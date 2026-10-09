@@ -28,7 +28,7 @@ to that repository.
 
 ```sh
 cd ~/src/api/packages/server/src
-cowshed new agent-auth
+cowshed fork agent-auth
 ```
 
 That command selects the repository bound to `~/src/api`, then clones **that repository's** warm `main` image.
@@ -36,34 +36,35 @@ That command selects the repository bound to `~/src/api`, then clones **that rep
 For automation, be explicit so a changed process cwd cannot select the wrong repository:
 
 ```sh
-cowshed new agent-auth --project ~/src/api --json
-cowshed new agent-homepage --project ~/src/web --json
+cowshed fork agent-auth --project ~/src/api --json
+cowshed fork agent-homepage --project ~/src/web --json
 ```
 
 `--project` takes a Git path, not a `repo_id`. `--repo-id owner/repo` is an adoption-time identity choice for a
 repository whose remotes cannot supply a usable identity.
 
-## What `new` clones
+## What `fork` clones
 
 Within the selected repository:
 
 ```sh
-cowshed new <name>
+cowshed fork <ws>
 ```
 
-clones `main` by default. Use `--from` to use another workspace in the same repository as the copy-on-write source:
+clones main by default, carrying tracked edits and untracked files warm. Name a source to fork another session:
 
 ```sh
-cowshed new experiment --from agent-auth
+cowshed fork agent-auth experiment
 ```
 
-Use `--ref` when the new workspace's Git branch should start at a particular revision:
+`--clean` discards tracked edits and nonignored untracked files. `--ref` implies clean and selects a revision in the
+source:
 
 ```sh
-cowshed new reproduce-4821 --ref 8b31e9f
+cowshed fork reproduce-4821 --ref 8b31e9f
 ```
 
-`--from` never crosses repository boundaries. To select another repository, change cwd or pass `--project`.
+A fork never crosses repository boundaries. To select another repository, change cwd or pass `--project`.
 
 Use `fork` when you want a named divergent future from an existing workspace:
 
@@ -133,7 +134,7 @@ Create a workspace and capture its mount path:
 
 ```sh
 WS=fix-auth
-WS_PATH=$(cowshed new "$WS")
+WS_PATH=$(cowshed fork "$WS")
 cd "$WS_PATH"
 ```
 
@@ -182,7 +183,7 @@ Use one fresh workspace per task. Give it a deterministic, repository-local name
 PROJECT=~/src/api
 WS=agent-4821
 
-MOUNT=$(cowshed new "$WS" --project "$PROJECT")
+MOUNT=$(cowshed fork "$WS" --project "$PROJECT")
 cowshed exec "$WS" --project "$PROJECT" -- bun install
 cowshed exec "$WS" --project "$PROJECT" -- bun test
 cowshed exec "$WS" --project "$PROJECT" -- git status --porcelain
@@ -229,7 +230,7 @@ the lane base instead of main, and the lane base lands into main once, when the 
 ```sh
 LANE=auth-rework
 
-cowshed new "$LANE" --project "$PROJECT"
+cowshed fork "$LANE" --project "$PROJECT"
 cowshed fork "$LANE" "$LANE-schema" --project "$PROJECT"
 cowshed fork "$LANE" "$LANE-api" --project "$PROJECT"
 
@@ -259,7 +260,7 @@ Every command keeps control output separate from guidance:
 Prefer `--json` in orchestration:
 
 ```sh
-cowshed new agent-4821 --project ~/src/api --json
+cowshed fork agent-4821 --project ~/src/api --json
 ```
 
 ```json
@@ -354,9 +355,9 @@ images are unaffected.
 | Goal                             | Command                                                                              |
 | -------------------------------- | ------------------------------------------------------------------------------------ |
 | Adopt a repository               | `cowshed adopt [path] [--repo-id owner/repo]`                                        |
-| Create from selected repo's main | `cowshed new <name>`                                                                 |
-| Create from another workspace    | `cowshed new <name> --from <workspace>`                                              |
-| Fork current workspace state     | `cowshed fork <source> <destination>`                                                |
+| Create from selected repo's main | `cowshed fork <ws>`                                                                  |
+| Create from another workspace    | `cowshed fork <src> <ws>`                                                            |
+| Create clean at a revision       | `cowshed fork [<src>] <ws> --ref <rev>`                                              |
 | List selected repository         | `cowshed ls`                                                                         |
 | Resolve/attach a mount           | `cowshed path <workspace>`                                                           |
 | Run a sandboxed command          | `cowshed exec <workspace> -- <argv...>`                                              |

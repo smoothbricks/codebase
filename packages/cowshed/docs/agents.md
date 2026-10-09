@@ -17,7 +17,7 @@ Harnesses should pass `--project` explicitly rather than make correctness depend
 
 ```sh
 PROJECT=~/src/api
-cowshed new task-4821 --project "$PROJECT" --json
+cowshed fork task-4821 --project "$PROJECT" --json
 ```
 
 `--repo-id` is only an adoption-time identity input. It is not how ordinary commands select a repository.
@@ -38,14 +38,14 @@ them.
 
 ```sh
 PROJECT=~/src/api
-WS_PATH=$(cowshed new task-4821 --project "$PROJECT") # stdout only: the mountpoint
+WS_PATH=$(cowshed fork task-4821 --project "$PROJECT") # stdout only: the mountpoint
 # stderr remains visible to the agent: cowshed: ... / next: cowshed exec task-4821 -- ...
 ```
 
 Prefer `--json` when you want structure:
 
 ```sh
-cowshed new task-4821 --project ~/src/api --json | jq -r .result.mount
+cowshed fork task-4821 --project ~/src/api --json | jq -r .result.mount
 ```
 
 ## Warm workspaces for coding agents
@@ -58,7 +58,7 @@ cleanup.
 # spawn
 PROJECT=~/src/api
 WS=task-4821
-WS_PATH=$(cowshed new "$WS" --project "$PROJECT")
+WS_PATH=$(cowshed fork "$WS" --project "$PROJECT")
 
 # work — either cd into it with the caller's ordinary host permissions...
 cd "$WS_PATH" && bun test
@@ -75,7 +75,7 @@ cowshed land "$WS" --project "$PROJECT"
 
 Notes for harness integration:
 
-- `cowshed new` uses copy-on-write storage and is safe to call per task. Names are unique within the selected
+- `cowshed fork` uses copy-on-write storage and is safe to call per task. Names are unique within the selected
   repository; exit 4 means the name is taken — pick another instead of retrying the same name.
 - The workspace branch is `cowshed/<name>`; `cowshed push` delivers it to the main repo's refs, where a human (or a
   merge queue) takes over. Never push to main's checked-out branch.

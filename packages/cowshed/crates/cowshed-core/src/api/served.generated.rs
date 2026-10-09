@@ -187,49 +187,31 @@ impl Serves<CoordinatorAdopt> for Coordinator {
     }
 }
 
-impl Serves<CoordinatorCreate> for Coordinator {
-    const BOUND: &'static [&'static str] = &["repoId"];
-
-    fn request(
-        authority: &<Self as Binder>::Fields<'_>,
-        arguments: Arguments,
-    ) -> Result<CreateRequest> {
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase", deny_unknown_fields)]
-        struct Caller {
-            workspace: WorkspaceName,
-            options: CreateOptions,
-        }
-        let Caller { workspace, options } = decode::<CoordinatorCreate, Caller>(arguments)?;
-        Ok(CreateRequest {
-            repo_id: owned(authority.repo_id),
-            workspace,
-            options,
-        })
-    }
-}
-
 impl Serves<CoordinatorFork> for Coordinator {
     const BOUND: &'static [&'static str] = &["repoId"];
 
     fn request(
         authority: &<Self as Binder>::Fields<'_>,
         arguments: Arguments,
-    ) -> Result<SourceDestinationRequest> {
+    ) -> Result<ForkRequest> {
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase", deny_unknown_fields)]
         struct Caller {
-            source: WorkspaceName,
-            destination: WorkspaceName,
+            workspace: WorkspaceName,
+            #[serde(default)]
+            source: Option<WorkspaceName>,
+            options: ForkOptions,
         }
         let Caller {
+            workspace,
             source,
-            destination,
+            options,
         } = decode::<CoordinatorFork, Caller>(arguments)?;
-        Ok(SourceDestinationRequest {
+        Ok(ForkRequest {
             repo_id: owned(authority.repo_id),
+            workspace,
             source,
-            destination,
+            options,
         })
     }
 }
@@ -1330,7 +1312,6 @@ pub(crate) fn each_served(
     check.served::<WorkspaceBuildVolume, _>(workspace_ref, &[]);
     check.served::<CoordinatorRename, _>(coordinator, &[]);
     check.served::<CoordinatorAdopt, _>(coordinator, &[]);
-    check.served::<CoordinatorCreate, _>(coordinator, &[]);
     check.served::<CoordinatorFork, _>(coordinator, &[]);
     check.served::<CoordinatorMoveCheckout, _>(coordinator, &[]);
     check.served::<CoordinatorChangeRepoId, _>(coordinator, &[]);

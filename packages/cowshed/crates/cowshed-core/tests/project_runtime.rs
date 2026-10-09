@@ -11,8 +11,8 @@ use bytes::Bytes;
 use cowshed_core::apfs::{CommandRunner, DetachIntent, DiskImageSource, SystemCommandRunner};
 use cowshed_core::api::dto::{
     AbandonedWork, AdoptOptions, AttachOptions, CheckpointInfo, CheckpointOptions, CheckpointQuota,
-    CheckpointResult, CommandArg, CreateOptions, DefragmentResult, DoctorReport, ExecCommand,
-    ExecRequest, Finding, FindingSeverity, GcOptions, GcReport, GitOid, GrantDelta, GrantSet,
+    CheckpointResult, CommandArg, DefragmentResult, DoctorReport, ExecCommand, ExecRequest,
+    Finding, FindingSeverity, ForkOptions, GcOptions, GcReport, GitOid, GrantDelta, GrantSet,
     JobId, JobInfo, JobJournalCursor, JobState, JobTail, JobTailBytes, JobTailLimits, LandOptions,
     LandReport, MirrorInfo, PortBlock, PushOptions, PushReport, RebaseOptions, RemoveOptions,
     RemoveProjectOptions, RemoveProjectReport, RemoveReport, Reseed, ReseedResult, ResizeResult,
@@ -637,10 +637,10 @@ impl ProjectRuntimeHost for FakeHost {
         Ok(self.snapshot(&workspace))
     }
 
-    async fn create(
+    async fn resume_fork(
         &mut self,
         workspace: WorkspaceName,
-        _options: CreateOptions,
+        _options: cowshed_core::storage::recovery::MintOptions,
     ) -> Result<WorkspaceSnapshot> {
         if self
             .state
@@ -656,7 +656,7 @@ impl ProjectRuntimeHost for FakeHost {
         // The real host's steps, in the shape it reports them: a clone step holding the first
         // write into the clone, then the initializer.
         let gate = self.create_gate.clone();
-        timed_async("new", "clone", async {
+        timed_async("fork", "clone", async {
             timed("apfs", format_args!("canonical/first-write"), || {
                 Ok::<_, CowshedError>(())
             })?;
@@ -669,7 +669,7 @@ impl ProjectRuntimeHost for FakeHost {
         let prepared = self.next_workspace(workspace.clone());
         self.events.send(Event::Initialize(workspace.clone())).ok();
         let fail = std::mem::take(&mut self.fail_create_initializer);
-        timed_async("new", "initialize", async {
+        timed_async("fork", "initialize", async {
             if fail {
                 Err(CowshedError::internal(
                     "injected create initializer failure",
@@ -685,13 +685,17 @@ impl ProjectRuntimeHost for FakeHost {
         Ok(self.snapshot(&prepared))
     }
 
-    async fn fork(
+    async fn clone_for_rename(
         &mut self,
         source: WorkspaceName,
         destination: WorkspaceName,
     ) -> Result<WorkspaceSnapshot> {
         self.workspace(&source)?;
-        self.create(destination, CreateOptions::default()).await
+        self.resume_fork(
+            destination,
+            cowshed_core::storage::recovery::MintOptions::default(),
+        )
+        .await
     }
 
     async fn rename(
@@ -700,7 +704,7 @@ impl ProjectRuntimeHost for FakeHost {
         destination: WorkspaceName,
     ) -> Result<WorkspaceSnapshot> {
         self.workspace(&source)?;
-        self.create(destination, CreateOptions::default()).await
+        self.clone_for_rename(source, destination).await
     }
 
     async fn move_checkout(&mut self, destination: PathBuf) -> Result<WorkspaceSnapshot> {
@@ -3501,7 +3505,7 @@ async fn host_controller_a_job_s_listening_ports_are_its_own_group_s() {
     )
     .await;
     jobs.coordinator
-        .create(feature.as_str(), CreateOptions::default())
+        .fork(feature.as_str(), None, ForkOptions::default())
         .await
         .expect("create the feature workspace");
     let feature_worker = jobs
@@ -4456,7 +4460,7 @@ async fn a_reported_create_hears_its_steps_while_it_runs() {
     };
     let ended = |step| StepReport::Ended { step, error: None };
     let (steps, mut reports) = mpsc::unbounded_channel();
-    let create = coordinator.create_reporting("feature", CreateOptions::default(), steps);
+    let create = coordinator.fork_reporting("feature", None, ForkOptions::default(), steps);
     tokio::pin!(create);
     let heard_while_held = async {
         let mut heard = Vec::new();
@@ -4479,7 +4483,7 @@ async fn a_reported_create_hears_its_steps_while_it_runs() {
     assert_eq!(
         heard_while_held,
         [
-            started(0, None, "new", "clone"),
+            started(0, None, "fork", "clone"),
             started(1, Some(0), "apfs", "canonical/first-write"),
             ended(1),
         ]
@@ -4497,7 +4501,7 @@ async fn a_reported_create_hears_its_steps_while_it_runs() {
     }
     assert_eq!(
         rest,
-        [ended(0), started(2, None, "new", "initialize"), ended(2)]
+        [ended(0), started(2, None, "fork", "initialize"), ended(2)]
     );
 }
 
@@ -4585,6 +4589,30 @@ async fn secret_refusal_precedes_image_initialization_and_quarantine_preserves_p
 }
 
 #[tokio::test]
+async fn fork_ref_requires_clean_before_any_mint_effect() {
+    let root = test_root();
+    let (_runtime, router, repo, mut events) = start(&root, false, false, Vec::new()).await;
+    adopt(&router, &repo).await;
+    while events.try_recv().is_ok() {}
+    let error = route(
+        &router,
+        coordinator(repo.clone()),
+        "coordinator.fork",
+        json!({
+            "repoId": repo, "workspace": "refused",
+            "options": { "ref": { "branch": "main" }, "clean": false }
+        }),
+    )
+    .await
+    .expect_err("a ref requires explicit clean");
+    assert_eq!(error.code, ErrorCode::Usage);
+    assert!(
+        events.try_recv().is_err(),
+        "no clone or initialization occurred"
+    );
+}
+
+#[tokio::test]
 async fn adopt_then_create_list_and_path_use_one_immutable_snapshot() {
     let root = test_root();
     let (_runtime, router, repo, mut events) = start(&root, false, false, Vec::new()).await;
@@ -4592,8 +4620,8 @@ async fn adopt_then_create_list_and_path_use_one_immutable_snapshot() {
     route(
         &router,
         coordinator(repo.clone()),
-        "coordinator.create",
-        json!({ "repoId": repo, "workspace": "task", "options": CreateOptions::default() }),
+        "coordinator.fork",
+        json!({ "repoId": repo, "workspace": "task", "options": ForkOptions::default() }),
     )
     .await
     .expect("create");
@@ -4669,8 +4697,8 @@ async fn workspace_at_uses_active_mount_facts_and_attach_preserves_exec_mount() 
     let created = route(
         &router,
         coordinator(repo.clone()),
-        "coordinator.create",
-        json!({ "repoId": repo, "workspace": "task", "options": CreateOptions::default() }),
+        "coordinator.fork",
+        json!({ "repoId": repo, "workspace": "task", "options": ForkOptions::default() }),
     )
     .await
     .expect("create session");
@@ -4959,8 +4987,8 @@ async fn the_build_volume_answer_is_the_hosts_grant_for_one_attached_incarnation
     let created = route(
         &router,
         coordinator(repo.clone()),
-        "coordinator.create",
-        json!({ "repoId": repo, "workspace": "built", "options": CreateOptions::default() }),
+        "coordinator.fork",
+        json!({ "repoId": repo, "workspace": "built", "options": ForkOptions::default() }),
     )
     .await
     .expect("create");
@@ -5025,8 +5053,8 @@ async fn a_grants_read_that_holds_an_incarnation_is_fenced_on_a_coordinator_conn
     let created = route(
         &router,
         coordinator(repo.clone()),
-        "coordinator.create",
-        json!({ "repoId": repo, "workspace": "fenced", "options": CreateOptions::default() }),
+        "coordinator.fork",
+        json!({ "repoId": repo, "workspace": "fenced", "options": ForkOptions::default() }),
     )
     .await
     .expect("create");
@@ -5065,8 +5093,8 @@ async fn labeled_checkpoint_is_pinned_and_projected_without_mount_inspection() {
     let workspace = route(
         &router,
         coordinator(repo.clone()),
-        "coordinator.create",
-        json!({ "repoId": repo, "workspace": "retry", "options": CreateOptions::default() }),
+        "coordinator.fork",
+        json!({ "repoId": repo, "workspace": "retry", "options": ForkOptions::default() }),
     )
     .await
     .expect("create");
@@ -5123,8 +5151,8 @@ async fn checkpoint_quota_charges_active_plus_all_workspace_checkpoints_at_exact
     let other = route(
         &router,
         coordinator(repo.clone()),
-        "coordinator.create",
-        json!({ "repoId": repo, "workspace": "other", "options": CreateOptions::default() }),
+        "coordinator.fork",
+        json!({ "repoId": repo, "workspace": "other", "options": ForkOptions::default() }),
     )
     .await
     .expect("create other");
@@ -5251,18 +5279,17 @@ async fn same_name_creates_serialize_to_one_success_and_one_conflict() {
     let root = test_root();
     let (_runtime, router, repo, _events) = start(&root, false, false, Vec::new()).await;
     adopt(&router, &repo).await;
-    let params =
-        json!({ "repoId": repo, "workspace": "same", "options": CreateOptions::default() });
+    let params = json!({ "repoId": repo, "workspace": "same", "options": ForkOptions::default() });
     let left = route(
         &router,
         coordinator(repo.clone()),
-        "coordinator.create",
+        "coordinator.fork",
         params.clone(),
     );
     let right = route(
         &router,
         coordinator(repo.clone()),
-        "coordinator.create",
+        "coordinator.fork",
         params,
     );
     let (left, right) = tokio::join!(left, right);
@@ -5279,8 +5306,8 @@ async fn initializer_failure_never_publishes_or_lists_workspace() {
     let error = route(
         &router,
         coordinator(repo.clone()),
-        "coordinator.create",
-        json!({ "repoId": repo, "workspace": "hidden", "options": CreateOptions::default() }),
+        "coordinator.fork",
+        json!({ "repoId": repo, "workspace": "hidden", "options": ForkOptions::default() }),
     )
     .await
     .expect_err("injected failure");
@@ -5409,8 +5436,8 @@ async fn remove_stops_supervisor_before_retirement() {
     route(
         &router,
         coordinator(repo.clone()),
-        "coordinator.create",
-        json!({ "repoId": repo, "workspace": "gone", "options": CreateOptions::default() }),
+        "coordinator.fork",
+        json!({ "repoId": repo, "workspace": "gone", "options": ForkOptions::default() }),
     )
     .await
     .expect("create");
@@ -5450,8 +5477,8 @@ async fn session_removal_refuses_dirty_work_until_forced() {
     route(
         &router,
         coordinator(repo.clone()),
-        "coordinator.create",
-        json!({ "repoId": repo, "workspace": "unsafe", "options": CreateOptions::default() }),
+        "coordinator.fork",
+        json!({ "repoId": repo, "workspace": "unsafe", "options": ForkOptions::default() }),
     )
     .await
     .expect("create");
@@ -5504,8 +5531,8 @@ async fn unlanded_session_removal_survives_force_and_only_abandon_destroys_it() 
     route(
         &router,
         coordinator(repo.clone()),
-        "coordinator.create",
-        json!({ "repoId": repo, "workspace": "unsafe", "options": CreateOptions::default() }),
+        "coordinator.fork",
+        json!({ "repoId": repo, "workspace": "unsafe", "options": ForkOptions::default() }),
     )
     .await
     .expect("create");
@@ -5583,8 +5610,8 @@ async fn head_change_at_retirement_fence_preserves_the_workspace() {
     route(
         &router,
         coordinator(repo.clone()),
-        "coordinator.create",
-        json!({ "repoId": repo, "workspace": "moving", "options": CreateOptions::default() }),
+        "coordinator.fork",
+        json!({ "repoId": repo, "workspace": "moving", "options": ForkOptions::default() }),
     )
     .await
     .expect("create");
@@ -5825,8 +5852,8 @@ async fn destroy_returns_after_logical_retirement_before_background_reclaim() {
     route(
         &router,
         coordinator(repo.clone()),
-        "coordinator.create",
-        json!({ "repoId": repo, "workspace": "retired", "options": CreateOptions::default() }),
+        "coordinator.fork",
+        json!({ "repoId": repo, "workspace": "retired", "options": ForkOptions::default() }),
     )
     .await
     .expect("create");
@@ -6079,8 +6106,8 @@ async fn removing_a_project_settles_its_reclaims_before_collecting_then_restores
         route(
             &router,
             coordinator(repo.clone()),
-            "coordinator.create",
-            json!({ "repoId": repo, "workspace": name, "options": CreateOptions::default() }),
+            "coordinator.fork",
+            json!({ "repoId": repo, "workspace": name, "options": ForkOptions::default() }),
         )
         .await
         .expect("create");
@@ -6173,8 +6200,8 @@ async fn a_stale_collection_is_a_retryable_refusal_and_the_retry_finishes_the_re
     route(
         &router,
         coordinator(repo.clone()),
-        "coordinator.create",
-        json!({ "repoId": repo, "workspace": "landed", "options": CreateOptions::default() }),
+        "coordinator.fork",
+        json!({ "repoId": repo, "workspace": "landed", "options": ForkOptions::default() }),
     )
     .await
     .expect("create");

@@ -36,11 +36,11 @@ Workspace Git fetches from the main mount, and from the network only through an 
 fetch and refuses push. Remote publication is coordinator work outside the sandbox.
 
 ```rust
-use cowshed_core::{Cowshed, CreateOptions, ExecRequest};
+use cowshed_core::{Cowshed, ForkOptions, ExecRequest};
 
 let project = Cowshed::open("<project-root>").await?;
 let coordinator = project.coordinator()?;
-let workspace = coordinator.create("task-raven", CreateOptions::default()).await?;
+let workspace = coordinator.fork("task-raven", None, ForkOptions::default()).await?;
 let worker = coordinator.worker("task-raven")?;
 
 let job = worker

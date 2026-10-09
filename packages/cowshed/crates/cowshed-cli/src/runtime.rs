@@ -15,9 +15,9 @@ pub use cowshed_core::api::ProjectWorkspaces;
 use cowshed_core::api::server::{ConnectionAuthority, serve_controller_connection};
 use cowshed_core::api::{
     AdoptOptions, AttachOptions, BranchName, CheckpointInfo, CheckpointOptions, CheckpointResult,
-    CommandArg, Coordinator, CreateOptions, DefragmentResult, DoctorReport, EmptyResult,
-    ExecRequest, ExitStatus, ExpectedRefHead, Finding, FindingSeverity, GatewayStatus, GcOptions,
-    GcReason, GcReport, GitOid, GrantDelta, GrantSet, JobInfo, JobStream, LandOptions, LandReport,
+    CommandArg, Coordinator, DefragmentResult, DoctorReport, EmptyResult, ExecRequest, ExitStatus,
+    ExpectedRefHead, Finding, FindingSeverity, ForkOptions, GatewayStatus, GcOptions, GcReason,
+    GcReport, GitOid, GrantDelta, GrantSet, JobInfo, JobStream, LandOptions, LandReport,
     LandingCommits, MountResult, OutputPublication, ProjectGrantDelta, ProjectGrants,
     PublicationPolicy, PushOptions, PushReport, RebaseBuildVolume, RebaseOptions, RebaseReport,
     RemoveOptions, RemoveProjectOptions, RemoveProjectReport, RemoveReport, Reseed, ReseedResult,
@@ -95,8 +95,12 @@ pub enum ExecEnd {
 #[async_trait]
 pub trait CliService: Send {
     async fn adopt(&mut self, options: AdoptOptions) -> Result<WorkspaceInfo>;
-    async fn create(&mut self, name: &str, options: CreateOptions) -> Result<WorkspaceInfo>;
-    async fn fork(&mut self, source: &str, destination: &str) -> Result<WorkspaceInfo>;
+    async fn fork(
+        &mut self,
+        workspace: &str,
+        source: Option<&str>,
+        options: ForkOptions,
+    ) -> Result<WorkspaceInfo>;
     async fn rename(&mut self, source: &str, destination: &str) -> Result<WorkspaceInfo>;
     async fn move_checkout(&mut self, destination: &Path) -> Result<WorkspaceInfo>;
     async fn change_repo_id(&mut self, _repo_id: RepoId) -> Result<WorkspaceInfo> {
@@ -194,7 +198,6 @@ enum RuntimeOpenMode {
 fn needs_daemon_of_this_build(command: &Command) -> bool {
     match command {
         Command::Adopt(_)
-        | Command::New(_)
         | Command::Fork(_)
         | Command::Move(_)
         | Command::Checkpoint(_)
@@ -256,8 +259,7 @@ fn runtime_open_mode(command: &Command) -> RuntimeOpenMode {
         Command::Move(args) if matches!(args.destination, MoveDestination::RepoId(_)) => {
             RuntimeOpenMode::IdentityChange
         }
-        Command::New(_)
-        | Command::Fork(_)
+        Command::Fork(_)
         | Command::Move(_)
         | Command::Checkpoint(_)
         | Command::Restore(_)
@@ -343,8 +345,7 @@ fn runtime_recovery_scope(command: &Command) -> Result<RecoveryScope> {
             .map_err(|error| usage(error.to_string(), "use a valid workspace name"))?,
         Command::Gc(_) => RecoveryScope::Store,
         Command::Doctor(args) if !args.repair => RecoveryScope::Inspect,
-        Command::New(args) => named([Some(args.name.as_str()), args.from.as_deref()]),
-        Command::Fork(args) => named([Some(args.source.as_str()), Some(args.destination.as_str())]),
+        Command::Fork(args) => named([args.source.as_deref(), Some(args.destination.as_str())]),
         Command::Move(args) => match &args.destination {
             MoveDestination::Workspace(destination) => {
                 named([Some(args.source.as_str()), Some(destination.as_str())])
@@ -627,14 +628,15 @@ impl CliService for ActorBridge {
         Ok(self.coordinator()?.adopt(options).await?.into_info())
     }
 
-    async fn create(&mut self, name: &str, options: CreateOptions) -> Result<WorkspaceInfo> {
-        Ok(self.coordinator()?.create(name, options).await?.into_info())
-    }
-
-    async fn fork(&mut self, source: &str, destination: &str) -> Result<WorkspaceInfo> {
+    async fn fork(
+        &mut self,
+        workspace: &str,
+        source: Option<&str>,
+        options: ForkOptions,
+    ) -> Result<WorkspaceInfo> {
         Ok(self
             .coordinator()?
-            .fork(source, destination)
+            .fork(workspace, source, options)
             .await?
             .into_info())
     }
@@ -1205,7 +1207,7 @@ where
     };
     output.guidance(&guidance).map_err(output_error)?;
     match gateway {
-        Ok(()) => output.hint("cowshed new <name>").map_err(output_error)?,
+        Ok(()) => output.hint("cowshed fork <ws>").map_err(output_error)?,
         Err(error) => {
             output
                 .guidance(&format!(
@@ -1271,26 +1273,6 @@ where
             )
             .await
         }
-        Command::New(args) => {
-            let options =
-                CreateOptions {
-                    revision: args.reference.map(os_revision).transpose()?,
-                    from_workspace: args.from.map(WorkspaceName::new).transpose().map_err(
-                        |error| usage(error.to_string(), "use a valid source workspace name"),
-                    )?,
-                    browse: args.browse,
-                    slot: args.slot,
-                    register: args.register,
-                    git_worktree: args.git_worktree,
-                };
-            let info = service.create(&args.name, options).await?;
-            service.reconcile_gateway().await?;
-            emit_mount(output, json, &info)?;
-            output
-                .hint(&format!("cowshed exec {} -- <cmd>", args.name))
-                .map_err(output_error)?;
-            Ok(success())
-        }
         Command::Move(args) => {
             let info = match &args.destination {
                 MoveDestination::Workspace(name) => service.rename(&args.source, name).await?,
@@ -1310,7 +1292,17 @@ where
             Ok(success())
         }
         Command::Fork(args) => {
-            let info = service.fork(&args.source, &args.destination).await?;
+            let options = ForkOptions {
+                revision: args.reference.map(os_revision).transpose()?,
+                clean: args.clean,
+                browse: args.browse,
+                slot: args.slot,
+                register: args.register,
+                git_worktree: args.git_worktree,
+            };
+            let info = service
+                .fork(&args.destination, args.source.as_deref(), options)
+                .await?;
             service.reconcile_gateway().await?;
             emit_mount(output, json, &info)?;
             output
@@ -2103,7 +2095,7 @@ async fn slot_tenant(service: &mut dyn CliService, slot: u32) -> Result<String> 
         .ok_or_else(|| {
             CowshedError::not_found(
                 format!("no workspace occupies slot {slot}"),
-                format!("give the slot a tenant: cowshed new <name> --slot {slot}"),
+                format!("give the slot a tenant: cowshed fork <ws> --slot {slot}"),
             )
         })
 }
@@ -4805,7 +4797,7 @@ mod tests {
             &["rm", "raven"][..],
             &["rm", "raven", "--force"],
             &["exec", "raven", "--", "true"],
-            &["new", "raven"],
+            &["fork", "raven"],
             &["fork", "raven", "crow"],
             &["mv", "raven", "crow"],
             &["checkpoint", "raven", "before"],
@@ -6276,7 +6268,7 @@ mod tests {
                 vec!["mv", "main", "--repo-id", "other/widget"],
                 RuntimeOpenMode::IdentityChange,
             ),
-            (vec!["new", "raven"], RuntimeOpenMode::ExistingOnly),
+            (vec!["fork", "raven"], RuntimeOpenMode::ExistingOnly),
             (
                 vec!["fork", "raven", "falcon"],
                 RuntimeOpenMode::ExistingOnly,

@@ -235,18 +235,6 @@ export const parseCpuTotals = (json: string): Api.CpuTotals => assertCpuTotals(J
 export const assertCpuTotalsList = typia.createAssertEquals<readonly Api.CpuTotals[]>();
 export const parseCpuTotalsList = (json: string): readonly Api.CpuTotals[] => assertCpuTotalsList(JSON.parse(json));
 
-export const assertCreateOptions = typia.createAssertEquals<Api.CreateOptions>();
-export const parseCreateOptions = (json: string): Api.CreateOptions => assertCreateOptions(JSON.parse(json));
-export const assertCreateOptionsList = typia.createAssertEquals<readonly Api.CreateOptions[]>();
-export const parseCreateOptionsList = (json: string): readonly Api.CreateOptions[] =>
-  assertCreateOptionsList(JSON.parse(json));
-
-export const assertCreateRequest = typia.createAssertEquals<Api.CreateRequest>();
-export const parseCreateRequest = (json: string): Api.CreateRequest => assertCreateRequest(JSON.parse(json));
-export const assertCreateRequestList = typia.createAssertEquals<readonly Api.CreateRequest[]>();
-export const parseCreateRequestList = (json: string): readonly Api.CreateRequest[] =>
-  assertCreateRequestList(JSON.parse(json));
-
 export const assertCredentialReport = typia.createAssertEquals<Api.CredentialReport>();
 export const parseCredentialReport = (json: string): Api.CredentialReport => assertCredentialReport(JSON.parse(json));
 export const assertCredentialReportList = typia.createAssertEquals<readonly Api.CredentialReport[]>();
@@ -370,6 +358,18 @@ export const parseForkCommitment = (json: string): Api.ForkCommitment => assertF
 export const assertForkCommitmentList = typia.createAssertEquals<readonly Api.ForkCommitment[]>();
 export const parseForkCommitmentList = (json: string): readonly Api.ForkCommitment[] =>
   assertForkCommitmentList(JSON.parse(json));
+
+export const assertForkOptions = typia.createAssertEquals<Api.ForkOptions>();
+export const parseForkOptions = (json: string): Api.ForkOptions => assertForkOptions(JSON.parse(json));
+export const assertForkOptionsList = typia.createAssertEquals<readonly Api.ForkOptions[]>();
+export const parseForkOptionsList = (json: string): readonly Api.ForkOptions[] =>
+  assertForkOptionsList(JSON.parse(json));
+
+export const assertForkRequest = typia.createAssertEquals<Api.ForkRequest>();
+export const parseForkRequest = (json: string): Api.ForkRequest => assertForkRequest(JSON.parse(json));
+export const assertForkRequestList = typia.createAssertEquals<readonly Api.ForkRequest[]>();
+export const parseForkRequestList = (json: string): readonly Api.ForkRequest[] =>
+  assertForkRequestList(JSON.parse(json));
 
 export const assertGatewayStatus = typia.createAssertEquals<Api.GatewayStatus>();
 export const parseGatewayStatus = (json: string): Api.GatewayStatus => assertGatewayStatus(JSON.parse(json));

@@ -1783,13 +1783,13 @@ fn setup_never_discovers_a_project_from_any_directory() {
 /// Guidance can never name a verb the parser does not have (06_cli.md rule 4), and `setup` is now
 /// the verb storage guidance names.
 #[test]
-fn setup_is_in_the_command_map_between_adopt_and_new() {
+fn setup_is_in_the_command_map_between_adopt_and_fork() {
     let map = help::command_map();
     let adopt = map.find("\n  adopt").expect("adopt is listed");
     let setup = map.find("\n  setup").expect("setup is listed");
-    let new = map.find("\n  new").expect("new is listed");
+    let fork = map.find("\n  fork").expect("fork is listed");
     assert!(
-        adopt < setup && setup < new,
+        adopt < setup && setup < fork,
         "setup sits after adopt:\n{map}"
     );
 

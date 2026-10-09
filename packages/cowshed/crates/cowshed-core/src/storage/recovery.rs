@@ -7,7 +7,7 @@ use std::sync::LazyLock;
 
 use serde::{Deserialize, Serialize};
 
-use crate::api::dto::{AdoptOptions, CreateOptions, RemoveOptions, RemoveReport};
+use crate::api::dto::{AdoptOptions, ForkOptions, RemoveOptions, RemoveReport, RevisionTarget};
 use crate::error::{CowshedError, Result as CowshedResult};
 use crate::metadata::{MetadataError, WorkspaceIncarnation, WorkspaceName, read_json, write_json};
 use crate::repository::RepoId;
@@ -492,6 +492,38 @@ fn check_image(
     Ok(())
 }
 
+/// Frozen create-intent storage schema, not a public creation API. Missing `clean` preserves
+/// older binaries' main-only discard rule; new fork intents record their explicit choice.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+pub struct MintOptions {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revision: Option<RevisionTarget>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from_workspace: Option<WorkspaceName>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clean: Option<bool>,
+    pub browse: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slot: Option<u32>,
+    pub register: bool,
+    pub git_worktree: bool,
+}
+
+impl MintOptions {
+    pub fn fork(source: Option<WorkspaceName>, options: ForkOptions) -> Self {
+        Self {
+            revision: options.revision,
+            from_workspace: source,
+            clean: Some(options.clean),
+            browse: options.browse,
+            slot: options.slot,
+            register: options.register,
+            git_worktree: options.git_worktree,
+        }
+    }
+}
+
 /// Durable user intent written before a lifecycle verb's first mutation.
 ///
 /// Deliberately not [`super::lifecycle::Operation`], and not substitutable for it. An intent
@@ -514,7 +546,7 @@ pub enum LifecycleIntent {
     },
     Create {
         workspace: WorkspaceName,
-        options: CreateOptions,
+        options: MintOptions,
     },
     Fork {
         source: WorkspaceName,

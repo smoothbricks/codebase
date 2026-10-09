@@ -21,7 +21,7 @@ diagnostics remain macOS-only. From the repository root, `bun run check:linux` c
 
 ```sh
 $ cd ~/src/api
-$ cowshed new raven --json
+$ cowshed fork raven --json
 {"ok":true,"result":{"workspace":"raven","mount":"<mount-root>/acme/api/raven","baseCommit":"6f3a2c1000000000000000000000000000000000"}}
 next: cowshed exec raven -- <cmd>
 ```
@@ -31,7 +31,7 @@ machines; stderr is for humans and agents deciding what to do next.**
 
 ## Why
 
-- **Copy-on-write.** `cowshed new` clones an image instead of recursively copying or registering a linked worktree.
+- **Copy-on-write.** `cowshed fork` clones an image instead of recursively copying or registering a linked worktree.
   `cowshed rm` retires one storage object instead of walking tens of thousands of files.
 - **Warm.** Each adopted repository has its own live `main` image. Workspaces inherit that repository's source,
   standalone `.git`, materialized dependencies, and build state.
@@ -104,7 +104,7 @@ cowshed gateway start
 
 # 3. Create a warm workspace from this repository's main.
 WS=raven
-MOUNT=$(cowshed new "$WS")
+MOUNT=$(cowshed fork "$WS")
 
 # 4. Work normally, or run autonomous commands under the sandbox.
 cd "$MOUNT"
@@ -117,7 +117,7 @@ cowshed land "$WS"
 From outside the repository, make selection explicit:
 
 ```sh
-cowshed new raven --project <project-root>
+cowshed fork raven --project <project-root>
 ```
 
 For the complete repository-selection model, multi-repository examples, agent loop, JSON contract, and safe cleanup
@@ -182,7 +182,7 @@ capability, not from store reads
 
 Two different mechanisms save build time, and it helps to keep them apart.
 
-**The clone is why a workspace starts warm.** `cowshed new` clones the target's source image and its latest immutable
+**The clone is why a workspace starts warm.** `cowshed fork` clones the target's source image and its latest immutable
 build-volume seed. Cargo target directories, Nx state and per-tree indexers live in that separate private APFS image,
 reached through `.cowshed/build` and fixed relative links. No file copy or warm-build step is part of fork or land. A
 land freezes the seed from the landing workspace's volume; whatever the target runs afterwards reaches the seed when the

@@ -685,7 +685,6 @@ mod parity_tests {
     fn napi_operations(command: &Command) -> Option<&'static [&'static str]> {
         match command {
             Command::Adopt(_) => Some(&["coordinator.adopt"]),
-            Command::New(_) => Some(&["coordinator.create"]),
             Command::Fork(_) => Some(&["coordinator.fork"]),
             Command::Move(_) => Some(&["coordinator.rename", "coordinator.moveCheckout"]),
             Command::Checkpoint(_) => Some(&["worker.checkpoint"]),
@@ -728,7 +727,7 @@ mod parity_tests {
     /// One representative argv per `Command` arm, paired with the operations it must map to.
     const SAMPLES: &[(&[&str], Option<&[&str]>)] = &[
         (&["adopt"], Some(&["coordinator.adopt"])),
-        (&["new", "parity"], Some(&["coordinator.create"])),
+        (&["fork", "parity"], Some(&["coordinator.fork"])),
         (&["fork", "main", "parity"], Some(&["coordinator.fork"])),
         (
             &["mv", "parity", "renamed"],

@@ -1,18 +1,18 @@
 use super::call::{Binder, Binding, JobFields, RepoFields, WorkspaceFields};
 use super::dto::{
-    AdmissionKey, AdoptOptions, AttachOptions, CheckpointOptions, CheckpointQuota, CreateOptions,
-    DefragmentResult, DoctorReport, EmptyResult, ExecRequest, GcOptions, GcReport, GrantDelta,
-    GrantSet, JobId, JobInfo, JobJournalCursor, JobListeningPorts, JobTail, JobTailLimits,
-    LandOptions, LandReport, MirrorInfo, ProjectGrantDelta, ProjectGrants, PushOptions, PushReport,
-    RebaseOptions, RebaseReport, RemoveOptions, RemoveProjectOptions, RemoveProjectReport,
-    RemoveReport, ReseedResult, ResizeResult, ResizeVolume, SealedJob, StdinSource, StepReport,
-    WorkspaceIncarnation, WorkspaceInfo, WorkspaceTarget,
+    AdmissionKey, AdoptOptions, AttachOptions, CheckpointOptions, CheckpointQuota,
+    DefragmentResult, DoctorReport, EmptyResult, ExecRequest, ForkOptions, GcOptions, GcReport,
+    GrantDelta, GrantSet, JobId, JobInfo, JobJournalCursor, JobListeningPorts, JobTail,
+    JobTailLimits, LandOptions, LandReport, MirrorInfo, ProjectGrantDelta, ProjectGrants,
+    PushOptions, PushReport, RebaseOptions, RebaseReport, RemoveOptions, RemoveProjectOptions,
+    RemoveProjectReport, RemoveReport, ReseedResult, ResizeResult, ResizeVolume, SealedJob,
+    StdinSource, StepReport, WorkspaceIncarnation, WorkspaceInfo, WorkspaceTarget,
 };
 use super::frame;
 use super::operations::{
-    self, AdmissionKeyRequest, AdoptRequest, ChangeRepoIdRequest, CheckpointRequest, CreateRequest,
-    DestroyRequest, ExecParams, ExecStdin, GcRequest, GrantRequest, JobRequest, JobStream,
-    LandRequest, LogsChunk, LogsRequest, MirrorRequest, MoveCheckoutRequest, Operation,
+    self, AdmissionKeyRequest, AdoptRequest, ChangeRepoIdRequest, CheckpointRequest,
+    DestroyRequest, ExecParams, ExecStdin, ForkRequest, GcRequest, GrantRequest, JobRequest,
+    JobStream, LandRequest, LogsChunk, LogsRequest, MirrorRequest, MoveCheckoutRequest, Operation,
     ProgressRequest, ProjectGrantRequest, ProjectOpenRequest, PushRequest, QuotaRequest,
     RebaseRequest, RemoveProjectRequest, RepoRequest, ResizeRequest, RestoreRequest,
     SessionRequest, SlotRequest, SourceDestinationRequest, StdinWriteRequest, StreamOperation,
@@ -1826,43 +1826,57 @@ impl Coordinator {
             .map(|view| self.workspace_ref(view))
     }
 
-    pub async fn create(&self, name: &str, options: CreateOptions) -> Result<WorkspaceRef> {
-        self.create_call(name, options, None).await
+    pub async fn fork(
+        &self,
+        name: &str,
+        source: Option<&str>,
+        options: ForkOptions,
+    ) -> Result<WorkspaceRef> {
+        self.fork_call(name, source, options, None).await
     }
 
-    /// [`Self::create`], with each of its lifecycle steps sent to `steps` as the controller
+    /// [`Self::fork`], with each of its lifecycle steps sent to `steps` as the controller
     /// reports it — the clone, the first write into it, its mount, the checkout and the rest —
     /// nested under the step it runs inside. Every step is sent before this returns, and the
     /// stream ends with it.
-    pub async fn create_reporting(
+    pub async fn fork_reporting(
         &self,
         name: &str,
-        options: CreateOptions,
+        source: Option<&str>,
+        options: ForkOptions,
         steps: tokio::sync::mpsc::UnboundedSender<StepReport>,
     ) -> Result<WorkspaceRef> {
-        self.create_call(name, options, Some(steps)).await
+        self.fork_call(name, source, options, Some(steps)).await
     }
 
-    async fn create_call(
+    async fn fork_call(
         &self,
         name: &str,
-        options: CreateOptions,
+        source: Option<&str>,
+        options: ForkOptions,
         steps: Option<tokio::sync::mpsc::UnboundedSender<StepReport>>,
     ) -> Result<WorkspaceRef> {
         let workspace = WorkspaceName::session(name).map_err(|error| {
             CowshedError::usage(error.to_string(), "use a valid non-main workspace name")
         })?;
-        let request = CreateRequest {
+        let source = source
+            .map(WorkspaceName::new)
+            .transpose()
+            .map_err(|error| {
+                CowshedError::usage(error.to_string(), "use a valid source workspace name")
+            })?;
+        let request = ForkRequest {
             repo_id: self.repo_id(),
             workspace,
+            source,
             options,
         };
         let view = match steps {
             Some(steps) => {
-                invoke_reporting::<operations::CoordinatorCreate>(&*self.runtime, &request, steps)
+                invoke_reporting::<operations::CoordinatorFork>(&*self.runtime, &request, steps)
                     .await?
             }
-            None => invoke::<operations::CoordinatorCreate>(&*self.runtime, &request).await?,
+            None => invoke::<operations::CoordinatorFork>(&*self.runtime, &request).await?,
         };
         Ok(self.workspace_ref(view))
     }
@@ -1905,23 +1919,6 @@ impl Coordinator {
             new_repo_id: repo_id.clone(),
         };
         invoke::<operations::CoordinatorChangeRepoId>(&*self.runtime, &request)
-            .await
-            .map(|view| self.workspace_ref(view))
-    }
-
-    pub async fn fork(&self, source: &str, destination: &str) -> Result<WorkspaceRef> {
-        let source = WorkspaceName::new(source).map_err(|error| {
-            CowshedError::usage(error.to_string(), "use a valid source workspace name")
-        })?;
-        let destination = WorkspaceName::session(destination).map_err(|error| {
-            CowshedError::usage(error.to_string(), "use a valid non-main destination name")
-        })?;
-        let request = SourceDestinationRequest {
-            repo_id: self.repo_id(),
-            source,
-            destination,
-        };
-        invoke::<operations::CoordinatorFork>(&*self.runtime, &request)
             .await
             .map(|view| self.workspace_ref(view))
     }

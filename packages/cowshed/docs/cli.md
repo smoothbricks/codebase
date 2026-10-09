@@ -34,7 +34,7 @@ only for an established content integrity failure, never for a summary mismatch 
 The JSON envelope is uniform:
 
 ```
-$ cowshed new raven --json
+$ cowshed fork raven --json
 {"ok":true,"result":{"workspace":"raven","mount":"<project-root>/.cowshed/raven","baseCommit":"6f3a2c1"}}
 
 $ cowshed path nonesuch --json
@@ -203,7 +203,7 @@ succeeded. It still exits 6.
 The stranded-user recovery, after a reboot left the store unmounted:
 
 ```
-$ cowshed new raven
+$ cowshed fork raven
 cowshed: cowshed.store is not mounted at /private/cowshed/store
 next: cowshed setup
 
@@ -351,8 +351,8 @@ cowshed: created dedicated volume cowshed.store (space-sharing, excluded from ba
 cowshed: creating image /private/cowshed/store/acme/widget/main.dmg (capacity 100g)
 cowshed: copying 8,357,293 objects into the image (this is the one-time cost)
 cowshed: verifying tree against source ... ok
-cowshed: swapping <project-root> -> mountpoint
-next: cowshed new <name>
+cowshed: swapping <project-root> -> mountpoint (stub .envrc written beneath)
+next: cowshed fork <ws>
 <project-root>
 ```
 
@@ -427,37 +427,37 @@ Two namespaces both present, or a malformed intent, are refused by name instead 
 `--repo-id` is an identity override, not a remote check. `origin` may already point at the renamed repository, may still
 use the old path, or may be absent; cowshed does not inspect or rewrite it.
 
-### `cowshed new <name> [--ref <rev> | --from <workspace>] [--browse] [--slot <n>]`
+### `cowshed fork [<src>] <ws> [--clean] [--ref <rev>] [--browse] [--slot <n>] [--register] [--git-worktree]`
 
-Clones a live image from the repository selected by cwd or `--project`, then mounts it. The source is that repository's
-`main` by default. A clone of main starts at main's committed `HEAD`: main's uncommitted edits and untracked files stay
-in main, while ignored paths (installed dependencies, build outputs, build state) arrive warm:
+Clones a live image from the selected repository and mints its own `cowshed/<ws>` branch. The source defaults to main
+and may be any session. By default tracked edits, untracked files, dependencies and build state all carry warm.
+`--clean` resets tracked edits and removes nonignored untracked paths; ignored build state stays.
 
 ```sh
 cd ~/src/api
-cowshed new raven
+cowshed fork raven
 ```
 
 From another cwd, select the same repository explicitly:
 
 ```sh
-cowshed new raven --project ~/src/api
+cowshed fork raven --project ~/src/api
 ```
 
-Use `--from` to clone another workspace inside the selected repository:
+Name a source to clone another workspace inside the selected repository:
 
 ```sh
-cowshed new raven-alt --from raven --project ~/src/api
+cowshed fork raven raven-alt --project ~/src/api
 ```
 
-Cross-repository `--from` is forbidden; select another repository with cwd or `--project` instead. `--ref` starts the
-new Git branch at another revision and is mutually exclusive with `--from`. The storage clone remains warm regardless.
-`--browse` makes the volume visible in Finder; the default mount is nobrowse.
+Sources never cross repositories. Select another repository with cwd or `--project`. `--ref` implies clean and starts
+the new branch at a revision the source holds. Linked sources first establish clone-owned Git before cleaning, never
+changing the source index. `--browse` makes the volume visible in Finder; the default mount is nobrowse.
 
 A symlink the source left pointing outside its tree, such as a `bun install` `link:` dependency, is rewritten in the new
-workspace to the absolute path it named in the source: `main`, or the `--from` workspace, whatever its depth. In-tree
-relative links keep their bytes. A link whose target is missing from the source refuses the clone by name and rewrites
-nothing; repair it in the source, then rerun the same `cowshed new` to resume.
+workspace to the absolute path it named in the source: main or a session, whatever its depth. In-tree relative links
+keep their bytes. A link whose target is missing from the source refuses the clone by name and rewrites nothing; repair
+it in the source, then rerun the same `cowshed fork` to resume.
 
 `--slot <n>` binds the workspace to a build slot, so it mounts at that slot's stable path instead of one named after it
 — see [`cowshed path --slot`](#cowshed-path---slot-n--build-slots-and-compiler-cache-reuse). A slot already held by
@@ -498,7 +498,7 @@ path is always live; pass `--no-attach` to skip the remount and get the would-be
 
 ### `cowshed path --slot <n>` — build slots and compiler-cache reuse
 
-A **build slot** is one stable mount path, occupied by one workspace at a time. `cowshed new <name> --slot 3` binds slot
+A **build slot** is one stable mount path, occupied by one workspace at a time. `cowshed fork <ws> --slot 3` binds slot
 3, and that workspace mounts at `<project-root>/.cowshed/slot-3` instead of `.../<name>`. When it is removed or renamed
 the slot is released, and the next workspace to take slot 3 mounts at exactly the same absolute path.
 

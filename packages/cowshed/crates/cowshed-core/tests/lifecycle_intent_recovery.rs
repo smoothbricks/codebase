@@ -4,11 +4,12 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use cowshed_core::api::{AdoptOptions, CreateOptions, RemoveOptions, RemoveReport};
+use cowshed_core::api::{AdoptOptions, RemoveOptions, RemoveReport};
+use cowshed_os::fork_lock::{Run as _, Spawn as _};
 use cowshed_core::metadata::{WorkspaceIncarnation, WorkspaceName};
 use cowshed_core::storage::recovery::{
     IntentLease, LIFECYCLE_INTENTS_FILE, LifecycleIntent, LifecycleIntentCompletion,
-    LifecycleIntentJournal, LifecycleIntentPhase,
+    LifecycleIntentJournal, LifecycleIntentPhase, MintOptions,
 };
 use cowshed_os::fork_lock::{Run as _, Spawn as _};
 
@@ -46,12 +47,32 @@ impl Drop for TestRoot {
 fn workspace(value: &str) -> WorkspaceName {
     WorkspaceName::new(value).expect("fixture workspace name")
 }
+#[test]
+fn historical_create_and_fork_tags_remain_readable_without_public_aliases() {
+    let old_create = serde_json::json!({
+        "kind": "create", "workspace": "raven",
+        "options": { "revision": { "branch": "main" }, "fromWorkspace": "main",
+            "browse": false, "register": false, "gitWorktree": false }
+    });
+    let LifecycleIntent::Create { options, .. } =
+        serde_json::from_value(old_create).expect("historical create")
+    else {
+        panic!("expected historical create")
+    };
+    assert_eq!(
+        options.clean, None,
+        "the old main-only clean rule remains distinguishable"
+    );
+    let old_fork = serde_json::json!({ "kind": "fork", "source": "main", "destination": "raven" });
+    let fork: LifecycleIntent = serde_json::from_value(old_fork.clone()).expect("historical fork");
+    assert_eq!(serde_json::to_value(fork).unwrap(), old_fork);
+}
 
 fn intent(operation: &str) -> LifecycleIntent {
     match operation {
         "create" => LifecycleIntent::Create {
             workspace: workspace("created"),
-            options: CreateOptions::default(),
+            options: MintOptions::default(),
         },
         "fork" => LifecycleIntent::Fork {
             source: workspace("main"),
@@ -254,7 +275,7 @@ fn prepared_retirement_of_one_workspace_cannot_block_an_unrelated_command() {
     journal.begin(retire("unrelated", RemoveOptions::default()));
     journal.begin(LifecycleIntent::Create {
         workspace: workspace("requested"),
-        options: CreateOptions::default(),
+        options: MintOptions::default(),
     });
 
     assert!(journal.discard_prepared_retirement(&workspace("unrelated")));

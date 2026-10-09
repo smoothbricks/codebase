@@ -42,7 +42,6 @@ export interface NativeWorkspaceRefOperations
 export interface NativeCoordinatorOperations
   extends NativeCoordinatorRename,
     NativeCoordinatorAdopt,
-    NativeCoordinatorCreate,
     NativeCoordinatorFork,
     NativeCoordinatorMoveCheckout,
     NativeCoordinatorChangeRepoId,
@@ -152,24 +151,6 @@ export async function coordinatorChangeRepoId(
   return handle.changeRepoId(JSON.stringify(args));
 }
 
-/** A handle that serves `coordinator.create`. */
-export interface NativeCoordinatorCreate {
-  create(argumentsJson: string): Promise<NativeWorkspaceRefHandle>;
-}
-
-/** The request fields a `coordinator.create` caller names; its handle binds the rest. */
-export type CoordinatorCreateArguments = Pick<Api.CreateRequest, 'workspace' | 'options'>;
-
-/**
- * Creates a session workspace from main.
- */
-export async function coordinatorCreate(
-  handle: NativeCoordinatorCreate,
-  args: CoordinatorCreateArguments,
-): Promise<NativeWorkspaceRefHandle> {
-  return handle.create(JSON.stringify(args));
-}
-
 /** A handle that serves `coordinator.defragment`. */
 export interface NativeCoordinatorDefragment {
   defragment(argumentsJson: string): Promise<string>;
@@ -248,10 +229,10 @@ export interface NativeCoordinatorFork {
 }
 
 /** The request fields a `coordinator.fork` caller names; its handle binds the rest. */
-export type CoordinatorForkArguments = Pick<Api.SourceDestinationRequest, 'source' | 'destination'>;
+export type CoordinatorForkArguments = Pick<Api.ForkRequest, 'workspace' | 'source' | 'options'>;
 
 /**
- * Forks a workspace into a new session workspace.
+ * Mints a warm workspace from main or an explicit source.
  */
 export async function coordinatorFork(
   handle: NativeCoordinatorFork,

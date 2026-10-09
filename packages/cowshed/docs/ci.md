@@ -26,9 +26,10 @@ Nix and a cowshed store already available" necessarily means **self-hosted**.
 
 - **`github`** runs the existing `setup-devenv` path: Nix install, caches, devenv build.
 - **`cowshed`** requires `cowshed` on the runner's `PATH` and an adopted checkout. It creates a workspace named
-  `ci-<run_id>` at the job's commit with `cowshed new`, publishes its mount as `steps.cowshed.outputs.workspace-path`,
-  and exports `COWSHED_CI_WORKSPACE` and `COWSHED_CI_WORKSPACE_PATH`. A composite action cannot register a post-job
-  hook, so reclaim the workspace with a final `if: always()` step running `cowshed rm "$COWSHED_CI_WORKSPACE"`.
+  `ci-<run_id>` at the job's commit with `cowshed fork --ref`, publishes its mount as
+  `steps.cowshed.outputs.workspace-path`, and exports `COWSHED_CI_WORKSPACE` and `COWSHED_CI_WORKSPACE_PATH`. A
+  composite action cannot register a post-job hook, so reclaim the workspace with a final `if: always()` step running
+  `cowshed rm "$COWSHED_CI_WORKSPACE"`.
 - **`auto`** picks `cowshed` when the binary is on `PATH`, else `github`.
 
 The action only provisions an environment and publishes a cwd. It does not wrap later steps: a step runs inside the

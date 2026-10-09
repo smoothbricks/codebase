@@ -61,13 +61,13 @@ impl MainRemote {
 
 /// The two trees a freshly cloned workspace answers to at mint.
 ///
-/// They are one tree only under a plain `cowshed new`. Under `--from` the image came from a
+/// They are one tree only when a fork's source is main. With an explicit session source the image came from a
 /// sibling mounted at another depth than main, and every byte the clone inherited was written
 /// there: resolving those bytes against main instead names paths nobody wrote. Named fields
 /// rather than two positional paths, because swapping them is exactly that failure.
 #[derive(Clone, Copy, Debug)]
 pub struct CloneOrigin<'a> {
-    /// The mount whose image was cloned — main, or the `--from` workspace. Escaping symlinks
+    /// The mount whose image was cloned — main, or the named source workspace. Escaping symlinks
     /// and the Git identity are re-resolved against it.
     pub source: &'a Path,
     /// Main's canonical mount. The `main` remote and a linked-worktree registration name it
@@ -1488,21 +1488,30 @@ impl GitRepository {
         origin: CloneOrigin<'_>,
         repository: WorkspaceRepository,
         start: Option<&str>,
+        clean: bool,
         resuming: bool,
     ) -> Result<()> {
-        if origin.source == origin.main {
-            timed_async("new", "head", self.discard_uncommitted()).await?;
+        if clean && self.root.join(".git").is_dir() {
+            timed_async("fork", "head", self.discard_uncommitted()).await?;
         }
         // Before any branch is checked out, so only what the clone inherited is judged. On resume
         // every link still holds either the source's bytes or the absolute target an earlier pass
         // derived from those same bytes, so the source remains the producer to resolve against.
-        timed_async("new", "links", self.restore_inherited_links(origin.source)).await?;
+        timed_async("fork", "links", self.restore_inherited_links(origin.source)).await?;
         match repository {
             WorkspaceRepository::LinkedWorktree => {
                 // Registration may have replaced the cloned `.git` directory with a pointer
                 // before a kill. Resume that state machine before preparing workspace Git.
-                self.adopt_as_linked_worktree_resumable(name, origin.main, start, resuming)
-                    .await?;
+                let source_head = Self::from_root(origin.source).head_oid().await?;
+                self.adopt_as_linked_worktree_resumable(
+                    name,
+                    origin.main,
+                    Some(source_head.as_str()),
+                    start,
+                    clean,
+                    resuming,
+                )
+                .await?;
             }
             WorkspaceRepository::Standalone => {
                 self.prepare_workspace(name, origin.main, start, resuming)
@@ -1514,21 +1523,17 @@ impl GitRepository {
         // failing for want of an identity. Only the source's context resolves the operator's
         // `includeIf gitdir:` rules, and a fork of a workspace that already inherited one no
         // longer needs the operator's global file at all.
-        timed_async("new", "identity", self.inherit_identity_from(origin.source)).await
+        timed_async(
+            "fork",
+            "identity",
+            self.inherit_identity_from(origin.source),
+        )
+        .await
     }
 
-    /// A clone of main starts at main's committed `HEAD` (02_workspaces.md, "The
-    /// safe-to-clone-main invariant"): main's uncommitted edits belong to main's user. Tracked
-    /// changes are reset from `HEAD`, and untracked files and directories Git does not ignore are
-    /// deleted. Ignored paths stay, so installed dependencies, build outputs and every build-state
-    /// link the clone inherited stay warm; a reset rewrites only the files that differ, so every
-    /// other mtime is kept.
-    ///
-    /// Runs against the clone's own `.git` directory, before a linked worktree replaces it; once
-    /// it is a pointer, an earlier pass of this resumed mint already ran it. The clone's excludes
-    /// are brought up to date first: the clone is its volume's root, whose bookkeeping macOS
-    /// may have grown at mount (a root-owned `.Trashes` this user cannot empty), and main's
-    /// exclude file may predate the patterns that keep a clean off it.
+    /// Opt-in clean discards tracked edits and nonignored untracked paths, keeping ignored warmth.
+    /// Only call through clone-owned Git: a linked source's inherited pointer must first be
+    /// replaced by the clone's registration/index, never reset through the source registration.
     async fn discard_uncommitted(&self) -> Result<()> {
         if !self.root.join(".git").is_dir() {
             return Ok(());
@@ -1542,10 +1547,10 @@ impl GitRepository {
             refresh,
         )?;
         let reset = self.run(["reset", "-q", "--hard", "HEAD"]).await?;
-        ensure_git_success("reset main's uncommitted edits in the clone", reset)?;
+        ensure_git_success("reset source edits in the clone", reset)?;
         self.ensure_cowshed_excludes().await?;
         let clean = self.run(["clean", "-q", "-f", "-d"]).await?;
-        ensure_git_success("delete main's untracked files in the clone", clean)
+        ensure_git_success("delete nonignored untracked files in the clone", clean)
     }
 
     /// Configure local-only workspace Git. A fresh preparation refuses an existing branch; it
@@ -1566,13 +1571,13 @@ impl GitRepository {
         }
         // Before any branch is judged: an inherited registration may hold `cowshed/<name>`.
         timed_async(
-            "new",
+            "fork",
             "worktrees",
             self.strip_inherited_worktree_registrations(),
         )
         .await?;
 
-        let retry = format!("remove or rename cowshed/{name}, then retry: cowshed new {name}");
+        let retry = format!("remove or rename cowshed/{name}, then retry: cowshed fork {name}");
         let (branch, branch_ready) = self
             .workspace_branch_for_initialization(name, "the cloned workspace", retry, resuming)
             .await?;
@@ -1580,7 +1585,7 @@ impl GitRepository {
         // The `.git` directory arrived by CoW carrying every remote main had, including network
         // URLs. Replaying this loop is safe: an earlier pass leaves either no remotes or the local
         // cowshed-owned `main`, which configure_main_remote recreates below.
-        timed_async("new", "remotes", async {
+        timed_async("fork", "remotes", async {
             for remote in self.remote_names().await? {
                 let output = self.run(["remote", "remove", remote.as_str()]).await?;
                 ensure_git_success("remove inherited remote", output)?;
@@ -1588,10 +1593,14 @@ impl GitRepository {
             Ok::<_, CowshedError>(())
         })
         .await?;
-        let main_remote =
-            timed_async("new", "main-remote", self.configure_main_remote(main_mount)).await?;
+        let main_remote = timed_async(
+            "fork",
+            "main-remote",
+            self.configure_main_remote(main_mount),
+        )
+        .await?;
 
-        timed_async("new", "branch", async {
+        timed_async("fork", "branch", async {
             if branch_ready {
                 let (_, branch_ref) = workspace_branch(name);
                 self.ensure_workspace_branch_checked_out(&branch, &branch_ref)
@@ -1605,7 +1614,7 @@ impl GitRepository {
     }
 
     /// Drop the linked-worktree registrations this standalone clone inherited from main, before any
-    /// branch is judged against them (02_workspaces.md, `cowshed new`, step 6).
+    /// branch is judged against them (02_workspaces.md, fork mint step 6).
     async fn strip_inherited_worktree_registrations(&self) -> Result<()> {
         let root = self.root.clone();
         tokio::task::spawn_blocking(move || strip_inherited_registrations(&root))
@@ -1615,15 +1624,18 @@ impl GitRepository {
             })?
     }
 
-    /// Re-resolve this tree's symlinks that point outside it, against the tree they came from.
+    /// Re-resolve this tree's symlinks that point outside it or into the tree they came from,
+    /// against that tree.
     ///
     /// Runs at mint, where the workspace is still cowshed's: a link that escapes the root is
     /// generated state carrying its source tree's depth, in the same way an inherited remote
     /// carries main's URLs, and neither is the user's yet.
     ///
-    /// Only escaping links are rewritten. That predicate is what keeps the step affordable on
-    /// a tree whose whole value is being ready in seconds — the walk reads directory entries
-    /// and rewrites the handful of links that need it, rather than reinstalling anything.
+    /// Only escaping links and absolute links into the source tree are rewritten; the latter
+    /// become relative links to the same path in this tree. That predicate keeps the step
+    /// affordable on a tree whose whole value is being ready in seconds — the walk reads
+    /// directory entries and rewrites the handful of links that need it, rather than reinstalling
+    /// anything.
     ///
     /// An escaping link whose source-tree target does not exist is refused by name rather than
     /// repointed at a guess, and the refusal writes nothing. It is broken in the source tree
@@ -1945,7 +1957,7 @@ impl GitRepository {
     }
 
     /// Turn this freshly cloned image into a registered linked worktree of the repository at
-    /// `main_mount`, then create the session branch — `cowshed new --git-worktree`.
+    /// `main_mount`, then create the session branch — `cowshed fork --git-worktree`.
     ///
     /// `self.root` is the workspace mount; `main_mount` is main's *canonical mount*, never the
     /// recorded checkout path, for the same reason the `main` remote uses it: a registration
@@ -1968,7 +1980,7 @@ impl GitRepository {
         main_mount: &Path,
         start: Option<&str>,
     ) -> Result<()> {
-        self.adopt_as_linked_worktree_resumable(name, main_mount, start, false)
+        self.adopt_as_linked_worktree_resumable(name, main_mount, None, start, false, false)
             .await
     }
 
@@ -1978,7 +1990,9 @@ impl GitRepository {
         &self,
         name: &str,
         main_mount: &Path,
+        source_head: Option<&str>,
         start: Option<&str>,
+        clean: bool,
         resuming: bool,
     ) -> Result<()> {
         if !main_mount.is_absolute() {
@@ -1989,7 +2003,7 @@ impl GitRepository {
         }
         let main = Self::from_root(main_mount);
         let retry = format!(
-            "remove or rename cowshed/{name}, then retry: cowshed new {name} --git-worktree"
+            "remove or rename cowshed/{name}, then retry: cowshed fork {name} --git-worktree"
         );
         let (branch, branch_ref) = workspace_branch(name);
         let branch_exists = main
@@ -2030,7 +2044,14 @@ impl GitRepository {
         }
 
         if !admin.exists() {
-            let head = main.head_oid().await?;
+            let fallback_head;
+            let head = match source_head.or(start) {
+                Some(start) => start,
+                None => {
+                    fallback_head = main.head_oid().await?;
+                    fallback_head.as_str()
+                }
+            };
             tokio::task::spawn_blocking({
                 let dot_git = dot_git.clone();
                 let staging = staging.clone();
@@ -2065,7 +2086,7 @@ impl GitRepository {
                     OsStr::new("--no-checkout"),
                     OsStr::new("--detach"),
                     staged.as_os_str(),
-                    OsStr::new(head.as_str()),
+                    OsStr::new(head),
                 ],
             )
             .await?;
@@ -2125,6 +2146,9 @@ impl GitRepository {
         main.repair_linked_worktree(&mount).await?;
         let reset = self.run(["reset", "-q"]).await?;
         ensure_git_success("populate linked worktree index", reset)?;
+        if clean {
+            self.discard_uncommitted().await?;
+        }
         if branch_ready {
             let (_, branch_ref) = workspace_branch(name);
             self.ensure_workspace_branch_checked_out(&branch, &branch_ref)
@@ -2874,7 +2898,7 @@ pub fn is_hidden_path(path: &[u8]) -> bool {
 }
 
 /// Remove the linked-worktree registrations a standalone clone inherited from its source
-/// (02_workspaces.md, `cowshed new`, step 6). Each `.git/worktrees/<id>` directory describes a
+/// (02_workspaces.md, fork mint step 6). Each `.git/worktrees/<id>` directory describes a
 /// worktree of the source repository, so removing that whole directory is the unregistration and
 /// nothing else. Every entry is judged before the first removal, so a refusal leaves the clone as
 /// it was. An absent `worktrees` directory is success, which keeps a resumed mint idempotent.
@@ -3189,6 +3213,130 @@ mod tests {
         fixture
     }
 
+    #[tokio::test]
+    async fn fork_carry_clean_and_ref_preserve_source_bytes_and_index() {
+        for linked in [false, true] {
+            for session in [false, true] {
+                let main = repository();
+                fs::write(main.join(".gitignore"), "/ignored/\n").unwrap();
+                fs::write(main.join("staged.txt"), "base\n").unwrap();
+                git(&main, &["add", "."]);
+                git(&main, &["commit", "-qm", "warm baseline"]);
+                let baseline = git_stdout(&main, &["rev-parse", "HEAD"]).trim().to_owned();
+                let sibling = main.with_extension("source");
+                let source = if session {
+                    if linked {
+                        git(
+                            &main,
+                            &[
+                                "worktree",
+                                "add",
+                                "-q",
+                                "-b",
+                                "source",
+                                sibling.to_str().unwrap(),
+                            ],
+                        );
+                    } else {
+                        copy_tree(&main, &sibling);
+                        git(&sibling, &["switch", "-qc", "source"]);
+                    }
+                    fs::write(sibling.join("README"), "session committed\n").unwrap();
+                    git(&sibling, &["add", "README"]);
+                    git(
+                        &sibling,
+                        &["commit", "-qm", "session head differs from main"],
+                    );
+                    sibling.as_path()
+                } else {
+                    &*main
+                };
+                fs::write(source.join("README"), "source working edit\n").unwrap();
+                fs::write(source.join("staged.txt"), "index-only edit\n").unwrap();
+                git(source, &["add", "staged.txt"]);
+                fs::write(source.join("staged.txt"), "base\n").unwrap();
+                fs::write(source.join("stray.txt"), "untracked\n").unwrap();
+                fs::create_dir_all(source.join("ignored")).unwrap();
+                fs::write(source.join("ignored/warm"), "installed build state\n").unwrap();
+                let branch = git_stdout(source, &["branch", "--show-current"]);
+                let status = git_stdout(source, &["status", "--porcelain"]);
+                let head = git_stdout(source, &["rev-parse", "HEAD"]);
+                let index_path = git_stdout(source, &["rev-parse", "--git-path", "index"]);
+                let index_path = source.join(index_path.trim());
+                let index = fs::read(&index_path).unwrap();
+                for (choice, clean, start) in [
+                    ("carry", false, None),
+                    ("clean", true, None),
+                    ("ref", true, Some(baseline.as_str())),
+                ] {
+                    let name = format!("fork-{linked}-{session}-{choice}");
+                    let clone = main.with_extension(&name);
+                    copy_tree(source, &clone);
+                    GitRepository::from_root(&clone)
+                        .mint_workspace(
+                            &name,
+                            CloneOrigin {
+                                source,
+                                main: &main,
+                            },
+                            if linked {
+                                WorkspaceRepository::LinkedWorktree
+                            } else {
+                                WorkspaceRepository::Standalone
+                            },
+                            start,
+                            clean,
+                            false,
+                        )
+                        .await
+                        .unwrap_or_else(|error| panic!("{name}: {error}"));
+                    assert_eq!(
+                        git_stdout(&clone, &["branch", "--show-current"]).trim(),
+                        format!("cowshed/{name}")
+                    );
+                    assert_eq!(
+                        git_stdout(&clone, &["rev-parse", "HEAD"]).trim(),
+                        start.unwrap_or(head.trim())
+                    );
+                    assert_eq!(
+                        fs::read_to_string(clone.join("ignored/warm")).unwrap(),
+                        "installed build state\n"
+                    );
+                    assert_eq!(clone.join("stray.txt").exists(), !clean);
+                    if !clean {
+                        assert_eq!(
+                            fs::read_to_string(clone.join("README")).unwrap(),
+                            "source working edit\n"
+                        );
+                        let staged = git_stdout(&clone, &["show", ":staged.txt"]);
+                        assert_eq!(
+                            staged,
+                            if linked {
+                                "base\n"
+                            } else {
+                                "index-only edit\n"
+                            }
+                        );
+                    } else {
+                        assert_eq!(git_stdout(&clone, &["status", "--porcelain"]), "");
+                    }
+                    assert_eq!(git_stdout(source, &["branch", "--show-current"]), branch);
+                    assert_eq!(git_stdout(source, &["rev-parse", "HEAD"]), head);
+                    assert_eq!(git_stdout(source, &["status", "--porcelain"]), status);
+                    assert_eq!(
+                        fs::read(&index_path).unwrap(),
+                        index,
+                        "source index must never be reset"
+                    );
+                    assert_eq!(
+                        fs::read_to_string(source.join("README")).unwrap(),
+                        "source working edit\n"
+                    );
+                }
+            }
+        }
+    }
+
     fn command_output(exit_code: i32, stderr: &[u8]) -> Output {
         Output {
             status: ExitStatus::from_raw(exit_code << 8),
@@ -3360,6 +3508,7 @@ mod tests {
                 WorkspaceRepository::Standalone,
                 None,
                 false,
+                false,
             )
             .await
             .expect("a plain Git repository requires no shell configuration");
@@ -3416,6 +3565,7 @@ mod tests {
                 },
                 WorkspaceRepository::Standalone,
                 None,
+                true,
                 false,
             )
             .await
@@ -3493,6 +3643,7 @@ mod tests {
                 WorkspaceRepository::Standalone,
                 None,
                 false,
+                false,
             )
             .await
             .expect("mint beside the volume's bookkeeping");
@@ -3535,6 +3686,7 @@ mod tests {
                     },
                     WorkspaceRepository::Standalone,
                     None,
+                    false,
                     false,
                 )
                 .await
@@ -3934,7 +4086,7 @@ mod tests {
             .expect("initial linked worktree");
 
         workspace
-            .adopt_as_linked_worktree_resumable("raven", &main, None, true)
+            .adopt_as_linked_worktree_resumable("raven", &main, None, None, false, true)
             .await
             .expect("resume linked worktree");
         assert_eq!(
@@ -3953,7 +4105,7 @@ mod tests {
     /// Where the source's `link:` dependency sits in every tree, relative to the tree root.
     const LINKED_PACKAGE: &str = "node_modules/@scope/pkg";
 
-    /// Main, a `--from` source and the new workspace at three different depths. The source holds
+    /// Main, a session source and the new workspace at three different depths. The source holds
     /// what `bun install` leaves for a `link:` dependency — a relative link that climbs out of the
     /// tree into an immutable global install — beside an ordinary in-tree relative link.
     struct ThreeDepths {
@@ -4003,6 +4155,8 @@ mod tests {
             fs::create_dir_all(source.join("vendor/lib")).expect("in-tree target");
             fs::create_dir_all(source.join("packages/app")).expect("in-tree link parent");
             symlink("../../vendor/lib", source.join("packages/app/lib")).expect("in-tree link");
+            symlink(source.join("vendor/lib"), source.join("packages/app/own"))
+                .expect("absolute link into the source");
 
             // Main sits deeper than the source, so the same bytes resolved from main land on a
             // real directory: the silent wrong answer, not merely a dangling one.
@@ -4063,6 +4217,17 @@ mod tests {
                 lib.canonicalize().expect("in-tree link resolves"),
                 self.destination.join("vendor/lib"),
                 "an in-tree link resolves inside the clone"
+            );
+            let own = self.destination.join("packages/app/own");
+            assert_eq!(
+                fs::read_link(&own).expect("absolute link into the source"),
+                Path::new("../../vendor/lib"),
+                "an absolute link into the source is re-spelled relative to the clone's own copy"
+            );
+            assert_eq!(
+                own.canonicalize().expect("re-spelled link resolves"),
+                self.destination.join("vendor/lib"),
+                "never the source's"
             );
         }
 
@@ -4126,6 +4291,7 @@ mod tests {
                 WorkspaceRepository::Standalone,
                 None,
                 false,
+                false,
             )
             .await
             .expect("mint standalone workspace");
@@ -4144,6 +4310,7 @@ mod tests {
                 trees.origin(),
                 WorkspaceRepository::LinkedWorktree,
                 None,
+                false,
                 false,
             )
             .await
@@ -4181,6 +4348,7 @@ mod tests {
                 WorkspaceRepository::Standalone,
                 None,
                 false,
+                false,
             )
             .await
             .expect_err("an escaping link its source cannot resolve fails closed");
@@ -4210,6 +4378,7 @@ mod tests {
                 trees.origin(),
                 WorkspaceRepository::Standalone,
                 None,
+                false,
                 true,
             )
             .await

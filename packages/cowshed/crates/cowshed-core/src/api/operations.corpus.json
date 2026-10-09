@@ -17,12 +17,12 @@
   },
   "coordinator.rename": { "repoId": "acme/widget", "source": "feature", "destination": "renamed" },
   "coordinator.adopt": { "repoId": "acme/widget", "options": { "quarantine": false, "reAdopt": false } },
-  "coordinator.create": {
+  "coordinator.fork": {
     "repoId": "acme/widget",
     "workspace": "feature",
-    "options": { "browse": false, "gitWorktree": false, "register": false }
+    "source": "main",
+    "options": { "clean": false, "browse": false, "gitWorktree": false, "register": false }
   },
-  "coordinator.fork": { "repoId": "acme/widget", "source": "main", "destination": "feature" },
   "coordinator.moveCheckout": { "repoId": "acme/widget", "destination": "/trusted/acme/moved" },
   "coordinator.changeRepoId": { "repoId": "acme/widget", "newRepoId": "acme/gadget" },
   "coordinator.grant": { "repoId": "acme/widget", "workspace": "feature", "delta": {} },
