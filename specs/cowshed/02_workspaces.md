@@ -195,6 +195,11 @@ each clone and is never reported; a relative include that climbs out of the repo
 is. The answer depends only on the host's git configuration and the mount root, never on a workspace, so `new` does not
 repeat it.
 
+Linked Git worktrees share their primary checkout's config. Managed shell setup retains that primary checkout's
+repo-relative `tooling/workspace.gitconfig` include; it never retargets the shared config to the linked caller's foreign
+tree. A standalone gitdir pointer without a `commondir` still owns its own checkout's include. Entering a linked
+worktree cannot make Main or a clone require read access to that worktree.
+
 Cowshed does not compensate beyond reporting. Capturing the effective identity at adopt time and stamping it as
 repo-local config would snapshot one moment of a configuration the user keeps editing, and would then silently diverge
 from it; honoring the path condition by telling the user exactly which rule to extend is the only faithful behavior.

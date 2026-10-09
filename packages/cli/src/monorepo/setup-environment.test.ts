@@ -1730,6 +1730,51 @@ describe('the workspace git config', () => {
     });
   });
 
+  it('keeps the shared primary include unchanged when a real linked worktree enters twice', async () => {
+    await withManagedRepository({}, async (original) => {
+      expect(await original.enterShell()).toEqual(HEALTHY);
+      const config = join(original.root, '.git', 'config');
+      const before = readFileSync(config, 'utf8');
+      const writes = original.gitConfigWrites().length;
+      await git(original.root, ['add', 'package.json', '.npmrc', '.envrc', 'tooling']);
+      await git(original.root, [
+        '-c',
+        'user.name=smoo-fixture',
+        '-c',
+        'user.email=smoo-fixture@example.invalid',
+        '-c',
+        'commit.gpgsign=false',
+        'commit',
+        '--quiet',
+        '-m',
+        'seed managed checkout',
+      ]);
+      const scratch = dirname(original.root);
+      const linked = join(scratch, 'linked');
+      await git(original.root, ['worktree', 'add', '--quiet', '--detach', linked, 'HEAD']);
+      await cp(join(original.root, 'node_modules'), join(linked, 'node_modules'), {
+        recursive: true,
+        verbatimSymlinks: true,
+      });
+      await writeFile(join(linked, 'tooling', 'workspace.gitconfig'), '[smoo]\n\tcheckout = linked\n');
+      const entry = repository(linked, join(scratch, 'ledgers'), join(scratch, 'bin'));
+      expect(await entry.enterShell()).toEqual(HEALTHY);
+      expect(await entry.enterShell()).toEqual(HEALTHY);
+      expect(readFileSync(config, 'utf8')).toBe(before);
+      expect(original.gitConfigWrites()).toHaveLength(writes);
+      await chmod(join(linked, 'tooling', 'workspace.gitconfig'), 0o000);
+      try {
+        expect(await git(original.root, ['config', '--get-all', 'include.path'])).toBe(
+          '../tooling/workspace.gitconfig\n',
+        );
+        expect(await git(original.root, ['config', 'smoo.checkout'])).toBe('original\n');
+        expect(await git(linked, ['config', 'smoo.checkout'])).toBe('original\n');
+      } finally {
+        await chmod(join(linked, 'tooling', 'workspace.gitconfig'), 0o644);
+      }
+    });
+  });
+
   it('is written by one shell entry at a time when two start on a clean config', async () => {
     // Two shells entering one checkout at once — a pool warming a spare beside a command's own
     // activation — must not both write .git/config: git takes config.lock with O_EXCL, and

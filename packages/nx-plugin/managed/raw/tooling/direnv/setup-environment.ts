@@ -1035,9 +1035,10 @@ interface RepositorySetting {
  * absolute path names the checkout that first wrote it: a copy-on-write clone
  * copies .git/config verbatim, and git refuses to run at all — `fatal: unable
  * to access` — when an include exists but cannot be read, which is exactly
- * what the original checkout is from inside a sandboxed clone. Every include
- * of a workspace.gitconfig is replaced; any other include the user added
- * stays.
+ * what the original checkout is from inside a sandboxed clone. Linked worktrees
+ * share their primary checkout's config, so they retain that checkout's
+ * repo-relative include instead of retargeting it into the worktree. Other
+ * includes the user added stay.
  *
  * Reads and writes therefore go through nothing of git's repository
  * discovery: the config file is located on disk and read and edited with
@@ -1045,12 +1046,13 @@ interface RepositorySetting {
  * follows no stale include.
  */
 async function keepRepositoryConfig(root: string): Promise<void> {
-  const configFile = repositoryConfigFile(root);
+  const config = repositoryConfig(root);
+  const configFile = config.file;
   const outside = path.parse(configFile).root;
   const settings: RepositorySetting[] = [
     {
       key: 'include.path',
-      value: path.relative(path.dirname(configFile), path.join(root, 'tooling', 'workspace.gitconfig')),
+      value: path.relative(path.dirname(configFile), path.join(config.checkout, 'tooling', 'workspace.gitconfig')),
       replaces: '(^|/)tooling/workspace\\.gitconfig$',
     },
     // Keep the newer runtime version pins on any merge (nvfetcher overlay +
@@ -1096,14 +1098,14 @@ async function keepRepositoryConfig(root: string): Promise<void> {
 }
 
 /**
- * The config file git reads as this checkout's local config: `.git/config`,
- * or, when `.git` is a worktree's `gitdir:` pointer, the config in that
- * worktree's common directory.
+ * The config file and checkout whose include it owns. A standalone gitdir
+ * pointer keeps its checkout; a linked worktree's commondir keeps the primary
+ * checkout, never the linked caller.
  */
-function repositoryConfigFile(root: string): string {
+function repositoryConfig(root: string): { file: string; checkout: string } {
   const dotGit = path.join(root, '.git');
   if (statSync(dotGit).isDirectory()) {
-    return path.join(dotGit, 'config');
+    return { file: path.join(dotGit, 'config'), checkout: root };
   }
   const pointer = /^gitdir: (.+)$/m.exec(readFileSync(dotGit, 'utf8'));
   if (pointer?.[1] === undefined) {
@@ -1111,7 +1113,9 @@ function repositoryConfigFile(root: string): string {
   }
   const gitDir = path.resolve(root, pointer[1].trim());
   const commonDir = readFileIfPresent(path.join(gitDir, 'commondir'));
-  return path.join(commonDir === null ? gitDir : path.resolve(gitDir, commonDir.toString('utf8').trim()), 'config');
+  if (commonDir === null) return { file: path.join(gitDir, 'config'), checkout: root };
+  const common = path.resolve(gitDir, commonDir.toString('utf8').trim());
+  return { file: path.join(common, 'config'), checkout: path.dirname(common) };
 }
 
 function reportSetupFailure(error: unknown): never {
