@@ -48,6 +48,13 @@ pub enum InputAdmissionError {
         row: u32,
         cause: VoRefusal,
     },
+    /// Binding the program's row-expression table failed; nothing was
+    /// admitted or run.
+    Rows(ErrorCode),
+    /// The program carries a row-expression table but was run without
+    /// binding it. Its scopes and VO columns may be derived, so admission
+    /// reads the bound columns: run it through `AdmittedProgram::execute_bound`.
+    UnboundRows,
 }
 
 /// Reusable working memory of [`InputPlan::admit_and_execute`]: per-input

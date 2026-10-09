@@ -310,7 +310,7 @@ impl Entry<'_> {
 /// The row-expression table of `program`: `None` when the content ends with
 /// the reduce section. A program too short for its own header, or a trailer
 /// that does not open with the table magic, is `InvalidProgram`.
-fn row_table(program: &[u8]) -> Result<Option<&[u8]>, ErrorCode> {
+pub(crate) fn row_table(program: &[u8]) -> Result<Option<&[u8]>, ErrorCode> {
     let trailer = ProgramHeader::sections(program)
         .ok_or(ErrorCode::InvalidProgram)?
         .tail;

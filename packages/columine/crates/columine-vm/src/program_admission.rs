@@ -19,6 +19,7 @@ use columine_types::vo::{
 use crate::counts_fold::CountsFoldOp;
 use crate::element_body::{InvalidSource, SourceOp, visit_source_ops};
 use crate::program_inputs::InputPlan;
+use crate::row_exprs::{LiveColumns, RowColumns, RowExpression, bind_row_columns, row_table};
 use crate::state_init;
 use crate::vm::Vm;
 
@@ -68,6 +69,9 @@ pub struct AdmittedProgram<A: VoProgramAdmission> {
     metadata: VoProgramMetadata,
     admission: A,
     inputs: InputPlan,
+    /// Whether the bytecode carries a row-expression table, which only
+    /// [`Self::execute_bound`] binds.
+    binds_rows: bool,
     magic: u32,
     state_size: u32,
 }
@@ -86,6 +90,13 @@ impl<A: VoProgramAdmission> AdmittedProgram<A> {
         let state_size = state_init::calculate_state_size(&bytecode, accepted_magics)
             .map_err(ProgramAdmissionError::InvalidProgram)?;
         let magic = sections.header.magic;
+        let binds_rows = row_table(&bytecode)
+            .map_err(|_| {
+                ProgramAdmissionError::InvalidProgram(
+                    state_init::ProgramInvalidCause::MalformedProgram,
+                )
+            })?
+            .is_some();
         for (index, link) in metadata.fields.iter().enumerate() {
             if metadata.fields[..index]
                 .iter()
@@ -175,6 +186,7 @@ impl<A: VoProgramAdmission> AdmittedProgram<A> {
             metadata,
             admission,
             inputs,
+            binds_rows,
             magic,
             state_size,
         })
@@ -202,8 +214,10 @@ impl<A: VoProgramAdmission> AdmittedProgram<A> {
     }
 
     /// Run an embedding dispatch loop over this certificate's own bytecode
-    /// and certified columns. This is the boundary for live-column or superset
-    /// execution: admission completes before the callback may mutate state.
+    /// and certified columns: admission completes before the callback may
+    /// mutate state. A program with a row-expression table is refused with
+    /// [`InputAdmissionError::UnboundRows`]; it runs through
+    /// [`Self::execute_bound`], so admission reads the columns execution reads.
     pub fn execute_with(
         &self,
         cols: &[&[u8]],
@@ -211,6 +225,9 @@ impl<A: VoProgramAdmission> AdmittedProgram<A> {
         scratch: &mut ProgramScratch,
         execute: impl FnOnce(&[u8], &[&[u8]]) -> u32,
     ) -> Result<u32, InputAdmissionError> {
+        if self.binds_rows {
+            return Err(InputAdmissionError::UnboundRows);
+        }
         self.inputs.admit_and_execute(
             &self.metadata,
             &self.admission,
@@ -218,6 +235,37 @@ impl<A: VoProgramAdmission> AdmittedProgram<A> {
             batch_len,
             scratch,
             |cols| execute(&self.bytecode, cols),
+        )
+    }
+
+    /// Bind the row-expression table over `cols`, admit the selected VO frames
+    /// against that bound column set, then run `execute` on it with the
+    /// batch's live columns. A scope filter, FLAT_MAP offsets or VO column
+    /// may be a derived column, so admission must read the same cells the
+    /// reduce section will: a host placeholder for a derived column is never
+    /// what admission sees. Binding reads `state` and writes only `rows` and
+    /// `cols`; every refusal happens before `execute` runs. A program without
+    /// a table binds nothing and its live columns are empty.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_bound<'a, E: RowExpression>(
+        &'a self,
+        state: &mut [u8],
+        cols: &mut [&'a [u8]],
+        batch_len: u32,
+        scratch: &mut ProgramScratch,
+        eval: &mut E,
+        rows: &'a mut RowColumns,
+        execute: impl FnOnce(&[u8], &mut [u8], &[&[u8]], &mut LiveColumns<'_, '_>) -> u32,
+    ) -> Result<u32, InputAdmissionError> {
+        let mut live = bind_row_columns(&self.bytecode, state, cols, batch_len, eval, rows)
+            .map_err(InputAdmissionError::Rows)?;
+        self.inputs.admit_and_execute(
+            &self.metadata,
+            &self.admission,
+            cols,
+            batch_len,
+            scratch,
+            |cols| execute(&self.bytecode, state, cols, &mut live),
         )
     }
 
@@ -403,5 +451,203 @@ fn visit_counts<'p>(
 impl From<InvalidSource> for ProgramAdmissionError {
     fn from(_: InvalidSource) -> Self {
         Self::InvalidProgram(state_init::ProgramInvalidCause::MalformedProgram)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use columine_types::PROGRAM_MAGIC;
+    use columine_types::types::ErrorCode;
+    use columine_types::vo::{
+        UnavailableVoAdmission, VoAdmissionError, VoFieldLink, VoMetadata, VoProfile,
+        VoProgramMetadata, VoRefusal,
+    };
+
+    use super::{AdmittedProgram, InputAdmissionError, ProgramScratch};
+    use crate::program_inputs::InputPlan;
+    use crate::row_exprs::{BatchView, Binding, ROW_EXPRESSIONS_MAGIC, RowColumns, RowExpression};
+
+    /// The derived column the FOR_EACH reads its type from.
+    const DERIVED: u8 = 4;
+    /// The event type whose rows the table derives `FOR_EACH_TYPE` for.
+    const EVENT: u32 = 1;
+    /// The type the FOR_EACH selects; only the derived column carries it.
+    const FOR_EACH_TYPE: u8 = 7;
+
+    /// One-byte expression `[k]`: the constant `k` for every matched row.
+    struct Constant;
+
+    impl RowExpression for Constant {
+        fn admit(&mut self, expr: &[u8], _: &BatchView<'_>) -> Result<Binding, ErrorCode> {
+            match expr {
+                [_] => Ok(Binding::Bound),
+                _ => Err(ErrorCode::InvalidProgram),
+            }
+        }
+
+        fn eval(&mut self, expr: &[u8], _: &BatchView<'_>, _: u32) -> Result<u32, ErrorCode> {
+            Ok(u32::from(expr[0]))
+        }
+    }
+
+    /// A StructMap slot with one VO field, read under a FOR_EACH whose type
+    /// column is derived by the program's row table from column 0:
+    /// `FOR_EACH(col 4 == 7) { upsert(key col 3, VO pair cols 1/2) }`, and
+    /// the table writes 7 into column 4 for rows of type 1. `expr` is the
+    /// table entry's expression.
+    fn derived_scope_program(expr: &[u8]) -> (Box<[u8]>, Vec<u8>, Vec<u8>) {
+        let init = vec![0x18, 0, 6, 4, 0, 1, 10, 0];
+        let body = [0x80, 0, 3, 0, 1, 1, 2, 0];
+        let mut reduce = vec![0xe0, DERIVED, 1];
+        reduce.extend(u32::from(FOR_EACH_TYPE).to_le_bytes());
+        reduce.extend(u16::try_from(body.len()).unwrap().to_le_bytes());
+        reduce.extend(body);
+        reduce.push(0);
+        let mut table = ROW_EXPRESSIONS_MAGIC.to_le_bytes().to_vec();
+        table.extend(1u16.to_le_bytes());
+        table.extend([0, DERIVED, 1]);
+        table.extend(EVENT.to_le_bytes());
+        table.extend(u16::try_from(expr.len()).unwrap().to_le_bytes());
+        table.extend(expr);
+        let mut bytes = vec![0u8; 32];
+        bytes.extend(PROGRAM_MAGIC.to_le_bytes());
+        bytes.extend([2, 0, 0, 0]);
+        bytes.extend(1u32.to_le_bytes());
+        bytes.extend(5u32.to_le_bytes());
+        bytes.extend(u32::try_from(init.len()).unwrap().to_le_bytes());
+        bytes.extend(u32::try_from(reduce.len()).unwrap().to_le_bytes());
+        bytes.extend(&init);
+        bytes.extend(&reduce);
+        bytes.extend(table);
+        (bytes.into_boxed_slice(), init, reduce)
+    }
+
+    /// The program admitted with a capability that refuses every frame it is
+    /// shown, so a refusal names exactly the frames admission selected. Built
+    /// directly: `load` would refuse the capability at preparation.
+    fn admitted(expr: &[u8]) -> AdmittedProgram<UnavailableVoAdmission> {
+        let (bytecode, init, reduce) = derived_scope_program(expr);
+        let metadata = VoProgramMetadata {
+            fields: vec![VoFieldLink {
+                slot: 0,
+                field_idx: 0,
+                schema: VoMetadata {
+                    root: "example.Counter".into(),
+                    frame: vec![1],
+                    rows: vec![vec![1]],
+                    profile: VoProfile::default(),
+                    retained: vec![],
+                },
+            }],
+            counts: vec![],
+        };
+        let inputs = InputPlan::compile(&init, &reduce, &metadata).expect("plan compiles");
+        AdmittedProgram {
+            bytecode,
+            metadata,
+            admission: UnavailableVoAdmission,
+            inputs,
+            binds_rows: true,
+            magic: PROGRAM_MAGIC,
+            state_size: 0,
+        }
+    }
+
+    fn cells(values: &[u32]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect()
+    }
+
+    /// Admission reads the derived type column as bound, not the host's
+    /// empty placeholder: a row of the derived event type has its frame
+    /// shown to the capability, and a row of another type selects nothing
+    /// and runs with the bound zero cell.
+    #[test]
+    fn admission_reads_the_bound_derived_scope_column() {
+        let program = admitted(&[FOR_EACH_TYPE]);
+        let offsets = cells(&[0, 2]);
+        let key = cells(&[5]);
+        let mut scratch = ProgramScratch::default();
+        let mut rows = RowColumns::new();
+
+        let types = cells(&[EVENT]);
+        let mut cols: [&[u8]; 5] = [&types, &offsets, b"ab", &key, &[]];
+        let mut ran = false;
+        let result = program.execute_bound(
+            &mut [],
+            &mut cols,
+            1,
+            &mut scratch,
+            &mut Constant,
+            &mut rows,
+            |_, _, _, _| {
+                ran = true;
+                0
+            },
+        );
+        assert_eq!(
+            result,
+            Err(InputAdmissionError::Frame {
+                slot: 0,
+                field_idx: 0,
+                row: 0,
+                cause: VoRefusal::Admission(VoAdmissionError::Unavailable),
+            }),
+            "the derived type selects row 0 for admission"
+        );
+        assert!(!ran);
+
+        let types = cells(&[EVENT + 1]);
+        let mut rows = RowColumns::new();
+        let mut cols: [&[u8]; 5] = [&types, &offsets, b"ab", &key, &[]];
+        let result = program.execute_bound(
+            &mut [],
+            &mut cols,
+            1,
+            &mut scratch,
+            &mut Constant,
+            &mut rows,
+            |bytecode, _, cols, live| {
+                assert!(core::ptr::eq(bytecode, program.bytecode()));
+                assert!(live.is_empty());
+                assert_eq!(cols[usize::from(DERIVED)], cells(&[0]).as_slice());
+                42
+            },
+        );
+        assert_eq!(result, Ok(42), "an unmatched row selects no frame");
+    }
+
+    /// A program with a row table is never run over unbound columns, and a
+    /// table the evaluator refuses is refused before admission or execution.
+    #[test]
+    fn row_tables_run_only_through_the_bound_path() {
+        let program = admitted(&[FOR_EACH_TYPE]);
+        let types = cells(&[EVENT]);
+        let offsets = cells(&[0, 2]);
+        let key = cells(&[5]);
+        let cols: [&[u8]; 5] = [&types, &offsets, b"ab", &key, &[]];
+        let mut scratch = ProgramScratch::default();
+        assert_eq!(
+            program.execute_with(&cols, 1, &mut scratch, |_, _| unreachable!("never run")),
+            Err(InputAdmissionError::UnboundRows)
+        );
+
+        let refused = admitted(&[]);
+        let mut cols: [&[u8]; 5] = [&types, &offsets, b"ab", &key, &[]];
+        let mut rows = RowColumns::new();
+        assert_eq!(
+            refused.execute_bound(
+                &mut [],
+                &mut cols,
+                1,
+                &mut scratch,
+                &mut Constant,
+                &mut rows,
+                |_, _, _, _| unreachable!("never run"),
+            ),
+            Err(InputAdmissionError::Rows(ErrorCode::InvalidProgram))
+        );
     }
 }
