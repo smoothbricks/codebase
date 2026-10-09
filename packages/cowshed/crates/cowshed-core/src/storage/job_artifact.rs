@@ -9276,9 +9276,14 @@ mod tests {
                 .as_path(),
         );
         let original_prefix = fs::read(&prefix_path).unwrap();
+        let sealed_first_mode = fs::metadata(&prefix_path).unwrap().permissions();
+        let mut writable_first = sealed_first_mode.clone();
+        writable_first.set_readonly(false);
         let mut corrupted_prefix = original_prefix.clone();
         corrupted_prefix[0] ^= 0xff;
+        fs::set_permissions(&prefix_path, writable_first.clone()).unwrap();
         fs::write(&prefix_path, &corrupted_prefix).unwrap();
+        fs::set_permissions(&prefix_path, sealed_first_mode.clone()).unwrap();
         assert!(
             reader.sealed(JobId::new(2).unwrap()).unwrap().is_none(),
             "unchanged records do not re-hash a prefix whose manifest was already validated"
@@ -9299,7 +9304,9 @@ mod tests {
             reader.sealed(JobId::new(3).unwrap()).unwrap().is_none(),
             "a new record does not re-hash the identical already-validated manifest"
         );
+        fs::set_permissions(&prefix_path, writable_first.clone()).unwrap();
         fs::write(&prefix_path, &original_prefix).unwrap();
+        fs::set_permissions(&prefix_path, sealed_first_mode.clone()).unwrap();
 
         store.append(&token, StreamKind::Stdout, b"-after").unwrap();
         let second = store.checkpoint().unwrap();
@@ -9312,10 +9319,22 @@ mod tests {
             second_visible.sha256,
             Sha256Digest::compute(b"before-checkpoint-after")
         );
-        let current_prefix = fs::read(&prefix_path).unwrap();
+        let second_prefix_path = root.join(
+            second_visible
+                .protected_path
+                .as_ref()
+                .expect("a nonempty live checkpoint prefix is promoted to a protected file")
+                .as_path(),
+        );
+        let sealed_second_mode = fs::metadata(&second_prefix_path).unwrap().permissions();
+        let mut writable_second = sealed_second_mode.clone();
+        writable_second.set_readonly(false);
+        let current_prefix = fs::read(&second_prefix_path).unwrap();
         let mut corrupted_current = current_prefix.clone();
         corrupted_current[0] ^= 0xff;
-        fs::write(&prefix_path, &corrupted_current).unwrap();
+        fs::set_permissions(&second_prefix_path, writable_second.clone()).unwrap();
+        fs::write(&second_prefix_path, &corrupted_current).unwrap();
+        fs::set_permissions(&second_prefix_path, sealed_second_mode.clone()).unwrap();
         assert!(
             matches!(
                 reader.sealed(JobId::new(3).unwrap()),
@@ -9323,7 +9342,9 @@ mod tests {
             ),
             "a newly learned manifest still validates its captured prefixes"
         );
-        fs::write(&prefix_path, &current_prefix).unwrap();
+        fs::set_permissions(&second_prefix_path, writable_second.clone()).unwrap();
+        fs::write(&second_prefix_path, &current_prefix).unwrap();
+        fs::set_permissions(&second_prefix_path, sealed_second_mode.clone()).unwrap();
         assert_eq!(
             first.record.visible_jobs[0].stdout.bytes,
             b"before-checkpoint".len() as u64
