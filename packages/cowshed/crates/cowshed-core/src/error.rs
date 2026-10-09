@@ -96,9 +96,10 @@ pub struct CowshedError {
         deserialize_with = "known_to_this_build"
     )]
     retry: Option<Retry>,
-    /// Present only on a keyed exec that spawned nothing (07_api "Keyed admission and restart
-    /// attachment"), naming why and the job the key admitted. Absent from the wire otherwise,
-    /// like `fence`.
+    /// Present only on a keyed exec that spawned nothing, or a refused read of a job id or
+    /// admission key (07_api "Keyed admission and restart attachment" and "Captured-content
+    /// authority"), naming why and either the job the key admitted or the set-aside store that
+    /// may hold it. Absent from the wire otherwise, like `fence`.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -254,8 +255,10 @@ impl AdmissionField {
     }
 }
 
-/// Why a keyed exec spawned nothing. Each refusal names the job the key admitted, when the
-/// store can name it, so the caller reaches that job instead of exec'ing again.
+/// Why a keyed exec spawned nothing, or why a read of a job id or admission key was refused. A
+/// `KeyConflict` or `StdinBound` names the job the key admitted, so the caller reaches that job
+/// instead of exec'ing again. `Unprovable` names the unread set-aside store instead: the requested
+/// job or key may be recorded there, so neither presence nor absence is known.
 ///
 /// Fields are additive like [`FenceRefusal`]'s; a reason a later build added decodes as no
 /// refusal (`CowshedError::admission_source` answers `None`) rather than losing the whole error.
@@ -276,8 +279,10 @@ pub enum AdmissionRefusal {
     /// answers the job and cannot bind a second stream: its bytes go through an attachment. A
     /// `Usage` error.
     StdinBound { job_id: crate::api::dto::JobId },
-    /// A job store set aside in this workspace incarnation, at `set_aside`, may hold the key:
-    /// whether it admitted a job cannot be told, so nothing is spawned under it. A `Conflict`.
+    /// A job store set aside at `set_aside` may hold the requested job id or admission key, and
+    /// this build cannot read it: whether it recorded that job or admitted that key cannot be told.
+    /// A keyed exec spawns nothing under the key, and a read by job id proves no absence. A
+    /// `Conflict`.
     Unprovable { set_aside: std::path::PathBuf },
 }
 
@@ -629,8 +634,10 @@ impl CowshedError {
         }
     }
 
-    /// A keyed exec that spawned nothing: a `Usage` error for a second stream bound to the
-    /// key's job, else a `Conflict`, carrying the reason as [`AdmissionRefusal`].
+    /// A keyed exec that spawned nothing, or a refused read of a job id or admission key (07_api
+    /// "Keyed admission and restart attachment" and "Captured-content authority"): a `Usage`
+    /// error for a second stream bound to the key's job, else a `Conflict`, carrying the reason
+    /// as [`AdmissionRefusal`].
     pub fn admission_refusal(refusal: AdmissionRefusal) -> Self {
         let error = match &refusal {
             AdmissionRefusal::KeyConflict { job_id, fields } => {
@@ -676,7 +683,10 @@ impl CowshedError {
                      aside at {}, which this cowshed cannot read",
                     set_aside.display()
                 ),
-                "retain the original job binding and inspect the unread history; absence and safe re-execution are not proven",
+                "retain the original job binding and inspect the unread history; whether the original job \
+                 exists or ran is unknown, so re-executing it is not proven safe. A deliberately new \
+                 exec may use another workspace incarnation or no admission key: that is a new effect, not \
+                 a replay of the original. A read by job id proves no absence.",
             ),
         };
         Self {
@@ -830,7 +840,9 @@ impl CowshedError {
         self.retry
     }
 
-    /// Why a keyed exec spawned nothing, when this is that refusal.
+    /// Why a keyed exec spawned nothing, or why a read of a job id or admission key was refused,
+    /// when this is that refusal (07_api "Keyed admission and restart attachment" and
+    /// "Captured-content authority").
     pub fn admission_source(&self) -> Option<&AdmissionRefusal> {
         self.admission.as_deref()
     }

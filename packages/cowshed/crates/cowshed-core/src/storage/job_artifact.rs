@@ -538,13 +538,10 @@ struct Admitted {
     scheduling: JobScheduling,
 }
 
-/// Readable admission keys and unread job history of the store's incarnation.
+/// Readable admission keys of the store's incarnation; unread history is store authority.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct AdmissionIndex {
     keys: BTreeMap<AdmissionKey, Admitted>,
-    /// Every unread layout that may have served this incarnation, in deterministic path order.
-    /// Numeric jobs exist in every layout; only keyed layouts can make an admission key unknown.
-    unread_history: Vec<UnreadHistory>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -570,12 +567,10 @@ pub enum AdmissionLookup<'a> {
 }
 
 impl AdmissionIndex {
-    /// The keyed admissions of `incarnation` among the recovered records, and whether a store
-    /// set aside under `job_root` may hold more.
+    /// The keyed admissions of this incarnation among the validated readable records.
     fn recover(
         recovery: &RecoveryReport,
         incarnation: &WorkspaceIncarnation,
-        job_root: &Path,
     ) -> Result<Self, ArtifactError> {
         let mut keys = BTreeMap::<AdmissionKey, Admitted>::new();
         for frame in &recovery.frames {
@@ -618,17 +613,15 @@ impl AdmissionIndex {
                 }
             }
         }
-        Ok(Self {
-            keys,
-            unread_history: history_set_aside(job_root, incarnation)?,
-        })
+        Ok(Self { keys })
     }
 
-    fn lookup(&self, key: &AdmissionKey) -> AdmissionLookup<'_> {
-        let keyed_history = self
-            .unread_history
-            .iter()
-            .find(|history| history.may_hold_keys);
+    fn lookup<'a>(
+        &'a self,
+        key: &AdmissionKey,
+        history: &'a [UnreadHistory],
+    ) -> AdmissionLookup<'a> {
+        let keyed_history = history.iter().find(|history| history.may_hold_keys);
         match (self.keys.get(key), keyed_history) {
             (Some(known), _) => AdmissionLookup::Admitted {
                 job_id: known.job_id,
@@ -645,8 +638,13 @@ impl AdmissionIndex {
 
     /// Refuse a record of `job_id` that binds `admission`'s key unless the key is provably
     /// free or already `job_id`'s.
-    fn check(&self, job_id: JobId, admission: &JobAdmission) -> Result<(), ArtifactError> {
-        match self.lookup(&admission.key) {
+    fn check(
+        &self,
+        job_id: JobId,
+        admission: &JobAdmission,
+        history: &[UnreadHistory],
+    ) -> Result<(), ArtifactError> {
+        match self.lookup(&admission.key, history) {
             AdmissionLookup::Absent => Ok(()),
             AdmissionLookup::Admitted {
                 job_id: admitted, ..
@@ -674,8 +672,8 @@ impl AdmissionIndex {
     }
 }
 
-/// Name the incarnation a store just set aside served. Until that name is durable a later open
-/// keeps the history unknown for any incarnation ([`history_set_aside`]).
+/// Name the incarnation a keyed store just set aside served. Numeric absence never comes from
+/// this marker, and keyless layouts never need one.
 fn record_set_aside_incarnation(
     set_aside: &SetAsideStore,
     incarnation: &WorkspaceIncarnation,
@@ -1103,13 +1101,18 @@ pub struct ArtifactStore {
     next_job_id: u64,
     live_jobs: BTreeMap<JobId, LiveJobState>,
     committed_jobs: BTreeMap<JobId, JobArtifactRecord>,
+    readable_jobs: BTreeSet<JobId>,
     admissions: AdmissionIndex,
+    unread_history: Vec<UnreadHistory>,
+    retained_job_floor: Option<u64>,
     recovery: RecoveryReport,
     /// The records file as this store last recovered or appended to it. An append that finds it
     /// unchanged — same inode, same length — knows every frame already, so it skips re-reading
     /// and re-hashing the whole log; any other writer's append, a torn tail it left, or a
     /// replacement changes one of the two and brings the full recovery back.
     records_seen: Option<RecordsIdentity>,
+    /// The latest manifest whose captured prefixes this snapshot already validated.
+    validated_manifest: Option<Sha256Digest>,
 }
 
 /// Which records file, at which length.
@@ -1192,7 +1195,8 @@ impl ArtifactStore {
         let mut recovery =
             recover_records_with_budget_under_lock(&lock, config.retained_recovery_budget_bytes)?;
         validate_recovered_authority(&owned_repo_ids, &workspace_incarnation, &config, &recovery)?;
-        validate_recovered_files(&workspace_root, &workspace_incarnation, &recovery)?;
+        let (_, validated_manifest) =
+            validate_recovered_files(&workspace_root, &workspace_incarnation, &recovery)?;
         let directory_max = scan_job_directories(&workspace_root)?;
         let record_max = recovery
             .frames
@@ -1203,8 +1207,10 @@ impl ArtifactStore {
             })
             .max()
             .unwrap_or(0);
-        let floor = read_counter(&job_floor_path(&lock)?, &JOB_FLOOR)?.unwrap_or(0);
-        let maximum = directory_max.max(record_max).max(floor);
+        let retained_job_floor = read_counter(&job_floor_path(&lock)?, &JOB_FLOOR)?;
+        let maximum = directory_max
+            .max(record_max)
+            .max(retained_job_floor.unwrap_or(0));
         let next_job_id = maximum
             .checked_add(1)
             .ok_or(ArtifactError::InvalidConfig("job id allocation exhausted"))?;
@@ -1233,10 +1239,25 @@ impl ArtifactStore {
             .parent()
             .ok_or_else(|| integrity(0, "records path has no job parent"))?
             .to_path_buf();
-        if let Some(set_aside) = &recovery.set_aside {
+        if let Some(set_aside) = &recovery.set_aside
+            && set_aside.layout >= FIRST_KEYED_LAYOUT
+        {
             record_set_aside_incarnation(set_aside, &workspace_incarnation)?;
         }
-        let admissions = AdmissionIndex::recover(&recovery, &workspace_incarnation, &job_root)?;
+        let admissions = AdmissionIndex::recover(&recovery, &workspace_incarnation)?;
+        let unread_history = history_set_aside(&job_root, &workspace_incarnation)?;
+        let readable_jobs = recovery
+            .frames
+            .iter()
+            .filter_map(|frame| match &frame.record {
+                ProtectedRecord::Job(record)
+                    if record.workspace_incarnation == workspace_incarnation =>
+                {
+                    Some(record.job_id)
+                }
+                _ => None,
+            })
+            .collect();
         let records_seen = RecordsIdentity::of(&records_path)?;
         drop(lock);
         let token_namespace = Sha256Digest::compute(workspace_root.as_os_str().as_encoded_bytes());
@@ -1252,10 +1273,14 @@ impl ArtifactStore {
             next_job_id,
             live_jobs: BTreeMap::new(),
             committed_jobs,
+            readable_jobs,
             admissions,
+            unread_history,
+            retained_job_floor,
             recovery,
             config,
             records_seen,
+            validated_manifest,
         })
     }
 
@@ -1273,52 +1298,118 @@ impl ArtifactStore {
         if !self.committed_jobs.contains_key(&job_id) {
             let path = records_path(&self.workspace_root);
             let lock = RecordsLock::acquire(&path)?;
-            if self.records_seen.is_some() && RecordsIdentity::of(&path)?.is_none() {
-                return Err(integrity(
-                    0,
-                    "previously readable protected job records disappeared",
-                ));
-            }
-            let recovery = recover_records_with_budget_under_lock(
-                &lock,
-                self.config.retained_recovery_budget_bytes,
-            )?;
-            validate_recovered_authority(
-                &self.owned_repo_ids,
-                &self.workspace_incarnation,
-                &self.config,
-                &recovery,
-            )?;
-            validate_recovered_files(&self.workspace_root, &self.workspace_incarnation, &recovery)?;
-            if let Some(set_aside) = &recovery.set_aside {
-                record_set_aside_incarnation(set_aside, &self.workspace_incarnation)?;
-            }
-            let job_root = path
-                .parent()
-                .ok_or_else(|| integrity(0, "records path has no job parent"))?;
-            self.admissions =
-                AdmissionIndex::recover(&recovery, &self.workspace_incarnation, job_root)?;
-            for frame in &recovery.frames {
-                if let ProtectedRecord::Job(record) = &frame.record
-                    && record.workspace_incarnation == self.workspace_incarnation
-                    && !matches!(record.state, JobState::Queued | JobState::Running)
-                {
-                    self.committed_jobs
-                        .entry(record.job_id)
-                        .or_insert_with(|| record.clone());
-                }
-            }
-            self.records_seen = RecordsIdentity::of(&path)?;
+            self.refresh_under_lock(&lock)?;
         }
         if let Some(record) = self.committed_jobs.get(&job_id) {
             return Ok(Some(record));
         }
-        if let Some(store) = self.admissions.unread_history.first() {
+        if self.readable_jobs.contains(&job_id) {
+            return Ok(None);
+        }
+        if let Some(store) = self.unread_history.first()
+            && self
+                .retained_job_floor
+                .is_none_or(|floor| job_id.get() <= floor)
+        {
             return Err(ArtifactError::HistoryUnprovable {
                 set_aside: store.store.path.clone(),
             });
         }
         Ok(None)
+    }
+
+    /// One validated generation for reads, appends and checkpoints. Advancing record identity
+    /// always advances its readable rows, terminal rows and key authority together.
+    fn refresh_under_lock(&mut self, lock: &RecordsLock<'_>) -> Result<(), ArtifactError> {
+        let seen = RecordsIdentity::of(lock.records)?;
+        if self.records_seen.is_some() && seen.is_none() {
+            return Err(integrity(
+                0,
+                "previously readable protected job records disappeared",
+            ));
+        }
+        let unchanged = seen == self.records_seen
+            && seen.is_none_or(|seen| {
+                usize::try_from(seen.len)
+                    .is_ok_and(|len| len <= self.config.retained_recovery_budget_bytes)
+            });
+        let job_root = lock
+            .records
+            .parent()
+            .ok_or_else(|| integrity(0, "records path has no job parent"))?;
+        if unchanged {
+            // Refresh metadata authority without reading or hashing unchanged captured payloads.
+            let unread_history = history_set_aside(job_root, &self.workspace_incarnation)?;
+            let retained_job_floor = read_counter(&job_floor_path(lock)?, &JOB_FLOOR)?;
+            self.unread_history = unread_history;
+            self.retained_job_floor = retained_job_floor;
+            return Ok(());
+        }
+        let recovery = recover_records_with_budget_under_lock(
+            lock,
+            self.config.retained_recovery_budget_bytes,
+        )?;
+        validate_recovered_authority(
+            &self.owned_repo_ids,
+            &self.workspace_incarnation,
+            &self.config,
+            &recovery,
+        )?;
+        let (terminal_jobs, validated_manifest) = validate_recovered_files_since(
+            &self.workspace_root,
+            &self.workspace_incarnation,
+            &recovery,
+            Some(&self.committed_jobs),
+            self.validated_manifest,
+        )?;
+        if let Some(set_aside) = &recovery.set_aside
+            && set_aside.layout >= FIRST_KEYED_LAYOUT
+        {
+            record_set_aside_incarnation(set_aside, &self.workspace_incarnation)?;
+        }
+        let admissions = AdmissionIndex::recover(&recovery, &self.workspace_incarnation)?;
+        let unread_history = history_set_aside(job_root, &self.workspace_incarnation)?;
+        let retained_job_floor = read_counter(&job_floor_path(lock)?, &JOB_FLOOR)?;
+        let readable_jobs = recovery
+            .frames
+            .iter()
+            .filter_map(|frame| match &frame.record {
+                ProtectedRecord::Job(record)
+                    if record.workspace_incarnation == self.workspace_incarnation =>
+                {
+                    Some(record.job_id)
+                }
+                _ => None,
+            })
+            .collect();
+        let mut new_terminals = BTreeMap::new();
+        for frame in &recovery.frames {
+            if let ProtectedRecord::Job(record) = &frame.record
+                && record.workspace_incarnation == self.workspace_incarnation
+                && !matches!(record.state, JobState::Queued | JobState::Running)
+                && !self.committed_jobs.contains_key(&record.job_id)
+            {
+                new_terminals.insert(record.job_id, record.clone());
+            }
+        }
+        for job_id in self.committed_jobs.keys() {
+            if !terminal_jobs.contains(job_id) {
+                return Err(integrity(
+                    0,
+                    "a validated terminal job disappeared from protected records",
+                ));
+            }
+        }
+        let records_seen = RecordsIdentity::of(lock.records)?;
+        self.committed_jobs.append(&mut new_terminals);
+        self.readable_jobs = readable_jobs;
+        self.admissions = admissions;
+        self.unread_history = unread_history;
+        self.retained_job_floor = retained_job_floor;
+        self.recovery = recovery;
+        self.records_seen = records_seen;
+        self.validated_manifest = validated_manifest;
+        Ok(())
     }
 
     pub fn buffered_bytes(&self) -> usize {
@@ -1402,7 +1493,7 @@ impl ArtifactStore {
 
     /// What this incarnation's admissions say of `key`.
     pub fn admitted(&self, key: &AdmissionKey) -> AdmissionLookup<'_> {
-        self.admissions.lookup(key)
+        self.admissions.lookup(key, &self.unread_history)
     }
 
     /// Seal every job this incarnation admitted and never sealed: the jobs a supervisor ran when
@@ -1467,43 +1558,10 @@ impl ArtifactStore {
     ) -> Result<(JobArtifactRecord, Sha256Digest), ArtifactError> {
         let path = records_path(&self.workspace_root);
         let lock = RecordsLock::acquire(&path)?;
-        let terminal = !matches!(record.state, JobState::Queued | JobState::Running);
-        let seen = RecordsIdentity::of(&path)?;
-        // A log past the retained budget still goes through recovery, which refuses it exactly
-        // as before: the frames it retains never exceed the file's length.
-        let unchanged = seen == self.records_seen
-            && seen.is_some_and(|seen| {
-                usize::try_from(seen.len)
-                    .is_ok_and(|len| len <= self.config.retained_recovery_budget_bytes)
-            });
-        let duplicate_terminal = if unchanged {
-            // Nothing wrote the log since this store last read or appended to it: every terminal
-            // record of this incarnation is one it holds.
-            terminal
-                && record.workspace_incarnation == self.workspace_incarnation
-                && self.committed_jobs.contains_key(&record.job_id)
-        } else {
-            let recovery = recover_records_with_budget_under_lock(
-                &lock,
-                self.config.retained_recovery_budget_bytes,
-            )?;
-            // Another writer appended: the keys it bound are this store's to honour too.
-            let job_root = path
-                .parent()
-                .ok_or_else(|| integrity(0, "records path has no job parent"))?;
-            self.admissions =
-                AdmissionIndex::recover(&recovery, &self.workspace_incarnation, job_root)?;
-            terminal
-                && recovery.frames.iter().any(|frame| {
-                    matches!(
-                        &frame.record,
-                        ProtectedRecord::Job(existing)
-                            if existing.workspace_incarnation == record.workspace_incarnation
-                                && existing.job_id == record.job_id
-                                && !matches!(existing.state, JobState::Queued | JobState::Running)
-                    )
-                })
-        };
+        self.refresh_under_lock(&lock)?;
+        let duplicate_terminal = !matches!(record.state, JobState::Queued | JobState::Running)
+            && record.workspace_incarnation == self.workspace_incarnation
+            && self.committed_jobs.contains_key(&record.job_id);
         if duplicate_terminal {
             return Err(integrity(
                 0,
@@ -1513,7 +1571,8 @@ impl ArtifactStore {
         // The key binds under the lock that orders every record: no other job can take it
         // between this check and the append.
         if let Some(admission) = &record.admission {
-            self.admissions.check(record.job_id, admission)?;
+            self.admissions
+                .check(record.job_id, admission, &self.unread_history)?;
         }
         let sequence = allocate_record_sequence(&lock)?;
         let mut record = record;
@@ -1523,13 +1582,16 @@ impl ArtifactStore {
         let payload = encode_batch(&batch)?;
         let digest = Sha256Digest::compute(&payload);
         append_framed_batch_under_lock(&lock, &payload, digest, JOB_RECORD_DURABILITY, None)?;
-        self.records_seen = RecordsIdentity::of(&path)?;
+        if record.workspace_incarnation == self.workspace_incarnation {
+            self.readable_jobs.insert(record.job_id);
+        }
         if let Some(admission) = &record.admission {
             self.admissions.admit(&record, admission);
         }
         if !matches!(record.state, JobState::Queued | JobState::Running) {
             self.committed_jobs.insert(record.job_id, record.clone());
         }
+        self.records_seen = RecordsIdentity::of(&path)?;
         Ok((record, digest))
     }
 
@@ -1539,6 +1601,9 @@ impl ArtifactStore {
     /// barrier merely skips an id instead of leaving a consumed id that every later checkpoint
     /// trips over.
     pub fn checkpoint(&mut self) -> Result<SealedCheckpointManifest, ArtifactError> {
+        let path = records_path(&self.workspace_root);
+        let lock = RecordsLock::acquire(&path)?;
+        self.refresh_under_lock(&lock)?;
         let mut visible = self
             .committed_jobs
             .values()
@@ -1552,13 +1617,6 @@ impl ArtifactStore {
                 state.durable_commitment(workspace_root, budget, workspace_incarnation, job_id)?;
             visible.insert(job_id, commitment);
         }
-        let path = records_path(&self.workspace_root);
-        let lock = RecordsLock::acquire(&path)?;
-        // Recovery is the tail repair for this path, not its allocator: it truncates an incomplete
-        // frame under this lock, before `records_sha256` hashes the file and before the manifest is
-        // appended. Appending over a partial frame would make every later recovery truncate this
-        // manifest — and everything after it — away.
-        recover_records_with_budget_under_lock(&lock, self.config.retained_recovery_budget_bytes)?;
         let barrier_id = allocate_checkpoint_barrier(&lock, &self.workspace_incarnation)?;
         let records_sha256 = match fs::symlink_metadata(&path) {
             Ok(metadata) if metadata.len() == 0 => Sha256Digest::compute(RECORD_MAGIC),
@@ -1587,6 +1645,9 @@ impl ArtifactStore {
             Durability::PowerLoss,
             None,
         )?;
+        let records_seen = RecordsIdentity::of(&path)?;
+        self.records_seen = records_seen;
+        self.validated_manifest = Some(manifest_batch_sha256);
         Ok(SealedCheckpointManifest {
             record,
             manifest_batch_sha256,
@@ -2754,7 +2815,17 @@ fn validate_recovered_files(
     workspace_root: &Path,
     current_incarnation: &WorkspaceIncarnation,
     recovery: &RecoveryReport,
-) -> Result<(), ArtifactError> {
+) -> Result<(BTreeSet<JobId>, Option<Sha256Digest>), ArtifactError> {
+    validate_recovered_files_since(workspace_root, current_incarnation, recovery, None, None)
+}
+
+fn validate_recovered_files_since(
+    workspace_root: &Path,
+    current_incarnation: &WorkspaceIncarnation,
+    recovery: &RecoveryReport,
+    known: Option<&BTreeMap<JobId, JobArtifactRecord>>,
+    known_manifest: Option<Sha256Digest>,
+) -> Result<(BTreeSet<JobId>, Option<Sha256Digest>), ArtifactError> {
     let mut terminal_jobs = BTreeSet::new();
     let mut latest_manifest = None;
     for frame in &recovery.frames {
@@ -2769,18 +2840,31 @@ fn validate_recovered_files(
                         "duplicate terminal artifact record for current job id",
                     ));
                 }
-                validate_stream_file(workspace_root, &record.stdout)?;
-                validate_stream_file(workspace_root, &record.stderr)?;
+                match known.and_then(|known| known.get(&record.job_id)) {
+                    Some(before) if before == record => {}
+                    Some(_) => {
+                        return Err(integrity(
+                            0,
+                            "a validated terminal record changed its immutable facts",
+                        ));
+                    }
+                    None => {
+                        validate_stream_file(workspace_root, &record.stdout)?;
+                        validate_stream_file(workspace_root, &record.stderr)?;
+                    }
+                }
             }
             ProtectedRecord::CheckpointManifest(manifest)
                 if &manifest.origin_incarnation == current_incarnation =>
             {
-                latest_manifest = Some(manifest);
+                latest_manifest = Some((manifest, frame.batch_sha256));
             }
             _ => {}
         }
     }
-    if let Some(manifest) = latest_manifest {
+    if let Some((manifest, digest)) = latest_manifest
+        && known_manifest != Some(digest)
+    {
         for job in &manifest.visible_jobs {
             if &job.workspace_incarnation != current_incarnation
                 || terminal_jobs.contains(&job.job_id)
@@ -2791,7 +2875,7 @@ fn validate_recovered_files(
             validate_visible_file(workspace_root, &job.stderr)?;
         }
     }
-    Ok(())
+    Ok((terminal_jobs, latest_manifest.map(|(_, digest)| digest)))
 }
 
 fn validate_stream_file(workspace_root: &Path, stream: &StreamInfo) -> Result<(), ArtifactError> {
@@ -8131,6 +8215,245 @@ mod tests {
         fs::remove_dir_all(&root).unwrap();
     }
 
+    /// An earlier store stays unread. Its retained floor is the numeric proof: an id at or below
+    /// it stays unprovable, an id above it is absent, and a row a refresh cannot authorize is
+    /// integrity, never absence. The pre-key layout does not widen keyed admission authority.
+    #[test]
+    fn an_unread_store_retains_numeric_authority_across_readers_and_checkpoints() {
+        let root = temp_root("unread-store-authority");
+        drop(store_at(&root, ArtifactConfig::default()));
+        append_batch(&root, &earlier_batch(&valid_job_record(1), 14, 7));
+        let old_records = fs::read(records_path(&root)).unwrap();
+        let job_root = root.join(PROTECTED_DIRECTORY).join(JOB_DIRECTORY);
+        let set_aside = job_root.join(SET_ASIDE_DIRECTORY).join("layout-7");
+
+        // The low inline cap makes the spill below a real promotion to a protected file.
+        let mut store = store_at(
+            &root,
+            ArtifactConfig {
+                inline_cap_bytes: 4,
+                ..ArtifactConfig::default()
+            },
+        );
+        assert_eq!(
+            store.recovery().set_aside,
+            Some(SetAsideStore {
+                layout: 7,
+                path: set_aside.clone(),
+            })
+        );
+        assert!(
+            store.recovery().frames.is_empty(),
+            "nothing of the earlier layout is decoded"
+        );
+        assert!(matches!(
+            store.sealed(JobId::new(1).unwrap()),
+            Err(ArtifactError::HistoryUnprovable { set_aside: ref path }) if path == &set_aside
+        ));
+        assert_eq!(store.next_job_id().unwrap().get(), 2);
+        assert_eq!(fs::read(set_aside.join(RECORDS_FILE)).unwrap(), old_records);
+        assert_eq!(
+            store.admitted(&AdmissionKey::new("op-1").unwrap()),
+            AdmissionLookup::Absent,
+            "pre-key history does not claim keyed admissions"
+        );
+
+        // A reader opened before the next writer's terminal append must refresh a miss.
+        let mut reader = store_at(&root, ArtifactConfig::default());
+        let mut untouched = store_at(&root, ArtifactConfig::default());
+        let readable_id = store.next_job_id().unwrap();
+        let token = store
+            .begin_job(readable_id, 1, &argv_true(), None, OutputTargets::default())
+            .unwrap();
+        store.finish(token, JobState::Failed).unwrap();
+        // The manifest names the readable job from the records themselves, with no sealed read first.
+        let manifest = untouched.checkpoint().unwrap();
+        assert!(
+            manifest
+                .record
+                .visible_jobs
+                .iter()
+                .any(|job| job.job_id == readable_id && job.workspace_incarnation == incarnation()),
+            "a checkpoint names the readable current job without any prior sealed read"
+        );
+        assert_eq!(
+            reader
+                .sealed(readable_id)
+                .unwrap()
+                .map(|record| record.job_id),
+            Some(readable_id),
+            "a sealed cache miss learns another writer's actual terminal record",
+        );
+
+        // The opening incarnation's marker narrows only key scope. Numeric absence is decided by
+        // the retained floor, which is the highest id the set-aside store allocated.
+        let other = WorkspaceIncarnation::new("1198f2c0b7e34dc795f17b238b331c80").unwrap();
+        fs::write(set_aside.join(SET_ASIDE_INCARNATION_FILE), other.as_str()).unwrap();
+        assert_eq!(
+            read_counter(&job_root.join(JOB_FLOOR_FILE), &JOB_FLOOR).unwrap(),
+            Some(1),
+            "the set-aside store retained job 1 as its floor"
+        );
+        assert!(
+            matches!(
+                reader.sealed(JobId::new(1).unwrap()),
+                Err(ArtifactError::HistoryUnprovable { set_aside: ref path }) if path == &set_aside
+            ),
+            "an id at or below the retained floor may be the set-aside store's job"
+        );
+        let above_floor = JobId::new(3).unwrap();
+        assert!(
+            reader.sealed(above_floor).unwrap().is_none(),
+            "an id above the retained floor is authoritatively absent"
+        );
+        assert_eq!(
+            reader.admitted(&AdmissionKey::new("op-1").unwrap()),
+            AdmissionLookup::Absent,
+            "key lookup retains its narrower keyed-incarnation contract",
+        );
+        assert_eq!(
+            fs::read(set_aside.join(RECORDS_FILE)).unwrap(),
+            old_records,
+            "no earlier payload was decoded or changed"
+        );
+        assert_eq!(
+            reader
+                .sealed(readable_id)
+                .unwrap()
+                .map(|record| record.job_id),
+            Some(readable_id)
+        );
+
+        // Rows the store never authorized are refused by the refresh that reads them, never
+        // reported as absence. Each is a valid encoded row appended after the reader's snapshot at
+        // the sequence after the file's highest, then removed by restoring the exact bytes.
+        let intact_records = fs::read(records_path(&root)).unwrap();
+        let sequence = highest_record_sequence(
+            &recover_records_with_budget(
+                &records_path(&root),
+                ArtifactConfig::default().retained_recovery_budget_bytes,
+            )
+            .unwrap(),
+        ) + 1;
+        let foreign = JobArtifactRecord {
+            repo_id: RepoId::parse("acme/elsewhere").unwrap(),
+            sequence,
+            ..valid_job_record(3)
+        };
+        let lineage = JobArtifactRecord {
+            workspace_incarnation: WorkspaceIncarnation::new("2198f2c0b7e34dc795f17b238b331c80")
+                .unwrap(),
+            sequence,
+            ..valid_job_record(3)
+        };
+        for (label, row, cause) in [
+            (
+                "a foreign repository",
+                foreign,
+                "is not owned by attached project",
+            ),
+            (
+                "an unknown lineage",
+                lineage,
+                "is neither current nor in the workspace's lineage",
+            ),
+        ] {
+            append_protected_record(&root, ProtectedRecord::Job(row));
+            assert!(
+                matches!(
+                    reader.sealed(above_floor),
+                    Err(ArtifactError::Integrity { message, .. }) if message.contains(cause)
+                ),
+                "{label} row must be refused as integrity by the refresh that reads it"
+            );
+            fs::write(records_path(&root), &intact_records).unwrap();
+        }
+
+        let retained = root.join("retained-current-records");
+        fs::rename(records_path(&root), &retained).unwrap();
+        assert!(
+            matches!(
+                reader.sealed(above_floor),
+                Err(ArtifactError::Integrity { .. })
+            ),
+            "a disappeared readable store is damage, not absence"
+        );
+        fs::rename(&retained, records_path(&root)).unwrap();
+
+        // A spill the store promotes and seals is learned by the next refresh, which checks its
+        // bytes against the digest its terminal record committed. The corruption keeps the length
+        // and the seal, so only the digest can refuse it.
+        let spill_id = store.next_job_id().unwrap();
+        let token = store
+            .begin_job(spill_id, 1, &argv_true(), None, OutputTargets::default())
+            .unwrap();
+        let correct: &[u8] = b"sealed spill bytes";
+        store.append(&token, StreamKind::Stdout, correct).unwrap();
+        let terminal = store.finish(token, JobState::Exited).unwrap();
+        let ProtectedOutput::File { path: spill_path } = terminal.record.stdout.storage.artifact()
+        else {
+            panic!("bytes beyond the inline cap are promoted to a protected file");
+        };
+        let spill = root.join(spill_path.as_path());
+        let sealed_mode = fs::metadata(&spill).unwrap().permissions();
+        assert!(sealed_mode.readonly(), "finish seals the promoted file");
+        let mut writable = sealed_mode.clone();
+        writable.set_readonly(false);
+        let mut corrupt = correct.to_vec();
+        corrupt[0] ^= 0xff;
+        fs::set_permissions(&spill, writable.clone()).unwrap();
+        fs::write(&spill, &corrupt).unwrap();
+        fs::set_permissions(&spill, sealed_mode.clone()).unwrap();
+        assert!(
+            matches!(
+                reader.sealed(spill_id),
+                Err(ArtifactError::Integrity { message, .. })
+                    if message.contains("does not match committed bytes and digest")
+            ),
+            "a newly learned spill whose bytes miss its committed digest is integrity, not a job"
+        );
+        fs::set_permissions(&spill, writable.clone()).unwrap();
+        fs::write(&spill, correct).unwrap();
+        fs::set_permissions(&spill, sealed_mode.clone()).unwrap();
+        assert_eq!(
+            reader.sealed(spill_id).unwrap().map(|record| record.job_id),
+            Some(spill_id),
+            "the restored sealed bytes are learned by the next refresh"
+        );
+        // Its records identity is unchanged, so a miss for an unrelated above-floor id reads and
+        // hashes no spill it already learned: the changed fixture bytes are not consulted.
+        fs::set_permissions(&spill, writable.clone()).unwrap();
+        fs::write(&spill, &corrupt).unwrap();
+        fs::set_permissions(&spill, sealed_mode.clone()).unwrap();
+        assert!(
+            reader.sealed(JobId::new(4).unwrap()).unwrap().is_none(),
+            "an unchanged miss above the floor re-hashes no spill already learned"
+        );
+        // The writer's next empty inline job changes the records identity but not the known
+        // spill's immutable record: a changed refresh validates only the newly learned terminal.
+        let next_id = store.next_job_id().unwrap();
+        let token = store
+            .begin_job(next_id, 1, &argv_true(), None, OutputTargets::default())
+            .unwrap();
+        store.finish(token, JobState::Exited).unwrap();
+        assert!(
+            reader.sealed(JobId::new(5).unwrap()).unwrap().is_none(),
+            "a changed refresh validates only the newly learned terminal, not the corrupt spill"
+        );
+        fs::set_permissions(&spill, writable).unwrap();
+        fs::write(&spill, correct).unwrap();
+        fs::set_permissions(&spill, sealed_mode).unwrap();
+        assert_eq!(
+            fs::read(set_aside.join(RECORDS_FILE)).unwrap(),
+            old_records,
+            "the archived store stayed byte-identical through every refresh"
+        );
+        drop(reader);
+        drop(store);
+        drop(untouched);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
     /// Two stores over one log stand for two writers: the second learns the key the first
     /// bound when its own append re-reads the log, under the lock, and binds nothing.
     #[test]
@@ -8179,8 +8502,9 @@ mod tests {
 
     /// A store set aside in a keyed layout took its keys along unread. While it may have served
     /// this incarnation -- its directory names this incarnation, or names none -- no key absent
-    /// from the readable records is free; a store of an earlier, keyless layout or of another
-    /// incarnation proves nothing missing.
+    /// from the readable records is free. A store of an earlier, keyless layout or of another
+    /// incarnation proves no unread key binding; numeric absence comes only from its retained
+    /// floor, which this fixture never writes, so every missing id stays unknown.
     #[test]
     fn a_keyed_store_set_aside_for_this_incarnation_makes_absence_unprovable() {
         let key = AdmissionKey::new("op-1").unwrap();
@@ -8938,6 +9262,45 @@ mod tests {
             Sha256Digest::compute(b"before-checkpoint")
         );
 
+        assert_eq!(
+            store.validated_manifest,
+            Some(first.manifest_batch_sha256),
+            "own publication keeps the already-computed validated manifest digest"
+        );
+        let mut reader = store_at(&root, ArtifactConfig::default());
+        let prefix_path = root.join(
+            first_visible
+                .protected_path
+                .as_ref()
+                .expect("a nonempty live checkpoint prefix is promoted to a protected file")
+                .as_path(),
+        );
+        let original_prefix = fs::read(&prefix_path).unwrap();
+        let mut corrupted_prefix = original_prefix.clone();
+        corrupted_prefix[0] ^= 0xff;
+        fs::write(&prefix_path, &corrupted_prefix).unwrap();
+        assert!(
+            reader.sealed(JobId::new(2).unwrap()).unwrap().is_none(),
+            "unchanged records do not re-hash a prefix whose manifest was already validated"
+        );
+        let other_id = store.next_job_id().unwrap();
+        let other = store
+            .begin_job(
+                other_id,
+                1,
+                &argv_true(),
+                None,
+                OutputTargets::default(),
+                OriginalJobCwd::WorkspaceRoot,
+            )
+            .unwrap();
+        store.finish(other, JobState::Failed).unwrap();
+        assert!(
+            reader.sealed(JobId::new(3).unwrap()).unwrap().is_none(),
+            "a new record does not re-hash the identical already-validated manifest"
+        );
+        fs::write(&prefix_path, &original_prefix).unwrap();
+
         store.append(&token, StreamKind::Stdout, b"-after").unwrap();
         let second = store.checkpoint().unwrap();
         let second_visible = &second.record.visible_jobs[0].stdout;
@@ -8949,6 +9312,18 @@ mod tests {
             second_visible.sha256,
             Sha256Digest::compute(b"before-checkpoint-after")
         );
+        let current_prefix = fs::read(&prefix_path).unwrap();
+        let mut corrupted_current = current_prefix.clone();
+        corrupted_current[0] ^= 0xff;
+        fs::write(&prefix_path, &corrupted_current).unwrap();
+        assert!(
+            matches!(
+                reader.sealed(JobId::new(3).unwrap()),
+                Err(ArtifactError::Integrity { .. }),
+            ),
+            "a newly learned manifest still validates its captured prefixes"
+        );
+        fs::write(&prefix_path, &current_prefix).unwrap();
         assert_eq!(
             first.record.visible_jobs[0].stdout.bytes,
             b"before-checkpoint".len() as u64
@@ -8960,6 +9335,7 @@ mod tests {
             b"before-checkpoint-after"
         );
         drop(store);
+        drop(reader);
         fs::remove_dir_all(root).unwrap();
     }
 
