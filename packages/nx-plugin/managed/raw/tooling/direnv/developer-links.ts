@@ -156,6 +156,11 @@ export function reportDeveloperLinks(root: string): void {
   describeDeveloperLinks(root, findDeveloperLinks(root).live);
 }
 
+/** A missing external developer target makes the stamped install stale. */
+export function hasDanglingDeveloperLinks(root: string): boolean {
+  return findDeveloperLinks(root).dangling.length > 0;
+}
+
 /** The package a link stands for in its tree: `name` or `@scope/name`. */
 function packageName(link: DeveloperLink): string {
   return link.path.slice(link.path.lastIndexOf('node_modules/') + 'node_modules/'.length);

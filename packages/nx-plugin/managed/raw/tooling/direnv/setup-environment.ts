@@ -23,6 +23,7 @@ import { $ } from 'bun';
 import {
   activatePackageProduct,
   applyDeclaredLinks,
+  hasDanglingDeveloperLinks,
   keepDeveloperLinks,
   materializeDeclaredPackages,
   planDeclaredLinks,
@@ -451,12 +452,16 @@ function bunInstallStamp(inputs: readonly string[]): { isCurrent(): boolean; rec
  * copy-on-write clone — is installed exactly when this one is. Besides the
  * stamp, the TypeScript API package must still resolve through its link, the
  * one package every managed repository installs, which catches a cache that
- * was pruned out from under node_modules.
+ * was pruned out from under node_modules. A dangling developer target also
+ * invalidates a matching stamp, so the normal install replaces it.
  */
 function bunInstaller(inputs: readonly string[]): Installer {
   const stamp = bunInstallStamp(inputs);
   return {
-    isCurrent: () => stamp.isCurrent() && findInstalledTypeScriptApiPackage(projectRoot) !== null,
+    isCurrent: () =>
+      stamp.isCurrent() &&
+      findInstalledTypeScriptApiPackage(projectRoot) !== null &&
+      !hasDanglingDeveloperLinks(projectRoot),
     install: async ({ quiet }) => {
       await keepDeveloperLinks(projectRoot, () =>
         runSetupCommand('bun install --no-summary', $`bun install --no-summary`, { quiet }),

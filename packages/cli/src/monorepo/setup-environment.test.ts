@@ -676,15 +676,22 @@ describe('what shell entry keeps linked', () => {
   });
 
   it('replaces a dangling developer link with the installed lockfile dependency', async () => {
-    await withManagedRepository(WORKSPACE, async ({ root, enterShell: enter }) => {
+    await withManagedRepository(WORKSPACE, async ({ root, enterShell: enter, count }) => {
       expect(await enter()).toEqual(HEALTHY);
+      expect(count('install')).toBe(1);
+      const stamp = join(root, 'node_modules', '.smoo-install');
+      const stampBytes = readFileSync(stamp);
       const gone = join(dirname(root), 'deleted-lib');
       await rm(join(root, LINKED));
       symlinkSync(gone, join(root, LINKED));
 
-      await touchManifest(root);
+      expect(readFileSync(stamp)).toEqual(stampBytes);
       expect((await enter()).exitCode).toBe(0);
+      expect(count('install')).toBe(2);
       expect(readlinkSync(join(root, LINKED))).toBe('../../../lib');
+
+      expect((await enter()).exitCode).toBe(0);
+      expect(count('install')).toBe(2);
     });
   });
 

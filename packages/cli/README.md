@@ -391,16 +391,17 @@ nothing when nothing changed:
 
 - `setup-environment.ts` runs `bun install` only when its inputs changed since the last successful install: the root and
   every workspace member `package.json`, `bun.lock`, `bunfig.toml`, the patch files `patchedDependencies` names, and the
-  Bun version. The record lives in `node_modules/.smoo-install`, so deleting `node_modules` reinstalls; a failed install
-  records nothing and is retried on the next entry. A CI runner writes it too, after its install: devenv's
-  `smoo:install` task lists the file among its inputs, and a runner's devenv state outlives its checkout (a host runner
-  keeps it on a shared bind), so without the record a fresh checkout of an unchanged lockfile found the task current,
-  installed nothing, and the shell hook failed on a missing `ttsc`. A CI runner always installs with
-  `--frozen-lockfile`. A CI runner is one that sets `GITHUB_ACTIONS=true` (GitHub Actions, and Forgejo Actions, which
-  mirrors its variables as `GITHUB_*`), never `CI` alone: agent harnesses export `CI=true` on every command they run.
-  When that frozen install misses, the entry installs again without the flag, prints the `git diff` of what the install
-  changed (the `bun.lock` the pull request should have committed) and fails. The diff goes to stderr, whole: devenv
-  reports a failed shell entry as its stderr alone, so anything written to stdout would be lost.
+  Bun version, or when a required installed package is missing or an external developer link is dangling. The record
+  lives in `node_modules/.smoo-install`, so deleting `node_modules` reinstalls; a failed install records nothing and is
+  retried on the next entry. A CI runner writes it too, after its install: devenv's `smoo:install` task lists the file
+  among its inputs, and a runner's devenv state outlives its checkout (a host runner keeps it on a shared bind), so
+  without the record a fresh checkout of an unchanged lockfile found the task current, installed nothing, and the shell
+  hook failed on a missing `ttsc`. A CI runner always installs with `--frozen-lockfile`. A CI runner is one that sets
+  `GITHUB_ACTIONS=true` (GitHub Actions, and Forgejo Actions, which mirrors its variables as `GITHUB_*`), never `CI`
+  alone: agent harnesses export `CI=true` on every command they run. When that frozen install misses, the entry installs
+  again without the flag, prints the `git diff` of what the install changed (the `bun.lock` the pull request should have
+  committed) and fails. The diff goes to stderr, whole: devenv reports a failed shell entry as its stderr alone, so
+  anything written to stdout would be lost.
 - A repository whose `devenv.nix` enables `languages.python.uv` gets its uv workspace synced the same way
   (`uv sync --all-packages --all-groups`, `--locked` on a CI runner) into devenv's `UV_PROJECT_ENVIRONMENT`, with the
   interpreter devenv provides, and activated after the sync. Its inputs are the root `pyproject.toml`, `uv.lock` and
@@ -480,7 +481,9 @@ Every install smoo runs keeps such a link: shell entry's install, a CI runner's 
 `smoo monorepo update`. A developer link is any symlink directly in the root's or a workspace member's `node_modules`
 (scoped names included) whose target lies outside the repository. The install records these links first, then puts
 exactly those back afterwards. A link whose target no longer exists is removed with a warning, and that install puts the
-lockfile's version in its place. To unlink, remove the link: the next install puts the lockfile's version there.
+lockfile's version in its place. To unlink, remove the link: the next install puts the lockfile's version there. A
+missing external target also makes a matching stamp stale: the next managed shell entry installs and replaces the
+dangling link, while live external links are preserved.
 
 Only an observed missing target makes a link dangling. Permission or other metadata errors abort the install without
 removing captured links; an unreadable checkout is not a deleted checkout.
