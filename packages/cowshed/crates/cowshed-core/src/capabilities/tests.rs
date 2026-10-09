@@ -2,12 +2,81 @@ use super::test_support::Fixture;
 use super::*;
 
 #[test]
-fn a_plain_repository_has_no_tool_authority() {
+fn a_plain_repository_has_only_the_core_executable_probe() {
     let fixture = Fixture::new();
+    let detected = detect(&fixture.context(), &BTreeMap::new()).unwrap();
+    assert!(detected.active.is_empty());
+    assert!(detected.contribution.bootstrap_programs.is_empty());
     assert_eq!(
-        detect(&fixture.context(), &BTreeMap::new()).unwrap(),
-        DetectedCapabilities::default()
+        detected.contribution.grants,
+        [CapabilityGrant {
+            path: crate::host_dirs::support_directory(&fixture.home).join("bin/cowshed"),
+            scope: GrantScope::Literal,
+            access: GrantAccess::Read,
+        }]
     );
+}
+
+#[test]
+fn the_installed_cowshed_is_a_core_bootstrap_without_controller_data_authority() {
+    let fixture = Fixture::new();
+    let bin = crate::host_dirs::support_directory(&fixture.home).join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let program = bin.join("cowshed-build");
+    fs::write(&program, "#!/bin/sh\n").unwrap();
+    fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+    std::os::unix::fs::symlink("cowshed-build", bin.join("cowshed")).unwrap();
+
+    let detected = detect(&fixture.context(), &BTreeMap::new()).unwrap();
+    assert!(
+        detected.active.is_empty(),
+        "core bootstrap needs no project capability"
+    );
+    assert_eq!(
+        detected.contribution.bootstrap_programs,
+        [BootstrapProgram {
+            name: "cowshed",
+            target: program.clone()
+        }]
+    );
+    assert_eq!(
+        detected.contribution.grants,
+        [bin.join("cowshed"), program].map(|path| CapabilityGrant {
+            path,
+            scope: GrantScope::Literal,
+            access: GrantAccess::Read,
+        })
+    );
+    assert!(detected.contribution.shared_caches.is_empty());
+}
+
+#[test]
+fn a_detector_conflicting_with_the_core_program_returns_a_typed_conflict() {
+    let mut output = CapabilityContribution {
+        bootstrap_programs: vec![BootstrapProgram {
+            name: "cowshed",
+            target: PathBuf::from("/installed/cowshed"),
+        }],
+        ..CapabilityContribution::default()
+    };
+    let mut owners =
+        BTreeMap::from([(ContributionKey::Program("cowshed"), ContributionOwner::Core)]);
+    let error = merge(
+        &mut output,
+        &mut owners,
+        CapabilityId::Nx,
+        CapabilityContribution {
+            bootstrap_programs: vec![BootstrapProgram {
+                name: "cowshed",
+                target: PathBuf::from("/different/cowshed"),
+            }],
+            ..CapabilityContribution::default()
+        },
+    )
+    .unwrap_err();
+    assert_eq!(error.code, crate::ErrorCode::Conflict);
+    assert!(error.message.contains("core") && error.message.contains("nx"));
+    assert!(error.message.contains("cowshed"));
 }
 
 #[test]

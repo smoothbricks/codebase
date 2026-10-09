@@ -989,11 +989,16 @@ workspace root.
 - **Enforced by**: the consuming repository's Nx lint calls the plugin's `refuseOutputsUnderBuildState` validator with
   its already resolved graph (including project overrides), `cowshed build-state --json` path records, and its workspace
   root. A refusal names the target, output, and build-state path. Job admission and `cowshed doctor` never construct an
-  Nx graph or execute repository plugins for this rule.
+  Nx graph or execute repository plugins for this rule. Sandboxed lint resolves the installed `cowshed` through the
+  job's private `tools/bin` (15_capabilities.md, "Bootstrap executables"); its executable-only grant admits no
+  controller data or socket.
 - `cowshed build-state --json` reads the selected checkout's volume-state record and prints
   `{paths:[{checkout,volume}]}` without opening the controller or store. It never rediscovers tools. A missing link or
   state record refuses with `environment-missing` (exit 5): "this checkout has no build volume yet; run `cowshed setup`
-  (host) or any `cowshed exec` in it to migrate".
+  (host) or any `cowshed exec` in it to migrate". It selects the nearest `.git` marker from the canonicalized cwd or
+  `--project` path using the existing filesystem-only root walk, stopping at a filesystem boundary. It executes no Git
+  discovery subprocess: a controller's nested Git profile is neither required nor authority for a checkout-local state
+  read.
 
 ### Hash inputs are the same in every checkout
 

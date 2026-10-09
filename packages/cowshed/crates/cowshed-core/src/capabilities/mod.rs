@@ -369,7 +369,25 @@ fn detect_with(
 ) -> Result<DetectedCapabilities> {
     validate_project_directory(context.workspace_root, context.command_cwd)?;
     let mut result = DetectedCapabilities::default();
-    let mut owners = BTreeMap::new();
+    // The checkout-local build-state verb needs the installed CLI, not the controller.
+    // Resolve only this executable; neither its directory nor controller data joins the job.
+    add_bootstrap(
+        &mut result.contribution,
+        context,
+        "cowshed",
+        &[crate::host_dirs::support_directory(context.home).join("bin")],
+    )?;
+    let mut owners = result
+        .contribution
+        .bootstrap_programs
+        .iter()
+        .map(|program| {
+            (
+                ContributionKey::Program(program.name),
+                ContributionOwner::Core,
+            )
+        })
+        .collect();
     for detector in DETECTORS {
         let override_ = overrides.get(&detector.id);
         if override_.is_some_and(|override_| override_.disabled) {
@@ -429,6 +447,21 @@ enum ContributionKey {
     Shell,
 }
 
+#[derive(Clone, Copy)]
+enum ContributionOwner {
+    Core,
+    Detector(CapabilityId),
+}
+
+impl ContributionOwner {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Core => "core",
+            Self::Detector(id) => id.name(),
+        }
+    }
+}
+
 fn merge_build_state(
     output: &mut Vec<BuildStatePath>,
     incoming: Vec<BuildStatePath>,
@@ -466,7 +499,7 @@ fn merge_build_state(
 
 fn merge(
     output: &mut CapabilityContribution,
-    owners: &mut BTreeMap<ContributionKey, CapabilityId>,
+    owners: &mut BTreeMap<ContributionKey, ContributionOwner>,
     id: CapabilityId,
     contribution: CapabilityContribution,
 ) -> Result<()> {
@@ -495,7 +528,10 @@ fn merge(
                 ));
             }
         } else {
-            owners.insert(ContributionKey::Environment(name), id);
+            owners.insert(
+                ContributionKey::Environment(name),
+                ContributionOwner::Detector(id),
+            );
             output.env.insert(name, action);
         }
     }
@@ -519,7 +555,7 @@ fn merge(
             }
             owners
                 .entry(ContributionKey::CacheTarget(target.clone()))
-                .or_insert(id);
+                .or_insert(ContributionOwner::Detector(id));
         }
     }
     if let Some(shell) = contribution.shell {
@@ -540,7 +576,9 @@ fn merge(
                 "repair shell capability configuration",
             ));
         }
-        owners.entry(ContributionKey::Shell).or_insert(id);
+        owners
+            .entry(ContributionKey::Shell)
+            .or_insert(ContributionOwner::Detector(id));
         output.shell = Some(shell);
     }
     output.grants.extend(contribution.grants);
@@ -567,7 +605,7 @@ fn merge(
                     .expect("every program records its owner");
                 return Err(CowshedError::conflict(
                     format!(
-                        "{} and {} detectors conflict on executable {}",
+                        "{} and {} contributors conflict on executable {}",
                         previous.name(),
                         id.name(),
                         program.name
@@ -576,7 +614,10 @@ fn merge(
                 ));
             }
         } else {
-            owners.insert(ContributionKey::Program(program.name), id);
+            owners.insert(
+                ContributionKey::Program(program.name),
+                ContributionOwner::Detector(id),
+            );
             output.bootstrap_programs.push(program);
         }
     }

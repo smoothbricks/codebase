@@ -51,10 +51,25 @@ struct Listing<'a> {
 }
 
 pub fn dispatch<W: Write, E: Write>(
-    checkout: &Path,
+    start: &Path,
     json: bool,
     output: &mut Output<W, E>,
 ) -> Result<i32> {
+    let start = fs::canonicalize(start).map_err(|error| {
+        CowshedError::environment_missing(
+            format!(
+                "could not resolve checkout path {}: {error}",
+                start.display()
+            ),
+            "run from a readable git checkout or pass --project <git-root>",
+        )
+    })?;
+    let checkout = cowshed_core::resident::repository_root(&start).ok_or_else(|| {
+        CowshedError::environment_missing(
+            format!("{} is not inside a git checkout", start.display()),
+            "run from a git checkout or pass --project <git-root>",
+        )
+    })?;
     let state = read(checkout)?;
     if json {
         output
@@ -108,6 +123,7 @@ mod tests {
         let checkout = root.0.join("checkout");
         let volume = root.0.join("volume");
         fs::create_dir_all(checkout.join(".cowshed")).unwrap();
+        fs::create_dir(checkout.join(".git")).unwrap();
         fs::create_dir(&volume).unwrap();
         (root, checkout, volume)
     }
@@ -147,6 +163,13 @@ mod tests {
         let mut output = Output::new(Vec::new(), Vec::new(), false);
         assert_eq!(dispatch(&checkout, true, &mut output).unwrap(), 0);
         let (stdout, stderr) = output.into_inner();
+        let nested = checkout.join("nested/cwd");
+        fs::create_dir_all(&nested).unwrap();
+        let mut nested_output = Output::new(Vec::new(), Vec::new(), false);
+        assert_eq!(dispatch(&nested, true, &mut nested_output).unwrap(), 0);
+        let (nested_stdout, nested_stderr) = nested_output.into_inner();
+        assert_eq!(nested_stdout, stdout);
+        assert!(nested_stderr.is_empty());
         assert!(stderr.is_empty());
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&stdout).unwrap(),

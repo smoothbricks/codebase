@@ -110,12 +110,19 @@ mod tests {
     }
 
     #[test]
-    fn a_program_linked_outside_the_store_reads_nothing() {
+    fn a_program_linked_outside_the_store_adds_no_grant_beyond_the_core_probe() {
         let fixture = Fixture::new();
         let tools = fixture.root.join(".cowshed/tools/bin");
         std::fs::create_dir_all(&tools).unwrap();
         std::os::unix::fs::symlink("/usr/bin/env", tools.join("env")).unwrap();
         let detected = super::super::detect(&fixture.context(), &BTreeMap::new()).unwrap();
-        assert!(detected.contribution.grants.is_empty());
+        assert_eq!(
+            detected.contribution.grants,
+            [CapabilityGrant {
+                path: crate::host_dirs::support_directory(&fixture.home).join("bin/cowshed"),
+                scope: GrantScope::Literal,
+                access: GrantAccess::Read,
+            }]
+        );
     }
 }

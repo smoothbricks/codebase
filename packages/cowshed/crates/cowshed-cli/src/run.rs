@@ -159,9 +159,16 @@ async fn run_command(parsed: args::Cli, interrupts: InterruptPolicy) -> Result<i
         return Ok(finish(outcome, &mut output, json));
     }
     if matches!(parsed.command, args::Command::BuildState) {
-        let outcome = match runtime::resolve_project_root(&parsed).await {
-            Ok(root) => crate::build_state::dispatch(&root, json, &mut output),
-            Err(error) => Err(error),
+        let outcome = match parsed.global.project.as_deref() {
+            Some(start) => crate::build_state::dispatch(start, json, &mut output),
+            None => std::env::current_dir()
+                .map_err(|error| {
+                    CowshedError::environment_missing(
+                        format!("could not determine the current directory: {error}"),
+                        "use --project <git-root>",
+                    )
+                })
+                .and_then(|start| crate::build_state::dispatch(&start, json, &mut output)),
         };
         return Ok(finish(outcome, &mut output, json));
     }

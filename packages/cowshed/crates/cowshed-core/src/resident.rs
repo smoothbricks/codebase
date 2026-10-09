@@ -381,7 +381,7 @@ fn build_volume_grant(
 /// The nearest ancestor of `start` holding `.git`, as Git's discovery finds it: the walk stops
 /// at a filesystem boundary, and the directory the boundary is crossed from is the last one
 /// Git examines.
-fn repository_root(start: &Path) -> Option<&Path> {
+pub fn repository_root(start: &Path) -> Option<&Path> {
     use std::os::unix::fs::MetadataExt as _;
 
     let device = start.metadata().ok()?.dev();
