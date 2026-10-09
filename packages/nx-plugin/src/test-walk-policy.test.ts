@@ -107,6 +107,36 @@ describe('test-walk-policy', () => {
         ['same-path', 'C', 'B', 2],
       ]);
 
+      // An advisory partner never hides a refusing one. B repeats a's path (same-path, 2 statements) and replays c's
+      // scenario (same-scenario, 4 statements, nearer); both are reported, and the refusal stands.
+      write(
+        ts,
+        lines(
+          "test('a', () => {",
+          '  const ledger = openLedger(memoryLog());',
+          "  ledger.post({ account: 'sales', amount: 50 });",
+          "  expect(ledger.balance('sales')).toBe(50);",
+          '});',
+          "test('c', () => {",
+          '  const ledger = openLedger(memoryLog());',
+          "  ledger.close('2026-09');",
+          "  ledger.post({ account: 'sales', amount: 50 });",
+          "  ledger.post({ account: 'fees', amount: 5 });",
+          '  expect(ledger.journal()).toHaveLength(2);',
+          '});',
+          "test('b', () => {",
+          '  const ledger = openLedger(memoryLog());',
+          "  ledger.post({ account: 'sales', amount: 50 });",
+          "  ledger.post({ account: 'fees', amount: 5 });",
+          '  expect(ledger.journal()).toHaveLength(2);',
+          '});',
+        ),
+      );
+      expect(pairs(ts)).toEqual([
+        ['same-path', 'a', 'b', 2],
+        ['same-scenario', 'c', 'b', 4],
+      ]);
+
       // Two cases that differ only in the posted and expected values are one table.
       write(
         ts,
