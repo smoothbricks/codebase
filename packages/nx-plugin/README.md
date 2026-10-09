@@ -439,6 +439,33 @@ are resolved against the caller's workspace root. `BuildStateOutputError.finding
 configuration, output, and contributed path. Keep cacheable artifacts under source-tree paths such as `dist/` and
 `.cache/nextest/`; restoring an output under `target/` or `.nx/` can replace a build-volume link with a real directory.
 
+## Test Walk Policy
+
+A test pays its setup once and asserts after each step; two cases that test one path are one test. Consuming
+repositories enforce this in their Nx lint with `findDuplicateScenarios(root, files, changes)` and
+`formatDuplicateScenario` from `@smoothbricks/nx-plugin/test-walk-policy`. `diffScope(root, base)` gives the files
+changed since `base` and their new-side line ranges, so the check judges a pair only when one of its cases changed.
+Existing pairs therefore need no allowance table.
+
+The policy reads bun:test `test`/`it` cases in test files and `#[test]`-family fns in any Rust file. It normalizes each
+top-level statement of a case body three ways. `exact` renames the names the case declares to their declaration index.
+`shape` also abstracts every literal. `skeleton` also collapses the declared names. Field, method, key and path names
+are never renamed. A pure assertion reads only what earlier steps built: `expect`/`assert…` that calls only methods and
+runs no closure, constructor, rejection or throw matcher; an `if (…) throw` guard; or an `assert*!` that borrows nothing
+mutably and calls no method on a `let mut` local. `TEST-ONE-WALK` refuses three shapes:
+
+- **same-path:** the cases share at least two leading statements exactly, and one of them only purely asserts beyond
+  them. Fold its assertions into the other's walk.
+- **literal-twin:** two or more statements equal once literals are abstracted. Make one table or property over the
+  values.
+- **same-scenario:** one case's skeleton is the other's head (at least one statement) and tail (at least three: the
+  action and its outcome) around exactly one statement of its own. The injected step differs, for example which crash
+  window or precondition. Extra trailing pure assertions on either side are more checks on the same outcome. Walk the
+  variants over one fixture, or make one table over the injected step.
+
+A separate case stays only for a distinct boundary or edge: its setup or path diverges, or it needs a state the walk's
+earlier steps destroy. Each diagnostic names the file, both cases, the shared statement count and that remedy.
+
 ## Nx Target Naming
 
 Target names are `{tool}-{output}` names. Use names like `tsc-js`, `tsdown-js`, and `cargo-wasm`; `build` and `lint` are
