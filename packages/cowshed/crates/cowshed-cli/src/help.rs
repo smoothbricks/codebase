@@ -446,9 +446,7 @@ mod tests {
 
     #[test]
     fn current_help_pages_do_not_name_the_deleted_clone_command() {
-        for command in ["defrag", "reseed"] {
-            let page = command_named(command).unwrap().page();
-            assert!(!page.contains("`new`"), "{command}: {page}");
-        }
+        let page = command_named("defrag").unwrap().page();
+        assert!(!page.contains("`new`"), "{page}");
     }
 }

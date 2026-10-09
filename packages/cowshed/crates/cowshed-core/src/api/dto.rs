@@ -1626,6 +1626,21 @@ pub struct LandAdoptionCommitment {
     pub inputs_digest: Sha256Digest,
 }
 
+/// One land's actual build-volume outcome, including a seeded-but-skipped adoption.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LandOutcomeCommitment {
+    pub version: u16,
+    pub order: u64,
+    pub repo_id: RepoId,
+    pub landing_incarnation: WorkspaceIncarnation,
+    pub target_incarnation: WorkspaceIncarnation,
+    pub landed_head: GitOid,
+    pub seeded: bool,
+    /// None only when adoption succeeded; otherwise the report's complete refusal.
+    pub skip: Option<AdoptionSkip>,
+}
+
 /// Versioned controller-owned existence, lifecycle, order, and lineage evidence.
 ///
 /// Protected payload bytes and artifact paths deliberately do not appear in any variant.
@@ -1640,6 +1655,7 @@ pub enum ControllerCommitment {
     Fork(ForkCommitment),
     Restore(RestoreCommitment),
     LandAdoption(LandAdoptionCommitment),
+    LandOutcome(LandOutcomeCommitment),
 }
 
 impl ControllerCommitment {
@@ -1653,6 +1669,7 @@ impl ControllerCommitment {
             Self::Fork(value) => value.version,
             Self::Restore(value) => value.version,
             Self::LandAdoption(value) => value.version,
+            Self::LandOutcome(value) => value.version,
         }
     }
 
@@ -1666,6 +1683,7 @@ impl ControllerCommitment {
             Self::Fork(value) => value.order,
             Self::Restore(value) => value.order,
             Self::LandAdoption(value) => value.order,
+            Self::LandOutcome(value) => value.order,
         }
     }
 
@@ -1679,6 +1697,7 @@ impl ControllerCommitment {
             Self::Fork(value) => &value.repo_id,
             Self::Restore(value) => &value.repo_id,
             Self::LandAdoption(value) => &value.repo_id,
+            Self::LandOutcome(value) => &value.repo_id,
         }
     }
 
@@ -1752,6 +1771,14 @@ impl ControllerCommitment {
                     "land adoption task and hash must be named",
                 ))
             }
+            Self::LandOutcome(value) if value.landing_incarnation == value.target_incarnation => {
+                Err(DtoError::InvalidJobProjection(
+                    "land outcome landing and target incarnations must differ",
+                ))
+            }
+            Self::LandOutcome(value) if !value.seeded && value.skip.is_none() => Err(
+                DtoError::InvalidJobProjection("an adopted land outcome must be seeded"),
+            ),
             _ => Ok(()),
         }
     }
@@ -1775,6 +1802,7 @@ enum ControllerCommitmentRef<'a> {
     Fork(&'a ForkCommitment),
     Restore(&'a RestoreCommitment),
     LandAdoption(&'a LandAdoptionCommitment),
+    LandOutcome(&'a LandOutcomeCommitment),
 }
 
 #[derive(Deserialize)]
@@ -1788,6 +1816,7 @@ enum ControllerCommitmentWire {
     Fork(ForkCommitment),
     Restore(RestoreCommitment),
     LandAdoption(LandAdoptionCommitment),
+    LandOutcome(LandOutcomeCommitment),
 }
 
 impl Serialize for ControllerCommitment {
@@ -1805,6 +1834,7 @@ impl Serialize for ControllerCommitment {
             Self::Fork(value) => ControllerCommitmentRef::Fork(value),
             Self::Restore(value) => ControllerCommitmentRef::Restore(value),
             Self::LandAdoption(value) => ControllerCommitmentRef::LandAdoption(value),
+            Self::LandOutcome(value) => ControllerCommitmentRef::LandOutcome(value),
         }
         .serialize(serializer)
     }
@@ -1826,6 +1856,7 @@ impl<'de> Deserialize<'de> for ControllerCommitment {
             ControllerCommitmentWire::Fork(value) => Self::Fork(value),
             ControllerCommitmentWire::Restore(value) => Self::Restore(value),
             ControllerCommitmentWire::LandAdoption(value) => Self::LandAdoption(value),
+            ControllerCommitmentWire::LandOutcome(value) => Self::LandOutcome(value),
         };
         value.validate().map_err(serde::de::Error::custom)?;
         Ok(value)
@@ -2732,101 +2763,6 @@ pub struct DefragmentResult {
     pub previous_extents: u64,
     pub extents: u64,
     pub bytes: u64,
-}
-
-/// What `cowshed reseed` did with a target's seed (16_build_volumes.md, "Targets and seeds").
-/// Every fork of the target does the same before it clones the seed.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ReseedResult {
-    pub workspace: WorkspaceName,
-    pub outcome: Reseed,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
-pub enum Reseed {
-    /// The target links no build volume: it has no seed to keep up.
-    NoBuildVolume,
-    /// The seed already holds every write the target's live build volume has had.
-    Fresh,
-    /// The seed is now a clone of the live volume. It was frozen `behindMs` before the live
-    /// volume's last write, or the target had none (`behindMs` absent).
-    Reseeded {
-        #[serde(rename = "behindMs", skip_serializing_if = "Option::is_none")]
-        behind_ms: Option<u64>,
-        #[serde(rename = "elapsedMs")]
-        elapsed_ms: u64,
-    },
-    /// The seed stays behind: the live volume has a writer, and a clone of it could hold a
-    /// half-written Cargo unit or Nx database. The next fork tries again.
-    Skipped {
-        #[serde(rename = "behindMs", skip_serializing_if = "Option::is_none")]
-        behind_ms: Option<u64>,
-        reason: ReseedSkip,
-    },
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
-pub enum ReseedSkip {
-    /// A process other than the target's Nx daemon holds its task database at admission.
-    Held {
-        database: PathBuf,
-        holders: Vec<DatabaseHolder>,
-    },
-    /// The target's Nx daemon outlived its stop.
-    DaemonStayed { daemon: DatabaseHolder },
-    /// A Cargo build holds a target directory's build lock.
-    Building {
-        lock: PathBuf,
-        holders: Vec<DatabaseHolder>,
-    },
-    /// The source could not be sealed without forcing a filesystem holder off its volume.
-    VolumeBusy { reason: String },
-}
-
-impl fmt::Display for ReseedSkip {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let holders = |formatter: &mut fmt::Formatter<'_>, holders: &[DatabaseHolder]| {
-            for (index, holder) in holders.iter().enumerate() {
-                let separator = if index == 0 { "" } else { ", " };
-                write!(
-                    formatter,
-                    "{separator}pid {} ({})",
-                    holder.pid, holder.command
-                )?;
-            }
-            Ok(())
-        };
-        match self {
-            Self::Held {
-                database,
-                holders: held,
-            } => {
-                write!(formatter, "{} is open in ", database.display())?;
-                holders(formatter, held)
-            }
-            Self::DaemonStayed { daemon } => write!(
-                formatter,
-                "the Nx daemon pid {} ({}) did not exit after SIGTERM",
-                daemon.pid, daemon.command
-            ),
-            Self::Building {
-                lock,
-                holders: held,
-            } => {
-                write!(formatter, "a Cargo build holds {}", lock.display())?;
-                if !held.is_empty() {
-                    formatter.write_str(": ")?;
-                }
-                holders(formatter, held)
-            }
-            Self::VolumeBusy { reason } => {
-                write!(formatter, "the build volume could not be sealed: {reason}")
-            }
-        }
-    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -3748,7 +3684,6 @@ result_bodies!(
     RebaseReport,
     ResizeResult,
     DefragmentResult,
-    ReseedResult,
     SlotResult,
     WorkspaceInfo,
     JobInfo,

@@ -456,6 +456,13 @@ export const assertIdentityReportList = typia.createAssertEquals<readonly Api.Id
 export const parseIdentityReportList = (json: string): readonly Api.IdentityReport[] =>
   assertIdentityReportList(JSON.parse(json));
 
+export const assertIndexMigrationRefusal = typia.createAssertEquals<Api.IndexMigrationRefusal>();
+export const parseIndexMigrationRefusal = (json: string): Api.IndexMigrationRefusal =>
+  assertIndexMigrationRefusal(JSON.parse(json));
+export const assertIndexMigrationRefusalList = typia.createAssertEquals<readonly Api.IndexMigrationRefusal[]>();
+export const parseIndexMigrationRefusalList = (json: string): readonly Api.IndexMigrationRefusal[] =>
+  assertIndexMigrationRefusalList(JSON.parse(json));
+
 export const assertJobAccounting = typia.createAssertEquals<Api.JobAccounting>();
 export const parseJobAccounting = (json: string): Api.JobAccounting => assertJobAccounting(JSON.parse(json));
 export const assertJobAccountingList = typia.createAssertEquals<readonly Api.JobAccounting[]>();
@@ -605,6 +612,13 @@ export const parseLandOptions = (json: string): Api.LandOptions => assertLandOpt
 export const assertLandOptionsList = typia.createAssertEquals<readonly Api.LandOptions[]>();
 export const parseLandOptionsList = (json: string): readonly Api.LandOptions[] =>
   assertLandOptionsList(JSON.parse(json));
+
+export const assertLandOutcomeCommitment = typia.createAssertEquals<Api.LandOutcomeCommitment>();
+export const parseLandOutcomeCommitment = (json: string): Api.LandOutcomeCommitment =>
+  assertLandOutcomeCommitment(JSON.parse(json));
+export const assertLandOutcomeCommitmentList = typia.createAssertEquals<readonly Api.LandOutcomeCommitment[]>();
+export const parseLandOutcomeCommitmentList = (json: string): readonly Api.LandOutcomeCommitment[] =>
+  assertLandOutcomeCommitmentList(JSON.parse(json));
 
 export const assertLandReport = typia.createAssertEquals<Api.LandReport>();
 export const parseLandReport = (json: string): Api.LandReport => assertLandReport(JSON.parse(json));
@@ -939,22 +953,6 @@ export const parseRepositoryBinding = (json: string): Api.RepositoryBinding =>
 export const assertRepositoryBindingList = typia.createAssertEquals<readonly Api.RepositoryBinding[]>();
 export const parseRepositoryBindingList = (json: string): readonly Api.RepositoryBinding[] =>
   assertRepositoryBindingList(JSON.parse(json));
-
-export const assertReseed = typia.createAssertEquals<Api.Reseed>();
-export const parseReseed = (json: string): Api.Reseed => assertReseed(JSON.parse(json));
-export const assertReseedList = typia.createAssertEquals<readonly Api.Reseed[]>();
-export const parseReseedList = (json: string): readonly Api.Reseed[] => assertReseedList(JSON.parse(json));
-
-export const assertReseedResult = typia.createAssertEquals<Api.ReseedResult>();
-export const parseReseedResult = (json: string): Api.ReseedResult => assertReseedResult(JSON.parse(json));
-export const assertReseedResultList = typia.createAssertEquals<readonly Api.ReseedResult[]>();
-export const parseReseedResultList = (json: string): readonly Api.ReseedResult[] =>
-  assertReseedResultList(JSON.parse(json));
-
-export const assertReseedSkip = typia.createAssertEquals<Api.ReseedSkip>();
-export const parseReseedSkip = (json: string): Api.ReseedSkip => assertReseedSkip(JSON.parse(json));
-export const assertReseedSkipList = typia.createAssertEquals<readonly Api.ReseedSkip[]>();
-export const parseReseedSkipList = (json: string): readonly Api.ReseedSkip[] => assertReseedSkipList(JSON.parse(json));
 
 export const assertResidentBytes = typia.createAssertEquals<Api.ResidentBytes>();
 export const parseResidentBytes = (json: string): Api.ResidentBytes => assertResidentBytes(JSON.parse(json));

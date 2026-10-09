@@ -58,7 +58,6 @@ fn paths() -> Vec<BuildStatePath> {
         BuildStatePath::new("target", "target").unwrap(),
         BuildStatePath::new(".nx/cache", "nx/cache").unwrap(),
         BuildStatePath::new(".nx/workspace-data", "nx/workspace-data").unwrap(),
-        BuildStatePath::new(".codegraph", "codegraph").unwrap(),
     ]
 }
 
@@ -125,10 +124,9 @@ fn migration_discards_only_contributed_real_state_and_keeps_one_fixed_link_per_p
     let findings = adopt_paths(&checkout, &scratch.volume(), &paths())
         .unwrap()
         .unwrap();
-    assert_eq!(findings.len(), 4);
+    assert_eq!(findings.len(), 3);
     assert_eq!(findings[0].likely_tool, BuildStateTool::Cargo);
     assert_eq!(findings[1].likely_tool, BuildStateTool::Nx);
-    assert_eq!(findings[3].likely_tool, BuildStateTool::Codegraph);
     for state in paths() {
         assert_eq!(
             fs::read_link(checkout.join(state.checkout.as_path())).unwrap(),

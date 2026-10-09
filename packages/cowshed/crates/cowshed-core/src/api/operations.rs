@@ -15,9 +15,9 @@ use super::dto::{
     GcOptions, GcReport, GrantDelta, GrantSet, JobId, JobInfo, JobJournalCursor, JobListeningPorts,
     JobTail, JobTailLimits, LandOptions, LandReport, MirrorInfo, OutputPublication,
     ProjectGrantDelta, PushOptions, PushReport, RebaseOptions, RebaseReport, RemoveOptions,
-    RemoveProjectOptions, RemoveProjectReport, RemoveReport, ReseedResult, ResizeResult,
-    ResizeVolume, RunSandboxMode, ScriptCommand, SealedJob, TraceContext, WorkspaceIncarnation,
-    WorkspaceInfo, WorkspacePath, WorkspaceTarget,
+    RemoveProjectOptions, RemoveProjectReport, RemoveReport, ResizeResult, ResizeVolume,
+    RunSandboxMode, ScriptCommand, SealedJob, TraceContext, WorkspaceIncarnation, WorkspaceInfo,
+    WorkspacePath, WorkspaceTarget,
 };
 use super::process::{JobProcessEvent, JobProcessTree};
 use super::resources::{JobResourceSample, SampleInterval};
@@ -292,8 +292,6 @@ operations! {
     coordinator json "coordinator.resize" CoordinatorResize(ResizeRequest) -> ResizeResult;
     /// Rewrites a workspace's image contiguously.
     coordinator json "coordinator.defragment" CoordinatorDefragment(WorkspaceRequest) -> DefragmentResult;
-    /// Refreezes a target's seed from its live build volume.
-    coordinator json "coordinator.reseed" CoordinatorReseed(WorkspaceRequest) -> ReseedResult;
     /// Detaches a workspace.
     coordinator json "coordinator.detach" CoordinatorDetach(WorkspaceRequest) -> EmptyResult;
     /// Assigns a workspace's gateway port slot.

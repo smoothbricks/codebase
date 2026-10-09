@@ -12,7 +12,7 @@ use cowshed_cli::runtime::{ActorBridge, CliService, dispatch};
 use cowshed_core::api::JsonEnvelope;
 use cowshed_core::api::dto::{
     Adoption, AdoptionSkip, CarrySide, DatabaseHolder, GcReport, LandReport, LandSeed,
-    RebaseBuildVolume, RebaseCarrySkip, RebaseReport, Reseed, ReseedResult,
+    RebaseBuildVolume, RebaseCarrySkip, RebaseReport,
 };
 use cowshed_core::build_volume::{
     BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord, BuildVolumeRole, link, nx,
@@ -1376,8 +1376,8 @@ fn assert_nx_executable(checkout: &Path) {
     );
 }
 
-/// Every `landAdoption` commitment sealed under `telemetry`.
-fn land_adoptions(telemetry: &Path) -> Vec<cowshed_core::api::dto::LandAdoptionCommitment> {
+/// Every controller commitment sealed under `telemetry`.
+fn controller_commitments(telemetry: &Path) -> Vec<cowshed_core::api::dto::ControllerCommitment> {
     let mut found = Vec::new();
     let mut pending = vec![telemetry.to_path_buf()];
     while let Some(directory) = pending.pop() {
@@ -1394,11 +1394,7 @@ fn land_adoptions(telemetry: &Path) -> Vec<cowshed_core::api::dto::LandAdoptionC
                     &fs::read(&path).unwrap(),
                 )
                 .unwrap();
-                if let cowshed_core::api::dto::ControllerCommitment::LandAdoption(adoption) =
-                    commitment
-                {
-                    found.push(adoption);
-                }
+                found.push(commitment);
             }
         }
     }
@@ -1411,6 +1407,37 @@ fn nx_run_many(node: &Path, targets: &str) -> String {
         "{} node_modules/nx/dist/bin/nx.js run-many -t {targets}",
         node.display()
     )
+}
+
+fn land_adoptions(telemetry: &Path) -> Vec<cowshed_core::api::dto::LandAdoptionCommitment> {
+    controller_commitments(telemetry)
+        .into_iter()
+        .filter_map(|value| match value {
+            cowshed_core::api::dto::ControllerCommitment::LandAdoption(value) => Some(value),
+            _ => None,
+        })
+        .collect()
+}
+
+fn assert_land_outcome(telemetry: &Path, build: &cowshed_core::api::dto::LandBuildVolume) {
+    let outcomes = controller_commitments(telemetry)
+        .into_iter()
+        .filter_map(|value| match value {
+            cowshed_core::api::dto::ControllerCommitment::LandOutcome(value) => Some(value),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let [outcome] = outcomes.as_slice() else {
+        panic!("one durable outcome per land: {outcomes:?}");
+    };
+    assert_eq!(outcome.seeded, build.seeded);
+    assert_eq!(
+        outcome.skip.as_ref(),
+        match &build.adoption {
+            Adoption::Adopted { .. } => None,
+            Adoption::Skipped { reason } => Some(reason),
+        }
+    );
 }
 
 /// A land whose checks build `a` and then test it, from a topic forked off main: the build's
@@ -2040,11 +2067,10 @@ async fn nx_statuses(
 /// of the old volume, its new label and the exact linked mounts (16_build_volumes.md, steps 5–7).
 /// What main runs after a land reaches main's seed (16_build_volumes.md, "Targets and seeds"):
 /// main changes `a` and runs it on the adopted volume, so its seed, frozen from the landing
-/// volume, is behind; doctor says so, `cowshed reseed main` refreezes it, and a fork hits
-/// main's run. A fork that reseeds its source on its own is
-/// [`directory_a_fork_of_a_workspace_reseeds_it_and_hits_its_latest_run_substrate_lifecycle`]:
-/// `fork` reseeds through the one fork path, so a second fork of main here would only pay two more
-/// attaches for it.
+/// volume at the same tree, is behind; doctor says so, and the next `fork` reseeds main
+/// from its volume before it clones the seed and hits main's run. No command does it by hand.
+/// A fork of a workspace reseeds through the same fork path:
+/// [`directory_a_fork_of_a_workspace_reseeds_it_and_hits_its_latest_run_substrate_lifecycle`].
 #[tokio::test]
 async fn directory_what_main_runs_after_a_land_reaches_its_seed_and_a_fork_hits_it_substrate_lifecycle()
  {
@@ -2135,37 +2161,21 @@ async fn directory_what_main_runs_after_a_land_reaches_its_seed_and_a_fork_hits_
         .map(|finding| finding["message"].as_str().unwrap_or_default().to_owned())
         .collect::<Vec<_>>();
     assert!(
-        behind
-            .iter()
-            .any(|message| message.starts_with(&format!("main's seed {landed_seed} "))),
+        behind.iter().any(|message| {
+            message.starts_with("main's build volume ")
+                && message.contains(&format!("its seed {landed_seed}, "))
+        }),
         "doctor reports main's seed behind its volume: {behind:?}"
     );
 
-    let (stdout, stderr) = succeed(&mut service, ["--json", "reseed", "main"]).await;
-    let envelope: JsonEnvelope<ReseedResult> = serde_json::from_slice(&stdout)
-        .unwrap_or_else(|error| panic!("reseed --json ({error}): {stderr}"));
-    let reseeded = envelope.result().cloned().expect("a reseed result");
-    assert!(
-        matches!(
-            reseeded.outcome,
-            Reseed::Reseeded {
-                behind_ms: Some(_),
-                ..
-            }
-        ),
-        "{reseeded:?}"
-    );
+    let w1 = new_workspace(&mut service, "w1").await;
     let [(seed, record)] = seeds_of_main(&layout).try_into().expect("one seed of main");
-    assert_ne!(seed, landed_seed, "the landed seed was replaced");
+    assert_ne!(seed, landed_seed, "the fork reseeded main first");
     assert_eq!(
         record.tree.as_ref().map(|tree| tree.as_str()),
         Some(landed_tree.as_str()),
         "the seed records the tree its volume was adopted at"
     );
-    let (stdout, _) = succeed(&mut service, ["reseed", "main"]).await;
-    assert_eq!(stdout, b"fresh\n", "nothing wrote main's volume since");
-
-    let w1 = new_workspace(&mut service, "w1").await;
     let hits = nx_statuses(&mut service, "w1", &w1, &nx_check).await;
     assert_eq!(hits.len(), 2, "{hits:?}");
     assert!(
@@ -2427,68 +2437,6 @@ async fn directory_a_land_carries_mains_nx_entries_into_the_volume_main_adopts_s
     );
 }
 
-/// Run `sql` against the SQLite database `database` with the system's `sqlite3`; it must
-/// succeed. Answers its stdout.
-fn sqlite3(database: &Path, sql: &str) -> String {
-    let output = Command::new("/usr/bin/sqlite3")
-        .arg(database)
-        .arg(sql)
-        .output()
-        .expect("sqlite3 process");
-    assert!(
-        output.status.success(),
-        "sqlite3 {} {sql:?}: {}",
-        database.display(),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8(output.stdout).expect("sqlite3 prints UTF-8")
-}
-
-/// A land carries main's code-graph index into a landing volume that has none
-/// (16_build_volumes.md, "Carry"): `w` forks before main indexes, so its volume's `.codegraph/`
-/// holds no database; main then indexes, `w` lands, and main's `.codegraph/codegraph.db`, now on
-/// the adopted volume, opens with main's rows. Adopting `w`'s volume as it was left main's
-/// `.codegraph/` empty after every such land.
-#[tokio::test]
-async fn directory_a_land_carries_mains_code_graph_index_into_the_volume_main_adopts() {
-    let mut fixture = Fixture::directory();
-    fs::create_dir(fixture.checkout.join(".codegraph")).unwrap();
-    let mut service = serve_project(&mut fixture, &[]).await;
-    let layout = build_volumes(&fixture);
-
-    let workspace = new_workspace(&mut service, "w").await;
-    fs::write(workspace.join("notes.txt"), b"notes\n").unwrap();
-    git(&workspace, &["add", "notes.txt"]);
-    git(&workspace, &["commit", "-q", "-m", "notes"]);
-    let landing = linked_volume(&layout, &workspace);
-    let index = fixture.checkout.join(".codegraph/codegraph.db");
-    sqlite3(
-        &index,
-        "PRAGMA journal_mode = WAL; CREATE TABLE nodes (id TEXT PRIMARY KEY); \
-         INSERT INTO nodes VALUES ('main');",
-    );
-    assert!(
-        !layout
-            .mount(&landing)
-            .join("codegraph/codegraph.db")
-            .exists()
-    );
-
-    let report = land(&mut service, "w", true, &[]).await;
-    let adopted = linked_volume(&layout, &fixture.checkout);
-    let nodes = index
-        .is_file()
-        .then(|| sqlite3(&index, "SELECT id FROM nodes;"));
-    service.shutdown().await.expect("stop the runtime");
-    fixture.stop_gateway().await;
-    assert!(report.build_volume.adoption.is_adopted(), "{report:?}");
-    assert_eq!(adopted, landing);
-    assert_eq!(
-        nodes.as_deref(),
-        Some("main\n"),
-        "main's .codegraph/ on the adopted volume holds main's index"
-    );
-}
 
 /// A rebase carries main's Nx cache entries into the rebased workspace's volume
 /// (16_build_volumes.md, "Rebase carry"), and only those the rebased tree looks up: `b`, forked
@@ -2774,6 +2722,7 @@ async fn directory_a_foreign_database_opener_skips_adoption_with_its_pid_and_arg
         LandSeed::Frozen,
         "a skipped swap still freezes its seed: {report:?}"
     );
+    assert_land_outcome(fixture.storage.telemetry(), &report.build_volume);
     match report.build_volume.adoption {
         Adoption::Skipped {
             reason:
@@ -2835,6 +2784,7 @@ async fn directory_a_foreign_database_opener_skips_adoption_with_its_pid_and_arg
         LandSeed::Frozen,
         "forks still start from the new seed: {report:?}"
     );
+    assert_land_outcome(fixture.storage.telemetry(), &report.build_volume);
     match report.build_volume.adoption {
         Adoption::Skipped {
             reason:

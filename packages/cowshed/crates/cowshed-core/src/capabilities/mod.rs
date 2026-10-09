@@ -23,7 +23,6 @@ pub use build_state_discovery::{
 pub mod bun;
 pub mod cache;
 pub mod cargo;
-mod codegraph;
 mod direnv;
 pub mod go;
 pub mod gradle;
@@ -54,7 +53,6 @@ pub enum CapabilityId {
     Gradle,
     Nix,
     Sccache,
-    Codegraph,
 }
 
 impl CapabilityId {
@@ -72,7 +70,6 @@ impl CapabilityId {
             Self::Gradle => "gradle",
             Self::Nix => "nix",
             Self::Sccache => "sccache",
-            Self::Codegraph => "codegraph",
         }
     }
     pub const fn section_name(self) -> &'static str {
@@ -89,11 +86,10 @@ impl CapabilityId {
             Self::Gradle => "capabilities.gradle",
             Self::Nix => "capabilities.nix",
             Self::Sccache => "capabilities.sccache",
-            Self::Codegraph => "capabilities.codegraph",
         }
     }
 
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 12] = [
         Self::Direnv,
         Self::Nx,
         Self::Cargo,
@@ -106,7 +102,6 @@ impl CapabilityId {
         Self::Gradle,
         Self::Nix,
         Self::Sccache,
-        Self::Codegraph,
     ];
 }
 
@@ -308,7 +303,7 @@ impl Detector {
     }
 }
 
-pub static DETECTORS: [&Detector; 13] = [
+pub static DETECTORS: [&Detector; 12] = [
     &direnv::DETECTOR,
     &nx::DETECTOR,
     &cargo::DETECTOR,
@@ -321,7 +316,6 @@ pub static DETECTORS: [&Detector; 13] = [
     &gradle::DETECTOR,
     &nix::DETECTOR,
     &sccache::DETECTOR,
-    &codegraph::DETECTOR,
 ];
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]

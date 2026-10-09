@@ -6515,7 +6515,7 @@ pub(in crate::storage) fn io_error(
     }
 }
 
-pub(in crate::storage) fn swap_paths(left: &Path, right: &Path) -> Result<(), ApfsStorageError> {
+pub(crate) fn swap_paths(left: &Path, right: &Path) -> Result<(), ApfsStorageError> {
     #[cfg(target_os = "macos")]
     {
         let left_name = CString::new(left.as_os_str().as_bytes())

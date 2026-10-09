@@ -796,6 +796,97 @@ fn land_adoption_commitments_round_trip_and_earlier_segments_still_read() {
 }
 
 #[test]
+fn land_outcome_commitments_preserve_every_skip_and_earlier_layout() {
+    use cowshed_core::api::dto::{AdoptionSkip, DatabaseHolder};
+    use cowshed_core::storage::audit::CommitmentDraft;
+    let holder = DatabaseHolder {
+        pid: 4242,
+        command: "cargo build --profile test".into(),
+    };
+    let database = std::path::PathBuf::from("/build/nx/workspace-data/task.db");
+    let skips = [
+        AdoptionSkip::NoLandingVolume,
+        AdoptionSkip::NoTargetVolume,
+        AdoptionSkip::LandingHeld {
+            database: database.clone(),
+            holders: vec![holder.clone()],
+        },
+        AdoptionSkip::LandingDaemonStayed {
+            daemon: holder.clone(),
+        },
+        AdoptionSkip::LandingBuilding {
+            lock: "/build/target/debug/.cargo-lock".into(),
+            holders: vec![holder.clone()],
+        },
+        AdoptionSkip::TargetHeld {
+            database: database.clone(),
+            holders: vec![holder.clone()],
+        },
+        AdoptionSkip::TargetOpening {
+            database,
+            holders: vec![holder.clone()],
+        },
+        AdoptionSkip::TargetDaemonStayed { daemon: holder },
+        AdoptionSkip::LandingVolumeBusy {
+            reason: "pid 4242 holds the volume; nothing was forced".into(),
+        },
+    ];
+    let outcome = |seeded, skip| {
+        CommitmentDraft::LandOutcome {
+            repo_id: RepoId::parse("acme/widget").unwrap(),
+            landing_incarnation: WorkspaceIncarnation::new("0198f2c0b7e34dc795f17b238b331c80")
+                .unwrap(),
+            target_incarnation: WorkspaceIncarnation::new("0198f2c0b7e34dc795f17b238b331c81")
+                .unwrap(),
+            landed_head: GitOid::new("1111111111111111111111111111111111111111").unwrap(),
+            seeded,
+            skip,
+        }
+        .into_commitment(1)
+    };
+    for skip in skips {
+        for seeded in [false, true] {
+            let value = outcome(seeded, Some(skip.clone()));
+            let encoded = encode_controller_commitment(&value).unwrap();
+            assert_eq!(decode_controller_commitment(&encoded).unwrap(), value);
+            let json = serde_json::to_value(&value).unwrap();
+            assert_eq!(json["skip"], serde_json::to_value(&skip).unwrap());
+            assert_eq!(
+                serde_json::from_value::<ControllerCommitment>(json).unwrap(),
+                value
+            );
+        }
+    }
+    let adopted = outcome(true, None);
+    let batch = controller_commitments_to_batch(std::slice::from_ref(&adopted)).unwrap();
+    assert_eq!(decode_controller_commitments(&batch).unwrap(), [adopted]);
+    assert!(controller_commitments_to_batch(&[outcome(false, None)]).is_err());
+    for columns in [23, 27] {
+        let hidden = batch.project(&(0..columns).collect::<Vec<_>>()).unwrap();
+        assert!(
+            decode_controller_commitments(&hidden).is_err(),
+            "new rows require their fields"
+        );
+    }
+    let older = ControllerCommitment::LandAdoption(LandAdoptionCommitment {
+        version: CONTROLLER_COMMITMENT_VERSION,
+        order: 2,
+        repo_id: RepoId::parse("acme/widget").unwrap(),
+        landing_incarnation: WorkspaceIncarnation::new("0198f2c0b7e34dc795f17b238b331c80").unwrap(),
+        target_incarnation: WorkspaceIncarnation::new("0198f2c0b7e34dc795f17b238b331c81").unwrap(),
+        landed_head: GitOid::new("1111111111111111111111111111111111111111").unwrap(),
+        task: "widget:build".into(),
+        task_hash: "123".into(),
+        inputs_digest: Sha256Digest::compute(b"inputs"),
+    });
+    let old_batch = controller_commitments_to_batch(std::slice::from_ref(&older))
+        .unwrap()
+        .project(&(0..27).collect::<Vec<_>>())
+        .unwrap();
+    assert_eq!(decode_controller_commitments(&old_batch).unwrap(), [older]);
+}
+
+#[test]
 fn output_publication_json_is_bounded_and_explicit() {
     let value = OutputPublication {
         path: WorkspacePath::new("published/stdout.bin").unwrap(),

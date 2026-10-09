@@ -738,16 +738,6 @@ fn reports() -> BTreeMap<&'static str, BTreeMap<&'static str, Value>> {
         },
         ..land_first.clone()
     };
-    let reseed_busy = cowshed_core::api::dto::ReseedResult {
-        workspace: WorkspaceName::main(),
-        outcome: cowshed_core::api::dto::Reseed::Skipped {
-            behind_ms: Some(1200),
-            reason: cowshed_core::api::dto::ReseedSkip::VolumeBusy {
-                reason: "the source is held by pid 4848 (rust-analyzer); nothing was forced"
-                    .to_owned(),
-            },
-        },
-    };
     // One document per `RebaseCarrySkip` arm and per side: an arm absent here is one the
     // TypeScript union is not checked against.
     let rebase_carried = RebaseReport {
@@ -896,10 +886,6 @@ fn reports() -> BTreeMap<&'static str, BTreeMap<&'static str, Value>> {
                     document("land report", &land_opening),
                 ),
             ]),
-        ),
-        (
-            "ReseedResult",
-            BTreeMap::from([("volumeBusy", document("reseed result", &reseed_busy))]),
         ),
         (
             "RebaseReport",

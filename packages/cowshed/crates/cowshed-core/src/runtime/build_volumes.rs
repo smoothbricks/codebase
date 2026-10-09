@@ -1,14 +1,15 @@
-//! The project side of build volumes (16_build_volumes.md): a fork clones its target's seed, a
-//! land quiesces the landing workspace, freezes the target's seed, and moves the target's one
-//! link, a rebase carries its target's Nx cache entries into the rebased workspace's volume, a
-//! reseed refreezes a target's seed from its own quiet volume, and collection deletes what
-//! nothing links.
+//! The project side of build volumes (16_build_volumes.md): a fork first refreshes its target's
+//! seed for the tree it checks out, from a workspace that landed that tree outside `cowshed land`
+//! or from the target's own quiet volume, then clones it; a land quiesces the landing workspace,
+//! freezes the target's seed, and moves the target's one link; a rebase carries its target's Nx
+//! cache entries into the rebased workspace's volume; and collection deletes what nothing links.
 //!
 //! Every step here runs inside one process's project actor, so no two of that process's steps
 //! interleave; another cowshed process's can, which is why collection defers what a workspace
 //! still being created may own ([`Links::creating`]). What a crash leaves behind is a volume
 //! nothing links, which [`BuildVolumes::collect`] deletes.
 
+use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -18,7 +19,7 @@ use std::time::{Duration, Instant, SystemTime};
 use super::storage_host::RuntimeStorageHost;
 use crate::api::dto::{
     AdoptionSkip, CarrySide, DatabaseHolder, GcCandidate, GcDeferred, GcReason, GitOid, LandSeed,
-    NxCarry, RebaseBuildVolume, RebaseCarrySkip, Reseed, ReseedSkip, Sha256Digest,
+    NxCarry, RebaseBuildVolume, RebaseCarrySkip, Sha256Digest,
 };
 use crate::build_volume::migrate::{MintedBeside, MintedVolume};
 use crate::build_volume::{
@@ -210,36 +211,221 @@ pub(crate) struct Staging {
     elapsed: Duration,
 }
 
-/// How far a target's latest seed is behind the live build volume it links, as the instant of
-/// the last write each image holds (16_build_volumes.md, "Targets and seeds").
+/// How near a volume's recorded tree is to the tree a fork checks out (16_build_volumes.md,
+/// "Which volume a seed holds"). The derived order is the preference: the fork's own tree, then
+/// fewer paths differing from it, then a tree cowshed cannot compare at all.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) enum Nearness {
+    Equal,
+    /// This many paths differ between the two trees.
+    Paths(u64),
+    /// No recorded tree, or one the target's repository cannot compare.
+    Unknown,
+}
+
+/// A target's latest seed: the tree it was frozen at, how near that is to the fork's tree, and
+/// the instant of the last write it holds.
+#[derive(Clone, Debug)]
+pub(crate) struct Frozen {
+    pub id: BuildVolumeId,
+    pub tree: Option<GitOid>,
+    pub nearness: Nearness,
+    pub written: SystemTime,
+}
+
+/// A target's latest seed against the live build volume it links, both measured against the tree
+/// a fork checks out and as the instant of the last write each image holds (16_build_volumes.md,
+/// "Targets and seeds").
 #[derive(Clone, Debug)]
 pub(crate) struct SeedAge {
     pub live: BuildVolumeId,
     /// The tree the live volume's record names: the one a reseed records.
     pub tree: Option<GitOid>,
+    pub nearness: Nearness,
     /// When the live volume's image was last written, after its volume was flushed.
     pub written: SystemTime,
-    /// The latest seed and the instant of the last write it holds; `None` for a target that
-    /// has no seed.
-    pub seed: Option<(BuildVolumeId, SystemTime)>,
+    /// `None` for a target that has no seed.
+    pub seed: Option<Frozen>,
 }
 
 impl SeedAge {
-    /// Whether the live volume holds a write its seed does not.
-    pub fn stale(&self) -> bool {
-        self.seed
-            .as_ref()
-            .is_none_or(|(_, frozen)| self.written > *frozen)
+    /// Whether a reseed replaces the seed with a capture of the live volume: the live volume is
+    /// nearer the fork's tree, or as near and holds a write the seed does not. A seed nearer
+    /// than the live volume is kept however much later the live volume was written.
+    pub fn reseeds(&self) -> bool {
+        self.seed.as_ref().is_none_or(|seed| {
+            (self.nearness, Reverse(self.written)) < (seed.nearness, Reverse(seed.written))
+        })
+    }
+
+    /// Whether neither volume was built at the fork's tree: when that tree is the target's
+    /// `HEAD^{tree}`, the target's branch moved without a `cowshed land`.
+    pub fn unlanded(&self) -> bool {
+        self.nearness != Nearness::Equal
+            && self
+                .seed
+                .as_ref()
+                .is_none_or(|seed| seed.nearness != Nearness::Equal)
     }
 
     /// How long before the live volume's last write the seed was frozen: `None` when the seed
     /// holds it, or when there is no seed.
     pub fn behind(&self) -> Option<Duration> {
-        let (_, frozen) = self.seed.as_ref()?;
+        let seed = self.seed.as_ref()?;
         self.written
-            .duration_since(*frozen)
+            .duration_since(seed.written)
             .ok()
             .filter(|behind| !behind.is_zero())
+    }
+}
+
+/// The tree a fork checks out, and the live workspaces that may have landed it in the target
+/// outside `cowshed land` (16_build_volumes.md, "Which volume a seed holds").
+#[derive(Clone, Debug)]
+pub(crate) struct Aim {
+    pub tree: GitOid,
+    /// Every live workspace but the target when `tree` is the target's `HEAD^{tree}`; empty
+    /// otherwise, since only the target's own tree can have landed in it.
+    pub landed: Vec<Peer>,
+}
+
+/// A live workspace whose checkout may have the fork's tree checked out.
+#[derive(Clone, Debug)]
+pub(crate) struct Peer {
+    pub name: WorkspaceName,
+    pub checkout: PathBuf,
+    /// Its image lock: the one its own forks, lands and removal take.
+    pub lock: PathBuf,
+}
+
+/// What a seed refresh (Fork step 2) did, and each live workspace at the fork's tree that did
+/// not seed the target, with why.
+#[derive(Clone, Debug)]
+pub(crate) struct Refreshed {
+    pub passed: Vec<(WorkspaceName, LandedSkip)>,
+    pub outcome: Refresh,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum Refresh {
+    /// The target links no build volume: it has no seed to keep up.
+    NoBuildVolume,
+    /// The seed stays: it is nearer the fork's tree than the live volume, or as near and holds
+    /// every write the live volume has had.
+    Kept,
+    /// The seed is now a capture of the target's live volume. It was frozen `behind_ms` before
+    /// the live volume's last write, or the target had none.
+    Reseeded {
+        behind_ms: Option<u64>,
+        elapsed_ms: u64,
+    },
+    /// The target's branch moved to `tree` outside `cowshed land`, and the seed is now a capture
+    /// of the build volume of `workspace`, which has that tree checked out.
+    Landed {
+        workspace: WorkspaceName,
+        tree: GitOid,
+        elapsed_ms: u64,
+    },
+    /// The seed stays behind: the live volume has a writer, and a clone of it could hold a
+    /// half-written Cargo unit or Nx database. The next fork tries again.
+    Skipped {
+        behind_ms: Option<u64>,
+        reason: CaptureSkip,
+    },
+}
+
+/// Why a live workspace at the fork's tree did not seed the target; the seed stays as it was.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum LandedSkip {
+    /// Another operation on the workspace (its own fork, land or removal) holds its image lock.
+    Locked,
+    /// Its `HEAD^{tree}` moved off the fork's tree before its volume was captured: a seed is
+    /// never recorded at a tree its volume was not built at.
+    Moved {
+        tree: GitOid,
+    },
+    /// Its `HEAD^{tree}` could not be read.
+    Unreadable {
+        reason: String,
+    },
+    /// It links no build volume.
+    NoBuildVolume,
+    Capture(CaptureSkip),
+}
+
+impl std::fmt::Display for LandedSkip {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Locked => formatter.write_str(
+                "another cowshed operation on it holds its image lock; the next fork retries",
+            ),
+            Self::Moved { tree } => write!(formatter, "its HEAD moved to tree {tree}"),
+            Self::Unreadable { reason } => write!(formatter, "its HEAD^{{tree}}: {reason}"),
+            Self::NoBuildVolume => formatter.write_str("it links no build volume"),
+            Self::Capture(skip) => write!(formatter, "{skip}"),
+        }
+    }
+}
+
+/// Why a quiet volume could not be captured as a seed: something still writes it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum CaptureSkip {
+    /// A process other than the volume's Nx daemon holds its task database at admission.
+    Held {
+        database: PathBuf,
+        holders: Vec<DatabaseHolder>,
+    },
+    /// The volume's Nx daemon outlived its stop.
+    DaemonStayed { daemon: DatabaseHolder },
+    /// A Cargo build holds a target directory's build lock.
+    Building {
+        lock: PathBuf,
+        holders: Vec<DatabaseHolder>,
+    },
+    /// The source could not be sealed without forcing a filesystem holder off its volume.
+    VolumeBusy { reason: String },
+}
+
+impl std::fmt::Display for CaptureSkip {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let holders = |formatter: &mut std::fmt::Formatter<'_>, holders: &[DatabaseHolder]| {
+            for (index, holder) in holders.iter().enumerate() {
+                let separator = if index == 0 { "" } else { ", " };
+                write!(
+                    formatter,
+                    "{separator}pid {} ({})",
+                    holder.pid, holder.command
+                )?;
+            }
+            Ok(())
+        };
+        match self {
+            Self::Held {
+                database,
+                holders: held,
+            } => {
+                write!(formatter, "{} is open in ", database.display())?;
+                holders(formatter, held)
+            }
+            Self::DaemonStayed { daemon } => write!(
+                formatter,
+                "the Nx daemon pid {} ({}) did not exit after SIGTERM",
+                daemon.pid, daemon.command
+            ),
+            Self::Building {
+                lock,
+                holders: held,
+            } => {
+                write!(formatter, "a Cargo build holds {}", lock.display())?;
+                if !held.is_empty() {
+                    formatter.write_str(": ")?;
+                }
+                holders(formatter, held)
+            }
+            Self::VolumeBusy { reason } => {
+                write!(formatter, "the build volume could not be sealed: {reason}")
+            }
+        }
     }
 }
 
@@ -603,7 +789,13 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
                 }
             };
             let mount = host.mount_build_volume(layout, &id).map_err(storage)?;
-            let held = BuildVolumeState::read(&mount)?;
+            let held = migrate_owned_indexes(
+                host,
+                layout,
+                &id,
+                &checkout,
+                BuildVolumeState::read(&mount)?,
+            )?;
             let (state, added) = match discovered {
                 Discovered::Unchanged => (held.clone(), Vec::new()),
                 Discovered::Changed {
@@ -681,29 +873,23 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
         })
     }
 
-    /// Fork steps 2 and 3 (16_build_volumes.md, "Fork"), up to the checkout: `source`'s seed
-    /// first catches up with the live volume `source_checkout` links ([`Self::reseed`]; a skip
-    /// is said on stderr, and the older seed is forked), then `destination` gets its live volume,
-    /// a clone of `source`'s latest seed, mounted, with no daemon record. A source with no seed
-    /// gives none. The caller holds `source`'s image lock, which every fork of `source` and its
-    /// reseed hold, and runs this beside the clone of `source`'s image, whose stage
-    /// [`Self::finish_fork`] then links.
+    /// Fork steps 2 and 3 (16_build_volumes.md, "Fork"), up to the checkout: `source`'s seed is
+    /// first refreshed for the tree `aim` names ([`Self::refresh_seed`]; what it did instead is said
+    /// on stderr, and the older seed is forked), then `destination` gets its live volume, a clone
+    /// of `source`'s latest seed, mounted, with no daemon record. A source with no seed gives
+    /// none. The caller holds `source`'s image lock, which every fork of `source` holds, and runs
+    /// this beside the clone of `source`'s image, whose stage [`Self::finish_fork`] then links.
     pub async fn prepare_fork(
         &self,
         source: Owner,
         source_checkout: PathBuf,
         destination: WorkspaceName,
+        aim: Aim,
     ) -> Result<Option<PreparedFork>> {
-        if let Reseed::Skipped { behind_ms, reason } =
-            self.reseed(source.clone(), source_checkout).await?
-        {
-            eprintln!(
-                "cowshed: {}'s seed stays{} behind its build volume, so {destination} misses what {} built since: {reason}; the next fork retries",
-                source.name,
-                behind_ms.map(|ms| format!(" {ms} ms")).unwrap_or_default(),
-                source.name,
-            );
-        }
+        let refreshed = self
+            .refresh_seed(source.clone(), source_checkout, aim)
+            .await?;
+        say_refresh(&source.name, &destination, &refreshed);
         self.blocking(move |host, layout| {
             let Some((seed, record)) = layout.seed_of(&source.name, &source.incarnation)? else {
                 return Ok(None);
@@ -1018,35 +1204,85 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
         .await
     }
 
-    /// How far `target`'s seed is behind the live volume `checkout` links, or `None` when it
-    /// links none, or one an interrupted first touch left unpublished.
-    pub async fn seed_age(&self, target: Owner, checkout: PathBuf) -> Result<Option<SeedAge>> {
+    /// `target`'s seed against the live volume `checkout` links, both measured against `tree`,
+    /// or `None` when it links none, or one an interrupted first touch left unpublished.
+    pub async fn seed_age(
+        &self,
+        target: Owner,
+        checkout: PathBuf,
+        tree: GitOid,
+    ) -> Result<Option<SeedAge>> {
         let live = self.layout.linked(&checkout)?;
         self.blocking(move |host, layout| match live {
-            Some(live) => seed_age(host, layout, &target, live),
+            Some(live) => seed_age(host, layout, &target, live, &checkout, &tree),
             None => Ok(None),
         })
         .await
     }
 
-    /// Reseed `target` from the live volume `checkout` links when that volume holds a write the
-    /// seed does not and has no writer. The caller holds `target`'s workspace lock, which every
+    /// Fork step 2 (16_build_volumes.md, "Which volume a seed holds"): when neither `target`'s
+    /// seed nor the live volume `checkout` links was built at `aim`'s tree, capture the volume of
+    /// a live workspace that has it checked out ([`Self::seed_from_landed_now`]); otherwise, or
+    /// when none is captured, reseed from the live volume when that is nearer the tree, or as near
+    /// and written since, and has no writer. The caller holds `target`'s image lock, which every
     /// fork of `target` holds while it clones the seed.
-    pub async fn reseed(&self, target: Owner, checkout: PathBuf) -> Result<Reseed> {
+    pub async fn refresh_seed(
+        &self,
+        target: Owner,
+        checkout: PathBuf,
+        aim: Aim,
+    ) -> Result<Refreshed> {
         let this = self.clone();
-        crate::storage::lifecycle::dispatch_blocking(move || this.reseed_now(&target, &checkout))
-            .await
-            .map_err(|error| CowshedError::internal(format!("build volume task failed: {error}")))?
+        crate::storage::lifecycle::dispatch_blocking(move || {
+            let Some(age) = this.age_now(&target, &checkout, &aim.tree)? else {
+                return Ok(Refreshed {
+                    passed: Vec::new(),
+                    outcome: Refresh::NoBuildVolume,
+                });
+            };
+            let mut passed = Vec::new();
+            if age.unlanded()
+                && let Some(landed) =
+                    seed_from_landed(&this.host, &this.layout, &target, &aim, &mut passed)?
+            {
+                return Ok(Refreshed {
+                    passed,
+                    outcome: landed,
+                });
+            }
+            let outcome = reseed(&this.host, &this.layout, &target, age)?;
+            Ok(Refreshed { passed, outcome })
+        })
+        .await
+        .map_err(|error| CowshedError::internal(format!("build volume task failed: {error}")))?
     }
 
-    /// [`Self::reseed`] on the calling thread, for a caller already off the async runtime.
-    pub fn reseed_now(&self, target: &Owner, checkout: &Path) -> Result<Reseed> {
-        let Some(live) = self.layout.linked(checkout)? else {
-            return Ok(Reseed::NoBuildVolume);
+    /// The external-land half of [`Self::refresh_seed`] alone, on the calling thread, for `rm` of a
+    /// workspace that may be the landed one: it never reseeds from the target's live volume. The
+    /// caller holds `target`'s image lock. `Kept` when a volume at `aim`'s tree already seeds or
+    /// is `target`'s, or when no live workspace was captured.
+    pub fn seed_from_landed_now(
+        &self,
+        target: &Owner,
+        checkout: &Path,
+        aim: &Aim,
+    ) -> Result<Refreshed> {
+        let mut passed = Vec::new();
+        let outcome = match self.age_now(target, checkout, &aim.tree)? {
+            None => Refresh::NoBuildVolume,
+            Some(age) if age.unlanded() => {
+                seed_from_landed(&self.host, &self.layout, target, aim, &mut passed)?
+                    .unwrap_or(Refresh::Kept)
+            }
+            Some(_) => Refresh::Kept,
         };
-        match seed_age(&*self.host, &self.layout, target, live)? {
-            Some(age) => reseed(&*self.host, &self.layout, target, age),
-            None => Ok(Reseed::NoBuildVolume),
+        Ok(Refreshed { passed, outcome })
+    }
+
+    fn age_now(&self, target: &Owner, checkout: &Path, tree: &GitOid) -> Result<Option<SeedAge>> {
+        match self.layout.linked(checkout)? {
+            Some(live) => seed_age(&*self.host, &self.layout, target, live, checkout, tree),
+            None => Ok(None),
         }
     }
 
@@ -1076,7 +1312,7 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
 
     /// Land step 5.1, carry phase 1 (16_build_volumes.md, "Carry"), while the target still runs:
     /// stage in the quiet landing volume every Nx cache entry the target's volume indexes and
-    /// the landing volume lacks, and give it the target's code-graph index when it has none.
+    /// the landing volume lacks.
     pub async fn stage(&self, quiet: &Quiet, target_checkout: PathBuf) -> Result<Staging> {
         let target = self.layout.linked(&target_checkout)?;
         let quiet = quiet.clone();
@@ -1086,16 +1322,7 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
                 Some(target) => {
                     let mount = host.mount_build_volume(layout, &target).map_err(storage)?;
                     let state = BuildVolumeState::read(&mount)?;
-                    let staged = carry::stage(&mount, &state, &quiet.mount, &quiet.state);
-                    if let Err(error) =
-                        carry::codegraph(&mount, &state, &quiet.mount, &quiet.state)
-                    {
-                        eprintln!(
-                            "cowshed: landing build volume {} takes no code-graph index from {target}: {error}; the target adopts it without one, and its indexer starts over",
-                            quiet.id
-                        );
-                    }
-                    staged
+                    carry::stage(&mount, &state, &quiet.mount, &quiet.state)
                 }
                 None => carry::Staged::default(),
             };
@@ -1409,6 +1636,19 @@ fn still_doomed(
     if layout.read_record_present(&doomed.id)? != doomed.seen {
         return Ok(Some(Deferral::Changed));
     }
+    if doomed.image_missing {
+        match std::fs::symlink_metadata(layout.image(&doomed.id)) {
+            Ok(_) => return Ok(Some(Deferral::Changed)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(io(
+                    "inspect orphan seed image",
+                    &layout.image(&doomed.id),
+                    &error,
+                ));
+            }
+        }
+    }
     for (checkout, path) in &links.checkouts {
         if layout.linked(path)?.as_ref() == Some(&doomed.id) {
             return Ok(Some(Deferral::Linked(checkout.clone())));
@@ -1574,6 +1814,8 @@ pub(crate) struct Doomed {
     pub reason: GcReason,
     pub bytes: u64,
     pub seen: Option<BuildVolumeRecord>,
+    /// An orphan sidecar: a newly appearing image makes the planned release stale.
+    pub image_missing: bool,
 }
 
 /// What collection decides from the records, the links and the images' sizes alone.
@@ -1635,6 +1877,27 @@ pub(crate) fn plan(
                 continue;
             }
         };
+        if matches!(&record.role, BuildVolumeRole::Seed { target, .. } if !links.creating.contains(target))
+        {
+            match std::fs::symlink_metadata(layout.image(&id)) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    plan.doomed.push(Doomed {
+                        id,
+                        reason: GcReason::SupersededSeed,
+                        bytes: 0,
+                        seen: Some(record),
+                        image_missing: true,
+                    });
+                    continue;
+                }
+                Err(error) => {
+                    plan.deferred
+                        .push((id, Deferral::SizeUnreadable(error.to_string())));
+                    continue;
+                }
+                Ok(_) => {}
+            }
+        }
         match &record.role {
             BuildVolumeRole::Seed { target, .. } | BuildVolumeRole::Linked { checkout: target }
                 if links.creating.contains(target) =>
@@ -1688,6 +1951,7 @@ pub(crate) fn plan(
                 reason,
                 bytes,
                 seen,
+                image_missing: false,
             }),
             Err(error) => plan.deferred.push((
                 id,
@@ -1878,91 +2142,423 @@ fn say_release(id: &BuildVolumeId, whose: &str, release: &BuildVolumeRelease) {
     }
 }
 
-/// `target`'s seed against its live volume `live`, or `None` when `live` is an interrupted first
-/// touch's, unpublished: only a fresh discovery finishes that one.
+/// Processes, each as `pid <n> (<argv>)`, joined by `; `.
+struct Holders<'a>(&'a [nx::Holder]);
+
+impl std::fmt::Display for Holders<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write_holders(formatter, self.0)
+    }
+}
+
+fn write_holders(
+    formatter: &mut std::fmt::Formatter<'_>,
+    holders: &[nx::Holder],
+) -> std::fmt::Result {
+    for (index, holder) in holders.iter().enumerate() {
+        if index > 0 {
+            formatter.write_str("; ")?;
+        }
+        write!(formatter, "{holder}")?;
+    }
+    Ok(())
+}
+
+/// Spec 16's owned index-link cutover. Only a recorded fixed `.codegraph` link is exchanged;
+/// the index is copied from a sealed snapshot, never from the live database.
+fn migrate_owned_indexes(
+    host: &Host,
+    layout: &BuildVolumeLayout,
+    live: &BuildVolumeId,
+    checkout: &Path,
+    mut state: BuildVolumeState,
+) -> Result<BuildVolumeState> {
+    let is_index = |path: &BuildStatePath| {
+        !path.is_declared()
+            && path.checkout.as_path().file_name() == Some(std::ffi::OsStr::new(".codegraph"))
+    };
+    if !state.paths.iter().any(is_index) {
+        return Ok(state);
+    }
+    let mut owned = Vec::new();
+    for path in state.paths.iter().filter(|path| is_index(path)) {
+        let (parent, name) = link::contained_parent(checkout, path.checkout.as_path())
+            .map_err(|error| io("inspect the index parent", checkout, &error))?;
+        let at = parent.join(name);
+        match std::fs::symlink_metadata(&at) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                let target = std::fs::read_link(&at)
+                    .map_err(|error| io("read the index link", &at, &error))?;
+                if target == link::relative_target(path.checkout.as_path(), path.volume.as_path()) {
+                    owned.push((at, path));
+                }
+            }
+            Ok(_) => {} // A real directory is a completed publication; foreign entries stay.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(io("inspect the index link", &at, &error)),
+        }
+    }
+    if !owned.is_empty() {
+        let snapshot = BuildVolumeId::mint();
+        let hold = layout.hold_new(&snapshot).map_err(|error| {
+            io(
+                "hold the index snapshot",
+                &layout.hold_path(&snapshot),
+                &error,
+            )
+        })?;
+        let staging = checkout
+            .join(".cowshed")
+            .join(format!("index-cutover-{snapshot}"));
+        let copied = (|| {
+            match host.clone_build_volume(
+                layout,
+                live,
+                &snapshot,
+                &BuildVolumeRecord::new(None, BuildVolumeRole::Unlinked),
+            ) {
+                Ok(()) => {}
+                Err(ApfsStorageError::Apfs(error))
+                    if cowshed_apfs::detach_was_dissented(&error) =>
+                {
+                    let holders = nx::volume_holders(&layout.mount(live))
+                        .map_err(|error| {
+                            io(
+                                "name the index snapshot holders",
+                                &layout.mount(live),
+                                &error,
+                            )
+                        })?
+                        .into_iter()
+                        .map(database_holder)
+                        .collect();
+                    return Err(CowshedError::index_migration_refusal(
+                        crate::error::IndexMigrationRefusal {
+                            path: owned[0].0.clone(),
+                            reason: error.to_string(),
+                            holders,
+                        },
+                    ));
+                }
+                Err(error) => return Err(storage(error)),
+            }
+            let frozen = host
+                .mount_build_volume(layout, &snapshot)
+                .map_err(storage)?;
+            std::fs::create_dir_all(&staging)
+                .map_err(|error| io("stage the source index", &staging, &error))?;
+            for (index, (at, path)) in owned.iter().enumerate() {
+                let source = frozen.join(path.volume.as_path());
+                if !std::fs::symlink_metadata(&source)
+                    .map_err(|error| io("inspect the sealed index", &source, &error))?
+                    .is_dir()
+                {
+                    return Err(CowshedError::integrity(
+                        format!("{} is not an index directory", source.display()),
+                        "inspect the recorded index path; no foreign target is copied",
+                    ));
+                }
+                let staged = staging.join(index.to_string());
+                crate::copy::copy_until_quiescent_blocking(&source, &staged)?;
+                crate::copy::verify_tree_blocking(&source, &staged)?;
+                let holders = nx::volume_holders(&layout.mount(live)).map_err(|error| {
+                    io(
+                        "recheck index migration holders",
+                        &layout.mount(live),
+                        &error,
+                    )
+                })?;
+                if !holders.is_empty() {
+                    return Err(CowshedError::index_migration_refusal(
+                        crate::error::IndexMigrationRefusal {
+                            path: at.clone(),
+                            reason:
+                                "a holder arrived after the sealed snapshot; publication refused"
+                                    .into(),
+                            holders: holders.into_iter().map(database_holder).collect(),
+                        },
+                    ));
+                }
+                // Re-read immediately before publication. A foreign replacement stays intact.
+                if std::fs::read_link(at)
+                    .map_err(|error| io("revalidate the owned index link", at, &error))?
+                    != link::relative_target(path.checkout.as_path(), path.volume.as_path())
+                {
+                    return Err(CowshedError::conflict(
+                        format!("{} no longer names its recorded index", at.display()),
+                        "leave the foreign link intact and retry after settling the checkout",
+                    ));
+                }
+                crate::storage::apfs::native::swap_paths(at, &staged).map_err(storage)?;
+                crate::fsio::sync_directory(at.parent().expect("index parent"))
+                    .map_err(|error| io("sync the index publication", at, &error))?;
+                std::fs::remove_file(&staged)
+                    .map_err(|error| io("remove the exchanged index link", &staged, &error))?;
+                eprintln!(
+                    "cowshed: {} now holds its verified index on the source volume",
+                    at.display()
+                );
+            }
+            Ok(())
+        })();
+        let staged_cleanup = match std::fs::remove_dir_all(&staging) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(io("remove index staging", &staging, &error)),
+        };
+        drop(hold);
+        let released = host
+            .release_build_volume(layout, &snapshot)
+            .map_err(storage)
+            .and_then(|release| match release {
+                BuildVolumeRelease::Deleted { .. } => Ok(()),
+                BuildVolumeRelease::Held { .. } => Err(CowshedError::integrity(
+                    "the private index snapshot is held after migration",
+                    "cowshed gc retries collection; inspect its named holder",
+                )),
+            });
+        let cleanup = staged_cleanup.and(released);
+        match (copied, cleanup) {
+            (Ok(()), Ok(())) => {}
+            (Ok(()), Err(error)) | (Err(error), Ok(())) => return Err(error),
+            (Err(mut error), Err(cleanup)) => {
+                error
+                    .message
+                    .push_str(&format!("; index snapshot cleanup also failed: {cleanup}"));
+                return Err(error);
+            }
+        }
+    }
+    state.paths.retain(|path| !is_index(path));
+    state.write(&layout.mount(live))?;
+    Ok(state)
+}
+
+/// `target`'s seed against its live volume `live`, both measured against `tree` in the target's
+/// repository at `checkout`, or `None` when `live` is an interrupted first touch's, unpublished:
+/// only a fresh discovery finishes that one.
 fn seed_age(
     host: &impl RuntimeStorageHost,
     layout: &BuildVolumeLayout,
     target: &Owner,
     live: BuildVolumeId,
+    checkout: &Path,
+    tree: &GitOid,
 ) -> Result<Option<SeedAge>> {
     let Some(record) = layout.read_record_present(&live)? else {
         return Ok(None);
     };
     let written = host.build_volume_written(layout, &live).map_err(storage)?;
     let seed = match layout.seed_of(&target.name, &target.incarnation)? {
-        Some((seed, _)) => {
-            let frozen = host.build_volume_written(layout, &seed).map_err(storage)?;
-            Some((seed, frozen))
-        }
+        Some((id, seed)) => Some(Frozen {
+            written: host.build_volume_written(layout, &id).map_err(storage)?,
+            nearness: nearness(checkout, seed.tree.as_ref(), tree),
+            tree: seed.tree,
+            id,
+        }),
         None => None,
     };
     Ok(Some(SeedAge {
         live,
+        nearness: nearness(checkout, record.tree.as_ref(), tree),
         tree: record.tree,
         written,
         seed,
     }))
 }
 
-/// Refreeze an out-of-date seed after Nx and existing Cargo profiles admit capture. The
-/// non-forced detach, not profile enumeration or a later holder probe, excludes filesystem
-/// writers while the image is validated and cloned.
-///
-/// The source's build hold is claimed first and kept through the capture: a job admitted on the
-/// source skips the reseed, and while the claim lives no job is admitted on it. Stopping a
-/// shed's daemon makes its supervisor's keeper submit a start job on its next probe; claimed
-/// after the stop, that job refused the seal (16_build_volumes.md, "Targets and seeds").
+/// How near `recorded` is to `tree` in the repository at `checkout`: the number of paths
+/// `git diff-tree -r` reports between them. A tree the repository cannot compare is said on
+/// stderr and is farther than any count.
+fn nearness(checkout: &Path, recorded: Option<&GitOid>, tree: &GitOid) -> Nearness {
+    use cowshed_os::fork_lock::Run as _;
+    let Some(recorded) = recorded else {
+        return Nearness::Unknown;
+    };
+    if recorded == tree {
+        return Nearness::Equal;
+    }
+    let compared = crate::git::git_command_at(checkout)
+        .args(["diff-tree", "-r", "--no-renames", "--name-only", "-z"])
+        .args([recorded.as_str(), tree.as_str()])
+        .output_locked();
+    match compared {
+        Ok(output) if output.status.success() => {
+            let paths = output
+                .stdout
+                .split(|byte| *byte == 0)
+                .filter(|path| !path.is_empty())
+                .count();
+            Nearness::Paths(u64::try_from(paths).unwrap_or(u64::MAX))
+        }
+        Ok(output) => {
+            eprintln!(
+                "cowshed: cannot compare build tree {recorded} with {tree} in {}: {}; it counts as farther than any comparable tree",
+                checkout.display(),
+                crate::git::git_ended(&output)
+            );
+            Nearness::Unknown
+        }
+        Err(error) => {
+            eprintln!(
+                "cowshed: cannot compare build tree {recorded} with {tree} in {}: {}; it counts as farther than any comparable tree",
+                checkout.display(),
+                crate::git::git_spawn_error(&error)
+            );
+            Nearness::Unknown
+        }
+    }
+}
+
+/// The tree `checkout` has checked out, `HEAD^{tree}`.
+fn head_tree(checkout: &Path) -> std::result::Result<GitOid, String> {
+    use cowshed_os::fork_lock::Run as _;
+    let output = crate::git::git_command_at(checkout)
+        .args(["rev-parse", "--verify", "HEAD^{tree}"])
+        .output_locked()
+        .map_err(|error| crate::git::git_spawn_error(&error).to_string())?;
+    if !output.status.success() {
+        return Err(crate::git::git_ended(&output));
+    }
+    let tree = String::from_utf8(output.stdout).map_err(|error| error.to_string())?;
+    GitOid::new(tree.trim_end()).map_err(|error| error.to_string())
+}
+
+/// An external land (16_build_volumes.md, "Which volume a seed holds", step 1): capture as
+/// `target`'s seed the build volume of a live workspace in `aim` that has `aim`'s tree checked
+/// out, warmest first, each under its own image lock taken without waiting and its tree read
+/// again under it. `None` when none was captured; every candidate passed over is in `passed`.
+/// The caller holds `target`'s image lock.
+fn seed_from_landed(
+    host: &Host,
+    layout: &BuildVolumeLayout,
+    target: &Owner,
+    aim: &Aim,
+    passed: &mut Vec<(WorkspaceName, LandedSkip)>,
+) -> Result<Option<Refresh>> {
+    // The unlocked read only selects; the read under the candidate's lock decides.
+    let mut candidates = Vec::new();
+    for peer in &aim.landed {
+        match head_tree(&peer.checkout) {
+            Ok(tree) if tree == aim.tree => {}
+            Ok(_) => continue,
+            Err(reason) => {
+                passed.push((peer.name.clone(), LandedSkip::Unreadable { reason }));
+                continue;
+            }
+        }
+        let Some(live) = layout.linked(&peer.checkout)? else {
+            passed.push((peer.name.clone(), LandedSkip::NoBuildVolume));
+            continue;
+        };
+        let written = host.build_volume_written(layout, &live).map_err(storage)?;
+        candidates.push((Reverse(written), peer));
+    }
+    candidates.sort_by_key(|(written, _)| *written);
+    for (_, peer) in candidates {
+        let Some(_held) = host
+            .lock_images(std::slice::from_ref(&peer.lock), LockMode::Try)
+            .map_err(storage)?
+        else {
+            passed.push((peer.name.clone(), LandedSkip::Locked));
+            continue;
+        };
+        match head_tree(&peer.checkout) {
+            Ok(tree) if tree == aim.tree => {}
+            Ok(tree) => {
+                passed.push((peer.name.clone(), LandedSkip::Moved { tree }));
+                continue;
+            }
+            Err(reason) => {
+                passed.push((peer.name.clone(), LandedSkip::Unreadable { reason }));
+                continue;
+            }
+        }
+        let Some(live) = layout.linked(&peer.checkout)? else {
+            passed.push((peer.name.clone(), LandedSkip::NoBuildVolume));
+            continue;
+        };
+        match capture(host, layout, target, &live, Some(aim.tree.clone()))? {
+            Ok(elapsed_ms) => {
+                return Ok(Some(Refresh::Landed {
+                    workspace: peer.name.clone(),
+                    tree: aim.tree.clone(),
+                    elapsed_ms,
+                }));
+            }
+            Err(skip) => passed.push((peer.name.clone(), LandedSkip::Capture(skip))),
+        }
+    }
+    Ok(None)
+}
+
+/// A reseed (16_build_volumes.md, "Which volume a seed holds", step 2): capture the target's
+/// live volume when it is nearer the fork's tree than the seed, or as near and written since.
 fn reseed(
-    host: &impl RuntimeStorageHost,
+    host: &Host,
     layout: &BuildVolumeLayout,
     target: &Owner,
     age: SeedAge,
-) -> Result<Reseed> {
-    if !age.stale() {
-        return Ok(Reseed::Fresh);
+) -> Result<Refresh> {
+    if !age.reseeds() {
+        return Ok(Refresh::Kept);
     }
     let behind_ms = age.behind().map(millis);
+    Ok(match capture(host, layout, target, &age.live, age.tree)? {
+        Ok(elapsed_ms) => Refresh::Reseeded {
+            behind_ms,
+            elapsed_ms,
+        },
+        Err(reason) => Refresh::Skipped { behind_ms, reason },
+    })
+}
+
+/// Freeze `source`, recorded at `tree`, as `target`'s seed after Nx and existing Cargo profiles
+/// admit capture, then retire every older seed of `target`; the elapsed milliseconds. The
+/// non-forced detach, not profile enumeration or a later holder probe, excludes filesystem
+/// writers while the image is validated and cloned. A skip leaves every seed as it was.
+fn capture(
+    host: &Host,
+    layout: &BuildVolumeLayout,
+    target: &Owner,
+    source: &BuildVolumeId,
+    tree: Option<GitOid>,
+) -> Result<std::result::Result<u64, CaptureSkip>> {
     let started = Instant::now();
-    let mount = host
-        .mount_build_volume(layout, &age.live)
-        .map_err(storage)?;
+    let mount = host.mount_build_volume(layout, source).map_err(storage)?;
     let state = BuildVolumeState::read(&mount)?;
-    let skipped = |reason| Ok(Reseed::Skipped { behind_ms, reason });
-    let claim = match host
-        .claim_build_volume(layout, &age.live)
-        .map_err(storage)?
-    {
+    // Claim before stopping Nx: the source's keeper must not admit a replacement job.
+    // Retain the claim through sealing, canonical restore and immutable seed publication.
+    let claim = match host.claim_build_volume(layout, source).map_err(storage)? {
         BuildVolumeClaim::Claimed(claim) => claim,
         BuildVolumeClaim::Held { open } => {
-            let hold = layout.hold_path(&age.live);
+            let hold = layout.hold_path(source);
             let claimants = nx::holders(&hold)
                 .map_err(|error| io("list the build hold's holders", &hold, &error))?;
-            return skipped(ReseedSkip::VolumeBusy {
-                reason: build_hold_busy_reason(&layout.image(&age.live), &hold, &claimants, &open),
-            });
+            return Ok(Err(CaptureSkip::VolumeBusy {
+                reason: build_hold_busy_reason(&layout.image(source), &hold, &claimants, &open),
+            }));
         }
     };
     if let Err(busy) = nx::close(&mount, &state)
-        .map_err(|error| io("close the target's Nx state", &mount, &error))?
+        .map_err(|error| io("close the volume's Nx state", &mount, &error))?
     {
-        return skipped(reseed_skip(busy));
+        return Ok(Err(capture_skip(busy)));
     }
     let builds = match cargo::hold(&mount, &state)
-        .map_err(|error| io("take the target's Cargo build locks", &mount, &error))?
+        .map_err(|error| io("take the volume's Cargo build locks", &mount, &error))?
     {
         Ok(held) => held,
         Err(lock) => {
             let holders = nx::holders(&lock)
                 .map_err(|error| io("list the Cargo build's processes", &lock, &error))?;
-            return skipped(ReseedSkip::Building {
+            return Ok(Err(CaptureSkip::Building {
                 lock,
                 holders: holders.into_iter().map(database_holder).collect(),
-            });
+            }));
         }
     };
     let previous = seeds_of(layout, target)?;
-    let seed = BuildVolumeId::mint();
     // The capture now removes the source from the filesystem namespace without force and
     // clones only its detached, inode-held image. Our own lock descriptors would keep that
     // unmount busy. Release them before sealing: a Cargo that gets in first makes unmount
@@ -1971,9 +2567,9 @@ fn reseed(
     match host.clone_claimed_build_volume(
         layout,
         &claim,
-        &seed,
+        &BuildVolumeId::mint(),
         &BuildVolumeRecord::new(
-            age.tree,
+            tree,
             BuildVolumeRole::Seed {
                 target: target.name.clone(),
                 incarnation: target.incarnation.clone(),
@@ -1981,15 +2577,15 @@ fn reseed(
         ),
     ) {
         Ok(()) => {}
-        Err(ApfsStorageError::BuildVolumeHeld { image, open, .. }) => {
-            return skipped(ReseedSkip::VolumeBusy {
-                reason: volume_busy_reason(&image, &open),
-            });
+        Err(error @ ApfsStorageError::BuildVolumeHeld { .. }) => {
+            return Ok(Err(CaptureSkip::VolumeBusy {
+                reason: error.to_string(),
+            }));
         }
         Err(ApfsStorageError::Apfs(error)) if cowshed_apfs::detach_was_dissented(&error) => {
-            return skipped(ReseedSkip::VolumeBusy {
+            return Ok(Err(CaptureSkip::VolumeBusy {
                 reason: error.to_string(),
-            });
+            }));
         }
         Err(error) => return Err(storage(error)),
     }
@@ -1997,15 +2593,38 @@ fn reseed(
     retire_seeds(host, layout, target, previous)?;
     let elapsed_ms = millis(started.elapsed());
     cowshed_os::timing::event("build-volume", || {
-        format!(
-            "reseed {} from {} in {elapsed_ms} ms",
-            target.name, age.live
-        )
+        format!("seed {} from {source} in {elapsed_ms} ms", target.name)
     });
-    Ok(Reseed::Reseeded {
-        behind_ms,
-        elapsed_ms,
-    })
+    Ok(Ok(elapsed_ms))
+}
+
+/// Say on stderr what a seed refresh of `target` did beyond keeping a seed that needed nothing:
+/// each live workspace at the fork's tree it passed over and why, a capture of a landed
+/// workspace's volume, or a reseed that a writer refused, which `destination` then misses.
+pub(crate) fn say_refresh(
+    target: &WorkspaceName,
+    destination: &WorkspaceName,
+    refreshed: &Refreshed,
+) {
+    for (workspace, reason) in &refreshed.passed {
+        eprintln!(
+            "cowshed: {workspace} has the tree {target} moved to checked out, but does not seed {target}: {reason}"
+        );
+    }
+    match &refreshed.outcome {
+        Refresh::NoBuildVolume | Refresh::Kept | Refresh::Reseeded { .. } => {}
+        Refresh::Landed {
+            workspace,
+            tree,
+            elapsed_ms,
+        } => eprintln!(
+            "cowshed: {target}'s branch moved to tree {tree} outside cowshed land; its seed is now {workspace}'s build volume ({elapsed_ms} ms)"
+        ),
+        Refresh::Skipped { behind_ms, reason } => eprintln!(
+            "cowshed: {target}'s seed stays{} behind its build volume, so {destination} misses what {target} built since: {reason}; the next fork retries",
+            behind_ms.map(|ms| format!(" {ms} ms")).unwrap_or_default(),
+        ),
+    }
 }
 
 /// Why a reseed could not claim its source's build hold, naming every holder of that hold: a
@@ -2051,13 +2670,13 @@ fn database_holder(holder: cowshed_os::process::Holder) -> DatabaseHolder {
     }
 }
 
-fn reseed_skip(busy: nx::Busy) -> ReseedSkip {
+fn capture_skip(busy: nx::Busy) -> CaptureSkip {
     match busy {
-        nx::Busy::Held { database, holders } => ReseedSkip::Held {
+        nx::Busy::Held { database, holders } => CaptureSkip::Held {
             database,
             holders: holders.into_iter().map(database_holder).collect(),
         },
-        nx::Busy::DaemonStayed { daemon } => ReseedSkip::DaemonStayed {
+        nx::Busy::DaemonStayed { daemon } => CaptureSkip::DaemonStayed {
             daemon: database_holder(daemon),
         },
     }
@@ -2269,29 +2888,142 @@ mod tests {
             .collect()
     }
 
-    /// A seed is behind exactly when the live volume was written after it was frozen; a
-    /// target with no seed is behind by no measurable amount, and still reseeds.
+    /// A fork's aim at a tree no volume in these tests records, with no workspace that may have
+    /// landed it: every volume is `Unknown`, so the reseed decides by write instants alone.
+    fn unlanded_aim() -> Aim {
+        Aim {
+            tree: GitOid::new("f".repeat(40)).unwrap(),
+            landed: Vec::new(),
+        }
+    }
+
+    fn age(live: (Nearness, SystemTime), seed: Option<(Nearness, SystemTime)>) -> SeedAge {
+        SeedAge {
+            live: BuildVolumeId::mint(),
+            tree: None,
+            nearness: live.0,
+            written: live.1,
+            seed: seed.map(|(nearness, written)| Frozen {
+                id: BuildVolumeId::mint(),
+                tree: None,
+                nearness,
+                written,
+            }),
+        }
+    }
+
+    /// Between two volumes as near the fork's tree, a seed is behind exactly when the live
+    /// volume was written after it was frozen; a target with no seed is behind by no measurable
+    /// amount, and still reseeds.
     #[test]
     fn a_seed_is_behind_only_when_the_live_volume_was_written_after_it() {
         let frozen = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
-        let age = |written: SystemTime, seed: Option<SystemTime>| SeedAge {
-            live: BuildVolumeId::mint(),
-            tree: None,
-            written,
-            seed: seed.map(|frozen| (BuildVolumeId::mint(), frozen)),
-        };
-        let fresh = age(frozen, Some(frozen));
-        assert!(!fresh.stale());
-        assert_eq!(fresh.behind(), None);
-        let older = age(frozen - Duration::from_secs(5), Some(frozen));
-        assert!(!older.stale(), "a seed newer than every write holds them");
-        assert_eq!(older.behind(), None);
-        let behind = age(frozen + Duration::from_millis(1_500), Some(frozen));
-        assert!(behind.stale());
-        assert_eq!(behind.behind(), Some(Duration::from_millis(1_500)));
-        let unseeded = age(frozen, None);
-        assert!(unseeded.stale());
+        for nearness in [Nearness::Equal, Nearness::Paths(3), Nearness::Unknown] {
+            let at = |written| age((nearness, written), Some((nearness, frozen)));
+            let fresh = at(frozen);
+            assert!(!fresh.reseeds());
+            assert_eq!(fresh.behind(), None);
+            let older = at(frozen - Duration::from_secs(5));
+            assert!(!older.reseeds(), "a seed newer than every write holds them");
+            assert_eq!(older.behind(), None);
+            let behind = at(frozen + Duration::from_millis(1_500));
+            assert!(behind.reseeds());
+            assert_eq!(behind.behind(), Some(Duration::from_millis(1_500)));
+        }
+        let unseeded = age((Nearness::Unknown, frozen), None);
+        assert!(unseeded.reseeds());
         assert_eq!(unseeded.behind(), None);
+    }
+
+    /// A seed nearer the fork's tree than the live volume is kept however much later the live
+    /// volume was written: a landed seed beats a live volume built at an older tree. A live
+    /// volume nearer than the seed reseeds it even when the seed was frozen after its last write.
+    #[test]
+    fn the_volume_nearer_the_forks_tree_seeds_it_before_the_newer_one() {
+        let frozen = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let later = frozen + Duration::from_secs(600);
+        let landed = age(
+            (Nearness::Paths(40), later),
+            Some((Nearness::Equal, frozen)),
+        );
+        assert!(!landed.reseeds());
+        assert!(!landed.unlanded(), "the seed was built at the fork's tree");
+        let nearer = age(
+            (Nearness::Paths(2), later),
+            Some((Nearness::Paths(9), frozen)),
+        );
+        assert!(!nearer.reseeds());
+        let comparable = age(
+            (Nearness::Paths(9), later),
+            Some((Nearness::Unknown, frozen)),
+        );
+        assert!(
+            comparable.reseeds(),
+            "any count is nearer than an unknown tree"
+        );
+        let adopted = age((Nearness::Equal, frozen), Some((Nearness::Paths(1), later)));
+        assert!(
+            adopted.reseeds(),
+            "an older live volume at the fork's own tree"
+        );
+        assert!(!adopted.unlanded());
+        let moved = age(
+            (Nearness::Paths(1), later),
+            Some((Nearness::Paths(1), frozen)),
+        );
+        assert!(
+            moved.unlanded(),
+            "neither volume was built at the fork's tree"
+        );
+        assert!(age((Nearness::Unknown, frozen), None).unlanded());
+    }
+
+    /// A git repository at `path` whose commit holds `files`, by its `HEAD^{tree}`.
+    fn commit(path: &Path, files: &[(&str, &str)]) -> GitOid {
+        use cowshed_os::fork_lock::Run as _;
+        let git = |args: &[&str]| {
+            let output = crate::git::git_command_at(path)
+                .args([
+                    "-c",
+                    "user.name=cowshed",
+                    "-c",
+                    "user.email=cowshed@example.invalid",
+                ])
+                .args(args)
+                .output_locked()
+                .unwrap();
+            assert!(output.status.success(), "git {args:?}: {output:?}");
+            String::from_utf8(output.stdout).unwrap()
+        };
+        if !path.join(".git").exists() {
+            fs::create_dir_all(path).unwrap();
+            git(&["init", "--quiet"]);
+        }
+        for (name, content) in files {
+            fs::write(path.join(name), content).unwrap();
+            git(&["add", "--", name]);
+        }
+        git(&["commit", "--quiet", "--allow-empty", "-m", "files"]);
+        GitOid::new(git(&["rev-parse", "HEAD^{tree}"]).trim_end()).unwrap()
+    }
+
+    /// Nearness counts the paths `git diff-tree` reports between two trees, and a tree the
+    /// repository does not hold, or none, is farther than any count.
+    #[test]
+    fn nearness_counts_the_paths_two_trees_differ_in() {
+        let root = std::env::temp_dir().join(format!(
+            "cowshed-nearness-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let first = commit(&root, &[("a", "1"), ("b", "1")]);
+        let second = commit(&root, &[("a", "2"), ("c", "1")]);
+        let absent = GitOid::new("e".repeat(40)).unwrap();
+        assert_eq!(nearness(&root, Some(&second), &second), Nearness::Equal);
+        assert_eq!(nearness(&root, Some(&first), &second), Nearness::Paths(2));
+        assert_eq!(nearness(&root, Some(&absent), &second), Nearness::Unknown);
+        assert_eq!(nearness(&root, None, &second), Nearness::Unknown);
+        assert_eq!(head_tree(&root), Ok(second));
+        fs::remove_dir_all(&root).unwrap();
     }
 
     /// A live link is the proof of reachability, so it protects its volume before any record is
@@ -2503,7 +3235,12 @@ mod tests {
         fs::create_dir_all(staged.join(".cowshed")).unwrap();
         let prepared = scratch
             .volumes
-            .prepare_fork(main.clone(), main_checkout, lane.name.clone())
+            .prepare_fork(
+                main.clone(),
+                main_checkout,
+                lane.name.clone(),
+                unlanded_aim(),
+            )
             .await
             .expect("prepare the fork from main's seed");
         let forked = scratch
@@ -2767,7 +3504,12 @@ mod tests {
         };
         let topic_checkout = checkout("topic");
         let prepared = volumes
-            .prepare_fork(main.clone(), main_checkout.clone(), topic.name.clone())
+            .prepare_fork(
+                main.clone(),
+                main_checkout.clone(),
+                topic.name.clone(),
+                unlanded_aim(),
+            )
             .await
             .expect("prepare the fork from main's seed");
         let forked = volumes
@@ -2954,6 +3696,168 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn real_apfs_owned_index_cutover_preserves_a_busy_holder_and_resumes() {
+        use crate::build_volume::sqlite::Connection;
+        let scratch = Scratch::new("index-cutover");
+        let (checkout, live, mount) = scratch.linked_checkout("main", 1);
+        let index = BuildStatePath::new(".codegraph", "codegraph").unwrap();
+        let state = BuildVolumeState {
+            paths: vec![index.clone()],
+            fingerprint: Some("before-cutover".into()),
+        };
+        state.write(&mount).unwrap();
+        link::link_paths(&checkout, &mount, &state.paths).unwrap();
+        let database = checkout.join(".codegraph/codegraph.db");
+        fs::write(&database, b"").unwrap();
+        let holder = Connection::open(&database).unwrap();
+        holder.execute("PRAGMA journal_mode=WAL", &[]).unwrap();
+        holder
+            .execute("CREATE TABLE evidence (value TEXT)", &[])
+            .unwrap();
+        holder
+            .execute("INSERT INTO evidence VALUES ('before')", &[])
+            .unwrap();
+        let refused = scratch
+            .volumes
+            .refresh(
+                owner("main", '0'),
+                checkout.clone(),
+                Discovered::Unchanged,
+                Lent::Nothing,
+            )
+            .await
+            .unwrap_err();
+        let reason = refused
+            .index_migration_source()
+            .expect("typed index migration refusal");
+        assert_eq!(reason.path, checkout.join(".codegraph"));
+        assert!(
+            reason
+                .holders
+                .iter()
+                .any(|held| u32::try_from(held.pid) == Ok(std::process::id()))
+        );
+        assert_eq!(BuildVolumeState::read(&mount).unwrap(), state);
+        assert_eq!(
+            fs::read_link(checkout.join(".codegraph")).unwrap(),
+            link::relative_target(index.checkout.as_path(), index.volume.as_path())
+        );
+        // The same SQLite holder remains usable after the refusal: no force, kill or live copy.
+        holder
+            .execute("INSERT INTO evidence VALUES ('after refusal')", &[])
+            .unwrap();
+        let mut rows = holder.prepare("SELECT count(*) FROM evidence").unwrap();
+        assert!(rows.step().unwrap());
+        assert_eq!(rows.integer(0), 2);
+        drop(rows);
+        drop(holder);
+        let before = fs::read(&database).unwrap();
+        let written = fs::metadata(&database).unwrap().modified().unwrap();
+        scratch
+            .volumes
+            .refresh(
+                owner("main", '0'),
+                checkout.clone(),
+                Discovered::Unchanged,
+                Lent::Nothing,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            fs::symlink_metadata(checkout.join(".codegraph"))
+                .unwrap()
+                .is_dir()
+        );
+        assert_eq!(fs::read(&database).unwrap(), before);
+        assert_eq!(
+            fs::metadata(&database).unwrap().modified().unwrap(),
+            written
+        );
+        assert!(BuildVolumeState::read(&mount).unwrap().paths.is_empty());
+        let restored = Connection::open(&database).unwrap();
+        let mut rows = restored.prepare("SELECT count(*) FROM evidence").unwrap();
+        assert!(rows.step().unwrap());
+        assert_eq!(rows.integer(0), 2);
+        drop(rows);
+        drop(restored);
+        // A foreign index link is never copied, exchanged, or followed.
+        fs::remove_dir_all(checkout.join(".codegraph")).unwrap();
+        let foreign = scratch.root.path().join("foreign-index");
+        fs::create_dir(&foreign).unwrap();
+        fs::write(foreign.join("marker"), "foreign").unwrap();
+        std::os::unix::fs::symlink(&foreign, checkout.join(".codegraph")).unwrap();
+        state.write(&mount).unwrap();
+        scratch
+            .volumes
+            .refresh(
+                owner("main", '0'),
+                checkout.clone(),
+                Discovered::Unchanged,
+                Lent::Nothing,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(fs::read_link(checkout.join(".codegraph")).unwrap(), foreign);
+        assert_eq!(
+            fs::read_to_string(foreign.join("marker")).unwrap(),
+            "foreign"
+        );
+        assert!(scratch.layout.read_record_present(&live).unwrap().is_some());
+        scratch.release_all();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn real_apfs_gc_collects_an_imageless_seed_sidecar_and_rechecks_its_image() {
+        let scratch = Scratch::new("seed-sidecar-gc");
+        let seed = BuildVolumeId::mint();
+        let record = BuildVolumeRecord::new(
+            None,
+            BuildVolumeRole::Seed {
+                target: WorkspaceName::main(),
+                incarnation: owner("main", '0').incarnation,
+            },
+        );
+        fs::create_dir_all(scratch.layout.record(&seed).parent().unwrap()).unwrap();
+        scratch.layout.write_record(&seed, &record).unwrap();
+        assert!(
+            scratch.layout.list().unwrap().is_empty(),
+            "not a usable seed"
+        );
+        let ids = scratch.layout.collection_ids().unwrap();
+        assert_eq!(ids, std::slice::from_ref(&seed));
+        let links = Links::default();
+        let preview = plan(&scratch.layout, &ids, &links).unwrap();
+        assert_eq!(preview.doomed.len(), 1);
+        assert_eq!(preview.doomed[0].bytes, 0);
+        fs::write(scratch.layout.image(&seed), "new image").unwrap();
+        assert_eq!(
+            still_doomed(&scratch.layout, &links, &preview.doomed[0]).unwrap(),
+            Some(Deferral::Changed),
+            "an image appearing after planning stays"
+        );
+        fs::remove_file(scratch.layout.image(&seed)).unwrap();
+        let dry = scratch
+            .volumes
+            .collect(ids.clone(), links.clone(), true)
+            .await
+            .unwrap();
+        assert_eq!(dry.candidates.len(), 1);
+        assert!(
+            scratch.layout.record(&seed).exists(),
+            "preview does not delete"
+        );
+        let collected = scratch.volumes.collect(ids, links, false).await.unwrap();
+        assert_eq!(collected.reclaimed, 1);
+        assert_eq!(collected.freed_bytes, 0);
+        assert!(!scratch.layout.record(&seed).exists());
+        scratch.release_all();
     }
 
     /// A real Cargo build stopped inside its build script, after Cargo has taken the profile's
@@ -3365,11 +4269,14 @@ fn main() {
             SeedAge {
                 live,
                 tree: None,
+                nearness: Nearness::Unknown,
                 written: SystemTime::UNIX_EPOCH + Duration::from_secs(2),
-                seed: Some((
-                    previous.clone(),
-                    SystemTime::UNIX_EPOCH + Duration::from_secs(1),
-                )),
+                seed: Some(Frozen {
+                    id: previous.clone(),
+                    tree: None,
+                    nearness: Nearness::Unknown,
+                    written: SystemTime::UNIX_EPOCH + Duration::from_secs(1),
+                }),
             },
         );
         let kept = scratch
@@ -3381,8 +4288,8 @@ fn main() {
         drop(held);
         scratch.release_all();
         assert_eq!(kept, previous);
-        let Reseed::Skipped {
-            reason: ReseedSkip::VolumeBusy { reason },
+        let Refresh::Skipped {
+            reason: CaptureSkip::VolumeBusy { reason },
             ..
         } = reseeded.unwrap()
         else {
@@ -3393,6 +4300,169 @@ fn main() {
             "{reason}"
         );
         assert!(reason.contains("nothing was forced"), "{reason}");
+    }
+
+    /// Fork `destination` from `main`'s seed refreshed for `aim`, as `fork` does, and read the
+    /// marker output in the fork's live volume, if any.
+    #[cfg(target_os = "macos")]
+    async fn fork_marker(
+        scratch: &Scratch,
+        main: &Owner,
+        main_checkout: &Path,
+        destination: &str,
+        aim: Aim,
+    ) -> Option<String> {
+        let destination = owner(destination, '2');
+        let staged = scratch
+            .root
+            .path()
+            .join(format!("staged-{}", destination.name));
+        fs::create_dir_all(staged.join(".cowshed")).unwrap();
+        let prepared = scratch
+            .volumes
+            .prepare_fork(
+                main.clone(),
+                main_checkout.to_owned(),
+                destination.name.clone(),
+                aim,
+            )
+            .await
+            .expect("prepare the fork from main's seed");
+        let forked = scratch
+            .volumes
+            .finish_fork(prepared, destination, staged)
+            .await
+            .expect("fork from main's seed")
+            .expect("main has a seed");
+        fs::read_to_string(scratch.layout.mount(&forked).join("marker")).ok()
+    }
+
+    /// An external land (16_build_volumes.md, "Which volume a seed holds"): main's branch moves
+    /// by plain git to the tree `lander` has checked out, and `lander`'s build volume holds a
+    /// marker output nothing in main built. A fork of main at that tree inherits the marker
+    /// without building, and keeps inheriting it after main's own volume is written again. The
+    /// control (no candidate), the plant (a candidate whose volume holds a marker at another
+    /// tree) and a candidate whose image lock is held all leave main's seed where it was.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn real_apfs_a_fork_after_an_external_land_inherits_the_landed_volume() {
+        let scratch = Scratch::new("build-external-land");
+        let main = owner("main", '0');
+        let (main_checkout, main_live, main_mount) = scratch.linked_checkout("main", 1);
+        let before = commit(&main_checkout, &[("lib.rs", "1")]);
+        scratch
+            .layout
+            .write_record(
+                &main_live,
+                &BuildVolumeRecord::new(Some(before.clone()), linked("main")),
+            )
+            .unwrap();
+        scratch
+            .host
+            .clone_build_volume(
+                &scratch.layout,
+                &main_live,
+                &BuildVolumeId::mint(),
+                &BuildVolumeRecord::new(
+                    Some(before.clone()),
+                    BuildVolumeRole::Seed {
+                        target: main.name.clone(),
+                        incarnation: main.incarnation.clone(),
+                    },
+                ),
+            )
+            .expect("seed main");
+        let peer = |name: &str, checkout: &Path| Peer {
+            name: WorkspaceName::new(name).unwrap(),
+            checkout: checkout.to_owned(),
+            lock: scratch.image_lock(&WorkspaceName::new(name).unwrap()),
+        };
+        let (lander_checkout, _, lander_mount) = scratch.linked_checkout("lander", 1);
+        let landed = commit(&lander_checkout, &[("lib.rs", "2")]);
+        fs::write(lander_mount.join("marker"), "M").unwrap();
+        let lander = peer("lander", &lander_checkout);
+        let (drifter_checkout, _, drifter_mount) = scratch.linked_checkout("drifter", 1);
+        commit(&drifter_checkout, &[("lib.rs", "3")]);
+        fs::write(drifter_mount.join("marker"), "D").unwrap();
+        let drifter = peer("drifter", &drifter_checkout);
+        // The external land: main's checkout reaches the landed tree by plain git.
+        assert_eq!(commit(&main_checkout, &[("lib.rs", "2")]), landed);
+        let aim = |landed_by: Vec<Peer>| Aim {
+            tree: landed.clone(),
+            landed: landed_by,
+        };
+        let seed_tree = || {
+            scratch
+                .layout
+                .seed_of(&main.name, &main.incarnation)
+                .unwrap()
+                .expect("main has a seed")
+                .1
+                .tree
+        };
+
+        // Control: no live workspace offered, so the fork is built from main's own state.
+        let control = fork_marker(&scratch, &main, &main_checkout, "control", aim(vec![])).await;
+        assert_eq!(control, None);
+        assert_eq!(seed_tree(), Some(before.clone()));
+
+        // Plant: a workspace at another tree never seeds main, whatever its volume holds.
+        let plant = fork_marker(
+            &scratch,
+            &main,
+            &main_checkout,
+            "plant",
+            aim(vec![drifter.clone()]),
+        )
+        .await;
+        assert_eq!(plant, None);
+        assert_eq!(seed_tree(), Some(before.clone()));
+
+        // A landed workspace whose own operation holds its image lock is passed over, named.
+        let held = scratch
+            .host
+            .lock_images(std::slice::from_ref(&lander.lock), LockMode::Try)
+            .unwrap()
+            .expect("nothing else holds lander's image lock");
+        let refreshed = scratch
+            .volumes
+            .refresh_seed(
+                main.clone(),
+                main_checkout.clone(),
+                aim(vec![lander.clone()]),
+            )
+            .await
+            .unwrap();
+        drop(held);
+        assert_eq!(
+            refreshed.passed,
+            vec![(lander.name.clone(), LandedSkip::Locked)]
+        );
+        assert!(
+            !matches!(refreshed.outcome, Refresh::Landed { .. }),
+            "{refreshed:?}"
+        );
+        assert_eq!(seed_tree(), Some(before.clone()));
+
+        // The fork at the landed tree inherits the landed volume's marker without building.
+        let inherited = fork_marker(
+            &scratch,
+            &main,
+            &main_checkout,
+            "inherited",
+            aim(vec![drifter.clone(), lander.clone()]),
+        )
+        .await;
+        assert_eq!(inherited.as_deref(), Some("M"));
+        assert_eq!(seed_tree(), Some(landed.clone()));
+
+        // Main's own volume, built at the old tree, is written again: the landed seed is nearer
+        // the fork's tree and stays, though the live volume was written after it.
+        fs::write(main_mount.join("later"), "written after the land").unwrap();
+        let after = fork_marker(&scratch, &main, &main_checkout, "after", aim(vec![])).await;
+        assert_eq!(after.as_deref(), Some("M"));
+        assert_eq!(seed_tree(), Some(landed));
+        scratch.release_all();
     }
 
     /// A shed's daemon keeper answers the reseed's stop of its daemon by admitting a start job
@@ -3490,11 +4560,14 @@ fn main() {
             SeedAge {
                 live,
                 tree: None,
+                nearness: Nearness::Unknown,
                 written: SystemTime::UNIX_EPOCH + Duration::from_secs(2),
-                seed: Some((
-                    previous.clone(),
-                    SystemTime::UNIX_EPOCH + Duration::from_secs(1),
-                )),
+                seed: Some(Frozen {
+                    id: previous.clone(),
+                    tree: None,
+                    nearness: Nearness::Unknown,
+                    written: SystemTime::UNIX_EPOCH + Duration::from_secs(1),
+                }),
             },
         );
         let stopped = daemon.try_wait().unwrap();
@@ -3518,7 +4591,7 @@ fn main() {
             "the restart's admission meets the reseed's claim"
         );
         assert!(
-            matches!(reseeded.unwrap(), Reseed::Reseeded { .. }),
+            matches!(reseeded.unwrap(), Refresh::Reseeded { .. }),
             "the reseed captures"
         );
         assert!(
@@ -3559,19 +4632,22 @@ fn main() {
             SeedAge {
                 live: live.clone(),
                 tree: None,
+                nearness: Nearness::Unknown,
                 written: SystemTime::UNIX_EPOCH + Duration::from_secs(2),
-                seed: Some((
-                    previous.clone(),
-                    SystemTime::UNIX_EPOCH + Duration::from_secs(1),
-                )),
+                seed: Some(Frozen {
+                    id: previous.clone(),
+                    tree: None,
+                    nearness: Nearness::Unknown,
+                    written: SystemTime::UNIX_EPOCH + Duration::from_secs(1),
+                }),
             },
         );
         drop(job);
         let seeds = seeds_of(&scratch.layout, &target).unwrap();
         scratch.release_all();
         assert_eq!(seeds, [previous], "the skip keeps the previous seed");
-        let Reseed::Skipped {
-            reason: ReseedSkip::VolumeBusy { reason },
+        let Refresh::Skipped {
+            reason: CaptureSkip::VolumeBusy { reason },
             ..
         } = reseeded.unwrap()
         else {
@@ -4290,14 +5366,15 @@ fn main() {
             .lock_images(&[scratch.image_lock(&main.name)], LockMode::Wait)
             .unwrap()
             .expect("a blocking lock");
-        assert!(matches!(
+        assert_eq!(
             scratch
                 .volumes
-                .reseed(main.clone(), main_checkout.clone())
+                .refresh_seed(main.clone(), main_checkout.clone(), unlanded_aim())
                 .await
-                .unwrap(),
-            Reseed::Fresh
-        ));
+                .unwrap()
+                .outcome,
+            Refresh::Kept
+        );
         let (seed, record) = scratch
             .layout
             .seed_of(&main.name, &main.incarnation)

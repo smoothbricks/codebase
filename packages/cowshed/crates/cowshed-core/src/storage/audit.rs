@@ -29,10 +29,10 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::api::dto::{
-    AdmissionCommitment, CONTROLLER_COMMITMENT_VERSION, CheckpointCommitment, ControllerCommitment,
-    ForkCommitment, GitOid, JobId, JobState, LandAdoptionCommitment, OutputLimitInfo,
-    RestoreCommitment, Sha256Digest, TerminalCommitment, WorkspaceIntroducedCommitment,
-    WorkspaceRetiredCommitment,
+    AdmissionCommitment, AdoptionSkip, CONTROLLER_COMMITMENT_VERSION, CheckpointCommitment,
+    ControllerCommitment, ForkCommitment, GitOid, JobId, JobState, LandAdoptionCommitment,
+    LandOutcomeCommitment, OutputLimitInfo, RestoreCommitment, Sha256Digest, TerminalCommitment,
+    WorkspaceIntroducedCommitment, WorkspaceRetiredCommitment,
 };
 use crate::metadata::WorkspaceIncarnation;
 use crate::repository::RepoId;
@@ -58,7 +58,8 @@ fn commitment_durability(commitment: &ControllerCommitment) -> Durability {
         | ControllerCommitment::Checkpoint(_)
         | ControllerCommitment::Fork(_)
         | ControllerCommitment::Restore(_)
-        | ControllerCommitment::LandAdoption(_) => Durability::PowerLoss,
+        | ControllerCommitment::LandAdoption(_)
+        | ControllerCommitment::LandOutcome(_) => Durability::PowerLoss,
     }
 }
 
@@ -128,6 +129,14 @@ pub enum CommitmentDraft {
         task: String,
         task_hash: String,
         inputs_digest: Sha256Digest,
+    },
+    LandOutcome {
+        repo_id: RepoId,
+        landing_incarnation: WorkspaceIncarnation,
+        target_incarnation: WorkspaceIncarnation,
+        landed_head: GitOid,
+        seeded: bool,
+        skip: Option<AdoptionSkip>,
     },
 }
 
@@ -251,6 +260,23 @@ impl CommitmentDraft {
                 task,
                 task_hash,
                 inputs_digest,
+            }),
+            Self::LandOutcome {
+                repo_id,
+                landing_incarnation,
+                target_incarnation,
+                landed_head,
+                seeded,
+                skip,
+            } => ControllerCommitment::LandOutcome(LandOutcomeCommitment {
+                version: CONTROLLER_COMMITMENT_VERSION,
+                order,
+                repo_id,
+                landing_incarnation,
+                target_incarnation,
+                landed_head,
+                seeded,
+                skip,
             }),
         }
     }

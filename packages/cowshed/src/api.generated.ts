@@ -307,7 +307,8 @@ export type ControllerCommitmentRef =
   | ({ readonly kind: 'checkpoint' } & CheckpointCommitment)
   | ({ readonly kind: 'fork' } & ForkCommitment)
   | ({ readonly kind: 'restore' } & RestoreCommitment)
-  | ({ readonly kind: 'landAdoption' } & LandAdoptionCommitment);
+  | ({ readonly kind: 'landAdoption' } & LandAdoptionCommitment)
+  | ({ readonly kind: 'landOutcome' } & LandOutcomeCommitment);
 
 /**
  * An operational error with a concrete recovery command.
@@ -354,6 +355,7 @@ export type CowshedError = {
    * where that input stands. Absent from the wire otherwise, like `fence`.
    */
   readonly stdin?: StdinRefusal;
+  readonly indexMigration?: IndexMigrationRefusal;
 };
 
 /**
@@ -790,6 +792,15 @@ export type IdentityReport = {
 };
 
 /**
+ * A writer-excluded owned index migration refused without changing its link or bytes.
+ */
+export type IndexMigrationRefusal = {
+  readonly path: string;
+  readonly reason: string;
+  readonly holders: ReadonlyArray<DatabaseHolder>;
+};
+
+/**
  * A job's totals and the independent source that counted them, never a sum of the processes a
  * sampler happened to see (that sum misses every descendant born and reaped between two
  * samples), each reconciled against those processes. Each variant's documentation names what
@@ -1181,6 +1192,23 @@ export type LandOptions = {
   readonly expectedWorkspaceIncarnation?: WorkspaceIncarnation;
   readonly expectedSourceHead?: GitOid;
   readonly expectedTargetHead?: ExpectedRefHead;
+};
+
+/**
+ * One land's actual build-volume outcome, including a seeded-but-skipped adoption.
+ */
+export type LandOutcomeCommitment = {
+  readonly version: number & tags.Type<'uint32'> & tags.Maximum<65535>;
+  readonly order: number & tags.Type<'uint64'>;
+  readonly repoId: RepoId;
+  readonly landingIncarnation: WorkspaceIncarnation;
+  readonly targetIncarnation: WorkspaceIncarnation;
+  readonly landedHead: GitOid;
+  readonly seeded: boolean;
+  /**
+   * None only when adoption succeeded; otherwise the report's complete refusal.
+   */
+  readonly skip: AdoptionSkip | null;
 };
 
 export type LandReport = {
@@ -1761,43 +1789,6 @@ export type RepositoryBinding = {
   readonly identities: ReadonlyArray<BoundIdentity>;
   readonly formerIdentities?: ReadonlyArray<RepoId>;
 };
-
-export type Reseed =
-  | { readonly kind: 'noBuildVolume' }
-  | { readonly kind: 'fresh' }
-  | ({ readonly kind: 'reseeded' } & {
-      readonly behindMs?: number & tags.Type<'uint64'>;
-      readonly elapsedMs: number & tags.Type<'uint64'>;
-    })
-  | ({ readonly kind: 'skipped' } & {
-      readonly behindMs?: number & tags.Type<'uint64'>;
-      readonly reason: ReseedSkip;
-    });
-
-/**
- * What `cowshed reseed` did with a target's seed (16_build_volumes.md, "Targets and seeds").
- * Every fork of the target does the same before it clones the seed.
- */
-export type ReseedResult = {
-  readonly workspace: WorkspaceName;
-  readonly outcome: Reseed;
-};
-
-export type ReseedSkip =
-  | ({ readonly kind: 'held' } & {
-      readonly database: string;
-      readonly holders: ReadonlyArray<DatabaseHolder>;
-    })
-  | ({ readonly kind: 'daemonStayed' } & {
-      readonly daemon: DatabaseHolder;
-    })
-  | ({ readonly kind: 'building' } & {
-      readonly lock: string;
-      readonly holders: ReadonlyArray<DatabaseHolder>;
-    })
-  | ({ readonly kind: 'volumeBusy' } & {
-      readonly reason: string;
-    });
 
 /**
  * Bytes of memory resident in RAM: what processes hold now, never memory charged to them
