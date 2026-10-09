@@ -126,7 +126,11 @@ pub enum Binding {
     Live,
 }
 
-/// The embedder's expression evaluator.
+/// The embedder's expression evaluator. Its answer for an expression is a
+/// function of the expression bytes, the batch's columns and the state at
+/// the row: a resume over retained cells evaluates its deferred entries
+/// with whatever evaluator it is handed, so every evaluator one embedder
+/// passes for a program implements one expression language.
 pub trait RowExpression {
     /// Validate one entry's expression against the batch before any row is
     /// evaluated, and answer how it binds: every column it reads must cover
@@ -452,6 +456,12 @@ fn refuse_plain_reads_of_live_columns(
     Ok(())
 }
 
+/// Back `additional` more elements of `buf`, refusing with `OutOfMemory`.
+fn room<T>(buf: &mut Vec<T>, additional: usize) -> Result<(), ErrorCode> {
+    buf.try_reserve(additional)
+        .map_err(|_| ErrorCode::OutOfMemory)
+}
+
 /// Evaluate `program`'s row-expression table over the batch and replace each
 /// target column in `cols` with its derived cells. Entries bind in table
 /// order; a later entry reads an earlier one's column through
@@ -461,7 +471,9 @@ fn refuse_plain_reads_of_live_columns(
 /// when every entry bound up front.
 ///
 /// Errors leave `cols` untouched: the table is validated and every cell
-/// computed before the first splice.
+/// computed before the first splice. `out` grows to the widest and longest
+/// batch it has bound and keeps that storage; memory that cannot back it
+/// refuses with `OutOfMemory`.
 pub fn bind_row_columns<'a, 'e, E: RowExpression>(
     program: &'a [u8],
     state: &[u8],
@@ -503,12 +515,14 @@ pub fn bind_row_columns<'a, 'e, E: RowExpression>(
     // The table is the program's tail: a table offset plus this is a
     // program offset, which is what the live reads index.
     let table_start = program.len() - table.len();
-    out.table
-        .try_reserve(table.len())
-        .map_err(|_| ErrorCode::OutOfMemory)?;
+    room(&mut out.table, table.len())?;
     out.table.extend_from_slice(table);
     out.table_start = table_start;
+    let have = out.cells.len();
+    room(&mut out.cells, count.saturating_sub(have))?;
     out.cells.resize_with(count, Vec::new);
+    let have = out.targets.len();
+    room(&mut out.targets, count.saturating_sub(have))?;
     out.targets.resize(count, 0);
     out.type_col = type_col;
     out.batch_len = batch_len;
@@ -536,6 +550,7 @@ pub fn bind_row_columns<'a, 'e, E: RowExpression>(
         let binding = eval.admit(entry.expr, &batch)?;
         let cells = &mut rest[0];
         cells.clear();
+        room(cells, batch_len as usize)?;
         cells.resize(batch_len as usize, 0);
         if binding == Binding::Live {
             // The zero cells stand in for the column the reduce section
@@ -547,8 +562,11 @@ pub fn bind_row_columns<'a, 'e, E: RowExpression>(
                 return Err(ErrorCode::InvalidProgram);
             }
             if out.live_index.len() < view.len() {
+                let have = out.live_index.len();
+                room(&mut out.live_index, view.len() - have)?;
                 out.live_index.resize(view.len(), NOT_LIVE);
             }
+            room(&mut out.live, 1)?;
             out.live_index[entry.target_col as usize] = index;
             out.live.push(LiveEntry {
                 match_ids: entry.match_ids_at.shifted(table_start),

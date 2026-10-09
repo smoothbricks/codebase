@@ -11,6 +11,69 @@ use columine_vm::row_exprs::{
 use columine_vm::state_init::{DEFAULT_ACCEPTED_PROGRAM_MAGICS, calculate_state_size, init_state};
 use columine_vm::struct_map::StructMapSlot;
 use columine_vm::vm::{CheckedMap, Vm, col_u32_exact, u32s_as_bytes};
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
+
+/// Forwards to the system allocator, refusing this thread's allocations
+/// while a [`without_memory`] scope is open.
+struct RefusingAllocator;
+
+thread_local! {
+    static ALLOCATION_REFUSED: Cell<bool> = const { Cell::new(false) };
+}
+
+fn allocation_refused() -> bool {
+    ALLOCATION_REFUSED.try_with(Cell::get).unwrap_or(false)
+}
+
+// SAFETY: every call forwards the original pointer and layout to System; a
+// refused allocation returns null, which GlobalAlloc permits for any call.
+unsafe impl GlobalAlloc for RefusingAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        if allocation_refused() {
+            return core::ptr::null_mut();
+        }
+        unsafe { System.alloc(layout) }
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        if allocation_refused() {
+            return core::ptr::null_mut();
+        }
+        unsafe { System.alloc_zeroed(layout) }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        unsafe { System.dealloc(ptr, layout) }
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        if allocation_refused() {
+            return core::ptr::null_mut();
+        }
+        unsafe { System.realloc(ptr, layout, new_size) }
+    }
+}
+
+#[global_allocator]
+static ALLOCATOR: RefusingAllocator = RefusingAllocator;
+
+struct RefusalScope;
+
+impl Drop for RefusalScope {
+    fn drop(&mut self) {
+        ALLOCATION_REFUSED.with(|refused| refused.set(false));
+    }
+}
+
+/// Run `run` while every allocation on this thread fails.
+fn without_memory<T>(run: impl FnOnce() -> T) -> T {
+    ALLOCATION_REFUSED.with(|refused| refused.set(true));
+    let scope = RefusalScope;
+    let result = run();
+    drop(scope);
+    result
+}
 
 const OK: u32 = ErrorCode::Ok as u32;
 
@@ -383,9 +446,46 @@ fn two_entries_bind_their_own_targets_over_the_host_batch() {
         admitted: 0,
         evaluated: 0,
     };
+    // Storage that memory cannot back refuses the bind by name, with the
+    // columns untouched.
+    let mut cold = RowColumns::new();
+    assert_eq!(
+        without_memory(|| {
+            bind_row_columns(&prog, &state, &mut cols, 2, &mut eval, &mut cold).err()
+        }),
+        Some(ErrorCode::OutOfMemory)
+    );
+    assert!(cols[3].is_empty() && cols[4].is_empty());
     bind_row_columns(&prog, &state, &mut cols, 2, &mut eval, &mut rows).expect("bind");
     assert_eq!(cols[3], u32s_as_bytes(&[0u32, 1]));
     assert_eq!(cols[4], u32s_as_bytes(&[1u32, 1]));
+    // A batch no wider or longer than one already bound binds in the
+    // storage it left, so the same refusal no longer applies.
+    let mut again: Vec<&[u8]> = vec![u32s_as_bytes(&types), &[], u32s_as_bytes(&vals), &[], &[]];
+    assert_eq!(
+        without_memory(|| {
+            bind_row_columns(&prog, &state, &mut again, 2, &mut eval, &mut rows).err()
+        }),
+        None
+    );
+    assert_eq!(again[4], u32s_as_bytes(&[1u32, 1]));
+    // A longer batch needs longer cells than the storage holds: refused by
+    // name, columns untouched.
+    let (long_types, long_vals) = ([ORDER_TYPE; 64], [150u32; 64]);
+    let mut longer: Vec<&[u8]> = vec![
+        u32s_as_bytes(&long_types),
+        &[],
+        u32s_as_bytes(&long_vals),
+        &[],
+        &[],
+    ];
+    assert_eq!(
+        without_memory(|| {
+            bind_row_columns(&prog, &state, &mut longer, 64, &mut eval, &mut rows).err()
+        }),
+        Some(ErrorCode::OutOfMemory)
+    );
+    assert!(longer[3].is_empty() && longer[4].is_empty());
 }
 
 /// Expression `[key_col, val_col]`: 1 when the row's value exceeds what the

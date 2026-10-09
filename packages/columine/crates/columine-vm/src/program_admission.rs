@@ -278,6 +278,15 @@ impl<A: VoProgramAdmission> AdmittedProgram<A> {
     /// in any run, against the state the resumed rows before it left. `rows`
     /// from another table or another batch length is refused as
     /// `Rows(InvalidProgram)`, before admission or execution.
+    ///
+    /// Embedder contract for `eval`: it implements the same expression
+    /// language as the evaluator that bound `rows`. The table bytes `rows`
+    /// is bound to are the expressions; which entries were deferred is the
+    /// bind's answer and is never asked again, and the bound cells are
+    /// never re-evaluated, so only deferred entries reach `eval`, at their
+    /// rows. An evaluator whose answer depends on anything beyond the
+    /// expression, the batch's columns and the state at the row is outside
+    /// this contract, as it is for any run.
     #[allow(clippy::too_many_arguments)]
     pub fn execute_spliced<'a, E: RowExpression>(
         &'a self,
