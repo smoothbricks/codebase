@@ -389,7 +389,28 @@ describe('processes a task left working in its RAM lease', () => {
       await writeFile(gate, 'go\n');
       child = await childPid;
 
-      const stopped = await hostLeaseProcesses.stopWorkingIn(lease);
+      const owned = [pid, child];
+      let cwdReads = 0;
+      let consecutiveStopped = 0;
+      const processes = leaseProcessesOn({
+        workingIn: async (directory) => {
+          if (cwdReads > 0) {
+            expect(consecutiveStopped).toBeGreaterThanOrEqual(2);
+          }
+          cwdReads += 1;
+          return pidsWorkingIn(directory);
+        },
+        signal: terminate,
+        async table() {
+          const table = await processTable();
+          const rows = table.filter((entry) => owned.includes(entry.pid));
+          const bothStopped = rows.length === owned.length && rows.every((entry) => /^[TtZ]/.test(entry.stat));
+          consecutiveStopped = bothStopped ? consecutiveStopped + 1 : 0;
+          return table;
+        },
+      });
+
+      const stopped = await processes.stopWorkingIn(lease);
 
       expect(stopped.map((entry) => Number(entry.split(' ')[0])).sort((a, b) => a - b)).toEqual(
         [pid, child].sort((a, b) => a - b),

@@ -153,7 +153,8 @@ const STARTS_NOTHING = /^[TtZ]/;
  * again, until a read names nothing that the read before did not already show stopped: a stopped
  * process starts nothing, and whatever it started before it stopped is in every table read after.
  * Only then does each get SIGTERM, and SIGCONT to act on it. A child whose parent exited before it
- * could be held has lost its ancestry, so every round also asks again what works in the lease.
+ * could be held has lost its ancestry, so once the stopped-table barrier holds, the lease is asked
+ * again what works in it, including when that table names nothing, to recover reparented children.
  */
 export function leaseProcessesOn(host: ProcessHost): LeaseProcesses {
   return {
@@ -162,27 +163,31 @@ export function leaseProcessesOn(host: ProcessHost): LeaseProcesses {
       if (working.length === 0) {
         return [];
       }
-      const deadline = Date.now() + LEFTOVER_GRACE_MS;
+      const start = Date.now();
+      const deadline = start + LEFTOVER_GRACE_MS;
       const known = new Map<number, ProcessEntry>();
       let held = new Set<number>();
       let failures: unknown[] | undefined;
+      let tableReads = 0;
       try {
         for (;;) {
           const roots = [...working, ...known.keys()];
           const current = withDescendants(await host.table(), roots).filter((entry) => entry.pid !== process.pid);
+          tableReads += 1;
           for (const entry of current) {
             known.set(entry.pid, entry);
           }
-          working = (await host.workingIn(directory)).filter((pid) => pid !== process.pid);
-          if (
-            current.every((entry) => held.has(entry.pid) && STARTS_NOTHING.test(entry.stat)) &&
-            working.every((pid) => held.has(pid))
-          ) {
-            break;
+          if (current.every((entry) => held.has(entry.pid) && STARTS_NOTHING.test(entry.stat))) {
+            working = (await host.workingIn(directory)).filter((pid) => pid !== process.pid);
+            if (working.every((pid) => held.has(pid))) {
+              break;
+            }
           }
-          if (Date.now() > deadline) {
+          const now = Date.now();
+          if (now > deadline) {
+            const list = current.map((entry) => `${entry.pid} (${entry.command}, state ${entry.stat})`).join(', ');
             throw new Error(
-              `processes working in ${directory}: ${current.map((entry) => `${entry.pid} (${entry.command})`).join(', ')} did not stop spawning within ${LEFTOVER_GRACE_MS}ms`,
+              `processes working in ${directory}: ${list || 'no current processes'} did not stop spawning within ${LEFTOVER_GRACE_MS}ms after ${tableReads} table reads and ${now - start}ms; cwd roots: ${working.join(', ') || 'none'}`,
             );
           }
           for (const entry of current) {

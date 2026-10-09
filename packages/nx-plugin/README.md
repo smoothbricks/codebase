@@ -818,7 +818,10 @@ gap. Discovery failures attempt to resume every held process; one denied SIGCONT
 the original discovery failure and name any denied continuation with its PID and command. The settled census gets
 SIGTERM then SIGCONT, SIGKILL if anything has not exited five seconds later, and names each PID once on stderr
 (`stopped <pid> (<command>), which the command left working in its lease`). A lease with nothing in it costs no scan.
-The line is the leak check: a suite that prints it has a fixture to fix.
+The lease's working directories are read again only after the same census is stopped in consecutive process tables,
+including an empty one, which recovers children reparented out of the tree. This avoids host-wide cwd scans while
+stopped-table quiescence is still being established. The line is the leak check: a suite that prints it has a fixture to
+fix.
 
 The volume mounts at `/Volumes/smoo-ram-<uid>`, where DiskArbitration puts it: asking for any other mountpoint escalates
 to an administrator dialog that blocks every `diskutil` on the host. That mount is `noowners`, and launchd refuses a
