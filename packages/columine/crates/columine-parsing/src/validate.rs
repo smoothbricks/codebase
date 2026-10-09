@@ -314,17 +314,19 @@ impl PayloadViolation {
         }
     }
 
-    /// An event the judgment cannot place: its `type` is
-    /// missing, not a string, or names no declared signal type.
-    fn unmodeled(event_type: Option<&str>, type_value: Option<&dyn ValueView>) -> Self {
+    /// An event whose `type` names no declared signal type: the refusal
+    /// every lane that admits events against a semantic schema gives it.
+    pub fn undeclared_type() -> Self {
+        Self::unmodeled("undeclared")
+    }
+
+    /// An event the judgment cannot place: its `type` is missing, not a
+    /// string, or names no declared signal type.
+    fn unmodeled(observed: &str) -> Self {
         Self {
             path: "type".into(),
             expected: "signal type declared by the semantic schema".into(),
-            observed: match (event_type, type_value) {
-                (Some(_), _) => "undeclared".into(),
-                (None, Some(value)) => value.kind().as_str().into(),
-                (None, None) => "absent".into(),
-            },
+            observed: observed.into(),
             vo: None,
         }
     }
@@ -928,7 +930,11 @@ impl<A: VoAdmission> PreparedSchemas<A> {
                 return Err(refuse(PayloadViolation::repeated_key(name)));
             }
             let Some(schema) = event_type.and_then(|name| self.schemas.get(name)) else {
-                return Err(refuse(PayloadViolation::unmodeled(event_type, type_value)));
+                return Err(refuse(match (event_type, type_value) {
+                    (Some(_), _) => PayloadViolation::undeclared_type(),
+                    (None, Some(value)) => PayloadViolation::unmodeled(value.kind().as_str()),
+                    (None, None) => PayloadViolation::unmodeled("absent"),
+                }));
             };
             refuse_flat_payload_keys(event).map_err(refuse)?;
             let value = event.object_field("value").unwrap_or(&AbsentValue);
@@ -2955,6 +2961,9 @@ mod tests {
                         (violation.path.as_str(), violation.observed.as_str()),
                         ("type", observed)
                     );
+                    if event_type.is_some() {
+                        assert_eq!(*violation, PayloadViolation::undeclared_type());
+                    }
                 }
                 result => panic!("an unknown type must refuse: {result:?}"),
             }
