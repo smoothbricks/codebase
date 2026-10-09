@@ -44,6 +44,8 @@ export interface Step {
 export interface TestCase {
   readonly name: string;
   readonly start: number;
+  /** The 1-based column of the case's first token on its `start` line. */
+  readonly column: number;
   readonly end: number;
   /**
    * What decides the case's outcome besides its body: an expected-failure or ignore modifier, and in TypeScript the
@@ -279,6 +281,7 @@ export function typeScriptCases(file: string, text: string): TestCase[] {
         cases.push({
           name: ts.isStringLiteralLike(title) ? title.text : title.getText(source),
           start: line(node.getStart(source)),
+          column: source.getLineAndCharacterOfPosition(node.getStart(source)).character + 1,
           end: line(node.end),
           identity: [callee.endsWith('.failing') ? 'failing' : '', ...describeChain(node, source)].join('\n'),
           steps: caseSteps(body.body, source, declaredNames(body)),
@@ -539,6 +542,7 @@ export function rustCases(text: string): TestCase[] {
     cases.push({
       name,
       start: line(start),
+      column: start - (newlines[line(start) - 2] ?? -1),
       end: line(tokens[end]?.offset ?? start),
       identity: modifiers.sort().join('\n'),
       steps: wrapped === undefined ? steps : [step(wrapped.wrapper, false), ...rustSteps(wrapped.inner)],
@@ -693,8 +697,8 @@ export function formatDuplicateScenario(duplicate: DuplicateScenario): string {
           'and outcome)';
   return (
     `${REFUSES[duplicate.kind] ? 'error' : 'warning'}[${TEST_ONE_WALK.id}]: ${what}\n` +
-    `  --> ${duplicate.file}:${second.start}\n` +
-    `  --> ${duplicate.file}:${first.start}\n` +
+    `  --> ${duplicate.file}:${second.start}:${second.column}\n` +
+    `  --> ${duplicate.file}:${first.start}:${first.column}\n` +
     `  = help: ${TEST_ONE_WALK.help}`
   );
 }

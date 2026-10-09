@@ -56,8 +56,9 @@ describe('test-walk-policy', () => {
       const diagnostic = findDuplicateScenarios(root, [ts]).map(formatDuplicateScenario)[0] ?? '';
       for (const part of [
         `error[${TEST_ONE_WALK.id}]`,
-        `${ts}:6`,
-        `${ts}:1`,
+        // rustc-style `--> file:line:column`, which a diagnostics parser for rustc reads as is.
+        `  --> ${ts}:6:1\n`,
+        `  --> ${ts}:1:1\n`,
         '`posts a sale` only asserts after the 2 statements it shares with `a sale lands in the journal`',
         'its assertions belong in `a sale lands in the journal` after statement 2',
         'one walk',
@@ -257,7 +258,9 @@ describe('test-walk-policy', () => {
       ]);
       // Same-scenario is advisory: a warning for the writer and reviewer, never a refusal.
       expect(REFUSES['same-scenario']).toBe(false);
-      expect(findDuplicateScenarios(root, [rs]).map(formatDuplicateScenario)[0]).toStartWith('warning[TEST-ONE-WALK]');
+      const warning = findDuplicateScenarios(root, [rs]).map(formatDuplicateScenario)[0] ?? '';
+      expect(warning).toStartWith('warning[TEST-ONE-WALK]');
+      expect(warning).toMatch(/ {2}--> src\/ledger\.rs:\d+:5\n/u);
 
       // Same-scenario controls: a shared tail of assertions only (no shared action); a tail of two statements; two
       // injected statements on each side.
