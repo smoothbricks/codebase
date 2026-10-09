@@ -170,6 +170,8 @@ Shape:
 ;;     settings file, and the sccache GC root that names RUSTC_WRAPPER.
 (allow file-read* file-read-data (literal "~/.nix-profile/bin/direnv"))  ;; … one per grant
 (allow file-read-metadata (literal "~/.nix-profile/bin") (literal "~/.nix-profile") (literal "~"))  ;; its ancestors beneath HOME
+;; Core bootstrap: exact installed cowshed link/target reads only, metadata-only ancestors.
+(allow file-read* file-read-data (literal "<installed cowshed executable>"))
 (allow file-read* file-read-data file-write* (subpath "<workspace mount>")) ;; own mount ONLY
 ;; TMPDIR: the workspace's own directory in its project's store directory,
 ;; <store>/<owner>/<repo>/tmp/<workspace> (01_storage.md). Outside every checkout,
@@ -271,9 +273,11 @@ Notes:
   repository's main are unaffected.
 - Gateway mirrors (layer 1) live in cowshed's own cache directory, `~/Library/Caches/dev.cowshed/{mirror,repo-mirrors}`
   (Linux `$XDG_CACHE_HOME/cowshed/…`), and only the gateway writes them (03_caches.md, 05_gateway.md). That directory
-  and `~/Library/Application Support/dev.cowshed` are cowshed's controller state: no grant names them, so the HOME read
-  deny keeps a sandbox from reading or writing either, and the profile builder refuses a shared cache that intersects
-  one of them or a hard deny (`GrantIntersectsDeny`), as it refuses one that is HOME itself or lies outside HOME.
+  and `~/Library/Application Support/dev.cowshed` are cowshed's controller state: their directory contents stay denied.
+  The only core exception reads the exact installed `cowshed` program link and executable, with metadata-only ancestors
+  (15_capabilities.md, "Bootstrap executables"); it grants no data beside the executable and no write or socket access.
+  The profile builder refuses a shared cache that intersects either directory or a hard deny (`GrantIntersectsDeny`), as
+  it refuses one that is HOME itself or lies outside HOME.
 - `~/.cargo` and `~/.gradle` are never shared wholesale — only their cache subtrees are (03_caches.md). The deny list
   above pins their config and credential paths to the host precisely because those subtrees beside them are
   sandbox-writable. A cargo project on a rustup host reads `~/.cargo/bin` and `~/.rustup`'s settings and toolchains,
