@@ -33,7 +33,6 @@ pub static COMMANDS: &[&CommandSpec] = &[
     &MOUNT,
     &RESIZE,
     &DEFRAG,
-    &RESEED,
     &REKEY,
     &GC,
     &PUSH,
@@ -84,7 +83,6 @@ pub enum Command {
     Mount(MountArgs),
     Resize(ResizeArgs),
     Defrag(DefragArgs),
-    Reseed(ReseedArgs),
     Rekey(RekeyArgs),
     Gc(GcArgs),
     Push(PushArgs),
@@ -133,7 +131,6 @@ impl Command {
             | Self::Attach(_)
             | Self::Resize(_)
             | Self::Defrag(_)
-            | Self::Reseed(_)
             | Self::Rekey(_)
             | Self::Gc(_)
             | Self::Push(_)
@@ -445,12 +442,6 @@ pub struct ResizeArgs {
 /// `defrag <ws|main>` — rewrite one workspace's image contiguously.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DefragArgs {
-    pub workspace: String,
-}
-
-/// `reseed <ws|main>` — refreeze a target's seed from its quiet live build volume.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ReseedArgs {
     pub workspace: String,
 }
 
@@ -818,7 +809,6 @@ fn cli_command() -> ClapCommand {
                 .arg(value_once("build")),
         )
         .subcommand(leaf("defrag").arg(positional("workspace", 0..=1)))
-        .subcommand(leaf("reseed").arg(positional("workspace", 0..=1)))
         .subcommand(leaf("rekey").arg(positional("workspace", 0..=1)))
         .subcommand(leaf("gc").arg(flag("dry-run")))
         .subcommand(leaf("push").arg(positional("workspace", 0..=1)).args([
@@ -991,7 +981,6 @@ fn cli_from_matches(matches: ArgMatches) -> Result<Cli, UsageError> {
         "mount" => parse_mount(leaf)?,
         "resize" => parse_resize(leaf)?,
         "defrag" => parse_defrag(leaf)?,
-        "reseed" => parse_reseed(leaf)?,
         "rekey" => parse_rekey(leaf)?,
         "gc" => parse_gc(leaf)?,
         "push" => parse_push(leaf)?,
@@ -2653,26 +2642,6 @@ fn parse_defrag(matches: &ArgMatches) -> Result<Command, UsageError> {
     }))
 }
 
-const RESEED: CommandSpec = CommandSpec {
-    name: "reseed",
-    missing: "reseed requires a workspace",
-    args: "<ws|main>",
-    trailing: "",
-    summary: "refreeze a workspace's build-volume seed",
-    about: &[
-        "A fork clones its target's seed, never the target's live build volume, because something may be writing that. A land freezes the seed from the landing workspace's volume, so whatever the target runs afterwards (its own builds and gates, the land's adoption check) is in its live volume and not in its seed. Every `fork` therefore reseeds its source first, and this verb does the same on its own: when the live volume was written after the seed was frozen, the seed becomes a clone of it.",
-        "The live volume must have no writer while it is cloned: the workspace's Nx daemon is stopped as a land stops it, any other holder of its Nx task database skips the reseed, and so does a Cargo build holding a target directory's build lock; the skip names them. Nothing is reseeded when the seed already holds every write. The workspace must be attached, because its build link names the volume.",
-    ],
-    options: &[],
-};
-
-fn parse_reseed(matches: &ArgMatches) -> Result<Command, UsageError> {
-    const USAGE: &CommandSpec = &RESEED;
-    Ok(Command::Reseed(ReseedArgs {
-        workspace: require_workspace(matches, "workspace", false, USAGE, USAGE.missing)?,
-    }))
-}
-
 const REKEY: CommandSpec = CommandSpec {
     name: "rekey",
     missing: "rekey requires a workspace",
@@ -2952,6 +2921,12 @@ fn unknown_flag(flag: &str, usage: &'static CommandSpec) -> UsageError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn manual_reseed_is_not_a_command_or_help_topic() {
+        assert!(parse_args(["reseed", "main"]).is_err());
+        assert!(parse_args(["help", "reseed"]).is_err());
+    }
 
     #[test]
     fn build_state_is_read_only_checkout_scoped_and_rejects_positionals() {
@@ -4395,7 +4370,6 @@ mod tests {
             (&["detach", "--all"], NotUsed),
             (&["resize", "raven", "32GiB"], Required),
             (&["defrag", "main"], Required),
-            (&["reseed", "main"], Required),
             (&["rekey", "raven"], Required),
             (&["gc"], Required),
             (&["push", "raven"], Required),
@@ -4450,7 +4424,6 @@ mod tests {
             (&["detach"], "detach requires a workspace"),
             (&["resize"], "resize requires a workspace"),
             (&["defrag"], "defrag requires a workspace"),
-            (&["reseed"], "reseed requires a workspace"),
             (&["rekey"], "rekey requires a workspace"),
             (&["land"], "land requires a workspace"),
             (&["gateway"], "gateway action is required"),

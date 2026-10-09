@@ -21,7 +21,7 @@ pub mod link;
 pub mod migrate;
 pub mod nx;
 #[cfg(target_os = "macos")]
-mod sqlite;
+pub(crate) mod sqlite;
 
 use std::fs;
 use std::io;
@@ -322,15 +322,13 @@ fn overlapping(path: &Path, left: &BuildStatePath, right: &BuildStatePath) -> cr
 pub enum BuildStateTool {
     Cargo,
     Nx,
-    Codegraph,
     /// `.cowshed.toml` `[build] state`: a tool no capability detects.
     Declared,
 }
 
 impl BuildStateTool {
     /// The tool whose state `path` is: declared state by its own volume namespace, Nx's
-    /// directories under `.nx`, the indexer's `.codegraph`, and otherwise a Cargo target
-    /// directory, the only other contribution.
+    /// directories under `.nx`, and otherwise a Cargo target directory.
     pub fn of(path: &BuildStatePath) -> Self {
         let checkout = path.checkout.as_path();
         if path.is_declared() {
@@ -341,11 +339,6 @@ impl BuildStateTool {
             .is_some_and(|name| name == ".nx")
         {
             Self::Nx
-        } else if checkout
-            .file_name()
-            .is_some_and(|name| name == ".codegraph")
-        {
-            Self::Codegraph
         } else {
             Self::Cargo
         }
@@ -364,7 +357,6 @@ impl std::fmt::Display for DisplacedBuildStateFinding {
         let tool = match self.likely_tool {
             BuildStateTool::Cargo => "cargo clean or another Cargo command",
             BuildStateTool::Nx => "an Nx reset or cache command",
-            BuildStateTool::Codegraph => "the indexer",
             BuildStateTool::Declared => {
                 return write!(
                     formatter,
@@ -744,20 +736,34 @@ impl BuildVolumeLayout {
 
     /// Every published build volume: each `<id>.dmg` directly in the images directory.
     pub fn list(&self) -> crate::Result<Vec<BuildVolumeId>> {
+        self.list_entries(false)
+    }
+
+    /// GC's snapshot includes sidecars as well as images; seed selection never does.
+    pub fn collection_ids(&self) -> crate::Result<Vec<BuildVolumeId>> {
+        self.list_entries(true)
+    }
+
+    fn list_entries(&self, include_records: bool) -> crate::Result<Vec<BuildVolumeId>> {
         let entries = match fs::read_dir(&self.images) {
             Ok(entries) => entries,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(error) => return Err(io_error("list build volumes", &self.images, &error)),
         };
+        let image_name = format!(".{IMAGE_EXTENSION}");
+        let record_name = format!(".{IMAGE_EXTENSION}{RECORD_SUFFIX}");
         let mut ids = Vec::new();
         for entry in entries {
             let entry =
                 entry.map_err(|error| io_error("list build volumes", &self.images, &error))?;
             let name = entry.file_name();
-            let Some(stem) = name
-                .to_str()
-                .and_then(|name| name.strip_suffix(&format!(".{IMAGE_EXTENSION}")))
-            else {
+            let Some(stem) = name.to_str().and_then(|name| {
+                name.strip_suffix(&image_name).or_else(|| {
+                    include_records
+                        .then(|| name.strip_suffix(&record_name))
+                        .flatten()
+                })
+            }) else {
                 continue;
             };
             if let Some(id) = BuildVolumeId::parse(stem) {
@@ -765,6 +771,7 @@ impl BuildVolumeLayout {
             }
         }
         ids.sort();
+        ids.dedup();
         Ok(ids)
     }
 

@@ -182,12 +182,16 @@ capability, not from store reads
 
 Two different mechanisms save build time, and it helps to keep them apart.
 
-**The clone is why a workspace starts warm.** `cowshed fork` clones the target's source image and its latest immutable
-build-volume seed. Cargo target directories, Nx state and per-tree indexers live in that separate private APFS image,
-reached through `.cowshed/build` and fixed relative links. No file copy or warm-build step is part of fork or land. A
-land freezes the seed from the landing workspace's volume; whatever the target runs afterwards reaches the seed when the
-next fork reseeds it first, which it does when the target's volume was written since and nothing (an Nx run, a Cargo
-build) is writing it. `cowshed reseed <ws>` does it on demand; `cowshed doctor` reports a seed that is behind.
+**The clone is why a workspace starts warm.** A fork clones the target's source image and its latest immutable
+build-volume seed. Cargo target directories and Nx state live in that separate private APFS image, reached through
+`.cowshed/build` and fixed relative links; source indexers such as `.codegraph` remain on the source volume. Every land
+freezes a seed from the landing workspace's warm volume. A plain Git fast-forward is detected at the next fork,
+including `--ref` at the target's current tree: a quiet live workspace at exactly that tree seeds the target
+automatically. Between lands, the fork captures newer live state only when it is at least as near the requested tree and
+has no writer. A nearer landed seed beats an older live volume. There is no manual reseed or warm step. `doctor` reports
+target-only `seed-age`, `seed-tree-behind` and `target-moved-outside-land`; land records its actual
+seeded/adopted/skipped outcome durably, including holders. Existing owned index links migrate back to source from a
+verified sealed snapshot; a holder refuses that migration without losing bytes or being forced off.
 
 **Existing checkouts migrate by rebuilding, never copying.** Setup and the first admitted job create an empty build
 volume, publish `.cowshed/build`, discard only contributed real build-state directories, and install their fixed links.

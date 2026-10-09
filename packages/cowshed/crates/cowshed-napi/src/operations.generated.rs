@@ -215,16 +215,6 @@ impl Coordinator {
         )
     }
 
-    /// Refreezes a target's seed from its live build volume.
-    #[napi(js_name = "reseed")]
-    pub fn reseed(&self, env: Env, arguments: String) -> napi::Result<JsObject> {
-        super::json_call::<operations::CoordinatorReseed, _>(
-            env,
-            Arc::clone(&self.inner),
-            arguments,
-        )
-    }
-
     /// Detaches a workspace.
     #[napi(js_name = "detach")]
     pub fn detach(&self, env: Env, arguments: String) -> napi::Result<JsObject> {
@@ -612,6 +602,12 @@ pub(super) fn cowshed_error(
         error.set_named_property(
             "stdin",
             details.get_named_property::<napi::JsUnknown>("stdin")?,
+        )?;
+    }
+    if details.has_named_property("indexMigration")? {
+        error.set_named_property(
+            "indexMigration",
+            details.get_named_property::<napi::JsUnknown>("indexMigration")?,
         )?;
     }
     Ok(napi::Error::from(error.into_unknown()))

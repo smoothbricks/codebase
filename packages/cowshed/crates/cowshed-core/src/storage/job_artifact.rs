@@ -24,7 +24,7 @@ use uuid::Uuid;
 use crate::api::dto::{
     AdmissionCommitment, AdmissionKey, BinaryData, CheckpointCommitment, CommandArg,
     ControllerCommitment, DtoError, ExecCommand, ExitStatus, ForkCommitment, GitOid, JobId,
-    JobState, LandAdoptionCommitment, MAX_ARGV_BYTES, MAX_COMMAND_ARG_BYTES,
+    JobState, LandAdoptionCommitment, LandOutcomeCommitment, MAX_ARGV_BYTES, MAX_COMMAND_ARG_BYTES,
     MAX_INLINE_OUTPUT_BYTES, OutputLimitInfo, OutputPublication, OutputStorage, OutputSummary,
     ProtectedOutput, PublicationPolicy, RestoreCommitment, RunSandboxMode, Sha256Digest,
     StreamInfo, TerminalCommitment, UtcTimestamp, WorkspaceIntroducedCommitment, WorkspacePath,
@@ -5289,7 +5289,7 @@ fn parse_state(value: &str) -> Result<JobState, ArtifactError> {
 }
 
 /// The controller commitment schema is compared against every decoded segment during replay, so
-/// it is built once rather than allocating twenty-seven fields per comparison.
+/// it is built once rather than allocating twenty-nine fields per comparison.
 pub fn controller_commitment_schema() -> Arc<Schema> {
     static SCHEMA: LazyLock<Arc<Schema>> = LazyLock::new(build_controller_commitment_schema);
     Arc::clone(&SCHEMA)
@@ -5299,6 +5299,16 @@ pub fn controller_commitment_schema() -> Arc<Schema> {
 /// twenty-three. Every earlier variant reads the same from them, since the later columns are
 /// `landAdoption`'s alone and null for every other kind.
 const SEGMENT_COLUMNS_BEFORE_LAND_ADOPTION: usize = 23;
+const SEGMENT_COLUMNS_BEFORE_LAND_OUTCOME: usize = 27;
+
+fn controller_commitment_schema_before_land_outcome() -> Arc<Schema> {
+    static SCHEMA: LazyLock<Arc<Schema>> = LazyLock::new(|| {
+        Arc::new(Schema::new(
+            controller_commitment_schema().fields()[..SEGMENT_COLUMNS_BEFORE_LAND_OUTCOME].to_vec(),
+        ))
+    });
+    Arc::clone(&SCHEMA)
+}
 
 fn controller_commitment_schema_before_land_adoption() -> Arc<Schema> {
     static SCHEMA: LazyLock<Arc<Schema>> = LazyLock::new(|| {
@@ -5339,6 +5349,8 @@ fn build_controller_commitment_schema() -> Arc<Schema> {
         field("task", DataType::Utf8, true),
         field("task_hash", DataType::Utf8, true),
         field("inputs_digest", DataType::Binary, true),
+        field("seeded", DataType::Boolean, true),
+        field("adoption_skip", DataType::Utf8, true),
     ]))
 }
 
@@ -5370,6 +5382,8 @@ struct ControllerFlatRow<'a> {
     task: Option<&'a str>,
     task_hash: Option<&'a str>,
     inputs_digest: Option<&'a [u8]>,
+    seeded: Option<bool>,
+    adoption_skip: Option<&'a crate::api::dto::AdoptionSkip>,
 }
 
 fn flatten_controller(value: &ControllerCommitment) -> ControllerFlatRow<'_> {
@@ -5401,6 +5415,8 @@ fn flatten_controller(value: &ControllerCommitment) -> ControllerFlatRow<'_> {
         task: None,
         task_hash: None,
         inputs_digest: None,
+        seeded: None,
+        adoption_skip: None,
     };
     match value {
         ControllerCommitment::WorkspaceIntroduced(value) => {
@@ -5462,6 +5478,14 @@ fn flatten_controller(value: &ControllerCommitment) -> ControllerFlatRow<'_> {
             row.task_hash = Some(&value.task_hash);
             row.inputs_digest = Some(value.inputs_digest.as_bytes());
         }
+        ControllerCommitment::LandOutcome(value) => {
+            row.kind = "landOutcome";
+            row.source_incarnation = Some(value.landing_incarnation.as_str());
+            row.destination_incarnation = Some(value.target_incarnation.as_str());
+            row.landed_head = Some(value.landed_head.as_str());
+            row.seeded = Some(value.seeded);
+            row.adoption_skip = value.skip.as_ref();
+        }
     }
     row
 }
@@ -5473,6 +5497,15 @@ pub fn controller_commitments_to_batch(
         commitment.validate()?;
     }
     let rows: Vec<_> = commitments.iter().map(flatten_controller).collect();
+    let skips = rows
+        .iter()
+        .map(|row| {
+            row.adoption_skip
+                .map(serde_json::to_string)
+                .transpose()
+                .map_err(|error| ArtifactError::Arrow(error.to_string()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let columns: Vec<ArrayRef> = vec![
         Arc::new(StringArray::from(
             rows.iter().map(|row| row.kind).collect::<Vec<_>>(),
@@ -5575,6 +5608,12 @@ pub fn controller_commitments_to_batch(
         Arc::new(BinaryArray::from(
             rows.iter().map(|row| row.inputs_digest).collect::<Vec<_>>(),
         )),
+        Arc::new(BooleanArray::from(
+            rows.iter().map(|row| row.seeded).collect::<Vec<_>>(),
+        )),
+        Arc::new(StringArray::from(
+            skips.iter().map(|skip| skip.as_deref()).collect::<Vec<_>>(),
+        )),
     ];
     RecordBatch::try_new(controller_commitment_schema(), columns)
         .map_err(|error| ArtifactError::Arrow(error.to_string()))
@@ -5627,6 +5666,7 @@ pub fn decode_controller_commitments(
     let schema = batch.schema();
     if schema != controller_commitment_schema()
         && schema != controller_commitment_schema_before_land_adoption()
+        && schema != controller_commitment_schema_before_land_outcome()
     {
         return Err(ArtifactError::Arrow(
             "controller commitment schema mismatch".into(),
@@ -5756,6 +5796,37 @@ pub fn decode_controller_commitments(
                     task: required_string(batch, 24, row)?.to_owned(),
                     task_hash: required_string(batch, 25, row)?.to_owned(),
                     inputs_digest: required_digest(batch, 26, row)?,
+                })
+            }
+            "landOutcome" => {
+                if batch.num_columns() <= SEGMENT_COLUMNS_BEFORE_LAND_OUTCOME {
+                    return Err(ArtifactError::Arrow(
+                        "a landOutcome commitment in a segment without its columns".into(),
+                    ));
+                }
+                let selected: &[usize] = if batch.column(28).is_null(row) {
+                    &[17, 18, 23, 27]
+                } else {
+                    &[17, 18, 23, 27, 28]
+                };
+                require_variant_columns(batch, row, selected)?;
+                let skip = if batch.column(28).is_null(row) {
+                    None
+                } else {
+                    Some(
+                        serde_json::from_str(required_string(batch, 28, row)?)
+                            .map_err(|error| ArtifactError::Arrow(error.to_string()))?,
+                    )
+                };
+                ControllerCommitment::LandOutcome(LandOutcomeCommitment {
+                    version,
+                    order,
+                    repo_id,
+                    landing_incarnation: required_incarnation(batch, 17, row)?,
+                    target_incarnation: required_incarnation(batch, 18, row)?,
+                    landed_head: GitOid::new(required_string(batch, 23, row)?)?,
+                    seeded: boolean(batch, 27)?.value(row),
+                    skip,
                 })
             }
             _ => {

@@ -2055,19 +2055,6 @@
     },
     "imageOnly": {}
   },
-  "ReseedResult": {
-    "volumeBusy": {
-      "outcome": {
-        "behindMs": 1200,
-        "kind": "skipped",
-        "reason": {
-          "kind": "volumeBusy",
-          "reason": "the source is held by pid 4848 (rust-analyzer); nothing was forced"
-        }
-      },
-      "workspace": "main"
-    }
-  },
   "ResizeResult": {
     "buildGrown": {
       "capacity": "300g",

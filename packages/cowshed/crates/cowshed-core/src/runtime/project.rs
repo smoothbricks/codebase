@@ -206,9 +206,6 @@ pub trait ProjectRuntimeHost: Send + 'static {
         &mut self,
         workspace: WorkspaceName,
     ) -> Result<crate::api::dto::DefragmentResult>;
-    /// Refreeze `workspace`'s seed from its live build volume when the seed is behind it and the
-    /// volume has no writer (16_build_volumes.md, "Targets and seeds").
-    async fn reseed(&mut self, workspace: WorkspaceName) -> Result<crate::api::dto::ReseedResult>;
     async fn checkpoint(
         &mut self,
         workspace: WorkspaceName,
@@ -1244,10 +1241,6 @@ impl ProjectActor {
                 respond::<operations::CoordinatorDefragment>(
                     &self.host.defragment(params.workspace).await?,
                 )
-            }
-            Op::CoordinatorReseed(params) => {
-                self.require_repo(&params.repo_id)?;
-                respond::<operations::CoordinatorReseed>(&self.host.reseed(params.workspace).await?)
             }
             Op::CoordinatorDetach(params) => {
                 self.require_repo(&params.repo_id)?;
@@ -4265,7 +4258,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         let journal = self.lifecycle_intents_path.clone();
         let layout = volumes.layout.clone();
         let (images, creating) = crate::storage::lifecycle::dispatch_blocking(move || {
-            let images = layout.list()?;
+            let images = layout.collection_ids()?;
             let creating = crate::storage::recovery::LifecycleIntentJournal::load(&journal)?
                 .forming()
                 .cloned()
@@ -4421,7 +4414,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             Ok(locked) => locked,
             Err(contended) => {
                 eprintln!(
-                    "cowshed: another cowshed operation on {} holds its image lock (e.g. a new, fork or reseed of it); the land freezes {}'s seed and moves its build link once that ends",
+                    "cowshed: another cowshed operation on {} holds its image lock (e.g. a new, fork or rm of it); the land freezes {}'s seed and moves its build link once that ends",
                     into.name, into.name
                 );
                 timed_async("land", "target-lock", contended.wait()).await?
@@ -4517,6 +4510,129 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             }
         };
         Ok(LandBuildVolume { seed, adoption })
+    }
+
+    /// Fork step 2's aim (16_build_volumes.md, "Which volume a seed holds"): the tree a fork of
+    /// `target` checks out, `revision`'s or else the target's own, and, when that is the target's
+    /// `HEAD^{tree}`, every other live workspace, any of which may have landed it outside
+    /// `cowshed land`.
+    async fn seed_aim(
+        &self,
+        target: &WorkspaceName,
+        target_mount: &Path,
+        revision: Option<&GitOid>,
+    ) -> Result<super::build_volumes::Aim> {
+        let head = git_revision_oid(target_mount, "HEAD^{tree}").await?;
+        let tree = match revision {
+            Some(commit) => git_revision_oid(target_mount, &format!("{commit}^{{tree}}")).await?,
+            None => head.clone(),
+        };
+        let landed = if tree == head {
+            self.landed_peers(target).await?
+        } else {
+            Vec::new()
+        };
+        Ok(super::build_volumes::Aim { tree, landed })
+    }
+
+    /// Every mounted workspace but `target`: each may have the tree `target` moved to checked out.
+    async fn landed_peers(
+        &self,
+        target: &WorkspaceName,
+    ) -> Result<Vec<super::build_volumes::Peer>> {
+        let mut peers = Vec::new();
+        for workspace in self.authoritative().await? {
+            let name = workspace.derived.workspace.name();
+            if name == target
+                || !matches!(
+                    workspace.derived.mount_state,
+                    crate::storage::lifecycle::MountState::Mounted { .. }
+                )
+            {
+                continue;
+            }
+            peers.push(super::build_volumes::Peer {
+                name: name.clone(),
+                checkout: self.workspace_mount_path(name)?,
+                lock: self
+                    .layout
+                    .canonical_image(name)
+                    .map_err(native_integrity_error)?
+                    .lock()
+                    .to_owned(),
+            });
+        }
+        Ok(peers)
+    }
+
+    /// An external land's retire (16_build_volumes.md, "Which volume a seed holds"): before
+    /// `current` is removed, each target it may have landed in outside `cowshed land` (the
+    /// workspace it was forked from, and main) whose `HEAD^{tree}` is the one `current` has
+    /// checked out, and whose seed and live volume were not built at that tree, takes `current`'s
+    /// build volume as its seed under its image lock. `current`'s supervisor has stopped.
+    async fn seed_targets_from_retiring(&mut self, current: &NativeWorkspace) -> Result<()> {
+        let workspace = current.derived.workspace.name().clone();
+        let checkout = self.workspace_mount_path(&workspace)?;
+        let Some(tree) = git_optional_ref_oid(&checkout, "HEAD^{tree}").await? else {
+            return Ok(());
+        };
+        let peer = super::build_volumes::Peer {
+            name: workspace.clone(),
+            checkout,
+            lock: self
+                .layout
+                .canonical_image(&workspace)
+                .map_err(native_integrity_error)?
+                .lock()
+                .to_owned(),
+        };
+        let mut targets = Vec::from([main_name()]);
+        if let Some(source) = current.metadata.info_snapshot.forked_from.clone()
+            && !targets.contains(&source)
+        {
+            targets.insert(0, source);
+        }
+        for target in targets {
+            let fact = match self.current(&target).await {
+                Ok(fact) => fact,
+                Err(error) if error.code == ErrorCode::NotFound => continue,
+                Err(error) => return Err(error),
+            };
+            if !matches!(
+                fact.derived.mount_state,
+                crate::storage::lifecycle::MountState::Mounted { .. }
+            ) {
+                continue;
+            }
+            let target_mount = self.workspace_mount_path(&target)?;
+            if git_revision_oid(&target_mount, "HEAD^{tree}").await? != tree {
+                continue;
+            }
+            let owner = super::build_volumes::Owner {
+                name: target.clone(),
+                incarnation: fact.derived.workspace.incarnation().clone(),
+            };
+            let aim = super::build_volumes::Aim {
+                tree: tree.clone(),
+                landed: vec![peer.clone()],
+            };
+            let lock_path = self
+                .layout
+                .canonical_image(&target)
+                .map_err(native_integrity_error)?
+                .lock()
+                .to_owned();
+            let volumes = self.build_volumes()?;
+            let refreshed = self
+                .substrate
+                .dispatch_with_image_lock(lock_path, move || {
+                    volumes.seed_from_landed_now(&owner, &target_mount, &aim)
+                })
+                .await
+                .map_err(native_storage_error)??;
+            super::build_volumes::say_refresh(&target, &workspace, &refreshed);
+        }
+        Ok(())
     }
 
     /// Land step 7 (2b): each landed check re-run in the target on the adopted volume. Hits and
@@ -6085,6 +6201,17 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                 ),
                 None => None,
             };
+            // A workspace removed right after its branch was fast-forwarded into a target outside
+            // `cowshed land` is that land's only warm build volume: it seeds the target first
+            // (16_build_volumes.md, "Which volume a seed holds"). Warmth is not what removal
+            // promises, so a failure is said and the removal goes on.
+            if !workspace.is_main()
+                && let Err(error) = self.seed_targets_from_retiring(&current).await
+            {
+                eprintln!(
+                    "cowshed: {workspace}'s build volume seeds no target it may have landed in: {error}"
+                );
+            }
             self.finish_retirement(current).await?;
             // The workspace's build volume and seed retire with it, unless a target adopted the
             // volume (16_build_volumes.md, "Garbage collection"), and with them whatever else no
@@ -8984,6 +9111,11 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
             } else {
                 crate::git::WorkspaceRepository::Standalone
             };
+            // The tree the clone checks out, `--ref`'s or the source's, is what its seed is
+            // refreshed for (16_build_volumes.md, "Which volume a seed holds").
+            let aim = self
+                .seed_aim(&source_name, &source_mount, start.as_ref())
+                .await?;
             let start = start.as_ref().map(GitOid::as_str);
             let clean = match mode {
                 MintMode::Historical => source_name == main_name(),
@@ -8996,9 +9128,10 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
             let home = &self.home;
             let build_volumes = self.build_volumes()?;
             // Under the source's image lock, which every fork of the source holds while its
-            // clone is staged: the seed the fork clones is first the source's own work up to
-            // now, unless something still writes the source's volume. The fork's live volume is
-            // attached beside the clone's own attach, so the two wait on `storagekitd` once.
+            // clone is staged: the seed the fork clones is first refreshed for the tree it checks
+            // out, from a landed workspace's volume or the source's own, unless something still
+            // writes that volume. The fork's live volume is attached beside the clone's own
+            // attach, so the two wait on `storagekitd` once.
             let preparing = build_volumes.clone();
             let abandoning = build_volumes.clone();
             let prepare = {
@@ -9011,7 +9144,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                     timed_async(
                         "fork",
                         "build-volume",
-                        preparing.prepare_fork(seed_source, source_mount, destination),
+                        preparing.prepare_fork(seed_source, source_mount, destination, aim),
                     )
                     .await
                 }
@@ -9356,6 +9489,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                     .await?;
                 let main_mount = self.workspace_mount_path(&main_name())?;
                 let forked = destination.clone();
+                let aim = self.seed_aim(&source, &source_mount, None).await?;
                 let plan = self
                     .substrate
                     .plan_fork(
@@ -9372,8 +9506,8 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                 let home = &self.home;
                 let build_volumes = self.build_volumes()?;
                 let source_name_for_callback = source.clone();
-                // Under the source's image lock, as for `resume_fork`: the source's seed first catches up
-                // with its live volume, and the fork's live volume attaches beside the clone.
+                // Under the source's image lock, as for `resume_fork`: the source's seed is first
+                // refreshed for the source's tree, and the fork's live volume attaches beside the clone.
                 let preparing = build_volumes.clone();
                 let abandoning = build_volumes.clone();
                 let prepare = {
@@ -9386,7 +9520,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                         timed_async(
                             "fork",
                             "build-volume",
-                            preparing.prepare_fork(seed_source, source_mount, forked),
+                            preparing.prepare_fork(seed_source, source_mount, forked, aim),
                         )
                         .await
                     }
@@ -10077,40 +10211,6 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
             extents: outcome.extents.get(),
             bytes: outcome.bytes,
         })
-    }
-
-    /// `cowshed reseed`: under `workspace`'s image lock, which every fork of it holds while it
-    /// clones the seed, so no fork clones a seed this deletes.
-    async fn reseed(&mut self, workspace: WorkspaceName) -> Result<crate::api::dto::ReseedResult> {
-        self.validate_binding().await?;
-        let current = self.current(&workspace).await?;
-        if !matches!(
-            current.derived.mount_state,
-            crate::storage::lifecycle::MountState::Mounted { .. }
-        ) {
-            return Err(CowshedError::conflict(
-                format!("workspace {workspace} is detached, so its build link cannot be read"),
-                format!("cowshed attach {workspace}, then retry the reseed"),
-            ));
-        }
-        let owner = super::build_volumes::Owner {
-            name: workspace.clone(),
-            incarnation: current.derived.workspace.incarnation().clone(),
-        };
-        let checkout = self.workspace_mount_path(&workspace)?;
-        let lock_path = self
-            .layout
-            .canonical_image(&workspace)
-            .map_err(native_integrity_error)?
-            .lock()
-            .to_owned();
-        let volumes = self.build_volumes()?;
-        let outcome = self
-            .substrate
-            .dispatch_with_image_lock(lock_path, move || volumes.reseed_now(&owner, &checkout))
-            .await
-            .map_err(native_storage_error)??;
-        Ok(crate::api::dto::ReseedResult { workspace, outcome })
     }
 
     async fn checkpoint(
@@ -11096,26 +11196,39 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                 failed.hint,
             )
         })?;
+        use super::supervisor::{CommitmentDraft, CommitmentSink};
+        let landing_incarnation = self
+            .current(&workspace)
+            .await?
+            .derived
+            .workspace
+            .incarnation()
+            .clone();
+        let target_incarnation = self
+            .current(&into.name)
+            .await?
+            .derived
+            .workspace
+            .incarnation()
+            .clone();
+        self.commitments
+            .record(CommitmentDraft::LandOutcome {
+                repo_id: self.descriptor.repo_id.clone(),
+                landing_incarnation: landing_incarnation.clone(),
+                target_incarnation: target_incarnation.clone(),
+                landed_head: source_head.clone(),
+                seeded: build_volume.seeded,
+                skip: match &build_volume.adoption {
+                    crate::api::dto::Adoption::Adopted { .. } => None,
+                    crate::api::dto::Adoption::Skipped { reason } => Some(reason.clone()),
+                },
+            })
+            .await?;
         // Each 2b miss is a durable finding (13_telemetry.md, `landAdoption`), from the same
         // value the report carries.
         if let crate::api::dto::Adoption::Adopted { check, .. } = &build_volume.adoption
             && !check.misses.is_empty()
         {
-            use super::supervisor::{CommitmentDraft, CommitmentSink};
-            let landing_incarnation = self
-                .current(&workspace)
-                .await?
-                .derived
-                .workspace
-                .incarnation()
-                .clone();
-            let target_incarnation = self
-                .current(&into.name)
-                .await?
-                .derived
-                .workspace
-                .incarnation()
-                .clone();
             for miss in &check.misses {
                 self.commitments
                     .record(CommitmentDraft::LandAdoption {
@@ -11448,6 +11561,11 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
 
         match self.authoritative().await {
             Ok(workspaces) => {
+                let seed_targets = workspaces
+                    .iter()
+                    .filter_map(|workspace| workspace.metadata.info_snapshot.forked_from.clone())
+                    .chain(std::iter::once(main_name()))
+                    .collect::<std::collections::BTreeSet<_>>();
                 let main_mount = self.workspace_mount_path(&main_name()).ok();
                 companion_images.extend(workspaces.iter().map(|workspace| {
                     (
@@ -11588,28 +11706,48 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                                     )),
                                 }
                             }
-                            let owner = super::build_volumes::Owner {
-                                name: workspace_name.clone(),
-                                incarnation: workspace.derived.workspace.incarnation().clone(),
-                            };
-                            let age = match self.build_volumes() {
-                                Ok(volumes) => {
-                                    volumes.seed_age(owner, expected_mount.clone()).await
+                            if seed_targets.contains(&workspace_name) {
+                                let owner = super::build_volumes::Owner {
+                                    name: workspace_name.clone(),
+                                    incarnation: workspace.derived.workspace.incarnation().clone(),
+                                };
+                                let diagnosed = async {
+                                    let Some(tree) =
+                                        git_optional_ref_oid(&expected_mount, "HEAD^{tree}")
+                                            .await?
+                                    else {
+                                        return Ok::<_, CowshedError>(Vec::new());
+                                    };
+                                    let Some(age) = self
+                                        .build_volumes()?
+                                        .seed_age(owner, expected_mount.clone(), tree.clone())
+                                        .await?
+                                    else {
+                                        return Ok(Vec::new());
+                                    };
+                                    let mut result = seed_tree_findings(
+                                        &workspace_name,
+                                        &age,
+                                        &tree,
+                                        &expected_mount,
+                                    )
+                                    .await?;
+                                    result.extend(seed_age_finding(
+                                        &workspace_name,
+                                        &age,
+                                        expected_mount.clone(),
+                                    ));
+                                    Ok(result)
                                 }
-                                Err(error) => Err(error),
-                            };
-                            match age {
-                                Ok(Some(age)) => findings.extend(seed_age_finding(
-                                    &workspace_name,
-                                    &age,
-                                    expected_mount.clone(),
-                                )),
-                                Ok(None) => {}
-                                Err(error) => findings.push(native_finding(
-                                    "seed-age",
-                                    crate::api::dto::FindingSeverity::Error,
-                                    error,
-                                )),
+                                .await;
+                                match diagnosed {
+                                    Ok(diagnosed) => findings.extend(diagnosed),
+                                    Err(error) => findings.push(native_finding(
+                                        "seed-age",
+                                        crate::api::dto::FindingSeverity::Error,
+                                        error,
+                                    )),
+                                }
                             }
                             let checkout = expected_mount.clone();
                             let links = crate::storage::lifecycle::dispatch_blocking(move || {
@@ -16779,8 +16917,81 @@ fn build_link_finding(
     }
 }
 
-/// Doctor's report of a target whose seed is behind its live build volume
-/// (16_build_volumes.md, "Targets and seeds"); a seed that holds every write is no finding.
+#[cfg(target_os = "macos")]
+async fn seed_tree_findings(
+    workspace: &WorkspaceName,
+    age: &super::build_volumes::SeedAge,
+    tree: &GitOid,
+    checkout: &Path,
+) -> Result<Vec<crate::api::dto::Finding>> {
+    use super::build_volumes::Nearness;
+    use crate::api::dto::{Finding, FindingSeverity};
+    let recorded = |value: Option<&GitOid>| {
+        value
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "unknown".to_owned())
+    };
+    let mut findings = Vec::new();
+    if age
+        .seed
+        .as_ref()
+        .is_none_or(|seed| seed.nearness != Nearness::Equal)
+    {
+        let seed_tree = age.seed.as_ref().and_then(|seed| seed.tree.as_ref());
+        let distance = if let Some(seed_tree) = seed_tree {
+            let history =
+                invoke_git(checkout, &["log", "--first-parent", "--format=%T", "HEAD"]).await?;
+            require_git_success("count commits since the seed tree", &history)?;
+            String::from_utf8(history.stdout)
+                .map_err(|error| {
+                    CowshedError::integrity(error.to_string(), "inspect Git's tree history")
+                })?
+                .lines()
+                .position(|candidate| candidate == seed_tree.as_str())
+                .map(|count| format!("; {count} first-parent commits since that tree"))
+                .unwrap_or_else(|| {
+                    "; no matching tree in first-parent history, commit count unavailable"
+                        .to_owned()
+                })
+        } else {
+            "; no recorded seed tree, commit count unavailable".to_owned()
+        };
+        findings.push(Finding {
+            code: "seed-tree-behind".into(),
+            severity: FindingSeverity::Warning,
+            message: format!(
+                "{workspace}'s seed tree {} differs from HEAD tree {tree}{distance}",
+                recorded(seed_tree),
+            ),
+            hint: format!(
+                "the next fork of {workspace}, including --ref naming HEAD, tries a quiet live \
+                 workspace at that exact tree; use cowshed land for future lands"
+            ),
+            path: Some(checkout.to_owned()),
+        });
+    }
+    if age.unlanded() {
+        findings.push(Finding {
+            code: "target-moved-outside-land".into(),
+            severity: FindingSeverity::Warning,
+            message: format!(
+                "{workspace}'s HEAD tree {tree} matches neither its live build tree {} nor seed \
+                 tree {}; no cowshed build-volume adoption records this tree",
+                recorded(age.tree.as_ref()),
+                recorded(age.seed.as_ref().and_then(|seed| seed.tree.as_ref())),
+            ),
+            hint: "a plain Git fast-forward forfeits carry, output restoration and adoption; \
+                   the next fork attempts tree-matched seed capture without building"
+                .into(),
+            path: Some(checkout.to_owned()),
+        });
+    }
+    Ok(findings)
+}
+
+/// Doctor's report of a target whose next fork would reseed it (16_build_volumes.md, "Which
+/// volume a seed holds"): the live volume is nearer the target's tree than the seed, or as near
+/// and written since. A seed the fork keeps is no finding.
 #[cfg(target_os = "macos")]
 fn seed_age_finding(
     workspace: &WorkspaceName,
@@ -16788,25 +16999,32 @@ fn seed_age_finding(
     checkout: PathBuf,
 ) -> Option<crate::api::dto::Finding> {
     use crate::storage::deletion_log::rfc3339_utc;
-    if !age.stale() {
+    if !age.reseeds() {
         return None;
     }
+    let built_at = |tree: Option<&GitOid>| match tree {
+        Some(tree) => format!("built at tree {tree}"),
+        None => "with no recorded tree".to_owned(),
+    };
     let hint = format!(
-        "cowshed reseed {workspace} refreezes it now; every fork of {workspace} does the same \
-         first, unless an Nx run or a Cargo build is writing the volume"
+        "the next fork of {workspace} reseeds it first, unless an Nx run, a Cargo build or \
+         another holder is using the volume, and then names that holder"
     );
     Some(match &age.seed {
-        Some((seed, frozen)) => crate::api::dto::Finding {
+        Some(seed) => crate::api::dto::Finding {
             code: "seed-age".into(),
             severity: crate::api::dto::FindingSeverity::Info,
             message: format!(
-                "{workspace}'s seed {seed} holds its build volume {} as written at {}; the volume \
-                 was last written {:.1} s later, at {}, and a fork cloning the seed now misses \
-                 what ran in {workspace} since",
+                "{workspace}'s build volume {}, {}, last written at {}, is nearer {workspace}'s \
+                 tree than its seed {}, {}, last written at {}, or as near and written {:.1} s \
+                 later; a fork cloning this older state may miss build work written since",
                 age.live,
-                rfc3339_utc(*frozen),
-                age.behind().unwrap_or_default().as_secs_f64(),
+                built_at(age.tree.as_ref()),
                 rfc3339_utc(age.written),
+                seed.id,
+                built_at(seed.tree.as_ref()),
+                rfc3339_utc(seed.written),
+                age.behind().unwrap_or_default().as_secs_f64(),
             ),
             hint,
             path: Some(checkout),
@@ -17969,6 +18187,85 @@ mod workspace_origin_tests {
         ));
         std::fs::create_dir(&path).expect("temp directory");
         path
+    }
+
+    #[tokio::test]
+    async fn doctor_names_seed_tree_drift_and_keeps_a_nearer_landed_seed() {
+        use super::super::build_volumes::{Frozen, Nearness, SeedAge};
+        use crate::build_volume::BuildVolumeId;
+        let root = temp_directory("seed-tree-doctor");
+        let checkout = root.as_path();
+        let commit = |message: &'static str| async move {
+            let output = invoke_git(
+                checkout,
+                &[
+                    "-c",
+                    "user.name=cowshed",
+                    "-c",
+                    "user.email=cowshed@example.invalid",
+                    "commit",
+                    "--quiet",
+                    "-am",
+                    message,
+                ],
+            )
+            .await
+            .unwrap();
+            require_git_success("commit fixture", &output).unwrap();
+            git_revision_oid(checkout, "HEAD^{tree}").await.unwrap()
+        };
+        require_git_success(
+            "init fixture",
+            &invoke_git(&root, &["init", "--quiet"]).await.unwrap(),
+        )
+        .unwrap();
+        std::fs::write(root.join("file"), "one").unwrap();
+        require_git_success(
+            "add fixture",
+            &invoke_git(&root, &["add", "file"]).await.unwrap(),
+        )
+        .unwrap();
+        let previous = commit("before").await;
+        std::fs::write(root.join("file"), "two").unwrap();
+        let current = commit("after").await;
+        let frozen = std::time::SystemTime::UNIX_EPOCH;
+        let mut age = SeedAge {
+            live: BuildVolumeId::mint(),
+            tree: Some(previous.clone()),
+            nearness: Nearness::Paths(1),
+            written: frozen + std::time::Duration::from_secs(1),
+            seed: Some(Frozen {
+                id: BuildVolumeId::mint(),
+                tree: Some(previous),
+                nearness: Nearness::Paths(1),
+                written: frozen,
+            }),
+        };
+        let findings = seed_tree_findings(&main_name(), &age, &current, &root)
+            .await
+            .unwrap();
+        assert_eq!(
+            findings
+                .iter()
+                .map(|finding| finding.code.as_str())
+                .collect::<Vec<_>>(),
+            ["seed-tree-behind", "target-moved-outside-land"]
+        );
+        assert!(findings[0].message.contains("1 first-parent commits"));
+        let seed = age.seed.as_mut().unwrap();
+        seed.tree = Some(current.clone());
+        seed.nearness = Nearness::Equal;
+        assert!(
+            seed_tree_findings(&main_name(), &age, &current, &root)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            seed_age_finding(&main_name(), &age, root.clone()).is_none(),
+            "an older live build must not displace the exactly matching landed seed"
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     fn write_marker(root: &Path, workspace: &str, role: WorkspaceRole, project_root: &Path) {

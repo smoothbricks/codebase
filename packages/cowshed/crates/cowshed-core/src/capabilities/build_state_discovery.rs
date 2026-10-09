@@ -64,8 +64,8 @@ pub struct BuildStateDiscovery {
 /// would otherwise keep an answer an earlier one got wrong, findings included, until a manifest
 /// happens to change. Bump it whenever discovery's questions or the environment they run in
 /// change. 2: Cargo is asked as a job, after the workspace shell's activation. 3: installed
-/// JavaScript packages contribute their `node_modules/.cache`.
-const DISCOVERY_REVISION: &[u8] = b"cowshed build-state discovery 3";
+/// JavaScript packages contribute their `node_modules/.cache`. 4: source indexes are not build state.
+const DISCOVERY_REVISION: &[u8] = b"cowshed build-state discovery 4";
 
 /// The manifest whose directory, once installed, holds a JavaScript package's tool caches.
 const PACKAGE_MANIFEST: &str = "package.json";
@@ -122,7 +122,6 @@ pub fn tracked_manifest_fingerprint(workspace: &Path) -> Result<String> {
         &super::bun::DETECTOR,
         &super::npm::DETECTOR,
         &super::pnpm::DETECTOR,
-        &super::codegraph::DETECTOR,
     ] {
         let setting = settings.capabilities().get(&detector.id);
         if setting.is_some_and(|setting| setting.disabled) {
@@ -145,7 +144,7 @@ pub fn tracked_manifest_fingerprint(workspace: &Path) -> Result<String> {
 
 /// Whether discovery at `workspace` can name any build state: it names only a tracked Cargo
 /// manifest's targets, a tracked package manifest's installed tool caches, a declared `[build]
-/// state`, or what an enabled Nx or codegraph detector contributes. The other tracked build
+/// state`, or what an enabled Nx detector contributes. The other tracked build
 /// inputs (`.cargo/config*`, `go.mod`, whose caches are the host's) name none. A checkout with
 /// none of them has its first touch make no volume, so `adopt` mints none beside main's image
 /// for it.
@@ -166,7 +165,7 @@ pub fn may_name_build_state(workspace: &Path) -> Result<bool> {
     if !settings.build_state().is_empty() {
         return Ok(true);
     }
-    for detector in [&super::nx::DETECTOR, &super::codegraph::DETECTOR] {
+    for detector in [&super::nx::DETECTOR] {
         let setting = settings.capabilities().get(&detector.id);
         if setting.is_some_and(|setting| setting.disabled) {
             continue;
@@ -1240,10 +1239,10 @@ mod tests {
             fingerprint = next;
         }
         fs::create_dir(fixture.root.join(".codegraph")).unwrap();
-        assert_ne!(
+        assert_eq!(
             fingerprint,
             tracked_manifest_fingerprint(&fixture.root).unwrap(),
-            "an indexer marker adds its build state"
+            "a source index is not a build-state input"
         );
     }
 
@@ -1396,10 +1395,7 @@ mod tests {
         upstream_checkout(&fixture);
         fs::create_dir(fixture.root.join(".codegraph")).unwrap();
         let undeclared = tracked_manifest_fingerprint(&fixture.root).unwrap();
-        assert_eq!(
-            cargo_paths(&fixture).paths,
-            [BuildStatePath::new(".codegraph", "codegraph").unwrap()]
-        );
+        assert!(cargo_paths(&fixture).paths.is_empty());
         write(
             &fixture,
             ".cowshed.toml",
@@ -1411,10 +1407,7 @@ mod tests {
         assert!(state.findings.is_empty(), "{:?}", state.findings);
         assert_eq!(
             state.paths,
-            [
-                BuildStatePath::new(".codegraph", "codegraph").unwrap(),
-                BuildStatePath::declared("vendor/upstream").unwrap(),
-            ]
+            [BuildStatePath::declared("vendor/upstream").unwrap(),]
         );
         write(
             &fixture,
@@ -1429,7 +1422,6 @@ mod tests {
         assert_eq!(
             cargo_paths(&fixture).paths,
             [
-                BuildStatePath::new(".codegraph", "codegraph").unwrap(),
                 BuildStatePath::declared("tools/.pin").unwrap(),
                 BuildStatePath::declared("vendor/upstream").unwrap(),
             ]
@@ -1469,23 +1461,23 @@ mod tests {
             "a refused declaration deletes nothing"
         );
 
-        fs::create_dir_all(fixture.root.join(".codegraph/db")).unwrap();
+        write(&fixture, "nx.json", "{}");
         write(
             &fixture,
             ".cowshed.toml",
-            "[build]\nstate = [\".codegraph/db\"]\n",
+            "[build]\nstate = [\".nx/cache/db\"]\n",
         );
         let overlap = refused(&fixture);
         assert_eq!(overlap.code, crate::ErrorCode::Conflict);
         assert_eq!(
             overlap.message,
-            ".cowshed.toml [build] state declares .codegraph/db, which overlaps .codegraph, the \
-             Codegraph build state capability detection already keeps on the build volume"
+            ".cowshed.toml [build] state declares .nx/cache/db, which overlaps .nx/cache, the \
+             Nx build state capability detection already keeps on the build volume"
         );
         assert!(
             overlap
                 .hint
-                .contains("remove .codegraph/db from [build] state"),
+                .contains("remove .nx/cache/db from [build] state"),
             "{overlap:?}"
         );
 

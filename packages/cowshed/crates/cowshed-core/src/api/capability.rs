@@ -5,8 +5,8 @@ use super::dto::{
     GrantDelta, GrantSet, JobId, JobInfo, JobJournalCursor, JobListeningPorts, JobTail,
     JobTailLimits, LandOptions, LandReport, MirrorInfo, ProjectGrantDelta, ProjectGrants,
     PushOptions, PushReport, RebaseOptions, RebaseReport, RemoveOptions, RemoveProjectOptions,
-    RemoveProjectReport, RemoveReport, ReseedResult, ResizeResult, ResizeVolume, SealedJob,
-    StdinSource, StepReport, WorkspaceIncarnation, WorkspaceInfo, WorkspaceTarget,
+    RemoveProjectReport, RemoveReport, ResizeResult, ResizeVolume, SealedJob, StdinSource,
+    StepReport, WorkspaceIncarnation, WorkspaceInfo, WorkspaceTarget,
 };
 use super::frame;
 use super::operations::{
@@ -2039,13 +2039,6 @@ impl Coordinator {
     pub async fn defragment(&self, workspace: &str) -> Result<DefragmentResult> {
         let request = self.workspace_request(workspace)?;
         invoke::<operations::CoordinatorDefragment>(&*self.runtime, &request).await
-    }
-
-    /// Refreeze a target's seed from its live build volume when the seed is behind it and the
-    /// volume has no writer; a writer leaves the seed as it is and is named.
-    pub async fn reseed(&self, workspace: &str) -> Result<ReseedResult> {
-        let request = self.workspace_request(workspace)?;
-        invoke::<operations::CoordinatorReseed>(&*self.runtime, &request).await
     }
 
     pub async fn assign_slot(&self, workspace: &str, slot: u32) -> Result<()> {

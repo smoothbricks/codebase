@@ -15,9 +15,8 @@ use cowshed_core::api::dto::{
     Finding, FindingSeverity, ForkOptions, GcOptions, GcReport, GitOid, GrantDelta, GrantSet,
     JobId, JobInfo, JobJournalCursor, JobState, JobTail, JobTailBytes, JobTailLimits, LandOptions,
     LandReport, MirrorInfo, PortBlock, PushOptions, PushReport, RebaseOptions, RemoveOptions,
-    RemoveProjectOptions, RemoveProjectReport, RemoveReport, Reseed, ReseedResult, ResizeResult,
-    ResizeVolume, RunSandboxMode, StdinSource, StepReport, WorkspaceInfo, WorkspaceState,
-    WorkspaceTarget,
+    RemoveProjectOptions, RemoveProjectReport, RemoveReport, ResizeResult, ResizeVolume,
+    RunSandboxMode, StdinSource, StepReport, WorkspaceInfo, WorkspaceState, WorkspaceTarget,
 };
 use cowshed_core::api::operations::{JobLogs, LogsRequest, Operation, OperationRequest};
 use cowshed_core::api::server::{ConnectionAuthority, RouterHandle, serve_controller_connection};
@@ -774,14 +773,6 @@ impl ProjectRuntimeHost for FakeHost {
             previous_extents: 2,
             extents: 1,
             bytes: 0,
-        })
-    }
-
-    async fn reseed(&mut self, workspace: WorkspaceName) -> Result<ReseedResult> {
-        self.workspace(&workspace)?;
-        Ok(ReseedResult {
-            workspace,
-            outcome: Reseed::NoBuildVolume,
         })
     }
 
