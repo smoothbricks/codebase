@@ -4,6 +4,52 @@
   "nx": {
     "name": "tooling",
     "targets": {
+      "nx-daemon-idle-proof-compile": {
+        "executor": "nx:run-commands",
+        "cache": true,
+        "dependsOn": [
+          "@smoothbricks/codebase:patched-nx-bindings"
+        ],
+        "inputs": [
+          "default",
+          "^production",
+          "{workspaceRoot}/tsconfig.base.json",
+          "{workspaceRoot}/packages/nx-plugin/src/testing.ts",
+          "{workspaceRoot}/packages/nx-plugin/src/ensure-built.ts",
+          "{workspaceRoot}/packages/nx-plugin/src/managed-assets.ts",
+          {
+            "externalDependencies": [
+              "ttsc",
+              "typescript",
+              "typia",
+              "nx"
+            ]
+          },
+          {
+            "dependentTasksOutputFiles": "**/*",
+            "transitive": true
+          }
+        ],
+        "outputs": [
+          "{workspaceRoot}/.cache/nx-daemon-idle-proof"
+        ],
+        "options": {
+          "command": "ttsc -p tooling/tsconfig.nx-daemon-idle-proof.json --emit",
+          "cwd": "{workspaceRoot}"
+        }
+      },
+      "nx-daemon-idle-proof": {
+        "executor": "nx:run-commands",
+        "cache": false,
+        "dependsOn": [
+          "nx-daemon-idle-proof-compile"
+        ],
+        "outputs": [],
+        "options": {
+          "command": "bun --config=/dev/null --no-env-file --no-install .cache/nx-daemon-idle-proof/tooling/nx-daemon-idle-proof.js",
+          "cwd": "{workspaceRoot}"
+        }
+      },
       "test": {
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "options": {

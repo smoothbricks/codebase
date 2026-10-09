@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-/** Uncached host proof: run from packages/nx-plugin, outside the bounded Bun shards. */
+/** Uncached host proof: run its declared Nx target from the checkout root, outside the bounded Bun shards. */
 import { mkdir, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { connect, type Socket } from 'node:net';
@@ -7,7 +7,6 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import type { DaemonProcessJson } from 'nx/src/daemon/cache';
-import type * as NxShutdown from 'nx/src/daemon/server/shutdown-utils';
 import typia from 'typia';
 import { findNxWorkspaceRoot } from '../packages/nx-plugin/src/ensure-built.js';
 import {
@@ -24,7 +23,9 @@ const root = findNxWorkspaceRoot(process.cwd());
 if (root === null) throw new Error('run the host proof from its owning Nx checkout');
 const nx = join(root, 'node_modules', '.bin', 'nx');
 const require = createRequire(import.meta.url);
-const installedPolicy: typeof NxShutdown = require('nx/src/daemon/server/shutdown-utils.js');
+const installedPolicy = typia.assert<{ SERVER_INACTIVITY_TIMEOUT_MS: number }>(
+  require('nx/src/daemon/server/shutdown-utils.js'),
+);
 const timeoutMs = installedPolicy.SERVER_INACTIVITY_TIMEOUT_MS;
 if (timeoutMs !== 300_000) throw new Error(`the installed Nx inactivity policy is ${timeoutMs}, not 300000ms`);
 const implementation = await realpath(dirname(require.resolve('nx/package.json')));

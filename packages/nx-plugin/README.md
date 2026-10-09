@@ -738,11 +738,10 @@ The Nx patch repairs upstream Nx runtime behavior, separately from this plugin's
   file watcher or graph listener retains the daemon even when silent. The last request connection's close starts a fresh
   five-minute idle interval. Cowshed's existing usage-aware keeper remains authoritative for sheds whose tree changes
   without a job, session or task-database holder. No daemon is disabled and the next normal client starts one again. The
-  uncached host proof compiles with `bun x ttsc -p tooling/tsconfig.nx-daemon-idle-proof.json --emit`, then runs
-  `bun --config=/dev/null --no-env-file --no-install .cache/nx-daemon-idle-proof/tooling/nx-daemon-idle-proof.js` from
-  the checkout root. It holds a real silent client beyond five minutes, disconnects, and records the kernel and
-  daemon-log evidence of the next five-minute departure. It is outside the bounded Bun shards; their fast regression
-  checks the actual installed policy export. The proof's canonical Typia decoder runs only in that transformed product.
+  non-default, uncached host proof is `bun nx run tooling:nx-daemon-idle-proof` from the checkout root. Its declared
+  compile dependency emits the Typia-transformed product before Bun runs it. The proof holds a real silent client beyond
+  five minutes, disconnects, and records the kernel and daemon-log evidence of the next five-minute departure. It stays
+  outside the bounded Bun shards; their fast regression checks the actual installed policy export.
 - **The daemon stops for an ignore file only when its watcher's rules may be stale.** Nx's native watcher reads its
   ignore files once, in `watch()`, and the daemon stopped itself on every watcher event for a `.gitignore` or
   `.nxignore`, whatever the file then held. A rewrite with the same bytes (a checkout, a formatter) reports one, and so

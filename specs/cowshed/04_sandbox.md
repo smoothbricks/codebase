@@ -832,9 +832,10 @@ of its own, outside the sandbox, until the keeper stops that one too. A daemon i
 command starts one (16_build_volumes.md, "The Nx daemon stays on").
 
 An open request connection, registered watcher or graph listener retains the daemon even when silent; closing the last
-request connection resets the full idle interval. The uncached host script `tooling/nx-daemon-idle-proof.ts` exercises a
-connected silent client past five minutes and the daemon's departure five minutes after disconnection, using its real
-kernel process and daemon log. It runs explicitly outside the ordinary bounded test shards.
+request connection resets the full idle interval. The non-default, uncached target
+`bun nx run tooling:nx-daemon-idle-proof` compiles `tooling/nx-daemon-idle-proof.ts` with the canonical Typia transform,
+then exercises a connected silent client past five minutes and the daemon's departure five minutes after disconnection,
+using its real kernel process and daemon log. It stays outside the ordinary bounded test shards.
 
 A known, accepted property: a host client that connects to a workspace's daemon sends it the client's environment, as
 every Nx client does with its first message (`getDaemonEnv`, pinned Nx 23.2.1 `daemon/client/daemon-environment.js`).
