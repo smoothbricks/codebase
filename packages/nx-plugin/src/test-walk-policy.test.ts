@@ -7,6 +7,7 @@ import {
   diffScope,
   findDuplicateScenarios,
   formatDuplicateScenario,
+  REFUSES,
   TEST_ONE_WALK,
   upstreamBase,
 } from './test-walk-policy.js';
@@ -224,6 +225,39 @@ describe('test-walk-policy', () => {
           4,
         ],
       ]);
+      // Same-scenario is advisory: a warning for the writer and reviewer, never a refusal.
+      expect(REFUSES['same-scenario']).toBe(false);
+      expect(findDuplicateScenarios(root, [rs]).map(formatDuplicateScenario)[0]).toStartWith('warning[TEST-ONE-WALK]');
+
+      // Same-scenario controls: a shared tail of assertions only (no shared action); a tail of two statements; two
+      // injected statements on each side.
+      const world = (name: string, injected: string[], tail: string[]) => [
+        '    #[test]',
+        `    fn ${name}() {`,
+        '        let world = KillWindow::new("window").expect("kill window");',
+        ...injected.map((statement) => `        ${statement}`),
+        ...tail.map((statement) => `        ${statement}`),
+        '    }',
+      ];
+      const assertsOnly = [
+        'assert_eq!(world.main.incarnation(), 1);',
+        'assert!(world.checkout.exists());',
+        'assert!(!world.staging.exists());',
+      ];
+      const adoptTwo = ['let adopted = world.adopt().expect("adopt");', 'assert_eq!(adopted.incarnation(), 1);'];
+      const adoptThree = [...adoptTwo, 'world.assert_adopted().expect("adopted");'];
+      for (const [injectedA, injectedB, tail] of [
+        [['world.fence().expect("fence");'], ['drop(world.fenced_image().expect("attached"));'], assertsOnly],
+        [['world.fence().expect("fence");'], ['drop(world.fenced_image().expect("attached"));'], adoptTwo],
+        [
+          ['world.fence().expect("fence");', 'world.clone_template().expect("cloned");'],
+          ['drop(world.fenced_image().expect("attached"));', 'world.mount_staging().expect("mounted");'],
+          adoptThree,
+        ],
+      ] satisfies [string[], string[], string[]][]) {
+        write(rs, rust(...world('first_window', injectedA, tail), ...world('second_window', injectedB, tail)));
+        expect(pairs(rs)).toEqual([]);
+      }
 
       // Rust controls: an append through a mutable log is an action, not an assertion; a refusal ends in a different
       // action and outcome; a crash edge replays through a reopened handle.
@@ -277,6 +311,16 @@ describe('test-walk-policy', () => {
         rust(...panicking('#[test]', 'withdraws', '50'), ...panicking('#[test] #[should_panic]', 'overdraws', '51')),
       );
       expect(pairs(rs)).toEqual([]);
+      // A cfg gate is part of a case too: a macOS-only twin, or one ignored under miri, is not one table.
+      write(
+        rs,
+        rust(
+          ...panicking('#[test]', 'withdraws', '50'),
+          ...panicking('#[cfg(target_os = "macos")] #[test]', 'withdraws_on_macos', '51'),
+          ...panicking('#[test] #[cfg_attr(miri, ignore)]', 'withdraws_outside_miri', '52'),
+        ),
+      );
+      expect(pairs(rs)).toEqual([]);
       write(
         rs,
         rust(...panicking('#[test]', 'withdraws', '50'), ...panicking('#[ignore = "slow"] #[test]', 'big', '51')),
@@ -307,13 +351,50 @@ describe('test-walk-policy', () => {
         ),
       );
       expect(pairs(rs)).toEqual([]);
+      write(
+        rs,
+        rust(
+          '    #[test]',
+          '    fn reads_the_first_inner() {',
+          '        let pair = endpoint();',
+          '        assert_eq!(pair.0.1, 7);',
+          '    }',
+          '    #[test]',
+          '    fn reads_the_second_inner() {',
+          '        let pair = endpoint();',
+          '        assert_eq!(pair.1.0, 7);',
+          '    }',
+        ),
+      );
+      expect(pairs(rs)).toEqual([]);
 
-      // A body that is one wrapper call walks the wrapper's statements: `block_on(async { … })` in Rust and
-      // `await withHarness(async (h) => { … })` in TypeScript.
-      const blockOn = (name: string, amount: string) => [
+      // An assertion that borrows mutably acts: it is no pure assertion, so this pair is no same-path.
+      write(
+        rs,
+        rust(
+          '    #[test]',
+          '    fn resets_the_queue() {',
+          '        let queue = Queue::open();',
+          '        let mut sink = Vec::new();',
+          '        queue.reset();',
+          '    }',
+          '    #[test]',
+          '    fn drains_into_the_sink() {',
+          '        let queue = Queue::open();',
+          '        let mut sink = Vec::new();',
+          '        assert!(queue.drain_into(&mut sink).is_ok());',
+          '    }',
+        ),
+      );
+      expect(pairs(rs)).toEqual([]);
+
+      // A body that is one wrapper call walks the call (its body replaced by `$body`) and then the wrapper's
+      // statements: `block_on(async { … })` in Rust and `await withHarness(async (h) => { … })` in TypeScript. The
+      // wrapper's own arguments still tell cases apart: two runtimes, or two backends, are not one table.
+      const blockOn = (name: string, amount: string, runtime = 'runtime') => [
         '    #[test]',
         `    fn ${name}() {`,
-        '        runtime().block_on(async {',
+        `        ${runtime}().block_on(async {`,
         '            let ledger = Ledger::open(MemoryLog::new()).await;',
         `            ledger.post("sales", ${amount}).await;`,
         `            assert_eq!(ledger.balance("sales").await, ${amount});`,
@@ -321,10 +402,15 @@ describe('test-walk-policy', () => {
         '    }',
       ];
       write(rs, rust(...blockOn('posts_50', '50'), ...blockOn('posts_70', '70')));
-      expect(pairs(rs)).toEqual([['literal-twin', 'posts_50', 'posts_70', 3]]);
-      const harness = (title: string, amount: string) => [
+      expect(pairs(rs)).toEqual([['literal-twin', 'posts_50', 'posts_70', 4]]);
+      write(
+        rs,
+        rust(...blockOn('posts_50', '50', 'current_thread_rt'), ...blockOn('posts_70', '70', 'multi_thread_rt')),
+      );
+      expect(pairs(rs)).toEqual([]);
+      const harness = (title: string, amount: string, backend = '') => [
         `test('${title}', async () => {`,
-        '  await withHarness(async (h) => {',
+        `  await withHarness(${backend}async (h) => {`,
         '    const ledger = h.ledger();',
         `    ledger.post({ account: 'sales', amount: ${amount} });`,
         `    expect(ledger.balance('sales')).toBe(${amount});`,
@@ -332,7 +418,9 @@ describe('test-walk-policy', () => {
         '});',
       ];
       write(ts, lines(...harness('posts 50', '50'), ...harness('posts 70', '70')));
-      expect(pairs(ts)).toEqual([['literal-twin', 'posts 50', 'posts 70', 3]]);
+      expect(pairs(ts)).toEqual([['literal-twin', 'posts 50', 'posts 70', 4]]);
+      write(ts, lines(...harness('memory', '50', 'memoryBackend, '), ...harness('sqlite', '50', 'sqliteBackend, ')));
+      expect(pairs(ts)).toEqual([]);
 
       // An expected failure, or a different hook chain, is part of a TypeScript case.
       write(
@@ -353,6 +441,21 @@ describe('test-walk-policy', () => {
           "describe('seeded', () => {",
           '  beforeEach(() => { store = Store.seeded(); });',
           ...ledgerCase('posts'),
+          '});',
+        ),
+      );
+      expect(pairs(ts)).toEqual([]);
+      // Declarations of the describe chain are part of a case: the same `it` over a memory store and a disk store.
+      write(
+        ts,
+        lines(
+          "describe('MemoryStore', () => {",
+          '  const make = () => new MemoryStore();',
+          "  it('round-trips', () => { const store = make(); store.put('k', 1); expect(store.get('k')).toBe(1); });",
+          '});',
+          "describe('DiskStore', () => {",
+          '  const make = () => new DiskStore();',
+          "  it('round-trips', () => { const store = make(); store.put('k', 1); expect(store.get('k')).toBe(1); });",
           '});',
         ),
       );

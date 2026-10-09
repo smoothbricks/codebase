@@ -57,9 +57,17 @@ export interface TestCase {
  * `same-path`: the cases share their leading statements exactly, and one of them only asserts beyond them, so it
  * walks a prefix of the other's path. `literal-twin`: the bodies have the same shape and differ only in literals.
  * `same-scenario`: one case is the other's setup (in skeleton) and its action and outcome (exactly, up to declared
- * names) around one injected statement of its own.
+ * names) around one injected statement of its own. It is advisory: measured at about 80% precision, it is reported to
+ * the writer and reviewer and never refuses.
  */
 export type Duplication = 'same-path' | 'literal-twin' | 'same-scenario';
+
+/** Whether a kind refuses (a lint error) or only advises (a warning for the writer and reviewer). */
+export const REFUSES: Record<Duplication, boolean> = {
+  'same-path': true,
+  'literal-twin': true,
+  'same-scenario': false,
+};
 
 export interface DuplicateScenario {
   readonly file: string;
@@ -193,9 +201,12 @@ function tsTokens(node: ts.Node, source: ts.SourceFile, locals: ReadonlyMap<stri
 
 const HOOK_CALLEE = /^(?:before|after)(?:Each|All)$/u;
 
-/** The `before*`/`after*` hook calls of every `describe` around `node`, outermost first, as source text. */
-function hookChain(node: ts.Node, source: ts.SourceFile): string[] {
-  const hooks: string[] = [];
+/**
+ * What the enclosing `describe` chain fixes for a case, outermost first, as source text: its `before*`/`after*` hook
+ * calls and its own declarations (`const make = () => new MemoryStore()` makes a different subject than a DiskStore).
+ */
+function describeChain(node: ts.Node, source: ts.SourceFile): string[] {
+  const context: string[] = [];
   for (let scope = node.parent; scope !== undefined; scope = scope.parent) {
     if (!(ts.isArrowFunction(scope) || ts.isFunctionExpression(scope)) || !ts.isBlock(scope.body)) continue;
     const call = scope.parent;
@@ -203,36 +214,53 @@ function hookChain(node: ts.Node, source: ts.SourceFile): string[] {
     const own = scope.body.statements
       .filter(
         (statement) =>
-          ts.isExpressionStatement(statement) &&
-          ts.isCallExpression(statement.expression) &&
-          ts.isIdentifier(statement.expression.expression) &&
-          HOOK_CALLEE.test(statement.expression.expression.text),
+          ts.isVariableStatement(statement) ||
+          ts.isFunctionDeclaration(statement) ||
+          (ts.isExpressionStatement(statement) &&
+            ts.isCallExpression(statement.expression) &&
+            ts.isIdentifier(statement.expression.expression) &&
+            HOOK_CALLEE.test(statement.expression.expression.text)),
       )
       .map((statement) => statement.getText(source).replace(/\s+/gu, ' '));
-    hooks.unshift(...own);
+    context.unshift(...own);
   }
-  return hooks;
+  return context;
 }
 
 /**
- * The statements a case walks. A body that is one call whose last argument is a function, such as
- * `await withHarness(async (h) => { … })`, walks that function's statements.
+ * The steps a case walks. A body that is one call whose last argument is a function, such as
+ * `await withHarness(memoryBackend, async (h) => { … })`, walks the call itself as its first step, with the function
+ * replaced by `$body` so the wrapper's other arguments still tell cases apart, and then that function's statements.
  */
-function caseStatements(body: ts.ConciseBody): readonly ts.Node[] {
+function caseSteps(body: ts.ConciseBody, source: ts.SourceFile, locals: ReadonlyMap<string, number>): Step[] {
+  const steps: Step[] = [];
   let statements: readonly ts.Node[] = ts.isBlock(body) ? body.statements : [body];
   for (;;) {
     const only = statements.length === 1 ? statements[0] : undefined;
     let expression = only !== undefined && ts.isExpressionStatement(only) ? only.expression : only;
     while (expression !== undefined && ts.isAwaitExpression(expression)) expression = expression.expression;
-    const inner = expression !== undefined && ts.isCallExpression(expression) ? expression.arguments.at(-1) : undefined;
+    const call = expression !== undefined && ts.isCallExpression(expression) ? expression : undefined;
+    const inner = call?.arguments.at(-1);
     if (
+      call === undefined ||
       inner === undefined ||
       !(ts.isArrowFunction(inner) || ts.isFunctionExpression(inner)) ||
       !ts.isBlock(inner.body)
     )
-      return statements;
+      break;
+    const punct = (text: string): Token => ({ text, literal: false, local: false });
+    const wrapper = [
+      ...tsTokens(call.expression, source, locals),
+      punct('('),
+      ...call.arguments.slice(0, -1).flatMap((argument) => [...tsTokens(argument, source, locals), punct(',')]),
+      punct('$body'),
+      punct(')'),
+    ];
+    steps.push(step(wrapper, false));
     statements = inner.body.statements;
   }
+  for (const statement of statements) steps.push(step(tsTokens(statement, source, locals), tsAssertion(statement)));
+  return steps;
 }
 
 export function typeScriptCases(file: string, text: string): TestCase[] {
@@ -248,15 +276,12 @@ export function typeScriptCases(file: string, text: string): TestCase[] {
       );
       const title = node.arguments[0];
       if (body !== undefined && title !== undefined) {
-        const locals = declaredNames(body);
         cases.push({
           name: ts.isStringLiteralLike(title) ? title.text : title.getText(source),
           start: line(node.getStart(source)),
           end: line(node.end),
-          identity: [callee.endsWith('.failing') ? 'failing' : '', ...hookChain(node, source)].join('\n'),
-          steps: caseStatements(body.body).map((statement) =>
-            step(tsTokens(statement, source, locals), tsAssertion(statement)),
-          ),
+          identity: [callee.endsWith('.failing') ? 'failing' : '', ...describeChain(node, source)].join('\n'),
+          steps: caseSteps(body.body, source, declaredNames(body)),
         });
         return;
       }
@@ -436,21 +461,24 @@ function rustSteps(body: readonly RustToken[]): Step[] {
 }
 
 /**
- * The statements of an `async { … }` block that is the whole of a one-statement body, as in
- * `runtime().block_on(async { … })`; otherwise undefined.
+ * An `async { … }` block that is the whole of a one-statement body, as in `runtime().block_on(async { … })`: the tokens
+ * before it (the wrapper, kept as the case's first step so a different runtime still tells cases apart) and the
+ * block's statements. Undefined for any other body.
  */
-function asyncBody(body: readonly RustToken[]): readonly RustToken[] | undefined {
+function asyncBody(
+  body: readonly RustToken[],
+): { readonly wrapper: readonly RustToken[]; readonly inner: readonly RustToken[] } | undefined {
   const at = body.findIndex((token) => token.text === 'async');
   if (at === -1) return undefined;
   const open = body[at + 1]?.text === 'move' ? at + 2 : at + 1;
   if (body[open]?.text !== '{') return undefined;
   const close = closing(body, open);
   // Only the call's closing parentheses, a `;` and an unwrap or `?` may follow the block.
-  return body.length - close <= 8 ? body.slice(open + 1, close) : undefined;
+  return body.length - close <= 8 ? { wrapper: body.slice(0, at), inner: body.slice(open + 1, close) } : undefined;
 }
 
-/** Attributes that change what a test's outcome means: an expected panic, or not running it. */
-const OUTCOME_ATTRIBUTE: Record<string, true> = { should_panic: true, ignore: true };
+/** Attributes that change what a test's outcome means or where it runs: an expected panic, not running it, a cfg gate. */
+const OUTCOME_ATTRIBUTE: Record<string, true> = { should_panic: true, ignore: true, cfg: true, cfg_attr: true };
 
 export function rustCases(text: string): TestCase[] {
   const tokens = rustTokens(text);
@@ -507,13 +535,13 @@ export function rustCases(text: string): TestCase[] {
     const start = tokens[index]?.offset ?? 0;
     const body = tokens.slice(cursor + 1, end);
     const steps = rustSteps(body);
-    const inner = steps.length === 1 ? asyncBody(body) : undefined;
+    const wrapped = steps.length === 1 ? asyncBody(body) : undefined;
     cases.push({
       name,
       start: line(start),
       end: line(tokens[end]?.offset ?? start),
       identity: modifiers.sort().join('\n'),
-      steps: inner === undefined ? steps : rustSteps(inner),
+      steps: wrapped === undefined ? steps : [step(wrapped.wrapper, false), ...rustSteps(wrapped.inner)],
     });
     index = end;
   }
@@ -660,7 +688,7 @@ export function formatDuplicateScenario(duplicate: DuplicateScenario): string {
         : `${b} replays the scenario of ${a} with one step changed (${shared} shared statements of setup, action ` +
           'and outcome)';
   return (
-    `error[${TEST_ONE_WALK.id}]: ${what}\n` +
+    `${REFUSES[duplicate.kind] ? 'error' : 'warning'}[${TEST_ONE_WALK.id}]: ${what}\n` +
     `  --> ${duplicate.file}:${second.start}\n` +
     `  --> ${duplicate.file}:${first.start}\n` +
     `  = help: ${TEST_ONE_WALK.help}`

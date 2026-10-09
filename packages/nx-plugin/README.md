@@ -451,10 +451,12 @@ when it names no commit), `refs/remotes/main/main`, the local main's upstream br
 exported from `@smoothbricks/nx-plugin/test-walk-policy`, and git failures come back as `GitAnswer` values.
 
 The policy reads bun:test `test`/`it` cases in test files and `#[test]`-family fns in any Rust file. A body that is one
-wrapper call is read through to the wrapper's statements: `await withHarness(async (h) => { … })`, or
-`block_on(async { … })`. A case's identity is part of the comparison, and only cases of one identity are compared.
-Identity covers `test.failing` in TypeScript, and `#[should_panic]` and `#[ignore]` in Rust. It also covers the
-`before*`/`after*` hooks of the enclosing `describe` chain.
+wrapper call, `await withHarness(memoryBackend, async (h) => { … })` or `runtime().block_on(async { … })`, walks the
+call itself as its first step, with its body replaced by `$body`. It then walks the wrapper's statements, so a different
+backend or runtime still tells two cases apart. A case's identity is part of the comparison, and only cases of one
+identity are compared. Identity covers `test.failing` in TypeScript, and `#[should_panic]`, `#[ignore]`, `#[cfg(…)]` and
+`#[cfg_attr(…)]` in Rust. It also covers the `before*`/`after*` hooks and the declarations of the enclosing `describe`
+chain.
 
 Each top-level statement of a case body is normalized several ways:
 
@@ -471,17 +473,22 @@ earlier steps built. It is one of:
 - an `assert*!` that borrows nothing mutably and calls no method on a `let mut` local.
 
 Whether a method reads or acts is not statically decidable. A method that acts inside an assertion, such as
-`expect(await queue.drain())`, is treated as a read, and review decides. `TEST-ONE-WALK` refuses three shapes:
+`expect(await queue.drain())`, is treated as a read, and review decides. `TEST-ONE-WALK` refuses two shapes with
+`error[TEST-ONE-WALK]` (exit 1):
 
 - **same-path:** the cases share at least two leading statements exactly, and one of them only purely asserts beyond
   them. Move its assertions into the other walk at the statement the diagnostic names.
 - **literal-twin:** two or more statements equal once literals are abstracted; identical bodies are reported as verbatim
   repeats. Make one table or property over the values.
+
+It advises on a third with `warning[TEST-ONE-WALK]`, which never fails the run. The warning is for the writer and the
+reviewer, who decide whether the variants share one walk:
+
 - **same-scenario:** one case's skeleton is the other's head (at least one statement) and tail around exactly one
   statement of its own. The tail is the action and its outcome: at least three statements equal in flow, with at least
   one action among them. The injected step differs, for example which crash window or precondition. Extra trailing pure
-  assertions on either side are more checks on the same outcome. Walk the variants over one fixture, or make one table
-  over the injected step.
+  assertions on either side are more checks on the same outcome. Measured on two corpora at about 80% precision, which
+  is too low to refuse. Walk the variants over one fixture, or make one table over the injected step.
 
 A separate case stays only for a distinct boundary or edge: its setup or path diverges, or it needs a state the walk's
 earlier steps destroy. Each diagnostic names the file, both cases, the shared statement count and that remedy.
