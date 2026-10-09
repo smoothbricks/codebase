@@ -10,7 +10,6 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering as AtomicOrdering};
 use std::sync::mpsc::{self, Sender, SyncSender};
-use std::sync::{Arc, Mutex};
 use std::thread;
 
 #[cfg(unix)]
@@ -309,14 +308,24 @@ pub(in crate::storage) fn warn_missing_session_sidecar(image: &Path) {
 
 /// What one read of a project's sessions directory says about its legacy images: the retained
 /// regular files, and each entry that could not be judged with the reason. Both are sorted, so
-/// two reads of the same directory compare equal whatever order `readdir` returned.
+/// the report does not depend on the order `readdir` returned. Reading it is the project open's
+/// job, once (01_storage.md, "Ownership, identity, and the volume label"); the enumerators that
+/// list workspaces never say anything about legacy images.
 #[derive(Debug, Default, Eq, PartialEq)]
-struct LegacyImageReport {
+pub struct LegacyImageReport {
     retained: Vec<String>,
     unjudged: Vec<(String, String)>,
 }
 
 impl LegacyImageReport {
+    /// Read the legacy images in a project's `sessions` directory.
+    pub fn read(sessions: &Path) -> Result<Self, ApfsStorageError> {
+        Ok(Self::of(&read_dir_paths(
+            sessions,
+            "enumerate legacy session images",
+        )?))
+    }
+
     /// Old image names are diagnostic evidence only, never a runtime image grammar or GC
     /// authority. Inspect metadata, not image contents, and leave every legacy payload intact.
     fn of(entries: &[PathBuf]) -> Self {
@@ -346,7 +355,7 @@ impl LegacyImageReport {
     }
 
     /// One line naming every retained image, then one line per entry that could not be judged.
-    fn lines(&self) -> Vec<String> {
+    pub fn lines(&self) -> Vec<String> {
         let mut lines = Vec::with_capacity(1 + self.unjudged.len());
         if !self.retained.is_empty() {
             let plural = if self.retained.len() == 1 { "" } else { "s" };
@@ -363,32 +372,6 @@ impl LegacyImageReport {
                 .map(|(name, issue)| session_image_issue(name, issue)),
         );
         lines
-    }
-}
-
-/// The legacy report this process last said for each sessions directory. One command reads a
-/// project's sessions many times and every read finds the same files, so a report is said when
-/// it first appears and again only when it changes (01_storage.md, "Ownership, identity, and
-/// the volume label").
-static LEGACY_REPORTS: Mutex<BTreeMap<PathBuf, LegacyImageReport>> = Mutex::new(BTreeMap::new());
-
-/// The warning lines this read of `sessions` adds to what the process has already said.
-fn legacy_report_lines(sessions: &Path, entries: &[PathBuf]) -> Vec<String> {
-    let report = LegacyImageReport::of(entries);
-    let mut said = LEGACY_REPORTS
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner());
-    if said.get(sessions) == Some(&report) {
-        return Vec::new();
-    }
-    let lines = report.lines();
-    said.insert(sessions.to_owned(), report);
-    lines
-}
-
-fn warn_legacy_images(sessions: &Path, entries: &[PathBuf]) {
-    for line in legacy_report_lines(sessions, entries) {
-        eprintln!("{line}");
     }
 }
 
@@ -1617,7 +1600,6 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
             });
         }
         let entries = read_dir_paths(&layout.project().sessions, "enumerate session images")?;
-        warn_legacy_images(&layout.project().sessions, &entries);
         for discovered in discover_session_images(entries) {
             match grants_sidecar_missing(discovered.path()) {
                 Ok(false) => {}
@@ -5408,7 +5390,6 @@ where
             &storage.project().sessions,
             "enumerate pending session images",
         )?;
-        warn_legacy_images(&storage.project().sessions, &entries);
         for discovered in discover_session_images(entries) {
             match grants_sidecar_missing(discovered.path()) {
                 Ok(false) => {}
@@ -6614,10 +6595,9 @@ mod tests {
     use super::*;
     use cowshed_os::fork_lock::Run as _;
 
-    /// Every read of a project's sessions finds the same legacy files; the process says them as
-    /// one line naming them all, once, and again only when what is there changes.
+    /// A project's legacy images are one line naming them all, whatever order readdir returned.
     #[test]
-    fn legacy_images_are_one_summary_said_once_until_they_change() {
+    fn legacy_images_are_one_summary_line_whatever_the_readdir_order() {
         let sessions =
             std::env::temp_dir().join(format!("cowshed-legacy-report-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&sessions).unwrap();
@@ -6629,30 +6609,25 @@ mod tests {
             .iter()
             .map(|name| sessions.join(name))
             .collect();
-        let unjudged = "cowshed: warning: skipping session image linked.asif: legacy image is not \
-                        a regular file";
+        let report = LegacyImageReport::read(&sessions).unwrap();
         assert_eq!(
-            legacy_report_lines(&sessions, &entries),
+            report.lines(),
             [
                 "cowshed: warning: 2 legacy session images retained; explicit transition or \
                  retirement is required: a.sparseimage, b.asif",
-                unjudged,
+                "cowshed: warning: skipping session image linked.asif: legacy image is not a \
+                 regular file",
             ]
         );
-        // Another read in another order is the same report, and says nothing.
         let reversed: Vec<PathBuf> = entries.iter().rev().cloned().collect();
-        assert!(legacy_report_lines(&sessions, &reversed).is_empty());
-        // A change is news: the whole new report is said, once.
-        fs::remove_file(sessions.join("b.asif")).unwrap();
-        assert_eq!(
-            legacy_report_lines(&sessions, &entries),
-            [
-                "cowshed: warning: 1 legacy session image retained; explicit transition or \
-                 retirement is required: a.sparseimage",
-                unjudged,
-            ]
+        assert_eq!(LegacyImageReport::of(&entries), report);
+        assert_eq!(LegacyImageReport::of(&reversed), report);
+        // Nothing legacy, nothing said.
+        assert!(
+            LegacyImageReport::of(&[sessions.join("c.dmg")])
+                .lines()
+                .is_empty()
         );
-        assert!(legacy_report_lines(&sessions, &entries).is_empty());
         fs::remove_dir_all(&sessions).unwrap();
     }
 

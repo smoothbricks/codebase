@@ -3048,9 +3048,10 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         let recovery_intents_path = lifecycle_intents_path.clone();
         let recovery_config = config.clone();
         let recovery_repo = repo_id.clone();
+        let recovery_sessions = layout.project().sessions.clone();
         let recovery_span = cowshed_os::timing::span("open", "inventory");
         let repairs = recovery_scope.repairs();
-        let (host, facts, pending, lifecycle_intents) =
+        let (host, facts, pending, legacy, lifecycle_intents) =
             crate::storage::lifecycle::dispatch_blocking(move || {
                 let lifecycle_intents = match replay_journal {
                     Some(journal) => journal,
@@ -3075,13 +3076,19 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                 let pending = host
                     .pending_publications(&recovery_repo)
                     .map_err(native_storage_error)?;
-                Ok::<_, CowshedError>((host, facts, pending, lifecycle_intents))
+                let legacy =
+                    crate::storage::apfs::native::LegacyImageReport::read(&recovery_sessions)
+                        .map_err(native_storage_error)?;
+                Ok::<_, CowshedError>((host, facts, pending, legacy, lifecycle_intents))
             })
             .await
             .map_err(|error| {
                 CowshedError::internal(format!("APFS recovery task failed: {error}"))
             })??;
         drop(recovery_span);
+        for line in legacy.lines() {
+            eprintln!("{line}");
+        }
         let retired_project_root = layout.project().project_root.clone();
         let retired_repo = repo_id.clone();
         let retired = spanned(
@@ -3473,8 +3480,13 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             .partition(|(workspace, _)| {
                 self.recovery_scope.replay(workspace) != IntentReplay::Leave
             });
-        for (workspace, verb) in left {
-            eprintln!("cowshed: leaving unfinished {verb} of {workspace} to a verb that names it");
+        // One line however many: doctor names each as an `unfinished-intent` finding.
+        if !left.is_empty() {
+            let plural = if left.len() == 1 { "" } else { "s" };
+            eprintln!(
+                "cowshed: leaving {} unfinished lifecycle operation{plural} to the verbs that name them; cowshed doctor lists each",
+                left.len()
+            );
         }
         let mut claimed = Vec::with_capacity(unfinished.len());
         for (workspace, _) in unfinished {
