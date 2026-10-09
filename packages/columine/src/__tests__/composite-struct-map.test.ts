@@ -121,35 +121,42 @@ describe('StructMap2 public WASM readers', () => {
     expect(restoredEntries.value).toHaveLength(2);
   });
 
-  it('executes strict signed i64x2 max in the built WASM dispatcher', async () => {
+  it('executes strict signed i64x2 max and min in the built WASM dispatcher', async () => {
     expect(Opcode.BATCH_STRUCT_MAP2_UPSERT_MAX_I64X2).toBe(0x87);
+    expect(Opcode.BATCH_STRUCT_MAP2_UPSERT_MIN_I64X2).toBe(0x89);
     const getRow = backend.structMap2GetRow.bind(backend);
-    const max = await backend.loadProgram(
-      reducer(
-        [Opcode.BATCH_STRUCT_MAP2_UPSERT_MAX_I64X2, 0, 0, 1, 1, 2, 0, 3, 1, 4, 2],
-        [StructFieldType.UINT32, StructFieldType.INT64, StructFieldType.INT64],
-        5,
-      ),
-    );
-    const state = backend.createState(max);
-    const candidates: ColumnInput[] = [
-      { data: new Uint32Array([7, 7, 7]), type: ValueType.UINT32 },
-      { data: new Uint32Array([40, 40, 40]), type: ValueType.UINT32 },
-      { data: new Uint32Array([10, 20, 30]), type: ValueType.UINT32 },
-      { data: new BigInt64Array([-5n, -5n, -4n]), type: ValueType.UINT32 },
-      { data: new BigInt64Array([10n, 10n, -(1n << 63n)]), type: ValueType.UINT32 },
-    ];
-    expect(backend.executeBatch(state, max, candidates, 3)).toBe(ErrorCode.OK);
+    // One pair sees a tie on (-5, 10) and then the greater (-4, i64::MIN): max keeps the last, min the first.
+    for (const [op, payload, first, second] of [
+      [Opcode.BATCH_STRUCT_MAP2_UPSERT_MAX_I64X2, 30, -4n, -(1n << 63n)],
+      [Opcode.BATCH_STRUCT_MAP2_UPSERT_MIN_I64X2, 10, -5n, 10n],
+    ] as const) {
+      const program = await backend.loadProgram(
+        reducer(
+          [op, 0, 0, 1, 1, 2, 0, 3, 1, 4, 2],
+          [StructFieldType.UINT32, StructFieldType.INT64, StructFieldType.INT64],
+          5,
+        ),
+      );
+      const state = backend.createState(program);
+      const candidates: ColumnInput[] = [
+        { data: new Uint32Array([7, 7, 7]), type: ValueType.UINT32 },
+        { data: new Uint32Array([40, 40, 40]), type: ValueType.UINT32 },
+        { data: new Uint32Array([10, 20, 30]), type: ValueType.UINT32 },
+        { data: new BigInt64Array([-5n, -5n, -4n]), type: ValueType.UINT32 },
+        { data: new BigInt64Array([10n, 10n, -(1n << 63n)]), type: ValueType.UINT32 },
+      ];
+      expect(backend.executeBatch(state, program, candidates, 3)).toBe(ErrorCode.OK);
 
-    const rowRead = getRow(state, max, 0, 7, 40);
-    if (!rowRead.ok) throw new Error(`unexpected structMap2GetRow error ${rowRead.error}`);
-    const row = rowRead.value;
-    if (!row) throw new Error('Strict signed i64x2 max did not materialize its winner');
-    const bytes = backend.serialize(state, max);
-    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-    const offset = row.rowOffset;
-    expect(view.getUint32(offset + 1, true)).toBe(30);
-    expect(view.getBigInt64(offset + 5, true)).toBe(-4n);
-    expect(view.getBigInt64(offset + 13, true)).toBe(-(1n << 63n));
+      const rowRead = getRow(state, program, 0, 7, 40);
+      if (!rowRead.ok) throw new Error(`unexpected structMap2GetRow error ${rowRead.error}`);
+      const row = rowRead.value;
+      if (!row) throw new Error('the strict signed i64x2 pick did not materialize its winner');
+      const bytes = backend.serialize(state, program);
+      const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+      const offset = row.rowOffset;
+      expect(view.getUint32(offset + 1, true)).toBe(payload);
+      expect(view.getBigInt64(offset + 5, true)).toBe(first);
+      expect(view.getBigInt64(offset + 13, true)).toBe(second);
+    }
   });
 });

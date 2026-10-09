@@ -353,7 +353,7 @@ pub(crate) fn walk_operands<S: OperandSink>(
             pairs(r, sink, MAX_STRUCT_SCALAR_OPERANDS)?;
             &[]
         }
-        Opcode::BatchStructMap2UpsertMaxI64x2 => {
+        Opcode::BatchStructMap2UpsertMaxI64x2 | Opcode::BatchStructMap2UpsertMinI64x2 => {
             // 0x83's row, then (cmp_col, cmp_field) for both comparison lanes,
             // which take two of the row's pair slots.
             for _ in 0..3 {

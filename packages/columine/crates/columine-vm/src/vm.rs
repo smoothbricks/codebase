@@ -981,7 +981,7 @@ pub struct Vm {
     /// (zeroing and copying) the arrays per row.
     element_struct_map: StructMapUpsertOperands,
     element_struct_map2: StructMap2UpsertOperands,
-    element_struct_map2_max: StructMap2MaxI64x2Operands,
+    element_struct_map2_tuple: StructMap2TupleOperands,
     element_list_vals: ScalarOperands,
     nested_scratch: nested::NestedScratch,
     /// Batch capacity admission (`capacity`), retained across batches.
@@ -1005,7 +1005,7 @@ impl Vm {
             element_plan: BodyPlan::default(),
             element_struct_map: StructMapUpsertOperands::EMPTY,
             element_struct_map2: StructMap2UpsertOperands::EMPTY,
-            element_struct_map2_max: StructMap2MaxI64x2Operands::EMPTY,
+            element_struct_map2_tuple: StructMap2TupleOperands::EMPTY,
             element_list_vals: ScalarOperands::EMPTY,
             nested_scratch: nested::NestedScratch::default(),
             capacity: CapacityScratch::default(),
@@ -1962,40 +1962,65 @@ pub(crate) fn decode_struct_map2_upsert_operands(
     decode_struct_map2_row(&mut Operands::at(code, start), 0)
 }
 
+/// Which row a 0x87/0x89 tuple pick keeps: the strictly greatest or the
+/// strictly least signed-i64 lexicographic `(cmp1, cmp2)`. An equal tuple never
+/// replaces the kept row; the selected tuple is independent of arrival order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TupleKeep {
+    Greatest,
+    Least,
+}
+
+impl TupleKeep {
+    /// The pick a tuple opcode names; `None` for every other opcode.
+    pub(crate) fn of(op: Opcode) -> Option<Self> {
+        match op {
+            Opcode::BatchStructMap2UpsertMaxI64x2 => Some(Self::Greatest),
+            Opcode::BatchStructMap2UpsertMinI64x2 => Some(Self::Least),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct StructMap2MaxI64x2Operands {
+pub(crate) struct StructMap2TupleOperands {
     pub(crate) row: StructMap2UpsertOperands,
     pub(crate) cmp1_col: u32,
     pub(crate) cmp1_field: u8,
     pub(crate) cmp2_col: u32,
     pub(crate) cmp2_field: u8,
+    pub(crate) keep: TupleKeep,
     pub(crate) end: usize,
 }
 
 /// 0x83's row operands followed by `cmp1_col:index, cmp1_field:u8,
 /// cmp2_col:index, cmp2_field:u8`. The two comparison lanes are written with
 /// the row, so they take two of its pair slots.
-pub(crate) fn decode_struct_map2_max_i64x2_operands(
+/// The opcode names which tuple the pick keeps.
+pub(crate) fn decode_struct_map2_tuple_operands(
     code: &[u8],
     start: usize,
-) -> Option<StructMap2MaxI64x2Operands> {
-    let mut operands = StructMap2MaxI64x2Operands::EMPTY;
-    operands.decode_from(&mut Operands::at(code, start))?;
+    op: Opcode,
+) -> Option<StructMap2TupleOperands> {
+    let mut operands = StructMap2TupleOperands::EMPTY;
+    operands.decode_from(&mut Operands::at(code, start), op)?;
     Some(operands)
 }
 
-impl StructMap2MaxI64x2Operands {
+impl StructMap2TupleOperands {
     const EMPTY: Self = Self {
         row: StructMap2UpsertOperands::EMPTY,
         cmp1_col: 0,
         cmp1_field: 0,
         cmp2_col: 0,
         cmp2_field: 0,
+        keep: TupleKeep::Greatest,
         end: 0,
     };
 
     /// Decode over this value, writing only what the instruction carries.
-    fn decode_from<'a, R: OperandRead<'a>>(&mut self, operands: &mut R) -> Option<()> {
+    fn decode_from<'a, R: OperandRead<'a>>(&mut self, operands: &mut R, op: Opcode) -> Option<()> {
+        self.keep = TupleKeep::of(op)?;
         self.row.decode_from(operands, 2)?;
         self.cmp1_col = operands.index()?;
         self.cmp1_field = operands.byte()?;
@@ -2006,10 +2031,10 @@ impl StructMap2MaxI64x2Operands {
     }
 }
 
-fn validate_struct_map2_max_i64x2(
+fn validate_struct_map2_tuple(
     state: &[u8],
     smap: &StructMap2Slot,
-    operands: &StructMap2MaxI64x2Operands,
+    operands: &StructMap2TupleOperands,
 ) -> bool {
     if operands.cmp1_field == operands.cmp2_field
         || operands.cmp1_field >= smap.num_fields
@@ -2024,12 +2049,12 @@ fn validate_struct_map2_max_i64x2(
     })
 }
 
-fn should_upsert_struct_map2_max_i64x2(
+fn should_upsert_struct_map2_tuple(
     state: &[u8],
     smap: &StructMap2Slot,
     key1: u32,
     key2: u32,
-    operands: &StructMap2MaxI64x2Operands,
+    operands: &StructMap2TupleOperands,
     cols: &[&[u8]],
     element_idx: u32,
 ) -> bool {
@@ -2051,7 +2076,10 @@ fn should_upsert_struct_map2_max_i64x2(
         bytes::read_i64(col_at(cols, operands.cmp1_col as usize), comparison_offset),
         bytes::read_i64(col_at(cols, operands.cmp2_col as usize), comparison_offset),
     );
-    candidate > existing
+    match operands.keep {
+        TupleKeep::Greatest => candidate > existing,
+        TupleKeep::Least => candidate < existing,
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -2389,11 +2417,11 @@ fn single_struct_map2_upsert_last(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn single_struct_map2_upsert_max_i64x2(
+fn single_struct_map2_upsert_tuple(
     undo: &mut UndoState,
     delta_mode: bool,
     state: &mut [u8],
-    operands: &StructMap2MaxI64x2Operands,
+    operands: &StructMap2TupleOperands,
     key1: u32,
     key2: u32,
     cols: &[&[u8]],
@@ -2403,7 +2431,7 @@ fn single_struct_map2_upsert_max_i64x2(
         return ErrorCode::InvalidKey;
     }
     let smap = StructMap2Slot::bind(state, operands.row.slot);
-    if !should_upsert_struct_map2_max_i64x2(state, &smap, key1, key2, operands, cols, element_idx) {
+    if !should_upsert_struct_map2_tuple(state, &smap, key1, key2, operands, cols, element_idx) {
         return ErrorCode::Ok;
     }
 
@@ -3944,13 +3972,13 @@ impl Vm {
                     }
                 }
 
-                Opcode::BatchStructMap2UpsertMaxI64x2 => {
-                    let Some(operands) = decode_struct_map2_max_i64x2_operands(code, pc) else {
+                Opcode::BatchStructMap2UpsertMaxI64x2 | Opcode::BatchStructMap2UpsertMinI64x2 => {
+                    let Some(operands) = decode_struct_map2_tuple_operands(code, pc, op) else {
                         return INVALID_PROGRAM;
                     };
                     pc = operands.end;
                     let smap = StructMap2Slot::bind(state, operands.row.slot);
-                    if !validate_struct_map2_max_i64x2(state, &smap, &operands) {
+                    if !validate_struct_map2_tuple(state, &smap, &operands) {
                         return INVALID_PROGRAM;
                     }
                     let keys1 = batch_col!(col_u32_exact(
@@ -3963,7 +3991,7 @@ impl Vm {
                     ));
                     for i in 0..batch_len {
                         let index = i as usize;
-                        let result = single_struct_map2_upsert_max_i64x2(
+                        let result = single_struct_map2_upsert_tuple(
                             &mut self.undo,
                             delta_mode,
                             state,
@@ -4868,17 +4896,17 @@ impl Vm {
                         return result as u32;
                     }
                 }
-                Opcode::BatchStructMap2UpsertMaxI64x2 => {
-                    let operands = &mut self.element_struct_map2_max;
-                    if operands.decode_from(&mut r).is_none() {
+                Opcode::BatchStructMap2UpsertMaxI64x2 | Opcode::BatchStructMap2UpsertMinI64x2 => {
+                    let operands = &mut self.element_struct_map2_tuple;
+                    if operands.decode_from(&mut r, op).is_none() {
                         return INVALID_PROGRAM;
                     }
                     bpc = operands.end;
                     let smap = StructMap2Slot::bind(state, operands.row.slot);
-                    if !validate_struct_map2_max_i64x2(state, &smap, operands) {
+                    if !validate_struct_map2_tuple(state, &smap, operands) {
                         return INVALID_PROGRAM;
                     }
-                    let result = single_struct_map2_upsert_max_i64x2(
+                    let result = single_struct_map2_upsert_tuple(
                         &mut self.undo,
                         delta_mode,
                         state,

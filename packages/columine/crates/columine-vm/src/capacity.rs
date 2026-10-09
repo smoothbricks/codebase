@@ -290,7 +290,9 @@ fn effects(op: Opcode, o: &[u32], out: &mut impl FnMut(Effect)) -> Option<()> {
         }
         // Init frames charged for absent rows and clear fields alike.
         Opcode::BatchStructMapCountsFold => out(Effect::Opaque { slot: at(0)? }),
-        Opcode::BatchStructMap2UpsertLast | Opcode::BatchStructMap2UpsertMaxI64x2 => {
+        Opcode::BatchStructMap2UpsertLast
+        | Opcode::BatchStructMap2UpsertMaxI64x2
+        | Opcode::BatchStructMap2UpsertMinI64x2 => {
             out(Effect::Pair {
                 slot: at(0)?,
                 col1: at(1)?,

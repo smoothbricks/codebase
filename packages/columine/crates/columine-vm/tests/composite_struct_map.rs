@@ -79,20 +79,15 @@ fn upsert_code(key1_col: u8, key2_col: u8, pairs: &[(u8, u8)]) -> Vec<u8> {
     code
 }
 
-fn max_i64x2_code(
+fn tuple_code(
+    op: Opcode,
     key1_col: u8,
     key2_col: u8,
     pairs: &[(u8, u8)],
     comparison1: (u8, u8),
     comparison2: (u8, u8),
 ) -> Vec<u8> {
-    let mut code = vec![
-        Opcode::BatchStructMap2UpsertMaxI64x2 as u8,
-        0,
-        key1_col,
-        key2_col,
-        pairs.len() as u8,
-    ];
+    let mut code = vec![op as u8, 0, key1_col, key2_col, pairs.len() as u8];
     for &(column, field) in pairs {
         code.extend([column, field]);
     }
@@ -129,7 +124,7 @@ fn permission(state: &[u8], principal: u32, resource: u32) -> Option<(u32, u32)>
     ))
 }
 
-fn max_winner(state: &[u8], key1: u32, key2: u32) -> Option<(u32, i64, i64)> {
+fn tuple_winner(state: &[u8], key1: u32, key2: u32) -> Option<(u32, i64, i64)> {
     let slot = StructMap2Slot::bind(state, 0);
     let row = pair_row(state, key1, key2)?;
     for field in 0..3 {
@@ -157,7 +152,8 @@ fn execute_u32(
     }
 }
 
-struct MaxI64x2Columns<'a> {
+#[derive(Clone, Copy)]
+struct TupleColumns<'a> {
     key1: &'a [u32],
     key2: &'a [u32],
     payload: &'a [u32],
@@ -165,14 +161,14 @@ struct MaxI64x2Columns<'a> {
     comparison2: &'a [i64],
 }
 
-fn execute_max_i64x2(
+fn execute_tuple(
     vm: &mut Vm,
     state: &mut [u8],
     program: &[u8],
-    columns: MaxI64x2Columns<'_>,
+    columns: TupleColumns<'_>,
     delta: bool,
 ) -> u32 {
-    let MaxI64x2Columns {
+    let TupleColumns {
         key1,
         key2,
         payload,
@@ -471,7 +467,14 @@ fn payload_free_graph_edges_and_unary_layout_remain_supported() {
 
 #[test]
 fn max_i64x2_uses_strict_signed_lexicographic_order_without_noop_undo() {
-    let reduce = max_i64x2_code(0, 1, &[(2, 0)], (3, 1), (4, 2));
+    let reduce = tuple_code(
+        Opcode::BatchStructMap2UpsertMaxI64x2,
+        0,
+        1,
+        &[(2, 0)],
+        (3, 1),
+        (4, 2),
+    );
     let program = map2_program(4, &[0, 1, 1], 5, &reduce);
     let mut state = init(&program);
     let mut vm = Vm::default();
@@ -483,11 +486,11 @@ fn max_i64x2_uses_strict_signed_lexicographic_order_without_noop_undo() {
     let comparison2 = [i64::MAX, i64::MIN, i64::MIN, 0, i64::MIN, i64::MIN];
     assert_eq!(
         OK,
-        execute_max_i64x2(
+        execute_tuple(
             &mut vm,
             &mut state,
             &program,
-            MaxI64x2Columns {
+            TupleColumns {
                 key1: &key1,
                 key2: &key2,
                 payload: &payload,
@@ -497,15 +500,15 @@ fn max_i64x2_uses_strict_signed_lexicographic_order_without_noop_undo() {
             false,
         )
     );
-    assert_eq!(max_winner(&state, 7, 40), Some((50, i64::MAX, i64::MIN)));
+    assert_eq!(tuple_winner(&state, 7, 40), Some((50, i64::MAX, i64::MIN)));
 
     assert_eq!(
         OK,
-        execute_max_i64x2(
+        execute_tuple(
             &mut vm,
             &mut state,
             &program,
-            MaxI64x2Columns {
+            TupleColumns {
                 key1: &[7],
                 key2: &[41],
                 payload: &[70],
@@ -515,7 +518,7 @@ fn max_i64x2_uses_strict_signed_lexicographic_order_without_noop_undo() {
             false,
         )
     );
-    assert_eq!(max_winner(&state, 7, 41), Some((70, -1, i64::MAX)));
+    assert_eq!(tuple_winner(&state, 7, 41), Some((70, -1, i64::MAX)));
 
     vm.undo_enable(&state).expect("valid inactive window");
     let before_noops = vm.undo_checkpoint();
@@ -523,11 +526,11 @@ fn max_i64x2_uses_strict_signed_lexicographic_order_without_noop_undo() {
     state[change_flags_offset] = 0;
     assert_eq!(
         OK,
-        execute_max_i64x2(
+        execute_tuple(
             &mut vm,
             &mut state,
             &program,
-            MaxI64x2Columns {
+            TupleColumns {
                 key1: &[7, 7],
                 key2: &[40, 40],
                 payload: &[80, 90],
@@ -539,15 +542,15 @@ fn max_i64x2_uses_strict_signed_lexicographic_order_without_noop_undo() {
     );
     assert_eq!(vm.undo_checkpoint(), before_noops);
     assert_eq!(state[change_flags_offset], 0);
-    assert_eq!(max_winner(&state, 7, 40), Some((50, i64::MAX, i64::MIN)));
+    assert_eq!(tuple_winner(&state, 7, 40), Some((50, i64::MAX, i64::MIN)));
 
     assert_eq!(
         OK,
-        execute_max_i64x2(
+        execute_tuple(
             &mut vm,
             &mut state,
             &program,
-            MaxI64x2Columns {
+            TupleColumns {
                 key1: &[7],
                 key2: &[40],
                 payload: &[100],
@@ -559,20 +562,20 @@ fn max_i64x2_uses_strict_signed_lexicographic_order_without_noop_undo() {
     );
     assert!(vm.undo_checkpoint() > before_noops);
     assert_ne!(state[change_flags_offset] & 0x02, 0);
-    assert_eq!(max_winner(&state, 7, 40), Some((100, i64::MAX, i64::MAX)));
+    assert_eq!(tuple_winner(&state, 7, 40), Some((100, i64::MAX, i64::MAX)));
     vm.undo_rollback(&mut state, before_noops)
         .expect("valid checkpoint");
-    assert_eq!(max_winner(&state, 7, 40), Some((50, i64::MAX, i64::MIN)));
+    assert_eq!(tuple_winner(&state, 7, 40), Some((50, i64::MAX, i64::MIN)));
 
     let checkpoint = state.clone();
     let mut fork = checkpoint.clone();
     assert_eq!(
         OK,
-        execute_max_i64x2(
+        execute_tuple(
             &mut vm,
             &mut fork,
             &program,
-            MaxI64x2Columns {
+            TupleColumns {
                 key1: &[7],
                 key2: &[41],
                 payload: &[71],
@@ -582,13 +585,20 @@ fn max_i64x2_uses_strict_signed_lexicographic_order_without_noop_undo() {
             false,
         )
     );
-    assert_eq!(max_winner(&fork, 7, 41), Some((71, 0, i64::MIN)));
-    assert_eq!(max_winner(&checkpoint, 7, 41), Some((70, -1, i64::MAX)));
+    assert_eq!(tuple_winner(&fork, 7, 41), Some((71, 0, i64::MIN)));
+    assert_eq!(tuple_winner(&checkpoint, 7, 41), Some((70, -1, i64::MAX)));
 }
 
 #[test]
 fn max_i64x2_body_dispatch_keeps_one_winner_per_exact_pair() {
-    let body = max_i64x2_code(1, 2, &[(3, 0)], (4, 1), (5, 2));
+    let body = tuple_code(
+        Opcode::BatchStructMap2UpsertMaxI64x2,
+        1,
+        2,
+        &[(3, 0)],
+        (4, 1),
+        (5, 2),
+    );
     let program = map2_program(4, &[0, 1, 1], 6, &for_each(ADD, &body));
     let mut state = init(&program);
     let mut vm = Vm::default();
@@ -610,22 +620,156 @@ fn max_i64x2_body_dispatch_keeps_one_winner_per_exact_pair() {
         OK,
         vm.execute_batch(&mut state, &program, &columns, types.len() as u32)
     );
-    assert_eq!(max_winner(&state, 3, 9), Some((30, -9, i64::MIN)));
+    assert_eq!(tuple_winner(&state, 3, 9), Some((30, -9, i64::MIN)));
+}
+
+#[test]
+fn min_i64x2_keeps_the_least_tuple_and_parts_from_max_exactly_on_distinct_tuples() {
+    // Pair (7, 40) sees four distinct tuples, neither extreme first or last;
+    // pair (7, 41) sees one tuple three times under different payloads.
+    let candidates = TupleColumns {
+        key1: &[7; 7],
+        key2: &[40, 40, 41, 40, 41, 40, 41],
+        payload: &[10, 20, 30, 40, 50, 60, 70],
+        comparison1: &[-5, i64::MIN, 3, i64::MAX, 3, -5, 3],
+        comparison2: &[0, i64::MAX, 3, i64::MIN, 3, -1, 3],
+    };
+    let mut vm = Vm::default();
+    let mut winners = Vec::new();
+    for op in [
+        Opcode::BatchStructMap2UpsertMaxI64x2,
+        Opcode::BatchStructMap2UpsertMinI64x2,
+    ] {
+        let program = map2_program(
+            4,
+            &[0, 1, 1],
+            5,
+            &tuple_code(op, 0, 1, &[(2, 0)], (3, 1), (4, 2)),
+        );
+        let mut state = init(&program);
+        assert_eq!(
+            OK,
+            execute_tuple(&mut vm, &mut state, &program, candidates, false)
+        );
+        winners.push((tuple_winner(&state, 7, 40), tuple_winner(&state, 7, 41)));
+    }
+    assert_eq!(winners[0].0, Some((40, i64::MAX, i64::MIN)));
+    assert_eq!(winners[1].0, Some((20, i64::MIN, i64::MAX)));
+    // One tuple seen three times: both picks keep its first row, so they agree.
+    assert_eq!(winners[0].1, Some((30, 3, 3)));
+    assert_eq!(winners[1].1, Some((30, 3, 3)));
+
+    // A candidate that is not strictly less writes nothing: no undo entry, no change flag.
+    let min = tuple_code(
+        Opcode::BatchStructMap2UpsertMinI64x2,
+        0,
+        1,
+        &[(2, 0)],
+        (3, 1),
+        (4, 2),
+    );
+    let program = map2_program(4, &[0, 1, 1], 5, &min);
+    let mut state = init(&program);
+    assert_eq!(
+        OK,
+        execute_tuple(&mut vm, &mut state, &program, candidates, false)
+    );
+    vm.undo_enable(&state).expect("valid inactive window");
+    let before_noops = vm.undo_checkpoint();
+    let change_flags_offset = (STATE_HEADER_SIZE + SlotMetaOffset::CHANGE_FLAGS) as usize;
+    state[change_flags_offset] = 0;
+    assert_eq!(
+        OK,
+        execute_tuple(
+            &mut vm,
+            &mut state,
+            &program,
+            TupleColumns {
+                key1: &[7, 7],
+                key2: &[40, 40],
+                payload: &[80, 90],
+                comparison1: &[i64::MAX, i64::MIN],
+                comparison2: &[i64::MAX, i64::MAX],
+            },
+            true,
+        )
+    );
+    assert_eq!(vm.undo_checkpoint(), before_noops);
+    assert_eq!(state[change_flags_offset], 0);
+    assert_eq!(tuple_winner(&state, 7, 40), Some((20, i64::MIN, i64::MAX)));
+    // A strictly less tuple replaces the row through the undo log.
+    assert_eq!(
+        OK,
+        execute_tuple(
+            &mut vm,
+            &mut state,
+            &program,
+            TupleColumns {
+                key1: &[7],
+                key2: &[40],
+                payload: &[100],
+                comparison1: &[i64::MIN],
+                comparison2: &[i64::MIN],
+            },
+            true,
+        )
+    );
+    assert!(vm.undo_checkpoint() > before_noops);
+    assert_ne!(state[change_flags_offset] & 0x02, 0);
+    assert_eq!(tuple_winner(&state, 7, 40), Some((100, i64::MIN, i64::MIN)));
+
+    // The FOR_EACH body keeps the least tuple among the rows its type admits.
+    let body = tuple_code(
+        Opcode::BatchStructMap2UpsertMinI64x2,
+        1,
+        2,
+        &[(3, 0)],
+        (4, 1),
+        (5, 2),
+    );
+    let program = map2_program(4, &[0, 1, 1], 6, &for_each(ADD, &body));
+    let mut state = init(&program);
+    let types = [ADD, REVOKE, ADD, ADD];
+    let key1 = [3, 3, 3, 3];
+    let key2 = [9, 9, 9, 9];
+    let payload = [10, 99, 20, 30];
+    let comparison1 = [-10, i64::MIN, -10, -9];
+    let comparison2 = [6, i64::MIN, 5, i64::MIN];
+    let columns = [
+        u32s_as_bytes(&types),
+        u32s_as_bytes(&key1),
+        u32s_as_bytes(&key2),
+        u32s_as_bytes(&payload),
+        i64s_as_bytes(&comparison1),
+        i64s_as_bytes(&comparison2),
+    ];
+    assert_eq!(
+        OK,
+        vm.execute_batch(&mut state, &program, &columns, types.len() as u32)
+    );
+    assert_eq!(tuple_winner(&state, 3, 9), Some((20, -10, 5)));
 }
 
 #[test]
 fn max_i64x2_rejected_batch_rolls_back_and_growth_rehashes_collisions() {
-    let reduce = max_i64x2_code(0, 1, &[(2, 0)], (3, 1), (4, 2));
+    let reduce = tuple_code(
+        Opcode::BatchStructMap2UpsertMaxI64x2,
+        0,
+        1,
+        &[(2, 0)],
+        (3, 1),
+        (4, 2),
+    );
     let program = map2_program(2, &[0, 1, 1], 5, &reduce);
     let mut state = init(&program);
     let mut vm = Vm::default();
     assert_eq!(
         OK,
-        execute_max_i64x2(
+        execute_tuple(
             &mut vm,
             &mut state,
             &program,
-            MaxI64x2Columns {
+            TupleColumns {
                 key1: &[9],
                 key2: &[1],
                 payload: &[10],
@@ -645,11 +789,11 @@ fn max_i64x2_rejected_batch_rolls_back_and_growth_rehashes_collisions() {
     let comparison2: Vec<i64> = (0..12).collect();
     assert_eq!(
         ErrorCode::NeedsGrowth as u32,
-        execute_max_i64x2(
+        execute_tuple(
             &mut vm,
             &mut state,
             &program,
-            MaxI64x2Columns {
+            TupleColumns {
                 key1: &key1,
                 key2: &key2,
                 payload: &payload,
@@ -661,7 +805,7 @@ fn max_i64x2_rejected_batch_rolls_back_and_growth_rehashes_collisions() {
     );
     vm.undo_rollback(&mut state, checkpoint)
         .expect("valid checkpoint");
-    assert_eq!(max_winner(&state, 9, 1), Some((10, 1, 1)));
+    assert_eq!(tuple_winner(&state, 9, 1), Some((10, 1, 1)));
     for second in 2..=12 {
         assert!(pair_row(&state, 9, second).is_none());
     }
@@ -682,11 +826,11 @@ fn max_i64x2_rejected_batch_rolls_back_and_growth_rehashes_collisions() {
     let (second1, second2) = collision.expect("two exact pairs collide before growth");
     assert_eq!(
         OK,
-        execute_max_i64x2(
+        execute_tuple(
             &mut vm,
             &mut state,
             &program,
-            MaxI64x2Columns {
+            TupleColumns {
                 key1: &[77, 77],
                 key2: &[second1, second2],
                 payload: &[201, 202],
@@ -701,7 +845,7 @@ fn max_i64x2_rejected_batch_rolls_back_and_growth_rehashes_collisions() {
     let mut grown = vec![0; grown_size as usize];
     grow_state(&state, &mut grown, 0).unwrap();
     assert_eq!(StructMap2Slot::bind(&grown, 0).capacity, old_capacity * 2);
-    assert_eq!(max_winner(&grown, 77, second1), Some((201, 3, 5)));
-    assert_eq!(max_winner(&grown, 77, second2), Some((202, 4, 6)));
-    assert_eq!(max_winner(&grown, 9, 1), Some((10, 1, 1)));
+    assert_eq!(tuple_winner(&grown, 77, second1), Some((201, 3, 5)));
+    assert_eq!(tuple_winner(&grown, 77, second2), Some((202, 4, 6)));
+    assert_eq!(tuple_winner(&grown, 9, 1), Some((10, 1, 1)));
 }

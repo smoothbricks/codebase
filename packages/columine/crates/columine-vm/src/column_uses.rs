@@ -32,7 +32,7 @@ use columine_types::types::{ErrorCode, NO_PARENT_TS_COL, Opcode, ProgramHeader, 
 
 use crate::meta::SlotMetaView;
 use crate::vm::{
-    body_op_len, decode_struct_map_upsert_operands, decode_struct_map2_max_i64x2_operands,
+    body_op_len, decode_struct_map_upsert_operands, decode_struct_map2_tuple_operands,
     decode_struct_map2_upsert_operands,
 };
 
@@ -350,8 +350,8 @@ fn walk_op(
         Opcode::BatchStructMap2UpsertLast => {
             struct_map2_reads(&decode_struct_map2_upsert_operands(code, pc + 1)?, visit);
         }
-        Opcode::BatchStructMap2UpsertMaxI64x2 => {
-            let operands = decode_struct_map2_max_i64x2_operands(code, pc + 1)?;
+        Opcode::BatchStructMap2UpsertMaxI64x2 | Opcode::BatchStructMap2UpsertMinI64x2 => {
+            let operands = decode_struct_map2_tuple_operands(code, pc + 1, op)?;
             struct_map2_reads(&operands.row, visit);
             cell(visit, operands.cmp1_col, ColumnUse::Read);
             cell(visit, operands.cmp2_col, ColumnUse::Read);
