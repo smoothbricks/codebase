@@ -269,6 +269,34 @@ impl<A: VoProgramAdmission> AdmittedProgram<A> {
         )
     }
 
+    /// Re-admit a batch that resumes after its bind: splice the derived
+    /// cells `rows` retained from this program's last bind over this batch
+    /// into `cols`, admit the selected VO frames over that spliced set, then
+    /// run `execute` on it. A resume must see the cells the paused run saw,
+    /// not a fresh bind over the state as it stands now. `rows` from another
+    /// table or another batch length is refused as `Rows(InvalidProgram)`,
+    /// before admission or execution.
+    pub fn execute_spliced<'a>(
+        &'a self,
+        cols: &mut [&'a [u8]],
+        batch_len: u32,
+        scratch: &mut ProgramScratch,
+        rows: &'a RowColumns,
+        execute: impl FnOnce(&[u8], &[&[u8]]) -> u32,
+    ) -> Result<u32, InputAdmissionError> {
+        rows.bound_for(&self.bytecode, batch_len)
+            .and_then(|()| rows.splice(cols))
+            .map_err(InputAdmissionError::Rows)?;
+        self.inputs.admit_and_execute(
+            &self.metadata,
+            &self.admission,
+            cols,
+            batch_len,
+            scratch,
+            |cols| execute(&self.bytecode, cols),
+        )
+    }
+
     /// Admit selected VO cells and counts templates before the VM touches any
     /// state; their schemas and counts roles were certified at load. Same-layout
     /// cells stay borrowed, while retained-writer projections are written from
@@ -648,6 +676,135 @@ mod tests {
                 |_, _, _, _| unreachable!("never run"),
             ),
             Err(InputAdmissionError::Rows(ErrorCode::InvalidProgram))
+        );
+    }
+
+    /// A resume re-admits over the derived cells its bind retained, not the
+    /// host's placeholder: the frame the bind's derived type selected is
+    /// shown to the capability again, and an unselected row runs on the
+    /// retained zero cell.
+    #[test]
+    fn a_resume_admits_over_the_retained_derived_cells() {
+        let program = admitted(&[FOR_EACH_TYPE]);
+        let offsets = cells(&[0, 2]);
+        let key = cells(&[5]);
+        let mut scratch = ProgramScratch::default();
+        let frame_refusal = Err(InputAdmissionError::Frame {
+            slot: 0,
+            field_idx: 0,
+            row: 0,
+            cause: VoRefusal::Admission(VoAdmissionError::Unavailable),
+        });
+
+        let types = cells(&[EVENT]);
+        let mut rows = RowColumns::new();
+        let mut cols: [&[u8]; 5] = [&types, &offsets, b"ab", &key, &[]];
+        let bound = program.execute_bound(
+            &mut [],
+            &mut cols,
+            1,
+            &mut scratch,
+            &mut Constant,
+            &mut rows,
+            |_, _, _, _| unreachable!("refused at admission"),
+        );
+        assert_eq!(bound, frame_refusal);
+        let mut resumed: [&[u8]; 5] = [&types, &offsets, b"ab", &key, &[]];
+        assert_eq!(
+            program.execute_spliced(&mut resumed, 1, &mut scratch, &rows, |_, _| {
+                unreachable!("refused at admission")
+            }),
+            frame_refusal,
+            "the resume admits the frame its bind selected"
+        );
+
+        let other = cells(&[EVENT + 1]);
+        let mut rows = RowColumns::new();
+        let mut cols: [&[u8]; 5] = [&other, &offsets, b"ab", &key, &[]];
+        assert_eq!(
+            program.execute_bound(
+                &mut [],
+                &mut cols,
+                1,
+                &mut scratch,
+                &mut Constant,
+                &mut rows,
+                |_, _, _, _| 1,
+            ),
+            Ok(1)
+        );
+        let mut resumed: [&[u8]; 5] = [&other, &offsets, b"ab", &key, &[]];
+        assert_eq!(
+            program.execute_spliced(&mut resumed, 1, &mut scratch, &rows, |_, cols| {
+                assert_eq!(cols[usize::from(DERIVED)], cells(&[0]).as_slice());
+                2
+            }),
+            Ok(2)
+        );
+    }
+
+    /// Cells that are not this program's completed bind over this batch
+    /// length are refused before admission: never bound, bound over another
+    /// length, or left by a failed bind.
+    #[test]
+    fn a_resume_refuses_cells_that_are_not_its_bind() {
+        let program = admitted(&[FOR_EACH_TYPE]);
+        let types = cells(&[EVENT + 1]);
+        let offsets = cells(&[0, 2]);
+        let key = cells(&[5]);
+        let mut scratch = ProgramScratch::default();
+        let refused = Err(InputAdmissionError::Rows(ErrorCode::InvalidProgram));
+        let never = |_: &[u8], _: &[&[u8]]| -> u32 { unreachable!("refused before admission") };
+
+        let fresh = RowColumns::new();
+        let mut cols: [&[u8]; 5] = [&types, &offsets, b"ab", &key, &[]];
+        assert_eq!(
+            program.execute_spliced(&mut cols, 1, &mut scratch, &fresh, never),
+            refused,
+            "never bound"
+        );
+
+        let mut rows = RowColumns::new();
+        let mut cols: [&[u8]; 5] = [&types, &offsets, b"ab", &key, &[]];
+        assert_eq!(
+            program.execute_bound(
+                &mut [],
+                &mut cols,
+                1,
+                &mut scratch,
+                &mut Constant,
+                &mut rows,
+                |_, _, _, _| 0,
+            ),
+            Ok(0)
+        );
+        let two = cells(&[EVENT + 1, EVENT + 1]);
+        let mut cols: [&[u8]; 5] = [&two, &offsets, b"ab", &key, &[]];
+        assert_eq!(
+            program.execute_spliced(&mut cols, 2, &mut scratch, &rows, never),
+            refused,
+            "bound over another batch length"
+        );
+
+        let failed = admitted(&[]);
+        let mut cols: [&[u8]; 5] = [&types, &offsets, b"ab", &key, &[]];
+        assert_eq!(
+            failed.execute_bound(
+                &mut [],
+                &mut cols,
+                1,
+                &mut scratch,
+                &mut Constant,
+                &mut rows,
+                |_, _, _, _| unreachable!("bind refused"),
+            ),
+            Err(InputAdmissionError::Rows(ErrorCode::InvalidProgram))
+        );
+        let mut cols: [&[u8]; 5] = [&types, &offsets, b"ab", &key, &[]];
+        assert_eq!(
+            program.execute_spliced(&mut cols, 1, &mut scratch, &rows, never),
+            refused,
+            "left by a failed bind"
         );
     }
 }

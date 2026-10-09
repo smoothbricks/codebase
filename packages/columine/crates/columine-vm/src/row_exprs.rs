@@ -157,6 +157,9 @@ pub struct RowColumns {
     live_index: Vec<u32>,
     type_col: u32,
     batch_len: u32,
+    /// Whether the last bind completed: a failed bind leaves partial cells
+    /// that no splice may hand out as that bind's.
+    bound: bool,
 }
 
 /// `live_index` value of a column no live entry targets.
@@ -195,7 +198,36 @@ impl RowColumns {
             live_index: Vec::new(),
             type_col: 0,
             batch_len: 0,
+            bound: false,
         }
+    }
+
+    /// Whether these are the cells of a completed bind of `program`'s table
+    /// over a batch of `batch_len` rows: the same type column and the same
+    /// entry targets in table order. A batch with no rows binds nothing, and
+    /// a program without a table needs no bind.
+    pub(crate) fn bound_for(&self, program: &[u8], batch_len: u32) -> Result<(), ErrorCode> {
+        let table = match row_table(program)? {
+            None if self.targets.is_empty() => return Ok(()),
+            Some(_) if batch_len == 0 && self.bound && self.targets.is_empty() => return Ok(()),
+            Some(table) if batch_len != 0 => table,
+            _ => return Err(ErrorCode::InvalidProgram),
+        };
+        let count = usize::from(bytes::read_u16(table, 4));
+        if !self.bound || self.batch_len != batch_len || self.targets.len() != count {
+            return Err(ErrorCode::InvalidProgram);
+        }
+        let mut header = Operands::at(table, TABLE_FIXED_BYTES);
+        if header.index() != Some(self.type_col) {
+            return Err(ErrorCode::InvalidProgram);
+        }
+        let mut pos = header.pos();
+        for &target in &self.targets {
+            if parse_entry(table, &mut pos)?.target_col != target {
+                return Err(ErrorCode::InvalidProgram);
+            }
+        }
+        Ok(())
     }
 
     /// Forget the last bind's live entries; the next bind records its own.
@@ -419,7 +451,9 @@ pub fn bind_row_columns<'a, 'e, E: RowExpression>(
     // must not leave the previous batch's targets or live entries behind.
     out.targets.clear();
     out.clear_live();
+    out.bound = false;
     let Some(table) = row_table(program)? else {
+        out.bound = true;
         return Ok(LiveColumns {
             rows: out,
             program,
@@ -429,6 +463,7 @@ pub fn bind_row_columns<'a, 'e, E: RowExpression>(
     // An empty batch carries no rows to derive and may carry no column
     // pointers at all; the reduce section reads nothing from it either.
     if batch_len == 0 {
+        out.bound = true;
         return Ok(LiveColumns {
             rows: out,
             program,
@@ -509,6 +544,7 @@ pub fn bind_row_columns<'a, 'e, E: RowExpression>(
         refuse_plain_reads_of_live_columns(program, state, out)?;
     }
 
+    out.bound = true;
     let bound: &'a RowColumns = out;
     bound.splice(cols)?;
     Ok(LiveColumns {
