@@ -28,6 +28,7 @@ use crate::struct_map::{
     ArenaRegion, StructMap2Slot, StructMapSlot, scalar_cell_encoded, scalar_cell_order_key,
     scalar_order_key,
 };
+use crate::ttl_plan::{TtlBatchPlan, TtlBatchScratch, consume_ttl_batch, prepare_ttl_batch};
 use crate::undo_log::{FLAT_UNDO_ENTRY_SIZE, FlatUndoEntry, FlatUndoOp};
 use bitmosaic::BitmosaicView;
 use columine_types::DEFAULT_ACCEPTED_PROGRAM_MAGICS;
@@ -5564,11 +5565,8 @@ impl Vm {
         u.entries.reserve(UNDO_CAPACITY as usize);
         u.capture_scratch.reserve(UNDO_CAPACITY as usize * 8);
         u.capture_ranges.reserve(UNDO_CAPACITY as usize);
-        u.ttl_batch_scratch.order.clear();
-        u.ttl_batch_scratch.commands.clear();
-        u.ttl_batch_scratch.generation = u.ttl_batch_scratch.generation.wrapping_add(1);
-        u.ttl_batch_scratch.order.reserve(UNDO_CAPACITY as usize);
-        u.ttl_batch_scratch.commands.reserve(UNDO_CAPACITY as usize);
+        u.ttl_batch_scratch.reset();
+        u.ttl_batch_scratch.reserve(UNDO_CAPACITY as usize);
         u.erase_scratch.ranges.clear();
         u.erase_scratch.ranges.reserve(UNDO_CAPACITY as usize);
         u.saved_change_flags.reserve(slots as usize + 1);
@@ -5617,9 +5615,7 @@ impl Vm {
         u.reserved_entries = 0;
         u.capture_scratch.clear();
         u.capture_ranges.clear();
-        u.ttl_batch_scratch.order.clear();
-        u.ttl_batch_scratch.commands.clear();
-        u.ttl_batch_scratch.generation = u.ttl_batch_scratch.generation.wrapping_add(1);
+        u.ttl_batch_scratch.reset();
         u.generation = u.generation.wrapping_add(1);
         u.entries.clear();
         u.redo.clear();
@@ -6205,256 +6201,4 @@ impl<'a> CheckedStructMap2<'a> {
         live_key_at(self.state, self.view.keys1_off, self.view.capacity, pos)?;
         Ok(self.view.row_off(pos))
     }
-}
-
-/// The single TTL planner retains references and ordered physical writes, never an
-/// encoded index image or a second family implementation.
-#[derive(Debug, Default)]
-struct TtlBatchScratch {
-    generation: u64,
-    order: Vec<TtlSource>,
-    commands: Vec<TtlCommand>,
-}
-
-#[derive(Clone, Copy, Debug)]
-enum TtlSource {
-    Original(u32),
-    Inserted(usize),
-}
-
-#[derive(Debug)]
-enum TtlCommand {
-    Move {
-        source: u32,
-        destination: u32,
-        len: u32,
-    },
-    Write {
-        position: u32,
-        timestamp: f64,
-        key: u32,
-        value: u32,
-    },
-}
-
-/// Consuming authority for one preflight TTL batch's retained commands.
-#[derive(Debug)]
-pub struct TtlBatchPlan {
-    generation: u64,
-    base: u32,
-    initial_size: u32,
-    final_size: u32,
-    ranges: [(u32, u32); 2],
-}
-
-impl TtlBatchPlan {
-    pub fn ranges(&self) -> &[(u32, u32); 2] {
-        &self.ranges
-    }
-}
-
-fn ttl_source_key(state: &[u8], base: u32, source: TtlSource, commands: &[TtlCommand]) -> u32 {
-    match source {
-        TtlSource::Original(index) => evict_key(state, base, index),
-        TtlSource::Inserted(index) => match commands[index] {
-            TtlCommand::Write { key, .. } => key,
-            TtlCommand::Move { .. } => unreachable!("insert source must name a retained write"),
-        },
-    }
-}
-
-fn ttl_source_timestamp(
-    state: &[u8],
-    base: u32,
-    source: TtlSource,
-    commands: &[TtlCommand],
-) -> f64 {
-    match source {
-        TtlSource::Original(index) => evict_ts(state, base, index),
-        TtlSource::Inserted(index) => match commands[index] {
-            TtlCommand::Write { timestamp, .. } => timestamp,
-            TtlCommand::Move { .. } => unreachable!("insert source must name a retained write"),
-        },
-    }
-}
-
-fn prepare_ttl_batch(
-    state: &[u8],
-    meta: &SlotMetaView,
-    mutations: impl IntoIterator<Item = crate::hooks::TtlMutation>,
-    scratch: &mut TtlBatchScratch,
-) -> Result<TtlBatchPlan, ErrorCode> {
-    let validated = crate::hooks::ttl_capture_ranges(state, meta, 0)?;
-    let base = meta.eviction_index_offset(state);
-    let initial_size = meta.eviction_index_size(state);
-    let capacity = meta.eviction_index_capacity(state);
-    scratch.order.clear();
-    scratch.commands.clear();
-    scratch.generation = scratch.generation.wrapping_add(1);
-    scratch
-        .order
-        .extend((0..initial_size).map(TtlSource::Original));
-    let mut first = u32::MAX;
-    let mut last = 0u32;
-    for mutation in mutations {
-        let key = match mutation {
-            crate::hooks::TtlMutation::Upsert { key, .. }
-            | crate::hooks::TtlMutation::Remove { key } => key,
-        };
-        let size = scratch.order.len();
-        let mut write = 0usize;
-        let mut last_move = None;
-        for read in 0..size {
-            let source = scratch.order[read];
-            if ttl_source_key(state, base, source, &scratch.commands) == key {
-                continue;
-            }
-            scratch.order[write] = source;
-            if read != write {
-                first = first.min(write as u32);
-                last = last.max(write as u32 + 1);
-                let merged = last_move.is_some_and(|index| {
-                    if let TtlCommand::Move {
-                        source,
-                        destination,
-                        len,
-                    } = &mut scratch.commands[index]
-                        && *source + *len == read as u32
-                        && *destination + *len == write as u32
-                    {
-                        *len += 1;
-                        true
-                    } else {
-                        false
-                    }
-                });
-                if !merged {
-                    last_move = Some(scratch.commands.len());
-                    scratch.commands.push(TtlCommand::Move {
-                        source: read as u32,
-                        destination: write as u32,
-                        len: 1,
-                    });
-                }
-            }
-            write += 1;
-        }
-        scratch.order.truncate(write);
-        if let crate::hooks::TtlMutation::Upsert {
-            key,
-            timestamp,
-            mapped_value,
-        } = mutation
-        {
-            if write as u32 >= capacity {
-                return Err(ErrorCode::CapacityExceeded);
-            }
-            let (mut left, mut right) = (0usize, write);
-            while left < right {
-                let middle = left + (right - left) / 2;
-                if ttl_source_timestamp(state, base, scratch.order[middle], &scratch.commands)
-                    < timestamp
-                {
-                    left = middle + 1;
-                } else {
-                    right = middle;
-                }
-            }
-            let position = left as u32;
-            first = first.min(position);
-            last = last.max(write as u32 + 1);
-            if left != write {
-                scratch.commands.push(TtlCommand::Move {
-                    source: position,
-                    destination: position + 1,
-                    len: write as u32 - position,
-                });
-            }
-            let inserted = scratch.commands.len();
-            scratch.commands.push(TtlCommand::Write {
-                position,
-                timestamp,
-                key,
-                value: mapped_value,
-            });
-            scratch.order.insert(left, TtlSource::Inserted(inserted));
-        }
-    }
-    let final_size = u32::try_from(scratch.order.len()).map_err(|_| ErrorCode::InvalidState)?;
-    let touched = if first == u32::MAX {
-        (0, 0)
-    } else {
-        let offset = base
-            .checked_add(
-                first
-                    .checked_mul(EVICTION_ENTRY_SIZE)
-                    .ok_or(ErrorCode::InvalidState)?,
-            )
-            .ok_or(ErrorCode::InvalidState)?;
-        let len = (last - first)
-            .checked_mul(EVICTION_ENTRY_SIZE)
-            .ok_or(ErrorCode::InvalidState)?;
-        if offset
-            .checked_add(len)
-            .is_none_or(|end| end as usize > state.len())
-        {
-            return Err(ErrorCode::InvalidState);
-        }
-        (offset, len)
-    };
-    Ok(TtlBatchPlan {
-        generation: scratch.generation,
-        base,
-        initial_size,
-        final_size,
-        ranges: [
-            (
-                validated[0].0,
-                if final_size != initial_size { 4 } else { 0 },
-            ),
-            touched,
-        ],
-    })
-}
-
-fn consume_ttl_batch(
-    state: &mut [u8],
-    meta: &SlotMetaView,
-    plan: TtlBatchPlan,
-    scratch: &mut TtlBatchScratch,
-) {
-    assert_eq!(
-        plan.generation, scratch.generation,
-        "TTL batch lost its retained commands"
-    );
-    assert_eq!(
-        meta.eviction_index_size(state),
-        plan.initial_size,
-        "TTL batch layout changed"
-    );
-    for command in &scratch.commands {
-        match *command {
-            TtlCommand::Move {
-                source,
-                destination,
-                len,
-            } => bytes::copy_within(
-                state,
-                plan.base + source * EVICTION_ENTRY_SIZE,
-                plan.base + destination * EVICTION_ENTRY_SIZE,
-                len * EVICTION_ENTRY_SIZE,
-            ),
-            TtlCommand::Write {
-                position,
-                timestamp,
-                key,
-                value,
-            } => evict_write(state, plan.base, position, timestamp, key, value),
-        }
-    }
-    if plan.final_size != plan.initial_size {
-        meta.set_eviction_index_size(state, plan.final_size);
-    }
-    scratch.order.clear();
-    scratch.commands.clear();
 }

@@ -49,5 +49,6 @@ pub mod row_exprs;
 pub mod slot_growth;
 pub mod state_init;
 pub mod struct_map;
+pub mod ttl_plan;
 pub mod undo_log;
 pub mod vm;

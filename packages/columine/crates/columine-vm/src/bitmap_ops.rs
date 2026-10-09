@@ -38,7 +38,7 @@ use crate::bitmap_ttl::{TtlAlgebraScratch, merge_expiries};
 use crate::hooks::{ByteCapture, TtlMutation, VmHooks};
 use crate::meta::SlotMetaView;
 use crate::state_init::bind_slot;
-use crate::vm::TtlBatchPlan;
+use crate::ttl_plan::TtlBatchPlan;
 use bitmosaic::{
     AndNotRange, AndRange, BatchOutcome, Bitmosaic, BitmosaicView, IMAGE_ID_LEN, KeyWidth, OrRange,
     PatchError, PatchReport, PatchScratch, PreparedPatch, Range, XorRange, image_header,

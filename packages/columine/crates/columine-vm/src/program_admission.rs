@@ -96,7 +96,7 @@ impl<A: VoProgramAdmission> AdmittedProgram<A> {
                     field_idx: link.field_idx,
                 });
             }
-            if declared_field(sections.init_code, link.slot, link.field_idx)
+            if declared_field(sections.init_code, link.slot, link.field_idx)?
                 != Some(StructFieldType::Vo)
             {
                 return Err(ProgramAdmissionError::UnexpectedSchema {
@@ -129,7 +129,7 @@ impl<A: VoProgramAdmission> AdmittedProgram<A> {
         let reduce_base = sections.reduce_code.as_ptr() as usize - bytecode.as_ptr() as usize;
         let mut found_roles = Vec::with_capacity(metadata.counts.len());
         visit_counts(sections.reduce_code, reduce_base, &mut |offset, op| {
-            if declared_field(sections.init_code, op.slot, op.field_idx)
+            if declared_field(sections.init_code, op.slot, op.field_idx)?
                 != Some(StructFieldType::Vo)
             {
                 return Err(ProgramAdmissionError::InvalidProgram(
@@ -363,16 +363,21 @@ fn visit_fields(
     ))
 }
 
-fn declared_field(init: &[u8], slot: u32, field_idx: u8) -> Option<StructFieldType> {
+/// The kind `slot`'s field `field_idx` declares, if any. An init section that
+/// does not decode keeps its own named refusal.
+fn declared_field(
+    init: &[u8],
+    slot: u32,
+    field_idx: u8,
+) -> Result<Option<StructFieldType>, ProgramAdmissionError> {
     let mut found = None;
     visit_fields(init, |declared_slot, declared_field, kind| {
         if declared_slot == slot && declared_field == field_idx {
             found = Some(kind);
         }
         Ok(())
-    })
-    .ok()?;
-    found
+    })?;
+    Ok(found)
 }
 
 fn visit_counts<'p>(

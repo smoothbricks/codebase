@@ -545,19 +545,32 @@ describe('Compact native results and lifecycle', () => {
     expect(mock.destroyCalls).toHaveLength(0);
   });
 
-  it('retries once with the exact native-reported Arrow capacity', () => {
-    const payload = new Uint8Array(5000);
-    payload.fill(0x5a);
-    const mock = createCompactMock({ capacityPayload: payload });
+  it('refuses a native capacity miss as an invariant error without retrying', () => {
+    const mock = createCompactMock({ capacityPayload: new Uint8Array(5000) });
     const backend = createParseCompactWasmBackend(mock.exports);
 
-    const result = backend.encode(batch(0, schema(), []));
-
-    expect(result).toEqual(payload);
-    expect(mock.compactCalls.map((call) => call.outputLen)).toEqual([
-      OUTPUT_HEADER_BYTES + 4096,
-      OUTPUT_HEADER_BYTES + payload.byteLength,
-    ]);
+    let thrown: unknown;
+    try {
+      backend.encode(batch(0, schema(), []));
+    } catch (error) {
+      thrown = error;
+    }
+    if (!(thrown instanceof CompactEncodingError)) {
+      throw new Error('Expected CompactEncodingError');
+    }
+    const compactError = thrown;
+    expect(compactError.status).toBe(3);
+    expect(compactError.code).toBe('ENCODE_ERROR');
+    expect(compactError.diagnostic).toEqual({
+      version: 1,
+      stage: 5,
+      detail: 0,
+      expectedType: 0,
+      actualType: 0,
+      fieldIndex: 0,
+      rowIndex: 0,
+    });
+    expect(mock.compactCalls).toHaveLength(1);
     expect(mock.destroyCalls).toHaveLength(0);
   });
 

@@ -66,21 +66,16 @@ function activeDataEnds(wasm: Uint8Array): number[] {
   return ends;
 }
 
-function hashMapsProgram(maps: number, capacity: number): Uint8Array {
-  const init: number[] = [];
-  const reduce: number[] = [];
-  for (let slot = 0; slot < maps; slot++) {
-    init.push(Opcode.SLOT_DEF, slot, SlotType.HASHMAP, capacity & 0xff, capacity >> 8);
-    reduce.push(Opcode.BATCH_MAP_UPSERT_LAST, slot, 0, 1);
-  }
+/** A program: `init` defines its slots and `reduce` runs once per batch. */
+function program(init: readonly number[], reduce: readonly number[], numSlots: number, numInputs: number): Uint8Array {
   const initCode = new Uint8Array([...init, Opcode.HALT]);
   const reduceCode = new Uint8Array([...reduce, Opcode.HALT]);
   const bytes = new Uint8Array(PROGRAM_HASH_PREFIX + HEADER_SIZE + initCode.length + reduceCode.length);
   bytes.set(
     encodeProgramHeader({
       magic: PROGRAM_MAGIC,
-      numSlots: maps,
-      numInputs: 2,
+      numSlots,
+      numInputs,
       initCodeLength: initCode.length,
       reduceCodeLength: reduceCode.length,
     }),
@@ -89,6 +84,16 @@ function hashMapsProgram(maps: number, capacity: number): Uint8Array {
   bytes.set(initCode, PROGRAM_HASH_PREFIX + HEADER_SIZE);
   bytes.set(reduceCode, PROGRAM_HASH_PREFIX + HEADER_SIZE + initCode.length);
   return bytes;
+}
+
+function hashMapsProgram(maps: number, capacity: number): Uint8Array {
+  const init: number[] = [];
+  const reduce: number[] = [];
+  for (let slot = 0; slot < maps; slot++) {
+    init.push(Opcode.SLOT_DEF, slot, SlotType.HASHMAP, capacity & 0xff, capacity >> 8);
+    reduce.push(Opcode.BATCH_MAP_UPSERT_LAST, slot, 0, 1);
+  }
+  return program(init, reduce, maps, 2);
 }
 
 function utf8Schema(): EncodedArrowSchema {
@@ -212,5 +217,67 @@ describe('host-owned WASM region on the real artifacts', () => {
 
     const restored = backend.deserialize(reducer, backend.serialize(state, reducer));
     expect(backend.mapGet(restored, reducer, maps - 1, 2)).toStrictEqual({ ok: true, value: 20 });
+  });
+
+  it('re-uploads the state when growth moves the region past pages native allocation appended', async () => {
+    const backend = await createColumineWasmBackend(await Bun.file(WASM_PATH).arrayBuffer());
+    // Slot 0 grows under automatic NEEDS_GROWTH from capacity 8. Slot 1 pads the
+    // state so a grown image outweighs the batch's working set. Native bitmap work
+    // in slot 2 grows the Rust heap, appending pages past the region, so growing
+    // slot 0 reserves past them and the region moves.
+    const reducer = await backend.loadProgram(
+      program(
+        [
+          Opcode.SLOT_DEF,
+          0,
+          SlotType.HASHMAP,
+          8,
+          0,
+          Opcode.SLOT_DEF,
+          1,
+          SlotType.HASHMAP,
+          0x00,
+          0x40,
+          Opcode.SLOT_DEF,
+          2,
+          SlotType.BITMAP,
+          0x00,
+          0x40,
+        ],
+        [Opcode.BATCH_BITMAP_ADD, 2, 0, Opcode.BATCH_MAP_UPSERT_LAST, 0, 0, 1],
+        3,
+        2,
+      ),
+    );
+    const state = backend.createState(reducer);
+    const rounds = 6;
+    const perRound = 40_000;
+    const total = rounds * perRound;
+    for (let round = 0; round < rounds; round++) {
+      // Distinct and nonzero across every round.
+      const base = round * perRound;
+      const keys = Uint32Array.from({ length: perRound }, (_, index) => base + index + 1);
+      const values = Uint32Array.from(keys, (key) => key * 2);
+      expect(
+        backend.executeBatch(
+          state,
+          reducer,
+          [
+            { data: keys, type: ValueType.UINT32 },
+            { data: values, type: ValueType.UINT32 },
+          ],
+          perRound,
+        ),
+      ).toBe(ErrorCode.OK);
+    }
+
+    expect(backend.getMapSize(state, reducer, 0)).toBe(total);
+    // First and last keys of the first and last rounds, staged before and after the moves.
+    for (const key of [1, perRound, total - perRound + 1, total]) {
+      expect(backend.mapGet(state, reducer, 0, key)).toStrictEqual({ ok: true, value: key * 2 });
+      expect(backend.setContains(state, reducer, 2, key)).toStrictEqual({ ok: true, value: true });
+    }
+    expect(backend.mapGet(state, reducer, 0, total + 1)).toStrictEqual({ ok: true, value: undefined });
+    expect(backend.setContains(state, reducer, 2, total + 1)).toStrictEqual({ ok: true, value: false });
   });
 });

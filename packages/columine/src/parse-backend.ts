@@ -293,7 +293,6 @@ export class CompactEncodingError extends Error {
   constructor(
     readonly status: number,
     readonly diagnostic: CompactDiagnostic | null,
-    message?: string,
   ) {
     const code = compactStatusCode(status);
     const diagnosticMessage =
@@ -301,7 +300,7 @@ export class CompactEncodingError extends Error {
         ? ''
         : ` (detail=${diagnostic.detail}, field=${diagnostic.fieldIndex}, row=${diagnostic.rowIndex}, ` +
           `expectedType=${diagnostic.expectedType}, actualType=${diagnostic.actualType})`;
-    super(message ?? `ep_compact failed with ${code} (${status})${diagnosticMessage}`);
+    super(`ep_compact failed with ${code} (${status})${diagnosticMessage}`);
     this.name = 'CompactEncodingError';
     this.code = code;
   }
@@ -1102,9 +1101,7 @@ export function createParseCompactWasmBackend(wasm: EventProcessorWasmExports): 
       assertOpen();
       validateCompactBatch(batch);
       const layout = planCompactMemoryLayout(batch);
-      let outputLength = layout.outputLength;
-      let arrowCapacity = layout.arrowCapacity;
-      let base = region.reserve(layout.outputOffset + outputLength);
+      const base = region.reserve(layout.outputOffset + layout.outputLength);
 
       let handle: number;
       if (cachedHandle && schemaMatches(cachedHandle, batch.schema)) {
@@ -1130,81 +1127,52 @@ export function createParseCompactWasmBackend(wasm: EventProcessorWasmExports): 
       }
 
       writeCompactBatch(wasm.memory.buffer, base + layout.batchOffset, layout, batch);
-      let retriedForCapacity = false;
-      for (;;) {
-        const batchPtr = base + layout.batchOffset;
-        const outputPtr = base + layout.outputOffset;
-        new Uint8Array(wasm.memory.buffer, outputPtr, WASM_OUTPUT_HEADER_SIZE).fill(0);
-        let result: number;
-        try {
-          result = wasm.ep_compact(handle, batchPtr, layout.batchLength, outputPtr, outputLength);
-        } catch (error) {
-          destroyCachedHandle();
-          throw error;
-        }
-
-        const view = new DataView(wasm.memory.buffer);
-        const headerStatus = view.getUint32(outputPtr, true);
-        if (result !== headerStatus) {
-          destroyCachedHandle();
-          throw new Error(`ep_compact returned status ${result} but wrote result-header status ${headerStatus}`);
-        }
-
-        const arrowOffset = view.getUint32(outputPtr + 4, true);
-        const arrowLen = view.getUint32(outputPtr + 8, true);
-        if (result !== RESULT_OK) {
-          if (
-            !retriedForCapacity &&
-            result === 3 &&
-            arrowOffset === WASM_OUTPUT_HEADER_SIZE &&
-            arrowLen > arrowCapacity
-          ) {
-            if (arrowLen > MAX_BATCH_OUTPUT_BYTES) {
-              throw new CompactEncodingError(
-                result,
-                readCompactDiagnostic(view, outputPtr),
-                `ep_compact requires ${formatBytes(arrowLen)}, exceeding ${formatBytes(MAX_BATCH_OUTPUT_BYTES)}`,
-              );
-            }
-            retriedForCapacity = true;
-            arrowCapacity = Math.max(MIN_COMPACT_ARROW_CAPACITY, arrowLen);
-            outputLength = checkedAdd(WASM_OUTPUT_HEADER_SIZE, arrowCapacity, 'Compact retry output buffer');
-            // A larger output may move the region past pages the attempt's
-            // native allocation appended; a move carries no bytes, so the
-            // packed batch is staged again at the new base.
-            const grown = region.reserve(layout.outputOffset + outputLength);
-            if (grown !== base) {
-              base = grown;
-              writeCompactBatch(wasm.memory.buffer, base + layout.batchOffset, layout, batch);
-            }
-            continue;
-          }
-          throw new CompactEncodingError(result, readCompactDiagnostic(view, outputPtr));
-        }
-
-        const rowsEncoded = view.getUint32(outputPtr + 12, true);
-        const duplicates = view.getUint32(outputPtr + 16, true);
-        const arrowStart = checkedAdd(outputPtr, arrowOffset, 'Compact Arrow start');
-        const arrowEnd = checkedAdd(arrowStart, arrowLen, 'Compact Arrow end');
-        const outputEnd = checkedAdd(outputPtr, outputLength, 'Compact output end');
-        if (
-          arrowOffset !== WASM_OUTPUT_HEADER_SIZE ||
-          rowsEncoded !== batch.rowCount ||
-          duplicates !== 0 ||
-          arrowLen > arrowCapacity ||
-          arrowEnd > outputEnd
-        ) {
-          destroyCachedHandle();
-          throw new Error(
-            'ep_compact produced an invalid success header: ' +
-              `offset=${arrowOffset}, len=${arrowLen}, rows=${rowsEncoded}, duplicates=${duplicates}`,
-          );
-        }
-
-        const arrowIpc = new Uint8Array(arrowLen);
-        arrowIpc.set(new Uint8Array(wasm.memory.buffer, arrowStart, arrowLen));
-        return arrowIpc;
+      const batchPtr = base + layout.batchOffset;
+      const outputPtr = base + layout.outputOffset;
+      new Uint8Array(wasm.memory.buffer, outputPtr, WASM_OUTPUT_HEADER_SIZE).fill(0);
+      let result: number;
+      try {
+        result = wasm.ep_compact(handle, batchPtr, layout.batchLength, outputPtr, layout.outputLength);
+      } catch (error) {
+        destroyCachedHandle();
+        throw error;
       }
+
+      const view = new DataView(wasm.memory.buffer);
+      const headerStatus = view.getUint32(outputPtr, true);
+      if (result !== headerStatus) {
+        destroyCachedHandle();
+        throw new Error(`ep_compact returned status ${result} but wrote result-header status ${headerStatus}`);
+      }
+
+      if (result !== RESULT_OK) {
+        throw new CompactEncodingError(result, readCompactDiagnostic(view, outputPtr));
+      }
+
+      const arrowOffset = view.getUint32(outputPtr + 4, true);
+      const arrowLen = view.getUint32(outputPtr + 8, true);
+      const rowsEncoded = view.getUint32(outputPtr + 12, true);
+      const duplicates = view.getUint32(outputPtr + 16, true);
+      const arrowStart = checkedAdd(outputPtr, arrowOffset, 'Compact Arrow start');
+      const arrowEnd = checkedAdd(arrowStart, arrowLen, 'Compact Arrow end');
+      const outputEnd = checkedAdd(outputPtr, layout.outputLength, 'Compact output end');
+      if (
+        arrowOffset !== WASM_OUTPUT_HEADER_SIZE ||
+        rowsEncoded !== batch.rowCount ||
+        duplicates !== 0 ||
+        arrowLen > layout.arrowCapacity ||
+        arrowEnd > outputEnd
+      ) {
+        destroyCachedHandle();
+        throw new Error(
+          'ep_compact produced an invalid success header: ' +
+            `offset=${arrowOffset}, len=${arrowLen}, rows=${rowsEncoded}, duplicates=${duplicates}`,
+        );
+      }
+
+      const arrowIpc = new Uint8Array(arrowLen);
+      arrowIpc.set(new Uint8Array(wasm.memory.buffer, arrowStart, arrowLen));
+      return arrowIpc;
     },
 
     dispose(): void {

@@ -12,6 +12,12 @@
 //! census counts every heap allocation the timed call makes, so a steady path
 //! that allocates is visible as a number rather than a suspicion.
 //!
+//! A third table times TTL bitmap algebra (`OR` of two TTL bitmaps through
+//! `Vm::bitmap_algebra`) at N = 1K..16K members: every expiry changes, one
+//! expiry changes, and every expiry changes over an index carrying NaN
+//! timestamps (the exact replay plan). Per-member cost must stay flat as N
+//! doubles.
+//!
 //! Run: `cargo bench -p columine-vm --bench bitmap_cells`.
 
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -24,11 +30,13 @@ use columine_types::types::{
     SlotMetaOffset, SlotType, StateHeaderOffset,
 };
 use columine_vm::bitmap_ops::{
-    BitmapEnv, batch_bitmap_add, batch_bitmap_remove, bitmap_payload_capacity, get_bitmap_storage,
-    intersect_count_serialized,
+    BitmapAlgebraOp, BitmapEnv, BitmapSource, batch_bitmap_add, batch_bitmap_remove,
+    bitmap_payload_capacity, get_bitmap_storage, intersect_count_serialized,
 };
 use columine_vm::hooks::NoVm;
 use columine_vm::meta::SlotMetaView;
+use columine_vm::state_init::{DEFAULT_ACCEPTED_PROGRAM_MAGICS, calculate_state_size, init_state};
+use columine_vm::vm::{Vm, f64s_as_bytes, u32s_as_bytes};
 
 struct Counting;
 
@@ -422,5 +430,124 @@ fn main() {
             left.len(),
             right.len()
         );
+    }
+
+    ttl_algebra_cells();
+}
+
+/// A program of two TTL bitmaps of `capacity`; its reduce section is `reduce`.
+fn ttl_bitmaps_program(capacity: u16, reduce: &[u8]) -> Vec<u8> {
+    use columine_types::PROGRAM_MAGIC;
+    use columine_types::types::Opcode;
+    let mut init = Vec::new();
+    for slot in 0..2u8 {
+        let [lo, hi] = capacity.to_le_bytes();
+        init.extend([
+            Opcode::SlotDef as u8,
+            slot,
+            SlotType::Bitmap as u8 | 0x10,
+            lo,
+            hi,
+        ]);
+        init.extend(3600.0f32.to_le_bytes());
+        init.extend(0.0f32.to_le_bytes());
+        init.extend([1, 0]);
+    }
+    init.push(Opcode::Halt as u8);
+    let mut program = vec![0u8; 32];
+    program.extend(PROGRAM_MAGIC.to_le_bytes());
+    program.extend([2, 0, 0, 0]);
+    program.extend(2u32.to_le_bytes());
+    program.extend(2u32.to_le_bytes());
+    program.extend((init.len() as u32).to_le_bytes());
+    program.extend((reduce.len() as u32).to_le_bytes());
+    program.extend(init);
+    program.extend_from_slice(reduce);
+    program
+}
+
+/// Two TTL bitmaps seeded through the real `BATCH_SET_INSERT_TTL` opcode.
+fn ttl_pair(n: u32, target: &[f64], source: &[f64]) -> Vec<u8> {
+    use columine_types::types::Opcode;
+    let capacity = u16::try_from(n).expect("bench N fits a slot capacity");
+    let layout = ttl_bitmaps_program(capacity, &[]);
+    let size = calculate_state_size(&layout, DEFAULT_ACCEPTED_PROGRAM_MAGICS)
+        .expect("valid program admission");
+    let mut state = vec![0u8; size as usize];
+    init_state(&mut state, &layout, DEFAULT_ACCEPTED_PROGRAM_MAGICS).expect("init");
+    let keys: Vec<u32> = (0..n).collect();
+    let mut vm = Vm::default();
+    for (slot, stamps) in [(0u8, target), (1u8, source)] {
+        let insert = ttl_bitmaps_program(capacity, &[Opcode::BatchSetInsertTtl as u8, slot, 0, 1]);
+        let cols = [u32s_as_bytes(&keys), f64s_as_bytes(stamps)];
+        assert_eq!(
+            vm.execute_batch(&mut state, &insert, &cols, n),
+            ErrorCode::Ok as u32
+        );
+    }
+    state
+}
+
+fn ttl_algebra_cells() {
+    println!();
+    println!("| ttl algebra (OR) | N | wall (mean) | per member | allocs |");
+    println!("| --- | --- | --- | --- | --- |");
+    for (name, change_all, nan) in [
+        ("all expiries change", true, false),
+        ("one expiry changes", false, false),
+        ("all change, NaN in index", true, true),
+    ] {
+        for n in [1024u32, 2048, 4096, 8192, 16384] {
+            let target: Vec<f64> = (0..n)
+                .map(|i| {
+                    if nan && i % 64 == 0 {
+                        f64::NAN
+                    } else {
+                        f64::from(i)
+                    }
+                })
+                .collect();
+            let source: Vec<f64> = (0..n)
+                .map(|i| {
+                    if change_all || i == n / 2 {
+                        f64::from(i + n)
+                    } else {
+                        f64::from(i)
+                    }
+                })
+                .collect();
+            let seeded = ttl_pair(n, &target, &source);
+            let mut vm = Vm::default();
+            let mut work = seeded.clone();
+            let mut run = |work: &mut Vec<u8>| -> (u128, usize) {
+                work.copy_from_slice(&seeded);
+                let a0 = ALLOCS.load(Ordering::Relaxed);
+                let t0 = Instant::now();
+                let r =
+                    vm.bitmap_algebra(false, BitmapAlgebraOp::Or, work, 0, BitmapSource::Slot(1));
+                let dt = t0.elapsed().as_nanos();
+                assert_eq!(r, ErrorCode::Ok);
+                (dt, ALLOCS.load(Ordering::Relaxed) - a0)
+            };
+            for _ in 0..3 {
+                run(&mut work);
+            }
+            let iters = 20u32;
+            let (mut total, mut allocs) = (0u128, 0usize);
+            for _ in 0..iters {
+                let (dt, a) = run(&mut work);
+                total += dt;
+                allocs += a;
+            }
+            let mean = total as f64 / f64::from(iters);
+            println!(
+                "| {} | {} | {:.1} µs | {:.1} ns | {} |",
+                name,
+                n,
+                mean / 1000.0,
+                mean / f64::from(n),
+                allocs / iters as usize
+            );
+        }
     }
 }

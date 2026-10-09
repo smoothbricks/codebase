@@ -120,13 +120,13 @@ pub trait VmHooks {
         state: &[u8],
         meta: &SlotMetaView,
         mutations: impl IntoIterator<Item = TtlMutation>,
-    ) -> Result<crate::vm::TtlBatchPlan, ErrorCode>;
+    ) -> Result<crate::ttl_plan::TtlBatchPlan, ErrorCode>;
 
     fn consume_ttl_batch_plan(
         &mut self,
         state: &mut [u8],
         meta: &SlotMetaView,
-        plan: crate::vm::TtlBatchPlan,
+        plan: crate::ttl_plan::TtlBatchPlan,
     );
 }
 
@@ -180,7 +180,7 @@ impl VmHooks for NoVm {
         _state: &[u8],
         _meta: &SlotMetaView,
         _mutations: impl IntoIterator<Item = TtlMutation>,
-    ) -> Result<crate::vm::TtlBatchPlan, ErrorCode> {
+    ) -> Result<crate::ttl_plan::TtlBatchPlan, ErrorCode> {
         unreachable!("TTL plan requires the VM eviction environment")
     }
 
@@ -188,7 +188,7 @@ impl VmHooks for NoVm {
         &mut self,
         _state: &mut [u8],
         _meta: &SlotMetaView,
-        _plan: crate::vm::TtlBatchPlan,
+        _plan: crate::ttl_plan::TtlBatchPlan,
     ) {
         unreachable!("TTL plan requires the VM eviction environment")
     }

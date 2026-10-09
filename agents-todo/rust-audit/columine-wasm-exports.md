@@ -181,6 +181,12 @@ hand JS typed arrays would write into wasm memory once at ingest.
 
 ### F4 — HIGH — STRUCTURE — Memory map and Runtime singleton are unenforced; debug overlap probe is dead
 
+Status: the memory-map half is resolved. Both wasm artifacts now take linker-derived initial memory (only
+`--max-memory=268435456` is pinned), and both TS hosts stage every working set in a `WasmHostRegion`
+(`src/wasm-memory-contract.ts`) that starts at the memory's byte length at instantiation and moves past pages native
+allocation appends. The fixed 64 KiB state offset, the 9 MiB parse reserve, the unused imported memory and
+`debug-memory.ts` are gone. The evidence below records the layout as audited. The `RUNTIME` singleton half stands.
+
 Evidence: `packages/columine/crates/columine-wasm/build.rs:1-13` (+
 `packages/columine/src/wasm-backend.ts:37-38,283-287` + `packages/columine/src/__tests__/debug-memory.ts:4-46` +
 `packages/columine/crates/columine-wasm/src/lib.rs:33-67`)
@@ -356,6 +362,10 @@ a tiny `wasm-host.ts`). Route wasm-backend growth through `ensureWasmMemoryForWo
 used by both checklists (or generate both checklists from the F1 table). Cost/Risk: wasm-backend currently grows past
 the parse cap until the engine's max-memory trap; unifying on the contract is a behavior change for oversized reduce
 states (fail closed instead of trap).
+
+Status: the host half is resolved. Both hosts import `loadWasmBytes` and `align8` from `wasm-memory-contract.ts` and
+reserve through `WasmHostRegion.reserve`, capped at `WASM_MAX_PAGES`; `ensureWasmMemoryForWorkingSet` no longer exists.
+The duplicated checklist section parser stands.
 
 ### F8 — LOW — TESTS — Guards cannot catch the ABI drift this slice is for
 
