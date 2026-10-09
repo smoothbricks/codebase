@@ -248,6 +248,7 @@ pub struct AdoptArgs {
     pub capacity: Option<OsString>,
     pub repo_id: Option<OsString>,
     pub quarantine: bool,
+    pub re_adopt: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -699,6 +700,7 @@ fn cli_command() -> ClapCommand {
             value("capacity"),
             value("repo-id"),
             flag("quarantine"),
+            flag("re-adopt"),
         ]))
         .subcommand(leaf("setup").args([
             flag("uninstall"),
@@ -1645,6 +1647,7 @@ fn parse_adopt(matches: &ArgMatches) -> Result<Command, UsageError> {
         capacity: os(matches, "capacity"),
         repo_id: os(matches, "repo-id"),
         quarantine: flagged(matches, "quarantine"),
+        re_adopt: flagged(matches, "re-adopt"),
     }))
 }
 
@@ -1658,6 +1661,7 @@ const ADOPT: CommandSpec = CommandSpec {
         "Converts an existing checkout into this repository's image-backed main workspace, at the same path. Run it once per repository; every other verb finds its project from the cwd or `--project`. Adoption is the only operation that copies a source tree into an image, and one of only two commands that may create host storage — so the first adopt on a host may raise one administrator prompt while the cowshed volumes are created, and no ordinary command ever can.",
         "`cowshed setup` is the other, and the one every storage error points at: it repairs a host without needing a checkout to adopt. Reach for adopt when you have a repository to bring in, and for setup when the machine itself is wrong.",
         "The secret gate runs before anything changes. A refusal names every offending file and prints the exact controller-owned `waivers.json` path plus a valid entry example. Entries carry an exact repository-relative `path` and a non-empty `reason`. Only intentionally committed synthetic or public detector fixtures that can never hold live credentials may be waived — never live, temporary, copied, developer-local, deployment, or recoverable credentials. A waiver unblocks adoption while every waived finding stays retained for audit.",
+        "Default adopt is idempotent. `--re-adopt` explicitly replaces an adopted main through a durable, verified copy into a fresh sparse RAW image. It retains the old backing image and the original `.pre-cowshed` tree, carries the entire checkout and Git state, and preserves the warm build volume's identity. Use it for a format transition or guest-space reclamation; run outside the checkout with no source or build-volume holders.",
     ],
     options: &[
         Opt {
@@ -1671,6 +1675,10 @@ const ADOPT: CommandSpec = CommandSpec {
         Opt {
             spelling: "--quarantine",
             meaning: "move detected secret files into the project's quarantine instead of refusing the adopt",
+        },
+        Opt {
+            spelling: "--re-adopt",
+            meaning: "replace an adopted main by verified re-adoption, retaining its old backing image and full Git/build state",
         },
     ],
 };

@@ -58,8 +58,27 @@ pub fn copy_leaf(source: &Path, destination: &Path) -> io::Result<LeafMaterializ
                 Err(remove) if remove.kind() == io::ErrorKind::NotFound => {}
                 Err(remove) => return Err(remove),
             }
-            copyfile(source, destination, COPYFILE_ALL | libc::COPYFILE_NOFOLLOW)
-                .map(|()| LeafMaterialization::Copied)
+            use std::os::unix::fs::MetadataExt;
+            let metadata = std::fs::symlink_metadata(source)?;
+            let sparse =
+                if metadata.is_file() && metadata.blocks().saturating_mul(512) < metadata.len() {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    let file = std::fs::OpenOptions::new()
+                        .read(true)
+                        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                        .open(source)?;
+                    super::has_holes(&file, metadata.len())?
+                } else {
+                    false
+                };
+            let flags = if sparse {
+                // Omitting COPYFILE_DATA makes an unsupported sparse copy refuse instead of
+                // silently materializing the source's holes (copyfile(3)).
+                libc::COPYFILE_METADATA | libc::COPYFILE_DATA_SPARSE | libc::COPYFILE_NOFOLLOW
+            } else {
+                COPYFILE_ALL | libc::COPYFILE_NOFOLLOW
+            };
+            copyfile(source, destination, flags).map(|()| LeafMaterialization::Copied)
         }
         Err(error) => Err(error),
     }

@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use crate::device::{DISKUTIL, container_of, identifier_depth};
 
-/// The disk-image driver's detach interface. Creation and attachment of ASIF images use
+/// The disk-image driver's detach interface. Creation and attachment of RAW images use
 /// `diskutil image`; releasing an owned image goes directly through `hdiutil detach`. Which
 /// images are attached is read from the kernel ([`CommandRunner::attached_disk_images`]), never
 /// from `hdiutil info`.
@@ -160,17 +160,13 @@ pub trait CommandRunner {
     /// release that never happened and lost a mounted workspace's identity on restart. The
     /// kernel's matching snapshot is taken under the registry's own consistency check.
     fn attached_disk_images(&self) -> io::Result<Vec<AttachedDiskImage>>;
-    /// Grow a detached ASIF image's virtual disk to `capacity` by rewriting the one header field
-    /// that records it, and nothing else.
+    /// Grow a detached RAW image's virtual disk to `capacity` by extending its file, and nothing
+    /// else: the file's length is the virtual capacity, and no header is rewritten.
     ///
-    /// `diskutil image resize` grows the same field, but on an image whose APFS container spans
-    /// the whole device (no partition map, so `--image-only` is refused) it also attaches the
-    /// image itself to grow the filesystem, then detaches it: an attachment no image lease,
-    /// ownership proof or raw pin covers, which reported `ENOENT` after completing while other
-    /// resizes ran. Growing the header here leaves the container to cowshed's own verified
-    /// attachment ([`ApfsBackend::grow_container`]). Measured on macOS 26: a successful
-    /// `--image-only` resize changes exactly the header's sector count, and an image grown that
-    /// way attaches at the new size and its container grows to fill it.
+    /// `diskutil image resize` is not used: on an image whose container spans the whole device it
+    /// also attaches the image outside any image lease, ownership proof or raw pin. The container
+    /// inside grows afterwards through cowshed's own verified attachment
+    /// ([`ApfsBackend::grow_container`]).
     ///
     /// Recording runners script or refuse it explicitly; production never falls back to diskutil.
     fn grow_image(&self, image: &Path, capacity: ImageCapacity) -> io::Result<()>;
@@ -311,175 +307,73 @@ impl CommandRunner for SystemCommandRunner {
     fn grow_image(&self, image: &Path, capacity: ImageCapacity) -> io::Result<()> {
         #[cfg(target_os = "macos")]
         {
-            asif::grow(image, capacity)
+            raw::grow(image, capacity)
         }
         #[cfg(not(target_os = "macos"))]
         {
             let _ = (image, capacity);
             Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                "ASIF images exist only on macOS",
+                "RAW disk images exist only on macOS",
             ))
         }
     }
 }
 
-/// ASIF version-1 header reads and growth: the fields used are all big-endian (huven/asif-format,
-/// "ASIF binary specification", header version 1; Apple publishes no layout) — the `shdw` magic
-/// at 0x00, the version at 0x04, the header length at 0x08, the virtual disk's 512-byte sector
-/// count at 0x30 and the largest sector count the image accepts at 0x38. Directories and tables
-/// are sized from the maximum, never from the current count, so growing within the maximum
-/// changes nothing but the count — measured: Apple's own `--image-only` grow changes exactly those
-/// eight bytes.
+/// A RAW image's virtual capacity is its file length. Growth extends the detached sparse file;
+/// there is no outer image header or allocation map to decode.
 #[cfg(target_os = "macos")]
-mod asif {
+mod raw {
     use crate::metadata::ImageCapacity;
     use std::fs::{File, OpenOptions};
     use std::io;
-    use std::os::unix::fs::{FileExt, OpenOptionsExt};
+    use std::os::unix::fs::OpenOptionsExt;
     use std::path::Path;
 
-    pub(super) const MAGIC: [u8; 4] = *b"shdw";
-    pub(super) const MAGIC_AT: u64 = 0x00;
-    pub(super) const VERSION: u32 = 1;
-    pub(super) const VERSION_AT: u64 = 0x04;
-    pub(super) const HEADER_LENGTH: u32 = 0x200;
-    pub(super) const HEADER_LENGTH_AT: u64 = 0x08;
-    pub(super) const SECTOR_COUNT_AT: u64 = 0x30;
-    pub(super) const MAX_SECTOR_COUNT_AT: u64 = 0x38;
     const SECTOR_BYTES: u64 = 512;
-    /// `diskutil image resize` rounds every size to this block; a grow never asks for less.
     const GROW_BLOCK: u64 = 4096;
 
-    /// The header fields a grow decides from, as read from the image.
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    pub(super) struct Header {
-        pub(super) magic: [u8; 4],
-        pub(super) version: u32,
-        pub(super) length: u32,
-        pub(super) sector_count: u64,
-        pub(super) max_sector_count: u64,
+    fn file_capacity(file: &File) -> io::Result<ImageCapacity> {
+        let metadata = file.metadata()?;
+        let length = metadata.len();
+        if !metadata.is_file() || length == 0 || !length.is_multiple_of(SECTOR_BYTES) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "a RAW image must be a nonempty regular file aligned to 512-byte sectors",
+            ));
+        }
+        Ok(ImageCapacity::from_bytes(length))
     }
 
-    impl Header {
-        /// Positional reads of exactly the fields used; a short file is `UnexpectedEof`.
-        pub(super) fn read(file: &File) -> io::Result<Self> {
-            fn field<const N: usize>(file: &File, at: u64) -> io::Result<[u8; N]> {
-                let mut bytes = [0; N];
-                file.read_exact_at(&mut bytes, at)?;
-                Ok(bytes)
-            }
-            Ok(Self {
-                magic: field(file, MAGIC_AT)?,
-                version: u32::from_be_bytes(field(file, VERSION_AT)?),
-                length: u32::from_be_bytes(field(file, HEADER_LENGTH_AT)?),
-                sector_count: u64::from_be_bytes(field(file, SECTOR_COUNT_AT)?),
-                max_sector_count: u64::from_be_bytes(field(file, MAX_SECTOR_COUNT_AT)?),
-            })
-        }
-
-        /// Why this header is not one cowshed reads or writes: no `shdw` magic, or a version or
-        /// header length other than the measured version-1 layout.
-        fn recognized(&self) -> io::Result<()> {
-            if self.magic != MAGIC {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "not an ASIF image: the header has no `shdw` magic",
-                ));
-            }
-            if self.version != VERSION || self.length != HEADER_LENGTH {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "unrecognized ASIF header: version {}, length {:#x}; expected \
-                         {VERSION}, {HEADER_LENGTH:#x}",
-                        self.version, self.length
-                    ),
-                ));
-            }
-            Ok(())
-        }
-
-        /// The virtual disk's size as the header records it.
-        pub(super) fn capacity(&self) -> io::Result<ImageCapacity> {
-            self.recognized()?;
-            Ok(ImageCapacity::from_bytes(
-                self.sector_count.saturating_mul(SECTOR_BYTES),
-            ))
-        }
-
-        /// The sector count growing this image to `capacity` writes, or why it is refused: an
-        /// unrecognized header, a size off the 4 KiB grid, one that does not grow, or one past
-        /// the image's own maximum. Pure; nothing is written unless this answers.
-        pub(super) fn grown_sector_count(&self, capacity: ImageCapacity) -> io::Result<u64> {
-            self.recognized()?;
-            let bytes = capacity.bytes();
-            if !bytes.is_multiple_of(GROW_BLOCK) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("{capacity} is not a whole number of {GROW_BLOCK}-byte blocks"),
-                ));
-            }
-            let requested = bytes / SECTOR_BYTES;
-            if requested <= self.sector_count || requested > self.max_sector_count {
-                let size =
-                    |sectors: u64| ImageCapacity::from_bytes(sectors.saturating_mul(SECTOR_BYTES));
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!(
-                        "{capacity} must exceed the image's {} and stay within its {} maximum",
-                        size(self.sector_count),
-                        size(self.max_sector_count)
-                    ),
-                ));
-            }
-            Ok(requested)
-        }
-    }
-
-    /// The capacity an image's header records, read without a lock: the image driver holds an
-    /// attached image's file under `O_EXLOCK`, and a lock-free read neither waits on nor disturbs
-    /// it. Only [`grow`] changes the count, and only while the image is detached, so an attached
-    /// image's header is the size it was attached at.
-    ///
-    /// This replaces `diskutil image resize --plist`, whose `current` is the same count: every
-    /// `diskutil image` verb first waits on StorageKit's host-wide disk resync, which measured
-    /// 2.5–8.2 s per call under the parallel real-APFS suite for an eight-byte read.
     pub(super) fn capacity(image: &Path) -> io::Result<ImageCapacity> {
         let file = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(image)?;
-        Header::read(&file)?.capacity()
+        file_capacity(&file)
     }
 
-    /// Rewrite a detached image's eight-byte sector count in place, and nothing else.
-    ///
-    /// The image driver holds an attached image's file under an exclusive lock (01_storage.md: a
-    /// second `O_SHLOCK`/`O_EXLOCK` open fails with `EAGAIN`), so the non-blocking `O_EXLOCK`
-    /// open is the detached precondition itself: any attachment — cowshed's, one another tool
-    /// made, another user's — refuses it with `EWOULDBLOCK` instead of being raced, and holding
-    /// the lock keeps every attach out until the write is durable. The power-loss flush comes
-    /// before the descriptor closes: the container grows on top of this size once the image is
-    /// attached again, and a lost count beneath a grown container would describe a smaller disk
-    /// than the filesystem on it.
+    /// The nonblocking exclusive open refuses any attached image and keeps attachment excluded
+    /// until the larger file length is power-loss durable. Extending a file preserves its holes.
     pub(super) fn grow(image: &Path, capacity: ImageCapacity) -> io::Result<()> {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .custom_flags(libc::O_EXLOCK | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(image)?;
-        let grown = Header::read(&file)?.grown_sector_count(capacity)?;
-        file.write_all_at(&grown.to_be_bytes(), SECTOR_COUNT_AT)?;
+        let current = file_capacity(&file)?;
+        if !capacity.bytes().is_multiple_of(GROW_BLOCK) || capacity.bytes() <= current.bytes() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "{capacity} must exceed {current} and be aligned to {GROW_BLOCK}-byte blocks"
+                ),
+            ));
+        }
+        file.set_len(capacity.bytes())?;
         crate::fsio::Durability::PowerLoss.sync_file(&file)
     }
 }
-
-/// Whether a detached ASIF image's map describes a whole image: what [`ApfsBackend::clone_image`]
-/// proves of its source, under the same held descriptor it clones from, before anything is
-/// cloned.
-#[cfg(any(target_os = "macos", test))]
-mod asif_consistency;
 
 /// The lock file of one image identity:
 /// `/private/tmp/cowshed-apfs-image-leases-<euid>/<sha256(identity bytes)>.lock`.
@@ -823,7 +717,7 @@ pub(crate) fn apfs_step_leg(image: &Path) -> &'static str {
     }
 }
 
-/// A blank ASIF image holding one case-sensitive APFS volume, staged at `staged_stem.asif`.
+/// A blank RAW image holding one case-sensitive APFS volume, staged at `staged_stem.dmg`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CreateImageRequest {
     /// Staged path without an image extension, e.g. `.staging/main`.
@@ -883,6 +777,57 @@ impl AttachedImage {
             .lock()
             .expect("attachment pin mutex poisoned")
             .take();
+    }
+}
+
+/// A path named by a validated explicit re-adoption record, not another runtime image format.
+/// Ordinary operations still accept only RAW. This token enables identity inspection and
+/// read-only retained attachment, never image creation or growth.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RetainedInput<'a> {
+    path: &'a Path,
+}
+
+impl<'a> RetainedInput<'a> {
+    pub(crate) fn from_record(
+        source: &'a crate::storage::recovery::ReAdoptSource,
+        path: &'a Path,
+    ) -> crate::Result<Self> {
+        source.validate()?;
+        let named = path == source.image.original.as_path()
+            || path == source.image.retained.as_path()
+            || source.build.as_ref().is_some_and(|build| {
+                path == build.image.original.as_path() || path == build.image.retained.as_path()
+            })
+            || source
+                .old_seeds
+                .iter()
+                .any(|seed| path == seed.original.as_path() || path == seed.retained.as_path());
+        if !named {
+            return Err(crate::CowshedError::integrity(
+                format!(
+                    "{} is not an input named by this re-adoption record",
+                    path.display()
+                ),
+                "keep the source images and repair the replacement record",
+            ));
+        }
+        Ok(Self { path })
+    }
+
+    pub(crate) fn path(&self) -> &'a Path {
+        self.path
+    }
+}
+
+/// Retained inputs expose no writable-mount capability. Only this module can obtain the inner
+/// attachment; callers use its read-only mount and non-forced release methods.
+#[derive(Debug)]
+pub(crate) struct RetainedAttachment(AttachedImage);
+
+impl RetainedAttachment {
+    pub(crate) fn volume_device(&self) -> &str {
+        self.0.volume_device()
     }
 }
 
@@ -1000,17 +945,9 @@ pub enum CloneFileError {
         destination: PathBuf,
     },
     UnsupportedPlatform,
-    /// The source's backing file is locked by an attachment: the image driver holds an attached
-    /// image's file under an exclusive lock, and a clone of it would copy whatever mix of map
-    /// generations its write-back has reached. Refused, never captured.
+    /// A detached capture was requested, but an image driver still holds the source inode.
     SourceAttached {
         source: PathBuf,
-    },
-    /// The detached source's ASIF map does not describe a whole image (`error` names how), so
-    /// a clone of it would publish the tear.
-    SourceInconsistent {
-        source: PathBuf,
-        error: io::Error,
     },
     Io {
         source_path: PathBuf,
@@ -1044,12 +981,7 @@ impl fmt::Display for CloneFileError {
             Self::UnsupportedPlatform => write!(f, "clonefile is available only on macOS"),
             Self::SourceAttached { source } => write!(
                 f,
-                "{} is attached, and an attached image is never cloned: detach it first",
-                source.display()
-            ),
-            Self::SourceInconsistent { source, error } => write!(
-                f,
-                "{} is not a consistent ASIF image, so it was not cloned: {error}",
+                "{} is attached, but this capture requires a detached source",
                 source.display()
             ),
             Self::Io {
@@ -1071,7 +1003,6 @@ impl std::error::Error for CloneFileError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io { source, .. } => Some(source),
-            Self::SourceInconsistent { error, .. } => Some(error),
             _ => None,
         }
     }
@@ -1157,7 +1088,7 @@ pub enum ApfsError {
         source: io::Error,
     },
     Clone(CloneFileError),
-    AsifCreationAndCleanupFailed {
+    ImageCreationAndCleanupFailed {
         primary: Box<ApfsError>,
         detach: Option<Box<ApfsError>>,
         remove: Option<Box<ApfsError>>,
@@ -1286,12 +1217,12 @@ impl fmt::Display for ApfsError {
                 source,
             } => write!(f, "{} {} failed: {}", operation, path.display(), source),
             Self::Clone(error) => error.fmt(f),
-            Self::AsifCreationAndCleanupFailed {
+            Self::ImageCreationAndCleanupFailed {
                 primary,
                 detach,
                 remove,
             } => {
-                write!(f, "ASIF creation failed: {primary}")?;
+                write!(f, "RAW image creation failed: {primary}")?;
                 if let Some(detach) = detach {
                     write!(f, "; detach cleanup failed: {detach}")?;
                 }
@@ -1346,7 +1277,7 @@ impl std::error::Error for ApfsError {
             Self::FileOperation { source, .. } => Some(source),
             Self::Clone(error) => Some(error),
             Self::VerificationAndDetachFailed { detach, .. } => Some(detach),
-            Self::AsifCreationAndCleanupFailed { primary, .. } => Some(primary),
+            Self::ImageCreationAndCleanupFailed { primary, .. } => Some(primary),
             Self::AttachmentCleanupFailed { primary, .. } => Some(primary),
             Self::CaptureSourceBusy { refusal, .. } => Some(refusal),
             _ => None,
@@ -1366,9 +1297,17 @@ impl From<CloneFileError> for ApfsError {
     }
 }
 
+/// Source images may be captured live; immutable templates and build seeds are captured only
+/// while their source inode is held against attachment (specs/cowshed/16_build_volumes.md).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ImageCapture {
+    Live,
+    Detached,
+}
+
 pub trait ApfsBackend {
     fn create_staged_image(&self, request: &CreateImageRequest) -> Result<PathBuf, ApfsError>;
-    /// Write the blank, unattached ASIF file `staged_stem.asif` and nothing else: the one step
+    /// Write the blank, unattached sparse RAW file `staged_stem.dmg` and nothing else: the one step
     /// of creation that needs no attachment, so a crash inside it leaves only a staging file.
     fn create_blank_image(&self, request: &CreateImageRequest) -> Result<PathBuf, ApfsError>;
     /// Attach the blank image at `image`, format its one case-sensitive APFS volume, and hand
@@ -1382,28 +1321,25 @@ pub trait ApfsBackend {
     ) -> Result<AttachedImage, ApfsError>;
     /// Push the latest writes of a source still in use into its image file: its volume when
     /// `mount_point` is mounted, then the image file itself. What the flushed file's modification
-    /// time then says is current; the file is still attached, and an attached image is never a
-    /// clone source ([`Self::clone_image`] refuses it).
+    /// time then says is current. Live source captures may follow the flush; build-state captures
+    /// still require detached writer exclusion.
     ///
     /// Only the source is flushed. The host-wide `sync(8)` this replaces also waited for every
     /// other mounted volume's dirty data — measured at 16 s, and at 39 s inside a fork under a
     /// host with dozens of workspaces building, against 3–676 ms for the source volume alone.
     fn sync_for_freshness(&self, image: &Path, mount_point: Option<&Path>)
     -> Result<(), ApfsError>;
-    /// Clone the detached image `source` to `destination`, which must not exist. Every image
-    /// clone goes through here.
-    ///
-    /// The source is opened once, without following a symlink, under a non-blocking shared lock.
-    /// The image driver holds an attached image's file under an exclusive lock, so that open is
-    /// the detached precondition: an attached source is refused as
-    /// [`CloneFileError::SourceAttached`] — a clone of a file the driver is still writing back
-    /// can capture a map from one generation over tables and chunks from another — and while
-    /// the lock is held no attach can begin. Shared, not exclusive, so captures of one source
-    /// (mints of one template, forks of one seed) never refuse each other. Through that one
-    /// descriptor the source is flushed, its ASIF map validated
-    /// ([`CloneFileError::SourceInconsistent`]) and cloned (`fclonefileat`): no path is
-    /// resolved again, so nothing swapped in after the open can be what is cloned.
-    fn clone_image(&self, source: &Path, destination: &Path) -> Result<(), CloneFileError>;
+    /// Descriptor-clone `source` to a destination that must not exist. Open the source once,
+    /// without following symlinks, and flush that descriptor before cloning. A detached capture
+    /// additionally holds a nonblocking shared lock excluding image attachment; live source
+    /// captures do not change the source's attachment or mount state. The cloned APFS volume is
+    /// verified before its first mount.
+    fn clone_image(
+        &self,
+        source: &Path,
+        destination: &Path,
+        capture: ImageCapture,
+    ) -> Result<(), CloneFileError>;
     fn rename_volume(&self, mount_point: &Path, volume_name: &str) -> Result<(), ApfsError>;
     fn attach_verified(&self, image: &Path) -> Result<AttachedImage, ApfsError>;
     fn mount(
@@ -1415,8 +1351,7 @@ pub trait ApfsBackend {
     ) -> Result<(), ApfsError>;
     fn detach(&self, attachment: &AttachedImage, intent: DetachIntent) -> Result<(), ApfsError>;
     fn delete_image(&self, image: &Path) -> Result<(), ApfsError>;
-    /// The capacity an image's ASIF header records. Spawns nothing: the header is the record
-    /// `diskutil image resize --plist` itself reports from.
+    /// The capacity a RAW image's file length records. Spawns nothing: the length is the record.
     fn image_capacity(&self, image: &Path) -> Result<ImageCapacity, ApfsError>;
     /// Grow a detached image's virtual disk to `capacity`. Only the image grows: the container
     /// inside it grows afterwards through an owned, verified attachment ([`Self::grow_container`]).
@@ -1509,7 +1444,8 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
     /// was replaced under it) still owns each of its devices, and releasing them one by one has to
     /// get past this check.
     fn require_attached_mapping(&self, attachment: &AttachedImage) -> Result<(), ApfsError> {
-        let actual = self.recovered_image_attachments(&attachment.image)?;
+        let image = attachment_inventory_path(&attachment.image)?;
+        let actual = image_attachments(&image, &self.attached_disk_images()?)?;
         if actual.iter().any(|held| {
             matches!(held, RecoveredImageAttachment::Apfs(held)
                 if held.whole_device == attachment.whole_device
@@ -1633,6 +1569,7 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
         &self,
         image: &Path,
         before: &BTreeSet<String>,
+        intent: DetachIntent,
     ) -> Result<(), AttachmentCleanupFailure> {
         let after =
             self.attached_whole_devices(image)
@@ -1644,9 +1581,7 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
         let new_devices: BTreeSet<_> = after.difference(before).cloned().collect();
         let mut detach = Vec::new();
         for device in &new_devices {
-            if let Err(error) =
-                self.detach_image_device_unlocked(image, device, DetachIntent::Release)
-            {
+            if let Err(error) = self.detach_image_device_unlocked(image, device, intent) {
                 detach.push(AttachmentDetachFailure {
                     device: device.clone(),
                     error: Box::new(error),
@@ -1681,8 +1616,9 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
         image: &Path,
         before: &BTreeSet<String>,
         primary: ApfsError,
+        intent: DetachIntent,
     ) -> ApfsError {
-        match self.cleanup_new_attachments(image, before) {
+        match self.cleanup_new_attachments(image, before, intent) {
             Ok(()) => primary,
             Err(cleanup) => ApfsError::AttachmentCleanupFailed {
                 image: image.to_owned(),
@@ -1692,14 +1628,14 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
         }
     }
 
-    fn failed_asif_attachment(
+    fn failed_image_attachment(
         &self,
         path: &Path,
         before: &BTreeSet<String>,
         primary: ApfsError,
     ) -> ApfsError {
-        match self.cleanup_new_attachments(path, before) {
-            Ok(()) => self.cleanup_failed_asif(path, primary),
+        match self.cleanup_new_attachments(path, before, DetachIntent::Release) {
+            Ok(()) => self.cleanup_failed_image(path, primary),
             Err(cleanup) => ApfsError::AttachmentCleanupFailed {
                 image: path.to_owned(),
                 primary: Box::new(primary),
@@ -1827,10 +1763,10 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
         Ok(())
     }
 
-    /// Create a blank ASIF image, attach it without mounting, and format its whole device as one
+    /// Create a blank sparse RAW image, attach it without mounting, and format its whole device as one
     /// case-sensitive APFS volume (`newfs_apfs -e`) owned by the invoking user (`-U`/`-G`).
     /// Nothing here runs as root.
-    fn create_asif(&self, path: &Path, request: &CreateImageRequest) -> Result<(), ApfsError> {
+    fn create_raw(&self, path: &Path, request: &CreateImageRequest) -> Result<(), ApfsError> {
         validate_image_path(path)?;
         let _lease = self.image_lease(path)?;
         self.create_blank_unlocked(path, request)?;
@@ -1851,7 +1787,7 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
                 OsString::from("create"),
                 OsString::from("blank"),
                 OsString::from("--format"),
-                OsString::from("ASIF"),
+                OsString::from("RAW"),
                 OsString::from("--size"),
                 OsString::from(capacity_argument(request.capacity)),
                 OsString::from("--volumeName"),
@@ -1862,7 +1798,7 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
             ],
         );
         timed_apfs_step(apfs_step_leg(path), "blank-create", || {
-            self.run_checked("create ASIF image", create)
+            self.run_checked("create sparse RAW image", create)
         })
         .map(|_| ())
     }
@@ -1888,17 +1824,17 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
             ],
         );
         let output = match timed_apfs_step(apfs_step_leg(path), "blank-attach", || {
-            self.run_checked("attach blank ASIF image", attach)
+            self.run_checked("attach blank RAW image", attach)
         }) {
             Ok(output) => output,
             Err(primary) => {
-                return Err(self.failed_asif_attachment(path, &attached_before, primary));
+                return Err(self.failed_image_attachment(path, &attached_before, primary));
             }
         };
-        let whole_device = match parse_blank_asif_whole_device(&output.stdout) {
+        let whole_device = match parse_blank_image_whole_device(&output.stdout) {
             Ok(device) => device,
             Err(primary) => {
-                return Err(self.failed_asif_attachment(path, &attached_before, primary));
+                return Err(self.failed_image_attachment(path, &attached_before, primary));
             }
         };
         self.require_blank_attachment(path, &whole_device)?;
@@ -1916,7 +1852,7 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
             ],
         );
         if let Err(primary) = timed_apfs_step(apfs_step_leg(path), "format", || {
-            self.run_checked("format ASIF APFS volume", format)
+            self.run_checked("format RAW APFS volume", format)
         }) {
             return Err(self.release_failed_format(path, &whole_device, primary));
         }
@@ -1931,8 +1867,8 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
         primary: ApfsError,
     ) -> ApfsError {
         match self.detach_image_device_unlocked(path, whole_device, DetachIntent::Release) {
-            Ok(()) => self.cleanup_failed_asif(path, primary),
-            Err(detach) => ApfsError::AsifCreationAndCleanupFailed {
+            Ok(()) => self.cleanup_failed_image(path, primary),
+            Err(detach) => ApfsError::ImageCreationAndCleanupFailed {
                 primary: Box::new(primary),
                 detach: Some(Box::new(detach)),
                 remove: None,
@@ -1979,12 +1915,12 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
         Ok(attachment)
     }
 
-    fn cleanup_failed_asif(&self, path: &Path, primary: ApfsError) -> ApfsError {
+    fn cleanup_failed_image(&self, path: &Path, primary: ApfsError) -> ApfsError {
         let remove = match fs::remove_file(path) {
             Ok(()) => None,
             Err(error) if error.kind() == io::ErrorKind::NotFound => None,
             Err(source) => Some(ApfsError::FileOperation {
-                operation: "remove failed ASIF image",
+                operation: "remove failed RAW image",
                 path: path.to_owned(),
                 source,
             }),
@@ -1992,7 +1928,7 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
         if remove.is_none() {
             primary
         } else {
-            ApfsError::AsifCreationAndCleanupFailed {
+            ApfsError::ImageCreationAndCleanupFailed {
                 primary: Box::new(primary),
                 detach: None,
                 remove: remove.map(Box::new),
@@ -2091,30 +2027,35 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
 
     /// Attach `image` without mounting it, answering the volume and container the attach itself
     /// reports ([`attached_apfs_volume`]). No Disk Arbitration query follows the attach.
-    fn attach_without_mounting(&self, image: &Path) -> Result<AttachedImage, ApfsError> {
-        validate_image_path(image)?;
+    fn attach_without_mounting(
+        &self,
+        image: &Path,
+        access: MountAccess,
+        cleanup: DetachIntent,
+    ) -> Result<AttachedImage, ApfsError> {
         let attached_before = self.refuse_second_attach(image)?;
         let request = CommandRequest::new(
             DISKUTIL,
-            [
-                OsString::from("image"),
-                OsString::from("attach"),
-                OsString::from("--nobrowse"),
-                OsString::from("--noMount"),
-                OsString::from("--plist"),
-                image.as_os_str().to_owned(),
-            ],
+            [OsString::from("image"), OsString::from("attach")]
+                .into_iter()
+                .chain((access == MountAccess::ReadOnly).then(|| OsString::from("--readOnly")))
+                .chain([
+                    OsString::from("--nobrowse"),
+                    OsString::from("--noMount"),
+                    OsString::from("--plist"),
+                    image.as_os_str().to_owned(),
+                ]),
         );
         let output = match self.run_checked("attach image without mounting", request) {
             Ok(output) => output,
             Err(primary) => {
-                return Err(self.failed_attachment(image, &attached_before, primary));
+                return Err(self.failed_attachment(image, &attached_before, primary, cleanup));
             }
         };
         let (whole_device, volume_device) = match parse_attachment_plist(&output.stdout) {
             Ok(attachment) => attachment,
             Err(primary) => {
-                return Err(self.failed_attachment(image, &attached_before, primary));
+                return Err(self.failed_attachment(image, &attached_before, primary, cleanup));
             }
         };
         Ok(AttachedImage {
@@ -2123,6 +2064,124 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
             volume_device,
             pin: std::sync::Mutex::new(None),
         })
+    }
+
+    fn verify_attachment(
+        &self,
+        image: &Path,
+        access: MountAccess,
+        cleanup: DetachIntent,
+    ) -> Result<AttachedImage, ApfsError> {
+        let leg = apfs_step_leg(image);
+        let (mut attachment, request, output, pin) = {
+            let _lease = self.image_lease(image)?;
+            let mut retried_lost_device = false;
+            loop {
+                let attachment = timed_apfs_step(leg, "attach", || {
+                    self.attach_without_mounting(image, access, cleanup)
+                })?;
+                // A raw descriptor pins the actual IOMedia from identity verification
+                // through fsck; its ownership is handed to the attachment until mount.
+                let pin = match self.pin_attached_volume(&attachment) {
+                    Ok(pin) => pin,
+                    Err(error)
+                        if !retried_lost_device
+                            && matches!(
+                                &error,
+                                ApfsError::InvalidAttachmentInventory(_)
+                                    | ApfsError::FileOperation {
+                                        operation: "pin attached APFS volume against device reuse",
+                                        ..
+                                    }
+                            )
+                            && self.attached_whole_devices(image)?.is_empty() =>
+                    {
+                        retried_lost_device = true;
+                        eprintln!(
+                            "cowshed: apfs {} lost its reported device before verification ({error}); attaching once more",
+                            image.display()
+                        );
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
+                let request = CommandRequest::new(
+                    FSCK_APFS,
+                    [
+                        OsString::from("-q"),
+                        OsString::from(raw_device_from(&attachment.volume_device)),
+                    ],
+                );
+                let output = timed_apfs_step(leg, "fsck", || self.runner.run(&request.clone()))?;
+                break (attachment, request, output, pin);
+            }
+        };
+        if output.succeeded() {
+            *attachment
+                .pin
+                .get_mut()
+                .expect("attachment pin mutex poisoned") = pin;
+            return Ok(attachment);
+        }
+        drop(pin);
+
+        match self.detach(&attachment, cleanup) {
+            Ok(()) => Err(ApfsError::VerificationFailed { request, output }),
+            Err(detach) => Err(ApfsError::VerificationAndDetachFailed {
+                request,
+                verification: output,
+                detach: Box::new(detach),
+            }),
+        }
+    }
+
+    pub(crate) fn existing_retained_attachment(
+        &self,
+        input: &RetainedInput<'_>,
+    ) -> Result<Option<RetainedAttachment>, ApfsError> {
+        let image = attachment_inventory_path(input.path())?;
+        match existing_image_attachment(&image, &self.attached_disk_images()?)? {
+            None => Ok(None),
+            Some(RecoveredImageAttachment::Apfs(attachment)) => {
+                Ok(Some(RetainedAttachment(attachment)))
+            }
+            Some(RecoveredImageAttachment::Unformatted { image, .. }) => {
+                Err(ApfsError::InvalidAttachmentInventory(format!(
+                    "{} is still unformatted; a retained filesystem input requires APFS",
+                    image.display(),
+                )))
+            }
+        }
+    }
+
+    pub(crate) fn attach_retained_verified(
+        &self,
+        input: &RetainedInput<'_>,
+    ) -> Result<RetainedAttachment, ApfsError> {
+        self.verify_attachment(input.path(), MountAccess::ReadOnly, DetachIntent::WhenIdle)
+            .map(RetainedAttachment)
+    }
+
+    pub(crate) fn mount_retained_read_only(
+        &self,
+        attachment: &RetainedAttachment,
+        mount: &Path,
+    ) -> Result<(), ApfsError> {
+        self.mount(&attachment.0, mount, MountAccess::ReadOnly, false)
+    }
+
+    pub(crate) fn unmount_retained_when_idle(
+        &self,
+        attachment: &RetainedAttachment,
+    ) -> Result<(), ApfsError> {
+        self.unmount_verified(&attachment.0, DetachIntent::WhenIdle)
+    }
+
+    pub(crate) fn detach_retained_when_idle(
+        &self,
+        attachment: &RetainedAttachment,
+    ) -> Result<(), ApfsError> {
+        self.detach(&attachment.0, DetachIntent::WhenIdle)
     }
 
     /// Detach an owned whole device under `intent`.
@@ -2287,7 +2346,7 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
     }
 }
 
-/// The `.asif` path a creation request stages its image at, once the request itself is sound.
+/// The `.dmg` path a creation request stages its image at, once the request itself is sound.
 fn staged_image_path(request: &CreateImageRequest) -> Result<PathBuf, ApfsError> {
     if request.staged_stem.extension().is_some() || request.staged_stem.file_name().is_none() {
         return Err(ApfsError::InvalidStagedStem(request.staged_stem.clone()));
@@ -2303,7 +2362,7 @@ fn staged_image_path(request: &CreateImageRequest) -> Result<PathBuf, ApfsError>
 impl<R: CommandRunner, S: Sleeper> ApfsBackend for MacOsApfsBackend<R, S> {
     fn create_staged_image(&self, request: &CreateImageRequest) -> Result<PathBuf, ApfsError> {
         let path = staged_image_path(request)?;
-        self.create_asif(&path, request)?;
+        self.create_raw(&path, request)?;
         Ok(path)
     }
 
@@ -2361,20 +2420,25 @@ impl<R: CommandRunner, S: Sleeper> ApfsBackend for MacOsApfsBackend<R, S> {
             })
     }
 
-    fn clone_image(&self, source: &Path, destination: &Path) -> Result<(), CloneFileError> {
+    fn clone_image(
+        &self,
+        source: &Path,
+        destination: &Path,
+        capture: ImageCapture,
+    ) -> Result<(), CloneFileError> {
         validate_clone_path(source)?;
         validate_clone_path(destination)?;
         #[cfg(target_os = "macos")]
         {
             let leg = apfs_step_leg(destination);
             let held = timed_apfs_step(leg, "hold-source", || {
-                DetachedImage::hold(source, destination)
+                ImageSource::hold(source, destination, capture)
             })?;
-            timed_apfs_step(leg, "validate-source", || held.validate())?;
             timed_apfs_step(leg, "clonefile", || held.clone_to(destination))
         }
         #[cfg(not(target_os = "macos"))]
         {
+            let _ = capture;
             Err(CloneFileError::UnsupportedPlatform)
         }
     }
@@ -2401,66 +2465,8 @@ impl<R: CommandRunner, S: Sleeper> ApfsBackend for MacOsApfsBackend<R, S> {
     }
 
     fn attach_verified(&self, image: &Path) -> Result<AttachedImage, ApfsError> {
-        let leg = apfs_step_leg(image);
-        let (mut attachment, request, output, pin) = {
-            let _lease = self.image_lease(image)?;
-            let mut retried_lost_device = false;
-            loop {
-                let attachment =
-                    timed_apfs_step(leg, "attach", || self.attach_without_mounting(image))?;
-                // A raw descriptor pins the actual IOMedia from identity verification
-                // through fsck; its ownership is handed to the attachment until mount.
-                let pin = match self.pin_attached_volume(&attachment) {
-                    Ok(pin) => pin,
-                    Err(error)
-                        if !retried_lost_device
-                            && matches!(
-                                &error,
-                                ApfsError::InvalidAttachmentInventory(_)
-                                    | ApfsError::FileOperation {
-                                        operation: "pin attached APFS volume against device reuse",
-                                        ..
-                                    }
-                            )
-                            && self.attached_whole_devices(image)?.is_empty() =>
-                    {
-                        retried_lost_device = true;
-                        eprintln!(
-                            "cowshed: apfs {} lost its reported device before verification ({error}); attaching once more",
-                            image.display()
-                        );
-                        continue;
-                    }
-                    Err(error) => return Err(error),
-                };
-                let request = CommandRequest::new(
-                    FSCK_APFS,
-                    [
-                        OsString::from("-q"),
-                        OsString::from(raw_device_from(&attachment.volume_device)),
-                    ],
-                );
-                let output = timed_apfs_step(leg, "fsck", || self.runner.run(&request.clone()))?;
-                break (attachment, request, output, pin);
-            }
-        };
-        if output.succeeded() {
-            *attachment
-                .pin
-                .get_mut()
-                .expect("attachment pin mutex poisoned") = pin;
-            return Ok(attachment);
-        }
-        drop(pin);
-
-        match self.detach(&attachment, DetachIntent::Release) {
-            Ok(()) => Err(ApfsError::VerificationFailed { request, output }),
-            Err(detach) => Err(ApfsError::VerificationAndDetachFailed {
-                request,
-                verification: output,
-                detach: Box::new(detach),
-            }),
-        }
+        validate_image_path(image)?;
+        self.verify_attachment(image, MountAccess::ReadWrite, DetachIntent::Release)
     }
 
     fn mount(
@@ -2536,14 +2542,14 @@ impl<R: CommandRunner, S: Sleeper> ApfsBackend for MacOsApfsBackend<R, S> {
     fn image_capacity(&self, image: &Path) -> Result<ImageCapacity, ApfsError> {
         validate_image_path(image)?;
         #[cfg(target_os = "macos")]
-        let capacity = asif::capacity(image);
+        let capacity = raw::capacity(image);
         #[cfg(not(target_os = "macos"))]
         let capacity = Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "ASIF images exist only on macOS",
+            "RAW disk images exist only on macOS",
         ));
         capacity.map_err(|source| ApfsError::FileOperation {
-            operation: "read ASIF image capacity",
+            operation: "read RAW image capacity",
             path: image.to_owned(),
             source,
         })
@@ -2556,7 +2562,7 @@ impl<R: CommandRunner, S: Sleeper> ApfsBackend for MacOsApfsBackend<R, S> {
             self.runner
                 .grow_image(image, capacity)
                 .map_err(|source| ApfsError::FileOperation {
-                    operation: "grow ASIF image",
+                    operation: "grow RAW image",
                     path: image.to_owned(),
                     source,
                 })
@@ -3134,7 +3140,7 @@ fn validate_clone_path(path: &Path) -> Result<(), CloneFileError> {
     }
 }
 
-fn parse_blank_asif_whole_device(bytes: &[u8]) -> Result<String, ApfsError> {
+fn parse_blank_image_whole_device(bytes: &[u8]) -> Result<String, ApfsError> {
     let value = plist::Value::from_reader(std::io::Cursor::new(bytes))
         .map_err(|error| ApfsError::InvalidAttachmentPlist(error.to_string()))?;
     let system_entities = value
@@ -3287,32 +3293,36 @@ fn raw_device_from(device: &str) -> String {
     }
 }
 
-/// An image file nothing has attached, for as long as this value lives: one descriptor, opened
-/// without following a symlink, under a non-blocking shared lock the image driver's exclusive
-/// attach lock refuses and excludes ([`ApfsBackend::clone_image`]). [`Self::hold`] is the only
-/// way to make one, so nothing is validated or cloned that was not held first.
+/// One source inode retained from no-follow open through descriptor cloning. Detached captures
+/// also retain the shared lock that excludes an image driver; live source captures retain no
+/// attachment lock and leave the source mounted.
 #[cfg(target_os = "macos")]
-struct DetachedImage<'a> {
+struct ImageSource<'a> {
     file: File,
     path: &'a Path,
 }
 
 #[cfg(target_os = "macos")]
-impl<'a> DetachedImage<'a> {
-    /// Hold `path`, or refuse it as [`CloneFileError::SourceAttached`] when an attachment holds
-    /// it. The held file is flushed: a clone shares the file's on-disk extents, so the pages the
-    /// driver's write-back left in the cache go to disk before anything reads or clones them.
-    /// `destination` only names the clone this hold is for in an I/O failure.
-    fn hold(path: &'a Path, destination: &Path) -> Result<Self, CloneFileError> {
+impl<'a> ImageSource<'a> {
+    /// Hold and flush exactly the inode that is cloned, without resolving its path again.
+    fn hold(
+        path: &'a Path,
+        destination: &Path,
+        capture: ImageCapture,
+    ) -> Result<Self, CloneFileError> {
         use std::os::unix::fs::OpenOptionsExt;
         let failed = |error: io::Error| CloneFileError::Io {
             source_path: path.to_owned(),
             destination_path: destination.to_owned(),
             source: error,
         };
+        let lock_flags = match capture {
+            ImageCapture::Live => 0,
+            ImageCapture::Detached => libc::O_SHLOCK | libc::O_NONBLOCK,
+        };
         let file = OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_SHLOCK | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .custom_flags(lock_flags | libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(path)
             .map_err(|error| match error.kind() {
                 io::ErrorKind::WouldBlock => CloneFileError::SourceAttached {
@@ -3325,15 +3335,6 @@ impl<'a> DetachedImage<'a> {
             return Err(failed(io::Error::last_os_error()));
         }
         Ok(Self { file, path })
-    }
-
-    /// The held file's ASIF map describes a whole image, or [`CloneFileError::SourceInconsistent`]
-    /// names how it does not.
-    fn validate(&self) -> Result<(), CloneFileError> {
-        asif_consistency::validate(&self.file).map_err(|error| CloneFileError::SourceInconsistent {
-            source: self.path.to_owned(),
-            error,
-        })
     }
 
     /// Clone the held file, by its descriptor, to `destination`, which must not exist.
@@ -4354,7 +4355,7 @@ mod tests {
     use std::cell::{Ref, RefCell};
     use std::collections::{BTreeMap, VecDeque};
 
-    const BLANK_ASIF_PLIST: &str = r#"<?xml version="1.0"?><plist><dict><key>system-entities</key><array>
+    const BLANK_IMAGE_PLIST: &str = r#"<?xml version="1.0"?><plist><dict><key>system-entities</key><array>
       <dict><key>dev-entry</key><string>disk8</string><key>content-hint</key><string>GUID_partition_scheme</string></dict>
     </array></dict></plist>"#;
 
@@ -4610,6 +4611,80 @@ mod tests {
         )])
     }
 
+    /// One command-contract walk covers strict recorded input selection, readonly attach and
+    /// fsck, then a retained-source cleanup dissent that must never escalate to force.
+    #[test]
+    fn retained_inputs_are_record_bound_read_only_and_never_forced() {
+        use crate::storage::recovery::re_adopt_tests::Fixture;
+
+        let fixture = Fixture::new();
+        let mut source = fixture.source(Some(fixture.build()));
+        source.image.original.set_extension("asif");
+        source.image.retained.set_extension("asif");
+        fs::create_dir_all(source.image.retained.parent().unwrap()).unwrap();
+        let input = RetainedInput::from_record(&source, &source.image.retained).unwrap();
+        let unrelated = source.image.retained.with_file_name("unrecorded.asif");
+        let refused = RetainedInput::from_record(&source, &unrelated).unwrap_err();
+        assert_eq!(refused.code, crate::ErrorCode::Integrity);
+        assert!(
+            matches!(
+                validate_image_path(input.path()),
+                Err(ApfsError::InvalidImagePath(_))
+            ),
+            "ordinary runtime still refuses ASIF"
+        );
+
+        let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
+            no_images(),
+            ok(ATTACH_PLIST),
+            holding_verified_volume(input.path()),
+            ok([]),
+        ]));
+        let attachment = backend.attach_retained_verified(&input).unwrap();
+        assert_eq!(attachment.0.image(), input.path());
+        assert_eq!(attachment.volume_device(), "/dev/disk5s1");
+        assert_eq!(attachment.0.whole_device(), "/dev/disk5");
+        let requests = backend.runner().requests();
+        assert_eq!(
+            argv(&requests[0]),
+            [
+                "image",
+                "attach",
+                "--readOnly",
+                "--nobrowse",
+                "--noMount",
+                "--plist",
+                input.path().to_str().unwrap(),
+            ]
+        );
+        assert_eq!(requests[1].program, Path::new(FSCK_APFS));
+        drop(attachment);
+
+        let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
+            no_images(),
+            failed(1, "attach failed after adding the device"),
+            holding(input.path(), "/dev/disk4"),
+            holding(input.path(), "/dev/disk4"),
+            dissent(),
+            holding(input.path(), "/dev/disk4"),
+        ]));
+        assert!(matches!(
+            backend.attach_retained_verified(&input),
+            Err(ApfsError::AttachmentCleanupFailed { .. })
+        ));
+        let requests = backend.runner().requests();
+        assert_eq!(argv(&requests[1]), ["detach", "-verbose", "/dev/disk4"]);
+        assert!(
+            requests.iter().all(|request| {
+                request
+                    .args
+                    .iter()
+                    .all(|argument| argument != OsStr::new("-force"))
+            }),
+            "a retained source is never force-detached, including attach-failure cleanup"
+        );
+    }
+
     /// Attaches its one new device to `image` on the first `diskutil image attach`, answers that
     /// attach with a malformed plist, and removes the device again when `hdiutil detach` names it.
     struct StatefulMalformedAttachRunner {
@@ -4632,7 +4707,7 @@ mod tests {
                     .collect(),
             );
             attached.insert(
-                PathBuf::from("/tmp/cowshed-unrelated.asif"),
+                PathBuf::from("/tmp/cowshed-unrelated.dmg"),
                 BTreeSet::from(["/dev/disk20".into()]),
             );
             Self {
@@ -4902,8 +4977,8 @@ mod tests {
     #[test]
     fn deferred_images_roundtrip_dedup_and_drain_oldest_first() {
         let _ = take_deferred_images();
-        let main = PathBuf::from("/store/acme/main.asif");
-        let session = PathBuf::from("/store/acme/session.asif");
+        let main = PathBuf::from("/store/acme/main.dmg");
+        let session = PathBuf::from("/store/acme/session.dmg");
         record_deferred_image(main.clone());
         record_deferred_image(main.clone());
         record_deferred_image(session.clone());
@@ -4922,10 +4997,10 @@ mod tests {
                     "--nobrowse",
                     "--noMount",
                     "--plist",
-                    "/store/acme/main.asif"
+                    "/store/acme/main.dmg"
                 ],
             )),
-            Some(PathBuf::from("/store/acme/main.asif"))
+            Some(PathBuf::from("/store/acme/main.dmg"))
         );
         assert_eq!(
             deferred_image_target(&CommandRequest::new(HDIUTIL, ["detach", "/dev/disk9"])),
@@ -4941,7 +5016,7 @@ mod tests {
                 ["image", "attach", "/store/acme/main.sparseimage"],
             )),
             None,
-            "only an ASIF image path is a workspace image"
+            "only a .dmg image path is a workspace image"
         );
         assert_eq!(
             deferred_image_target(&CommandRequest::new("/bin/sleep", ["30"])),
@@ -4950,7 +5025,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_a_path_that_is_not_an_asif_image_before_spawning() {
+    fn rejects_a_path_that_is_not_an_image_before_spawning() {
         let backend = MacOsApfsBackend::new(RecordingRunner::default());
         for image in ["session.sparseimage", "session.img", "session"] {
             let error = backend.attach_verified(Path::new(image)).unwrap_err();
@@ -4964,14 +5039,14 @@ mod tests {
         let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
             no_images(),
             ok(ATTACH_PLIST),
-            holding_verified_volume("session.asif"),
+            holding_verified_volume("session.dmg"),
             failed(8, "not clean"),
-            holding("session.asif", "/dev/disk5"),
+            holding("session.dmg", "/dev/disk5"),
             ok([]),
             no_images(),
         ]));
         let error = backend
-            .attach_verified(Path::new("session.asif"))
+            .attach_verified(Path::new("session.dmg"))
             .unwrap_err();
         assert!(matches!(
             error,
@@ -5007,13 +5082,13 @@ mod tests {
     /// and the held device is left alone.
     #[test]
     fn an_image_the_kernel_already_holds_is_never_attached_again() {
-        let image = Path::new("/tmp/cowshed-preexisting.asif");
-        let inventory = || images(&[("/tmp/cowshed-preexisting.asif", &["/dev/disk5"][..])]);
+        let image = Path::new("/tmp/cowshed-preexisting.dmg");
+        let inventory = || images(&[("/tmp/cowshed-preexisting.dmg", &["/dev/disk5"][..])]);
         let refused = |error: ApfsError| {
             matches!(
                 error,
                 ApfsError::InvalidAttachmentInventory(message)
-                    if message == "/tmp/cowshed-preexisting.asif is already attached as \
+                    if message == "/tmp/cowshed-preexisting.dmg is already attached as \
                                    {\"/dev/disk5\"}; refusing to attach it a second time"
             )
         };
@@ -5040,7 +5115,7 @@ mod tests {
     /// refuses them as ambiguous.
     #[test]
     fn every_attachment_of_a_path_held_twice_is_listed() {
-        let image = Path::new("/tmp/cowshed-target.asif");
+        let image = Path::new("/tmp/cowshed-target.dmg");
         let mut second = live_capture();
         for media in &mut second.media {
             media.device = media.device.replace("/dev/disk1", "/dev/disk2");
@@ -5064,8 +5139,8 @@ mod tests {
     /// image's. (An image the kernel already holds is not attached at all; see
     /// `an_image_the_kernel_already_holds_is_never_attached_again`.)
     #[test]
-    fn malformed_asif_attach_detaches_only_the_new_device_and_verifies_absence() {
-        let image = Path::new("/tmp/cowshed-malformed-attach.asif");
+    fn malformed_image_attach_detaches_only_the_new_device_and_verifies_absence() {
+        let image = Path::new("/tmp/cowshed-malformed-attach.dmg");
         let backend = MacOsApfsBackend::new(StatefulMalformedAttachRunner::new(image, &[], false));
 
         let error = backend.attach_verified(image).unwrap_err();
@@ -5075,7 +5150,7 @@ mod tests {
         assert_eq!(
             backend
                 .runner()
-                .devices_for(Path::new("/tmp/cowshed-unrelated.asif")),
+                .devices_for(Path::new("/tmp/cowshed-unrelated.dmg")),
             BTreeSet::from(["/dev/disk20".into()])
         );
         let steps = backend.runner().steps();
@@ -5089,7 +5164,7 @@ mod tests {
                 "--nobrowse",
                 "--noMount",
                 "--plist",
-                "/tmp/cowshed-malformed-attach.asif",
+                "/tmp/cowshed-malformed-attach.dmg",
             ]
         );
         assert_eq!(steps[2], Seen::Inventory);
@@ -5107,7 +5182,7 @@ mod tests {
     }
 
     #[test]
-    fn malformed_blank_asif_cleanup_failure_preserves_image_and_typed_context() {
+    fn malformed_blank_image_cleanup_failure_preserves_image_and_typed_context() {
         let stem = temp_path("malformed-blank-cleanup", "stem").with_extension("");
         let image = stem.with_extension(IMAGE_EXTENSION);
         fs::write(&image, b"created").unwrap();
@@ -5176,8 +5251,8 @@ mod tests {
 
     #[test]
     fn failed_detach_remains_a_cleanup_error_when_inventory_reports_absence() {
-        let image = Path::new("/tmp/cowshed-failed-detach.asif");
-        let attached = || images(&[("/tmp/cowshed-failed-detach.asif", &["/dev/disk8"][..])]);
+        let image = Path::new("/tmp/cowshed-failed-detach.dmg");
+        let attached = || images(&[("/tmp/cowshed-failed-detach.dmg", &["/dev/disk8"][..])]);
         let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
             no_images(),
             ok("<plist><dict><key>malformed"),
@@ -5211,7 +5286,7 @@ mod tests {
     }
 
     #[test]
-    fn malformed_blank_asif_inventory_failures_preserve_the_image() {
+    fn malformed_blank_image_inventory_failures_preserve_the_image() {
         for index in 0..2 {
             let stem =
                 temp_path(&format!("malformed-inventory-{index}"), "stem").with_extension("");
@@ -5265,8 +5340,8 @@ mod tests {
     }
 
     #[test]
-    fn post_create_asif_attach_failure_removes_the_image() {
-        let stem = temp_path("asif-attach-failure", "stem").with_extension("");
+    fn post_create_image_attach_failure_removes_the_image() {
+        let stem = temp_path("image-attach-failure", "stem").with_extension("");
         let image = stem.with_extension(IMAGE_EXTENSION);
         fs::write(&image, b"partial").unwrap();
         let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
@@ -5289,7 +5364,7 @@ mod tests {
         assert!(matches!(
             error,
             ApfsError::CommandFailed {
-                operation: "attach blank ASIF image",
+                operation: "attach blank RAW image",
                 ..
             }
         ));
@@ -5308,7 +5383,7 @@ mod tests {
 
     #[test]
     fn post_create_cleanup_treats_a_missing_staged_image_as_already_removed() {
-        let stem = temp_path("asif-missing-cleanup", "stem").with_extension("");
+        let stem = temp_path("image-missing-cleanup", "stem").with_extension("");
         let image = stem.with_extension(IMAGE_EXTENSION);
         assert!(!image.exists());
         let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
@@ -5331,7 +5406,7 @@ mod tests {
         assert!(matches!(
             error,
             ApfsError::CommandFailed {
-                operation: "attach blank ASIF image",
+                operation: "attach blank RAW image",
                 output: CommandOutput {
                     status: ProcessStatus::Exit(9),
                     ..
@@ -5349,7 +5424,7 @@ mod tests {
     fn an_attach_whose_framework_lost_its_helper_is_typed_with_the_host_load() {
         let helper_lost = "Error: Couldn\u{2019}t communicate with a helper application.\n";
         let attach = |stderr: &'static str| {
-            let stem = temp_path("asif-helper-lost", "stem").with_extension("");
+            let stem = temp_path("image-helper-lost", "stem").with_extension("");
             let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
                 ok([]),
                 no_images(),
@@ -5372,7 +5447,7 @@ mod tests {
         let ApfsError::DiskImageHelperUnreachable(failure) = &error else {
             panic!("expected the typed helper failure, got {error:?}");
         };
-        assert_eq!(failure.operation, "attach blank ASIF image");
+        assert_eq!(failure.operation, "attach blank RAW image");
         assert!(failure.load.is_some(), "the host load travels with it");
         assert_eq!(failure.output.stderr, helper_lost.as_bytes());
         let report = error.to_string();
@@ -5387,7 +5462,7 @@ mod tests {
         assert!(matches!(
             attach("attach failed"),
             ApfsError::CommandFailed {
-                operation: "attach blank ASIF image",
+                operation: "attach blank RAW image",
                 ..
             }
         ));
@@ -5457,12 +5532,12 @@ mod tests {
     /// `diskutil image resize` refused it as busy. No step may consult `hdiutil info` at all.
     #[test]
     fn a_formatted_blank_image_is_released_through_the_kernel_mapping() {
-        let stem = temp_path("asif-kernel-release", "stem").with_extension("");
+        let stem = temp_path("image-kernel-release", "stem").with_extension("");
         let image = stem.with_extension(IMAGE_EXTENSION);
         let backend = graced_backend([
             ok([]),
             no_images(),
-            ok(BLANK_ASIF_PLIST),
+            ok(BLANK_IMAGE_PLIST),
             holding(&image, "/dev/disk8"),
             ok([]),
             holding(&image, "/dev/disk8"),
@@ -5494,7 +5569,7 @@ mod tests {
     /// so no second attach is needed to mount it.
     #[test]
     fn formatting_keeps_its_one_attach_and_hands_back_a_verified_volume() {
-        let image = temp_path("asif-format-attached", IMAGE_EXTENSION);
+        let image = temp_path("image-format-attached", IMAGE_EXTENSION);
         let formatted = || {
             let path = attachment_inventory_path(&image).unwrap();
             images(&[(
@@ -5504,7 +5579,7 @@ mod tests {
         };
         let backend = graced_backend([
             no_images(),
-            ok(BLANK_ASIF_PLIST),
+            ok(BLANK_IMAGE_PLIST),
             holding(&image, "/dev/disk8"),
             ok([]),
             formatted(),
@@ -5545,11 +5620,11 @@ mod tests {
     /// is released by the image's own mapping and the image removed.
     #[test]
     fn formatting_without_a_registered_volume_releases_the_attachment_and_the_image() {
-        let image = temp_path("asif-format-no-volume", IMAGE_EXTENSION);
+        let image = temp_path("image-format-no-volume", IMAGE_EXTENSION);
         fs::write(&image, b"blank").unwrap();
         let backend = graced_backend([
             no_images(),
-            ok(BLANK_ASIF_PLIST),
+            ok(BLANK_IMAGE_PLIST),
             holding(&image, "/dev/disk8"),
             ok([]),
             holding(&image, "/dev/disk8"),
@@ -5577,12 +5652,12 @@ mod tests {
     /// An unreadable kernel inventory at the final release is a typed refusal, never a release.
     #[test]
     fn an_unreadable_inventory_at_release_is_never_treated_as_released() {
-        let stem = temp_path("asif-unreadable-release", "stem").with_extension("");
+        let stem = temp_path("image-unreadable-release", "stem").with_extension("");
         let image = stem.with_extension(IMAGE_EXTENSION);
         let backend = graced_backend([
             ok([]),
             no_images(),
-            ok(BLANK_ASIF_PLIST),
+            ok(BLANK_IMAGE_PLIST),
             holding(&image, "/dev/disk8"),
             ok([]),
             unreadable_inventory(),
@@ -5604,13 +5679,13 @@ mod tests {
 
     #[test]
     fn conflicting_blank_attachment_mapping_never_formats_or_removes_the_image() {
-        let stem = temp_path("asif-foreign-publication", "stem").with_extension("");
+        let stem = temp_path("image-foreign-publication", "stem").with_extension("");
         let image = stem.with_extension(IMAGE_EXTENSION);
         fs::write(&image, b"created").unwrap();
         let backend = graced_backend([
             ok([]),
             no_images(),
-            ok(BLANK_ASIF_PLIST),
+            ok(BLANK_IMAGE_PLIST),
             holding(&image, "/dev/disk9"),
         ]);
         let error = backend
@@ -5643,10 +5718,10 @@ mod tests {
     /// refuse at once, not lag to wait out.
     #[test]
     fn an_unregistered_blank_attachment_fails_closed_without_waiting_or_mutating() {
-        let stem = temp_path("asif-unregistered-attachment", "stem").with_extension("");
+        let stem = temp_path("image-unregistered-attachment", "stem").with_extension("");
         let image = stem.with_extension(IMAGE_EXTENSION);
         fs::write(&image, b"created").unwrap();
-        let backend = graced_backend([ok([]), no_images(), ok(BLANK_ASIF_PLIST), no_images()]);
+        let backend = graced_backend([ok([]), no_images(), ok(BLANK_IMAGE_PLIST), no_images()]);
         let error = backend
             .create_staged_image(&CreateImageRequest {
                 staged_stem: stem,
@@ -5673,14 +5748,14 @@ mod tests {
     }
 
     #[test]
-    fn failed_newfs_detaches_and_removes_staged_asif() {
-        let stem = temp_path("asif-newfs-failure", "stem").with_extension("");
+    fn failed_newfs_detaches_and_removes_staged_image() {
+        let stem = temp_path("image-newfs-failure", "stem").with_extension("");
         let image = stem.with_extension(IMAGE_EXTENSION);
         fs::write(&image, b"partial").unwrap();
         let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
             ok([]),
             no_images(),
-            ok(BLANK_ASIF_PLIST),
+            ok(BLANK_IMAGE_PLIST),
             holding(&image, "/dev/disk8"),
             failed(70, "format failed"),
             holding(&image, "/dev/disk8"),
@@ -5700,7 +5775,7 @@ mod tests {
         assert!(matches!(
             error,
             ApfsError::CommandFailed {
-                operation: "format ASIF APFS volume",
+                operation: "format RAW APFS volume",
                 output: CommandOutput {
                     status: ProcessStatus::Exit(70),
                     ..
@@ -5722,13 +5797,13 @@ mod tests {
 
     #[test]
     fn failed_newfs_preserves_image_when_detach_cleanup_fails() {
-        let stem = temp_path("asif-detach-cleanup-failure", "stem").with_extension("");
+        let stem = temp_path("image-detach-cleanup-failure", "stem").with_extension("");
         let image = stem.with_extension(IMAGE_EXTENSION);
         fs::write(&image, b"partial").unwrap();
         let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
             ok([]),
             no_images(),
-            ok(BLANK_ASIF_PLIST),
+            ok(BLANK_IMAGE_PLIST),
             holding(&image, "/dev/disk8"),
             failed(70, "format failed"),
             holding(&image, "/dev/disk8"),
@@ -5747,14 +5822,14 @@ mod tests {
         assert!(std::error::Error::source(&error).is_some());
         assert!(matches!(
             error,
-            ApfsError::AsifCreationAndCleanupFailed {
+            ApfsError::ImageCreationAndCleanupFailed {
                 primary,
                 detach: Some(detach),
                 remove: None,
             } if matches!(
                 *primary,
                 ApfsError::CommandFailed {
-                    operation: "format ASIF APFS volume",
+                    operation: "format RAW APFS volume",
                     ..
                 }
             ) && matches!(
@@ -5775,13 +5850,13 @@ mod tests {
 
     #[test]
     fn failed_newfs_preserves_remove_cleanup_failure_after_detach() {
-        let stem = temp_path("asif-remove-cleanup-failure", "stem").with_extension("");
+        let stem = temp_path("image-remove-cleanup-failure", "stem").with_extension("");
         let image = stem.with_extension(IMAGE_EXTENSION);
         fs::create_dir(&image).unwrap();
         let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
             ok([]),
             no_images(),
-            ok(BLANK_ASIF_PLIST),
+            ok(BLANK_IMAGE_PLIST),
             holding(&image, "/dev/disk8"),
             failed(70, "format failed"),
             holding(&image, "/dev/disk8"),
@@ -5800,20 +5875,20 @@ mod tests {
 
         assert!(matches!(
             error,
-            ApfsError::AsifCreationAndCleanupFailed {
+            ApfsError::ImageCreationAndCleanupFailed {
                 primary,
                 detach: None,
                 remove: Some(remove),
             } if matches!(
                 *primary,
                 ApfsError::CommandFailed {
-                    operation: "format ASIF APFS volume",
+                    operation: "format RAW APFS volume",
                     ..
                 }
             ) && matches!(
                 *remove,
                 ApfsError::FileOperation {
-                    operation: "remove failed ASIF image",
+                    operation: "remove failed RAW image",
                     ..
                 }
             )
@@ -5822,14 +5897,14 @@ mod tests {
     }
 
     #[test]
-    fn failed_final_asif_eject_preserves_attached_image() {
-        let stem = temp_path("asif-final-eject-failure", "stem").with_extension("");
+    fn failed_final_image_eject_preserves_attached_image() {
+        let stem = temp_path("image-final-eject-failure", "stem").with_extension("");
         let image = stem.with_extension(IMAGE_EXTENSION);
         fs::write(&image, b"formatted").unwrap();
         let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
             ok([]),
             no_images(),
-            ok(BLANK_ASIF_PLIST),
+            ok(BLANK_IMAGE_PLIST),
             holding(&image, "/dev/disk8"),
             ok([]),
             holding(&image, "/dev/disk8"),
@@ -5874,14 +5949,18 @@ mod tests {
     }
 
     #[test]
-    fn clone_validation_requires_both_paths_to_be_asif_images() {
+    fn clone_validation_requires_both_paths_to_be_image_paths() {
         let backend = MacOsApfsBackend::new(RecordingRunner::default());
         for (source, destination, invalid) in [
-            ("main.sparseimage", "session.asif", "main.sparseimage"),
-            ("main.asif", "session.sparseimage", "session.sparseimage"),
+            ("main.sparseimage", "session.dmg", "main.sparseimage"),
+            ("main.dmg", "session.sparseimage", "session.sparseimage"),
         ] {
             let error = backend
-                .clone_image(Path::new(source), Path::new(destination))
+                .clone_image(
+                    Path::new(source),
+                    Path::new(destination),
+                    crate::apfs::ImageCapture::Detached,
+                )
                 .unwrap_err();
             assert!(matches!(
                 error,
@@ -5891,7 +5970,9 @@ mod tests {
 
         let source = temp_path("validated-missing-source", IMAGE_EXTENSION);
         let destination = temp_path("validated-missing-destination", IMAGE_EXTENSION);
-        let error = backend.clone_image(&source, &destination).unwrap_err();
+        let error = backend
+            .clone_image(&source, &destination, crate::apfs::ImageCapture::Detached)
+            .unwrap_err();
         #[cfg(target_os = "macos")]
         assert!(matches!(error, CloneFileError::Io { .. }));
         #[cfg(not(target_os = "macos"))]
@@ -5914,7 +5995,7 @@ mod tests {
     #[test]
     fn detach_leaves_a_recorded_device_that_now_belongs_to_another_image() {
         let attachment = identity_attachment("reused-device");
-        let backend = graced_backend([images(&[("/tmp/someone-else.asif", &["/dev/disk12"][..])])]);
+        let backend = graced_backend([images(&[("/tmp/someone-else.dmg", &["/dev/disk12"][..])])]);
 
         backend.detach(&attachment, DetachIntent::Release).unwrap();
 
@@ -6005,7 +6086,7 @@ mod tests {
         let backend = graced_backend([
             holding(&attachment.image, &attachment.whole_device),
             ok([]),
-            images(&[("/tmp/someone-else.asif", &["/dev/disk12"][..])]),
+            images(&[("/tmp/someone-else.dmg", &["/dev/disk12"][..])]),
         ]);
         backend.detach(&attachment, DetachIntent::Release).unwrap();
         assert_eq!(backend.runner().steps().len(), 3);
@@ -6241,8 +6322,8 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn real_apfs_asif_attach_normalizes_bare_devices_and_verifies_the_volume() {
-        let root = ScratchRoot::new("asif-resolution").expect("scratch root");
+    fn real_apfs_image_attach_normalizes_bare_devices_and_verifies_the_volume() {
+        let root = ScratchRoot::new("image-resolution").expect("scratch root");
         let image = root.path().join("image").with_extension(IMAGE_EXTENSION);
         let backend = MacOsApfsBackend::new(SystemCommandRunner);
         let mut cleanup = RealImageCleanup::new(&backend, image.clone());
@@ -6262,7 +6343,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn real_apfs_grow_refuses_an_attached_image_and_lands_once_detached() {
-        let root = ScratchRoot::new("asif-grow").expect("scratch root");
+        let root = ScratchRoot::new("image-grow").expect("scratch root");
         let image = root.path().join("image").with_extension(IMAGE_EXTENSION);
         let backend = MacOsApfsBackend::new(SystemCommandRunner);
         let mut cleanup = RealImageCleanup::new(&backend, image.clone());
@@ -6276,7 +6357,7 @@ mod tests {
             assert_eq!(refused.kind(), io::ErrorKind::WouldBlock, "{refused}");
             assert!(matches!(
                 backend.resize_image(created, capacity("2g")),
-                Err(ApfsError::FileOperation { operation: "grow ASIF image", source, .. })
+                Err(ApfsError::FileOperation { operation: "grow RAW image", source, .. })
                     if source.kind() == io::ErrorKind::WouldBlock
             ));
             backend.detach(attachment, DetachIntent::Release)?;
@@ -6771,9 +6852,9 @@ mod tests {
     }
 
     #[test]
-    fn blank_asif_plist_requires_one_canonical_whole_device() {
+    fn blank_image_plist_requires_one_canonical_whole_device() {
         assert_eq!(
-            parse_blank_asif_whole_device(BLANK_ASIF_PLIST.as_bytes()).unwrap(),
+            parse_blank_image_whole_device(BLANK_IMAGE_PLIST.as_bytes()).unwrap(),
             "/dev/disk8"
         );
         let missing = br#"<?xml version="1.0"?><plist><dict>
@@ -6782,7 +6863,7 @@ mod tests {
           </array>
         </dict></plist>"#;
         assert!(matches!(
-            parse_blank_asif_whole_device(missing),
+            parse_blank_image_whole_device(missing),
             Err(ApfsError::InvalidAttachmentPlist(message))
                 if message == "no canonical whole image device"
         ));
@@ -6793,7 +6874,7 @@ mod tests {
           </array>
         </dict></plist>"#;
         assert!(matches!(
-            parse_blank_asif_whole_device(ambiguous),
+            parse_blank_image_whole_device(ambiguous),
             Err(ApfsError::InvalidAttachmentPlist(message))
                 if message == "multiple whole image devices"
         ));
@@ -6803,30 +6884,30 @@ mod tests {
     fn attachment_inventory_selects_only_exact_image_path_whole_devices() {
         let images = attached_images(&[
             (
-                "/tmp/cowshed-target.asif",
+                "/tmp/cowshed-target.dmg",
                 &["disk4", "/dev/disk4s1", "/dev/disk5"][..],
             ),
-            ("/tmp/cowshed-unrelated.asif", &["/dev/disk20"][..]),
+            ("/tmp/cowshed-unrelated.dmg", &["/dev/disk20"][..]),
         ]);
 
-        let parsed = image_inventory(Path::new("/tmp/cowshed-target.asif"), &images).unwrap();
+        let parsed = image_inventory(Path::new("/tmp/cowshed-target.dmg"), &images).unwrap();
         assert_eq!(
             parsed.devices,
             BTreeSet::from(["/dev/disk4".into(), "/dev/disk5".into()])
         );
         assert!(parsed.matched);
         assert_eq!(parsed.capacity, None);
-        let absent = image_inventory(Path::new("/tmp/cowshed-absent.asif"), &images).unwrap();
+        let absent = image_inventory(Path::new("/tmp/cowshed-absent.dmg"), &images).unwrap();
         assert!(!absent.matched);
         assert!(absent.devices.is_empty());
     }
 
-    /// One attached ASIF image as the I/O Registry records it, with the device numbers and
+    /// One attached disk image as the I/O Registry records it, with the device numbers and
     /// partition-type GUID contents of a live macOS 26.6 capture: the image's own store, then the
     /// synthesized container and its volume.
     fn live_capture() -> AttachedDiskImage {
         AttachedDiskImage::file(
-            "/tmp/cowshed-target.asif",
+            "/tmp/cowshed-target.dmg",
             Some(ImageCapacity::from_bytes(125_000 * 512)),
             [
                 ("/dev/disk14", ""),
@@ -6848,14 +6929,14 @@ mod tests {
         ]));
 
         let attachment = backend
-            .existing_attachment(Path::new("/tmp/cowshed-target.asif"))
+            .existing_attachment(Path::new("/tmp/cowshed-target.dmg"))
             .expect("inventory")
             .expect("existing attachment");
         assert_eq!(attachment.whole_device(), "/dev/disk15");
         assert_eq!(attachment.volume_device(), "/dev/disk15s1");
         assert_eq!(
             backend
-                .attached_capacity(Path::new("/tmp/cowshed-target.asif"))
+                .attached_capacity(Path::new("/tmp/cowshed-target.dmg"))
                 .unwrap(),
             ImageCapacity::from_bytes(125_000 * 512)
         );
@@ -6874,27 +6955,27 @@ mod tests {
             MacOsApfsBackend::new(RecordingRunner::with_outputs([no_images(), no_images()]));
         assert!(
             backend
-                .existing_attachment(Path::new("/tmp/cowshed-target.asif"))
+                .existing_attachment(Path::new("/tmp/cowshed-target.dmg"))
                 .unwrap()
                 .is_none()
         );
         assert!(matches!(
-            backend.attached_capacity(Path::new("/tmp/cowshed-target.asif")),
-            Err(ApfsError::ImageNotAttached(path)) if path == Path::new("/tmp/cowshed-target.asif")
+            backend.attached_capacity(Path::new("/tmp/cowshed-target.dmg")),
+            Err(ApfsError::ImageNotAttached(path)) if path == Path::new("/tmp/cowshed-target.dmg")
         ));
     }
 
     /// Foreign, ambiguous, malformed and unreadable inventories fail closed.
     #[test]
     fn foreign_ambiguous_and_unreadable_inventories_fail_closed() {
-        let image = Path::new("/tmp/cowshed-target.asif");
+        let image = Path::new("/tmp/cowshed-target.dmg");
         let foreign = [
             AttachedDiskImage {
                 source: DiskImageSource::Url("ram://2048".into()),
                 capacity: None,
                 media: live_capture().media,
             },
-            AttachedDiskImage::file("/tmp/cowshed-other.asif", None, [("/dev/disk20", "")]),
+            AttachedDiskImage::file("/tmp/cowshed-other.dmg", None, [("/dev/disk20", "")]),
         ];
         assert!(
             existing_image_attachment(image, &foreign)
@@ -6930,8 +7011,8 @@ mod tests {
     #[test]
     fn disk_image_sources_decode_only_local_file_urls_to_paths() {
         assert_eq!(
-            DiskImageSource::from_url("file:///private/tmp/a%20b.asif"),
-            DiskImageSource::File(PathBuf::from("/private/tmp/a b.asif"))
+            DiskImageSource::from_url("file:///private/tmp/a%20b.dmg"),
+            DiskImageSource::File(PathBuf::from("/private/tmp/a b.dmg"))
         );
         for url in ["ram://2048", "file://host/share/x.asif", "not a url"] {
             assert_eq!(
@@ -6944,7 +7025,7 @@ mod tests {
     #[test]
     fn inventory_attachment_entities_select_apfs_guid_hints() {
         let Some(RecoveredImageAttachment::Apfs(attachment)) =
-            existing_image_attachment(Path::new("/tmp/cowshed-target.asif"), &[live_capture()])
+            existing_image_attachment(Path::new("/tmp/cowshed-target.dmg"), &[live_capture()])
                 .unwrap()
         else {
             panic!("the live capture is a formatted APFS attachment");
@@ -7026,7 +7107,7 @@ mod tests {
 
     #[test]
     fn attachment_inventory_rejects_malformed_matching_records() {
-        let image = Path::new("/tmp/cowshed-target.asif");
+        let image = Path::new("/tmp/cowshed-target.dmg");
         let malformed = [
             vec![AttachedDiskImage::file(
                 image,
@@ -7065,7 +7146,7 @@ mod tests {
 
     #[test]
     fn attachment_inventory_returns_devices_and_capacity() {
-        let image = Path::new("/tmp/cowshed-target.asif");
+        let image = Path::new("/tmp/cowshed-target.dmg");
         let images = [AttachedDiskImage::file(
             image,
             Some(ImageCapacity::from_bytes(419_430_400_u64 * 512)),
@@ -7089,24 +7170,20 @@ mod tests {
         ));
     }
 
-    /// Neither reading an image's capacity nor growing it spawns a disk command: the capacity is
-    /// the header's own sector count, read while another descriptor holds the file exclusively as
-    /// the image driver does for an attached image, and the grow goes through the runner seam,
-    /// never `diskutil image resize`, whose content resize attaches the image outside every
-    /// ownership check.
+    /// Capacity is the RAW file's length, even while the image driver holds it exclusively.
+    /// Neither reading it nor requesting growth spawns a disk command.
     #[cfg(target_os = "macos")]
     #[test]
-    fn asif_capacity_comes_from_the_header_and_growth_spawns_no_disk_command() {
+    fn raw_capacity_comes_from_file_length_and_growth_spawns_no_disk_command() {
         use std::os::unix::fs::OpenOptionsExt;
 
-        let (image, mut bytes) = synthetic_asif("capacity-from-header");
+        let (image, _) = sparse_raw_file("capacity-from-length", capacity("1g"));
         let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([Reply::Grow(Ok(()))]));
         let holder = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_EXLOCK | libc::O_NONBLOCK)
             .open(&image)
             .unwrap();
-
         assert_eq!(backend.image_capacity(&image).unwrap(), capacity("1g"));
         drop(holder);
         backend.resize_image(&image, capacity("2g")).unwrap();
@@ -7114,24 +7191,19 @@ mod tests {
             backend.runner().steps(),
             [Seen::Grow(image.clone(), capacity("2g"))]
         );
-
-        bytes[0] = b'x';
-        fs::write(&image, &bytes).unwrap();
-        assert!(
-            matches!(
-                backend.image_capacity(&image),
-                Err(ApfsError::FileOperation { operation: "read ASIF image capacity", path, source })
-                    if path == image && source.kind() == io::ErrorKind::InvalidData
-            ),
-            "a header without the ASIF magic has no capacity"
-        );
+        fs::write(&image, b"not a whole sector").unwrap();
+        assert!(matches!(
+            backend.image_capacity(&image),
+            Err(ApfsError::FileOperation { operation: "read RAW image capacity", path, source })
+                if path == image && source.kind() == io::ErrorKind::InvalidData
+        ));
         fs::remove_file(image).unwrap();
     }
 
     /// A refused grow is the operation's failure, typed and naming the image, never a success.
     #[test]
     fn a_refused_grow_is_a_typed_failure_naming_the_image() {
-        let image = Path::new("/tmp/cowshed-resize/main.asif");
+        let image = Path::new("/tmp/cowshed-resize/main.dmg");
         let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([Reply::Grow(Err(
             io::Error::from_raw_os_error(libc::EWOULDBLOCK),
         ))]));
@@ -7142,7 +7214,7 @@ mod tests {
         assert!(
             matches!(
                 &error,
-                ApfsError::FileOperation { operation: "grow ASIF image", path, source }
+                ApfsError::FileOperation { operation: "grow RAW image", path, source }
                     if path == image && source.kind() == io::ErrorKind::WouldBlock
             ),
             "{error}"
@@ -7150,100 +7222,70 @@ mod tests {
         assert!(backend.runner().requests().is_empty());
     }
 
-    /// A version-1 header as the measured images carry it: 1 GiB of 512-byte sectors, the
-    /// 4 PiB maximum, and recognizable bytes in every field a grow must leave alone.
     #[cfg(target_os = "macos")]
-    fn synthetic_asif(label: &str) -> (PathBuf, Vec<u8>) {
-        let mut bytes: Vec<u8> = (0..=250_u8).cycle().take(4096).collect();
-        bytes[0..4].copy_from_slice(b"shdw");
-        bytes[4..8].copy_from_slice(&1_u32.to_be_bytes());
-        bytes[8..12].copy_from_slice(&0x200_u32.to_be_bytes());
-        bytes[0x30..0x38].copy_from_slice(&0x0020_0000_u64.to_be_bytes());
-        bytes[0x38..0x40].copy_from_slice(&0x0800_0000_0000_u64.to_be_bytes());
+    fn sparse_raw_file(label: &str, capacity: ImageCapacity) -> (PathBuf, Vec<u8>) {
+        use std::io::Write;
+        let bytes: Vec<u8> = (0..=250_u8).cycle().take(4096).collect();
         let path = temp_path(label, IMAGE_EXTENSION);
-        fs::write(&path, &bytes).unwrap();
+        let mut file = File::create(&path).unwrap();
+        file.write_all(&bytes).unwrap();
+        file.set_len(capacity.bytes()).unwrap();
         (path, bytes)
     }
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn asif_grow_rewrites_only_the_eight_byte_sector_count() {
-        let (image, before) = synthetic_asif("grow-sector-count");
+    fn raw_growth_preserves_content_and_extends_with_holes() {
+        use std::os::unix::fs::{FileExt, MetadataExt};
+        let (image, before) = sparse_raw_file("grow-raw", capacity("1g"));
+        let allocated_before = fs::metadata(&image).unwrap().blocks() * 512;
         SystemCommandRunner
             .grow_image(&image, capacity("2g"))
-            .expect("a valid header grows");
-        let after = fs::read(&image).unwrap();
-        assert_eq!(after.len(), before.len());
-        let changed: Vec<usize> = (0..after.len())
-            .filter(|&index| after[index] != before[index])
-            .collect();
-        assert!(
-            changed.iter().all(|index| (0x30..0x38).contains(index)),
-            "{changed:?}"
-        );
-        assert_eq!(after[0x30..0x38], 0x0040_0000_u64.to_be_bytes());
+            .unwrap();
+        let file = File::open(&image).unwrap();
+        assert_eq!(file.metadata().unwrap().len(), capacity("2g").bytes());
+        let mut prefix = vec![0; before.len()];
+        file.read_exact_at(&mut prefix, 0).unwrap();
+        assert_eq!(prefix, before);
+        let mut tail = [1; 4096];
+        file.read_exact_at(&mut tail, capacity("2g").bytes() - 4096)
+            .unwrap();
+        assert_eq!(tail, [0; 4096]);
+        assert!(file.metadata().unwrap().blocks() * 512 <= allocated_before + 65536);
+        drop(file);
         fs::remove_file(image).unwrap();
     }
 
-    /// Every refusal is decided before the write: the file is byte-for-byte what it was.
+    /// Refused growth leaves the complete small file and its length unchanged.
     #[cfg(target_os = "macos")]
     #[test]
-    fn asif_grow_refusals_leave_every_byte_unchanged() {
-        type Mutation = fn(&mut Vec<u8>);
-        let cases: [(&str, Mutation, ImageCapacity, io::ErrorKind); 8] = [
-            (
-                "magic",
-                |bytes| bytes[0] = b'x',
-                capacity("2g"),
-                io::ErrorKind::InvalidData,
-            ),
-            (
-                "version",
-                |bytes| bytes[4..8].copy_from_slice(&2_u32.to_be_bytes()),
-                capacity("2g"),
-                io::ErrorKind::InvalidData,
-            ),
-            (
-                "length",
-                |bytes| bytes[8..12].copy_from_slice(&0x400_u32.to_be_bytes()),
-                capacity("2g"),
-                io::ErrorKind::InvalidData,
-            ),
-            (
-                "short",
-                |bytes| bytes.truncate(0x34),
-                capacity("2g"),
-                io::ErrorKind::UnexpectedEof,
-            ),
-            (
-                "unaligned",
-                |_| {},
-                ImageCapacity::from_bytes(2 * ImageCapacity::GIBIBYTE + 512),
-                io::ErrorKind::InvalidInput,
-            ),
-            ("equal", |_| {}, capacity("1g"), io::ErrorKind::InvalidInput),
-            (
-                "shrink",
-                |_| {},
-                capacity("512m"),
-                io::ErrorKind::InvalidInput,
-            ),
-            (
-                "past-maximum",
-                |bytes| bytes[0x38..0x40].copy_from_slice(&0x0030_0000_u64.to_be_bytes()),
-                capacity("2g"),
-                io::ErrorKind::InvalidInput,
-            ),
-        ];
-        for (label, mutate, requested, kind) in cases {
-            let (image, mut bytes) = synthetic_asif(&format!("grow-refused-{label}"));
-            mutate(&mut bytes);
-            fs::write(&image, &bytes).unwrap();
+    fn raw_growth_refusals_leave_every_byte_unchanged() {
+        for (label, requested) in [
+            ("unaligned", ImageCapacity::from_bytes(16384 + 512)),
+            ("equal", ImageCapacity::from_bytes(8192)),
+            ("shrink", ImageCapacity::from_bytes(4096)),
+        ] {
+            let (image, _) = sparse_raw_file(label, ImageCapacity::from_bytes(8192));
+            let before = fs::read(&image).unwrap();
             let error = SystemCommandRunner
                 .grow_image(&image, requested)
-                .expect_err(label);
-            assert_eq!(error.kind(), kind, "{label}: {error}");
-            assert_eq!(fs::read(&image).unwrap(), bytes, "{label} wrote");
+                .unwrap_err();
+            assert_eq!(
+                error.kind(),
+                io::ErrorKind::InvalidInput,
+                "{label}: {error}"
+            );
+            assert_eq!(fs::read(&image).unwrap(), before, "{label}");
+            fs::remove_file(image).unwrap();
+        }
+        for bytes in [Vec::new(), vec![1; 513]] {
+            let image = temp_path("invalid-raw-size", IMAGE_EXTENSION);
+            fs::write(&image, &bytes).unwrap();
+            let error = SystemCommandRunner
+                .grow_image(&image, capacity("1g"))
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(fs::read(&image).unwrap(), bytes);
             fs::remove_file(image).unwrap();
         }
     }
@@ -7252,10 +7294,11 @@ mod tests {
     /// exclusive holder stands in for it here, and the grow refuses without writing.
     #[cfg(target_os = "macos")]
     #[test]
-    fn asif_grow_refuses_a_file_another_descriptor_holds_exclusively() {
+    fn raw_growth_refuses_a_file_another_descriptor_holds_exclusively() {
         use std::os::unix::fs::OpenOptionsExt;
 
-        let (image, before) = synthetic_asif("grow-exclusive");
+        let (image, _) = sparse_raw_file("grow-exclusive", ImageCapacity::from_bytes(8192));
+        let before = fs::read(&image).unwrap();
         let holder = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_EXLOCK | libc::O_NONBLOCK)
@@ -7271,7 +7314,7 @@ mod tests {
     }
 
     /// Growth happens under the image's own production lease, so no cooperating attach,
-    /// format or detach of the same image can interleave with the header write.
+    /// format or detach of the same image can interleave with the file-length change.
     #[cfg(target_os = "macos")]
     #[test]
     fn resize_image_grows_while_holding_the_image_lease() {
@@ -7312,7 +7355,7 @@ mod tests {
     }
 
     #[test]
-    fn resize_refuses_a_path_that_is_not_an_asif_image() {
+    fn resize_refuses_a_path_that_is_not_a_raw_image() {
         let backend = MacOsApfsBackend::new(RecordingRunner::default());
         let image = Path::new("/tmp/cowshed-resize/main.sparseimage");
         assert!(matches!(
@@ -7335,12 +7378,12 @@ mod tests {
             let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
                 no_images(),
                 ok(ATTACH_PLIST),
-                holding_verified_volume("/tmp/cowshed-resize/main.asif"),
+                holding_verified_volume("/tmp/cowshed-resize/main.dmg"),
                 ok([]),
                 failed(1, refusal),
             ]));
             let attachment = backend
-                .attach_verified(Path::new("/tmp/cowshed-resize/main.asif"))
+                .attach_verified(Path::new("/tmp/cowshed-resize/main.dmg"))
                 .unwrap();
             backend.grow_container(&attachment).unwrap();
         }
@@ -7351,12 +7394,12 @@ mod tests {
         let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
             no_images(),
             ok(ATTACH_PLIST),
-            holding_verified_volume("/tmp/cowshed-resize/main.asif"),
+            holding_verified_volume("/tmp/cowshed-resize/main.dmg"),
             ok([]),
             failed(1, "Error: -69620: The given file system is not supported"),
         ]));
         let attachment = backend
-            .attach_verified(Path::new("/tmp/cowshed-resize/main.asif"))
+            .attach_verified(Path::new("/tmp/cowshed-resize/main.dmg"))
             .unwrap();
         assert!(matches!(
             backend.grow_container(&attachment),
@@ -7423,19 +7466,19 @@ mod tests {
     #[test]
     fn clonefile_errors_classify_existing_destination_and_other_io() {
         let destination = classify_clone_error(
-            Path::new("main.asif"),
-            Path::new("session.asif"),
+            Path::new("main.dmg"),
+            Path::new("session.dmg"),
             io::Error::from_raw_os_error(17),
         );
         assert!(matches!(
             destination,
             CloneFileError::DestinationExists { destination }
-                if destination == Path::new("session.asif")
+                if destination == Path::new("session.dmg")
         ));
 
         let other = classify_clone_error(
-            Path::new("main.asif"),
-            Path::new("session.asif"),
+            Path::new("main.dmg"),
+            Path::new("session.dmg"),
             io::Error::new(io::ErrorKind::PermissionDenied, "denied"),
         );
         assert!(matches!(
@@ -7444,8 +7487,8 @@ mod tests {
                 source_path,
                 destination_path,
                 source,
-            } if source_path == Path::new("main.asif")
-                && destination_path == Path::new("session.asif")
+            } if source_path == Path::new("main.dmg")
+                && destination_path == Path::new("session.dmg")
                 && source.kind() == io::ErrorKind::PermissionDenied
         ));
         assert_eq!(
@@ -7459,7 +7502,7 @@ mod tests {
         let source = temp_path("missing-clone-source", IMAGE_EXTENSION);
         let destination = temp_path("missing-clone-destination", IMAGE_EXTENSION);
         let error = MacOsApfsBackend::new(RecordingRunner::default())
-            .clone_image(&source, &destination)
+            .clone_image(&source, &destination, crate::apfs::ImageCapture::Detached)
             .unwrap_err();
         #[cfg(target_os = "macos")]
         assert!(matches!(error, CloneFileError::Io { .. }));
@@ -7471,14 +7514,14 @@ mod tests {
     #[test]
     fn clonefile_cross_volume_error_is_typed() {
         let error = classify_clone_error(
-            Path::new("main.asif"),
-            Path::new("session.asif"),
+            Path::new("main.dmg"),
+            Path::new("session.dmg"),
             io::Error::from_raw_os_error(18),
         );
         assert!(matches!(error, CloneFileError::CrossVolume { .. }));
     }
 
-    /// A fresh `.asif` path pair in the temporary directory, which shares one volume.
+    /// A fresh `.dmg` path pair in the temporary directory, which shares one volume.
     #[cfg(target_os = "macos")]
     fn clone_pair(label: &str) -> (PathBuf, PathBuf) {
         let nonce = format!("{}-{:?}", std::process::id(), std::thread::current().id());
@@ -7508,7 +7551,7 @@ mod tests {
         let (source, destination) = clone_pair("held-clone");
         fs::write(&source, b"fresh image bytes").unwrap();
 
-        DetachedImage::hold(&source, &destination)
+        ImageSource::hold(&source, &destination, ImageCapture::Detached)
             .unwrap()
             .clone_to(&destination)
             .unwrap();
@@ -7528,13 +7571,16 @@ mod tests {
         let attached = lock_as_attached(&source).unwrap();
 
         let error = MacOsApfsBackend::new(RecordingRunner::default())
-            .clone_image(&source, &destination)
+            .clone_image(&source, &destination, crate::apfs::ImageCapture::Detached)
             .unwrap_err();
         assert!(
             matches!(&error, CloneFileError::SourceAttached { source: refused } if *refused == source),
             "{error}"
         );
-        assert!(!destination.exists(), "an attached image is never cloned");
+        assert!(
+            !destination.exists(),
+            "a detached capture refuses an attached source"
+        );
 
         drop(attached);
         fs::remove_file(source).unwrap();
@@ -7546,9 +7592,9 @@ mod tests {
         let (source, destination) = clone_pair("held-lock");
         fs::write(&source, b"held image bytes").unwrap();
 
-        let held = DetachedImage::hold(&source, &destination).unwrap();
-        let concurrent = DetachedImage::hold(&source, &destination)
-            .expect("two captures of one source do not refuse each other");
+        let held = ImageSource::hold(&source, &destination, ImageCapture::Detached).unwrap();
+        let concurrent = ImageSource::hold(&source, &destination, ImageCapture::Detached)
+            .expect("two detached captures of one source do not refuse each other");
         assert_eq!(
             lock_as_attached(&source).unwrap_err().kind(),
             io::ErrorKind::WouldBlock,
@@ -7562,20 +7608,23 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn an_image_whose_map_does_not_validate_is_refused_and_nothing_is_cloned() {
-        let (source, destination) = clone_pair("inconsistent-clone");
-        fs::write(&source, b"not an ASIF image").unwrap();
-
-        let error = MacOsApfsBackend::new(RecordingRunner::default())
-            .clone_image(&source, &destination)
-            .unwrap_err();
-        assert!(
-            matches!(&error, CloneFileError::SourceInconsistent { source: refused, .. } if *refused == source),
-            "{error}"
+    fn a_live_capture_preserves_an_attached_sources_bytes_and_lock() {
+        let (source, destination) = clone_pair("live-clone");
+        let bytes = b"the APFS volume is verified by attach, not by an outer image map";
+        fs::write(&source, bytes).unwrap();
+        let attached = lock_as_attached(&source).unwrap();
+        MacOsApfsBackend::new(RecordingRunner::default())
+            .clone_image(&source, &destination, ImageCapture::Live)
+            .unwrap();
+        assert_eq!(fs::read(&source).unwrap(), bytes);
+        assert_eq!(fs::read(&destination).unwrap(), bytes);
+        assert_eq!(
+            lock_as_attached(&source).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
         );
-        assert!(!destination.exists(), "a torn image is never cloned");
-
+        drop(attached);
         fs::remove_file(source).unwrap();
+        fs::remove_file(destination).unwrap();
     }
 
     #[cfg(target_os = "macos")]
@@ -7587,7 +7636,7 @@ mod tests {
         std::os::unix::fs::symlink(&target, &source).unwrap();
 
         let error = MacOsApfsBackend::new(RecordingRunner::default())
-            .clone_image(&source, &destination)
+            .clone_image(&source, &destination, crate::apfs::ImageCapture::Detached)
             .unwrap_err();
         assert!(
             matches!(&error, CloneFileError::Io { source, .. } if source.raw_os_error() == Some(libc::ELOOP)),

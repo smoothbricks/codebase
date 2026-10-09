@@ -456,7 +456,9 @@ async fn contention_attaches_stay_fast_beside_mount_churn_only_under_the_lease()
         .expect("a formatted image");
     let clone = |name: String| {
         let image = images.join(name).with_extension(IMAGE_EXTENSION);
-        backend.clone_image(&source, &image).expect("clone");
+        backend
+            .clone_image(&source, &image, cowshed_core::apfs::ImageCapture::Detached)
+            .expect("clone");
         image
     };
     let attach_images: Vec<PathBuf> = (0..ATTACHERS).map(|i| clone(format!("a{i}"))).collect();

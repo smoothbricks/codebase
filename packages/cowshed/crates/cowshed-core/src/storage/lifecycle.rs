@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -247,7 +247,7 @@ pub enum Operation {
         repo: RepoId,
         capacity: ImageCapacity,
         source_checkout: PathBuf,
-        pre_cowshed_checkout: PathBuf,
+        handoff: AdoptHandoff,
         identity: OperationIdentity,
     },
     Create {
@@ -276,6 +276,34 @@ pub enum Operation {
     },
 }
 
+/// How main's checkout path passes from what is there to main's mount (02_workspaces.md, adopt
+/// step 5 and "Re-adoption").
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AdoptHandoff {
+    /// A first adoption: main is copied from the user's tree at the checkout, which is swapped
+    /// aside to `pre_cowshed_checkout`, never present before.
+    Checkout { pre_cowshed_checkout: PathBuf },
+    /// A re-adoption: main is copied from the replaced main's retained image, mounted read-only
+    /// at `copy_source`, and mounted at the checkout path, which the replaced main left an empty
+    /// mountpoint. The user's original `.pre-cowshed` tree, if any, is not touched. The
+    /// replacement is published as exactly `incarnation`, which the re-adoption intent recorded
+    /// before its first mutation.
+    Replacement {
+        copy_source: PathBuf,
+        incarnation: WorkspaceIncarnation,
+    },
+}
+
+impl AdoptHandoff {
+    /// The tree main's image is copied from.
+    pub fn copy_source<'a>(&'a self, checkout: &'a Path) -> &'a Path {
+        match self {
+            Self::Checkout { .. } => checkout,
+            Self::Replacement { copy_source, .. } => copy_source,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AdoptRequest {
     pub repo: RepoId,
@@ -283,7 +311,7 @@ pub struct AdoptRequest {
     pub capacity: ImageCapacity,
     pub topology_revision: Revision,
     pub source_checkout: PathBuf,
-    pub pre_cowshed_checkout: PathBuf,
+    pub handoff: AdoptHandoff,
     pub identity: OperationIdentity,
 }
 
@@ -310,7 +338,9 @@ pub enum PlanError {
     CheckpointMismatch,
     #[error("main cannot be retired or reclaimed")]
     MainIsPermanent,
-    #[error("adopt source and pre-cowshed checkout paths are not distinct absolute paths")]
+    #[error(
+        "adopt checkout and its handoff path are not distinct absolute paths, one outside the other"
+    )]
     InvalidAdoptHandoff,
 }
 
@@ -365,9 +395,16 @@ fn destination_expected(
 impl LifecyclePlanner for PurePlanner {
     fn plan_adopt(&self, request: AdoptRequest) -> Result<AdoptPlan, PlanError> {
         let main = WorkspaceName::main();
+        let other = match &request.handoff {
+            AdoptHandoff::Checkout {
+                pre_cowshed_checkout,
+            } => pre_cowshed_checkout,
+            AdoptHandoff::Replacement { copy_source, .. } => copy_source,
+        };
         if !request.source_checkout.is_absolute()
-            || !request.pre_cowshed_checkout.is_absolute()
-            || request.source_checkout == request.pre_cowshed_checkout
+            || !other.is_absolute()
+            || request.source_checkout == *other
+            || other.starts_with(&request.source_checkout)
         {
             return Err(PlanError::InvalidAdoptHandoff);
         }
@@ -381,7 +418,7 @@ impl LifecyclePlanner for PurePlanner {
                 repo: request.repo,
                 capacity: request.capacity,
                 source_checkout: request.source_checkout,
-                pre_cowshed_checkout: request.pre_cowshed_checkout,
+                handoff: request.handoff,
                 identity: request.identity,
             },
         })
@@ -581,10 +618,6 @@ impl StorageGcCandidate {
     }
 
     pub fn path(&self) -> &std::path::Path {
-        &self.path
-    }
-
-    pub(crate) fn path_buf(&self) -> &PathBuf {
         &self.path
     }
 

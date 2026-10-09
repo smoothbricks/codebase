@@ -159,7 +159,7 @@ Invariants the table-driven unit cases only sample. Each is a pure function over
 ## Integration tests (real substrate)
 
 Parametrized over the substrate the host provides, and never gated off on it: a missing capability is a failure, not a
-skip. On macOS these are the `real_apfs_*` tests, compiled only for macOS: small `.asif` images (1 GiB caps) under
+skip. On macOS these are the `real_apfs_*` tests, compiled only for macOS: small `.dmg` images (1 GiB caps) under
 `/private/tmp/cowshed-itest-<pid>-<n>-<label>`, driven by the production host — real `diskutil`/`hdiutil`/`mount_apfs`,
 the live kernel mount table. A mount state a test needs (wrong flags, an impostor volume, a busy holder) is produced on
 a real volume, never by a substitute mount source. Every scratch root selects its backing image paths, then calls the
@@ -231,11 +231,11 @@ Staging GC derives backing-image and mountpoint paths in one preallocated buffer
 parsed workspace for the deletion record rather than allocating a second name; mount GC also retains its parsed stem.
 
 The native inventory teardown regression runs the production read-only host-storage planner against the real home device
-while detaching a disposable ASIF image. Attachment and teardown use the production APFS backend, including its
-per-image lease and image ownership checks, so independent Nextest runners cannot recycle another fixture's device. A
-barrier starts one real teardown beside the planner; measured operation intervals must overlap, and the selected home
-device and container must remain unchanged. The regression does not require machine-global `cowshed.store` installation
-on an ephemeral runner. Installation validation remains a separate contract and still refuses missing storage.
+while detaching a disposable RAW image. Attachment and teardown use the production APFS backend, including its per-image
+lease and image ownership checks, so independent Nextest runners cannot recycle another fixture's device. A barrier
+starts one real teardown beside the planner; measured operation intervals must overlap, and the selected home device and
+container must remain unchanged. The regression does not require machine-global `cowshed.store` installation on an
+ephemeral runner. Installation validation remains a separate contract and still refuses missing storage.
 
 Real teardown also produces a nonempty global plist containing a container dictionary with only `ContainerReference`.
 Read-only planning reobserves that departing-container snapshot within the existing four-read bound, just as it does an
@@ -328,12 +328,16 @@ Covered flows:
   rebinding. Repeat for both grant and revoke.
 - **attach `-nomount` → fsck device → mount** ordering on APFS (the clone is verified as a block device _before_ it is
   mounted, per 02) — asserts the sequence and that a structurally-bad clone is caught before mount, not after;
-- **sealed image capture, never an attached backing-file clone**: the raw clone primitive refuses an attached ASIF
-  before creating a destination; a usable live source is detached without force, cloned through its held inode, and
-  restored with identical access/visibility and an updated registry after both success and failure. Busy-source refusal
-  names visible holders and leaves source bytes and mounts intact. Synthetic mixed-generation allocation maps pointing
-  past EOF or aliasing a physical chunk are rejected; valid sparse/partial maps are accepted. The earlier ten-sample
-  live-clone smoke was an observation, not proof of image-driver consistency.
+- **live source capture stays mounted; build seeds are sealed**: a live capture (`new`, `fork`, `checkpoint`) flushes
+  the source volume and backing file, descriptor-clones the live RAW image, and asserts that the source's attachment and
+  mount flags are unchanged (01_storage.md, "Images"). `new` and `fork` verify the clone with `fsck_apfs` before its
+  first mount; a failed verification deletes the clone and retries once from a fresh live capture, and a second failure
+  refuses publication (02_workspaces.md, `new` step 4). `restore` verifies a checkpoint clone before its first mount. A
+  build seed is the exception (16_build_volumes.md): the sealed capture detaches its source without force, clones
+  through its held inode, and restores identical access/visibility and an updated registry after both success and
+  failure; busy-source refusal names visible holders and leaves source bytes and mounts intact. The earlier ten-sample
+  ASIF live-clone smoke (pre-cutover, historical) passed fsck and reads but did not prove image-driver consistency; RAW
+  has no outer allocation map (02_workspaces.md, `new` step 2).
 - checkpoint/restore round-trip (restore undo image `pre-restore-…` present);
 - defrag: main fragmented by rewriting pages while a clone shares them refuses the rewrite while a file is open on its
   volume (image untouched), then, idle, comes back in at most a tenth of its extents with its data, marker, and mount
@@ -457,13 +461,13 @@ runner noise, local `cowshed doctor --bench` reports raw numbers.
 
 ### APFS / Seatbelt (macOS)
 
-| Operation                     | Budget (median, local)  | Basis                                                        |
-| ----------------------------- | ----------------------- | ------------------------------------------------------------ |
-| `cowshed new` cold            | ≤ 1 s                   | clonefile ~2 ms + attach ~235 ms + branch/marker work        |
-| `cowshed rm` (perceived)      | ≤ 100 ms to return      | rename + grant-file unlink; detach is background             |
-| `cowshed fork` / `checkpoint` | ≤ 1 s                   | same physics as new                                          |
-| `cowshed path` / `ls`         | ≤ 50 ms                 | readdir + getmntinfo only — proves the no-state-store design |
-| exec sandbox overhead         | ≤ 50 ms over bare spawn | profile generation + sandbox-exec                            |
+| Operation                     | Budget (median, local)  | Basis                                                                     |
+| ----------------------------- | ----------------------- | ------------------------------------------------------------------------- |
+| `cowshed new` cold            | ≤ 1 s                   | pre-cutover measurement: clonefile ~2 ms + attach ~235 ms; RAW unmeasured |
+| `cowshed rm` (perceived)      | ≤ 100 ms to return      | rename + grant-file unlink; detach is background                          |
+| `cowshed fork` / `checkpoint` | ≤ 1 s                   | same path as new; RAW unmeasured                                          |
+| `cowshed path` / `ls`         | ≤ 50 ms                 | readdir + getmntinfo only — proves the no-state-store design              |
+| exec sandbox overhead         | ≤ 50 ms over bare spawn | profile generation + sandbox-exec                                         |
 
 **Basis, and what the numbers are (and are not).** Figures come from the apfs-workspace-bench study
 (`specs/cowshed/prototypes/apfs-workspace-bench/`, harness, REPORT.md, and results committed alongside): clonefile of a
@@ -472,19 +476,21 @@ synchronous write throughput, which is why clones are the substrate. These are *
 single 20-sample run**, not end-to-end cowshed SLOs — budgets are stated as **medians** precisely because 20 samples
 cannot fix a stable tail. Note the p99 correction: the ~590 ms figure sometimes quoted is the p99 of **shadow
 create+attach**, not clone attach — clone _attach-only_ p99 in that run was ~273 ms and clonefile+attach ~271 ms. Do not
-cite ~590 ms as a clone-attach percentile.
+cite ~590 ms as a clone-attach percentile. These figures are pre-cutover measurements and are not RAW timings; no RAW
+measurement backs the budgets above.
 
-The image-format prototype (`specs/cowshed/prototypes/image-format-bench/`, harness and results; 100 GB images holding a
-6.3 GB tree; 01_storage.md, "Format measurements") is the basis for the one format, case-sensitive ASIF: create 441 vs
-1,046 ms for SPARSE, attach + fsck + mount 228 vs 308 ms, clonefile equal (under 0.1 ms at these sizes), small files
-created, symlinked, and unlinked 10×, 16×, and 7× faster and 1 GiB written and read 4.3× and 7.5× faster (interleaved
-medians), a 6.3 GB tree filled 1.6–3.5× faster; case-insensitive ASIF measures the same as case-sensitive within noise.
-The earlier 4 GiB experiment (`apfs-workspace-bench/results/2026-07-11-substrate-experiments.json`) points the same way.
-**Attach floor verdict: not flag-reducible** — `-noverify` saves ~15 ms (noise), `-noautofsck` nothing,
+The pre-cutover image-format prototype (`specs/cowshed/prototypes/image-format-bench/`, harness and results; 100 GB
+images holding a 6.3 GB tree; 01_storage.md, "Format measurements") was the basis for the then-chosen case-sensitive
+ASIF format (historical; superseded by the single RAW format in 01_storage.md §Images): create 441 vs 1,046 ms for
+SPARSE, attach + fsck + mount 228 vs 308 ms, clonefile equal (under 0.1 ms at these sizes), small files created,
+symlinked, and unlinked 10×, 16×, and 7× faster and 1 GiB written and read 4.3× and 7.5× faster (interleaved medians), a
+6.3 GB tree filled 1.6–3.5× faster; case-insensitive ASIF measures the same as case-sensitive within noise. The earlier
+4 GiB experiment (`apfs-workspace-bench/results/2026-07-11-substrate-experiments.json`) points the same way. **Attach
+floor verdict (pre-cutover measurement): not flag-reducible** — `-noverify` saves ~15 ms (noise), `-noautofsck` nothing,
 `diskutil image attach` exposes no equivalent knobs; the ~200–400 ms is inherent to DiskImages attach plus the APFS
 mount. Halving it would need a different attach path (DiskImages2 private API) — a research note, and budgets must not
-assume it. The two harnesses are the reference methodology for any future substrate change (they validated ASIF;
-apfs-workspace-bench establishes the ZFS baseline below).
+assume it. The two harnesses are the reference methodology for any future substrate change (they validated the
+pre-cutover ASIF choice; apfs-workspace-bench establishes the ZFS baseline below).
 
 ### ZFS / Landlock (Linux) — separate baseline
 

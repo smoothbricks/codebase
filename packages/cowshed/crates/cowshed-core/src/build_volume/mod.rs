@@ -2,8 +2,8 @@
 //! directories, Nx's cache and task database, a per-tree indexer — on a volume of its own beside
 //! a workspace's source image.
 //!
-//! A build volume is an ASIF image at `<project>/build/<id>.asif` with its record at
-//! `<id>.asif.json`, mounted `nobrowse` at `<host mount root>/.build/<owner>/<repo>/<id>`. A
+//! A build volume is a RAW (`.dmg`) image at `<project>/build/<id>.dmg` with its record at
+//! `<id>.dmg.json`, mounted `nobrowse` at `<host mount root>/.build/<owner>/<repo>/<id>`. A
 //! checkout reaches it through exactly one symlink, [`BUILD_LINK`], whose target is that
 //! mountpoint ([`link`]). The mountpoint names the volume, so the link is the whole record of
 //! which checkout uses which volume: garbage collection reads links, never derives ownership
@@ -41,19 +41,19 @@ use crate::storage::StorageLayoutError;
 pub use link::BUILD_LINK;
 
 /// The project's build-volume images, beside `sessions/`.
-const IMAGES_DIRECTORY: &str = "build";
+pub(crate) const IMAGES_DIRECTORY: &str = "build";
 /// Every project's build-volume mountpoints, beneath the host mount root and outside every
 /// workspace mount: `<host mount root>/.build/<owner>/<repo>/<id>`.
 const MOUNTS_DIRECTORY: &str = ".build";
-/// The record beside each image: `<id>.asif.json`.
+/// The record beside each image: `<id>.dmg.json`.
 const RECORD_SUFFIX: &str = ".json";
 /// The lock beside each image that every job admitted on the volume holds shared for its whole
-/// run, and that a release takes exclusively: `<id>.asif.hold` ([`BuildVolumeHold`]).
+/// run, and that a release takes exclusively: `<id>.dmg.hold` ([`BuildVolumeHold`]).
 const HOLD_SUFFIX: &str = ".hold";
 /// The volume's own statement of the build-state paths it holds, at its root. It travels with
 /// every clone, so a fork knows what its source linked without rediscovering it.
 pub const STATE_FILE: &str = "cowshed-build-state.json";
-const RECORD_VERSION: u32 = 1;
+pub(crate) const RECORD_VERSION: u32 = 1;
 /// The capacity of a build volume created from nothing, unless `.cowshed.toml` `[build] capacity`
 /// says otherwise (16_build_volumes.md, "Substrate"). Sparse: a cap on build-cache growth, not an
 /// allocation.
@@ -619,6 +619,39 @@ impl BuildVolumeLayout {
         }
     }
 
+    /// Claim build volume `id` for re-adoption's move by the hold file beside the image it
+    /// actually is, `image` in this layout's images in whatever format it was written
+    /// (`<image>.hold`): a job admitted on a volume written before RAW holds that file, not the
+    /// RAW name. `None` while a job holds it; the claim keeps every new hold out until dropped.
+    pub(crate) fn claim_re_adopt_source(
+        &self,
+        id: &BuildVolumeId,
+        image: &Path,
+    ) -> io::Result<Option<ReleaseClaim>> {
+        if image.parent() != Some(self.images.as_path())
+            || image.file_stem().and_then(|stem| stem.to_str()) != Some(id.as_str())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "{} is not build volume {} in {}",
+                    image.display(),
+                    id.as_str(),
+                    self.images.display()
+                ),
+            ));
+        }
+        let file = open_hold(&crate::metadata::append_suffix(image, HOLD_SUFFIX))?;
+        match file.try_lock() {
+            Ok(()) => Ok(Some(ReleaseClaim {
+                id: id.clone(),
+                _file: file,
+            })),
+            Err(fs::TryLockError::WouldBlock) => Ok(None),
+            Err(fs::TryLockError::Error(error)) => Err(error),
+        }
+    }
+
     /// The volume a build link's target names, or `None` when the target is not one of this
     /// project's build mountpoints.
     pub fn volume_at(&self, target: &Path) -> Option<BuildVolumeId> {
@@ -709,7 +742,7 @@ impl BuildVolumeLayout {
         write_json(&path, record).map_err(|error| record_error(&path, &error))
     }
 
-    /// Every published build volume: each `<id>.asif` directly in the images directory.
+    /// Every published build volume: each `<id>.dmg` directly in the images directory.
     pub fn list(&self) -> crate::Result<Vec<BuildVolumeId>> {
         let entries = match fs::read_dir(&self.images) {
             Ok(entries) => entries,
@@ -925,11 +958,11 @@ mod tests {
         let id = BuildVolumeId::parse("0123456789abcdef0123456789abcdef").unwrap();
         assert_eq!(
             layout.image(&id),
-            Path::new("/store/acme/widget/build/0123456789abcdef0123456789abcdef.asif")
+            Path::new("/store/acme/widget/build/0123456789abcdef0123456789abcdef.dmg")
         );
         assert_eq!(
             layout.record(&id),
-            Path::new("/store/acme/widget/build/0123456789abcdef0123456789abcdef.asif.json")
+            Path::new("/store/acme/widget/build/0123456789abcdef0123456789abcdef.dmg.json")
         );
         assert_eq!(
             layout.mount(&id),

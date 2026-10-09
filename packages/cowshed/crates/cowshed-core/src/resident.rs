@@ -497,10 +497,10 @@ mod tests {
             fixture.workspace(&WorkspaceName::main(), &fixture.checkout, 1, 2);
             fixture.workspace(&raven(), &fixture.raven_mount, 2, 5);
             for index in 0..RETIRED_SESSIONS {
-                let leftover = project.sessions.join(format!("retired-{index}.asif"));
+                let leftover = project.sessions.join(format!("retired-{index}.dmg"));
                 std::fs::write(sidecar_path(&leftover), b"{ not a sidecar").expect("garbage");
                 std::fs::write(
-                    project.sessions.join(format!("retired-{index}.asif.lock")),
+                    project.sessions.join(format!("retired-{index}.dmg.lock")),
                     b"",
                 )
                 .expect("lock");

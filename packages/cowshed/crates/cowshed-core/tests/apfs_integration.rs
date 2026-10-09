@@ -10,7 +10,11 @@ fn native_apfs_clone_refuses_a_host_without_clonefile() {
 
     let backend = MacOsApfsBackend::new(SystemCommandRunner);
     assert!(matches!(
-        backend.clone_image(Path::new("/tmp/source.asif"), Path::new("/tmp/clone.asif")),
+        backend.clone_image(
+            Path::new("/tmp/source.dmg"),
+            Path::new("/tmp/clone.dmg"),
+            cowshed_core::apfs::ImageCapture::Detached,
+        ),
         Err(CloneFileError::UnsupportedPlatform)
     ));
 }

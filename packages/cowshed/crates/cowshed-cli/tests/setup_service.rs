@@ -106,7 +106,7 @@ fn occupied_census() -> WorkspaceCensus {
 fn detached_main() -> Vec<UnreachableMain> {
     vec![UnreachableMain {
         repo_id: RepoId::parse("acme/api").expect("repo"),
-        image: PathBuf::from("/private/cowshed/store/acme/api/main.asif"),
+        image: PathBuf::from("/private/cowshed/store/acme/api/main.dmg"),
         mountpoint: PathBuf::from("/Users/dev/src/api"),
         reason: String::from("main's volume is not mounted"),
     }]

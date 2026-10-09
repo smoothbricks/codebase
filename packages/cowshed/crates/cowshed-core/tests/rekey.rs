@@ -132,7 +132,7 @@ fn base_fixture(case: &str, name: &str) -> Fixture {
         main.image().to_owned()
     } else {
         fs::create_dir_all(&paths.sessions).expect("sessions");
-        paths.sessions.join(format!("{name}.asif"))
+        paths.sessions.join(format!("{name}.dmg"))
     };
     fs::write(&image, b"image").expect("image");
 
@@ -185,9 +185,9 @@ fn quarantined_fixture(case: &str, name: &str) -> Fixture {
         QUARANTINED_REVISION,
         &fixture.root.join("checkout"),
     )
-    .write_for_image(&entry.join(format!("{name}.asif")))
+    .write_for_image(&entry.join(format!("{name}.dmg")))
     .expect("quarantined sidecar");
-    let quarantined_sidecar_path = sidecar_path(&entry.join(format!("{name}.asif")));
+    let quarantined_sidecar_path = sidecar_path(&entry.join(format!("{name}.dmg")));
     assert!(quarantined_sidecar_path.is_file());
     let tombstone = serde_json::json!({
         "version": 1,

@@ -22,17 +22,19 @@ directly, Bun/Node applications use `cowshed-napi`, and shell-based agents use t
 ## Decisions already made (do not relitigate)
 
 - **Substrate**: clonefile'd disk images (Option B). Shadows rejected (2.34× worse sync writes, base-file GC
-  dependency). **One format: ASIF holding one case-sensitive APFS volume** — measured faster than SPARSE on every row
-  (2.1× create, 2.5× write, 5.6× read, 2.3× metadata; clonefile equal) and equal to case-insensitive ASIF within noise.
-  No fallback, no format field anywhere, macOS 26 is the floor. Created unprivileged: blank `--fs None` image, attach
-  `--noMount`, `newfs_apfs -U/-G … -e`, eject; attach is `diskutil image attach`, and `hdiutil` only reads the
-  attachment inventory. 01_storage.md.
-- **No templates**: main-as-base. `cowshed adopt` turns the existing checkout into an image mounted at its original
-  path; `cowshed new` clones main's live image (sync + clonefile, crash-consistent). Safe because secrets never live in
-  worktrees (gateway holds them; no `.env` files). The invariant is enforced, not assumed: a built-in scanner gates
-  `cowshed adopt` (blocking, full-tree, `--quarantine` escape), gates `cowshed push`/autosave on the content delta, and
-  audits in `cowshed doctor` (filename + known-token-shape rules, no entropy heuristics; explicit reasoned waivers
-  outside the image; `--secrets-deep` via gitleaks when installed). Spec: 02_workspaces.md.
+  dependency). **One format: RAW (UDRW) `.dmg` holding one case-sensitive APFS volume, stored as a sparse file**
+  (01_storage.md §Images). No fallback, no format field anywhere, macOS 26 is the floor. Historical, pre-cutover ASIF
+  measurements: ASIF was measured faster than SPARSE on every row (2.1× create, 2.5× write, 5.6× read, 2.3× metadata;
+  clonefile equal) and equal to case-insensitive ASIF within noise; they do not describe RAW. Blank templates are
+  created unprivileged: `diskutil image create blank --format RAW --fs None`, attach `--noMount`,
+  `newfs_apfs -U/-G … -e`, `fsck_apfs -q`, `hdiutil detach`; attach is `diskutil image attach` (01_storage.md).
+- **No workspace pools**: main-as-base; formatted blank templates serve image minting only. `cowshed adopt` turns the
+  existing checkout into an image mounted at its original path; `cowshed new` descriptor-clones main's live image after
+  a flush, with main still mounted (filesystem crash-consistent). Safe because secrets never live in worktrees (gateway
+  holds them; no `.env` files). The invariant is enforced, not assumed: a built-in scanner gates `cowshed adopt`
+  (blocking, full-tree, `--quarantine` escape), gates `cowshed push`/autosave on the content delta, and audits in
+  `cowshed doctor` (filename + known-token-shape rules, no entropy heuristics; explicit reasoned waivers outside the
+  image; `--secrets-deep` via gitleaks when installed). Spec: 02_workspaces.md.
 - **Stable repository identity and trusted policy**: `repo_id` comes from one explicitly chosen Git remote URL,
   normalized to lowercase `owner/repo` after discarding transport, credentials, host, leading slash, optional `.git`,
   query, and fragment. Controller-owned binding metadata records both the chosen URL and `repo_id`; every open
@@ -233,14 +235,16 @@ then targeted verification plus the repository's full Rust checks and a CLI tran
 **Resolved experiments** (2026-07-11, harnesses + results in `specs/cowshed/prototypes/apfs-workspace-bench/`; verdicts
 folded into the specs):
 
-- ASIF vs SPARSE → **ASIF only, case-sensitive** (2.1× create, 2.5× write, 5.6× read, 2.3× metadata; hdiutil cannot
-  attach ASIF, so attach is `diskutil image attach`; case-sensitive ASIF equals case-insensitive within noise).
-- Attach latency floor → **not flag-reducible** (`-noverify` ~15 ms noise); only a DiskImages2/diskarbitrationd-level
-  path could improve it — research item, budgets don't assume it.
-- Fork-mid-write clone validity → **10/10 clean** under continuous writer + streaming dd, both formats, `fsck_apfs -q`
-  and full `-n`; sync-before-clone is filesystem freshness, not crash-consistency. Checkpoint still requires the
-  separate supervisor artifact barrier so process-resident captured bytes and its manifest are durable;
-  regression-pinned in 08_testing.md.
+- ASIF vs SPARSE (2026-07-11, historical) → ASIF only, case-sensitive (2.1× create, 2.5× write, 5.6× read, 2.3×
+  metadata; case-sensitive ASIF equals case-insensitive within noise). **Superseded:** RAW (UDRW) `.dmg`,
+  case-sensitive, is the single format (01_storage.md §Images).
+- Attach latency floor (pre-cutover measurement) → **not flag-reducible** (`-noverify` ~15 ms noise); only a
+  DiskImages2/diskarbitrationd-level path could improve it — research item, budgets don't assume it.
+- Fork-mid-write clone validity (historical, pre-cutover) → **10/10 clean** under continuous writer + streaming dd, both
+  candidate formats, `fsck_apfs -q` and full `-n`; that finding judged sync-before-clone filesystem freshness, not
+  crash-consistency. 01_storage.md §Images now calls the flushed RAW descriptor clone filesystem crash-consistent.
+  Checkpoint still requires the separate supervisor artifact barrier so process-resident captured bytes and its manifest
+  are durable; regression-pinned in 08_testing.md.
 - (a) bunfig relative `install.cache.dir` → **works, resolves to project root** (bun 1.3.14); `[install] cacheDir` is
   silently ignored. Unused: under the isolated linker every checkout shares bun's global cache through one literal path
   (03_caches.md).

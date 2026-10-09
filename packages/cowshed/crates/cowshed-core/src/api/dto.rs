@@ -2620,6 +2620,9 @@ pub struct AdoptOptions {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub capacity: Option<String>,
     pub quarantine: bool,
+    /// Explicitly replace an adopted main through verified, retained-source re-adoption.
+    /// False keeps ordinary adoption idempotent.
+    pub re_adopt: bool,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]

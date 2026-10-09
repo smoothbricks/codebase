@@ -1,4 +1,4 @@
-//! The store's blank templates (01_storage.md, "Images"): one formatted, verified, detached ASIF
+//! The store's blank templates (01_storage.md, "Images"): one formatted, verified, detached RAW
 //! image per capacity and owner, from which every new image is cloned. A mint is then one
 //! `clonefile` and one attach. The `diskutil image create`, the formatting attach, the
 //! `newfs_apfs` and the detach are paid once per store and capacity, here, instead of once per
@@ -30,7 +30,7 @@ const BLANK_TEMPLATE_DIRECTORY: &str = ".blank";
 /// "Substrate").
 pub const BLANK_TEMPLATE_LABEL: &str = "[cowshed]";
 
-/// `<store>/.blank/<bytes>-<uid>-<gid>.asif`: the template a mint at `capacity` clones for the
+/// `<store>/.blank/<bytes>-<uid>-<gid>.dmg`: the template a mint at `capacity` clones for the
 /// invoking user. The owner is part of the name because `newfs_apfs -U/-G` writes it into the
 /// volume root, and every clone inherits it.
 pub fn blank_template_path(store_root: &Path, capacity: ImageCapacity) -> PathBuf {
@@ -41,7 +41,7 @@ pub fn blank_template_path(store_root: &Path, capacity: ImageCapacity) -> PathBu
 const STAGING_SUFFIX: &str = "-minting";
 
 /// `<store>/.blank/<bytes>-<uid>-<gid>-minting-<nonce>`: where one minter writes, formats and
-/// detaches the template before it takes its name, as `<stem>.asif`. Each call answers a name
+/// detaches the template before it takes its name, as `<stem>.dmg`. Each call answers a name
 /// no minter used before, so a path is attached at most once in its life: a minter killed with
 /// its attach still queued on `storagekitd` can have that attach land later, after the next
 /// minter removed its file, and on a reused name it landed beside the next minter's own attach
@@ -93,7 +93,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
             let template = blank_template(&self.backend, &self.config.store_root, capacity)?;
             timed_apfs_step(leg, "clonefile", || {
                 self.backend
-                    .clone_image(&template, image)
+                    .clone_image(&template, image, crate::apfs::ImageCapture::Detached)
                     .map_err(ApfsError::from)
             })?;
             sync_parent_path(image)?;
@@ -149,7 +149,7 @@ pub fn blank_template<R: CommandRunner>(
     Ok(template)
 }
 
-/// Create, format, verify and detach a fresh template at `staged_stem.asif`, a name nothing has
+/// Create, format, verify and detach a fresh template at `staged_stem.dmg`, a name nothing has
 /// held before.
 fn mint<R: CommandRunner>(
     backend: &MacOsApfsBackend<R>,

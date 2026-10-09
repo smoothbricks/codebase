@@ -17,7 +17,9 @@ use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 use super::scratch_apfs::ROOT_PREFIX;
-use super::{ApfsBackend, ImageCapacity, MacOsApfsBackend, SystemCommandRunner, blank_template};
+use super::{
+    ApfsBackend, ImageCapacity, ImageCapture, MacOsApfsBackend, SystemCommandRunner, blank_template,
+};
 
 /// The 1 GiB test cap (08_testing.md): the template's capacity, and so every clone's.
 pub const CAPACITY: ImageCapacity = ImageCapacity::from_gibibytes(1);
@@ -25,7 +27,7 @@ pub const CAPACITY: ImageCapacity = ImageCapacity::from_gibibytes(1);
 /// The user's template, minted by whichever test asks first.
 static TEMPLATE: LazyLock<PathBuf> = LazyLock::new(mint_once);
 
-/// Put a formatted, detached, one-volume ASIF image of [`CAPACITY`] at `destination`, which must
+/// Put a formatted, detached, one-volume RAW image of [`CAPACITY`] at `destination`, which must
 /// not exist yet, creating its directory: an APFS clone of this run's template.
 pub fn blank_image(destination: &Path) {
     let directory = destination.parent().expect("an image has a directory");
@@ -33,7 +35,7 @@ pub fn blank_image(destination: &Path) {
         .unwrap_or_else(|error| panic!("image directory {}: {error}", directory.display()));
     let template = TEMPLATE.as_path();
     MacOsApfsBackend::new(SystemCommandRunner)
-        .clone_image(template, destination)
+        .clone_image(template, destination, ImageCapture::Detached)
         .unwrap_or_else(|error| {
             panic!(
                 "clone the run's blank image {} to {}: {error}",

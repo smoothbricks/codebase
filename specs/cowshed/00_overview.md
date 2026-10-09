@@ -8,10 +8,10 @@ closed and widen only through explicit, controller-owned grants.
 
 ## Platforms
 
-| Platform | Substrate                           | Sandbox                      | Secrets                        |
-| -------- | ----------------------------------- | ---------------------------- | ------------------------------ |
-| macOS    | APFS images in ASIF files (`.asif`) | Seatbelt (`sandbox-exec`)    | Keychain                       |
-| Linux    | ZFS datasets (snapshot + clone)     | Landlock + network namespace | secret-service / systemd-creds |
+| Platform | Substrate                         | Sandbox                      | Secrets                        |
+| -------- | --------------------------------- | ---------------------------- | ------------------------------ |
+| macOS    | APFS images in RAW files (`.dmg`) | Seatbelt (`sandbox-exec`)    | Keychain                       |
+| Linux    | ZFS datasets (snapshot + clone)   | Landlock + network namespace | secret-service / systemd-creds |
 
 The substrate and enforcement layers sit behind traits (09_substrates.md, 04_sandbox.md); every concept above them —
 grants, gateway, cache taxonomy, CLI contract, marker files — is identical across platforms.
@@ -66,9 +66,9 @@ Agent-driven development multiplies workspaces. Three failure modes follow:
                     ┌────────────────────┘          └──────────────────┐
                     ▼                                                  ▼
         /private/cowshed/store/  (= the cowshed.store volume)                  cowshed-gateway (localhost)
-        <owner>/<repo>/main.asif ─ clonefile ─►                   npm mirror · per-workspace CA interception
-        <owner>/<repo>/sessions/<ws>.asif                         repo-mirror verb · Arrow audit (13)
-        <owner>/<repo>/sessions/<ws>.asif.grants.json                   │
+        <owner>/<repo>/main.dmg ─ clonefile ─►                    npm mirror · per-workspace CA interception
+        <owner>/<repo>/sessions/<ws>.dmg                          repo-mirror verb · Arrow audit (13)
+        <owner>/<repo>/sessions/<ws>.dmg.grants.json                    │
                     │                                                ▼
                     ▼ diskutil image attach, mount_apfs      ~/Library/Caches/dev.cowshed/
         <mount-root>/<owner>/<repo>/<ws>/                        {mirror,repo-mirrors}/  (gateway-only)
@@ -77,7 +77,7 @@ Agent-driven development multiplies workspaces. Three failure modes follow:
                     └─ cargo · bun · zig · gradle ─►  each tool's own cache in the host HOME (03_caches.md)
 ```
 
-The diagram shows the macOS/APFS substrate: every image is a case-sensitive APFS volume in one ASIF file (`.asif`),
+The diagram shows the macOS/APFS substrate: every image is a case-sensitive APFS volume in one RAW file (`.dmg`),
 attached with `diskutil image attach` (01_storage.md). On Linux the same logical shape holds with ZFS datasets in place
 of image files and the store mounted directly at `/private/cowshed/store` (09_substrates.md). The store volume is
 dedicated: the Data volume carries no image or store byte (01_storage.md). Shared caches are not on the store: each
@@ -157,6 +157,7 @@ accepted. The remaining unsandboxed surfaces — main and the controller tooling
 kernel uid boundary by running the whole stack as a dedicated `dev` account (deployment posture B, 14_nix.md); that is
 the recommended hardening, not a substrate change.
 
-**Warm pools rejected.** Pre-attached image pools would hide attach latency (~235 ms) but add a claim/refill state
-machine and staleness handling. The cold path already meets the ≤ 1 s budget; the acceptable-latency envelope (10 s for
-humans, minutes for agents) makes pooling pure complexity.
+**Warm pools rejected.** Pre-attached image pools would hide attach latency but add a claim/refill state machine and
+staleness handling. The ~235 ms attach figure is a pre-cutover APFS measurement (08_testing.md), not a RAW figure, and
+the ≤ 1 s cold budget has no RAW measurement yet. The acceptable-latency envelope (10 s for humans, minutes for agents)
+makes pooling pure complexity.

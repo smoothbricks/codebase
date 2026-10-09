@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use cowshed_core::apfs::{
     ApfsBackend, AttachedImage, CommandRunner, CreateImageRequest, DetachIntent, DiskImageSource,
-    MacOsApfsBackend, MountAccess, SystemCommandRunner, volume_name,
+    ImageCapture, MacOsApfsBackend, MountAccess, SystemCommandRunner, volume_name,
 };
 use cowshed_core::fork_lock::Run as _;
 use cowshed_core::metadata::{
@@ -27,8 +27,8 @@ use cowshed_core::storage::apfs::{
     IncarnationSource, MetadataPolicy, TokioApfsBlockingLane,
 };
 use cowshed_core::storage::lifecycle::{
-    AdoptRequest, Destination, LifecyclePlanner, LifecycleWorkspace, MountIntent, MountState,
-    OperationIdentity, Pin, RestoreMode, Revision, Substrate,
+    AdoptHandoff, AdoptRequest, Destination, LifecyclePlanner, LifecycleWorkspace, MountIntent,
+    MountState, OperationIdentity, Pin, RestoreMode, Revision, Substrate,
 };
 use cowshed_core::storage::{CheckpointLabel, StorageLayout, WORKSPACE_MARKER_PATH};
 
@@ -124,7 +124,7 @@ impl Drop for ChurnGuard {
 /// running beside this one; the backend's per-image leases keep their images independent rather
 /// than queueing them. A missing capability is a failure, never a skip.
 #[test]
-fn real_apfs_asif_substrate_lifecycle() {
+fn real_apfs_raw_substrate_lifecycle() {
     match run_lifecycle() {
         Ok(evidence) => eprintln!("APFS: {evidence}"),
         Err(error) => panic!("required APFS capability failed: {error}"),
@@ -191,7 +191,12 @@ fn run_lifecycle() -> Result<String, Box<dyn Error>> {
             capacity: ImageCapacity::from_gibibytes(1),
             topology_revision: Revision::new(0),
             source_checkout: checkout_path.clone(),
-            pre_cowshed_checkout: PathBuf::from(format!("{}.pre-cowshed", checkout_path.display())),
+            handoff: AdoptHandoff::Checkout {
+                pre_cowshed_checkout: PathBuf::from(format!(
+                    "{}.pre-cowshed",
+                    checkout_path.display()
+                )),
+            },
             identity: identity()?,
         })?;
         let (receipt, ()) = substrate
@@ -662,7 +667,9 @@ impl KillWindow {
             capacity: ImageCapacity::from_gibibytes(1),
             topology_revision: Revision::new(0),
             source_checkout: self.checkout.clone(),
-            pre_cowshed_checkout: self.pre_cowshed.clone(),
+            handoff: AdoptHandoff::Checkout {
+                pre_cowshed_checkout: self.pre_cowshed.clone(),
+            },
             identity: self.identity.clone(),
         })?;
         let (receipt, ()) =
@@ -715,7 +722,7 @@ fn real_apfs_adopt_resumes_a_fenced_image_killed_between_clone_and_attach() {
     let backend = world.host().backend();
     let template = blank_template(backend, &world.store, CAPACITY).expect("the seeded template");
     backend
-        .clone_image(&template, &world.image)
+        .clone_image(&template, &world.image, ImageCapture::Detached)
         .expect("the template cloned under the canonical name");
 
     let adopted = world.adopt().expect("adopt resumes");
@@ -733,7 +740,7 @@ fn real_apfs_adopt_mints_a_template_over_the_one_a_killed_minter_left_attached()
     let world = KillWindow::unseeded("adopt-kill-template").expect("kill window");
     let backend = world.host().backend();
     let stem = blank_template_staged_stem(&world.store, CAPACITY);
-    let leftover = stem.with_extension("asif");
+    let leftover = stem.with_extension("dmg");
     fs::create_dir_all(stem.parent().expect("a template has a directory"))
         .expect("template directory");
     let request = CreateImageRequest {
@@ -821,11 +828,12 @@ fn real_apfs_finishing_an_adoption_killed_before_its_checkout_swap() {
 
     for _ in 0..2 {
         world
-            .block_on(
-                world
-                    .substrate
-                    .finish_adoption(&world.main, &world.pre_cowshed),
-            )
+            .block_on(world.substrate.finish_adoption(
+                &world.main,
+                &AdoptHandoff::Checkout {
+                    pre_cowshed_checkout: world.pre_cowshed.clone(),
+                },
+            ))
             .expect("runtime")
             .expect("finish adoption");
     }
@@ -841,11 +849,12 @@ fn real_apfs_finishing_an_adoption_killed_between_checkout_swap_and_mount() {
     assert!(world.mounted_device().expect("mounts").is_none());
 
     world
-        .block_on(
-            world
-                .substrate
-                .finish_adoption(&world.main, &world.pre_cowshed),
-        )
+        .block_on(world.substrate.finish_adoption(
+            &world.main,
+            &AdoptHandoff::Checkout {
+                pre_cowshed_checkout: world.pre_cowshed.clone(),
+            },
+        ))
         .expect("runtime")
         .expect("finish adoption");
     world.assert_adopted().expect("adopted");

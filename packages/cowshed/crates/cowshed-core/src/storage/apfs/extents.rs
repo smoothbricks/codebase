@@ -423,7 +423,7 @@ mod tests {
     /// Two data regions around a hole and a trailing hole — the shape of a sparse disk image —
     /// with every other page of the data rewritten while a clone shares it.
     fn fragmented_sparse_file(root: &Path) -> (PathBuf, Vec<(u64, u64)>) {
-        let path = root.join("image.asif");
+        let path = root.join("image.dmg");
         let file = OpenOptions::new()
             .create_new(true)
             .write(true)

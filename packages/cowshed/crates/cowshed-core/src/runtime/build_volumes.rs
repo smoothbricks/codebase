@@ -2952,8 +2952,8 @@ fn main() {
 
     /// Build volume `id`, mounted, its image recording `gib` GiB: a clone of the run's blank
     /// image put in place and mounted the way a fork's volume is. Creation is not what these
-    /// tests prove. Above the 1 GiB test cap only the clone's ASIF header grows and its container
-    /// stays the template's: these tests compare image capacities, which the header records, and
+    /// tests prove. Above the 1 GiB test cap only the clone's sparse RAW file length grows and its
+    /// container stays the template's: these tests compare virtual image capacities, not guest free space, and
     /// a mint at another capacity would cost the store a template of its own — a `diskutil image
     /// create`, a formatting attach and a detach.
     #[cfg(target_os = "macos")]
@@ -2970,7 +2970,7 @@ fn main() {
         if capacity > crate::blank_image::CAPACITY {
             SystemCommandRunner
                 .grow_image(&image, capacity)
-                .expect("grow the clone's image header");
+                .expect("grow the clone's sparse image length");
         }
         host.mount_build_volume(layout, id)
             .expect("mount a build volume")

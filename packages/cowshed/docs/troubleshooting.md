@@ -141,14 +141,21 @@ not override a pin. Unpin explicitly before expecting GC to remove it.
 
 ## Disk usage
 
-Images are sparse files that grow with churn; deleting files inside a volume does not shrink the image file.
+Images are sparse files that grow with churn; deleting files inside a volume does not shrink the image file. Sparse
+creation reserves no host space for capacity (01_storage.md, "Capacity and allocation"). Guest-freed space is not
+returned automatically: in the RAW measurement, a deleted 1 GiB payload kept its host allocation after guest sync, image
+fsync, clean unmount and detach. `hdiutil compact` does not support RAW. To reclaim the space, run a verified
+re-adoption (`cowshed adopt <checkout> --re-adopt`, 02_workspaces.md): the filesystem is copied into a fresh sparse RAW
+image, verified, and the old image is kept until you remove it after verification. The host frees the old blocks only
+after the retained image and every clone or checkpoint sharing them are released.
+
 `cowshed gc` reclaims retired images, removes orphans, and prunes expired checkpoints (`--dry-run` lists each candidate
 first):
 
 ```
 $ cowshed gc --dry-run
 44023414784
-cowshed: would delete /private/cowshed/store/acme/widget/sessions/.trash/fox-3f2a….asif (18203238400 bytes; reason: workspace was retired)
+cowshed: would delete /private/cowshed/store/acme/widget/sessions/.trash/fox-3f2a….dmg (18203238400 bytes; reason: workspace was retired)
 …
 cowshed: dry run examined 12 objects; 4 candidates, 44023414784 bytes deletable
 $ cowshed gc

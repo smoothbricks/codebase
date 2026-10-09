@@ -1816,6 +1816,7 @@ fn adopt_options(args: AdoptArgs) -> Result<AdoptOptions> {
         repo_id: args.repo_id.map(os_repo_id).transpose()?,
         capacity: args.capacity.map(os_capacity).transpose()?,
         quarantine: args.quarantine,
+        re_adopt: args.re_adopt,
     })
 }
 
@@ -5263,13 +5264,13 @@ mod tests {
         let mains = vec![
             UnreachableMain {
                 repo_id: RepoId::parse("acme/alpha").expect("repo"),
-                image: PathBuf::from("/store/acme/alpha/main.asif"),
+                image: PathBuf::from("/store/acme/alpha/main.dmg"),
                 mountpoint: PathBuf::from("/checkouts/alpha"),
                 reason: "main's volume is not mounted".into(),
             },
             UnreachableMain {
                 repo_id: RepoId::parse("acme/beta").expect("repo"),
-                image: PathBuf::from("/store/acme/beta/main.asif"),
+                image: PathBuf::from("/store/acme/beta/main.dmg"),
                 mountpoint: PathBuf::from("/checkouts/beta"),
                 reason: "main's volume is not mounted".into(),
             },
@@ -5302,7 +5303,7 @@ mod tests {
     fn attach_mains_hint_matches_doctor_main_hint() {
         let main = UnreachableMain {
             repo_id: RepoId::parse("acme/alpha").expect("repo"),
-            image: PathBuf::from("/store/acme/alpha/main.asif"),
+            image: PathBuf::from("/store/acme/alpha/main.dmg"),
             mountpoint: PathBuf::from("/checkouts/alpha"),
             reason: "main's volume is not mounted".into(),
         };
@@ -6138,7 +6139,7 @@ mod tests {
 
         let main = UnreachableMain {
             repo_id: RepoId::parse("acme/widget").expect("repo"),
-            image: PathBuf::from("/private/cowshed/store/acme/widget/main.asif"),
+            image: PathBuf::from("/private/cowshed/store/acme/widget/main.dmg"),
             mountpoint: PathBuf::from("/Users/dev/src/widget"),
             reason: String::from("main's volume is not mounted"),
         };
@@ -6150,7 +6151,7 @@ mod tests {
         assert_eq!(
             finding.message,
             "acme/widget: main is not mounted at /Users/dev/src/widget \
-             (image /private/cowshed/store/acme/widget/main.asif): main's volume is not mounted"
+             (image /private/cowshed/store/acme/widget/main.dmg): main's volume is not mounted"
         );
         assert_eq!(finding.hint, "cowshed gateway start");
         assert_eq!(finding.path.as_deref(), Some(main.mountpoint.as_path()));
@@ -6174,7 +6175,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let store = root.join("store");
         let project = bind_test_repository(&store, "acme/widget");
-        let metadata = project.join("sessions/raven.asif.grants.json");
+        let metadata = project.join("sessions/raven.dmg.grants.json");
         std::fs::create_dir_all(metadata.parent().unwrap()).unwrap();
         let plan = plan_mount_root_change(&store, &root.join("configured-mount-root"), []).unwrap();
         execute_mount_root_change(&plan).unwrap();
@@ -6279,7 +6280,7 @@ mod tests {
     ) {
         let sessions = store.join(owner).join(repo).join("sessions");
         std::fs::create_dir_all(&sessions).unwrap();
-        let image = sessions.join(format!("{workspace}.asif"));
+        let image = sessions.join(format!("{workspace}.dmg"));
         std::fs::write(&image, b"image").unwrap();
         let mut sidecar = serde_json::json!({
             "version": 1,

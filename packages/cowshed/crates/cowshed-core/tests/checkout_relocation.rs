@@ -58,7 +58,7 @@ impl Relocated {
         let live_root = root.join("dev/projects/example-app");
         let session = root.join("mnt/example-org/example-app/relocated-session");
         let store = root.join("store/example-org/example-app");
-        let image = store.join("sessions/relocated-session.asif");
+        let image = store.join("sessions/relocated-session.dmg");
         for path in [&live_root, &session] {
             fs::create_dir_all(path).expect("fixture tree");
         }

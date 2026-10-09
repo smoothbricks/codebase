@@ -384,7 +384,7 @@ fn doctor_gc_and_empty_results_have_exact_shapes() {
             severity: FindingSeverity::Error,
             message: "detached format disagrees with extension".into(),
             hint: "cowshed doctor --fix-format raven".into(),
-            path: Some(PathBuf::from("/store/raven.asif.grants.json")),
+            path: Some(PathBuf::from("/store/raven.dmg.grants.json")),
         }],
     };
     assert_eq!(
@@ -396,7 +396,7 @@ fn doctor_gc_and_empty_results_have_exact_shapes() {
                 "severity": "error",
                 "message": "detached format disagrees with extension",
                 "hint": "cowshed doctor --fix-format raven",
-                "path": "/store/raven.asif.grants.json"
+                "path": "/store/raven.dmg.grants.json"
             }]
         })
     );
@@ -411,7 +411,7 @@ fn doctor_gc_and_empty_results_have_exact_shapes() {
         dry_run: true,
         candidates: vec![GcCandidate {
             identity: gc_identity,
-            path: PathBuf::from("/store/checkpoints/raven/old.asif"),
+            path: PathBuf::from("/store/checkpoints/raven/old.dmg"),
             bytes: 4096,
             reason: GcReason::ExpiredCheckpoint,
         }],
@@ -428,7 +428,7 @@ fn doctor_gc_and_empty_results_have_exact_shapes() {
             "dryRun":true,
             "candidates":[{
                 "identity":gc_identity.to_string(),
-                "path":"/store/checkpoints/raven/old.asif",
+                "path":"/store/checkpoints/raven/old.dmg",
                 "bytes":4096,
                 "reason":"expiredCheckpoint"
             }],
@@ -736,9 +736,14 @@ fn all_lifecycle_options_use_camel_case_and_omit_only_optionals() {
             repo_id: Some(repo()),
             capacity: Some("100g".into()),
             quarantine: true,
+            re_adopt: true,
         })
         .unwrap(),
-        json!({"repoId":"acme/widget","capacity":"100g","quarantine":true})
+        json!({"repoId":"acme/widget","capacity":"100g","quarantine":true,"reAdopt":true})
+    );
+    assert_eq!(
+        serde_json::to_value(AdoptOptions::default()).unwrap(),
+        json!({"quarantine":false,"reAdopt":false})
     );
     assert_eq!(
         serde_json::to_value(CreateOptions {

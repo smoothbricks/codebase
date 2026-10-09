@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use cowshed_core::apfs::{
-    ApfsBackend, CommandRunner, DetachIntent, DiskImageSource, MacOsApfsBackend,
+    ApfsBackend, CommandRunner, DetachIntent, DiskImageSource, ImageCapture, MacOsApfsBackend,
     SystemCommandRunner,
 };
 use cowshed_core::api::dto::{AdoptOptions, CreateOptions, RemoveOptions, RevisionTarget};
@@ -93,6 +93,7 @@ impl Fixture {
                     repo_id: Some(self.repo.clone()),
                     capacity: Some("1g".to_owned()),
                     quarantine: false,
+                    re_adopt: false,
                 },
             }),
         )

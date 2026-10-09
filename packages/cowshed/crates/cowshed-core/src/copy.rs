@@ -80,6 +80,7 @@ struct Entry {
     kind: EntryKind,
     mode: u32,
     size: u64,
+    allocated_bytes: u64,
     mtime: (i64, i64),
     ctime: (i64, i64),
     device: u64,
@@ -111,6 +112,7 @@ impl Entry {
             kind,
             mode: metadata.mode() & 0o7777,
             size: metadata.size(),
+            allocated_bytes: metadata.blocks().saturating_mul(512),
             mtime: (metadata.mtime(), metadata.mtime_nsec()),
             ctime: (metadata.ctime(), metadata.ctime_nsec()),
             device: metadata.dev(),
@@ -173,6 +175,192 @@ pub async fn copy_with_budget(
     })
     .await
     .map_err(|error| CowshedError::internal(format!("repository copy worker failed: {error}")))?
+}
+
+/// Content evidence and regular-file allocations observed in the same verification walk.
+/// Hard-link aliases are counted once. Separate CoW-sharing inodes still have their own
+/// st_blocks values; these are file allocations, not an estimate of unique host-device blocks.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CopyVerification {
+    pub digest: crate::api::Sha256Digest,
+    pub source_allocated_bytes: u64,
+    pub copied_allocated_bytes: u64,
+}
+
+/// One hard-linked inode already byte-compared in this walk: the destination inode it was
+/// compared against, and the digest of its payload, reused for every other name of that inode.
+struct VerifiedAlias {
+    copied_inode: (u64, u64),
+    digest: crate::api::Sha256Digest,
+}
+
+/// Verify the copied namespace, metadata, symlink targets and every regular-file byte before
+/// adoption stamps its own marker and credentials. Reuse the copier's volume-metadata and
+/// runtime-artifact exclusions; never follow a copied symlink while reading file content.
+pub(crate) fn verify_tree_blocking(source: &Path, destination: &Path) -> Result<CopyVerification> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let before = snapshot(source)?;
+    let copied = snapshot(destination)?;
+    let mismatch = |relative: &Path, reason: &str| {
+        CowshedError::integrity(
+            format!("copied tree differs at {}: {reason}", render_path(relative)),
+            "keep the source tree and repair the copy before re-running adoption",
+        )
+    };
+    if before.keys().ne(copied.keys()) {
+        return Err(CowshedError::integrity(
+            "copied tree has a different path set",
+            "keep the source tree and repair the copy before re-running adoption",
+        ));
+    }
+    let mut digest = Sha256::new();
+    let mut source_allocated_bytes = 0_u64;
+    let mut copied_allocated_bytes = 0_u64;
+    let mut aliases: BTreeMap<(u64, u64), VerifiedAlias> = BTreeMap::new();
+    let mut source_bytes = [0_u8; 65536];
+    let mut destination_bytes = [0_u8; 65536];
+    for (relative, original) in &before {
+        let copy = copied
+            .get(relative)
+            .ok_or_else(|| mismatch(relative, "missing path"))?;
+        if original.kind != copy.kind || original.mode != copy.mode || original.mtime != copy.mtime
+        {
+            return Err(mismatch(relative, "type, mode or modification time"));
+        }
+        if original.kind != EntryKind::Directory && original.size != copy.size {
+            return Err(mismatch(relative, "file length"));
+        }
+        let path_bytes = relative.as_os_str().as_bytes();
+        let path_length = u64::try_from(path_bytes.len())
+            .map_err(|_| CowshedError::internal("path length exceeds the digest framing"))?;
+        digest.update(path_length.to_le_bytes());
+        digest.update(path_bytes);
+        digest.update(original.mode.to_le_bytes());
+        digest.update(original.mtime.0.to_le_bytes());
+        digest.update(original.mtime.1.to_le_bytes());
+        let source_path = source.join(relative);
+        let destination_path = destination.join(relative);
+        match original.kind {
+            EntryKind::Directory => digest.update([0]),
+            EntryKind::Symlink => {
+                digest.update([1]);
+                let target = fs::read_link(&source_path)
+                    .map_err(|error| read_error(&source_path, &error))?;
+                let copied_target = fs::read_link(&destination_path)
+                    .map_err(|error| read_error(&destination_path, &error))?;
+                if target != copied_target {
+                    return Err(mismatch(relative, "symlink target"));
+                }
+                digest.update(original.size.to_le_bytes());
+                digest.update(target.as_os_str().as_bytes());
+            }
+            EntryKind::File => {
+                digest.update([2]);
+                digest.update(original.size.to_le_bytes());
+                let source_inode = (original.device, original.inode);
+                let copied_inode = (copy.device, copy.inode);
+                if let Some(VerifiedAlias {
+                    copied_inode: verified_inode,
+                    digest: payload_digest,
+                }) = aliases.get(&source_inode)
+                {
+                    if *verified_inode != copied_inode {
+                        return Err(mismatch(relative, "hard-link relationship"));
+                    }
+                    // This same immutable inode was already compared byte-for-byte. Record its
+                    // digest for this name without rereading either hard-link alias.
+                    digest.update(payload_digest.as_bytes());
+                    continue;
+                }
+                source_allocated_bytes = source_allocated_bytes
+                    .checked_add(original.allocated_bytes)
+                    .ok_or_else(|| CowshedError::internal("source allocation sum overflow"))?;
+                copied_allocated_bytes =
+                    copied_allocated_bytes
+                        .checked_add(copy.allocated_bytes)
+                        .ok_or_else(|| CowshedError::internal("copied allocation sum overflow"))?;
+                let open = |path: &Path| {
+                    fs::OpenOptions::new()
+                        .read(true)
+                        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                        .open(path)
+                        .map_err(|error| read_error(path, &error))
+                };
+                let source_file = open(&source_path)?;
+                let mut destination_file = open(&destination_path)?;
+                if copy.allocated_bytes > original.allocated_bytes.saturating_add(65536)
+                    && original.allocated_bytes < original.size
+                    && native::has_holes(&source_file, original.size)
+                        .map_err(|error| read_error(&source_path, &error))?
+                {
+                    return Err(mismatch(relative, "sparse holes were materialized"));
+                }
+                let mut payload_digest = Sha256::new();
+                let mut reader = source_file.take(original.size);
+                let mut read_bytes = 0_u64;
+                loop {
+                    let count = reader
+                        .read(&mut source_bytes)
+                        .map_err(|error| read_error(&source_path, &error))?;
+                    if count == 0 {
+                        break;
+                    }
+                    destination_file
+                        .read_exact(&mut destination_bytes[..count])
+                        .map_err(|error| read_error(&destination_path, &error))?;
+                    if source_bytes[..count] != destination_bytes[..count] {
+                        return Err(mismatch(relative, "file content"));
+                    }
+                    payload_digest.update(&source_bytes[..count]);
+                    read_bytes += u64::try_from(count)
+                        .map_err(|_| CowshedError::internal("read count exceeds u64"))?;
+                }
+                if read_bytes != original.size {
+                    return Err(mismatch(relative, "source shortened during verification"));
+                }
+                let mut extra = [0];
+                if reader
+                    .into_inner()
+                    .read(&mut extra)
+                    .map_err(|error| read_error(&source_path, &error))?
+                    != 0
+                    || destination_file
+                        .read(&mut extra)
+                        .map_err(|error| read_error(&destination_path, &error))?
+                        != 0
+                {
+                    return Err(mismatch(relative, "file grew during verification"));
+                }
+                let payload_digest =
+                    crate::api::Sha256Digest::from_bytes(payload_digest.finalize().into());
+                digest.update(payload_digest.as_bytes());
+                if original.is_hard_linked() {
+                    aliases.insert(
+                        source_inode,
+                        VerifiedAlias {
+                            copied_inode,
+                            digest: payload_digest,
+                        },
+                    );
+                }
+            }
+        }
+    }
+    if snapshot(source)? != before || snapshot(destination)? != copied {
+        return Err(CowshedError::conflict(
+            "source or copied tree changed during verification",
+            "stop the writers and re-run adoption",
+        ));
+    }
+    Ok(CopyVerification {
+        digest: crate::api::Sha256Digest::from_bytes(digest.finalize().into()),
+        source_allocated_bytes,
+        copied_allocated_bytes,
+    })
 }
 
 /// The convergence loop, with the source observation injected.
@@ -936,6 +1124,7 @@ mod tests {
 
     /// `.git` object stores and package stores are full of hard links. Expanding
     /// them into independent copies inflates the image for nothing.
+    #[cfg(not(target_os = "macos"))]
     #[test]
     #[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
     fn host_controller_preserves_hard_linked_files_as_a_single_inode() {
@@ -1292,5 +1481,182 @@ mod tests {
             }
         }
         fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn verification_walk_checks_content_namespace_and_link_targets() {
+        use std::os::unix::fs::symlink;
+        let (root, source, destination) = copy_roots("verified-walk");
+        let relative = Path::new("payload");
+        fs::write(source.join(relative), b"original").unwrap();
+        symlink("payload", source.join("link")).unwrap();
+        run(&source, &destination, 6);
+        let original = super::verify_tree_blocking(&source, &destination).unwrap();
+
+        let source_time = fs::metadata(source.join(relative))
+            .unwrap()
+            .modified()
+            .unwrap();
+        fs::write(destination.join(relative), b"tampered").unwrap();
+        fs::File::open(destination.join(relative))
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(source_time))
+            .unwrap();
+        let error = super::verify_tree_blocking(&source, &destination).unwrap_err();
+        assert_eq!(error.code, crate::ErrorCode::Integrity);
+        assert!(error.message.contains("file content"), "{}", error.message);
+        fs::write(destination.join(relative), b"original").unwrap();
+        fs::File::open(destination.join(relative))
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(source_time))
+            .unwrap();
+        assert_eq!(
+            super::verify_tree_blocking(&source, &destination).unwrap(),
+            original
+        );
+
+        fs::write(destination.join("extra"), b"not in source").unwrap();
+        let error = super::verify_tree_blocking(&source, &destination).unwrap_err();
+        assert_eq!(error.code, crate::ErrorCode::Integrity);
+        assert!(error.message.contains("path set"), "{}", error.message);
+        fs::remove_file(destination.join("extra")).unwrap();
+        super::native::directory_metadata(&source, &destination).unwrap();
+        assert_eq!(
+            super::verify_tree_blocking(&source, &destination).unwrap(),
+            original
+        );
+
+        #[cfg(target_os = "macos")]
+        {
+            fs::remove_file(destination.join("link")).unwrap();
+            symlink("changed", destination.join("link")).unwrap();
+            super::native::directory_metadata(&source.join("link"), &destination.join("link"))
+                .unwrap();
+            super::native::directory_metadata(&source, &destination).unwrap();
+            assert_eq!(
+                fs::read_link(destination.join("link")).unwrap(),
+                PathBuf::from("changed")
+            );
+            let source_link = fs::symlink_metadata(source.join("link")).unwrap();
+            let destination_link = fs::symlink_metadata(destination.join("link")).unwrap();
+            assert_eq!(source_link.len(), destination_link.len());
+            assert_eq!(source_link.mode(), destination_link.mode());
+            assert_eq!(
+                source_link.modified().unwrap(),
+                destination_link.modified().unwrap()
+            );
+            let error = super::verify_tree_blocking(&source, &destination).unwrap_err();
+            assert_eq!(error.code, crate::ErrorCode::Integrity);
+            assert!(
+                error.message.contains("symlink target"),
+                "{}",
+                error.message
+            );
+        }
+        assert_eq!(fs::read(source.join(relative)).unwrap(), b"original");
+        assert_eq!(
+            fs::read_link(source.join("link")).unwrap(),
+            PathBuf::from("payload")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// One cross-volume copy walk covers dense bytes, sparse allocation, links, metadata, resumed
+    /// verification and a same-length corruption control without paying another volume setup.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+    fn host_controller_copy_preserves_holes_and_verifies_each_lifecycle_step() {
+        use crate::apfs::{ApfsBackend, MacOsApfsBackend, MountAccess, SystemCommandRunner};
+        use std::io::{Seek, SeekFrom, Write};
+        use std::os::unix::fs::symlink;
+
+        let root = crate::scratch_apfs::ScratchRoot::new("verified-sparse-copy").unwrap();
+        let source = root.path().join("source");
+        let destination = root.path().join("destination");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("dense"), b"original").unwrap();
+        let sparse_path = source.join("sparse");
+        let mut sparse = fs::File::create(&sparse_path).unwrap();
+        sparse.set_len(64 * 1024 * 1024).unwrap();
+        sparse.seek(SeekFrom::Start(32 * 1024 * 1024)).unwrap();
+        sparse.write_all(b"nonzero sparse payload").unwrap();
+        sparse.sync_all().unwrap();
+        drop(sparse);
+        symlink("sparse", source.join("link")).unwrap();
+        fs::hard_link(source.join("dense"), source.join("dense-alias")).unwrap();
+        write_xattr(&source.join("dense"), TEST_XATTR, b"verified attribute");
+
+        let image = root
+            .path()
+            .join("destination")
+            .with_extension(crate::metadata::IMAGE_EXTENSION);
+        crate::blank_image::blank_image(&image);
+        let backend = MacOsApfsBackend::new(SystemCommandRunner);
+        let attachment = backend.attach_verified(&image).unwrap();
+        backend
+            .mount(&attachment, &destination, MountAccess::ReadWrite, false)
+            .unwrap();
+        assert_ne!(
+            fs::metadata(&source).unwrap().dev(),
+            fs::metadata(&destination).unwrap().dev()
+        );
+        let report = run(&source, &destination, 6);
+        assert!(
+            report.copied_files > 0,
+            "cross-volume copy exercised the native data path"
+        );
+        let before = super::verify_tree_blocking(&source, &destination).unwrap();
+        let source_sparse = fs::metadata(&sparse_path).unwrap();
+        let copied_sparse = fs::metadata(destination.join("sparse")).unwrap();
+        assert_eq!(copied_sparse.len(), source_sparse.len());
+        assert!(
+            copied_sparse.blocks() * 512 <= source_sparse.blocks() * 512 + 65536,
+            "sparse holes were materialized: source {} bytes, copied {} bytes",
+            source_sparse.blocks() * 512,
+            copied_sparse.blocks() * 512
+        );
+        assert_eq!(
+            read_xattr(&destination.join("dense"), TEST_XATTR),
+            Some(b"verified attribute".to_vec())
+        );
+        assert_eq!(
+            fs::metadata(destination.join("dense")).unwrap().ino(),
+            fs::metadata(destination.join("dense-alias")).unwrap().ino()
+        );
+        assert_eq!(
+            fs::metadata(destination.join("dense-alias"))
+                .unwrap()
+                .nlink(),
+            2
+        );
+        assert_eq!(
+            fs::read_link(destination.join("link")).unwrap(),
+            PathBuf::from("sparse")
+        );
+        let resumed = run(&source, &destination, 6);
+        assert_eq!(resumed.cloned_files + resumed.copied_files, 0);
+        assert_eq!(
+            super::verify_tree_blocking(&source, &destination).unwrap(),
+            before
+        );
+
+        fs::write(destination.join("dense"), b"tampered").unwrap();
+        super::native::directory_metadata(&source.join("dense"), &destination.join("dense"))
+            .unwrap();
+        let refused = super::verify_tree_blocking(&source, &destination).unwrap_err();
+        assert_eq!(refused.code, crate::ErrorCode::Integrity);
+        assert!(
+            refused.message.contains("file content"),
+            "{}",
+            refused.message
+        );
+        assert_eq!(fs::read(source.join("dense")).unwrap(), b"original");
+        backend
+            .unmount_verified(&attachment, crate::apfs::DetachIntent::WhenIdle)
+            .unwrap();
+        backend
+            .detach(&attachment, crate::apfs::DetachIntent::WhenIdle)
+            .unwrap();
     }
 }

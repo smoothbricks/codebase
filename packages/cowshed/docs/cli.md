@@ -328,7 +328,8 @@ $ cowshed setup --uninstall --force --json
 
 Run once inside each existing checkout you want cowshed to manage. Adoption converts that repository into an
 image-backed **main workspace** at the same path. A host may have any number of adopted repositories and therefore any
-number of repository-scoped mains. Adoption is the only operation that copies the source tree into a new image.
+number of repository-scoped mains. Only adoption, and explicit re-adoption below, copies the source tree into a new
+image.
 
 On macOS, `cowshed adopt` and `cowshed setup` are the only commands allowed to create native storage. The first adopt on
 a machine may display one administrator authorization prompt from `diskutil` while cowshed creates and mounts the
@@ -347,13 +348,43 @@ adopt, and `adopt` would ask for one.
 ```
 $ cd <project-root> && cowshed adopt
 cowshed: created dedicated volume cowshed.store (space-sharing, excluded from backup)
-cowshed: creating image /private/cowshed/store/acme/widget/main.asif (capacity 100g, asif)
+cowshed: creating image /private/cowshed/store/acme/widget/main.dmg (capacity 100g)
 cowshed: copying 8,357,293 objects into the image (this is the one-time cost)
 cowshed: verifying tree against source ... ok
 cowshed: swapping <project-root> -> mountpoint (stub .envrc written beneath)
 next: cowshed new <name>
 <project-root>
 ```
+
+Use `cowshed adopt <checkout> --re-adopt` for an explicit format transition or to reclaim guest-freed space. Default
+adopt remains idempotent. Run re-adoption from outside the checkout, after every source and build-volume holder has
+exited; it lists each holder's PID and command and refuses, rather than killing a process or forcing an unmount.
+
+Re-adoption replaces main through the same staged copy, verification and checkout handoff as adopt. It copies the old
+image's filesystem entries, not its free guest blocks, into a fresh sparse RAW image, and the copy includes all of
+`.git` and the warm ignored build contents. Git configuration, hooks, lock files and worktree registrations are carried
+as they are: nothing is normalized, pruned or deleted, and only cowshed's own marker and credentials are regenerated.
+Each image's capacity is read from the kernel before the old image is detached, and the fresh image keeps that capacity;
+the old file's apparent length is not used.
+
+The build volume keeps its identity, owner record, built-at tree and creation time. Its warm contents are carried into a
+sparse RAW image at the recorded capacity; an empty build volume is never substituted. Old-incarnation seeds are left
+unchanged as retained evidence, and the new main gets one fresh RAW seed captured from the verified warm replacement.
+The workspaces' links to main's checkout path are preserved.
+
+Before publication, cowshed verifies tracked and untracked-not-ignored file checksums, the full Git state, `git fsck`,
+and the build contents and identity, and checks host allocation with `du` and `st_blocks * 512`. Any mismatch refuses
+publication and leaves the source available. The verified replacement then mounts at the original checkout path.
+
+The old backing image and any existing `<checkout>.pre-cowshed` tree are never overwritten or deleted. cowshed reports
+their paths and keeps them until you remove them after verification. An interrupted replacement resumes its recorded
+transaction rather than starting another. An earlier ASIF main is only an input to this transaction; ordinary commands
+attach RAW images only.
+
+RAW images are sparse at creation: capacity is a cap, not a reservation, and nothing returns guest-freed space
+automatically. In the RAW measurement, a deleted 1 GiB payload kept its host allocation after guest sync, image fsync,
+clean unmount and detach. Space returns only after verification and explicit release of the retained old image and every
+clone or checkpoint sharing its blocks. See 02_workspaces.md §Re-adoption and 01_storage.md, "Space reclamation".
 
 Workspace environment lives in the image at `.cowshed/env` and is rewritten on token rotation. The repository `.envrc`
 is a two-liner that sources that file. Cowshed does not authorize direnv or devenv trust databases. Reattach a detached
@@ -784,10 +815,10 @@ this verb does the same on its own. A seed that already holds every write the li
 The workspace's Nx daemon is stopped the way a land stops it (it restarts on the next Nx command). A foreign task
 database holder or a Cargo build holding an existing profile's shared `.cargo-lock` leaves the old seed unchanged and is
 named (`skipped`). Existing profile locks cannot fence a profile created later. After that admission check, cowshed
-closes its own lock descriptors and unmounts/detaches the build volume without force, validates the allocation map and
-clones by a held image descriptor. A late build, new profile or editor that prevents the seal is a `volumeBusy` skip,
-not a failed reseed or an attached raw clone. The source is restored before publication; a build starting afterwards
-cannot invalidate the captured seed. The workspace must be attached, because its build link names the volume. `--json`:
+closes its own lock descriptors and unmounts/detaches the build volume without force and clones by a held image
+descriptor. A late build, new profile or editor that prevents the seal is a `volumeBusy` skip, not a failed reseed or an
+attached raw clone. The source is restored before publication; a build starting afterwards cannot invalidate the
+captured seed. The workspace must be attached, because its build link names the volume. `--json`:
 `ReseedResult { workspace, outcome: { kind: "noBuildVolume" | "fresh" | "reseeded" | "skipped", behindMs?, elapsedMs?, reason? } }`.
 
 ### `cowshed rekey <name|main>`
@@ -988,18 +1019,18 @@ resume after its source is repaired. This repair does not change the fork's inhe
 
 ### `cowshed checkpoint <name> [label]` / `cowshed restore <name> <label>`
 
-Checkpoint captures the workspace image only after its driver is detached, then descriptor-clones the held source under
-a label — generated from the UTC timestamp when you don't give one. Source access and visibility are restored even if
-capture fails; a busy source is named and refuses without force, never copied while attached. ASIF allocation validation
-protects the outer image map, and fsck protects the inner filesystem. Before publication, a supervisor barrier seals
-complete Arrow batches and spill files; a manifest commits every checkpoint-resident job byte. Recovery may discard only
-incomplete trailing data.
+Checkpoint captures the workspace image while it stays mounted: with the supervisor barrier holding writes quiesced,
+cowshed syncs for filesystem freshness and descriptor-clones the live image under a label — generated from the UTC
+timestamp when you don't give one. Nothing detaches or unmounts the source. A RAW image has no outer allocation map, so
+the clone is only filesystem crash-consistent, not an application-state transaction; `restore` validates it, including
+`fsck_apfs`, before its first mount. Before publication, a supervisor barrier seals complete Arrow batches and spill
+files; a manifest commits every checkpoint-resident job byte. Recovery may discard only incomplete trailing data.
 
-Restore swaps the current image for the checkpoint (detach → clone → reattach, ~500 ms) and mints a new workspace
-incarnation. Protected content remains authoritative for the restored snapshot's origin boundary; the restored marker
-records the lineage, and the controller's audit record of the restore carries the hashes. Restore refuses over unsaved
-work (exit 4); the displaced image is kept as a `pre-restore-<timestamp>` checkpoint, so a restore is itself undoable.
-List checkpoints with `cowshed ls --json`.
+Restore swaps the current image for the checkpoint (detach → clone → reattach) and mints a new workspace incarnation.
+Protected content remains authoritative for the restored snapshot's origin boundary; the restored marker records the
+lineage, and the controller's audit record of the restore carries the hashes. Restore refuses over unsaved work (exit
+4); the displaced image is kept as a `pre-restore-<timestamp>` checkpoint, so a restore is itself undoable. List
+checkpoints with `cowshed ls --json`.
 
 ```
 $ cowshed checkpoint raven pre-refactor

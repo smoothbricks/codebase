@@ -17,13 +17,13 @@ use crate::repository::{OwnedRepoIds, RepoId};
 use crate::timing::timed_async;
 
 use super::lifecycle::{
-    AdoptPlan, AdoptRequest, CheckpointFact, CheckpointPlan, CheckpointRef, CreatePlan,
-    DefragmentOutcome, DerivedWorkspace, Destination, ExecuteError, ForkPlan, ImmutablePlan,
-    KernelMountFact, LifecycleBackend, LifecycleFact, LifecyclePlanner, LifecycleReceipt,
-    LifecycleWorkspace, MountIntent, MountState, Operation, OperationIdentity, Pin, PlanError,
-    PurePlanner, ResizeOutcome, RestoreMode, RestorePlan, RestoreReceipt, RetirePlan, RetiredRef,
-    Revision, StorageFact, StorageGcPlan, StorageGcReport, Substrate, SubstrateStats,
-    execute_checked, revalidate,
+    AdoptHandoff, AdoptPlan, AdoptRequest, CheckpointFact, CheckpointPlan, CheckpointRef,
+    CreatePlan, DefragmentOutcome, DerivedWorkspace, Destination, ExecuteError, ForkPlan,
+    ImmutablePlan, KernelMountFact, LifecycleBackend, LifecycleFact, LifecyclePlanner,
+    LifecycleReceipt, LifecycleWorkspace, MountIntent, MountState, Operation, OperationIdentity,
+    Pin, PlanError, PurePlanner, ResizeOutcome, RestoreMode, RestorePlan, RestoreReceipt,
+    RetirePlan, RetiredRef, Revision, StorageFact, StorageGcPlan, StorageGcReport, Substrate,
+    SubstrateStats, execute_checked, revalidate,
 };
 use super::{CheckpointLabel, PRE_RESTORE_PREFIX, StorageLayout, StorageLayoutError};
 
@@ -580,6 +580,11 @@ pub trait ApfsExecutionHost: Send + Sync + 'static {
         source_checkout: &Path,
         pre_cowshed_checkout: &Path,
     ) -> Result<(), PublicationError>;
+    /// Refuse unless `checkout` is an empty directory nothing is mounted at: the mountpoint a
+    /// replaced main left, which a re-adoption's replacement mounts on (02_workspaces.md,
+    /// "Re-adoption" step 5). A volume still mounted there, or anything written into the
+    /// directory, means the replaced main or something else still owns the path.
+    fn require_vacant_checkout(&self, checkout: &Path) -> Result<(), ApfsStorageError>;
     fn publish_metadata(
         &self,
         image: &Path,
@@ -880,13 +885,14 @@ where
         .await
     }
 
-    /// Complete an adoption whose main is published but whose checkout swap or mount at the
-    /// checkout was interrupted: swap the checkout for main's mountpoint if that has not happened,
-    /// then mount main there, reusing a surviving attachment. Idempotent once main is mounted.
+    /// Complete an adoption whose main is published but whose checkout handoff or mount at the
+    /// checkout was interrupted: hand the checkout over as `handoff` says if that has not
+    /// happened, then mount main there, reusing a surviving attachment. Idempotent once main is
+    /// mounted.
     pub async fn finish_adoption(
         &self,
         workspace: &LifecycleWorkspace,
-        pre_cowshed_checkout: &Path,
+        handoff: &AdoptHandoff,
     ) -> Result<(), ApfsStorageError> {
         if !workspace.name().is_main() {
             return Err(ApfsStorageError::InvalidPlan(
@@ -899,9 +905,9 @@ where
             workspace.name(),
         )?];
         let workspace = workspace.clone();
-        let pre_cowshed_checkout = pre_cowshed_checkout.to_owned();
+        let handoff = handoff.clone();
         self.dispatch_with_locks(lock_paths, true, move |host, config| {
-            finish_adoption(host.as_ref(), &config, &workspace, &pre_cowshed_checkout)
+            finish_adoption(host.as_ref(), &config, &workspace, &handoff)
         })
         .await
     }
@@ -976,7 +982,7 @@ where
                 repo,
                 capacity,
                 source_checkout,
-                pre_cowshed_checkout,
+                handoff,
                 identity,
             } = &operation
             else {
@@ -992,7 +998,7 @@ where
                     repo,
                     capacity: *capacity,
                     source_checkout,
-                    pre_cowshed_checkout,
+                    handoff,
                     identity,
                 },
                 incarnations.as_ref(),
@@ -1598,6 +1604,23 @@ where
             .await
     }
 
+    /// Runs `job` against the execution host on the blocking lane while holding `lock_path`, the
+    /// same image lock lifecycle operations take: a re-adoption's retention and its build
+    /// replacement's publication happen under main's lock, so staging collection, which takes
+    /// it too before it acts, never interleaves with them.
+    pub(crate) async fn dispatch_on_host_with_image_lock<T, F>(
+        &self,
+        lock_path: PathBuf,
+        job: F,
+    ) -> Result<T, ApfsStorageError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&H) -> Result<T, ApfsStorageError> + Send + 'static,
+    {
+        self.dispatch_with_locks(vec![lock_path], false, move |host, _| job(host.as_ref()))
+            .await
+    }
+
     /// Reclaims a trash image whose grants sidecar is gone, under the lock of the name its
     /// `<workspace>-<incarnation>` file name carries: a retirement holds that lock between moving
     /// the image and moving its sidecar, so waiting on it means never deleting one mid-flight.
@@ -1988,7 +2011,7 @@ struct AdoptExecution<'a> {
     repo: &'a RepoId,
     capacity: ImageCapacity,
     source_checkout: &'a Path,
-    pre_cowshed_checkout: &'a Path,
+    handoff: &'a AdoptHandoff,
     identity: &'a OperationIdentity,
 }
 
@@ -1999,7 +2022,7 @@ struct PreparedAdopt<A> {
     image: PathBuf,
     canonical_mount: PathBuf,
     source_checkout: PathBuf,
-    pre_cowshed_checkout: PathBuf,
+    handoff: AdoptHandoff,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2173,7 +2196,7 @@ fn prepare_adopt_stage<H: ApfsExecutionHost>(
         repo,
         capacity,
         source_checkout,
-        pre_cowshed_checkout,
+        handoff,
         identity: requested,
     } = execution;
     if requested.project_root != source_checkout || config.checkout_path != source_checkout {
@@ -2181,10 +2204,19 @@ fn prepare_adopt_stage<H: ApfsExecutionHost>(
             "adopt source must equal operation project root and the configured checkout path",
         ));
     }
-    if pre_cowshed_checkout.exists() {
-        return Err(ApfsStorageError::InvalidPlan(
-            "pre-cowshed checkout already exists",
-        ));
+    match handoff {
+        AdoptHandoff::Checkout {
+            pre_cowshed_checkout,
+        } => {
+            if pre_cowshed_checkout.exists() {
+                return Err(ApfsStorageError::InvalidPlan(
+                    "pre-cowshed checkout already exists",
+                ));
+            }
+        }
+        // The replaced main is gone from the checkout: nothing may be mounted there, or main
+        // would mount over it.
+        AdoptHandoff::Replacement { .. } => host.require_vacant_checkout(source_checkout)?,
     }
     let topology = absent_expected(expected)?;
     let image = layout(config, repo)?.main_image()?.image().to_owned();
@@ -2198,7 +2230,13 @@ fn prepare_adopt_stage<H: ApfsExecutionHost>(
         let workspace = adopted_workspace(repo, pending.incarnation.clone(), topology)?;
         let staging = staging_mount(config, &workspace)?;
         let same_source = pending.info.project_root == requested.project_root
-            && pending.info.base_commit == requested.base_commit;
+            && pending.info.base_commit == requested.base_commit
+            && match handoff {
+                AdoptHandoff::Checkout { .. } => true,
+                AdoptHandoff::Replacement { incarnation, .. } => {
+                    pending.incarnation == *incarnation
+                }
+            };
         let attachment = if same_source {
             timed_apfs_step("staging", "resume", || {
                 host.resume_pending_adopt(&pending.image, &staging, &workspace)
@@ -2232,7 +2270,11 @@ fn prepare_adopt_stage<H: ApfsExecutionHost>(
             (workspace, identity, attachment, staging, true)
         }
         None => {
-            let workspace = adopted_workspace(repo, incarnations.mint()?, topology)?;
+            let incarnation = match handoff {
+                AdoptHandoff::Checkout { .. } => incarnations.mint()?,
+                AdoptHandoff::Replacement { incarnation, .. } => incarnation.clone(),
+            };
+            let workspace = adopted_workspace(repo, incarnation, topology)?;
             let staging = staging_mount(config, &workspace)?;
             // The sidecar is the publication fence and is durable before the payload name
             // appears. A crash in the gap leaves a sidecar-only record that recover_pending
@@ -2278,7 +2320,7 @@ fn prepare_adopt_stage<H: ApfsExecutionHost>(
     let canonical_mount = mount_point(config, &workspace)?;
     let companion = companion_path(&image);
     let prepared = timed_apfs_step("staging", "copy", || {
-        host.copy_tree(source_checkout, &staging)
+        host.copy_tree(handoff.copy_source(source_checkout), &staging)
     })
     .and_then(|()| {
         timed_apfs_step("staging", "creds", || {
@@ -2306,7 +2348,7 @@ fn prepare_adopt_stage<H: ApfsExecutionHost>(
         image,
         canonical_mount,
         source_checkout: source_checkout.to_owned(),
-        pre_cowshed_checkout: pre_cowshed_checkout.to_owned(),
+        handoff: handoff.clone(),
     };
     match prepared {
         Ok(()) => Ok(adopt),
@@ -2385,7 +2427,7 @@ fn commit_prepared_adopt<H: ApfsExecutionHost>(
         image,
         canonical_mount,
         source_checkout,
-        pre_cowshed_checkout,
+        handoff,
     } = prepared;
     // The staging mount comes down through the kernel's unmount and the image stays attached, so
     // the checkout mount below needs no detach, second attach or second fsck.
@@ -2409,11 +2451,12 @@ fn commit_prepared_adopt<H: ApfsExecutionHost>(
             release_unpublished_adopt(host, attachment, &image, stage.resuming),
         );
     }
-    // Only now does the checkout path change hands, in one atomic swap. The mountpoint *is* the
-    // checkout path and cannot exist until the swap creates it, so the swap comes first and the
-    // mount follows. A failure leaves a published main that `ApfsSubstrate::finish_adoption` completes.
-    host.vacate_adopted_checkout(&source_checkout, &pre_cowshed_checkout)
-        .map_err(PublicationError::into_source)?;
+    // Only now does the checkout path change hands: for a first adoption in one atomic swap (the
+    // mountpoint *is* the checkout path and cannot exist until the swap creates it, so the swap
+    // comes first and the mount follows); for a re-adoption the replaced main left the checkout
+    // an empty mountpoint, which must still be one. A failure leaves a published main that
+    // `ApfsSubstrate::finish_adoption` completes.
+    hand_over_checkout(host, &source_checkout, &handoff)?;
     if let Err(primary) = host
         .mount(&attachment, &canonical_mount, MountAccess::ReadWrite, false)
         .and_then(|()| {
@@ -2436,17 +2479,36 @@ fn commit_prepared_adopt<H: ApfsExecutionHost>(
     }))
 }
 
-/// Finish an adoption whose image is published but whose checkout swap or mount a crash or
+/// Give main the checkout path as `handoff` says.
+fn hand_over_checkout<H: ApfsExecutionHost>(
+    host: &H,
+    checkout: &Path,
+    handoff: &AdoptHandoff,
+) -> Result<(), ApfsStorageError> {
+    match handoff {
+        AdoptHandoff::Checkout {
+            pre_cowshed_checkout,
+        } => host
+            .vacate_adopted_checkout(checkout, pre_cowshed_checkout)
+            .map_err(PublicationError::into_source),
+        AdoptHandoff::Replacement { .. } => host.require_vacant_checkout(checkout),
+    }
+}
+
+/// Finish an adoption whose image is published but whose checkout handoff or mount a crash or
 /// failure interrupted: every step converges from what is already on disk and in the kernel.
 fn finish_adoption<H: ApfsExecutionHost>(
     host: &H,
     config: &ApfsSubstrateConfig,
     workspace: &LifecycleWorkspace,
-    pre_cowshed_checkout: &Path,
+    handoff: &AdoptHandoff,
 ) -> Result<(), ApfsStorageError> {
-    host.vacate_adopted_checkout(&config.checkout_path, pre_cowshed_checkout)
-        .map_err(PublicationError::into_source)?;
     let checkout = mount_point(config, workspace)?;
+    // A first adoption's swap converges idempotently, a leftover staging name included, whether
+    // or not main is mounted yet.
+    if let AdoptHandoff::Checkout { .. } = handoff {
+        hand_over_checkout(host, &checkout, handoff)?;
+    }
     let derived = super::lifecycle::derive_workspaces(
         host.list(workspace.repo())?,
         host.mounts(workspace.repo())?,
@@ -2459,6 +2521,10 @@ fn finish_adoption<H: ApfsExecutionHost>(
     let expected = MarkerExpectation::owned(config, workspace);
     if mounted {
         return host.validate_marker(&checkout, &expected);
+    }
+    // A replacement mounts only on the empty mountpoint the replaced main left.
+    if let AdoptHandoff::Replacement { .. } = handoff {
+        hand_over_checkout(host, &checkout, handoff)?;
     }
     let image = canonical_image_path(config, workspace)?;
     let attachment = host.attach_and_mount_resumable(&image, &checkout, workspace)?;
@@ -3280,7 +3346,7 @@ fn undo_image(
         )))
 }
 
-/// `<sessions>/<TRASH_NAMESPACE>/<name>-<incarnation>.asif`. `sessions` is
+/// `<sessions>/<TRASH_NAMESPACE>/<name>-<incarnation>.dmg`. `sessions` is
 /// [`crate::repository::ProjectPaths::sessions`]; this helper does not name that directory.
 ///
 /// The `-` between name and incarnation is the separator [`split_retired_stem`] reverses; the two
@@ -3424,7 +3490,7 @@ mod tests {
         let main_lock = workspace_lock_path(&config, &repo, &main).expect("main");
         assert_eq!(
             main_lock,
-            Path::new("/tmp/cowshed-lock-table/store/acme/widget/main.asif.lock")
+            Path::new("/tmp/cowshed-lock-table/store/acme/widget/main.dmg.lock")
         );
         let source_lock = workspace_lock_path(&config, &repo, &source).expect("source");
         let destination_lock =
@@ -3437,7 +3503,9 @@ mod tests {
                     repo: repo.clone(),
                     capacity: DEFAULT_IMAGE_CAPACITY,
                     source_checkout: PathBuf::from("/project"),
-                    pre_cowshed_checkout: PathBuf::from("/project.pre-cowshed"),
+                    handoff: AdoptHandoff::Checkout {
+                        pre_cowshed_checkout: PathBuf::from("/project.pre-cowshed"),
+                    },
                     identity: identity(),
                 },
                 vec![main_lock],
@@ -3499,7 +3567,7 @@ mod tests {
         std::fs::create_dir_all(&store).expect("store");
         let counter = root.join("grant-revision");
         std::fs::write(&counter, "0").expect("initial revision");
-        let lock = store.join("sessions/raven.asif.lock");
+        let lock = store.join("sessions/raven.dmg.lock");
         let config = ApfsSubstrateConfig::new(&store, root.join("checkout"));
         let host =
             native::MacOsApfsExecutionHost::new(crate::apfs::SystemCommandRunner, config.clone())

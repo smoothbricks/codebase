@@ -76,6 +76,11 @@ export type AdoptOptions = {
   readonly repoId?: RepoId;
   readonly capacity?: string;
   readonly quarantine?: boolean;
+  /**
+   * Explicitly replace an adopted main through verified, retained-source re-adoption.
+   * False keeps ordinary adoption idempotent.
+   */
+  readonly reAdopt?: boolean;
 };
 
 export type AdoptRequest = {

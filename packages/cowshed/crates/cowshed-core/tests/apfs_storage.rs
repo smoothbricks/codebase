@@ -18,10 +18,10 @@ use cowshed_core::storage::apfs::{
     RetireExecutionError, volume_key,
 };
 use cowshed_core::storage::lifecycle::{
-    AdoptRequest, CheckpointFact, DefragmentOutcome, Destination, ExtentCount, KernelMountFact,
-    LifecycleFact, LifecyclePlanner, LifecycleWorkspace, MountIntent, MountState,
-    OperationIdentity, Pin, ResizeOutcome, RestoreMode, RetiredRef, Revision, StorageFact,
-    StorageGcPlan, StorageGcReport, Substrate, SubstrateStats,
+    AdoptHandoff, AdoptRequest, CheckpointFact, DefragmentOutcome, Destination, ExtentCount,
+    KernelMountFact, LifecycleFact, LifecyclePlanner, LifecycleWorkspace, MountIntent, MountState,
+    OperationIdentity, Pin, PlanError, ResizeOutcome, RestoreMode, RetiredRef, Revision,
+    StorageFact, StorageGcPlan, StorageGcReport, Substrate, SubstrateStats,
 };
 use proptest::prelude::*;
 
@@ -378,8 +378,9 @@ impl ApfsExecutionHost for FakeHost {
         Ok(FakeAttachment)
     }
 
-    fn copy_tree(&self, _: &Path, _: &Path) -> Result<(), ApfsStorageError> {
+    fn copy_tree(&self, source: &Path, _: &Path) -> Result<(), ApfsStorageError> {
         self.record("copy-until-quiescent");
+        self.record_path(source);
         Ok(())
     }
     fn mount(
@@ -574,6 +575,11 @@ impl ApfsExecutionHost for FakeHost {
         self.record("atomic-adopt-checkout-vacate");
         self.record_path(source_checkout);
         self.record_path(pre_cowshed_checkout);
+        Ok(())
+    }
+    fn require_vacant_checkout(&self, checkout: &Path) -> Result<(), ApfsStorageError> {
+        self.record("replacement-checkout-vacant");
+        self.record_path(checkout);
         Ok(())
     }
     fn publish_metadata(
@@ -1052,7 +1058,9 @@ fn adopt_request() -> AdoptRequest {
         capacity: DEFAULT_IMAGE_CAPACITY,
         topology_revision: Revision::new(0),
         source_checkout: PathBuf::from("/project"),
-        pre_cowshed_checkout: PathBuf::from("/project.pre-cowshed"),
+        handoff: AdoptHandoff::Checkout {
+            pre_cowshed_checkout: PathBuf::from("/project.pre-cowshed"),
+        },
         identity: identity(),
     }
 }
@@ -1204,7 +1212,7 @@ async fn adopt_publishes_main_by_activating_its_fence_on_one_attachment() {
     );
     assert_eq!(
         host.paths()[0],
-        PathBuf::from("/store/acme/widget/main.asif"),
+        PathBuf::from("/store/acme/widget/main.dmg"),
         "the image is created at its canonical path"
     );
     assert_eq!(
@@ -1226,10 +1234,97 @@ async fn adopt_publishes_main_by_activating_its_fence_on_one_attachment() {
     );
 }
 
+/// A re-adoption's replacement goes through the same staged copy, fence and activation as an
+/// adoption (02_workspaces.md, "Re-adoption" steps 3 and 5), with three differences: it copies
+/// from the replaced main's retained read-only mount, it is published as the incarnation the
+/// re-adoption recorded, and it mounts on the empty mountpoint the replaced main left instead
+/// of swapping the user's tree aside.
+#[tokio::test]
+async fn a_replacement_copies_its_retained_source_and_mounts_on_the_vacant_checkout() {
+    let host = FakeHost::default();
+    let substrate = substrate(host.clone(), CountingLane::default());
+    let replacement = incarnation(42);
+    let copy_source = PathBuf::from("/store/mnt/acme/widget/.staging/readopt-old-main");
+    let plan = substrate
+        .plan_adopt(AdoptRequest {
+            handoff: AdoptHandoff::Replacement {
+                copy_source: copy_source.clone(),
+                incarnation: replacement.clone(),
+            },
+            ..adopt_request()
+        })
+        .expect("replacement plan");
+    let (receipt, ()) = substrate
+        .execute_adopt_staged(plan, Alongside::none(), |_| async {
+            Ok::<(), &'static str>(())
+        })
+        .await
+        .expect("replacement");
+
+    assert_eq!(receipt.workspace.incarnation(), &replacement);
+    let events = host.events();
+    assert!(
+        !events
+            .iter()
+            .any(|event| event == "atomic-adopt-checkout-vacate"),
+        "a replacement never swaps the checkout: {events:?}"
+    );
+    let vacant = events
+        .iter()
+        .rposition(|event| event == "replacement-checkout-vacant")
+        .expect("the checkout is proven vacant before main mounts there");
+    let activated = events
+        .iter()
+        .position(|event| event == "activate-pending")
+        .expect("published");
+    assert!(activated < vacant, "{events:?}");
+    assert_eq!(
+        events[vacant + 1..].first().map(String::as_str),
+        Some("mount"),
+        "{events:?}"
+    );
+    assert!(
+        host.paths().contains(&copy_source),
+        "main is copied from the retained source"
+    );
+    assert!(
+        !host
+            .paths()
+            .contains(&PathBuf::from("/project.pre-cowshed")),
+        "the user's .pre-cowshed tree is never named"
+    );
+    assert_eq!(
+        host.mount_paths(),
+        [
+            PathBuf::from(format!(
+                "/store/mnt/acme/widget/.staging/main-{replacement}"
+            )),
+            PathBuf::from("/project"),
+        ]
+    );
+}
+
+/// A replacement plan names a copy source outside the checkout it replaces.
+#[test]
+fn a_replacement_copying_from_inside_its_checkout_is_not_planned() {
+    let host = FakeHost::default();
+    let substrate = substrate(host, CountingLane::default());
+    let error = substrate
+        .plan_adopt(AdoptRequest {
+            handoff: AdoptHandoff::Replacement {
+                copy_source: PathBuf::from("/project/inner"),
+                incarnation: incarnation(42),
+            },
+            ..adopt_request()
+        })
+        .expect_err("a source inside the checkout");
+    assert!(matches!(error, PlanError::InvalidAdoptHandoff), "{error:?}");
+}
+
 fn pending_adoption(identity: &OperationIdentity) -> PendingAdoption {
     PendingAdoption {
         incarnation: incarnation(7),
-        image: PathBuf::from("/store/acme/widget/main.asif"),
+        image: PathBuf::from("/store/acme/widget/main.dmg"),
         info: WorkspaceInfoSnapshot {
             project_root: identity.project_root.clone(),
             role: WorkspaceRole::Main,
@@ -1551,7 +1646,9 @@ async fn finishing_a_published_adoption_swaps_and_mounts_once() {
     let substrate = substrate(host.clone(), CountingLane::default());
     let main = workspace("main", 1);
     host.seed(&main);
-    let pre_cowshed = PathBuf::from("/project.pre-cowshed");
+    let pre_cowshed = AdoptHandoff::Checkout {
+        pre_cowshed_checkout: PathBuf::from("/project.pre-cowshed"),
+    };
 
     substrate
         .finish_adoption(&main, &pre_cowshed)
@@ -2749,7 +2846,7 @@ proptest! {
                     }
                 }
             }
-            // The fake refuses a clone between paths that are not `<name>.asif`, so each operation
+            // The fake refuses a clone between paths that are not `<name>.dmg`, so each operation
             // above succeeding is the proof that it cloned an image to an image.
             let clones = host.events().iter().filter(|event| event.as_str() == "clone").count();
             prop_assert_eq!(clones, count);
@@ -2852,7 +2949,7 @@ async fn pending_canonical_clone_resumes_without_reclone_and_activates_after_ini
     host.resume_clone_from(
         resumed.clone(),
         original_identity.clone(),
-        "/store/acme--widget/sessions/hedge.asif",
+        "/store/acme--widget/sessions/hedge.dmg",
     );
     let substrate = substrate(host.clone(), CountingLane::default());
     let plan = substrate
@@ -2928,7 +3025,7 @@ async fn pending_clone_retirement_inspects_before_trash_without_activation() {
     host.resume_clone_from(
         pending.clone(),
         original.clone(),
-        "/store/acme--widget/sessions/unfinished.asif",
+        "/store/acme--widget/sessions/unfinished.dmg",
     );
     let substrate = substrate(host.clone(), CountingLane::default());
     let plan = substrate

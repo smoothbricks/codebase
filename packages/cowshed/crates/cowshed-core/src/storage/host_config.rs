@@ -796,7 +796,7 @@ mod tests {
         let root = temp_directory("retired");
         let store = root.join("store");
         let project = bind_repository(&store, "acme/widget");
-        let metadata = project.join("sessions/raven.asif.grants.json");
+        let metadata = project.join("sessions/raven.dmg.grants.json");
         fs::create_dir_all(metadata.parent().unwrap()).unwrap();
         let plan = plan_mount_root_change(&store, &root.join("configured-mount-root"), []).unwrap();
         execute_mount_root_change(&plan).unwrap();
@@ -833,7 +833,7 @@ mod tests {
         let root = temp_directory("active-default");
         let store = root.join("store");
         let project = bind_repository(&store, "acme/widget");
-        let metadata = project.join("sessions/raven.asif.grants.json");
+        let metadata = project.join("sessions/raven.dmg.grants.json");
         fs::create_dir_all(metadata.parent().unwrap()).unwrap();
         fs::write(
             &metadata,

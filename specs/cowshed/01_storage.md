@@ -263,7 +263,7 @@ entries, 0.75 GB of loose objects): 6.3 GB, 55,821 files, 46,575 symlinks. One c
 fleet throughout (load average 10–35), so single timings carry about ±20 %; the I/O rows interleave the three candidates
 round by round.
 
-| Metric                                                                   | ASIF, case-sensitive (chosen)                                                     | ASIF, case-insensitive                                                   | SPARSE, case-sensitive                                           |
+| Metric                                                                   | ASIF, case-sensitive (historical choice)                                          | ASIF, case-insensitive                                                   | SPARSE, case-sensitive                                           |
 | ------------------------------------------------------------------------ | --------------------------------------------------------------------------------- | ------------------------------------------------------------------------ | ---------------------------------------------------------------- |
 | Create, unprivileged (median of 5)                                       | 441 ms                                                                            | 448 ms                                                                   | 1,046 ms                                                         |
 | Attach + `fsck_apfs -q` + mount (median of 5)                            | 228 ms                                                                            | 204 ms                                                                   | 308 ms                                                           |
@@ -298,22 +298,22 @@ The detached-grow timings above measured Apple's content resize, before the nati
 ASIF's 1 MiB chunks, its capacity limit, and its versioned allocation directory come from reverse engineering
 (<https://schamper.dev/dissecting-apples-sparse-image-format-asif/>), not from Apple; SPARSE's limits and its compaction
 warning come from `man hdiutil`. APFS's journal does not make the enclosing image driver's mutable allocation map a
-snapshot: `sync_volume_np(WAIT)` followed by image `fsync` and `clonefile` can capture mixed ASIF map generations.
-Cowshed therefore captures only a detached image, holds its inode with a non-blocking shared no-follow lock that
-excludes the driver's exclusive attachment lock, validates the allocation map, and clones through that held descriptor.
-Concurrent sealed readers may clone the same immutable seed or blank; an attachment cannot start until they finish. A
-mounted source is unmounted and detached **without force**, then restored with its original access/visibility and
-verified mapping, even after a clone failure. A busy source refuses with its holders; it is never cloned as a fallback.
-An already-detached seed is never attached for capture. No destination is published from inconsistent allocation data.
-`fsck_apfs -q` still checks the inner filesystem before a mount, but cannot establish the outer ASIF map's consistency.
-ASIF's chunk table can mark a chunk unmapped, which fits it returning part of deleted space on its own; SPARSE returns
-nothing until `hdiutil compact`, and little then. `diskutil image create from` rewrites a detached ASIF image from its
-allocated chunks only: on the churned four-clone image it took 2.8 s against the plain copy's 2.4 s and left 217 extents
-and 7.95 GiB against 792 and 8.83 GiB, with the same content, case sensitivity, and owner. An ASIF capacity as large as
-the store volume measured no cost against 100 GiB: creation, attach, empty allocation, and the allocation after a fill
-and a churn round match within noise, the churned image held 932 extents against 455 (about 1.5 ms more first write),
-and `df` inside the volume reports the store's own free space as available. SPARSE at that capacity attached slower (525
-against 287 ms) and once refused its first detach with `EBUSY`.
+snapshot: `sync_volume_np(WAIT)` followed by image `fsync` and `clonefile` can capture mixed ASIF map generations. The
+pre-RAW ASIF implementation therefore captured only detached images, holding each inode with a shared no-follow lock,
+validating its allocation map and cloning through that descriptor. It unmounted and detached a mounted source without
+force and restored it afterwards; a source holder refused the capture. That policy blocked live-main forks, and the
+cause of the observed inconsistent maps was not established by the earlier successful smoke reads. It is historical, not
+the current RAW source-capture contract. RAW has no outer map; source captures remain live, while build seeds retain the
+separate writer exclusion in "Images" and 16_build_volumes.md. `fsck_apfs -q` still checks the inner filesystem before a
+mount, but cannot establish the outer ASIF map's consistency. ASIF's chunk table can mark a chunk unmapped, which fits
+it returning part of deleted space on its own; SPARSE returns nothing until `hdiutil compact`, and little then.
+`diskutil image create from` rewrites a detached ASIF image from its allocated chunks only: on the churned four-clone
+image it took 2.8 s against the plain copy's 2.4 s and left 217 extents and 7.95 GiB against 792 and 8.83 GiB, with the
+same content, case sensitivity, and owner. An ASIF capacity as large as the store volume measured no cost against 100
+GiB: creation, attach, empty allocation, and the allocation after a fill and a churn round match within noise, the
+churned image held 932 extents against 455 (about 1.5 ms more first write), and `df` inside the volume reports the
+store's own free space as available. SPARSE at that capacity attached slower (525 against 287 ms) and once refused its
+first detach with `EBUSY`.
 
 Case-sensitive ASIF therefore costs nothing that case-insensitive ASIF does not: the flag is set once at creation, no
 step recurs per `new`, and every measured difference between the two sits inside the noise. SPARSE loses on creation,
@@ -439,7 +439,7 @@ markers, not active mount flags. A
 [blank template](../../packages/cowshed/crates/cowshed-core/src/storage/apfs/native/blank_template.rs) is formatted,
 verified and detached **without ever being mounted**. The
 [bounded-exec RAM volume](../../packages/nx-plugin/src/executors/bounded-exec/ram-temp.ts) is a separate APFS volume,
-not an ASIF image.
+not a `.dmg` image.
 
 The table distinguishes options cowshed requests from flags the kernel supplies. Seeing `nodev`, `nosuid` or `journaled`
 in `mount` output does not mean cowshed passed an option with that name. Likewise, no indexing or backup command is
@@ -581,8 +581,8 @@ What the substrate does about each:
   spans), adopt's mint went from 537–705 ms to 303–345 ms and first touch from 565–756 ms to 312–317 ms on a quiet
   queue; under a loaded parallel suite the old adopt mint took 10.6 s (create 2.4 s, attach 7.7 s) against 5.0 s for the
   new one, all of it the one attach. Values the image itself records come from the image, never from a `diskutil` query:
-  an ASIF image's capacity is read from its header (through the same `recognized()` gate the grow uses, which refuses
-  any layout other than the measured one), and a mounted volume's from IORegistry.
+  a RAW image's virtual capacity is its file length, read without spawning a storage tool, and an attached image's
+  kernel capacity comes from its authoritative IOMedia mapping.
 - **No attach→detach→attach on a success path**, and no verify-by-reattach.
 - **Storage calls and mount-table changes never overlap.** Every disk tool on the host runs under the gateway's
   disk-lifecycle lease (05_gateway.md, "Disk-lifecycle lease"): `diskutil`, `hdiutil` and `newfs_apfs` share one phase,
@@ -615,14 +615,16 @@ Three questions, three authorities, none of them the volume label:
   when it does not name the expected workspace. A marker that cannot be read is not ours.
 
 An image with no sidecar is not a discoverable workspace: inventory and the store-wide port allocator skip a named
-`<workspace>.asif` with a warning rather than failing every project. Sidecarless legacy `<workspace>.sparseimage`
-entries are also skipped with a named warning and never opened as workspaces. `doctor` names sidecarless `.asif` and
-`.sparseimage` files directly under `sessions/`; `gc` may reclaim them only after checking the exact path, locks, and
-mount ownership. A legacy image never becomes a live workspace just because its filename resembles one.
+`<workspace>.dmg` with a warning rather than failing every project. Ordinary GC may reclaim only sidecarless RAW images,
+under the exact path, lock, attachment and mount-ownership fences. Legacy `.asif` and `.sparseimage` files are reported
+as warnings and retained evidence only; removal requires an explicit transition or retirement, never filename-based
+ordinary GC. A legacy image never becomes a live workspace just because its filename resembles one.
 
 The orphan plan fingerprints the image's inode, device, length, and modification/change times; a same-sized replacement
-invalidates the plan before any deletion. For a legacy disk image, `gc` also checks the image-path attachment inventory,
-not merely the expected mountpoint: an image attached somewhere else remains in place and is reported as deferred.
+invalidates the plan before any deletion. GC also checks the RAW image's kernel attachment identity, not merely the
+expected mountpoint: an image attached elsewhere remains in place and is reported as deferred. Re-adoption's retained
+namespace is never an ordinary orphan scan, and its exact forming-intent staging paths remain protected until the
+replacement completes.
 
 A sidecar that exists but is malformed or mismatched is not an orphan; its uncertain grants and identity still require
 an integrity finding instead of a guessed admission or deletion.

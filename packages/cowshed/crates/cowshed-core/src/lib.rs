@@ -17,6 +17,7 @@ mod fsio;
 mod gateway_inventory;
 pub mod gateway_sessions;
 pub mod git;
+mod git_preservation;
 pub mod host_dirs;
 pub mod host_load;
 mod inherited_daemons;
@@ -45,7 +46,7 @@ pub mod workspace_git_fetch;
 // sweep, one sequence, whichever module attaches the image; and one blank image template.
 #[cfg(all(test, target_os = "macos"))]
 use crate::apfs::{
-    ApfsBackend, CommandRunner, DetachIntent, DiskImageSource, MacOsApfsBackend,
+    ApfsBackend, CommandRunner, DetachIntent, DiskImageSource, ImageCapture, MacOsApfsBackend,
     SystemCommandRunner,
 };
 #[cfg(all(test, target_os = "macos"))]

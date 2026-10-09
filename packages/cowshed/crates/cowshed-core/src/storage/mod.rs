@@ -336,7 +336,7 @@ impl DiscoveredSessionImage {
 /// Select only published session images from a directory listing.
 ///
 /// Sidecars, locks, staging directories, temporary names, invalid workspace names, and every
-/// file that is not `<name>.asif` are deliberately invisible.
+/// file that is not `<name>.dmg` are deliberately invisible.
 pub fn discover_session_images(
     entries: impl IntoIterator<Item = PathBuf>,
 ) -> Vec<DiscoveredSessionImage> {
@@ -355,7 +355,7 @@ pub fn discover_session_images(
     discovered
 }
 
-/// The non-empty stem of `<stem>.asif`.
+/// The non-empty stem of `<stem>.dmg`.
 fn image_stem(file_name: &str) -> Option<&str> {
     file_name
         .strip_suffix(IMAGE_EXTENSION)
@@ -625,25 +625,25 @@ mod tests {
     }
 
     #[test]
-    fn maps_the_asif_image_and_its_complete_sibling_suffixes() {
+    fn maps_the_dmg_image_and_its_complete_sibling_suffixes() {
         let layout = layout();
         let raven = WorkspaceName::session("raven").unwrap();
         let paths = layout.session_image(&raven).unwrap();
         assert_eq!(
             paths.image,
-            Path::new("/private/cowshed/store/acme/widget/sessions/raven.asif")
+            Path::new("/private/cowshed/store/acme/widget/sessions/raven.dmg")
         );
         assert_eq!(
             paths.sidecar,
-            Path::new("/private/cowshed/store/acme/widget/sessions/raven.asif.grants.json")
+            Path::new("/private/cowshed/store/acme/widget/sessions/raven.dmg.grants.json")
         );
         assert_eq!(
             paths.lock,
-            Path::new("/private/cowshed/store/acme/widget/sessions/raven.asif.lock")
+            Path::new("/private/cowshed/store/acme/widget/sessions/raven.dmg.lock")
         );
         assert_eq!(
             paths.ca_private_key,
-            Path::new("/private/cowshed/store/acme/widget/sessions/raven.asif.ca.key")
+            Path::new("/private/cowshed/store/acme/widget/sessions/raven.dmg.ca.key")
         );
         crate::metadata::validate_image_path(&paths.image).unwrap();
     }
@@ -655,16 +655,16 @@ mod tests {
         let label = CheckpointLabel::new("ci-fail.2026-07-11").unwrap();
         assert_eq!(
             layout.main_image().unwrap().image,
-            Path::new("/private/cowshed/store/acme/widget/main.asif")
+            Path::new("/private/cowshed/store/acme/widget/main.dmg")
         );
         assert_eq!(
             layout.staged_main_image().unwrap().image,
-            Path::new("/private/cowshed/store/acme/widget/.staging/main.asif")
+            Path::new("/private/cowshed/store/acme/widget/.staging/main.dmg")
         );
         assert_eq!(
             layout.checkpoint_image(&raven, &label).unwrap().image,
             Path::new(
-                "/private/cowshed/store/acme/widget/checkpoints/raven/ci-fail.2026-07-11.asif"
+                "/private/cowshed/store/acme/widget/checkpoints/raven/ci-fail.2026-07-11.dmg"
             )
         );
         assert_eq!(
@@ -884,19 +884,19 @@ mod tests {
     }
 
     #[test]
-    fn enumeration_returns_only_published_asif_images() {
+    fn enumeration_returns_only_published_dmg_images() {
         let entries = [
-            "/store/sessions/raven.asif",
+            "/store/sessions/raven.dmg",
             "/store/sessions/owl.sparseimage",
             "/store/sessions/owl.sparseimage.grants.json",
-            "/store/sessions/finch.asif",
-            "/store/sessions/raven.asif.grants.json",
-            "/store/sessions/raven.asif.lock",
-            "/store/sessions/main.asif",
+            "/store/sessions/finch.dmg",
+            "/store/sessions/raven.dmg.grants.json",
+            "/store/sessions/raven.dmg.lock",
+            "/store/sessions/main.dmg",
             "/store/sessions/.staging",
-            "/store/sessions/.raven.asif",
-            "/store/sessions/raven.tmp.asif",
-            "/store/sessions/upper.Asif",
+            "/store/sessions/.raven.dmg",
+            "/store/sessions/raven.tmp.dmg",
+            "/store/sessions/upper.Dmg",
         ]
         .map(PathBuf::from);
         let images = discover_session_images(entries);
@@ -906,8 +906,8 @@ mod tests {
                 .map(|image| (image.workspace.as_str(), image.path()))
                 .collect::<Vec<_>>(),
             [
-                ("finch", Path::new("/store/sessions/finch.asif")),
-                ("raven", Path::new("/store/sessions/raven.asif")),
+                ("finch", Path::new("/store/sessions/finch.dmg")),
+                ("raven", Path::new("/store/sessions/raven.dmg")),
             ],
             "sorted by workspace; a .sparseimage is not a workspace image"
         );
@@ -981,9 +981,9 @@ mod tests {
         #[test]
         fn staged_names_are_never_enumerated(stem in "[a-z0-9-]{1,32}") {
             let names = [
-                PathBuf::from(format!(".staging-{stem}.asif")),
+                PathBuf::from(format!(".staging-{stem}.dmg")),
                 PathBuf::from(format!(".{stem}.sparseimage")),
-                PathBuf::from(format!("{stem}.asif.tmp")),
+                PathBuf::from(format!("{stem}.dmg.tmp")),
             ];
             prop_assert!(discover_session_images(names).is_empty());
         }

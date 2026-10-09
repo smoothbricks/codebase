@@ -3521,7 +3521,7 @@ mod tests {
         let root =
             crate::scratch_apfs::ScratchRoot::new("inventory-teardown").expect("scratch root");
         let backend = MacOsApfsBackend::new(SystemCommandRunner);
-        let image = root.path().join("transient.asif");
+        let image = root.path().join("transient.dmg");
         crate::blank_image::blank_image(&image);
 
         // Exercise the production read-only planner, not installation validation: a hosted
@@ -4496,7 +4496,7 @@ mod tests {
         source.statfs_overrides.insert(
             PathBuf::from("/workspace/project"),
             StatFsSnapshot {
-                fs_type: "asif".to_owned(),
+                fs_type: "apfs".to_owned(),
                 mount_source: PathBuf::from("/dev/disk13s1"),
                 mountpoint: PathBuf::from("/workspace"),
                 nobrowse: true,

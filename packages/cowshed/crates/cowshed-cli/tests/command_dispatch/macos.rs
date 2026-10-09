@@ -2,7 +2,7 @@ use cowshed_cli::args::parse_args;
 use cowshed_cli::output::Output;
 use cowshed_cli::runtime::{ActorBridge, CliService, dispatch};
 use cowshed_core::apfs::{
-    ApfsBackend, CommandRunner, DetachIntent, DiskImageSource, MacOsApfsBackend,
+    ApfsBackend, CommandRunner, DetachIntent, DiskImageSource, ImageCapture, MacOsApfsBackend,
     SystemCommandRunner,
 };
 use cowshed_core::api::JsonEnvelope;
@@ -2678,4 +2678,347 @@ async fn real_apfs_rm_evicts_and_names_a_host_process_holding_an_unlinked_build_
     drop(holder);
     service.shutdown().await.expect("stop the runtime");
     fixture.stop_gateway().await;
+}
+
+/// Re-adoption (02_workspaces.md, "Re-adoption: format transition and space reclamation"), one
+/// walk over one project:
+/// - a default adopt over a main in a format this runtime only replaces refuses before it
+///   records anything, and leaves that main's bytes alone;
+/// - `adopt --re-adopt` replaces an adopted main with a fresh RAW image under a new incarnation,
+///   keeping the checkout's tracked and untracked bytes, its Git HEAD and status, its build
+///   volume's identity, owner record and warm contents, and the original `.pre-cowshed` tree;
+/// - the replaced main and build images stay at their retained paths, in their own format.
+#[tokio::test]
+async fn real_apfs_re_adopt_replaces_main_keeps_its_build_identity_and_retains_the_old_image() {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    struct RestoreStderr(Option<OwnedFd>);
+    impl RestoreStderr {
+        fn restore(&mut self) -> std::io::Result<()> {
+            if let Some(saved) = self.0.take() {
+                // SAFETY: saved owns the descriptor until duplication completes.
+                if unsafe { libc::dup2(saved.as_raw_fd(), libc::STDERR_FILENO) } < 0 {
+                    self.0 = Some(saved);
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        }
+    }
+    impl Drop for RestoreStderr {
+        fn drop(&mut self) {
+            if let Err(error) = self.restore() {
+                eprintln!("replacement proof could not restore stderr: {error}");
+            }
+        }
+    }
+    let fixture = Fixture::with(Project::Declared);
+    let mut service = fixture.open().await;
+    let storage = cowshed_core::storage::StorageLayout::new(
+        fixture.storage.store(),
+        &RepoId::parse("fixture/dispatch").expect("repository identity"),
+    )
+    .expect("fixture storage layout");
+    let project_root = storage.project().project_root.clone();
+    let pre_cowshed = PathBuf::from(format!("{}.pre-cowshed", fixture.checkout.display()));
+    let adopt_args = [
+        OsString::from("adopt"),
+        fixture.checkout.as_os_str().to_os_string(),
+        OsString::from("--repo-id"),
+        OsString::from("fixture/dispatch"),
+        OsString::from("--capacity"),
+        OsString::from("1g"),
+    ];
+
+    // A main adopted before RAW is invisible to this runtime's inventory: a default adopt must
+    // refuse rather than journal over it and mint a second main.
+    let legacy = project_root.join("main.asif");
+    fs::create_dir_all(&project_root).expect("project directory");
+    fs::write(&legacy, b"legacy main").expect("plant a legacy main");
+    let (refused, _, _) = run(&mut service, adopt_args.clone()).await;
+    let error = refused.expect_err("a default adopt over a legacy main refuses");
+    assert_eq!(error.code, ErrorCode::Conflict, "{error:?}");
+    assert!(error.hint.contains("--re-adopt"), "{error:?}");
+    assert_eq!(fs::read(&legacy).expect("legacy main"), b"legacy main");
+    assert!(!project_root.join("lifecycle-intents.json").exists());
+    assert!(!project_root.join("main.dmg").exists());
+    assert!(!pre_cowshed.exists(), "the checkout was not touched");
+    fs::remove_file(&legacy).expect("remove the planted legacy main");
+
+    // An ordinary RAW main, with a linked build volume holding warm state.
+    let (result, _, _) = run(&mut service, adopt_args).await;
+    assert_eq!(result.expect("RAW adoption"), 0);
+    let layout = build_volumes(&fixture);
+    let main_volume = linked_volume(&layout, &fixture.checkout);
+    let record = layout
+        .read_record(&main_volume)
+        .expect("main's build record");
+    let warm = fixture.checkout.join(DECLARED_STATE).join("build");
+    fs::create_dir_all(&warm).unwrap();
+    fs::write(warm.join("build.ninja"), b"warm\n").unwrap();
+    fs::write(
+        fixture.checkout.join("tracked"),
+        b"changed before re-adoption\n",
+    )
+    .unwrap();
+    git(
+        &fixture.checkout,
+        &["commit", "-q", "-am", "change tracked"],
+    );
+    fs::write(fixture.checkout.join("notes.txt"), b"untracked notes\n").unwrap();
+    let head = git_stdout(&fixture.checkout, &["rev-parse", "HEAD"]);
+    let status = git_stdout(
+        &fixture.checkout,
+        &["status", "--porcelain", "--untracked-files=all"],
+    );
+    let pre_cowshed_head = fs::read(pre_cowshed.join(".git/HEAD")).expect("retained tree");
+    let main_image = project_root.join("main.dmg");
+    let old = cowshed_core::metadata::DetachedWorkspaceMetadata::read_for_image(&main_image)
+        .expect("main's sidecar")
+        .workspace_incarnation;
+
+    // Core retention guidance writes to the real stderr descriptor, not the CLI Output buffer.
+    // Observe that actual channel; the isolated nextest process has only this lifecycle walk.
+    let report_path = fixture._scratch.path().join("re-adopt-report.stderr");
+    let report_file = fs::File::create(&report_path).expect("capture core replacement report");
+    // SAFETY: fcntl duplicates the live standard-error descriptor and owns the result.
+    let saved = unsafe { libc::fcntl(libc::STDERR_FILENO, libc::F_DUPFD_CLOEXEC, 3) };
+    assert!(
+        saved >= 0,
+        "save stderr: {}",
+        std::io::Error::last_os_error()
+    );
+    // SAFETY: the successful duplication returned an owned, non-stdio descriptor.
+    let mut restore = RestoreStderr(Some(unsafe { OwnedFd::from_raw_fd(saved) }));
+    // SAFETY: report_file stays open until stderr is restored.
+    assert!(
+        unsafe { libc::dup2(report_file.as_raw_fd(), libc::STDERR_FILENO) } >= 0,
+        "capture stderr: {}",
+        std::io::Error::last_os_error()
+    );
+    let (_, stderr) = succeed(
+        &mut service,
+        [
+            OsString::from("adopt"),
+            fixture.checkout.as_os_str().to_os_string(),
+            OsString::from("--re-adopt"),
+        ],
+    )
+    .await;
+    restore.restore().expect("restore stderr after replacement");
+    drop(report_file);
+    let core_report = fs::read_to_string(&report_path).expect("read actual replacement guidance");
+
+    let new = cowshed_core::metadata::DetachedWorkspaceMetadata::read_for_image(&main_image)
+        .expect("the replacement's sidecar")
+        .workspace_incarnation;
+    assert_ne!(new, old, "the replacement is a new incarnation");
+    assert_eq!(
+        fs::read(fixture.checkout.join("tracked")).unwrap(),
+        b"changed before re-adoption\n"
+    );
+    assert_eq!(
+        fs::read(fixture.checkout.join("notes.txt")).unwrap(),
+        b"untracked notes\n"
+    );
+    assert_eq!(git_stdout(&fixture.checkout, &["rev-parse", "HEAD"]), head);
+    assert_eq!(
+        git_stdout(
+            &fixture.checkout,
+            &["status", "--porcelain", "--untracked-files=all"]
+        ),
+        status
+    );
+    assert_eq!(
+        linked_volume(&layout, &fixture.checkout),
+        main_volume,
+        "the build volume keeps its identity"
+    );
+    assert_eq!(
+        layout
+            .read_record(&main_volume)
+            .expect("the replacement's build record"),
+        record,
+        "the owner record is carried verbatim"
+    );
+    assert_eq!(
+        fs::read(warm.join("build.ninja")).expect("warm build state"),
+        b"warm\n",
+        "the build volume's contents are copied, never substituted"
+    );
+    assert_eq!(
+        fs::read(pre_cowshed.join(".git/HEAD")).expect("retained tree"),
+        pre_cowshed_head,
+        "the original .pre-cowshed tree is never touched"
+    );
+    let retained = project_root.join("retained");
+    for kept in [
+        retained.join(format!("main-{}.dmg", old.as_str())),
+        retained.join(format!("main-{}.dmg.grants.json", old.as_str())),
+        retained.join(format!("build-{}.dmg", main_volume.as_str())),
+        retained.join(format!("build-{}.dmg.json", main_volume.as_str())),
+    ] {
+        assert!(kept.exists(), "{} is retained: {stderr}", kept.display());
+        assert!(
+            core_report.contains(&kept.display().to_string()),
+            "the actual stderr report names {}: {core_report}",
+            kept.display()
+        );
+    }
+    service.shutdown().await.expect("stop the runtime");
+
+    // Reuse this warm checkout for an actual pre-cutover ASIF main and build volume. The OS
+    // converts only detached fixture payloads; no runtime legacy creator/decoder is introduced.
+    let host = MacOsApfsExecutionHost::new(
+        SystemCommandRunner,
+        ApfsSubstrateConfig::new(fixture.storage.store(), &fixture.checkout),
+    )
+    .expect("fixture controller");
+    let build_image = layout.image(&main_volume);
+    for image in [&main_image, &build_image] {
+        host.detach_existing_image(image, DetachIntent::WhenIdle)
+            .expect("seal only this fixture input");
+        let legacy_image = image.with_extension("asif");
+        let convert = cowshed_core::apfs::CommandRequest::new(
+            "/usr/sbin/diskutil",
+            [
+                OsString::from("image"),
+                OsString::from("create"),
+                OsString::from("from"),
+                OsString::from("--format"),
+                OsString::from("ASIF"),
+                image.as_os_str().to_os_string(),
+                legacy_image.as_os_str().to_os_string(),
+            ],
+        );
+        let converted = SystemCommandRunner
+            .run(&convert)
+            .expect("native ASIF fixture conversion");
+        assert!(
+            converted.succeeded(),
+            "ASIF fixture conversion: {converted:?}"
+        );
+        fs::rename(image, image.with_extension("fixture-raw"))
+            .expect("retain original RAW fixture");
+        let suffixes: &[&str] = if image == &main_image {
+            &[".grants.json", ".ca.key"]
+        } else {
+            &[".json", ".hold"]
+        };
+        for suffix in suffixes {
+            let from = PathBuf::from(format!("{}{suffix}", image.display()));
+            let to = PathBuf::from(format!("{}{suffix}", legacy_image.display()));
+            if from.exists() {
+                fs::rename(from, to).expect("carry the fixture's actual sidecar or hold");
+            }
+        }
+        let mount = if image == &main_image {
+            fixture.checkout.clone()
+        } else {
+            layout.mount(&main_volume)
+        };
+        let attach = cowshed_core::apfs::CommandRequest::new(
+            "/usr/sbin/diskutil",
+            [
+                OsString::from("image"),
+                OsString::from("attach"),
+                OsString::from("--nobrowse"),
+                OsString::from("--mountPoint"),
+                mount.as_os_str().to_os_string(),
+                legacy_image.as_os_str().to_os_string(),
+            ],
+        );
+        let attached = SystemCommandRunner
+            .run(&attach)
+            .expect("attach actual legacy fixture");
+        assert!(attached.succeeded(), "legacy fixture attach: {attached:?}");
+    }
+    assert_eq!(linked_volume(&layout, &fixture.checkout), main_volume);
+    let legacy_record: BuildVolumeRecord =
+        cowshed_core::metadata::read_json(&build_image.with_extension("asif.json"))
+            .expect("the original ASIF build owner record");
+    assert_eq!(legacy_record, record);
+    // Setup's native project list must not admit this legacy main to rebuild-only refresh.
+    // This is the exact production inventory used by NativeSetupHost::build_state_projects.
+    let setup_projects = cowshed_core::NativeGatewayInventory::new(fixture.storage.clone())
+        .adopted_projects()
+        .await
+        .expect("setup inventory preserves legacy inputs");
+    assert!(
+        setup_projects
+            .iter()
+            .all(|project| { project.repo_id != RepoId::parse("fixture/dispatch").unwrap() })
+    );
+    assert_eq!(fs::read(warm.join("build.ninja")).unwrap(), b"warm\n");
+    assert_eq!(
+        cowshed_core::metadata::read_json::<BuildVolumeRecord>(
+            &build_image.with_extension("asif.json")
+        )
+        .unwrap(),
+        record
+    );
+    let mut legacy_service = fixture.open().await;
+    succeed(
+        &mut legacy_service,
+        [
+            OsString::from("adopt"),
+            fixture.checkout.as_os_str().to_os_string(),
+            OsString::from("--re-adopt"),
+        ],
+    )
+    .await;
+    assert_eq!(git_stdout(&fixture.checkout, &["rev-parse", "HEAD"]), head);
+    assert_eq!(
+        fs::read(fixture.checkout.join("notes.txt")).unwrap(),
+        b"untracked notes\n"
+    );
+    assert_eq!(fs::read(warm.join("build.ninja")).unwrap(), b"warm\n");
+    assert_eq!(linked_volume(&layout, &fixture.checkout), main_volume);
+    assert_eq!(layout.read_record(&main_volume).unwrap(), record);
+    assert_eq!(
+        fs::read(pre_cowshed.join(".git/HEAD")).unwrap(),
+        pre_cowshed_head
+    );
+    // Published-new-main / empty-checkout kill window: reuse the actual recorded replacement
+    // intent, stop the fixture at an empty real mountpoint, then reopen through ordinary startup.
+    let journal_path = project_root.join("lifecycle-intents.json");
+    let journal =
+        cowshed_core::storage::recovery::LifecycleIntentJournal::load(&journal_path).unwrap();
+    let operation = journal
+        .get(&WorkspaceName::main())
+        .unwrap()
+        .operation
+        .clone();
+    legacy_service
+        .shutdown()
+        .await
+        .expect("stop legacy migration runtime");
+    host.detach_existing_image(&main_image, DetachIntent::WhenIdle)
+        .expect("produce the actual post-publication empty mountpoint");
+    cowshed_core::storage::recovery::LifecycleIntentJournal::update(&journal_path, |journal| {
+        journal.begin(operation);
+        journal.mark_mutating(&WorkspaceName::main())
+    })
+    .unwrap();
+    assert!(
+        !fixture.checkout.join(".git").exists(),
+        "the crash window has no Git checkout mounted"
+    );
+    let recovered = fixture.open().await;
+    assert_eq!(git_stdout(&fixture.checkout, &["rev-parse", "HEAD"]), head);
+    assert_eq!(fs::read(warm.join("build.ninja")).unwrap(), b"warm\n");
+    assert_eq!(linked_volume(&layout, &fixture.checkout), main_volume);
+    assert_eq!(layout.read_record(&main_volume).unwrap(), record);
+    let recovered_journal =
+        cowshed_core::storage::recovery::LifecycleIntentJournal::load(&journal_path).unwrap();
+    assert!(
+        recovered_journal
+            .get(&WorkspaceName::main())
+            .unwrap()
+            .completion
+            .is_some()
+    );
+    recovered
+        .shutdown()
+        .await
+        .expect("stop recovered fixture runtime");
 }

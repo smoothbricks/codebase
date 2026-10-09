@@ -152,16 +152,16 @@ fn io_error(path: &Path, source: io::Error) -> MetadataError {
     }
 }
 
-/// Every workspace image is an ASIF file holding one case-sensitive APFS volume
+/// Every workspace image is a sparse RAW file holding one case-sensitive APFS volume
 /// (specs/cowshed/01_storage.md): one extension, no alias, nothing inferred from anything else.
-pub const IMAGE_EXTENSION: &str = "asif";
+pub const IMAGE_EXTENSION: &str = "dmg";
 
-/// Whether `path` names `<stem>.asif`.
+/// Whether `path` names `<stem>.dmg`.
 pub fn is_image_path(path: &Path) -> bool {
     path.extension() == Some(OsStr::new(IMAGE_EXTENSION))
 }
 
-/// Refuses any path that is not `<stem>.asif`, naming the extension it found.
+/// Refuses any path that is not `<stem>.dmg`, naming the extension it found.
 pub fn validate_image_path(path: &Path) -> Result<(), MetadataError> {
     if is_image_path(path) {
         Ok(())
@@ -1567,9 +1567,15 @@ mod tests {
     }
 
     #[test]
-    fn only_asif_paths_are_workspace_images() {
-        validate_image_path(Path::new("raven.asif")).unwrap();
-        for refused in ["raven.sparseimage", "raven.img", "raven", "raven.asif.lock"] {
+    fn only_raw_dmg_paths_are_workspace_images() {
+        validate_image_path(Path::new("raven.dmg")).unwrap();
+        for refused in [
+            "raven.asif",
+            "raven.sparseimage",
+            "raven.img",
+            "raven",
+            "raven.dmg.lock",
+        ] {
             assert!(
                 matches!(
                     validate_image_path(Path::new(refused)),
@@ -1602,7 +1608,7 @@ mod tests {
     }
 
     #[test]
-    fn detached_metadata_beside_a_non_asif_image_is_refused_before_use() {
+    fn detached_metadata_beside_a_non_raw_image_is_refused_before_use() {
         let directory = temp_directory("sparse-image");
         let image = directory.join("raven.sparseimage");
         write_json(&sidecar_path(&image), &frozen_sidecar_json()).unwrap();
@@ -1958,7 +1964,7 @@ mod tests {
     #[test]
     fn detached_sidecar_write_persists_and_validates_before_creation() {
         let directory = temp_directory("sidecar-write");
-        let image = directory.join("raven.asif");
+        let image = directory.join("raven.dmg");
         let metadata: DetachedWorkspaceMetadata =
             serde_json::from_value(frozen_sidecar_json()).unwrap();
         metadata.write_for_image(&image).unwrap();
@@ -2040,7 +2046,7 @@ mod tests {
             serde_json::from_value(frozen_sidecar_json()).unwrap();
         sidecar.version = 2;
         assert!(matches!(
-            sidecar.validate(Path::new("/tmp/image.asif")),
+            sidecar.validate(Path::new("/tmp/image.dmg")),
             Err(MetadataError::UnsupportedVersion {
                 kind: "detached workspace",
                 version: 2

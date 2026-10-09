@@ -720,7 +720,7 @@ mod tests {
         let root = test_root("contract");
         let mount = root.join("mount");
         fs::create_dir(&mount).expect("mount");
-        let key_path = root.join("staged.asif.ca.key");
+        let key_path = root.join("staged.dmg.ca.key");
         let workspace = workspace("00112233445566778899aabbccddeeff");
 
         mint_credentials(&workspace, &mount, &key_path).expect("mint credentials");

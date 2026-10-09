@@ -207,7 +207,7 @@ mod tests {
 
     fn fixture(root: &Path, project_root: &Path) -> CheckoutRecord {
         let mount_point = root.join("mount");
-        let image = root.join("main.asif");
+        let image = root.join("main.dmg");
         let repo_id = RepoId::parse("acme/widget").expect("repo");
         let workspace = WorkspaceName::new("main").expect("main");
         let marker_path = mount_point.join(WORKSPACE_MARKER_PATH);

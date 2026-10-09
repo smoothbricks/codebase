@@ -207,11 +207,13 @@ scans pools or silently picks one. A configured pool must contain or permit crea
 
 ## APFS image substrate (reference)
 
-As specified in 01_storage.md and 02_workspaces.md: one ASIF image (`.asif`) per workspace holding a case-sensitive APFS
-volume, with clonefile ≈ 2 ms and attach ≈ 235–400 ms. Attach is `diskutil image attach --noMount` followed by
-verification before the first mount (`fsck_apfs -q`, then mount). Deletion unlinks one file. Clones are fully
-independent of their source — no GC coupling — but inherit its extent map, so a fragmented main makes every clone's
-first write slow until `cowshed defrag main` (01_storage.md, "Clone cost follows extents, not size").
+As specified in 01_storage.md and 02_workspaces.md: one RAW image (`.dmg`) per workspace, a sparse file holding a
+case-sensitive APFS volume. Attach is `diskutil image attach --noMount` followed by verification before the first mount
+(`fsck_apfs -q`, then mount). Deletion unlinks one file. Clones are logically independent of their source (no GC
+coupling), but inherit its extent map, so a fragmented main makes every clone's first write slow until
+`cowshed defrag main` (01_storage.md, "Clone cost follows extents, not size"), and they share its blocks until every
+sharer is released (01_storage.md, "Space reclamation"). The clonefile ≈ 2 ms and attach ≈ 235–400 ms figures are
+pre-cutover APFS measurements (08_testing.md, historical), not RAW timings; no RAW timing budget is stated here.
 
 ## ZFS substrate
 

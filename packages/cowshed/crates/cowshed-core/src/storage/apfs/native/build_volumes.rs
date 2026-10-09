@@ -1,4 +1,4 @@
-//! Build volumes on APFS (16_build_volumes.md, "Substrate"): one ASIF image each, created,
+//! Build volumes on APFS (16_build_volumes.md, "Substrate"): one RAW image each, created,
 //! cloned, attached and released through the same backend as workspace images, but with no
 //! workspace sidecar, no marker and no lifecycle intent. A build volume nothing links is
 //! garbage by construction, so an interrupted operation leaves only what garbage collection
@@ -117,7 +117,7 @@ where
         let _creating = layout
             .hold_new(destination)
             .map_err(|error| io_error("hold a build volume while it is cloned", &hold, error))?;
-        if let Err(error) = self.capture_image(&from, mounted.then_some(mount.as_path()), &to, None)
+        if let Err(error) = self.capture_build_seed(&from, mounted.then_some(mount.as_path()), &to)
         {
             // No image, so nothing will ever release this hold file.
             if !to.exists() {
@@ -611,7 +611,7 @@ mod tests {
             use crate::build_volume::link;
             use crate::capabilities::BuildStatePath;
 
-            let image = root.join("store/lane.asif");
+            let image = root.join("store/lane.dmg");
             crate::blank_image::blank_image(&image);
             let attachment = host
                 .backend

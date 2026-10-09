@@ -112,7 +112,11 @@ mod macos {
             for index in 0..21 {
                 let clone = root.0.join(format!("clone-{index}.{IMAGE_EXTENSION}"));
                 let started = Instant::now();
-                backend.clone_image(&created, &clone)?;
+                backend.clone_image(
+                    &created,
+                    &clone,
+                    cowshed_core::apfs::ImageCapture::Detached,
+                )?;
                 clone_samples.push(started.elapsed());
                 backend.delete_image(&clone)?;
             }

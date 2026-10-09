@@ -2210,7 +2210,7 @@ mod tests {
             .sessions
             .clone();
         fs::create_dir_all(&sessions).expect("sessions directory");
-        fs::write(sessions.join("scratch.asif"), b"unpublished image").expect("orphan image");
+        fs::write(sessions.join("scratch.dmg"), b"unpublished image").expect("orphan image");
         let inventory = NativeGatewayInventory::with_source(
             fixture.storage.clone(),
             source as Arc<dyn InventorySource>,
@@ -2225,7 +2225,7 @@ mod tests {
             2
         );
         fs::write(
-            sidecar_path(&sessions.join("scratch.asif")),
+            sidecar_path(&sessions.join("scratch.dmg")),
             b"{\"invalid\": true}",
         )
         .expect("malformed sidecar");
@@ -2283,7 +2283,7 @@ mod tests {
         );
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].0, repo_a);
-        assert!(issues[0].1.to_string().contains("main.asif.grants.json"));
+        assert!(issues[0].1.to_string().contains("main.dmg.grants.json"));
     }
 
     /// A project's standing grants reach every workspace's gateway session, on top of its own,
@@ -2613,7 +2613,7 @@ mod tests {
             canonical_image_paths(&layout, &storage.workspace).expect("canonical image");
         let trash = layout.project().sessions.join(".trash");
         fs::create_dir_all(&trash).expect("trash");
-        let retired = trash.join("main-retired.asif");
+        let retired = trash.join("main-retired.dmg");
         fs::rename(canonical.image(), &retired).expect("retire image");
         fs::rename(sidecar_path(canonical.image()), sidecar_path(&retired))
             .expect("retire metadata");

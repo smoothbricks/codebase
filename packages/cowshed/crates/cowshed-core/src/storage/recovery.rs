@@ -22,6 +22,282 @@ const LIFECYCLE_INTENT_VERSION: u32 = 1;
 /// Suffix of the per-workspace lease file beside a project's session images.
 pub const INTENT_LEASE_SUFFIX: &str = ".intent.lock";
 
+/// A filesystem input retained by explicit re-adoption, never a second runtime image format.
+/// Exact paths and kernel IOMedia capacities are captured before the first detach.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReAdoptImage {
+    pub original: PathBuf,
+    pub retained: PathBuf,
+    pub source_mount: PathBuf,
+    pub capacity_bytes: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReAdoptBuild {
+    pub id: crate::build_volume::BuildVolumeId,
+    pub image: ReAdoptImage,
+    pub owner_record: crate::build_volume::BuildVolumeRecord,
+    /// Where the replacement volume is minted and copied, outside the build images collection
+    /// reads, until it is verified, detached and renamed to the build image path:
+    /// `<project>/.staging/readopt-<replacement>-build.dmg`.
+    pub replacement_image: PathBuf,
+    /// Where the replacement volume is mounted while it is copied:
+    /// `<mount root>/.staging/readopt-<replacement>-build`, beside the source mounts.
+    pub replacement_mount: PathBuf,
+}
+
+/// An old-incarnation seed re-adoption moved, bytes and record unchanged, out of the build
+/// images collection reads, so it stays as retained evidence (02_workspaces.md, "Re-adoption"
+/// step 3) until the user removes it.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReAdoptRetained {
+    pub original: PathBuf,
+    pub retained: PathBuf,
+}
+
+/// Persisted replacement authority. A real absent build link is `None`, not an empty stand-in:
+/// the `build` key is required, an explicit `null` is the only way to say there is none.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReAdoptSource {
+    pub checkout: PathBuf,
+    pub image: ReAdoptImage,
+    pub metadata: crate::metadata::DetachedWorkspaceMetadata,
+    /// The incarnation the replacement is published as, chosen before the first mutation: the
+    /// only one the intent may complete with.
+    pub replacement: WorkspaceIncarnation,
+    pub(crate) git_before: crate::git_preservation::GitPreservationSnapshot,
+    // `deserialize_with` turns off serde's missing-`Option`-is-`None` rule for this field.
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub build: Option<ReAdoptBuild>,
+    pub old_seeds: Vec<ReAdoptRetained>,
+}
+
+impl ReAdoptSource {
+    /// Refuse a replacement record whose paths could reach outside its own project, or whose
+    /// names do not say whose they are, before anything acts on it (02_workspaces.md,
+    /// "Re-adoption" step 1: exact source backing path, incarnation and retained paths).
+    pub(crate) fn validate(&self) -> CowshedResult<()> {
+        let refuse = |reason: String| {
+            Err(CowshedError::integrity(
+                format!("re-adoption record is invalid: {reason}"),
+                "repair the lifecycle intent journal, then reopen cowshed",
+            ))
+        };
+        let old = self.metadata.workspace_incarnation.as_str();
+        let Some(project) = self
+            .image
+            .original
+            .parent()
+            .filter(|root| root.is_absolute())
+        else {
+            return refuse(format!(
+                "main image {} is not an absolute path",
+                self.image.original.display()
+            ));
+        };
+        if !self.checkout.is_absolute() || self.checkout != self.metadata.info_snapshot.project_root
+        {
+            return refuse(format!(
+                "checkout {} is not main's absolute recorded checkout {}",
+                self.checkout.display(),
+                self.metadata.info_snapshot.project_root.display()
+            ));
+        }
+        if self.metadata.workspace != WorkspaceName::main() {
+            return refuse(format!(
+                "source workspace {} is not main",
+                self.metadata.workspace
+            ));
+        }
+        if self.replacement == self.metadata.workspace_incarnation {
+            return refuse(format!("replacement reuses the incarnation {old}"));
+        }
+        let retained = project.join(RETAINED_NAMESPACE);
+        check_image(
+            &self.image,
+            project,
+            "main",
+            &retained,
+            &format!("main-{old}"),
+            &format!("readopt-{old}-main"),
+        )
+        .or_else(refuse)?;
+        let images = project.join(crate::build_volume::IMAGES_DIRECTORY);
+        if let Some(build) = &self.build {
+            let id = build.id.as_str();
+            check_image(
+                &build.image,
+                &images,
+                id,
+                &retained,
+                &format!("build-{id}"),
+                &format!("readopt-{old}-build"),
+            )
+            .or_else(refuse)?;
+            let new = self.replacement.as_str();
+            let staged_image = project
+                .join(STAGING_NAMESPACE)
+                .join(format!("readopt-{new}-build"))
+                .with_extension(crate::metadata::IMAGE_EXTENSION);
+            if build.replacement_image != staged_image {
+                return refuse(format!(
+                    "replacement build image {} is not {}",
+                    build.replacement_image.display(),
+                    staged_image.display()
+                ));
+            }
+            let mounts = self.image.source_mount.parent();
+            if build.image.source_mount.parent() != mounts
+                || build.replacement_mount.parent() != mounts
+                || build
+                    .replacement_mount
+                    .file_name()
+                    .is_none_or(|name| *name != *format!("readopt-{new}-build"))
+            {
+                return refuse(format!(
+                    "build mounts {} and {} are not readopt mounts beside {}",
+                    build.image.source_mount.display(),
+                    build.replacement_mount.display(),
+                    self.image.source_mount.display()
+                ));
+            }
+        }
+        for seed in &self.old_seeds {
+            let id = seed
+                .original
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .and_then(crate::build_volume::BuildVolumeId::parse);
+            let valid = id.is_some_and(|id| {
+                retained_at(
+                    &seed.original,
+                    &seed.retained,
+                    &images,
+                    id.as_str(),
+                    &retained,
+                    &format!("seed-{}", id.as_str()),
+                )
+            });
+            if !valid {
+                return refuse(format!(
+                    "old seed {} retained at {} is not a build volume image of {} retained in {}",
+                    seed.original.display(),
+                    seed.retained.display(),
+                    images.display(),
+                    retained.display()
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Every staging mountpoint this re-adoption uses, exactly as recorded: the read-only
+    /// source mounts of main and its build volume, and the build replacement's copy mount.
+    /// Staging collection leaves these alone while the intent forms.
+    pub fn staging_mounts(&self) -> impl Iterator<Item = &Path> {
+        std::iter::once(self.image.source_mount.as_path()).chain(self.build.iter().flat_map(
+            |build| {
+                [
+                    build.image.source_mount.as_path(),
+                    build.replacement_mount.as_path(),
+                ]
+            },
+        ))
+    }
+
+    /// Every staged image this re-adoption mints outside the canonical names: the build
+    /// replacement until it is renamed to its build image path.
+    pub fn staging_images(&self) -> impl Iterator<Item = &Path> {
+        self.build
+            .iter()
+            .map(|build| build.replacement_image.as_path())
+    }
+}
+
+/// Where re-adoption retains the images it replaced, under the project directory.
+pub const RETAINED_NAMESPACE: &str = "retained";
+
+/// `original` is `<directory>/<stem>.<extension>` and `retained` is
+/// `<retained_directory>/<retained_stem>.<the same extension>`: a retained input keeps the
+/// format it was written in, never renamed as if it were RAW.
+fn retained_at(
+    original: &Path,
+    retained: &Path,
+    directory: &Path,
+    stem: &str,
+    retained_directory: &Path,
+    retained_stem: &str,
+) -> bool {
+    let Some(extension) = original.extension().filter(|extension| {
+        [crate::metadata::IMAGE_EXTENSION, "asif", "sparseimage"]
+            .iter()
+            .any(|known| **extension == **known)
+    }) else {
+        return false;
+    };
+    original.parent() == Some(directory)
+        && original.file_stem().is_some_and(|name| name == stem)
+        && retained
+            == retained_directory
+                .join(retained_stem)
+                .with_extension(extension)
+}
+
+/// `image` is retained as [`retained_at`] says, read from a mount named `mount_name` in a
+/// staging namespace: a name no BuildVolumeId parses as.
+fn check_image(
+    image: &ReAdoptImage,
+    directory: &Path,
+    stem: &str,
+    retained_directory: &Path,
+    retained_stem: &str,
+    mount_name: &str,
+) -> std::result::Result<(), String> {
+    if !retained_at(
+        &image.original,
+        &image.retained,
+        directory,
+        stem,
+        retained_directory,
+        retained_stem,
+    ) {
+        return Err(format!(
+            "image {} retained at {} is not {stem} in {} retained as {retained_stem} in {}",
+            image.original.display(),
+            image.retained.display(),
+            directory.display(),
+            retained_directory.display()
+        ));
+    }
+    let mount_ok = image.source_mount.is_absolute()
+        && image
+            .source_mount
+            .file_name()
+            .is_some_and(|name| name == mount_name)
+        && image
+            .source_mount
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|name| name == STAGING_NAMESPACE);
+    if !mount_ok {
+        return Err(format!(
+            "source mount {} is not {STAGING_NAMESPACE}/{mount_name}",
+            image.source_mount.display()
+        ));
+    }
+    if image.capacity_bytes == 0 {
+        return Err(format!(
+            "image {} records no capacity",
+            image.original.display()
+        ));
+    }
+    Ok(())
+}
+
 /// Durable user intent written before a lifecycle verb's first mutation.
 ///
 /// Deliberately not [`super::lifecycle::Operation`], and not substitutable for it. An intent
@@ -37,6 +313,10 @@ pub const INTENT_LEASE_SUFFIX: &str = ".intent.lock";
 pub enum LifecycleIntent {
     Adopt {
         options: AdoptOptions,
+    },
+    ReAdopt {
+        options: AdoptOptions,
+        source: Box<ReAdoptSource>,
     },
     Create {
         workspace: WorkspaceName,
@@ -59,7 +339,7 @@ pub enum LifecycleIntent {
 impl LifecycleIntent {
     pub fn target(&self) -> &WorkspaceName {
         match self {
-            Self::Adopt { .. } => main_name(),
+            Self::Adopt { .. } | Self::ReAdopt { .. } => main_name(),
             Self::Create { workspace, .. } | Self::Retire { workspace, .. } => workspace,
             Self::Fork { destination, .. } => destination,
         }
@@ -68,7 +348,7 @@ impl LifecycleIntent {
     /// The verb that recorded the intent, for operator-facing reports.
     pub fn verb(&self) -> &'static str {
         match self {
-            Self::Adopt { .. } => "adopt",
+            Self::Adopt { .. } | Self::ReAdopt { .. } => "adopt",
             Self::Create { .. } => "create",
             Self::Fork { .. } => "fork",
             Self::Retire { .. } => "retire",
@@ -293,11 +573,29 @@ impl LifecycleIntentJournal {
                     && matches!(
                         record.operation,
                         LifecycleIntent::Adopt { .. }
+                            | LifecycleIntent::ReAdopt { .. }
                             | LifecycleIntent::Create { .. }
                             | LifecycleIntent::Fork { .. }
                     )
             })
             .map(|(workspace, _)| workspace)
+    }
+
+    /// The validated source records of the re-adoptions [`Self::forming`] names: what staging
+    /// collection reads for the exact mounts and staged images
+    /// ([`ReAdoptSource::staging_mounts`], [`ReAdoptSource::staging_images`]) it leaves alone.
+    pub fn forming_re_adoptions(&self) -> impl Iterator<Item = &ReAdoptSource> {
+        self.entries
+            .values()
+            .filter_map(|record| match &record.operation {
+                LifecycleIntent::ReAdopt { source, .. }
+                    if record.completion.is_none()
+                        && record.phase == LifecycleIntentPhase::Mutating =>
+                {
+                    Some(source.as_ref())
+                }
+                _ => None,
+            })
     }
 
     /// Records `operation` as the workspace's pending intent and returns the record it
@@ -474,11 +772,31 @@ impl LifecycleIntentJournal {
                     "repair the lifecycle intent journal, then reopen cowshed",
                 ));
             }
+            if let LifecycleIntent::ReAdopt { source, .. } = &record.operation {
+                source.validate()?;
+                // A replacement concludes as exactly the incarnation recorded before its first
+                // mutation; any other, the replaced one above all, would report a main that is not
+                // the replacement.
+                if let Some(LifecycleIntentCompletion::Workspace(incarnation)) = &record.completion
+                    && incarnation != &source.replacement
+                {
+                    return Err(CowshedError::integrity(
+                        format!(
+                            "re-adoption of {workspace} completes with incarnation {}, not its \
+                             recorded replacement {}",
+                            incarnation.as_str(),
+                            source.replacement.as_str()
+                        ),
+                        "repair the lifecycle intent journal, then reopen cowshed",
+                    ));
+                }
+            }
             let valid_completion = matches!(
                 (&record.operation, &record.completion),
                 (_, None)
                     | (
                         LifecycleIntent::Adopt { .. }
+                            | LifecycleIntent::ReAdopt { .. }
                             | LifecycleIntent::Create { .. }
                             | LifecycleIntent::Fork { .. },
                         Some(LifecycleIntentCompletion::Workspace(_))
@@ -728,6 +1046,9 @@ pub(crate) fn prepared_retirement_unreadable(
         ),
     )
 }
+
+#[cfg(test)]
+pub(crate) mod re_adopt_tests;
 
 #[cfg(all(test, target_os = "macos"))]
 mod prepared_retirement_diagnostic_tests {

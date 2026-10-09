@@ -1911,6 +1911,10 @@ fn exec_request(
 }
 
 #[cfg(target_os = "macos")]
+#[path = "project_re_adopt.rs"]
+mod re_adopt;
+
+#[cfg(target_os = "macos")]
 type NativeSubstrate = crate::storage::apfs::ApfsSubstrate<
     crate::storage::apfs::native::MacOsApfsExecutionHost<crate::apfs::SystemCommandRunner>,
 >;
@@ -2640,10 +2644,23 @@ impl NativeProjectRuntimeHost {
         use crate::storage::apfs::ApfsExecutionHost;
         use crate::timing::spanned;
 
-        let git = spanned("open", "git-discover", async {
-            let git = crate::git::GitRepository::discover(project_root).await?;
-            git.ensure_adoptable().await?;
-            Ok::<_, CowshedError>(git)
+        // A re-adoption interrupted between retiring the replaced main and mounting its
+        // replacement leaves the checkout an empty mountpoint, where no repository is discovered.
+        // Such an open goes on as far as reading the project's journal, and only continues if that
+        // journal holds the forming re-adoption that owns the checkout; any other open of an empty
+        // directory fails as discovery did.
+        let (git, undiscovered) = spanned("open", "git-discover", async {
+            match crate::git::GitRepository::discover(project_root).await {
+                Ok(git) => {
+                    git.ensure_adoptable().await?;
+                    Ok::<_, CowshedError>((git, None))
+                }
+                Err(error) if is_empty_directory(project_root) => Ok((
+                    crate::git::GitRepository::from_root(project_root),
+                    Some(error),
+                )),
+                Err(error) => Err(error),
+            }
         })
         .await?;
         let git_root = git.root().to_path_buf();
@@ -2741,7 +2758,7 @@ impl NativeProjectRuntimeHost {
             }
             _ => (git_root, git),
         };
-        if existing_only && binding_repo_id.is_none() {
+        if (existing_only || undiscovered.is_some()) && binding_repo_id.is_none() {
             let inventory_storage = storage.clone();
             binding_repo_id = spanned(
                 "open",
@@ -2752,6 +2769,7 @@ impl NativeProjectRuntimeHost {
             .await
             .map_err(native_integrity_error)?;
         }
+        let mut replay_journal = None;
         let binding_span = crate::timing::span("open", "binding");
         let (repo_id, layout, binding) = if let Some(resolved) = session_project {
             resolved
@@ -2771,29 +2789,49 @@ impl NativeProjectRuntimeHost {
                         .map_err(native_integrity_error)?
                         .repo_id
                         .clone();
-                    let remotes = git.remotes().await?;
-                    // A transport move heals here, at the one place the binding is loaded, so
-                    // everything downstream — the descriptor, the gateway inventory — reads the
-                    // URL Git actually uses. An identity move refuses with the rebind verb, and
-                    // that verb reaches this arm under `ForIdentityChange` without tripping it.
-                    // An inspecting open keeps the recorded binding, and doctor reports the move.
-                    let binding = match reconcile_binding_with_remotes(
-                        &binding,
-                        &remotes,
-                        validation,
-                        git.root(),
-                    )? {
-                        Some(updated) if recovery_scope.repairs() => {
-                            persist_binding(&layout, &updated).await?;
-                            updated
+                    let binding = if let Some(discovery_error) = undiscovered.as_ref() {
+                        // A missing checkout cannot answer Git's remotes. Skip that query only
+                        // for the validated, exact replacement record owning this repo/root;
+                        // an unrelated empty directory still returns the original discovery error.
+                        let journal_path = layout
+                            .project()
+                            .project_root
+                            .join(crate::storage::recovery::LIFECYCLE_INTENTS_FILE);
+                        let journal = crate::storage::lifecycle::dispatch_blocking(move || {
+                            crate::storage::recovery::LifecycleIntentJournal::load(&journal_path)
+                        })
+                        .await
+                        .map_err(|error| CowshedError::internal(error.to_string()))??;
+                        if !journal.forming_re_adoptions().any(|source| {
+                            source.checkout == git_root && source.metadata.repo_id == repo_id
+                        }) {
+                            return Err(discovery_error.clone());
                         }
-                        Some(_) | None => binding,
+                        replay_journal = Some(journal);
+                        binding
+                    } else {
+                        let remotes = git.remotes().await?;
+                        match reconcile_binding_with_remotes(
+                            &binding,
+                            &remotes,
+                            validation,
+                            git.root(),
+                        )? {
+                            Some(updated) if recovery_scope.repairs() => {
+                                persist_binding(&layout, &updated).await?;
+                                updated
+                            }
+                            Some(_) | None => binding,
+                        }
                     };
                     (repo_id, layout, binding)
                 }
                 // Nothing adopted under this identity: the remotes are the only source left, and
                 // this is the adoption path that derives an identity from them for the first time.
                 None => {
+                    if let Some(error) = undiscovered {
+                        return Err(error);
+                    }
                     let candidate = binding_from_git(&git, binding_repo_id.as_ref()).await?;
                     let repo_id = candidate
                         .primary()
@@ -2846,8 +2884,19 @@ impl NativeProjectRuntimeHost {
         let repairs = recovery_scope.repairs();
         let (host, facts, pending, lifecycle_intents) =
             crate::storage::lifecycle::dispatch_blocking(move || {
-                let lifecycle_intents =
-                    crate::storage::recovery::LifecycleIntentJournal::load(&recovery_intents_path)?;
+                let lifecycle_intents = match replay_journal {
+                    Some(journal) => journal,
+                    None => crate::storage::recovery::LifecycleIntentJournal::load(
+                        &recovery_intents_path,
+                    )?,
+                };
+                // Before any repair touches the store: an empty checkout opens only for the
+                // re-adoption that emptied it.
+                if let Some(error) = undiscovered
+                    && lifecycle_intents.forming_re_adoptions().next().is_none()
+                {
+                    return Err(error);
+                }
                 // Store-wide completion of interrupted publications; an inspecting open reads the
                 // store as it stands, and doctor names what this would have completed.
                 if repairs {
@@ -3275,6 +3324,17 @@ impl NativeProjectRuntimeHost {
                     LifecycleIntent::Adopt { options } => {
                         self.adopt(options).await?;
                     }
+                    // A re-adoption is recorded and marked mutating in one journal update, so a
+                    // prepared one was never written by cowshed: refuse it rather than guess.
+                    LifecycleIntent::ReAdopt { source, .. } => {
+                        if phase != crate::storage::recovery::LifecycleIntentPhase::Mutating {
+                            return Err(CowshedError::integrity(
+                                "a re-adoption record was never marked mutating",
+                                "repair the lifecycle intent journal, then reopen cowshed",
+                            ));
+                        }
+                        self.resume_re_adopt(*source).await?;
+                    }
                     LifecycleIntent::Create { workspace, options } => {
                         match self.current(&workspace).await {
                             Ok(current) => {
@@ -3645,12 +3705,14 @@ impl NativeProjectRuntimeHost {
     /// Finish an adoption whose main is already published: swap the checkout for main's
     /// mountpoint if a crash or failure stopped before it, mount main there, and conclude.
     async fn finish_adoption(&mut self, current: NativeWorkspace) -> Result<WorkspaceSnapshot> {
-        let pre_cowshed = pre_cowshed_path(&self.descriptor.git_root)?;
+        let handoff = crate::storage::lifecycle::AdoptHandoff::Checkout {
+            pre_cowshed_checkout: pre_cowshed_path(&self.descriptor.git_root)?,
+        };
         timed_async(
             "adopt",
             "finish",
             self.substrate
-                .finish_adoption(&current.derived.workspace, &pre_cowshed),
+                .finish_adoption(&current.derived.workspace, &handoff),
         )
         .await
         .map_err(native_storage_error)?;
@@ -7986,7 +8048,14 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                     crate::storage::lifecycle::MountState::Detached
                 )
         });
-        if !detached_direct_main {
+        // A forming re-adoption validated the binding before it recorded itself, and the checkout
+        // it is replacing may be an empty mountpoint with no repository to ask until it finishes.
+        let re_adopting = self
+            .lifecycle_intents
+            .forming_re_adoptions()
+            .next()
+            .is_some();
+        if !detached_direct_main && !re_adopting {
             crate::timing::spanned("recover", "binding", self.validate_binding()).await?;
         }
         // Intent recovery finishes interrupted create/fork/remove work by creating and destroying
@@ -8010,6 +8079,24 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
 
     async fn adopt(&mut self, options: AdoptOptions) -> Result<WorkspaceSnapshot> {
         use crate::storage::lifecycle::LifecyclePlanner;
+        if options.re_adopt {
+            return self.re_adopt(options).await;
+        }
+        // A main adopted before RAW is invisible to this runtime's inventory, which therefore
+        // reads empty: a fresh adopt would journal over it and mint a second main. Only its
+        // explicit replacement may touch it (02_workspaces.md, "Re-adoption").
+        if let Some(image) = self.legacy_main_image()? {
+            return Err(CowshedError::conflict(
+                format!(
+                    "main is adopted as {}, a format this cowshed only replaces",
+                    image.display()
+                ),
+                format!(
+                    "cowshed adopt {} --re-adopt",
+                    self.descriptor.git_root.display()
+                ),
+            ));
+        }
         let intent = crate::storage::recovery::LifecycleIntent::Adopt {
             options: options.clone(),
         };
@@ -8096,7 +8183,9 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                 capacity,
                 topology_revision: crate::storage::lifecycle::Revision::new(0),
                 source_checkout: self.descriptor.git_root.to_path_buf(),
-                pre_cowshed_checkout: pre_cowshed,
+                handoff: crate::storage::lifecycle::AdoptHandoff::Checkout {
+                    pre_cowshed_checkout: pre_cowshed,
+                },
                 identity,
             })
             .map_err(native_integrity_error)?;
@@ -14565,7 +14654,7 @@ mod retired_recovery_tests {
         std::fs::create_dir_all(&trash).unwrap();
         let repo_id = RepoId::parse("acme/widget").unwrap();
         let incarnation = WorkspaceIncarnation::new("0198f2c0b7e34dc795f17b238b331c80").unwrap();
-        let image = trash.join(format!("raven-{}.asif", incarnation.as_str()));
+        let image = trash.join(format!("raven-{}.dmg", incarnation.as_str()));
         std::fs::write(&image, b"retired image").unwrap();
         let mut grants =
             GrantSet::closed_baseline(Some(PortBlock::new(49_136, 16).unwrap())).unwrap();
@@ -14619,7 +14708,7 @@ mod retired_recovery_tests {
         let name = WorkspaceName::new("idle").expect("workspace");
         let incarnation =
             WorkspaceIncarnation::new("0198f2c0b7e34dc795f17b238b331c80").expect("incarnation");
-        let image = trash.join(format!("idle-{}.asif", incarnation.as_str()));
+        let image = trash.join(format!("idle-{}.dmg", incarnation.as_str()));
         std::fs::write(&image, b"retired pending clone").expect("retired image");
         let mut grants =
             GrantSet::closed_baseline(Some(PortBlock::new(49_136, 16).expect("port block")))
@@ -14673,7 +14762,7 @@ mod retired_recovery_tests {
             .write_for_image(&image)
             .expect("restore metadata identity");
 
-        let live = project_root.join("sessions/idle.asif");
+        let live = project_root.join("sessions/idle.dmg");
         std::fs::write(&live, b"new workspace").expect("new canonical image");
         mismatched.workspace_incarnation =
             WorkspaceIncarnation::new("1198f2c0b7e34dc795f17b238b331c80").expect("new incarnation");
@@ -14701,7 +14790,7 @@ mod retired_recovery_tests {
         std::fs::create_dir_all(&trash).unwrap();
         let repo_id = RepoId::parse("acme/widget").unwrap();
         let incarnation = WorkspaceIncarnation::new("2198f2c0b7e34dc795f17b238b331c80").unwrap();
-        let image = trash.join(format!("main-{}.asif", incarnation.as_str()));
+        let image = trash.join(format!("main-{}.dmg", incarnation.as_str()));
         std::fs::write(&image, b"retired main image").unwrap();
         let mut grants = GrantSet::closed_baseline(Some(
             PortBlock::new(crate::metadata::MACOS_PORT_MAX - 15, 16).unwrap(),
@@ -14796,7 +14885,7 @@ mod retired_recovery_tests {
         let trash = project_root.join("sessions/.trash");
         std::fs::create_dir_all(&trash).unwrap();
         let incarnation = WorkspaceIncarnation::new("0198f2c0b7e34dc795f17b238b331c80").unwrap();
-        let image = trash.join(format!("raven-{}.asif", incarnation.as_str()));
+        let image = trash.join(format!("raven-{}.dmg", incarnation.as_str()));
         std::fs::write(&image, b"retired image").unwrap();
         DetachedWorkspaceMetadata {
             version: SIDECAR_VERSION,
@@ -14877,7 +14966,7 @@ mod retired_recovery_tests {
         let project_root = layout.project().project_root.clone();
         let trash = project_root.join("sessions/.trash");
         std::fs::create_dir_all(&trash).unwrap();
-        let image = trash.join("raven-0198f2c0b7e34dc795f17b238b331c80.asif");
+        let image = trash.join("raven-0198f2c0b7e34dc795f17b238b331c80.dmg");
         let companion = crate::metadata::append_suffix(&image, ".ca.key");
         std::fs::write(&image, b"retired image").unwrap();
         std::fs::write(&companion, b"retired CA key").unwrap();
@@ -15122,6 +15211,12 @@ async fn close_checkout_nx(
             "cowshed doctor --json",
         )
     })
+}
+
+/// Whether `path` is a directory with nothing in it, as a replaced main leaves its checkout.
+/// Anything unreadable is not proven empty.
+fn is_empty_directory(path: &Path) -> bool {
+    std::fs::read_dir(path).is_ok_and(|mut entries| entries.next().is_none())
 }
 
 /// Whether a file system is mounted exactly at `path`: its device differs from its parent's.
@@ -16445,7 +16540,7 @@ mod doctor_hint_tests {
     fn every_orphan_session_image_gets_its_own_named_doctor_finding() {
         use crate::storage::lifecycle::{StorageGcCandidate, StorageGcReason};
 
-        let first = PathBuf::from("/store/acme/widget/sessions/ghost.asif");
+        let first = PathBuf::from("/store/acme/widget/sessions/ghost.dmg");
         let second = PathBuf::from("/store/acme/widget/sessions/scratch.sparseimage");
         let candidates = [
             StorageGcCandidate::new(
@@ -16456,7 +16551,7 @@ mod doctor_hint_tests {
             ),
             StorageGcCandidate::new(
                 [2; 32],
-                PathBuf::from("/store/acme/widget/.staging/orphan.asif"),
+                PathBuf::from("/store/acme/widget/.staging/orphan.dmg"),
                 100,
                 StorageGcReason::OrphanStagingImage,
             ),
@@ -16491,7 +16586,7 @@ mod doctor_hint_tests {
         use crate::api::dto::FindingSeverity;
         use crate::storage::lifecycle::ExtentCount;
 
-        let image = PathBuf::from("/store/acme/widget/main.asif");
+        let image = PathBuf::from("/store/acme/widget/main.dmg");
         // 12 µs per extent: 83,333 extents copy in just under a second, 83,334 in just over.
         let under = main_extents_finding(image.clone(), ExtentCount::new(83_333));
         assert_eq!(under.code, "main-extents");
@@ -16582,8 +16677,8 @@ mod doctor_hint_tests {
     #[test]
     fn missing_ca_companion_is_an_error_hinting_rekey_not_doctor() {
         let workspace = WorkspaceName::new("raven").expect("workspace");
-        let image = PathBuf::from("/store/acme/widget/raven.asif");
-        let companion = PathBuf::from("/store/acme/widget/raven.asif.ca.key");
+        let image = PathBuf::from("/store/acme/widget/raven.dmg");
+        let companion = PathBuf::from("/store/acme/widget/raven.dmg.ca.key");
         let finding = missing_ca_companion_finding(&workspace, "canonical", &image, &companion);
         assert_eq!(finding.code, "ca-companion-missing");
         assert_eq!(finding.severity, crate::api::dto::FindingSeverity::Error);
@@ -16607,8 +16702,8 @@ mod doctor_hint_tests {
 
     #[test]
     fn missing_ca_companion_error_names_both_paths_and_hints_rekey() {
-        let image = PathBuf::from("/store/acme/widget/raven.asif");
-        let companion = PathBuf::from("/store/acme/widget/raven.asif.ca.key");
+        let image = PathBuf::from("/store/acme/widget/raven.dmg");
+        let companion = PathBuf::from("/store/acme/widget/raven.dmg.ca.key");
         let rendered =
             native_storage_error(crate::storage::apfs::ApfsStorageError::MissingCaCompanion {
                 layout: "canonical",
@@ -16672,8 +16767,8 @@ mod doctor_hint_tests {
         let rendered =
             native_storage_error(crate::storage::apfs::ApfsStorageError::MissingCaCompanion {
                 layout: "canonical",
-                image: PathBuf::from("/store/acme/widget/cargo-wasmbench.asif"),
-                companion: PathBuf::from("/store/acme/widget/cargo-wasmbench.asif.ca.key"),
+                image: PathBuf::from("/store/acme/widget/cargo-wasmbench.dmg"),
+                companion: PathBuf::from("/store/acme/widget/cargo-wasmbench.dmg.ca.key"),
             });
         assert_eq!(rendered.code, ErrorCode::Integrity);
         assert_eq!(rendered.hint, "cowshed rekey cargo-wasmbench");
@@ -16712,8 +16807,8 @@ mod doctor_hint_tests {
                 "incarnation": "0198f2c0b7e34dc795f17b238b331c80",
                 "revision": 3,
                 "reason": "missing-ca-companion",
-                "image": "/store/acme/widget/raven.asif",
-                "companion": "/store/acme/widget/raven.asif.ca.key",
+                "image": "/store/acme/widget/raven.dmg",
+                "companion": "/store/acme/widget/raven.dmg.ca.key",
                 "quarantinedAt": "2026-09-04T00:00:00Z",
                 "sidecar": "/store/acme/widget/quarantine/raven-1754000000/sidecar.json",
             })
@@ -16733,8 +16828,8 @@ mod doctor_hint_tests {
                 "incarnation": "0198f2c0b7e34dc795f17b238b331c80",
                 "revision": 3,
                 "reason": "missing-ca-companion",
-                "image": "/store/acme/widget/kestrel.asif",
-                "companion": "/store/acme/widget/kestrel.asif.ca.key",
+                "image": "/store/acme/widget/kestrel.dmg",
+                "companion": "/store/acme/widget/kestrel.dmg.ca.key",
                 "quarantinedAt": "2026-09-04T00:00:00Z",
                 "sidecar": "/store/acme/widget/quarantine/kestrel-1754000001/sidecar.json",
             })
@@ -16745,7 +16840,7 @@ mod doctor_hint_tests {
         // Live images: kestrel's sidecar survived without its companion; falcon is whole.
         let live = root.join("live");
         std::fs::create_dir_all(&live).expect("live dir");
-        let bare_image = live.join("kestrel.asif");
+        let bare_image = live.join("kestrel.dmg");
         std::fs::write(&bare_image, b"image").expect("bare image");
         std::fs::write(crate::metadata::sidecar_path(&bare_image), b"sidecar")
             .expect("bare sidecar");
