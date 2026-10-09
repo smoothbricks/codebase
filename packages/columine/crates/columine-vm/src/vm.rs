@@ -1040,8 +1040,11 @@ impl Vm {
     /// Reserve the working memory `demand` names before any write.
     fn reserve_scratch(&mut self, demand: &ScratchDemand) -> Result<(), ErrorCode> {
         self.undo.ttl_batch_scratch.reserve_for(demand.ttl)?;
-        match demand.nested {
-            Some(nested) => self.nested_scratch.reserve_for(nested),
+        if let Some(nested) = demand.nested {
+            self.nested_scratch.reserve_for(nested)?;
+        }
+        match demand.bitmap {
+            Some(bitmap) => self.bitmap_env.reserve_for(bitmap),
             None => Ok(()),
         }
     }
@@ -1051,11 +1054,13 @@ impl Vm {
     fn seal_scratch(&mut self) {
         self.undo.ttl_batch_scratch.seal();
         self.nested_scratch.seal();
+        self.bitmap_env.seal();
     }
 
     fn unseal_scratch(&mut self) {
         self.undo.ttl_batch_scratch.unseal();
         self.nested_scratch.unseal();
+        self.bitmap_env.unseal();
     }
 
     /// The working memory `rows` operations of one call on `meta`'s slot
@@ -1064,6 +1069,13 @@ impl Vm {
         ScratchDemand {
             ttl: crate::ttl_plan::plan_demand(state, meta, u64::try_from(rows).unwrap_or(u64::MAX)),
             nested: None,
+            // A slot whose image cannot be read refuses in the call itself.
+            bitmap: (meta.slot_type() == SlotType::Bitmap)
+                .then(|| {
+                    let rows = u64::try_from(rows).unwrap_or(u64::MAX);
+                    crate::bitmap_ops::patch_demand(state, meta, rows, rows).ok()
+                })
+                .flatten(),
         }
     }
 

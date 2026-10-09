@@ -537,6 +537,23 @@ impl CapacityScratch {
             let slot = self.touched[index];
             let d = self.demand[usize::try_from(slot).ok()?];
             let meta = slot_meta(state, slot)?;
+            if meta.slot_type() == SlotType::Bitmap {
+                if d.rows || d.opaque {
+                    return Some(Admission::DryRun);
+                }
+                let mut patch =
+                    crate::bitmap_ops::patch_demand(state, &meta, d.units, d.touches).ok()?;
+                if meta.has_ttl() && (d.algebra_units != 0 || d.algebra_touches != 0) {
+                    patch.ttl = crate::bitmap_ttl::TtlAlgebraDemand {
+                        target_rows: expiry_rows(state, slot),
+                        source_rows: (0..slots)
+                            .map(|source| expiry_rows(state, source))
+                            .max()
+                            .unwrap_or(0),
+                    };
+                }
+                self.scratch.bitmap.get_or_insert_default().widen(patch);
+            }
             if meta.has_ttl() {
                 if d.rows || d.opaque {
                     return Some(Admission::DryRun);
@@ -747,6 +764,14 @@ fn scratch_members(env: &BitmapEnv) -> Option<u64> {
         return Some(0);
     }
     BitmosaicView::open(image).map(|view| view.len())
+}
+
+/// Live expiry rows of a TTL bitmap slot; zero for any other slot.
+fn expiry_rows(state: &[u8], slot: u32) -> usize {
+    slot_meta(state, slot)
+        .filter(|meta| meta.slot_type() == SlotType::Bitmap && meta.has_ttl())
+        .and_then(|meta| usize::try_from(meta.eviction_index_size(state)).ok())
+        .unwrap_or(0)
 }
 
 /// `slot`'s metadata as execution reads it. The state's geometry was

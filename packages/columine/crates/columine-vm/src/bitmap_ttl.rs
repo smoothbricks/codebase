@@ -27,6 +27,36 @@ pub(crate) struct TtlAlgebraScratch {
     scatter: Vec<ExpiryEntry>,
     removals: Vec<u32>,
     upserts: Vec<ExpiryEntry>,
+    /// Capacities when a batch's reservation was sealed: no merge of the batch
+    /// may grow any buffer past them.
+    #[cfg(debug_assertions)]
+    sealed: Option<[usize; 5]>,
+}
+
+/// The largest TTL algebra one batch or call can run: the most live index
+/// rows of a target and of a source.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct TtlAlgebraDemand {
+    /// Live index rows of the target slot.
+    pub(crate) target_rows: usize,
+    /// Live index rows of the source slot.
+    pub(crate) source_rows: usize,
+}
+
+impl TtlAlgebraDemand {
+    /// Raise each field to the larger of the two, so a batch's demand covers
+    /// every merge widened into it.
+    pub(crate) fn widen(&mut self, other: Self) {
+        self.target_rows = self.target_rows.max(other.target_rows);
+        self.source_rows = self.source_rows.max(other.source_rows);
+    }
+}
+
+/// Grow `buf` so its capacity is at least `total` elements, keeping its
+/// contents. Refuses with `OutOfMemory` instead of aborting.
+fn reserve_to<T>(buf: &mut Vec<T>, total: usize) -> Result<(), ErrorCode> {
+    buf.try_reserve(total.saturating_sub(buf.len()))
+        .map_err(|_| ErrorCode::OutOfMemory)
 }
 
 impl TtlAlgebraScratch {
@@ -50,6 +80,66 @@ impl TtlAlgebraScratch {
         self.removals.clear();
         self.upserts.clear();
     }
+
+    /// Back the largest algebra a batch can run, before the batch's first
+    /// write, so every merge of the batch finds the storage it needs. Capacity
+    /// only grows; buffer contents are kept.
+    pub(crate) fn reserve_for(&mut self, demand: TtlAlgebraDemand) -> Result<(), ErrorCode> {
+        let upsert_rows = demand
+            .target_rows
+            .checked_add(demand.source_rows)
+            .ok_or(ErrorCode::OutOfMemory)?;
+        reserve_to(&mut self.target, demand.target_rows)?;
+        reserve_to(&mut self.source, demand.source_rows)?;
+        reserve_to(
+            &mut self.scatter,
+            demand.target_rows.max(demand.source_rows),
+        )?;
+        reserve_to(&mut self.removals, demand.target_rows)?;
+        reserve_to(&mut self.upserts, upsert_rows)
+    }
+
+    /// From here until [`Self::unseal`], no merge may grow this storage.
+    pub(crate) fn seal(&mut self) {
+        #[cfg(debug_assertions)]
+        {
+            self.sealed = Some(self.capacities());
+        }
+    }
+
+    /// Lift the seal taken by [`Self::seal`] once the batch is done.
+    pub(crate) fn unseal(&mut self) {
+        #[cfg(debug_assertions)]
+        {
+            self.sealed = None;
+        }
+    }
+
+    /// Current capacity of each buffer a seal covers, in the order of `sealed`.
+    #[cfg(debug_assertions)]
+    fn capacities(&self) -> [usize; 5] {
+        [
+            self.target.capacity(),
+            self.source.capacity(),
+            self.scatter.capacity(),
+            self.removals.capacity(),
+            self.upserts.capacity(),
+        ]
+    }
+
+    /// Debug check: a merge under a seal left every buffer's capacity as it was.
+    fn check_sealed(&self) {
+        #[cfg(debug_assertions)]
+        {
+            if let Some(sealed) = self.sealed {
+                debug_assert_eq!(
+                    self.capacities(),
+                    sealed,
+                    "TTL algebra grew past its batch's reservation"
+                );
+            }
+        }
+    }
 }
 
 /// Read each live index row once; stable ordering later preserves which
@@ -68,7 +158,7 @@ fn read_entries(
     let end = start.checked_add(len).ok_or(ErrorCode::InvalidState)?;
     let rows = state.get(start..end).ok_or(ErrorCode::InvalidState)?;
     let width = usize::try_from(EVICTION_ENTRY_SIZE).map_err(|_| ErrorCode::InvalidState)?;
-    entries.reserve(rows.len() / width);
+    reserve_to(entries, rows.len() / width)?;
     let mut previous = None;
     let mut sorted = true;
     for row in rows.chunks_exact(width) {
@@ -86,9 +176,14 @@ fn read_entries(
 /// Stable four-pass LSD radix order. The scatter keeps its high-water length
 /// across calls; only the active prefix is read, so warming a smaller side
 /// does not erase or reinitialize the larger side's retained workspace.
-fn radix_order(entries: &mut [ExpiryEntry], scatter: &mut Vec<ExpiryEntry>) {
+/// Refuses with `OutOfMemory` if the scatter cannot grow to the entry count.
+fn radix_order(
+    entries: &mut [ExpiryEntry],
+    scatter: &mut Vec<ExpiryEntry>,
+) -> Result<(), ErrorCode> {
     let len = entries.len();
     if scatter.len() < len {
+        reserve_to(scatter, len)?;
         scatter.resize(len, ExpiryEntry { key: 0, bits: 0 });
     }
     let mut buckets = [[0usize; 256]; 4];
@@ -115,6 +210,7 @@ fn radix_order(entries: &mut [ExpiryEntry], scatter: &mut Vec<ExpiryEntry>) {
             positions[bucket] += 1;
         }
     }
+    Ok(())
 }
 
 fn group_expiry(entries: &[ExpiryEntry], at: &mut usize, key: u32) -> Option<u64> {
@@ -197,21 +293,21 @@ pub(crate) fn merge_expiries(
         return Ok(false);
     }
     if !read_entries(state, target_meta, &mut scratch.target)? {
-        radix_order(&mut scratch.target, &mut scratch.scatter);
+        radix_order(&mut scratch.target, &mut scratch.scatter)?;
     }
     if !same_slot
         && let Some(meta) = source_meta
         && !read_entries(state, meta, &mut scratch.source)?
     {
-        radix_order(&mut scratch.source, &mut scratch.scatter);
+        radix_order(&mut scratch.source, &mut scratch.scatter)?;
     }
-    scratch.removals.reserve(scratch.target.len());
+    reserve_to(&mut scratch.removals, scratch.target.len())?;
     let upper = scratch
         .target
         .len()
         .checked_add(scratch.source.len())
         .ok_or(ErrorCode::InvalidState)?;
-    scratch.upserts.reserve(upper);
+    reserve_to(&mut scratch.upserts, upper)?;
     let mut target_at = 0;
     let mut source_at = 0;
     loop {
@@ -248,6 +344,7 @@ pub(crate) fn merge_expiries(
             scratch.removals.push(key);
         }
     }
+    scratch.check_sealed();
     Ok(!scratch.removals.is_empty() || !scratch.upserts.is_empty())
 }
 
@@ -306,7 +403,7 @@ mod tests {
     }
 
     #[test]
-    fn radix_order_is_stable_and_keeps_last_original_duplicate() {
+    fn radix_order_is_stable_and_keeps_last_original_duplicate() -> Result<(), ErrorCode> {
         let mut entries = vec![
             ExpiryEntry {
                 key: u32::MAX,
@@ -321,7 +418,7 @@ mod tests {
             ExpiryEntry { key: 0, bits: 5 },
         ];
         let mut scatter = Vec::new();
-        radix_order(&mut entries, &mut scatter);
+        radix_order(&mut entries, &mut scatter)?;
         assert_eq!(
             entries
                 .iter()
@@ -337,8 +434,9 @@ mod tests {
             ExpiryEntry { key: 2, bits: 6 },
             ExpiryEntry { key: 1, bits: 7 },
         ];
-        radix_order(&mut smaller, &mut scatter);
+        radix_order(&mut smaller, &mut scatter)?;
         assert_eq!((smaller[0].key, smaller[1].key), (1, 2));
         assert_eq!(scatter.len(), high_water);
+        Ok(())
     }
 }

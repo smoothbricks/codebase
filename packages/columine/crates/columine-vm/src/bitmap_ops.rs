@@ -34,7 +34,7 @@
 //! Membership, cardinality, rank/select, iteration and intersection open an
 //! `BitmosaicView` over the slot bytes (or over caller-supplied bytes for the
 //! decision-side `*_serialized` queries) and answer from the string; no read
-use crate::bitmap_ttl::{TtlAlgebraScratch, merge_expiries};
+use crate::bitmap_ttl::{TtlAlgebraDemand, TtlAlgebraScratch, merge_expiries};
 use crate::hooks::{ByteCapture, TtlMutation, VmHooks};
 use crate::meta::SlotMetaView;
 use crate::state_init::bind_slot;
@@ -42,7 +42,7 @@ use crate::ttl_plan::TtlBatchPlan;
 use bitmosaic::{
     AndNotRange, AndRange, BatchOutcome, Bitmosaic, BitmosaicView, IMAGE_ID_LEN, KeyWidth, OrRange,
     PatchError, PatchReport, PatchScratch, PreparedPatch, Range, XorRange, image_header,
-    prepare_patch_in_witnessed,
+    patched_len_bound, prepare_patch_in_witnessed,
 };
 use columine_types::{
     BITMAP_BYTES_PER_CAPACITY, ChangeFlag, EMPTY_KEY, ErrorCode, SlotMetaOffset, TOMBSTONE,
@@ -138,6 +138,85 @@ pub struct BitmapEnv {
     algebra_result: Vec<u8>,
     ttl_mutations: Vec<TtlMutation>,
     ttl_algebra_scratch: TtlAlgebraScratch,
+    /// Capacities when a batch's reservation was sealed: no operation of
+    /// the batch may grow past them.
+    #[cfg(debug_assertions)]
+    sealed: Option<[usize; 8]>,
+}
+
+/// The largest bitmap patch one batch or call can make.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct BitmapPatchDemand {
+    /// Most values one operation adds or removes, before deduplication.
+    pub(crate) values: usize,
+    /// The largest image one patch can leave, bounded by its slot.
+    pub(crate) image_bytes: usize,
+    /// Most members one patch touches.
+    pub(crate) touches: usize,
+    /// The largest TTL algebra merge.
+    pub(crate) ttl: TtlAlgebraDemand,
+}
+
+impl BitmapPatchDemand {
+    pub(crate) fn widen(&mut self, other: Self) {
+        self.values = self.values.max(other.values);
+        self.image_bytes = self.image_bytes.max(other.image_bytes);
+        self.touches = self.touches.max(other.touches);
+        self.ttl.widen(other.ttl);
+    }
+}
+
+/// The demand of one patch adding at most `adds` and removing at most
+/// `removes` members of `meta`'s bitmap: its image never outgrows
+/// `patched_len_bound`, nor the slot's payload.
+pub(crate) fn patch_demand(
+    state: &[u8],
+    meta: &SlotMetaView,
+    adds: u64,
+    removes: u64,
+) -> Result<BitmapPatchDemand, ErrorCode> {
+    storage_demand(state, get_bitmap_storage(meta), adds, removes)
+}
+
+/// [`patch_demand`] for a bitmap known by its storage.
+fn storage_demand(
+    state: &[u8],
+    storage: BitmapStorage,
+    adds: u64,
+    removes: u64,
+) -> Result<BitmapPatchDemand, ErrorCode> {
+    let image = storage.serialized_data(state)?;
+    let touches = adds.saturating_add(removes);
+    let bound = patched_len_bound(image, adds, touches)
+        .ok_or(ErrorCode::InvalidState)?
+        .min(u64::from(storage.payload_capacity));
+    let narrow = |value: u64| usize::try_from(value).map_err(|_| ErrorCode::OutOfMemory);
+    Ok(BitmapPatchDemand {
+        values: narrow(touches)?,
+        image_bytes: narrow(bound)?,
+        touches: narrow(touches)?,
+        ttl: TtlAlgebraDemand::default(),
+    })
+}
+
+/// The number of values a column names, for demand arithmetic.
+fn count(values: &[u32]) -> u64 {
+    u64::try_from(values.len()).unwrap_or(u64::MAX)
+}
+
+/// The live expiry rows of `meta`'s slot; none without TTL.
+fn expiry_rows(state: &[u8], meta: &SlotMetaView) -> usize {
+    if meta.has_ttl() {
+        usize::try_from(meta.eviction_index_size(state)).unwrap_or(usize::MAX)
+    } else {
+        0
+    }
+}
+
+/// Grow `buf` to hold `total` elements, refusing with `OutOfMemory`.
+fn hold<T>(buf: &mut Vec<T>, total: usize) -> Result<(), ErrorCode> {
+    buf.try_reserve(total.saturating_sub(buf.len()))
+        .map_err(|_| ErrorCode::OutOfMemory)
 }
 
 impl Default for BitmapEnv {
@@ -155,6 +234,8 @@ impl Default for BitmapEnv {
             algebra_result: Vec::new(),
             ttl_mutations: Vec::new(),
             ttl_algebra_scratch: TtlAlgebraScratch::default(),
+            #[cfg(debug_assertions)]
+            sealed: None,
         }
     }
 }
@@ -173,6 +254,67 @@ impl BitmapEnv {
     /// exposes the buffer; core code returns the slice.
     pub fn algebra_result(&self) -> &[u8] {
         &self.algebra_result
+    }
+
+    /// Back every buffer the patches `demand` bounds can fill: the value and
+    /// witness buffers, the capture ranges (one run per old payload word and
+    /// eight per touched chunk, then the tail, size, flag and two TTL
+    /// ranges), the kernel's patch scratch and the TTL algebra merge.
+    /// Capacity already held is kept.
+    pub(crate) fn reserve_for(&mut self, demand: BitmapPatchDemand) -> Result<(), ErrorCode> {
+        let planes = demand.values.div_ceil(64);
+        hold(&mut self.adds, demand.values)?;
+        hold(&mut self.removes, demand.values)?;
+        hold(&mut self.staged_adds, demand.values)?;
+        hold(&mut self.ttl_mutations, demand.values)?;
+        hold(&mut self.adds_new, planes)?;
+        hold(&mut self.removes_held, planes)?;
+        let ranges = (demand.image_bytes / 8)
+            .saturating_add(demand.touches.saturating_mul(8))
+            .saturating_add(6);
+        hold(&mut self.capture_ranges, ranges)?;
+        self.scratch
+            .try_reserve_for(demand.image_bytes, demand.touches)
+            .map_err(|_| ErrorCode::OutOfMemory)?;
+        self.ttl_algebra_scratch.reserve_for(demand.ttl)
+    }
+
+    /// From here until [`Self::unseal`], no operation may grow this storage;
+    /// debug builds check it when the batch ends.
+    pub(crate) fn seal(&mut self) {
+        self.ttl_algebra_scratch.seal();
+        #[cfg(debug_assertions)]
+        {
+            self.sealed = Some(self.capacities());
+        }
+    }
+
+    pub(crate) fn unseal(&mut self) {
+        self.ttl_algebra_scratch.unseal();
+        #[cfg(debug_assertions)]
+        {
+            if let Some(sealed) = self.sealed.take() {
+                debug_assert_eq!(
+                    self.capacities(),
+                    sealed,
+                    "a bitmap operation grew past its batch's reservation"
+                );
+            }
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    fn capacities(&self) -> [usize; 8] {
+        [
+            self.adds.capacity(),
+            self.removes.capacity(),
+            self.staged_adds.capacity(),
+            self.ttl_mutations.capacity(),
+            self.adds_new.capacity(),
+            self.removes_held.capacity(),
+            self.capture_ranges.capacity(),
+            self.scratch.capacity_bytes(),
+        ]
     }
 }
 
@@ -226,6 +368,7 @@ pub fn prepare_bitmap_patch<'state, 'work>(
     let range = bitmap_payload_range(storage, state.len()).inspect_err(|_| {
         env.last_error = 102;
     })?;
+    env.reserve_for(storage_demand(state, storage, count(adds), count(removes))?)?;
     prepare_patch_in_witnessed(
         state,
         range,
@@ -250,6 +393,7 @@ pub fn bitmap_patch(
     let range = bitmap_payload_range(storage, state.len()).inspect_err(|_| {
         env.last_error = 102;
     })?;
+    env.reserve_for(storage_demand(state, storage, count(adds), count(removes))?)?;
     env.adds_new.resize(adds.len().div_ceil(64), 0);
     env.removes_held.resize(removes.len().div_ceil(64), 0);
     let mut outcome = BatchOutcome::new(&mut env.adds_new, &mut env.removes_held);
@@ -418,6 +562,12 @@ pub fn batch_bitmap_add(
     env.ttl_mutations.clear();
     env.staged_adds.clear();
     let storage = get_bitmap_storage(meta);
+    // Every buffer this add can fill is backed before it writes.
+    if let Err(code) = storage_demand(state, storage, count(elem_col), 0)
+        .and_then(|demand| env.reserve_for(demand))
+    {
+        return code;
+    }
     let has_ttl = meta.has_ttl();
     let timestamp_at = |i: usize| -> f64 {
         if has_ttl {
@@ -584,6 +734,12 @@ pub fn batch_bitmap_remove(
     if cardinality == 0 || elem_col.is_empty() {
         return ErrorCode::Ok;
     }
+    // Every buffer this removal can fill is backed before it writes.
+    if let Err(code) = storage_demand(state, storage, 0, count(elem_col))
+        .and_then(|demand| env.reserve_for(demand))
+    {
+        return code;
+    }
     // A column that is already the batch is patched as it is; any other is
     // staged, sorted and deduplicated into the retained buffer.
     let mut removes = core::mem::take(&mut env.removes);
@@ -676,6 +832,48 @@ pub fn batch_bitmap_algebra(
     env.ttl_mutations.clear();
     let target_storage = get_bitmap_storage(target_meta);
     let original_size = target_meta.size(state);
+
+    // Every buffer the algebra can fill is backed before it writes: it adds
+    // at most the source's members, removes at most the target's, and merges
+    // at most both sides' live expiry rows. An unreadable operand is refused
+    // below, where it is read.
+    let source_slot = match source {
+        BitmapSource::Slot(slot) => bind_slot(state, slot).ok(),
+        BitmapSource::Scratch | BitmapSource::Bytes(_) => None,
+    };
+    let source_members = match source {
+        BitmapSource::Slot(_) => source_slot
+            .as_ref()
+            .map_or(0, |meta| u64::from(meta.size(state))),
+        BitmapSource::Scratch => {
+            BitmosaicView::open(&env.algebra_result).map_or(0, |view| view.len())
+        }
+        BitmapSource::Bytes(data) => BitmosaicView::open(data).map_or(0, |view| view.len()),
+    };
+    let adds_source = matches!(op, BitmapAlgebraOp::Or | BitmapAlgebraOp::Xor);
+    let removes_target = !matches!(op, BitmapAlgebraOp::Or);
+    let algebra_demand = storage_demand(
+        state,
+        target_storage,
+        if adds_source { source_members } else { 0 },
+        if removes_target {
+            u64::from(original_size)
+        } else {
+            0
+        },
+    )
+    .map(|mut demand| {
+        demand.ttl = TtlAlgebraDemand {
+            target_rows: expiry_rows(state, target_meta),
+            source_rows: source_slot
+                .as_ref()
+                .map_or(0, |meta| expiry_rows(state, meta)),
+        };
+        demand
+    });
+    if let Err(code) = algebra_demand.and_then(|demand| env.reserve_for(demand)) {
+        return code;
+    }
 
     let target_data = match target_storage.serialized_data(state) {
         Ok(data) => data,

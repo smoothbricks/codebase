@@ -261,6 +261,70 @@ fn each_tier_answers_only_what_the_tier_before_cannot() {
         assert_eq!(None, map.get(key), "key {key}");
     }
     assert_eq!(Some(1000), map.get(100));
+
+    // Bitmap patches reserve their working memory per batch too. A batch
+    // adds one value to bitmap 0, then 300 to bitmap 1; on a VM whose patch
+    // scratch only served one-value patches, every allocation refused, the
+    // batch is refused as a whole with nothing written rather than after its
+    // first patch. A VM that never ran a batch, adding, removing or running
+    // algebra, is refused the same way.
+    let bitmaps = |reduce: &[u8]| {
+        program(
+            2,
+            2,
+            &[
+                vec![Opcode::SlotDef as u8, 0, SlotType::Bitmap as u8, 0, 2],
+                vec![Opcode::SlotDef as u8, 1, SlotType::Bitmap as u8, 0, 2],
+            ]
+            .concat(),
+            reduce,
+        )
+    };
+    let adds = bitmaps(&[
+        Opcode::BatchBitmapAdd as u8,
+        0,
+        0,
+        Opcode::BatchBitmapAdd as u8,
+        1,
+        1,
+    ]);
+    let mut state = init(&adds);
+    let mut vm = Vm::default();
+    let one = [7u32];
+    assert_eq!(
+        OK,
+        vm.execute_batch(
+            &mut state,
+            &adds,
+            &[u32s_as_bytes(&one), u32s_as_bytes(&one)],
+            1
+        )
+    );
+    let small = vec![9u32; 300];
+    let large: Vec<u32> = (0..300).map(|i| i * 977).collect();
+    let cols = [u32s_as_bytes(&small), u32s_as_bytes(&large)];
+    let before = state.clone();
+    assert_eq!(
+        ErrorCode::OutOfMemory as u32,
+        without_memory(|| vm.execute_batch(&mut state, &adds, &cols, 300))
+    );
+    assert_eq!(before, state, "a refused batch writes nothing");
+    assert_eq!(OK, vm.execute_batch(&mut state, &adds, &cols, 300));
+    for reduce in [
+        vec![Opcode::BatchBitmapAdd as u8, 0, 0],
+        vec![Opcode::BatchBitmapRemove as u8, 0, 0],
+        vec![Opcode::BatchBitmapOr as u8, 0, 1],
+    ] {
+        let prog = bitmaps(&reduce);
+        let mut fresh = Vm::default();
+        let before = state.clone();
+        assert_eq!(
+            ErrorCode::OutOfMemory as u32,
+            without_memory(|| fresh.execute_batch(&mut state, &prog, &cols, 300)),
+            "{reduce:?}"
+        );
+        assert_eq!(before, state);
+    }
 }
 
 // ---------------------------------------------------------------------------

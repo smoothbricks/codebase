@@ -3,6 +3,7 @@
 //! this demand first, so `OutOfMemory` refuses a whole batch with nothing
 //! written and never stops one partway.
 
+use crate::bitmap_ops::BitmapPatchDemand;
 use crate::nested::NestedPlanDemand;
 use crate::ttl_plan::TtlPlanDemand;
 
@@ -14,4 +15,6 @@ pub(crate) struct ScratchDemand {
     /// The largest inner-table rehash of a nested slot; `None` when the
     /// batch makes no nested plan at all.
     pub(crate) nested: Option<NestedPlanDemand>,
+    /// The largest bitmap patch; `None` when the batch patches no bitmap.
+    pub(crate) bitmap: Option<BitmapPatchDemand>,
 }
