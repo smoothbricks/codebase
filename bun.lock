@@ -222,7 +222,7 @@
         "smoo-nx-bound-failures": "./dist/bin/smoo-nx-bound-failures.js",
       },
       "dependencies": {
-        "@nx/js": "latest",
+        "@nx/js": "23.2.1",
         "jsonc-parser": "^3.3.1",
         "nx": "latest",
         "prettier": "^3.9.8",
@@ -399,6 +399,7 @@
       "name": "@smoothbricks/tooling",
       "dependencies": {
         "@smoothbricks/cli": "workspace:*",
+        "typia": "14.0.6",
       },
     },
   },

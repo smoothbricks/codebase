@@ -1,0 +1,16 @@
+{
+  "extends": "../tsconfig.base.json",
+  "compilerOptions": {
+    "composite": false,
+    "declaration": false,
+    "declarationMap": false,
+    "emitDeclarationOnly": false,
+    "noEmit": false,
+    "module": "Preserve",
+    "moduleResolution": "bundler",
+    "rootDir": "..",
+    "outDir": "../.cache/nx-daemon-idle-proof",
+    "types": ["bun", "node"]
+  },
+  "include": ["nx-daemon-idle-proof.ts"]
+}

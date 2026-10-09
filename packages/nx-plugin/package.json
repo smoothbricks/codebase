@@ -238,7 +238,7 @@
           "command": "bun test --timeout=30000 --timings=test-timings.json --shard=1/4",
           "cwd": "{projectRoot}",
           "timeoutMs": 120000,
-          "killAfterMs": 10000.0
+          "killAfterMs": 10000
         }
       },
       "test-shard2": {
@@ -259,7 +259,7 @@
           "command": "bun test --timeout=30000 --timings=test-timings.json --shard=2/4",
           "cwd": "{projectRoot}",
           "timeoutMs": 120000,
-          "killAfterMs": 10000.0
+          "killAfterMs": 10000
         }
       },
       "test-shard3": {
@@ -280,7 +280,7 @@
           "command": "bun test --timeout=30000 --timings=test-timings.json --shard=3/4",
           "cwd": "{projectRoot}",
           "timeoutMs": 120000,
-          "killAfterMs": 10000.0
+          "killAfterMs": 10000
         }
       },
       "test-shard4": {
@@ -301,7 +301,7 @@
           "command": "bun test --timeout=30000 --timings=test-timings.json --shard=4/4",
           "cwd": "{projectRoot}",
           "timeoutMs": 120000,
-          "killAfterMs": 10000.0
+          "killAfterMs": 10000
         }
       }
     },
@@ -333,7 +333,7 @@
     "directory": "packages/nx-plugin"
   },
   "dependencies": {
-    "@nx/js": "latest",
+    "@nx/js": "23.2.1",
     "jsonc-parser": "^3.3.1",
     "nx": "latest",
     "prettier": "^3.9.8",
