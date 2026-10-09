@@ -177,7 +177,7 @@ struct LiveEntry {
 }
 
 /// A `start..end` byte range, `Copy` so an entry stays a plain record.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Range {
     start: usize,
     end: usize,
@@ -202,11 +202,32 @@ impl RowColumns {
         }
     }
 
+    /// The live columns of a batch that resumes after this bind: the
+    /// deferred entries evaluate again, at their rows, against the state as
+    /// it stands when the resumed run reaches them. Refused unless these are
+    /// the cells of a completed bind of `program`'s table over `batch_len`
+    /// rows (see [`Self::bound_for`]).
+    pub(crate) fn resume<'a, 'e>(
+        &'a self,
+        program: &'a [u8],
+        batch_len: u32,
+        eval: &'e mut dyn RowExpression,
+    ) -> Result<LiveColumns<'a, 'e>, ErrorCode> {
+        self.bound_for(program, batch_len)?;
+        Ok(LiveColumns {
+            rows: self,
+            program,
+            eval,
+        })
+    }
+
     /// Whether these are the cells of a completed bind of `program`'s table
-    /// over a batch of `batch_len` rows: the same type column and the same
-    /// entry targets in table order. A batch with no rows binds nothing, and
-    /// a program without a table needs no bind.
-    pub(crate) fn bound_for(&self, program: &[u8], batch_len: u32) -> Result<(), ErrorCode> {
+    /// over a batch of `batch_len` rows: the same type column, the same entry
+    /// targets in table order, and every deferred entry at the program range
+    /// this table holds it, so a live read indexes `program` exactly. A
+    /// batch with no rows binds nothing, and a program without a table needs
+    /// no bind.
+    fn bound_for(&self, program: &[u8], batch_len: u32) -> Result<(), ErrorCode> {
         let table = match row_table(program)? {
             None if self.targets.is_empty() => return Ok(()),
             Some(_) if batch_len == 0 && self.bound && self.targets.is_empty() => return Ok(()),
@@ -221,11 +242,26 @@ impl RowColumns {
         if header.index() != Some(self.type_col) {
             return Err(ErrorCode::InvalidProgram);
         }
+        let table_start = program.len() - table.len();
         let mut pos = header.pos();
+        let mut live = 0usize;
         for &target in &self.targets {
-            if parse_entry(table, &mut pos)?.target_col != target {
+            let entry = parse_entry(table, &mut pos)?;
+            if entry.target_col != target {
                 return Err(ErrorCode::InvalidProgram);
             }
+            if let Some(index) = self.live_entry(target) {
+                let deferred = self.live[index];
+                if deferred.match_ids != entry.match_ids_at.shifted(table_start)
+                    || deferred.expr != entry.expr_at.shifted(table_start)
+                {
+                    return Err(ErrorCode::InvalidProgram);
+                }
+                live += 1;
+            }
+        }
+        if live != self.live.len() {
+            return Err(ErrorCode::InvalidProgram);
         }
         Ok(())
     }

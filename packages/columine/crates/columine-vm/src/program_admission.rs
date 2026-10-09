@@ -272,20 +272,26 @@ impl<A: VoProgramAdmission> AdmittedProgram<A> {
     /// Re-admit a batch that resumes after its bind: splice the derived
     /// cells `rows` retained from this program's last bind over this batch
     /// into `cols`, admit the selected VO frames over that spliced set, then
-    /// run `execute` on it. A resume must see the cells the paused run saw,
-    /// not a fresh bind over the state as it stands now. `rows` from another
-    /// table or another batch length is refused as `Rows(InvalidProgram)`,
-    /// before admission or execution.
-    pub fn execute_spliced<'a>(
+    /// run `execute` on it with the batch's live columns. A resume sees the
+    /// bound cells the paused run saw, never a fresh bind over the state as
+    /// it stands now; a deferred live entry evaluates at its row, as it does
+    /// in any run, against the state the resumed rows before it left. `rows`
+    /// from another table or another batch length is refused as
+    /// `Rows(InvalidProgram)`, before admission or execution.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_spliced<'a, E: RowExpression>(
         &'a self,
+        state: &mut [u8],
         cols: &mut [&'a [u8]],
         batch_len: u32,
         scratch: &mut ProgramScratch,
+        eval: &mut E,
         rows: &'a RowColumns,
-        execute: impl FnOnce(&[u8], &[&[u8]]) -> u32,
+        execute: impl FnOnce(&[u8], &mut [u8], &[&[u8]], &mut LiveColumns<'_, '_>) -> u32,
     ) -> Result<u32, InputAdmissionError> {
-        rows.bound_for(&self.bytecode, batch_len)
-            .and_then(|()| rows.splice(cols))
+        let mut live = rows
+            .resume(&self.bytecode, batch_len, eval)
+            .and_then(|live| rows.splice(cols).map(|()| live))
             .map_err(InputAdmissionError::Rows)?;
         self.inputs.admit_and_execute(
             &self.metadata,
@@ -293,7 +299,7 @@ impl<A: VoProgramAdmission> AdmittedProgram<A> {
             cols,
             batch_len,
             scratch,
-            |cols| execute(&self.bytecode, cols),
+            |cols| execute(&self.bytecode, state, cols, &mut live),
         )
     }
 
@@ -493,37 +499,44 @@ mod tests {
 
     use super::{AdmittedProgram, InputAdmissionError, ProgramScratch};
     use crate::program_inputs::InputPlan;
-    use crate::row_exprs::{BatchView, Binding, ROW_EXPRESSIONS_MAGIC, RowColumns, RowExpression};
+    use crate::row_exprs::{
+        BatchView, Binding, LiveColumns, ROW_EXPRESSIONS_MAGIC, RowColumns, RowExpression,
+    };
 
     /// The derived column the FOR_EACH reads its type from.
     const DERIVED: u8 = 4;
+    /// A live derived column no instruction reads plainly.
+    const LIVE: u8 = 5;
     /// The event type whose rows the table derives `FOR_EACH_TYPE` for.
     const EVENT: u32 = 1;
     /// The type the FOR_EACH selects; only the derived column carries it.
     const FOR_EACH_TYPE: u8 = 7;
 
-    /// One-byte expression `[k]`: the constant `k` for every matched row.
+    /// `[k]`: the constant `k` for every matched row, bound up front.
+    /// `[k, 0]`: `k` plus the state's first byte, a live read evaluated at
+    /// the row against the state as it then stands.
     struct Constant;
 
     impl RowExpression for Constant {
         fn admit(&mut self, expr: &[u8], _: &BatchView<'_>) -> Result<Binding, ErrorCode> {
             match expr {
                 [_] => Ok(Binding::Bound),
+                [_, 0] => Ok(Binding::Live),
                 _ => Err(ErrorCode::InvalidProgram),
             }
         }
 
-        fn eval(&mut self, expr: &[u8], _: &BatchView<'_>, _: u32) -> Result<u32, ErrorCode> {
-            Ok(u32::from(expr[0]))
+        fn eval(&mut self, expr: &[u8], batch: &BatchView<'_>, _: u32) -> Result<u32, ErrorCode> {
+            let state = batch.state.first().copied().unwrap_or(0);
+            Ok(u32::from(expr[0]) + if expr.len() == 2 { u32::from(state) } else { 0 })
         }
     }
 
     /// A StructMap slot with one VO field, read under a FOR_EACH whose type
     /// column is derived by the program's row table from column 0:
-    /// `FOR_EACH(col 4 == 7) { upsert(key col 3, VO pair cols 1/2) }`, and
-    /// the table writes 7 into column 4 for rows of type 1. `expr` is the
-    /// table entry's expression.
-    fn derived_scope_program(expr: &[u8]) -> (Box<[u8]>, Vec<u8>, Vec<u8>) {
+    /// `FOR_EACH(col 4 == 7) { upsert(key col 3, VO pair cols 1/2) }`. Each
+    /// table entry is `(target, event type, expression)`.
+    fn derived_scope_program(entries: &[(u8, u32, &[u8])]) -> (Box<[u8]>, Vec<u8>, Vec<u8>) {
         let init = vec![0x18, 0, 6, 4, 0, 1, 10, 0];
         let body = [0x80, 0, 3, 0, 1, 1, 2, 0];
         let mut reduce = vec![0xe0, DERIVED, 1];
@@ -532,16 +545,19 @@ mod tests {
         reduce.extend(body);
         reduce.push(0);
         let mut table = ROW_EXPRESSIONS_MAGIC.to_le_bytes().to_vec();
-        table.extend(1u16.to_le_bytes());
-        table.extend([0, DERIVED, 1]);
-        table.extend(EVENT.to_le_bytes());
-        table.extend(u16::try_from(expr.len()).unwrap().to_le_bytes());
-        table.extend(expr);
+        table.extend(u16::try_from(entries.len()).unwrap().to_le_bytes());
+        table.push(0);
+        for &(target, event, expr) in entries {
+            table.extend([target, 1]);
+            table.extend(event.to_le_bytes());
+            table.extend(u16::try_from(expr.len()).unwrap().to_le_bytes());
+            table.extend(expr);
+        }
         let mut bytes = vec![0u8; 32];
         bytes.extend(PROGRAM_MAGIC.to_le_bytes());
         bytes.extend([2, 0, 0, 0]);
         bytes.extend(1u32.to_le_bytes());
-        bytes.extend(5u32.to_le_bytes());
+        bytes.extend(6u32.to_le_bytes());
         bytes.extend(u32::try_from(init.len()).unwrap().to_le_bytes());
         bytes.extend(u32::try_from(reduce.len()).unwrap().to_le_bytes());
         bytes.extend(&init);
@@ -553,8 +569,8 @@ mod tests {
     /// The program admitted with a capability that refuses every frame it is
     /// shown, so a refusal names exactly the frames admission selected. Built
     /// directly: `load` would refuse the capability at preparation.
-    fn admitted(expr: &[u8]) -> AdmittedProgram<UnavailableVoAdmission> {
-        let (bytecode, init, reduce) = derived_scope_program(expr);
+    fn admitted_with(entries: &[(u8, u32, &[u8])]) -> AdmittedProgram<UnavailableVoAdmission> {
+        let (bytecode, init, reduce) = derived_scope_program(entries);
         let metadata = VoProgramMetadata {
             fields: vec![VoFieldLink {
                 slot: 0,
@@ -581,6 +597,22 @@ mod tests {
         }
     }
 
+    /// The program whose table derives only the FOR_EACH type, from `expr`.
+    fn admitted(expr: &[u8]) -> AdmittedProgram<UnavailableVoAdmission> {
+        admitted_with(&[(DERIVED, EVENT, expr)])
+    }
+
+    /// The same program with a live entry on `LIVE` for rows of the type the
+    /// FOR_EACH does not select; `first` is the first entry's expression.
+    fn admitted_live(first: &[u8]) -> AdmittedProgram<UnavailableVoAdmission> {
+        admitted_with(&[(DERIVED, EVENT, first), (LIVE, EVENT + 1, &[3, 0])])
+    }
+
+    /// Refused before admission: runs nothing.
+    fn never(_: &[u8], _: &mut [u8], _: &[&[u8]], _: &mut LiveColumns<'_, '_>) -> u32 {
+        unreachable!("refused before admission")
+    }
+
     fn cells(values: &[u32]) -> Vec<u8> {
         values
             .iter()
@@ -601,7 +633,7 @@ mod tests {
         let mut rows = RowColumns::new();
 
         let types = cells(&[EVENT]);
-        let mut cols: [&[u8]; 5] = [&types, &offsets, b"ab", &key, &[]];
+        let mut cols: [&[u8]; 6] = [&types, &offsets, b"ab", &key, &[], &[]];
         let mut ran = false;
         let result = program.execute_bound(
             &mut [],
@@ -629,7 +661,7 @@ mod tests {
 
         let types = cells(&[EVENT + 1]);
         let mut rows = RowColumns::new();
-        let mut cols: [&[u8]; 5] = [&types, &offsets, b"ab", &key, &[]];
+        let mut cols: [&[u8]; 6] = [&types, &offsets, b"ab", &key, &[], &[]];
         let result = program.execute_bound(
             &mut [],
             &mut cols,
@@ -655,7 +687,7 @@ mod tests {
         let types = cells(&[EVENT]);
         let offsets = cells(&[0, 2]);
         let key = cells(&[5]);
-        let cols: [&[u8]; 5] = [&types, &offsets, b"ab", &key, &[]];
+        let cols: [&[u8]; 6] = [&types, &offsets, b"ab", &key, &[], &[]];
         let mut scratch = ProgramScratch::default();
         assert_eq!(
             program.execute_with(&cols, 1, &mut scratch, |_, _| unreachable!("never run")),
@@ -663,7 +695,7 @@ mod tests {
         );
 
         let refused = admitted(&[]);
-        let mut cols: [&[u8]; 5] = [&types, &offsets, b"ab", &key, &[]];
+        let mut cols: [&[u8]; 6] = [&types, &offsets, b"ab", &key, &[], &[]];
         let mut rows = RowColumns::new();
         assert_eq!(
             refused.execute_bound(
@@ -698,7 +730,7 @@ mod tests {
 
         let types = cells(&[EVENT]);
         let mut rows = RowColumns::new();
-        let mut cols: [&[u8]; 5] = [&types, &offsets, b"ab", &key, &[]];
+        let mut cols: [&[u8]; 6] = [&types, &offsets, b"ab", &key, &[], &[]];
         let bound = program.execute_bound(
             &mut [],
             &mut cols,
@@ -709,18 +741,24 @@ mod tests {
             |_, _, _, _| unreachable!("refused at admission"),
         );
         assert_eq!(bound, frame_refusal);
-        let mut resumed: [&[u8]; 5] = [&types, &offsets, b"ab", &key, &[]];
+        let mut resumed: [&[u8]; 6] = [&types, &offsets, b"ab", &key, &[], &[]];
         assert_eq!(
-            program.execute_spliced(&mut resumed, 1, &mut scratch, &rows, |_, _| {
-                unreachable!("refused at admission")
-            }),
+            program.execute_spliced(
+                &mut [],
+                &mut resumed,
+                1,
+                &mut scratch,
+                &mut Constant,
+                &rows,
+                never,
+            ),
             frame_refusal,
             "the resume admits the frame its bind selected"
         );
 
         let other = cells(&[EVENT + 1]);
         let mut rows = RowColumns::new();
-        let mut cols: [&[u8]; 5] = [&other, &offsets, b"ab", &key, &[]];
+        let mut cols: [&[u8]; 6] = [&other, &offsets, b"ab", &key, &[], &[]];
         assert_eq!(
             program.execute_bound(
                 &mut [],
@@ -733,13 +771,61 @@ mod tests {
             ),
             Ok(1)
         );
-        let mut resumed: [&[u8]; 5] = [&other, &offsets, b"ab", &key, &[]];
+        let mut resumed: [&[u8]; 6] = [&other, &offsets, b"ab", &key, &[], &[]];
         assert_eq!(
-            program.execute_spliced(&mut resumed, 1, &mut scratch, &rows, |_, cols| {
-                assert_eq!(cols[usize::from(DERIVED)], cells(&[0]).as_slice());
-                2
-            }),
+            program.execute_spliced(
+                &mut [],
+                &mut resumed,
+                1,
+                &mut scratch,
+                &mut Constant,
+                &rows,
+                |_, _, cols, _| {
+                    assert_eq!(cols[usize::from(DERIVED)], cells(&[0]).as_slice());
+                    2
+                },
+            ),
             Ok(2)
+        );
+
+        // A deferred live entry evaluates again on resume, at its row and
+        // against the state the resumed run hands it, never as its zero
+        // placeholder.
+        let program = admitted_live(&[FOR_EACH_TYPE]);
+        let mut rows = RowColumns::new();
+        let mut cols: [&[u8]; 6] = [&other, &offsets, b"ab", &key, &[], &[]];
+        assert_eq!(
+            program.execute_bound(
+                &mut [2],
+                &mut cols,
+                1,
+                &mut scratch,
+                &mut Constant,
+                &mut rows,
+                |_, state, cols, live| {
+                    assert_eq!(cols[usize::from(LIVE)], cells(&[0]).as_slice());
+                    assert_eq!(live.cell(u32::from(LIVE), 0, state, cols), Some(Ok(5)));
+                    3
+                },
+            ),
+            Ok(3)
+        );
+        let mut resumed: [&[u8]; 6] = [&other, &offsets, b"ab", &key, &[], &[]];
+        assert_eq!(
+            program.execute_spliced(
+                &mut [9],
+                &mut resumed,
+                1,
+                &mut scratch,
+                &mut Constant,
+                &rows,
+                |_, state, cols, live| {
+                    assert!(!live.is_empty(), "the resume carries the deferred entry");
+                    assert_eq!(live.cell(u32::from(LIVE), 0, state, cols), Some(Ok(12)));
+                    4
+                },
+            ),
+            Ok(4)
         );
     }
 
@@ -754,18 +840,25 @@ mod tests {
         let key = cells(&[5]);
         let mut scratch = ProgramScratch::default();
         let refused = Err(InputAdmissionError::Rows(ErrorCode::InvalidProgram));
-        let never = |_: &[u8], _: &[&[u8]]| -> u32 { unreachable!("refused before admission") };
 
         let fresh = RowColumns::new();
-        let mut cols: [&[u8]; 5] = [&types, &offsets, b"ab", &key, &[]];
+        let mut cols: [&[u8]; 6] = [&types, &offsets, b"ab", &key, &[], &[]];
         assert_eq!(
-            program.execute_spliced(&mut cols, 1, &mut scratch, &fresh, never),
+            program.execute_spliced(
+                &mut [],
+                &mut cols,
+                1,
+                &mut scratch,
+                &mut Constant,
+                &fresh,
+                never
+            ),
             refused,
             "never bound"
         );
 
         let mut rows = RowColumns::new();
-        let mut cols: [&[u8]; 5] = [&types, &offsets, b"ab", &key, &[]];
+        let mut cols: [&[u8]; 6] = [&types, &offsets, b"ab", &key, &[], &[]];
         assert_eq!(
             program.execute_bound(
                 &mut [],
@@ -779,15 +872,23 @@ mod tests {
             Ok(0)
         );
         let two = cells(&[EVENT + 1, EVENT + 1]);
-        let mut cols: [&[u8]; 5] = [&two, &offsets, b"ab", &key, &[]];
+        let mut cols: [&[u8]; 6] = [&two, &offsets, b"ab", &key, &[], &[]];
         assert_eq!(
-            program.execute_spliced(&mut cols, 2, &mut scratch, &rows, never),
+            program.execute_spliced(
+                &mut [],
+                &mut cols,
+                2,
+                &mut scratch,
+                &mut Constant,
+                &rows,
+                never
+            ),
             refused,
             "bound over another batch length"
         );
 
         let failed = admitted(&[]);
-        let mut cols: [&[u8]; 5] = [&types, &offsets, b"ab", &key, &[]];
+        let mut cols: [&[u8]; 6] = [&types, &offsets, b"ab", &key, &[], &[]];
         assert_eq!(
             failed.execute_bound(
                 &mut [],
@@ -800,11 +901,52 @@ mod tests {
             ),
             Err(InputAdmissionError::Rows(ErrorCode::InvalidProgram))
         );
-        let mut cols: [&[u8]; 5] = [&types, &offsets, b"ab", &key, &[]];
+        let mut cols: [&[u8]; 6] = [&types, &offsets, b"ab", &key, &[], &[]];
         assert_eq!(
-            program.execute_spliced(&mut cols, 1, &mut scratch, &rows, never),
+            program.execute_spliced(
+                &mut [],
+                &mut cols,
+                1,
+                &mut scratch,
+                &mut Constant,
+                &rows,
+                never
+            ),
             refused,
             "left by a failed bind"
+        );
+
+        // A live entry recorded at another program range than this table
+        // holds it: a live read would index this program's bytes wrongly.
+        let live = admitted_live(&[FOR_EACH_TYPE]);
+        let mut rows = RowColumns::new();
+        let mut cols: [&[u8]; 6] = [&types, &offsets, b"ab", &key, &[], &[]];
+        assert_eq!(
+            live.execute_bound(
+                &mut [],
+                &mut cols,
+                1,
+                &mut scratch,
+                &mut Constant,
+                &mut rows,
+                |_, _, _, _| 0,
+            ),
+            Ok(0)
+        );
+        let shifted = admitted_live(&[FOR_EACH_TYPE, 0, 0]);
+        let mut cols: [&[u8]; 6] = [&types, &offsets, b"ab", &key, &[], &[]];
+        assert_eq!(
+            shifted.execute_spliced(
+                &mut [],
+                &mut cols,
+                1,
+                &mut scratch,
+                &mut Constant,
+                &rows,
+                never
+            ),
+            refused,
+            "a live entry at another range"
         );
     }
 }
