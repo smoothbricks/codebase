@@ -615,6 +615,29 @@ fn nested_initial_containers_are_admitted_against_the_spent_arena() {
             run_growing(&mut vm, &mut state, &prog, &cols, 1);
         }
     }
+
+    // A sentinel outer or inner key is no key growth could place: refused
+    // by name with nothing written, never a request to grow.
+    for (outer, inner) in [
+        (u32::MAX, 3),
+        (u32::MAX - 1, 3),
+        (2, u32::MAX),
+        (2, u32::MAX - 1),
+    ] {
+        let (keys, values) = ([outer], [inner]);
+        let cols = [
+            u32s_as_bytes(&keys),
+            u32s_as_bytes(&values),
+            u32s_as_bytes(&types),
+        ];
+        let before = state.clone();
+        assert_eq!(
+            ErrorCode::InvalidKey as u32,
+            vm.execute_batch(&mut state, &prog, &cols, 1),
+            "outer {outer:#x}, inner {inner:#x}"
+        );
+        assert_eq!(before, state);
+    }
 }
 
 // ---------------------------------------------------------------------------

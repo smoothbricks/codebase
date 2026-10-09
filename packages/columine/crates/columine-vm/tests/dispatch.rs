@@ -847,6 +847,19 @@ fn probe_scatter_apply_parity_across_kinds_and_skip() {
     // nodeTouch (slot 3): asserted then retracted → empty.
     assert_eq!(0, slot_size(&state, 3));
     assert!(!set_contains(&state, 3, 8004));
+
+    // A probed row whose output key is a sentinel names no destination row.
+    // Growing the destination cannot place it, so it is refused by name,
+    // with nothing written, rather than as a request for growth.
+    for sentinel in [EMPTY_KEY, EMPTY_KEY - 1] {
+        seed_probe_row(&mut state, 19, 0, 0, sentinel, 7001, 0.0, 0);
+        let before = state.clone();
+        assert_eq!(
+            ErrorCode::InvalidKey as u32,
+            run_scatter_one(&mut vm, &mut state, &prog, T, 19)
+        );
+        assert_eq!(before, state, "the refused row writes nothing");
+    }
 }
 
 #[test]

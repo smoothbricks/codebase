@@ -1106,9 +1106,15 @@ fn nested_refused_plan_leaves_outer_keys_flags_and_arena_unchanged() {
         Some(ErrorCode::CapacityExceeded),
     );
     assert_eq!(state, before);
+    // A sentinel key is refused by name: growth could never place it.
     assert_eq!(
         prepare_nested_map_upsert_last(&mut state, &meta, 123, TOMBSTONE, 70, &mut scratch).err(),
-        Some(ErrorCode::CapacityExceeded),
+        Some(ErrorCode::InvalidKey),
+    );
+    assert_eq!(state, before);
+    assert_eq!(
+        prepare_nested_map_upsert_last(&mut state, &meta, TOMBSTONE, 7, 70, &mut scratch).err(),
+        Some(ErrorCode::InvalidKey),
     );
     assert_eq!(state, before);
 }

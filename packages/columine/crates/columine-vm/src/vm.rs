@@ -1471,6 +1471,10 @@ fn scatter_card_one(
     cell_size: u32,
     is_retract: bool,
 ) -> ErrorCode {
+    // A sentinel output key names no row: no growth could place it.
+    if key == EMPTY_KEY || key == TOMBSTONE {
+        return ErrorCode::InvalidKey;
+    }
     let target = if is_retract {
         map.find(state, key)
             .map(|pos| crate::struct_map::Upsert { pos, is_new: false })

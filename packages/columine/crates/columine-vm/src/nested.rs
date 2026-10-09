@@ -527,8 +527,9 @@ fn prepare_outer<'state, 'work>(
         return Err(ErrorCode::InvalidProgram);
     }
     let outer = OuterTable::bind(meta);
+    // A sentinel names no key: no growth could place it.
     if outer_key >= TOMBSTONE {
-        return Err(ErrorCode::CapacityExceeded);
+        return Err(ErrorCode::InvalidKey);
     }
     let probe =
         hash_table::probe_linear(
@@ -614,7 +615,7 @@ fn prepare_table<'state, 'work>(
     scratch: &'work mut NestedScratch,
 ) -> Result<NestedMutation<'state, 'work>, ErrorCode> {
     if key >= TOMBSTONE {
-        return Err(ErrorCode::CapacityExceeded);
+        return Err(ErrorCode::InvalidKey);
     }
     let inner_type = if value.is_some() {
         SlotType::HashMap
