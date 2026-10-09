@@ -729,6 +729,49 @@ fn nested_initial_containers_are_admitted_against_the_spent_arena() {
         );
         assert_eq!(before, state);
     }
+
+    // One batch grows outer key 1's inner set past its load factor partway:
+    // the rows before the rehash insert plainly, the rehash needs a plan as
+    // large as the set. A VM whose scratch only ever planned small rehashes
+    // is refused as a whole while every allocation fails, with nothing
+    // written, rather than after its plain rows. The arena is grown first so
+    // that only memory, not capacity, can refuse the batch.
+    let keys = [1u32; 160];
+    let values: Vec<u32> = (1000..1160).collect();
+    let row_types = [TYPE; 160];
+    let cols = [
+        u32s_as_bytes(&keys),
+        u32s_as_bytes(&values),
+        u32s_as_bytes(&row_types),
+    ];
+    loop {
+        let mut trial = state.clone();
+        match Vm::default().execute_batch(&mut trial, &prog, &cols, 160) {
+            OK => break,
+            NEEDS_GROWTH => state = grow(&mut vm, &state, needs_growth_slot()),
+            other => panic!("trial batch refused with {other}"),
+        }
+    }
+    // Warm a fresh VM on a copy: 160 rows of new outer keys, so admission
+    // and plain nested plans have run at this batch size, and only tiny
+    // inner tables have rehashed.
+    let mut cold = Vm::default();
+    let warm_keys: Vec<u32> = (50_000..50_160).collect();
+    let warm_values = [0u32; 160];
+    let warm_cols = [
+        u32s_as_bytes(&warm_keys),
+        u32s_as_bytes(&warm_values),
+        u32s_as_bytes(&row_types),
+    ];
+    let mut warm_state = state.clone();
+    run_growing(&mut cold, &mut warm_state, &prog, &warm_cols, 160);
+    let before = state.clone();
+    assert_eq!(
+        ErrorCode::OutOfMemory as u32,
+        without_memory(|| cold.execute_batch(&mut state, &prog, &cols, 160))
+    );
+    assert_eq!(before, state, "a refused batch writes nothing");
+    assert_eq!(OK, cold.execute_batch(&mut state, &prog, &cols, 160));
 }
 
 // ---------------------------------------------------------------------------

@@ -680,6 +680,10 @@ impl CapacityScratch {
         if nested_type.is_some() {
             match nested {
                 Some(nested) => {
+                    self.scratch
+                        .nested
+                        .get_or_insert_default()
+                        .widen(nested.rehash);
                     d.units = nested.outer_keys;
                     d.bytes = nested.arena_bytes;
                     d.nested = Some(nested.fits);

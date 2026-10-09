@@ -1039,17 +1039,23 @@ impl Vm {
 
     /// Reserve the working memory `demand` names before any write.
     fn reserve_scratch(&mut self, demand: &ScratchDemand) -> Result<(), ErrorCode> {
-        self.undo.ttl_batch_scratch.reserve_for(demand.ttl)
+        self.undo.ttl_batch_scratch.reserve_for(demand.ttl)?;
+        match demand.nested {
+            Some(nested) => self.nested_scratch.reserve_for(nested),
+            None => Ok(()),
+        }
     }
 
     /// From here until [`Self::unseal_scratch`] no scratch may grow: debug
     /// builds assert every plan fits what the batch reserved.
     fn seal_scratch(&mut self) {
         self.undo.ttl_batch_scratch.seal();
+        self.nested_scratch.seal();
     }
 
     fn unseal_scratch(&mut self) {
         self.undo.ttl_batch_scratch.unseal();
+        self.nested_scratch.unseal();
     }
 
     /// The working memory `rows` operations of one call on `meta`'s slot
@@ -1057,6 +1063,7 @@ impl Vm {
     fn call_demand(state: &[u8], meta: &SlotMetaView, rows: usize) -> ScratchDemand {
         ScratchDemand {
             ttl: crate::ttl_plan::plan_demand(state, meta, u64::try_from(rows).unwrap_or(u64::MAX)),
+            nested: None,
         }
     }
 

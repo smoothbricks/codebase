@@ -229,8 +229,9 @@ impl OuterTable {
 // =============================================================================
 /// Retained work space for nested mutations, shared by every call on one VM.
 /// Each buffer keeps the high-water mark of the plans it has admitted: a plan
-/// reserves the capacity its own path can push before it writes, and a warm
-/// plan that fits that mark allocates nothing.
+/// reserves the capacity its own path can push before it writes, unless the
+/// batch already backed its largest plan with `reserve_for`. A warm plan that
+/// fits that mark allocates nothing.
 #[derive(Debug, Default)]
 pub struct NestedScratch {
     /// Disjoint byte ranges the current plan may overwrite.
@@ -239,11 +240,34 @@ pub struct NestedScratch {
     placements: Vec<Placement>,
     /// Occupancy of the grown inner table's cells while destinations are placed.
     occupied: Vec<bool>,
+    /// Debug only: buffer capacities when a batch's reservation was sealed.
+    /// No plan of the batch may grow past them until `unseal`.
+    #[cfg(debug_assertions)]
+    sealed: Option<[usize; 3]>,
 }
 
 /// Most ranges a plan that does not rehash can push: an outer insert pushes its
 /// key, size, inner header, entry, arena usage, outer pointer and change flag.
 const PLAIN_PLAN_RANGES: usize = 7;
+
+/// The largest inner-table rehash one batch or call can plan: from
+/// `old_cap` cells into `grown_cap` cells. Zero when no rehash is possible.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct NestedPlanDemand {
+    /// Cells in the inner table before the rehash.
+    pub(crate) old_cap: u32,
+    /// Cells in the inner table after the rehash.
+    pub(crate) grown_cap: u32,
+}
+
+impl NestedPlanDemand {
+    /// Raise each field to the larger of the two demands, so one value bounds
+    /// every rehash folded into it.
+    pub(crate) fn widen(&mut self, other: Self) {
+        self.old_cap = self.old_cap.max(other.old_cap);
+        self.grown_cap = self.grown_cap.max(other.grown_cap);
+    }
+}
 
 impl NestedScratch {
     /// Bytes held by the retained buffers, which is the admitted high-water mark.
@@ -257,7 +281,9 @@ impl NestedScratch {
     /// plan without rehash can push. A refusal here precedes every write.
     fn begin_plan(&mut self) -> Result<(), ErrorCode> {
         self.ranges.clear();
-        self.admit_ranges(PLAIN_PLAN_RANGES)
+        self.admit_ranges(PLAIN_PLAN_RANGES)?;
+        self.check_sealed();
+        Ok(())
     }
 
     /// Admit a rehash from `old_cap` cells into `grown_cap` cells. The whole
@@ -267,7 +293,9 @@ impl NestedScratch {
     fn admit_rehash(&mut self, old_cap: u32, grown_cap: u32) -> Result<(), ErrorCode> {
         self.admit_ranges(old_cap as usize + 8)?;
         reserve_cleared(&mut self.placements, old_cap as usize + 1)?;
-        reserve_cleared(&mut self.occupied, grown_cap as usize)
+        reserve_cleared(&mut self.occupied, grown_cap as usize)?;
+        self.check_sealed();
+        Ok(())
     }
 
     /// Reserve the ranges buffer to hold `total` entries, counting pushes this
@@ -276,6 +304,66 @@ impl NestedScratch {
         self.ranges
             .try_reserve_exact(total.saturating_sub(self.ranges.len()))
             .map_err(|_| ErrorCode::OutOfMemory)
+    }
+
+    /// Back the largest plan a batch can make before the batch's first write:
+    /// a plan without a rehash, or the largest rehash `demand` names. Buffers
+    /// are cleared first. A failure keeps the capacity already obtained, so a
+    /// later reservation starts from it.
+    pub(crate) fn reserve_for(&mut self, demand: NestedPlanDemand) -> Result<(), ErrorCode> {
+        let old = usize::try_from(demand.old_cap).map_err(|_| ErrorCode::OutOfMemory)?;
+        let grown = usize::try_from(demand.grown_cap).map_err(|_| ErrorCode::OutOfMemory)?;
+        let rehash_ranges = old.checked_add(8).ok_or(ErrorCode::OutOfMemory)?;
+        reserve_cleared(&mut self.ranges, PLAIN_PLAN_RANGES.max(rehash_ranges))?;
+        if old > 0 {
+            let destinations = old.checked_add(1).ok_or(ErrorCode::OutOfMemory)?;
+            reserve_cleared(&mut self.placements, destinations)?;
+        }
+        reserve_cleared(&mut self.occupied, grown)
+    }
+
+    /// From here until [`Self::unseal`], no plan of the batch may grow these
+    /// buffers. Debug builds record the capacities now and check them again
+    /// when each plan starts and each rehash is admitted.
+    pub(crate) fn seal(&mut self) {
+        #[cfg(debug_assertions)]
+        {
+            self.sealed = Some(self.capacities());
+        }
+    }
+
+    /// End the batch that [`Self::seal`] sealed; plans may grow buffers again.
+    pub(crate) fn unseal(&mut self) {
+        #[cfg(debug_assertions)]
+        {
+            self.sealed = None;
+        }
+    }
+
+    /// Debug only: the capacities of `ranges`, `placements` and `occupied`.
+    #[cfg(debug_assertions)]
+    fn capacities(&self) -> [usize; 3] {
+        [
+            self.ranges.capacity(),
+            self.placements.capacity(),
+            self.occupied.capacity(),
+        ]
+    }
+
+    /// Debug only: a sealed batch's buffers must still hold the capacities
+    /// `seal` recorded. Growth here is an allocation the batch's reservation
+    /// did not cover.
+    fn check_sealed(&self) {
+        #[cfg(debug_assertions)]
+        {
+            if let Some(sealed) = self.sealed {
+                debug_assert_eq!(
+                    self.capacities(),
+                    sealed,
+                    "a nested plan grew past its batch's reservation"
+                );
+            }
+        }
     }
 }
 
@@ -874,8 +962,9 @@ pub fn nested_agg_update(
 // =============================================================================
 // Nested-container read operations
 
-/// What a batch of nested mutations on one slot needs: new outer keys and
-/// arena bytes. The arena is a bump allocator that never reclaims, and
+/// What a batch of nested mutations on one slot needs: new outer keys, arena
+/// bytes, and the largest inner rehash, which sizes the plan scratch. The
+/// arena is a bump allocator that never reclaims, and
 /// [`prepare_outer`]/[`prepare_table`] are its only writers in a batch, so
 /// the demand is exact up to the order of inner keys, which does not change
 /// it: a container rehashes to twice its capacity before an insert finds
@@ -886,6 +975,8 @@ pub(crate) struct NestedDemand {
     pub(crate) outer_keys: u64,
     pub(crate) arena_bytes: u64,
     pub(crate) fits: bool,
+    /// The largest inner rehash the batch makes; zero when none does.
+    pub(crate) rehash: NestedPlanDemand,
 }
 
 /// Demand of the `(outer, inner)` key pairs one batch sends to `meta`'s slot,
@@ -950,7 +1041,12 @@ pub(crate) fn batch_demand(
                     continue;
                 }
                 if size >= hash_table::max_load_for_cap(cap) {
+                    let old = cap;
                     cap = cap.checked_mul(2)?;
+                    demand.rehash.widen(NestedPlanDemand {
+                        old_cap: old,
+                        grown_cap: cap,
+                    });
                     bytes += align(
                         u64::from(cap) * u64::from(4 + entry_size)
                             + u64::from(hash_table::HDR_BYTES),
