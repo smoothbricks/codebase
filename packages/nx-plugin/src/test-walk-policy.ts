@@ -34,6 +34,8 @@ export interface Step {
   readonly exact: string;
   readonly shape: string;
   readonly skeleton: string;
+  /** `exact` with every declared name collapsed: equal flows do the same thing with the same values. */
+  readonly flow: string;
   /** A pure assertion: it only reads what earlier steps built, so it walks no path of its own. */
   readonly assertion: boolean;
 }
@@ -43,14 +45,19 @@ export interface TestCase {
   readonly name: string;
   readonly start: number;
   readonly end: number;
+  /**
+   * What decides the case's outcome besides its body: an expected-failure or ignore modifier, and in TypeScript the
+   * `before*`/`after*` hooks of its enclosing `describe` chain. Only cases with equal identities are compared.
+   */
+  readonly identity: string;
   readonly steps: readonly Step[];
 }
 
 /**
  * `same-path`: the cases share their leading statements exactly, and one of them only asserts beyond them, so it
  * walks a prefix of the other's path. `literal-twin`: the bodies have the same shape and differ only in literals.
- * `same-scenario`: the cases share their setup and their action and outcome in skeleton, and the shorter one differs
- * in at most one injected statement between them.
+ * `same-scenario`: one case is the other's setup (in skeleton) and its action and outcome (exactly, up to declared
+ * names) around one injected statement of its own.
  */
 export type Duplication = 'same-path' | 'literal-twin' | 'same-scenario';
 
@@ -81,6 +88,7 @@ function step(tokens: readonly Token[], assertion: boolean): Step {
     exact: tokens.map((token) => token.text).join(' '),
     shape: tokens.map((token) => (token.literal ? '$L' : token.text)).join(' '),
     skeleton: tokens.map((token) => (token.literal ? '$L' : token.local ? '$' : token.text)).join(' '),
+    flow: tokens.map((token) => (token.local ? '$' : token.text)).join(' '),
     assertion,
   };
 }
@@ -183,12 +191,57 @@ function tsTokens(node: ts.Node, source: ts.SourceFile, locals: ReadonlyMap<stri
   return tokens;
 }
 
+const HOOK_CALLEE = /^(?:before|after)(?:Each|All)$/u;
+
+/** The `before*`/`after*` hook calls of every `describe` around `node`, outermost first, as source text. */
+function hookChain(node: ts.Node, source: ts.SourceFile): string[] {
+  const hooks: string[] = [];
+  for (let scope = node.parent; scope !== undefined; scope = scope.parent) {
+    if (!(ts.isArrowFunction(scope) || ts.isFunctionExpression(scope)) || !ts.isBlock(scope.body)) continue;
+    const call = scope.parent;
+    if (!ts.isCallExpression(call) || !/^describe(?:[.(]|$)/u.test(call.expression.getText(source))) continue;
+    const own = scope.body.statements
+      .filter(
+        (statement) =>
+          ts.isExpressionStatement(statement) &&
+          ts.isCallExpression(statement.expression) &&
+          ts.isIdentifier(statement.expression.expression) &&
+          HOOK_CALLEE.test(statement.expression.expression.text),
+      )
+      .map((statement) => statement.getText(source).replace(/\s+/gu, ' '));
+    hooks.unshift(...own);
+  }
+  return hooks;
+}
+
+/**
+ * The statements a case walks. A body that is one call whose last argument is a function, such as
+ * `await withHarness(async (h) => { … })`, walks that function's statements.
+ */
+function caseStatements(body: ts.ConciseBody): readonly ts.Node[] {
+  let statements: readonly ts.Node[] = ts.isBlock(body) ? body.statements : [body];
+  for (;;) {
+    const only = statements.length === 1 ? statements[0] : undefined;
+    let expression = only !== undefined && ts.isExpressionStatement(only) ? only.expression : only;
+    while (expression !== undefined && ts.isAwaitExpression(expression)) expression = expression.expression;
+    const inner = expression !== undefined && ts.isCallExpression(expression) ? expression.arguments.at(-1) : undefined;
+    if (
+      inner === undefined ||
+      !(ts.isArrowFunction(inner) || ts.isFunctionExpression(inner)) ||
+      !ts.isBlock(inner.body)
+    )
+      return statements;
+    statements = inner.body.statements;
+  }
+}
+
 export function typeScriptCases(file: string, text: string): TestCase[] {
   const source = ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true);
   const cases: TestCase[] = [];
   const line = (offset: number): number => source.getLineAndCharacterOfPosition(offset).line + 1;
   const visit = (node: ts.Node): void => {
-    if (ts.isCallExpression(node) && CASE_CALLEE.test(node.expression.getText(source))) {
+    const callee = ts.isCallExpression(node) ? node.expression.getText(source) : '';
+    if (ts.isCallExpression(node) && CASE_CALLEE.test(callee)) {
       const body = node.arguments.find(
         (argument): argument is ts.ArrowFunction | ts.FunctionExpression =>
           ts.isArrowFunction(argument) || ts.isFunctionExpression(argument),
@@ -196,13 +249,13 @@ export function typeScriptCases(file: string, text: string): TestCase[] {
       const title = node.arguments[0];
       if (body !== undefined && title !== undefined) {
         const locals = declaredNames(body);
-        const statements: readonly ts.Node[] = ts.isBlock(body.body) ? body.body.statements : [body.body];
         cases.push({
           name: ts.isStringLiteralLike(title) ? title.text : title.getText(source),
           start: line(node.getStart(source)),
           end: line(node.end),
-          steps: statements.map((statement) =>
-            step(tsTokens(statement, source, locals), ts.isBlock(body.body) ? tsAssertion(statement) : false),
+          identity: [callee.endsWith('.failing') ? 'failing' : '', ...hookChain(node, source)].join('\n'),
+          steps: caseStatements(body.body).map((statement) =>
+            step(tsTokens(statement, source, locals), tsAssertion(statement)),
           ),
         });
         return;
@@ -226,7 +279,8 @@ const RUST_NUMBER =
   /(?:0[xob][0-9A-Fa-f_]+|[0-9][0-9_]*(?:\.[0-9][0-9_]*)?(?:[eE][+-]?[0-9_]+)?)(?:[iuf](?:8|16|32|64|128|size))?/uy;
 const RUST_RAW_STRING = /b?r(#*)"/uy;
 const RUST_CHAR = /b?'(?:\\(?:u\{[0-9A-Fa-f]+\}|x[0-9A-Fa-f]{2}|.)|[^\\'\n])'/uy;
-const RUST_PUNCT = ['::', '->', '=>', '==', '!=', '<=', '>=', '&&', '||', '..='];
+/** Longest first: `..` is one token, so a range end (`0..5`) is never read as a tuple index after `.`. */
+const RUST_PUNCT = ['..=', '::', '->', '=>', '==', '!=', '<=', '>=', '&&', '||', '..'];
 const RUST_ASSERT = /^(?:debug_)?(?:prop_)?assert(?:_eq|_ne|_matches)?$/u;
 
 /**
@@ -291,6 +345,10 @@ export function rustTokens(text: string): RustToken[] {
       const ident = at(RUST_IDENT) ?? '';
       index += ident.length;
       push(ident === 'true' || ident === 'false' ? 'literal' : 'ident', start);
+    } else if (tokens.at(-1)?.text === '.' && /[0-9]/u.test(char)) {
+      // A tuple index (`pair.0.1`) names a field; lexed as a number it would read `0.1` as one float literal.
+      while (/[0-9]/u.test(text[index] ?? '')) index += 1;
+      push('ident', start);
     } else if ((at(RUST_NUMBER) ?? '') !== '') {
       index += at(RUST_NUMBER)?.length ?? 0;
       push('literal', start);
@@ -356,9 +414,12 @@ function rustSteps(body: readonly RustToken[]): Step[] {
   for (let index = 0; index < body.length; index += 1) {
     const token = body[index];
     if (token === undefined) break;
-    // A name after `.` or `::` is a field, method or path item, never the local it may share a spelling with.
-    const member = body[index - 1]?.text === '.' || body[index - 1]?.text === '::';
-    const local = token.kind === 'ident' && !member ? locals.get(token.text) : undefined;
+    // A name after `.` or `::` is a field, method or path item, and a name before a lone `:` that opens or follows a
+    // `,` in a group is a struct-literal key: neither is the local it may share a spelling with.
+    const before = body[index - 1]?.text;
+    const member = before === '.' || before === '::';
+    const key = body[index + 1]?.text === ':' && (before === '{' || before === ',');
+    const local = token.kind === 'ident' && !member && !key ? locals.get(token.text) : undefined;
     current.push(local === undefined ? token : { text: `$${local}`, literal: false, local: true });
     if (token.kind !== 'punct') continue;
     if (OPEN[token.text]) depth += 1;
@@ -374,19 +435,66 @@ function rustSteps(body: readonly RustToken[]): Step[] {
   return steps;
 }
 
+/**
+ * The statements of an `async { … }` block that is the whole of a one-statement body, as in
+ * `runtime().block_on(async { … })`; otherwise undefined.
+ */
+function asyncBody(body: readonly RustToken[]): readonly RustToken[] | undefined {
+  const at = body.findIndex((token) => token.text === 'async');
+  if (at === -1) return undefined;
+  const open = body[at + 1]?.text === 'move' ? at + 2 : at + 1;
+  if (body[open]?.text !== '{') return undefined;
+  const close = closing(body, open);
+  // Only the call's closing parentheses, a `;` and an unwrap or `?` may follow the block.
+  return body.length - close <= 8 ? body.slice(open + 1, close) : undefined;
+}
+
+/** Attributes that change what a test's outcome means: an expected panic, or not running it. */
+const OUTCOME_ATTRIBUTE: Record<string, true> = { should_panic: true, ignore: true };
+
 export function rustCases(text: string): TestCase[] {
   const tokens = rustTokens(text);
-  const line = (offset: number): number => text.slice(0, offset).split('\n').length;
+  const newlines: number[] = [];
+  for (let offset = text.indexOf('\n'); offset !== -1; offset = text.indexOf('\n', offset + 1)) newlines.push(offset);
+  const line = (offset: number): number => {
+    let [low, high] = [0, newlines.length];
+    while (low < high) {
+      const middle = (low + high) >> 1;
+      if ((newlines[middle] ?? 0) < offset) low = middle + 1;
+      else high = middle;
+    }
+    return low + 1;
+  };
   const cases: TestCase[] = [];
+  // Outcome attributes may sit before or after `#[test]`; those before it are held until a non-attribute token.
+  let held: string[] = [];
+  let heldUntil = -1;
   for (let index = 0; index < tokens.length; index += 1) {
-    if (tokens[index]?.text !== '#' || tokens[index + 1]?.text !== '[') continue;
+    if (tokens[index]?.text !== '#' || tokens[index + 1]?.text !== '[') {
+      if (index !== heldUntil) held = [];
+      continue;
+    }
     const close = closing(tokens, index + 1);
     const attribute = tokens.slice(index + 2, close).map((token) => token.text);
     const pathEnd = attribute.findIndex((text) => text === '(' || text === '=');
-    if ((pathEnd === -1 ? attribute : attribute.slice(0, pathEnd)).at(-1) !== 'test') continue;
+    const path = (pathEnd === -1 ? attribute : attribute.slice(0, pathEnd)).at(-1) ?? '';
+    if (path !== 'test') {
+      if (index !== heldUntil) held = [];
+      if (OUTCOME_ATTRIBUTE[path]) held.push(attribute.join(' '));
+      heldUntil = close + 1;
+      index = close;
+      continue;
+    }
+    const modifiers = [...held];
+    held = [];
     let cursor = close + 1;
     while (cursor < tokens.length && tokens[cursor]?.text !== 'fn') {
-      if (tokens[cursor]?.text === '#' && tokens[cursor + 1]?.text === '[') cursor = closing(tokens, cursor + 1);
+      if (tokens[cursor]?.text === '#' && tokens[cursor + 1]?.text === '[') {
+        const end = closing(tokens, cursor + 1);
+        const attribute = tokens.slice(cursor + 2, end).map((token) => token.text);
+        if (OUTCOME_ATTRIBUTE[attribute[0] ?? '']) modifiers.push(attribute.join(' '));
+        cursor = end;
+      }
       cursor += 1;
     }
     const name = tokens[cursor + 1]?.text;
@@ -397,11 +505,15 @@ export function rustCases(text: string): TestCase[] {
     if (name === undefined || cursor >= tokens.length) break;
     const end = closing(tokens, cursor);
     const start = tokens[index]?.offset ?? 0;
+    const body = tokens.slice(cursor + 1, end);
+    const steps = rustSteps(body);
+    const inner = steps.length === 1 ? asyncBody(body) : undefined;
     cases.push({
       name,
       start: line(start),
       end: line(tokens[end]?.offset ?? start),
-      steps: rustSteps(tokens.slice(cursor + 1, end)),
+      identity: modifiers.sort().join('\n'),
+      steps: inner === undefined ? steps : rustSteps(inner),
     });
     index = end;
   }
@@ -410,25 +522,40 @@ export function rustCases(text: string): TestCase[] {
 
 // --- Comparison -------------------------------------------------------------------------------------------------
 
-/** The duplication between two cases, if either walks the other's path again or differs only in literals. */
+/**
+ * The duplication between two cases of one identity, if either walks the other's path again, differs from it only in
+ * literals, or replays its scenario with one injected step changed.
+ */
 export function duplication(
   first: TestCase,
   second: TestCase,
 ): { readonly kind: Duplication; readonly shared: number } | undefined {
+  if (first.identity !== second.identity) return undefined;
   const [a, b] = [first.steps, second.steps];
   if (a.length === b.length && a.length >= TEST_ONE_WALK.literalTwin && a.every((s, i) => s.shape === b[i]?.shape))
     return { kind: 'literal-twin', shared: a.length };
-  let shared = 0;
-  while (shared < a.length && shared < b.length && a[shared]?.exact === b[shared]?.exact) shared += 1;
-  const onlyAsserts = (steps: readonly Step[]): boolean => steps.slice(shared).every((s) => s.assertion);
-  if (shared >= TEST_ONE_WALK.samePath && (onlyAsserts(a) || onlyAsserts(b))) return { kind: 'same-path', shared };
+  const shared = exactPrefix(a, b);
+  if (shared >= TEST_ONE_WALK.samePath && (onlyAssertsAfter(a, shared) || onlyAssertsAfter(b, shared)))
+    return { kind: 'same-path', shared };
   return sameScenario(a, b);
 }
 
+function exactPrefix(a: readonly Step[], b: readonly Step[]): number {
+  let shared = 0;
+  while (shared < a.length && shared < b.length && a[shared]?.exact === b[shared]?.exact) shared += 1;
+  return shared;
+}
+
+function onlyAssertsAfter(steps: readonly Step[], shared: number): boolean {
+  return steps.slice(shared).every((s) => s.assertion);
+}
+
 /**
- * One case's skeleton is the other's head and tail around exactly one statement of its own: the same setup, a
- * different injected step, then the same action and outcome. The other case may inject more steps, and either case
- * may end with extra pure assertions; they are more checks on the same outcome.
+ * One case is the other's setup (equal in skeleton) and action and outcome (equal in flow: the same calls with the
+ * same values, up to declared names) around exactly one statement of its own: the same scenario with a different
+ * injected step. The other case may inject more steps, and either case may end with extra pure assertions; they are
+ * more checks on the same outcome. The shared tail must hold an action, so two cases that only assert alike after
+ * different actions are not one scenario.
  */
 function sameScenario(
   a: readonly Step[],
@@ -459,21 +586,30 @@ function framed(own: readonly Step[], other: readonly Step[]): number {
       while (
         tail < ownEnd - head &&
         tail < otherEnd - head &&
-        own[ownEnd - 1 - tail]?.skeleton === other[otherEnd - 1 - tail]?.skeleton
+        own[ownEnd - 1 - tail]?.flow === other[otherEnd - 1 - tail]?.flow
       )
         tail += 1;
-      if (tail >= TEST_ONE_WALK.scenarioTail && ownEnd - head - tail === 1) best = Math.max(best, head + tail);
+      const acts = own.slice(ownEnd - tail, ownEnd).some((s) => !s.assertion);
+      if (acts && tail >= TEST_ONE_WALK.scenarioTail && ownEnd - head - tail === 1) best = Math.max(best, head + tail);
     }
   }
   return best;
 }
 
-/** For each case, the earlier case in the file it most nearly repeats. */
-export function duplicateScenarios(file: string, cases: readonly TestCase[]): DuplicateScenario[] {
+/**
+ * For each case, the earlier case in the file it most nearly repeats, among the pairs `judged` admits (a diff-scoped
+ * caller admits a pair when either case changed; the choice of nearest partner is made only among those).
+ */
+export function duplicateScenarios(
+  file: string,
+  cases: readonly TestCase[],
+  judged: (first: TestCase, second: TestCase) => boolean = () => true,
+): DuplicateScenario[] {
   const found: DuplicateScenario[] = [];
   cases.forEach((second, later) => {
     let best: DuplicateScenario | undefined;
     for (const first of cases.slice(0, later)) {
+      if (!judged(first, second)) continue;
       const match = duplication(first, second);
       if (match !== undefined && (best === undefined || match.shared > best.shared))
         best = { file, first, second, ...match };
@@ -502,25 +638,31 @@ export function findDuplicateScenarios(
     const ranges = changes?.get(file);
     const touched = (test: TestCase): boolean =>
       ranges === undefined || ranges.some((range) => range.start <= test.end && range.end >= test.start);
-    for (const duplicate of duplicateScenarios(file, cases))
-      if (touched(duplicate.first) || touched(duplicate.second)) found.push(duplicate);
+    found.push(...duplicateScenarios(file, cases, (first, second) => touched(first) || touched(second)));
   }
   return found;
 }
 
 export function formatDuplicateScenario(duplicate: DuplicateScenario): string {
-  const first = `\`${duplicate.first.name}\``;
+  const { first, second, shared } = duplicate;
+  const [a, b] = [`\`${first.name}\``, `\`${second.name}\``];
+  const verbatim =
+    first.steps.length === second.steps.length && first.steps.every((s, i) => s.exact === second.steps[i]?.exact);
+  const asserter = onlyAssertsAfter(first.steps, shared) ? [a, b] : [b, a];
   const what =
     duplicate.kind === 'literal-twin'
-      ? `differs from ${first} only in literals (${duplicate.shared} statements of one shape)`
+      ? verbatim
+        ? `${b} repeats ${a} verbatim (${shared} statements)`
+        : `${b} differs from ${a} only in literals (${shared} statements of one shape)`
       : duplicate.kind === 'same-path'
-        ? `walks the path of ${first} again (${duplicate.shared} shared statements, then one of them only asserts)`
-        : `replays the scenario of ${first} with one step changed (${duplicate.shared} shared statements of setup, ` +
-          'action and outcome)';
+        ? `${asserter[0]} only asserts after the ${shared} statements it shares with ${asserter[1]}: its assertions ` +
+          `belong in ${asserter[1]} after statement ${shared}`
+        : `${b} replays the scenario of ${a} with one step changed (${shared} shared statements of setup, action ` +
+          'and outcome)';
   return (
-    `error[${TEST_ONE_WALK.id}]: test \`${duplicate.second.name}\` ${what}\n` +
-    `  --> ${duplicate.file}:${duplicate.second.start}\n` +
-    `  --> ${duplicate.file}:${duplicate.first.start}\n` +
+    `error[${TEST_ONE_WALK.id}]: ${what}\n` +
+    `  --> ${duplicate.file}:${second.start}\n` +
+    `  --> ${duplicate.file}:${first.start}\n` +
     `  = help: ${TEST_ONE_WALK.help}`
   );
 }
