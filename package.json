@@ -74,9 +74,16 @@
     "includedScripts": [],
     "targets": {
       "lint": {
+        "inputs": [
+          "...",
+          {
+            "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh bun packages/nx-plugin/src/bin/smoo-nx-test-walks.ts --base"
+          }
+        ],
         "options": {
           "commands": [
-            "biome check --files-ignore-unknown=true {projectRoot}"
+            "biome check --files-ignore-unknown=true {projectRoot}",
+            "bun packages/nx-plugin/src/bin/smoo-nx-test-walks.ts"
           ]
         }
       },
