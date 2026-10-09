@@ -572,159 +572,115 @@ fn re_adopt_source_with_malformed_fields_is_refused() {
     let valid =
         serde_json::to_value(fixture.intent(Some(fixture.build()))).expect("encode ReAdopt");
     let project = fixture.project.display().to_string();
-    let cases: [(&str, Box<dyn Fn(&mut Value)>); 21] = [
-        (
-            "image capacity as text",
-            Box::new(|v: &mut Value| {
-                v["source"]["image"]["capacityBytes"] = json!("100GiB");
-            }),
-        ),
+    type MalformedField = (&'static str, fn(&mut Value, &str));
+    let cases: [MalformedField; 21] = [
+        ("image capacity as text", |v: &mut Value, _: &str| {
+            v["source"]["image"]["capacityBytes"] = json!("100GiB");
+        }),
         (
             "build id that is not a BuildVolumeId",
-            Box::new(|v: &mut Value| {
+            |v: &mut Value, _: &str| {
                 v["source"]["build"]["id"] = json!("not-a-build-volume-id");
-            }),
+            },
         ),
         (
             "metadata from another sidecar schema",
-            Box::new(|v: &mut Value| {
+            |v: &mut Value, _: &str| {
                 v["source"]["metadata"]["version"] = json!(SIDECAR_VERSION + 1);
-            }),
+            },
         ),
         (
             "main metadata claiming the workspace role",
-            Box::new(|v: &mut Value| {
+            |v: &mut Value, _: &str| {
                 v["source"]["metadata"]["infoSnapshot"]["role"] = json!("workspace");
-            }),
+            },
         ),
         (
             "publication state outside the grammar",
-            Box::new(|v: &mut Value| {
+            |v: &mut Value, _: &str| {
                 v["source"]["metadata"]["publicationState"] = json!("published");
-            }),
+            },
         ),
-        (
-            "old seeds not a list",
-            Box::new(|v: &mut Value| {
-                v["source"]["oldSeeds"] = json!("build/seed.dmg");
-            }),
-        ),
-        (
-            "unknown field on source",
-            Box::new(|v: &mut Value| {
-                v["source"]["unexpected"] = json!(true);
-            }),
-        ),
-        (
-            "unknown field on image",
-            Box::new(|v: &mut Value| {
-                v["source"]["image"]["unexpected"] = json!(true);
-            }),
-        ),
-        (
-            "unknown field on build",
-            Box::new(|v: &mut Value| {
-                v["source"]["build"]["unexpected"] = json!(true);
-            }),
-        ),
-        (
-            "unknown field on git evidence",
-            Box::new(|v: &mut Value| {
-                v["source"]["gitBefore"]["unexpected"] = json!(true);
-            }),
-        ),
-        (
-            "relative checkout",
-            Box::new(|v: &mut Value| {
-                v["source"]["checkout"] = json!("checkout");
-            }),
-        ),
-        (
-            "relative main image",
-            Box::new(|v: &mut Value| {
-                v["source"]["image"]["original"] = json!("main.dmg");
-            }),
-        ),
+        ("old seeds not a list", |v: &mut Value, _: &str| {
+            v["source"]["oldSeeds"] = json!("build/seed.dmg");
+        }),
+        ("unknown field on source", |v: &mut Value, _: &str| {
+            v["source"]["unexpected"] = json!(true);
+        }),
+        ("unknown field on image", |v: &mut Value, _: &str| {
+            v["source"]["image"]["unexpected"] = json!(true);
+        }),
+        ("unknown field on build", |v: &mut Value, _: &str| {
+            v["source"]["build"]["unexpected"] = json!(true);
+        }),
+        ("unknown field on git evidence", |v: &mut Value, _: &str| {
+            v["source"]["gitBefore"]["unexpected"] = json!(true);
+        }),
+        ("relative checkout", |v: &mut Value, _: &str| {
+            v["source"]["checkout"] = json!("checkout");
+        }),
+        ("relative main image", |v: &mut Value, _: &str| {
+            v["source"]["image"]["original"] = json!("main.dmg");
+        }),
         (
             "main image not named main",
-            Box::new({
-                let project = project.clone();
-                move |v: &mut Value| {
-                    v["source"]["image"]["original"] = json!(format!("{project}/other.dmg"))
-                }
-            }),
+            |v: &mut Value, project: &str| {
+                v["source"]["image"]["original"] = json!(format!("{project}/other.dmg"))
+            },
         ),
         (
             "retained main outside the retained namespace",
-            Box::new({
-                let project = project.clone();
-                move |v: &mut Value| {
-                    v["source"]["image"]["retained"] =
-                        json!(format!("{project}/main-{OLD_INCARNATION}.dmg"));
-                }
-            }),
+            |v: &mut Value, project: &str| {
+                v["source"]["image"]["retained"] =
+                    json!(format!("{project}/main-{OLD_INCARNATION}.dmg"));
+            },
         ),
         (
             "retained main naming another incarnation",
-            Box::new({
-                let project = project.clone();
-                move |v: &mut Value| {
-                    v["source"]["image"]["retained"] =
-                        json!(format!("{project}/retained/main-{NEW_INCARNATION}.dmg"));
-                }
-            }),
+            |v: &mut Value, project: &str| {
+                v["source"]["image"]["retained"] =
+                    json!(format!("{project}/retained/main-{NEW_INCARNATION}.dmg"));
+            },
         ),
         (
             "source mount outside the staging namespace",
-            Box::new({
-                let project = project.clone();
-                move |v: &mut Value| {
-                    v["source"]["image"]["sourceMount"] =
-                        json!(format!("{project}/readopt-{OLD_INCARNATION}-main"));
-                }
-            }),
+            |v: &mut Value, project: &str| {
+                v["source"]["image"]["sourceMount"] =
+                    json!(format!("{project}/readopt-{OLD_INCARNATION}-main"));
+            },
         ),
         (
             "build image of another id",
-            Box::new({
-                let project = project.clone();
-                move |v: &mut Value| {
-                    v["source"]["build"]["image"]["original"] =
-                        json!(format!("{project}/build/{}.dmg", SEED_IDS[0]));
-                }
-            }),
+            |v: &mut Value, project: &str| {
+                v["source"]["build"]["image"]["original"] =
+                    json!(format!("{project}/build/{}.dmg", SEED_IDS[0]));
+            },
         ),
         (
             "old seed outside the project's build images",
-            Box::new(|v: &mut Value| {
+            |v: &mut Value, _: &str| {
                 v["source"]["oldSeeds"][0]["original"] = json!(format!("/tmp/{}.dmg", SEED_IDS[0]));
-            }),
+            },
         ),
-        (
-            "zero main capacity",
-            Box::new(|v: &mut Value| {
-                v["source"]["image"]["capacityBytes"] = json!(0);
-            }),
-        ),
+        ("zero main capacity", |v: &mut Value, _: &str| {
+            v["source"]["image"]["capacityBytes"] = json!(0);
+        }),
         (
             "replacement reusing the replaced incarnation",
-            Box::new(|v: &mut Value| {
+            |v: &mut Value, _: &str| {
                 v["source"]["replacement"] = json!(OLD_INCARNATION);
-            }),
+            },
         ),
         (
             "legacy main retained as if it were RAW",
-            Box::new({
-                let project = project.clone();
-                move |v: &mut Value| {
-                    v["source"]["image"]["original"] = json!(format!("{project}/main.asif"));
-                }
-            }),
+            |v: &mut Value, project: &str| {
+                v["source"]["image"]["original"] = json!(format!("{project}/main.asif"));
+            },
         ),
     ];
     for (label, mutate) in cases {
         let mut damaged = valid.clone();
-        mutate(&mut damaged);
+        mutate(&mut damaged, &project);
         assert_refused(damaged, label);
     }
 }

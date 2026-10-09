@@ -50,19 +50,18 @@ where
             source.metadata.repo_id.clone(),
             source.metadata.workspace.clone(),
         );
-        if let Some(entry) = self.mounted.remove(key.clone())? {
-            if entry.attachment.image() != source.image.original.as_path() {
-                let restored = self.mounted.restore(key, entry)?;
-                if restored.is_err() {
-                    return Err(ApfsStorageError::Host(
-                        "main's mount registration changed during retained-source handoff"
-                            .to_owned(),
-                    ));
-                }
+        if let Some(entry) = self.mounted.remove(key.clone())?
+            && entry.attachment.image() != source.image.original.as_path()
+        {
+            let restored = self.mounted.restore(key, entry)?;
+            if restored.is_err() {
                 return Err(ApfsStorageError::Host(
-                    "main's cached attachment does not name the recorded source image".to_owned(),
+                    "main's mount registration changed during retained-source handoff".to_owned(),
                 ));
             }
+            return Err(ApfsStorageError::Host(
+                "main's cached attachment does not name the recorded source image".to_owned(),
+            ));
         }
         if let Some(build) = &source.build {
             self.retain_image(
