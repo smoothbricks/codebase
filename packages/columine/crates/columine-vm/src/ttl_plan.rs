@@ -60,7 +60,42 @@ pub(crate) struct TtlBatchScratch {
     /// Buffer capacities right after [`Self::reserve`]: a plan that grows
     /// any buffer past them would allocate mid-plan.
     #[cfg(debug_assertions)]
-    reserved: [usize; 11],
+    reserved: [usize; 12],
+    /// Capacities when a batch's reservation was sealed: no plan of the
+    /// batch may grow past them.
+    #[cfg(debug_assertions)]
+    sealed: Option<[usize; 12]>,
+}
+
+/// The largest TTL plan one batch or call can build.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct TtlPlanDemand {
+    pub(crate) originals: usize,
+    pub(crate) mutations: usize,
+}
+
+impl TtlPlanDemand {
+    pub(crate) fn widen(&mut self, other: Self) {
+        self.originals = self.originals.max(other.originals);
+        self.mutations = self.mutations.max(other.mutations);
+    }
+}
+
+/// The largest plan `rows` operations on `meta`'s slot can ask for. Each row
+/// adds at most one live index entry, and the index never outgrows its
+/// capacity; one plan takes at most every row's mutation. Nothing for a slot
+/// without TTL.
+pub(crate) fn plan_demand(state: &[u8], meta: &SlotMetaView, rows: u64) -> TtlPlanDemand {
+    if !meta.has_ttl() {
+        return TtlPlanDemand::default();
+    }
+    let capacity = u64::from(meta.eviction_index_capacity(state));
+    let size = u64::from(meta.eviction_index_size(state));
+    let originals = size.saturating_add(rows).min(capacity);
+    TtlPlanDemand {
+        originals: usize::try_from(originals).unwrap_or(usize::MAX),
+        mutations: usize::try_from(rows.max(1)).unwrap_or(usize::MAX),
+    }
 }
 
 /// Clear `buf` and back `total` elements, refusing with `OutOfMemory`.
@@ -92,13 +127,42 @@ impl TtlBatchScratch {
         #[cfg(debug_assertions)]
         {
             self.reserved = self.capacities();
+            if let Some(sealed) = self.sealed {
+                debug_assert_eq!(
+                    self.reserved, sealed,
+                    "a TTL plan grew past its batch's reservation"
+                );
+            }
         }
         Ok(())
     }
 
+    /// Back the largest plan a batch can build, before the batch's first
+    /// write; each of its plans then fits the storage it finds.
+    pub(crate) fn reserve_for(&mut self, demand: TtlPlanDemand) -> Result<(), ErrorCode> {
+        back(&mut self.mutations, demand.mutations)?;
+        self.reserve(demand.originals, demand.mutations)
+    }
+
+    /// From here until [`Self::unseal`], no plan may grow this storage.
+    pub(crate) fn seal(&mut self) {
+        #[cfg(debug_assertions)]
+        {
+            self.sealed = Some(self.capacities());
+        }
+    }
+
+    pub(crate) fn unseal(&mut self) {
+        #[cfg(debug_assertions)]
+        {
+            self.sealed = None;
+        }
+    }
+
     #[cfg(debug_assertions)]
-    fn capacities(&self) -> [usize; 11] {
+    fn capacities(&self) -> [usize; 12] {
         [
+            self.mutations.capacity(),
             self.by_key.capacity(),
             self.keys.capacity(),
             self.key_of.capacity(),

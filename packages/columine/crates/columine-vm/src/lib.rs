@@ -47,6 +47,7 @@ pub mod nested;
 pub mod program_admission;
 mod program_inputs;
 pub mod row_exprs;
+mod scratch;
 pub mod slot_growth;
 pub mod state_init;
 pub mod struct_map;

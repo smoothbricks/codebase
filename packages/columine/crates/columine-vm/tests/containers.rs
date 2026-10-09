@@ -35,6 +35,12 @@ struct CountingAllocator;
 thread_local! {
     // Thread-local accounting excludes allocations made by concurrent tests.
     static ALLOCATION_COUNT: Cell<Option<usize>> = const { Cell::new(None) };
+    // While set, every allocation on this thread fails.
+    static ALLOCATION_REFUSED: Cell<bool> = const { Cell::new(false) };
+}
+
+fn allocation_refused() -> bool {
+    ALLOCATION_REFUSED.try_with(Cell::get).unwrap_or(false)
 }
 
 fn count_allocation() {
@@ -46,15 +52,22 @@ fn count_allocation() {
 }
 
 // SAFETY: every allocation/deallocation forwards the original pointer and
-// layout to System; the counter does not change the allocation contract.
+// layout to System; the counter does not change the allocation contract. A
+// refused allocation returns null, which GlobalAlloc permits for any call.
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         count_allocation();
+        if allocation_refused() {
+            return core::ptr::null_mut();
+        }
         unsafe { System.alloc(layout) }
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         count_allocation();
+        if allocation_refused() {
+            return core::ptr::null_mut();
+        }
         unsafe { System.alloc_zeroed(layout) }
     }
 
@@ -64,6 +77,9 @@ unsafe impl GlobalAlloc for CountingAllocator {
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         count_allocation();
+        if allocation_refused() {
+            return core::ptr::null_mut();
+        }
         unsafe { System.realloc(ptr, layout, new_size) }
     }
 }
@@ -77,6 +93,23 @@ impl Drop for AllocationScope {
     fn drop(&mut self) {
         ALLOCATION_COUNT.with(|count| count.set(None));
     }
+}
+
+struct RefusalScope;
+
+impl Drop for RefusalScope {
+    fn drop(&mut self) {
+        ALLOCATION_REFUSED.with(|refused| refused.set(false));
+    }
+}
+
+/// Run `run` while every allocation on this thread fails.
+fn without_memory<T>(run: impl FnOnce() -> T) -> T {
+    ALLOCATION_REFUSED.with(|refused| refused.set(true));
+    let scope = RefusalScope;
+    let result = run();
+    drop(scope);
+    result
 }
 
 fn allocations_during<T>(run: impl FnOnce() -> T) -> (T, usize) {
@@ -2207,6 +2240,29 @@ fn full_ttl_index_refuses_new_key_before_any_primary_or_metadata_write() {
             assert_eq!(state, before);
         }
     }
+
+    // Each new key's TTL plan is one entry longer than the last. A call whose
+    // later plans need more planner memory than the VM holds is refused as a
+    // whole, with nothing written and no undo window to fall back on, rather
+    // than after the keys whose plans still fit.
+    let mut state = mk_ttl_slot_state(16, 0x11);
+    let mut vm = Vm::default();
+    assert_eq!(
+        vm.set_insert(false, &mut state, 0, &[3], Some(&[10.0])),
+        ErrorCode::Ok
+    );
+    let before = state.clone();
+    let keys: Vec<u32> = (100..108).collect();
+    let times = vec![20.0f64; keys.len()];
+    assert_eq!(
+        without_memory(|| vm.set_insert(false, &mut state, 0, &keys, Some(&times))),
+        ErrorCode::OutOfMemory
+    );
+    assert_eq!(state, before, "a refused call writes nothing");
+    assert_eq!(
+        vm.set_insert(false, &mut state, 0, &keys, Some(&times)),
+        ErrorCode::Ok
+    );
 }
 
 #[test]

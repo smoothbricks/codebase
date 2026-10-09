@@ -30,6 +30,7 @@ use crate::hash_table::max_load_for_cap;
 use crate::hashmap_ops::bind_slot_map;
 use crate::hashset_ops::bind_slot_set;
 use crate::meta::SlotMetaView;
+use crate::scratch::ScratchDemand;
 use crate::state_init;
 use crate::struct_map::{ArenaRegion, StructMap2Slot, StructMapSlot};
 use bitmosaic::{BitmosaicView, patched_len_bound};
@@ -75,6 +76,9 @@ pub(crate) struct CapacityScratch {
     /// The tier-3 state copy.
     pub(crate) image: Vec<u8>,
     pub(crate) counts: CapacityCounts,
+    /// The working memory the last batch admitted by tiers 1 and 2 needs;
+    /// a dry run grows scratch itself.
+    pub(crate) scratch: ScratchDemand,
 }
 
 /// One slot's demand. `units` are new keys, members or entries; `touches`
@@ -494,6 +498,26 @@ impl CapacityScratch {
         });
         self.operands = operands;
         walked?;
+
+        // Working memory: a TTL slot's planner storage follows its rows. A
+        // TTL slot whose rows have no row-free bound is left to the dry run,
+        // which grows that storage before the batch's first write.
+        self.scratch = ScratchDemand::default();
+        for index in 0..self.touched.len() {
+            let slot = self.touched[index];
+            let d = self.demand[usize::try_from(slot).ok()?];
+            let meta = slot_meta(state, slot)?;
+            if meta.has_ttl() {
+                if d.rows || d.opaque {
+                    return Some(Admission::DryRun);
+                }
+                self.scratch.ttl.widen(crate::ttl_plan::plan_demand(
+                    state,
+                    &meta,
+                    d.units.max(d.touches),
+                ));
+            }
+        }
 
         let mut cleared = true;
         for index in 0..self.touched.len() {

@@ -24,6 +24,7 @@ use crate::hooks::{ByteCapture, CaptureFrame, EraseScratch, VmHooks};
 use crate::meta::{SlotMetaView, slot_meta_base};
 use crate::nested;
 use crate::row_exprs::LiveColumns;
+use crate::scratch::ScratchDemand;
 use crate::state_init::{self, EVICTION_ENTRY_SIZE, NEEDS_GROWTH_SLOT};
 use crate::struct_map::{
     ArenaRegion, StructMap2Slot, StructMapSlot, scalar_cell_encoded, scalar_cell_order_key,
@@ -1036,6 +1037,46 @@ impl Vm {
         Ok(result)
     }
 
+    /// Reserve the working memory `demand` names before any write.
+    fn reserve_scratch(&mut self, demand: &ScratchDemand) -> Result<(), ErrorCode> {
+        self.undo.ttl_batch_scratch.reserve_for(demand.ttl)
+    }
+
+    /// From here until [`Self::unseal_scratch`] no scratch may grow: debug
+    /// builds assert every plan fits what the batch reserved.
+    fn seal_scratch(&mut self) {
+        self.undo.ttl_batch_scratch.seal();
+    }
+
+    fn unseal_scratch(&mut self) {
+        self.undo.ttl_batch_scratch.unseal();
+    }
+
+    /// The working memory `rows` operations of one call on `meta`'s slot
+    /// can need.
+    fn call_demand(state: &[u8], meta: &SlotMetaView, rows: usize) -> ScratchDemand {
+        ScratchDemand {
+            ttl: crate::ttl_plan::plan_demand(state, meta, u64::try_from(rows).unwrap_or(u64::MAX)),
+        }
+    }
+
+    /// Run one direct call with the working memory `demand` names reserved
+    /// first: memory that cannot back the call refuses it with nothing
+    /// written.
+    fn with_scratch(
+        &mut self,
+        demand: ScratchDemand,
+        run: impl FnOnce(&mut Self) -> ErrorCode,
+    ) -> ErrorCode {
+        if let Err(error) = self.reserve_scratch(&demand) {
+            return error;
+        }
+        self.seal_scratch();
+        let result = run(self);
+        self.unseal_scratch();
+        result
+    }
+
     /// Upsert a parallel key/value batch into an authoritatively bound map.
     /// Comparison and TTL columns use the supplied comparison encoding.
     #[allow(clippy::too_many_arguments)]
@@ -1068,21 +1109,24 @@ impl Vm {
                 return ErrorCode::ColumnUnderrun;
             }
         }
-        self.change_flag_boundary(delta_mode, state, |vm, state| {
-            hashmap_ops::batch_map_upsert(
-                strategy,
-                delta_mode,
-                state,
-                &meta,
-                slot,
-                keys,
-                vals,
-                cmp_col,
-                cmp_type,
-                &mut vm.ctx(),
-            )
+        let demand = Self::call_demand(state, &meta, keys.len());
+        self.with_scratch(demand, |vm| {
+            vm.change_flag_boundary(delta_mode, state, |vm, state| {
+                hashmap_ops::batch_map_upsert(
+                    strategy,
+                    delta_mode,
+                    state,
+                    &meta,
+                    slot,
+                    keys,
+                    vals,
+                    cmp_col,
+                    cmp_type,
+                    &mut vm.ctx(),
+                )
+            })
+            .unwrap_or_else(|error| error)
         })
-        .unwrap_or_else(|error| error)
     }
 
     /// Remove keys through the same checked map and flag/capture authority.
@@ -1100,10 +1144,13 @@ impl Vm {
         if meta.slot_type() != SlotType::HashMap {
             return ErrorCode::InvalidSlot;
         }
-        self.change_flag_boundary(delta_mode, state, |vm, state| {
-            hashmap_ops::batch_map_remove(delta_mode, state, &meta, slot, keys, &mut vm.ctx())
+        let demand = Self::call_demand(state, &meta, keys.len());
+        self.with_scratch(demand, |vm| {
+            vm.change_flag_boundary(delta_mode, state, |vm, state| {
+                hashmap_ops::batch_map_remove(delta_mode, state, &meta, slot, keys, &mut vm.ctx())
+            })
+            .unwrap_or_else(|error| error)
         })
-        .unwrap_or_else(|error| error)
     }
 
     /// Set insertion routed by slot type: BITMAP slots run in `bitmap_env`,
@@ -1131,10 +1178,13 @@ impl Vm {
         {
             return ErrorCode::ColumnUnderrun;
         }
-        self.change_flag_boundary(delta_mode, state, |vm, state| {
-            vm.route_set_insert(delta_mode, state, &meta, slot_idx, elems, ts_col)
+        let demand = Self::call_demand(state, &meta, elems.len());
+        self.with_scratch(demand, |vm| {
+            vm.change_flag_boundary(delta_mode, state, |vm, state| {
+                vm.route_set_insert(delta_mode, state, &meta, slot_idx, elems, ts_col)
+            })
+            .unwrap_or_else(|error| error)
         })
-        .unwrap_or_else(|error| error)
     }
 
     /// [`Vm::set_insert`] inside its boundary.
@@ -1187,10 +1237,13 @@ impl Vm {
         if !matches!(meta.slot_type(), SlotType::HashSet | SlotType::Bitmap) {
             return ErrorCode::InvalidSlot;
         }
-        self.change_flag_boundary(delta_mode, state, |vm, state| {
-            vm.route_set_remove(delta_mode, state, &meta, slot_idx, elems)
+        let demand = Self::call_demand(state, &meta, elems.len());
+        self.with_scratch(demand, |vm| {
+            vm.change_flag_boundary(delta_mode, state, |vm, state| {
+                vm.route_set_remove(delta_mode, state, &meta, slot_idx, elems)
+            })
+            .unwrap_or_else(|error| error)
         })
-        .unwrap_or_else(|error| error)
     }
 
     /// [`Vm::set_remove`] inside its boundary.
@@ -3132,6 +3185,12 @@ impl Vm {
             let admission =
                 vm.capacity
                     .admit(state, sections.reduce_code, cols, batch_len, &vm.bitmap_env);
+            if admission == Admission::Fits {
+                let demand = vm.capacity.scratch;
+                if let Err(error) = vm.reserve_scratch(&demand) {
+                    return error as u32;
+                }
+            }
             if admission == Admission::DryRun {
                 let result = vm.dry_run(
                     state,
@@ -3148,6 +3207,9 @@ impl Vm {
                 }
                 vm.capacity.counts.dry_run_fit += 1;
             }
+            // Tiers 1 and 2 reserved the batch's working memory; a dry run
+            // grew it running the same batch. Execution grows none.
+            vm.seal_scratch();
             let result = vm.execute_ops(
                 delta_mode,
                 state,
@@ -3156,6 +3218,7 @@ impl Vm {
                 batch_len,
                 live,
             );
+            vm.unseal_scratch();
             debug_assert!(
                 result != NEEDS_GROWTH && result != ErrorCode::CapacityExceeded as u32,
                 "capacity admission cleared a batch that ran out of capacity: {result}"
