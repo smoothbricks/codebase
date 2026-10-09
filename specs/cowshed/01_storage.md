@@ -46,9 +46,9 @@ layout root:
   host.json                          # host configuration: mount root, credential routes
   .staging/                          # port-block reservations held while a workspace's grants are minted
   .blank/                            # blank templates every new image is cloned from (see "Images")
-    <bytes>-<uid>-<gid>.asif         # one formatted, verified, detached image per capacity and owner
+    <bytes>-<uid>-<gid>.dmg          # one formatted, verified, detached image per capacity and owner
     <bytes>-<uid>-<gid>.lock         # flock held only while that template is minted
-    <bytes>-<uid>-<gid>-minting-<nonce>.asif # a template being minted, under a name no minter used before
+    <bytes>-<uid>-<gid>-minting-<nonce>.dmg # a template being minted, under a name no minter used before
   <owner>/<repo>/                    # primary repo_id, encoded one component at a time
     repository.json                  # chosen remote binding, alternate identities, and primary designation
     checkout-root.json               # where the checkout was when main was last removed (written then, read to reopen)
@@ -58,23 +58,23 @@ layout root:
     lifecycle-intents.json           # bounded persist-before-mutate create/fork/remove recovery journal, mode 0600
     lifecycle-intents.json.lock      # flock held for each read-modify-write of the journal
     deletion-log.jsonl               # one line per artifact the controller unlinked, one per build volume released (storage/deletion_log.rs)
-    main.asif                        # adopted main image (created here behind a PendingFence sidecar)
-    main.asif.grants.json            # controller-owned grants + detached metadata
-    main.asif.ca.key                 # main's workspace CA private key, 0600
-    main.asif.lock                   # flock target for lifecycle operations
+    main.dmg                         # adopted main image (created here behind a PendingFence sidecar)
+    main.dmg.grants.json             # controller-owned grants + detached metadata
+    main.dmg.ca.key                  # main's workspace CA private key, 0600
+    main.dmg.lock                    # flock target for lifecycle operations
     .staging/                        # restore stages, never enumerated
     sessions/
-      <workspace>.asif               # one image per workspace
-      <workspace>.asif.grants.json   # grants + detached metadata (see 04_sandbox.md)
-      <workspace>.asif.ca.key        # the workspace's CA private key, 0600
-      <workspace>.asif.lock          # flock target for lifecycle operations
+      <workspace>.dmg                # one image per workspace
+      <workspace>.dmg.grants.json    # grants + detached metadata (see 04_sandbox.md)
+      <workspace>.dmg.ca.key         # the workspace's CA private key, 0600
+      <workspace>.dmg.lock           # flock target for lifecycle operations
       <workspace>.intent.lock        # flock the process executing <workspace>'s lifecycle intent holds
       .trash/                        # removed images awaiting reclamation (`gc`)
     checkpoints/
-      <workspace>/<label>.asif       # clonefile snapshot
+      <workspace>/<label>.dmg        # clonefile snapshot
     build/
-      <id>.asif                      # one build volume: Cargo target dirs + Nx cache and task DB (16_build_volumes.md)
-      <id>.asif.json                 # its sidecar: built-at tree, linking checkout, seed flag, created
+      <id>.dmg                       # one build volume: Cargo target dirs + Nx cache and task DB (16_build_volumes.md)
+      <id>.dmg.json                  # its sidecar: built-at tree, linking checkout, seed flag, created
     tmp/
       <workspace>/                   # its TMPDIR, 0700: writable by its own sandbox only; reclaimed with its retired image,
                                      #   read-only directories its tools sealed made owner-writable first (`go clean -modcache`)
@@ -113,7 +113,7 @@ Workspace names match `[a-z0-9][a-z0-9-]{0,63}`; `main` is reserved. Repository 
 components are validated and encoded independently; the slash between them is structural and percent-decoding is never
 performed during path lookup.
 
-Sidecar suffixes append to the complete image filename (`<workspace>.asif.grants.json`). `portBlock` in detached sidecar
+Sidecar suffixes append to the complete image filename (`<workspace>.dmg.grants.json`). `portBlock` in detached sidecar
 metadata is optional and platform-specific: it is present only for macOS workspaces and is omitted on Linux; Linux does
 not synthesize a base port in persistent metadata.
 
@@ -135,16 +135,15 @@ every clone automatically). Main and sessions use identical wiring; only the san
 
 ## Images
 
-- **Format**: one — an ASIF image (`.asif`) holding one case-sensitive APFS volume. There is no second format, no
-  fallback, and no format field in any metadata: `.asif` is the only image extension anything enumerates, and macOS 26,
-  which introduced ASIF (`diskutil` documents it as the replacement for the legacy `.sparseimage`), is the floor. Every
-  image starts as a clone. Each store keeps one **blank template** per capacity and owner,
-  `.blank/<capacity-bytes>-<uid>-<gid>.asif`, and a **mint** — adopt's main image, a build volume's first touch — is one
-  `clonefile` of it to the image's canonical name plus one `diskutil image attach --nobrowse --noMount --plist`,
-  verified with `fsck_apfs -q` like every attach. The clone takes the canonical name whole, so the name only ever holds
-  a complete, formatted volume. A template is minted lazily, the first time a store mints at its capacity, in five
-  unprivileged steps:
-  `diskutil image create blank --format ASIF --size <capacity-bytes> --volumeName [cowshed] --fs None <stem>-minting-<nonce>.asif`,
+- **Format**: one — a RAW (UDRW) image (`.dmg`) holding one case-sensitive APFS volume, stored as a sparse file on the
+  store's APFS filesystem. There is no second runtime format, fallback, or format field in metadata: `.dmg` is the only
+  image extension anything enumerates. macOS 26 remains the floor. Every image starts as a clone. Each store keeps one
+  **blank template** per capacity and owner, `.blank/<capacity-bytes>-<uid>-<gid>.dmg`, and a **mint** — adopt's main
+  image, a build volume's first touch — is one `clonefile` of it to the image's canonical name plus one
+  `diskutil image attach --nobrowse --noMount --plist`, verified with `fsck_apfs -q` like every attach. The clone takes
+  the canonical name whole, so the name only ever holds a complete, formatted volume. A template is minted lazily, the
+  first time a store mints at its capacity, in five unprivileged steps:
+  `diskutil image create blank --format RAW --size <capacity-bytes> --volumeName [cowshed] --fs None <stem>-minting-<nonce>.dmg`,
   `diskutil image attach --nobrowse --noMount --plist <image>`,
   `newfs_apfs -U <uid> -G <gid> -e -v [cowshed] <whole-device>`, a `fsck_apfs -q` of the new volume, and
   `hdiutil detach <whole-device>`; only then is it renamed to its name. Only minting takes the template's lock, and a
@@ -165,12 +164,30 @@ every clone automatically). Main and sessions use identical wiring; only the san
   `storagekitd` call on every such mint (0.93–1.0 s measured on a loaded host), where a template costs one mint per
   store and capacity (0.57–0.63 s measured).
 - **Case-sensitive, always**: `-e` is the entire cost — one flag at creation. Clones copy the volume as it is, so `new`,
-  `fork`, `checkpoint`, and `restore` never repeat it, and case-sensitive ASIF measures the same as case-insensitive
-  ASIF on every axis below within noise. A case-sensitive volume holds every path a repository can contain, including
-  paths that differ only in case, which a case-insensitive volume merges. The checkout's own volume does not matter:
-  adopt copies from it and sets the copied repository's `core.ignorecase` to `false` (02_workspaces.md).
-- **Capacity**: 100 GiB sparse. Capacity is a cap, not an allocation; images occupy only written blocks. Override per
-  project via `.cowshed.toml` `capacity`.
+  `fork`, `checkpoint`, and `restore` never repeat it. A case-sensitive volume holds every path a repository can
+  contain, including paths that differ only in case, which a case-insensitive volume merges. The checkout's own volume
+  does not matter: adopt copies from it and sets the copied repository's `core.ignorecase` to `false`
+  (02_workspaces.md).
+- **Capacity and allocation**: 100 GiB sparse. Capacity is a cap, not a reservation; a 300 GiB image does not reserve
+  300 GiB on the host. Override per project via `.cowshed.toml` `capacity`. Creation uses only the sparse `diskutil`
+  path above, never `hdiutil create -type UDIF`, which preallocates the nominal capacity. Copies preserve holes with
+  `clonefile` or a hole-aware data copy. Allocation checks use `st_blocks * 512` and `du`, not the apparent file size.
+  Re-adoption records the current source and build images' capacity from their authoritative kernel IOMedia mappings
+  before detaching them; an old image's apparent file length is not its virtual capacity. The fresh RAW image keeps that
+  recorded capacity.
+- **Live source snapshots**: a RAW file has no outer allocation directories, chunk tables, or bitmap that a clone can
+  capture from mixed generations. Source-image snapshots flush the source volume and backing file, then descriptor-clone
+  the live image without unmounting, detaching, sealing, or changing the source's mount flags. The clone is verified
+  with `fsck_apfs` before its first mount. A shell whose cwd is in main, an editor, or a source watcher does not prevent
+  a fork. This is filesystem crash consistency, not an application-state guarantee: build volumes still use the sealed
+  seeds and writer exclusion in 16_build_volumes.md.
+- **Space reclamation**: sparse creation does not imply automatic return of guest-freed space. The measured RAW producer
+  retained a deleted 1 GiB payload's host allocation after guest sync, image fsync, clean unmount, and detach.
+  `hdiutil compact` supports SPARSE and SPARSEBUNDLE, not RAW. Reclaim guest-freed space by the verified re-adoption
+  transaction in 02_workspaces.md: copy the live filesystem into a fresh sparse RAW image, verify its contents and Git
+  state, and retain the old image until verification passes. The host reclaims old blocks only when the retained image
+  and every clone or checkpoint sharing them are explicitly released. This costs a filesystem copy; neither `defrag` nor
+  a sparse-file copy identifies guest-freed nonzero blocks.
 - **Clone cost follows extents, not size**: `clonefile` of an image returns in milliseconds because the clone shares the
   source file's extent map, and the first write to either file copies that map: about 3.5 µs per extent for maps of
   thousands of extents, rising to about 12 µs for maps of millions, on the store volume. A long-used main is slow to
@@ -210,16 +227,13 @@ every clone automatically). Main and sessions use identical wiring; only the san
   `defrag` replaces one an interrupted run left, and `doctor` names it until then. Mains are never detached implicitly
   (the gateway keeps them mounted), so no path rewrites main on its own.
 - **Detached growth**: under the image's lease, an `O_EXLOCK | O_NONBLOCK | O_NOFOLLOW` open proves no image driver
-  holds the file and excludes attachment until the write is durable. Validate the ASIF v1 `shdw` header, version 1,
-  length `0x200`, 4 KiB alignment, and a strictly larger capacity within the header's maximum sector count (`0x38`);
-  rewrite only the eight-byte big-endian 512-byte sector count at `0x30`, then power-loss flush before closing.
-  Directories and chunk tables are sized from the maximum, not the current count
-  ([format specification](https://github.com/huven/asif-format)); Apple publishes no layout.
-  `diskutil image resize --plist` only reads limits. Its content resize secretly attaches the image outside cowshed's
-  ownership check and pin, and concurrent resizes were observed exiting `ENOENT` after completing. Cowshed instead
-  attaches and verifies its own image, grows the container with `diskutil apfs resizeContainer`, and checks kernel
-  capacity. A crash between the header and container growth leaves a larger image around the old container:
-  equal-capacity resize is refused, while a larger resize completes both steps, as in the previous two-phase path.
+  holds the file and excludes attachment until the write is durable. The RAW file's length is its virtual capacity.
+  Refuse a requested length not aligned to 4 KiB or not strictly larger than the existing length; extend with
+  `ftruncate` and power-loss flush before closing. Extending creates holes, not a host allocation of the larger
+  capacity. There is no image header or allocation map to parse or rewrite. Cowshed then attaches and verifies its own
+  image, grows the container with `diskutil apfs resizeContainer`, and checks kernel capacity. A crash between file and
+  container growth leaves a larger image around the old container: equal-capacity resize is refused, while a larger
+  resize completes both steps.
 - **Volume name**: the repository name for `main`, `<repo> — <workspace>` for every other workspace. The volume name is
   a label and nothing else: Finder shows it in place of the directory name for a mounted volume's directory, so it is
   written for the person looking at it. Nothing parses it, nothing classifies a volume by it, and nothing derives
@@ -238,8 +252,8 @@ every clone automatically). Main and sessions use identical wiring; only the san
 ### Format measurements
 
 The image-format prototype (`specs/cowshed/prototypes/image-format-bench/`: harness, `results/`) compared three
-candidates on the store's APFS container, all created and mounted without root: case-sensitive ASIF (the format),
-case-insensitive ASIF (`newfs_apfs -i`, otherwise identical), and case-sensitive SPARSE
+candidates on the store's APFS container, all created and mounted without root: case-sensitive ASIF (the historical
+pre-RAW format), case-insensitive ASIF (`newfs_apfs -i`, otherwise identical), and case-sensitive SPARSE
 (`hdiutil create -type SPARSE -fs "Case-sensitive APFS"`, attached with `hdiutil attach -owners on -nomount`). The data
 set is one real Bun `node_modules` (3.6 GB, 34k files, 6.5k symlinks), 40,000 further symlinks, 2 GiB of
 cargo-target-like files (24 × 64 MiB, 512 × 1 MiB), and a git repository tracking all but the target files (80,744 index

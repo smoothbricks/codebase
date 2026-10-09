@@ -84,7 +84,7 @@ not a best-effort script:
    applied otherwise — and the dedicated store volume exists: run the same host setup `cowshed setup` runs, which
    creates and mounts `cowshed.store` at `/private/cowshed/store` (the volume marker in 01_storage.md) before any image
    is created.
-2. Create the image (case-sensitive APFS in ASIF, 01_storage.md) at its canonical name, `<owner>/<repo>/main.asif`,
+2. Create the image (case-sensitive APFS in sparse RAW, 01_storage.md) at its canonical name, `<owner>/<repo>/main.dmg`,
    behind a fence: its complete sibling host sidecar is written first, in publication state `PendingFence`, which keeps
    main out of ordinary enumeration, gateway inventory, and every verb that would mount or serve it. Both path
    components come from the validated primary `repo_id` and are encoded independently as specified in 01_storage.md. The
@@ -110,6 +110,46 @@ not a best-effort script:
    prescribes, and the same attachment mounts there with `mount_apfs`. The normal path has no detach, image rename,
    second attach, or second fsck: an attached image is never renamed, because its identity is the backing path it was
    attached from.
+
+### Re-adoption: format transition and space reclamation
+
+`cowshed adopt <checkout> --re-adopt` replaces an adopted main through the same staged copy, verification, publication
+fence and checkout handoff as adopt. Default adopt remains idempotent; replacement is explicit. Re-adoption is the
+ASIF-to-RAW transition and the RAW guest-space reclaim operation, not an image converter or a second runtime format.
+
+1. Require the caller to be outside the checkout and require its source and build volumes to have no holders. Refuse
+   with each holder's PID and command; never kill a user process or force an unmount. Record the exact source backing
+   path, incarnation, original checkout path, build-volume identity, current kernel IOMedia capacities and retained
+   paths in the durable adoption intent before changing any of them. Preserve an existing `<checkout>.pre-cowshed` tree
+   without overwriting or deleting it. Source and build copy mounts use the project's recorded adoption staging
+   namespace, with source and destination names that cannot be parsed as BuildVolumeIds.
+2. Record the source's complete content and Git state while it is quiescent: HEAD, porcelain, count-objects, local
+   config including includes, every ref, packed refs or reftables, reflogs and stash, hooks, `info/`, index and worktree
+   registrations. Preserve the sheds' links to the same main checkout path. Detach the exact old source without force,
+   retain its backing image and sidecars under the recorded retained name, then attach that image read-only at the
+   recorded source staging mount. The original checkout becomes the publication target, not the copy source.
+3. Mint a fresh sparse RAW image behind `PendingFence` and copy the entire source filesystem, including ignored build
+   state and all of `.git`, directly into its staging mount. Preserve sparse leaves through metadata clones or
+   hole-aware copies; do not materialize the nominal image capacity or use an intermediate full checkout on Data. The
+   main's build-volume identity and owner record are preserved verbatim, including its built-at tree and creation time;
+   its contents are carried into a sparse RAW backing image by the same staged, verified copy at the recorded capacity.
+   Nothing substitutes an empty build volume for the recorded warm one. Leave old-incarnation seed images unchanged as
+   retained evidence; publish one fresh RAW seed from the verified warm replacement for the new incarnation.
+4. Verify the copied content before publication, including tracked and untracked-not-ignored file checksums, the entire
+   `.git` state above, `git fsck`, and the build contents and identity. Re-adoption does not normalize Git
+   configuration, delete lock files, prune worktree registrations or replace user hooks. Only cowshed's own marker and
+   credentials are regenerated as part of the new incarnation. Check host allocation with `du` and `st_blocks * 512`,
+   not apparent file length. Any mismatch refuses publication and leaves the retained source available.
+5. Reuse adopt's atomic `PendingFence` activation and mount the verified replacement at the exact original checkout
+   path. Recovery resumes the recorded replacement; it never starts an unrelated adopt or deletes a retained source.
+   Verify the remounted content, Git state and build identity against the recorded before-state. Return the retained
+   image path and its explicit later-removal instruction. Keep the old backing image and original `.pre-cowshed` until
+   the user removes them after verification; repeated invocation resumes the transaction rather than replacing its
+   evidence.
+
+Re-adoption copies filesystem entries, not allocated-but-free guest blocks. Space returns only after verification and
+explicit release of the old image and any snapshots sharing its blocks (01_storage.md, "Space reclamation"). Existing
+ASIF images are retained inputs to this transaction; ordinary runtime image enumeration and attachment use RAW only.
 
 ## Checkout layouts
 
@@ -252,26 +292,23 @@ observation converges nothing rather than guessing.
 
 ## `cowshed new <name>` — create a session workspace
 
-No pool or pre-warming. The CoW copy itself is small; sealing and restoring a live source are real lifecycle work, not
-part of the former attached-image clone shortcut.
+No pool or pre-warming. The source image remains live and mounted throughout capture.
 
-1. `flock` main's image lock. Capture its image only after a non-forced unmount/detach has settled the image driver;
-   preserve and restore the source's access, visibility and verified attachment mapping. A holder that prevents sealing
-   is named and refuses the capture, never forced or bypassed. Volume sync provides freshness, not an allocation-map
-   snapshot.
-2. Hold the detached source inode with a shared no-follow image lock excluding attachments, validate its ASIF map, then
-   descriptor-clone it to `sessions/<name>.asif`. Concurrent sealed readers are permitted. Create the complete
-   closed-baseline sibling sidecar before attach; allocate `portBlock` only on macOS and omit it on Linux.
+1. `flock` main's image lock. Flush its source volume and backing file for freshness without unmounting, detaching,
+   sealing, or changing its mount flags. Main's shells, editors and source watchers continue to use it.
+2. Open the source inode without following symlinks and descriptor-clone it to `sessions/<name>.dmg`. RAW has no outer
+   allocation map; the filesystem snapshot is crash-consistent, not an application-state transaction. Create the
+   complete closed-baseline sibling sidecar before attach; allocate `portBlock` only on macOS and omit it on Linux.
 3. Attach without mounting (`diskutil image attach --noMount`, flags per 01_storage.md), run `fsck_apfs -q` against the
-   clone's APFS volume device, then mount at `<mount-root>/<owner>/<repo>/<name>` — ~235–400 ms typical for a freshly
-   written image. Before the attach, the `first-write` step rewrites the clone's first block with the bytes it holds,
-   which copies the source image's extent map (01_storage.md, "Clone cost follows extents, not size"). On a long-used
-   main that costs tens of seconds, and under host load a container-wide metadata stall follows it, until
-   `cowshed defrag main` rewrites main contiguously. Verification precedes the first mount; a clone never mounts
-   unchecked.
-4. On fsck failure, delete the clone and retry once from a fresh **sealed** capture. The former ten-sample live-clone
-   smoke passed fsck and reads, but did not prove image-driver consistency; a later mixed-generation ASIF allocation
-   tear falsified that guarantee. An attached backing-file clone is not a filesystem snapshot.
+   clone's APFS volume device, then mount at `<mount-root>/<owner>/<repo>/<name>`. The earlier ~235–400 ms attach
+   measurements are pre-RAW figures, not a RAW timing guarantee. Before attach, the `first-write` step rewrites the
+   clone's first block with the bytes it holds, which copies the source image's extent map (01_storage.md, "Clone cost
+   follows extents, not size"). On a long-used main that costs tens of seconds, and under host load a container-wide
+   metadata stall follows it, until `cowshed defrag main` rewrites main contiguously. Verification precedes the first
+   mount; a clone never mounts unchecked.
+4. On fsck failure, delete the clone and retry once from a fresh live RAW capture. If verification fails again, refuse
+   publication with the actual fsck result; never detach the live source as a fallback. The earlier ASIF live-clone
+   smoke and inconsistent allocation maps are historical evidence, not a proof of what caused their corruption.
 5. Rewrite `.cowshed/workspace.json` (`role: "workspace"`, `baseCommit` = main's HEAD), mint a fresh `.cowshed/token`,
    mint a fresh per-workspace CA (private key controller-side next to the grant file; CA cert placed in-image as a trust
    anchor with the tool anchors wired — 04_sandbox.md/05_gateway.md), and complete platform wiring. On macOS, use the
@@ -550,8 +587,8 @@ deliberate trade of isolation for immediacy, taken per workspace, and never by d
 
 ## `cowshed fork <src> <dst>`
 
-Clones a _session_ mid-flight with the same barrier/fencing as `cowshed new` (`sessions/<src>.asif` →
-`sessions/<dst>.asif`). The marker records `forkedFrom` and `lineage` (the source incarnation, then the source's own
+Clones a _session_ mid-flight with the same barrier/fencing as `cowshed new` (`sessions/<src>.dmg` →
+`sessions/<dst>.dmg`). The marker records `forkedFrom` and `lineage` (the source incarnation, then the source's own
 ancestors), and the controller records the audit
 `ControllerCommitment::Fork(ForkCommitment { version, order, repo_id, source_incarnation, destination_incarnation })`.
 Grants do **not** carry over: the fork starts closed, with a fresh CA and platform endpoint identity. macOS allocates a
@@ -860,7 +897,7 @@ clone of a snapshot of the lane base on ZFS as it is a clone of its image on APF
    This is the one piece of teardown that lives where the user can see it — a remote or a registration naming a trashed
    mount is a broken fetch and a broken `git worktree list` in the user's own checkout.
 4. Logically retire: atomically rename the image and its detached grants/CA companions to
-   `sessions/.trash/<ws>-<incarnation>.asif`. The canonical image disappears from enumeration and the command returns
+   `sessions/.trash/<ws>-<incarnation>.dmg`. The canonical image disappears from enumeration and the command returns
    here (typically well under a second; a stubborn process tree delays it by at most the kill grace). Valid checkpoint
    facts left behind during this asynchronous phase neither republish the workspace nor authorize deletion by
    themselves; malformed, foreign, and duplicate facts remain integrity errors.

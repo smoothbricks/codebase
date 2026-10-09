@@ -67,10 +67,10 @@ writers at once. Content-addressed caches, whose entries are immutable and valid
 
 ### Substrate
 
-- **APFS**: a build volume is an ASIF image of its own, created exactly as a workspace image is (01_storage.md "Images":
-  case-sensitive APFS), stored beside the workspace's image as `<owner>/<repo>/build/<id>.asif` with its sidecar
-  `<id>.asif.json`. It is attached `nobrowse` at a store-side mountpoint, `<mount-root>/.build/<owner>/<repo>/<id>`,
-  never inside another volume.
+- **APFS**: a build volume is a sparse RAW image of its own, created exactly as a workspace image is (01_storage.md
+  "Images": case-sensitive APFS), stored beside the workspace's image as `<owner>/<repo>/build/<id>.dmg` with its
+  sidecar `<id>.dmg.json`. It is attached `nobrowse` at a store-side mountpoint,
+  `<mount-root>/.build/<owner>/<repo>/<id>`, never inside another volume.
 - **Names**: every mounted live build volume is named `[cowshed] <project> — build <checkout>` (the project is displayed
   as `<owner> · <repo>`); main uses `build main`, and a session uses `build <ws>`. A mounted live volume is never left
   named only `[cowshed]`. Its supervisor queues the APFS rename off the provisioning path, checks the name again on
@@ -265,14 +265,20 @@ Everything below holds for every target alike; main is the target at the root.
 A **seed** is a build volume nobody writes: a target's frozen build state at one landed tree. **Each target has its own
 latest seed.** Every fork of a target clones that target's seed, never the target's live build volume. A target's live
 build volume is written by whatever runs there (a developer's build, a reload, the target's own check); cloning it
-mid-write would copy a Cargo unit or an Nx database half-written. An APFS seed stays detached, and its allocation map is
-validated under an inode-held shared lock before descriptor cloning (01_storage.md, "Images").
+mid-write would copy a Cargo unit or an Nx database half-written. An APFS seed stays detached, and its source inode is
+held with a shared no-follow lock excluding attachment while descriptor cloning runs (01_storage.md, "Images").
 
 A target's seed is made when the target is created (a clone of the seed it was forked from, or of its first build volume
 at its first touch), during every land into it (below), by sealing and cloning the landing workspace's build volume
 before the target adopts it, and again by a **reseed** whenever the target's live volume holds a write its seed does
 not. Stopping supervised jobs alone is not writer exclusion: a host Cargo build or editor may still hold the volume.
 Each target keeps only its latest seed; a target's seed is deleted when the target retires.
+
+Re-adoption preserves the live BuildVolumeId, its owner record, tree and creation time, and carries its warm filesystem
+into RAW at the capacity recorded from the kernel before detach (02_workspaces.md §Re-adoption). It leaves every
+old-incarnation seed unchanged as retained evidence, rather than relabeling it as a seed of the new incarnation. The new
+main receives one fresh RAW seed captured from its verified warm replacement under the same writer exclusion as every
+seed. This explicit retained evidence is not an active latest seed and is never silently collected as one.
 
 **Why a reseed.** A land freezes the seed before the target runs anything on the adopted volume. Everything the target
 runs afterwards (its own builds and gates, the land's adoption check, a developer's build in main) is written to its
@@ -300,7 +306,7 @@ while it clones the seed, so a reseed never deletes a seed a fork is cloning:
    unmount. Enumeration cannot fence a previously absent profile or a build starting afterwards;
 4. the APFS source is unmounted and detached without force. A late Cargo build, a new profile, an editor or any other
    filesystem holder refuses that seal; it is reported as a busy-volume skip and the old seed remains. The detached
-   image is flushed, its allocation map validated and its source inode held against reattachment while it is cloned;
+   image is flushed and its source inode held against reattachment while it is cloned;
 5. the live volume is restored with the same mount flags and current attachment identity, then the new seed replaces the
    old one. A process starting after restoration cannot invalidate the already-sealed capture; later writes make the
    seed behind again rather than requiring another holder query.
@@ -315,15 +321,17 @@ reports each target whose seed is behind its live volume, with both instants (`s
 
 - **Enforced by**: a real-APFS test in which main runs an Nx task after adopting a landed volume, `cowshed reseed main`
   refreezes its seed and a fork hits that task; real Cargo build-script rendezvous tests for both an existing profile
-  and a profile created after quiescence and lock enumeration; and the sealed-source holder and allocation-map tests.
+  and a profile created after quiescence and lock enumeration; and the sealed-source holder and attachment-exclusion
+  tests.
 
 ## Fork: `cowshed new` / `cowshed fork`
 
 A fork names its target: `cowshed new <ws>` forks main, `cowshed fork <target> <ws>` forks an integration workspace (a
 lane base, a stack base).
 
-1. Clone the target's source image as today (02_workspaces.md). The fork holds the target's image lock from here to the
-   end of step 3.
+1. Flush and descriptor-clone the target's live RAW source image without detaching it (02_workspaces.md). Source
+   filesystem crash consistency does not replace build-state writer exclusion. The fork holds the target's image lock
+   from here to the end of step 3.
 2. **Reseed the target** when its seed is behind its live volume and the volume has no writer (Targets and seeds).
 3. Clone **the target's** latest seed image to a new build volume owned by the new workspace, attach it, and point the
    workspace's `.cowshed/build` at it. Clones preserve every file's bytes and mtime; Cargo freshness depends on that
@@ -351,7 +359,7 @@ same for main and for an integration workspace; "the target" is whichever one it
 2. **Validate in the workspace**: the caller's check (`--check`, for an Nx project `nx run-many -t lint test build` over
    what the workspace changed) runs in the sandbox against the workspace's own build volume. Only the delta builds.
 3. **Fast-forward the target** under its repository lock (as today).
-4. **Quiesce the landing workspace.** The land holds the landing build volume (the shared `<id>.asif.hold` a job holds,
+4. **Quiesce the landing workspace.** The land holds the landing build volume (the shared `<id>.dmg.hold` a job holds,
    GC below) from before the workspace's jobs stop until its build-volume steps end (after step 7), so no collection in
    any process releases it while step 6 renames the target's link and records the target as its owner. Its supervisor
    stops the workspace's jobs and its sandboxed Nx daemon, and the landing build volume's Nx task database must have no
@@ -501,11 +509,11 @@ One budget spans both phases and every Nx state. The row count is a defensive ca
 database pairs, including multiple machine databases that might index the same hash. Recorded entry bytes and
 block-rounded copied bytes are capped at a tenth of both the destination image's capacity and its backing store's. Both
 filesystems retain a tenth of their capacity free, and the allowance is reduced to the currently available space above
-either reserve. An ASIF image's virtual free space does not prove its backing store has space. Every filesystem object
-is charged and both free-space values checked before its write. A failed store-space query stops the carry, never falls
-back to image space alone. A cache row understating a file's size cannot hide an unbounded data copy. Files are walked
-once, not sized in a preliminary second traversal; regular-file reads are pinned and length-limited, growth or shrinkage
-refuses the partial entry, and directory metadata is restored after children. Hitting a bound stops with
+either reserve. A sparse RAW image's virtual free space does not prove its backing store has space. Every filesystem
+object is charged and both free-space values checked before its write. A failed store-space query stops the carry, never
+falls back to image space alone. A cache row understating a file's size cannot hide an unbounded data copy. Files are
+walked once, not sized in a preliminary second traversal; regular-file reads are pinned and length-limited, growth or
+shrinkage refuses the partial entry, and directory metadata is restored after children. Hitting a bound stops with
 `carried.stopped`, keeps whole entries already carried, removes the partial entry, and leaves the rebase successful.
 Moving staged entries at commit consumes no second copy allowance.
 
@@ -548,7 +556,7 @@ again at any level above it.
   `land` (including `--no-retire`) run collection before returning, not only on a later explicit `gc`.
 - Ownership is a job hold, a land's hold on its landing volume, or an unfinished create/fork/adopt in the lifecycle
   intent journal, not the kernel's refusal to unmount. Every admitted cowshed job holds a shared flock on the build
-  volume's `<id>.asif.hold` for its lifetime; release must claim it exclusively. A running job therefore keeps main's
+  volume's `<id>.dmg.hold` for its lifetime; release must claim it exclusively. A running job therefore keeps main's
   previous volume across a swap.
 - Collection decides from a snapshot, and a land can move a target's link onto a volume after it: an `rm` that retired
   the landing workspace while that workspace's land still ran saw the landing volume linked by nothing, and once it
