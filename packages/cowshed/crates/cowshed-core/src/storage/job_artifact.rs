@@ -8220,6 +8220,8 @@ mod tests {
     /// integrity, never absence. The pre-key layout does not widen keyed admission authority.
     #[test]
     fn an_unread_store_retains_numeric_authority_across_readers_and_checkpoints() {
+        use std::os::unix::fs::PermissionsExt;
+
         let root = temp_root("unread-store-authority");
         drop(store_at(&root, ArtifactConfig::default()));
         append_batch(&root, &earlier_batch(&valid_job_record(1), 14, 7));
@@ -8411,7 +8413,7 @@ mod tests {
         let sealed_mode = fs::metadata(&spill).unwrap().permissions();
         assert!(sealed_mode.readonly(), "finish seals the promoted file");
         let mut writable = sealed_mode.clone();
-        writable.set_readonly(false);
+        writable.set_mode(sealed_mode.mode() | 0o200);
         let mut corrupt = correct.to_vec();
         corrupt[0] ^= 0xff;
         fs::set_permissions(&spill, writable.clone()).unwrap();
@@ -9256,6 +9258,8 @@ mod tests {
 
     #[test]
     fn checkpoint_snapshots_only_messages_sequenced_before_the_barrier() {
+        use std::os::unix::fs::PermissionsExt;
+
         let root = temp_root("actor-checkpoint-order");
         let mut store = store_at(&root, ArtifactConfig::default());
         let token = store
@@ -9295,7 +9299,7 @@ mod tests {
         let original_prefix = fs::read(&prefix_path).unwrap();
         let sealed_first_mode = fs::metadata(&prefix_path).unwrap().permissions();
         let mut writable_first = sealed_first_mode.clone();
-        writable_first.set_readonly(false);
+        writable_first.set_mode(sealed_first_mode.mode() | 0o200);
         let mut corrupted_prefix = original_prefix.clone();
         corrupted_prefix[0] ^= 0xff;
         fs::set_permissions(&prefix_path, writable_first.clone()).unwrap();
@@ -9345,7 +9349,7 @@ mod tests {
         );
         let sealed_second_mode = fs::metadata(&second_prefix_path).unwrap().permissions();
         let mut writable_second = sealed_second_mode.clone();
-        writable_second.set_readonly(false);
+        writable_second.set_mode(sealed_second_mode.mode() | 0o200);
         let current_prefix = fs::read(&second_prefix_path).unwrap();
         let mut corrupted_current = current_prefix.clone();
         corrupted_current[0] ^= 0xff;
