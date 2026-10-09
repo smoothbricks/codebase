@@ -83,6 +83,8 @@
           "{workspaceRoot}/**/*_test.*",
           "{workspaceRoot}/**/test-*",
           "{workspaceRoot}/**/test_*",
+          "{workspaceRoot}/**/test-*/**/*",
+          "{workspaceRoot}/**/test_*/**/*",
           "{workspaceRoot}/**/__tests__/**/*",
           "{workspaceRoot}/**/tests/**/*",
           "{workspaceRoot}/**/test/**/*",
