@@ -599,7 +599,7 @@ fn visit_source_body<'a, E: From<InvalidSource>>(
 /// body starts within `code`. The envelopes are `FOR_EACH: type_col,
 /// match_count, match_ids:u32 × match_count, body_len:u16, body` and
 /// `FLAT_MAP: offsets_col, parent_ts_col, body_len:u16, body`.
-fn envelope_body(op: Opcode, code: &[u8], operands: usize) -> Option<(usize, &[u8])> {
+pub(crate) fn envelope_body(op: Opcode, code: &[u8], operands: usize) -> Option<(usize, &[u8])> {
     let mut r = Operands::at(code, operands);
     match op {
         Opcode::ForEach => {

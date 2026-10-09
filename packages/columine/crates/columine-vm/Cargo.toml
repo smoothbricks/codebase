@@ -28,3 +28,10 @@ harness = false
 [[bench]]
 name = "row_exprs"
 harness = false
+
+# Batch capacity admission: each tier's cost, and how often each tier decides
+# in a near-capacity stream.
+# Run: `cargo bench -p columine-vm --bench capacity_admission`
+[[bench]]
+name = "capacity_admission"
+harness = false

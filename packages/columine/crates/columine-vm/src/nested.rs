@@ -873,6 +873,100 @@ pub fn nested_agg_update(
 // =============================================================================
 // Nested-container read operations
 
+/// What a batch of nested mutations on one slot needs: new outer keys and
+/// arena bytes. The arena is a bump allocator that never reclaims, and
+/// [`prepare_outer`]/[`prepare_table`] are its only writers in a batch, so
+/// the demand is exact up to the order of inner keys, which does not change
+/// it: a container rehashes to twice its capacity before an insert finds
+/// its size at the load limit, and that depends only on how many new keys
+/// reach it.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct NestedDemand {
+    pub(crate) outer_keys: u64,
+    pub(crate) arena_bytes: u64,
+    pub(crate) fits: bool,
+}
+
+/// Demand of the `(outer, inner)` key pairs one batch sends to `meta`'s slot,
+/// as the slot is now; `inner_type` is the container the instructions name.
+/// `pairs` is sorted and deduplicated in place; an aggregate's inner key is
+/// ignored. `None` means execution refuses for another reason (a sentinel
+/// key, a container of another type), which a dry run reports.
+pub(crate) fn batch_demand(
+    state: &[u8],
+    meta: &SlotMetaView,
+    inner_type: SlotType,
+    pairs: &mut Vec<(u32, u32)>,
+) -> Option<NestedDemand> {
+    let prefix = read_nested_prefix(state, meta.offset);
+    if prefix.inner_type != inner_type {
+        return None;
+    }
+    let entry_size = match inner_type {
+        SlotType::HashMap => hash_table::ENTRY_U32,
+        SlotType::HashSet => hash_table::ENTRY_NONE,
+        SlotType::Aggregate => 0,
+        _ => return None,
+    };
+    let aggregate = inner_type == SlotType::Aggregate;
+    if aggregate {
+        for pair in pairs.iter_mut() {
+            pair.1 = 0;
+        }
+    }
+    pairs.sort_unstable();
+    pairs.dedup();
+    let outer = OuterTable::bind(meta);
+    let initial_cap = next_power_of_2(u32::from(prefix.inner_initial_cap));
+    let mut demand = NestedDemand::default();
+    let mut bytes = 0u64;
+    let align = |len: u64| (len + 7) & !7;
+    let mut at = 0;
+    while at < pairs.len() {
+        let key = pairs[at].0;
+        let end = at + pairs[at..].iter().take_while(|pair| pair.0 == key).count();
+        if key >= TOMBSTONE || (!aggregate && pairs[at..end].iter().any(|p| p.1 >= TOMBSTONE)) {
+            return None;
+        }
+        let offset = outer.lookup(state, key);
+        let existing = (offset != 0 && !aggregate)
+            .then(|| hash_table::FlatTable::bind(state, offset, entry_size));
+        let (mut cap, mut size) = match existing {
+            Some(table) => (table.cap, table.size(state)),
+            None => (initial_cap, 0),
+        };
+        if offset == 0 {
+            demand.outer_keys += 1;
+            bytes += align(u64::from(inner_container_size(
+                inner_type,
+                initial_cap,
+                prefix.inner_agg_type_byte,
+            )));
+        }
+        if !aggregate {
+            for &(_, inner) in &pairs[at..end] {
+                if existing.is_some_and(|table| table.contains(state, inner)) {
+                    continue;
+                }
+                if size >= hash_table::max_load_for_cap(cap) {
+                    cap = cap.checked_mul(2)?;
+                    bytes += align(
+                        u64::from(cap) * u64::from(4 + entry_size)
+                            + u64::from(hash_table::HDR_BYTES),
+                    );
+                }
+                size += 1;
+            }
+        }
+        at = end;
+    }
+    demand.arena_bytes = bytes;
+    demand.fits = u64::from(outer.size(state)) + demand.outer_keys
+        <= u64::from(hash_table::max_load_for_cap(outer.cap))
+        && u64::from(outer.arena.used(state)) + bytes <= u64::from(outer.arena.capacity(state));
+    Some(demand)
+}
+
 /// Return zero when the outer key is absent.
 pub fn get_inner_offset(state: &[u8], meta: &SlotMetaView, outer_key: u32) -> u32 {
     OuterTable::bind(meta).lookup(state, outer_key)
@@ -923,4 +1017,115 @@ pub fn inner_agg_get_count(state: &[u8], inner_offset: u32, agg_type_byte: u8) -
         8
     };
     bytes::read_u64(state, inner_offset + count_off)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state_init;
+    use crate::vm::{Vm, u32s_as_bytes};
+    use columine_types::PROGRAM_MAGIC;
+    use columine_types::types::Opcode;
+
+    fn program(inner: SlotType, inner_cap: u8, body: &[u8]) -> Vec<u8> {
+        let init = [
+            Opcode::SlotNested as u8,
+            0,
+            SlotType::Nested as u8,
+            0,
+            1, // outer capacity 256: the arena, not the outer table, binds
+            inner as u8,
+            inner_cap,
+            0,
+            0,
+            Opcode::Halt as u8,
+        ];
+        let mut reduce = vec![Opcode::ForEach as u8, 2, 1];
+        reduce.extend(1u32.to_le_bytes());
+        reduce.extend((body.len() as u16).to_le_bytes());
+        reduce.extend_from_slice(body);
+        let mut prog = vec![0u8; 32];
+        prog.extend(PROGRAM_MAGIC.to_le_bytes());
+        prog.extend([2, 0, 0, 0]);
+        prog.extend(1u32.to_le_bytes());
+        prog.extend(3u32.to_le_bytes());
+        prog.extend((init.len() as u32).to_le_bytes());
+        prog.extend((reduce.len() as u32).to_le_bytes());
+        prog.extend(init);
+        prog.extend(reduce);
+        prog
+    }
+
+    /// The demand model is exact: a batch that runs adds exactly the outer
+    /// keys and arena bytes `batch_demand` computed for it beforehand.
+    #[test]
+    fn batch_demand_is_the_arena_and_outer_growth_execution_makes() {
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let set_body = [Opcode::NestedSetInsert as u8, 0, 0, 1];
+        let map_body = [Opcode::NestedMapUpsertLast as u8, 0, 0, 1, 1];
+        for (inner, cap, body) in [
+            (SlotType::HashSet, 1u8, &set_body[..]),
+            (SlotType::HashSet, 4, &set_body[..]),
+            (SlotType::HashMap, 2, &map_body[..]),
+        ] {
+            let prog = program(inner, cap, body);
+            let size = state_init::calculate_state_size(
+                &prog,
+                state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
+            )
+            .unwrap();
+            let mut state = vec![0u8; size as usize];
+            state_init::init_state(
+                &mut state,
+                &prog,
+                state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
+            )
+            .unwrap();
+            let mut vm = Vm::default();
+            let mut pairs = Vec::new();
+            for _ in 0..40 {
+                let rows = 1 + (next() % 12) as usize;
+                let outer: Vec<u32> = (0..rows).map(|_| (next() % 9) as u32).collect();
+                let inner_keys: Vec<u32> = (0..rows).map(|_| (next() % 30) as u32).collect();
+                let types = vec![1u32; rows];
+                let meta = SlotMetaView::read(&state, 0);
+                pairs.clear();
+                pairs.extend(outer.iter().copied().zip(inner_keys.iter().copied()));
+                let demand = batch_demand(&state, &meta, inner, &mut pairs).unwrap();
+                let table = OuterTable::bind(&meta);
+                let (used, keys) = (table.arena.used(&state), table.size(&state));
+                let status = vm.execute_batch(
+                    &mut state,
+                    &prog,
+                    &[
+                        u32s_as_bytes(&outer),
+                        u32s_as_bytes(&inner_keys),
+                        u32s_as_bytes(&types),
+                    ],
+                    rows as u32,
+                );
+                if !demand.fits {
+                    assert_eq!(ErrorCode::NeedsGrowth as u32, status);
+                    break;
+                }
+                assert_eq!(ErrorCode::Ok as u32, status);
+                assert_eq!(
+                    demand.arena_bytes,
+                    u64::from(table.arena.used(&state) - used),
+                    "{inner:?} cap {cap}: arena bytes"
+                );
+                assert_eq!(
+                    demand.outer_keys,
+                    u64::from(table.size(&state) - keys),
+                    "{inner:?} cap {cap}: outer keys"
+                );
+            }
+        }
+    }
 }

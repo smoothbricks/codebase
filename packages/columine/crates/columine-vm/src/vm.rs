@@ -16,6 +16,7 @@ use crate::bitmap_ops::{
     batch_bitmap_remove, get_bitmap_storage,
 };
 use crate::bytes;
+use crate::capacity::{Admission, CapacityCounts, CapacityScratch};
 use crate::hash_table;
 use crate::hashmap_ops::{self, CmpType, Strategy};
 use crate::hashset_ops;
@@ -932,6 +933,8 @@ pub struct Vm {
     element_struct_map2_max: StructMap2MaxI64x2Operands,
     element_list_vals: ScalarOperands,
     nested_scratch: nested::NestedScratch,
+    /// Batch capacity admission (`capacity`), retained across batches.
+    capacity: CapacityScratch,
 }
 
 impl Vm {
@@ -951,6 +954,7 @@ impl Vm {
             element_struct_map2_max: StructMap2MaxI64x2Operands::EMPTY,
             element_list_vals: ScalarOperands::EMPTY,
             nested_scratch: nested::NestedScratch::default(),
+            capacity: CapacityScratch::default(),
         }
     }
 }
@@ -3118,16 +3122,68 @@ impl Vm {
             return INVALID_PROGRAM;
         }
         self.change_flag_boundary(delta_mode, state, |vm, state| {
-            vm.execute_ops(
+            let mut live = live;
+            let admission =
+                vm.capacity
+                    .admit(state, sections.reduce_code, cols, batch_len, &vm.bitmap_env);
+            if admission == Admission::DryRun {
+                let result = vm.dry_run(
+                    state,
+                    sections.reduce_code,
+                    cols,
+                    batch_len,
+                    live.as_deref_mut(),
+                );
+                if result != OK {
+                    if result == NEEDS_GROWTH {
+                        vm.capacity.counts.refused += 1;
+                    }
+                    return result;
+                }
+                vm.capacity.counts.dry_run_fit += 1;
+            }
+            let result = vm.execute_ops(
                 delta_mode,
                 state,
                 sections.reduce_code,
                 cols,
                 batch_len,
                 live,
-            )
+            );
+            debug_assert_ne!(
+                result, NEEDS_GROWTH,
+                "capacity admission cleared a batch that ran out of capacity"
+            );
+            result
         })
         .unwrap_or_else(|error| error as u32)
+    }
+
+    /// Tier 3 of capacity admission: run the batch on a retained copy of the
+    /// state with the journal off and answer what it answered. Execution is
+    /// deterministic, so a batch this run admits runs the same way for real,
+    /// and one it refuses has written nothing to `state`.
+    fn dry_run(
+        &mut self,
+        state: &[u8],
+        code: &[u8],
+        cols: &[&[u8]],
+        batch_len: u32,
+        live: Option<&mut LiveColumns<'_, '_>>,
+    ) -> u32 {
+        let mut image = core::mem::take(&mut self.capacity.image);
+        image.clear();
+        image.extend_from_slice(state);
+        let enabled = core::mem::replace(&mut self.undo.enabled, false);
+        let result = self.execute_ops(false, &mut image, code, cols, batch_len, live);
+        self.undo.enabled = enabled;
+        self.capacity.image = image;
+        result
+    }
+
+    /// How this VM has admitted batches so far.
+    pub fn capacity_counts(&self) -> CapacityCounts {
+        self.capacity.counts
     }
 
     fn execute_ops(

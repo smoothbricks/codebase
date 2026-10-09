@@ -34,6 +34,7 @@ pub mod aggregates;
 pub mod bitmap_ops;
 mod bitmap_ttl;
 pub mod bytes;
+pub mod capacity;
 pub mod column_uses;
 pub mod counts_fold;
 mod element_body;

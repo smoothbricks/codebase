@@ -1059,9 +1059,9 @@ fn arena_overflow_refuses_without_row_write_then_growth_compacts_live_bytes() {
     );
     assert_eq!(SLOT, needs_growth_slot());
 
-    // Each row fits alone; the pair does not. The first row applies, the
-    // second overflows the arena and writes nothing, and the checkpoint
-    // rollback restores the image.
+    // Each row fits alone; the pair does not. Capacity admission sums the
+    // rows' array bytes before the first write, so the batch refuses with
+    // nothing applied and the open undo window holds no entry.
     let each = free / 2 + 1;
     assert!(
         each <= free && 2 * each > free,
@@ -1075,12 +1075,8 @@ fn arena_overflow_refuses_without_row_write_then_growth_compacts_live_bytes() {
     let checkpoint = vm.undo_checkpoint();
     assert_eq!(growth, run(&mut vm, &mut state, &prog, &summed));
     assert_eq!(SLOT, needs_growth_slot());
-    let smap = StructMapSlot::bind(&state, SLOT);
-    assert!(
-        smap.find(&state, 5).is_some(),
-        "the first row applies before the refusal"
-    );
-    assert_eq!(None, smap.find(&state, 6), "the refused row writes nothing");
+    assert_eq!(before_summed, state, "a refused batch writes nothing");
+    assert_eq!(checkpoint, vm.undo_checkpoint(), "and journals nothing");
     rollback(&mut vm, &mut state, checkpoint);
     vm.undo_commit();
     assert_eq!(before_summed, state, "rollback must restore the image");
