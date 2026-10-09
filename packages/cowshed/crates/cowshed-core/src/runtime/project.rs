@@ -10655,6 +10655,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                             crate::workspace_environment::EnvironmentMount::Served {
                                 workspace_mount: &config.workspace_mount,
                                 temp_dir: &config.exec_temp_dir,
+                                capability_env: &config.capabilities.contribution,
                             },
                             current.metadata.platform,
                             published.port_block,
@@ -11580,6 +11581,27 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                                     hint: "inspect the workspace image; cowshed could not read the marker".into(),
                                     path: Some(marker_path),
                                 }),
+                            }
+                            let install_root = expected_mount.clone();
+                            let install_workspace = workspace_name.clone();
+                            match crate::storage::lifecycle::dispatch_blocking(move || {
+                                node_modules_install_findings(&install_workspace, &install_root)
+                            })
+                            .await
+                            {
+                                Ok(Ok(install)) => findings.extend(install),
+                                Ok(Err(error)) => findings.push(native_finding(
+                                    "node-modules-install",
+                                    crate::api::dto::FindingSeverity::Error,
+                                    error,
+                                )),
+                                Err(error) => findings.push(native_finding(
+                                    "node-modules-install",
+                                    crate::api::dto::FindingSeverity::Error,
+                                    CowshedError::internal(format!(
+                                        "install receipt scan failed: {error}"
+                                    )),
+                                )),
                             }
                             match crate::git::GitRepository::from_root(&expected_mount)
                                 .inspect_merge_drivers()
@@ -17397,12 +17419,112 @@ fn missing_ca_companion_finding(
     }
 }
 
+/// Read the existing successful-install receipt; inspection never runs an installer.
+#[cfg(target_os = "macos")]
+fn node_modules_install_findings(
+    workspace: &WorkspaceName,
+    checkout: &Path,
+) -> Result<Vec<crate::api::dto::Finding>> {
+    #[derive(serde::Deserialize)]
+    struct Receipt {
+        lockfiles: std::collections::BTreeMap<String, crate::api::dto::Sha256Digest>,
+    }
+    let mut locks = std::collections::BTreeMap::new();
+    for name in ["bun.lock", "bun.lockb"] {
+        let path = checkout.join(name);
+        match std::fs::read(&path) {
+            Ok(bytes) => {
+                locks.insert(
+                    name.to_owned(),
+                    crate::api::dto::Sha256Digest::compute(&bytes),
+                );
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(CowshedError::integrity(
+                    format!("cannot read install lock {}: {error}", path.display()),
+                    "repair the workspace lockfile permissions",
+                ));
+            }
+        }
+    }
+    if locks.is_empty() {
+        return Ok(Vec::new());
+    }
+    let path = checkout.join("node_modules/.smoo-install");
+    let receipt = match std::fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice::<Receipt>(&bytes).ok(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(CowshedError::integrity(
+                format!("cannot read install receipt {}: {error}", path.display()),
+                "repair the workspace install receipt permissions",
+            ));
+        }
+    };
+    let (code, message) = match receipt {
+        Some(receipt) if receipt.lockfiles == locks => return Ok(Vec::new()),
+        Some(_) => (
+            "node-modules-lock-drift",
+            format!(
+                "workspace {workspace} node_modules was installed from different lockfile bytes"
+            ),
+        ),
+        None => (
+            "node-modules-install-missing",
+            format!("workspace {workspace} has no readable successful-install lock receipt"),
+        ),
+    };
+    Ok(vec![crate::api::dto::Finding {
+        code: code.into(),
+        severity: crate::api::dto::FindingSeverity::Warning,
+        message,
+        hint: "run tooling/direnv/setup-environment.ts in this checkout to install and record its lockfile; doctor never installs".into(),
+        path: Some(path),
+    }])
+}
+
 #[cfg(all(test, target_os = "macos"))]
 mod doctor_hint_tests {
     use super::*;
     use crate::git::{CowshedUpstream, MergeDriver, MergeDriverState};
     use crate::metadata::{MARKER_VERSION, WorkspaceIncarnation, WorkspaceMarker, WorkspaceRole};
     use std::path::PathBuf;
+    #[test]
+    fn install_receipt_reports_missing_drift_and_matching_lock_bytes_without_writes() {
+        let root =
+            std::env::temp_dir().join(format!("cowshed-install-receipt-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("node_modules")).unwrap();
+        let workspace = WorkspaceName::new("receipt").unwrap();
+        std::fs::write(root.join("bun.lock"), b"locked").unwrap();
+        assert_eq!(
+            node_modules_install_findings(&workspace, &root).unwrap()[0].code,
+            "node-modules-install-missing"
+        );
+        let path = root.join("node_modules/.smoo-install");
+        let receipt = serde_json::json!({
+            "inputs": "existing-installer-identity",
+            "lockfiles": { "bun.lock": crate::api::dto::Sha256Digest::compute(b"locked") },
+        });
+        let bytes = serde_json::to_vec(&receipt).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(
+            node_modules_install_findings(&workspace, &root)
+                .unwrap()
+                .is_empty()
+        );
+        std::fs::write(root.join("bun.lock"), b"changed").unwrap();
+        assert_eq!(
+            node_modules_install_findings(&workspace, &root).unwrap()[0].code,
+            "node-modules-lock-drift"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            bytes,
+            "doctor changes no receipt"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     fn marker(project_root: &str, workspace: &str) -> WorkspaceMarker {
         WorkspaceMarker {

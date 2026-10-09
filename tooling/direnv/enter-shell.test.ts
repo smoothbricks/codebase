@@ -7,6 +7,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readdirSync,
+  readFileSync,
   readlinkSync,
   realpathSync,
   rmSync,
@@ -121,6 +122,31 @@ it('the environment capture pass rebuilds nothing, the entry proper still does',
     const entry = enter({ DEVENV_SKIP_TASKS: '' });
     expect(entry.status, `${entry.stdout}${entry.stderr}`).not.toBe(0);
     expect(existsSync(attempts)).toBe(true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+it('direct devenv entry sources the existing workspace policy before project hooks', () => {
+  const module = readFileSync(join(import.meta.dir, 'devenv.smoo.nix'), 'utf8');
+  const prologue = module.match(/\(lib\.mkBefore ''\n([\s\S]*?) {6}export PATH=/)?.[1];
+  expect(prologue).toBeDefined();
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'smoo-direct-entry-')));
+  try {
+    mkdirSync(join(root, 'tooling/direnv'), { recursive: true });
+    mkdirSync(join(root, '.cowshed'));
+    writeFileSync(
+      join(root, '.cowshed/env'),
+      'if [ "${GITHUB_ACTIONS:-}" != true ]; then unset CI; fi\nexport RUSTC_WRAPPER=/store/pinned-sccache\n',
+    );
+    for (const marker of ['false', 'true']) {
+      const entered = spawnSync('/bin/sh', ['-c', `${prologue}` + 'printf \'%s\\n\' "${CI-unset}" "$RUSTC_WRAPPER"'], {
+        encoding: 'utf8',
+        env: { DEVENV_ROOT: join(root, 'tooling/direnv'), CI: 'true', GITHUB_ACTIONS: marker },
+      });
+      expect(entered.status, entered.stderr).toBe(0);
+      expect(entered.stdout).toBe(`${marker === 'true' ? 'true' : 'unset'}\n/store/pinned-sccache\n`);
+    }
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

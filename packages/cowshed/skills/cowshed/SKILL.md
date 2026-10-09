@@ -98,22 +98,30 @@ paths; `--ref <rev>` implies clean. Ignored dependencies and build state stay wa
 
 ## Keep builds shareable
 
-- Never point agents at a shared external build directory; `target/` is inside each image and warm. Never set
-  `CARGO_INCREMENTAL` (1 hard-fails the sccache wrapper; 0 makes every workspace crate a second unit) — not even for a
-  land check. Leave it unset: workspace crates stay incremental, dependencies use the shared host cache.
-- Two profiles only: `dev` (tests included) and `release`; let `test` inherit `dev`, no `[profile.test]` overrides.
-- Never compile in `env!("CARGO_MANIFEST_DIR")`, tests included: cargo does not fingerprint the path, so a cloned binary
-  baked with main's path silently reads main's files. Read `std::env::var_os("CARGO_MANIFEST_DIR")` at runtime.
-- One Nx state per checkout: host shells, sandboxed jobs and land checks of one checkout share its `.nx` cache, task
-  database and daemon (clones inherit it warm through the build volume). Never delete or redirect `.nx/workspace-data` /
-  `.nx/cache` to "clean" a shed — that splits the state and cold-starts everything.
-- Build volumes: a land's target adopts the landing shed's build volume including `.nx/cache`; `new`/`fork` reseed from
-  the source's live volume first, so a fork is warm only as of its source's last writes. Re-warm main after
-  lockfile/toolchain bumps via the land path, not by hand-copying caches.
-- sccache is a host daemon: jobs get `SCCACHE_DIR`/`SCCACHE_SERVER_UDS`/`RUSTC_WRAPPER` injected, and `setup` writes
-  sccache's config so env-less host clients use the shared store. Start it deliberately
-  (`cowshed sccache start --capacity <size>`); a self-spawned daemon silently gets the 10 GiB default. Check
-  `cowshed sccache status` (per-language hits) before debugging misses.
+- Never point agents at a shared external build directory. `target/` is inside each workspace image and already warm; an
+  external shared target restores contention and serializes builds on Cargo's per-target-directory lock.
+- Never set `CARGO_INCREMENTAL`, not even for a land check. Setting it to `1` hard-fails the sccache wrapper at Cargo's
+  version probe; setting it to `0` discards incremental compilation and makes every workspace crate a second unit. Leave
+  it unset: workspace crates stay incremental while their dependencies use the shared host cache.
+- Let `test` inherit `dev`: no `[profile.test]` overrides. `cargo test` then reuses the dependencies `cargo build`
+  compiled, and the `target/` a new workspace clones from main is warm for both.
+- Never compile `env!("CARGO_MANIFEST_DIR")` in, tests included. Cargo does not fingerprint the checkout path, so a
+  workspace runs the test binaries it cloned from main and a baked path reads main's files. Read it at run time with
+  `std::env::var_os("CARGO_MANIFEST_DIR")`, which cargo and nextest set for every test.
+- After a lockfile or toolchain bump, re-warm main's image with `cowshed exec main -- <canonical build>` so new clones
+  inherit the dependency graph.
+- Cargo's linker must be a bare PATH program or immutable store path, never checkout-relative. Use the pinned nightly's
+  checksum/content freshness consistently; switching modes invalidates units once.
+- Nx inside a workspace sandbox keeps its normal daemon and the checkout's own `.nx`: host shells, read-write and
+  read-only jobs share one task database, cache and daemon through the build volume. Read-only jobs keep source
+  read-only, not a second Nx state. The supervisor keeps the daemon in the sandbox and host shells connect to it.
+  `NX_MAX_CACHE_SIZE` defaults to configured build-volume capacity divided by ten; explicit overrides win. Repository
+  shells leave `NX_DAEMON` to Nx.
+- The compile cache is a host daemon. Start it deliberately with `cowshed sccache start --capacity <size>`; a client
+  that spawns its own daemon silently gets sccache's 10 GiB default cap. If hits are absent, run
+  `cowshed sccache status` first.
+- A successful managed Bun install records lockfile SHA-256 values in `node_modules/.smoo-install`. Doctor reports
+  missing receipts or lock drift and never installs dependencies.
 
 ## Output and failures
 

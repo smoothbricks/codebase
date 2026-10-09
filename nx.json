@@ -8,7 +8,7 @@
     "enabled": false
   },
   "namedInputs": {
-    "default": ["{projectRoot}/**/*", "sharedGlobals"],
+    "default": ["{projectRoot}/**/*"],
     "production": [
       "{projectRoot}/src/**/*",
       "{projectRoot}/package.json",
@@ -16,7 +16,6 @@
       "!{projectRoot}/**/*.test.*",
       "!{projectRoot}/**/*.spec.*"
     ],
-    "sharedGlobals": ["{workspaceRoot}/.github/workflows/ci.yml"],
     "externalRustCrates": [
       {
         "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh smoo-nx-cargo-hash"

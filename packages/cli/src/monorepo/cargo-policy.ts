@@ -63,6 +63,7 @@ interface CargoConfig {
     incremental?: boolean;
   };
   target?: Record<string, CargoConfigTarget>;
+  host?: CargoConfigTarget;
   env?: Record<string, string | CargoConfigEnvObject>;
   resolver?: {
     'feature-unification'?: string;
@@ -622,15 +623,19 @@ function configPolicy(loaded: LoadedConfig, repositoryRoot: string): number {
     );
   }
 
-  for (const [targetName, target] of Object.entries(config.target ?? {})) {
+  const linkers: Record<string, CargoConfigTarget> = Object.fromEntries(
+    Object.entries(config.target ?? {}).map(([name, target]) => [`target.${name}`, target]),
+  );
+  if (config.host !== undefined) linkers.host = config.host;
+  for (const [section, target] of Object.entries(linkers)) {
     if (
       target.linker !== undefined &&
-      isAbsolute(target.linker) &&
-      resolvedPathIsOutsideRoot(repositoryRoot, target.linker)
+      (target.linker.includes('/') || target.linker.includes('\\')) &&
+      !(isAbsolute(target.linker) && target.linker.startsWith('/nix/store/'))
     ) {
       failures += report(
         path,
-        `[target.${targetName}] linker is an absolute path outside the repository root (${target.linker}); SCCACHE_BASEDIR_CWD normalises only paths at or below the build's working directory. Fix it by using a repository-relative linker.`,
+        `[${section}] linker is checkout-resolved or mutable (${target.linker}); Cargo hashes it into every unit. Use a bare program on PATH or an immutable /nix/store path, never a repository-relative linker.`,
       );
     }
   }

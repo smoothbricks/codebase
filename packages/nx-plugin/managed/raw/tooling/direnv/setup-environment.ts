@@ -422,6 +422,8 @@ interface Installer {
 interface InstallStamp {
   /** sha256 over the installer's identity and the bytes of every input file. */
   readonly inputs: string;
+  /** The successful Bun install's lock bytes; doctor checks these without running Bun. */
+  readonly lockfiles?: Readonly<Record<string, string>>;
 }
 
 /**
@@ -433,9 +435,27 @@ interface InstallStamp {
 function bunInstallStamp(inputs: readonly string[]): { isCurrent(): boolean; record(): void } {
   const stampPath = path.join(projectRoot, 'node_modules', '.smoo-install');
   const identity = ['bun install', Bun.version, Bun.revision];
+  const lockDigests = (): Readonly<Record<string, string>> => {
+    const lockfiles: Record<string, string> = {};
+    for (const name of ['bun.lock', 'bun.lockb']) {
+      const bytes = readFileIfPresent(path.join(projectRoot, name));
+      if (bytes !== null) {
+        lockfiles[name] = new Bun.CryptoHasher('sha256').update(bytes).digest('hex');
+      }
+    }
+    return lockfiles;
+  };
   return {
-    isCurrent: () => readInstallStamp(stampPath)?.inputs === inputsDigest(identity, inputs),
-    record: () => writeInstallStamp(stampPath, { inputs: inputsDigest(identity, inputs) }),
+    isCurrent: () => {
+      const stamp = readInstallStamp(stampPath);
+      if (stamp?.inputs !== inputsDigest(identity, inputs) || stamp.lockfiles === undefined) return false;
+      const locks = lockDigests();
+      return (
+        Object.keys(stamp.lockfiles).length === Object.keys(locks).length &&
+        Object.entries(locks).every(([name, digest]) => stamp.lockfiles?.[name] === digest)
+      );
+    },
+    record: () => writeInstallStamp(stampPath, { inputs: inputsDigest(identity, inputs), lockfiles: lockDigests() }),
   };
 }
 
@@ -777,11 +797,20 @@ function readInstallStamp(file: string): InstallStamp | null {
   }
   // A torn or foreign stamp proves nothing was installed, which is what an
   // absent one says too: the installer runs and writes a fresh one.
-  const inputs = field(
-    parseOrUndefined(() => JSON.parse(bytes.toString('utf8'))),
-    'inputs',
-  );
-  return typeof inputs === 'string' ? { inputs } : null;
+  const parsed = parseOrUndefined(() => JSON.parse(bytes.toString('utf8')));
+  const inputs = field(parsed, 'inputs');
+  if (typeof inputs !== 'string') return null;
+  const recordedLocks = field(parsed, 'lockfiles');
+  if (typeof recordedLocks !== 'object' || recordedLocks === null || Array.isArray(recordedLocks)) {
+    return { inputs };
+  }
+  const lockfiles: Record<string, string> = {};
+  for (const name of Object.keys(recordedLocks)) {
+    const digest = field(recordedLocks, name);
+    if (typeof digest !== 'string' || !/^[0-9a-f]{64}$/.test(digest)) return { inputs };
+    lockfiles[name] = digest;
+  }
+  return { inputs, lockfiles };
 }
 
 function writeInstallStamp(file: string, stamp: InstallStamp): void {

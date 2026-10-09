@@ -2743,6 +2743,7 @@ impl WorkspaceSupervisor {
             crate::workspace_environment::EnvironmentMount::Served {
                 workspace_mount: &config.sandbox.workspace_mount,
                 temp_dir: &config.sandbox.exec_temp_dir,
+                capability_env: &config.sandbox.capabilities.contribution,
             },
             crate::metadata::Platform::Macos,
             Some(config.sandbox.port_block),
@@ -6598,6 +6599,11 @@ mod workspace_toolchain_tests {
         let mount = root.join("workspace");
         std::fs::create_dir_all(mount.join(".cowshed")).expect("private root");
         std::fs::write(mount.join(".cowshed/token"), "A".repeat(43)).expect("token");
+        std::fs::set_permissions(
+            mount.join(".cowshed/token"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o600),
+        )
+        .expect("private token permissions");
         std::fs::write(mount.join("Cargo.toml"), "").expect("cargo project");
         let sandbox = sandbox_at(&mount);
         std::fs::create_dir_all(&sandbox.home).expect("home");
@@ -6613,10 +6619,38 @@ mod workspace_toolchain_tests {
             configured
                 .configure_capabilities()
                 .expect("detect capabilities");
+            crate::workspace_credentials::publish_workspace_environment(
+                crate::workspace_environment::EnvironmentMount::Served {
+                    workspace_mount: &mount,
+                    temp_dir: &configured.exec_temp_dir,
+                    capability_env: &configured.capabilities.contribution,
+                },
+                crate::metadata::Platform::Macos,
+                Some(configured.port_block),
+            )
+            .expect("publish host environment");
             let environment = sandbox_environment(&configured, &caller)
                 .await
                 .expect("environment");
             let child = environment.child(&caller);
+            let mut host = std::process::Command::new("/bin/sh");
+            host.env_clear()
+                .args(["-c", ". \"$1\"; env", "host"])
+                .arg(mount.join(".cowshed/env"));
+            let output =
+                crate::fork_lock::Run::output_locked(&mut host).expect("source host environment");
+            assert!(output.status.success());
+            let text = String::from_utf8(output.stdout).unwrap();
+            for name in crate::capabilities::sccache::HOST_ENVIRONMENT {
+                let value = text
+                    .lines()
+                    .find_map(|line| line.strip_prefix(&format!("{name}=")));
+                assert_eq!(
+                    value.map(OsString::from),
+                    child.get(OsStr::new(name)).cloned(),
+                    "host and supervisor agree on {name}",
+                );
+            }
             let mut pooled = environment.base();
             pooled.extend(environment.overlay(&caller));
             assert_eq!(

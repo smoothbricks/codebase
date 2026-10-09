@@ -43,6 +43,7 @@ import {
   listCargoWorkspacePackages,
   NEXTEST_REPO_CONFIG_PATH,
   nextestToolConfigArg,
+  PLUGIN_NEXTEST_CONFIG_PATH,
   type SerialTestGroup,
   serialTestGroups,
 } from './cargo-workspace.js';
@@ -2668,7 +2669,7 @@ async function cargoTestRunnerInputs(
       ...workspace.packages.map((member) => posix.join(inputRoot, member.package.dir, 'Cargo.toml')),
       posix.join(inputRoot, NEXTEST_REPO_CONFIG_PATH),
     ]),
-    fileHashInput(PLUGIN_NEXTEST_CONFIG),
+    fileHashInput(PLUGIN_NEXTEST_CONFIG_PATH),
   ];
 }
 

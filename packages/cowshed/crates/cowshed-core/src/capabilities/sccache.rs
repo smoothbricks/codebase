@@ -6,6 +6,15 @@ use crate::{CowshedError, Result};
 use cowshed_gateway_types::STORE_ROOT;
 use std::path::{Path, PathBuf};
 
+/// Host shells source the same detector-owned client settings as supervisor children.
+pub const HOST_ENVIRONMENT: [&str; 5] = [
+    "RUSTC_WRAPPER",
+    "SCCACHE_BASEDIR_CWD",
+    "SCCACHE_BASEDIR",
+    "SCCACHE_SERVER_UDS",
+    "SCCACHE_DIR",
+];
+
 pub const DETECTOR: Detector = Detector {
     id: CapabilityId::Sccache,
     marker_kind: super::MarkerKind::File,
@@ -117,6 +126,10 @@ fn contribute(context: &DetectionContext<'_>) -> Result<CapabilityContribution> 
             .env
             .insert("SCCACHE_BASEDIR_CWD", EnvAction::Unset);
         contribution.env.insert("SCCACHE_BASEDIR", EnvAction::Unset);
+        contribution
+            .env
+            .insert("SCCACHE_SERVER_UDS", EnvAction::Unset);
+        contribution.env.insert("SCCACHE_DIR", EnvAction::Unset);
     }
     Ok(contribution)
 }

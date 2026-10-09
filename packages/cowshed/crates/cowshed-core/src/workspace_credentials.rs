@@ -667,6 +667,7 @@ mod tests {
             EnvironmentMount::Served {
                 workspace_mount: &image_mount,
                 temp_dir: &temp_dir,
+                capability_env: &crate::capabilities::CapabilityContribution::default(),
             },
             crate::metadata::Platform::Macos,
             Some(port_block),
