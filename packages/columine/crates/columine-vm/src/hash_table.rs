@@ -496,12 +496,13 @@ impl FlatTable {
     /// Reserves first for every range the erase's capture can name: the key
     /// and entry lanes here, plus a caller's timestamp lane over the same
     /// runs and its size, change-flag and two TTL ranges. Memory that cannot
-    /// back them refuses with `OutOfMemory` before any write.
+    /// back them refuses with `OutOfMemory` before any write. Answers the
+    /// reserved capacity, which the caller's appends must not outgrow.
     pub fn erase_ranges(
         &self,
         plan: &ErasePlan,
         ranges: &mut Vec<(u32, u32)>,
-    ) -> Result<(), ErrorCode> {
+    ) -> Result<usize, ErrorCode> {
         let runs = plan.shifts.len() + 1;
         ranges
             .try_reserve(3 * runs + ERASE_CALLER_RANGES)
@@ -515,7 +516,7 @@ impl FlatTable {
                 ));
             }
         });
-        Ok(())
+        Ok(ranges.capacity())
     }
 
     /// Apply a retained erase, moving a caller's side lane with each entry.

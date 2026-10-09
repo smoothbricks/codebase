@@ -144,12 +144,13 @@ pub fn batch_set_remove(
             };
 
             ranges.clear();
-            if let Err(error) = tbl
+            let reserved = match tbl
                 .plan_erase_at(state, pos, plan)
                 .and_then(|()| tbl.erase_ranges(plan, ranges))
             {
-                return error;
-            }
+                Ok(reserved) => reserved,
+                Err(error) => return error,
+            };
             ranges.push((tbl.size_off, 4));
             ranges.push((meta.meta_base + SlotMetaOffset::CHANGE_FLAGS, 1));
             let ttl_plan = if meta.has_ttl() {
@@ -167,6 +168,11 @@ pub fn batch_set_remove(
             if let Some(plan) = &ttl_plan {
                 ranges.extend_from_slice(plan.ranges());
             }
+            debug_assert_eq!(
+                ranges.capacity(),
+                reserved,
+                "erase capture ranges grew past their reservation"
+            );
             let capture = match hooks.begin_capture(state, ranges) {
                 Ok(capture) => capture,
                 Err(error) => return error,

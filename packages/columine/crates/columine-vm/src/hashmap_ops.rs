@@ -304,12 +304,13 @@ pub fn batch_map_remove(
             };
 
             ranges.clear();
-            if let Err(error) = tbl
+            let reserved = match tbl
                 .plan_erase_at(state, pos, plan)
                 .and_then(|()| tbl.erase_ranges(plan, ranges))
             {
-                return error;
-            }
+                Ok(reserved) => reserved,
+                Err(error) => return error,
+            };
             if has_ts {
                 plan.for_each_destination_run(|start, len| {
                     ranges.push((cmp_lane_off(meta) + start * 8, len * 8));
@@ -332,6 +333,11 @@ pub fn batch_map_remove(
             if let Some(plan) = &ttl_plan {
                 ranges.extend_from_slice(plan.ranges());
             }
+            debug_assert_eq!(
+                ranges.capacity(),
+                reserved,
+                "erase capture ranges grew past their reservation"
+            );
             let capture = match hooks.begin_capture(state, ranges) {
                 Ok(capture) => capture,
                 Err(error) => return error,

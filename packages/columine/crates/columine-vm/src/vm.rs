@@ -260,12 +260,17 @@ fn remove_entry_by_key(
                 return Ok(false);
             };
             table.plan_erase_at(state, position, &mut erase)?;
-            table.erase_ranges(&erase, &mut ranges)?;
+            let reserved = table.erase_ranges(&erase, &mut ranges)?;
             if meta.has_hashmap_timestamp_storage() {
                 erase.for_each_destination_run(|start, len| {
                     ranges.push((hashmap_ops::cmp_lane_off(meta) + start * 8, len * 8));
                 });
             }
+            debug_assert_eq!(
+                ranges.capacity(),
+                reserved,
+                "erase capture ranges grew past their reservation"
+            );
             let capture = undo.begin_capture(state, &ranges)?;
             if meta.slot_type() == SlotType::HashMap {
                 hashmap_ops::erase_slot_map_planned(state, meta, &table, &erase);
