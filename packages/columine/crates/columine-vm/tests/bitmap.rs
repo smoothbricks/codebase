@@ -2684,6 +2684,11 @@ fn ttl_algebra_program(source_ttl: bool) -> Vec<u8> {
 }
 
 fn ttl_algebra_program_flags(source_ttl: bool, target_flags: u8) -> Vec<u8> {
+    ttl_algebra_program_reducing(source_ttl, target_flags, &[])
+}
+
+/// The two-slot TTL algebra program with `reduce` as its reduce section.
+fn ttl_algebra_program_reducing(source_ttl: bool, target_flags: u8, reduce: &[u8]) -> Vec<u8> {
     let mut init = Vec::new();
     for slot in 0..2u8 {
         let has_ttl = slot == 0 || source_ttl;
@@ -2707,7 +2712,7 @@ fn ttl_algebra_program_flags(source_ttl: bool, target_flags: u8) -> Vec<u8> {
             init.extend([1, 0]);
         }
     }
-    program(2, 2, &init, &[])
+    program(2, 2, &init, reduce)
 }
 
 /// Checkpoint setup uses actual bitmosaic owned-byte primitives and the given
@@ -2856,6 +2861,36 @@ fn timestamp_only_algebra_overflow_preserves_the_real_accepted_prefix_and_redo()
             "delta={delta}: complete valid-prefix rollback"
         );
     }
+
+    // A batch AND of a large TTL target with a small source drops most
+    // target members, and its expiry plan takes one mutation per member it
+    // drops. The batch reserves that plan before its first write, so the
+    // plan fits the reservation; debug builds assert it.
+    let and = ttl_algebra_program_reducing(true, TTL_FLAG, &[Opcode::BatchBitmapAnd as u8, 0, 1]);
+    let mut state = init_program_state(&and);
+    let mut vm = Vm::default();
+    let target: Vec<u32> = (1..=40).collect();
+    let rows: Vec<(u32, u64)> = target
+        .iter()
+        .map(|&key| (key, f64::from(key).to_bits()))
+        .collect();
+    seed_bitmap_checkpoint(&mut vm, &mut state, 0, &target, &rows);
+    seed_bitmap_checkpoint(
+        &mut vm,
+        &mut state,
+        1,
+        &[1, 2],
+        &[(1, 50.0f64.to_bits()), (2, 60.0f64.to_bits())],
+    );
+    assert_eq!(
+        vm.execute_batch(&mut state, &and, &[], 1),
+        ErrorCode::Ok as u32
+    );
+    let target_meta = SlotMetaView::read(&state, 0);
+    assert_eq!(
+        members(&state, get_bitmap_storage(&target_meta)),
+        vec![1, 2]
+    );
 }
 
 #[test]
