@@ -623,6 +623,13 @@ diff --git a/dist/src/daemon/server/shutdown-utils.js b/dist/src/daemon/server/s
 index a449f2f..ecb6886 100644
 --- a/dist/src/daemon/server/shutdown-utils.js
 +++ b/dist/src/daemon/server/shutdown-utils.js
+@@ -27,5 +27,5 @@ const promises_1 = require("fs/promises");
+ const tmp_dir_1 = require("../tmp-dir");
+-exports.SERVER_INACTIVITY_TIMEOUT_MS = 10800000; // 10800000 ms = 3 hours
++exports.SERVER_INACTIVITY_TIMEOUT_MS = 300000; // 300000 ms = 5 minutes
+ async function startNewDaemonInBackground() {
+     (0, node_fs_1.mkdirSync)(tmp_dir_1.DAEMON_DIR_FOR_CURRENT_WORKSPACE, { recursive: true });
+     if (!(0, node_fs_1.existsSync)(tmp_dir_1.DAEMON_OUTPUT_LOG_FILE)) {
 @@ -85,15 +85,31 @@ async function handleServerProcessTerminationWithRestart({ server, reason, socke
      await startNewDaemonInBackground();
      await performShutdown(server, reason, sockets);
