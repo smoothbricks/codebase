@@ -379,6 +379,18 @@ Untracked files are preserved by path, mode and bytes; a nested repository is ne
 `mv` is a rename, not a fresh fork or mint. It preserves the source branch, remotes, uncommitted work and git-worktree
 registration through its clone-then-retire composition.
 
+The existing on-disk `fork` intent has an optional `rename` discriminator. Absent or false retains historical raw-fork
+recovery; true owns the complete rename transaction: raw clone, linked-registration/index handoff when applicable, and
+source retirement. It is never a public fork alias or a fresh mint. The intent is durable before any mutation. The
+source's supervisor admission and ownership fences remain enforced without force; dirty state alone does not refuse a
+rename because the destination preserves it. In-progress Git operations still refuse.
+
+A rename preserves the source branch, staged-only index state, working-tree edits, untracked files and ignored warm
+state. Linked registration handoff is resumable before and after its durable publication, never an index reset. Neither
+source nor destination may start new work while the rename is unfinished, and the destination is not served before
+ownership transfer and source retirement complete. Recovery resumes the exact journaled source/destination pair rather
+than creating another incarnation or discarding staged state.
+
 Moving an adopted checkout is always cowshed-mediated (`mv <ws> <new-path>`): the image is detached, published at the
 new path, and reattached — no unmount-and-remount gap at the user's path, no relink to maintain.
 
