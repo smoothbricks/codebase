@@ -3179,6 +3179,14 @@ impl Vm {
         {
             return INVALID_PROGRAM;
         }
+        // The declaration check's storage is backed first, so it reports a
+        // mismatch, never a failed allocation.
+        if usize::try_from(sections.header.num_slots)
+            .ok()
+            .is_none_or(|slots| self.declared_slots.try_reserve(slots).is_err())
+        {
+            return OUT_OF_MEMORY;
+        }
         if !state_init::program_matches_state(
             sections.init_code,
             sections.header.num_slots,
@@ -3192,6 +3200,9 @@ impl Vm {
             let admission =
                 vm.capacity
                     .admit(state, sections.reduce_code, cols, batch_len, &vm.bitmap_env);
+            if admission == Admission::OutOfMemory {
+                return OUT_OF_MEMORY;
+            }
             if admission == Admission::Fits {
                 let demand = vm.capacity.scratch;
                 if let Err(error) = vm.reserve_scratch(&demand) {

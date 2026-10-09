@@ -752,6 +752,35 @@ fn nested_initial_containers_are_admitted_against_the_spent_arena() {
             other => panic!("trial batch refused with {other}"),
         }
     }
+    // A VM that has never run a batch cannot back its declaration check,
+    // and one that has only admitted a one-row batch cannot back admission's
+    // per-row storage for 160 rows, while every allocation fails: both are
+    // refused by name with nothing written, never aborted.
+    let mut fresh = Vm::default();
+    let before = state.clone();
+    assert_eq!(
+        ErrorCode::OutOfMemory as u32,
+        without_memory(|| fresh.execute_batch(&mut state, &prog, &cols, 160))
+    );
+    assert_eq!(before, state, "a refused batch writes nothing");
+    let mut one_row_state = state.clone();
+    run_growing(
+        &mut fresh,
+        &mut one_row_state,
+        &prog,
+        &[
+            u32s_as_bytes(&[3u32]),
+            u32s_as_bytes(&[5u32]),
+            u32s_as_bytes(&types),
+        ],
+        1,
+    );
+    assert_eq!(
+        ErrorCode::OutOfMemory as u32,
+        without_memory(|| fresh.execute_batch(&mut state, &prog, &cols, 160))
+    );
+    assert_eq!(before, state, "admission refuses before any write");
+
     // Warm a fresh VM on a copy: 160 rows of new outer keys, so admission
     // and plain nested plans have run at this batch size, and only tiny
     // inner tables have rehashed.

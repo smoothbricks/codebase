@@ -63,6 +63,9 @@ pub(crate) enum Admission {
     Fits,
     /// Only a dry run can decide.
     DryRun,
+    /// Admission's own working memory could not be backed; the batch is
+    /// refused before any write.
+    OutOfMemory,
 }
 
 /// Retained admission storage: no allocation after its high-water mark.
@@ -79,6 +82,8 @@ pub(crate) struct CapacityScratch {
     /// The working memory the last batch admitted by tiers 1 and 2 needs;
     /// a dry run grows scratch itself.
     pub(crate) scratch: ScratchDemand,
+    /// Set when admission could not back its own storage.
+    out_of_memory: bool,
 }
 
 /// One slot's demand. `units` are new keys, members or entries; `touches`
@@ -454,8 +459,22 @@ impl CapacityScratch {
         batch_len: u32,
         env: &BitmapEnv,
     ) -> Admission {
-        self.admit_inner(state, code, cols, batch_len, env)
-            .unwrap_or(Admission::DryRun)
+        self.out_of_memory = false;
+        match self.admit_inner(state, code, cols, batch_len, env) {
+            Some(admission) => admission,
+            None if self.out_of_memory => Admission::OutOfMemory,
+            None => Admission::DryRun,
+        }
+    }
+
+    /// Back `additional` more elements of `buf`; a failure is remembered so
+    /// the batch is refused as out of memory, not left to a dry run.
+    fn room<T>(out_of_memory: &mut bool, buf: &mut Vec<T>, additional: usize) -> Option<()> {
+        if buf.try_reserve(additional).is_err() {
+            *out_of_memory = true;
+            return None;
+        }
+        Some(())
     }
 
     fn admit_inner(
@@ -471,10 +490,21 @@ impl CapacityScratch {
             self.demand[usize::try_from(slot).ok()?] = Demand::default();
         }
         self.touched.clear();
-        if self.demand.len() < usize::try_from(slots).ok()? {
-            self.demand
-                .resize(usize::try_from(slots).ok()?, Demand::default());
+        let slot_count = usize::try_from(slots).ok()?;
+        if self.demand.len() < slot_count {
+            let have = self.demand.len();
+            Self::room(&mut self.out_of_memory, &mut self.demand, slot_count - have)?;
+            self.demand.resize(slot_count, Demand::default());
         }
+        // Every slot is touched at most once, and one instruction has fewer
+        // operands than the program has bytes.
+        Self::room(&mut self.out_of_memory, &mut self.touched, slot_count)?;
+        let operands_len = self.operands.len();
+        Self::room(
+            &mut self.out_of_memory,
+            &mut self.operands,
+            code.len().saturating_sub(operands_len),
+        )?;
 
         // Tier 1: the row-count bound, in program order.
         let mut operands = core::mem::take(&mut self.operands);
@@ -571,6 +601,7 @@ impl CapacityScratch {
         let mut operands = core::mem::take(&mut self.operands);
         let mut pairs = core::mem::take(&mut self.pairs);
         pairs.clear();
+        let mut out_of_memory = false;
         let mut nested_type = None;
         let walked = walk(code, Domain::TOP, &mut operands, &mut |op, o, domain| {
             let mut ok = Some(());
@@ -655,6 +686,7 @@ impl CapacityScratch {
                             } else {
                                 cell(cols, inner_col, row)?
                             };
+                            Self::room(&mut out_of_memory, &mut pairs, 1)?;
                             pairs.push((outer, key));
                             Some(())
                         })
@@ -676,6 +708,10 @@ impl CapacityScratch {
             _ => None,
         };
         self.pairs = pairs;
+        if out_of_memory {
+            self.out_of_memory = true;
+            return None;
+        }
         walked?;
         if nested_type.is_some() {
             match nested {
