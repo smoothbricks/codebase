@@ -1953,7 +1953,10 @@ mod tests {
         handle.retire().await.unwrap();
         drop(handle);
         assert_eq!(
-            store().sealed(job_id).and_then(|sealed| sealed.resources),
+            store()
+                .sealed(job_id)
+                .unwrap()
+                .and_then(|sealed| sealed.resources),
             Some(terminal),
             "the stored record decodes to the terminal sample, its volumes and accounting with it"
         );

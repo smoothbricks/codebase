@@ -672,11 +672,11 @@ impl CowshedError {
             ),
             AdmissionRefusal::Unprovable { set_aside } => Self::conflict(
                 format!(
-                    "the admission key may have admitted a job recorded in the job store set \
+                    "the requested job or admission key may be recorded in the job history set \
                      aside at {}, which this cowshed cannot read",
                     set_aside.display()
                 ),
-                "exec under the key in a new workspace incarnation, or without a key",
+                "retain the original job binding and inspect the unread history; absence and safe re-execution are not proven",
             ),
         };
         Self {
