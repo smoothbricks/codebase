@@ -314,7 +314,11 @@ export enum ErrorCode {
   DELTA_LANE_MISMATCH = 13,
   /** Beginning a window refused because another speculation window is still active. */
   SPECULATION_ACTIVE = 14,
-  /** Working memory the operation needs could not be allocated; the operation refused before any write. */
+  /**
+   * Working memory the operation needs could not be allocated. The operation that met it wrote nothing; earlier
+   * operations of the same batch may have applied, so, as with JOURNAL_OVERFLOW, the image holds an exact accepted
+   * prefix. An undo window rolls it back; without one the host restores the image before running the batch again.
+   */
   OUT_OF_MEMORY = 15,
 }
 

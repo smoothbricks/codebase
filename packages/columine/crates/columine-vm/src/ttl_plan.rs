@@ -72,7 +72,7 @@ fn back<T>(buf: &mut Vec<T>, total: usize) -> Result<(), ErrorCode> {
 impl TtlBatchScratch {
     /// Back every buffer a plan of `size` originals and `count` mutations
     /// can fill, before any of them is written, so planning never allocates
-    /// and memory that cannot back it refuses before any state write. Each
+    /// and memory that cannot back it refuses before this plan's write. Each
     /// buffer grows to the largest plan it has served and is kept.
     fn reserve(&mut self, size: usize, count: usize) -> Result<(), ErrorCode> {
         // Every original and every upsert can be a node, a live entry, and a

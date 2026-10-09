@@ -456,7 +456,7 @@ impl FlatTable {
     /// Derive the exact erase once, retaining keys and source/destination cells
     /// before any bytes change. `plan` is reusable across a whole batch and
     /// grows to the longest cluster it has planned; memory that cannot back
-    /// a shift refuses with `OutOfMemory` before any write.
+    /// a shift refuses with `OutOfMemory` before this erase writes.
     pub fn plan_erase_at(
         &self,
         state: &[u8],
@@ -496,7 +496,7 @@ impl FlatTable {
     /// Reserves first for every range the erase's capture can name: the key
     /// and entry lanes here, plus a caller's timestamp lane over the same
     /// runs and its size, change-flag and two TTL ranges. Memory that cannot
-    /// back them refuses with `OutOfMemory` before any write. Answers the
+    /// back them refuses with `OutOfMemory` before this erase writes. Answers the
     /// reserved capacity, which the caller's appends must not outgrow.
     pub fn erase_ranges(
         &self,

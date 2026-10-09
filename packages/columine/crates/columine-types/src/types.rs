@@ -876,8 +876,12 @@ pub enum ErrorCode {
     DeltaLaneMismatch = 13,
     /// A new speculation window cannot replace an active window's checkpoints.
     SpeculationActive = 14,
-    /// Working memory the operation needs could not be allocated; the operation
-    /// refused before any write.
+    /// Working memory the operation needs could not be allocated. The
+    /// operation that met it wrote nothing; earlier operations of the same
+    /// batch may have applied, so, as with `JournalOverflow`, the image holds
+    /// an exact accepted prefix. An undo window rolls it back; without one
+    /// the host restores the image before running the batch again. Not a
+    /// request to grow: growing the state cannot supply working memory.
     OutOfMemory = 15,
 }
 
