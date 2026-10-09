@@ -625,8 +625,9 @@ function framed(own: readonly Step[], other: readonly Step[]): number {
 }
 
 /**
- * For each case, the earlier case in the file it most nearly repeats, among the pairs `judged` admits (a diff-scoped
- * caller admits a pair when either case changed; the choice of nearest partner is made only among those).
+ * For each case, the earlier case it most nearly repeats among the pairs `judged` admits (a diff-scoped caller admits
+ * a pair when either case changed; partners are chosen only among those). The nearest refusing partner and the nearest
+ * advisory partner are reported separately, so an advisory pair can never hide a refusing one.
  */
 export function duplicateScenarios(
   file: string,
@@ -635,14 +636,17 @@ export function duplicateScenarios(
 ): DuplicateScenario[] {
   const found: DuplicateScenario[] = [];
   cases.forEach((second, later) => {
-    let best: DuplicateScenario | undefined;
+    const best: Partial<Record<'refusing' | 'advisory', DuplicateScenario>> = {};
     for (const first of cases.slice(0, later)) {
       if (!judged(first, second)) continue;
       const match = duplication(first, second);
-      if (match !== undefined && (best === undefined || match.shared > best.shared))
-        best = { file, first, second, ...match };
+      if (match === undefined) continue;
+      const slot = REFUSES[match.kind] ? 'refusing' : 'advisory';
+      const held = best[slot];
+      if (held === undefined || match.shared > held.shared) best[slot] = { file, first, second, ...match };
     }
-    if (best !== undefined) found.push(best);
+    if (best.refusing !== undefined) found.push(best.refusing);
+    if (best.advisory !== undefined) found.push(best.advisory);
   });
   return found;
 }
