@@ -2831,8 +2831,11 @@ fn exec_scalar_latest(
             let Some(vals) = col_u32_exact(val_col, batch_len) else {
                 return ErrorCode::ColumnUnderrun;
             };
+            // A scalar cell stores a value: every u32, 0xffffffff included, is
+            // stored on a matching row. A reader decodes wrapped absence from
+            // the field's declared wrapper, not the kernel.
             for i in 0..batch_len as usize {
-                if matches(i) && cmp_vals[i] > latest && vals[i] != EMPTY_KEY {
+                if matches(i) && cmp_vals[i] > latest {
                     latest = cmp_vals[i];
                     selected = Some(u64::from(vals[i]));
                 }

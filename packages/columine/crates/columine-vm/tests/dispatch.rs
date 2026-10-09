@@ -2863,6 +2863,35 @@ fn scalar_u32_latest_rollback_preserves_upper_word_and_timestamp() {
     assert_full_image_roundtrip(&mut vm, &before, &after, cp);
 }
 
+/// A U32 scalar latest stores 0xffffffff from a matching row like any other
+/// value; a non-matching row with a newer timestamp selects nothing.
+#[test]
+fn scalar_u32_latest_stores_all_ones_on_a_matching_row_only() {
+    const T: u32 = 3202;
+    let init_code = slot_def(0, SlotType::Scalar as u8, AggType::ScalarU32 as u8, 0);
+    let body = [Opcode::BatchScalarLatest as u8, 0, 1, 2];
+    let mut reduce = vec![0xE0, 0, 1];
+    reduce.extend(T.to_le_bytes());
+    reduce.extend((body.len() as u16).to_le_bytes());
+    reduce.extend_from_slice(&body);
+    let prog = program(1, 3, &init_code, &reduce);
+    let mut state = init(&prog);
+    let mut vm = Vm::default();
+    let data = slot_offset(&state, 0);
+
+    let types = [T, T, T + 1];
+    let values = [7u32, u32::MAX, 9];
+    let stamps = [10.0f64, 20.0, 30.0];
+    let cols: Vec<&[u8]> = vec![
+        u32s_as_bytes(&types),
+        u32s_as_bytes(&values),
+        f64s_as_bytes(&stamps),
+    ];
+    assert_eq!(OK, vm.execute_batch(&mut state, &prog, &cols, 3));
+    assert_eq!(u32::MAX, bytes::read_u32(&state, data));
+    assert_eq!(20.0, bytes::read_f64(&state, data + 8));
+}
+
 /// A row whose field bit is clear but whose payload stays allocated and nonzero
 /// is physical state. The upsert that re-sets the field and its rollback leave
 /// every byte of the image exact, the stale payload included.
