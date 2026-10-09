@@ -2891,6 +2891,47 @@ fn timestamp_only_algebra_overflow_preserves_the_real_accepted_prefix_and_redo()
         members(&state, get_bitmap_storage(&target_meta)),
         vec![1, 2]
     );
+
+    let column =
+        |values: &[u32]| -> Vec<u8> { values.iter().flat_map(|v| v.to_le_bytes()).collect() };
+
+    // A batch's working memory follows what its own earlier operations do.
+    // Inserting new keys into TTL bitmap 0 grows its expiry index before the
+    // same batch ORs bitmap 1 into it: the merge reads the grown index, and
+    // the batch reserved for it, so the merge fits (debug builds assert it).
+    let insert_then_or = ttl_algebra_program_reducing(
+        true,
+        TTL_FLAG,
+        &[
+            Opcode::BatchSetInsertTtl as u8,
+            0,
+            0,
+            1,
+            Opcode::BatchBitmapOr as u8,
+            0,
+            1,
+        ],
+    );
+    let mut state = init_program_state(&insert_then_or);
+    let mut vm = Vm::default();
+    seed_bitmap_checkpoint(&mut vm, &mut state, 0, &[1], &[(1, 1.0f64.to_bits())]);
+    seed_bitmap_checkpoint(&mut vm, &mut state, 1, &[2], &[(2, 2.0f64.to_bits())]);
+    // Few enough that the patched image provably fits the 64-member slot's
+    // payload, so tiers 1 and 2 admit the batch with no dry run.
+    let fresh: Vec<u32> = (100..106).collect();
+    let stamps: Vec<u8> = fresh.iter().flat_map(|_| 5.0f64.to_le_bytes()).collect();
+    let mut vm = Vm::default();
+    assert_eq!(
+        vm.execute_batch(&mut state, &insert_then_or, &[&column(&fresh), &stamps], 6),
+        ErrorCode::Ok as u32
+    );
+    let target_meta = SlotMetaView::read(&state, 0);
+    assert_eq!(members(&state, get_bitmap_storage(&target_meta)).len(), 8);
+    assert_eq!(
+        vm.capacity_counts().dry_run_fit,
+        0,
+        "admitted without a dry run"
+    );
 }
 
 #[test]

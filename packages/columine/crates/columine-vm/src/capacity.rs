@@ -545,9 +545,15 @@ impl CapacityScratch {
                     crate::bitmap_ops::patch_demand(state, &meta, d.units, d.touches).ok()?;
                 if meta.has_ttl() && (d.algebra_units != 0 || d.algebra_touches != 0) {
                     patch.ttl = crate::bitmap_ttl::TtlAlgebraDemand {
-                        target_rows: expiry_rows(state, slot),
+                        target_rows: expiry_rows(state, slot, d.units),
                         source_rows: (0..slots)
-                            .map(|source| expiry_rows(state, source))
+                            .map(|source| {
+                                let units = usize::try_from(source)
+                                    .ok()
+                                    .and_then(|index| self.demand.get(index))
+                                    .map_or(0, |demand| demand.units);
+                                expiry_rows(state, source, units)
+                            })
                             .max()
                             .unwrap_or(0),
                     };
@@ -766,11 +772,18 @@ fn scratch_members(env: &BitmapEnv) -> Option<u64> {
     BitmosaicView::open(image).map(|view| view.len())
 }
 
-/// Live expiry rows of a TTL bitmap slot; zero for any other slot.
-fn expiry_rows(state: &[u8], slot: u32) -> usize {
+/// The most live expiry rows a TTL bitmap slot can hold during a batch that
+/// adds at most `units` new members to it: one row per new member, up to
+/// the index's capacity. Zero for any other slot.
+fn expiry_rows(state: &[u8], slot: u32, units: u64) -> usize {
     slot_meta(state, slot)
         .filter(|meta| meta.slot_type() == SlotType::Bitmap && meta.has_ttl())
-        .and_then(|meta| usize::try_from(meta.eviction_index_size(state)).ok())
+        .map(|meta| {
+            u64::from(meta.eviction_index_size(state))
+                .saturating_add(units)
+                .min(u64::from(meta.eviction_index_capacity(state)))
+        })
+        .and_then(|rows| usize::try_from(rows).ok())
         .unwrap_or(0)
 }
 
