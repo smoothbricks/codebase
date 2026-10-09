@@ -1556,6 +1556,14 @@ impl GitRepository {
                 "retry from a resolved repository root",
             ));
         }
+        // Before any branch is judged: an inherited registration may hold `cowshed/<name>`.
+        timed_async(
+            "new",
+            "worktrees",
+            self.strip_inherited_worktree_registrations(),
+        )
+        .await?;
+
         let retry = format!("remove or rename cowshed/{name}, then retry: cowshed new {name}");
         let (branch, branch_ready) = self
             .workspace_branch_for_initialization(name, "the cloned workspace", retry, resuming)
@@ -1586,6 +1594,17 @@ impl GitRepository {
         })
         .await?;
         Ok(main_remote)
+    }
+
+    /// Drop the linked-worktree registrations this standalone clone inherited from main, before any
+    /// branch is judged against them (02_workspaces.md, `cowshed new`, step 6).
+    async fn strip_inherited_worktree_registrations(&self) -> Result<()> {
+        let root = self.root.clone();
+        tokio::task::spawn_blocking(move || strip_inherited_registrations(&root))
+            .await
+            .map_err(|error| {
+                CowshedError::internal(format!("stripping inherited worktrees panicked: {error}"))
+            })?
     }
 
     /// Re-resolve this tree's symlinks that point outside it, against the tree they came from.
@@ -2836,6 +2855,87 @@ pub fn is_hidden_path(path: &[u8]) -> bool {
         .any(|component| component.first() == Some(&b'.'))
 }
 
+/// Remove the linked-worktree registrations a standalone clone inherited from its source
+/// (02_workspaces.md, `cowshed new`, step 6). Each `.git/worktrees/<id>` directory describes a
+/// worktree of the source repository, so removing that whole directory is the unregistration and
+/// nothing else. Every entry is judged before the first removal, so a refusal leaves the clone as
+/// it was. An absent `worktrees` directory is success, which keeps a resumed mint idempotent.
+fn strip_inherited_registrations(root: &Path) -> Result<()> {
+    fn inspect(path: &Path) -> Result<fs::Metadata> {
+        fs::symlink_metadata(path).map_err(|error| {
+            CowshedError::integrity(
+                format!("cannot inspect {}: {error}", path.display()),
+                "repair the cloned workspace before retrying",
+            )
+        })
+    }
+    let git = root.join(".git");
+    if !inspect(&git)?.file_type().is_dir() {
+        return Err(CowshedError::integrity(
+            format!("cloned .git is not a real directory: {}", git.display()),
+            "repair the cloned workspace before retrying; the source repository is untouched",
+        ));
+    }
+    let worktrees = git.join("worktrees");
+    let metadata = match fs::symlink_metadata(&worktrees) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(CowshedError::integrity(
+                format!("cannot inspect {}: {error}", worktrees.display()),
+                "repair the cloned workspace before retrying",
+            ));
+        }
+    };
+    if !metadata.file_type().is_dir() {
+        return Err(CowshedError::integrity(
+            format!(
+                "cloned worktree registry is not a real directory: {}",
+                worktrees.display()
+            ),
+            "repair the cloned workspace before retrying; cowshed will not follow or delete it",
+        ));
+    }
+    let listing = fs::read_dir(&worktrees).map_err(|error| {
+        CowshedError::integrity(
+            format!("cannot list {}: {error}", worktrees.display()),
+            "repair the cloned workspace before retrying",
+        )
+    })?;
+    let mut admins = Vec::new();
+    for entry in listing {
+        let entry = entry.map_err(|error| {
+            CowshedError::integrity(
+                format!("cannot list {}: {error}", worktrees.display()),
+                "repair the cloned workspace before retrying",
+            )
+        })?;
+        let admin = entry.path();
+        if !inspect(&admin)?.file_type().is_dir() {
+            return Err(CowshedError::integrity(
+                format!(
+                    "cloned worktree registration is not a real directory: {}",
+                    admin.display()
+                ),
+                "remove or repair that entry by hand; cowshed will not delete it",
+            ));
+        }
+        admins.push(admin);
+    }
+    for admin in admins {
+        fs::remove_dir_all(&admin).map_err(|error| {
+            CowshedError::integrity(
+                format!(
+                    "cannot remove inherited worktree registration {}: {error}",
+                    admin.display()
+                ),
+                "retry the workspace; removal is idempotent and the source repository is untouched",
+            )
+        })?;
+    }
+    Ok(())
+}
+
 fn git_internal(operation: &str, output: &Output) -> CowshedError {
     CowshedError::internal(git_message(operation, output))
 }
@@ -3578,10 +3678,10 @@ mod tests {
 
     #[tokio::test]
     async fn prepares_standalone_workspace_branch_and_only_the_local_main_remote() {
-        let root = repository();
+        let main = repository();
         let status = Command::new("git")
             .arg("-C")
-            .arg(&root)
+            .arg(&main)
             .args([
                 "remote",
                 "add",
@@ -3591,10 +3691,29 @@ mod tests {
             .status_locked()
             .expect("add inherited network remote");
         assert!(status.success());
+        // A linked worktree of main: the registration a standalone clone inherits from it.
+        let linked = main.with_extension("inherited-worktree");
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(&main)
+            .args(["worktree", "add", "-q", "--detach"])
+            .arg(&linked)
+            .status_locked()
+            .expect("register inherited worktree");
+        assert!(status.success());
+        let source_registrations = registrations(&main);
+        let source_worktrees = worktree_lines(&main);
+        assert_eq!(source_registrations.len(), 1);
 
-        let repo = GitRepository::from_root(&root);
+        let mount = clone_image(&main);
         assert_eq!(
-            repo.prepare_workspace("raven", &root, Some("main"), false)
+            worktree_lines(&mount).len(),
+            2,
+            "the clone inherits main's registration"
+        );
+        let repo = GitRepository::from_root(&mount);
+        assert_eq!(
+            repo.prepare_workspace("raven", &main, Some("main"), false)
                 .await
                 .expect("prepare workspace"),
             MainRemote::Canonical
@@ -3603,11 +3722,22 @@ mod tests {
             repo.current_branch().await.expect("read branch").as_deref(),
             Some("cowshed/raven")
         );
+        // The clone lists only itself and holds no registration; the source keeps its own.
+        assert!(registrations(&mount).is_empty());
+        assert_eq!(
+            worktree_lines(&mount),
+            vec![format!(
+                "worktree {}",
+                fs::canonicalize(&mount).expect("canonical clone").display()
+            )]
+        );
+        assert_eq!(registrations(&main), source_registrations);
+        assert_eq!(worktree_lines(&main), source_worktrees);
         // The inherited network remote is gone and exactly one local remote stands in its place.
         let remotes = repo.remotes().await.expect("read remotes");
         assert_eq!(remotes.len(), 1);
         assert_eq!(remotes[0].name, MAIN_REMOTE);
-        assert_eq!(Path::new(&remotes[0].url), &*root);
+        assert_eq!(Path::new(&remotes[0].url), &*main);
     }
 
     #[tokio::test]
@@ -3663,6 +3793,32 @@ mod tests {
             .expect("run git");
         assert!(output.status.success(), "{args:?}");
         String::from_utf8(output.stdout).expect("git output is utf-8")
+    }
+
+    /// `worktree <path>` lines from `git worktree list --porcelain`: the checkout first, then each
+    /// linked worktree git knows about.
+    fn worktree_lines(root: &Path) -> Vec<String> {
+        git_stdout(root, &["worktree", "list", "--porcelain"])
+            .lines()
+            .filter(|line| line.starts_with("worktree "))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// Every `.git/worktrees/<id>` entry as its name and `gitdir` bytes, sorted; empty when none.
+    fn registrations(root: &Path) -> Vec<(OsString, Vec<u8>)> {
+        let Ok(entries) = fs::read_dir(root.join(".git/worktrees")) else {
+            return Vec::new();
+        };
+        let mut found: Vec<(OsString, Vec<u8>)> = entries
+            .map(|entry| {
+                let entry = entry.expect("registration entry");
+                let gitdir = fs::read(entry.path().join("gitdir")).expect("registration gitdir");
+                (entry.file_name(), gitdir)
+            })
+            .collect();
+        found.sort();
+        found
     }
 
     /// The whole mint sequence, witnessed by what main and the workspace actually hold: one
