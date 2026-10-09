@@ -220,6 +220,7 @@
         "smoo-nx-cargo-hash": "./dist/bin/smoo-nx-cargo-hash.js",
         "smoo-nx-nextest-extract": "./dist/bin/smoo-nx-nextest-extract.js",
         "smoo-nx-bound-failures": "./dist/bin/smoo-nx-bound-failures.js",
+        "smoo-nx-test-walks": "./dist/bin/smoo-nx-test-walks.js",
       },
       "dependencies": {
         "@nx/js": "23.2.1",

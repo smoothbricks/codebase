@@ -3,7 +3,13 @@ import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { diffScope, findDuplicateScenarios, formatDuplicateScenario, TEST_ONE_WALK } from './test-walk-policy.js';
+import {
+  diffScope,
+  findDuplicateScenarios,
+  formatDuplicateScenario,
+  TEST_ONE_WALK,
+  upstreamBase,
+} from './test-walk-policy.js';
 
 const lines = (...source: string[]): string => `${source.join('\n')}\n`;
 const rust = (...body: string[]): string => lines('fn post() {}', '#[cfg(test)]', 'mod tests {', ...body, '}');
@@ -25,6 +31,8 @@ describe('test-walk-policy', () => {
       ]);
     const ts = 'tests/ledger.test.ts';
     const rs = 'src/ledger.rs';
+    const inheritedBase = process.env.NX_BASE;
+    delete process.env.NX_BASE;
     try {
       // The second case rebuilds the first one's ledger and posts the same entry, then only asserts more.
       write(
@@ -399,7 +407,8 @@ describe('test-walk-policy', () => {
       const base = git('rev-parse', 'HEAD').trim();
       const judged = () => {
         const scope = diffScope(root, base);
-        return findDuplicateScenarios(root, scope.files, scope.changes).map((found) => found.kind);
+        if (!scope.ok) throw new Error(scope.reason);
+        return findDuplicateScenarios(root, scope.value.files, scope.value.changes).map((found) => found.kind);
       };
       expect(judged()).toEqual([]);
       write(ts, lines(...legacy.slice(0, 11), "  expect(openLedger(memoryLog()).balance('sales')).toBe(0.0);", '});'));
@@ -407,10 +416,33 @@ describe('test-walk-policy', () => {
       write(ts, lines(...legacy.slice(0, 8), "  expect(ledger.balance('sales')).toBe(71);", ...legacy.slice(9)));
       expect(judged()).toEqual(['literal-twin']);
       write('tests/new.test.ts', lines(...legacy.slice(0, 10)));
-      expect(diffScope(root, base).changes.get('tests/new.test.ts')).toEqual([
+      const scope = diffScope(root, base);
+      expect(scope.ok && scope.value.changes.get('tests/new.test.ts')).toEqual([
         { start: 1, end: Number.POSITIVE_INFINITY },
       ]);
+
+      // Base selection: local main; a CI checkout with only origin/main; no main at all; NX_BASE set, and unresolvable.
+      const commit = (...args: string[]) =>
+        git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '--quiet', ...args);
+      commit('-am', 'next');
+      expect(upstreamBase(root)).toEqual({ ok: true, value: git('rev-parse', 'HEAD').trim() });
+      git('checkout', '--quiet', '-b', 'topic');
+      commit('--allow-empty', '-m', 'topic');
+      const mainHead = git('rev-parse', 'main').trim();
+      git('branch', '--quiet', '-D', 'main');
+      git('update-ref', 'refs/remotes/origin/main', mainHead);
+      expect(upstreamBase(root)).toEqual({ ok: true, value: mainHead });
+      git('update-ref', '-d', 'refs/remotes/origin/main');
+      const missing = upstreamBase(root);
+      expect(missing.ok).toBe(false);
+      expect(missing.ok ? '' : missing.reason).toContain('export NX_BASE');
+      process.env.NX_BASE = base;
+      expect(upstreamBase(root)).toEqual({ ok: true, value: base });
+      process.env.NX_BASE = 'no-such-commit';
+      expect(upstreamBase(root)).toEqual({ ok: false, reason: 'NX_BASE=no-such-commit names no commit' });
     } finally {
+      if (inheritedBase === undefined) delete process.env.NX_BASE;
+      else process.env.NX_BASE = inheritedBase;
       rmSync(root, { recursive: true, force: true });
     }
   });
