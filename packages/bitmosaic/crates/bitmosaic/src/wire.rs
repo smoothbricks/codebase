@@ -287,6 +287,82 @@ pub(crate) fn slot_bits_for_span(chunks: u32, first: u16, last: u16) -> u8 {
     (n * 8 / 7 + 1).next_power_of_two().trailing_zeros() as u8
 }
 
+/// Upper bound on the encoded length of every u32 set a patch sequence can
+/// reach from the native image `image` while adding at most `adds` members
+/// and touching at most `touches` members' chunks (adds included). A slot
+/// that admits this bound before writing can never meet
+/// [`PatchError::Capacity`] partway through the sequence. Reads only the
+/// frame and root header, so it costs the same for any set; `None` for
+/// bytes that are no u32 image.
+///
+/// A forest image is a pure function of its set, so the bound is over sets,
+/// not patch histories. Every untouched chunk keeps its payload bytes. A
+/// touched chunk of `n` members takes the ladder's cheapest arm, which on the
+/// wire costs at most `2n + 3` bytes up to [`crate::ARRAY_MAX`] members
+/// (the Array arm, or Runs at most a uleb past its in-memory price) and at
+/// most one span-tight Words payload above it. Each added member may open a
+/// chunk and its directory record, the slot plane may appear at its full
+/// width for the grown chunk count, and the frame and header varints grow by
+/// at most 15 bytes. An Elias-Fano root, which a patch keeps, re-encodes the
+/// set at under five bytes a member plus its header.
+pub fn patched_len_bound(image: &[u8], adds: u64, touches: u64) -> Option<u64> {
+    let header = image_header(image)?;
+    if header.width != KeyWidth::U32 {
+        return None;
+    }
+    let encoded = u64::try_from(header.encoded_len).ok()?;
+    let (members, chunks, ef) = if header.encoded_len == IMAGE_ID_LEN {
+        (0, 0, false)
+    } else {
+        let mut at = header.body_offset;
+        let members = u64::from(read_uleb(image, &mut at, u32::MAX)?) + 1;
+        if header.root == ROOT_EF {
+            (members, 0, true)
+        } else {
+            (
+                members,
+                u64::from(read_uleb(image, &mut at, u32::MAX)?) + 1,
+                false,
+            )
+        }
+    };
+    let members = members.saturating_add(adds);
+    if ef {
+        return Some(
+            encoded
+                .saturating_add(members.saturating_mul(5))
+                .saturating_add(64),
+        );
+    }
+    let words_max = u64::try_from(
+        WORDS_AT + 8 * crate::CHUNK_WORDS + 2 * (crate::CHUNK_WORDS / crate::DIR_STRIDE - 1),
+    )
+    .ok()?;
+    let array_chunk = u64::try_from(crate::ARRAY_MAX).ok()? + 1;
+    let dense_excess = words_max.saturating_sub(2 * array_chunk);
+    let dense_chunks = members / array_chunk;
+    let payload = members
+        .saturating_mul(2)
+        .saturating_add(touches.saturating_mul(3))
+        .saturating_add(dense_chunks.saturating_mul(dense_excess));
+    // Directory record per chunk: key (2), before (4), descriptor (4) and
+    // three kind bits.
+    let directory = adds.saturating_mul(11);
+    let grown_chunks = chunks.saturating_add(adds).min(1 << 16);
+    let slot_plane = if grown_chunks <= u64::from(SLOT_MIN_CHUNKS) {
+        0
+    } else {
+        8 * (grown_chunks * 8 / 7 + 1).next_power_of_two()
+    };
+    Some(
+        encoded
+            .saturating_add(payload)
+            .saturating_add(directory)
+            .saturating_add(slot_plane)
+            .saturating_add(15),
+    )
+}
+
 /// Fibonacci-hashed slot for a chunk key.
 ///
 /// CORRECTNESS INVARIANT, and it is the reason there is no verify step: a

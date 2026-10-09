@@ -41,7 +41,7 @@ pub use range::{
 };
 pub use wire::{
     Bitmosaic64View, Bitmosaic64ViewRange, BitmosaicView, BitmosaicViewRange, EMPTY_U32_IMAGE,
-    EMPTY_U64_IMAGE, IMAGE_ID_LEN, ImageHeader, KeyWidth, image_header,
+    EMPTY_U64_IMAGE, IMAGE_ID_LEN, ImageHeader, KeyWidth, image_header, patched_len_bound,
 };
 
 const CHUNK_WORDS: usize = 1024;
