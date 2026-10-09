@@ -838,7 +838,7 @@ impl Rope<'_> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use proptest::prelude::*;
     use std::alloc::{GlobalAlloc, Layout, System};
@@ -896,7 +896,9 @@ mod tests {
         }
     }
 
-    fn without_memory<T>(run: impl FnOnce() -> T) -> T {
+    /// Run `run` while every allocation on this thread fails. The allocator
+    /// is this test binary's, so other modules' tests use it too.
+    pub(crate) fn without_memory<T>(run: impl FnOnce() -> T) -> T {
         ALLOCATION_REFUSED.with(|refused| refused.set(true));
         let scope = RefusalScope;
         let result = run();

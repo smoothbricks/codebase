@@ -139,6 +139,8 @@ impl InputPlan {
     /// batch's columns. A projected frame's CSR columns are substituted by
     /// their rebuilt versions. Every refusal happens before `execute` runs, and
     /// the original columns and state are never written.
+    /// Memory that cannot back admission refuses the batch as
+    /// `Physical(OutOfMemory)` before execution.
     pub(crate) fn admit_and_execute<A: VoAdmission>(
         &self,
         metadata: &VoProgramMetadata,
@@ -150,6 +152,8 @@ impl InputPlan {
     ) -> Result<u32, InputAdmissionError> {
         let count = self.inputs.len();
         if scratch.inputs.len() < count {
+            let grow = count.saturating_sub(scratch.inputs.len());
+            room(&mut scratch.inputs, grow).map_err(InputAdmissionError::Physical)?;
             scratch.inputs.resize_with(count, InputScratch::default);
         }
         let states = &mut scratch.inputs[..count];
@@ -163,7 +167,9 @@ impl InputPlan {
         if states.iter().all(|state| !state.projected) {
             return Ok(execute(cols));
         }
-        let mut refs = cols.to_vec();
+        let mut refs: Vec<&[u8]> = Vec::new();
+        room(&mut refs, cols.len()).map_err(InputAdmissionError::Physical)?;
+        refs.extend_from_slice(cols);
         for (input, state) in self.inputs.iter().zip(states) {
             if state.projected {
                 *refs
@@ -421,7 +427,9 @@ impl Input {
         let cells = offsets.len() / 4;
         let cells_u32 = u32::try_from(cells).map_err(|_| ErrorCode::CapacityExceeded)?;
         state.visited.clear();
-        state.visited.resize(cells.div_ceil(64), 0);
+        let words = cells.div_ceil(64);
+        room(&mut state.visited, words)?;
+        state.visited.resize(words, 0);
         for scope in &self.scopes {
             mark_scope(scope, cols, batch_len, cells_u32, &mut state.visited)?;
         }
@@ -559,9 +567,11 @@ impl<'o> Rebuild<'o> {
         self.copy_through(offsets, values, count)?;
         push_offset(self.out_offsets, self.out_values.len())?;
         let tail = values.get(self.cursor..).ok_or(ErrorCode::ColumnUnderrun)?;
+        room(self.out_values, tail.len())?;
         self.out_values.extend_from_slice(tail);
         let whole = offsets.len() / 4 * 4;
         let trailing = offsets.get(whole..).ok_or(ErrorCode::ColumnUnderrun)?;
+        room(self.out_offsets, trailing.len())?;
         self.out_offsets.extend_from_slice(trailing);
         Ok(())
     }
@@ -593,19 +603,25 @@ impl<'o> Rebuild<'o> {
         let gap = values
             .get(self.cursor..start)
             .ok_or(ErrorCode::ColumnUnderrun)?;
+        room(self.out_values, gap.len())?;
         self.out_values.extend_from_slice(gap);
         push_offset(self.out_offsets, self.out_values.len())?;
-        match certified {
-            Some(bytes) => self.out_values.extend_from_slice(bytes),
-            None => {
-                let bytes = values.get(start..end).ok_or(ErrorCode::ColumnUnderrun)?;
-                self.out_values.extend_from_slice(bytes);
-            }
-        }
+        let bytes = match certified {
+            Some(bytes) => bytes,
+            None => values.get(start..end).ok_or(ErrorCode::ColumnUnderrun)?,
+        };
+        room(self.out_values, bytes.len())?;
+        self.out_values.extend_from_slice(bytes);
         self.cursor = end;
         self.next = next;
         Ok(())
     }
+}
+
+/// Grow `buf` by `additional` elements, or refuse as out of memory.
+fn room<T>(buf: &mut Vec<T>, additional: usize) -> Result<(), ErrorCode> {
+    buf.try_reserve(additional)
+        .map_err(|_| ErrorCode::OutOfMemory)
 }
 
 /// Mark the elements `scope` selects in `marks`, lazily: filter the batch rows,
@@ -695,7 +711,9 @@ fn column_cell(cols: &[&[u8]], col: u32, cell: u32) -> Result<u32, ErrorCode> {
 /// than a capacity of the storage growth.
 fn push_offset(out: &mut Vec<u8>, at: usize) -> Result<(), ErrorCode> {
     let at = u32::try_from(at).map_err(|_| ErrorCode::InvalidCellValue)?;
-    out.extend_from_slice(&at.to_le_bytes());
+    let bytes = at.to_le_bytes();
+    room(out, bytes.len())?;
+    out.extend_from_slice(&bytes);
     Ok(())
 }
 
@@ -1219,6 +1237,26 @@ mod tests {
             counts: vec![],
         };
         let mut scratch = ProgramScratch::default();
+
+        // Admission's own storage that memory cannot back refuses the batch
+        // by name before it runs, never aborting.
+        let ty = column(&[1, 2, 2]);
+        let offsets = column(&[0, 2]);
+        let cols: [&[u8]; 3] = [&ty, &offsets, b"ab"];
+        let refused = crate::ttl_plan::tests::without_memory(|| {
+            plan.admit_and_execute(
+                &metadata,
+                &UnavailableVoAdmission,
+                &cols,
+                3,
+                &mut ProgramScratch::default(),
+                |_| unreachable!("refused before execution"),
+            )
+        });
+        assert_eq!(
+            refused,
+            Err(InputAdmissionError::Physical(ErrorCode::OutOfMemory))
+        );
 
         // No row matches, and the VO pair's columns are absent altogether.
         let ty = column(&[2, 2, 2]);
