@@ -89,22 +89,17 @@ export { encodeVoProgramMetadata, VoProgramAdmissionUnavailableError } from './v
 // WASM backend (for standalone columine usage)
 export type { VmProgramInvalidCause } from './wasm-backend.js';
 export { createColumineWasmBackend, loadColumineWasm, VmProgramAdmissionError } from './wasm-backend.js';
-// Shared WASM memory sizing contract (used by wrappers)
-export type {
-  WasmMemoryContractErrorCode,
-  WasmMemoryGrowthOptions,
-  WasmMemoryGrowthResult,
-  WasmWorkingSetBytes,
-} from './wasm-memory-contract.js';
+// Shared WASM host memory contract (used by wrappers): host bytes live only in
+// a WasmHostRegion above the module's linker-derived memory.
+export type { WasmMemoryContractErrorCode } from './wasm-memory-contract.js';
 export {
-  calculateRequiredWasmBytes,
   calculateRequiredWasmPages,
   createInvalidWasmMemoryConfigError,
   createInvalidWasmWorkingSetError,
   createWasmMemoryCapExceededError,
-  ensureWasmMemoryForWorkingSet,
-  validateWasmWorkingSetBytes,
   WASM_MAX_BYTES,
   WASM_MAX_PAGES,
   WASM_PAGE_BYTES,
+  WasmHostRegion,
+  WasmMemoryContractError,
 } from './wasm-memory-contract.js';

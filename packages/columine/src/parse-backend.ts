@@ -8,14 +8,7 @@
 import { COMPACT_MAX_KIND_TAG, compactKindTag } from './arrow-planes.js';
 
 import type { CompactBatch, CompactColumn, EncodedArrowSchema, ParseConfig, ParseResult } from './pipeline.js';
-import {
-  align8,
-  calculateRequiredWasmBytes,
-  ensureWasmMemoryForWorkingSet,
-  loadWasmBytes,
-  WASM_MAX_BYTES,
-  WASM_MAX_PAGES,
-} from './wasm-memory-contract.js';
+import { align8, loadWasmBytes, WasmHostRegion } from './wasm-memory-contract.js';
 
 export interface ParseCompactBackend {
   readonly backend: string;
@@ -92,11 +85,8 @@ function parseEventProcessorWasmExports(exports: WebAssembly.Instance['exports']
 }
 
 const WASM_OUTPUT_HEADER_SIZE = 32;
-const WASM_HEAP_RESERVE = 9 * 1024 * 1024;
 const MIN_INPUT_BYTES = 4 * 1024;
 const MIN_OUTPUT_BYTES = 64 * 1024;
-const MIN_WORKSPACE_BYTES = 256 * 1024;
-const FIXED_LAYOUT_OVERHEAD_BYTES = 64 * 1024;
 const MAX_BATCH_INPUT_BYTES = 64 * 1024 * 1024;
 const MAX_BATCH_OUTPUT_BYTES = 64 * 1024 * 1024;
 /**
@@ -317,18 +307,19 @@ export class CompactEncodingError extends Error {
   }
 }
 
+/**
+ * One parse call's working set, as offsets from the base its host region
+ * returns. Native allocation needs no room here: it appends its own pages.
+ */
 interface ParseMemoryLayout {
   readonly inputOffset: number;
   readonly inputLength: number;
   readonly outputOffset: number;
   readonly outputLength: number;
-  readonly workspaceOffset: number;
-  readonly workspaceLength: number;
   readonly schemaOffset: number;
   readonly fieldMetaOffset: number;
   readonly fieldNamesOffset: number;
-  readonly regionsBytes: number;
-  readonly requiredWorkingSetBytes: number;
+  readonly workingSetBytes: number;
 }
 
 interface CompactBufferPlan {
@@ -345,6 +336,7 @@ interface CompactColumnPlan {
   readonly offsetElementBytes: 4 | 8;
 }
 
+/** One encode call's working set, as offsets from its host region's base. */
 interface CompactMemoryLayout {
   readonly schemaOffset: number;
   readonly fieldMetaOffset: number;
@@ -353,7 +345,6 @@ interface CompactMemoryLayout {
   readonly outputOffset: number;
   readonly outputLength: number;
   readonly arrowCapacity: number;
-  readonly requiredWorkingSetBytes: number;
   readonly columns: readonly CompactColumnPlan[];
 }
 
@@ -377,11 +368,6 @@ function estimateOutputBytes(inputBytes: number): number {
   return Math.min(MAX_BATCH_OUTPUT_BYTES, Math.max(MIN_OUTPUT_BYTES, align8(estimated)));
 }
 
-function estimateWorkspaceBytes(inputBytes: number, outputBytes: number): number {
-  const estimated = Math.ceil(inputBytes * 0.5 + outputBytes * 0.25);
-  return Math.max(MIN_WORKSPACE_BYTES, align8(estimated));
-}
-
 function planParseMemoryLayout(
   inputLen: number,
   schemaLen: number,
@@ -396,42 +382,22 @@ function planParseMemoryLayout(
 
   const inputLength = Math.max(MIN_INPUT_BYTES, align8(inputLen));
   const outputLength = Math.max(WASM_OUTPUT_HEADER_SIZE, estimateOutputBytes(inputLen));
-  const workspaceLength = estimateWorkspaceBytes(inputLen, outputLength);
-  const schemaBytes = align8(schemaLen);
-  const fieldMetaBytes = align8(fieldMetaLen);
-  const fieldNamesBytes = align8(fieldNamesLen);
-  const regionsBytes =
-    checkedAdd(
-      checkedAdd(checkedAdd(schemaBytes, fieldMetaBytes, 'parse regions'), fieldNamesBytes, 'parse regions'),
-      FIXED_LAYOUT_OVERHEAD_BYTES,
-      'parse regions',
-    ) + WASM_HEAP_RESERVE;
-  const requiredWorkingSetBytes = calculateRequiredWasmBytes({
-    inputBytes: inputLength,
-    outputBytes: outputLength,
-    workspaceBytes: workspaceLength,
-    regionsBytes,
-  });
-
-  const inputOffset = WASM_HEAP_RESERVE;
+  const inputOffset = 0;
   const outputOffset = checkedAdd(inputOffset, inputLength, 'parse output offset');
-  const workspaceOffset = checkedAdd(outputOffset, outputLength, 'parse workspace offset');
-  const schemaOffset = checkedAdd(workspaceOffset, workspaceLength, 'parse schema offset');
-  const fieldMetaOffset = checkedAdd(schemaOffset, schemaBytes, 'parse metadata offset');
-  const fieldNamesOffset = checkedAdd(fieldMetaOffset, fieldMetaBytes, 'parse field names offset');
+  const schemaOffset = checkedAdd(outputOffset, outputLength, 'parse schema offset');
+  const fieldMetaOffset = checkedAdd(schemaOffset, align8(schemaLen), 'parse metadata offset');
+  const fieldNamesOffset = checkedAdd(fieldMetaOffset, align8(fieldMetaLen), 'parse field names offset');
+  const workingSetBytes = checkedAdd(fieldNamesOffset, align8(fieldNamesLen), 'parse working set');
 
   return {
     inputOffset,
     inputLength,
     outputOffset,
     outputLength,
-    workspaceOffset,
-    workspaceLength,
     schemaOffset,
     fieldMetaOffset,
     fieldNamesOffset,
-    regionsBytes,
-    requiredWorkingSetBytes,
+    workingSetBytes,
   };
 }
 
@@ -893,7 +859,7 @@ function planCompactMemoryLayout(batch: CompactBatch): CompactMemoryLayout {
   const arrowCapacity = Math.max(MIN_COMPACT_ARROW_CAPACITY, exactArrowLength);
   const outputLength = checkedAdd(WASM_OUTPUT_HEADER_SIZE, arrowCapacity, 'Compact output buffer');
 
-  const schemaOffset = WASM_HEAP_RESERVE;
+  const schemaOffset = 0;
   const fieldMetaOffset = align8(
     checkedAdd(schemaOffset, batch.schema.schemaBytes.byteLength, 'Compact metadata offset'),
   );
@@ -901,10 +867,6 @@ function planCompactMemoryLayout(batch: CompactBatch): CompactMemoryLayout {
     checkedAdd(fieldMetaOffset, batch.schema.fieldMetadata.byteLength, 'Compact batch offset'),
   );
   const outputOffset = align8(checkedAdd(batchOffset, batchLength, 'Compact output offset'));
-  const requiredWorkingSetBytes = checkedAdd(outputOffset, outputLength, 'Compact working set');
-  if (requiredWorkingSetBytes > WASM_MAX_BYTES || outputOffset > UINT32_MAX || outputLength > UINT32_MAX) {
-    throw new RangeError(`Compact working set ${formatBytes(requiredWorkingSetBytes)} exceeds native WASM bounds`);
-  }
 
   return {
     schemaOffset,
@@ -914,7 +876,6 @@ function planCompactMemoryLayout(batch: CompactBatch): CompactMemoryLayout {
     outputOffset,
     outputLength,
     arrowCapacity,
-    requiredWorkingSetBytes,
     columns,
   };
 }
@@ -935,18 +896,23 @@ function copyLittleEndian(memory: Uint8Array, offset: number, source: Uint8Array
   }
 }
 
-function writeCompactBatch(memoryBuffer: ArrayBuffer, layout: CompactMemoryLayout, batch: CompactBatch): void {
+function writeCompactBatch(
+  memoryBuffer: ArrayBuffer,
+  batchPtr: number,
+  layout: CompactMemoryLayout,
+  batch: CompactBatch,
+): void {
   const memory = new Uint8Array(memoryBuffer);
   const view = new DataView(memoryBuffer);
-  view.setUint32(layout.batchOffset, COMPACT_MAGIC, true);
-  view.setUint16(layout.batchOffset + 4, COMPACT_VERSION, true);
-  view.setUint16(layout.batchOffset + 6, COMPACT_DESCRIPTOR_SIZE, true);
-  view.setUint32(layout.batchOffset + 8, batch.rowCount, true);
-  view.setUint32(layout.batchOffset + 12, batch.columns.length, true);
+  view.setUint32(batchPtr, COMPACT_MAGIC, true);
+  view.setUint16(batchPtr + 4, COMPACT_VERSION, true);
+  view.setUint16(batchPtr + 6, COMPACT_DESCRIPTOR_SIZE, true);
+  view.setUint32(batchPtr + 8, batch.rowCount, true);
+  view.setUint32(batchPtr + 12, batch.columns.length, true);
 
   for (let index = 0; index < layout.columns.length; index += 1) {
     const column = requiredArrayValue(layout.columns, index, 'Compact column layout');
-    const descriptor = layout.batchOffset + COMPACT_HEADER_SIZE + index * COMPACT_DESCRIPTOR_SIZE;
+    const descriptor = batchPtr + COMPACT_HEADER_SIZE + index * COMPACT_DESCRIPTOR_SIZE;
     view.setUint8(descriptor, column.tag);
     view.setUint8(descriptor + 1, column.validity === null ? 0 : 1);
     view.setUint16(descriptor + 2, 0, true);
@@ -959,18 +925,13 @@ function writeCompactBatch(memoryBuffer: ArrayBuffer, layout: CompactMemoryLayou
     view.setUint32(descriptor + 28, 0, true);
 
     if (column.validity !== null) {
-      memory.set(column.validity.source, layout.batchOffset + column.validity.offset);
+      memory.set(column.validity.source, batchPtr + column.validity.offset);
     }
     if (column.offsets !== null) {
-      copyLittleEndian(
-        memory,
-        layout.batchOffset + column.offsets.offset,
-        column.offsets.source,
-        column.offsetElementBytes,
-      );
+      copyLittleEndian(memory, batchPtr + column.offsets.offset, column.offsets.source, column.offsetElementBytes);
     }
     if (column.data !== null) {
-      copyLittleEndian(memory, layout.batchOffset + column.data.offset, column.data.source, column.dataElementBytes);
+      copyLittleEndian(memory, batchPtr + column.data.offset, column.data.source, column.dataElementBytes);
     }
   }
 }
@@ -995,6 +956,9 @@ export function createParseCompactWasmBackend(wasm: EventProcessorWasmExports): 
     readonly fieldNames: Uint8Array | null;
   }
 
+  // Constructed before this backend's first native call: every working set
+  // lives above the module's own memory and past pages native code appends.
+  const region = new WasmHostRegion(wasm.memory);
   let cachedHandle: CachedHandle | null = null;
   let disposed = false;
 
@@ -1047,55 +1011,41 @@ export function createParseCompactWasmBackend(wasm: EventProcessorWasmExports): 
         config.fieldMetadata.length,
         fieldNamesBuffer?.length ?? 0,
       );
-
-      try {
-        ensureWasmMemoryForWorkingSet(
-          wasm.memory,
-          {
-            inputBytes: layout.inputLength,
-            outputBytes: layout.outputLength,
-            workspaceBytes: layout.workspaceLength,
-            regionsBytes: layout.regionsBytes,
-          },
-          { maxPages: WASM_MAX_PAGES },
-        );
-      } catch (error) {
-        if (error instanceof Error) {
-          throw new Error(
-            `Failed to size parse WASM memory (${formatBytes(layout.requiredWorkingSetBytes)}): ${error.message}`,
-          );
-        }
-        throw error;
-      }
+      const base = region.reserve(layout.workingSetBytes);
+      const inputPtr = base + layout.inputOffset;
+      const outputPtr = base + layout.outputOffset;
 
       let handle: number;
       if (cachedHandle && configMatches(cachedHandle, config, fieldNamesBuffer)) {
         handle = cachedHandle.handle;
       } else {
         destroyCachedHandle();
+        const schemaPtr = base + layout.schemaOffset;
+        const fieldMetaPtr = base + layout.fieldMetaOffset;
+        const fieldNamesPtr = base + layout.fieldNamesOffset;
         const memory = new Uint8Array(wasm.memory.buffer);
-        memory.set(config.schemaBytes, layout.schemaOffset);
-        memory.set(config.fieldMetadata, layout.fieldMetaOffset);
+        memory.set(config.schemaBytes, schemaPtr);
+        memory.set(config.fieldMetadata, fieldMetaPtr);
         if (fieldNamesBuffer) {
-          memory.set(fieldNamesBuffer, layout.fieldNamesOffset);
+          memory.set(fieldNamesBuffer, fieldNamesPtr);
         }
         const fieldCount = config.fieldMetadata.length / 4;
         handle = requireEpHandle(
           fieldNamesBuffer
             ? wasm.ep_create_with_schema_and_names(
                 EP_EVENT_CAPACITY,
-                layout.schemaOffset,
+                schemaPtr,
                 config.schemaBytes.length,
-                layout.fieldMetaOffset,
+                fieldMetaPtr,
                 fieldCount,
-                layout.fieldNamesOffset,
+                fieldNamesPtr,
                 fieldNamesBuffer.length,
               )
             : wasm.ep_create_with_schema(
                 EP_EVENT_CAPACITY,
-                layout.schemaOffset,
+                schemaPtr,
                 config.schemaBytes.length,
-                layout.fieldMetaOffset,
+                fieldMetaPtr,
                 fieldCount,
               ),
           'parse could not create an EventProcessor',
@@ -1103,16 +1053,15 @@ export function createParseCompactWasmBackend(wasm: EventProcessorWasmExports): 
         cacheHandle(handle, config, fieldNamesBuffer);
       }
 
-      const memory = new Uint8Array(wasm.memory.buffer);
-      memory.set(inputBytes, layout.inputOffset);
+      new Uint8Array(wasm.memory.buffer).set(inputBytes, inputPtr);
       let result: number;
       try {
         result = wasm.ep_create_log_entry(
           handle,
-          layout.inputOffset,
+          inputPtr,
           inputBytes.length,
           INPUT_FORMAT_JSON,
-          layout.outputOffset,
+          outputPtr,
           layout.outputLength,
         );
       } catch (error) {
@@ -1125,19 +1074,19 @@ export function createParseCompactWasmBackend(wasm: EventProcessorWasmExports): 
       }
 
       const view = new DataView(wasm.memory.buffer);
-      const code = view.getUint32(layout.outputOffset, true);
-      const arrowOffset = view.getUint32(layout.outputOffset + 4, true);
-      const arrowLen = view.getUint32(layout.outputOffset + 8, true);
-      const eventsProcessed = view.getUint32(layout.outputOffset + 12, true);
+      const code = view.getUint32(outputPtr, true);
+      const arrowOffset = view.getUint32(outputPtr + 4, true);
+      const arrowLen = view.getUint32(outputPtr + 8, true);
+      const eventsProcessed = view.getUint32(outputPtr + 12, true);
       if (code !== RESULT_OK) {
         destroyCachedHandle();
         throw new Error(`ep_create_log_entry returned error code ${code}`);
       }
 
-      const arrowStart = checkedAdd(layout.outputOffset, arrowOffset, 'parse Arrow start');
+      const arrowStart = checkedAdd(outputPtr, arrowOffset, 'parse Arrow start');
       const arrowEnd = checkedAdd(arrowStart, arrowLen, 'parse Arrow end');
-      const outputEnd = checkedAdd(layout.outputOffset, layout.outputLength, 'parse output end');
-      if (arrowStart < layout.outputOffset || arrowEnd > outputEnd) {
+      const outputEnd = checkedAdd(outputPtr, layout.outputLength, 'parse output end');
+      if (arrowEnd > outputEnd) {
         destroyCachedHandle();
         throw new Error(
           'ep_create_log_entry produced out-of-bounds output: ' +
@@ -1155,31 +1104,24 @@ export function createParseCompactWasmBackend(wasm: EventProcessorWasmExports): 
       const layout = planCompactMemoryLayout(batch);
       let outputLength = layout.outputLength;
       let arrowCapacity = layout.arrowCapacity;
-      ensureWasmMemoryForWorkingSet(
-        wasm.memory,
-        {
-          inputBytes: layout.batchLength,
-          outputBytes: outputLength,
-          workspaceBytes: 0,
-          regionsBytes: layout.outputOffset - layout.batchLength,
-        },
-        { maxPages: WASM_MAX_PAGES },
-      );
+      let base = region.reserve(layout.outputOffset + outputLength);
 
       let handle: number;
       if (cachedHandle && schemaMatches(cachedHandle, batch.schema)) {
         handle = cachedHandle.handle;
       } else {
         destroyCachedHandle();
+        const schemaPtr = base + layout.schemaOffset;
+        const fieldMetaPtr = base + layout.fieldMetaOffset;
         const memory = new Uint8Array(wasm.memory.buffer);
-        memory.set(batch.schema.schemaBytes, layout.schemaOffset);
-        memory.set(batch.schema.fieldMetadata, layout.fieldMetaOffset);
+        memory.set(batch.schema.schemaBytes, schemaPtr);
+        memory.set(batch.schema.fieldMetadata, fieldMetaPtr);
         handle = requireEpHandle(
           wasm.ep_create_with_schema(
             EP_EVENT_CAPACITY,
-            layout.schemaOffset,
+            schemaPtr,
             batch.schema.schemaBytes.length,
-            layout.fieldMetaOffset,
+            fieldMetaPtr,
             batch.columns.length,
           ),
           'encode could not create an EventProcessor',
@@ -1187,27 +1129,29 @@ export function createParseCompactWasmBackend(wasm: EventProcessorWasmExports): 
         cacheHandle(handle, batch.schema, null);
       }
 
-      writeCompactBatch(wasm.memory.buffer, layout, batch);
+      writeCompactBatch(wasm.memory.buffer, base + layout.batchOffset, layout, batch);
       let retriedForCapacity = false;
       for (;;) {
-        new Uint8Array(wasm.memory.buffer, layout.outputOffset, WASM_OUTPUT_HEADER_SIZE).fill(0);
+        const batchPtr = base + layout.batchOffset;
+        const outputPtr = base + layout.outputOffset;
+        new Uint8Array(wasm.memory.buffer, outputPtr, WASM_OUTPUT_HEADER_SIZE).fill(0);
         let result: number;
         try {
-          result = wasm.ep_compact(handle, layout.batchOffset, layout.batchLength, layout.outputOffset, outputLength);
+          result = wasm.ep_compact(handle, batchPtr, layout.batchLength, outputPtr, outputLength);
         } catch (error) {
           destroyCachedHandle();
           throw error;
         }
 
         const view = new DataView(wasm.memory.buffer);
-        const headerStatus = view.getUint32(layout.outputOffset, true);
+        const headerStatus = view.getUint32(outputPtr, true);
         if (result !== headerStatus) {
           destroyCachedHandle();
           throw new Error(`ep_compact returned status ${result} but wrote result-header status ${headerStatus}`);
         }
 
-        const arrowOffset = view.getUint32(layout.outputOffset + 4, true);
-        const arrowLen = view.getUint32(layout.outputOffset + 8, true);
+        const arrowOffset = view.getUint32(outputPtr + 4, true);
+        const arrowLen = view.getUint32(outputPtr + 8, true);
         if (result !== RESULT_OK) {
           if (
             !retriedForCapacity &&
@@ -1218,41 +1162,31 @@ export function createParseCompactWasmBackend(wasm: EventProcessorWasmExports): 
             if (arrowLen > MAX_BATCH_OUTPUT_BYTES) {
               throw new CompactEncodingError(
                 result,
-                readCompactDiagnostic(view, layout.outputOffset),
+                readCompactDiagnostic(view, outputPtr),
                 `ep_compact requires ${formatBytes(arrowLen)}, exceeding ${formatBytes(MAX_BATCH_OUTPUT_BYTES)}`,
               );
             }
             retriedForCapacity = true;
             arrowCapacity = Math.max(MIN_COMPACT_ARROW_CAPACITY, arrowLen);
             outputLength = checkedAdd(WASM_OUTPUT_HEADER_SIZE, arrowCapacity, 'Compact retry output buffer');
-            const requiredWorkingSetBytes = checkedAdd(layout.outputOffset, outputLength, 'Compact retry working set');
-            if (requiredWorkingSetBytes > WASM_MAX_BYTES) {
-              throw new CompactEncodingError(
-                result,
-                readCompactDiagnostic(view, layout.outputOffset),
-                `ep_compact retry requires ${formatBytes(requiredWorkingSetBytes)}, exceeding native WASM bounds`,
-              );
+            // A larger output may move the region past pages the attempt's
+            // native allocation appended; a move carries no bytes, so the
+            // packed batch is staged again at the new base.
+            const grown = region.reserve(layout.outputOffset + outputLength);
+            if (grown !== base) {
+              base = grown;
+              writeCompactBatch(wasm.memory.buffer, base + layout.batchOffset, layout, batch);
             }
-            ensureWasmMemoryForWorkingSet(
-              wasm.memory,
-              {
-                inputBytes: layout.batchLength,
-                outputBytes: outputLength,
-                workspaceBytes: 0,
-                regionsBytes: layout.outputOffset - layout.batchLength,
-              },
-              { maxPages: WASM_MAX_PAGES },
-            );
             continue;
           }
-          throw new CompactEncodingError(result, readCompactDiagnostic(view, layout.outputOffset));
+          throw new CompactEncodingError(result, readCompactDiagnostic(view, outputPtr));
         }
 
-        const rowsEncoded = view.getUint32(layout.outputOffset + 12, true);
-        const duplicates = view.getUint32(layout.outputOffset + 16, true);
-        const arrowStart = checkedAdd(layout.outputOffset, arrowOffset, 'Compact Arrow start');
+        const rowsEncoded = view.getUint32(outputPtr + 12, true);
+        const duplicates = view.getUint32(outputPtr + 16, true);
+        const arrowStart = checkedAdd(outputPtr, arrowOffset, 'Compact Arrow start');
         const arrowEnd = checkedAdd(arrowStart, arrowLen, 'Compact Arrow end');
-        const outputEnd = checkedAdd(layout.outputOffset, outputLength, 'Compact output end');
+        const outputEnd = checkedAdd(outputPtr, outputLength, 'Compact output end');
         if (
           arrowOffset !== WASM_OUTPUT_HEADER_SIZE ||
           rowsEncoded !== batch.rowCount ||

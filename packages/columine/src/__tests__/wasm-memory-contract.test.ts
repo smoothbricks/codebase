@@ -1,88 +1,43 @@
 import { describe, expect, it } from 'bun:test';
 
-import {
-  calculateRequiredWasmBytes,
-  ensureWasmMemoryForWorkingSet,
-  WASM_MAX_BYTES,
-  WASM_MAX_PAGES,
-  WASM_PAGE_BYTES,
-  WasmMemoryContractError,
-} from '../wasm-memory-contract.js';
+import { WASM_MAX_PAGES, WASM_PAGE_BYTES, WasmHostRegion, WasmMemoryContractError } from '../wasm-memory-contract.js';
 
-function assertWasmMemoryContractError(error: unknown): WasmMemoryContractError {
-  if (!(error instanceof WasmMemoryContractError)) {
-    throw new Error('expected WasmMemoryContractError');
+function contractError(run: () => unknown): WasmMemoryContractError {
+  try {
+    run();
+  } catch (error) {
+    if (error instanceof WasmMemoryContractError) return error;
+    throw error;
   }
-  return error;
+  throw new Error('expected a WasmMemoryContractError');
 }
 
-describe('wasm-memory-contract', () => {
-  it('grows from small initial pages when working set requires it', () => {
-    const memory = new WebAssembly.Memory({ initial: 2, maximum: 1024 });
+describe('wasm-memory-contract host region', () => {
+  it('starts at the memory end and grows in place while it ends there', () => {
+    const memory = new WebAssembly.Memory({ initial: 2, maximum: 256 });
+    const region = new WasmHostRegion(memory);
+    expect(region.offset).toBe(2 * WASM_PAGE_BYTES);
 
-    const result = ensureWasmMemoryForWorkingSet(memory, {
-      inputBytes: 6 * 1024 * 1024,
-      outputBytes: 2 * 1024 * 1024,
-      workspaceBytes: 2 * 1024 * 1024,
-      regionsBytes: 1 * 1024 * 1024,
-    });
-
-    expect(result.grownPages).toBeGreaterThan(0);
-    expect(result.totalPages).toBe(result.requiredPages);
+    const base = region.reserve(10 * 1024 * 1024 + 1);
+    expect(base).toBe(2 * WASM_PAGE_BYTES);
+    expect(memory.buffer.byteLength).toBe(base + Math.ceil((10 * 1024 * 1024 + 1) / WASM_PAGE_BYTES) * WASM_PAGE_BYTES);
+    expect(region.reserve(1)).toBe(base);
   });
 
-  it('succeeds at or below configured cap', () => {
+  it('refuses above its cap with a structured error and leaves memory unchanged', () => {
     const memory = new WebAssembly.Memory({ initial: 4, maximum: WASM_MAX_PAGES });
-    const targetBytes = WASM_MAX_BYTES - WASM_PAGE_BYTES;
-
-    const result = ensureWasmMemoryForWorkingSet(memory, {
-      inputBytes: targetBytes - 2 * WASM_PAGE_BYTES,
-      outputBytes: WASM_PAGE_BYTES,
-      workspaceBytes: WASM_PAGE_BYTES,
-      regionsBytes: 0,
-    });
-
-    expect(result.requiredBytes).toBe(targetBytes);
-    expect(result.requiredPages).toBeLessThanOrEqual(WASM_MAX_PAGES);
+    const region = new WasmHostRegion(memory, 8);
+    const error = contractError(() => region.reserve(4 * WASM_PAGE_BYTES + 1));
+    expect(error.code).toBe('WASM_MEMORY_CAP_EXCEEDED');
+    expect(memory.buffer.byteLength).toBe(4 * WASM_PAGE_BYTES);
+    expect(region.reserve(4 * WASM_PAGE_BYTES)).toBe(4 * WASM_PAGE_BYTES);
   });
 
-  it('fails above cap with structured error', () => {
-    const memory = new WebAssembly.Memory({ initial: 4, maximum: WASM_MAX_PAGES });
-
-    expect(() =>
-      ensureWasmMemoryForWorkingSet(memory, {
-        inputBytes: WASM_MAX_BYTES,
-        outputBytes: WASM_PAGE_BYTES,
-        workspaceBytes: 0,
-        regionsBytes: 0,
-      }),
-    ).toThrow(WasmMemoryContractError);
-
-    try {
-      ensureWasmMemoryForWorkingSet(memory, {
-        inputBytes: WASM_MAX_BYTES,
-        outputBytes: WASM_PAGE_BYTES,
-        workspaceBytes: 0,
-        regionsBytes: 0,
-      });
-      throw new Error('expected cap error');
-    } catch (error) {
-      expect(error).toBeInstanceOf(WasmMemoryContractError);
-      const contractError = assertWasmMemoryContractError(error);
-      expect(contractError.code).toBe('WASM_MEMORY_CAP_EXCEEDED');
-      expect(contractError.message).toContain('cap');
-    }
-  });
-
-  it('required-bytes includes output and workspace, not only input', () => {
-    const requiredBytes = calculateRequiredWasmBytes({
-      inputBytes: 1024,
-      outputBytes: 2048,
-      workspaceBytes: 4096,
-      regionsBytes: 512,
-    });
-
-    expect(requiredBytes).toBe(1024 + 2048 + 4096 + 512);
-    expect(requiredBytes).toBeGreaterThan(1024);
+  it('refuses an invalid cap or byte count', () => {
+    const memory = new WebAssembly.Memory({ initial: 1, maximum: 4 });
+    expect(contractError(() => new WasmHostRegion(memory, 0)).code).toBe('INVALID_WASM_MEMORY_CONFIG');
+    expect(contractError(() => new WasmHostRegion(memory, WASM_MAX_PAGES + 1)).code).toBe('INVALID_WASM_MEMORY_CONFIG');
+    expect(contractError(() => new WasmHostRegion(memory).reserve(-1)).code).toBe('INVALID_WASM_WORKING_SET');
+    expect(contractError(() => new WasmHostRegion(memory).reserve(1.5)).code).toBe('INVALID_WASM_WORKING_SET');
   });
 });

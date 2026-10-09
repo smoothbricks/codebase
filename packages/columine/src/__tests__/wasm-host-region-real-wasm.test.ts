@@ -1,15 +1,19 @@
 import { describe, expect, it } from 'bun:test';
+import { tableFromArrays, tableFromIPC, tableToIPC, utf8 } from '@uwdata/flechette';
+import { loadParseBackend } from '../parse-backend.js';
+import type { CompactBatch, EncodedArrowSchema } from '../pipeline.js';
 import { encodeProgramHeader } from '../reducer-bytecode.js';
 import { ErrorCode, HEADER_SIZE, Opcode, PROGRAM_HASH_PREFIX, PROGRAM_MAGIC, SlotType, ValueType } from '../types.js';
 import { createColumineWasmBackend } from '../wasm-backend.js';
 import { WASM_PAGE_BYTES, WasmHostRegion, WasmMemoryContractError } from '../wasm-memory-contract.js';
 
 // The host owns only pages above the module's linker-derived memory and skips
-// pages native allocation appends. These run against the real built artifact.
+// pages native allocation appends. These run against the real built artifacts.
 const WASM_PATH = new URL('../../dist/columine.wasm', import.meta.url);
+const EP_WASM_PATH = new URL('../../dist/event_processor.wasm', import.meta.url);
 
-async function instantiate(): Promise<WebAssembly.Memory> {
-  const module = await WebAssembly.compile(await Bun.file(WASM_PATH).arrayBuffer());
+async function instantiate(path: URL = WASM_PATH): Promise<WebAssembly.Memory> {
+  const module = await WebAssembly.compile(await Bun.file(path).arrayBuffer());
   const instance = await WebAssembly.instantiate(module, {});
   const memory = instance.exports.memory;
   if (!(memory instanceof WebAssembly.Memory)) throw new Error('real wasm artifact exports no memory');
@@ -87,15 +91,61 @@ function hashMapsProgram(maps: number, capacity: number): Uint8Array {
   return bytes;
 }
 
-describe('host-owned WASM region on the real artifact', () => {
-  it('starts past every active data segment of the linker-derived memory', async () => {
-    const wasm = new Uint8Array(await Bun.file(WASM_PATH).arrayBuffer());
-    const ends = activeDataEnds(wasm);
-    expect(ends.length).toBeGreaterThan(0);
-    const memory = await instantiate();
-    const region = new WasmHostRegion(memory);
-    expect(region.offset).toBe(memory.buffer.byteLength);
-    for (const end of ends) expect(end).toBeLessThanOrEqual(region.offset);
+function utf8Schema(): EncodedArrowSchema {
+  const stream = tableToIPC(tableFromArrays({ text: [''] }, { types: { text: utf8() } }), { format: 'stream' });
+  if (stream === null) throw new Error('Flechette did not return in-memory Arrow IPC bytes');
+  const view = new DataView(stream.buffer, stream.byteOffset, stream.byteLength);
+  return {
+    schemaBytes: stream.slice(0, 8 + view.getUint32(4, true)),
+    // UTF8 is compact kind tag 4; the field is nullable.
+    fieldMetadata: new Uint8Array([4, 1, 0, 0]),
+  };
+}
+
+function textBatch(schema: EncodedArrowSchema, rows: number, width: number): { batch: CompactBatch; texts: string[] } {
+  const encoder = new TextEncoder();
+  const texts = Array.from({ length: rows }, (_, row) => `${row}:`.padEnd(width, String.fromCharCode(97 + (row % 26))));
+  const encoded = texts.map((text) => encoder.encode(text));
+  const offsets = new Uint32Array(rows + 1);
+  for (let row = 0; row < rows; row++) offsets[row + 1] = offsets[row] + encoded[row].byteLength;
+  const data = new Uint8Array(offsets[rows]);
+  for (let row = 0; row < rows; row++) data.set(encoded[row], offsets[row]);
+  return { batch: { rowCount: rows, schema, columns: [{ kind: 'utf8', offsets, data }] }, texts };
+}
+
+const ARTIFACTS: ReadonlyArray<readonly [name: string, path: URL]> = [
+  ['columine.wasm', WASM_PATH],
+  ['event_processor.wasm', EP_WASM_PATH],
+];
+
+describe('host-owned WASM region on the real artifacts', () => {
+  for (const [name, path] of ARTIFACTS) {
+    it(`starts past every active data segment of the linker-derived memory, ${name}`, async () => {
+      const wasm = new Uint8Array(await Bun.file(path).arrayBuffer());
+      const ends = activeDataEnds(wasm);
+      expect(ends.length).toBeGreaterThan(0);
+      const memory = await instantiate(path);
+      const region = new WasmHostRegion(memory);
+      expect(region.offset).toBe(memory.buffer.byteLength);
+      for (const end of ends) expect(end).toBeLessThanOrEqual(region.offset);
+    });
+  }
+
+  it('encodes small, large, then small batches exactly after native allocation grew memory', async () => {
+    const backend = await loadParseBackend(EP_WASM_PATH);
+    try {
+      const schema = utf8Schema();
+      const small = textBatch(schema, 8, 32);
+      const large = textBatch(schema, 40_000, 200);
+      const first = backend.encode(small.batch);
+      expect(tableFromIPC(first).toColumns().text).toEqual(small.texts);
+      // Larger than everything staged before: its working set must not land on
+      // pages native allocation appended after the first call.
+      expect(tableFromIPC(backend.encode(large.batch)).toColumns().text).toEqual(large.texts);
+      expect(backend.encode(small.batch)).toEqual(first);
+    } finally {
+      backend.dispose();
+    }
   });
 
   it('moves past pages appended outside it and never grows over them', async () => {
