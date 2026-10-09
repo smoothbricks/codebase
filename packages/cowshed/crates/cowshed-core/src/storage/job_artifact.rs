@@ -1284,6 +1284,7 @@ impl ArtifactStore {
         })
     }
 
+    /// What opening this store recovered, including its adjusted allocation floor and set-aside.
     pub fn recovery(&self) -> &RecoveryReport {
         &self.recovery
     }
@@ -1406,7 +1407,6 @@ impl ArtifactStore {
         self.admissions = admissions;
         self.unread_history = unread_history;
         self.retained_job_floor = retained_job_floor;
-        self.recovery = recovery;
         self.records_seen = records_seen;
         self.validated_manifest = validated_manifest;
         Ok(())
@@ -1601,14 +1601,7 @@ impl ArtifactStore {
     /// barrier merely skips an id instead of leaving a consumed id that every later checkpoint
     /// trips over.
     pub fn checkpoint(&mut self) -> Result<SealedCheckpointManifest, ArtifactError> {
-        let path = records_path(&self.workspace_root);
-        let lock = RecordsLock::acquire(&path)?;
-        self.refresh_under_lock(&lock)?;
-        let mut visible = self
-            .committed_jobs
-            .values()
-            .map(VisibleJobCommitment::from_record)
-            .collect::<BTreeMap<_, _>>();
+        let mut visible = BTreeMap::new();
         let workspace_root = &self.workspace_root;
         let workspace_incarnation = &self.workspace_incarnation;
         let budget = &mut self.budget;
@@ -1616,6 +1609,14 @@ impl ArtifactStore {
             let commitment =
                 state.durable_commitment(workspace_root, budget, workspace_incarnation, job_id)?;
             visible.insert(job_id, commitment);
+        }
+        let path = records_path(&self.workspace_root);
+        let lock = RecordsLock::acquire(&path)?;
+        self.refresh_under_lock(&lock)?;
+        for record in self.committed_jobs.values() {
+            visible
+                .entry(record.job_id)
+                .or_insert_with(|| VisibleJobCommitment::from_record(record).1);
         }
         let barrier_id = allocate_checkpoint_barrier(&lock, &self.workspace_incarnation)?;
         let records_sha256 = match fs::symlink_metadata(&path) {
@@ -8462,6 +8463,20 @@ mod tests {
             fs::read(set_aside.join(RECORDS_FILE)).unwrap(),
             old_records,
             "the archived store stayed byte-identical through every refresh"
+        );
+        assert_eq!(
+            store
+                .recovery()
+                .set_aside
+                .as_ref()
+                .map(|history| &history.path),
+            Some(&set_aside),
+            "refresh preserves the open-time set-aside report"
+        );
+        assert_eq!(
+            store.recovery().next_job_id.get(),
+            2,
+            "refresh preserves the open-time adjusted allocation report"
         );
         drop(reader);
         drop(store);
