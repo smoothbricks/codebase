@@ -76,6 +76,19 @@
       "lint": {
         "inputs": [
           "...",
+          "{workspaceRoot}/**/*.rs",
+          "{workspaceRoot}/**/*.test.*",
+          "{workspaceRoot}/**/*.spec.*",
+          "{workspaceRoot}/**/*-test.*",
+          "{workspaceRoot}/**/*_test.*",
+          "{workspaceRoot}/**/test-*",
+          "{workspaceRoot}/**/test_*",
+          "{workspaceRoot}/**/__tests__/**/*",
+          "{workspaceRoot}/**/tests/**/*",
+          "{workspaceRoot}/**/test/**/*",
+          "{workspaceRoot}/**/nx-it/**/*",
+          "{workspaceRoot}/packages/nx-plugin/src/test-walk-policy.ts",
+          "{workspaceRoot}/packages/nx-plugin/src/bin/smoo-nx-test-walks.ts",
           {
             "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh bun packages/nx-plugin/src/bin/smoo-nx-test-walks.ts --base"
           }
