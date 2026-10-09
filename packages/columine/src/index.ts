@@ -53,6 +53,7 @@ export {
 export type {
   ColumineBackend,
   ColumnInput,
+  DeltaSegmentExport,
   EvictedRow,
   EvictionResult,
   ReducerProgram,
