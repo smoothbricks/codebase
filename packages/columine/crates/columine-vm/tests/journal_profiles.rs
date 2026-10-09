@@ -13,7 +13,9 @@
 //! declares exactly the 8-byte cell it changes.
 //!
 //! Allocation claims use a thread-local scoped counter over the system
-//! allocator, the same forwarding pattern as `containers.rs`.
+//! allocator, the same forwarding pattern as `containers.rs`. The same
+//! allocator can refuse this thread's allocations on demand, which is how the
+//! out-of-memory refusals below are reached.
 
 use columine_types::PROGRAM_MAGIC;
 use columine_types::types::{AggType, ErrorCode, Opcode, SlotType};
@@ -129,6 +131,12 @@ struct CountingAllocator;
 thread_local! {
     // Thread-local accounting excludes allocations made by concurrent tests.
     static ALLOCATION_COUNT: Cell<Option<usize>> = const { Cell::new(None) };
+    // While set, every allocation on this thread fails.
+    static ALLOCATION_REFUSED: Cell<bool> = const { Cell::new(false) };
+}
+
+fn allocation_refused() -> bool {
+    ALLOCATION_REFUSED.try_with(Cell::get).unwrap_or(false)
 }
 
 fn count_allocation() {
@@ -141,14 +149,21 @@ fn count_allocation() {
 
 // SAFETY: every allocation and deallocation forwards the original pointer and
 // layout to System; the counter observes calls and never changes the contract.
+// A refused allocation returns null, which GlobalAlloc permits for any call.
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         count_allocation();
+        if allocation_refused() {
+            return core::ptr::null_mut();
+        }
         unsafe { System.alloc(layout) }
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         count_allocation();
+        if allocation_refused() {
+            return core::ptr::null_mut();
+        }
         unsafe { System.alloc_zeroed(layout) }
     }
 
@@ -158,6 +173,9 @@ unsafe impl GlobalAlloc for CountingAllocator {
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         count_allocation();
+        if allocation_refused() {
+            return core::ptr::null_mut();
+        }
         unsafe { System.realloc(ptr, layout, new_size) }
     }
 }
@@ -184,6 +202,23 @@ fn allocations_during<T>(run: impl FnOnce() -> T) -> (T, usize) {
     let count = ALLOCATION_COUNT.with(|count| count.get().expect("active allocation scope"));
     drop(scope);
     (result, count)
+}
+
+struct RefusalScope;
+
+impl Drop for RefusalScope {
+    fn drop(&mut self) {
+        ALLOCATION_REFUSED.with(|refused| refused.set(false));
+    }
+}
+
+/// Run `run` while every allocation on this thread fails.
+fn without_memory<T>(run: impl FnOnce() -> T) -> T {
+    ALLOCATION_REFUSED.with(|refused| refused.set(true));
+    let scope = RefusalScope;
+    let result = run();
+    drop(scope);
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -819,4 +854,115 @@ fn status_snapshot_is_a_value_copy_that_cannot_steer_the_journal() {
     assert!(!vm.undo_status().overflow);
     assert_eq!(vm.undo_checkpoint(), vm.undo_status().checkpoint);
     vm.undo_commit();
+}
+
+fn open(enabled: bool, overflow: bool, checkpoint: u32, delta_count: u32) -> UndoStatus {
+    UndoStatus {
+        enabled,
+        overflow,
+        checkpoint,
+        delta_count,
+    }
+}
+
+/// Journal storage the memory cannot back refuses like the budget: the
+/// capture returns `JournalOverflow` before its writer runs, the image is
+/// unchanged, and the window stays refused once memory is available again.
+/// Only a new window clears it.
+#[test]
+fn unbacked_capture_storage_refuses_before_any_write_and_stays_refused() {
+    let prog = count_program();
+    let mut state = init(&prog);
+    let original = state.clone();
+    let cell = count_cell(&state);
+    let mut vm = Vm::default();
+    vm.undo_enable(&state).expect("undo window opens");
+
+    let mut writer_ran = false;
+    let refused = without_memory(|| {
+        vm.capture_mutation(false, &mut state, &[(cell, 8)], |image| {
+            writer_ran = true;
+            bytes::write_u64(image, cell, 1)
+        })
+    });
+    assert_eq!(Err(ErrorCode::JournalOverflow), refused);
+    assert!(
+        !writer_ran,
+        "a refused reservation never reaches the writer"
+    );
+    assert_eq!(original, state, "the refusal wrote nothing");
+    assert_eq!(open(true, true, 0, 0), vm.undo_status());
+
+    assert_eq!(
+        Err(ErrorCode::JournalOverflow),
+        set_count(&mut vm, &mut state, cell, 1),
+        "memory coming back does not reopen a refused window"
+    );
+    assert_eq!(original, state);
+
+    vm.undo_commit();
+    vm.undo_enable(&state).expect("a committed window reopens");
+    set_count(&mut vm, &mut state, cell, 1).expect("the new window journals");
+    assert_eq!(open(true, false, 1, 0), vm.undo_status());
+}
+
+/// A paired write whose undo and redo records cannot be backed refuses
+/// before it inserts, and the refusal is sticky for undo-only writes too.
+#[test]
+fn unbacked_paired_write_refuses_before_inserting() {
+    let prog = map_program(16);
+    let mut state = init(&prog);
+    let original = state.clone();
+    let mut vm = Vm::default();
+    vm.undo_enable(&state).expect("undo window opens");
+
+    let refused = without_memory(|| upsert(&mut vm, &mut state, 7, 70, true));
+    assert_eq!(ErrorCode::JournalOverflow, refused);
+    assert_eq!(original, state, "the refusal wrote nothing");
+    assert_eq!(None, lookup(&state, 7));
+    assert_eq!(open(true, true, 0, 0), vm.undo_status());
+    assert_eq!(
+        ErrorCode::JournalOverflow,
+        upsert(&mut vm, &mut state, 7, 70, false)
+    );
+    assert_eq!(original, state);
+}
+
+/// Opening the redo lane in a window that already holds undo-only entries
+/// backs one redo record per existing entry. When that storage cannot be had
+/// the paired write is refused before any write, and the window stays refused.
+#[test]
+fn unbacked_redo_lane_refuses_the_paired_write_and_stays_refused() {
+    let prog = map_program(16);
+    let mut state = init(&prog);
+    let mut vm = Vm::default();
+    vm.undo_enable(&state).expect("undo window opens");
+    assert_eq!(ErrorCode::Ok, upsert(&mut vm, &mut state, 1, 10, false));
+    let checkpoint = vm.undo_checkpoint();
+    assert!(checkpoint > 0, "the undo-only write journals");
+    assert!(!vm.undo_redo_lane_status().active);
+    let written = state.clone();
+
+    let refused = without_memory(|| upsert(&mut vm, &mut state, 2, 20, true));
+    assert_eq!(ErrorCode::JournalOverflow, refused);
+    assert_eq!(written, state, "the refusal wrote nothing");
+    assert_eq!(None, lookup(&state, 2));
+    assert!(
+        !vm.undo_redo_lane_status().active,
+        "a refused lane is not opened"
+    );
+    assert_eq!(open(true, true, checkpoint, 0), vm.undo_status());
+    assert_eq!(
+        ErrorCode::JournalOverflow,
+        upsert(&mut vm, &mut state, 3, 30, false),
+        "memory coming back does not reopen a refused window"
+    );
+    assert_eq!(written, state);
+
+    assert_eq!(Ok(image_len(&state)), vm.undo_rollback(&mut state, 0));
+    assert_eq!(
+        None,
+        lookup(&state, 1),
+        "rollback still restores the window"
+    );
 }

@@ -654,9 +654,17 @@ impl UndoState {
             redo.is_none() || self.redo_active,
             "paired lane must be admitted before writing"
         );
+        debug_assert!(
+            self.entries.len() < self.entries.capacity(),
+            "undo entry storage must be admitted before writing"
+        );
         self.entries.push(undo);
         if self.redo_active {
             debug_assert_eq!(self.redo.len() + 1, self.entries.len());
+            debug_assert!(
+                self.redo.len() < self.redo.capacity(),
+                "redo storage must be admitted before writing"
+            );
             self.redo.push(redo);
         }
         if redo.is_some() {
@@ -763,6 +771,13 @@ impl UndoState {
                     cursor += 1;
                 } else {
                     let size = self.chunk_len(cursor, end - cursor);
+                    debug_assert!(
+                        self.capture_ranges.len() < self.capture_ranges.capacity()
+                            && usize::try_from(size).is_ok_and(|size| {
+                                self.capture_scratch.capacity() - self.capture_scratch.len() >= size
+                            }),
+                        "capture storage must be admitted before copying"
+                    );
                     self.capture_ranges.push((cursor, size));
                     self.capture_scratch
                         .extend_from_slice(&state[cursor as usize..(cursor + size) as usize]);
@@ -6227,5 +6242,61 @@ impl<'a> CheckedStructMap2<'a> {
     pub fn iter_row(&self, pos: u32) -> Result<u32, ErrorCode> {
         live_key_at(self.state, self.view.keys1_off, self.view.capacity, pos)?;
         Ok(self.view.row_off(pos))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Vm;
+    use crate::state_init::{DEFAULT_ACCEPTED_PROGRAM_MAGICS, calculate_state_size, init_state};
+    use columine_types::PROGRAM_MAGIC;
+    use columine_types::types::{AggType, Opcode, SlotType};
+
+    /// A state holding one COUNT aggregate slot.
+    fn count_state() -> Vec<u8> {
+        let init = [
+            Opcode::SlotDef as u8,
+            0,
+            SlotType::Aggregate as u8,
+            AggType::Count as u8,
+            0,
+            Opcode::Halt as u8,
+        ];
+        let reduce = [Opcode::Halt as u8];
+        let mut prog = vec![0u8; 32];
+        prog.extend(PROGRAM_MAGIC.to_le_bytes());
+        prog.extend([2, 0, 0, 0]);
+        prog.extend(1u32.to_le_bytes());
+        prog.extend(0u32.to_le_bytes());
+        prog.extend(6u32.to_le_bytes());
+        prog.extend(1u32.to_le_bytes());
+        prog.extend(init);
+        prog.extend(reduce);
+        let size = calculate_state_size(&prog, DEFAULT_ACCEPTED_PROGRAM_MAGICS).expect("admitted");
+        let mut state = vec![0u8; usize::try_from(size).expect("size fits usize")];
+        init_state(&mut state, &prog, DEFAULT_ACCEPTED_PROGRAM_MAGICS).expect("init_state");
+        state
+    }
+
+    /// Generations are unique across journals: a frame begun in one VM's
+    /// window cannot be finished by another VM's window over the same image,
+    /// even though both windows opened at the same point.
+    #[test]
+    #[should_panic(expected = "another undo window")]
+    fn a_capture_cannot_finish_in_another_journal() {
+        let state = count_state();
+        let mut a = Vm::default();
+        let mut b = Vm::default();
+        a.undo_enable(&state).expect("window a opens");
+        b.undo_enable(&state).expect("window b opens");
+        let ranges = [(0, 4)];
+        let capture = a
+            .undo
+            .begin_capture(&state, &ranges)
+            .expect("capture begins");
+        // B's own open frame gives it the depth A's frame carries, so only the
+        // generation tells the two windows apart.
+        let _open_in_b = b.undo.begin_capture(&state, &[]).expect("b opens a frame");
+        b.undo.finish_capture(false, &state, &ranges, capture);
     }
 }

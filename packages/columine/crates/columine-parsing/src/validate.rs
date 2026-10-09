@@ -2680,9 +2680,11 @@ mod tests {
             SemanticSchema::Vo(_)
         ));
         // Namespace segments are DNS labels: hyphens inside, a leading digit.
+        let longest_label = format!("{}.Line", "a".repeat(63));
         for root in [
             "org.example.shell-exec.v3.Failed",
             "org.ex-ample.9lives.Sample",
+            longest_label.as_str(),
         ] {
             assert!(
                 matches!(
