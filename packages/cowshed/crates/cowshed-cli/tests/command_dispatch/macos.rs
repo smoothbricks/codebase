@@ -2877,6 +2877,15 @@ async fn real_apfs_re_adopt_replaces_main_keeps_its_build_identity_and_retains_t
     for image in [&main_image, &build_image] {
         host.detach_existing_image(image, DetachIntent::WhenIdle)
             .expect("seal only this fixture input");
+        if image == &main_image {
+            // This own underlay blocks publication after the warm build copy, giving the
+            // prepublication crash boundary without a mock or a second volume setup.
+            fs::write(
+                fixture.checkout.join("publication-blocker"),
+                b"operator data\n",
+            )
+            .expect("hold the fixture's publication boundary");
+        }
         let legacy_image = image.with_extension("asif");
         let convert = cowshed_core::apfs::CommandRequest::new(
             "/usr/sbin/diskutil",
@@ -2957,7 +2966,7 @@ async fn real_apfs_re_adopt_replaces_main_keeps_its_build_identity_and_retains_t
         record
     );
     let mut legacy_service = fixture.open().await;
-    succeed(
+    let (refused, _, _) = run(
         &mut legacy_service,
         [
             OsString::from("adopt"),
@@ -2966,6 +2975,208 @@ async fn real_apfs_re_adopt_replaces_main_keeps_its_build_identity_and_retains_t
         ],
     )
     .await;
+    let refused = refused.expect_err("the own underlay refuses publication after build copy");
+    assert!(
+        refused
+            .message
+            .contains("the checkout a replacement mounts on"),
+        "{refused:?}"
+    );
+    legacy_service
+        .shutdown()
+        .await
+        .expect("stop the interrupted migration runtime");
+    let journal_path = project_root.join("lifecycle-intents.json");
+    let interrupted =
+        cowshed_core::storage::recovery::LifecycleIntentJournal::load(&journal_path).unwrap();
+    let interrupted = interrupted
+        .get(&WorkspaceName::main())
+        .expect("recorded replacement");
+    assert!(interrupted.completion.is_none());
+    let cowshed_core::storage::recovery::LifecycleIntent::ReAdopt { source, .. } =
+        &interrupted.operation
+    else {
+        panic!("the same re-adoption is recorded")
+    };
+    let replacement = source.replacement.clone();
+    let replacement_build = source.build.as_ref().expect("recorded warm build");
+    assert!(
+        replacement_build.replacement_image.exists(),
+        "the build-copy-complete boundary"
+    );
+    assert!(
+        !main_image.exists(),
+        "the replacement main is not published yet"
+    );
+    assert!(
+        source.image.retained.exists(),
+        "the original source remains retained"
+    );
+    assert!(
+        replacement_build.image.retained.exists(),
+        "the original build remains retained"
+    );
+    assert!(
+        !fixture.checkout.join(".git").exists(),
+        "there is no Git checkout to discover"
+    );
+    assert_eq!(
+        fs::read(fixture.checkout.join("publication-blocker")).unwrap(),
+        b"operator data\n"
+    );
+    fs::remove_file(fixture.checkout.join("publication-blocker"))
+        .expect("the operator releases only this fixture's owned publication blocker");
+
+    // Both normal CLI routes use the same exact strict unfinished-journal authority.
+    let inventory = cowshed_core::NativeGatewayInventory::new(fixture.storage.clone());
+    assert_eq!(
+        inventory
+            .forming_re_adoption_root(&fixture.checkout)
+            .await
+            .unwrap(),
+        Some(fixture.checkout.clone())
+    );
+    let unrelated = fixture._scratch.path().join("unrelated-empty");
+    fs::create_dir(&unrelated).unwrap();
+    assert_eq!(
+        inventory
+            .forming_re_adoption_root(&unrelated)
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        cowshed_core::forming_re_adoption_checkout(
+            &storage,
+            &RepoId::parse("other/dispatch").unwrap(),
+            &fixture.checkout,
+        )
+        .unwrap(),
+        None,
+        "the same checkout never admits a different repository"
+    );
+    let resolved_mount = cowshed_cli::mount_main::resolve_main_mount(
+        fixture.storage.store(),
+        &RepoId::parse("fixture/dispatch").unwrap(),
+    )
+    .expect("the documented mount route resolves a prepublication replacement");
+    assert!(resolved_mount.resuming_re_adoption);
+    assert_eq!(resolved_mount.checkout_path, fixture.checkout);
+    let retained_before: std::collections::BTreeSet<_> =
+        fs::read_dir(project_root.join("retained"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+    // The operator can restore the retained source and build read-only at their canonical
+    // paths while the same intent is pending. Reproduce that real recovery boundary here.
+    use cowshed_core::storage::apfs::native::{KernelMountSource, SystemKernelMountSource};
+    let mounts = SystemKernelMountSource
+        .mounts()
+        .expect("own retained fixture mounts");
+    for (from, to) in [
+        (&source.image.source_mount, fixture.checkout.clone()),
+        (
+            &replacement_build.image.source_mount,
+            layout.mount(&main_volume),
+        ),
+    ] {
+        let device = &mounts
+            .iter()
+            .find(|mount| mount.mount_point == *from)
+            .expect("the recorded retained fixture input is mounted")
+            .source_device;
+        let unmount = cowshed_core::apfs::CommandRequest::new(
+            "/sbin/umount",
+            [from.as_os_str().to_os_string()],
+        );
+        let result = SystemCommandRunner.run(&unmount).unwrap();
+        assert!(
+            result.succeeded(),
+            "normal own retained-input unmount: {result:?}"
+        );
+        let remount = cowshed_core::apfs::CommandRequest::new(
+            "/sbin/mount_apfs",
+            [
+                OsString::from("-o"),
+                OsString::from("rdonly,nobrowse,owners"),
+                OsString::from(device),
+                to.as_os_str().to_os_string(),
+            ],
+        );
+        let result = SystemCommandRunner.run(&remount).unwrap();
+        assert!(
+            result.succeeded(),
+            "normal own readonly remount: {result:?}"
+        );
+        let refused = fs::write(to.join("readonly-remount-probe"), b"must refuse")
+            .expect_err("the restored retained input must be read-only");
+        assert_eq!(refused.raw_os_error(), Some(libc::EROFS));
+    }
+    assert_eq!(
+        cowshed_core::git::GitRepository::discover(&fixture.checkout)
+            .await
+            .unwrap()
+            .root(),
+        fixture.checkout,
+        "Git is now present, but the pending replacement still owns this retry"
+    );
+    assert_eq!(
+        inventory
+            .forming_re_adoption_root(&fixture.checkout)
+            .await
+            .unwrap(),
+        Some(fixture.checkout.clone())
+    );
+    let backend = cowshed_cli::mount_main::NativeMainMountBackend::new(fixture.storage.clone());
+    let mut mount_output = Output::new(Vec::new(), Vec::new(), false);
+    cowshed_cli::mount_main::dispatch_mount_main(
+        &backend,
+        &RepoId::parse("fixture/dispatch").unwrap(),
+        true,
+        &mut mount_output,
+    )
+    .await
+    .expect("the actual native mount command resumes the prepublication replacement");
+    legacy_service = fixture.open().await;
+    // The retry returns the existing coordinator's main info, never another adopt/reclaim.
+    let recovered_info = legacy_service
+        .workspace_at(fixture.checkout.clone())
+        .await
+        .expect("the existing coordinator returns the recovered main");
+    assert_eq!(recovered_info.workspace, WorkspaceName::main());
+    assert_eq!(recovered_info.mount, fixture.checkout);
+    let (mount_stdout, _) = mount_output.into_inner();
+    let mount_response: serde_json::Value = serde_json::from_slice(&mount_stdout).unwrap();
+    assert_eq!(
+        mount_response["result"]["mount"],
+        fixture.checkout.to_str().unwrap()
+    );
+    let recovered_metadata =
+        cowshed_core::metadata::DetachedWorkspaceMetadata::read_for_image(&main_image).unwrap();
+    assert_eq!(recovered_metadata.workspace_incarnation, replacement);
+    assert_eq!(
+        inventory
+            .forming_re_adoption_root(&fixture.checkout)
+            .await
+            .unwrap(),
+        None
+    );
+    let resumed =
+        cowshed_core::storage::recovery::LifecycleIntentJournal::load(&journal_path).unwrap();
+    let resumed = resumed.get(&WorkspaceName::main()).unwrap();
+    assert!(resumed.completion.is_some());
+    assert_eq!(
+        resumed.operation, interrupted.operation,
+        "no second replacement was issued"
+    );
+    let retained_after: std::collections::BTreeSet<_> = fs::read_dir(project_root.join("retained"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(
+        retained_after, retained_before,
+        "recovery adds no second retained generation"
+    );
     assert_eq!(git_stdout(&fixture.checkout, &["rev-parse", "HEAD"]), head);
     assert_eq!(
         fs::read(fixture.checkout.join("notes.txt")).unwrap(),

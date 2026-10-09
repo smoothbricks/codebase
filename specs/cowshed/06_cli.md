@@ -244,6 +244,12 @@ never errors).
 | `cowshed gc`                                  | freed bytes                                      | Two-phase exact candidate plan (01); `--dry-run` lists typed candidates and sums bytes with zero mutation.                                                                                                                                                                                                                                                                                                                                                                                                                     |
 | `cowshed doctor`                              | `--json` findings                                | Invariant checks; each finding carries a `fix:` hint.                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 
+During an interrupted re-adoption (02 §Re-adoption), `adopt <checkout> --re-adopt` and
+`mount main --repo-id <owner/repo>` resolve from the existing controller checkout-path record only when a strict
+unfinished journal owns the exact repository and checkout. No Git checkout is required at that boundary. They finish the
+recorded replacement incarnation, never a second reclaim; a checkout-path record without that journal is not recovery
+authority.
+
 `gc` never lets a candidate-local failure prevent later candidates from being tried; it reports each deferred path and
 diagnostic on stderr and in the structured result, alongside actual bytes freed. `doctor` diagnoses sidecarless session
 images by name rather than treating them as live workspaces or failing the inventory. Store-wide `ls --all` and

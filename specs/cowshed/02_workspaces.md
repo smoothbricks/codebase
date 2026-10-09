@@ -145,7 +145,14 @@ ASIF-to-RAW transition and the RAW guest-space reclaim operation, not an image c
    Verify the remounted content, Git state and build identity against the recorded before-state. Return the retained
    image path and its explicit later-removal instruction. Keep the old backing image and original `.pre-cowshed` until
    the user removes them after verification; repeated invocation resumes the transaction rather than replacing its
-   evidence.
+   evidence. Both `adopt <checkout> --re-adopt` and `mount main --repo-id <owner/repo>` reach this recovery without a
+   live Git checkout, but only from the strict unfinished journal's exact repository/checkout match. After startup
+   finishes that intent, retrying adopt retrieves its recorded replacement rather than beginning another reclaim or
+   retained generation. A recorded retained source temporarily remounted read-only at its canonical checkout remains a
+   recovery input, not an active workspace. Repairing startup recognizes it only when the strict unfinished journal's
+   old repository, checkout, workspace and incarnation match its marker, and the kernel joins that exact retained image
+   to a read-only mount at that checkout. Recorded main/build inputs restored read-only at their canonical paths move
+   back to their recorded copy stages without force. Foreign paths and read-write retained mounts refuse.
 
 Re-adoption copies filesystem entries, not allocated-but-free guest blocks. Space returns only after verification and
 explicit release of the old image and any snapshots sharing its blocks (01_storage.md, "Space reclamation"). Existing
@@ -160,10 +167,10 @@ mounts at `<mount-root>/<owner>/<repo>/<workspace>`, where the mount root is hos
 exclusion is required for them. Changing the root requires every workspace detached and is refused otherwise.
 
 **Direct mount.** `main` mounts at the checkout's original path. Publication renames the original tree to
-`<root>.pre-cowshed`, recreates the emptied directory as the mountpoint with the stub `.envrc` inside it, and attaches
-there. The user's path is the real thing: `pwd -P` reports it, the gitdir physically lives under it, and Finder shows
-the volume label — which is why the label is the repository's name (01_storage.md) rather than an encoded identity. The
-cost is one mounted volume inside the user's source tree and a mountpoint that cannot be moved by `mv`.
+`<root>.pre-cowshed`, recreates an empty directory as the mountpoint without any shell hook, and attaches there. The
+user's path is the real thing: `pwd -P` reports it, the gitdir physically lives under it, and Finder shows the volume
+label — which is why the label is the repository's name (01_storage.md) rather than an encoded identity. The cost is one
+mounted volume inside the user's source tree and a mountpoint that cannot be moved by `mv`.
 
 **Why not a symlink.** Mounting main inside the store and leaving a symlink at the original path would keep the tree
 movable, but Git resolves `gitdir:` conditions against the real path — the moment adopt completed, every

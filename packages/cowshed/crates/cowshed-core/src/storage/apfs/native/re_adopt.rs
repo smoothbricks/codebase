@@ -90,6 +90,24 @@ where
         Ok(self.backend.attached_capacity(image)?.bytes())
     }
 
+    /// A recorded retained main restored at the checkout is a recovery input, not an active
+    /// workspace. Its actual backing-image/device join and read-only mount must both match.
+    pub(crate) fn retained_re_adopt_main_is_mounted(
+        &self,
+        source: &ReAdoptSource,
+    ) -> Result<bool, ApfsStorageError> {
+        self.verify_controller_path(&source.image.retained)?;
+        let input = retained_input(source, &source.image.retained)?;
+        let Some(attachment) = self.backend.existing_retained_attachment(&input)? else {
+            return Ok(false);
+        };
+        Ok(self.mount_source.mounts()?.into_iter().any(|mount| {
+            mount.mount_point == source.checkout
+                && mount.source_device == attachment.volume_device()
+                && mount.access() == MountAccess::ReadOnly
+        }))
+    }
+
     /// Attach the retained main and build images read-only at their recorded staging mounts,
     /// each verified by the attach's fsck. An image already mounted there by its own volume is
     /// left as it is.
@@ -414,9 +432,9 @@ where
         }
     }
 
-    /// Attach the retained input at `path` read-only and mount it at `mount`. One already
-    /// mounted exactly there read-only is left as it is; one attached without a mount (a crash
-    /// between attach and mount) is detached and verified afresh.
+    /// Attach the retained input at `path` read-only and mount it at `mount`. An exact
+    /// read-only staging mount is kept. An operator-restored read-only canonical main/build
+    /// is moved back without force; every foreign or read-write mount still refuses.
     fn mount_retained(
         &self,
         source: &ReAdoptSource,
@@ -436,6 +454,27 @@ where
                         && mounted.access() == MountAccess::ReadOnly =>
                 {
                     return Ok(());
+                }
+                Some(mounted) if mounted.access() == MountAccess::ReadOnly => {
+                    let canonical = if path == source.image.retained {
+                        mounted.mount_point == source.checkout
+                    } else if let Some(build) = &source.build
+                        && path == build.image.retained
+                    {
+                        let layout = BuildVolumeLayout::new(
+                            super::layout(&self.config, &source.metadata.repo_id)?.project(),
+                        )?;
+                        mounted.mount_point == layout.mount(&build.id)
+                    } else {
+                        false
+                    };
+                    if !canonical {
+                        return Err(ApfsStorageError::InvalidPlan(
+                            "a retained re-adoption input is mounted outside its recorded canonical or staging path",
+                        ));
+                    }
+                    self.backend.unmount_retained_when_idle(&attachment)?;
+                    self.backend.detach_retained_when_idle(&attachment)?;
                 }
                 Some(_) => {
                     return Err(ApfsStorageError::InvalidPlan(

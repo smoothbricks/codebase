@@ -1,10 +1,8 @@
 //! `cowshed mount main --repo-id <owner/repo>`.
 //!
-//! The one verb that mounts a main without a live checkout. Resolution reads
-//! store records only — the repository binding (`repository.json`) and the
-//! checkout-path record (the canonical main image's sidecar) — so an empty
-//! stub directory left by a broken workspace still resolves, and no git
-//! repository is ever consulted.
+//! The one verb that mounts a main without a live checkout. Resolution reads store records
+//! only: the repository binding and the canonical main's sidecar, or the exact checkout-root
+//! owned by a strict unfinished re-adoption. Git discovery is never consulted.
 //!
 //! The mount itself goes through the gateway's own path
 //! ([`ApfsSubstrate::ensure_mounted`] with `browse` disabled, exactly the
@@ -47,14 +45,15 @@ pub struct ResolvedMainMount {
     pub image: PathBuf,
     /// The project's store directory, where every record above lives.
     pub project_root: PathBuf,
+    /// Opening must finish this exact recorded replacement before the normal mount.
+    pub resuming_re_adoption: bool,
 }
 
 /// Resolve a main from store records alone.
 ///
-/// Order: the repository binding, then the checkout-path record carried by
-/// the canonical main image's sidecar. A missing checkout-path record is an
-/// error naming the expected checkout path, never a silent default. Git —
-/// live or otherwise — is not consulted.
+/// Order: the repository binding, then the canonical main's Active sidecar. Before a
+/// replacement is published, the checkout-root is accepted only when its strict unfinished
+/// journal names this same repository and checkout. Git is never consulted.
 pub fn resolve_main_mount(store_root: &Path, repo_id: &RepoId) -> Result<ResolvedMainMount> {
     let layout = StorageLayout::new(store_root, repo_id).map_err(|error| {
         CowshedError::not_found(
@@ -123,6 +122,22 @@ pub fn resolve_main_mount(store_root: &Path, repo_id: &RepoId) -> Result<Resolve
     } else {
         None
     };
+    let (found, resuming_re_adoption) = match found {
+        Some(checkout) => (Some(checkout), false),
+        None => {
+            let recorded = layout.recorded_checkout_root().map_err(|error| {
+                integrity(format!("invalid checkout-root for {repo_id}: {error}"))
+            })?;
+            let checkout = match recorded {
+                Some(checkout) => {
+                    cowshed_core::forming_re_adoption_checkout(&layout, repo_id, &checkout)
+                        .map_err(|error| integrity(error.to_string()))?
+                }
+                None => None,
+            };
+            (checkout, true)
+        }
+    };
     let checkout_path = found.ok_or_else(|| {
         CowshedError::not_found(
             format!(
@@ -137,6 +152,7 @@ pub fn resolve_main_mount(store_root: &Path, repo_id: &RepoId) -> Result<Resolve
         checkout_path,
         image,
         project_root: project.project_root.clone(),
+        resuming_re_adoption,
     })
 }
 
@@ -184,6 +200,17 @@ impl MainMountBackend for NativeMainMountBackend {
         resolved: &ResolvedMainMount,
         intent: MountIntent,
     ) -> Result<PathBuf> {
+        if resolved.resuming_re_adoption {
+            // Resume the journal through the existing runtime before asking the shared mount
+            // path for main. Never invent a main from an empty directory or an unpublished image.
+            let runtime = cowshed_core::runtime::ProjectRuntime::open_existing_at(
+                &resolved.checkout_path,
+                cowshed_core::runtime::RecoveryScope::Workspaces(Default::default()),
+                self.storage.clone(),
+            )
+            .await?;
+            runtime.shutdown().await?;
+        }
         let config = ApfsSubstrateConfig::new(self.storage.store(), &resolved.checkout_path);
         let host = MacOsApfsExecutionHost::new(SystemCommandRunner, config.clone())
             .map_err(storage_error)?;

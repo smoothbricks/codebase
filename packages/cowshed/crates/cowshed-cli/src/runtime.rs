@@ -1038,7 +1038,18 @@ pub fn merge_primary(primary: CowshedError, teardown: Option<CowshedError>) -> C
     }
 }
 
+struct ResolvedProjectRoot {
+    root: PathBuf,
+    resuming_re_adoption: bool,
+}
+
 pub async fn resolve_project_root(cli: &Cli) -> Result<PathBuf> {
+    resolve_project_context(cli)
+        .await
+        .map(|resolved| resolved.root)
+}
+
+async fn resolve_project_context(cli: &Cli) -> Result<ResolvedProjectRoot> {
     let candidate = cli.global.project.as_deref().or(match &cli.command {
         Command::Adopt(args) => args.path.as_deref(),
         _ => None,
@@ -1052,13 +1063,31 @@ pub async fn resolve_project_root(cli: &Cli) -> Result<PathBuf> {
             )
         })?,
     };
-    let root = GitRepository::discover(start)
+    let root = GitRepository::discover(&start)
         .await
         .map(|repository| repository.root().to_path_buf());
+    // A retained source can be restored read-only while recovery is pending. Its Git
+    // checkout then exists again, but this invocation still finishes the recorded intent.
+    if matches!(&cli.command, Command::Adopt(args) if args.re_adopt) {
+        let inventory = NativeGatewayInventory::new(host_storage().await?);
+        if let Some(root) = inventory
+            .forming_re_adoption_root(&start)
+            .await
+            .map_err(project_inventory_error)?
+        {
+            return Ok(ResolvedProjectRoot {
+                root,
+                resuming_re_adoption: true,
+            });
+        }
+    }
     match (&cli.command, root) {
-        (Command::Adopt(_), result) => result,
+        (_, Ok(root)) => Ok(ResolvedProjectRoot {
+            root,
+            resuming_re_adoption: false,
+        }),
+        (Command::Adopt(_), Err(error)) => Err(error),
         (_, Err(error)) => Err(project_context_error(error)),
-        (_, Ok(root)) => Ok(root),
     }
 }
 
@@ -1080,6 +1109,69 @@ fn optional_project_unavailable(error: &CowshedError) -> bool {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DispatchExit {
     pub code: i32,
+}
+
+enum AdoptionOutcome<'a> {
+    Created { capacity: &'a str },
+    Recovered,
+}
+
+async fn report_adoption<S, W, E>(
+    service: &mut S,
+    info: &WorkspaceInfo,
+    outcome: AdoptionOutcome<'_>,
+    json: bool,
+    output: &mut Output<W, E>,
+) -> Result<DispatchExit>
+where
+    S: CliService,
+    W: Write + Send,
+    E: Write + Send,
+{
+    // The durable adoption/recovery is complete. A gateway refusal is a separate,
+    // recoverable condition, not a reason to issue another adoption.
+    let gateway = service.reconcile_gateway().await;
+    emit_mount(output, json, info)?;
+    let guidance = match outcome {
+        AdoptionOutcome::Created { capacity } => format!(
+            "created {}.{IMAGE_EXTENSION} for {} (capacity {capacity})",
+            info.workspace, info.repo_id,
+        ),
+        AdoptionOutcome::Recovered => format!(
+            "resumed recorded replacement for {} at {}",
+            info.workspace,
+            info.mount.display(),
+        ),
+    };
+    output.guidance(&guidance).map_err(output_error)?;
+    match gateway {
+        Ok(()) => output.hint("cowshed new <name>").map_err(output_error)?,
+        Err(error) => {
+            output
+                .guidance(&format!(
+                    "adopted; the gateway is not ready yet: {}",
+                    error.message,
+                ))
+                .map_err(output_error)?;
+            output.hint(&error.hint).map_err(output_error)?;
+        }
+    }
+    Ok(success())
+}
+
+async fn report_recovered_adoption<S, W, E>(
+    service: &mut S,
+    root: &Path,
+    json: bool,
+    output: &mut Output<W, E>,
+) -> Result<DispatchExit>
+where
+    S: CliService,
+    W: Write + Send,
+    E: Write + Send,
+{
+    let info = service.workspace_at(root.to_path_buf()).await?;
+    report_adoption(service, &info, AdoptionOutcome::Recovered, json, output).await
 }
 
 pub async fn dispatch<S, R, W, E>(
@@ -1108,33 +1200,16 @@ where
                 .clone()
                 .unwrap_or_else(|| DEFAULT_IMAGE_CAPACITY.to_string());
             let info = service.adopt(options).await?;
-            // Adoption is the durable state change and it has already happened:
-            // the tree is copied and the image is mounted. A gateway that is not
-            // installed or running is a separate, recoverable condition, and
-            // reporting it as the command's failure reads as "adoption failed"
-            // and invites a destructive retry. Report the mount, then the
-            // gateway, and let `doctor` be the health verdict.
-            let gateway = service.reconcile_gateway().await;
-            emit_mount(output, json, &info)?;
-            output
-                .guidance(&format!(
-                    "created {}.{IMAGE_EXTENSION} for {} (capacity {capacity})",
-                    info.workspace, info.repo_id,
-                ))
-                .map_err(output_error)?;
-            match gateway {
-                Ok(()) => output.hint("cowshed new <name>").map_err(output_error)?,
-                Err(error) => {
-                    output
-                        .guidance(&format!(
-                            "adopted; the gateway is not ready yet: {}",
-                            error.message
-                        ))
-                        .map_err(output_error)?;
-                    output.hint(&error.hint).map_err(output_error)?;
-                }
-            }
-            Ok(success())
+            report_adoption(
+                service,
+                &info,
+                AdoptionOutcome::Created {
+                    capacity: &capacity,
+                },
+                json,
+                output,
+            )
+            .await
         }
         Command::New(args) => {
             let options =
@@ -4405,6 +4480,13 @@ where
         dispatch(&mut service, cli, stdin, output),
     )
     .await;
+    finish_dispatch(service, primary).await
+}
+
+async fn finish_dispatch<S: CliService>(
+    service: S,
+    primary: Result<DispatchExit>,
+) -> Result<DispatchExit> {
     let teardown = cowshed_core::timing::spanned("cli", "shutdown", service.shutdown())
         .await
         .err();
@@ -4446,19 +4528,17 @@ where
     if discovery == ProjectDiscovery::NotUsed {
         return dispatch_host_command(cli, output, false).await;
     }
-    let root = match cowshed_core::timing::spanned(
-        "cli",
-        "resolve-root",
-        resolve_project_root(&cli),
-    )
-    .await
-    {
-        Ok(root) => root,
-        Err(_) if discovery == ProjectDiscovery::Optional => {
-            return dispatch_host_command(cli, output, true).await;
-        }
-        Err(error) => return Err(error),
-    };
+    let resolved =
+        match cowshed_core::timing::spanned("cli", "resolve-root", resolve_project_context(&cli))
+            .await
+        {
+            Ok(resolved) => resolved,
+            Err(_) if discovery == ProjectDiscovery::Optional => {
+                return dispatch_host_command(cli, output, true).await;
+            }
+            Err(error) => return Err(error),
+        };
+    let root = &resolved.root;
     let mode = runtime_open_mode(&cli.command);
     let requested_repo_id = runtime_open_repo_id(&cli.command)?;
     if mode == RuntimeOpenMode::Provision {
@@ -4476,7 +4556,7 @@ where
         }
     };
     drop(open_span);
-    let bridge = match bridge {
+    let mut bridge = match bridge {
         Ok(bridge) => bridge,
         Err(error)
             if discovery == ProjectDiscovery::Optional && optional_project_unavailable(&error) =>
@@ -4485,7 +4565,17 @@ where
         }
         Err(error) => return Err(error),
     };
-    dispatch_and_shutdown(bridge, cli, stdin, output).await
+    if resolved.resuming_re_adoption {
+        let primary = cowshed_core::timing::spanned(
+            "cli",
+            "dispatch",
+            report_recovered_adoption(&mut bridge, root, cli.global.json, output),
+        )
+        .await;
+        finish_dispatch(bridge, primary).await
+    } else {
+        dispatch_and_shutdown(bridge, cli, stdin, output).await
+    }
 }
 
 pub async fn run_host_command<W, E>(cli: Cli, output: &mut Output<W, E>) -> Result<DispatchExit>

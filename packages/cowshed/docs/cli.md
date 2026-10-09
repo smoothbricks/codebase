@@ -376,6 +376,11 @@ Before publication, cowshed verifies tracked and untracked-not-ignored file chec
 and the build contents and identity, and checks host allocation with `du` and `st_blocks * 512`. Any mismatch refuses
 publication and leaves the source available. The verified replacement then mounts at the original checkout path.
 
+If interrupted before the replacement mounts, retry the same `adopt <checkout> --re-adopt` from outside the checkout, or
+run `cowshed mount main --repo-id <owner/repo>`. Both routes admit a checkout without Git only when the controller's
+strict unfinished replacement record owns that exact repository and path. They finish the recorded incarnation; they do
+not begin a second replacement or retained generation.
+
 The old backing image and any existing `<checkout>.pre-cowshed` tree are never overwritten or deleted. cowshed reports
 their paths and keeps them until you remove them after verification. An interrupted replacement resumes its recorded
 transaction rather than starting another. An earlier ASIF main is only an input to this transaction; ordinary commands
@@ -747,7 +752,9 @@ stderr; successful changes to other workspaces remain effective.
 Mount main for the named project and print its mount path. Resolution reads store records — the repository binding and
 the checkout-path record — rather than a live git checkout, so it works from an empty stub directory left by a broken
 workspace and never requires cwd or git discovery. The mount uses the gateway-canonical flags; a volume mounted with
-other flags is remounted rather than refused.
+other flags is remounted rather than refused. During an unfinished re-adoption, its strict recorded repository and
+checkout authorize recovery before the normal mount. A checkout-path record alone never authorizes mounting an arbitrary
+empty directory.
 
 ### `cowshed resize <name|main> <size>`
 

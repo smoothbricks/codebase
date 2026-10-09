@@ -2929,11 +2929,33 @@ impl NativeProjectRuntimeHost {
         })??;
         let verified_facts = verified_recovery_facts(&facts, &pending);
         if let Some(origin) = origin.as_ref() {
-            validate_workspace_origin_against_inventory(
-                origin,
-                &binding.owned_repo_ids().map_err(native_integrity_error)?,
-                &verified_facts,
-            )?;
+            // The exact old input may have been restored read-only at main while its
+            // replacement is pending. It is admitted only to finish that recorded recovery,
+            // never fabricated as an active storage fact.
+            let retained_origin = if recovery_scope.repairs() {
+                match lifecycle_intents.forming_re_adoptions().find(|source| {
+                    source.checkout == git_root
+                        && source.metadata.repo_id == repo_id
+                        && origin.project_root == source.checkout
+                        && origin.repo_id == source.metadata.repo_id
+                        && origin.workspace == source.metadata.workspace
+                        && origin.workspace_incarnation == source.metadata.workspace_incarnation
+                }) {
+                    Some(source) => host
+                        .retained_re_adopt_main_is_mounted(source)
+                        .map_err(native_storage_error)?,
+                    None => false,
+                }
+            } else {
+                false
+            };
+            if !retained_origin {
+                validate_workspace_origin_against_inventory(
+                    origin,
+                    &binding.owned_repo_ids().map_err(native_integrity_error)?,
+                    &verified_facts,
+                )?;
+            }
         }
         // Authority is the inventory itself: an incarnation that is both an active storage fact
         // and a retired (trashed) one is a host-side integrity fault, found here in one pass —

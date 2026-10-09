@@ -849,6 +849,33 @@ impl NativeGatewayInventory {
         .map_err(|error| GatewayInventoryError::Blocking(error.to_string()))?
     }
 
+    /// The exact checkout an unfinished, validated re-adoption owns, even before its new
+    /// main image is published. A recorded checkout alone never authorizes this recovery.
+    pub async fn forming_re_adoption_root(
+        &self,
+        project_root: &Path,
+    ) -> Result<Option<PathBuf>, GatewayInventoryError> {
+        let inventory = self.clone();
+        let project_root = project_root.to_owned();
+        crate::storage::lifecycle::dispatch_blocking(move || {
+            let Some(repo) = inventory.repository_for_project_root_blocking(&project_root)? else {
+                return Ok(None);
+            };
+            let checkout = fs::canonicalize(&project_root).map_err(|source| {
+                io_error("resolving re-adoption checkout", &project_root, source)
+            })?;
+            let layout = StorageLayout::new(inventory.storage.store(), &repo).map_err(|error| {
+                GatewayInventoryError::InvalidMetadata {
+                    path: inventory.storage.store().to_owned(),
+                    message: error.to_string(),
+                }
+            })?;
+            forming_re_adoption_checkout(&layout, &repo, &checkout)
+        })
+        .await
+        .map_err(|error| GatewayInventoryError::Blocking(error.to_string()))?
+    }
+
     fn repository_for_project_root_blocking(
         &self,
         project_root: &Path,
@@ -1567,6 +1594,30 @@ pub(crate) fn authoritative_checkout_path(
         return Ok(None);
     }
     Ok(Some(metadata.info_snapshot.project_root))
+}
+
+/// Resolve only the exact checkout owned by a strict unfinished replacement record.
+/// A checkout-root record without this journal authority is not a mount/recovery grant.
+pub fn forming_re_adoption_checkout(
+    layout: &StorageLayout,
+    repo: &RepoId,
+    checkout: &Path,
+) -> Result<Option<PathBuf>, GatewayInventoryError> {
+    let path = layout
+        .project()
+        .project_root
+        .join(crate::storage::recovery::LIFECYCLE_INTENTS_FILE);
+    let journal =
+        crate::storage::recovery::LifecycleIntentJournal::load(&path).map_err(|error| {
+            GatewayInventoryError::InvalidMetadata {
+                path,
+                message: error.to_string(),
+            }
+        })?;
+    Ok(journal
+        .forming_re_adoptions()
+        .find(|source| source.checkout == checkout && source.metadata.repo_id == *repo)
+        .map(|source| source.checkout.clone()))
 }
 
 fn expected_mount_paths(
