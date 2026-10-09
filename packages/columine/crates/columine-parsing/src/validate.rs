@@ -1711,23 +1711,38 @@ fn parse_vo_definitions(value: Option<&JsonValue>) -> Option<Vec<VoDefinition>> 
     Some(definitions)
 }
 
-/// `namespace.Record`: two or more dot-separated segments, each an ASCII
-/// identifier (a letter or underscore, then letters, digits, underscores).
+/// `namespace.Record`: two or more dot-separated segments. VO names are
+/// dot-namespaced and DNS-anchored, so every namespace segment is a DNS label
+/// (1-63 letters, digits or hyphens, neither first nor last a hyphen; an
+/// underscore is also admitted, as in identifier-style namespaces). The final
+/// segment names the record and is an ASCII identifier: a letter or
+/// underscore, then letters, digits, underscores.
 fn is_qualified_root(root: &str) -> bool {
-    let mut segments = 0_usize;
-    for segment in root.split('.') {
-        let mut bytes = segment.bytes();
-        let Some(first) = bytes.next() else {
-            return false;
-        };
-        if !(first.is_ascii_alphabetic() || first == b'_')
-            || !bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-        {
-            return false;
-        }
-        segments += 1;
-    }
-    segments >= 2
+    let Some((namespace, record)) = root.rsplit_once('.') else {
+        return false;
+    };
+    namespace.split('.').all(is_namespace_label) && is_identifier(record)
+}
+
+fn is_namespace_label(label: &str) -> bool {
+    let bytes = label.as_bytes();
+    let (Some(&first), Some(&last)) = (bytes.first(), bytes.last()) else {
+        return false;
+    };
+    bytes.len() <= 63
+        && first != b'-'
+        && last != b'-'
+        && bytes
+            .iter()
+            .all(|&byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+}
+
+fn is_identifier(segment: &str) -> bool {
+    let mut bytes = segment.bytes();
+    bytes
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic() || first == b'_')
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
 }
 
 /// Canonical lowercase hex: non-empty, even length, `0-9a-f` only.
@@ -2664,6 +2679,19 @@ mod tests {
             schema(&vo_tree("_a.b_2.C", "00", r#"["00"]"#)),
             SemanticSchema::Vo(_)
         ));
+        // Namespace segments are DNS labels: hyphens inside, a leading digit.
+        for root in [
+            "org.example.shell-exec.v3.Failed",
+            "org.ex-ample.9lives.Sample",
+        ] {
+            assert!(
+                matches!(
+                    schema(&vo_tree(root, "00", r#"["00"]"#)),
+                    SemanticSchema::Vo(_)
+                ),
+                "{root}"
+            );
+        }
         let SemanticSchema::Vo(retained) = schema(
             r#"{"kind":"vo","root":"orders.Line","frame":"00","rows":["00"],"retained":["0a0b","ff"]}"#,
         ) else {
@@ -2709,6 +2737,13 @@ mod tests {
             (vo_tree("orders..Line", "00", rows), Root),
             (vo_tree("orders.1Line", "00", rows), Root),
             (vo_tree("orders.Li-ne", "00", rows), Root),
+            (vo_tree("-orders.Line", "00", rows), Root),
+            (vo_tree("orders-.Line", "00", rows), Root),
+            (vo_tree("or ders.Line", "00", rows), Root),
+            (
+                vo_tree(&format!("{}.Line", "a".repeat(64)), "00", rows),
+                Root,
+            ),
             (
                 r#"{"kind":"vo","frame":"00","rows":["00"]}"#.to_owned(),
                 Root,
