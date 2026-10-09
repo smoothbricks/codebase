@@ -100,6 +100,9 @@ struct Mirrored {
     mode: u32,
     size: u64,
     mtime: (i64, i64),
+    /// Destination identity observed in the paid snapshot; unknown after a fresh leaf copy
+    /// until a hard-link operation needs it. This is never compared to the source's inode.
+    identity: Option<(u64, u64)>,
 }
 
 type Snapshot = BTreeMap<PathBuf, Entry>;
@@ -134,7 +137,24 @@ impl From<&Entry> for Mirrored {
             mode: entry.mode,
             size: entry.size,
             mtime: entry.mtime,
+            identity: None,
         }
+    }
+}
+
+impl Mirrored {
+    fn from_destination(entry: &Entry) -> Self {
+        Self {
+            identity: (entry.kind == EntryKind::File).then_some((entry.device, entry.inode)),
+            ..Self::from(entry)
+        }
+    }
+
+    fn matches(&self, entry: &Entry) -> bool {
+        self.kind == entry.kind
+            && self.mode == entry.mode
+            && self.size == entry.size
+            && self.mtime == entry.mtime
     }
 }
 
@@ -376,7 +396,7 @@ fn converge(
 ) -> Result<CopyReport> {
     let mut mirrored: MirrorState = snapshot(destination)?
         .iter()
-        .map(|(path, entry)| (path.clone(), Mirrored::from(entry)))
+        .map(|(path, entry)| (path.clone(), Mirrored::from_destination(entry)))
         .collect();
     let mut observed = observe(source)?;
     let mut changed_entries = 0usize;
@@ -441,8 +461,44 @@ fn reconcile(
 ) -> Result<CopyCounts> {
     let obsolete = obsolete_paths(mirrored, target);
     let outdated = outdated_paths(mirrored, target);
-    let staging = staging_directories(target, &obsolete, &outdated);
 
+    // Plan every leaf mutation before staging directory metadata. Correct alias groups are
+    // already known from the destination snapshot and need neither stat nor relink.
+    let mut hard_link_primaries: BTreeMap<(u64, u64), PathBuf> = BTreeMap::new();
+    let mut hard_link_aliases = Vec::new();
+    let mut leaf_copies = Vec::new();
+    for (relative, entry) in target {
+        if entry.kind == EntryKind::Directory {
+            continue;
+        }
+        if entry.is_hard_linked() {
+            let key = (entry.device, entry.inode);
+            if let Some(primary) = hard_link_primaries.get(&key) {
+                let primary_identity = mirrored.get(primary).and_then(|state| state.identity);
+                let alias_identity = mirrored.get(relative).and_then(|state| state.identity);
+                if outdated.contains(primary)
+                    || outdated.contains(relative)
+                    || primary_identity.is_none()
+                    || primary_identity != alias_identity
+                {
+                    hard_link_aliases.push(HardLinkAlias {
+                        primary: primary.clone(),
+                        relative: relative.clone(),
+                        state: Mirrored::from(entry),
+                    });
+                }
+                continue;
+            }
+            hard_link_primaries.insert(key, relative.clone());
+        }
+        if outdated.contains(relative) {
+            leaf_copies.push(LeafCopy {
+                relative: relative.clone(),
+                state: Mirrored::from(entry),
+            });
+        }
+    }
+    let staging = staging_directories(target, &obsolete, &outdated, &hard_link_aliases);
     for relative in &staging {
         let path = destination.join(relative);
         if path.is_dir() {
@@ -452,7 +508,6 @@ fn reconcile(
             }
         }
     }
-
     for relative in obsolete.iter().rev() {
         let kind = mirrored
             .get(relative)
@@ -460,53 +515,25 @@ fn reconcile(
         remove(&destination.join(relative), kind)?;
         mirrored.remove(relative);
     }
-
-    let mut hard_link_primaries: BTreeMap<(u64, u64), PathBuf> = BTreeMap::new();
-    let mut hard_link_aliases = Vec::new();
-    let mut leaf_copies = Vec::new();
     for (relative, entry) in target {
-        if entry.kind == EntryKind::Directory {
-            if !outdated.contains(relative) {
-                continue;
-            }
-            let path = destination.join(relative);
-            let materialized =
-                relative.as_os_str().is_empty() || path.is_dir() || create_directory(&path)?;
-            if materialized {
-                mirrored.insert(
-                    relative.clone(),
-                    Mirrored {
-                        mode: DIRECTORY_STAGING_MODE,
-                        ..Mirrored::from(entry)
-                    },
-                );
-            } else {
-                mirrored.remove(relative);
-            }
+        if entry.kind != EntryKind::Directory || !outdated.contains(relative) {
             continue;
         }
-
-        if entry.is_hard_linked() {
-            let key = (entry.device, entry.inode);
-            if let Some(primary) = hard_link_primaries.get(&key) {
-                hard_link_aliases.push(HardLinkAlias {
-                    primary: primary.clone(),
-                    relative: relative.clone(),
-                    state: Mirrored::from(entry),
-                });
-                continue;
-            }
-            hard_link_primaries.insert(key, relative.clone());
-        }
-
-        if outdated.contains(relative) {
-            leaf_copies.push(LeafCopy {
-                relative: relative.clone(),
-                state: Mirrored::from(entry),
-            });
+        let path = destination.join(relative);
+        let materialized =
+            relative.as_os_str().is_empty() || path.is_dir() || create_directory(&path)?;
+        if materialized {
+            mirrored.insert(
+                relative.clone(),
+                Mirrored {
+                    mode: DIRECTORY_STAGING_MODE,
+                    ..Mirrored::from(entry)
+                },
+            );
+        } else {
+            mirrored.remove(relative);
         }
     }
-
     let mut copied = CopyCounts::default();
     for outcome in copy_leaves_parallel(source, destination, &leaf_copies)? {
         if let Some(materialization) = outcome.materialization {
@@ -519,20 +546,41 @@ fn reconcile(
             mirrored.remove(&outcome.relative);
         }
     }
-
-    // A primary may have been recopied on this pass, so aliases are relinked after every primary
-    // copy has settled. This preserves one destination inode even when names cross worker batches.
+    // A recopied primary changes identity. Repair its aliases after workers settle, and
+    // observe that primary only once; subsequent aliases share the same known inode.
     for alias in hard_link_aliases {
         if link_leaf(
             &destination.join(&alias.primary),
             &destination.join(&alias.relative),
         )? {
-            mirrored.insert(alias.relative, alias.state);
+            let identity = match mirrored
+                .get(&alias.primary)
+                .and_then(|state| state.identity)
+            {
+                Some(identity) => identity,
+                None => {
+                    use std::os::unix::fs::MetadataExt as _;
+                    let primary = destination.join(&alias.primary);
+                    let metadata = fs::symlink_metadata(&primary)
+                        .map_err(|error| read_error(&primary, &error))?;
+                    let identity = (metadata.dev(), metadata.ino());
+                    if let Some(state) = mirrored.get_mut(&alias.primary) {
+                        state.identity = Some(identity);
+                    }
+                    identity
+                }
+            };
+            mirrored.insert(
+                alias.relative,
+                Mirrored {
+                    identity: Some(identity),
+                    ..alias.state
+                },
+            );
         } else {
             mirrored.remove(&alias.relative);
         }
     }
-
     for relative in staging.iter().rev() {
         let Some(entry) = target.get(relative) else {
             continue;
@@ -634,7 +682,11 @@ fn obsolete_paths(mirrored: &MirrorState, target: &Snapshot) -> Vec<PathBuf> {
 fn outdated_paths(mirrored: &MirrorState, target: &Snapshot) -> BTreeSet<PathBuf> {
     target
         .iter()
-        .filter(|(path, entry)| mirrored.get(*path) != Some(&Mirrored::from(*entry)))
+        .filter(|(path, entry)| {
+            mirrored
+                .get(*path)
+                .is_none_or(|state| !state.matches(entry))
+        })
         .map(|(path, _)| path.clone())
         .collect()
 }
@@ -646,6 +698,7 @@ fn staging_directories(
     target: &Snapshot,
     obsolete: &[PathBuf],
     outdated: &BTreeSet<PathBuf>,
+    aliases: &[HardLinkAlias],
 ) -> BTreeSet<PathBuf> {
     let mut staging = BTreeSet::new();
     let mut note_ancestors = |path: &Path| {
@@ -662,6 +715,9 @@ fn staging_directories(
     }
     for path in outdated {
         note_ancestors(path);
+    }
+    for alias in aliases {
+        note_ancestors(&alias.relative);
     }
     for path in outdated {
         if target
@@ -1585,6 +1641,8 @@ mod tests {
         drop(sparse);
         symlink("sparse", source.join("link")).unwrap();
         fs::hard_link(source.join("dense"), source.join("dense-alias")).unwrap();
+        fs::create_dir_all(source.join("nested/out")).unwrap();
+        fs::hard_link(source.join("dense"), source.join("nested/out/alias")).unwrap();
         write_xattr(&source.join("dense"), TEST_XATTR, b"verified attribute");
 
         let image = root
@@ -1628,18 +1686,76 @@ mod tests {
             fs::metadata(destination.join("dense-alias"))
                 .unwrap()
                 .nlink(),
-            2
+            3
         );
         assert_eq!(
             fs::read_link(destination.join("link")).unwrap(),
             PathBuf::from("sparse")
         );
+        let alias_dir_before = fs::metadata(destination.join("nested/out")).unwrap();
+        let primary_before = fs::metadata(destination.join("dense")).unwrap();
         let resumed = run(&source, &destination, 6);
         assert_eq!(resumed.cloned_files + resumed.copied_files, 0);
+        let alias_dir_after = fs::metadata(destination.join("nested/out")).unwrap();
+        let primary_after = fs::metadata(destination.join("dense")).unwrap();
+        assert_eq!(
+            (alias_dir_after.mtime(), alias_dir_after.mtime_nsec()),
+            (alias_dir_before.mtime(), alias_dir_before.mtime_nsec()),
+            "a correct nested hard-link alias is not relinked on replay"
+        );
+        assert_eq!(
+            (primary_after.ctime(), primary_after.ctime_nsec()),
+            (primary_before.ctime(), primary_before.ctime_nsec()),
+            "a correct hard-link inode has no relink churn"
+        );
         assert_eq!(
             super::verify_tree_blocking(&source, &destination).unwrap(),
             before
         );
+
+        // Break only topology, preserving bytes and source-comparable metadata. A replay
+        // must repair the alias and restore every ancestor's mtime without recopying data.
+        let alias = destination.join("nested/out/alias");
+        fs::remove_file(&alias).unwrap();
+        fs::write(&alias, b"original").unwrap();
+        super::native::directory_metadata(&source.join("nested/out/alias"), &alias).unwrap();
+        for relative in ["nested/out", "nested", ""] {
+            super::native::directory_metadata(&source.join(relative), &destination.join(relative))
+                .unwrap();
+        }
+        assert_eq!(
+            super::verify_tree_blocking(&source, &destination)
+                .unwrap_err()
+                .code,
+            crate::ErrorCode::Integrity
+        );
+        let repaired = run(&source, &destination, 6);
+        assert_eq!(repaired.cloned_files + repaired.copied_files, 0);
+        assert_eq!(
+            fs::metadata(&alias).unwrap().ino(),
+            fs::metadata(destination.join("dense")).unwrap().ino()
+        );
+        assert_eq!(
+            super::verify_tree_blocking(&source, &destination).unwrap(),
+            before
+        );
+
+        let primary_inode = fs::metadata(destination.join("dense")).unwrap().ino();
+        fs::write(source.join("dense"), b"updated!").unwrap();
+        let recopy = run(&source, &destination, 6);
+        assert_eq!(
+            recopy.cloned_files + recopy.copied_files,
+            1,
+            "a changed primary is copied once, not once per alias"
+        );
+        let new_primary = fs::metadata(destination.join("dense")).unwrap().ino();
+        assert_ne!(new_primary, primary_inode);
+        assert_eq!(
+            fs::metadata(&alias).unwrap().ino(),
+            new_primary,
+            "a recopied primary must relink its previously correct nested alias"
+        );
+        super::verify_tree_blocking(&source, &destination).unwrap();
 
         fs::write(destination.join("dense"), b"tampered").unwrap();
         super::native::directory_metadata(&source.join("dense"), &destination.join("dense"))
@@ -1651,7 +1767,7 @@ mod tests {
             "{}",
             refused.message
         );
-        assert_eq!(fs::read(source.join("dense")).unwrap(), b"original");
+        assert_eq!(fs::read(source.join("dense")).unwrap(), b"updated!");
         backend
             .unmount_verified(&attachment, crate::apfs::DetachIntent::WhenIdle)
             .unwrap();

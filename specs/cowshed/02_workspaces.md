@@ -134,7 +134,11 @@ ASIF-to-RAW transition and the RAW guest-space reclaim operation, not an image c
    main's build-volume identity and owner record are preserved verbatim, including its built-at tree and creation time;
    its contents are carried into a sparse RAW backing image by the same staged, verified copy at the recorded capacity.
    Nothing substitutes an empty build volume for the recorded warm one. Leave old-incarnation seed images unchanged as
-   retained evidence; publish one fresh RAW seed from the verified warm replacement for the new incarnation.
+   retained evidence; publish one fresh RAW seed from the verified warm replacement for the new incarnation. A resumed
+   copy leaves already-correct hard-link topology untouched. It relinks only missing, mismatched or recopied-primary
+   aliases and restores every changed alias's ancestor metadata after the subtree is complete. Already-mirrored file
+   payloads are not recopied merely because the transaction was interrupted; full content and metadata verification
+   still runs before publication.
 4. Verify the copied content before publication, including tracked and untracked-not-ignored file checksums, the entire
    `.git` state above, `git fsck`, and the build contents and identity. Re-adoption does not normalize Git
    configuration, delete lock files, prune worktree registrations or replace user hooks. Only cowshed's own marker and
