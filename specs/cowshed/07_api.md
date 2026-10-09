@@ -633,6 +633,10 @@ is crossed. Accounting includes protected and in-flight bytes; the supervisor ad
 boundary, terminates the process group, drains pipes, seals artifacts, and only then publishes terminal state. Summaries
 remain a separate bounded diagnostic projection.
 
+The invariant is the same one that keeps grant files outside the volume (01_storage.md, 04): a capability reachable from
+inside a sandbox must not authorize escalation. `WorkspaceHandle` is that principle expressed in the type system — a
+subagent holding one cannot grant itself anything.
+
 ### Captured-content authority
 
 The shell connection is a reconnectable view over the persistent, permission-checked, multi-client per-workspace
@@ -644,21 +648,29 @@ outside the marker lineage; nothing silently wins. Authorization, grant, and gat
 controller-owned.
 
 The artifact sink's `sealed(jobId)` returns `Result<Option<SealedJob>>`: `Ok(None)` means the current protected-store
-authority proves no terminal record for that id. A missing cached row is not that proof. A miss refreshes under the
-existing records lock and recovery validation; read, repository/lineage, batch, stream and recovery failures retain
-their causes and never become `None`. A readable sealed record remains answerable even when other history is unread.
+authority proves no terminal record for that id. A supervisor-held unsealed job answers that fact before any store
+refresh; a held sealed terminal still answers its record. A readable current-incarnation admission row likewise proves
+that its job has no terminal row, rather than making that known job an unread-history unknown.
 
-Any unread layout can hold numeric job ids. If the refreshed store cannot read the requested id and any set-aside
-history remains, the sink refuses with the existing `AdmissionRefusal::Unprovable { setAside }`, carried as typed
-`Conflict`, rather than reporting a job that never existed. An archived opening-incarnation marker never proves numeric
-absence: the unread store may retain lineage rows. Key lookup keeps its narrower keyed-layout/incarnation contract
-below. No earlier payload is decoded or migrated. `sealed`, sealed monitoring, logs and tails preserve that same
-complete refusal across the controller/socket boundary; none silently converts it to `NotFound`, empty bytes or a
-re-execution. Only authoritative readable-history absence reaches the public missing-job error.
+A cache miss refreshes under the existing records lock through the same authoritative snapshot that append and
+checkpoint use. Unchanged validated inode/length within the retained budget reads no record payload and re-hashes no
+sealed stream. Changed records validate repository/lineage and row invariants; only newly learned terminal spill files
+are hashed. The snapshot also keeps the already-computed validated manifest batch digest: an identical manifest skips
+its captured-prefix hashes, while a new manifest validates its prefixes and own checkpoint publication retains its
+digest. No manifest body or stream payload is copied into a second cache. Read and recovery failures retain their causes
+and never become `None`. Snapshot publication advances readable-job presence, immutable terminal rows, key authority,
+record identity and the validated manifest digest together. A checkpoint derives its manifest from that snapshot,
+independent of earlier read traffic.
 
-The invariant is the same one that keeps grant files outside the volume (01_storage.md, 04): a capability reachable from
-inside a sandbox must not authorize escalation. `WorkspaceHandle` is that principle expressed in the type system — a
-subagent holding one cannot grant itself anything.
+Any unread layout can hold numeric job ids at or below its valid retained `records.job-floor`. A missing id above that
+floor is proven not to come from the unread store and reaches the ordinary missing-job error. With unread history but no
+trustworthy retained floor, every missing id stays unknown; a malformed floor retains its integrity failure. At or below
+the floor, the sink refuses with the existing `AdmissionRefusal::Unprovable { setAside }`, carried as typed `Conflict`,
+not a fabricated absence. An archived opening-incarnation marker never proves numeric absence: the unread store may
+retain lineage rows. Key lookup keeps its narrower keyed-layout/incarnation contract below. No earlier payload is
+decoded or migrated. A readable sealed record remains answerable despite unrelated unread history. `sealed`, sealed
+monitoring, logs and tails preserve that same complete refusal across the controller/socket boundary; none silently
+converts it to `NotFound`, empty bytes or a re-execution.
 
 ## DTO freeze (single source of truth)
 

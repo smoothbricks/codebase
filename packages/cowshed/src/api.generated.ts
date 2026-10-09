@@ -65,8 +65,10 @@ export type AdmissionKeyRequest = {
 };
 
 /**
- * Why a keyed exec spawned nothing. Each refusal names the job the key admitted, when the
- * store can name it, so the caller reaches that job instead of exec'ing again.
+ * Why a keyed exec spawned nothing, or why a read of a job id or admission key was refused. A
+ * `KeyConflict` or `StdinBound` names the job the key admitted, so the caller reaches that job
+ * instead of exec'ing again. `Unprovable` names the unread set-aside store instead: the requested
+ * job or key may be recorded there, so neither presence nor absence is known.
  *
  * Fields are additive like [`FenceRefusal`]'s; a reason a later build added decodes as no
  * refusal (`CowshedError::admission_source` answers `None`) rather than losing the whole error.
@@ -368,9 +370,10 @@ export type CowshedError = {
    */
   readonly retry?: Retry;
   /**
-   * Present only on a keyed exec that spawned nothing (07_api "Keyed admission and restart
-   * attachment"), naming why and the job the key admitted. Absent from the wire otherwise,
-   * like `fence`.
+   * Present only on a keyed exec that spawned nothing, or a refused read of a job id or
+   * admission key (07_api "Keyed admission and restart attachment" and "Captured-content
+   * authority"), naming why and either the job the key admitted or the set-aside store that
+   * may hold it. Absent from the wire otherwise, like `fence`.
    */
   readonly admission?: AdmissionRefusal;
   /**

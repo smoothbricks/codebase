@@ -3649,6 +3649,8 @@ async fn a_key_a_set_aside_store_may_hold_is_refused_and_never_spawned() {
 
 /// One real-store lifecycle distinguishes authoritative absence from unread numeric history and
 /// preserves readable captured content. Every served read retains the same structured refusal.
+/// A job this supervisor holds unsealed answers NotFound, never that refusal. A sealed one
+/// still answers under the unread history.
 #[tokio::test]
 async fn sealed_reads_preserve_unread_history_without_hiding_readable_jobs() {
     use std::os::unix::fs::DirBuilderExt as _;
@@ -3758,6 +3760,44 @@ async fn sealed_reads_preserve_unread_history_without_hiding_readable_jobs() {
     assert!(
         resumed.spawned.try_recv().is_err(),
         "absence, refusal and restored reads start no process"
+    );
+
+    // One deliberate admission under the same unread history. Until it seals, the supervisor's
+    // own state answers: NotFound with no admission refusal, on the direct and socket paths alike.
+    let admitted = resumed
+        .handle
+        .exec(None, None, request(StdinSource::Empty))
+        .await
+        .unwrap();
+    let spawned = resumed.spawned.recv().await.unwrap();
+    assert_eq!(spawned.request.job_id, admitted);
+    let held = [
+        resumed.handle.sealed(admitted).await.unwrap_err(),
+        remote.sealed(admitted).await.unwrap_err(),
+    ];
+    for error in &held {
+        assert_eq!(
+            error.code,
+            ErrorCode::NotFound,
+            "a held unsealed job has no terminal record yet"
+        );
+        assert_eq!(error.admission_source(), None);
+    }
+    assert_eq!(held[0], held[1], "the socket preserves the same answer");
+    complete(&spawned, b"admitted\n", b"", ExitStatus::Exited { code: 0 }).await;
+    remote.wait(admitted).await.unwrap();
+    for answer in [
+        resumed.handle.sealed(admitted).await.unwrap(),
+        remote.sealed(admitted).await.unwrap(),
+    ] {
+        assert_eq!(
+            answer.job_id, admitted,
+            "a sealed job answers despite unread history"
+        );
+    }
+    assert!(
+        resumed.spawned.try_recv().is_err(),
+        "the one admission spawned once; no read replayed it"
     );
 }
 

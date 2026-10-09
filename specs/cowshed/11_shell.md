@@ -349,8 +349,8 @@ fork/restore/checkpoint lineage and commitments admit it as inherited history; a
 new allocation under a non-current incarnation, is `Integrity`. Thus copied histories are intentional but cannot smuggle
 a foreign repository/timeline. Supervisor replacement and attach otherwise discard only an incomplete trailing Arrow
 batch and never rewrite a complete batch or sealed artifact. Fork/checkpoint/restore copies start above every inherited
-allocation. The `records.job-floor` counter retains the highest id of a store set aside whole; it never decodes or
-retrofits that earlier store's rows.
+allocation, including the maximum id retained by `records.job-floor` for a store set aside unread. That floor record
+never decodes or retrofits the earlier store's rows.
 
 **Durability of a job's own records.** A job's records — its admission and terminal batches, its spill files (made
 durable when it backgrounds, sealed when it ends), the output copies it publishes, and its admission and terminal
@@ -403,14 +403,17 @@ row. Its admission keys are not inferred absent either: while the set-aside stor
 incarnation, a key the new store lacks is typed `Unprovable` and a keyed exec under it is refused, never run a second
 time.
 
-Numeric sealed lookup does not infer absence from a set-aside store either. A cache miss refreshes under the records
-lock and the same recovery validation as open. Any unread layout can hold the requested job id, so a still-missing row
-is the typed `Unprovable` refusal of 07_api.md "Captured-content authority"; the opening-incarnation marker does not
-attest to every retained lineage row. A readable sealed row still answers, and read/recovery failures remain errors. The
-sealed monitoring, log and tail paths preserve that refusal rather than asserting a job never ran. A controller-minted
-immutable `workspaceIncarnation` disambiguates histories copied by fork/checkpoint/restore. Each create, fork
-destination, and restore result receives a fresh incarnation; inherited records retain the incarnation that produced
-them, and the new allocator starts above the inherited maximum. Thus the durable job key is
+Numeric sealed lookup uses one records-lock snapshot shared with appends and checkpoints. Unchanged validated
+inode/length skips record and sealed-stream hashes; changed records validate authority and only newly learned terminal
+spill files. Known current-incarnation admissions and supervisor-held unsealed jobs prove no terminal row without an
+unread-history refusal. A readable sealed row still answers. A missing id above a valid `records.job-floor` is proven
+absent from the unread store; at or below it, or with unread history but no trustworthy floor, lookup returns the typed
+`Unprovable` of 07_api.md "Captured-content authority". The opening-incarnation marker never attests to every retained
+lineage row. Read/recovery failures remain errors, and sealed monitoring, logs and tails preserve their full cause.
+Checkpoint manifests derive from the same authoritative snapshot, not from which rows earlier readers happened to ask
+about. A controller-minted immutable `workspaceIncarnation` disambiguates histories copied by fork/checkpoint/restore.
+Each create, fork destination, and restore result receives a fresh incarnation; inherited records retain the incarnation
+that produced them, and the new allocator starts above the inherited maximum. Thus the durable job key is
 `(repoId, workspaceIncarnation, jobId)`: `jobId` is the familiar workspace-local handle, while the full tuple remains
 unique across checkpoint copies and recycled workspace names.
 

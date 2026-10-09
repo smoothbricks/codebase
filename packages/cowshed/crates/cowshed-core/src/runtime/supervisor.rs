@@ -3988,9 +3988,15 @@ impl SupervisorActor {
                 reply,
             } => {
                 let result = self.validate_authority(&authority).and_then(|()| {
-                    self.artifacts
-                        .sealed(job_id)?
-                        .ok_or_else(|| unsealed_job(job_id))
+                    // A job this supervisor holds unsealed has no terminal record yet.
+                    // Its own state answers: no store refresh, no unread-history refusal.
+                    match self.jobs.get(&job_id) {
+                        Some(job) if !job.sealed() => Err(unsealed_job(job_id)),
+                        Some(_) | None => self
+                            .artifacts
+                            .sealed(job_id)?
+                            .ok_or_else(|| unsealed_job(job_id)),
+                    }
                 });
                 let _ = reply.send(result);
             }
