@@ -19,6 +19,7 @@
 
 use columine_types::operand::Operands;
 use columine_types::types::Opcode;
+use columine_types::vo::COUNTS_FOLD_CAPACITIES;
 
 use crate::vm::{
     MAX_STRUCT_ARRAY_OPERANDS, MAX_STRUCT_SCALAR_OPERANDS, body_op_len, is_aggregate_op,
@@ -319,7 +320,7 @@ pub(crate) fn walk_operands<S: OperandSink>(
             index(r, sink)?; // init bytes
             index(r, sink)?; // count offset
             let histograms = count(r, sink)?;
-            if histograms == 0 || histograms > crate::counts_fold::MAX_COUNTS_HISTOGRAMS {
+            if !COUNTS_FOLD_CAPACITIES.histograms.admits(histograms) {
                 return None;
             }
             for _ in 0..histograms {
@@ -329,7 +330,7 @@ pub(crate) fn walk_operands<S: OperandSink>(
                 index(r, sink)?;
             }
             let masks = count(r, sink)?;
-            if masks > crate::counts_fold::MAX_COUNTS_MASKS {
+            if !COUNTS_FOLD_CAPACITIES.masks.admits(masks) {
                 return None;
             }
             for _ in 0..masks {

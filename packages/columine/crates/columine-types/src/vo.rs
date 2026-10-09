@@ -324,6 +324,41 @@ pub struct VoCountsLayout {
     pub mask_offs: Vec<u32>,
 }
 
+/// Inclusive bounds on how many of one thing a counts instruction may name.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CountBounds {
+    pub min: usize,
+    pub max: usize,
+}
+
+impl CountBounds {
+    pub const fn admits(self, count: usize) -> bool {
+        self.min <= count && count <= self.max
+    }
+}
+
+/// What one counts instruction may hold. The VM refuses an instruction
+/// outside these bounds; a compiler reads the same value to refuse a counts
+/// role before it emits one.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CountsFoldCapacities {
+    /// Histograms one instruction names: at least one, since a counts fold
+    /// without a histogram has nothing to bin.
+    pub histograms: CountBounds,
+    /// Bins one histogram holds.
+    pub bins: CountBounds,
+    /// OR-masks one instruction names; none is a valid fold.
+    pub masks: CountBounds,
+}
+
+/// The single definition of counts-fold capacity. `src/counts-fold-capacities.ts`
+/// is generated from it (`tests/counts_fold_capacities.rs`).
+pub const COUNTS_FOLD_CAPACITIES: CountsFoldCapacities = CountsFoldCapacities {
+    histograms: CountBounds { min: 1, max: 8 },
+    bins: CountBounds { min: 1, max: 64 },
+    masks: CountBounds { min: 0, max: 4 },
+};
+
 /// A kernel's proof of where one counts role lives in its schema's frames.
 pub trait VoCountsProof {
     /// The role certified. [`certify_counts`] requires the very role it lent

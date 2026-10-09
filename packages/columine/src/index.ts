@@ -11,6 +11,9 @@
  */
 // Parse/Compact backend (event_processor WASM bridge)
 
+// Counts-fold capacities (generated from the native definition)
+export type { CountBounds, CountsFoldCapacities } from './counts-fold-capacities.js';
+export { COUNTS_FOLD_CAPACITIES } from './counts-fold-capacities.js';
 // Index operands (column, slot and match-count encoding)
 export { appendIndex, MAX_INDEX_LEN, readIndex } from './operand.js';
 export type {

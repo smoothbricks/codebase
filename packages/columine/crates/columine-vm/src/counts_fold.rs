@@ -62,14 +62,10 @@ use columine_types::operand::Operands;
 
 use crate::bytes;
 use crate::element_body::OperandRead;
-use columine_types::vo::VoCountsLayout;
+use columine_types::vo::{COUNTS_FOLD_CAPACITIES, VoCountsLayout};
 
-/// Histograms one instruction may name.
-pub const MAX_COUNTS_HISTOGRAMS: usize = 8;
-/// Bins one histogram may hold.
-pub const MAX_COUNTS_BINS: usize = 64;
-/// OR-masks one instruction may name.
-pub const MAX_COUNTS_MASKS: usize = 4;
+pub(crate) const MAX_COUNTS_HISTOGRAMS: usize = COUNTS_FOLD_CAPACITIES.histograms.max;
+pub(crate) const MAX_COUNTS_MASKS: usize = COUNTS_FOLD_CAPACITIES.masks.max;
 
 const COUNT_WIDTH: u32 = 4;
 const REF_WIDTH: u32 = 4;
@@ -254,7 +250,10 @@ impl<'p> CountsFoldOp<'p> {
         let init_values_col = ops.index()?;
         let count_off = ops.index()?;
         let num_hists = ops.byte()?;
-        if num_hists == 0 || usize::from(num_hists) > MAX_COUNTS_HISTOGRAMS {
+        if !COUNTS_FOLD_CAPACITIES
+            .histograms
+            .admits(usize::from(num_hists))
+        {
             return None;
         }
         let mut hists = [CountsHistogram::default(); MAX_COUNTS_HISTOGRAMS];
@@ -266,15 +265,16 @@ impl<'p> CountsFoldOp<'p> {
                 bucket_col: ops.index()?,
             };
             // The region's element-count word precedes element zero.
-            if hist.bin_count == 0
-                || usize::from(hist.bin_count) > MAX_COUNTS_BINS
+            if !COUNTS_FOLD_CAPACITIES
+                .bins
+                .admits(usize::from(hist.bin_count))
                 || hist.elems_at < 4
             {
                 return None;
             }
         }
         let num_masks = ops.byte()?;
-        if usize::from(num_masks) > MAX_COUNTS_MASKS {
+        if !COUNTS_FOLD_CAPACITIES.masks.admits(usize::from(num_masks)) {
             return None;
         }
         let mut masks = [CountsMask::default(); MAX_COUNTS_MASKS];
