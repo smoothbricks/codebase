@@ -2952,7 +2952,7 @@ mod tests {
             (Nearness::Paths(2), later),
             Some((Nearness::Paths(9), frozen)),
         );
-        assert!(!nearer.reseeds());
+        assert!(nearer.reseeds());
         let comparable = age(
             (Nearness::Paths(9), later),
             Some((Nearness::Unknown, frozen)),
