@@ -574,6 +574,8 @@ impl CapacityScratch {
                             Some(())
                         })
                     }
+                    // Present members only: the same deliberate touch margin
+                    // as tier 1.
                     Effect::Remove { slot, col } if slot == target => {
                         for_rows(domain, cols, batch_len, &mut |row| {
                             if lookup.contains(state, cell(cols, col, row)?) {
@@ -906,6 +908,10 @@ impl Tier1<'_> {
             (Effect::Opaque { .. }, _) => d.opaque = true,
             // Rehash allocations depend on each container's capacity.
             (Effect::Nested { .. }, _) => d.rows = true,
+            // A removal re-encodes its chunk: charged per `patched_len_bound`'s
+            // touched-chunk term. Deliberate margin: no test can isolate it,
+            // because the bound's two bytes per member already cover every
+            // shape tried, but the bound's soundness argument is per term.
             (Effect::Remove { .. }, Some(n)) => d.touches = d.touches.saturating_add(n),
             (Effect::Arena { col, .. }, _) => {
                 // Rows are bounded like any key; the array bytes need rows.

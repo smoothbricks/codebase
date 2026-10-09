@@ -314,6 +314,8 @@ export enum ErrorCode {
   DELTA_LANE_MISMATCH = 13,
   /** Beginning a window refused because another speculation window is still active. */
   SPECULATION_ACTIVE = 14,
+  /** Working memory the operation needs could not be allocated; the operation refused before any write. */
+  OUT_OF_MEMORY = 15,
 }
 
 // =============================================================================

@@ -876,6 +876,9 @@ pub enum ErrorCode {
     DeltaLaneMismatch = 13,
     /// A new speculation window cannot replace an active window's checkpoints.
     SpeculationActive = 14,
+    /// Working memory the operation needs could not be allocated; the operation
+    /// refused before any write.
+    OutOfMemory = 15,
 }
 
 impl ErrorCode {
@@ -899,6 +902,7 @@ impl ErrorCode {
             12 => Self::JournalOverflow,
             13 => Self::DeltaLaneMismatch,
             14 => Self::SpeculationActive,
+            15 => Self::OutOfMemory,
             _ => return None,
         })
     }

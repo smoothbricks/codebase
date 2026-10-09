@@ -2995,6 +2995,7 @@ const OK: u32 = ErrorCode::Ok as u32;
 const INVALID_STATE: u32 = ErrorCode::InvalidState as u32;
 const INVALID_PROGRAM: u32 = ErrorCode::InvalidProgram as u32;
 const NEEDS_GROWTH: u32 = ErrorCode::NeedsGrowth as u32;
+const OUT_OF_MEMORY: u32 = ErrorCode::OutOfMemory as u32;
 
 /// Map a capacity failure to NEEDS_GROWTH and record its slot.
 fn signal_growth(slot_idx: u32, result: ErrorCode) -> u32 {
@@ -3154,9 +3155,9 @@ impl Vm {
                 batch_len,
                 live,
             );
-            debug_assert_ne!(
-                result, NEEDS_GROWTH,
-                "capacity admission cleared a batch that ran out of capacity"
+            debug_assert!(
+                result != NEEDS_GROWTH && result != ErrorCode::CapacityExceeded as u32,
+                "capacity admission cleared a batch that ran out of capacity: {result}"
             );
             result
         })
@@ -3164,7 +3165,8 @@ impl Vm {
     }
 
     /// Tier 3 of capacity admission: run the batch on a retained copy of the
-    /// state with the journal off and answer what it answered. Execution is
+    /// state with the journal off and answer what it answered, or
+    /// `OutOfMemory` when the copy cannot be backed. Execution is
     /// deterministic, so a batch this run admits runs the same way for real,
     /// and one it refuses has written nothing to `state`.
     fn dry_run(
@@ -3177,6 +3179,12 @@ impl Vm {
     ) -> u32 {
         let mut image = core::mem::take(&mut self.capacity.image);
         image.clear();
+        // The image grows to the largest state this VM has dry-run; memory
+        // that cannot back it refuses before any write, never an abort.
+        if image.try_reserve(state.len()).is_err() {
+            self.capacity.image = image;
+            return OUT_OF_MEMORY;
+        }
         image.extend_from_slice(state);
         let enabled = core::mem::replace(&mut self.undo.enabled, false);
         let result = self.execute_ops(false, &mut image, code, cols, batch_len, live);

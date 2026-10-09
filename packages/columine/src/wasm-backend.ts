@@ -320,6 +320,8 @@ function vmErrorCode(status: number): ErrorCode {
       return ErrorCode.DELTA_LANE_MISMATCH;
     case ErrorCode.SPECULATION_ACTIVE:
       return ErrorCode.SPECULATION_ACTIVE;
+    case ErrorCode.OUT_OF_MEMORY:
+      return ErrorCode.OUT_OF_MEMORY;
     default:
       throw new Error(
         `WASM VM returned unknown status ${status}: the TypeScript ErrorCode enum is out of sync ` +

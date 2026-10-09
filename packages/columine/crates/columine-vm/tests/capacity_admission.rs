@@ -4,6 +4,8 @@
 //! the row count, tier 2 from the rows the slot lacks, tier 3 by a dry run.
 //! Debug builds also assert inside the VM that a cleared batch never runs out.
 
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 
 use bitmosaic::{BitmosaicView, EMPTY_U32_IMAGE, patched_len_bound};
@@ -28,6 +30,70 @@ use proptest::prelude::*;
 const OK: u32 = ErrorCode::Ok as u32;
 const NEEDS_GROWTH: u32 = ErrorCode::NeedsGrowth as u32;
 const TYPE: u32 = 7;
+
+// ---------------------------------------------------------------------------
+// An allocator that refuses this thread's allocations on demand, forwarding
+// every other call to the system allocator unchanged.
+// ---------------------------------------------------------------------------
+
+struct RefusingAllocator;
+
+thread_local! {
+    static ALLOCATION_REFUSED: Cell<bool> = const { Cell::new(false) };
+}
+
+fn allocation_refused() -> bool {
+    ALLOCATION_REFUSED.try_with(Cell::get).unwrap_or(false)
+}
+
+// SAFETY: every call forwards the original pointer and layout to System; a
+// refused allocation returns null, which GlobalAlloc permits for any call.
+unsafe impl GlobalAlloc for RefusingAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        if allocation_refused() {
+            return core::ptr::null_mut();
+        }
+        unsafe { System.alloc(layout) }
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        if allocation_refused() {
+            return core::ptr::null_mut();
+        }
+        unsafe { System.alloc_zeroed(layout) }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        unsafe { System.dealloc(ptr, layout) }
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        if allocation_refused() {
+            return core::ptr::null_mut();
+        }
+        unsafe { System.realloc(ptr, layout, new_size) }
+    }
+}
+
+#[global_allocator]
+static ALLOCATOR: RefusingAllocator = RefusingAllocator;
+
+struct RefusalScope;
+
+impl Drop for RefusalScope {
+    fn drop(&mut self) {
+        ALLOCATION_REFUSED.with(|refused| refused.set(false));
+    }
+}
+
+/// Run `run` while every allocation on this thread fails.
+fn without_memory<T>(run: impl FnOnce() -> T) -> T {
+    ALLOCATION_REFUSED.with(|refused| refused.set(true));
+    let scope = RefusalScope;
+    let result = run();
+    drop(scope);
+    result
+}
 
 fn program(num_slots: u8, num_inputs: u8, init: &[u8], reduce: &[u8]) -> Vec<u8> {
     let mut init = init.to_vec();
@@ -135,8 +201,18 @@ fn each_tier_answers_only_what_the_tier_before_cannot() {
     assert_eq!(1, counts(&vm).probed);
 
     // Two new keys named five times each: ten absent rows exceed the room,
-    // so only a dry run can tell the two keys fit.
+    // so only a dry run can tell the two keys fit. Without memory for the
+    // dry run's image the batch is refused by name with nothing written, and
+    // with memory back the same batch runs.
     let repeated: Vec<u32> = [100, 101].repeat(5);
+    let before = state.clone();
+    let values: Vec<u32> = repeated.iter().map(|k| k * 10).collect();
+    let cols = [u32s_as_bytes(&repeated), u32s_as_bytes(&values)];
+    assert_eq!(
+        ErrorCode::OutOfMemory as u32,
+        without_memory(|| vm.execute_batch(&mut state, &prog, &cols, 10))
+    );
+    assert_eq!(before, state);
     assert_eq!(OK, upsert(&mut vm, &mut state, &prog, &repeated));
     assert_eq!(1, counts(&vm).dry_run_fit);
     let map = CheckedMap::bind(&state, 0).unwrap();

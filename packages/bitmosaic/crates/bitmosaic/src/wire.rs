@@ -305,6 +305,12 @@ pub(crate) fn slot_bits_for_span(chunks: u32, first: u16, last: u16) -> u8 {
 /// width for the grown chunk count, and the frame and header varints grow by
 /// at most 15 bytes. An Elias-Fano root, which a patch keeps, re-encodes the
 /// set at under five bytes a member plus its header.
+///
+/// Each term covers one cost on its own. Two are deliberate margin that no
+/// test can isolate: the three bytes per touched chunk and the 15 bytes of
+/// varint growth. The current image plus two bytes for every member, not
+/// only touched ones, already exceeds them on every shape tried, but the
+/// bound is argued term by term, not from that slack.
 pub fn patched_len_bound(image: &[u8], adds: u64, touches: u64) -> Option<u64> {
     let header = image_header(image)?;
     if header.width != KeyWidth::U32 {
