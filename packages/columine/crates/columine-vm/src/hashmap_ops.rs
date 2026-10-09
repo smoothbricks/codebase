@@ -303,9 +303,13 @@ pub fn batch_map_remove(
                 continue;
             };
 
-            tbl.plan_erase_at(state, pos, plan);
             ranges.clear();
-            tbl.erase_ranges(plan, ranges);
+            if let Err(error) = tbl
+                .plan_erase_at(state, pos, plan)
+                .and_then(|()| tbl.erase_ranges(plan, ranges))
+            {
+                return error;
+            }
             if has_ts {
                 plan.for_each_destination_run(|start, len| {
                     ranges.push((cmp_lane_off(meta) + start * 8, len * 8));

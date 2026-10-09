@@ -281,6 +281,7 @@ pub(crate) fn push_payload_capture_range(
             return Ok(());
         }
     }
+    ranges.try_reserve(1).map_err(|_| ErrorCode::OutOfMemory)?;
     ranges.push((offset, len));
     Ok(())
 }

@@ -70,6 +70,10 @@ pub struct Probe {
     pub found: bool,
 }
 
+/// Ranges an erase's caller appends after the lane runs: size, change flag
+/// and the two TTL capture ranges.
+const ERASE_CALLER_RANGES: usize = 4;
+
 /// Retained backward-shift destinations for one erase. A batch reuses this
 /// allocation; capture and mutation consume the same plan without re-probing.
 #[derive(Debug, Default)]
@@ -450,8 +454,15 @@ impl FlatTable {
     }
 
     /// Derive the exact erase once, retaining keys and source/destination cells
-    /// before any bytes change. `plan` is reusable across a whole batch.
-    pub fn plan_erase_at(&self, state: &[u8], mut hole: u32, plan: &mut ErasePlan) {
+    /// before any bytes change. `plan` is reusable across a whole batch and
+    /// grows to the longest cluster it has planned; memory that cannot back
+    /// a shift refuses with `OutOfMemory` before any write.
+    pub fn plan_erase_at(
+        &self,
+        state: &[u8],
+        mut hole: u32,
+        plan: &mut ErasePlan,
+    ) -> Result<(), ErrorCode> {
         debug_assert!(self.cap.is_power_of_two());
         debug_assert!(self.key_at(state, hole) < TOMBSTONE);
         plan.shifts.clear();
@@ -464,6 +475,9 @@ impl FlatTable {
             }
             let home = hash_key(key, self.cap);
             if (scan.wrapping_sub(home) & mask) >= (scan.wrapping_sub(hole) & mask) {
+                plan.shifts
+                    .try_reserve(1)
+                    .map_err(|_| ErrorCode::OutOfMemory)?;
                 plan.shifts.push(EraseShift {
                     from: scan,
                     to: hole,
@@ -474,11 +488,24 @@ impl FlatTable {
             scan = (scan + 1) & mask;
         }
         plan.tail = hole;
+        Ok(())
     }
 
     /// Append bounded key/value destination ranges for a retained erase.
     /// Side lanes use the same destination runs, never a second cluster walk.
-    pub fn erase_ranges(&self, plan: &ErasePlan, ranges: &mut Vec<(u32, u32)>) {
+    /// Reserves first for every range the erase's capture can name: the key
+    /// and entry lanes here, plus a caller's timestamp lane over the same
+    /// runs and its size, change-flag and two TTL ranges. Memory that cannot
+    /// back them refuses with `OutOfMemory` before any write.
+    pub fn erase_ranges(
+        &self,
+        plan: &ErasePlan,
+        ranges: &mut Vec<(u32, u32)>,
+    ) -> Result<(), ErrorCode> {
+        let runs = plan.shifts.len() + 1;
+        ranges
+            .try_reserve(3 * runs + ERASE_CALLER_RANGES)
+            .map_err(|_| ErrorCode::OutOfMemory)?;
         plan.for_each_destination_run(|start, len| {
             ranges.push((self.keys_off + start * 4, len * 4));
             if self.entry_size != 0 {
@@ -488,6 +515,7 @@ impl FlatTable {
                 ));
             }
         });
+        Ok(())
     }
 
     /// Apply a retained erase, moving a caller's side lane with each entry.

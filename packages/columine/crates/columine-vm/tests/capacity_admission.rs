@@ -246,6 +246,22 @@ fn each_tier_answers_only_what_the_tier_before_cannot() {
     let mut grown = grow(&mut vm, &state, 0);
     assert_eq!(OK, upsert(&mut vm, &mut grown, &prog, &[1, 2, 200]));
     assert_eq!(Some(2000), CheckedMap::bind(&grown, 0).unwrap().get(200));
+
+    // A removal plans its erase in storage it grows to demand: on a VM that
+    // has never erased, memory that cannot back the plan refuses it by name
+    // with nothing written, and the same removal runs once memory returns.
+    let mut fresh = Vm::default();
+    let before = grown.clone();
+    assert_eq!(
+        ErrorCode::OutOfMemory,
+        without_memory(|| fresh.map_remove(false, &mut grown, 0, &[200]))
+    );
+    assert_eq!(before, grown);
+    assert_eq!(
+        ErrorCode::Ok,
+        fresh.map_remove(false, &mut grown, 0, &[200])
+    );
+    assert_eq!(None, CheckedMap::bind(&grown, 0).unwrap().get(200));
 }
 
 // ---------------------------------------------------------------------------

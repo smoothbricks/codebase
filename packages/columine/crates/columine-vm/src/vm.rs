@@ -259,8 +259,8 @@ fn remove_entry_by_key(
             let Some(position) = table.find(state, key) else {
                 return Ok(false);
             };
-            table.plan_erase_at(state, position, &mut erase);
-            table.erase_ranges(&erase, &mut ranges);
+            table.plan_erase_at(state, position, &mut erase)?;
+            table.erase_ranges(&erase, &mut ranges)?;
             if meta.has_hashmap_timestamp_storage() {
                 erase.for_each_destination_run(|start, len| {
                     ranges.push((hashmap_ops::cmp_lane_off(meta) + start * 8, len * 8));

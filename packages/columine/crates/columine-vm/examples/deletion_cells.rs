@@ -33,7 +33,9 @@ pub extern "C" fn deletion_cell(mode: u32, cap: u32, rounds: u32, seed: u32) -> 
         if mode == 0 {
             table.set_key_at(&mut state, pos, TOMBSTONE);
         } else {
-            table.plan_erase_at(&state, pos, &mut plan);
+            table
+                .plan_erase_at(&state, pos, &mut plan)
+                .expect("memory backs the plan");
             table.erase_planned(&mut state, &plan, |_, _, _| {});
         }
         let size = table.size(&state);

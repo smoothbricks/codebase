@@ -29,7 +29,9 @@ fn backward_shift(table: &FlatTable, state: &mut [u8], plan: &mut ErasePlan, key
     let Some(pos) = table.find(state, key) else {
         return false;
     };
-    table.plan_erase_at(state, pos, plan);
+    table
+        .plan_erase_at(state, pos, plan)
+        .expect("memory backs the plan");
     table.erase_planned(state, plan, |_, _, _| {});
     table.set_size(state, table.size(state) - 1);
     true

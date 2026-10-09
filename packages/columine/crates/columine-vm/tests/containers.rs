@@ -1554,7 +1554,9 @@ fn retained_erase_plan_matches_actual_wrapped_table_geometry() {
         let pos = table.find(&state, 3).expect("collision head");
         assert_eq!(pos, 15);
         let mut plan = ErasePlan::default();
-        table.plan_erase_at(&state, pos, &mut plan);
+        table
+            .plan_erase_at(&state, pos, &mut plan)
+            .expect("memory backs the plan");
         let mut runs = Vec::new();
         plan.for_each_destination_run(|start, len| runs.push((start, len)));
         assert_eq!(runs, [(15, 1), (0, 2)], "wrap splits touched cells");

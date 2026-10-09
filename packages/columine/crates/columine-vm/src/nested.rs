@@ -275,7 +275,7 @@ impl NestedScratch {
     fn admit_ranges(&mut self, total: usize) -> Result<(), ErrorCode> {
         self.ranges
             .try_reserve_exact(total.saturating_sub(self.ranges.len()))
-            .map_err(|_| ErrorCode::InvalidState)
+            .map_err(|_| ErrorCode::OutOfMemory)
     }
 }
 
@@ -284,7 +284,7 @@ impl NestedScratch {
 fn reserve_cleared<T>(buf: &mut Vec<T>, cap: usize) -> Result<(), ErrorCode> {
     buf.clear();
     buf.try_reserve_exact(cap)
-        .map_err(|_| ErrorCode::InvalidState)
+        .map_err(|_| ErrorCode::OutOfMemory)
 }
 
 /// Append into capacity the plan admitted before it pushed. A full buffer

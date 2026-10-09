@@ -143,9 +143,13 @@ pub fn batch_set_remove(
                 continue;
             };
 
-            tbl.plan_erase_at(state, pos, plan);
             ranges.clear();
-            tbl.erase_ranges(plan, ranges);
+            if let Err(error) = tbl
+                .plan_erase_at(state, pos, plan)
+                .and_then(|()| tbl.erase_ranges(plan, ranges))
+            {
+                return error;
+            }
             ranges.push((tbl.size_off, 4));
             ranges.push((meta.meta_base + SlotMetaOffset::CHANGE_FLAGS, 1));
             let ttl_plan = if meta.has_ttl() {

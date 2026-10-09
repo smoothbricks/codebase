@@ -57,9 +57,62 @@ pub(crate) struct TtlBatchScratch {
     commands: Vec<TtlCommand>,
     right_runs: Vec<TtlCommand>,
     writes: Vec<TtlCommand>,
+    /// Buffer capacities right after [`Self::reserve`]: a plan that grows
+    /// any buffer past them would allocate mid-plan.
+    #[cfg(debug_assertions)]
+    reserved: [usize; 11],
+}
+
+/// Clear `buf` and back `total` elements, refusing with `OutOfMemory`.
+fn back<T>(buf: &mut Vec<T>, total: usize) -> Result<(), ErrorCode> {
+    buf.clear();
+    buf.try_reserve(total).map_err(|_| ErrorCode::OutOfMemory)
 }
 
 impl TtlBatchScratch {
+    /// Back every buffer a plan of `size` originals and `count` mutations
+    /// can fill, before any of them is written, so planning never allocates
+    /// and memory that cannot back it refuses before any state write. Each
+    /// buffer grows to the largest plan it has served and is kept.
+    fn reserve(&mut self, size: usize, count: usize) -> Result<(), ErrorCode> {
+        // Every original and every upsert can be a node, a live entry, and a
+        // move; each upsert also writes once.
+        let all = size + count;
+        back(&mut self.by_key, count)?;
+        back(&mut self.keys, count)?;
+        back(&mut self.key_of, count)?;
+        back(&mut self.links, size)?;
+        back(&mut self.inserts, count)?;
+        back(&mut self.nodes, all)?;
+        back(&mut self.stack, all)?;
+        back(&mut self.order, all)?;
+        back(&mut self.commands, all + count)?;
+        back(&mut self.right_runs, all)?;
+        back(&mut self.writes, count)?;
+        #[cfg(debug_assertions)]
+        {
+            self.reserved = self.capacities();
+        }
+        Ok(())
+    }
+
+    #[cfg(debug_assertions)]
+    fn capacities(&self) -> [usize; 11] {
+        [
+            self.by_key.capacity(),
+            self.keys.capacity(),
+            self.key_of.capacity(),
+            self.links.capacity(),
+            self.inserts.capacity(),
+            self.nodes.capacity(),
+            self.stack.capacity(),
+            self.order.capacity(),
+            self.commands.capacity(),
+            self.right_runs.capacity(),
+            self.writes.capacity(),
+        ]
+    }
+
     /// Invalidate any retained plan.
     pub(crate) fn reset(&mut self) {
         self.order.clear();
@@ -261,8 +314,14 @@ fn plan_order(
     s: &mut TtlBatchScratch,
 ) -> Result<(), ErrorCode> {
     s.mutations.clear();
-    s.mutations.extend(mutations);
+    for mutation in mutations {
+        s.mutations
+            .try_reserve(1)
+            .map_err(|_| ErrorCode::OutOfMemory)?;
+        s.mutations.push(mutation);
+    }
     let count = u32::try_from(s.mutations.len()).map_err(|_| ErrorCode::InvalidState)?;
+    s.reserve(size as usize, s.mutations.len())?;
 
     // Distinct mutated keys, each with the originals that carry it.
     s.by_key.clear();
@@ -499,6 +558,12 @@ fn emit_commands(s: &mut TtlBatchScratch) -> (u32, u32) {
     flush(open.take(), s);
     s.commands.extend(s.right_runs.drain(..).rev());
     s.commands.append(&mut s.writes);
+    #[cfg(debug_assertions)]
+    debug_assert_eq!(
+        s.capacities(),
+        s.reserved,
+        "the TTL plan grew a buffer past its reservation"
+    );
     (first, last)
 }
 
@@ -712,6 +777,95 @@ impl Rope<'_> {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+
+    /// Forwards to the system allocator, refusing this thread's allocations
+    /// while a [`without_memory`] scope is open.
+    struct RefusingAllocator;
+
+    thread_local! {
+        static ALLOCATION_REFUSED: Cell<bool> = const { Cell::new(false) };
+    }
+
+    fn allocation_refused() -> bool {
+        ALLOCATION_REFUSED.try_with(Cell::get).unwrap_or(false)
+    }
+
+    // SAFETY: every call forwards the original pointer and layout to System;
+    // a refused allocation returns null, which GlobalAlloc permits.
+    unsafe impl GlobalAlloc for RefusingAllocator {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            if allocation_refused() {
+                return core::ptr::null_mut();
+            }
+            unsafe { System.alloc(layout) }
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            if allocation_refused() {
+                return core::ptr::null_mut();
+            }
+            unsafe { System.alloc_zeroed(layout) }
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            unsafe { System.dealloc(ptr, layout) }
+        }
+
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            if allocation_refused() {
+                return core::ptr::null_mut();
+            }
+            unsafe { System.realloc(ptr, layout, new_size) }
+        }
+    }
+
+    #[global_allocator]
+    static ALLOCATOR: RefusingAllocator = RefusingAllocator;
+
+    struct RefusalScope;
+
+    impl Drop for RefusalScope {
+        fn drop(&mut self) {
+            ALLOCATION_REFUSED.with(|refused| refused.set(false));
+        }
+    }
+
+    fn without_memory<T>(run: impl FnOnce() -> T) -> T {
+        ALLOCATION_REFUSED.with(|refused| refused.set(true));
+        let scope = RefusalScope;
+        let result = run();
+        drop(scope);
+        result
+    }
+
+    /// A planner with no storage yet refuses with `OutOfMemory` when memory
+    /// cannot back it; one that already served this plan replans it under
+    /// the same refusal without allocating, and its commands write the same
+    /// bytes.
+    fn plans_in_reserved_storage(entries: &[(f64, u32)], capacity: u32, mutations: &[TtlMutation]) {
+        let size = u32::try_from(entries.len()).unwrap();
+        let state = image(entries, capacity);
+        let plan = |s: &mut TtlBatchScratch| {
+            plan_order(&state, 0, size, capacity, mutations.iter().copied(), s)?;
+            emit_commands(s);
+            Ok::<(), ErrorCode>(())
+        };
+        let mut cold = TtlBatchScratch::default();
+        assert_eq!(
+            without_memory(|| plan(&mut cold)),
+            Err(ErrorCode::OutOfMemory)
+        );
+        let mut warm = TtlBatchScratch::default();
+        plan(&mut warm).expect("plans with memory");
+        let mut first = state.clone();
+        apply_commands(&mut first, 0, &warm.commands);
+        assert_eq!(without_memory(|| plan(&mut warm)), Ok(()));
+        let mut again = state.clone();
+        apply_commands(&mut again, 0, &warm.commands);
+        assert_eq!(again, first, "the replan writes the same bytes");
+    }
 
     /// The previous planner's placement, kept as the differential oracle: each
     /// mutation scans the whole live sequence to remove its key, then an
@@ -872,6 +1026,7 @@ mod tests {
             })
             .collect();
         check(&entries, 2048, &mutations);
+        plans_in_reserved_storage(&entries, 2048, &mutations);
     }
 
     #[test]
@@ -900,5 +1055,6 @@ mod tests {
             })
             .collect();
         check(&entries, 1100, &mutations);
+        plans_in_reserved_storage(&entries, 1100, &mutations);
     }
 }
