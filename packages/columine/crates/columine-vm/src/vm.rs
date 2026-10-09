@@ -3191,6 +3191,11 @@ impl Vm {
         {
             return INVALID_PROGRAM;
         }
+        // A FOR_EACH body's plan is drawn from the reduce section: backed
+        // here, before any write, so planning a body never allocates.
+        if self.element_plan.reserve_for(sections.reduce_code).is_err() {
+            return OUT_OF_MEMORY;
+        }
         // The declaration check's storage is backed first, so it reports a
         // mismatch, never a failed allocation.
         if usize::try_from(sections.header.num_slots)

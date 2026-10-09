@@ -18,7 +18,7 @@
 //! with a different [`OperandSink`].
 
 use columine_types::operand::Operands;
-use columine_types::types::Opcode;
+use columine_types::types::{ErrorCode, Opcode};
 use columine_types::vo::COUNTS_FOLD_CAPACITIES;
 
 use crate::vm::{
@@ -449,6 +449,25 @@ pub(crate) struct BodyPlan {
     /// The body's per-element form once widened: no aggregates, `u32`
     /// indexes, each `FLAT_MAP`'s inner body widened behind a `u32` length.
     pub(crate) wide: Vec<u8>,
+}
+
+impl BodyPlan {
+    /// Back every plan a body drawn from `code` can need: at most one
+    /// aggregate and one scalar-latest slot per byte, and a widened form at
+    /// most four bytes per byte (an index of one byte or more widens to four;
+    /// a `FLAT_MAP`'s two-byte length to four). Capacity already held is kept.
+    pub(crate) fn reserve_for(&mut self, code: &[u8]) -> Result<(), ErrorCode> {
+        let wide = code.len().checked_mul(4).ok_or(ErrorCode::OutOfMemory)?;
+        hold(&mut self.aggregates, code.len())?;
+        hold(&mut self.scalar_latest_slots, code.len())?;
+        hold(&mut self.wide, wide)
+    }
+}
+
+/// Grow `buf` to hold `total` elements, refusing with `OutOfMemory`.
+fn hold<T>(buf: &mut Vec<T>, total: usize) -> Result<(), ErrorCode> {
+    buf.try_reserve(total.saturating_sub(buf.len()))
+        .map_err(|_| ErrorCode::OutOfMemory)
 }
 
 /// Scan `body` for one batch over `plan`'s allocations. `None` for a body

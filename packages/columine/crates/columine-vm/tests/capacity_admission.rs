@@ -325,6 +325,57 @@ fn each_tier_answers_only_what_the_tier_before_cannot() {
         );
         assert_eq!(before, state);
     }
+
+    // A FOR_EACH body's per-element form is drawn from the reduce section
+    // and backed before the batch writes. A VM that has admitted this
+    // program, but never widened its body because no row matched, widens it
+    // while every allocation fails: the batch runs whole, its upsert and
+    // every body upsert, rather than stopping after the first.
+    let body = [Opcode::BatchMapUpsertLast as u8, 1, 0, 1].repeat(400);
+    let prog = program(
+        2,
+        3,
+        &[
+            vec![Opcode::SlotDef as u8, 0, SlotType::HashMap as u8, 16, 0],
+            // Room for every body row, so tier 1 clears the batch without a
+            // dry run, whose image copy would need memory of its own.
+            vec![Opcode::SlotDef as u8, 1, SlotType::HashMap as u8, 0, 4],
+        ]
+        .concat(),
+        &[
+            vec![Opcode::BatchMapUpsertLast as u8, 0, 0, 1],
+            for_each(&body),
+        ]
+        .concat(),
+    );
+    let mut state = init(&prog);
+    let mut vm = Vm::default();
+    let (keys, values) = ([3u32], [30u32]);
+    let unmatched = [TYPE + 1];
+    assert_eq!(
+        OK,
+        vm.execute_batch(
+            &mut state,
+            &prog,
+            &[
+                u32s_as_bytes(&keys),
+                u32s_as_bytes(&values),
+                u32s_as_bytes(&unmatched)
+            ],
+            1
+        )
+    );
+    let matched = [TYPE];
+    let cols = [
+        u32s_as_bytes(&keys),
+        u32s_as_bytes(&values),
+        u32s_as_bytes(&matched),
+    ];
+    assert_eq!(
+        OK,
+        without_memory(|| vm.execute_batch(&mut state, &prog, &cols, 1))
+    );
+    assert_eq!(Some(30), CheckedMap::bind(&state, 1).unwrap().get(3));
 }
 
 // ---------------------------------------------------------------------------
