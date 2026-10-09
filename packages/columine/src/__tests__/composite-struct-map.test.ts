@@ -61,8 +61,8 @@ describe('StructMap2 public WASM readers', () => {
   });
 
   it('reduces pair rows and restores checkpoint bytes with point lookup and iteration', async () => {
-    const getRow = backend.structMap2GetRow;
-    const entries = backend.structMap2Entries;
+    const getRow = backend.structMap2GetRow.bind(backend);
+    const entries = backend.structMap2Entries.bind(backend);
     const upsert = await backend.loadProgram(reducer([Opcode.BATCH_STRUCT_MAP2_UPSERT_LAST, 0, 0, 1, 2, 2, 0, 3, 1]));
     const remove = await backend.loadProgram(reducer([Opcode.BATCH_STRUCT_MAP2_REMOVE, 0, 0, 1]));
     const state = backend.createState(upsert);
@@ -81,12 +81,18 @@ describe('StructMap2 public WASM readers', () => {
       ),
     ).toBe(ErrorCode.OK);
 
-    const first = getRow(state, upsert, 0, 7, 40);
-    const second = getRow(state, upsert, 0, 7, 41);
+    const firstRead = getRow(state, upsert, 0, 7, 40);
+    const secondRead = getRow(state, upsert, 0, 7, 41);
+    if (!firstRead.ok) throw new Error(`unexpected structMap2GetRow error ${firstRead.error}`);
+    if (!secondRead.ok) throw new Error(`unexpected structMap2GetRow error ${secondRead.error}`);
+    const first = firstRead.value;
+    const second = secondRead.value;
     expect(first).toBeDefined();
     expect(second).toBeDefined();
     expect(first?.rowOffset).not.toBe(second?.rowOffset);
-    const pairs = entries(state, upsert, 0).map(({ key1, key2 }) => [key1, key2]);
+    const pairsRead = entries(state, upsert, 0);
+    if (!pairsRead.ok) throw new Error(`unexpected structMap2Entries error ${pairsRead.error}`);
+    const pairs = pairsRead.value.map(({ key1, key2 }) => [key1, key2]);
     pairs.sort((left, right) => left[1] - right[1]);
     expect(pairs).toEqual([
       [7, 40],
@@ -105,17 +111,19 @@ describe('StructMap2 public WASM readers', () => {
     expect(backend.executeBatch(state, remove, columns(new Uint32Array([7]), new Uint32Array([41])), 1)).toBe(
       ErrorCode.OK,
     );
-    expect(getRow(state, upsert, 0, 7, 41)).toBeUndefined();
+    expect(getRow(state, upsert, 0, 7, 41)).toStrictEqual({ ok: true, value: undefined });
 
     const restored = backend.deserialize(upsert, checkpoint);
-    expect(getRow(restored, upsert, 0, 7, 40)).toEqual(first);
-    expect(getRow(restored, upsert, 0, 7, 41)).toEqual(second);
-    expect(entries(restored, upsert, 0)).toHaveLength(2);
+    expect(getRow(restored, upsert, 0, 7, 40)).toStrictEqual({ ok: true, value: first });
+    expect(getRow(restored, upsert, 0, 7, 41)).toStrictEqual({ ok: true, value: second });
+    const restoredEntries = entries(restored, upsert, 0);
+    if (!restoredEntries.ok) throw new Error(`unexpected structMap2Entries error ${restoredEntries.error}`);
+    expect(restoredEntries.value).toHaveLength(2);
   });
 
   it('executes strict signed i64x2 max in the built WASM dispatcher', async () => {
     expect(Opcode.BATCH_STRUCT_MAP2_UPSERT_MAX_I64X2).toBe(0x87);
-    const getRow = backend.structMap2GetRow;
+    const getRow = backend.structMap2GetRow.bind(backend);
     const max = await backend.loadProgram(
       reducer(
         [Opcode.BATCH_STRUCT_MAP2_UPSERT_MAX_I64X2, 0, 0, 1, 1, 2, 0, 3, 1, 4, 2],
@@ -133,7 +141,9 @@ describe('StructMap2 public WASM readers', () => {
     ];
     expect(backend.executeBatch(state, max, candidates, 3)).toBe(ErrorCode.OK);
 
-    const row = getRow(state, max, 0, 7, 40);
+    const rowRead = getRow(state, max, 0, 7, 40);
+    if (!rowRead.ok) throw new Error(`unexpected structMap2GetRow error ${rowRead.error}`);
+    const row = rowRead.value;
     if (!row) throw new Error('Strict signed i64x2 max did not materialize its winner');
     const bytes = backend.serialize(state, max);
     const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);

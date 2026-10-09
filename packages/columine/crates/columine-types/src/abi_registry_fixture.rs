@@ -56,6 +56,7 @@ pub const TYPES_OPCODE_REGISTRY: &[(&str, u8)] = &[
     ("batchstructmap2remove", 0x86),
     ("batchstructmap2upsertlast", 0x83),
     ("batchstructmap2upsertmaxi64x2", 0x87),
+    ("batchstructmapcountsfold", 0x88),
     ("batchstructmapupsertfirst", 0x81),
     ("batchstructmapupsertlast", 0x80),
     ("batchstructmapupsertmax", 0x82),
@@ -116,6 +117,7 @@ pub const STRUCT_FIELD_TYPES: &[(&str, u8)] = &[
     ("int64", 1),
     ("string", 4),
     ("uint32", 0),
+    ("vo", 10),
 ];
 pub const DURATION_UNITS: &[(&str, u8)] = &[
     ("day", 4),
@@ -132,35 +134,26 @@ pub const ERROR_CODES: &[(&str, u32)] = &[
     ("arenaoverflow", 6),
     ("capacityexceeded", 1),
     ("columnunderrun", 8),
+    ("countoverflow", 10),
     ("invalidcellvalue", 9),
     ("invalidkey", 7),
     ("invalidprogram", 2),
     ("invalidslot", 3),
     ("invalidstate", 4),
+    ("deltalanemismatch", 13),
+    ("journaloverflow", 12),
+    ("metadataconflict", 11),
     ("needsgrowth", 5),
     ("ok", 0),
+    ("speculationactive", 14),
 ];
 pub const DISPATCHED_OPCODE_BYTES: &[u8] = &[
     0x00, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2a, 0x2b, 0x2c, 0x2d, 0x2e,
     0x2f, 0x3e, 0x3f, 0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x3b, 0x3c,
     0x3d, 0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49, 0x4a, 0x4b, 0x80, 0x81, 0x82,
-    0x83, 0x84, 0x85, 0x86, 0x87, 0x90, 0x92, 0x95, 0xe0, 0xe1,
+    0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x90, 0x92, 0x95, 0xe0, 0xe1,
 ];
-pub const FLAT_UNDO_OPS: &[(&str, u8)] = &[
-    ("aggupdate", 0x06),
-    ("countupdate", 0x0b),
-    ("factinsertnew", 0x07),
-    ("factinsertupdate", 0x08),
-    ("factretract", 0x09),
-    ("listappendundo", 0x0a),
-    ("mapdelete", 0x03),
-    ("mapinsert", 0x01),
-    ("mapupdate", 0x02),
-    ("setdelete", 0x05),
-    ("setinsert", 0x04),
-    ("structmapfield", 0x0c),
-    ("structmaprow", 0x0d),
-];
+pub const FLAT_UNDO_OPS: &[(&str, u8)] = &[("statebytes", 0x0f)];
 pub const RETE_OPCODES: &[(&str, u8)] = &[
     ("alphacolfiltereq", 0x58),
     ("alphacolfilterge", 0x5d),

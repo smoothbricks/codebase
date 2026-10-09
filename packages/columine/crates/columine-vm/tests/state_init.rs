@@ -12,9 +12,9 @@ use columine_vm::meta::SlotMetaView;
 use columine_vm::nested::nested_slot_data_size;
 use columine_vm::slot_growth::slot_data_size;
 use columine_vm::state_init::{
-    EVICTED_BUFFER_CAP, EVICTION_ENTRY_SIZE, arena_initial_capacity_64, calculate_grown_state_size,
-    calculate_state_size, compute_struct_row_layout_padded, grow_state, init_state, reset_state,
-    struct_map_slot_data_size, ttl_side_buffer_size,
+    EVICTED_BUFFER_CAP, EVICTION_ENTRY_SIZE, ProgramInvalidCause, arena_initial_capacity_64,
+    calculate_grown_state_size, calculate_state_size, compute_struct_row_layout_padded, grow_state,
+    init_state, reset_state, struct_map_slot_data_size, ttl_side_buffer_size,
 };
 use columine_vm::{aggregates, bytes};
 use proptest::prelude::*;
@@ -104,7 +104,7 @@ fn assert_invalid_init_without_mutation(num_slots: u32, init: &[u8]) {
             &prog,
             columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS
         ),
-        0
+        Err(ProgramInvalidCause::MalformedProgram)
     );
 
     let mut state = vec![0xa5; 256];
@@ -136,23 +136,23 @@ fn program_magic_acceptance_uses_embedder_set() {
     let mut foreign = base.clone();
     foreign[HASH_PREFIX..HASH_PREFIX + 4].copy_from_slice(&foreign_magic.to_le_bytes());
 
-    assert!(
-        calculate_state_size(
-            &base,
-            columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS
-        ) > 0
-    );
+    let base_size = calculate_state_size(
+        &base,
+        columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
+    )
+    .expect("valid program admission");
+    assert!(base_size > 0);
     assert_eq!(
         calculate_state_size(
             &foreign,
             columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS
         ),
-        0
+        Err(ProgramInvalidCause::MalformedProgram)
     );
     let accepted = [PROGRAM_MAGIC, foreign_magic];
-    assert!(calculate_state_size(&foreign, &accepted) > 0);
+    assert!(calculate_state_size(&foreign, &accepted).expect("valid program admission") > 0);
 }
-/// Probe-read a u32 hashmap value the way vm_map_get does.
+/// Probe-read a u32 hashmap value using the container's bounded linear walk.
 fn map_get(state: &[u8], offset: u32, cap: u32, key: u32) -> Option<u32> {
     let mut pos = hash_key(key, cap);
     loop {
@@ -298,7 +298,8 @@ fn calculate_state_size_hashmap() {
     let size = calculate_state_size(
         &prog,
         columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
-    );
+    )
+    .expect("valid program admission");
     assert!(size > 0);
 
     let cap = 16u32;
@@ -315,7 +316,8 @@ fn calculate_state_size_aggregate_count() {
     let size = calculate_state_size(
         &prog,
         columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
-    );
+    )
+    .expect("valid program admission");
     assert!(size > 0);
 
     let mut expected = align8(STATE_HEADER_SIZE + SLOT_META_SIZE);
@@ -333,7 +335,8 @@ fn condition_tree_derived_facts_use_sixteen_bytes_per_cell() {
         calculate_state_size(
             &prog,
             columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS
-        ),
+        )
+        .expect("valid program admission"),
         expected
     );
 
@@ -381,7 +384,8 @@ fn init_state_hashmap_keys_empty_size_zero_timestamps_neg_inf() {
     let size = calculate_state_size(
         &prog,
         columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
-    );
+    )
+    .expect("valid program admission");
     assert!(size > 0);
 
     let mut state = vec![0u8; 16384];
@@ -419,7 +423,8 @@ fn init_state_aggregate_sum_value_zero_count_zero() {
     let size = calculate_state_size(
         &prog,
         columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
-    );
+    )
+    .expect("valid program admission");
     assert!(size > 0);
 
     let mut state = vec![0u8; 16384];
@@ -457,7 +462,8 @@ fn init_state_hashset_keys_empty() {
     let size = calculate_state_size(
         &prog,
         columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
-    );
+    )
+    .expect("valid program admission");
     assert!(size > 0);
 
     let mut state = vec![0u8; 16384];
@@ -487,7 +493,8 @@ fn calculate_grown_state_size_hashmap_cap_doubles() {
     let size = calculate_state_size(
         &prog,
         columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
-    );
+    )
+    .expect("valid program admission");
     let mut state = vec![0u8; 16384];
     init_state(
         &mut state,
@@ -496,7 +503,7 @@ fn calculate_grown_state_size_hashmap_cap_doubles() {
     )
     .expect("init must succeed");
 
-    let grown_size = calculate_grown_state_size(&state, 0);
+    let grown_size = calculate_grown_state_size(&state, 0).expect("valid growth geometry");
     assert!(grown_size > size);
 
     let new_cap = 32u32; // nextPowerOf2(16*2)
@@ -519,11 +526,13 @@ fn hashmap_no_timestamp_slot_reduces_state_size() {
     let with_ts_size = calculate_state_size(
         &with_ts,
         columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
-    );
+    )
+    .expect("valid program admission");
     let no_ts_size = calculate_state_size(
         &no_ts,
         columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
-    );
+    )
+    .expect("valid program admission");
     // Effective capacity nextPowerOf2(4*2) = 16, saving one f64 per entry.
     assert_eq!(with_ts_size - no_ts_size, 16 * 8);
 }
@@ -537,7 +546,7 @@ fn hashmap_no_timestamp_plus_ttl_combination_rejected() {
             &prog,
             columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS
         ),
-        0
+        Err(ProgramInvalidCause::MalformedProgram)
     );
 
     let mut state = vec![0u8; 256];
@@ -560,14 +569,14 @@ fn calculate_state_size_rejects_bad_magic_and_short_programs() {
             &prog,
             columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS
         ),
-        0
+        Err(ProgramInvalidCause::MalformedProgram)
     );
     assert_eq!(
         calculate_state_size(
             &[0u8; 8],
             columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS
         ),
-        0
+        Err(ProgramInvalidCause::MalformedProgram)
     );
 }
 
@@ -588,7 +597,8 @@ fn scalar_slot_metadata_accepts_only_explicit_u32_f64_and_i64_subtypes() {
         let size = calculate_state_size(
             &prog,
             columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
-        );
+        )
+        .expect("valid program admission");
         assert!(size > 0);
         let mut state = vec![0u8; size as usize];
         init_state(
@@ -684,19 +694,22 @@ fn calculate_state_size_ttl_hashset_adds_eviction_buffers() {
     let base_size = calculate_state_size(
         &base,
         columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
-    );
+    )
+    .expect("valid program admission");
     assert_eq!(
         calculate_state_size(
             &ttl,
             columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS
-        ),
+        )
+        .expect("valid program admission"),
         base_size + align8(cap * EVICTION_ENTRY_SIZE)
     );
     assert_eq!(
         calculate_state_size(
             &ttl_evict,
             columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS
-        ),
+        )
+        .expect("valid program admission"),
         base_size
             + align8(cap * EVICTION_ENTRY_SIZE)
             + align8(EVICTED_BUFFER_CAP * EVICTION_ENTRY_SIZE)
@@ -710,7 +723,8 @@ fn init_state_ttl_hashset_writes_eviction_metadata() {
     let size = calculate_state_size(
         &prog,
         columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
-    );
+    )
+    .expect("valid program admission");
     assert!(size > 0);
 
     let mut state = vec![0u8; size as usize];
@@ -759,7 +773,8 @@ fn grow_state_hashmap_preserves_entries_and_doubles_cap() {
     let size = calculate_state_size(
         &prog,
         columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
-    );
+    )
+    .expect("valid program admission");
     let mut state = vec![0u8; size as usize];
     init_state(
         &mut state,
@@ -775,7 +790,7 @@ fn grow_state_hashmap_preserves_entries_and_doubles_cap() {
         insert_into_hashmap(&mut state, offset, cap, i, i * 10);
     }
 
-    let grown_size = calculate_grown_state_size(&state, 0);
+    let grown_size = calculate_grown_state_size(&state, 0).expect("valid growth geometry");
     let mut grown = vec![0u8; grown_size as usize];
     grow_state(&state, &mut grown, 0).expect("grow must succeed");
 
@@ -796,7 +811,8 @@ fn grow_state_relocates_full_derived_fact_cells_without_lane_drift() {
     let size = calculate_state_size(
         &prog,
         columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
-    );
+    )
+    .expect("valid program admission");
     let mut state = vec![0u8; size as usize];
     init_state(
         &mut state,
@@ -815,7 +831,7 @@ fn grow_state_relocates_full_derived_fact_cells_without_lane_drift() {
     bytes::write_u32(&mut state, old_derived + capacity * 12 + 4, 0x5566_7788);
     bytes::write_u32(&mut state, old_derived + capacity * 12 + 12, 0xddee_ff00);
 
-    let grown_size = calculate_grown_state_size(&state, 0);
+    let grown_size = calculate_grown_state_size(&state, 0).expect("valid growth geometry");
     let mut grown = vec![0u8; grown_size as usize];
     grow_state(&state, &mut grown, 0).expect("grow must succeed");
 
@@ -849,7 +865,8 @@ fn grow_state_struct_map_rehashes_rows() {
     let size = calculate_state_size(
         &prog,
         columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
-    );
+    )
+    .expect("valid program admission");
     let mut state = vec![0u8; size as usize];
     init_state(
         &mut state,
@@ -880,7 +897,7 @@ fn grow_state_struct_map_rehashes_rows() {
     bytes::write_i64(&mut state, row + 1 + 4, -9); // INT64 field
     bytes::write_u32(&mut state, meta + 8, 1);
 
-    let grown_size = calculate_grown_state_size(&state, 0);
+    let grown_size = calculate_grown_state_size(&state, 0).expect("valid growth geometry");
     let mut grown = vec![0u8; grown_size as usize];
     grow_state(&state, &mut grown, 0).expect("grow must succeed");
 
@@ -922,11 +939,13 @@ proptest! {
         let size_lo = calculate_state_size(
             &prog_lo,
             columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
-        );
+        )
+        .expect("valid program admission");
         let size_hi = calculate_state_size(
             &prog_hi,
             columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
-        );
+        )
+        .expect("valid program admission");
         prop_assert!(size_lo > 0 && size_hi > 0);
         prop_assert_eq!(size_lo % 8, 0);
         prop_assert!(size_lo <= size_hi);
@@ -995,7 +1014,8 @@ proptest! {
         let calculated = calculate_state_size(
             &program,
             columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
-        );
+        )
+        .expect("valid program admission");
         prop_assert!(calculated > 0);
         let mut state = vec![0u8; calculated as usize];
         init_state(
@@ -1043,7 +1063,8 @@ proptest! {
         let calculated = calculate_state_size(
             &program,
             columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
-        );
+        )
+        .expect("valid program admission");
         prop_assert!(calculated > 0);
         let mut state = vec![0u8; calculated as usize];
         init_state(
@@ -1080,11 +1101,13 @@ proptest! {
             calculate_state_size(
                 &prog_zero,
                 columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
-            ),
+            )
+            .expect("valid program admission"),
             calculate_state_size(
                 &prog_default,
                 columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
             )
+            .expect("valid program admission")
         );
     }
 
@@ -1107,7 +1130,8 @@ proptest! {
         let size = calculate_state_size(
             &prog,
             columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
-        ) as usize;
+        )
+        .expect("valid program admission") as usize;
         prop_assert!(size > 0);
 
         let mut fresh = vec![0u8; size];
@@ -1156,7 +1180,8 @@ proptest! {
         let size = calculate_state_size(
             &prog,
             columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
-        ) as usize;
+        )
+        .expect("valid program admission") as usize;
         let mut state = vec![0u8; size];
         init_state(
             &mut state,
@@ -1172,7 +1197,7 @@ proptest! {
             insert_into_hashmap(&mut state, offset, cap, k, k.wrapping_mul(7));
         }
 
-        let grown_size = calculate_grown_state_size(&state, 0) as usize;
+        let grown_size = calculate_grown_state_size(&state, 0).expect("valid growth geometry") as usize;
         let mut grown = vec![0u8; grown_size];
         grow_state(&state, &mut grown, 0).expect("grow");
 
@@ -1192,7 +1217,8 @@ proptest! {
         let size = calculate_state_size(
             &prog,
             columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
-        ) as usize;
+        )
+        .expect("valid program admission") as usize;
         let mut state = vec![0u8; size];
         init_state(
             &mut state,
@@ -1204,12 +1230,12 @@ proptest! {
         let meta = STATE_HEADER_SIZE;
         let cap1 = bytes::read_u32(&state, meta + 4);
 
-        let g1_size = calculate_grown_state_size(&state, 0) as usize;
+        let g1_size = calculate_grown_state_size(&state, 0).expect("valid growth geometry") as usize;
         let mut g1 = vec![0u8; g1_size];
         grow_state(&state, &mut g1, 0).expect("grow 1");
         prop_assert_eq!(bytes::read_u32(&g1, meta + 4), next_pow2_check(cap1 * 2));
 
-        let g2_size = calculate_grown_state_size(&g1, 0) as usize;
+        let g2_size = calculate_grown_state_size(&g1, 0).expect("valid growth geometry") as usize;
         let mut g2 = vec![0u8; g2_size];
         grow_state(&g1, &mut g2, 0).expect("grow 2");
         prop_assert_eq!(bytes::read_u32(&g2, meta + 4), next_pow2_check(cap1 * 4));
@@ -1227,11 +1253,16 @@ fn condition_tree_capacity_must_be_a_power_of_two() {
     for cap in [3u16, 6, 100, 1000] {
         let program =
             build_single_slot_program(SlotType::ConditionTree as u8, cap as u8, (cap >> 8) as u8);
-        let size = calculate_state_size(
-            &program,
-            columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
+        assert_eq!(
+            calculate_state_size(
+                &program,
+                columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
+            ),
+            Err(ProgramInvalidCause::MalformedProgram),
+            "capacity {cap}"
         );
-        let mut state = vec![0u8; size as usize];
+        // Sizing refused the program, so init is probed on a fixed image.
+        let mut state = vec![0u8; 256];
         assert_eq!(
             init_state(
                 &mut state,
@@ -1248,7 +1279,8 @@ fn condition_tree_capacity_must_be_a_power_of_two() {
         let size = calculate_state_size(
             &program,
             columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
-        );
+        )
+        .expect("valid program admission");
         let mut state = vec![0u8; size as usize];
         assert!(
             init_state(

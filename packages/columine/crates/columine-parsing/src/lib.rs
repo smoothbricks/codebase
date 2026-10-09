@@ -214,25 +214,78 @@ pub struct ExtractionConfig {
     pub(crate) enum_variants: HashMap<(String, String), Vec<String>>,
 }
 
+/// A nested payload member as its event's own schema declares it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum MemberSchema<'a> {
+    /// No semantic envelope, no known signal type, or a payload that is not
+    /// an object schema: the member resolves by column name alone.
+    Unjudged,
+    /// The event's object schema declares the member.
+    Declared(&'a crate::validate::SemanticSchema),
+    /// The event's open object schema does not declare the member: it is
+    /// captured into the carrier, never written to another type's column.
+    UndeclaredOpen,
+}
+
+/// Certified value-object frames, each paired with the batch slice it was
+/// admitted from: `(lent, certified)`. An admission that projected a frame
+/// into the reader's layout hands the pair here, and the extractor writes the
+/// certified bytes wherever it would have written the lent slice. The pairs
+/// borrow the admission's proofs, so the certified bytes are copied once,
+/// into the column, and nowhere else.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FrameProjections<'p> {
+    frames: &'p [(&'p [u8], &'p [u8])],
+}
+
+impl<'p> FrameProjections<'p> {
+    pub fn new(frames: &'p [(&'p [u8], &'p [u8])]) -> Self {
+        Self { frames }
+    }
+
+    /// The certified bytes replacing `lent`, matched by identity (address
+    /// and length), never by content.
+    pub(crate) fn certified(&self, lent: &[u8]) -> Option<&'p [u8]> {
+        self.frames
+            .iter()
+            .find(|(frame, _)| core::ptr::eq(*frame, lent))
+            .map(|(_, certified)| *certified)
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.frames.len()
+    }
+}
+
 impl ExtractionConfig {
     pub(crate) fn is_open_payload_path(&self, path: &str) -> bool {
         self.open_paths.iter().any(|open| open == path)
     }
 
-    pub(crate) fn semantic_field_schema(
+    /// How one nested payload member of an event of `event_type` is judged by
+    /// that event's OWN schema. Columns are shared across signal types, so a
+    /// member resolves against the schema of the type that carries it, never
+    /// against whichever signal type happens to declare the same name.
+    pub(crate) fn payload_member_schema(
         &self,
-        name: &str,
-    ) -> Option<&crate::validate::SemanticSchema> {
-        let name = name.strip_prefix("value.").unwrap_or(name);
-        let schemas = self.semantic_schemas.as_ref()?;
-        schemas.values().find_map(|schema| match schema {
-            crate::validate::SemanticSchema::Object { fields, .. } => fields
-                .iter()
-                .find(|(field, _)| field == name)
-                .map(|(_, schema)| schema),
-            _ => None,
-        })
+        event_type: Option<&str>,
+        member: &str,
+    ) -> MemberSchema<'_> {
+        let schema = self
+            .semantic_schemas
+            .as_ref()
+            .zip(event_type)
+            .and_then(|(schemas, event_type)| schemas.get(event_type));
+        let Some(crate::validate::SemanticSchema::Object { fields, open }) = schema else {
+            return MemberSchema::Unjudged;
+        };
+        match fields.iter().find(|(field, _)| field == member) {
+            Some((_, schema)) => MemberSchema::Declared(schema),
+            None if *open => MemberSchema::UndeclaredOpen,
+            None => MemberSchema::Unjudged,
+        }
     }
+
     pub(crate) fn lookup_field(&self, name: &str) -> Option<&FieldLookup> {
         self.field_map.get(name).or_else(|| {
             let prefixed = format!("value.{name}");

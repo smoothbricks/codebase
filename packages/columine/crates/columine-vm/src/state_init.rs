@@ -14,13 +14,15 @@
 //!
 //! Suffixes `_padded` and `_64` keep these domains distinct at call sites.
 //!
-//! `calculate_state_size` returns 0 for an invalid program. Stateful entry
+//! `calculate_state_size` returns a typed admission Result. Stateful entry
 //! points return `Result<(), ErrorCode>`, which wrappers map to numeric codes.
-//! An undersized state buffer is a caller bug and panics through slice bounds.
 //! Malformed-but-length-valid bytecode with invalid slot-type nibbles returns
-//! `InvalidProgram`/0 rather than invoking undefined behavior.
+//! a typed `ProgramInvalidCause` or `InvalidProgram`, never a fabricated size.
+//! Undersized or corrupt state images return `InvalidState` before writes.
 
+use crate::element_body::{InvalidSource, SourceOp, visit_source_ops};
 use crate::meta::SlotMetaView;
+use crate::struct_map::ArenaRegion;
 use crate::{aggregates, bitmap_ops, bytes, hash_table, nested, slot_growth};
 use bitmosaic::{EMPTY_U32_IMAGE, KeyWidth, image_header};
 pub use columine_types::DEFAULT_ACCEPTED_PROGRAM_MAGICS;
@@ -30,7 +32,7 @@ use columine_types::types::{
     EvictionEntry, Opcode, PROGRAM_HASH_PREFIX, ProgramHeader, SLOT_META_SIZE,
     STATE_FORMAT_VERSION, STATE_HEADER_SIZE, STATE_MAGIC, SlotMetaOffset, SlotType, SlotTypeFlags,
     StateFlags, StateHeaderOffset, StructFieldType, TOMBSTONE, align8, arena_elem_size,
-    has_array_fields, is_array_field_type, next_power_of_2, state_num_slots,
+    has_arena_fields, is_arena_field_type, next_power_of_2, state_num_slots,
 };
 use core::mem::size_of;
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -189,6 +191,9 @@ pub const fn ttl_side_buffer_size(has_ttl: bool, has_evict_trigger: bool, capaci
 struct ProgramView<'a> {
     num_slots: u32,
     init_code: &'a [u8],
+    /// The reduce section, borrowed from the header: admission reads its
+    /// bitmap algebra against the declarations the init section proved.
+    reduce_code: &'a [u8],
 }
 
 /// Parse the shared program header and return `None` for an invalid program.
@@ -203,16 +208,17 @@ fn parse_program<'a>(
     Some(ProgramView {
         num_slots: sections.header.num_slots,
         init_code: sections.init_code,
+        reduce_code: sections.reduce_code,
     })
 }
 
 /// The TTL parameters a `SLOT_DEF` with `has_ttl` carries after its
 /// capacity: `ttl:f32, grace:f32, ts_col:index, start_of:u8`.
 #[derive(Clone, Copy)]
-struct TtlParams {
+pub(crate) struct TtlParams {
     ttl_seconds: f32,
     grace_seconds: f32,
-    timestamp_col: u32,
+    pub(crate) timestamp_col: u32,
     start_of: u8,
 }
 
@@ -224,7 +230,7 @@ impl TtlParams {
         start_of: 0, // DurationUnit::None
     };
 
-    fn read(code: &[u8], pc: usize) -> Option<(Self, usize)> {
+    pub(crate) fn read(code: &[u8], pc: usize) -> Option<(Self, usize)> {
         let mut operands = Operands::at(code, pc);
         let params = Self {
             ttl_seconds: operands.f32()?,
@@ -236,9 +242,21 @@ impl TtlParams {
     }
 }
 
+/// The TTL v1 matrix is shared by program admission and persisted geometry:
+/// only hash maps, hash sets and bitmaps carry expiry.
+fn supports_ttl(slot_type: SlotType) -> bool {
+    matches!(
+        slot_type,
+        SlotType::HashMap | SlotType::HashSet | SlotType::Bitmap
+    )
+}
+
 /// SLOT_DEF capacity normalization shared by the size and init walkers.
 fn slot_def_capacity(type_flags: SlotTypeFlags, cap_lo: u8, cap_hi: u8) -> Option<(SlotType, u32)> {
     let slot_type = type_flags.slot_type()?;
+    if type_flags.has_ttl() && !supports_ttl(slot_type) {
+        return None;
+    }
     let mut capacity = (u32::from(cap_hi) << 8) | u32::from(cap_lo);
     let is_fixed_size = matches!(
         slot_type,
@@ -254,15 +272,37 @@ fn slot_def_capacity(type_flags: SlotTypeFlags, cap_lo: u8, cap_hi: u8) -> Optio
     Some((slot_type, capacity))
 }
 
-/// Read the slot index that opens every init instruction and claim it:
-/// `None` when the index is malformed, out of range or already defined.
-fn claim_slot(code: &[u8], pc: usize, seen: &mut [bool]) -> Option<(u32, usize)> {
+/// The slot type an init record declares. `SLOT_ARRAY` has no type byte after
+/// its slot index: its slot is `SlotType::Array`, as `init_state` writes it.
+/// Every other record opens with its flags byte at `at`.
+fn declared_type(op: Opcode, code: &[u8], at: usize) -> Option<SlotTypeFlags> {
+    if op == Opcode::SlotArray {
+        return Some(SlotTypeFlags::new(
+            SlotType::Array,
+            false,
+            false,
+            false,
+            false,
+        ));
+    }
+    Some(SlotTypeFlags::from_byte(*code.get(at)?))
+}
+
+/// Read the slot index that opens every init instruction and claim it with the
+/// type that record declares: `None` when the index is malformed, out of range,
+/// already defined, or its record carries no type byte.
+fn claim_slot(
+    code: &[u8],
+    pc: usize,
+    op: Opcode,
+    declared: &mut [Option<SlotTypeFlags>],
+) -> Option<(u32, usize)> {
     let (slot, next) = read_index(code, pc)?;
-    let defined = seen.get_mut(usize::try_from(slot).ok()?)?;
-    if *defined {
+    let claimed = declared.get_mut(usize::try_from(slot).ok()?)?;
+    if claimed.is_some() {
         return None;
     }
-    *defined = true;
+    *claimed = Some(declared_type(op, code, next)?);
     Some((slot, next))
 }
 
@@ -290,43 +330,52 @@ fn valid_scalar_subtype(byte: u8) -> bool {
     )
 }
 
-fn validate_init_code(view: &ProgramView<'_>) -> bool {
+/// The init grammar: every slot claimed once with the type its record declares,
+/// then the reduce section's bitmap algebra checked against those declarations
+/// at the successful `HALT`, where the declarations are complete.
+fn validate_init_code(view: &ProgramView<'_>) -> Result<(), ProgramInvalidCause> {
     let code = view.init_code;
     // Every slot is defined exactly once, by an init instruction of at least
     // five bytes, so a header counting more slots than the init section has
     // bytes is refused before the bookkeeping for it is allocated.
     let Ok(num_slots) = usize::try_from(view.num_slots) else {
-        return false;
+        return Err(ProgramInvalidCause::MalformedProgram);
     };
     if num_slots > code.len() {
-        return false;
+        return Err(ProgramInvalidCause::MalformedProgram);
     }
-    let mut seen = vec![false; num_slots];
+    let mut declared: Vec<Option<SlotTypeFlags>> = vec![None; num_slots];
     let mut pc = 0usize;
 
     while pc < code.len() {
         let Some(op) = Opcode::from_u8(code[pc]) else {
-            return false;
+            return Err(ProgramInvalidCause::MalformedProgram);
         };
         pc += 1;
         if op == Opcode::Halt {
-            return pc == code.len() && seen.iter().all(|defined| *defined);
+            if pc != code.len() || !declared.iter().all(Option::is_some) {
+                return Err(ProgramInvalidCause::MalformedProgram);
+            }
+            return bitmap_algebra_admitted(view.reduce_code, &declared);
         }
-        let Some((_, after_slot)) = claim_slot(code, pc, &mut seen) else {
-            return false;
+        let Some((_, after_slot)) = claim_slot(code, pc, op, &mut declared) else {
+            return Err(ProgramInvalidCause::MalformedProgram);
         };
         pc = after_slot;
 
         match op {
             Opcode::SlotDef => {
                 let Some(operands) = code.get(pc..pc.saturating_add(3)) else {
-                    return false;
+                    return Err(ProgramInvalidCause::MalformedProgram);
                 };
                 let type_flags = SlotTypeFlags::from_byte(operands[0]);
                 let cap_lo = operands[1];
                 let Some(slot_type) = type_flags.slot_type() else {
-                    return false;
+                    return Err(ProgramInvalidCause::MalformedProgram);
                 };
+                if type_flags.has_ttl() && !supports_ttl(slot_type) {
+                    return Err(ProgramInvalidCause::MalformedProgram);
+                }
                 if matches!(
                     slot_type,
                     SlotType::StructMap
@@ -334,125 +383,209 @@ fn validate_init_code(view: &ProgramView<'_>) -> bool {
                         | SlotType::OrderedList
                         | SlotType::Nested
                 ) {
-                    return false;
+                    return Err(ProgramInvalidCause::MalformedProgram);
                 }
                 if slot_type == SlotType::Aggregate && !valid_aggregate_subtype(cap_lo) {
-                    return false;
+                    return Err(ProgramInvalidCause::MalformedProgram);
                 }
                 if slot_type == SlotType::Scalar && !valid_scalar_subtype(cap_lo) {
-                    return false;
+                    return Err(ProgramInvalidCause::MalformedProgram);
+                }
+                // The derived-facts region indexes with `capacity - 1` masks; a
+                // capacity that is not a power of two would alias slots silently.
+                let capacity = u16::from_le_bytes([cap_lo, operands[2]]);
+                if slot_type == SlotType::ConditionTree
+                    && capacity > 0
+                    && !capacity.is_power_of_two()
+                {
+                    return Err(ProgramInvalidCause::MalformedProgram);
                 }
                 if slot_type == SlotType::HashMap
                     && type_flags.has_ttl()
                     && type_flags.no_hashmap_timestamps()
                 {
-                    return false;
+                    return Err(ProgramInvalidCause::MalformedProgram);
                 }
                 pc += 3;
                 if type_flags.has_ttl() {
                     let Some((ttl, after)) = TtlParams::read(code, pc) else {
-                        return false;
+                        return Err(ProgramInvalidCause::MalformedProgram);
                     };
                     if ttl.start_of > 8 {
-                        return false;
+                        return Err(ProgramInvalidCause::MalformedProgram);
                     }
                     pc = after;
                 }
             }
             Opcode::SlotArray => {
                 if code.get(pc..pc.saturating_add(3)).is_none() {
-                    return false;
+                    return Err(ProgramInvalidCause::MalformedProgram);
                 }
                 pc += 3;
             }
             Opcode::SlotStructMap | Opcode::SlotStructMap2 => {
                 let Some(operands) = code.get(pc..pc.saturating_add(4)) else {
-                    return false;
+                    return Err(ProgramInvalidCause::MalformedProgram);
                 };
                 let type_flags = SlotTypeFlags::from_byte(operands[0]);
-                if type_flags.has_ttl() {
-                    return false;
+                let expected = if op == Opcode::SlotStructMap {
+                    SlotType::StructMap
+                } else {
+                    SlotType::StructMap2
+                };
+                if type_flags.has_ttl() || type_flags.slot_type() != Some(expected) {
+                    return Err(ProgramInvalidCause::MalformedProgram);
                 }
                 let num_fields = usize::from(operands[3]);
                 pc += 4;
                 let Some(field_types) = code.get(pc..pc.saturating_add(num_fields)) else {
-                    return false;
+                    return Err(ProgramInvalidCause::MalformedProgram);
                 };
-                if field_types
-                    .iter()
-                    .any(|field_type| StructFieldType::from_u8(*field_type).is_none())
-                {
-                    return false;
+                if field_types.iter().any(|field_type| {
+                    StructFieldType::from_u8(*field_type).is_none()
+                        || (op == Opcode::SlotStructMap2
+                            && *field_type == StructFieldType::Vo as u8)
+                }) {
+                    return Err(ProgramInvalidCause::MalformedProgram);
                 }
                 pc += num_fields;
             }
             Opcode::SlotOrderedList => {
                 let Some(operands) = code.get(pc..pc.saturating_add(4)) else {
-                    return false;
+                    return Err(ProgramInvalidCause::MalformedProgram);
                 };
+                let type_flags = SlotTypeFlags::from_byte(operands[0]);
+                if type_flags.slot_type() != Some(SlotType::OrderedList) || type_flags.has_ttl() {
+                    return Err(ProgramInvalidCause::MalformedProgram);
+                }
                 let elem_type = operands[3];
                 pc += 4;
                 if elem_type == 0xff {
                     let Some(&num_fields) = code.get(pc) else {
-                        return false;
+                        return Err(ProgramInvalidCause::MalformedProgram);
                     };
                     pc += 1;
                     let Some(field_types) =
                         code.get(pc..pc.saturating_add(usize::from(num_fields)))
                     else {
-                        return false;
+                        return Err(ProgramInvalidCause::MalformedProgram);
                     };
-                    if field_types
-                        .iter()
-                        .any(|field_type| StructFieldType::from_u8(*field_type).is_none())
-                    {
-                        return false;
+                    if field_types.iter().any(|field_type| {
+                        StructFieldType::from_u8(*field_type).is_none()
+                            || *field_type == StructFieldType::Vo as u8
+                    }) {
+                        return Err(ProgramInvalidCause::MalformedProgram);
                     }
                     pc += usize::from(num_fields);
-                } else if StructFieldType::from_u8(elem_type).is_none() {
-                    return false;
+                } else if StructFieldType::from_u8(elem_type).is_none()
+                    || elem_type == StructFieldType::Vo as u8
+                {
+                    return Err(ProgramInvalidCause::MalformedProgram);
                 }
             }
             Opcode::SlotNested => {
                 let Some(operands) = code.get(pc..pc.saturating_add(7)) else {
-                    return false;
+                    return Err(ProgramInvalidCause::MalformedProgram);
                 };
+                let flags = SlotTypeFlags::from_byte(operands[0]);
+                if flags.has_ttl() || flags.slot_type() != Some(SlotType::Nested) {
+                    return Err(ProgramInvalidCause::MalformedProgram);
+                }
                 let Some(inner_type) = SlotType::from_u8(operands[3] & 0x0f) else {
-                    return false;
+                    return Err(ProgramInvalidCause::MalformedProgram);
                 };
                 if inner_type == SlotType::Aggregate && !valid_aggregate_subtype(operands[6]) {
-                    return false;
+                    return Err(ProgramInvalidCause::MalformedProgram);
                 }
                 pc += 7;
             }
-            _ => return false,
+            _ => return Err(ProgramInvalidCause::MalformedProgram),
         }
     }
 
-    false
+    Err(ProgramInvalidCause::MalformedProgram)
+}
+
+/// Whether the reduce section's bitmap algebra agrees with the declarations.
+/// A slot×slot algebra op folds its source into its target, so a source that
+/// carries timestamps cannot fold into a target that tracks none. That layout
+/// change is refused here, never applied silently.
+fn bitmap_algebra_admitted(
+    reduce: &[u8],
+    declared: &[Option<SlotTypeFlags>],
+) -> Result<(), ProgramInvalidCause> {
+    visit_source_ops(reduce, 0, &mut |source| {
+        check_bitmap_algebra(&source, declared)
+    })
+}
+
+fn check_bitmap_algebra(
+    source: &SourceOp<'_>,
+    declared: &[Option<SlotTypeFlags>],
+) -> Result<(), ProgramInvalidCause> {
+    if !matches!(
+        source.op,
+        Opcode::BatchBitmapAnd
+            | Opcode::BatchBitmapOr
+            | Opcode::BatchBitmapAndNot
+            | Opcode::BatchBitmapXor
+    ) {
+        return Ok(());
+    }
+    let mut r = Operands::at(source.code, source.operands);
+    let target = r.index().ok_or(ProgramInvalidCause::MalformedProgram)?;
+    let source_slot = r.index().ok_or(ProgramInvalidCause::MalformedProgram)?;
+    let target_flags =
+        declared_bitmap(declared, target).ok_or(ProgramInvalidCause::MalformedProgram)?;
+    let source_flags =
+        declared_bitmap(declared, source_slot).ok_or(ProgramInvalidCause::MalformedProgram)?;
+    if source_flags.has_ttl() && !target_flags.has_ttl() {
+        return Err(ProgramInvalidCause::BitmapTtlSourceToUntrackedTarget {
+            source: source_slot,
+            target,
+        });
+    }
+    Ok(())
+}
+
+/// The declaration of `slot`, when it exists and is a bitmap.
+fn declared_bitmap(declared: &[Option<SlotTypeFlags>], slot: u32) -> Option<SlotTypeFlags> {
+    let flags = (*declared.get(usize::try_from(slot).ok()?)?)?;
+    (flags.slot_type() == Some(SlotType::Bitmap)).then_some(flags)
 }
 
 fn validated_program<'a>(
     program: &'a [u8],
     accepted_program_magics: &[u32],
-) -> Option<ProgramView<'a>> {
-    let view = parse_program(program, accepted_program_magics)?;
-    validate_init_code(&view).then_some(view)
+) -> Result<ProgramView<'a>, ProgramInvalidCause> {
+    let view = parse_program(program, accepted_program_magics)
+        .ok_or(ProgramInvalidCause::MalformedProgram)?;
+    validate_init_code(&view)?;
+    Ok(view)
 }
 // =============================================================================
 // State Size Calculation — vm_calculate_state_size
 // =============================================================================
 
-/// Calculate the required state-buffer size, or return 0 for an invalid
-/// program.
-pub fn calculate_state_size(program: &[u8], accepted_program_magics: &[u32]) -> u32 {
-    let Some(view) = validated_program(program, accepted_program_magics) else {
-        return 0;
-    };
+/// Calculate the required state-buffer size or retain the actual admission cause.
+pub fn calculate_state_size(
+    program: &[u8],
+    accepted_program_magics: &[u32],
+) -> Result<u32, ProgramInvalidCause> {
+    let view = validated_program(program, accepted_program_magics)?;
+    calculate_state_size_from_view(&view)
+}
+
+fn calculate_state_size_from_view(view: &ProgramView<'_>) -> Result<u32, ProgramInvalidCause> {
     let init_code = view.init_code;
 
     // Header + slot metadata (48 bytes per slot).
-    let mut size = align8(STATE_HEADER_SIZE + view.num_slots * SLOT_META_SIZE);
+    let mut size =
+        (u64::from(STATE_HEADER_SIZE) + u64::from(view.num_slots) * u64::from(SLOT_META_SIZE) + 7)
+            & !7;
+    if size > u64::from(u32::MAX) {
+        return Err(ProgramInvalidCause::MalformedProgram);
+    }
 
     let mut pc = 0usize;
     while pc < init_code.len() {
@@ -464,7 +597,7 @@ pub fn calculate_state_size(program: &[u8], accepted_program_magics: &[u32]) -> 
         // Every init instruction opens with its slot index; validation has
         // already claimed it, so only its length matters here.
         let Some((_, after_slot)) = read_index(init_code, pc) else {
-            return 0;
+            return Err(ProgramInvalidCause::MalformedProgram);
         };
         pc = after_slot;
 
@@ -475,7 +608,7 @@ pub fn calculate_state_size(program: &[u8], accepted_program_magics: &[u32]) -> 
             let cap_hi = init_code[pc + 2];
             // Invalid slot-type nibbles make the program invalid.
             let Some((slot_type, capacity)) = slot_def_capacity(type_flags, cap_lo, cap_hi) else {
-                return 0;
+                return Err(ProgramInvalidCause::MalformedProgram);
             };
             pc += 3;
 
@@ -483,12 +616,12 @@ pub fn calculate_state_size(program: &[u8], accepted_program_magics: &[u32]) -> 
                 && type_flags.has_ttl()
                 && type_flags.no_hashmap_timestamps()
             {
-                return 0;
+                return Err(ProgramInvalidCause::MalformedProgram);
             }
 
             if type_flags.has_ttl() {
                 let Some((_, after_ttl)) = TtlParams::read(init_code, pc) else {
-                    return 0;
+                    return Err(ProgramInvalidCause::MalformedProgram);
                 };
                 pc = after_ttl;
             }
@@ -499,18 +632,18 @@ pub fn calculate_state_size(program: &[u8], accepted_program_magics: &[u32]) -> 
                 } else {
                     AggType::Sum as u8
                 };
-            size += slot_growth::slot_data_size(
+            size += u64::from(slot_growth::slot_data_size(
                 slot_type,
                 capacity,
                 !type_flags.no_hashmap_timestamps(),
                 agg_type_byte,
-            );
-            size = align8(size);
-            size += ttl_side_buffer_size(
+            ));
+            size = (size + 7) & !7;
+            size += u64::from(ttl_side_buffer_size(
                 type_flags.has_ttl(),
                 type_flags.has_evict_trigger(),
                 capacity,
-            );
+            ));
         } else if op == Opcode::SlotArray as u8 {
             let cap_lo = init_code[pc];
             let cap_hi = init_code[pc + 1];
@@ -521,8 +654,8 @@ pub fn calculate_state_size(program: &[u8], accepted_program_magics: &[u32]) -> 
             capacity = next_power_of_2(capacity * 2);
             pc += 3;
 
-            size += capacity * 4 + capacity * 8;
-            size = align8(size);
+            size += u64::from(capacity) * 12;
+            size = (size + 7) & !7;
         } else if op == Opcode::SlotStructMap as u8 || op == Opcode::SlotStructMap2 as u8 {
             let type_flags = SlotTypeFlags::from_byte(init_code[pc]);
             let cap_lo = init_code[pc + 1];
@@ -540,21 +673,22 @@ pub fn calculate_state_size(program: &[u8], accepted_program_magics: &[u32]) -> 
             pc += usize::from(num_fields);
 
             let layout = compute_struct_row_layout_padded(num_fields, field_types);
-            size += if op == Opcode::SlotStructMap2 as u8 {
+            size += u64::from(if op == Opcode::SlotStructMap2 as u8 {
                 struct_map2_slot_data_size(layout.descriptor_size, capacity, layout.row_size)
             } else {
                 struct_map_slot_data_size(layout.descriptor_size, capacity, layout.row_size, false)
-            };
+            });
 
-            if has_array_fields(num_fields, field_types) {
-                size += ARENA_HEADER_SIZE + arena_initial_capacity_64(capacity);
+            if has_arena_fields(num_fields, field_types) {
+                size +=
+                    u64::from(ARENA_HEADER_SIZE) + u64::from(arena_initial_capacity_64(capacity));
             }
-            size = align8(size);
-            size += ttl_side_buffer_size(
+            size = (size + 7) & !7;
+            size += u64::from(ttl_side_buffer_size(
                 type_flags.has_ttl(),
                 type_flags.has_evict_trigger(),
                 capacity,
-            );
+            ));
         } else if op == Opcode::SlotOrderedList as u8 {
             let cap_lo = init_code[pc + 1];
             let cap_hi = init_code[pc + 2];
@@ -573,16 +707,17 @@ pub fn calculate_state_size(program: &[u8], accepted_program_magics: &[u32]) -> 
                 pc += 1 + usize::from(num_fields);
 
                 let layout = compute_struct_row_layout_padded(num_fields, field_types);
-                size += layout.descriptor_size + capacity * layout.row_size;
+                size += u64::from(layout.descriptor_size)
+                    + u64::from(capacity) * u64::from(layout.row_size);
             } else {
                 let elem_size = columine_types::types::struct_field_size(
                     columine_types::types::StructFieldType::from_u8(elem_type).unwrap_or_else(
                         || columine_types::die!("invariant: ordered-list element type is invalid"),
                     ),
                 );
-                size += capacity * elem_size;
+                size += u64::from(capacity) * u64::from(elem_size);
             }
-            size = align8(size);
+            size = (size + 7) & !7;
         } else if op == Opcode::SlotNested as u8 {
             let outer_cap_lo = init_code[pc + 1];
             let outer_cap_hi = init_code[pc + 2];
@@ -605,7 +740,7 @@ pub fn calculate_state_size(program: &[u8], accepted_program_magics: &[u32]) -> 
             // Truncate the inner type to its low nibble; invalid values reject
             // the program instead of reaching an unchecked enum conversion.
             let Some(inner_type) = SlotType::from_u8(inner_type_byte & 0x0f) else {
-                return 0;
+                return Err(ProgramInvalidCause::MalformedProgram);
             };
             // Only interpret as AggType for AGGREGATE inner containers.
             let inner_agg = if inner_type == SlotType::Aggregate && inner_agg_type_byte >= 1 {
@@ -614,19 +749,23 @@ pub fn calculate_state_size(program: &[u8], accepted_program_magics: &[u32]) -> 
                 1 // SUM
             };
 
-            size += nested::nested_slot_data_size(
-                outer_cap,
-                next_power_of_2(inner_initial_cap),
+            let inner_size = u64::from(nested::inner_container_size(
                 inner_type,
+                next_power_of_2(inner_initial_cap),
                 inner_agg,
-            );
-            size = align8(size);
+            ));
+            size += u64::from(nested::NESTED_PREFIX_SIZE + ARENA_HEADER_SIZE)
+                + u64::from(outer_cap) * (8 + ((inner_size + 7) & !7));
+            size = (size + 7) & !7;
         } else {
-            return 0;
+            return Err(ProgramInvalidCause::MalformedProgram);
+        }
+        if size > u64::from(u32::MAX) {
+            return Err(ProgramInvalidCause::MalformedProgram);
         }
     }
 
-    size
+    u32::try_from(size).map_err(|_| ProgramInvalidCause::MalformedProgram)
 }
 
 // =============================================================================
@@ -697,9 +836,20 @@ pub fn init_state(
     program: &[u8],
     accepted_program_magics: &[u32],
 ) -> Result<(), ErrorCode> {
-    let Some(view) = validated_program(program, accepted_program_magics) else {
-        return Err(ErrorCode::InvalidProgram);
-    };
+    let view = validated_program(program, accepted_program_magics)
+        .map_err(|_| ErrorCode::InvalidProgram)?;
+    let required = calculate_state_size_from_view(&view).map_err(|_| ErrorCode::InvalidProgram)?;
+    if state.len() < required as usize {
+        return Err(ErrorCode::InvalidState);
+    }
+    init_state_from_view(state, program, view)
+}
+
+fn init_state_from_view(
+    state: &mut [u8],
+    program: &[u8],
+    view: ProgramView<'_>,
+) -> Result<(), ErrorCode> {
     let content = &program[PROGRAM_HASH_PREFIX as usize..];
     let num_slots = view.num_slots;
     let init_code = view.init_code;
@@ -744,11 +894,6 @@ pub fn init_state(
                 && type_flags.has_ttl()
                 && type_flags.no_hashmap_timestamps()
             {
-                return Err(ErrorCode::InvalidProgram);
-            }
-            // The derived-facts region indexes with `capacity - 1` masks; a
-            // capacity that is not a power of two would alias slots silently.
-            if slot_type == SlotType::ConditionTree && capacity > 0 && !capacity.is_power_of_two() {
                 return Err(ErrorCode::InvalidProgram);
             }
 
@@ -929,10 +1074,10 @@ pub fn init_state(
             }
             capacity = next_power_of_2(capacity * 2);
 
-            let field_types = init_code[pc..pc + usize::from(num_fields)].to_vec();
+            let field_types = &init_code[pc..pc + usize::from(num_fields)];
             pc += usize::from(num_fields);
 
-            let layout = compute_struct_row_layout_padded(num_fields, &field_types);
+            let layout = compute_struct_row_layout_padded(num_fields, field_types);
             let meta_base = STATE_HEADER_SIZE + slot * SLOT_META_SIZE;
 
             write_overlay_meta(
@@ -950,7 +1095,7 @@ pub fn init_state(
             );
 
             // Field descriptor, exact key lane(s), then zeroed rows.
-            bytes::copy(state, data_offset, &field_types, 0, u32::from(num_fields));
+            bytes::copy(state, data_offset, field_types, 0, u32::from(num_fields));
             let keys1_offset = data_offset + layout.descriptor_size;
             bytes::fill_u32(state, keys1_offset, capacity, EMPTY_KEY);
             let rows_offset = if op == Opcode::SlotStructMap2 as u8 {
@@ -968,7 +1113,7 @@ pub fn init_state(
                 struct_map_slot_data_size(layout.descriptor_size, capacity, layout.row_size, false)
             };
 
-            if has_array_fields(num_fields, &field_types) {
+            if has_arena_fields(num_fields, field_types) {
                 let arena_cap = arena_initial_capacity_64(capacity);
                 // Arena header offset overlays GRACE_SECONDS.
                 bytes::write_u32(state, meta_base + STRUCT_ARENA_HDR, data_offset);
@@ -996,10 +1141,10 @@ pub fn init_state(
             if elem_type == 0xff {
                 // Struct list.
                 let num_fields = init_code[pc];
-                let field_types = init_code[pc + 1..pc + 1 + usize::from(num_fields)].to_vec();
+                let field_types = &init_code[pc + 1..pc + 1 + usize::from(num_fields)];
                 pc += 1 + usize::from(num_fields);
 
-                let layout = compute_struct_row_layout_padded(num_fields, &field_types);
+                let layout = compute_struct_row_layout_padded(num_fields, field_types);
 
                 write_overlay_meta(
                     state,
@@ -1015,7 +1160,7 @@ pub fn init_state(
                     },
                 );
 
-                bytes::copy(state, data_offset, &field_types, 0, u32::from(num_fields));
+                bytes::copy(state, data_offset, field_types, 0, u32::from(num_fields));
                 let rows_offset = data_offset + layout.descriptor_size;
                 bytes::zero(state, rows_offset, capacity * layout.row_size);
 
@@ -1125,11 +1270,14 @@ pub fn reset_state(
     program: &[u8],
     accepted_program_magics: &[u32],
 ) -> Result<(), ErrorCode> {
-    if validated_program(program, accepted_program_magics).is_none() {
-        return Err(ErrorCode::InvalidProgram);
+    let view = validated_program(program, accepted_program_magics)
+        .map_err(|_| ErrorCode::InvalidProgram)?;
+    let required = calculate_state_size_from_view(&view).map_err(|_| ErrorCode::InvalidProgram)?;
+    if state.len() < required as usize {
+        return Err(ErrorCode::InvalidState);
     }
     state.fill(0);
-    init_state(state, program, accepted_program_magics)
+    init_state_from_view(state, program, view)
 }
 // =============================================================================
 // Slot growth — calculate, allocate, copy, and rehash
@@ -1137,6 +1285,315 @@ pub fn reset_state(
 //
 // When a HashMap or HashSet exceeds 70% load, the VM reports NEEDS_GROWTH so
 // the caller can allocate the larger state and retry the batch.
+
+/// Validate the actual image header before any metadata access.
+pub(crate) fn state_geometry(state: &[u8]) -> Result<(u32, u32), ErrorCode> {
+    if state.len() < STATE_HEADER_SIZE as usize
+        || bytes::read_u32(state, StateHeaderOffset::MAGIC) != STATE_MAGIC
+        || state[StateHeaderOffset::FORMAT_VERSION as usize] != STATE_FORMAT_VERSION
+    {
+        return Err(ErrorCode::InvalidState);
+    }
+    let slots = state_num_slots(state);
+    let end =
+        checked_size(u64::from(STATE_HEADER_SIZE) + u64::from(slots) * u64::from(SLOT_META_SIZE))?;
+    let end = checked_align8(end)?;
+    if end as usize > state.len() {
+        return Err(ErrorCode::InvalidState);
+    }
+    Ok((slots, end))
+}
+
+fn checked_size(size: u64) -> Result<u32, ErrorCode> {
+    u32::try_from(size).map_err(|_| ErrorCode::InvalidState)
+}
+
+fn checked_align8(size: u32) -> Result<u32, ErrorCode> {
+    size.checked_add(7)
+        .map(|size| size & !7)
+        .ok_or(ErrorCode::InvalidState)
+}
+
+/// Preserve the established minimum-16 capacity normalization without overflow.
+fn grown_capacity(capacity: u32) -> Result<u32, ErrorCode> {
+    capacity
+        .checked_mul(2)
+        .and_then(|capacity| capacity.max(16).checked_next_power_of_two())
+        .ok_or(ErrorCode::InvalidState)
+}
+
+/// Physical ownership follows offsets, not metadata slot-index order.
+fn slot_limit(state: &[u8], slot: u32, slots: u32, metadata_end: u32) -> Result<u32, ErrorCode> {
+    let offset = bytes::read_u32(state, STATE_HEADER_SIZE + slot * SLOT_META_SIZE);
+    let mut limit = u32::try_from(state.len()).map_err(|_| ErrorCode::InvalidState)?;
+    if offset < metadata_end || offset > limit || !offset.is_multiple_of(8) {
+        return Err(ErrorCode::InvalidState);
+    }
+    for other in 0..slots {
+        if other == slot {
+            continue;
+        }
+        let other_offset = bytes::read_u32(state, STATE_HEADER_SIZE + other * SLOT_META_SIZE);
+        if other_offset < metadata_end
+            || other_offset > state.len() as u32
+            || !other_offset.is_multiple_of(8)
+            || other_offset == offset
+        {
+            return Err(ErrorCode::InvalidState);
+        }
+        if other_offset > offset {
+            limit = limit.min(other_offset);
+        }
+    }
+    Ok(limit)
+}
+
+fn checked_struct_layout(
+    state: &[u8],
+    meta: u32,
+    kind: SlotType,
+) -> Result<columine_types::types::StructRowLayout, ErrorCode> {
+    let offset = bytes::read_u32(state, meta + SlotMetaOffset::OFFSET);
+    let nf = state[(meta + STRUCT_NUM_FIELDS) as usize];
+    let end = offset
+        .checked_add(u32::from(nf))
+        .ok_or(ErrorCode::InvalidState)?;
+    let descriptor = state
+        .get(offset as usize..end as usize)
+        .ok_or(ErrorCode::InvalidState)?;
+    for &field in descriptor {
+        StructFieldType::from_u8(field).ok_or(ErrorCode::InvalidState)?;
+        if kind != SlotType::StructMap && field == StructFieldType::Vo as u8 {
+            return Err(ErrorCode::InvalidState);
+        }
+    }
+    let layout = compute_struct_row_layout_padded(nf, descriptor);
+    if overlay_row_size(state, meta) != layout.row_size
+        || u32::from(state[(meta + STRUCT_BITSET_BYTES) as usize]) != layout.bitset_bytes
+    {
+        return Err(ErrorCode::InvalidState);
+    }
+    Ok(layout)
+}
+
+/// Bind one slot only after validating its actual image and physical ownership.
+/// Readers derive geometry from this metadata, never caller-supplied capacities.
+pub fn bind_slot(state: &[u8], slot: u32) -> Result<SlotMetaView, ErrorCode> {
+    let (slots, metadata_end) = state_geometry(state)?;
+    if slot >= slots {
+        return Err(ErrorCode::InvalidSlot);
+    }
+    let limit = slot_limit(state, slot, slots, metadata_end)?;
+    validate_slot_geometry(state, slot, limit)?;
+    Ok(SlotMetaView::read(state, slot))
+}
+
+/// Checked single-key struct geometry, cached by the caller before probing.
+/// An arena must begin at the exact primary end and remain in this slot.
+pub fn bind_struct_map(
+    state: &[u8],
+    slot: u32,
+) -> Result<crate::struct_map::StructMapSlot, ErrorCode> {
+    let meta = bind_slot(state, slot)?;
+    if meta.slot_type() != SlotType::StructMap {
+        return Err(ErrorCode::InvalidProgram);
+    }
+    Ok(crate::struct_map::StructMapSlot::bind(state, slot))
+}
+
+fn checked_primary_size(
+    state: &[u8],
+    meta: u32,
+    m: &OldSlotMeta,
+    cap: u32,
+) -> Result<u32, ErrorCode> {
+    let capacity = u64::from(cap);
+    let size = match m.slot_type {
+        SlotType::StructMap | SlotType::StructMap2 => {
+            let layout = checked_struct_layout(state, meta, m.slot_type)?;
+            u64::from(layout.descriptor_size)
+                + capacity
+                    * (u64::from(layout.row_size)
+                        + if m.slot_type == SlotType::StructMap2 {
+                            8
+                        } else {
+                            4
+                        }
+                        + if m.slot_type == SlotType::StructMap
+                            && overlay_kind_byte(state, meta) != 0
+                        {
+                            8
+                        } else {
+                            0
+                        })
+        }
+        SlotType::OrderedList => {
+            let elem = overlay_kind_byte(state, meta);
+            if elem == 0xff {
+                let layout = checked_struct_layout(state, meta, m.slot_type)?;
+                u64::from(layout.descriptor_size) + capacity * u64::from(layout.row_size)
+            } else {
+                let field = StructFieldType::from_u8(elem).ok_or(ErrorCode::InvalidState)?;
+                if field == StructFieldType::Vo
+                    || overlay_row_size(state, meta)
+                        != columine_types::types::struct_field_size(field)
+                {
+                    return Err(ErrorCode::InvalidState);
+                }
+                capacity * u64::from(overlay_row_size(state, meta))
+            }
+        }
+        SlotType::Nested => {
+            let end = m
+                .offset
+                .checked_add(nested::NESTED_PREFIX_SIZE)
+                .ok_or(ErrorCode::InvalidState)?;
+            let prefix = state
+                .get(m.offset as usize..end as usize)
+                .ok_or(ErrorCode::InvalidState)?;
+            let kind = SlotType::from_u8(prefix[0] & 0x0f).ok_or(ErrorCode::InvalidState)?;
+            let inner_cap = u32::from(u16::from_le_bytes([prefix[1], prefix[2]]))
+                .max(16)
+                .checked_next_power_of_two()
+                .ok_or(ErrorCode::InvalidState)?;
+            let inner_size = match kind {
+                SlotType::HashMap => 8 + u64::from(inner_cap) * 8,
+                SlotType::HashSet => 8 + u64::from(inner_cap) * 4,
+                SlotType::Aggregate => u64::from(aggregates::agg_slot_byte_size(prefix[3])),
+                _ => 0,
+            };
+            u64::from(nested::NESTED_PREFIX_SIZE + ARENA_HEADER_SIZE)
+                + capacity * (8 + ((inner_size + 7) & !7))
+        }
+        SlotType::HashMap => capacity * if m.has_hashmap_timestamps { 16 } else { 8 },
+        SlotType::HashSet => capacity * 4,
+        SlotType::Aggregate => u64::from(aggregates::agg_slot_byte_size(m.agg_type_byte)),
+        SlotType::ConditionTree => u64::from(CONDITION_TREE_STATE_BYTES) + capacity * 16,
+        SlotType::Scalar => 16,
+        SlotType::Bitmap => {
+            capacity * u64::from(columine_types::BITMAP_BYTES_PER_CAPACITY)
+                + bitmosaic::IMAGE_ID_LEN as u64
+        }
+        SlotType::Array => capacity * 12,
+    };
+    checked_size(size)
+}
+
+fn validate_slot_geometry(state: &[u8], slot: u32, limit: u32) -> Result<(), ErrorCode> {
+    let meta = STATE_HEADER_SIZE + slot * SLOT_META_SIZE;
+    let flags = SlotTypeFlags::from_byte(state[(meta + SlotMetaOffset::TYPE_FLAGS) as usize]);
+    let kind = flags.slot_type().ok_or(ErrorCode::InvalidState)?;
+    let m = read_old_slot_meta(state, slot);
+    if !matches!(
+        kind,
+        SlotType::Aggregate | SlotType::Scalar | SlotType::ConditionTree
+    ) && ((m.capacity == 0 && kind != SlotType::Bitmap)
+        || (m.capacity != 0 && !m.capacity.is_power_of_two())
+        || bytes::read_u32(state, meta + SlotMetaOffset::SIZE) > m.capacity)
+    {
+        return Err(ErrorCode::InvalidState);
+    }
+    if flags.has_ttl() && !supports_ttl(kind) {
+        return Err(ErrorCode::InvalidState);
+    }
+    let primary = checked_primary_size(state, meta, &m, m.capacity)?;
+    let mut end = m
+        .offset
+        .checked_add(primary)
+        .ok_or(ErrorCode::InvalidState)?;
+    if end > limit {
+        return Err(ErrorCode::InvalidState);
+    }
+    if matches!(kind, SlotType::StructMap | SlotType::StructMap2) {
+        let nf = state[(meta + STRUCT_NUM_FIELDS) as usize];
+        let descriptor_end = m
+            .offset
+            .checked_add(u32::from(nf))
+            .ok_or(ErrorCode::InvalidState)?;
+        let descriptor = state
+            .get(m.offset as usize..descriptor_end as usize)
+            .ok_or(ErrorCode::InvalidState)?;
+        let header = overlay_arena_hdr(state, meta);
+        if has_arena_fields(nf, descriptor) {
+            if header != end {
+                return Err(ErrorCode::InvalidState);
+            }
+            let arena = ArenaRegion::bind(state, header)?;
+            end = checked_size(
+                u64::from(header) + u64::from(ARENA_HEADER_SIZE) + u64::from(arena.capacity),
+            )?;
+            if end > limit {
+                return Err(ErrorCode::InvalidState);
+            }
+        } else if header != 0 {
+            return Err(ErrorCode::InvalidState);
+        }
+    }
+    if kind == SlotType::Nested {
+        let header = m
+            .offset
+            .checked_add(nested::NESTED_PREFIX_SIZE)
+            .and_then(|off| off.checked_add(m.capacity.checked_mul(8)?))
+            .ok_or(ErrorCode::InvalidState)?;
+        let arena = ArenaRegion::bind(state, header)?;
+        if checked_size(
+            u64::from(header) + u64::from(ARENA_HEADER_SIZE) + u64::from(arena.capacity),
+        )? != end
+        {
+            return Err(ErrorCode::InvalidState);
+        }
+        let keys = nested::outer_keys_offset(m.offset);
+        let pointers = nested::outer_ptrs_offset(m.offset, m.capacity);
+        for pos in 0..m.capacity {
+            let key = bytes::read_u32(state, keys + pos * 4);
+            if key == EMPTY_KEY || key == TOMBSTONE {
+                continue;
+            }
+            let pointer = bytes::read_u32(state, pointers + pos * 4);
+            let relative = pointer
+                .checked_sub(header + ARENA_HEADER_SIZE)
+                .ok_or(ErrorCode::InvalidState)?;
+            if relative >= arena.used {
+                return Err(ErrorCode::InvalidState);
+            }
+        }
+    }
+    if kind == SlotType::Bitmap {
+        state
+            .get(m.offset as usize..end as usize)
+            .and_then(image_header)
+            .filter(|header| header.width == KeyWidth::U32)
+            .ok_or(ErrorCode::InvalidState)?;
+    }
+    if m.has_ttl {
+        let eviction = bytes::read_u32(state, meta + SlotMetaOffset::EVICTION_INDEX_OFFSET);
+        let capacity = bytes::read_u32(state, meta + SlotMetaOffset::EVICTION_INDEX_CAPACITY);
+        if eviction != checked_align8(end)?
+            || capacity != m.capacity
+            || bytes::read_u32(state, meta + SlotMetaOffset::EVICTION_INDEX_SIZE) > capacity
+        {
+            return Err(ErrorCode::InvalidState);
+        }
+        end = checked_size(
+            u64::from(eviction) + u64::from(capacity) * u64::from(EVICTION_ENTRY_SIZE),
+        )?;
+        if m.has_evict_trigger {
+            let evicted = bytes::read_u32(state, meta + SlotMetaOffset::EVICTED_BUFFER_OFFSET);
+            if evicted != checked_align8(end)?
+                || bytes::read_u32(state, meta + SlotMetaOffset::EVICTED_COUNT) > EVICTED_BUFFER_CAP
+            {
+                return Err(ErrorCode::InvalidState);
+            }
+            end = checked_size(
+                u64::from(evicted) + u64::from(EVICTED_BUFFER_CAP) * u64::from(EVICTION_ENTRY_SIZE),
+            )?;
+        }
+    }
+    if end > limit {
+        return Err(ErrorCode::InvalidState);
+    }
+    Ok(())
+}
 
 /// Per-slot facts the growth walkers re-derive from old-state metadata.
 struct OldSlotMeta {
@@ -1207,55 +1664,50 @@ fn nested_primary_size_from_prefix(old_state: &[u8], slot_offset: u32, outer_cap
     )
 }
 
-/// Calculate grown-state size with 2× capacity for `grown_slot_idx`, reading
-/// the slot metadata from the old state so already-grown states grow again
-/// correctly.
-pub fn calculate_grown_state_size(old_state: &[u8], grown_slot_idx: u32) -> u32 {
-    let num_slots = state_num_slots(old_state);
-    let mut total_size = align8(STATE_HEADER_SIZE + num_slots * SLOT_META_SIZE);
-
-    for slot_i in 0..num_slots {
-        let meta_base = STATE_HEADER_SIZE + slot_i * SLOT_META_SIZE;
-        let m = read_old_slot_meta(old_state, slot_i);
-
-        let cap = if slot_i == grown_slot_idx {
-            next_power_of_2(m.capacity * 2)
+/// Calculate the checked extent after doubling one slot and its arena.
+pub fn calculate_grown_state_size(old_state: &[u8], grown_slot_idx: u32) -> Result<u32, ErrorCode> {
+    let (num_slots, metadata_end) = state_geometry(old_state)?;
+    if grown_slot_idx >= num_slots {
+        return Err(ErrorCode::InvalidSlot);
+    }
+    let mut total_size = metadata_end;
+    for slot in 0..num_slots {
+        let limit = slot_limit(old_state, slot, num_slots, metadata_end)?;
+        validate_slot_geometry(old_state, slot, limit)?;
+        let meta = STATE_HEADER_SIZE + slot * SLOT_META_SIZE;
+        let m = read_old_slot_meta(old_state, slot);
+        let cap = if slot == grown_slot_idx {
+            grown_capacity(m.capacity)?
         } else {
             m.capacity
         };
-
-        let mut slot_size = match m.slot_type {
-            SlotType::StructMap | SlotType::StructMap2 => {
-                let mut sz =
-                    struct_map_primary_size_from_meta(old_state, meta_base, cap, m.slot_type);
-                // Arena: doubled on growth, kept on non-growth.
-                let arena_hdr_off = overlay_arena_hdr(old_state, meta_base);
-                if arena_hdr_off != 0 {
-                    let old_arena_cap = bytes::read_u32(old_state, arena_hdr_off);
-                    let new_arena_cap = if slot_i == grown_slot_idx {
-                        old_arena_cap * 2
-                    } else {
-                        old_arena_cap
-                    };
-                    sz += ARENA_HEADER_SIZE + new_arena_cap;
-                }
-                sz
+        let mut size = u64::from(checked_primary_size(old_state, meta, &m, cap)?);
+        if matches!(m.slot_type, SlotType::StructMap | SlotType::StructMap2) {
+            let header = overlay_arena_hdr(old_state, meta);
+            if header != 0 {
+                let capacity = bytes::read_u32(old_state, header);
+                let capacity = if slot == grown_slot_idx {
+                    capacity.checked_mul(2).ok_or(ErrorCode::InvalidState)?
+                } else {
+                    capacity
+                };
+                size += u64::from(ARENA_HEADER_SIZE) + u64::from(capacity);
             }
-            SlotType::OrderedList => ordered_list_primary_size_from_meta(old_state, meta_base, cap),
-            SlotType::Nested => nested_primary_size_from_prefix(old_state, m.offset, cap),
-            _ => slot_growth::slot_data_size(
-                m.slot_type,
-                cap,
-                m.has_hashmap_timestamps,
-                m.agg_type_byte,
-            ),
-        };
-
-        slot_size += ttl_side_buffer_size(m.has_ttl, m.has_evict_trigger, cap);
-        total_size = align8(total_size + slot_size);
+        }
+        total_size = checked_align8(checked_size(u64::from(total_size) + size)?)?;
+        if m.has_ttl {
+            total_size = checked_align8(checked_size(
+                u64::from(total_size) + u64::from(cap) * u64::from(EVICTION_ENTRY_SIZE),
+            )?)?;
+            if m.has_evict_trigger {
+                total_size = checked_align8(checked_size(
+                    u64::from(total_size)
+                        + u64::from(EVICTED_BUFFER_CAP) * u64::from(EVICTION_ENTRY_SIZE),
+                )?)?;
+            }
+        }
     }
-
-    total_size
+    Ok(total_size)
 }
 
 /// Copy old state into `new_state` (which must be zeroed and large enough for
@@ -1266,7 +1718,13 @@ pub fn grow_state(
     new_state: &mut [u8],
     grown_slot_idx: u32,
 ) -> Result<(), ErrorCode> {
+    let required = calculate_grown_state_size(old_state, grown_slot_idx)?;
+    if new_state.len() < required as usize {
+        return Err(ErrorCode::InvalidState);
+    }
+    validate_struct_arenas(old_state, grown_slot_idx)?;
     let num_slots = state_num_slots(old_state);
+    new_state[..required as usize].fill(0);
 
     // Copy header verbatim.
     bytes::copy(new_state, 0, old_state, 0, STATE_HEADER_SIZE);
@@ -1280,7 +1738,7 @@ pub fn grow_state(
         let old_cap = m.capacity;
 
         let new_cap = if slot_i == grown_slot_idx {
-            next_power_of_2(old_cap * 2)
+            grown_capacity(old_cap)?
         } else {
             old_cap
         };
@@ -1415,31 +1873,55 @@ pub fn grow_state(
                     };
                     bytes::write_u32(new_state, meta_base + SlotMetaOffset::SIZE, rehashed);
 
-                    // Arena compaction: copy live array data into the new arena.
+                    if m.slot_type == SlotType::StructMap
+                        && overlay_kind_byte(old_state, meta_base) != 0
+                    {
+                        let old_keys = old_offset + desc_size;
+                        let old_timestamps = old_keys + old_cap * 4 + old_cap * rs;
+                        let new_timestamps = new_rows_base + new_cap * rs;
+                        for pos in 0..old_cap {
+                            let key = bytes::read_u32(old_state, old_keys + pos * 4);
+                            if key == EMPTY_KEY || key == TOMBSTONE {
+                                continue;
+                            }
+                            let target =
+                                hash_table::find_key(new_state, new_keys_off, new_cap, key)
+                                    .ok_or(ErrorCode::InvalidState)?;
+                            bytes::copy(
+                                new_state,
+                                new_timestamps + target * 8,
+                                old_state,
+                                old_timestamps + pos * 8,
+                                8,
+                            );
+                        }
+                    }
+                    // Arena compaction: copy live opaque payloads into the new arena.
                     let old_arena_hdr_off = overlay_arena_hdr(old_state, meta_base);
                     if old_arena_hdr_off != 0 {
-                        let old_arena_cap = bytes::read_u32(old_state, old_arena_hdr_off);
-                        let new_arena_cap = old_arena_cap * 2;
+                        let old_arena = ArenaRegion::bind(old_state, old_arena_hdr_off)?;
+                        let new_arena_cap = old_arena
+                            .capacity
+                            .checked_mul(2)
+                            .ok_or(ErrorCode::InvalidState)?;
                         let struct_data_size = struct_map_primary_size_from_meta(
                             old_state,
                             meta_base,
                             new_cap,
                             m.slot_type,
                         );
-                        let new_arena_hdr_off = new_offset + struct_data_size;
-
+                        let new_arena_hdr_off = new_offset
+                            .checked_add(struct_data_size)
+                            .ok_or(ErrorCode::InvalidState)?;
                         bytes::write_u32(new_state, new_arena_hdr_off, new_arena_cap);
                         bytes::write_u32(
                             new_state,
                             meta_base + STRUCT_ARENA_HDR,
                             new_arena_hdr_off,
                         );
-
-                        let old_arena_data_base = old_arena_hdr_off + ARENA_HEADER_SIZE;
                         let new_arena_data_base = new_arena_hdr_off + ARENA_HEADER_SIZE;
-                        // Descriptor was copied to the new slot's prefix already.
-                        let field_types: Vec<u8> =
-                            new_state[new_offset as usize..(new_offset + nf) as usize].to_vec();
+                        let field_types =
+                            &old_state[old_offset as usize..(old_offset + nf) as usize];
                         let mut new_arena_used = 0u32;
 
                         for ki in 0..new_cap {
@@ -1455,7 +1937,7 @@ pub fn grow_state(
                                         "invariant: struct-map descriptor contains an invalid field type"
                                     );
                                 };
-                                if !is_array_field_type(field_type) {
+                                if !is_arena_field_type(field_type) {
                                     continue;
                                 }
 
@@ -1466,25 +1948,32 @@ pub fn grow_state(
                                     continue;
                                 }
 
-                                let f_off = struct_field_offset(nf as u8, &field_types, fi as u8);
+                                let f_off = struct_field_offset(nf as u8, field_types, fi as u8);
                                 let old_offset_val = bytes::read_u32(new_state, row_base + f_off);
                                 let arr_len = bytes::read_u32(new_state, row_base + f_off + 4);
-                                if arr_len == 0 {
-                                    continue;
+                                let payload = old_arena.bytes(
+                                    old_state,
+                                    old_offset_val,
+                                    arr_len,
+                                    arena_elem_size(field_type),
+                                )?;
+                                let byte_len = u32::try_from(payload.len())
+                                    .map_err(|_| ErrorCode::InvalidState)?;
+                                let next_used = new_arena_used
+                                    .checked_add(byte_len)
+                                    .ok_or(ErrorCode::InvalidState)?;
+                                if next_used > new_arena_cap {
+                                    return Err(ErrorCode::InvalidState);
                                 }
-
-                                let elem_sz = arena_elem_size(field_type);
-                                let byte_len = arr_len * elem_sz;
-
                                 bytes::copy(
                                     new_state,
                                     new_arena_data_base + new_arena_used,
-                                    old_state,
-                                    old_arena_data_base + old_offset_val,
+                                    payload,
+                                    0,
                                     byte_len,
                                 );
                                 bytes::write_u32(new_state, row_base + f_off, new_arena_used);
-                                new_arena_used += byte_len;
+                                new_arena_used = next_used;
                             }
                         }
 
@@ -1517,6 +2006,34 @@ pub fn grow_state(
                             bytes::copy(new_state, new_offset, old_state, old_offset, copy_bytes);
                         }
                     }
+                }
+                SlotType::Nested => {
+                    copy_nested_slot(
+                        old_state,
+                        new_state,
+                        &m,
+                        new_offset,
+                        new_cap,
+                        new_primary_size,
+                        meta_base + SlotMetaOffset::SIZE,
+                    )?;
+                }
+                SlotType::Array => {
+                    bytes::fill_u32(new_state, new_offset, new_cap, EMPTY_KEY);
+                    bytes::fill_f64(
+                        new_state,
+                        new_offset + new_cap * 4,
+                        new_cap,
+                        f64::NEG_INFINITY,
+                    );
+                    bytes::copy(new_state, new_offset, old_state, old_offset, old_cap * 4);
+                    bytes::copy(
+                        new_state,
+                        new_offset + new_cap * 4,
+                        old_state,
+                        old_offset + old_cap * 4,
+                        old_cap * 8,
+                    );
                 }
                 _ => {
                     // Non-hash slot: copy data. The "aggregates/condition
@@ -1568,7 +2085,17 @@ pub fn grow_state(
                     m.agg_type_byte,
                 ),
             };
-            if primary_size > 0 {
+            if m.slot_type == SlotType::Nested {
+                copy_nested_slot(
+                    old_state,
+                    new_state,
+                    &m,
+                    new_offset,
+                    new_cap,
+                    new_primary_size,
+                    meta_base + SlotMetaOffset::SIZE,
+                )?;
+            } else if primary_size > 0 {
                 bytes::copy(new_state, new_offset, old_state, old_offset, primary_size);
             }
             // Arena header offset shifts with the slot data.
@@ -1672,4 +2199,331 @@ pub fn grow_state(
     }
 
     Ok(())
+}
+
+/// Admission compares the declared physical kinds with the actual state image.
+/// Capacity is deliberately not compared: a grown image has the same shape.
+/// This walk borrows the descriptor and reuses the VM's declaration scratch.
+pub(crate) fn program_matches_state(
+    init: &[u8],
+    num_slots: u32,
+    state: &[u8],
+    seen: &mut Vec<bool>,
+) -> bool {
+    let Ok(slot_count) = usize::try_from(num_slots) else {
+        return false;
+    };
+    if state.len() < STATE_HEADER_SIZE as usize
+        || state_num_slots(state) != num_slots
+        || u64::from(STATE_HEADER_SIZE) + u64::from(num_slots) * u64::from(SLOT_META_SIZE)
+            > state.len() as u64
+        || slot_count > init.len()
+    {
+        return false;
+    }
+    seen.clear();
+    seen.resize(slot_count, false);
+    let mut r = Operands::at(init, 0);
+    while r.pos() < init.len() {
+        let Some(op) = r.byte().and_then(Opcode::from_u8) else {
+            return false;
+        };
+        if op == Opcode::Halt {
+            return r.pos() == init.len() && seen.iter().all(|defined| *defined);
+        }
+        let Some(slot) = r.index().filter(|slot| *slot < num_slots) else {
+            return false;
+        };
+        let Ok(slot_index) = usize::try_from(slot) else {
+            return false;
+        };
+        if seen[slot_index] {
+            return false;
+        }
+        seen[slot_index] = true;
+        let meta = STATE_HEADER_SIZE + slot * SLOT_META_SIZE;
+        let Some(flags) = r.byte().map(SlotTypeFlags::from_byte) else {
+            return false;
+        };
+        let Some(cap_lo) = r.byte() else {
+            return false;
+        };
+        if r.byte().is_none()
+            || flags.slot_type().is_none()
+            || state[(meta + SlotMetaOffset::TYPE_FLAGS) as usize] & 0x0f != flags.to_byte() & 0x0f
+        {
+            return false;
+        }
+        match op {
+            Opcode::SlotStructMap | Opcode::SlotStructMap2 => {
+                let expected = if op == Opcode::SlotStructMap {
+                    SlotType::StructMap
+                } else {
+                    SlotType::StructMap2
+                };
+                if flags.slot_type() != Some(expected)
+                    || flags.has_ttl()
+                    || state[(meta + SlotMetaOffset::TYPE_FLAGS) as usize] & 0x0f != expected as u8
+                {
+                    return false;
+                }
+                let Some(nf) = r.byte() else {
+                    return false;
+                };
+                if state[(meta + STRUCT_NUM_FIELDS) as usize] != nf {
+                    return false;
+                }
+                let off = bytes::read_u32(state, meta + SlotMetaOffset::OFFSET);
+                let Some(end) = off.checked_add(u32::from(nf)) else {
+                    return false;
+                };
+                let Some(descriptor) = state.get(off as usize..end as usize) else {
+                    return false;
+                };
+                for &field_type in descriptor {
+                    if StructFieldType::from_u8(field_type).is_none()
+                        || (expected == SlotType::StructMap2
+                            && field_type == StructFieldType::Vo as u8)
+                        || r.byte() != Some(field_type)
+                    {
+                        return false;
+                    }
+                }
+                let layout = compute_struct_row_layout_padded(nf, descriptor);
+                if overlay_row_size(state, meta) != layout.row_size
+                    || u32::from(state[(meta + STRUCT_BITSET_BYTES) as usize])
+                        != layout.bitset_bytes
+                {
+                    return false;
+                }
+                let capacity = bytes::read_u32(state, meta + SlotMetaOffset::CAPACITY);
+                let Some(primary_end) = capacity
+                    .checked_mul(
+                        layout.row_size
+                            + if expected == SlotType::StructMap2 {
+                                8
+                            } else {
+                                4
+                            },
+                    )
+                    .and_then(|bytes| off.checked_add(layout.descriptor_size)?.checked_add(bytes))
+                else {
+                    return false;
+                };
+                if primary_end as usize > state.len() {
+                    return false;
+                }
+            }
+            Opcode::SlotDef => {
+                if matches!(
+                    flags.slot_type(),
+                    Some(SlotType::Aggregate | SlotType::Scalar)
+                ) && state[(meta + SlotMetaOffset::AGG_TYPE) as usize] != cap_lo
+                {
+                    return false;
+                }
+                if flags.has_ttl() {
+                    let Some((_, next)) = TtlParams::read(init, r.pos()) else {
+                        return false;
+                    };
+                    r = Operands::at(init, next);
+                }
+            }
+            Opcode::SlotArray => {}
+            Opcode::SlotOrderedList => {
+                let Some(elem) = r.byte() else {
+                    return false;
+                };
+                if elem == StructFieldType::Vo as u8 {
+                    return false;
+                }
+                if elem == 0xff {
+                    let Some(nf) = r.byte() else {
+                        return false;
+                    };
+                    for _ in 0..nf {
+                        let Some(field) = r.byte() else {
+                            return false;
+                        };
+                        if field == StructFieldType::Vo as u8
+                            || StructFieldType::from_u8(field).is_none()
+                        {
+                            return false;
+                        }
+                    }
+                }
+            }
+            Opcode::SlotNested => {
+                for _ in 0..4 {
+                    if r.byte().is_none() {
+                        return false;
+                    }
+                }
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// Geometry was checked by sizing; validate live references and compaction span
+/// before any destination write. The descriptor and row offsets are reused.
+fn validate_struct_arenas(state: &[u8], grown_slot: u32) -> Result<(), ErrorCode> {
+    for slot in 0..state_num_slots(state) {
+        let meta = STATE_HEADER_SIZE + slot * SLOT_META_SIZE;
+        let kind = SlotType::from_u8(state[(meta + SlotMetaOffset::TYPE_FLAGS) as usize] & 0x0f)
+            .ok_or(ErrorCode::InvalidState)?;
+        if !matches!(kind, SlotType::StructMap | SlotType::StructMap2) {
+            continue;
+        }
+        let header = overlay_arena_hdr(state, meta);
+        if header == 0 {
+            continue;
+        }
+        let nf = state[(meta + STRUCT_NUM_FIELDS) as usize];
+        let cap = bytes::read_u32(state, meta + SlotMetaOffset::CAPACITY);
+        let rs = overlay_row_size(state, meta);
+        let off = bytes::read_u32(state, meta + SlotMetaOffset::OFFSET);
+        let descriptor = &state[off as usize..off as usize + usize::from(nf)];
+        let keys = off + align8(u32::from(nf));
+        let rows = keys + cap * if kind == SlotType::StructMap2 { 8 } else { 4 };
+        let arena = ArenaRegion::bind(state, header)?;
+        let mut compact_bytes = 0u64;
+        for pos in 0..cap {
+            let key = bytes::read_u32(state, keys + pos * 4);
+            if key == EMPTY_KEY || key == TOMBSTONE {
+                continue;
+            }
+            let row = rows + pos * rs;
+            let mut field_offset = u32::from(nf).div_ceil(8);
+            for (field_idx, &field_type) in descriptor.iter().enumerate() {
+                let field_type =
+                    StructFieldType::from_u8(field_type).ok_or(ErrorCode::InvalidState)?;
+                if is_arena_field_type(field_type)
+                    && state[row as usize + field_idx / 8] & (1 << (field_idx % 8)) != 0
+                {
+                    let field = row + field_offset;
+                    let payload = arena.bytes(
+                        state,
+                        bytes::read_u32(state, field),
+                        bytes::read_u32(state, field + 4),
+                        arena_elem_size(field_type),
+                    )?;
+                    compact_bytes += payload.len() as u64;
+                }
+                field_offset += columine_types::types::struct_field_size(field_type);
+            }
+        }
+        if slot == grown_slot && compact_bytes > u64::from(arena.capacity) * 2 {
+            return Err(ErrorCode::InvalidState);
+        }
+    }
+    Ok(())
+}
+
+/// Relocate absolute inner pointers while copying or rehashing an outer table.
+fn copy_nested_slot(
+    old: &[u8],
+    new: &mut [u8],
+    m: &OldSlotMeta,
+    new_offset: u32,
+    new_cap: u32,
+    new_size: u32,
+    size_off: u32,
+) -> Result<(), ErrorCode> {
+    let old_offset = m.offset;
+    let old_cap = m.capacity;
+    let old_header = nested::arena_header_offset(old_offset, old_cap);
+    let old_arena = ArenaRegion::bind(old, old_header)?;
+    let new_header = nested::arena_header_offset(new_offset, new_cap);
+    let new_data = new_header + ARENA_HEADER_SIZE;
+    let new_arena_cap = new_size - (new_data - new_offset);
+    if old_arena.used > new_arena_cap {
+        return Err(ErrorCode::InvalidState);
+    }
+    bytes::copy(new, new_offset, old, old_offset, nested::NESTED_PREFIX_SIZE);
+    bytes::write_u32(new, new_header, new_arena_cap);
+    bytes::write_u32(new, new_header + 4, old_arena.used);
+    bytes::copy(
+        new,
+        new_data,
+        old,
+        old_header + ARENA_HEADER_SIZE,
+        old_arena.used,
+    );
+    let old_keys = nested::outer_keys_offset(old_offset);
+    let old_ptrs = nested::outer_ptrs_offset(old_offset, old_cap);
+    let new_keys = nested::outer_keys_offset(new_offset);
+    let new_ptrs = nested::outer_ptrs_offset(new_offset, new_cap);
+    let table =
+        hash_table::FlatTable::bind_external(new_keys, new_cap, size_off, hash_table::ENTRY_U32);
+    if new_cap == old_cap {
+        bytes::copy(new, new_keys, old, old_keys, old_cap * 8);
+    } else {
+        bytes::fill_u32(new, new_keys, new_cap, EMPTY_KEY);
+        bytes::write_u32(new, size_off, 0);
+    }
+    for pos in 0..old_cap {
+        let key = bytes::read_u32(old, old_keys + pos * 4);
+        if key == EMPTY_KEY || key == TOMBSTONE {
+            continue;
+        }
+        let old_ptr = bytes::read_u32(old, old_ptrs + pos * 4);
+        let relative = old_ptr
+            .checked_sub(old_header + ARENA_HEADER_SIZE)
+            .ok_or(ErrorCode::InvalidState)?;
+        if relative >= old_arena.used {
+            return Err(ErrorCode::InvalidState);
+        }
+        let pointer = new_data + relative;
+        if new_cap == old_cap {
+            bytes::write_u32(new, new_ptrs + pos * 4, pointer);
+        } else {
+            table
+                .upsert_u32(new, key, pointer)
+                .ok_or(ErrorCode::InvalidState)?;
+        }
+    }
+    Ok(())
+}
+
+/// The actual reason a program cannot be admitted, retained before state writes
+/// or capability preparation. Malformed declarations/grammar and size overflow
+/// are distinct from the statically forbidden bitmap expiry layout.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProgramInvalidCause {
+    MalformedProgram,
+    BitmapTtlSourceToUntrackedTarget { source: u32, target: u32 },
+}
+
+impl From<InvalidSource> for ProgramInvalidCause {
+    fn from(_: InvalidSource) -> Self {
+        Self::MalformedProgram
+    }
+}
+
+/// Byte length of the sizing record a status-plus-record export writes: four
+/// little-endian u32 words.
+pub const SIZING_RECORD_LEN: u32 = 16;
+/// Word 1 of a sizing record whose status is `InvalidProgram`: malformed program.
+pub const SIZING_CAUSE_MALFORMED: u32 = 1;
+/// Word 1 of a sizing record whose status is `InvalidProgram`: a TTL bitmap
+/// source folding into an untracked target, with words 2 and 3 naming them.
+pub const SIZING_CAUSE_BITMAP_TTL_SOURCE: u32 = 2;
+
+/// Status and record words for one sizing result. `Ok` names `[size, 0, 0, 0]`;
+/// a refusal names `[0, kind, source, target]`, where source and target are
+/// meaningful only for the TTL-layout cause. The status discriminates the
+/// record; no word is read as absence.
+pub fn sizing_record(result: Result<u32, ProgramInvalidCause>) -> (ErrorCode, [u32; 4]) {
+    match result {
+        Ok(size) => (ErrorCode::Ok, [size, 0, 0, 0]),
+        Err(ProgramInvalidCause::MalformedProgram) => {
+            (ErrorCode::InvalidProgram, [0, SIZING_CAUSE_MALFORMED, 0, 0])
+        }
+        Err(ProgramInvalidCause::BitmapTtlSourceToUntrackedTarget { source, target }) => (
+            ErrorCode::InvalidProgram,
+            [0, SIZING_CAUSE_BITMAP_TTL_SOURCE, source, target],
+        ),
+    }
 }

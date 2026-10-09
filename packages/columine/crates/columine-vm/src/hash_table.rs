@@ -12,9 +12,12 @@
 //! Probe sequence, sentinel handling, load factor, and rehash placement define
 //! the observable ABI; the ascending key-cell scan order is exposed to
 //! TypeScript backends.
+//!
+//! Raw public mutations below are unjournaled caller-owned storage operations.
+//! A speculative caller uses the VM or captures their actual prior bytes first.
 
 use crate::bytes;
-use columine_types::types::{EMPTY_KEY, TOMBSTONE, hash_key, hash_key_pair};
+use columine_types::types::{EMPTY_KEY, ErrorCode, TOMBSTONE, hash_key, hash_key_pair};
 
 /// Inline table header field offsets.
 const HDR_CAP: u32 = 0;
@@ -54,6 +57,7 @@ pub const fn data_size_no_header(capacity: u32, entry_size: u32) -> u32 {
 
 /// Initialize key cells in a metadata-managed table. Values are deliberately
 /// left untouched; their initialization belongs to the caller.
+/// Unjournaled initialization of caller-owned bytes.
 #[inline(always)]
 pub fn init_external_keys(state: &mut [u8], data_offset: u32, capacity: u32) {
     bytes::fill_u32(state, data_offset, capacity, EMPTY_KEY);
@@ -64,6 +68,47 @@ pub fn init_external_keys(state: &mut [u8], data_offset: u32, capacity: u32) {
 pub struct Probe {
     pub pos: u32,
     pub found: bool,
+}
+
+/// Retained backward-shift destinations for one erase. A batch reuses this
+/// allocation; capture and mutation consume the same plan without re-probing.
+#[derive(Debug, Default)]
+pub struct ErasePlan {
+    shifts: Vec<EraseShift>,
+    tail: u32,
+}
+
+#[derive(Debug)]
+struct EraseShift {
+    from: u32,
+    to: u32,
+    key: u32,
+}
+
+impl ErasePlan {
+    pub fn tail(&self) -> u32 {
+        self.tail
+    }
+
+    /// Emit only cells overwritten by a shift or cleared at the final hole.
+    /// Adjacent cells coalesce; wrapping produces two distinct ranges.
+    pub fn for_each_destination_run(&self, mut visit: impl FnMut(u32, u32)) {
+        let mut positions = self.shifts.iter().map(|shift| shift.to).chain([self.tail]);
+        let Some(mut start) = positions.next() else {
+            return;
+        };
+        let mut end = start + 1;
+        for pos in positions {
+            if pos == end {
+                end += 1;
+            } else {
+                visit(start, end - start);
+                start = pos;
+                end = pos + 1;
+            }
+        }
+        visit(start, end - start);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -223,7 +268,41 @@ impl FlatTable {
         }
     }
 
-    /// Initialize an inline-header table and fill keys with `EMPTY_KEY`.
+    /// Bind a mutable table only after its complete probe/value and size extents
+    /// fit. Every journal mode uses this geometry without scanning or copying.
+    pub fn checked_bind_external(
+        state: &[u8],
+        data_off: u32,
+        cap: u32,
+        size_off: u32,
+        entry_size: u32,
+    ) -> Result<Self, ErrorCode> {
+        if !cap.is_power_of_two() {
+            return Err(ErrorCode::InvalidState);
+        }
+        let entries_off = data_off
+            .checked_add(cap.checked_mul(4).ok_or(ErrorCode::InvalidState)?)
+            .ok_or(ErrorCode::InvalidState)?;
+        let entries_end = entries_off
+            .checked_add(cap.checked_mul(entry_size).ok_or(ErrorCode::InvalidState)?)
+            .ok_or(ErrorCode::InvalidState)?;
+        let size_end = size_off.checked_add(4).ok_or(ErrorCode::InvalidState)?;
+        if entries_end as usize > state.len() || size_end as usize > state.len() {
+            return Err(ErrorCode::InvalidState);
+        }
+        if bytes::read_u32(state, size_off) > cap {
+            return Err(ErrorCode::InvalidState);
+        }
+        Ok(Self {
+            cap,
+            size_off,
+            keys_off: data_off,
+            entries_off,
+            entry_size,
+        })
+    }
+
+    /// Initialize an inline-header table and its keys without journaling.
     pub fn init(state: &mut [u8], offset: u32, capacity: u32, entry_size: u32) -> Self {
         bytes::write_u32(state, offset + HDR_CAP, capacity);
         bytes::write_u32(state, offset + HDR_SIZE, 0);
@@ -237,7 +316,7 @@ impl FlatTable {
         }
     }
 
-    /// Initialize a headerless table.
+    /// Initialize a headerless table without journaling.
     pub fn init_external(
         state: &mut [u8],
         data_off: u32,
@@ -255,6 +334,7 @@ impl FlatTable {
         bytes::read_u32(state, self.keys_off + pos * 4)
     }
 
+    /// Write a caller-owned key cell without journaling.
     #[inline(always)]
     pub fn set_key_at(&self, state: &mut [u8], pos: u32, key: u32) {
         bytes::write_u32(state, self.keys_off + pos * 4, key);
@@ -267,6 +347,7 @@ impl FlatTable {
         bytes::read_u32(state, self.entries_off + pos * 4)
     }
 
+    /// Write a caller-owned value cell without journaling.
     #[inline(always)]
     pub fn set_entry_u32_at(&self, state: &mut [u8], pos: u32, value: u32) {
         debug_assert_eq!(self.entry_size, ENTRY_U32);
@@ -286,6 +367,7 @@ impl FlatTable {
         bytes::read_u32(state, self.size_off)
     }
 
+    /// Publish a caller-owned size word without journaling.
     #[inline(always)]
     pub fn set_size(&self, state: &mut [u8], value: u32) {
         bytes::write_u32(state, self.size_off, value);
@@ -331,6 +413,7 @@ impl FlatTable {
 
     /// Set semantics: `Some(true)` inserted, `Some(false)` already present,
     /// and `None` means sentinel, full table, or load factor exceeded.
+    /// Unjournaled; this raw operation does not participate in VM undo.
     pub fn insert_key(&self, state: &mut [u8], key: u32) -> Option<bool> {
         let probe = self.find_insert(state, key)?;
         if probe.found {
@@ -349,6 +432,7 @@ impl FlatTable {
     /// `Some(false)` overwrote an existing value, and `None` means sentinel,
     /// full table, or load factor exceeded. The entry-size assertion enforces
     /// that this accessor is not used for set tables.
+    /// Unjournaled; this raw operation does not participate in VM undo.
     pub fn upsert_u32(&self, state: &mut [u8], key: u32, value: u32) -> Option<bool> {
         let probe = self.find_insert(state, key)?;
         if probe.found {
@@ -365,41 +449,71 @@ impl FlatTable {
         Some(true)
     }
 
-    /// Erase a known live cell by closing its linear-probe cluster. No tombstone
-    /// remains. `moved` carries an optional caller-owned side lane along with
-    /// each relocated entry. The returned final vacancy lets that caller clear
-    /// the side lane too. Size publication belongs to the caller, so eviction
-    /// can still publish its batch count once.
-    ///
-    /// Admission leaves an empty cell (70% maximum load); every follower moves
-    /// only when its probe path crosses the hole. All positions are mask-wrapped.
-    pub fn erase_at(
-        &self,
-        state: &mut [u8],
-        mut hole: u32,
-        mut moved: impl FnMut(&mut [u8], u32, u32),
-    ) -> u32 {
+    /// Derive the exact erase once, retaining keys and source/destination cells
+    /// before any bytes change. `plan` is reusable across a whole batch.
+    pub fn plan_erase_at(&self, state: &[u8], mut hole: u32, plan: &mut ErasePlan) {
         debug_assert!(self.cap.is_power_of_two());
         debug_assert!(self.key_at(state, hole) < TOMBSTONE);
+        plan.shifts.clear();
         let mask = self.cap - 1;
         let mut scan = (hole + 1) & mask;
-        while self.key_at(state, scan) != EMPTY_KEY {
+        loop {
             let key = self.key_at(state, scan);
+            if key == EMPTY_KEY {
+                break;
+            }
             let home = hash_key(key, self.cap);
             if (scan.wrapping_sub(home) & mask) >= (scan.wrapping_sub(hole) & mask) {
-                self.set_key_at(state, hole, key);
-                if self.entry_size != 0 {
-                    self.raw_entry_copy(state, self.entries_off + scan * self.entry_size, hole);
-                }
-                moved(state, scan, hole);
+                plan.shifts.push(EraseShift {
+                    from: scan,
+                    to: hole,
+                    key,
+                });
                 hole = scan;
             }
             scan = (scan + 1) & mask;
         }
-        self.set_key_at(state, hole, EMPTY_KEY);
-        let start = (self.entries_off + hole * self.entry_size) as usize;
+        plan.tail = hole;
+    }
+
+    /// Append bounded key/value destination ranges for a retained erase.
+    /// Side lanes use the same destination runs, never a second cluster walk.
+    pub fn erase_ranges(&self, plan: &ErasePlan, ranges: &mut Vec<(u32, u32)>) {
+        plan.for_each_destination_run(|start, len| {
+            ranges.push((self.keys_off + start * 4, len * 4));
+            if self.entry_size != 0 {
+                ranges.push((
+                    self.entries_off + start * self.entry_size,
+                    len * self.entry_size,
+                ));
+            }
+        });
+    }
+
+    /// Apply a retained erase, moving a caller's side lane with each entry.
+    /// Size/flags are published by the caller inside its capture.
+    /// Unjournaled; capture ownership belongs to the caller, not this writer.
+    pub fn erase_planned(
+        &self,
+        state: &mut [u8],
+        plan: &ErasePlan,
+        mut moved: impl FnMut(&mut [u8], u32, u32),
+    ) -> u32 {
+        for shift in &plan.shifts {
+            self.set_key_at(state, shift.to, shift.key);
+            if self.entry_size != 0 {
+                self.raw_entry_copy(
+                    state,
+                    self.entries_off + shift.from * self.entry_size,
+                    shift.to,
+                );
+            }
+            moved(state, shift.from, shift.to);
+        }
+        self.set_key_at(state, plan.tail, EMPTY_KEY);
+        let start = (self.entries_off + plan.tail * self.entry_size) as usize;
         state[start..start + self.entry_size as usize].fill(0);
-        hole
+        plan.tail
     }
 
     /// Move live entries into a fresh inline-header table. The destination has
@@ -428,7 +542,7 @@ impl FlatTable {
     }
 
     /// Ascending-cell scan of live keys, stepping with [`next_live_key`] so the
-    /// bound view and the `vm_map_iter_*` exports walk one implementation.
+    /// bound table and checked-reader views walk one implementation.
     /// Yields `(cell_index, key)`.
     pub fn iter_live<'a>(&'a self, state: &'a [u8]) -> impl Iterator<Item = (u32, u32)> + 'a {
         let mut pos = next_live_key(state, self.keys_off, self.cap, 0);

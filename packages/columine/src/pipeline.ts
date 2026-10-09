@@ -11,13 +11,14 @@
  *   const { arrowIpc, eventCount } = stages.parse.parse(json, config);
  *   stages.reduce.executeBatch(state, program, columns, batchLen);
  *   const output = stages.compact.encode(batch);
- *   const token = stages.undo.checkpoint(state);
- *   stages.undo.rollback(state, token);
+ *   const begun = stages.undo.checkpoint(state);
+ *   if (!begun.ok) throw new Error(`undo begin refused: ${begun.error}`);
+ *   stages.undo.rollback(state, begun.value);
  */
 
 import type { CompactColumn } from './arrow-planes.js';
 import type { ParseCompactBackend } from './parse-backend.js';
-import type { ColumineBackend, ColumnInput, ReducerProgram, StateHandle } from './types.js';
+import type { ColumineBackend, ColumnInput, ReducerProgram, StateHandle, VmReadResult } from './types.js';
 
 // =============================================================================
 // Configuration Types
@@ -130,20 +131,22 @@ export interface CompactStage {
 export interface UndoStage {
   readonly name: 'undo';
   /**
-   * Create a checkpoint before speculative execution.
-   * The returned token captures the undo log position.
+   * Begin an undo window, then take a checkpoint before speculative execution.
+   * The savepoint is taken only after the native begin succeeds; a refused begin
+   * (e.g. SPECULATION_ACTIVE) is returned as an error value and takes no savepoint.
    *
    * @param state - State handle to checkpoint
-   * @returns Opaque undo token
+   * @returns Opaque undo token, or the native begin error
    */
-  checkpoint(state: StateHandle): UndoToken;
+  checkpoint(state: StateHandle): VmReadResult<UndoToken>;
   /**
    * Roll back all state mutations since the checkpoint token.
    * Replays the undo log in reverse to restore pre-speculation state.
    *
    * @param state - State handle to roll back
    * @param token - Token from a prior checkpoint() call
-   * @returns 'ok' if undo log replay was sufficient, 'overflow' if shadow buffer was needed
+   * @returns 'ok' if every write in the window was journaled; 'overflow' if a prior write was refused,
+   *   in which case the exact valid prefix was rolled back (no snapshot restore)
    */
   rollback(state: StateHandle, token: UndoToken): 'ok' | 'overflow';
   /**
@@ -227,14 +230,15 @@ function createUndoStage(backend: ColumineBackend): UndoStage {
   return {
     name: 'undo',
 
-    checkpoint(state: StateHandle): UndoToken {
-      backend.undoEnable(state);
+    checkpoint(state: StateHandle): VmReadResult<UndoToken> {
+      const begun = backend.undoEnable(state);
+      if (!begun.ok) return begun;
       const position = backend.undoCheckpoint(state);
       const token: InternalUndoToken = {
         _brand: 'UndoToken',
         position,
       };
-      return token;
+      return { ok: true, value: token };
     },
 
     rollback(state: StateHandle, token: UndoToken): 'ok' | 'overflow' {

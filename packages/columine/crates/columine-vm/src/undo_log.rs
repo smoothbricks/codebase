@@ -1,119 +1,46 @@
-//! Typed rollback helpers over `FlatTable`.
-//!
-//! Bitmap and TTL rollback remain in the VM module; this module owns the
-//! container rollback operations and the serialized undo-entry contract.
-//! `FlatUndoOp`/`FlatUndoEntry` are explicit byte layouts used by exported
-//! delta and fork segments. In-memory rings, overflow snapshots, change-flag
-//! save/restore, and delta export assembly remain VM-owned.
+//! Physical undo/delta wire entries. All mutation families restore actual
+//! bounded bytes; no logical inverse can rewrite unrelated allocated cells.
 
-use crate::bytes;
-use crate::hash_table::{ENTRY_NONE, ENTRY_U32, FlatTable};
-use crate::meta::SlotMetaView;
-use columine_types::types::SlotMetaOffset;
-
-/// Operation byte of a serialized undo entry. Discriminants are wire values
-/// inside exported delta/fork segments.
+/// Physical record discriminant in exported undo/delta/fork segments.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FlatUndoOp {
-    /// Rollback: tombstone key, decrement size.
-    MapInsert = 1,
-    /// Rollback: restore prev value + timestamp.
-    MapUpdate = 2,
-    /// Rollback: restore key + value + timestamp, increment size.
-    MapDelete = 3,
-    /// Rollback: tombstone elem, decrement size.
-    SetInsert = 4,
-    /// Rollback: restore elem, increment size.
-    SetDelete = 5,
-    /// Rollback: restore prev value (f64/i64) + count (u64) — 16-byte slots.
-    AggUpdate = 6,
-    /// Rollback: tombstone the derived-fact identity at `prev_value`.
-    FactInsertNew = 7,
-    /// Restore a derived-fact identity and value at `prev_value`.
-    FactInsertUpdate = 8,
-    /// Restore a retracted derived-fact identity and value at `prev_value`.
-    FactRetract = 9,
-    /// Rollback: restore list count to prev_value.
-    ListAppendUndo = 10,
-    /// Rollback: restore prev count (u64) — 8-byte COUNT slot.
-    CountUpdate = 11,
-    /// Restore a scalar slot's value and comparison timestamp.
-    /// Scalar-update is an extension; the frozen ABI did not journal scalar writes.
-    ScalarUpdate = 14,
-    /// Restore `pad1` (1..=8) raw bytes at absolute state offset `key` from
-    /// `aux`'s little-endian bytes. Used as paired before/after entries for
-    /// nested arenas and variable payloads without widening this 24-byte ABI.
+    /// Restore `pad1` (1..=8) prior bytes at absolute state offset `key`
+    /// from `aux`'s little-endian bytes without changing layout.
     StateBytes = 15,
-    /// Roll back one struct-map scalar field or remove a newly created row.
-    /// `_pad1` is the field index, `_pad2` carries flags, and `aux` stores the
-    /// field bytes in little-endian order.
-    StructMapField = 12,
-    /// Whole-row rollback for struct-map upserts that clear the row bitset.
-    /// `_pad2 = 0x02` marks an absent row; `aux` stores up to eight bitset bytes.
-    StructMapRow = 13,
 }
 
 impl FlatUndoOp {
     pub const fn from_u8(value: u8) -> Option<Self> {
         match value {
-            1 => Some(Self::MapInsert),
-            2 => Some(Self::MapUpdate),
-            3 => Some(Self::MapDelete),
-            4 => Some(Self::SetInsert),
-            5 => Some(Self::SetDelete),
-            6 => Some(Self::AggUpdate),
-            7 => Some(Self::FactInsertNew),
-            8 => Some(Self::FactInsertUpdate),
-            9 => Some(Self::FactRetract),
-            10 => Some(Self::ListAppendUndo),
-            11 => Some(Self::CountUpdate),
-            12 => Some(Self::StructMapField),
-            13 => Some(Self::StructMapRow),
-            14 => Some(Self::ScalarUpdate),
             15 => Some(Self::StateBytes),
             _ => None,
         }
     }
 }
 
-/// Field-present flag in a `STRUCT_MAP_FIELD` entry.
-pub const SMF_BIT_SET: u8 = 0x01;
-/// Row-absent flag shared by struct-map rollback entries.
-pub const SMF_ROW_ABSENT: u8 = 0x02;
-/// `STRUCT_MAP_FIELD`/`STRUCT_MAP_ROW` flags. Both row-absence flags use
-/// `0x02` deliberately, so rollback can share the same removal test.
-pub const SMR_ROW_ABSENT: u8 = 0x02;
-
-/// One serialized undo/redo entry. Layout: op@0, a zero byte@1, `_pad1`@2,
-/// `_pad2`@3, key@4, prev_value@8, slot@12 (`u32`), aux@16; size 24.
-/// `_pad1`/`_pad2` carry field index and flags for struct-map entries.
-/// Following crate convention the struct is plain Rust; the byte contract
-/// lives in [`FlatUndoEntry::write_to`] / [`FlatUndoEntry::read_from`], pinned
-/// by layout tests.
+/// One serialized physical record. Layout: op@0, zero@1, byte length@2,
+/// zero@3, absolute offset@4, zero@8, zero@12, payload@16; size 24.
+/// The explicit wire codec, not the Rust memory layout, defines the ABI.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FlatUndoEntry {
     pub op: FlatUndoOp,
-    /// Slot index ([`DERIVED_FACT_SLOT`] = derived fact); ignored by STATE_BYTES.
+    /// Reserved zero lane.
     pub slot: u32,
-    /// STRUCT_MAP_FIELD: field_idx. FACT_*: fact_idx low. STATE_BYTES: length.
+    /// Physical payload length, 1..=8.
     pub pad1: u8,
-    /// STRUCT_MAP_*: SMF/SMR flags. FACT_*: fact_idx high byte.
+    /// Reserved zero lane.
     pub pad2: u8,
-    /// Container/fact key, or absolute state offset for STATE_BYTES.
+    /// Absolute state offset.
     pub key: u32,
-    /// Previous value, physical fact slot, or zero for STATE_BYTES.
+    /// Reserved zero lane.
     pub prev_value: u32,
-    /// Previous timestamp bits, target/restored fact value, field/bitset bytes,
-    /// or raw STATE_BYTES payload — per-op documented above.
+    /// Prior or subsequent bytes in little-endian order.
     pub aux: u64,
 }
 
 /// Serialized size of one undo entry.
 pub const FLAT_UNDO_ENTRY_SIZE: u32 = 24;
-
-/// The `slot` of an entry that journals a derived fact rather than a slot.
-pub const DERIVED_FACT_SLOT: u32 = u32::MAX;
 
 /// One undo/redo pair occupying 48 serialized bytes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -144,6 +71,13 @@ impl FlatUndoEntry {
     /// not a programmer bug).
     pub fn read_from(buf: &[u8; FLAT_UNDO_ENTRY_SIZE as usize]) -> Option<Self> {
         let op = FlatUndoOp::from_u8(buf[0])?;
+        if !(1..=8).contains(&buf[2])
+            || buf[1] != 0
+            || buf[3] != 0
+            || buf[8..16].iter().any(|byte| *byte != 0)
+        {
+            return None;
+        }
         Some(Self {
             op,
             slot: u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]),
@@ -158,144 +92,6 @@ impl FlatUndoEntry {
     }
 }
 
-/// Bind the HASHMAP table used by rollback.
-fn bind_map(meta: &SlotMetaView) -> FlatTable {
-    FlatTable::bind_external(
-        meta.offset,
-        meta.capacity,
-        meta.meta_base + SlotMetaOffset::SIZE,
-        ENTRY_U32,
-    )
-}
-
-/// Bind the HASHSET table used by rollback.
-fn bind_set(meta: &SlotMetaView) -> FlatTable {
-    FlatTable::bind_external(
-        meta.offset,
-        meta.capacity,
-        meta.meta_base + SlotMetaOffset::SIZE,
-        ENTRY_NONE,
-    )
-}
-
-/// Offset of a HASHMAP timestamp lane: one u64 (f64 bits) per position.
-fn ts_off(meta: &SlotMetaView, pos: u32) -> u32 {
-    meta.offset + meta.capacity * 8 + pos * 8
-}
-
-// Rollback restores logical contents. Compaction can relocate surviving keys,
-// so a saved physical iterator position does not survive an undo operation.
-/// Roll back a map insertion by closing the probe cluster and decrementing size.
-pub fn rollback_map_insert(state: &mut [u8], meta: &SlotMetaView, key: u32) -> bool {
-    let tbl = bind_map(meta);
-    let Some(pos) = tbl.find(state, key) else {
-        return false;
-    };
-    crate::hashmap_ops::erase_slot_map_at(state, meta, &tbl, pos);
-    let size = tbl.size(state);
-    tbl.set_size(state, size - 1);
-    true
-}
-
-/// Restore a map value and optional timestamp from raw u64 bits.
-pub fn rollback_map_update(
-    state: &mut [u8],
-    meta: &SlotMetaView,
-    key: u32,
-    prev_value: u32,
-    prev_ts_bits: u64,
-) -> bool {
-    let tbl = bind_map(meta);
-    let Some(pos) = tbl.find(state, key) else {
-        return false;
-    };
-    tbl.set_entry_u32_at(state, pos, prev_value);
-    if meta.has_hashmap_timestamp_storage() {
-        bytes::write_u64(state, ts_off(meta, pos), prev_ts_bits);
-    }
-    true
-}
-
-/// Restore a deleted map key, value, and optional timestamp at its probe
-/// position, incrementing size. Return false when the key is already present
-/// or the table has no insertion position.
-pub fn rollback_map_delete(
-    state: &mut [u8],
-    meta: &SlotMetaView,
-    key: u32,
-    prev_value: u32,
-    prev_ts_bits: u64,
-) -> bool {
-    let tbl = bind_map(meta);
-    let Some(probe) = tbl.find_insert(state, key) else {
-        return false;
-    };
-    if probe.found {
-        return false;
-    }
-    tbl.set_key_at(state, probe.pos, key);
-    tbl.set_entry_u32_at(state, probe.pos, prev_value);
-    if meta.has_hashmap_timestamp_storage() {
-        bytes::write_u64(state, ts_off(meta, probe.pos), prev_ts_bits);
-    }
-    let size = tbl.size(state);
-    tbl.set_size(state, size + 1);
-    true
-}
-
-/// Restore the previous value bits and full u64 count of a 16-byte aggregate
-/// slot (`[value: u64][count: u64]`).
-// The count uses prev_value (low) and key (high) lanes so values above u32::MAX
-// remain lossless.
-pub fn rollback_agg_update(
-    state: &mut [u8],
-    meta: &SlotMetaView,
-    prev_count: u64,
-    prev_val_bits: u64,
-) {
-    bytes::write_u64(state, meta.offset, prev_val_bits);
-    bytes::write_u64(state, meta.offset + 8, prev_count);
-}
-
-/// Restore the count of an 8-byte COUNT-only slot.
-// Full u64 count (prev_value low + key high lanes) — see rollback_agg_update.
-pub fn rollback_count_update(state: &mut [u8], meta: &SlotMetaView, prev_count: u64) {
-    bytes::write_u64(state, meta.offset, prev_count);
-}
-
-/// Restore a scalar slot's value bytes and comparison timestamp.
-pub fn rollback_scalar_update(state: &mut [u8], meta: &SlotMetaView, value: u64, ts: f64) {
-    bytes::write_u64(state, meta.offset, value);
-    bytes::write_f64(state, meta.offset + 8, ts);
-}
-
-/// Roll back a set insertion by closing the probe cluster and decrementing size.
-pub fn rollback_set_insert(state: &mut [u8], meta: &SlotMetaView, elem: u32) -> bool {
-    let tbl = bind_set(meta);
-    let Some(pos) = tbl.find(state, elem) else {
-        return false;
-    };
-    tbl.erase_at(state, pos, |_, _, _| {});
-    let size = tbl.size(state);
-    tbl.set_size(state, size - 1);
-    true
-}
-
-/// Restore a deleted set element and increment size.
-pub fn rollback_set_delete(state: &mut [u8], meta: &SlotMetaView, elem: u32) -> bool {
-    let tbl = bind_set(meta);
-    let Some(probe) = tbl.find_insert(state, elem) else {
-        return false;
-    };
-    if probe.found {
-        return false;
-    }
-    tbl.set_key_at(state, probe.pos, elem);
-    let size = tbl.size(state);
-    tbl.set_size(state, size + 1);
-    true
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -305,48 +101,36 @@ mod tests {
     #[test]
     fn flat_undo_entry_serialized_layout_is_pinned() {
         let entry = FlatUndoEntry {
-            op: FlatUndoOp::StructMapField,
-            slot: 0x0102_0304,
+            op: FlatUndoOp::StateBytes,
+            slot: 0,
             pad1: 3,
-            pad2: SMF_BIT_SET,
+            pad2: 0,
             key: 0x11223344,
-            prev_value: 0x55667788,
+            prev_value: 0,
             aux: 0x99aabbccddeeff00,
         };
         let mut buf = [0xa5u8; 24];
         entry.write_to(&mut buf);
-        assert_eq!(buf[0], 12); // StructMapField discriminant
+        assert_eq!(buf[0], 15);
         assert_eq!(buf[1], 0);
         assert_eq!(buf[2], 3);
-        assert_eq!(buf[3], 0x01);
+        assert_eq!(buf[3], 0);
         assert_eq!(&buf[4..8], &0x11223344u32.to_le_bytes());
-        assert_eq!(&buf[8..12], &0x55667788u32.to_le_bytes());
-        assert_eq!(&buf[12..16], &0x0102_0304u32.to_le_bytes());
+        assert_eq!(&buf[8..12], &[0; 4]);
+        assert_eq!(&buf[12..16], &[0; 4]);
         assert_eq!(&buf[16..24], &0x99aabbccddeeff00u64.to_le_bytes());
         assert_eq!(FlatUndoEntry::read_from(&buf), Some(entry));
         assert_eq!(FLAT_UNDO_ENTRY_SIZE, 24);
         assert_eq!(FLAT_DELTA_ENTRY_SIZE, 48);
     }
 
-    /// Every FlatUndoOp discriminant matches the serialized ABI, including the
-    /// deliberate gap between LIST_APPEND_UNDO=10 and COUNT_UPDATE=11.
+    /// Logical encodings are not a second accepted ABI.
     #[test]
     fn flat_undo_op_discriminants_match_contract() {
-        assert_eq!(FlatUndoOp::MapInsert as u8, 1);
-        assert_eq!(FlatUndoOp::MapUpdate as u8, 2);
-        assert_eq!(FlatUndoOp::MapDelete as u8, 3);
-        assert_eq!(FlatUndoOp::SetInsert as u8, 4);
-        assert_eq!(FlatUndoOp::SetDelete as u8, 5);
-        assert_eq!(FlatUndoOp::AggUpdate as u8, 6);
-        assert_eq!(FlatUndoOp::FactInsertNew as u8, 7);
-        assert_eq!(FlatUndoOp::FactInsertUpdate as u8, 8);
-        assert_eq!(FlatUndoOp::FactRetract as u8, 9);
-        assert_eq!(FlatUndoOp::ListAppendUndo as u8, 10);
-        assert_eq!(FlatUndoOp::CountUpdate as u8, 11);
-        assert_eq!(FlatUndoOp::StructMapField as u8, 12);
-        assert_eq!(FlatUndoOp::StructMapRow as u8, 13);
-        assert_eq!(FlatUndoOp::ScalarUpdate as u8, 14); // post-parity extension
-        assert_eq!(FlatUndoOp::StateBytes as u8, 15); // post-parity extension
+        assert_eq!(FlatUndoOp::StateBytes as u8, 15);
+        for opcode in 0..15 {
+            assert_eq!(FlatUndoOp::from_u8(opcode), None);
+        }
         assert_eq!(FlatUndoEntry::read_from(&[0u8; 24]), None); // 0 invalid
         assert_eq!(
             FlatUndoEntry::read_from(&{

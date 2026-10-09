@@ -13,6 +13,13 @@
 //! the encoded batch is emitted once — without a second parse, cloned
 //! columns, or intermediate IPC.
 //!
+//! Value-object payloads are judged by a [`VoAdmission`] capability the
+//! caller injects through [`EventProcessor::new_with_vo_admission`]. The
+//! capability is prepared for every declared value-object schema before any
+//! processor state exists, and [`EventProcessor::new`] uses the explicit
+//! [`UnavailableVoAdmission`] refusal, so a value-object schema never yields
+//! a processor that would accept frames unchecked.
+//!
 //! The `ep_*` wasm exports of `columine-ep-wasm` are thin bindings around
 //! this library core.
 
@@ -29,10 +36,12 @@ use columine_arrow::{
     write_arrow_ipc_from_dynamic_columns,
 };
 use columine_parsing::{
-    ExtractionConfig, json_extractor, json_scanner, msgpack_extractor, msgpack_scanner,
+    ExtractionConfig, FrameProjections, json_extractor, json_scanner, msgpack_extractor,
+    msgpack_scanner,
     validate::{
-        BatchValidationError, SemanticSchemaSet, parse_schema_envelope, validate_json_batch,
-        validate_msgpack_batch,
+        BatchValidationError, PayloadViolation, PreparedSchemas, UnavailableVoAdmission,
+        VoAdmission, VoFrameProof, VoPreparationError, VoPresence, VoRefusal,
+        parse_schema_envelope,
     },
 };
 
@@ -219,6 +228,8 @@ pub enum EpInitError {
     Metadata(columine_arrow::MetadataError),
     Config(columine_parsing::ConfigError),
     SemanticSchema(columine_parsing::validate::SchemaParseError),
+    /// The value-object capability refused to prepare a declared schema.
+    VoAdmission(VoPreparationError),
 }
 
 /// Structured diagnostic for a semantic payload refusal. The result header
@@ -228,23 +239,56 @@ pub enum EpInitError {
 pub struct PayloadValidationDiagnostic {
     pub stage: u8,
     pub detail: u8,
+    /// The refused event, or the refused row of a compact batch.
     pub event_index: u32,
-    pub signal_type: String,
+    /// The event's signal type, when it named one; a compact row carries
+    /// none.
+    pub signal_type: Option<String>,
     pub path: String,
     pub expected: String,
     pub observed: String,
+    /// The value-object admission cause, when the capability or its proof
+    /// refused the payload.
+    pub vo: Option<VoRefusal>,
 }
 
-/// The public event-processor parse plane.
-pub struct EventProcessor {
+impl PayloadValidationDiagnostic {
+    fn new(event_index: usize, signal_type: Option<String>, violation: PayloadViolation) -> Self {
+        Self {
+            stage: diagnostic_stage::VALIDATION,
+            detail: diagnostic_detail::PAYLOAD_VIOLATION,
+            event_index: u32::try_from(event_index).unwrap_or(u32::MAX),
+            signal_type,
+            path: violation.path,
+            expected: violation.expected,
+            observed: violation.observed,
+            vo: violation.vo,
+        }
+    }
+}
+
+/// The public event-processor parse plane, generic over its value-object
+/// admission capability.
+///
+/// The prepared envelope is read-only after construction and the plane is
+/// the only mutable state, so a validated input can borrow the envelope's
+/// admission proofs while it extracts into the plane.
+pub struct EventProcessor<A = UnavailableVoAdmission> {
+    semantic: Option<PreparedSchemas<A>>,
+    last_validation_diagnostic: Option<PayloadValidationDiagnostic>,
+    plane: Plane,
+}
+
+/// The processor's mutable parse state: one column plane, its schema and
+/// extraction configuration, retained Arrow metadata, and workspaces.
+struct Plane {
     options: ParseOptions,
     schema_config: DynamicSchemaConfig,
     extraction_config: Option<ExtractionConfig>,
-    semantic_schemas: Option<SemanticSchemaSet>,
-    last_validation_diagnostic: Option<PayloadValidationDiagnostic>,
     dynamic_columns: DynamicColumns,
-    /// True when the schema IS the base event log and the options keep the
-    /// scanner path, so the four-column scanners can write by index.
+    /// True when the schema IS the base event log, the options keep the
+    /// scanner path, and no value object is declared, so the four-column
+    /// scanners can write by index.
     use_base_scanners: bool,
     record_batch_metadata: MetadataStorage,
     /// Reusable MessagePack workspace for declared Binary values and
@@ -256,21 +300,49 @@ pub struct EventProcessor {
 
 impl EventProcessor {
     /// Init with schema + field names (the primary path; names enable JSON
-    /// key matching). `column_capacity` sizes the batch columns; the wasm
-    /// exports build every handle at [`WASM_EVENT_CAPACITY`]. `options`
-    /// selects the base scanner path, MessagePack workspace growth, and
-    /// header diagnostics.
+    /// key matching) and no value-object capability: a semantic schema that
+    /// declares a value object is refused with [`EpInitError::VoAdmission`].
+    /// `column_capacity` sizes the batch columns; the wasm exports build every
+    /// handle at [`WASM_EVENT_CAPACITY`]. `options` selects the base scanner
+    /// path, MessagePack workspace growth, and header diagnostics.
     pub fn new(
         options: ParseOptions,
         column_capacity: u32,
         schema_config: DynamicSchemaConfig,
     ) -> Result<Self, EpInitError> {
-        let semantic_schemas = schema_config
-            .semantic_schema
-            .as_deref()
-            .map(parse_schema_envelope)
-            .transpose()
-            .map_err(EpInitError::SemanticSchema)?;
+        Self::new_with_vo_admission(
+            options,
+            column_capacity,
+            schema_config,
+            UnavailableVoAdmission,
+        )
+    }
+}
+
+impl<A: VoAdmission> EventProcessor<A> {
+    /// [`EventProcessor::new`] with a value-object capability. The semantic
+    /// envelope is decoded once and `admission` is prepared once for every
+    /// distinct value-object schema it declares, before any metadata,
+    /// extraction configuration, or column plane is allocated; a refusal
+    /// leaves no processor behind.
+    pub fn new_with_vo_admission(
+        options: ParseOptions,
+        column_capacity: u32,
+        schema_config: DynamicSchemaConfig,
+        admission: A,
+    ) -> Result<Self, EpInitError> {
+        let semantic = match schema_config.semantic_schema.as_deref() {
+            None => None,
+            Some(envelope) => {
+                let schemas =
+                    parse_schema_envelope(envelope).map_err(EpInitError::SemanticSchema)?;
+                Some(
+                    PreparedSchemas::prepare(schemas, admission)
+                        .map_err(EpInitError::VoAdmission)?,
+                )
+            }
+        };
+
         let record_batch_metadata =
             MetadataStorage::for_fields(&schema_config.field_metadata, MetadataLimits::default())
                 .map_err(EpInitError::Metadata)?;
@@ -289,25 +361,46 @@ impl EventProcessor {
                 columine_parsing::build_extraction_config_with_semantic_schemas(
                     &schema_config.field_metadata,
                     &names,
-                    semantic_schemas.as_ref(),
+                    semantic.as_ref().map(PreparedSchemas::schemas),
                     schema_config.payload_discriminator.as_ref(),
                 )
                 .map_err(EpInitError::Config)?,
             )
         };
 
+        // The base scanners store each event's raw `value` span, which is not
+        // the frame a value-object admission judged, so a processor that
+        // declares value objects always takes the extraction path.
+        let use_base_scanners = options.base_path
+            && schema_config.is_base_event_log
+            && semantic
+                .as_ref()
+                .is_none_or(|prepared| prepared.presence() == VoPresence::Absent);
         Ok(Self {
-            use_base_scanners: options.base_path && schema_config.is_base_event_log,
-            dynamic_columns: DynamicColumns::new(&schema_config.field_metadata, column_capacity),
-            record_batch_metadata,
-            extraction_config,
-            semantic_schemas,
+            semantic,
             last_validation_diagnostic: None,
-            schema_config,
-            options,
-            work_buffer: Vec::new(),
-            fallback_work_buffer: Vec::new(),
+            plane: Plane {
+                use_base_scanners,
+                dynamic_columns: DynamicColumns::new(
+                    &schema_config.field_metadata,
+                    column_capacity,
+                ),
+                record_batch_metadata,
+                extraction_config,
+                schema_config,
+                options,
+                work_buffer: Vec::new(),
+                fallback_work_buffer: Vec::new(),
+            },
         })
+    }
+
+    /// Replace the retained column plane with one sized for `rows`, under
+    /// the same clamp as construction. The prepared capability, schema
+    /// metadata, extraction configuration, and work buffers are kept.
+    pub fn grow_plane(&mut self, rows: u32) {
+        let plane = &mut self.plane;
+        plane.dynamic_columns = DynamicColumns::new(&plane.schema_config.field_metadata, rows);
     }
 
     /// Last semantic validation refusal, if the most recent append was refused
@@ -316,31 +409,20 @@ impl EventProcessor {
         self.last_validation_diagnostic.as_ref()
     }
 
-    /// Grow a workspace geometrically toward `MAX_WORK_BUFFER_SIZE`
-    /// (`ensureWorkBufferCapacity`). Err means already at the cap.
-    fn grow_work_buffer(&mut self, fallback: bool) -> Result<(), ()> {
-        let buffer = if fallback {
-            &mut self.fallback_work_buffer
-        } else {
-            &mut self.work_buffer
-        };
-        if buffer.len() >= MAX_WORK_BUFFER_SIZE {
-            return Err(());
-        }
-        let target = (buffer.len() * 2).min(MAX_WORK_BUFFER_SIZE);
-        buffer.resize(target, 0);
-        Ok(())
-    }
-
     /// The retained schema configuration.
     pub fn schema_config(&self) -> &DynamicSchemaConfig {
-        &self.schema_config
+        &self.plane.schema_config
     }
 
     /// Run the semantic precheck on `input` and, on success, hand back the
     /// proof that it completed: a [`ValidatedInput`] that can be extracted
     /// exactly once. The processor retains its one column plane; nothing is
     /// cloned or re-validated downstream.
+    ///
+    /// Every event must name a signal type the envelope declares. With a
+    /// value-object node in the envelope, input the judgment cannot read is
+    /// also refused here rather than left to extraction. Arrow passthrough
+    /// never reaches the column plane on any profile.
     ///
     /// [`ProcessError`] on a semantic refusal carries the header's
     /// diagnostic bytes; the structured path/message form is available
@@ -349,31 +431,75 @@ impl EventProcessor {
         &'a mut self,
         input: &'a [u8],
         format: InputFormat,
-    ) -> Result<ValidatedInput<'a>, ProcessError> {
-        self.last_validation_diagnostic = None;
-        if let Some((event_index, event_type, violation)) = self.validate_input(input, format) {
-            self.last_validation_diagnostic = Some(PayloadValidationDiagnostic {
-                stage: diagnostic_stage::VALIDATION,
-                detail: diagnostic_detail::PAYLOAD_VIOLATION,
-                event_index: u32::try_from(event_index).unwrap_or(u32::MAX),
-                signal_type: event_type,
-                path: violation.path,
-                expected: violation.expected,
-                observed: violation.observed,
-            });
-            return Err(ProcessError {
-                code: ResultCode::ParseError,
-                diagnostic: Some(ResultDiagnostic {
-                    stage: diagnostic_stage::VALIDATION,
-                    detail: diagnostic_detail::PAYLOAD_VIOLATION,
-                    ..ResultDiagnostic::default()
-                }),
-            });
+    ) -> Result<ValidatedInput<'a, A>, ProcessError> {
+        let EventProcessor {
+            semantic,
+            last_validation_diagnostic,
+            plane,
+        } = self;
+        // The envelope stays shared for `'a`: the projected frames borrow it.
+        let semantic: &'a Option<PreparedSchemas<A>> = semantic;
+        *last_validation_diagnostic = None;
+        let mut projected = Vec::new();
+        if let Some(prepared) = semantic {
+            // A passthrough batch is never judged, so with value objects armed it
+            // could carry a frame nothing admitted: refuse it before any work.
+            if format == InputFormat::ArrowPassthrough && prepared.presence() == VoPresence::Present
+            {
+                return Err(ProcessError {
+                    code: ResultCode::InvalidFormat,
+                    diagnostic: None,
+                });
+            }
+            let result = match format {
+                InputFormat::Json => prepared.validate_json_batch(input).map(|()| Vec::new()),
+                InputFormat::Msgpack => prepared.validate_msgpack_batch(input, false),
+                InputFormat::MsgpackStream => prepared.validate_msgpack_batch(input, true),
+                InputFormat::ArrowPassthrough => Ok(Vec::new()),
+            };
+            match result {
+                Ok(frames) => projected = frames,
+                // Ordinary profiles leave unreadable input to extraction,
+                // which names the malformed token.
+                Err(BatchValidationError::InvalidInput) => {
+                    if prepared.presence() == VoPresence::Present {
+                        return Err(ProcessError {
+                            code: ResultCode::ParseError,
+                            diagnostic: Some(ResultDiagnostic {
+                                stage: diagnostic_stage::VALIDATION,
+                                detail: diagnostic_detail::INVALID_JSON,
+                                field_index: NO_FIELD,
+                                ..ResultDiagnostic::default()
+                            }),
+                        });
+                    }
+                }
+                Err(BatchValidationError::Violation {
+                    event_index,
+                    event_type,
+                    violation,
+                }) => {
+                    *last_validation_diagnostic = Some(PayloadValidationDiagnostic::new(
+                        event_index,
+                        event_type,
+                        *violation,
+                    ));
+                    return Err(ProcessError {
+                        code: ResultCode::ParseError,
+                        diagnostic: Some(ResultDiagnostic {
+                            stage: diagnostic_stage::VALIDATION,
+                            detail: diagnostic_detail::PAYLOAD_VIOLATION,
+                            ..ResultDiagnostic::default()
+                        }),
+                    });
+                }
+            }
         }
         Ok(ValidatedInput {
-            processor: self,
+            plane,
             input,
             format,
+            projected,
         })
     }
 
@@ -403,7 +529,7 @@ impl EventProcessor {
             Ok(batch) => batch.encode(output),
             Err(error) => {
                 match error.diagnostic {
-                    Some(diagnostic) if self.options.diagnostics => {
+                    Some(diagnostic) if self.plane.options.diagnostics => {
                         write_result_header_with_diagnostic(output, error.code as u32, &diagnostic);
                     }
                     _ => write_result_header(output, error.code as u32, 0, 0, 0),
@@ -416,27 +542,57 @@ impl EventProcessor {
 
 /// Proof that the semantic precheck on one input completed. Consumed by
 /// [`ValidatedInput::parse`], which extracts into the processor's retained
-/// column plane exactly once.
-pub struct ValidatedInput<'a> {
-    processor: &'a mut EventProcessor,
+/// column plane exactly once. It carries the admission proofs of every
+/// value-object frame certified as a projection into the reader's layout,
+/// so extraction writes their certified bytes without admitting twice.
+pub struct ValidatedInput<'a, A: VoAdmission + 'a = UnavailableVoAdmission> {
+    plane: &'a mut Plane,
     input: &'a [u8],
     format: InputFormat,
+    projected: Vec<A::Frame<'a>>,
 }
 
-impl<'a> ValidatedInput<'a> {
+impl<'a, A: VoAdmission + 'a> ValidatedInput<'a, A> {
     /// Extract the validated input into the retained column plane. The
     /// scanners write the four base event-log columns by index when the
-    /// options keep the base path and the schema IS that event log.
+    /// options keep the base path and the schema IS that event log. Each
+    /// projected frame's certified bytes are copied into its column, and the
+    /// proofs are released once the extraction returns.
     pub fn parse(self) -> Result<ParsedBatch<'a>, ProcessError> {
         let ValidatedInput {
-            processor,
+            plane,
             input,
             format,
+            projected,
         } = self;
-        if processor.use_base_scanners {
-            return processor.parse_base(input, format);
+        let frames: Vec<(&[u8], &[u8])> = projected
+            .iter()
+            .map(|proof| (proof.lent(), proof.bytes()))
+            .collect();
+        if plane.use_base_scanners {
+            // The base scanners store each event's raw value bytes, so a
+            // projected frame inside them has no cell of its own.
+            if !frames.is_empty() {
+                return Err(unwritten_projection());
+            }
+            return plane.parse_base(input, format);
         }
-        processor.parse_dynamic(input, format)
+        plane.parse_dynamic(input, format, FrameProjections::new(&frames))
+    }
+}
+
+/// A projected value-object frame found no cell where its certified bytes
+/// could be written; the batch is refused rather than storing the writer's
+/// layout.
+fn unwritten_projection() -> ProcessError {
+    ProcessError {
+        code: ResultCode::ParseError,
+        diagnostic: Some(ResultDiagnostic {
+            stage: diagnostic_stage::VALIDATION,
+            detail: diagnostic_detail::PAYLOAD_VIOLATION,
+            field_index: NO_FIELD,
+            ..ResultDiagnostic::default()
+        }),
     }
 }
 
@@ -493,40 +649,39 @@ impl ParsedBatch<'_> {
         }
     }
 }
-impl EventProcessor {
-    fn validate_input(
-        &self,
-        input: &[u8],
-        format: InputFormat,
-    ) -> Option<(usize, String, columine_parsing::validate::PayloadViolation)> {
-        let schemas = self.semantic_schemas.as_ref()?;
-        let result = match format {
-            InputFormat::Json => validate_json_batch(input, schemas),
-            InputFormat::Msgpack => validate_msgpack_batch(input, schemas, false),
-            InputFormat::MsgpackStream => validate_msgpack_batch(input, schemas, true),
-            InputFormat::ArrowPassthrough => return None,
-        };
-        match result {
-            Err(BatchValidationError::Violation {
-                event_index,
-                event_type,
-                violation,
-            }) => Some((event_index, event_type, violation)),
-            Err(BatchValidationError::InvalidInput) | Ok(()) => None,
-        }
-    }
-
+impl<A: VoAdmission> EventProcessor<A> {
     /// Encode one validated CPB1 column batch into `[ResultHeader][Arrow IPC]`.
     ///
     /// Validation and exact-size preflight finish before any Arrow output byte
     /// is mutated. On `EncodeError` caused by insufficient capacity, the
     /// header reports offset 32 and the exact required Arrow IPC length so the
     /// caller can retry with `32 + max(4096, arrow_len)` bytes.
+    ///
+    /// A compact batch is caller-built columns: the payload is already
+    /// columns, so the semantic judgment has nothing to read. No production
+    /// caller arms a semantic envelope on a compact handle, and a processor
+    /// whose envelope holds value-object nodes refuses compact batches as
+    /// `InvalidFormat` rather than writing value objects it never admitted.
     pub fn compact(&mut self, batch: &[u8], output: &mut [u8]) -> ResultCode {
         if output.len() < RESULT_HEADER_SIZE {
             return ResultCode::OutOfMemory;
         }
-        let view = match CompactBatchView::parse(batch, &self.schema_config) {
+        if self
+            .semantic
+            .as_ref()
+            .is_some_and(|prepared| prepared.presence() == VoPresence::Present)
+        {
+            let diagnostic = ResultDiagnostic {
+                stage: diagnostic_stage::VALIDATION,
+                detail: diagnostic_detail::PAYLOAD_VIOLATION,
+                field_index: NO_FIELD,
+                ..ResultDiagnostic::default()
+            };
+            write_compact_result_header(output, ResultCode::InvalidFormat, 0, 0, 0, &diagnostic);
+            return ResultCode::InvalidFormat;
+        }
+        let plane = &mut self.plane;
+        let view = match CompactBatchView::parse(batch, &plane.schema_config) {
             Ok(view) => view,
             Err(error) => {
                 write_compact_result_header(output, error.code, 0, 0, 0, &error.diagnostic);
@@ -534,8 +689,8 @@ impl EventProcessor {
             }
         };
 
-        let required_ipc = match required_arrow_ipc_len(&self.schema_config, |index| {
-            view.column(index, &self.schema_config)
+        let required_ipc = match required_arrow_ipc_len(&plane.schema_config, |index| {
+            view.column(index, &plane.schema_config)
         }) {
             Ok(required) => required,
             Err(_) => {
@@ -569,10 +724,10 @@ impl EventProcessor {
 
         let result = write_arrow_ipc_from_borrowed_columns(
             view.row_count(),
-            &self.schema_config,
+            &plane.schema_config,
             &mut output[RESULT_HEADER_SIZE..],
-            &mut self.record_batch_metadata,
-            |index| view.column(index, &self.schema_config),
+            &mut plane.record_batch_metadata,
+            |index| view.column(index, &plane.schema_config),
             |index| view.null_count(index),
         );
         match result {
@@ -603,6 +758,24 @@ impl EventProcessor {
                 ResultCode::EncodeError
             }
         }
+    }
+}
+
+impl Plane {
+    /// Grow a workspace geometrically toward `MAX_WORK_BUFFER_SIZE`
+    /// (`ensureWorkBufferCapacity`). Err means already at the cap.
+    fn grow_work_buffer(&mut self, fallback: bool) -> Result<(), ()> {
+        let buffer = if fallback {
+            &mut self.fallback_work_buffer
+        } else {
+            &mut self.work_buffer
+        };
+        if buffer.len() >= MAX_WORK_BUFFER_SIZE {
+            return Err(());
+        }
+        let target = (buffer.len() * 2).min(MAX_WORK_BUFFER_SIZE);
+        buffer.resize(target, 0);
+        Ok(())
     }
 
     /// BASE PATH: the base event-log scanners, which write the four
@@ -657,6 +830,7 @@ impl EventProcessor {
         &mut self,
         input: &[u8],
         format: InputFormat,
+        projections: FrameProjections<'_>,
     ) -> Result<ParsedBatch<'_>, ProcessError> {
         if format == InputFormat::ArrowPassthrough {
             return Err(ProcessError {
@@ -673,11 +847,19 @@ impl EventProcessor {
         };
 
         let mut extraction_diagnostic = json_extractor::ExtractionDiagnostic::default();
-        let extract_result =
-            self.extract_with_growth(input, format, &config, &mut extraction_diagnostic);
+        let extract_result = self.extract_with_growth(
+            input,
+            format,
+            &config,
+            projections,
+            &mut extraction_diagnostic,
+        );
         self.extraction_config = Some(config);
 
         if let Err(err) = extract_result {
+            if err == json_extractor::ExtractionError::UnwrittenProjection {
+                return Err(unwritten_projection());
+            }
             let code = match err {
                 json_extractor::ExtractionError::OutOfMemory => ResultCode::OutOfMemory,
                 _ => ResultCode::ParseError,
@@ -744,6 +926,7 @@ impl EventProcessor {
         input: &[u8],
         format: InputFormat,
         config: &ExtractionConfig,
+        projections: FrameProjections<'_>,
         diagnostic: &mut json_extractor::ExtractionDiagnostic,
     ) -> Result<usize, json_extractor::ExtractionError> {
         // A processor that never sees a format retains no scratch allocation
@@ -767,12 +950,13 @@ impl EventProcessor {
                     diagnostic,
                 ),
                 InputFormat::Msgpack | InputFormat::MsgpackStream => {
-                    msgpack_extractor::extract_msgpack_events(
+                    msgpack_extractor::extract_msgpack_events_with_projections(
                         input,
                         config,
                         &mut self.dynamic_columns,
                         &mut self.work_buffer,
                         format == InputFormat::MsgpackStream,
+                        projections,
                     )
                 }
                 InputFormat::ArrowPassthrough => {
@@ -969,7 +1153,7 @@ mod tests {
         let schema = schema_with_names(&base_fields(), b"id\0type\0timestamp\0value\0");
         assert!(schema.is_base_event_log);
         let mut ep = EventProcessor::new(columine_options(), 100, schema).unwrap();
-        assert!(ep.use_base_scanners);
+        assert!(ep.plane.use_base_scanners);
         let input =
             br#"[{"id":"a-1","type":"click","timestamp":100,"value":{"x":1}},{"id":"a-2","type":"view","timestamp":200}]"#;
         let mut output = vec![0u8; 64 * 1024];
@@ -1097,9 +1281,9 @@ mod tests {
         assert!(!schema.is_base_event_log);
 
         let mut consumer_ep = EventProcessor::new(admission_options(), 10, schema.clone()).unwrap();
-        consumer_ep.work_buffer = vec![0; 8];
+        consumer_ep.plane.work_buffer = vec![0; 8];
         let mut col_ep = EventProcessor::new(columine_options(), 10, schema).unwrap();
-        col_ep.work_buffer = vec![0; 8];
+        col_ep.plane.work_buffer = vec![0; 8];
 
         // Msgpack map {id:"x", big:"yyyyyyyyyyyyyyyy"} — undeclared `big`
         // routes through the msgpack workspace.
@@ -1141,8 +1325,8 @@ mod tests {
         };
         let mut lazy = EventProcessor::new(options, 2, schema.clone()).unwrap();
         let mut presized = EventProcessor::new(options, 2, schema).unwrap();
-        presized.work_buffer.resize(64 * 1024, 0);
-        presized.fallback_work_buffer.resize(16 * 1024, 0);
+        presized.plane.work_buffer.resize(64 * 1024, 0);
+        presized.plane.fallback_work_buffer.resize(16 * 1024, 0);
         let mut actual = vec![0; 256 * 1024];
         let mut expected = vec![0; 256 * 1024];
 
@@ -1254,8 +1438,224 @@ mod tests {
         assert_eq!(diagnostic.expected, "string");
         assert_eq!(diagnostic.observed, "number");
         assert_eq!(diagnostic.event_index, 0);
-        assert_eq!(diagnostic.signal_type, "hi");
+        assert_eq!(diagnostic.signal_type.as_deref(), Some("hi"));
         assert_eq!(read_result_header(&output).0, ResultCode::ParseError as u32);
         assert!(output[32..].iter().all(|byte| *byte == 0xa5));
+    }
+
+    use columine_parsing::validate::{SchemaParseError, VoAdmissionError, VoMetadataField};
+
+    const LINE_VO: &str = r#"{"kind":"vo","root":"orders.Line","frame":"0a1b","rows":["00ff"]}"#;
+
+    fn semantic_schema(envelope: &str) -> DynamicSchemaConfig {
+        DynamicSchemaConfig {
+            semantic_schema: Some(envelope.as_bytes().to_vec()),
+            ..schema_with_names(&base_fields(), b"id\0type\0timestamp\0value\0")
+        }
+    }
+
+    /// The same value-object metadata declared twice, under two event types.
+    fn line_envelope() -> String {
+        format!(
+            r#"{{"line":{{"kind":"object","fields":{{"frame":{LINE_VO}}}}},"lines":{{"kind":"array","item":{LINE_VO}}}}}"#
+        )
+    }
+
+    #[test]
+    fn vo_schema_without_a_capability_refuses_at_init() {
+        let refused = Some(EpInitError::VoAdmission(VoPreparationError {
+            root: "orders.Line".into(),
+            error: VoAdmissionError::Unavailable,
+        }));
+        assert_eq!(
+            EventProcessor::new(admission_options(), 8, semantic_schema(&line_envelope())).err(),
+            refused
+        );
+        assert_eq!(
+            EventProcessor::new_with_vo_admission(
+                admission_options(),
+                8,
+                semantic_schema(&line_envelope()),
+                UnavailableVoAdmission,
+            )
+            .err(),
+            refused
+        );
+    }
+
+    #[test]
+    fn malformed_vo_metadata_refuses_at_init_before_any_capability_runs() {
+        let envelope = r#"{"line":{"kind":"vo","root":"orders.Line","frame":"0A","rows":["00"]}}"#;
+        let malformed = Some(EpInitError::SemanticSchema(
+            SchemaParseError::InvalidVoMetadata(VoMetadataField::Frame),
+        ));
+        assert_eq!(
+            EventProcessor::new(admission_options(), 8, semantic_schema(envelope)).err(),
+            malformed
+        );
+    }
+
+    #[test]
+    fn grow_plane_replaces_only_the_column_plane() {
+        let envelope = r#"{"hi":{"kind":"object","fields":{"greeting":{"kind":"string"}}}}"#;
+        let mut ep =
+            EventProcessor::new(admission_options(), 2, semantic_schema(envelope)).unwrap();
+        ep.plane.fallback_work_buffer.resize(64, 0);
+        ep.grow_plane(16);
+        assert_eq!(ep.plane.dynamic_columns.capacity, 16);
+        assert_eq!(
+            ep.plane.fallback_work_buffer.len(),
+            64,
+            "work buffers are kept"
+        );
+        let mut output = vec![0u8; 4096];
+        assert_eq!(
+            ep.create_log_entry(
+                br#"[{"id":"a","type":"hi","timestamp":1,"value":{"greeting":42}}]"#,
+                InputFormat::Json,
+                &mut output
+            ),
+            ResultCode::ParseError,
+            "the prepared envelope still judges"
+        );
+    }
+
+    #[test]
+    fn unknown_event_types_refuse_before_columns_change() {
+        let envelope = r#"{"hi":{"kind":"object","fields":{"greeting":{"kind":"string"}}}}"#;
+        let mut ep =
+            EventProcessor::new(admission_options(), 8, semantic_schema(envelope)).unwrap();
+        let mut output = vec![0u8; 64 * 1024];
+        assert_eq!(
+            ep.create_log_entry(
+                br#"[{"id":"a","type":"hi","timestamp":1,"value":{"greeting":"ok"}}]"#,
+                InputFormat::Json,
+                &mut output
+            ),
+            ResultCode::Ok
+        );
+        assert_eq!(ep.plane.dynamic_columns.count, 1);
+        for (input, signal_type, observed) in [
+            (
+                &br#"[{"id":"a","type":"other","timestamp":1,"value":{"greeting":42}}]"#[..],
+                Some("other"),
+                "undeclared",
+            ),
+            (&br#"[{"id":"b","timestamp":2}]"#[..], None, "absent"),
+        ] {
+            assert_eq!(
+                ep.create_log_entry(input, InputFormat::Json, &mut output),
+                ResultCode::ParseError
+            );
+            let diagnostic = ep.payload_validation_diagnostic().unwrap();
+            assert_eq!(diagnostic.signal_type.as_deref(), signal_type);
+            assert_eq!(
+                (diagnostic.path.as_str(), diagnostic.observed.as_str()),
+                ("type", observed)
+            );
+            assert_eq!(
+                ep.plane.dynamic_columns.count, 1,
+                "the refused batch left no row"
+            );
+        }
+    }
+
+    #[test]
+    fn repeated_type_or_value_refuses_before_columns_change() {
+        let envelope = r#"{"hi":{"kind":"object","fields":{"greeting":{"kind":"string"}}}}"#;
+        let mut ep =
+            EventProcessor::new(admission_options(), 8, semantic_schema(envelope)).unwrap();
+        let mut output = vec![0u8; 64 * 1024];
+        assert_eq!(
+            ep.create_log_entry(
+                br#"[{"id":"a","type":"hi","timestamp":1,"value":{"greeting":"ok"}}]"#,
+                InputFormat::Json,
+                &mut output
+            ),
+            ResultCode::Ok
+        );
+        assert_eq!(ep.plane.dynamic_columns.count, 1);
+        for (input, path) in [
+            (
+                &br#"[{"id":"b","type":"hi","type":"hi","timestamp":2,"value":{"greeting":"ok"}}]"#[..],
+                "type",
+            ),
+            (
+                &br#"[{"id":"b","type":"hi","timestamp":2,"value":{"greeting":"ok"},"value":{"greeting":42}}]"#[..],
+                "value",
+            ),
+        ] {
+            assert_eq!(
+                ep.create_log_entry(input, InputFormat::Json, &mut output),
+                ResultCode::ParseError
+            );
+            let diagnostic = ep.payload_validation_diagnostic().unwrap();
+            assert_eq!(
+                (diagnostic.path.as_str(), diagnostic.observed.as_str()),
+                (path, "repeated key")
+            );
+            assert_eq!(ep.plane.dynamic_columns.count, 1, "the refused batch left no row");
+        }
+    }
+
+    #[test]
+    fn range_and_exact_array_refuse_through_the_real_ingress() {
+        let envelope = r#"{"order":{"kind":"object","fields":{"qty":{"kind":"range","min":1,"max":10,"integer":true},"dims":{"kind":"array","item":{"kind":"number"},"length":3}}}}"#;
+        let mut ep =
+            EventProcessor::new(admission_options(), 8, semantic_schema(envelope)).unwrap();
+        let mut output = vec![0u8; 64 * 1024];
+        assert_eq!(
+            ep.create_log_entry(
+                br#"[{"id":"a","type":"order","timestamp":1,"value":{"qty":3,"dims":[1,2.5,3]}}]"#,
+                InputFormat::Json,
+                &mut output
+            ),
+            ResultCode::Ok
+        );
+        assert_eq!(ep.plane.dynamic_columns.count, 1);
+
+        for (input, path, expected, observed) in [
+            (
+                &br#"[{"id":"a","type":"order","timestamp":1,"value":{"qty":11,"dims":[1,2,3]}}]"#
+                    [..],
+                "value.qty",
+                "safe integer in [1, 10]",
+                "number",
+            ),
+            (
+                &br#"[{"id":"a","type":"order","timestamp":1,"value":{"qty":2.5,"dims":[1,2,3]}}]"#
+                    [..],
+                "value.qty",
+                "safe integer in [1, 10]",
+                "number",
+            ),
+            (
+                &br#"[{"id":"a","type":"order","timestamp":1,"value":{"qty":3,"dims":[1,2]}}]"#[..],
+                "value.dims",
+                "array of length 3",
+                "array of length 2",
+            ),
+        ] {
+            let mut refused = vec![0xa5; 4096];
+            assert_eq!(
+                ep.create_log_entry(input, InputFormat::Json, &mut refused),
+                ResultCode::ParseError
+            );
+            let diagnostic = ep.payload_validation_diagnostic().unwrap();
+            assert_eq!(
+                (
+                    diagnostic.path.as_str(),
+                    diagnostic.expected.as_str(),
+                    diagnostic.observed.as_str(),
+                    diagnostic.vo,
+                ),
+                (path, expected, observed, None)
+            );
+            assert!(refused[32..].iter().all(|byte| *byte == 0xa5));
+            assert_eq!(
+                ep.plane.dynamic_columns.count, 1,
+                "the refused batch left no row"
+            );
+        }
     }
 }

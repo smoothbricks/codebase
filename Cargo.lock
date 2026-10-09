@@ -706,6 +706,7 @@ name = "columine-parsing"
 version = "0.0.1"
 dependencies = [
  "columine-arrow",
+ "columine-types",
  "proptest",
 ]
 

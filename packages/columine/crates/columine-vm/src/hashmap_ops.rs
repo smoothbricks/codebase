@@ -8,13 +8,15 @@
 //!
 //! Strategy and delta mode are runtime parameters. Calls that need VM-owned
 //! undo or TTL state go through the `hooks::VmHooks` boundary.
+//! Each accepted primitive publishes its size inside one prior-byte capture.
+//! Flags are included for direct callers; an enclosing VM boundary owns those
+//! bytes instead. TTL helpers never append a second logical journal.
 
 use crate::bytes;
-use crate::hash_table::{ENTRY_U32, FlatTable};
-use crate::hooks::{MutationRecord, VmHooks};
+use crate::hash_table::{ENTRY_U32, ErasePlan, FlatTable};
+use crate::hooks::{TtlMutation, VmHooks};
 use crate::meta::SlotMetaView;
-use crate::undo_log::FlatUndoOp;
-use columine_types::types::{ChangeFlag, ErrorCode};
+use columine_types::types::{ChangeFlag, ErrorCode, SlotMetaOffset};
 
 pub use columine_types::CmpType;
 
@@ -113,25 +115,6 @@ fn should_update(strategy: Strategy, new_cmp: u64, existing: u64, cmp_type: CmpT
     }
 }
 
-/// Flush size and change flags before an early return.
-#[inline(always)]
-fn flush(
-    state: &mut [u8],
-    meta: &SlotMetaView,
-    tbl: &FlatTable,
-    local_size: u32,
-    had_insert: bool,
-    had_update: bool,
-) {
-    tbl.set_size(state, local_size);
-    if had_insert {
-        meta.set_change_flag(state, ChangeFlag::INSERTED);
-    }
-    if had_update {
-        meta.set_change_flag(state, ChangeFlag::UPDATED);
-    }
-}
-
 /// Upsert a batch of keys and values. `cmp_col` is the raw comparison or TTL
 /// timestamp column (stride per `cmp_type`). It is required by comparison
 /// strategies and by TTL slots.
@@ -143,7 +126,7 @@ pub fn batch_map_upsert(
     delta_mode: bool,
     state: &mut [u8],
     meta: &SlotMetaView,
-    slot_idx: u32,
+    _slot_idx: u32,
     keys: &[u32],
     vals: &[u32],
     cmp_col: Option<&[u8]>,
@@ -163,8 +146,6 @@ pub fn batch_map_upsert(
     let tbl = bind_slot_map(meta);
     let mut local_size = tbl.size(state);
     let max_load = tbl.max_load();
-    let mut had_insert = false;
-    let mut had_update = false;
 
     for (i, (&key, &val)) in keys.iter().zip(vals).enumerate() {
         let i = i as u32;
@@ -183,132 +164,103 @@ pub fn batch_map_upsert(
             0
         };
 
-        if !probe.found {
-            // New key — check capacity before insertion.
-            if local_size >= max_load {
-                flush(state, meta, &tbl, local_size, had_insert, had_update);
-                return ErrorCode::CapacityExceeded;
-            }
-
-            if hooks.undo_enabled() {
-                // Flush size before appending so the undo log sees consistent
-                // state.
-                tbl.set_size(state, local_size);
-                hooks.append_mutation(
-                    delta_mode,
-                    state,
-                    MutationRecord {
-                        op: FlatUndoOp::MapInsert,
-                        slot: slot_idx,
-                        key,
-                        prev_value: 0,
-                        aux: 0,
-                    },
-                    MutationRecord {
-                        op: FlatUndoOp::MapDelete,
-                        slot: slot_idx,
-                        key,
-                        prev_value: val,
-                        aux: if stores_aux { new_cmp } else { 0 },
-                    },
-                );
-            }
-
-            tbl.set_key_at(state, probe.pos, key);
-            tbl.set_entry_u32_at(state, probe.pos, val);
-            if stores_aux {
-                write_cmp_slot(state, meta, probe.pos, new_cmp);
-            }
-            local_size += 1;
-            had_insert = true;
-
-            if meta.has_ttl() {
-                let ttl_result =
-                    hooks.insert_with_ttl(state, meta, key, cmp_to_f64(new_cmp, cmp_type));
-                if ttl_result != ErrorCode::Ok {
-                    flush(state, meta, &tbl, local_size, had_insert, had_update);
-                    return ttl_result;
-                }
-            }
+        if !probe.found && local_size >= max_load {
+            return ErrorCode::CapacityExceeded;
+        }
+        if probe.found
+            && !should_update(
+                strategy,
+                new_cmp,
+                if stores_aux {
+                    read_cmp_slot(state, meta, probe.pos)
+                } else {
+                    0
+                },
+                cmp_type,
+            )
+        {
             continue;
         }
 
-        // Existing key — apply the selected strategy.
-        let pos = probe.pos;
-        if should_update(
-            strategy,
-            new_cmp,
+        let ttl_plan = if meta.has_ttl() {
+            match hooks.plan_ttl_batch(
+                state,
+                meta,
+                core::iter::once(TtlMutation::Upsert {
+                    key,
+                    timestamp: cmp_to_f64(new_cmp, cmp_type),
+                    mapped_value: val,
+                }),
+            ) {
+                Ok(plan) => Some(plan),
+                Err(error) => return error,
+            }
+        } else {
+            None
+        };
+        let ttl = ttl_plan.as_ref().map_or(&[(0, 0); 2], |plan| plan.ranges());
+        let ranges = [
+            (
+                tbl.keys_off + probe.pos * 4,
+                if probe.found { 0 } else { 4 },
+            ),
+            (tbl.entries_off + probe.pos * 4, 4),
             if stores_aux {
-                read_cmp_slot(state, meta, pos)
+                (cmp_lane_off(meta) + probe.pos * 8, 8)
             } else {
-                0
+                (0, 0)
             },
-            cmp_type,
-        ) {
-            if hooks.undo_enabled() {
-                tbl.set_size(state, local_size);
-                let prev_cmp = if stores_aux {
-                    read_cmp_slot(state, meta, pos)
-                } else {
-                    0
-                };
-                hooks.append_mutation(
-                    delta_mode,
-                    state,
-                    MutationRecord {
-                        op: FlatUndoOp::MapUpdate,
-                        slot: slot_idx,
-                        key,
-                        prev_value: tbl.entry_u32_at(state, pos),
-                        aux: prev_cmp,
-                    },
-                    MutationRecord {
-                        op: FlatUndoOp::MapUpdate,
-                        slot: slot_idx,
-                        key,
-                        prev_value: val,
-                        aux: if stores_aux { new_cmp } else { 0 },
-                    },
-                );
-            }
-            tbl.set_entry_u32_at(state, pos, val);
-            if stores_aux {
-                write_cmp_slot(state, meta, pos, new_cmp);
-            }
-            had_update = true;
-
-            if meta.has_ttl() {
-                let ttl_result =
-                    hooks.insert_with_ttl(state, meta, key, cmp_to_f64(new_cmp, cmp_type));
-                if ttl_result != ErrorCode::Ok {
-                    flush(state, meta, &tbl, local_size, had_insert, had_update);
-                    return ttl_result;
-                }
-            }
+            (tbl.size_off, if probe.found { 0 } else { 4 }),
+            (meta.meta_base + SlotMetaOffset::CHANGE_FLAGS, 1),
+            ttl[0],
+            ttl[1],
+        ];
+        let capture = match hooks.begin_capture(state, &ranges) {
+            Ok(capture) => capture,
+            Err(error) => return error,
+        };
+        if !probe.found {
+            tbl.set_key_at(state, probe.pos, key);
+            local_size += 1;
+            tbl.set_size(state, local_size);
         }
+        tbl.set_entry_u32_at(state, probe.pos, val);
+        if stores_aux {
+            write_cmp_slot(state, meta, probe.pos, new_cmp);
+        }
+        meta.set_change_flag(
+            state,
+            if probe.found {
+                ChangeFlag::UPDATED
+            } else {
+                ChangeFlag::INSERTED
+            },
+        );
+        if let Some(plan) = ttl_plan {
+            hooks.consume_ttl_batch_plan(state, meta, plan);
+        }
+        hooks.finish_capture(delta_mode, state, &ranges, capture);
     }
-
-    flush(state, meta, &tbl, local_size, had_insert, had_update);
     ErrorCode::Ok
 }
 
-/// Compact a map cell and its optional comparison/timestamp side lane. The
-/// caller already resolved the cell and owns size/change-flag publication.
-pub(crate) fn erase_slot_map_at(
+/// Apply the retained key/value/aux erase inside a caller-owned capture.
+/// TTL, size and flags remain with that caller (including the eviction path).
+pub(crate) fn erase_slot_map_planned(
     state: &mut [u8],
     meta: &SlotMetaView,
     table: &FlatTable,
-    pos: u32,
+    plan: &ErasePlan,
 ) {
     let has_timestamps = meta.has_hashmap_timestamp_storage();
-    let hole = table.erase_at(state, pos, |state, from, to| {
+    let tail = table.erase_planned(state, plan, |state, from, to| {
         if has_timestamps {
             let value = read_cmp_slot(state, meta, from);
             write_cmp_slot(state, meta, to, value);
         }
     });
     if has_timestamps {
-        write_cmp_slot(state, meta, hole, 0);
+        write_cmp_slot(state, meta, tail, 0);
     }
 }
 
@@ -317,64 +269,82 @@ pub fn batch_map_remove(
     delta_mode: bool,
     state: &mut [u8],
     meta: &SlotMetaView,
-    slot_idx: u32,
+    _slot_idx: u32,
     keys: &[u32],
     hooks: &mut impl VmHooks,
-) {
-    let tbl = bind_slot_map(meta);
+) -> ErrorCode {
+    let tbl = match FlatTable::checked_bind_external(
+        state,
+        meta.offset,
+        meta.capacity,
+        meta.meta_base + SlotMetaOffset::SIZE,
+        ENTRY_U32,
+    ) {
+        Ok(table) => table,
+        Err(error) => return error,
+    };
     let has_ts = meta.has_hashmap_timestamp_storage();
-    let mut had_remove = false;
-
-    for &key in keys {
-        let Some(pos) = tbl.find(state, key) else {
-            continue;
-        };
-
-        if hooks.undo_enabled() {
-            let prev_aux = if meta.has_ttl() {
-                hooks
-                    .latest_eviction_ts(state, meta, key)
-                    .unwrap_or_else(|| {
-                        columine_types::die!("live TTL map key is missing its eviction entry")
-                    })
-                    .to_bits()
-            } else if has_ts {
-                read_cmp_slot(state, meta, pos)
-            } else {
-                0
+    let side_end = tbl
+        .cap
+        .checked_mul(if has_ts { 12 } else { 4 })
+        .and_then(|len| tbl.entries_off.checked_add(len));
+    let flag_end = meta.meta_base.checked_add(SlotMetaOffset::CHANGE_FLAGS + 1);
+    if side_end.is_none_or(|end| end as usize > state.len())
+        || flag_end.is_none_or(|end| end as usize > state.len())
+    {
+        return ErrorCode::InvalidState;
+    }
+    let mut scratch = hooks.take_erase_scratch();
+    let result = (|| {
+        let plan = &mut scratch.plan;
+        let ranges = &mut scratch.ranges;
+        for &key in keys {
+            let Some(pos) = tbl.find(state, key) else {
+                continue;
             };
-            hooks.append_mutation(
-                delta_mode,
-                state,
-                MutationRecord {
-                    op: FlatUndoOp::MapDelete,
-                    slot: slot_idx,
-                    key,
-                    prev_value: tbl.entry_u32_at(state, pos),
-                    aux: prev_aux,
-                },
-                MutationRecord {
-                    op: FlatUndoOp::MapInsert,
-                    slot: slot_idx,
-                    key,
-                    prev_value: 0,
-                    aux: 0,
-                },
-            );
-        }
-        if meta.has_ttl() {
-            hooks.remove_ttl_entries_for_key(state, meta, key);
-        }
 
-        erase_slot_map_at(state, meta, &tbl, pos);
-        let size = tbl.size(state);
-        tbl.set_size(state, size - 1);
-        had_remove = true;
-    }
-
-    if had_remove {
-        meta.set_change_flag(state, ChangeFlag::REMOVED);
-    }
+            tbl.plan_erase_at(state, pos, plan);
+            ranges.clear();
+            tbl.erase_ranges(plan, ranges);
+            if has_ts {
+                plan.for_each_destination_run(|start, len| {
+                    ranges.push((cmp_lane_off(meta) + start * 8, len * 8));
+                });
+            }
+            ranges.push((tbl.size_off, 4));
+            ranges.push((meta.meta_base + SlotMetaOffset::CHANGE_FLAGS, 1));
+            let ttl_plan = if meta.has_ttl() {
+                match hooks.plan_ttl_batch(
+                    state,
+                    meta,
+                    core::iter::once(TtlMutation::Remove { key }),
+                ) {
+                    Ok(plan) => Some(plan),
+                    Err(error) => return error,
+                }
+            } else {
+                None
+            };
+            if let Some(plan) = &ttl_plan {
+                ranges.extend_from_slice(plan.ranges());
+            }
+            let capture = match hooks.begin_capture(state, ranges) {
+                Ok(capture) => capture,
+                Err(error) => return error,
+            };
+            erase_slot_map_planned(state, meta, &tbl, plan);
+            let size = tbl.size(state);
+            tbl.set_size(state, size - 1);
+            meta.set_change_flag(state, ChangeFlag::REMOVED);
+            if let Some(plan) = ttl_plan {
+                hooks.consume_ttl_batch_plan(state, meta, plan);
+            }
+            hooks.finish_capture(delta_mode, state, ranges, capture);
+        }
+        ErrorCode::Ok
+    })();
+    hooks.restore_erase_scratch(scratch);
+    result
 }
 
 /// Upsert one key/value pair for the per-element dispatch.
@@ -409,6 +379,6 @@ pub fn single_map_remove(
     slot_idx: u32,
     key: u32,
     hooks: &mut impl VmHooks,
-) {
-    batch_map_remove(delta_mode, state, meta, slot_idx, &[key], hooks);
+) -> ErrorCode {
+    batch_map_remove(delta_mode, state, meta, slot_idx, &[key], hooks)
 }

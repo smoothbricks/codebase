@@ -8,7 +8,7 @@ use columine_vm::state_init::{
     calculate_grown_state_size, calculate_state_size, grow_state, init_state,
 };
 use columine_vm::struct_map::{StructMap2Slot, StructMapSlot};
-use columine_vm::vm::{Vm, i64s_as_bytes, u32s_as_bytes, vm_struct_map2_get_row_ptr};
+use columine_vm::vm::{CheckedStructMap2, Vm, i64s_as_bytes, u32s_as_bytes};
 
 const ADD: u32 = 0xadd0_0001;
 const REVOKE: u32 = 0xadd0_0002;
@@ -52,7 +52,8 @@ fn init(program: &[u8]) -> Vec<u8> {
     let size = calculate_state_size(
         program,
         columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
-    );
+    )
+    .expect("valid program admission");
     assert!(size > 0);
     let mut state = vec![0u8; size as usize];
     init_state(
@@ -112,17 +113,9 @@ fn for_each(type_id: u32, body: &[u8]) -> Vec<u8> {
 }
 
 fn pair_row(state: &[u8], key1: u32, key2: u32) -> Option<u32> {
-    let slot = StructMap2Slot::bind(state, 0);
-    let row = vm_struct_map2_get_row_ptr(
-        state,
-        slot.slot_offset,
-        slot.capacity,
-        u32::from(slot.num_fields),
-        slot.row_size,
-        key1,
-        key2,
-    );
-    (row != u32::MAX).then_some(row)
+    CheckedStructMap2::bind(state, 0)
+        .expect("valid composite slot")
+        .row(key1, key2)
 }
 
 fn permission(state: &[u8], principal: u32, resource: u32) -> Option<(u32, u32)> {
@@ -325,7 +318,7 @@ fn growth_rehash_preserves_same_first_lane_pairs_and_checkpoint_forks() {
     );
 
     let old_capacity = StructMap2Slot::bind(&state, 0).capacity;
-    let grown_size = calculate_grown_state_size(&state, 0);
+    let grown_size = calculate_grown_state_size(&state, 0).expect("valid growth geometry");
     let mut grown = vec![0u8; grown_size as usize];
     grow_state(&state, &mut grown, 0).unwrap();
     assert_eq!(StructMap2Slot::bind(&grown, 0).capacity, old_capacity * 2);
@@ -356,7 +349,7 @@ fn rollback_restores_update_remove_and_rejected_batch() {
         execute_u32(&mut vm, &mut state, &program, &[&[9], &[1], &[10]], true)
     );
 
-    vm.undo_enable(&state);
+    vm.undo_enable(&state).expect("valid inactive window");
     let checkpoint = vm.undo_checkpoint();
     assert_eq!(
         OK,
@@ -367,7 +360,8 @@ fn rollback_restores_update_remove_and_rejected_batch() {
         OK,
         execute_u32(&mut vm, &mut state, &remove_program, &[&[9], &[1]], true)
     );
-    vm.undo_rollback(&mut state, checkpoint);
+    vm.undo_rollback(&mut state, checkpoint)
+        .expect("valid checkpoint");
     let slot = StructMap2Slot::bind(&state, 0);
     let row = pair_row(&state, 9, 1).unwrap();
     assert_eq!(
@@ -377,7 +371,8 @@ fn rollback_restores_update_remove_and_rejected_batch() {
     assert_eq!(slot.size(&state), 1);
     assert_eq!(slot.capacity, 16);
 
-    vm.undo_enable(&state);
+    vm.undo_commit();
+    vm.undo_enable(&state).expect("valid inactive window");
     let checkpoint = vm.undo_checkpoint();
     let first = vec![9u32; 12];
     let second: Vec<u32> = (1..=12).collect();
@@ -392,7 +387,8 @@ fn rollback_restores_update_remove_and_rejected_batch() {
             true
         )
     );
-    vm.undo_rollback(&mut state, checkpoint);
+    vm.undo_rollback(&mut state, checkpoint)
+        .expect("valid checkpoint");
     let slot = StructMap2Slot::bind(&state, 0);
     let row = pair_row(&state, 9, 1).unwrap();
     assert_eq!(
@@ -521,7 +517,7 @@ fn max_i64x2_uses_strict_signed_lexicographic_order_without_noop_undo() {
     );
     assert_eq!(max_winner(&state, 7, 41), Some((70, -1, i64::MAX)));
 
-    vm.undo_enable(&state);
+    vm.undo_enable(&state).expect("valid inactive window");
     let before_noops = vm.undo_checkpoint();
     let change_flags_offset = (STATE_HEADER_SIZE + SlotMetaOffset::CHANGE_FLAGS) as usize;
     state[change_flags_offset] = 0;
@@ -564,7 +560,8 @@ fn max_i64x2_uses_strict_signed_lexicographic_order_without_noop_undo() {
     assert!(vm.undo_checkpoint() > before_noops);
     assert_ne!(state[change_flags_offset] & 0x02, 0);
     assert_eq!(max_winner(&state, 7, 40), Some((100, i64::MAX, i64::MAX)));
-    vm.undo_rollback(&mut state, before_noops);
+    vm.undo_rollback(&mut state, before_noops)
+        .expect("valid checkpoint");
     assert_eq!(max_winner(&state, 7, 40), Some((50, i64::MAX, i64::MIN)));
 
     let checkpoint = state.clone();
@@ -639,7 +636,7 @@ fn max_i64x2_rejected_batch_rolls_back_and_growth_rehashes_collisions() {
         )
     );
 
-    vm.undo_enable(&state);
+    vm.undo_enable(&state).expect("valid inactive window");
     let checkpoint = vm.undo_checkpoint();
     let key1 = vec![9; 12];
     let key2: Vec<u32> = (1..=12).collect();
@@ -662,7 +659,8 @@ fn max_i64x2_rejected_batch_rolls_back_and_growth_rehashes_collisions() {
             true,
         )
     );
-    vm.undo_rollback(&mut state, checkpoint);
+    vm.undo_rollback(&mut state, checkpoint)
+        .expect("valid checkpoint");
     assert_eq!(max_winner(&state, 9, 1), Some((10, 1, 1)));
     for second in 2..=12 {
         assert!(pair_row(&state, 9, second).is_none());
@@ -699,7 +697,7 @@ fn max_i64x2_rejected_batch_rolls_back_and_growth_rehashes_collisions() {
         )
     );
     let old_capacity = StructMap2Slot::bind(&state, 0).capacity;
-    let grown_size = calculate_grown_state_size(&state, 0);
+    let grown_size = calculate_grown_state_size(&state, 0).expect("valid growth geometry");
     let mut grown = vec![0; grown_size as usize];
     grow_state(&state, &mut grown, 0).unwrap();
     assert_eq!(StructMap2Slot::bind(&grown, 0).capacity, old_capacity * 2);

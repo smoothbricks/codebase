@@ -4,9 +4,8 @@
 //! [`Vm`] owns [`UndoState`] and [`bitmap_ops::BitmapEnv`]. Bindings keep one
 //! long-lived instance per module instance.
 //!
-//! Overflow snapshots use exact-size allocations for every state size, so
-//! mutations remain recoverable after overflow without a wasm-specific size
-//! cap.
+//! Mutations reserve bounded physical before-byte records before writing.
+//! Budget refusal leaves the accepted prefix exact and rollbackable.
 //!
 //! The allocator handles temporary bitmap storage; no separate scratch reset
 //! step is observable at entrypoint boundaries.
@@ -14,24 +13,23 @@
 use crate::aggregates::{self, AggKind, TypeMask};
 use crate::bitmap_ops::{
     self, BitmapAlgebraOp, BitmapEnv, BitmapSource, batch_bitmap_add, batch_bitmap_algebra,
-    batch_bitmap_remove, bitmap_patch, bitmap_select, get_bitmap_storage,
+    batch_bitmap_remove, get_bitmap_storage,
 };
 use crate::bytes;
 use crate::hash_table;
 use crate::hashmap_ops::{self, CmpType, Strategy};
 use crate::hashset_ops;
-use crate::hooks::{MutationRecord, VmHooks};
+use crate::hooks::{ByteCapture, CaptureFrame, EraseScratch, VmHooks};
 use crate::meta::{SlotMetaView, slot_meta_base};
 use crate::nested;
 use crate::row_exprs::LiveColumns;
-use crate::state_init::{self, ARENA_HEADER_SIZE, EVICTION_ENTRY_SIZE, NEEDS_GROWTH_SLOT};
+use crate::state_init::{self, EVICTION_ENTRY_SIZE, NEEDS_GROWTH_SLOT};
 use crate::struct_map::{
-    StructMap2Slot, StructMapSlot, scalar_cell_encoded, scalar_cell_order_key, scalar_order_key,
+    ArenaRegion, StructMap2Slot, StructMapSlot, scalar_cell_encoded, scalar_cell_order_key,
+    scalar_order_key,
 };
-use crate::undo_log::{
-    self, FLAT_UNDO_ENTRY_SIZE, FlatUndoEntry, FlatUndoOp, SMF_BIT_SET, SMF_ROW_ABSENT,
-    SMR_ROW_ABSENT,
-};
+use crate::undo_log::{FLAT_UNDO_ENTRY_SIZE, FlatUndoEntry, FlatUndoOp};
+use bitmosaic::BitmosaicView;
 use columine_types::DEFAULT_ACCEPTED_PROGRAM_MAGICS;
 use columine_types::operand::Operands;
 
@@ -39,10 +37,10 @@ use crate::element_body::{
     BodyPlan, OperandRead, Skip, WideOperands, plan_element_body, walk_operands, widen_element_body,
 };
 use columine_types::types::{
-    AggType, ChangeFlag, DERIVED_FACT_TOMBSTONE_IDENTITY, EMPTY_KEY, ErrorCode,
-    MAX_GUARD_COMPONENTS, MAX_SCATTER_ROUTES, NO_PARENT_TS_COL, Opcode, ProgramHeader,
-    SLOT_META_SIZE, STATE_FORMAT_VERSION, STATE_MAGIC, SlotMetaOffset, SlotType, StateHeaderOffset,
-    StructFieldType, TOMBSTONE, align8, state_num_slots, struct_field_size,
+    AggType, ChangeFlag, EMPTY_KEY, ErrorCode, MAX_GUARD_COMPONENTS, MAX_SCATTER_ROUTES,
+    NO_PARENT_TS_COL, Opcode, ProgramHeader, SLOT_META_SIZE, STATE_FORMAT_VERSION, STATE_MAGIC,
+    SlotMetaOffset, SlotType, StateHeaderOffset, StructFieldType, TOMBSTONE, align8,
+    arena_elem_size, is_arena_field_type, state_num_slots, struct_field_size,
 };
 use core::sync::atomic::Ordering;
 
@@ -205,20 +203,6 @@ fn evict_copy(state: &mut [u8], base: u32, dst: u32, src: u32) {
 // TTL eviction operations
 // =============================================================================
 
-/// Find the sorted insertion position for an eviction timestamp.
-fn binary_search_eviction_pos(state: &[u8], base: u32, size: u32, timestamp: f64) -> u32 {
-    let (mut left, mut right) = (0u32, size);
-    while left < right {
-        let mid = left + (right - left) / 2;
-        if evict_ts(state, base, mid) < timestamp {
-            left = mid + 1;
-        } else {
-            right = mid;
-        }
-    }
-    left
-}
-
 /// Shift eviction entries left after removing an item.
 fn shift_eviction_left(state: &mut [u8], base: u32, count: u32, size: u32) {
     if count >= size {
@@ -227,35 +211,6 @@ fn shift_eviction_left(state: &mut [u8], base: u32, count: u32, size: u32) {
     for i in 0..size - count {
         evict_copy(state, base, i, i + count);
     }
-}
-
-/// Shift eviction entries right to make room at `pos`.
-fn shift_eviction_right(state: &mut [u8], base: u32, pos: u32, size: u32) {
-    if size == 0 {
-        return;
-    }
-    let mut i = size;
-    while i > pos {
-        evict_copy(state, base, i, i - 1);
-        i -= 1;
-    }
-}
-
-/// Remove all eviction entries for a key and return the removed count.
-fn remove_eviction_entries_for_key(state: &mut [u8], base: u32, size: u32, key: u32) -> u32 {
-    let mut write_idx = 0u32;
-    let mut removed = 0u32;
-    for read_idx in 0..size {
-        if evict_key(state, base, read_idx) == key {
-            removed += 1;
-            continue;
-        }
-        if write_idx != read_idx {
-            evict_copy(state, base, write_idx, read_idx);
-        }
-        write_idx += 1;
-    }
-    removed
 }
 
 /// Find the latest eviction timestamp for a key, if present.
@@ -272,250 +227,263 @@ pub fn find_latest_eviction_timestamp_for_key(
         .map(|i| evict_ts(state, base, i))
 }
 
-/// Remove all TTL eviction entries for a key.
-pub fn remove_ttl_entries_for_key(state: &mut [u8], meta: &SlotMetaView, key: u32) {
-    if !meta.has_ttl() {
-        return;
-    }
-    let base = meta.eviction_index_offset(state);
-    let size = meta.eviction_index_size(state);
-    let removed = remove_eviction_entries_for_key(state, base, size, key);
-    if removed > 0 {
-        meta.set_eviction_index_size(state, size - removed);
-    }
-}
-
-/// Restore a TTL entry during rollback. Failure means the entry no longer fits
-/// the capacity that was valid when it was captured.
-fn restore_ttl_entry(state: &mut [u8], meta: &SlotMetaView, key: u32, timestamp: f64) {
-    if !meta.has_ttl() {
-        return;
-    }
-    let result = insert_with_ttl(state, meta, key, timestamp);
-    debug_assert_eq!(result, ErrorCode::Ok);
-}
-
 /// Return whether an eviction entry is current (no newer entry for its key).
 fn is_eviction_entry_current(state: &[u8], base: u32, size: u32, entry_idx: u32, key: u32) -> bool {
     ((entry_idx + 1)..size).all(|i| evict_key(state, base, i) != key)
 }
 
-/// Insert a key/timestamp into the sorted eviction index, removing stale
-/// entries first. `CAPACITY_EXCEEDED` signals index growth.
-pub fn insert_with_ttl(
-    state: &mut [u8],
-    meta: &SlotMetaView,
-    key: u32,
-    timestamp: f64,
-) -> ErrorCode {
-    if !meta.has_ttl() {
-        return ErrorCode::Ok;
-    }
-
-    let base = meta.eviction_index_offset(state);
-    let size_initial = meta.eviction_index_size(state);
-    let removed = remove_eviction_entries_for_key(state, base, size_initial, key);
-    let size = size_initial - removed;
-    meta.set_eviction_index_size(state, size);
-
-    if size >= meta.eviction_index_capacity(state) {
-        return ErrorCode::CapacityExceeded;
-    }
-
-    let pos = binary_search_eviction_pos(state, base, size, timestamp);
-
-    // Snapshot the key's current mapped value in the eviction entry.
-    let entry_value = match meta.slot_type() {
-        SlotType::HashMap => {
-            let tbl = hashmap_ops::bind_slot_map(meta);
-            tbl.get_u32(state, key).unwrap_or(0)
-        }
-        SlotType::HashSet | SlotType::Bitmap => key,
-        _ => 0,
-    };
-
-    shift_eviction_right(state, base, pos, size);
-    evict_write(state, base, pos, timestamp, key, entry_value);
-    meta.set_eviction_index_size(state, size + 1);
-    ErrorCode::Ok
-}
-
-/// Clear the count of evicted entries.
-pub fn clear_evicted_buffer(state: &mut [u8], meta: &SlotMetaView) {
-    meta.set_evicted_count(state, 0);
-}
-
-/// Remove a key from its primary storage according to slot type.
+/// Remove only primary payload bytes. Metadata and TTL have one enclosing
+/// owner; each paid probe/patch plan is consumed once within that authority.
 fn remove_entry_by_key(
+    delta_mode: bool,
+    undo: &mut UndoState,
     env: &mut BitmapEnv,
     state: &mut [u8],
     meta: &SlotMetaView,
     key: u32,
-) -> bool {
-    match meta.slot_type() {
-        SlotType::HashMap => {
-            let tbl = hashmap_ops::bind_slot_map(meta);
-            match tbl.find(state, key) {
-                Some(pos) => {
-                    hashmap_ops::erase_slot_map_at(state, meta, &tbl, pos);
-                    true
-                }
-                None => false,
+) -> Result<bool, ErrorCode> {
+    let EraseScratch {
+        plan: mut erase,
+        mut ranges,
+    } = core::mem::take(&mut undo.erase_scratch);
+    ranges.clear();
+    let result = (|| match meta.slot_type() {
+        SlotType::HashMap | SlotType::HashSet => {
+            let table = if meta.slot_type() == SlotType::HashMap {
+                hashmap_ops::bind_slot_map(meta)
+            } else {
+                hashset_ops::bind_slot_set(meta)
+            };
+            let Some(position) = table.find(state, key) else {
+                return Ok(false);
+            };
+            table.plan_erase_at(state, position, &mut erase);
+            table.erase_ranges(&erase, &mut ranges);
+            if meta.has_hashmap_timestamp_storage() {
+                erase.for_each_destination_run(|start, len| {
+                    ranges.push((hashmap_ops::cmp_lane_off(meta) + start * 8, len * 8));
+                });
             }
-        }
-        SlotType::HashSet => {
-            let tbl = hashset_ops::bind_slot_set(meta);
-            match tbl.find(state, key) {
-                Some(pos) => {
-                    tbl.erase_at(state, pos, |_, _, _| {});
-                    true
-                }
-                None => false,
+            let capture = undo.begin_capture(state, &ranges)?;
+            if meta.slot_type() == SlotType::HashMap {
+                hashmap_ops::erase_slot_map_planned(state, meta, &table, &erase);
+            } else {
+                table.erase_planned(state, &erase, |_, _, _| {});
             }
+            undo.finish_capture(delta_mode, state, &ranges, capture);
+            Ok(true)
         }
         SlotType::Bitmap => {
             let storage = get_bitmap_storage(meta);
-            match bitmap_patch(env, state, storage, &[], &[key]) {
-                Ok(report) if report.removed == 1 => {
-                    meta.set_size(state, report.len as u32);
-                    true
+            let removes = [key];
+            let prepared = bitmap_ops::prepare_bitmap_patch(env, state, storage, &[], &removes)?;
+            let mut tail = prepared.cleared_tail_range();
+            for &(offset, len) in prepared.mutation_ranges() {
+                if let Some((tail_offset, tail_len)) = tail
+                    && tail_offset <= offset
+                {
+                    bitmap_ops::push_payload_capture_range(
+                        &mut ranges,
+                        storage.payload_offset(),
+                        tail_offset,
+                        tail_len,
+                    )?;
+                    tail = None;
                 }
-                _ => false,
+                bitmap_ops::push_payload_capture_range(
+                    &mut ranges,
+                    storage.payload_offset(),
+                    offset,
+                    len,
+                )?;
             }
+            if let Some((offset, len)) = tail {
+                bitmap_ops::push_payload_capture_range(
+                    &mut ranges,
+                    storage.payload_offset(),
+                    offset,
+                    len,
+                )?;
+            }
+            let capture = undo.begin_capture(prepared.state(), &ranges)?;
+            let (report, state) = prepared.apply_with_cleared_tail();
+            undo.finish_capture(delta_mode, state, &ranges, capture);
+            Ok(report.removed == 1)
         }
         SlotType::Array => {
-            // Array slots use key_or_idx as the array index.
-            let data = meta.offset;
-            if key < meta.capacity {
-                let k = bytes::read_u32(state, data + key * 4);
-                if k == EMPTY_KEY || k == TOMBSTONE {
-                    return false;
-                }
-                bytes::write_u32(state, data + key * 4, TOMBSTONE);
-                return true;
+            if key >= meta.capacity {
+                return Ok(false);
             }
-            false
+            let offset = meta
+                .offset
+                .checked_add(key.checked_mul(4).ok_or(ErrorCode::InvalidState)?)
+                .ok_or(ErrorCode::InvalidState)?;
+            if offset
+                .checked_add(4)
+                .is_none_or(|end| end as usize > state.len())
+            {
+                return Err(ErrorCode::InvalidState);
+            }
+            let current = bytes::read_u32(state, offset);
+            if current == EMPTY_KEY || current == TOMBSTONE {
+                return Ok(false);
+            }
+            ranges.push((offset, 4));
+            let capture = undo.begin_capture(state, &ranges)?;
+            bytes::write_u32(state, offset, TOMBSTONE);
+            undo.finish_capture(delta_mode, state, &ranges, capture);
+            Ok(true)
         }
         SlotType::ConditionTree => {
-            // Bump condition-tree lifecycle generation and record the removed
-            // key.
-            let off = meta.offset;
-            let generation = bytes::read_u32(state, off).wrapping_add(1);
-            bytes::write_u32(state, off, generation);
-            bytes::write_u32(state, off + 4, key);
-            true
+            ranges.push((meta.offset, 8));
+            let capture = undo.begin_capture(state, &ranges)?;
+            let generation = bytes::read_u32(state, meta.offset).wrapping_add(1);
+            bytes::write_u32(state, meta.offset, generation);
+            bytes::write_u32(state, meta.offset + 4, key);
+            undo.finish_capture(delta_mode, state, &ranges, capture);
+            Ok(true)
         }
-        // These slot types have no per-entry TTL removal.
         SlotType::Aggregate
         | SlotType::StructMap
         | SlotType::StructMap2
         | SlotType::OrderedList
         | SlotType::Scalar
-        | SlotType::Nested => false,
-    }
+        | SlotType::Nested => Ok(false),
+    })();
+    undo.erase_scratch = EraseScratch {
+        plan: erase,
+        ranges,
+    };
+    result
 }
 
-/// Evict every entry older than the slot's cutoff.
-//#region eviction-index-expired
-pub fn evict_expired(
+/// TTL metadata, index shifts and trigger destinations have one outer owner.
+/// A refusing payload write is never applied; this owner still closes the
+/// exact accepted prefix, including its processed-index compaction.
+pub(crate) fn evict_expired(
+    delta_mode: bool,
     undo: &mut UndoState,
     env: &mut BitmapEnv,
     state: &mut [u8],
     meta: &SlotMetaView,
-    slot_idx: u32,
     now: f64,
-) -> u32 {
+) -> Result<u32, ErrorCode> {
     if !meta.has_ttl() {
-        return 0;
+        return Ok(0);
     }
-
+    if !matches!(
+        meta.slot_type(),
+        SlotType::HashMap | SlotType::HashSet | SlotType::Bitmap
+    ) {
+        return Err(ErrorCode::InvalidState);
+    }
+    crate::hooks::ttl_capture_ranges(state, meta, 0)?;
     let cutoff = meta.cutoff(state, now);
     let base = meta.eviction_index_offset(state);
-    let eviction_size = meta.eviction_index_size(state);
-
+    let initial = meta.eviction_index_size(state);
+    let mut expired = 0u32;
+    while expired < initial
+        && !matches!(
+            evict_ts(state, base, expired).partial_cmp(&cutoff),
+            Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal),
+        )
+    {
+        expired += 1;
+    }
+    // A budget refusal may end this operation at any processed prefix. The
+    // maximum actual left-shift destination is the live prefix minus one,
+    // never allocated capacity or the already-dead tail.
+    let shift_len = if expired == 0 {
+        0
+    } else {
+        (initial - 1)
+            .checked_mul(EVICTION_ENTRY_SIZE)
+            .ok_or(ErrorCode::InvalidState)?
+    };
+    let buffer_len = if meta.has_evict_trigger() {
+        expired
+            .min(state_init::EVICTED_BUFFER_CAP)
+            .checked_mul(EVICTION_ENTRY_SIZE)
+            .ok_or(ErrorCode::InvalidState)?
+    } else {
+        0
+    };
+    let ranges = [
+        (
+            meta.meta_base + SlotMetaOffset::SIZE,
+            if expired == 0 { 0 } else { 4 },
+        ),
+        (
+            meta.meta_base + SlotMetaOffset::CHANGE_FLAGS,
+            if expired == 0 { 0 } else { 1 },
+        ),
+        (
+            meta.meta_base + SlotMetaOffset::EVICTION_INDEX_SIZE,
+            if expired == 0 { 0 } else { 4 },
+        ),
+        (meta.meta_base + SlotMetaOffset::EVICTED_COUNT, 4),
+        (base, shift_len),
+        (
+            if buffer_len == 0 {
+                0
+            } else {
+                meta.evicted_buffer_offset(state)
+            },
+            buffer_len,
+        ),
+    ];
+    let capture = undo.begin_capture(state, &ranges)?;
+    undo.prepare_redo(delta_mode);
+    meta.set_evicted_count(state, 0);
     let mut processed = 0u32;
-    let mut removed_count = 0u32;
-
-    while processed < eviction_size {
-        let entry_ts = evict_ts(state, base, processed);
-        if entry_ts >= cutoff {
-            break;
-        }
-        let entry_key = evict_key(state, base, processed);
-        let entry_value = evict_value(state, base, processed);
-
-        if !is_eviction_entry_current(state, base, eviction_size, processed, entry_key) {
+    let mut removed = 0u32;
+    let mut error = None;
+    while processed < expired {
+        let key = evict_key(state, base, processed);
+        if !is_eviction_entry_current(state, base, initial, processed, key) {
             processed += 1;
             continue;
         }
-
-        // Journal evictions in the undo-only lane: they have no meaningful
-        // forward replay, so the redo lane is an explicit zeroed no-op marker.
-        if undo.enabled {
-            match meta.slot_type() {
-                SlotType::HashMap => {
-                    let tbl = hashmap_ops::bind_slot_map(meta);
-                    if let Some(idx) = tbl.find(state, entry_key) {
-                        let value = tbl.entry_u32_at(state, idx);
-                        // Timestamp lane lives after keys+values (cap*8).
-                        let ts = bytes::read_f64(state, meta.offset + meta.capacity * 8 + idx * 8);
-                        undo.append_undo_only_snapshot(
-                            state,
-                            FlatUndoEntry {
-                                op: FlatUndoOp::MapDelete,
-                                slot: slot_idx,
-                                pad1: 0,
-                                pad2: 0,
-                                key: entry_key,
-                                prev_value: value,
-                                aux: ts.to_bits(),
-                            },
-                        );
-                    }
+        if meta.has_evict_trigger() && removed == state_init::EVICTED_BUFFER_CAP {
+            error = Some(ErrorCode::CapacityExceeded);
+            break;
+        }
+        match remove_entry_by_key(delta_mode, undo, env, state, meta, key) {
+            Ok(true) => {
+                if meta.has_evict_trigger() {
+                    let buffer = meta.evicted_buffer_offset(state);
+                    let timestamp = evict_ts(state, base, processed);
+                    let value = evict_value(state, base, processed);
+                    evict_write(state, buffer, removed, timestamp, key, value);
+                    meta.set_evicted_count(state, removed + 1);
                 }
-                SlotType::HashSet | SlotType::Bitmap => {
-                    undo.append_undo_only_snapshot(
-                        state,
-                        FlatUndoEntry {
-                            op: FlatUndoOp::SetDelete,
-                            slot: slot_idx,
-                            pad1: 0,
-                            pad2: 0,
-                            key: entry_key,
-                            prev_value: 0,
-                            aux: entry_ts.to_bits(),
-                        },
-                    );
-                }
-                _ => {}
+                removed += 1;
+            }
+            Ok(false) => {}
+            Err(failure) => {
+                error = Some(failure);
+                break;
             }
         }
-
-        if remove_entry_by_key(env, state, meta, entry_key) {
-            if meta.has_evict_trigger() {
-                let buf = meta.evicted_buffer_offset(state);
-                let evicted_count = meta.evicted_count(state);
-                evict_write(state, buf, evicted_count, entry_ts, entry_key, entry_value);
-                meta.set_evicted_count(state, evicted_count + 1);
-            }
-            removed_count += 1;
-        }
-
         processed += 1;
     }
-
-    if processed > 0 {
-        shift_eviction_left(state, base, processed, eviction_size);
-        meta.set_eviction_index_size(state, eviction_size - processed);
-
-        if removed_count > 0 {
-            let size = meta.size(state);
-            meta.set_size(state, size - removed_count);
+    if processed != 0 {
+        shift_eviction_left(state, base, processed, initial);
+        meta.set_eviction_index_size(state, initial - processed);
+    }
+    if removed != 0 {
+        if let Some(size) = meta.size(state).checked_sub(removed) {
+            meta.set_size(state, size);
             meta.set_change_flag(state, ChangeFlag::EVICTED);
+        } else {
+            error = Some(ErrorCode::InvalidState);
         }
     }
-
-    removed_count
+    undo.finish_capture(delta_mode, state, &ranges, capture);
+    match error {
+        Some(error) => Err(error),
+        None => Ok(removed),
+    }
 }
 //#endregion vm-architecture-ttl.evict
 
@@ -570,45 +538,45 @@ pub fn write_derived_facts_header(
 /// Maximum number of undo entries retained in memory.
 pub const UNDO_CAPACITY: u32 = 16384;
 
-/// Owned undo/delta state for one VM instance.
-#[derive(Debug, Default)]
-pub struct UndoState {
-    /// `g_undo_entries[0..g_undo_count]`.
-    entries: Vec<FlatUndoEntry>,
-    /// Parallel redo lane. Undo-only appends store explicit zeroed no-op
-    /// markers, which rollforward skips to keep exported segments deterministic.
-    redo: Vec<FlatUndoEntry>,
-    /// `g_delta_count` — pairs are valid up to here.
-    delta_count: u32,
-    pub overflow: bool,
+/// Read-only lifecycle witness for the scenario lane, not record authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RedoLaneStatus {
+    pub active: bool,
+    pub entries: usize,
+    pub capacity: usize,
+}
+
+/// Read-only journal facts. Mutation authority remains with the owning VM.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UndoStatus {
     pub enabled: bool,
-    /// `g_undo_shadow_*` — exact-size snapshot taken at first overflow.
-    shadow: Option<Vec<u8>>,
-    shadow_active: bool,
-    /// `g_undo_overflow_entry` (+ redo lane) — the entry that hit the wall.
-    overflow_entry: Option<(FlatUndoEntry, FlatUndoEntry)>,
-    /// `g_undo_state_size` — size registered at `vm_undo_enable`.
-    pub state_size: u32,
-    /// Each slot's change flags, then the derived-facts flag, saved for
-    /// restoration after rollback; empty when nothing is saved.
+    pub overflow: bool,
+    pub checkpoint: u32,
+    pub delta_count: u32,
+}
+
+/// Owned, bounded physical undo/delta state for one VM instance.
+#[derive(Debug, Default)]
+pub(crate) struct UndoState {
+    entries: Vec<FlatUndoEntry>,
+    redo: Vec<Option<FlatUndoEntry>>,
+    redo_active: bool,
+    delta_count: u32,
+    overflow: bool,
+    enabled: bool,
+    state_size: u32,
     saved_change_flags: Vec<u8>,
-    /// `g_delta_export_*`.
+    reserved_entries: u32,
+    capture_depth: u32,
+    generation: u64,
     export_start: u32,
     export_count: u32,
     export_overflow: bool,
-    /// Reused pre-mutation bytes for post-mutation paired diff journaling.
     capture_scratch: Vec<u8>,
+    capture_ranges: Vec<(u32, u32)>,
+    ttl_batch_scratch: TtlBatchScratch,
+    erase_scratch: EraseScratch,
 }
-
-const ZERO_ENTRY: FlatUndoEntry = FlatUndoEntry {
-    op: FlatUndoOp::MapInsert, // placeholder discriminant; never read (see redo lane note)
-    slot: 0,
-    pad1: 0,
-    pad2: 0,
-    key: 0,
-    prev_value: 0,
-    aux: 0,
-};
 
 impl UndoState {
     pub fn count(&self) -> u32 {
@@ -619,148 +587,265 @@ impl UndoState {
         self.delta_count
     }
 
-    fn snapshot(&mut self, state: &[u8]) {
-        let size = self.state_size as usize;
-        debug_assert!(
-            state.len() >= size,
-            "undo state shrank since vm_undo_enable"
+    fn reserve_entries(&mut self, count: u32) -> Result<(), ErrorCode> {
+        if self.overflow {
+            return Err(ErrorCode::JournalOverflow);
+        }
+        if self
+            .count()
+            .checked_add(self.reserved_entries)
+            .and_then(|total| total.checked_add(count))
+            .is_none_or(|total| total > UNDO_CAPACITY)
+        {
+            self.overflow = true;
+            return Err(ErrorCode::JournalOverflow);
+        }
+        self.reserved_entries += count;
+        Ok(())
+    }
+
+    /// Admit scenario storage before its first writer. Pure production windows
+    /// allocate and write no redo buffer.
+    fn prepare_redo(&mut self, delta_mode: bool) {
+        if !self.enabled || !delta_mode || self.redo_active {
+            return;
+        }
+        debug_assert!(self.redo.is_empty());
+        self.redo.reserve(UNDO_CAPACITY as usize);
+        self.redo.resize(self.entries.len(), None);
+        self.redo_active = true;
+    }
+
+    fn push_reserved(&mut self, undo: FlatUndoEntry, redo: Option<FlatUndoEntry>) {
+        assert!(
+            self.entries.len() < UNDO_CAPACITY as usize,
+            "physical journal reservation lost"
         );
-        self.shadow = Some(state[..size].to_vec());
-        self.shadow_active = true;
-    }
-
-    /// Append a derived-fact journal entry through the undo-only lane. The
-    /// consumer RETE crate checks `enabled` before calling this extension.
-    pub fn append_undo_only(&mut self, state: &[u8], entry: FlatUndoEntry) {
-        self.append_undo_only_snapshot(state, entry);
-    }
-
-    /// Append a paired before/after mutation through the same bounded journal
-    /// and first-overflow snapshot path as VM-owned delta mutations.
-    ///
-    /// The derived-fact VM uses this public seam because its RETE execution
-    /// lives in a sibling crate while the journal remains owned here.
-    pub fn append_pair(
-        &mut self,
-        state: &[u8],
-        undo_entry: FlatUndoEntry,
-        redo_entry: FlatUndoEntry,
-    ) {
-        self.append_pair_snapshot(state, undo_entry, redo_entry);
-    }
-
-    /// Append an undo-only entry for non-delta batches and evictions.
-    fn append_undo_only_snapshot(&mut self, state: &[u8], entry: FlatUndoEntry) {
-        if self.count() < UNDO_CAPACITY {
-            self.entries.push(entry);
-            self.redo.push(ZERO_ENTRY);
-        } else if !self.overflow {
-            self.snapshot(state);
-            self.overflow_entry = Some((entry, ZERO_ENTRY));
-            self.overflow = true;
+        debug_assert!(
+            redo.is_none() || self.redo_active,
+            "paired lane must be admitted before writing"
+        );
+        self.entries.push(undo);
+        if self.redo_active {
+            debug_assert_eq!(self.redo.len() + 1, self.entries.len());
+            self.redo.push(redo);
         }
-        // Already overflowed: silently drop — the shadow covers it.
-    }
-
-    /// Append an undo/redo pair for a delta batch.
-    fn append_pair_snapshot(&mut self, state: &[u8], undo_e: FlatUndoEntry, redo_e: FlatUndoEntry) {
-        if self.count() < UNDO_CAPACITY {
-            self.entries.push(undo_e);
-            self.redo.push(redo_e);
+        if redo.is_some() {
             self.delta_count = self.count();
-        } else if !self.overflow {
-            self.snapshot(state);
-            self.overflow_entry = Some((undo_e, redo_e));
-            self.overflow = true;
         }
     }
 
-    /// Capture discontiguous state regions before a mutation whose exact byte
-    /// changes are only known afterward. Capacity is reserved up front so a
-    /// first overflow snapshots the true pre-mutation state, never post-state.
-    fn begin_state_capture(
+    fn boundary_flag(&self, offset: u32) -> bool {
+        if self.saved_change_flags.is_empty() {
+            return false;
+        }
+        if offset == StateHeaderOffset::DERIVED_FACTS_CHANGE_FLAG {
+            return true;
+        }
+        let first = columine_types::types::STATE_HEADER_SIZE + SlotMetaOffset::CHANGE_FLAGS;
+        offset.checked_sub(first).is_some_and(|relative| {
+            relative % SLOT_META_SIZE == 0
+                && (relative / SLOT_META_SIZE) < self.saved_change_flags.len() as u32 - 1
+        })
+    }
+
+    fn chunk_len(&self, offset: u32, remaining: u32) -> u32 {
+        let max = remaining.min(8);
+        (1..max)
+            .find(|relative| self.boundary_flag(offset + relative))
+            .unwrap_or(max)
+    }
+
+    /// Reserve all possible changed chunks before copying any before-bytes.
+    /// Frames are disjoint and LIFO; a child cannot overwrite a parent's scratch.
+    pub(crate) fn begin_capture(
         &mut self,
         state: &[u8],
         ranges: &[(u32, u32)],
-        additional_entries: u32,
-    ) -> bool {
-        if !self.enabled || self.overflow {
-            return false;
+    ) -> Result<ByteCapture, ErrorCode> {
+        let state_size = u32::try_from(state.len()).map_err(|_| ErrorCode::InvalidState)?;
+        if self.enabled && self.overflow {
+            return Err(ErrorCode::JournalOverflow);
         }
-        let max_entries = ranges
-            .iter()
-            .map(|(_, len)| len.div_ceil(8))
-            .sum::<u32>()
-            .saturating_add(additional_entries);
-        if self.count().saturating_add(max_entries) > UNDO_CAPACITY {
-            self.snapshot(state);
-            self.overflow_entry = None;
-            self.overflow = true;
-            return false;
+        if self.enabled && state_size != self.state_size {
+            return Err(ErrorCode::InvalidState);
         }
-
-        self.capture_scratch.clear();
-        let capture_len = ranges.iter().map(|(_, len)| *len as usize).sum();
-        self.capture_scratch.reserve(capture_len);
-        for &(offset, len) in ranges {
-            let start = offset as usize;
-            let end = start + len as usize;
-            self.capture_scratch.extend_from_slice(&state[start..end]);
-        }
-        true
-    }
-
-    /// Emit only changed 1..=8-byte chunks from a prior `begin_state_capture`.
-    fn finish_state_capture(&mut self, delta_mode: bool, state: &[u8], ranges: &[(u32, u32)]) {
-        let mut scratch_offset = 0usize;
-        for &(state_offset, len) in ranges {
-            let mut relative = 0u32;
-            while relative < len {
-                let chunk_len = (len - relative).min(8);
-                let before_start = scratch_offset + relative as usize;
-                let before_end = before_start + chunk_len as usize;
-                let after_start = (state_offset + relative) as usize;
-                let after_end = after_start + chunk_len as usize;
-                let before = &self.capture_scratch[before_start..before_end];
-                let after = &state[after_start..after_end];
-                if before != after {
-                    let undo_entry =
-                        state_bytes_entry(state_offset + relative, chunk_len as u8, before);
-                    let redo_entry =
-                        state_bytes_entry(state_offset + relative, chunk_len as u8, after);
-                    if delta_mode {
-                        self.append_pair_snapshot(state, undo_entry, redo_entry);
-                    } else {
-                        self.append_undo_only_snapshot(state, undo_entry);
-                    }
-                }
-                relative += chunk_len;
+        let mut count = 0u32;
+        for (index, &(offset, len)) in ranges.iter().enumerate() {
+            let end = offset.checked_add(len).ok_or(ErrorCode::InvalidState)?;
+            if end > state_size {
+                return Err(ErrorCode::InvalidState);
             }
-            scratch_offset += len as usize;
+            if len == 0 {
+                continue;
+            }
+            for &(other, size) in &ranges[..index] {
+                let other_end = other.checked_add(size).ok_or(ErrorCode::InvalidState)?;
+                if size != 0 && offset < other_end && other < end {
+                    return Err(ErrorCode::InvalidState);
+                }
+            }
+            for &(other, size) in &self.capture_ranges {
+                if offset < other + size && other < end {
+                    return Err(ErrorCode::InvalidState);
+                }
+            }
+            if !self.enabled {
+                continue;
+            }
+            let mut cursor = offset;
+            while cursor < end {
+                if self.boundary_flag(cursor) {
+                    cursor += 1;
+                } else {
+                    count = count.checked_add(1).ok_or(ErrorCode::InvalidState)?;
+                    cursor += self.chunk_len(cursor, end - cursor);
+                }
+            }
         }
-        self.capture_scratch.clear();
+        if !self.enabled {
+            return Ok(ByteCapture { frame: None });
+        }
+        self.reserve_entries(count)?;
+        let frame = CaptureFrame {
+            generation: self.generation,
+            owner: self.capture_scratch.as_ptr() as usize,
+            image: state.as_ptr() as usize,
+            depth: self.capture_depth,
+            scratch_start: self.capture_scratch.len(),
+            ranges_start: self.capture_ranges.len(),
+            entries: count,
+        };
+        self.capture_depth += 1;
+        for &(offset, len) in ranges {
+            let end = offset + len;
+            let mut cursor = offset;
+            while cursor < end {
+                if self.boundary_flag(cursor) {
+                    cursor += 1;
+                } else {
+                    let size = self.chunk_len(cursor, end - cursor);
+                    self.capture_ranges.push((cursor, size));
+                    self.capture_scratch
+                        .extend_from_slice(&state[cursor as usize..(cursor + size) as usize]);
+                    cursor += size;
+                }
+            }
+        }
+        Ok(ByteCapture { frame: Some(frame) })
     }
 
-    /// Save change flags for restoration after rollback.
-    fn save_change_flags(&mut self, state: &[u8]) {
-        self.saved_change_flags.clear();
+    /// Consume one physical authority. No budget decision is possible after write.
+    pub(crate) fn finish_capture(
+        &mut self,
+        delta_mode: bool,
+        state: &[u8],
+        ranges: &[(u32, u32)],
+        capture: ByteCapture,
+    ) {
+        let Some(frame) = capture.frame else {
+            return;
+        };
+        assert_eq!(
+            frame.generation, self.generation,
+            "capture belongs to another undo window"
+        );
+        assert_eq!(
+            frame.owner,
+            self.capture_scratch.as_ptr() as usize,
+            "capture belongs to another journal"
+        );
+        assert_eq!(
+            frame.image,
+            state.as_ptr() as usize,
+            "capture belongs to another state image"
+        );
+        assert_eq!(
+            frame.depth + 1,
+            self.capture_depth,
+            "capture must finish in LIFO order"
+        );
+        assert_eq!(
+            state.len(),
+            self.state_size as usize,
+            "captured image changed layout"
+        );
+        let mut scratch = frame.scratch_start;
+        for index in frame.ranges_start..self.capture_ranges.len() {
+            let (offset, len) = self.capture_ranges[index];
+            assert!(
+                ranges
+                    .iter()
+                    .any(|&(start, size)| offset >= start && offset + len <= start + size),
+                "capture finished with another range plan"
+            );
+            let before = &self.capture_scratch[scratch..scratch + len as usize];
+            let after = &state[offset as usize..(offset + len) as usize];
+            if before != after {
+                let undo = state_bytes_entry(offset, len as u8, before);
+                let redo = delta_mode.then(|| state_bytes_entry(offset, len as u8, after));
+                self.push_reserved(undo, redo);
+            }
+            scratch += len as usize;
+        }
+        self.capture_scratch.truncate(frame.scratch_start);
+        self.capture_ranges.truncate(frame.ranges_start);
+        self.reserved_entries -= frame.entries;
+        self.capture_depth -= 1;
+    }
+
+    fn open_change_flags(&mut self, state: &[u8]) -> Result<bool, ErrorCode> {
+        if !self.enabled {
+            return Ok(false);
+        }
+        if self.overflow {
+            return Err(ErrorCode::JournalOverflow);
+        }
+        if state.len() != self.state_size as usize
+            || state.len() < columine_types::types::STATE_HEADER_SIZE as usize
+        {
+            return Err(ErrorCode::InvalidState);
+        }
+        if !self.saved_change_flags.is_empty() {
+            return Ok(false);
+        }
+        let slots = state_num_slots(state);
+        let end = slots
+            .checked_mul(SLOT_META_SIZE)
+            .and_then(|len| len.checked_add(columine_types::types::STATE_HEADER_SIZE))
+            .ok_or(ErrorCode::InvalidState)?;
+        if end as usize > state.len() {
+            return Err(ErrorCode::InvalidState);
+        }
+        let count = slots.checked_add(1).ok_or(ErrorCode::InvalidState)?;
+        self.reserve_entries(count)?;
         self.saved_change_flags.extend(
-            (0..state_num_slots(state))
+            (0..slots)
                 .map(|slot| state[(slot_meta_base(slot) + SlotMetaOffset::CHANGE_FLAGS) as usize]),
         );
         self.saved_change_flags
             .push(state[StateHeaderOffset::DERIVED_FACTS_CHANGE_FLAG as usize]);
+        Ok(true)
     }
 
-    /// Restore change flags saved before rollback.
-    fn restore_change_flags(&self, state: &mut [u8]) {
-        let Some((&derived, slots)) = self.saved_change_flags.split_last() else {
-            return;
-        };
-        for (slot, &flags) in (0u32..).zip(slots) {
-            state[(slot_meta_base(slot) + SlotMetaOffset::CHANGE_FLAGS) as usize] = flags;
+    fn finish_change_flags(&mut self, delta_mode: bool, state: &[u8]) {
+        for index in 0..self.saved_change_flags.len() {
+            let offset = if index + 1 == self.saved_change_flags.len() {
+                StateHeaderOffset::DERIVED_FACTS_CHANGE_FLAG
+            } else {
+                slot_meta_base(index as u32) + SlotMetaOffset::CHANGE_FLAGS
+            };
+            let before = self.saved_change_flags[index];
+            let after = state[offset as usize];
+            if before != after {
+                self.push_reserved(
+                    state_bytes_entry(offset, 1, &[before]),
+                    delta_mode.then(|| state_bytes_entry(offset, 1, &[after])),
+                );
+            }
         }
-        state[StateHeaderOffset::DERIVED_FACTS_CHANGE_FLAG as usize] = derived;
+        self.reserved_entries -= self.saved_change_flags.len() as u32;
+        self.saved_change_flags.clear();
     }
 }
 
@@ -783,9 +868,11 @@ fn state_bytes_entry(offset: u32, len: u8, value: &[u8]) -> FlatUndoEntry {
 /// One long-lived reducer VM instance.
 #[derive(Debug)]
 pub struct Vm {
-    pub undo: UndoState,
+    pub(crate) undo: UndoState,
     pub bitmap_env: BitmapEnv,
     accepted_program_magics: &'static [u32],
+    /// Reused physical program/shape declaration admission scratch.
+    declared_slots: Vec<bool>,
     /// The plan of the FOR_EACH body being run (`element_body`), made once
     /// per batch; kept so a batch reuses its allocations.
     element_plan: BodyPlan,
@@ -796,6 +883,7 @@ pub struct Vm {
     element_struct_map2: StructMap2UpsertOperands,
     element_struct_map2_max: StructMap2MaxI64x2Operands,
     element_list_vals: ScalarOperands,
+    nested_scratch: nested::NestedScratch,
 }
 
 impl Vm {
@@ -808,11 +896,13 @@ impl Vm {
             undo: UndoState::default(),
             bitmap_env: BitmapEnv::default(),
             accepted_program_magics,
+            declared_slots: Vec::new(),
             element_plan: BodyPlan::default(),
             element_struct_map: StructMapUpsertOperands::EMPTY,
             element_struct_map2: StructMap2UpsertOperands::EMPTY,
             element_struct_map2_max: StructMap2MaxI64x2Operands::EMPTY,
             element_list_vals: ScalarOperands::EMPTY,
+            nested_scratch: nested::NestedScratch::default(),
         }
     }
 }
@@ -826,21 +916,176 @@ impl Default for Vm {
 /// The VM's undo lane as the container-ops hook boundary. It borrows only
 /// `undo`, so a bitmap operation can take `&mut self.bitmap_env` alongside it
 /// as a split borrow instead of a throwaway environment.
-pub struct VmCtx<'a> {
-    pub undo: &'a mut UndoState,
+pub(crate) struct VmCtx<'a> {
+    pub(crate) undo: &'a mut UndoState,
 }
 
 impl Vm {
-    pub fn ctx(&mut self) -> VmCtx<'_> {
+    /// Container operations capture their flags physically unless an enclosing
+    /// [`Vm::change_flag_boundary`] has reserved their exclusive flag owner.
+    pub(crate) fn ctx(&mut self) -> VmCtx<'_> {
         VmCtx {
             undo: &mut self.undo,
         }
     }
 
+    /// Reserve the declared physical ranges before calling the writer and
+    /// journal every changed byte on every normal return, including an error
+    /// value or an early-stop value returned as `T`.
+    ///
+    /// The writer MUST mutate only the declared ranges. It cannot access the
+    /// VM's journal, cancel this capture, or publish an unjournaled prefix.
+    ///
+    /// Outside a batch, no internal flag boundary is open: a writer that
+    /// changes slot or derived-fact flags MUST include those actual flag bytes
+    /// in `ranges`. Flag bytes are filtered from a capture only when an
+    /// internal boundary already owns and has reserved their journal records.
+    /// Returning an error stops the writer; it does not discard prior writes.
+    /// Those writes are always captured on normal callback return.
+    pub fn capture_mutation<T>(
+        &mut self,
+        delta_mode: bool,
+        state: &mut [u8],
+        ranges: &[(u32, u32)],
+        mutate: impl FnOnce(&mut [u8]) -> T,
+    ) -> Result<T, ErrorCode> {
+        let capture = self.undo.begin_capture(state, ranges)?;
+        self.undo.prepare_redo(delta_mode);
+        let result = mutate(state);
+        self.undo.finish_capture(delta_mode, state, ranges, capture);
+        Ok(result)
+    }
+
+    /// Run `mutate` as one change-flag boundary. The slot change flags and the
+    /// derived-facts flag it leaves different from how it found them are
+    /// journaled at its close as exact before-bytes (and, on the delta lane,
+    /// after-bytes), so a rollback to a checkpoint taken before it restores
+    /// them and a rollback to one taken after leaves them. The outermost
+    /// boundary owns the journal: one opened inside it only runs `mutate`, so
+    /// a flag is never journaled twice.
+    ///
+    /// Every mutating entrypoint is one: the `execute_batch` family,
+    /// [`Vm::set_insert`], [`Vm::set_remove`] and [`Vm::evict_all_expired`].
+    /// A reservation refusal returns before `mutate` runs. Raw extension
+    /// writers acquire their own bounded physical capture before writing.
+    pub(crate) fn change_flag_boundary<T>(
+        &mut self,
+        delta_mode: bool,
+        state: &mut [u8],
+        mutate: impl FnOnce(&mut Vm, &mut [u8]) -> T,
+    ) -> Result<T, ErrorCode> {
+        let owner = self.undo.open_change_flags(state)?;
+        self.undo.prepare_redo(delta_mode);
+        let result = mutate(self, state);
+        if owner {
+            self.undo.finish_change_flags(delta_mode, state);
+        }
+        Ok(result)
+    }
+
+    /// Upsert a parallel key/value batch into an authoritatively bound map.
+    /// Comparison and TTL columns use the supplied comparison encoding.
+    #[allow(clippy::too_many_arguments)]
+    pub fn map_upsert(
+        &mut self,
+        strategy: Strategy,
+        delta_mode: bool,
+        state: &mut [u8],
+        slot: u32,
+        keys: &[u32],
+        vals: &[u32],
+        cmp_col: Option<&[u8]>,
+        cmp_type: CmpType,
+    ) -> ErrorCode {
+        let meta = match state_init::bind_slot(state, slot) {
+            Ok(meta) => meta,
+            Err(error) => return error,
+        };
+        if meta.slot_type() != SlotType::HashMap {
+            return ErrorCode::InvalidSlot;
+        }
+        if keys.len() != vals.len() || u32::try_from(keys.len()).is_err() {
+            return ErrorCode::ColumnUnderrun;
+        }
+        if strategy.needs_timestamps() || meta.has_ttl() {
+            let Some(required) = keys.len().checked_mul(cmp_type.stride()) else {
+                return ErrorCode::ColumnUnderrun;
+            };
+            if cmp_col.is_none_or(|column| column.len() < required) {
+                return ErrorCode::ColumnUnderrun;
+            }
+        }
+        self.change_flag_boundary(delta_mode, state, |vm, state| {
+            hashmap_ops::batch_map_upsert(
+                strategy,
+                delta_mode,
+                state,
+                &meta,
+                slot,
+                keys,
+                vals,
+                cmp_col,
+                cmp_type,
+                &mut vm.ctx(),
+            )
+        })
+        .unwrap_or_else(|error| error)
+    }
+
+    /// Remove keys through the same checked map and flag/capture authority.
+    pub fn map_remove(
+        &mut self,
+        delta_mode: bool,
+        state: &mut [u8],
+        slot: u32,
+        keys: &[u32],
+    ) -> ErrorCode {
+        let meta = match state_init::bind_slot(state, slot) {
+            Ok(meta) => meta,
+            Err(error) => return error,
+        };
+        if meta.slot_type() != SlotType::HashMap {
+            return ErrorCode::InvalidSlot;
+        }
+        self.change_flag_boundary(delta_mode, state, |vm, state| {
+            hashmap_ops::batch_map_remove(delta_mode, state, &meta, slot, keys, &mut vm.ctx())
+        })
+        .unwrap_or_else(|error| error)
+    }
+
     /// Set insertion routed by slot type: BITMAP slots run in `bitmap_env`,
     /// flat sets in the hash table. A TTL slot requires one timestamp per
-    /// element.
+    /// element. A change-flag boundary of its own: a direct call journals the
+    /// flags it sets, and inside a batch the batch's boundary already owns
+    /// them. Journal refusal is returned before any unlogged byte is written.
     pub fn set_insert(
+        &mut self,
+        delta_mode: bool,
+        state: &mut [u8],
+        slot_idx: u32,
+        elems: &[u32],
+        ts_col: Option<&[f64]>,
+    ) -> ErrorCode {
+        let meta = match state_init::bind_slot(state, slot_idx) {
+            Ok(meta) => meta,
+            Err(error) => return error,
+        };
+        if !matches!(meta.slot_type(), SlotType::HashSet | SlotType::Bitmap) {
+            return ErrorCode::InvalidSlot;
+        }
+        if u32::try_from(elems.len()).is_err()
+            || (meta.has_ttl() && ts_col.is_none_or(|timestamps| timestamps.len() < elems.len()))
+        {
+            return ErrorCode::ColumnUnderrun;
+        }
+        self.change_flag_boundary(delta_mode, state, |vm, state| {
+            vm.route_set_insert(delta_mode, state, &meta, slot_idx, elems, ts_col)
+        })
+        .unwrap_or_else(|error| error)
+    }
+
+    /// [`Vm::set_insert`] inside its boundary.
+    fn route_set_insert(
         &mut self,
         delta_mode: bool,
         state: &mut [u8],
@@ -859,7 +1104,6 @@ impl Vm {
                 delta_mode,
                 state,
                 meta,
-                slot_idx,
                 elems,
                 ts_col,
             );
@@ -880,6 +1124,27 @@ impl Vm {
         &mut self,
         delta_mode: bool,
         state: &mut [u8],
+        slot_idx: u32,
+        elems: &[u32],
+    ) -> ErrorCode {
+        let meta = match state_init::bind_slot(state, slot_idx) {
+            Ok(meta) => meta,
+            Err(error) => return error,
+        };
+        if !matches!(meta.slot_type(), SlotType::HashSet | SlotType::Bitmap) {
+            return ErrorCode::InvalidSlot;
+        }
+        self.change_flag_boundary(delta_mode, state, |vm, state| {
+            vm.route_set_remove(delta_mode, state, &meta, slot_idx, elems)
+        })
+        .unwrap_or_else(|error| error)
+    }
+
+    /// [`Vm::set_remove`] inside its boundary.
+    fn route_set_remove(
+        &mut self,
+        delta_mode: bool,
+        state: &mut [u8],
         meta: &SlotMetaView,
         slot_idx: u32,
         elems: &[u32],
@@ -894,38 +1159,41 @@ impl Vm {
                 delta_mode,
                 state,
                 meta,
-                slot_idx,
                 elems,
             );
         }
         hashset_ops::batch_set_remove(delta_mode, state, meta, slot_idx, elems, &mut self.ctx())
     }
 
-    /// In-place set algebra on a BITMAP slot with the operand read where it
-    /// lives (another slot or the scratch image) — no operand copy.
-    fn bitmap_algebra(
+    /// Apply bitmap algebra with authoritative target/source slot ownership.
+    /// TTL merging is admitted before either payload or expiry state changes.
+    pub fn bitmap_algebra(
         &mut self,
+        delta_mode: bool,
         op: BitmapAlgebraOp,
         state: &mut [u8],
-        target_meta: &SlotMetaView,
+        target_slot: u32,
         source: BitmapSource<'_>,
     ) -> ErrorCode {
-        let hooks = &mut VmCtx {
-            undo: &mut self.undo,
+        let target_meta = match state_init::bind_slot(state, target_slot) {
+            Ok(meta) => meta,
+            Err(error) => return error,
         };
-        batch_bitmap_algebra(&mut self.bitmap_env, hooks, op, state, target_meta, source)
-    }
-}
-
-const fn record_to_entry(r: MutationRecord) -> FlatUndoEntry {
-    FlatUndoEntry {
-        op: r.op,
-        slot: r.slot,
-        pad1: 0,
-        pad2: 0,
-        key: r.key,
-        prev_value: r.prev_value,
-        aux: r.aux,
+        if target_meta.slot_type() != SlotType::Bitmap {
+            return ErrorCode::InvalidSlot;
+        }
+        self.change_flag_boundary(delta_mode, state, |vm, state| {
+            batch_bitmap_algebra(
+                &mut vm.bitmap_env,
+                &mut VmCtx { undo: &mut vm.undo },
+                delta_mode,
+                op,
+                state,
+                &target_meta,
+                source,
+            )
+        })
+        .unwrap_or_else(|error| error)
     }
 }
 
@@ -934,50 +1202,48 @@ impl VmHooks for VmCtx<'_> {
         self.undo.enabled
     }
 
-    fn append_mutation(
+    fn take_erase_scratch(&mut self) -> EraseScratch {
+        core::mem::take(&mut self.undo.erase_scratch)
+    }
+
+    fn restore_erase_scratch(&mut self, scratch: EraseScratch) {
+        self.undo.erase_scratch = scratch;
+    }
+
+    fn begin_capture(
+        &mut self,
+        state: &[u8],
+        ranges: &[(u32, u32)],
+    ) -> Result<ByteCapture, ErrorCode> {
+        self.undo.begin_capture(state, ranges)
+    }
+
+    fn finish_capture(
         &mut self,
         delta_mode: bool,
         state: &[u8],
-        undo_r: MutationRecord,
-        redo_r: MutationRecord,
+        ranges: &[(u32, u32)],
+        capture: ByteCapture,
     ) {
-        // Snapshot the state on first undo overflow. Container operations
-        // reborrow the same buffer, so this captures the true pre-overflow
-        // state for every append path.
-        let (u, r) = (record_to_entry(undo_r), record_to_entry(redo_r));
-        if delta_mode {
-            self.undo.append_pair_snapshot(state, u, r);
-        } else {
-            self.undo.append_undo_only_snapshot(state, u);
-        }
+        self.undo.finish_capture(delta_mode, state, ranges, capture);
     }
 
-    fn insert_with_ttl(
+    fn plan_ttl_batch(
+        &mut self,
+        state: &[u8],
+        meta: &SlotMetaView,
+        mutations: impl IntoIterator<Item = crate::hooks::TtlMutation>,
+    ) -> Result<TtlBatchPlan, ErrorCode> {
+        prepare_ttl_batch(state, meta, mutations, &mut self.undo.ttl_batch_scratch)
+    }
+
+    fn consume_ttl_batch_plan(
         &mut self,
         state: &mut [u8],
         meta: &SlotMetaView,
-        key: u32,
-        ts: f64,
-    ) -> ErrorCode {
-        insert_with_ttl(state, meta, key, ts)
-    }
-
-    fn latest_eviction_ts(&self, state: &[u8], meta: &SlotMetaView, key: u32) -> Option<f64> {
-        find_latest_eviction_timestamp_for_key(state, meta, key)
-    }
-
-    fn remove_ttl_entries_for_key(&mut self, state: &mut [u8], meta: &SlotMetaView, key: u32) {
-        remove_ttl_entries_for_key(state, meta, key);
-    }
-
-    fn undo_overflow(&self) -> bool {
-        self.undo.overflow
-    }
-
-    fn force_undo_snapshot(&mut self, state: &[u8]) {
-        // Bulk bitmap algebra uses snapshot-based rollback.
-        self.undo.snapshot(state);
-        self.undo.overflow = true;
+        plan: TtlBatchPlan,
+    ) {
+        consume_ttl_batch(state, meta, plan, &mut self.undo.ttl_batch_scratch);
     }
 }
 
@@ -985,584 +1251,204 @@ impl VmHooks for VmCtx<'_> {
 // Rollback
 // =============================================================================
 
-/// Reverse-apply one mutation to the state buffer.
-pub fn rollback_entry(env: &mut BitmapEnv, state: &mut [u8], entry: &FlatUndoEntry) {
-    match entry.op {
-        FlatUndoOp::MapInsert => {
-            let meta = SlotMetaView::read(state, entry.slot);
-            if undo_log::rollback_map_insert(state, &meta, entry.key) && meta.has_ttl() {
-                remove_ttl_entries_for_key(state, &meta, entry.key);
-            }
-        }
-        FlatUndoOp::MapUpdate => {
-            let meta = SlotMetaView::read(state, entry.slot);
-            if undo_log::rollback_map_update(state, &meta, entry.key, entry.prev_value, entry.aux)
-                && meta.has_ttl()
-            {
-                remove_ttl_entries_for_key(state, &meta, entry.key);
-                restore_ttl_entry(state, &meta, entry.key, f64::from_bits(entry.aux));
-            }
-        }
-        FlatUndoOp::MapDelete => {
-            let meta = SlotMetaView::read(state, entry.slot);
-            if undo_log::rollback_map_delete(state, &meta, entry.key, entry.prev_value, entry.aux)
-                && meta.has_ttl()
-            {
-                remove_ttl_entries_for_key(state, &meta, entry.key);
-                restore_ttl_entry(state, &meta, entry.key, f64::from_bits(entry.aux));
-            }
-        }
-        FlatUndoOp::SetInsert => {
-            let meta = SlotMetaView::read(state, entry.slot);
-            if meta.slot_type() == SlotType::Bitmap {
-                let storage = get_bitmap_storage(&meta);
-                if let Ok(report) = bitmap_patch(env, state, storage, &[], &[entry.key])
-                    && report.removed == 1
-                {
-                    meta.set_size(state, report.len as u32);
-                    if meta.has_ttl() {
-                        remove_ttl_entries_for_key(state, &meta, entry.key);
-                    }
-                }
-            } else if undo_log::rollback_set_insert(state, &meta, entry.key) && meta.has_ttl() {
-                remove_ttl_entries_for_key(state, &meta, entry.key);
-            }
-        }
-        FlatUndoOp::SetDelete => {
-            let meta = SlotMetaView::read(state, entry.slot);
-            if meta.slot_type() == SlotType::Bitmap {
-                let storage = get_bitmap_storage(&meta);
-                // The element cap is a write-side admission rule; the undo of
-                // a delete re-admits only what the cap allows, exactly as the
-                // forward insert would.
-                let admitted = match storage.view(state) {
-                    Ok(view) => {
-                        view.is_some_and(|v| v.contains(entry.key))
-                            || view.map_or(0, |v| v.len()) < u64::from(meta.capacity)
-                    }
-                    Err(_) => false,
-                };
-                if admitted && let Ok(report) = bitmap_patch(env, state, storage, &[entry.key], &[])
-                {
-                    meta.set_size(state, report.len as u32);
-                }
-                if meta.has_ttl() {
-                    remove_ttl_entries_for_key(state, &meta, entry.key);
-                    restore_ttl_entry(state, &meta, entry.key, f64::from_bits(entry.aux));
-                }
-            } else if undo_log::rollback_set_delete(state, &meta, entry.key) && meta.has_ttl() {
-                remove_ttl_entries_for_key(state, &meta, entry.key);
-                restore_ttl_entry(state, &meta, entry.key, f64::from_bits(entry.aux));
-            }
-        }
-        FlatUndoOp::AggUpdate => {
-            let meta = SlotMetaView::read(state, entry.slot);
-            let count = u64::from(entry.prev_value) | (u64::from(entry.key) << 32);
-            undo_log::rollback_agg_update(state, &meta, count, entry.aux);
-        }
-        FlatUndoOp::CountUpdate => {
-            let meta = SlotMetaView::read(state, entry.slot);
-            let count = u64::from(entry.prev_value) | (u64::from(entry.key) << 32);
-            undo_log::rollback_count_update(state, &meta, count);
-        }
-        FlatUndoOp::ScalarUpdate => {
-            let meta = SlotMetaView::read(state, entry.slot);
-            let ts = u64::from(entry.prev_value) | (u64::from(entry.key) << 32);
-            undo_log::rollback_scalar_update(state, &meta, entry.aux, f64::from_bits(ts));
-        }
-        FlatUndoOp::FactInsertNew => {
-            let derived_offset = get_derived_facts_offset(state);
-            let capacity = u32::from(get_derived_facts_capacity(state));
-            let slot_idx = entry.prev_value;
-            if slot_idx < capacity {
-                bytes::write_u64(
-                    state,
-                    derived_offset + slot_idx * 8,
-                    DERIVED_FACT_TOMBSTONE_IDENTITY,
-                );
-            }
-        }
-        FlatUndoOp::FactInsertUpdate | FlatUndoOp::FactRetract => {
-            let derived_offset = get_derived_facts_offset(state);
-            let capacity = u32::from(get_derived_facts_capacity(state));
-            let slot_idx = entry.prev_value;
-            if slot_idx < capacity {
-                let fact_idx = u16::from_le_bytes([entry.pad1, entry.pad2]);
-                let identity = (u64::from(fact_idx) << 32) | u64::from(entry.key);
-                bytes::write_u64(state, derived_offset + slot_idx * 8, identity);
-                bytes::write_u32(
-                    state,
-                    derived_offset + capacity * 8 + slot_idx * 4,
-                    entry.aux as u32,
-                );
-                bytes::write_u32(
-                    state,
-                    derived_offset + capacity * 12 + slot_idx * 4,
-                    (entry.aux >> 32) as u32,
-                );
-            }
-        }
-        FlatUndoOp::StateBytes => {
-            let len = u32::from(entry.pad1);
-            if len == 0 || len > 8 || entry.key.saturating_add(len) > state.len() as u32 {
-                return;
-            }
-            let cell = entry.aux.to_le_bytes();
-            state[entry.key as usize..(entry.key + len) as usize]
-                .copy_from_slice(&cell[..len as usize]);
-        }
-        FlatUndoOp::ListAppendUndo => {
-            // Restore the ORDERED_LIST count from its repurposed metadata
-            // field; the general metadata view cannot bind this slot type.
-            let meta_off = slot_meta_base(entry.slot);
-            bytes::write_u32(state, meta_off + SlotMetaOffset::SIZE, entry.prev_value);
-        }
-        FlatUndoOp::StructMapField => {
-            if SlotMetaView::read(state, entry.slot).slot_type() == SlotType::StructMap2 {
-                rollback_struct_map2_field(state, entry);
-            } else {
-                rollback_struct_map_field(state, entry);
-            }
-        }
-        FlatUndoOp::StructMapRow => {
-            if SlotMetaView::read(state, entry.slot).slot_type() == SlotType::StructMap2 {
-                rollback_struct_map2_row(state, entry);
-            } else {
-                rollback_struct_map_row(state, entry);
-            }
-        }
+/// Apply one validated physical record without probing, resizing or rewriting
+/// any other allocated byte.
+pub fn rollback_entry(state: &mut [u8], entry: &FlatUndoEntry) -> Result<(), ErrorCode> {
+    let len = u32::from(entry.pad1);
+    if !(1..=8).contains(&len) {
+        return Err(ErrorCode::InvalidState);
     }
-}
-
-fn rollback_struct_map_field(state: &mut [u8], entry: &FlatUndoEntry) {
-    let smap = StructMapSlot::bind(state, entry.slot);
-    let field_idx = entry.pad1;
-    let want_absent = entry.pad2 & SMF_ROW_ABSENT != 0;
-    let want_bit_set = entry.pad2 & SMF_BIT_SET != 0;
-    if want_absent {
-        if let Some(pos) = smap.remove(state, entry.key) {
-            smap.clear_bitset(state, smap.row_off(pos));
-        }
-        return;
-    }
-    let Some(ins) = smap.find_insert(state, entry.key) else {
-        return;
-    };
-    if !ins.found {
-        smap.set_key_at(state, ins.pos, entry.key);
-        smap.set_size(state, smap.size(state) + 1);
-        smap.clear_bitset(state, smap.row_off(ins.pos));
-    }
-    let row = smap.row_off(ins.pos);
-    let fsize = struct_field_size(smap.field_type(state, field_idx));
-    let f_off = row + smap.field_offset(state, field_idx);
-    if want_bit_set {
-        StructMapSlot::set_field_bit(state, row, field_idx);
-        let cell = entry.aux.to_le_bytes();
-        state[f_off as usize..(f_off + fsize) as usize].copy_from_slice(&cell[..fsize as usize]);
-    } else {
-        StructMapSlot::clear_scalar_field(state, row, field_idx);
-        bytes::zero(state, f_off, fsize);
-    }
-}
-
-fn rollback_struct_map_row(state: &mut [u8], entry: &FlatUndoEntry) {
-    let smap = StructMapSlot::bind(state, entry.slot);
-    if entry.pad2 & SMR_ROW_ABSENT != 0 {
-        if let Some(pos) = smap.remove(state, entry.key) {
-            smap.clear_bitset(state, smap.row_off(pos));
-        }
-        return;
-    }
-    let Some(ins) = smap.find_insert(state, entry.key) else {
-        return;
-    };
-    if !ins.found {
-        smap.set_key_at(state, ins.pos, entry.key);
-        smap.set_size(state, smap.size(state) + 1);
-    }
-    let row = smap.row_off(ins.pos);
-    let n = smap.bitset_bytes.min(8);
-    let cell = entry.aux.to_le_bytes();
-    state[row as usize..(row + n) as usize].copy_from_slice(&cell[..n as usize]);
-}
-
-fn rollback_struct_map2_field(state: &mut [u8], entry: &FlatUndoEntry) {
-    let smap = StructMap2Slot::bind(state, entry.slot);
-    let (key1, key2) = (entry.key, entry.prev_value);
-    let field_idx = entry.pad1;
-    let want_absent = entry.pad2 & SMF_ROW_ABSENT != 0;
-    let want_bit_set = entry.pad2 & SMF_BIT_SET != 0;
-    if want_absent {
-        if let Some(pos) = smap.remove(state, key1, key2) {
-            smap.clear_bitset(state, smap.row_off(pos));
-        }
-        return;
-    }
-    let Some(ins) = smap.find_insert(state, key1, key2) else {
-        return;
-    };
-    if !ins.found {
-        smap.set_keys_at(state, ins.pos, key1, key2);
-        smap.set_size(state, smap.size(state) + 1);
-        smap.clear_bitset(state, smap.row_off(ins.pos));
-    }
-    let row = smap.row_off(ins.pos);
-    let fsize = struct_field_size(smap.field_type(state, field_idx));
-    let f_off = row + smap.field_offset(state, field_idx);
-    if want_bit_set {
-        StructMapSlot::set_field_bit(state, row, field_idx);
-        let cell = entry.aux.to_le_bytes();
-        state[f_off as usize..(f_off + fsize) as usize].copy_from_slice(&cell[..fsize as usize]);
-    } else {
-        StructMapSlot::clear_scalar_field(state, row, field_idx);
-        bytes::zero(state, f_off, fsize);
-    }
-}
-
-fn rollback_struct_map2_row(state: &mut [u8], entry: &FlatUndoEntry) {
-    let smap = StructMap2Slot::bind(state, entry.slot);
-    let (key1, key2) = (entry.key, entry.prev_value);
-    if entry.pad2 & SMR_ROW_ABSENT != 0 {
-        if let Some(pos) = smap.remove(state, key1, key2) {
-            smap.clear_bitset(state, smap.row_off(pos));
-        }
-        return;
-    }
-    let Some(ins) = smap.find_insert(state, key1, key2) else {
-        return;
-    };
-    if !ins.found {
-        smap.set_keys_at(state, ins.pos, key1, key2);
-        smap.set_size(state, smap.size(state) + 1);
-    }
-    let row = smap.row_off(ins.pos);
-    let n = smap.bitset_bytes.min(8);
-    let cell = entry.aux.to_le_bytes();
-    state[row as usize..(row + n) as usize].copy_from_slice(&cell[..n as usize]);
+    let end = entry.key.checked_add(len).ok_or(ErrorCode::InvalidState)?;
+    let destination = state
+        .get_mut(entry.key as usize..end as usize)
+        .ok_or(ErrorCode::InvalidState)?;
+    destination.copy_from_slice(&entry.aux.to_le_bytes()[..len as usize]);
+    Ok(())
 }
 
 // =============================================================================
-// Struct-map journaling
+// Struct-map row writes: one physical capture per row mutation
 // =============================================================================
 
-/// Pack up to eight field-cell bytes into a little-endian u64.
-fn pack_field_bytes(bytes_in: &[u8]) -> u64 {
-    let mut buf = [0u8; 8];
-    buf[..bytes_in.len()].copy_from_slice(bytes_in);
-    u64::from_le_bytes(buf)
-}
-
-/// Pack up to eight row-presence bytes into a little-endian u64.
-fn pack_bitset_bytes(state: &[u8], off: u32, bitset_bytes: u32) -> u64 {
-    let n = bitset_bytes.min(8) as usize;
-    let mut buf = [0u8; 8];
-    buf[..n].copy_from_slice(&state[off as usize..off as usize + n]);
-    u64::from_le_bytes(buf)
-}
-
-/// Pre-overwrite row snapshot passed explicitly instead of stored in globals.
-struct RowPrior {
-    bitset: [u8; 8],
-    cells: [u64; 64],
-}
-
-impl RowPrior {
-    const fn new() -> Self {
-        Self {
-            bitset: [0; 8],
-            cells: [0; 64],
-        }
-    }
-
-    fn is_field_set(&self, fi: u8) -> bool {
-        self.bitset[(fi / 8) as usize] & (1 << (fi % 8)) != 0
-    }
-}
-
-/// Capture the prior row state before an upsert rewrites it.
-fn capture_struct_map_row_prior(
-    state: &[u8],
-    smap: &StructMapSlot,
-    row: u32,
-    prior: &mut RowPrior,
-) {
-    let nb = smap.bitset_bytes.min(8) as usize;
-    prior.bitset = [0; 8];
-    prior.bitset[..nb].copy_from_slice(&state[row as usize..row as usize + nb]);
-    let n_fields = smap.num_fields.min(64);
-    for fi in 0..n_fields {
-        if StructMapSlot::is_field_set(state, row, fi) {
-            let ft = smap.field_type(state, fi);
-            let fsize = struct_field_size(ft);
-            let f_off = row + smap.field_offset(state, fi);
-            prior.cells[fi as usize] =
-                pack_field_bytes(&state[f_off as usize..(f_off + fsize) as usize]);
-        }
-    }
-}
-
-/// Emit a STRUCT_MAP_ROW entry first, then per-field entries; reverse rollback
-/// restores the authoritative row bitset before field-level state.
+/// Run `write` as one physical mutation of row `target` in struct map `map`
+/// (slot `slot`, key `key`). The capture is taken before any byte moves: the key
+/// and size cells when the key is new, the slot's change-flag byte, and the whole
+/// row with its bitset and every field cell, stale bytes included. A new key is
+/// applied and its bitset cleared before `write` runs. The capture is finished
+/// even when `write` refuses partway, so the accepted prefix is journaled exactly
+/// as it now stands.
 #[allow(clippy::too_many_arguments)]
-fn emit_struct_map_row_journal(
+fn journal_row_write(
     undo: &mut UndoState,
     delta_mode: bool,
-    state: &[u8],
-    smap: &StructMapSlot,
-    slot_idx: u32,
+    state: &mut [u8],
+    map: &StructMapSlot,
+    slot: u32,
     key: u32,
-    pos: u32,
-    was_new: bool,
-    prior: &RowPrior,
-) {
-    let row = smap.row_off(pos);
-
-    let smr = |pad2: u8, aux: u64| FlatUndoEntry {
-        op: FlatUndoOp::StructMapRow,
-        slot: slot_idx,
-        pad1: 0,
-        pad2,
-        key,
-        prev_value: 0,
-        aux,
+    target: crate::struct_map::Upsert,
+    write: impl FnOnce(&mut [u8]) -> ErrorCode,
+) -> ErrorCode {
+    let ranges = row_capture_ranges(map, slot, target);
+    let capture = match undo.begin_capture(state, &ranges) {
+        Ok(capture) => capture,
+        Err(error) => return error,
     };
-    if was_new {
-        append_mutation_state(
-            undo,
-            delta_mode,
-            state,
-            smr(SMR_ROW_ABSENT, 0),
-            smr(0, pack_bitset_bytes(state, row, smap.bitset_bytes)),
-        );
-    } else {
-        append_mutation_state(
-            undo,
-            delta_mode,
-            state,
-            smr(
-                0,
-                pack_field_bytes(&prior.bitset[..smap.bitset_bytes.min(8) as usize]),
-            ),
-            smr(0, pack_bitset_bytes(state, row, smap.bitset_bytes)),
-        );
-    }
-
-    let n_fields = smap.num_fields.min(64);
-    for fi in 0..n_fields {
-        let prior_set = !was_new && prior.is_field_set(fi);
-        let now_set = StructMapSlot::is_field_set(state, row, fi);
-        if !prior_set && !now_set {
-            continue;
-        }
-
-        let ft = smap.field_type(state, fi);
-        let fsize = struct_field_size(ft);
-        let f_off = row + smap.field_offset(state, fi);
-
-        let smf = |pad2: u8, aux: u64| FlatUndoEntry {
-            op: FlatUndoOp::StructMapField,
-            slot: slot_idx,
-            pad1: fi,
-            pad2,
-            key,
-            prev_value: 0,
-            aux,
-        };
-        let undo_flags = if prior_set { SMF_BIT_SET } else { 0 };
-        let undo_aux = if prior_set {
-            prior.cells[fi as usize]
-        } else {
-            0
-        };
-        let redo_flags = if now_set { SMF_BIT_SET } else { 0 };
-        let redo_aux = if now_set {
-            pack_field_bytes(&state[f_off as usize..(f_off + fsize) as usize])
-        } else {
-            0
-        };
-        append_mutation_state(
-            undo,
-            delta_mode,
-            state,
-            smf(undo_flags, undo_aux),
-            smf(redo_flags, redo_aux),
-        );
-    }
+    apply_planned_row(map, state, key, target);
+    let result = write(&mut *state);
+    undo.finish_capture(delta_mode, state, &ranges, capture);
+    result
 }
 
-fn capture_struct_map2_row_prior(
-    state: &[u8],
-    smap: &StructMap2Slot,
-    row: u32,
-    prior: &mut RowPrior,
-) {
-    let nb = smap.bitset_bytes.min(8) as usize;
-    prior.bitset = [0; 8];
-    prior.bitset[..nb].copy_from_slice(&state[row as usize..row as usize + nb]);
-    for fi in 0..smap.num_fields.min(64) {
-        if StructMapSlot::is_field_set(state, row, fi) {
-            let fsize = struct_field_size(smap.field_type(state, fi));
-            let f_off = row + smap.field_offset(state, fi);
-            prior.cells[fi as usize] =
-                pack_field_bytes(&state[f_off as usize..(f_off + fsize) as usize]);
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn emit_struct_map2_upsert_journal(
-    undo: &mut UndoState,
-    delta_mode: bool,
-    state: &[u8],
-    smap: &StructMap2Slot,
+/// The bytes one row mutation may touch, shared by every capture of that row: the
+/// key and size cells when the key is new, the slot's change-flag byte, and the
+/// whole row with its bitset and field cells, stale bytes included.
+fn row_capture_ranges(
+    map: &StructMapSlot,
     slot: u32,
-    key1: u32,
-    key2: u32,
-    pos: u32,
-    was_new: bool,
-    prior: &RowPrior,
-) {
-    let row = smap.row_off(pos);
-    let row_entry = |pad2: u8, aux: u64| FlatUndoEntry {
-        op: FlatUndoOp::StructMapRow,
-        slot,
-        pad1: 0,
-        pad2,
-        key: key1,
-        prev_value: key2,
-        aux,
-    };
-    let prior_bits = if was_new {
-        0
-    } else {
-        pack_field_bytes(&prior.bitset[..smap.bitset_bytes.min(8) as usize])
-    };
-    append_mutation_state(
-        undo,
-        delta_mode,
-        state,
-        row_entry(if was_new { SMR_ROW_ABSENT } else { 0 }, prior_bits),
-        row_entry(0, pack_bitset_bytes(state, row, smap.bitset_bytes)),
-    );
-
-    for fi in 0..smap.num_fields.min(64) {
-        let prior_set = !was_new && prior.is_field_set(fi);
-        let now_set = StructMapSlot::is_field_set(state, row, fi);
-        if !prior_set && !now_set {
-            continue;
-        }
-        let fsize = struct_field_size(smap.field_type(state, fi));
-        let f_off = row + smap.field_offset(state, fi);
-        let field_entry = |pad2: u8, aux: u64| FlatUndoEntry {
-            op: FlatUndoOp::StructMapField,
-            slot,
-            pad1: fi,
-            pad2,
-            key: key1,
-            prev_value: key2,
-            aux,
-        };
-        append_mutation_state(
-            undo,
-            delta_mode,
-            state,
-            field_entry(
-                if prior_set { SMF_BIT_SET } else { 0 },
-                if prior_set {
-                    prior.cells[fi as usize]
-                } else {
-                    0
-                },
-            ),
-            field_entry(
-                if now_set { SMF_BIT_SET } else { 0 },
-                if now_set {
-                    pack_field_bytes(&state[f_off as usize..(f_off + fsize) as usize])
-                } else {
-                    0
-                },
-            ),
-        );
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn emit_struct_map2_remove_journal(
-    undo: &mut UndoState,
-    delta_mode: bool,
-    state: &[u8],
-    smap: &StructMap2Slot,
-    slot: u32,
-    key1: u32,
-    key2: u32,
-    prior: &RowPrior,
-) {
-    let entry = |op: FlatUndoOp, field: u8, flags: u8, aux: u64| FlatUndoEntry {
-        op,
-        slot,
-        pad1: field,
-        pad2: flags,
-        key: key1,
-        prev_value: key2,
-        aux,
-    };
-    append_mutation_state(
-        undo,
-        delta_mode,
-        state,
-        entry(
-            FlatUndoOp::StructMapRow,
-            0,
-            0,
-            pack_field_bytes(&prior.bitset[..smap.bitset_bytes.min(8) as usize]),
-        ),
-        entry(FlatUndoOp::StructMapRow, 0, SMR_ROW_ABSENT, 0),
-    );
-    for fi in 0..smap.num_fields.min(64) {
-        if !prior.is_field_set(fi) {
-            continue;
-        }
-        append_mutation_state(
-            undo,
-            delta_mode,
-            state,
-            entry(
-                FlatUndoOp::StructMapField,
-                fi,
-                SMF_BIT_SET,
-                prior.cells[fi as usize],
-            ),
-            entry(FlatUndoOp::StructMapField, fi, SMF_ROW_ABSENT, 0),
-        );
-    }
-}
-
-/// Append a mutation while the caller owns the state buffer, allowing the
-/// first-overflow snapshot to capture the live bytes.
-fn append_mutation_state(
-    undo: &mut UndoState,
-    delta_mode: bool,
-    state: &[u8],
-    undo_e: FlatUndoEntry,
-    redo_e: FlatUndoEntry,
-) {
-    if delta_mode {
-        undo.append_pair_snapshot(state, undo_e, redo_e);
-    } else {
-        undo.append_undo_only_snapshot(state, undo_e);
-    }
-}
-
-fn nested_journal_ranges(state: &[u8], meta: &SlotMetaView) -> [(u32, u32); 2] {
-    let arena_header = nested::arena_header_offset(meta.offset, meta.capacity);
-    let arena_capacity = bytes::read_u32(state, arena_header);
-    let slot_data_len = arena_header + nested::ARENA_HDR_SIZE + arena_capacity - meta.offset;
+    target: crate::struct_map::Upsert,
+) -> [(u32, u32); 4] {
+    let key_cells = if target.is_new { 4 } else { 0 };
     [
-        (meta.meta_base, SLOT_META_SIZE),
-        (meta.offset, slot_data_len),
+        (map.size_off, key_cells),
+        (slot_meta_base(slot) + SlotMetaOffset::CHANGE_FLAGS, 1),
+        (map.keys_off + target.pos * 4, key_cells),
+        (map.row_off(target.pos), map.row_size),
     ]
 }
+
+/// Apply a planned new key and clear its row's bitset, so stale bits never count as
+/// present. An existing row is left as it stands.
+fn apply_planned_row(
+    map: &StructMapSlot,
+    state: &mut [u8],
+    key: u32,
+    target: crate::struct_map::Upsert,
+) {
+    if target.is_new {
+        map.apply_upsert(state, key, target);
+        map.clear_bitset(state, map.row_off(target.pos));
+    }
+}
+
+/// Whether row `pos` holds `cell` as the live value of card-one `field`.
+fn card_one_held(
+    state: &[u8],
+    map: &StructMapSlot,
+    pos: u32,
+    field: u8,
+    cell: &[u8; 8],
+    cell_size: u32,
+) -> bool {
+    let row = map.row_off(pos);
+    let dst = (row + map.field_offset(state, field)) as usize;
+    let size = cell_size as usize;
+    StructMapSlot::is_field_set(state, row, field) && state[dst..dst + size] == cell[..size]
+}
+
+/// Whether a card-one element changes `up`'s row as it stands: an assert changes
+/// a value that is not held, a retract changes one that is. A new row's bytes are
+/// stale until cleared, so they never hold the value.
+fn card_one_changes(
+    state: &[u8],
+    map: &StructMapSlot,
+    up: crate::struct_map::Upsert,
+    field: u8,
+    cell: &[u8; 8],
+    cell_size: u32,
+    is_retract: bool,
+) -> bool {
+    let held = !up.is_new && card_one_held(state, map, up.pos, field, cell, cell_size);
+    held == is_retract
+}
+
+/// The card-one write of one row, under the caller's capture. An assert stores
+/// `cell` and sets the presence bit, recording INSERTED or UPDATED from the bit as
+/// it stood. A retract clears the bit and the cell only while the stored cell
+/// still equals `cell`, recording REMOVED.
+#[allow(clippy::too_many_arguments)]
+fn write_card_one(
+    state: &mut [u8],
+    map: &StructMapSlot,
+    slot: u32,
+    pos: u32,
+    field: u8,
+    cell: &[u8; 8],
+    cell_size: u32,
+    is_retract: bool,
+) {
+    let row = map.row_off(pos);
+    let dst_off = row + map.field_offset(state, field);
+    let flags = (slot_meta_base(slot) + SlotMetaOffset::CHANGE_FLAGS) as usize;
+    let held = card_one_held(state, map, pos, field, cell, cell_size);
+    match (held, is_retract) {
+        (true, true) => {
+            StructMapSlot::clear_scalar_field(state, row, field);
+            bytes::zero(state, dst_off, cell_size);
+            state[flags] |= ChangeFlag::REMOVED;
+        }
+        (false, false) => {
+            let prior_bit = StructMapSlot::is_field_set(state, row, field);
+            StructMapSlot::set_field_bit(state, row, field);
+            state[dst_off as usize..(dst_off + cell_size) as usize]
+                .copy_from_slice(&cell[..cell_size as usize]);
+            state[flags] |= if prior_bit {
+                ChangeFlag::UPDATED
+            } else {
+                ChangeFlag::INSERTED
+            };
+        }
+        // A retract of an absent value and an assert of a held one write nothing.
+        _ => {}
+    }
+}
+
+/// One card-one scatter element on struct map `map` (slot `slot`): an assert
+/// stores `cell` in `field` of `key`'s row, a retract clears it while the stored
+/// cell still equals `cell`. The key is planned once, and an element that changes
+/// nothing reserves and journals nothing.
+#[allow(clippy::too_many_arguments)]
+fn scatter_card_one(
+    undo: &mut UndoState,
+    delta_mode: bool,
+    state: &mut [u8],
+    map: &StructMapSlot,
+    slot: u32,
+    key: u32,
+    field: u8,
+    cell: &[u8; 8],
+    cell_size: u32,
+    is_retract: bool,
+) -> ErrorCode {
+    let target = if is_retract {
+        map.find(state, key)
+            .map(|pos| crate::struct_map::Upsert { pos, is_new: false })
+    } else {
+        let Some(planned) = map.plan_upsert(state, key) else {
+            return ErrorCode::CapacityExceeded;
+        };
+        Some(planned)
+    };
+    let Some(up) = target else {
+        return ErrorCode::Ok;
+    };
+    if !card_one_changes(state, map, up, field, cell, cell_size, is_retract) {
+        return ErrorCode::Ok;
+    }
+    journal_row_write(
+        undo,
+        delta_mode,
+        state,
+        map,
+        slot,
+        key,
+        up,
+        |state: &mut [u8]| {
+            write_card_one(state, map, slot, up.pos, field, cell, cell_size, is_retract);
+            ErrorCode::Ok
+        },
+    )
+}
+
 // =============================================================================
 // Guarded-scatter guards
 // =============================================================================
@@ -1651,70 +1537,37 @@ impl GuardTuple {
     }
 
     /// Whether the row already remembers exactly this guard, so the stamp
-    /// would rewrite identical bytes and journal them.
+    /// would rewrite identical bytes.
     fn already_stamped(&self, incoming: &GuardKey, stored: Option<GuardKey>) -> bool {
         stored.is_some_and(|s| s[..self.len] == incoming[..self.len])
     }
 
-    /// Write the element's guard into row `pos`, journaled field by field.
-    /// `row_created` marks the row this stamp brought into existence: its
-    /// first entry then carries the row-absent undo that rollback removes
-    /// the whole row by, so exactly one journal entry claims the creation.
-    #[allow(clippy::too_many_arguments)]
+    /// Write the element's guard into row `pos`: a pure writer under the
+    /// caller's row capture (see [`journal_row_write`]). Every component's cell
+    /// is encoded before the first byte moves, so a refused guard writes nothing.
     fn stamp(
         &self,
-        undo: &mut UndoState,
-        delta_mode: bool,
         state: &mut [u8],
         smap: &StructMapSlot,
-        slot: u32,
-        key: u32,
         pos: u32,
         cols: &[&[u8]],
         element_idx: u32,
-        row_created: bool,
     ) -> ErrorCode {
-        let row = smap.row_off(pos);
+        let mut cells = [([0u8; 8], 0u32); MAX_GUARD_COMPONENTS];
         for gi in 0..self.len {
-            let fi = self.fields[gi];
-            let ft = smap.field_type(state, fi);
-            let Some((cell, cell_size)) =
+            let ft = smap.field_type(state, self.fields[gi]);
+            let Some(cell) =
                 scalar_cell_encoded(ft, col_at(cols, self.cols[gi] as usize), element_idx)
             else {
                 return ErrorCode::InvalidProgram;
             };
+            cells[gi] = cell;
+        }
+        let row = smap.row_off(pos);
+        for gi in 0..self.len {
+            let fi = self.fields[gi];
+            let (cell, cell_size) = cells[gi];
             let f_off = row + smap.field_offset(state, fi);
-            let prior_bit = StructMapSlot::is_field_set(state, row, fi);
-            if undo.enabled {
-                let undo_flags = if row_created && gi == 0 {
-                    SMF_ROW_ABSENT
-                } else if prior_bit {
-                    SMF_BIT_SET
-                } else {
-                    0
-                };
-                let prior_aux = if prior_bit {
-                    pack_field_bytes(&state[f_off as usize..(f_off + cell_size) as usize])
-                } else {
-                    0
-                };
-                let smf = |pad2: u8, aux: u64| FlatUndoEntry {
-                    op: FlatUndoOp::StructMapField,
-                    slot,
-                    pad1: fi,
-                    pad2,
-                    key,
-                    prev_value: 0,
-                    aux,
-                };
-                append_mutation_state(
-                    undo,
-                    delta_mode,
-                    state,
-                    smf(undo_flags, prior_aux),
-                    smf(SMF_BIT_SET, pack_field_bytes(&cell[..cell_size as usize])),
-                );
-            }
             StructMapSlot::set_field_bit(state, row, fi);
             state[f_off as usize..(f_off + cell_size) as usize]
                 .copy_from_slice(&cell[..cell_size as usize]);
@@ -1725,11 +1578,6 @@ impl GuardTuple {
 
 // =============================================================================
 // Single-element struct-map operations
-
-struct StructUpsertResult {
-    err: ErrorCode,
-    pos: u32,
-}
 
 pub(crate) const MAX_STRUCT_SCALAR_OPERANDS: usize = 32;
 pub(crate) const MAX_STRUCT_ARRAY_OPERANDS: usize = 16;
@@ -2048,7 +1896,8 @@ fn resolve_struct_map_max_comparison(
         | StructFieldType::ArrayI64
         | StructFieldType::ArrayF64
         | StructFieldType::ArrayString
-        | StructFieldType::ArrayBool => return None,
+        | StructFieldType::ArrayBool
+        | StructFieldType::Vo => return None,
     };
     let col = vals
         .fields()
@@ -2063,6 +1912,31 @@ fn resolve_struct_map_max_comparison(
     })
 }
 
+/// Operand kinds are a program property, admitted before FIRST/MAX can skip
+/// a row. Skipping execution must not make an invalid mapping valid.
+fn validate_struct_map_operands(
+    state: &[u8],
+    map: &StructMapSlot,
+    operands: &StructMapUpsertOperands,
+) -> Result<(), ErrorCode> {
+    for &field in operands.vals.fields() {
+        if field >= map.num_fields {
+            return Err(ErrorCode::InvalidProgram);
+        }
+        if is_arena_field_type(map.field_type(state, field)) {
+            return Err(ErrorCode::InvalidProgram);
+        }
+    }
+    for field in operands.array_fields() {
+        if field.field_idx >= map.num_fields
+            || !is_arena_field_type(map.field_type(state, field.field_idx))
+        {
+            return Err(ErrorCode::InvalidProgram);
+        }
+    }
+    Ok(())
+}
+
 /// Decide a struct-map arg-max before bitset clearing, journaling, row writes,
 /// or change flags. Missing keys or missing stored comparison fields accept;
 /// equal and lower values are true no-ops.
@@ -2073,13 +1947,23 @@ fn should_upsert_struct_map_max(
     comparison: StructMapMaxComparison,
     cols: &[&[u8]],
     element_idx: u32,
-) -> bool {
+) -> Result<bool, ErrorCode> {
+    let width = comparison.cmp_type.stride();
+    let start = (element_idx as usize)
+        .checked_mul(width)
+        .ok_or(ErrorCode::ColumnUnderrun)?;
+    let end = start.checked_add(width).ok_or(ErrorCode::ColumnUnderrun)?;
+    let cell = cols
+        .get(comparison.col as usize)
+        .and_then(|col| col.get(start..end))
+        .ok_or(ErrorCode::ColumnUnderrun)?;
+    let incoming = hashmap_ops::read_cmp_value(cell, 0, comparison.cmp_type);
     let Some(position) = smap.find(state, key) else {
-        return true;
+        return Ok(true);
     };
     let row = smap.row_off(position);
     if !StructMapSlot::is_field_set(state, row, comparison.field_idx) {
-        return true;
+        return Ok(true);
     }
 
     let field_offset = row + smap.field_offset(state, comparison.field_idx);
@@ -2093,95 +1977,152 @@ fn should_upsert_struct_map_max(
         | StructFieldType::ArrayI64
         | StructFieldType::ArrayF64
         | StructFieldType::ArrayString
-        | StructFieldType::ArrayBool => unreachable!("comparison kind validated as scalar"),
+        | StructFieldType::ArrayBool
+        | StructFieldType::Vo => unreachable!("comparison kind validated as scalar"),
     };
-    let incoming = hashmap_ops::read_cmp_value(
-        col_at(cols, comparison.col as usize),
-        element_idx,
-        comparison.cmp_type,
-    );
-    hashmap_ops::cmp_gt(incoming, existing, comparison.cmp_type)
+    Ok(hashmap_ops::cmp_gt(incoming, existing, comparison.cmp_type))
 }
 
-/// Upsert one struct-map row using the latest-value strategy.
-#[allow(clippy::too_many_arguments)]
-fn single_struct_map_upsert_last(
-    undo: &mut UndoState,
-    delta_mode: bool,
-    state: &mut [u8],
-    slot_idx: u32,
+/// A checked row mutation. Probing and scalar source admission leave the
+/// position and borrowed sources the writer actually consumes.
+struct PreparedRow<'a> {
+    map: StructMapSlot,
+    slot: u32,
     key: u32,
-    val_cols: &[u32],
-    field_idxs: &[u8],
-    cols: &[&[u8]],
+    upsert: crate::struct_map::Upsert,
+    arena: Option<ArenaRegion>,
+    val_cols: &'a [u32],
+    field_idxs: &'a [u8],
+    cols: &'a [&'a [u8]],
     element_idx: u32,
-) -> StructUpsertResult {
-    if key == EMPTY_KEY || key == TOMBSTONE {
-        return StructUpsertResult {
-            err: ErrorCode::Ok,
-            pos: 0,
-        };
-    }
+}
 
-    let smap = StructMapSlot::bind(state, slot_idx);
-    let Some(result) = smap.upsert(state, key) else {
-        let meta_base = slot_meta_base(slot_idx);
-        state[(meta_base + SlotMetaOffset::CHANGE_FLAGS) as usize] |= ChangeFlag::INSERTED;
-        NEEDS_GROWTH_SLOT.store(slot_idx, Ordering::Relaxed);
-        return StructUpsertResult {
-            err: ErrorCode::CapacityExceeded,
-            pos: 0,
-        };
-    };
-
-    let row = smap.row_off(result.pos);
-
-    // Capture the prior row before clear_bitset wipes it; small batches have no
-    // overflow shadow snapshot to fall back on.
-    let mut prior = RowPrior::new();
-    if undo.enabled && !result.is_new {
-        capture_struct_map_row_prior(state, &smap, row, &mut prior);
-    }
-
-    smap.clear_bitset(state, row);
-
-    for (vi, &val_col) in val_cols.iter().enumerate() {
-        smap.write_scalar_field(
+impl<'a> PreparedRow<'a> {
+    #[allow(clippy::too_many_arguments)]
+    fn prepare(
+        state: &[u8],
+        map: StructMapSlot,
+        slot: u32,
+        key: u32,
+        val_cols: &'a [u32],
+        field_idxs: &'a [u8],
+        cols: &'a [&'a [u8]],
+        element_idx: u32,
+    ) -> Result<Self, ErrorCode> {
+        if val_cols.len() != field_idxs.len() {
+            return Err(ErrorCode::InvalidProgram);
+        }
+        validate_scalar_fields(
             state,
-            result.pos,
-            field_idxs[vi],
+            map.field_types_off,
+            map.num_fields,
+            val_cols,
+            field_idxs,
             cols,
-            val_col,
             element_idx,
-        );
-    }
-
-    if undo.enabled {
-        emit_struct_map_row_journal(
-            undo,
-            delta_mode,
-            state,
-            &smap,
-            slot_idx,
+        )?;
+        let upsert = map
+            .plan_upsert(state, key)
+            .ok_or(ErrorCode::CapacityExceeded)?;
+        let arena = if map.arena_header_off == 0 {
+            None
+        } else {
+            let arena = ArenaRegion::bind(state, map.arena_header_off)?;
+            if !upsert.is_new {
+                let row = map.row_off(upsert.pos);
+                let mut offset = map.bitset_bytes;
+                for field_idx in 0..map.num_fields {
+                    let kind = map.field_type(state, field_idx);
+                    if is_arena_field_type(kind)
+                        && StructMapSlot::is_field_set(state, row, field_idx)
+                    {
+                        arena.bytes(
+                            state,
+                            bytes::read_u32(state, row + offset),
+                            bytes::read_u32(state, row + offset + 4),
+                            arena_elem_size(kind),
+                        )?;
+                    }
+                    offset += struct_field_size(kind);
+                }
+            }
+            Some(arena)
+        };
+        Ok(Self {
+            map,
+            slot,
             key,
-            result.pos,
-            result.is_new,
-            &prior,
-        );
+            upsert,
+            arena,
+            val_cols,
+            field_idxs,
+            cols,
+            element_idx,
+        })
     }
 
-    // Change flags are change tracking, not journaling: the RETE gate and the
-    // slot-change alphas read them on every batch, delta mode or not (the
-    // two-key upsert already stamps unconditionally).
-    let meta_base = slot_meta_base(slot_idx);
-    state[(meta_base + SlotMetaOffset::CHANGE_FLAGS) as usize] |= if result.is_new {
-        ChangeFlag::INSERTED
-    } else {
-        ChangeFlag::UPDATED
-    };
-    StructUpsertResult {
-        err: ErrorCode::Ok,
-        pos: result.pos,
+    fn write(&self, state: &mut [u8]) {
+        self.map.apply_upsert(state, self.key, self.upsert);
+        self.map
+            .clear_bitset(state, self.map.row_off(self.upsert.pos));
+        for (&val_col, &field_idx) in self.val_cols.iter().zip(self.field_idxs) {
+            self.map.write_scalar_field(
+                state,
+                self.upsert.pos,
+                field_idx,
+                self.cols,
+                val_col,
+                self.element_idx,
+            );
+        }
+        state[(slot_meta_base(self.slot) + SlotMetaOffset::CHANGE_FLAGS) as usize] |=
+            if self.upsert.is_new {
+                ChangeFlag::INSERTED
+            } else {
+                ChangeFlag::UPDATED
+            };
+    }
+
+    /// One journal owner per mutation. An arena slot captures only the
+    /// affected key/row/metadata and append destination, never the whole arena.
+    fn apply(
+        &self,
+        undo: &mut UndoState,
+        delta_mode: bool,
+        state: &mut [u8],
+        arrays: Option<&ArenaWrites>,
+    ) -> Result<(), ErrorCode> {
+        let meta = slot_meta_base(self.slot);
+        let (header, append) = self.arena.map_or(((0, 0), (0, 0)), |arena| {
+            (
+                (arena.header + 4, if arrays.is_some() { 4 } else { 0 }),
+                (
+                    arena.data + arena.used,
+                    arrays.map_or(0, |plan| plan.used - arena.used),
+                ),
+            )
+        });
+        let ranges = [
+            (
+                meta + SlotMetaOffset::SIZE,
+                if self.upsert.is_new { 4 } else { 0 },
+            ),
+            (meta + SlotMetaOffset::CHANGE_FLAGS, 1),
+            (
+                self.map.keys_off + self.upsert.pos * 4,
+                if self.upsert.is_new { 4 } else { 0 },
+            ),
+            (self.map.row_off(self.upsert.pos), self.map.row_size),
+            header,
+            append,
+        ];
+        let capture = undo.begin_capture(state, &ranges)?;
+        self.write(state);
+        if let Some(arrays) = arrays {
+            arrays.write(state, &self.map, self.upsert.pos, self.cols);
+        }
+        undo.finish_capture(delta_mode, state, &ranges, capture);
+        Ok(())
     }
 }
 
@@ -2197,32 +2138,45 @@ fn single_struct_map2_upsert_last(
     field_idxs: &[u8],
     cols: &[&[u8]],
     element_idx: u32,
-) -> StructUpsertResult {
+) -> ErrorCode {
     if key1 == EMPTY_KEY || key1 == TOMBSTONE {
-        return StructUpsertResult {
-            err: ErrorCode::InvalidKey,
-            pos: 0,
-        };
+        return ErrorCode::InvalidKey;
     }
     let smap = StructMap2Slot::bind(state, slot);
-    if field_idxs.iter().any(|&field| field >= smap.num_fields) {
-        return StructUpsertResult {
-            err: ErrorCode::InvalidProgram,
-            pos: 0,
-        };
+    if let Err(err) = validate_scalar_fields(
+        state,
+        smap.field_types_off,
+        smap.num_fields,
+        val_cols,
+        field_idxs,
+        cols,
+        element_idx,
+    ) {
+        return err;
     }
-    let Some(result) = smap.upsert(state, key1, key2) else {
+    let Some(result) = smap.plan_upsert(state, key1, key2) else {
         NEEDS_GROWTH_SLOT.store(slot, Ordering::Relaxed);
-        return StructUpsertResult {
-            err: ErrorCode::CapacityExceeded,
-            pos: 0,
-        };
+        return ErrorCode::CapacityExceeded;
     };
     let row = smap.row_off(result.pos);
-    let mut prior = RowPrior::new();
-    if undo.enabled && !result.is_new {
-        capture_struct_map2_row_prior(state, &smap, row, &mut prior);
-    }
+    let ranges = [
+        (smap.size_off, if result.is_new { 4 } else { 0 }),
+        (slot_meta_base(slot) + SlotMetaOffset::CHANGE_FLAGS, 1),
+        (
+            smap.keys1_off + result.pos * 4,
+            if result.is_new { 4 } else { 0 },
+        ),
+        (
+            smap.keys2_off + result.pos * 4,
+            if result.is_new { 4 } else { 0 },
+        ),
+        (row, smap.row_size),
+    ];
+    let capture = match undo.begin_capture(state, &ranges) {
+        Ok(capture) => capture,
+        Err(error) => return error,
+    };
+    smap.apply_upsert(state, key1, key2, result);
     smap.clear_bitset(state, row);
     for (index, &val_col) in val_cols.iter().enumerate() {
         smap.write_scalar_field(
@@ -2234,30 +2188,14 @@ fn single_struct_map2_upsert_last(
             element_idx,
         );
     }
-    if undo.enabled {
-        emit_struct_map2_upsert_journal(
-            undo,
-            delta_mode,
-            state,
-            &smap,
-            slot,
-            key1,
-            key2,
-            result.pos,
-            result.is_new,
-            &prior,
-        );
-    }
     let meta_base = slot_meta_base(slot);
     state[(meta_base + SlotMetaOffset::CHANGE_FLAGS) as usize] |= if result.is_new {
         ChangeFlag::INSERTED
     } else {
         ChangeFlag::UPDATED
     };
-    StructUpsertResult {
-        err: ErrorCode::Ok,
-        pos: result.pos,
-    }
+    undo.finish_capture(delta_mode, state, &ranges, capture);
+    ErrorCode::Ok
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2270,19 +2208,13 @@ fn single_struct_map2_upsert_max_i64x2(
     key2: u32,
     cols: &[&[u8]],
     element_idx: u32,
-) -> StructUpsertResult {
+) -> ErrorCode {
     if key1 == EMPTY_KEY || key1 == TOMBSTONE {
-        return StructUpsertResult {
-            err: ErrorCode::InvalidKey,
-            pos: 0,
-        };
+        return ErrorCode::InvalidKey;
     }
     let smap = StructMap2Slot::bind(state, operands.row.slot);
     if !should_upsert_struct_map2_max_i64x2(state, &smap, key1, key2, operands, cols, element_idx) {
-        return StructUpsertResult {
-            err: ErrorCode::Ok,
-            pos: 0,
-        };
+        return ErrorCode::Ok;
     }
 
     // Room for the two comparison lanes was reserved at decode.
@@ -2319,17 +2251,21 @@ fn single_struct_map2_remove(
         return ErrorCode::Ok;
     };
     let row = smap.row_off(pos);
-    let mut prior = RowPrior::new();
-    if undo.enabled {
-        capture_struct_map2_row_prior(state, &smap, row, &mut prior);
-    }
-    let removed = smap.remove(state, key1, key2);
-    debug_assert_eq!(removed, Some(pos));
+    let ranges = [
+        (smap.size_off, 4),
+        (slot_meta_base(slot) + SlotMetaOffset::CHANGE_FLAGS, 1),
+        (smap.keys1_off + pos * 4, 4),
+        (row, smap.bitset_bytes),
+    ];
+    let capture = match undo.begin_capture(state, &ranges) {
+        Ok(capture) => capture,
+        Err(error) => return error,
+    };
+    smap.tombstone_at(state, pos);
+    smap.set_size(state, smap.size(state) - 1);
     smap.clear_bitset(state, row);
-    if undo.enabled {
-        emit_struct_map2_remove_journal(undo, delta_mode, state, &smap, slot, key1, key2, &prior);
-    }
     state[(slot_meta_base(slot) + SlotMetaOffset::CHANGE_FLAGS) as usize] |= ChangeFlag::REMOVED;
+    undo.finish_capture(delta_mode, state, &ranges, capture);
     ErrorCode::Ok
 }
 
@@ -2346,31 +2282,45 @@ fn single_struct_map_upsert_from_probe(
     probe_row: u32,
     probe_field_idxs: &[u8],
     out_field_idxs: &[u8],
-) -> StructUpsertResult {
+) -> ErrorCode {
     if out_key == EMPTY_KEY || out_key == TOMBSTONE {
-        return StructUpsertResult {
-            err: ErrorCode::Ok,
-            pos: 0,
-        };
+        return ErrorCode::Ok;
     }
 
-    let out = StructMapSlot::bind(state, out_slot);
-    let Some(result) = out.upsert(state, out_key) else {
-        let meta_base = slot_meta_base(out_slot);
-        state[(meta_base + SlotMetaOffset::CHANGE_FLAGS) as usize] |= ChangeFlag::INSERTED;
+    let out = match state_init::bind_struct_map(state, out_slot) {
+        Ok(out) => out,
+        Err(err) => return err,
+    };
+    for (&source, &destination) in probe_field_idxs.iter().zip(out_field_idxs) {
+        if source >= probe.num_fields || destination >= out.num_fields {
+            return ErrorCode::InvalidProgram;
+        }
+        let source_type = probe.field_type(state, source);
+        if source_type != out.field_type(state, destination) || is_arena_field_type(source_type) {
+            return ErrorCode::InvalidProgram;
+        }
+    }
+    let Some(result) = out.plan_upsert(state, out_key) else {
         NEEDS_GROWTH_SLOT.store(out_slot, Ordering::Relaxed);
-        return StructUpsertResult {
-            err: ErrorCode::CapacityExceeded,
-            pos: 0,
-        };
+        return ErrorCode::CapacityExceeded;
     };
 
     let out_row = out.row_off(result.pos);
 
-    let mut prior = RowPrior::new();
-    if undo.enabled && !result.is_new {
-        capture_struct_map_row_prior(state, &out, out_row, &mut prior);
-    }
+    let ranges = [
+        (out.size_off, if result.is_new { 4 } else { 0 }),
+        (slot_meta_base(out_slot) + SlotMetaOffset::CHANGE_FLAGS, 1),
+        (
+            out.keys_off + result.pos * 4,
+            if result.is_new { 4 } else { 0 },
+        ),
+        (out_row, out.row_size),
+    ];
+    let capture = match undo.begin_capture(state, &ranges) {
+        Ok(capture) => capture,
+        Err(error) => return error,
+    };
+    out.apply_upsert(state, out_key, result);
 
     out.clear_bitset(state, out_row);
 
@@ -2385,118 +2335,168 @@ fn single_struct_map_upsert_from_probe(
         bytes::copy_within(state, src_off, dst_off, fsize);
     }
 
-    if undo.enabled {
-        emit_struct_map_row_journal(
-            undo,
-            delta_mode,
-            state,
-            &out,
-            out_slot,
-            out_key,
-            result.pos,
-            result.is_new,
-            &prior,
-        );
-    }
-
-    // Change tracking, not journaling — see single_struct_map_upsert_last.
     let meta_base = slot_meta_base(out_slot);
     state[(meta_base + SlotMetaOffset::CHANGE_FLAGS) as usize] |= if result.is_new {
         ChangeFlag::INSERTED
     } else {
         ChangeFlag::UPDATED
     };
-    StructUpsertResult {
-        err: ErrorCode::Ok,
-        pos: result.pos,
-    }
+    undo.finish_capture(delta_mode, state, &ranges, capture);
+    ErrorCode::Ok
 }
 //#endregion reduce-typed-state.probe-upsert
 
-/// Write CSR array fields into the nested arena.
-#[allow(clippy::too_many_arguments)]
-fn write_struct_map_array_fields(
-    state: &mut [u8],
-    slot_idx: u32,
-    row_pos: u32,
-    array_fields: &[ArrayField],
+/// Validate scalar source geometry without writing or allocating. Arena-backed
+/// logical scalars must enter through CSR operands, never through scalar cells.
+fn validate_scalar_fields(
+    state: &[u8],
+    descriptor_off: u32,
+    num_fields: u8,
+    val_cols: &[u32],
+    field_idxs: &[u8],
     cols: &[&[u8]],
-    child_idx: u32,
-) -> ErrorCode {
-    if array_fields.is_empty() {
-        return ErrorCode::Ok;
-    }
-
-    let meta_base = slot_meta_base(slot_idx);
-    let slot_offset = bytes::read_u32(state, meta_base + SlotMetaOffset::OFFSET);
-    let capacity = bytes::read_u32(state, meta_base + SlotMetaOffset::CAPACITY);
-    let num_fields = state[(meta_base + SlotMetaOffset::AGG_TYPE) as usize];
-    let row_size = u32::from(bytes::read_u16(
-        state,
-        meta_base + SlotMetaOffset::TTL_SECONDS,
-    ));
-    let arena_header_off = bytes::read_u32(state, meta_base + SlotMetaOffset::GRACE_SECONDS);
-
-    if arena_header_off == 0 {
-        return ErrorCode::Ok; // no arena
-    }
-
-    let descriptor_size = align8(u32::from(num_fields));
-    let keys_offset = slot_offset + descriptor_size;
-    let rows_base = keys_offset + capacity * 4;
-    let row_off = rows_base + row_pos * row_size;
-
-    let arena_capacity = bytes::read_u32(state, arena_header_off);
-    let mut arena_used = bytes::read_u32(state, arena_header_off + 4);
-    let arena_data_base = arena_header_off + ARENA_HEADER_SIZE;
-
-    for &ArrayField {
-        offsets_col,
-        values_col,
-        field_idx,
-    } in array_fields
-    {
-        let field_type_byte = state[(slot_offset + u32::from(field_idx)) as usize];
-        let f_offset = {
-            let descriptor =
-                &state[slot_offset as usize..(slot_offset + u32::from(num_fields)) as usize];
-            state_init::struct_field_offset(num_fields, descriptor, field_idx)
+    element_idx: u32,
+) -> Result<(), ErrorCode> {
+    for (&col_idx, &field_idx) in val_cols.iter().zip(field_idxs) {
+        if field_idx >= num_fields {
+            return Err(ErrorCode::InvalidProgram);
+        }
+        let field_type =
+            StructFieldType::from_u8(state[(descriptor_off + u32::from(field_idx)) as usize])
+                .ok_or(ErrorCode::InvalidState)?;
+        if is_arena_field_type(field_type) {
+            return Err(ErrorCode::InvalidProgram);
+        }
+        let width = if field_type == StructFieldType::Bool {
+            4
+        } else {
+            struct_field_size(field_type)
         };
-        let elem_size = columine_types::types::arena_elem_size(
-            StructFieldType::from_u8(field_type_byte).unwrap_or_else(|| {
-                columine_types::die!("validated array field type vanished during execution")
-            }),
-        );
-
-        let offsets = col_u32(cols[offsets_col as usize], child_idx + 2);
-        let arr_start = offsets[child_idx as usize];
-        let arr_end = offsets[child_idx as usize + 1];
-        let arr_len = arr_end - arr_start;
-        let byte_len = arr_len * elem_size;
-
-        if arena_used + byte_len > arena_capacity {
-            NEEDS_GROWTH_SLOT.store(slot_idx, Ordering::Relaxed);
-            return ErrorCode::ArenaOverflow;
+        let end = element_idx
+            .checked_add(1)
+            .and_then(|n| n.checked_mul(width))
+            .ok_or(ErrorCode::ColumnUnderrun)?;
+        if cols
+            .get(col_idx as usize)
+            .is_none_or(|col| end as usize > col.len())
+        {
+            return Err(ErrorCode::ColumnUnderrun);
         }
+    }
+    Ok(())
+}
 
-        state[(row_off + u32::from(field_idx) / 8) as usize] |= 1 << (field_idx % 8);
+#[derive(Clone, Copy, Default)]
+struct ArenaWrite {
+    field_idx: u8,
+    field_offset: u32,
+    values_col: u32,
+    source_offset: u32,
+    byte_len: u32,
+    len: u32,
+    arena_offset: u32,
+}
 
-        bytes::write_u32(state, row_off + f_offset, arena_used);
-        bytes::write_u32(state, row_off + f_offset + 4, arr_len);
+struct ArenaWrites {
+    arena: Option<ArenaRegion>,
+    fields: [ArenaWrite; MAX_STRUCT_ARRAY_OPERANDS],
+    len: usize,
+    used: u32,
+}
 
-        if byte_len > 0 {
-            let src = cols[values_col as usize];
-            let src_off = (arr_start * elem_size) as usize;
-            let dst_off = (arena_data_base + arena_used) as usize;
-            state[dst_off..dst_off + byte_len as usize]
-                .copy_from_slice(&src[src_off..src_off + byte_len as usize]);
+impl ArenaWrites {
+    fn prepare(
+        state: &[u8],
+        row: &PreparedRow<'_>,
+        fields: &[ArrayField],
+    ) -> Result<Self, ErrorCode> {
+        let arena = row.arena.ok_or(ErrorCode::InvalidProgram)?;
+        let mut plan = Self {
+            arena: Some(arena),
+            fields: [ArenaWrite::default(); MAX_STRUCT_ARRAY_OPERANDS],
+            len: fields.len(),
+            used: arena.used,
+        };
+        for (write, field) in plan.fields.iter_mut().zip(fields) {
+            if field.field_idx >= row.map.num_fields {
+                return Err(ErrorCode::InvalidProgram);
+            }
+            let field_type =
+                StructFieldType::from_u8(row.map.field_type_byte(state, field.field_idx))
+                    .ok_or(ErrorCode::InvalidState)?;
+            if !is_arena_field_type(field_type) {
+                return Err(ErrorCode::InvalidProgram);
+            }
+            let elem_size = arena_elem_size(field_type);
+            let offsets = row
+                .cols
+                .get(field.offsets_col as usize)
+                .ok_or(ErrorCode::ColumnUnderrun)?;
+            let offset_pos = row
+                .element_idx
+                .checked_mul(4)
+                .ok_or(ErrorCode::ColumnUnderrun)?;
+            let offset_end = offset_pos.checked_add(8).ok_or(ErrorCode::ColumnUnderrun)?;
+            let pair = offsets
+                .get(offset_pos as usize..offset_end as usize)
+                .ok_or(ErrorCode::ColumnUnderrun)?;
+            let start = bytes::read_u32(pair, 0);
+            let end = bytes::read_u32(pair, 4);
+            let len = end.checked_sub(start).ok_or(ErrorCode::InvalidCellValue)?;
+            let source_offset = start
+                .checked_mul(elem_size)
+                .ok_or(ErrorCode::InvalidCellValue)?;
+            let source_end = end
+                .checked_mul(elem_size)
+                .ok_or(ErrorCode::InvalidCellValue)?;
+            let byte_len = source_end - source_offset;
+            let values = row
+                .cols
+                .get(field.values_col as usize)
+                .ok_or(ErrorCode::ColumnUnderrun)?;
+            if source_end as usize > values.len() {
+                return Err(ErrorCode::ColumnUnderrun);
+            }
+            let next_used = plan
+                .used
+                .checked_add(byte_len)
+                .ok_or(ErrorCode::ArenaOverflow)?;
+            if next_used > arena.capacity {
+                return Err(ErrorCode::ArenaOverflow);
+            }
+            *write = ArenaWrite {
+                field_idx: field.field_idx,
+                field_offset: row.map.field_offset(state, field.field_idx),
+                values_col: field.values_col,
+                source_offset,
+                byte_len,
+                len,
+                arena_offset: plan.used,
+            };
+            plan.used = next_used;
         }
-
-        arena_used += byte_len;
+        Ok(plan)
     }
 
-    bytes::write_u32(state, arena_header_off + 4, arena_used);
-    ErrorCode::Ok
+    fn write(&self, state: &mut [u8], smap: &StructMapSlot, pos: u32, cols: &[&[u8]]) {
+        let Some(arena) = self.arena else {
+            return;
+        };
+        let row = smap.row_off(pos);
+        for field in &self.fields[..self.len] {
+            StructMapSlot::set_field_bit(state, row, field.field_idx);
+            bytes::write_u32(state, row + field.field_offset, field.arena_offset);
+            bytes::write_u32(state, row + field.field_offset + 4, field.len);
+            bytes::copy(
+                state,
+                arena.data + field.arena_offset,
+                cols[field.values_col as usize],
+                field.source_offset,
+                field.byte_len,
+            );
+        }
+        bytes::write_u32(state, arena.header + 4, self.used);
+    }
 }
 
 /// Both batch and nested execution apply the same row replacement and arena journal.
@@ -2517,54 +2517,182 @@ fn upsert_struct_map_row(
     if key == EMPTY_KEY || key == TOMBSTONE {
         return OK;
     }
-    let (ranges, captured) = if array_fields.is_empty() {
-        ([(0, 0); 2], false)
-    } else {
-        let meta_base = slot_meta_base(slot_idx);
-        let arena_header = bytes::read_u32(state, meta_base + SlotMetaOffset::GRACE_SECONDS);
-        let arena_capacity = bytes::read_u32(state, arena_header);
-        let ranges = [
-            (meta_base, SLOT_META_SIZE),
-            (
-                smap.slot_offset,
-                arena_header + ARENA_HEADER_SIZE + arena_capacity - smap.slot_offset,
-            ),
-        ];
-        let captured = undo.begin_state_capture(state, &ranges, u32::from(smap.num_fields) + 1);
-        (ranges, captured)
-    };
-    let result = single_struct_map_upsert_last(
-        undo,
-        delta_mode,
+    let row = match PreparedRow::prepare(
         state,
+        *smap,
         slot_idx,
         key,
         val_cols,
         field_idxs,
         cols,
         element_idx,
-    );
-    let error = if result.err == ErrorCode::Ok {
-        write_struct_map_array_fields(state, slot_idx, result.pos, array_fields, cols, element_idx)
-    } else {
-        result.err
+    ) {
+        Ok(row) => row,
+        Err(ErrorCode::CapacityExceeded) => {
+            NEEDS_GROWTH_SLOT.store(slot_idx, Ordering::Relaxed);
+            return NEEDS_GROWTH;
+        }
+        Err(error) => return error as u32,
     };
-    if captured {
-        undo.finish_state_capture(delta_mode, state, &ranges);
+    let arrays = if array_fields.is_empty() {
+        None
+    } else {
+        match ArenaWrites::prepare(state, &row, array_fields) {
+            Ok(plan) => Some(plan),
+            Err(ErrorCode::ArenaOverflow) => {
+                NEEDS_GROWTH_SLOT.store(slot_idx, Ordering::Relaxed);
+                return NEEDS_GROWTH;
+            }
+            Err(error) => return error as u32,
+        }
+    };
+    match row.apply(undo, delta_mode, state, arrays.as_ref()) {
+        Ok(()) => OK,
+        Err(error) => error as u32,
     }
-    if error == ErrorCode::CapacityExceeded || error == ErrorCode::ArenaOverflow {
-        NEEDS_GROWTH_SLOT.store(slot_idx, Ordering::Relaxed);
+}
+
+fn counts_error(error: crate::counts_fold::CountsFoldError) -> ErrorCode {
+    use crate::counts_fold::CountsFoldError;
+    match error {
+        CountsFoldError::InvalidProgram => ErrorCode::InvalidProgram,
+        CountsFoldError::ColumnUnderrun => ErrorCode::ColumnUnderrun,
+        CountsFoldError::InvalidCellValue => ErrorCode::InvalidCellValue,
+        CountsFoldError::FrameMismatch => ErrorCode::InvalidState,
+        CountsFoldError::MetadataConflict => ErrorCode::MetadataConflict,
+        CountsFoldError::CountOverflow => ErrorCode::CountOverflow,
+    }
+}
+
+/// Apply one physically planned fold. Schema-role certification belongs to
+/// the admitted program; this mutation owns its exact physical journal.
+fn fold_counts_row(
+    undo: &mut UndoState,
+    delta_mode: bool,
+    state: &mut [u8],
+    op: &crate::counts_fold::CountsFoldOp<'_>,
+    cols: &[&[u8]],
+    element: u32,
+) -> u32 {
+    use crate::counts_fold::{CountsFoldTarget, MAX_COUNTS_HISTOGRAMS, MAX_COUNTS_MASKS};
+    let map = match state_init::bind_struct_map(state, op.slot) {
+        Ok(map) => map,
+        Err(error) => return error as u32,
+    };
+    if op.field_idx >= map.num_fields || map.field_type(state, op.field_idx) != StructFieldType::Vo
+    {
+        return INVALID_PROGRAM;
+    }
+    let key = match op.read_key(cols, element) {
+        Ok(key) => key,
+        Err(error) => return counts_error(error) as u32,
+    };
+    if key == EMPTY_KEY || key == TOMBSTONE {
+        return OK;
+    }
+    let sample = match op.read_sample(cols, element) {
+        Ok(sample) => sample,
+        Err(error) => return counts_error(error) as u32,
+    };
+    let Some(upsert) = map.plan_upsert(state, key) else {
+        NEEDS_GROWTH_SLOT.store(op.slot, Ordering::Relaxed);
         return NEEDS_GROWTH;
+    };
+    let stored = if upsert.is_new {
+        None
+    } else {
+        match map.arena_field(state, upsert.pos, op.field_idx) {
+            Ok(frame) => frame,
+            Err(error) => return error as u32,
+        }
+    };
+    let plan = match op.prepare(stored, &sample) {
+        Ok(plan) => plan,
+        Err(error) => return counts_error(error) as u32,
+    };
+    let arena = match ArenaRegion::bind(state, map.arena_header_off) {
+        Ok(arena) => arena,
+        Err(error) => return error as u32,
+    };
+    let row = map.row_off(upsert.pos);
+    let cell = row + map.field_offset(state, op.field_idx);
+    let (frame_offset, frame_len, next_used) = match plan.target() {
+        CountsFoldTarget::Insert => {
+            let Ok(len) = u32::try_from(sample.init().len()) else {
+                return ErrorCode::InvalidCellValue as u32;
+            };
+            let Some(next_used) = arena.used.checked_add(len) else {
+                NEEDS_GROWTH_SLOT.store(op.slot, Ordering::Relaxed);
+                return NEEDS_GROWTH;
+            };
+            if next_used > arena.capacity {
+                NEEDS_GROWTH_SLOT.store(op.slot, Ordering::Relaxed);
+                return NEEDS_GROWTH;
+            }
+            (arena.data + arena.used, len, next_used)
+        }
+        CountsFoldTarget::Stored => (
+            arena.data + bytes::read_u32(state, cell),
+            bytes::read_u32(state, cell + 4),
+            arena.used,
+        ),
+    };
+    const MAX_RANGES: usize = 2 + MAX_COUNTS_HISTOGRAMS + MAX_COUNTS_MASKS;
+    let mut ranges = [(0, 0); MAX_RANGES];
+    let meta = slot_meta_base(op.slot);
+    let range_count = match plan.target() {
+        CountsFoldTarget::Insert => {
+            ranges[0] = (
+                meta + SlotMetaOffset::SIZE,
+                if upsert.is_new { 4 } else { 0 },
+            );
+            ranges[1] = (
+                map.keys_off + upsert.pos * 4,
+                if upsert.is_new { 4 } else { 0 },
+            );
+            ranges[2] = (row, map.row_size);
+            ranges[3] = (arena.header + 4, 4);
+            ranges[4] = (frame_offset, frame_len);
+            5
+        }
+        CountsFoldTarget::Stored => op.journal_ranges(&plan, frame_offset, &mut ranges),
+    };
+    ranges[range_count] = (meta + SlotMetaOffset::CHANGE_FLAGS, 1);
+    let ranges = &ranges[..range_count + 1];
+    let capture = match undo.begin_capture(state, ranges) {
+        Ok(capture) => capture,
+        Err(error) => return error as u32,
+    };
+    if plan.target() == CountsFoldTarget::Insert {
+        map.apply_upsert(state, key, upsert);
+        if upsert.is_new {
+            map.clear_bitset(state, row);
+        }
+        StructMapSlot::set_field_bit(state, row, op.field_idx);
+        bytes::write_u32(state, cell, arena.used);
+        bytes::write_u32(state, cell + 4, frame_len);
+        bytes::copy(state, frame_offset, sample.init(), 0, frame_len);
+        bytes::write_u32(state, arena.header + 4, next_used);
     }
-    error as u32
+    op.apply(
+        &plan,
+        &mut state[frame_offset as usize..(frame_offset + frame_len) as usize],
+    );
+    state[(meta + SlotMetaOffset::CHANGE_FLAGS) as usize] |= if upsert.is_new {
+        ChangeFlag::INSERTED
+    } else {
+        ChangeFlag::UPDATED
+    };
+    undo.finish_capture(delta_mode, state, ranges, capture);
+    OK
 }
 
 // =============================================================================
 // Aggregate execution
 // =============================================================================
 
-/// Execute an aggregate on f64 slots (`[value: u64][count: u64]`). The full
-/// u64 count uses the journal's `prev_value` low lane and `key` high lane.
+/// Reduce the aggregate value, capturing only its actual value lane and flag.
+/// The adjacent allocated count lane remains byte-identical.
 #[allow(clippy::too_many_arguments)]
 fn exec_agg_f64(
     undo: &mut UndoState,
@@ -2575,40 +2703,25 @@ fn exec_agg_f64(
     vals: &[f64],
     type_mask: Option<TypeMask<'_>>,
     pred_col: Option<&[u32]>,
-) {
+) -> ErrorCode {
     let meta = SlotMetaView::read(state, slot);
     let old_val = bytes::read_f64(state, meta.offset);
-    let count = bytes::read_u64(state, meta.offset + 8);
-
     let new_val = aggregates::reduce_col_f64(kind, vals, old_val, type_mask, pred_col);
-
-    // A NaN old or new value compares unequal, so every NaN transition changes.
     #[allow(clippy::float_cmp)]
     if new_val != old_val {
-        if undo.enabled {
-            let agg = |aux: u64| FlatUndoEntry {
-                op: FlatUndoOp::AggUpdate,
-                slot,
-                pad1: 0,
-                pad2: 0,
-                // Full u64 count: low half in prev_value, high half in the
-                // Store the full u64 count across the journal's low/high lanes
-                // so counts above u32::MAX remain lossless during rollback.
-                key: (count >> 32) as u32,
-                prev_value: count as u32,
-                aux,
-            };
-            append_mutation_state(
-                undo,
-                delta_mode,
-                state,
-                agg(old_val.to_bits()),
-                agg(new_val.to_bits()),
-            );
-        }
+        let ranges = [
+            (meta.offset, 8),
+            (meta.meta_base + SlotMetaOffset::CHANGE_FLAGS, 1),
+        ];
+        let capture = match undo.begin_capture(state, &ranges) {
+            Ok(capture) => capture,
+            Err(error) => return error,
+        };
         bytes::write_f64(state, meta.offset, new_val);
         meta.set_change_flag(state, ChangeFlag::SIZE_CHANGED);
+        undo.finish_capture(delta_mode, state, &ranges, capture);
     }
+    ErrorCode::Ok
 }
 
 /// Execute an aggregate on i64 slots.
@@ -2622,38 +2735,24 @@ fn exec_agg_i64(
     vals: &[i64],
     type_mask: Option<TypeMask<'_>>,
     pred_col: Option<&[u32]>,
-) {
+) -> ErrorCode {
     let meta = SlotMetaView::read(state, slot);
     let old_val = bytes::read_i64(state, meta.offset);
-    let count = bytes::read_u64(state, meta.offset + 8);
-
     let new_val = aggregates::reduce_col_i64(kind, vals, old_val, type_mask, pred_col);
-
     if new_val != old_val {
-        if undo.enabled {
-            let agg = |aux: u64| FlatUndoEntry {
-                op: FlatUndoOp::AggUpdate,
-                slot,
-                pad1: 0,
-                pad2: 0,
-                // Full u64 count: low half in prev_value, high half in the
-                // Store the full u64 count across the journal's low/high lanes
-                // so counts above u32::MAX remain lossless during rollback.
-                key: (count >> 32) as u32,
-                prev_value: count as u32,
-                aux,
-            };
-            append_mutation_state(
-                undo,
-                delta_mode,
-                state,
-                agg(old_val as u64),
-                agg(new_val as u64),
-            );
-        }
+        let ranges = [
+            (meta.offset, 8),
+            (meta.meta_base + SlotMetaOffset::CHANGE_FLAGS, 1),
+        ];
+        let capture = match undo.begin_capture(state, &ranges) {
+            Ok(capture) => capture,
+            Err(error) => return error,
+        };
         bytes::write_i64(state, meta.offset, new_val);
         meta.set_change_flag(state, ChangeFlag::SIZE_CHANGED);
+        undo.finish_capture(delta_mode, state, &ranges, capture);
     }
+    ErrorCode::Ok
 }
 
 /// Bump a COUNT slot.
@@ -2663,32 +2762,31 @@ fn exec_agg_count(
     state: &mut [u8],
     slot: u32,
     matched: u64,
-) {
+) -> ErrorCode {
     let meta = SlotMetaView::read(state, slot);
     if matched == 0 {
-        return;
+        return ErrorCode::Ok;
     }
-    let prev_count = bytes::read_u64(state, meta.offset);
-    let next_count = prev_count + matched;
-    if undo.enabled {
-        // Full u64 count: prev_value low + key high lanes (see undo_log).
-        let cu = |prev: u64| FlatUndoEntry {
-            op: FlatUndoOp::CountUpdate,
-            slot,
-            pad1: 0,
-            pad2: 0,
-            key: (prev >> 32) as u32,
-            prev_value: prev as u32,
-            aux: 0,
-        };
-        append_mutation_state(undo, delta_mode, state, cu(prev_count), cu(next_count));
-    }
-    bytes::write_u64(state, meta.offset, next_count);
+    let previous = bytes::read_u64(state, meta.offset);
+    let Some(next) = previous.checked_add(matched) else {
+        return ErrorCode::CountOverflow;
+    };
+    let ranges = [
+        (meta.offset, 8),
+        (meta.meta_base + SlotMetaOffset::CHANGE_FLAGS, 1),
+    ];
+    let capture = match undo.begin_capture(state, &ranges) {
+        Ok(capture) => capture,
+        Err(error) => return error,
+    };
+    bytes::write_u64(state, meta.offset, next);
     meta.set_change_flag(state, ChangeFlag::SIZE_CHANGED);
+    undo.finish_capture(delta_mode, state, &ranges, capture);
+    ErrorCode::Ok
 }
 
-/// Execute the shared BATCH_SCALAR_LATEST core. Unknown scalar subtypes return
-/// INVALID_PROGRAM. Scalar writes are undo-journaled with one pair per change.
+/// Select a scalar latest value without writes, then capture and publish its
+/// actual value width, timestamp and change flag once.
 #[allow(clippy::too_many_arguments)]
 fn exec_scalar_latest(
     undo: &mut UndoState,
@@ -2725,9 +2823,8 @@ fn exec_scalar_latest(
     {
         return ErrorCode::ColumnUnderrun;
     }
-    let prev_value = bytes::read_u64(state, data);
-    let prev_ts = bytes::read_f64(state, data + 8);
-
+    let mut latest = bytes::read_f64(state, data + 8);
+    let mut selected = None;
     let matches = |i: usize| type_mask.is_none_or(|(td, id)| td[i] == id);
     match kind {
         AggType::ScalarU32 => {
@@ -2735,11 +2832,9 @@ fn exec_scalar_latest(
                 return ErrorCode::ColumnUnderrun;
             };
             for i in 0..batch_len as usize {
-                let ts = cmp_vals[i];
-                if matches(i) && ts > bytes::read_f64(state, data + 8) && vals[i] != EMPTY_KEY {
-                    bytes::write_u32(state, data, vals[i]);
-                    bytes::write_f64(state, data + 8, ts);
-                    meta.set_change_flag(state, ChangeFlag::UPDATED);
+                if matches(i) && cmp_vals[i] > latest && vals[i] != EMPTY_KEY {
+                    latest = cmp_vals[i];
+                    selected = Some(u64::from(vals[i]));
                 }
             }
         }
@@ -2748,11 +2843,9 @@ fn exec_scalar_latest(
                 return ErrorCode::ColumnUnderrun;
             };
             for i in 0..batch_len as usize {
-                let ts = cmp_vals[i];
-                if matches(i) && ts > bytes::read_f64(state, data + 8) {
-                    bytes::write_f64(state, data, vals[i]);
-                    bytes::write_f64(state, data + 8, ts);
-                    meta.set_change_flag(state, ChangeFlag::UPDATED);
+                if matches(i) && cmp_vals[i] > latest {
+                    latest = cmp_vals[i];
+                    selected = Some(vals[i].to_bits());
                 }
             }
         }
@@ -2761,41 +2854,32 @@ fn exec_scalar_latest(
                 return ErrorCode::ColumnUnderrun;
             };
             for i in 0..batch_len as usize {
-                let ts = cmp_vals[i];
-                if matches(i) && ts > bytes::read_f64(state, data + 8) {
-                    bytes::write_i64(state, data, vals[i]);
-                    bytes::write_f64(state, data + 8, ts);
-                    meta.set_change_flag(state, ChangeFlag::UPDATED);
+                if matches(i) && cmp_vals[i] > latest {
+                    latest = cmp_vals[i];
+                    selected = Some(u64::from_le_bytes(vals[i].to_le_bytes()));
                 }
             }
         }
         _ => return ErrorCode::InvalidProgram,
     }
-
-    if undo.enabled {
-        let next_value = bytes::read_u64(state, data);
-        let next_ts = bytes::read_f64(state, data + 8);
-        if next_value != prev_value || next_ts.to_bits() != prev_ts.to_bits() {
-            // value bits ride aux; timestamp bits ride prev_value (low) +
-            // key (high) — same split as the widened count lanes.
-            let su = |value: u64, ts: f64| FlatUndoEntry {
-                op: FlatUndoOp::ScalarUpdate,
-                slot,
-                pad1: 0,
-                pad2: 0,
-                key: (ts.to_bits() >> 32) as u32,
-                prev_value: ts.to_bits() as u32,
-                aux: value,
-            };
-            append_mutation_state(
-                undo,
-                delta_mode,
-                state,
-                su(prev_value, prev_ts),
-                su(next_value, next_ts),
-            );
-        }
-    }
+    let Some(value) = selected else {
+        return ErrorCode::Ok;
+    };
+    let width = if kind == AggType::ScalarU32 { 4 } else { 8 };
+    let ranges = [
+        (data, width),
+        (data + 8, 8),
+        (meta.meta_base + SlotMetaOffset::CHANGE_FLAGS, 1),
+    ];
+    let capture = match undo.begin_capture(state, &ranges) {
+        Ok(capture) => capture,
+        Err(error) => return error,
+    };
+    let encoded = value.to_le_bytes();
+    state[data as usize..(data + width) as usize].copy_from_slice(&encoded[..width as usize]);
+    bytes::write_f64(state, data + 8, latest);
+    meta.set_change_flag(state, ChangeFlag::UPDATED);
+    undo.finish_capture(delta_mode, state, &ranges, capture);
     ErrorCode::Ok
 }
 
@@ -2913,23 +2997,40 @@ impl Vm {
         self.execute_impl(true, state, program, cols, batch_len, Some(live))
     }
 
-    /// Evict every expired entry, returning a count that cannot collide with an error.
-    pub fn evict_all_expired(&mut self, state: &mut [u8], now: f64) -> Result<u32, ErrorCode> {
-        if bytes::read_u32(state, 0) != STATE_MAGIC
+    /// Evict expired entries on the selected lane. A delta operation retains
+    /// complete paired physical redo; an undo-only operation does not.
+    pub fn evict_all_expired(
+        &mut self,
+        delta_mode: bool,
+        state: &mut [u8],
+        now: f64,
+    ) -> Result<u32, ErrorCode> {
+        if state.len() < columine_types::types::STATE_HEADER_SIZE as usize
+            || bytes::read_u32(state, 0) != STATE_MAGIC
             || state[StateHeaderOffset::FORMAT_VERSION as usize] != STATE_FORMAT_VERSION
         {
             return Err(ErrorCode::InvalidState);
         }
-        let num_slots = state_num_slots(state);
-        let mut total = 0u32;
-        for i in 0..num_slots {
-            let meta = SlotMetaView::read(state, i);
-            if meta.has_ttl() {
-                clear_evicted_buffer(state, &meta);
-                total += evict_expired(&mut self.undo, &mut self.bitmap_env, state, &meta, i, now);
+        let slots = state_num_slots(state);
+        self.change_flag_boundary(delta_mode, state, |vm, state| {
+            let mut total = 0u32;
+            for slot in 0..slots {
+                let meta = SlotMetaView::read(state, slot);
+                if meta.has_ttl() {
+                    total = total
+                        .checked_add(evict_expired(
+                            delta_mode,
+                            &mut vm.undo,
+                            &mut vm.bitmap_env,
+                            state,
+                            &meta,
+                            now,
+                        )?)
+                        .ok_or(ErrorCode::InvalidState)?;
+                }
             }
-        }
-        Ok(total)
+            Ok(total)
+        })?
     }
 
     /// Execute the core batch implementation for normal or delta mode.
@@ -2940,9 +3041,10 @@ impl Vm {
         program: &[u8],
         cols: &[&[u8]],
         batch_len: u32,
-        mut live: Option<&mut LiveColumns<'_, '_>>,
+        live: Option<&mut LiveColumns<'_, '_>>,
     ) -> u32 {
-        if bytes::read_u32(state, 0) != STATE_MAGIC
+        if state.len() < columine_types::types::STATE_HEADER_SIZE as usize
+            || bytes::read_u32(state, 0) != STATE_MAGIC
             || state[StateHeaderOffset::FORMAT_VERSION as usize] != STATE_FORMAT_VERSION
         {
             return INVALID_STATE;
@@ -2956,8 +3058,36 @@ impl Vm {
         {
             return INVALID_PROGRAM;
         }
-        let code = sections.reduce_code;
+        if !state_init::program_matches_state(
+            sections.init_code,
+            sections.header.num_slots,
+            state,
+            &mut self.declared_slots,
+        ) {
+            return INVALID_PROGRAM;
+        }
+        self.change_flag_boundary(delta_mode, state, |vm, state| {
+            vm.execute_ops(
+                delta_mode,
+                state,
+                sections.reduce_code,
+                cols,
+                batch_len,
+                live,
+            )
+        })
+        .unwrap_or_else(|error| error as u32)
+    }
 
+    fn execute_ops(
+        &mut self,
+        delta_mode: bool,
+        state: &mut [u8],
+        code: &[u8],
+        cols: &[&[u8]],
+        batch_len: u32,
+        mut live: Option<&mut LiveColumns<'_, '_>>,
+    ) -> u32 {
         let mut pc = 0usize;
         while pc < code.len() {
             let Some(_) = body_op_len(code, pc) else {
@@ -3098,7 +3228,7 @@ impl Vm {
                     let (slot, key_col) = (operand!(r.index()), operand!(r.index()));
                     pc = r.pos();
                     let meta = SlotMetaView::read(state, slot);
-                    hashmap_ops::batch_map_remove(
+                    let result = hashmap_ops::batch_map_remove(
                         delta_mode,
                         state,
                         &meta,
@@ -3106,6 +3236,9 @@ impl Vm {
                         batch_col!(col_u32_exact(col_at(cols, key_col as usize), batch_len)),
                         &mut self.ctx(),
                     );
+                    if result != ErrorCode::Ok {
+                        return signal_growth(slot, result);
+                    }
                 }
 
                 Opcode::BatchMapUpsertMax | Opcode::BatchMapUpsertMin => {
@@ -3161,7 +3294,6 @@ impl Vm {
                     let result = self.set_insert(
                         delta_mode,
                         state,
-                        &meta,
                         slot,
                         batch_col!(col_u32_exact(col_at(cols, elem_col as usize), batch_len)),
                         ts,
@@ -3178,11 +3310,9 @@ impl Vm {
                         operand!(r.index()),
                     );
                     pc = r.pos();
-                    let meta = SlotMetaView::read(state, slot);
                     let result = self.set_insert(
                         delta_mode,
                         state,
-                        &meta,
                         slot,
                         batch_col!(col_u32_exact(col_at(cols, elem_col as usize), batch_len)),
                         Some(batch_col!(col_f64_exact(
@@ -3198,11 +3328,9 @@ impl Vm {
                 Opcode::BatchSetRemove => {
                     let (slot, elem_col) = (operand!(r.index()), operand!(r.index()));
                     pc = r.pos();
-                    let meta = SlotMetaView::read(state, slot);
                     let result = self.set_remove(
                         delta_mode,
                         state,
-                        &meta,
                         slot,
                         batch_col!(col_u32_exact(col_at(cols, elem_col as usize), batch_len)),
                     );
@@ -3226,7 +3354,6 @@ impl Vm {
                     let result = self.set_insert(
                         delta_mode,
                         state,
-                        &meta,
                         slot,
                         batch_col!(col_u32_exact(col_at(cols, elem_col as usize), batch_len)),
                         ts,
@@ -3239,11 +3366,9 @@ impl Vm {
                 Opcode::BatchBitmapRemove => {
                     let (slot, elem_col) = (operand!(r.index()), operand!(r.index()));
                     pc = r.pos();
-                    let meta = SlotMetaView::read(state, slot);
                     let result = self.set_remove(
                         delta_mode,
                         state,
-                        &meta,
                         slot,
                         batch_col!(col_u32_exact(col_at(cols, elem_col as usize), batch_len)),
                     );
@@ -3258,8 +3383,6 @@ impl Vm {
                 | Opcode::BatchBitmapXor => {
                     let (target_slot, source_slot) = (operand!(r.index()), operand!(r.index()));
                     pc = r.pos();
-                    let target_meta = SlotMetaView::read(state, target_slot);
-                    let source_meta = SlotMetaView::read(state, source_slot);
                     let alg_op = match op {
                         Opcode::BatchBitmapAnd => BitmapAlgebraOp::And,
                         Opcode::BatchBitmapOr => BitmapAlgebraOp::Or,
@@ -3267,10 +3390,11 @@ impl Vm {
                         _ => BitmapAlgebraOp::Xor,
                     };
                     let result = self.bitmap_algebra(
+                        delta_mode,
                         alg_op,
                         state,
-                        &target_meta,
-                        BitmapSource::Slot(get_bitmap_storage(&source_meta)),
+                        target_slot,
+                        BitmapSource::Slot(source_slot),
                     );
                     if result == ErrorCode::CapacityExceeded {
                         return signal_growth(target_slot, result);
@@ -3286,15 +3410,19 @@ impl Vm {
                 | Opcode::BatchBitmapXorScratch => {
                     let target_slot = operand!(r.index());
                     pc = r.pos();
-                    let target_meta = SlotMetaView::read(state, target_slot);
                     let alg_op = match op {
                         Opcode::BatchBitmapAndScratch => BitmapAlgebraOp::And,
                         Opcode::BatchBitmapOrScratch => BitmapAlgebraOp::Or,
                         Opcode::BatchBitmapAndNotScratch => BitmapAlgebraOp::AndNot,
                         _ => BitmapAlgebraOp::Xor,
                     };
-                    let result =
-                        self.bitmap_algebra(alg_op, state, &target_meta, BitmapSource::Scratch);
+                    let result = self.bitmap_algebra(
+                        delta_mode,
+                        alg_op,
+                        state,
+                        target_slot,
+                        BitmapSource::Scratch,
+                    );
                     if result == ErrorCode::CapacityExceeded {
                         return signal_growth(target_slot, result);
                     }
@@ -3311,7 +3439,7 @@ impl Vm {
                         Opcode::BatchAggMin => AggKind::Min,
                         _ => AggKind::Max,
                     };
-                    exec_agg_f64(
+                    let result = exec_agg_f64(
                         &mut self.undo,
                         delta_mode,
                         state,
@@ -3321,18 +3449,24 @@ impl Vm {
                         None,
                         None,
                     );
+                    if result != ErrorCode::Ok {
+                        return result as u32;
+                    }
                 }
 
                 Opcode::BatchAggCount => {
                     let slot = operand!(r.index());
                     pc = r.pos();
-                    exec_agg_count(
+                    let result = exec_agg_count(
                         &mut self.undo,
                         delta_mode,
                         state,
                         slot,
                         u64::from(batch_len),
                     );
+                    if result != ErrorCode::Ok {
+                        return result as u32;
+                    }
                 }
 
                 Opcode::BatchAggSumI64 | Opcode::BatchAggMinI64 | Opcode::BatchAggMaxI64 => {
@@ -3343,7 +3477,7 @@ impl Vm {
                         Opcode::BatchAggMinI64 => AggKind::Min,
                         _ => AggKind::Max,
                     };
-                    exec_agg_i64(
+                    let result = exec_agg_i64(
                         &mut self.undo,
                         delta_mode,
                         state,
@@ -3353,6 +3487,9 @@ impl Vm {
                         None,
                         None,
                     );
+                    if result != ErrorCode::Ok {
+                        return result as u32;
+                    }
                 }
 
                 Opcode::BatchScalarLatest => {
@@ -3390,7 +3527,13 @@ impl Vm {
                     };
                     pc = operands.end;
 
-                    let smap = StructMapSlot::bind(state, operands.slot);
+                    let smap = match state_init::bind_struct_map(state, operands.slot) {
+                        Ok(map) => map,
+                        Err(error) => return error as u32,
+                    };
+                    if let Err(error) = validate_struct_map_operands(state, &smap, &operands) {
+                        return error as u32;
+                    }
                     let comparison = match operands.comparison_field_idx {
                         Some(field_idx) => {
                             let Some(comparison) = resolve_struct_map_max_comparison(
@@ -3418,7 +3561,12 @@ impl Vm {
                                 let Some(comparison) = comparison else {
                                     return INVALID_PROGRAM;
                                 };
-                                should_upsert_struct_map_max(state, &smap, key, comparison, cols, i)
+                                match should_upsert_struct_map_max(
+                                    state, &smap, key, comparison, cols, i,
+                                ) {
+                                    Ok(should_write) => should_write,
+                                    Err(error) => return error as u32,
+                                }
                             }
                             _ => true,
                         };
@@ -3438,6 +3586,27 @@ impl Vm {
                             operands.array_fields(),
                             cols,
                             i,
+                        );
+                        if result != OK {
+                            return result;
+                        }
+                    }
+                }
+
+                Opcode::BatchStructMapCountsFold => {
+                    let operands = match crate::counts_fold::CountsFoldOp::decode(code, pc) {
+                        Ok(operands) => operands,
+                        Err(error) => return counts_error(error) as u32,
+                    };
+                    pc = operands.end;
+                    for row in 0..batch_len {
+                        let result = fold_counts_row(
+                            &mut self.undo,
+                            delta_mode,
+                            state,
+                            &operands,
+                            cols,
+                            row,
                         );
                         if result != OK {
                             return result;
@@ -3472,11 +3641,11 @@ impl Vm {
                             cols,
                             i,
                         );
-                        if result.err == ErrorCode::CapacityExceeded {
+                        if result == ErrorCode::CapacityExceeded {
                             return NEEDS_GROWTH;
                         }
-                        if result.err != ErrorCode::Ok {
-                            return result.err as u32;
+                        if result != ErrorCode::Ok {
+                            return result as u32;
                         }
                     }
                 }
@@ -3510,11 +3679,11 @@ impl Vm {
                             cols,
                             i,
                         );
-                        if result.err == ErrorCode::CapacityExceeded {
+                        if result == ErrorCode::CapacityExceeded {
                             return NEEDS_GROWTH;
                         }
-                        if result.err != ErrorCode::Ok {
-                            return result.err as u32;
+                        if result != ErrorCode::Ok {
+                            return result as u32;
                         }
                     }
                 }
@@ -3693,7 +3862,7 @@ impl Vm {
                         Opcode::BatchAggMin => AggKind::Min,
                         _ => AggKind::Max,
                     };
-                    exec_agg_f64(
+                    let result = exec_agg_f64(
                         &mut self.undo,
                         delta_mode,
                         state,
@@ -3706,11 +3875,18 @@ impl Vm {
                         }),
                         None,
                     );
+                    if result != ErrorCode::Ok {
+                        return result as u32;
+                    }
                 }
                 Opcode::BatchAggCount => {
                     let slot = operand!(r.index());
                     let matched = aggregates::masked_agg_count(type_data, type_id);
-                    exec_agg_count(&mut self.undo, delta_mode, state, slot, u64::from(matched));
+                    let result =
+                        exec_agg_count(&mut self.undo, delta_mode, state, slot, u64::from(matched));
+                    if result != ErrorCode::Ok {
+                        return result as u32;
+                    }
                 }
                 Opcode::BatchAggSumIf | Opcode::BatchAggMinIf | Opcode::BatchAggMaxIf => {
                     let (slot, val_col, pred_col) = (
@@ -3723,7 +3899,7 @@ impl Vm {
                         Opcode::BatchAggMinIf => AggKind::Min,
                         _ => AggKind::Max,
                     };
-                    exec_agg_f64(
+                    let result = exec_agg_f64(
                         &mut self.undo,
                         delta_mode,
                         state,
@@ -3739,6 +3915,9 @@ impl Vm {
                             batch_len
                         ))),
                     );
+                    if result != ErrorCode::Ok {
+                        return result as u32;
+                    }
                 }
                 Opcode::BatchAggCountIf => {
                     let (slot, pred_col) = (operand!(r.index()), operand!(r.index()));
@@ -3750,7 +3929,10 @@ impl Vm {
                             matched += 1;
                         }
                     }
-                    exec_agg_count(&mut self.undo, delta_mode, state, slot, matched);
+                    let result = exec_agg_count(&mut self.undo, delta_mode, state, slot, matched);
+                    if result != ErrorCode::Ok {
+                        return result as u32;
+                    }
                 }
                 Opcode::BatchScalarLatest => {
                     let (slot, val_col, cmp_col) = (
@@ -3781,7 +3963,7 @@ impl Vm {
                         Opcode::BatchAggMinI64 => AggKind::Min,
                         _ => AggKind::Max,
                     };
-                    exec_agg_i64(
+                    let result = exec_agg_i64(
                         &mut self.undo,
                         delta_mode,
                         state,
@@ -3794,6 +3976,9 @@ impl Vm {
                         }),
                         None,
                     );
+                    if result != ErrorCode::Ok {
+                        return result as u32;
+                    }
                 }
                 _ => return INVALID_PROGRAM,
             }
@@ -3882,9 +4067,8 @@ impl Vm {
                         cmp_type,
                         &mut self.ctx(),
                     );
-                    if result == ErrorCode::CapacityExceeded {
-                        NEEDS_GROWTH_SLOT.store(slot, Ordering::Relaxed);
-                        return NEEDS_GROWTH;
+                    if result != ErrorCode::Ok {
+                        return signal_growth(slot, result);
                     }
                 }
 
@@ -3909,9 +4093,8 @@ impl Vm {
                         CmpType::F64,
                         &mut self.ctx(),
                     );
-                    if result == ErrorCode::CapacityExceeded {
-                        NEEDS_GROWTH_SLOT.store(slot, Ordering::Relaxed);
-                        return NEEDS_GROWTH;
+                    if result != ErrorCode::Ok {
+                        return signal_growth(slot, result);
                     }
                 }
 
@@ -3941,9 +4124,8 @@ impl Vm {
                         CmpType::F64,
                         &mut self.ctx(),
                     );
-                    if result == ErrorCode::CapacityExceeded {
-                        NEEDS_GROWTH_SLOT.store(slot, Ordering::Relaxed);
-                        return NEEDS_GROWTH;
+                    if result != ErrorCode::Ok {
+                        return signal_growth(slot, result);
                     }
                 }
 
@@ -3976,9 +4158,8 @@ impl Vm {
                         CmpType::F64,
                         &mut self.ctx(),
                     );
-                    if result == ErrorCode::CapacityExceeded {
-                        NEEDS_GROWTH_SLOT.store(slot, Ordering::Relaxed);
-                        return NEEDS_GROWTH;
+                    if result != ErrorCode::Ok {
+                        return signal_growth(slot, result);
                     }
                 }
 
@@ -3987,7 +4168,7 @@ impl Vm {
                     let (slot, key_col) = (operand!(r.index()), operand!(r.index()));
                     bpc = r.pos();
                     let meta = SlotMetaView::read(state, slot);
-                    hashmap_ops::single_map_remove(
+                    let result = hashmap_ops::single_map_remove(
                         delta_mode,
                         state,
                         &meta,
@@ -3995,6 +4176,9 @@ impl Vm {
                         cell_u32(cols, key_col, child_idx),
                         &mut self.ctx(),
                     );
+                    if result != ErrorCode::Ok {
+                        return signal_growth(slot, result);
+                    }
                 }
 
                 // MAP_UPSERT_MAX (0x26) / MIN (0x27)
@@ -4032,9 +4216,8 @@ impl Vm {
                         cmp_type,
                         &mut self.ctx(),
                     );
-                    if result == ErrorCode::CapacityExceeded {
-                        NEEDS_GROWTH_SLOT.store(slot, Ordering::Relaxed);
-                        return NEEDS_GROWTH;
+                    if result != ErrorCode::Ok {
+                        return signal_growth(slot, result);
                     }
                 }
 
@@ -4074,9 +4257,8 @@ impl Vm {
                         cmp_type,
                         &mut self.ctx(),
                     );
-                    if result == ErrorCode::CapacityExceeded {
-                        NEEDS_GROWTH_SLOT.store(slot, Ordering::Relaxed);
-                        return NEEDS_GROWTH;
+                    if result != ErrorCode::Ok {
+                        return signal_growth(slot, result);
                     }
                 }
 
@@ -4115,9 +4297,8 @@ impl Vm {
                         CmpType::F64,
                         &mut self.ctx(),
                     );
-                    if result == ErrorCode::CapacityExceeded {
-                        NEEDS_GROWTH_SLOT.store(slot, Ordering::Relaxed);
-                        return NEEDS_GROWTH;
+                    if result != ErrorCode::Ok {
+                        return signal_growth(slot, result);
                     }
                 }
 
@@ -4131,7 +4312,7 @@ impl Vm {
                     bpc = r.pos();
                     predicate!(pred_col);
                     let meta = SlotMetaView::read(state, slot);
-                    hashmap_ops::single_map_remove(
+                    let result = hashmap_ops::single_map_remove(
                         delta_mode,
                         state,
                         &meta,
@@ -4139,6 +4320,9 @@ impl Vm {
                         cell_u32(cols, key_col, child_idx),
                         &mut self.ctx(),
                     );
+                    if result != ErrorCode::Ok {
+                        return signal_growth(slot, result);
+                    }
                 }
 
                 // MAP_UPSERT_MAX_IF (0x2C) / MIN_IF (0x2D)
@@ -4180,9 +4364,8 @@ impl Vm {
                         cmp_type,
                         &mut self.ctx(),
                     );
-                    if result == ErrorCode::CapacityExceeded {
-                        NEEDS_GROWTH_SLOT.store(slot, Ordering::Relaxed);
-                        return NEEDS_GROWTH;
+                    if result != ErrorCode::Ok {
+                        return signal_growth(slot, result);
                     }
                 }
 
@@ -4199,14 +4382,12 @@ impl Vm {
                     let result = self.set_insert(
                         delta_mode,
                         state,
-                        &meta,
                         slot,
                         &[cell_u32(cols, elem_col, child_idx)],
                         meta.has_ttl().then_some(&[ts][..]),
                     );
-                    if result == ErrorCode::CapacityExceeded {
-                        NEEDS_GROWTH_SLOT.store(slot, Ordering::Relaxed);
-                        return NEEDS_GROWTH;
+                    if result != ErrorCode::Ok {
+                        return signal_growth(slot, result);
                     }
                 }
 
@@ -4227,14 +4408,12 @@ impl Vm {
                     let result = self.set_insert(
                         delta_mode,
                         state,
-                        &meta,
                         slot,
                         &[cell_u32(cols, elem_col, child_idx)],
                         meta.has_ttl().then_some(&[ts][..]),
                     );
-                    if result == ErrorCode::CapacityExceeded {
-                        NEEDS_GROWTH_SLOT.store(slot, Ordering::Relaxed);
-                        return NEEDS_GROWTH;
+                    if result != ErrorCode::Ok {
+                        return signal_growth(slot, result);
                     }
                 }
 
@@ -4256,14 +4435,12 @@ impl Vm {
                     let result = self.set_insert(
                         delta_mode,
                         state,
-                        &meta,
                         slot,
                         &[cell_u32(cols, elem_col, child_idx)],
                         meta.has_ttl().then_some(&[ts][..]),
                     );
-                    if result == ErrorCode::CapacityExceeded {
-                        NEEDS_GROWTH_SLOT.store(slot, Ordering::Relaxed);
-                        return NEEDS_GROWTH;
+                    if result != ErrorCode::Ok {
+                        return signal_growth(slot, result);
                     }
                 }
 
@@ -4271,11 +4448,9 @@ impl Vm {
                 Opcode::BatchSetRemove | Opcode::BatchBitmapRemove => {
                     let (slot, elem_col) = (operand!(r.index()), operand!(r.index()));
                     bpc = r.pos();
-                    let meta = SlotMetaView::read(state, slot);
                     let result = self.set_remove(
                         delta_mode,
                         state,
-                        &meta,
                         slot,
                         &[cell_u32(cols, elem_col, child_idx)],
                     );
@@ -4297,7 +4472,13 @@ impl Vm {
                     }
                     bpc = operands.end;
 
-                    let smap = StructMapSlot::bind(state, operands.slot);
+                    let smap = match state_init::bind_struct_map(state, operands.slot) {
+                        Ok(map) => map,
+                        Err(error) => return error as u32,
+                    };
+                    if let Err(error) = validate_struct_map_operands(state, &smap, operands) {
+                        return error as u32;
+                    }
                     let comparison = match operands.comparison_field_idx {
                         Some(field_idx) => {
                             let Some(comparison) = resolve_struct_map_max_comparison(
@@ -4319,9 +4500,12 @@ impl Vm {
                             let Some(comparison) = comparison else {
                                 return INVALID_PROGRAM;
                             };
-                            should_upsert_struct_map_max(
+                            match should_upsert_struct_map_max(
                                 state, &smap, key, comparison, cols, child_idx,
-                            )
+                            ) {
+                                Ok(should_write) => should_write,
+                                Err(error) => return error as u32,
+                            }
                         }
                         _ => true,
                     };
@@ -4345,6 +4529,25 @@ impl Vm {
                     }
                 }
 
+                Opcode::BatchStructMapCountsFold => {
+                    let Some(operands) = crate::counts_fold::CountsFoldOp::decode_from(&mut r)
+                    else {
+                        return INVALID_PROGRAM;
+                    };
+                    bpc = operands.end;
+                    let result = fold_counts_row(
+                        &mut self.undo,
+                        delta_mode,
+                        state,
+                        &operands,
+                        cols,
+                        child_idx,
+                    );
+                    if result != OK {
+                        return result;
+                    }
+                }
+
                 // Exact two-lane struct map upsert/remove.
                 Opcode::BatchStructMap2UpsertLast => {
                     let operands = &mut self.element_struct_map2;
@@ -4364,11 +4567,11 @@ impl Vm {
                         cols,
                         child_idx,
                     );
-                    if result.err == ErrorCode::CapacityExceeded {
+                    if result == ErrorCode::CapacityExceeded {
                         return NEEDS_GROWTH;
                     }
-                    if result.err != ErrorCode::Ok {
-                        return result.err as u32;
+                    if result != ErrorCode::Ok {
+                        return result as u32;
                     }
                 }
                 Opcode::BatchStructMap2UpsertMaxI64x2 => {
@@ -4391,11 +4594,11 @@ impl Vm {
                         cols,
                         child_idx,
                     );
-                    if result.err == ErrorCode::CapacityExceeded {
+                    if result == ErrorCode::CapacityExceeded {
                         return NEEDS_GROWTH;
                     }
-                    if result.err != ErrorCode::Ok {
-                        return result.err as u32;
+                    if result != ErrorCode::Ok {
+                        return result as u32;
                     }
                 }
                 Opcode::BatchStructMap2Remove => {
@@ -4440,7 +4643,10 @@ impl Vm {
                     bpc = r.pos();
 
                     let key = cell_u32(cols, key_col, child_idx);
-                    let probe = StructMapSlot::bind(state, probe_slot);
+                    let probe = match state_init::bind_struct_map(state, probe_slot) {
+                        Ok(probe) => probe,
+                        Err(error) => return error as u32,
+                    };
                     let Some(probe_pos) = probe.find(state, key) else {
                         // Miss: skip (inner join); 'null' (left join) is
                         // compiler-rejected — treat defensively as skip.
@@ -4460,9 +4666,12 @@ impl Vm {
                         &probe_fis[..num_fields],
                         &out_fis[..num_fields],
                     );
-                    if result.err == ErrorCode::CapacityExceeded {
+                    if result == ErrorCode::CapacityExceeded {
                         NEEDS_GROWTH_SLOT.store(out_slot, Ordering::Relaxed);
                         return NEEDS_GROWTH;
+                    }
+                    if result != ErrorCode::Ok {
+                        return result as u32;
                     }
                 }
                 //#endregion reduce-typed-state.probe-exec
@@ -4495,7 +4704,20 @@ impl Vm {
                     bpc = r.pos();
 
                     let key = cell_u32(cols, key_col, child_idx);
-                    let probe = StructMapSlot::bind(state, probe_slot);
+                    let probe = match state_init::bind_struct_map(state, probe_slot) {
+                        Ok(probe) => probe,
+                        Err(error) => return error as u32,
+                    };
+                    for field in [route_field_idx, op_field_idx] {
+                        if field >= probe.num_fields
+                            || !matches!(
+                                probe.field_type(state, field),
+                                StructFieldType::UInt32 | StructFieldType::String
+                            )
+                        {
+                            return INVALID_PROGRAM;
+                        }
+                    }
                     let Some(probe_pos) = probe.find(state, key) else {
                         continue;
                     };
@@ -4514,139 +4736,91 @@ impl Vm {
                     let dest_slot = route_dest_slots[ri];
                     let dest_field_idx = route_dest_fields[ri];
                     let v_src_field_idx = route_v_src_fields[ri];
-                    let out_key_off =
-                        probe_row + probe.field_offset(state, route_out_key_fields[ri]);
+                    let out_key_field = route_out_key_fields[ri];
+                    if out_key_field >= probe.num_fields
+                        || !matches!(
+                            probe.field_type(state, out_key_field),
+                            StructFieldType::UInt32 | StructFieldType::String
+                        )
+                        || v_src_field_idx >= probe.num_fields
+                    {
+                        return INVALID_PROGRAM;
+                    }
+                    let out_key_off = probe_row + probe.field_offset(state, out_key_field);
                     let out_key = bytes::read_u32(state, out_key_off);
 
                     match route_kind {
                         // kind 0: card-one struct field on the `nodes` map.
                         0 => {
-                            let out = StructMapSlot::bind(state, dest_slot);
+                            let out = match state_init::bind_struct_map(state, dest_slot) {
+                                Ok(out) => out,
+                                Err(error) => return error as u32,
+                            };
+                            if dest_field_idx >= out.num_fields
+                                || v_src_field_idx >= probe.num_fields
+                            {
+                                return INVALID_PROGRAM;
+                            }
                             let dst_ft = out.field_type(state, dest_field_idx);
+                            if dst_ft != probe.field_type(state, v_src_field_idx)
+                                || is_arena_field_type(dst_ft)
+                            {
+                                return INVALID_PROGRAM;
+                            }
+                            // The source cell is copied out of the probed row before
+                            // the output row is touched, so no write reads its own
+                            // stale bytes.
                             let fsize = struct_field_size(dst_ft);
                             let src_off = probe_row + probe.field_offset(state, v_src_field_idx);
-
-                            if !is_retract {
-                                let Some(up) = out.upsert(state, out_key) else {
-                                    NEEDS_GROWTH_SLOT.store(dest_slot, Ordering::Relaxed);
-                                    return NEEDS_GROWTH;
-                                };
-                                let row = out.row_off(up.pos);
-                                let dst_off = row + out.field_offset(state, dest_field_idx);
-
-                                let prior_bit =
-                                    StructMapSlot::is_field_set(state, row, dest_field_idx);
-                                let value_matches = prior_bit
-                                    && state[dst_off as usize..(dst_off + fsize) as usize]
-                                        == state[src_off as usize..(src_off + fsize) as usize];
-                                if value_matches {
-                                    continue;
-                                }
-
-                                if self.undo.enabled {
-                                    let undo_flags = if up.is_new {
-                                        SMF_ROW_ABSENT
-                                    } else if prior_bit {
-                                        SMF_BIT_SET
-                                    } else {
-                                        0
-                                    };
-                                    let prior_aux = if up.is_new || !prior_bit {
-                                        0
-                                    } else {
-                                        pack_field_bytes(
-                                            &state[dst_off as usize..(dst_off + fsize) as usize],
-                                        )
-                                    };
-                                    let v_aux = pack_field_bytes(
-                                        &state[src_off as usize..(src_off + fsize) as usize],
-                                    );
-                                    let smf = |pad2: u8, aux: u64| FlatUndoEntry {
-                                        op: FlatUndoOp::StructMapField,
-                                        slot: dest_slot,
-                                        pad1: dest_field_idx,
-                                        pad2,
-                                        key: out_key,
-                                        prev_value: 0,
-                                        aux,
-                                    };
-                                    append_mutation_state(
-                                        &mut self.undo,
-                                        delta_mode,
-                                        state,
-                                        smf(undo_flags, prior_aux),
-                                        smf(SMF_BIT_SET, v_aux),
-                                    );
-                                }
-
-                                StructMapSlot::set_field_bit(state, row, dest_field_idx);
-                                bytes::copy_within(state, src_off, dst_off, fsize);
-                                let meta_base = slot_meta_base(dest_slot);
-                                state[(meta_base + SlotMetaOffset::CHANGE_FLAGS) as usize] |=
-                                    if prior_bit {
-                                        ChangeFlag::UPDATED
-                                    } else {
-                                        ChangeFlag::INSERTED
-                                    };
-                            } else if let Some(pos) = out.find(state, out_key) {
-                                let row = out.row_off(pos);
-                                let dst_off = row + out.field_offset(state, dest_field_idx);
-                                // Retract is a no-op unless the stored value matches v.
-                                let stored_matches =
-                                    StructMapSlot::is_field_set(state, row, dest_field_idx)
-                                        && state[dst_off as usize..(dst_off + fsize) as usize]
-                                            == state[src_off as usize..(src_off + fsize) as usize];
-                                if stored_matches {
-                                    if self.undo.enabled {
-                                        let prior_aux = pack_field_bytes(
-                                            &state[dst_off as usize..(dst_off + fsize) as usize],
-                                        );
-                                        let smf = |pad2: u8, aux: u64| FlatUndoEntry {
-                                            op: FlatUndoOp::StructMapField,
-                                            slot: dest_slot,
-                                            pad1: dest_field_idx,
-                                            pad2,
-                                            key: out_key,
-                                            prev_value: 0,
-                                            aux,
-                                        };
-                                        append_mutation_state(
-                                            &mut self.undo,
-                                            delta_mode,
-                                            state,
-                                            smf(SMF_BIT_SET, prior_aux),
-                                            smf(0, 0),
-                                        );
-                                    }
-                                    StructMapSlot::clear_scalar_field(state, row, dest_field_idx);
-                                    bytes::zero(state, dst_off, fsize);
-                                    let meta_base = slot_meta_base(dest_slot);
-                                    state[(meta_base + SlotMetaOffset::CHANGE_FLAGS) as usize] |=
-                                        ChangeFlag::REMOVED;
-                                }
+                            let mut cell = [0u8; 8];
+                            cell[..fsize as usize].copy_from_slice(
+                                &state[src_off as usize..(src_off + fsize) as usize],
+                            );
+                            let code = scatter_card_one(
+                                &mut self.undo,
+                                delta_mode,
+                                state,
+                                &out,
+                                dest_slot,
+                                out_key,
+                                dest_field_idx,
+                                &cell,
+                                fsize,
+                                is_retract,
+                            );
+                            if code != ErrorCode::Ok {
+                                return signal_growth(dest_slot, code);
                             }
                         }
                         // kind 1: card-many set — element is the precomputed
                         // interned composite (e, v) read off the probed row.
                         1 => {
+                            if dest_slot >= state_num_slots(state)
+                                || is_arena_field_type(probe.field_type(state, v_src_field_idx))
+                            {
+                                return INVALID_PROGRAM;
+                            }
                             let meta = SlotMetaView::read(state, dest_slot);
+                            if !matches!(meta.slot_type(), SlotType::HashSet | SlotType::Bitmap) {
+                                return INVALID_PROGRAM;
+                            }
                             let src_off = probe_row + probe.field_offset(state, v_src_field_idx);
                             let v = bytes::read_u32(state, src_off);
                             if is_retract {
-                                self.set_remove(delta_mode, state, &meta, dest_slot, &[v]);
+                                let result = self.set_remove(delta_mode, state, dest_slot, &[v]);
+                                if result != ErrorCode::Ok {
+                                    return signal_growth(dest_slot, result);
+                                }
                             } else {
                                 let set_result = self.set_insert(
                                     delta_mode,
                                     state,
-                                    &meta,
                                     dest_slot,
                                     &[v],
                                     meta.has_ttl().then_some(&[0.0][..]),
                                 );
-                                // Any failure requests growth so the caller can retry.
                                 if set_result != ErrorCode::Ok {
-                                    NEEDS_GROWTH_SLOT.store(dest_slot, Ordering::Relaxed);
-                                    return NEEDS_GROWTH;
+                                    return signal_growth(dest_slot, set_result);
                                 }
                             }
                         }
@@ -4703,7 +4877,13 @@ impl Vm {
                     match route_kind {
                         // kind 0: card-one struct field on the `nodes` map.
                         0 => {
-                            let out = StructMapSlot::bind(state, dest_slot);
+                            let out = match state_init::bind_struct_map(state, dest_slot) {
+                                Ok(out) => out,
+                                Err(error) => return error as u32,
+                            };
+                            if dest_field_idx >= out.num_fields {
+                                return INVALID_PROGRAM;
+                            }
                             let dst_ft = out.field_type(state, dest_field_idx);
                             let Some((cell, cell_size)) = scalar_cell_encoded(
                                 dst_ft,
@@ -4715,135 +4895,48 @@ impl Vm {
                                 // field bytes against garbage.
                                 return INVALID_PROGRAM;
                             };
-
-                            if !is_retract {
-                                let Some(up) = out.upsert(state, key) else {
-                                    NEEDS_GROWTH_SLOT.store(dest_slot, Ordering::Relaxed);
-                                    return NEEDS_GROWTH;
-                                };
-                                let row = out.row_off(up.pos);
-                                let dst_off = row + out.field_offset(state, dest_field_idx);
-
-                                let prior_bit =
-                                    StructMapSlot::is_field_set(state, row, dest_field_idx);
-                                let value_matches = prior_bit
-                                    && state[dst_off as usize..(dst_off + cell_size) as usize]
-                                        == cell[..cell_size as usize];
-                                if value_matches {
-                                    continue;
-                                }
-
-                                if self.undo.enabled {
-                                    let undo_flags = if up.is_new {
-                                        SMF_ROW_ABSENT
-                                    } else if prior_bit {
-                                        SMF_BIT_SET
-                                    } else {
-                                        0
-                                    };
-                                    let prior_aux = if up.is_new || !prior_bit {
-                                        0
-                                    } else {
-                                        pack_field_bytes(
-                                            &state
-                                                [dst_off as usize..(dst_off + cell_size) as usize],
-                                        )
-                                    };
-                                    let smf = |pad2: u8, aux: u64| FlatUndoEntry {
-                                        op: FlatUndoOp::StructMapField,
-                                        slot: dest_slot,
-                                        pad1: dest_field_idx,
-                                        pad2,
-                                        key,
-                                        prev_value: 0,
-                                        aux,
-                                    };
-                                    append_mutation_state(
-                                        &mut self.undo,
-                                        delta_mode,
-                                        state,
-                                        smf(undo_flags, prior_aux),
-                                        smf(
-                                            SMF_BIT_SET,
-                                            pack_field_bytes(&cell[..cell_size as usize]),
-                                        ),
-                                    );
-                                }
-
-                                out.write_scalar_field(
-                                    state,
-                                    up.pos,
-                                    dest_field_idx,
-                                    cols,
-                                    v_col,
-                                    child_idx,
-                                );
-                                let meta_base = slot_meta_base(dest_slot);
-                                state[(meta_base + SlotMetaOffset::CHANGE_FLAGS) as usize] |=
-                                    if prior_bit {
-                                        ChangeFlag::UPDATED
-                                    } else {
-                                        ChangeFlag::INSERTED
-                                    };
-                            } else if let Some(pos) = out.find(state, key) {
-                                let row = out.row_off(pos);
-                                let dst_off = row + out.field_offset(state, dest_field_idx);
-                                // Retract is a no-op unless the stored value matches v.
-                                let stored_matches =
-                                    StructMapSlot::is_field_set(state, row, dest_field_idx)
-                                        && state[dst_off as usize..(dst_off + cell_size) as usize]
-                                            == cell[..cell_size as usize];
-                                if stored_matches {
-                                    if self.undo.enabled {
-                                        let prior_aux = pack_field_bytes(
-                                            &state
-                                                [dst_off as usize..(dst_off + cell_size) as usize],
-                                        );
-                                        let smf = |pad2: u8, aux: u64| FlatUndoEntry {
-                                            op: FlatUndoOp::StructMapField,
-                                            slot: dest_slot,
-                                            pad1: dest_field_idx,
-                                            pad2,
-                                            key,
-                                            prev_value: 0,
-                                            aux,
-                                        };
-                                        append_mutation_state(
-                                            &mut self.undo,
-                                            delta_mode,
-                                            state,
-                                            smf(SMF_BIT_SET, prior_aux),
-                                            smf(0, 0),
-                                        );
-                                    }
-                                    StructMapSlot::clear_scalar_field(state, row, dest_field_idx);
-                                    bytes::zero(state, dst_off, cell_size);
-                                    let meta_base = slot_meta_base(dest_slot);
-                                    state[(meta_base + SlotMetaOffset::CHANGE_FLAGS) as usize] |=
-                                        ChangeFlag::REMOVED;
-                                }
+                            let code = scatter_card_one(
+                                &mut self.undo,
+                                delta_mode,
+                                state,
+                                &out,
+                                dest_slot,
+                                key,
+                                dest_field_idx,
+                                &cell,
+                                cell_size,
+                                is_retract,
+                            );
+                            if code != ErrorCode::Ok {
+                                return signal_growth(dest_slot, code);
                             }
                         }
                         // kind 1: card-many set — element is the precomputed
                         // interned composite (e, v) read from its column.
                         1 => {
+                            if dest_slot >= state_num_slots(state) {
+                                return INVALID_PROGRAM;
+                            }
                             let meta = SlotMetaView::read(state, dest_slot);
+                            if !matches!(meta.slot_type(), SlotType::HashSet | SlotType::Bitmap) {
+                                return INVALID_PROGRAM;
+                            }
                             let v = cell_u32(cols, v_col, child_idx);
                             if is_retract {
-                                self.set_remove(delta_mode, state, &meta, dest_slot, &[v]);
+                                let result = self.set_remove(delta_mode, state, dest_slot, &[v]);
+                                if result != ErrorCode::Ok {
+                                    return signal_growth(dest_slot, result);
+                                }
                             } else {
                                 let set_result = self.set_insert(
                                     delta_mode,
                                     state,
-                                    &meta,
                                     dest_slot,
                                     &[v],
                                     meta.has_ttl().then_some(&[0.0][..]),
                                 );
-                                // Any failure requests growth so the caller can retry.
                                 if set_result != ErrorCode::Ok {
-                                    NEEDS_GROWTH_SLOT.store(dest_slot, Ordering::Relaxed);
-                                    return NEEDS_GROWTH;
+                                    return signal_growth(dest_slot, set_result);
                                 }
                             }
                         }
@@ -4859,12 +4952,13 @@ impl Vm {
                 // semantics are stated once, on the opcode's declaration;
                 // what is here is how they run in one pass.
                 //
-                // Order of work per element, and why: resolve the guarded
-                // row ONCE off the key, compare, and only then act. The
-                // stamp precedes the route action because the kind-0 arm
-                // can `continue` on an identical assert, and a guard left
-                // behind the transaction that just won would let a
-                // transaction between the two write over it afterwards.
+                // Order of work per element, and why: one probe resolves the
+                // guarded row, the guard decides whether the element may act,
+                // and the stamp and the kind-0 card write then land in one
+                // physical capture of that row. The stamp precedes the card
+                // write because an identical assert skips the card write but
+                // must still land the guard, or a transaction between the two
+                // would write over it.
                 Opcode::BatchStructMapScatterGuarded => {
                     let route_col = operand!(r.index());
                     let op_col = operand!(r.index());
@@ -4889,11 +4983,10 @@ impl Vm {
                         route_dest_slots[ri] = operand!(r.index());
                         route_dest_fields[ri] = operand!(r.byte());
                         route_v_cols[ri] = operand!(r.index());
-                        // The guarded row IS the destination row. A kind-0
-                        // route pointing elsewhere would be a card-one write
-                        // gated by a guard no row of its own slot keeps —
-                        // refused by name rather than left silently
-                        // unguarded.
+                        // The guarded row IS the destination row. A kind-0 route
+                        // pointing elsewhere would be a card-one write gated by a
+                        // guard no row of its own slot keeps — refused by name
+                        // rather than left silently unguarded.
                         if route_kinds[ri] == 0 && route_dest_slots[ri] != guard_slot {
                             return INVALID_PROGRAM;
                         }
@@ -4915,195 +5008,191 @@ impl Vm {
                     let dest_field_idx = route_dest_fields[ri];
                     let v_col = route_v_cols[ri];
 
-                    let guarded = StructMapSlot::bind(state, guard_slot);
+                    let guarded = match state_init::bind_struct_map(state, guard_slot) {
+                        Ok(guarded) => guarded,
+                        Err(error) => return error as u32,
+                    };
+                    let selected_cell = match route_kind {
+                        0 => {
+                            if dest_field_idx >= guarded.num_fields {
+                                return INVALID_PROGRAM;
+                            }
+                            let kind = guarded.field_type(state, dest_field_idx);
+                            if is_arena_field_type(kind) {
+                                return INVALID_PROGRAM;
+                            }
+                            if let Err(error) = validate_scalar_fields(
+                                state,
+                                guarded.field_types_off,
+                                guarded.num_fields,
+                                &[v_col],
+                                &[dest_field_idx],
+                                cols,
+                                child_idx,
+                            ) {
+                                return error as u32;
+                            }
+                            let Some(cell) =
+                                scalar_cell_encoded(kind, col_at(cols, v_col as usize), child_idx)
+                            else {
+                                return INVALID_PROGRAM;
+                            };
+                            Some(cell)
+                        }
+                        1 => {
+                            if dest_slot >= state_num_slots(state)
+                                || !matches!(
+                                    SlotMetaView::read(state, dest_slot).slot_type(),
+                                    SlotType::HashSet | SlotType::Bitmap
+                                )
+                            {
+                                return INVALID_PROGRAM;
+                            }
+                            None
+                        }
+                        _ => return INVALID_PROGRAM,
+                    };
                     let Some(incoming) = guard.incoming(state, &guarded, cols, child_idx) else {
                         return INVALID_PROGRAM;
                     };
-                    // One key lookup for the guard read, the stamp and the
-                    // kind-0 write: the guarded row is the destination row.
-                    let mut guard_pos = guarded.find(state, key);
-                    let stored = guard_pos
-                        .and_then(|pos| guard.stored(state, &guarded, guarded.row_off(pos)));
+                    // One probe per element. An assert plans its guarded row, found
+                    // or new; a retract only looks it up, because removing a value
+                    // never creates a row.
+                    let target = if is_retract {
+                        guarded
+                            .find(state, key)
+                            .map(|pos| crate::struct_map::Upsert { pos, is_new: false })
+                    } else {
+                        let Some(planned) = guarded.plan_upsert(state, key) else {
+                            return signal_growth(guard_slot, ErrorCode::CapacityExceeded);
+                        };
+                        Some(planned)
+                    };
+                    let stored = target
+                        .filter(|up| !up.is_new)
+                        .and_then(|up| guard.stored(state, &guarded, guarded.row_off(up.pos)));
                     if guard.loses(&incoming, stored) {
                         continue; // an older transaction writes nothing, by any route
                     }
-
-                    if !guard.already_stamped(&incoming, stored) {
-                        let row_created = guard_pos.is_none();
-                        // A retract of an absent row is already a no-op.
-                        // Creating a row to remember it would grow the map
-                        // from keys nothing ever asserted.
-                        if row_created && !is_retract {
-                            let Some(up) = guarded.upsert(state, key) else {
-                                NEEDS_GROWTH_SLOT.store(guard_slot, Ordering::Relaxed);
-                                return NEEDS_GROWTH;
-                            };
-                            guard_pos = Some(up.pos);
-                        }
-                        if let Some(pos) = guard_pos {
-                            let stamped = guard.stamp(
+                    // A retract of an absent row has no row to stamp, and creating
+                    // one to remember it would grow the map from keys nothing ever
+                    // asserted.
+                    let stamp_needed =
+                        target.is_some() && !guard.already_stamped(&incoming, stored);
+                    let card_changes = match (target, selected_cell) {
+                        (Some(up), Some((cell, cell_size))) => card_one_changes(
+                            state,
+                            &guarded,
+                            up,
+                            dest_field_idx,
+                            &cell,
+                            cell_size,
+                            is_retract,
+                        ),
+                        _ => false,
+                    };
+                    // Kind 0's stamp and card write share one row capture. Kind 1's
+                    // set writes other rows, so the guard's capture is reserved before
+                    // the set and the stamp lands only once the set is accepted: a
+                    // refused set leaves the guard unstamped.
+                    let guard_flags = slot_meta_base(guard_slot) + SlotMetaOffset::CHANGE_FLAGS;
+                    if route_kind == 0 {
+                        if let Some(up) = target.filter(|_| stamp_needed || card_changes) {
+                            let written = journal_row_write(
                                 &mut self.undo,
                                 delta_mode,
                                 state,
                                 &guarded,
                                 guard_slot,
                                 key,
-                                pos,
-                                cols,
-                                child_idx,
-                                row_created,
+                                up,
+                                |state: &mut [u8]| {
+                                    if stamp_needed {
+                                        let stamped =
+                                            guard.stamp(state, &guarded, up.pos, cols, child_idx);
+                                        if stamped != ErrorCode::Ok {
+                                            return stamped;
+                                        }
+                                        state[guard_flags as usize] |= if up.is_new {
+                                            ChangeFlag::INSERTED
+                                        } else {
+                                            ChangeFlag::UPDATED
+                                        };
+                                    }
+                                    if let Some((cell, cell_size)) = selected_cell {
+                                        write_card_one(
+                                            state,
+                                            &guarded,
+                                            dest_slot,
+                                            up.pos,
+                                            dest_field_idx,
+                                            &cell,
+                                            cell_size,
+                                            is_retract,
+                                        );
+                                    }
+                                    ErrorCode::Ok
+                                },
                             );
-                            if stamped != ErrorCode::Ok {
-                                return stamped as u32;
+                            if written != ErrorCode::Ok {
+                                return written as u32;
                             }
-                            let meta_base = slot_meta_base(guard_slot);
-                            state[(meta_base + SlotMetaOffset::CHANGE_FLAGS) as usize] |=
-                                if row_created {
-                                    ChangeFlag::INSERTED
-                                } else {
-                                    ChangeFlag::UPDATED
-                                };
                         }
-                    }
-
-                    match route_kind {
-                        // kind 0: card-one struct field on the guarded row.
-                        0 => {
-                            let dst_ft = guarded.field_type(state, dest_field_idx);
-                            let Some((cell, cell_size)) = scalar_cell_encoded(
-                                dst_ft,
-                                col_at(cols, v_col as usize),
-                                child_idx,
-                            ) else {
-                                // Array destinations have no column-cell
-                                // value form; refuse by name instead of
-                                // comparing field bytes against garbage.
-                                return INVALID_PROGRAM;
-                            };
-                            // The stamp resolved this row: it created it for
-                            // an assert, and left a retract of an absent row
-                            // with nothing to clear.
-                            let Some(pos) = guard_pos else {
-                                continue;
-                            };
-                            let row = guarded.row_off(pos);
-                            let dst_off = row + guarded.field_offset(state, dest_field_idx);
-                            let prior_bit = StructMapSlot::is_field_set(state, row, dest_field_idx);
-                            let value_matches = prior_bit
-                                && state[dst_off as usize..(dst_off + cell_size) as usize]
-                                    == cell[..cell_size as usize];
-
-                            if !is_retract {
-                                if value_matches {
-                                    continue;
+                    } else {
+                        // kind 1: card-many set — the element carries the precomputed
+                        // interned composite in its column. The set keeps no guard of
+                        // its own; the guarded row's guard gates this write too, which
+                        // is what makes a stale transaction lose the whole group.
+                        // Kind 0 was written above, and the route selection refused
+                        // every other kind.
+                        let meta = SlotMetaView::read(state, dest_slot);
+                        let v = cell_u32(cols, v_col, child_idx);
+                        let guard_frame = match target.filter(|_| stamp_needed) {
+                            Some(up) => {
+                                let ranges = row_capture_ranges(&guarded, guard_slot, up);
+                                match self.undo.begin_capture(state, &ranges) {
+                                    Ok(capture) => Some((up, ranges, capture)),
+                                    Err(error) => return error as u32,
                                 }
-                                if self.undo.enabled {
-                                    let prior_aux = if prior_bit {
-                                        pack_field_bytes(
-                                            &state
-                                                [dst_off as usize..(dst_off + cell_size) as usize],
-                                        )
-                                    } else {
-                                        0
-                                    };
-                                    let smf = |pad2: u8, aux: u64| FlatUndoEntry {
-                                        op: FlatUndoOp::StructMapField,
-                                        slot: dest_slot,
-                                        pad1: dest_field_idx,
-                                        pad2,
-                                        key,
-                                        prev_value: 0,
-                                        aux,
-                                    };
-                                    // The row's creation is journaled by the
-                                    // stamp, which owns the only row-absent
-                                    // entry; this entry restores one field.
-                                    append_mutation_state(
-                                        &mut self.undo,
-                                        delta_mode,
-                                        state,
-                                        smf(if prior_bit { SMF_BIT_SET } else { 0 }, prior_aux),
-                                        smf(
-                                            SMF_BIT_SET,
-                                            pack_field_bytes(&cell[..cell_size as usize]),
-                                        ),
-                                    );
-                                }
-                                guarded.write_scalar_field(
-                                    state,
-                                    pos,
-                                    dest_field_idx,
-                                    cols,
-                                    v_col,
-                                    child_idx,
-                                );
-                                let meta_base = slot_meta_base(dest_slot);
-                                state[(meta_base + SlotMetaOffset::CHANGE_FLAGS) as usize] |=
-                                    if prior_bit {
-                                        ChangeFlag::UPDATED
-                                    } else {
+                            }
+                            None => None,
+                        };
+                        let set_result = if is_retract {
+                            self.set_remove(delta_mode, state, dest_slot, &[v])
+                        } else {
+                            self.set_insert(
+                                delta_mode,
+                                state,
+                                dest_slot,
+                                &[v],
+                                meta.has_ttl().then_some(&[0.0][..]),
+                            )
+                        };
+                        let mut guard_result = ErrorCode::Ok;
+                        if let Some((up, ranges, capture)) = guard_frame {
+                            if set_result == ErrorCode::Ok {
+                                apply_planned_row(&guarded, state, key, up);
+                                guard_result =
+                                    guard.stamp(state, &guarded, up.pos, cols, child_idx);
+                                if guard_result == ErrorCode::Ok {
+                                    state[guard_flags as usize] |= if up.is_new {
                                         ChangeFlag::INSERTED
+                                    } else {
+                                        ChangeFlag::UPDATED
                                     };
-                            } else if value_matches {
-                                // Retract is a no-op unless the stored value
-                                // still matches v.
-                                if self.undo.enabled {
-                                    let prior_aux = pack_field_bytes(
-                                        &state[dst_off as usize..(dst_off + cell_size) as usize],
-                                    );
-                                    let smf = |pad2: u8, aux: u64| FlatUndoEntry {
-                                        op: FlatUndoOp::StructMapField,
-                                        slot: dest_slot,
-                                        pad1: dest_field_idx,
-                                        pad2,
-                                        key,
-                                        prev_value: 0,
-                                        aux,
-                                    };
-                                    append_mutation_state(
-                                        &mut self.undo,
-                                        delta_mode,
-                                        state,
-                                        smf(SMF_BIT_SET, prior_aux),
-                                        smf(0, 0),
-                                    );
-                                }
-                                StructMapSlot::clear_scalar_field(state, row, dest_field_idx);
-                                bytes::zero(state, dst_off, cell_size);
-                                let meta_base = slot_meta_base(dest_slot);
-                                state[(meta_base + SlotMetaOffset::CHANGE_FLAGS) as usize] |=
-                                    ChangeFlag::REMOVED;
-                            }
-                        }
-                        // kind 1: card-many set — the element carries the
-                        // precomputed interned composite in its column. The
-                        // set keeps no guard of its own; the guarded row's
-                        // guard gates this write too, which is what makes a
-                        // stale transaction lose the whole group.
-                        1 => {
-                            let meta = SlotMetaView::read(state, dest_slot);
-                            let v = cell_u32(cols, v_col, child_idx);
-                            if is_retract {
-                                self.set_remove(delta_mode, state, &meta, dest_slot, &[v]);
-                            } else {
-                                let set_result = self.set_insert(
-                                    delta_mode,
-                                    state,
-                                    &meta,
-                                    dest_slot,
-                                    &[v],
-                                    meta.has_ttl().then_some(&[0.0][..]),
-                                );
-                                // Any failure requests growth so the caller
-                                // can retry.
-                                if set_result != ErrorCode::Ok {
-                                    NEEDS_GROWTH_SLOT.store(dest_slot, Ordering::Relaxed);
-                                    return NEEDS_GROWTH;
                                 }
                             }
+                            // Finished even when the set refused: nothing of the guard
+                            // changed, so the frame journals nothing.
+                            self.undo
+                                .finish_capture(delta_mode, state, &ranges, capture);
                         }
-                        // kind 2: deferred to Phase 2 — never emitted.
-                        _ => return INVALID_PROGRAM,
+                        if set_result != ErrorCode::Ok {
+                            return signal_growth(dest_slot, set_result);
+                        }
+                        if guard_result != ErrorCode::Ok {
+                            return guard_result as u32;
+                        }
                     }
                 }
                 //#endregion reduce-typed-state.scatter-element-guarded-exec
@@ -5112,6 +5201,11 @@ impl Vm {
                 Opcode::ListAppend => {
                     let (slot, val_col) = (operand!(r.index()), operand!(r.index()));
                     bpc = r.pos();
+                    if slot >= state_num_slots(state)
+                        || SlotMetaView::read(state, slot).slot_type() != SlotType::OrderedList
+                    {
+                        return INVALID_PROGRAM;
+                    }
 
                     // Read the repurposed ORDERED_LIST metadata fields directly.
                     let meta_base = slot_meta_base(slot);
@@ -5128,49 +5222,51 @@ impl Vm {
                         return NEEDS_GROWTH;
                     }
 
-                    let write_off = slot_offset + count * elem_size;
+                    if !matches!(elem_size, 1 | 4 | 8) {
+                        return INVALID_STATE;
+                    }
+                    let source_width = if elem_size == 8 { 8usize } else { 4usize };
+                    let Some(source_offset) = (child_idx as usize).checked_mul(source_width) else {
+                        return ErrorCode::ColumnUnderrun as u32;
+                    };
+                    let Some(source) = col_at(cols, val_col as usize)
+                        .get(source_offset..)
+                        .and_then(|cells| cells.get(..source_width))
+                    else {
+                        return ErrorCode::ColumnUnderrun as u32;
+                    };
+                    let mut cell = [0u8; 8];
+                    cell[..source_width].copy_from_slice(source);
+                    let Some(write_off) = count
+                        .checked_mul(elem_size)
+                        .and_then(|offset| slot_offset.checked_add(offset))
+                    else {
+                        return INVALID_STATE;
+                    };
                     let payload_ranges = [
                         (write_off, elem_size),
+                        (meta_base + SlotMetaOffset::SIZE, 4),
                         (meta_base + SlotMetaOffset::CHANGE_FLAGS, 1),
                     ];
-                    let captured = self.undo.begin_state_capture(state, &payload_ranges, 1);
-                    if self.undo.enabled {
-                        let lau = |prev: u32| FlatUndoEntry {
-                            op: FlatUndoOp::ListAppendUndo,
-                            slot,
-                            pad1: 0,
-                            pad2: 0,
-                            key: 0,
-                            prev_value: prev,
-                            aux: 0,
-                        };
-                        append_mutation_state(
-                            &mut self.undo,
-                            delta_mode,
-                            state,
-                            lau(count),
-                            lau(count + 1),
+                    let capture = match self.undo.begin_capture(state, &payload_ranges) {
+                        Ok(capture) => capture,
+                        Err(error) => return error as u32,
+                    };
+                    if elem_size == 1 {
+                        state[write_off as usize] = u8::from(
+                            u32::from_le_bytes(cell[..4].try_into().expect("four-byte cell")) != 0,
                         );
-                    }
-                    if elem_size == 4 {
-                        bytes::write_u32(state, write_off, cell_u32(cols, val_col, child_idx));
-                    } else if elem_size == 8 {
-                        let v = bytes::read_u64(col_at(cols, val_col as usize), child_idx * 8);
-                        bytes::write_u64(state, write_off, v);
                     } else {
-                        // BOOL (1 byte)
-                        let v = cell_u32(cols, val_col, child_idx);
-                        state[write_off as usize] = u8::from(v != 0);
+                        state[write_off as usize..(write_off + elem_size) as usize]
+                            .copy_from_slice(&cell[..elem_size as usize]);
                     }
 
                     count += 1;
                     bytes::write_u32(state, meta_base + SlotMetaOffset::SIZE, count);
                     state[(meta_base + SlotMetaOffset::CHANGE_FLAGS) as usize] |=
                         ChangeFlag::INSERTED;
-                    if captured {
-                        self.undo
-                            .finish_state_capture(delta_mode, state, &payload_ranges);
-                    }
+                    self.undo
+                        .finish_capture(delta_mode, state, &payload_ranges, capture);
                 }
 
                 // LIST_APPEND_STRUCT (0x85)
@@ -5183,6 +5279,11 @@ impl Vm {
                     }
                     bpc = r.pos();
                     let (vc, fi) = (vals.cols(), vals.fields());
+                    if slot >= state_num_slots(state)
+                        || SlotMetaView::read(state, slot).slot_type() != SlotType::OrderedList
+                    {
+                        return INVALID_PROGRAM;
+                    }
 
                     let meta_base = slot_meta_base(slot);
                     let slot_offset = bytes::read_u32(state, meta_base + SlotMetaOffset::OFFSET);
@@ -5196,6 +5297,17 @@ impl Vm {
                         state,
                         meta_base + SlotMetaOffset::TTL_SECONDS,
                     ));
+                    if let Err(error) = validate_scalar_fields(
+                        state,
+                        slot_offset,
+                        num_fields,
+                        vc,
+                        fi,
+                        cols,
+                        child_idx,
+                    ) {
+                        return error as u32;
+                    }
 
                     if count >= capacity {
                         NEEDS_GROWTH_SLOT.store(slot, Ordering::Relaxed);
@@ -5204,30 +5316,21 @@ impl Vm {
 
                     let descriptor_size = align8(u32::from(num_fields));
                     let rows_base = slot_offset + descriptor_size;
-                    let row_off = rows_base + count * row_size;
+                    let Some(row_off) = count
+                        .checked_mul(row_size)
+                        .and_then(|offset| rows_base.checked_add(offset))
+                    else {
+                        return INVALID_STATE;
+                    };
                     let payload_ranges = [
                         (row_off, row_size),
+                        (meta_base + SlotMetaOffset::SIZE, 4),
                         (meta_base + SlotMetaOffset::CHANGE_FLAGS, 1),
                     ];
-                    let captured = self.undo.begin_state_capture(state, &payload_ranges, 1);
-                    if self.undo.enabled {
-                        let lau = |prev: u32| FlatUndoEntry {
-                            op: FlatUndoOp::ListAppendUndo,
-                            slot,
-                            pad1: 0,
-                            pad2: 0,
-                            key: 0,
-                            prev_value: prev,
-                            aux: 0,
-                        };
-                        append_mutation_state(
-                            &mut self.undo,
-                            delta_mode,
-                            state,
-                            lau(count),
-                            lau(count + 1),
-                        );
-                    }
+                    let capture = match self.undo.begin_capture(state, &payload_ranges) {
+                        Ok(capture) => capture,
+                        Err(error) => return error as u32,
+                    };
 
                     bytes::zero(state, row_off, bitset_bytes);
 
@@ -5274,6 +5377,7 @@ impl Vm {
                             | StructFieldType::ArrayF64
                             | StructFieldType::ArrayString
                             | StructFieldType::ArrayBool => {}
+                            StructFieldType::Vo => return INVALID_PROGRAM,
                         }
                     }
 
@@ -5281,10 +5385,8 @@ impl Vm {
                     bytes::write_u32(state, meta_base + SlotMetaOffset::SIZE, count);
                     state[(meta_base + SlotMetaOffset::CHANGE_FLAGS) as usize] |=
                         ChangeFlag::INSERTED;
-                    if captured {
-                        self.undo
-                            .finish_state_capture(delta_mode, state, &payload_ranges);
-                    }
+                    self.undo
+                        .finish_capture(delta_mode, state, &payload_ranges, capture);
                 }
 
                 // FLAT_MAP (0xE1)
@@ -5328,22 +5430,22 @@ impl Vm {
                     );
                     bpc = r.pos();
                     let meta = SlotMetaView::read(state, slot);
-                    let journal_ranges = nested_journal_ranges(state, &meta);
-                    let captured = self.undo.begin_state_capture(state, &journal_ranges, 0);
-                    let result = nested::nested_set_insert(
+                    let plan = match nested::prepare_nested_set_insert(
                         state,
                         &meta,
                         cell_u32(cols, outer_key_col, child_idx),
                         cell_u32(cols, elem_col, child_idx),
-                    );
-                    if captured {
-                        self.undo
-                            .finish_state_capture(delta_mode, state, &journal_ranges);
-                    }
-                    if result == ErrorCode::CapacityExceeded {
-                        NEEDS_GROWTH_SLOT.store(slot, Ordering::Relaxed);
-                        return NEEDS_GROWTH;
-                    }
+                        &mut self.nested_scratch,
+                    ) {
+                        Ok(plan) => plan,
+                        Err(error) => return signal_growth(slot, error),
+                    };
+                    let capture = match self.undo.begin_capture(plan.state(), plan.ranges()) {
+                        Ok(capture) => capture,
+                        Err(error) => return error as u32,
+                    };
+                    let (state, ranges) = plan.apply();
+                    self.undo.finish_capture(delta_mode, state, ranges, capture);
                 }
 
                 // NESTED_MAP_UPSERT_LAST (0x92)
@@ -5356,23 +5458,23 @@ impl Vm {
                     );
                     bpc = r.pos();
                     let meta = SlotMetaView::read(state, slot);
-                    let journal_ranges = nested_journal_ranges(state, &meta);
-                    let captured = self.undo.begin_state_capture(state, &journal_ranges, 0);
-                    let result = nested::nested_map_upsert_last(
+                    let plan = match nested::prepare_nested_map_upsert_last(
                         state,
                         &meta,
                         cell_u32(cols, outer_key_col, child_idx),
                         cell_u32(cols, inner_key_col, child_idx),
                         cell_u32(cols, val_col, child_idx),
-                    );
-                    if captured {
-                        self.undo
-                            .finish_state_capture(delta_mode, state, &journal_ranges);
-                    }
-                    if result == ErrorCode::CapacityExceeded {
-                        NEEDS_GROWTH_SLOT.store(slot, Ordering::Relaxed);
-                        return NEEDS_GROWTH;
-                    }
+                        &mut self.nested_scratch,
+                    ) {
+                        Ok(plan) => plan,
+                        Err(error) => return signal_growth(slot, error),
+                    };
+                    let capture = match self.undo.begin_capture(plan.state(), plan.ranges()) {
+                        Ok(capture) => capture,
+                        Err(error) => return error as u32,
+                    };
+                    let (state, ranges) = plan.apply();
+                    self.undo.finish_capture(delta_mode, state, ranges, capture);
                 }
 
                 // NESTED_AGG_UPDATE (0x95)
@@ -5384,22 +5486,22 @@ impl Vm {
                     );
                     bpc = r.pos();
                     let meta = SlotMetaView::read(state, slot);
-                    let journal_ranges = nested_journal_ranges(state, &meta);
-                    let captured = self.undo.begin_state_capture(state, &journal_ranges, 0);
-                    let result = nested::nested_agg_update(
+                    let plan = match nested::prepare_nested_agg_update(
                         state,
                         &meta,
                         cell_u32(cols, outer_key_col, child_idx),
                         cell_f64(cols, val_col, child_idx).to_bits(),
-                    );
-                    if captured {
-                        self.undo
-                            .finish_state_capture(delta_mode, state, &journal_ranges);
-                    }
-                    if result == ErrorCode::CapacityExceeded {
-                        NEEDS_GROWTH_SLOT.store(slot, Ordering::Relaxed);
-                        return NEEDS_GROWTH;
-                    }
+                        &mut self.nested_scratch,
+                    ) {
+                        Ok(plan) => plan,
+                        Err(error) => return signal_growth(slot, error),
+                    };
+                    let capture = match self.undo.begin_capture(plan.state(), plan.ranges()) {
+                        Ok(capture) => capture,
+                        Err(error) => return error as u32,
+                    };
+                    let (state, ranges) = plan.apply();
+                    self.undo.finish_capture(delta_mode, state, ranges, capture);
                 }
 
                 _ => return INVALID_PROGRAM,
@@ -5411,19 +5513,65 @@ impl Vm {
     // =========================================================================
     // Undo-log surface
 
-    /// Enable undo and capture the state size.
-    pub fn undo_enable(&mut self, state: &[u8]) {
+    /// Grow only a committed image. The owner of a speculative window must
+    /// roll back and end that window, grow, then retry the full window.
+    pub fn grow_state(
+        &mut self,
+        old_state: &[u8],
+        new_state: &mut [u8],
+        slot: u32,
+    ) -> Result<(), ErrorCode> {
+        if self.undo.enabled {
+            return Err(ErrorCode::NeedsGrowth);
+        }
+        state_init::grow_state(old_state, new_state, slot)
+    }
+
+    /// Begin an inactive speculation window over an admitted image span.
+    /// An active window must be ended first; refusal changes no journal state.
+    ///
+    /// ```
+    /// use columine_types::types::ErrorCode;
+    /// let mut vm = columine_vm::vm::Vm::default();
+    /// let before = vm.undo_status();
+    /// assert_eq!(vm.undo_enable(&[]), Err(ErrorCode::InvalidState));
+    /// assert_eq!(vm.undo_status(), before);
+    /// ```
+    pub fn undo_enable(&mut self, state: &[u8]) -> Result<(), ErrorCode> {
+        if self.undo.enabled {
+            return Err(ErrorCode::SpeculationActive);
+        }
+        let state_size = u32::try_from(state.len()).map_err(|_| ErrorCode::InvalidState)?;
+        let (slots, _) = state_init::state_geometry(state)?;
         let u = &mut self.undo;
         u.enabled = true;
         u.entries.clear();
         u.redo.clear();
+        u.redo_active = false;
         u.delta_count = 0;
         u.overflow = false;
-        u.shadow_active = false;
-        u.overflow_entry = None;
-        u.shadow = None;
-        u.state_size = state.len() as u32;
-        u.save_change_flags(state);
+        u.export_start = 0;
+        u.export_count = 0;
+        u.export_overflow = false;
+        u.generation = u.generation.wrapping_add(1);
+        u.capture_depth = 0;
+        u.reserved_entries = 0;
+        u.capture_scratch.clear();
+        u.capture_ranges.clear();
+        u.entries.reserve(UNDO_CAPACITY as usize);
+        u.capture_scratch.reserve(UNDO_CAPACITY as usize * 8);
+        u.capture_ranges.reserve(UNDO_CAPACITY as usize);
+        u.ttl_batch_scratch.order.clear();
+        u.ttl_batch_scratch.commands.clear();
+        u.ttl_batch_scratch.generation = u.ttl_batch_scratch.generation.wrapping_add(1);
+        u.ttl_batch_scratch.order.reserve(UNDO_CAPACITY as usize);
+        u.ttl_batch_scratch.commands.reserve(UNDO_CAPACITY as usize);
+        u.erase_scratch.ranges.clear();
+        u.erase_scratch.ranges.reserve(UNDO_CAPACITY as usize);
+        u.saved_change_flags.reserve(slots as usize + 1);
+        u.saved_change_flags.clear();
+        u.state_size = state_size;
+        Ok(())
     }
 
     /// Return the current undo checkpoint position.
@@ -5432,24 +5580,21 @@ impl Vm {
     }
 
     /// Roll back to a checkpoint, restoring the state and change flags.
-    pub fn undo_rollback(&mut self, state: &mut [u8], checkpoint_pos: u32) {
+    pub fn undo_rollback(
+        &mut self,
+        state: &mut [u8],
+        checkpoint_pos: u32,
+    ) -> Result<u32, ErrorCode> {
+        let size = u32::try_from(state.len()).map_err(|_| ErrorCode::InvalidState)?;
         let u = &mut self.undo;
-        if u.overflow && u.shadow_active {
-            if let Some(shadow) = u.shadow.take() {
-                let size = u.state_size as usize;
-                state[..size].copy_from_slice(&shadow[..size]);
-            }
-            u.shadow_active = false;
-            if let Some((overflow_entry, _redo)) = u.overflow_entry.take() {
-                rollback_entry(&mut self.bitmap_env, state, &overflow_entry);
-            }
+        if checkpoint_pos > u.count() || (u.enabled && u.state_size != size) {
+            return Err(ErrorCode::InvalidState);
         }
-        let u = &mut self.undo;
         let mut i = u.count();
         while i > checkpoint_pos {
             i -= 1;
             let entry = u.entries[i as usize];
-            rollback_entry(&mut self.bitmap_env, state, &entry);
+            rollback_entry(state, &entry)?;
         }
         let u = &mut self.undo;
         u.entries.truncate(checkpoint_pos as usize);
@@ -5457,19 +5602,31 @@ impl Vm {
         if u.delta_count > u.count() {
             u.delta_count = u.count();
         }
-        u.restore_change_flags(state);
+        u.export_start = u.export_start.min(u.count());
+        u.export_count = u.export_count.min(u.count() - u.export_start);
+        Ok(size)
     }
 
-    /// Commit undo state and discard its shadow snapshot.
+    /// End the speculative window and retain only reusable journal storage.
     pub fn undo_commit(&mut self) {
         let u = &mut self.undo;
-        u.shadow = None;
-        u.shadow_active = false;
-        u.overflow_entry = None;
+        u.capture_depth = 0;
+        u.reserved_entries = 0;
+        u.capture_scratch.clear();
+        u.capture_ranges.clear();
+        u.ttl_batch_scratch.order.clear();
+        u.ttl_batch_scratch.commands.clear();
+        u.ttl_batch_scratch.generation = u.ttl_batch_scratch.generation.wrapping_add(1);
+        u.generation = u.generation.wrapping_add(1);
         u.entries.clear();
         u.redo.clear();
+        u.redo_active = false;
         u.delta_count = 0;
         u.overflow = false;
+        u.export_start = 0;
+        u.export_count = 0;
+        u.export_overflow = false;
+        u.saved_change_flags.clear();
         u.enabled = false;
     }
 
@@ -5478,27 +5635,82 @@ impl Vm {
         self.undo.overflow
     }
 
+    /// Observe a journal without being able to reset its live window or refusal.
+    ///
+    /// External consumers cannot disable logging:
+    /// ```compile_fail,E0616
+    /// let mut vm = columine_vm::vm::Vm::default();
+    /// vm.undo.enabled = false;
+    /// ```
+    ///
+    /// They cannot clear an overflow:
+    /// ```compile_fail,E0616
+    /// let mut vm = columine_vm::vm::Vm::default();
+    /// vm.undo.overflow = false;
+    /// ```
+    ///
+    /// They cannot change the journal's image extent:
+    /// ```compile_fail,E0616
+    /// let mut vm = columine_vm::vm::Vm::default();
+    /// vm.undo.state_size = 0;
+    /// ```
+    pub fn undo_status(&self) -> UndoStatus {
+        UndoStatus {
+            enabled: self.undo.enabled,
+            overflow: self.undo.overflow,
+            checkpoint: self.undo.count(),
+            delta_count: self.undo.delta_count(),
+        }
+    }
+
+    /// Observe lazy redo admission without exposing mutable journal storage.
+    pub fn undo_redo_lane_status(&self) -> RedoLaneStatus {
+        RedoLaneStatus {
+            active: self.undo.redo_active,
+            entries: self.undo.redo.len(),
+            capacity: self.undo.redo.capacity(),
+        }
+    }
+
     // =========================================================================
     // Delta export and apply
     // =========================================================================
 
-    /// Export the selected `[from, to)` delta pair range and return its count.
-    pub fn delta_export_segment(&mut self, from_pos: u32, to_pos: u32) -> u32 {
+    /// Export exactly the requested complete paired range. Refuse an invalid
+    /// range or any undo-only record before changing the previous export.
+    pub fn delta_export_segment(&mut self, from_pos: u32, to_pos: u32) -> Result<u32, ErrorCode> {
         let u = &mut self.undo;
-        let end = to_pos.min(u.delta_count);
-        let start = from_pos.min(end);
-        u.export_start = start;
-        u.export_count = end - start;
+        if from_pos > to_pos || to_pos > u.count() {
+            return Err(ErrorCode::InvalidState);
+        }
+        if from_pos != to_pos {
+            if !u.redo_active {
+                return Err(ErrorCode::DeltaLaneMismatch);
+            }
+            let redo = u
+                .redo
+                .get(from_pos as usize..to_pos as usize)
+                .ok_or(ErrorCode::InvalidState)?;
+            if redo.iter().any(Option::is_none) {
+                return Err(ErrorCode::DeltaLaneMismatch);
+            }
+        }
+        u.export_start = from_pos;
+        u.export_count = to_pos - from_pos;
         u.export_overflow = u.overflow;
-        u.export_count
+        Ok(u.export_count)
     }
 
     /// The exported undo lane as serialized 24-byte entries (bindings expose
     /// the raw pointer; core code returns owned bytes).
     pub fn delta_export_undo_bytes(&self) -> Vec<u8> {
         serialize_entries(
-            &self.undo.entries,
-            self.undo.export_start,
+            self.undo
+                .entries
+                .iter()
+                .skip(self.undo.export_start as usize)
+                .copied()
+                .map(Some),
             self.undo.export_count,
         )
     }
@@ -5506,8 +5718,11 @@ impl Vm {
     /// The exported redo lane.
     pub fn delta_export_redo_bytes(&self) -> Vec<u8> {
         serialize_entries(
-            &self.undo.redo,
-            self.undo.export_start,
+            self.undo
+                .redo
+                .iter()
+                .skip(self.undo.export_start as usize)
+                .copied(),
             self.undo.export_count,
         )
     }
@@ -5522,24 +5737,56 @@ impl Vm {
         self.undo.export_overflow
     }
 
-    /// Reverse-apply an undo segment. Segments are produced by
-    /// `delta_export_*`; a corrupt op byte is a programmer error and panics.
+    /// Validate a serialized delta before mutation. Physical entries cannot
+    /// address outside the image that owns this stable-layout segment.
+    pub fn delta_required_state_size(
+        segment: &[u8],
+        entry_size: u32,
+        initial_size: u32,
+    ) -> Result<u32, ErrorCode> {
+        if entry_size != FLAT_UNDO_ENTRY_SIZE
+            || !segment.len().is_multiple_of(FLAT_UNDO_ENTRY_SIZE as usize)
+        {
+            return Err(ErrorCode::InvalidState);
+        }
+        for row in segment.as_chunks::<{ FLAT_UNDO_ENTRY_SIZE as usize }>().0 {
+            if row.iter().all(|byte| *byte == 0) {
+                continue;
+            }
+            let entry = FlatUndoEntry::read_from(row).ok_or(ErrorCode::InvalidState)?;
+            if entry.op == FlatUndoOp::StateBytes
+                && (!(1..=8).contains(&entry.pad1)
+                    || entry
+                        .key
+                        .checked_add(u32::from(entry.pad1))
+                        .is_none_or(|end| end > initial_size))
+            {
+                return Err(ErrorCode::InvalidState);
+            }
+        }
+        Ok(initial_size)
+    }
+
+    /// Reverse-apply an undo segment only after its complete preflight.
     pub fn delta_apply_rollback_segment(
         &mut self,
         state: &mut [u8],
         undo_segment: &[u8],
         entry_size: u32,
-    ) {
-        if entry_size != FLAT_UNDO_ENTRY_SIZE
-            || !(undo_segment.len() as u32).is_multiple_of(entry_size)
-        {
-            return;
-        }
+    ) -> Result<u32, ErrorCode> {
+        let size = u32::try_from(state.len()).map_err(|_| ErrorCode::InvalidState)?;
+        Self::delta_required_state_size(undo_segment, entry_size, size)?;
         let count = undo_segment.len() / FLAT_UNDO_ENTRY_SIZE as usize;
         for i in (0..count).rev() {
-            let entry = parse_entry(undo_segment, i);
-            rollback_entry(&mut self.bitmap_env, state, &entry);
+            let row = &undo_segment
+                [i * FLAT_UNDO_ENTRY_SIZE as usize..(i + 1) * FLAT_UNDO_ENTRY_SIZE as usize];
+            if row.iter().all(|byte| *byte == 0) {
+                continue;
+            }
+            let entry = parse_entry(undo_segment, i)?;
+            rollback_entry(state, &entry)?;
         }
+        Ok(size)
     }
 
     /// Forward-apply a redo segment; entries move the state toward the target.
@@ -5548,22 +5795,20 @@ impl Vm {
         state: &mut [u8],
         redo_segment: &[u8],
         entry_size: u32,
-    ) {
-        if entry_size != FLAT_UNDO_ENTRY_SIZE
-            || !(redo_segment.len() as u32).is_multiple_of(entry_size)
-        {
-            return;
-        }
+    ) -> Result<u32, ErrorCode> {
+        let size = u32::try_from(state.len()).map_err(|_| ErrorCode::InvalidState)?;
+        Self::delta_required_state_size(redo_segment, entry_size, size)?;
         let count = redo_segment.len() / FLAT_UNDO_ENTRY_SIZE as usize;
         for i in 0..count {
-            // Entries without a forward effect use an explicit zeroed no-op
-            // marker (op byte 0); skip them during rollforward.
-            if redo_segment[i * FLAT_UNDO_ENTRY_SIZE as usize] == 0 {
+            let row = &redo_segment
+                [i * FLAT_UNDO_ENTRY_SIZE as usize..(i + 1) * FLAT_UNDO_ENTRY_SIZE as usize];
+            if row.iter().all(|byte| *byte == 0) {
                 continue;
             }
-            let entry = parse_entry(redo_segment, i);
-            rollback_entry(&mut self.bitmap_env, state, &entry);
+            let entry = parse_entry(redo_segment, i)?;
+            rollback_entry(state, &entry)?;
         }
+        Ok(size)
     }
 
     /// Return the serialized size of one delta entry.
@@ -5572,218 +5817,641 @@ impl Vm {
     }
 }
 
-fn serialize_entries(entries: &[FlatUndoEntry], start: u32, count: u32) -> Vec<u8> {
+fn serialize_entries(entries: impl Iterator<Item = Option<FlatUndoEntry>>, count: u32) -> Vec<u8> {
     let mut out = vec![0u8; (count * FLAT_UNDO_ENTRY_SIZE) as usize];
-    for i in 0..count as usize {
-        let mut buf = [0u8; FLAT_UNDO_ENTRY_SIZE as usize];
-        entries[start as usize + i].write_to(&mut buf);
-        out[i * FLAT_UNDO_ENTRY_SIZE as usize..(i + 1) * FLAT_UNDO_ENTRY_SIZE as usize]
-            .copy_from_slice(&buf);
+    for (index, entry) in entries.take(count as usize).enumerate() {
+        if let Some(entry) = entry {
+            let mut encoded = [0u8; FLAT_UNDO_ENTRY_SIZE as usize];
+            entry.write_to(&mut encoded);
+            out[index * FLAT_UNDO_ENTRY_SIZE as usize..(index + 1) * FLAT_UNDO_ENTRY_SIZE as usize]
+                .copy_from_slice(&encoded);
+        }
     }
     out
 }
 
-fn parse_entry(segment: &[u8], i: usize) -> FlatUndoEntry {
-    let mut buf = [0u8; FLAT_UNDO_ENTRY_SIZE as usize];
-    buf.copy_from_slice(
-        &segment[i * FLAT_UNDO_ENTRY_SIZE as usize..(i + 1) * FLAT_UNDO_ENTRY_SIZE as usize],
-    );
-    FlatUndoEntry::read_from(&buf)
-        .unwrap_or_else(|| columine_types::die!("corrupt undo-entry op byte in delta segment"))
+fn parse_entry(segment: &[u8], i: usize) -> Result<FlatUndoEntry, ErrorCode> {
+    let start = i
+        .checked_mul(FLAT_UNDO_ENTRY_SIZE as usize)
+        .ok_or(ErrorCode::InvalidState)?;
+    let encoded = segment
+        .get(start..)
+        .and_then(|row| row.first_chunk::<{ FLAT_UNDO_ENTRY_SIZE as usize }>())
+        .ok_or(ErrorCode::InvalidState)?;
+    FlatUndoEntry::read_from(encoded).ok_or(ErrorCode::InvalidState)
 }
 
 // =============================================================================
 // Read and iteration exports
 // =============================================================================
 
-/// Look up a value in a HASHMAP slot, returning `EMPTY_KEY` when absent.
+/// The ascending cursor rule shared by every reader iterator. `current` lies in
+/// `0..=capacity`; `capacity` itself is the terminal end and is returned as a
+/// success. A position past it is a corrupted cursor, refused as
+/// [`ErrorCode::InvalidState`]. `step` yields the successor of a cursor that is
+/// still below the end, from `current + 1`.
+fn cursor_step(
+    current: u32,
+    capacity: u32,
+    step: impl FnOnce(u32) -> u32,
+) -> Result<u32, ErrorCode> {
+    if current > capacity {
+        return Err(ErrorCode::InvalidState);
+    }
+    if current == capacity {
+        return Ok(capacity);
+    }
+    Ok(step(current + 1))
+}
+
+/// Whether a key cell holds data; `EMPTY_KEY` and `TOMBSTONE` mark dead cells.
+fn is_live_key(key: u32) -> bool {
+    key != EMPTY_KEY && key != TOMBSTONE
+}
+
+/// The key of live cell `pos` in a `capacity`-cell key lane. The iteration end,
+/// any position past it, and a dead cell are [`ErrorCode::InvalidState`].
+fn live_key_at(state: &[u8], lane: u32, capacity: u32, pos: u32) -> Result<u32, ErrorCode> {
+    if pos >= capacity {
+        return Err(ErrorCode::InvalidState);
+    }
+    let key = bytes::read_u32(state, lane + pos * 4);
+    if is_live_key(key) {
+        Ok(key)
+    } else {
+        Err(ErrorCode::InvalidState)
+    }
+}
+
+/// A bound HASHMAP slot. It borrows the state image immutably for its whole life.
 ///
-/// The lookup goes through [`hash_table::find_key`] rather than a local probe:
-/// a hand-rolled loop that only terminates on `EMPTY_KEY` matches a TOMBSTONE
-/// cell when the caller passes `TOMBSTONE` as the key, and would return the
-/// removed entry's stale value lane as a live value.
-pub fn vm_map_get(state: &[u8], slot_offset: u32, capacity: u32, key: u32) -> u32 {
-    match hash_table::find_key(state, slot_offset, capacity, key) {
-        Some(pos) => bytes::read_u32(state, slot_offset + capacity * 4 + pos * 4),
-        None => EMPTY_KEY,
+/// [`CheckedMap::bind`] validates the image geometry once through
+/// [`state_init::bind_slot`]. Every method then reuses the bound table's probe and
+/// live-cell walk on those same bytes, so nothing is copied or decoded.
+#[derive(Clone, Copy, Debug)]
+pub struct CheckedMap<'a> {
+    state: &'a [u8],
+    keys: u32,
+    values: u32,
+    capacity: u32,
+}
+
+impl<'a> CheckedMap<'a> {
+    /// Bind HASHMAP `slot`. A slot index past the state's slot count, or a slot of
+    /// another kind, is [`ErrorCode::InvalidSlot`]. Malformed geometry is
+    /// [`ErrorCode::InvalidState`]. Absence is an `Ok` answer from [`Self::get`].
+    pub fn bind(state: &'a [u8], slot: u32) -> Result<Self, ErrorCode> {
+        let meta = state_init::bind_slot(state, slot)?;
+        if meta.slot_type() != SlotType::HashMap {
+            return Err(ErrorCode::InvalidSlot);
+        }
+        Ok(Self {
+            state,
+            keys: meta.offset,
+            values: meta.offset + meta.capacity * 4,
+            capacity: meta.capacity,
+        })
+    }
+
+    /// The element capacity, which is also the ascending iteration end.
+    pub fn capacity(&self) -> u32 {
+        self.capacity
+    }
+
+    /// The value mapped to `key`, or `None` when absent. A mapped `u32::MAX` is
+    /// `Some(u32::MAX)`, never absence. Sentinel keys are never present.
+    pub fn get(&self, key: u32) -> Option<u32> {
+        hash_table::find_key(self.state, self.keys, self.capacity, key)
+            .map(|pos| bytes::read_u32(self.state, self.values + pos * 4))
+    }
+
+    /// The first live cell, or [`Self::capacity`] when the map is empty.
+    pub fn iter_start(&self) -> u32 {
+        hash_table::next_live_key(self.state, self.keys, self.capacity, 0)
+    }
+
+    /// The next live cell after `current`; `capacity` is the terminal value.
+    /// `current > capacity` is [`ErrorCode::InvalidState`].
+    pub fn iter_next(&self, current: u32) -> Result<u32, ErrorCode> {
+        cursor_step(current, self.capacity, |from| {
+            hash_table::next_live_key(self.state, self.keys, self.capacity, from)
+        })
+    }
+
+    /// The key and value of live cell `pos`, packed as `(value << 32) | key`.
+    /// A dead cell or `pos >= capacity` is [`ErrorCode::InvalidState`].
+    pub fn iter_get(&self, pos: u32) -> Result<u64, ErrorCode> {
+        let key = live_key_at(self.state, self.keys, self.capacity, pos)?;
+        let value = bytes::read_u32(self.state, self.values + pos * 4);
+        Ok((u64::from(value) << 32) | u64::from(key))
     }
 }
 
-/// Test whether a set contains a key.
-pub fn vm_set_contains(state: &[u8], slot_offset: u32, capacity: u32, elem: u32) -> bool {
-    if let Some(meta) = find_slot_meta_by_offset(state, slot_offset)
-        && meta.slot_type() == SlotType::Bitmap
-    {
-        let storage = get_bitmap_storage(&meta);
-        return storage
-            .serialized_data(state)
-            .is_ok_and(|data| bitmap_ops::contains_serialized(data, elem));
-    }
-
-    hash_table::find_key(state, slot_offset, capacity, elem).is_some()
+/// A bound HASHSET or BITMAP slot. It borrows the state image immutably for its
+/// whole life.
+///
+/// `capacity` is the slot's element capacity and the ascending iteration end. A
+/// HASHSET walks its live key cells. A BITMAP walks ranks `0..cardinality` over
+/// the borrowed native image: `bind` validates that image once, so membership and
+/// rank reads never meet a malformed payload, and `false` always means absence.
+#[derive(Clone, Copy, Debug)]
+pub struct CheckedSet<'a> {
+    state: &'a [u8],
+    capacity: u32,
+    members: SetMembers<'a>,
 }
 
-/// Start a map iterator by scanning live key cells in ascending order.
-pub fn vm_map_iter_start(state: &[u8], slot_offset: u32, capacity: u32) -> u32 {
-    hash_table::next_live_key(state, slot_offset, capacity, 0)
+#[derive(Clone, Copy, Debug)]
+enum SetMembers<'a> {
+    /// HASHSET: the key lane at the slot offset.
+    Keys { lane: u32 },
+    /// BITMAP: the borrowed image (`None` is the empty set) and the cardinality
+    /// the slot records, which `bind` has checked against that image.
+    Ranks {
+        image: Option<BitmosaicView<'a>>,
+        cardinality: u32,
+    },
 }
 
-/// Advance a map iterator.
-pub fn vm_map_iter_next(state: &[u8], slot_offset: u32, capacity: u32, current: u32) -> u32 {
-    hash_table::next_live_key(state, slot_offset, capacity, current + 1)
-}
-
-/// Return the key and value at a map iterator position, packed as u64.
-pub fn vm_map_iter_get(state: &[u8], slot_offset: u32, capacity: u32, pos: u32) -> u64 {
-    let key = bytes::read_u32(state, slot_offset + pos * 4);
-    let val = bytes::read_u32(state, slot_offset + capacity * 4 + pos * 4);
-    (u64::from(val) << 32) | u64::from(key)
-}
-
-/// Start a BITMAP/set iterator; BITMAP slots iterate by rank.
-pub fn vm_set_iter_start(state: &[u8], slot_offset: u32, capacity: u32) -> u32 {
-    if let Some(meta) = find_slot_meta_by_offset(state, slot_offset)
-        && meta.slot_type() == SlotType::Bitmap
-    {
-        return if meta.size(state) == 0 { capacity } else { 0 };
-    }
-    vm_map_iter_start(state, slot_offset, capacity)
-}
-
-/// Advance a BITMAP/set iterator.
-pub fn vm_set_iter_next(state: &[u8], slot_offset: u32, capacity: u32, current: u32) -> u32 {
-    if let Some(meta) = find_slot_meta_by_offset(state, slot_offset)
-        && meta.slot_type() == SlotType::Bitmap
-    {
-        let next = current + 1;
-        return if next < meta.size(state) {
-            next
-        } else {
-            capacity
+impl<'a> CheckedSet<'a> {
+    /// Bind HASHSET or BITMAP `slot`. A slot index past the slot count, or a slot
+    /// of another kind, is [`ErrorCode::InvalidSlot`]. For a BITMAP, a malformed
+    /// image, a payload cardinality that differs from the slot size, or a
+    /// cardinality above the element capacity is [`ErrorCode::InvalidState`],
+    /// never an empty set.
+    pub fn bind(state: &'a [u8], slot: u32) -> Result<Self, ErrorCode> {
+        let meta = state_init::bind_slot(state, slot)?;
+        let members = match meta.slot_type() {
+            SlotType::HashSet => SetMembers::Keys { lane: meta.offset },
+            SlotType::Bitmap => {
+                let bytes = get_bitmap_storage(&meta).serialized_data(state)?;
+                let image = BitmosaicView::open_verified(bytes).ok_or(ErrorCode::InvalidState)?;
+                let cardinality = meta.size(state);
+                if image.len() != u64::from(cardinality) || cardinality > meta.capacity {
+                    return Err(ErrorCode::InvalidState);
+                }
+                SetMembers::Ranks {
+                    image: Some(image),
+                    cardinality,
+                }
+            }
+            _ => return Err(ErrorCode::InvalidSlot),
         };
+        Ok(Self {
+            state,
+            capacity: meta.capacity,
+            members,
+        })
     }
-    vm_map_iter_next(state, slot_offset, capacity, current)
-}
 
-/// Return the element at a BITMAP/set iterator position.
-pub fn vm_set_iter_get(state: &[u8], slot_offset: u32, pos: u32) -> u32 {
-    if let Some(meta) = find_slot_meta_by_offset(state, slot_offset)
-        && meta.slot_type() == SlotType::Bitmap
-    {
-        let storage = get_bitmap_storage(&meta);
-        return bitmap_select(state, storage, pos).unwrap_or(EMPTY_KEY);
+    /// The element capacity, which is also the ascending iteration end.
+    pub fn capacity(&self) -> u32 {
+        self.capacity
     }
-    bytes::read_u32(state, slot_offset + pos * 4)
+
+    /// Whether `elem` is a member. A malformed BITMAP was refused at [`Self::bind`],
+    /// so `false` is always a genuine absence.
+    pub fn contains(&self, elem: u32) -> bool {
+        match self.members {
+            SetMembers::Keys { lane } => {
+                hash_table::find_key(self.state, lane, self.capacity, elem).is_some()
+            }
+            SetMembers::Ranks { image, .. } => image.is_some_and(|view| view.contains(elem)),
+        }
+    }
+
+    /// Rank `0` when the set is non-empty, otherwise [`Self::capacity`]. For a
+    /// HASHSET this is the first live cell.
+    pub fn iter_start(&self) -> u32 {
+        match self.members {
+            SetMembers::Keys { lane } => {
+                hash_table::next_live_key(self.state, lane, self.capacity, 0)
+            }
+            SetMembers::Ranks { cardinality, .. } => {
+                if cardinality == 0 {
+                    self.capacity
+                } else {
+                    0
+                }
+            }
+        }
+    }
+
+    /// The next position after `current`; `capacity` is the terminal value. For a
+    /// BITMAP, a rank in `cardinality..capacity` is [`ErrorCode::InvalidState`], as
+    /// is any position past `capacity`.
+    pub fn iter_next(&self, current: u32) -> Result<u32, ErrorCode> {
+        match self.members {
+            SetMembers::Keys { lane } => cursor_step(current, self.capacity, |from| {
+                hash_table::next_live_key(self.state, lane, self.capacity, from)
+            }),
+            SetMembers::Ranks { cardinality, .. } => {
+                if current >= cardinality && current < self.capacity {
+                    return Err(ErrorCode::InvalidState);
+                }
+                cursor_step(current, self.capacity, |next| {
+                    if next < cardinality {
+                        next
+                    } else {
+                        self.capacity
+                    }
+                })
+            }
+        }
+    }
+
+    /// The element of live HASHSET cell or BITMAP rank `pos`. A dead cell, a rank
+    /// at or past the cardinality, or a HASHSET position at or past `capacity` is
+    /// [`ErrorCode::InvalidState`].
+    pub fn iter_get(&self, pos: u32) -> Result<u32, ErrorCode> {
+        match self.members {
+            SetMembers::Keys { lane } => live_key_at(self.state, lane, self.capacity, pos),
+            SetMembers::Ranks { image, cardinality } => {
+                if pos >= cardinality {
+                    return Err(ErrorCode::InvalidState);
+                }
+                image
+                    .and_then(|view| view.select(u64::from(pos)))
+                    .ok_or(ErrorCode::InvalidState)
+            }
+        }
+    }
 }
 
-/// Find slot metadata by its data offset.
-pub fn find_slot_meta_by_offset(state: &[u8], slot_offset: u32) -> Option<SlotMetaView> {
-    (0..state_num_slots(state))
-        .map(|slot| SlotMetaView::read(state, slot))
-        .find(|meta| meta.offset == slot_offset)
-}
-
-/// Return a struct-map row offset, or `u32::MAX` when absent.
+/// A bound unary STRUCT_MAP slot. It borrows the state image immutably for its
+/// whole life.
 ///
-/// Rollback of a struct-map insert stamps a TOMBSTONE key cell, so a local
-/// probe that only terminates on `EMPTY_KEY` resolves a live-looking row for a
-/// `TOMBSTONE` query key. [`hash_table::find_key`] refuses both sentinels.
-pub fn vm_struct_map_get_row_ptr(
-    state: &[u8],
-    slot_offset: u32,
-    capacity: u32,
-    num_fields: u32,
-    row_size: u32,
-    key: u32,
-) -> u32 {
-    let keys_off = slot_offset + align8(num_fields);
-    let rows_base = keys_off + capacity * 4;
-    match hash_table::find_key(state, keys_off, capacity, key) {
-        Some(pos) => rows_base + pos * row_size,
-        None => u32::MAX,
+/// [`CheckedStructMap::bind`] validates the slot geometry and row layout once
+/// through [`state_init::bind_slot`]. `row` and the iterators read the same keys
+/// and rows through the bound [`StructMapSlot`]. Row offsets are absolute.
+#[derive(Clone, Copy, Debug)]
+pub struct CheckedStructMap<'a> {
+    state: &'a [u8],
+    view: StructMapSlot,
+}
+
+impl<'a> CheckedStructMap<'a> {
+    /// Bind STRUCT_MAP `slot`. A slot index past the slot count, or a slot of
+    /// another kind, is [`ErrorCode::InvalidSlot`]. Malformed geometry or a row
+    /// layout that disagrees with the field descriptor is [`ErrorCode::InvalidState`].
+    pub fn bind(state: &'a [u8], slot: u32) -> Result<Self, ErrorCode> {
+        if state_init::bind_slot(state, slot)?.slot_type() != SlotType::StructMap {
+            return Err(ErrorCode::InvalidSlot);
+        }
+        Ok(Self {
+            state,
+            view: StructMapSlot::bind(state, slot),
+        })
+    }
+
+    /// The element capacity, which is also the ascending iteration end.
+    pub fn capacity(&self) -> u32 {
+        self.view.capacity
+    }
+
+    /// The absolute offset of the row stored under `key`, or `None` when absent.
+    pub fn row(&self, key: u32) -> Option<u32> {
+        self.view
+            .find(self.state, key)
+            .map(|pos| self.view.row_off(pos))
+    }
+
+    /// The first live cell, or [`Self::capacity`] when the map is empty.
+    pub fn iter_start(&self) -> u32 {
+        hash_table::next_live_key(self.state, self.view.keys_off, self.view.capacity, 0)
+    }
+
+    /// The next live cell after `current`; `capacity` is the terminal value.
+    /// `current > capacity` is [`ErrorCode::InvalidState`].
+    pub fn iter_next(&self, current: u32) -> Result<u32, ErrorCode> {
+        cursor_step(current, self.view.capacity, |from| {
+            hash_table::next_live_key(self.state, self.view.keys_off, self.view.capacity, from)
+        })
+    }
+
+    /// The key of live cell `pos`. A dead cell or `pos >= capacity` is
+    /// [`ErrorCode::InvalidState`].
+    pub fn iter_key(&self, pos: u32) -> Result<u32, ErrorCode> {
+        live_key_at(self.state, self.view.keys_off, self.view.capacity, pos)
     }
 }
 
-/// Start a struct-map iterator by scanning live key cells.
-pub fn vm_struct_map_iter_start(
-    state: &[u8],
-    slot_offset: u32,
-    capacity: u32,
-    num_fields: u32,
-) -> u32 {
-    hash_table::next_live_key(state, slot_offset + align8(num_fields), capacity, 0)
+/// A bound exact-pair STRUCT_MAP2 slot. It borrows the state image immutably for
+/// its whole life.
+///
+/// Lane one owns the EMPTY/TOMBSTONE sentinel state and lane two carries every
+/// u32 value, so the liveness of a cell is decided by lane one alone.
+#[derive(Clone, Copy, Debug)]
+pub struct CheckedStructMap2<'a> {
+    state: &'a [u8],
+    view: StructMap2Slot,
 }
 
-/// Advance a struct-map iterator.
-pub fn vm_struct_map_iter_next(
-    state: &[u8],
-    slot_offset: u32,
-    capacity: u32,
-    num_fields: u32,
-    current: u32,
-) -> u32 {
-    hash_table::next_live_key(
-        state,
-        slot_offset + align8(num_fields),
-        capacity,
-        current + 1,
-    )
-}
+impl<'a> CheckedStructMap2<'a> {
+    /// Bind STRUCT_MAP2 `slot`, with the same refusals as [`CheckedStructMap::bind`].
+    pub fn bind(state: &'a [u8], slot: u32) -> Result<Self, ErrorCode> {
+        if state_init::bind_slot(state, slot)?.slot_type() != SlotType::StructMap2 {
+            return Err(ErrorCode::InvalidSlot);
+        }
+        Ok(Self {
+            state,
+            view: StructMap2Slot::bind(state, slot),
+        })
+    }
 
-/// Return the key at a struct-map iterator position.
-pub fn vm_struct_map_iter_key(state: &[u8], slot_offset: u32, num_fields: u32, pos: u32) -> u32 {
-    bytes::read_u32(state, slot_offset + align8(num_fields) + pos * 4)
-}
+    /// The element capacity, which is also the ascending iteration end.
+    pub fn capacity(&self) -> u32 {
+        self.view.capacity
+    }
 
-/// Exact pair point lookup for the two-key struct-map ABI.
-pub fn vm_struct_map2_get_row_ptr(
-    state: &[u8],
-    slot_offset: u32,
-    capacity: u32,
-    num_fields: u32,
-    row_size: u32,
-    key1: u32,
-    key2: u32,
-) -> u32 {
-    let keys1 = slot_offset + align8(num_fields);
-    let keys2 = keys1 + capacity * 4;
-    let rows = keys2 + capacity * 4;
-    match hash_table::find_key_pair(state, keys1, keys2, capacity, key1, key2) {
-        Some(pos) => rows + pos * row_size,
-        None => u32::MAX,
+    /// The absolute offset of the row stored under the exact pair, or `None`.
+    pub fn row(&self, key1: u32, key2: u32) -> Option<u32> {
+        self.view
+            .find(self.state, key1, key2)
+            .map(|pos| self.view.row_off(pos))
+    }
+
+    /// The first live cell, or [`Self::capacity`] when the map is empty.
+    pub fn iter_start(&self) -> u32 {
+        hash_table::next_live_key(self.state, self.view.keys1_off, self.view.capacity, 0)
+    }
+
+    /// The next live cell after `current`; `capacity` is the terminal value.
+    /// `current > capacity` is [`ErrorCode::InvalidState`].
+    pub fn iter_next(&self, current: u32) -> Result<u32, ErrorCode> {
+        cursor_step(current, self.view.capacity, |from| {
+            hash_table::next_live_key(self.state, self.view.keys1_off, self.view.capacity, from)
+        })
+    }
+
+    /// The first key of live cell `pos`. A dead cell or `pos >= capacity` is
+    /// [`ErrorCode::InvalidState`].
+    pub fn iter_key1(&self, pos: u32) -> Result<u32, ErrorCode> {
+        live_key_at(self.state, self.view.keys1_off, self.view.capacity, pos)
+    }
+
+    /// The second key of live cell `pos`. Liveness comes from the first key, so the
+    /// same refusals apply.
+    pub fn iter_key2(&self, pos: u32) -> Result<u32, ErrorCode> {
+        live_key_at(self.state, self.view.keys1_off, self.view.capacity, pos)?;
+        Ok(self.view.key2_at(self.state, pos))
+    }
+
+    /// The authoritative row offset for one live iterator position.
+    pub fn iter_row(&self, pos: u32) -> Result<u32, ErrorCode> {
+        live_key_at(self.state, self.view.keys1_off, self.view.capacity, pos)?;
+        Ok(self.view.row_off(pos))
     }
 }
 
-pub fn vm_struct_map2_iter_start(
-    state: &[u8],
-    slot_offset: u32,
-    capacity: u32,
-    num_fields: u32,
-) -> u32 {
-    vm_struct_map_iter_start(state, slot_offset, capacity, num_fields)
+/// The single TTL planner retains references and ordered physical writes, never an
+/// encoded index image or a second family implementation.
+#[derive(Debug, Default)]
+struct TtlBatchScratch {
+    generation: u64,
+    order: Vec<TtlSource>,
+    commands: Vec<TtlCommand>,
 }
 
-pub fn vm_struct_map2_iter_next(
-    state: &[u8],
-    slot_offset: u32,
-    capacity: u32,
-    num_fields: u32,
-    current: u32,
-) -> u32 {
-    vm_struct_map_iter_next(state, slot_offset, capacity, num_fields, current)
+#[derive(Clone, Copy, Debug)]
+enum TtlSource {
+    Original(u32),
+    Inserted(usize),
 }
 
-pub fn vm_struct_map2_iter_key1(state: &[u8], slot_offset: u32, num_fields: u32, pos: u32) -> u32 {
-    vm_struct_map_iter_key(state, slot_offset, num_fields, pos)
+#[derive(Debug)]
+enum TtlCommand {
+    Move {
+        source: u32,
+        destination: u32,
+        len: u32,
+    },
+    Write {
+        position: u32,
+        timestamp: f64,
+        key: u32,
+        value: u32,
+    },
 }
 
-pub fn vm_struct_map2_iter_key2(
+/// Consuming authority for one preflight TTL batch's retained commands.
+#[derive(Debug)]
+pub struct TtlBatchPlan {
+    generation: u64,
+    base: u32,
+    initial_size: u32,
+    final_size: u32,
+    ranges: [(u32, u32); 2],
+}
+
+impl TtlBatchPlan {
+    pub fn ranges(&self) -> &[(u32, u32); 2] {
+        &self.ranges
+    }
+}
+
+fn ttl_source_key(state: &[u8], base: u32, source: TtlSource, commands: &[TtlCommand]) -> u32 {
+    match source {
+        TtlSource::Original(index) => evict_key(state, base, index),
+        TtlSource::Inserted(index) => match commands[index] {
+            TtlCommand::Write { key, .. } => key,
+            TtlCommand::Move { .. } => unreachable!("insert source must name a retained write"),
+        },
+    }
+}
+
+fn ttl_source_timestamp(
     state: &[u8],
-    slot_offset: u32,
-    capacity: u32,
-    num_fields: u32,
-    pos: u32,
-) -> u32 {
-    let keys1 = slot_offset + align8(num_fields);
-    bytes::read_u32(state, keys1 + capacity * 4 + pos * 4)
+    base: u32,
+    source: TtlSource,
+    commands: &[TtlCommand],
+) -> f64 {
+    match source {
+        TtlSource::Original(index) => evict_ts(state, base, index),
+        TtlSource::Inserted(index) => match commands[index] {
+            TtlCommand::Write { timestamp, .. } => timestamp,
+            TtlCommand::Move { .. } => unreachable!("insert source must name a retained write"),
+        },
+    }
+}
+
+fn prepare_ttl_batch(
+    state: &[u8],
+    meta: &SlotMetaView,
+    mutations: impl IntoIterator<Item = crate::hooks::TtlMutation>,
+    scratch: &mut TtlBatchScratch,
+) -> Result<TtlBatchPlan, ErrorCode> {
+    let validated = crate::hooks::ttl_capture_ranges(state, meta, 0)?;
+    let base = meta.eviction_index_offset(state);
+    let initial_size = meta.eviction_index_size(state);
+    let capacity = meta.eviction_index_capacity(state);
+    scratch.order.clear();
+    scratch.commands.clear();
+    scratch.generation = scratch.generation.wrapping_add(1);
+    scratch
+        .order
+        .extend((0..initial_size).map(TtlSource::Original));
+    let mut first = u32::MAX;
+    let mut last = 0u32;
+    for mutation in mutations {
+        let key = match mutation {
+            crate::hooks::TtlMutation::Upsert { key, .. }
+            | crate::hooks::TtlMutation::Remove { key } => key,
+        };
+        let size = scratch.order.len();
+        let mut write = 0usize;
+        let mut last_move = None;
+        for read in 0..size {
+            let source = scratch.order[read];
+            if ttl_source_key(state, base, source, &scratch.commands) == key {
+                continue;
+            }
+            scratch.order[write] = source;
+            if read != write {
+                first = first.min(write as u32);
+                last = last.max(write as u32 + 1);
+                let merged = last_move.is_some_and(|index| {
+                    if let TtlCommand::Move {
+                        source,
+                        destination,
+                        len,
+                    } = &mut scratch.commands[index]
+                        && *source + *len == read as u32
+                        && *destination + *len == write as u32
+                    {
+                        *len += 1;
+                        true
+                    } else {
+                        false
+                    }
+                });
+                if !merged {
+                    last_move = Some(scratch.commands.len());
+                    scratch.commands.push(TtlCommand::Move {
+                        source: read as u32,
+                        destination: write as u32,
+                        len: 1,
+                    });
+                }
+            }
+            write += 1;
+        }
+        scratch.order.truncate(write);
+        if let crate::hooks::TtlMutation::Upsert {
+            key,
+            timestamp,
+            mapped_value,
+        } = mutation
+        {
+            if write as u32 >= capacity {
+                return Err(ErrorCode::CapacityExceeded);
+            }
+            let (mut left, mut right) = (0usize, write);
+            while left < right {
+                let middle = left + (right - left) / 2;
+                if ttl_source_timestamp(state, base, scratch.order[middle], &scratch.commands)
+                    < timestamp
+                {
+                    left = middle + 1;
+                } else {
+                    right = middle;
+                }
+            }
+            let position = left as u32;
+            first = first.min(position);
+            last = last.max(write as u32 + 1);
+            if left != write {
+                scratch.commands.push(TtlCommand::Move {
+                    source: position,
+                    destination: position + 1,
+                    len: write as u32 - position,
+                });
+            }
+            let inserted = scratch.commands.len();
+            scratch.commands.push(TtlCommand::Write {
+                position,
+                timestamp,
+                key,
+                value: mapped_value,
+            });
+            scratch.order.insert(left, TtlSource::Inserted(inserted));
+        }
+    }
+    let final_size = u32::try_from(scratch.order.len()).map_err(|_| ErrorCode::InvalidState)?;
+    let touched = if first == u32::MAX {
+        (0, 0)
+    } else {
+        let offset = base
+            .checked_add(
+                first
+                    .checked_mul(EVICTION_ENTRY_SIZE)
+                    .ok_or(ErrorCode::InvalidState)?,
+            )
+            .ok_or(ErrorCode::InvalidState)?;
+        let len = (last - first)
+            .checked_mul(EVICTION_ENTRY_SIZE)
+            .ok_or(ErrorCode::InvalidState)?;
+        if offset
+            .checked_add(len)
+            .is_none_or(|end| end as usize > state.len())
+        {
+            return Err(ErrorCode::InvalidState);
+        }
+        (offset, len)
+    };
+    Ok(TtlBatchPlan {
+        generation: scratch.generation,
+        base,
+        initial_size,
+        final_size,
+        ranges: [
+            (
+                validated[0].0,
+                if final_size != initial_size { 4 } else { 0 },
+            ),
+            touched,
+        ],
+    })
+}
+
+fn consume_ttl_batch(
+    state: &mut [u8],
+    meta: &SlotMetaView,
+    plan: TtlBatchPlan,
+    scratch: &mut TtlBatchScratch,
+) {
+    assert_eq!(
+        plan.generation, scratch.generation,
+        "TTL batch lost its retained commands"
+    );
+    assert_eq!(
+        meta.eviction_index_size(state),
+        plan.initial_size,
+        "TTL batch layout changed"
+    );
+    for command in &scratch.commands {
+        match *command {
+            TtlCommand::Move {
+                source,
+                destination,
+                len,
+            } => bytes::copy_within(
+                state,
+                plan.base + source * EVICTION_ENTRY_SIZE,
+                plan.base + destination * EVICTION_ENTRY_SIZE,
+                len * EVICTION_ENTRY_SIZE,
+            ),
+            TtlCommand::Write {
+                position,
+                timestamp,
+                key,
+                value,
+            } => evict_write(state, plan.base, position, timestamp, key, value),
+        }
+    }
+    if plan.final_size != plan.initial_size {
+        meta.set_eviction_index_size(state, plan.final_size);
+    }
+    scratch.order.clear();
+    scratch.commands.clear();
 }

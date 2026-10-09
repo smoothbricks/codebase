@@ -422,6 +422,8 @@ pub enum StructFieldType {
     ArrayF64 = 7,
     ArrayString = 8,
     ArrayBool = 9,
+    /// Opaque value-object bytes; schema admission belongs to the typed host.
+    Vo = 10,
 }
 
 impl StructFieldType {
@@ -437,6 +439,7 @@ impl StructFieldType {
             7 => Some(Self::ArrayF64),
             8 => Some(Self::ArrayString),
             9 => Some(Self::ArrayBool),
+            10 => Some(Self::Vo),
             _ => None,
         }
     }
@@ -737,6 +740,9 @@ pub enum Opcode {
     /// comparison. Encoding extends 0x83 with
     /// cmp1_col,cmp1_field,cmp2_col,cmp2_field.
     BatchStructMap2UpsertMaxI64x2 = 0x87,
+    /// slot, key column, VO field, init CSR columns, count offset,
+    /// histogram and mask operands, then the schema-bound frame prefix.
+    BatchStructMapCountsFold = 0x88,
     /// slot:index, val_col:index (body opcode inside FOR_EACH/FLAT_MAP blocks)
     ListAppend = 0x84,
     /// slot:index, num_vals:u8, \[(val_col:index, field_idx:u8) × N\]
@@ -827,6 +833,7 @@ impl Opcode {
             0x85 => Self::ListAppendStruct,
             0x86 => Self::BatchStructMap2Remove,
             0x87 => Self::BatchStructMap2UpsertMaxI64x2,
+            0x88 => Self::BatchStructMapCountsFold,
             0x90 => Self::NestedSetInsert,
             0x92 => Self::NestedMapUpsertLast,
             0x95 => Self::NestedAggUpdate,
@@ -857,6 +864,17 @@ pub enum ErrorCode {
     /// fractional, negative or out-of-range number, or a non-scalar. Refused
     /// by name instead of truncating the value into a wrong cell.
     InvalidCellValue = 9,
+    /// A fixed-width sample count cannot admit another sample.
+    CountOverflow = 10,
+    /// A keyed fold's immutable frame metadata differs from its init value.
+    MetadataConflict = 11,
+    /// Physical journal budget refused this operation before any write.
+    /// The speculative window remains unusable until it is ended or reset.
+    JournalOverflow = 12,
+    /// A paired delta export contains an undo-only mutation without redo.
+    DeltaLaneMismatch = 13,
+    /// A new speculation window cannot replace an active window's checkpoints.
+    SpeculationActive = 14,
 }
 
 impl ErrorCode {
@@ -875,6 +893,11 @@ impl ErrorCode {
             7 => Self::InvalidKey,
             8 => Self::ColumnUnderrun,
             9 => Self::InvalidCellValue,
+            10 => Self::CountOverflow,
+            11 => Self::MetadataConflict,
+            12 => Self::JournalOverflow,
+            13 => Self::DeltaLaneMismatch,
+            14 => Self::SpeculationActive,
             _ => return None,
         })
     }
@@ -951,7 +974,8 @@ pub const fn struct_field_size(field_type: StructFieldType) -> u32 {
         | StructFieldType::ArrayI64
         | StructFieldType::ArrayF64
         | StructFieldType::ArrayString
-        | StructFieldType::ArrayBool => 8,
+        | StructFieldType::ArrayBool
+        | StructFieldType::Vo => 8,
     }
 }
 
@@ -959,12 +983,13 @@ pub const fn arena_elem_size(field_type: StructFieldType) -> u32 {
     match field_type {
         StructFieldType::ArrayU32 | StructFieldType::ArrayString => 4,
         StructFieldType::ArrayI64 | StructFieldType::ArrayF64 => 8,
-        StructFieldType::ArrayBool => 1,
+        StructFieldType::ArrayBool | StructFieldType::Vo => 1,
         _ => 0,
     }
 }
 
-pub const fn is_array_field_type(field_type: StructFieldType) -> bool {
+/// Physical arena storage, independent of the field's logical scalar/array shape.
+pub const fn is_arena_field_type(field_type: StructFieldType) -> bool {
     matches!(
         field_type,
         StructFieldType::ArrayU32
@@ -972,15 +997,16 @@ pub const fn is_array_field_type(field_type: StructFieldType) -> bool {
             | StructFieldType::ArrayF64
             | StructFieldType::ArrayString
             | StructFieldType::ArrayBool
+            | StructFieldType::Vo
     )
 }
 
-pub fn has_array_fields(num_fields: u8, field_types: &[u8]) -> bool {
+pub fn has_arena_fields(num_fields: u8, field_types: &[u8]) -> bool {
     field_types
         .iter()
         .take(usize::from(num_fields))
         .any(|&field_type| {
-            is_array_field_type(StructFieldType::from_u8(field_type).unwrap_or_else(|| {
+            is_arena_field_type(StructFieldType::from_u8(field_type).unwrap_or_else(|| {
                 crate::die!("invariant: struct-map descriptor contains an invalid field type")
             }))
         })
@@ -1112,7 +1138,7 @@ mod tests {
         // helper in columine-vm's state_init; only field-level helpers live
         // here.)
         assert_eq!(struct_field_offset(4, &fields, 3), 1 + 1 + 8 + 8);
-        assert!(has_array_fields(4, &fields));
+        assert!(has_arena_fields(4, &fields));
         assert_eq!(arena_elem_size(StructFieldType::ArrayU32), 4);
         assert_eq!(arena_elem_size(StructFieldType::ArrayBool), 1);
         assert_eq!(arena_elem_size(StructFieldType::Int64), 0);
@@ -1154,6 +1180,6 @@ mod tests {
             StructFieldType::Float64 as u8,
         ];
         assert_eq!(struct_field_offset(2, &fields, 1), 5);
-        assert!(!has_array_fields(2, &fields));
+        assert!(!has_arena_fields(2, &fields));
     }
 }

@@ -73,6 +73,7 @@ enum Top {
     Done,
 }
 
+#[derive(Clone)]
 pub struct JsonParser<'a> {
     input: &'a [u8],
     cursor: usize,
@@ -191,8 +192,20 @@ impl<'a> JsonParser<'a> {
         })
     }
 
+    /// One token at the cursor. Whitespace belongs to no token, so it is skipped
+    /// before the save point. A failed read rolls back to the token start; the
+    /// readers change the stack and phase only after their last fallible step.
     fn advance(&mut self) -> Result<SpannedToken, ParserError> {
         self.skip_whitespace();
+        let at = self.cursor;
+        let result = self.advance_inner();
+        if result.is_err() {
+            self.cursor = at;
+        }
+        result
+    }
+
+    fn advance_inner(&mut self) -> Result<SpannedToken, ParserError> {
         match self.stack.last().copied() {
             None => match self.top {
                 Top::NotStarted => self.read_value_token(),
@@ -591,6 +604,53 @@ mod tests {
         p.expect_field_name().unwrap();
         p.expect_int64().unwrap();
         assert!(p.is_object_end());
+    }
+
+    /// A failed read consumes nothing: the cursor is restored, so a repeated peek
+    /// and the direct read report the same error from the same position.
+    #[test]
+    fn failed_value_read_consumes_nothing() {
+        let mut p = JsonParser::new(br#"{"a": :5}"#);
+        p.expect_object_begin().unwrap();
+        assert_eq!(p.expect_field_name().unwrap(), "a");
+        let at = p.cursor();
+        assert_eq!(p.peek_token(), Err(ParserError::InvalidJson));
+        assert_eq!(p.cursor(), at);
+        assert_eq!(p.peek_token(), Err(ParserError::InvalidJson));
+        assert_eq!(p.next_token(), Err(ParserError::InvalidJson));
+        assert_eq!(p.cursor(), at);
+    }
+    #[test]
+    fn failed_number_read_leaves_cursor_before_the_minus() {
+        let mut p = JsonParser::new(br#"{"a":-:5}"#);
+        p.expect_object_begin().unwrap();
+        assert_eq!(p.expect_field_name().unwrap(), "a");
+        let at = p.cursor();
+        assert_eq!(p.next_token(), Err(ParserError::InvalidNumber));
+        assert_eq!(p.cursor(), at);
+    }
+    #[test]
+    fn peeked_value_is_read_back_unchanged() {
+        let mut p = JsonParser::new(br#"{"a":"x"}"#);
+        p.expect_object_begin().unwrap();
+        p.expect_field_name().unwrap();
+        assert_eq!(p.peek_token(), Ok(Token::String("x".into())));
+        assert_eq!(p.next_token(), Ok(Token::String("x".into())));
+        assert_eq!(p.next_token(), Ok(Token::ObjectEnd));
+    }
+
+    /// Trailing whitespace belongs to no token: the failed read past the top-level
+    /// value leaves the cursor at end of input, which `JsonValue::parse` depends on.
+    #[test]
+    fn failed_read_past_top_level_value_leaves_cursor_at_end() {
+        let input = br#"{"a":1}  "#;
+        let mut p = JsonParser::new(input);
+        p.expect_object_begin().unwrap();
+        p.expect_field_name().unwrap();
+        p.expect_int64().unwrap();
+        assert_eq!(p.next_token(), Ok(Token::ObjectEnd));
+        assert_eq!(p.next_token(), Err(ParserError::EndOfInput));
+        assert_eq!(p.cursor(), input.len());
     }
 
     fn drain(input: &[u8]) -> Result<Vec<Token>, ParserError> {

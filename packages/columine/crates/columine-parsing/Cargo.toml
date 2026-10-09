@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 columine-arrow = { path = "../columine-arrow" }
+columine-types = { path = "../columine-types" }
 
 [dev-dependencies]
 proptest.workspace = true

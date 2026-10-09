@@ -96,35 +96,119 @@ describe('parseReducerProgram', () => {
     });
   });
 
-  it('decodes struct-map TTL payload and field types', () => {
-    const typeFlags = SlotType.STRUCT_MAP | SlotTypeFlag.HAS_TTL;
-    const initCode = [
-      0x18,
-      0x00,
-      typeFlags,
+  it('refuses TTL on both struct-map declarations before decoding their metadata', () => {
+    const structMap = [
+      Opcode.SLOT_STRUCT_MAP,
+      0,
+      SlotType.STRUCT_MAP | SlotTypeFlag.HAS_TTL,
       0x40,
       0x00,
       0x02,
       StructFieldType.UINT32,
       StructFieldType.INT64,
       ...ttlBytes(300, 0, 2, TtlStartOf.HOUR),
-      0x00,
+      Opcode.HALT,
     ];
+    expect(() => parseReducerProgram(buildProgram(structMap, 1))).toThrow('struct-map TTL is not supported');
 
-    const program = parseReducerProgram(buildProgram(initCode, 1));
-    const slot = program.slotDefs[0];
-    expect(slot.type).toBe(SlotType.STRUCT_MAP);
-    if (slot.type !== SlotType.STRUCT_MAP) {
-      throw new Error('invariant: expected struct-map slot');
-    }
-    expect(slot.fieldTypes).toEqual([StructFieldType.UINT32, StructFieldType.INT64]);
-    expect(slot.ttl).toEqual({
-      ttlSeconds: 300,
-      graceSeconds: 0,
-      timestampFieldIndex: 2,
-      startOf: TtlStartOf.HOUR,
-      hasEvictTrigger: false,
+    const structMap2 = [
+      Opcode.SLOT_STRUCT_MAP2,
+      0,
+      SlotType.STRUCT_MAP2 | SlotTypeFlag.HAS_TTL,
+      0x40,
+      0x00,
+      0x01,
+      StructFieldType.UINT32,
+      ...ttlBytes(300, 0, 2, TtlStartOf.HOUR),
+      Opcode.HALT,
+    ];
+    expect(() => parseReducerProgram(buildProgram(structMap2, 1))).toThrow('struct-map2 TTL is not supported');
+
+    // Refusal precedes metadata decoding: a TTL flag with no TTL bytes is still the kind refusal.
+    const noMetadata = [
+      Opcode.SLOT_STRUCT_MAP,
+      0,
+      SlotType.STRUCT_MAP | SlotTypeFlag.HAS_TTL,
+      0x40,
+      0x00,
+      0x00,
+      Opcode.HALT,
+    ];
+    expect(() => parseReducerProgram(buildProgram(noMetadata, 1))).toThrow('struct-map TTL is not supported');
+  });
+
+  it('admits VO struct-map fields and refuses the first byte past the closed field-kind set', () => {
+    const init = [Opcode.SLOT_STRUCT_MAP, 0, SlotType.STRUCT_MAP, 4, 0, 2, StructFieldType.UINT32, StructFieldType.VO];
+    const bytecode = buildProgram([...init, Opcode.HALT], 1);
+
+    expect(StructFieldType.VO).toBe(10);
+    expect(parseReducerProgram(bytecode).slotDefs[0]).toEqual({
+      type: SlotType.STRUCT_MAP,
+      capacity: 4,
+      fieldTypes: [StructFieldType.UINT32, StructFieldType.VO],
     });
+    bytecode[PROGRAM_HASH_PREFIX + HEADER_SIZE + init.length - 1] = StructFieldType.VO + 1;
+    expect(() => parseReducerProgram(bytecode)).toThrow('Invalid program: unknown struct field type 11');
+  });
+
+  it('refuses VO descriptors outside STRUCT_MAP', () => {
+    const structMap2 = [Opcode.SLOT_STRUCT_MAP2, 0, SlotType.STRUCT_MAP2, 4, 0, 1, StructFieldType.VO, Opcode.HALT];
+    expect(() => parseReducerProgram(buildProgram(structMap2, 1))).toThrow(
+      'Invalid program: struct-map2 VO field descriptors are not supported',
+    );
+
+    const orderedList = (...descriptor: number[]) =>
+      buildProgram([Opcode.SLOT_ORDERED_LIST, 0, SlotType.ORDERED_LIST, 4, 0, ...descriptor, Opcode.HALT], 1);
+
+    expect(() => parseReducerProgram(orderedList(StructFieldType.VO))).toThrow(
+      'Invalid program: ordered-list VO field descriptors are not supported',
+    );
+    expect(() => parseReducerProgram(orderedList(0xff, 2, StructFieldType.UINT32, StructFieldType.VO))).toThrow(
+      'Invalid program: ordered-list VO field descriptors are not supported',
+    );
+    expect(parseReducerProgram(orderedList(0xff, 1, StructFieldType.ARRAY_BOOL)).slotDefs[0]).toEqual({
+      type: SlotType.ORDERED_LIST,
+      capacity: 4,
+      fieldTypes: [StructFieldType.ARRAY_BOOL],
+    });
+  });
+
+  it('requires each specialized slot opcode to name its actual native kind', () => {
+    const declarations: readonly (readonly [
+      Opcode,
+      SlotType.STRUCT_MAP | SlotType.STRUCT_MAP2 | SlotType.ORDERED_LIST,
+    ])[] = [
+      [Opcode.SLOT_STRUCT_MAP, SlotType.STRUCT_MAP],
+      [Opcode.SLOT_STRUCT_MAP2, SlotType.STRUCT_MAP2],
+      [Opcode.SLOT_ORDERED_LIST, SlotType.ORDERED_LIST],
+    ];
+    for (const [opcode, kind] of declarations) {
+      const descriptor = opcode === Opcode.SLOT_ORDERED_LIST ? [StructFieldType.UINT32] : [1, StructFieldType.UINT32];
+      const valid = [opcode, 0, kind, 4, 0, ...descriptor, Opcode.HALT];
+      expect(parseReducerProgram(buildProgram(valid, 1)).slotDefs[0].type).toBe(kind);
+      for (const other of [SlotType.HASHSET, SlotType.STRUCT_MAP, SlotType.ORDERED_LIST, SlotType.STRUCT_MAP2]) {
+        if (other === kind) continue;
+        const invalid = [...valid];
+        invalid[2] = other;
+        expect(() => parseReducerProgram(buildProgram(invalid, 1))).toThrow('declared slot kind disagree');
+      }
+    }
+    expect(() =>
+      parseReducerProgram(
+        buildProgram(
+          [
+            Opcode.SLOT_ORDERED_LIST,
+            0,
+            SlotType.ORDERED_LIST | SlotTypeFlag.HAS_TTL,
+            4,
+            0,
+            StructFieldType.UINT32,
+            Opcode.HALT,
+          ],
+          1,
+        ),
+      ),
+    ).toThrow('ordered-list TTL is not supported');
   });
 
   it('reads slot and timestamp-column indexes past one byte', () => {
@@ -144,6 +228,55 @@ describe('parseReducerProgram', () => {
     expect(program.slotDefs[200]).toEqual({ type: SlotType.HASHSET, capacity: 4, ttl: undefined });
     const last = program.slotDefs[numSlots - 1];
     expect('ttl' in last && last.ttl?.timestampFieldIndex).toBe(280);
+  });
+
+  it('admits TTL only on the spec-defined HashMap, HashSet and Bitmap slot kinds', () => {
+    for (const kind of [SlotType.AGGREGATE, SlotType.SCALAR, SlotType.CONDITION_TREE]) {
+      const invalid = buildProgram(
+        [Opcode.SLOT_DEF, 0, kind | SlotTypeFlag.HAS_TTL, 4, 0, ...ttlBytes(10, 0, 0, TtlStartOf.NONE), Opcode.HALT],
+        1,
+      );
+      expect(() => parseReducerProgram(invalid)).toThrow('TTL is unsupported');
+    }
+    for (const kind of [SlotType.HASHMAP, SlotType.HASHSET, SlotType.BITMAP]) {
+      const valid = buildProgram(
+        [Opcode.SLOT_DEF, 0, kind | SlotTypeFlag.HAS_TTL, 4, 0, ...ttlBytes(10, 0, 0, TtlStartOf.NONE), Opcode.HALT],
+        1,
+      );
+      const slot = parseReducerProgram(valid).slotDefs[0];
+      expect<SlotType>(slot.type).toBe(kind);
+      expect('ttl' in slot && slot.ttl?.ttlSeconds).toBe(10);
+    }
+  });
+
+  it('decodes BITMAP TTL metadata and refuses malformed TTL tails like HASHSET', () => {
+    const typeFlags = SlotType.BITMAP | SlotTypeFlag.HAS_TTL;
+    const initCode = [Opcode.SLOT_DEF, 0, typeFlags, 0x40, 0x00, ...ttlBytes(90, 5, 3, TtlStartOf.MINUTE), Opcode.HALT];
+    expect(parseReducerProgram(buildProgram(initCode, 1)).slotDefs[0]).toEqual({
+      type: SlotType.BITMAP,
+      capacity: 64,
+      ttl: {
+        ttlSeconds: 90,
+        graceSeconds: 5,
+        timestampFieldIndex: 3,
+        startOf: TtlStartOf.MINUTE,
+        hasEvictTrigger: false,
+      },
+    });
+
+    const truncated = [Opcode.SLOT_DEF, 0, typeFlags, 0x40, 0x00, 0x00, 0x00, 0x00, Opcode.HALT];
+    expect(() => parseReducerProgram(buildProgram(truncated, 1))).toThrow('truncated TTL metadata');
+
+    const badStartOf = [
+      Opcode.SLOT_DEF,
+      0,
+      typeFlags,
+      0x40,
+      0x00,
+      ...ttlBytes(10, 0, 0, TtlStartOf.NONE).slice(0, -1),
+      9,
+    ];
+    expect(() => parseReducerProgram(buildProgram(badStartOf, 1))).toThrow('unknown TTL startOf 9');
   });
 
   it('refuses a program of another format version', () => {

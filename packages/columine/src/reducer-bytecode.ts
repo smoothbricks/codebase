@@ -1,5 +1,5 @@
 import { readIndex } from './operand.js';
-import type { ReducerProgram, SlotDef, SlotTtlMetadata, StructFieldType } from './types.js';
+import type { ReducerProgram, SlotDef, SlotTtlMetadata } from './types.js';
 import {
   AggType,
   HEADER_SIZE,
@@ -9,6 +9,7 @@ import {
   PROGRAM_MAGIC,
   SlotType,
   SlotTypeFlag,
+  StructFieldType,
   type TtlStartOf,
 } from './types.js';
 
@@ -82,10 +83,20 @@ function parseStructFieldType(value: number): StructFieldType {
     case 7:
     case 8:
     case 9:
+    case 10:
       return value;
     default:
       throw new Error(`Invalid program: unknown struct field type ${value}`);
   }
+}
+
+/** VO is a STRUCT_MAP-only field kind: the VM refuses it in every other container, and so does this mirror. */
+function parseNonStructMapFieldType(value: number, container: 'struct-map2' | 'ordered-list'): StructFieldType {
+  const fieldType = parseStructFieldType(value);
+  if (fieldType === StructFieldType.VO) {
+    throw new Error(`Invalid program: ${container} VO field descriptors are not supported`);
+  }
+  return fieldType;
 }
 
 function parseTtlStartOf(value: number): TtlStartOf {
@@ -194,6 +205,16 @@ export function parseReducerSlotDefs(initCode: Uint8Array, expectedSlots: number
         const capLo = initCode[pc + 1];
         const capHi = initCode[pc + 2];
         pc += 3;
+        if (
+          (typeFlags & HAS_TTL_FLAG) !== 0 &&
+          slotType !== SlotType.HASHMAP &&
+          slotType !== SlotType.HASHSET &&
+          slotType !== SlotType.BITMAP
+        ) {
+          throw new Error(
+            `Invalid program: TTL is unsupported for SLOT_DEF type ${slotType}; only HASHMAP, HASHSET, BITMAP admit it`,
+          );
+        }
 
         const ttlParsed = parseTtlIfPresent(initCode, pc, typeFlags);
         if (ttlParsed) {
@@ -241,6 +262,14 @@ export function parseReducerSlotDefs(initCode: Uint8Array, expectedSlots: number
         pc = next;
         requireInitBytes(initCode, pc, 4, 'struct-map slot operands');
         const typeFlags = initCode[pc];
+        const expectedType = op === Opcode.SLOT_STRUCT_MAP ? SlotType.STRUCT_MAP : SlotType.STRUCT_MAP2;
+        if ((typeFlags & SLOT_TYPE_MASK) !== expectedType) {
+          throw new Error('Invalid program: struct-map opcode and declared slot kind disagree');
+        }
+        if ((typeFlags & HAS_TTL_FLAG) !== 0) {
+          const container = op === Opcode.SLOT_STRUCT_MAP ? 'struct-map' : 'struct-map2';
+          throw new Error(`Invalid program: ${container} TTL is not supported`);
+        }
         const capLo = initCode[pc + 1];
         const capHi = initCode[pc + 2];
         const numFields = initCode[pc + 3];
@@ -249,12 +278,12 @@ export function parseReducerSlotDefs(initCode: Uint8Array, expectedSlots: number
 
         const fieldTypes: StructFieldType[] = [];
         for (let i = 0; i < numFields; i++) {
-          fieldTypes.push(parseStructFieldType(initCode[pc++]));
-        }
-
-        const ttlParsed = op === Opcode.SLOT_STRUCT_MAP ? parseTtlIfPresent(initCode, pc, typeFlags) : undefined;
-        if (ttlParsed) {
-          pc = ttlParsed.nextPc;
+          const fieldTypeByte = initCode[pc++];
+          fieldTypes.push(
+            op === Opcode.SLOT_STRUCT_MAP2
+              ? parseNonStructMapFieldType(fieldTypeByte, 'struct-map2')
+              : parseStructFieldType(fieldTypeByte),
+          );
         }
 
         defineSlot(
@@ -271,7 +300,6 @@ export function parseReducerSlotDefs(initCode: Uint8Array, expectedSlots: number
                 type: SlotType.STRUCT_MAP,
                 capacity: (capHi << 8) | capLo || defaultCapacity,
                 fieldTypes,
-                ttl: ttlParsed?.ttl,
               },
         );
         break;
@@ -281,6 +309,13 @@ export function parseReducerSlotDefs(initCode: Uint8Array, expectedSlots: number
         const { value: slot, next } = readIndex(initCode, pc);
         pc = next;
         requireInitBytes(initCode, pc, 4, 'SLOT_ORDERED_LIST operands');
+        const typeFlags = initCode[pc];
+        if ((typeFlags & SLOT_TYPE_MASK) !== SlotType.ORDERED_LIST) {
+          throw new Error('Invalid program: ordered-list opcode and declared slot kind disagree');
+        }
+        if ((typeFlags & HAS_TTL_FLAG) !== 0) {
+          throw new Error('Invalid program: ordered-list TTL is not supported');
+        }
         const capLo = initCode[pc + 1];
         const capHi = initCode[pc + 2];
         const elemTypeByte = initCode[pc + 3];
@@ -294,11 +329,15 @@ export function parseReducerSlotDefs(initCode: Uint8Array, expectedSlots: number
           requireInitBytes(initCode, pc, numFields, 'ordered-list field metadata');
           const fieldTypes: StructFieldType[] = [];
           for (let i = 0; i < numFields; i++) {
-            fieldTypes.push(parseStructFieldType(initCode[pc++]));
+            fieldTypes.push(parseNonStructMapFieldType(initCode[pc++], 'ordered-list'));
           }
           slotDef = { type: SlotType.ORDERED_LIST, capacity, fieldTypes };
         } else {
-          slotDef = { type: SlotType.ORDERED_LIST, capacity, elemType: parseStructFieldType(elemTypeByte) };
+          slotDef = {
+            type: SlotType.ORDERED_LIST,
+            capacity,
+            elemType: parseNonStructMapFieldType(elemTypeByte, 'ordered-list'),
+          };
         }
         defineSlot(slotDefs, expectedSlots, slot, slotDef);
         break;

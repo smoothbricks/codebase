@@ -40,8 +40,9 @@ fn main() {
     }
     let mut seed: u32 = first.parse().expect("u32 seed");
     let rounds: u32 = args.next().expect("rounds").parse().expect("u32 rounds");
-    let mut state =
-        vec![0; calculate_state_size(&insert, DEFAULT_ACCEPTED_PROGRAM_MAGICS) as usize];
+    let size = calculate_state_size(&insert, DEFAULT_ACCEPTED_PROGRAM_MAGICS)
+        .expect("valid program admission");
+    let mut state = vec![0; size as usize];
     init_state(&mut state, &insert, DEFAULT_ACCEPTED_PROGRAM_MAGICS).expect("valid fixture");
     let mut vm = Vm::default();
     for _ in 0..rounds {

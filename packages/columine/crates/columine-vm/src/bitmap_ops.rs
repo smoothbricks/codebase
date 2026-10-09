@@ -34,13 +34,19 @@
 //! Membership, cardinality, rank/select, iteration and intersection open an
 //! `BitmosaicView` over the slot bytes (or over caller-supplied bytes for the
 //! decision-side `*_serialized` queries) and answer from the string; no read
-use crate::hooks::{MutationRecord, VmHooks};
+use crate::bitmap_ttl::{TtlAlgebraScratch, merge_expiries};
+use crate::hooks::{ByteCapture, TtlMutation, VmHooks};
 use crate::meta::SlotMetaView;
+use crate::state_init::bind_slot;
+use crate::vm::TtlBatchPlan;
 use bitmosaic::{
     AndNotRange, AndRange, BatchOutcome, Bitmosaic, BitmosaicView, IMAGE_ID_LEN, KeyWidth, OrRange,
-    PatchError, PatchReport, PatchScratch, Range, XorRange, image_header, patch_witnessed,
+    PatchError, PatchReport, PatchScratch, PreparedPatch, Range, XorRange, image_header,
+    prepare_patch_in_witnessed,
 };
-use columine_types::{BITMAP_BYTES_PER_CAPACITY, ChangeFlag, EMPTY_KEY, ErrorCode, TOMBSTONE};
+use columine_types::{
+    BITMAP_BYTES_PER_CAPACITY, ChangeFlag, EMPTY_KEY, ErrorCode, SlotMetaOffset, TOMBSTONE,
+};
 
 /// Canonical payload-capacity formula used by allocation, grow-copy, and
 /// readers. Keeping one formula prevents those paths from disagreeing: four
@@ -111,13 +117,6 @@ pub fn get_bitmap_storage(meta: &SlotMetaView) -> BitmapStorage {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-enum PendingBitmapMutation {
-    Insert { key: u32, timestamp: f64 },
-    RefreshTtl { key: u32, timestamp: f64 },
-    Remove { key: u32, previous_ts_bits: u64 },
-}
-
 /// Observable bitmap operation state: the patch scratch and the batch
 /// buffers every write reuses, the decision-side algebra result, and the
 /// last diagnostic.
@@ -125,6 +124,8 @@ pub struct BitmapEnv {
     /// `g_bitmap_last_error` — diagnostic code readable after a failure.
     pub last_error: u32,
     scratch: PatchScratch,
+    eviction_witness: (),
+    capture_ranges: Vec<(u32, u32)>,
     /// Staged adds as `elem << 32 | column index`, so one sort orders them by
     /// value and, within a value, by first occurrence.
     staged_adds: Vec<u64>,
@@ -135,7 +136,8 @@ pub struct BitmapEnv {
     adds_new: Vec<u64>,
     removes_held: Vec<u64>,
     algebra_result: Vec<u8>,
-    pending_mutations: Vec<PendingBitmapMutation>,
+    ttl_mutations: Vec<TtlMutation>,
+    ttl_algebra_scratch: TtlAlgebraScratch,
 }
 
 impl Default for BitmapEnv {
@@ -143,13 +145,16 @@ impl Default for BitmapEnv {
         BitmapEnv {
             last_error: 0,
             scratch: PatchScratch::new(),
+            eviction_witness: (),
+            capture_ranges: Vec::new(),
             staged_adds: Vec::new(),
             adds: Vec::new(),
             removes: Vec::new(),
             adds_new: Vec::new(),
             removes_held: Vec::new(),
             algebra_result: Vec::new(),
-            pending_mutations: Vec::new(),
+            ttl_mutations: Vec::new(),
+            ttl_algebra_scratch: TtlAlgebraScratch::default(),
         }
     }
 }
@@ -169,16 +174,6 @@ impl BitmapEnv {
     pub fn algebra_result(&self) -> &[u8] {
         &self.algebra_result
     }
-
-    /// Whether `adds[i]` of the last successful [`bitmap_patch`] was new.
-    fn add_was_new(&self, i: usize) -> bool {
-        self.adds_new[i / 64] >> (i % 64) & 1 == 1
-    }
-
-    /// Whether `removes[i]` of the last successful [`bitmap_patch`] was held.
-    fn remove_was_held(&self, i: usize) -> bool {
-        self.removes_held[i / 64] >> (i % 64) & 1 == 1
-    }
 }
 
 /// Whether a column is already the batch a patch takes: strictly ascending
@@ -190,70 +185,61 @@ fn is_batch(column: &[u32]) -> bool {
     column.last().is_none_or(|&last| last < TOMBSTONE) && column.is_sorted_by(|a, b| a < b)
 }
 
-fn commit_bitmap_mutations(
-    env: &mut BitmapEnv,
-    hooks: &mut impl VmHooks,
-    delta_mode: bool,
-    state: &mut [u8],
-    meta: &SlotMetaView,
-    slot_idx: u32,
-) -> ErrorCode {
-    for idx in 0..env.pending_mutations.len() {
-        match env.pending_mutations[idx] {
-            PendingBitmapMutation::Insert { key, timestamp } => {
-                if hooks.undo_enabled() {
-                    hooks.append_mutation(
-                        delta_mode,
-                        state,
-                        MutationRecord::set_insert(slot_idx, key),
-                        MutationRecord::set_delete(slot_idx, key, 0),
-                    );
-                }
-                if meta.has_ttl() {
-                    let result = hooks.insert_with_ttl(state, meta, key, timestamp);
-                    if result != ErrorCode::Ok {
-                        env.pending_mutations.clear();
-                        return result;
-                    }
-                }
-            }
-            PendingBitmapMutation::RefreshTtl { key, timestamp } => {
-                let result = hooks.insert_with_ttl(state, meta, key, timestamp);
-                if result != ErrorCode::Ok {
-                    env.pending_mutations.clear();
-                    return result;
-                }
-            }
-            PendingBitmapMutation::Remove {
-                key,
-                previous_ts_bits,
-            } => {
-                if hooks.undo_enabled() {
-                    hooks.append_mutation(
-                        delta_mode,
-                        state,
-                        MutationRecord::set_delete(slot_idx, key, previous_ts_bits),
-                        MutationRecord::set_insert(slot_idx, key),
-                    );
-                }
-                if meta.has_ttl() {
-                    hooks.remove_ttl_entries_for_key(state, meta, key);
-                }
-            }
+fn bitmap_patch_error(last_error: &mut u32, error: PatchError) -> ErrorCode {
+    match error {
+        PatchError::Capacity { .. } => {
+            *last_error = 60;
+            ErrorCode::CapacityExceeded
+        }
+        PatchError::Malformed => {
+            *last_error = 102;
+            ErrorCode::InvalidState
+        }
+        PatchError::Unsorted => {
+            columine_types::die!("bitmap batches are sorted and deduplicated before patching")
         }
     }
-    env.pending_mutations.clear();
-    ErrorCode::Ok
 }
 
-/// Patch the slot's image in place: the set becomes `(old ∪ adds) \ removes`.
-/// `adds` and `removes` are strictly ascending. The slot already holds a
-/// valid image — initialization and empty-result emission provide one — so
-/// the patch runs directly with no seed copy and no separate length write:
-/// framing is rewritten by the patch itself. On success only the stale tail
-/// is cleared, and `env.add_was_new(i)` / `env.remove_was_held(i)` answer
-/// per value what the patch found; a refusal leaves the slot exactly as it
-/// was and `env.last_error` names why.
+fn bitmap_payload_range(
+    storage: BitmapStorage,
+    state_len: usize,
+) -> Result<core::ops::Range<usize>, ErrorCode> {
+    let start = storage.payload_offset() as usize;
+    let end = start
+        .checked_add(storage.payload_capacity as usize)
+        .filter(|&end| end <= state_len)
+        .ok_or(ErrorCode::InvalidState)?;
+    Ok(start..end)
+}
+
+/// Retain the real kernel's paid mutation plan for VM-owned eviction. The
+/// authority borrows the same state and scratch until applied, so it cannot
+/// be replayed against another image or after another patch reuses scratch.
+pub fn prepare_bitmap_patch<'state, 'work>(
+    env: &'work mut BitmapEnv,
+    state: &'state mut [u8],
+    storage: BitmapStorage,
+    adds: &'work [u32],
+    removes: &'work [u32],
+) -> Result<PreparedPatch<'state, 'work, ()>, ErrorCode> {
+    let range = bitmap_payload_range(storage, state.len()).inspect_err(|_| {
+        env.last_error = 102;
+    })?;
+    prepare_patch_in_witnessed(
+        state,
+        range,
+        adds,
+        removes,
+        &mut env.scratch,
+        &mut env.eviction_witness,
+    )
+    .map_err(|error| bitmap_patch_error(&mut env.last_error, error))
+}
+
+/// Patch the native image once, using its existing bitmosaic membership
+/// witness. A refusal changes no state; success also clears the old framing
+/// tail, without copying the image or its allocated capacity.
 pub fn bitmap_patch(
     env: &mut BitmapEnv,
     state: &mut [u8],
@@ -261,43 +247,148 @@ pub fn bitmap_patch(
     adds: &[u32],
     removes: &[u32],
 ) -> Result<PatchReport, ErrorCode> {
-    let old_len = match storage.serialized_len(state) {
-        Ok(len) => len as usize,
-        Err(_) => {
-            env.last_error = 102;
-            return Err(ErrorCode::InvalidState);
-        }
-    };
-    let capacity = storage.payload_capacity as usize;
-    let payload = storage.payload_offset() as usize;
-    let slot = &mut state[payload..payload + capacity];
+    let range = bitmap_payload_range(storage, state.len()).inspect_err(|_| {
+        env.last_error = 102;
+    })?;
     env.adds_new.resize(adds.len().div_ceil(64), 0);
     env.removes_held.resize(removes.len().div_ceil(64), 0);
     let mut outcome = BatchOutcome::new(&mut env.adds_new, &mut env.removes_held);
-    match patch_witnessed(slot, adds, removes, &mut env.scratch, &mut outcome) {
-        Ok(report) => {
-            // Every payload byte past the image is zero, so the image is a
-            // function of the set alone: clear whatever the old image
-            // occupied beyond the new one. A zero-member result already
-            // emits the four-byte empty image, so no separate empty path.
-            let new_len = report.serialized_len;
-            if new_len < old_len {
-                slot[new_len..old_len].fill(0);
-            }
-            Ok(report)
-        }
-        Err(PatchError::Capacity { .. }) => {
-            env.last_error = 60;
-            Err(ErrorCode::CapacityExceeded)
-        }
-        Err(PatchError::Malformed) => {
-            env.last_error = 102;
-            Err(ErrorCode::InvalidState)
-        }
-        Err(PatchError::Unsorted) => {
-            columine_types::die!("bitmap batches are sorted and deduplicated before patching")
+    let prepared =
+        prepare_patch_in_witnessed(state, range, adds, removes, &mut env.scratch, &mut outcome)
+            .map_err(|error| bitmap_patch_error(&mut env.last_error, error))?;
+    Ok(prepared.apply_with_cleared_tail().0)
+}
+
+pub(crate) fn push_payload_capture_range(
+    ranges: &mut Vec<(u32, u32)>,
+    payload: u32,
+    relative: usize,
+    len: usize,
+) -> Result<(), ErrorCode> {
+    if len == 0 {
+        return Ok(());
+    }
+    let relative = u32::try_from(relative).map_err(|_| ErrorCode::InvalidState)?;
+    let len = u32::try_from(len).map_err(|_| ErrorCode::InvalidState)?;
+    let offset = payload
+        .checked_add(relative)
+        .ok_or(ErrorCode::InvalidState)?;
+    let end = offset.checked_add(len).ok_or(ErrorCode::InvalidState)?;
+    if let Some((previous, previous_len)) = ranges.last_mut() {
+        let previous_end = *previous + *previous_len;
+        if offset <= previous_end {
+            *previous_len = previous_end.max(end) - *previous;
+            return Ok(());
         }
     }
+    ranges.push((offset, len));
+    Ok(())
+}
+
+enum BitmapTtlCapture {
+    Unchanged,
+    Membership,
+    Prepared(TtlBatchPlan),
+}
+
+/// Admit every payload/header/index range before the prepared patch writes
+/// its first byte. The shared owner reserves StateBytes and the outstanding
+/// flag boundary; TTL work stays inside this one physical capture.
+#[allow(clippy::too_many_arguments)]
+fn capture_bitmap_patch(
+    env: &mut BitmapEnv,
+    hooks: &mut impl VmHooks,
+    state: &mut [u8],
+    meta: &SlotMetaView,
+    storage: BitmapStorage,
+    adds: &[u32],
+    removes: &[u32],
+    ttl_capture: BitmapTtlCapture,
+) -> Result<(PatchReport, ByteCapture, Option<TtlBatchPlan>), ErrorCode> {
+    let range = bitmap_payload_range(storage, state.len()).inspect_err(|_| {
+        env.last_error = 102;
+    })?;
+    env.adds_new.resize(adds.len().div_ceil(64), 0);
+    env.removes_held.resize(removes.len().div_ceil(64), 0);
+    let mut outcome = BatchOutcome::new(&mut env.adds_new, &mut env.removes_held);
+    let prepared =
+        prepare_patch_in_witnessed(state, range, adds, removes, &mut env.scratch, &mut outcome)
+            .map_err(|error| bitmap_patch_error(&mut env.last_error, error))?;
+    env.capture_ranges.clear();
+    // Merge the single cleared-tail interval into the kernel's already sorted
+    // ranges in one pass. No re-sort, duplicate capture, or capacity-sized copy.
+    let mut tail = prepared.cleared_tail_range();
+    for &(offset, len) in prepared.mutation_ranges() {
+        if let Some((tail_offset, tail_len)) = tail
+            && tail_offset <= offset
+        {
+            push_payload_capture_range(
+                &mut env.capture_ranges,
+                storage.payload_offset(),
+                tail_offset,
+                tail_len,
+            )?;
+            tail = None;
+        }
+        push_payload_capture_range(
+            &mut env.capture_ranges,
+            storage.payload_offset(),
+            offset,
+            len,
+        )?;
+    }
+    if let Some((offset, len)) = tail {
+        push_payload_capture_range(
+            &mut env.capture_ranges,
+            storage.payload_offset(),
+            offset,
+            len,
+        )?;
+    }
+    env.capture_ranges
+        .push((meta.meta_base + SlotMetaOffset::SIZE, 4));
+    // The shared owner filters this byte when an enclosing boundary owns it;
+    // a direct container caller without that boundary still journals flags.
+    env.capture_ranges
+        .push((meta.meta_base + SlotMetaOffset::CHANGE_FLAGS, 1));
+    let ttl_plan = match ttl_capture {
+        BitmapTtlCapture::Unchanged => None,
+        BitmapTtlCapture::Prepared(plan) => Some(plan),
+        BitmapTtlCapture::Membership => {
+            // Membership operations consume the paid kernel's final witness.
+            // Algebra already joined its expiry changes and admitted its plan.
+            for (i, &key) in removes.iter().enumerate() {
+                if prepared.witness().remove_was_held(i) {
+                    env.ttl_mutations.push(TtlMutation::Remove { key });
+                }
+            }
+            Some(hooks.plan_ttl_batch(prepared.state(), meta, env.ttl_mutations.iter().copied())?)
+        }
+    };
+    if let Some(plan) = &ttl_plan {
+        env.capture_ranges.extend_from_slice(plan.ranges());
+    }
+    let capture = hooks.begin_capture(prepared.state(), &env.capture_ranges)?;
+    let (report, _) = prepared.apply_with_cleared_tail();
+    Ok((report, capture, ttl_plan))
+}
+
+/// Consume the already-admitted TTL plan once; neither payload nor index can
+/// discover an operational refusal after the first primary byte is written.
+fn finish_bitmap_mutations(
+    env: &mut BitmapEnv,
+    hooks: &mut impl VmHooks,
+    delta_mode: bool,
+    state: &mut [u8],
+    meta: &SlotMetaView,
+    capture: ByteCapture,
+    ttl_plan: Option<TtlBatchPlan>,
+) {
+    if let Some(plan) = ttl_plan {
+        hooks.consume_ttl_batch_plan(state, meta, plan);
+    }
+    env.ttl_mutations.clear();
+    hooks.finish_capture(delta_mode, state, &env.capture_ranges, capture);
 }
 
 /// Select the element at `rank` in ascending order.
@@ -319,12 +410,11 @@ pub fn batch_bitmap_add(
     delta_mode: bool,
     state: &mut [u8],
     meta: &SlotMetaView,
-    slot_idx: u32,
     elem_col: &[u32],
     ts_col: Option<&[f64]>,
 ) -> ErrorCode {
     env.last_error = 0;
-    env.pending_mutations.clear();
+    env.ttl_mutations.clear();
     env.staged_adds.clear();
     let storage = get_bitmap_storage(meta);
     let has_ttl = meta.has_ttl();
@@ -347,27 +437,39 @@ pub fn batch_bitmap_add(
         if elem_col.is_empty() {
             return ErrorCode::Ok;
         }
-        let report = match bitmap_patch(env, state, storage, elem_col, &[]) {
-            Ok(report) => report,
-            Err(code) => return code,
-        };
-        if hooks.undo_enabled() || has_ttl {
+        if has_ttl {
             for (i, &key) in elem_col.iter().enumerate() {
-                let timestamp = timestamp_at(i);
-                if env.add_was_new(i) {
-                    env.pending_mutations
-                        .push(PendingBitmapMutation::Insert { key, timestamp });
-                } else if has_ttl {
-                    env.pending_mutations
-                        .push(PendingBitmapMutation::RefreshTtl { key, timestamp });
-                }
+                env.ttl_mutations.push(TtlMutation::Upsert {
+                    key,
+                    timestamp: timestamp_at(i),
+                    mapped_value: key,
+                });
             }
         }
+        let ttl_capture = if has_ttl {
+            BitmapTtlCapture::Membership
+        } else {
+            BitmapTtlCapture::Unchanged
+        };
+        let (report, capture, ttl_plan) = match capture_bitmap_patch(
+            env,
+            hooks,
+            state,
+            meta,
+            storage,
+            elem_col,
+            &[],
+            ttl_capture,
+        ) {
+            Ok(patched) => patched,
+            Err(code) => return code,
+        };
         meta.set_size(state, cardinality + report.added);
         if report.added > 0 {
             meta.set_change_flag(state, ChangeFlag::INSERTED);
         }
-        return commit_bitmap_mutations(env, hooks, delta_mode, state, meta, slot_idx);
+        finish_bitmap_mutations(env, hooks, delta_mode, state, meta, capture, ttl_plan);
+        return ErrorCode::Ok;
     }
 
     // Value order with first occurrence first, so the dedup keeps the
@@ -422,45 +524,42 @@ pub fn batch_bitmap_add(
         false
     };
 
-    let mut added = 0;
-    if !env.staged_adds.is_empty() {
-        let mut adds = core::mem::take(&mut env.adds);
-        adds.clear();
-        adds.extend(env.staged_adds.iter().map(|staged| (*staged >> 32) as u32));
-        let patched = bitmap_patch(env, state, storage, &adds, &[]);
-        env.adds = adds;
-        match patched {
-            Ok(report) => added = report.added,
-            Err(code) => {
-                env.pending_mutations.clear();
-                return code;
-            }
-        }
-        // The undo records and TTL entries of what the patch found new —
-        // only when something consumes them.
-        if hooks.undo_enabled() || has_ttl {
-            for (i, staged) in env.staged_adds.iter().enumerate() {
-                let key = (*staged >> 32) as u32;
-                let timestamp = timestamp_at(*staged as u32 as usize);
-                if env.add_was_new(i) {
-                    env.pending_mutations
-                        .push(PendingBitmapMutation::Insert { key, timestamp });
-                } else if has_ttl {
-                    env.pending_mutations
-                        .push(PendingBitmapMutation::RefreshTtl { key, timestamp });
-                }
-            }
+    if env.staged_adds.is_empty() {
+        return if overflow {
+            ErrorCode::CapacityExceeded
+        } else {
+            ErrorCode::Ok
+        };
+    }
+    let mut adds = core::mem::take(&mut env.adds);
+    adds.clear();
+    adds.extend(env.staged_adds.iter().map(|staged| (*staged >> 32) as u32));
+    if has_ttl {
+        for staged in &env.staged_adds {
+            let key = (*staged >> 32) as u32;
+            env.ttl_mutations.push(TtlMutation::Upsert {
+                key,
+                timestamp: timestamp_at(*staged as u32 as usize),
+                mapped_value: key,
+            });
         }
     }
-
-    meta.set_size(state, cardinality + added);
-    if added > 0 {
+    let ttl_capture = if has_ttl {
+        BitmapTtlCapture::Membership
+    } else {
+        BitmapTtlCapture::Unchanged
+    };
+    let patched = capture_bitmap_patch(env, hooks, state, meta, storage, &adds, &[], ttl_capture);
+    env.adds = adds;
+    let (report, capture, ttl_plan) = match patched {
+        Ok(patched) => patched,
+        Err(code) => return code,
+    };
+    meta.set_size(state, cardinality + report.added);
+    if report.added > 0 {
         meta.set_change_flag(state, ChangeFlag::INSERTED);
     }
-    let commit_result = commit_bitmap_mutations(env, hooks, delta_mode, state, meta, slot_idx);
-    if commit_result != ErrorCode::Ok {
-        return commit_result;
-    }
+    finish_bitmap_mutations(env, hooks, delta_mode, state, meta, capture, ttl_plan);
     if overflow {
         ErrorCode::CapacityExceeded
     } else {
@@ -475,11 +574,10 @@ pub fn batch_bitmap_remove(
     delta_mode: bool,
     state: &mut [u8],
     meta: &SlotMetaView,
-    slot_idx: u32,
     elem_col: &[u32],
 ) -> ErrorCode {
     env.last_error = 0;
-    env.pending_mutations.clear();
+    env.ttl_mutations.clear();
     let storage = get_bitmap_storage(meta);
     let cardinality = meta.size(state);
     if cardinality == 0 || elem_col.is_empty() {
@@ -503,44 +601,30 @@ pub fn batch_bitmap_remove(
         &removes
     };
 
-    let patched = bitmap_patch(env, state, storage, &[], batch);
-    let report = match patched {
-        Ok(report) => report,
+    if batch.is_empty() {
+        env.removes = removes;
+        return ErrorCode::Ok;
+    }
+    let ttl_capture = if meta.has_ttl() {
+        BitmapTtlCapture::Membership
+    } else {
+        BitmapTtlCapture::Unchanged
+    };
+    let patched = capture_bitmap_patch(env, hooks, state, meta, storage, &[], batch, ttl_capture);
+    let (report, capture, ttl_plan) = match patched {
+        Ok(patched) => patched,
         Err(code) => {
             env.removes = removes;
             return code;
         }
     };
-    // The undo records and TTL entries of what the patch found held — only
-    // when something consumes them. The eviction timestamp is read after
-    // the patch: the eviction index is a separate plane the patch does not
-    // touch.
-    let journaled = hooks.undo_enabled() || meta.has_ttl();
-    for (i, &elem) in batch.iter().enumerate() {
-        if !journaled || !env.remove_was_held(i) {
-            continue;
-        }
-        let previous_ts_bits = if meta.has_ttl() {
-            hooks
-                .latest_eviction_ts(state, meta, elem)
-                .unwrap_or_else(|| {
-                    columine_types::die!("live TTL bitmap key is missing its eviction entry")
-                })
-                .to_bits()
-        } else {
-            0
-        };
-        env.pending_mutations.push(PendingBitmapMutation::Remove {
-            key: elem,
-            previous_ts_bits,
-        });
-    }
     env.removes = removes;
     meta.set_size(state, cardinality - report.removed);
     if report.removed > 0 {
         meta.set_change_flag(state, ChangeFlag::REMOVED);
     }
-    commit_bitmap_mutations(env, hooks, delta_mode, state, meta, slot_idx)
+    finish_bitmap_mutations(env, hooks, delta_mode, state, meta, capture, ttl_plan);
+    ErrorCode::Ok
 }
 
 /// Set-algebra operation applied to a target bitmap.
@@ -558,8 +642,8 @@ pub enum BitmapAlgebraOp {
 /// scratch operand lives in the `env` whose buffers the store path reuses.
 #[derive(Clone, Copy, Debug)]
 pub enum BitmapSource<'a> {
-    /// Another BITMAP slot of the same state buffer.
-    Slot(BitmapStorage),
+    /// Another authoritative BITMAP slot of the same state buffer.
+    Slot(u32),
     /// `env.algebra_result` — the image the previous decision-side algebra
     /// left behind.
     Scratch,
@@ -567,55 +651,103 @@ pub enum BitmapSource<'a> {
     Bytes(&'a [u8]),
 }
 
-/// Apply in-place set algebra to a target slot. The operation is expressed
-/// as the patch that turns the target into the result — the values to add
-/// and the values to remove, each computed by a lazy merge of the two
-/// views — so the slot is edited only where the result differs from the
-/// target. Bulk mutations use one undo snapshot because per-element
-/// tracking is impractical.
+fn verified_bitmap_view(data: &[u8]) -> Result<Option<BitmosaicView<'_>>, ErrorCode> {
+    if data.is_empty() {
+        return Ok(None);
+    }
+    let view = BitmosaicView::open_verified(data).ok_or(ErrorCode::InvalidState)?;
+    Ok((!view.is_empty()).then_some(view))
+}
+
+/// Apply membership algebra and its optional exact-bit expiry join together.
+/// Slot operands are bound by index and all views remain borrowed; the pure
+/// timestamp join feeds the one existing atomic TTL planner before either
+/// payload or index writes. Timestamp-only changes are not membership no-ops.
 pub fn batch_bitmap_algebra(
     env: &mut BitmapEnv,
     hooks: &mut impl VmHooks,
+    delta_mode: bool,
     op: BitmapAlgebraOp,
     state: &mut [u8],
     target_meta: &SlotMetaView,
     source: BitmapSource<'_>,
 ) -> ErrorCode {
+    env.ttl_mutations.clear();
     let target_storage = get_bitmap_storage(target_meta);
     let original_size = target_meta.size(state);
 
-    let source_data: Option<&[u8]> = match source {
-        // A slot operand the reader cannot parse is a corrupt state, not an
-        // empty set: reading it as empty would let AND silently clear the
-        // target.
-        BitmapSource::Slot(storage) => match storage.serialized_data(state) {
-            Ok(data) => Some(data),
-            Err(code) => {
-                env.last_error = 80;
-                return code;
-            }
-        },
-        BitmapSource::Scratch => {
-            (!env.algebra_result.is_empty()).then_some(&env.algebra_result[..])
+    let target_data = match target_storage.serialized_data(state) {
+        Ok(data) => data,
+        Err(code) => {
+            env.last_error = 102;
+            return code;
         }
-        BitmapSource::Bytes(bytes) => (!bytes.is_empty()).then_some(bytes),
     };
-    let source_view = match source_data {
-        None => None,
-        Some(data) => match BitmosaicView::open(data) {
-            Some(view) => Some(view),
-            None => {
-                env.last_error = 80;
-                return ErrorCode::InvalidState;
-            }
-        },
-    };
-    let target_view = match target_storage.view(state) {
+    let target_view = match verified_bitmap_view(target_data) {
         Ok(view) => view,
         Err(code) => {
             env.last_error = 102;
             return code;
         }
+    };
+    let (source_meta, source_data) = match source {
+        BitmapSource::Slot(slot) => {
+            let meta = match bind_slot(state, slot) {
+                Ok(meta) => meta,
+                Err(code) => {
+                    env.last_error = 80;
+                    return code;
+                }
+            };
+            if meta.slot_type() != columine_types::SlotType::Bitmap {
+                return ErrorCode::InvalidSlot;
+            }
+            if meta.has_ttl() && !target_meta.has_ttl() {
+                return ErrorCode::InvalidProgram;
+            }
+            let data = if meta.offset == target_meta.offset && meta.capacity == target_meta.capacity
+            {
+                target_data
+            } else {
+                match get_bitmap_storage(&meta).serialized_data(state) {
+                    Ok(data) => data,
+                    Err(code) => {
+                        env.last_error = 80;
+                        return code;
+                    }
+                }
+            };
+            (Some(meta), data)
+        }
+        BitmapSource::Scratch => (None, &env.algebra_result[..]),
+        BitmapSource::Bytes(data) => (None, data),
+    };
+    let source_view = if source_meta.as_ref().is_some_and(|meta| {
+        meta.meta_base == target_meta.meta_base
+            && meta.offset == target_meta.offset
+            && meta.capacity == target_meta.capacity
+    }) {
+        target_view
+    } else {
+        match verified_bitmap_view(source_data) {
+            Ok(view) => view,
+            Err(code) => {
+                env.last_error = 80;
+                return code;
+            }
+        }
+    };
+    let expiry_changed = match merge_expiries(
+        state,
+        target_meta,
+        source_meta.as_ref(),
+        target_view,
+        source_view,
+        op,
+        &mut env.ttl_algebra_scratch,
+    ) {
+        Ok(changed) => changed,
+        Err(code) => return code,
     };
 
     let mut adds = core::mem::take(&mut env.adds);
@@ -623,8 +755,6 @@ pub fn batch_bitmap_algebra(
     adds.clear();
     removes.clear();
     match (target_view, source_view) {
-        // AND/ANDNOT against nothing leaves an empty target empty; OR/XOR
-        // against nothing leaves any target as it is.
         (None, None) => {}
         (None, Some(source)) => match op {
             BitmapAlgebraOp::And | BitmapAlgebraOp::AndNot => {}
@@ -651,33 +781,80 @@ pub fn batch_bitmap_algebra(
         },
     }
 
-    if adds.is_empty() && removes.is_empty() {
+    let membership_changed = !adds.is_empty() || !removes.is_empty();
+    if !membership_changed && !expiry_changed {
         env.adds = adds;
         env.removes = removes;
         return ErrorCode::Ok;
     }
-
-    // Force undo snapshot before bulk mutation.
-    if hooks.undo_enabled() && !hooks.undo_overflow() {
-        hooks.force_undo_snapshot(state);
-    }
-
-    let patched = bitmap_patch(env, state, target_storage, &adds, &removes);
-    env.adds = adds;
-    env.removes = removes;
-    let report = match patched {
-        Ok(report) => report,
+    let old_members = target_view.map_or(0, |view| view.len());
+    let admitted_size = (|| {
+        let added = u64::try_from(adds.len()).map_err(|_| ErrorCode::InvalidState)?;
+        let removed = u64::try_from(removes.len()).map_err(|_| ErrorCode::InvalidState)?;
+        let result_members = old_members
+            .checked_add(added)
+            .and_then(|len| len.checked_sub(removed))
+            .ok_or(ErrorCode::InvalidState)?;
+        if result_members > u64::from(target_meta.capacity) {
+            return Err(ErrorCode::CapacityExceeded);
+        }
+        u32::try_from(result_members).map_err(|_| ErrorCode::CapacityExceeded)
+    })();
+    let new_card = match admitted_size {
+        Ok(size) => size,
         Err(code) => {
-            target_meta.set_size(state, original_size);
+            env.adds = adds;
+            env.removes = removes;
             return code;
         }
     };
-
-    let new_card = report.len as u32;
+    let ttl_capture = if expiry_changed {
+        match hooks.plan_ttl_batch(state, target_meta, env.ttl_algebra_scratch.mutations()) {
+            Ok(plan) => BitmapTtlCapture::Prepared(plan),
+            Err(code) => {
+                env.adds = adds;
+                env.removes = removes;
+                return code;
+            }
+        }
+    } else {
+        BitmapTtlCapture::Unchanged
+    };
+    let patched = capture_bitmap_patch(
+        env,
+        hooks,
+        state,
+        target_meta,
+        target_storage,
+        &adds,
+        &removes,
+        ttl_capture,
+    );
+    env.adds = adds;
+    env.removes = removes;
+    let (report, capture, ttl_plan) = match patched {
+        Ok(patched) => patched,
+        Err(code) => return code,
+    };
+    // The verified set-difference batches prove this count before mutation;
+    // the retained kernel report is a consistency check, not new admission.
+    debug_assert_eq!(report.len, u64::from(new_card));
     target_meta.set_size(state, new_card);
     if new_card != original_size {
         target_meta.set_change_flag(state, ChangeFlag::SIZE_CHANGED);
     }
+    if expiry_changed {
+        target_meta.set_change_flag(state, ChangeFlag::UPDATED);
+    }
+    finish_bitmap_mutations(
+        env,
+        hooks,
+        delta_mode,
+        state,
+        target_meta,
+        capture,
+        ttl_plan,
+    );
     ErrorCode::Ok
 }
 

@@ -12,18 +12,23 @@
 //! zero placeholder cells, so such a read would silently see zeros;
 //! `row_exprs` refuses the bind instead.
 //!
+//! [`reduce_column_roles`] is the same walk for load-time admission. It
+//! reports each operand as a `ColumnOperand`: an ordinary cell, or a
+//! value-object CSR pair. The public walk reports a CSR pair as its two reads.
+//!
 //! WHY a walker and not a role table beside the dispatch: the operand order
 //! of every opcode is already spelled once in the dispatch arms and once in
 //! `body_op_len`; this walk is the third spelling and the tests hold the
 //! three together. An opcode the walk does not know is `InvalidProgram`, the
 //! same answer the dispatch gives an opcode it does not know — so a new
 //! reduce opcode without an arm here fails loudly on its first live bind,
-//! never silently.
+//! never silently. Both entry points share this one walk, so a role and a
+//! read can never disagree about which operand an opcode names.
 //!
 //! [`LiveColumns`]: crate::row_exprs::LiveColumns
 
 use columine_types::operand::Operands;
-use columine_types::types::{ErrorCode, NO_PARENT_TS_COL, Opcode, ProgramHeader};
+use columine_types::types::{ErrorCode, NO_PARENT_TS_COL, Opcode, ProgramHeader, SlotTypeFlags};
 
 use crate::meta::SlotMetaView;
 use crate::vm::{
@@ -41,9 +46,26 @@ pub enum ColumnUse {
     ElementPredicate,
 }
 
+/// One column operand of a reduce section, by the role it plays.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ColumnOperand {
+    /// An ordinary cell column, read as `usage` says.
+    Cell { column: u32, usage: ColumnUse },
+    /// The offsets and values columns of a struct-map CSR field: element `e`
+    /// is `values[offsets[e]..offsets[e + 1]]`. `slot` and `field_idx` name
+    /// the field the instruction fills, which admission links to a schema.
+    Csr {
+        slot: u32,
+        field_idx: u8,
+        offsets_col: u32,
+        values_col: u32,
+    },
+}
+
 /// Visit every column operand of `program`'s reduce section. `state` is the
 /// initialised state the program runs against: a `BatchMapUpsertLast` on a
 /// TTL slot reads the slot's timestamp column, which only the state names.
+/// A CSR pair is visited as its offsets read, then its values read.
 /// A reduce section the VM would refuse is `InvalidProgram` here too.
 pub fn reduce_column_uses(
     program: &[u8],
@@ -51,7 +73,58 @@ pub fn reduce_column_uses(
     visit: &mut dyn FnMut(u32, ColumnUse),
 ) -> Result<(), ErrorCode> {
     let sections = ProgramHeader::sections(program).ok_or(ErrorCode::InvalidProgram)?;
-    walk(sections.reduce_code, state, false, visit)
+    walk(
+        sections.reduce_code,
+        TimestampSource::State(state),
+        false,
+        &mut |operand| match operand {
+            ColumnOperand::Cell { column, usage } => visit(column, usage),
+            ColumnOperand::Csr {
+                offsets_col,
+                values_col,
+                ..
+            } => {
+                visit(offsets_col, ColumnUse::Read);
+                visit(values_col, ColumnUse::Read);
+            }
+        },
+    )
+}
+
+/// Visit every column operand of the reduce section `code` by role. `init` is
+/// the init section the program is compiled from: a `BatchMapUpsertLast` on a
+/// TTL slot reads the timestamp column its definition names, and `init` is
+/// the only place that column is named before a state exists. A reduce
+/// section the walk refuses, or a slot `init` does not define, is
+/// `InvalidProgram`.
+pub(crate) fn reduce_column_roles(
+    init: &[u8],
+    code: &[u8],
+    visit: &mut dyn FnMut(ColumnOperand),
+) -> Result<(), ErrorCode> {
+    walk(code, TimestampSource::Init(init), false, visit)
+}
+
+/// Where a `BatchMapUpsertLast` on a TTL slot finds the slot's timestamp
+/// column: the state the program runs against, or the init section it is
+/// compiled from.
+#[derive(Clone, Copy)]
+enum TimestampSource<'a> {
+    State(&'a [u8]),
+    Init(&'a [u8]),
+}
+
+impl TimestampSource<'_> {
+    /// The timestamp column of `slot` when the slot has a TTL.
+    fn timestamp_col(self, slot: u32) -> Result<Option<u32>, ErrorCode> {
+        match self {
+            Self::State(state) => {
+                let meta = SlotMetaView::read(state, slot);
+                Ok(meta.has_ttl().then(|| meta.timestamp_col(state)))
+            }
+            Self::Init(init) => init_timestamp_col(init, slot),
+        }
+    }
 }
 
 /// Walk one instruction sequence: the top level (`element == false`, where
@@ -59,9 +132,9 @@ pub fn reduce_column_uses(
 /// a `FOR_EACH`/`FLAT_MAP` body.
 fn walk(
     code: &[u8],
-    state: &[u8],
+    source: TimestampSource<'_>,
     element: bool,
-    visit: &mut dyn FnMut(u32, ColumnUse),
+    visit: &mut dyn FnMut(ColumnOperand),
 ) -> Result<(), ErrorCode> {
     let predicate = if element {
         ColumnUse::ElementPredicate
@@ -74,7 +147,7 @@ fn walk(
         let len = body_op_len(code, pc).ok_or(ErrorCode::InvalidProgram)?;
         // `body_op_len` proved every operand of `code[pc..pc + len]` decodes.
         let mut ops = Operands::at(code, pc + 1);
-        walk_op(op, &mut ops, code, pc, state, predicate, visit)
+        walk_op(op, &mut ops, code, pc, source, predicate, visit)
             .ok_or(ErrorCode::InvalidProgram)??;
         if op == Opcode::Halt {
             break;
@@ -91,14 +164,14 @@ fn walk_op(
     ops: &mut Operands<'_>,
     code: &[u8],
     pc: usize,
-    state: &[u8],
+    source: TimestampSource<'_>,
     predicate: ColumnUse,
-    visit: &mut dyn FnMut(u32, ColumnUse),
+    visit: &mut dyn FnMut(ColumnOperand),
 ) -> Option<Result<(), ErrorCode>> {
     // Read `n` index operands as plain column reads.
-    let reads = |ops: &mut Operands<'_>, n: usize, visit: &mut dyn FnMut(u32, ColumnUse)| {
+    let reads = |ops: &mut Operands<'_>, n: usize, visit: &mut dyn FnMut(ColumnOperand)| {
         for _ in 0..n {
-            visit(ops.index()?, ColumnUse::Read);
+            cell(visit, ops.index()?, ColumnUse::Read);
         }
         Some(())
     };
@@ -117,9 +190,10 @@ fn walk_op(
             reads(ops, 2, visit)?;
             // The TTL slot's timestamp column is named by the slot, not the
             // instruction.
-            let meta = SlotMetaView::read(state, slot);
-            if meta.has_ttl() {
-                visit(meta.timestamp_col(state), ColumnUse::Read);
+            match source.timestamp_col(slot) {
+                Ok(Some(column)) => cell(visit, column, ColumnUse::Read),
+                Ok(None) => {}
+                Err(error) => return Some(Err(error)),
             }
         }
         Opcode::BatchMapRemove => {
@@ -134,17 +208,17 @@ fn walk_op(
             ops.index()?;
             reads(ops, 3, visit)?;
             ops.byte()?;
-            visit(ops.index()?, predicate);
+            cell(visit, ops.index()?, predicate);
         }
         Opcode::BatchMapUpsertFirstIf | Opcode::BatchMapUpsertLastIf => {
             ops.index()?;
             reads(ops, 2, visit)?;
-            visit(ops.index()?, predicate);
+            cell(visit, ops.index()?, predicate);
         }
         Opcode::BatchMapRemoveIf => {
             ops.index()?;
             reads(ops, 1, visit)?;
-            visit(ops.index()?, predicate);
+            cell(visit, ops.index()?, predicate);
         }
         Opcode::BatchStructMapProbe => {
             // probe_slot, key, miss_mode, out_slot, num_fields,
@@ -230,7 +304,7 @@ fn walk_op(
         Opcode::BatchSetInsertIf => {
             ops.index()?;
             reads(ops, 1, visit)?;
-            visit(ops.index()?, predicate);
+            cell(visit, ops.index()?, predicate);
         }
         Opcode::NestedMapUpsertLast => {
             ops.index()?;
@@ -241,13 +315,36 @@ fn walk_op(
         | Opcode::BatchStructMapUpsertMax => {
             let operands =
                 decode_struct_map_upsert_operands(code, pc + 1, op == Opcode::BatchStructMapUpsertMax)?;
-            visit(operands.key_col, ColumnUse::Read);
+            cell(visit, operands.key_col, ColumnUse::Read);
             for &col in operands.vals.cols() {
-                visit(col, ColumnUse::Read);
+                cell(visit, col, ColumnUse::Read);
             }
+            // Each array field is a CSR pair, named by the field it fills.
             for array in operands.array_fields() {
-                visit(array.offsets_col, ColumnUse::Read);
-                visit(array.values_col, ColumnUse::Read);
+                visit(ColumnOperand::Csr {
+                    slot: operands.slot,
+                    field_idx: array.field_idx,
+                    offsets_col: array.offsets_col,
+                    values_col: array.values_col,
+                });
+            }
+        }
+        Opcode::BatchStructMapCountsFold => {
+            let fold = crate::counts_fold::CountsFoldOp::decode(code, pc + 1).ok()?;
+            // The key, then the init frame's CSR pair, then the buckets and
+            // masks: the order the fold's columns are named in.
+            cell(visit, fold.key_col, ColumnUse::Read);
+            visit(ColumnOperand::Csr {
+                slot: fold.slot,
+                field_idx: fold.field_idx,
+                offsets_col: fold.init_offsets_col,
+                values_col: fold.init_values_col,
+            });
+            for hist in fold.histograms() {
+                cell(visit, hist.bucket_col, ColumnUse::Read);
+            }
+            for mask in fold.masks() {
+                cell(visit, mask.mask_col, ColumnUse::Read);
             }
         }
         Opcode::BatchStructMap2UpsertLast => {
@@ -256,8 +353,8 @@ fn walk_op(
         Opcode::BatchStructMap2UpsertMaxI64x2 => {
             let operands = decode_struct_map2_max_i64x2_operands(code, pc + 1)?;
             struct_map2_reads(&operands.row, visit);
-            visit(operands.cmp1_col, ColumnUse::Read);
-            visit(operands.cmp2_col, ColumnUse::Read);
+            cell(visit, operands.cmp1_col, ColumnUse::Read);
+            cell(visit, operands.cmp2_col, ColumnUse::Read);
         }
         Opcode::ListAppendStruct => {
             // slot, num_vals, (col, field) × num_vals.
@@ -269,14 +366,15 @@ fn walk_op(
             }
         }
         Opcode::FlatMap => {
-            // offsets, parent_ts, body_len u16, body.
+            // offsets, parent_ts, body_len u16, body. Both columns are cells:
+            // the offsets name the expansion, the parent timestamp is a read.
             reads(ops, 1, visit)?;
             let parent_ts = ops.index()?;
             if parent_ts != NO_PARENT_TS_COL {
-                visit(parent_ts, ColumnUse::Read);
+                cell(visit, parent_ts, ColumnUse::Read);
             }
             let body_len = usize::from(ops.u16()?);
-            return Some(walk(ops.bytes(body_len)?, state, true, visit));
+            return Some(walk(ops.bytes(body_len)?, source, true, visit));
         }
         Opcode::ForEach => {
             // col, match_count, ids u32 × match_count, body_len u16, body.
@@ -284,33 +382,95 @@ fn walk_op(
             let match_count = usize::try_from(ops.index()?).ok()?;
             ops.bytes(match_count * 4)?;
             let body_len = usize::from(ops.u16()?);
-            return Some(walk(ops.bytes(body_len)?, state, true, visit));
+            return Some(walk(ops.bytes(body_len)?, source, true, visit));
         }
         _ => return Some(Err(ErrorCode::InvalidProgram)),
     }
     Some(Ok(()))
 }
 
+/// Visit an ordinary cell operand, read as `usage` says.
+fn cell(visit: &mut dyn FnMut(ColumnOperand), column: u32, usage: ColumnUse) {
+    visit(ColumnOperand::Cell { column, usage });
+}
+
 /// `num_routes:u8, (kind, dest_slot, dest_field, v_col) × num_routes`: the
 /// value column of every route is a read.
-fn route_value_reads(ops: &mut Operands<'_>, visit: &mut dyn FnMut(u32, ColumnUse)) -> Option<()> {
+fn route_value_reads(ops: &mut Operands<'_>, visit: &mut dyn FnMut(ColumnOperand)) -> Option<()> {
     let num_routes = ops.byte()?;
     for _ in 0..num_routes {
         ops.byte()?;
         ops.index()?;
         ops.byte()?;
-        visit(ops.index()?, ColumnUse::Read);
+        cell(visit, ops.index()?, ColumnUse::Read);
     }
     Some(())
 }
 
 fn struct_map2_reads(
     operands: &crate::vm::StructMap2UpsertOperands,
-    visit: &mut dyn FnMut(u32, ColumnUse),
+    visit: &mut dyn FnMut(ColumnOperand),
 ) {
-    visit(operands.key1_col, ColumnUse::Read);
-    visit(operands.key2_col, ColumnUse::Read);
+    cell(visit, operands.key1_col, ColumnUse::Read);
+    cell(visit, operands.key2_col, ColumnUse::Read);
     for &col in operands.vals.cols() {
-        visit(col, ColumnUse::Read);
+        cell(visit, col, ColumnUse::Read);
     }
+}
+
+/// The timestamp column `slot`'s definition names when the slot has a TTL,
+/// `None` otherwise. Program admission validates the init grammar before
+/// compile, so this scan mirrors only what it needs to reach `slot`: each
+/// record's head (`op, slot, flags, cap_lo, cap_hi`), the TTL params
+/// (`ttl:f32, grace:f32, ts_col:index, start_of:u8`) only when a `SLOT_DEF`'s
+/// flags carry TTL, and the length of every other record kind.
+fn init_timestamp_col(init: &[u8], slot: u32) -> Result<Option<u32>, ErrorCode> {
+    let mut r = Operands::at(init, 0);
+    while r.pos() < init.len() {
+        let op = r
+            .byte()
+            .and_then(Opcode::from_u8)
+            .ok_or(ErrorCode::InvalidProgram)?;
+        if op == Opcode::Halt {
+            break;
+        }
+        let record = r.index().ok_or(ErrorCode::InvalidProgram)?;
+        let flags = SlotTypeFlags::from_byte(r.byte().ok_or(ErrorCode::InvalidProgram)?);
+        // The two bytes after the flags: `cap_lo, cap_hi` for a `SLOT_DEF`.
+        r.bytes(2).ok_or(ErrorCode::InvalidProgram)?;
+        let timestamp = match op {
+            Opcode::SlotDef if flags.has_ttl() => {
+                let (ttl, next) = crate::state_init::TtlParams::read(init, r.pos())
+                    .ok_or(ErrorCode::InvalidProgram)?;
+                r = Operands::at(init, next);
+                Some(ttl.timestamp_col)
+            }
+            Opcode::SlotDef | Opcode::SlotArray => None,
+            Opcode::SlotStructMap | Opcode::SlotStructMap2 => {
+                // count, then one field-kind byte per field.
+                let count = r.byte().ok_or(ErrorCode::InvalidProgram)?;
+                r.bytes(usize::from(count))
+                    .ok_or(ErrorCode::InvalidProgram)?;
+                None
+            }
+            Opcode::SlotOrderedList => {
+                // kind, then for kind 0xff a count and that many bytes.
+                if r.byte().ok_or(ErrorCode::InvalidProgram)? == 0xff {
+                    let count = r.byte().ok_or(ErrorCode::InvalidProgram)?;
+                    r.bytes(usize::from(count))
+                        .ok_or(ErrorCode::InvalidProgram)?;
+                }
+                None
+            }
+            Opcode::SlotNested => {
+                r.bytes(4).ok_or(ErrorCode::InvalidProgram)?;
+                None
+            }
+            _ => return Err(ErrorCode::InvalidProgram),
+        };
+        if record == slot {
+            return Ok(timestamp);
+        }
+    }
+    Err(ErrorCode::InvalidProgram)
 }

@@ -3,9 +3,11 @@ use columine_types::PROGRAM_MAGIC;
 use columine_types::operand::encode_index;
 use columine_types::types::{ChangeFlag, ErrorCode, STATE_HEADER_SIZE, SlotMetaOffset};
 use columine_vm::bytes;
-use columine_vm::state_init::{calculate_state_size, init_state};
+use columine_vm::state_init::{
+    DEFAULT_ACCEPTED_PROGRAM_MAGICS, ProgramInvalidCause, calculate_state_size, init_state,
+};
 use columine_vm::struct_map::StructMapSlot;
-use columine_vm::vm::{Vm, u32s_as_bytes, vm_struct_map_get_row_ptr};
+use columine_vm::vm::{CheckedStructMap, Vm, u32s_as_bytes};
 
 const OK: u32 = ErrorCode::Ok as u32;
 const INVALID_PROGRAM: u32 = ErrorCode::InvalidProgram as u32;
@@ -101,7 +103,8 @@ fn init(program: &[u8]) -> Vec<u8> {
     let size = calculate_state_size(
         program,
         columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
-    );
+    )
+    .expect("valid program admission");
     assert!(size > 0);
     let mut state = vec![0u8; usize::try_from(size).expect("state size fits usize")];
     init_state(
@@ -111,10 +114,6 @@ fn init(program: &[u8]) -> Vec<u8> {
     )
     .expect("init state");
     state
-}
-
-fn meta_u32(state: &[u8], field_off: u32) -> u32 {
-    bytes::read_u32(state, STATE_HEADER_SIZE + field_off)
 }
 
 fn change_flags(state: &[u8]) -> u8 {
@@ -128,20 +127,10 @@ fn clear_change_flags(state: &mut [u8]) {
 }
 
 fn row(state: &[u8], key: u32) -> u32 {
-    let meta_base = STATE_HEADER_SIZE;
-    let num_fields = u32::from(state[(meta_base + SlotMetaOffset::AGG_TYPE) as usize]);
-    let row_size = u32::from(bytes::read_u16(
-        state,
-        meta_base + SlotMetaOffset::TTL_SECONDS,
-    ));
-    vm_struct_map_get_row_ptr(
-        state,
-        meta_u32(state, SlotMetaOffset::OFFSET),
-        meta_u32(state, SlotMetaOffset::CAPACITY),
-        num_fields,
-        row_size,
-        key,
-    )
+    CheckedStructMap::bind(state, 0)
+        .expect("actual struct geometry")
+        .row(key)
+        .expect("control row must exist")
 }
 
 fn payload(state: &[u8], key: u32) -> u32 {
@@ -181,7 +170,7 @@ fn assert_scalar_comparison(
     assert_eq!(10, payload(&state, 7));
     clear_change_flags(&mut state);
 
-    vm.undo_enable(&state);
+    vm.undo_enable(&state).expect("valid inactive window");
     let checkpoint = vm.undo_checkpoint();
     let accepted = state.clone();
 
@@ -322,10 +311,12 @@ fn top_level_max_accepts_missing_key_and_missing_stored_comparison() {
     assert_ne!(0xFFFF_FFFF, row(&state, 88));
 }
 
-fn assert_invalid_without_mutation(program: &[u8], comparison: &[u8]) {
-    let mut state = init(program);
+/// Execute `program` against a state initialised from `layout`, which declares
+/// the same slots: the refusal must leave the state and the journal untouched.
+fn assert_invalid_without_mutation(layout: &[u8], program: &[u8], comparison: &[u8]) {
+    let mut state = init(layout);
     let mut vm = Vm::default();
-    vm.undo_enable(&state);
+    vm.undo_enable(&state).expect("valid inactive window");
     let checkpoint = vm.undo_checkpoint();
     let before = state.clone();
     assert_eq!(
@@ -339,18 +330,25 @@ fn assert_invalid_without_mutation(program: &[u8], comparison: &[u8]) {
 #[test]
 fn top_level_max_rejects_unmapped_invalid_and_non_scalar_comparisons() {
     let unmapped = program(3, &[0, 0], &max_upsert(0, &[(1, 0)], 1));
-    assert_invalid_without_mutation(&unmapped, &1u32.to_le_bytes());
+    assert_invalid_without_mutation(&unmapped, &unmapped, &1u32.to_le_bytes());
 
     let invalid_ordinal = program(3, &[0, 0], &max_upsert(0, &[(1, 0), (2, 1)], 2));
-    assert_invalid_without_mutation(&invalid_ordinal, &1u32.to_le_bytes());
+    assert_invalid_without_mutation(&invalid_ordinal, &invalid_ordinal, &1u32.to_le_bytes());
 
     let array_comparison = program(3, &[0, 5], &max_upsert(0, &[(1, 0), (2, 1)], 1));
-    assert_invalid_without_mutation(&array_comparison, &1u32.to_le_bytes());
+    assert_invalid_without_mutation(&array_comparison, &array_comparison, &1u32.to_le_bytes());
 
     let mut truncated_reduce = max_upsert(0, &[(1, 0), (2, 1)], 1);
     truncated_reduce.pop();
     let truncated = program(3, &[0, 0], &truncated_reduce);
-    assert_invalid_without_mutation(&truncated, &1u32.to_le_bytes());
+    // A truncated reduce section is refused by admission before any state
+    // exists; execution of it against a valid state still refuses cleanly.
+    assert_eq!(
+        calculate_state_size(&truncated, DEFAULT_ACCEPTED_PROGRAM_MAGICS),
+        Err(ProgramInvalidCause::MalformedProgram)
+    );
+    let layout = program(3, &[0, 0], &[]);
+    assert_invalid_without_mutation(&layout, &truncated, &1u32.to_le_bytes());
 }
 
 #[test]
@@ -378,7 +376,7 @@ fn for_each_max_rejects_ties_and_lower_rows_before_array_or_undo_mutation() {
     assert_eq!(10, payload(&state, 9));
     clear_change_flags(&mut state);
 
-    vm.undo_enable(&state);
+    vm.undo_enable(&state).expect("valid inactive window");
     let checkpoint = vm.undo_checkpoint();
     let accepted = state.clone();
 
@@ -445,7 +443,7 @@ fn flat_map_body_length_and_dispatch_include_max_comparison_ordinal() {
     assert_eq!(30, payload(&state, 11));
     clear_change_flags(&mut state);
 
-    vm.undo_enable(&state);
+    vm.undo_enable(&state).expect("valid inactive window");
     let checkpoint = vm.undo_checkpoint();
     let accepted = state.clone();
     let tie_offsets = [0u32, 1];
@@ -476,7 +474,7 @@ fn block_max_rejects_unmapped_and_non_scalar_comparisons_without_mutation() {
         let program = program(4, &field_types, &for_each(&body));
         let mut state = init(&program);
         let mut vm = Vm::default();
-        vm.undo_enable(&state);
+        vm.undo_enable(&state).expect("valid inactive window");
         let checkpoint = vm.undo_checkpoint();
         let before = state.clone();
         let types = [TYPE_ID];

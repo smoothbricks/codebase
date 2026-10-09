@@ -5,22 +5,23 @@ use columine_types::NO_PARENT_TS_COL;
 use columine_types::PROGRAM_MAGIC;
 use columine_types::operand::encode_index;
 use columine_types::types::{
-    ChangeFlag, EMPTY_KEY, ErrorCode, Opcode, SLOT_META_SIZE, STATE_HEADER_SIZE, SlotMetaOffset,
-    SlotType,
+    AggType, ChangeFlag, EMPTY_KEY, ErrorCode, Opcode, SLOT_META_SIZE, STATE_HEADER_SIZE,
+    SlotMetaOffset, SlotType,
 };
 use columine_vm::bytes;
 use columine_vm::meta::SlotMetaView;
 use columine_vm::state_init::{
     calculate_grown_state_size, calculate_state_size, grow_state, init_state, needs_growth_slot,
 };
-use columine_vm::struct_map::StructMapSlot;
+use columine_vm::struct_map::{StructMap2Slot, StructMapSlot};
 use columine_vm::vm::{
-    Vm, f64s_as_bytes, i64s_as_bytes, u32s_as_bytes, vm_map_get, vm_set_contains,
-    vm_struct_map_get_row_ptr,
+    CheckedMap, CheckedSet, CheckedStructMap, UNDO_CAPACITY, Vm, f64s_as_bytes, i64s_as_bytes,
+    u32s_as_bytes,
 };
 
 const OK: u32 = ErrorCode::Ok as u32;
 const NEEDS_GROWTH: u32 = ErrorCode::NeedsGrowth as u32;
+const JOURNAL_OVERFLOW: u32 = ErrorCode::JournalOverflow as u32;
 
 // =============================================================================
 // Program builders (, 1200-1293, 1530-1600, 1957-2036,
@@ -127,10 +128,10 @@ fn build_block_struct_map_program(type_id: u32) -> Vec<u8> {
     program(1, 4, &init, &reduce)
 }
 
-/// Build a FOR_EACH/FLAT_MAP program with the documented type-flag quirk:
-/// initialization keys on the opcode, not the flag byte's type bits.
+/// Build a FOR_EACH/FLAT_MAP program whose declared slot kind matches its
+/// struct-map opcode and actual state shape.
 fn build_flat_map_program(type_id: u32) -> Vec<u8> {
-    let init = slot_struct_map(0, 0x05, 4, &[0, 4]);
+    let init = slot_struct_map(0, 0x06, 4, &[0, 4]);
     let inner_body = [0x80u8, 0, 2, 2, 3, 0, 4, 1, 0];
     let mut flat_map = vec![0xE1, 1];
     flat_map.extend(encode_index(NO_PARENT_TS_COL).as_bytes());
@@ -192,7 +193,8 @@ fn init(prog: &[u8]) -> Vec<u8> {
     let size = calculate_state_size(
         prog,
         columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
-    );
+    )
+    .expect("valid program admission");
     assert!(size > 0, "state size must be > 0");
     let mut state = vec![0u8; size as usize];
     init_state(
@@ -233,21 +235,30 @@ fn clear_slot_change_flags(state: &mut [u8], slot: u8) {
     state[(meta_base + SlotMetaOffset::CHANGE_FLAGS) as usize] = 0;
 }
 
-fn struct_map_row(state: &[u8], slot: u8, key: u32) -> u32 {
-    let meta_base = STATE_HEADER_SIZE + u32::from(slot) * SLOT_META_SIZE;
-    let num_fields = u32::from(state[(meta_base + SlotMetaOffset::AGG_TYPE) as usize]);
-    let row_size = u32::from(bytes::read_u16(
-        state,
-        meta_base + SlotMetaOffset::TTL_SECONDS,
-    ));
-    vm_struct_map_get_row_ptr(
-        state,
-        slot_offset(state, slot),
-        slot_cap(state, slot),
-        num_fields,
-        row_size,
-        key,
-    )
+/// Typed HASHMAP point read. A refused slot is a test failure; absence is `None`.
+fn map_get(state: &[u8], slot: u8, key: u32) -> Option<u32> {
+    CheckedMap::bind(state, u32::from(slot))
+        .expect("valid hashmap slot")
+        .get(key)
+}
+
+/// Typed HASHSET membership. A refused slot is a test failure, never `false`.
+fn set_contains(state: &[u8], slot: u8, elem: u32) -> bool {
+    CheckedSet::bind(state, u32::from(slot))
+        .expect("valid set slot")
+        .contains(elem)
+}
+
+/// Typed STRUCT_MAP row lookup; `None` is a valid absent key.
+fn struct_map_row(state: &[u8], slot: u8, key: u32) -> Option<u32> {
+    CheckedStructMap::bind(state, u32::from(slot))
+        .expect("valid struct-map slot")
+        .row(key)
+}
+
+/// The row of a key the test has already established as present.
+fn present_row(state: &[u8], slot: u8, key: u32) -> u32 {
+    struct_map_row(state, slot, key).expect("key present")
 }
 
 fn bit_set(state: &[u8], row: u32, fi: u8) -> bool {
@@ -299,14 +310,13 @@ fn ttl_hashmap_insert_and_evict_through_live_reducer_path() {
     let cols: Vec<&[u8]> = vec![u32s_as_bytes(&key), u32s_as_bytes(&val), f64s_as_bytes(&ts)];
     assert_eq!(OK, vm.execute_batch(&mut state, &prog, &cols, 1));
 
-    let (off, cap) = (slot_offset(&state, 0), slot_cap(&state, 0));
-    assert_eq!(7, vm_map_get(&state, off, cap, 42));
+    assert_eq!(Some(7), map_get(&state, 0, 42));
 
-    assert_eq!(0, vm.evict_all_expired(&mut state, 105.0).unwrap());
-    assert_eq!(7, vm_map_get(&state, off, cap, 42));
+    assert_eq!(0, vm.evict_all_expired(false, &mut state, 105.0).unwrap());
+    assert_eq!(Some(7), map_get(&state, 0, 42));
 
-    assert_eq!(1, vm.evict_all_expired(&mut state, 111.0).unwrap());
-    assert_eq!(EMPTY_KEY, vm_map_get(&state, off, cap, 42));
+    assert_eq!(1, vm.evict_all_expired(false, &mut state, 111.0).unwrap());
+    assert_eq!(None, map_get(&state, 0, 42));
 }
 
 #[test]
@@ -323,14 +333,14 @@ fn ttl_eviction_result_distinguishes_four_rows_from_invalid_state() {
         f64s_as_bytes(&timestamps),
     ];
     assert_eq!(OK, vm.execute_batch(&mut state, &prog, &cols, 4));
-    assert_eq!(Ok(4), vm.evict_all_expired(&mut state, 114.0));
+    assert_eq!(Ok(4), vm.evict_all_expired(false, &mut state, 114.0));
 
     let meta = SlotMetaView::read(&state, 0);
     assert_eq!(4, meta.evicted_count(&state));
     let mut invalid = vec![0u8; STATE_HEADER_SIZE as usize];
     assert_eq!(
         Err(ErrorCode::InvalidState),
-        vm.evict_all_expired(&mut invalid, 114.0)
+        vm.evict_all_expired(false, &mut invalid, 114.0)
     );
 }
 
@@ -352,10 +362,9 @@ fn ttl_hashmap_stale_eviction_entries_do_not_evict_newer_values() {
         assert_eq!(OK, vm.execute_batch(&mut state, &prog, &cols, 1));
     }
 
-    let (off, cap) = (slot_offset(&state, 0), slot_cap(&state, 0));
     // cutoff=140: the stale ts=100 index entry must not evict the ts=200 value.
-    assert_eq!(0, vm.evict_all_expired(&mut state, 150.0).unwrap());
-    assert_eq!(200, vm_map_get(&state, off, cap, 9));
+    assert_eq!(0, vm.evict_all_expired(false, &mut state, 150.0).unwrap());
+    assert_eq!(Some(200), map_get(&state, 0, 9));
 }
 
 #[test]
@@ -371,14 +380,13 @@ fn ttl_hashset_reinsertion_refreshes_ttl_and_evicts_deterministically() {
         assert_eq!(OK, vm.execute_batch(&mut state, &prog, &cols, 1));
     }
 
-    let (off, cap) = (slot_offset(&state, 0), slot_cap(&state, 0));
-    assert!(vm_set_contains(&state, off, cap, 77));
+    assert!(set_contains(&state, 0, 77));
 
-    assert_eq!(0, vm.evict_all_expired(&mut state, 150.0).unwrap());
-    assert!(vm_set_contains(&state, off, cap, 77));
+    assert_eq!(0, vm.evict_all_expired(false, &mut state, 150.0).unwrap());
+    assert!(set_contains(&state, 0, 77));
 
-    assert_eq!(1, vm.evict_all_expired(&mut state, 211.0).unwrap());
-    assert!(!vm_set_contains(&state, off, cap, 77));
+    assert_eq!(1, vm.evict_all_expired(false, &mut state, 211.0).unwrap());
+    assert!(!set_contains(&state, 0, 77));
 }
 
 #[test]
@@ -451,16 +459,15 @@ fn slot_growth_grow_preserves_hashmap_entries_and_aggregate() {
     let agg_off = slot_offset(&state, 1);
     assert_eq!(11, bytes::read_u64(&state, agg_off));
 
-    let grown_size = calculate_grown_state_size(&state, 0);
+    let grown_size = calculate_grown_state_size(&state, 0).expect("valid growth geometry");
     let mut new_state = vec![0u8; grown_size as usize];
     grow_state(&state, &mut new_state, 0).expect("grow_state");
 
     assert_eq!(32, slot_cap(&new_state, 0));
     assert_eq!(11, slot_size(&new_state, 0));
 
-    let new_off = slot_offset(&new_state, 0);
     for i in 0..11u32 {
-        assert_eq!(i * 10, vm_map_get(&new_state, new_off, 32, i));
+        assert_eq!(Some(i * 10), map_get(&new_state, 0, i));
     }
     // Aggregate preserved (copied, not re-executed).
     let new_agg_off = slot_offset(&new_state, 1);
@@ -471,7 +478,7 @@ fn slot_growth_grow_preserves_hashmap_entries_and_aggregate() {
     let val = [1000u32];
     let cols: Vec<&[u8]> = vec![u32s_as_bytes(&key), u32s_as_bytes(&val)];
     assert_eq!(OK, vm.execute_batch(&mut new_state, &prog, &cols, 1));
-    assert_eq!(1000, vm_map_get(&new_state, new_off, 32, 100));
+    assert_eq!(Some(1000), map_get(&new_state, 0, 100));
 }
 
 #[test]
@@ -494,19 +501,18 @@ fn slot_growth_hashset_growth_preserves_elements() {
     let cols: Vec<&[u8]> = vec![u32s_as_bytes(&elem)];
     assert_eq!(NEEDS_GROWTH, vm.execute_batch(&mut state, &prog, &cols, 1));
 
-    let grown_size = calculate_grown_state_size(&state, 0);
+    let grown_size = calculate_grown_state_size(&state, 0).expect("valid growth geometry");
     let mut new_state = vec![0u8; grown_size as usize];
     grow_state(&state, &mut new_state, 0).expect("grow_state");
 
     assert_eq!(32, slot_cap(&new_state, 0));
     assert_eq!(11, slot_size(&new_state, 0));
-    let new_off = slot_offset(&new_state, 0);
     for i in 0..11u32 {
-        assert!(vm_set_contains(&new_state, new_off, 32, i + 1000));
+        assert!(set_contains(&new_state, 0, i + 1000));
     }
     // And the overflowing element now fits.
     assert_eq!(OK, vm.execute_batch(&mut new_state, &prog, &cols, 1));
-    assert!(vm_set_contains(&new_state, new_off, 32, 5000));
+    assert!(set_contains(&new_state, 0, 5000));
 }
 
 // =============================================================================
@@ -538,10 +544,9 @@ fn for_each_basic_type_filtering() {
     assert_eq!(OK, vm.execute_batch(&mut state, &prog, &cols, 3));
 
     assert_eq!(2, slot_size(&state, 0));
-    let (off, cap) = (slot_offset(&state, 0), slot_cap(&state, 0));
-    assert_eq!(10, vm_map_get(&state, off, cap, 100));
-    assert_eq!(30, vm_map_get(&state, off, cap, 300));
-    assert_eq!(EMPTY_KEY, vm_map_get(&state, off, cap, 200));
+    assert_eq!(Some(10), map_get(&state, 0, 100));
+    assert_eq!(Some(30), map_get(&state, 0, 300));
+    assert_eq!(None, map_get(&state, 0, 200));
     assert_eq!(2, agg_count(&state, 1));
 }
 
@@ -602,11 +607,10 @@ fn for_each_multi_match_2() {
     assert_eq!(OK, vm.execute_batch(&mut state, &prog, &cols, 4));
 
     assert_eq!(3, slot_size(&state, 0));
-    let (off, cap) = (slot_offset(&state, 0), slot_cap(&state, 0));
-    assert_eq!(10, vm_map_get(&state, off, cap, 100));
-    assert_eq!(20, vm_map_get(&state, off, cap, 200));
-    assert_eq!(40, vm_map_get(&state, off, cap, 400));
-    assert_eq!(EMPTY_KEY, vm_map_get(&state, off, cap, 300));
+    assert_eq!(Some(10), map_get(&state, 0, 100));
+    assert_eq!(Some(20), map_get(&state, 0, 200));
+    assert_eq!(Some(40), map_get(&state, 0, 400));
+    assert_eq!(None, map_get(&state, 0, 300));
     assert_eq!(3, agg_count(&state, 1));
 }
 
@@ -649,10 +653,9 @@ fn for_each_struct_map_upsert_with_type_filtering() {
     assert_eq!(OK, vm.execute_batch(&mut state, &prog, &cols, 3));
 
     assert_eq!(2, slot_size(&state, 0));
-    let row_100 = struct_map_row(&state, 0, 100);
-    assert_ne!(0xFFFF_FFFF, row_100);
+    let row_100 = present_row(&state, 0, 100);
     assert_eq!(42, bytes::read_u32(&state, row_100 + 1)); // bitset(1) + field 0
-    assert_eq!(0xFFFF_FFFF, struct_map_row(&state, 0, 200));
+    assert_eq!(None, struct_map_row(&state, 0, 200));
 }
 
 // =============================================================================
@@ -680,13 +683,12 @@ fn flat_map_basic_two_parents_with_children() {
     assert_eq!(OK, vm.execute_batch(&mut state, &prog, &cols, 2));
 
     assert_eq!(3, slot_size(&state, 0));
-    let r100 = struct_map_row(&state, 0, 100);
-    assert_ne!(0xFFFF_FFFF, r100);
+    let r100 = present_row(&state, 0, 100);
     assert_eq!(10, bytes::read_u32(&state, r100 + 1));
     assert_eq!(1001, bytes::read_u32(&state, r100 + 5));
-    let r200 = struct_map_row(&state, 0, 200);
+    let r200 = present_row(&state, 0, 200);
     assert_eq!(20, bytes::read_u32(&state, r200 + 1));
-    let r300 = struct_map_row(&state, 0, 300);
+    let r300 = present_row(&state, 0, 300);
     assert_eq!(30, bytes::read_u32(&state, r300 + 1));
 }
 
@@ -733,7 +735,7 @@ fn flat_map_key_collision_last_child_wins() {
     assert_eq!(OK, vm.execute_batch(&mut state, &prog, &cols, 1));
 
     assert_eq!(1, slot_size(&state, 0));
-    let row = struct_map_row(&state, 0, 100);
+    let row = present_row(&state, 0, 100);
     assert_eq!(99, bytes::read_u32(&state, row + 1));
     assert_eq!(2002, bytes::read_u32(&state, row + 5));
 }
@@ -759,8 +761,8 @@ fn flat_map_type_filtering_skips_non_matching_parents() {
     assert_eq!(OK, vm.execute_batch(&mut state, &prog, &cols, 3));
 
     assert_eq!(3, slot_size(&state, 0));
-    assert_eq!(0xFFFF_FFFF, struct_map_row(&state, 0, 999));
-    assert_ne!(0xFFFF_FFFF, struct_map_row(&state, 0, 300));
+    assert_eq!(None, struct_map_row(&state, 0, 999));
+    assert!(struct_map_row(&state, 0, 300).is_some());
 }
 
 #[test]
@@ -830,8 +832,7 @@ fn probe_scatter_apply_parity_across_kinds_and_skip() {
     assert_eq!(OK, vm.execute_batch(&mut state, &prog, &cols, 1));
 
     // nodes (slot 1): row 500 — bitset(1) + title(4) + status(4) + boost(8).
-    let row_500 = struct_map_row(&state, 1, 500);
-    assert_ne!(0xFFFF_FFFF, row_500);
+    let row_500 = present_row(&state, 1, 500);
     assert!(!bit_set(&state, row_500, 0)); // title retracted (MATCH)
     assert_eq!(0, bytes::read_u32(&state, row_500 + 1));
     assert!(bit_set(&state, row_500, 1)); // status survives NON-MATCH retract
@@ -841,13 +842,11 @@ fn probe_scatter_apply_parity_across_kinds_and_skip() {
 
     // nodeDeps (slot 2): {(e,7003)=8003} deduped → size 1.
     assert_eq!(1, slot_size(&state, 2));
-    let (d_off, d_cap) = (slot_offset(&state, 2), slot_cap(&state, 2));
-    assert!(vm_set_contains(&state, d_off, d_cap, 8003));
+    assert!(set_contains(&state, 2, 8003));
 
     // nodeTouch (slot 3): asserted then retracted → empty.
     assert_eq!(0, slot_size(&state, 3));
-    let (t_off, t_cap) = (slot_offset(&state, 3), slot_cap(&state, 3));
-    assert!(!vm_set_contains(&state, t_off, t_cap, 8004));
+    assert!(!set_contains(&state, 3, 8004));
 }
 
 #[test]
@@ -858,14 +857,13 @@ fn probe_scatter_kind0_insert_sets_effective_flag_without_delta_mode() {
     let mut vm = Vm::default();
 
     seed_probe_row(&mut state, 10, 0, 0, 600, 7001, 0.0, 0);
-    vm.undo_enable(&state);
+    vm.undo_enable(&state).expect("undo window opens");
     let cp = vm.undo_checkpoint();
 
     assert_eq!(OK, run_scatter_one(&mut vm, &mut state, &prog, T, 10));
     assert_eq!(ChangeFlag::INSERTED, slot_change_flags(&state, 1));
     assert!(vm.undo_checkpoint() > cp);
-    let row = struct_map_row(&state, 1, 600);
-    assert_ne!(0xFFFF_FFFF, row);
+    let row = present_row(&state, 1, 600);
     assert!(bit_set(&state, row, 0));
     assert_eq!(7001, bytes::read_u32(&state, row + 1));
 }
@@ -881,13 +879,13 @@ fn probe_scatter_kind0_differing_assert_sets_updated_without_delta_mode() {
     seed_probe_row(&mut state, 11, 0, 0, 600, 7002, 0.0, 0);
     assert_eq!(OK, run_scatter_one(&mut vm, &mut state, &prog, T, 10));
     clear_slot_change_flags(&mut state, 1);
-    vm.undo_enable(&state);
+    vm.undo_enable(&state).expect("undo window opens");
     let cp = vm.undo_checkpoint();
 
     assert_eq!(OK, run_scatter_one(&mut vm, &mut state, &prog, T, 11));
     assert_eq!(ChangeFlag::UPDATED, slot_change_flags(&state, 1));
     assert!(vm.undo_checkpoint() > cp);
-    let row = struct_map_row(&state, 1, 600);
+    let row = present_row(&state, 1, 600);
     assert!(bit_set(&state, row, 0));
     assert_eq!(7002, bytes::read_u32(&state, row + 1));
 }
@@ -902,7 +900,7 @@ fn probe_scatter_kind0_identical_assert_is_noop_without_undo_or_flag() {
     seed_probe_row(&mut state, 10, 0, 0, 600, 7001, 0.0, 0);
     assert_eq!(OK, run_scatter_one(&mut vm, &mut state, &prog, T, 10));
     clear_slot_change_flags(&mut state, 1);
-    vm.undo_enable(&state);
+    vm.undo_enable(&state).expect("undo window opens");
     let cp = vm.undo_checkpoint();
     let before = state.clone();
 
@@ -924,7 +922,7 @@ fn probe_scatter_kind0_retract_only_matching_value_removes() {
     seed_probe_row(&mut state, 12, 0, 1, 600, 7001, 0.0, 0);
     assert_eq!(OK, run_scatter_one(&mut vm, &mut state, &prog, T, 10));
     clear_slot_change_flags(&mut state, 1);
-    vm.undo_enable(&state);
+    vm.undo_enable(&state).expect("undo window opens");
     let cp = vm.undo_checkpoint();
     let before = state.clone();
 
@@ -936,7 +934,7 @@ fn probe_scatter_kind0_retract_only_matching_value_removes() {
     assert_eq!(OK, run_scatter_one(&mut vm, &mut state, &prog, T, 12));
     assert_eq!(ChangeFlag::REMOVED, slot_change_flags(&state, 1));
     assert!(vm.undo_checkpoint() > cp);
-    let row = struct_map_row(&state, 1, 600);
+    let row = present_row(&state, 1, 600);
     assert!(!bit_set(&state, row, 0));
     assert_eq!(0, bytes::read_u32(&state, row + 1));
 }
@@ -962,10 +960,9 @@ fn probe_scatter_card_many_keeps_two_entities_sharing_a_value_distinct() {
     assert_eq!(OK, vm.execute_batch(&mut state, &prog, &cols, 1));
 
     assert_eq!(2, slot_size(&state, 2));
-    let (d_off, d_cap) = (slot_offset(&state, 2), slot_cap(&state, 2));
-    assert!(vm_set_contains(&state, d_off, d_cap, 8101));
-    assert!(vm_set_contains(&state, d_off, d_cap, 8102));
-    assert!(!vm_set_contains(&state, d_off, d_cap, 7003));
+    assert!(set_contains(&state, 2, 8101));
+    assert!(set_contains(&state, 2, 8102));
+    assert!(!set_contains(&state, 2, 7003));
 }
 
 #[test]
@@ -977,20 +974,21 @@ fn probe_scatter_kind0_assert_then_rollback_restores_absence() {
 
     seed_probe_row(&mut state, 10, 0, 0, 600, 7001, 0.0, 0);
 
-    assert_eq!(0xFFFF_FFFF, struct_map_row(&state, 1, 600));
+    assert_eq!(None, struct_map_row(&state, 1, 600));
 
-    vm.undo_enable(&state);
+    let before = state.clone();
+    vm.undo_enable(&state).expect("undo window opens");
     let cp = vm.undo_checkpoint();
     assert_eq!(OK, run_scatter_one(&mut vm, &mut state, &prog, T, 10));
 
-    let row_after = struct_map_row(&state, 1, 600);
-    assert_ne!(0xFFFF_FFFF, row_after);
+    let row_after = present_row(&state, 1, 600);
     assert!(bit_set(&state, row_after, 0));
     assert_eq!(7001, bytes::read_u32(&state, row_after + 1));
     assert_eq!(1, slot_size(&state, 1));
 
-    vm.undo_rollback(&mut state, cp);
-    assert_eq!(0xFFFF_FFFF, struct_map_row(&state, 1, 600));
+    vm.undo_rollback(&mut state, cp).expect("valid checkpoint");
+    assert_eq!(before, state);
+    assert_eq!(None, struct_map_row(&state, 1, 600));
     assert_eq!(0, slot_size(&state, 1));
     vm.undo_commit();
 }
@@ -1007,18 +1005,19 @@ fn probe_scatter_kind0_retract_clear_then_rollback_restores_value_and_bit() {
 
     // Commit the assert WITHOUT undo.
     assert_eq!(OK, run_scatter_one(&mut vm, &mut state, &prog, T, 10));
-    let row = struct_map_row(&state, 1, 700);
-    assert_ne!(0xFFFF_FFFF, row);
+    let row = present_row(&state, 1, 700);
     assert!(bit_set(&state, row, 0));
     assert_eq!(7001, bytes::read_u32(&state, row + 1));
 
-    vm.undo_enable(&state);
+    let before = state.clone();
+    vm.undo_enable(&state).expect("undo window opens");
     let cp = vm.undo_checkpoint();
     assert_eq!(OK, run_scatter_one(&mut vm, &mut state, &prog, T, 11));
     assert!(!bit_set(&state, row, 0));
     assert_eq!(0, bytes::read_u32(&state, row + 1));
 
-    vm.undo_rollback(&mut state, cp);
+    vm.undo_rollback(&mut state, cp).expect("valid checkpoint");
+    assert_eq!(before, state);
     assert!(bit_set(&state, row, 0));
     assert_eq!(7001, bytes::read_u32(&state, row + 1));
     vm.undo_commit();
@@ -1081,6 +1080,18 @@ fn run_struct_scatter(
     type_id: u32,
     elements: &[ScatterElement],
 ) -> u32 {
+    run_struct_scatter_lane(vm, state, prog, type_id, elements, false)
+}
+
+/// [`run_struct_scatter`] on either lane; `delta` journals every element as a pair.
+fn run_struct_scatter_lane(
+    vm: &mut Vm,
+    state: &mut [u8],
+    prog: &[u8],
+    type_id: u32,
+    elements: &[ScatterElement],
+    delta: bool,
+) -> u32 {
     let types: Vec<u32> = vec![type_id; elements.len()];
     let routes: Vec<u32> = elements.iter().map(|e| e.route).collect();
     let ops: Vec<u32> = elements.iter().map(|e| e.op_retract).collect();
@@ -1100,7 +1111,11 @@ fn run_struct_scatter(
         f64s_as_bytes(&v_nums),
         u32s_as_bytes(&v_sets),
     ];
-    vm.execute_batch(state, prog, &cols, 1)
+    if delta {
+        vm.execute_batch_delta(state, prog, &cols, 1)
+    } else {
+        vm.execute_batch(state, prog, &cols, 1)
+    }
 }
 
 /// The 0x2f parity fixture replayed through the probe-free opcode: same
@@ -1192,8 +1207,7 @@ fn struct_scatter_apply_parity_across_kinds_and_skip() {
     );
 
     // nodes (slot 0): row 500 — bitset(1) + title(4) + status(4) + boost(8).
-    let row_500 = struct_map_row(&state, 0, 500);
-    assert_ne!(0xFFFF_FFFF, row_500);
+    let row_500 = present_row(&state, 0, 500);
     assert!(!bit_set(&state, row_500, 0)); // title retracted (MATCH)
     assert_eq!(0, bytes::read_u32(&state, row_500 + 1));
     assert!(bit_set(&state, row_500, 1)); // status survives NON-MATCH retract
@@ -1203,13 +1217,11 @@ fn struct_scatter_apply_parity_across_kinds_and_skip() {
 
     // nodeDeps (slot 1): {(e,7003)=8003} deduped -> size 1.
     assert_eq!(1, slot_size(&state, 1));
-    let (d_off, d_cap) = (slot_offset(&state, 1), slot_cap(&state, 1));
-    assert!(vm_set_contains(&state, d_off, d_cap, 8003));
+    assert!(set_contains(&state, 1, 8003));
 
     // nodeTouch (slot 2): asserted then retracted -> empty.
     assert_eq!(0, slot_size(&state, 2));
-    let (t_off, t_cap) = (slot_offset(&state, 2), slot_cap(&state, 2));
-    assert!(!vm_set_contains(&state, t_off, t_cap, 8004));
+    assert!(!set_contains(&state, 2, 8004));
 }
 
 #[test]
@@ -1227,7 +1239,7 @@ fn struct_scatter_kind0_insert_sets_effective_flag_without_delta_mode() {
         v_num: 0.0,
         v_set: 0,
     }];
-    vm.undo_enable(&state);
+    vm.undo_enable(&state).expect("undo window opens");
     let cp = vm.undo_checkpoint();
 
     assert_eq!(
@@ -1236,8 +1248,7 @@ fn struct_scatter_kind0_insert_sets_effective_flag_without_delta_mode() {
     );
     assert_eq!(ChangeFlag::INSERTED, slot_change_flags(&state, 0));
     assert!(vm.undo_checkpoint() > cp);
-    let row = struct_map_row(&state, 0, 600);
-    assert_ne!(0xFFFF_FFFF, row);
+    let row = present_row(&state, 0, 600);
     assert!(bit_set(&state, row, 0));
     assert_eq!(7001, bytes::read_u32(&state, row + 1));
 }
@@ -1270,7 +1281,7 @@ fn struct_scatter_kind0_differing_assert_sets_updated_without_delta_mode() {
         run_struct_scatter(&mut vm, &mut state, &prog, T, &first)
     );
     clear_slot_change_flags(&mut state, 0);
-    vm.undo_enable(&state);
+    vm.undo_enable(&state).expect("undo window opens");
     let cp = vm.undo_checkpoint();
 
     assert_eq!(
@@ -1279,7 +1290,7 @@ fn struct_scatter_kind0_differing_assert_sets_updated_without_delta_mode() {
     );
     assert_eq!(ChangeFlag::UPDATED, slot_change_flags(&state, 0));
     assert!(vm.undo_checkpoint() > cp);
-    let row = struct_map_row(&state, 0, 600);
+    let row = present_row(&state, 0, 600);
     assert!(bit_set(&state, row, 0));
     assert_eq!(7002, bytes::read_u32(&state, row + 1));
 }
@@ -1304,7 +1315,7 @@ fn struct_scatter_kind0_identical_assert_is_noop_without_undo_or_flag() {
         run_struct_scatter(&mut vm, &mut state, &prog, T, &element)
     );
     clear_slot_change_flags(&mut state, 0);
-    vm.undo_enable(&state);
+    vm.undo_enable(&state).expect("undo window opens");
     let cp = vm.undo_checkpoint();
     let before = state.clone();
 
@@ -1353,7 +1364,7 @@ fn struct_scatter_kind0_retract_only_matching_value_removes() {
         run_struct_scatter(&mut vm, &mut state, &prog, T, &assert_title)
     );
     clear_slot_change_flags(&mut state, 0);
-    vm.undo_enable(&state);
+    vm.undo_enable(&state).expect("undo window opens");
     let cp = vm.undo_checkpoint();
     let before = state.clone();
 
@@ -1371,7 +1382,7 @@ fn struct_scatter_kind0_retract_only_matching_value_removes() {
     );
     assert_eq!(ChangeFlag::REMOVED, slot_change_flags(&state, 0));
     assert!(vm.undo_checkpoint() > cp);
-    let row = struct_map_row(&state, 0, 600);
+    let row = present_row(&state, 0, 600);
     assert!(!bit_set(&state, row, 0));
     assert_eq!(0, bytes::read_u32(&state, row + 1));
 }
@@ -1407,10 +1418,9 @@ fn struct_scatter_card_many_keeps_two_entities_sharing_a_value_distinct() {
     );
 
     assert_eq!(2, slot_size(&state, 1));
-    let (d_off, d_cap) = (slot_offset(&state, 1), slot_cap(&state, 1));
-    assert!(vm_set_contains(&state, d_off, d_cap, 8101));
-    assert!(vm_set_contains(&state, d_off, d_cap, 8102));
-    assert!(!vm_set_contains(&state, d_off, d_cap, 7003));
+    assert!(set_contains(&state, 1, 8101));
+    assert!(set_contains(&state, 1, 8102));
+    assert!(!set_contains(&state, 1, 7003));
 }
 
 #[test]
@@ -1429,23 +1439,24 @@ fn struct_scatter_kind0_assert_then_rollback_restores_absence() {
         v_set: 0,
     }];
 
-    assert_eq!(0xFFFF_FFFF, struct_map_row(&state, 0, 600));
+    assert_eq!(None, struct_map_row(&state, 0, 600));
 
-    vm.undo_enable(&state);
+    let before = state.clone();
+    vm.undo_enable(&state).expect("undo window opens");
     let cp = vm.undo_checkpoint();
     assert_eq!(
         OK,
         run_struct_scatter(&mut vm, &mut state, &prog, T, &assert_title)
     );
 
-    let row_after = struct_map_row(&state, 0, 600);
-    assert_ne!(0xFFFF_FFFF, row_after);
+    let row_after = present_row(&state, 0, 600);
     assert!(bit_set(&state, row_after, 0));
     assert_eq!(7001, bytes::read_u32(&state, row_after + 1));
     assert_eq!(1, slot_size(&state, 0));
 
-    vm.undo_rollback(&mut state, cp);
-    assert_eq!(0xFFFF_FFFF, struct_map_row(&state, 0, 600));
+    vm.undo_rollback(&mut state, cp).expect("valid checkpoint");
+    assert_eq!(before, state);
+    assert_eq!(None, struct_map_row(&state, 0, 600));
     assert_eq!(0, slot_size(&state, 0));
     vm.undo_commit();
 }
@@ -1479,12 +1490,12 @@ fn struct_scatter_kind0_retract_clear_then_rollback_restores_value_and_bit() {
         OK,
         run_struct_scatter(&mut vm, &mut state, &prog, T, &assert_title)
     );
-    let row = struct_map_row(&state, 0, 700);
-    assert_ne!(0xFFFF_FFFF, row);
+    let row = present_row(&state, 0, 700);
     assert!(bit_set(&state, row, 0));
     assert_eq!(7001, bytes::read_u32(&state, row + 1));
 
-    vm.undo_enable(&state);
+    let before = state.clone();
+    vm.undo_enable(&state).expect("undo window opens");
     let cp = vm.undo_checkpoint();
     assert_eq!(
         OK,
@@ -1493,9 +1504,10 @@ fn struct_scatter_kind0_retract_clear_then_rollback_restores_value_and_bit() {
     assert!(!bit_set(&state, row, 0));
     assert_eq!(0, bytes::read_u32(&state, row + 1));
 
-    vm.undo_rollback(&mut state, cp);
+    vm.undo_rollback(&mut state, cp).expect("valid checkpoint");
     assert!(bit_set(&state, row, 0));
     assert_eq!(7001, bytes::read_u32(&state, row + 1));
+    assert_eq!(before, state);
     vm.undo_commit();
 }
 
@@ -1685,6 +1697,18 @@ fn run_guarded_scatter(
     type_id: u32,
     elements: &[GuardedElement],
 ) -> u32 {
+    run_guarded_scatter_lane(vm, state, prog, type_id, elements, false)
+}
+
+/// [`run_guarded_scatter`] on either lane; `delta` journals every element as a pair.
+fn run_guarded_scatter_lane(
+    vm: &mut Vm,
+    state: &mut [u8],
+    prog: &[u8],
+    type_id: u32,
+    elements: &[GuardedElement],
+    delta: bool,
+) -> u32 {
     let types: Vec<u32> = vec![type_id; elements.len()];
     let routes: Vec<u32> = elements.iter().map(|e| e.route).collect();
     let ops: Vec<u32> = elements.iter().map(|e| e.op_retract).collect();
@@ -1706,7 +1730,11 @@ fn run_guarded_scatter(
         i64s_as_bytes(&at_ns),
         i64s_as_bytes(&ordinals),
     ];
-    vm.execute_batch(state, prog, &cols, 1)
+    if delta {
+        vm.execute_batch_delta(state, prog, &cols, 1)
+    } else {
+        vm.execute_batch(state, prog, &cols, 1)
+    }
 }
 
 /// The three elements of one transaction against key `key`: verdict,
@@ -1755,7 +1783,7 @@ fn read_i64(state: &[u8], off: u32) -> i64 {
 }
 
 fn tag_present(state: &[u8], tag: u32) -> bool {
-    vm_set_contains(state, slot_offset(state, 1), slot_cap(state, 1), tag)
+    set_contains(state, 1, tag)
 }
 
 /// The row-granularity rule: an element whose guard is strictly below the
@@ -1782,8 +1810,7 @@ fn guarded_scatter_stale_transaction_writes_through_no_route_including_the_set()
         run_guarded_scatter(&mut vm, &mut state, &prog, T, &stale)
     );
 
-    let row = struct_map_row(&state, 0, 500);
-    assert_ne!(0xFFFF_FFFF, row);
+    let row = present_row(&state, 0, 500);
     assert_eq!(7002, bytes::read_u32(&state, row + VERDICT_AT));
     assert_eq!(7012, bytes::read_u32(&state, row + DETAIL_AT));
     assert_eq!(2000, read_i64(&state, row + AT_NS_AT));
@@ -1817,7 +1844,7 @@ fn guarded_scatter_equal_guard_completes_the_row_and_order_does_not_change_it() 
     );
     // Every column of the older transaction landed: three elements, one
     // guard, none of them skipped.
-    let row = struct_map_row(&forward, 0, 500);
+    let row = present_row(&forward, 0, 500);
     assert_eq!(7001, bytes::read_u32(&forward, row + VERDICT_AT));
     assert_eq!(7011, bytes::read_u32(&forward, row + DETAIL_AT));
     assert!(tag_present(&forward, 8001));
@@ -1836,8 +1863,8 @@ fn guarded_scatter_equal_guard_completes_the_row_and_order_does_not_change_it() 
         run_guarded_scatter(&mut vm, &mut reverse, &prog, T, &older)
     );
 
-    let f_row = struct_map_row(&forward, 0, 500);
-    let r_row = struct_map_row(&reverse, 0, 500);
+    let f_row = present_row(&forward, 0, 500);
+    let r_row = present_row(&reverse, 0, 500);
     for (name, at) in [("verdict", VERDICT_AT), ("detail", DETAIL_AT)] {
         assert_eq!(
             bytes::read_u32(&forward, f_row + at),
@@ -1898,7 +1925,7 @@ fn guarded_scatter_stale_retract_does_not_delete_a_fresher_row() {
         run_guarded_scatter(&mut vm, &mut state, &prog, T, &stale_retract)
     );
 
-    let row = struct_map_row(&state, 0, 500);
+    let row = present_row(&state, 0, 500);
     assert!(bit_set(&state, row, 0));
     assert_eq!(7002, bytes::read_u32(&state, row + VERDICT_AT));
     assert!(tag_present(&state, 8002));
@@ -1971,7 +1998,8 @@ fn guarded_scatter_rolling_back_a_transaction_removes_the_row_it_stamped() {
         run_guarded_scatter(&mut vm, &mut state, &prog, T, &first)
     );
 
-    vm.undo_enable(&state);
+    let before = state.clone();
+    vm.undo_enable(&state).expect("undo window opens");
     let cp = vm.undo_checkpoint();
     let second = guarded_transaction(501, 7002, 7012, 8002, 2000, 20);
     assert_eq!(
@@ -1980,10 +2008,14 @@ fn guarded_scatter_rolling_back_a_transaction_removes_the_row_it_stamped() {
     );
     assert_eq!(2, slot_size(&state, 0));
 
-    vm.undo_rollback(&mut state, cp);
+    vm.undo_rollback(&mut state, cp).expect("valid checkpoint");
+    assert_eq!(
+        before, state,
+        "rollback restores every guard bit and payload byte"
+    );
     vm.undo_commit();
     assert_eq!(
-        0xFFFF_FFFF,
+        None,
         struct_map_row(&state, 0, 501),
         "the rolled-back transaction leaves no guard-only row behind"
     );
@@ -1991,7 +2023,7 @@ fn guarded_scatter_rolling_back_a_transaction_removes_the_row_it_stamped() {
 
     // And the row it did not touch still remembers its own guard, so a
     // transaction older than the first still loses.
-    let row = struct_map_row(&state, 0, 500);
+    let row = present_row(&state, 0, 500);
     assert_eq!(1000, read_i64(&state, row + AT_NS_AT));
     let older = guarded_transaction(500, 7009, 7019, 8009, 500, 5);
     assert_eq!(
@@ -2006,8 +2038,7 @@ fn guarded_scatter_rolling_back_a_transaction_removes_the_row_it_stamped() {
         OK,
         run_guarded_scatter(&mut vm, &mut state, &prog, T, &second)
     );
-    let restored = struct_map_row(&state, 0, 501);
-    assert_ne!(0xFFFF_FFFF, restored);
+    let restored = present_row(&state, 0, 501);
     assert_eq!(7002, bytes::read_u32(&state, restored + VERDICT_AT));
     assert_eq!(2000, read_i64(&state, restored + AT_NS_AT));
 }
@@ -2058,8 +2089,7 @@ fn guarded_scatter_an_identical_assert_still_advances_the_row_guard() {
     // looks for it: on a row the stamp had not yet created, every kind-0
     // route would find nothing and the transaction would leave a row of
     // guard columns and no values.
-    let row = struct_map_row(&state, 0, 500);
-    assert_ne!(0xFFFF_FFFF, row);
+    let row = present_row(&state, 0, 500);
     assert_eq!(7002, bytes::read_u32(&state, row + VERDICT_AT));
     assert_eq!(7012, bytes::read_u32(&state, row + DETAIL_AT));
     assert_eq!(1000, read_i64(&state, row + AT_NS_AT));
@@ -2198,7 +2228,7 @@ fn struct_scatter_sentinel_key_is_skipped() {
         OK,
         run_struct_scatter(&mut vm, &mut state, &prog, T, &element)
     );
-    assert_eq!(0xFFFF_FFFF, struct_map_row(&state, 0, EMPTY_KEY));
+    assert_eq!(None, struct_map_row(&state, 0, EMPTY_KEY));
     assert_eq!(0, slot_size(&state, 0));
 }
 
@@ -2232,14 +2262,14 @@ fn struct_map_upsert_overwrite_then_rollback_restores_prior_field_value_and_bit(
         OK,
         exec_struct_upsert(&mut vm, &mut state, &prog, &[100], &[42], &[1001])
     );
-    let row = struct_map_row(&state, 0, 100);
-    assert_ne!(0xFFFF_FFFF, row);
+    let row = present_row(&state, 0, 100);
     assert_eq!(0x03, state[row as usize]);
     assert_eq!(42, bytes::read_u32(&state, row + 1));
     assert_eq!(1001, bytes::read_u32(&state, row + 5));
 
-    vm.undo_enable(&state);
-    assert!(vm.undo.enabled);
+    let before = state.clone();
+    vm.undo_enable(&state).expect("undo window opens");
+    assert!(vm.undo_status().enabled);
     let cp = vm.undo_checkpoint();
     assert_eq!(0, cp); // fresh enable resets the log
     assert_eq!(
@@ -2250,13 +2280,14 @@ fn struct_map_upsert_overwrite_then_rollback_restores_prior_field_value_and_bit(
     assert!(vm.undo_checkpoint() > cp); // whole-row journaling fired
     assert_eq!(777, bytes::read_u32(&state, row + 1));
     assert_eq!(2002, bytes::read_u32(&state, row + 5));
-    assert!(!vm.undo_has_overflow()); // no shadow snapshot in play
+    assert!(!vm.undo_status().overflow); // the window accepted every entry
 
-    vm.undo_rollback(&mut state, cp);
+    vm.undo_rollback(&mut state, cp).expect("valid checkpoint");
     assert_eq!(0x03, state[row as usize]);
     assert_eq!(42, bytes::read_u32(&state, row + 1));
     assert_eq!(1001, bytes::read_u32(&state, row + 5));
     assert_eq!(1, slot_size(&state, 0));
+    assert_eq!(before, state);
     vm.undo_commit();
 }
 
@@ -2271,24 +2302,25 @@ fn struct_map_upsert_create_then_rollback_removes_key_and_restores_size() {
         exec_struct_upsert(&mut vm, &mut state, &prog, &[100], &[42], &[1001])
     );
     assert_eq!(1, slot_size(&state, 0));
-    assert_eq!(0xFFFF_FFFF, struct_map_row(&state, 0, 555));
+    assert_eq!(None, struct_map_row(&state, 0, 555));
 
-    vm.undo_enable(&state);
+    let before = state.clone();
+    vm.undo_enable(&state).expect("undo window opens");
     let cp = vm.undo_checkpoint();
     assert_eq!(
         OK,
         exec_struct_upsert(&mut vm, &mut state, &prog, &[555], &[88], &[3003])
     );
-    assert_ne!(0xFFFF_FFFF, struct_map_row(&state, 0, 555));
+    assert!(struct_map_row(&state, 0, 555).is_some());
     assert_eq!(2, slot_size(&state, 0));
-    assert!(!vm.undo_has_overflow());
+    assert!(!vm.undo_status().overflow);
 
-    vm.undo_rollback(&mut state, cp);
-    assert_eq!(0xFFFF_FFFF, struct_map_row(&state, 0, 555));
+    vm.undo_rollback(&mut state, cp).expect("valid checkpoint");
+    assert_eq!(None, struct_map_row(&state, 0, 555));
     assert_eq!(1, slot_size(&state, 0));
-    let row100 = struct_map_row(&state, 0, 100);
-    assert_ne!(0xFFFF_FFFF, row100);
+    let row100 = present_row(&state, 0, 100);
     assert_eq!(42, bytes::read_u32(&state, row100 + 1));
+    assert_eq!(before, state);
     vm.undo_commit();
 }
 
@@ -2309,10 +2341,11 @@ fn struct_map_upsert_multi_row_speculative_batch_fully_rolled_back() {
             &[1001, 1002]
         )
     );
-    let r100 = struct_map_row(&state, 0, 100);
-    let r200 = struct_map_row(&state, 0, 200);
+    let r100 = present_row(&state, 0, 100);
+    let r200 = present_row(&state, 0, 200);
 
-    vm.undo_enable(&state);
+    let before = state.clone();
+    vm.undo_enable(&state).expect("undo window opens");
     let cp = vm.undo_checkpoint();
     assert_eq!(
         OK,
@@ -2327,16 +2360,17 @@ fn struct_map_upsert_multi_row_speculative_batch_fully_rolled_back() {
     );
     assert_eq!(3, slot_size(&state, 0));
     assert_eq!(7000, bytes::read_u32(&state, r100 + 1));
-    assert!(!vm.undo_has_overflow());
+    assert!(!vm.undo_status().overflow);
 
-    vm.undo_rollback(&mut state, cp);
+    vm.undo_rollback(&mut state, cp).expect("valid checkpoint");
     assert_eq!(2, slot_size(&state, 0));
     assert_eq!(0x03, state[r100 as usize]);
     assert_eq!(42, bytes::read_u32(&state, r100 + 1));
     assert_eq!(1001, bytes::read_u32(&state, r100 + 5));
     assert_eq!(43, bytes::read_u32(&state, r200 + 1));
     assert_eq!(1002, bytes::read_u32(&state, r200 + 5));
-    assert_eq!(0xFFFF_FFFF, struct_map_row(&state, 0, 300));
+    assert_eq!(None, struct_map_row(&state, 0, 300));
+    assert_eq!(before, state);
     vm.undo_commit();
 }
 
@@ -2355,8 +2389,7 @@ fn struct_map_init_upsert_and_read_back() {
         exec_struct_upsert(&mut vm, &mut state, &prog, &[100], &[42], &[1001])
     );
     assert_eq!(1, slot_size(&state, 0));
-    let row = struct_map_row(&state, 0, 100);
-    assert_ne!(0xFFFF_FFFF, row);
+    let row = present_row(&state, 0, 100);
     assert_eq!(0x03, state[row as usize]); // both field bits
     assert_eq!(42, bytes::read_u32(&state, row + 1));
     assert_eq!(1001, bytes::read_u32(&state, row + 5));
@@ -2377,7 +2410,7 @@ fn struct_map_upsert_overwrites_existing_key() {
         exec_struct_upsert(&mut vm, &mut state, &prog, &[100], &[777], &[2002])
     );
     assert_eq!(1, slot_size(&state, 0));
-    let row = struct_map_row(&state, 0, 100);
+    let row = present_row(&state, 0, 100);
     assert_eq!(777, bytes::read_u32(&state, row + 1));
     assert_eq!(2002, bytes::read_u32(&state, row + 5));
 }
@@ -2389,8 +2422,8 @@ fn struct_map_upsert_overwrites_existing_key() {
 use proptest::prelude::*;
 
 proptest! {
-    /// Rollback through the REAL dispatch path restores logical map content
-    /// for arbitrary speculative batches over a committed baseline.
+    /// Rollback through the REAL dispatch path restores the full image, byte for
+    /// byte, for arbitrary speculative batches over a committed baseline.
     #[test]
     fn dispatch_rollback_restores_baseline(
         baseline in proptest::collection::vec((0u32..500, 1u32..1000), 1..8),
@@ -2404,35 +2437,37 @@ proptest! {
         let vals: Vec<u32> = baseline.iter().map(|(_, v)| *v).collect();
         let cols: Vec<&[u8]> = vec![u32s_as_bytes(&keys), u32s_as_bytes(&vals)];
         prop_assert_eq!(OK, vm.execute_batch(&mut state, &prog, &cols, keys.len() as u32));
-        let base_snapshot: Vec<(u32, u32)> = {
-            let (off, cap) = (slot_offset(&state, 0), slot_cap(&state, 0));
-            keys.iter().map(|&k| (k, vm_map_get(&state, off, cap, k))).collect()
+        let base_snapshot: Vec<(u32, Option<u32>)> = {
+            let map = CheckedMap::bind(&state, 0).expect("valid map slot");
+            keys.iter().map(|&k| (k, map.get(k))).collect()
         };
         let base_size = slot_size(&state, 0);
         let base_count = agg_count(&state, 1);
 
-        vm.undo_enable(&state);
+        let base_image = state.clone();
+        vm.undo_enable(&state).expect("undo window opens");
         let cp = vm.undo_checkpoint();
         let skeys: Vec<u32> = speculative.iter().map(|(k, _)| *k + 1).collect();
         let svals: Vec<u32> = speculative.iter().map(|(_, v)| *v + 5000).collect();
         let scols: Vec<&[u8]> = vec![u32s_as_bytes(&skeys), u32s_as_bytes(&svals)];
         prop_assert_eq!(OK, vm.execute_batch(&mut state, &prog, &scols, skeys.len() as u32));
 
-        vm.undo_rollback(&mut state, cp);
+        vm.undo_rollback(&mut state, cp).expect("valid checkpoint");
         vm.undo_commit();
+        prop_assert_eq!(&base_image, &state, "rollback restores the baseline image byte for byte");
 
         prop_assert_eq!(base_size, slot_size(&state, 0));
         prop_assert_eq!(base_count, agg_count(&state, 1));
-        let (off, cap) = (slot_offset(&state, 0), slot_cap(&state, 0));
+        let map = CheckedMap::bind(&state, 0).expect("valid map slot");
         for (k, v) in base_snapshot {
-            prop_assert_eq!(v, vm_map_get(&state, off, cap, k));
+            prop_assert_eq!(v, map.get(k));
         }
     }
 
     /// Delta export/apply: exporting a delta-mode batch's segments and
     /// applying rollback+rollforward to a COPY of the pre-batch state lands
-    /// on the post-batch logical content — the Scenario fork-navigation
-    /// contract (logical, not byte-exact: rollback leaves tombstones).
+    /// on the post-batch image, byte for byte: the Scenario fork-navigation
+    /// contract over the physical journal.
     #[test]
     fn delta_segments_roundtrip_fork_navigation(
         batch in proptest::collection::vec((0u32..200, 1u32..1000), 1..10),
@@ -2442,7 +2477,7 @@ proptest! {
         let mut state = init(&prog);
         let mut vm = Vm::default();
 
-        vm.undo_enable(&state);
+        vm.undo_enable(&state).expect("undo window opens");
         let keys: Vec<u32> = batch.iter().map(|(k, _)| *k + 1).collect();
         let vals: Vec<u32> = batch.iter().map(|(_, v)| *v).collect();
         let pre_state = state.clone();
@@ -2468,26 +2503,31 @@ proptest! {
             prop_assert_eq!(OK, vm.execute_batch_delta(&mut state, &remove_prog, &rcols, rkeys.len() as u32));
         }
 
-        let count = vm.delta_export_segment(0, vm.undo.delta_count());
-        prop_assert!(count > 0);
+        let end = vm.undo_checkpoint();
+        prop_assert_eq!(vm.delta_export_segment(0, end), Ok(end));
+        prop_assert!(end > 0);
         let undo_seg = vm.delta_export_undo_bytes();
         let redo_seg = vm.delta_export_redo_bytes();
         let entry_size = Vm::delta_export_entry_size();
 
-        // Roll the LIVE state back via the excovered undo segment → logical
-        // pre-batch content.
+        // Roll the LIVE state back via the exported undo segment → the pre-batch image.
         let mut rolled = state.clone();
-        vm.delta_apply_rollback_segment(&mut rolled, &undo_seg, entry_size);
-        let (off, cap) = (slot_offset(&pre_state, 0), slot_cap(&pre_state, 0));
+        vm.delta_apply_rollback_segment(&mut rolled, &undo_seg, entry_size).expect("valid undo segment");
+        prop_assert_eq!(&pre_state, &rolled, "undo segment restores the pre-batch image byte for byte");
+        let pre_map = CheckedMap::bind(&pre_state, 0).expect("valid map slot");
+        let rolled_map = CheckedMap::bind(&rolled, 0).expect("valid map slot");
         for &k in &keys {
-            prop_assert_eq!(vm_map_get(&pre_state, off, cap, k), vm_map_get(&rolled, off, cap, k));
+            prop_assert_eq!(pre_map.get(k), rolled_map.get(k));
         }
         prop_assert_eq!(slot_size(&pre_state, 0), slot_size(&rolled, 0));
 
         // Roll it forward again via the redo segment → post-batch content.
-        vm.delta_apply_rollforward_segment(&mut rolled, &redo_seg, entry_size);
+        vm.delta_apply_rollforward_segment(&mut rolled, &redo_seg, entry_size).expect("valid redo segment");
+        prop_assert_eq!(&state, &rolled, "redo segment reproduces the post-batch image byte for byte");
+        let state_map = CheckedMap::bind(&state, 0).expect("valid map slot");
+        let rolled_map = CheckedMap::bind(&rolled, 0).expect("valid map slot");
         for &k in &keys {
-            prop_assert_eq!(vm_map_get(&state, off, cap, k), vm_map_get(&rolled, off, cap, k));
+            prop_assert_eq!(state_map.get(k), rolled_map.get(k));
         }
         prop_assert_eq!(slot_size(&state, 0), slot_size(&rolled, 0));
         vm.undo_commit();
@@ -2520,59 +2560,505 @@ proptest! {
 
         prop_assert_eq!(slot_size(&state_a, 0), slot_size(&state_b, 0));
         prop_assert_eq!(agg_count(&state_a, 1), agg_count(&state_b, 1));
-        let (off, cap) = (slot_offset(&state_a, 0), slot_cap(&state_a, 0));
+        let map_a = CheckedMap::bind(&state_a, 0).expect("valid map slot");
+        let map_b = CheckedMap::bind(&state_b, 0).expect("valid map slot");
         for &k in &keys {
-            prop_assert_eq!(vm_map_get(&state_a, off, cap, k), vm_map_get(&state_b, off, cap, k));
+            prop_assert_eq!(map_a.get(k), map_b.get(k));
         }
     }
 }
 
 // =============================================================================
-// Undo overflow through the container-operation hooks path: every append
-// snapshots on first overflow, including hashmap/hashset/bitmap operations.
+// Journal refusal and full-image windows through the real dispatch path. A
+// refused write is a typed prewrite refusal: no shadow snapshot is taken.
+// =============================================================================
 
+/// One delta window: production rollback and the exported undo and redo
+/// segments must each reproduce the full image byte for byte.
+fn assert_full_image_roundtrip(vm: &mut Vm, before: &[u8], after: &[u8], checkpoint: u32) {
+    let end = vm.undo_checkpoint();
+    assert!(
+        end > checkpoint,
+        "mutation must emit paired journal entries"
+    );
+    assert_eq!(
+        Ok(end - checkpoint),
+        vm.delta_export_segment(checkpoint, end)
+    );
+    let undo = vm.delta_export_undo_bytes();
+    let redo = vm.delta_export_redo_bytes();
+    let entry = Vm::delta_export_entry_size();
+
+    let mut production = after.to_vec();
+    vm.undo_rollback(&mut production, checkpoint)
+        .expect("valid checkpoint");
+    assert_eq!(
+        before,
+        production.as_slice(),
+        "production rollback restores the full image"
+    );
+
+    let mut replay = Vm::default();
+    let mut rolled_back = after.to_vec();
+    replay
+        .delta_apply_rollback_segment(&mut rolled_back, &undo, entry)
+        .expect("valid undo segment");
+    assert_eq!(
+        before,
+        rolled_back.as_slice(),
+        "undo segment restores the full image"
+    );
+
+    let mut rolled_forward = before.to_vec();
+    replay
+        .delta_apply_rollforward_segment(&mut rolled_forward, &redo, entry)
+        .expect("valid redo segment");
+    assert_eq!(
+        after,
+        rolled_forward.as_slice(),
+        "redo segment reproduces the full image"
+    );
+}
+
+/// Real alternating writes fill the journal through `execute_batch_delta`. The
+/// first refused write changes nothing and returns JournalOverflow, the refusal
+/// is sticky, and the accepted prefix still rolls back and redoes to exact
+/// images from its start and from its midpoint.
 #[test]
-fn undo_overflow_inside_container_op_snapshots_and_rolls_back() {
-    // HASHMAP(LAST) cap 32768: 70% load = 22937 max entries, so 18000
-    // distinct-key inserts overflow the 16384-entry undo log through the
-    // hashmap_ops hooks path without ever signaling growth.
+fn journal_overflow_refuses_prewrite_and_accepted_prefix_stays_exact() {
     let mut init_code = Vec::new();
-    init_code.extend(slot_def(0, 0x00, 0, 0x80));
+    init_code.extend(slot_def(0, 0x00, 16, 0));
     let reduce = [0x22, 0, 0, 1]; // BATCH_MAP_UPSERT_LAST slot=0 key=c0 val=c1
     let prog = program(1, 2, &init_code, &reduce);
     let mut state = init(&prog);
     let mut vm = Vm::default();
 
-    vm.undo_enable(&state);
-    let cp = vm.undo_checkpoint();
-    assert_eq!(0, cp);
+    // One committed row; every window write below changes only its value cell.
+    let seed_keys = [7u32];
+    let seed_vals = [1u32];
+    let seed_cols: Vec<&[u8]> = vec![u32s_as_bytes(&seed_keys), u32s_as_bytes(&seed_vals)];
+    assert_eq!(OK, vm.execute_batch(&mut state, &prog, &seed_cols, 1));
+    let pristine = state.clone();
 
-    const TOTAL: u32 = 18_000;
-    const BATCH: u32 = 1_000;
-    let mut batch = 0u32;
-    while batch < TOTAL / BATCH {
-        let keys: Vec<u32> = (0..BATCH).map(|i| batch * BATCH + i + 1).collect();
-        let vals: Vec<u32> = keys.iter().map(|k| k + 7).collect();
+    vm.undo_enable(&state).expect("undo window opens");
+    let window_start = vm.undo_checkpoint();
+    assert_eq!(0, window_start);
+
+    let mut midpoint: Option<(u32, Vec<u8>)> = None;
+    let mut refused: Option<(u32, Vec<u8>)> = None;
+    let mut writes = 0u32;
+    while refused.is_none() {
+        assert!(
+            writes < 2 * UNDO_CAPACITY,
+            "journal never refused a real write"
+        );
+        let checkpoint = vm.undo_checkpoint();
+        let image = state.clone();
+        if midpoint.is_none() && checkpoint >= UNDO_CAPACITY / 2 {
+            midpoint = Some((checkpoint, image.clone()));
+        }
+        let keys = [7u32];
+        let vals = [if writes.is_multiple_of(2) {
+            0xAAAA_0001u32
+        } else {
+            0xBBBB_0002
+        }];
         let cols: Vec<&[u8]> = vec![u32s_as_bytes(&keys), u32s_as_bytes(&vals)];
-        assert_eq!(OK, vm.execute_batch(&mut state, &prog, &cols, BATCH));
-        batch += 1;
+        match vm.execute_batch_delta(&mut state, &prog, &cols, 1) {
+            OK => {}
+            JOURNAL_OVERFLOW => refused = Some((checkpoint, image)),
+            status => panic!("write {writes}: unexpected status {status}"),
+        }
+        writes += 1;
     }
-    assert_eq!(TOTAL, slot_size(&state, 0));
-    // The log overflowed strictly inside batch_map_upsert (the only journaled
-    // op in the program), so the shadow snapshot MUST have been taken there.
-    assert!(vm.undo_has_overflow());
+    let (refused_checkpoint, image_at_refusal) = refused.expect("the journal refused a write");
+    let (midpoint_checkpoint, midpoint_image) = midpoint.expect("the window passed its midpoint");
+    assert!(
+        refused_checkpoint + 4 >= UNDO_CAPACITY,
+        "refusal must come at capacity, not earlier (checkpoint {refused_checkpoint})"
+    );
+    assert!(midpoint_checkpoint < refused_checkpoint);
+    assert!(vm.undo_status().overflow);
+    // The refused write left the image and the checkpoint exactly as they were.
+    assert_eq!(image_at_refusal, state);
+    assert_eq!(refused_checkpoint, vm.undo_checkpoint());
 
-    vm.undo_rollback(&mut state, cp);
+    // Sticky: a further write is refused and still changes nothing.
+    let keys = [7u32];
+    let vals = [0xCCCC_0003u32];
+    let cols: Vec<&[u8]> = vec![u32s_as_bytes(&keys), u32s_as_bytes(&vals)];
+    assert_eq!(
+        JOURNAL_OVERFLOW,
+        vm.execute_batch_delta(&mut state, &prog, &cols, 1)
+    );
+    assert_eq!(image_at_refusal, state);
+    assert_eq!(refused_checkpoint, vm.undo_checkpoint());
 
-    // Every key — logged (1..=16384) AND unlogged past the overflow point
-    // (16385..=18000, restorable only via the shadow) — must be gone.
-    let (off, cap) = (slot_offset(&state, 0), slot_cap(&state, 0));
-    assert_eq!(0, slot_size(&state, 0));
-    for k in [1u32, 2, 16_384, 16_385, 16_386, 17_500, 18_000] {
+    // Export the accepted prefix before any rollback truncates it.
+    let entry = Vm::delta_export_entry_size();
+    assert_eq!(
+        Ok(refused_checkpoint),
+        vm.delta_export_segment(window_start, refused_checkpoint)
+    );
+    assert!(
+        vm.delta_export_overflow(),
+        "the overflow diagnostic stays set on export"
+    );
+    let window_undo = vm.delta_export_undo_bytes();
+    let window_redo = vm.delta_export_redo_bytes();
+    assert_eq!(
+        Ok(refused_checkpoint - midpoint_checkpoint),
+        vm.delta_export_segment(midpoint_checkpoint, refused_checkpoint)
+    );
+    let tail_undo = vm.delta_export_undo_bytes();
+    let tail_redo = vm.delta_export_redo_bytes();
+
+    let mut replay = Vm::default();
+    let mut at_midpoint = image_at_refusal.clone();
+    replay
+        .delta_apply_rollback_segment(&mut at_midpoint, &tail_undo, entry)
+        .expect("valid tail undo");
+    assert_eq!(
+        midpoint_image, at_midpoint,
+        "the tail undo reaches the midpoint image"
+    );
+    replay
+        .delta_apply_rollforward_segment(&mut at_midpoint, &tail_redo, entry)
+        .expect("valid tail redo");
+    assert_eq!(
+        image_at_refusal, at_midpoint,
+        "the tail redo reaches the refusal image"
+    );
+
+    let mut at_start = image_at_refusal.clone();
+    replay
+        .delta_apply_rollback_segment(&mut at_start, &window_undo, entry)
+        .expect("valid window undo");
+    assert_eq!(
+        pristine, at_start,
+        "the accepted window undoes to the pristine image"
+    );
+    replay
+        .delta_apply_rollforward_segment(&mut at_start, &window_redo, entry)
+        .expect("valid window redo");
+    assert_eq!(
+        image_at_refusal, at_start,
+        "the accepted window redoes exactly"
+    );
+
+    // The live journal rolls back to the midpoint, then to the start, exactly.
+    vm.undo_rollback(&mut state, midpoint_checkpoint)
+        .expect("valid checkpoint");
+    assert_eq!(midpoint_image, state);
+    vm.undo_rollback(&mut state, window_start)
+        .expect("valid checkpoint");
+    assert_eq!(pristine, state);
+    vm.undo_commit();
+}
+
+/// A COUNT that cannot add its matched rows is refused before its cell, its
+/// change flag, or any journal entry is written. It is a semantic refusal, so
+/// the journal diagnostic stays clear.
+#[test]
+fn count_overflow_refuses_prewrite_without_journal_or_flag() {
+    let prog = program(1, 1, &slot_def(0, 0x02, 2, 0), &[0x41, 0]);
+    let mut state = init(&prog);
+    let mut vm = Vm::default();
+    let count_off = slot_offset(&state, 0);
+    bytes::write_u64(&mut state, count_off, u64::MAX);
+    let before = state.clone();
+    let rows = [0u32];
+    let cols: Vec<&[u8]> = vec![u32s_as_bytes(&rows)];
+
+    vm.undo_enable(&state).expect("undo window opens");
+    let cp = vm.undo_checkpoint();
+    assert_eq!(
+        ErrorCode::CountOverflow as u32,
+        vm.execute_batch_delta(&mut state, &prog, &cols, 1)
+    );
+    assert_eq!(before, state);
+    assert_eq!(cp, vm.undo_checkpoint());
+    assert_eq!(0, slot_change_flags(&state, 0));
+    assert!(
+        !vm.undo_status().overflow,
+        "a refused count is not a journal refusal"
+    );
+    vm.undo_commit();
+}
+
+/// A COUNT crossing the 32-bit word boundary journals its whole 8-byte cell and
+/// its SIZE_CHANGED flag; rollback restores both exactly.
+#[test]
+fn count_aggregate_high_word_rollback_restores_cell_and_size_flag() {
+    let prog = program(1, 1, &slot_def(0, 0x02, 2, 0), &[0x41, 0]);
+    let mut state = init(&prog);
+    let mut vm = Vm::default();
+    let count_off = slot_offset(&state, 0);
+    bytes::write_u64(&mut state, count_off, u64::from(u32::MAX));
+    let before = state.clone();
+    let rows = [0u32];
+    let cols: Vec<&[u8]> = vec![u32s_as_bytes(&rows)];
+
+    vm.undo_enable(&state).expect("undo window opens");
+    let cp = vm.undo_checkpoint();
+    assert_eq!(OK, vm.execute_batch_delta(&mut state, &prog, &cols, 1));
+    assert_eq!(0x1_0000_0000, agg_count(&state, 0));
+    assert_eq!(ChangeFlag::SIZE_CHANGED, slot_change_flags(&state, 0));
+    let after = state.clone();
+    assert_full_image_roundtrip(&mut vm, &before, &after, cp);
+}
+
+/// A U32 scalar latest writes four value bytes and its timestamp cell. The upper
+/// word of the 8-byte value lane is stale and survives the write, the noop, and
+/// the rollback exactly.
+#[test]
+fn scalar_u32_latest_rollback_preserves_upper_word_and_timestamp() {
+    const T: u32 = 3201;
+    let init_code = slot_def(0, SlotType::Scalar as u8, AggType::ScalarU32 as u8, 0);
+    let body = [Opcode::BatchScalarLatest as u8, 0, 1, 2];
+    let mut reduce = vec![0xE0, 0, 1];
+    reduce.extend(T.to_le_bytes());
+    reduce.extend((body.len() as u16).to_le_bytes());
+    reduce.extend_from_slice(&body);
+    let prog = program(1, 3, &init_code, &reduce);
+    let mut state = init(&prog);
+    let mut vm = Vm::default();
+    let data = slot_offset(&state, 0);
+    bytes::write_u32(&mut state, data + 4, 0xA5A5_5A5A);
+    let before = state.clone();
+
+    vm.undo_enable(&state).expect("undo window opens");
+    let cp = vm.undo_checkpoint();
+    let types = [T];
+    let values = [42u32];
+    let stamps = [100.0f64];
+    let cols: Vec<&[u8]> = vec![
+        u32s_as_bytes(&types),
+        u32s_as_bytes(&values),
+        f64s_as_bytes(&stamps),
+    ];
+    assert_eq!(OK, vm.execute_batch_delta(&mut state, &prog, &cols, 1));
+    assert_eq!(42, bytes::read_u32(&state, data));
+    assert_eq!(
+        0xA5A5_5A5A,
+        bytes::read_u32(&state, data + 4),
+        "a U32 write leaves the upper word alone"
+    );
+    assert_eq!(100.0, bytes::read_f64(&state, data + 8));
+    let after = state.clone();
+
+    // An older timestamp selects nothing: same image, no journal entry.
+    let late_values = [7u32];
+    let late_stamps = [50.0f64];
+    let late_cols: Vec<&[u8]> = vec![
+        u32s_as_bytes(&types),
+        u32s_as_bytes(&late_values),
+        f64s_as_bytes(&late_stamps),
+    ];
+    let end = vm.undo_checkpoint();
+    assert_eq!(OK, vm.execute_batch_delta(&mut state, &prog, &late_cols, 1));
+    assert_eq!(end, vm.undo_checkpoint());
+    assert_eq!(after, state);
+
+    assert_full_image_roundtrip(&mut vm, &before, &after, cp);
+}
+
+/// A row whose field bit is clear but whose payload stays allocated and nonzero
+/// is physical state. The upsert that re-sets the field and its rollback leave
+/// every byte of the image exact, the stale payload included.
+#[test]
+fn struct_map_upsert_over_stale_unset_payload_rolls_back_to_full_image() {
+    let prog = build_struct_map_program(4, 0);
+    let mut state = init(&prog);
+    let mut vm = Vm::default();
+    assert_eq!(
+        OK,
+        exec_struct_upsert(
+            &mut vm,
+            &mut state,
+            &prog,
+            &[100, 200],
+            &[42, 43],
+            &[1001, 1002]
+        )
+    );
+    let smap = StructMapSlot::bind(&state, 0);
+    let row = present_row(&state, 0, 100);
+    let stale_payload = row + smap.field_offset(&state, 1);
+    state[row as usize] &= !0x02;
+    bytes::write_u32(&mut state, stale_payload, 0xDEAD_BEEF);
+    let before = state.clone();
+
+    vm.undo_enable(&state).expect("undo window opens");
+    let cp = vm.undo_checkpoint();
+    let next_keys = [100u32];
+    let next_vals = [777u32];
+    let next_strs = [2002u32];
+    let next_cols: Vec<&[u8]> = vec![
+        u32s_as_bytes(&next_keys),
+        u32s_as_bytes(&next_vals),
+        u32s_as_bytes(&next_strs),
+    ];
+    assert_eq!(OK, vm.execute_batch_delta(&mut state, &prog, &next_cols, 1));
+    assert_eq!(0x03, state[row as usize]);
+    assert_eq!(777, bytes::read_u32(&state, row + 1));
+    assert_eq!(2002, bytes::read_u32(&state, stale_payload));
+    let after = state.clone();
+    assert_full_image_roundtrip(&mut vm, &before, &after, cp);
+}
+
+/// Composite-key (StructMap2) rows share the bitset-and-payload layout: a stale
+/// unset payload under a composite key survives its upsert and rollback exactly.
+#[test]
+fn struct_map2_upsert_over_stale_unset_payload_rolls_back_to_full_image() {
+    let init_code = [
+        Opcode::SlotStructMap2 as u8,
+        0,
+        SlotType::StructMap2 as u8,
+        8,
+        0,
+        2,
+        0,
+        4,
+    ];
+    // BATCH_STRUCT_MAP2_UPSERT_LAST slot=0 key1=c0 key2=c1, (c2 -> field 0), (c3 -> field 1).
+    let reduce = [
+        Opcode::BatchStructMap2UpsertLast as u8,
+        0,
+        0,
+        1,
+        2,
+        2,
+        0,
+        3,
+        1,
+    ];
+    let prog = program(1, 4, &init_code, &reduce);
+    let mut state = init(&prog);
+    let mut vm = Vm::default();
+    let key1 = [1u32];
+    let key2 = [9u32];
+    let first_a = [42u32];
+    let first_b = [1001u32];
+    let first_cols: Vec<&[u8]> = vec![
+        u32s_as_bytes(&key1),
+        u32s_as_bytes(&key2),
+        u32s_as_bytes(&first_a),
+        u32s_as_bytes(&first_b),
+    ];
+    assert_eq!(OK, vm.execute_batch(&mut state, &prog, &first_cols, 1));
+
+    let smap = StructMap2Slot::bind(&state, 0);
+    let row = smap.get_row_ptr_by_key(&state, 1, 9);
+    assert_ne!(0xFFFF_FFFF, row);
+    let stale_payload = row + smap.field_offset(&state, 1);
+    state[row as usize] &= !0x02;
+    bytes::write_u32(&mut state, stale_payload, 0xDEAD_BEEF);
+    let before = state.clone();
+
+    vm.undo_enable(&state).expect("undo window opens");
+    let cp = vm.undo_checkpoint();
+    let next_a = [7u32];
+    let next_b = [2002u32];
+    let next_cols: Vec<&[u8]> = vec![
+        u32s_as_bytes(&key1),
+        u32s_as_bytes(&key2),
+        u32s_as_bytes(&next_a),
+        u32s_as_bytes(&next_b),
+    ];
+    assert_eq!(OK, vm.execute_batch_delta(&mut state, &prog, &next_cols, 1));
+    assert_ne!(before, state);
+    let after = state.clone();
+    assert_full_image_roundtrip(&mut vm, &before, &after, cp);
+}
+
+/// The probe scatter's assert over a node row whose title bit is clear, while the
+/// title payload stays allocated and nonzero: the write and its rollback leave
+/// every image byte exact.
+#[test]
+fn probe_scatter_assert_over_stale_unset_title_rolls_back_to_full_image() {
+    const T: u32 = 2011;
+    let prog = build_probe_scatter_program(T);
+    let mut state = init(&prog);
+    let mut vm = Vm::default();
+
+    seed_probe_row(&mut state, 10, 0, 0, 600, 7001, 0.0, 0);
+    let nodes = StructMapSlot::bind(&state, 1);
+    let node = nodes.upsert(&mut state, 600).expect("node row");
+    let row = nodes.row_off(node.pos);
+    nodes.clear_bitset(&mut state, row);
+    let stale_title = row + nodes.field_offset(&state, 0);
+    bytes::write_u32(&mut state, stale_title, 0xDEAD_BEEF);
+    let before = state.clone();
+
+    vm.undo_enable(&state).expect("undo window opens");
+    let cp = vm.undo_checkpoint();
+    let types = [T];
+    let offsets = [0u32, 1];
+    let keys = [10u32];
+    let cols: Vec<&[u8]> = vec![
+        u32s_as_bytes(&types),
+        u32s_as_bytes(&offsets),
+        u32s_as_bytes(&keys),
+    ];
+    assert_eq!(OK, vm.execute_batch_delta(&mut state, &prog, &cols, 1));
+    assert!(bit_set(&state, row, 0));
+    assert_eq!(7001, bytes::read_u32(&state, stale_title));
+    let after = state.clone();
+    assert_full_image_roundtrip(&mut vm, &before, &after, cp);
+}
+
+/// Nested savepoints over one window: each checkpoint restores the exact image
+/// it saw, innermost first, and the middle window replays from its own export.
+#[test]
+fn nested_savepoints_roll_back_innermost_first_to_exact_images() {
+    let prog = build_test_program(16, 0);
+    let mut state = init(&prog);
+    let mut vm = Vm::default();
+    vm.undo_enable(&state).expect("undo window opens");
+
+    let mut checkpoints = vec![vm.undo_checkpoint()];
+    let mut images = vec![state.clone()];
+    let rounds: [([u32; 2], [u32; 2]); 3] =
+        [([1, 2], [11, 12]), ([3, 2], [23, 22]), ([4, 5], [34, 35])];
+    for (keys, vals) in rounds {
+        let cols: Vec<&[u8]> = vec![u32s_as_bytes(&keys), u32s_as_bytes(&vals)];
+        assert_eq!(OK, vm.execute_batch_delta(&mut state, &prog, &cols, 2));
+        checkpoints.push(vm.undo_checkpoint());
+        images.push(state.clone());
+    }
+
+    // The middle window [checkpoints[1], checkpoints[2]) replays exactly from its export.
+    let (from, to) = (checkpoints[1], checkpoints[2]);
+    assert_eq!(Ok(to - from), vm.delta_export_segment(from, to));
+    let undo = vm.delta_export_undo_bytes();
+    let redo = vm.delta_export_redo_bytes();
+    let entry = Vm::delta_export_entry_size();
+    let mut replay = Vm::default();
+    let mut middle = images[2].clone();
+    replay
+        .delta_apply_rollback_segment(&mut middle, &undo, entry)
+        .expect("valid middle undo");
+    assert_eq!(
+        images[1], middle,
+        "middle undo reaches its opening savepoint"
+    );
+    replay
+        .delta_apply_rollforward_segment(&mut middle, &redo, entry)
+        .expect("valid middle redo");
+    assert_eq!(
+        images[2], middle,
+        "middle redo reaches its closing savepoint"
+    );
+
+    // Live rollbacks, innermost first, each landing on the image its savepoint saw.
+    assert_eq!(images[3], state);
+    for level in (0..3).rev() {
+        vm.undo_rollback(&mut state, checkpoints[level])
+            .expect("valid checkpoint");
         assert_eq!(
-            EMPTY_KEY,
-            vm_map_get(&state, off, cap, k),
-            "key {k} survived rollback"
+            images[level], state,
+            "savepoint {level} restores its exact image"
         );
     }
     vm.undo_commit();
@@ -2594,7 +3080,8 @@ fn empty_batch_with_no_column_pointers_is_ok() {
     let size = calculate_state_size(
         &prog,
         columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
-    );
+    )
+    .expect("valid program admission");
     assert!(size > 0, "state size must be > 0");
     let mut state = vec![0u8; size as usize];
     init_state(
@@ -2607,10 +3094,10 @@ fn empty_batch_with_no_column_pointers_is_ok() {
     // Plain and delta paths, zero columns: both must no-op cleanly.
     let cols: Vec<&[u8]> = Vec::new();
     assert_eq!(OK, vm.execute_batch(&mut state, &prog, &cols, 0));
-    vm.undo_enable(&state);
+    vm.undo_enable(&state).expect("undo window opens");
     let cp = vm.undo_checkpoint();
     assert_eq!(OK, vm.execute_batch_delta(&mut state, &prog, &cols, 0));
-    vm.undo_rollback(&mut state, cp);
+    vm.undo_rollback(&mut state, cp).expect("valid checkpoint");
     vm.undo_commit();
 }
 
@@ -2633,7 +3120,8 @@ fn nonempty_batch_with_missing_columns_is_column_underrun() {
     let size = calculate_state_size(
         &prog,
         columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
-    );
+    )
+    .expect("valid program admission");
     let mut state = vec![0u8; size as usize];
     init_state(
         &mut state,
@@ -2677,7 +3165,8 @@ fn ts_scalar_latest_program_writes_value_and_cmp() {
     let size = calculate_state_size(
         &prog,
         columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
-    );
+    )
+    .expect("valid program admission");
     assert!(size > 0, "state size must be > 0");
     let mut state = vec![0u8; size as usize];
     init_state(
@@ -2723,7 +3212,7 @@ fn incompatible_state_format_is_refused_without_mutating_the_image() {
         ErrorCode::InvalidState as u32
     );
     assert_eq!(
-        vm.evict_all_expired(&mut state, 100.0),
+        vm.evict_all_expired(false, &mut state, 100.0),
         Err(ErrorCode::InvalidState)
     );
     assert_eq!(state, before);
@@ -2766,10 +3255,10 @@ fn slots_and_columns_past_one_byte_are_addressed_exactly() {
     assert_eq!(OK, Vm::default().execute_batch(&mut state, &prog, &cols, 1));
 
     for slot in 0..SLOTS {
-        let meta = SlotMetaView::read(&state, slot);
+        let set = CheckedSet::bind(&state, slot).expect("valid set slot");
         let read_col = SLOTS - 1 - slot;
         assert_eq!(
-            vm_set_contains(&state, meta.offset, meta.capacity, 10_000 + read_col),
+            set.contains(10_000 + read_col),
             addressed.contains(&slot),
             "slot {slot}"
         );
@@ -2790,14 +3279,353 @@ fn growth_reports_and_grows_a_slot_past_one_byte() {
     assert_eq!(needs_growth_slot(), 299);
 
     while vm.execute_batch(&mut state, &prog, &cols, 40) == NEEDS_GROWTH {
-        let mut grown = vec![0u8; calculate_grown_state_size(&state, 299) as usize];
+        let mut grown = vec![
+            0u8;
+            calculate_grown_state_size(&state, 299).expect("valid growth geometry")
+                as usize
+        ];
         grow_state(&state, &mut grown, 299).expect("grow_state");
         state = grown;
     }
-    let meta = SlotMetaView::read(&state, 299);
-    assert!(
-        elems
-            .iter()
-            .all(|&e| vm_set_contains(&state, meta.offset, meta.capacity, e))
+    let set = CheckedSet::bind(&state, 299).expect("valid set slot");
+    assert!(elems.iter().all(|&e| set.contains(e)));
+}
+
+/// One exported delta window `[from, to)`: its undo and redo segments.
+fn export_window(vm: &mut Vm, from: u32, to: u32) -> (Vec<u8>, Vec<u8>) {
+    assert_eq!(Ok(to - from), vm.delta_export_segment(from, to));
+    (vm.delta_export_undo_bytes(), vm.delta_export_redo_bytes())
+}
+
+/// Reverse, then forward, one exported window from its end image. Each step
+/// must reproduce the full image it was exported from, byte for byte.
+fn assert_window_replays(start: &[u8], end: &[u8], undo: &[u8], redo: &[u8]) {
+    let entry = Vm::delta_export_entry_size();
+    let mut replay = Vm::default();
+    let mut image = end.to_vec();
+    replay
+        .delta_apply_rollback_segment(&mut image, undo, entry)
+        .expect("valid undo window");
+    assert_eq!(
+        start,
+        image.as_slice(),
+        "undo window restores the start image"
     );
+    replay
+        .delta_apply_rollforward_segment(&mut image, redo, entry)
+        .expect("valid redo window");
+    assert_eq!(
+        end,
+        image.as_slice(),
+        "redo window reproduces the end image"
+    );
+}
+
+/// Struct scatter (0x3e) over a seeded stale row: every field bit is clear while
+/// the title, status and boost payloads hold nonzero bytes. Two real asserts land
+/// in their own savepoints. Each rollback restores the exact image, stale payloads
+/// included, and both windows replay exactly through their exported segments.
+#[test]
+fn struct_scatter_stale_unset_payload_nested_savepoints_roll_back_to_exact_images() {
+    const T: u32 = 2111;
+    let prog = build_struct_map_scatter_program(T);
+    let mut state = init(&prog);
+    let mut vm = Vm::default();
+
+    let nodes = StructMapSlot::bind(&state, 0);
+    let node = nodes.upsert(&mut state, 600).expect("seed node row");
+    let row = nodes.row_off(node.pos);
+    nodes.clear_bitset(&mut state, row);
+    let title = row + nodes.field_offset(&state, 0);
+    let status = row + nodes.field_offset(&state, 1);
+    let boost = row + nodes.field_offset(&state, 2);
+    bytes::write_u32(&mut state, title, 0xDEAD_0001);
+    bytes::write_u32(&mut state, status, 0xDEAD_0002);
+    bytes::write_u64(&mut state, boost, 0xDEAD_BEEF_F00D_CAFE);
+    let before = state.clone();
+
+    vm.undo_enable(&state).expect("undo window opens");
+    let cp0 = vm.undo_checkpoint();
+
+    // Savepoint 1: the title assert finds its bit clear and sets it.
+    let assert_title = [ScatterElement {
+        route: 0,
+        op_retract: 0,
+        key: 600,
+        v_str: 7001,
+        v_num: 0.0,
+        v_set: 0,
+    }];
+    assert_eq!(
+        OK,
+        run_struct_scatter_lane(&mut vm, &mut state, &prog, T, &assert_title, true)
+    );
+    assert!(bit_set(&state, row, 0));
+    assert_eq!(7001, bytes::read_u32(&state, title));
+    assert!(!bit_set(&state, row, 2));
+    let cp1 = vm.undo_checkpoint();
+    let image1 = state.clone();
+
+    // Savepoint 2: the boost assert sets its own bit over the stale payload.
+    let assert_boost = [ScatterElement {
+        route: 4,
+        op_retract: 0,
+        key: 600,
+        v_str: 0,
+        v_num: 2.5,
+        v_set: 0,
+    }];
+    assert_eq!(
+        OK,
+        run_struct_scatter_lane(&mut vm, &mut state, &prog, T, &assert_boost, true)
+    );
+    assert!(bit_set(&state, row, 2));
+    assert_eq!(2.5, f64::from_bits(bytes::read_u64(&state, boost)));
+    let cp2 = vm.undo_checkpoint();
+    let image2 = state.clone();
+    assert!(cp0 < cp1 && cp1 < cp2);
+    assert_ne!(image1, image2);
+
+    // Export both windows before any rollback truncates the journal.
+    let (undo_inner, redo_inner) = export_window(&mut vm, cp1, cp2);
+    let (undo_all, redo_all) = export_window(&mut vm, cp0, cp2);
+    assert_window_replays(&image1, &image2, &undo_inner, &redo_inner);
+    assert_window_replays(&before, &image2, &undo_all, &redo_all);
+
+    // Live nested rollbacks, innermost first.
+    vm.undo_rollback(&mut state, cp2).expect("valid checkpoint");
+    assert_eq!(image2, state);
+    vm.undo_rollback(&mut state, cp1).expect("valid checkpoint");
+    assert_eq!(
+        image1, state,
+        "savepoint 1 restores its exact image over the stale boost"
+    );
+    vm.undo_rollback(&mut state, cp0).expect("valid checkpoint");
+    assert_eq!(
+        before, state,
+        "the outer window restores the stale row byte for byte"
+    );
+    vm.undo_commit();
+}
+
+/// Guarded scatter (0x3f) over a seeded stale stamp: the row's guard bits are
+/// clear while its guard payloads and verdict/detail payloads hold nonzero bytes.
+/// The first transaction stamps the unset guard. A newer transaction stacks on it
+/// in its own savepoint. An older one loses and writes nothing. Each savepoint
+/// restores its exact image, and both windows replay exactly.
+#[test]
+fn guarded_scatter_stale_stamp_bitset_nested_savepoints_roll_back_to_exact_images() {
+    const T: u32 = 3111;
+    let prog = build_guarded_scatter_program(T);
+    let mut state = init(&prog);
+    let mut vm = Vm::default();
+
+    let checks = StructMapSlot::bind(&state, 0);
+    let node = checks.upsert(&mut state, 500).expect("seed guarded row");
+    let row = checks.row_off(node.pos);
+    checks.clear_bitset(&mut state, row);
+    let verdict = row + checks.field_offset(&state, 0);
+    let detail = row + checks.field_offset(&state, 1);
+    let at_ns = row + checks.field_offset(&state, 2);
+    let ordinal = row + checks.field_offset(&state, 3);
+    bytes::write_u32(&mut state, verdict, 0xDEAD_0001);
+    bytes::write_u32(&mut state, detail, 0xDEAD_0002);
+    bytes::write_u64(&mut state, at_ns, 0xBAAD_F00D_0000_0001);
+    bytes::write_u64(&mut state, ordinal, 0xBAAD_F00D_0000_0002);
+    let before = state.clone();
+
+    vm.undo_enable(&state).expect("undo window opens");
+    let cp0 = vm.undo_checkpoint();
+
+    // Savepoint 1: the stamp bits are clear, so no guard is stored and the first
+    // transaction lands, stamping the row.
+    let first = guarded_transaction(500, 7001, 7011, 8001, 1000, 10);
+    assert_eq!(
+        OK,
+        run_guarded_scatter_lane(&mut vm, &mut state, &prog, T, &first, true)
+    );
+    assert!(bit_set(&state, row, 2));
+    assert!(bit_set(&state, row, 3));
+    assert_eq!(7001, bytes::read_u32(&state, verdict));
+    assert_eq!(1000, read_i64(&state, at_ns));
+    assert_eq!(10, read_i64(&state, ordinal));
+    assert!(tag_present(&state, 8001));
+    let cp1 = vm.undo_checkpoint();
+    let image1 = state.clone();
+
+    // Savepoint 2: a newer transaction wins over the stamp the first one wrote.
+    let second = guarded_transaction(500, 7002, 7012, 8002, 2000, 20);
+    assert_eq!(
+        OK,
+        run_guarded_scatter_lane(&mut vm, &mut state, &prog, T, &second, true)
+    );
+    assert_eq!(7002, bytes::read_u32(&state, verdict));
+    assert_eq!(2000, read_i64(&state, at_ns));
+    assert_eq!(20, read_i64(&state, ordinal));
+    assert!(tag_present(&state, 8002));
+    let cp2 = vm.undo_checkpoint();
+    let image2 = state.clone();
+    assert_ne!(image1, image2);
+
+    // An older transaction loses to the remembered guard: no route writes and no
+    // journal entry is made.
+    let older = guarded_transaction(500, 7003, 7013, 8003, 1500, 15);
+    assert_eq!(
+        OK,
+        run_guarded_scatter_lane(&mut vm, &mut state, &prog, T, &older, true)
+    );
+    assert_eq!(cp2, vm.undo_checkpoint());
+    assert_eq!(image2, state);
+    assert!(!tag_present(&state, 8003));
+
+    // Export both windows before any rollback truncates the journal.
+    let (undo_inner, redo_inner) = export_window(&mut vm, cp1, cp2);
+    let (undo_all, redo_all) = export_window(&mut vm, cp0, cp2);
+    assert_window_replays(&image1, &image2, &undo_inner, &redo_inner);
+    assert_window_replays(&before, &image2, &undo_all, &redo_all);
+
+    // Live nested rollbacks, innermost first.
+    vm.undo_rollback(&mut state, cp2).expect("valid checkpoint");
+    assert_eq!(image2, state);
+    vm.undo_rollback(&mut state, cp1).expect("valid checkpoint");
+    assert_eq!(
+        image1, state,
+        "savepoint 1 restores its exact image over the stale stamp"
+    );
+    vm.undo_rollback(&mut state, cp0).expect("valid checkpoint");
+    assert_eq!(
+        before, state,
+        "the outer window restores the stale stamp byte for byte"
+    );
+    vm.undo_commit();
+}
+
+/// Journal exhaustion inside one multi-row batch. Real alternating single-row
+/// writes first bring the journal to within a few entries of capacity. Then one
+/// batch of distinct rows runs into it. The accepted rows form an exact prefix:
+/// the image equals exactly that many rows applied, and the refused row onward
+/// changed nothing. No whole-batch atomicity is assumed. The pre-batch window
+/// and the accepted prefix each roll back and redo to exact full images.
+#[test]
+fn journal_exhaustion_mid_batch_keeps_accepted_prefix_exact() {
+    const FILL_MARGIN: u32 = 16;
+    const ROWS: u32 = 24;
+    let mut init_code = Vec::new();
+    init_code.extend(slot_def(0, 0x00, 16, 0));
+    let reduce = [0x22, 0, 0, 1]; // BATCH_MAP_UPSERT_LAST slot=0 key=c0 val=c1
+    let prog = program(1, 2, &init_code, &reduce);
+    let mut state = init(&prog);
+    let mut vm = Vm::default();
+
+    let seed_keys = [7u32];
+    let seed_vals = [1u32];
+    let seed_cols: Vec<&[u8]> = vec![u32s_as_bytes(&seed_keys), u32s_as_bytes(&seed_vals)];
+    assert_eq!(OK, vm.execute_batch(&mut state, &prog, &seed_cols, 1));
+    let pristine = state.clone();
+
+    vm.undo_enable(&state).expect("undo window opens");
+    let window_start = vm.undo_checkpoint();
+
+    // Real alternating writes until the journal has only a little room left.
+    let mut writes = 0u32;
+    while vm.undo_checkpoint() + FILL_MARGIN < UNDO_CAPACITY {
+        assert!(
+            writes < 2 * UNDO_CAPACITY,
+            "the fill never reached the margin"
+        );
+        let keys = [7u32];
+        let vals = [if writes.is_multiple_of(2) {
+            0xAAAA_0001u32
+        } else {
+            0xBBBB_0002
+        }];
+        let cols: Vec<&[u8]> = vec![u32s_as_bytes(&keys), u32s_as_bytes(&vals)];
+        assert_eq!(OK, vm.execute_batch_delta(&mut state, &prog, &cols, 1));
+        writes += 1;
+    }
+    let before_cp = vm.undo_checkpoint();
+    let image_before = state.clone();
+
+    // One batch of distinct values: each row changes the value cell, so every
+    // row prefix has its own image.
+    let keys = vec![7u32; ROWS as usize];
+    let values: Vec<u32> = (0..ROWS).map(|row| 0x1000_0000 + row).collect();
+    let cols: Vec<&[u8]> = vec![u32s_as_bytes(&keys), u32s_as_bytes(&values)];
+    assert_eq!(
+        JOURNAL_OVERFLOW,
+        vm.execute_batch_delta(&mut state, &prog, &cols, ROWS)
+    );
+    let after_cp = vm.undo_checkpoint();
+    assert!(vm.undo_status().overflow);
+    assert!(
+        before_cp < after_cp && after_cp <= UNDO_CAPACITY,
+        "some rows fit before the refusal"
+    );
+    let accepted_image = state.clone();
+
+    // The accepted image must be exactly one row prefix of this batch, applied
+    // through the same dispatch on a fresh VM from the pre-batch image.
+    let mut matching = Vec::new();
+    for rows in 0..=ROWS {
+        let mut reference = image_before.clone();
+        if rows > 0 {
+            let r_keys = &keys[..rows as usize];
+            let r_values = &values[..rows as usize];
+            let r_cols: Vec<&[u8]> = vec![u32s_as_bytes(r_keys), u32s_as_bytes(r_values)];
+            let mut reference_vm = Vm::default();
+            assert_eq!(
+                OK,
+                reference_vm.execute_batch(&mut reference, &prog, &r_cols, rows)
+            );
+        }
+        if reference == accepted_image {
+            matching.push(rows);
+        }
+    }
+    assert_eq!(
+        1,
+        matching.len(),
+        "the accepted image is exactly one row prefix"
+    );
+    let accepted = matching[0];
+    assert!(
+        (1..ROWS).contains(&accepted),
+        "rows fit, then the next row is refused: accepted {accepted} of {ROWS}"
+    );
+
+    // The refusal is sticky: the next write changes nothing either.
+    let next_keys = [7u32];
+    let next_vals = [0x2000_0000u32];
+    let next_cols: Vec<&[u8]> = vec![u32s_as_bytes(&next_keys), u32s_as_bytes(&next_vals)];
+    assert_eq!(
+        JOURNAL_OVERFLOW,
+        vm.execute_batch_delta(&mut state, &prog, &next_cols, 1)
+    );
+    assert_eq!(accepted_image, state);
+    assert_eq!(after_cp, vm.undo_checkpoint());
+
+    // Export both windows before any rollback truncates the journal.
+    let (undo_batch, redo_batch) = export_window(&mut vm, before_cp, after_cp);
+    let (undo_all, redo_all) = export_window(&mut vm, window_start, after_cp);
+    assert!(
+        vm.delta_export_overflow(),
+        "the overflow diagnostic stays set on export"
+    );
+    assert_window_replays(&image_before, &accepted_image, &undo_batch, &redo_batch);
+    assert_window_replays(&pristine, &accepted_image, &undo_all, &redo_all);
+
+    // Live nested rollbacks: the batch window, then the whole window.
+    vm.undo_rollback(&mut state, before_cp)
+        .expect("valid checkpoint");
+    assert_eq!(
+        image_before, state,
+        "the savepoint before the batch restores its image"
+    );
+    vm.undo_rollback(&mut state, window_start)
+        .expect("valid checkpoint");
+    assert_eq!(
+        pristine, state,
+        "the window start restores the pristine image"
+    );
+    vm.undo_commit();
 }

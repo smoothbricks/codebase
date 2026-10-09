@@ -6,8 +6,12 @@
 //! `[timestamps: f64 × capacity]?`.
 //!
 //! Struct-map probing scans past tombstones and reuses the first tombstone
-//! only when the key is absent. Struct maps have no remove operation, so
-//! tombstones are not expected in a well-formed state.
+//! only when the key is absent. Unary and exact-pair writers retain the same
+//! planned position for prior-byte capture and mutation, restoring every
+//! overwritten key, row field and arena byte physically.
+//!
+//! Raw public writers are unjournaled operations on caller-owned bytes.
+//! Speculative callers use journaled VM operations or a bounded capture.
 
 use crate::bytes;
 use crate::hash_table::{
@@ -15,9 +19,68 @@ use crate::hash_table::{
 };
 use crate::meta::slot_meta_base;
 use columine_types::types::{
-    EMPTY_KEY, SlotMetaOffset, StructFieldType, TOMBSTONE, align8, hash_key, hash_key_pair,
-    struct_field_size,
+    EMPTY_KEY, ErrorCode, SlotMetaOffset, StructFieldType, TOMBSTONE, align8, arena_elem_size,
+    hash_key, hash_key_pair, is_arena_field_type, struct_field_size,
 };
+
+/// Checked physical bounds of a per-slot CSR arena. No schema or frame decoding.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ArenaRegion {
+    pub(crate) header: u32,
+    pub(crate) data: u32,
+    pub(crate) capacity: u32,
+    pub(crate) used: u32,
+}
+
+impl ArenaRegion {
+    pub(crate) fn bind(state: &[u8], header: u32) -> Result<Self, ErrorCode> {
+        if header == 0 {
+            return Err(ErrorCode::InvalidState);
+        }
+        let data = header
+            .checked_add(crate::state_init::ARENA_HEADER_SIZE)
+            .ok_or(ErrorCode::InvalidState)?;
+        let header_bytes = state
+            .get(header as usize..data as usize)
+            .ok_or(ErrorCode::InvalidState)?;
+        let capacity = bytes::read_u32(header_bytes, 0);
+        let used = bytes::read_u32(header_bytes, 4);
+        let end = data.checked_add(capacity).ok_or(ErrorCode::InvalidState)?;
+        if used > capacity || end as usize > state.len() {
+            return Err(ErrorCode::InvalidState);
+        }
+        Ok(Self {
+            header,
+            data,
+            capacity,
+            used,
+        })
+    }
+
+    pub(crate) fn bytes<'a>(
+        &self,
+        state: &'a [u8],
+        offset: u32,
+        len: u32,
+        elem_size: u32,
+    ) -> Result<&'a [u8], ErrorCode> {
+        let byte_len = len.checked_mul(elem_size).ok_or(ErrorCode::InvalidState)?;
+        let end = offset
+            .checked_add(byte_len)
+            .ok_or(ErrorCode::InvalidState)?;
+        if elem_size == 0 || end > self.used {
+            return Err(ErrorCode::InvalidState);
+        }
+        let start = self
+            .data
+            .checked_add(offset)
+            .ok_or(ErrorCode::InvalidState)?;
+        let end = self.data.checked_add(end).ok_or(ErrorCode::InvalidState)?;
+        state
+            .get(start as usize..end as usize)
+            .ok_or(ErrorCode::InvalidState)
+    }
+}
 
 /// Result of an `upsert` operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -47,7 +110,8 @@ fn write_scalar_cell(
         | StructFieldType::ArrayI64
         | StructFieldType::ArrayF64
         | StructFieldType::ArrayString
-        | StructFieldType::ArrayBool => {}
+        | StructFieldType::ArrayBool
+        | StructFieldType::Vo => unreachable!("arena fields require CSR operands"),
     }
 }
 /// Encode one column cell exactly as [`write_scalar_cell`] writes it, so the
@@ -82,7 +146,8 @@ pub(crate) fn scalar_cell_encoded(
         | StructFieldType::ArrayI64
         | StructFieldType::ArrayF64
         | StructFieldType::ArrayString
-        | StructFieldType::ArrayBool => None,
+        | StructFieldType::ArrayBool
+        | StructFieldType::Vo => None,
     }
 }
 
@@ -125,7 +190,8 @@ pub(crate) fn scalar_order_key(ft: StructFieldType, cell: &[u8]) -> Option<u64> 
         | StructFieldType::ArrayI64
         | StructFieldType::ArrayF64
         | StructFieldType::ArrayString
-        | StructFieldType::ArrayBool => None,
+        | StructFieldType::ArrayBool
+        | StructFieldType::Vo => None,
     }
 }
 
@@ -160,6 +226,8 @@ pub struct StructMapSlot {
     pub keys_off: u32,
     /// Absolute offset of row zero.
     pub rows_base: u32,
+    /// Absolute header offset of the slot's CSR arena; zero when there is none.
+    pub arena_header_off: u32,
 }
 
 impl StructMapSlot {
@@ -192,6 +260,7 @@ impl StructMapSlot {
             field_types_off: slot_offset,
             keys_off,
             rows_base: keys_off + capacity * 4,
+            arena_header_off: bytes::read_u32(state, meta_base + SlotMetaOffset::GRACE_SECONDS),
         }
     }
 
@@ -281,7 +350,7 @@ impl StructMapSlot {
         byte & (1u8 << (field_idx % 8)) != 0
     }
 
-    /// Set a row field's presence bit.
+    /// Set a row field's presence bit without journaling.
     #[inline(always)]
     pub fn set_field_bit(state: &mut [u8], row_off: u32, field_idx: u8) {
         state[(row_off + u32::from(field_idx) / 8) as usize] |= 1u8 << (field_idx % 8);
@@ -291,27 +360,23 @@ impl StructMapSlot {
     /// Clear a single field's bit in the bitset (inverse of `set_field_bit`).
     /// Used by BATCH_STRUCT_MAP_PROBE_SCATTER card-one retract to drop one
     /// routed attribute field without disturbing the row's other field bits.
+    /// Unjournaled; the caller owns these bytes or already reserved their capture.
     pub fn clear_scalar_field(state: &mut [u8], row_off: u32, field_idx: u8) {
         state[(row_off + u32::from(field_idx) / 8) as usize] &= !(1u8 << (field_idx % 8));
     }
     //#endregion reduce-typed-state.scatter-clear
 
-    /// Clear the row's presence bitset.
+    /// Clear the row's presence bitset without journaling.
     pub fn clear_bitset(&self, state: &mut [u8], row_off: u32) {
         bytes::zero(state, row_off, self.bitset_bytes);
     }
 
-    /// Insert or find `key`, tracking size. `None` means sentinel key, probe
-    /// exhaustion, or load factor exceeded.
-    pub fn upsert(&self, state: &mut [u8], key: u32) -> Option<Upsert> {
+    /// Plan one insertion without changing the table. The returned position
+    /// is reused by the writer and journal; no second probe is necessary.
+    pub(crate) fn plan_upsert(&self, state: &[u8], key: u32) -> Option<Upsert> {
         let probe = self.find_insert(state, key)?;
-        if !probe.found {
-            if self.size(state) >= self.max_load() {
-                return None;
-            }
-            bytes::write_u32(state, self.keys_off + probe.pos * 4, key);
-            let size = self.size(state);
-            self.set_size(state, size + 1);
+        if !probe.found && self.size(state) >= self.max_load() {
+            return None;
         }
         Some(Upsert {
             pos: probe.pos,
@@ -319,9 +384,26 @@ impl StructMapSlot {
         })
     }
 
+    /// Apply a position planned against this unchanged table.
+    pub(crate) fn apply_upsert(&self, state: &mut [u8], key: u32, planned: Upsert) {
+        if planned.is_new {
+            self.set_key_at(state, planned.pos, key);
+            self.set_size(state, self.size(state) + 1);
+        }
+    }
+
+    /// Insert or find `key`, tracking size. `None` means sentinel key, probe
+    /// exhaustion, or load factor exceeded.
+    /// Unjournaled; this raw storage operation does not participate in VM undo.
+    pub fn upsert(&self, state: &mut [u8], key: u32) -> Option<Upsert> {
+        let planned = self.plan_upsert(state, key)?;
+        self.apply_upsert(state, key, planned);
+        Some(planned)
+    }
+
     /// Stamp `key`'s cell as a TOMBSTONE and decrement size, returning the
-    /// vacated position. The row payload is left to the caller (rollback
-    /// clears the bitset); the same shape as [`StructMap2Slot::remove`].
+    /// vacated position. The row payload is left to the caller. Unjournaled;
+    /// speculative callers capture the actual bytes before invoking it.
     pub fn remove(&self, state: &mut [u8], key: u32) -> Option<u32> {
         let pos = self.find(state, key)?;
         self.set_key_at(state, pos, TOMBSTONE);
@@ -329,8 +411,88 @@ impl StructMapSlot {
         Some(pos)
     }
 
+    /// Borrow a present arena field. The borrow cannot outlive a mutation, growth,
+    /// restore or fork replacement of the state image. VO bytes are opaque here.
+    pub fn arena_field<'a>(
+        &self,
+        state: &'a [u8],
+        pos: u32,
+        field_idx: u8,
+    ) -> Result<Option<&'a [u8]>, ErrorCode> {
+        if pos >= self.capacity || field_idx >= self.num_fields {
+            return Err(ErrorCode::InvalidProgram);
+        }
+        let descriptor_end = self
+            .field_types_off
+            .checked_add(u32::from(self.num_fields))
+            .ok_or(ErrorCode::InvalidState)?;
+        let descriptor = state
+            .get(self.field_types_off as usize..descriptor_end as usize)
+            .ok_or(ErrorCode::InvalidState)?;
+        let field_type = StructFieldType::from_u8(descriptor[usize::from(field_idx)])
+            .ok_or(ErrorCode::InvalidState)?;
+        if !is_arena_field_type(field_type) {
+            return Err(ErrorCode::InvalidProgram);
+        }
+        let row = self
+            .rows_base
+            .checked_add(
+                pos.checked_mul(self.row_size)
+                    .ok_or(ErrorCode::InvalidState)?,
+            )
+            .ok_or(ErrorCode::InvalidState)?;
+        let bit_off = row
+            .checked_add(u32::from(field_idx) / 8)
+            .ok_or(ErrorCode::InvalidState)?;
+        let bit = state.get(bit_off as usize).ok_or(ErrorCode::InvalidState)?;
+        if bit & (1 << (field_idx % 8)) == 0 {
+            return Ok(None);
+        }
+        let mut field_offset = self.bitset_bytes;
+        for &kind in &descriptor[..usize::from(field_idx)] {
+            let kind = StructFieldType::from_u8(kind).ok_or(ErrorCode::InvalidState)?;
+            field_offset = field_offset
+                .checked_add(struct_field_size(kind))
+                .ok_or(ErrorCode::InvalidState)?;
+        }
+        if field_offset
+            .checked_add(8)
+            .is_none_or(|end| end > self.row_size)
+        {
+            return Err(ErrorCode::InvalidState);
+        }
+        let field = row
+            .checked_add(field_offset)
+            .ok_or(ErrorCode::InvalidState)?;
+        let cell_end = field.checked_add(8).ok_or(ErrorCode::InvalidState)?;
+        let cell = state
+            .get(field as usize..cell_end as usize)
+            .ok_or(ErrorCode::InvalidState)?;
+        let rows_end = self
+            .rows_base
+            .checked_add(
+                self.capacity
+                    .checked_mul(self.row_size)
+                    .ok_or(ErrorCode::InvalidState)?,
+            )
+            .ok_or(ErrorCode::InvalidState)?;
+        if self.arena_header_off < rows_end {
+            return Err(ErrorCode::InvalidState);
+        }
+        let arena = ArenaRegion::bind(state, self.arena_header_off)?;
+        arena
+            .bytes(
+                state,
+                bytes::read_u32(cell, 0),
+                bytes::read_u32(cell, 4),
+                arena_elem_size(field_type),
+            )
+            .map(Some)
+    }
+
     /// Write one scalar field from a raw little-endian column into the row,
     /// setting its bitset bit. Array fields are handled by the arena path.
+    /// Unjournaled; the caller owns or has captured the row bytes.
     pub fn write_scalar_field(
         &self,
         state: &mut [u8],
@@ -487,14 +649,11 @@ impl StructMap2Slot {
         )
     }
 
-    pub fn upsert(&self, state: &mut [u8], key1: u32, key2: u32) -> Option<Upsert> {
+    /// Plan one exact-pair insertion without changing the table.
+    pub(crate) fn plan_upsert(&self, state: &[u8], key1: u32, key2: u32) -> Option<Upsert> {
         let probe = self.find_insert(state, key1, key2)?;
-        if !probe.found {
-            if self.size(state) >= self.max_load() {
-                return None;
-            }
-            self.set_keys_at(state, probe.pos, key1, key2);
-            self.set_size(state, self.size(state) + 1);
+        if !probe.found && self.size(state) >= self.max_load() {
+            return None;
         }
         Some(Upsert {
             pos: probe.pos,
@@ -502,6 +661,22 @@ impl StructMap2Slot {
         })
     }
 
+    /// Apply the same position used to capture the actual prior row bytes.
+    pub(crate) fn apply_upsert(&self, state: &mut [u8], key1: u32, key2: u32, planned: Upsert) {
+        if planned.is_new {
+            self.set_keys_at(state, planned.pos, key1, key2);
+            self.set_size(state, self.size(state) + 1);
+        }
+    }
+
+    /// Upsert an exact key pair without journaling these caller-owned bytes.
+    pub fn upsert(&self, state: &mut [u8], key1: u32, key2: u32) -> Option<Upsert> {
+        let planned = self.plan_upsert(state, key1, key2)?;
+        self.apply_upsert(state, key1, key2, planned);
+        Some(planned)
+    }
+
+    /// Remove an exact key pair without journaling these caller-owned bytes.
     pub fn remove(&self, state: &mut [u8], key1: u32, key2: u32) -> Option<u32> {
         let pos = self.find(state, key1, key2)?;
         self.tombstone_at(state, pos);
@@ -531,10 +706,12 @@ impl StructMap2Slot {
         off
     }
 
+    /// Clear the row presence bitset without journaling.
     pub fn clear_bitset(&self, state: &mut [u8], row_off: u32) {
         bytes::zero(state, row_off, self.bitset_bytes);
     }
 
+    /// Write a scalar field and its presence bit without journaling.
     pub fn write_scalar_field(
         &self,
         state: &mut [u8],

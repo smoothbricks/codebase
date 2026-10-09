@@ -10,13 +10,11 @@ use columine_types::types::{
 };
 use columine_vm::bytes;
 use columine_vm::state_init::{
-    ARENA_HEADER_SIZE, calculate_grown_state_size, calculate_state_size, grow_state, init_state,
-    needs_growth_slot, struct_field_offset,
+    ARENA_HEADER_SIZE, DEFAULT_ACCEPTED_PROGRAM_MAGICS, ProgramInvalidCause,
+    calculate_grown_state_size, calculate_state_size, grow_state, init_state, needs_growth_slot,
+    struct_field_offset,
 };
-use columine_vm::vm::{
-    Vm, f64s_as_bytes, u32s_as_bytes, vm_struct_map_get_row_ptr, vm_struct_map_iter_key,
-    vm_struct_map_iter_next, vm_struct_map_iter_start,
-};
+use columine_vm::vm::{CheckedStructMap, Vm, f64s_as_bytes, u32s_as_bytes};
 
 const OK: u32 = ErrorCode::Ok as u32;
 const INVALID_PROGRAM: u32 = ErrorCode::InvalidProgram as u32;
@@ -58,7 +56,8 @@ fn init(prog: &[u8]) -> Vec<u8> {
     let size = calculate_state_size(
         prog,
         columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
-    );
+    )
+    .expect("valid program admission");
     assert!(size > 0);
     let mut state = vec![0u8; size as usize];
     init_state(
@@ -76,25 +75,29 @@ fn assert_delta_roundtrip(vm: &mut Vm, before: &[u8], after: &[u8], checkpoint: 
         end > checkpoint,
         "mutation must emit paired journal entries"
     );
-    assert_eq!(vm.delta_export_segment(checkpoint, end), end - checkpoint,);
+    assert_eq!(
+        Ok(end - checkpoint),
+        vm.delta_export_segment(checkpoint, end)
+    );
     let undo = vm.delta_export_undo_bytes();
     let redo = vm.delta_export_redo_bytes();
 
     let mut production = after.to_vec();
-    vm.undo_rollback(&mut production, checkpoint);
+    vm.undo_rollback(&mut production, checkpoint)
+        .expect("valid checkpoint");
     assert_eq!(production, before);
 
     let mut replay = Vm::default();
     let mut rolled_back = after.to_vec();
-    replay.delta_apply_rollback_segment(&mut rolled_back, &undo, Vm::delta_export_entry_size());
+    replay
+        .delta_apply_rollback_segment(&mut rolled_back, &undo, Vm::delta_export_entry_size())
+        .expect("valid undo segment");
     assert_eq!(rolled_back, before);
 
     let mut rolled_forward = before.to_vec();
-    replay.delta_apply_rollforward_segment(
-        &mut rolled_forward,
-        &redo,
-        Vm::delta_export_entry_size(),
-    );
+    replay
+        .delta_apply_rollforward_segment(&mut rolled_forward, &redo, Vm::delta_export_entry_size())
+        .expect("valid redo segment");
     assert_eq!(rolled_forward, after);
 }
 
@@ -117,21 +120,10 @@ fn slot_cap(state: &[u8], slot: u8) -> u32 {
     meta_u32(state, slot, SlotMetaOffset::CAPACITY)
 }
 
-fn struct_map_row(state: &[u8], slot: u8, key: u32) -> u32 {
-    let meta_base = STATE_HEADER_SIZE + u32::from(slot) * SLOT_META_SIZE;
-    let num_fields = u32::from(state[(meta_base + SlotMetaOffset::AGG_TYPE) as usize]);
-    let row_size = u32::from(bytes::read_u16(
-        state,
-        meta_base + SlotMetaOffset::TTL_SECONDS,
-    ));
-    vm_struct_map_get_row_ptr(
-        state,
-        slot_offset(state, slot),
-        slot_cap(state, slot),
-        num_fields,
-        row_size,
-        key,
-    )
+fn struct_map_row(state: &[u8], slot: u8, key: u32) -> Option<u32> {
+    CheckedStructMap::bind(state, u32::from(slot))
+        .expect("actual struct geometry")
+        .row(key)
 }
 
 #[test]
@@ -148,15 +140,23 @@ fn unknown_and_truncated_block_opcodes_reject_before_mutation_or_undo() {
     let values = [42u32];
     let cols: Vec<&[u8]> = vec![u32s_as_bytes(&types), u32s_as_bytes(&values)];
 
+    // The state comes from the same declarations with no reduce code: admission
+    // refuses the malformed program before any state exists, and execution of
+    // it against a valid state still refuses before mutation or journaling.
+    let layout = init(&program(1, 2, &init_code, &[]));
     for body in [
         vec![Opcode::ListAppend as u8, 0, 1, 0xfe],
         vec![Opcode::ListAppend as u8, 0],
     ] {
         let prog = program(1, 2, &init_code, &for_each(TYPE_A, &body));
-        let mut state = init(&prog);
+        assert_eq!(
+            calculate_state_size(&prog, DEFAULT_ACCEPTED_PROGRAM_MAGICS),
+            Err(ProgramInvalidCause::MalformedProgram)
+        );
+        let mut state = layout.clone();
         let before = state.clone();
         let mut vm = Vm::default();
-        vm.undo_enable(&state);
+        vm.undo_enable(&state).expect("undo window opens");
         let checkpoint = vm.undo_checkpoint();
 
         assert_eq!(
@@ -179,10 +179,14 @@ fn truncated_top_level_opcode_rejects_before_mutation_or_undo() {
         0,
     ];
     let prog = program(1, 0, &init_code, &[Opcode::BatchMapUpsertLatest as u8, 0]);
-    let mut state = init(&prog);
+    assert_eq!(
+        calculate_state_size(&prog, DEFAULT_ACCEPTED_PROGRAM_MAGICS),
+        Err(ProgramInvalidCause::MalformedProgram)
+    );
+    let mut state = init(&program(1, 0, &init_code, &[]));
     let before = state.clone();
     let mut vm = Vm::default();
-    vm.undo_enable(&state);
+    vm.undo_enable(&state).expect("undo window opens");
     let checkpoint = vm.undo_checkpoint();
 
     assert_eq!(
@@ -208,7 +212,7 @@ fn unknown_block_scalar_subtype_rejects_before_mutation_or_undo() {
     state[(STATE_HEADER_SIZE + SlotMetaOffset::AGG_TYPE) as usize] = 7;
     let before = state.clone();
     let mut vm = Vm::default();
-    vm.undo_enable(&state);
+    vm.undo_enable(&state).expect("undo window opens");
     let checkpoint = vm.undo_checkpoint();
 
     let types = [TYPE_A];
@@ -231,10 +235,9 @@ fn unknown_block_scalar_subtype_rejects_before_mutation_or_undo() {
 
 #[test]
 fn flat_map_plus_event_level_agg_sum_in_same_for_each_block() {
-    // Slot 0 is STRUCT_MAP and slot 1 is AGGREGATE SUM. The initializer's
-    // type byte 0 selects the aggregate defaulting behavior.
+    // Slot 0 is STRUCT_MAP and slot 1 explicitly declares AGGREGATE SUM.
     let mut init_sec = vec![0x18, 0, 6, 4, 0, 2, 0, 4];
-    init_sec.extend([0x10, 1, 2, 0, 0]);
+    init_sec.extend([0x10, 1, 2, 1, 0]);
 
     let inner = [0x80u8, 0, 3, 2, 4, 0, 5, 1, 0];
     let mut body = vec![0x40, 1, 2]; // AGG_SUM slot=1 val_col=2
@@ -272,7 +275,7 @@ fn flat_map_plus_event_level_agg_sum_in_same_for_each_block() {
 
 #[test]
 fn nested_flat_map_depth_2_groups_items_struct_map() {
-    let init_sec = [0x18u8, 0, 0x05, 4, 0, 2, 0, 4];
+    let init_sec = [0x18u8, 0, 0x06, 4, 0, 2, 0, 4];
     let leaf = [0x80u8, 0, 3, 2, 4, 0, 5, 1, 0];
     let inner_fm = flat_map(2, NO_PARENT_TS_COL, &leaf);
     let outer_fm = flat_map(1, NO_PARENT_TS_COL, &inner_fm);
@@ -299,8 +302,7 @@ fn nested_flat_map_depth_2_groups_items_struct_map() {
 
     assert_eq!(3, slot_size(&state, 0));
     for (key, v0) in [(100u32, 10u32), (200, 20), (300, 30)] {
-        let row = struct_map_row(&state, 0, key);
-        assert_ne!(0xFFFF_FFFF, row);
+        let row = struct_map_row(&state, 0, key).expect("inserted row");
         assert_eq!(v0, bytes::read_u32(&state, row + 1));
     }
 }
@@ -354,7 +356,7 @@ fn flat_map_latest_parent_timestamp_overrides_child_ts_col() {
 
 ///  `buildScalarListTestProgram`.
 fn build_scalar_list_program(type_id: u32) -> Vec<u8> {
-    let init_sec = [0x19u8, 0, 6, 8, 0, 0]; // SLOT_ORDERED_LIST, elem UINT32
+    let init_sec = [0x19u8, 0, 7, 8, 0, 0]; // SLOT_ORDERED_LIST, elem UINT32
     let body = [0x84u8, 0, 1];
     program(1, 2, &init_sec, &for_each(type_id, &body))
 }
@@ -446,7 +448,7 @@ fn ordered_list_scalar_payload_delta_roundtrip() {
     assert_eq!(OK, vm.execute_batch(&mut state, &prog, &cols, 2));
     let before = state.clone();
 
-    vm.undo_enable(&state);
+    vm.undo_enable(&state).expect("undo window opens");
     let checkpoint = vm.undo_checkpoint();
     let next_types = [TYPE_A];
     let next_values = [0xaabb_ccddu32];
@@ -481,7 +483,7 @@ fn ordered_list_struct_payload_delta_roundtrip() {
     assert_eq!(OK, vm.execute_batch(&mut state, &prog, &first_cols, 1));
     let before = state.clone();
 
-    vm.undo_enable(&state);
+    vm.undo_enable(&state).expect("undo window opens");
     let checkpoint = vm.undo_checkpoint();
     let second_types = [TYPE_A];
     let second_a = [0x99aa_bbccu32];
@@ -521,7 +523,7 @@ fn ordered_list_inside_flat_map() {
     let mut state = init(&prog);
     let mut vm = Vm::default();
     let before = state.clone();
-    vm.undo_enable(&state);
+    vm.undo_enable(&state).expect("undo window opens");
     let checkpoint = vm.undo_checkpoint();
 
     let types = [TYPE_A, TYPE_A];
@@ -539,6 +541,42 @@ fn ordered_list_inside_flat_map() {
     assert_eq!(10, bytes::read_u32(&state, off));
     assert_eq!(20, bytes::read_u32(&state, off + 4));
     assert_eq!(30, bytes::read_u32(&state, off + 8));
+    let after = state.clone();
+    assert_delta_roundtrip(&mut vm, &before, &after, checkpoint);
+}
+
+#[test]
+fn ordered_list_scalar_stale_dead_tail_rolls_back_to_full_image() {
+    let prog = build_scalar_list_program(TYPE_A);
+    let mut state = init(&prog);
+    let mut vm = Vm::default();
+    let types = [TYPE_A, TYPE_A];
+    let vals = [100u32, 200];
+    let cols: Vec<&[u8]> = vec![u32s_as_bytes(&types), u32s_as_bytes(&vals)];
+    assert_eq!(OK, vm.execute_batch(&mut state, &prog, &cols, 2));
+
+    // Dead tail: allocated capacity past the live size holds stale nonzero
+    // values, including the cell the next append overwrites.
+    let off = slot_offset(&state, 0);
+    for index in [2u32, 5] {
+        bytes::write_u32(&mut state, off + index * 4, 0xCAFE_0000 | index);
+    }
+    let before = state.clone();
+
+    vm.undo_enable(&state).expect("undo window opens");
+    let checkpoint = vm.undo_checkpoint();
+    let next_types = [TYPE_A];
+    let next_values = [0xaabb_ccddu32];
+    let next_cols: Vec<&[u8]> = vec![u32s_as_bytes(&next_types), u32s_as_bytes(&next_values)];
+    assert_eq!(OK, vm.execute_batch_delta(&mut state, &prog, &next_cols, 1));
+    assert_eq!(3, slot_size(&state, 0));
+    assert_eq!(0xaabb_ccdd, bytes::read_u32(&state, off + 8));
+    assert_eq!(
+        0xCAFE_0005,
+        bytes::read_u32(&state, off + 20),
+        "an untouched dead tail survives the append"
+    );
+
     let after = state.clone();
     assert_delta_roundtrip(&mut vm, &before, &after, checkpoint);
 }
@@ -569,15 +607,13 @@ fn struct_map_iteration() {
     ];
     assert_eq!(OK, vm.execute_batch(&mut state, &prog, &cols, 3));
 
-    let off = slot_offset(&state, 0);
-    let cap = slot_cap(&state, 0);
-    let num_fields = u32::from(state[(STATE_HEADER_SIZE + SlotMetaOffset::AGG_TYPE) as usize]);
+    let view = CheckedStructMap::bind(&state, 0).expect("actual struct geometry");
 
     let mut found = Vec::new();
-    let mut pos = vm_struct_map_iter_start(&state, off, cap, num_fields);
-    while pos < cap {
-        found.push(vm_struct_map_iter_key(&state, off, num_fields, pos));
-        pos = vm_struct_map_iter_next(&state, off, cap, num_fields, pos);
+    let mut pos = view.iter_start();
+    while pos < view.capacity() {
+        found.push(view.iter_key(pos).expect("live iteration cell"));
+        pos = view.iter_next(pos).expect("valid iterator");
     }
     assert_eq!(3, found.len());
     for key in [100, 200, 300] {
@@ -616,21 +652,19 @@ fn struct_map_growth_preserves_entries() {
         vm.execute_batch(&mut state, &prog, &cols12, 1)
     );
 
-    let grown_size = calculate_grown_state_size(&state, 0);
+    let grown_size = calculate_grown_state_size(&state, 0).expect("valid growth geometry");
     let mut new_state = vec![0u8; grown_size as usize];
     grow_state(&state, &mut new_state, 0).expect("grow_state");
 
     assert_eq!(32, slot_cap(&new_state, 0));
     for i in 0..11u32 {
-        let row = struct_map_row(&new_state, 0, i + 1000);
-        assert_ne!(0xFFFF_FFFF, row);
+        let row = struct_map_row(&new_state, 0, i + 1000).expect("grown committed row");
         assert_eq!(i * 10, bytes::read_u32(&new_state, row + 1));
         assert_eq!(i + 5000, bytes::read_u32(&new_state, row + 5));
     }
 
     assert_eq!(OK, vm.execute_batch(&mut new_state, &prog, &cols12, 1));
-    let row12 = struct_map_row(&new_state, 0, 2000);
-    assert_ne!(0xFFFF_FFFF, row12);
+    let row12 = struct_map_row(&new_state, 0, 2000).expect("new row after growth");
     assert_eq!(999, bytes::read_u32(&new_state, row12 + 1));
 }
 
@@ -662,8 +696,7 @@ fn read_array_row(state: &[u8], key: u32) -> ArrayRow {
     let off = slot_offset(state, 0);
     let num_fields = state[(meta_base + SlotMetaOffset::AGG_TYPE) as usize];
     let descriptor = &state[off as usize..(off + u32::from(num_fields)) as usize];
-    let row = struct_map_row(state, 0, key);
-    assert_ne!(0xFFFF_FFFF, row, "row for key {key} missing");
+    let row = struct_map_row(state, 0, key).expect("array row must exist");
     assert_ne!(0, state[row as usize] & (1 << 1), "array field is unset");
     let scalar_off = struct_field_offset(num_fields, descriptor, 0);
     let arr_off = struct_field_offset(num_fields, descriptor, 1);
@@ -829,7 +862,7 @@ fn struct_map_array_field_overwrite_last_wins_old_arena_data_abandoned() {
         assert_eq!(OK, vm.execute_batch(&mut state, &prog, &cols, 1));
     }
     let before = state.clone();
-    vm.undo_enable(&state);
+    vm.undo_enable(&state).expect("undo window opens");
     let checkpoint = vm.undo_checkpoint();
     {
         let types = [TYPE_A];
@@ -872,8 +905,8 @@ fn struct_map_array_field_overwrite_last_wins_old_arena_data_abandoned() {
 
 use columine_vm::meta::SlotMetaView;
 use columine_vm::nested::{
-    arena_header_offset, get_inner_offset, get_inner_set_size, inner_agg_get_count,
-    inner_agg_get_f64, inner_map_get, inner_set_contains, read_nested_prefix,
+    arena_data_offset, arena_header_offset, get_inner_offset, get_inner_set_size,
+    inner_agg_get_count, inner_agg_get_f64, inner_map_get, inner_set_contains, read_nested_prefix,
 };
 
 ///  `buildNestedSetE2EProgram`.
@@ -953,7 +986,7 @@ fn nested_set_delta_restores_outer_inner_arena_and_growth() {
     assert_eq!(bytes::read_u32(&state, arena_header + 4), 0);
 
     let mut vm = Vm::default();
-    vm.undo_enable(&state);
+    vm.undo_enable(&state).expect("undo window opens");
     let checkpoint = vm.undo_checkpoint();
     let distinct = 18u32;
     let types = vec![type_id; distinct as usize];
@@ -1023,7 +1056,7 @@ fn nested_map_update_delta_restores_prior_value_and_container_state() {
         &before,
         arena_header_offset(before_meta.offset, before_meta.capacity) + 4,
     );
-    vm.undo_enable(&state);
+    vm.undo_enable(&state).expect("undo window opens");
     let checkpoint = vm.undo_checkpoint();
     let second_values = [0xaabb_ccddu32];
     let second_cols: Vec<&[u8]> = vec![
@@ -1081,7 +1114,7 @@ fn nested_aggregate_delta_restores_prior_value_count_and_arena_pointer() {
     assert_eq!(inner_agg_get_f64(&before, before_inner), 11.75);
     assert_eq!(inner_agg_get_count(&before, before_inner, 1), 2);
 
-    vm.undo_enable(&state);
+    vm.undo_enable(&state).expect("undo window opens");
     let checkpoint = vm.undo_checkpoint();
     let values = [3.0f64];
     let cols: Vec<&[u8]> = vec![
@@ -1103,6 +1136,46 @@ fn nested_aggregate_delta_restores_prior_value_count_and_arena_pointer() {
         ),
         before_used,
     );
+    let after = state.clone();
+    assert_delta_roundtrip(&mut vm, &before, &after, checkpoint);
+}
+
+#[test]
+fn nested_set_insert_over_stale_arena_bytes_rolls_back_to_full_image() {
+    let type_id = 1u32;
+    let prog = build_nested_set_e2e_program(type_id);
+    let mut state = init(&prog);
+    let meta = SlotMetaView::read(&state, 0);
+
+    // Stale allocated arena bytes: nonzero words where inner sets are placed.
+    let arena_data = arena_data_offset(meta.offset, meta.capacity);
+    for word in 0..8u32 {
+        bytes::write_u32(&mut state, arena_data + word * 4, 0xD00D_0000 | word);
+    }
+    let before = state.clone();
+
+    let mut vm = Vm::default();
+    vm.undo_enable(&state).expect("undo window opens");
+    let checkpoint = vm.undo_checkpoint();
+    let distinct = 18u32;
+    let types = vec![type_id; distinct as usize];
+    let outer_keys = vec![77u32; distinct as usize];
+    let elems: Vec<u32> = (0..distinct).collect();
+    let cols: Vec<&[u8]> = vec![
+        u32s_as_bytes(&types),
+        u32s_as_bytes(&outer_keys),
+        u32s_as_bytes(&elems),
+    ];
+    assert_eq!(
+        OK,
+        vm.execute_batch_delta(&mut state, &prog, &cols, distinct)
+    );
+
+    let after_meta = SlotMetaView::read(&state, 0);
+    let inner = get_inner_offset(&state, &after_meta, 77);
+    assert_eq!(distinct, get_inner_set_size(&state, inner));
+    assert_ne!(before, state);
+
     let after = state.clone();
     assert_delta_roundtrip(&mut vm, &before, &after, checkpoint);
 }
@@ -1182,7 +1255,7 @@ fn ts_struct_map_upsert_first_keeps_first_row_and_rolls_back() {
         u32s_as_bytes(&child_qty),    // col 6: quantity (field 2)
     ];
     // Scenario runs the delta path with undo enabled — mirror it exactly.
-    vm.undo_enable(&state);
+    vm.undo_enable(&state).expect("undo window opens");
     let cp = vm.undo_checkpoint();
     assert_eq!(OK, vm.execute_batch_delta(&mut state, &prog, &cols, 1));
 
@@ -1192,10 +1265,7 @@ fn ts_struct_map_upsert_first_keeps_first_row_and_rolls_back() {
         let num_fields = state[(meta_base + SlotMetaOffset::AGG_TYPE) as usize];
         let descriptor: Vec<u8> =
             state[off as usize..(off + u32::from(num_fields)) as usize].to_vec();
-        let row = struct_map_row(state, 0, 42);
-        if row == 0xFFFF_FFFF {
-            return None;
-        }
+        let row = struct_map_row(state, 0, 42)?;
         let f0 = struct_field_offset(num_fields, &descriptor, 0);
         let f1 = struct_field_offset(num_fields, &descriptor, 1);
         let f2 = struct_field_offset(num_fields, &descriptor, 2);
@@ -1233,11 +1303,593 @@ fn ts_struct_map_upsert_first_keeps_first_row_and_rolls_back() {
     );
 
     // Rollback to the checkpoint erases the row (Scenario fork navigation).
-    vm.undo_rollback(&mut state, cp);
+    vm.undo_rollback(&mut state, cp).expect("valid checkpoint");
     vm.undo_commit();
     assert_eq!(
         None,
         read_row(&state),
         "rollback must remove the first-write row"
     );
+}
+
+// Element-family refusal proofs use a separate real COUNT reducer to fill the
+// journal without overflowing its window before the element body is attempted.
+fn element_refusal_programs(
+    kind: SlotType,
+    ttl: bool,
+    flattened: bool,
+    body: &[u8],
+) -> (Vec<u8>, Vec<u8>) {
+    let mut init_sec = vec![
+        Opcode::SlotDef as u8,
+        0,
+        kind as u8 | if ttl { 0x10 } else { 0 },
+    ];
+    init_sec.extend(512u16.to_le_bytes());
+    if ttl {
+        init_sec.extend(10.0f32.to_le_bytes());
+        init_sec.extend(0.0f32.to_le_bytes());
+        init_sec.extend([3, 0]); // timestamp column, no calendar alignment
+    }
+    init_sec.extend([
+        Opcode::SlotDef as u8,
+        1,
+        SlotType::Aggregate as u8,
+        AggType::Count as u8,
+        0,
+    ]);
+    let reduce = if flattened {
+        for_each(TYPE_A, &flat_map(5, NO_PARENT_TS_COL, body))
+    } else {
+        for_each(TYPE_A, body)
+    };
+    (
+        program(2, 6, &init_sec, &reduce),
+        program(2, 6, &init_sec, &[Opcode::BatchAggCount as u8, 1]),
+    )
+}
+
+fn execute_element_lane(
+    vm: &mut Vm,
+    state: &mut [u8],
+    prog: &[u8],
+    cols: &[&[u8]],
+    batch_len: u32,
+    delta: bool,
+) -> u32 {
+    if delta {
+        vm.execute_batch_delta(state, prog, cols, batch_len)
+    } else {
+        vm.execute_batch(state, prog, cols, batch_len)
+    }
+}
+
+fn fill_element_journal(
+    vm: &mut Vm,
+    state: &mut [u8],
+    count_prog: &[u8],
+    delta: bool,
+    remaining: u32,
+) {
+    let target = columine_vm::vm::UNDO_CAPACITY - remaining;
+    while vm.undo_checkpoint() < target {
+        assert_eq!(
+            OK,
+            execute_element_lane(vm, state, count_prog, &[], 1, delta)
+        );
+    }
+    assert_eq!(target, vm.undo_checkpoint());
+    assert!(
+        !vm.undo_status().overflow,
+        "filling must not poison the element attempt"
+    );
+}
+
+struct ElementRows<'a> {
+    keys: &'a [u32],
+    values: &'a [u32],
+    comparisons: &'a [f64],
+    predicates: &'a [u32],
+}
+
+fn execute_element_rows(
+    vm: &mut Vm,
+    state: &mut [u8],
+    prog: &[u8],
+    delta: bool,
+    flattened: bool,
+    input: ElementRows<'_>,
+) -> u32 {
+    let rows = u32::try_from(input.keys.len()).expect("test row count fits the VM");
+    let batch_len = if flattened { 1 } else { rows };
+    let types = vec![TYPE_A; usize::try_from(batch_len).expect("test batch fits memory")];
+    let offsets = [0u32, rows];
+    let cols = [
+        u32s_as_bytes(&types),
+        u32s_as_bytes(input.keys),
+        u32s_as_bytes(input.values),
+        f64s_as_bytes(input.comparisons),
+        u32s_as_bytes(input.predicates),
+        u32s_as_bytes(&offsets),
+    ];
+    execute_element_lane(vm, state, prog, &cols, batch_len, delta)
+}
+
+fn assert_element_exported_window(vm: &mut Vm, before: &[u8], after: &[u8], start: u32, end: u32) {
+    assert!(
+        end > start,
+        "the accepted window must contain actual mutations"
+    );
+    assert_eq!(Ok(end - start), vm.delta_export_segment(start, end));
+    assert!(
+        vm.delta_export_overflow(),
+        "refusal diagnostic must not erase the valid prefix"
+    );
+    let undo = vm.delta_export_undo_bytes();
+    let redo = vm.delta_export_redo_bytes();
+    let mut replay = Vm::default();
+    let mut backward = after.to_vec();
+    replay
+        .delta_apply_rollback_segment(&mut backward, &undo, Vm::delta_export_entry_size())
+        .expect("valid accepted-prefix undo");
+    assert_eq!(backward, before, "every allocated byte must undo");
+    let mut forward = before.to_vec();
+    replay
+        .delta_apply_rollforward_segment(&mut forward, &redo, Vm::delta_export_entry_size())
+        .expect("valid accepted-prefix redo");
+    assert_eq!(forward, after, "every allocated byte must redo");
+}
+
+#[test]
+fn element_upsert_arms_preserve_journal_overflow_cause() {
+    const JOURNAL_OVERFLOW: u32 = ErrorCode::JournalOverflow as u32;
+    const F64_CMP: u8 = columine_types::types::CmpType::F64 as u8;
+    const FRESH_KEY: u32 = 7;
+    const RETRY_KEY: u32 = 9;
+    // Body columns are the ones `element_refusal_programs` declares: 0 target
+    // slot, 1 key, 2 value, 3 f64 comparison/TTL, 4 u32 predicate. Each arm
+    // runs through FOR_EACH (flattened=false) and FLAT_MAP (flattened=true).
+    // Paired sibling opcodes share an arm and are listed separately.
+    const CASES: &[(&str, SlotType, bool, &[u8])] = &[
+        (
+            "MAP_UPSERT_LATEST",
+            SlotType::HashMap,
+            false,
+            &[Opcode::BatchMapUpsertLatest as u8, 0, 1, 2, 3, F64_CMP],
+        ),
+        (
+            "MAP_UPSERT_LATEST_TTL",
+            SlotType::HashMap,
+            true,
+            &[Opcode::BatchMapUpsertLatestTtl as u8, 0, 1, 2, 3, F64_CMP],
+        ),
+        (
+            "MAP_UPSERT_FIRST",
+            SlotType::HashMap,
+            false,
+            &[Opcode::BatchMapUpsertFirst as u8, 0, 1, 2],
+        ),
+        (
+            "MAP_UPSERT_LAST",
+            SlotType::HashMap,
+            false,
+            &[Opcode::BatchMapUpsertLast as u8, 0, 1, 2],
+        ),
+        (
+            "MAP_UPSERT_LAST_TTL",
+            SlotType::HashMap,
+            true,
+            &[Opcode::BatchMapUpsertLastTtl as u8, 0, 1, 2, 3],
+        ),
+        (
+            "MAP_UPSERT_MAX",
+            SlotType::HashMap,
+            false,
+            &[Opcode::BatchMapUpsertMax as u8, 0, 1, 2, 3, F64_CMP],
+        ),
+        (
+            "MAP_UPSERT_MIN",
+            SlotType::HashMap,
+            false,
+            &[Opcode::BatchMapUpsertMin as u8, 0, 1, 2, 3, F64_CMP],
+        ),
+        (
+            "MAP_UPSERT_LATEST_IF",
+            SlotType::HashMap,
+            false,
+            &[Opcode::BatchMapUpsertLatestIf as u8, 0, 1, 2, 3, F64_CMP, 4],
+        ),
+        (
+            "MAP_UPSERT_FIRST_IF",
+            SlotType::HashMap,
+            false,
+            &[Opcode::BatchMapUpsertFirstIf as u8, 0, 1, 2, 4],
+        ),
+        (
+            "MAP_UPSERT_LAST_IF",
+            SlotType::HashMap,
+            false,
+            &[Opcode::BatchMapUpsertLastIf as u8, 0, 1, 2, 4],
+        ),
+        (
+            "MAP_UPSERT_MAX_IF",
+            SlotType::HashMap,
+            false,
+            &[Opcode::BatchMapUpsertMaxIf as u8, 0, 1, 2, 3, F64_CMP, 4],
+        ),
+        (
+            "MAP_UPSERT_MIN_IF",
+            SlotType::HashMap,
+            false,
+            &[Opcode::BatchMapUpsertMinIf as u8, 0, 1, 2, 3, F64_CMP, 4],
+        ),
+        (
+            "SET_INSERT",
+            SlotType::HashSet,
+            false,
+            &[Opcode::BatchSetInsert as u8, 0, 1],
+        ),
+        (
+            "SET_INSERT_TTL",
+            SlotType::HashSet,
+            true,
+            &[Opcode::BatchSetInsertTtl as u8, 0, 1, 3],
+        ),
+        (
+            "SET_INSERT_IF",
+            SlotType::HashSet,
+            false,
+            &[Opcode::BatchSetInsertIf as u8, 0, 1, 4],
+        ),
+        (
+            "BITMAP_SET_INSERT",
+            SlotType::Bitmap,
+            false,
+            &[Opcode::BatchSetInsert as u8, 0, 1],
+        ),
+        (
+            "BITMAP_SET_INSERT_TTL",
+            SlotType::Bitmap,
+            true,
+            &[Opcode::BatchSetInsertTtl as u8, 0, 1, 3],
+        ),
+        (
+            "BITMAP_SET_INSERT_IF",
+            SlotType::Bitmap,
+            false,
+            &[Opcode::BatchSetInsertIf as u8, 0, 1, 4],
+        ),
+        (
+            "BITMAP_ADD",
+            SlotType::Bitmap,
+            false,
+            &[Opcode::BatchBitmapAdd as u8, 0, 1],
+        ),
+    ];
+
+    for &(label, kind, ttl, body) in CASES {
+        for flattened in [false, true] {
+            for delta in [false, true] {
+                let (target, count) = element_refusal_programs(kind, ttl, flattened, body);
+                let mut state = init(&target);
+                let mut vm = Vm::default();
+                vm.undo_enable(&state).expect("undo window opens");
+                let initial = state.clone();
+
+                // Four records of room remain. The root boundary reserves
+                // slots + derived flag (3) and is admitted; the family needs
+                // at least two records and must refuse.
+                fill_element_journal(&mut vm, &mut state, &count, delta, 4);
+                let checkpoint = vm.undo_checkpoint();
+                let accepted = state.clone();
+
+                let refused = execute_element_rows(
+                    &mut vm,
+                    &mut state,
+                    &target,
+                    delta,
+                    flattened,
+                    ElementRows {
+                        keys: &[FRESH_KEY],
+                        values: &[17],
+                        comparisons: &[42.0],
+                        predicates: &[1],
+                    },
+                );
+                assert_eq!(
+                    JOURNAL_OVERFLOW, refused,
+                    "{label} flattened={flattened} delta={delta}: family must refuse with JournalOverflow"
+                );
+                assert_eq!(
+                    accepted, state,
+                    "{label} flattened={flattened} delta={delta}: refusal wrote bytes"
+                );
+                assert_eq!(
+                    checkpoint,
+                    vm.undo_checkpoint(),
+                    "{label} flattened={flattened} delta={delta}: refusal moved the checkpoint"
+                );
+                assert!(
+                    vm.undo_status().overflow,
+                    "{label} flattened={flattened} delta={delta}: refusal must set the sticky diagnostic"
+                );
+
+                let retry = execute_element_rows(
+                    &mut vm,
+                    &mut state,
+                    &target,
+                    delta,
+                    flattened,
+                    ElementRows {
+                        keys: &[RETRY_KEY],
+                        values: &[18],
+                        comparisons: &[43.0],
+                        predicates: &[1],
+                    },
+                );
+                assert_eq!(
+                    JOURNAL_OVERFLOW, retry,
+                    "{label} flattened={flattened} delta={delta}: overflow must stay sticky"
+                );
+                assert_eq!(
+                    accepted, state,
+                    "{label} flattened={flattened} delta={delta}: sticky retry wrote bytes"
+                );
+                assert_eq!(
+                    checkpoint,
+                    vm.undo_checkpoint(),
+                    "{label} flattened={flattened} delta={delta}: sticky retry moved the checkpoint"
+                );
+
+                if delta {
+                    assert_element_exported_window(&mut vm, &initial, &accepted, 0, checkpoint);
+                }
+                vm.undo_rollback(&mut state, 0).expect("valid checkpoint");
+                assert_eq!(
+                    initial, state,
+                    "{label} flattened={flattened} delta={delta}: rollback to 0 must restore the initial image"
+                );
+                assert_eq!(0, vm.undo_checkpoint());
+
+                vm.undo_commit();
+                vm.undo_enable(&state).expect("undo window opens");
+                let fitting = execute_element_rows(
+                    &mut vm,
+                    &mut state,
+                    &target,
+                    delta,
+                    flattened,
+                    ElementRows {
+                        keys: &[FRESH_KEY],
+                        values: &[17],
+                        comparisons: &[42.0],
+                        predicates: &[1],
+                    },
+                );
+                assert_eq!(
+                    OK, fitting,
+                    "{label} flattened={flattened} delta={delta}: fitting same-family op must succeed after re-enable"
+                );
+                assert_ne!(
+                    initial, state,
+                    "{label} flattened={flattened} delta={delta}: fitting op must write"
+                );
+                assert!(!vm.undo_status().overflow);
+            }
+        }
+    }
+}
+
+#[test]
+fn nested_element_journal_overflow_retains_exact_accepted_prefix() {
+    // Real MAP_UPSERT_LAST (slot 0, key column 1, value column 2) over 128 fresh keys.
+    let body = [Opcode::BatchMapUpsertLast as u8, 0, 1, 2];
+    let keys: Vec<u32> = (1..=128).collect();
+    let values: Vec<u32> = (1000..1128).collect();
+    let comparisons = vec![0.0f64; keys.len()];
+    let predicates = vec![1u32; keys.len()];
+    let rows = keys.len();
+    for flattened in [false, true] {
+        for delta in [false, true] {
+            let (prog, count_prog) =
+                element_refusal_programs(SlotType::HashMap, false, flattened, &body);
+            let mut state = init(&prog);
+            let mut vm = Vm::default();
+            vm.undo_enable(&state).expect("undo window opens");
+            let initial = state.clone();
+            // The real COUNT reducer leaves the window 96 records short of its end.
+            fill_element_journal(&mut vm, &mut state, &count_prog, delta, 96);
+            let before = state.clone();
+            let checkpoint = vm.undo_checkpoint();
+
+            // 128 valid fresh keys in one body batch: the window runs out mid-batch.
+            let refused = execute_element_rows(
+                &mut vm,
+                &mut state,
+                &prog,
+                delta,
+                flattened,
+                ElementRows {
+                    keys: &keys,
+                    values: &values,
+                    comparisons: &comparisons,
+                    predicates: &predicates,
+                },
+            );
+            assert_eq!(ErrorCode::JournalOverflow as u32, refused);
+            let after = state.clone();
+            let end = vm.undo_checkpoint();
+            assert!(
+                end > checkpoint,
+                "the accepted prefix must journal its mutations"
+            );
+            assert!(vm.undo_status().overflow);
+
+            // The refusal is sticky: a retry neither writes nor journals.
+            let retry = execute_element_rows(
+                &mut vm,
+                &mut state,
+                &prog,
+                delta,
+                flattened,
+                ElementRows {
+                    keys: &keys,
+                    values: &values,
+                    comparisons: &comparisons,
+                    predicates: &predicates,
+                },
+            );
+            assert_eq!(ErrorCode::JournalOverflow as u32, retry);
+            assert_eq!(state, after, "the sticky refusal must not write");
+            assert_eq!(
+                vm.undo_checkpoint(),
+                end,
+                "the sticky refusal must not journal"
+            );
+
+            // Exactly one undo-off prefix from the same COUNT image reproduces the refusal.
+            let accepted_prefixes: Vec<usize> = (1..rows)
+                .filter(|&k| {
+                    let mut reference = before.clone();
+                    let mut reference_vm = Vm::default();
+                    let prefix = ElementRows {
+                        keys: &keys[..k],
+                        values: &values[..k],
+                        comparisons: &comparisons[..k],
+                        predicates: &predicates[..k],
+                    };
+                    let reference_result = execute_element_rows(
+                        &mut reference_vm,
+                        &mut reference,
+                        &prog,
+                        false,
+                        flattened,
+                        prefix,
+                    );
+                    assert_eq!(
+                        OK, reference_result,
+                        "a prefix of the body batch applies cleanly"
+                    );
+                    reference == after
+                })
+                .collect();
+            assert_eq!(
+                accepted_prefixes.len(),
+                1,
+                "exactly one prefix reproduces the refused image"
+            );
+
+            if delta {
+                // Replay every window before any live rollback touches the journal.
+                assert_element_exported_window(&mut vm, &initial, &before, 0, checkpoint);
+                assert_element_exported_window(&mut vm, &before, &after, checkpoint, end);
+                assert_element_exported_window(&mut vm, &initial, &after, 0, end);
+            }
+
+            vm.undo_rollback(&mut state, checkpoint)
+                .expect("the accepted-prefix checkpoint stays valid after overflow");
+            assert_eq!(
+                state, before,
+                "rollback to the checkpoint restores its image"
+            );
+            assert_eq!(vm.undo_checkpoint(), checkpoint);
+            vm.undo_rollback(&mut state, 0)
+                .expect("the origin checkpoint stays valid");
+            assert_eq!(
+                state, initial,
+                "rollback to the origin restores every allocated byte"
+            );
+            vm.undo_commit();
+        }
+    }
+}
+
+#[test]
+fn malformed_bitmap_element_preserves_invalid_state_cause() {
+    // BATCH_BITMAP_ADD (slot 0, element column 1) over one canonical BITMAP slot.
+    let body = [Opcode::BatchBitmapAdd as u8, 0, 1];
+    let keys = [7u32];
+    let values = [0u32];
+    let comparisons = [0.0f64];
+    let predicates = [1u32];
+    for flattened in [false, true] {
+        for delta in [false, true] {
+            let (prog, _) = element_refusal_programs(SlotType::Bitmap, false, flattened, &body);
+
+            // Control: the same program adds the element to the canonical image.
+            let mut clean = init(&prog);
+            let mut clean_vm = Vm::default();
+            clean_vm.undo_enable(&clean).expect("undo window opens");
+            let admitted = execute_element_rows(
+                &mut clean_vm,
+                &mut clean,
+                &prog,
+                delta,
+                flattened,
+                ElementRows {
+                    keys: &keys,
+                    values: &values,
+                    comparisons: &comparisons,
+                    predicates: &predicates,
+                },
+            );
+            assert_eq!(
+                OK, admitted,
+                "the canonical bitmap image accepts the element"
+            );
+
+            // Corrupt only the four native image-id bytes at the payload offset. Slot metadata
+            // and layout stay as initialised; the U64 id differs from the U32 id in one bit.
+            // Authoritative slot binding now refuses this payload before mutation;
+            // this proves element-loop cause propagation, not kernel preparation.
+            let mut state = init(&prog);
+            let meta = SlotMetaView::read(&state, 0);
+            let storage = columine_vm::bitmap_ops::get_bitmap_storage(&meta);
+            assert!(
+                storage.serialized_len(&state).is_ok(),
+                "fresh bitmap image is canonical"
+            );
+            let payload = storage.payload_offset() as usize;
+            state[payload..payload + bitmosaic::IMAGE_ID_LEN]
+                .copy_from_slice(&bitmosaic::EMPTY_U64_IMAGE);
+            assert_eq!(storage.serialized_len(&state), Err(ErrorCode::InvalidState));
+
+            let mut vm = Vm::default();
+            vm.undo_enable(&state).expect("undo window opens");
+            let baseline = state.clone();
+            let checkpoint = vm.undo_checkpoint();
+            let result = execute_element_rows(
+                &mut vm,
+                &mut state,
+                &prog,
+                delta,
+                flattened,
+                ElementRows {
+                    keys: &keys,
+                    values: &values,
+                    comparisons: &comparisons,
+                    predicates: &predicates,
+                },
+            );
+            assert_eq!(
+                ErrorCode::InvalidState as u32,
+                result,
+                "the bitmap prepare's InvalidState must reach the element caller"
+            );
+            assert_eq!(state, baseline, "a refused prepare writes no bytes");
+            assert_eq!(
+                vm.undo_checkpoint(),
+                checkpoint,
+                "a refused prepare journals nothing"
+            );
+            assert!(
+                !vm.undo_status().overflow,
+                "a malformed image is not a journal refusal"
+            );
+            assert!(
+                !vm.delta_export_overflow(),
+                "no overflow diagnostic may be exported"
+            );
+        }
+    }
 }

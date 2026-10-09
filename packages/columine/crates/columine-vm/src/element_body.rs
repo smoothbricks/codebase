@@ -311,6 +311,39 @@ pub(crate) fn walk_operands<S: OperandSink>(
             }
             &[]
         }
+        Opcode::BatchStructMapCountsFold => {
+            index(r, sink)?; // slot
+            index(r, sink)?; // key column
+            byte(r, sink)?; // VO field
+            index(r, sink)?; // init offsets
+            index(r, sink)?; // init bytes
+            index(r, sink)?; // count offset
+            let histograms = count(r, sink)?;
+            if histograms == 0 || histograms > crate::counts_fold::MAX_COUNTS_HISTOGRAMS {
+                return None;
+            }
+            for _ in 0..histograms {
+                index(r, sink)?;
+                byte(r, sink)?;
+                byte(r, sink)?;
+                index(r, sink)?;
+            }
+            let masks = count(r, sink)?;
+            if masks > crate::counts_fold::MAX_COUNTS_MASKS {
+                return None;
+            }
+            for _ in 0..masks {
+                index(r, sink)?;
+                index(r, sink)?;
+            }
+            let prefix_len = r.index()?;
+            if prefix_len == 0 {
+                return None;
+            }
+            sink.index(prefix_len);
+            raw(r, sink, usize::try_from(prefix_len).ok()?)?;
+            &[]
+        }
         Opcode::BatchStructMap2UpsertLast => {
             // slot, key1_col, key2_col, then the value pairs.
             for _ in 0..3 {
@@ -493,4 +526,94 @@ fn widen_body(body: &[u8], out: &mut Vec<u8>) -> Option<()> {
         pc = r.pos();
     }
     Some(())
+}
+
+/// Container nesting a source program may reach: a `FOR_EACH` or `FLAT_MAP`
+/// inside at most this many others. The input planner keeps the same bound.
+const MAX_SOURCE_NESTING: usize = 64;
+
+/// A source section that does not decode, or an instruction a caller refuses.
+/// Each caller turns it into its own refusal through `From`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct InvalidSource;
+
+/// One source instruction, as [`visit_source_ops`] reports it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SourceOp<'a> {
+    /// The instruction's opcode.
+    pub(crate) op: Opcode,
+    /// The body holding the instruction, borrowed from the program.
+    pub(crate) code: &'a [u8],
+    /// Where the instruction's operands start within `code`.
+    pub(crate) operands: usize,
+    /// Where the opcode sits: the section's base offset plus its offset
+    /// within `code`.
+    pub(crate) offset: usize,
+}
+
+/// Visit every instruction of the source section `code`, which starts at
+/// `base` in the program, in order. A `FOR_EACH` or `FLAT_MAP` is visited
+/// before the body it carries, and the walk enters that body in place. A
+/// section that does not decode, or nests past [`MAX_SOURCE_NESTING`], fails
+/// with `InvalidSource` converted into `E`. Instruction lengths come from
+/// [`body_op_len`], the shape authority the widened form also uses.
+pub(crate) fn visit_source_ops<'a, E: From<InvalidSource>>(
+    code: &'a [u8],
+    base: usize,
+    visit: &mut impl FnMut(SourceOp<'a>) -> Result<(), E>,
+) -> Result<(), E> {
+    visit_source_body(code, base, 0, visit)
+}
+
+fn visit_source_body<'a, E: From<InvalidSource>>(
+    code: &'a [u8],
+    base: usize,
+    nesting: usize,
+    visit: &mut impl FnMut(SourceOp<'a>) -> Result<(), E>,
+) -> Result<(), E> {
+    let mut pc = 0;
+    while pc < code.len() {
+        let op = Opcode::from_u8(code[pc]).ok_or(InvalidSource)?;
+        let len = body_op_len(code, pc).ok_or(InvalidSource)?;
+        visit(SourceOp {
+            op,
+            code,
+            operands: pc + 1,
+            offset: base.checked_add(pc).ok_or(InvalidSource)?,
+        })?;
+        if matches!(op, Opcode::ForEach | Opcode::FlatMap) {
+            let nesting = nesting + 1;
+            if nesting > MAX_SOURCE_NESTING {
+                return Err(InvalidSource.into());
+            }
+            let (start, body) = envelope_body(op, code, pc + 1).ok_or(InvalidSource)?;
+            let body_base = base.checked_add(start).ok_or(InvalidSource)?;
+            visit_source_body(body, body_base, nesting, visit)?;
+        }
+        pc = pc.checked_add(len).ok_or(InvalidSource)?;
+    }
+    Ok(())
+}
+
+/// The body a `FOR_EACH` or `FLAT_MAP` carries at `operands`, and where that
+/// body starts within `code`. The envelopes are `FOR_EACH: type_col,
+/// match_count, match_ids:u32 × match_count, body_len:u16, body` and
+/// `FLAT_MAP: offsets_col, parent_ts_col, body_len:u16, body`.
+fn envelope_body(op: Opcode, code: &[u8], operands: usize) -> Option<(usize, &[u8])> {
+    let mut r = Operands::at(code, operands);
+    match op {
+        Opcode::ForEach => {
+            r.index()?;
+            let count = r.index()?;
+            r.bytes(usize::try_from(count).ok()?.checked_mul(4)?)?;
+        }
+        Opcode::FlatMap => {
+            r.index()?;
+            r.index()?;
+        }
+        _ => return None,
+    }
+    let len = r.u16()?;
+    let start = r.pos();
+    Some((start, r.bytes(usize::from(len))?))
 }

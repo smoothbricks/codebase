@@ -1,7 +1,7 @@
 //! JSON extraction and typed-column diagnostics.
 
 use crate::{
-    ArrowType, ColumnValue, DynamicColumns, ExtractionConfig, ParseError, PlaneKind,
+    ArrowType, ColumnValue, DynamicColumns, ExtractionConfig, MemberSchema, ParseError, PlaneKind,
     SignalSchemaField,
     json_parser::{JsonParser, Token},
     validate::{SemanticSchema, encode_path_segment},
@@ -18,6 +18,10 @@ pub enum ExtractionError {
     MsgpackError,
     TooManyEvents,
     OutOfMemory,
+    /// A value-object frame the admission projected into the reader's
+    /// layout found no cell where the extractor writes its certified bytes;
+    /// storing the writer's layout instead would break the column's schema.
+    UnwrittenProjection,
 }
 
 /// Sentinel for an unset diagnostic field index.
@@ -137,6 +141,7 @@ impl ExtractionDiagnostic {
             ExtractionError::BufferOverflow
             | ExtractionError::TooManyEvents
             | ExtractionError::OutOfMemory => diagnostic_stage::COLUMN,
+            ExtractionError::UnwrittenProjection => diagnostic_stage::VALIDATION,
         };
         self.detail = match failure {
             ExtractionError::InvalidJson => diagnostic_detail::INVALID_JSON,
@@ -145,6 +150,7 @@ impl ExtractionDiagnostic {
             ExtractionError::MsgpackError => diagnostic_detail::INVALID_JSON,
             ExtractionError::TooManyEvents => diagnostic_detail::TOO_MANY_EVENTS,
             ExtractionError::OutOfMemory => diagnostic_detail::OUT_OF_MEMORY,
+            ExtractionError::UnwrittenProjection => diagnostic_detail::PAYLOAD_VIOLATION,
         };
     }
 }
@@ -375,14 +381,36 @@ fn extract_json_event_open(
     // discriminator key that sorts before `value` is always seen first; a
     // producer that spells `value` earlier resolves undiscriminated.
     let mut discriminant: Option<String> = None;
+    // A discriminator spelled `type` is the signal type itself: its string is
+    // owned once, in `event_type`, and this flag marks the discriminant as that
+    // same string rather than a second copy of it.
+    let mut discriminant_is_event_type = false;
+    // The signal type, which selects the schema nested payload members are
+    // routed by. A producer that spells `value` before `type` is looked ahead
+    // for it, so routing never depends on key order.
+    let mut event_type: Option<String> = None;
     while !parser.is_object_end() {
         let name = parser
             .expect_field_name()
             .map_err(|_| ExtractionError::InvalidJson)?;
-        if config.is_discriminator_key(name.as_bytes())
+        let is_type = name == "type";
+        if config.is_discriminator_key(name.as_bytes()) {
+            // A failed read consumes nothing (see `JsonParser::advance`), so one
+            // peek settles the discriminant and, spelled `type`, the signal type.
+            if let Ok(Token::String(value)) = parser.peek_token() {
+                if is_type {
+                    event_type = Some(value);
+                    discriminant_is_event_type = true;
+                } else {
+                    discriminant = Some(value);
+                }
+            }
+        } else if is_type
+            && config.semantic_schemas.is_some()
             && let Ok(Token::String(value)) = parser.peek_token()
         {
-            discriminant = Some(value);
+            // Only armed routing reads the signal type, so unarmed parsing never decodes it.
+            event_type = Some(value);
         }
         if saw_nested_value && name.starts_with("value.")
             || saw_flat_value_key && name == "value" && config.has_value_fields
@@ -411,9 +439,17 @@ fn extract_json_event_open(
             && matches!(parser.peek_token(), Ok(Token::ObjectBegin))
         {
             saw_nested_value = true;
+            if event_type.is_none() && config.semantic_schemas.is_some() {
+                event_type = lookahead_event_type(parser);
+            }
             parser
                 .expect_object_begin()
                 .map_err(|_| ExtractionError::InvalidJson)?;
+            let discriminant_name = if discriminant_is_event_type {
+                event_type.as_deref()
+            } else {
+                discriminant.as_deref()
+            };
             let mut column_name = String::with_capacity(32);
             while !parser.is_object_end() {
                 let member = parser
@@ -429,7 +465,8 @@ fn extract_json_event_open(
                     diagnostic,
                     &mut extra,
                     &mut extra_count,
-                    discriminant.as_deref(),
+                    discriminant_name,
+                    config.payload_member_schema(event_type.as_deref(), &member),
                     &column_name,
                     &member,
                 )?;
@@ -447,6 +484,13 @@ fn extract_json_event_open(
             &mut extra,
             &mut extra_count,
             None,
+            // A top-level key may be a system member (`id`, `type`, ...), so
+            // the event's schema only lends a declared member its capture
+            // schema here; it never diverts a top-level key to the carrier.
+            match config.payload_member_schema(event_type.as_deref(), &name) {
+                MemberSchema::Declared(schema) => MemberSchema::Declared(schema),
+                MemberSchema::Unjudged | MemberSchema::UndeclaredOpen => MemberSchema::Unjudged,
+            },
             &name,
             &name,
         )?;
@@ -489,6 +533,25 @@ fn extract_json_event_open(
     Ok(())
 }
 
+/// The string `type` member of the event whose nested `value` object the
+/// parser is positioned at, read from a clone so the real parser does not
+/// move. Only producers that spell `value` before `type` pay for it.
+fn lookahead_event_type(parser: &JsonParser<'_>) -> Option<String> {
+    let mut ahead = parser.clone();
+    ahead.skip_value().ok()?;
+    while !ahead.is_object_end() {
+        let key = ahead.expect_field_name().ok()?;
+        if key == "type" {
+            return match ahead.next_token().ok()? {
+                Token::String(value) => Some(value),
+                _ => None,
+            };
+        }
+        ahead.skip_value().ok()?;
+    }
+    None
+}
+
 /// Handle one named member of the event or its nested payload: a declared
 /// column extracts typed (with deep carrier capture below open paths), an
 /// unknown member captures into the bounded carrier when one is declared, and
@@ -511,16 +574,23 @@ fn extract_named_member(
     extra: &mut Option<MsgpackValueWriter<'_>>,
     extra_count: &mut u32,
     discriminant: Option<&str>,
+    member_schema: MemberSchema<'_>,
     column_name: &str,
     payload_name: &str,
 ) -> Result<(), ExtractionError> {
-    let lookup = config
-        .lookup_payload_member(discriminant, payload_name, column_name)
-        .filter(|lookup| Some(lookup.column) != config.fallback_column);
+    let lookup = match member_schema {
+        MemberSchema::UndeclaredOpen => None,
+        MemberSchema::Unjudged | MemberSchema::Declared(_) => {
+            config.lookup_payload_member(discriminant, payload_name, column_name)
+        }
+    }
+    .filter(|lookup| Some(lookup.column) != config.fallback_column);
     if let Some(lookup) = lookup {
-        let capture_schema = config
-            .semantic_field_schema(column_name)
-            .filter(|_| config.is_open_payload_path(payload_name));
+        let capture_schema = match member_schema {
+            MemberSchema::Declared(schema) => Some(schema),
+            MemberSchema::Unjudged | MemberSchema::UndeclaredOpen => None,
+        }
+        .filter(|_| config.is_open_payload_path(payload_name));
         let variants = config.enum_ordinals(discriminant, payload_name);
         let extraction_result = match (capture_schema, extra.as_mut()) {
             (Some(schema), Some(extra_writer)) => {
@@ -1404,6 +1474,35 @@ mod tests {
             ),
             Err(ExtractionError::InvalidFieldType)
         );
+        // `value` before `type`: the lookahead picks the payload schema, but the
+        // discriminant stays undiscriminated, so no enum ordinal resolves and the
+        // string is refused.
+        let mut columns = DynamicColumns::new(&fields, 2);
+        assert_eq!(
+            extract_json_events(
+                br#"[{"id":"e4","value":{"outcome":"stuck"},"type":"close"}]"#,
+                &config,
+                &mut columns,
+                &mut work,
+                &mut diagnostic,
+            ),
+            Err(ExtractionError::InvalidFieldType)
+        );
+        // An escaped `type` key is the same member: `\u0074ype` decodes to `type`,
+        // so it discriminates the payload exactly as the plain spelling does.
+        let mut columns = DynamicColumns::new(&fields, 2);
+        assert_eq!(
+            extract_json_events(
+                br#"[{"id":"e5","\u0074ype":"close","value":{"authorRole":"human","outcome":"stuck"}}]"#,
+                &config,
+                &mut columns,
+                &mut work,
+                &mut diagnostic,
+            ),
+            Ok(1)
+        );
+        assert_eq!(columns.cell(2, 0), Some(ColumnValue::Int(1)));
+        assert_eq!(columns.cell(3, 0), Some(ColumnValue::Int(0)));
     }
 
     #[test]
@@ -1872,14 +1971,18 @@ mod tests {
 
     #[test]
     fn nested_open_object_captures_path_keyed_unknown_without_typed_leak() {
-        let fields = [field(ArrowType::Binary), field(ArrowType::Binary)];
+        let fields = [
+            field(ArrowType::Utf8),
+            field(ArrowType::Binary),
+            field(ArrowType::Binary),
+        ];
         let schemas = crate::validate::parse_schema_envelope(
             br#"{"order":{"kind":"object","fields":{"user":{"kind":"object","fields":{"id":{"kind":"string"}},"open":true}}}}"#,
         )
         .unwrap();
         let config = crate::build_extraction_config_with_semantic_schemas(
             &fields,
-            &["value.user", crate::UNDECLARED_COLUMN_NAME],
+            &["type", "value.user", crate::UNDECLARED_COLUMN_NAME],
             Some(&schemas),
             None,
         )
@@ -1887,7 +1990,7 @@ mod tests {
         let mut columns = DynamicColumns::new(&fields, 1);
         let mut work = [0; 512];
         extract_json_events(
-            br#"[{"user":{"id":"u","nickname":"n"}}]"#,
+            br#"[{"type":"order","value":{"user":{"id":"u","nickname":"n"}}}]"#,
             &config,
             &mut columns,
             &mut work,
@@ -1895,17 +1998,144 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            columns.cell(0, 0),
+            columns.cell(1, 0),
             Some(ColumnValue::Binary(vec![
                 0xdf, 0, 0, 0, 1, 0xa2, b'i', b'd', 0xa1, b'u'
             ]))
         );
         assert_eq!(
-            columns.cell(1, 0),
+            columns.cell(2, 0),
             Some(ColumnValue::Binary(vec![
                 0xdf, 0, 0, 0, 1, 0xad, b'u', b's', b'e', b'r', b'.', b'n', b'i', b'c', b'k', b'n',
                 b'a', b'm', b'e', 0xa1, b'n'
             ]))
         );
+    }
+
+    /// Columns are shared across signal types, but a payload member is routed
+    /// by its own event's schema: an undeclared member of an open payload is
+    /// captured even when another signal type declares a column of that name,
+    /// whichever order the producer spells `type` and `value` in.
+    #[test]
+    fn undeclared_open_member_captures_instead_of_another_types_column() {
+        let fields = [
+            field(ArrowType::Utf8),
+            field(ArrowType::Utf8),
+            field(ArrowType::Binary),
+        ];
+        let schemas = crate::validate::parse_schema_envelope(
+            br#"{"a":{"kind":"object","fields":{},"open":true},"b":{"kind":"object","fields":{"note":{"kind":"string"}}}}"#,
+        )
+        .unwrap();
+        let config = crate::build_extraction_config_with_semantic_schemas(
+            &fields,
+            &["type", "value.note", crate::UNDECLARED_COLUMN_NAME],
+            Some(&schemas),
+            None,
+        )
+        .unwrap();
+        let captured_note = ColumnValue::Binary(vec![
+            0xdf, 0, 0, 0, 1, 0xa4, b'n', b'o', b't', b'e', 0xa1, b'x',
+        ]);
+        for input in [
+            &br#"[{"type":"a","value":{"note":"x"}}]"#[..],
+            &br#"[{"value":{"note":"x"},"type":"a"}]"#[..],
+            &br#"[{"\u0074ype":"a","value":{"note":"x"}}]"#[..],
+        ] {
+            let mut columns = DynamicColumns::new(&fields, 1);
+            let mut work = [0; 512];
+            extract_json_events(
+                input,
+                &config,
+                &mut columns,
+                &mut work,
+                &mut ExtractionDiagnostic::default(),
+            )
+            .unwrap();
+            assert_eq!(columns.cell(1, 0), None, "b's column stays empty");
+            assert_eq!(columns.cell(2, 0), Some(captured_note.clone()));
+        }
+        let mut columns = DynamicColumns::new(&fields, 1);
+        let mut work = [0; 512];
+        extract_json_events(
+            br#"[{"type":"b","value":{"note":"x"}}]"#,
+            &config,
+            &mut columns,
+            &mut work,
+            &mut ExtractionDiagnostic::default(),
+        )
+        .unwrap();
+        assert_eq!(columns.cell(1, 0), Some(ColumnValue::Utf8("x".into())));
+        assert_eq!(columns.cell(2, 0), None);
+    }
+
+    /// A malformed `type` value is refused on every route. A failed read consumes
+    /// nothing, so the read after it meets the same token: skipped, typed, or
+    /// discriminated, each reports `InvalidJson`.
+    #[test]
+    fn malformed_type_value_is_refused_on_every_route() {
+        let one = [field(ArrowType::Utf8)];
+        let two = [field(ArrowType::Utf8), field(ArrowType::Utf8)];
+        let five = [
+            field(ArrowType::Utf8),
+            field(ArrowType::Utf8),
+            field(ArrowType::Int32),
+            field(ArrowType::Int32),
+            field(ArrowType::Utf8),
+        ];
+        let schemas = crate::validate::parse_schema_envelope(
+            br#"{"a":{"kind":"object","fields":{},"open":true}}"#,
+        )
+        .unwrap();
+        let nested = crate::validate::parse_schema_envelope(
+            br#"{"close":{"kind":"object","fields":{"outcome":{"kind":"enum","variants":["achieved","stuck"]},"authorRole":{"kind":"enum","variants":["human"]}}},"open":{"kind":"object","fields":{"authorRole":{"kind":"nullable","value":{"kind":"string"}}}}}"#,
+        )
+        .unwrap();
+        let undeclared = config(&one, &["id"]);
+        let declared = config(&two, &["id", "type"]);
+        let armed = crate::build_extraction_config_with_semantic_schemas(
+            &two,
+            &["id", "type"],
+            Some(&schemas),
+            None,
+        )
+        .unwrap();
+        let discriminated = crate::build_extraction_config_with_semantic_schemas(
+            &five,
+            &[
+                "id",
+                "type",
+                "value.outcome",
+                "authorRole@close",
+                "authorRole@open",
+            ],
+            Some(&nested),
+            Some(&discriminator()),
+        )
+        .unwrap();
+        for input in [
+            &br#"[{"id":"e","type": :5}]"#[..],
+            &br#"[{"id":"e","type":-:5}]"#[..],
+        ] {
+            for (cfg, fields) in [
+                (&undeclared, &one[..]),
+                (&declared, &two[..]),
+                (&armed, &two[..]),
+                (&discriminated, &five[..]),
+            ] {
+                let mut columns = DynamicColumns::new(fields, 1);
+                let mut work = [0; 64];
+                assert_eq!(
+                    extract_json_events(
+                        input,
+                        cfg,
+                        &mut columns,
+                        &mut work,
+                        &mut ExtractionDiagnostic::default(),
+                    ),
+                    Err(ExtractionError::InvalidJson)
+                );
+            }
+        }
     }
 }

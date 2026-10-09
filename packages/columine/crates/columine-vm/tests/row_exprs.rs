@@ -3,14 +3,14 @@
 //! spliced into the batch so dispatch reads the derived column like input.
 
 use columine_types::PROGRAM_MAGIC;
-use columine_types::types::{EMPTY_KEY, ErrorCode};
+use columine_types::types::ErrorCode;
 use columine_vm::meta::SlotMetaView;
 use columine_vm::row_exprs::{
     BatchView, Binding, ROW_EXPRESSIONS_MAGIC, RowColumns, RowExpression, bind_row_columns,
 };
 use columine_vm::state_init::{DEFAULT_ACCEPTED_PROGRAM_MAGICS, calculate_state_size, init_state};
 use columine_vm::struct_map::StructMapSlot;
-use columine_vm::vm::{Vm, col_u32_exact, u32s_as_bytes, vm_map_get};
+use columine_vm::vm::{CheckedMap, Vm, col_u32_exact, u32s_as_bytes};
 
 const OK: u32 = ErrorCode::Ok as u32;
 
@@ -66,7 +66,8 @@ fn table(type_col: u8, entries: &[Vec<u8>]) -> Vec<u8> {
 }
 
 fn init(prog: &[u8]) -> Vec<u8> {
-    let size = calculate_state_size(prog, DEFAULT_ACCEPTED_PROGRAM_MAGICS);
+    let size = calculate_state_size(prog, DEFAULT_ACCEPTED_PROGRAM_MAGICS)
+        .expect("valid program admission");
     assert!(size > 0, "state size must be > 0");
     let mut state = vec![0u8; size as usize];
     init_state(&mut state, prog, DEFAULT_ACCEPTED_PROGRAM_MAGICS).expect("init_state");
@@ -109,9 +110,8 @@ fn threshold_expr(col: u8, threshold: u32) -> Vec<u8> {
     e
 }
 
-fn map_value(state: &[u8], key: u32) -> u32 {
-    let meta = SlotMetaView::read(state, 0);
-    vm_map_get(state, meta.offset, meta.capacity, key)
+fn map_value(state: &[u8], key: u32) -> Option<u32> {
+    CheckedMap::bind(state, 0).expect("valid map slot").get(key)
 }
 
 #[test]
@@ -151,10 +151,10 @@ fn derived_predicate_gates_the_upsert_and_unmatched_rows_stay_zero() {
 
     let mut vm = Vm::new(DEFAULT_ACCEPTED_PROGRAM_MAGICS);
     assert_eq!(vm.execute_batch(&mut state, &prog, &cols, 4), OK);
-    assert_eq!(map_value(&state, 1), EMPTY_KEY);
-    assert_eq!(map_value(&state, 2), 150);
-    assert_eq!(map_value(&state, 3), EMPTY_KEY);
-    assert_eq!(map_value(&state, 4), 101);
+    assert_eq!(map_value(&state, 1), None);
+    assert_eq!(map_value(&state, 2), Some(150));
+    assert_eq!(map_value(&state, 3), None);
+    assert_eq!(map_value(&state, 4), Some(101));
 }
 
 #[test]
@@ -409,14 +409,17 @@ impl RowExpression for Competes {
             .expect("key column")[row as usize];
         let val = col_u32_exact(batch.column(u32::from(expr[1])), batch.batch_len)
             .expect("value column")[row as usize];
-        let stored = map_value(batch.state, key);
-        Ok(u32::from(stored == EMPTY_KEY || val > stored))
+        let stored = CheckedMap::bind(batch.state, 0)?.get(key);
+        Ok(match stored {
+            None => 1,
+            Some(stored) => u32::from(val > stored),
+        })
     }
 }
 
 /// Run `keys`/`vals` as one batch of rows through the live path and answer
 /// the stored value of every key.
-fn run_live(prog: &[u8], state: &mut [u8], keys: &[u32], vals: &[u32]) -> Vec<u32> {
+fn run_live(prog: &[u8], state: &mut [u8], keys: &[u32], vals: &[u32]) -> Vec<Option<u32>> {
     let types = vec![ORDER_TYPE; keys.len()];
     let mut cols: Vec<&[u8]> = vec![
         u32s_as_bytes(&types),
@@ -474,7 +477,7 @@ fn a_live_entry_reads_the_state_the_rows_before_it_left() {
     for (k, v) in keys.iter().zip(&vals) {
         run_live(&prog, &mut many, &[*k], &[*v]);
     }
-    let expected = vec![70u32, 60];
+    let expected = vec![Some(70u32), Some(60)];
     assert_eq!(batched, expected);
     assert_eq!(
         vec![map_value(&many, 1), map_value(&many, 2)],
@@ -510,10 +513,10 @@ fn a_live_entry_gates_on_the_type_column_and_re_binds_per_batch() {
             OK
         );
     }
-    assert_eq!(map_value(&state, 1), 40);
+    assert_eq!(map_value(&state, 1), Some(40));
     assert_eq!(
         map_value(&state, 2),
-        EMPTY_KEY,
+        None,
         "the FOR_EACH never reaches the other type"
     );
 

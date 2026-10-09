@@ -4,7 +4,7 @@
 use columine_types::types::{EMPTY_KEY, TOMBSTONE, hash_key};
 use columine_types::types::{SLOT_META_SIZE, STATE_HEADER_SIZE, SlotMetaOffset};
 use columine_vm::bytes;
-use columine_vm::hash_table::{ENTRY_U32, FlatTable, hashmap_byte_size};
+use columine_vm::hash_table::{ENTRY_U32, ErasePlan, FlatTable, hashmap_byte_size};
 use columine_vm::hashmap_ops::{
     CmpType, Strategy, batch_map_remove, batch_map_upsert, bind_slot_map,
 };
@@ -25,11 +25,12 @@ fn tombstone(table: &FlatTable, state: &mut [u8], key: u32) -> bool {
 }
 
 #[inline(never)]
-fn backward_shift(table: &FlatTable, state: &mut [u8], key: u32) -> bool {
+fn backward_shift(table: &FlatTable, state: &mut [u8], plan: &mut ErasePlan, key: u32) -> bool {
     let Some(pos) = table.find(state, key) else {
         return false;
     };
-    table.erase_at(state, pos, |_, _, _| {});
+    table.plan_erase_at(state, pos, plan);
+    table.erase_planned(state, plan, |_, _, _| {});
     table.set_size(state, table.size(state) - 1);
     true
 }
@@ -43,11 +44,12 @@ fn new_table(cap: u32) -> (FlatTable, Vec<u8>) {
 fn differential(ops: &[(bool, u32, u32)]) -> Result<(), TestCaseError> {
     let (table, mut control) = new_table(128);
     let mut candidate = control.clone();
+    let mut plan = ErasePlan::default();
     for &(remove, key, value) in ops {
         if remove {
             prop_assert_eq!(
                 tombstone(&table, &mut control, key),
-                backward_shift(&table, &mut candidate, key)
+                backward_shift(&table, &mut candidate, &mut plan, key)
             );
         } else {
             prop_assert_eq!(
@@ -76,6 +78,7 @@ fn differential(ops: &[(bool, u32, u32)]) -> Result<(), TestCaseError> {
 
 fn order_witness() {
     let cap = 16;
+    let mut plan = ErasePlan::default();
     let keys: Vec<_> = (0..10_000)
         .filter(|&key| hash_key(key, cap) == cap - 1)
         .take(3)
@@ -86,7 +89,7 @@ fn order_witness() {
     }
     let mut candidate = control.clone();
     tombstone(&table, &mut control, keys[0]);
-    backward_shift(&table, &mut candidate, keys[0]);
+    backward_shift(&table, &mut candidate, &mut plan, keys[0]);
     let old_order: Vec<_> = table.iter_live(&control).collect();
     let new_order: Vec<_> = table.iter_live(&candidate).collect();
     let (table, mut reverse) = new_table(cap);
@@ -95,7 +98,7 @@ fn order_witness() {
     }
     let mut old_reverse = reverse.clone();
     tombstone(&table, &mut old_reverse, keys[0]);
-    backward_shift(&table, &mut reverse, keys[0]);
+    backward_shift(&table, &mut reverse, &mut plan, keys[0]);
     println!("order witness: keys={keys:?} old={old_order:?} new={new_order:?}");
     println!(
         "old-only forward/reverse byte equality: {}",
@@ -110,6 +113,7 @@ fn order_witness() {
 fn batch_order_witness() {
     let offset = STATE_HEADER_SIZE + SLOT_META_SIZE;
     let mut images = Vec::new();
+    let mut hooks = NoVm::default();
     for keys in [[3u32, 18, 24], [24, 18, 3]] {
         let mut state = vec![0u8; (offset + 16 * 8) as usize];
         bytes::write_u32(&mut state, STATE_HEADER_SIZE, offset);
@@ -128,14 +132,14 @@ fn batch_order_witness() {
             &values,
             None,
             CmpType::F64,
-            &mut NoVm,
+            &mut hooks,
         );
         assert_eq!(result, columine_types::types::ErrorCode::Ok);
         let mut shifted = state.clone();
         let table = bind_slot_map(&meta);
         tombstone(&table, &mut state, 3);
         meta.set_change_flag(&mut state, columine_types::types::ChangeFlag::REMOVED);
-        batch_map_remove(false, &mut shifted, &meta, 0, &[3], &mut NoVm);
+        batch_map_remove(false, &mut shifted, &meta, 0, &[3], &mut hooks);
         images.push((state, shifted));
     }
     println!(
@@ -151,6 +155,7 @@ fn churn(
     state: &mut [u8],
     live: &mut [u32],
     next: &mut u32,
+    plan: &mut ErasePlan,
     shift: bool,
     rounds: usize,
 ) -> u64 {
@@ -164,7 +169,7 @@ fn churn(
                 .expect("live key"),
         );
         if shift {
-            backward_shift(table, state, black_box(key));
+            backward_shift(table, state, plan, black_box(key));
         } else {
             tombstone(table, state, black_box(key));
         }
@@ -182,6 +187,7 @@ fn churn(
 }
 
 fn cells() {
+    let mut plan = ErasePlan::default();
     for cap in [16, 128, 1024] {
         let (table, mut initial) = new_table(cap);
         let count = (table.max_load() / 2) as usize;
@@ -206,6 +212,7 @@ fn cells() {
                         &mut control,
                         &mut control_keys,
                         &mut control_next,
+                        &mut plan,
                         false,
                         rounds,
                     )
@@ -215,6 +222,7 @@ fn cells() {
                         &mut candidate,
                         &mut candidate_keys,
                         &mut candidate_next,
+                        &mut plan,
                         true,
                         rounds,
                     )

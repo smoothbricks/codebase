@@ -169,9 +169,10 @@ fn shifted_array_members(odd_shift: bool, array_len: usize, seed: u64) -> Vec<u3
 fn seeded_slot(members: &[u32]) -> (Vec<u8>, SlotMetaView) {
     let (mut state, meta) = init_slot((members.len() * 2) as u32);
     let mut env = BitmapEnv::default();
+    let mut hooks = NoVm::default();
     assert_eq!(
         batch_bitmap_add(
-            &mut env, &mut NoVm, false, &mut state, &meta, 0, members, None
+            &mut env, &mut hooks, false, &mut state, &meta, members, None
         ),
         ErrorCode::Ok
     );
@@ -331,9 +332,10 @@ fn main() {
         };
         let (mut state, meta) = init_slot((cell.set * 2) as u32);
         let mut env = BitmapEnv::default();
+        let mut hooks = NoVm::default();
         assert_eq!(
             batch_bitmap_add(
-                &mut env, &mut NoVm, false, &mut state, &meta, 0, &members, None
+                &mut env, &mut hooks, false, &mut state, &meta, &members, None
             ),
             ErrorCode::Ok
         );
@@ -346,11 +348,9 @@ fn main() {
             let b0 = BYTES.load(Ordering::Relaxed);
             let t0 = Instant::now();
             let r = if cell.remove == timed {
-                batch_bitmap_remove(&mut env, &mut NoVm, false, &mut state, &meta, 0, &batch)
+                batch_bitmap_remove(&mut env, &mut hooks, false, &mut state, &meta, &batch)
             } else {
-                batch_bitmap_add(
-                    &mut env, &mut NoVm, false, &mut state, &meta, 0, &batch, None,
-                )
+                batch_bitmap_add(&mut env, &mut hooks, false, &mut state, &meta, &batch, None)
             };
             let dt = t0.elapsed().as_nanos();
             assert_eq!(r, ErrorCode::Ok);

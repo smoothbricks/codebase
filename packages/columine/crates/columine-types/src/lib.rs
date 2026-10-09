@@ -32,6 +32,7 @@ pub mod abort;
 pub mod audit_parser;
 pub mod operand;
 pub mod types;
+pub mod vo;
 pub mod wasm_abi;
 
 pub use types::*;

@@ -90,6 +90,17 @@ export enum StructFieldType {
   ARRAY_F64 = 7,
   ARRAY_STRING = 8,
   ARRAY_BOOL = 9,
+  /**
+   * Opaque value-object bytes: one logical scalar stored as a byte run in the
+   * slot arena. In-row geometry matches the arrays (8 bytes: arena-relative
+   * offset:u32 LE + length:u32 LE), element size 1, bytes retained verbatim.
+   * The VM verifies only arena geometry; frame and schema validation belong to
+   * the typed host above it. Admitted on STRUCT_MAP fields only and written by
+   * the CSR `(offsets_col, values_col, field_idx)` operands of 0x80–0x82.
+   * No layout version bump: geometry is unchanged, and a VM without this kind
+   * refuses the program at its closed field-kind admission.
+   */
+  VO = 10,
 }
 
 /**
@@ -134,13 +145,54 @@ export interface SlotTtlMetadata {
 // Program - compiled once per agent TYPE, immutable, shared
 // =============================================================================
 
+/** Opaque canonical VO1 definition evidence, encoded as lowercase hex. */
+export interface VoDefinitionMetadata {
+  readonly name: string;
+  readonly definition: string;
+}
+
+/** Schema evidence consumed by the injected native kernel, never a VO value. */
+export interface VoSchemaMetadata {
+  readonly root: string;
+  readonly frame: string;
+  readonly rows: readonly string[];
+  readonly profile: {
+    readonly records: readonly VoDefinitionMetadata[];
+    readonly attributes: readonly VoDefinitionMetadata[];
+  };
+  readonly retained?: readonly string[];
+}
+
+/** One logical VO field, bound to its canonical source schema. */
+export interface VoFieldLink {
+  readonly slot: number;
+  readonly fieldIdx: number;
+  readonly schema: VoSchemaMetadata;
+}
+
+/** Descriptor field roles of a counts instruction, not trusted byte offsets. */
+export interface VoCountsRole {
+  readonly instructionOffset: number;
+  readonly countField: number;
+  readonly histogramFields: readonly number[];
+  readonly maskFields: readonly number[];
+}
+
+/** Native admission metadata for one complete program. */
+export interface VoProgramMetadata {
+  readonly fields: readonly VoFieldLink[];
+  readonly counts: readonly VoCountsRole[];
+}
+
 export interface ReducerProgram {
   readonly bytecode: Uint8Array;
   readonly numSlots: number;
   readonly numInputs: number;
   readonly slotDefs: readonly SlotDef[];
+  readonly voProgramMetadata?: VoProgramMetadata;
 }
 
+/** TTL is admitted only on HASHMAP, HASHSET and BITMAP. */
 export type SlotDef =
   | { type: SlotType.HASHMAP; capacity: number; storesTimestamps: boolean; ttl?: SlotTtlMetadata }
   | { type: SlotType.HASHSET; capacity: number; ttl?: SlotTtlMetadata }
@@ -148,7 +200,7 @@ export type SlotDef =
   | { type: SlotType.AGGREGATE; aggType: AggType }
   | { type: SlotType.SCALAR; aggType: AggType }
   | { type: SlotType.CONDITION_TREE; capacity?: number }
-  | { type: SlotType.STRUCT_MAP; capacity: number; fieldTypes: readonly StructFieldType[]; ttl?: SlotTtlMetadata }
+  | { type: SlotType.STRUCT_MAP; capacity: number; fieldTypes: readonly StructFieldType[] }
   | { type: SlotType.STRUCT_MAP2; capacity: number; fieldTypes: readonly StructFieldType[] }
   | {
       type: SlotType.ORDERED_LIST;
@@ -179,8 +231,11 @@ export interface StateHandle {
 // =============================================================================
 
 export interface ColumnInput {
-  /** Raw column cells copied into backend memory. Reducer bytecode determines how each cell is interpreted. */
-  data: Uint32Array | Float64Array | BigInt64Array;
+  /**
+   * Raw column cells copied into backend memory. Reducer bytecode determines how each cell is interpreted;
+   * a `Uint8Array` carries the raw byte values of a CSR array/VO field, addressed by a u32 offsets column.
+   */
+  data: Uint32Array | Float64Array | BigInt64Array | Uint8Array;
   /** Element type */
   type: ValueType;
 }
@@ -192,6 +247,24 @@ export interface StructMap2RowRef {
   /** State-buffer-relative byte offset of the sparse payload row. */
   readonly rowOffset: number;
 }
+
+/** A checked read: ordinary absence is an ok value, malformed state is an error. */
+export type VmReadResult<T> =
+  | { readonly ok: true; readonly value: T }
+  | { readonly ok: false; readonly error: ErrorCode };
+
+/**
+ * One STRUCT_MAP arena-backed field (arrays, VO) read through the VM's checked
+ * arena geometry: the row is `absent`, the field `unset`, or its exact `bytes`.
+ * `bytes` is a fresh copy taken before any later state mutation or growth, so it
+ * never aliases backend memory. `error` carries the VM's refusal: a non-arena
+ * field kind is `INVALID_PROGRAM`, a reference outside the arena is `INVALID_STATE`.
+ */
+export type StructMapArenaField =
+  | { readonly kind: 'absent' }
+  | { readonly kind: 'unset' }
+  | { readonly kind: 'bytes'; readonly bytes: Uint8Array }
+  | { readonly kind: 'error'; readonly error: ErrorCode };
 
 /** Lossless reducer-VM scalar slot value (`AggType::SCALAR_*`), not a CompactColumn plane. Empty is explicit rather than overloaded as zero. */
 export type ScalarValue =
@@ -231,6 +304,16 @@ export enum ErrorCode {
   COLUMN_UNDERRUN = 8,
   /** A row expression produced a value its u32 cell cannot hold (fractional, negative, out of range, non-scalar). */
   INVALID_CELL_VALUE = 9,
+  /** A fixed-width sample count cannot admit another sample. */
+  COUNT_OVERFLOW = 10,
+  /** A keyed fold's immutable metadata differs from its init value. */
+  METADATA_CONFLICT = 11,
+  /** Physical journal budget refused before mutation; end/reset the undo window before retrying. */
+  JOURNAL_OVERFLOW = 12,
+  /** A paired delta export was refused because the range contains an undo-only mutation. */
+  DELTA_LANE_MISMATCH = 13,
+  /** Beginning a window refused because another speculation window is still active. */
+  SPECULATION_ACTIVE = 14,
 }
 
 // =============================================================================
@@ -388,6 +471,7 @@ export enum Opcode {
   BATCH_STRUCT_MAP2_UPSERT_LAST = 0x83, // slot,key1_col,key2_col,num_vals,[val_col,field_idx] × N
   BATCH_STRUCT_MAP2_REMOVE = 0x86, // slot,key1_col,key2_col
   BATCH_STRUCT_MAP2_UPSERT_MAX_I64X2 = 0x87, // 0x83 operands + cmp1_col,cmp1_field,cmp2_col,cmp2_field; strict signed lexicographic max
+  BATCH_STRUCT_MAP_COUNTS_FOLD = 0x88,
 
   // Ordered list ops
   SLOT_ORDERED_LIST = 0x19, // slot, type_flags, cap_lo, cap_hi [, num_fields, field_type × num_fields]
@@ -431,9 +515,16 @@ export interface ColumineBackend {
    * Parse and validate a program. Fills embedded hash if needed; caches by hash when available.
    * Call once per agent type.
    *
-   * @param acceptedMagics - Program magics accepted by this embedder. Defaults to [PROGRAM_MAGIC].
+   * @param acceptedMagics - Caller acceptance restriction; never extends the compiled backend's supported magics.
+   * @param voProgramMetadata - Native value-object admission metadata. Only a backend that links the
+   *   native value-object capability admits it; any other backend rejects with
+   *   `VoProgramAdmissionUnavailableError` rather than accepting the metadata unchecked.
    */
-  loadProgram(bytecode: Uint8Array, acceptedMagics?: readonly number[]): Promise<ReducerProgram>;
+  loadProgram(
+    bytecode: Uint8Array,
+    acceptedMagics?: readonly number[],
+    voProgramMetadata?: VoProgramMetadata,
+  ): Promise<ReducerProgram>;
 
   // ===========================================================================
   // State Management
@@ -451,6 +542,14 @@ export interface ColumineBackend {
    * Use for: testing, reprocessing from scratch, windowed reducers.
    */
   resetState(state: StateHandle, program: ReducerProgram): void;
+
+  /**
+   * Grow the pending overflowing slot at a committed boundary.
+   * An active undo window returns NEEDS_GROWTH without changing the image.
+   * Its owner must roll back the complete window, end it, grow, then retry
+   * the complete window under newly enabled undo.
+   */
+  growState(state: StateHandle, program: ReducerProgram): number;
 
   // ===========================================================================
   // Execution
@@ -482,19 +581,30 @@ export interface ColumineBackend {
   getAggregateValue(state: StateHandle, program: ReducerProgram, slot: number): number;
   getScalarValue(state: StateHandle, program: ReducerProgram, slot: number): ScalarValue;
 
-  mapGet(state: StateHandle, program: ReducerProgram, slot: number, key: number): number | undefined;
-  setContains(state: StateHandle, program: ReducerProgram, slot: number, elem: number): boolean;
+  mapGet(state: StateHandle, program: ReducerProgram, slot: number, key: number): VmReadResult<number | undefined>;
+  setContains(state: StateHandle, program: ReducerProgram, slot: number, elem: number): VmReadResult<boolean>;
   structMap2GetRow(
     state: StateHandle,
     program: ReducerProgram,
     slot: number,
     key1: number,
     key2: number,
-  ): StructMap2RowRef | undefined;
-  structMap2Entries(state: StateHandle, program: ReducerProgram, slot: number): readonly StructMap2RowRef[];
+  ): VmReadResult<StructMap2RowRef | undefined>;
+  structMap2Entries(
+    state: StateHandle,
+    program: ReducerProgram,
+    slot: number,
+  ): VmReadResult<readonly StructMap2RowRef[]>;
+  structMapArenaField(
+    state: StateHandle,
+    program: ReducerProgram,
+    slot: number,
+    key: number,
+    fieldIdx: number,
+  ): StructMapArenaField;
 
-  /** Evict every expired TTL entry and expose configured eviction-trigger rows. */
-  evictExpired(state: StateHandle, program: ReducerProgram, now: number): EvictionResult;
+  /** Evict expired entries on the explicitly chosen undo-only or paired delta lane. */
+  evictExpired(state: StateHandle, program: ReducerProgram, now: number, delta: boolean): EvictionResult;
 
   // ===========================================================================
   // Serialization
@@ -517,7 +627,7 @@ export interface ColumineBackend {
   // ===========================================================================
 
   /** Enable native undo logging before speculative execution. */
-  undoEnable(state: StateHandle): void;
+  undoEnable(state: StateHandle): VmReadResult<void>;
 
   /** Save the current native undo-log position. */
   undoCheckpoint(state: StateHandle): number;
@@ -528,11 +638,11 @@ export interface ColumineBackend {
   /** Commit and discard undo entries since the checkpoint. */
   undoCommit(state: StateHandle, checkpointPos: number): void;
 
-  /** Whether the native undo log used its overflow shadow state. */
+  /** Whether the current undo window refused an unjournaled write; its valid prefix remains rollbackable. */
   undoHasOverflow(): boolean;
 
-  /** Export mutation deltas in [fromPos, toPos). */
-  deltaExportSegment(state: StateHandle, fromPos: number, toPos: number): DeltaSegmentExport;
+  /** Export only a completely paired range; an undo-only row returns DELTA_LANE_MISMATCH. */
+  deltaExportSegment(state: StateHandle, fromPos: number, toPos: number): VmReadResult<DeltaSegmentExport>;
 
   /** Apply an exported rollback segment. */
   deltaApplyRollbackSegment(state: StateHandle, segment: Uint8Array, entrySize: number): void;
@@ -546,5 +656,6 @@ export interface DeltaSegmentExport {
   undoBytes: Uint8Array;
   redoBytes: Uint8Array;
   entrySize: number;
+  /** Journal refusal occurred; both lanes still describe the exact accepted prefix. */
   overflow: boolean;
 }

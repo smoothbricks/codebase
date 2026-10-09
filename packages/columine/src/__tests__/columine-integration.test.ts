@@ -11,7 +11,7 @@
  * SC1, SC2, SC4 require the columine WASM binary and skip gracefully if unavailable.
  */
 
-import { beforeAll, describe, expect, it } from 'bun:test';
+import { beforeAll, beforeEach, describe, expect, it } from 'bun:test';
 
 import {
   AggType,
@@ -53,29 +53,34 @@ function createMockColumineBackend(overrides: Partial<ColumineBackend> = {}): Co
     loadProgram: async () => ({ bytecode: new Uint8Array(0), numSlots: 0, numInputs: 0, slotDefs: [] }),
     createState: () => ({ _brand: 'ColumineStateHandle' }),
     resetState: () => {},
+    growState: () => ErrorCode.OK,
     executeBatch: () => ErrorCode.OK,
     executeBatchDelta: () => ErrorCode.OK,
     getMapSize: () => 0,
     getSetSize: () => 0,
     getAggregateValue: () => 0,
     getScalarValue: () => ({ kind: 'empty' }),
-    mapGet: () => undefined,
-    setContains: () => false,
-    structMap2GetRow: () => undefined,
-    structMap2Entries: () => [],
+    mapGet: () => ({ ok: true, value: undefined }),
+    setContains: () => ({ ok: true, value: false }),
+    structMap2GetRow: () => ({ ok: true, value: undefined }),
+    structMap2Entries: () => ({ ok: true, value: [] }),
+    structMapArenaField: () => ({ kind: 'absent' }),
     evictExpired: () => ({ ok: true, count: 0, rows: [] }),
     serialize: () => new Uint8Array(0),
     deserialize: () => ({ _brand: 'ColumineStateHandle' }),
-    undoEnable: () => {},
+    undoEnable: () => ({ ok: true, value: undefined }),
     undoCheckpoint: () => 0,
     undoRollback: () => {},
     undoCommit: () => {},
     undoHasOverflow: () => false,
     deltaExportSegment: () => ({
-      undoBytes: new Uint8Array(0),
-      redoBytes: new Uint8Array(0),
-      entrySize: 24,
-      overflow: false,
+      ok: true,
+      value: {
+        undoBytes: new Uint8Array(0),
+        redoBytes: new Uint8Array(0),
+        entrySize: 24,
+        overflow: false,
+      },
     }),
     deltaApplyRollbackSegment: () => {},
     deltaApplyRollforwardSegment: () => {},
@@ -181,7 +186,7 @@ describe('Program magic admission', () => {
     backend = await loadColumineWasm(WASM_PATH);
   });
 
-  it('rejects foreign magics by default and admits an embedder-provided magic', async () => {
+  it('caller magics narrow admission but cannot extend the standalone compiled backend', async () => {
     const foreignMagic = 0xdead_beef;
     const bytecode = buildProgram({
       slots: [{ type: 'hashset', capacity: 4 }],
@@ -191,8 +196,10 @@ describe('Program magic admission', () => {
     });
 
     await expect(backend.loadProgram(bytecode)).rejects.toThrow('Invalid program: bad magic');
-    const program = await backend.loadProgram(bytecode, [PROGRAM_MAGIC, foreignMagic]);
-    expect(program.numSlots).toBe(1);
+    await expect(backend.loadProgram(bytecode, [PROGRAM_MAGIC, foreignMagic])).rejects.toMatchObject({
+      code: ErrorCode.INVALID_PROGRAM,
+      reason: { kind: 'MalformedProgram' },
+    });
   });
 });
 
@@ -234,9 +241,9 @@ describe('SC1: Reduce stage for aggregation', () => {
 
     // Verify map contents
     expect(backend.getMapSize(state, program, 0)).toBe(3);
-    expect(backend.mapGet(state, program, 0, 1)).toBe(40); // last write wins
-    expect(backend.mapGet(state, program, 0, 2)).toBe(20);
-    expect(backend.mapGet(state, program, 0, 3)).toBe(30);
+    expect(backend.mapGet(state, program, 0, 1)).toStrictEqual({ ok: true, value: 40 }); // last write wins
+    expect(backend.mapGet(state, program, 0, 2)).toStrictEqual({ ok: true, value: 20 });
+    expect(backend.mapGet(state, program, 0, 3)).toStrictEqual({ ok: true, value: 30 });
   });
 
   it('executes Aggregate SUM program', async () => {
@@ -318,9 +325,9 @@ describe('SC1: Reduce stage for aggregation', () => {
 
     // HashMap: 3 unique keys
     expect(backend.getMapSize(state, program, 0)).toBe(3);
-    expect(backend.mapGet(state, program, 0, 1)).toBe(150); // last write
-    expect(backend.mapGet(state, program, 0, 2)).toBe(200);
-    expect(backend.mapGet(state, program, 0, 3)).toBe(300);
+    expect(backend.mapGet(state, program, 0, 1)).toStrictEqual({ ok: true, value: 150 }); // last write
+    expect(backend.mapGet(state, program, 0, 2)).toStrictEqual({ ok: true, value: 200 });
+    expect(backend.mapGet(state, program, 0, 3)).toStrictEqual({ ok: true, value: 300 });
 
     // Aggregate: sum = 10 + 20 + 30 + 40 = 100
     expect(backend.getAggregateValue(state, program, 1)).toBe(100);
@@ -356,7 +363,11 @@ describe('SC1: Reduce stage for aggregation', () => {
     ).toBe(ErrorCode.OK);
     expect(backend.getMapSize(mapState, mapProgram, 0)).toBe(keys.length);
     expect(backend.getAggregateValue(mapState, mapProgram, 1)).toBe(78);
-    for (const key of keys) expect(backend.mapGet(mapState, mapProgram, 0, key)).toBe(key * 10);
+    for (const key of keys) {
+      const read = backend.mapGet(mapState, mapProgram, 0, key);
+      if (!read.ok) throw new Error(`unexpected mapGet error ${read.error}`);
+      expect(read.value).toBe(key * 10);
+    }
 
     const setProgram = await backend.loadProgram(
       buildProgram({
@@ -370,7 +381,11 @@ describe('SC1: Reduce stage for aggregation', () => {
       ErrorCode.OK,
     );
     expect(backend.getSetSize(setState, setProgram, 0)).toBe(keys.length);
-    for (const key of keys) expect(backend.setContains(setState, setProgram, 0, key)).toBeTrue();
+    for (const key of keys) {
+      const read = backend.setContains(setState, setProgram, 0, key);
+      if (!read.ok) throw new Error(`unexpected setContains error ${read.error}`);
+      expect(read.value).toBeTrue();
+    }
   });
 
   it('reads U32, F64, and I64 scalar slots losslessly with explicit empty state', async () => {
@@ -447,7 +462,7 @@ describe('SC1: Reduce stage for aggregation', () => {
       ),
     ).toBe(ErrorCode.OK);
 
-    const result = backend.evictExpired(state, program, 114);
+    const result = backend.evictExpired(state, program, 114, false);
     expect(result.ok).toBeTrue();
     if (!result.ok) throw new Error(`unexpected eviction error ${result.error}`);
     expect(result.count).toBe(4);
@@ -460,7 +475,11 @@ describe('SC1: Reduce stage for aggregation', () => {
     expect(backend.getMapSize(state, program, 0)).toBe(0);
     const restored = backend.deserialize(program, backend.serialize(state, program));
     expect(backend.getMapSize(restored, program, 0)).toBe(0);
-    for (const key of keys) expect(backend.mapGet(restored, program, 0, key)).toBeUndefined();
+    for (const key of keys) {
+      const read = backend.mapGet(restored, program, 0, key);
+      if (!read.ok) throw new Error(`unexpected mapGet error ${read.error}`);
+      expect(read.value).toBeUndefined();
+    }
   });
 
   it('parses and initializes CONDITION_TREE slots as first-class slot types', async () => {
@@ -518,7 +537,8 @@ describe('SC1: Reduce stage for aggregation', () => {
 describe('SC2: Undo stage for event cancellation', () => {
   let backend: ColumineBackend;
 
-  beforeAll(async () => {
+  // A fresh backend per test: a rollback leaves its undo window open, refusing the next begin.
+  beforeEach(async () => {
     backend = await loadColumineWasm(WASM_PATH);
   });
 
@@ -541,7 +561,9 @@ describe('SC2: Undo stage for event cancellation', () => {
     expect(backend.getAggregateValue(state, program, 0)).toBe(100);
 
     // Checkpoint before speculative batch
-    const token = stages.undo.checkpoint(state);
+    const begun = stages.undo.checkpoint(state);
+    if (!begun.ok) throw new Error(`unexpected undo checkpoint error ${begun.error}`);
+    const token = begun.value;
 
     // Speculative batch: sum should be 100 + 500 = 600
     const batch2 = new Float64Array([100, 200, 200]);
@@ -570,7 +592,9 @@ describe('SC2: Undo stage for event cancellation', () => {
     stages.reduce.executeBatch(state, program, [{ data: batch1, type: ValueType.FLOAT64 }], 2);
 
     // Checkpoint
-    const token = stages.undo.checkpoint(state);
+    const begun = stages.undo.checkpoint(state);
+    if (!begun.ok) throw new Error(`unexpected undo checkpoint error ${begun.error}`);
+    const token = begun.value;
 
     // Second batch: sum = 50 + 100 = 150
     const batch2 = new Float64Array([100]);
@@ -763,9 +787,9 @@ describe('SC4: Streaming processing', () => {
       2,
     );
     expect(backend.getMapSize(state, program, 0)).toBe(3);
-    expect(backend.mapGet(state, program, 0, 1)).toBe(150); // Updated
-    expect(backend.mapGet(state, program, 0, 2)).toBe(200); // Unchanged
-    expect(backend.mapGet(state, program, 0, 3)).toBe(300); // New
+    expect(backend.mapGet(state, program, 0, 1)).toStrictEqual({ ok: true, value: 150 }); // Updated
+    expect(backend.mapGet(state, program, 0, 2)).toStrictEqual({ ok: true, value: 200 }); // Unchanged
+    expect(backend.mapGet(state, program, 0, 3)).toStrictEqual({ ok: true, value: 300 }); // New
   });
 
   it('state serialization and deserialization preserves accumulated state', async () => {

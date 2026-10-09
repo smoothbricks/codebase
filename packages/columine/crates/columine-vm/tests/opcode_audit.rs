@@ -15,7 +15,7 @@
 use columine_types::abi_registry_fixture::{
     DISPATCHED_OPCODE_BYTES, FLAT_UNDO_OPS, TYPES_OPCODE_REGISTRY,
 };
-use columine_types::audit_parser::{arm_names, enum_decls, norm, read_source};
+use columine_types::audit_parser::{enum_decls, norm, read_source};
 use columine_types::types::Opcode;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -147,28 +147,13 @@ fn every_frozen_dispatched_byte_decodes_in_types_registry() {
     }
 }
 
-/// FlatUndoOp: the undo-entry wire ops. The frozen ABI set must remain a
-/// subset (the fixture never shrinks or renumbers), post-parity extensions are
-/// the explicit allowlist below, and the Rust rollback/decode dispatch must
-/// cover every declared op.
+/// The current undo wire is physical StateBytes only. Logical operations are
+/// removed at cutover, not retained as unrelated reader-evolution aliases.
 #[test]
-fn flat_undo_op_registry_and_rollback_arms_match_fixture() {
-    // WHY an allowlist: the wire contract is ours to evolve post-cutover,
-    // but every extension must be named here deliberately — an unlisted new
-    // op fails the audit exactly like a dropped frozen op.
-    const POST_PARITY_EXTENSIONS: &[(&str, u8)] = &[
-        // Scalar writes were un-journaled in the frozen ABI; journaled
-        // deliberately at the post-parity sweep.
-        ("ScalarUpdate", 14),
-        // Variable nested state snapshots journal exact bytes without widening
-        // the fixed undo-entry ABI.
-        ("StateBytes", 15),
-    ];
-
+fn physical_undo_op_registry_and_decoder_match_fixture() {
     let rust_undo = read_source(&manifest_dir(), "src/undo_log.rs");
-    let rust_vm = read_source(&manifest_dir(), "src/vm.rs");
 
-    let mut frozen: BTreeMap<String, u8> = FLAT_UNDO_OPS
+    let frozen: BTreeMap<String, u8> = FLAT_UNDO_OPS
         .iter()
         .map(|(n, b)| (n.to_string(), *b))
         .collect();
@@ -176,35 +161,20 @@ fn flat_undo_op_registry_and_rollback_arms_match_fixture() {
         .into_iter()
         .map(|(n, b)| (norm(&n), b))
         .collect();
-    assert!(
-        frozen.len() >= 13,
-        "frozen FlatUndoOp fixture rotted: {}",
-        frozen.len()
+    assert_eq!(
+        frozen,
+        BTreeMap::from([("statebytes".to_owned(), 0x0f)]),
+        "the current wire must not retain logical operations",
     );
-    for (name, byte) in POST_PARITY_EXTENSIONS {
-        assert!(
-            !frozen.values().any(|b| b == byte),
-            "extension {name} reuses a frozen ABI byte {byte:#04x}"
-        );
-        frozen.insert(norm(name), *byte);
-    }
     assert_eq!(
         frozen, rust_decls,
-        "FlatUndoOp declarations diverged from frozen ABI + named extensions"
+        "FlatUndoOp declarations diverged from the frozen ABI"
     );
 
-    let declared_names: BTreeSet<String> = frozen.keys().cloned().collect();
-    let mut rust_arms = BTreeSet::new();
-    for src in [&rust_undo, &rust_vm] {
-        for name in arm_names(src, "FlatUndoOp::") {
-            let n = norm(&name);
-            if frozen.contains_key(&n) {
-                rust_arms.insert(n);
-            }
-        }
+    for &(_, byte) in FLAT_UNDO_OPS {
+        assert_eq!(
+            columine_vm::undo_log::FlatUndoOp::from_u8(byte),
+            Some(columine_vm::undo_log::FlatUndoOp::StateBytes),
+        );
     }
-    assert_eq!(
-        rust_arms, declared_names,
-        "Rust rollback/decode arms do not cover every declared FlatUndoOp"
-    );
 }

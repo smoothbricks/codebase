@@ -61,6 +61,13 @@ export type {
   SlotTtlMetadata,
   StateHandle,
   StructMap2RowRef,
+  StructMapArenaField,
+  VmReadResult,
+  VoCountsRole,
+  VoDefinitionMetadata,
+  VoFieldLink,
+  VoProgramMetadata,
+  VoSchemaMetadata,
 } from './types.js';
 export {
   AggType,
@@ -78,8 +85,10 @@ export {
   TtlStartOf,
   ValueType,
 } from './types.js';
+export { encodeVoProgramMetadata, VoProgramAdmissionUnavailableError } from './vo-program-metadata.js';
 // WASM backend (for standalone columine usage)
-export { createColumineWasmBackend, loadColumineWasm } from './wasm-backend.js';
+export type { VmProgramInvalidCause } from './wasm-backend.js';
+export { createColumineWasmBackend, loadColumineWasm, VmProgramAdmissionError } from './wasm-backend.js';
 // Shared WASM memory sizing contract (used by wrappers)
 export type {
   WasmMemoryContractErrorCode,

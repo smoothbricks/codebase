@@ -3,8 +3,9 @@
 use crate::msgpack_scanner::{BIGINT_EXTENSION, Reader, bigint_ext_i64, bigint_ext_u64};
 use crate::validate::encode_path_segment;
 use crate::{
-    ColumnValue, DynamicColumns, ExtractionConfig, ParseError, PlaneKind, SignalSchemaField,
-    json_extractor::ExtractionError, json_scanner::parse_iso8601_to_micros,
+    ColumnValue, DynamicColumns, ExtractionConfig, FrameProjections, MemberSchema, ParseError,
+    PlaneKind, SignalSchemaField, json_extractor::ExtractionError,
+    json_scanner::parse_iso8601_to_micros,
 };
 
 /// Extracts either a concatenated MessagePack map stream or an array of maps.
@@ -15,16 +16,43 @@ pub fn extract_msgpack_events(
     work_buffer: &mut [u8],
     stream: bool,
 ) -> Result<usize, ExtractionError> {
+    extract_msgpack_events_with_projections(
+        input,
+        config,
+        columns,
+        work_buffer,
+        stream,
+        FrameProjections::default(),
+    )
+}
+
+/// [`extract_msgpack_events`] writing each projected value-object frame's
+/// certified bytes in place of the batch slice it was admitted from. A
+/// projection that finds no cell to replace — a frame stored inside a raw
+/// Binary document, say — refuses the batch rather than storing the writer's
+/// layout.
+pub fn extract_msgpack_events_with_projections(
+    input: &[u8],
+    config: &ExtractionConfig,
+    columns: &mut DynamicColumns,
+    work_buffer: &mut [u8],
+    stream: bool,
+    projections: FrameProjections<'_>,
+) -> Result<usize, ExtractionError> {
     if input.is_empty() {
         return Ok(0);
     }
+    let mut frames = FrameWrites {
+        projections,
+        written: 0,
+    };
     let mut reader = Reader::new(input);
     let mut count = 0;
     // An exactly-capacity stream is legal; reject only when more events
     // follow a full batch.
     if stream {
         while !reader.at_end() {
-            extract_msgpack_event(&mut reader, config, columns, work_buffer)?;
+            extract_msgpack_event(&mut reader, config, columns, work_buffer, &mut frames)?;
             count += 1;
             if count >= columns.capacity as usize && !reader.at_end() {
                 return Err(ExtractionError::TooManyEvents);
@@ -40,11 +68,20 @@ pub fn extract_msgpack_events(
             return Err(ExtractionError::TooManyEvents);
         }
         for _ in 0..size {
-            extract_msgpack_event(&mut reader, config, columns, work_buffer)?;
+            extract_msgpack_event(&mut reader, config, columns, work_buffer, &mut frames)?;
             count += 1;
         }
     }
+    if frames.written != frames.projections.len() {
+        return Err(ExtractionError::UnwrittenProjection);
+    }
     Ok(count)
+}
+
+/// The projections of one extraction attempt and how many were written.
+struct FrameWrites<'p> {
+    projections: FrameProjections<'p>,
+    written: usize,
 }
 
 fn extract_msgpack_event(
@@ -52,6 +89,7 @@ fn extract_msgpack_event(
     config: &ExtractionConfig,
     columns: &mut DynamicColumns,
     work_buffer: &mut [u8],
+    frames: &mut FrameWrites<'_>,
 ) -> Result<(), ExtractionError> {
     // Parse the map header before opening a row, so an invalid header never
     // leaves a partially initialized row.
@@ -61,7 +99,7 @@ fn extract_msgpack_event(
     if !columns.begin_row() {
         return Err(ExtractionError::TooManyEvents);
     }
-    let result = extract_msgpack_fields(reader, fields, config, columns, work_buffer);
+    let result = extract_msgpack_fields(reader, fields, config, columns, work_buffer, frames);
     if result.is_err() {
         // Abandon the row on error; failed extraction must not commit it.
         columns.abandon_row();
@@ -75,6 +113,7 @@ fn extract_msgpack_fields(
     config: &ExtractionConfig,
     columns: &mut DynamicColumns,
     work_buffer: &mut [u8],
+    frames: &mut FrameWrites<'_>,
 ) -> Result<(), ExtractionError> {
     // Presence is schema-sized state owned by DynamicColumns and allocated
     // once with the column storage. Resetting it per row avoids both the old
@@ -100,13 +139,23 @@ fn extract_msgpack_fields(
     // discriminator key that sorts before `value` is always seen first; a
     // producer that spells `value` earlier resolves undiscriminated.
     let mut discriminant: Option<&str> = None;
-    for _ in 0..fields {
+    // The signal type, which selects the schema nested payload members are
+    // routed by. A producer that spells `value` before `type` is looked ahead
+    // for it, so routing never depends on key order.
+    let mut event_type: Option<&str> = None;
+    for field_index in 0..fields {
         let key_start = reader.position();
         let key = reader.read_string().ok_or(ExtractionError::InvalidJson)?;
         let key_end = reader.position();
         if config.is_discriminator_key(key) {
             let mut probe = Reader::new(&reader.input()[reader.position()..]);
             discriminant = probe
+                .read_string()
+                .and_then(|bytes| std::str::from_utf8(bytes).ok());
+        }
+        if key == b"type" {
+            let mut probe = Reader::new(&reader.input()[reader.position()..]);
+            event_type = probe
                 .read_string()
                 .and_then(|bytes| std::str::from_utf8(bytes).ok());
         }
@@ -131,6 +180,9 @@ fn extract_msgpack_fields(
             )
         {
             saw_nested_value = true;
+            if event_type.is_none() && config.semantic_schemas.is_some() {
+                event_type = lookahead_event_type(reader, fields - field_index - 1);
+            }
             let members = reader
                 .read_map_header()
                 .ok_or(ExtractionError::InvalidJson)?;
@@ -154,7 +206,9 @@ fn extract_msgpack_fields(
                     columns,
                     work_buffer,
                     &mut state,
+                    frames,
                     discriminant,
+                    event_type,
                     lookup_name,
                     member,
                     member_start,
@@ -170,6 +224,8 @@ fn extract_msgpack_fields(
             columns,
             work_buffer,
             &mut state,
+            frames,
+            None,
             None,
             lookup_name,
             key,
@@ -204,6 +260,23 @@ fn extract_msgpack_fields(
     }
     columns.end_row();
     Ok(())
+}
+
+/// The string `type` member among the `remaining` keys after the nested
+/// `value` map the reader is positioned at, read from a probe so the real
+/// reader does not move. Only producers that spell `value` before `type` pay
+/// for it.
+fn lookahead_event_type<'a>(reader: &Reader<'a>, remaining: u32) -> Option<&'a str> {
+    let mut probe = Reader::new(&reader.input()[reader.position()..]);
+    probe.skip_value()?;
+    for _ in 0..remaining {
+        let key = probe.read_string()?;
+        if key == b"type" {
+            return std::str::from_utf8(probe.read_string()?).ok();
+        }
+        probe.skip_value()?;
+    }
+    None
 }
 
 /// Byte length of the MessagePack string header for a payload of `len` bytes.
@@ -269,19 +342,35 @@ fn extract_msgpack_member(
     columns: &mut DynamicColumns,
     work_buffer: &mut [u8],
     state: &mut ExtraState,
+    frames: &mut FrameWrites<'_>,
     discriminant: Option<&str>,
+    event_type: Option<&str>,
     lookup_name: Option<&str>,
     key: &[u8],
     key_start: usize,
     key_end: usize,
 ) -> Result<(), ExtractionError> {
     let member = std::str::from_utf8(key).ok();
-    let lookup = lookup_name
-        .and_then(|name| config.lookup_payload_member(discriminant, member.unwrap_or(name), name))
-        .filter(|lookup| Some(lookup.column) != config.fallback_column);
+    // A non-UTF-8 member is undeclared by construction: under an open payload
+    // object it is captured like any other undeclared member.
+    let member_schema = config.payload_member_schema(event_type, member.unwrap_or_default());
+    let lookup = match member_schema {
+        MemberSchema::UndeclaredOpen => None,
+        MemberSchema::Unjudged | MemberSchema::Declared(_) => lookup_name.and_then(|name| {
+            config.lookup_payload_member(discriminant, member.unwrap_or(name), name)
+        }),
+    }
+    .filter(|lookup| Some(lookup.column) != config.fallback_column);
     if let Some(lookup) = lookup {
         let variants = member.and_then(|member| config.enum_ordinals(discriminant, member));
-        extract_typed_value(reader, lookup.field, columns, lookup.column, variants)?;
+        extract_typed_value(
+            reader,
+            lookup.field,
+            columns,
+            lookup.column,
+            variants,
+            frames,
+        )?;
         columns.columns_seen[lookup.column] = true;
         return Ok(());
     }
@@ -343,6 +432,7 @@ fn extract_typed_value(
     columns: &mut DynamicColumns,
     column: usize,
     enum_variants: Option<&[String]>,
+    frames: &mut FrameWrites<'_>,
 ) -> Result<(), ExtractionError> {
     let first = *reader
         .input()
@@ -540,8 +630,16 @@ fn extract_typed_value(
                 // Binary values are stored as the payload of their canonical
                 // MessagePack bin representation. Keeping the payload avoids a
                 // second decode after Arrow materialization and preserves raw
-                // bytes.
+                // bytes. A value-object frame the admission projected into the
+                // reader's layout is stored as its certified bytes instead.
                 let payload = reader.read_bin().ok_or(ExtractionError::InvalidJson)?;
+                let payload = match frames.projections.certified(payload) {
+                    Some(certified) => {
+                        frames.written += 1;
+                        certified
+                    }
+                    None => payload,
+                };
                 Some(ColumnValue::Binary(payload.to_vec()))
             } else {
                 // External standard MessagePack may provide a structured value
@@ -603,6 +701,132 @@ mod tests {
     }
     fn config(fields: &[SignalSchemaField], names: &[&str]) -> ExtractionConfig {
         build_extraction_config(fields, names).unwrap()
+    }
+
+    /// A projected frame's certified bytes replace exactly the batch slice it
+    /// was admitted from — matched by identity, not by content — and a
+    /// projection with no cell to replace refuses the batch.
+    #[test]
+    fn projected_frames_write_certified_bytes_or_refuse() {
+        let fields = [field(ArrowType::Binary), field(ArrowType::Binary)];
+        let config_two = config(&fields, &["frame", "copy"]);
+        // {"frame": <bin8 01 02>, "copy": <bin8 01 02>}: equal bytes, two slices.
+        let mut input = vec![0x82];
+        str_(&mut input, "frame");
+        input.extend([0xc4, 2, 1, 2]);
+        str_(&mut input, "copy");
+        input.extend([0xc4, 2, 1, 2]);
+        let frame_at = 1 + 6 + 2;
+        let lent = &input[frame_at..frame_at + 2];
+        let certified = [9_u8, 9, 9];
+        let pairs = [(lent, &certified[..])];
+        let mut columns = DynamicColumns::new(&fields, 1);
+        let mut work = [0; 64];
+        assert_eq!(
+            extract_msgpack_events_with_projections(
+                &input,
+                &config_two,
+                &mut columns,
+                &mut work,
+                true,
+                FrameProjections::new(&pairs),
+            ),
+            Ok(1)
+        );
+        assert_eq!(columns.cell(0, 0), Some(ColumnValue::Binary(vec![9, 9, 9])));
+        assert_eq!(
+            columns.cell(1, 0),
+            Some(ColumnValue::Binary(vec![1, 2])),
+            "an equal slice elsewhere is not the lent frame"
+        );
+
+        // A frame inside a map stored as one raw Binary document has no cell.
+        let mut nested = vec![0x81];
+        str_(&mut nested, "frame");
+        nested.push(0x81);
+        str_(&mut nested, "inner");
+        nested.extend([0xc4, 2, 1, 2]);
+        let inner_at = nested.len() - 2;
+        let pairs = [(&nested[inner_at..], &certified[..])];
+        let one = [field(ArrowType::Binary)];
+        let config_one = config(&one, &["frame"]);
+        let mut columns = DynamicColumns::new(&one, 1);
+        assert_eq!(
+            extract_msgpack_events_with_projections(
+                &nested,
+                &config_one,
+                &mut columns,
+                &mut work,
+                true,
+                FrameProjections::new(&pairs),
+            ),
+            Err(ExtractionError::UnwrittenProjection)
+        );
+    }
+
+    /// The msgpack twin of the JSON routing rule: an undeclared member of an
+    /// open payload is captured, never written to the column another signal
+    /// type declares under that name, in either key order.
+    #[test]
+    fn undeclared_open_member_captures_instead_of_another_types_column() {
+        let fields = [
+            field(ArrowType::Utf8),
+            field(ArrowType::Utf8),
+            field(ArrowType::Binary),
+        ];
+        let schemas = crate::validate::parse_schema_envelope(
+            br#"{"a":{"kind":"object","fields":{},"open":true},"b":{"kind":"object","fields":{"note":{"kind":"string"}}}}"#,
+        )
+        .unwrap();
+        let config = crate::build_extraction_config_with_semantic_schemas(
+            &fields,
+            &["type", "value.note", crate::UNDECLARED_COLUMN_NAME],
+            Some(&schemas),
+            None,
+        )
+        .unwrap();
+        let event = |event_type: &str, type_first: bool| {
+            let mut payload = vec![0x81];
+            str_(&mut payload, "note");
+            str_(&mut payload, "x");
+            let mut input = vec![0x82];
+            let mut type_pair = Vec::new();
+            str_(&mut type_pair, "type");
+            str_(&mut type_pair, event_type);
+            let mut value_pair = Vec::new();
+            str_(&mut value_pair, "value");
+            value_pair.extend(&payload);
+            if type_first {
+                input.extend(type_pair);
+                input.extend(value_pair);
+            } else {
+                input.extend(value_pair);
+                input.extend(type_pair);
+            }
+            input
+        };
+        let captured = ColumnValue::Binary(vec![
+            0xdf, 0, 0, 0, 1, 0xa4, b'n', b'o', b't', b'e', 0xa1, b'x',
+        ]);
+        for type_first in [true, false] {
+            let mut columns = DynamicColumns::new(&fields, 1);
+            let mut work = [0; 64];
+            extract_msgpack_events(
+                &event("a", type_first),
+                &config,
+                &mut columns,
+                &mut work,
+                true,
+            )
+            .unwrap();
+            assert_eq!(columns.cell(1, 0), None, "b's column stays empty");
+            assert_eq!(columns.cell(2, 0), Some(captured.clone()));
+        }
+        let mut columns = DynamicColumns::new(&fields, 1);
+        let mut work = [0; 64];
+        extract_msgpack_events(&event("b", true), &config, &mut columns, &mut work, true).unwrap();
+        assert_eq!(columns.cell(1, 0), Some(ColumnValue::Utf8("x".into())));
+        assert_eq!(columns.cell(2, 0), None);
     }
 
     /// A JavaScript number above u32 arrives as float64 under standard
