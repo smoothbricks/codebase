@@ -315,9 +315,8 @@ export enum ErrorCode {
   /** Beginning a window refused because another speculation window is still active. */
   SPECULATION_ACTIVE = 14,
   /**
-   * Working memory the operation needs could not be allocated. The operation that met it wrote nothing; earlier
-   * operations of the same batch may have applied, so, as with JOURNAL_OVERFLOW, the image holds an exact accepted
-   * prefix. An undo window rolls it back; without one the host restores the image before running the batch again.
+   * Working memory the batch or call needs could not be allocated. Every buffer it can grow is reserved before its
+   * first write, so the refused batch or call wrote nothing and can be run again as it is. Not a request to grow.
    */
   OUT_OF_MEMORY = 15,
 }
