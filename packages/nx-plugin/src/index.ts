@@ -97,6 +97,23 @@ const TYPESCRIPT_PATCH_INPUTS = ['{workspaceRoot}/patches/**/*'];
 const WORKSPACE_TSCONFIG_BASE_INPUT = '{workspaceRoot}/tsconfig.base.json';
 
 /**
+ * The native compiler a typecheck runs, apart from the one emit runs: devenv.smoo.nix builds it
+ * from a pinned source revision and exports its path. The typecheck targets run it directly,
+ * not through ttsc: ttsc auto-loads a dependency's transform plugin (typia) and then checks
+ * inside that plugin's host, which links ttsc's own compiler and never runs the pinned one.
+ * Transform diagnostics stay enforced where the transform runs: for the lib program in `tsc-js`'s
+ * emit, for test files when the test runner transforms them. A test file no test executes has
+ * its types checked here but its transform calls checked nowhere. Hashed by the store path,
+ * which carries the revision, so a compiler bump misses the cache. The command refuses an unset
+ * variable: falling back would check with another compiler under the same key.
+ */
+const TYPECHECK_COMPILER_ENV = 'SMOO_TYPECHECK_TSC';
+const TYPECHECK_COMPILER_INPUT = { env: TYPECHECK_COMPILER_ENV };
+function typecheckCommand(args: string): string {
+  return `"\${${TYPECHECK_COMPILER_ENV}:?is unset, enter the devenv shell (devenv.smoo.nix builds the typecheck compiler)}" ${args}`;
+}
+
+/**
  * The two release-rewritten files hashed by field instead of by byte, for a
  * check that only reads them.
  *
@@ -1233,11 +1250,17 @@ async function createProjectTargets(
     targets.typecheck = {
       executor: 'nx:run-commands',
       cache: true,
-      inputs: [selfProduction, dependencyProduction, ...checkInputs, '{projectRoot}/tsconfig.lib.json'],
+      inputs: [
+        selfProduction,
+        dependencyProduction,
+        ...checkInputs,
+        TYPECHECK_COMPILER_INPUT,
+        '{projectRoot}/tsconfig.lib.json',
+      ],
       outputs: [],
       dependsOn: ['^*-js', ...(cargoWasmConfig ? ['cargo-wasm'] : [])],
       options: {
-        command: 'ttsc -p tsconfig.lib.json --noEmit',
+        command: typecheckCommand('-p tsconfig.lib.json --noEmit'),
         cwd: projectRoot,
       },
     };
@@ -1247,10 +1270,16 @@ async function createProjectTargets(
     targets['typecheck-tests'] = {
       executor: 'nx:run-commands',
       cache: true,
-      inputs: [selfDefault, dependencyProduction, ...checkInputs, '{projectRoot}/tsconfig.test.json'],
+      inputs: [
+        selfDefault,
+        dependencyProduction,
+        ...checkInputs,
+        TYPECHECK_COMPILER_INPUT,
+        '{projectRoot}/tsconfig.test.json',
+      ],
       dependsOn: ['typecheck'],
       options: {
-        command: 'ttsc -p tsconfig.test.json --noEmit',
+        command: typecheckCommand('-p tsconfig.test.json --noEmit'),
         cwd: projectRoot,
       },
     };
@@ -1258,7 +1287,7 @@ async function createProjectTargets(
       executor: 'nx:run-commands',
       continuous: true,
       options: {
-        command: 'ttsc -p tsconfig.test.json --noEmit --watch',
+        command: typecheckCommand('-p tsconfig.test.json --noEmit --watch'),
         cwd: projectRoot,
       },
     };

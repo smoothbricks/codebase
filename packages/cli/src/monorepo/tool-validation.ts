@@ -75,7 +75,7 @@ const rootDevDependencies: RequiredDependency[] = [
   // pin the repository owns, read back from bun.lock rather than restated here.
   { name: 'ttsc', fallbackVersion: managedTtscPatch.version, pinnedFromLockfile: true },
   // Nx and typescript-eslint still load the TypeScript JS API (6.x).
-  // Compilation is exclusively delegated to ttsc by the Nx plugin targets.
+  // Emit is delegated to ttsc by the Nx plugin targets; typecheck runs SMOO_TYPECHECK_TSC.
   { name: 'typescript', fallbackVersion: '^6.0.3', minimumVersion: '6.0.0', prefix: '^' },
   // TS7 native compiler for ttsc (TTSC_TSGO_BINARY). Not the unscoped API package.
   // npm alias form required — Bun cannot install @typescript/typescript6 cleanly (bun#33834).

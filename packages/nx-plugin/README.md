@@ -449,9 +449,13 @@ Concrete targets come from concrete files:
 - `tsc-js` emits transformed JavaScript through a temporary JS-only `ttsc` config, restores execute bits on outputs
   declared by `package.json#bin`, then emits declarations and declaration maps from the original project with native
   `tsc`. Direct project references and every cached output lane are preserved.
-- `typecheck` is inferred from `tsconfig.lib.json` and runs native `tsc -p tsconfig.lib.json --noEmit`.
-- `typecheck-tests` is inferred from `tsconfig.test.json` and runs `tsc -p tsconfig.test.json --noEmit`. It first
-  rebuilds the current package's `tsc-js` output (or its non-TypeScript `build`) so self-imports resolve after `clean`.
+- `typecheck` is inferred from `tsconfig.lib.json` and runs the native compiler `SMOO_TYPECHECK_TSC` names (built by
+  `devenv.smoo.nix` from a pinned TypeScript revision) as `-p tsconfig.lib.json --noEmit`, directly rather than through
+  `ttsc`. Transform plugins' diagnostics are enforced by `tsc-js`, which runs them.
+- `typecheck-tests` is inferred from `tsconfig.test.json` and runs the same compiler on
+  `-p tsconfig.test.json --noEmit`. It first rebuilds the current package's `tsc-js` output (or its non-TypeScript
+  `build`) so self-imports resolve after `clean`. Transform calls in test files are checked when the test runner
+  transforms them.
 - `typecheck-tests:watch` is inferred from `tsconfig.test.json` and runs the same typecheck in watch mode.
 - `test-watch` is inferred when the package already defines an explicit Bun or Vitest `test` command. The plugin derives
   the corresponding watch command and makes it depend on `typecheck-tests`.
