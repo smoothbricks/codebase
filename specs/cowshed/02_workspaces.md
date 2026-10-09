@@ -376,6 +376,9 @@ contents are not a path the rename can carry by bytes, so the workspace rename r
 capture, naming the directory and the way out — commit it, move it out of the workspace, or exclude it, then retry.
 Untracked files are preserved by path, mode and bytes; a nested repository is never recursed into.
 
+`mv` is a rename, not a fresh fork or mint. It preserves the source branch, remotes, uncommitted work and git-worktree
+registration through its clone-then-retire composition.
+
 Moving an adopted checkout is always cowshed-mediated (`mv <ws> <new-path>`): the image is detached, published at the
 new path, and reattached — no unmount-and-remount gap at the user's path, no relink to maintain.
 
