@@ -18,7 +18,6 @@ use crate::help::{self, CommandSpec, EXPECTED_SOURCE_HEAD, EXPECTED_WORKSPACE_IN
 pub static COMMANDS: &[&CommandSpec] = &[
     &ADOPT,
     &SETUP,
-    &NEW,
     &FORK,
     &MOVE,
     &CHECKPOINT,
@@ -69,7 +68,6 @@ pub enum Command {
     /// Host storage setup, repair, and teardown. Its subject is the host, so it takes no
     /// project and no workspace — neither is something a stranded machine can name.
     Setup(SetupArgs),
-    New(NewArgs),
     Fork(ForkArgs),
     Move(MoveArgs),
     Checkpoint(CheckpointArgs),
@@ -123,7 +121,6 @@ impl Command {
             Self::Detach(_) => ProjectDiscovery::NotUsed,
             Self::Mount(_) => ProjectDiscovery::NotUsed,
             Self::Adopt(_)
-            | Self::New(_)
             | Self::Fork(_)
             | Self::Move(_)
             | Self::Checkpoint(_)
@@ -265,20 +262,15 @@ pub struct AdoptArgs {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct NewArgs {
-    pub name: String,
+pub struct ForkArgs {
+    pub source: Option<String>,
+    pub destination: String,
     pub reference: Option<OsString>,
-    pub from: Option<String>,
+    pub clean: bool,
     pub browse: bool,
     pub slot: Option<u32>,
     pub register: bool,
     pub git_worktree: bool,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ForkArgs {
-    pub source: String,
-    pub destination: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -724,18 +716,17 @@ fn cli_command() -> ClapCommand {
             flag("downgrade"),
             value("mount-root"),
         ]))
-        .subcommand(leaf("new").arg(positional("name", 0..=1)).args([
-            value("ref"),
-            value("from"),
-            flag("browse"),
-            value("slot"),
-            flag("register"),
-            flag("git-worktree"),
-        ]))
         .subcommand(
             leaf("fork")
-                .arg(positional("src", 0..=1))
-                .arg(positional("dst", 0..=1)),
+                .arg(positional("workspaces", 0..=2).num_args(0..=2))
+                .args([
+                    value("ref"),
+                    flag("clean"),
+                    flag("browse"),
+                    value("slot"),
+                    flag("register"),
+                    flag("git-worktree"),
+                ]),
         )
         .subcommand(
             leaf("mv")
@@ -985,7 +976,6 @@ fn cli_from_matches(matches: ArgMatches) -> Result<Cli, UsageError> {
     let command = match name {
         "adopt" => parse_adopt(leaf)?,
         "setup" => parse_setup(leaf, &global)?,
-        "new" => parse_new(leaf)?,
         "fork" => parse_fork(leaf)?,
         "mv" => parse_move(leaf)?,
         "checkpoint" => parse_checkpoint(leaf)?,
@@ -1872,85 +1862,77 @@ fn parse_setup(matches: &ArgMatches, global: &GlobalOptions) -> Result<Command, 
     }))
 }
 
-const NEW: CommandSpec = CommandSpec {
-    name: "new",
-    missing: "new requires a workspace name",
-    args: "<name>",
+const FORK: CommandSpec = CommandSpec {
+    name: "fork",
+    missing: "fork requires a destination workspace",
+    args: "[<src>] <ws>",
     trailing: "",
-    summary: "create a workspace",
+    summary: "create a warm workspace",
     about: &[
-        "Clones a live image of the project's main workspace and mounts it. The clone is copy-on-write, so a workspace costs the writes it makes rather than a copy of the tree, and it inherits main's source, dependencies, and build state warm.",
-        "A build slot is a stable mount path, `mnt/<owner>/<repo>/slot@<n>`, held by one workspace at a time and released when that workspace is removed or renamed, so the next tenant of slot n builds through byte-identical absolute paths. Path identity is no longer what makes the compiler cache hit: cargo computes `-C metadata` path-independently for workspace members from 1.97, and the bundled sccache keys cwd, the blanket CARGO_* values, env-dep values and the argument bytes against the request cwd, so every workspace shares one cache at any mount. A slot is for what neither reaches — a crate whose output bakes in its path, such as an `env!(\"CARGO_MANIFEST_DIR\")` string, fails closed across paths, tooling that persists absolute paths across tenant generations keeps working, and an unpatched sccache or an older cargo still needs the path itself. Main cannot take a slot: its mount is fixed by the checkout layout.",
+        "Clones main by default, or any named source, carrying tracked edits, untracked files, dependencies and build state warm. Every fork mints its own cowshed/<ws> branch and fresh closed grants.",
+        "--clean resets tracked edits and removes nonignored untracked files. --ref implies clean and selects a commit held by the source. Ignored build state stays warm.",
     ],
     options: &[
         Opt {
-            spelling: "--ref <rev>",
-            meaning: "start the branch at <rev> instead of main's tip; conflicts with --from",
+            spelling: "--clean",
+            meaning: "discard source edits and nonignored untracked files in the clone",
         },
         Opt {
-            spelling: "--from <ws>",
-            meaning: "clone another workspace of this project instead of main; conflicts with --ref",
+            spelling: "--ref <rev>",
+            meaning: "start at the source's revision; implies --clean",
         },
         Opt {
             spelling: "--browse",
-            meaning: "show the volume in Finder; the default mount is nobrowse",
+            meaning: "show the volume in Finder",
         },
         Opt {
             spelling: "--slot <n>",
-            meaning: "mount at build slot <n>'s stable path instead of one named after the workspace, so compiler caches keyed on absolute paths survive the tenant",
+            meaning: "mount at the stable build-slot path",
         },
         Opt {
             spelling: "--register",
-            meaning: "also add the workspace as a remote in main's repository; off by default because it is host-side state that outlives an interrupted retire",
+            meaning: "also register the workspace as a remote in main",
         },
         Opt {
             spelling: "--git-worktree",
-            meaning: "mint a linked worktree of main's repository instead of a standalone clone: one object store and one ref namespace, at the cost of requiring main mounted and giving up checkpoint and restore",
+            meaning: "share main's object store through a clone-owned linked-worktree registration",
         },
     ],
-};
-
-fn parse_new(matches: &ArgMatches) -> Result<Command, UsageError> {
-    const USAGE: &CommandSpec = &NEW;
-    let reference = os(matches, "ref");
-    let from = optional_workspace(matches, "from", false, USAGE)?;
-    if reference.is_some() && from.is_some() {
-        return Err(UsageError::new("--ref conflicts with --from", USAGE));
-    }
-    Ok(Command::New(NewArgs {
-        name: require_workspace(matches, "name", true, USAGE, USAGE.missing)?,
-        reference,
-        from,
-        browse: flagged(matches, "browse"),
-        slot: parse_slot_value(matches, USAGE)?,
-        register: flagged(matches, "register"),
-        git_worktree: flagged(matches, "git-worktree"),
-    }))
-}
-
-const FORK: CommandSpec = CommandSpec {
-    name: "fork",
-    missing: "fork requires a source workspace",
-    args: "<src> <dst>",
-    trailing: "",
-    summary: "fork a workspace",
-    about: &[
-        "Clones a running workspace: two divergent futures from the same mid-flight state, in milliseconds. Grants are not inherited — a fork starts closed, like any new workspace.",
-    ],
-    options: &[],
 };
 
 fn parse_fork(matches: &ArgMatches) -> Result<Command, UsageError> {
     const USAGE: &CommandSpec = &FORK;
+    let mut workspaces = matches
+        .get_many::<OsString>("workspaces")
+        .ok_or_else(|| UsageError::new(USAGE.missing, USAGE))?;
+    let (source, destination) = match (workspaces.next(), workspaces.next()) {
+        (Some(destination), None) => (None, destination),
+        (Some(source), Some(destination)) => {
+            let source = source
+                .to_str()
+                .ok_or_else(|| UsageError::new("source must be UTF-8", USAGE))?;
+            WorkspaceName::new(source)
+                .map_err(|error| UsageError::new(error.to_string(), USAGE))?;
+            (Some(source.to_owned()), destination)
+        }
+        _ => return Err(UsageError::new(USAGE.missing, USAGE)),
+    };
+    let destination = destination
+        .to_str()
+        .ok_or_else(|| UsageError::new("destination must be UTF-8", USAGE))?;
+    WorkspaceName::session(destination)
+        .map_err(|error| UsageError::new(error.to_string(), USAGE))?;
+    let reference = os(matches, "ref");
+    let clean = flagged(matches, "clean") || reference.is_some();
     Ok(Command::Fork(ForkArgs {
-        source: require_workspace(matches, "src", false, USAGE, USAGE.missing)?,
-        destination: require_workspace(
-            matches,
-            "dst",
-            true,
-            USAGE,
-            "fork requires a destination workspace",
-        )?,
+        source,
+        destination: destination.to_owned(),
+        reference,
+        clean,
+        browse: flagged(matches, "browse"),
+        slot: parse_slot_value(matches, USAGE)?,
+        register: flagged(matches, "register"),
+        git_worktree: flagged(matches, "git-worktree"),
     }))
 }
 
@@ -3605,34 +3587,66 @@ mod tests {
     }
 
     #[test]
-    fn validates_names_and_new_option_conflicts() {
-        assert!(parse_args(["new", "Bad_Name"]).is_err());
-        assert!(parse_args(["new", "main"]).is_err());
-        assert!(parse_args(["new", "raven", "--ref", "HEAD", "--from", "main"]).is_err());
+    fn fork_validates_names_and_rejects_the_removed_new_verb() {
+        assert!(parse_args(["fork", "Bad_Name"]).is_err());
+        assert!(parse_args(["fork", "main"]).is_err());
+        assert!(parse_args(["new", "raven"]).is_err());
         assert!(parse_args(["path", "main"]).is_ok());
     }
 
     #[test]
-    fn new_carries_the_git_worktree_request_through_to_the_command() {
-        let cli = parse_args(["new", "raven", "--git-worktree"]).unwrap();
-        let Command::New(args) = cli.command else {
-            panic!("expected new")
+    fn fork_defaults_to_main_and_ref_implies_clean() {
+        for argv in [
+            vec!["fork", "raven"],
+            vec!["fork", "main", "raven"],
+            vec!["fork", "sibling", "raven", "--clean"],
+            vec!["fork", "sibling", "raven", "--ref", "main"],
+        ] {
+            let cli = parse_args(argv.clone()).unwrap();
+            let Command::Fork(args) = cli.command else {
+                panic!("expected fork")
+            };
+            assert_eq!(args.destination, "raven");
+            assert_eq!(
+                args.source.as_deref(),
+                if argv.len() == 2 { None } else { Some(argv[1]) }
+            );
+            assert_eq!(
+                args.clean,
+                argv.contains(&"--clean") || argv.contains(&"--ref")
+            );
+        }
+        assert!(parse_args(["fork", "main", "raven", "extra"]).is_err());
+        assert!(parse_args(["fork", "raven", "--from", "main"]).is_err());
+        assert!(
+            parse_args(["new", "raven"])
+                .unwrap_err()
+                .message
+                .contains("unknown command")
+        );
+    }
+
+    #[test]
+    fn fork_carries_the_git_worktree_request_through_to_the_command() {
+        let cli = parse_args(["fork", "raven", "--git-worktree"]).unwrap();
+        let Command::Fork(args) = cli.command else {
+            panic!("expected fork")
         };
         assert!(args.git_worktree);
         assert!(!args.register);
 
-        let cli = parse_args(["new", "raven"]).unwrap();
-        let Command::New(args) = cli.command else {
-            panic!("expected new")
+        let cli = parse_args(["fork", "raven"]).unwrap();
+        let Command::Fork(args) = cli.command else {
+            panic!("expected fork")
         };
         assert!(!args.git_worktree);
     }
 
     #[test]
-    fn slots_parse_on_new_and_path_and_refuse_a_workspace_alongside() {
-        let cli = parse_args(["new", "raven", "--slot", "3"]).unwrap();
-        let Command::New(args) = cli.command else {
-            panic!("expected new")
+    fn slots_parse_on_fork_and_path_and_refuse_a_workspace_alongside() {
+        let cli = parse_args(["fork", "raven", "--slot", "3"]).unwrap();
+        let Command::Fork(args) = cli.command else {
+            panic!("expected fork")
         };
         assert_eq!(args.slot, Some(3));
 
@@ -4247,7 +4261,7 @@ mod tests {
 
     #[test]
     fn lifecycle_parsers_enforce_required_values_and_preserve_revision_bytes() {
-        assert!(parse_args(["fork", "raven"]).is_err());
+        assert!(parse_args(["fork"]).is_err());
         assert!(parse_args(["restore", "raven"]).is_err());
         assert!(parse_args(["push", "raven", "--branch"]).is_err());
         assert!(parse_args(["land", "raven", "--check"]).is_err());
@@ -4297,19 +4311,19 @@ mod tests {
             assert_eq!(parse_args(spelling).unwrap().command, Command::Help(None));
         }
 
-        let new = help::command_named("new").unwrap();
+        let fork = help::command_named("fork").unwrap();
         assert_eq!(
-            parse_args(["new", "--help"]).unwrap().command,
-            Command::Help(Some(new))
+            parse_args(["fork", "--help"]).unwrap().command,
+            Command::Help(Some(fork))
         );
         assert_eq!(
-            parse_args(["help", "new"]).unwrap().command,
-            Command::Help(Some(new))
+            parse_args(["help", "fork"]).unwrap().command,
+            Command::Help(Some(fork))
         );
         // A half-typed line answers the question rather than refusing the grammar it is missing.
         assert_eq!(
-            parse_args(["new", "--slot", "--help"]).unwrap().command,
-            Command::Help(Some(new))
+            parse_args(["fork", "--slot", "--help"]).unwrap().command,
+            Command::Help(Some(fork))
         );
 
         // Globals still parse around it.
@@ -4364,7 +4378,7 @@ mod tests {
         let cases: &[(&[&str], ProjectDiscovery)] = &[
             (&["adopt", "/repo"], Required),
             (&["setup"], NotUsed),
-            (&["new", "raven"], Required),
+            (&["fork", "raven"], Required),
             (&["fork", "raven", "falcon"], Required),
             (&["mv", "raven", "falcon"], Required),
             (&["checkpoint", "raven"], Required),
@@ -4405,11 +4419,11 @@ mod tests {
     /// and the flags its usage line advertises cannot drift apart.
     #[test]
     fn usage_hints_come_from_the_same_table_as_the_help() {
-        let error = parse_args(["new", "raven", "--unknown"]).unwrap_err();
+        let error = parse_args(["fork", "raven", "--unknown"]).unwrap_err();
         assert_eq!(error.message, "unknown flag `--unknown`");
         assert_eq!(
             error.hint,
-            "cowshed new <name> [--ref <rev>] [--from <ws>] [--browse] [--slot <n>] [--register] [--git-worktree]"
+            "cowshed fork [<src>] <ws> [--clean] [--ref <rev>] [--browse] [--slot <n>] [--register] [--git-worktree]"
         );
 
         for spec in COMMANDS {

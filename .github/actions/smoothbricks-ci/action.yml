@@ -62,7 +62,7 @@ runs:
         set -euo pipefail
         ws="ci-${{ github.run_id }}"
         # cowshed prints the workspace path on stdout; all guidance is on stderr.
-        path="$(cowshed new "$ws" --ref '${{ github.sha }}')"
+        path="$(cowshed fork "$ws" --ref '${{ github.sha }}')"
         echo "workspace-path=$path" >>"$GITHUB_OUTPUT"
         # Marker consumed by later steps / the post-job cleanup.
         {

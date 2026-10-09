@@ -186,14 +186,18 @@ class CoordinatorImpl implements Coordinator {
     );
   }
 
-  async create(name: string, options?: Api.CreateOptions): Promise<WorkspaceRef> {
+  async fork(workspace: string, options?: Partial<Api.ForkOptions> & { source?: string }): Promise<WorkspaceRef> {
+    const { source, ...requested } = options ?? {};
+    const mint: Api.ForkOptions = {
+      clean: false,
+      browse: false,
+      register: false,
+      gitWorktree: false,
+      ...requested,
+    };
     return new WorkspaceRefImpl(
-      await callNativeAsync(() => N.coordinatorCreate(this.#native, { workspace: name, options: options ?? {} })),
+      await callNativeAsync(() => N.coordinatorFork(this.#native, { workspace, source, options: mint })),
     );
-  }
-
-  async fork(source: string, destination: string): Promise<WorkspaceRef> {
-    return new WorkspaceRefImpl(await callNativeAsync(() => N.coordinatorFork(this.#native, { source, destination })));
   }
 
   async rename(source: string, destination: string): Promise<WorkspaceRef> {

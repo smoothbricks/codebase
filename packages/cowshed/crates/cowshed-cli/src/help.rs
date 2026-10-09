@@ -46,7 +46,7 @@ pub struct CommandSpec {
 }
 
 impl CommandSpec {
-    /// The full grammar: `new <name> [--ref <rev>] [--from <ws>] …`.
+    /// The full grammar: `fork [<src>] <ws> [--clean] [--ref <rev>] …`.
     #[must_use]
     pub fn usage(&self) -> String {
         let mut usage = String::from(self.name);
@@ -342,12 +342,12 @@ mod tests {
 
     #[test]
     fn usage_is_the_option_table_printed() {
-        let new = command_named("new").unwrap();
+        let fork = command_named("fork").unwrap();
         assert_eq!(
-            new.usage(),
-            "new <name> [--ref <rev>] [--from <ws>] [--browse] [--slot <n>] [--register] [--git-worktree]"
+            fork.usage(),
+            "fork [<src>] <ws> [--clean] [--ref <rev>] [--browse] [--slot <n>] [--register] [--git-worktree]"
         );
-        assert_eq!(new.hint(), format!("cowshed {}", new.usage()));
+        assert_eq!(fork.hint(), format!("cowshed {}", fork.usage()));
 
         // The child argv follows the options, wherever the flags end.
         let exec = command_named("exec").unwrap();
@@ -401,11 +401,10 @@ mod tests {
                 spec.name
             );
         }
-        // `new`'s flags are the ones a workspace is created with; the map names them rather than
-        // leaving `cowshed new --help` as the only way to learn they exist.
-        assert!(
-            map.contains("new <name> [--ref|--from|--browse|--slot|--register|--git-worktree]")
-        );
+        // Fork's creation flags are discoverable in the command map, not only its help page.
+        assert!(map.contains(
+            "fork [<src>] <ws> [--clean|--ref|--browse|--slot|--register|--git-worktree]"
+        ));
         // `exec`'s eleven flags do not fit a scannable line, so the map defers to the page.
         assert!(map.contains("exec <ws> [options] -- <cmd...>"));
         assert!(map.lines().all(|line| line.len() <= WIDTH));

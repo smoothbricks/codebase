@@ -22,9 +22,14 @@
 //!
 //! The rule is deliberately narrow. Escaping links are rewritten to the absolute path they
 //! named in the source tree, which is depth-independent and so survives every later clone.
-//! In-tree links and already-absolute links are left alone: rewriting them would spend clone
-//! time to change nothing, and the whole point of a copy-on-write workspace is that it is
-//! ready in seconds.
+//! Absolute links into the source tree itself (a hook installer's `.git/hooks` entry, a
+//! package linker's link to a directory the checkout owns) named the source checkout's own
+//! files: another checkout's, which a sandboxed workspace cannot read and whose edits are not
+//! this tree's. They are rewritten to the same path under this tree's root, spelled relative to
+//! the link, so they keep naming this tree's copy at whatever depth it is mounted later.
+//! In-tree links and absolute links outside the source tree are left alone: rewriting them
+//! would spend clone time to change nothing, and the whole point of a copy-on-write workspace
+//! is that it is ready in seconds.
 
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -99,14 +104,17 @@ pub fn resolve_in_source(source_root: &Path, link_parent: &Path, target: &Path) 
     normalize(&source_root.join(link_parent).join(target))
 }
 
-/// An escaping link and the absolute target that restores its source-tree meaning.
+/// A link whose inherited target means something else in this tree, and the target that
+/// restores its source-tree meaning.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rewrite {
     /// The link itself, relative to the tree root.
     pub at: PathBuf,
     /// The target the tree inherited.
     pub inherited: PathBuf,
-    /// The absolute path that target named in the source tree.
+    /// What the link points at instead: for an escaping target, the absolute path it named in
+    /// the source tree; for an absolute target inside the source tree, the same path under
+    /// this tree's root, relative to the link's parent.
     pub restored: PathBuf,
 }
 
@@ -126,7 +134,8 @@ pub struct Refusal {
     pub probed: PathBuf,
 }
 
-/// Every escaping link in one tree, split into what can be restored and what cannot.
+/// Every link in one tree whose meaning the move changes, split into what can be restored and
+/// what cannot.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct LinkPlan {
     pub rewrites: Vec<Rewrite>,
@@ -170,7 +179,7 @@ impl LinkPlan {
 /// the kernel, so the count does not follow the host's core count.
 const WALKERS: usize = 32;
 
-/// What an escaping symlink contributes to a plan.
+/// What a symlink whose meaning moved contributes to a plan.
 enum Found {
     Rewrite(Rewrite),
     Refusal(Refusal),
@@ -185,7 +194,7 @@ impl Found {
     }
 }
 
-/// Walk `tree_root` and decide what each escaping symlink should become.
+/// Walk `tree_root` and decide what each symlink whose meaning moved should become.
 ///
 /// The walk never follows links, so it cannot leave the tree it was handed or cycle through
 /// one that points back into itself. Directories are read concurrently; the plan is sorted by
@@ -208,33 +217,66 @@ pub fn plan(tree_root: &Path, source_root: &Path) -> Result<LinkPlan> {
     Ok(plan)
 }
 
-/// Classify one symlink, `relative` to the tree root, and resolve it against the source tree
-/// when its recorded target escapes. `None` is a link that keeps its meaning at any depth.
+/// Classify one symlink, `relative` to the tree root. An escaping target is resolved against
+/// the source tree; an absolute target inside the source tree is re-spelled relative to the
+/// same path in this tree. `None` is a link that keeps its meaning at any depth.
 fn judge(tree_root: &Path, source_root: &Path, relative: PathBuf) -> Option<Found> {
     // A link whose target cannot be read is not this module's business: it is reported by
     // whatever reads it, and guessing at a replacement would be worse than leaving it exactly
     // as the source tree had it.
     let target = fs::read_link(tree_root.join(&relative)).ok()?;
     let parent = relative.parent().unwrap_or_else(|| Path::new(""));
-    if classify(parent, &target) != Targeting::Escapes {
-        return None;
+    match classify(parent, &target) {
+        Targeting::InTree => None,
+        Targeting::Absolute => {
+            // Lexical, like the classification: whether the source path exists does not
+            // change what the bytes named, and this tree holds the same paths the source does.
+            let inside = normalize(&target)
+                .strip_prefix(source_root)
+                .ok()?
+                .to_owned();
+            Some(Found::Rewrite(Rewrite {
+                restored: relative_from(parent, &inside),
+                at: relative,
+                inherited: target,
+            }))
+        }
+        Targeting::Escapes => {
+            let restored = resolve_in_source(source_root, parent, &target);
+            // `symlink_metadata`, not `exists`: a source target that is itself a symlink counts
+            // as present, and following it here would resolve someone else's link for them.
+            Some(if fs::symlink_metadata(&restored).is_ok() {
+                Found::Rewrite(Rewrite {
+                    at: relative,
+                    inherited: target,
+                    restored,
+                })
+            } else {
+                Found::Refusal(Refusal {
+                    at: relative,
+                    inherited: target,
+                    probed: restored,
+                })
+            })
+        }
     }
-    let restored = resolve_in_source(source_root, parent, &target);
-    // `symlink_metadata`, not `exists`: a source target that is itself a symlink counts as
-    // present, and following it here would resolve someone else's link for them.
-    Some(if fs::symlink_metadata(&restored).is_ok() {
-        Found::Rewrite(Rewrite {
-            at: relative,
-            inherited: target,
-            restored,
-        })
-    } else {
-        Found::Refusal(Refusal {
-            at: relative,
-            inherited: target,
-            probed: restored,
-        })
-    })
+}
+
+/// `inside`, a path relative to the tree root, spelled from `link_parent` (also relative to
+/// the tree root): one `..` per directory the parent is below the root, then `inside`.
+fn relative_from(link_parent: &Path, inside: &Path) -> PathBuf {
+    let mut relative: PathBuf = link_parent
+        .components()
+        .filter(|component| matches!(component, Component::Normal(_)))
+        .map(|_| Component::ParentDir)
+        .collect();
+    if !inside.as_os_str().is_empty() {
+        relative.push(inside);
+    }
+    if relative.as_os_str().is_empty() {
+        relative.push(Component::CurDir);
+    }
+    relative
 }
 
 /// The directories one walk has yet to read, shared by its readers.
@@ -357,7 +399,7 @@ where
     })
 }
 
-/// Replace each planned link with its absolute source-tree target.
+/// Replace each planned link with its restored target.
 pub fn apply(tree_root: &Path, plan: &LinkPlan) -> Result<()> {
     for rewrite in &plan.rewrites {
         let path = tree_root.join(&rewrite.at);
@@ -552,7 +594,7 @@ mod tests {
     }
 
     #[test]
-    fn in_tree_and_absolute_links_are_left_byte_for_byte_alone() {
+    fn in_tree_links_and_absolute_links_outside_the_source_are_left_byte_for_byte_alone() {
         let base = temp_tree("untouched");
         let source = base.join("source");
         let clone = base.join("clone");
@@ -574,6 +616,71 @@ mod tests {
         assert_eq!(
             fs::read_link(clone.join("packages/app/abs")).expect("link"),
             Path::new("/opt/lib")
+        );
+    }
+
+    #[test]
+    fn an_absolute_link_into_the_source_tree_is_respelled_relative_to_the_clones_own_copy() {
+        // The shapes a host leaves in main: a hook installer's absolute `.git/hooks` entry and
+        // a package linker's absolute link to a directory main owns. Inherited as they are,
+        // both name main's files from inside the clone.
+        let base = temp_tree("absolute-into-source");
+        let source = base.join("source");
+        let clone = base.join("deeper/clone");
+        for root in [&source, &clone] {
+            fs::create_dir_all(root.join(".git/hooks")).expect("hooks");
+            fs::create_dir_all(root.join("tooling/git-hooks")).expect("hook sources");
+            fs::write(root.join("tooling/git-hooks/pre-commit.sh"), "").expect("hook source");
+            fs::create_dir_all(root.join(".cache/patched-nx/package")).expect("package");
+            fs::create_dir_all(root.join("node_modules")).expect("node_modules");
+        }
+        symlink(
+            source.join("tooling/git-hooks/pre-commit.sh"),
+            clone.join(".git/hooks/pre-commit"),
+        )
+        .expect("hook link");
+        symlink(
+            source.join(".cache/patched-nx/package"),
+            clone.join("node_modules/nx"),
+        )
+        .expect("package link");
+        symlink(&source, clone.join("root")).expect("root link");
+        symlink("/opt/lib", clone.join("node_modules/outside")).expect("outside link");
+
+        let plan = restore(&clone, &source).expect("restore");
+        assert!(plan.refusals.is_empty());
+        assert_eq!(
+            plan.rewrites.len(),
+            3,
+            "every absolute link into the source, and only those"
+        );
+        assert_eq!(
+            fs::read_link(clone.join(".git/hooks/pre-commit")).expect("hook"),
+            Path::new("../../tooling/git-hooks/pre-commit.sh")
+        );
+        assert_eq!(
+            fs::read_link(clone.join("node_modules/nx")).expect("package"),
+            Path::new("../.cache/patched-nx/package")
+        );
+        assert_eq!(
+            fs::read_link(clone.join("root")).expect("root"),
+            Path::new(".")
+        );
+        assert_eq!(
+            clone
+                .join("node_modules/nx")
+                .canonicalize()
+                .expect("package resolves"),
+            clone
+                .join(".cache/patched-nx/package")
+                .canonicalize()
+                .expect("clone package"),
+            "the link names the clone's own copy, never the source's"
+        );
+        assert_eq!(
+            fs::read_link(clone.join("node_modules/outside")).expect("outside"),
+            Path::new("/opt/lib"),
+            "an absolute link outside the source tree is not the source's to re-spell"
         );
     }
 

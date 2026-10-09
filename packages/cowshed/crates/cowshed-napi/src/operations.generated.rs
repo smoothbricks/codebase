@@ -93,17 +93,7 @@ impl Coordinator {
         )
     }
 
-    /// Creates a session workspace from main.
-    #[napi(js_name = "create")]
-    pub fn create(&self, env: Env, arguments: String) -> napi::Result<JsObject> {
-        super::workspace_call::<operations::CoordinatorCreate, _>(
-            env,
-            Arc::clone(&self.inner),
-            arguments,
-        )
-    }
-
-    /// Forks a workspace into a new session workspace.
+    /// Mints a warm workspace from main or an explicit source.
     #[napi(js_name = "fork")]
     pub fn fork(&self, env: Env, arguments: String) -> napi::Result<JsObject> {
         super::workspace_call::<operations::CoordinatorFork, _>(

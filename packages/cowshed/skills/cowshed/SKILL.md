@@ -10,10 +10,18 @@ description:
 # cowshed — warm workspaces for parallel agents
 
 A cowshed workspace is a full standalone checkout — source, `.git`, `node_modules`, `target/`, every build cache —
-cloned copy-on-write from the repository's warm `main` image. A `git worktree` starts cold; a shed starts warm. On a
-large, long-used repo `cowshed new` still takes tens of seconds: APFS copies main's extent map at ~12 µs/extent on first
-write, then setup walks the tree for escaping symlinks. `cowshed defrag main` is the remedy when `doctor` warns
-`main-extents`.
+cloned copy-on-write from the repository's warm `main` image. A `git worktree` gives an agent a cold tree whose build
+cache starts empty and a first build that costs minutes; a cowshed workspace starts warm. `cowshed fork` on a large,
+long-used repository still takes tens of seconds, and nearly all of it is two steps. The clone call returns in
+milliseconds, but the clone's first write, during its attach or mount, makes APFS copy the extent map of main's image
+file. That copy costs about 12 µs per extent, and main's image fragments with every write it takes while clones share
+its blocks: 2.1 million extents cost 25 s on a quiet host and over a minute on a busy one. Then setup walks the whole
+tree for symlinks that point outside it, about 5 s over a million entries. The number of attached images does not
+matter.
+
+`fork [<src>] <ws>` is the only creation verb; the source defaults to main. Every fork carries source edits and
+untracked files by default on its own `cowshed/<ws>` branch. `--clean` discards tracked edits and nonignored untracked
+paths; `--ref <rev>` implies clean. Ignored dependencies and build state stay warm. `mv` is a rename, not a fresh mint.
 
 ## Use it
 
@@ -31,30 +39,36 @@ write, then setup walks the tree for escaping symlinks. `cowshed defrag main` is
 
 ## Commands
 
-| Task                     | Command                                                                            | Use                                                                                                                                                          |
-| ------------------------ | ---------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Create from main         | `cowshed new <name>` (`--ref <rev>`)                                               | Clone the warm main image at main's tip (or a rev).                                                                                                          |
-| Create from a sibling    | `cowshed new <name> --from <ws>`                                                   | Clone another workspace's image. Same repo only.                                                                                                             |
-| Fork live state          | `cowshed fork <src> <dst>`                                                         | Divergent future from a running workspace; grants are NOT inherited.                                                                                         |
-| Create at a stable slot  | `cowshed new <name> --slot <n>`                                                    | Stable mount path — only for crates/tooling that bake absolute paths; cargo ≥1.97 + bundled sccache already hit across paths.                                |
-| Linked worktree (escape) | `cowshed new <name> --git-worktree`                                                | One object store with main; costs checkpoint/restore, needs main mounted. Prefer a real shed.                                                                |
-| Locate                   | `cowshed path <ws>` (`--no-attach`)                                                | Print the mount path; attaches a detached shed first unless `--no-attach`.                                                                                   |
-| Run a command            | `cowshed exec <ws> -- <cmd>`                                                       | One argv, never a shell string, inside the sandbox. `--session`, `--background`, `--timeout`, `--stdin*` exist.                                              |
-| Grant host paths         | `cowshed grant <ws> --read <p…> [--write <p…>]`                                    | Applies from next exec; omit flags to list. Grant the symlink's target, not the link.                                                                        |
-| Grant network / ports    | `cowshed grant <ws> --egress <host> [--opaque]`; `--ports <N>`                     | Egress via gateway (`--opaque` for cert-pinning clients, e.g. Go on macOS). macOS: grow the port block _before_ launching services — refused while jobs run. |
-| List                     | `cowshed ls` / `ls --all` / `ls --landed`                                          | `--landed` = patch-equivalence-aware safe-rm list (`ls --landed \| xargs -n1 cowshed rm`).                                                                   |
-| Inspect host / cache     | `cowshed doctor` / `cowshed sccache status`                                        | Doctor names attach-pool, extent and orphan findings (below).                                                                                                |
-| Attach / detach          | `cowshed attach [<ws>]` / `cowshed detach [<ws>]` (`--all`)                        | Mount or park. Detach is NOT cleanup: image, commits, grants, ports persist. Only `rm`/`land` retire.                                                        |
-| Checkpoint / restore     | `cowshed checkpoint [<ws>] [label]` / `cowshed restore <ws> <label>`               | Explicit labels pin; restore keeps the displaced image as `pre-restore-*` and refuses over unsaved work.                                                     |
-| Rebase                   | `cowshed rebase [<ws>]` (`--into <lane>`, `--onto <rev>`)                          | Onto main by default; `--into` onto a lane base's branch. Dirty tree refused; conflict aborts clean.                                                         |
-| Land                     | `cowshed land <ws> [--check '<cmd>' …]`                                            | Check (repeatable), fast-forward, retire by default. Does NOT rebase — rebase first. `--into <lane>`, `--no-retire`, `--push-only` exist.                    |
-| Deliver a branch         | `cowshed push [<ws>] [--branch <name>]`                                            | Preserves `refs/cowshed/<ws>/heads/<branch>` in main's repo for review; touches no checkout.                                                                 |
-| Retire / reclaim         | `cowshed rm <ws>` / `cowshed gc [--dry-run]`                                       | `rm` refuses until main contains HEAD (ancestry or patch equivalence).                                                                                       |
-| Grow / repair images     | `cowshed resize <ws\|main> <size>` (`--build <size>`), `defrag`, `reseed`, `rekey` | Resize never shrinks; `--build` grows the build volume. Reseed refreshes a stale fork seed.                                                                  |
-| Rename / move            | `cowshed mv <ws> <new>` / `cowshed mv main <path>`                                 | Moving/re-identifying main needs a quiesced mount, run from outside.                                                                                         |
-
-Also present: `mount main`, `build-state` (Nx lint), `gateway`, `credential`, `identity add`, `skill install` — run
-`cowshed <verb> --help`; every verb is self-describing.
+| Task                    | Command                                                              | Use                                                                                        |
+| ----------------------- | -------------------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| Create from main        | `cowshed fork <ws>`                                                  | Carry main's current state warm.                                                           |
+| Create from a sibling   | `cowshed fork <src> <ws>`                                            | Carry another workspace's current state warm.                                              |
+| Create at a stable slot | `cowshed fork <ws> --slot <n>`                                       | Recycle a stable path for path-keyed caches.                                               |
+| Create clean            | `cowshed fork [<src>] <ws> --clean`                                  | Reset tracked edits and remove nonignored untracked files.                                 |
+| Create at a ref         | `cowshed fork [<src>] <ws> --ref <rev>`                              | Clean and branch at the source's revision.                                                 |
+| Locate                  | `cowshed path <ws>`                                                  | Print the live mount path.                                                                 |
+| Run a command           | `cowshed exec <ws> -- <cmd>`                                         | Execute argv inside the workspace sandbox.                                                 |
+| Grant host paths        | `cowshed grant <ws> --read <path...> [--write <path...>]`            | Widen filesystem access from the next exec; omit flags to list.                            |
+| Grant network reach     | `cowshed grant <ws> --egress <host>`                                 | Admit one host through the gateway; separately audited.                                    |
+| Grant a pinned client   | `cowshed grant <ws> --egress <host> --opaque`                        | Tunnel without interception for a client that verifies the real certificate (Go on macOS). |
+| Grant service ports     | `cowshed grant <ws> --ports <N>`                                     | macOS: grow the port block to at least N service ports before launching services.          |
+| List this project       | `cowshed ls`                                                         | Show its workspaces.                                                                       |
+| List every project      | `cowshed ls --all`                                                   | Show workspaces store-wide.                                                                |
+| Inspect host            | `cowshed doctor`                                                     | Check host and workspace invariants without mutation.                                      |
+| Inspect compile cache   | `cowshed sccache status`                                             | Check daemon health and cache hits before debugging misses.                                |
+| Attach or detach        | `cowshed attach <ws>` / `cowshed detach <ws>`                        | Mount or park one session workspace.                                                       |
+| Attach or detach all    | `cowshed attach --all` / `cowshed detach --all`                      | Mount or park all session workspaces.                                                      |
+| Checkpoint or restore   | `cowshed checkpoint <ws> <label>` / `cowshed restore <ws> <label>`   | Save or roll back an image.                                                                |
+| Rebase                  | `cowshed rebase <ws>`                                                | Rebase the workspace branch onto main.                                                     |
+| Land with a check       | `cowshed land <ws> --target main --check '<bare command>'`           | Check, fast-forward main, and retire on success.                                           |
+| Rebase within a lane    | `cowshed rebase <ws> --into <lane>`                                  | Rebase onto the lane base's branch, where the lane's other units land.                     |
+| Land into a lane base   | `cowshed land <ws> --into <lane> --check '<bare command>'`           | Check, fast-forward the lane base instead of main, and retire.                             |
+| Deliver a branch        | `cowshed push <ws> --branch <name>`                                  | Put the workspace branch in main's repository for review.                                  |
+| Retire                  | `cowshed rm <ws>`                                                    | Remove a landed workspace.                                                                 |
+| Reclaim                 | `cowshed gc --dry-run` / `cowshed gc`                                | Review, then reclaim orphaned storage.                                                     |
+| Grow an image           | `cowshed resize <ws> <size>`                                         | Grow an image; resize never shrinks it.                                                    |
+| Make clones cheap again | `cowshed defrag main`                                                | Rewrite main contiguously when doctor warns `main-extents`.                                |
+| Rename or move          | `cowshed mv <ws> <new-name>` / `cowshed mv main <new-checkout-path>` | Rename a workspace or move the adopted checkout.                                           |
 
 ## Merge flow
 

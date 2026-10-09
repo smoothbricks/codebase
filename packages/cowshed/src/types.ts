@@ -83,8 +83,7 @@ export interface Project {
 
 export interface Coordinator {
   adopt(options?: Api.AdoptOptions): Promise<WorkspaceRef>;
-  create(name: string, options?: Api.CreateOptions): Promise<WorkspaceRef>;
-  fork(source: string, destination: string): Promise<WorkspaceRef>;
+  fork(workspace: string, options?: Partial<Api.ForkOptions> & { source?: string }): Promise<WorkspaceRef>;
   rename(source: string, destination: string): Promise<WorkspaceRef>;
   moveCheckout(destination: string): Promise<WorkspaceRef>;
   grant(workspace: string, delta: Api.GrantDelta): Promise<Api.GrantSet>;

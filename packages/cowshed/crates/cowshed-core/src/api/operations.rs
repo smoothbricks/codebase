@@ -11,7 +11,7 @@
 
 use super::dto::{
     AdmissionKey, AdoptOptions, AttachOptions, CheckpointOptions, CheckpointQuota,
-    CheckpointResult, CommandArg, CreateOptions, DefragmentResult, DoctorReport, EmptyResult,
+    CheckpointResult, CommandArg, DefragmentResult, DoctorReport, EmptyResult, ForkOptions,
     GcOptions, GcReport, GrantDelta, GrantSet, JobId, JobInfo, JobJournalCursor, JobListeningPorts,
     JobTail, JobTailLimits, LandOptions, LandReport, MirrorInfo, OutputPublication,
     ProjectGrantDelta, PushOptions, PushReport, RebaseOptions, RebaseReport, RemoveOptions,
@@ -266,10 +266,8 @@ operations! {
     coordinator json "coordinator.rename" CoordinatorRename(SourceDestinationRequest) -> WorkspaceView;
     /// Adopts the project's checkout as main.
     coordinator json "coordinator.adopt" CoordinatorAdopt(AdoptRequest) -> WorkspaceView;
-    /// Creates a session workspace from main.
-    coordinator json "coordinator.create" CoordinatorCreate(CreateRequest) -> WorkspaceView;
-    /// Forks a workspace into a new session workspace.
-    coordinator json "coordinator.fork" CoordinatorFork(SourceDestinationRequest) -> WorkspaceView;
+    /// Mints a warm workspace from main or an explicit source.
+    coordinator json "coordinator.fork" CoordinatorFork(ForkRequest) -> WorkspaceView;
     /// Moves the project's checkout.
     coordinator json "coordinator.moveCheckout" CoordinatorMoveCheckout(MoveCheckoutRequest) -> WorkspaceView;
     /// Changes the adopted project's repository identity.
@@ -477,10 +475,12 @@ pub struct AdoptRequest {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct CreateRequest {
+pub struct ForkRequest {
     pub repo_id: RepoId,
     pub workspace: WorkspaceName,
-    pub options: CreateOptions,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<WorkspaceName>,
+    pub options: ForkOptions,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -807,6 +807,26 @@ mod tests {
             drifted.is_empty(),
             "corpus requests that do not encode back to themselves, as encoded:\n{}",
             serde_json::to_string_pretty(&drifted).expect("JSON")
+        );
+    }
+
+    #[test]
+    fn fork_is_the_only_public_mint_and_omitted_source_means_main() {
+        let params = serde_json::json!({
+            "repoId": "acme/widget", "workspace": "raven",
+            "options": { "clean": false, "browse": false, "register": false, "gitWorktree": false }
+        });
+        let request = OperationRequest::decode("coordinator.fork", &params).expect("fork");
+        let OperationRequest::CoordinatorFork(fork) = &request else {
+            panic!("expected fork")
+        };
+        assert_eq!(fork.source, None);
+        assert_eq!(request.params().unwrap(), params);
+        assert_eq!(
+            OperationRequest::decode("coordinator.create", &params)
+                .unwrap_err()
+                .code,
+            crate::error::ErrorCode::Usage
         );
     }
 

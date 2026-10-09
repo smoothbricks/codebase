@@ -809,9 +809,9 @@ fn all_lifecycle_options_use_camel_case_and_omit_only_optionals() {
         json!({"quarantine":false,"reAdopt":false})
     );
     assert_eq!(
-        serde_json::to_value(CreateOptions {
+        serde_json::to_value(ForkOptions {
             revision: Some(RevisionTarget::Oid(oid('a'))),
-            from_workspace: Some(workspace()),
+            clean: true,
             browse: false,
             slot: Some(2),
             register: true,
@@ -819,8 +819,8 @@ fn all_lifecycle_options_use_camel_case_and_omit_only_optionals() {
         })
         .unwrap(),
         json!({
-            "revision":{"oid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
-            "fromWorkspace":"raven",
+            "ref":{"oid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+            "clean":true,
             "browse":false,
             "slot":2,
             "register":true,
@@ -886,8 +886,8 @@ fn all_lifecycle_options_use_camel_case_and_omit_only_optionals() {
         AttachOptions::default()
     );
     assert_eq!(
-        serde_json::from_value::<CreateOptions>(json!({})).unwrap(),
-        CreateOptions::default()
+        serde_json::from_value::<ForkOptions>(json!({})).unwrap(),
+        ForkOptions::default()
     );
     let land_default = serde_json::from_value::<LandOptions>(json!({})).unwrap();
     assert!(land_default.retire);

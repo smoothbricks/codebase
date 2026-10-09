@@ -22,7 +22,7 @@ use crate::api::dto::LandingCommits;
 use crate::api::dto::RunSandboxMode;
 use crate::api::dto::{
     AdmissionKey, AdoptOptions, AttachOptions, CheckpointOptions, CheckpointQuota,
-    CheckpointResult, CommandArg, CreateOptions, DoctorReport, EmptyResult, ExecRequest, GcOptions,
+    CheckpointResult, CommandArg, DoctorReport, EmptyResult, ExecRequest, ForkOptions, GcOptions,
     GcReport, GrantDelta, GrantSet, JobId, JobInfo, JobJournalCursor, JobListeningPorts, JobTail,
     JobTailLimits, LandOptions, LandReport, MirrorInfo, ProjectGrantDelta, ProjectGrants,
     PushOptions, PushReport, RebaseOptions, RebaseReport, RemoveOptions, RemoveProjectOptions,
@@ -112,12 +112,39 @@ pub trait ProjectRuntimeHost: Send + 'static {
     async fn workspace_at(&mut self, path: PathBuf) -> Result<WorkspaceSnapshot>;
 
     async fn adopt(&mut self, options: AdoptOptions) -> Result<WorkspaceSnapshot>;
-    async fn create(
+    async fn resume_fork(
         &mut self,
         workspace: WorkspaceName,
-        options: CreateOptions,
+        options: crate::storage::recovery::MintOptions,
     ) -> Result<WorkspaceSnapshot>;
     async fn fork(
+        &mut self,
+        source: Option<WorkspaceName>,
+        workspace: WorkspaceName,
+        options: ForkOptions,
+    ) -> Result<WorkspaceSnapshot> {
+        if options.revision.is_some() && !options.clean {
+            return Err(CowshedError::usage(
+                "a fork ref requires clean: true",
+                "set clean: true when selecting a ref",
+            ));
+        }
+        if workspace == main_name() {
+            return Err(CowshedError::usage(
+                "main is not a fork destination",
+                "choose a non-main workspace name",
+            ));
+        }
+        self.resume_fork(
+            workspace,
+            crate::storage::recovery::MintOptions::fork(
+                Some(source.unwrap_or_else(main_name)),
+                options,
+            ),
+        )
+        .await
+    }
+    async fn clone_for_rename(
         &mut self,
         source: WorkspaceName,
         destination: WorkspaceName,
@@ -1027,14 +1054,12 @@ impl ProjectActor {
             Op::CoordinatorAdopt(params) => {
                 respond::<operations::CoordinatorAdopt>(&self.coordinator_adopt(params).await?)
             }
-            Op::CoordinatorCreate(params) => {
-                self.require_repo(&params.repo_id)?;
-                let snapshot = self.host.create(params.workspace, params.options).await?;
-                respond::<operations::CoordinatorCreate>(&workspace_view(snapshot))
-            }
             Op::CoordinatorFork(params) => {
                 self.require_repo(&params.repo_id)?;
-                let snapshot = self.host.fork(params.source, params.destination).await?;
+                let snapshot = self
+                    .host
+                    .fork(params.source, params.workspace, params.options)
+                    .await?;
                 respond::<operations::CoordinatorFork>(&workspace_view(snapshot))
             }
             Op::CoordinatorRename(params) => {
@@ -3547,16 +3572,20 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                                 if options.register {
                                     self.register_workspace_in_main(&workspace).await?;
                                 }
-                                self.commitments
-                                    .record(CommitmentDraft::WorkspaceIntroduced {
+                                let draft = if options.clean.is_some() {
+                                    let source = options.from_workspace.clone().unwrap_or_else(main_name);
+                                    CommitmentDraft::Fork {
                                         repo_id: self.descriptor.repo_id.clone(),
-                                        workspace_incarnation: current
-                                            .derived
-                                            .workspace
-                                            .incarnation()
-                                            .clone(),
-                                    })
-                                    .await?;
+                                        source_incarnation: self.current(&source).await?.derived.workspace.incarnation().clone(),
+                                        destination_incarnation: current.derived.workspace.incarnation().clone(),
+                                    }
+                                } else {
+                                    CommitmentDraft::WorkspaceIntroduced {
+                                        repo_id: self.descriptor.repo_id.clone(),
+                                        workspace_incarnation: current.derived.workspace.incarnation().clone(),
+                                    }
+                                };
+                                self.commitments.record(draft).await?;
                                 self.complete_lifecycle_intent(
                                     &workspace,
                                     LifecycleIntentCompletion::Workspace(
@@ -3575,7 +3604,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                                         "cowshed: leaving the unfinished {verb} of {workspace} to the rm retiring it"
                                     );
                                 } else {
-                                    self.create(workspace, options).await?;
+                                    self.resume_fork(workspace, options).await?;
                                 }
                             }
                             Err(error) => return Err(error),
@@ -3622,7 +3651,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                                     "cowshed: leaving the unfinished {verb} of {destination} to the rm retiring it"
                                 );
                             } else {
-                                self.fork(source, destination).await?;
+                                self.clone_for_rename(source, destination).await?;
                             }
                         }
                         Err(error) => return Err(error),
@@ -4938,7 +4967,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         Ok(())
     }
 
-    /// Add `workspace`'s mount as a remote in main's repository, for `cowshed new --register`.
+    /// Add `workspace`'s mount as a remote in main's repository, for `cowshed fork --register`.
     ///
     /// Opt-in because it is host-side state that accumulates one entry per workspace: a
     /// coordinator minting and retiring all day would silt up the user's config.
@@ -5110,9 +5139,17 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         forked_from: Option<WorkspaceName>,
         git_worktree: bool,
     ) -> Result<crate::storage::lifecycle::OperationIdentity> {
+        let base_commit = match forked_from.as_ref() {
+            Some(source) => {
+                crate::git::GitRepository::from_root(self.workspace_mount_path(source)?)
+                    .head_oid()
+                    .await?
+            }
+            None => self.git.head_oid().await?,
+        };
         Ok(crate::storage::lifecycle::OperationIdentity {
             project_root: self.descriptor.git_root.to_path_buf(),
-            base_commit: self.git.head_oid().await?.as_str().to_owned(),
+            base_commit: base_commit.as_str().to_owned(),
             // One clock for the runtime module. Spawning `/bin/date` was a process, a pipe, and
             // a UTF-8 parse to render what `SystemTime` already holds.
             created_at: super::supervisor::utc_now()?.as_str().to_owned(),
@@ -8531,10 +8568,10 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         self.conclude_adoption(&receipt.workspace, first).await
     }
 
-    async fn create(
+    async fn resume_fork(
         &mut self,
         workspace: WorkspaceName,
-        options: CreateOptions,
+        options: crate::storage::recovery::MintOptions,
     ) -> Result<WorkspaceSnapshot> {
         use super::supervisor::CommitmentSink;
         use crate::storage::lifecycle::LifecyclePlanner;
@@ -8573,7 +8610,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         if options.register && git_worktree {
             return Err(CowshedError::usage(
                 "--register has nothing to fetch on a git-worktree workspace: main already holds its branch",
-                format!("cowshed new {workspace} --git-worktree"),
+                format!("cowshed fork {workspace} --git-worktree"),
             ));
         }
         // `--ref` is resolved before anything is journaled, in the repository the clone inherits:
@@ -8623,7 +8660,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                 .operation_identity(
                     grants,
                     Some(format!("cowshed/{workspace}")),
-                    None,
+                    options.clean.map(|_| source_name.clone()),
                     git_worktree,
                 )
                 .await?;
@@ -8644,7 +8681,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
             // soon as the checkout moves, and only the canonical mount is maintained by
             // `cowshed mv`.
             let main_mount = self.workspace_mount_path(&main_name())?;
-            // The tree the image came from: main under a plain `new`, the sibling under `--from`.
+            // The tree the image came from: main by default, or the named session source.
             // It produced every byte the clone inherited, so it is what inherited links and the
             // Git identity resolve against — never main unless main is the source.
             let source_mount = self.workspace_mount_path(&source_name)?;
@@ -8654,6 +8691,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                 crate::git::WorkspaceRepository::Standalone
             };
             let start = start.as_ref().map(GitOid::as_str);
+            let clean = options.clean.unwrap_or(source_name == main_name());
             let destination = workspace.clone();
             if slot.is_none() {
                 self.mark_lifecycle_intent_mutating(&workspace).await?;
@@ -8674,7 +8712,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                 };
                 async move {
                     timed_async(
-                        "new",
+                        "fork",
                         "build-volume",
                         preparing.prepare_fork(seed_source, source_mount, destination),
                     )
@@ -8696,13 +8734,13 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                         // image was cloned is held by nobody here, and would refuse every write to
                         // the file it guards.
                         timed_async(
-                            "new",
+                            "fork",
                             "locks",
                             crate::inherited_git_locks::discard_in(&stage.mount_point),
                         )
                         .await?;
                         timed_async(
-                            "new",
+                            "fork",
                             "daemons",
                             crate::inherited_daemons::macos::discard_in(
                                 &stage.mount_point,
@@ -8711,7 +8749,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                         )
                         .await?;
                         timed_async(
-                            "new",
+                            "fork",
                             "build-volume-seed",
                             build_volumes.finish_fork(
                                 prepared?,
@@ -8732,6 +8770,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                                 },
                                 repository_shape,
                                 start,
+                                clean,
                                 stage.resuming,
                             )
                             .await
@@ -8748,17 +8787,18 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                 self.register_workspace_in_main(&workspace).await?;
             }
             timed_async(
-                "new",
+                "fork",
                 "commitment",
                 self.commitments
-                    .record(super::supervisor::CommitmentDraft::WorkspaceIntroduced {
+                    .record(super::supervisor::CommitmentDraft::Fork {
                         repo_id: self.descriptor.repo_id.clone(),
-                        workspace_incarnation: receipt.workspace.incarnation().clone(),
+                        source_incarnation: source.derived.workspace.incarnation().clone(),
+                        destination_incarnation: receipt.workspace.incarnation().clone(),
                     }),
             )
             .await?;
             timed_async(
-                "new",
+                "fork",
                 "journal",
                 self.complete_lifecycle_intent(
                     &workspace,
@@ -8768,8 +8808,8 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                 ),
             )
             .await?;
-            timed_async("new", "supervisor", self.ensure_supervisor(&workspace)).await?;
-            timed_async("new", "snapshot", self.snapshot_named(&workspace)).await
+            timed_async("fork", "supervisor", self.ensure_supervisor(&workspace)).await?;
+            timed_async("fork", "snapshot", self.snapshot_named(&workspace)).await
         }
         .await;
         if outcome.is_err() {
@@ -8848,7 +8888,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         }
     }
 
-    async fn fork(
+    async fn clone_for_rename(
         &mut self,
         source: WorkspaceName,
         destination: WorkspaceName,
@@ -8975,6 +9015,8 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                                     &forked.to_string(),
                                     &main_mount,
                                     None,
+                                    None,
+                                    false,
                                     stage.resuming,
                                 )
                                 .await?;
@@ -9063,7 +9105,8 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
             ));
         }
 
-        self.fork(source.clone(), destination.clone()).await?;
+        self.clone_for_rename(source.clone(), destination.clone())
+            .await?;
         // The source's commits are not being discarded, they are being republished under the
         // destination, whose image is a copy of this one — so the landed-ancestry gate that guards
         // a real removal would refuse a rename that loses nothing. This retires the source directly
@@ -15895,7 +15938,7 @@ fn require_checkpointable(
             "git-worktree workspace {name} cannot {verb}: its history lives in main, not in its image"
         ),
         format!(
-            "commit and cowshed land {name}, or cowshed new <name> for a checkpointable workspace"
+            "commit and cowshed land {name}, or cowshed fork <name> for a checkpointable workspace"
         ),
     ))
 }
@@ -15918,7 +15961,7 @@ fn another_process_is_running(workspace: &WorkspaceName) -> CowshedError {
 }
 
 /// The clone intent an abandoned clone's own metadata implies: a fork when it records its
-/// source, otherwise a create from main. A create `--from` a workspace records no source, so it
+/// source, otherwise a historical create from main. Older create intents could name a session without recording it here, so it
 /// is retired as a create from main: the source only anchors the pending image's identity checks,
 /// and the retirement's containment check against main still guards the clone's history.
 #[cfg(target_os = "macos")]
@@ -15932,9 +15975,9 @@ fn abandoned_clone_origin(
         },
         None => crate::storage::recovery::LifecycleIntent::Create {
             workspace: metadata.workspace.clone(),
-            options: CreateOptions {
+            options: crate::storage::recovery::MintOptions {
                 git_worktree: metadata.info_snapshot.git_worktree,
-                ..CreateOptions::default()
+                ..crate::storage::recovery::MintOptions::default()
             },
         },
     }
@@ -16059,7 +16102,7 @@ fn merge_driver_finding(
     }
 }
 
-/// The first-write cost at which main's extent map alone spends the budget `cowshed new` has for
+/// The first-write cost at which main's extent map alone spends the budget `cowshed fork` has for
 /// its whole cold path (08_testing.md), and the rewrite starts paying for itself.
 #[cfg(target_os = "macos")]
 const CLONE_FIRST_WRITE_BUDGET: std::time::Duration = std::time::Duration::from_secs(1);
@@ -17328,7 +17371,7 @@ mod git_worktree_tests {
             assert!(error.message.contains(verb));
             // Both honest substitutes: keep the work, or mint something checkpointable.
             assert!(error.hint.contains("cowshed land raven"), "{}", error.hint);
-            assert!(error.hint.contains("cowshed new"), "{}", error.hint);
+            assert!(error.hint.contains("cowshed fork"), "{}", error.hint);
         }
     }
 

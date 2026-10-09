@@ -703,8 +703,8 @@ async fn directory_plain_git_repository_adopts_clones_executes_and_lands_without
         .reconcile_gateway()
         .await
         .expect("serve plain repository");
-    phase("new topic");
-    let (created, _, stderr) = run(&mut service, ["new", "topic"]).await;
+    phase("fork topic");
+    let (created, _, stderr) = run(&mut service, ["fork", "topic"]).await;
     assert_eq!(
         created.unwrap_or_else(|error| panic!(
             "plain clone: {error}; {}",
@@ -923,7 +923,7 @@ async fn directory_a_git_worktree_workspace_starts_its_supervisor_and_executes()
         .map(|line| format!("{line}\n"))
         .collect::<String>();
     fs::write(&main_exclude, stripped).expect("strip cowshed's excludes from main's");
-    let (created, _, stderr) = run(&mut service, ["new", "linked-topic", "--git-worktree"]).await;
+    let (created, _, stderr) = run(&mut service, ["fork", "linked-topic", "--git-worktree"]).await;
     assert_eq!(
         created.unwrap_or_else(|error| panic!(
             "git-worktree clone: {error}; {}",
@@ -1432,7 +1432,7 @@ async fn land_nx_project(
     });
     let nx_reads = nx_read_paths(&fixture_nx(&fixture.checkout));
     let mut service = serve_project(&mut fixture, &nx_reads).await;
-    let (created, _, stderr) = run(&mut service, ["new", "topic"]).await;
+    let (created, _, stderr) = run(&mut service, ["fork", "topic"]).await;
     assert_eq!(
         created.unwrap_or_else(|error| panic!(
             "new topic: {error}; {}",
@@ -1748,7 +1748,7 @@ async fn sh(service: &mut ActorBridge, workspace: &str, script: &str) -> Vec<u8>
 }
 
 async fn new_workspace(service: &mut ActorBridge, name: &str) -> PathBuf {
-    succeed(service, ["new", name]).await;
+    succeed(service, ["fork", name]).await;
     let mount = service
         .path(name, false)
         .await

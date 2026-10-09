@@ -2,7 +2,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use cowshed_core::api::dto::{AdoptOptions, CreateOptions, RemoveOptions, RevisionTarget};
+use cowshed_apfs::{
+    ApfsBackend, CommandRunner, DetachIntent, DiskImageSource, ImageCapture, MacOsApfsBackend,
+    SystemCommandRunner,
+};
+use cowshed_core::api::dto::{AdoptOptions, ForkOptions, RemoveOptions, RevisionTarget};
 use cowshed_core::api::operations::OperationRequest;
 use cowshed_core::api::server::ConnectionAuthority;
 use cowshed_core::metadata::{
@@ -151,15 +155,15 @@ impl Fixture {
         Ok(response.into_answer()?.0)
     }
 
-    async fn create(
+    async fn mint(
         &self,
         runtime: &ProjectRuntime,
         workspace: &str,
-        options: CreateOptions,
+        options: ForkOptions,
     ) -> Result<Value> {
         self.call(
             runtime,
-            "coordinator.create",
+            "coordinator.fork",
             json!({ "repoId": self.repo, "workspace": workspace, "options": options }),
         )
         .await
@@ -174,7 +178,7 @@ impl Fixture {
         self.call(
             runtime,
             "coordinator.fork",
-            json!({ "repoId": self.repo, "source": source, "destination": destination }),
+            json!({ "repoId": self.repo, "source": source, "workspace": destination, "options": ForkOptions::default() }),
         )
         .await
     }
@@ -438,14 +442,16 @@ fn completed(record: Option<LifecycleIntentRecord>) -> bool {
 /// A short commit id main does not hold, spelled as `cowshed new --ref` passes it.
 const MISSING_REVISION: &str = "2f9cfc74";
 
-fn missing_revision() -> CreateOptions {
-    CreateOptions {
+fn missing_revision() -> ForkOptions {
+    ForkOptions {
         revision: Some(RevisionTarget::parse_cli(MISSING_REVISION).expect("revision spelling")),
-        ..CreateOptions::default()
+        clean: true,
+        ..ForkOptions::default()
     }
 }
 
 #[tokio::test]
+
 async fn a_create_interrupted_after_its_pending_clone_exists_still_resumes() {
     // One adopted project proves both journal spellings (08_testing.md, "Host limit"): the
     // current binary's `Mutating` create, and an older binary's `Prepared` one — binaries
@@ -453,19 +459,46 @@ async fn a_create_interrupted_after_its_pending_clone_exists_still_resumes() {
     // not its phase, is what recovery decides on.
     let fixture = Fixture::new("mutating-create");
     let runtime = fixture.adopt().await;
-    for workspace in ["resumed", "legacy"] {
-        fixture.plant_workspace_branch(workspace);
-        fixture
-            .create(&runtime, workspace, CreateOptions::default())
-            .await
-            .expect_err("the clone's initializer refuses the inherited workspace branch");
-    }
+    fixture.plant_workspace_branch("resumed");
+
+    fixture
+        .mint(&runtime, "resumed", ForkOptions::default())
+        .await
+        .expect_err("the clone's initializer refuses the inherited workspace branch");
     let record = fixture
         .intent("resumed")
         .expect("the intent stays journaled");
     assert_eq!(record.phase, LifecycleIntentPhase::Mutating);
     assert_eq!(record.completion, None);
-    fixture.strip_phase("legacy");
+    assert_eq!(fixture.listed(&runtime).await, ["main"]);
+    runtime
+        .shutdown()
+        .await
+        .expect("stop the interrupted runtime");
+
+    let gc = fixture.gc().await;
+    assert_eq!(fixture.listed(&gc).await, ["main", "resumed"]);
+    assert!(completed(fixture.intent("resumed")));
+    gc.shutdown().await.expect("stop gc");
+}
+
+/// Binaries before the `Mutating` mark journaled every create `Prepared`. Its pending clone,
+/// not its phase, is what recovery decides on.
+#[tokio::test]
+async fn an_older_binarys_prepared_create_with_a_pending_clone_still_resumes() {
+    let fixture = Fixture::new("legacy-create");
+    let runtime = fixture.adopt().await;
+    fixture.plant_workspace_branch("resumed");
+
+    fixture
+        .mint(&runtime, "resumed", ForkOptions::default())
+        .await
+        .expect_err("the clone's initializer refuses the inherited workspace branch");
+    runtime
+        .shutdown()
+        .await
+        .expect("stop the interrupted runtime");
+    fixture.strip_phase("resumed");
     assert_eq!(
         fixture.intent("legacy").expect("legacy intent").phase,
         LifecycleIntentPhase::Prepared
@@ -488,14 +521,14 @@ async fn a_slot_bound_create_that_fails_after_binding_is_kept_and_resumed() {
     let fixture = Fixture::new("slot-create");
     let runtime = fixture.adopt().await;
     let claims = fixture.claim_every_port_block();
-    let slotted = CreateOptions {
+    let slotted = ForkOptions {
         slot: Some(3),
-        ..CreateOptions::default()
+        ..ForkOptions::default()
     };
 
     refused(
         fixture
-            .create(&runtime, "slotted", slotted)
+            .mint(&runtime, "slotted", slotted)
             .await
             .expect_err("every port block is claimed"),
     );
@@ -507,12 +540,12 @@ async fn a_slot_bound_create_that_fails_after_binding_is_kept_and_resumed() {
 
     // A bind refusal mutates nothing: the slot is another workspace's.
     fixture
-        .create(
+        .mint(
             &runtime,
             "intruder",
-            CreateOptions {
+            ForkOptions {
                 slot: Some(3),
-                ..CreateOptions::default()
+                ..ForkOptions::default()
             },
         )
         .await
@@ -541,7 +574,7 @@ async fn rm_retires_a_pending_clone_whose_create_can_never_be_replayed() {
     let runtime = fixture.adopt().await;
     fixture.commit_escaping_link();
     fixture
-        .create(&runtime, "wedged", CreateOptions::default())
+        .mint(&runtime, "wedged", ForkOptions::default())
         .await
         .expect_err("the clone's initializer refuses the escaping link");
     runtime
@@ -563,6 +596,26 @@ async fn rm_retires_a_pending_clone_whose_create_can_never_be_replayed() {
     rm.shutdown().await.expect("stop the removing runtime");
     fixture.remove_escaping_link();
 
+    let next = fixture
+        .open_naming("wedged")
+        .await
+        .expect("`new wedged` opens: the retired create is not replayed");
+    fixture
+        .mint(&next, "wedged", ForkOptions::default())
+        .await
+        .expect("the name is free again");
+    assert_eq!(fixture.listed(&next).await, ["main", "wedged"]);
+    next.shutdown().await.expect("stop the creating runtime");
+}
+
+/// The same unreplayable create with no clone behind it — stopped after its mutation mark,
+/// before the clone's first write. `rm` has only the intent to retire, and retires it.
+#[tokio::test]
+async fn rm_retires_a_clone_intent_that_left_no_clone_and_can_never_be_replayed() {
+    let fixture = Fixture::new("unreplayable-intent");
+    let runtime = fixture.adopt().await;
+    runtime.shutdown().await.expect("stop the adopting runtime");
+    fixture.journal_unreplayable_create("wedged");
     let rm = fixture
         .open_removing("stranded")
         .await
@@ -579,23 +632,16 @@ async fn rm_retires_a_pending_clone_whose_create_can_never_be_replayed() {
     ));
     rm.shutdown().await.expect("stop the removing runtime");
 
-    for workspace in ["wedged", "stranded"] {
-        let next = fixture
-            .open_naming(workspace)
-            .await
-            .expect("`new` opens: the retired create is not replayed");
-        fixture
-            .create(&next, workspace, CreateOptions::default())
-            .await
-            .expect("the name is free again");
-        next.shutdown().await.expect("stop the creating runtime");
-    }
-    let listed = fixture.gc().await;
-    assert_eq!(
-        fixture.listed(&listed).await,
-        ["main", "stranded", "wedged"]
-    );
-    listed.shutdown().await.expect("stop gc");
+    let next = fixture
+        .open_naming("wedged")
+        .await
+        .expect("`new wedged` opens: the retired create is not replayed");
+    fixture
+        .mint(&next, "wedged", ForkOptions::default())
+        .await
+        .expect("the name is free again");
+    assert_eq!(fixture.listed(&next).await, ["main", "wedged"]);
+    next.shutdown().await.expect("stop the creating runtime");
 }
 
 /// The kernel claim on a new workspace's port block lasts until its image publication is
@@ -615,7 +661,7 @@ async fn a_created_workspaces_port_block_is_free_for_its_gateway_session_once_pu
     let claims = fixture.claim_every_port_block();
     refused(
         fixture
-            .create(&runtime, "refused", CreateOptions::default())
+            .mint(&runtime, "refused", ForkOptions::default())
             .await
             .expect_err("every port block is claimed"),
     );
@@ -645,7 +691,7 @@ async fn a_created_workspaces_port_block_is_free_for_its_gateway_session_once_pu
     LifecycleIntentJournal::update(&fixture.journal_path(), |journal| {
         journal.begin(LifecycleIntent::Create {
             workspace: name("refused"),
-            options: CreateOptions::default(),
+            options: cowshed_core::storage::recovery::MintOptions::default(),
         });
         Ok(())
     })
@@ -655,7 +701,7 @@ async fn a_created_workspaces_port_block_is_free_for_its_gateway_session_once_pu
     assert_eq!(fixture.intent("refused"), None);
 
     let error = fixture
-        .create(&runtime, "wedged", missing_revision())
+        .mint(&runtime, "wedged", missing_revision())
         .await
         .expect_err("main holds no such commit");
     assert!(
@@ -678,7 +724,7 @@ async fn a_created_workspaces_port_block_is_free_for_its_gateway_session_once_pu
         .expect("`new wedged` opens: nothing of the refused create is replayed");
     let gateway = fixture.gateway_at_hello("wedged");
     fixture
-        .create(&next, "wedged", CreateOptions::default())
+        .mint(&next, "wedged", ForkOptions::default())
         .await
         .expect("the name is free for a create that can succeed");
     assert_eq!(fixture.listed(&next).await, ["main", "wedged"]);

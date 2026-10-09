@@ -552,7 +552,7 @@ pub enum StepReport {
         step: u32,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         parent: Option<u32>,
-        /// The verb or layer the step belongs to: `new`, `apfs`.
+        /// The verb or layer the step belongs to: `fork`, `apfs`.
         scope: String,
         /// The step within its scope: `links`, `canonical/mount`.
         name: String,
@@ -2680,11 +2680,10 @@ pub struct AdoptOptions {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase", deny_unknown_fields)]
-pub struct CreateOptions {
-    #[serde(skip_serializing_if = "Option::is_none")]
+pub struct ForkOptions {
+    #[serde(rename = "ref", skip_serializing_if = "Option::is_none")]
     pub revision: Option<RevisionTarget>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub from_workspace: Option<WorkspaceName>,
+    pub clean: bool,
     pub browse: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub slot: Option<u32>,

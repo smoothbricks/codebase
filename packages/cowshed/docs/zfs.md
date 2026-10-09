@@ -71,7 +71,7 @@ Same path before and after, like macOS.
 ## What's different from macOS (all of it pleasant)
 
 ```
-$ cowshed new raven
+$ cowshed fork raven
 cowshed: snapshot rpool/cowshed/projects/acme/widget/main@cowshed:raven
 cowshed: cloned to ws/raven (copy-on-write)
 cowshed: branch cowshed/raven created from main @ 6f3a2c1
@@ -79,9 +79,9 @@ next: cowshed exec raven -- <cmd>
 <mount-root>/acme/widget/raven
 ```
 
-- **`cowshed new` is tens of milliseconds.** Snapshot + clone are O(1) metadata operations, and the clone mounts as part
-  of creation. No 250 ms attach, and no fsck pass — ZFS snapshots are transactionally consistent by construction, so the
-  crash-consistency dance the image substrate does (sync, clone, verify) simply doesn't exist.
+- **`cowshed fork` is tens of milliseconds.** Snapshot + clone are O(1) metadata operations, and the clone mounts as
+  part of creation. No 250 ms attach, and no fsck pass — ZFS snapshots are transactionally consistent by construction,
+  so the crash-consistency dance the image substrate does (sync, clone, verify) simply doesn't exist.
 - **`cowshed checkpoint raven before-refactor` is instant and pinned.** Publication first crosses the same supervisor
   barrier as APFS: complete Arrow batches and protected spill files are sealed, and a manifest commits every
   checkpoint-resident job byte. Small terminal streams may remain inline in Arrow, so checkpointing does not force one

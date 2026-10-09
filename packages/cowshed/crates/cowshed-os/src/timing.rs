@@ -313,7 +313,7 @@ mod tests {
         let (sender, mut receiver) = mpsc::unbounded_channel();
         let result = reporting(
             StepSink::new(sender),
-            timed_async("new", "init", async {
+            timed_async("fork", "init", async {
                 timed("apfs", format_args!("canonical/{}", "mount"), || {
                     Ok::<_, String>(())
                 })?;
@@ -332,7 +332,7 @@ mod tests {
         assert_eq!(
             reports(&mut receiver),
             [
-                started(0, None, "new", "init"),
+                started(0, None, "fork", "init"),
                 started(1, Some(0), "apfs", "canonical/mount"),
                 ended(1, None),
                 started(2, Some(0), "apfs", "canonical/creds"),
@@ -352,7 +352,7 @@ mod tests {
             let (sender, receiver) = mpsc::unbounded_channel();
             let task = tokio::spawn(reporting(
                 StepSink::new(sender),
-                timed_async("new", name, async move {
+                timed_async("fork", name, async move {
                     barrier.wait().await;
                     timed("apfs", format_args!("{name}/inner"), || Ok::<_, String>(()))
                 }),
@@ -372,7 +372,7 @@ mod tests {
             assert_eq!(
                 super::tests::reports(reports),
                 [
-                    started(0, None, "new", name),
+                    started(0, None, "fork", name),
                     started(1, Some(0), "apfs", &format!("{name}/inner")),
                     ended(1, None),
                     ended(0, None),

@@ -236,9 +236,10 @@ fn fence_sub_steps_distinguish_crash_window_from_external_deletion() {
     let mut journal = LifecycleIntentJournal::default();
     journal.begin(LifecycleIntent::Create {
         workspace: workspace.clone(),
-        options: cowshed_core::api::dto::CreateOptions {
+        options: cowshed_core::storage::recovery::MintOptions {
             revision: None,
             from_workspace: None,
+            clean: None,
             browse: false,
             slot: None,
             register: false,

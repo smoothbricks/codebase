@@ -29,7 +29,7 @@ directly, Bun/Node applications use `cowshed-napi`, and shell-based agents use t
   created unprivileged: `diskutil image create blank --format RAW --fs None`, attach `--noMount`,
   `newfs_apfs -U/-G … -e`, `fsck_apfs -q`, `hdiutil detach`; attach is `diskutil image attach` (01_storage.md).
 - **No workspace pools**: main-as-base; formatted blank templates serve image minting only. `cowshed adopt` turns the
-  existing checkout into an image mounted at its original path; `cowshed new` descriptor-clones main's live image after
+  existing checkout into an image mounted at its original path; `cowshed fork` descriptor-clones main's live image after
   a flush, with main still mounted (filesystem crash-consistent). Safe because secrets never live in worktrees (gateway
   holds them; no `.env` files). The invariant is enforced, not assumed: a built-in scanner gates `cowshed adopt`
   (blocking, full-tree, `--quarantine` escape), gates `cowshed push`/autosave on the content delta, and audits in
@@ -264,9 +264,9 @@ Open experiments (fold into Phase 1 as tests, don't block on them):
 - **In-block-only self-connects in practice** — under the outbound-only model an in-sandbox client can reach only its
   own block ports; survey which real tools break by spawning a helper server on a random port and connecting back (test
   runners, HMR side-channels), and whether the PORT convention covers them (04_sandbox.md).
-- **devenv eval cost across clone paths** — needs the first real `cowshed new`: does a fresh clone's `.envrc` evaluation
-  reuse the in-image `.devenv`/Nix state (cheap) or re-evaluate? Related measurement: warm `direnv exec` on this repo
-  costs 1.3–2.9 s (11_shell.md's pool rationale).
+- **devenv eval cost across clone paths** — needs the first real `cowshed fork`: does a fresh clone's `.envrc`
+  evaluation reuse the in-image `.devenv`/Nix state (cheap) or re-evaluate? Related measurement: warm `direnv exec` on
+  this repo costs 1.3–2.9 s (11_shell.md's pool rationale).
 - (b) bun registry token via the per-workspace port URL / registry auth (the workspace's identity is primarily its
   data-plane _port_ now, so this decides only whether `COWSHED_GATEWAY_TOKEN` survives as a load-bearing export); (c)
   bun's Linux copyfile backend × OpenZFS BRT (`copy_file_range` — empties layer 2 on ZFS); cargo `trim-paths`
@@ -316,11 +316,11 @@ Interception + telemetry verification (05_gateway.md, 13_telemetry.md — fold i
 
 ## Acceptance
 
-- `cowshed adopt && cowshed new x && cowshed exec x -- <build> && cowshed push x && cowshed rm x` works end-to-end on
+- `cowshed adopt && cowshed fork x && cowshed exec x -- <build> && cowshed push x && cowshed rm x` works end-to-end on
   each supported host, sandboxed, with caches warm from main.
 - Exit code 6 and a grant hint appear only on authoritative sandbox-denial evidence. After a filesystem grant, the prior
   supervisor drains and relaunches at the new revision before retry; egress and simulator grants apply immediately.
-- `cowshed attach` fast path ≤ 25 ms; `cowshed new` ≤ 1 s cold; `cowshed rm` returns instantly.
+- `cowshed attach` fast path ≤ 25 ms; `cowshed fork` ≤ 1 s cold; `cowshed rm` returns instantly.
 - Zero host-visible inode growth per workspace beyond the image file + grants file.
 - Substrate parity: the acceptance flow above passes on Linux/ZFS with Landlock enforcement (integration leg; can run in
   CI on a ZFS-capable Linux host once the runner exists — bootstrap order is macOS first, then Linux substrate, then the

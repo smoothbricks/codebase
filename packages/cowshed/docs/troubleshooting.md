@@ -226,7 +226,7 @@ Xcode DerivedData does key on absolute paths: slot mounts (`new --slot`) recycle
 Every build-state path is a fixed link onto the checkout's build volume
 (`.nx/workspace-data -> ../.cowshed/build/nx/workspace-data`). A tool that removes the path itself — `nx reset`, an
 `rm -rf .nx/workspace-data` — leaves the next Nx run to make a real directory there: its task database and graph then
-live outside the volume, so no fork, land or seed sees them, and every `cowshed new` clones the directory from main.
+live outside the volume, so no fork, land or seed sees them, and every `cowshed fork` clones the directory from main.
 `cowshed doctor` reports each such path as `build-link`; `cowshed exec <ws> -- true` relinks it (the refresh before
 every exec discards what is there), and `cowshed setup` does the same for every workspace. A script that means to clear
 Nx's state should empty the directory, never remove the path.
@@ -289,7 +289,7 @@ backup.
 - **Uncommitted work exists only in the workspace image.** Nothing saves it in the background.
 
 Restoring a machine: clone main's repo from its origin remote, `cowshed adopt` again; workspaces are recreated from
-their pushed branches (`cowshed new x --ref refs/cowshed/x/heads/<branch>`). Checkpoints and images are not backup
+their pushed branches (`cowshed fork x --ref refs/cowshed/x/heads/<branch>`). Checkpoints and images are not backup
 artifacts — never treat them as one. Export any terminal job stream you need to retain independently; cowshed
 materializes a clone, reflink, or copy, never a hardlink to protected content.
 
@@ -377,7 +377,7 @@ evicting a live session. Retire one of the two (`cowshed rm`, or `detach` and re
 and rerun `doctor`. One workspace that cannot be installed no longer stops the rest of the project from being installed;
 the error names every failed identity.
 
-## `cowshed ls` takes tens of seconds; `cowshed new` or `doctor` takes a minute
+## `cowshed ls` takes tens of seconds; `cowshed fork` or `doctor` takes a minute
 
 Per-command cost does not grow with history or with the number of warm workspaces: no command reads the audit segments
 under `/private/cowshed/store/telemetry/` (they are write-only telemetry; authority is the image inventory); the host
@@ -388,7 +388,7 @@ arbitration client on the host); one project open validates the repository bindi
 every workspace it recovers. When a command is still slow on a wait in a host process,
 `ps -o pid,ppid,etime,args -ax | grep -E 'diskutil|hdiutil|git'` names it while it runs.
 
-`cowshed new` prints a `cowshed: apfs canonical/<step>` or `cowshed: new <step>` span with its elapsed time for every
+`cowshed fork` prints a `cowshed: apfs canonical/<step>` or `cowshed: fork <step>` span with its elapsed time for every
 step, so the slow step is named on stderr. On a large repository two steps carry nearly all of the time:
 
 - **The first write into the fresh clone**, `apfs canonical/first-write`. The clone call shares main's image extent map
@@ -437,7 +437,7 @@ command line: a command that kept its phase ten seconds while the other class wa
 ## Every attach fails with `error code 150`
 
 `Failed to initialize IO manager … error code 150` (`kIOReturnNoResources`) from every image attach,
-`diskutil image info`, `cowshed new` and cold mount, while images already attached keep working, means the host's
+`diskutil image info`, `cowshed fork` and cold mount, while images already attached keep working, means the host's
 disk-image attach pool is spent. A command that meets it fails with `AttachPoolExhausted`, and `cowshed doctor` says
 which of two causes spent it.
 

@@ -385,30 +385,6 @@ export type CpuTotals = {
   readonly sysUs: CpuMicros;
 };
 
-export type CreateOptions = {
-  readonly revision?: RevisionTarget;
-  readonly fromWorkspace?: WorkspaceName;
-  readonly browse?: boolean;
-  readonly slot?: number & tags.Type<'uint32'>;
-  /**
-   * Also register this workspace as a remote in main's repository. Off by default: it is
-   * host-side state that accumulates one entry per workspace and outlives an interrupted retire.
-   */
-  readonly register?: boolean;
-  /**
-   * Mint a registered linked worktree of main's repository instead of a standalone clone: one
-   * object store and one ref namespace, at the cost of requiring main mounted and giving up
-   * checkpoint and restore.
-   */
-  readonly gitWorktree?: boolean;
-};
-
-export type CreateRequest = {
-  readonly repoId: RepoId;
-  readonly workspace: WorkspaceName;
-  readonly options: CreateOptions;
-};
-
 export type CredentialReport = {
   readonly routes: ReadonlyArray<CredentialRoute>;
 };
@@ -614,6 +590,31 @@ export type ForkCommitment = {
   readonly repoId: RepoId;
   readonly sourceIncarnation: WorkspaceIncarnation;
   readonly destinationIncarnation: WorkspaceIncarnation;
+};
+
+export type ForkOptions = {
+  readonly ref?: RevisionTarget;
+  readonly clean?: boolean;
+  readonly browse?: boolean;
+  readonly slot?: number & tags.Type<'uint32'>;
+  /**
+   * Also register this workspace as a remote in main's repository. Off by default: it is
+   * host-side state that accumulates one entry per workspace and outlives an interrupted retire.
+   */
+  readonly register?: boolean;
+  /**
+   * Mint a registered linked worktree of main's repository instead of a standalone clone: one
+   * object store and one ref namespace, at the cost of requiring main mounted and giving up
+   * checkpoint and restore.
+   */
+  readonly gitWorktree?: boolean;
+};
+
+export type ForkRequest = {
+  readonly repoId: RepoId;
+  readonly workspace: WorkspaceName;
+  readonly source?: WorkspaceName;
+  readonly options: ForkOptions;
 };
 
 export type GatewayStatus = {
@@ -2076,7 +2077,7 @@ export type StepReport =
       readonly step: number & tags.Type<'uint32'>;
       readonly parent?: number & tags.Type<'uint32'>;
       /**
-       * The verb or layer the step belongs to: `new`, `apfs`.
+       * The verb or layer the step belongs to: `fork`, `apfs`.
        */
       readonly scope: string;
       /**

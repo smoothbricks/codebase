@@ -547,7 +547,7 @@ pub(crate) mod codec {
         #[test]
         fn a_call_that_asks_for_its_steps_reads_them_as_step_frames() {
             let raw = serde_json::value::to_raw_value(&json!({})).expect("raw params");
-            let request = encode_rpc_request(9, "coordinator.create", &raw, None, true)
+            let request = encode_rpc_request(9, "coordinator.fork", &raw, None, true)
                 .expect("encode request");
             assert!(decode_request(&request).expect("decode request").steps());
 
