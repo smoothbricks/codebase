@@ -42,6 +42,10 @@ in {
       jq # Used in pre-commit hook and generally useful
       alejandra # Nix formatter
     ])
+    ++ lib.optionals pkgs.stdenv.isDarwin [
+      (pkgs.writeShellScriptBin "smoothbricks-macos-linker"
+        (builtins.readFile ../../packages/cowshed/scripts/macos-linker.sh))
+    ]
     # GARM/Linux CI: rustc needs host linker `cc` (-Zbuild-std, native crates).
     # N-API cross targets need raw Clang: Nix's cc-wrapper injects host include
     # paths ahead of the downloaded target sysroot.

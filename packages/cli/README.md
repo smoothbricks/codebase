@@ -406,7 +406,11 @@ nothing when nothing changed:
   `GITHUB_*`), never `CI` alone: agent harnesses export `CI=true` on every command they run. When that frozen install
   misses, the entry installs again without the flag, prints the `git diff` of what the install changed (the `bun.lock`
   the pull request should have committed) and fails. The diff goes to stderr, whole: devenv reports a failed shell entry
-  as its stderr alone, so anything written to stdout would be lost.
+  as its stderr alone, so anything written to stdout would be lost. The same receipt records each present
+  `bun.lock`/`bun.lockb` SHA-256 after success. Missing or mismatching lock receipts require the normal installer to
+  run; cowshed doctor reports missing install provenance or lock drift without installing or rewriting anything. Direct
+  `devenv shell` sources `.cowshed/env` in the managed prologue before project hooks, just as direnv does, so both entry
+  paths reuse cowshed's CI and pinned compiler-cache environment.
 - A repository whose `devenv.nix` enables `languages.python.uv` gets its uv workspace synced the same way
   (`uv sync --all-packages --all-groups`, `--locked` on a CI runner) into devenv's `UV_PROJECT_ENVIRONMENT`, with the
   interpreter devenv provides, and activated after the sync. Its inputs are the root `pyproject.toml`, `uv.lock` and

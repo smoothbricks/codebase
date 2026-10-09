@@ -486,7 +486,8 @@ Concrete targets come from concrete files:
   config path be absolute, and naming the file through the workspace root's `node_modules` link — never the plugin's
   real location — keeps it identical for a plugin linked from a checkout outside the workspace, whatever depth each
   workspace sits at; `--user-config-file none` still holds, because a developer's `~/.config/nextest` must not decide a
-  cached verdict.
+  cached verdict. Runtime hash inputs use that same workspace-relative installed path, never the physical plugin
+  checkout. Both the runtime output and the owning target's command declaration therefore remain portable.
 - A crate whose suite is better spread over several runners declares `[package.metadata.smoothbricks.test] shards = N`,
   and gets `cargo-test-<package>-shard1..N`, each running `--partition hash:i/N` under the same progress bound. nextest
   assigns a test to a shard by hashing its name, so the shards stay an exact partition of the crate as tests and test
@@ -712,6 +713,8 @@ The Nx patch repairs upstream Nx runtime behavior, separately from this plugin's
   its nearest existing ancestor when the directory has not been created. This avoids synchronously inventorying every
   mounted disk. Explicit `NX_MAX_CACHE_SIZE` and `nx.json.maxCacheSize` retain their precedence; filesystem errors other
   than a missing directory still fail the operation. See [upstream Nx #37269](https://github.com/nrwl/nx/pull/37269).
+  Cowshed exports an explicit caller-overridable default of configured build-volume capacity divided by ten for host
+  shells and jobs. The hosted setup action keeps its existing separate `20GB` ceiling.
 - **The daemon keeps graph plugin workers running.** Nx stops an isolated plugin worker after the last phase it has
   hooks for, which for a graph-only plugin is every graph; the daemon recomputes the graph on every tracked file change,
   so each change spawned and loaded every graph plugin's worker again (median 199 ms against 63 ms from edit to graph in

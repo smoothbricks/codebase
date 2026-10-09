@@ -158,8 +158,21 @@ describe('Cargo cache policy', () => {
       '.cargo/config.toml': '[target.aarch64-apple-darwin]\nlinker = "/opt/toolchain/clang"\n',
     });
     expect(result.failures).toBe(1);
-    expect(result.messages[0]).toContain('linker is an absolute path outside');
-    expect(result.messages[0]).toContain('repository-relative linker');
+    expect(result.messages[0]).toContain('checkout-resolved or mutable');
+    expect(result.messages[0]).toContain('bare program on PATH');
+  });
+
+  it('refuses checkout-relative linkers and accepts bare programs or immutable store paths', async () => {
+    for (const linker of ['scripts/macos-linker.sh', './clang', '/tmp/checkout/clang']) {
+      expect(
+        (await check({ '.cargo/config.toml': `[target.aarch64-apple-darwin]\nlinker = "${linker}"\n` })).failures,
+      ).toBe(1);
+    }
+    for (const linker of ['smoothbricks-macos-linker', '/nix/store/immutable-clang/bin/clang']) {
+      expect(
+        (await check({ '.cargo/config.toml': `[target.aarch64-apple-darwin]\nlinker = "${linker}"\n` })).failures,
+      ).toBe(0);
+    }
   });
 
   // Cargo does not fingerprint the checkout path, so a cowshed workspace runs the test binaries it

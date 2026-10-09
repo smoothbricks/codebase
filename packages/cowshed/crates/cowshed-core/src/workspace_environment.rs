@@ -1,6 +1,8 @@
 use std::fmt::Write as _;
 use std::path::Path;
 
+use crate::capabilities::{CapabilityContribution, EnvAction};
+
 use thiserror::Error;
 use zeroize::Zeroizing;
 
@@ -37,6 +39,8 @@ pub enum WorkspaceEnvironmentError {
         "workspace temp directory {0:?} cannot be exported: it must be an absolute UTF-8 path without a quote or newline"
     )]
     UnexportableTempDir(std::path::PathBuf),
+    #[error("workspace capability variable {0} cannot be exported as UTF-8 shell text")]
+    UnexportableCapability(&'static str),
     #[error(transparent)]
     Publication(#[from] MetadataError),
 }
@@ -52,6 +56,7 @@ pub enum EnvironmentMount<'a> {
     Served {
         workspace_mount: &'a Path,
         temp_dir: &'a Path,
+        capability_env: &'a CapabilityContribution,
     },
 }
 
@@ -99,6 +104,7 @@ pub(crate) fn write_workspace_environment(
         EnvironmentMount::Served {
             workspace_mount,
             temp_dir,
+            ..
         } => {
             let temp_dir = temp_dir
                 .to_str()
@@ -112,14 +118,31 @@ pub(crate) fn write_workspace_environment(
             ))
         }
     };
-    // Token alphabet is unpadded base64url (`A-Za-z0-9_-`), already shell-safe; it is pushed
-    // into a Zeroizing buffer and never through an intermediate String. Capacity is sized so the
-    // buffer cannot reallocate: 32 fixed bytes around the token, at most 68 for the port lines,
-    // 18 around the temp directory, 49 for the runtime link line, plus the fixed development CI
-    // policy.
+    // Keep the secret token in one Zeroizing buffer. Reserve capability values'
+    // shell-escaped bound too so publication does not reallocate and copy the token.
+    let capability_bytes = match mount {
+        EnvironmentMount::Served { capability_env, .. } => capability_env
+            .env
+            .iter()
+            .filter(|(name, _)| {
+                crate::capabilities::sccache::HOST_ENVIRONMENT.contains(name)
+                    || **name == "NX_MAX_CACHE_SIZE"
+            })
+            .map(|(name, action)| {
+                name.len()
+                    + 96
+                    + match action {
+                        EnvAction::Own(value) | EnvAction::Default(value) => value.len() * 4,
+                        EnvAction::Append(_) | EnvAction::Unset => 0,
+                    }
+            })
+            .sum::<usize>(),
+        EnvironmentMount::Minted(_) => 0,
+    };
     let mut contents = Zeroizing::new(String::with_capacity(
         192 + token.len()
             + DEV_CI_POLICY.len()
+            + capability_bytes
             + served.as_ref().map_or(0, |(temp_dir, _)| temp_dir.len()),
     ));
     contents.push_str(DEV_CI_POLICY);
@@ -145,6 +168,48 @@ pub(crate) fn write_workspace_environment(
             runtime_link.display()
         )
         .expect("writing to a String cannot fail");
+    }
+    if let EnvironmentMount::Served { capability_env, .. } = mount {
+        for name in crate::capabilities::sccache::HOST_ENVIRONMENT
+            .into_iter()
+            .chain(["NX_MAX_CACHE_SIZE"])
+        {
+            let Some(action) = capability_env.env.get(name) else {
+                continue;
+            };
+            match action {
+                EnvAction::Unset => {
+                    writeln!(&mut *contents, "unset {name}")
+                        .expect("writing to a String cannot fail");
+                }
+                EnvAction::Own(value) | EnvAction::Default(value) => {
+                    let value = value
+                        .to_str()
+                        .filter(|text| !text.contains(['\0', '\n', '\r']))
+                        .ok_or(WorkspaceEnvironmentError::UnexportableCapability(name))?;
+                    if matches!(action, EnvAction::Default(_)) {
+                        writeln!(&mut *contents, "if [ \"${{{name}+x}}\" != x ]; then")
+                            .expect("writing to a String cannot fail");
+                    }
+                    write!(&mut *contents, "export {name}='")
+                        .expect("writing to a String cannot fail");
+                    for character in value.chars() {
+                        if character == '\'' {
+                            contents.push_str("'\\''");
+                        } else {
+                            contents.push(character);
+                        }
+                    }
+                    contents.push_str("'\n");
+                    if matches!(action, EnvAction::Default(_)) {
+                        contents.push_str("fi\n");
+                    }
+                }
+                EnvAction::Append(_) => {
+                    return Err(WorkspaceEnvironmentError::UnexportableCapability(name));
+                }
+            }
+        }
     }
 
     write_atomic_bytes(
@@ -179,6 +244,7 @@ mod tests {
                     EnvironmentMount::Served {
                         workspace_mount: Path::new("/nonexistent-image"),
                         temp_dir: Path::new(refused),
+                        capability_env: &CapabilityContribution::default(),
                     },
                     &Zeroizing::new("token".to_owned()),
                     Platform::Linux,
@@ -210,6 +276,7 @@ mod tests {
             EnvironmentMount::Served {
                 workspace_mount: root,
                 temp_dir: &temp_dir,
+                capability_env: &CapabilityContribution::default(),
             },
             &Zeroizing::new("token".to_owned()),
             Platform::Linux,
@@ -251,5 +318,57 @@ mod tests {
                 "{marker:?}",
             );
         }
+    }
+
+    #[test]
+    fn host_capability_values_are_shell_quoted_and_defaults_preserve_overrides() {
+        use crate::fork_lock::Run;
+        let root =
+            std::env::temp_dir().join(format!("cowshed-env-values-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join(".cowshed")).unwrap();
+        let mut contribution = CapabilityContribution::default();
+        contribution.env.insert(
+            "RUSTC_WRAPPER",
+            EnvAction::Own("/store/it's a client".into()),
+        );
+        contribution.env.insert(
+            "NX_MAX_CACHE_SIZE",
+            EnvAction::Default("10737418240".into()),
+        );
+        write_workspace_environment(
+            EnvironmentMount::Served {
+                workspace_mount: &root,
+                temp_dir: &root,
+                capability_env: &contribution,
+            },
+            &Zeroizing::new("token".to_owned()),
+            Platform::Linux,
+            None,
+        )
+        .unwrap();
+        for override_value in [None, Some("20GB")] {
+            let mut command = std::process::Command::new("/bin/sh");
+            command
+                .env_clear()
+                .args([
+                    "-c",
+                    ". \"$1\"; printf '%s\\n' \"$RUSTC_WRAPPER\" \"$NX_MAX_CACHE_SIZE\"",
+                    "host",
+                ])
+                .arg(root.join(WORKSPACE_ENVIRONMENT_PATH));
+            if let Some(value) = override_value {
+                command.env("NX_MAX_CACHE_SIZE", value);
+            }
+            let output = command.output_locked().unwrap();
+            assert!(output.status.success());
+            assert_eq!(
+                String::from_utf8(output.stdout).unwrap(),
+                format!(
+                    "/store/it's a client\n{}\n",
+                    override_value.unwrap_or("10737418240")
+                )
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

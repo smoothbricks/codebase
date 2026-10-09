@@ -1389,10 +1389,8 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
   // bare shell and inside a devenv profile, which made the pre-push
   // cross-compile probe unsatisfiable by construction.
   //
-  // Runtime inputs are checked by their OUTPUT, not their command text, because
-  // that is what Nx hashes: measured, two workspaces at different absolute
-  // paths whose only difference is the spelling of a runtime command producing
-  // identical stdout hash identically.
+  // The runtime value AND its command declaration must be portable: Nx also
+  // hashes the owning project's target configuration.
   it('hashes no machine-local value into a cached cargo target', async () => {
     const workspace = await createWorkspace();
     try {
@@ -1414,6 +1412,9 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
           }
           if ('env' in input) offenders.push(`${name}: environment input ${String(input.env)}`);
           if (!('runtime' in input)) continue;
+          if (input.runtime.includes(fileURLToPath(new URL('..', import.meta.url)))) {
+            offenders.push(`${name}: runtime command names the plugin checkout`);
+          }
           const value = await runtimeInputValue(input.runtime, workspace.context.workspaceRoot);
           const rooted = PATH_OUTSIDE_WORKSPACE.exec(value);
           if (rooted) offenders.push(`${name}: runtime input yields ${rooted[0].trim()} — from ${input.runtime}`);

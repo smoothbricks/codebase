@@ -422,6 +422,34 @@ describe('what shell entry installs', () => {
     );
   });
 
+  it('reinstalls receipts missing lock digests and repairs digest drift through the same installer', async () => {
+    await withManagedRepository(
+      {
+        workspaces: ['packages/*'],
+        files: {
+          'packages/member/package.json':
+            '{"name":"member","version":"0.0.0","dependencies":{"dep":"file:../../vendor/dep"}}',
+          'vendor/dep/package.json': '{"name":"dep","version":"0.0.0"}',
+        },
+      },
+      async ({ root, enterShell: enter, count }) => {
+        expect(await enter()).toEqual(HEALTHY);
+        const path = join(root, 'node_modules/.smoo-install');
+        const stamp = JSON.parse(readFileSync(path, 'utf8'));
+        await writeFile(path, JSON.stringify({ inputs: stamp.inputs }));
+        expect(await enter()).toEqual(HEALTHY);
+        expect(count('install')).toBe(2);
+        const recorded = JSON.parse(readFileSync(path, 'utf8'));
+        expect(recorded.lockfiles['bun.lock']).toBe(
+          new Bun.CryptoHasher('sha256').update(readFileSync(join(root, 'bun.lock'))).digest('hex'),
+        );
+        await writeFile(path, JSON.stringify({ ...recorded, lockfiles: {} }));
+        expect(await enter()).toEqual(HEALTHY);
+        expect(count('install')).toBe(3);
+      },
+    );
+  });
+
   it('retries an install that failed instead of recording it as done', async () => {
     await withManagedRepository(
       { prepare: `printf 'x\\n' >> attempts; exit 1` },
@@ -650,7 +678,12 @@ describe('what a CI install reports and records', () => {
 
       expect(exitCode).toBe(0);
       const stamp = JSON.parse(readFileSync(join(root, 'node_modules', '.smoo-install'), 'utf8'));
-      expect(stamp).toEqual({ inputs: expect.stringMatching(/^[0-9a-f]{64}$/) });
+      expect(stamp).toEqual({
+        inputs: expect.stringMatching(/^[0-9a-f]{64}$/),
+        lockfiles: {
+          'bun.lock': new Bun.CryptoHasher('sha256').update(readFileSync(join(root, 'bun.lock'))).digest('hex'),
+        },
+      });
       expect(readFileSync(join(MANAGED, 'tooling', 'direnv', 'devenv.smoo.nix'), 'utf8')).toContain(
         '"../../node_modules/.smoo-install"',
       );

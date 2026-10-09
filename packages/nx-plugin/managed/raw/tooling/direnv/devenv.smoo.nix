@@ -510,6 +510,11 @@ in {
     # they run.
     (lib.mkBefore ''
       cd "$DEVENV_ROOT/../.."
+      # Direct `devenv shell` skips .envrc. Reuse cowshed's one environment writer
+      # before project hooks, rather than restating its CI/compiler-cache policy.
+      if [ -f .cowshed/env ]; then
+        . "$PWD/.cowshed/env"
+      fi
       export PATH="$("$PWD/tooling/direnv/repo-path")"
       export PATH="${rustToolchainBin}:$PATH"
       # devenv enters the shell with TMPDIR unset (not empty) on every platform.

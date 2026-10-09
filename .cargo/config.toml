@@ -1,13 +1,13 @@
 [env]
 MACOSX_DEPLOYMENT_TARGET = { value = "11.0", force = true }
 
-# One workspace means one native-link fingerprint. Route every macOS artifact
-# through Xcode's clang so Nix wrapper flags cannot leak an SDK dependency.
+# Cargo hashes the linker spelling into every unit. Keep it checkout-independent;
+# the dev shell installs this program in the immutable store on Darwin.
 [target.aarch64-apple-darwin]
-linker = "packages/cowshed/scripts/macos-linker.sh"
+linker = "smoothbricks-macos-linker"
 
 [target.x86_64-apple-darwin]
-linker = "packages/cowshed/scripts/macos-linker.sh"
+linker = "smoothbricks-macos-linker"
 
 # One feature resolution for the whole workspace. Without it every per-crate
 # cargo invocation resolves features for its own selection, so one shared
@@ -18,6 +18,10 @@ linker = "packages/cowshed/scripts/macos-linker.sh"
 # [unstable] opt-in.
 [unstable]
 feature-unification = true
+checksum-freshness = true
 
 [resolver]
 feature-unification = "workspace"
+
+[build]
+fingerprint = "content"

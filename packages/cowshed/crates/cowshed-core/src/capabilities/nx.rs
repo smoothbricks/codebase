@@ -61,6 +61,12 @@ const WORKSPACE_ROOT_ENV: &str = "NX_WORKSPACE_ROOT_PATH";
 fn contribute(context: &DetectionContext<'_>) -> Result<CapabilityContribution> {
     let state = context.project_root.join(STATE);
     let project = workspace_relative(context.workspace_root, context.project_root)?;
+    // Keep Nx's existing ten-percent policy, but derive the bound from the configured
+    // build volume instead of whichever filesystem the client happens to discover.
+    let cache_bytes = super::workspace_config(context.workspace_root)?
+        .build_capacity()
+        .bytes()
+        / 10;
     let mut contribution = CapabilityContribution {
         env: [
             ("NX_SOCKET_DIR", own(context.runtime_dir.join("nx"))),
@@ -69,6 +75,10 @@ fn contribute(context: &DetectionContext<'_>) -> Result<CapabilityContribution> 
                 own(state.join("workspace-data")),
             ),
             ("NX_CACHE_DIRECTORY", own(state.join("cache"))),
+            (
+                "NX_MAX_CACHE_SIZE",
+                EnvAction::Default(cache_bytes.to_string().into()),
+            ),
             (WORKSPACE_ROOT_ENV, own(context.project_root.into())),
             ("NX_DAEMON", EnvAction::Unset),
             ("NX_PROJECT_GRAPH_CACHE_DIRECTORY", EnvAction::Unset),
@@ -157,6 +167,21 @@ mod tests {
     fn nx_json_switches_nx_on_and_off() {
         assert_switch(&DETECTOR, &["nx.json"]);
     }
+    #[test]
+    fn cache_bound_uses_configured_build_capacity_and_preserves_explicit_overrides() {
+        let fixture = Fixture::new();
+        fixture.files(&["nx.json"]);
+        std::fs::write(
+            fixture.root.join(".cowshed.toml"),
+            "[build]\ncapacity = \"250g\"\n",
+        )
+        .unwrap();
+        let contribution = DETECTOR.detect(&fixture.context()).unwrap().unwrap();
+        assert_eq!(
+            contribution.env.get("NX_MAX_CACHE_SIZE"),
+            Some(&EnvAction::Default("26843545600".into())),
+        );
+    }
 
     /// One Nx state per checkout (04_sandbox.md): a read-write job's Nx state is the
     /// checkout's own `.nx`, the directories every other boundary of the checkout uses, never a
@@ -178,6 +203,10 @@ mod tests {
                     ("NX_DAEMON", EnvAction::Unset),
                     ("NX_PROJECT_GRAPH_CACHE_DIRECTORY", EnvAction::Unset),
                     ("NX_USE_LOCAL", EnvAction::Own(OsString::from("true"))),
+                    (
+                        "NX_MAX_CACHE_SIZE",
+                        EnvAction::Default("10737418240".into())
+                    ),
                     ("NX_SOCKET_DIR", own(fixture.runtime.join("nx"))),
                     (
                         "NX_WORKSPACE_DATA_DIRECTORY",

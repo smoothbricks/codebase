@@ -1,8 +1,10 @@
 #!/bin/sh
 set -eu
 
-unset DEVELOPER_DIR SDKROOT
-DEVELOPER_DIR=$(/usr/bin/xcode-select -p)
-export DEVELOPER_DIR
-sdk_root=$(/usr/bin/xcrun --sdk macosx --show-sdk-path)
-exec /usr/bin/xcrun --sdk macosx clang -isysroot "$sdk_root" "$@"
+# Nix's developer directory is not Apple's toolchain. An already-selected SDK
+# needs no discovery; otherwise xcrun follows the host's Xcode selection.
+unset DEVELOPER_DIR
+if [ -z "${SDKROOT:-}" ]; then
+  SDKROOT=$(xcrun --sdk macosx --show-sdk-path)
+fi
+exec /usr/bin/clang -isysroot "$SDKROOT" "$@"

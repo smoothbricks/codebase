@@ -1099,7 +1099,7 @@ function readIntersectionOperator(
 }
 
 /** The plugin's nextest.toml as the workspace root's `node_modules` links it. */
-const PLUGIN_NEXTEST_CONFIG_PATH = 'node_modules/@smoothbricks/nx-plugin/nextest.toml';
+export const PLUGIN_NEXTEST_CONFIG_PATH = 'node_modules/@smoothbricks/nx-plugin/nextest.toml';
 
 /**
  * The plugin's own nextest settings, as a config layer BENEATH the repository's.
