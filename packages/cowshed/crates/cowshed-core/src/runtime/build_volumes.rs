@@ -2259,6 +2259,8 @@ fn migrate_owned_indexes(
                     ));
                 }
                 let staged = staging.join(index.to_string());
+                std::fs::create_dir(&staged)
+                    .map_err(|error| io("create the staged index directory", &staged, &error))?;
                 crate::copy::copy_until_quiescent_blocking(&source, &staged)?;
                 crate::copy::verify_tree_blocking(&source, &staged)?;
                 let holders = nx::volume_holders(&layout.mount(live)).map_err(|error| {
