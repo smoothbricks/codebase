@@ -803,6 +803,10 @@ those belong to whoever attached them, so the lease and the volume are kept and 
 own `env.TMPDIR` wins over the lease. Inside a cowshed sandbox, which cannot write the lock in `/private/tmp`, the task
 keeps its inherited `TMPDIR` and says so once. A failed task that left the volume nearly full names the volume.
 
+The real RAM-volume regression walks one volume's lifecycle in a single test: unmarked debris and a live-lease refusal,
+recovery over the debris, concurrent leases, a held dead lease, owner detach and reclaim, and the final detach. It keeps
+every boundary while avoiding duplicate provision and teardown, and its 60 s case and 120 s shard bounds are unchanged.
+
 Whatever still works in a lease when its task ends is a leak, and is stopped before the lease goes. The usual one is a
 fixture's Nx daemon: Nx detaches it into a session of its own, so the process-group kill that ends a timed-out command
 never reaches it, and a test process that is killed runs no teardown. Deleting its root asks the daemon to leave only by
