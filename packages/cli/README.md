@@ -278,7 +278,7 @@ Concrete targets use `{tool}-{output}` names and describe the tool that runs and
   typecheck path.
 - Test tsconfigs are validation configs, not TypeScript build-mode projects. They must use `noEmit`, must not set
   `composite: true`, and package root `tsconfig.json` must not reference `./tsconfig.test.json`. The inferred
-  `typecheck-tests` target runs `ttsc --noEmit -p tsconfig.test.json` after `build` instead.
+  `typecheck-tests` target runs `"$SMOO_TYPECHECK_TSC" -p tsconfig.test.json --noEmit` after `build` instead.
 - A neighboring workspace-root `Cargo.toml` provides Cargo test, lint, mutation, and benchmark targets. Workspaces with
   `cdylib` member crates also receive the cacheable `cargo-wasm` output target.
 - `build` is an aggregate. It exists only when there is at least one concrete build target such as `tsc-js`,
@@ -445,6 +445,13 @@ nothing when nothing changed:
   caches across checkouts sets them itself, unless the caller's environment was bound for another workspace (its
   `NX_WORKSPACE_ROOT_PATH` names another directory): that workspace's caches are dropped. Go's own caches keep Go's
   defaults.
+- `SMOO_TYPECHECK_TSC` names the native compiler the inferred `typecheck` and `typecheck-tests` targets run.
+  `devenv.smoo.nix` builds it from one pinned TypeScript source revision with `go_1_27` from the `nixpkgs-go` input. The
+  targets run it directly rather than through ttsc, whose auto-loaded transform plugins (typia) check inside their own
+  host with ttsc's compiler. Transform diagnostics stay enforced where the transform runs: `tsc-js` for the lib program,
+  the test runner's transform for executed test files. The variable is a hashed input, so a revision bump misses the
+  cache. Emit, editors and ttsc plugins keep the npm `@typescript/native` compiler. A target run outside the devenv
+  shell fails on the unset variable rather than checking with another compiler under the same key.
 - `tooling/direnv/nx-socket-dir.sh` exports `NX_WORKSPACE_ROOT_PATH` and `NX_SOCKET_DIR`. A checkout gets its own socket
   dir under `DEVENV_RUNTIME`; an inherited one that resolves into another checkout is dropped. A cowshed checkout whose
   `.cowshed/env` names a `COWSHED_RUNTIME_LINK` uses `<that link>/nx`, the literal path cowshed gives its sandboxed

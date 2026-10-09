@@ -31,6 +31,46 @@
     hash = "sha256-ebjX+1+9axEqsnZXCRZSumA38gPNdmoz98tMt2oftN4=";
   };
 
+  # The nixpkgs the Go pin below comes from (devenv.yaml `nixpkgs-go`).
+  goPkgs = import inputs.nixpkgs-go {inherit (pkgs.stdenv.hostPlatform) system;};
+
+  # The native TypeScript compiler typecheck targets run, built from a pinned
+  # source revision rather than taken from the npm `@typescript/native` binary
+  # that emit, editors and ttsc plugins keep using. The Nx plugin's inferred
+  # `typecheck` and `typecheck-tests` run it directly (not through ttsc, whose
+  # auto-loaded typia host checks with its own compiler) and hash this path as
+  # an input, so a revision bump is a cache miss.
+  #
+  # The revision is can1357/TypeScript perf/checker-speedups-v3: 36 checker,
+  # arena and scheduler commits on microsoft/TypeScript main 6ad8c56f9b5a,
+  # while they are upstreamed. Its Go module (tsc/, Go 1.27) builds with the
+  # nixpkgs-go input's go_1_27 inside this derivation; the shell's own Go stays the
+  # one ttsc vendors. The sparse checkout keeps the ~61k test baselines out of
+  # the store, and GOWORK=off keeps the repository's go.work (tools/) out of
+  # the module build.
+  typecheckTsc = goPkgs.buildGo127Module {
+    pname = "tsc";
+    version = "7.1.0-dev-c1ae0cde";
+    src = pkgs.fetchFromGitHub {
+      owner = "can1357";
+      repo = "TypeScript";
+      rev = "c1ae0cde041b8aa08600198fad014d869c83b602";
+      sparseCheckout = ["tsc/cmd" "tsc/internal"];
+      hash = "sha256-X4wKd/+b4EGMGwXGpfQ5YHkgfqqtPgfyf3x1maEuE+4=";
+    };
+    modRoot = "tsc";
+    subPackages = ["cmd/tsc"];
+    vendorHash = "sha256-XmN6VfL922FqKUHRnBfGTuEUFbPELf8F6JINVMTz1/w=";
+    env = {
+      CGO_ENABLED = "0";
+      GOWORK = "off";
+    };
+    ldflags = ["-s" "-w"];
+    # Upstream's tests run against the full checkout's baselines, which the
+    # sparse source omits; the revision is the tested artifact.
+    doCheck = false;
+  };
+
   # A repository that enables uv under languages.python gets its uv workspace
   # synced and activated by this contract (enterShell item 5), never by
   # devenv's own python tasks.
@@ -70,6 +110,7 @@ in {
       # `NX_USE_LOCAL=false nx migrate` restores that for the one command.
       NX_USE_LOCAL = "true";
       TTSC_TYPESCRIPT_GO_DIR = "${typescriptGo}";
+      SMOO_TYPECHECK_TSC = "${typecheckTsc}/bin/tsc";
     }
     # Playwright's downloaded Ubuntu browser has no runtime closure on NixOS
     # (CI reached the executable, then failed loading libglib-2.0.so.0). Use
@@ -229,6 +270,8 @@ in {
 
   # One Go for every repository, same reasoning as the Rust toolchain: a compiler
   # is part of a cache key, so two of them mean two caches.
+  # The typecheck compiler's Go 1.27 above is a build input of that one
+  # derivation only: no shell, plugin or repository build ever runs it.
   #
   # Pinned to the patch release ttsc vendors inside its native package: ttsc
   # builds plugins with that SDK unless TTSC_GO_BINARY names another, so matching
@@ -278,7 +321,7 @@ in {
   # `nixpkgs_2`.
   packages =
     [
-      (import inputs.nixpkgs-go {inherit (pkgs.stdenv.hostPlatform) system;}).go
+      goPkgs.go
       pkgs.nodejs_26
       pkgs.binaryen
       # Test runner for inferred Cargo test targets. Generated targets must never

@@ -184,8 +184,13 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         '{projectRoot}/tsconfig.lib.json',
       ]);
       expect(targets['tsc-js']?.outputs).toEqual(['{projectRoot}/dist/**/*.{js,cjs,mjs,jsx,d.ts,d.cts,d.mts}{,.map}']);
+      // Typecheck runs the compiler devenv.smoo.nix pins (SMOO_TYPECHECK_TSC) itself, not through
+      // ttsc, whose auto-loaded transform plugins would check with their own compiler; and it refuses
+      // to fall back to another when the shell does not provide it.
+      const typecheckCompiler =
+        '"${SMOO_TYPECHECK_TSC:?is unset, enter the devenv shell (devenv.smoo.nix builds the typecheck compiler)}"';
       expect(targets.typecheck?.options).toMatchObject({
-        command: 'ttsc -p tsconfig.lib.json --noEmit',
+        command: `${typecheckCompiler} -p tsconfig.lib.json --noEmit`,
         cwd: 'packages/example',
       });
       const checkToolchainInputs = [
@@ -194,10 +199,12 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         { json: '{workspaceRoot}/package.json', excludeFields: ['version', 'scripts', 'smoo', 'nx'] },
         { json: '{workspaceRoot}/bun.lock', excludeFields: ['workspaces'] },
       ];
+      // The compiler's store path names its pinned revision, so a compiler bump misses the cache.
       expect(targets.typecheck?.inputs).toEqual([
         'versionlessProduction',
         '^production',
         ...checkToolchainInputs,
+        { env: 'SMOO_TYPECHECK_TSC' },
         '{projectRoot}/tsconfig.lib.json',
       ]);
       expect(targets.build?.executor).toBe('nx:noop');
@@ -210,20 +217,21 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(targets['typecheck-tests']?.cache).toBe(true);
       expect(targets['typecheck-tests']?.dependsOn).toEqual(['tsc-js', 'typecheck']);
       expect(targets['typecheck-tests']?.options).toMatchObject({
-        command: 'ttsc -p tsconfig.test.json --noEmit',
+        command: `${typecheckCompiler} -p tsconfig.test.json --noEmit`,
         cwd: 'packages/example',
       });
       expect(targets['typecheck-tests']?.inputs).toEqual([
         'versionlessDefault',
         '^production',
         ...checkToolchainInputs,
+        { env: 'SMOO_TYPECHECK_TSC' },
         '{projectRoot}/tsconfig.test.json',
       ]);
 
       expect(targets['typecheck-tests:watch']?.executor).toBe('nx:run-commands');
       expect(targets['typecheck-tests:watch']?.continuous).toBe(true);
       expect(targets['typecheck-tests:watch']?.options).toMatchObject({
-        command: 'ttsc -p tsconfig.test.json --noEmit --watch',
+        command: `${typecheckCompiler} -p tsconfig.test.json --noEmit --watch`,
         cwd: 'packages/example',
       });
 
@@ -283,12 +291,14 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         'versionlessProduction',
         { input: 'versionlessProduction', dependencies: true },
         ...checkToolchain,
+        { env: 'SMOO_TYPECHECK_TSC' },
         '{projectRoot}/tsconfig.lib.json',
       ]);
       expect(targets['typecheck-tests']?.inputs).toEqual([
         'versionlessDefault',
         { input: 'versionlessProduction', dependencies: true },
         ...checkToolchain,
+        { env: 'SMOO_TYPECHECK_TSC' },
         '{projectRoot}/tsconfig.test.json',
       ]);
       expect(targets.lint?.inputs).toEqual([
@@ -384,6 +394,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         '{workspaceRoot}/tsconfig.base.json',
         { json: '{workspaceRoot}/package.json', excludeFields: ['version', 'scripts', 'smoo', 'nx'] },
         { json: '{workspaceRoot}/bun.lock', excludeFields: ['workspaces'] },
+        { env: 'SMOO_TYPECHECK_TSC' },
         '{projectRoot}/tsconfig.lib.json',
       ]);
     } finally {
@@ -426,12 +437,14 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         'versionlessProduction',
         '^production',
         ...checkToolchain,
+        { env: 'SMOO_TYPECHECK_TSC' },
         '{projectRoot}/tsconfig.lib.json',
       ]);
       expect(targets['typecheck-tests']?.inputs).toEqual([
         'versionlessDefault',
         '^production',
         ...checkToolchain,
+        { env: 'SMOO_TYPECHECK_TSC' },
         '{projectRoot}/tsconfig.test.json',
       ]);
       // An emit reads the same options, and a stale artifact is worse than a
@@ -510,6 +523,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         '{workspaceRoot}/packages/example/tsconfig.lib.json',
         { json: '{workspaceRoot}/package.json', excludeFields: ['version', 'scripts', 'smoo', 'nx'] },
         { json: '{workspaceRoot}/bun.lock', excludeFields: ['workspaces'] },
+        { env: 'SMOO_TYPECHECK_TSC' },
         '{projectRoot}/tsconfig.lib.json',
       ]);
       expect(JSON.stringify(inputs)).not.toContain('node_modules');
@@ -552,6 +566,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         '{workspaceRoot}/packages/tsconfig/base.json',
         { json: '{workspaceRoot}/package.json', excludeFields: ['version', 'scripts', 'smoo', 'nx'] },
         { json: '{workspaceRoot}/bun.lock', excludeFields: ['workspaces'] },
+        { env: 'SMOO_TYPECHECK_TSC' },
         '{projectRoot}/tsconfig.lib.json',
       ]);
       expect(stderr).toBe('');
@@ -587,6 +602,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         '{workspaceRoot}/tsconfig.base.json',
         { json: '{workspaceRoot}/package.json', excludeFields: ['version', 'scripts', 'smoo', 'nx'] },
         { json: '{workspaceRoot}/bun.lock', excludeFields: ['workspaces'] },
+        { env: 'SMOO_TYPECHECK_TSC' },
         '{projectRoot}/tsconfig.lib.json',
       ]);
     } finally {
