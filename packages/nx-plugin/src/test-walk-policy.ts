@@ -8,7 +8,7 @@
 // matches across cases that declare a different number of names before it. Field, method, key and path names are
 // never renamed. Callers choose the files and, for a diff-scoped check, the changed line ranges: a pair is judged when
 // either of its cases overlaps a change.
-import { execFileSync } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { extname, join } from 'node:path';
 import ts from 'typescript';
@@ -667,39 +667,102 @@ export function formatDuplicateScenario(duplicate: DuplicateScenario): string {
   );
 }
 
+/** A git answer, or why git could not give one. */
+export type GitAnswer<T> = { readonly ok: true; readonly value: T } | { readonly ok: false; readonly reason: string };
+
+/** Runs git without global or system configuration, so a sandboxed caller gets the same answer as its host. */
+function git(
+  root: string,
+  args: readonly string[],
+): { readonly status: number; readonly stdout: string; readonly stderr: string } {
+  const result = spawnSync('git', args, {
+    cwd: root,
+    encoding: 'utf8',
+    env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' },
+    maxBuffer: 1 << 28,
+  });
+  return { status: result.status ?? -1, stdout: result.stdout, stderr: result.stderr.trim() };
+}
+
+function failed(args: readonly string[], result: { readonly status: number; readonly stderr: string }): string {
+  return `git ${args.join(' ')}: ${result.stderr || `exit ${result.status}`}`;
+}
+
+/**
+ * The merge base of HEAD and the upstream main. A set `NX_BASE` (exported by nx-set-shas in CI) is the upstream and
+ * must name a commit. Otherwise the upstream is the first that exists of `refs/remotes/main/main`, the local main's
+ * upstream branch and `refs/remotes/origin/main`, and local `main` when none does.
+ */
+export function upstreamBase(root: string): GitAnswer<string> {
+  const nxBase = process.env.NX_BASE;
+  const exists = (ref: string): GitAnswer<boolean> => {
+    const args = ['rev-parse', '--verify', '--quiet', ref];
+    const result = git(root, args);
+    // `--verify --quiet` answers an absent ref with status 1; any other failure is git failing, not an answer.
+    if (result.status === 0 || result.status === 1) return { ok: true, value: result.status === 0 };
+    return { ok: false, reason: failed(args, result) };
+  };
+  let upstream = 'main';
+  if (nxBase !== undefined && nxBase !== '') {
+    const named = exists(`${nxBase}^{commit}`);
+    if (!named.ok) return named;
+    if (!named.value) return { ok: false, reason: `NX_BASE=${nxBase} names no commit` };
+    upstream = nxBase;
+  } else {
+    // The local main's upstream, when it has one: `for-each-ref` answers empty, never fails, when either is missing.
+    const tracked = git(root, ['for-each-ref', '--format=%(upstream)', 'refs/heads/main']).stdout.trim();
+    for (const ref of ['refs/remotes/main/main', tracked, 'refs/remotes/origin/main'].filter(Boolean)) {
+      const found = exists(ref);
+      if (!found.ok) return found;
+      if (found.value) {
+        upstream = ref;
+        break;
+      }
+    }
+  }
+  const args = ['merge-base', 'HEAD', upstream];
+  const result = git(root, args);
+  if (result.status !== 0)
+    return {
+      ok: false,
+      reason: `${failed(args, result)} (fetch main, set refs/remotes/main/main, or export NX_BASE)`,
+    };
+  return { ok: true, value: result.stdout.trim() };
+}
+
 /**
  * The files changed since `base`, tracked or untracked, and the new-side line ranges of each change; an untracked
- * file is changed throughout. Git runs without global or system configuration, so a sandboxed caller gets the same
- * answer as its host.
+ * file is changed throughout.
  */
 export function diffScope(
   root: string,
   base: string,
-): { readonly files: readonly string[]; readonly changes: ReadonlyMap<string, readonly ChangeRange[]> } {
-  const git = (args: readonly string[]): string =>
-    execFileSync('git', args, {
-      cwd: root,
-      encoding: 'utf8',
-      env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' },
-      maxBuffer: 1 << 28,
-    });
-  const changed = git(['diff', '--name-only', '-z', base, '--']).split('\0');
-  const untracked = new Set(git(['ls-files', '--others', '--exclude-standard', '-z']).split('\0'));
-  const files = [...new Set([...changed, ...untracked].filter(Boolean))].sort();
+): GitAnswer<{ readonly files: readonly string[]; readonly changes: ReadonlyMap<string, readonly ChangeRange[]> }> {
+  const read = (args: readonly string[]): GitAnswer<string> => {
+    const result = git(root, args);
+    return result.status === 0 ? { ok: true, value: result.stdout } : { ok: false, reason: failed(args, result) };
+  };
+  const changed = read(['diff', '--name-only', '-z', base, '--']);
+  if (!changed.ok) return changed;
+  const listed = read(['ls-files', '--others', '--exclude-standard', '-z']);
+  if (!listed.ok) return listed;
+  const untracked = new Set(listed.value.split('\0'));
+  const files = [...new Set([...changed.value.split('\0'), ...untracked].filter(Boolean))].sort();
   const changes = new Map<string, readonly ChangeRange[]>();
   for (const file of files) {
     if (untracked.has(file)) {
       changes.set(file, [{ start: 1, end: Number.POSITIVE_INFINITY }]);
       continue;
     }
-    const diff = git(['diff', '--unified=0', '--no-ext-diff', '--no-color', base, '--', file]);
+    const diff = read(['diff', '--unified=0', '--no-ext-diff', '--no-color', base, '--', file]);
+    if (!diff.ok) return diff;
     changes.set(
       file,
-      Array.from(diff.matchAll(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/gmu), (match) => {
+      Array.from(diff.value.matchAll(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/gmu), (match) => {
         const start = Number(match[1]);
         return { start, end: start + Math.max(Number(match[2] ?? 1), 1) - 1 };
       }),
     );
   }
-  return { files, changes };
+  return { ok: true, value: { files, changes } };
 }
