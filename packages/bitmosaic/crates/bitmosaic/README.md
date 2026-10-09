@@ -145,6 +145,25 @@ varint-width changes assemble the new image in retained scratch before touching 
 touched-payload/rigid-tail path with byte offsets. Forest results agree with fresh `to_forest_bytes()` output under the
 same chooser.
 
+`prepare_patch_witnessed` retains that same validated plan without writing the image. For an embedded slot,
+`prepare_patch_in_witnessed(state, slot_range, adds, removes, scratch, witness)` keeps the enclosing buffer borrowed as
+well. The returned `PreparedPatch` exposes `state()` read-only, `old_serialized_len()` and `new_serialized_len()`, and
+sorted, disjoint `mutation_ranges()` as slot-relative `(offset, length)` pairs. These cover framing, directory updates,
+changed payload extents and intermediate tail moves; a sparse stable Words edit does not capture untouched chunks or
+unused capacity. `cleared_tail_range()` separately identifies the old framed tail for callers that clear it.
+
+A physical journal can coalesce those ranges with its metadata ranges, capture prior bytes through `state()`, and refuse
+by dropping the plan if admission fails. `apply()` consumes the retained writer once and returns
+`(PatchReport, original_state)`; `apply_with_cleared_tail()` also zeros only the old framed tail. Existing `patch` and
+`patch_witnessed` use this same preparation/application path and preserve their tail behavior. The plan cannot be
+redirected to a different image, and its batches, witness and scratch cannot change while it is retained. Independent
+state/work lifetimes release scratch and witness access on application even when the returned state reference is kept.
+`witness()` exposes complete per-value answers on successful preparation, allowing dependent metadata/index plans before
+journal admission. Words retains the paid trial's fresh/held masks and publishes them only after its verdict; a failed
+trial discards them before the general planner reports. Application does not publish those answers again. The final
+counts remain in the application report; no provisional report is exposed. All preparation refusals and dropping an
+admitted plan leave the complete enclosing buffer unchanged.
+
 ## Verification and measurements
 
 From the smoothbricks workspace root:

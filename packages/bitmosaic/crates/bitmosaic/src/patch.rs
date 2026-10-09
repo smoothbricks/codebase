@@ -99,13 +99,180 @@ pub struct PatchReport {
     pub serialized_len: usize,
 }
 
+/// A validated patch tied to the image, batches, witness and scratch it was
+/// prepared from. Dropping it refuses the write without changing the image.
+///
+/// [`Self::state`] exposes the enclosing buffer immutably so a physical journal
+/// can reserve and capture [`Self::mutation_ranges`] before consuming the plan.
+/// No mutable image or scratch access is possible while the plan is retained.
+/// [`Self::witness`] is complete on successful preparation, including Words
+/// answers retained from the paid trial. The final report is returned on apply.
+///
+/// A prepared patch keeps its original image immutably accessible, not mutable:
+/// ```compile_fail
+/// use bitmosaic::{EMPTY_U32_IMAGE, PatchScratch, prepare_patch_witnessed};
+/// let mut image = EMPTY_U32_IMAGE;
+/// let mut scratch = PatchScratch::new();
+/// let mut witness = ();
+/// let prepared = prepare_patch_witnessed(
+///     &mut image, &[], &[], &mut scratch, &mut witness,
+/// ).unwrap();
+/// image[0] = 0;
+/// prepared.apply();
+/// ```
+/// Nor can its scratch be reused before applying or dropping it:
+/// ```compile_fail
+/// use bitmosaic::{EMPTY_U32_IMAGE, PatchScratch, prepare_patch_witnessed};
+/// let mut image = EMPTY_U32_IMAGE;
+/// let mut other = EMPTY_U32_IMAGE;
+/// let mut scratch = PatchScratch::new();
+/// let mut witness = ();
+/// let prepared = prepare_patch_witnessed(
+///     &mut image, &[], &[], &mut scratch, &mut witness,
+/// ).unwrap();
+/// let mut other_witness = ();
+/// let _ = prepare_patch_witnessed(
+///     &mut other, &[], &[], &mut scratch, &mut other_witness,
+/// );
+/// prepared.apply();
+/// ```
+#[must_use = "capture the planned writes before applying, or drop to refuse them"]
+pub struct PreparedPatch<'state, 'work, W: Witness> {
+    state: &'state mut [u8],
+    slot: core::ops::Range<usize>,
+    adds: &'work [u32],
+    removes: &'work [u32],
+    scratch: &'work mut PatchScratch,
+    witness: &'work mut W,
+    plan: PreparedPlan,
+    old_serialized_len: usize,
+    new_serialized_len: usize,
+}
+
+enum PreparedPlan {
+    Unchanged(PatchReport),
+    Forest(ForestPlan),
+    Built(PatchReport),
+}
+
+impl<'state, W: Witness> PreparedPatch<'state, '_, W> {
+    /// The original enclosing buffer, available only for reading before apply.
+    pub fn state(&self) -> &[u8] {
+        self.state
+    }
+
+    /// The complete per-value witness of a successfully prepared patch. Words
+    /// answers come from the retained trial, not another image membership probe.
+    pub fn witness(&self) -> &W {
+        self.witness
+    }
+
+    /// The old image's framed length, not the slot's capacity.
+    pub fn old_serialized_len(&self) -> usize {
+        self.old_serialized_len
+    }
+
+    /// The prepared result's framed length, known before the first image write.
+    pub fn new_serialized_len(&self) -> usize {
+        self.new_serialized_len
+    }
+
+    /// Sorted, disjoint `(offset, length)` ranges relative to the slot. They
+    /// cover the retained writer's payload, framing, directory and transient
+    /// tail moves, not unused capacity. Clearing the old tail additionally
+    /// requires [`Self::cleared_tail_range`].
+    pub fn mutation_ranges(&self) -> &[(usize, usize)] {
+        &self.scratch.mutation_ranges
+    }
+
+    /// The old image bytes cleared by [`Self::apply_with_cleared_tail`], relative
+    /// to the slot. This range may overlap the retained writer's ranges; a
+    /// journal must coalesce their union rather than capture bytes twice.
+    pub fn cleared_tail_range(&self) -> Option<(usize, usize)> {
+        (self.new_serialized_len < self.old_serialized_len).then(|| {
+            (
+                self.new_serialized_len,
+                self.old_serialized_len - self.new_serialized_len,
+            )
+        })
+    }
+
+    /// The highest possibly written slot offset, including optional tail
+    /// clearing and transient moves. Prefer the disjoint ranges for capture.
+    pub fn touched_len(&self) -> usize {
+        self.mutation_ranges()
+            .last()
+            .map_or(0, |&(at, len)| at + len)
+            .max(self.cleared_tail_range().map_or(0, |(at, len)| at + len))
+    }
+
+    /// Apply the retained plan once, preserving bytes past the result exactly
+    /// as [`patch_witnessed`] does. Returns the report and the original enclosing
+    /// buffer, releasing the scratch and witness borrows.
+    pub fn apply(self) -> (PatchReport, &'state mut [u8]) {
+        self.apply_inner(false)
+    }
+
+    /// Apply the same retained plan, then zero only the old framed image's tail.
+    pub fn apply_with_cleared_tail(self) -> (PatchReport, &'state mut [u8]) {
+        self.apply_inner(true)
+    }
+
+    fn apply_inner(self, clear_tail: bool) -> (PatchReport, &'state mut [u8]) {
+        let Self {
+            state,
+            slot,
+            adds,
+            removes,
+            scratch,
+            witness: _,
+            plan,
+            old_serialized_len,
+            new_serialized_len,
+        } = self;
+        let image = &mut state[slot];
+        let report = match plan {
+            PreparedPlan::Unchanged(report) => report,
+            PreparedPlan::Built(report) => {
+                image[..new_serialized_len].copy_from_slice(&scratch.build[..new_serialized_len]);
+                report
+            }
+            PreparedPlan::Forest(mut plan) => {
+                let (added, removed) = apply_in_place(image, &plan, adds, removes, scratch);
+                plan.added += added;
+                plan.removed += removed;
+                plan.len = plan.len + u64::from(plan.added) - u64::from(plan.removed);
+                let body_bytes = plan.forest_total
+                    - (plan.geometry.keys_at - forest_header_len(plan.len, plan.chunks as u32));
+                write_forest_header(
+                    image,
+                    plan.geometry.slot_bits,
+                    plan.len,
+                    plan.chunks as u32,
+                    body_bytes,
+                );
+                PatchReport {
+                    added: plan.added,
+                    removed: plan.removed,
+                    len: plan.len,
+                    serialized_len: plan.forest_total,
+                }
+            }
+        };
+        if clear_tail && new_serialized_len < old_serialized_len {
+            image[new_serialized_len..old_serialized_len].fill(0);
+        }
+        (report, state)
+    }
+}
+
 /// Where a patch reports, value by value, what it changed: the index into
 /// `adds` of every value that was NOT already a member, and the index into
 /// `removes` of every value that WAS one (a value both added and removed in
 /// one batch is new on the add side and held on the remove side — adds land
-/// first). The forest root answers from the edit itself — the old bit a
-/// plane or word edit overwrites — so a caller that needs the per-value
-/// answer pays no second probe; see [`patch_witnessed`].
+/// first). The forest root answers while planning the edit — the old bit a
+/// plane overwrites, or the fresh/held masks a Words trial already computes —
+/// so a caller needing the per-value answer pays no second membership probe.
 pub trait Witness {
     /// `true` for a witness that records: a root that cannot answer as a
     /// byproduct probes for it, and skips the probes when nothing listens.
@@ -245,6 +412,8 @@ struct Fresh {
     /// For a `Words` chunk edited where it lies: the window the result
     /// occupies, `(base_word, word_count)`, which may extend the old one.
     window: (u16, u16),
+    /// Bounds retained by the Words trial, so journaling does not probe it again.
+    word_writes: Option<WordWrites>,
 }
 
 /// A chunk of the old string: directory index, payload length,
@@ -285,6 +454,24 @@ pub struct PatchScratch {
     /// Per directory group, the change in popcount a `Words` in-place edit
     /// made: the directory is then one prefix sum, not a rebuild.
     group_delta: Box<[i32; CHUNK_WORDS / DIR_STRIDE]>,
+    /// Sorted, coalesced prior-byte ranges of the retained writer.
+    mutation_ranges: Vec<(usize, usize)>,
+    /// Fresh/held masks of one Words trial, published only after it is accepted.
+    word_witnesses: Vec<WordWitness>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct WordWrites {
+    old_window: (u16, u16),
+    /// The first changed word determines the rank-directory suffix.
+    first_changed: Option<u16>,
+}
+
+struct WordWitness {
+    fresh: u64,
+    held: u64,
+    adds: core::ops::Range<usize>,
+    removes: core::ops::Range<usize>,
 }
 
 impl Default for PatchScratch {
@@ -305,6 +492,8 @@ impl PatchScratch {
             staged: Vec::new(),
             build: Vec::new(),
             group_delta: Box::new([0; CHUNK_WORDS / DIR_STRIDE]),
+            mutation_ranges: Vec::new(),
+            word_witnesses: Vec::new(),
         }
     }
 
@@ -321,6 +510,15 @@ impl PatchScratch {
         scratch.rows.reserve(touched_chunks + slot_bytes / 10);
         scratch.staged.reserve(slot_bytes);
         scratch.build.reserve(slot_bytes);
+        // At most one retained word-write run per old payload word, plus the
+        // framing/directory/window/tail ranges of each touched chunk.
+        scratch
+            .mutation_ranges
+            .reserve(slot_bytes / 8 + 8 * touched_chunks + 1);
+        if touched_chunks != 0 {
+            // One record per word of a single trial; published before reuse.
+            scratch.word_witnesses.reserve(CHUNK_WORDS);
+        }
         scratch
     }
 }
@@ -366,8 +564,8 @@ pub fn patch(
 
 /// [`patch`] that also reports, through `witness`, which adds were new and
 /// which removes were held — the per-value form of the report's counts.
-/// On a forest root every answer is the byproduct of the edit that decides
-/// it (the old bit a plane or word edit overwrites); an Elias-Fano root,
+/// On a forest root every answer is a byproduct of planning the edit (the old
+/// bit a plane overwrites, or the retained Words trial); an Elias-Fano root,
 /// which is not a slot's mutating form, probes the old plane once per
 /// value before it is spliced. The witness is meaningful only on `Ok`: a
 /// refusal may have reported part of a batch before refusing.
@@ -378,18 +576,96 @@ pub fn patch_witnessed<W: Witness>(
     scratch: &mut PatchScratch,
     witness: &mut W,
 ) -> Result<PatchReport, PatchError> {
+    let capacity = slot.len();
+    Ok(
+        prepare::<W, false>(slot, 0..capacity, adds, removes, scratch, witness)?
+            .apply()
+            .0,
+    )
+}
+
+/// Validate and prepare a patch without changing the slot. The retained plan
+/// owns the image and working-memory borrows until it is applied or dropped.
+/// Witnesses are complete only on `Ok`; a refusal may have reported a prefix.
+pub fn prepare_patch_witnessed<'state, 'work, W: Witness>(
+    slot: &'state mut [u8],
+    adds: &'work [u32],
+    removes: &'work [u32],
+    scratch: &'work mut PatchScratch,
+    witness: &'work mut W,
+) -> Result<PreparedPatch<'state, 'work, W>, PatchError> {
+    let capacity = slot.len();
+    prepare_patch_in_witnessed(slot, 0..capacity, adds, removes, scratch, witness)
+}
+
+/// Prepare an image embedded in an enclosing buffer. The returned plan's
+/// [`PreparedPatch::state`] borrows the whole original buffer immutably for
+/// physical capture, while mutation ranges remain relative to `slot`.
+///
+/// An out-of-buffer or reversed slot range is [`PatchError::Malformed`].
+/// Capacity, body validation and batch-order refusals precede any buffer write.
+pub fn prepare_patch_in_witnessed<'state, 'work, W: Witness>(
+    state: &'state mut [u8],
+    slot: core::ops::Range<usize>,
+    adds: &'work [u32],
+    removes: &'work [u32],
+    scratch: &'work mut PatchScratch,
+    witness: &'work mut W,
+) -> Result<PreparedPatch<'state, 'work, W>, PatchError> {
+    let prepared = prepare::<W, true>(state, slot, adds, removes, scratch, witness)?;
+    match &prepared.plan {
+        PreparedPlan::Unchanged(_) => {}
+        PreparedPlan::Built(report) => {
+            prepared.scratch.mutation_ranges.clear();
+            prepared
+                .scratch
+                .mutation_ranges
+                .push((0, report.serialized_len));
+        }
+        PreparedPlan::Forest(plan) => plan_mutation_ranges(plan, prepared.scratch),
+    }
+    Ok(prepared)
+}
+
+// One preparation path for both APIs. Immediate patch callers do not need
+// journal extents, so only the public retained-plan API derives those ranges.
+fn prepare<'state, 'work, W: Witness, const CAPTURE: bool>(
+    state: &'state mut [u8],
+    slot: core::ops::Range<usize>,
+    adds: &'work [u32],
+    removes: &'work [u32],
+    scratch: &'work mut PatchScratch,
+    witness: &'work mut W,
+) -> Result<PreparedPatch<'state, 'work, W>, PatchError> {
     if !strictly_ascending(adds) || !strictly_ascending(removes) {
         return Err(PatchError::Unsorted);
     }
-    let header = image_header(slot).ok_or(PatchError::Malformed)?;
+    let image = state.get(slot.clone()).ok_or(PatchError::Malformed)?;
+    let header = image_header(image).ok_or(PatchError::Malformed)?;
     if header.width != KeyWidth::U32 {
         return Err(PatchError::Malformed);
     }
-    if slot[3] & 2 != 0 {
-        patch_ef(slot, adds, removes, scratch, witness)
+    scratch.mutation_ranges.clear();
+    let plan = if image[3] & 2 != 0 {
+        PreparedPlan::Built(prepare_ef(image, adds, removes, scratch, witness)?)
     } else {
-        patch_forest(slot, adds, removes, scratch, witness)
-    }
+        prepare_forest::<W, CAPTURE>(image, adds, removes, scratch, witness)?
+    };
+    let new_serialized_len = match &plan {
+        PreparedPlan::Unchanged(report) | PreparedPlan::Built(report) => report.serialized_len,
+        PreparedPlan::Forest(plan) => plan.forest_total,
+    };
+    Ok(PreparedPatch {
+        state,
+        slot,
+        adds,
+        removes,
+        scratch,
+        witness,
+        plan,
+        old_serialized_len: header.encoded_len,
+        new_serialized_len,
+    })
 }
 
 // ── staging one chunk ────────────────────────────────────────────────────
@@ -805,6 +1081,7 @@ fn emit_arm(scratch: &mut PatchScratch, arm: Arm, card: u32) -> Fresh {
         staged_at: at as u32,
         edits: (0, 0, 0, 0),
         window: (0, 0),
+        word_writes: None,
     }
 }
 
@@ -946,14 +1223,22 @@ impl Iterator for WordRuns<'_> {
 /// refuted from its first gap; the exact count is taken only to confirm
 /// one, which a dense chunk with a hole never reaches. The edit itself
 /// reports the counts.
-fn words_in_place_plan(
+fn words_in_place_plan<W: Witness, const CAPTURE: bool>(
     payload: &[u8],
     base_word: u32,
     word_count: u32,
     card: u32,
-    adds: &[u32],
-    removes: &[u32],
-) -> Option<((u16, u16), u32, u32)> {
+    batch: ChunkBatch<'_>,
+    scratch: &mut PatchScratch,
+    witness: &mut W,
+) -> Option<((u16, u16), u32, u32, WordWrites)> {
+    let ChunkBatch { adds, removes, .. } = batch;
+    let PatchScratch {
+        mutation_ranges: ranges,
+        word_witnesses,
+        ..
+    } = scratch;
+    word_witnesses.clear();
     let (lo, wc) = (base_word as usize, word_count as usize);
     let word_of = |v: u32| usize::from((v & 0xffff) as u16 >> 6);
     let word = |w: usize| {
@@ -971,23 +1256,54 @@ fn words_in_place_plan(
     let mut remove_masks = WordRuns { values: removes }.peekable();
     let (mut added, mut removed, mut runs, mut previous) = (0u32, 0u32, 0usize, 0u64);
     let (mut first, mut last) = (None, 0usize);
+    let mut first_changed = None;
+    let range_start = ranges.len();
+    let (mut ia, mut ir) = (0usize, 0usize);
     for w in start..end {
         while remove_masks.peek().is_some_and(|(at, _, _)| *at < w) {
-            remove_masks.next();
+            ir += remove_masks.next().expect("skipped remove mask").2;
         }
-        let add = if add_masks.peek().is_some_and(|(at, _, _)| *at == w) {
-            add_masks.next().expect("peeked add mask").1
+        let (add, na) = if add_masks.peek().is_some_and(|(at, _, _)| *at == w) {
+            let (_, mask, count) = add_masks.next().expect("peeked add mask");
+            (mask, count)
         } else {
-            0
+            (0, 0)
         };
-        let remove = if remove_masks.peek().is_some_and(|(at, _, _)| *at == w) {
-            remove_masks.next().expect("peeked remove mask").1
+        let (remove, nr) = if remove_masks.peek().is_some_and(|(at, _, _)| *at == w) {
+            let (_, mask, count) = remove_masks.next().expect("peeked remove mask");
+            (mask, count)
         } else {
-            0
+            (0, 0)
         };
         let old = word(w);
-        added += (add & !old).count_ones();
-        removed += (remove & (old | add)).count_ones();
+        let fresh = add & !old;
+        let held = remove & (old | add);
+        added += fresh.count_ones();
+        removed += held.count_ones();
+        if W::LISTENS && (fresh != 0 || held != 0) {
+            word_witnesses.push(WordWitness {
+                fresh,
+                held,
+                adds: ia..ia + na,
+                removes: ir..ir + nr,
+            });
+        }
+        ia += na;
+        ir += nr;
+        if fresh != 0 || held != 0 {
+            let w = w as u16;
+            first_changed.get_or_insert(w);
+            if CAPTURE && usize::from(w) >= lo && usize::from(w) < lo + wc {
+                let w = usize::from(w);
+                if ranges.len() > range_start
+                    && ranges.last().is_some_and(|&(at, len)| at + len == w)
+                {
+                    ranges.last_mut().expect("retained word run").1 += 1;
+                } else {
+                    ranges.push((w, 1));
+                }
+            }
+        }
         let result = (old | add) & !remove;
         runs += (result & !((result << 1) | previous)).count_ones() as usize;
         previous = result >> 63;
@@ -1022,7 +1338,61 @@ fn words_in_place_plan(
     if grows && shrinks {
         return None;
     }
-    Some(((new_lo as u16, (new_hi - new_lo) as u16), added, removed))
+    // Adds land before removes. An add cancelled outside the surviving window
+    // still needs a word during the edit; use the existing general path rather
+    // than treating that unrepresentable transient as a stable Words edit.
+    let (edit_lo, edit_hi) = if grows {
+        (new_lo, new_hi)
+    } else {
+        (lo, lo + wc)
+    };
+    if adds.first().is_some_and(|v| word_of(*v) < edit_lo)
+        || adds.last().is_some_and(|v| word_of(*v) >= edit_hi)
+    {
+        return None;
+    }
+    // No callback has run on the trial's behalf until every Words verdict
+    // succeeds. A refused trial falls through to the existing general planner,
+    // which publishes its own witness once instead.
+    if W::LISTENS {
+        report_word_witnesses(batch, word_witnesses, witness);
+    }
+    Some((
+        (new_lo as u16, (new_hi - new_lo) as u16),
+        added,
+        removed,
+        WordWrites {
+            old_window: (base_word as u16, word_count as u16),
+            first_changed,
+        },
+    ))
+}
+
+fn report_word_witnesses<W: Witness>(batch: ChunkBatch<'_>, runs: &[WordWitness], witness: &mut W) {
+    for run in runs {
+        if run.fresh != 0 {
+            if run.fresh.count_ones() as usize == run.adds.len() {
+                witness.adds_new(batch.a0 + run.adds.start..batch.a0 + run.adds.end);
+            } else {
+                for (i, &value) in batch.adds[run.adds.clone()].iter().enumerate() {
+                    if run.fresh >> (value & 63) & 1 != 0 {
+                        witness.add_new(batch.a0 + run.adds.start + i);
+                    }
+                }
+            }
+        }
+        if run.held != 0 {
+            if run.held.count_ones() as usize == run.removes.len() {
+                witness.removes_held(batch.r0 + run.removes.start..batch.r0 + run.removes.end);
+            } else {
+                for (i, &value) in batch.removes[run.removes.clone()].iter().enumerate() {
+                    if run.held >> (value & 63) & 1 != 0 {
+                        witness.remove_held(batch.r0 + run.removes.start + i);
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Move a `Words` payload from window `(lo, wc)` to the enclosing window
@@ -1094,21 +1464,15 @@ fn words_shrink(payload: &mut [u8], (lo, wc): (usize, usize), (lo2, wc2): (usize
 /// the exact min/max refuter. `payload` covers the larger of the old and
 /// the new payload: a window that grows is grown before the edit, one
 /// that shrinks is shrunk after it.
-fn words_edit_in_place<W: Witness>(
+fn words_edit_in_place(
     payload: &mut [u8],
     card: u32,
     window: (u16, u16),
-    batch: ChunkBatch<'_>,
-    witness: &mut W,
+    adds: &[u32],
+    removes: &[u32],
     scratch_dir: &mut Vec<u16>,
     group_delta: &mut [i32],
 ) -> (u32, u32) {
-    let ChunkBatch {
-        adds,
-        removes,
-        a0,
-        r0,
-    } = batch;
     let old = (
         usize::from(read_u16_at(payload, 16)),
         usize::from(read_u16_at(payload, 18)),
@@ -1132,28 +1496,10 @@ fn words_edit_in_place<W: Witness>(
     let (mut min_add, mut max_add) = (None, None);
     let mut first_group = usize::MAX;
     let (mut added, mut removed) = (0u32, 0u32);
-    // The runs consume the batches in order, so each value's index is the
-    // cursor the witness pass advances alongside the run it belongs to.
-    let (mut ia, mut ir) = (0usize, 0usize);
-    for (w, mask, n) in (WordRuns { values: adds }) {
+    for (w, mask, _) in (WordRuns { values: adds }) {
         let at = WORDS_AT + (w - lo) * 8;
         let word = read_u64_at(payload, at);
         let fresh = mask & !word;
-        if W::LISTENS {
-            // A run landing entirely on empty bits is the common shape of
-            // a batch of fresh values and is reported as one range; only a
-            // run that hit held bits is walked value by value.
-            if fresh == mask {
-                witness.adds_new(a0 + ia..a0 + ia + n);
-            } else if fresh != 0 {
-                for (k, &v) in adds[ia..ia + n].iter().enumerate() {
-                    if fresh >> (v & 63) & 1 == 1 {
-                        witness.add_new(a0 + ia + k);
-                    }
-                }
-            }
-            ia += n;
-        }
         if fresh != 0 {
             payload[at..at + 8].copy_from_slice(&(word | mask).to_le_bytes());
             let g = (w - lo) / DIR_STRIDE;
@@ -1166,24 +1512,12 @@ fn words_edit_in_place<W: Witness>(
             max_add = Some(w * 64 + 63 - fresh.leading_zeros() as usize);
         }
     }
-    for (w, mask, n) in (WordRuns { values: removes }) {
+    for (w, mask, _) in (WordRuns { values: removes }) {
         let held = if w < lo || w >= lo + wc {
             0
         } else {
             mask & read_u64_at(payload, WORDS_AT + (w - lo) * 8)
         };
-        if W::LISTENS {
-            if held == mask {
-                witness.removes_held(r0 + ir..r0 + ir + n);
-            } else if held != 0 {
-                for (k, &v) in removes[ir..ir + n].iter().enumerate() {
-                    if held >> (v & 63) & 1 == 1 {
-                        witness.remove_held(r0 + ir + k);
-                    }
-                }
-            }
-            ir += n;
-        }
         if held != 0 {
             let at = WORDS_AT + (w - lo) * 8;
             let word = read_u64_at(payload, at);
@@ -1284,84 +1618,155 @@ struct ForestPlan {
     len: u64,
     forest_total: usize,
     in_place: bool,
+    old_total: usize,
 }
 
-fn patch_forest<W: Witness>(
-    slot: &mut [u8],
+fn prepare_forest<W: Witness, const CAPTURE: bool>(
+    slot: &[u8],
     adds: &[u32],
     removes: &[u32],
     scratch: &mut PatchScratch,
     witness: &mut W,
-) -> Result<PatchReport, PatchError> {
-    let (plan, old_total, old_len) = {
-        let view = BitmosaicView::open(slot).ok_or(PatchError::Malformed)?;
-        let Root::Forest(forest) = view.root else {
-            return Err(PatchError::Malformed);
-        };
-        let old_total = view.serialized_len();
-        (
-            plan_forest(&forest, adds, removes, scratch, slot.len(), witness),
-            old_total,
-            view.len(),
-        )
+) -> Result<PreparedPlan, PatchError> {
+    let view = BitmosaicView::open(slot).ok_or(PatchError::Malformed)?;
+    let Root::Forest(forest) = view.root else {
+        return Err(PatchError::Malformed);
     };
-    let Some(mut plan) = plan else {
-        return Ok(PatchReport {
+    let Some(mut plan) =
+        plan_forest::<W, CAPTURE>(&forest, adds, removes, scratch, slot.len(), witness)
+    else {
+        return Ok(PreparedPlan::Unchanged(PatchReport {
             added: 0,
             removed: 0,
-            len: old_len,
-            serialized_len: old_total,
-        });
+            len: view.len(),
+            serialized_len: view.serialized_len(),
+        }));
     };
     let needed = plan.forest_total;
     if needed > slot.len() {
         return Err(PatchError::Capacity { needed });
     }
-    // Chunks edited where they lie are edited in the slot once the tail
-    // has moved, or — for a rebuild, which reads the slot until the whole
-    // string is assembled — in the staged region, from where the rebuild
-    // copies them as bytes like any other row.
-    let (added, removed) = if plan.in_place {
-        apply_in_place(slot, &plan, adds, removes, scratch, witness)
-    } else {
-        stage_words_edits(slot, adds, removes, scratch, witness)
-    };
+    if plan.in_place {
+        return Ok(PreparedPlan::Forest(plan));
+    }
+    // The rebuild reads the image only during preparation. Accepted Words
+    // trials already published their witnesses; edit once in retained staging.
+    let (added, removed) = stage_words_edits(slot, adds, removes, scratch);
     plan.added += added;
     plan.removed += removed;
     plan.len = plan.len + u64::from(plan.added) - u64::from(plan.removed);
-    if plan.in_place {
-        let body_bytes =
-            needed - (plan.geometry.keys_at - forest_header_len(plan.len, plan.chunks as u32));
-        write_forest_header(
-            slot,
-            plan.geometry.slot_bits,
-            plan.len,
-            plan.chunks as u32,
-            body_bytes,
-        );
-    } else {
-        refresh_rows(scratch);
-        assemble(slot, scratch, needed, plan.len);
-        slot[..needed].copy_from_slice(&scratch.build[..needed]);
-    }
-    Ok(PatchReport {
+    refresh_rows(scratch);
+    assemble(slot, scratch, needed, plan.len);
+    Ok(PreparedPlan::Built(PatchReport {
         added: plan.added,
         removed: plan.removed,
         len: plan.len,
         serialized_len: needed,
-    })
+    }))
+}
+
+/// Derive writes from the retained geometry and edits, without reopening the
+/// image, restaging a chunk, or probing membership. The descending payload walk
+/// follows the writer's transient totals, not merely the final image length.
+fn plan_mutation_ranges(plan: &ForestPlan, scratch: &mut PatchScratch) {
+    let ranges = &mut scratch.mutation_ranges;
+    let touched = &scratch.touched;
+    let geometry = plan.geometry;
+    ranges.push((0, geometry.keys_at));
+    let (mut shift, mut dcard) = (0isize, 0u32);
+    for (index, t) in touched.iter().enumerate() {
+        let old = t.old.expect("in place: chunk set unchanged");
+        let fresh = t.fresh.expect("in place: chunk set unchanged");
+        let i = old.index as usize;
+        let bit = i * 3;
+        ranges.push((geometry.kinds_at + bit / 8, 1 + usize::from(bit % 8 > 5)));
+        shift += fresh.len as isize - old.len as isize;
+        dcard = dcard.wrapping_add(fresh.card.wrapping_sub(old.card));
+        // Later rows up to and including the next touched row see these sums
+        // before that next row contributes its own change.
+        let start = i + 1;
+        let end = touched.get(index + 1).map_or(plan.chunks, |next| {
+            next.old.expect("in place: chunk set unchanged").index as usize + 1
+        });
+        if start < end {
+            let len = 4 * (end - start);
+            if shift != 0 {
+                ranges.push((geometry.desc_at + 4 * (start - 1), len));
+            }
+            if dcard != 0 {
+                ranges.push((geometry.before_at + 4 * (start - 1), len));
+            }
+        }
+    }
+    let mut running_total = plan.old_total;
+    for t in touched.iter().rev() {
+        let old = t.old.expect("in place: chunk set unchanged");
+        let fresh = t.fresh.expect("in place: chunk set unchanged");
+        let (at, was, now) = (old.at as usize, old.len as usize, fresh.len as usize);
+        if fresh.staged {
+            ranges.push((at, now));
+        } else {
+            let writes = fresh.word_writes.expect("retained Words trial");
+            if writes.old_window != fresh.window {
+                // Window movement writes its words and rank directory, and the
+                // edit runs on the larger of the old and new footprints.
+                ranges.push((at, was.max(now)));
+            } else {
+                // The trial already retained each changed word run. Add only
+                // the summary/refuter and rank suffix the writer also touches.
+                ranges.push((at, SUMMARY_WORDS * 8));
+                ranges.push((at + BOUNDS_AT, 4));
+                if let Some(first) = writes.first_changed {
+                    let (lo, wc) = writes.old_window;
+                    let first_group = usize::from(first - lo) / DIR_STRIDE;
+                    let groups = usize::from(wc) / DIR_STRIDE;
+                    if first_group + 1 < groups {
+                        ranges.push((
+                            at + WORDS_AT + usize::from(wc) * 8 + 2 * first_group,
+                            2 * (groups - 1 - first_group),
+                        ));
+                    }
+                }
+            }
+        }
+        let delta = now as isize - was as isize;
+        if old.index as usize + 1 == plan.chunks {
+            running_total = at + now;
+        } else if delta != 0 {
+            running_total = (running_total as isize + delta) as usize;
+            let start = at + now;
+            if start < running_total {
+                ranges.push((start, running_total - start));
+            }
+        }
+    }
+    debug_assert_eq!(running_total, plan.forest_total);
+    ranges.sort_unstable_by_key(|&(at, _)| at);
+    let mut merged = 0usize;
+    for i in 0..ranges.len() {
+        let (at, len) = ranges[i];
+        if merged > 0 {
+            let (prior_at, prior_len) = &mut ranges[merged - 1];
+            if at <= *prior_at + *prior_len {
+                *prior_len = (*prior_at + *prior_len).max(at + len) - *prior_at;
+                continue;
+            }
+        }
+        ranges[merged] = (at, len);
+        merged += 1;
+    }
+    ranges.truncate(merged);
 }
 
 /// The rebuild path's in-place edits: each chunk edited where it lies is
 /// copied from the old string into the staged region on a fresh footprint
 /// of its result length and edited there, and its `Fresh` then names that
 /// copy. Returns the counts the edits reported.
-fn stage_words_edits<W: Witness>(
+fn stage_words_edits(
     slot: &[u8],
     adds: &[u32],
     removes: &[u32],
     scratch: &mut PatchScratch,
-    witness: &mut W,
 ) -> (u32, u32) {
     let (mut added, mut removed) = (0u32, 0u32);
     let PatchScratch {
@@ -1387,13 +1792,8 @@ fn stage_words_edits<W: Witness>(
                 &mut staged[staged_at..staged_at + room],
                 old.card,
                 fresh.window,
-                ChunkBatch {
-                    adds: &adds[a0 as usize..a1 as usize],
-                    removes: &removes[r0 as usize..r1 as usize],
-                    a0: a0 as usize,
-                    r0: r0 as usize,
-                },
-                witness,
+                &adds[a0 as usize..a1 as usize],
+                &removes[r0 as usize..r1 as usize],
                 members,
                 &mut group_delta[..],
             );
@@ -1434,7 +1834,7 @@ fn refresh_rows(scratch: &mut PatchScratch) {
 /// `capacity` is the slot's length: the in-place edit is routed only when
 /// its transient footprint fits, and the caller compares the final length
 /// against the same bound.
-fn plan_forest<W: Witness>(
+fn plan_forest<W: Witness, const CAPTURE: bool>(
     forest: &Forest<'_>,
     adds: &[u32],
     removes: &[u32],
@@ -1476,34 +1876,57 @@ fn plan_forest<W: Witness>(
                 len,
             },
         )) = located
-            && let Some((window, a, r)) = words_in_place_plan(
+        {
+            let range_start = scratch.mutation_ranges.len();
+            if let Some((window, a, r, word_writes)) = words_in_place_plan::<W, CAPTURE>(
                 payload,
                 base_word,
                 word_count,
                 len,
-                chunk_adds,
-                chunk_removes,
-            )
-        {
-            scratch.touched.push(Touched {
-                key,
-                old: Some(old),
-                fresh: Some(Fresh {
-                    kind: K_WORDS,
-                    card: len + a - r,
-                    len: words_payload_len(usize::from(window.1)) as u32,
-                    staged: false,
-                    staged_at: 0,
-                    edits: (
-                        add_range.start as u32,
-                        add_range.end as u32,
-                        remove_range.start as u32,
-                        remove_range.end as u32,
-                    ),
-                    window,
-                }),
-            });
-            continue;
+                ChunkBatch {
+                    adds: chunk_adds,
+                    removes: chunk_removes,
+                    a0: add_range.start,
+                    r0: remove_range.start,
+                },
+                scratch,
+                witness,
+            ) {
+                if CAPTURE {
+                    if word_writes.old_window != window {
+                        // Window movement is one bounded payload rewrite.
+                        scratch.mutation_ranges.truncate(range_start);
+                    } else {
+                        for (at, count) in &mut scratch.mutation_ranges[range_start..] {
+                            *at = old.at as usize + WORDS_AT + (*at - base_word as usize) * 8;
+                            *count *= 8;
+                        }
+                    }
+                }
+                scratch.touched.push(Touched {
+                    key,
+                    old: Some(old),
+                    fresh: Some(Fresh {
+                        kind: K_WORDS,
+                        card: len + a - r,
+                        len: words_payload_len(usize::from(window.1)) as u32,
+                        staged: false,
+                        staged_at: 0,
+                        edits: (
+                            add_range.start as u32,
+                            add_range.end as u32,
+                            remove_range.start as u32,
+                            remove_range.end as u32,
+                        ),
+                        window,
+                        word_writes: Some(word_writes),
+                    }),
+                });
+                continue;
+            }
+            // A refused Words trial contributes no writes to the real plan.
+            scratch.mutation_ranges.truncate(range_start);
+            scratch.word_witnesses.clear();
         }
         if let Some((old, container @ (CView::Runs(_) | CView::Stride { stride: 1, .. }))) = located
         {
@@ -1645,6 +2068,7 @@ fn plan_forest<W: Witness>(
         len: forest.len,
         forest_total,
         in_place,
+        old_total,
     })
 }
 
@@ -1792,17 +2216,16 @@ fn assemble(slot: &[u8], scratch: &mut PatchScratch, total: usize, len: u64) {
 /// chunks already finished and nothing this chunk still needs to read.
 /// Returns the counts the chunks edited where they lie reported; the
 /// header is the caller's to finish.
-fn apply_in_place<W: Witness>(
+fn apply_in_place(
     slot: &mut [u8],
     plan: &ForestPlan,
     adds: &[u32],
     removes: &[u32],
     scratch: &mut PatchScratch,
-    witness: &mut W,
 ) -> (u32, u32) {
     let chunks = plan.chunks;
     let geometry = plan.geometry;
-    let mut running_total = image_header(slot).expect("validated frame").encoded_len;
+    let mut running_total = plan.old_total;
     let (mut added, mut removed) = (0u32, 0u32);
     let PatchScratch {
         touched,
@@ -1851,13 +2274,8 @@ fn apply_in_place<W: Witness>(
                 &mut slot[at..at + room],
                 old.card,
                 fresh.window,
-                ChunkBatch {
-                    adds: &adds[a0 as usize..a1 as usize],
-                    removes: &removes[r0 as usize..r1 as usize],
-                    a0: a0 as usize,
-                    r0: r0 as usize,
-                },
-                witness,
+                &adds[a0 as usize..a1 as usize],
+                &removes[r0 as usize..r1 as usize],
                 members,
                 &mut group_delta[..],
             );
@@ -1868,7 +2286,6 @@ fn apply_in_place<W: Witness>(
                 running_total = move_tail(slot, running_total);
             }
         }
-        slot[at + new_len..at + now].fill(0);
 
         // Its own record: the payload stays where it was, the kind may
         // change. The shift the tail took is applied to the later records
@@ -1980,39 +2397,35 @@ impl<I: Iterator<Item = u32>> Iterator for Merge<'_, I> {
     }
 }
 
-fn patch_ef<W: Witness>(
-    slot: &mut [u8],
+fn prepare_ef<W: Witness>(
+    slot: &[u8],
     adds: &[u32],
     removes: &[u32],
     scratch: &mut PatchScratch,
     witness: &mut W,
 ) -> Result<PatchReport, PatchError> {
-    let (needed, report) = {
-        let view = BitmosaicView::open(slot).ok_or(PatchError::Malformed)?;
-        let Root::Ef(ef) = view.root else {
-            return Err(PatchError::Malformed);
-        };
-        // The splice and the re-encode both count what they fold in but
-        // consume the batch bucket by bucket; the per-value answer is a
-        // probe of the old plane, taken only when something listens.
-        if W::LISTENS {
-            for (i, &a) in adds.iter().enumerate() {
-                if !ef.contains(a) {
-                    witness.add_new(i);
-                }
-            }
-            for (i, &r) in removes.iter().enumerate() {
-                if ef.contains(r) || adds.binary_search(&r).is_ok() {
-                    witness.remove_held(i);
-                }
-            }
-        }
-        match splice_ef(slot, ef, adds, removes, scratch) {
-            Some(done) => done?,
-            None => reencode_ef(slot, Merge::new(view.range(), adds, removes), scratch)?,
-        }
+    let view = BitmosaicView::open(slot).ok_or(PatchError::Malformed)?;
+    let Root::Ef(ef) = view.root else {
+        return Err(PatchError::Malformed);
     };
-    slot[..needed].copy_from_slice(&scratch.build[..needed]);
+    // The existing EF witness probes once before splice/re-encode. Retain the
+    // built result rather than repeating either pass when the plan is applied.
+    if W::LISTENS {
+        for (i, &a) in adds.iter().enumerate() {
+            if !ef.contains(a) {
+                witness.add_new(i);
+            }
+        }
+        for (i, &r) in removes.iter().enumerate() {
+            if ef.contains(r) || adds.binary_search(&r).is_ok() {
+                witness.remove_held(i);
+            }
+        }
+    }
+    let (_, report) = match splice_ef(slot, ef, adds, removes, scratch) {
+        Some(done) => done?,
+        None => reencode_ef(slot, Merge::new(view.range(), adds, removes), scratch)?,
+    };
     Ok(report)
 }
 

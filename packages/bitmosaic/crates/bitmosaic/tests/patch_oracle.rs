@@ -24,7 +24,8 @@ use std::cell::Cell;
 use std::collections::BTreeSet;
 
 use bitmosaic::{
-    BatchOutcome, Bitmosaic, BitmosaicView, PatchError, PatchScratch, patch, patch_witnessed,
+    BatchOutcome, Bitmosaic, BitmosaicView, PatchError, PatchReport, PatchScratch, Witness, patch,
+    patch_witnessed, prepare_patch_in_witnessed, prepare_patch_witnessed,
 };
 
 #[test]
@@ -909,4 +910,469 @@ fn a_words_window_shrinks_where_it_lies() {
         check_reads(what, step, &slot[..want.len()], &result, &mut rng);
         set = result;
     }
+}
+
+/// Run the actual borrowed writer behind a bounded prior-byte capture. The
+/// BTreeSet/fresh encoder owns the expected answer; the planned ranges must
+/// restore every enclosing-buffer byte, including capacity seeded nonzero.
+fn captured_prepared_patch(
+    state: &mut [u8],
+    slot: core::ops::Range<usize>,
+    adds: &[u32],
+    removes: &[u32],
+    scratch: &mut PatchScratch,
+    oracle: &mut BTreeSet<u32>,
+    clear_tail: bool,
+) -> PatchReport {
+    let before = state.to_vec();
+    let old_view = BitmosaicView::open(&before[slot.clone()]).unwrap();
+    let old_len = old_view.serialized_len();
+    let was_ef = old_view.is_elias_fano();
+    let expected_adds: Vec<_> = adds.iter().map(|v| !oracle.contains(v)).collect();
+    oracle.extend(adds.iter().copied());
+    let expected_removes: Vec<_> = removes.iter().map(|v| oracle.contains(v)).collect();
+    for v in removes {
+        oracle.remove(v);
+    }
+    let mut add_bits = vec![0; adds.len().div_ceil(64)];
+    let mut remove_bits = vec![0; removes.len().div_ceil(64)];
+    let mut witness = BatchOutcome::new(&mut add_bits, &mut remove_bits);
+    let prepared =
+        prepare_patch_in_witnessed(state, slot.clone(), adds, removes, scratch, &mut witness)
+            .unwrap();
+    assert_eq!(
+        prepared.state(),
+        before,
+        "preparation cannot write the owner buffer"
+    );
+    assert_eq!(prepared.old_serialized_len(), old_len);
+    let new_len = prepared.new_serialized_len();
+    for (i, &expected) in expected_adds.iter().enumerate() {
+        assert_eq!(
+            prepared.witness().add_was_new(i),
+            expected,
+            "prepared add witnesses must be complete before journal admission"
+        );
+    }
+    for (i, &expected) in expected_removes.iter().enumerate() {
+        assert_eq!(
+            prepared.witness().remove_was_held(i),
+            expected,
+            "prepared removal witnesses must be complete before journal admission"
+        );
+    }
+    let mut ranges = prepared.mutation_ranges().to_vec();
+    assert!(
+        ranges
+            .iter()
+            .all(|&(at, len)| len > 0 && at + len <= slot.len())
+    );
+    assert!(ranges.windows(2).all(|p| p[0].0 + p[0].1 < p[1].0));
+    if clear_tail && let Some(tail) = prepared.cleared_tail_range() {
+        ranges.push(tail);
+    }
+    ranges.sort_unstable_by_key(|&(at, _)| at);
+    let mut coalesced: Vec<(usize, usize)> = Vec::new();
+    for (at, len) in ranges {
+        if let Some((prior_at, prior_len)) = coalesced.last_mut()
+            && at <= *prior_at + *prior_len
+        {
+            *prior_len = (*prior_at + *prior_len).max(at + len) - *prior_at;
+        } else {
+            coalesced.push((at, len));
+        }
+    }
+    let prior: Vec<_> = coalesced
+        .iter()
+        .map(|&(at, len)| prepared.state()[slot.start + at..slot.start + at + len].to_vec())
+        .collect();
+    let (report, state) = if clear_tail {
+        prepared.apply_with_cleared_tail()
+    } else {
+        prepared.apply()
+    };
+    assert_eq!(report.serialized_len, new_len);
+    assert_eq!(report.len, oracle.len() as u64);
+    assert_eq!(
+        report.added as usize,
+        expected_adds.iter().filter(|&&v| v).count()
+    );
+    assert_eq!(
+        report.removed as usize,
+        expected_removes.iter().filter(|&&v| v).count()
+    );
+    for (i, &expected) in expected_adds.iter().enumerate() {
+        assert_eq!(witness.add_was_new(i), expected);
+    }
+    for (i, &expected) in expected_removes.iter().enumerate() {
+        assert_eq!(witness.remove_was_held(i), expected);
+    }
+    let view = BitmosaicView::open_verified(&state[slot.clone()]).unwrap();
+    assert_eq!(view.is_elias_fano(), was_ef && oracle.len() >= 2);
+    assert_eq!(
+        view.range().collect::<Vec<_>>(),
+        oracle.iter().copied().collect::<Vec<_>>()
+    );
+    if let Some(want) = canonical(oracle, view.is_elias_fano()) {
+        assert_eq!(&state[slot.start..slot.start + new_len], want);
+    }
+    if clear_tail && new_len < old_len {
+        assert!(
+            state[slot.start + new_len..slot.start + old_len]
+                .iter()
+                .all(|&b| b == 0)
+        );
+    }
+    let after = state.to_vec();
+    for (at, (&was, &now)) in before.iter().zip(&after).enumerate() {
+        if was != now {
+            assert!(
+                coalesced.iter().any(|&(start, len)| {
+                    slot.start + start <= at && at < slot.start + start + len
+                }),
+                "write at byte {at} escaped the prepared capture"
+            );
+        }
+    }
+    let next: Vec<_> = coalesced
+        .iter()
+        .map(|&(at, len)| after[slot.start + at..slot.start + at + len].to_vec())
+        .collect();
+    for (&(at, len), bytes) in coalesced.iter().zip(&prior) {
+        state[slot.start + at..slot.start + at + len].copy_from_slice(bytes);
+    }
+    assert_eq!(
+        state, before,
+        "bounded undo must restore the complete owner"
+    );
+    for (&(at, len), bytes) in coalesced.iter().zip(&next) {
+        state[slot.start + at..slot.start + at + len].copy_from_slice(bytes);
+    }
+    assert_eq!(state, after, "bounded redo must restore the complete owner");
+    report
+}
+
+#[test]
+fn prepared_ranges_restore_forest_ef_windows_and_cleared_tails() {
+    let mut scratch = PatchScratch::new();
+    for (i, shape) in shapes().iter().enumerate() {
+        let mut oracle: BTreeSet<_> = shape.initial.iter().copied().collect();
+        let owned = Bitmosaic::from_sorted(oracle.iter().copied());
+        let image = if shape.sealed {
+            owned.to_bytes()
+        } else {
+            owned.to_forest_bytes()
+        };
+        let slot = 17..17 + image.len() + 64 * 1024;
+        let mut state = vec![0xa5; slot.end + 31];
+        state[slot.start..slot.start + image.len()].copy_from_slice(&image);
+        let mut rng = Rng(0xB000_5EED + i as u64);
+        for step in 0..24 {
+            let members: Vec<_> = oracle.iter().copied().collect();
+            let adds = sorted_unique(
+                (0..1 + rng.below(40))
+                    .map(|_| rng.below(u64::from(shape.universe)) as u32)
+                    .collect(),
+            );
+            let removes = if step == 23 {
+                members
+            } else if members.is_empty() {
+                Vec::new()
+            } else {
+                sorted_unique(
+                    (0..1 + rng.below(40))
+                        .map(|_| members[rng.below(members.len() as u64) as usize])
+                        .collect(),
+                )
+            };
+            captured_prepared_patch(
+                &mut state,
+                slot.clone(),
+                &adds,
+                &removes,
+                &mut scratch,
+                &mut oracle,
+                step % 2 == 0,
+            );
+        }
+    }
+    // A dense window shrinks above and below, then grows on both sides.
+    let base = 3u32 << 16;
+    let mut rng = Rng(0x5EED_5A1E);
+    let mut oracle: BTreeSet<_> = (1024..12000u32)
+        .filter(|_| rng.next() & 1 == 1)
+        .map(|v| base + v)
+        .collect();
+    oracle.extend((0..50u32).map(|i| (5 << 16) + i * 7 + (i * i) % 5));
+    let image = Bitmosaic::from_sorted(oracle.iter().copied()).to_forest_bytes();
+    let slot = 13..64 * 1024;
+    let mut state = vec![0xc7; slot.end + 29];
+    state[slot.start..slot.start + image.len()].copy_from_slice(&image);
+    // An add removed in the same batch outside the surviving Words window
+    // must still get an add and remove witness without an invalid word offset.
+    captured_prepared_patch(
+        &mut state,
+        slot.clone(),
+        &[base + 2],
+        &[base + 2],
+        &mut scratch,
+        &mut oracle,
+        true,
+    );
+    for (adds, bounds) in [
+        (vec![], (23 * 512, 24 * 512)),
+        (vec![], (1024, 1536)),
+        (vec![base + 65530], (0, 0)),
+        (vec![base + 8], (0, 0)),
+    ] {
+        let removes: Vec<_> = oracle
+            .range(base + bounds.0..base + bounds.1)
+            .copied()
+            .collect();
+        captured_prepared_patch(
+            &mut state,
+            slot.clone(),
+            &adds,
+            &removes,
+            &mut scratch,
+            &mut oracle,
+            true,
+        );
+    }
+}
+
+#[test]
+fn a_prepared_sparse_word_edit_does_not_capture_untouched_payloads() {
+    let values: Vec<_> = (0..60000u32)
+        .filter(|v| v % 7 < 3)
+        .flat_map(|v| [v, (1 << 16) + v, (2 << 16) + v])
+        .collect();
+    let values = sorted_unique(values);
+    let mut slot = Bitmosaic::from_sorted(values.iter().copied()).to_forest_bytes();
+    let old_len = slot.len();
+    slot.resize(old_len + 4096, 0xee);
+    let before = slot.clone();
+    let mut scratch = PatchScratch::with_capacity(slot.len(), 1);
+    let mut witness = ();
+    let adds = [(2 << 16) + 56006, (2 << 16) + 59996];
+    assert!(
+        adds.iter().all(|v| !values.contains(v)),
+        "fixture adds two distant fresh bits near the last chunk's end"
+    );
+    let prepared =
+        prepare_patch_witnessed(&mut slot, &adds, &[], &mut scratch, &mut witness).unwrap();
+    let captured: usize = prepared.mutation_ranges().iter().map(|&(_, len)| len).sum();
+    assert!(
+        captured < 128,
+        "a sparse last-chunk edit captured {captured} bytes"
+    );
+    assert!(prepared.touched_len() <= old_len);
+    let (report, _) = prepared.apply();
+    assert_eq!((report.added, report.removed), (2, 0));
+    let expected = Bitmosaic::from_sorted(sorted_unique(values.into_iter().chain(adds).collect()))
+        .to_forest_bytes();
+    assert_eq!(&slot[..report.serialized_len], expected);
+    assert_eq!(&slot[old_len..], &before[old_len..]);
+}
+
+#[test]
+fn dropping_a_prepared_patch_leaves_owner_unchanged_and_scratch_reusable() {
+    let mut slot = Bitmosaic::from_sorted([3, 7, 11]).to_forest_bytes();
+    slot.resize(256, 0xab);
+    let before = slot.clone();
+    let mut scratch = PatchScratch::with_capacity(slot.len(), 2);
+    let mut witness = ();
+    let adds = [17, 1 << 16];
+    let prepared =
+        prepare_patch_witnessed(&mut slot, &adds, &[7], &mut scratch, &mut witness).unwrap();
+    assert_eq!(prepared.state(), before);
+    drop(prepared);
+    assert_eq!(
+        slot, before,
+        "dropping a prepared patch cannot write the owner"
+    );
+    let report = prepare_patch_witnessed(&mut slot, &adds, &[7], &mut scratch, &mut witness)
+        .unwrap()
+        .apply_with_cleared_tail()
+        .0;
+    assert_eq!((report.added, report.removed, report.len), (2, 1, 4));
+    let expected = Bitmosaic::from_sorted([3, 11, 17, 1 << 16]).to_forest_bytes();
+    assert_eq!(&slot[..report.serialized_len], expected);
+}
+
+#[derive(Default)]
+struct OnceWitness {
+    adds: Vec<usize>,
+    removes: Vec<usize>,
+}
+
+impl Witness for OnceWitness {
+    const LISTENS: bool = true;
+    fn add_new(&mut self, i: usize) {
+        self.adds.push(i);
+    }
+    fn remove_held(&mut self, i: usize) {
+        self.removes.push(i);
+    }
+}
+
+#[test]
+fn retained_patch_reports_each_witness_once_and_releases_work_borrows() {
+    for sealed in [false, true] {
+        let values = scattered(12000, 0x5EED);
+        let owned = Bitmosaic::from_sorted(values.iter().copied());
+        let mut state = if sealed {
+            owned.to_bytes()
+        } else {
+            owned.to_forest_bytes()
+        };
+        if sealed {
+            assert!(BitmosaicView::open(&state).unwrap().is_elias_fano());
+        }
+        state.resize(state.len() + 65536, 0xa9);
+        let mut scratch = PatchScratch::with_capacity(state.len(), 4);
+        let mut witness = OnceWitness::default();
+        let adds = sorted_unique(vec![values[0], values[300] + 1, u32::MAX - 1]);
+        let removes = sorted_unique(vec![values[40], values[800], u32::MAX - 1]);
+        let old: BTreeSet<_> = values.iter().copied().collect();
+        let expected_adds: Vec<_> = adds
+            .iter()
+            .enumerate()
+            .filter_map(|(i, v)| (!old.contains(v)).then_some(i))
+            .collect();
+        let expected_removes: Vec<_> = removes
+            .iter()
+            .enumerate()
+            .filter_map(|(i, v)| (old.contains(v) || adds.contains(v)).then_some(i))
+            .collect();
+        let prepared =
+            prepare_patch_witnessed(&mut state, &adds, &removes, &mut scratch, &mut witness)
+                .unwrap();
+        assert_eq!(
+            prepared.witness().adds,
+            expected_adds,
+            "all roots must expose final add witnesses before any image write"
+        );
+        assert_eq!(
+            prepared.witness().removes,
+            expected_removes,
+            "all roots must expose final removal witnesses before any image write"
+        );
+        let (report, state) = prepared.apply_with_cleared_tail();
+        witness.adds.sort_unstable();
+        witness.removes.sort_unstable();
+        assert_eq!(
+            witness.adds, expected_adds,
+            "the prepare/apply boundary cannot probe twice"
+        );
+        assert_eq!(witness.removes, expected_removes);
+        assert_eq!(report.added as usize, witness.adds.len());
+        assert_eq!(report.removed as usize, witness.removes.len());
+        // A retained owner reference remains usable after the scratch is reused.
+        let mut other = bitmosaic::EMPTY_U32_IMAGE;
+        let mut other_witness = ();
+        prepare_patch_witnessed(&mut other, &[], &[], &mut scratch, &mut other_witness)
+            .unwrap()
+            .apply();
+        assert_eq!(
+            BitmosaicView::open_verified(state).unwrap().len(),
+            report.len
+        );
+    }
+}
+
+#[test]
+fn prepared_ranges_include_the_transient_peak_not_just_old_and_new_frames() {
+    let mut scratch = PatchScratch::new();
+    for (shrink, grow, chunks) in tight_slot_layouts() {
+        let (mut oracle, adds, removes) = tight_slot_case(shrink, grow, chunks);
+        let image = Bitmosaic::from_sorted(oracle.iter().copied()).to_forest_bytes();
+        let mut slot = image.clone();
+        slot.resize(image.len() + 4096, 0xdb);
+        let mut witness = ();
+        let prepared =
+            prepare_patch_witnessed(&mut slot, &adds, &removes, &mut scratch, &mut witness)
+                .unwrap();
+        assert!(
+            prepared.touched_len()
+                > prepared
+                    .old_serialized_len()
+                    .max(prepared.new_serialized_len()),
+            "descending growth must retain its peak beyond both framed images"
+        );
+        drop(prepared);
+        let capacity = slot.len();
+        captured_prepared_patch(
+            &mut slot,
+            0..capacity,
+            &adds,
+            &removes,
+            &mut scratch,
+            &mut oracle,
+            true,
+        );
+    }
+}
+
+#[test]
+fn prepared_patch_has_no_extra_allocations_with_presized_scratch() {
+    let values = scattered(6000, 0xA110C);
+    let add = values[values.len() - 1] + 1;
+    let batch = [add];
+    for sealed in [false, true] {
+        let owned = Bitmosaic::from_sorted(values.iter().copied());
+        let mut slot = if sealed {
+            owned.to_bytes()
+        } else {
+            owned.to_forest_bytes()
+        };
+        slot.resize(slot.len() + 65536, 0xa5);
+        let mut scratch = PatchScratch::with_capacity(slot.len(), 2);
+        let mut witness = ();
+        assert_eq!(
+            allocations_during(|| {
+                let prepared =
+                    prepare_patch_witnessed(&mut slot, &batch, &[], &mut scratch, &mut witness)
+                        .unwrap();
+                std::hint::black_box(prepared.state());
+                std::hint::black_box(prepared.mutation_ranges());
+                assert_eq!(prepared.apply_with_cleared_tail().0.added, 1);
+                let prepared =
+                    prepare_patch_witnessed(&mut slot, &[], &batch, &mut scratch, &mut witness)
+                        .unwrap();
+                std::hint::black_box(prepared.mutation_ranges());
+                assert_eq!(prepared.apply_with_cleared_tail().0.removed, 1);
+            }),
+            0,
+            "preparation and application use the same retained buffers"
+        );
+    }
+}
+
+#[test]
+fn embedded_preparation_refuses_invalid_ranges_before_owner_writes() {
+    let mut state = [0xa5; 128];
+    state[17..21].copy_from_slice(&bitmosaic::EMPTY_U32_IMAGE);
+    let before = state;
+    let mut scratch = PatchScratch::new();
+    let mut witness = ();
+    for slot in [17..129, std::ops::Range { start: 33, end: 17 }, 0..3] {
+        assert!(matches!(
+            prepare_patch_in_witnessed(&mut state, slot, &[], &[], &mut scratch, &mut witness,),
+            Err(PatchError::Malformed)
+        ));
+        assert_eq!(state, before);
+    }
+    assert!(matches!(
+        prepare_patch_in_witnessed(
+            &mut state,
+            17..128,
+            &[5, 3],
+            &[],
+            &mut scratch,
+            &mut witness,
+        ),
+        Err(PatchError::Unsorted)
+    ));
+    assert_eq!(state, before);
 }

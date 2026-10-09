@@ -32,7 +32,8 @@ mod wire;
 
 pub use ef::EfView;
 pub use patch::{
-    BatchOutcome, PatchError, PatchReport, PatchScratch, Witness, patch, patch_witnessed,
+    BatchOutcome, PatchError, PatchReport, PatchScratch, PreparedPatch, Witness, patch,
+    patch_witnessed, prepare_patch_in_witnessed, prepare_patch_witnessed,
 };
 pub(crate) use range::ContainerRange;
 pub use range::{
