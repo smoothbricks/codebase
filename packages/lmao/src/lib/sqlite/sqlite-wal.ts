@@ -17,29 +17,28 @@
  * same 32 against a file already in WAL never fail, because the setter then finds WAL in the header and changes
  * nothing.
  *
- * So the file is built where no other process can see it — a private sibling path — switched to WAL there, closed,
- * and published with link(2), which either creates `dbPath` naming the finished file or fails with `EEXIST` because
- * another opener published first. Either way `dbPath` only ever names a file whose header already says WAL, and an
- * existing file is never replaced or converted.
+ * Coordinated lmao openers serialize publication with a persistent sibling SQLite gate, then recheck `dbPath`.
+ * The gate holder builds a private sibling draft, switches it to WAL, closes it, and publishes it with rename(2).
+ * Thus the visible file is already WAL, and no coordinated opener replaces or converts an existing sink. Other
+ * creators must not write the sink path during publication. The gate is never unlinked: doing so splits its lock.
  *
  * @module sqlite-wal
  */
 
-import { randomUUID } from 'node:crypto';
-import { existsSync, linkSync, mkdirSync, rmSync } from 'node:fs';
+import { closeSync, existsSync, mkdirSync, openSync, readSync, renameSync, rmSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
-import { readJournalMode } from './sqlite-common.js';
 import type { SyncSQLiteDatabase } from './sqlite-db.js';
 
 const JOURNAL_MODE_WAL_SQL = 'PRAGMA journal_mode = WAL';
+const PUBLISH_GATE_TIMEOUT_MS = 10_000;
 
 /**
  * Open `dbPath` with `open`, first creating it in WAL if it does not exist.
  *
- * `open` is the driver's own constructor (`bun:sqlite`, `node:sqlite`, better-sqlite3), called for the private draft
- * and then for `dbPath`. A file already at `dbPath` is opened as it is, in whatever journal mode it has. A fileless
- * name (`:memory:`, `''`) has no path to publish — doing so would leave a literal file nothing reads — so it is opened
- * directly.
+ * `open` is the driver's own constructor (`bun:sqlite`, `node:sqlite`, better-sqlite3), called for the publication
+ * gate, private draft and then `dbPath`. A file already at `dbPath` is opened as it is, in whatever journal mode it
+ * has. A fileless name (`:memory:`, `''`) has no path to publish, so it is opened directly. Publication assumes no
+ * simultaneous same-path openers in different SQLite libraries on threads of one process (POSIX locks are per process).
  */
 export function openWalDatabase<D extends SyncSQLiteDatabase>(dbPath: string, open: (path: string) => D): D {
   // SQLite's names for a database with no shared file: `:memory:`, and `''` for a private temporary one.
@@ -55,29 +54,65 @@ export function openWalDatabase<D extends SyncSQLiteDatabase>(dbPath: string, op
 }
 
 function publishWalDatabase(dbPath: string, open: (path: string) => SyncSQLiteDatabase): void {
-  // Same directory, so link(2) never crosses a filesystem; dot-prefixed, so it reads as nobody's database.
-  const draft = join(dirname(dbPath), `.${basename(dbPath)}.${randomUUID()}.draft`);
+  const directory = dirname(dbPath);
+  const name = basename(dbPath);
+  const gatePath = join(directory, `.${name}.publish`);
+  const gate = open(gatePath);
   try {
-    const db = open(draft);
+    gate.exec(`PRAGMA busy_timeout = ${PUBLISH_GATE_TIMEOUT_MS}`);
     try {
-      // Nothing else can open the draft, so this conversion holds the only lock on it and cannot be refused for
-      // contention. Closing the last connection checkpoints and removes the draft's `-wal` and `-shm`.
-      const mode = readJournalMode(db, JOURNAL_MODE_WAL_SQL);
-      if (mode !== 'wal') {
-        throw new Error(`${JOURNAL_MODE_WAL_SQL} on ${draft} settled on journal_mode=${mode}`);
-      }
-    } finally {
-      db.close();
-    }
-    try {
-      linkSync(draft, dbPath);
+      // From autocommit, not a held read transaction: SQLite's busy handler may wait for the other publisher.
+      gate.exec('BEGIN EXCLUSIVE');
     } catch (error) {
-      // Another opener published first; its file is just as WAL as this draft.
-      if (!(error instanceof Error && 'code' in error && error.code === 'EEXIST')) {
-        throw error;
+      throw new Error(
+        `Cannot acquire SQLite WAL publication gate ${gatePath} (busy_timeout ${PUBLISH_GATE_TIMEOUT_MS}ms)`,
+        { cause: error },
+      );
+    }
+    if (existsSync(dbPath)) return;
+    // Only the gate holder touches this fixed path, including a killed holder's leftover sidecars.
+    const draft = join(directory, `.${name}.draft`);
+    try {
+      removeDraft(draft);
+      const db = open(draft);
+      try {
+        // exec leaves no prepared statement alive: Bun's close_v2 can release the draft immediately.
+        db.exec(JOURNAL_MODE_WAL_SQL);
+      } finally {
+        db.close();
       }
+      requireWalHeader(draft);
+      renameSync(draft, dbPath);
+    } finally {
+      // Cleanup must finish before releasing the gate, or it could delete the next holder's draft.
+      removeDraft(draft);
     }
   } finally {
-    rmSync(draft, { force: true });
+    // Closing rolls back the gate's unwritten transaction and releases its kernel lock, also on failure.
+    // Never unlink the gate: another opener may already hold its inode while waiting for this lock.
+    gate.close();
+  }
+}
+
+function removeDraft(draft: string): void {
+  rmSync(draft, { force: true });
+  rmSync(`${draft}-wal`, { force: true });
+  rmSync(`${draft}-shm`, { force: true });
+  rmSync(`${draft}-journal`, { force: true });
+}
+
+function requireWalHeader(draft: string): void {
+  const header = Buffer.alloc(20);
+  const descriptor = openSync(draft, 'r');
+  try {
+    const bytes = readSync(descriptor, header, 0, header.length, 0);
+    // SQLite header bytes 18/19 are the file's write/read versions: 2 means WAL for both.
+    if (bytes !== header.length || header[18] !== 2 || header[19] !== 2) {
+      throw new Error(
+        `SQLite WAL draft ${draft} has ${bytes} header bytes and write/read versions ${header[18]}/${header[19]}`,
+      );
+    }
+  } finally {
+    closeSync(descriptor);
   }
 }

@@ -201,7 +201,14 @@ for a failure.
   `createNodeSQLiteDatabase` creates an absent file already in WAL, so processes sharing one file never convert it — a
   conversion SQLite refuses with `SQLITE_BUSY` without waiting. For another driver, wrap its constructor the same way:
   `openWalDatabase(path, (path) => new Database(path))` from the same entry. The tracer never changes a database's
-  journal mode; it rejects only `memory` and `off` on a file, which cannot roll back a killed writer.
+  journal mode; it rejects only `memory` and `off` on a file, which cannot roll back a killed writer. Coordinated
+  openers hold SQLite's exclusive lock on the persistent sibling `.<file>.publish`, recheck for a sink, then rename a
+  closed WAL draft into place. No hard-link authority or native addon is needed. Only coordinated openers may create
+  that sink path; unrelated creators must not race publication. The gate must never be unlinked while openers may run,
+  and a process must not publish one path simultaneously from threads using different SQLite libraries (POSIX locks are
+  process-scoped). A killed publisher releases its lock; the next holder removes its draft and sidecars before
+  rebuilding. A held gate refuses after 10 seconds with its path and wait bound. Delete the gate only with the whole
+  retired sink directory, when no opener can run.
 - **Query engine** — the companion package [`@smoothbricks/lmao-inspector`](../lmao-inspector) runs SQL over exported
   Arrow data in the browser.
 
@@ -238,8 +245,8 @@ import `describe`/`it`/`expect` from their native runner as usual. Bun and Vites
 (`@smoothbricks/lmao/testing/bun` · `@smoothbricks/lmao/testing/vitest`). `DEFAULT_TRACE_DB_PATH` resolves to
 `.cache/lmao/trace-results.db` under the package or workspace root. Project walkers and file watchers skip `.cache`,
 which the sink needs because a SQLite database churns its directory's membership through journal sidecars and a compiler
-watching that directory would call its own transform generation incoherent. And `.cache/lmao` holds nothing but the
-sink, so a workspace manager that keeps build state off the source tree can hold exactly that directory (cowshed:
+watching that directory would call its own transform generation incoherent. And `.cache/lmao` holds only the sink, its
+SQLite sidecars and persistent publication gate, so a workspace manager can hold exactly that directory (cowshed:
 `.cowshed.toml` `[build] state = ["packages/*/.cache/lmao"]`). Traces flush to a SQLite sink you can query with the
 `TraceQuery` API or the `sqlite3` CLI. See the docs for the full harness setup, the SQLite schema, and query recipes.
 

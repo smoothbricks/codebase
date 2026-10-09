@@ -200,6 +200,33 @@ integration. It consists of these main components:
   claim does not make span setup allocation-free.
 - **Call-Site Naming**: Span names provided at invocation for contextual flexibility.
 
+## Shared SQLite trace sinks <a id="smoo/lmao!n/sqlite-publication"></a>
+
+`openWalDatabase(dbPath, open)` owns initial publication for synchronous filesystem-backed sinks. `open` is the driver's
+constructor, shared by Node, Bun and better-sqlite3; fileless `''` and `:memory:` open directly. An existing sink opens
+in its existing journal mode and is never converted. A newly visible sink MUST already have WAL write/read versions
+(SQLite header bytes 18 and 19 both equal 2), so concurrent openers never race a shared-file journal upgrade.
+
+Only coordinated lmao openers may create the sink path during publication. Each publisher takes SQLite's exclusive
+transaction lock on the persistent sibling `.<file>.publish`, from autocommit with a 10-second busy timeout, then
+rechecks whether the sink exists. If absent, the holder removes any abandoned `.<file>.draft` and its `-wal`, `-shm` and
+`-journal`, constructs that private draft, sets WAL using `exec` (no prepared statement survives its close), closes it,
+verifies the header, and atomically renames it to the sink path. Draft cleanup completes before releasing the gate. No
+hard links, native addon, external lock service or retry loop is needed. A gate-acquisition failure MUST name the gate
+path and wait bound and preserve the driver's cause.
+
+The gate MUST NOT be unlinked while an opener may run: its inode is the cross-process lock, and replacing it would admit
+two publishers. A killed holder releases its kernel lock; the next holder cleans the abandoned draft while holding that
+same gate. SQLite owns the gate's transient journal and its recovery. Retiring the whole sink directory, gate included,
+requires that no opener can run. POSIX locks are process-scoped: simultaneous same-path publishers on threads using
+different SQLite libraries in one process are outside this contract, as are unrelated path creators. The sink, gate and
+draft share one directory/filesystem, including when that directory is cowshed build state.
+
+**Enforced by:** `packages/lmao/src/lib/sqlite/__tests__/sqlite-writer-concurrent-open.test.ts` holds the gate, plants
+abandoned draft sidecars, releases 32 mixed Node/Bun process openers, kills the holder and requires one WAL inode, every
+committed row, integrity, no remaining drafts and the unchanged gate inode. The same walk runs inside the
+file-link-denying cowshed profile; the fileless and existing-reader cases retain their existing-mode behavior.
+
 ## The Op + Span Pattern <a id="smoo/lmao!n/lmao-trace-the-op-span-pattern"></a>
 
 ### op() - Definition Time <a id="smoo/lmao!n/lmao-trace-op---definition-time"></a>
