@@ -2800,7 +2800,7 @@ fn prepare_clone_stage<H: ApfsExecutionHost>(
                 &canonical_mount,
                 &workspace,
                 fork.then_some(source.name())
-                    .or(identity.info.forked_from.as_ref()),
+                    .or(identity.forked_from.as_ref()),
                 &identity,
             )
         })
