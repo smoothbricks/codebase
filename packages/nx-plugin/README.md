@@ -442,10 +442,13 @@ configuration, output, and contributed path. Keep cacheable artifacts under sour
 ## Test Walk Policy
 
 A test pays its setup once and asserts after each step; two cases that test one path are one test. Consuming
-repositories enforce this in their Nx lint with `findDuplicateScenarios(root, files, changes)` and
-`formatDuplicateScenario` from `@smoothbricks/nx-plugin/test-walk-policy`. `diffScope(root, base)` gives the files
-changed since `base` and their new-side line ranges. The check judges only pairs with a changed case, and picks each
-case's nearest partner among those pairs. Existing pairs therefore need no allowance table.
+repositories enforce this in their root Nx lint with the `smoo-nx-test-walks` bin. The bin judges only pairs with a case
+changed since the upstream merge base, and picks each case's nearest partner among those pairs. Existing pairs therefore
+need no allowance table. `smoo-nx-test-walks --base` prints that base for the target's runtime input, because the
+verdict depends on it and no file hash names it. `upstreamBase` picks the upstream in this order: `NX_BASE` (refused
+when it names no commit), `refs/remotes/main/main`, the local main's upstream branch, `refs/remotes/origin/main`, then
+`main`. `findDuplicateScenarios(root, files, changes)`, `formatDuplicateScenario`, `diffScope` and `upstreamBase` are
+exported from `@smoothbricks/nx-plugin/test-walk-policy`, and git failures come back as `GitAnswer` values.
 
 The policy reads bun:test `test`/`it` cases in test files and `#[test]`-family fns in any Rust file. A body that is one
 wrapper call is read through to the wrapper's statements: `await withHarness(async (h) => { … })`, or
