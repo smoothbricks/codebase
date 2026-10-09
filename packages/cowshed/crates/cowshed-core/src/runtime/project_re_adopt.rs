@@ -377,6 +377,17 @@ impl NativeProjectRuntimeHost {
                 .map_err(native_storage_error)?;
         }
         // Step 5: the mounted replacement holds exactly the recorded Git state.
+        // A published replay may begin after an earlier run released its staging mounts.
+        // Reattach only the intent's retained inputs read-only before comparing the copy.
+        {
+            let retained = std::sync::Arc::clone(&source);
+            self.substrate
+                .dispatch_on_host_with_image_lock(lock.clone(), move |host| {
+                    host.mount_re_adopt_sources(&retained)
+                })
+                .await
+                .map_err(native_storage_error)?;
+        }
         {
             let source = std::sync::Arc::clone(&source);
             crate::storage::lifecycle::dispatch_blocking(move || {
