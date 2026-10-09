@@ -142,6 +142,12 @@ pub struct BitmapEnv {
     /// the batch may grow past them.
     #[cfg(debug_assertions)]
     sealed: Option<[usize; 8]>,
+    /// Whether a batch reserved this storage and sealed it. An operation
+    /// inside such a batch reserves nothing of its own: the batch's bound
+    /// covers every set its operations reach from the batch's starting
+    /// images, while an operation's own bound, taken from an image the batch
+    /// already changed, can exceed it.
+    batch_sealed: bool,
 }
 
 /// The largest bitmap patch one batch or call can make.
@@ -236,6 +242,7 @@ impl Default for BitmapEnv {
             ttl_algebra_scratch: TtlAlgebraScratch::default(),
             #[cfg(debug_assertions)]
             sealed: None,
+            batch_sealed: false,
         }
     }
 }
@@ -281,7 +288,17 @@ impl BitmapEnv {
 
     /// From here until [`Self::unseal`], no operation may grow this storage;
     /// debug builds check it when the batch ends.
+    /// Reserve one operation's own demand, unless a batch already reserved
+    /// and sealed this storage.
+    fn reserve_op(&mut self, demand: BitmapPatchDemand) -> Result<(), ErrorCode> {
+        if self.batch_sealed {
+            return Ok(());
+        }
+        self.reserve_for(demand)
+    }
+
     pub(crate) fn seal(&mut self) {
+        self.batch_sealed = true;
         self.ttl_algebra_scratch.seal();
         #[cfg(debug_assertions)]
         {
@@ -290,6 +307,7 @@ impl BitmapEnv {
     }
 
     pub(crate) fn unseal(&mut self) {
+        self.batch_sealed = false;
         self.ttl_algebra_scratch.unseal();
         #[cfg(debug_assertions)]
         {
@@ -368,7 +386,7 @@ pub fn prepare_bitmap_patch<'state, 'work>(
     let range = bitmap_payload_range(storage, state.len()).inspect_err(|_| {
         env.last_error = 102;
     })?;
-    env.reserve_for(storage_demand(state, storage, count(adds), count(removes))?)?;
+    env.reserve_op(storage_demand(state, storage, count(adds), count(removes))?)?;
     prepare_patch_in_witnessed(
         state,
         range,
@@ -393,7 +411,7 @@ pub fn bitmap_patch(
     let range = bitmap_payload_range(storage, state.len()).inspect_err(|_| {
         env.last_error = 102;
     })?;
-    env.reserve_for(storage_demand(state, storage, count(adds), count(removes))?)?;
+    env.reserve_op(storage_demand(state, storage, count(adds), count(removes))?)?;
     env.adds_new.resize(adds.len().div_ceil(64), 0);
     env.removes_held.resize(removes.len().div_ceil(64), 0);
     let mut outcome = BatchOutcome::new(&mut env.adds_new, &mut env.removes_held);
@@ -563,8 +581,8 @@ pub fn batch_bitmap_add(
     env.staged_adds.clear();
     let storage = get_bitmap_storage(meta);
     // Every buffer this add can fill is backed before it writes.
-    if let Err(code) = storage_demand(state, storage, count(elem_col), 0)
-        .and_then(|demand| env.reserve_for(demand))
+    if let Err(code) =
+        storage_demand(state, storage, count(elem_col), 0).and_then(|demand| env.reserve_op(demand))
     {
         return code;
     }
@@ -735,8 +753,8 @@ pub fn batch_bitmap_remove(
         return ErrorCode::Ok;
     }
     // Every buffer this removal can fill is backed before it writes.
-    if let Err(code) = storage_demand(state, storage, 0, count(elem_col))
-        .and_then(|demand| env.reserve_for(demand))
+    if let Err(code) =
+        storage_demand(state, storage, 0, count(elem_col)).and_then(|demand| env.reserve_op(demand))
     {
         return code;
     }
@@ -871,7 +889,7 @@ pub fn batch_bitmap_algebra(
         };
         demand
     });
-    if let Err(code) = algebra_demand.and_then(|demand| env.reserve_for(demand)) {
+    if let Err(code) = algebra_demand.and_then(|demand| env.reserve_op(demand)) {
         return code;
     }
 

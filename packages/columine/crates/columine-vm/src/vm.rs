@@ -937,6 +937,9 @@ pub struct Vm {
     nested_scratch: nested::NestedScratch,
     /// Batch capacity admission (`capacity`), retained across batches.
     capacity: CapacityScratch,
+    /// Whether the batch now running reserved and sealed its scratch: a
+    /// container call it makes runs inside that reservation.
+    scratch_sealed: bool,
 }
 
 impl Vm {
@@ -957,6 +960,7 @@ impl Vm {
             element_list_vals: ScalarOperands::EMPTY,
             nested_scratch: nested::NestedScratch::default(),
             capacity: CapacityScratch::default(),
+            scratch_sealed: false,
         }
     }
 }
@@ -1052,12 +1056,14 @@ impl Vm {
     /// From here until [`Self::unseal_scratch`] no scratch may grow: debug
     /// builds assert every plan fits what the batch reserved.
     fn seal_scratch(&mut self) {
+        self.scratch_sealed = true;
         self.undo.ttl_batch_scratch.seal();
         self.nested_scratch.seal();
         self.bitmap_env.seal();
     }
 
     fn unseal_scratch(&mut self) {
+        self.scratch_sealed = false;
         self.undo.ttl_batch_scratch.unseal();
         self.nested_scratch.unseal();
         self.bitmap_env.unseal();
@@ -1087,6 +1093,10 @@ impl Vm {
         demand: ScratchDemand,
         run: impl FnOnce(&mut Self) -> ErrorCode,
     ) -> ErrorCode {
+        // Inside a batch, the batch reserved and sealed this call's memory.
+        if self.scratch_sealed {
+            return run(self);
+        }
         if let Err(error) = self.reserve_scratch(&demand) {
             return error;
         }

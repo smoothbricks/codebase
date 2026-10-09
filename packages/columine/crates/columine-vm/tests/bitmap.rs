@@ -2932,6 +2932,39 @@ fn timestamp_only_algebra_overflow_preserves_the_real_accepted_prefix_and_redo()
         0,
         "admitted without a dry run"
     );
+
+    // Two adds to one bitmap in one batch: the second patches an image the
+    // first already grew past the slot-plane threshold. The batch's bound
+    // covers every set the two reach from the starting image, so neither
+    // patch outgrows the reservation (debug builds assert it).
+    let two_adds = program(
+        1,
+        2,
+        &[Opcode::SlotDef as u8, 0, SlotType::Bitmap as u8, 0, 16],
+        &[
+            Opcode::BatchBitmapAdd as u8,
+            0,
+            0,
+            Opcode::BatchBitmapAdd as u8,
+            0,
+            1,
+        ],
+    );
+    let mut state = init_program_state(&two_adds);
+    let mut vm = Vm::default();
+    let first: Vec<u32> = (0..100).map(|i| (i << 16) | i).collect();
+    let second: Vec<u32> = (100..200).map(|i| (i << 16) | i).collect();
+    assert_eq!(
+        vm.execute_batch(
+            &mut state,
+            &two_adds,
+            &[&column(&first), &column(&second)],
+            100
+        ),
+        ErrorCode::Ok as u32
+    );
+    let meta = SlotMetaView::read(&state, 0);
+    assert_eq!(members(&state, get_bitmap_storage(&meta)).len(), 200);
 }
 
 #[test]
