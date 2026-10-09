@@ -506,21 +506,97 @@ impl PatchScratch {
     /// values.
     pub fn with_capacity(slot_bytes: usize, touched_chunks: usize) -> Self {
         let mut scratch = Self::new();
-        scratch.touched.reserve(touched_chunks);
-        scratch.rows.reserve(touched_chunks + slot_bytes / 10);
-        scratch.staged.reserve(slot_bytes);
-        scratch.build.reserve(slot_bytes);
-        // At most one retained word-write run per old payload word, plus the
-        // framing/directory/window/tail ranges of each touched chunk.
-        scratch
-            .mutation_ranges
-            .reserve(slot_bytes / 8 + 8 * touched_chunks + 1);
-        if touched_chunks != 0 {
-            // One record per word of a single trial; published before reuse.
-            scratch.word_witnesses.reserve(CHUNK_WORDS);
-        }
+        let targets = Targets::for_patch(slot_bytes, touched_chunks);
+        scratch.touched.reserve(targets.touched);
+        scratch.rows.reserve(targets.rows);
+        scratch.staged.reserve(targets.staged);
+        scratch.build.reserve(targets.build);
+        scratch.mutation_ranges.reserve(targets.mutation_ranges);
+        scratch.word_witnesses.reserve(targets.word_witnesses);
         scratch
     }
+
+    /// Back every growable buffer for patches whose image never exceeds
+    /// `image_bytes` and which touch at most `touched_chunks` chunks, the same
+    /// closed forms as [`Self::with_capacity`], without aborting: memory that
+    /// cannot back them is an error and nothing is patched. Capacity already
+    /// held is kept, so a warm scratch reserves nothing. A failure part-way
+    /// leaves the buffers reserved before it at their new capacity.
+    pub fn try_reserve_for(
+        &mut self,
+        image_bytes: usize,
+        touched_chunks: usize,
+    ) -> Result<(), std::collections::TryReserveError> {
+        let targets = Targets::for_patch(image_bytes, touched_chunks);
+        reserve_total(&mut self.touched, targets.touched)?;
+        reserve_total(&mut self.rows, targets.rows)?;
+        reserve_total(&mut self.staged, targets.staged)?;
+        reserve_total(&mut self.build, targets.build)?;
+        reserve_total(&mut self.mutation_ranges, targets.mutation_ranges)?;
+        reserve_total(&mut self.word_witnesses, targets.word_witnesses)
+    }
+
+    /// The retained high-water mark of the growable buffers, in bytes. A
+    /// caller compares it before and after a patch to check that the patch
+    /// grew nothing.
+    pub fn capacity_bytes(&self) -> usize {
+        use core::mem::size_of;
+        [
+            self.members.capacity().saturating_mul(size_of::<u16>()),
+            self.runs.capacity().saturating_mul(size_of::<crate::Run>()),
+            self.touched.capacity().saturating_mul(size_of::<Touched>()),
+            self.rows.capacity().saturating_mul(size_of::<Row>()),
+            self.staged.capacity(),
+            self.build.capacity(),
+            self.mutation_ranges
+                .capacity()
+                .saturating_mul(size_of::<(usize, usize)>()),
+            self.word_witnesses
+                .capacity()
+                .saturating_mul(size_of::<WordWitness>()),
+        ]
+        .into_iter()
+        .fold(0, usize::saturating_add)
+    }
+}
+
+/// Capacity targets for a patch whose image never exceeds `image_bytes` and
+/// which touches at most `touched_chunks` chunks. Both [`PatchScratch::with_capacity`]
+/// and [`PatchScratch::try_reserve_for`] read them, so the two cannot drift.
+struct Targets {
+    touched: usize,
+    rows: usize,
+    staged: usize,
+    build: usize,
+    mutation_ranges: usize,
+    word_witnesses: usize,
+}
+
+impl Targets {
+    fn for_patch(image_bytes: usize, touched_chunks: usize) -> Self {
+        Targets {
+            touched: touched_chunks,
+            // A chunk row costs the string at least 10 directory bytes.
+            rows: touched_chunks.saturating_add(image_bytes / 10),
+            staged: image_bytes,
+            build: image_bytes,
+            // At most one retained word-write run per old payload word, plus the
+            // framing/directory/window/tail ranges of each touched chunk.
+            mutation_ranges: (image_bytes / 8)
+                .saturating_add(touched_chunks.saturating_mul(8))
+                .saturating_add(1),
+            // One record per word of a single trial; published before reuse.
+            word_witnesses: if touched_chunks != 0 { CHUNK_WORDS } else { 0 },
+        }
+    }
+}
+
+/// Reserve so `buffer` can hold `total` elements without growing again.
+fn reserve_total<T>(
+    buffer: &mut Vec<T>,
+    total: usize,
+) -> Result<(), std::collections::TryReserveError> {
+    buffer.try_reserve(total.saturating_sub(buffer.len()))
 }
 
 /// Grow a retained buffer to at least `len` bytes. Bytes already there are

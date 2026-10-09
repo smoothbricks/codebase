@@ -7,7 +7,9 @@
 
 use std::collections::BTreeSet;
 
-use bitmosaic::{Bitmosaic, BitmosaicView, EMPTY_U32_IMAGE, patched_len_bound};
+use bitmosaic::{
+    Bitmosaic, BitmosaicView, EMPTY_U32_IMAGE, PatchScratch, patch, patched_len_bound,
+};
 
 struct Rng(u64);
 
@@ -139,4 +141,48 @@ fn elias_fano_roots_stay_within_the_bound() {
         checked += 1;
     }
     assert!(checked > 100, "too few Elias-Fano cases: {checked}");
+}
+
+/// A scratch reserved by `try_reserve_for` at the bound takes every batch that
+/// reaches a set within that bound without growing one of its buffers.
+#[test]
+fn reserved_scratch_absorbs_every_reachable_patch() {
+    let mut rng = Rng(0x5C2A_7E5E_12E5_0A11);
+    for case in 0..200 {
+        let s = shaped(&mut rng, 6);
+        let a = shaped(&mut rng, 4);
+        let r = shaped(&mut rng, 3);
+        let image = if s.is_empty() {
+            EMPTY_U32_IMAGE.to_vec()
+        } else {
+            Bitmosaic::from_sorted(s.iter().copied()).to_forest_bytes()
+        };
+        let adds = len(a.difference(&s).count());
+        let touches = adds + len(r.intersection(&s).count());
+        let bound = patched_len_bound(&image, adds, touches).expect("u32 image");
+        let bound = usize::try_from(bound).expect("a bound fits in usize");
+        let touched_chunks = usize::try_from(touches).expect("a touch count fits in usize");
+        // The batch that reaches (S ∪ A) \ R: each add is new and not removed,
+        // each remove is held.
+        let batch_adds: Vec<u32> = a
+            .iter()
+            .copied()
+            .filter(|v| !s.contains(v) && !r.contains(v))
+            .collect();
+        let batch_removes: Vec<u32> = r.intersection(&s).copied().collect();
+        let mut scratch = PatchScratch::new();
+        scratch
+            .try_reserve_for(bound, touched_chunks)
+            .expect("reserving one patch's scratch");
+        let reserved = scratch.capacity_bytes();
+        let mut slot = image.clone();
+        slot.resize(bound, 0xa5);
+        patch(&mut slot, &batch_adds, &batch_removes, &mut scratch)
+            .expect("a reachable patch fits its bound");
+        assert_eq!(
+            scratch.capacity_bytes(),
+            reserved,
+            "case {case}: a reserved buffer grew"
+        );
+    }
 }
