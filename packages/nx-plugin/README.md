@@ -444,24 +444,41 @@ configuration, output, and contributed path. Keep cacheable artifacts under sour
 A test pays its setup once and asserts after each step; two cases that test one path are one test. Consuming
 repositories enforce this in their Nx lint with `findDuplicateScenarios(root, files, changes)` and
 `formatDuplicateScenario` from `@smoothbricks/nx-plugin/test-walk-policy`. `diffScope(root, base)` gives the files
-changed since `base` and their new-side line ranges, so the check judges a pair only when one of its cases changed.
-Existing pairs therefore need no allowance table.
+changed since `base` and their new-side line ranges. The check judges only pairs with a changed case, and picks each
+case's nearest partner among those pairs. Existing pairs therefore need no allowance table.
 
-The policy reads bun:test `test`/`it` cases in test files and `#[test]`-family fns in any Rust file. It normalizes each
-top-level statement of a case body three ways. `exact` renames the names the case declares to their declaration index.
-`shape` also abstracts every literal. `skeleton` also collapses the declared names. Field, method, key and path names
-are never renamed. A pure assertion reads only what earlier steps built: `expect`/`assert…` that calls only methods and
-runs no closure, constructor, rejection or throw matcher; an `if (…) throw` guard; or an `assert*!` that borrows nothing
-mutably and calls no method on a `let mut` local. `TEST-ONE-WALK` refuses three shapes:
+The policy reads bun:test `test`/`it` cases in test files and `#[test]`-family fns in any Rust file. A body that is one
+wrapper call is read through to the wrapper's statements: `await withHarness(async (h) => { … })`, or
+`block_on(async { … })`. A case's identity is part of the comparison, and only cases of one identity are compared.
+Identity covers `test.failing` in TypeScript, and `#[should_panic]` and `#[ignore]` in Rust. It also covers the
+`before*`/`after*` hooks of the enclosing `describe` chain.
+
+Each top-level statement of a case body is normalized several ways:
+
+- `exact` renames the names the case declares to their declaration index.
+- `shape` also abstracts every literal.
+- `skeleton` also collapses the declared names.
+- `flow` is `exact` with the declared names collapsed.
+
+Field, method, key, struct-literal key, tuple-index and path names are never renamed. A pure assertion reads only what
+earlier steps built. It is one of:
+
+- an `expect`/`assert…` call that calls only methods and runs no closure, constructor, rejection or throw matcher;
+- an `if (…) throw` guard;
+- an `assert*!` that borrows nothing mutably and calls no method on a `let mut` local.
+
+Whether a method reads or acts is not statically decidable. A method that acts inside an assertion, such as
+`expect(await queue.drain())`, is treated as a read, and review decides. `TEST-ONE-WALK` refuses three shapes:
 
 - **same-path:** the cases share at least two leading statements exactly, and one of them only purely asserts beyond
-  them. Fold its assertions into the other's walk.
-- **literal-twin:** two or more statements equal once literals are abstracted. Make one table or property over the
-  values.
-- **same-scenario:** one case's skeleton is the other's head (at least one statement) and tail (at least three: the
-  action and its outcome) around exactly one statement of its own. The injected step differs, for example which crash
-  window or precondition. Extra trailing pure assertions on either side are more checks on the same outcome. Walk the
-  variants over one fixture, or make one table over the injected step.
+  them. Move its assertions into the other walk at the statement the diagnostic names.
+- **literal-twin:** two or more statements equal once literals are abstracted; identical bodies are reported as verbatim
+  repeats. Make one table or property over the values.
+- **same-scenario:** one case's skeleton is the other's head (at least one statement) and tail around exactly one
+  statement of its own. The tail is the action and its outcome: at least three statements equal in flow, with at least
+  one action among them. The injected step differs, for example which crash window or precondition. Extra trailing pure
+  assertions on either side are more checks on the same outcome. Walk the variants over one fixture, or make one table
+  over the injected step.
 
 A separate case stays only for a distinct boundary or edge: its setup or path diverges, or it needs a state the walk's
 earlier steps destroy. Each diagnostic names the file, both cases, the shared statement count and that remedy.
