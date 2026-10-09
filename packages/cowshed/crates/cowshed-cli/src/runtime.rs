@@ -4547,12 +4547,12 @@ where
     }
     let open_span = cowshed_core::timing::span("cli", "open");
     let bridge = match mode {
-        RuntimeOpenMode::Provision => ActorBridge::open_for_adopt(&root, requested_repo_id).await,
+        RuntimeOpenMode::Provision => ActorBridge::open_for_adopt(root, requested_repo_id).await,
         RuntimeOpenMode::ExistingOnly => {
-            ActorBridge::open_existing(&root, runtime_recovery_scope(&cli.command)?).await
+            ActorBridge::open_existing(root, runtime_recovery_scope(&cli.command)?).await
         }
         RuntimeOpenMode::IdentityChange => {
-            ActorBridge::open_existing_for_identity_change(&root).await
+            ActorBridge::open_existing_for_identity_change(root).await
         }
     };
     drop(open_span);
