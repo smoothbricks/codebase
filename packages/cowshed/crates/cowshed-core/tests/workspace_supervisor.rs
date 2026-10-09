@@ -297,8 +297,8 @@ impl ArtifactSink for FakeArtifactSink {
     /// This sink keeps no terminal records: it hands each seal back and forgets the job. The
     /// record a fresh supervisor answers from is the production store's
     /// ([`a_fresh_supervisor_answers_for_a_job_its_predecessor_sealed`]).
-    fn sealed(&self, _job_id: JobId) -> Option<cowshed_core::api::SealedJob> {
-        None
+    fn sealed(&mut self, _job_id: JobId) -> Result<Option<cowshed_core::api::SealedJob>> {
+        Ok(None)
     }
 }
 
@@ -3644,6 +3644,120 @@ async fn a_key_a_set_aside_store_may_hold_is_refused_and_never_spawned() {
             .unwrap_err(),
         lookup,
         "the supervisor socket preserves the complete unprovable error"
+    );
+}
+
+/// One real-store lifecycle distinguishes authoritative absence from unread numeric history and
+/// preserves readable captured content. Every served read retains the same structured refusal.
+#[tokio::test]
+async fn sealed_reads_preserve_unread_history_without_hiding_readable_jobs() {
+    use std::os::unix::fs::DirBuilderExt as _;
+    let (config, _root) = isolated_config("sealed-history-authority");
+    let mut empty = real_store_harness(config.clone());
+    let (remote, _socket) = served(&empty.handle).await;
+    let missing = JobId::new(42).unwrap();
+    let limits = JobTailLimits {
+        bytes_per_stream: JobTailBytes::new(64).unwrap(),
+        lines_per_stream: std::num::NonZeroU32::new(8).unwrap(),
+    };
+    for error in [
+        remote.sealed(missing).await.unwrap_err(),
+        remote
+            .log_read(missing, StreamKind::Stdout, 0, false)
+            .await
+            .unwrap_err(),
+        remote.tail(missing, None, limits).await.unwrap_err(),
+    ] {
+        assert_eq!(
+            error.code,
+            ErrorCode::NotFound,
+            "a genuinely empty protected store proves absence"
+        );
+        assert_eq!(error.admission_source(), None);
+    }
+    assert!(empty.spawned.try_recv().is_err());
+    empty.handle.retire().await.unwrap();
+    drop(empty);
+
+    let mut store = ArtifactStoreSink::open(
+        config.workspace_root.clone(),
+        &config.owned_repo_ids,
+        &config.authority,
+        config.artifacts.clone(),
+    )
+    .unwrap();
+    let readable = store.next_job_id().unwrap();
+    store
+        .admit(
+            readable,
+            config.authority.grant_revision,
+            &request(StdinSource::Empty).command,
+            None,
+        )
+        .unwrap();
+    store
+        .write(readable, StreamKind::Stdout, b"real captured bytes\n")
+        .unwrap();
+    store
+        .seal(readable, JobState::Failed.into(), None, None)
+        .unwrap();
+    drop(store);
+
+    // Numeric ids predate keyed layouts, and an opening marker cannot prove the contents of
+    // retained lineage. No archived payload is projected or interpreted in this fixture.
+    let set_aside = config
+        .workspace_root
+        .join(".cowshed/job/set-aside")
+        .join(format!("layout-{}", FIRST_KEYED_LAYOUT - 1));
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&set_aside)
+        .unwrap();
+    std::fs::write(
+        set_aside.join("incarnation"),
+        "1198f2c0b7e34dc795f17b238b331c80",
+    )
+    .unwrap();
+    let mut resumed = real_store_harness(config);
+    let (remote, _socket) = served(&resumed.handle).await;
+    let refusal = AdmissionRefusal::Unprovable { set_aside };
+    let direct = resumed.handle.sealed(missing).await.unwrap_err();
+    assert_eq!(direct.code, ErrorCode::Conflict);
+    assert_eq!(direct.admission_source(), Some(&refusal));
+    for error in [
+        remote.sealed(missing).await.unwrap_err(),
+        remote
+            .log_read(missing, StreamKind::Stdout, 0, false)
+            .await
+            .unwrap_err(),
+        remote.tail(missing, None, limits).await.unwrap_err(),
+    ] {
+        assert_eq!(
+            error, direct,
+            "each socket read preserves the complete same history refusal"
+        );
+    }
+    assert_eq!(
+        remote
+            .job_by_key(AdmissionKey::new("unknown-key").unwrap())
+            .await
+            .unwrap(),
+        None,
+        "pre-key history never changes key lookup's narrower contract"
+    );
+    let sealed = remote.sealed(readable).await.unwrap();
+    assert_eq!(sealed.job_id, readable);
+    let log = remote
+        .log_read(readable, StreamKind::Stdout, 0, false)
+        .await
+        .unwrap();
+    assert_eq!(log.bytes.as_ref(), b"real captured bytes\n");
+    let tail = remote.tail(readable, None, limits).await.unwrap();
+    assert_eq!(tail.stdout.as_bytes(), b"real captured bytes\n");
+    assert!(
+        resumed.spawned.try_recv().is_err(),
+        "absence, refusal and restored reads start no process"
     );
 }
 

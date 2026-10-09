@@ -813,6 +813,7 @@ pub trait ArtifactSink: Send {
     fn admitted(&self, key: &AdmissionKey) -> AdmissionLookup<'_>;
     fn prepare_background(&mut self, job_id: JobId) -> Result<()>;
     fn write(&mut self, job_id: JobId, stream: StreamKind, bytes: &[u8]) -> Result<ArtifactWrite>;
+
     fn seal(
         &mut self,
         job_id: JobId,
@@ -821,9 +822,9 @@ pub trait ArtifactSink: Send {
         stderr_copy: Option<OutputPublication>,
     ) -> Result<ArtifactSeal>;
     fn checkpoint(&mut self) -> Result<CheckpointBarrier>;
-    /// The terminal record of a job of this workspace incarnation, whichever supervisor sealed
-    /// it; `None` for a job without one.
-    fn sealed(&self, job_id: JobId) -> Option<SealedJob>;
+    /// The terminal record under current store authority. `Ok(None)` proves absence; unread or
+    /// set-aside history is the original refusal, never a missing-job answer.
+    fn sealed(&mut self, job_id: JobId) -> Result<Option<SealedJob>>;
 }
 
 pub use crate::storage::audit::CommitmentDraft;
@@ -870,22 +871,26 @@ impl ArtifactSink for ArtifactStoreSink {
         self.store.next_job_id().map_err(map_artifact_error)
     }
 
-    fn sealed(&self, job_id: JobId) -> Option<SealedJob> {
-        self.store.sealed(job_id).map(|record| SealedJob {
-            job_id: record.job_id,
-            state: record.state,
-            exit: record.exit.clone(),
-            failure: record.failure,
-            duration_ms: record.duration_ms,
-            resources: record.resources.clone(),
-            output_limit: record.output_limit.clone(),
-            stdout: record.stdout.clone(),
-            stderr: record.stderr.clone(),
-            class: record.scheduling.class(),
-            scope: record.scheduling.scope(),
-            nice: record.nice,
-            cpu_tokens: record.cpu_tokens,
-        })
+    fn sealed(&mut self, job_id: JobId) -> Result<Option<SealedJob>> {
+        Ok(self
+            .store
+            .sealed(job_id)
+            .map_err(map_artifact_error)?
+            .map(|record| SealedJob {
+                job_id: record.job_id,
+                state: record.state,
+                exit: record.exit.clone(),
+                failure: record.failure,
+                duration_ms: record.duration_ms,
+                resources: record.resources.clone(),
+                output_limit: record.output_limit.clone(),
+                stdout: record.stdout.clone(),
+                stderr: record.stderr.clone(),
+                class: record.scheduling.class(),
+                scope: record.scheduling.scope(),
+                nice: record.nice,
+                cpu_tokens: record.cpu_tokens,
+            }))
     }
 
     fn admit(
@@ -3984,7 +3989,7 @@ impl SupervisorActor {
             } => {
                 let result = self.validate_authority(&authority).and_then(|()| {
                     self.artifacts
-                        .sealed(job_id)
+                        .sealed(job_id)?
                         .ok_or_else(|| unsealed_job(job_id))
                 });
                 let _ = reply.send(result);
@@ -5480,9 +5485,16 @@ impl SupervisorActor {
         let Ok(job) = self.job_mut(job_id) else {
             // A job an earlier supervisor of this incarnation ran and sealed: its sealed artifact
             // answers exactly as this supervisor's own terminal jobs do.
-            let Some(sealed) = self.artifacts.sealed(job_id) else {
-                let _ = reply.send(Err(not_found_job(job_id)));
-                return;
+            let sealed = match self.artifacts.sealed(job_id) {
+                Ok(Some(sealed)) => sealed,
+                Ok(None) => {
+                    let _ = reply.send(Err(not_found_job(job_id)));
+                    return;
+                }
+                Err(error) => {
+                    let _ = reply.send(Err(error));
+                    return;
+                }
             };
             let stream = match stream {
                 StreamKind::Stdout => sealed.stdout,
@@ -5557,9 +5569,13 @@ impl SupervisorActor {
             Ok(job) => (job.info.stdout.clone(), job.info.stderr.clone()),
             // A job an earlier supervisor of this incarnation sealed: its artifact answers.
             Err(_) => match self.artifacts.sealed(job_id) {
-                Some(sealed) => (sealed.stdout, sealed.stderr),
-                None => {
+                Ok(Some(sealed)) => (sealed.stdout, sealed.stderr),
+                Ok(None) => {
                     let _ = reply.send(Err(not_found_job(job_id)));
+                    return;
+                }
+                Err(error) => {
+                    let _ = reply.send(Err(error));
                     return;
                 }
             },
@@ -6891,7 +6907,7 @@ pub(super) fn map_artifact_error(error: ArtifactError) -> CowshedError {
             error.to_string(),
             format!("reach job {} with jobByKey", admitted.get()),
         ),
-        ArtifactError::AdmissionKeyUnprovable { set_aside } => {
+        ArtifactError::HistoryUnprovable { set_aside } => {
             CowshedError::admission_refusal(AdmissionRefusal::Unprovable { set_aside })
         }
         error => CowshedError::integrity(error.to_string(), "cowshed doctor --json"),

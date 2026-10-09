@@ -14062,8 +14062,8 @@ mod removal_supervisor_tests {
             })
         }
 
-        fn sealed(&self, _job_id: JobId) -> Option<SealedJob> {
-            None
+        fn sealed(&mut self, _job_id: JobId) -> Result<Option<SealedJob>> {
+            Ok(None)
         }
     }
 

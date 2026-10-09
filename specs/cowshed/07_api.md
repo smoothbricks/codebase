@@ -633,6 +633,8 @@ is crossed. Accounting includes protected and in-flight bytes; the supervisor ad
 boundary, terminates the process group, drains pipes, seals artifacts, and only then publishes terminal state. Summaries
 remain a separate bounded diagnostic projection.
 
+### Captured-content authority
+
 The shell connection is a reconnectable view over the persistent, permission-checked, multi-client per-workspace
 supervisor socket (11_shell.md). Dropping a `Session`, `JobHandle`, or transport never unlinks that socket or stops the
 job. Protected complete in-volume Arrow batches and sealed artifacts are the authoritative evidence of a job; controller
@@ -640,6 +642,19 @@ commitments are audit telemetry that no API reads for a decision (11_shell.md). 
 altered artifact, an invalid complete batch, a checkpoint-barrier counter behind a durable barrier, or an incarnation
 outside the marker lineage; nothing silently wins. Authorization, grant, and gateway audit authority remain
 controller-owned.
+
+The artifact sink's `sealed(jobId)` returns `Result<Option<SealedJob>>`: `Ok(None)` means the current protected-store
+authority proves no terminal record for that id. A missing cached row is not that proof. A miss refreshes under the
+existing records lock and recovery validation; read, repository/lineage, batch, stream and recovery failures retain
+their causes and never become `None`. A readable sealed record remains answerable even when other history is unread.
+
+Any unread layout can hold numeric job ids. If the refreshed store cannot read the requested id and any set-aside
+history remains, the sink refuses with the existing `AdmissionRefusal::Unprovable { setAside }`, carried as typed
+`Conflict`, rather than reporting a job that never existed. An archived opening-incarnation marker never proves numeric
+absence: the unread store may retain lineage rows. Key lookup keeps its narrower keyed-layout/incarnation contract
+below. No earlier payload is decoded or migrated. `sealed`, sealed monitoring, logs and tails preserve that same
+complete refusal across the controller/socket boundary; none silently converts it to `NotFound`, empty bytes or a
+re-execution. Only authoritative readable-history absence reaches the public missing-job error.
 
 The invariant is the same one that keeps grant files outside the volume (01_storage.md, 04): a capability reachable from
 inside a sandbox must not authorize escalation. `WorkspaceHandle` is that principle expressed in the type system — a

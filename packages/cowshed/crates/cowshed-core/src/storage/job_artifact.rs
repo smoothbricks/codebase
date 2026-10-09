@@ -248,9 +248,9 @@ pub enum ArtifactError {
     /// The record would bind an admission key this incarnation already bound to another job.
     #[error("admission key already admitted job {admitted:?}, not job {job_id:?}")]
     AdmissionKeyTaken { job_id: JobId, admitted: JobId },
-    /// The record would bind an admission key a set-aside store may already bind.
-    #[error("admission key may be bound in the job store set aside at {}", set_aside.display())]
-    AdmissionKeyUnprovable { set_aside: PathBuf },
+    /// Unread history may hold the requested job or admission key in this incarnation.
+    #[error("job history may be held in the store set aside at {}", set_aside.display())]
+    HistoryUnprovable { set_aside: PathBuf },
     #[error("failed to secure redirect descriptor for {path}: {message}")]
     RedirectDescriptor { path: PathBuf, message: String },
     #[error(
@@ -538,13 +538,19 @@ struct Admitted {
     scheduling: JobScheduling,
 }
 
-/// Every admission key the store's incarnation admitted a job under.
+/// Readable admission keys and unread job history of the store's incarnation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct AdmissionIndex {
     keys: BTreeMap<AdmissionKey, Admitted>,
-    /// A store set aside while serving this incarnation in a keyed layout: the keys it holds
-    /// are unreadable, so a key not in `keys` may still have admitted a job.
-    set_aside: Option<PathBuf>,
+    /// Every unread layout that may have served this incarnation, in deterministic path order.
+    /// Numeric jobs exist in every layout; only keyed layouts can make an admission key unknown.
+    unread_history: Vec<UnreadHistory>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct UnreadHistory {
+    store: SetAsideStore,
+    may_hold_keys: bool,
 }
 
 /// What an incarnation's admissions say of one key.
@@ -614,12 +620,16 @@ impl AdmissionIndex {
         }
         Ok(Self {
             keys,
-            set_aside: keyed_history_set_aside(job_root, incarnation)?,
+            unread_history: history_set_aside(job_root, incarnation)?,
         })
     }
 
     fn lookup(&self, key: &AdmissionKey) -> AdmissionLookup<'_> {
-        match (self.keys.get(key), &self.set_aside) {
+        let keyed_history = self
+            .unread_history
+            .iter()
+            .find(|history| history.may_hold_keys);
+        match (self.keys.get(key), keyed_history) {
             (Some(known), _) => AdmissionLookup::Admitted {
                 job_id: known.job_id,
                 command: &known.command,
@@ -627,7 +637,9 @@ impl AdmissionIndex {
                 scheduling: known.scheduling,
             },
             (None, None) => AdmissionLookup::Absent,
-            (None, Some(set_aside)) => AdmissionLookup::Unprovable { set_aside },
+            (None, Some(history)) => AdmissionLookup::Unprovable {
+                set_aside: &history.store.path,
+            },
         }
     }
 
@@ -642,11 +654,9 @@ impl AdmissionIndex {
             AdmissionLookup::Admitted {
                 job_id: admitted, ..
             } => Err(ArtifactError::AdmissionKeyTaken { job_id, admitted }),
-            AdmissionLookup::Unprovable { set_aside } => {
-                Err(ArtifactError::AdmissionKeyUnprovable {
-                    set_aside: set_aside.to_path_buf(),
-                })
-            }
+            AdmissionLookup::Unprovable { set_aside } => Err(ArtifactError::HistoryUnprovable {
+                set_aside: set_aside.to_path_buf(),
+            }),
         }
     }
 
@@ -664,9 +674,8 @@ impl AdmissionIndex {
     }
 }
 
-/// Name, in the directory of a store just set aside in a keyed layout, the incarnation it
-/// served. Until the name is durable a later open reads the store as anyone's
-/// ([`keyed_history_set_aside`]).
+/// Name the incarnation a store just set aside served. Until that name is durable a later open
+/// keeps the history unknown for any incarnation ([`history_set_aside`]).
 fn record_set_aside_incarnation(
     set_aside: &SetAsideStore,
     incarnation: &WorkspaceIncarnation,
@@ -681,19 +690,19 @@ fn record_set_aside_incarnation(
     })
 }
 
-/// The first store set aside under `job_root` in a keyed layout that may have served
-/// `incarnation`: one whose directory names it, or names no incarnation at all.
-fn keyed_history_set_aside(
+/// Every unread layout remains unknown for numeric jobs. Markers can narrow only the admission-key
+/// scope: an opening incarnation marker does not attest to every lineage row the store retained.
+fn history_set_aside(
     job_root: &Path,
     incarnation: &WorkspaceIncarnation,
-) -> Result<Option<PathBuf>, ArtifactError> {
+) -> Result<Vec<UnreadHistory>, ArtifactError> {
     let parent = job_root.join(SET_ASIDE_DIRECTORY);
     let entries = match fs::read_dir(&parent) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(io_error(&parent, error)),
     };
-    let mut keyed = Vec::new();
+    let mut unread = Vec::new();
     for entry in entries {
         let entry = entry.map_err(|error| io_error(&parent, error))?;
         let name = entry.file_name();
@@ -708,42 +717,41 @@ fn keyed_history_set_aside(
                     &format!("set-aside entry {name:?} names no record layout"),
                 )
             })?;
-        if layout < FIRST_KEYED_LAYOUT {
-            continue;
-        }
         let path = entry.path();
         let served = path.join(SET_ASIDE_INCARNATION_FILE);
-        let may_hold = match fs::read(&served) {
-            Ok(bytes) => {
-                let value = String::from_utf8(bytes).map_err(|error| {
-                    integrity(
-                        0,
-                        &format!(
-                            "invalid set-aside incarnation in {}: {error}",
-                            served.display()
-                        ),
-                    )
-                })?;
-                let recorded = WorkspaceIncarnation::new(value).map_err(|error| {
-                    integrity(
-                        0,
-                        &format!(
-                            "invalid set-aside incarnation in {}: {error}",
-                            served.display()
-                        ),
-                    )
-                })?;
-                &recorded == incarnation
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => true,
-            Err(error) => return Err(io_error(&served, error)),
-        };
-        if may_hold {
-            keyed.push(path);
-        }
+        let may_hold_keys = layout >= FIRST_KEYED_LAYOUT
+            && match fs::read(&served) {
+                Ok(bytes) => {
+                    let value = String::from_utf8(bytes).map_err(|error| {
+                        integrity(
+                            0,
+                            &format!(
+                                "invalid set-aside incarnation in {}: {error}",
+                                served.display()
+                            ),
+                        )
+                    })?;
+                    let recorded = WorkspaceIncarnation::new(value).map_err(|error| {
+                        integrity(
+                            0,
+                            &format!(
+                                "invalid set-aside incarnation in {}: {error}",
+                                served.display()
+                            ),
+                        )
+                    })?;
+                    &recorded == incarnation
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => true,
+                Err(error) => return Err(io_error(&served, error)),
+            };
+        unread.push(UnreadHistory {
+            store: SetAsideStore { layout, path },
+            may_hold_keys,
+        });
     }
-    keyed.sort();
-    Ok(keyed.into_iter().next())
+    unread.sort_by(|left, right| left.store.path.cmp(&right.store.path));
+    Ok(unread)
 }
 
 impl JobArtifactRecord {
@@ -1183,30 +1191,7 @@ impl ArtifactStore {
         let lock = RecordsLock::acquire(&records_path)?;
         let mut recovery =
             recover_records_with_budget_under_lock(&lock, config.retained_recovery_budget_bytes)?;
-        for frame in &recovery.frames {
-            if !owned_repo_ids.accepts(frame.record.repo_id()) {
-                return Err(ArtifactError::Integrity {
-                    offset: 0,
-                    message: format!(
-                        "record repo identity {} is not owned by attached project {owned_repo_ids}",
-                        frame.record.repo_id(),
-                    ),
-                });
-            }
-            if frame.record.origin_incarnation() != &workspace_incarnation
-                && !config
-                    .historical_incarnations
-                    .contains(frame.record.origin_incarnation())
-            {
-                return Err(ArtifactError::Integrity {
-                    offset: 0,
-                    message: format!(
-                        "record incarnation {} is neither current nor in the workspace's lineage",
-                        frame.record.origin_incarnation()
-                    ),
-                });
-            }
-        }
+        validate_recovered_authority(&owned_repo_ids, &workspace_incarnation, &config, &recovery)?;
         validate_recovered_files(&workspace_root, &workspace_incarnation, &recovery)?;
         let directory_max = scan_job_directories(&workspace_root)?;
         let record_max = recovery
@@ -1248,9 +1233,7 @@ impl ArtifactStore {
             .parent()
             .ok_or_else(|| integrity(0, "records path has no job parent"))?
             .to_path_buf();
-        if let Some(set_aside) = &recovery.set_aside
-            && set_aside.layout >= FIRST_KEYED_LAYOUT
-        {
+        if let Some(set_aside) = &recovery.set_aside {
             record_set_aside_incarnation(set_aside, &workspace_incarnation)?;
         }
         let admissions = AdmissionIndex::recover(&recovery, &workspace_incarnation, &job_root)?;
@@ -1284,10 +1267,58 @@ impl ArtifactStore {
         JobId::new(self.next_job_id).map_err(ArtifactError::from)
     }
 
-    /// The terminal record of a job of this incarnation, whichever supervisor sealed it: read from
-    /// the records at open, and kept current as this store seals jobs.
-    pub fn sealed(&self, job_id: JobId) -> Option<&JobArtifactRecord> {
-        self.committed_jobs.get(&job_id)
+    /// A readable terminal record, or authoritative absence. Unread history is a refusal, never
+    /// evidence that a numeric job was not admitted.
+    pub fn sealed(&mut self, job_id: JobId) -> Result<Option<&JobArtifactRecord>, ArtifactError> {
+        if !self.committed_jobs.contains_key(&job_id) {
+            let path = records_path(&self.workspace_root);
+            let lock = RecordsLock::acquire(&path)?;
+            if self.records_seen.is_some() && RecordsIdentity::of(&path)?.is_none() {
+                return Err(integrity(
+                    0,
+                    "previously readable protected job records disappeared",
+                ));
+            }
+            let recovery = recover_records_with_budget_under_lock(
+                &lock,
+                self.config.retained_recovery_budget_bytes,
+            )?;
+            validate_recovered_authority(
+                &self.owned_repo_ids,
+                &self.workspace_incarnation,
+                &self.config,
+                &recovery,
+            )?;
+            validate_recovered_files(&self.workspace_root, &self.workspace_incarnation, &recovery)?;
+            if let Some(set_aside) = &recovery.set_aside {
+                record_set_aside_incarnation(set_aside, &self.workspace_incarnation)?;
+            }
+            let job_root = path
+                .parent()
+                .ok_or_else(|| integrity(0, "records path has no job parent"))?;
+            self.admissions =
+                AdmissionIndex::recover(&recovery, &self.workspace_incarnation, job_root)?;
+            for frame in &recovery.frames {
+                if let ProtectedRecord::Job(record) = &frame.record
+                    && record.workspace_incarnation == self.workspace_incarnation
+                    && !matches!(record.state, JobState::Queued | JobState::Running)
+                {
+                    self.committed_jobs
+                        .entry(record.job_id)
+                        .or_insert_with(|| record.clone());
+                }
+            }
+            self.records_seen = RecordsIdentity::of(&path)?;
+        }
+        if let Some(record) = self.committed_jobs.get(&job_id) {
+            return Ok(Some(record));
+        }
+        if let Some(store) = self.admissions.unread_history.first() {
+            return Err(ArtifactError::HistoryUnprovable {
+                set_aside: store.store.path.clone(),
+            });
+        }
+        Ok(None)
     }
 
     pub fn buffered_bytes(&self) -> usize {
@@ -2684,6 +2715,39 @@ pub fn read_stream(workspace_root: &Path, stream: &StreamInfo) -> Result<Vec<u8>
         bytes.extend_from_slice(&buffer[..read]);
     }
     Ok(bytes)
+}
+
+fn validate_recovered_authority(
+    owned_repo_ids: &OwnedRepoIds,
+    current_incarnation: &WorkspaceIncarnation,
+    config: &ArtifactConfig,
+    recovery: &RecoveryReport,
+) -> Result<(), ArtifactError> {
+    for frame in &recovery.frames {
+        if !owned_repo_ids.accepts(frame.record.repo_id()) {
+            return Err(integrity(
+                0,
+                &format!(
+                    "record repo identity {} is not owned by attached project {owned_repo_ids}",
+                    frame.record.repo_id(),
+                ),
+            ));
+        }
+        if frame.record.origin_incarnation() != current_incarnation
+            && !config
+                .historical_incarnations
+                .contains(frame.record.origin_incarnation())
+        {
+            return Err(integrity(
+                0,
+                &format!(
+                    "record incarnation {} is neither current nor in the workspace's lineage",
+                    frame.record.origin_incarnation(),
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn validate_recovered_files(
@@ -8148,6 +8212,13 @@ mod tests {
             }
             let mut store = store_at(&root, ArtifactConfig::default());
             let job_id = store.next_job_id().unwrap();
+            assert!(
+                matches!(
+                    store.sealed(job_id),
+                    Err(ArtifactError::HistoryUnprovable { set_aside: ref path }) if path == &set_aside
+                ),
+                "{label}: every unread layout can hold a numeric job, regardless of its marker or key support"
+            );
             let before = fs::read(records_path(&root)).ok();
             let begun = store.begin_job(
                 job_id,
@@ -8168,7 +8239,7 @@ mod tests {
                 assert!(
                     matches!(
                         begun,
-                        Err(ArtifactError::AdmissionKeyUnprovable { set_aside: ref path })
+                        Err(ArtifactError::HistoryUnprovable { set_aside: ref path })
                             if path == &set_aside
                     ),
                     "{label}: {begun:?}"
