@@ -34,6 +34,12 @@
       "import": "./dist/build-state-output-policy.js",
       "default": "./dist/build-state-output-policy.js"
     },
+    "./test-walk-policy": {
+      "types": "./dist/test-walk-policy.d.ts",
+      "development": "./src/test-walk-policy.ts",
+      "import": "./dist/test-walk-policy.js",
+      "default": "./dist/test-walk-policy.js"
+    },
     "./workspace-config-policy": {
       "types": "./dist/workspace-config-policy.d.ts",
       "import": "./dist/workspace-config-policy.js",
@@ -298,6 +304,7 @@
     "prettier": "^3.9.8",
     "smol-toml": "^1.6.1",
     "tslib": "^2.8.1",
+    "typescript": "^6.0.3",
     "typia": "14.0.6",
     "yaml": "^2.9.0"
   },
