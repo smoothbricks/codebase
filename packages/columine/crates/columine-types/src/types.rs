@@ -868,7 +868,8 @@ pub enum ErrorCode {
     CountOverflow = 10,
     /// A keyed fold's immutable frame metadata differs from its init value.
     MetadataConflict = 11,
-    /// Physical journal budget refused this operation before any write.
+    /// Physical journal budget, or the memory that backs it, refused this
+    /// operation before any write.
     /// The speculative window remains unusable until it is ended or reset.
     JournalOverflow = 12,
     /// A paired delta export contains an undo-only mutation without redo.

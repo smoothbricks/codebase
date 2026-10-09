@@ -433,8 +433,8 @@ pub(crate) fn evict_expired(
             buffer_len,
         ),
     ];
+    undo.prepare_redo(delta_mode)?;
     let capture = undo.begin_capture(state, &ranges)?;
-    undo.prepare_redo(delta_mode);
     meta.set_evicted_count(state, 0);
     let mut processed = 0u32;
     let mut removed = 0u32;
@@ -536,8 +536,17 @@ pub fn write_derived_facts_header(
 // Undo/delta runtime state
 // =============================================================================
 
-/// Maximum number of undo entries retained in memory.
+/// Maximum number of undo entries one window may hold. A logical budget:
+/// journal storage grows to actual demand and is admitted before any write.
 pub const UNDO_CAPACITY: u32 = 16384;
+
+/// Source of window generations, unique across every journal in the process,
+/// so a capture frame names exactly one window of exactly one journal.
+static NEXT_GENERATION: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+
+fn next_generation() -> u64 {
+    NEXT_GENERATION.fetch_add(1, Ordering::Relaxed)
+}
 
 /// Read-only lifecycle witness for the scenario lane, not record authority.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -601,20 +610,39 @@ impl UndoState {
             self.overflow = true;
             return Err(ErrorCode::JournalOverflow);
         }
+        // Back the admitted entries with storage now, grown geometrically to
+        // actual demand, so no later push allocates. Storage that cannot be
+        // had refuses like the budget: before any write, and sticky.
+        let total = self.entries.len() + (self.reserved_entries + count) as usize;
+        if self
+            .entries
+            .try_reserve(total - self.entries.len())
+            .is_err()
+            || (self.redo_active && self.redo.try_reserve(total - self.redo.len()).is_err())
+        {
+            self.overflow = true;
+            return Err(ErrorCode::JournalOverflow);
+        }
         self.reserved_entries += count;
         Ok(())
     }
 
-    /// Admit scenario storage before its first writer. Pure production windows
-    /// allocate and write no redo buffer.
-    fn prepare_redo(&mut self, delta_mode: bool) {
+    /// Admit scenario storage before its first writer, and before any entry
+    /// reservation that must cover it. Pure production windows allocate and
+    /// write no redo buffer.
+    fn prepare_redo(&mut self, delta_mode: bool) -> Result<(), ErrorCode> {
         if !self.enabled || !delta_mode || self.redo_active {
-            return;
+            return Ok(());
         }
         debug_assert!(self.redo.is_empty());
-        self.redo.reserve(UNDO_CAPACITY as usize);
+        let total = self.entries.len() + self.reserved_entries as usize;
+        if self.redo.try_reserve(total).is_err() {
+            self.overflow = true;
+            return Err(ErrorCode::JournalOverflow);
+        }
         self.redo.resize(self.entries.len(), None);
         self.redo_active = true;
+        Ok(())
     }
 
     fn push_reserved(&mut self, undo: FlatUndoEntry, redo: Option<FlatUndoEntry>) {
@@ -707,10 +735,19 @@ impl UndoState {
         if !self.enabled {
             return Ok(ByteCapture { frame: None });
         }
+        // Before-bytes and their ranges never exceed the declared bytes and
+        // the reserved chunks; both are backed before the budget is taken.
+        let bytes: usize = ranges.iter().map(|&(_, len)| len as usize).sum();
+        if self.overflow
+            || self.capture_scratch.try_reserve(bytes).is_err()
+            || self.capture_ranges.try_reserve(count as usize).is_err()
+        {
+            self.overflow = true;
+            return Err(ErrorCode::JournalOverflow);
+        }
         self.reserve_entries(count)?;
         let frame = CaptureFrame {
             generation: self.generation,
-            owner: self.capture_scratch.as_ptr() as usize,
             image: state.as_ptr() as usize,
             depth: self.capture_depth,
             scratch_start: self.capture_scratch.len(),
@@ -750,11 +787,6 @@ impl UndoState {
         assert_eq!(
             frame.generation, self.generation,
             "capture belongs to another undo window"
-        );
-        assert_eq!(
-            frame.owner,
-            self.capture_scratch.as_ptr() as usize,
-            "capture belongs to another journal"
         );
         assert_eq!(
             frame.image,
@@ -950,8 +982,8 @@ impl Vm {
         ranges: &[(u32, u32)],
         mutate: impl FnOnce(&mut [u8]) -> T,
     ) -> Result<T, ErrorCode> {
+        self.undo.prepare_redo(delta_mode)?;
         let capture = self.undo.begin_capture(state, ranges)?;
-        self.undo.prepare_redo(delta_mode);
         let result = mutate(state);
         self.undo.finish_capture(delta_mode, state, ranges, capture);
         Ok(result)
@@ -975,8 +1007,8 @@ impl Vm {
         state: &mut [u8],
         mutate: impl FnOnce(&mut Vm, &mut [u8]) -> T,
     ) -> Result<T, ErrorCode> {
+        self.undo.prepare_redo(delta_mode)?;
         let owner = self.undo.open_change_flags(state)?;
-        self.undo.prepare_redo(delta_mode);
         let result = mutate(self, state);
         if owner {
             self.undo.finish_change_flags(delta_mode, state);
@@ -5557,18 +5589,13 @@ impl Vm {
         u.export_start = 0;
         u.export_count = 0;
         u.export_overflow = false;
-        u.generation = u.generation.wrapping_add(1);
+        u.generation = next_generation();
         u.capture_depth = 0;
         u.reserved_entries = 0;
         u.capture_scratch.clear();
         u.capture_ranges.clear();
-        u.entries.reserve(UNDO_CAPACITY as usize);
-        u.capture_scratch.reserve(UNDO_CAPACITY as usize * 8);
-        u.capture_ranges.reserve(UNDO_CAPACITY as usize);
         u.ttl_batch_scratch.reset();
-        u.ttl_batch_scratch.reserve(UNDO_CAPACITY as usize);
         u.erase_scratch.ranges.clear();
-        u.erase_scratch.ranges.reserve(UNDO_CAPACITY as usize);
         u.saved_change_flags.reserve(slots as usize + 1);
         u.saved_change_flags.clear();
         u.state_size = state_size;
@@ -5616,7 +5643,7 @@ impl Vm {
         u.capture_scratch.clear();
         u.capture_ranges.clear();
         u.ttl_batch_scratch.reset();
-        u.generation = u.generation.wrapping_add(1);
+        u.generation = next_generation();
         u.entries.clear();
         u.redo.clear();
         u.redo_active = false;

@@ -268,11 +268,30 @@ fn pure_window_writes_undo_only_and_never_admits_the_redo_lane() {
     );
 }
 
-/// A pure physical write after a warm-up allocates nothing. `undo_enable`
-/// reserves the journal's storage, so a measured capture on a fresh VM touches
-/// only reserved memory, journals exactly its one changed cell, and never
+/// A pure physical write after a warm-up allocates nothing. The warm write
+/// grew the journal's storage to its demand, so the measured capture touches
+/// only retained memory, journals exactly its one changed cell, and never
 /// admits the redo lane. The warm write stays in the image and rollback
 /// restores the complete image.
+/// Opening a window costs its change-flag snapshot, not the window budget:
+/// journal, capture and planner storage grow to what writes actually need,
+/// so a host holding one journal per state does not pay the full budget per
+/// journal.
+#[test]
+fn opening_a_window_reserves_no_budget_sized_storage() {
+    let prog = count_program();
+    let state = init(&prog);
+    let mut vm = Vm::default();
+    let (opened, allocations) = allocations_during(|| vm.undo_enable(&state));
+    assert_eq!(Ok(()), opened);
+    assert!(
+        allocations <= 1,
+        "opening a window allocated {allocations} buffers"
+    );
+    let lane = vm.undo_redo_lane_status();
+    assert_eq!(0, lane.capacity, "a pure window reserves no redo lane");
+}
+
 #[test]
 fn warm_pure_capture_allocates_nothing_and_admits_no_redo() {
     let prog = count_program();
@@ -352,8 +371,12 @@ fn paired_window_admits_the_redo_lane_and_exports_a_replayable_range() {
         "every undo entry has a redo partner"
     );
     assert!(
-        lane.capacity >= UNDO_CAPACITY as usize,
-        "the lane reserves its scenario capacity before the first write"
+        lane.capacity >= lane.entries,
+        "the lane backs every entry before its write"
+    );
+    assert!(
+        lane.capacity < UNDO_CAPACITY as usize,
+        "the lane grows to actual demand, not to the window budget"
     );
 
     assert_eq!(Ok(end), vm.delta_export_segment(0, end));
@@ -538,10 +561,7 @@ fn ended_paired_window_retains_lane_storage_but_a_reopened_pure_window_stays_ina
     vm.undo_enable(&state).expect("undo window opens");
     assert_eq!(ErrorCode::Ok, upsert(&mut vm, &mut state, 42, 100, true));
     let retained = vm.undo_redo_lane_status().capacity;
-    assert!(
-        retained >= UNDO_CAPACITY as usize,
-        "the paired window reserved the lane"
-    );
+    assert!(retained > 0, "the paired window backed the lane");
 
     vm.undo_commit();
     assert_eq!(

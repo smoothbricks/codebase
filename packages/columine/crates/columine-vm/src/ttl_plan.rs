@@ -60,12 +60,6 @@ pub(crate) struct TtlBatchScratch {
 }
 
 impl TtlBatchScratch {
-    /// Reserve for `entries` index entries and mutations.
-    pub(crate) fn reserve(&mut self, entries: usize) {
-        self.order.reserve(entries);
-        self.commands.reserve(entries);
-    }
-
     /// Invalidate any retained plan.
     pub(crate) fn reset(&mut self) {
         self.order.clear();

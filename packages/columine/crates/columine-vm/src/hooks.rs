@@ -68,7 +68,6 @@ pub struct ByteCapture {
 #[derive(Debug)]
 pub(crate) struct CaptureFrame {
     pub(crate) generation: u64,
-    pub(crate) owner: usize,
     pub(crate) image: usize,
     pub(crate) depth: u32,
     pub(crate) scratch_start: usize,
