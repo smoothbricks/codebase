@@ -218,13 +218,102 @@ struct VerifiedAlias {
 /// adoption stamps its own marker and credentials. Reuse the copier's volume-metadata and
 /// runtime-artifact exclusions; never follow a copied symlink while reading file content.
 pub(crate) fn verify_tree_blocking(source: &Path, destination: &Path) -> Result<CopyVerification> {
+    verify_with_snapshot(source, destination, snapshot)
+}
+
+/// Compare raw Git-listed paths without running attributes or external filters. A listed
+/// directory (a Git link/submodule) includes its complete subtree, including ignored bytes.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn verify_relative_paths_blocking(
+    source: &Path,
+    destination: &Path,
+    paths: &[PathBuf],
+) -> Result<()> {
+    verify_with_snapshot(source, destination, |root| selected_snapshot(root, paths)).map(|_| ())
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn selected_snapshot(root: &Path, paths: &[PathBuf]) -> Result<Snapshot> {
+    let mut entries = Snapshot::new();
+    for relative in paths {
+        if relative.as_os_str().is_empty()
+            || relative
+                .components()
+                .any(|part| !matches!(part, std::path::Component::Normal(_)))
+        {
+            return Err(CowshedError::integrity(
+                "Git-listed content path is not a relative repository path",
+                "repair the retained index before retrying",
+            ));
+        }
+        let mut ancestor = PathBuf::new();
+        let mut parts = relative.components().peekable();
+        let mut missing_ancestor = false;
+        while let Some(part) = parts.next() {
+            if parts.peek().is_none() {
+                break;
+            }
+            ancestor.push(part.as_os_str());
+            let path = root.join(&ancestor);
+            match fs::symlink_metadata(&path) {
+                Ok(metadata) if metadata.file_type().is_dir() => {}
+                Ok(_) => {
+                    return Err(CowshedError::integrity(
+                        format!(
+                            "Git-listed content path traverses a non-directory: {}",
+                            path.display()
+                        ),
+                        "repair the retained worktree before retrying",
+                    ));
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    missing_ancestor = true;
+                    break;
+                }
+                Err(error) => return Err(read_error(&path, &error)),
+            }
+        }
+        if missing_ancestor {
+            continue;
+        }
+        let path = root.join(relative);
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(read_error(&path, &error)),
+        };
+        let kind = classify(&metadata).ok_or_else(|| {
+            CowshedError::integrity(
+                format!(
+                    "Git-listed content is not a file, link or directory: {}",
+                    path.display()
+                ),
+                "repair the retained worktree before retrying",
+            )
+        })?;
+        if kind == EntryKind::Directory {
+            for (child, entry) in snapshot(&path)? {
+                entries.insert(relative.join(child), entry);
+            }
+        } else {
+            entries.insert(relative.clone(), Entry::new(kind, &metadata));
+        }
+    }
+    Ok(entries)
+}
+
+fn verify_with_snapshot(
+    source: &Path,
+    destination: &Path,
+    observe: impl Fn(&Path) -> Result<Snapshot>,
+) -> Result<CopyVerification> {
     use sha2::{Digest, Sha256};
     use std::io::Read;
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::OpenOptionsExt;
 
-    let before = snapshot(source)?;
-    let copied = snapshot(destination)?;
+    let before = observe(source)?;
+    let copied = observe(destination)?;
     let mismatch = |relative: &Path, reason: &str| {
         CowshedError::integrity(
             format!("copied tree differs at {}: {reason}", render_path(relative)),
@@ -370,7 +459,7 @@ pub(crate) fn verify_tree_blocking(source: &Path, destination: &Path) -> Result<
             }
         }
     }
-    if snapshot(source)? != before || snapshot(destination)? != copied {
+    if observe(source)? != before || observe(destination)? != copied {
         return Err(CowshedError::conflict(
             "source or copied tree changed during verification",
             "stop the writers and re-run adoption",

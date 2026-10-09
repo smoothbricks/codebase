@@ -380,10 +380,11 @@ impl NativeProjectRuntimeHost {
         {
             let source = std::sync::Arc::clone(&source);
             crate::storage::lifecycle::dispatch_blocking(move || {
-                crate::git_preservation::verify(
+                crate::git_preservation::verify_copy(
                     &source.checkout,
                     &source.checkout,
                     &source.git_before,
+                    &source.image.source_mount,
                 )
             })
             .await
@@ -497,10 +498,11 @@ impl NativeProjectRuntimeHost {
                 // recorded Git state, and its image holds its entries' blocks, not its capacity.
                 move |stage| async move {
                     crate::storage::lifecycle::dispatch_blocking(move || {
-                        crate::git_preservation::verify(
+                        crate::git_preservation::verify_copy(
                             &stage.mount_point,
                             &evidence.checkout,
                             &evidence.git_before,
+                            &evidence.image.source_mount,
                         )?;
                         let (new, old) = host
                             .require_sparse_replacement(
