@@ -6,12 +6,13 @@ import { runText } from '../lib/run.js';
 /**
  * devenv's Go and the Go SDK ttsc vendors inside its native package, as a pair.
  *
- * These are two different toolchains by construction: ttsc exposes no override
- * for the SDK it ships, so the only way to have one Go is for the devenv pin to
- * name the same patch release the vendored SDK reports. Nothing enforces that
- * agreement at install time — npm resolves ttsc, the lock resolves Go, and the
- * two move on unrelated schedules — so it is checked here instead of being
- * discovered as `compile: version does not match go tool version` mid-build.
+ * These are two different toolchains by construction: ttsc builds plugins with
+ * the SDK it ships unless TTSC_GO_BINARY names another, so the way to have one
+ * Go is for the devenv pin to name the same patch release the vendored SDK
+ * reports. Nothing enforces that agreement at install time — npm resolves ttsc,
+ * the lock resolves Go, and the two move on unrelated schedules — so it is
+ * checked here instead of being discovered as `compile: version does not match
+ * go tool version` mid-build.
  */
 export interface GoToolchainPair {
   /** Normalised `goX.Y.Z` from the devenv profile's `go version`. */
@@ -138,10 +139,27 @@ export function validateGoToolchainPair(pair: GoToolchainPair): number {
  *
  * Reads the live devenv profile rather than a stored template, for the same
  * reason the runtime pin check does: the shell is the thing that builds, so it
- * is the only authoritative statement of which Go is in play.
+ * is the only authoritative statement of which Go is in play. A repository
+ * without ttsc has no invariant, so nothing is run. One with ttsc but no devenv
+ * profile is refused by name rather than compared against whatever `go` is on
+ * PATH, which is not the Go the pin is about.
  */
 export async function validateGoToolchainAgreement(root: string): Promise<number> {
-  const goBinary = goCommand(root);
+  if (readJsonObject(join(root, 'node_modules', 'ttsc', 'package.json')) === null) {
+    return 0;
+  }
+  const candidates = [
+    join(root, 'tooling', 'direnv', '.devenv', 'profile', 'bin', 'go'),
+    join(root, 'tooling', 'devenv', '.profile', 'bin', 'go'),
+  ];
+  const goBinary = candidates.find((path) => existsSync(path));
+  if (goBinary === undefined) {
+    console.error(
+      `ttsc is installed, so its vendored Go must match devenv's, but there is no devenv profile go (looked in:\n  ${candidates.join('\n  ')}).\n` +
+        '  Enter the devenv shell (`direnv allow`) and rerun.',
+    );
+    return 1;
+  }
   let devenvGoVersionText: string;
   try {
     devenvGoVersionText = await runText(goBinary, ['version'], root);
@@ -158,12 +176,4 @@ export async function validateGoToolchainAgreement(root: string): Promise<number
     return 1;
   }
   return validateGoToolchainPair(pair);
-}
-
-function goCommand(root: string): string {
-  const candidates = [
-    join(root, 'tooling', 'direnv', '.devenv', 'profile', 'bin', 'go'),
-    join(root, 'tooling', 'devenv', '.profile', 'bin', 'go'),
-  ];
-  return candidates.find((path) => existsSync(path)) ?? 'go';
 }

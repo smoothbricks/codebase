@@ -1,7 +1,7 @@
 import { appendFileSync, readFileSync, writeFileSync } from 'node:fs';
 import { printCommandOutput, run, runResult } from '../lib/run.js';
 import { escapeRegex, getWorkspacePackages, getWorkspacePatterns, listReleasePackages } from '../lib/workspace.js';
-import { readProjectTargets } from '../nx/index.js';
+import { type ProjectTargets, readProjectTargets } from '../nx/index.js';
 import {
   applyCargoFeatureUnification,
   validateCargoCachePolicy,
@@ -15,6 +15,7 @@ import {
 } from './commit-msg.js';
 import { keepDeveloperLinks } from './developer-links.js';
 import { applyWorkspaceGitConfig } from './git-config.js';
+import { validateGoToolchainAgreement } from './go-toolchain.js';
 import { syncBunLockfileVersions } from './lockfile.js';
 import {
   applyManagedFiles,
@@ -153,9 +154,24 @@ export async function checkManagedFiles(root: string, options: { warn?: boolean 
     printResults(results);
     drifted = results.some((result) => result.action === 'drifted');
   }
-  const projectTargets = await readProjectTargets(root);
-  const resolvedTargets = resolvedTargetsByProject(projectTargets);
-  const packageFailures =
+  const packageFailures = await checkPolicyFailures(root, await readProjectTargets(root));
+  if (drifted) {
+    throw new Error('Managed monorepo files or package conventions are out of date. Run: smoo monorepo update');
+  }
+  if (packageFailures > 0) {
+    throw new Error(`${packageFailures} monorepo package convention check(s) failed; fix the findings above.`);
+  }
+}
+
+/**
+ * The findings `smoo monorepo check` fails on besides drift, over the project targets Nx
+ * resolved. Each validator prints its own findings; the sum is how many there were.
+ */
+export async function checkPolicyFailures(root: string, projectTargets: ProjectTargets[]): Promise<number> {
+  return (
+    // The devenv profile's Go against the SDK ttsc vendors: two releases are two
+    // cache keys and a GOROOT crossing between them fails the build.
+    (await validateGoToolchainAgreement(root)) +
     validateRootPackagePolicy(root) +
     validateNxProjectNames(root) +
     validateNxReleaseConfig(root) +
@@ -164,17 +180,12 @@ export async function checkManagedFiles(root: string, options: { warn?: boolean 
     validateSingletonPeerDependencies(root) +
     validateTestFileLocations(root) +
     validateNoStaleTestOutput(root) +
-    validateWorkspaceDependencies(root, { resolvedTargetsByProject: resolvedTargets }) +
+    validateWorkspaceDependencies(root, { resolvedTargetsByProject: resolvedTargetsByProject(projectTargets) }) +
     validateDevenvModuleImport(root) +
     validateCargoCachePolicy(root) +
     validateCargoToolchainInputs(root, projectTargets) +
-    validateSccachePatches(root);
-  if (drifted) {
-    throw new Error('Managed monorepo files or package conventions are out of date. Run: smoo monorepo update');
-  }
-  if (packageFailures > 0) {
-    throw new Error(`${packageFailures} monorepo package convention check(s) failed; fix the findings above.`);
-  }
+    validateSccachePatches(root)
+  );
 }
 
 export async function diffManagedFiles(root: string): Promise<void> {
