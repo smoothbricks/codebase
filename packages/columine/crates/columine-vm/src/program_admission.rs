@@ -550,7 +550,10 @@ mod tests {
     /// column is derived by the program's row table from column 0:
     /// `FOR_EACH(col 4 == 7) { upsert(key col 3, VO pair cols 1/2) }`. Each
     /// table entry is `(target, event type, expression)`.
-    fn derived_scope_program(entries: &[(u8, u32, &[u8])]) -> (Box<[u8]>, Vec<u8>, Vec<u8>) {
+    fn derived_scope_program(
+        entries: &[(u8, u32, &[u8])],
+        pad: usize,
+    ) -> (Box<[u8]>, Vec<u8>, Vec<u8>) {
         let init = vec![0x18, 0, 6, 4, 0, 1, 10, 0];
         let body = [0x80, 0, 3, 0, 1, 1, 2, 0];
         let mut reduce = vec![0xe0, DERIVED, 1];
@@ -558,6 +561,8 @@ mod tests {
         reduce.extend(u16::try_from(body.len()).unwrap().to_le_bytes());
         reduce.extend(body);
         reduce.push(0);
+        // Bytes past the reduce section's HALT move the table, not its bytes.
+        reduce.resize(reduce.len() + pad, 0);
         let mut table = ROW_EXPRESSIONS_MAGIC.to_le_bytes().to_vec();
         table.extend(u16::try_from(entries.len()).unwrap().to_le_bytes());
         table.push(0);
@@ -584,7 +589,14 @@ mod tests {
     /// shown, so a refusal names exactly the frames admission selected. Built
     /// directly: `load` would refuse the capability at preparation.
     fn admitted_with(entries: &[(u8, u32, &[u8])]) -> AdmittedProgram<UnavailableVoAdmission> {
-        let (bytecode, init, reduce) = derived_scope_program(entries);
+        admitted_padded(entries, 0)
+    }
+
+    fn admitted_padded(
+        entries: &[(u8, u32, &[u8])],
+        pad: usize,
+    ) -> AdmittedProgram<UnavailableVoAdmission> {
+        let (bytecode, init, reduce) = derived_scope_program(entries, pad);
         let metadata = VoProgramMetadata {
             fields: vec![VoFieldLink {
                 slot: 0,
@@ -998,6 +1010,44 @@ mod tests {
             ),
             refused,
             "another program's split of the same table shape"
+        );
+
+        // The same table bytes at another program position: a live read
+        // would index this program at the bind's offsets.
+        let moved = admitted_padded(
+            &[
+                (DERIVED, EVENT, &[FOR_EACH_TYPE]),
+                (LIVE, EVENT + 1, &[3, 0]),
+            ],
+            4,
+        );
+        let mut rows = RowColumns::new();
+        let mut cols: [&[u8]; 6] = [&types, &offsets, b"ab", &key, &[], &[]];
+        assert_eq!(
+            live.execute_bound(
+                &mut [],
+                &mut cols,
+                1,
+                &mut scratch,
+                &mut Constant,
+                &mut rows,
+                |_, _, _, _| 0,
+            ),
+            Ok(0)
+        );
+        let mut cols: [&[u8]; 6] = [&types, &offsets, b"ab", &key, &[], &[]];
+        assert_eq!(
+            moved.execute_spliced(
+                &mut [],
+                &mut cols,
+                1,
+                &mut scratch,
+                &mut Constant,
+                &rows,
+                never
+            ),
+            refused,
+            "the same table at another position"
         );
     }
 }
