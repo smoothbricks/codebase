@@ -8265,6 +8265,19 @@ mod tests {
         let token = store
             .begin_job(readable_id, 1, &argv_true(), None, OutputTargets::default())
             .unwrap();
+        let mut running_reader = store_at(&root, ArtifactConfig::default());
+        assert!(running_reader.sealed(readable_id).unwrap().is_none());
+        let retained_records = root.join("retained-running-records");
+        fs::rename(records_path(&root), &retained_records).unwrap();
+        assert!(
+            matches!(
+                running_reader.sealed(readable_id),
+                Err(ArtifactError::Integrity { .. }),
+            ),
+            "a disappeared running-only readable store is damage"
+        );
+        fs::rename(&retained_records, records_path(&root)).unwrap();
+        drop(running_reader);
         store.finish(token, JobState::Failed).unwrap();
         // The manifest names the readable job from the records themselves, with no sealed read first.
         let manifest = untouched.checkpoint().unwrap();
@@ -8575,6 +8588,10 @@ mod tests {
                 );
             } else {
                 assert!(begun.is_ok(), "{label}: {begun:?}");
+                assert!(
+                    store.sealed(job_id).unwrap().is_none(),
+                    "{label}: readable current admission proves no terminal despite unread history/no floor"
+                );
             }
             fs::remove_dir_all(&root).unwrap();
         }
