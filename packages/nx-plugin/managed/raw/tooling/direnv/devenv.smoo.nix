@@ -230,22 +230,20 @@ in {
   # One Go for every repository, same reasoning as the Rust toolchain: a compiler
   # is part of a cache key, so two of them mean two caches.
   #
-  # Pinned to the patch release ttsc vendors inside its native package, because
-  # that SDK is not overridable — ttsc exposes cache locations and
-  # TTSC_TSGO_BINARY, never the Go it builds plugins with — so matching it is the
-  # only way to have ONE Go rather than ours plus a dependency's. `smoo monorepo
-  # check` enforces the match and fails with both versions when they diverge,
-  # which is what makes this pin a maintained invariant instead of a comment that
-  # rots.
+  # Pinned to the patch release ttsc vendors inside its native package: ttsc
+  # builds plugins with that SDK unless TTSC_GO_BINARY names another, so matching
+  # it is how there is ONE Go rather than ours plus a dependency's. `smoo
+  # monorepo check` enforces the match and fails with both versions when they
+  # diverge, which is what makes this pin a maintained invariant instead of a
+  # comment that rots.
   #
   # It needs its own input because the fleet's nixpkgs does not carry that patch:
-  # devenv-nixpkgs rolling ships go 1.26.5 and its `go_1_27` is a release
-  # candidate, while ttsc 0.28.3 vendors go1.26.7. Same idiom, and same reason,
-  # for any single-package pin — one leaf package from a nixpkgs that has it,
-  # lock-pinned, prebuilt, rather than a fleet-wide bump that would move rustc,
-  # bun and node too. Not every pairing is reachable: ttsc 0.28.1/0.28.2 vendor
-  # go1.26.6, which NO channel packages, so when no revision offers the vendored
-  # patch the ttsc pin is what moves.
+  # devenv-nixpkgs rolling ships go 1.26.5, while ttsc 0.30.4 vendors go1.26.8.
+  # Same idiom, and same reason, for any single-package pin — one leaf package
+  # from a nixpkgs that has it, lock-pinned, prebuilt, rather than a fleet-wide
+  # bump that would move rustc, bun and node too. Not every pairing is
+  # reachable: ttsc 0.28.1/0.28.2 vendor go1.26.6, which NO channel packages, so
+  # when no revision offers the vendored patch the ttsc pin is what moves.
   #
   # The ownership boundary this pin sits inside, unchanged by it: our code is
   # built with the Go devenv provides, a dependency may vendor its own SDK, and
