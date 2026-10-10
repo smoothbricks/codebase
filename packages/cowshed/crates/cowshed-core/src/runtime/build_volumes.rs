@@ -1700,8 +1700,13 @@ fn collect_legacy_seed_sidecars(
             }
             if !dry_run {
                 let hold = crate::metadata::append_suffix(&candidate.image, ".hold");
-                std::fs::remove_file(&hold)
-                    .map_err(|error| io("remove legacy seed hold", &hold, &error))?;
+                match std::fs::remove_file(&hold) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(io("remove obsolete legacy seed hold", &hold, &error));
+                    }
+                }
                 std::fs::remove_file(&candidate.sidecar).map_err(|error| {
                     io(
                         "remove orphan legacy seed metadata",
@@ -3207,6 +3212,32 @@ mod tests {
         assert!(!held_path.exists());
         assert!(retained.sidecar.exists() && retained.image.exists());
         assert!(nonseed.sidecar.exists());
+    }
+
+    #[test]
+    fn a_legacy_seed_sidecar_with_an_already_absent_hold_is_collected() {
+        let store = Store::new();
+        let target = WorkspaceName::new("lane").unwrap();
+        let record = BuildVolumeRecord::new(
+            None,
+            BuildVolumeRole::Seed {
+                target,
+                incarnation: owner("lane", '0').incarnation,
+            },
+        );
+        let id = BuildVolumeId::mint();
+        let image = store.layout.images().join(format!("{id}.asif"));
+        let sidecar = crate::metadata::append_suffix(&image, ".json");
+        crate::metadata::write_json(&sidecar, &record).unwrap();
+        let hold = crate::metadata::append_suffix(&image, ".hold");
+        assert!(!image.exists() && !hold.exists());
+        let links = Links::default();
+        let mut collected = Collection::default();
+        collect_legacy_seed_sidecars(&store.layout, &links, false, &mut collected).unwrap();
+        assert_eq!(collected.reclaimed, 1);
+        assert!(!sidecar.exists());
+        assert!(!hold.exists());
+        assert!(!image.exists());
     }
 
     fn name(value: &str) -> WorkspaceName {
