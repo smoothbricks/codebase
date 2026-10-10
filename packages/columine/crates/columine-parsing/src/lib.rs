@@ -200,7 +200,7 @@ pub(crate) struct FieldLookup {
 }
 /// Schema-name lookup for extraction: O(1) name → column/type, plus the
 /// [`UNDECLARED_COLUMN_NAME`] carrier column when declared.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct ExtractionConfig {
     pub(crate) field_entries: Vec<(usize, SignalSchemaField)>,
     pub(crate) field_map: HashMap<String, FieldLookup>,

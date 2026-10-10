@@ -634,7 +634,7 @@ impl ExactInteger {
 }
 
 /// The recursive canonical-JSON semantic schema tree.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub enum SemanticSchema {
     Unknown,
     String,
@@ -673,7 +673,7 @@ pub enum SemanticSchema {
 /// batch refusal's violation. Stable Rust has no fallible `Box::new`, so the
 /// box is built from exactly backed storage and a value that does not fit
 /// refuses with [`SchemaParseError::OutOfMemory`].
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub struct Node<T>(Box<[T; 1]>);
 
 impl<T> Node<T> {
@@ -977,7 +977,7 @@ fn batch_slice<'i>(input: &'i [u8], frame: &[u8]) -> Option<&'i [u8]> {
 
 /// Semantic schemas keyed by event type as carried at EP creation, held
 /// sorted by event type in storage backed fallibly.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Debug, Default, PartialEq)]
 pub struct SemanticSchemaSet {
     entries: Vec<(String, SemanticSchema)>,
 }
@@ -1106,7 +1106,7 @@ impl<'a> IntoIterator for &'a SemanticSchemaSet {
 }
 
 /// A validation failure tied to one event in an input batch.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub enum BatchValidationError {
     InvalidInput,
     Violation {
