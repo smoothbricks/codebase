@@ -1186,6 +1186,50 @@ fn write_nx_project(checkout: &Path, nx: &Path, node: &Path, declared: bool) {
     .unwrap();
     fs::create_dir_all(checkout.join("node_modules")).unwrap();
     std::os::unix::fs::symlink(nx, checkout.join("node_modules/nx")).unwrap();
+    // Match the package manager's real executable entry: the keeper starts the same Nx
+    // installation that the fixture's explicit node invocation runs, in every clone.
+    fs::create_dir_all(checkout.join("node_modules/.bin")).unwrap();
+    std::os::unix::fs::symlink(
+        "../nx/dist/bin/nx.js",
+        checkout.join("node_modules/.bin/nx"),
+    )
+    .unwrap();
+    assert_eq!(
+        checkout
+            .join("node_modules/.bin/nx")
+            .canonicalize()
+            .expect("installed Nx executable"),
+        nx.join("dist/bin/nx.js")
+            .canonicalize()
+            .expect("repository Nx executable"),
+    );
+}
+
+/// A cloned Nx project must retain the real package-manager executable entry the keeper runs.
+fn assert_nx_executable(checkout: &Path) {
+    let entry = checkout.join("node_modules/.bin/nx");
+    assert_eq!(
+        fs::read_link(&entry).expect("Nx executable link survives image cloning"),
+        Path::new("../nx/dist/bin/nx.js"),
+    );
+    let installed = checkout.join("node_modules/nx/dist/bin/nx.js");
+    assert_eq!(
+        entry
+            .canonicalize()
+            .expect("the keeper's Nx executable resolves"),
+        installed
+            .canonicalize()
+            .expect("the installed real Nx program resolves"),
+    );
+    assert_ne!(
+        fs::metadata(&entry)
+            .expect("the keeper's Nx executable exists")
+            .permissions()
+            .mode()
+            & 0o111,
+        0,
+        "the real Nx program is executable, not a diagnostic stand-in",
+    );
 }
 
 /// Every `landAdoption` commitment sealed under `telemetry`.
@@ -1240,6 +1284,7 @@ async fn land_nx_project(
         0
     );
     let topic = service.path("topic", false).await.expect("mounted topic");
+    assert_nx_executable(&topic.mount);
     fs::write(topic.mount.join("a/src.txt"), b"src, changed\n").unwrap();
     git(&topic.mount, &["commit", "-q", "-am", "change a"]);
     let landed_head = String::from_utf8(
@@ -1535,11 +1580,15 @@ async fn sh(service: &mut ActorBridge, workspace: &str, script: &str) -> Vec<u8>
 
 async fn new_workspace(service: &mut ActorBridge, name: &str) -> PathBuf {
     succeed(service, ["new", name]).await;
-    service
+    let mount = service
         .path(name, false)
         .await
         .unwrap_or_else(|error| panic!("{name} is mounted: {error}"))
-        .mount
+        .mount;
+    if mount.join("nx.json").is_file() {
+        assert_nx_executable(&mount);
+    }
+    mount
 }
 
 /// `cowshed land --json <workspace>` with `checks`, retiring the workspace unless `retire` is
