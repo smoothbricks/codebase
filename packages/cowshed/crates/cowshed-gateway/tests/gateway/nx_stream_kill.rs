@@ -126,6 +126,7 @@ async fn host_controller_nx_backend_killed_mid_body_is_a_failed_transfer() {
     config.timeouts = GatewayTimeouts {
         request_total: STEP_LIMIT,
         response_headers: STEP_LIMIT,
+        tunnel_total: STEP_LIMIT,
         ..config.timeouts
     };
     config.nx_cache = Some(NxCacheServiceConfig {

@@ -820,7 +820,10 @@ mod tests {
     impl Repository {
         /// An empty checkout in a scratch root of its own.
         fn empty() -> Self {
-            let scratch = TempRoot::new("cowshed-git-preservation");
+            let scratch = TempRoot::new_in(
+                &crate::temp_parent::canonical_parent(),
+                "cowshed-git-preservation",
+            );
             let root = scratch.join("repository");
             fs::create_dir(&root).expect("create test checkout");
             Self { scratch, root }
@@ -1314,7 +1317,10 @@ mod tests {
 
     #[test]
     fn git_probe_failure_returns_an_actionable_typed_error() {
-        let root = TempRoot::new("cowshed-git-preservation-not-repository");
+        let root = TempRoot::new_in(
+            &crate::temp_parent::canonical_parent(),
+            "cowshed-git-preservation-not-repository",
+        );
         let error = capture(&root, &root).expect_err("not a Git repository");
         assert_eq!(error.code, crate::ErrorCode::Integrity);
         assert!(error.message.contains("HEAD"));

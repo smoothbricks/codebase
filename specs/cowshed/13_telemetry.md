@@ -261,6 +261,29 @@ or normal-client missing-artifact proofs, and they do not measure a stock client
 Live physical-bound eviction and killed-upload proofs remain with the server's own tests. No proof here checks
 entry-level stats for the entire store bound.
 
+### Gateway-client outage and cold controls
+
+`cowshed-gateway` `tests/gateway/nx_outage.rs` runs the installed Nx client in fresh fixture workspaces with separate
+local caches and task databases. Real gateway cases cover missing service configuration, a missing executable, a dead
+backend socket, an offline connector, and a backend's pre-response 503. Each unavailable GET is an audited 404, the task
+executes locally once, and its ordinary read-only PUT is refused with 403. A hash-qualified direct native store against
+the 503 backend returns `false` without another task execution and records a failed `nx-backend-unavailable` PUT. The
+ordinary short-Content-Length case commits a 200 head and visible body prefix before closing the upstream early. It
+requires a client-visible short body and a failed `nx-transfer-failed` audit, never a completed read. Direct-client
+controls expose why the gateway mapping is needed: an unmodified upstream GET503 fails before execution; GET404 followed
+by PUT503 fails after local execution.
+
+Run fresh one-task cold controls both without an endpoint and through the gateway. Record each wall-time row, its
+cacheable-task count, execution marker, gateway statuses and backend-request count in a dated proof receipt. The rows
+are observations under that run's load, not a universal overhead bound or an isolated measurement of compression CPU,
+archive allocation, transfer bytes, accepted restores or an installed landing. Keep pass counts and measured timings in
+the proof receipt, not in this contract.
+
+The ignored `tests/gateway/nx_stream_kill.rs` host-controller case uses the normally produced server executable and
+kills that backend after a real read has committed its 200 head and begun its body. Its required observation is a short
+stream and a failed `nx-transfer-failed` audit event, never a completed hit. This is a stream-failure proof surface, not
+task-result restoration or cutover evidence.
+
 ### Stock Nx read-only client cost control
 
 Governing sections: `specs/cowshed/05_gateway.md`, “`/nx/v1/cache/{hash}` — accepted-project Nx artifacts”;

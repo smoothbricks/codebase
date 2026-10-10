@@ -492,7 +492,7 @@ async fn h2_tls_fixture(
     Arc<ClientConfig>,
     Arc<Notify>,
     mpsc::Receiver<String>,
-    JoinHandle<()>,
+    JoinHandle<TcpListener>,
 ) {
     let (server, client) = fixture_tls_configs(host, vec![b"h2".to_vec()]);
     let listener = fixture_ports::bind_fixture_listener().await;
@@ -551,11 +551,12 @@ async fn h2_tls_fixture(
             .max_header_list_size(64 * 1024)
             .max_send_buf_size(64 * 1024);
         let _ = builder.serve_connection(TokioIo::new(tls), service).await;
+        listener
     });
     (port, client, gate, receiver, task)
 }
 
-async fn h1_tls_fixture(host: &str) -> (u16, Arc<ClientConfig>, JoinHandle<()>) {
+async fn h1_tls_fixture(host: &str) -> (u16, Arc<ClientConfig>, JoinHandle<TcpListener>) {
     let (server, client) = fixture_tls_configs(host, vec![b"http/1.1".to_vec()]);
     let listener = fixture_ports::bind_fixture_listener().await;
     let port = listener.local_addr().expect("h1 fixture address").port();
@@ -580,13 +581,19 @@ async fn h1_tls_fixture(host: &str) -> (u16, Arc<ClientConfig>, JoinHandle<()>) 
         let _ = server_http1::Builder::new()
             .serve_connection(TokioIo::new(tls), service)
             .await;
+        listener
     });
     (port, client, task)
 }
 
 async fn no_alpn_tls_fixture(
     host: &str,
-) -> (u16, Arc<ClientConfig>, mpsc::Receiver<bool>, JoinHandle<()>) {
+) -> (
+    u16,
+    Arc<ClientConfig>,
+    mpsc::Receiver<bool>,
+    JoinHandle<TcpListener>,
+) {
     let (server, client) = fixture_tls_configs(host, Vec::new());
     let listener = fixture_ports::bind_fixture_listener().await;
     let port = listener
@@ -610,6 +617,7 @@ async fn no_alpn_tls_fixture(
             .send(received_http)
             .await
             .expect("report no-ALPN bytes");
+        listener
     });
     (port, client, receiver, task)
 }

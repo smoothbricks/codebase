@@ -60,6 +60,9 @@ mod scratch_apfs;
 #[path = "../tests/support/scratch_directory.rs"]
 mod scratch_directory;
 #[cfg(test)]
+#[path = "../tests/support/temp_parent.rs"]
+mod temp_parent;
+#[cfg(test)]
 #[path = "../tests/support/temp_root.rs"]
 mod temp_root;
 

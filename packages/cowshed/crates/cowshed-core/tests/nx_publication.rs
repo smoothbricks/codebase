@@ -25,6 +25,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use cowshed_core::build_volume::cache_adapter;
 use serde_json::{Value, json};
 
+#[path = "support/temp_root.rs"]
+mod temp_root;
+use temp_root::TempRoot;
+
 const BRIDGE: &str = include_str!("../src/build_volume/nx_publication.js");
 const CHECK: &str = "00000000000000000000000000000001";
 const REFUSED: &str = "00000000000000000000000000000002";
@@ -54,75 +58,11 @@ const UNKNOWN_HASH: &str = "18446744073709551615";
 /// A fixture workspace under `COWSHED_RUNTIME_LINK` when one is set, else the system temporary
 /// directory. Its child is owned by this guard from the moment it is created, so a failed check
 /// below removes it as the panic unwinds.
-struct Fixture(PathBuf);
-
-impl Fixture {
-    fn new() -> Self {
-        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-
-        let parent = std::env::var_os("COWSHED_RUNTIME_LINK")
-            .map(PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir);
-        assert!(
-            parent.is_absolute(),
-            "fixture parent {} must be absolute",
-            parent.display()
-        );
-        assert!(
-            parent.is_dir(),
-            "fixture parent {} must be a directory",
-            parent.display()
-        );
-        let path = parent.join(format!(
-            "cowshed-nx-publication-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("clock after the epoch")
-                .as_nanos()
-        ));
-        std::fs::create_dir(&path)
-            .unwrap_or_else(|error| panic!("create fixture {}: {error}", path.display()));
-        let fixture = Self(path);
-        std::fs::set_permissions(&fixture.0, std::fs::Permissions::from_mode(0o700))
-            .unwrap_or_else(|error| panic!("restrict fixture {}: {error}", fixture.0.display()));
-        let metadata = std::fs::symlink_metadata(&fixture.0)
-            .unwrap_or_else(|error| panic!("lstat fixture {}: {error}", fixture.0.display()));
-        assert!(
-            metadata.is_dir() && !metadata.file_type().is_symlink(),
-            "fixture {} must be a real directory",
-            fixture.0.display()
-        );
-        // SAFETY: geteuid has no preconditions and reads no caller-owned memory.
-        let uid = unsafe { libc::geteuid() };
-        assert_eq!(
-            metadata.uid(),
-            uid,
-            "fixture {} must be owned by the test process",
-            fixture.0.display()
-        );
-        assert_eq!(
-            metadata.mode() & 0o777,
-            0o700,
-            "fixture {} must be mode 0700",
-            fixture.0.display()
-        );
-        fixture
-    }
-}
-
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        match std::fs::remove_dir_all(&self.0) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            // The unwinding test already reports its own failure; a second panic would abort it.
-            Err(error) if std::thread::panicking() => {
-                eprintln!("remove fixture {}: {error}", self.0.display());
-            }
-            Err(error) => panic!("remove fixture {}: {error}", self.0.display()),
-        }
-    }
+fn fixture() -> TempRoot {
+    let parent = std::env::var_os("COWSHED_RUNTIME_LINK")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    TempRoot::new_in(&parent, "cowshed-nx-publication")
 }
 
 /// A remote cache endpoint and the one token a process is given against it.
@@ -449,8 +389,8 @@ fn hint(root: &Path, receipt: &str) -> Value {
 
 #[test]
 fn stock_nx_bridge_qualifies_only_the_checked_successful_task() {
-    let fixture = Fixture::new();
-    let root = fixture.0.as_path();
+    let fixture = fixture();
+    let root: &Path = &fixture;
     write_workspace(root);
 
     // An unrelated cached task, run without a receipt: no checked run ever names it.
@@ -563,15 +503,15 @@ fn stock_nx_bridge_qualifies_only_the_checked_successful_task() {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
 fn host_controller_bridge_publishes_and_reads_through_the_production_server() {
-    let source = Fixture::new();
-    let reader = Fixture::new();
-    let backend = Fixture::new();
-    let source_root = source.0.as_path();
-    let reader_root = reader.0.as_path();
+    let source = fixture();
+    let reader = fixture();
+    let backend = fixture();
+    let source_root: &Path = &source;
+    let reader_root: &Path = &reader;
     write_workspace(source_root);
     write_workspace(reader_root);
 
-    let server = Server::start(backend.0.as_path(), WRITER_TOKEN, READER_TOKEN);
+    let server = Server::start(&backend, WRITER_TOKEN, READER_TOKEN);
     let writer = Remote {
         origin: server.origin.clone(),
         token: WRITER_TOKEN.to_owned(),
@@ -627,7 +567,7 @@ fn host_controller_bridge_publishes_and_reads_through_the_production_server() {
 
     // The stored entry is the server's file for the key, no extension; its allocation is the blocks it occupies.
     use std::os::unix::fs::MetadataExt as _;
-    let stored = backend.0.join("entries").join(&hash);
+    let stored = backend.join("entries").join(&hash);
     let stored_metadata = std::fs::metadata(&stored)
         .unwrap_or_else(|error| panic!("stat {}: {error}", stored.display()));
     let allocated = stored_metadata
@@ -726,10 +666,10 @@ fn repository_root_resolves_the_manifest_at_runtime_not_at_compile_time() {
         println!("probe-root {}", repository_root().display());
         return;
     }
-    let fixture = Fixture::new();
-    let manifest = fixture.0.join("packages/cowshed/crates/cowshed-core");
+    let fixture = fixture();
+    let manifest = fixture.join("packages/cowshed/crates/cowshed-core");
     std::fs::create_dir_all(&manifest).expect("fixture manifest directory");
-    let expected = std::fs::canonicalize(&fixture.0).expect("canonical fixture root");
+    let expected = std::fs::canonicalize(&*fixture).expect("canonical fixture root");
     let output = Command::new(std::env::current_exe().expect("this test binary"))
         .args([
             "--exact",
@@ -738,7 +678,7 @@ fn repository_root_resolves_the_manifest_at_runtime_not_at_compile_time() {
         ])
         .env("CARGO_MANIFEST_DIR", &manifest)
         .env(ROOT_PROBE, "1")
-        .output()
+        .output_locked()
         .expect("run the root probe child");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(output.status.success(), "{}", text(&output));

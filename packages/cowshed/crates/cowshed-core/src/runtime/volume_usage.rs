@@ -349,7 +349,10 @@ mod tests {
     fn only_a_path_a_volume_is_mounted_at_is_a_volume_mountpoint() {
         let devfs = VolumeMountpoint::new(PathBuf::from("/dev")).expect("devfs is mounted at /dev");
         assert_eq!(devfs.path(), Path::new("/dev"));
-        let root = crate::temp_root::TempRoot::new("cowshed-volume-mountpoint");
+        let root = crate::temp_root::TempRoot::new_in(
+            &crate::temp_parent::canonical_parent(),
+            "cowshed-volume-mountpoint",
+        );
         let directory = root.join("checkout");
         std::fs::create_dir(&directory).unwrap();
         let file = root.join("file");

@@ -7040,7 +7040,10 @@ mod workspace_toolchain_tests {
     }
 
     fn scratch(test: &str) -> crate::temp_root::TempRoot {
-        crate::temp_root::TempRoot::new(&format!("cowshed-toolchain-{test}"))
+        crate::temp_root::TempRoot::new_in(
+            &crate::temp_parent::canonical_parent(),
+            &format!("cowshed-toolchain-{test}"),
+        )
     }
 
     /// A workspace whose project uses cargo, Go, uv, Nix and Bun gets each tool's wiring from
@@ -7835,15 +7838,51 @@ mod workspace_toolchain_tests {
         );
     }
 
-    /// The Nx cache endpoint and token are the workspace's own read authority, whatever the caller
-    /// supplies. A caller-named endpoint or token never reaches the child, and a checkout without
-    /// Nx withholds both names.
+    /// The real host-side environment builder creates its own global short runtime alias. The
+    /// caller's endpoint and token never reach the child; a non-Nx checkout withholds both names.
     #[cfg(target_os = "macos")]
     #[tokio::test]
-    async fn caller_supplied_nx_endpoint_and_token_never_reach_the_child() {
-        let root = scratch("nx-endpoint");
+    #[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+    async fn host_controller_caller_supplied_nx_endpoint_and_token_never_reach_the_child() {
+        struct RuntimeAlias {
+            path: PathBuf,
+            target: PathBuf,
+        }
+        impl Drop for RuntimeAlias {
+            fn drop(&mut self) {
+                let removed = match std::fs::read_link(&self.path) {
+                    Ok(target) if target == self.target => std::fs::remove_file(&self.path),
+                    Ok(target) => Err(std::io::Error::other(format!(
+                        "runtime alias {} now belongs to {}",
+                        self.path.display(),
+                        target.display()
+                    ))),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    Err(error) => Err(error),
+                };
+                if let Err(error) = removed {
+                    if std::thread::panicking() {
+                        eprintln!(
+                            "remove owned runtime alias {}: {error}",
+                            self.path.display()
+                        );
+                    } else {
+                        panic!(
+                            "remove owned runtime alias {}: {error}",
+                            self.path.display()
+                        );
+                    }
+                }
+            }
+        }
+        let parent = std::env::var_os(crate::workspace_environment::RUNTIME_LINK_ENV)
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let root = crate::temp_root::TempRoot::new_in(&parent, "cowshed-toolchain-nx-endpoint");
         let mount = root.join("workspace");
         std::fs::create_dir_all(mount.join(".cowshed")).expect("metadata directory");
+        // Capability containment takes the controller's canonical workspace mount, not its alias.
+        let mount = std::fs::canonicalize(&mount).expect("canonical fixture workspace mount");
         let token = cowshed_gateway_types::WorkspaceToken::from_bytes([7; 32]);
         std::fs::write(
             mount.join(crate::workspace_credentials::WORKSPACE_TOKEN_PATH),
@@ -7861,6 +7900,16 @@ mod workspace_toolchain_tests {
             ),
         ]);
         let sandbox = sandbox_at(&mount);
+        let runtime_link = sandbox_runtime_link(&sandbox);
+        assert!(
+            matches!(std::fs::symlink_metadata(&runtime_link), Err(error) if error.kind() == std::io::ErrorKind::NotFound),
+            "fixture runtime alias {} must not already exist",
+            runtime_link.display()
+        );
+        let alias = RuntimeAlias {
+            path: runtime_link.clone(),
+            target: sandbox_runtime_dir(&sandbox),
+        };
         std::fs::create_dir_all(&sandbox.home).expect("home");
 
         // Without an Nx project, the caller's endpoint and token are withheld, not passed through.
@@ -7870,20 +7919,12 @@ mod workspace_toolchain_tests {
             .await
             .expect("environment")
             .child(&caller);
-        assert!(
-            without_nx
-                .get(OsStr::new(
-                    crate::workspace_environment::NX_REMOTE_SERVER_ENV
-                ))
-                .is_none()
-        );
-        assert!(
-            without_nx
-                .get(OsStr::new(
-                    crate::workspace_environment::NX_REMOTE_TOKEN_ENV
-                ))
-                .is_none()
-        );
+        assert!(!without_nx.contains_key(OsStr::new(
+            crate::workspace_environment::NX_REMOTE_SERVER_ENV
+        )));
+        assert!(!without_nx.contains_key(OsStr::new(
+            crate::workspace_environment::NX_REMOTE_TOKEN_ENV
+        )));
 
         // With one, both names are the workspace's own read endpoint and workspace token.
         std::fs::write(mount.join("nx.json"), "{}").expect("nx project");
@@ -7906,6 +7947,16 @@ mod workspace_toolchain_tests {
                 crate::workspace_environment::NX_REMOTE_TOKEN_ENV
             )),
             Some(&std::ffi::OsString::from(token.encode()))
+        );
+        assert_eq!(
+            std::fs::read_link(&runtime_link).expect("owned runtime alias"),
+            alias.target
+        );
+        drop(alias);
+        assert!(
+            matches!(std::fs::symlink_metadata(&runtime_link), Err(error) if error.kind() == std::io::ErrorKind::NotFound),
+            "fixture must remove its runtime alias {}",
+            runtime_link.display()
         );
     }
 }
