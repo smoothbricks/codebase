@@ -2755,59 +2755,198 @@ fn registered_worktree_git_dir(root: &Path) -> Result<Option<PathBuf>> {
 #[cfg(target_os = "macos")]
 const MAX_GIT_INCLUDE_DEPTH: usize = 10;
 
-/// The files `config` includes, transitively, which Git reads on every command that reads it.
-///
-/// A linked worktree's common config lives in main's `.git`, and an include it names by a
-/// relative path (`include.path = ../tooling/workspace.gitconfig`) lands in main's working tree,
-/// outside every root the worktree's sandboxed Git otherwise reads, so Git fails before it reads
-/// `HEAD`. The controller resolves them from the config it already grants and grants each file,
-/// never its directory. An include that does not exist is skipped, as Git skips it; a
-/// conditional include is granted whether or not its condition holds, since reading a file the
-/// condition then ignores grants nothing.
+/// The most config files one linked worktree's common config may bring in through includes.
 #[cfg(target_os = "macos")]
-fn included_config_files(config: &Path, home: &Path) -> Result<Vec<PathBuf>> {
-    let mut files: Vec<PathBuf> = Vec::new();
-    let mut pending = vec![(config.to_owned(), 0)];
+const MAX_GIT_INCLUDED_FILES: usize = 64;
+
+/// The largest Git config file the controller reads to resolve includes.
+#[cfg(target_os = "macos")]
+const MAX_GIT_CONFIG_BYTES: u64 = 1024 * 1024;
+
+/// The files main's tree holds that a linked worktree's common config includes, transitively:
+/// the read grants its controller Git needs (02_workspaces.md, "Git-worktree workspaces").
+///
+/// The common config lives in main's `.git`, and an include it names by a path relative to it
+/// (`include.path = ../tooling/workspace.gitconfig`) lands in main's working tree, which the
+/// worktree's sandboxed Git cannot otherwise read, so Git fails before it reads `HEAD`. Every
+/// job of the workspace can write that config, so what it names is held to the narrowest
+/// reading: a target inside the workspace or the common directory is already readable and is
+/// followed without a grant; a regular file inside main's tree is granted, by itself; any other
+/// target is refused by name. `~/` resolves against `git_home`, the HOME the sandboxed Git runs
+/// with. An include that does not exist is skipped, as Git skips it. A conditional include is
+/// held to the same bounds whatever its condition, which is Git's to decide. Every file is read
+/// without following a final symlink or blocking on a FIFO, only when it is a regular file, and
+/// only up to [`MAX_GIT_CONFIG_BYTES`].
+#[cfg(target_os = "macos")]
+fn included_config_files(common: &Path, workspace: &Path, git_home: &Path) -> Result<Vec<PathBuf>> {
+    let main_tree = common
+        .parent()
+        .filter(|_| common.file_name() == Some(OsStr::new(".git")));
+    let refuse = |file: &Path, target: &Path, reason: &str| {
+        CowshedError::integrity(
+            format!(
+                "Git config {} includes {}, which {reason}; a git-worktree workspace's controller Git reads only regular config files inside main's checkout, the common Git directory or the workspace",
+                file.display(),
+                target.display()
+            ),
+            "move the included file into main's checkout or remove the include from main's .git/config",
+        )
+    };
+    let mut granted: Vec<PathBuf> = Vec::new();
+    let mut seen: Vec<PathBuf> = Vec::new();
+    let mut pending = vec![(common.join("config"), 0)];
     while let Some((file, depth)) = pending.pop() {
-        let text = match fs::read(&file) {
-            Ok(text) => text,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => {
-                return Err(CowshedError::integrity(
-                    format!("cannot read Git config {}: {error}", file.display()),
-                    "repair the repository's Git config",
-                ));
-            }
+        let text = match read_git_config_bounded(&file)? {
+            Some(text) => text,
+            None => continue,
         };
         let directory = file.parent().unwrap_or(Path::new("/"));
         for path in config_include_paths(&String::from_utf8_lossy(&text)) {
             let target = match path.strip_prefix("~/") {
-                Some(relative) => home.join(relative),
+                Some(relative) => git_home.join(relative),
                 None => directory.join(path),
             };
             let target = match fs::canonicalize(&target) {
                 Ok(target) => target,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(error) => {
-                    return Err(CowshedError::integrity(
-                        format!(
-                            "cannot resolve Git config include {} of {}: {error}",
-                            target.display(),
-                            file.display()
-                        ),
-                        "repair the repository's Git config",
+                    return Err(refuse(
+                        &file,
+                        &target,
+                        &format!("cannot be resolved: {error}"),
                     ));
                 }
             };
-            if !files.contains(&target) {
-                if depth + 1 < MAX_GIT_INCLUDE_DEPTH {
-                    pending.push((target.clone(), depth + 1));
-                }
-                files.push(target);
+            if seen.contains(&target) {
+                continue;
+            }
+            if target.starts_with(workspace) || target.starts_with(common) {
+                // Readable already; nothing to grant.
+            } else if main_tree.is_some_and(|tree| target.starts_with(tree)) {
+                granted.push(target.clone());
+            } else {
+                return Err(refuse(&file, &target, "is outside main's checkout"));
+            }
+            if seen.len() == MAX_GIT_INCLUDED_FILES {
+                return Err(refuse(
+                    &file,
+                    &target,
+                    &format!("is past the {MAX_GIT_INCLUDED_FILES} included files allowed"),
+                ));
+            }
+            seen.push(target.clone());
+            if depth + 1 < MAX_GIT_INCLUDE_DEPTH {
+                pending.push((target, depth + 1));
             }
         }
     }
-    Ok(files)
+    Ok(granted)
+}
+
+/// One Git config file's bytes, or `None` when it does not exist. Refused unless it is a
+/// regular file within [`MAX_GIT_CONFIG_BYTES`]: its path comes from config a job can write, so
+/// it may name a FIFO, a device or a symlink to one.
+#[cfg(target_os = "macos")]
+fn read_git_config_bounded(path: &Path) -> Result<Option<Vec<u8>>> {
+    use std::io::Read as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let refuse = |reason: String| {
+        CowshedError::integrity(
+            format!("Git config {} {reason}", path.display()),
+            "repair the repository's Git config",
+        )
+    };
+    let file = match fs::OpenOptions::new()
+        .read(true)
+        // Regular files ignore O_NONBLOCK; a FIFO must not block the open before fstat refuses it.
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(refuse(format!("cannot be opened: {error}"))),
+    };
+    let metadata = file
+        .metadata()
+        .map_err(|error| refuse(format!("cannot be inspected: {error}")))?;
+    if !metadata.file_type().is_file() {
+        return Err(refuse("is not a regular file".to_owned()));
+    }
+    if metadata.len() > MAX_GIT_CONFIG_BYTES {
+        return Err(refuse(format!(
+            "is larger than {MAX_GIT_CONFIG_BYTES} bytes"
+        )));
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_GIT_CONFIG_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| refuse(format!("cannot be read: {error}")))?;
+    if bytes.len() as u64 > MAX_GIT_CONFIG_BYTES {
+        return Err(refuse(format!(
+            "is larger than {MAX_GIT_CONFIG_BYTES} bytes"
+        )));
+    }
+    Ok(Some(bytes))
+}
+
+/// The `-c` overrides that switch off every filter, merge and diff driver a linked worktree's
+/// Git config names, given `git config -z --name-only --list`. Its controller Git reads files in
+/// main's checkout that the workspace's own jobs cannot, and those jobs write the config, so no
+/// command the config selects may run with that read: filters pass content through unchanged,
+/// merge and external diff drivers fail as `diff.external` already does, and a textconv is the
+/// identity. A key that cannot be spelled as a `-c` override refuses the command.
+#[cfg(target_os = "macos")]
+fn driver_overrides(listing: &[u8]) -> Result<Vec<String>> {
+    let mut drivers = std::collections::BTreeSet::new();
+    for key in listing
+        .split(|byte| *byte == 0)
+        .filter(|key| !key.is_empty())
+    {
+        let key = std::str::from_utf8(key).map_err(|_| {
+            CowshedError::integrity(
+                "a Git config key is not UTF-8",
+                "repair the repository's Git config",
+            )
+        })?;
+        let Some((section, rest)) = key.split_once('.') else {
+            continue;
+        };
+        let Some((name, variable)) = rest.rsplit_once('.') else {
+            continue;
+        };
+        let section = section.to_ascii_lowercase();
+        let variable = variable.to_ascii_lowercase();
+        let driver = match (section.as_str(), variable.as_str()) {
+            ("filter", "clean" | "smudge" | "process" | "required") => "filter",
+            ("merge", "driver") => "merge",
+            ("diff", "textconv" | "command") => "diff",
+            _ => continue,
+        };
+        if name.contains('=') {
+            return Err(CowshedError::integrity(
+                format!("Git config names a {driver} driver {name:?} that cannot be switched off"),
+                "rename the driver in the repository's Git config",
+            ));
+        }
+        drivers.insert((driver, name.to_owned()));
+    }
+    let mut overrides = Vec::new();
+    for (driver, name) in drivers {
+        match driver {
+            "filter" => overrides.extend([
+                format!("filter.{name}.clean="),
+                format!("filter.{name}.smudge="),
+                format!("filter.{name}.process="),
+                format!("filter.{name}.required=false"),
+            ]),
+            "merge" => overrides.push(format!("merge.{name}.driver=false")),
+            _ => overrides.extend([
+                format!("diff.{name}.textconv=cat"),
+                format!("diff.{name}.command=false"),
+            ]),
+        }
+    }
+    Ok(overrides)
 }
 
 /// The values of `include.path` and every `includeIf.<condition>.path` in one Git config file,
@@ -2957,10 +3096,12 @@ fn sandboxed_git_command_with_paths(
         )
     })?;
     let common = registered_worktree_git_dir(&canonical)?;
+    let git_home = canonical.join(".cowshed/home");
     let mut read = match &common {
-        Some(common) => included_config_files(&common.join("config"), &home)?,
+        Some(common) => included_config_files(common, &canonical, &git_home)?,
         None => Vec::new(),
     };
+    let linked = common.is_some();
     if let Some(path) = readable {
         read.push(fs::canonicalize(path).map_err(|error| {
             CowshedError::integrity(
@@ -3027,31 +3168,56 @@ fn sandboxed_git_command_with_paths(
             "run `cowshed setup` so the store's run directory exists and is yours",
         )
     })?;
-    let git = git_command_at(&canonical);
-    let mut command = std::process::Command::new(crate::exec::SANDBOX_EXEC);
-    command
-        .args(profile.args())
-        .arg("/var/select/developer_dir/usr/bin/git");
-    command.args(git.get_args());
-    for (name, value) in git.get_envs() {
-        match value {
-            Some(value) => {
-                command.env(name, value);
-            }
-            None => {
-                command.env_remove(name);
+    let build = || -> Result<std::process::Command> {
+        let git = git_command_at(&canonical);
+        let mut command = std::process::Command::new(crate::exec::SANDBOX_EXEC);
+        command
+            .args(profile.args())
+            .arg("/var/select/developer_dir/usr/bin/git");
+        command.args(git.get_args());
+        for (name, value) in git.get_envs() {
+            match value {
+                Some(value) => {
+                    command.env(name, value);
+                }
+                None => {
+                    command.env_remove(name);
+                }
             }
         }
-    }
-    command
-        .current_dir(if canonical.is_dir() {
-            &canonical
-        } else {
-            parent
-        })
-        .env("HOME", canonical.join(".cowshed/home"));
-    if let Some(identity) = workspace_git_identity_config(&canonical)? {
-        command.env("GIT_CONFIG_GLOBAL", identity);
+        command
+            .current_dir(if canonical.is_dir() {
+                &canonical
+            } else {
+                parent
+            })
+            .env("HOME", &git_home);
+        if let Some(identity) = workspace_git_identity_config(&canonical)? {
+            command.env("GIT_CONFIG_GLOBAL", identity);
+        }
+        Ok(command)
+    };
+    let mut command = build()?;
+    if linked {
+        // Git's own reading of its config, under the same profile, names every driver it could
+        // select; each is switched off for the command the caller runs.
+        let listing = build()?
+            .args(["config", "-z", "--name-only", "--list"])
+            .output_locked()
+            .map_err(|error| git_spawn_error(&error))?;
+        if !listing.status.success() {
+            return Err(CowshedError::integrity(
+                format!(
+                    "cannot read the Git config of {}: {}",
+                    root.display(),
+                    git_ended(&listing)
+                ),
+                "repair the repository's Git config",
+            ));
+        }
+        for setting in driver_overrides(&listing.stdout)? {
+            command.arg("-c").arg(setting);
+        }
     }
     Ok(command)
 }
@@ -3841,6 +4007,185 @@ mod tests {
                 "~/work.gitconfig"
             ]
         );
+    }
+
+    /// A git-worktree workspace whose main config includes each of `includes`, and main.
+    #[cfg(target_os = "macos")]
+    fn linked_worktree(includes: &[&str]) -> (Repository, PathBuf) {
+        let main = repository();
+        for include in includes {
+            git(&main, &["config", "--add", "include.path", include]);
+        }
+        let workspace = main.with_extension("linked");
+        let added = Command::new("git")
+            .arg("-C")
+            .arg(&*main)
+            .args(["worktree", "add", "-q", "--detach"])
+            .arg(&workspace)
+            .status_locked()
+            .expect("add linked worktree");
+        assert!(added.success());
+        let workspace = workspace.canonicalize().expect("canonical workspace");
+        (main, workspace)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn sandboxed_config(workspace: &Path, key: &str) -> String {
+        let output = super::sandboxed_git_command_at(workspace)
+            .expect("narrow Git")
+            .args(["config", key])
+            .output_locked()
+            .expect("sandboxed Git");
+        assert!(
+            output.status.success(),
+            "{key}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).expect("UTF-8 value")
+    }
+
+    /// `~/` is the HOME the sandboxed Git runs with, inside the workspace; a conditional include
+    /// inside main's checkout is followed and its own relative include is granted too.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn linked_worktree_includes_resolve_home_conditions_and_nesting() {
+        let (main, workspace) = linked_worktree(&["~/home.gitconfig"]);
+        git(
+            &main,
+            &[
+                "config",
+                "includeIf.gitdir:/.path",
+                "../tooling/outer.gitconfig",
+            ],
+        );
+        fs::create_dir_all(main.join("tooling")).expect("tooling");
+        fs::write(
+            main.join("tooling/outer.gitconfig"),
+            "[include]\n\tpath = inner.gitconfig\n",
+        )
+        .expect("outer");
+        fs::write(
+            main.join("tooling/inner.gitconfig"),
+            "[core]\n\tabbrev = 11\n",
+        )
+        .expect("inner");
+        fs::create_dir_all(workspace.join(".cowshed/home")).expect("git home");
+        fs::write(
+            workspace.join(".cowshed/home/home.gitconfig"),
+            "[user]\n\tname = Home Include\n",
+        )
+        .expect("home include");
+        assert_eq!(sandboxed_config(&workspace, "core.abbrev"), "11\n");
+        assert_eq!(sandboxed_config(&workspace, "user.name"), "Home Include\n");
+    }
+
+    /// An include outside main's checkout stays denied: the controller refuses it by name rather
+    /// than granting it, and never opens a device or a FIFO a job named.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn linked_worktree_includes_outside_main_or_not_regular_are_refused() {
+        let (main, workspace) = linked_worktree(&[]);
+        // Written by file, from outside the repository: Git opening main would read the include.
+        let config = main.join(".git/config");
+        let include = |target: &str| {
+            let status = Command::new("git")
+                .args(["config", "--file"])
+                .arg(&config)
+                .args(["include.path", target])
+                .current_dir("/")
+                .status_locked()
+                .expect("git config --file");
+            assert!(status.success());
+        };
+        let outside = main.with_extension("outside.gitconfig");
+        fs::write(&outside, "[core]\n\tabbrev = 13\n").expect("outside include");
+        for target in [outside.to_str().expect("UTF-8 path"), "/dev/zero"] {
+            include(target);
+            let refused = super::sandboxed_git_command_at(&workspace)
+                .expect_err("an include outside main is refused");
+            assert!(
+                refused.message.contains("outside main's checkout"),
+                "{}",
+                refused.message
+            );
+        }
+        let fifo = main.join("tooling.fifo");
+        let made = Command::new("mkfifo")
+            .arg(&fifo)
+            .status_locked()
+            .expect("mkfifo");
+        assert!(made.success());
+        include("../tooling.fifo");
+        let refused = super::sandboxed_git_command_at(&workspace)
+            .expect_err("a FIFO include is refused without blocking");
+        assert!(
+            refused.message.contains("is not a regular file"),
+            "{}",
+            refused.message
+        );
+    }
+
+    /// The config a workspace's jobs write cannot run a filter under the controller's read of
+    /// main's checkout: the same `git add` that runs the clean filter unconfined passes the file
+    /// through unchanged under the controller's Git.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn linked_worktree_controller_git_runs_no_repository_filter() {
+        let (main, workspace) = linked_worktree(&[]);
+        git(
+            &main,
+            &[
+                "config",
+                "filter.marker.clean",
+                "sh -c 'echo ran >> .filter-ran; cat'",
+            ],
+        );
+        fs::write(workspace.join(".gitattributes"), "README filter=marker\n").expect("attributes");
+        fs::write(workspace.join("README"), "changed\n").expect("change README");
+        let added = super::sandboxed_git_command_at(&workspace)
+            .expect("narrow Git")
+            .args(["add", "README"])
+            .output_locked()
+            .expect("sandboxed add");
+        assert!(
+            added.status.success(),
+            "{}",
+            String::from_utf8_lossy(&added.stderr)
+        );
+        assert!(
+            !workspace.join(".filter-ran").exists(),
+            "the controller's Git ran the repository's clean filter"
+        );
+        git(&workspace, &["add", "README"]);
+        assert!(
+            workspace.join(".filter-ran").exists(),
+            "unconfined Git runs the filter, so the fixture would have shown it"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn driver_overrides_switch_off_every_named_driver() {
+        let listing = b"core.abbrev\0filter.lfs.clean\0filter.lfs.smudge\0filter.a.b.process\0merge.ours.driver\0diff.img.textconv\0diff.ext.command\0merge.ours.name\0";
+        assert_eq!(
+            super::driver_overrides(listing).expect("overrides"),
+            [
+                "diff.ext.textconv=cat",
+                "diff.ext.command=false",
+                "diff.img.textconv=cat",
+                "diff.img.command=false",
+                "filter.a.b.clean=",
+                "filter.a.b.smudge=",
+                "filter.a.b.process=",
+                "filter.a.b.required=false",
+                "filter.lfs.clean=",
+                "filter.lfs.smudge=",
+                "filter.lfs.process=",
+                "filter.lfs.required=false",
+                "merge.ours.driver=false",
+            ]
+        );
+        assert!(super::driver_overrides(b"filter.a=b.clean\0").is_err());
     }
 
     /// A committed Git repository inside a private scratch directory. Every tree a test derives

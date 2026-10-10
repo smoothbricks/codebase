@@ -639,11 +639,21 @@ user's own repository. The profile carries that hole as a distinct, controller-o
 `<main-canonical-mount>/.git` and nothing wider, emitted after every deny that would otherwise close it (04_sandbox.md).
 It cannot be an ordinary read/write grant: grants are refused outright when they intersect a protected path, and main's
 mount is one — the denied project root under direct mount. Main's working tree stays as unreachable as any other
-workspace's, and a workspace that did not ask for `--git-worktree` never has any of it. The controller's own Git for
-such a workspace (mint, attach, `rm`, `gc`) reads main's shared config through that carve-back, and Git refuses to run
-when a file the config includes cannot be read: a relative include such as `../tooling/workspace.gitconfig` lands in
-main's working tree. So the controller resolves the config's `include.path` and `includeIf.*.path` targets itself,
-transitively, and grants its Git read of each existing target file, nothing else of main's tree.
+workspace's, and a workspace that did not ask for `--git-worktree` never has any of it.
+
+The controller's own Git for such a workspace (mint, attach, `rm`, `gc`) reads main's shared config through that
+carve-back, and Git refuses to run when a file the config includes cannot be read: a relative include such as
+`../tooling/workspace.gitconfig` lands in main's working tree. Every job of the workspace can write that config, so the
+controller resolves its `include.path` and `includeIf.*.path` targets itself, transitively, and holds each to the
+narrowest reading. `~/` is the HOME the controller's Git runs with, inside the workspace. A target in the workspace or
+in main's `.git` is readable already. A regular config file inside main's checkout is granted to that Git, by itself,
+read without following a final symlink, without blocking on a FIFO, and only up to 1 MiB. Any other target — outside
+main's checkout, a device, a FIFO, past 64 included files — refuses the command by name; an include outside main stays
+denied, as it always was. Because that Git now reads files of main's checkout the workspace's jobs cannot, it runs no
+driver the config selects: every `filter.<name>` clean, smudge and process command is emptied, as hooks already are,
+every `merge.<name>.driver` and `diff.<name>.command` is `false`, and every `diff.<name>.textconv` is the identity. A
+job's own Git inside the workspace keeps only the `.git` carve-back, so such an include still fails there; widening the
+job profile is not part of this.
 
 The controller's own Git for such a workspace (mint, attach, `rm`, `gc`, `rebase`, `land`) reads main's shared config
 through that carve-back, and Git refuses to run when a file the config includes cannot be read: a relative include such
