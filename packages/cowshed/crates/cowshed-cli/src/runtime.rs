@@ -3330,6 +3330,7 @@ fn land_build_volume_lines(build: &cowshed_core::api::dto::LandBuildVolume) -> V
                 check.hits,
                 check.misses.len()
             ));
+
             for miss in &check.misses {
                 lines.push(format!(
                     "build volume: cache miss {} (checked hash {}, inputs {}): {}{}",

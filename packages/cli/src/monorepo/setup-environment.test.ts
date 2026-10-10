@@ -1921,7 +1921,7 @@ describe('the workspace git config', () => {
         expect(refused.exitCode).toBe(0);
         expect(refused.stderr).toContain('--- WARNING: setup-environment.ts failed:');
         expect(refused.stderr).toContain('EACCES');
-        expect(refused.stderr).toContain(hooks);
+        expect(refused.stderr).toContain(join(hooks, 'pre-commit'));
         expect(refused.stderr).toContain(
           'Git hooks and repository config were not applied; the shell is loaded without them.',
         );
@@ -1930,6 +1930,12 @@ describe('the workspace git config', () => {
       }
       expect(await enter()).toEqual(HEALTHY);
       expect(readlinkSync(join(hooks, 'pre-commit'))).toBe('../../tooling/git-hooks/pre-commit.sh');
+      await chmod(hooks, 0o555);
+      try {
+        expect(await enter()).toEqual(HEALTHY);
+      } finally {
+        await chmod(hooks, 0o755);
+      }
     });
   });
 });

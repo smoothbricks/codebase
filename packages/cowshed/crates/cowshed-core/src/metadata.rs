@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub const MARKER_VERSION: u32 = 1;
+pub const OWNED_LINKS_REVISION: u8 = 1;
 pub const SIDECAR_VERSION: u32 = 1;
 pub const CHECKOUT_ROOT_VERSION: u32 = 1;
 pub const SLOT_BINDINGS_VERSION: u32 = 1;
@@ -602,6 +603,14 @@ pub struct WorkspaceMarker {
     /// already carries and rewrites the marker.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lineage: Option<Vec<WorkspaceIncarnation>>,
+    /// The owned-link revision this tree was migrated to: 0 for a marker written before the
+    /// migration existed, [`OWNED_LINKS_REVISION`] once it has run or the tree was made by it.
+    #[serde(skip_serializing_if = "is_legacy_owned_links")]
+    pub owned_links_revision: u8,
+}
+
+fn is_legacy_owned_links(revision: &u8) -> bool {
+    *revision == 0
 }
 
 #[derive(Deserialize)]
@@ -619,6 +628,8 @@ struct WorkspaceMarkerWire {
     created_trace: String,
     #[serde(default)]
     lineage: Option<Vec<WorkspaceIncarnation>>,
+    #[serde(default)]
+    owned_links_revision: u8,
 }
 
 impl<'de> Deserialize<'de> for WorkspaceMarker {
@@ -639,6 +650,7 @@ impl<'de> Deserialize<'de> for WorkspaceMarker {
             forked_from: wire.forked_from,
             created_trace: wire.created_trace,
             lineage: wire.lineage,
+            owned_links_revision: wire.owned_links_revision,
         };
         marker.validate().map_err(serde::de::Error::custom)?;
         Ok(marker)

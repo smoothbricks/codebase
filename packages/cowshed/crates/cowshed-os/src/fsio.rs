@@ -475,7 +475,7 @@ impl AnchoredDirectory {
 
     /// `name` as a symlink to exactly `target`: a matching link is kept, anything else but a
     /// directory is unlinked (never followed) and the link created anew.
-    fn exact_symlink(&self, name: &CStr, target: &Path) -> io::Result<bool> {
+    pub(crate) fn exact_symlink(&self, name: &CStr, target: &Path) -> io::Result<bool> {
         let mut buffer = [0u8; 4096];
         match self.read_link(name, &mut buffer) {
             Ok(bytes) if bytes == target.as_os_str().as_bytes() => return Ok(false),

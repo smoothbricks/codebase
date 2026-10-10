@@ -9,6 +9,7 @@
 //! reaps it again and `gc` [`finish`]es it.
 
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -21,15 +22,21 @@ pub const DISCARD_DIRECTORY: &str = ".cowshed/discard";
 /// in one `rename(2)`. The name keeps the path it came from, readable in a listing.
 pub fn move_aside(checkout: &Path, relative: &Path) -> io::Result<PathBuf> {
     let directory = discard_directory(checkout, true)?;
+    let moved = directory.join(leaf_name(relative));
+    fs::rename(checkout.join(relative), &moved)?;
+    Ok(moved)
+}
+
+/// The discard leaf for the checkout-relative `relative`: its path with `/` as `%`, then this
+/// process's id and a random suffix, so concurrent discards of one path never collide.
+pub fn leaf_name(relative: &Path) -> OsString {
     let mut name = relative.to_string_lossy().replace('/', "%");
     name.push_str(&format!(
         "-{}-{}",
         std::process::id(),
         &uuid::Uuid::new_v4().simple().to_string()[..8]
     ));
-    let moved = directory.join(name);
-    fs::rename(checkout.join(relative), &moved)?;
-    Ok(moved)
+    OsString::from(name)
 }
 
 /// Every discard of `checkout` not yet deleted.

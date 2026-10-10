@@ -31,12 +31,18 @@
 //! would spend clone time to change nothing, and the whole point of a copy-on-write workspace
 //! is that it is ready in seconds.
 
+use std::ffi::CString;
 use std::fs;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread;
 
 use crate::error::{CowshedError, Result};
+use crate::fsio::AnchoredDirectory;
+use crate::metadata::{OWNED_LINKS_REVISION, WorkspaceIncarnation, WorkspaceMarker, write_json};
+use crate::repository::RepoId;
+use crate::storage::WORKSPACE_MARKER_PATH;
 
 /// What a symlink's recorded target means once its tree moves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,6 +53,17 @@ pub enum Targeting {
     InTree,
     /// A relative target that climbs above the tree root.
     Escapes,
+}
+
+/// Which inherited links a restoration may retarget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestoreScope {
+    /// A new mint's inherited tree: escaping links resolve against the source, and absolute
+    /// links into the source are re-spelled relative to this tree.
+    Inherited,
+    /// The owned-link migration: only absolute links into the donor root are re-spelled. Escaping
+    /// links are the current workspace's own and are left exactly as they are.
+    OwnedAbsolute,
 }
 
 /// Classify a target from the link's parent directory, expressed relative to the tree root.
@@ -199,9 +216,9 @@ impl Found {
 /// The walk never follows links, so it cannot leave the tree it was handed or cycle through
 /// one that points back into itself. Directories are read concurrently; the plan is sorted by
 /// link path, so it does not depend on which reader reached a link first.
-pub fn plan(tree_root: &Path, source_root: &Path) -> Result<LinkPlan> {
+pub fn plan(tree_root: &Path, source_root: &Path, scope: RestoreScope) -> Result<LinkPlan> {
     let (symlinks_seen, mut found) = walk_symlinks(tree_root, |relative| {
-        judge(tree_root, source_root, relative)
+        judge(tree_root, source_root, relative, scope)
     });
     found.sort_unstable_by(|left, right| left.at().cmp(right.at()));
     let mut plan = LinkPlan {
@@ -220,7 +237,12 @@ pub fn plan(tree_root: &Path, source_root: &Path) -> Result<LinkPlan> {
 /// Classify one symlink, `relative` to the tree root. An escaping target is resolved against
 /// the source tree; an absolute target inside the source tree is re-spelled relative to the
 /// same path in this tree. `None` is a link that keeps its meaning at any depth.
-fn judge(tree_root: &Path, source_root: &Path, relative: PathBuf) -> Option<Found> {
+fn judge(
+    tree_root: &Path,
+    source_root: &Path,
+    relative: PathBuf,
+    scope: RestoreScope,
+) -> Option<Found> {
     // A link whose target cannot be read is not this module's business: it is reported by
     // whatever reads it, and guessing at a replacement would be worse than leaving it exactly
     // as the source tree had it.
@@ -241,6 +263,7 @@ fn judge(tree_root: &Path, source_root: &Path, relative: PathBuf) -> Option<Foun
                 inherited: target,
             }))
         }
+        Targeting::Escapes if scope == RestoreScope::OwnedAbsolute => None,
         Targeting::Escapes => {
             let restored = resolve_in_source(source_root, parent, &target);
             // `symlink_metadata`, not `exists`: a source target that is itself a symlink counts
@@ -403,25 +426,35 @@ where
 pub fn apply(tree_root: &Path, plan: &LinkPlan) -> Result<()> {
     for rewrite in &plan.rewrites {
         let path = tree_root.join(&rewrite.at);
-        fs::remove_file(&path).map_err(|source| {
+        let parent = path.parent().expect("a planned link has a parent");
+        let name = path.file_name().expect("a planned link has a name");
+        let name = CString::new(name.as_bytes()).map_err(|_| {
+            CowshedError::integrity(
+                format!("link name at {} contains NUL", path.display()),
+                "repair the workspace link name",
+            )
+        })?;
+        let directory = AnchoredDirectory::open(parent).map_err(|source| {
             CowshedError::integrity(
                 format!(
-                    "could not replace the inherited link {}: {source}",
-                    path.display()
+                    "could not open {} to repoint its link: {source}",
+                    parent.display()
                 ),
                 "check the workspace mount is writable, then retry",
             )
         })?;
-        std::os::unix::fs::symlink(&rewrite.restored, &path).map_err(|source| {
-            CowshedError::integrity(
-                format!(
-                    "could not point {} at {}: {source}",
-                    path.display(),
-                    rewrite.restored.display()
-                ),
-                "check the workspace mount is writable, then retry",
-            )
-        })?;
+        directory
+            .exact_symlink(&name, &rewrite.restored)
+            .map_err(|source| {
+                CowshedError::integrity(
+                    format!(
+                        "could not point {} at {}: {source}",
+                        path.display(),
+                        rewrite.restored.display()
+                    ),
+                    "check the workspace mount is writable, then retry",
+                )
+            })?;
     }
     Ok(())
 }
@@ -431,12 +464,64 @@ pub fn apply(tree_root: &Path, plan: &LinkPlan) -> Result<()> {
 /// A plan with any refusal applies nothing. The tree then still holds exactly the bytes it
 /// inherited, so a retry after the source is repaired judges every link afresh against the
 /// tree that produced it, instead of inheriting half of a pass that already failed.
-pub fn restore(tree_root: &Path, source_root: &Path) -> Result<LinkPlan> {
-    let plan = plan(tree_root, source_root)?;
+pub fn restore(tree_root: &Path, source_root: &Path, scope: RestoreScope) -> Result<LinkPlan> {
+    let plan = plan(tree_root, source_root, scope)?;
     if plan.refusals.is_empty() {
         apply(tree_root, &plan)?;
     }
     Ok(plan)
+}
+
+/// The one-time owned-link migration of a workspace whose marker predates
+/// [`OWNED_LINKS_REVISION`]: absolute links into `donor` are re-spelled relative to this tree.
+///
+/// The protected marker must name this repository, incarnation and donor before anything is
+/// walked or written. Returns `None` without a walk when the marker is already at the current
+/// revision.
+pub fn migrate_owned_links(
+    root: &Path,
+    donor: &Path,
+    expected_repo: &RepoId,
+    expected_incarnation: &WorkspaceIncarnation,
+) -> Result<Option<LinkPlan>> {
+    let marker_path = root.join(WORKSPACE_MARKER_PATH);
+    let mut marker = WorkspaceMarker::read_from(&marker_path).map_err(|error| {
+        CowshedError::integrity(
+            format!(
+                "cannot read workspace marker {}: {error}",
+                marker_path.display()
+            ),
+            "repair the workspace marker, then retry",
+        )
+    })?;
+    if marker.repo_id != *expected_repo
+        || marker.workspace_incarnation != *expected_incarnation
+        || marker.project_root != donor
+    {
+        return Err(CowshedError::integrity(
+            format!(
+                "workspace marker {} does not name this repository, incarnation and donor",
+                marker_path.display()
+            ),
+            "refuse the migration; the marker and the donor disagree",
+        ));
+    }
+    if marker.owned_links_revision >= OWNED_LINKS_REVISION {
+        return Ok(None);
+    }
+    let plan = plan(root, donor, RestoreScope::OwnedAbsolute)?;
+    apply(root, &plan)?;
+    marker.owned_links_revision = OWNED_LINKS_REVISION;
+    write_json(&marker_path, &marker).map_err(|error| {
+        CowshedError::integrity(
+            format!(
+                "cannot record the owned-link revision in {}: {error}",
+                marker_path.display()
+            ),
+            "repair the workspace marker, then retry",
+        )
+    })?;
+    Ok(Some(plan))
 }
 
 #[cfg(test)]
@@ -543,7 +628,7 @@ mod tests {
             "the inherited link must be broken in the clone, or this test proves nothing"
         );
 
-        let plan = restore(&clone, &source).expect("restore");
+        let plan = restore(&clone, &source, RestoreScope::Inherited).expect("restore");
         assert_eq!(plan.rewrites.len(), 1);
         assert!(plan.refusals.is_empty());
         assert_eq!(
@@ -580,7 +665,7 @@ mod tests {
             "the inherited link must resolve onto the decoy, or this test proves nothing"
         );
 
-        let plan = restore(&clone, &source).expect("restore");
+        let plan = restore(&clone, &source, RestoreScope::Inherited).expect("restore");
         assert_eq!(
             plan.rewrites.len(),
             1,
@@ -605,7 +690,7 @@ mod tests {
             symlink("/opt/lib", root.join("packages/app/abs")).expect("absolute link");
         }
 
-        let plan = restore(&clone, &source).expect("restore");
+        let plan = restore(&clone, &source, RestoreScope::Inherited).expect("restore");
         assert!(plan.is_empty(), "no escaping links, so nothing to rewrite");
         assert_eq!(plan.symlinks_seen, 2, "both links must have been examined");
         assert_eq!(
@@ -647,7 +732,7 @@ mod tests {
         symlink(&source, clone.join("root")).expect("root link");
         symlink("/opt/lib", clone.join("node_modules/outside")).expect("outside link");
 
-        let plan = restore(&clone, &source).expect("restore");
+        let plan = restore(&clone, &source, RestoreScope::Inherited).expect("restore");
         assert!(plan.refusals.is_empty());
         assert_eq!(
             plan.rewrites.len(),
@@ -696,7 +781,7 @@ mod tests {
         symlink("../../../gone/pkg", clone_nested.join("pkg")).expect("clone link");
         symlink("../../../present/pkg", clone_nested.join("present")).expect("restorable link");
 
-        let plan = restore(&clone, &source).expect("restore");
+        let plan = restore(&clone, &source, RestoreScope::Inherited).expect("restore");
         assert_eq!(
             plan.rewrites.len(),
             1,
@@ -752,7 +837,7 @@ mod tests {
         }
         expected.sort();
 
-        let plan = plan(&clone, &source).expect("plan");
+        let plan = plan(&clone, &source, RestoreScope::Inherited).expect("plan");
         let found: Vec<_> = plan
             .rewrites
             .iter()
@@ -800,11 +885,108 @@ mod tests {
         fs::create_dir_all(&source).expect("source");
         fs::create_dir_all(clone.join("empty/nested")).expect("clone");
 
-        let plan = restore(&clone, &source).expect("restore");
+        let plan = restore(&clone, &source, RestoreScope::Inherited).expect("restore");
         assert!(plan.is_empty());
         assert_eq!(
             plan.symlinks_seen, 0,
             "a tree with no symlinks must report zero examined, not silently succeed"
+        );
+    }
+
+    #[test]
+    fn owned_link_migration_retargets_absolute_donor_links_once() {
+        let donor = temp_tree("owned-donor");
+        let tree = temp_tree("owned-tree");
+        fs::create_dir_all(donor.join(".cache/owned")).expect("donor product");
+        fs::create_dir_all(donor.join("node_modules")).expect("donor modules");
+        fs::create_dir_all(tree.join(".cowshed")).expect("marker parent");
+        fs::create_dir_all(tree.join("node_modules")).expect("tree modules");
+        symlink(donor.join(".cache/owned"), tree.join("node_modules/owned"))
+            .expect("inherited owned link");
+        symlink("../../../external/pkg", tree.join("node_modules/sibling"))
+            .expect("job-made sibling");
+        let marker: WorkspaceMarker = serde_json::from_value(serde_json::json!({
+            "version": 1,
+            "repoId": "acme/widget",
+            "projectRoot": donor.display().to_string(),
+            "workspace": "raven",
+            "workspaceIncarnation": "0198f2c0b7e34dc795f17b238b331c80",
+            "role": "workspace",
+            "baseCommit": "8f31c2d",
+            "createdAt": "2026-07-11T12:00:00Z",
+            "forkedFrom": null,
+            "createdTrace": "4bf92f"
+        }))
+        .expect("legacy marker");
+        write_json(&tree.join(WORKSPACE_MARKER_PATH), &marker).expect("write legacy marker");
+        let repo = RepoId::parse("acme/widget").expect("repo");
+        let incarnation =
+            WorkspaceIncarnation::new("0198f2c0b7e34dc795f17b238b331c80").expect("incarnation");
+        let migrated = migrate_owned_links(&tree, &donor, &repo, &incarnation)
+            .expect("migrate")
+            .expect("first migration runs");
+        assert_eq!(migrated.rewrites.len(), 1);
+        assert_eq!(
+            fs::read_link(tree.join("node_modules/owned")).expect("owned link"),
+            Path::new("../.cache/owned")
+        );
+        assert_eq!(
+            fs::read_link(tree.join("node_modules/sibling")).expect("sibling link"),
+            Path::new("../../../external/pkg")
+        );
+        assert_eq!(
+            WorkspaceMarker::read_from(&tree.join(WORKSPACE_MARKER_PATH))
+                .expect("marker")
+                .owned_links_revision,
+            OWNED_LINKS_REVISION
+        );
+        symlink(donor.join(".cache/owned"), tree.join("node_modules/late")).expect("late link");
+        assert!(
+            migrate_owned_links(&tree, &donor, &repo, &incarnation)
+                .expect("second migrate")
+                .is_none()
+        );
+        assert_eq!(
+            fs::read_link(tree.join("node_modules/late")).expect("late link"),
+            donor.join(".cache/owned")
+        );
+    }
+
+    #[test]
+    fn a_new_mint_at_the_current_revision_skips_the_walk_and_leaves_late_donor_links_alone() {
+        let donor = temp_tree("owned-current-donor");
+        let tree = temp_tree("owned-current-tree");
+        fs::create_dir_all(donor.join(".cache/owned")).expect("donor product");
+        fs::create_dir_all(tree.join(".cowshed")).expect("marker parent");
+        fs::create_dir_all(tree.join("node_modules")).expect("tree modules");
+        let marker: WorkspaceMarker = serde_json::from_value(serde_json::json!({
+            "version": 1,
+            "repoId": "acme/widget",
+            "projectRoot": donor.display().to_string(),
+            "workspace": "raven",
+            "workspaceIncarnation": "0198f2c0b7e34dc795f17b238b331c80",
+            "role": "workspace",
+            "baseCommit": "8f31c2d",
+            "createdAt": "2026-07-11T12:00:00Z",
+            "forkedFrom": null,
+            "createdTrace": "4bf92f",
+            "ownedLinksRevision": OWNED_LINKS_REVISION
+        }))
+        .expect("current marker");
+        write_json(&tree.join(WORKSPACE_MARKER_PATH), &marker).expect("write current marker");
+        symlink(donor.join(".cache/owned"), tree.join("node_modules/late"))
+            .expect("late donor link");
+        let repo = RepoId::parse("acme/widget").expect("repo");
+        let incarnation =
+            WorkspaceIncarnation::new("0198f2c0b7e34dc795f17b238b331c80").expect("incarnation");
+        assert!(
+            migrate_owned_links(&tree, &donor, &repo, &incarnation)
+                .expect("migrate at current revision")
+                .is_none()
+        );
+        assert_eq!(
+            fs::read_link(tree.join("node_modules/late")).expect("late link"),
+            donor.join(".cache/owned")
         );
     }
 }

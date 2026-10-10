@@ -1,11 +1,9 @@
 #!/usr/bin/env bun
 import { dlopen, FFIType, read as ffiRead } from 'bun:ffi';
 import {
-  accessSync,
   chmodSync,
   closeSync,
   cpSync,
-  constants,
   existsSync,
   lstatSync,
   mkdirSync,
@@ -1409,9 +1407,6 @@ function assertTypescriptApiAt(typescriptRoot: string, expectedTarget: string): 
  */
 async function applyWorkspaceGitConfig(root: string): Promise<void> {
   // Authority is what this process may write, not whether a workspace token exists.
-  const configFile = repositoryConfig(root).file;
-  accessSync(path.dirname(configFile), constants.W_OK);
-  accessSync(configFile, constants.W_OK);
   await keepRepositoryConfig(root);
 
   const gitDirResult = await $`git rev-parse --git-dir`.cwd(root).quiet().nothrow();
@@ -1425,7 +1420,6 @@ async function applyWorkspaceGitConfig(root: string): Promise<void> {
   }
 
   const gitDir = path.resolve(root, new TextDecoder().decode(gitDirResult.stdout).trim());
-  accessSync(existsSync(path.join(gitDir, 'hooks')) ? path.join(gitDir, 'hooks') : gitDir, constants.W_OK);
   const tooling = path.join(root, 'tooling');
   linkHook(gitDir, tooling, 'pre-commit');
   installPostCommitHook(gitDir, tooling);
@@ -1471,8 +1465,9 @@ function installPostCommitHook(gitDir: string, tooling: string): void {
   const kept = stripPostCommitBlock(existing).replace(/\s+$/, '');
   const next = `${kept === '' ? '#!/usr/bin/env bash' : kept}\n\n${POST_COMMIT_BLOCK}\n`;
   if (existing === next) {
-    // A hook that is not executable is a hook git silently skips.
-    chmodSync(target, 0o755);
+    // A hook that is not executable is a hook git silently skips. A correct hook that is
+    // write-denied is left as it is, so only a missing execute bit is repaired.
+    if ((statSync(target).mode & 0o111) === 0) chmodSync(target, 0o755);
     return;
   }
 

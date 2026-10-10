@@ -5,10 +5,11 @@ import {
   readFileSync,
   readlinkSync,
   rmSync,
+  statSync,
   symlinkSync,
   writeFileSync,
 } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, join, relative, resolve } from 'node:path';
 import { $ } from 'bun';
 import { decode, run } from '../lib/run.js';
 
@@ -37,9 +38,6 @@ const POST_COMMIT_BLOCK = [
  * it hit, and this returns.
  */
 export async function applyWorkspaceGitConfig(root: string): Promise<void> {
-  // Workspace Git metadata belongs to the host setup, not a sandboxed job. Its hooks
-  // are installed in the warm checkout already; a job must never rewrite them.
-  if (process.env.COWSHED_WORKSPACE_TOKEN) return;
   try {
     await wireWorkspaceGit(root);
   } catch (error) {
@@ -89,13 +87,14 @@ function linkHook(gitDir: string, tooling: string, name: string): void {
   }
 
   const target = join(gitDir, 'hooks', name);
-  if (readLinkOrNull(target) === source) {
+  const relativeTarget = relative(dirname(target), source);
+  if (readLinkOrNull(target) === relativeTarget) {
     return;
   }
 
   mkdirSync(dirname(target), { recursive: true });
   rmSync(target, { force: true });
-  symlinkSync(source, target);
+  symlinkSync(relativeTarget, target);
 }
 
 function installPostCommitHook(gitDir: string, tooling: string): void {
@@ -116,8 +115,9 @@ function installPostCommitHook(gitDir: string, tooling: string): void {
   const existing = link === null && existsSync(target) ? readFileSync(target, 'utf8') : '';
   const next = postCommitHookFile(existing);
   if (existing === next) {
-    // A hook that is not executable is a hook git silently skips.
-    chmodSync(target, 0o755);
+    // A hook that is not executable is a hook git silently skips. A correct hook that is
+    // write-denied is left as it is, so only a missing execute bit is repaired.
+    if ((statSync(target).mode & 0o111) === 0) chmodSync(target, 0o755);
     return;
   }
 

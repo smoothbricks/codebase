@@ -596,7 +596,9 @@ those bindings.
 A job's terminal cleanup applies the same boundary to the developer links it displaced. A registry replacement is
 restored to its recorded link. A different live developer binding is kept as the developer left it, with no new grant or
 attestation. A link that is absent with no observed install is reported as `developer-link-ambiguous` and stays absent.
-A deliberate relink that a successful install made keeps its intent.
+A covered install restores its snapshot exactly before it returns, so a relink made through a covered `bun`, `npm` or
+`pnpm` install is reverted. A relink made outside covered installs, by an absolute bypass or a command that is not an
+install, keeps its intent.
 
 While such links exist, every shell entry and every install smoo runs prints one line naming them, such as
 `linked to local checkouts: @smoothbricks/lmao -> ~/src/smoothbricks/packages/lmao (12 links)`. Entries that install

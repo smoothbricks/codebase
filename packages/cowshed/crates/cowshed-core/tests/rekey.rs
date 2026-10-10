@@ -153,6 +153,7 @@ fn base_fixture(case: &str, name: &str) -> Fixture {
             forked_from: None,
             created_trace: "rekey-fixture".to_owned(),
             lineage: None,
+            owned_links_revision: 0,
         },
     )
     .expect("marker");

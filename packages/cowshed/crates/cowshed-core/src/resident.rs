@@ -551,6 +551,7 @@ mod tests {
                     forked_from: None,
                     created_trace: "fixture".to_owned(),
                     lineage: Some(Vec::new()),
+                    owned_links_revision: 0,
                 },
             )
             .expect("marker");

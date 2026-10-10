@@ -1856,15 +1856,20 @@ impl GitRepository {
     ) -> Result<crate::inherited_links::LinkPlan> {
         let root = self.root.clone();
         let source = source_root.to_path_buf();
-        let plan =
-            tokio::task::spawn_blocking(move || crate::inherited_links::restore(&root, &source))
-                .await
-                .map_err(|source| {
-                    CowshedError::integrity(
-                        format!("restoring inherited links panicked: {source}"),
-                        "retry the operation and report the failure if it repeats",
-                    )
-                })??;
+        let plan = tokio::task::spawn_blocking(move || {
+            crate::inherited_links::restore(
+                &root,
+                &source,
+                crate::inherited_links::RestoreScope::Inherited,
+            )
+        })
+        .await
+        .map_err(|source| {
+            CowshedError::integrity(
+                format!("restoring inherited links panicked: {source}"),
+                "retry the operation and report the failure if it repeats",
+            )
+        })??;
         if !plan.refusals.is_empty() {
             return Err(CowshedError::integrity(
                 format!(

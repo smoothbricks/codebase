@@ -239,9 +239,9 @@ export interface PackageSecretCommand {
 }
 
 /**
- * A directory relative to the project's main checkout. Project-contained paths
- * select that path in the current checkout, rejecting physical symlink escapes;
- * genuine sibling paths stay anchored at the main checkout a cowshed marker names.
+ * A directory relative to this checkout's root. Project-contained paths select that path in
+ * the current checkout, rejecting physical symlink escapes; inherited sibling links keep their
+ * absolute targets.
  */
 export type DeveloperLinkDirectory = string & typia.tags.MinLength<1> & typia.tags.Pattern<'^[^/]'>;
 

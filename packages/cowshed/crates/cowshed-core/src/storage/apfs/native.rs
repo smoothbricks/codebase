@@ -3503,6 +3503,24 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         }
         Ok(report)
     }
+
+    /// Remove every artifact a restore retained beside `undo` before it completed.
+    fn unretain_restore(undo: &Path) -> Result<(), ApfsStorageError> {
+        for artifact in [sidecar_path(undo), companion_path(undo)] {
+            match fs::remove_file(&artifact) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(io_error(
+                        "remove retained restore artifact",
+                        &artifact,
+                        error,
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
@@ -4321,6 +4339,24 @@ where
         // A cloned image arrives with its source's marker still in place: that marker is the
         // lineage. A fresh image (adopt) has none and starts a lineage of its own.
         let lineage = clone_lineage_from(&marker_path, workspace.repo());
+        // A copy of the same workspace (restore or re-adopt) keeps its owned-link revision, so a
+        // legacy tree still runs its one migration. A fork or a new mint starts at the current one.
+        let copied = match WorkspaceMarker::read_from(&marker_path) {
+            Ok(old) => Some(old).filter(|old| {
+                forked_from.is_none()
+                    && old.repo_id == *workspace.repo()
+                    && old.workspace == *workspace.name()
+            }),
+            Err(crate::metadata::MetadataError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                None
+            }
+            Err(error) => return Err(ApfsStorageError::MarkerMismatch(error.to_string())),
+        };
+        let owned_links_revision = copied.map_or(crate::metadata::OWNED_LINKS_REVISION, |old| {
+            old.owned_links_revision
+        });
         let marker = WorkspaceMarker {
             version: MARKER_VERSION,
             repo_id: workspace.repo().clone(),
@@ -4333,6 +4369,7 @@ where
             forked_from: forked_from.cloned(),
             created_trace: identity.created_trace.clone(),
             lineage: Some(lineage),
+            owned_links_revision,
         };
         marker
             .validate()
@@ -4982,24 +5019,24 @@ where
         }
         self.trip_restore_failpoint(RestoreFailpoint::AfterUndoSidecar)?;
         if let Err(error) = swap_paths(canonical, staged) {
-            let _ = fs::remove_file(&undo_sidecar);
-            let _ = fs::remove_file(&undo_companion);
-            return Err(error);
+            return super::combine_cleanup(
+                "restore image swap",
+                error,
+                Self::unretain_restore(undo),
+            );
         }
         self.trip_restore_failpoint(RestoreFailpoint::AfterRestoreImageSwap)?;
         if let Err(primary) = swap_paths(&canonical_companion, &staged_companion) {
-            let rollback = swap_paths(canonical, staged);
-            let _ = fs::remove_file(&undo_sidecar);
-            let _ = fs::remove_file(&undo_companion);
+            let rollback =
+                swap_paths(canonical, staged).and_then(|()| Self::unretain_restore(undo));
             return super::combine_cleanup("restore CA key swap", primary, rollback);
         }
         self.trip_restore_failpoint(RestoreFailpoint::AfterImageSwap)?;
         if let Err(error) = fs::rename(staged, undo) {
             let primary = io_error("retain restore undo image", undo, error);
             let rollback = swap_paths(&canonical_companion, &staged_companion)
-                .and_then(|()| swap_paths(canonical, staged));
-            let _ = fs::remove_file(&undo_sidecar);
-            let _ = fs::remove_file(&undo_companion);
+                .and_then(|()| swap_paths(canonical, staged))
+                .and_then(|()| Self::unretain_restore(undo));
             return super::combine_cleanup("restore swap", primary, rollback);
         }
         self.trip_restore_failpoint(RestoreFailpoint::AfterRestoreUndoImageRename)?;
@@ -7153,6 +7190,7 @@ mod tests {
             forked_from: None,
             created_trace: "trace".into(),
             lineage: Some(vec![ancestor.clone()]),
+            owned_links_revision: 0,
         };
         crate::metadata::write_json(&marker_path, &marker).unwrap();
         assert_eq!(

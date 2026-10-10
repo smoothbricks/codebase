@@ -3549,6 +3549,56 @@ enum Conclusion {
     Unsealed(CowshedError),
 }
 
+/// The per-job marker a covered install wrapper writes once its install ran, named by the job's
+/// `COWSHED_INSTALL_OBSERVED` environment. Created before launch; its presence alone lets terminal
+/// cleanup restore a link the install removed. A job can write it, so forging it only restores
+/// links the cleanup would otherwise report: it grants and attests nothing.
+struct InstallObservation {
+    directory: AnchoredDirectory,
+    name: std::ffi::CString,
+    path: PathBuf,
+}
+
+const INSTALL_OBSERVATION_DIRECTORY: &str = "install-observed";
+
+impl InstallObservation {
+    fn new(exec_temp_dir: &Path) -> Result<Self> {
+        let parent = exec_temp_dir.join(INSTALL_OBSERVATION_DIRECTORY);
+        let directory = AnchoredDirectory::create(&parent).map_err(private_environment_error)?;
+        let leaf = uuid::Uuid::new_v4().simple().to_string();
+        let name = std::ffi::CString::new(leaf.as_str())
+            .map_err(|error| CowshedError::internal(error.to_string()))?;
+        Ok(Self {
+            directory,
+            name,
+            path: parent.join(leaf),
+        })
+    }
+
+    /// Whether the wrapper left a regular marker. Any other entry is refused, never followed.
+    fn observed(&self) -> std::io::Result<bool> {
+        match self.directory.stat_child(&self.name)? {
+            None => Ok(false),
+            Some(stat) if stat.st_mode & libc::S_IFMT == libc::S_IFREG => Ok(true),
+            Some(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "install observation is not a regular file",
+            )),
+        }
+    }
+
+    fn remove(&self) -> std::io::Result<()> {
+        self.directory.remove_file(&self.name)
+    }
+}
+
+fn install_observation_error(error: &std::io::Error) -> CowshedError {
+    CowshedError::integrity(
+        format!("install observation: {error}"),
+        "inspect the job's install-observed directory, then retry",
+    )
+}
+
 struct JobStateRecord {
     info: JobInfo,
     started_at: Instant,
@@ -3565,6 +3615,7 @@ struct JobStateRecord {
     /// record free of a fabricated exit and hands the failure to everyone awaiting the job.
     wait_failure: Option<CowshedError>,
     developer_links: crate::developer_links::DeveloperLinks,
+    install_observation: Option<InstallObservation>,
     restoration_failure: Option<CowshedError>,
     /// Set once the job ended, whatever became of its record.
     conclusion: Option<Conclusion>,
@@ -4769,7 +4820,8 @@ impl SupervisorActor {
             },
         };
         let child = self.policy.child(request.mode).0;
-        let developer_links = if child.mode == crate::sandbox::RunSandboxMode::ReadWrite
+        let (developer_links, install_observation) = if child.mode
+            == crate::sandbox::RunSandboxMode::ReadWrite
             && child.capabilities.active.iter().any(|id| {
                 matches!(
                     id,
@@ -4778,16 +4830,19 @@ impl SupervisorActor {
                         | crate::capabilities::CapabilityId::Pnpm
                 )
             }) {
+            let exec_temp = child.exec_temp_dir.clone();
+            let observation = InstallObservation::new(&exec_temp)?;
             let root = self.workspace_root.clone();
-            tokio::task::spawn_blocking(move || {
-                crate::developer_links::DeveloperLinks::capture(&root)
+            let links = tokio::task::spawn_blocking(move || {
+                crate::developer_links::DeveloperLinks::capture_job(&root)
             })
             .await
             .map_err(|error| {
                 CowshedError::internal(format!("developer-link snapshot failed: {error}"))
-            })??
+            })??;
+            (links, Some(observation))
         } else {
-            crate::developer_links::DeveloperLinks::default()
+            (crate::developer_links::DeveloperLinks::default(), None)
         };
         let build_hold = self.hold_build_volume(build_volume.as_deref())?;
         // A volume the link moved to (a land, a refork) was another checkout's: it takes this
@@ -4868,6 +4923,12 @@ impl SupervisorActor {
         // in the caller's environment would hand the workspace the very bytes the host kept out
         // of it, so it is dropped here — at the one place every job's environment is settled.
         merged_env.retain(|name, _| !self.credential_env_names.contains(name));
+        if let Some(marker) = &install_observation {
+            merged_env.insert(
+                crate::developer_links::INSTALL_OBSERVED_ENV.to_owned(),
+                marker.path.to_string_lossy().into_owned(),
+            );
+        }
         let job_id = self.next_job_id;
         let expected_next = job_id
             .get()
@@ -4997,6 +5058,7 @@ impl SupervisorActor {
             exit: None,
             wait_failure: None,
             developer_links,
+            install_observation,
             restoration_failure: None,
             conclusion: None,
             birth: None,
@@ -6022,14 +6084,39 @@ impl SupervisorActor {
     }
 
     async fn finalize_job(&mut self, job_id: JobId, forced_state: Option<JobState>) {
-        let links = match self.jobs.get_mut(&job_id) {
-            Some(job) if !job.terminal() => std::mem::take(&mut job.developer_links),
+        let (links, observation) = match self.jobs.get_mut(&job_id) {
+            Some(job) if !job.terminal() => (
+                std::mem::take(&mut job.developer_links),
+                job.install_observation.take(),
+            ),
             _ => return,
         };
-        if !links.is_empty() {
+        if !links.is_empty() || observation.is_some() {
             let root = self.workspace_root.clone();
             let restored = tokio::task::spawn_blocking(move || {
-                links.restore(&root, crate::developer_links::RestoreMode::JobTerminal)
+                // The wrapper's marker decides the mode before anything is restored. It is removed
+                // on every path, so a finished run leaves none behind.
+                let (inspected, removed) = match observation {
+                    Some(marker) => (marker.observed(), marker.remove()),
+                    None => (Ok(false), Ok(())),
+                };
+                let observed = match (inspected, removed) {
+                    (Ok(observed), Ok(())) => observed,
+                    (Err(inspection), Ok(())) => return Err(install_observation_error(&inspection)),
+                    (Ok(_), Err(removal)) => return Err(install_observation_error(&removal)),
+                    (Err(inspection), Err(removal)) => {
+                        return Err(CowshedError::integrity(
+                            format!("install observation: {inspection}; removing it also failed: {removal}"),
+                            "inspect the job's install-observed directory, then retry",
+                        ));
+                    }
+                };
+                let mode = if observed {
+                    crate::developer_links::RestoreMode::JobTerminalObservedInstall
+                } else {
+                    crate::developer_links::RestoreMode::JobTerminal
+                };
+                links.restore(&root, mode)
             })
             .await;
             let failure = match restored {
@@ -9139,5 +9226,76 @@ mod admission_environment_commitment_tests {
             admission_env_sha256(&right, &withheld),
             "component boundaries are committed"
         );
+    }
+}
+
+#[cfg(test)]
+mod install_observation_tests {
+    use super::*;
+    use std::fs;
+    use std::os::unix::fs::symlink;
+
+    #[test]
+    fn an_absent_marker_is_not_observed_and_removing_it_is_idempotent() {
+        let scratch = crate::temp_root::TempRoot::new("install-observation-absent");
+        let exec = scratch.join("exec");
+        fs::create_dir_all(&exec).unwrap();
+        let marker = InstallObservation::new(&exec).unwrap();
+        assert!(!marker.observed().unwrap());
+        marker.remove().unwrap();
+        marker.remove().unwrap();
+        assert!(!marker.observed().unwrap());
+    }
+
+    #[test]
+    fn a_regular_marker_is_observed_until_it_is_removed() {
+        let scratch = crate::temp_root::TempRoot::new("install-observation-regular");
+        let exec = scratch.join("exec");
+        fs::create_dir_all(&exec).unwrap();
+        let marker = InstallObservation::new(&exec).unwrap();
+        fs::write(&marker.path, b"observed\n").unwrap();
+        assert!(marker.observed().unwrap());
+        marker.remove().unwrap();
+        assert!(!marker.observed().unwrap());
+        assert!(fs::symlink_metadata(&marker.path).is_err());
+    }
+
+    #[test]
+    fn a_symlink_marker_is_refused_and_unlinked_without_touching_its_target() {
+        let scratch = crate::temp_root::TempRoot::new("install-observation-symlink");
+        let exec = scratch.join("exec");
+        fs::create_dir_all(&exec).unwrap();
+        let foreign = scratch.join("foreign");
+        fs::write(&foreign, b"keep\n").unwrap();
+        let marker = InstallObservation::new(&exec).unwrap();
+        symlink(&foreign, &marker.path).unwrap();
+        assert!(marker.observed().is_err());
+        marker.remove().unwrap();
+        assert!(fs::symlink_metadata(&marker.path).is_err());
+        assert_eq!(fs::read(&foreign).unwrap(), b"keep\n");
+    }
+
+    #[test]
+    fn a_swapped_parent_cannot_redirect_the_marker_to_a_foreign_directory() {
+        let scratch = crate::temp_root::TempRoot::new("install-observation-swap");
+        let exec = scratch.join("exec");
+        fs::create_dir_all(&exec).unwrap();
+        let marker = InstallObservation::new(&exec).unwrap();
+        let leaf = marker.name.to_str().unwrap().to_owned();
+        fs::write(&marker.path, b"observed\n").unwrap();
+        let held_parent = exec.join(INSTALL_OBSERVATION_DIRECTORY);
+        let moved = exec.join("moved");
+        fs::rename(&held_parent, &moved).unwrap();
+        let foreign_dir = scratch.join("foreign-dir");
+        fs::create_dir_all(&foreign_dir).unwrap();
+        fs::write(foreign_dir.join(&leaf), b"foreign\n").unwrap();
+        symlink(&foreign_dir, &held_parent).unwrap();
+        assert!(
+            marker.observed().unwrap(),
+            "the held directory still holds the marker"
+        );
+        marker.remove().unwrap();
+        assert_eq!(fs::read(foreign_dir.join(&leaf)).unwrap(), b"foreign\n");
+        assert!(fs::symlink_metadata(moved.join(&leaf)).is_err());
     }
 }

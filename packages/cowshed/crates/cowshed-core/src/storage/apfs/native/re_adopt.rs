@@ -22,6 +22,7 @@ use crate::storage::recovery::{
 };
 use cowshed_apfs::image::ImageCapacity;
 use cowshed_apfs::{ApfsBackend, CommandRunner, DetachIntent, MountAccess, RetainedInput};
+use cowshed_apfs::{ApfsBackend, CommandRunner, DetachIntent, MountAccess, RetainedInput};
 
 /// The files beside a workspace image: its grants sidecar and its CA companion.
 const MAIN_COMPANION_SUFFIXES: [&str; 2] =
