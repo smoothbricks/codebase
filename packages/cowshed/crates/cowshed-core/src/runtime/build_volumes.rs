@@ -1061,8 +1061,10 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
             let Landing { id, hold } = landing;
             let mount = host.mount_build_volume(layout, &id).map_err(storage)?;
             let state = BuildVolumeState::read(&mount)?;
-            if let Err(busy) = nx::close(&mount, &state)
-                .map_err(|error| io("close the landing volume's Nx state", &mount, &error))?
+            // Read-only: the landing's daemon was stopped by the land's ledger-proven plan before this
+            // point; quiesce never rereads a record to signal anything.
+            if let Err(busy) = nx::held(&mount, &state)
+                .map_err(|error| io("look at the landing volume's Nx state", &mount, &error))?
             {
                 return Ok(Err(skip(busy, Side::Landing)));
             }

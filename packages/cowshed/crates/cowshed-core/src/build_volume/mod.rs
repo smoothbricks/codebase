@@ -268,13 +268,29 @@ impl BuildVolumeState {
 
     /// Every Nx directory `.nx/<name>` the volume holds, relative to its root.
     fn nx_named(&self, name: &'static str) -> impl Iterator<Item = &Path> {
-        self.paths
-            .iter()
-            .filter(move |state| {
-                BuildStateTool::of(state) == BuildStateTool::Nx
-                    && state.checkout.as_path().file_name() == Some(std::ffi::OsStr::new(name))
-            })
-            .map(|state| state.volume.as_path())
+        self.nx_states(name).map(|state| state.volume.as_path())
+    }
+
+    /// The Nx states `.nx/<name>` the volume holds, by the one predicate every Nx view shares.
+    fn nx_states(&self, name: &'static str) -> impl Iterator<Item = &BuildStatePath> {
+        self.paths.iter().filter(move |state| {
+            BuildStateTool::of(state) == BuildStateTool::Nx
+                && state.checkout.as_path().file_name() == Some(std::ffi::OsStr::new(name))
+        })
+    }
+
+    /// Every checkout-relative project root that holds an Nx `.nx/workspace-data` in the volume: the
+    /// directory above the project's `.nx`, where Nx reads its `nx.json`. The empty path is the
+    /// checkout root itself.
+    pub fn nx_project_roots(&self) -> impl Iterator<Item = &Path> {
+        self.nx_states("workspace-data").map(|state| {
+            state
+                .checkout
+                .as_path()
+                .parent()
+                .and_then(Path::parent)
+                .expect("BuildStateTool::of classifies only <project>/.nx/<name> as Nx, so the project root exists")
+        })
     }
 
     /// Every Cargo target directory the volume holds, relative to its root.

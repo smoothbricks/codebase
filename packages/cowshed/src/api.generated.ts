@@ -145,6 +145,10 @@ export type AdoptionSkip =
   | ({ readonly kind: 'landingDaemonStayed' } & {
       readonly daemon: DatabaseHolder;
     })
+  | ({ readonly kind: 'landingDaemonUnverifiable' } & {
+      readonly record: string;
+      readonly reason: string;
+    })
   | ({ readonly kind: 'landingBuilding' } & {
       readonly lock: string;
       readonly holders: ReadonlyArray<DatabaseHolder>;

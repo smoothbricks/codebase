@@ -827,6 +827,30 @@ fn reports() -> BTreeMap<&'static str, BTreeMap<&'static str, Value>> {
         },
         ..land_first.clone()
     };
+    let land_unverifiable = LandReport {
+        build_volume: cowshed_core::api::dto::LandBuildVolume {
+            seed: cowshed_core::api::dto::LandSeed::Unchanged,
+            adoption: cowshed_core::api::dto::Adoption::Skipped {
+                reason: cowshed_core::api::dto::AdoptionSkip::LandingDaemonUnverifiable {
+                    record: PathBuf::from(
+                        "/fixture/Dev/widget/.nx/workspace-data/d/server-process.json",
+                    ),
+                    reason: "the daemon record is unreadable; no signal was sent".to_owned(),
+                },
+            },
+        },
+        ..land_first.clone()
+    };
+    let reseed_busy = cowshed_core::api::dto::ReseedResult {
+        workspace: WorkspaceName::main(),
+        outcome: cowshed_core::api::dto::Reseed::Skipped {
+            behind_ms: Some(1200),
+            reason: cowshed_core::api::dto::ReseedSkip::VolumeBusy {
+                reason: "the source is held by pid 4848 (rust-analyzer); nothing was forced"
+                    .to_owned(),
+            },
+        },
+    };
     // One document per `RebaseCarrySkip` arm and per side: an arm absent here is one the
     // TypeScript union is not checked against.
     let rebase_carried = RebaseReport {
@@ -980,6 +1004,10 @@ fn reports() -> BTreeMap<&'static str, BTreeMap<&'static str, Value>> {
                 ("adoptionSkipped", document("land report", &LandReport::Landed(land_held))),
                 ("landingBuilding", document("land report", &LandReport::Landed(land_building))),
                 ("landingOpening", document("land report", &LandReport::Landed(landing_opening))),
+                (
+                    "landingDaemonUnverifiable",
+                    document("land report", &LandReport::Landed(land_unverifiable)),
+                ),
                 (
                     "adoptionSkippedOpening",
                     document("land report", &LandReport::Landed(land_opening)),

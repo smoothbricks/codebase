@@ -5267,6 +5267,221 @@ async fn real_apfs_rename_keeps_edits_written_after_clone_publication() {
     fixture.stop_gateway().await;
 }
 
+fn write_emit_project(checkout: &Path, node: &Path, guarded: bool) {
+    fs::create_dir_all(checkout.join("b")).unwrap();
+    fs::write(checkout.join("b/src.txt"), b"src\n").unwrap();
+    // The producer's outputs are generated, never source: ignored as `a/generated.txt` is.
+    fs::write(checkout.join("b/.gitignore"), "/gen.txt\n/uncached.txt\n").unwrap();
+    let node = node.display();
+    let guard = if guarded {
+        "require('fs').readFileSync('node_modules/runtime-ok');"
+    } else {
+        ""
+    };
+    fs::write(
+        checkout.join("b/project.json"),
+        format!(
+            r#"{{"name":"b","targets":{{
+  "emit":{{"executor":"nx:run-commands","cache":true,"inputs":["{{projectRoot}}/src.txt"],"outputs":["{{projectRoot}}/gen.txt"],
+    "options":{{"command":"{node} -e \"{guard}require('fs').writeFileSync('b/gen.txt','emit\\n')\""}}}},
+  "uncached":{{"executor":"nx:run-commands","cache":false,"inputs":["{{projectRoot}}/src.txt"],"outputs":["{{projectRoot}}/uncached.txt"],
+    "options":{{"command":"{node} -e \"require('fs').writeFileSync('b/uncached.txt','uncached\\n')\""}}}},
+  "empty":{{"executor":"nx:run-commands","cache":true,"inputs":["{{projectRoot}}/src.txt"],"outputs":[],
+    "options":{{"command":"{node} -e \"0\""}}}}}}}}"#
+        ),
+    )
+    .unwrap();
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LandDaemonRecord {
+    process_id: i32,
+}
+
+/// Land 4 (16_build_volumes.md): a landing daemon the job ledger does not prove the job's own is
+/// never signalled. A daemon started detached from the job, as stock Nx does, skips adoption as
+/// `LandingDaemonStayed` and is still running after the land.
+#[tokio::test]
+async fn real_apfs_land_leaves_a_stock_detached_landing_daemon_running_and_skips_adoption() {
+    let (nx, node) = repository_nx();
+    let mut fixture = Fixture::with(Project::Build {
+        nx: Some((&nx, &node)),
+        rust: None,
+    });
+    write_emit_project(&fixture.checkout, &node, false);
+    git(&fixture.checkout, &["add", "b"]);
+    git(
+        &fixture.checkout,
+        &["commit", "-q", "-m", "add emit producer"],
+    );
+    let mut service = serve_project(&mut fixture, &nx_read_paths(&nx)).await;
+    let topic = new_workspace(&mut service, "outputs").await;
+    fs::write(topic.join("a/src.txt"), "changed\n").unwrap();
+    git(&topic, &["commit", "-q", "-am", "change output input"]);
+    sh(&mut service, "outputs", &nx_run_many(&node)).await;
+    sh(
+        &mut service,
+        "outputs",
+        "node_modules/.bin/nx daemon --start",
+    )
+    .await;
+    let record = topic.join(".nx/workspace-data/d/server-process.json");
+    eventually("the topic's Nx daemon publishes its record", || {
+        record.is_file()
+    })
+    .await;
+    let daemon_pid = serde_json::from_slice::<LandDaemonRecord>(&fs::read(&record).unwrap())
+        .expect("the daemon's own record")
+        .process_id;
+
+    let report = land(&mut service, "outputs", true, &[]).await;
+    match &report.build_volume.adoption {
+        Adoption::Skipped {
+            reason: AdoptionSkip::LandingDaemonStayed { daemon },
+        } => assert_eq!(daemon.pid, daemon_pid, "{report:?}"),
+        other => panic!("an unproven landing daemon skips adoption: {other:?}"),
+    }
+    assert!(!report.build_volume.seeded, "{report:?}");
+    let daemon = cowshed_core::runtime::job_groups::Process::observe(daemon_pid)
+        .expect("observe the daemon after land");
+    assert!(daemon.is_some(), "the unproven daemon was never signalled");
+
+    // Cleanup of the daemon this test started: a labelled host-context stop, after the assertions.
+    let daemon = daemon.expect("the daemon still runs");
+    let exit = daemon.watch_exit().expect("watch the daemon's exit");
+    // SAFETY: `daemon_pid` is the process this test started and observed through its own record.
+    assert_eq!(unsafe { libc::kill(daemon_pid, libc::SIGTERM) }, 0);
+    assert!(
+        exit.within(std::time::Duration::from_secs(10))
+            .expect("exit watch")
+    );
+    drop(service);
+    fixture.stop_gateway().await;
+}
+
+/// Land 4 authority: a record that names a live process the job ledger does not prove the job's own
+/// is a nomination only. The foreign process is left alive and adoption is skipped by name.
+#[tokio::test]
+async fn real_apfs_land_never_signals_a_foreign_process_a_daemon_record_names() {
+    let (nx, node) = repository_nx();
+    let mut fixture = Fixture::with(Project::Build {
+        nx: Some((&nx, &node)),
+        rust: None,
+    });
+    write_emit_project(&fixture.checkout, &node, false);
+    git(&fixture.checkout, &["add", "b"]);
+    git(
+        &fixture.checkout,
+        &["commit", "-q", "-m", "add emit producer"],
+    );
+    let mut service = serve_project(&mut fixture, &nx_read_paths(&nx)).await;
+    let topic = new_workspace(&mut service, "outputs").await;
+    fs::write(topic.join("a/src.txt"), "changed\n").unwrap();
+    git(&topic, &["commit", "-q", "-am", "change output input"]);
+    sh(&mut service, "outputs", &nx_run_many(&node)).await;
+    // A process no job started, under sandbox-exec with signals to other pids denied. The ledger
+    // names no group for it, so the forged record is an unproven nominee.
+    let mut foreign = Command::new("/usr/bin/sandbox-exec")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .args([
+            "-p",
+            "(version 1)(allow default)(deny signal (target others))",
+            "/bin/sh",
+            "-c",
+            "echo READY; read _",
+        ])
+        .spawn()
+        .expect("sandboxed foreign sleeper");
+    use std::io::BufRead as _;
+    let mut ready = String::new();
+    std::io::BufReader::new(foreign.stdout.take().expect("foreign stdout"))
+        .read_line(&mut ready)
+        .expect("settled sandboxed foreign nominee");
+    assert_eq!(ready.trim(), "READY");
+    let foreign_pid = i32::try_from(foreign.id()).expect("pid");
+    let record = topic.join(".nx/workspace-data/d/server-process.json");
+    fs::create_dir_all(record.parent().expect("record directory")).unwrap();
+    fs::write(
+        &record,
+        serde_json::json!({
+            "processId": foreign_pid,
+            "socketPath": topic.join(".nx/workspace-data/d/foreign.sock"),
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let report = land(&mut service, "outputs", true, &[]).await;
+    match &report.build_volume.adoption {
+        Adoption::Skipped {
+            reason: AdoptionSkip::LandingDaemonStayed { daemon },
+        } => assert_eq!(daemon.pid, foreign_pid, "{report:?}"),
+        other => panic!("a forged nominee skips adoption: {other:?}"),
+    }
+    assert!(
+        cowshed_core::runtime::job_groups::Process::observe(foreign_pid)
+            .expect("observe the foreign process")
+            .is_some(),
+        "the foreign process was never signalled"
+    );
+    foreign.kill().expect("stop the test's own foreign sleeper");
+    foreign.wait().expect("reap the sleeper");
+    drop(service);
+    fixture.stop_gateway().await;
+}
+
+/// An unreadable or malformed landing daemon record cannot authorize retirement or adoption.
+#[tokio::test]
+async fn real_apfs_land_skips_an_unverifiable_daemon_record_before_quiesce() {
+    let (nx, node) = repository_nx();
+    for unreadable in [false, true] {
+        let mut fixture = Fixture::with(Project::Build {
+            nx: Some((&nx, &node)),
+            rust: None,
+        });
+        write_emit_project(&fixture.checkout, &node, false);
+        git(&fixture.checkout, &["add", "b"]);
+        git(
+            &fixture.checkout,
+            &["commit", "-q", "-m", "add emit producer"],
+        );
+        let mut service = serve_project(&mut fixture, &nx_read_paths(&nx)).await;
+        let topic = new_workspace(&mut service, "outputs").await;
+        fs::write(topic.join("a/src.txt"), "changed\n").unwrap();
+        git(&topic, &["commit", "-q", "-am", "change output input"]);
+        sh(&mut service, "outputs", &nx_run_many(&node)).await;
+        let record = topic.join(".nx/workspace-data/d/server-process.json");
+        fs::create_dir_all(record.parent().unwrap()).unwrap();
+        if record.exists() {
+            fs::remove_file(&record).unwrap();
+        }
+        if unreadable {
+            fs::create_dir(&record).unwrap();
+        } else {
+            fs::write(&record, b"{not a daemon record").unwrap();
+        }
+        let report = land(&mut service, "outputs", true, &[]).await;
+        match &report.build_volume.adoption {
+            Adoption::Skipped {
+                reason:
+                    AdoptionSkip::LandingDaemonUnverifiable {
+                        record: skipped_record,
+                        reason,
+                    },
+            } => {
+                assert_eq!(skipped_record, &record);
+                assert!(!reason.is_empty());
+            }
+            other => panic!("an unverifiable daemon record skips adoption: {other:?}"),
+        }
+        assert!(!report.build_volume.seeded, "{report:?}");
+        drop(service);
+        fixture.stop_gateway().await;
+    }
+}
+
 #[tokio::test]
 async fn real_apfs_managed_install_restores_developer_links_before_nx_and_cleans_absolute_bypass() {
     cowshed_core::runtime::shell_host::register(

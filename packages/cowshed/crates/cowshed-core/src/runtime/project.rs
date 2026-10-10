@@ -3036,6 +3036,14 @@ fn verified_recovery_facts<'a>(
         .collect()
 }
 
+/// The two heads a land's build-volume steps are keyed on: the target's head before the land, and
+/// the head it landed. `previous_head` is absent for a first land.
+#[cfg(target_os = "macos")]
+struct LandOutputRange<'a> {
+    previous_head: Option<&'a GitOid>,
+    landed_head: &'a GitOid,
+}
+
 #[cfg(target_os = "macos")]
 impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
     #[allow(
@@ -4452,6 +4460,10 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         retire: bool,
         carry_stopped: Option<String>,
     ) -> Result<crate::api::dto::LandBuildVolume> {
+        let LandOutputRange {
+            previous_head,
+            landed_head,
+        } = heads;
         use crate::api::dto::{Adoption, AdoptionSkip, LandBuildVolume, LandSeed};
         let volumes = self.build_volumes()?;
         let skipped = |reason| LandBuildVolume {
@@ -4464,12 +4476,97 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         if volumes.layout.linked(&into.mount)?.is_none() {
             return Ok(skipped(AdoptionSkip::NoTargetVolume));
         }
-        // Step 4: the supervisor stops every job of the landing workspace; the volume's own
-        // daemon and database holders are then the build volume module's to settle. The land
-        // holds the volume from before the jobs let go of it until the target's link and record
-        // name it, so no collection takes it between, whatever links that collection read.
+        // Step 4, controller-owned (16_build_volumes.md, Land 4). Each landing Nx daemon's plan is
+        // read from the trusted ledger before the supervisor retires: the record only nominates a
+        // pid, and only a ledger-proven process of the job is ever signalled. The sandbox is taken
+        // here too, for the socket-cleanup job that follows the signal.
+        let current = self.current(workspace).await?;
+        let grants = effective_workspace_grants(&self.layout, &current.metadata.grants)?;
+        let main_mount = self.workspace_mount_path(&main_name())?;
+        let sandbox = supervisor_sandbox(
+            &self.home,
+            &self.layout,
+            &self.telemetry_root,
+            &current,
+            &grants,
+            landing.to_owned(),
+            main_mount,
+            volumes.layout.grant(workspace, landing)?,
+        )?;
+        let ledger =
+            crate::runtime::job_groups::ledger_path(&super::supervisor_socket::socket_path(
+                self.descriptor.storage.store(),
+                &self.descriptor.repo_id,
+                workspace,
+            ));
+        let state = crate::build_volume::BuildVolumeState::read(
+            &landing.join(crate::build_volume::BUILD_LINK),
+        )?;
+        let mut daemons = Vec::new();
+        for root in state.nx_project_roots() {
+            let root = landing.join(root);
+            let record = crate::capabilities::nx::daemon_record(&root);
+            match crate::runtime::nx_daemon::prepare_daemon_stop(&record, &ledger) {
+                Ok(plan) => daemons.push((root, plan)),
+                Err(reason) => return Ok(skipped(reason)),
+            }
+        }
         let stopped = self.stop_supervisor_for_removal(workspace, true).await?;
         require_lost_groups_released(workspace, &stopped, "quiesce").await?;
+        for (root, plan) in daemons {
+            match plan {
+                crate::runtime::nx_daemon::DaemonStopPlan::NotRunning => {}
+                crate::runtime::nx_daemon::DaemonStopPlan::Unproven { pid, reason } => {
+                    eprintln!(
+                        "cowshed: the landing workspace's Nx daemon {pid} was left running: {reason}"
+                    );
+                    return Ok(skipped(AdoptionSkip::LandingDaemonStayed {
+                        daemon: crate::api::dto::DatabaseHolder {
+                            pid,
+                            command: "an Nx daemon not proven to be the job's own".to_owned(),
+                        },
+                    }));
+                }
+                crate::runtime::nx_daemon::DaemonStopPlan::Owned { process, exit } => {
+                    let outcome =
+                        crate::runtime::nx_daemon::stop_owned_daemon(process, exit, || {
+                            timed_async(
+                                "land",
+                                "stop-landing-nx",
+                                super::supervisor::run_as_job(
+                                    &sandbox,
+                                    &root,
+                                    vec![
+                                        root.join("node_modules/.bin/nx").into_os_string(),
+                                        "daemon".into(),
+                                        "--stop".into(),
+                                    ],
+                                ),
+                            )
+                        })
+                        .await?;
+                    for diagnostic in &outcome.diagnostics {
+                        eprintln!("cowshed: the landing workspace's Nx daemon: {diagnostic}");
+                    }
+                    if !outcome.stderr.is_empty() {
+                        eprint!("{}", String::from_utf8_lossy(&outcome.stderr));
+                    }
+                    if !outcome.exited {
+                        return Ok(skipped(AdoptionSkip::LandingDaemonStayed {
+                            daemon: crate::api::dto::DatabaseHolder {
+                                pid: outcome.pid,
+                                command: if outcome.signalled {
+                                    "an Nx daemon that outlived SIGTERM"
+                                } else {
+                                    "an Nx daemon still running without a delivered SIGTERM"
+                                }
+                                .to_owned(),
+                            },
+                        }));
+                    }
+                }
+            }
+        }
         let quiet = match timed_async(
             "land",
             "quiesce",

@@ -210,6 +210,13 @@ policy its children run under: a containment check that joins it (an embedder's 
 embedder's own sockets is one) sees any socket, deny or grant cowshed admits later, where a hand-built copy would pass
 unseen.
 
+For the landing workspace's Nx daemons in Land step 4, lifecycle signal authority stays with the controller. A daemon
+record is a nomination only: the controller signals a process only when the supervisor's job group ledger proves that
+process is a job's own, captured before the supervisor retires. The sandbox grants a job no signal right over another
+process, so this authority is the controller's alone (16_build_volumes.md, Land 4). The existing record-nominated target
+daemon stops in Land steps 5 and 6, migration, reseeding and idle-keeper cleanup remain outside this ledger-only
+cutover; their ownership hardening is open, not a guarantee of this step.
+
 The revision-bound profile above is the **supervisor profile**. It grants the trusted supervisor write access to
 `<workspace mount>/.cowshed/job/**` so the supervisor can allocate job IDs, capture streams, and write protected job
 records and lazy spill files. That authority must never reach repository-controlled code. Before any anonymous shell,

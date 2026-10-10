@@ -20,7 +20,7 @@ const DAEMON_RECORD: &str = "server-process.json";
 /// every `run`/`run-many` (pinned Nx 23.2.1, `tasks-runner/life-cycles/store-run-information-life-cycle.js`).
 pub const RUN_SUMMARY: &str = "run.json";
 /// How long a stopped daemon gets to exit after `SIGTERM`, as `nx daemon --stop` sends it.
-const DAEMON_EXIT_GRACE: Duration = Duration::from_secs(10);
+pub(crate) const DAEMON_EXIT_GRACE: Duration = Duration::from_secs(10);
 
 use cowshed_os::process::Holder;
 
@@ -2148,5 +2148,60 @@ mod tests {
             "daemon {daemon} or another process outlived the test"
         );
         assert!(!path.exists(), "{} was removed", path.display());
+    }
+    /// `held` answers from the task databases' open locks alone. A daemon record rewritten after a
+    /// snapshot to name a foreign live process changes nothing it answers, signals nothing, and
+    /// leaves that process running.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn held_reads_task_databases_only_and_a_rewritten_daemon_record_signals_nothing() {
+        let scratch = crate::temp_root::TempRoot::new("nx-held-record");
+        let data = scratch.join("nx/workspace-data");
+        fs::create_dir_all(data.join(DAEMON_DIRECTORY)).unwrap();
+        fs::write(data.join("T-v3.db"), b"").unwrap();
+        let state = BuildVolumeState {
+            paths: vec![BuildStatePath::new(".nx/workspace-data", "nx/workspace-data").unwrap()],
+            fingerprint: None,
+        };
+        let mut foreign = std::process::Command::new("/bin/sleep")
+            .arg("300")
+            .spawn_locked()
+            .unwrap();
+        let record = data.join(DAEMON_DIRECTORY).join(DAEMON_RECORD);
+        fs::write(
+            &record,
+            b"{\"processId\":0,\"socketPath\":\"/nonexistent.sock\"}",
+        )
+        .unwrap();
+        assert!(
+            held(&scratch, &state).unwrap().is_ok(),
+            "no database is held"
+        );
+        let socket = scratch.join("live.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        fs::write(
+            &record,
+            serde_json::json!({
+                "processId": foreign.id(),
+                "socketPath": socket,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(
+            held(&scratch, &state).unwrap().is_ok(),
+            "the record is not read"
+        );
+        assert!(
+            std::os::unix::net::UnixStream::connect(&socket).is_ok(),
+            "held neither closes nor disturbs the live socket"
+        );
+        assert!(
+            foreign.try_wait().unwrap().is_none(),
+            "the foreign process is untouched"
+        );
+        drop(listener);
+        foreign.kill().unwrap();
+        foreign.wait().unwrap();
     }
 }

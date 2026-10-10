@@ -3601,6 +3601,8 @@ enum TerminalCleanupFailure {
     Links(CowshedError),
     /// Removing the install observation marker failed (its own cleanup, after the restore).
     InstallObservation(CowshedError),
+    /// The blocking cleanup task failed before either filesystem outcome could be known.
+    Task(CowshedError),
     /// Both failed; the restore's error and the marker's are kept, in that order.
     Both {
         links: CowshedError,
@@ -3616,6 +3618,7 @@ impl TerminalCleanupFailure {
             Self::InstallObservation(error) => {
                 format!("install observation cleanup failed: {error}")
             }
+            Self::Task(error) => format!("terminal cleanup task failed: {error}"),
             Self::Both { links, observation } => format!(
                 "developer-link restoration failed: {links}; install observation cleanup failed: {observation}"
             ),
@@ -3628,6 +3631,7 @@ impl TerminalCleanupFailure {
         match self {
             Self::Links(error) => relabel(error, "developer-link restoration failed"),
             Self::InstallObservation(error) => relabel(error, "install observation cleanup failed"),
+            Self::Task(error) => relabel(error, "terminal cleanup task failed"),
             Self::Both { links, observation } => CowshedError::new(
                 links.code,
                 format!(
@@ -3654,6 +3658,17 @@ fn relabel(error: CowshedError, label: &str) -> CowshedError {
 struct JobFinish {
     findings: Vec<String>,
     failure: Option<TerminalCleanupFailure>,
+}
+
+impl JobFinish {
+    fn task_failed(error: tokio::task::JoinError) -> Self {
+        Self {
+            findings: Vec::new(),
+            failure: Some(TerminalCleanupFailure::Task(CowshedError::internal(
+                format!("terminal cleanup task did not finish: {error}"),
+            ))),
+        }
+    }
 }
 
 /// Terminal restoration of one job's developer links. The wrapper's marker decides the mode.
@@ -6216,12 +6231,7 @@ impl SupervisorActor {
                 finish_terminal_restore(&root, links, observation)
             })
             .await
-            .unwrap_or_else(|error| JobFinish {
-                findings: Vec::new(),
-                failure: Some(TerminalCleanupFailure::Links(CowshedError::internal(
-                    format!("terminal cleanup panicked: {error}"),
-                ))),
-            });
+            .unwrap_or_else(JobFinish::task_failed);
             for finding in finish.findings {
                 self.process_output(
                     job_id,
@@ -9551,6 +9561,23 @@ mod install_observation_tests {
             "{}",
             error.message
         );
+    }
+
+    #[tokio::test]
+    async fn a_cleanup_task_failure_does_not_claim_a_filesystem_failure() {
+        let finish = tokio::task::spawn_blocking(|| -> JobFinish {
+            panic!("cleanup task panic oracle");
+        })
+        .await
+        .unwrap_or_else(JobFinish::task_failed);
+        let failure = finish.failure.expect("the task failure is recorded");
+        assert!(matches!(failure, TerminalCleanupFailure::Task(_)));
+        let label = failure.label();
+        assert!(label.starts_with("terminal cleanup task failed: "));
+        assert!(!label.contains("developer-link restoration"));
+        assert!(!label.contains("install observation cleanup"));
+        let error = failure.into_error();
+        assert!(error.message.starts_with("terminal cleanup task failed: "));
     }
 
     /// Both causes at once keep both errors: the label names each, and the one error carries both.

@@ -867,6 +867,21 @@ impl Process {
         })
     }
 
+    /// The process `pid` names now, held by the identity its kernel record carries; `None` once it
+    /// has exited, reaped or not. A pid below one names no process, so it is refused, not read.
+    pub fn observe(pid: i32) -> io::Result<Option<Self>> {
+        if pid < 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("pid {pid} names no process"),
+            ));
+        }
+        Ok(running_info(pid)?.map(|info| Self {
+            pid,
+            version: u32::from_ne_bytes(info.unique.id_version.to_ne_bytes()),
+        }))
+    }
+
     pub fn pid(&self) -> i32 {
         self.pid
     }
@@ -1008,6 +1023,48 @@ impl Process {
             Some(_) | None => Ok(None),
         }
     }
+}
+
+/// A process the trusted ledger proves is a job's own: a member of a recorded group whose
+/// ownership held throughout ([`ownership`]). Only [`owned_process`] makes one, so a caller holding
+/// it has the proof and no other process can enter the privileged signal path through it.
+#[cfg(target_os = "macos")]
+pub(crate) struct OwnedGroupProcess(Process);
+
+#[cfg(target_os = "macos")]
+impl OwnedGroupProcess {
+    pub(crate) fn pid(&self) -> i32 {
+        self.0.pid()
+    }
+
+    /// Watch this process's exit from now. Registered before any signal is sent.
+    pub(crate) fn watch_exit(&self) -> io::Result<ExitWatch> {
+        self.0.watch_exit()
+    }
+
+    /// `SIGTERM` the exact identity the ledger proved: `Ok(false)` when it no longer runs.
+    pub(crate) fn terminate(&self) -> io::Result<bool> {
+        self.0.signal(libc::SIGTERM)
+    }
+}
+
+/// The job's own process `pid`, as the ledger at `path` proves it. The pid must be a member of a
+/// recorded group whose [`ownership`] proof holds, so a group whose leader is gone or belongs to
+/// another process, and every unresolved group, name nothing. A ledger that is absent names no
+/// job; one that cannot be read is an error, never an empty answer.
+#[cfg(target_os = "macos")]
+pub(crate) fn owned_process(path: &Path, pid: i32) -> io::Result<Option<OwnedGroupProcess>> {
+    let Some(ledger) = read(path)? else {
+        return Ok(None);
+    };
+    for group in &ledger.groups {
+        if let Ownership::Owned(members) = ownership(group)?
+            && let Some(member) = members.into_iter().find(|member| member.pid() == pid)
+        {
+            return Ok(Some(OwnedGroupProcess(member)));
+        }
+    }
+    Ok(None)
 }
 
 /// A process's exit, watched from a moment it ran (`Process::watch_exit`). The kernel reports
