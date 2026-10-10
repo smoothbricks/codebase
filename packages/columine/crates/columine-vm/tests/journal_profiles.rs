@@ -1020,3 +1020,35 @@ fn a_capture_over_budget_is_journal_overflow_even_without_memory() {
     assert_eq!(Some(ErrorCode::JournalOverflow), vm.undo_refusal());
     assert_eq!(before, state);
 }
+
+/// The first paired write of a window whose budget undo-only writes spent is
+/// over budget: it answers `JournalOverflow` before the redo lane asks for
+/// storage, even with no memory. A window that refused keeps its first code:
+/// a later paired write at no memory still answers `JournalOverflow`.
+#[test]
+fn a_paired_write_over_budget_is_journal_overflow_and_keeps_that_code() {
+    let prog = map_program(16);
+    let mut state = init(&prog);
+    let mut vm = Vm::default();
+    vm.undo_enable(&state).expect("undo window opens");
+    let last = image_len(&state) - 1;
+    for _ in 0..UNDO_CAPACITY {
+        vm.capture_mutation(false, &mut state, &[(last, 1)], |image| {
+            image[last as usize] ^= 1;
+        })
+        .expect("within the record budget");
+    }
+    let before = state.clone();
+    let paired = |vm: &mut Vm, state: &mut Vec<u8>| {
+        without_memory(|| {
+            vm.capture_mutation(true, state, &[(last, 1)], |image| {
+                image[last as usize] ^= 1;
+            })
+        })
+    };
+    assert_eq!(Err(ErrorCode::JournalOverflow), paired(&mut vm, &mut state));
+    assert_eq!(Some(ErrorCode::JournalOverflow), vm.undo_refusal());
+    assert_eq!(Err(ErrorCode::JournalOverflow), paired(&mut vm, &mut state));
+    assert_eq!(Some(ErrorCode::JournalOverflow), vm.undo_refusal());
+    assert_eq!(before, state);
+}

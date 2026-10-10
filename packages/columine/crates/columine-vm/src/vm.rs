@@ -612,10 +612,10 @@ impl UndoState {
         self.delta_count
     }
 
-    /// Refuse every later write in the window with `code`, and answer it now.
+    /// Refuse every later write in the window, and answer it now. The first
+    /// refusal is the window's: a later one never replaces its code.
     fn refuse(&mut self, code: ErrorCode) -> Result<(), ErrorCode> {
-        self.refused = Some(code);
-        Err(code)
+        Err(*self.refused.get_or_insert(code))
     }
 
     /// Refuse `count` more records past the record budget, before any storage
@@ -657,11 +657,14 @@ impl UndoState {
 
     /// Admit scenario storage before its first writer, and before any entry
     /// reservation that must cover it. Pure production windows allocate and
-    /// write no redo buffer.
+    /// write no redo buffer. A refused window answers its own refusal, and a
+    /// window with no record of budget left answers `JournalOverflow`, before
+    /// any redo storage is asked for: every recording write needs a record.
     fn prepare_redo(&mut self, delta_mode: bool) -> Result<(), ErrorCode> {
         if !self.enabled || !delta_mode || self.redo_active {
             return Ok(());
         }
+        self.within_budget(1)?;
         debug_assert!(self.redo.is_empty());
         let total = self.entries.len() + self.reserved_entries as usize;
         if self.redo.try_reserve(total).is_err() {
