@@ -7,9 +7,6 @@
       "nx-daemon-idle-proof-compile": {
         "executor": "nx:run-commands",
         "cache": true,
-        "dependsOn": [
-          "@smoothbricks/codebase:patched-nx-bindings"
-        ],
         "inputs": [
           "default",
           "^production",

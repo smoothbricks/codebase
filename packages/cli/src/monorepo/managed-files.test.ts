@@ -3,11 +3,13 @@ import { describe, expect, it } from 'bun:test';
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { managedNxPatch } from '@smoothbricks/nx-plugin/managed-files/files';
 import { renderPublishWorkflowYaml } from '@smoothbricks/nx-plugin/managed-files/publish-workflow';
 import { LINUX_PLATFORM_TARGET_GLOBS, PLATFORM_TARGET_GLOBS } from '@smoothbricks/nx-plugin/workspace-config-policy';
 import { type NxProjects, targetNamesFromProjects } from '../nx/index.js';
 import {
   anyProjectHasTagForTest,
+  applyManagedFilesForContext,
   crossTestArchivesForTest,
   DEVENV_MODULE_IMPORT,
   deployTargetInfoFromProjects,
@@ -194,6 +196,41 @@ describe('nx graph project helpers', () => {
 });
 
 describe('managed raw files', () => {
+  it('distributes the exact Nx patch and repairs consumer drift through the managed writer', async () => {
+    expect(managedFileTargetsForTest).toContainEqual({ target: managedNxPatch.path });
+    const [authoritative, packaged] = await Promise.all([
+      readFile(join(REPO_ROOT, managedNxPatch.path), 'utf8'),
+      readFile(join(REPO_ROOT, 'packages/nx-plugin/managed/raw', managedNxPatch.path), 'utf8'),
+    ]);
+    expect(packaged).toBe(authoritative);
+    const root = await mkdtemp(join(tmpdir(), 'smoo-managed-nx-patch-'));
+    try {
+      const shape = context({ hasReleasePackages: false });
+      await applyManagedFilesForContext(root, 'update', shape);
+      const destination = join(root, managedNxPatch.path);
+      expect(await readFile(destination, 'utf8')).toBe(authoritative);
+      await writeFile(destination, `${authoritative}\nconsumer drift\n`);
+      const checked = await applyManagedFilesForContext(root, 'check', shape);
+      expect(checked).toContainEqual(
+        expect.objectContaining({
+          target: managedNxPatch.path,
+          action: 'drifted',
+        }),
+      );
+      await applyManagedFilesForContext(root, 'update', shape);
+      expect(await readFile(destination, 'utf8')).toBe(authoritative);
+      const unchanged = await applyManagedFilesForContext(root, 'check', shape);
+      expect(unchanged).toContainEqual(
+        expect.objectContaining({
+          target: managedNxPatch.path,
+          action: 'unchanged',
+        }),
+      );
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it('manages the devenv wrapper as an executable byte-exact copy', async () => {
     expect(managedFileTargetsForTest).toContainEqual({ target: 'tooling/devenv', executable: true });
 

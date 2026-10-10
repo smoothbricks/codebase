@@ -947,15 +947,14 @@ async fn real_apfs_rm_stops_the_checkouts_nx_daemon_before_its_unmount() {
     fixture.stop_gateway().await;
 }
 
-/// The declared patched-Nx product and its actual Node runtime, resolved from this test checkout:
-/// no installed ancestor implementation or compiled checkout path substitutes for the product.
+/// The checkout's ordinary Bun-installed patched Nx and its actual Node runtime.
 fn repository_nx() -> (PathBuf, PathBuf) {
     let manifest = std::env::var_os("CARGO_MANIFEST_DIR")
         .expect("cargo and nextest export CARGO_MANIFEST_DIR to the test process");
     let nx = PathBuf::from(manifest)
-        .join("../../../../.cache/patched-nx/node_modules/nx")
+        .join("../../../../node_modules/nx")
         .canonicalize()
-        .expect("the declared patched-nx producer ran before the sandbox consumer");
+        .expect("install the pinned Bun-patched Nx before the sandbox consumer");
     let node = std::env::var_os("PATH")
         .and_then(|path| {
             std::env::split_paths(&path)
@@ -969,145 +968,103 @@ fn repository_nx() -> (PathBuf, PathBuf) {
 }
 
 #[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct NxDependencyClosure {
-    version: u8,
-    package_name: String,
-    platform: String,
-    arch: String,
-    dependencies: Vec<NxPackageDependency>,
-}
-
-#[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct NxPackageDependency {
-    name: String,
-    version: String,
-    store_path: PathBuf,
-    binding_paths: Vec<PathBuf>,
-    direct: bool,
-}
-
-#[derive(serde::Deserialize)]
 struct InstalledPackageIdentity {
     name: String,
     version: String,
 }
 
-/// Exact immutable logical packages emitted by the declared Nx product, never a hoist or home grant.
+/// Read only the installed package-private namespaces reachable from Nx, not a hoist or home.
+/// Bun keeps patched packages in this checkout's `.bun` tree and shares eligible dependencies
+/// through its global store; neither layout requires a generated release closure.
 fn nx_read_paths(nx: &Path) -> Vec<PathBuf> {
-    let closure: NxDependencyClosure = serde_json::from_slice(
-        &fs::read(nx.join("dependency-closure.json"))
-            .expect("build the declared patched-nx product and its dependency closure"),
-    )
-    .expect("typed patched-Nx dependency closure");
-    assert_eq!(closure.version, 1);
-    assert_eq!(closure.package_name, "nx");
-    assert_eq!(closure.platform, "darwin");
-    let arch = match std::env::consts::ARCH {
-        "aarch64" => "arm64",
-        "x86_64" => "x64",
-        other => panic!("unsupported Node architecture for this macOS fixture: {other}"),
-    };
-    assert_eq!(closure.arch, arch);
-    let cache = std::env::var_os("BUN_INSTALL_CACHE_DIR")
+    let manifest = std::env::var_os("CARGO_MANIFEST_DIR").expect("the test manifest directory");
+    let local = PathBuf::from(manifest)
+        .join("../../../../node_modules/.bun")
+        .canonicalize()
+        .expect("the checkout's Bun install namespace");
+    let store = std::env::var_os("BUN_INSTALL_CACHE_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
             PathBuf::from(std::env::var_os("HOME").expect("host HOME")).join(".bun/install/cache")
         })
         .canonicalize()
-        .expect("the host's admitted immutable Bun install cache");
+        .expect("the host's Bun install cache");
+    let installed = |path: &Path| {
+        (path.starts_with(&local) && path != local) || (path.starts_with(&store) && path != store)
+    };
+    assert!(
+        installed(nx),
+        "Nx must be the checkout's pinned Bun install"
+    );
     let mut reads = std::collections::BTreeSet::from([nx.to_path_buf()]);
     let mut namespaces = std::collections::BTreeSet::new();
-    for dependency in closure.dependencies {
+    let mut binaries = Vec::new();
+    let mut pending = vec![nx.parent().expect("Nx package namespace").to_path_buf()];
+    while let Some(namespace) = pending.pop() {
         assert!(
-            dependency
-                .store_path
-                .components()
-                .all(|part| matches!(part, std::path::Component::Normal(_)))
+            installed(&namespace),
+            "dependency namespace leaves the Bun install"
         );
-        let selected = cache.join(&dependency.store_path);
-        let canonical = selected
-            .canonicalize()
-            .expect("an installed immutable dependency resolves");
-        assert_eq!(canonical, selected);
-        assert!(
-            canonical.starts_with(&cache) && canonical != cache,
-            "dependency {} is not an immutable installed Bun-store package: {}",
-            dependency.name,
-            canonical.display()
-        );
-        let installed: InstalledPackageIdentity = serde_json::from_slice(
-            &fs::read(canonical.join("package.json")).expect("installed package manifest"),
-        )
-        .expect("installed logical package identity");
-        assert_eq!(installed.name, dependency.name);
-        assert_eq!(installed.version, dependency.version);
-        if dependency.direct {
-            assert_eq!(
-                nx.join("node_modules")
-                    .join(&dependency.name)
-                    .canonicalize()
-                    .expect("the existing activation owner bound this direct dependency"),
-                canonical
-            );
+        if !namespaces.insert(namespace.clone()) {
+            continue;
         }
-        for relative in dependency.binding_paths {
-            assert!(
-                relative
-                    .components()
-                    .all(|part| matches!(part, std::path::Component::Normal(_)))
-            );
-            let binding = cache.join(relative);
-            assert_eq!(
-                binding
-                    .canonicalize()
-                    .expect("logical dependency link resolves"),
-                canonical,
-                "read admission cannot redirect a logical package binding"
-            );
-            assert!(binding.ends_with(Path::new(&dependency.name)));
-            let mut namespace = binding;
-            for _ in Path::new(&dependency.name).components() {
-                assert!(namespace.pop());
-            }
-            assert_eq!(
-                namespace.file_name(),
-                Some(std::ffi::OsStr::new("node_modules"))
-            );
-            namespaces.insert(
-                namespace
-                    .canonicalize()
-                    .expect("the immutable package's dependency namespace resolves"),
-            );
-        }
-        reads.insert(canonical);
-    }
-    for namespace in namespaces {
-        assert!(namespace.starts_with(&cache) && namespace != cache);
-        let mut groups = vec![namespace.clone()];
+        let mut groups = vec![namespace];
         while let Some(group) = groups.pop() {
-            for entry in fs::read_dir(group).expect("installed dependency namespace") {
+            for entry in fs::read_dir(&group).expect("installed dependency namespace") {
                 let entry = entry.expect("dependency namespace entry");
                 let target = entry
                     .path()
                     .canonicalize()
                     .expect("installed namespace entry resolves");
+                if group.file_name() == Some(std::ffi::OsStr::new(".bin")) {
+                    binaries.push(target);
+                    continue;
+                }
                 if reads.iter().any(|package| target.starts_with(package)) {
                     continue;
                 }
                 let name = entry.file_name();
-                let grouping = name.to_string_lossy().starts_with('@') || name == ".bin";
+                if (name.to_string_lossy().starts_with('@') || name == ".bin")
+                    && entry.file_type().expect("namespace entry kind").is_dir()
+                {
+                    groups.push(entry.path());
+                    continue;
+                }
                 assert!(
-                    grouping && entry.file_type().expect("namespace entry kind").is_dir(),
-                    "dependency namespace contains an undeclared payload: {}",
-                    entry.path().display()
+                    installed(&target),
+                    "dependency {} leaves the Bun install: {}",
+                    entry.path().display(),
+                    target.display()
                 );
-                groups.push(entry.path());
+                let identity: InstalledPackageIdentity = serde_json::from_slice(
+                    &fs::read(target.join("package.json")).expect("installed package manifest"),
+                )
+                .expect("installed logical package identity");
+                assert!(
+                    entry.path().ends_with(Path::new(&identity.name))
+                        && !identity.version.is_empty(),
+                    "dependency binding does not match its installed package identity"
+                );
+                reads.insert(target.clone());
+                let mut dependency_namespace = target;
+                for _ in Path::new(&identity.name).components() {
+                    assert!(dependency_namespace.pop());
+                }
+                assert_eq!(
+                    dependency_namespace.file_name(),
+                    Some(std::ffi::OsStr::new("node_modules"))
+                );
+                pending.push(dependency_namespace);
             }
         }
-        reads.insert(namespace);
     }
+    assert!(
+        binaries
+            .iter()
+            .all(|binary| reads.iter().any(|package| binary.starts_with(package))),
+        "an installed binary binding leaves the package closure"
+    );
+    reads.extend(namespaces);
     reads.into_iter().collect()
 }
 

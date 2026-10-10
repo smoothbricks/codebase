@@ -1,5 +1,5 @@
 diff --git a/dist/bin/nx.js b/dist/bin/nx.js
-index 5a59f76..7a3a0ca 100755
+index 5a59f762f2002f61f84d0966c8fb48d48b3bdce2..7a3a0cafad1b1f8e356206505e5a526b97e0e404 100755
 --- a/dist/bin/nx.js
 +++ b/dist/bin/nx.js
 @@ -12,6 +12,7 @@ if (process.env.FORCE_COLOR === '0') {
@@ -80,7 +80,7 @@ index 006c077033a6e92a8bdcc6c732110736fb465b5a..2ac4a0252c813cec5492b7ac83e2d516
      catch {
          try {
 diff --git a/dist/src/daemon/cache.d.ts b/dist/src/daemon/cache.d.ts
-index 65e58a0..cb060c6 100644
+index 65e58a019d7c1f7ba7c8243ad119aa444ec3a499..cb060c6d90352cbaf69d105652617d5a995385ea 100644
 --- a/dist/src/daemon/cache.d.ts
 +++ b/dist/src/daemon/cache.d.ts
 @@ -2,9 +2,29 @@ export interface DaemonProcessJson {
@@ -115,7 +115,7 @@ index 65e58a0..cb060c6 100644
 +export declare function claimDaemonJsonProcessCache(daemonJson: DaemonProcessJson): Promise<DaemonClaim>;
  export declare function getDaemonProcessIdSync(): number | null;
 diff --git a/dist/src/daemon/cache.js b/dist/src/daemon/cache.js
-index 757fd20..1bf7e57 100644
+index 757fd200dbd83f335c9868987e4135d4b7b580cb..1bf7e571cc66d3483f8b2ebb7b73ad8b43128269 100644
 --- a/dist/src/daemon/cache.js
 +++ b/dist/src/daemon/cache.js
 @@ -3,9 +3,10 @@ Object.defineProperty(exports, "__esModule", { value: true });
@@ -312,7 +312,7 @@ index 757fd20..1bf7e57 100644
  }
  // Must be sync for the help output use case
 diff --git a/dist/src/daemon/client/client.d.ts b/dist/src/daemon/client/client.d.ts
-index 9bd7b61..c552b4b 100644
+index 9bd7b61bf9ad94c72a198dfe6f15fbcb68dfaac3..c552b4b252c2d0496312ddb6ff481699a6771552 100644
 --- a/dist/src/daemon/client/client.d.ts
 +++ b/dist/src/daemon/client/client.d.ts
 @@ -2,7 +2,7 @@ import { ChildProcess } from 'child_process';
@@ -335,7 +335,7 @@ index 9bd7b61..c552b4b 100644
      flushSyncGeneratorChangesToDisk(generators: string[]): Promise<FlushSyncGeneratorChangesResult>;
      getRegisteredSyncGenerators(): Promise<{
 diff --git a/dist/src/daemon/client/client.js b/dist/src/daemon/client/client.js
-index cebfd6d..a0389a0 100644
+index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..a0389a0c54c40d43cf863b899bf49193d2918332 100644
 --- a/dist/src/daemon/client/client.js
 +++ b/dist/src/daemon/client/client.js
 @@ -40,7 +40,6 @@ const nx_console_1 = require("../message-types/nx-console");
@@ -388,9 +388,80 @@ index cebfd6d..a0389a0 100644
          }
          else {
              // A permission refusal from either source wins, then the poll's errno,
+diff --git a/dist/src/daemon/message-types/daemon-message.d.ts b/dist/src/daemon/message-types/daemon-message.d.ts
+index 9dd6123ad6d9adb20a07f7db56fc476be78cbcca..0b1ee217729d63a29806cf6c38d0fc5d4a2161a5 100644
+--- a/dist/src/daemon/message-types/daemon-message.d.ts
++++ b/dist/src/daemon/message-types/daemon-message.d.ts
+@@ -11,6 +11,8 @@ export type DaemonMessage = {
+     data?: any;
+ };
+ export declare function isDaemonMessage(msg: unknown): msg is DaemonMessage;
++/** Normalize path spelling without removing a POSIX, drive or UNC root. */
++export declare function normalizeRootString(workspaceRoot: string, platform?: NodeJS.Platform): string;
+ /**
+  * Any message carrying the sender's workspace root. Structural so the checks
+  * below serve the daemon and the plugin worker without either importing the
+@@ -24,7 +26,7 @@ type WorkspaceScopedMessage = {
+ /**
+  * A message from a different workspace — two sharing an NX_SOCKET_DIR — must not
+  * be processed. Roots are normalized first so that a workspace does not look
+- * foreign to itself; see {@link normalizeWorkspaceRoot}.
++ * foreign to itself; see {@link normalizeRootString}.
+  */
+ export declare function isForeignWorkspaceMessage(msg: WorkspaceScopedMessage, receiverWorkspaceRoot: string): boolean;
+ /**
+diff --git a/dist/src/daemon/message-types/daemon-message.js b/dist/src/daemon/message-types/daemon-message.js
+index e7a63499d18a3a8896fb117591356c3bb138032a..8d03082ada878fedd70c6245791f4c6979f17801 100644
+--- a/dist/src/daemon/message-types/daemon-message.js
++++ b/dist/src/daemon/message-types/daemon-message.js
+@@ -3,6 +3,7 @@ Object.defineProperty(exports, "__esModule", { value: true });
+ exports.isDaemonMessage = isDaemonMessage;
+ exports.isForeignWorkspaceMessage = isForeignWorkspaceMessage;
+ exports.assertNotForeignWorkspaceMessage = assertNotForeignWorkspaceMessage;
++exports.normalizeRootString = normalizeRootString;
+ const node_path_1 = require("node:path");
+ function isDaemonMessage(msg) {
+     return typeof msg === 'object' && msg && 'type' in msg;
+@@ -22,22 +23,29 @@ function isDaemonMessage(msg) {
+  * POSIX roots keep their case, where `/repo` and `/REPO` really can be two
+  * directories.
+  */
+-function normalizeWorkspaceRoot(workspaceRoot) {
+-    return process.platform === 'win32'
+-        ? node_path_1.win32.normalize(workspaceRoot).toLowerCase()
+-        : node_path_1.posix.normalize(workspaceRoot);
++function normalizeRootString(workspaceRoot, platform = process.platform) {
++    const windows = platform === 'win32';
++    const format = windows ? node_path_1.win32 : node_path_1.posix;
++    const normalized = format.normalize(workspaceRoot);
++    const rootLength = format.parse(normalized).root.length;
++    let end = normalized.length;
++    while (end > rootLength && (normalized[end - 1] === '/' || (windows && normalized[end - 1] === '\\'))) {
++        end--;
++    }
++    const root = normalized.slice(0, end);
++    return windows ? root.toLowerCase() : root;
+ }
+ /**
+  * A message from a different workspace — two sharing an NX_SOCKET_DIR — must not
+  * be processed. Roots are normalized first so that a workspace does not look
+- * foreign to itself; see {@link normalizeWorkspaceRoot}.
++ * foreign to itself; see {@link normalizeRootString}.
+  */
+ function isForeignWorkspaceMessage(msg, receiverWorkspaceRoot) {
+     if (msg.workspaceRoot === undefined) {
+         return false;
+     }
+-    return (normalizeWorkspaceRoot(msg.workspaceRoot) !==
+-        normalizeWorkspaceRoot(receiverWorkspaceRoot));
++    return (normalizeRootString(msg.workspaceRoot) !==
++        normalizeRootString(receiverWorkspaceRoot));
+ }
+ /**
+  * Throws on a message this receiver must not act on. The daemon catches it and
 diff --git a/dist/src/daemon/message-types/task-history.d.ts b/dist/src/daemon/message-types/task-history.d.ts
 deleted file mode 100644
-index cc2b606..0000000
+index cc2b606d99db19beb05d85e5ec2f13600712e7bd..0000000000000000000000000000000000000000
 --- a/dist/src/daemon/message-types/task-history.d.ts
 +++ /dev/null
 @@ -1,19 +0,0 @@
@@ -415,7 +486,7 @@ index cc2b606..0000000
 -export declare function isHandleWriteTaskRunsToHistoryMessage(message: unknown): message is HandleRecordTaskRunsMessage;
 diff --git a/dist/src/daemon/message-types/task-history.js b/dist/src/daemon/message-types/task-history.js
 deleted file mode 100644
-index 12c1507..0000000
+index 12c1507aec3cf894bc18c680818bf76ec1533cca..0000000000000000000000000000000000000000
 --- a/dist/src/daemon/message-types/task-history.js
 +++ /dev/null
 @@ -1,27 +0,0 @@
@@ -448,7 +519,7 @@ index 12c1507..0000000
 -}
 diff --git a/dist/src/daemon/server/handle-task-history.d.ts b/dist/src/daemon/server/handle-task-history.d.ts
 deleted file mode 100644
-index 70e1f4d..0000000
+index 70e1f4db2d37af99bfea24cebca2cdf49f71406d..0000000000000000000000000000000000000000
 --- a/dist/src/daemon/server/handle-task-history.d.ts
 +++ /dev/null
 @@ -1,13 +0,0 @@
@@ -467,7 +538,7 @@ index 70e1f4d..0000000
 -}>;
 diff --git a/dist/src/daemon/server/handle-task-history.js b/dist/src/daemon/server/handle-task-history.js
 deleted file mode 100644
-index 0051f7f..0000000
+index 0051f7f97f0d9c05341f8cbaa7f51eb851051077..0000000000000000000000000000000000000000
 --- a/dist/src/daemon/server/handle-task-history.js
 +++ /dev/null
 @@ -1,30 +0,0 @@
@@ -502,7 +573,7 @@ index 0051f7f..0000000
 -    };
 -}
 diff --git a/dist/src/daemon/server/server.js b/dist/src/daemon/server/server.js
-index b1c143e..57925ac 100644
+index b1c143e244efd435b28642ed86e999d6c86f7d94..57925ac7a79a16756e6af51d6ead4b5f019ec821 100644
 --- a/dist/src/daemon/server/server.js
 +++ b/dist/src/daemon/server/server.js
 @@ -34,7 +34,6 @@ const hash_glob_1 = require("../message-types/hash-glob");
@@ -521,8 +592,7 @@ index b1c143e..57925ac 100644
  const handle_tasks_execution_hooks_1 = require("./handle-tasks-execution-hooks");
  const handle_update_workspace_context_1 = require("./handle-update-workspace-context");
  const handle_outputs_changes_1 = require("./handle-outputs-changes");
-@@ -96,6 +94,9 @@ const server = (0, net_1.createServer)(async (socket) => {
-     socket.on('close', () => {
+@@ -97,6 +95,9 @@ const server = (0, net_1.createServer)(async (socket) => {
          numberOfOpenConnections -= 1;
          exports.openSockets.delete(socket);
          logger_1.serverLogger.log(`Closed a connection. Number of open connections: ${numberOfOpenConnections}`);
@@ -531,7 +601,8 @@ index b1c143e..57925ac 100644
 +        }
          (0, file_watcher_sockets_1.removeRegisteredFileWatcherSocket)(socket);
          (0, project_graph_listener_sockets_1.removeRegisteredProjectGraphListenerSocket)(socket);
-@@ -185,15 +183,6 @@ async function handleMessage(socket, data) {
+     });
+@@ -185,15 +186,6 @@ async function handleMessage(socket, data) {
      else if ((0, hash_glob_1.isHandleHashMultiGlobMessage)(payload)) {
          await handleResult(socket, hash_glob_1.HASH_GLOB, () => (0, handle_hash_glob_1.handleHashMultiGlob)(payload.globGroups), mode);
      }
@@ -547,7 +618,9 @@ index b1c143e..57925ac 100644
      else if ((0, force_shutdown_1.isHandleForceShutdownMessage)(payload)) {
          await handleResult(socket, 'FORCE_SHUTDOWN', () => (0, handle_force_shutdown_1.handleForceShutdown)(server), mode);
      }
-@@ -258,7 +250,8 @@ async function handleResult(socket, type, hrFn, mode) {
+@@ -256,9 +248,10 @@ async function handleResult(socket, type, hrFn, mode) {
+     logger_1.serverLogger.log(`Handled ${mode} message ${type}. Handling time: ${doneHandlingMark.getTime() - startMark.getTime()}. Response time: ${endMark.getTime() - doneHandlingMark.getTime()}.`);
+ }
  function handleInactivityTimeout() {
 -    if ((0, file_watcher_sockets_1.hasRegisteredFileWatcherSockets)() ||
 +    if (numberOfOpenConnections > 0 ||
@@ -558,7 +631,7 @@ index b1c143e..57925ac 100644
          (0, shutdown_utils_1.resetInactivityTimeout)(handleInactivityTimeout);
      }
      else {
-@@ -348,7 +337,40 @@ const handleWorkspaceChanges = async (err, changeEvents) => {
+@@ -348,7 +341,40 @@ const handleWorkspaceChanges = async (err, changeEvents) => {
          (0, file_watcher_sockets_1.notifyFileWatcherSocketsOfError)(err);
      }
  };
@@ -599,7 +672,7 @@ index b1c143e..57925ac 100644
      // Watch before scan: a file written during boot must be visible to the
      // watcher or the scan below. Scan-first left a blind window where such
      // files stayed invisible to both until an unrelated change arrived.
-@@ -359,18 +381,11 @@ async function startServer() {
+@@ -359,18 +385,11 @@ async function startServer() {
      (0, workspace_context_1.setupWorkspaceContext)(workspace_root_1.workspaceRoot);
      // Initialize analytics for daemon process
      await (0, analytics_1.startAnalytics)();
@@ -618,7 +691,7 @@ index b1c143e..57925ac 100644
      // See notes in socket-command-line-utils.ts on OS differences regarding clean up of existings connections.
      if (!socket_utils_1.isWindows) {
          (0, socket_utils_1.killSocketOrPath)();
-@@ -384,6 +399,13 @@ async function startServer() {
+@@ -384,6 +403,13 @@ async function startServer() {
                  sockets: exports.openSockets,
              });
          }
@@ -632,7 +705,7 @@ index b1c143e..57925ac 100644
          const outdated = daemonIsOutdated();
          if (outdated) {
              logger_1.serverLogger.log(`[Server] Daemon outdated: ${outdated}`);
-@@ -432,6 +454,7 @@ async function startServer() {
+@@ -432,6 +458,7 @@ async function startServer() {
                              // Best effort; the 0700 socket directory is the primary control.
                          }
                      }
@@ -641,7 +714,7 @@ index b1c143e..57925ac 100644
                      daemonIsOutdated();
                      if (!(0, shutdown_utils_1.getOutputWatcherInstance)()) {
 diff --git a/dist/src/daemon/server/shutdown-utils.d.ts b/dist/src/daemon/server/shutdown-utils.d.ts
-index 698fcf9..422d244 100644
+index 698fcf9e061b8e0b37057a6318614dbe6d290b9e..422d244931ceb3a7143fc06e23d113bc0c566092 100644
 --- a/dist/src/daemon/server/shutdown-utils.d.ts
 +++ b/dist/src/daemon/server/shutdown-utils.d.ts
 @@ -1,6 +1,6 @@
@@ -653,10 +726,12 @@ index 698fcf9..422d244 100644
  export declare function getWatcherInstance(): Watcher;
  export declare function storeOutputWatcherInstance(instance: Watcher): void;
 diff --git a/dist/src/daemon/server/shutdown-utils.js b/dist/src/daemon/server/shutdown-utils.js
-index a449f2f..7123ce2 100644
+index a449f2fb3c864bc9d3d710078418c8a05879aa84..7123ce257437d940409bc683b00ed500f6b10a55 100644
 --- a/dist/src/daemon/server/shutdown-utils.js
 +++ b/dist/src/daemon/server/shutdown-utils.js
-@@ -27,5 +27,5 @@ const promises_1 = require("fs/promises");
+@@ -25,7 +25,7 @@ const path_1 = require("path");
+ const node_fs_1 = require("node:fs");
+ const promises_1 = require("fs/promises");
  const tmp_dir_1 = require("../tmp-dir");
 -exports.SERVER_INACTIVITY_TIMEOUT_MS = 10800000; // 10800000 ms = 3 hours
 +exports.SERVER_INACTIVITY_TIMEOUT_MS = 300000; // 300000 ms = 5 minutes
@@ -700,7 +775,7 @@ index a449f2f..7123ce2 100644
          if (watcherInstance) {
              await watcherInstance.stop();
 diff --git a/dist/src/daemon/server/watcher.js b/dist/src/daemon/server/watcher.js
-index cbc34a1..7ff8c38 100644
+index cbc34a1a9c7650ddd50ee7309a0b487f1837e88a..7ff8c387c06f6f50ea8f8e334a64b5b5db57d87a 100644
 --- a/dist/src/daemon/server/watcher.js
 +++ b/dist/src/daemon/server/watcher.js
 @@ -6,20 +6,103 @@ exports.watchOutputFiles = watchOutputFiles;
@@ -834,7 +909,7 @@ index cbc34a1..7ff8c38 100644
  }
  /**
 diff --git a/dist/src/daemon/socket-utils.d.ts b/dist/src/daemon/socket-utils.d.ts
-index 52b621b..1c13e49 100644
+index 52b621b433beccb8e6590316cfd5baa7c7ec3b80..1c13e49fb4e8e37520ecd6e7a1c00ce251d201e4 100644
 --- a/dist/src/daemon/socket-utils.d.ts
 +++ b/dist/src/daemon/socket-utils.d.ts
 @@ -11,6 +11,21 @@ export declare const getForkedProcessOsSocketPath: (id: string) => string;
@@ -860,7 +935,7 @@ index 52b621b..1c13e49 100644
  /**
   * Serialize using `preferred`, falling back to the other format when it throws.
 diff --git a/dist/src/daemon/socket-utils.js b/dist/src/daemon/socket-utils.js
-index 6637161..92b1f00 100644
+index 66371610921778e1ee3c44055ca6438cc01dc7a9..92b1f00e948ac522fad5a6e6e3e87f41e2c098dc 100644
 --- a/dist/src/daemon/socket-utils.js
 +++ b/dist/src/daemon/socket-utils.js
 @@ -3,6 +3,8 @@ Object.defineProperty(exports, "__esModule", { value: true });
@@ -1221,6 +1296,93 @@ index 4a34ba245ca18dc4f4897fb45130e0d9dce94861..c7301119b99aa8d2a6dff507bee8f865
  }
  /**
   * Converts a string representation of a max cache size to a number.
+diff --git a/dist/src/tasks-runner/create-task-graph.js b/dist/src/tasks-runner/create-task-graph.js
+index f0996420e6a01e90f58512e433bd98cdd299d47b..cdb4fdcb687916f6098b8b77c9471da934bf0243 100644
+--- a/dist/src/tasks-runner/create-task-graph.js
++++ b/dist/src/tasks-runner/create-task-graph.js
+@@ -77,7 +77,33 @@ class ProcessTasks {
+                 ];
+             }
+         }
+-        return Object.keys(this.tasks).filter((d) => this.dependencies[d].length === 0 &&
++        // Dummy-cycle normalization can disconnect tasks found during expansion.
++        const taskIds = Object.keys(this.tasks);
++        const pending = Object.keys(initialTasks);
++        const reachable = new Set(pending);
++        while (pending.length > 0) {
++            const taskId = pending.pop();
++            for (const dependency of this.dependencies[taskId]) {
++                if (!reachable.has(dependency)) {
++                    reachable.add(dependency);
++                    pending.push(dependency);
++                }
++            }
++            for (const dependency of this.continuousDependencies[taskId]) {
++                if (!reachable.has(dependency)) {
++                    reachable.add(dependency);
++                    pending.push(dependency);
++                }
++            }
++        }
++        for (const taskId of taskIds) {
++            if (!reachable.has(taskId)) {
++                delete this.tasks[taskId];
++                delete this.dependencies[taskId];
++                delete this.continuousDependencies[taskId];
++            }
++        }
++        return taskIds.filter((d) => reachable.has(d) && this.dependencies[d].length === 0 &&
+             this.continuousDependencies[d].length === 0);
+     }
+     processTask(task, projectUsedToDeriveDependencies, configuration, overrides) {
+diff --git a/dist/src/tasks-runner/default-tasks-runner.js b/dist/src/tasks-runner/default-tasks-runner.js
+index 713453e37ce42da670e6a37d62e0bab763d7cf37..841eb089b99e0c6029c0d860bf5e0a305fe6ad50 100644
+--- a/dist/src/tasks-runner/default-tasks-runner.js
++++ b/dist/src/tasks-runner/default-tasks-runner.js
+@@ -54,12 +54,12 @@ class RemoteCacheV2 {
+     }
+ }
+ exports.RemoteCacheV2 = RemoteCacheV2;
+-const defaultTasksRunner = async (tasks, options, context) => {
++const defaultTasksRunner = async (tasks, options, context, runnerCompletion) => {
+     const { total: threadCount, discrete } = (0, task_orchestrator_1.getThreadPoolSize)(options, context.taskGraph);
+     // Total thread count drives the TUI; the discrete `--parallel` feeds the perf report.
+     await options.lifeCycle.startCommand(threadCount, discrete);
+     try {
+-        return await runAllTasks(options, context);
++        return await runAllTasks(options, context, runnerCompletion);
+     }
+     finally {
+         // Hand the TUI exit popup the perf report (multi-task TUI runs); other modes flush it.
+@@ -67,8 +67,13 @@ const defaultTasksRunner = async (tasks, options, context) => {
+     }
+ };
+ exports.defaultTasksRunner = defaultTasksRunner;
+-async function runAllTasks(options, context) {
++async function runAllTasks(options, context, runnerCompletion) {
+     const orchestrator = new task_orchestrator_1.TaskOrchestrator(context.hasher, context.initiatingProject, context.initiatingTasks, context.projectGraph, context.taskGraph, context.nxJson, options, context.nxArgs?.nxBail, context.daemon, context.nxArgs?.outputStyle);
+-    return orchestrator.run();
++    const statuses = await orchestrator.run();
++    if (runnerCompletion) {
++        runnerCompletion.bailed = orchestrator.bailed;
++        runnerCompletion.interrupted = orchestrator.stopRequested;
++    }
++    return statuses;
+ }
+ exports.default = exports.defaultTasksRunner;
+diff --git a/dist/src/tasks-runner/life-cycles/performance-life-cycle.js b/dist/src/tasks-runner/life-cycles/performance-life-cycle.js
+index fa73e9c05acc22a21b26f37df2b52fae4727b23a..8eb555827d52af60c047697f42e8d185235d4bb4 100644
+--- a/dist/src/tasks-runner/life-cycles/performance-life-cycle.js
++++ b/dist/src/tasks-runner/life-cycles/performance-life-cycle.js
+@@ -12,7 +12,7 @@ const performance_analysis_1 = require("./performance-analysis");
+  * Measures how much wall-clock a run loses to parallelism contention versus its
+  * critical-path floor, and reports it at the end of a run. Added on every run by
+  * `constructLifeCycles`, but only emitted where the report is flushed (the CLI
+- * `invokeTasksRunner` path) — the programmatic `init-tasks-runner` path collects
++ * `runCommandForTasks` path) — the programmatic `init-tasks-runner` path collects
+  * timings but never displays them.
+  *
+  * overhead = runDuration − criticalPathDuration, split by CAUSE off the occupancy
 diff --git a/dist/src/tasks-runner/life-cycles/static-run-many-terminal-output-life-cycle.d.ts b/dist/src/tasks-runner/life-cycles/static-run-many-terminal-output-life-cycle.d.ts
 index b948965217d385e31f5f49895bb09aa5d11afedb..6fff5d5e42ba9ff87f074ccba1045960a5501fe5 100644
 --- a/dist/src/tasks-runner/life-cycles/static-run-many-terminal-output-life-cycle.d.ts
@@ -1450,56 +1612,8 @@ index 4b3ae70c8af939f85e02dc5de8afefc62d6d20d4..88857f50b46fe34ad9e8330aa4e6f3ab
      endTasks(taskResults) {
          for (let t of taskResults) {
              this.allCompletedTasks.set(t.task.id, t.task);
-diff --git a/dist/src/tasks-runner/default-tasks-runner.js b/dist/src/tasks-runner/default-tasks-runner.js
-index 713453e37c..841eb089b9 100644
---- a/dist/src/tasks-runner/default-tasks-runner.js
-+++ b/dist/src/tasks-runner/default-tasks-runner.js
-@@ -54,12 +54,12 @@ class RemoteCacheV2 {
-     }
- }
- exports.RemoteCacheV2 = RemoteCacheV2;
--const defaultTasksRunner = async (tasks, options, context) => {
-+const defaultTasksRunner = async (tasks, options, context, runnerCompletion) => {
-     const { total: threadCount, discrete } = (0, task_orchestrator_1.getThreadPoolSize)(options, context.taskGraph);
-     // Total thread count drives the TUI; the discrete `--parallel` feeds the perf report.
-     await options.lifeCycle.startCommand(threadCount, discrete);
-     try {
--        return await runAllTasks(options, context);
-+        return await runAllTasks(options, context, runnerCompletion);
-     }
-     finally {
-         // Hand the TUI exit popup the perf report (multi-task TUI runs); other modes flush it.
-@@ -67,8 +67,13 @@ const defaultTasksRunner = async (tasks, options, context) => {
-     }
- };
- exports.defaultTasksRunner = defaultTasksRunner;
--async function runAllTasks(options, context) {
-+async function runAllTasks(options, context, runnerCompletion) {
-     const orchestrator = new task_orchestrator_1.TaskOrchestrator(context.hasher, context.initiatingProject, context.initiatingTasks, context.projectGraph, context.taskGraph, context.nxJson, options, context.nxArgs?.nxBail, context.daemon, context.nxArgs?.outputStyle);
--    return orchestrator.run();
-+    const statuses = await orchestrator.run();
-+    if (runnerCompletion) {
-+        runnerCompletion.bailed = orchestrator.bailed;
-+        runnerCompletion.interrupted = orchestrator.stopRequested;
-+    }
-+    return statuses;
- }
- exports.default = exports.defaultTasksRunner;
-diff --git a/dist/src/tasks-runner/life-cycles/performance-life-cycle.js b/dist/src/tasks-runner/life-cycles/performance-life-cycle.js
-index fa73e9c05a..8eb555827d 100644
---- a/dist/src/tasks-runner/life-cycles/performance-life-cycle.js
-+++ b/dist/src/tasks-runner/life-cycles/performance-life-cycle.js
-@@ -12,7 +12,7 @@ const performance_analysis_1 = require("./performance-analysis");
-  * Measures how much wall-clock a run loses to parallelism contention versus its
-  * critical-path floor, and reports it at the end of a run. Added on every run by
-  * `constructLifeCycles`, but only emitted where the report is flushed (the CLI
-- * `invokeTasksRunner` path) — the programmatic `init-tasks-runner` path collects
-+ * `runCommandForTasks` path) — the programmatic `init-tasks-runner` path collects
-  * timings but never displays them.
-  *
-  * overhead = runDuration − criticalPathDuration, split by CAUSE off the occupancy
 diff --git a/dist/src/tasks-runner/run-command.js b/dist/src/tasks-runner/run-command.js
-index 4e64afa4fb..14723620cb 100644
+index 4e64afa4fb985191ac8bc0e31a1e380bcecf9427..14723620cb7d8094bff0eb70214442dd39fe9131 100644
 --- a/dist/src/tasks-runner/run-command.js
 +++ b/dist/src/tasks-runner/run-command.js
 @@ -41,6 +41,7 @@ const task_profiling_life_cycle_1 = require("./life-cycles/task-profiling-life-c
@@ -1631,43 +1745,6 @@ index 4e64afa4fb..14723620cb 100644
  }
  function constructLifeCycles(lifeCycle, taskGraph, nxJson, skipNxCache) {
      const lifeCycles = [];
-diff --git a/dist/src/tasks-runner/create-task-graph.js b/dist/src/tasks-runner/create-task-graph.js
---- a/dist/src/tasks-runner/create-task-graph.js
-+++ b/dist/src/tasks-runner/create-task-graph.js
-@@ -77,6 +77,32 @@ class ProcessTasks {
-                 ];
-             }
-         }
-+        // Dummy-cycle normalization can disconnect tasks found during expansion.
-+        const taskIds = Object.keys(this.tasks);
-+        const pending = Object.keys(initialTasks);
-+        const reachable = new Set(pending);
-+        while (pending.length > 0) {
-+            const taskId = pending.pop();
-+            for (const dependency of this.dependencies[taskId]) {
-+                if (!reachable.has(dependency)) {
-+                    reachable.add(dependency);
-+                    pending.push(dependency);
-+                }
-+            }
-+            for (const dependency of this.continuousDependencies[taskId]) {
-+                if (!reachable.has(dependency)) {
-+                    reachable.add(dependency);
-+                    pending.push(dependency);
-+                }
-+            }
-+        }
-+        for (const taskId of taskIds) {
-+            if (!reachable.has(taskId)) {
-+                delete this.tasks[taskId];
-+                delete this.dependencies[taskId];
-+                delete this.continuousDependencies[taskId];
-+            }
-+        }
--        return Object.keys(this.tasks).filter((d) => this.dependencies[d].length === 0 &&
-+        return taskIds.filter((d) => reachable.has(d) && this.dependencies[d].length === 0 &&
-             this.continuousDependencies[d].length === 0);
-     }
 diff --git a/dist/src/tasks-runner/task-graph-utils.d.ts b/dist/src/tasks-runner/task-graph-utils.d.ts
 index 2ba00c254450c7d3b93e288b1f0bb28361ef8cf3..5f76eee85731e34fbf1edc4ebc0c7593dd2abdbd 100644
 --- a/dist/src/tasks-runner/task-graph-utils.d.ts
@@ -1808,7 +1885,7 @@ index a6e742172f09e800da486af4716e9747d5ff2304..29f3376dfc5a00f83e90a7a2a7ce1a4e
 +    });
 +}
 diff --git a/dist/src/utils/task-history.js b/dist/src/utils/task-history.js
-index 34dbaa2..09f95b7 100644
+index 34dbaa2a5a44e6b7d1f69a516756b30939877bd7..09f95b73572a0d411f26d42aac2cfbf0098311f4 100644
 --- a/dist/src/utils/task-history.js
 +++ b/dist/src/utils/task-history.js
 @@ -2,12 +2,13 @@
@@ -1962,7 +2039,7 @@ index a887d862c9c431d8cbbc0d44e26fd394b243fb9c..ead0324cffa7dac0a019a756ab990287
      if (!useDaemonProcess || (0, is_on_daemon_1.isOnDaemon)() || !client_1.daemonClient.enabled()) {
          ensureContextAvailable(workspaceRoot);
 diff --git a/dist/src/utils/workspace-root.d.ts b/dist/src/utils/workspace-root.d.ts
-index 74bf8f9..8034019 100644
+index 74bf8f91928de190fda5886163a4b7cbd5add572..8034019f30f243d86a7a74abc42fd4ad5725b5ef 100644
 --- a/dist/src/utils/workspace-root.d.ts
 +++ b/dist/src/utils/workspace-root.d.ts
 @@ -4,3 +4,17 @@
@@ -1984,7 +2061,7 @@ index 74bf8f9..8034019 100644
 +}
 +export declare function foreignWorkspaceEnvironment(cwd: string, env: NodeJS.ProcessEnv): ForeignWorkspaceEnvironment | null;
 diff --git a/dist/src/utils/workspace-root.js b/dist/src/utils/workspace-root.js
-index 74f0682..03686ff 100644
+index 74f0682269ede01ee9ee4819e39f38c90a719894..03686ffeeff54286b99386fddeef77d031d3af71 100644
 --- a/dist/src/utils/workspace-root.js
 +++ b/dist/src/utils/workspace-root.js
 @@ -3,7 +3,10 @@ Object.defineProperty(exports, "__esModule", { value: true });
@@ -2137,72 +2214,3 @@ index 74f0682..03686ff 100644
 +        }
      }
  }
-diff --git a/dist/src/daemon/message-types/daemon-message.js b/dist/src/daemon/message-types/daemon-message.js
---- a/dist/src/daemon/message-types/daemon-message.js
-+++ b/dist/src/daemon/message-types/daemon-message.js
-@@ -3,6 +3,7 @@
- exports.isDaemonMessage = isDaemonMessage;
- exports.isForeignWorkspaceMessage = isForeignWorkspaceMessage;
- exports.assertNotForeignWorkspaceMessage = assertNotForeignWorkspaceMessage;
-+exports.normalizeRootString = normalizeRootString;
- const node_path_1 = require("node:path");
- function isDaemonMessage(msg) {
-     return typeof msg === 'object' && msg && 'type' in msg;
-@@ -22,22 +23,29 @@
-  * POSIX roots keep their case, where `/repo` and `/REPO` really can be two
-  * directories.
-  */
--function normalizeWorkspaceRoot(workspaceRoot) {
--    return process.platform === 'win32'
--        ? node_path_1.win32.normalize(workspaceRoot).toLowerCase()
--        : node_path_1.posix.normalize(workspaceRoot);
--}
-+function normalizeRootString(workspaceRoot, platform = process.platform) {
-+    const windows = platform === 'win32';
-+    const format = windows ? node_path_1.win32 : node_path_1.posix;
-+    const normalized = format.normalize(workspaceRoot);
-+    const rootLength = format.parse(normalized).root.length;
-+    let end = normalized.length;
-+    while (end > rootLength && (normalized[end - 1] === '/' || (windows && normalized[end - 1] === '\\'))) {
-+        end--;
-+    }
-+    const root = normalized.slice(0, end);
-+    return windows ? root.toLowerCase() : root;
-+}
- /**
-  * A message from a different workspace — two sharing an NX_SOCKET_DIR — must not
-  * be processed. Roots are normalized first so that a workspace does not look
-- * foreign to itself; see {@link normalizeWorkspaceRoot}.
-+ * foreign to itself; see {@link normalizeRootString}.
-  */
- function isForeignWorkspaceMessage(msg, receiverWorkspaceRoot) {
-     if (msg.workspaceRoot === undefined) {
-         return false;
-     }
--    return (normalizeWorkspaceRoot(msg.workspaceRoot) !==
--        normalizeWorkspaceRoot(receiverWorkspaceRoot));
-+    return (normalizeRootString(msg.workspaceRoot) !==
-+        normalizeRootString(receiverWorkspaceRoot));
- }
- /**
-  * Throws on a message this receiver must not act on. The daemon catches it and
-diff --git a/dist/src/daemon/message-types/daemon-message.d.ts b/dist/src/daemon/message-types/daemon-message.d.ts
---- a/dist/src/daemon/message-types/daemon-message.d.ts
-+++ b/dist/src/daemon/message-types/daemon-message.d.ts
-@@ -11,6 +11,8 @@
-     data?: any;
- };
- export declare function isDaemonMessage(msg: unknown): msg is DaemonMessage;
-+/** Normalize path spelling without removing a POSIX, drive or UNC root. */
-+export declare function normalizeRootString(workspaceRoot: string, platform?: NodeJS.Platform): string;
- /**
-  * Any message carrying the sender's workspace root. Structural so the checks
-  * below serve the daemon and the plugin worker without either importing the
-@@ -24,6 +26,6 @@
- /**
-  * A message from a different workspace — two sharing an NX_SOCKET_DIR — must not
-  * be processed. Roots are normalized first so that a workspace does not look
-- * foreign to itself; see {@link normalizeWorkspaceRoot}.
-+ * foreign to itself; see {@link normalizeRootString}.
-  */
- export declare function isForeignWorkspaceMessage(msg: WorkspaceScopedMessage, receiverWorkspaceRoot: string): boolean;

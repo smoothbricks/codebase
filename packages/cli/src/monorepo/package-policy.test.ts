@@ -18,6 +18,7 @@ import { listPublicPackages, listPublishablePackages } from '../lib/workspace.js
 import { validateCommitMessage } from './commit-msg.js';
 import {
   applyFixableMonorepoDefaults,
+  applyNxPatchDefaults,
   applyNxPluginDefaults,
   applyNxProjectNameDefaults,
   applyWorkspaceDependencyDefaults,
@@ -64,7 +65,7 @@ describe('root smoo monorepo policy', () => {
       );
       await writeJson(join(root, 'nx.json'), validNxJson());
 
-      expect(validateRootPackagePolicy(root)).toBe(9);
+      expect(validateRootPackagePolicy(root)).toBe(11);
       expect(validateNxReleaseConfig(root)).toBe(7);
 
       applyFixableMonorepoDefaults(root);
@@ -83,11 +84,97 @@ describe('root smoo monorepo policy', () => {
         postinstall: 'bun tooling/direnv/developer-links.ts',
       });
       expect(rootPackage).toMatchObject({ nx: { includedScripts: [] } });
+      expect(rootPackage.overrides).toEqual({ nx: '23.2.1' });
+      expect(rootPackage.patchedDependencies).toEqual({ 'nx@23.2.1': 'patches/nx@23.2.1.patch' });
       expect(nxJson.namedInputs).toEqual(validNamedInputs());
       expect(nxJson.targetDefaults).toEqual(validTargetDefaults());
       expect(nxJson.plugins).toEqual(['@smoothbricks/nx-plugin']);
       expect(validateRootPackagePolicy(root)).toBe(0);
       expect(validateNxReleaseConfig(root)).toBe(0);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('writes the managed Nx patch policy into a root config that lacks it', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'smoo-package-policy-'));
+    try {
+      await writeJson(join(root, 'package.json'), validRootPackage());
+      const errors = captureConsoleErrors();
+
+      validateRootPackagePolicy(root);
+      expect(errors).toContain('package.json overrides.nx must be 23.2.1; run smoo monorepo update');
+      expect(errors).toContain(
+        'package.json patchedDependencies.nx@23.2.1 must be patches/nx@23.2.1.patch; run smoo monorepo update',
+      );
+
+      applyNxPatchDefaults(root);
+
+      const rootPackage = await readJson(join(root, 'package.json'));
+      expect(rootPackage.overrides).toEqual({ nx: '23.2.1' });
+      expect(rootPackage.patchedDependencies).toEqual({ 'nx@23.2.1': 'patches/nx@23.2.1.patch' });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('migrates a served Nx override and repairs drifted Nx patches, keeping unrelated entries', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'smoo-package-policy-'));
+    try {
+      await writeJson(
+        join(root, 'package.json'),
+        validRootPackage({
+          overrides: {
+            typia: '14.0.6',
+            '@nx/js': '23.2.1',
+            nx: 'https://example.com/releases/nx-23.2.1.tgz',
+          },
+          patchedDependencies: {
+            '@nx/js@23.2.1': 'patches/@nx%2Fjs@23.2.1.patch',
+            'nx@23.1.0': 'patches/nx@23.1.0.patch',
+            'nx@23.2.1': 'patches/nx@23.2.1.old.patch',
+          },
+        }),
+      );
+      const errors = captureConsoleErrors();
+
+      validateRootPackagePolicy(root);
+      expect(errors).toContain('package.json overrides.nx must be 23.2.1; run smoo monorepo update');
+      expect(errors).toContain(
+        'package.json patchedDependencies.nx@23.2.1 must be patches/nx@23.2.1.patch; run smoo monorepo update',
+      );
+      expect(errors).toContain('package.json patchedDependencies.nx@23.1.0 is obsolete; run smoo monorepo update');
+
+      applyNxPatchDefaults(root);
+
+      const rootPackage = await readJson(join(root, 'package.json'));
+      expect(rootPackage.overrides).toEqual({ typia: '14.0.6', '@nx/js': '23.2.1', nx: '23.2.1' });
+      expect(rootPackage.patchedDependencies).toEqual({
+        '@nx/js@23.2.1': 'patches/@nx%2Fjs@23.2.1.patch',
+        'nx@23.2.1': 'patches/nx@23.2.1.patch',
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('leaves an already managed Nx patch policy byte-identical on reapply', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'smoo-package-policy-'));
+    try {
+      await writeJson(join(root, 'package.json'), validRootPackage());
+      applyNxPatchDefaults(root);
+      const packagePath = join(root, 'package.json');
+      const before = await readFile(packagePath, 'utf8');
+      const errors = captureConsoleErrors();
+
+      applyNxPatchDefaults(root);
+      validateRootPackagePolicy(root);
+
+      expect(await readFile(packagePath, 'utf8')).toBe(before);
+      const nxErrors = errors.filter(
+        (line) => line.includes('overrides.nx') || line.includes('patchedDependencies.nx@'),
+      );
+      expect(nxErrors).toEqual([]);
     } finally {
       await rm(root, { recursive: true, force: true });
     }

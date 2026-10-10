@@ -524,14 +524,14 @@ A repository whose checkouts should all run against a local checkout of a packag
 }
 ```
 
-Each key is a package name, scoped or not. Each value is the directory of that package's local checkout, relative to the
-project's main checkout. That is the checkout itself or, in a cowshed workspace, the `projectRoot` named by its
-`.cowshed/workspace.json`, so every workspace of one project resolves a declaration to the same directory. Every install
-refuses an absolute path, or a key that is not a package name, and fails naming it. In every `node_modules` tree that
-installed the package, the root's and each workspace member's, the entry becomes a link to that directory. A tree that
-does not depend on the package gains nothing, and an entry a developer pointed at a checkout of their own stays theirs.
-When the directory is missing on this machine, or a sandbox cannot read it, the installed version stays and stderr says
-so.
+Each key is a package name, scoped or not. Each value is a package directory relative to the project checkout. A
+project-contained declaration resolves within the current checkout, including a cowshed workspace, and rejects symlink
+escapes even before the declared directory exists. A genuine sibling declaration stays anchored to the main checkout
+(`projectRoot` in `.cowshed/workspace.json`), so every workspace selects the same sibling. Every install refuses an
+absolute path, or a key that is not a package name, and fails naming it. In every `node_modules` tree that installed the
+package, the root's and each workspace member's, the entry becomes a link to that directory. A tree that does not depend
+on the package gains nothing, and an entry a developer pointed at a checkout of their own stays theirs. When the
+directory is missing on this machine, or a sandbox cannot read it, the installed version stays and stderr says so.
 
 Declarations are applied at the end of every install. smoo's root script policy sets the root `postinstall` to
 `bun tooling/direnv/developer-links.ts`, and Bun runs root lifecycle scripts after it re-points the dependencies,

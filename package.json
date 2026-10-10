@@ -80,49 +80,6 @@
           ]
         }
       },
-      "patched-nx": {
-        "executor": "nx:run-commands",
-        "cache": true,
-        "inputs": [
-          "{workspaceRoot}/tooling/patched-nx.ts",
-          "{workspaceRoot}/packages/nx-plugin/src/managed-assets.ts",
-          "{workspaceRoot}/patches/nx@23.2.1.patch",
-          "{workspaceRoot}/bunfig.toml",
-          {
-            "json": "{workspaceRoot}/bun.lock",
-            "excludeFields": [
-              "workspaces"
-            ]
-          },
-          {
-            "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh bun -e 'console.log(Bun.version, Bun.revision)'"
-          },
-          {
-            "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh bun tooling/patched-nx.ts dependency-identity"
-          }
-        ],
-        "outputs": [
-          "{workspaceRoot}/.cache/patched-nx/nx-23.2.1.tgz",
-          "{workspaceRoot}/.cache/patched-nx/release-notes.md",
-          "{workspaceRoot}/.cache/patched-nx/product.json"
-        ],
-        "options": {
-          "command": "bun tooling/patched-nx.ts build .cache/patched-nx",
-          "cwd": "{workspaceRoot}"
-        }
-      },
-      "patched-nx-bindings": {
-        "executor": "nx:run-commands",
-        "cache": false,
-        "outputs": [],
-        "dependsOn": [
-          "patched-nx"
-        ],
-        "options": {
-          "command": "bun tooling/direnv/setup-environment.ts --links --package-product .cache/patched-nx",
-          "cwd": "{workspaceRoot}"
-        }
-      },
       "local-registry": {
         "executor": "@nx/js:verdaccio",
         "options": {
@@ -179,13 +136,14 @@
     "@conloca/content-api@0.1.16": "patches/@conloca%2Fcontent-api@0.1.16.patch",
     "@conloca/astro-cms@0.1.16": "patches/@conloca%2Fastro-cms@0.1.16.patch",
     "bun-types@1.4.2": "patches/bun-types@1.4.2.patch",
+    "nx@23.2.1": "patches/nx@23.2.1.patch",
     "ttsc@0.30.4": "patches/ttsc@0.30.4.patch",
     "@nx/js@23.2.1": "patches/@nx%2Fjs@23.2.1.patch"
   },
   "overrides": {
     "typia": "14.0.6",
     "@nx/js": "23.2.1",
-    "nx": "https://github.com/smoothbricks/codebase/releases/download/nx-23.2.1-patched-eaaee04dfdee/nx-23.2.1.tgz"
+    "nx": "23.2.1"
   },
   "smoo": {
     "github": {

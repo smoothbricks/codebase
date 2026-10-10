@@ -72,7 +72,6 @@
 
 import {
   type Dirent,
-  existsSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
@@ -84,14 +83,9 @@ import {
   rmSync,
   statSync,
   symlinkSync,
-  writeFileSync,
 } from 'node:fs';
 import path from 'node:path';
-import type {
-  KeepDeveloperLinksOptions,
-  PackageDependencyClosure,
-  PortablePackageProduct,
-} from '@smoothbricks/nx-plugin/managed-assets';
+import type { KeepDeveloperLinksOptions } from '@smoothbricks/nx-plugin/managed-assets';
 
 interface DeveloperLink {
   /** Where the link is, relative to the project root. */
@@ -299,6 +293,9 @@ export interface DeclaredLinksPlan {
  * declared directory. An entry a developer pointed at another checkout of
  * their own stays theirs, and a tree without the package gains nothing: a
  * declaration links what the manifests depend on, never adds a dependency.
+ * A contained declaration this checkout cannot honour throws rather than keep a
+ * binding it inherited from the main checkout, or reach through a redirected or
+ * escaping path.
  */
 export function planDeclaredLinks(root: string): DeclaredLinksPlan {
   const declared = readDeclaredLinks(root);
@@ -306,13 +303,19 @@ export function planDeclaredLinks(root: string): DeclaredLinksPlan {
     return { changes: [], unavailable: [] };
   }
   const anchor = linkAnchor(root);
+  const canonicalRoot = realpathSync(root);
   const trees = nodeModulesTrees(root);
   const changes: DeclaredLinkChange[] = [];
   const unavailable: UnavailableDeclaredLink[] = [];
   for (const [name, relative] of declared) {
     const target = declaredTarget(root, anchor, relative);
+    const contained = containsPath(path.resolve(root), target);
+    if (contained) {
+      assertOwnedPath(canonicalRoot, path.resolve(canonicalRoot, path.relative(path.resolve(root), target)));
+    }
     const reason = unavailableReason(target);
     if (reason !== null) {
+      if (contained) assertNoInheritedBinding(root, anchor, name, relative, target);
       unavailable.push({ name, target, reason });
       continue;
     }
@@ -340,6 +343,24 @@ export function planDeclaredLinks(root: string): DeclaredLinksPlan {
 }
 
 /**
+ * A contained declaration whose directory is absent here must not keep the binding it inherited from the
+ * main checkout: restoring it is this checkout's job, never a borrowed sibling's.
+ */
+function assertNoInheritedBinding(root: string, anchor: string, name: string, relative: string, target: string): void {
+  for (const tree of nodeModulesTrees(root)) {
+    const entry = path.join(tree, name);
+    const at = path.join(root, entry);
+    if (!lstatSync(at, { throwIfNoEntry: false })?.isSymbolicLink()) continue;
+    const current = resolvedTarget(root, { path: entry, target: readlinkSync(at) });
+    if (!containsPath(path.resolve(root), current) && inheritedContainedBinding(anchor, relative, current)) {
+      throw new Error(
+        `contained declared package ${name} is missing at ${target}; restore it in this checkout, never borrow the main checkout's package`,
+      );
+    }
+  }
+}
+
+/**
  * Makes `plan`'s changes and says what it linked, once per package, and
  * which declarations this machine cannot honour.
  */
@@ -360,212 +381,6 @@ export function applyDeclaredLinks(root: string, plan: DeclaredLinksPlan): void 
   }
 }
 
-/**
- * Publishes a portable product and then atomically selects its completed package.
- * The setup owner calls this under the existing checkout install lock. A check
- * reads only: missing or stale assets, generations, aliases and bindings are false.
- * Package payload and description are immutable; host-local dependency aliases are activation-owned.
- */
-export async function activatePackageProduct(root: string, productDirectory: string, check = false): Promise<boolean> {
-  const canonicalRoot = realpathSync(root);
-  const selected = path.resolve(root, productDirectory);
-  if (!containsPath(path.resolve(root), selected))
-    throw new Error(`package product must belong to this checkout: ${selected}`);
-  assertOwnedPath(canonicalRoot, path.resolve(canonicalRoot, path.relative(path.resolve(root), selected)));
-  if (!existsSync(selected)) {
-    if (check) return false;
-    throw new Error(`package product ${selected} is missing; run its producer in the owning checkout first`);
-  }
-  const directory = realpathSync(selected);
-  assertOwnedPath(canonicalRoot, directory);
-  const manifestPath = path.join(directory, 'product.json');
-  assertOwnedPath(canonicalRoot, manifestPath);
-  if (!existsSync(manifestPath)) {
-    if (check) return false;
-    throw new Error(`${manifestPath} is missing; run the portable product producer first`);
-  }
-  const product = readPackageProduct(manifestPath);
-  if (product.closure.platform !== process.platform || product.closure.arch !== process.arch) {
-    if (check) return false;
-    throw new Error(`${manifestPath}: rebuild this product for ${process.platform}/${process.arch}`);
-  }
-  const assetPath = path.join(directory, product.asset);
-  assertOwnedPath(canonicalRoot, assetPath);
-  if (!existsSync(assetPath)) {
-    if (check) return false;
-    throw new Error(`${assetPath} is missing; run the portable product producer first`);
-  }
-  // Hash and extract the same bytes; a producer/cache restore cannot replace the
-  // file between verification and extraction and give this identity new bytes.
-  const asset = readFileSync(assetPath);
-  const integrity = `sha512-${new Bun.CryptoHasher('sha512').update(asset).digest('base64')}`;
-  if (integrity !== product.integrity) {
-    if (check) return false;
-    throw new Error(`${assetPath}: asset integrity does not match product.json; no package was activated`);
-  }
-  const generation = path.join(directory, 'generations', product.identity);
-  const packageRoot = path.join(generation, 'node_modules', product.closure.packageName);
-  const alias = path.join(directory, 'node_modules', product.closure.packageName);
-  assertOwnedPath(canonicalRoot, generation);
-  assertOwnedPath(canonicalRoot, packageRoot);
-  assertOwnedPath(canonicalRoot, path.dirname(alias));
-  const bindings = dependencyBindings(root, product.closure, manifestPath, check);
-  if (bindings === null) return false;
-  if (lstatSync(generation, { throwIfNoEntry: false }) !== undefined) {
-    const published = path.join(generation, 'product.json');
-    assertOwnedPath(canonicalRoot, published);
-    if (!existsSync(published) || JSON.stringify(readPackageProduct(published)) !== JSON.stringify(product)) {
-      if (check) return false;
-      throw new Error(
-        `${generation}: immutable generation identity collision; produce a new identity, never overwrite it`,
-      );
-    }
-    // The retained archive is validated as a new publication is: names and kinds first, then its exact bytes.
-    validatePackageArchive(asset, assetPath);
-    const payload = await archivePayload(asset, assetPath);
-    if (
-      !packageMetadataCurrent(packageRoot, product.closure) ||
-      !(await packageArchiveCurrent(packageRoot, payload, bindings))
-    ) {
-      if (check) return false;
-      throw new Error(
-        `${generation}: immutable package payload is not its verified archive and closure; never overwrite it`,
-      );
-    }
-    if (!packageLinksCurrent(packageRoot, bindings)) {
-      if (check) return false;
-      for (const { name, target } of bindings) {
-        replacePackageAlias(canonicalRoot, path.join(packageRoot, 'node_modules', name), target);
-      }
-    }
-  } else {
-    if (check) return false;
-    refuseLegacyPackage(alias);
-    validatePackageArchive(asset, assetPath);
-    const payload = await archivePayload(asset, assetPath);
-    const staging = mkdtempSync(path.join(directory, '.generation-'));
-    try {
-      const stagedPackage = path.join(staging, 'node_modules', product.closure.packageName);
-      mkdirSync(stagedPackage, { recursive: true });
-      const extracted = Bun.spawnSync(['tar', '-xzf', '-', '-C', stagedPackage, '--strip-components=1'], {
-        stdin: asset,
-        stdout: 'pipe',
-        stderr: 'pipe',
-      });
-      if (extracted.exitCode !== 0)
-        throw new Error(`${assetPath}: tar extraction failed: ${new TextDecoder().decode(extracted.stderr)}`);
-      verifyPackageIdentity(stagedPackage, product.closure.packageName);
-      writeFileSync(path.join(stagedPackage, 'dependency-closure.json'), JSON.stringify(product.closure));
-      for (const { name, target } of bindings) {
-        const link = path.join(stagedPackage, 'node_modules', name);
-        mkdirSync(path.dirname(link), { recursive: true });
-        symlinkSync(target, link, 'dir');
-      }
-      if (!(await packageArchiveCurrent(stagedPackage, payload, bindings))) {
-        throw new Error(`${assetPath}: extracted package differs from its verified archive; nothing was published`);
-      }
-      writeFileSync(path.join(staging, 'product.json'), JSON.stringify(product));
-      mkdirSync(path.dirname(generation), { recursive: true });
-      // The directory is complete before it becomes addressable by its identity.
-      // The install lock serializes setup owners; rename cannot replace a
-      // nonempty generation published by another owner.
-      renameSync(staging, generation);
-    } finally {
-      // This is only our unpublished scratch path, never a generation/payload.
-      rmSync(staging, { recursive: true, force: true });
-    }
-  }
-  const state = lstatSync(alias, { throwIfNoEntry: false });
-  if (state?.isSymbolicLink() && readlinkSync(alias) === packageAliasTarget(canonicalRoot, alias, packageRoot))
-    return true;
-  if (check) return false;
-  replacePackageAlias(canonicalRoot, alias, packageRoot);
-  console.error(`activated portable package ${product.closure.packageName}: ${product.identity}`);
-  return true;
-}
-
-/** A sibling checkout owns its bindings; the consumer can inspect, never repair them. */
-export function materializePackageDependencies(root: string, product: string, check = false): boolean {
-  const packageRoot = realpathSync(product);
-  const metadataPath = path.join(packageRoot, 'dependency-closure.json');
-  if (!existsSync(metadataPath)) return true;
-  const metadata = readDependencyClosure(metadataPath);
-  if (metadata.platform !== process.platform || metadata.arch !== process.arch) {
-    if (check) return false;
-    throw new Error(`${metadataPath}: rebuild this declared product for ${process.platform}/${process.arch}`);
-  }
-  const bindings = dependencyBindings(root, metadata, metadataPath, check);
-  if (bindings !== null && packageMetadataCurrent(packageRoot, metadata) && packageLinksCurrent(packageRoot, bindings))
-    return true;
-  if (check) return false;
-  throw new Error(
-    `local product ${packageRoot} needs binding by its owning checkout; run its declared activation target`,
-  );
-}
-
-/** Activate contained declared products before planning links, including an absent stable alias. */
-export async function materializeDeclaredPackages(root: string, check = false): Promise<boolean> {
-  const anchor = linkAnchor(root);
-  const canonicalRoot = realpathSync(root);
-  const activated = new Set<string>();
-  for (const [name, relative] of readDeclaredLinks(root)) {
-    const target = declaredTarget(root, anchor, relative);
-    const contained = containsPath(path.resolve(root), target);
-    const portableAlias = target.endsWith(`${path.sep}${path.join('node_modules', name)}`);
-    if (contained) {
-      const directory = enclosingProductDirectory(root, target);
-      if (directory !== null) {
-        const canonicalDirectory = path.resolve(canonicalRoot, path.relative(path.resolve(root), directory));
-        assertOwnedPath(canonicalRoot, canonicalDirectory);
-        assertOwnedPath(canonicalRoot, path.join(canonicalDirectory, 'product.json'));
-        const product = readPackageProduct(path.join(directory, 'product.json'));
-        if (product.closure.packageName !== name || target !== path.join(directory, 'node_modules', name))
-          throw new Error(
-            `smoo.developerLinks ${name}: declaration must select its product's stable node_modules package`,
-          );
-        if (!activated.has(directory)) {
-          if (!(await activatePackageProduct(root, directory, check))) return false;
-          activated.add(directory);
-        }
-        continue;
-      }
-      if (portableAlias) {
-        if (check) return false;
-        throw new Error(
-          `contained declared product ${target} has no enclosing product.json; run its owning producer first`,
-        );
-      }
-      assertOwnedPath(canonicalRoot, path.resolve(canonicalRoot, path.relative(path.resolve(root), target)));
-      if (existsSync(path.join(target, 'dependency-closure.json'))) {
-        if (check) return false;
-        throw new Error(
-          `contained declared product ${target} has no enclosing product.json; run its owning producer first`,
-        );
-      }
-    }
-    if (unavailableReason(target) !== null) {
-      if (check && portableAlias) return false;
-      if (contained) {
-        for (const tree of nodeModulesTrees(root)) {
-          const entry = path.join(tree, name);
-          const at = path.join(root, entry);
-          if (!lstatSync(at, { throwIfNoEntry: false })?.isSymbolicLink()) continue;
-          const current = resolvedTarget(root, { path: entry, target: readlinkSync(at) });
-          if (!containsPath(path.resolve(root), current) && inheritedContainedBinding(anchor, relative, current)) {
-            if (check) return false;
-            throw new Error(
-              `contained declared package ${name} is missing at ${target}; run its producer in this checkout, never borrow the main checkout's package`,
-            );
-          }
-        }
-      }
-      continue;
-    }
-    if (!materializePackageDependencies(root, target, check)) return false;
-  }
-  return true;
-}
-
 function containsPath(root: string, candidate: string): boolean {
   const relative = path.relative(root, candidate);
   return relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
@@ -573,17 +388,16 @@ function containsPath(root: string, candidate: string): boolean {
 
 /** Existing ancestors must be real owned directories, not redirected namespaces. */
 function assertOwnedPath(root: string, candidate: string): void {
-  if (!containsPath(root, candidate)) throw new Error(`package product escapes its owning checkout: ${candidate}`);
+  if (!containsPath(root, candidate)) throw new Error(`owned path escapes its owning checkout: ${candidate}`);
   let existing = candidate;
   while (true) {
     try {
-      if (realpathSync(existing) !== existing)
-        throw new Error(`package product path redirects its owned namespace: ${candidate}`);
+      if (realpathSync(existing) !== existing) throw new Error(`path redirects its owned namespace: ${candidate}`);
       return;
     } catch (error) {
       if (!(error instanceof Error && 'code' in error && error.code === 'ENOENT')) throw error;
       if (lstatSync(existing, { throwIfNoEntry: false })?.isSymbolicLink())
-        throw new Error(`package product path has a dangling redirected namespace: ${candidate}`);
+        throw new Error(`path has a dangling redirected namespace: ${candidate}`);
       const parent = path.dirname(existing);
       if (parent === existing) throw error;
       existing = parent;
@@ -591,21 +405,11 @@ function assertOwnedPath(root: string, candidate: string): void {
   }
 }
 
-function enclosingProductDirectory(root: string, target: string): string | null {
-  let directory = path.dirname(target);
-  while (containsPath(path.resolve(root), directory)) {
-    if (existsSync(path.join(directory, 'product.json'))) return directory;
-    if (directory === path.resolve(root)) break;
-    directory = path.dirname(directory);
-  }
-  return null;
-}
-
 function refuseLegacyPackage(alias: string): void {
   const state = lstatSync(alias, { throwIfNoEntry: false });
   if (state !== undefined && !state.isSymbolicLink())
     throw new Error(
-      `refuse to replace live non-link package ${alias}; its owning checkout must relocate this legacy payload to a distinct retained directory while its CLI/daemon is inactive, then run activation`,
+      `refuse to replace live non-link package ${alias}; its owning checkout must relocate this legacy directory to a distinct retained path while its CLI/daemon is inactive, then run the developer-links task again`,
     );
 }
 
@@ -629,308 +433,6 @@ function replacePackageAlias(root: string, alias: string, target: string): void 
 /** Owned namespace aliases relocate with a checkout; genuine host/sibling bindings do not. */
 function packageAliasTarget(root: string, alias: string, target: string): string {
   return containsPath(path.resolve(root), path.resolve(target)) ? path.relative(path.dirname(alias), target) : target;
-}
-
-function verifyPackageIdentity(packageRoot: string, expected: string): void {
-  const file = path.join(packageRoot, 'package.json');
-  const identity: unknown = JSON.parse(readFileSync(file, 'utf8'));
-  if (
-    typeof identity !== 'object' ||
-    identity === null ||
-    Array.isArray(identity) ||
-    Reflect.get(identity, 'name') !== expected
-  )
-    throw new Error(`${file}: package identity does not match its portable dependency closure`);
-}
-
-/** The generation's own record: package.json names its identity, dependency-closure.json is the closure published. */
-function packageMetadataCurrent(packageRoot: string, metadata: PackageDependencyClosure): boolean {
-  const manifest = path.join(packageRoot, 'package.json');
-  const closure = path.join(packageRoot, 'dependency-closure.json');
-  if (
-    !lstatSync(manifest, { throwIfNoEntry: false })?.isFile() ||
-    !lstatSync(closure, { throwIfNoEntry: false })?.isFile()
-  )
-    return false;
-  verifyPackageIdentity(packageRoot, metadata.packageName);
-  return JSON.stringify(readDependencyClosure(closure)) === JSON.stringify(metadata);
-}
-
-/** Each host binding is a symlink to its exact store target; only activation repairs one. */
-function packageLinksCurrent(
-  packageRoot: string,
-  bindings: readonly { readonly name: string; readonly target: string }[],
-): boolean {
-  for (const { name, target } of bindings) {
-    const link = path.join(packageRoot, 'node_modules', name);
-    const state = lstatSync(link, { throwIfNoEntry: false });
-    if (
-      !state?.isSymbolicLink() ||
-      path.resolve(path.dirname(link), readlinkSync(link)) !== target ||
-      realpathSync(path.dirname(link)) !== path.dirname(link)
-    )
-      return false;
-  }
-  return true;
-}
-
-/**
- * The canonical tar's regular files by package-relative path, read in memory by Bun.Archive. They are compared with
- * the generation and never unpacked to check it; only validated names become lookup paths.
- */
-async function archivePayload(asset: Uint8Array, source: string): Promise<ReadonlyMap<string, File>> {
-  const payload = new Map<string, File>();
-  for (const [name, file] of await new Bun.Archive(asset).files()) {
-    if (!name.startsWith('package/') || !safeArchiveName(name))
-      throw new Error(`${source}: unsafe archive path ${JSON.stringify(name)}`);
-    payload.set(name.slice('package/'.length), file);
-  }
-  return payload;
-}
-
-/** What a generation may hold beyond its directories: the archive's files, and the owner's host bindings and scopes. */
-interface OwnedEntries {
-  readonly payload: ReadonlyMap<string, File>;
-  readonly links: ReadonlySet<string>;
-  readonly scopes: ReadonlySet<string>;
-}
-
-/**
- * A generation is exactly the archive's regular files, each a real file in this namespace holding the archive's bytes,
- * plus the owner's records: dependency-closure.json and, under node_modules, the host bindings the closure names
- * (symlinks) with their scope directories. Missing, redirected, changed or extra entries refuse; nothing is rewritten.
- */
-async function packageArchiveCurrent(
-  packageRoot: string,
-  payload: ReadonlyMap<string, File>,
-  bindings: readonly { readonly name: string }[],
-): Promise<boolean> {
-  for (const [relative, file] of payload) {
-    const target = path.join(packageRoot, relative);
-    // lstat never follows the leaf, and the realpath must be the path itself: no link on the path leaves the namespace.
-    const regular = lstatSync(target, { throwIfNoEntry: false })?.isFile() === true && realpathSync(target) === target;
-    if (!regular || !readFileSync(target).equals(await file.bytes())) return false;
-  }
-  const links = new Set(bindings.map(({ name }) => name));
-  const scopes = new Set(
-    [...links].filter((name) => name.startsWith('@')).map((name) => name.slice(0, name.indexOf('/'))),
-  );
-  return onlyOwnedEntries(packageRoot, '', { payload, links, scopes });
-}
-
-/** Every entry under `directory`, found without following links, must be owned; '' is the package root. */
-function onlyOwnedEntries(packageRoot: string, directory: string, owned: OwnedEntries): boolean {
-  for (const entry of directoryEntries(path.join(packageRoot, directory))) {
-    const relative = directory === '' ? entry.name : `${directory}/${entry.name}`;
-    if (!ownedEntry(relative, entry, owned)) return false;
-    if (entry.isDirectory() && !onlyOwnedEntries(packageRoot, relative, owned)) return false;
-  }
-  return true;
-}
-
-function ownedEntry(relative: string, entry: Dirent, owned: OwnedEntries): boolean {
-  if (relative === 'dependency-closure.json') return entry.isFile();
-  if (relative === 'node_modules') return entry.isDirectory();
-  if (relative.startsWith('node_modules/')) {
-    const name = relative.slice('node_modules/'.length);
-    return entry.isSymbolicLink() ? owned.links.has(name) : entry.isDirectory() && owned.scopes.has(name);
-  }
-  return entry.isDirectory() || (entry.isFile() && owned.payload.has(relative));
-}
-
-function dependencyBindings(
-  root: string,
-  metadata: PackageDependencyClosure,
-  source: string,
-  check: boolean,
-): readonly { readonly name: string; readonly target: string }[] | null {
-  if (metadata.dependencies.length === 0) return [];
-  const cache = Bun.spawnSync(['bun', 'pm', 'cache'], { cwd: root, stdout: 'pipe', stderr: 'pipe' });
-  if (cache.exitCode !== 0)
-    throw new Error(`cannot resolve the installed Bun store: ${new TextDecoder().decode(cache.stderr)}`);
-  const storeRoot = realpathSync(new TextDecoder().decode(cache.stdout).trim());
-  const bindings: { name: string; target: string }[] = [];
-  for (const dependency of metadata.dependencies) {
-    const target = path.join(storeRoot, dependency.storePath);
-    try {
-      if (realpathSync(target) !== target) {
-        if (check) return null;
-        throw new Error(`${source}: dependency ${dependency.name} redirects outside its immutable store identity`);
-      }
-      const installed: unknown = JSON.parse(readFileSync(path.join(target, 'package.json'), 'utf8'));
-      if (
-        typeof installed !== 'object' ||
-        installed === null ||
-        Array.isArray(installed) ||
-        Reflect.get(installed, 'name') !== dependency.name ||
-        Reflect.get(installed, 'version') !== dependency.version
-      ) {
-        if (check) return null;
-        throw new Error(`${source}: installed ${dependency.name} does not match its declared content identity`);
-      }
-      for (const binding of dependency.bindingPaths) {
-        if (realpathSync(path.join(storeRoot, binding)) !== target) {
-          if (check) return null;
-          throw new Error(`${source}: installed transitive binding ${binding} does not match ${dependency.name}`);
-        }
-      }
-    } catch (error) {
-      if (error instanceof Error && 'code' in error && (error.code === 'ENOENT' || error.code === 'ENOTDIR')) {
-        if (check) return null;
-        throw new Error(
-          `${source}: installed dependency ${dependency.name} is missing; install the locked closure before activation`,
-          { cause: error },
-        );
-      }
-      throw error;
-    }
-    if (dependency.direct) bindings.push({ name: dependency.name, target });
-  }
-  return bindings;
-}
-
-/** The producer packs only regular files/directories under package/, never host links. */
-function validatePackageArchive(asset: Uint8Array, source: string): void {
-  const listing = Bun.spawnSync(['tar', '-tzf', '-'], { stdin: asset, stdout: 'pipe', stderr: 'pipe' });
-  if (listing.exitCode !== 0)
-    throw new Error(`${source}: cannot list tar asset: ${new TextDecoder().decode(listing.stderr)}`);
-  const names = new TextDecoder().decode(listing.stdout).trimEnd().split('\n');
-  if (names.length === 0 || !names.includes('package/package.json'))
-    throw new Error(`${source}: expected an npm package archive containing package/package.json`);
-  for (const name of names) {
-    if (!safeArchiveName(name)) throw new Error(`${source}: unsafe or owner-only archive path ${JSON.stringify(name)}`);
-  }
-  const kinds = Bun.spawnSync(['tar', '-tzvf', '-'], { stdin: asset, stdout: 'pipe', stderr: 'pipe' });
-  if (kinds.exitCode !== 0)
-    throw new Error(`${source}: cannot inspect tar asset: ${new TextDecoder().decode(kinds.stderr)}`);
-  if (
-    new TextDecoder()
-      .decode(kinds.stdout)
-      .trimEnd()
-      .split('\n')
-      .some((entry) => entry[0] !== '-' && entry[0] !== 'd')
-  )
-    throw new Error(`${source}: portable package archives must contain only regular files and directories`);
-}
-
-/** A tar entry name a portable package may carry: under package/, plain components, never the owner's records. */
-function safeArchiveName(name: string): boolean {
-  const components = name.replace(/\/$/, '').split('/');
-  return (
-    components[0] === 'package' &&
-    !components.some(
-      (component) =>
-        component.length === 0 ||
-        /\\|\p{Cc}/u.test(component) ||
-        component === '.' ||
-        component === '..' ||
-        component === 'node_modules',
-    ) &&
-    name !== 'package/dependency-closure.json'
-  );
-}
-
-/** Bootstrap precedes installed workspace validators; use its existing explicit boundary validation. */
-function productFields(value: unknown, fields: readonly string[], source: string): object {
-  if (
-    typeof value !== 'object' ||
-    value === null ||
-    Array.isArray(value) ||
-    Object.keys(value).length !== fields.length ||
-    fields.some((field) => !Object.hasOwn(value, field))
-  )
-    throw new Error(`${source}: invalid portable package fields`);
-  return value;
-}
-
-function portablePath(value: unknown, source: string): string {
-  if (
-    typeof value !== 'string' ||
-    value.length === 0 ||
-    path.isAbsolute(value) ||
-    value.split('/').some((part) => !/^[A-Za-z0-9_@][A-Za-z0-9._@+%=-]*$/.test(part) || part === '.' || part === '..')
-  )
-    throw new Error(`${source}: dependency identity must be a contained Bun-store-relative path`);
-  return value;
-}
-
-function readPackageProduct(file: string): PortablePackageProduct {
-  const value = productFields(
-    JSON.parse(readFileSync(file, 'utf8')),
-    ['version', 'identity', 'asset', 'integrity', 'closure'],
-    file,
-  );
-  const version: unknown = Reflect.get(value, 'version');
-  const identity: unknown = Reflect.get(value, 'identity');
-  const asset: unknown = Reflect.get(value, 'asset');
-  const integrity: unknown = Reflect.get(value, 'integrity');
-  if (
-    version !== 1 ||
-    typeof identity !== 'string' ||
-    identity.split('/').some((component) => !/^[A-Za-z0-9_-][A-Za-z0-9._-]*$/.test(component)) ||
-    typeof asset !== 'string' ||
-    !/^[A-Za-z0-9_-][A-Za-z0-9._-]*\.tgz$/.test(asset) ||
-    typeof integrity !== 'string' ||
-    !/^sha512-[A-Za-z0-9+/]{86}==$/.test(integrity)
-  )
-    throw new Error(`${file}: invalid portable product identity, asset or sha512 integrity`);
-  return { version, identity, asset, integrity, closure: dependencyClosure(Reflect.get(value, 'closure'), file) };
-}
-
-function readDependencyClosure(file: string): PackageDependencyClosure {
-  return dependencyClosure(JSON.parse(readFileSync(file, 'utf8')), file);
-}
-
-function dependencyClosure(input: unknown, file: string): PackageDependencyClosure {
-  const value = productFields(input, ['version', 'packageName', 'platform', 'arch', 'dependencies'], file);
-  const version: unknown = Reflect.get(value, 'version');
-  const packageName: unknown = Reflect.get(value, 'packageName');
-  const platform: unknown = Reflect.get(value, 'platform');
-  const arch: unknown = Reflect.get(value, 'arch');
-  const records: unknown = Reflect.get(value, 'dependencies');
-  if (
-    version !== 1 ||
-    typeof packageName !== 'string' ||
-    !PACKAGE_NAME.test(packageName) ||
-    typeof platform !== 'string' ||
-    !/^(aix|android|darwin|freebsd|haiku|linux|openbsd|sunos|win32)$/.test(platform) ||
-    typeof arch !== 'string' ||
-    !/^(arm|arm64|ia32|loong64|mips|mipsel|ppc|ppc64|riscv64|s390|s390x|x64)$/.test(arch) ||
-    !Array.isArray(records)
-  )
-    throw new Error(`${file}: invalid portable package identity`);
-  const identities = new Set<string>();
-  const directNames = new Set<string>();
-  const bindings = new Set<string>();
-  const dependencies = records.map((input: unknown) => {
-    const record = productFields(input, ['name', 'version', 'storePath', 'bindingPaths', 'direct'], file);
-    const name: unknown = Reflect.get(record, 'name');
-    const version: unknown = Reflect.get(record, 'version');
-    const storePath = portablePath(Reflect.get(record, 'storePath'), file);
-    const bindingPaths: unknown = Reflect.get(record, 'bindingPaths');
-    const direct: unknown = Reflect.get(record, 'direct');
-    if (
-      typeof name !== 'string' ||
-      !PACKAGE_NAME.test(name) ||
-      typeof version !== 'string' ||
-      !/^[0-9][0-9A-Za-z.+_-]*$/.test(version) ||
-      typeof direct !== 'boolean' ||
-      !Array.isArray(bindingPaths) ||
-      identities.has(storePath) ||
-      (direct && directNames.has(name))
-    )
-      throw new Error(`${file}: invalid or duplicate dependency identity`);
-    identities.add(storePath);
-    if (direct) directNames.add(name);
-    const paths = bindingPaths.map((input: unknown) => {
-      const binding = portablePath(input, file);
-      if (bindings.has(binding)) throw new Error(`${file}: duplicate dependency binding ${binding}`);
-      bindings.add(binding);
-      return binding;
-    });
-    return { name, version, storePath, bindingPaths: paths, direct };
-  });
-  return { version, packageName, platform, arch, dependencies };
 }
 
 /** Why `target` cannot be linked to, or null when it is a directory this process can reach. */
@@ -989,7 +491,7 @@ function readDeclaredLinks(root: string): [string, string][] {
   });
 }
 
-/** Project-contained source products follow their checkout; siblings retain the shared main anchor. */
+/** Project-contained declared directories follow their checkout; siblings retain the shared main anchor. */
 function declaredTarget(root: string, anchor: string, relative: string): string {
   const shared = path.resolve(anchor, relative);
   const inside = path.relative(anchor, shared);
@@ -1001,7 +503,7 @@ function declaredTarget(root: string, anchor: string, relative: string): string 
     try {
       const physical = path.relative(canonicalRoot, realpathSync(existing));
       if (physical === '..' || physical.startsWith(`..${path.sep}`) || path.isAbsolute(physical)) {
-        throw new Error(`contained developer product escapes its owning checkout: ${candidate}`);
+        throw new Error(`contained declared directory escapes its owning checkout: ${candidate}`);
       }
       return candidate;
     } catch (error) {
@@ -1015,9 +517,9 @@ function declaredTarget(root: string, anchor: string, relative: string): string 
 
 /**
  * The stable anchor for genuine sibling directories is the project's main checkout.
- * A cowshed marker names it without reading main's tree. Contained source products
- * are projected into the current checkout by `declaredTarget`, with physical
- * containment checked against symlink escapes.
+ * A cowshed marker names it without reading main's tree. Contained declared
+ * directories are projected into the current checkout by `declaredTarget`, with
+ * physical containment checked against symlink escapes.
  */
 function linkAnchor(root: string): string {
   let marker: unknown;

@@ -1,35 +1,39 @@
 import { expect, it } from 'bun:test';
 import { execFileSync, spawn } from 'node:child_process';
 import { mkdir, readFile, realpath, symlink, writeFile } from 'node:fs/promises';
+import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
+import { resolveFromWorkspace } from 'nx/src/utils/installation-directory.js';
 import { readModulePackageJson } from 'nx/src/utils/package-json.js';
 import { guardEvent } from './__tests__/counted-cargo.js';
 import { fixtureNxEnv, withNxFixture } from './__tests__/fixture-nx-env.js';
 
 /**
  * Guards the workspace-resolution hunk of `patches/nx@23.2.1.patch`, the local build of nrwl/nx#37272. The
- * fixture selects the lockfile's immutable Bun-store install, independent of a developer-linked local product.
- * It sits next to nothing but Nx's own dependencies. Nx 23.2.1 loads `typescript` with a
- * plain `require`, which from there finds nothing: its dependency analysis then skips every TypeScript import and
- * the graph loses each edge one project's source import makes to another, without a warning (12 of this
- * repository's 44 edges). The patched Nx resolves `typescript` from the workspace first. Release version actions
- * take the same resolution; `packages/cli`'s release-version tests run them through it.
+ * fixture links the installed Nx and this repository's TypeScript into a workspace, so the graph is computed by the
+ * Nx this repository runs. Nx 23.2.1 loads `typescript` with a plain `require` from its own location; where that
+ * location cannot see TypeScript, its dependency analysis skips every TypeScript import and the graph loses each
+ * edge one project's source import makes to another, without a warning (12 of this repository's 44 edges). Bun's
+ * project-local layout hoists a TypeScript into the ancestry of Nx, so the graph alone no longer proves the fix: the
+ * test also asserts that `resolveFromWorkspace` returns the workspace's `typescript`. Release version actions take
+ * the same resolution; `packages/cli`'s release-version tests run them through it.
  *
  * Drop the hunk, and keep this test, once the Nx version in use contains that fix.
  */
 
 const repositoryRoot = join(import.meta.dir, '../../..');
 
-it('keeps the source-import edges when Nx is linked from the global store', async () => {
-  const nx = await realpath(dirname(readModulePackageJson('nx', [join(repositoryRoot, 'node_modules/.bun')]).path));
-  const store = await realpath(execFileSync('bun', ['pm', 'cache'], { cwd: repositoryRoot, encoding: 'utf8' }).trim());
-  if (!nx.startsWith(`${store}/`)) throw new Error(`the controlled fixture has no locked immutable Nx package: ${nx}`);
+it('keeps the source-import edges of the installed Nx, resolving typescript from the workspace', async () => {
+  const nx = await realpath(dirname(readModulePackageJson('nx', [repositoryRoot]).path));
   const typescript = dirname(readModulePackageJson('typescript', [repositoryRoot]).path);
 
   await withNxFixture('nx-store-resolution-', async ({ workspace: root, socketDirectory }) => {
     await mkdir(join(root, 'node_modules'));
     await symlink(nx, join(root, 'node_modules/nx'), 'dir');
     await symlink(typescript, join(root, 'node_modules/typescript'), 'dir');
+    expect(await realpath(resolveFromWorkspace('typescript', root))).toBe(
+      await realpath(createRequire(join(repositoryRoot, 'package.json')).resolve('typescript')),
+    );
     await writeFile(join(root, '.gitignore'), 'node_modules\n.nx\n');
     await writeFile(join(root, 'package.json'), JSON.stringify({ name: 'store-resolution-fixture', private: true }));
     // The fixture's root package.json names no @nx/* package, so Nx analyzes source files only when told to.

@@ -1,12 +1,9 @@
 import { expect, it } from 'bun:test';
 import type { ProjectGraph, ProjectGraphProjectNode } from 'nx/src/config/project-graph';
-import { createTaskGraph } from '../../../.cache/patched-nx/node_modules/nx/dist/src/tasks-runner/create-task-graph.js';
-import { findCycles } from '../../../.cache/patched-nx/node_modules/nx/dist/src/tasks-runner/task-graph-utils.js';
+import { createTaskGraph } from 'nx/src/tasks-runner/create-task-graph.js';
+import { findCycles } from 'nx/src/tasks-runner/task-graph-utils.js';
 
 /**
- * Loads the immutable package generation activated from the declared patched-nx producer's actual tarball,
- * not the previously installed release. Test shards and typechecking depend on publication and activation,
- * and hash the portable producer's output bytes.
  * Guards the task-graph hunk of `patches/nx@23.2.1.patch`. A target that depends on `^build` through a project with
  * no `build` target of its own gets a dummy task for that project, and Nx flattens each dummy into the real tasks
  * behind it, except a dummy it believes sits in a cycle, which contributes nothing. Nx 23.2.1 believed that of every

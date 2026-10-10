@@ -1,55 +1,26 @@
 # Patches
 
 Patches this repository applies to its dependencies. `bun install` applies the root `package.json`'s
-`patchedDependencies`. `nx@23.2.1.patch` is the exception: `tooling/patched-nx.ts` applies it to the registry tarball
-and packs the result as an immutable GitHub release, which the root `overrides.nx` installs. The Patched Nx workflow
-builds that release twice, byte for byte, and verifies the published asset against `bun.lock`. The root
-`overrides["@nx/js"]` holds every `@nx/js` at 23.2.1, the version its patch applies to: nx-plugin declares
-`"@nx/js": "latest"`, and any lock change would otherwise nest the newest release beside it, unpatched.
+`patchedDependencies`, including `nx@23.2.1.patch`. The root `overrides.nx` pins the registry version `23.2.1`;
+`bun.lock` is written by Bun and records that version, registry integrity and patch path. The root `overrides["@nx/js"]`
+likewise pins `23.2.1`, the version its patch applies to.
 
 ## Activating a patch change
 
-Nx is never developer-linked: this repository and its consumers install only the served release, which `overrides.nx`
-names and `bun.lock` pins by integrity. A tarball dependency lands in Bun's read-only global store
-(`~/.bun/install/cache/links`) like every other package. A `node_modules/nx` link to `.cache/patched-nx/package` would
-put a writable, unpinned Nx in its place, and a consumer that admits only a store realpath for the Nx it runs refuses
-that. A patch change therefore reaches local acceptance as a release. Land the patch on main and the Patched Nx workflow
-publishes the new content-addressed tag; `bun tooling/patched-nx.ts build <out-dir>` prints that tag and integrity
-beforehand. Then point `overrides.nx` at the new URL and run `bun install`, here and in each consumer.
-`bun tooling/patched-nx.ts lock <integrity>` confirms the lock matches the served asset. The library packages
-(`@smoothbricks/*`) keep their `smoo.developerLinks` path before publication (packages/cli README, "Declared Links").
+Generate Nx changes with `bun patch nx@23.2.1` and `bun patch --commit nx@23.2.1`, against the pinned registry package.
+This records the exact hunk coordinates Bun applies; a diff that only works after Git relocates its context can corrupt
+the installed product. Keep the managed consumer copy identical, then run ordinary `bun install` and commit the patch
+with Bun's lock changes. Nx is never developer-linked and needs no release publication, generated tarball or
+package-activation target. Bun's isolated global store deliberately keeps patched entries project-local under
+`node_modules/.bun`; their installed patch marker and cached patch identity distinguish the patched bytes. Do not
+replace that package with a writable generated-product link or hand-edit its installed files. The installed-product
+regression runs `node --check` on every patched JavaScript file as well as checking the five-minute inactivity policy.
 
-Project-contained declarations resolve to the current checkout's generated product, including a cowshed checkout; they
-never borrow the main checkout's same-path product. Existing ancestors and final targets must remain physically inside
-that checkout, so symlink escapes are refused even before a product exists. Genuine sibling declarations retain their
-main-checkout anchor. This is the shared developer-link rule, not an Nx-only sandbox allowance.
-
-The product is installed under its own `node_modules/nx` namespace, which the real CLI's local/self resolver consumes;
-no checkout-ancestor lookup or external alias stands in for that package layout.
-
-The cached product contains only the canonical tar, release notes and `product.json`: the existing release identity, the
-declared producer's existing Nx task hash, asset integrity and portable dependency closure. No installed generation or
-host-bound symlink is a cached output. The explicit `patched-nx-bindings` dependency uses the existing setup owner
-(`--links --package-product .cache/patched-nx`) to verify the asset and publish a completed immutable
-`generations/<identity>/node_modules/nx` tree before switching the stable `node_modules/nx` alias. Equal identities are
-no-op publications; collisions refuse, and previous generations are retained for live CLI and daemon owners. Before any
-retained generation is accepted or rebound, each regular payload file, JavaScript and native executables included, must
-be a real file whose bytes equal the canonical tar entry, read by `Bun.Archive` without unpacking. A missing,
-redirected, changed or extra file refuses in `--check` and activation alike, and no file in the generation is rewritten.
-Producer execution and cache restoration therefore cannot remove package files from beneath those processes. Neither a
-second hasher nor a registry names generations.
-
-Owned generation and project-contained declaration aliases are relative to their own namespace, so a source-image fork
-selects its own copied package without reading the donor. Activation checks and atomically normalizes older absolute
-owned aliases. Genuine sibling links and immutable-store host bindings retain their separate, host-local authority.
-
-Host-local package-name bindings are materialized before activation; stale foreign bindings fail `--check` and are
-rebound by the activation owner, never by a consumer repair. Sandbox hotlaunch consumers resolve the retained relative
-identities against the admitted current Bun store and verify the actual package names and versions. The provider
-checkout's general hoist directory is never borrowed. Because grants canonicalize symlinks, transitive reads admit the
-containing immutable package-private dependency namespace only after every reachable payload in it is proven to belong
-to the declared closure. Direct product links need no installed ancestor namespace. No ancestor store, home or provider
-hoist is granted.
+The nx-plugin managed files distribute the same Nx patch to consumers. The root monorepo policy maintains
+`overrides.nx = "23.2.1"` and `patchedDependencies["nx@23.2.1"] = "patches/nx@23.2.1.patch"`. Run `smoo monorepo update`
+and ordinary `bun install` in a consumer to adopt it. Tests import the actual installed Nx package, so a source gate
+covers the currently maintained patch without publishing anything. Drop a carried hunk only when the installed upstream
+version contains its repair, retaining its regression test.
 
 ## Canonical daemon workspace roots
 
@@ -58,8 +29,8 @@ a workspace foreign to itself, but a different workspace remains refused. The no
 root: POSIX `/`, Windows drive roots and UNC share roots remain absolute, Windows case/separator rules remain intact,
 and POSIX case and backslash filename components retain their meaning.
 
-`nx-daemon-root-normalization.test.ts` consumes the declared patched artifact. It checks both platform rules and drives
-an actual owned daemon RPC with the same root's trailing separator, then a genuinely foreign root, and verifies the
+`nx-daemon-root-normalization.test.ts` consumes the actual Bun-installed patched Nx. It checks both platform rules and
+drives an owned daemon RPC with the same root's trailing separator, then a genuinely foreign root, and verifies the
 daemon remains available to its own workspace. No caller root override, shared-socket allowance or namespace workaround
 replaces the guard. Drop this hunk only when upstream contains the same normalization, retaining the regression.
 
@@ -73,11 +44,9 @@ builds; no dependency of the nineteen requested-closure tasks was changed.
 
 The selection happens at Nx's graph-construction owner, not in a consumer cache probe or launcher. Explicitly requested
 tasks, genuine producer edges, continuous-only dependencies and real task cycles remain intact. The existing
-`nx-task-graph-cycles.test.ts` guards both this closure rule and cycle membership against the package extracted from the
-actual tarball produced by `@smoothbricks/codebase:patched-nx`. Every test shard and test typecheck depends on that
-producer and hashes its output bytes, so a source gate tests the current patch before its public release is installed.
-The registry dependency and its frozen lock remain unchanged until the served release is pinned; the maintained local
-package declaration may select the generated product before then. Drop each carried hunk only when the installed
+`nx-task-graph-cycles.test.ts` guards both this closure rule and cycle membership against the actual Bun-installed
+patched package. Ordinary installation applies the current patch before test typechecking or execution; no publication
+or generated product substitutes for the lock-selected implementation. Drop each carried hunk only when the installed
 upstream version contains its respective repair, retaining the regressions.
 
 ## Upstream PR draft: Nx `findCycles`
@@ -512,5 +481,5 @@ Run `nx test nx --testFile=packages/nx/src/tasks-runner/create-task-graph.spec.t
 
 ### After the PR is opened
 
-Move the `task graph` entry of `NOT_YET_UPSTREAM` in `tooling/patched-nx.ts` to `UPSTREAM` with the PR number. That only
-changes the release notes; the tag is the sha256 of the packed tar, and the patch does not change.
+Update the draft's status with the upstream PR number. Retain the carried patch and its regressions until the installed
+registry version contains the repair.

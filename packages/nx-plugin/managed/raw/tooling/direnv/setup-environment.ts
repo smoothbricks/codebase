@@ -21,11 +21,9 @@ import path from 'node:path';
 import { parseArgs } from 'node:util';
 import { $ } from 'bun';
 import {
-  activatePackageProduct,
   applyDeclaredLinks,
   hasDanglingDeveloperLinks,
   keepDeveloperLinks,
-  materializeDeclaredPackages,
   planDeclaredLinks,
   reportDeveloperLinks,
 } from './developer-links.ts';
@@ -144,15 +142,12 @@ const POST_COMMIT_BLOCK = [
 // `status` is `--links --check`. A status, not a file list, because what it
 // keeps is the trees' own state: a checkout whose links an install or a clone
 // lost has changed no file devenv could name.
-// `--package-product <directory>` explicitly activates the contained portable
-// product.json there, including in CI, without changing developer declarations.
 // Declared above the bootstrap block for the same hoisting reason as above.
 const { values: flags } = parseArgs({
   options: {
     python: { type: 'string' },
     cargo: { type: 'boolean' },
     links: { type: 'boolean' },
-    'package-product': { type: 'string' },
     check: { type: 'boolean' },
   },
 });
@@ -166,30 +161,15 @@ const CARGO_WORKSPACE = /^\s*\[workspace\]/m;
 process.chdir(projectRoot);
 
 try {
-  if (flags.links === true || flags['package-product'] !== undefined) {
-    // CI builds against the published packages its lockfile names; only an
-    // explicit product activation may change its owned installed generation.
-    if (process.env.GITHUB_ACTIONS === 'true' && flags['package-product'] === undefined) {
+  if (flags.links === true) {
+    // CI builds against the published packages its lockfile names; it never links them.
+    if (process.env.GITHUB_ACTIONS === 'true') {
       process.exit(0);
     }
-    if (flags['package-product'] !== undefined) {
-      if (path.isAbsolute(flags['package-product']))
-        throw new Error('--package-product must select a product directory relative to this checkout');
-      if (flags.check === true) {
-        process.exit((await activatePackageProduct(projectRoot, flags['package-product'], true)) ? 0 : 1);
-      }
-      const ready = await withInstallLock(async () => activatePackageProduct(projectRoot, flags['package-product']));
-      process.exit(ready ? 0 : 1);
-    }
     if (flags.check === true) {
-      const ready = await materializeDeclaredPackages(projectRoot, true);
-      const plan = planDeclaredLinks(projectRoot);
-      process.exit(ready && plan.changes.length === 0 ? 0 : 1);
+      process.exit(planDeclaredLinks(projectRoot).changes.length === 0 ? 0 : 1);
     }
     await withInstallLock(async () => {
-      // A contained declaration can name an alias that does not exist yet.
-      // Publish the declared product completely before linking its consumers.
-      await materializeDeclaredPackages(projectRoot);
       applyDeclaredLinks(projectRoot, planDeclaredLinks(projectRoot));
     });
     process.exit(0);

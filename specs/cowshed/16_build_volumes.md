@@ -773,24 +773,13 @@ An Nx task hash must not change between checkouts of the same tree.
   re-keys it.
 - **Enforced by**: step 2b of every land (100% hits on main) and the fork test (100% hits in a fresh fork).
 
-A cached tool product carries portable package identities and payloads, not host-bound dependency symlinks. Its ordinary
-activation owner checks and materializes those bindings on the current host after a cache restore, before consumers run;
-stale foreign bindings fail the check rather than becoming inherited authority. A project-contained developer-link
-declaration selects the product in the current checkout and refuses physical symlink escapes, including an escaping
-existing ancestor of a not-yet-built product. Genuine sibling declarations retain their main-checkout anchor. Neither
-rule grants the main checkout or an ancestor dependency store to a cowshed sandbox.
+A project-contained developer-link declaration selects its directory in the current checkout and refuses physical
+symlink escapes, including an escaping existing ancestor of a not-yet-existing declared directory. Genuine sibling
+declarations retain their main-checkout anchor. Neither the containment nor the sibling rule grants the main checkout or
+an ancestor dependency store to a cowshed sandbox.
 
-Cached product output and the installed executable generation are distinct. The declared producer writes the portable
-asset and description only; the existing activation owner verifies and fully publishes an immutable installed
-generation, named by existing release/task content identities, before switching its stable installed-package alias.
-Producer execution and cache restoration never overwrite an installed generation. Same-byte publication is a no-op;
-prior generations remain available to their live CLI and daemon owners. No second hash, registry, caller retry or
-version-guard suppression substitutes for this lifetime boundary.
-
-An owned installed-generation alias and a project-contained developer alias are relative links within their checkout. A
-source-image fork therefore selects its own generation without borrowing its donor's tree; ordinary activation
-normalizes older absolute owned aliases. Genuine sibling links and immutable-store host bindings retain their distinct
-host-local authority.
+A project-contained developer alias is a relative link within its checkout. A source-image fork therefore selects its
+own copy without borrowing its donor's tree. Genuine sibling links retain their distinct host-local authority.
 
 ### The adoption needs the target's Nx database closed
 

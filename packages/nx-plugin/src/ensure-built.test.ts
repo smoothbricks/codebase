@@ -6,11 +6,11 @@ import { dirname, isAbsolute, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { ProjectGraph } from 'nx/src/config/project-graph';
 import type { Task } from 'nx/src/config/task-graph';
+import type { DaemonProcessJson } from 'nx/src/daemon/cache';
 import { expandOutputs, matchOutputPaths } from 'nx/src/native';
 import { getExecutorNameForTask } from 'nx/src/tasks-runner/utils';
 import { signalToCode } from 'nx/src/utils/exit-codes';
 import typia from 'typia';
-import type { DaemonProcessJson } from '../../../.cache/patched-nx/node_modules/nx/dist/src/daemon/cache.js';
 import { nxFixtureRoot, withNxFixture } from './__tests__/fixture-nx-env.js';
 import {
   assignEnvironment,

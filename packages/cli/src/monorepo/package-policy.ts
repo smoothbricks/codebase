@@ -10,6 +10,7 @@ import {
   CROSS_CHECK_SCRIPT_COMMAND,
   CROSS_CHECK_SCRIPT_NAME,
 } from '@smoothbricks/nx-plugin/cross-check-policy';
+import { managedNxPatch } from '@smoothbricks/nx-plugin/managed-files/files';
 import {
   applyPackageTargetPolicy,
   checkPackageTargetPolicy,
@@ -111,6 +112,7 @@ const rootScriptPolicy: Record<string, string> = {
 
 export function applyFixableMonorepoDefaults(root: string): void {
   applyRootScriptDefaults(root);
+  applyNxPatchDefaults(root);
   applyNxPluginDefaults(root);
   applyNxProjectNameDefaults(root);
 }
@@ -137,6 +139,33 @@ export function applyRootScriptDefaults(root: string): void {
     console.log('updated        package.json root smoo scripts');
   } else {
     console.log('unchanged      package.json root smoo scripts');
+  }
+}
+
+/** Nx is an ordinary Bun patchedDependency: the override pins the version the patch key names. */
+export function applyNxPatchDefaults(root: string): void {
+  const rootPackagePath = join(root, 'package.json');
+  const rootPackage = readJsonObject(rootPackagePath);
+  if (!rootPackage) {
+    return;
+  }
+  const overrides = rootPackage.overrides ?? {};
+  const patches = rootPackage.patchedDependencies ?? {};
+  let changed = setStringProperty(overrides, 'nx', managedNxPatch.version);
+  changed = setStringProperty(patches, managedNxPatch.key, managedNxPatch.path) || changed;
+  for (const key of Object.keys(patches)) {
+    if (key.startsWith('nx@') && key !== managedNxPatch.key) {
+      delete patches[key];
+      changed = true;
+    }
+  }
+  rootPackage.overrides = overrides;
+  rootPackage.patchedDependencies = patches;
+  if (changed) {
+    writeJsonObject(rootPackagePath, rootPackage);
+    console.log('updated        package.json nx patch policy');
+  } else {
+    console.log('unchanged      package.json nx patch policy');
   }
 }
 
@@ -284,6 +313,7 @@ export function validateRootPackagePolicy(root: string): number {
   }
   failures += validateRootScripts(rootPackage);
   failures += validateRootNxScriptInference(rootPackage);
+  failures += validateNxPatchPolicy(rootPackage);
   const packageManager = rootPackage.packageManager;
   if (!packageManager?.startsWith('bun@')) {
     console.error('package.json packageManager must use bun@<version>');
@@ -827,6 +857,28 @@ function validateRootNxScriptInference(rootPackage: PackageJson): number {
   }
   console.error('package.json nx.includedScripts must be [] so root scripts do not become recursive Nx targets.');
   return 1;
+}
+
+function validateNxPatchPolicy(rootPackage: PackageJson): number {
+  let failures = 0;
+  if (rootPackage.overrides?.nx !== managedNxPatch.version) {
+    console.error(`package.json overrides.nx must be ${managedNxPatch.version}; run smoo monorepo update`);
+    failures++;
+  }
+  const patches = rootPackage.patchedDependencies ?? {};
+  if (patches[managedNxPatch.key] !== managedNxPatch.path) {
+    console.error(
+      `package.json patchedDependencies.${managedNxPatch.key} must be ${managedNxPatch.path}; run smoo monorepo update`,
+    );
+    failures++;
+  }
+  for (const key of Object.keys(patches)) {
+    if (key.startsWith('nx@') && key !== managedNxPatch.key) {
+      console.error(`package.json patchedDependencies.${key} is obsolete; run smoo monorepo update`);
+      failures++;
+    }
+  }
+  return failures;
 }
 
 function suggestNxProjectName(rootPackageName: string, packageName: string): string | null {

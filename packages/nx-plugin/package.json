@@ -197,20 +197,6 @@
   "nx": {
     "targets": {
       "lint": {},
-      "typecheck-tests": {
-        "dependsOn": [
-          "...",
-          "@smoothbricks/codebase:patched-nx",
-          "@smoothbricks/codebase:patched-nx-bindings"
-        ],
-        "inputs": [
-          "...",
-          {
-            "dependentTasksOutputFiles": "**/*",
-            "transitive": false
-          }
-        ]
-      },
       "test": {
         "executor": "nx:noop",
         "dependsOn": [
@@ -223,18 +209,6 @@
       },
       "test-shard1": {
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
-        "dependsOn": [
-          "...",
-          "@smoothbricks/codebase:patched-nx",
-          "@smoothbricks/codebase:patched-nx-bindings"
-        ],
-        "inputs": [
-          "...",
-          {
-            "dependentTasksOutputFiles": "**/*",
-            "transitive": false
-          }
-        ],
         "options": {
           "command": "bun test --timeout=30000 --timings=test-timings.json --shard=1/4 --path-ignore-patterns='**/*-host.test.ts'",
           "cwd": "{projectRoot}",
@@ -244,18 +218,6 @@
       },
       "test-shard2": {
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
-        "dependsOn": [
-          "...",
-          "@smoothbricks/codebase:patched-nx",
-          "@smoothbricks/codebase:patched-nx-bindings"
-        ],
-        "inputs": [
-          "...",
-          {
-            "dependentTasksOutputFiles": "**/*",
-            "transitive": false
-          }
-        ],
         "options": {
           "command": "bun test --timeout=30000 --timings=test-timings.json --shard=2/4 --path-ignore-patterns='**/*-host.test.ts'",
           "cwd": "{projectRoot}",
@@ -265,18 +227,6 @@
       },
       "test-shard3": {
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
-        "dependsOn": [
-          "...",
-          "@smoothbricks/codebase:patched-nx",
-          "@smoothbricks/codebase:patched-nx-bindings"
-        ],
-        "inputs": [
-          "...",
-          {
-            "dependentTasksOutputFiles": "**/*",
-            "transitive": false
-          }
-        ],
         "options": {
           "command": "bun test --timeout=30000 --timings=test-timings.json --shard=3/4 --path-ignore-patterns='**/*-host.test.ts'",
           "cwd": "{projectRoot}",
@@ -286,18 +236,6 @@
       },
       "test-shard4": {
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
-        "dependsOn": [
-          "...",
-          "@smoothbricks/codebase:patched-nx",
-          "@smoothbricks/codebase:patched-nx-bindings"
-        ],
-        "inputs": [
-          "...",
-          {
-            "dependentTasksOutputFiles": "**/*",
-            "transitive": false
-          }
-        ],
         "options": {
           "command": "bun test --timeout=30000 --timings=test-timings.json --shard=4/4 --path-ignore-patterns='**/*-host.test.ts'",
           "cwd": "{projectRoot}",
@@ -309,20 +247,11 @@
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "dependsOn": [
           "...",
-          "@smoothbricks/codebase:patched-nx",
-          "@smoothbricks/codebase:patched-nx-bindings",
           {
             "projects": [
               "@smoothbricks/codebase"
             ],
             "target": "cargo-test-group-real-apfs"
-          }
-        ],
-        "inputs": [
-          "...",
-          {
-            "dependentTasksOutputFiles": "**/*",
-            "transitive": false
           }
         ],
         "options": {
