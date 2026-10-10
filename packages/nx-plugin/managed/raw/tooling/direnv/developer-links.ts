@@ -53,8 +53,8 @@
  * A repository can also DECLARE such links, so every checkout of it on a
  * developer machine gets them without anyone running `bun link`: the root
  * package.json's `smoo.developerLinks` maps a package name to a relative
- * directory. Contained targets belong to this checkout; genuine sibling
- * targets are anchored at the project's main checkout (see `linkAnchor`).
+ * directory, resolved against this checkout's own root. Existing sibling
+ * links carried into a cowshed workspace keep their absolute targets.
  * `applyDeclaredLinks` makes it so: in every node_modules tree that has the
  * package installed, the entry becomes a link to that directory, unless a
  * developer already pointed it at a checkout of their own. An existing real
@@ -563,12 +563,6 @@ function unavailableReason(target: string): string | null {
   }
 }
 
-function inheritedContainedBinding(anchor: string, relative: string, current: string): boolean {
-  return (
-    containsPath(path.resolve(anchor), path.resolve(anchor, relative)) && containsPath(path.resolve(anchor), current)
-  );
-}
-
 /** A package name as npm spells one: `name` or `@scope/name`, one segment each. */
 const PACKAGE_NAME = /^(?:@[A-Za-z0-9_-][A-Za-z0-9._-]*\/)?[A-Za-z0-9_-][A-Za-z0-9._-]*$/;
 
@@ -615,7 +609,7 @@ function readDeclaredLinks(root: string): DeclaredLink[] {
     const directory: unknown = object ? Reflect.get(declaration, 'directory') : declaration;
     if (typeof directory !== 'string' || directory.length === 0 || path.isAbsolute(directory)) {
       throw new Error(
-        `${manifestPath}: smoo.developerLinks ${name} must be a directory relative to the main checkout, not ${JSON.stringify(directory)}`,
+        `${manifestPath}: smoo.developerLinks ${name} must be a directory relative to this checkout, not ${JSON.stringify(directory)}`,
       );
     }
     if (!object) return { name, directory, snapshot: undefined };

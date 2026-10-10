@@ -588,14 +588,26 @@ invocation with current bindings runs no `bun install`.
 Only an observed missing target makes a link dangling. Permission or other metadata errors abort the install without
 removing captured links; an unreadable checkout is not a deleted checkout.
 
+Declared `smoo.developerLinks` directories resolve against each checkout's own root, never a root borrowed from a
+cowshed marker. In-repository aliases are relative and travel with that checkout. A fork carries existing external
+developer links as absolute sibling bindings; a declaration whose sibling is absent at the fork's depth cannot redirect
+those bindings.
+
+A job's terminal cleanup applies the same boundary to the developer links it displaced. A registry replacement is
+restored to its recorded link. A different live developer binding is kept as the developer left it, with no new grant or
+attestation. A link that is absent with no observed install is reported as `developer-link-ambiguous` and stays absent.
+A deliberate relink that a successful install made keeps its intent.
+
 While such links exist, every shell entry and every install smoo runs prints one line naming them, such as
 `linked to local checkouts: @smoothbricks/lmao -> ~/src/smoothbricks/packages/lmao (12 links)`. Entries that install
 nothing print it too, because devenv's direnv integration hides the output of the run that installs.
 
-A plain `bun install`, `bun add` or `bun remove` re-points every declared dependency at its lockfile version, links
-included. Bun does this before the root `preinstall` script runs, so no lifecycle script can record a link and keep it.
-A link made by hand is gone after a plain install and has to be made again. A declared link (below) comes back by
-itself.
+A plain host `bun install`, `bun add` or `bun remove` re-points dependencies at their lockfile versions before root
+`preinstall`, so a lifecycle script cannot keep developer links. In a cowshed job the managed command-name Bun/npm/pnpm
+install entrypoints restore live developer package and executable aliases immediately before the next command; the
+supervisor also restores them when the job ends. Explicit absolute host/devenv executables bypass immediate wrapping and
+receive terminal cleanup only, so `absolute-bun install && nx ...` is not covered. Outside cowshed, a link made by hand
+is gone after a plain install and has to be made again. A declared link (below) comes back by itself.
 
 An install that exists to replace links, such as a script that runs `bun link <name>` against providers registered anew,
 names the packages it replaces so that smoo does not undo it:

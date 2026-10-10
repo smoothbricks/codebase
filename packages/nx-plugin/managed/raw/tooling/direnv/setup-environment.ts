@@ -1,9 +1,11 @@
 #!/usr/bin/env bun
 import { dlopen, FFIType, read as ffiRead } from 'bun:ffi';
 import {
+  accessSync,
   chmodSync,
   closeSync,
   cpSync,
+  constants,
   existsSync,
   lstatSync,
   mkdirSync,
@@ -1406,9 +1408,10 @@ function assertTypescriptApiAt(typescriptRoot: string, expectedTarget: string): 
  * package graph exists — not the installer. Called under the install lock.
  */
 async function applyWorkspaceGitConfig(root: string): Promise<void> {
-  // A workspace job inherits the installed hooks, but cannot mutate .git/config
-  // or .git/hooks. Git wiring belongs to setup outside the job's sandbox.
-  if (process.env.COWSHED_WORKSPACE_TOKEN) return;
+  // Authority is what this process may write, not whether a workspace token exists.
+  const configFile = repositoryConfig(root).file;
+  accessSync(path.dirname(configFile), constants.W_OK);
+  accessSync(configFile, constants.W_OK);
   await keepRepositoryConfig(root);
 
   const gitDirResult = await $`git rev-parse --git-dir`.cwd(root).quiet().nothrow();
@@ -1422,6 +1425,7 @@ async function applyWorkspaceGitConfig(root: string): Promise<void> {
   }
 
   const gitDir = path.resolve(root, new TextDecoder().decode(gitDirResult.stdout).trim());
+  accessSync(existsSync(path.join(gitDir, 'hooks')) ? path.join(gitDir, 'hooks') : gitDir, constants.W_OK);
   const tooling = path.join(root, 'tooling');
   linkHook(gitDir, tooling, 'pre-commit');
   installPostCommitHook(gitDir, tooling);
@@ -1436,13 +1440,14 @@ function linkHook(gitDir: string, tooling: string, name: string): void {
   }
 
   const target = path.join(gitDir, 'hooks', name);
-  if (readLinkOrNull(target) === source) {
+  const relativeTarget = path.relative(path.dirname(target), source);
+  if (readLinkOrNull(target) === relativeTarget) {
     return;
   }
 
   mkdirSync(path.dirname(target), { recursive: true });
   rmSync(target, { force: true });
-  symlinkSync(source, target);
+  symlinkSync(relativeTarget, target);
 }
 
 function installPostCommitHook(gitDir: string, tooling: string): void {

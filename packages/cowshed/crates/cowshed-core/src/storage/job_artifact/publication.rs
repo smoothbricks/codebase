@@ -507,9 +507,9 @@ fn publish_relative(
             }
         }
         PublicationPolicy::CreateNew => {
-            rename_noreplace(directory_fd, temporary, destination).map_err(|error| {
-                publication_error(destination_path, PublicationStage::Publish, error)
-            })?;
+            rename_noreplace(directory_fd, temporary, directory_fd, destination).map_err(
+                |error| publication_error(destination_path, PublicationStage::Publish, error),
+            )?;
         }
     }
     Ok(())

@@ -206,7 +206,7 @@ impl AnchoredDirectory {
     pub fn rename_child_noreplace(&self, source: &CStr, destination: &CStr) -> io::Result<()> {
         validate_directory_leaf(source)?;
         validate_directory_leaf(destination)?;
-        rename_noreplace(self.0.as_raw_fd(), source, destination)?;
+        rename_noreplace(self.0.as_raw_fd(), source, self.0.as_raw_fd(), destination)?;
         self.0.sync_all()
     }
 
@@ -265,6 +265,32 @@ impl AnchoredDirectory {
             Ok(())
         } else {
             Err(io::Error::last_os_error())
+        }
+    }
+
+    /// Restore one developer alias through held parents, never through a job-mutated path.
+    /// A replaced registry directory joins the existing discard lifecycle without overwriting it.
+    pub(crate) fn restore_symlink(
+        &self,
+        name: &CStr,
+        target: &Path,
+        discard: impl FnOnce() -> io::Result<(Self, CString)>,
+    ) -> io::Result<bool> {
+        validate_directory_leaf(name)?;
+        match self.exact_symlink(name, target) {
+            Ok(changed) => Ok(changed),
+            Err(error) => {
+                if !self
+                    .stat_child(name)?
+                    .is_some_and(|entry| entry.st_mode & libc::S_IFMT == libc::S_IFDIR)
+                {
+                    return Err(error);
+                }
+                let (discard, discarded) = discard()?;
+                validate_directory_leaf(&discarded)?;
+                rename_noreplace(self.0.as_raw_fd(), name, discard.0.as_raw_fd(), &discarded)?;
+                self.exact_symlink(name, target)
+            }
         }
     }
 
@@ -420,13 +446,12 @@ impl AnchoredDirectory {
         self.0.sync_all()
     }
 
-    /// `name` as a symlink to exactly `target`: a matching link is kept, anything else but a
-    /// directory is unlinked (never followed) and the link created anew.
-    fn exact_symlink(&self, name: &CStr, target: &Path) -> io::Result<()> {
-        let target = CString::new(target.as_os_str().as_bytes())
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "link target contains NUL"))?;
-        let mut buffer = [0u8; 4096];
-        // SAFETY: the fd/name are live and the buffer is writable for its full length.
+    /// Read the target of the symlink `name` through the held directory into `buffer`, returning
+    /// the borrowed prefix. A target filling the whole buffer is refused, never truncated.
+    pub(crate) fn read_link<'a>(&self, name: &CStr, buffer: &'a mut [u8]) -> io::Result<&'a [u8]> {
+        validate_directory_leaf(name)?;
+        // SAFETY: the held directory fd and the NUL-terminated leaf are live, and readlinkat writes
+        // at most `buffer.len()` bytes into the writable buffer.
         let count = unsafe {
             libc::readlinkat(
                 self.0.as_raw_fd(),
@@ -435,24 +460,38 @@ impl AnchoredDirectory {
                 buffer.len(),
             )
         };
-        if count >= 0 {
-            let count = usize::try_from(count).expect("non-negative readlink length");
-            if count < buffer.len() && buffer[..count] == *target.as_bytes() {
-                return Ok(());
-            }
-            self.unlink_entry(name)?;
-        } else {
-            let error = io::Error::last_os_error();
-            match error.raw_os_error() {
+        if count < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let count = usize::try_from(count).expect("non-negative readlink length");
+        if count == buffer.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "link target exceeds buffer",
+            ));
+        }
+        Ok(&buffer[..count])
+    }
+
+    /// `name` as a symlink to exactly `target`: a matching link is kept, anything else but a
+    /// directory is unlinked (never followed) and the link created anew.
+    fn exact_symlink(&self, name: &CStr, target: &Path) -> io::Result<bool> {
+        let mut buffer = [0u8; 4096];
+        match self.read_link(name, &mut buffer) {
+            Ok(bytes) if bytes == target.as_os_str().as_bytes() => return Ok(false),
+            Ok(_) => self.unlink_entry(name)?,
+            // Not a link: a regular file is replaced; a directory refuses the unlink.
+            Err(error) => match error.raw_os_error() {
                 Some(libc::ENOENT) => {}
-                // Not a link: a regular file is replaced; a directory refuses the unlink.
                 Some(libc::EINVAL) => self.unlink_entry(name)?,
                 _ => return Err(error),
-            }
+            },
         }
+        let target = CString::new(target.as_os_str().as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "link target contains NUL"))?;
         // SAFETY: the target and leaf are NUL-terminated; the held parent anchors creation.
         if unsafe { libc::symlinkat(target.as_ptr(), self.0.as_raw_fd(), name.as_ptr()) } == 0 {
-            Ok(())
+            Ok(true)
         } else {
             Err(io::Error::last_os_error())
         }
@@ -636,6 +675,7 @@ pub fn sync_directory(path: &Path) -> io::Result<()> {
 pub fn rename_noreplace(
     directory: std::os::fd::RawFd,
     source: &std::ffi::CStr,
+    destination_directory: std::os::fd::RawFd,
     destination: &std::ffi::CStr,
 ) -> io::Result<()> {
     // SAFETY: both names are NUL-terminated and remain live for the call; `directory` is an open
@@ -644,7 +684,7 @@ pub fn rename_noreplace(
         libc::renameatx_np(
             directory,
             source.as_ptr(),
-            directory,
+            destination_directory,
             destination.as_ptr(),
             libc::RENAME_EXCL,
         )
@@ -661,6 +701,7 @@ pub fn rename_noreplace(
 pub fn rename_noreplace(
     directory: std::os::fd::RawFd,
     source: &std::ffi::CStr,
+    destination_directory: std::os::fd::RawFd,
     destination: &std::ffi::CStr,
 ) -> io::Result<()> {
     // SAFETY: both names are NUL-terminated and remain live for the syscall; `directory` is an
@@ -670,7 +711,7 @@ pub fn rename_noreplace(
             libc::SYS_renameat2,
             directory,
             source.as_ptr(),
-            directory,
+            destination_directory,
             destination.as_ptr(),
             libc::RENAME_NOREPLACE,
         )
@@ -686,6 +727,7 @@ pub fn rename_noreplace(
 pub fn rename_noreplace(
     _directory: std::os::fd::RawFd,
     _source: &std::ffi::CStr,
+    _destination_directory: std::os::fd::RawFd,
     _destination: &std::ffi::CStr,
 ) -> io::Result<()> {
     Err(io::Error::new(
@@ -1424,5 +1466,57 @@ mod tests {
         }
         assert!(fs::symlink_metadata(bin.join("npm")).is_err());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_held_parent_swapped_for_a_link_never_writes_through_the_foreign_directory() {
+        let scratch = crate::temp_root::TempRoot::new("fsio-held-parent-swap");
+        let parent = scratch.join("parent");
+        let held = AnchoredDirectory::create(&parent).unwrap();
+        fs::create_dir(parent.join("alias")).unwrap();
+        let foreign = scratch.join("foreign");
+        fs::create_dir(&foreign).unwrap();
+        fs::write(foreign.join("sentinel"), "foreign\n").unwrap();
+        fs::rename(&parent, scratch.join("moved")).unwrap();
+        std::os::unix::fs::symlink(&foreign, &parent).unwrap();
+        held.restore_symlink(c"alias", Path::new("../target"), || {
+            Ok((
+                AnchoredDirectory::create(&scratch.join("discard"))?,
+                CString::new("displaced").map_err(io::Error::other)?,
+            ))
+        })
+        .unwrap();
+        assert_eq!(fs::read(foreign.join("sentinel")).unwrap(), b"foreign\n");
+        assert!(fs::symlink_metadata(foreign.join("alias")).is_err());
+        assert_eq!(
+            fs::read_link(scratch.join("moved/alias")).unwrap(),
+            Path::new("../target")
+        );
+    }
+
+    #[test]
+    fn a_discard_leaf_already_occupied_refuses_the_replaced_directory_untouched() {
+        let scratch = crate::temp_root::TempRoot::new("fsio-occupied-discard");
+        let links = AnchoredDirectory::create(&scratch.join("links")).unwrap();
+        let discard = AnchoredDirectory::create(&scratch.join("discard")).unwrap();
+        fs::create_dir(scratch.join("links/alias")).unwrap();
+        fs::write(scratch.join("links/alias/keep"), "real\n").unwrap();
+        fs::create_dir(scratch.join("discard/occupied")).unwrap();
+        fs::write(scratch.join("discard/occupied/keep"), "earlier\n").unwrap();
+        let target = scratch.join("target");
+        let error = links
+            .restore_symlink(c"alias", &target, || {
+                Ok((discard, CString::new("occupied").unwrap()))
+            })
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            fs::read(scratch.join("links/alias/keep")).unwrap(),
+            b"real\n"
+        );
+        assert_eq!(
+            fs::read(scratch.join("discard/occupied/keep")).unwrap(),
+            b"earlier\n"
+        );
     }
 }

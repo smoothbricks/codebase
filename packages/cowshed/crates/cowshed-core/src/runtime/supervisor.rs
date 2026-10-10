@@ -1224,6 +1224,7 @@ fn gateway_proxy_url(port_base: &str, workspace_token: &WorkspaceToken) -> Strin
 /// Every shared cache directory is created where the host keeps it before any child runs: a
 /// child granted writes inside one cannot create its parent.
 fn prepare_private_environment(
+    workspace_root: &Path,
     environment_root: &Path,
     runtime: Option<(&Path, &Path)>,
     contribution: &crate::capabilities::CapabilityContribution,
@@ -1237,6 +1238,27 @@ fn prepare_private_environment(
         .child(c"tools")
         .and_then(|tools| tools.child(c"bin"))
         .map_err(private_environment_error)?;
+    let manager_host = if contribution
+        .bootstrap_programs
+        .iter()
+        .any(|program| crate::developer_links::is_package_manager(OsStr::new(program.name)))
+    {
+        super::shell_host::registered().filter(|program| {
+            program.arguments().len() == 1
+                && program.arguments()[0] == super::shell_host::SHELL_HOST_ARGUMENT
+        })
+    } else {
+        None
+    };
+    let manager_host = manager_host
+        .as_ref()
+        .map(|program| super::shell_job::stage_host_executable(workspace_root, program))
+        .transpose()?;
+    let real_bin = environment
+        .child(c"tools")
+        .and_then(|tools| tools.child(c"real-bin"))
+        .map_err(private_environment_error)?;
+    let mut managers = Vec::new();
     let mut programs = Vec::with_capacity(contribution.bootstrap_programs.len());
     for program in &contribution.bootstrap_programs {
         if program.name.is_empty() || program.name.contains('/') {
@@ -1248,8 +1270,18 @@ fn prepare_private_environment(
         let name = std::ffi::CString::new(program.name).map_err(|error| {
             private_environment_error(io::Error::new(io::ErrorKind::InvalidInput, error))
         })?;
-        programs.push((name, program.target.as_path()));
+        if crate::developer_links::is_package_manager(OsStr::new(program.name))
+            && let Some(host) = manager_host.as_deref()
+        {
+            managers.push((name.clone(), program.target.as_path()));
+            programs.push((name, host));
+        } else {
+            programs.push((name, program.target.as_path()));
+        }
     }
+    real_bin
+        .reconcile_links(c".links", &managers)
+        .map_err(private_environment_error)?;
     bin.reconcile_links(c".links", &programs)
         .map_err(private_environment_error)?;
     for cache in &contribution.shared_caches {
@@ -1577,6 +1609,7 @@ pub(super) async fn sandbox_environment(
     let shared_runtime = shared_daemon_runtime_dir(sandbox);
     let shared_alias = shared_daemon_runtime_link(sandbox);
     let environment = prepare_private_environment(
+        &sandbox.workspace_mount,
         environment_root,
         Some((&shared_alias, &shared_runtime)),
         &sandbox.capabilities.contribution,
@@ -1642,6 +1675,14 @@ pub(super) async fn sandbox_environment(
         owned.insert(name.into(), value.to_owned());
     };
     own("PATH", &path);
+    own(
+        crate::developer_links::ROOT_ENV,
+        sandbox.workspace_mount.as_os_str(),
+    );
+    own(
+        crate::developer_links::TOOL_BIN_ENV,
+        environment_root.join("tools/bin").as_os_str(),
+    );
     own("HOME", private_home.as_os_str());
     own("XDG_CONFIG_HOME", private_config.as_os_str());
     own("XDG_CACHE_HOME", private_cache.as_os_str());
@@ -3523,6 +3564,8 @@ struct JobStateRecord {
     /// Set when `wait(2)` could not name the child's termination. Keeps the job's terminal
     /// record free of a fabricated exit and hands the failure to everyone awaiting the job.
     wait_failure: Option<CowshedError>,
+    developer_links: crate::developer_links::DeveloperLinks,
+    restoration_failure: Option<CowshedError>,
     /// Set once the job ended, whatever became of its record.
     conclusion: Option<Conclusion>,
     /// The job's process as its parent observed it, once its pid is known. Never observed again.
@@ -3641,14 +3684,18 @@ impl JobStateRecord {
     /// be established, then a refused output copy. `Ok` would be a wrong-success channel for
     /// what the caller asked.
     fn terminal_outcome(&self) -> Result<JobInfo> {
-        let failure = self.wait_failure.as_ref().or(match &self.conclusion {
-            Some(Conclusion::Sealed {
-                commitment,
-                publication,
-            }) => commitment.as_ref().or(publication.as_ref()),
-            Some(Conclusion::Unsealed(error)) => Some(error),
-            None => None,
-        });
+        let failure = self
+            .wait_failure
+            .as_ref()
+            .or(self.restoration_failure.as_ref())
+            .or(match &self.conclusion {
+                Some(Conclusion::Sealed {
+                    commitment,
+                    publication,
+                }) => commitment.as_ref().or(publication.as_ref()),
+                Some(Conclusion::Unsealed(error)) => Some(error),
+                None => None,
+            });
         match failure {
             Some(error) => Err(error.clone()),
             None => Ok(self.info.clone()),
@@ -4721,6 +4768,27 @@ impl SupervisorActor {
                 }
             },
         };
+        let child = self.policy.child(request.mode).0;
+        let developer_links = if child.mode == crate::sandbox::RunSandboxMode::ReadWrite
+            && child.capabilities.active.iter().any(|id| {
+                matches!(
+                    id,
+                    crate::capabilities::CapabilityId::Bun
+                        | crate::capabilities::CapabilityId::Npm
+                        | crate::capabilities::CapabilityId::Pnpm
+                )
+            }) {
+            let root = self.workspace_root.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::developer_links::DeveloperLinks::capture(&root)
+            })
+            .await
+            .map_err(|error| {
+                CowshedError::internal(format!("developer-link snapshot failed: {error}"))
+            })??
+        } else {
+            crate::developer_links::DeveloperLinks::default()
+        };
         let build_hold = self.hold_build_volume(build_volume.as_deref())?;
         // A volume the link moved to (a land, a refork) was another checkout's: it takes this
         // checkout's name, once.
@@ -4928,6 +4996,8 @@ impl SupervisorActor {
             stderr_eof: false,
             exit: None,
             wait_failure: None,
+            developer_links,
+            restoration_failure: None,
             conclusion: None,
             birth: None,
             sampling: Sampling::Unowned,
@@ -5952,27 +6022,72 @@ impl SupervisorActor {
     }
 
     async fn finalize_job(&mut self, job_id: JobId, forced_state: Option<JobState>) {
+        let links = match self.jobs.get_mut(&job_id) {
+            Some(job) if !job.terminal() => std::mem::take(&mut job.developer_links),
+            _ => return,
+        };
+        if !links.is_empty() {
+            let root = self.workspace_root.clone();
+            let restored = tokio::task::spawn_blocking(move || {
+                links.restore(&root, crate::developer_links::RestoreMode::JobTerminal)
+            })
+            .await;
+            let failure = match restored {
+                Ok(Ok(findings)) => {
+                    for finding in findings {
+                        self.process_output(
+                            job_id,
+                            StreamKind::Stderr,
+                            Bytes::from(format!("cowshed: {finding}\n")),
+                        );
+                    }
+                    None
+                }
+                Ok(Err(error)) => Some(error),
+                Err(error) => Some(CowshedError::internal(format!(
+                    "developer-link restoration failed: {error}"
+                ))),
+            };
+            if let Some(error) = failure {
+                self.process_output(
+                    job_id,
+                    StreamKind::Stderr,
+                    Bytes::from(format!(
+                        "cowshed: developer-link restoration failed: {error}\n"
+                    )),
+                );
+                if let Some(job) = self.jobs.get_mut(&job_id) {
+                    job.restoration_failure = Some(error);
+                }
+            }
+        }
         let Some(job) = self.jobs.get_mut(&job_id) else {
             return;
         };
         if job.terminal() {
             return;
         }
-        let state = forced_state.unwrap_or_else(|| match job.kill_reason {
-            Some(KillReason::OutputLimit) => JobState::OutputLimit,
-            Some(KillReason::Requested | KillReason::Retire) => JobState::Killed,
-            Some(
-                KillReason::SpawnFailure
-                | KillReason::StdinFailure
-                | KillReason::ArtifactFailure
-                | KillReason::WaitFailure
-                | KillReason::ScriptSyntax
-                | KillReason::CpuAdmission,
-            ) => JobState::Failed,
-            None => match job.exit.as_ref().expect("ready terminal job has exit") {
-                ExitStatus::Exited { .. } => JobState::Exited,
-                ExitStatus::Signaled { .. } => JobState::Signaled,
-            },
+        let state = forced_state.unwrap_or_else(|| {
+            if job.restoration_failure.is_some() {
+                JobState::Failed
+            } else {
+                match job.kill_reason {
+                    Some(KillReason::OutputLimit) => JobState::OutputLimit,
+                    Some(KillReason::Requested | KillReason::Retire) => JobState::Killed,
+                    Some(
+                        KillReason::SpawnFailure
+                        | KillReason::StdinFailure
+                        | KillReason::ArtifactFailure
+                        | KillReason::WaitFailure
+                        | KillReason::ScriptSyntax
+                        | KillReason::CpuAdmission,
+                    ) => JobState::Failed,
+                    None => match job.exit.as_ref().expect("ready terminal job has exit") {
+                        ExitStatus::Exited { .. } => JobState::Exited,
+                        ExitStatus::Signaled { .. } => JobState::Signaled,
+                    },
+                }
+            }
         });
         let duration_ms = job
             .started_at
@@ -7709,6 +7824,7 @@ mod workspace_toolchain_tests {
         ] {
             sandbox.mode = mode;
             prepare_private_environment(
+                &mount,
                 &environment_root,
                 None,
                 &sandbox.capabilities.contribution,
@@ -7731,6 +7847,7 @@ mod workspace_toolchain_tests {
             );
 
             prepare_private_environment(
+                &mount,
                 &environment_root,
                 None,
                 &crate::capabilities::CapabilityContribution::default(),
@@ -8347,7 +8464,7 @@ mod sandbox_environment_tests {
             },
             ..Default::default()
         };
-        prepare_private_environment(&environment, None, &contribution).unwrap();
+        prepare_private_environment(&root, &environment, None, &contribution).unwrap();
         assert!(home.join("go/pkg/mod").is_dir());
         assert!(home.join(".local/state/nix").is_dir());
         assert_eq!(
@@ -8365,7 +8482,7 @@ mod sandbox_environment_tests {
             }],
             ..Default::default()
         };
-        let error = prepare_private_environment(&environment, None, &escaping)
+        let error = prepare_private_environment(&root, &environment, None, &escaping)
             .expect_err("an escaping cache link is refused");
         assert_eq!(error.code, crate::error::ErrorCode::Integrity);
         assert!(!root.join("outside").exists());
@@ -8388,6 +8505,7 @@ mod sandbox_environment_tests {
             ..Default::default()
         };
         prepare_private_environment(
+            &root.join("checkout"),
             &checkout_environment,
             Some((alias, &runtime)),
             &contribution,
@@ -8395,6 +8513,7 @@ mod sandbox_environment_tests {
         .unwrap();
         std::fs::write(runtime.join("nx/preserved"), "shared").unwrap();
         prepare_private_environment(
+            &root.join("checkout"),
             &read_only_environment,
             Some((alias, &runtime)),
             &contribution,
@@ -8418,8 +8537,13 @@ mod sandbox_environment_tests {
             ..Default::default()
         };
         assert!(
-            prepare_private_environment(&read_only_environment, Some((alias, &runtime)), &escaping)
-                .is_err()
+            prepare_private_environment(
+                &root.join("checkout"),
+                &read_only_environment,
+                Some((alias, &runtime)),
+                &escaping
+            )
+            .is_err()
         );
         assert!(
             !outside.exists(),
@@ -8430,6 +8554,7 @@ mod sandbox_environment_tests {
         std::os::unix::fs::symlink(&outside, runtime.join("nx")).unwrap();
         assert!(
             prepare_private_environment(
+                &root.join("checkout"),
                 &read_only_environment,
                 Some((alias, &runtime)),
                 &contribution
@@ -8450,6 +8575,7 @@ mod sandbox_environment_tests {
         let root = scratch("plain-environment");
         let environment = root.join("environment");
         prepare_private_environment(
+            &root,
             &environment,
             None,
             &crate::capabilities::CapabilityContribution::default(),

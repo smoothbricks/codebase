@@ -9114,6 +9114,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         let reservation = timed_async("adopt", "grants", self.fresh_grants()).await?;
         let mut grants = reservation.grants.clone();
         grants.revision = 0;
+        grants = inherited_developer_read_grants(self.git.root().to_owned(), grants).await?;
         let identity = self
             .operation_identity(grants, self.git.current_branch().await?, None, false)
             .await?;
@@ -9289,6 +9290,12 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                 self.mark_lifecycle_intent_mutating(&workspace).await?;
             }
             let (grants, reservation) = self.destination_grants(&workspace, resuming).await?;
+            let grants = if reservation.is_some() {
+                inherited_developer_read_grants(self.workspace_mount_path(&source_name)?, grants)
+                    .await?
+            } else {
+                grants
+            };
             let identity = self
                 .operation_identity(
                     grants,
@@ -9686,6 +9693,11 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
             } else {
                 let (grants, reservation) = self.destination_grants(&destination, resuming).await?;
                 let source_mount = self.workspace_mount_path(&source)?;
+                let grants = if reservation.is_some() {
+                    inherited_developer_read_grants(source_mount.clone(), grants).await?
+                } else {
+                    grants
+                };
                 let branch = match purpose {
                     ClonePurpose::HistoricalFork => Some(format!("cowshed/{destination}")),
                     ClonePurpose::Rename => {
@@ -15084,6 +15096,27 @@ fn require_git_success(operation: &str, output: &std::process::Output) -> Result
             CowshedError::conflict(message, "inspect the repository state: git status")
         },
     )
+}
+
+/// A mint's source snapshot may widen its initial reads; later job snapshots never do.
+#[cfg(target_os = "macos")]
+async fn inherited_developer_read_grants(
+    source: PathBuf,
+    mut grants: GrantSet,
+) -> Result<GrantSet> {
+    let links = tokio::task::spawn_blocking(move || {
+        crate::developer_links::DeveloperLinks::capture(&source)
+    })
+    .await
+    .map_err(|error| {
+        CowshedError::internal(format!("mint developer-link snapshot failed: {error}"))
+    })??;
+    grants
+        .read
+        .extend(links.sibling_targets().map(Path::to_owned));
+    grants.read.sort();
+    grants.read.dedup();
+    Ok(grants)
 }
 
 /// The inputs Nx hashes for the missed task `task` in the workspace `handle` serves, from

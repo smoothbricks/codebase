@@ -138,6 +138,26 @@ Each detector returns data through one `CapabilityContribution`:
   conventions. Store-resolved executables receive immutable Nix-store reads; that alone does not grant Nix caches or
   daemon access. The same read-only store grant follows any program link in the mode's `tools/bin` or the workspace's
   `.cowshed/bin` that targets the store, with or without a Nix project; a host with no store gets none.
+
+  When the registered `cowshed` multicall executable owns the exec host, detected `bun`, `npm` and `pnpm` entries use
+  that same staged executable as their install wrapper. Their actual capability-resolved executables stay under the
+  reconciled `tools/real-bin`; neither route is writable by job code. The private `tools/bin` leads PATH after shell
+  activation. A first-argument install verb is covered immediately: Bun `install`, `i`, `add`, `remove`, `update`; npm
+  `install`, `i`, `ci`, `add`, `uninstall`, `remove`, `update`; pnpm `install`, `i`, `add`, `remove`, `update`. Other
+  invocations execute the recorded program directly, without guessing another CLI or changing explicit relinks. The
+  wrapper snapshots live developer package links and their executable aliases before the install, and restores them
+  before returning its actual exit or signal, so `bun install && nx ...` uses those links in one job.
+
+  The supervisor uses the same snapshot/restore implementation at job admission and terminal cleanup, including failed
+  or killed installs. It records restoration failure in the sealed job's stderr and failed state, and returns the error
+  to waiters, never a wrong success. Explicit absolute host/devenv executable paths, invocations whose first argument is
+  not one of those verbs, and unregistered library-only one-shot hosts bypass immediate wrapping and get terminal
+  cleanup only; chained-command preservation is not promised for those bypasses. No snapshot taken by a job or wrapper
+  grants a new target. Only the mint captures canonical sibling read grants from its source. Terminal cleanup repairs
+  developer-link registry replacements only: a link a job displaced with a real directory is discarded and restored to
+  its snapshot. A different live developer binding is preserved, with no new grant or attestation. A link absent with no
+  observed install produces a `developer-link-ambiguous` finding in the job's stderr and stays absent.
+
 - **HOME probes:** the sandboxed supervisor repeats detection beneath the HOME-wide read deny (04_sandbox.md), so every
   HOME path a detector inspects is also one it grants read: each bootstrap candidate beneath HOME as its literal program
   path, rustup's settings file, the compiler-cache GC root. The sandboxed search then sees what the host's saw. These
