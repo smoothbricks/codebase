@@ -64,7 +64,10 @@ pub(crate) struct Fixture {
 
 impl Fixture {
     pub(crate) fn new() -> Self {
-        let scratch = TempRoot::new("cowshed-readopt-journal");
+        let scratch = TempRoot::new_in(
+            &crate::temp_parent::canonical_parent(),
+            "cowshed-readopt-journal",
+        );
         let checkout = scratch.join("checkout");
         fs::create_dir(&checkout).expect("create checkout");
         git(&checkout, &["init", "-q", "-b", "main"]);
@@ -283,7 +286,10 @@ fn assert_refused(damaged: Value, label: &str) {
     let Ok(intent) = serde_json::from_value::<LifecycleIntent>(damaged) else {
         return;
     };
-    let scratch = TempRoot::new("cowshed-readopt-refusal");
+    let scratch = TempRoot::new_in(
+        &crate::temp_parent::canonical_parent(),
+        "cowshed-readopt-refusal",
+    );
     let journal = scratch.join(LIFECYCLE_INTENTS_FILE);
     let recorded = LifecycleIntentJournal::update(&journal, |state| {
         state.begin(intent);

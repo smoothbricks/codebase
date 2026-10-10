@@ -8433,7 +8433,10 @@ mod rebase_recovery_tests {
 
     #[tokio::test]
     async fn land_moves_only_the_branch_main_has_checked_out() {
-        let root = crate::temp_root::TempRoot::new("cowshed-land-target");
+        let root = crate::temp_root::TempRoot::new_in(
+            &crate::temp_parent::canonical_parent(),
+            "cowshed-land-target",
+        );
         run_git(&root, &["init", "--initial-branch=main"]);
         run_git(&root, &["config", "user.name", "Cowshed Test"]);
         run_git(&root, &["config", "user.email", "cowshed@example.invalid"]);
@@ -8481,7 +8484,10 @@ mod rebase_recovery_tests {
 
     #[tokio::test]
     async fn a_failed_rebase_restores_the_attached_branch_and_allows_the_next_rebase() {
-        let root = crate::temp_root::TempRoot::new("cowshed-rebase-recovery");
+        let root = crate::temp_root::TempRoot::new_in(
+            &crate::temp_parent::canonical_parent(),
+            "cowshed-rebase-recovery",
+        );
         run_git(&root, &["init", "--initial-branch=main"]);
         run_git(&root, &["config", "user.name", "Cowshed Test"]);
         run_git(&root, &["config", "user.email", "cowshed@example.invalid"]);
@@ -8535,7 +8541,10 @@ mod rebase_recovery_tests {
 
     #[tokio::test]
     async fn a_dirty_tree_refuses_even_under_autostash_instead_of_succeeding_over_conflicts() {
-        let root = crate::temp_root::TempRoot::new("cowshed-rebase-autostash");
+        let root = crate::temp_root::TempRoot::new_in(
+            &crate::temp_parent::canonical_parent(),
+            "cowshed-rebase-autostash",
+        );
         run_git(&root, &["init", "--initial-branch=main"]);
         run_git(&root, &["config", "user.name", "Cowshed Test"]);
         run_git(&root, &["config", "user.email", "cowshed@example.invalid"]);
@@ -8588,7 +8597,10 @@ mod rebase_recovery_tests {
 
     impl Lane {
         fn new(label: &str) -> Self {
-            let base = crate::temp_root::TempRoot::new(&format!("cowshed-lane-{label}"));
+            let base = crate::temp_root::TempRoot::new_in(
+                &crate::temp_parent::canonical_parent(),
+                &format!("cowshed-lane-{label}"),
+            );
             let main = base.join("main");
             std::fs::create_dir_all(&main).expect("create main");
             run_git(&main, &["init", "--initial-branch=main"]);
@@ -15598,7 +15610,10 @@ mod grant_unit_tests {
     use std::os::unix::fs::PermissionsExt;
 
     fn unique_root(name: &str) -> crate::temp_root::TempRoot {
-        crate::temp_root::TempRoot::new(&format!("cowshed-grant-{name}"))
+        crate::temp_root::TempRoot::new_in(
+            &crate::temp_parent::canonical_parent(),
+            &format!("cowshed-grant-{name}"),
+        )
     }
 
     fn canonical_dir(path: &Path) -> PathBuf {
@@ -20126,7 +20141,10 @@ mod port_reservation_tests {
     use std::path::PathBuf;
 
     fn root(label: &str) -> crate::temp_root::TempRoot {
-        crate::temp_root::TempRoot::new(&format!("cowshed-port-reservation-{label}"))
+        crate::temp_root::TempRoot::new_in(
+            &crate::temp_parent::canonical_parent(),
+            &format!("cowshed-port-reservation-{label}"),
+        )
     }
 
     fn inventory(root: &std::path::Path) -> (NativeGatewayInventory, StorageLayout) {

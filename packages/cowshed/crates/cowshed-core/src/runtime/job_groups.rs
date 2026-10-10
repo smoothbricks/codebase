@@ -1710,7 +1710,10 @@ mod tests {
     /// A scratch ledger and the directory holding it. The ledger's own removal is under test; the
     /// directory goes when the test ends, on any path.
     fn scratch() -> (crate::temp_root::TempRoot, std::path::PathBuf) {
-        let directory = crate::temp_root::TempRoot::new("cowshed-groups");
+        let directory = crate::temp_root::TempRoot::new_in(
+            &crate::temp_parent::canonical_parent(),
+            "cowshed-groups",
+        );
         let ledger = ledger_path(&directory.join("s.sock"));
         (directory, ledger)
     }

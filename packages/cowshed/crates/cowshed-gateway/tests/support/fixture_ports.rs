@@ -39,17 +39,21 @@ fn strict_port_env(name: &str, value: &std::ffi::OsStr) -> u16 {
         .unwrap_or_else(|error| panic!("{name}={text:?}: {error}"))
 }
 
+fn service_ports(base: u16, size: u16) -> impl Iterator<Item = u32> {
+    ((u32::from(base) + 1)..(u32::from(base) + u32::from(size))).step_by(2)
+}
+
 /// A loopback listener for a fixture's upstream server. Inside a workspace it takes the first free
-/// service port of the workspace's block: the gateway's own port `base` stays reserved, and the
-/// sandbox reaches no other port. Outside one it takes any free port.
+/// odd-offset service port of the workspace's block: the gateway's own port `base` stays reserved,
+/// and even offsets are session ports protected by the adjacent service claim. Outside one it takes any free port.
 pub async fn bind_fixture_listener() -> TcpListener {
     let Some((base, size)) = enclosing_cow_port_block() else {
         return TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .await
             .expect("bind upstream fixture");
     };
-    // Service ports are base+1 ..= base+size-1, and the validated block keeps them in the port space.
-    for port in (u32::from(base) + 1)..(u32::from(base) + u32::from(size)) {
+    // Each upstream listener is itself the P+1 claim; never take an even session port P.
+    for port in service_ports(base, size) {
         let port = u16::try_from(port).expect("service port fits the port space");
         match TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await {
             Ok(listener) => return listener,
@@ -58,4 +62,21 @@ pub async fn bind_fixture_listener() -> TcpListener {
         }
     }
     panic!("no free service port in workspace port block {base}+{size}: the block is exhausted");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::service_ports;
+
+    #[test]
+    fn upstream_service_ports_never_take_even_session_offsets() {
+        let base = cowshed_gateway_types::MACOS_PORT_MIN;
+        for size in [2_u16, 4, 32, 64] {
+            let ports = service_ports(base, size).collect::<Vec<_>>();
+            assert_eq!(ports.len(), usize::from(size / 2));
+            assert_eq!(ports.first(), Some(&(u32::from(base) + 1)));
+            assert_eq!(ports.last(), Some(&(u32::from(base) + u32::from(size) - 1)));
+            assert!(ports.iter().all(|port| (port - u32::from(base)) % 2 == 1));
+        }
+    }
 }

@@ -175,7 +175,7 @@ fn recorded_hash(root: &Path, receipt: &str) -> String {
 struct FixtureBackend {
     address: std::net::SocketAddr,
     lines: tokio::sync::mpsc::UnboundedReceiver<String>,
-    task: tokio::task::JoinHandle<()>,
+    task: tokio::task::JoinHandle<tokio::net::TcpListener>,
 }
 
 async fn spawn_backend(get: u16, put: u16) -> FixtureBackend {
@@ -214,6 +214,7 @@ async fn spawn_backend(get: u16, put: u16) -> FixtureBackend {
             let _ = stream.write_all(reply.as_bytes()).await;
             let _ = stream.shutdown().await;
         }
+        listener
     });
     FixtureBackend {
         address,
@@ -444,6 +445,148 @@ async fn real_nx_client_with_offline_connector_never_reaches_the_backend() {
     assert!(
         backend.lines.try_recv().is_err(),
         "an offline connector must not reach the backend"
+    );
+}
+
+/// The real stock client must execute after an upstream 503 is mapped to a gateway miss.
+#[tokio::test]
+async fn real_nx_client_with_503_backend_executes_locally() {
+    let root = super::fixture_dir::secure_fixture_dir(&format!(
+        "cowshed-nx-outage-upstream503-{}",
+        std::process::id()
+    ));
+    write_workspace(root.path());
+    let (config, _cache) = super::test_config();
+    let (gateway, audit) = gateway_with(config, super::UpstreamHealth::Healthy).await;
+    let handle = gateway.handle();
+    let mut backend = spawn_backend(503, 503).await;
+    handle
+        .configure_nx_cache(backend_config(backend.address))
+        .await
+        .expect("configure 503 backend");
+    let (endpoint, token) = install_session(&handle, "nx-outage-upstream503", 77).await;
+    let origin = format!("http://{endpoint}/nx");
+    let output = nx_run(root.path(), Some((&origin, &token)), Some(RUN_RECEIPT)).await;
+    assert!(output.status.success(), "{}", run_text(&output));
+    let hash = recorded_hash(root.path(), RUN_RECEIPT);
+    assert_unavailable_backend(root.path(), &output, &audit, &hash);
+    let line = backend
+        .lines
+        .try_recv()
+        .expect("the backend received a GET");
+    assert!(
+        line.starts_with(&format!("GET /v1/cache/{hash} ")),
+        "{line}"
+    );
+    gateway.drain().await.expect("drain gateway");
+    backend.task.abort();
+}
+
+/// The upstream closes after a committed 200 and a visible prefix, not after the declared length.
+#[tokio::test]
+async fn nx_short_content_length_is_a_failed_transfer_not_a_completed_hit() {
+    let listener = super::fixture_ports::bind_fixture_listener().await;
+    let address = listener.local_addr().expect("short-body backend");
+    let (close, closed) = tokio::sync::oneshot::channel();
+    let backend = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("backend connection");
+        let mut head = Vec::new();
+        let mut byte = [0; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            assert!(head.len() < FIXTURE_HEAD_LIMIT);
+            stream
+                .read_exact(&mut byte)
+                .await
+                .expect("backend request head");
+            head.push(byte[0]);
+        }
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 16\r\nConnection: close\r\n\r\nshort")
+            .await
+            .expect("committed response prefix");
+        closed.await.expect("client observed the prefix");
+        stream.shutdown().await.expect("close the incomplete body");
+    });
+    let (config, _cache) = super::test_config();
+    let (gateway, audit) = gateway_with(config, super::UpstreamHealth::Healthy).await;
+    let handle = gateway.handle();
+    handle
+        .configure_nx_cache(backend_config(address))
+        .await
+        .expect("short-body backend");
+    let (endpoint, token) = install_session(&handle, "nx-short-body", 78).await;
+    let mut client = tokio::net::TcpStream::connect(endpoint)
+        .await
+        .expect("gateway client");
+    client
+        .write_all(super::nx_request(endpoint, "GET", &token, "42").as_bytes())
+        .await
+        .expect("cache request");
+    let limit = std::time::Duration::from_secs(10);
+    let mut head = Vec::new();
+    let mut byte = [0; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        assert!(head.len() < FIXTURE_HEAD_LIMIT);
+        tokio::time::timeout(limit, client.read_exact(&mut byte))
+            .await
+            .expect("response head deadline")
+            .expect("response head");
+        head.push(byte[0]);
+    }
+    let head = String::from_utf8(head).expect("HTTP head");
+    assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
+    assert!(
+        head.to_ascii_lowercase().contains("content-length: 16"),
+        "{head}"
+    );
+    let mut prefix = [0; 5];
+    tokio::time::timeout(limit, client.read_exact(&mut prefix))
+        .await
+        .expect("prefix deadline")
+        .expect("visible body prefix");
+    assert_eq!(&prefix, b"short");
+    close
+        .send(())
+        .expect("cut the upstream after the committed prefix");
+    let mut suffix = Vec::new();
+    let ended = tokio::time::timeout(limit, client.read_to_end(&mut suffix))
+        .await
+        .expect("short-body deadline");
+    if let Err(error) = ended {
+        assert!(
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::UnexpectedEof
+            ),
+            "unexpected client failure: {error}"
+        );
+    }
+    assert!(
+        prefix.len() + suffix.len() < 16,
+        "the client must see a short body"
+    );
+    drop(client);
+    backend.await.expect("backend fixture completed");
+    gateway.drain().await.expect("drain gateway");
+    let events = audit.events.lock().expect("audit events");
+    let reads: Vec<_> = events
+        .iter()
+        .filter(|event| {
+            event.path.as_deref() == Some("/nx/v1/cache/42")
+                && event.method.as_deref() == Some("GET")
+        })
+        .collect();
+    assert!(
+        reads.iter().any(|event| event.http_status == Some(200)
+            && event.status == cowshed_gateway::AuditStatus::Failed
+            && event.classification.as_deref() == Some("nx-transfer-failed")),
+        "{reads:?}"
+    );
+    assert!(
+        !reads
+            .iter()
+            .any(|event| event.status == cowshed_gateway::AuditStatus::Completed),
+        "a short stream is never a completed read: {reads:?}"
     );
 }
 

@@ -4465,7 +4465,10 @@ mod tests {
     }
 
     fn repository() -> Repository {
-        let scratch = crate::temp_root::TempRoot::new("cowshed-git-test");
+        let scratch = crate::temp_root::TempRoot::new_in(
+            &crate::temp_parent::canonical_parent(),
+            "cowshed-git-test",
+        );
         let fixture = Repository {
             root: scratch.join("repository"),
             _scratch: scratch,

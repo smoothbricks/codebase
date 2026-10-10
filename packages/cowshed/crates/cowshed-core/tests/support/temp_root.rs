@@ -1,26 +1,33 @@
-//! A test's private directory under `/tmp`, removed when its owner drops: on return, on an
-//! assertion failure, and on any other panic. Every leaked fixture directory is one more entry
-//! each process started under `/tmp` has to read, so no exit path may keep one.
+//! A test's private directory under its selected granted parent, removed when its owner drops:
+//! on return, on an assertion failure, and on any other panic. Every leaked fixture directory is
+//! one more entry each process started under that parent has to read, so no exit path may keep one.
 //!
-//! The parent is fixed here rather than read from TMPDIR: a cowshed workspace exports a TMPDIR
-//! inside the protected store (`/private/cowshed`), and the sandbox refuses to grant any path
-//! there, so a fixture rooted in that TMPDIR fails every test that sandboxes it. `/tmp` is the
-//! same directory on macOS (`/private/tmp`) and exists on every Linux host.
+//! `new_in` creates a private child without changing the selected parent's runtime alias.
+//! Independent sandbox fixtures explicitly select the canonical `/tmp` parent because their
+//! profiles cannot grant protected store paths inherited through TMPDIR. This guard adds no grant.
 
 use std::path::{Path, PathBuf};
-
-const SCRATCH_PARENT: &str = "/tmp";
 
 pub(crate) struct TempRoot(PathBuf);
 
 impl TempRoot {
-    /// Creates `/tmp/<prefix>-<uuid>`, canonical: macOS's `/tmp` resolves into `/private/tmp`,
-    /// and capability detection refuses a path that resolves elsewhere.
-    pub(crate) fn new(prefix: &str) -> Self {
-        let parent = std::fs::canonicalize(SCRATCH_PARENT)
-            .unwrap_or_else(|error| panic!("canonical {SCRATCH_PARENT}: {error}"));
+    /// Creates one private child within the caller's granted parent, preserving any runtime alias.
+    pub(crate) fn new_in(parent: &Path, prefix: &str) -> Self {
+        use std::os::unix::fs::DirBuilderExt as _;
+        assert!(
+            parent.is_absolute(),
+            "test parent {} must be absolute",
+            parent.display()
+        );
+        assert!(
+            parent.is_dir(),
+            "test parent {} must be a directory",
+            parent.display()
+        );
         let path = parent.join(format!("{prefix}-{}", uuid::Uuid::new_v4().simple()));
-        std::fs::create_dir(&path)
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&path)
             .unwrap_or_else(|error| panic!("create test root {}: {error}", path.display()));
         Self(path)
     }

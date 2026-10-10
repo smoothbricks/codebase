@@ -40,7 +40,7 @@ use cowshed_gateway_types::{
 use crate::{
     actor::{
         Admission, AdmissionError, AuditAttempt, AuditDraft, Authentication, BoundListener,
-        Command, CompletionLease, RequestIntent, RequestTarget,
+        Command, CompletionLease, RequestIntent, RequestTarget, accept_locked,
     },
     cache::CacheBodyError,
     config::GatewayTimeouts,
@@ -99,7 +99,7 @@ pub(crate) async fn accept_loop(
     match listener {
         BoundListener::Tcp(listener) => loop {
             tokio::select! {
-                result = listener.accept() => {
+                result = accept_locked(|context| listener.poll_accept(context)) => {
                     let Ok((stream, _)) = result else { break };
                     let _ = stream.set_nodelay(true);
                     spawn_connection(stream, context.clone(), connection_stop.clone(), audit_stop.clone());
@@ -111,7 +111,7 @@ pub(crate) async fn accept_loop(
         },
         BoundListener::Unix(listener) => loop {
             tokio::select! {
-                result = listener.accept() => {
+                result = accept_locked(|context| listener.poll_accept(context)) => {
                     let Ok((stream, _)) = result else { break };
                     spawn_connection(stream, context.clone(), connection_stop.clone(), audit_stop.clone());
                 }

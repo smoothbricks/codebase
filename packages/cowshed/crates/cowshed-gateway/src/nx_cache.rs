@@ -38,8 +38,8 @@ impl NxCacheBackend {
     }
 }
 
-/// A hash-scoped capability supplied by an in-process caller. It does not verify an active land
-/// plan or protected receipt; production control is deferred until a qualified caller exists.
+/// A hash-scoped capability installed by an in-process caller. The qualified production land
+/// caller is deferred; this actor API does not itself verify a land plan or protected receipt.
 #[derive(Clone, Debug)]
 pub struct NxPublication {
     pub workspace_id: String,

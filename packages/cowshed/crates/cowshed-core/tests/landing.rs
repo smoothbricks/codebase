@@ -19,6 +19,8 @@ use cowshed_core::api::{LandingCommits, WorkspaceLanding};
 use cowshed_core::landing::{measure, resolve_target};
 use cowshed_os::fork_lock::Run as _;
 
+#[path = "support/temp_parent.rs"]
+mod temp_parent;
 #[path = "support/temp_root.rs"]
 mod temp_root;
 use temp_root::TempRoot;
@@ -32,7 +34,10 @@ struct Fixture(TempRoot);
 
 impl Fixture {
     fn new(label: &str) -> Self {
-        let fixture = Self(TempRoot::new(&format!("cowshed-landing-{label}")));
+        let fixture = Self(TempRoot::new_in(
+            &temp_parent::canonical_parent(),
+            &format!("cowshed-landing-{label}"),
+        ));
         git(
             fixture.parent_unchecked(),
             ["init", "-q", "-b", TARGET, "."],

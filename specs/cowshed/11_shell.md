@@ -218,15 +218,17 @@ attached (a client connects, then reads end of stream) and the lease stays held 
 process-wide fork lock (`cowshed_core::fork_lock`, Go's `syscall.ForkLock`) closes that window. Every child
 cowshed-core, the CLI and the gateway spawn is spawned holding it shared across the spawn call only, which returns once
 the child has run `exec` or failed to, never across a wait; spawns stay concurrent. Every descriptor whose release a
-peer observes — the supervisor listener and its `.sock.lock` lease, the APFS image lease and raw-device pin, image
-lifecycle locks, the intent lease and journal lock, the job records lock, cargo's cache locks — is fenced from the
-moment it is opened: its close takes the lock exclusive, waiting only for spawns in flight. A socket, which Darwin
-cannot create close-on-exec in one system call, is also created exclusive, or a child forked between `socket` and
-`fcntl` would keep it for life. A job's pipe pair is close-on-exec from birth too: `pipe2(O_CLOEXEC)` on Linux; on
-Darwin, which has no `pipe2`, it is created and marked under the exclusive lock (`fork_lock::create`), so no unrelated
-spawn holds a job's end of stream open. cowshed-core's clippy configuration refuses unlocked `spawn`/`output`/`status`.
-This includes test fixture children, such as the pinned Nx cache adapter's version-refusal probe. Perf finding: a spawn
-holds the shared guard for a whole `fork` of a large supervisor address space, which a release then waits out; a
+peer observes — the supervisor listener and its `.sock.lock` lease, the gateway's workspace session and control
+listeners, the APFS image lease and raw-device pin, image lifecycle locks, the intent lease and journal lock, the job
+records lock, cargo's cache locks — is fenced from the moment it is opened: its close takes the lock exclusive, waiting
+only for spawns in flight. A socket, which Darwin cannot create close-on-exec in one system call, is also created
+exclusive, or a child forked between `socket` and `fcntl` would keep it for life. A job's pipe pair is close-on-exec
+from birth too: `pipe2(O_CLOEXEC)` on Linux; on Darwin, which has no `pipe2`, it is created and marked under the
+exclusive lock (`fork_lock::create`), so no unrelated spawn holds a job's end of stream open. cowshed-core's clippy
+configuration refuses unlocked `spawn`/`output`/`status`. This includes test fixture children, such as the pinned Nx
+cache adapter's version-refusal probe. Gateway listener binds and accepted-socket creation use that same exclusive
+creation step, including close-on-exec publication; asynchronous readiness waits hold no fork-lock guard. Perf finding:
+a spawn holds the shared guard for a whole `fork` of a large supervisor address space, which a release then waits out; a
 `posix_spawn` spawner, which forks nothing, is the later improvement.
 
 The supervisor retains the job's diagnostics stderr before it acquires a warm host. If cloning that descriptor fails,

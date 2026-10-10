@@ -36,7 +36,7 @@ use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
 use rustls::pki_types::CertificateDer;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpStream,
+    net::{TcpListener, TcpStream},
     sync::{Notify, mpsc},
     task::JoinHandle,
     time::timeout,
@@ -207,7 +207,7 @@ async fn gateway(
 async fn http_fixture(
     accepts: usize,
     gate: Option<Arc<Notify>>,
-) -> (u16, mpsc::Receiver<String>, JoinHandle<()>) {
+) -> (u16, mpsc::Receiver<String>, JoinHandle<TcpListener>) {
     let listener = fixture_ports::bind_fixture_listener().await;
     let port = listener.local_addr().expect("fixture address").port();
     let (captured, receiver) = mpsc::channel(accepts.max(1));
@@ -230,8 +230,25 @@ async fn http_fixture(
                     .expect("write fixture response");
             });
         }
+        // The completed task keeps the port reserved until its fixture handle is released.
+        listener
     });
     (port, receiver, task)
+}
+
+#[tokio::test]
+async fn completed_http_fixture_keeps_its_port_reserved() {
+    let (port, mut captured, fixture) = http_fixture(0, None).await;
+    assert_eq!(
+        captured.recv().await,
+        None,
+        "fixture completed without a request"
+    );
+    let error = TcpListener::bind((Ipv4Addr::LOCALHOST, port))
+        .await
+        .expect_err("a completed fixture still owns its listening port");
+    assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+    drop(fixture);
 }
 
 async fn read_headers(stream: &mut TcpStream) -> String {

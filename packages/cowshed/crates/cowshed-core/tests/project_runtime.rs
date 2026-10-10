@@ -52,6 +52,8 @@ use serde_json::{Value, json};
 use tokio::sync::{Notify, mpsc};
 use url::Url;
 
+#[path = "support/temp_parent.rs"]
+mod temp_parent;
 #[path = "support/temp_root.rs"]
 mod temp_root;
 use temp_root::TempRoot;
@@ -1594,7 +1596,7 @@ impl ProjectRuntimeHost for FakeHost {
 
 /// Each test binds its root before the runtime that uses it, so the root drops after the runtime.
 fn test_root() -> TempRoot {
-    let root = TempRoot::new("cowshed-project-runtime");
+    let root = TempRoot::new_in(&temp_parent::canonical_parent(), "cowshed-project-runtime");
     std::fs::create_dir(root.join("checkout")).expect("create test checkout");
     root
 }

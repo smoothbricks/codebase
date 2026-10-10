@@ -293,18 +293,26 @@ artifact or 404 for a miss; `PUT` returns 200 for a publication, 409 for an exis
 refusal. An incomplete, interrupted, or evicted artifact is never a successful empty restore. Project backend lifecycle
 and bounded eviction belong to 03_caches.md.
 
-**Backend outage.** When a project's backend is unavailable, the gateway answers `GET` as a miss (404) and refuses `PUT`
-with 403 before forwarding, as an optimization: no archive is staged or sent to a backend that cannot take it. Each such
-request is audited with status `failed` and classification `nx-backend-unavailable`, and the server side logs the cause
-loudly. An outage is never a successful read: a 404 from it is not evidence that a hash is absent, and no audit record
-or receipt counts it as a hit.
+**Backend outage.** Before committing a response head, the gateway maps a project's backend startup, health, connect,
+handshake, response-head or upstream-5xx failure to a miss (404) for `GET` and a refusal (403) for `PUT`. It audits each
+as `failed` with classification `nx-backend-unavailable` and logs the cause loudly. A startup or connection refusal
+forwards no artifact, but an upstream-5xx response may arrive after request bytes have already been sent. An outage is
+never a successful read: its 404 is not evidence that a hash is absent and never counts as a hit.
+
+Startup waiting shares the gateway's queued-request bounds. A full startup queue is an audited `nx-queue-limited`
+404/403, not a stock-client-fatal 429. Other gateway-level refusals, including drain, audit fail-closed, ordinary queue
+capacity and ordinary queue deadlines, retain their own statuses; they are not backend outages. Unsupported Nx methods
+are denied before starting or waiting for a backend.
 
 **Backend lifecycle isolation.** Each repository's backend is supervised by a per-repository lifecycle state
-(`Starting`, `Ready`, or `Failed { retry_after }`) held outside the request actor. Concurrent requests for one
-repository share one start (single-flight). A failed start records `Failed { retry_after }` with `retry_after` taken
-from `GatewayTimeouts.connect` (default 5 s); until it elapses, requests for that repository are refused as in the
-outage above, without starting another child, and other repositories are unaffected. If the child exits, the next
-request replaces it immediately within the same call.
+(`Starting`, `Ready`, or `Failed { retry_after }`) held by the actor; backend startup and readiness waiting run outside
+it. Concurrent requests for one repository share one start (single-flight). A failed start records
+`Failed { retry_after }` with `retry_after` taken from `GatewayTimeouts.connect` (default 5 s); until it elapses,
+requests for that repository are refused as in the outage above, without starting another child, and other repositories
+are unaffected. If the child exits, the next request replaces it immediately within the same call. A startup worker's
+task failure is reported through the same failed-start transition; it cannot leave an unreported `Starting` state.
+Cancelling the reporting task also aborts its owned worker. A host-configured backend cannot replace a gateway-managed
+live child. Readiness logs the project, address and reclaimed staging-file count, never credentials.
 
 **Outage before and after the response head.** The statuses above apply only before the response head. Once the upstream
 commits a success head, the gateway keeps `200` and cannot change it. A body that then fails, times out, or is dropped

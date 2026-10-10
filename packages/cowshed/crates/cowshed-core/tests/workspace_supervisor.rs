@@ -45,6 +45,8 @@ use cowshed_core::runtime::supervisor::{
     WorkspaceSupervisorHandle,
 };
 
+#[path = "support/temp_parent.rs"]
+mod temp_parent;
 #[path = "support/temp_root.rs"]
 mod temp_root;
 use temp_root::TempRoot;
@@ -570,7 +572,10 @@ fn gate(request: ExecRequest) -> ExecRequest {
 /// A test's private root holding the workspace `config` places in it, removed when the test
 /// ends on any path. Each test binds it before any supervisor over it, so it outlives them all.
 fn workspace_root(label: &str) -> TempRoot {
-    let root = TempRoot::new(&format!("cowshed-supervisor-{label}"));
+    let root = TempRoot::new_in(
+        &temp_parent::canonical_parent(),
+        &format!("cowshed-supervisor-{label}"),
+    );
     std::fs::create_dir(root.join("workspace")).expect("workspace root");
     root
 }
