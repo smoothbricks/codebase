@@ -49,6 +49,11 @@ pub enum SandboxProfileRole {
     /// Controller-invoked Git directory discovery needs only system roots and explicit
     /// readable trees, not the child toolchain's ambient file-read-data permission.
     GitDiscovery,
+    /// [`Self::GitDiscovery`] for controller Git that reads files outside its workspace which
+    /// the workspace's own jobs cannot: it may execute only Git's own executables, so no program
+    /// the repository's config selects runs with that read (02_workspaces.md, "Git-worktree
+    /// workspaces").
+    GitDiscoveryGitOnly,
 }
 
 /// A symlink beside the workspace mount — `<mount_root>/<org>/<project>/<name>` — that an
@@ -674,7 +679,10 @@ pub fn seatbelt_profile(
     // Hard-link creation is a separate SBPL operation from file-write*.
     // Keep aliases unavailable to both authority tiers.
     push_line(&mut profile, "(deny file-link)");
-    if role != SandboxProfileRole::GitDiscovery {
+    if !matches!(
+        role,
+        SandboxProfileRole::GitDiscovery | SandboxProfileRole::GitDiscoveryGitOnly
+    ) {
         push_line(&mut profile, "(allow file-read-data (subpath \"/\"))");
         // The broad allow is for system paths. Nothing under HOME is readable unless a later
         // rule names it: an explicit grant, the workspace's own mount, the exec temp dir, an
@@ -687,7 +695,7 @@ pub fn seatbelt_profile(
     }
     // Every runtime seeds itself from the kernel's entropy before it runs a line; Python reads
     // `/dev/urandom` for it, and without it dies in `_Py_HashRandomization_Init`. Git's own
-    // profile runs merge drivers and hooks too, so every role reads both devices.
+    // profile may run a standalone repository's merge drivers too, so every role reads both devices.
     for device in ["/dev/random", "/dev/urandom"] {
         push_literal_rule(&mut profile, "allow file-read*", Path::new(device))?;
     }
@@ -711,7 +719,33 @@ pub fn seatbelt_profile(
         push_exact_and_subpath_rule(&mut profile, "allow file-read*", Path::new(root))?;
         push_readable_ancestors(&mut profile, Path::new(root))?;
     }
-    push_line(&mut profile, "(allow process-exec process-fork)");
+    if role == SandboxProfileRole::GitDiscoveryGitOnly {
+        push_line(&mut profile, "(allow process-fork)");
+        // The developer-dir `git` the sandbox launches and the helpers it re-executes from its
+        // exec path, in both the spelling Git is launched by and the one the link resolves to.
+        // Nothing else runs: not a shell, so not any command a config key names.
+        let developer = Path::new(GIT_DEVELOPER_DIR);
+        // Seatbelt matches the resolved spelling. A developer directory that does not resolve
+        // would leave only a rule that never matches, and Git would die with no cause named.
+        let resolved = std::fs::canonicalize(developer).map_err(|_| SandboxError::InvalidPath {
+            path: developer.to_owned(),
+            reason: "the active developer directory does not resolve",
+        })?;
+        for root in [developer.to_owned(), resolved] {
+            push_literal_rule(
+                &mut profile,
+                "allow process-exec",
+                &root.join("usr/bin/git"),
+            )?;
+            push_subpath_rule(
+                &mut profile,
+                "allow process-exec",
+                &root.join("usr/libexec/git-core"),
+            )?;
+        }
+    } else {
+        push_line(&mut profile, "(allow process-exec process-fork)");
+    }
     push_line(&mut profile, "(allow file-map-executable)");
     push_line(&mut profile, "(allow sysctl-read)");
     push_line(&mut profile, "(allow pseudo-tty)");
@@ -1056,7 +1090,9 @@ pub fn seatbelt_profile(
             // carve-back, including when the repository itself is read-only.
             push_exact_and_subpath_rule(&mut profile, "allow file-write*", &job_artifacts)?;
         }
-        SandboxProfileRole::ExecutedChild | SandboxProfileRole::GitDiscovery => {
+        SandboxProfileRole::ExecutedChild
+        | SandboxProfileRole::GitDiscovery
+        | SandboxProfileRole::GitDiscoveryGitOnly => {
             // These terminal rules are emitted after every configurable or broad
             // allow. Denying create/unlink at the metadata directory itself
             // prevents replacing or renaming that ancestor without blocking
@@ -1224,6 +1260,10 @@ fn push_readable_ancestors(profile: &mut String, path: &Path) -> Result<(), Sand
     }
     Ok(())
 }
+
+/// Where controller Git runs from: the active developer directory's `usr/bin/git` and its
+/// `usr/libexec/git-core` exec path.
+pub(crate) const GIT_DEVELOPER_DIR: &str = "/var/select/developer_dir";
 
 fn push_subpath_rule(
     profile: &mut String,
@@ -2698,6 +2738,29 @@ mod tests {
         );
     }
 
+    /// Controller Git that holds reads beyond its workspace executes only Git: the profile forks
+    /// and executes the developer directory's `git` and `git-core`, and nothing broader.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn git_only_profile_executes_only_git() {
+        let config = config(RunSandboxMode::ReadWrite);
+        let profile = seatbelt_profile(&config, SandboxProfileRole::GitDiscoveryGitOnly).unwrap();
+        assert!(!profile.contains("(allow process-exec process-fork)"));
+        assert!(profile.contains("(allow process-fork)"));
+        let execs = profile
+            .lines()
+            .filter(|line| line.contains("process-exec"))
+            .collect::<Vec<_>>();
+        assert!(!execs.is_empty());
+        assert!(
+            execs.iter().all(|line| line.ends_with("/usr/bin/git\"))")
+                || line.ends_with("/usr/libexec/git-core\"))")),
+            "{execs:?}"
+        );
+        let broad = seatbelt_profile(&config, SandboxProfileRole::GitDiscovery).unwrap();
+        assert!(broad.contains("(allow process-exec process-fork)"));
+    }
+
     /// Every role, Git's included, reads the entropy devices; none reaches the per-user directory
     /// helper, whose answers name host directories no job may write
     /// (`host_controller_seatbelt_gives_every_role_entropy` runs both).
@@ -2708,6 +2771,8 @@ mod tests {
             SandboxProfileRole::TrustedSupervisor,
             SandboxProfileRole::ExecutedChild,
             SandboxProfileRole::GitDiscovery,
+            #[cfg(target_os = "macos")]
+            SandboxProfileRole::GitDiscoveryGitOnly,
         ] {
             let profile = seatbelt_profile(&config, role).unwrap();
             for rule in [

@@ -3039,20 +3039,47 @@ pub fn sandboxed_git_command_at(root: &Path) -> Result<std::process::Command> {
     sandboxed_git_command_with_paths(root, None, None)
 }
 
-/// The controller passes main's resolved mount explicitly for a workspace
-/// fetch; the repository's own remote URL must never authorize a host read.
+/// A tree outside the checkout that controller Git reads, as the controller names it: never a
+/// path the repository's own config or remote URL chose.
 #[cfg(target_os = "macos")]
-pub(crate) fn sandboxed_git_command_with_read(
+#[derive(Clone, Copy)]
+enum ExtraRead<'a> {
+    /// A checkout fetched from by local path. Git runs `upload-pack` for it through a shell.
+    FetchSource(&'a Path),
+    /// Another repository's object store, read in place through `GIT_ALTERNATE_OBJECT_DIRECTORIES`.
+    AlternateObjects(&'a Path),
+}
+
+#[cfg(target_os = "macos")]
+impl<'a> ExtraRead<'a> {
+    fn kind(self) -> &'static str {
+        match self {
+            Self::FetchSource(_) => "Git source checkout",
+            Self::AlternateObjects(_) => "Git object store",
+        }
+    }
+
+    fn path(self) -> &'a Path {
+        match self {
+            Self::FetchSource(path) | Self::AlternateObjects(path) => path,
+        }
+    }
+}
+
+/// Git for a workspace fetch from `source`, a checkout the controller resolved: main's mount,
+/// a lane base, a unit. The repository's own remote URL never authorizes a host read.
+#[cfg(target_os = "macos")]
+pub(crate) fn sandboxed_git_fetch_command(
     root: &Path,
-    readable: &Path,
+    source: &Path,
 ) -> Result<std::process::Command> {
-    sandboxed_git_command_with_paths(root, Some(readable), None)
+    sandboxed_git_command_with_paths(root, Some(ExtraRead::FetchSource(source)), None)
 }
 
 #[cfg(target_os = "macos")]
 fn sandboxed_git_command_with_paths(
     root: &Path,
-    readable: Option<&Path>,
+    extra: Option<ExtraRead<'_>>,
     writable: Option<&Path>,
 ) -> Result<std::process::Command> {
     use crate::sandbox::{
@@ -3102,11 +3129,42 @@ fn sandboxed_git_command_with_paths(
         None => Vec::new(),
     };
     let linked = common.is_some();
-    if let Some(path) = readable {
-        read.push(fs::canonicalize(path).map_err(|error| {
+    // Reads of main's checkout that the workspace's jobs cannot make: no program the config
+    // selects may run beside them, whatever name it is selected by, or whenever it is added.
+    // A controller-named tree (`extra`) is not among them: it is one the controller chose. An
+    // object store is read in place and runs nothing. A local fetch runs Git's upload-pack through
+    // a shell, which a Git that may execute only Git cannot start, so the two never meet: such a
+    // fetch is refused here, by name, before Git runs (02_workspaces.md, "Git-worktree workspaces").
+    if let Some(ExtraRead::FetchSource(source)) = extra
+        && !read.is_empty()
+    {
+        return Err(CowshedError::sandbox_denied(
+            format!(
+                "a linked worktree whose main config includes main-tree files cannot fetch: {} reads {} from main's checkout through those includes, so its Git may execute only Git, and fetching from {} runs upload-pack through a shell",
+                canonical.display(),
+                read.iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                source.display()
+            ),
+            "move each included file into main's .git or remove the include from main's .git/config, or rebase and land through a standalone lane",
+        ));
+    }
+    let role = if read.is_empty() {
+        SandboxProfileRole::GitDiscovery
+    } else {
+        SandboxProfileRole::GitDiscoveryGitOnly
+    };
+    if let Some(extra) = extra {
+        read.push(fs::canonicalize(extra.path()).map_err(|error| {
             CowshedError::integrity(
-                format!("cannot resolve Git read path {}: {error}", path.display()),
-                "repair the Git source checkout",
+                format!(
+                    "cannot resolve the {} {}: {error}",
+                    extra.kind(),
+                    extra.path().display()
+                ),
+                "repair the path the controller named",
             )
         })?);
     }
@@ -3150,7 +3208,7 @@ fn sandboxed_git_command_with_paths(
         repository_caches: Vec::new(),
         capabilities: Default::default(),
     };
-    let profile = seatbelt_profile(&config, SandboxProfileRole::GitDiscovery).map_err(|error| {
+    let profile = seatbelt_profile(&config, role).map_err(|error| {
         CowshedError::integrity(
             format!(
                 "cannot sandbox controller git in {}: {error}",
@@ -3173,7 +3231,7 @@ fn sandboxed_git_command_with_paths(
         let mut command = std::process::Command::new(crate::exec::SANDBOX_EXEC);
         command
             .args(profile.args())
-            .arg("/var/select/developer_dir/usr/bin/git");
+            .arg(format!("{}/usr/bin/git", crate::sandbox::GIT_DEVELOPER_DIR));
         command.args(git.get_args());
         for (name, value) in git.get_envs() {
             match value {
@@ -3252,7 +3310,11 @@ where
     S: AsRef<OsStr>,
 {
     #[cfg(target_os = "macos")]
-    let git = sandboxed_git_command_with_paths(root, alternate_objects, writable)?;
+    let git = sandboxed_git_command_with_paths(
+        root,
+        alternate_objects.map(ExtraRead::AlternateObjects),
+        writable,
+    )?;
     #[cfg(not(target_os = "macos"))]
     let git = git_command_at(root);
     let mut command = Command::from(git);
@@ -3931,7 +3993,7 @@ mod tests {
             !denied.status.success(),
             "a repository URL cannot grant its own read"
         );
-        let admitted = super::sandboxed_git_command_with_read(&workspace, &main)
+        let admitted = super::sandboxed_git_fetch_command(&workspace, &main)
             .expect("trusted read grant")
             .args(["fetch", "--no-tags", source])
             .output_locked()
@@ -4156,10 +4218,176 @@ mod tests {
             !workspace.join(".filter-ran").exists(),
             "the controller's Git ran the repository's clean filter"
         );
+        // New content, so the unconfined add cleans the file rather than trusting the index.
+        fs::write(workspace.join("README"), "changed again\n").expect("change README again");
         git(&workspace, &["add", "README"]);
         assert!(
             workspace.join(".filter-ran").exists(),
             "unconfined Git runs the filter, so the fixture would have shown it"
+        );
+    }
+
+    /// A git-worktree workspace whose main config includes a file of main's checkout, so its
+    /// controller Git holds that read, with a forged signed commit in main and an executable in
+    /// the workspace that records it ran: what a job could leave behind for `rm`'s `git log` or
+    /// a land's `git merge` to run.
+    #[cfg(target_os = "macos")]
+    fn worktree_with_a_planted_program() -> (Repository, PathBuf, String, PathBuf) {
+        use crate::fork_lock::Spawn as _;
+        let (main, workspace) = linked_worktree(&["../tooling/workspace.gitconfig"]);
+        fs::create_dir_all(main.join("tooling")).expect("tooling");
+        fs::write(
+            main.join("tooling/workspace.gitconfig"),
+            "[core]\n\tabbrev = 12\n",
+        )
+        .expect("included config");
+        let marker = workspace.join(".program-ran");
+        let program = workspace.join("planted-gpg");
+        fs::write(
+            &program,
+            format!("#!/bin/sh\necho ran >> '{}'\nexit 1\n", marker.display()),
+        )
+        .expect("planted program");
+        fs::set_permissions(
+            &program,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .expect("executable");
+        let rev = |spec: &str| {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(&*main)
+                .args(["rev-parse", spec])
+                .output_locked()
+                .expect("rev-parse");
+            String::from_utf8(output.stdout)
+                .expect("oid")
+                .trim()
+                .to_owned()
+        };
+        let body = format!(
+            "tree {}\nparent {}\nauthor Forger <f@example.invalid> 0 +0000\ncommitter Forger <f@example.invalid> 0 +0000\ngpgsig -----BEGIN PGP SIGNATURE-----\n \n forged\n -----END PGP SIGNATURE-----\n\nforged\n",
+            rev("HEAD^{tree}"),
+            rev("HEAD")
+        );
+        let mut hash = Command::new("git")
+            .arg("-C")
+            .arg(&*main)
+            .args(["hash-object", "-t", "commit", "-w", "--stdin"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn_locked()
+            .expect("hash-object");
+        std::io::Write::write_all(&mut hash.stdin.take().expect("stdin"), body.as_bytes())
+            .expect("write commit");
+        let output = hash.wait_with_output().expect("hash-object output");
+        assert!(output.status.success());
+        let forged = String::from_utf8(output.stdout)
+            .expect("oid")
+            .trim()
+            .to_owned();
+        git(
+            &main,
+            &["config", "gpg.program", program.to_str().expect("UTF-8")],
+        );
+        (main, workspace, forged, marker)
+    }
+
+    /// `log.showSignature` makes `git log` run `gpg.program` on a signed commit. The controller's
+    /// Git for a workspace holding main-tree reads cannot run it: only Git's own executables run.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn linked_worktree_controller_git_runs_no_gpg_program_for_log() {
+        let (main, workspace, forged, marker) = worktree_with_a_planted_program();
+        git(&main, &["config", "log.showSignature", "true"]);
+        let _ = super::sandboxed_git_command_at(&workspace)
+            .expect("narrow Git")
+            // Git writes the signature to a temporary file before it runs gpg.program; a TMPDIR
+            // the sandbox can write isolates the exec rule as the only thing that stops it.
+            .env("TMPDIR", &workspace)
+            .args(["log", "-1", "--pretty=format:%H", &forged])
+            .output_locked()
+            .expect("sandboxed log");
+        assert!(!marker.exists(), "the controller's Git ran gpg.program");
+        let _ = Command::new("git")
+            .arg("-C")
+            .arg(&workspace)
+            .args(["log", "-1", "--pretty=format:%H", &forged])
+            .output_locked()
+            .expect("unconfined log");
+        assert!(
+            marker.exists(),
+            "unconfined Git runs it, so the fixture would have shown it"
+        );
+    }
+
+    /// `merge.verifySignatures` makes `git merge` run `gpg.program` on the commit it would take.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn linked_worktree_controller_git_runs_no_gpg_program_for_merge() {
+        let (main, workspace, forged, marker) = worktree_with_a_planted_program();
+        git(&main, &["config", "merge.verifySignatures", "true"]);
+        let merged = super::sandboxed_git_command_at(&workspace)
+            .expect("narrow Git")
+            .env("TMPDIR", &workspace)
+            .args(["merge", "--ff-only", &forged])
+            .output_locked()
+            .expect("sandboxed merge");
+        assert!(
+            !merged.status.success(),
+            "an unverifiable commit is not merged"
+        );
+        assert!(!marker.exists(), "the controller's Git ran gpg.program");
+    }
+
+    /// `rm`'s unlanded-work proof and `ls --landing` read a linked worktree through another
+    /// repository's object store (`with_alternate_objects`). That is a read, not a fetch: no shell
+    /// runs, so it works under the Git-only profile that main-tree include grants impose.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn an_alternate_object_read_works_under_main_tree_include_grants() {
+        let (main, workspace) = linked_worktree(&["../tooling/workspace.gitconfig"]);
+        fs::create_dir_all(main.join("tooling")).expect("tooling");
+        fs::write(
+            main.join("tooling/workspace.gitconfig"),
+            "[core]\n\tabbrev = 12\n",
+        )
+        .expect("included config");
+        let other = repository();
+        let objects = other.join(".git/objects").canonicalize().expect("objects");
+        let held = GitRepository::from_root(&workspace)
+            .with_alternate_objects(objects)
+            .expect("alternate objects")
+            .commits_already_held("HEAD", "HEAD")
+            .await
+            .expect("an alternate-object read is not a fetch");
+        assert_eq!(held, 0);
+    }
+
+    /// A driver added after the command was built — by a job of this or a sibling workspace,
+    /// between construction and spawn — is named by no override, and still cannot run.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_driver_added_after_construction_cannot_run() {
+        let (main, workspace, _, marker) = worktree_with_a_planted_program();
+        let mut command = super::sandboxed_git_command_at(&workspace).expect("narrow Git");
+        git(
+            &main,
+            &[
+                "config",
+                "filter.late.clean",
+                workspace.join("planted-gpg").to_str().expect("UTF-8"),
+            ],
+        );
+        fs::write(workspace.join(".gitattributes"), "README filter=late\n").expect("attributes");
+        fs::write(workspace.join("README"), "changed\n").expect("change README");
+        let _ = command
+            .args(["add", "README"])
+            .output_locked()
+            .expect("sandboxed add");
+        assert!(
+            !marker.exists(),
+            "a late driver ran under the controller's Git"
         );
     }
 
