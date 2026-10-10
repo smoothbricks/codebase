@@ -1,5 +1,7 @@
 #[path = "support/fixture_dir.rs"]
 mod fixture_dir;
+#[path = "support/fixture_ports.rs"]
+mod fixture_ports;
 #[cfg(target_os = "linux")]
 #[path = "gateway/linux.rs"]
 mod linux;
@@ -34,7 +36,7 @@ use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
 use rustls::pki_types::CertificateDer;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
+    net::TcpStream,
     sync::{Notify, mpsc},
     task::JoinHandle,
     time::timeout,
@@ -206,9 +208,7 @@ async fn http_fixture(
     accepts: usize,
     gate: Option<Arc<Notify>>,
 ) -> (u16, mpsc::Receiver<String>, JoinHandle<()>) {
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .await
-        .expect("bind upstream fixture");
+    let listener = fixture_ports::bind_fixture_listener().await;
     let port = listener.local_addr().expect("fixture address").port();
     let (captured, receiver) = mpsc::channel(accepts.max(1));
     let task = tokio::spawn(async move {

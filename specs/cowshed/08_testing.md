@@ -145,6 +145,27 @@ exec and touching memory. A parent's report of the just-forked PID is not that e
 measured zero before exec. One lifecycle keeps the live, exited-unreaped and reaped assertions; no sleep or retry
 supplies readiness.
 
+## Fixtures
+
+Every test fixture stays inside the effective grants of the ordinary exec it runs in. Gateway fixtures choose
+`COWSHED_RUNTIME_LINK` as the short alias when one is available and never canonicalize it back to the long store path;
+otherwise they use `TMPDIR` or the standard temp directory outside the cowshed store. An invalid requested alias fails
+loudly; it never falls through to a global or temp directory.
+
+A fixture's child directory is a real, non-symlink directory owned by the test process UID with mode 0700. Drop cleans
+every path the fixture created. No fixture adds a grant, a host cache path, a script wrapper, or a sandbox disable.
+
+Inside a workspace's port block, the gateway's own port `COWSHED_PORT_BASE` stays reserved: an upstream fixture binds
+the first free service port in `base+1` through `base+size-1` and never port 0 or a port outside the block. A block
+exported without its size, or the reverse, fails loudly by name. Inside a Cow test gateway, `free_endpoint` allocates
+aligned two-port sub-blocks starting at `base+2`, never the reserved real gateway `base`; each claimed service port is a
+single listener, and its claim is retained for the listener's lifetime. Outside a workspace, a fixture binds any free
+loopback port through the existing global allocator.
+
+Host-controller tests that need the global identities of the real host (the shared port range, the real gateway socket,
+the host's own store) name each such identity explicitly in the test. No blanket bypass of the workspace's block or
+grants is permitted.
+
 ## Host-controller authority
 
 Run `nx run cowshed:host-controller-test` from the owned checkout in an unsandboxed host-controller shell. This single

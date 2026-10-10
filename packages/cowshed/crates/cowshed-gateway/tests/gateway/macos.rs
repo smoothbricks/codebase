@@ -209,6 +209,14 @@ static CLAIMS: Mutex<BTreeMap<u16, std::net::TcpListener>> = Mutex::new(BTreeMap
 /// it, and every allocator on the host binds the lowest free block's base first, so a released
 /// base can be anyone's by then. [`install_claimed`] makes the gateway's own bind the probe.
 fn free_endpoint() -> SocketAddr {
+    match fixture_ports::enclosing_cow_port_block() {
+        Some((base, size)) => enclosed_subblock(base, size),
+        None => global_block(),
+    }
+}
+
+/// Outside a workspace: the next free global block, claimed as above.
+fn global_block() -> SocketAddr {
     static NEXT_BLOCK: AtomicU16 = AtomicU16::new(0);
     let seed = (std::process::id() % u32::from(PORT_BLOCKS)) as u16;
     for _ in 0..PORT_BLOCKS {
@@ -222,6 +230,34 @@ fn free_endpoint() -> SocketAddr {
         return SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), base);
     }
     panic!("no free macOS gateway port block in {PORT_BLOCKS} candidates");
+}
+
+/// Inside a workspace block: the 2-port subblocks at even offsets 2..=size-2, since base and
+/// base+1 belong to the gateway and the sandbox's upstream. Each subblock is claimed on its
+/// service port exactly as a global block is, so another claimant skips it.
+fn enclosed_subblock(base: u16, size: u16) -> SocketAddr {
+    static NEXT_SUBBLOCK: AtomicU16 = AtomicU16::new(0);
+    assert!(
+        size >= 4,
+        "workspace port block {base}+{size} needs a larger fixture capacity: it holds no free 2-port subblock"
+    );
+    let count = (size - 2) / 2;
+    for _ in 0..count {
+        let step = NEXT_SUBBLOCK.fetch_add(1, Ordering::Relaxed);
+        let subblock = base + 2 + (step % count) * 2;
+        match std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, subblock + 1)) {
+            Ok(claim) => {
+                CLAIMS.lock().expect("port claims").insert(subblock, claim);
+                return SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), subblock);
+            }
+            Err(error) if error.kind() == io::ErrorKind::AddrInUse => {}
+            Err(error) => panic!(
+                "claim workspace subblock service port {}: {error}",
+                subblock + 1
+            ),
+        }
+    }
+    panic!("workspace port block {base}+{size} has no free 2-port subblock");
 }
 
 /// A claimed block whose base this process binds too, for a test that needs an endpoint the
@@ -243,9 +279,13 @@ fn release_claim(endpoint: SocketAddr) {
 
 /// The session endpoint for a block [`free_endpoint`] claimed.
 fn block_endpoint(address: SocketAddr) -> WorkspaceEndpoint {
+    let block_size = match fixture_ports::enclosing_cow_port_block() {
+        Some(_) => 2,
+        None => cowshed_gateway::NEW_PORT_BLOCK_SIZE,
+    };
     WorkspaceEndpoint::Tcp {
         address,
-        block_size: cowshed_gateway::NEW_PORT_BLOCK_SIZE,
+        block_size,
     }
 }
 
@@ -449,9 +489,7 @@ async fn h2_tls_fixture(
     JoinHandle<()>,
 ) {
     let (server, client) = fixture_tls_configs(host, vec![b"h2".to_vec()]);
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .await
-        .expect("bind h2 TLS fixture");
+    let listener = fixture_ports::bind_fixture_listener().await;
     let port = listener.local_addr().expect("h2 fixture address").port();
     let gate = Arc::new(Notify::new());
     let producer_gate = Arc::clone(&gate);
@@ -513,9 +551,7 @@ async fn h2_tls_fixture(
 
 async fn h1_tls_fixture(host: &str) -> (u16, Arc<ClientConfig>, JoinHandle<()>) {
     let (server, client) = fixture_tls_configs(host, vec![b"http/1.1".to_vec()]);
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .await
-        .expect("bind h1 TLS fixture");
+    let listener = fixture_ports::bind_fixture_listener().await;
     let port = listener.local_addr().expect("h1 fixture address").port();
     let task = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.expect("accept h1 TLS");
@@ -546,9 +582,7 @@ async fn no_alpn_tls_fixture(
     host: &str,
 ) -> (u16, Arc<ClientConfig>, mpsc::Receiver<bool>, JoinHandle<()>) {
     let (server, client) = fixture_tls_configs(host, Vec::new());
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .await
-        .expect("bind no-ALPN TLS fixture");
+    let listener = fixture_ports::bind_fixture_listener().await;
     let port = listener
         .local_addr()
         .expect("no-ALPN fixture address")
@@ -1386,9 +1420,7 @@ async fn native_registry_requests_use_one_admitted_proxy_path_and_cache() {
 /// so each answer must still be audited as completed, not as a dropped response.
 #[tokio::test]
 async fn a_conditional_registry_request_is_answered_304_by_the_gateway_and_audited_completed() {
-    let registry = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .await
-        .expect("bind registry fixture");
+    let registry = fixture_ports::bind_fixture_listener().await;
     let upstream_port = registry.local_addr().expect("registry address").port();
     // One connection: everything after the fill is served from the cache.
     let registry = tokio::spawn(async move {
@@ -1501,9 +1533,7 @@ async fn intercepted_tarball_is_refused_before_its_last_bytes_escape_on_digest_m
     let expected = b"published tarball bytes";
     let tampered = b"tampered! tarball bytes";
     assert_eq!(expected.len(), tampered.len());
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .await
-        .expect("bind registry fixture");
+    let listener = fixture_ports::bind_fixture_listener().await;
     let upstream_port = listener.local_addr().expect("registry address").port();
     let packument = serde_json::to_vec(&serde_json::json!({
         "versions": {"1.0.0": {"dist": {
@@ -1627,9 +1657,7 @@ async fn intercepted_tarball_is_refused_before_its_last_bytes_escape_on_digest_m
 
 #[tokio::test]
 async fn opaque_connect_preserves_bytes_exactly() {
-    let upstream = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .await
-        .expect("bind echo fixture");
+    let upstream = fixture_ports::bind_fixture_listener().await;
     let upstream_port = upstream.local_addr().expect("echo address").port();
     let payload = tls_client_hello("pinned.test");
     let expected = payload.clone();
@@ -2034,9 +2062,7 @@ async fn active_queue_and_overflow_limits_are_enforced() {
 
 #[tokio::test]
 async fn queued_request_timeout_cancels_without_leaking_a_slot() {
-    let tunnel_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .await
-        .expect("bind held tunnel");
+    let tunnel_listener = fixture_ports::bind_fixture_listener().await;
     let tunnel_port = tunnel_listener.local_addr().expect("tunnel address").port();
     let held = tokio::spawn(async move {
         let (mut stream, _) = tunnel_listener.accept().await.expect("accept held tunnel");
@@ -2362,9 +2388,7 @@ async fn revision_tombstone_and_rotation_preserve_authority() {
 /// error instead of draining forever behind a healthy-looking control socket.
 #[tokio::test]
 async fn audit_failure_is_fail_closed_drains_and_stops_the_gateway() {
-    let upstream = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .await
-        .expect("bind active HTTP upstream");
+    let upstream = fixture_ports::bind_fixture_listener().await;
     let upstream_port = upstream.local_addr().expect("upstream address").port();
     let (started_tx, started_rx) = tokio::sync::oneshot::channel();
     let active_upstream = tokio::spawn(async move {
@@ -2580,9 +2604,7 @@ async fn active_error_and_disconnect_paths_reclaim_single_permit() {
     }
 
     {
-        let upstream = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-            .await
-            .expect("bind credential upstream");
+        let upstream = fixture_ports::bind_fixture_listener().await;
         let upstream_port = upstream.local_addr().expect("upstream address").port();
         let accepts = tokio::spawn(async move {
             for _ in 0..2 {
@@ -2635,9 +2657,7 @@ async fn active_error_and_disconnect_paths_reclaim_single_permit() {
     }
 
     {
-        let upstream = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-            .await
-            .expect("bind header upstream");
+        let upstream = fixture_ports::bind_fixture_listener().await;
         let upstream_port = upstream.local_addr().expect("upstream address").port();
         let accepts = tokio::spawn(async move {
             for _ in 0..2 {
@@ -2734,9 +2754,7 @@ async fn active_error_and_disconnect_paths_reclaim_single_permit() {
 
 #[tokio::test]
 async fn queued_disconnect_and_drain_reclaim_all_capacity() {
-    let upstream = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .await
-        .expect("bind held tunnel");
+    let upstream = fixture_ports::bind_fixture_listener().await;
     let upstream_port = upstream.local_addr().expect("upstream address").port();
     let held = tokio::spawn(async move {
         let (mut stream, _) = upstream.accept().await.expect("accept held tunnel");
