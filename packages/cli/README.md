@@ -589,9 +589,11 @@ Only an observed missing target makes a link dangling. Permission or other metad
 removing captured links; an unreadable checkout is not a deleted checkout.
 
 Declared `smoo.developerLinks` directories resolve against each checkout's own root, never a root borrowed from a
-cowshed marker. In-repository aliases are relative and travel with that checkout. A fork carries existing external
-developer links as absolute sibling bindings; a declaration whose sibling is absent at the fork's depth cannot redirect
-those bindings.
+cowshed marker. In-repository aliases are relative and travel with that checkout. An explicit declaration naming a
+checkout present on this machine is authoritative: it repoints an existing external binding, including a developer's
+previous choice. A declaration whose checkout is absent, or whose directory has no `package.json`, is reported as
+unavailable and leaves the installed version and the existing binding bytes unchanged. A fork carries existing external
+developer links as absolute sibling bindings.
 
 A job's terminal cleanup applies the same boundary to the developer links it displaced. A registry replacement is
 restored to its recorded link. A different live developer binding is kept as the developer left it, with no new grant or

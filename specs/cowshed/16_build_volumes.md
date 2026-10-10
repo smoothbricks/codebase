@@ -1065,6 +1065,22 @@ An Nx task hash must not change between checkouts of the same tree.
   to its own tree once, under the admission that verifies the marker (01_storage.md, "In-image marker"). Relative
   escaping job links and the mint's read grants are not touched by that migration.
 
+A project-contained developer-link declaration selects its directory in the current checkout and refuses physical
+symlink escapes, including an escaping existing ancestor of a not-yet-existing declared directory. Genuine sibling
+declarations retain their main-checkout anchor. An explicit declaration naming an available checkout is authoritative:
+it repoints an existing external binding, including a developer's previous choice. A declaration whose checkout is
+absent, or whose directory has no `package.json`, is reported as unavailable: its installed version and any existing
+undeclared binding keep their captured bytes. Neither the containment nor the sibling rule grants the main checkout or
+an ancestor dependency store to a cowshed sandbox. Genuine sibling links already carried by a fork retain their absolute
+targets; the mint grants reads only on their captured canonical sibling targets, never a target named by a later
+workspace-mutated symlink. Live developer package links, including owned relative aliases and the executable aliases
+that select those packages, are restored by cowshed across installs under the exact managed-command coverage of
+15_capabilities.md ("Bootstrap executables"). An absolute manager bypass receives terminal cleanup only. Cowshed's
+job-time restoration never broadens the mint's read authority; a later foreign target remains denied. A workspace whose
+marker predates the owned-link revision has its absolute owned aliases into the donor root re-spelled relative to its
+own tree once, under the admission that verifies the marker (01_storage.md, "In-image marker"). Relative escaping job
+links and the mint's read grants are not touched by that migration.
+
 A project-contained developer alias is a relative link within its checkout. A source-image fork therefore selects its
 own copy without borrowing its donor's tree. Ordinary activation normalizes absolute aliases into this checkout. Genuine
 sibling links retain their distinct host-local authority.

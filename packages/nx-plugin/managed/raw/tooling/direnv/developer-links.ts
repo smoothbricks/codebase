@@ -492,6 +492,13 @@ export function applyDeclaredLinks(root: string, plan: DeclaredLinksPlan): void 
   }
 }
 
+/** One stderr line per declaration this machine cannot honour; the installed version stays. */
+export function reportUnavailableDeclaredLinks(unavailable: readonly UnavailableDeclaredLink[]): void {
+  for (const { name, target, reason } of unavailable) {
+    console.error(`! smoo.developerLinks ${name}: ${target} ${reason}; the installed version stays`);
+  }
+}
+
 function containsPath(root: string, candidate: string): boolean {
   const relative = path.relative(root, candidate);
   return relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
@@ -546,10 +553,11 @@ function packageAliasTarget(root: string, alias: string, target: string): string
   return containsPath(path.resolve(root), path.resolve(target)) ? path.relative(path.dirname(alias), target) : target;
 }
 
-/** Why `target` cannot be linked to, or null when it is a directory this process can reach. */
+/** Why `target` cannot be linked to, or null when it is a package directory this process can reach. */
 function unavailableReason(target: string): string | null {
   try {
-    return statSync(target).isDirectory() ? null : 'is not a directory';
+    if (!statSync(target).isDirectory()) return 'is not a directory';
+    return existsSync(path.join(target, 'package.json')) ? null : 'has no package.json here';
   } catch (error) {
     if (error instanceof Error && 'code' in error) {
       if (error.code === 'ENOENT' || error.code === 'ENOTDIR') {
