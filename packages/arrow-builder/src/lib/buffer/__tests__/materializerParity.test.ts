@@ -471,3 +471,27 @@ describe('ColumnWriter materializer parity', () => {
     expect(snapshotBuffer(compiledBuffer, testCase.fields)).toEqual(reference);
   });
 });
+
+describe('closure materializer enum metadata', () => {
+  it('reads schema enum values once per class build, never per buffer construction', () => {
+    let reads = 0;
+    const values = new Proxy(['pending', 'done'], {
+      get(target, property, receiver) {
+        if (property === Symbol.iterator || (typeof property === 'string' && /^\d+$/.test(property))) reads++;
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    const schema = new ColumnSchema({ lazy: S.enum(values), eager: S.enum(values).eager() });
+    withMode('closure', () => {
+      reads = 0;
+      const BufferClass = getColumnBufferClass(schema);
+      const readsAtBuild = reads;
+      expect(readsAtBuild).toBeGreaterThan(0);
+      const first = new BufferClass(8);
+      const second = new BufferClass(8);
+      expect(reads).toBe(readsAtBuild);
+      expect(Reflect.get(first, 'lazy_enumValues')).toEqual(['pending', 'done']);
+      expect(Reflect.get(first, 'lazy_enumValues')).not.toBe(Reflect.get(second, 'lazy_enumValues'));
+    });
+  });
+});

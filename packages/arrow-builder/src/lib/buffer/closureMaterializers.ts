@@ -323,7 +323,9 @@ export function materializeColumnBufferClass(
     const { name, storage, mode } = column;
     const rawNulls = `_${name}_nulls`;
     const rawValues = `_${name}_values`;
-    const enumValues = storage.schemaType === 'enum' ? storage.enumValues : undefined;
+    // Copied once here, like the compiled class bakes an array literal: per-instance
+    // copies below must not re-read schema enum metadata on every buffer construction.
+    const enumValues = storage.schemaType === 'enum' && storage.enumValues ? Array.from(storage.enumValues) : undefined;
     const enumKey = `${name}_enumValues`;
     const writeValue = makeValueWriter(storage, rawValues);
 
