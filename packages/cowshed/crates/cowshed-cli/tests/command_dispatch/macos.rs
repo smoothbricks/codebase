@@ -5267,6 +5267,7 @@ async fn real_apfs_rename_keeps_edits_written_after_clone_publication() {
 }
 
 #[tokio::test]
+
 async fn real_apfs_managed_install_restores_developer_links_before_nx_and_cleans_absolute_bypass() {
     cowshed_core::runtime::shell_host::register(
         cowshed_core::runtime::shell_host::ShellHostProgram::with_arguments(
@@ -5322,7 +5323,18 @@ async fn real_apfs_managed_install_restores_developer_links_before_nx_and_cleans
         String::from_utf8_lossy(&installed.stderr)
     );
     for entry in ["node_modules/nx", "node_modules/.bin/nx"] {
-        fs::remove_file(fixture.checkout.join(entry)).unwrap();
+        let path = fixture.checkout.join(entry);
+        let metadata = fs::symlink_metadata(&path)
+            .unwrap_or_else(|error| panic!("installed fixture entry {}: {error}", path.display()));
+        if metadata.is_dir() && !metadata.file_type().is_symlink() {
+            fs::remove_dir_all(&path).unwrap_or_else(|error| {
+                panic!("remove installed directory {}: {error}", path.display())
+            });
+        } else {
+            fs::remove_file(&path).unwrap_or_else(|error| {
+                panic!("remove installed entry {}: {error}", path.display())
+            });
+        }
     }
     std::os::unix::fs::symlink(&nx, fixture.checkout.join("node_modules/nx")).unwrap();
     std::os::unix::fs::symlink(
