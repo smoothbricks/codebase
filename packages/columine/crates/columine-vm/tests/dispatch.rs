@@ -2638,8 +2638,8 @@ proptest! {
 }
 
 // =============================================================================
-// Journal refusal and full-image windows through the real dispatch path. A
-// refused write is a typed prewrite refusal: no shadow snapshot is taken.
+// Journal overflow and full-image windows through the real dispatch path. A
+// write past the record budget runs into the shadow; rollback stays exact.
 // =============================================================================
 
 /// One delta window: production rollback and the exported undo and redo
@@ -3761,4 +3761,150 @@ fn guarded_scatter_stale_stamp_bitset_nested_savepoints_roll_back_to_exact_image
         "the outer window restores the stale stamp byte for byte"
     );
     vm.undo_commit();
+}
+
+/// Fill the window with `fill` one-record captures of the derived-facts flag,
+/// run `op`, and when it overflowed, roll back to the window start: the image
+/// must be the pristine one byte for byte. Returns whether `op` overflowed.
+fn overflowed_op_rolls_back_exactly(
+    pristine: &[u8],
+    fill: u32,
+    delta: bool,
+    op: impl FnOnce(&mut Vm, &mut Vec<u8>),
+) -> Result<bool, (u32, bool, Vec<usize>)> {
+    use columine_types::types::StateHeaderOffset;
+    let flag = StateHeaderOffset::DERIVED_FACTS_CHANGE_FLAG;
+    let mut state = pristine.to_vec();
+    let mut vm = Vm::default();
+    vm.undo_enable(&state).expect("window opens");
+    let savepoint = vm.undo_checkpoint();
+    for _ in 0..fill {
+        vm.capture_mutation(delta, &mut state, &[(flag, 1)], |s| s[flag as usize] ^= 1)
+            .expect("filler");
+    }
+    op(&mut vm, &mut state);
+    if !vm.undo_has_overflow() {
+        return Ok(false);
+    }
+    vm.undo_rollback(&mut state, savepoint)
+        .expect("a pre-overflow savepoint rolls back");
+    if state.as_slice() == pristine {
+        Ok(true)
+    } else {
+        let diff = (0..state.len())
+            .filter(|&i| state[i] != pristine[i])
+            .collect();
+        Err((fill, delta, diff))
+    }
+}
+
+/// An eviction whose outer capture opens before the overflow while a nested
+/// removal overflows the window: the outer frame takes EVICTED_COUNT from 4
+/// through 0 back to 4, so it closes unchanged while the shadow holds an
+/// intermediate count. Every overflow position inside the loop, on both
+/// lanes, rolls back to the pristine image byte for byte.
+#[test]
+fn an_eviction_overflowing_inside_its_loop_rolls_back_byte_exact() {
+    let prog = build_ttl_map_program(16, 0, true);
+    let mut pristine = init(&prog);
+    let mut vm = Vm::default();
+    let run = |vm: &mut Vm, state: &mut Vec<u8>, keys: &[u32], ts: &[f64]| {
+        let vals: Vec<u32> = keys.iter().map(|k| k * 10).collect();
+        let cols: Vec<&[u8]> = vec![u32s_as_bytes(keys), u32s_as_bytes(&vals), f64s_as_bytes(ts)];
+        assert_eq!(OK, vm.execute_batch(state, &prog, &cols, keys.len() as u32));
+    };
+    run(
+        &mut vm,
+        &mut pristine,
+        &[1, 2, 3, 4],
+        &[100.0, 101.0, 102.0, 103.0],
+    );
+    assert_eq!(Ok(4), vm.evict_all_expired(false, &mut pristine, 114.0));
+    run(
+        &mut vm,
+        &mut pristine,
+        &[5, 6, 7, 8],
+        &[200.0, 201.0, 202.0, 203.0],
+    );
+    assert_eq!(4, SlotMetaView::read(&pristine, 0).evicted_count(&pristine));
+
+    let mut overflowed = 0;
+    let mut failures = Vec::new();
+    for fill in (UNDO_CAPACITY - 160)..=UNDO_CAPACITY {
+        for delta in [false, true] {
+            match overflowed_op_rolls_back_exactly(&pristine, fill, delta, |vm, state| {
+                assert_eq!(Ok(4), vm.evict_all_expired(delta, state, 214.0));
+            }) {
+                Ok(true) => overflowed += 1,
+                Ok(false) => {}
+                Err(failure) => failures.push(failure),
+            }
+        }
+    }
+    assert!(overflowed > 0, "no fill overflowed the window");
+    assert!(
+        failures.is_empty(),
+        "{} overflowing fills diverge: {:?}",
+        failures.len(),
+        &failures[..failures.len().min(6)]
+    );
+}
+
+/// A TTL upsert batch that inserts and updates keys, with every fill that
+/// puts the overflow at a different capture of the batch: each overflowing
+/// run lands the whole batch and rolls back to the pristine image exactly.
+#[test]
+fn a_ttl_upsert_batch_overflowing_at_every_position_rolls_back_byte_exact() {
+    let prog = build_ttl_map_program(64, 0, true);
+    let mut pristine = init(&prog);
+    let keys: Vec<u32> = (1..=12).collect();
+    let vals: Vec<u32> = keys.iter().map(|k| k * 10).collect();
+    let ts: Vec<f64> = keys.iter().map(|&k| 100.0 + f64::from(k)).collect();
+    let seed: Vec<&[u8]> = vec![
+        u32s_as_bytes(&keys[..6]),
+        u32s_as_bytes(&vals[..6]),
+        f64s_as_bytes(&ts[..6]),
+    ];
+    assert_eq!(
+        OK,
+        Vm::default().execute_batch(&mut pristine, &prog, &seed, 6)
+    );
+    let later: Vec<f64> = ts.iter().map(|t| t + 50.0).collect();
+    let cols: Vec<&[u8]> = vec![
+        u32s_as_bytes(&keys),
+        u32s_as_bytes(&vals),
+        f64s_as_bytes(&later),
+    ];
+
+    let mut expected = pristine.clone();
+    assert_eq!(
+        OK,
+        Vm::default().execute_batch(&mut expected, &prog, &cols, 12)
+    );
+
+    let mut overflowed = 0;
+    let mut failures = Vec::new();
+    for fill in (UNDO_CAPACITY - 200)..=UNDO_CAPACITY {
+        for delta in [false, true] {
+            match overflowed_op_rolls_back_exactly(&pristine, fill, delta, |vm, state| {
+                let code = if delta {
+                    vm.execute_batch_delta(state, &prog, &cols, 12)
+                } else {
+                    vm.execute_batch(state, &prog, &cols, 12)
+                };
+                assert_eq!(OK, code, "fill {fill}, delta {delta}");
+            }) {
+                Ok(true) => overflowed += 1,
+                Ok(false) => {}
+                Err(failure) => failures.push(failure),
+            }
+        }
+    }
+    assert!(overflowed > 0, "no fill overflowed the window");
+    assert!(
+        failures.is_empty(),
+        "{} overflowing fills diverge: {:?}",
+        failures.len(),
+        &failures[..failures.len().min(6)]
+    );
 }

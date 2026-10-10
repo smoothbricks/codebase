@@ -845,6 +845,42 @@ fn a_window_past_its_budget_overflows_into_a_shadow_and_rolls_back_exactly() {
     assert_eq!(1, vm.undo_checkpoint());
 }
 
+/// Writes past the overflow land on bytes no record before it covers: only
+/// the shadow knows their prior value, so a rollback that skipped restoring
+/// it would leave them changed.
+#[test]
+fn writes_only_the_shadow_covers_roll_back_exactly() {
+    let prog = count_program();
+    let mut state = init(&prog);
+    let cell = count_cell(&state);
+    let original = state.clone();
+    let mut vm = Vm::default();
+    vm.undo_enable(&state).expect("undo window opens");
+    for value in 1..=u64::from(UNDO_CAPACITY) {
+        set_count(&mut vm, &mut state, cell, value).expect("write within the budget");
+    }
+    // The image's first bytes: never written before the overflow.
+    assert!(cell >= 8, "the head is not the recorded cell");
+    let untouched = state[..8].to_vec();
+    vm.capture_mutation(false, &mut state, &[(0, 8)], |image| {
+        image[..8].fill(0xA5);
+    })
+    .expect("a write past the budget overflows");
+    assert!(vm.undo_has_overflow());
+    assert_ne!(
+        untouched,
+        state[..8].to_vec(),
+        "the overflowing write landed"
+    );
+
+    assert_eq!(Ok(image_len(&state)), vm.undo_rollback(&mut state, 0));
+    assert_eq!(
+        original, state,
+        "the shadow restores bytes no record covers"
+    );
+    vm.undo_commit();
+}
+
 /// `undo_status` returns a value copy. Edits to a copy change nothing in the
 /// VM, and the snapshot agrees with the live accessors when it was taken.
 #[test]

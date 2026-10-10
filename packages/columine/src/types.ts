@@ -650,7 +650,7 @@ export interface ColumineBackend {
   /** Commit and discard undo entries since the checkpoint. */
   undoCommit(state: StateHandle, checkpointPos: number): void;
 
-  /** Whether the current undo window refused an unjournaled write; its valid prefix remains rollbackable. */
+  /** Whether the current undo window passed its record budget into the shadow; rollback still restores it exactly. */
   undoHasOverflow(): boolean;
 
   /** Export only a completely paired range; an undo-only row returns DELTA_LANE_MISMATCH. */
@@ -668,6 +668,6 @@ export interface DeltaSegmentExport {
   undoBytes: Uint8Array;
   redoBytes: Uint8Array;
   entrySize: number;
-  /** Journal refusal occurred; both lanes still describe the exact accepted prefix. */
+  /** The export came from an overflowed window: its writes past the budget are in no record, so a fork materializes. */
   overflow: boolean;
 }

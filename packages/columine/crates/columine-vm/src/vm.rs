@@ -398,7 +398,7 @@ pub(crate) fn evict_expired(
     {
         expired += 1;
     }
-    // A budget refusal may end this operation at any processed prefix. The
+    // An OutOfMemory refusal may end this operation at any processed prefix. The
     // maximum actual left-shift destination is the live prefix minus one,
     // never allocated capacity or the already-dead tail.
     let shift_len = if expired == 0 {
@@ -653,8 +653,9 @@ impl UndoState {
 
     /// Overflow the window: copy `state` into the shadow before the first
     /// write the journal will not record. A capture open at that moment keeps
-    /// its reservation and records on close the bytes it saw on opening, so
-    /// replaying the records in reverse over the restored shadow is exact.
+    /// its reservation and records on close every chunk whose opening bytes
+    /// differ from its closing bytes or from the shadow's, so replaying the
+    /// records in reverse over the restored shadow is exact.
     /// Memory that cannot back the shadow refuses as `OutOfMemory`, before
     /// the write.
     fn overflow(&mut self, state: &[u8]) -> Result<(), ErrorCode> {
@@ -910,12 +911,17 @@ impl UndoState {
             self.state_size as usize,
             "captured image changed layout"
         );
+        // A frame open across the overflow saw its ranges change after the
+        // shadow was taken, possibly back to their opening bytes. Rollback
+        // restores the shadow first, so a chunk whose opening bytes differ
+        // from the shadow's needs its record even when it ends unchanged.
         let mut scratch = frame.scratch_start;
         for index in frame.ranges_start..self.capture_ranges.len() {
             let (offset, len) = self.capture_ranges[index];
+            let range = offset as usize..(offset + len) as usize;
             let before = &self.capture_scratch[scratch..scratch + len as usize];
-            let after = &state[offset as usize..(offset + len) as usize];
-            if before != after {
+            let after = &state[range.clone()];
+            if before != after || (self.overflowed && before != &self.image[range]) {
                 let undo = state_bytes_entry(offset, len as u8, before);
                 let redo = delta_mode.then(|| state_bytes_entry(offset, len as u8, after));
                 self.push_reserved(undo, redo);
@@ -977,7 +983,9 @@ impl UndoState {
             };
             let before = self.saved_change_flags[index];
             let after = state[offset as usize];
-            if before != after {
+            // As in `finish_recording`: the shadow may hold a flag the
+            // boundary moved after opening, even if it moved back.
+            if before != after || (self.overflowed && before != self.image[offset as usize]) {
                 self.push_reserved(
                     state_bytes_entry(offset, 1, &[before]),
                     delta_mode.then(|| state_bytes_entry(offset, 1, &[after])),
@@ -1314,7 +1322,7 @@ impl Vm {
     /// flat sets in the hash table. A TTL slot requires one timestamp per
     /// element. A change-flag boundary of its own: a direct call journals the
     /// flags it sets, and inside a batch the batch's boundary already owns
-    /// them. Journal refusal is returned before any unlogged byte is written.
+    /// them. An OutOfMemory refusal is returned before any unbacked write.
     pub fn set_insert(
         &mut self,
         delta_mode: bool,
