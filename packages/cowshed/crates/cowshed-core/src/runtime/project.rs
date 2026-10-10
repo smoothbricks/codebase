@@ -6633,7 +6633,8 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             let collisions = crate::gateway_inventory::NativeGatewayInventory::new(storage)
                 .port_collisions()
                 .await
-                .map_err(native_integrity_error)?;
+                .map_err(native_integrity_error)?
+                .collisions;
             if let Some(collision) = collisions.iter().find(|collision| {
                 [&collision.held, &collision.claimed]
                     .into_iter()
@@ -6656,34 +6657,58 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
     /// part of (04_sandbox.md, `portBlock`). Under `--repair` the newer member of each collision
     /// this project owns is first moved off the shared ports and reported by where it went.
     async fn port_collision_findings(&mut self) -> Vec<crate::api::dto::Finding> {
-        let collisions = match crate::gateway_inventory::NativeGatewayInventory::new(
+        let crate::gateway_inventory::PortCollisions {
+            collisions,
+            unreadable,
+        } = match crate::gateway_inventory::NativeGatewayInventory::new(
             self.descriptor.storage.clone(),
         )
         .port_collisions()
         .await
         {
-            Ok(collisions) => collisions,
+            Ok(found) => found,
             Err(error) => {
                 return vec![native_finding(
-                    "port-block-collision",
+                    "port-block-inventory",
                     crate::api::dto::FindingSeverity::Error,
                     native_integrity_error(error),
                 )];
             }
         };
         let repo = self.descriptor.repo_id.clone();
-        let mut findings = Vec::new();
+        let project_root = self.layout.project().project_root.clone();
+        let mut findings = unreadable
+            .into_iter()
+            .filter(|(path, _)| path.starts_with(&project_root))
+            .map(|(path, error)| crate::api::dto::Finding {
+                code: "port-claim-unreadable".into(),
+                severity: crate::api::dto::FindingSeverity::Warning,
+                message: format!(
+                    "{} cannot be read ({error}); a port block it names may be handed to another workspace",
+                    path.display()
+                ),
+                hint: "repair or remove the sidecar; cowshed gc collects staging no operation holds"
+                    .into(),
+                path: Some(path),
+            })
+            .collect::<Vec<_>>();
         let mut repairs = std::collections::BTreeMap::<
             WorkspaceName,
             Vec<crate::gateway_inventory::PortCollision>,
         >::new();
         for collision in collisions {
-            if collision.claimed.repo == repo && self.recovery_scope.repairs() {
+            let ours = collision.claimed.repo == repo;
+            // Only a published grant is the workspace's own to rewrite; a claim an intent or a
+            // sidecar outside the inventory carries changes when that operation finishes.
+            if ours
+                && collision.claimed.record == crate::gateway_inventory::ClaimRecord::Published
+                && self.recovery_scope.repairs()
+            {
                 repairs
                     .entry(collision.claimed.workspace.clone())
                     .or_default()
                     .push(collision);
-            } else if collision.claimed.repo == repo || collision.held.repo == repo {
+            } else if ours || collision.held.repo == repo {
                 findings.push(port_collision_finding(&collision));
             }
         }
@@ -6737,6 +6762,17 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
     ) -> Result<crate::metadata::PortBlock> {
         self.validate_binding().await?;
         let current = self.current(workspace).await?;
+        if !current
+            .metadata
+            .grants
+            .port_blocks()
+            .any(|block| colliding.contains(&block))
+        {
+            return Err(CowshedError::conflict(
+                format!("{workspace}'s published grants no longer name the colliding port blocks"),
+                "run cowshed doctor again",
+            ));
+        }
         let port_lease = if matches!(
             current.derived.mount_state,
             crate::storage::lifecycle::MountState::Mounted { .. }
@@ -17037,10 +17073,16 @@ fn port_collision_finding(
         code: "port-block-collision".into(),
         severity: crate::api::dto::FindingSeverity::Error,
         message: format!("{collision}; while both are attached the gateway serves only the older"),
-        hint: format!(
-            "cowshed doctor --repair, run in {}'s checkout, moves {} to a free block",
-            collision.claimed.repo, collision.claimed.workspace
-        ),
+        hint: match &collision.claimed.record {
+            crate::gateway_inventory::ClaimRecord::Published => format!(
+                "cowshed doctor --repair, run in {}'s checkout, moves {} to a free block",
+                collision.claimed.repo, collision.claimed.workspace
+            ),
+            record => format!(
+                "{record} is not a published grant doctor can rewrite; finish the operation that wrote it (any cowshed command in {}'s checkout) or retire it (cowshed gc), then run cowshed doctor again",
+                collision.claimed.repo
+            ),
+        },
         path: None,
     }
 }
@@ -20059,7 +20101,11 @@ mod port_reservation_tests {
             .expect("conflicting published grant");
         // A published grant naming the pending clone's block is a collision, not a second
         // holding: the newer of the two workspaces is named as claiming the older one's ports.
-        let collisions = inventory.port_collisions().await.expect("collisions");
+        let collisions = inventory
+            .port_collisions()
+            .await
+            .expect("collisions")
+            .collisions;
         assert!(matches!(
             collisions.as_slice(),
             [collision] if collision.held.block.base() == first_base
@@ -20140,6 +20186,41 @@ mod port_reservation_tests {
             "a new allocation is not handed the block an unfinished intent carries"
         );
         drop(next);
+    }
+
+    /// A collision whose newer claim an unfinished intent carries is not doctor's to rewrite: the
+    /// finding names the record and sends the operator to finish or retire that operation.
+    #[test]
+    fn a_collision_held_by_an_intent_names_its_record_instead_of_a_repair() {
+        use crate::gateway_inventory::{ClaimRecord, PortClaim, PortCollision};
+        let claim = |workspace: &str, record: ClaimRecord| PortClaim {
+            repo: RepoId::parse("acme/widget").expect("repo"),
+            workspace: WorkspaceName::new(workspace).expect("workspace"),
+            created_at: "2026-07-14T00:00:00Z".to_owned(),
+            block: PortBlock::new(MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE).expect("block"),
+            record,
+        };
+        let journal = PathBuf::from("/store/acme/widget/lifecycle-intents.json");
+        let finding = super::port_collision_finding(&PortCollision {
+            held: claim("main", ClaimRecord::Published),
+            claimed: claim("legacy", ClaimRecord::Intent(journal.clone())),
+        });
+        assert_eq!(finding.code, "port-block-collision");
+        assert!(
+            finding.message.contains(&journal.display().to_string()),
+            "{}",
+            finding.message
+        );
+        assert!(
+            finding.hint.contains("finish the operation"),
+            "{}",
+            finding.hint
+        );
+        assert!(
+            !finding.hint.contains("doctor --repair"),
+            "{}",
+            finding.hint
+        );
     }
 
     #[tokio::test]
