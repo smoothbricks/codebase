@@ -2853,6 +2853,66 @@ fn sidecar_removal_does_not_hide_non_file_errors() {
     assert!(host.reclaim_image(image.image()).is_err());
 }
 
+/// A `WhenIdle` detach that a holder dissents leaves the workspace exactly as it found it: still
+/// mounted, and still the actor's to detach once the holder lets go. The holder is real — a file
+/// open on the volume — so the refusal is the native unmount's resource-busy result. The separate
+/// real held-file release test proves escalation after the unchanged grace; this test proves that
+/// `WhenIdle` leaves the volume and its contents to their owner.
+#[test]
+fn real_apfs_dissented_when_idle_detach_leaves_the_mount_to_the_actor() {
+    let fixture = RealFixture::new("detach-dissent");
+    let image = fixture.layout().main_image().expect("image");
+    fixture.published_image(image.image());
+    let host = fixture.host();
+    let workspace = workspace();
+    let mount = fixture.main_mount();
+    std::fs::create_dir_all(&mount).expect("mount point");
+    let attachment = host.attach_verified(image.image()).expect("attachment");
+    host.mount(&attachment, &mount, MountAccess::ReadWrite, false)
+        .expect("mount");
+    host.retain_mounted(&workspace, attachment).expect("retain");
+    let holder = std::fs::File::create(mount.join("held")).expect("hold the volume");
+
+    host.detach_mounted(&workspace, DetachIntent::WhenIdle)
+        .expect_err("a dissented WhenIdle detach must fail");
+    assert!(
+        kernel_mount_at(&mount).is_some(),
+        "WhenIdle never forces: the volume stays mounted"
+    );
+
+    drop(holder);
+    host.detach_mounted(&workspace, DetachIntent::Release)
+        .expect("the workspace is still the actor's to detach");
+    assert!(kernel_mount_at(&mount).is_none());
+    assert!(!attached(image.image()));
+}
+
+#[test]
+fn real_apfs_release_detaches_a_volume_held_open_after_its_grace() {
+    let fixture = RealFixture::new("native-release-held-file");
+    let image = fixture.layout().main_image().expect("image");
+    fixture.published_image(image.image());
+    let host = fixture.host();
+    let workspace = workspace();
+    let mount = fixture.main_mount();
+    std::fs::create_dir_all(&mount).expect("mount point");
+    let attachment = host.attach_verified(image.image()).expect("attachment");
+    host.mount(&attachment, &mount, MountAccess::ReadWrite, false)
+        .expect("mount");
+    host.retain_mounted(&workspace, attachment).expect("retain");
+    let mut holder = std::fs::File::create(mount.join("held")).expect("hold the volume");
+
+    host.detach_mounted(&workspace, DetachIntent::Release)
+        .expect("release waits its grace, then forces the owned volume");
+    assert!(kernel_mount_at(&mount).is_none());
+    assert!(!attached(image.image()));
+    use std::io::Write as _;
+    assert!(
+        holder.write_all(b"after forced unmount").is_err(),
+        "a held file cannot write into a released filesystem"
+    );
+}
+
 /// On real APFS: a refused create (`slotted`, never attached) and an attached volume mounted
 /// nowhere are typed skips, the empty mountpoint is refused as no store image, and nothing the
 /// host owns changes name. The mounted workspace is renamed through its device, under the raw pin

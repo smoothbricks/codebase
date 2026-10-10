@@ -2764,11 +2764,13 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         let staging = project.join(super::STAGING_NAMESPACE);
         let mut staged_images = BTreeSet::new();
         let mut staged_sidecars = BTreeMap::new();
-        for path in regular_file_children(&staging)? {
-            if replacement_intents
+        let forming = |image: &Path| {
+            replacement_intents
                 .forming_re_adoptions()
-                .any(|source| source.staging_images().any(|image| image == path.as_path()))
-            {
+                .any(|source| source.staging_images().any(|staged| staged == image))
+        };
+        for path in regular_file_children(&staging)? {
+            if forming(path.as_path()) {
                 retained_active = retained_active
                     .checked_add(1)
                     .ok_or(ApfsStorageError::InvalidPlan("GC retained count overflow"))?;
@@ -2778,13 +2780,15 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                 staged_images.insert(path);
                 continue;
             }
+            // A grants sidecar belongs to the image its own name spells out,
+            // and a forming intent's image keeps every record it names.
             if path
                 .file_name()
                 .and_then(|name| name.to_str())
                 .is_some_and(|name| name.ends_with(GRANTS_SIDECAR_SUFFIX))
             {
                 let image = image_from_sidecar(&path)?;
-                if is_staged_image(&image) {
+                if is_staged_image(&image) && !forming(image.as_path()) {
                     staged_sidecars.insert(image, path);
                 }
             }
