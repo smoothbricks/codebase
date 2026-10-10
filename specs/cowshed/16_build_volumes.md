@@ -698,7 +698,13 @@ second file copy. No timings are claimed beyond these counts. Selection stays Al
 waiver.
 
 - **Enforced by**: a real-APFS test in which one workspace lands and warms an Nx task in main, a second, forked before
-  that land and changing nothing the task hashes, lands without running it, and a fork of main hits the task.
+  that land and changing nothing the task hashes, lands without running it, and a fork of main hits the task; a
+  real-APFS test in which a workspace forks before main indexes, lands, and main's `.codegraph/codegraph.db` on the
+  adopted volume opens with main's rows; a unit test in which the copy includes rows still in the target's write-ahead
+  log, a landing database of its own is kept, and a target without one gives none; initialization tests through the
+  pinned `DbCache` (creation, get, restore, store, eviction) and refusals of a changed schema or version; indexed
+  row-publication plans; unchanged/rewritten/evicted/late-row tests; and byte, mode, time and one-walk/two-phase copy
+  receipts.
 
 ### Rebase carry
 

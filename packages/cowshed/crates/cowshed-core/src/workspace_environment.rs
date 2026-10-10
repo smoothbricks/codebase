@@ -14,6 +14,8 @@ pub const PORT_BASE_ENV: &str = "COWSHED_PORT_BASE";
 /// The workspace's current port block size: `base+1 … base+size-1` are its service ports.
 /// Capacity grants can grow it, so tools read the admitted size rather than assuming one.
 pub const PORT_BLOCK_SIZE_ENV: &str = "COWSHED_PORT_BLOCK_SIZE";
+pub const NX_REMOTE_SERVER_ENV: &str = "NX_SELF_HOSTED_REMOTE_CACHE_SERVER";
+pub const NX_REMOTE_TOKEN_ENV: &str = "NX_SELF_HOSTED_REMOTE_CACHE_ACCESS_TOKEN";
 /// The sandbox's `TMPDIR` ([`crate::storage::StorageLayout::exec_temp_dir`]), exported to host
 /// shells too, so a host gate and a land gate of one workspace share one scratch directory and
 /// neither shares the machine's: Bun reads every ancestor directory of its working directory
@@ -160,7 +162,7 @@ pub(crate) fn write_workspace_environment(
         EnvironmentMount::Minted(_) => 0,
     };
     let mut contents = Zeroizing::new(String::with_capacity(
-        192 + token.len()
+        384 + 2 * token.len()
             + DEV_CI_POLICY.len()
             + capability_bytes
             + installed_directory_text.map_or(0, |path| path.len() * 4 + 96)
@@ -180,6 +182,12 @@ pub(crate) fn write_workspace_environment(
             block.size()
         )
         .expect("writing to a String cannot fail");
+    }
+    if mount.root().join("nx.json").is_file() {
+        let port = port_block.map_or(7_644, |block| block.base());
+        writeln!(&mut *contents,
+            "export {NX_REMOTE_SERVER_ENV}=http://127.0.0.1:{port}/nx\nexport {NX_REMOTE_TOKEN_ENV}={}", token.as_str())
+            .expect("writing to a String cannot fail");
     }
     if let Some((temp_dir, runtime_link)) = served {
         // The link is `/tmp/cs-` and hex digits: shell-safe, so it is written unquoted.
@@ -322,6 +330,28 @@ mod tests {
             None,
         )
         .unwrap();
+        let published = std::fs::read_to_string(root.join(WORKSPACE_ENVIRONMENT_PATH)).unwrap();
+        assert!(!published.contains(NX_REMOTE_SERVER_ENV));
+        assert!(!published.contains(NX_REMOTE_TOKEN_ENV));
+        std::fs::write(root.join("nx.json"), "{}").unwrap();
+        write_workspace_environment(
+            EnvironmentMount::Served {
+                workspace_mount: root,
+                temp_dir: &temp_dir,
+            },
+            &Zeroizing::new("token".to_owned()),
+            Platform::Linux,
+            None,
+        )
+        .unwrap();
+        let published = std::fs::read_to_string(root.join(WORKSPACE_ENVIRONMENT_PATH)).unwrap();
+        assert!(
+            published
+                .contains("export NX_SELF_HOSTED_REMOTE_CACHE_SERVER=http://127.0.0.1:7644/nx\n")
+        );
+        assert!(published.contains("export NX_SELF_HOSTED_REMOTE_CACHE_ACCESS_TOKEN=token\n"));
+        assert!(!published.contains("NX_CACHE_SERVER_WRITE_TOKENS"));
+        assert!(!published.contains("--exit-on-stdin-eof"));
         for marker in [None, Some(""), Some("false"), Some("true")] {
             let mut command = std::process::Command::new("/bin/sh");
             command

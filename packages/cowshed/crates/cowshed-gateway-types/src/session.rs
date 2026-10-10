@@ -158,6 +158,11 @@ impl WorkspaceToken {
         }
         self.0.ct_eq(candidate.as_slice()).into()
     }
+
+    /// Compare two already-validated capabilities without re-encoding, decoding or allocating.
+    pub fn matches(&self, candidate: &Self) -> bool {
+        self.0.ct_eq(&candidate.0).into()
+    }
 }
 
 impl Drop for WorkspaceToken {

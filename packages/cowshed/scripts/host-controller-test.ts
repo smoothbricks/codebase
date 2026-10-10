@@ -27,7 +27,7 @@ try {
       '--workspace-remap',
       checkout,
       '-E',
-      'test(/host_controller_/) and (package(cowshed-core) or package(cowshed-cli) or package(cowshed-shell))',
+      'test(/host_controller_/) and (package(cowshed-core) or package(cowshed-cli) or package(cowshed-shell) or package(cowshed-gateway))',
       '--run-ignored',
       'only',
       '--no-tests=fail',

@@ -271,6 +271,8 @@ pub struct GatewayConfig {
     pub executable_sha256: Option<String>,
     /// What status reports of the daemon's startup pass; `None` for a gateway no daemon owns.
     pub startup: Option<Arc<dyn StartupProbe>>,
+    /// Existing standalone accepted-artifact server, started lazily per Nx project.
+    pub nx_cache: Option<crate::nx_cache::NxCacheServiceConfig>,
 }
 
 impl Default for GatewayConfig {
@@ -292,6 +294,7 @@ impl Default for GatewayConfig {
             task_server: TaskServerLimits::default(),
             executable_sha256: None,
             startup: None,
+            nx_cache: None,
         }
     }
 }

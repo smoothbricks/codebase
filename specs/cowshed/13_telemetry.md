@@ -217,6 +217,119 @@ Interception enriches tiers 2 and 3 with request detail; an opaque tunnel remain
 workspace-exact **with request-level detail** (verb, path, bytes) and an outbound-injected `traceparent`, even when the
 inbound client is silent.
 
+## Accepted-project Nx cache measurements
+
+The Nx gateway route (05_gateway.md) attributes every accepted-project read and refused or accepted write to the
+selected project, workspace incarnation and operation. Accepted publication additionally names the active land
+transaction, accepted source head, protected source-check/job identities and exact task hash. These are diagnostic
+projections of controller-owned qualification; audit records never authorize a writer or recover an unfinished
+publication.
+
+Report the following independently, with unavailable measurements explicitly absent rather than zero:
+
+- ordinary WIP reads, local/remote hit counts, denied `PUT` attempts and bytes/time, and artifacts actually published
+  (zero for a read-only workspace);
+- qualified current task count, local hits explicitly published without task execution, accepted/new versus already
+  existing archives, and missing/failed entries refused;
+- client archive construction, publication transfer, target download/extraction, local carry/copy bytes and time, and
+  Cargo build-volume warmth;
+- server complete-entry bytes, staging bytes, configured capacity, eviction count/bytes, interrupted-upload recovery,
+  and actual allocated bytes where the filesystem reports them;
+- the target's exact landed head and the same successful cacheable task/hash set before and after adoption, every
+  hit/miss/exit status, the check timings, and its no-remote control.
+
+Read-only backend authorization is not evidence of a zero-cost client. Stock Nx's native HTTP cache may construct an
+in-memory gzip archive and attempt `PUT` before receiving 403; report that measured work instead of claiming no request
+or overhead. Task-hash archives are not a per-file content-addressed store, and transferred bytes are not filesystem
+allocation. A successful server-only HTTP smoke proves neither gateway authority nor a two-workspace adoption.
+
+### Automated Nx proof surfaces
+
+These are process and API fixtures. They are not protected authorized-land, installed-adoption, undeclared-input audit
+or normal-client missing-artifact proofs, and they do not measure a stock client against a real land.
+
+- `cowshed-core` `tests/nx_publication.rs`, ordinary bridge case: the exact task and history exclusions hold, and a
+  changed hash, a failed result and a missing artifact are each refused.
+- The same file's ignored `host_controller_bridge_publishes_and_reads_through_the_production_server` runs the normal
+  packaged server binary. It proves that an existing local hit in `native.store` is reused without task execution, and
+  that a distinct database reader gets a remote hit through `HttpRemoteCache.store`. It reports the source marker,
+  publish time, compressed file length, allocated entry bytes, a read-only cold total in milliseconds, and misses.
+- `cowshed-gateway` `tests/gateway/nx_process.rs`, ignored host case: a real `Gateway` is SIGKILLed, the kernel reports
+  its server's exit, a fresh server on the same store acquires the lock, and two sessions read through the read-only
+  route.
+
+Live physical-bound eviction and killed-upload proofs remain with the server's own tests. No proof here checks
+entry-level stats for the entire store bound.
+
+### Stock Nx read-only client cost control
+
+Governing sections: `specs/cowshed/05_gateway.md`, “`/nx/v1/cache/{hash}` — accepted-project Nx artifacts”;
+`specs/cowshed/13_telemetry.md`, “Accepted-project Nx cache measurements”; `specs/cowshed/16_build_volumes.md`,
+“Accepted-project Nx cache”.
+
+Nx 23.2.1's native HTTP cache has a zero-argument constructor configured by `NX_SELF_HOSTED_REMOTE_CACHE_SERVER` and
+`NX_SELF_HOSTED_REMOTE_CACHE_ACCESS_TOKEN`. `DbCache` checks its local cache first. On a local miss, it can retrieve an
+accepted artifact through HTTP. After an executed task, it stores the result locally and then calls the remote store
+operation.
+
+There is no supported GET-only/skip-upload control checked before archive construction. `HttpRemoteCache.store` reads
+the cached outputs and constructs a complete in-memory gzip tar archive before sending `PUT`. A read-only token's 403
+response returns `false`; it does not avoid that work. `skipRemoteCache` disables retrieval too. The public
+`RemoteCacheV2` type is not an arbitrary provider-injection hook. Public pre/post task lifecycle hooks can wire
+environment variables and capture task results, but expose neither a provider handle nor a prearchive store veto.
+
+A real native-client cost control used filesystem fixtures and an HTTP observation relay forwarding to a real compiled
+artifact service. The native binding was byte-identical to npm `@nx/nx-darwin-arm64@23.2.1`, SHA256
+`28f8f10db132f606420bb8a872c4ac760c2ae2acdd460fff7baafc131ef5f05d`. That is the **native binary hash**, not a
+source-file hash. Three uninstrumented fresh-client repetitions per fixture produced these medians:
+
+| Fixture                      | Read-only native store, including attempted PUT | Start to request headers | Request headers to 403 | Existing-client accepted GET + restore | Subsequent local hit | Completed gzip payload |
+| ---------------------------- | ----------------------------------------------: | -----------------------: | ---------------------: | -------------------------------------: | -------------------: | ---------------------: |
+| 1 MiB random, 1 file         |                                       19.039 ms |                17.732 ms |               1.045 ms |                               9.891 ms |             0.137 ms |            1,049,107 B |
+| 4 MiB random, 64 files       |                                       67.414 ms |                64.796 ms |               2.240 ms |                              34.125 ms |             0.160 ms |            4,204,325 B |
+| 4 MiB compressible, 64 files |                                        8.249 ms |                 7.853 ms |               0.270 ms |                              25.344 ms |             0.207 ms |                8,140 B |
+
+Normal `DbCache.put`, including local materialization and the refused remote attempt, took median 19.502, 74.159 and
+40.966 ms for those fixtures. Accepted remote-restored bytes were checked by SHA256 in both the cache and
+declared-output trees. Subsequent local hits made no HTTP request. WIP was checked as a local hit and a remote miss
+after the denied attempts; it was not independently SHA256 checked.
+
+Separate filesystem instrumentation for each 64-file direct native store observed 64 file opens, two directory opens, 69
+directory entries including dot entries, 129 metadata calls and all 4,194,304 output bytes read. The direct
+archive/store operation performed no filesystem copy or clone. Normal local materialization and accepted-output
+restoration each used 64 successful local APFS clone operations in these same-volume fixtures; this does not establish
+cloning across separate RAW-volume mounts.
+
+#### Attribution and custody limits
+
+- Start-to-request timing includes archive construction plus HTTP setup, connection and scheduling. It is not isolated
+  compression CPU time. The relay also contributes to request timing.
+- Accepted GET + restore timings are for the existing repository-patched `DbCache`, including its `stampRestored`
+  timestamp walk. Only the native HTTP binding is unmodified stock npm code.
+- Completed gzip payload length is exact from `Content-Length` and establishes at least that much archive-buffer payload
+  before PUT. It is not total allocation traffic, vector capacity, or peak memory. Nx uses statically linked
+  `tikv-jemallocator`; libc malloc and malloc-zone counters do not measure its allocations. Total native allocation
+  traffic was unavailable, not zero.
+- Actual process RSS is a separate observation. The 4 MiB random direct-store controls had net RSS increases from
+  622,592 to 6,258,688 B; these are not isolated archive allocation totals.
+- Body bytes observed at the relay depend on the relay and early-response cancellation. A complete archive may already
+  exist even when only part of its body is observed before 403. These are not intrinsic client/backend byte counts or
+  no-relay wire measurements.
+- The measured service binary was subsequently overwritten and no retained original copy was found. The recorded hash
+  identifies the binary observed during the run but does not pin a retained executable or committed source. Refusal
+  timing, zero stored bytes and final store contents from that build **do not qualify the artifact service or gateway**.
+- This is a source/client-cost control, not an installed-feature, trusted-publication, two-workspace landing, adoption,
+  hermeticity, or carry-removal proof. Source/API and attribution claims received independent review; the server-binary
+  custody limitation remains open.
+
+Primary sources:
+
+- [Nx self-hosted cache protocol and configuration](https://nx.dev/docs/kb/self-hosted-caching.md)
+- [Pinned native HTTP cache constructor/retrieve/store implementation](https://raw.githubusercontent.com/nrwl/nx/23.2.1/packages/nx/src/native/cache/http_remote_cache.rs)
+- [Pinned DbCache local-first flow and fixed provider discovery](https://raw.githubusercontent.com/nrwl/nx/23.2.1/packages/nx/src/tasks-runner/cache.ts)
+- [Pinned native allocator definition](https://raw.githubusercontent.com/nrwl/nx/23.2.1/packages/nx/src/lib.rs)
+- [Supported task lifecycle hooks](https://nx.dev/docs/kb/task-running-lifecycle.md)
+
 ## Storage: one authority tier, one audit trail, one Arrow substrate
 
 Cowshed uses Arrow IPC for both, but placement and authority differ:

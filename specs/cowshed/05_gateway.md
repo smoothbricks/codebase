@@ -72,10 +72,13 @@ client may present it as `Proxy-Authorization: Basic` with the token as password
 send for proxy-URL userinfo). The Basic username authenticates nothing: `job-<job_id>` (a job's proxy URL, 03_caches.md)
 is recorded as the request's job attribution (13_telemetry.md "Attribution tiers"), and any other username, `cowshed`
 included, leaves the request to the query-time interval join. No other header carries the token: a request's
-`Authorization` is the client's own and authenticates nothing. The gateway accepts no cookie, query parameter, URL
-userinfo, or path token; it strips `Proxy-Authorization` and `Authorization` before any upstream request. It decodes the
-presented value to bytes, rejects malformed or wrong-length values, and compares all 32 bytes in constant time. Missing
-or mismatched token is 401.
+`Authorization` is the client's own and authenticates nothing. The one non-proxy exception is the local Nx cache route
+below: stock Nx sends its bearer in `Authorization`, so only that exact route accepts that header, after endpoint
+selection. The gateway accepts no cookie, query parameter, URL userinfo, or path token; it strips `Proxy-Authorization`
+and `Authorization` before any upstream request. It decodes the presented value to bytes, rejects malformed or
+wrong-length values, and compares all 32 bytes in constant time. Missing or mismatched token is 401; a local Nx
+authentication refusal is 401 with exactly `Content-Type: text/plain`, and a proxy refusal uses the proxy's 407
+challenge.
 
 Create and fork mint a token. Restore stops admissions, drains the Linux connector and gateway connections, kills the
 connector cgroup, rotates the token, unlinks/recreates the Linux socket and namespace-local connector when applicable,
@@ -239,6 +242,62 @@ per-workspace endpoint would split it), and cargo has no client-side setting for
 credentials only over HTTPS, so it cannot authenticate to a plain-HTTP endpoint. The clients verify what they download
 themselves: cargo checks every crate against the index's own `cksum`, and Go checks `.mod` and `.zip` against `go.sum`
 or the checksum database and verifies the database's signed tree.
+
+### `/nx/v1/cache/{hash}` — accepted-project Nx artifacts
+
+Every checkout may read its project's accepted task artifacts, during ordinary iteration as well as adoption. Nx keeps
+its local artifact cache and task database private to that checkout (16_build_volumes.md); this route shares neither
+path nor live database. The controller wires stock Nx's `NX_SELF_HOSTED_REMOTE_CACHE_SERVER` to `<base>/nx`, without a
+trailing slash, and its access token to that endpoint's read authority. The backend's bearer credentials remain
+host-side. No scratch cache receives WIP artifacts.
+
+The listener or Linux socket selects the workspace, its session selects the project, and only the exact, query-free
+`/nx/v1/cache/{hash}` route accepts Nx's `Authorization: Bearer` credential. A hash is one validated Nx task key, never
+a filesystem path. The gateway forwards `GET` to the selected project's backend as `GET /v1/cache/{hash}`. An ordinary
+workspace credential has read authority only: `PUT` is 403 before any artifact is staged or forwarded. A sibling token,
+an expired transaction token, an ambiguous path, or a different project never acquires write authority.
+
+Publication is private to an active, authorized land plan. The authorized initiation accepts the caller's exact expected
+source head; external source review remains the caller's workflow, not a gateway interpretation of a model's ACK. Before
+issuing temporary write authority, the controller requires the protected successful-check receipt specified in
+16_build_volumes.md "Accepted-project Nx cache". It binds the project, source incarnation, clean accepted head,
+successful check/job identities, and exact successful current task hashes. Only those hashes may be forwarded as `PUT`
+under that transaction. The ordinary worker cannot create or replace the receipt, request a publication operation, or
+obtain backend write credentials. A changed head or failed, forged, missing, or foreign receipt refuses publication.
+Land without qualification reports it explicitly and does not publish.
+
+The publication control operation is deferred until a qualified production caller exists. The actor holds only a
+hash-scoped publication capability installed by an in-process caller. No production caller exists, so it is reachable
+only from tests until the qualified land caller lands; it does not itself verify a land plan or protected receipt.
+
+The controller revokes the temporary authority on completion, refusal, cancellation, or interrupted land. It is not
+written to `.cowshed/env`, shell configuration, source, or a later job's environment. Main's adoption checks and every
+ordinary exec remain read-only. A gateway restart restores ordinary read sessions from inventory, never a writer from an
+audit trail or an unfinished transaction.
+
+The existing artifact server is a controller-owned foreground child. The gateway passes `--exit-on-stdin-eof` and
+retains the write end of its stdin pipe; EOF drains the server and releases its store lock. A gateway SIGKILL closes
+that descriptor in the kernel, so `kill_on_drop` is not the parent-death mechanism. Ordinary standalone server
+invocation omits the flag and retains its signal-driven lifecycle. A real kill/reopen proof and a no-flag orphan control
+pin this lease.
+
+Before reclaiming staging or serving requests, the backend holds an exclusive nonblocking kernel `flock` on a
+persistent, never-unlinked `.owner.lock`. One small `bun:ffi` module calls libc's frozen `flock(int, int)` ABI
+(`libc.dylib` on macOS, `libc.so.6` on Linux). The backend owns the `FileHandle` through request drain and cleanup;
+SIGKILL releases it in the kernel. `EWOULDBLOCK` is a typed store-locked refusal, other errno is a loud startup failure,
+and unavailable FFI has no fallback. A second process must refuse before staging reclamation; kill/reopen and stdin-EOF
+proofs pin exclusion and lifetime. Report native macOS proof separately from Linux compile/typecheck coverage.
+
+The gateway preserves the existing self-hosted cache protocol and artifact bytes. `GET` returns 200 for a complete
+artifact or 404 for a miss; `PUT` returns 200 for a publication, 409 for an existing key, or 403 for a read-only
+refusal. An incomplete, interrupted, or evicted artifact is never a successful empty restore. Project backend lifecycle
+and bounded eviction belong to 03_caches.md.
+
+**Read-only is an authority guarantee, not a client-cost claim.** Stock Nx 23.2.1's `native/cache/http_remote_cache.rs`
+has no independent read-only/skip-upload option. Its `store` first builds an in-memory gzip tar archive, then attempts
+`PUT`; 403 returns false without failing the task. `skipRemoteCache` disables reads too. Do not patch Nx or hide the
+attempts: measure archive construction, denied request bytes/time and backend publication separately (13_telemetry.md).
+A read-only WIP run may attempt uploads but publishes zero artifacts.
 
 ### `/sim/` — personal-session simulator broker (posture B)
 
