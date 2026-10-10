@@ -6,6 +6,7 @@ pub mod caches_retirement;
 pub mod capabilities;
 pub mod checkout;
 pub mod copy;
+pub mod developer_links;
 pub mod error;
 pub mod exec;
 mod gateway_inventory;

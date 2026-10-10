@@ -783,11 +783,6 @@ struct CargoMetadata {
     target_directory: PathBuf,
 }
 
-/// The checkout-relative directory a JavaScript package's tools keep their per-tree state in:
-/// `node_modules/.cache/<tool>` of the package they run in (the find-cache-dir convention babel,
-/// webpack, ava and stryker follow).
-const TOOL_CACHE: &str = "node_modules/.cache";
-
 /// The JavaScript tool caches of every package a detected JavaScript package manager installed:
 /// a tracked `package.json` beside a real `node_modules` directory. Each contributes its own
 /// `node_modules/.cache` to the build volume. That directory is rewritten on every run, rebuilt
@@ -815,30 +810,53 @@ fn javascript_tool_caches(
         let prefix = selected
             .strip_prefix(context.workspace_root)
             .expect("directory was contained");
-        for name in tracked
-            .inputs(context.workspace_root)?
-            .split(|byte| *byte == 0)
-            .filter(|name| !name.is_empty())
-        {
-            let manifest = Path::new(std::ffi::OsStr::from_bytes(name));
-            if !tracked_manifest(manifest, prefix, PACKAGE_MANIFEST)
-                || !installed_package(
-                    context.workspace_root,
-                    &context.workspace_root.join(manifest),
-                )?
-            {
-                continue;
-            }
-            let cache = manifest
-                .parent()
-                .expect("a manifest path names a file")
-                .join(TOOL_CACHE);
+        visit_installed_javascript_trees(context.workspace_root, prefix, tracked, |tree| {
+            let cache = tree.join(".cache");
             caches.push(BuildStatePath::from_paths(&cache, &cache)?);
-        }
+            Ok(())
+        })?;
     }
     caches.sort();
     caches.dedup();
     Ok(caches)
+}
+
+/// The package trees already selected by JavaScript build-state discovery, never dependency stores.
+pub(crate) fn installed_javascript_trees(
+    workspace: &Path,
+    visit: impl FnMut(&Path) -> Result<()>,
+) -> Result<()> {
+    visit_installed_javascript_trees(
+        workspace,
+        Path::new(""),
+        &mut TrackedManifests::default(),
+        visit,
+    )
+}
+
+fn visit_installed_javascript_trees(
+    workspace: &Path,
+    prefix: &Path,
+    tracked: &mut TrackedManifests,
+    mut visit: impl FnMut(&Path) -> Result<()>,
+) -> Result<()> {
+    for name in tracked
+        .inputs(workspace)?
+        .split(|byte| *byte == 0)
+        .filter(|name| !name.is_empty())
+    {
+        let manifest = Path::new(std::ffi::OsStr::from_bytes(name));
+        if tracked_manifest(manifest, prefix, PACKAGE_MANIFEST)
+            && installed_package(workspace, &workspace.join(manifest))?
+        {
+            let tree = manifest
+                .parent()
+                .expect("a manifest names a file")
+                .join("node_modules");
+            visit(&tree)?;
+        }
+    }
+    Ok(())
 }
 
 /// Whether the package whose tracked manifest is `manifest` is installed: the manifest is a file

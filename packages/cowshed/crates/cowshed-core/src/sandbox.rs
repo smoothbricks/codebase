@@ -1176,6 +1176,11 @@ pub fn seatbelt_profile(
                 &workspace_metadata,
             )?;
             push_exact_and_subpath_rule(&mut profile, "deny file-write*", &job_artifacts)?;
+            let tool_root = match config.mode {
+                RunSandboxMode::ReadOnly => config.exec_temp_dir.join("tools"),
+                RunSandboxMode::ReadWrite => workspace_metadata.join("tools"),
+            };
+            push_exact_and_subpath_rule(&mut profile, "deny file-write*", &tool_root)?;
         }
     }
     Ok(profile)

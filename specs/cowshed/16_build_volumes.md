@@ -1048,7 +1048,12 @@ An Nx task hash must not change between checkouts of the same tree.
 A project-contained developer-link declaration selects its directory in the current checkout and refuses physical
 symlink escapes, including an escaping existing ancestor of a not-yet-existing declared directory. Genuine sibling
 declarations retain their main-checkout anchor. Neither the containment nor the sibling rule grants the main checkout or
-an ancestor dependency store to a cowshed sandbox.
+an ancestor dependency store to a cowshed sandbox. Genuine sibling links already carried by a fork retain their absolute
+targets; the mint grants reads only on their captured canonical sibling targets, never a target named by a later
+workspace-mutated symlink. Live developer package links, including owned relative aliases and the executable aliases
+that select those packages, are restored by cowshed across installs under the exact managed-command coverage of
+15_capabilities.md ("Bootstrap executables"). An absolute manager bypass receives terminal cleanup only. Cowshed's
+job-time restoration never broadens the mint's read authority; a later foreign target remains denied.
 
 A project-contained developer alias is a relative link within its checkout. A source-image fork therefore selects its
 own copy without borrowing its donor's tree. Genuine sibling links retain their distinct host-local authority.

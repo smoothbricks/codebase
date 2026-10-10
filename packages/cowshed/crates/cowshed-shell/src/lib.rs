@@ -57,6 +57,25 @@ const MAX_EXPORT_BYTES: usize = 64 * 1024 * 1024;
 /// thread exists: the host forks, and a single-threaded process is the one in which that is
 /// unconditionally sound.
 pub fn dispatch() -> io::Result<()> {
+    match cowshed_core::developer_links::dispatch() {
+        Ok(Some(status)) => {
+            if let Some(signal) = status.signal() {
+                // SAFETY: default signal disposition followed by delivery terminates this wrapper
+                // with the package manager's actual signal, rather than claiming a normal exit.
+                unsafe {
+                    libc::signal(signal, libc::SIG_DFL);
+                    libc::raise(signal);
+                }
+                std::process::exit(128 + signal);
+            }
+            std::process::exit(status.code().expect("the manager exited or was signaled"));
+        }
+        Ok(None) => {}
+        Err(error) => {
+            eprintln!("cowshed: managed package manager failed: {error}");
+            std::process::exit(126);
+        }
+    }
     let mut arguments = std::env::args_os().skip(1);
     if arguments.next().as_deref() == Some(OsStr::new(SHELL_HOST_ARGUMENT)) {
         std::process::exit(serve());
@@ -437,6 +456,21 @@ impl Host {
             ));
         }
         let mut environment = self.environment.clone();
+        if let Some(tool_bin) = self
+            .environment
+            .get(OsStr::new(cowshed_core::developer_links::TOOL_BIN_ENV))
+        {
+            let mut paths = vec![PathBuf::from(tool_bin)];
+            if let Some(path) = environment.get(OsStr::new("PATH")) {
+                paths.extend(
+                    std::env::split_paths(path).filter(|entry| entry.as_os_str() != tool_bin),
+                );
+            }
+            environment.insert(
+                "PATH".into(),
+                std::env::join_paths(paths).map_err(io::Error::other)?,
+            );
+        }
         for [name, value] in pairs {
             environment.insert(
                 OsString::from_vec(name.to_vec()),

@@ -471,6 +471,7 @@ impl ArrowAuditSink {
         rename_noreplace(
             date_directory.as_raw_fd(),
             temporary.as_c_str(),
+            date_directory.as_raw_fd(),
             sealed.as_c_str(),
         )
         .map_err(|source| io_failure("publishing audit segment", source))?;

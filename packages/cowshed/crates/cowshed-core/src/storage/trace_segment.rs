@@ -392,8 +392,13 @@ pub fn seal_segment(
         .sync_file(&file)
         .map_err(at(SealStep::SyncingSegment))?;
     drop(file);
-    rename_noreplace(directory.as_raw_fd(), &temporary, &sealed)
-        .map_err(at(SealStep::PublishingSegment))?;
+    rename_noreplace(
+        directory.as_raw_fd(),
+        &temporary,
+        directory.as_raw_fd(),
+        &sealed,
+    )
+    .map_err(at(SealStep::PublishingSegment))?;
     cleanup.disarm();
     Durability::PowerLoss
         .sync_new_entry_at(&directory)

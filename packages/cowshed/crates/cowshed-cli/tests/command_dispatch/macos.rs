@@ -5265,3 +5265,162 @@ async fn real_apfs_rename_keeps_edits_written_after_clone_publication() {
     service.shutdown().await.expect("stop the dispatch service");
     fixture.stop_gateway().await;
 }
+
+#[tokio::test]
+async fn real_apfs_managed_install_restores_developer_links_before_nx_and_cleans_absolute_bypass() {
+    cowshed_core::runtime::shell_host::register(
+        cowshed_core::runtime::shell_host::ShellHostProgram::with_arguments(
+            env!("CARGO_BIN_EXE_cowshed"),
+            vec![cowshed_core::runtime::shell_host::SHELL_HOST_ARGUMENT.into()],
+        ),
+    );
+    let (nx, node) = repository_nx();
+    let mut fixture = Fixture::with(Project::Build {
+        nx: Some((&nx, &node)),
+        rust: None,
+    });
+    let registry = fixture.storage.home().join("registry-nx");
+    fs::create_dir_all(registry.join("dist/bin")).unwrap();
+    fs::write(
+        registry.join("package.json"),
+        r#"{"name":"nx","version":"23.2.1","bin":{"nx":"dist/bin/nx.js"}}"#,
+    )
+    .unwrap();
+    fs::write(
+        registry.join("dist/bin/nx.js"),
+        "#!/usr/bin/env node\nthrow new Error('registry replacement was not restored');\n",
+    )
+    .unwrap();
+    fs::set_permissions(
+        registry.join("dist/bin/nx.js"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    fs::write(fixture.checkout.join("package.json"), serde_json::to_vec(&serde_json::json!({
+        "name": "fixture", "private": true, "dependencies": { "nx": format!("file:{}", registry.display()) }
+    })).unwrap()).unwrap();
+    let bun = Command::new("bun")
+        .args(["--print", "process.execPath"])
+        .output()
+        .expect("actual Bun");
+    assert!(
+        bun.status.success(),
+        "{}",
+        String::from_utf8_lossy(&bun.stderr)
+    );
+    let bun = PathBuf::from(String::from_utf8(bun.stdout).unwrap().trim())
+        .canonicalize()
+        .unwrap();
+    let installed = Command::new(&bun)
+        .args(["install", "--ignore-scripts"])
+        .current_dir(&fixture.checkout)
+        .output()
+        .expect("generate the actual local-package lockfile");
+    assert!(
+        installed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&installed.stderr)
+    );
+    for entry in ["node_modules/nx", "node_modules/.bin/nx"] {
+        fs::remove_file(fixture.checkout.join(entry)).unwrap();
+    }
+    std::os::unix::fs::symlink(&nx, fixture.checkout.join("node_modules/nx")).unwrap();
+    std::os::unix::fs::symlink(
+        "../nx/dist/bin/nx.js",
+        fixture.checkout.join("node_modules/.bin/nx"),
+    )
+    .unwrap();
+    git(&fixture.checkout, &["add", "package.json", "bun.lock"]);
+    git(
+        &fixture.checkout,
+        &["commit", "-q", "-m", "record local installer fixture"],
+    );
+    let mut reads = nx_read_paths(&nx);
+    reads.push(registry);
+    let mut service = serve_project(&mut fixture, &reads).await;
+    let topic = new_workspace(&mut service, "links").await;
+    let (stdout, stderr) = succeed(
+        &mut service,
+        [
+            "exec",
+            "links",
+            "--",
+            "/bin/sh",
+            "-c",
+            "bun install --ignore-scripts && node_modules/.bin/nx show projects --json",
+        ],
+    )
+    .await;
+    assert!(
+        String::from_utf8_lossy(&stdout).contains("\"a\""),
+        "real Nx ran: {}",
+        String::from_utf8_lossy(&stdout)
+    );
+    assert!(
+        stderr.contains("restored developer link node_modules/nx"),
+        "the installer actually displaced the link: {stderr}"
+    );
+    assert_eq!(topic.join("node_modules/nx").canonicalize().unwrap(), nx);
+    let guard = format!(
+        "if(require('fs').realpathSync('node_modules/nx') === {}) throw new Error('bypass did not replace the link'); console.log('bypass replaced');",
+        serde_json::to_string(&nx.to_string_lossy()).unwrap(),
+    ).replace('\'', "'\\''");
+    let bypass = format!(
+        "{} install --ignore-scripts && node -e '{guard}' && node_modules/.bin/nx show projects --json",
+        bun.display(),
+    );
+    let (exit, stdout, _) = run(
+        &mut service,
+        ["exec", "links", "--", "/bin/sh", "-c", &bypass],
+    )
+    .await;
+    assert_ne!(
+        exit.unwrap_or(-1),
+        0,
+        "absolute bypass is not chained-command coverage"
+    );
+    assert!(String::from_utf8_lossy(&stdout).contains("bypass replaced"));
+    assert_eq!(
+        topic.join("node_modules/nx").canonicalize().unwrap(),
+        nx,
+        "terminal cleanup restored the absolute bypass"
+    );
+    let link_grants = service.grants("links").await.expect("baseline grants").read;
+    sh(
+        &mut service,
+        "links",
+        "mkdir -p .cache/relinked-product && printf '%s' '{\"name\":\"relinked-product\",\"version\":\"1.0.0\"}' > .cache/relinked-product/package.json && rm node_modules/nx && ln -s ../.cache/relinked-product node_modules/nx",
+    )
+    .await;
+    assert_eq!(
+        fs::read_link(topic.join("node_modules/nx")).unwrap(),
+        PathBuf::from("../.cache/relinked-product"),
+        "the job's own relink survives terminal cleanup",
+    );
+    assert_eq!(
+        service
+            .grants("links")
+            .await
+            .expect("persisted grants")
+            .read,
+        link_grants
+    );
+    let foreign = fixture.storage.home().join(".ssh/foreign");
+    fs::create_dir_all(&foreign).unwrap();
+    fs::write(foreign.join("secret"), "must stay denied\n").unwrap();
+    std::os::unix::fs::symlink(&foreign, topic.join("node_modules/foreign")).unwrap();
+    let denied = format!("/bin/cat {}", foreign.join("secret").display());
+    let (exit, _, stderr) = run(
+        &mut service,
+        ["exec", "links", "--", "/bin/sh", "-c", &denied],
+    )
+    .await;
+    assert_ne!(exit.unwrap_or(-1), 0);
+    assert!(
+        String::from_utf8_lossy(&stderr).contains("Operation not permitted"),
+        "kernel denied the later foreign target: {}",
+        String::from_utf8_lossy(&stderr)
+    );
+    drop(service);
+    fixture.stop_gateway().await;
+}

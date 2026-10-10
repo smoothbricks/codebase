@@ -865,17 +865,17 @@ describe('what shell entry keeps linked', () => {
       return at;
     }
 
-    it('links each tree that installed a declared package, relative to the main checkout a cowshed marker names', async () => {
+    it('resolves declarations at this checkout even when a cowshed marker names another root', async () => {
       await withManagedRepository(
         { ...WORKSPACE, developerLinks: { '@fixture/lib': '../local-lib' } },
         async ({ root, enterShell: enter }) => {
           expect(await enter()).toEqual(HEALTHY);
-          // This checkout is a cowshed workspace: a clone of the main checkout, at a path of its own.
+          // The marker cannot change the root against which declarations resolve.
           const main = join(dirname(root), 'projects', 'main');
           await mkdir(main, { recursive: true });
           await mkdir(join(root, '.cowshed'), { recursive: true });
           await writeFile(join(root, '.cowshed', 'workspace.json'), JSON.stringify({ projectRoot: main }));
-          const local = await checkout(join(dirname(root), 'projects', 'local-lib'), '@fixture/lib');
+          const local = await checkout(join(dirname(root), 'local-lib'), '@fixture/lib');
 
           expect((await enter({ links: true, check: true })).exitCode).toBe(1);
           const linked = await enter({ links: true });
@@ -896,6 +896,23 @@ describe('what shell entry keeps linked', () => {
       );
     });
 
+    it('keeps an inherited absolute sibling link even when the declaration cannot resolve at this checkout depth', async () => {
+      await withManagedRepository(
+        { ...WORKSPACE, developerLinks: { '@fixture/lib': '../provider/lib' } },
+        async ({ root, enterShell: enter }) => {
+          expect(await enter()).toEqual(HEALTHY);
+          const sibling = await checkout(join(dirname(root), 'donor-side/provider/lib'), '@fixture/lib');
+          await rm(join(root, LINKED));
+          symlinkSync(sibling, join(root, LINKED));
+          expect((await enter({ links: true })).exitCode).toBe(0);
+          expect(readlinkSync(join(root, LINKED))).toBe(sibling);
+          await touchManifest(root);
+          expect((await enter()).exitCode).toBe(0);
+          expect(readlinkSync(join(root, LINKED))).toBe(sibling);
+        },
+      );
+    });
+
     it('selects contained package directories in this checkout, not the main checkout', async () => {
       await withManagedRepository(
         { ...WORKSPACE, developerLinks: { '@fixture/lib': '.cache/owned-package' } },
@@ -907,7 +924,6 @@ describe('what shell entry keeps linked', () => {
           const legacy = await checkout(join(main, '.cache', 'package'), '@fixture/lib');
           await mkdir(join(root, '.cowshed'), { recursive: true });
           await writeFile(join(root, '.cowshed', 'workspace.json'), JSON.stringify({ projectRoot: main }));
-
           await rm(join(root, LINKED));
           symlinkSync(legacy, join(root, LINKED));
           // A missing local directory refuses an inherited Main binding, without rewriting it.
@@ -997,7 +1013,7 @@ describe('what shell entry keeps linked', () => {
           const refused = await enter({ links: true, check: true });
           expect(refused.exitCode).toBe(1);
           expect(refused.stderr).toContain(
-            'smoo.developerLinks @fixture/lib must be a directory relative to the main checkout, not "/opt/lib"',
+            'smoo.developerLinks @fixture/lib must be a directory relative to this checkout, not "/opt/lib"',
           );
         },
       );
@@ -1905,7 +1921,7 @@ describe('the workspace git config', () => {
         expect(refused.exitCode).toBe(0);
         expect(refused.stderr).toContain('--- WARNING: setup-environment.ts failed:');
         expect(refused.stderr).toContain('EACCES');
-        expect(refused.stderr).toContain(join(hooks, 'pre-commit'));
+        expect(refused.stderr).toContain(hooks);
         expect(refused.stderr).toContain(
           'Git hooks and repository config were not applied; the shell is loaded without them.',
         );
@@ -1913,7 +1929,7 @@ describe('the workspace git config', () => {
         await chmod(hooks, 0o755);
       }
       expect(await enter()).toEqual(HEALTHY);
-      expect(readlinkSync(join(hooks, 'pre-commit'))).toBe(join(root, 'tooling', 'git-hooks', 'pre-commit.sh'));
+      expect(readlinkSync(join(hooks, 'pre-commit'))).toBe('../../tooling/git-hooks/pre-commit.sh');
     });
   });
 });

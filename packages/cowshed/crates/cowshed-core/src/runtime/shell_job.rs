@@ -1384,7 +1384,7 @@ impl Activator for HostActivator {
 /// The program is copied rather than run in place because the executed-child profile may deny
 /// reading where the controller's binary lives (the project root and every workspace mount are
 /// denied to a sibling workspace).
-fn stage_host_executable(mount: &Path, program: &ShellHostProgram) -> Result<PathBuf> {
+pub(super) fn stage_host_executable(mount: &Path, program: &ShellHostProgram) -> Result<PathBuf> {
     use std::os::unix::fs::MetadataExt as _;
     let staging_error = |what: &str, error: io::Error| {
         CowshedError::environment_missing(
