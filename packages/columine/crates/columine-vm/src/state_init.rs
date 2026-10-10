@@ -1384,8 +1384,42 @@ pub fn bind_slot(state: &[u8], slot: u32) -> Result<SlotMetaView, ErrorCode> {
         return Err(ErrorCode::InvalidSlot);
     }
     let limit = slot_limit(state, slot, slots, metadata_end)?;
-    validate_slot_geometry(state, slot, limit)?;
+    validate_slot_geometry(state, slot, limit, OuterPointers::Walk)?;
     Ok(SlotMetaView::read(state, slot))
+}
+
+/// Check a whole state image the way [`bind_slot`] checks one slot: header,
+/// slot table, and every slot's physical geometry within the image (primary
+/// storage, arenas, bitmap image header, TTL and evicted buffers) and every
+/// nested slot's outer pointers. A state that enters the VM from outside, a
+/// restored checkpoint or any host-supplied image, is checked here once.
+/// Refuses with `InvalidState`.
+pub fn validate_state(state: &[u8]) -> Result<(), ErrorCode> {
+    validate_slots(state, OuterPointers::Walk)
+}
+
+/// [`validate_state`] without the walk over nested outer pointers, which
+/// costs a nested slot's capacity: what a batch checks of the image it is
+/// handed, in time proportional to the slot count. Kernels check each outer
+/// pointer they follow instead.
+pub(crate) fn validate_layout(state: &[u8]) -> Result<(), ErrorCode> {
+    validate_slots(state, OuterPointers::Skip)
+}
+
+/// Whether slot validation reads every nested outer pointer.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum OuterPointers {
+    Walk,
+    Skip,
+}
+
+fn validate_slots(state: &[u8], outer: OuterPointers) -> Result<(), ErrorCode> {
+    let (slots, metadata_end) = state_geometry(state)?;
+    for slot in 0..slots {
+        let limit = slot_limit(state, slot, slots, metadata_end)?;
+        validate_slot_geometry(state, slot, limit, outer)?;
+    }
+    Ok(())
 }
 
 /// Checked single-key struct geometry, cached by the caller before probing.
@@ -1479,7 +1513,12 @@ fn checked_primary_size(
     checked_size(size)
 }
 
-fn validate_slot_geometry(state: &[u8], slot: u32, limit: u32) -> Result<(), ErrorCode> {
+fn validate_slot_geometry(
+    state: &[u8],
+    slot: u32,
+    limit: u32,
+    outer: OuterPointers,
+) -> Result<(), ErrorCode> {
     let meta = STATE_HEADER_SIZE + slot * SLOT_META_SIZE;
     let flags = SlotTypeFlags::from_byte(state[(meta + SlotMetaOffset::TYPE_FLAGS) as usize]);
     let kind = flags.slot_type().ok_or(ErrorCode::InvalidState)?;
@@ -1544,7 +1583,12 @@ fn validate_slot_geometry(state: &[u8], slot: u32, limit: u32) -> Result<(), Err
         }
         let keys = nested::outer_keys_offset(m.offset);
         let pointers = nested::outer_ptrs_offset(m.offset, m.capacity);
-        for pos in 0..m.capacity {
+        let walked = if outer == OuterPointers::Walk {
+            m.capacity
+        } else {
+            0
+        };
+        for pos in 0..walked {
             let key = bytes::read_u32(state, keys + pos * 4);
             if key == EMPTY_KEY || key == TOMBSTONE {
                 continue;
@@ -1673,7 +1717,7 @@ pub fn calculate_grown_state_size(old_state: &[u8], grown_slot_idx: u32) -> Resu
     let mut total_size = metadata_end;
     for slot in 0..num_slots {
         let limit = slot_limit(old_state, slot, num_slots, metadata_end)?;
-        validate_slot_geometry(old_state, slot, limit)?;
+        validate_slot_geometry(old_state, slot, limit, OuterPointers::Walk)?;
         let meta = STATE_HEADER_SIZE + slot * SLOT_META_SIZE;
         let m = read_old_slot_meta(old_state, slot);
         let cap = if slot == grown_slot_idx {

@@ -52,6 +52,7 @@ pub const COLUMINE_VM_EXPORTS: &[&str] = &[
     "vm_undo_enable",
     "vm_undo_has_overflow",
     "vm_undo_rollback",
+    "vm_validate_state",
 ];
 
 /// Function exports of `event_processor.wasm`. `ep_compact` is the CPB1

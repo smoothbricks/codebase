@@ -92,7 +92,12 @@ export {
 export { encodeVoProgramMetadata, VoProgramAdmissionUnavailableError } from './vo-program-metadata.js';
 // WASM backend (for standalone columine usage)
 export type { VmProgramInvalidCause } from './wasm-backend.js';
-export { createColumineWasmBackend, loadColumineWasm, VmProgramAdmissionError } from './wasm-backend.js';
+export {
+  createColumineWasmBackend,
+  loadColumineWasm,
+  VmProgramAdmissionError,
+  VmStateAdmissionError,
+} from './wasm-backend.js';
 // Shared WASM host memory contract (used by wrappers): host bytes live only in
 // a WasmHostRegion above the module's linker-derived memory.
 export type { WasmMemoryContractErrorCode } from './wasm-memory-contract.js';

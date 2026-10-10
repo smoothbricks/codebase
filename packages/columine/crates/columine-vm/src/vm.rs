@@ -3214,6 +3214,12 @@ impl Vm {
         {
             return INVALID_PROGRAM;
         }
+        // The image is the host's: check every slot's geometry before any
+        // kernel trusts the metadata it reads. Nested outer pointers are
+        // checked where a kernel follows one, not walked per batch.
+        if let Err(error) = state_init::validate_layout(state) {
+            return error as u32;
+        }
         // A FOR_EACH body's plan is drawn from the reduce section: backed
         // here, before any write, so planning a body never allocates.
         if self.element_plan.reserve_for(sections.reduce_code).is_err() {

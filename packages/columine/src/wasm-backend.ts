@@ -73,6 +73,14 @@ export class VmProgramAdmissionError extends Error {
   }
 }
 
+/** A host-supplied state image the native VM refused where it entered. */
+export class VmStateAdmissionError extends Error {
+  constructor(readonly code: ErrorCode) {
+    super(`Invalid state image: ${ErrorCode[code] ?? code}`);
+    this.name = 'VmStateAdmissionError';
+  }
+}
+
 // =============================================================================
 // State Handle - wraps JS ArrayBuffer
 // =============================================================================
@@ -92,6 +100,7 @@ interface VmExports {
   vm_calculate_state_size(programPtr: number, programLen: number, outputPtr: number): number;
   vm_init_state(statePtr: number, programPtr: number, programLen: number): number;
   vm_reset_state(statePtr: number, programPtr: number, programLen: number): number;
+  vm_validate_state(statePtr: number, stateLen: number): number;
   vm_get_needs_growth_slot(): number;
   vm_calculate_grown_state_size(oldStatePtr: number, oldStateLen: number, grownSlot: number, outPtr: number): number;
   vm_grow_state(
@@ -201,6 +210,7 @@ const VM_EXPORT_NAMES = [
   'vm_calculate_state_size',
   'vm_init_state',
   'vm_reset_state',
+  'vm_validate_state',
   'vm_get_needs_growth_slot',
   'vm_calculate_grown_state_size',
   'vm_grow_state',
@@ -833,7 +843,12 @@ export async function createColumineWasmBackend(wasmBytes: BufferSource): Promis
     deserialize(_program, data) {
       const buffer = new ArrayBuffer(data.length);
       new Uint8Array(buffer).set(data);
-      return createWasmStateHandle(buffer, data.length);
+      const state = createWasmStateHandle(buffer, data.length);
+      // A restored image enters the VM here: its whole geometry is checked
+      // once, so no later call trusts metadata the VM did not write.
+      const status = wasmInstance.exports.vm_validate_state(stageState(state, 0), state.size);
+      if (status !== ErrorCode.OK) throw new VmStateAdmissionError(vmErrorCode(status));
+      return state;
     },
 
     undoEnable(stateHandle) {

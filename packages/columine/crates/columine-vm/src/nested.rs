@@ -213,6 +213,25 @@ impl OuterTable {
         bytes::read_u32(state, self.ptrs_off + pos * 4)
     }
 
+    /// The inner container a live outer cell points to, checked to lie in the
+    /// arena's used bytes: a batch checks a host image's layout, not every
+    /// outer pointer, so a kernel checks each pointer it follows.
+    fn inner_at(&self, state: &[u8], pos: u32) -> Result<u32, ErrorCode> {
+        let pointer = self.ptr_at(state, pos);
+        match pointer.checked_sub(self.arena.data_offset) {
+            Some(relative) if relative < self.arena.used(state) => Ok(pointer),
+            _ => Err(ErrorCode::InvalidState),
+        }
+    }
+
+    /// [`Self::lookup`] with the pointer checked as [`Self::inner_at`] does.
+    fn lookup_checked(&self, state: &[u8], outer_key: u32) -> Result<u32, ErrorCode> {
+        match hash_table::find_key(state, self.keys_off, self.cap, outer_key) {
+            Some(pos) => self.inner_at(state, pos),
+            None => Ok(0),
+        }
+    }
+
     fn size(&self, state: &[u8]) -> u32 {
         bytes::read_u32(state, self.size_off)
     }
@@ -637,7 +656,7 @@ fn prepare_outer<'state, 'work>(
     }
     let mut plan = NestedMutation {
         inner_offset: if probe.found {
-            outer.ptr_at(state, probe.pos)
+            outer.inner_at(state, probe.pos)?
         } else {
             0
         },
@@ -1020,7 +1039,7 @@ pub(crate) fn batch_demand(
         if key >= TOMBSTONE || (!aggregate && pairs[at..end].iter().any(|p| p.1 >= TOMBSTONE)) {
             return None;
         }
-        let offset = outer.lookup(state, key);
+        let offset = outer.lookup_checked(state, key).ok()?;
         let existing = (offset != 0 && !aggregate)
             .then(|| hash_table::FlatTable::bind(state, offset, entry_size));
         let (mut cap, mut size) = match existing {

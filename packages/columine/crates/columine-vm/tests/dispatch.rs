@@ -11,7 +11,8 @@ use columine_types::types::{
 use columine_vm::bytes;
 use columine_vm::meta::SlotMetaView;
 use columine_vm::state_init::{
-    calculate_grown_state_size, calculate_state_size, grow_state, init_state, needs_growth_slot,
+    EVICTION_ENTRY_SIZE, calculate_grown_state_size, calculate_state_size, grow_state, init_state,
+    needs_growth_slot,
 };
 use columine_vm::struct_map::{StructMap2Slot, StructMapSlot};
 use columine_vm::vm::{
@@ -394,25 +395,55 @@ fn ttl_eviction_index_overflow_returns_needs_growth_instead_of_dropping() {
     let prog = build_ttl_map_program(4, 0, false);
     let mut state = init(&prog);
     let mut vm = Vm::default();
-
-    // Force a tiny eviction-index capacity for deterministic overflow.
-    let meta_base = STATE_HEADER_SIZE;
-    bytes::write_u32(
-        &mut state,
-        meta_base + SlotMetaOffset::EVICTION_INDEX_CAPACITY,
-        1,
-    );
-
-    let keys = [1u32, 2];
-    let vals = [10u32, 20];
-    let tss = [100.0f64, 101.0];
+    let keys = [1u32];
+    let vals = [10u32];
+    let tss = [100.0f64];
     let cols: Vec<&[u8]> = vec![
         u32s_as_bytes(&keys),
         u32s_as_bytes(&vals),
         f64s_as_bytes(&tss),
     ];
-    assert_eq!(NEEDS_GROWTH, vm.execute_batch(&mut state, &prog, &cols, 2));
+    assert_eq!(OK, vm.execute_batch(&mut state, &prog, &cols, 1));
+
+    // A retained index may hold older rows for a live key: fill it to its
+    // capacity with rows for key 1, a valid geometry the map's load factor
+    // does not see.
+    let meta = SlotMetaView::read(&state, 0);
+    let base = meta.eviction_index_offset(&state);
+    let capacity = meta.eviction_index_capacity(&state);
+    for row in 0..capacity {
+        let at = base + row * EVICTION_ENTRY_SIZE;
+        bytes::write_f64(&mut state, at, 50.0 + f64::from(row));
+        bytes::write_u32(&mut state, at + 8, 1);
+        bytes::write_u32(&mut state, at + 12, 10);
+    }
+    meta.set_eviction_index_size(&mut state, capacity);
+
+    let keys = [2u32];
+    let vals = [20u32];
+    let tss = [101.0f64];
+    let cols: Vec<&[u8]> = vec![
+        u32s_as_bytes(&keys),
+        u32s_as_bytes(&vals),
+        f64s_as_bytes(&tss),
+    ];
+    let before = state.clone();
+    assert_eq!(NEEDS_GROWTH, vm.execute_batch(&mut state, &prog, &cols, 1));
     assert_eq!(0, needs_growth_slot());
+    assert_eq!(before, state, "the refused batch writes nothing");
+
+    // An index capacity that disagrees with its slot is no valid geometry:
+    // the batch is refused as InvalidState where the state enters, not as
+    // a request to grow.
+    bytes::write_u32(
+        &mut state,
+        STATE_HEADER_SIZE + SlotMetaOffset::EVICTION_INDEX_CAPACITY,
+        1,
+    );
+    assert_eq!(
+        ErrorCode::InvalidState as u32,
+        vm.execute_batch(&mut state, &prog, &cols, 1)
+    );
 }
 
 // =============================================================================

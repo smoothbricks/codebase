@@ -17,7 +17,7 @@ import {
   ValueType,
 } from '../types.js';
 import { VoProgramAdmissionUnavailableError } from '../vo-program-metadata.js';
-import { createColumineWasmBackend } from '../wasm-backend.js';
+import { createColumineWasmBackend, VmStateAdmissionError } from '../wasm-backend.js';
 
 // The shipped wasm-opt output, as in composite-struct-map.test.ts: never gated on presence.
 const WASM_PATH = new URL('../../dist/columine.wasm', import.meta.url);
@@ -293,16 +293,23 @@ describe('STRUCT_MAP VO fields through the built WASM VM', () => {
     const capacity = new DataView(image.buffer).getUint32(header, true);
     expect(capacity).toBeGreaterThan(used);
 
+    // A stored reference is row content, refused where a reader or a batch
+    // follows it; an arena header is slot geometry, refused where the image
+    // enters the VM.
     const corruptions = [
       // A reference ending one byte past arena used, still inside arena capacity.
       { image: withU32(image, reference + 4, distinct.length + 1), key: 3 },
       // A reference whose end overflows u32.
       { image: withU32(image, reference, 0xffff_fff0), key: 3 },
-      // An arena header claiming more used bytes than its capacity.
-      { image: withU32(image, header + 4, capacity + 1), key: 1 },
-      // An arena capacity running past the state image yet inside WASM linear memory.
-      { image: withU32(image, header, image.byteLength), key: 1 },
     ];
+    for (const geometry of [
+      // An arena header claiming more used bytes than its capacity.
+      withU32(image, header + 4, capacity + 1),
+      // An arena capacity running past the state image yet inside WASM linear memory.
+      withU32(image, header, image.byteLength),
+    ]) {
+      expect(() => backend.deserialize(upsert, geometry)).toThrow(VmStateAdmissionError);
+    }
     for (const corruption of corruptions) {
       const corrupt = backend.deserialize(upsert, corruption.image);
       expect(backend.structMapArenaField(corrupt, upsert, 0, corruption.key, VO_FIELD)).toEqual({

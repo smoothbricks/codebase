@@ -30,7 +30,7 @@ import {
   SlotTypeFlag,
   ValueType,
 } from '../index.js';
-import { loadColumineWasm } from '../wasm-backend.js';
+import { loadColumineWasm, VmStateAdmissionError } from '../wasm-backend.js';
 
 // =============================================================================
 // WASM Binary
@@ -480,6 +480,11 @@ describe('SC1: Reduce stage for aggregation', () => {
       if (!read.ok) throw new Error(`unexpected mapGet error ${read.error}`);
       expect(read.value).toBeUndefined();
     }
+
+    // A restored image is checked where it enters the VM: one cut short
+    // inside its slots is refused by name, never restored.
+    const image = backend.serialize(state, program);
+    expect(() => backend.deserialize(program, image.subarray(0, image.length - 64))).toThrow(VmStateAdmissionError);
   });
 
   it('parses and initializes CONDITION_TREE slots as first-class slot types', async () => {

@@ -20,9 +20,10 @@ use columine_vm::bitmap_ops::{
 use columine_vm::capacity::CapacityCounts;
 use columine_vm::hooks::NoVm;
 use columine_vm::meta::SlotMetaView;
+use columine_vm::nested::{outer_keys_offset, outer_ptrs_offset};
 use columine_vm::state_init::{
     DEFAULT_ACCEPTED_PROGRAM_MAGICS, calculate_grown_state_size, calculate_state_size, init_state,
-    needs_growth_slot,
+    needs_growth_slot, validate_state,
 };
 use columine_vm::vm::{CheckedMap, Vm, f64s_as_bytes, u32s_as_bytes};
 use proptest::prelude::*;
@@ -376,6 +377,97 @@ fn each_tier_answers_only_what_the_tier_before_cannot() {
         without_memory(|| vm.execute_batch(&mut state, &prog, &cols, 1))
     );
     assert_eq!(Some(30), CheckedMap::bind(&state, 1).unwrap().get(3));
+}
+
+/// A state a host supplies (a restored checkpoint, an uploaded image) is
+/// checked whole where it enters the VM. One cut short inside a map's value
+/// lane is refused as `InvalidState` with or without a journal and never
+/// traps, whichever key a batch writes; the same image is refused by
+/// `validate_state` before any batch.
+#[test]
+fn a_corrupt_host_state_is_refused_at_entry_in_both_modes() {
+    let prog = map_program();
+    let mut whole = init(&prog);
+    let mut vm = Vm::default();
+    assert_eq!(OK, upsert(&mut vm, &mut whole, &prog, &[1, 2, 3]));
+    assert_eq!(Ok(()), validate_state(&whole));
+    let cut = whole[..whole.len() - 32].to_vec();
+    assert_eq!(Err(ErrorCode::InvalidState), validate_state(&cut));
+    for recording in [false, true] {
+        for key in 100..140u32 {
+            let mut state = cut.clone();
+            let mut vm = Vm::default();
+            if recording {
+                vm.undo_enable(&state)
+                    .expect("window opens over the cut image");
+            }
+            assert_eq!(
+                ErrorCode::InvalidState as u32,
+                upsert(&mut vm, &mut state, &prog, &[key]),
+                "key {key}, recording {recording}"
+            );
+            assert_eq!(cut, state, "a refused state is not written");
+        }
+    }
+
+    // A nested slot whose outer pointer leaves its arena: a batch checks the
+    // image's layout, not every pointer, and the kernel that follows this one
+    // refuses it. validate_state, which entry calls, walks every pointer.
+    let prog = program(
+        1,
+        3,
+        &[
+            Opcode::SlotNested as u8,
+            0,
+            SlotType::Nested as u8,
+            4,
+            0,
+            SlotType::HashSet as u8,
+            2,
+            0,
+            0,
+        ],
+        &for_each(&[Opcode::NestedSetInsert as u8, 0, 0, 1]),
+    );
+    let mut whole = init(&prog);
+    let types = [TYPE];
+    let (keys, values) = ([5u32], [50u32]);
+    let cols = [
+        u32s_as_bytes(&keys),
+        u32s_as_bytes(&values),
+        u32s_as_bytes(&types),
+    ];
+    assert_eq!(OK, Vm::default().execute_batch(&mut whole, &prog, &cols, 1));
+    assert_eq!(Ok(()), validate_state(&whole));
+    let meta = SlotMetaView::read(&whole, 0);
+    let keys_at = outer_keys_offset(meta.offset);
+    let ptrs_at = outer_ptrs_offset(meta.offset, meta.capacity);
+    let live = (0..meta.capacity)
+        .find(|&pos| columine_vm::bytes::read_u32(&whole, keys_at + pos * 4) == 5)
+        .expect("outer key 5 is live");
+    let mut bad = whole.clone();
+    let past_arena = u32::try_from(bad.len()).unwrap() - 4;
+    columine_vm::bytes::write_u32(&mut bad, ptrs_at + live * 4, past_arena);
+    assert_eq!(Err(ErrorCode::InvalidState), validate_state(&bad));
+    let (keys, values) = ([5u32], [51u32]);
+    let cols = [
+        u32s_as_bytes(&keys),
+        u32s_as_bytes(&values),
+        u32s_as_bytes(&types),
+    ];
+    for recording in [false, true] {
+        let mut state = bad.clone();
+        let mut vm = Vm::default();
+        if recording {
+            vm.undo_enable(&state).expect("window opens");
+        }
+        assert_eq!(
+            ErrorCode::InvalidState as u32,
+            vm.execute_batch(&mut state, &prog, &cols, 1),
+            "recording {recording}"
+        );
+        assert_eq!(bad, state, "a refused state is not written");
+    }
 }
 
 // ---------------------------------------------------------------------------

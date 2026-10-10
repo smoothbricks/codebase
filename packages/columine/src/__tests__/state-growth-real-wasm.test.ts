@@ -14,7 +14,7 @@ import {
   StructFieldType,
   ValueType,
 } from '../types.js';
-import { loadColumineWasm } from '../wasm-backend.js';
+import { loadColumineWasm, VmStateAdmissionError } from '../wasm-backend.js';
 import { WasmHostRegion } from '../wasm-memory-contract.js';
 
 const WASM_PATH = new URL('../../dist/columine.wasm', import.meta.url);
@@ -295,13 +295,11 @@ describe('real wasm state geometry and committed-boundary growth', () => {
     expect(absent.kind).toBe('absent');
     expect(Object.isFrozen(absent)).toBe(true);
     expect(backend.structMapArenaField(state, reducer, 0, 8, 0)).toBe(absent);
+    // Corrupt slot geometry is refused where the image enters the VM, before
+    // any reader could take it for absence.
     const corrupt = backend.serialize(state, reducer);
     new DataView(corrupt.buffer, corrupt.byteOffset, corrupt.byteLength).setUint32(36, 3, true);
-    const badState = backend.deserialize(reducer, corrupt);
-    expect(backend.structMapArenaField(badState, reducer, 0, 7, 0)).toEqual({
-      kind: 'error',
-      error: ErrorCode.INVALID_STATE,
-    });
+    expect(() => backend.deserialize(reducer, corrupt)).toThrow(VmStateAdmissionError);
   });
 
   it('reuses immutable unset results without collapsing a present empty arena field', async () => {
@@ -743,28 +741,14 @@ describe('real wasm state geometry and committed-boundary growth', () => {
     expect(new DataView(backend.serialize(state, reducer).buffer).getUint32(row.value.rowOffset + 1, true)).toBe(99);
     expect(backend.structMap2Entries(state, reducer, 2)).toStrictEqual({ ok: true, value: [row.value] });
     const committed = backend.serialize(state, reducer);
+    // Malformed reader geometry (a capacity of 3, an image one byte short) is
+    // refused where the image enters the VM, never read as absence.
     for (const slot of [0, 1, 2]) {
       const malformed = committed.slice();
       new DataView(malformed.buffer).setUint32(32 + slot * 48 + 4, 3, true);
-      const invalid = backend.deserialize(reducer, malformed);
-      const before = backend.serialize(invalid, reducer);
-      const read =
-        slot === 0
-          ? backend.mapGet(invalid, reducer, slot, 7)
-          : slot === 1
-            ? backend.setContains(invalid, reducer, slot, 7)
-            : backend.structMap2GetRow(invalid, reducer, slot, 7, 41);
-      expect(read).toStrictEqual({ ok: false, error: ErrorCode.INVALID_STATE });
-      if (slot === 2) {
-        expect(backend.structMap2Entries(invalid, reducer, slot)).toStrictEqual({
-          ok: false,
-          error: ErrorCode.INVALID_STATE,
-        });
-      }
-      expect(backend.serialize(invalid, reducer)).toEqual(before);
+      expect(() => backend.deserialize(reducer, malformed)).toThrow(VmStateAdmissionError);
     }
-    const short = backend.deserialize(reducer, committed.slice(0, -1));
-    expect(backend.structMap2Entries(short, reducer, 2)).toStrictEqual({ ok: false, error: ErrorCode.INVALID_STATE });
+    expect(() => backend.deserialize(reducer, committed.slice(0, -1))).toThrow(VmStateAdmissionError);
     expect(backend.mapGet(state, reducer, -1, 7)).toStrictEqual({ ok: false, error: ErrorCode.INVALID_SLOT });
     expect(backend.structMap2GetRow(state, reducer, 2, 7.5, 41)).toStrictEqual({
       ok: false,
@@ -776,12 +760,7 @@ describe('real wasm state geometry and committed-boundary growth', () => {
     expect(backend.setContains(bitmap, bitmapProgram, 0, 7)).toStrictEqual({ ok: true, value: false });
     const badBitmap = backend.serialize(bitmap, bitmapProgram);
     new DataView(badBitmap.buffer).setUint32(36, 3, true);
-    const invalidBitmap = backend.deserialize(bitmapProgram, badBitmap);
-    expect(backend.setContains(invalidBitmap, bitmapProgram, 0, 7)).toStrictEqual({
-      ok: false,
-      error: ErrorCode.INVALID_STATE,
-    });
-    expect(backend.serialize(invalidBitmap, bitmapProgram)).toEqual(badBitmap);
+    expect(() => backend.deserialize(bitmapProgram, badBitmap)).toThrow(VmStateAdmissionError);
   });
 
   it('propagates nested element journal refusal with an exact real-WASM accepted prefix', async () => {

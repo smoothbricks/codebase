@@ -339,6 +339,20 @@ pub unsafe extern "C" fn vm_reset_state(
     ))
 }
 
+/// Check a host-supplied state image's whole geometry where it enters the
+/// VM (`state_init::validate_state`): `Ok`, or `InvalidState`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vm_validate_state(state_ptr: *const u8, state_len: u32) -> u32 {
+    let state = match unsafe { bounded_buf(state_ptr, state_len) } {
+        Ok(state) => state,
+        Err(_) => return ErrorCode::InvalidState as u32,
+    };
+    match state_init::validate_state(state) {
+        Ok(()) => ErrorCode::Ok as u32,
+        Err(error) => error as u32,
+    }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn vm_get_needs_growth_slot() -> u32 {
     state_init::needs_growth_slot()

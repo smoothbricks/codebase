@@ -623,7 +623,8 @@ export interface ColumineBackend {
 
   /**
    * Deserialize state from bytes.
-   * Returns new state handle.
+   * Returns new state handle. The image's whole geometry is checked where it
+   * enters the VM; an image the VM refuses throws `VmStateAdmissionError`.
    */
   deserialize(program: ReducerProgram, data: Uint8Array): StateHandle;
 
