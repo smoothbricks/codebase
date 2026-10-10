@@ -8,6 +8,7 @@ import {
   validateCargoToolchainInputs,
 } from '../cargo-policy.js';
 import { validateConsumedScopedDependenciesExist, validateNoMachineLocalSpecifiers } from '../consumed-scope.js';
+import { validateGitHubActions } from '../github-actions.js';
 import { syncBunLockfileVersions, validateBunLockfileVersions } from '../lockfile.js';
 import { validateDevenvModuleImport, warnOnManagedFileDrift } from '../managed-files.js';
 import { fixNxSync, validateNxSync } from '../nx-sync.js';
@@ -86,6 +87,12 @@ interface CapturedOutput {
 }
 
 const packs: MonorepoPack[] = [
+  {
+    name: 'github-actions',
+    validatePreBuild(ctx) {
+      return validateGitHubActions(ctx.root, ctx.verbose === true);
+    },
+  },
   {
     name: 'core',
     async init(ctx) {

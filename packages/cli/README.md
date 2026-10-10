@@ -169,6 +169,7 @@ It checks:
 - Workspace dependency ranges.
 - Workspace-dependent package scripts delegate safe commands through Nx targets without recursive script runners.
 - Nx target conventions and inferred-task setup.
+- GitHub Actions workflows, composite actions, and Dependabot configuration with [`jactionlint`].
 - [`sherif`] package hygiene, with warnings treated as validation failures.
 - Packed public package artifacts with [`publint`].
 - Packed public package type resolution with the [`attw`][are-the-types-wrong] CLI.
@@ -180,6 +181,25 @@ tarball.
 The [`attw`][are-the-types-wrong] check uses the `node16` profile and ignores the CJS-to-ESM warning. SmoothBricks
 packages are [ESM]-first, so [CommonJS] consumers can use dynamic import. Node 10-only subpath failures are
 intentionally ignored because [Node.js] 10 is not part of the supported package contract.
+
+The `github-actions` pre-build check runs `jactionlint --no-online` from the repository root using the managed shell/CI
+`PATH`. It uses the default correctness, security, and policy profile unless the repository config chooses otherwise.
+The managed shell pins `shellcheck` and `pyflakes`; smoo requires both and passes their resolved paths to jactionlint,
+rather than quietly skipping those checks. Checker failures and missing tools count as one failed check with
+diagnostics. Without `--fix`, `--fail-fast` stops before the build; fix mode builds before checking. `--projects` scopes
+builds and packed-package checks, not this repository-wide check.
+
+Config is always explicit: the first existing `.github/jactionlint.yaml`, `.github/jactionlint.yml`,
+`.github/actionlint.yaml`, or `.github/actionlint.yml`, in that order, or `/dev/null` for empty/default settings.
+User-global dotfiles therefore cannot weaken the gate. Repository config may choose a profile, configure individual
+rules, or enable an existing baseline. Smoo never requests fixes, baseline creation, or ignore flags, including in
+`smoo monorepo validate --fix` mode; `--no-online` also disables network checks requested by repository config.
+
+Normally jactionlint discovers its own inputs and local action callers. For standalone Dependabot or subdirectory-action
+repositories that jactionlint cannot recognize in repository mode, smoo passes the explicit input files. Only YAML files
+directly in `.github/workflows` are workflows; action discovery follows jactionlint's dependency/test-fixture
+exclusions. A repository with no applicable workflow, action metadata, or Dependabot configuration is skipped, with the
+reason printed under `--verbose`; applicable files are never treated as a successful empty check.
 
 `smoo monorepo validate --only-if-new-workspace-package` first checks the staged git diff for newly added workspace
 package manifests. If none are staged, it exits successfully without running the full validator. The generated
@@ -1301,6 +1321,7 @@ The important design goal is one source of truth per convention:
 - Package manifests decide Bun lockfile workspace versions; the pre-publish pack maps unpublished `-next` entries to the
   last stable tag.
 - [`sherif`] handles broad package hygiene.
+- [`jactionlint`] checks GitHub Actions correctness, security, and policy.
 - [`publint`] and [`attw`][are-the-types-wrong] validate real packed artifacts.
 
 This keeps `smoo` small where external tools already do the job, but keeps SmoothBricks-specific policy native where
@@ -1333,6 +1354,7 @@ smoo monorepo validate
 [GitHub Actions]: https://docs.github.com/actions
 [github-actions-oidc]:
   https://docs.github.com/actions/deployment/security-hardening-your-deployments/about-security-hardening-with-openid-connect
+[`jactionlint`]: https://github.com/jdx/jactionlint
 [Nix]: https://nixos.org/
 [Node.js]: https://nodejs.org/
 [npm]: https://www.npmjs.com/
