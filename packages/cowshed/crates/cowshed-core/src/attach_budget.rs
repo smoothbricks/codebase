@@ -22,7 +22,6 @@
 //! explains replaces it.
 
 use std::fmt;
-use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -52,6 +51,11 @@ pub const RESTART_DISK_ARBITRATION_HINT: &str = "sudo killall diskarbitrationd: 
 pub const ORPHANS_FIRST_HINT: &str = "kill the orphaned diskimagesiod helpers `cowshed doctor` \
      names (orphaned-disk-image-helpers), then `attach-budget --clear`; reboot if attaches still \
      fail with error code 150";
+
+/// How the lane's checkout runs the operator's reset ([`clear`]): the bin is built from the
+/// checkout, not installed.
+pub const CLEAR_COMMAND: &str =
+    "cargo --frozen run -q -p cowshed-core --bin attach-budget -- --clear";
 
 /// The next step for a command the spent pool refused.
 pub const EXHAUSTED_HINT: &str = "cowshed doctor: its disk-image-attach-budget finding says \
@@ -199,12 +203,24 @@ impl PoolRecord {
         }
     }
 
-    /// The record after an attach during `session` succeeded, or the operator cleared it:
-    /// whatever spent the pool was freed. The exhaustion stays as evidence and ceiling.
+    /// The record after an attach during `session` succeeded: whatever spent the pool was
+    /// freed. The exhaustion stays as evidence and ceiling.
     pub fn attached(self, session: &str) -> Self {
         Self {
             spent_session: self.spent_session.filter(|spent| spent != session),
             ..self
+        }
+    }
+
+    /// The record after the operator cleared it (`attach-budget --clear`): this boot's
+    /// exhaustion ends, as after a successful attach, and the observed ceiling is forgotten,
+    /// back to [`OBSERVED_LEAK_CEILING`]. A ceiling only ever moves down and survives reboots,
+    /// so one 150 at a low leaked count would otherwise refuse the lane on every later boot,
+    /// with no attach left to raise it. The last exhaustion stays as evidence.
+    pub fn cleared(self, session: &str) -> Self {
+        Self {
+            ceiling: None,
+            ..self.attached(session)
         }
     }
 
@@ -324,10 +340,32 @@ impl Budget {
                 need,
                 headroom: Some(self.headroom()),
                 detail: self.to_string(),
-                remedy: self.remedy(),
+                remedy: self.refusal_remedy(need),
             });
         }
         Ok(())
+    }
+
+    /// What frees enough of the pool for `need` more attaches, which a refusal always names:
+    /// the orphaned helpers when the leaked devices do not explain a spent boot, the recorded
+    /// ceiling when it alone is below `need`, and otherwise a reboot, the one thing that frees
+    /// leaked image devices. Leaked volumes and media add the `diskarbitrationd` restart first.
+    fn refusal_remedy(&self, need: u64) -> String {
+        let step = match self.ceiling {
+            _ if self.spent.is_some() && !self.devices_full() => ORPHANS_FIRST_HINT.to_owned(),
+            Ceiling::Observed { leaked, .. } if leaked < need => format!(
+                "the ceiling recorded at this host's last error code 150, {leaked} leaked \
+                 devices, is below the {need} attaches needed whatever leaks now; it survives \
+                 reboots and only moves down, so if it no longer holds, `{CLEAR_COMMAND}` \
+                 forgets it (back to {OBSERVED_LEAK_CEILING})"
+            ),
+            Ceiling::Observed { .. } | Ceiling::Default => REBOOT_HINT.to_owned(),
+        };
+        if self.reading.leaked_volumes() >= VOLUME_LEAK_WARNING {
+            format!("{RESTART_DISK_ARBITRATION_HINT}; then {step}")
+        } else {
+            step
+        }
     }
 
     /// Whether the leaked devices alone account for the spent pool.
@@ -479,17 +517,36 @@ pub fn load(path: &Path) -> io::Result<PoolRecord> {
     }
 }
 
+/// The record at `path` as [`load`] reads it, except that a record that does not parse (a hand
+/// edit, a newer schema) is read as empty and said aloud with the file it names: it proves
+/// nothing about the pool, and must neither stop the kernel from being reported nor keep a 150
+/// from being recorded. The flag says the stored bytes are broken, so the next write replaces
+/// them.
+fn load_or_empty(path: &Path) -> io::Result<(PoolRecord, bool)> {
+    match load(path) {
+        Ok(record) => Ok((record, false)),
+        Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+            eprintln!(
+                "cowshed: warning: the disk-image attach pool record does not parse ({error}); \
+                 read as empty, and replaced at its next write"
+            );
+            Ok((PoolRecord::default(), true))
+        }
+        Err(error) => Err(error),
+    }
+}
+
 /// Apply `change` to the record at `path` under its sibling lock, so concurrent test processes
 /// cannot lose each other's updates, and answer the record now stored. An unchanged record is
-/// not rewritten.
+/// not rewritten, unless its stored bytes do not parse.
 pub fn update(
     path: &Path,
     change: impl FnOnce(PoolRecord) -> PoolRecord,
 ) -> io::Result<PoolRecord> {
-    let _lock: File = crate::apfs::locked_private_file(&path.with_extension("lock"))?;
-    let before = load(path)?;
+    let _lock = crate::apfs::locked_private_file(&path.with_extension("lock"))?;
+    let (before, broken) = load_or_empty(path)?;
     let after = change(before.clone());
-    if after == before {
+    if after == before && !broken {
         return Ok(after);
     }
     crate::fsio::publish_private_file(path, |writer| serde_json::to_writer(writer, &after))
@@ -592,11 +649,14 @@ fn unsupported() -> io::Error {
     )
 }
 
-/// The pool now. Reads only: nothing is attached and nothing is written.
+/// The pool now. Nothing is attached and the record is not written; only the record's private
+/// directory is created if it is missing. A record that does not parse reads as empty
+/// ([`load_or_empty`]), so the kernel's counts are still reported.
 pub fn observe() -> io::Result<Budget> {
     let boot = boot()?;
     let reading = read_kernel()?;
-    Ok(load(&record_path()?)?.budget(&boot.session, reading))
+    let (record, _) = load_or_empty(&record_path()?)?;
+    Ok(record.budget(&boot.session, reading))
 }
 
 /// Record that the host just answered a disk-image command with error code 150. The 150 is
@@ -619,7 +679,7 @@ pub fn record_attach() -> io::Result<PoolRecord> {
 }
 
 pub fn record_attach_at(path: &Path, session: &str) -> io::Result<PoolRecord> {
-    let record = load(path)?;
+    let (record, _) = load_or_empty(path)?;
     if record.spent(session).is_none() {
         return Ok(record);
     }
@@ -633,6 +693,16 @@ pub fn record_killed() -> io::Result<PoolRecord> {
 
 pub fn record_killed_at(path: &Path, session: &str) -> io::Result<PoolRecord> {
     update(path, |record| record.killed(session))
+}
+
+/// The operator's reset ([`PoolRecord::cleared`]): end this boot's exhaustion and forget the
+/// observed ceiling. A record that does not parse is replaced.
+pub fn clear() -> io::Result<PoolRecord> {
+    clear_at(&record_path()?, &boot()?.session)
+}
+
+pub fn clear_at(path: &Path, session: &str) -> io::Result<PoolRecord> {
+    update(path, |record| record.cleared(session))
 }
 
 /// Refuse `need` attaches the pool cannot take: the real-APFS lane's gate.
@@ -659,8 +729,8 @@ pub fn harness_gate() -> Result<(), AttachPoolExhausted> {
 
 /// [`harness_gate`] against the record at `path` during boot `session`.
 pub fn harness_gate_at(path: &Path, session: &str) -> Result<(), AttachPoolExhausted> {
-    let record = match load(path) {
-        Ok(record) => record,
+    let record = match load_or_empty(path) {
+        Ok((record, _)) => record,
         Err(error) => {
             unreadable(&error);
             return Ok(());
@@ -861,7 +931,11 @@ mod tests {
             report.starts_with("AttachPoolExhausted: 1001 attaches needed, 1000 of headroom"),
             "{report}"
         );
-        assert!(report.contains("\nnext: "), "{report}");
+        // Leaked devices are what refuse, and only a reboot frees them.
+        assert!(
+            report.ends_with(&format!("\nnext: {REBOOT_HINT}")),
+            "{report}"
+        );
 
         // A later 150 at a lower leaked count lowers the ceiling.
         let lowered = record
@@ -1001,6 +1075,96 @@ mod tests {
         record_attach_at(&path, BOOT).unwrap();
         assert!(harness_gate_at(&path, BOOT).is_ok());
         assert!(load(&path).unwrap().ceiling.is_some());
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// Every refusal names a step that can free the pool. Between a quarter of the ceiling and
+    /// the need, the doctor remedy has nothing to free, yet the gate refuses: it says reboot.
+    #[test]
+    fn a_refusal_for_low_headroom_says_reboot_even_when_doctor_would_not() {
+        let budget = PoolRecord::default().budget(NEXT_BOOT, leaking(700));
+        assert_eq!(budget.headroom(), 324);
+        assert_eq!(budget.remedy(), "nothing to free");
+        let refused = budget.admits(400).expect_err("324 < 400");
+        assert_eq!(refused.remedy, REBOOT_HINT);
+        let volumes = KernelReading {
+            apfs_volumes: count(1065, 81),
+            ..leaking(700)
+        };
+        let refused = PoolRecord::default()
+            .budget(NEXT_BOOT, volumes)
+            .admits(400)
+            .expect_err("324 < 400");
+        assert_eq!(
+            refused.remedy,
+            format!("{RESTART_DISK_ARBITRATION_HINT}; then {REBOOT_HINT}")
+        );
+        // A spent boot the leaked devices do not explain sends the operator to the orphans.
+        let orphaned = PoolRecord::default()
+            .exhausted(&boot(BOOT), Some(count(96, 66)), Some(10))
+            .budget(BOOT, leaking(30));
+        assert_eq!(orphaned.admits(1).unwrap_err().remedy, ORPHANS_FIRST_HINT);
+    }
+
+    /// A ceiling below the need refuses whatever leaks now; the refusal names the reset, and the
+    /// reset forgets the ceiling and the spent boot, keeping the last exhaustion as evidence.
+    #[test]
+    fn a_recorded_ceiling_below_the_need_names_the_reset_that_forgets_it() {
+        let low = PoolRecord::default().exhausted(&boot(BOOT), Some(count(40, 10)), Some(0));
+        let budget = low.budget(NEXT_BOOT, leaking(0));
+        assert_eq!(budget.ceiling.leaked(), 30);
+        let refused = budget.admits(273).expect_err("30 < 273");
+        assert!(
+            refused.remedy.contains(&format!("`{CLEAR_COMMAND}`")),
+            "{refused}"
+        );
+        assert!(refused.remedy.contains("30 leaked devices"), "{refused}");
+        // A ceiling above the need with too many leaked devices is the reboot's, not the reset's.
+        let high = PoolRecord::default().exhausted(&boot(BOOT), Some(count(510, 10)), Some(0));
+        let refused = high
+            .budget(NEXT_BOOT, leaking(400))
+            .admits(273)
+            .unwrap_err();
+        assert_eq!(refused.remedy, REBOOT_HINT);
+
+        let cleared = low.clone().cleared(BOOT);
+        assert_eq!(cleared.ceiling, None);
+        assert_eq!(cleared.spent_session, None);
+        assert_eq!(cleared.last_exhaustion, low.last_exhaustion);
+        assert!(cleared.budget(NEXT_BOOT, leaking(0)).admits(273).is_ok());
+
+        let directory = scratch("clear");
+        let path = directory.join("pool.json");
+        update(&path, |_| low.clone()).unwrap();
+        assert!(harness_gate_at(&path, BOOT).is_err());
+        clear_at(&path, BOOT).unwrap();
+        assert!(harness_gate_at(&path, BOOT).is_ok());
+        assert_eq!(load(&path).unwrap().ceiling(), Ceiling::Default);
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// A record that does not parse proves nothing: it reads as empty, the next 150 is still
+    /// recorded over it (so the cascade guard holds), and the reset replaces it.
+    #[test]
+    fn a_record_that_does_not_parse_is_read_as_empty_and_replaced() {
+        let directory = scratch("broken");
+        let path = directory.join("pool.json");
+        std::fs::write(&path, b"not json").unwrap();
+        assert_eq!(load(&path).unwrap_err().kind(), io::ErrorKind::InvalidData);
+        assert_eq!(load_or_empty(&path).unwrap(), (PoolRecord::default(), true));
+        update(&path, |record| {
+            record.exhausted(&boot(BOOT), Some(spent_host().image_devices), Some(0))
+        })
+        .unwrap();
+        assert!(harness_gate_at(&path, BOOT).is_err());
+
+        std::fs::write(&path, b"not json").unwrap();
+        assert_eq!(clear_at(&path, BOOT).unwrap(), PoolRecord::default());
+        assert_eq!(
+            load(&path).unwrap(),
+            PoolRecord::default(),
+            "rewritten, not left broken"
+        );
         std::fs::remove_dir_all(&directory).unwrap();
     }
 

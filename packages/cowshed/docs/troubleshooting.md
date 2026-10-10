@@ -447,7 +447,8 @@ instances (`ioclasscount`) that no attached image accounts for, which only a reb
 ran out (1024 leaked devices until one is recorded: an observation from one host and boot, not a documented limit), the
 headroom left, and any disk-image command killed at its 15-minute hard deadline, each a probable leaked device. "attach
 pool exhausted, reboot required" means an attach failed with error code 150 this boot with the leaked devices at the
-ceiling: reboot.
+ceiling: reboot. A recorded ceiling only moves down and survives reboots; if the lane gate refuses because that ceiling
+alone is below the attaches it needs, and the ceiling no longer holds, `attach-budget --clear` forgets it.
 
 The other cause is helpers that outlived their image. Every attached image has its own `diskimagesiod`, which maps 72
 MiB into the kernel; detach does not always end it, and a helper that outlived its image keeps its mapping.

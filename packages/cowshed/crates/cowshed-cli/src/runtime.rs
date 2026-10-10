@@ -4193,7 +4193,9 @@ fn disk_image_attach_budget_finding(
             code: "disk-image-attach-budget".into(),
             severity: FindingSeverity::Warning,
             message: format!("could not read the disk-image attach pool: {error}"),
-            hint: "ioclasscount AppleDiskImageDevice DIDeviceIOUserClient AppleAPFSVolume IOMedia"
+            hint: "the error names what failed: the kernel counts (ioclasscount \
+                   AppleDiskImageDevice DIDeviceIOUserClient AppleAPFSVolume IOMedia) or the \
+                   record directory (ls -ld /private/var/tmp/cowshed-attach-pool-$(id -u))"
                 .into(),
             path: None,
         }),

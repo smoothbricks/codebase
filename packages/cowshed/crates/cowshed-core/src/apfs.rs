@@ -369,18 +369,33 @@ fn warn_outlived(request: &CommandRequest, policy: DeadlinePolicy, elapsed: Dura
         .last()
         .map_or_else(String::new, |target| target.to_string_lossy().into_owned());
     eprintln!(
-        "cowshed: warning: {} {} on {target} is still running after {}s, past its {}s deadline; \
+        "cowshed: warning: {} on {target} is still running after {}s, past its {}s deadline; \
          a disk-image command killed mid-operation can leak its device until reboot, so it is \
          waited for, holding its leases, until {}s",
-        request.program.display(),
-        request
-            .args
-            .first()
-            .map_or_else(String::new, |verb| verb.to_string_lossy().into_owned()),
+        DiskImageVerb(request),
         elapsed.as_secs(),
         policy.deadline.as_secs(),
         policy.hard.as_secs()
     );
+}
+
+/// The program and verb a disk-image command names: `diskutil image attach`, `hdiutil detach`.
+struct DiskImageVerb<'a>(&'a CommandRequest);
+
+impl fmt::Display for DiskImageVerb<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let request = self.0;
+        let words = if request.program == Path::new(DISKUTIL) {
+            2
+        } else {
+            1
+        };
+        write!(f, "{}", request.program.display())?;
+        for word in request.args.iter().take(words) {
+            write!(f, " {}", word.display())?;
+        }
+        Ok(())
+    }
 }
 
 /// Record a disk-image command killed at its hard deadline as a probable leaked device.
@@ -396,14 +411,14 @@ fn record_killed(request: &CommandRequest) {
     }
 }
 
-/// Tell the attach-pool record what the host answered a disk-image command: error code 150
-/// spends the boot, a successful attach ends a spent boot. A failed record is said aloud; the
-/// command's own outcome still reaches the caller.
+/// Tell the attach-pool record what the host answered a disk-image command: a failure with
+/// error code 150 spends the boot, a successful attach ends a spent boot. A failed record is
+/// said aloud; the command's own outcome still reaches the caller.
 fn record_pool_outcome(request: &CommandRequest, output: &CommandOutput) {
     if !is_disk_image_command(request) {
         return;
     }
-    let recorded = if attach_budget::reports_pool_exhausted(&output.stderr) {
+    let recorded = if !output.succeeded() && attach_budget::reports_pool_exhausted(&output.stderr) {
         attach_budget::record_exhaustion()
     } else if output.succeeded() && is_image_attach(request) {
         attach_budget::record_attach()
@@ -602,8 +617,9 @@ fn open_private_file(path: &Path, what: &str) -> io::Result<File> {
 }
 
 /// [`open_private_file`] at `path`, held under an exclusive `flock` until the answer is dropped.
-pub(crate) fn locked_private_file(path: &Path) -> io::Result<File> {
-    let file = open_private_file(path, "lock file")?;
+/// Fenced like the image leases, so no child forked meanwhile keeps the lock.
+pub(crate) fn locked_private_file(path: &Path) -> io::Result<Fenced<File>> {
+    let file = Fenced::new(open_private_file(path, "lock file")?);
     lock_file(&file, libc::LOCK_EX)?;
     Ok(file)
 }
@@ -730,7 +746,8 @@ fn kill_disk_child_group(child: &mut std::process::Child) {
     let _ = child.kill();
 }
 
-/// Images whose disk child was killed at [`DISK_CHILD_DEADLINE`], oldest first.
+/// Images whose disk child was killed at its deadline ([`DISK_CHILD_DEADLINE`], or
+/// [`DISK_IMAGE_HARD_DEADLINE`] for a disk-image command), oldest first.
 ///
 /// The daemon startup pass drains this at the start of each pass (see
 /// [`take_deferred_images`]) and heals the drained images before the rest, so a
@@ -5532,6 +5549,19 @@ mod tests {
 
     fn disk_image_request() -> CommandRequest {
         CommandRequest::new(DISKUTIL, ["image", "attach", "/private/tmp/x.dmg"])
+    }
+
+    /// The outlived-deadline warning names the verb, not just its noun: `diskutil image attach`.
+    #[test]
+    fn a_disk_image_command_is_named_by_its_program_and_verb() {
+        assert_eq!(
+            DiskImageVerb(&disk_image_request()).to_string(),
+            "/usr/sbin/diskutil image attach"
+        );
+        assert_eq!(
+            DiskImageVerb(&CommandRequest::new(HDIUTIL, ["detach", "/dev/disk9"])).to_string(),
+            "/usr/bin/hdiutil detach"
+        );
     }
 
     /// The policy itself, at its real constants: a disk-image command past the 120 s deadline

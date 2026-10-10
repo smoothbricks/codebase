@@ -5,7 +5,8 @@
 //! headroom is below `N`, the lane's measured attach count. A pool that cannot be read proves
 //! nothing either way: the line says `unread`, stderr says why, and the exit is 0, so the lane
 //! runs with the warning visible. `--clear` ends this boot's recorded exhaustion once the
-//! operator has freed what spent it (killed the orphaned helpers `cowshed doctor` names).
+//! operator has freed what spent it (killed the orphaned helpers `cowshed doctor` names), and
+//! forgets the ceiling a past error code 150 recorded, back to the observed default.
 
 use std::process::ExitCode;
 
@@ -55,13 +56,10 @@ fn gate(need: u64) -> ExitCode {
 }
 
 fn clear() -> ExitCode {
-    let cleared = attach_budget::boot().and_then(|boot| {
-        attach_budget::record_attach_at(&attach_budget::record_path()?, &boot.session)
-    });
-    match cleared {
+    match attach_budget::clear() {
         Ok(_) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("attach-budget: clear the recorded exhaustion: {error}");
+            eprintln!("attach-budget: clear the recorded exhaustion and ceiling: {error}");
             ExitCode::from(1)
         }
     }
