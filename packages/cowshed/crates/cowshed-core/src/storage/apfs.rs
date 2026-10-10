@@ -1637,6 +1637,7 @@ where
     /// same image lock lifecycle operations take: a re-adoption's retention and its build
     /// replacement's publication happen under main's lock, so staging collection, which takes
     /// it too before it acts, never interleaves with them.
+    #[cfg(target_os = "macos")]
     pub(crate) async fn dispatch_on_host_with_image_lock<T, F>(
         &self,
         lock_path: PathBuf,

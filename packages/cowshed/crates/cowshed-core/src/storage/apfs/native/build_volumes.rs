@@ -135,6 +135,7 @@ where
     /// Quiet retains the stopped supervisor's socket lease against replacement admission and
     /// the landing's shared GC hold. Taking a second exclusive claim would conflict with that
     /// hold; upgrading it would open an admission gap (16_build_volumes.md, Land step 4).
+    #[cfg(target_os = "macos")]
     pub(crate) fn clone_quiet_build_volume(
         &self,
         layout: &BuildVolumeLayout,
@@ -160,6 +161,7 @@ where
     /// all run under it. A second exclusive claim on the same hold file would conflict with it,
     /// and an upgrade would reopen admission (16_build_volumes.md, "Targets and seeds"). The source
     /// is the claim's own volume, so no caller can pair a claim with another volume's id.
+    #[cfg(target_os = "macos")]
     pub(super) fn clone_claimed_build_volume(
         &self,
         layout: &BuildVolumeLayout,

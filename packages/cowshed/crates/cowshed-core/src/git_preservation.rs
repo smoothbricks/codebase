@@ -9,18 +9,27 @@
 //! Only the current checkout's worktree-list entry is mapped to the caller's
 //! canonical publication path; registered peers are never rewritten.
 
+#[cfg(any(target_os = "macos", test))]
 use std::ffi::OsString;
+#[cfg(any(target_os = "macos", test))]
 use std::fmt;
+#[cfg(any(target_os = "macos", test))]
 use std::fs;
+#[cfg(any(target_os = "macos", test))]
 use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
+#[cfg(any(target_os = "macos", test))]
 use std::os::unix::process::ExitStatusExt as _;
+#[cfg(any(target_os = "macos", test))]
 use std::path::{Path, PathBuf};
+#[cfg(any(target_os = "macos", test))]
 use std::process::Output;
 
 use serde::{Deserialize, Serialize};
 
 use crate::api::{GitOid, Sha256Digest};
+#[cfg(any(target_os = "macos", test))]
 use crate::error::{CowshedError, Result};
+#[cfg(any(target_os = "macos", test))]
 use crate::fork_lock::Run as _;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -32,12 +41,14 @@ struct Probe {
     stderr: Vec<u8>,
 }
 
+#[cfg(any(target_os = "macos", test))]
 impl Probe {
     fn succeeded(&self) -> bool {
         self.code == Some(0) && self.signal.is_none()
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 impl From<Output> for Probe {
     fn from(output: Output) -> Self {
         Self {
@@ -69,6 +80,7 @@ pub(crate) struct GitPreservationSnapshot {
     fsck: Probe,
 }
 
+#[cfg(any(target_os = "macos", test))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum GitPreservationComponent {
     Head,
@@ -82,6 +94,7 @@ pub(crate) enum GitPreservationComponent {
     Fsck,
 }
 
+#[cfg(any(target_os = "macos", test))]
 impl fmt::Display for GitPreservationComponent {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
@@ -99,11 +112,13 @@ impl fmt::Display for GitPreservationComponent {
 }
 
 /// All mismatches, in probe order; no first-mismatch-only verdict.
+#[cfg(any(target_os = "macos", test))]
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct GitPreservationDiff {
     pub(crate) components: Vec<GitPreservationComponent>,
 }
 
+#[cfg(any(target_os = "macos", test))]
 impl fmt::Display for GitPreservationDiff {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("Git preservation mismatch: ")?;
@@ -117,8 +132,10 @@ impl fmt::Display for GitPreservationDiff {
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 impl std::error::Error for GitPreservationDiff {}
 
+#[cfg(any(target_os = "macos", test))]
 impl GitPreservationSnapshot {
     pub(crate) fn head(&self) -> &GitOid {
         &self.head
@@ -177,6 +194,7 @@ impl GitPreservationSnapshot {
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn absolute(path: &Path, name: &str) -> Result<()> {
     if path.is_absolute() {
         Ok(())
@@ -192,6 +210,7 @@ fn absolute(path: &Path, name: &str) -> Result<()> {
 }
 
 /// Run without index refreshes or ambient Git-directory redirection.
+#[cfg(any(target_os = "macos", test))]
 fn probe(root: &Path, args: &[&str], allowed_codes: &[i32]) -> Result<Probe> {
     let output = crate::git::git_command_at(root)
         .env("GIT_OPTIONAL_LOCKS", "0")
@@ -231,6 +250,7 @@ fn probe(root: &Path, args: &[&str], allowed_codes: &[i32]) -> Result<Probe> {
     Ok(output.into())
 }
 
+#[cfg(any(target_os = "macos", test))]
 pub(crate) fn capture(root: &Path, canonical_checkout: &Path) -> Result<GitPreservationSnapshot> {
     absolute(root, "root")?;
     absolute(canonical_checkout, "canonical checkout")?;
@@ -342,6 +362,7 @@ pub(crate) fn capture(root: &Path, canonical_checkout: &Path) -> Result<GitPrese
     })
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn worktree_field<'a>(
     snapshot: &'a GitPreservationSnapshot,
     field: &'a [u8],
@@ -354,6 +375,7 @@ fn worktree_field<'a>(
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn worktrees_equal(expected: &GitPreservationSnapshot, actual: &GitPreservationSnapshot) -> bool {
     if expected.worktrees.code != actual.worktrees.code
         || expected.worktrees.signal != actual.worktrees.signal
@@ -382,6 +404,7 @@ fn worktrees_equal(expected: &GitPreservationSnapshot, actual: &GitPreservationS
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 pub(crate) fn verify(
     root: &Path,
     canonical_checkout: &Path,

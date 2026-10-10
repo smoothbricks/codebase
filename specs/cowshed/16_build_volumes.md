@@ -329,7 +329,11 @@ Land already owns a shared GC hold on its quiet source. Its typed quiet capture 
 lease that refuses replacement admission, from before the jobs stop through capture and adoption. It does not take a
 second exclusive claim, nor upgrade the shared hold: Darwin flock upgrades release and retake the lock and would reopen
 the gap. The socket lease is released only before replacement supervisors start, after the immutable seed mark and
-adoption (and a kept workspace's refork). The shared GC hold remains through the rest of the build-volume steps.
+adoption (and a kept workspace's refork). The shared GC hold remains through the rest of the build-volume steps. The
+quiet capability and the capture method that consumes it are compiled only with the macOS runtime; portable APFS backend
+operations do not depend on that platform-only capability. Re-adoption's retained-image runtime operations likewise
+compile with macOS, while its durable record data, Git evidence schema and pure command-contract and Git-preservation
+tests remain portable.
 
 This kernel boundary also covers writers outside Cargo and Nx protocols. A Rust analyzer holding a proc-macro library or
 a script with a file open can leave the fork colder by refusing the seal; neither is forced off the volume and no

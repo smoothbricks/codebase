@@ -966,11 +966,13 @@ impl AttachedImage {
 /// A path named by a validated explicit re-adoption record, not another runtime image format.
 /// Ordinary operations still accept only RAW. This token enables identity inspection and
 /// read-only retained attachment, never image creation or growth.
+#[cfg(any(target_os = "macos", test))]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct RetainedInput<'a> {
     path: &'a Path,
 }
 
+#[cfg(any(target_os = "macos", test))]
 impl<'a> RetainedInput<'a> {
     pub(crate) fn from_record(
         source: &'a crate::storage::recovery::ReAdoptSource,
@@ -1005,9 +1007,11 @@ impl<'a> RetainedInput<'a> {
 
 /// Retained inputs expose no writable-mount capability. Only this module can obtain the inner
 /// attachment; callers use its read-only mount and non-forced release methods.
+#[cfg(any(target_os = "macos", test))]
 #[derive(Debug)]
 pub(crate) struct RetainedAttachment(AttachedImage);
 
+#[cfg(any(target_os = "macos", test))]
 impl RetainedAttachment {
     pub(crate) fn volume_device(&self) -> &str {
         self.0.volume_device()
@@ -2404,6 +2408,7 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
         }
     }
 
+    #[cfg(target_os = "macos")]
     pub(crate) fn existing_retained_attachment(
         &self,
         input: &RetainedInput<'_>,
@@ -2423,6 +2428,7 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
         }
     }
 
+    #[cfg(any(target_os = "macos", test))]
     pub(crate) fn attach_retained_verified(
         &self,
         input: &RetainedInput<'_>,
@@ -2431,6 +2437,7 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
             .map(RetainedAttachment)
     }
 
+    #[cfg(target_os = "macos")]
     pub(crate) fn mount_retained_read_only(
         &self,
         attachment: &RetainedAttachment,
@@ -2439,6 +2446,7 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
         self.mount(&attachment.0, mount, MountAccess::ReadOnly, false)
     }
 
+    #[cfg(target_os = "macos")]
     pub(crate) fn unmount_retained_when_idle(
         &self,
         attachment: &RetainedAttachment,
@@ -2446,6 +2454,7 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
         self.unmount_verified(&attachment.0, DetachIntent::WhenIdle)
     }
 
+    #[cfg(target_os = "macos")]
     pub(crate) fn detach_retained_when_idle(
         &self,
         attachment: &RetainedAttachment,

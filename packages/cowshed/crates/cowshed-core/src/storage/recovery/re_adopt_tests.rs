@@ -90,12 +90,14 @@ impl Fixture {
 
     /// The same fixture recording its three re-adoption mounts in `staging`, a repository's
     /// staging directory as the host layout names it.
+    #[cfg(target_os = "macos")]
     pub(crate) fn with_staging(mut self, staging: PathBuf) -> Self {
         self.staging = staging;
         self
     }
 
     /// The store the project directory sits in, `<store>/acme/widget`.
+    #[cfg(target_os = "macos")]
     pub(crate) fn store(&self) -> &Path {
         self.project
             .parent()

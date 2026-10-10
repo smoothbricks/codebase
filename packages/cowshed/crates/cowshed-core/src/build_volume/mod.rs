@@ -623,6 +623,7 @@ impl BuildVolumeLayout {
     /// actually is, `image` in this layout's images in whatever format it was written
     /// (`<image>.hold`): a job admitted on a volume written before RAW holds that file, not the
     /// RAW name. `None` while a job holds it; the claim keeps every new hold out until dropped.
+    #[cfg(target_os = "macos")]
     pub(crate) fn claim_re_adopt_source(
         &self,
         id: &BuildVolumeId,

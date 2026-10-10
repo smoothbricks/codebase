@@ -15251,6 +15251,7 @@ async fn close_checkout_nx(
 
 /// Whether `path` is a directory with nothing in it, as a replaced main leaves its checkout.
 /// Anything unreadable is not proven empty.
+#[cfg(target_os = "macos")]
 fn is_empty_directory(path: &Path) -> bool {
     std::fs::read_dir(path).is_ok_and(|mut entries| entries.next().is_none())
 }

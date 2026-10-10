@@ -60,6 +60,7 @@ use crate::timing::timed;
 
 mod blank_template;
 mod build_volumes;
+#[cfg(target_os = "macos")]
 mod re_adopt;
 pub use blank_template::{
     BLANK_TEMPLATE_LABEL, blank_template, blank_template_path, blank_template_staged_stem,
