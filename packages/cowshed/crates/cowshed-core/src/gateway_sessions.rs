@@ -123,15 +123,23 @@ impl NativeSessionInventory {
     }
 
     /// Every attached session on the host the gateway serves, and the collisions whose newer
-    /// member it does not (05_gateway.md), each named on stderr with what repairs it.
-    async fn served(&self) -> Result<(Vec<GatewaySessionFact>, Vec<PortCollision>)> {
+    /// member it does not (05_gateway.md). Each collision `reporting` names, or every one when it
+    /// names no project, is said on stderr with what repairs it: a per-project reconcile reads
+    /// the whole host but speaks only for its own project.
+    async fn served(
+        &self,
+        reporting: Option<&RepoId>,
+    ) -> Result<(Vec<GatewaySessionFact>, Vec<PortCollision>)> {
         let (served, refused) = served_sessions(
             self.inventory
                 .all_attached()
                 .await
                 .map_err(inventory_error)?,
         );
-        for collision in &refused {
+        for collision in refused
+            .iter()
+            .filter(|collision| reporting.is_none_or(|repo| collision.claimed.repo == *repo))
+        {
             eprintln!(
                 "cowshed: not serving {}/{}: {collision}; next: cowshed doctor --repair",
                 collision.claimed.repo, collision.claimed.workspace
@@ -152,7 +160,7 @@ impl NativeSessionInventory {
 #[async_trait]
 impl SessionInventory for NativeSessionInventory {
     async fn all_sessions(&self) -> Result<Vec<WorkspaceSession>> {
-        sessions_from_facts(self.served().await?.0)
+        sessions_from_facts(self.served(None).await?.0)
     }
 
     /// One project's sessions, less each one an older workspace of any project holds a port of:
@@ -163,7 +171,7 @@ impl SessionInventory for NativeSessionInventory {
             .project_attached(repo_id)
             .await
             .map_err(inventory_error)?;
-        let (_, refused) = self.served().await?;
+        let (_, refused) = self.served(Some(repo_id)).await?;
         sessions_from_facts(project.into_iter().filter(|fact| {
             !refused
                 .iter()

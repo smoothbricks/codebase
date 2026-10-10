@@ -6684,7 +6684,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                 code: "port-claim-unreadable".into(),
                 severity: crate::api::dto::FindingSeverity::Warning,
                 message: format!(
-                    "{} cannot be read ({error}); a port block it names may be handed to another workspace",
+                    "{} cannot be used ({error}); a port block it names may be handed to another workspace",
                     path.display()
                 ),
                 hint: "repair or remove the sidecar; cowshed gc collects staging no operation holds"
