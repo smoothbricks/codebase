@@ -262,19 +262,21 @@ fn remove_entry_by_key(
                 return Ok(false);
             };
             let erase = table.plan_erase_at(state, position);
-            table.erase_ranges(&erase, &mut ranges);
-            if meta.has_hashmap_timestamp_storage() {
-                erase.for_each_destination_run(|start, len| {
-                    ranges.push((hashmap_ops::cmp_lane_off(meta) + start * 8, len * 8));
-                });
-            }
-            let capture = undo.begin_capture(state, ranges.as_slice())?;
+            let capture = undo.begin_capture(state, || {
+                table.erase_ranges(&erase, &mut ranges);
+                if meta.has_hashmap_timestamp_storage() {
+                    erase.for_each_destination_run(|start, len| {
+                        ranges.push((hashmap_ops::cmp_lane_off(meta) + start * 8, len * 8));
+                    });
+                }
+                ranges.as_slice()
+            })?;
             if meta.slot_type() == SlotType::HashMap {
                 hashmap_ops::erase_slot_map_planned(state, meta, &table, &erase);
             } else {
                 table.erase_planned(state, &erase, |_, _, _| {});
             }
-            undo.finish_capture(delta_mode, state, ranges.as_slice(), capture);
+            undo.finish_capture(delta_mode, state, capture);
             Ok(true)
         }
         SlotType::Bitmap => {
@@ -309,9 +311,9 @@ fn remove_entry_by_key(
                     len,
                 )?;
             }
-            let capture = undo.begin_capture(prepared.state(), &payload_ranges)?;
+            let capture = undo.begin_capture(prepared.state(), || &payload_ranges)?;
             let (report, state) = prepared.apply_with_cleared_tail();
-            undo.finish_capture(delta_mode, state, &payload_ranges, capture);
+            undo.finish_capture(delta_mode, state, capture);
             Ok(report.removed == 1)
         }
         SlotType::Array => {
@@ -332,19 +334,17 @@ fn remove_entry_by_key(
             if current == EMPTY_KEY || current == TOMBSTONE {
                 return Ok(false);
             }
-            ranges.push((offset, 4));
-            let capture = undo.begin_capture(state, ranges.as_slice())?;
+            let capture = undo.begin_capture(state, || [(offset, 4)])?;
             bytes::write_u32(state, offset, TOMBSTONE);
-            undo.finish_capture(delta_mode, state, ranges.as_slice(), capture);
+            undo.finish_capture(delta_mode, state, capture);
             Ok(true)
         }
         SlotType::ConditionTree => {
-            ranges.push((meta.offset, 8));
-            let capture = undo.begin_capture(state, ranges.as_slice())?;
+            let capture = undo.begin_capture(state, || [(meta.offset, 8)])?;
             let generation = bytes::read_u32(state, meta.offset).wrapping_add(1);
             bytes::write_u32(state, meta.offset, generation);
             bytes::write_u32(state, meta.offset + 4, key);
-            undo.finish_capture(delta_mode, state, ranges.as_slice(), capture);
+            undo.finish_capture(delta_mode, state, capture);
             Ok(true)
         }
         SlotType::Aggregate
@@ -412,32 +412,34 @@ pub(crate) fn evict_expired(
     } else {
         0
     };
-    let ranges = [
-        (
-            meta.meta_base + SlotMetaOffset::SIZE,
-            if expired == 0 { 0 } else { 4 },
-        ),
-        (
-            meta.meta_base + SlotMetaOffset::CHANGE_FLAGS,
-            if expired == 0 { 0 } else { 1 },
-        ),
-        (
-            meta.meta_base + SlotMetaOffset::EVICTION_INDEX_SIZE,
-            if expired == 0 { 0 } else { 4 },
-        ),
-        (meta.meta_base + SlotMetaOffset::EVICTED_COUNT, 4),
-        (base, shift_len),
-        (
-            if buffer_len == 0 {
-                0
-            } else {
-                meta.evicted_buffer_offset(state)
-            },
-            buffer_len,
-        ),
-    ];
+    let ranges = || {
+        [
+            (
+                meta.meta_base + SlotMetaOffset::SIZE,
+                if expired == 0 { 0 } else { 4 },
+            ),
+            (
+                meta.meta_base + SlotMetaOffset::CHANGE_FLAGS,
+                if expired == 0 { 0 } else { 1 },
+            ),
+            (
+                meta.meta_base + SlotMetaOffset::EVICTION_INDEX_SIZE,
+                if expired == 0 { 0 } else { 4 },
+            ),
+            (meta.meta_base + SlotMetaOffset::EVICTED_COUNT, 4),
+            (base, shift_len),
+            (
+                if buffer_len == 0 {
+                    0
+                } else {
+                    meta.evicted_buffer_offset(state)
+                },
+                buffer_len,
+            ),
+        ]
+    };
     undo.prepare_redo(delta_mode)?;
-    let capture = undo.begin_capture(state, &ranges)?;
+    let capture = undo.begin_capture(state, ranges)?;
     meta.set_evicted_count(state, 0);
     let mut processed = 0u32;
     let mut removed = 0u32;
@@ -483,7 +485,7 @@ pub(crate) fn evict_expired(
             error = Some(ErrorCode::InvalidState);
         }
     }
-    undo.finish_capture(delta_mode, state, &ranges, capture);
+    undo.finish_capture(delta_mode, state, capture);
     match error {
         Some(error) => Err(error),
         None => Ok(removed),
@@ -741,14 +743,28 @@ impl UndoState {
     /// no range check. The VM derives every range it captures from geometry it
     /// already checked, and a recording window checks them; an external
     /// writer's ranges are checked by [`Vm::capture_mutation`] in either mode.
-    pub(crate) fn begin_capture(
+    /// The check is inlined into every kernel and `plan` runs only while
+    /// recording, so an unjournaled write pays one branch and never builds
+    /// its range plan.
+    #[inline(always)]
+    pub(crate) fn begin_capture<P: AsRef<[(u32, u32)]>>(
         &mut self,
         state: &[u8],
-        ranges: &[(u32, u32)],
+        plan: impl FnOnce() -> P,
     ) -> Result<ByteCapture, ErrorCode> {
         if !self.enabled {
             return Ok(ByteCapture { frame: None });
         }
+        self.begin_recording(state, plan().as_ref())
+    }
+
+    /// [`Self::begin_capture`] while the journal records.
+    #[inline(never)]
+    fn begin_recording(
+        &mut self,
+        state: &[u8],
+        ranges: &[(u32, u32)],
+    ) -> Result<ByteCapture, ErrorCode> {
         if self.overflow {
             return Err(ErrorCode::JournalOverflow);
         }
@@ -802,16 +818,18 @@ impl UndoState {
     }
 
     /// Consume one physical authority. No budget decision is possible after write.
-    pub(crate) fn finish_capture(
-        &mut self,
-        delta_mode: bool,
-        state: &[u8],
-        ranges: &[(u32, u32)],
-        capture: ByteCapture,
-    ) {
-        let Some(frame) = capture.frame else {
-            return;
-        };
+    /// The frame owns the chunks its plan reserved, so finishing needs no plan.
+    /// An unrecorded capture is no frame: inlined, it costs one branch.
+    #[inline(always)]
+    pub(crate) fn finish_capture(&mut self, delta_mode: bool, state: &[u8], capture: ByteCapture) {
+        if let Some(frame) = capture.frame {
+            self.finish_recording(delta_mode, state, frame);
+        }
+    }
+
+    /// [`Self::finish_capture`] for a recorded frame.
+    #[inline(never)]
+    fn finish_recording(&mut self, delta_mode: bool, state: &[u8], frame: CaptureFrame) {
         assert_eq!(
             frame.generation, self.generation,
             "capture belongs to another undo window"
@@ -834,12 +852,6 @@ impl UndoState {
         let mut scratch = frame.scratch_start;
         for index in frame.ranges_start..self.capture_ranges.len() {
             let (offset, len) = self.capture_ranges[index];
-            assert!(
-                ranges
-                    .iter()
-                    .any(|&(start, size)| offset >= start && offset + len <= start + size),
-                "capture finished with another range plan"
-            );
             let before = &self.capture_scratch[scratch..scratch + len as usize];
             let after = &state[offset as usize..(offset + len) as usize];
             if before != after {
@@ -1021,9 +1033,9 @@ impl Vm {
         // records them: the VM did not derive them.
         self.undo.validate_ranges(state, ranges)?;
         self.undo.prepare_redo(delta_mode)?;
-        let capture = self.undo.begin_capture(state, ranges)?;
+        let capture = self.undo.begin_capture(state, || ranges)?;
         let result = mutate(state);
-        self.undo.finish_capture(delta_mode, state, ranges, capture);
+        self.undo.finish_capture(delta_mode, state, capture);
         Ok(result)
     }
 
@@ -1358,22 +1370,18 @@ impl VmHooks for VmCtx<'_> {
         self.undo.erase_scratch = scratch;
     }
 
-    fn begin_capture(
+    #[inline(always)]
+    fn begin_capture<P: AsRef<[(u32, u32)]>>(
         &mut self,
         state: &[u8],
-        ranges: &[(u32, u32)],
+        plan: impl FnOnce() -> P,
     ) -> Result<ByteCapture, ErrorCode> {
-        self.undo.begin_capture(state, ranges)
+        self.undo.begin_capture(state, plan)
     }
 
-    fn finish_capture(
-        &mut self,
-        delta_mode: bool,
-        state: &[u8],
-        ranges: &[(u32, u32)],
-        capture: ByteCapture,
-    ) {
-        self.undo.finish_capture(delta_mode, state, ranges, capture);
+    #[inline(always)]
+    fn finish_capture(&mut self, delta_mode: bool, state: &[u8], capture: ByteCapture) {
+        self.undo.finish_capture(delta_mode, state, capture);
     }
 
     fn plan_ttl_batch(
@@ -1436,14 +1444,13 @@ fn journal_row_write(
     target: crate::struct_map::Upsert,
     write: impl FnOnce(&mut [u8]) -> ErrorCode,
 ) -> ErrorCode {
-    let ranges = row_capture_ranges(map, slot, target);
-    let capture = match undo.begin_capture(state, &ranges) {
+    let capture = match undo.begin_capture(state, || row_capture_ranges(map, slot, target)) {
         Ok(capture) => capture,
         Err(error) => return error,
     };
     apply_planned_row(map, state, key, target);
     let result = write(&mut *state);
-    undo.finish_capture(delta_mode, state, &ranges, capture);
+    undo.finish_capture(delta_mode, state, capture);
     result
 }
 
@@ -2254,26 +2261,28 @@ impl<'a> PreparedRow<'a> {
                 ),
             )
         });
-        let ranges = [
-            (
-                meta + SlotMetaOffset::SIZE,
-                if self.upsert.is_new { 4 } else { 0 },
-            ),
-            (meta + SlotMetaOffset::CHANGE_FLAGS, 1),
-            (
-                self.map.keys_off + self.upsert.pos * 4,
-                if self.upsert.is_new { 4 } else { 0 },
-            ),
-            (self.map.row_off(self.upsert.pos), self.map.row_size),
-            header,
-            append,
-        ];
-        let capture = undo.begin_capture(state, &ranges)?;
+        let ranges = || {
+            [
+                (
+                    meta + SlotMetaOffset::SIZE,
+                    if self.upsert.is_new { 4 } else { 0 },
+                ),
+                (meta + SlotMetaOffset::CHANGE_FLAGS, 1),
+                (
+                    self.map.keys_off + self.upsert.pos * 4,
+                    if self.upsert.is_new { 4 } else { 0 },
+                ),
+                (self.map.row_off(self.upsert.pos), self.map.row_size),
+                header,
+                append,
+            ]
+        };
+        let capture = undo.begin_capture(state, ranges)?;
         self.write(state);
         if let Some(arrays) = arrays {
             arrays.write(state, &self.map, self.upsert.pos, self.cols);
         }
-        undo.finish_capture(delta_mode, state, &ranges, capture);
+        undo.finish_capture(delta_mode, state, capture);
         Ok(())
     }
 }
@@ -2311,20 +2320,22 @@ fn single_struct_map2_upsert_last(
         return ErrorCode::CapacityExceeded;
     };
     let row = smap.row_off(result.pos);
-    let ranges = [
-        (smap.size_off, if result.is_new { 4 } else { 0 }),
-        (slot_meta_base(slot) + SlotMetaOffset::CHANGE_FLAGS, 1),
-        (
-            smap.keys1_off + result.pos * 4,
-            if result.is_new { 4 } else { 0 },
-        ),
-        (
-            smap.keys2_off + result.pos * 4,
-            if result.is_new { 4 } else { 0 },
-        ),
-        (row, smap.row_size),
-    ];
-    let capture = match undo.begin_capture(state, &ranges) {
+    let ranges = || {
+        [
+            (smap.size_off, if result.is_new { 4 } else { 0 }),
+            (slot_meta_base(slot) + SlotMetaOffset::CHANGE_FLAGS, 1),
+            (
+                smap.keys1_off + result.pos * 4,
+                if result.is_new { 4 } else { 0 },
+            ),
+            (
+                smap.keys2_off + result.pos * 4,
+                if result.is_new { 4 } else { 0 },
+            ),
+            (row, smap.row_size),
+        ]
+    };
+    let capture = match undo.begin_capture(state, ranges) {
         Ok(capture) => capture,
         Err(error) => return error,
     };
@@ -2346,7 +2357,7 @@ fn single_struct_map2_upsert_last(
     } else {
         ChangeFlag::UPDATED
     };
-    undo.finish_capture(delta_mode, state, &ranges, capture);
+    undo.finish_capture(delta_mode, state, capture);
     ErrorCode::Ok
 }
 
@@ -2403,13 +2414,15 @@ fn single_struct_map2_remove(
         return ErrorCode::Ok;
     };
     let row = smap.row_off(pos);
-    let ranges = [
-        (smap.size_off, 4),
-        (slot_meta_base(slot) + SlotMetaOffset::CHANGE_FLAGS, 1),
-        (smap.keys1_off + pos * 4, 4),
-        (row, smap.bitset_bytes),
-    ];
-    let capture = match undo.begin_capture(state, &ranges) {
+    let ranges = || {
+        [
+            (smap.size_off, 4),
+            (slot_meta_base(slot) + SlotMetaOffset::CHANGE_FLAGS, 1),
+            (smap.keys1_off + pos * 4, 4),
+            (row, smap.bitset_bytes),
+        ]
+    };
+    let capture = match undo.begin_capture(state, ranges) {
         Ok(capture) => capture,
         Err(error) => return error,
     };
@@ -2417,7 +2430,7 @@ fn single_struct_map2_remove(
     smap.set_size(state, smap.size(state) - 1);
     smap.clear_bitset(state, row);
     state[(slot_meta_base(slot) + SlotMetaOffset::CHANGE_FLAGS) as usize] |= ChangeFlag::REMOVED;
-    undo.finish_capture(delta_mode, state, &ranges, capture);
+    undo.finish_capture(delta_mode, state, capture);
     ErrorCode::Ok
 }
 
@@ -2459,16 +2472,18 @@ fn single_struct_map_upsert_from_probe(
 
     let out_row = out.row_off(result.pos);
 
-    let ranges = [
-        (out.size_off, if result.is_new { 4 } else { 0 }),
-        (slot_meta_base(out_slot) + SlotMetaOffset::CHANGE_FLAGS, 1),
-        (
-            out.keys_off + result.pos * 4,
-            if result.is_new { 4 } else { 0 },
-        ),
-        (out_row, out.row_size),
-    ];
-    let capture = match undo.begin_capture(state, &ranges) {
+    let ranges = || {
+        [
+            (out.size_off, if result.is_new { 4 } else { 0 }),
+            (slot_meta_base(out_slot) + SlotMetaOffset::CHANGE_FLAGS, 1),
+            (
+                out.keys_off + result.pos * 4,
+                if result.is_new { 4 } else { 0 },
+            ),
+            (out_row, out.row_size),
+        ]
+    };
+    let capture = match undo.begin_capture(state, ranges) {
         Ok(capture) => capture,
         Err(error) => return error,
     };
@@ -2493,7 +2508,7 @@ fn single_struct_map_upsert_from_probe(
     } else {
         ChangeFlag::UPDATED
     };
-    undo.finish_capture(delta_mode, state, &ranges, capture);
+    undo.finish_capture(delta_mode, state, capture);
     ErrorCode::Ok
 }
 //#endregion reduce-typed-state.probe-upsert
@@ -2790,28 +2805,30 @@ fn fold_counts_row(
         ),
     };
     const MAX_RANGES: usize = 2 + MAX_COUNTS_HISTOGRAMS + MAX_COUNTS_MASKS;
-    let mut ranges = [(0, 0); MAX_RANGES];
     let meta = slot_meta_base(op.slot);
-    let range_count = match plan.target() {
-        CountsFoldTarget::Insert => {
-            ranges[0] = (
-                meta + SlotMetaOffset::SIZE,
-                if upsert.is_new { 4 } else { 0 },
-            );
-            ranges[1] = (
-                map.keys_off + upsert.pos * 4,
-                if upsert.is_new { 4 } else { 0 },
-            );
-            ranges[2] = (row, map.row_size);
-            ranges[3] = (arena.header + 4, 4);
-            ranges[4] = (frame_offset, frame_len);
-            5
-        }
-        CountsFoldTarget::Stored => op.journal_ranges(&plan, frame_offset, &mut ranges),
-    };
-    ranges[range_count] = (meta + SlotMetaOffset::CHANGE_FLAGS, 1);
-    let ranges = &ranges[..range_count + 1];
-    let capture = match undo.begin_capture(state, ranges) {
+    let capture = match undo.begin_capture(state, || {
+        // Entries past the change flag stay empty; an empty range plans nothing.
+        let mut ranges = [(0, 0); MAX_RANGES];
+        let range_count = match plan.target() {
+            CountsFoldTarget::Insert => {
+                ranges[0] = (
+                    meta + SlotMetaOffset::SIZE,
+                    if upsert.is_new { 4 } else { 0 },
+                );
+                ranges[1] = (
+                    map.keys_off + upsert.pos * 4,
+                    if upsert.is_new { 4 } else { 0 },
+                );
+                ranges[2] = (row, map.row_size);
+                ranges[3] = (arena.header + 4, 4);
+                ranges[4] = (frame_offset, frame_len);
+                5
+            }
+            CountsFoldTarget::Stored => op.journal_ranges(&plan, frame_offset, &mut ranges),
+        };
+        ranges[range_count] = (meta + SlotMetaOffset::CHANGE_FLAGS, 1);
+        ranges
+    }) {
         Ok(capture) => capture,
         Err(error) => return error as u32,
     };
@@ -2835,7 +2852,7 @@ fn fold_counts_row(
     } else {
         ChangeFlag::UPDATED
     };
-    undo.finish_capture(delta_mode, state, ranges, capture);
+    undo.finish_capture(delta_mode, state, capture);
     OK
 }
 
@@ -2861,17 +2878,19 @@ fn exec_agg_f64(
     let new_val = aggregates::reduce_col_f64(kind, vals, old_val, type_mask, pred_col);
     #[allow(clippy::float_cmp)]
     if new_val != old_val {
-        let ranges = [
-            (meta.offset, 8),
-            (meta.meta_base + SlotMetaOffset::CHANGE_FLAGS, 1),
-        ];
-        let capture = match undo.begin_capture(state, &ranges) {
+        let ranges = || {
+            [
+                (meta.offset, 8),
+                (meta.meta_base + SlotMetaOffset::CHANGE_FLAGS, 1),
+            ]
+        };
+        let capture = match undo.begin_capture(state, ranges) {
             Ok(capture) => capture,
             Err(error) => return error,
         };
         bytes::write_f64(state, meta.offset, new_val);
         meta.set_change_flag(state, ChangeFlag::SIZE_CHANGED);
-        undo.finish_capture(delta_mode, state, &ranges, capture);
+        undo.finish_capture(delta_mode, state, capture);
     }
     ErrorCode::Ok
 }
@@ -2892,17 +2911,19 @@ fn exec_agg_i64(
     let old_val = bytes::read_i64(state, meta.offset);
     let new_val = aggregates::reduce_col_i64(kind, vals, old_val, type_mask, pred_col);
     if new_val != old_val {
-        let ranges = [
-            (meta.offset, 8),
-            (meta.meta_base + SlotMetaOffset::CHANGE_FLAGS, 1),
-        ];
-        let capture = match undo.begin_capture(state, &ranges) {
+        let ranges = || {
+            [
+                (meta.offset, 8),
+                (meta.meta_base + SlotMetaOffset::CHANGE_FLAGS, 1),
+            ]
+        };
+        let capture = match undo.begin_capture(state, ranges) {
             Ok(capture) => capture,
             Err(error) => return error,
         };
         bytes::write_i64(state, meta.offset, new_val);
         meta.set_change_flag(state, ChangeFlag::SIZE_CHANGED);
-        undo.finish_capture(delta_mode, state, &ranges, capture);
+        undo.finish_capture(delta_mode, state, capture);
     }
     ErrorCode::Ok
 }
@@ -2923,17 +2944,19 @@ fn exec_agg_count(
     let Some(next) = previous.checked_add(matched) else {
         return ErrorCode::CountOverflow;
     };
-    let ranges = [
-        (meta.offset, 8),
-        (meta.meta_base + SlotMetaOffset::CHANGE_FLAGS, 1),
-    ];
-    let capture = match undo.begin_capture(state, &ranges) {
+    let ranges = || {
+        [
+            (meta.offset, 8),
+            (meta.meta_base + SlotMetaOffset::CHANGE_FLAGS, 1),
+        ]
+    };
+    let capture = match undo.begin_capture(state, ranges) {
         Ok(capture) => capture,
         Err(error) => return error,
     };
     bytes::write_u64(state, meta.offset, next);
     meta.set_change_flag(state, ChangeFlag::SIZE_CHANGED);
-    undo.finish_capture(delta_mode, state, &ranges, capture);
+    undo.finish_capture(delta_mode, state, capture);
     ErrorCode::Ok
 }
 
@@ -3021,12 +3044,14 @@ fn exec_scalar_latest(
         return ErrorCode::Ok;
     };
     let width = if kind == AggType::ScalarU32 { 4 } else { 8 };
-    let ranges = [
-        (data, width),
-        (data + 8, 8),
-        (meta.meta_base + SlotMetaOffset::CHANGE_FLAGS, 1),
-    ];
-    let capture = match undo.begin_capture(state, &ranges) {
+    let ranges = || {
+        [
+            (data, width),
+            (data + 8, 8),
+            (meta.meta_base + SlotMetaOffset::CHANGE_FLAGS, 1),
+        ]
+    };
+    let capture = match undo.begin_capture(state, ranges) {
         Ok(capture) => capture,
         Err(error) => return error,
     };
@@ -3034,7 +3059,7 @@ fn exec_scalar_latest(
     state[data as usize..(data + width) as usize].copy_from_slice(&encoded[..width as usize]);
     bytes::write_f64(state, data + 8, latest);
     meta.set_change_flag(state, ChangeFlag::UPDATED);
-    undo.finish_capture(delta_mode, state, &ranges, capture);
+    undo.finish_capture(delta_mode, state, capture);
     ErrorCode::Ok
 }
 
@@ -5399,9 +5424,10 @@ impl Vm {
                         let v = cell_u32(cols, v_col, child_idx);
                         let guard_frame = match target.filter(|_| stamp_needed) {
                             Some(up) => {
-                                let ranges = row_capture_ranges(&guarded, guard_slot, up);
-                                match self.undo.begin_capture(state, &ranges) {
-                                    Ok(capture) => Some((up, ranges, capture)),
+                                match self.undo.begin_capture(state, || {
+                                    row_capture_ranges(&guarded, guard_slot, up)
+                                }) {
+                                    Ok(capture) => Some((up, capture)),
                                     Err(error) => return error as u32,
                                 }
                             }
@@ -5419,7 +5445,7 @@ impl Vm {
                             )
                         };
                         let mut guard_result = ErrorCode::Ok;
-                        if let Some((up, ranges, capture)) = guard_frame {
+                        if let Some((up, capture)) = guard_frame {
                             if set_result == ErrorCode::Ok {
                                 apply_planned_row(&guarded, state, key, up);
                                 guard_result =
@@ -5434,8 +5460,7 @@ impl Vm {
                             }
                             // Finished even when the set refused: nothing of the guard
                             // changed, so the frame journals nothing.
-                            self.undo
-                                .finish_capture(delta_mode, state, &ranges, capture);
+                            self.undo.finish_capture(delta_mode, state, capture);
                         }
                         if set_result != ErrorCode::Ok {
                             return signal_growth(dest_slot, set_result);
@@ -5493,12 +5518,14 @@ impl Vm {
                     else {
                         return INVALID_STATE;
                     };
-                    let payload_ranges = [
-                        (write_off, elem_size),
-                        (meta_base + SlotMetaOffset::SIZE, 4),
-                        (meta_base + SlotMetaOffset::CHANGE_FLAGS, 1),
-                    ];
-                    let capture = match self.undo.begin_capture(state, &payload_ranges) {
+                    let payload_ranges = || {
+                        [
+                            (write_off, elem_size),
+                            (meta_base + SlotMetaOffset::SIZE, 4),
+                            (meta_base + SlotMetaOffset::CHANGE_FLAGS, 1),
+                        ]
+                    };
+                    let capture = match self.undo.begin_capture(state, payload_ranges) {
                         Ok(capture) => capture,
                         Err(error) => return error as u32,
                     };
@@ -5515,8 +5542,7 @@ impl Vm {
                     bytes::write_u32(state, meta_base + SlotMetaOffset::SIZE, count);
                     state[(meta_base + SlotMetaOffset::CHANGE_FLAGS) as usize] |=
                         ChangeFlag::INSERTED;
-                    self.undo
-                        .finish_capture(delta_mode, state, &payload_ranges, capture);
+                    self.undo.finish_capture(delta_mode, state, capture);
                 }
 
                 // LIST_APPEND_STRUCT (0x85)
@@ -5572,12 +5598,14 @@ impl Vm {
                     else {
                         return INVALID_STATE;
                     };
-                    let payload_ranges = [
-                        (row_off, row_size),
-                        (meta_base + SlotMetaOffset::SIZE, 4),
-                        (meta_base + SlotMetaOffset::CHANGE_FLAGS, 1),
-                    ];
-                    let capture = match self.undo.begin_capture(state, &payload_ranges) {
+                    let payload_ranges = || {
+                        [
+                            (row_off, row_size),
+                            (meta_base + SlotMetaOffset::SIZE, 4),
+                            (meta_base + SlotMetaOffset::CHANGE_FLAGS, 1),
+                        ]
+                    };
+                    let capture = match self.undo.begin_capture(state, payload_ranges) {
                         Ok(capture) => capture,
                         Err(error) => return error as u32,
                     };
@@ -5635,8 +5663,7 @@ impl Vm {
                     bytes::write_u32(state, meta_base + SlotMetaOffset::SIZE, count);
                     state[(meta_base + SlotMetaOffset::CHANGE_FLAGS) as usize] |=
                         ChangeFlag::INSERTED;
-                    self.undo
-                        .finish_capture(delta_mode, state, &payload_ranges, capture);
+                    self.undo.finish_capture(delta_mode, state, capture);
                 }
 
                 // FLAT_MAP (0xE1)
@@ -5690,12 +5717,12 @@ impl Vm {
                         Ok(plan) => plan,
                         Err(error) => return signal_growth(slot, error),
                     };
-                    let capture = match self.undo.begin_capture(plan.state(), plan.ranges()) {
+                    let capture = match self.undo.begin_capture(plan.state(), || plan.ranges()) {
                         Ok(capture) => capture,
                         Err(error) => return error as u32,
                     };
-                    let (state, ranges) = plan.apply();
-                    self.undo.finish_capture(delta_mode, state, ranges, capture);
+                    let (state, _) = plan.apply();
+                    self.undo.finish_capture(delta_mode, state, capture);
                 }
 
                 // NESTED_MAP_UPSERT_LAST (0x92)
@@ -5719,12 +5746,12 @@ impl Vm {
                         Ok(plan) => plan,
                         Err(error) => return signal_growth(slot, error),
                     };
-                    let capture = match self.undo.begin_capture(plan.state(), plan.ranges()) {
+                    let capture = match self.undo.begin_capture(plan.state(), || plan.ranges()) {
                         Ok(capture) => capture,
                         Err(error) => return error as u32,
                     };
-                    let (state, ranges) = plan.apply();
-                    self.undo.finish_capture(delta_mode, state, ranges, capture);
+                    let (state, _) = plan.apply();
+                    self.undo.finish_capture(delta_mode, state, capture);
                 }
 
                 // NESTED_AGG_UPDATE (0x95)
@@ -5746,12 +5773,12 @@ impl Vm {
                         Ok(plan) => plan,
                         Err(error) => return signal_growth(slot, error),
                     };
-                    let capture = match self.undo.begin_capture(plan.state(), plan.ranges()) {
+                    let capture = match self.undo.begin_capture(plan.state(), || plan.ranges()) {
                         Ok(capture) => capture,
                         Err(error) => return error as u32,
                     };
-                    let (state, ranges) = plan.apply();
-                    self.undo.finish_capture(delta_mode, state, ranges, capture);
+                    let (state, _) = plan.apply();
+                    self.undo.finish_capture(delta_mode, state, capture);
                 }
 
                 _ => return INVALID_PROGRAM,
@@ -6479,22 +6506,29 @@ mod tests {
         state
     }
 
-    /// A journal that is not recording does no capture work: ranges a
-    /// recording window would refuse (past the image, overlapping) open no
-    /// frame and are not even checked, so an unjournaled batch pays nothing
-    /// per capture. An external writer's ranges are still checked.
+    /// A journal that is not recording does no capture work: its range plan
+    /// is never built, and ranges a recording window would refuse (past the
+    /// image, overlapping) open no frame and are not even checked, so an
+    /// unjournaled batch pays one branch per capture. An external writer's
+    /// ranges are still checked.
     #[test]
     fn an_unrecorded_capture_does_no_work() {
         let mut state = count_state();
         let len = u32::try_from(state.len()).unwrap();
         let unchecked = [(0, 8), (4, 8), (len, 1)];
+        let planned = core::cell::Cell::new(0u32);
+        let plan = || {
+            planned.set(planned.get() + 1);
+            unchecked
+        };
         let mut vm = Vm::default();
         let capture = vm
             .undo
-            .begin_capture(&state, &unchecked)
+            .begin_capture(&state, plan)
             .expect("no work, no refusal");
         assert!(capture.frame.is_none());
-        vm.undo.finish_capture(false, &state, &unchecked, capture);
+        assert_eq!(planned.get(), 0, "an unrecorded capture builds no plan");
+        vm.undo.finish_capture(false, &state, capture);
         assert_eq!(
             vm.capture_mutation(false, &mut state, &unchecked, |_| ()),
             Err(ErrorCode::InvalidState),
@@ -6503,10 +6537,11 @@ mod tests {
 
         vm.undo_enable(&state).expect("window opens");
         assert_eq!(
-            vm.undo.begin_capture(&state, &unchecked).err(),
+            vm.undo.begin_capture(&state, plan).err(),
             Some(ErrorCode::InvalidState),
             "a recording window checks every range"
         );
+        assert_eq!(planned.get(), 1, "a recording window builds its plan once");
     }
 
     /// Generations are unique across journals: a frame begun in one VM's
@@ -6523,11 +6558,14 @@ mod tests {
         let ranges = [(0, 4)];
         let capture = a
             .undo
-            .begin_capture(&state, &ranges)
+            .begin_capture(&state, || &ranges)
             .expect("capture begins");
         // B's own open frame gives it the depth A's frame carries, so only the
         // generation tells the two windows apart.
-        let _open_in_b = b.undo.begin_capture(&state, &[]).expect("b opens a frame");
-        b.undo.finish_capture(false, &state, &ranges, capture);
+        let _open_in_b = b
+            .undo
+            .begin_capture(&state, || &[])
+            .expect("b opens a frame");
+        b.undo.finish_capture(false, &state, capture);
     }
 }

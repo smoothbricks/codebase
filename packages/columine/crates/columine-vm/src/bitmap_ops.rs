@@ -531,7 +531,7 @@ fn capture_bitmap_patch(
     if let Some(plan) = &ttl_plan {
         env.capture_ranges.extend_from_slice(plan.ranges());
     }
-    let capture = hooks.begin_capture(prepared.state(), &env.capture_ranges)?;
+    let capture = hooks.begin_capture(prepared.state(), || &env.capture_ranges)?;
     let (report, _) = prepared.apply_with_cleared_tail();
     Ok((report, capture, ttl_plan))
 }
@@ -551,7 +551,7 @@ fn finish_bitmap_mutations(
         hooks.consume_ttl_batch_plan(state, meta, plan);
     }
     env.ttl_mutations.clear();
-    hooks.finish_capture(delta_mode, state, &env.capture_ranges, capture);
+    hooks.finish_capture(delta_mode, state, capture);
 }
 
 /// Select the element at `rank` in ascending order.

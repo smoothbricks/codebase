@@ -99,20 +99,16 @@ pub trait VmHooks {
     fn restore_erase_scratch(&mut self, scratch: EraseScratch);
 
     /// Validate and reserve every possible physical record before mutation.
-    fn begin_capture(
+    /// `plan` yields the ranges the write may change; a journal that is not
+    /// recording never calls it, so unjournaled writes build no plan.
+    fn begin_capture<P: AsRef<[(u32, u32)]>>(
         &mut self,
         state: &[u8],
-        ranges: &[(u32, u32)],
+        plan: impl FnOnce() -> P,
     ) -> Result<ByteCapture, ErrorCode>;
 
     /// Consume the matching authority and journal the actual changed bytes.
-    fn finish_capture(
-        &mut self,
-        delta_mode: bool,
-        state: &[u8],
-        ranges: &[(u32, u32)],
-        capture: ByteCapture,
-    );
+    fn finish_capture(&mut self, delta_mode: bool, state: &[u8], capture: ByteCapture);
 
     /// Retain one or many TTL mutations under the same physical authority.
     /// Single-key families supply `iter::once`; no second planner exists.
@@ -152,12 +148,12 @@ impl VmHooks for NoVm {
         self.erase_scratch = scratch;
     }
 
-    fn begin_capture(
+    fn begin_capture<P: AsRef<[(u32, u32)]>>(
         &mut self,
         state: &[u8],
-        ranges: &[(u32, u32)],
+        plan: impl FnOnce() -> P,
     ) -> Result<ByteCapture, ErrorCode> {
-        for &(offset, len) in ranges {
+        for &(offset, len) in plan().as_ref() {
             let end = offset.checked_add(len).ok_or(ErrorCode::InvalidState)?;
             if end as usize > state.len() {
                 return Err(ErrorCode::InvalidState);
@@ -166,13 +162,7 @@ impl VmHooks for NoVm {
         Ok(ByteCapture { frame: None })
     }
 
-    fn finish_capture(
-        &mut self,
-        _delta_mode: bool,
-        _state: &[u8],
-        _ranges: &[(u32, u32)],
-        capture: ByteCapture,
-    ) {
+    fn finish_capture(&mut self, _delta_mode: bool, _state: &[u8], capture: ByteCapture) {
         assert!(capture.frame.is_none(), "enabled capture passed to NoVm");
     }
 

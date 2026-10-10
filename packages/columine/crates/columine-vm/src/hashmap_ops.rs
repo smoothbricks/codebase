@@ -198,24 +198,25 @@ pub fn batch_map_upsert(
         } else {
             None
         };
-        let ttl = ttl_plan.as_ref().map_or(&[(0, 0); 2], |plan| plan.ranges());
-        let ranges = [
-            (
-                tbl.keys_off + probe.pos * 4,
-                if probe.found { 0 } else { 4 },
-            ),
-            (tbl.entries_off + probe.pos * 4, 4),
-            if stores_aux {
-                (cmp_lane_off(meta) + probe.pos * 8, 8)
-            } else {
-                (0, 0)
-            },
-            (tbl.size_off, if probe.found { 0 } else { 4 }),
-            (meta.meta_base + SlotMetaOffset::CHANGE_FLAGS, 1),
-            ttl[0],
-            ttl[1],
-        ];
-        let capture = match hooks.begin_capture(state, &ranges) {
+        let capture = match hooks.begin_capture(state, || {
+            let ttl = ttl_plan.as_ref().map_or(&[(0, 0); 2], |plan| plan.ranges());
+            [
+                (
+                    tbl.keys_off + probe.pos * 4,
+                    if probe.found { 0 } else { 4 },
+                ),
+                (tbl.entries_off + probe.pos * 4, 4),
+                if stores_aux {
+                    (cmp_lane_off(meta) + probe.pos * 8, 8)
+                } else {
+                    (0, 0)
+                },
+                (tbl.size_off, if probe.found { 0 } else { 4 }),
+                (meta.meta_base + SlotMetaOffset::CHANGE_FLAGS, 1),
+                ttl[0],
+                ttl[1],
+            ]
+        }) {
             Ok(capture) => capture,
             Err(error) => return error,
         };
@@ -239,7 +240,7 @@ pub fn batch_map_upsert(
         if let Some(plan) = ttl_plan {
             hooks.consume_ttl_batch_plan(state, meta, plan);
         }
-        hooks.finish_capture(delta_mode, state, &ranges, capture);
+        hooks.finish_capture(delta_mode, state, capture);
     }
     ErrorCode::Ok
 }
@@ -302,16 +303,7 @@ pub fn batch_map_remove(
                 continue;
             };
 
-            ranges.clear();
             let erase = tbl.plan_erase_at(state, pos);
-            tbl.erase_ranges(&erase, ranges);
-            if has_ts {
-                erase.for_each_destination_run(|start, len| {
-                    ranges.push((cmp_lane_off(meta) + start * 8, len * 8));
-                });
-            }
-            ranges.push((tbl.size_off, 4));
-            ranges.push((meta.meta_base + SlotMetaOffset::CHANGE_FLAGS, 1));
             let ttl_plan = if meta.has_ttl() {
                 match hooks.plan_ttl_batch(
                     state,
@@ -324,12 +316,26 @@ pub fn batch_map_remove(
             } else {
                 None
             };
-            if let Some(plan) = &ttl_plan {
-                for &range in plan.ranges() {
-                    ranges.push(range);
+            let capture = match hooks.begin_capture(state, || {
+                // The plan buffer is reborrowed into the closure; the erase
+                // and TTL plans stay borrowed for the write that follows.
+                let plan_ranges = &mut *ranges;
+                plan_ranges.clear();
+                tbl.erase_ranges(&erase, plan_ranges);
+                if has_ts {
+                    erase.for_each_destination_run(|start, len| {
+                        plan_ranges.push((cmp_lane_off(meta) + start * 8, len * 8));
+                    });
                 }
-            }
-            let capture = match hooks.begin_capture(state, ranges.as_slice()) {
+                plan_ranges.push((tbl.size_off, 4));
+                plan_ranges.push((meta.meta_base + SlotMetaOffset::CHANGE_FLAGS, 1));
+                if let Some(plan) = &ttl_plan {
+                    for &range in plan.ranges() {
+                        plan_ranges.push(range);
+                    }
+                }
+                plan_ranges.as_slice()
+            }) {
                 Ok(capture) => capture,
                 Err(error) => return error,
             };
@@ -340,7 +346,7 @@ pub fn batch_map_remove(
             if let Some(plan) = ttl_plan {
                 hooks.consume_ttl_batch_plan(state, meta, plan);
             }
-            hooks.finish_capture(delta_mode, state, ranges.as_slice(), capture);
+            hooks.finish_capture(delta_mode, state, capture);
         }
         ErrorCode::Ok
     })();
