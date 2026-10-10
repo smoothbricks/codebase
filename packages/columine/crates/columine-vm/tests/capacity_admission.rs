@@ -568,6 +568,34 @@ fn a_corrupt_host_state_is_refused_at_entry_in_both_modes() {
             assert_eq!(wide, state, "neither slot is written");
         }
     }
+
+    // Ownership follows offsets, not slot order. Two equal sets whose
+    // regions trade places are still a valid image; a set that starts
+    // inside the one before it is not, though its offsets still ascend.
+    let prog = program(
+        2,
+        1,
+        &[
+            vec![Opcode::SlotDef as u8, 0, SlotType::HashSet as u8, 16, 0],
+            vec![Opcode::SlotDef as u8, 1, SlotType::HashSet as u8, 16, 0],
+        ]
+        .concat(),
+        &[Opcode::Halt as u8],
+    );
+    let whole = init(&prog);
+    let offset_at = |slot| SlotMetaView::read(&whole, slot).meta_base + SlotMetaOffset::OFFSET;
+    let (first, second) = (
+        SlotMetaView::read(&whole, 0).offset,
+        SlotMetaView::read(&whole, 1).offset,
+    );
+    assert!(first < second, "init lays slots out in index order");
+    let mut traded = whole.clone();
+    columine_vm::bytes::write_u32(&mut traded, offset_at(0), second);
+    columine_vm::bytes::write_u32(&mut traded, offset_at(1), first);
+    assert_eq!(Ok(()), validate_state(&traded));
+    let mut inside = whole.clone();
+    columine_vm::bytes::write_u32(&mut inside, offset_at(1), first + 8);
+    assert_eq!(Err(ErrorCode::InvalidState), validate_state(&inside));
 }
 
 // ---------------------------------------------------------------------------

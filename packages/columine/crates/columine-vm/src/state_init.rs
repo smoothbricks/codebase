@@ -1324,7 +1324,7 @@ fn grown_capacity(capacity: u32) -> Result<u32, ErrorCode> {
 
 /// Physical ownership follows offsets, not metadata slot-index order.
 fn slot_limit(state: &[u8], slot: u32, slots: u32, metadata_end: u32) -> Result<u32, ErrorCode> {
-    let offset = bytes::read_u32(state, STATE_HEADER_SIZE + slot * SLOT_META_SIZE);
+    let offset = slot_offset(state, slot);
     let mut limit = u32::try_from(state.len()).map_err(|_| ErrorCode::InvalidState)?;
     if offset < metadata_end || offset > limit || !offset.is_multiple_of(8) {
         return Err(ErrorCode::InvalidState);
@@ -1333,7 +1333,7 @@ fn slot_limit(state: &[u8], slot: u32, slots: u32, metadata_end: u32) -> Result<
         if other == slot {
             continue;
         }
-        let other_offset = bytes::read_u32(state, STATE_HEADER_SIZE + other * SLOT_META_SIZE);
+        let other_offset = slot_offset(state, other);
         if other_offset < metadata_end
             || other_offset > state.len() as u32
             || !other_offset.is_multiple_of(8)
@@ -1415,11 +1415,48 @@ enum OuterPointers {
 
 fn validate_slots(state: &[u8], outer: OuterPointers) -> Result<(), ErrorCode> {
     let (slots, metadata_end) = state_geometry(state)?;
+    let len = u32::try_from(state.len()).map_err(|_| ErrorCode::InvalidState)?;
+    if offsets_ascend(state, slots, metadata_end, len) {
+        // Every offset is in range, aligned and distinct, and the next
+        // higher one is the next slot's: the bounds `slot_limit` would find.
+        for slot in 0..slots {
+            let limit = if slot + 1 < slots {
+                slot_offset(state, slot + 1)
+            } else {
+                len
+            };
+            validate_slot_geometry(state, slot, limit, outer)?;
+        }
+        return Ok(());
+    }
     for slot in 0..slots {
         let limit = slot_limit(state, slot, slots, metadata_end)?;
         validate_slot_geometry(state, slot, limit, outer)?;
     }
     Ok(())
+}
+
+fn slot_offset(state: &[u8], slot: u32) -> u32 {
+    bytes::read_u32(state, STATE_HEADER_SIZE + slot * SLOT_META_SIZE)
+}
+
+/// Whether slot offsets rise strictly with the slot index from
+/// `metadata_end`, each 8-aligned and within `len`: the layout `init_state`
+/// and `grow_state` write. One pass decides it; any other order is checked
+/// by [`slot_limit`]'s search over every pair.
+fn offsets_ascend(state: &[u8], slots: u32, metadata_end: u32, len: u32) -> bool {
+    let mut floor = metadata_end;
+    for slot in 0..slots {
+        let offset = slot_offset(state, slot);
+        if offset < floor || offset > len || !offset.is_multiple_of(8) {
+            return false;
+        }
+        floor = match offset.checked_add(1) {
+            Some(next) => next,
+            None => return false,
+        };
+    }
+    true
 }
 
 /// Checked single-key struct geometry, cached by the caller before probing.
