@@ -32,3 +32,9 @@ remain separate process tests; generator tests never require registry authentica
 
 The macOS release build and unit-test jobs still use the existing devenv environment. Moving generation into Nx does not
 remove release validation or introduce another build environment.
+
+The managed `tooling/direnv/devenv.smoo.nix` includes `jactionlint` in its package list and supplies it through an
+overlay, pinned to the immutable upstream v2.0.2 release with per-archive SHA-256 hashes for macOS and Linux on x86_64
+and arm64. The existing managed-file checks detect a missing or stale module, and `smoo monorepo update` provisions that
+same module. Nix installs the prebuilt executable with the shell; no validation-time download or Go compilation occurs.
+CI puts the same devenv profile bin on PATH, so CI uses the same pin.
