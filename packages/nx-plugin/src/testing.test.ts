@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fixtureNxEnv, nxFixtureRoot, withNxFixture } from './__tests__/fixture-nx-env.js';
 import {
+  awaitExit,
   fixtureSocketDirectory,
   isRunning,
   NX_LONGEST_SOCKET_NAME,
@@ -18,6 +19,7 @@ import {
   publishFixtureSocketDirectory,
   retireFixtureSocketDirectory,
   socketNamespace,
+  stopNxDaemon,
   terminate,
   withDescendants,
 } from './testing.js';
@@ -96,6 +98,69 @@ it('stops the Nx daemon of a fixture whose body throws, and deletes its socket a
   expect(await pidsWorkingIn(root)).toEqual([]);
   expect(existsSync(root)).toBe(false);
   expect(lstatSync(alias, { throwIfNoEntry: false })).toBeUndefined();
+}, 120_000);
+
+it('ends a process its Nx daemon started as it exited, once the daemon is gone', async () => {
+  let root = '';
+  await withNxFixture('daemon-orphan-', async (fixture) => {
+    root = fixture.root;
+    const { workspace } = fixture;
+    const pidFile = join(workspace, 'orphan.pid');
+    const workerFile = join(workspace, 'worker.pid');
+    // A stand-in daemon: `sleep 3600` is a worker it started, and it waits on that worker. On SIGTERM it starts
+    // `sleep 60` as its last act and exits, so that child outlives the daemon, reparented to init.
+    const daemon = Bun.spawn(
+      [
+        'sh',
+        '-c',
+        `trap 'sleep 60 & echo $! > "$1"; exit 0' TERM; sleep 3600 & echo $! > "$2"; echo ready; wait`,
+        'sh',
+        pidFile,
+        workerFile,
+      ],
+      { cwd: workspace, stdout: 'pipe', stderr: 'ignore' },
+    );
+    try {
+      const reader = daemon.stdout.getReader();
+      const decoder = new TextDecoder();
+      let output = '';
+      while (!output.includes('ready\n')) {
+        const next = await reader.read();
+        if (next.done) {
+          throw new Error(`stand-in daemon exited before it was ready: ${output}`);
+        }
+        output += decoder.decode(next.value);
+      }
+      reader.releaseLock();
+      const record = join(workspace, '.nx', 'workspace-data', 'd', 'server-process.json');
+      await mkdir(dirname(record), { recursive: true });
+      await writeFile(record, JSON.stringify({ processId: daemon.pid }));
+      await stopNxDaemon(workspace, async () => {
+        terminate(daemon.pid);
+        await daemon.exited;
+      });
+      const orphan = Number(await readFile(pidFile, 'utf8'));
+      expect(orphan).toBeGreaterThan(0);
+      expect(await pidsWorkingIn(workspace)).toEqual([]);
+      // A zombie has exited already; a signal probe would still count it as running.
+      expect((await processTable()).filter((entry) => entry.pid === orphan && !entry.stat.startsWith('Z'))).toEqual([]);
+    } finally {
+      // Assert before retiring this probe, so a leaked orphan fails even though
+      // every exit path still releases the real processes the test started.
+      terminate(daemon.pid);
+      await daemon.exited;
+      const owned = [];
+      for (const file of [workerFile, pidFile]) {
+        const pid = existsSync(file) ? Number(await readFile(file, 'utf8')) : 0;
+        if (pid > 0) {
+          owned.push(pid);
+          terminate(pid);
+        }
+      }
+      await awaitExit(withDescendants(await processTable(), owned), `orphan probe of ${workspace}`);
+    }
+  });
+  expect(await pidsWorkingIn(root)).toEqual([]);
 }, 120_000);
 
 it('binds and connects through its short alias without granting the long fixture root a socket namespace', async () => {

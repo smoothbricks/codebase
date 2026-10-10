@@ -1,6 +1,17 @@
 import { describe, expect, it } from 'bun:test';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmdirSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { userInfo } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -65,9 +76,32 @@ function expectSandboxed(error: RamTempError): void {
   }
 }
 
+/** A readonly tree, two directories deep, with a file at each level. */
+function readonlyTree(directory: string): void {
+  const tree = join(directory, 'tree');
+  const inner = join(tree, 'inner');
+  mkdirSync(inner, { recursive: true });
+  writeFileSync(join(tree, 'file'), 'in a readonly directory');
+  writeFileSync(join(inner, 'deep'), 'in a nested readonly directory');
+  chmodSync(inner, 0o500);
+  chmodSync(tree, 0o555);
+}
+
+/** The directory a lease's link points at: it must keep its mode and contents, never be followed. */
+function expectUntouched(outside: string): void {
+  expect(statSync(outside).mode & 0o777).toBe(0o555);
+  expect(readFileSync(join(outside, 'keep'), 'utf8')).toBe('outside the lease');
+}
+
 describe('RAM temp volume on this host', () => {
   it('reclaims what a dead creator left, shares the volume between leases, and detaches it at the last release, never mounting beside it as "<name> 1"', async () => {
     const { parent, paths, capacity } = scratchVolume(1);
+    // A readonly directory outside every lease. Each lease links to it: removal must unlink the
+    // link and never follow it, leaving this directory's mode and contents as they were.
+    const outside = join(parent, 'outside');
+    mkdirSync(outside);
+    writeFileSync(join(outside, 'keep'), 'outside the lease');
+    chmodSync(outside, 0o555);
     // The host's own commands, with one injectable image in the I/O Registry listing.
     const host = createHostCommands();
     const attachedBelow: { image: string | null } = { image: null };
@@ -148,14 +182,19 @@ describe('RAM temp volume on this host', () => {
         throw new Error(`second lease failed: ${JSON.stringify(b)}`);
       }
       const leaseB = b.value.lease;
+      readonlyTree(leaseB.directory);
+      symlinkSync(outside, join(leaseB.directory, 'outside-link'));
       expect(leaseA.mountpoint).toBe(paths.mountpoint);
       expect(leaseB.mountpoint).toBe(paths.mountpoint);
       expect(leaseA.directory).not.toBe(leaseB.directory);
       expect(statSync(leaseA.directory).dev).not.toBe(statSync(parent).dev);
       writeFileSync(join(leaseA.directory, 'scratch'), 'on RAM');
+      readonlyTree(leaseA.directory);
+      symlinkSync(outside, join(leaseA.directory, 'outside-link'));
 
       expect(await first.release(leaseA)).toEqual({ ok: true, value: undefined });
       expect(existsSync(leaseA.directory)).toBe(false);
+      expectUntouched(outside);
       expect(statSync(leaseB.directory).dev).not.toBe(statSync(parent).dev);
 
       // The second task dies without releasing, with an image still attached from its lease: the
@@ -173,9 +212,15 @@ describe('RAM temp volume on this host', () => {
         `${leaseB.directory} is kept: ${image} (/dev/disk999) still attached from below it; detach through its owner`,
       ]);
       expect(existsSync(leaseB.directory)).toBe(true);
+      // Held from below: the lease stays whole, its readonly tree and the link with it.
+      expect(statSync(join(leaseB.directory, 'tree')).mode & 0o777).toBe(0o555);
+      expect(statSync(join(leaseB.directory, 'tree', 'inner')).mode & 0o777).toBe(0o500);
+      expect(existsSync(join(leaseB.directory, 'tree', 'inner', 'deep'))).toBe(true);
+      expectUntouched(outside);
       expect(await third.release(c.value.lease)).toEqual({ ok: true, value: undefined });
       expect(existsSync(c.value.lease.directory)).toBe(false);
       expect(statSync(leaseB.directory).dev).not.toBe(statSync(parent).dev);
+      expect(statSync(join(leaseB.directory, 'tree')).mode & 0o777).toBe(0o555);
 
       // Once its owner has detached the image, the next task reclaims the lease, and its release,
       // the last, detaches the volume.
@@ -187,10 +232,13 @@ describe('RAM temp volume on this host', () => {
       }
       expect(d.value.held).toEqual([]);
       expect(existsSync(leaseB.directory)).toBe(false);
+      expectUntouched(outside);
       expect(await fourth.release(d.value.lease)).toEqual({ ok: true, value: undefined });
       expect(existsSync(paths.mountpoint)).toBe(false);
       expect(attachedDisks(paths, capacity)).toEqual([]);
     } finally {
+      // Restore the owner write the outside directory was given, so the parent can be removed.
+      chmodSync(outside, 0o755);
       detachAll(paths, capacity);
       rmSync(parent, { recursive: true, force: true });
     }

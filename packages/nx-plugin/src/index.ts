@@ -601,11 +601,11 @@ function cargoWasmTargetDirectory(
 ): string {
   const cwd = repoRooted ? '.' : projectRoot;
   const crateDir = posix.join(cwd, posix.dirname(config.manifestPath));
-  const owner =
-    cargoWorkspace !== undefined &&
-    cargoWorkspace.packages.some((plan) => posix.join(cargoWorkspace.projectRoot, plan.package.dir) === crateDir)
-      ? cargoWorkspace.projectRoot
-      : crateDir;
+  const owner = cargoWorkspace?.packages.some(
+    (plan) => posix.join(cargoWorkspace.projectRoot, plan.package.dir) === crateDir,
+  )
+    ? cargoWorkspace.projectRoot
+    : crateDir;
   return posix.relative(cwd, posix.join(owner, 'target'));
 }
 
@@ -2544,9 +2544,9 @@ async function resolveCargoWorkspaces(
  * happened to fall.
  *
  * The two filtersets are exact complements, so their union is the crate whatever
- * either one matches. Every piece uses `--no-tests=pass`: a valid workspace
- * member may expose no nextest tests, a small suite can leave a declared hash
- * shard empty, and platform-specific exceptions may not exist on this host.
+ * either one matches. Every piece uses `--no-fail-fast`, so one failing test does not stop the rest of its
+ * piece, and `--no-tests=pass`: a valid workspace member may expose no nextest tests, a small suite can
+ * leave a declared hash shard empty, and platform-specific exceptions may not exist on this host.
  * Manifest discovery proves the package exists and generates the selector from
  * its Cargo name, so accepting an empty run cannot hide a misspelled package.
  *
@@ -2667,7 +2667,7 @@ function cargoTestRunnerTarget(
     inputs,
     dependsOn: [archive],
     options: {
-      command: nextestRunnerCommand(workspace, 'run', piece.selector, `${piece.extra} --no-tests=pass`),
+      command: nextestRunnerCommand(workspace, 'run', piece.selector, `${piece.extra} --no-fail-fast --no-tests=pass`),
       cwd: workspace.projectRoot,
       timeoutMs: BOUNDED_TEST_TIMEOUT_MS,
       killAfterMs: BOUNDED_TEST_KILL_AFTER_MS,
@@ -2677,8 +2677,9 @@ function cargoTestRunnerTarget(
 
 /**
  * A serial group's runner. Its count stage lists the group's selection and sizes the bound from
- * it; its run stage is the same nextest run every piece uses, with no partition and no thread flag:
- * the group is serial because its test-group declares `max-threads = 1`.
+ * it; its run stage is a nextest run of that selection with no partition and no thread flag: the
+ * group is serial because its test-group declares `max-threads = 1`. It runs `--no-fail-fast`, so an
+ * ordinary failure runs the group's remaining tests, and a failed verdict lists the failed ones.
  */
 function cargoTestGroupTarget(
   workspace: CargoWorkspace,
@@ -2691,7 +2692,7 @@ function cargoTestGroupTarget(
     inputs,
     dependsOn: [CARGO_TEST_ARCHIVE_TARGET],
     options: {
-      command: nextestRunnerCommand(workspace, 'run', group.filter, ' --no-tests=pass'),
+      command: nextestRunnerCommand(workspace, 'run', group.filter, ' --no-fail-fast --no-tests=pass'),
       listCommand: nextestRunnerCommand(workspace, 'list', group.filter, ' --message-format=json'),
       cwd: workspace.projectRoot,
       killAfterMs: BOUNDED_TEST_KILL_AFTER_MS,

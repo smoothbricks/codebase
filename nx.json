@@ -59,6 +59,9 @@
     "clean": {
       "executor": "@smoothbricks/nx-plugin:clean-outputs",
       "cache": false
+    },
+    "cargo-test-group-real-apfs": {
+      "dependsOn": ["...", "attach-budget-check"]
     }
   },
   "plugins": ["@smoothbricks/nx-plugin"],

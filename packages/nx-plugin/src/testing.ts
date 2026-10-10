@@ -238,9 +238,12 @@ export async function nxDaemonProcesses(workspace: string): Promise<ProcessEntry
  * the workspace, in the environment that started it. Nx deletes the daemon's
  * record before the daemon exits, so the record cannot say when the workspace
  * is free to delete; the processes can. The daemon also leaves what it
- * spawned to end on its own: plugin workers once they see it gone, an editor
- * extension probe never. Those get SIGTERM with it, the ones it started
- * while it was stopping included. A workspace without the record never had a
+ * spawned to end on its own: plugin workers once they see it gone, the editor
+ * extension probe it starts at launch never. Those get SIGTERM with it, the
+ * ones it started while it was stopping included. A child that outlives the
+ * daemon is reparented to init and leaves the daemon's process tree, but it
+ * still works in the workspace, so once the daemon has exited, the workspace
+ * census ends what is left. A workspace without the record never had a
  * daemon, and `stop` does not run.
  */
 export async function stopNxDaemon(workspace: string, stop: () => Promise<void>): Promise<void> {
@@ -256,6 +259,30 @@ export async function stopNxDaemon(workspace: string, stop: () => Promise<void>)
     terminate(entry.pid);
   }
   await awaitExit([daemon, ...spawned], `Nx daemon of ${workspace}`);
+  await endWorkspaceProcesses(workspace, `Nx daemon of ${workspace}`);
+}
+
+/**
+ * End every process still working in `workspace`, round after round, until a
+ * census finds none. The daemon has exited by now, so a process can start
+ * another under the workspace only while it is alive, and a child started
+ * just before its parent was ended is in the next census. A zombie has
+ * exited already, and this process never ends itself.
+ */
+async function endWorkspaceProcesses(workspace: string, owner: string): Promise<void> {
+  for (;;) {
+    const working = new Set(await pidsWorkingIn(workspace));
+    const leftovers = (await processTable()).filter(
+      (entry) => working.has(entry.pid) && entry.pid !== process.pid && !entry.stat.startsWith('Z'),
+    );
+    if (leftovers.length === 0) {
+      return;
+    }
+    for (const entry of leftovers) {
+      terminate(entry.pid);
+    }
+    await awaitExit(leftovers, owner);
+  }
 }
 
 /**

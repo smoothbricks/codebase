@@ -77,6 +77,10 @@ No mounts, no root, no network — pure functions with table-driven cases:
   bytes, streams, and normalized workspace-relative file paths without shell interpolation. Pure path cases reject
   absolute paths, traversal, symlinks, non-regular files, and ambiguous source combinations; job/trace DTO goldens carry
   kind, delivered bytes, completion, and optional relative path but never inline contents.
+- **Built-addon scripted Node peers**: `cowshed:napi-test` keeps exact stdout, exit-code and empty-stderr oracles for
+  binary delivery, typed refusals, attachment detach and job progress. Scripted Node fixtures retain `NO_COLOR` and the
+  rest of their inherited environment but omit `FORCE_COLOR`, so contradictory outer Nx color settings cannot inject
+  Node warnings. Nested Node peers inherit that coherent input; warnings are never filtered or suppressed.
 - **Shell AST redirect eligibility**: use the production parser against a matrix proving only a simple literal
   in-workspace `>`/`2>` can classify as `Redirect`, and then only when a trusted supervisor-controlled actual writable
   descriptor interposes with exact combined-quota accounting. Append, fd duplication, pipelines, lists, subshells,
@@ -230,16 +234,19 @@ rather than each re-attaching. Every real-APFS fixture image (`tests/support/bla
 150, the system runner that met it records it, and every later fixture of the run, in whichever process, fails with
 `AttachPoolExhausted` and its `next:` step without attaching. A record the gate cannot read proves nothing about the
 pool, so it warns and the fixture proceeds. The lane stays `--no-fail-fast`, so its ordinary failures still run to the
-end; the refusal is the harness's own error, not a scheduler flag. Before the real-APFS lane starts,
-`cargo run -q -p cowshed-core --bin attach-budget -- --need <N>` prints the pool as one JSON line (the four classes'
-instances, registered and leaked counts, the ceiling and its source, the headroom, whether this boot is spent) and
-refuses, exit 3 with `AttachPoolExhausted` and a `next:` hint, when the boot is spent or the headroom is below `N`; a
-pool it cannot read is exit 0 with an `unread` line and a warning, never a claim of headroom; `--clear` ends a recorded
-150 after the operator freed what spent it and forgets a recorded ceiling, which the refusal names when that ceiling
-alone is below `N`. `N` is the lane's measured attach count, one per `apfs-command attach image` line of a lane run
-under `COWSHED_TIMING=1` with its output shown, plus a fixed margin, and is measured again whenever the lane's test set
-changes. The leaked-device delta across a lane run (`ioclasscount AppleDiskImageDevice` against the registered devices,
-before and after) is the check that no disk-image command still leaks on a clean run; it must be 0.
+end; the refusal is the harness's own error, not a scheduler flag. Before the real-APFS lane starts, its root
+`attach-budget-check` dependency runs uncached through `nx:run-commands`, before the group's RAM leases and test run.
+`cargo --frozen run -q -p cowshed-core --bin attach-budget -- --need <N>` prints the pool as one JSON line (the four
+classes' instances, registered and leaked counts, the ceiling and its source, the headroom, whether this boot is spent)
+and refuses, exit 3 with `AttachPoolExhausted` and a `next:` hint, when the boot is spent or the headroom is below `N`;
+a pool it cannot read is exit 0 with an `unread` line and a warning, never a claim of headroom; `--clear` ends a
+recorded 150 after the operator freed what spent it and forgets a recorded ceiling, which the refusal names when that
+ceiling alone is below `N`. `N` is the lane's measured attach count, one per
+`apfs-command attach image without mounting start` or `apfs-command attach blank RAW image start` line of a lane run
+under `COWSHED_TIMING=1` with `NEXTEST_SUCCESS_OUTPUT=immediate` to show passing tests' captured output, plus a fixed
+margin of 32 attach slots. It is measured again whenever the lane's test set changes. The leaked-device delta across a
+lane run (`ioclasscount AppleDiskImageDevice` against the registered devices, before and after) is the check that no
+disk-image command still leaks on a clean run; it must be 0.
 
 **The suite spends a finite host budget.** Every attach→detach cycle a test makes can leak an AppleDiskImages2 device
 that the host's live sheds lose until reboot (01_storage.md, "How the APFS host degrades" §2), so a test pays the fewest
@@ -302,7 +309,9 @@ volume collection, its discard deletes and its substrate pass (`gc build-volumes
 real fixture also reports Git verb durations and elapsed phase boundaries, and each scratch root its teardown and a
 run's sweep of dead runs; these diagnostics do not expose command payloads. Build-state Git failures name the exit
 status or terminating signal alongside stderr, including when the command wrote nothing, so an interrupted query does
-not leave an unexplained empty error.
+not leave an unexplained empty error. The re-adoption witness captures the real core stderr channel to assert
+retained-image guidance, then replays it after restoring stderr and before asserting the command result. Unwinding also
+restores and replays that capture, so a refusal or panic cannot disappear when the fixture removes its private report.
 
 The CLI dispatch tier opens a real `ActorBridge` on caller-owned APFS images and the same persisted workspace/project
 grant stores as a normal controller. It tests grant denial without a write, grant survival across runtime restart, a

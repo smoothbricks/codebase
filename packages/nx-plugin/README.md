@@ -458,17 +458,22 @@ Concrete targets come from concrete files:
   shard by hashing its name, so the shards stay an exact partition of the crate as tests and test binaries are added,
   and a stale `N` can only make a target slow — never drop a test. Omitting the key means one target, as before.
 - Tests that a `nextest.toml` override singles out run separately in `cargo-test-<package>-exceptions-shard1..N`, using
-  the same declared partition count. Ordinary shards run the complement, so the union still covers every test exactly
-  once. The plugin's own overrides raise `slow-timeout` for compile-fail tests and for the real-APFS full-lifecycle
-  tests; lifting them out keeps their raised bound from delaying an ordinary shard, and partitioning the class keeps
-  every target inside its deadline without relaxing it. Exceptional shards are scheduled like the ordinary ones: nothing
-  is exclusive, and isolation between concurrent real-APFS fixtures is the production backend's per-image lease, not Nx
-  scheduling. The exceptional filter is derived from the overrides in `nextest.toml`, so adding an override is the whole
-  classification change. Only sharded crates need these targets; an unsharded crate already runs its whole suite in one
-  process. Empty partitions pass, including platforms where the tests are `cfg`-ed out. `nextest-partitions.test.ts`
-  executes the inferred archive and shard commands over 30 tests and asserts that the ordinary shards ran exactly the 13
-  ordinary tests once, the exceptional shards exactly the 13 exceptional ones, and the serial group exactly its 4
-  probes.
+  the same declared partition count. Ordinary shards run the complement of that class and of every declared serial group
+  (below), so the union still covers every test exactly once. The plugin's own overrides raise `slow-timeout` for
+  compile-fail tests and for the real-APFS full-lifecycle tests; lifting them out keeps their raised bound from delaying
+  an ordinary shard, and partitioning the class keeps every target inside its deadline without relaxing it. The
+  remaining non-group exceptional tests stay normally schedulable under the existing bounds. Every piece runs
+  `--no-fail-fast`, so a failing test does not stop the rest of its piece. The exceptional filter is the union of the
+  overrides in the plugin's own `nextest.toml`, so adding one there is the whole change to that class. Serial groups are
+  classified separately, by `test-group` overrides in the workspace's `.config/nextest.toml`; the plugin's file declares
+  none. Only sharded crates need these targets; an unsharded crate already runs all its non-group tests in one process.
+  Empty partitions pass, including platforms where the tests are `cfg`-ed out. `nextest-partitions.test.ts` executes the
+  inferred archive and shard commands over 30 tests and asserts that the ordinary shards ran exactly the 13 ordinary
+  tests once and the exceptional shards exactly the 13 exceptional ones. The suite builds one shared fixture and
+  archive, then runs separate bounded cases through the real default serial-group executor: a successful count and run
+  with the group's probes exactly once each, three refusals that run nothing and clear the task's previous verdict, and
+  a failing run whose ordinary failures still run the group's remaining probes. Each case settles its owned processes
+  before the next case starts; the fixture is removed only after the final settlement.
 - A repository's serial test groups each run in one runner, `cargo-test-group-<group>`, owned by the cargo workspace
   root beside `cargo-test-archive`. A group is declared once, in `<cargo-workspace>/.config/nextest.toml`: a
   `[test-groups.<group>]` table with `max-threads = 1`, and default-profile overrides that name it with `test-group` and
@@ -477,9 +482,11 @@ Concrete targets come from concrete files:
   one target. The runner is not inferred off macOS, where nextest applies the group nowhere and no piece excludes its
   tests. Its executor, `@smoothbricks/nx-plugin:nextest-group`, lists the selection
   (`nextest list --message-format=json`, same archive and reuse flags) under the existing bounded runner, counts the
-  matching non-ignored tests, and runs the group under a bound of that count × 30 s. A listing that fails, does not
-  parse, or selects no test fails the group rather than running it unbounded. A test whose own `slow-timeout` exceeds 30
-  s (the real-APFS lifecycle override is 60 s) is not covered by that per-test share. Ignored tests keep their explicit
+  matching non-ignored tests, and runs the group under a bound of that count × 30 s. The bound is an aggregate for the
+  whole group, not a per-test limit; the real-APFS lifecycle override stays at 60 s and is unchanged. The run carries
+  `--no-fail-fast`: an ordinary test failure does not stop the group's remaining tests, and a failed verdict lists the
+  failed ones. A listing that fails, does not parse, or selects no test refuses before anything runs, clears this task's
+  previous verdict and report, and fails the group rather than running it unbounded. Ignored tests keep their explicit
   lane. The root's `cargo-test` and every member's `cargo-test` depend on the group. A crate named `group-*` is refused,
   since its runner name would collide.
 - Canonical `napi` package metadata provides a host `cargo-napi` target and named release targets for each configured
@@ -817,9 +824,15 @@ those belong to whoever attached them, so the lease and the volume are kept and 
 own `env.TMPDIR` wins over the lease. Inside a cowshed sandbox, which cannot write the lock in `/private/tmp`, the task
 keeps its inherited `TMPDIR` and says so once. A failed task that left the volume nearly full names the volume.
 
+Once the process and holder checks permit removal, cleanup restores owner read/write/search permission on directories
+through no-follow directory handles before deleting the lease. Read-only fixture directories cannot strand a dead lease
+and block later tasks. File modes and symlink targets stay untouched; a directory on another device refuses cleanup
+instead of changing an attached volume. Held leases undergo no permission changes.
+
 The real RAM-volume regression walks one volume's lifecycle in a single test: unmarked debris and a live-lease refusal,
-recovery over the debris, concurrent leases, a held dead lease, owner detach and reclaim, and the final detach. It keeps
-every boundary while avoiding duplicate provision and teardown, and its 60 s case and 120 s shard bounds are unchanged.
+recovery over the debris, concurrent leases, read-only directory removal, a held dead lease, owner detach and reclaim,
+and the final detach. It checks that external symlink targets and held directory modes stay unchanged, while avoiding
+duplicate provision and teardown; its 60 s case and 120 s shard bounds are unchanged.
 
 Whatever still works in a lease when its task ends is a leak, and is stopped before the lease goes. The usual one is a
 fixture's Nx daemon: Nx detaches it into a session of its own, so the process-group kill that ends a timed-out command
@@ -985,7 +998,8 @@ tests) owns those roots:
   the workspace's path alone, so a deleted workspace retires too. A colliding non-symlink or retargeted alias refuses
   instead of removing another owner's entry; removing the fixture root reclaims its physical socket directories.
 - `stopNxDaemon(workspace, stop)` runs the caller's `nx daemon --stop` and waits until the daemon recorded in
-  `<workspace>/.nx/workspace-data/d/server-process.json`, and every process it started, has exited.
+  `<workspace>/.nx/workspace-data/d/server-process.json`, and its descendants, has exited, then ends every process still
+  working in the workspace. That final census also catches editor probes reparented when the daemon exits.
 
 A fixture retires on every exit path, a throwing body included: stop its daemon, unlink its socket alias, then delete
 its root. A daemon that outlives the stop keeps the alias and the root, so the next run's sweep still finds both.

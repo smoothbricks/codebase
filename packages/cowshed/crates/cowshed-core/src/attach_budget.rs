@@ -353,7 +353,7 @@ impl Budget {
     fn refusal_remedy(&self, need: u64) -> String {
         let step = match self.ceiling {
             _ if self.spent.is_some() && !self.devices_full() => ORPHANS_FIRST_HINT.to_owned(),
-            Ceiling::Observed { leaked, .. } if leaked < need => format!(
+            Ceiling::Observed { leaked, .. } if self.spent.is_none() && leaked < need => format!(
                 "the ceiling recorded at this host's last error code 150, {leaked} leaked \
                  devices, is below the {need} attaches needed whatever leaks now; it survives \
                  reboots and only moves down, so if it no longer holds, `{CLEAR_COMMAND}` \
@@ -1104,6 +1104,15 @@ mod tests {
             .exhausted(&boot(BOOT), Some(count(96, 66)), Some(10))
             .budget(BOOT, leaking(30));
         assert_eq!(orphaned.admits(1).unwrap_err().remedy, ORPHANS_FIRST_HINT);
+    }
+
+    /// Resetting a ceiling cannot free leaked devices that still fill this boot's spent pool.
+    #[test]
+    fn a_spent_boot_with_full_devices_needs_a_reboot_before_reset() {
+        let budget = PoolRecord::default()
+            .exhausted(&boot(BOOT), Some(count(40, 10)), Some(0))
+            .budget(BOOT, leaking(30));
+        assert_eq!(budget.admits(273).unwrap_err().remedy, REBOOT_HINT);
     }
 
     /// A ceiling below the need refuses whatever leaks now; the refusal names the reset, and the

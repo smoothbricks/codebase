@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'bun:test';
-import { groupBudgetMs, MAX_TIMER_MS, NEXTEST_GROUP_PER_TEST_MS, selectedRunnableTestCount } from './executor.js';
+import {
+  groupBudgetMs,
+  MAX_TIMER_MS,
+  NEXTEST_GROUP_PER_TEST_MS,
+  type SelectedRunnableTests,
+  selectedRunnableTestCount,
+} from './executor.js';
 
 describe('nextest-group count stage', () => {
   it('counts the matching, non-ignored tests of every suite and nothing else', () => {
@@ -60,7 +66,7 @@ describe('nextest-group count stage', () => {
   });
 
   it('refuses a testcase without a boolean ignored flag, a filter-match, or a known filter-match status', () => {
-    const malformed = {
+    const malformed: SelectedRunnableTests = {
       ok: false,
       error: 'a nextest list testcase has no ignored flag or filter-match status',
     };

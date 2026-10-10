@@ -813,7 +813,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       // moved tree). `--workspace` is not merely redundant here, nextest
       // rejects it beside a reused build.
       expect(targets['cargo-test-ferris-core']?.options?.command).toMatch(
-        /^extracted="\$\(node \.\.\/\.\.\/node_modules\/@smoothbricks\/nx-plugin\/dist\/bin\/smoo-nx-nextest-extract\.js \.cache\/nextest\/archive\.tar\.zst\)" && cargo --frozen nextest run --binaries-metadata "\$extracted\/target\/nextest\/binaries-metadata\.json" --cargo-metadata "\$extracted\/target\/nextest\/cargo-metadata\.json" --target-dir-remap "\$extracted\/target" --workspace-remap \. -E 'package\(ferris-core\)' --no-tests=pass --user-config-file none --tool-config-file "smoo:\$PWD\/\.\.\/\.\.\/node_modules\/@smoothbricks\/nx-plugin\/nextest\.toml"$/,
+        /^extracted="\$\(node \.\.\/\.\.\/node_modules\/@smoothbricks\/nx-plugin\/dist\/bin\/smoo-nx-nextest-extract\.js \.cache\/nextest\/archive\.tar\.zst\)" && cargo --frozen nextest run --binaries-metadata "\$extracted\/target\/nextest\/binaries-metadata\.json" --cargo-metadata "\$extracted\/target\/nextest\/cargo-metadata\.json" --target-dir-remap "\$extracted\/target" --workspace-remap \. -E 'package\(ferris-core\)' --no-fail-fast --no-tests=pass --user-config-file none --tool-config-file "smoo:\$PWD\/\.\.\/\.\.\/node_modules\/@smoothbricks\/nx-plugin\/nextest\.toml"$/,
       );
       expect(targets['cargo-test-ferris-core']?.inputs).toContain(
         '{workspaceRoot}/packages/ferris/.config/nextest.toml',
@@ -1878,7 +1878,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         'napi-debug',
       ]);
       expect(targets['cargo-test-cowshed-napi']?.options?.command).toMatch(
-        /^extracted="\$\(node \.\.\/\.\.\/node_modules\/@smoothbricks\/nx-plugin\/dist\/bin\/smoo-nx-nextest-extract\.js \.cache\/nextest\/archive\.tar\.zst\)" && cargo --frozen nextest run --binaries-metadata "\$extracted\/target\/nextest\/binaries-metadata\.json" --cargo-metadata "\$extracted\/target\/nextest\/cargo-metadata\.json" --target-dir-remap "\$extracted\/target" --workspace-remap \. -E 'package\(cowshed-napi\)' --no-tests=pass --user-config-file none --tool-config-file "smoo:\$PWD\/.*nextest\.toml"$/,
+        /^extracted="\$\(node \.\.\/\.\.\/node_modules\/@smoothbricks\/nx-plugin\/dist\/bin\/smoo-nx-nextest-extract\.js \.cache\/nextest\/archive\.tar\.zst\)" && cargo --frozen nextest run --binaries-metadata "\$extracted\/target\/nextest\/binaries-metadata\.json" --cargo-metadata "\$extracted\/target\/nextest\/cargo-metadata\.json" --target-dir-remap "\$extracted\/target" --workspace-remap \. -E 'package\(cowshed-napi\)' --no-fail-fast --no-tests=pass --user-config-file none --tool-config-file "smoo:\$PWD\/.*nextest\.toml"$/,
       );
       expect(targets['napi-test']).toMatchObject({
         executor: '@smoothbricks/nx-plugin:bounded-exec',
@@ -1983,7 +1983,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       // An unsharded crate keeps the bare name and takes no --partition, so
       // declaring nothing is exactly the old single-target behaviour.
       expect(targets['cargo-test-small']?.options?.command).toMatch(
-        /--workspace-remap \. -E 'package\(small\)' --no-tests=pass --user-config-file none/,
+        /--workspace-remap \. -E 'package\(small\)' --no-fail-fast --no-tests=pass --user-config-file none/,
       );
       // The shards partition the crate MINUS the classes nextest.toml singles
       // out, i of N. Those are lifted out because a test carrying a raised
@@ -1995,7 +1995,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       }
       for (const index of [1, 2, 3]) {
         expect(targets[`cargo-test-big-shard${index}`]?.options?.command).toContain(
-          `-E 'package(big) and not (${exceptional})' --partition hash:${index}/3 --no-tests=pass`,
+          `-E 'package(big) and not (${exceptional})' --partition hash:${index}/3 --no-fail-fast --no-tests=pass`,
         );
         expect(targets[`cargo-test-big-shard${index}`]?.options?.timeoutMs).toBe(BOUNDED_TEST_TIMEOUT_MS);
       }
@@ -2004,7 +2004,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       for (const index of [1, 2, 3]) {
         const name = `cargo-test-big-exceptions-shard${index}`;
         expect(targets[name]?.options?.command).toContain(
-          `-E 'package(big) and (${exceptional})' --partition hash:${index}/3 --no-tests=pass`,
+          `-E 'package(big) and (${exceptional})' --partition hash:${index}/3 --no-fail-fast --no-tests=pass`,
         );
         expect(targets[name]?.options?.timeoutMs).toBe(BOUNDED_TEST_TIMEOUT_MS);
         expect(packageNameFromCargoTestTarget(name)).toBe('big');
@@ -2083,7 +2083,9 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(group?.executor).toBe('@smoothbricks/nx-plugin:nextest-group');
       expect(group?.dependsOn).toEqual(['cargo-fetch', 'cargo-test-archive']);
       expect(String(group?.options?.command)).toContain('nextest run ');
-      expect(String(group?.options?.command)).toContain(`-E '${serial}' --no-tests=pass --user-config-file none`);
+      expect(String(group?.options?.command)).toContain(
+        `-E '${serial}' --no-fail-fast --no-tests=pass --user-config-file none`,
+      );
       expect(String(group?.options?.listCommand)).toContain('nextest list ');
       expect(String(group?.options?.listCommand)).toContain(
         `-E '${serial}' --message-format=json --user-config-file none`,
@@ -2092,7 +2094,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(group?.options?.killAfterMs).toBe(BOUNDED_TEST_KILL_AFTER_MS);
       expect(group?.inputs).toContain('{workspaceRoot}/packages/rusty/.config/nextest.toml');
       for (const command of [group?.options?.command, group?.options?.listCommand]) {
-        expect(String(command)).not.toMatch(/--partition|test-threads|parallelism/);
+        expect(String(command)).not.toMatch(/--partition|test-threads|parallelism|max-fail/);
       }
 
       // Every crate piece excludes the group's tests, so each test is selected by exactly one target.
@@ -2101,14 +2103,14 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         throw new Error('nextest.toml declares no overrides; this test asserts the pin that protects them');
       }
       expect(macos['cargo-test-small']?.options?.command).toContain(
-        `-E 'package(small) and not ((test(/real_apfs_/)))' --no-tests=pass`,
+        `-E 'package(small) and not ((test(/real_apfs_/)))' --no-fail-fast --no-tests=pass`,
       );
       for (const index of [1, 2, 3]) {
         expect(macos[`cargo-test-big-shard${index}`]?.options?.command).toContain(
-          `-E 'package(big) and not (${exceptional}) and not ((test(/real_apfs_/)))' --partition hash:${index}/3 --no-tests=pass`,
+          `-E 'package(big) and not (${exceptional}) and not ((test(/real_apfs_/)))' --partition hash:${index}/3 --no-fail-fast --no-tests=pass`,
         );
         expect(macos[`cargo-test-big-exceptions-shard${index}`]?.options?.command).toContain(
-          `-E 'package(big) and (${exceptional}) and not ((test(/real_apfs_/)))' --partition hash:${index}/3 --no-tests=pass`,
+          `-E 'package(big) and (${exceptional}) and not ((test(/real_apfs_/)))' --partition hash:${index}/3 --no-fail-fast --no-tests=pass`,
         );
       }
       // The root's aggregate reaches the group beside every crate piece.
@@ -2121,7 +2123,9 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         createNodesV2ForPlatform('linux', 'x64'),
       );
       expect(linux['cargo-test-group-real-apfs']).toBeUndefined();
-      expect(linux['cargo-test-small']?.options?.command).toContain(`-E 'package(small)' --no-tests=pass`);
+      expect(linux['cargo-test-small']?.options?.command).toContain(
+        `-E 'package(small)' --no-fail-fast --no-tests=pass`,
+      );
       expect(linux['cargo-test']?.dependsOn).not.toContain('cargo-test-group-real-apfs');
     } finally {
       await workspace.cleanup();

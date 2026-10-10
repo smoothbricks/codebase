@@ -1,6 +1,17 @@
 import { type ChildProcess, spawn } from 'node:child_process';
 import { constants } from 'node:fs';
-import { mkdtemp, open, readdir, readFile, rm, stat, statfs, writeFile } from 'node:fs/promises';
+import {
+  type FileHandle,
+  lstat,
+  mkdtemp,
+  open,
+  readdir,
+  readFile,
+  rm,
+  stat,
+  statfs,
+  writeFile,
+} from 'node:fs/promises';
 import { join } from 'node:path';
 import {
   awaitExit,
@@ -518,6 +529,9 @@ export class RamTempVolume {
     if (holders.value.length > 0) {
       return { ok: true, value: { kind: 'held', by: holders.value } };
     }
+    // Nothing holds the lease, so its directories may be made removable first: `rm -r` cannot
+    // empty a readonly one. Only this volume's device is changed (see prepareForRemoval).
+    await prepareForRemoval(directory, (await stat(this.paths.mountpoint)).dev);
     await rm(directory, { recursive: true, force: true });
     return { ok: true, value: { kind: 'removed' } };
   }
@@ -725,6 +739,50 @@ export class RamTempVolume {
 /** `directory` stays, with the volume under it: something attached below it still reads its files. */
 function holdingText(directory: string, holders: readonly string[]): string {
   return `${directory} is kept: ${holders.join(', ')} still attached from below it; detach through its owner`;
+}
+
+/**
+ * Give the owner `rwx` on `directory` and on every directory below it, keeping every other mode
+ * bit, so `rm -r` can empty them. Only directories are changed: a link is never descended
+ * (`withFileTypes` reports it as a link), and each directory is opened `O_NOFOLLOW` and changed
+ * through that handle, never by its path. A directory on another device than `device` is refused
+ * before it is changed. Node has no `openat`, so entries are named by path; the walk checks each
+ * directory's identity again after its `readdir`, and a directory swapped under its path stops it.
+ */
+async function prepareForRemoval(directory: string, device: number): Promise<void> {
+  let handle: FileHandle;
+  try {
+    handle = await open(directory, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+  } catch (error) {
+    // Already gone: `rm -f` ignores that too.
+    if (errorCode(error) === 'ENOENT') {
+      return;
+    }
+    throw error;
+  }
+  try {
+    const info = await handle.stat();
+    if (info.dev !== device) {
+      throw new Error(`${directory} is on device ${info.dev}, not the lease's device ${device}; not changed`);
+    }
+    if ((info.mode & 0o700) !== 0o700) {
+      await handle.chmod((info.mode & 0o7777) | 0o700).catch((error: unknown) => {
+        throw new Error(`${directory}: chmod u+rwx failed: ${errorText(error)}`);
+      });
+    }
+    const entries = await readdir(directory, { withFileTypes: true });
+    const named = await lstat(directory);
+    if (named.dev !== info.dev || named.ino !== info.ino) {
+      throw new Error(`${directory} was replaced while it was walked; not changed further`);
+    }
+    for (const entry of entries) {
+      if (entry.isDirectory()) {
+        await prepareForRemoval(join(directory, entry.name), device);
+      }
+    }
+  } finally {
+    await handle.close();
+  }
 }
 
 /**
