@@ -5700,9 +5700,9 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
     ///
     /// Non-land removal stops the checkout's recorded Nx daemon as `detach` does. A land only
     /// inspects holders here: its ledger-owned stop and honest adoption skip must never be
-    /// followed by a record-nominated signal during retirement (16_build_volumes.md, Land 8).
-    /// Anything else holding the volume is still the unmount's to wait for and force, as removal
-    /// always has; it is named here instead of refused.
+    /// followed by a record-nominated signal during direct retirement (16_build_volumes.md, Land 8).
+    /// Linked Nx state may now belong to the target. Report its holders without claiming that
+    /// retiring this workspace will unmount their adopted build volume.
     async fn finish_retirement(
         &mut self,
         current: NativeWorkspace,
@@ -5716,7 +5716,8 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             let mount = self.workspace_mount_path(&workspace)?;
             if let Err(busy) = check_checkout_nx(&workspace, &mount, nx_check).await? {
                 eprintln!(
-                    "cowshed: {workspace}'s Nx state is in use: {busy}; its unmount waits, then forces"
+                    "cowshed: {workspace}'s linked Nx state is in use: {busy}; {}",
+                    nx_check.busy_action()
                 );
             }
         }
@@ -17038,19 +17039,30 @@ fn native_storage_error(error: crate::storage::apfs::ApfsStorageError) -> Cowshe
     }
 }
 
-/// Land retirement only inspects holders: Land 4 already owns any signal authority. Other
-/// callers retain their existing record-nominated close, whose ownership hardening remains
-/// open (04_sandbox.md, "Trusted supervisor and child profiles").
+/// Direct land retirement only inspects holders: Land 4 owns its quiesce signal authority.
+/// Other callers retain their existing record-nominated close, whose ownership hardening
+/// remains open (04_sandbox.md, "Trusted supervisor and child profiles").
 #[cfg(target_os = "macos")]
+#[derive(Clone, Copy)]
 enum CheckoutNxCheck {
     Held,
     CloseRecorded,
 }
 
-/// Inspect or close the checkout's Nx state before its volume detaches.
-/// `.nx/workspace-data` is read through the checkout, so a build-volume link is followed.
-/// [`crate::build_volume::nx::Busy`] is the caller's to judge: `detach` refuses on it, while a
-/// retirement unmounts with its grace and force as it always has.
+#[cfg(target_os = "macos")]
+impl CheckoutNxCheck {
+    fn busy_action(self) -> &'static str {
+        match self {
+            Self::Held => "this holder inspection stops no process",
+            Self::CloseRecorded => "its unmount waits, then forces",
+        }
+    }
+}
+
+/// Inspect or close the checkout's linked Nx state. The link does not establish ownership:
+/// after adoption it may still name the target's build volume, which does not retire here.
+/// [`crate::build_volume::nx::Busy`] is the caller's to judge: `detach` refuses on it, while
+/// retirement reports it and retains the grace and force for its own workspace image.
 #[cfg(target_os = "macos")]
 async fn check_checkout_nx(
     workspace: &WorkspaceName,

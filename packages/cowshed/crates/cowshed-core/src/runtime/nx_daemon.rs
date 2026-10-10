@@ -158,47 +158,75 @@ pub(crate) fn prepare_daemon_stop(
     read_daemon_stop_plan(record, ledger).map_err(|error| {
         crate::api::dto::AdoptionSkip::LandingDaemonUnverifiable {
             record: record.to_owned(),
-            reason: format!(
-                "cannot verify against job ledger {}: {error}",
-                ledger.display()
-            ),
+            reason: error.to_string(),
         }
     })
 }
 
 #[cfg(target_os = "macos")]
 fn read_daemon_stop_plan(record: &Path, ledger: &Path) -> io::Result<DaemonStopPlan> {
+    let record_error = |error: io::Error| {
+        io::Error::new(
+            error.kind(),
+            format!("cannot read daemon record {}: {error}", record.display()),
+        )
+    };
     let mut file = match std::fs::File::open(record) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             return Ok(DaemonStopPlan::NotRunning);
         }
-        Err(error) => return Err(error),
+        Err(error) => return Err(record_error(error)),
     };
     // The modification time and the bytes come from the same descriptor, so they describe one write.
-    let modified = file.metadata()?.modified()?;
+    let modified = file
+        .metadata()
+        .and_then(|metadata| metadata.modified())
+        .map_err(record_error)?;
     let mut bytes = Vec::new();
-    io::Read::read_to_end(&mut file, &mut bytes)?;
-    let recorded: Record = serde_json::from_slice(&bytes)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    io::Read::read_to_end(&mut file, &mut bytes).map_err(record_error)?;
+    let recorded: Record = serde_json::from_slice(&bytes).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("cannot parse daemon record {}: {error}", record.display()),
+        )
+    })?;
     let pid = match libc::pid_t::try_from(recorded.process_id) {
         Ok(pid @ 1..) => pid,
         _ => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "the daemon record names no process: {}",
+                    "daemon record {} names no process: {}",
+                    record.display(),
                     recorded.process_id
                 ),
             ));
         }
     };
-    let Some(named) = super::job_groups::process_record(pid)? else {
+    let Some(named) = super::job_groups::process_record(pid).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "cannot inspect process {pid} named by daemon record {}: {error}",
+                record.display()
+            ),
+        )
+    })?
+    else {
         return Ok(DaemonStopPlan::NotRunning);
     };
     let written = modified
         .duration_since(std::time::UNIX_EPOCH)
-        .map_err(io::Error::other)?
+        .map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "daemon record {} has an invalid modification time: {error}",
+                    record.display()
+                ),
+            )
+        })?
         .as_secs();
     if written < named.started_seconds {
         return Ok(DaemonStopPlan::Unproven {
@@ -210,13 +238,27 @@ fn read_daemon_stop_plan(record: &Path, ledger: &Path) -> io::Result<DaemonStopP
     }
     // A job's daemon runs inside its sandbox. Unsandboxed is refused here, but a sandboxed pid
     // still needs the ledger's proof: this guard only refuses, it never grants.
-    if !crate::process::sandboxed(pid)? {
+    if !crate::process::sandboxed(pid).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("cannot inspect sandbox of process {pid}: {error}"),
+        )
+    })? {
         return Ok(DaemonStopPlan::Unproven {
             pid,
             reason: format!("process {pid} is not sandboxed, so it is not a job's daemon"),
         });
     }
-    let Some(process) = super::job_groups::owned_process(ledger, pid)? else {
+    let Some(process) = super::job_groups::owned_process(ledger, pid).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "cannot verify against job ledger {}: {error}",
+                ledger.display()
+            ),
+        )
+    })?
+    else {
         return Ok(DaemonStopPlan::Unproven {
             pid,
             reason: format!("no job group in the ledger proves process {pid} is the job's own"),
@@ -226,7 +268,10 @@ fn read_daemon_stop_plan(record: &Path, ledger: &Path) -> io::Result<DaemonStopP
         Ok(exit) => Ok(DaemonStopPlan::Owned { process, exit }),
         // It exited between the proof and its watch: nothing runs to stop.
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(DaemonStopPlan::NotRunning),
-        Err(error) => Err(error),
+        Err(error) => Err(io::Error::new(
+            error.kind(),
+            format!("cannot watch exit of ledger-proven process {pid}: {error}"),
+        )),
     }
 }
 
@@ -1102,13 +1147,17 @@ mod tests {
         let record = scratch.join("server-process.json");
         let ledger = scratch.join("supervisor.groups");
         let mut child = sandboxed_group_leader();
-        let assert_skip = |result| match result {
+        let assert_skip = |result, operation: &str, source: &Path| match result {
             Err(crate::api::dto::AdoptionSkip::LandingDaemonUnverifiable {
                 record: refused,
                 reason,
             }) => {
                 assert_eq!(refused, record);
-                assert!(!reason.is_empty());
+                let expected = format!("{operation} {}: ", source.display());
+                assert!(
+                    reason.starts_with(&expected),
+                    "{reason}; expected {expected}"
+                );
                 let skip = crate::api::dto::AdoptionSkip::LandingDaemonUnverifiable {
                     record: refused,
                     reason,
@@ -1139,14 +1188,14 @@ mod tests {
         let alive = child.try_wait().unwrap().is_none();
         child.kill().unwrap();
         child.wait().unwrap();
-        for result in [
-            malformed_record,
-            unreadable_record,
+        assert_skip(malformed_record, "cannot parse daemon record", &record);
+        assert_skip(unreadable_record, "cannot read daemon record", &record);
+        assert_skip(
             malformed_ledger,
-            result,
-        ] {
-            assert_skip(result);
-        }
+            "cannot verify against job ledger",
+            &ledger,
+        );
+        assert_skip(result, "cannot verify against job ledger", &ledger);
         assert!(alive, "no error path signals");
     }
 

@@ -210,15 +210,18 @@ policy its children run under: a containment check that joins it (an embedder's 
 embedder's own sockets is one) sees any socket, deny or grant cowshed admits later, where a hand-built copy would pass
 unseen.
 
-For the landing workspace's Nx daemons, lifecycle signal authority stays with the controller throughout a land. In Land
-step 4 a daemon record is a nomination only: the controller signals a process only when the supervisor's job group
-ledger proves that process is a job's own, captured before the supervisor retires. The sandbox grants a job no signal
-right over another process, so this authority is the controller's alone (16_build_volumes.md, Land 4). The default
-land's later workspace retirement only inspects Nx database holders; it never turns a skipped nomination into a
-record-nominated signal (Land 8). The existing record-nominated target daemon stops in Land steps 5 and 6, and the
-non-land stops in detach, rm/retire, workspace rename, re-adoption, resize, rebase carry, migration, reseeding and
-idle-keeper cleanup remain outside this ledger-only cutover. Their ownership hardening is open; no safety guarantee for
-those paths is claimed here.
+For the landing workspace's Land 4 quiesce, lifecycle signal authority stays with the controller. A daemon record is a
+nomination only: the controller signals a process only when the supervisor's job group ledger proves that process is a
+job's own, captured before the supervisor retires. The sandbox grants a job no signal right over another process, so
+this authority is the controller's alone (16_build_volumes.md, Land 4). The direct default-land retirement path only
+inspects Nx database holders; it never turns a skipped nomination into a record-nominated signal (Land 8).
+
+This ledger-only cutover does not harden idle-keeper cleanup: keepers still stop record-nominated processes and can run
+during a land, before Land 4 quiesces the landing supervisor and after the target's supervisor, a `--no-retire` landing
+supervisor or a refused retirement re-arms one. The target's record-nominated stop is at Land 5.3; Land 6's Nx
+preconditions only hold open locks and inspect holders. Those keeper paths, the target stop, and the non-land stops in
+detach, rm/retire, workspace rename, re-adoption, resize, rebase carry, migration and reseeding remain outside this
+cutover. Their ownership hardening is open; no safety guarantee for those paths is claimed here.
 
 The revision-bound profile above is the **supervisor profile**. It grants the trusted supervisor write access to
 `<workspace mount>/.cowshed/job/**` so the supervisor can allocate job IDs, capture streams, and write protected job
