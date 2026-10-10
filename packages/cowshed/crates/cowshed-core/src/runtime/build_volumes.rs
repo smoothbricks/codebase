@@ -1699,6 +1699,9 @@ fn collect_legacy_seed_sidecars(
                 return Ok(Some(deferral));
             }
             if !dry_run {
+                let hold = crate::metadata::append_suffix(&candidate.image, ".hold");
+                std::fs::remove_file(&hold)
+                    .map_err(|error| io("remove legacy seed hold", &hold, &error))?;
                 std::fs::remove_file(&candidate.sidecar).map_err(|error| {
                     io(
                         "remove orphan legacy seed metadata",
@@ -1706,9 +1709,6 @@ fn collect_legacy_seed_sidecars(
                         &error,
                     )
                 })?;
-                let hold = crate::metadata::append_suffix(&candidate.image, ".hold");
-                std::fs::remove_file(&hold)
-                    .map_err(|error| io("remove legacy seed hold", &hold, &error))?;
                 crate::fsio::sync_directory(layout.images()).map_err(|error| {
                     io(
                         "sync legacy seed metadata collection",
