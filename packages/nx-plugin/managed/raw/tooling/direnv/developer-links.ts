@@ -11,7 +11,8 @@
  * link. So each install smoo runs (shell entry's, a CI runner's
  * frozen-lockfile one, `smoo monorepo update`'s) records these links before
  * it installs and puts exactly those back afterwards. A plain `bun install`
- * still relinks them: only a wrapper around bun itself could intercept that.
+ * still relinks an undeclared link: only a wrapper around bun itself could
+ * intercept that. A declared one (below) comes back on its own.
  *
  * A developer link is a symlink directly inside a node_modules tree bun
  * installs (the root's or a workspace member's, scoped names included) whose
@@ -49,6 +50,18 @@
  * directory this machine does not have leaves the installed version, said so.
  * CI never applies them: it builds against the published packages the
  * lockfile names (setup-environment.ts `--links`).
+ *
+ * Declarations are applied at the end of every install. smoo's root script
+ * policy makes the root's `postinstall` run this file, and bun runs the
+ * root's lifecycle scripts after it has re-pointed the dependencies, an
+ * install with nothing to do included. Without it a plain `bun install` left
+ * the published package in place until the next shell entry, and a process
+ * started in that gap kept what it loaded: an Nx daemon ran the published
+ * plugin's sync generator for the rest of its life. Shell entry's `--links`
+ * task covers a tree that lost a link without an install, such as a clone
+ * made while it was missing. The postinstall takes no install lock: an
+ * install smoo runs holds that lock while bun runs the script, so waiting
+ * for it there would never end.
  *
  * Like secret-references.ts, this is a managed raw script: shell entry imports
  * it before anything is installed, and `smoo monorepo update` loads the copy
@@ -401,4 +414,14 @@ function linkAnchor(root: string): string {
   }
   const projectRoot = typeof marker === 'object' && marker !== null ? Reflect.get(marker, 'projectRoot') : undefined;
   return typeof projectRoot === 'string' && path.isAbsolute(projectRoot) ? projectRoot : root;
+}
+
+/**
+ * The root package's `postinstall`, `bun tooling/direnv/developer-links.ts`.
+ * Bun runs it in the root it installed, so that root is the working
+ * directory. A CI runner links nothing, as for setup-environment.ts `--links`.
+ */
+if (import.meta.main && process.env.GITHUB_ACTIONS !== 'true') {
+  const root = process.cwd();
+  applyDeclaredLinks(root, planDeclaredLinks(root));
 }

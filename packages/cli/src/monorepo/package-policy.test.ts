@@ -64,7 +64,7 @@ describe('root smoo monorepo policy', () => {
       );
       await writeJson(join(root, 'nx.json'), validNxJson());
 
-      expect(validateRootPackagePolicy(root)).toBe(8);
+      expect(validateRootPackagePolicy(root)).toBe(9);
       expect(validateNxReleaseConfig(root)).toBe(7);
 
       applyFixableMonorepoDefaults(root);
@@ -80,6 +80,7 @@ describe('root smoo monorepo policy', () => {
         'format:staged': 'git-format-staged --config tooling/git-hooks/git-format-staged.yml',
         lint: 'nx run-many -t lint',
         'lint:fix': 'git-format-staged --config tooling/git-hooks/git-format-staged.yml --unstaged',
+        postinstall: 'bun tooling/direnv/developer-links.ts',
       });
       expect(rootPackage).toMatchObject({ nx: { includedScripts: [] } });
       expect(nxJson.namedInputs).toEqual(validNamedInputs());

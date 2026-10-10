@@ -5,6 +5,7 @@ import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { keepDeveloperLinks } from './developer-links.js';
+import { DECLARED_LINKS_POSTINSTALL } from './package-policy.js';
 
 /**
  * What shell entry does, measured against the real script.
@@ -136,7 +137,7 @@ async function withManagedRepository(
         version: '0.0.0',
         private: true,
         ...(options.workspaces === undefined ? {} : { workspaces: options.workspaces }),
-        scripts: { prepare: options.prepare ?? record('install') },
+        scripts: { postinstall: DECLARED_LINKS_POSTINSTALL, prepare: options.prepare ?? record('install') },
         smoo: {
           secrets: {
             SMOO_NPM_TOKEN: { command: counter('SMOO_NPM_TOKEN', ledgers) },
@@ -757,12 +758,49 @@ describe('what shell entry keeps linked', () => {
       await withManagedRepository(
         { ...WORKSPACE, developerLinks: { '@fixture/lib': '/opt/lib' } },
         async ({ enterShell: enter }) => {
-          expect(await enter()).toEqual(HEALTHY);
+          // The root postinstall reads the same declaration, so the install shell entry runs refuses it too.
+          expect((await enter()).stderr).toContain(
+            'smoo.developerLinks @fixture/lib must be a directory relative to the main checkout, not "/opt/lib"',
+          );
           const refused = await enter({ links: true, check: true });
           expect(refused.exitCode).toBe(1);
           expect(refused.stderr).toContain(
             'smoo.developerLinks @fixture/lib must be a directory relative to the main checkout, not "/opt/lib"',
           );
+        },
+      );
+    });
+
+    it('keeps the declared link across a plain bun install, through the root postinstall', async () => {
+      await withManagedRepository(
+        { ...WORKSPACE, developerLinks: { '@fixture/lib': '../local-lib' } },
+        async ({ root, enterShell: enter }) => {
+          const local = await checkout(join(dirname(root), 'local-lib'), '@fixture/lib');
+          expect((await enter()).exitCode).toBe(0);
+          expect(readlinkSync(join(root, LINKED))).toBe(local);
+          // `bun install` as a developer types it: no shell entry and no install lock.
+          const install = () =>
+            Bun.spawnSync({
+              cmd: ['bun', 'install'],
+              cwd: root,
+              env: { PATH: process.env['PATH'], HOME: process.env['HOME'], SMOO_NPM_TOKEN: 'npm' },
+              stdout: 'pipe',
+              stderr: 'pipe',
+            }).exitCode;
+
+          // Bun re-points a link nothing declares at its lockfile version, and the postinstall puts the declared one back.
+          const mine = await checkout(join(dirname(root), 'my-util'), 'util');
+          await rm(join(root, UNLINKED));
+          symlinkSync(mine, join(root, UNLINKED));
+          expect(install()).toBe(0);
+          expect(readlinkSync(join(root, UNLINKED))).toBe('../../util');
+          expect(readlinkSync(join(root, LINKED))).toBe(local);
+
+          // An install with nothing to do runs the postinstall as well: the entry holds the lockfile's version and ends linked.
+          await rm(join(root, LINKED));
+          symlinkSync('../../../lib', join(root, LINKED));
+          expect(install()).toBe(0);
+          expect(readlinkSync(join(root, LINKED))).toBe(local);
         },
       );
     });

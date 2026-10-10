@@ -52,6 +52,7 @@
     "lint": "nx run-many -t lint",
     "lint:fix": "git-format-staged --config tooling/git-hooks/git-format-staged.yml --unstaged",
     "list:nx-build-targets": "nx show projects | xargs -n1 nx show project --json | jq -r  '.name as $name | .targets | to_entries[] | \"\\($name):\\(.key)\"'",
+    "postinstall": "bun tooling/direnv/developer-links.ts",
     "reload:direnv": "rm -rf tooling/direnv/.{direnv,devenv}; direnv reload",
     "reload:node_modules": "tooling/rm_node_modules; bun install",
     "show:tree": "tree --gitignore -d",

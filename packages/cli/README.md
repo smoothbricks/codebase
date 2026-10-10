@@ -490,8 +490,9 @@ While such links exist, every shell entry and every install smoo runs prints one
 nothing print it too, because devenv's direnv integration hides the output of the run that installs.
 
 A plain `bun install`, `bun add` or `bun remove` re-points every declared dependency at its lockfile version, links
-included. Bun does this before the root `preinstall` script runs, so no lifecycle script can keep a link. smoo has no
-command that brings a link back once it has been replaced, so after a plain install you have to link again.
+included. Bun does this before the root `preinstall` script runs, so no lifecycle script can record a link and keep it.
+A link made by hand is gone after a plain install and has to be made again. A declared link (below) comes back by
+itself.
 
 An install that exists to replace links, such as a script that runs `bun link <name>` against providers registered anew,
 names the packages it replaces so that smoo does not undo it:
@@ -504,6 +505,42 @@ this helper does not promise transactional rollback of new package-manager entri
 linked checkouts on success or failure. `relink` selects links and creates none: a named package without a link to a
 local checkout when the install starts is left as the install leaves it, and a named link whose checkout is gone is
 removed with the usual warning first.
+
+#### Declared Links
+
+A repository whose checkouts should all run against a local checkout of a package declares that checkout in the root
+`package.json`:
+
+```json
+{
+  "smoo": {
+    "developerLinks": {
+      "@smoothbricks/lmao": "../smoothbricks/packages/lmao"
+    }
+  }
+}
+```
+
+Each key is a package name, scoped or not. Each value is the directory of that package's local checkout, relative to the
+project's main checkout. That is the checkout itself or, in a cowshed workspace, the `projectRoot` named by its
+`.cowshed/workspace.json`, so every workspace of one project resolves a declaration to the same directory. Every install
+refuses an absolute path, or a key that is not a package name, and fails naming it. In every `node_modules` tree that
+installed the package, the root's and each workspace member's, the entry becomes a link to that directory. A tree that
+does not depend on the package gains nothing, and an entry a developer pointed at a checkout of their own stays theirs.
+When the directory is missing on this machine, or a sandbox cannot read it, the installed version stays and stderr says
+so.
+
+Declarations are applied at the end of every install. smoo's root script policy sets the root `postinstall` to
+`bun tooling/direnv/developer-links.ts`, and Bun runs root lifecycle scripts after it re-points the dependencies,
+including on an install that has nothing to do. A plain `bun install` therefore ends with the declared links in place.
+Shell entry's `smoo:developer-links` devenv task applies them as well, for a tree that lost a link without an install.
+An install run with `--ignore-scripts` skips the postinstall, and the next shell entry links again. CI runners
+(`GITHUB_ACTIONS=true`) link nothing and build against the published versions the lockfile names.
+
+A process that loaded a package while its link was missing keeps the version it loaded. An Nx daemon started in that
+window runs the published plugin's sync generators until it restarts (`nx daemon --stop`). Declare only the packages
+whose unpublished changes the repository needs. Remove a declaration once the lockfile names a published version that
+carries those changes.
 
 ## Formatting And Git Hooks
 

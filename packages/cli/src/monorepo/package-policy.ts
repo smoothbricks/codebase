@@ -93,6 +93,8 @@ export { SMOO_NX_RELEASE_TAG_PATTERN, SMOO_NX_VERSION_ACTIONS };
 // and `deps` — the ecosystem-standard dependency-update scope (Dependabot and
 // Renovate both emit it) for lockfile/patch/root-manifest changes.
 const extraCommitScopes = ['release', 'deps'];
+/** The root `postinstall`: every install ends with `smoo.developerLinks` in place (developer-links.ts). */
+export const DECLARED_LINKS_POSTINSTALL = 'bun tooling/direnv/developer-links.ts';
 const rootScriptPolicy: Record<string, string> = {
   // The Linux compile gate's developer entry point. Installed by `smoo` into
   // every repo alongside the managed devenv profile it activates, so the fleet
@@ -104,6 +106,7 @@ const rootScriptPolicy: Record<string, string> = {
   'format:staged': 'git-format-staged --config tooling/git-hooks/git-format-staged.yml',
   lint: 'nx run-many -t lint',
   'lint:fix': 'git-format-staged --config tooling/git-hooks/git-format-staged.yml --unstaged',
+  postinstall: DECLARED_LINKS_POSTINSTALL,
 };
 
 export function applyFixableMonorepoDefaults(root: string): void {
