@@ -155,6 +155,9 @@ loudly; it never falls through to a global or temp directory.
 A fixture's child directory is a real, non-symlink directory owned by the test process UID with mode 0700. Drop cleans
 every path the fixture created. No fixture adds a grant, a host cache path, a script wrapper, or a sandbox disable.
 
+A pure regression fixture runs inside an ordinary exec and covers both the HTTP and Unix-socket authentication cases. It
+is not a real APFS mount or cache cutover proof.
+
 Inside a workspace's port block, the gateway's own port `COWSHED_PORT_BASE` stays reserved: an upstream fixture binds
 the first free service port in `base+1` through `base+size-1` and never port 0 or a port outside the block. A block
 exported without its size, or the reverse, fails loudly by name. Inside a Cow test gateway, `free_endpoint` allocates
@@ -166,26 +169,30 @@ Host-controller tests that need the global identities of the real host (the shar
 the host's own store) name each such identity explicitly in the test. No blanket bypass of the workspace's block or
 grants is permitted.
 
+Known limitation: dead-run reclaim of the shared Nx fixture root enumerates live processes with `ps`, and the installed
+cowshed workspace denies that spawn, so reclaim cannot run there. A focused hook proof may use the host's direnv only to
+reclaim; that is neither a subject grant nor a cutover claim.
+
 ## Host-controller authority
 
 Run `nx run cowshed:host-controller-test` from the owned checkout in an unsandboxed host-controller shell. This single
-uncached target selects `test(/host_controller_/)` across `cowshed-core`, `cowshed-cli`, and `cowshed-shell` with
-`--run-ignored only`, without a second list of fixture names. Its `build` dependency, the existing inferred host build
-aggregate, completes first and refreshes the JS and host-platform native addon the worker proofs load, so they never
-load a stale `dist/native` addon from an earlier build. Its owning `cargo-test-archive` dependency compiles once before
-the run, and the target hashes the archive output bytes. The host runner consumes that prebuilt archive with
-`--archive-file` and remaps its workspace to the exact owned checkout; it never recompiles under the test guard or lets
-its private runtime `TMPDIR` change compiled artifacts. An empty selection fails. Controller-owned filesystem and
-kernel-profile fixtures carry that prefix and an explicit ignore reason naming this target. Ordinary sandboxed nextest
-runs report them ignored: an enclosing executed-child profile cannot grant an inner supervisor independent authority.
-Pure policy tests and pre-spawn refusal tests remain in the ordinary lane. The host runner probes actual hard-link
-authority before running and refuses with the same actionable command if an enclosing sandbox denies it; neither a write
-grant nor a nested profile can undo that denial. It pins `TMPDIR` to a unique disposable directory under the exact owned
-checkout's `.cowshed/tmp` and removes it afterward. Unix-socket fixtures use the existing short owned `ScratchRoot` so
-Darwin's socket-path bound is independent of that private `TMPDIR`. Fixtures use only disposable local data and never
-change installed host services or checkout source. The descriptor-inheritance proof launches only its unique one-shot
-agent from the generated gateway plist, holds 10000 descriptors with finite `OPEN_MAX`, and unloads that agent on every
-exit path.
+uncached target selects `test(/host_controller_/)` across `cowshed-core`, `cowshed-cli`, `cowshed-shell`, and
+`cowshed-gateway` with `--run-ignored only`, without a second list of fixture names. Its `build` dependency, the
+existing inferred host build aggregate, completes first and refreshes the JS and host-platform native addon the worker
+proofs load, so they never load a stale `dist/native` addon from an earlier build. Its owning `cargo-test-archive`
+dependency compiles once before the run, and the target hashes the archive output bytes. The host runner consumes that
+prebuilt archive with `--archive-file` and remaps its workspace to the exact owned checkout; it never recompiles under
+the test guard or lets its private runtime `TMPDIR` change compiled artifacts. An empty selection fails.
+Controller-owned filesystem and kernel-profile fixtures carry that prefix and an explicit ignore reason naming this
+target. Ordinary sandboxed nextest runs report them ignored: an enclosing executed-child profile cannot grant an inner
+supervisor independent authority. Pure policy tests and pre-spawn refusal tests remain in the ordinary lane. The host
+runner probes actual hard-link authority before running and refuses with the same actionable command if an enclosing
+sandbox denies it; neither a write grant nor a nested profile can undo that denial. It pins `TMPDIR` to a unique
+disposable directory under the exact owned checkout's `.cowshed/tmp` and removes it afterward. Unix-socket fixtures use
+the existing short owned `ScratchRoot` so Darwin's socket-path bound is independent of that private `TMPDIR`. Fixtures
+use only disposable local data and never change installed host services or checkout source. The descriptor-inheritance
+proof launches only its unique one-shot agent from the generated gateway plist, holds 10000 descriptors with finite
+`OPEN_MAX`, and unloads that agent on every exit path.
 
 An exit-watch fixture waits for an executed-body readiness byte before its parent captures the process identity and
 registers the watch. The parent holds the child's input gate until registration; returning from spawn alone is not
@@ -210,6 +217,11 @@ alias points to real socket leaves inside the fixture's own root, outside every 
 not a symlink. Workspace ownership is established by physical containment, so the foreign-workspace guard stays
 unchanged. The fixture stops its daemon before unlinking its verified alias and removing its root. Bind and connect are
 proved under the real sandbox's long store `TMPDIR`, not only a host runner's short temporary directory.
+
+Nx backend host-controller fixtures bind their standalone server on an ephemeral loopback listener owned by the fixture.
+The core ignored protocol fixture, `host_controller_bridge_publishes_and_reads_through_the_production_server`, and the
+gateway's process case, `host_controller_nx_backend_process_serves_and_releases_its_store`, are separate; each names one
+controller-owned backend. Neither grants a broader host bypass.
 
 Git discovery fixtures exercise the restricted discovery profile, including denied includes, alternate object stores,
 and worktree metadata grants. The probe executes Git through the system-selected developer directory, not the

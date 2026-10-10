@@ -1028,7 +1028,7 @@ fn unreadable(error: String) -> Attribution {
 /// spaces) names, when `check` spells that command: the script's stem as a word of the check,
 /// followed by exactly those arguments and then the end of a shell command. `None` when the
 /// check does not spell it.
-fn spelled_by(check: &str, command: &str) -> Option<Vec<String>> {
+pub(crate) fn spelled_by(check: &str, command: &str) -> Option<Vec<String>> {
     const SEPARATORS: [&str; 6] = [";", "&&", "||", "|", ")", "&"];
     let mut recorded = command.split_whitespace();
     let script = recorded.next()?;

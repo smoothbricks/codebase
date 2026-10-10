@@ -10,6 +10,10 @@ describe('Bun bootstrap imports', () => {
     const plugin = await import('@smoothbricks/nx-plugin');
     expect(plugin.createNodesV2).toBeDefined();
     expect(Array.isArray(plugin.createNodesV2)).toBe(true);
+    expect(typeof plugin.preTasksExecution).toBe('function');
+    expect(typeof plugin.postTasksExecution).toBe('function');
+    expect(typeof plugin.default.preTasksExecution).toBe('function');
+    expect(typeof plugin.default.postTasksExecution).toBe('function');
   });
 
   it('refuses a cold missing bootstrap product instead of returning an empty graph', async () => {

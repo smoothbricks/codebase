@@ -30,6 +30,7 @@ use crate::{
         CredentialProvider, SystemConnector, UpstreamConnector,
     },
     mirror::{MirrorCacheStatus, MirrorService},
+    nx_cache::{NxCacheBackend, NxPublication},
     proxy,
     repo_mirror::{Git2RepoTransport, RepoMirrorError, RepoMirrorHandle, RepoTransport},
     sim_broker::{SimBrokerError, SimBrokerHandle, SimRunner, XcrunSimRunner},
@@ -71,6 +72,38 @@ pub(crate) trait BrokerAuditor: Send + Sync {
 }
 
 impl GatewayHandle {
+    pub async fn configure_nx_cache(&self, backend: NxCacheBackend) -> Result<(), GatewayError> {
+        let (reply, receive) = oneshot::channel();
+        self.send(Command::ConfigureNxCache { backend, reply })
+            .await?;
+        receive.await.map_err(|_| GatewayError::Stopped)?
+    }
+
+    pub async fn begin_nx_publication(
+        &self,
+        publication: NxPublication,
+    ) -> Result<(), GatewayError> {
+        let (reply, receive) = oneshot::channel();
+        self.send(Command::BeginNxPublication { publication, reply })
+            .await?;
+        receive.await.map_err(|_| GatewayError::Stopped)?
+    }
+
+    pub async fn end_nx_publication(
+        &self,
+        workspace_id: String,
+        token: WorkspaceToken,
+    ) -> Result<(), GatewayError> {
+        let (reply, receive) = oneshot::channel();
+        self.send(Command::EndNxPublication {
+            workspace_id,
+            token,
+            reply,
+        })
+        .await?;
+        receive.await.map_err(|_| GatewayError::Stopped)?
+    }
+
     pub async fn install(&self, session: WorkspaceSession) -> Result<(), GatewayError> {
         let (reply, receive) = oneshot::channel();
         self.send(Command::Install { session, reply }).await?;
@@ -406,6 +439,19 @@ impl Drop for Gateway {
 }
 
 pub(crate) enum Command {
+    ConfigureNxCache {
+        backend: NxCacheBackend,
+        reply: oneshot::Sender<Result<(), GatewayError>>,
+    },
+    BeginNxPublication {
+        publication: NxPublication,
+        reply: oneshot::Sender<Result<(), GatewayError>>,
+    },
+    EndNxPublication {
+        workspace_id: String,
+        token: WorkspaceToken,
+        reply: oneshot::Sender<Result<(), GatewayError>>,
+    },
     Install {
         session: WorkspaceSession,
         reply: oneshot::Sender<Result<(), GatewayError>>,
@@ -459,6 +505,7 @@ pub(crate) enum Authentication {
 pub(crate) enum RequestTarget {
     Generic(CanonicalTarget),
     LocalSim,
+    LocalNx,
 }
 
 #[derive(Clone, Debug)]
@@ -494,6 +541,7 @@ pub(crate) struct Admission {
     pub protocol: Option<MirrorProtocol>,
     pub credential_allowed: bool,
     pub private_network_authorized: bool,
+    pub nx_token: Option<WorkspaceToken>,
     pub audit_kind: AuditKind,
     pub method: Method,
     pub request_path: String,
@@ -520,6 +568,7 @@ struct AdmissionSeed {
     protocol: Option<MirrorProtocol>,
     credential_allowed: bool,
     private_network_authorized: bool,
+    nx_token: Option<WorkspaceToken>,
     audit_kind: AuditKind,
     method: Method,
     request_path: String,
@@ -541,6 +590,7 @@ impl AdmissionSeed {
             protocol: self.protocol,
             credential_allowed: self.credential_allowed,
             private_network_authorized: self.private_network_authorized,
+            nx_token: self.nx_token,
             audit_kind: self.audit_kind,
             method: self.method,
             request_path: self.request_path,
@@ -846,6 +896,9 @@ struct Actor {
     repo_mirror: RepoMirrorHandle,
     sim_broker: SimBrokerHandle,
     sessions: HashMap<String, SessionState>,
+    nx_backends: HashMap<String, NxCacheBackend>,
+    nx_processes: HashMap<String, tokio::process::Child>,
+    nx_publications: HashMap<String, NxPublication>,
     revisions: HashMap<String, u64>,
     permits: HashMap<u64, PermitState>,
     origins: HashMap<(String, String), usize>,
@@ -900,6 +953,9 @@ impl Actor {
             repo_mirror,
             sim_broker,
             sessions: HashMap::new(),
+            nx_backends: HashMap::new(),
+            nx_processes: HashMap::new(),
+            nx_publications: HashMap::new(),
             revisions: HashMap::new(),
             permits: HashMap::new(),
             origins: HashMap::new(),
@@ -932,7 +988,43 @@ impl Actor {
                         return Ok(());
                     };
                     match command {
+                        Command::ConfigureNxCache { backend, reply } => {
+                            let result = backend.validate().map_err(|reason| GatewayError::NxAuthority(reason.to_owned()));
+                            if result.is_ok() {
+                                self.nx_backends.insert(backend.repo_id.clone(), backend);
+                            }
+                            let _ = reply.send(result);
+                        }
+                        Command::BeginNxPublication { publication, reply } => {
+                            let backend = Self::ensure_nx_backend(
+                                self.config.nx_cache.as_ref(), &mut self.nx_backends,
+                                &mut self.nx_processes, &mut self.nx_publications, &publication.repo_id,
+                            ).await;
+                            let result = backend.and_then(|()| publication.validate().map_err(|reason| GatewayError::NxAuthority(reason.to_owned()))).and_then(|()| {
+                                let session = self.sessions.get(&publication.workspace_id).ok_or(GatewayError::UnknownWorkspace)?;
+                                if session.repo_id != publication.repo_id || session.revision != publication.expected_revision
+                                    || !self.nx_backends.contains_key(&publication.repo_id)
+                                    || self.nx_publications.contains_key(&publication.workspace_id)
+                                    || session.token.matches(&publication.token)
+                                {
+                                    return Err(GatewayError::NxAuthority("Nx publication does not match the active project/session or already has a writer".to_owned()));
+                                }
+                                Ok(())
+                            });
+                            if result.is_ok() {
+                                self.nx_publications.insert(publication.workspace_id.clone(), publication);
+                            }
+                            let _ = reply.send(result);
+                        }
+                        Command::EndNxPublication { workspace_id, token, reply } => {
+                            if self.nx_publications.get(&workspace_id).is_some_and(|publication| publication.token.matches(&token)) {
+                                self.nx_publications.remove(&workspace_id);
+                                self.cancel_queued(&workspace_id).await;
+                            }
+                            let _ = reply.send(Ok(()));
+                        }
                         Command::Install { session, reply } => {
+                            self.nx_publications.remove(&session.workspace_id);
                             let result = self.install(session).await;
                             let _ = reply.send(result);
                         }
@@ -941,6 +1033,7 @@ impl Actor {
                             expected_revision,
                             reply,
                         } => {
+                            self.nx_publications.remove(&workspace_id);
                             let result = self.remove(&workspace_id, expected_revision).await;
                             let _ = reply.send(result);
                         }
@@ -1209,6 +1302,40 @@ impl Actor {
         session.listener_task = listener_task;
     }
 
+    async fn ensure_nx_backend(
+        config: Option<&crate::nx_cache::NxCacheServiceConfig>,
+        backends: &mut HashMap<String, NxCacheBackend>,
+        processes: &mut HashMap<String, tokio::process::Child>,
+        publications: &mut HashMap<String, NxPublication>,
+        repo_id: &str,
+    ) -> Result<(), GatewayError> {
+        if let Some(process) = processes.get_mut(repo_id) {
+            match process.try_wait()? {
+                None => return Ok(()),
+                Some(status) => {
+                    processes.remove(repo_id);
+                    backends.remove(repo_id);
+                    publications.retain(|_, publication| publication.repo_id != repo_id);
+                    return Err(GatewayError::NxAuthority(format!(
+                        "project Nx cache backend {repo_id} exited {status}; the next request may reopen it"
+                    )));
+                }
+            }
+        }
+        if backends.contains_key(repo_id) {
+            return Ok(());
+        }
+        let config = config.ok_or_else(|| {
+            GatewayError::NxAuthority("the installed Nx cache service is unavailable".to_owned())
+        })?;
+        let (backend, process) = crate::nx_cache::start_backend(config, repo_id)
+            .await
+            .map_err(GatewayError::NxAuthority)?;
+        backends.insert(repo_id.to_owned(), backend);
+        processes.insert(repo_id.to_owned(), process);
+        Ok(())
+    }
+
     async fn admit(
         &mut self,
         workspace_id: String,
@@ -1230,30 +1357,39 @@ impl Actor {
             let _ = reply.send(Err(audit_unavailable()));
             return;
         };
-        let authenticated = match authentication {
-            Authentication::Bearer(Some(token)) => session.token.matches_encoded(&token),
-            Authentication::Bearer(None) => false,
-            Authentication::Generation(generation) => generation == session.generation,
-        };
+        let is_nx = matches!(intent.target, RequestTarget::LocalNx);
+        let publication = self.nx_publications.get(&workspace_id);
+        let writer = is_nx && publication.is_some_and(|publication| {
+            publication.repo_id == session.repo_id && publication.expected_revision == session.revision
+                && matches!(&authentication, Authentication::Bearer(Some(token)) if publication.token.matches_encoded(token))
+        });
+        let authenticated = writer
+            || match &authentication {
+                Authentication::Bearer(Some(token)) => session.token.matches_encoded(token),
+                Authentication::Bearer(None) => false,
+                Authentication::Generation(generation) => {
+                    *generation == session.generation && !is_nx
+                }
+            };
         if !authenticated {
-            // 407, not 401: this is a proxy rejecting the client's credential for itself, and only
-            // 407 carries the `Proxy-Authenticate` challenge that lets a standard client answer
-            // with the proxy userinfo it already holds. A 401 tells the client the *upstream*
-            // demanded authentication, which no client can act on and every client reports as an
-            // opaque tunnel failure.
+            let status = if is_nx {
+                StatusCode::UNAUTHORIZED
+            } else {
+                StatusCode::PROXY_AUTHENTICATION_REQUIRED
+            };
             let draft = denial_draft(
                 &workspace_id,
                 session,
                 &intent,
                 AuditStatus::Unauthorized,
-                StatusCode::PROXY_AUTHENTICATION_REQUIRED,
+                status,
                 None,
             );
             let recorded = self.record(draft).await;
             let _ = reply.send(Err(if recorded {
                 admission_error(
-                    StatusCode::PROXY_AUTHENTICATION_REQUIRED,
-                    "missing or invalid proxy credential",
+                    status,
+                    "missing or invalid gateway credential",
                     AuditStatus::Unauthorized,
                     None,
                 )
@@ -1262,7 +1398,50 @@ impl Actor {
             }));
             return;
         }
-        let seed = match build_seed(&workspace_id, session, &intent) {
+        if is_nx
+            && let Err(error) = Self::ensure_nx_backend(
+                self.config.nx_cache.as_ref(),
+                &mut self.nx_backends,
+                &mut self.nx_processes,
+                &mut self.nx_publications,
+                &session.repo_id,
+            )
+            .await
+        {
+            let message = error.to_string();
+            let _ = self
+                .audit_denial(
+                    &workspace_id,
+                    AuditAttempt {
+                        kind: intent.audit_kind,
+                        host: None,
+                        method: intent.method.to_string(),
+                        path: intent.path.clone(),
+                        status: AuditStatus::Failed,
+                        http_status: StatusCode::SERVICE_UNAVAILABLE,
+                        classification: "nx-backend-unavailable",
+                    },
+                )
+                .await;
+            let _ = reply.send(Err(admission_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "project Nx cache backend is unavailable",
+                AuditStatus::Failed,
+                Some(message),
+            )));
+            return;
+        }
+        let seed = match build_seed(
+            &workspace_id,
+            session,
+            &intent,
+            self.nx_backends.get(&session.repo_id),
+            if writer {
+                self.nx_publications.get(&workspace_id)
+            } else {
+                None
+            },
+        ) {
             Ok(seed) => seed,
             Err((denial, hint)) => {
                 let draft = denial_draft(
@@ -1735,6 +1914,19 @@ impl Actor {
         if !self.draining || self.global_active.total() != 0 {
             return Ok(false);
         }
+        self.nx_publications.clear();
+        for (_, mut process) in self.nx_processes.drain() {
+            if let Some(pid) = process.id() {
+                // The actor owns this child; SIGTERM lets its existing server drain.
+                let pid = libc::pid_t::try_from(pid)
+                    .map_err(|_| std::io::Error::other("Nx cache child pid is out of range"))?;
+                let result = unsafe { libc::kill(pid, libc::SIGTERM) };
+                if result != 0 {
+                    return Err(std::io::Error::last_os_error().into());
+                }
+            }
+            process.wait().await?;
+        }
         let sessions = std::mem::take(&mut self.sessions);
         for (_, session) in sessions {
             session.stop().await;
@@ -1750,6 +1942,8 @@ impl Actor {
     }
 
     async fn force_stop(&mut self) -> Result<(), GatewayError> {
+        self.nx_publications.clear();
+        self.nx_processes.clear();
         let sessions = std::mem::take(&mut self.sessions);
         for (_, session) in sessions {
             session.stop().await;
@@ -1778,7 +1972,10 @@ fn build_seed(
     workspace_id: &str,
     session: &SessionState,
     intent: &RequestIntent,
+    nx_backend: Option<&NxCacheBackend>,
+    publication: Option<&NxPublication>,
 ) -> Result<AdmissionSeed, (&'static str, Option<String>)> {
+    let mut nx_token = None;
     let (target, mode, protocol, credential_allowed, private_network_authorized, upstream_path) =
         match &intent.target {
             RequestTarget::Generic(target) => {
@@ -1806,6 +2003,35 @@ fn build_seed(
                         }),
                     grant.host.is_exact(),
                     intent.path.clone(),
+                )
+            }
+            RequestTarget::LocalNx => {
+                let hash = crate::nx_cache::route_hash(&intent.path)
+                    .ok_or(("Nx cache path is invalid", None))?;
+                let backend =
+                    nx_backend.ok_or(("project Nx cache backend is unavailable", None))?;
+                let token = if intent.method == Method::GET {
+                    &backend.read_token
+                } else if intent.method == Method::PUT {
+                    let qualified = publication
+                        .filter(|publication| publication.hashes.contains(hash))
+                        .ok_or((
+                            "Nx cache publication requires an active qualified landing",
+                            None,
+                        ))?;
+                    let _ = qualified;
+                    &backend.write_token
+                } else {
+                    return Err(("Nx cache accepts only GET and PUT", None));
+                };
+                nx_token = Some(token.clone());
+                (
+                    backend.target(),
+                    EgressMode::Intercept,
+                    None,
+                    false,
+                    true,
+                    format!("/v1/cache/{hash}"),
                 )
             }
             RequestTarget::LocalSim => {
@@ -1837,6 +2063,7 @@ fn build_seed(
         protocol,
         credential_allowed,
         private_network_authorized,
+        nx_token,
         audit_kind: match protocol {
             Some(MirrorProtocol::Npm) => AuditKind::Npm,
             None => intent.audit_kind,
@@ -1887,7 +2114,7 @@ fn denial_draft(
 ) -> AuditDraft {
     let host = match &intent.target {
         RequestTarget::Generic(target) => Some(target.authority()),
-        RequestTarget::LocalSim => None,
+        RequestTarget::LocalSim | RequestTarget::LocalNx => None,
     };
     AuditDraft {
         workspace_id: workspace_id.to_owned(),
@@ -2184,6 +2411,8 @@ pub enum GatewayError {
     RepoMirror(#[from] RepoMirrorError),
     #[error(transparent)]
     SimBroker(#[from] SimBrokerError),
+    #[error("Nx cache authority refused: {0}")]
+    NxAuthority(String),
     #[error("gateway session capacity is exhausted")]
     SessionCapacity,
     #[error("gateway I/O failed: {0}")]
@@ -2228,6 +2457,7 @@ mod tests {
             protocol: None,
             credential_allowed: false,
             private_network_authorized: false,
+            nx_token: None,
             audit_kind: AuditKind::Connect,
             method,
             request_path: "/".to_owned(),

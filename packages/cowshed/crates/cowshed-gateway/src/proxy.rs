@@ -62,6 +62,7 @@ const MAX_HEADERS: usize = 100;
 const MAX_HEADER_FIELD: usize = 16 * 1024;
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_REQUEST_BODY: usize = 64 * 1024 * 1024;
+const MAX_NX_REQUEST_BODY: usize = 1024 * 1024 * 1024;
 const MAX_CLIENT_HELLO: usize = 64 * 1024;
 const MAX_SIM_REQUEST: usize = 64 * 1024;
 const MAX_H2_CONCURRENT_STREAMS: u32 = 32;
@@ -187,7 +188,21 @@ async fn handle_request(
         Authentication::Generation(generation) => Authentication::Generation(generation),
         Authentication::Bearer(_) => Authentication::Bearer(presented_token(
             request.headers(),
-            header::PROXY_AUTHORIZATION,
+            if fixed_target.is_none()
+                && request.uri().scheme().is_none()
+                && request.uri().authority().is_none()
+                && crate::nx_cache::route_hash(
+                    request
+                        .uri()
+                        .path_and_query()
+                        .map_or("/", |path| path.as_str()),
+                )
+                .is_some()
+            {
+                header::AUTHORIZATION
+            } else {
+                header::PROXY_AUTHORIZATION
+            },
         )),
     };
     if request.method() == Method::CONNECT {
@@ -1918,6 +1933,13 @@ async fn prepare_upstream_request(
     };
     write_upstream_headers(&mut parts.headers, &admission.target, trace)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if let Some(token) = &admission.nx_token {
+        let encoded = zeroize::Zeroizing::new(format!("Bearer {}", token.encode()));
+        let mut value = HeaderValue::from_str(encoded.as_str())
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        value.set_sensitive(true);
+        parts.headers.insert(header::AUTHORIZATION, value);
+    }
     if admission.credential_allowed {
         let protocol = admission
             .protocol
@@ -1955,7 +1977,15 @@ async fn prepare_upstream_request(
     )?;
     parts.version = version;
     parts.uri = uri;
-    let body = Limited::new(body, MAX_REQUEST_BODY).boxed();
+    let body = Limited::new(
+        body,
+        if admission.nx_token.is_some() {
+            MAX_NX_REQUEST_BODY
+        } else {
+            MAX_REQUEST_BODY
+        },
+    )
+    .boxed();
     let (signal, request_timeout) = oneshot::channel();
     let body =
         TimedRequestBody::new(body, signal, context.timeouts.body_idle, total_deadline).boxed();
@@ -2215,6 +2245,13 @@ fn request_target(
     }
     if let Some(kind) = local_kind {
         return Ok((RequestTarget::LocalSim, path, kind));
+    }
+    if fixed.is_none()
+        && request.uri().scheme().is_none()
+        && request.uri().authority().is_none()
+        && crate::nx_cache::route_hash(&path).is_some()
+    {
+        return Ok((RequestTarget::LocalNx, path, AuditKind::Http));
     }
     Err(RequestError::bad(
         "generic proxy requests require absolute-form URI",
@@ -2967,6 +3004,17 @@ fn empty(status: StatusCode) -> Response<ResponseBody> {
 const PROXY_REALM: &str = "Basic realm=\"cowshed\", charset=\"UTF-8\"";
 
 fn problem(status: StatusCode, message: &str, hint: Option<&str>) -> Response<ResponseBody> {
+    if status == StatusCode::UNAUTHORIZED {
+        let body = Full::new(Bytes::copy_from_slice(message.as_bytes()))
+            .map_err(|never| -> BoxError { match never {} })
+            .boxed();
+        return Response::builder()
+            .status(status)
+            .header(header::CONTENT_TYPE, "text/plain")
+            .header(header::WWW_AUTHENTICATE, "Bearer")
+            .body(ProxyBody::boxed(body))
+            .expect("static response is valid");
+    }
     json_problem(
         status,
         serde_json::json!({

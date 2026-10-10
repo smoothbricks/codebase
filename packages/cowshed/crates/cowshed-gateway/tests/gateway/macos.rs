@@ -1,4 +1,6 @@
 use super::*;
+#[path = "nx_process.rs"]
+mod nx_process;
 
 use bytes::Bytes;
 use cowshed_gateway::{
@@ -3461,4 +3463,181 @@ async fn direct_https_proxy_uses_negotiated_upstream_h2() {
         .await
         .expect("direct h2 upstream timeout")
         .expect("direct h2 upstream task");
+}
+
+#[derive(Debug, Default)]
+struct NxRecordingAudit {
+    events: Mutex<Vec<AuditEvent>>,
+}
+#[async_trait]
+impl AuditSink for NxRecordingAudit {
+    async fn record(&self, event: AuditEvent) -> Result<(), AuditError> {
+        self.events.lock().expect("audit lock").push(event);
+        Ok(())
+    }
+    async fn flush(&self) -> Result<(), AuditError> {
+        Ok(())
+    }
+}
+fn nx_request(endpoint: SocketAddr, method: &str, token: &str, hash: &str) -> String {
+    format!(
+        "{method} /nx/v1/cache/{hash} HTTP/1.1\r\nHost: {endpoint}\r\nAuthorization: Bearer {token}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    )
+}
+#[tokio::test]
+async fn nx_cache_route_is_project_bound_readonly_except_qualified_hashes() {
+    use cowshed_gateway::{NxCacheBackend, NxPublication};
+    let (port, mut captured, upstream) = http_fixture(2, None).await;
+    let (config, _cache) = test_config();
+    let audit = Arc::new(NxRecordingAudit::default());
+    let gateway = gateway(
+        config,
+        Arc::new(NoCredentials),
+        Arc::new(LocalConnector {
+            health: UpstreamHealth::Healthy,
+            observed: None,
+        }),
+        audit.clone(),
+    )
+    .await;
+    let handle = gateway.handle();
+    handle
+        .configure_nx_cache(NxCacheBackend {
+            repo_id: "owner/nx-one".to_owned(),
+            address: SocketAddr::from(([127, 0, 0, 1], port)),
+            read_token: WorkspaceToken::from_bytes([41; 32]),
+            write_token: WorkspaceToken::from_bytes([42; 32]),
+            reclaimed_staging_files: 0,
+        })
+        .await
+        .expect("configure project backend");
+    let (source, source_token, _) = session(
+        "nx-source",
+        "owner/nx-one",
+        block_endpoint(free_endpoint()),
+        1,
+        1,
+        WorkspacePolicy::default(),
+    );
+    let source_endpoint = install_in_free_block(&handle, source).await;
+    let (foreign, foreign_token, _) = session(
+        "nx-foreign",
+        "owner/nx-two",
+        block_endpoint(free_endpoint()),
+        2,
+        1,
+        WorkspacePolicy::default(),
+    );
+    let foreign_endpoint = install_in_free_block(&handle, foreign).await;
+    let response = proxy_request(
+        source_endpoint,
+        nx_request(source_endpoint, "GET", &source_token, "42"),
+    )
+    .await;
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    let forwarded = captured.recv().await.expect("forwarded read");
+    assert!(forwarded.starts_with("GET /v1/cache/42 "), "{forwarded}");
+    assert!(
+        forwarded.to_ascii_lowercase().contains(
+            &format!(
+                "authorization: bearer {}",
+                WorkspaceToken::from_bytes([41; 32]).encode()
+            )
+            .to_ascii_lowercase()
+        )
+    );
+    assert!(
+        !forwarded
+            .to_ascii_lowercase()
+            .contains("proxy-authorization")
+    );
+    let response = proxy_request(
+        source_endpoint,
+        nx_request(source_endpoint, "PUT", &source_token, "42"),
+    )
+    .await;
+    assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+    let response = proxy_request(
+        source_endpoint,
+        nx_request(source_endpoint, "GET", &foreign_token, "42"),
+    )
+    .await;
+    assert!(response.starts_with("HTTP/1.1 401"), "{response}");
+    assert!(
+        response
+            .to_ascii_lowercase()
+            .contains("content-type: text/plain\r\n")
+    );
+    let response = proxy_request(
+        foreign_endpoint,
+        nx_request(foreign_endpoint, "GET", &foreign_token, "42"),
+    )
+    .await;
+    assert!(response.starts_with("HTTP/1.1 503"), "{response}");
+    let publication_token = WorkspaceToken::from_bytes([43; 32]);
+    handle
+        .begin_nx_publication(NxPublication {
+            workspace_id: "nx-source".to_owned(),
+            repo_id: "owner/nx-one".to_owned(),
+            expected_revision: 1,
+            accepted_head: "a".repeat(40),
+            hashes: BTreeSet::from(["42".to_owned()]),
+            token: publication_token.clone(),
+        })
+        .await
+        .expect("private qualified publication");
+    let encoded = publication_token.encode();
+    let response = proxy_request(
+        source_endpoint,
+        nx_request(source_endpoint, "PUT", &encoded, "43"),
+    )
+    .await;
+    assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+    let response = proxy_request(
+        source_endpoint,
+        nx_request(source_endpoint, "PUT", &source_token, "42"),
+    )
+    .await;
+    assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+    let response = proxy_request(
+        source_endpoint,
+        nx_request(source_endpoint, "PUT", &encoded, "42"),
+    )
+    .await;
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    let forwarded = captured.recv().await.expect("forwarded publication");
+    assert!(forwarded.starts_with("PUT /v1/cache/42 "), "{forwarded}");
+    assert!(
+        forwarded.to_ascii_lowercase().contains(
+            &format!(
+                "authorization: bearer {}",
+                WorkspaceToken::from_bytes([42; 32]).encode()
+            )
+            .to_ascii_lowercase()
+        )
+    );
+    handle
+        .end_nx_publication("nx-source".to_owned(), publication_token)
+        .await
+        .expect("revoke publication");
+    let response = proxy_request(
+        source_endpoint,
+        nx_request(source_endpoint, "PUT", &encoded, "42"),
+    )
+    .await;
+    assert!(response.starts_with("HTTP/1.1 401"), "{response}");
+    gateway.drain().await.expect("drain gateway");
+    upstream.await.expect("upstream fixture");
+    let events = audit.events.lock().expect("audit events");
+    assert!(
+        events
+            .iter()
+            .any(|event| event.path.as_deref() == Some("/nx/v1/cache/42")
+                && event.status == AuditStatus::Denied)
+    );
+    assert!(
+        events.iter().any(
+            |event| event.http_status == Some(401) && event.status == AuditStatus::Unauthorized
+        )
+    );
 }

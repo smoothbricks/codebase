@@ -563,6 +563,7 @@ where
     let executable =
         HostStableExecutable::new(&home, COWSHED_BINARY_NAME).map_err(launchd_error)?;
     refuse_downgrade(&executable, &candidate, downgrade)?;
+    install_nx_cache_server(&mut executor, &home, &candidate.source)?;
     let spec = LaunchAgentSpec::gateway(&executable).map_err(launchd_error)?;
     let observed = inspect_install_state(&spec)?;
     let plan = plan_install(
@@ -814,8 +815,9 @@ pub fn gateway_launch_agent(home: &Path) -> Result<(HostStableExecutable, Launch
     Ok((executable, spec))
 }
 
-/// Stop the gateway; with `purge`, also delete the installed cowshed it ran — and the links on
-/// `PATH` that name it, which would otherwise answer `command not found` from the next shell.
+/// Stop the gateway; with `purge`, also delete the installed cowshed and its installed Nx cache
+/// server companion it ran — and the links on `PATH` that name cowshed, which would otherwise
+/// answer `command not found` from the next shell.
 ///
 /// Without `purge` the copy stays: it is host state rather than agent state, and leaving it makes
 /// the next `start` a plist write instead of a fresh multi-megabyte copy.
@@ -825,7 +827,22 @@ fn stop_service(purge: bool) -> Result<RemovalOutcome> {
     remove_launch_agent(spec.target())?;
     if purge {
         remove_path_entries(executable.path())?;
-        return remove_host_stable_executable(&executable);
+        let companion =
+            HostStableExecutable::new(&home, "nx-cache-server").map_err(launchd_error)?;
+        let removed = [
+            remove_host_stable_executable(&companion)?,
+            remove_host_stable_executable(&executable)?,
+        ];
+        return Ok(
+            if removed
+                .iter()
+                .any(|outcome| matches!(outcome, RemovalOutcome::Removed))
+            {
+                RemovalOutcome::Removed
+            } else {
+                RemovalOutcome::AlreadyAbsent
+            },
+        );
     }
     Ok(RemovalOutcome::AlreadyAbsent)
 }
@@ -937,6 +954,15 @@ async fn run_daemon() -> Result<()> {
             heal: Arc::clone(&heal),
             manager: Arc::clone(&manager),
         })),
+        nx_cache: Some(cowshed_gateway::NxCacheServiceConfig {
+            executable: HostStableExecutable::new(&home, "nx-cache-server")
+                .map_err(launchd_error)?
+                .path()
+                .to_path_buf(),
+            directory: paths.cache_dir.join("nx"),
+            max_bytes: 1024 * 1024 * 1024,
+            cap_bytes: 10 * 1024 * 1024 * 1024,
+        }),
         ..paths.config(effective_uid(), executable)
     };
     let telemetry = ArrowAuditConfig::new(paths.telemetry.clone())
@@ -1235,6 +1261,34 @@ impl Candidate {
 pub enum Downgrade {
     Refuse,
     Allow,
+}
+
+/// Install the exact server artifact packaged beside this cowshed. Never resolve a source
+/// checkout, an ambient PATH server, or a separate live workspace at daemon startup.
+fn install_nx_cache_server<F, C>(
+    executor: &mut LaunchdExecutor<F, C>,
+    home: &Path,
+    cowshed_source: &Path,
+) -> Result<HostStableExecutable>
+where
+    F: LaunchdFilesystem,
+{
+    let source = cowshed_source.with_file_name("nx-cache-server");
+    if !source.is_file() {
+        return Err(CowshedError::environment_missing(
+            format!(
+                "the cowshed distribution is missing its Nx cache server artifact {}",
+                source.display()
+            ),
+            "build or install the complete cowshed platform package, then run its cowshed setup",
+        ));
+    }
+    let executable = HostStableExecutable::new(home, "nx-cache-server").map_err(launchd_error)?;
+    let retained = retain_previous_executable(executor, &executable)?;
+    let digest = executable_digest(&source)?;
+    install_stored_executable(executor, &executable, &digest, &source)?;
+    prune_superseded(executor, &executable, &digest, retained.as_deref());
+    Ok(executable)
 }
 
 /// Install `source` as the host's cowshed: a copy of its bytes named for their digest, and the
@@ -1569,7 +1623,8 @@ fn prune_superseded<F, C>(
     });
     if let Err(error) = pruned {
         eprintln!(
-            "cowshed: could not remove superseded copies of cowshed: {}",
+            "cowshed: could not remove superseded copies of {}: {}",
+            executable.path().display(),
             error.message
         );
     }
@@ -1730,14 +1785,21 @@ pub async fn refresh_gateway_binary(
         Err(_) => None,
     };
     let mut executor = LaunchdExecutor::new(NativeFilesystem::new(), NativeLaunchctlCommand);
-    refresh_gateway_from(
+    let refreshed = refresh_gateway_from(
         home,
         &candidate,
         cfg!(debug_assertions),
         downgrade,
         daemon.as_ref(),
         &mut executor,
-    )
+    )?;
+    if !matches!(
+        refreshed,
+        Some(ServiceBinaryRefresh::Refused { .. } | ServiceBinaryRefresh::Downgrade { .. })
+    ) {
+        install_nx_cache_server(&mut executor, home, &candidate.source)?;
+    }
+    Ok(refreshed)
 }
 
 fn refresh_gateway_from<C: LaunchctlCommand>(

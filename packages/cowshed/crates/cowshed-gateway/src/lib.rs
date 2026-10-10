@@ -16,6 +16,7 @@ mod interfaces;
 mod jobserver;
 mod mirror;
 mod npm_index;
+mod nx_cache;
 mod platform;
 mod proxy;
 mod repo_mirror;
@@ -56,6 +57,7 @@ pub use mirror::{
     MirrorOutcome, MirrorProtocolMetadata, MirrorRedirect, MirrorRequest, MirrorResourceKind,
     MirrorResponse, MirrorService, MirrorUpstream,
 };
+pub use nx_cache::{NxCacheBackend, NxCacheServiceConfig, NxPublication};
 #[cfg(target_os = "macos")]
 pub use platform::KeychainCredentialProvider;
 #[cfg(target_os = "linux")]

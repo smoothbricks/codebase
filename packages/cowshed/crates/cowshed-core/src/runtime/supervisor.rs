@@ -1665,6 +1665,26 @@ pub(super) async fn sandbox_environment(
         OsStr::new(&sandbox.port_block.size().to_string()),
     );
     own(WORKSPACE_TOKEN_ENV, OsStr::new(&encoded_token));
+    if sandbox
+        .capabilities
+        .contribution
+        .env
+        .contains_key("NX_CACHE_DIRECTORY")
+    {
+        own(
+            crate::workspace_environment::NX_REMOTE_SERVER_ENV,
+            OsStr::new(&format!("http://127.0.0.1:{port_base}/nx")),
+        );
+        own(
+            crate::workspace_environment::NX_REMOTE_TOKEN_ENV,
+            OsStr::new(&encoded_token),
+        );
+    } else {
+        withheld.extend([
+            crate::workspace_environment::NX_REMOTE_SERVER_ENV,
+            crate::workspace_environment::NX_REMOTE_TOKEN_ENV,
+        ]);
+    }
     for name in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"] {
         own(name, OsStr::new(&gateway_http));
     }

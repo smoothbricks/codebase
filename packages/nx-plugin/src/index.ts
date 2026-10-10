@@ -74,6 +74,7 @@ import {
 } from './nextest-extraction.js';
 import { runtimeInput, shellWord } from './runtime-input.js';
 import { isNonSourceDirectory } from './source-directories.js';
+import { postTasksExecution, preTasksExecution } from './task-results.js';
 import {
   isBuildOutputTargetName,
   isTestRunnerTargetName,
@@ -82,7 +83,7 @@ import {
 } from './workspace-config-policy.js';
 import { globIndexedFiles } from './workspace-index.js';
 
-export { CARGO_TEST_COMPILE_TARGET };
+export { CARGO_TEST_COMPILE_TARGET, postTasksExecution, preTasksExecution };
 
 /** Makes a version live and proves it answers; never cached. */
 export const DEPLOY_TARGET = 'deploy';
@@ -1064,7 +1065,7 @@ function isBuildOutputPackageJson(packageJsonPath: string): boolean {
   return BUILD_OUTPUT_SEGMENTS.some((segment) => normalized.includes(segment));
 }
 
-export default { createNodesV2 };
+export default { createNodesV2, postTasksExecution, preTasksExecution };
 
 interface PackageJson {
   bin?: unknown;
