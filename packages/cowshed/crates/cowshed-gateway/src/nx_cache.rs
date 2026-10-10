@@ -81,6 +81,16 @@ pub(crate) fn route_hash(path: &str) -> Option<&str> {
         .filter(|hash| is_task_hash(hash))
 }
 
+/// The status an unavailable Nx backend answers with, before any response head: a read is a miss
+/// and a write is refused. Nothing is staged or sent to a backend that cannot take it.
+pub(crate) fn unavailable_status(method: &http::Method) -> http::StatusCode {
+    if *method == http::Method::GET {
+        http::StatusCode::NOT_FOUND
+    } else {
+        http::StatusCode::FORBIDDEN
+    }
+}
+
 /// Installed standalone server bytes and a host-private artifact root. A backend is started only
 /// when an Nx client first asks for its project, not for every non-Nx workspace in inventory.
 #[derive(Clone, Debug)]

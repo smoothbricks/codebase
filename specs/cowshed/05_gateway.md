@@ -293,6 +293,24 @@ artifact or 404 for a miss; `PUT` returns 200 for a publication, 409 for an exis
 refusal. An incomplete, interrupted, or evicted artifact is never a successful empty restore. Project backend lifecycle
 and bounded eviction belong to 03_caches.md.
 
+**Backend outage.** When a project's backend is unavailable, the gateway answers `GET` as a miss (404) and refuses `PUT`
+with 403 before forwarding, as an optimization: no archive is staged or sent to a backend that cannot take it. Each such
+request is audited with status `failed` and classification `nx-backend-unavailable`, and the server side logs the cause
+loudly. An outage is never a successful read: a 404 from it is not evidence that a hash is absent, and no audit record
+or receipt counts it as a hit.
+
+**Backend lifecycle isolation.** Each repository's backend is supervised by a per-repository lifecycle state
+(`Starting`, `Ready`, or `Failed { retry_after }`) held outside the request actor. Concurrent requests for one
+repository share one start (single-flight). A failed start records `Failed { retry_after }` with `retry_after` taken
+from `GatewayTimeouts.connect` (default 5 s); until it elapses, requests for that repository are refused as in the
+outage above, without starting another child, and other repositories are unaffected. If the child exits, the next
+request replaces it immediately within the same call.
+
+**Outage before and after the response head.** The statuses above apply only before the response head. Once the upstream
+commits a success head, the gateway keeps `200` and cannot change it. A body that then fails, times out, or is dropped
+ends early, and its audit event is `failed` with classification `nx-transfer-failed`, never a hit or a completed read. A
+client must treat a short body as a failed read; the gateway stages and buffers nothing to hide the cut.
+
 **Read-only is an authority guarantee, not a client-cost claim.** Stock Nx 23.2.1's `native/cache/http_remote_cache.rs`
 has no independent read-only/skip-upload option. Its `store` first builds an in-memory gzip tar archive, then attempts
 `PUT`; 403 returns false without failing the task. `skipRemoteCache` disables reads too. Do not patch Nx or hide the

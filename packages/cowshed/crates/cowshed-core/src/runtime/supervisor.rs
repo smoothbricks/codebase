@@ -7834,6 +7834,80 @@ mod workspace_toolchain_tests {
             Some(crate::capabilities::EnvAction::Unset)
         );
     }
+
+    /// The Nx cache endpoint and token are the workspace's own read authority, whatever the caller
+    /// supplies. A caller-named endpoint or token never reaches the child, and a checkout without
+    /// Nx withholds both names.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn caller_supplied_nx_endpoint_and_token_never_reach_the_child() {
+        let root = scratch("nx-endpoint");
+        let mount = root.join("workspace");
+        std::fs::create_dir_all(mount.join(".cowshed")).expect("metadata directory");
+        let token = cowshed_gateway_types::WorkspaceToken::from_bytes([7; 32]);
+        std::fs::write(
+            mount.join(crate::workspace_credentials::WORKSPACE_TOKEN_PATH),
+            token.encode(),
+        )
+        .expect("workspace token");
+        let caller = BTreeMap::from([
+            (
+                crate::workspace_environment::NX_REMOTE_SERVER_ENV.to_owned(),
+                "http://attacker.example:9/nx".to_owned(),
+            ),
+            (
+                crate::workspace_environment::NX_REMOTE_TOKEN_ENV.to_owned(),
+                "attacker-token".to_owned(),
+            ),
+        ]);
+        let sandbox = sandbox_at(&mount);
+        std::fs::create_dir_all(&sandbox.home).expect("home");
+
+        // Without an Nx project, the caller's endpoint and token are withheld, not passed through.
+        let mut plain = sandbox.clone();
+        plain.configure_capabilities().expect("detect capabilities");
+        let without_nx = sandbox_environment(&plain, &caller)
+            .await
+            .expect("environment")
+            .child(&caller);
+        assert!(
+            without_nx
+                .get(OsStr::new(
+                    crate::workspace_environment::NX_REMOTE_SERVER_ENV
+                ))
+                .is_none()
+        );
+        assert!(
+            without_nx
+                .get(OsStr::new(
+                    crate::workspace_environment::NX_REMOTE_TOKEN_ENV
+                ))
+                .is_none()
+        );
+
+        // With one, both names are the workspace's own read endpoint and workspace token.
+        std::fs::write(mount.join("nx.json"), "{}").expect("nx project");
+        let mut configured = sandbox.clone();
+        configured
+            .configure_capabilities()
+            .expect("detect capabilities");
+        let child = sandbox_environment(&configured, &caller)
+            .await
+            .expect("environment")
+            .child(&caller);
+        assert_eq!(
+            child.get(OsStr::new(
+                crate::workspace_environment::NX_REMOTE_SERVER_ENV
+            )),
+            Some(&std::ffi::OsString::from("http://127.0.0.1:40960/nx"))
+        );
+        assert_eq!(
+            child.get(OsStr::new(
+                crate::workspace_environment::NX_REMOTE_TOKEN_ENV
+            )),
+            Some(&std::ffi::OsString::from(token.encode()))
+        );
+    }
 }
 
 #[cfg(test)]

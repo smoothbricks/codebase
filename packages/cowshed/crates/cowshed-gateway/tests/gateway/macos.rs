@@ -1,6 +1,10 @@
 use super::*;
+#[path = "nx_outage.rs"]
+mod nx_outage;
 #[path = "nx_process.rs"]
 mod nx_process;
+#[path = "nx_stream_kill.rs"]
+mod nx_stream_kill;
 
 use bytes::Bytes;
 use cowshed_gateway::{
@@ -3573,7 +3577,7 @@ async fn nx_cache_route_is_project_bound_readonly_except_qualified_hashes() {
         nx_request(foreign_endpoint, "GET", &foreign_token, "42"),
     )
     .await;
-    assert!(response.starts_with("HTTP/1.1 503"), "{response}");
+    assert!(response.starts_with("HTTP/1.1 404"), "{response}");
     let publication_token = WorkspaceToken::from_bytes([43; 32]);
     handle
         .begin_nx_publication(NxPublication {

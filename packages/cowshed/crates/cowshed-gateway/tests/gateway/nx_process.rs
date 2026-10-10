@@ -28,13 +28,15 @@ const STREAM_LIMIT: u64 = 64 * 1024;
 
 /// The packaged standalone server for this host. Built by its own package step; the test asserts
 /// it exists rather than falling back to any other server.
-fn server_executable() -> PathBuf {
+pub(super) fn server_executable() -> PathBuf {
     let arch = if cfg!(target_arch = "aarch64") {
         "darwin-arm64"
     } else {
         "darwin-x64"
     };
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+    let manifest = std::env::var_os("CARGO_MANIFEST_DIR")
+        .expect("cargo and nextest export CARGO_MANIFEST_DIR to the test process");
+    let path = Path::new(&manifest)
         .join("../../../../packages/nx-cache-server/dist/bin")
         .join(arch)
         .join("nx-cache-server");
@@ -150,7 +152,7 @@ async fn nx_backend_gateway_child() {
         WorkspacePolicy::default(),
     );
     let reader_endpoint = install_in_free_block(&handle, reader).await;
-    let (foreign, _foreign_token, _) = session(
+    let (foreign, foreign_token, _) = session(
         "nx-process-foreign",
         "owner/nx-process-foreign",
         block_endpoint(free_endpoint()),
@@ -158,7 +160,7 @@ async fn nx_backend_gateway_child() {
         1,
         WorkspacePolicy::default(),
     );
-    let _foreign_endpoint = install_in_free_block(&handle, foreign).await;
+    let foreign_endpoint = install_in_free_block(&handle, foreign).await;
 
     // An ordinary workspace credential may not publish, before or after the backend starts.
     let response = proxy_request(
@@ -247,6 +249,21 @@ async fn nx_backend_gateway_child() {
     .await;
     assert!(response.starts_with("HTTP/1.1 403"), "{response}");
 
+    // Credentials never cross projects: each session's token is refused by the other project's
+    // listener before any backend is asked for an accepted key. Auth runs before startup, so this
+    // starts no second server.
+    let response = proxy_request(
+        source_endpoint,
+        nx_request(source_endpoint, "GET", &foreign_token, "42"),
+    )
+    .await;
+    assert!(response.starts_with("HTTP/1.1 401"), "{response}");
+    let response = proxy_request(
+        foreign_endpoint,
+        nx_request(foreign_endpoint, "GET", &source_token, "42"),
+    )
+    .await;
+    assert!(response.starts_with("HTTP/1.1 401"), "{response}");
     // Every assertion above passed. The parent learns where the store lives and that the gateway
     // is serving; then it holds stdin until the parent closes it.
     let project = directory.join(format!("{:x}", Sha256::digest(REPO.as_bytes())));
