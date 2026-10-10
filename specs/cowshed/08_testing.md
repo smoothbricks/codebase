@@ -121,8 +121,8 @@ fixtures provide the existing `.cowshed` directory that workspace creation owns.
 No outer sandbox installation or permission change is required for this target: the authority boundary is unchanged.
 Updating the checkout's sandbox source cannot change an already-running outer supervisor; separately testing a changed
 runtime policy requires the controller to install the intended release and start a fresh supervisor. Never broaden
-`file-link` to make this proof run. The `real_apfs_*` tests attach real images through DiskManagement and land in
-whichever ordinary or exceptional shard the hash assigns them, so no subset of shards is their proof: run the owning
+`file-link` to make this proof run. The real-APFS tests attach real images through DiskManagement in one macOS serial
+group, excluded from every ordinary and exceptional shard. A selected subset is not their full proof: run the owning
 default Nx lint, test and build of `cowshed` (`nx run-many -p cowshed -t lint test build`, default parallelism, no
 per-lane selection) from an unsandboxed host-controller shell. A sandboxed run cannot attach images and is not evidence
 for those tests. Run the explicit `host-controller-test` target separately: it covers controller fixtures beyond the
@@ -207,20 +207,22 @@ whatever `TMPDIR` a runner has: every run's sweep must see every dead run, not o
 reaches its template by `clonefile`, which cannot cross volumes; and Darwin's socket bound must not depend on the
 runner's `TMPDIR`. The lease never detaches an image attached from below it; it keeps such a lease and names it.
 
-The `real_apfs_*` tests are scheduled like every other test: nextest runs them in parallel within a run, and the hash
-partitions place them in whichever Nx shard falls out. No nextest test group, `parallelism` flag, process cap or other
-throttle orders them, and the cowshed CLI lane is unrestricted the same way. What keeps concurrent fixtures from
-interfering is the production backend's per-image lease (01_storage.md), not scheduling: independent images overlap and
-one image is driven by one holder at a time. Across images, every test's disk tools run under the host's disk-lifecycle
-lease (05_gateway.md) through the same `SystemCommandRunner` production uses, so a test's attaches never queue behind
-another lane's mount churn. The earlier scheduling serialized these tests and was measured on a hosted arm64 macOS
-runner: the CLI lane overlapped other cargo lanes, checked land timed out at 30s while still inside adopt, and its two
-production `hdiutil detach` calls took 6.4s and 9.1s; the core exceptions lane, which ran with no other task running,
-completed whole create/attach/format/detach tests in 3.3–5.4s, but its 23 serialized tests did not fit one 120s window
-(17 took 117.5s, six were still waiting). Test selection, per-test deadlines and the 120s target bound are unchanged:
-`nextest.toml` singles out only tests carrying a raised `slow-timeout` (compile-fail tests and the real-APFS
-full-lifecycle tests), and those are hash-partitioned into `cargo-test-<crate>-exceptions-shard1..N` by the crate's
-declared shard count.
+On macOS, real-APFS coverage runs once in the dedicated root `cargo-test-group-real-apfs` target. Its nextest group has
+`max-threads = 1`: the host-global storage lease is serialized by one runner rather than contested by independent
+per-crate shards. `.config/nextest.toml` declares the group's filter once: `real_apfs_*`, the `apfs_native_macos` and
+`clone_intent_recovery` binaries, and the exact qualified job-volume accounting witness. Both ordinary and exceptions
+shards exclude that same declared filter, so no test is duplicated or dropped. Non-macOS planning creates no APFS group.
+
+Before the group runs, nextest lists runnable, nonignored matches from the same compiled archive and filter. For `N`
+matches, the target logs `N` and its `N * 30000` millisecond outer budget. Empty or malformed listings, listing failure,
+and a budget exceeding Node's timer range fail closed; the budget is never silently clamped. The ordinary targets keep
+their 120s bound and the default per-test 30s bound stays unchanged. The existing full-lifecycle 60s class overrides
+remain explicit; they can exceed a single test's 30s share of the outer budget. The RAM host walk runs after this group
+in `test-host`, outside the four pure Bun shards, with its own existing target and case bounds.
+
+The attach-budget precheck's expected attach count is remeasured whenever this group's real-APFS test set changes. A
+conservative stand-in is labeled as such, never reported as a measured count; before landing, the configured count is
+pinned to observed attach-command receipts plus an explicitly stated fixed margin.
 
 **The suite spends a finite host budget.** Every attach→detach cycle a test makes costs one AppleDiskImages2 attach slot
 that the host's live sheds lose until reboot (01_storage.md, "How the APFS host degrades"), so a test pays the fewest
@@ -237,15 +239,19 @@ sweep selects a live pid's root. Inside the first scratch root of every test pro
 and 13 s after a run whose tests timed out, and every other test process of the run waited on its lock for as long.
 
 Coverage pays for an attachment only when the kernel behavior is the oracle. The image-growth witness also checks
-normalized whole/volume device names; live capture keeps a real source holder while checking success and destination
-refusal; restart-derived mount facts also check an idle-detach dissent before successful release. Workspace grant
-refusal, workspace grant persistence and project-policy persistence share one adopted CLI fixture, retaining both
-refused and successful restart checks. Create/fork refusal and adopt/create/fork port-publication checks likewise share
-an adopted project without omitting any entry point. Busy resize and defrag each run their original refusal oracles on
-one held volume. Capacity-only refusal uses the existing recording host over a sparse RAW file, and an invalid
-first-mint capacity uses the pure filesystem store: neither needs an attached volume. Distinct adoption crash windows,
-registered-versus-restarted detach paths, writer-admission boundaries and durable deletion records remain separate
-oracles.
+normalized whole/volume device names; unheld RW/RO live captures preserve source facts on success and destination
+refusal; a held RW capture also succeeds unchanged. Restart-derived facts check an idle-detach dissent before release.
+Workspace grant refusal, workspace grant persistence and project-policy persistence share one adopted CLI fixture,
+retaining both refused and successful restart checks. Create/fork refusal and adopt/create/fork port-publication checks
+likewise share an adopted project without omitting any entry point. Busy resize and defrag each run their original
+refusal oracles on one held volume. The raw-pin witness also checks independent forced release between verification and
+mount; the mount-flag truth table heals its final ownership-free mount by mountpoint. Declared first-touch and warm-fork
+assertions share the build-volume naming/reclamation walk. Push preservation and checked-land refusal/success share the
+plain-Git lifecycle walk, keeping the original Git-reference and no-write refusal oracles. Capacity-only refusal uses
+the existing recording host over a sparse RAW file, and an invalid first-mint capacity uses the pure filesystem store:
+neither needs an attached volume. Distinct adoption crash windows, registered-versus-restarted detach paths,
+writer-admission boundaries and durable deletion records remain separate oracles. The non-growing build-volume resize is
+refused as Usage on the held-conflict fixture before the holder is taken.
 
 Staging GC derives backing-image and mountpoint paths in one preallocated buffer each. Both orphan branches borrow the
 parsed workspace for the deletion record rather than allocating a second name; mount GC also retains its parsed stem.

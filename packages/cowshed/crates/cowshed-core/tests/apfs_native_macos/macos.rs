@@ -526,9 +526,9 @@ fn assert_capture_carries_source(
     );
 }
 
-/// The live rule (01_storage.md, "Live source snapshots"): a capture flushes the source and clones
-/// the live image without unmounting, detaching or changing the source's mount flags. A successful
-/// capture and a refused existing destination both leave the source exactly as it was.
+/// The live rule (01_storage.md, "Live source snapshots"): unheld RW/RO captures and destination
+/// refusals leave the source's mount, device, flags and attachment unchanged. A held RW capture
+/// also succeeds without changing those facts. RW volume writes are flushed; RO has none.
 #[test]
 fn real_apfs_live_capture_leaves_its_source_unchanged_on_success_and_refusal() {
     for (label, access, browse) in [
@@ -538,8 +538,6 @@ fn real_apfs_live_capture_leaves_its_source_unchanged_on_success_and_refusal() {
         let fixture = RealFixture::new(label);
         let (host, source, mount) = live_capture_source(&fixture, access, browse);
         let before = live_source_state(&source, &mount);
-        let held = std::fs::File::open(mount.join("sealed-payload"))
-            .expect("hold source during live capture");
         let destination = fixture.root().join("snapshot.dmg");
         host.clone_image(&source, Some(&mount), &destination)
             .expect("live capture");
@@ -569,7 +567,24 @@ fn real_apfs_live_capture_leaves_its_source_unchanged_on_success_and_refusal() {
         );
 
         assert_capture_carries_source(&host, &destination, &fixture.root().join("snapshot"));
-        drop(held);
+        if access == MountAccess::ReadWrite {
+            let held = std::fs::File::open(mount.join("sealed-payload"))
+                .expect("hold source during live capture");
+            let held_destination = fixture.root().join("snapshot-held.dmg");
+            host.clone_image(&source, Some(&mount), &held_destination)
+                .expect("a live capture is not refused by a holder");
+            assert_eq!(
+                live_source_state(&source, &mount),
+                before,
+                "a held live capture leaves the source's mount, device, flags and attachment as they were"
+            );
+            assert_capture_carries_source(
+                &host,
+                &held_destination,
+                &fixture.root().join("snapshot-held"),
+            );
+            drop(held);
+        }
         host.detach_mounted(&workspace(), DetachIntent::WhenIdle)
             .expect("source registry mapping");
         assert!(kernel_mount_at(&mount).is_none());
@@ -2981,6 +2996,10 @@ impl CommandRunner for EjectAtFsck {
     }
 }
 
+/// The raw pin is held from cowshed's identity check through fsck and the mount that follows. An
+/// independent forced release is refused in each window: the injected releases fire inside fsck and
+/// mount (`EjectAtFsck`), and the external diskutil and hdiutil releases below fire between
+/// verification and mount. A foreign volume is never attached, whichever window the release tries.
 #[test]
 fn real_apfs_raw_pin_prevents_foreign_eject_during_fsck() {
     let fixture = RealFixture::new("pin-vs-foreign-eject");
@@ -3001,28 +3020,6 @@ fn real_apfs_raw_pin_prevents_foreign_eject_during_fsck() {
         0,
         "foreign diskutil ejected an image while its raw volume was pinned"
     );
-    let mount = fixture.root().join("owned-mount");
-    backend
-        .mount(&attachment, &mount, MountAccess::ReadWrite, false)
-        .expect("pin also holds while mounting");
-    backend
-        .detach(&attachment, DetachIntent::Release)
-        .expect("detach owned image");
-    assert!(!attached(&owned));
-    assert!(!attached(&foreign), "the foreign image was never attached");
-}
-
-/// The verified attachment itself must own the kernel pin until its mount returns. A device
-/// checked and then released between these method calls can be ejected by an outside process.
-#[test]
-fn real_apfs_verified_attachment_cannot_be_recycled_before_mount() {
-    let fixture = RealFixture::new("pin-through-mount-handoff");
-    let owned = fixture.root().join("owned.dmg");
-    let foreign = fixture.root().join("foreign.dmg");
-    fixture.blank_image(&owned);
-    fixture.blank_image(&foreign);
-    let backend = cowshed_core::apfs::MacOsApfsBackend::new(SystemCommandRunner);
-    let attachment = backend.attach_verified(&owned).expect("verified owner");
     let ejected = SystemCommandRunner
         .run(&CommandRequest::new(
             "/usr/sbin/diskutil",
@@ -3071,12 +3068,12 @@ fn real_apfs_verified_attachment_cannot_be_recycled_before_mount() {
     let mount = fixture.root().join("owned-mount");
     backend
         .mount(&attachment, &mount, MountAccess::ReadWrite, false)
-        .expect("mount the pinned owner");
+        .expect("pin also holds while mounting");
     backend
         .detach(&attachment, DetachIntent::Release)
-        .expect("detach the owned image");
+        .expect("detach owned image");
     assert!(!attached(&owned));
-    assert!(!attached(&foreign));
+    assert!(!attached(&foreign), "the foreign image was never attached");
 }
 
 /// Attach `image` the way another process does, outside every cowshed image lease and check.
@@ -3304,7 +3301,8 @@ fn real_apfs_lost_attachment_reattaches_without_verifying_foreign_volume() {
 
 /// A mount an earlier controller left is a kernel fact a restarted host reads back, identified by
 /// the in-image marker rather than the volume label (here renamed by hand between the two), and
-/// the restarted host detaches it by its mountpoint.
+/// a `WhenIdle` detach of it reports the holder's dissent rather than forcing, and the restarted
+/// host detaches it by its mountpoint after the holder lets go.
 #[test]
 fn real_apfs_kernel_mount_facts_survive_host_restart_and_detach_by_mountpoint() {
     let fixture = RealFixture::new("kernel-restart");
@@ -3336,9 +3334,17 @@ fn real_apfs_kernel_mount_facts_survive_host_restart_and_detach_by_mountpoint() 
     );
     let holder = std::fs::File::create(mount.join("held")).expect("hold the volume");
 
-    restarted
+    let error = restarted
         .detach_mounted(&workspace(), DetachIntent::WhenIdle)
         .expect_err("a dissented WhenIdle detach must not escalate");
+    assert!(
+        matches!(
+            &error,
+            ApfsStorageError::Apfs(ApfsError::CommandFailed { operation, .. })
+                if *operation == "unmount verified APFS volume"
+        ),
+        "unexpected refusal: {error}"
+    );
     assert!(
         kernel_mount_at(&mount).is_some(),
         "the dissented volume is left mounted"
@@ -3456,34 +3462,6 @@ fn direct_mount_handoff_refuses_a_checkout_it_did_not_take_over() {
         !checkout.join(".envrc").exists(),
         "a refused handoff must leave the checkout exactly as it was"
     );
-}
-
-#[test]
-fn real_apfs_wrong_kernel_mount_flags_are_detected_and_healed_by_mountpoint() {
-    let fixture = RealFixture::new("wrong-flags");
-    let canonical = fixture.layout().main_image().expect("canonical");
-    fixture.published_image(canonical.image());
-    let mount = fixture.main_mount();
-    // Browsable, and with ownership ignored: both flags the canonical mount must not carry.
-    fixture.mount_left_behind(canonical.image(), &mount, "noowners");
-    fixture.plant_marker(&mount, &workspace());
-    let host = fixture.host();
-    let workspace = workspace();
-    assert!(
-        host.mounts(&repo())
-            .expect_err("wrong flags")
-            .to_string()
-            .contains("non-canonical flags")
-    );
-
-    host.heal_mount(&workspace, &mount)
-        .expect("heal by mountpoint");
-    assert!(
-        kernel_mount_at(&mount).is_none(),
-        "healing a wrongly flagged mount detaches it for a canonical remount"
-    );
-    assert!(!attached(canonical.image()));
-    assert!(host.mounts(&repo()).expect("healed facts").is_empty());
 }
 
 fn interrupted_restore_image_publication(
@@ -4950,7 +4928,9 @@ fn system_mount_source_observes_the_live_root_mount() {
 }
 
 /// One real volume remounted under every combination of the two flags the check reads, each read
-/// back from the kernel: browsing is the user's choice, honoring ownership is not.
+/// back from the kernel: browsing is the user's choice, honoring ownership is not. The ownership-free
+/// combination is the wrong-flags mount the host heals by its mountpoint, so the heal is proven here
+/// on this same volume and marker, once the verification attachment has released its raw pin.
 #[test]
 fn real_apfs_kernel_mount_flag_truth_table_allows_browse_but_requires_owners() {
     let fixture = RealFixture::new("flag-table");
@@ -4964,7 +4944,6 @@ fn real_apfs_kernel_mount_flag_truth_table_allows_browse_but_requires_owners() {
         ("nobrowse,owners", true),
         ("nobrowse,noowners", false),
         ("owners", true),
-        ("noowners", false),
     ] {
         if kernel_mount_at(&mount).is_none() {
             fixture.remount(&attachment, &mount, options);
@@ -4981,6 +4960,28 @@ fn real_apfs_kernel_mount_flag_truth_table_allows_browse_but_requires_owners() {
             String::from_utf8_lossy(&unmounted.stderr)
         );
     }
+
+    fixture.remount(&attachment, &mount, "noowners");
+    let result = host.mounts(&repo());
+    assert!(result.is_err(), "noowners: {result:?}");
+    assert!(
+        result
+            .expect_err("wrong flags")
+            .to_string()
+            .contains("non-canonical flags")
+    );
+    // The verification attachment still holds the raw device pin. Hdiutil's detach is refused
+    // while it is held, so release it first, as the standalone wrong-flags test did implicitly.
+    drop(attachment);
+
+    host.heal_mount(&workspace(), &mount)
+        .expect("heal by mountpoint");
+    assert!(
+        kernel_mount_at(&mount).is_none(),
+        "healing a wrongly flagged mount detaches it for a canonical remount"
+    );
+    assert!(!attached(canonical.image()));
+    assert!(host.mounts(&repo()).expect("healed facts").is_empty());
 }
 
 /// fseventsd's persistent event log on real volumes (01_storage.md, "The event log"). A fresh
@@ -5745,9 +5746,17 @@ fn real_apfs_resize_refuses_a_busy_workspace_before_growing_the_image() {
     );
     let defrag_host = fixture.host();
     let inode_before = std::fs::metadata(&image).expect("image").ino();
-    defrag_host
+    let error = defrag_host
         .defragment(&workspace(), &image, &mount)
         .expect_err("a busy volume refuses the rewrite rather than being torn out");
+    assert!(
+        matches!(
+            &error,
+            ApfsStorageError::Apfs(ApfsError::CommandFailed { operation, .. })
+                if *operation == "unmount verified APFS volume"
+        ),
+        "unexpected refusal: {error}"
+    );
     assert_eq!(
         std::fs::metadata(&image).expect("image").ino(),
         inode_before,

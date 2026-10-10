@@ -560,29 +560,81 @@ async fn real_apfs_dispatch_reallocates_a_raced_port_and_reconciles_gateway_gran
     drop(competing_listener);
 }
 
-/// `push` preserves a workspace minted with today's remote layout — one remote, `main` — in
-/// main's repository. Push once spoke to a remote named `host`, which the layout no longer
-/// creates, so every push of a current workspace failed before it moved anything.
+/// A plain Git repository, adopted and served through a real gateway, with one workspace,
+/// `topic`. Its exec runs with no shell hook. Push preserves the workspace branch as
+/// `refs/cowshed/topic/heads/cowshed/topic` in main's repository and never moves main's
+/// branch or working tree (02_workspaces.md, "`cowshed push`"). A checked land refuses while
+/// the gateway is absent, then fast-forwards main once it is back (02_workspaces.md,
+/// "`cowshed land`"). Adopt, new, exec and land never create a shell hook (02_workspaces.md,
+/// "Workspace environment"; 15_capabilities.md, "Required evidence").
 #[tokio::test]
-async fn real_apfs_push_preserves_a_current_workspace_branch_in_mains_repository() {
+async fn real_apfs_plain_git_repository_adopts_clones_executes_and_lands_without_shell_hooks() {
+    let started = std::time::Instant::now();
+    let phase = |name| {
+        eprintln!("plain-git fixture: {name} elapsed={:?}", started.elapsed());
+    };
+    phase("fixture");
     let mut fixture = Fixture::new();
+    for convention in [".envrc", ".envrc-local", "flake.nix", "devenv.nix"] {
+        assert!(!fixture.checkout.join(convention).exists());
+    }
+    assert_eq!(
+        fs::read_to_string(fixture.checkout.join(".cowshed.toml")).expect("fixture config"),
+        FIXTURE_COWSHED_TOML,
+        "the only cowshed configuration is the fixture's image cap"
+    );
+    phase("open");
     let mut service = fixture.open().await;
+    phase("adopt");
     adopt(&fixture, &mut service).await;
-    // `new` refuses without a gateway to install the workspace's session on; push needs none.
+    phase("start gateway");
     fixture.start_gateway().await;
+    phase("reconcile gateway");
     service
         .reconcile_gateway()
         .await
-        .expect("install main gateway session");
+        .expect("serve plain repository");
+    phase("new topic");
     let (created, _, stderr) = run(&mut service, ["new", "topic"]).await;
     assert_eq!(
         created.unwrap_or_else(|error| panic!(
-            "create real APFS topic: {error}; {}",
+            "plain clone: {error}; {}",
             String::from_utf8_lossy(&stderr)
         )),
         0
     );
-    let topic = service.path("topic", false).await.expect("mounted topic");
+    let topic = service
+        .path("topic", false)
+        .await
+        .expect("plain clone mount");
+    phase("exec topic");
+    let (executed, stdout, stderr) = run(
+        &mut service,
+        [
+            "exec",
+            "topic",
+            "--",
+            "/bin/sh",
+            "-c",
+            "test ! -e .envrc && test ! -e .envrc-local && test ! -e .gitignore && test ! -e flake.nix && test ! -e devenv.nix && printf 'generic\\n' > delivered.txt && printf 'plain-sandbox\\n'",
+        ],
+    )
+    .await;
+    assert_eq!(
+        executed.unwrap_or_else(|error| panic!(
+            "plain exec: {error}; {}",
+            String::from_utf8_lossy(&stderr)
+        )),
+        0
+    );
+    assert_eq!(stdout, b"plain-sandbox\n");
+    git(&topic.mount, &["add", "delivered.txt"]);
+    git(
+        &topic.mount,
+        &["commit", "-qm", "deliver generic repository change"],
+    );
+
+    phase("commit topic");
     assert_eq!(
         git_stdout(&topic.mount, &["remote"]),
         "main",
@@ -594,6 +646,7 @@ async fn real_apfs_push_preserves_a_current_workspace_branch_in_mains_repository
     let head = git_stdout(&topic.mount, &["rev-parse", "HEAD"]);
     let main_before = git_stdout(&fixture.checkout, &["rev-parse", "refs/heads/main"]);
 
+    phase("push topic");
     let (pushed, stdout, stderr) = run(&mut service, ["push", "topic"]).await;
     assert_eq!(
         pushed.unwrap_or_else(|error| panic!(
@@ -657,39 +710,11 @@ async fn real_apfs_push_preserves_a_current_workspace_branch_in_mains_repository
         preserved,
         "a refused push leaves no staging ref behind"
     );
-    service.shutdown().await.expect("shutdown runtime");
-    fixture.stop_gateway().await;
-}
 
-#[tokio::test]
-async fn real_apfs_checked_land_preserves_target_when_gateway_absent_then_fast_forwards() {
-    let started = std::time::Instant::now();
-    let phase = |name| {
-        eprintln!(
-            "checked-land fixture: {name} elapsed={:?}",
-            started.elapsed()
-        );
-    };
-    phase("fixture");
-    let mut fixture = Fixture::new();
-    phase("open");
-    let mut service = fixture.open().await;
-    phase("adopt");
-    adopt(&fixture, &mut service).await;
-    phase("start gateway");
-    fixture.start_gateway().await;
-    phase("reconcile gateway");
-    service
-        .reconcile_gateway()
-        .await
-        .expect("install main gateway session");
-    phase("new topic");
-    let (created, _, _) = run(&mut service, ["new", "topic"]).await;
-    assert_eq!(created.expect("create real APFS topic"), 0);
-    phase("commit topic");
-    let topic = service.path("topic", false).await.expect("mounted topic");
-    fs::write(topic.mount.join("feature.txt"), b"feature\n").expect("topic change");
-    git(&topic.mount, &["add", "feature.txt"]);
+    // The checked land's payload is its own file, committed before the gateway stops.
+    phase("commit checked-feature");
+    fs::write(topic.mount.join("checked-feature.txt"), b"feature\n").expect("topic change");
+    git(&topic.mount, &["add", "checked-feature.txt"]);
     git(&topic.mount, &["commit", "-q", "-m", "feature"]);
 
     phase("stop gateway");
@@ -702,7 +727,7 @@ async fn real_apfs_checked_land_preserves_target_when_gateway_absent_then_fast_f
             "topic",
             "--no-retire",
             "--check",
-            "test -f feature.txt",
+            "test -f checked-feature.txt",
         ],
     )
     .await;
@@ -713,7 +738,7 @@ async fn real_apfs_checked_land_preserves_target_when_gateway_absent_then_fast_f
         ErrorCode::EnvironmentMissing
     );
     assert!(stdout.is_empty(), "failed preflight has no machine answer");
-    assert!(!fixture.checkout.join("feature.txt").exists());
+    assert!(!fixture.checkout.join("checked-feature.txt").exists());
 
     phase("restart gateway");
     fixture.start_gateway().await;
@@ -725,7 +750,7 @@ async fn real_apfs_checked_land_preserves_target_when_gateway_absent_then_fast_f
             "topic",
             "--no-retire",
             "--check",
-            "test -f feature.txt",
+            "test -f delivered.txt && test -f checked-feature.txt",
         ],
     )
     .await;
@@ -737,88 +762,9 @@ async fn real_apfs_checked_land_preserves_target_when_gateway_absent_then_fast_f
     });
     assert_eq!(code, 0);
     assert_eq!(
-        fs::read(fixture.checkout.join("feature.txt")).expect("fast-forwarded main worktree"),
+        fs::read(fixture.checkout.join("checked-feature.txt"))
+            .expect("fast-forwarded main worktree"),
         b"feature\n"
-    );
-    phase("shutdown runtime");
-    service.shutdown().await.expect("shutdown runtime");
-    phase("drain gateway");
-    fixture.stop_gateway().await;
-    phase("done");
-}
-
-#[tokio::test]
-async fn real_apfs_plain_git_repository_adopts_clones_executes_and_lands_without_shell_hooks() {
-    let mut fixture = Fixture::new();
-    for convention in [".envrc", ".envrc-local", "flake.nix", "devenv.nix"] {
-        assert!(!fixture.checkout.join(convention).exists());
-    }
-    assert_eq!(
-        fs::read_to_string(fixture.checkout.join(".cowshed.toml")).expect("fixture config"),
-        FIXTURE_COWSHED_TOML,
-        "the only cowshed configuration is the fixture's image cap"
-    );
-    let mut service = fixture.open().await;
-    adopt(&fixture, &mut service).await;
-    fixture.start_gateway().await;
-    service
-        .reconcile_gateway()
-        .await
-        .expect("serve plain repository");
-    let (created, _, stderr) = run(&mut service, ["new", "plain-topic"]).await;
-    assert_eq!(
-        created.unwrap_or_else(|error| panic!(
-            "plain clone: {error}; {}",
-            String::from_utf8_lossy(&stderr)
-        )),
-        0
-    );
-    let topic = service
-        .path("plain-topic", false)
-        .await
-        .expect("plain clone mount");
-    let (executed, stdout, stderr) = run(
-        &mut service,
-        [
-            "exec",
-            "plain-topic",
-            "--",
-            "/bin/sh",
-            "-c",
-            "test ! -e .envrc && test ! -e .envrc-local && test ! -e .gitignore && test ! -e flake.nix && test ! -e devenv.nix && printf 'generic\\n' > delivered.txt && printf 'plain-sandbox\\n'",
-        ],
-    )
-    .await;
-    assert_eq!(
-        executed.unwrap_or_else(|error| panic!(
-            "plain exec: {error}; {}",
-            String::from_utf8_lossy(&stderr)
-        )),
-        0
-    );
-    assert_eq!(stdout, b"plain-sandbox\n");
-    git(&topic.mount, &["add", "delivered.txt"]);
-    git(
-        &topic.mount,
-        &["commit", "-qm", "deliver generic repository change"],
-    );
-    let (landed, _, stderr) = run(
-        &mut service,
-        [
-            "land",
-            "plain-topic",
-            "--no-retire",
-            "--check",
-            "test -f delivered.txt",
-        ],
-    )
-    .await;
-    assert_eq!(
-        landed.unwrap_or_else(|error| panic!(
-            "plain checked land: {error}; {}",
-            String::from_utf8_lossy(&stderr)
-        )),
-        0
     );
     assert_eq!(
         fs::read(fixture.checkout.join("delivered.txt")).unwrap(),
@@ -832,11 +778,14 @@ async fn real_apfs_plain_git_repository_adopts_clones_executes_and_lands_without
         assert!(!directory.join(".envrc-local").exists());
         assert!(!directory.join(".gitignore").exists());
     }
+    phase("shutdown runtime");
     service
         .shutdown()
         .await
         .expect("stop plain repository runtime");
+    phase("drain gateway");
     fixture.stop_gateway().await;
+    phase("done");
 }
 
 /// A `--git-worktree` workspace's checkout holds a `.git` pointer file, not a repository: its
@@ -1851,59 +1800,6 @@ fn write_declared_project(checkout: &Path) {
     fs::write(upstream.join("build/build.ninja"), b"before cowshed\n").unwrap();
 }
 
-/// Declared build state (16_build_volumes.md, "Declared build state"): main's first touch
-/// discards the real directory at the declared path, rebuild-only, and links the path onto
-/// main's build volume. What the author's reconstruct script then writes there lives on the
-/// volume, and a fork of main gets it warm through the same fixed link.
-#[tokio::test]
-async fn real_apfs_declared_build_state_is_linked_at_first_touch_and_a_fork_gets_it_warm() {
-    let mut fixture = Fixture::with(Project::Declared);
-    assert!(fixture.checkout.join(DECLARED_STATE).join(".git").is_dir());
-    let mut service = serve_project(&mut fixture, &[]).await;
-    let link = Path::new(".cowshed/build/declared").join(DECLARED_STATE);
-    assert_eq!(
-        fs::read_link(fixture.checkout.join(DECLARED_STATE)).expect("main's declared link"),
-        link
-    );
-    assert!(
-        !fixture
-            .checkout
-            .join(DECLARED_STATE)
-            .join("build/build.ninja")
-            .exists(),
-        "the first touch discards the old checkout and never copies it"
-    );
-    let layout = build_volumes(&fixture);
-    let main_volume = linked_volume(&layout, &fixture.checkout);
-    // The author's reconstruct script, run once more: from now on it lives on main's volume.
-    let warm = fixture.checkout.join(DECLARED_STATE).join("build");
-    fs::create_dir_all(&warm).unwrap();
-    fs::write(warm.join("build.ninja"), b"warm\n").unwrap();
-    assert_eq!(
-        git_stdout(
-            &fixture.checkout,
-            &["status", "--porcelain", "--untracked-files=all"]
-        ),
-        "",
-        "the link is excluded, never source"
-    );
-
-    let w1 = new_workspace(&mut service, "w1").await;
-    assert_ne!(linked_volume(&layout, &w1), main_volume);
-    assert_eq!(
-        fs::read_link(w1.join(DECLARED_STATE)).expect("the fork's declared link"),
-        link
-    );
-    let forked = fs::read(w1.join(DECLARED_STATE).join("build/build.ninja"));
-    service.shutdown().await.expect("stop the runtime");
-    fixture.stop_gateway().await;
-    assert_eq!(
-        forked.expect("the fork's declared state"),
-        b"warm\n",
-        "a fork of main clones main's declared state warm"
-    );
-}
-
 /// A land freezes main's new seed from the landing volume at the landed tree, moves main's link
 /// onto that volume, releases main's previous volume, and re-runs the check in main: every task
 /// hits (16_build_volumes.md, Land steps 5–7).
@@ -2659,19 +2555,61 @@ async fn assert_build_label(layout: &BuildVolumeLayout, checkout: &Path, name: &
     .await;
 }
 
-/// Adopt/new/fork name every attached build volume. Land renames the adopted volume even
-/// without a check, and rm/land reclaim unlinked volumes before returning, without a gc.
+/// One declared project, one walk. Main's first touch links the declared path onto its build
+/// volume, and the author's reconstruct script writes through that link (16_build_volumes.md,
+/// "Declared build state"). A fork of main gets that state warm through the same fixed link,
+/// and adopt/new/fork name every attached build volume (06_cli.md, "Build-volume names and
+/// reclamation"). Land renames the adopted volume even without a check, and rm/land reclaim
+/// unlinked volumes before returning, without a gc (16_build_volumes.md, "Garbage collection").
 #[tokio::test]
 async fn real_apfs_build_volume_names_follow_checkout_ownership_and_unlinked_mounts_are_reclaimed()
 {
     let mut fixture = Fixture::with(Project::Declared);
+    assert!(fixture.checkout.join(DECLARED_STATE).join(".git").is_dir());
     let mut service = serve_project(&mut fixture, &[]).await;
+    let link = Path::new(".cowshed/build/declared").join(DECLARED_STATE);
+    assert_eq!(
+        fs::read_link(fixture.checkout.join(DECLARED_STATE)).expect("main's declared link"),
+        link
+    );
+    assert!(
+        !fixture
+            .checkout
+            .join(DECLARED_STATE)
+            .join("build/build.ninja")
+            .exists(),
+        "the first touch discards the old checkout and never copies it"
+    );
     let layout = build_volumes(&fixture);
     let previous = linked_volume(&layout, &fixture.checkout);
     assert_build_label(&layout, &fixture.checkout, "main").await;
     assert_linked_build_mounts(&layout, &[&fixture.checkout]);
 
+    // The author's reconstruct script, run once more: from now on it lives on main's volume.
+    let warm = fixture.checkout.join(DECLARED_STATE).join("build");
+    fs::create_dir_all(&warm).unwrap();
+    fs::write(warm.join("build.ninja"), b"warm\n").unwrap();
+    assert_eq!(
+        git_stdout(
+            &fixture.checkout,
+            &["status", "--porcelain", "--untracked-files=all"]
+        ),
+        "",
+        "the link is excluded, never source"
+    );
+
     let topic = new_workspace(&mut service, "topic").await;
+    assert_ne!(linked_volume(&layout, &topic), previous);
+    assert_eq!(
+        fs::read_link(topic.join(DECLARED_STATE)).expect("the fork's declared link"),
+        link
+    );
+    assert_eq!(
+        fs::read(topic.join(DECLARED_STATE).join("build/build.ninja"))
+            .expect("the fork's declared state"),
+        b"warm\n",
+        "a fork of main clones main's declared state warm"
+    );
     assert_build_label(&layout, &topic, "topic").await;
     assert_linked_build_mounts(&layout, &[&fixture.checkout, &topic]);
 
