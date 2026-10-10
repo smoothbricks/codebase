@@ -28,13 +28,23 @@ use bitmosaic::{
     patch_witnessed, prepare_patch_in_witnessed, prepare_patch_witnessed,
 };
 
+/// A scratch backed for patches of images up to `image_bytes` touching at
+/// most `touched_chunks` chunks.
+fn reserved_scratch(image_bytes: usize, touched_chunks: usize) -> PatchScratch {
+    let mut scratch = PatchScratch::try_new().expect("scratch");
+    scratch
+        .try_reserve_for(image_bytes, touched_chunks)
+        .expect("scratch capacity");
+    scratch
+}
+
 #[test]
 fn run_patch_split_bridge_spill_and_empty_preserve_witnesses() {
     let initial = (0..4096u32).chain(32768..36864);
     let mut oracle: BTreeSet<_> = initial.collect();
     let mut slot = Bitmosaic::from_sorted(oracle.iter().copied()).to_forest_bytes();
     slot.resize(32 * 1024, 0xa5);
-    let mut scratch = PatchScratch::new();
+    let mut scratch = PatchScratch::try_new().expect("scratch");
     let batches: Vec<(Vec<u32>, Vec<u32>)> = vec![
         (vec![4096, 32767, 65535], vec![1, 2048, 33000]),
         (vec![1, 2048, 33000], vec![4096, 32767]),
@@ -78,7 +88,7 @@ fn run_patch_split_bridge_spill_and_empty_preserve_witnesses() {
 
 #[test]
 fn short_ef_low_planes_patch_without_guard_padding() {
-    let mut scratch = PatchScratch::new();
+    let mut scratch = PatchScratch::try_new().expect("scratch");
     for n in [65u32, 64, 63, 31, 15, 7] {
         let stride = u32::MAX / (n + 1);
         let values: Vec<_> = (0..n).map(|i| 1 + i * stride + i % 3).collect();
@@ -112,7 +122,7 @@ fn short_ef_low_planes_patch_without_guard_padding() {
 
 #[test]
 fn ef_zero_sample_boundaries_survive_a_shrinking_last_bucket() {
-    let mut scratch = PatchScratch::new();
+    let mut scratch = PatchScratch::try_new().expect("scratch");
     let mut rng = Rng(0xEF_0064);
     for zeros in [65u32, 64, 63] {
         // Forty members with 24 low bits, then a gap before the last two
@@ -515,7 +525,7 @@ fn history(shape: &Shape, steps: usize, seed: u64, scratch: &mut PatchScratch) {
 
 #[test]
 fn patched_bytes_are_a_fresh_freeze_and_reads_match_the_oracle() {
-    let mut scratch = PatchScratch::new();
+    let mut scratch = PatchScratch::try_new().expect("scratch");
     for (i, shape) in shapes().iter().enumerate() {
         history(shape, 120, 0x5EED_0000 + i as u64, &mut scratch);
     }
@@ -528,7 +538,7 @@ fn patched_bytes_are_a_fresh_freeze_and_reads_match_the_oracle() {
 /// kilobytes in both directions.
 #[test]
 fn a_single_member_moves_a_chunk_across_every_arm_boundary() {
-    let mut scratch = PatchScratch::new();
+    let mut scratch = PatchScratch::try_new().expect("scratch");
     let mut slot = vec![0u8; 64 * 1024];
     let base: Vec<u32> = (0..4_096u32)
         .map(|i| i * 16 + 3)
@@ -568,7 +578,7 @@ fn a_single_member_moves_a_chunk_across_every_arm_boundary() {
 
 #[test]
 fn refusals_touch_nothing() {
-    let mut scratch = PatchScratch::new();
+    let mut scratch = PatchScratch::try_new().expect("scratch");
     let set: Vec<u32> = (0..3_000u32).map(|i| i * 7).collect();
     let owned = Bitmosaic::from_sorted(set.iter().copied());
     let need = owned.forest_len();
@@ -656,7 +666,7 @@ fn a_warm_scratch_allocates_nothing() {
         } else {
             owned.write_forest_into_slice(&mut slot).expect("fits");
         }
-        let mut scratch = PatchScratch::with_capacity(slot.len(), 4_096);
+        let mut scratch = reserved_scratch(slot.len(), 4_096);
         let mut rng = Rng(0xA110C);
         let batches: Vec<(Vec<u32>, Vec<u32>)> = (0..6)
             .map(|i| {
@@ -739,7 +749,7 @@ fn tight_slot_case(
 
 #[test]
 fn a_tight_slot_takes_a_batch_whose_transient_would_not_fit() {
-    let mut scratch = PatchScratch::new();
+    let mut scratch = PatchScratch::try_new().expect("scratch");
     for (shrink, grow, chunks) in tight_slot_layouts() {
         let what = format!("shrink {shrink}, grow {grow}, {chunks} chunks");
         let (initial, adds, removes) = tight_slot_case(shrink, grow, chunks);
@@ -801,7 +811,7 @@ fn a_tight_slot_takes_a_batch_whose_transient_would_not_fit() {
 /// shrinks while a higher one grows.
 #[test]
 fn a_history_on_a_slot_that_is_never_larger_than_it_must_be() {
-    let mut scratch = PatchScratch::new();
+    let mut scratch = PatchScratch::try_new().expect("scratch");
     let mut rng = Rng(0xB1A5_ED5E_ED00_0945);
     let universe = 6u32 << 16;
     let mut oracle: BTreeSet<u32> = (0..3_000)
@@ -857,7 +867,7 @@ fn a_history_on_a_slot_that_is_never_larger_than_it_must_be() {
 /// sits below an Array chunk so the tail moves after every edit.
 #[test]
 fn a_words_window_shrinks_where_it_lies() {
-    let mut scratch = PatchScratch::new();
+    let mut scratch = PatchScratch::try_new().expect("scratch");
     let mut rng = Rng(0x5EED_5A1E);
     let base = 3u32 << 16;
     let mut set: BTreeSet<u32> = (0..12_000u32)
@@ -1054,7 +1064,7 @@ fn captured_prepared_patch(
 
 #[test]
 fn prepared_ranges_restore_forest_ef_windows_and_cleared_tails() {
-    let mut scratch = PatchScratch::new();
+    let mut scratch = PatchScratch::try_new().expect("scratch");
     for (i, shape) in shapes().iter().enumerate() {
         let mut oracle: BTreeSet<_> = shape.initial.iter().copied().collect();
         let owned = Bitmosaic::from_sorted(oracle.iter().copied());
@@ -1152,7 +1162,7 @@ fn a_prepared_sparse_word_edit_does_not_capture_untouched_payloads() {
     let old_len = slot.len();
     slot.resize(old_len + 4096, 0xee);
     let before = slot.clone();
-    let mut scratch = PatchScratch::with_capacity(slot.len(), 1);
+    let mut scratch = reserved_scratch(slot.len(), 1);
     let mut witness = ();
     let adds = [(2 << 16) + 56006, (2 << 16) + 59996];
     assert!(
@@ -1180,7 +1190,7 @@ fn dropping_a_prepared_patch_leaves_owner_unchanged_and_scratch_reusable() {
     let mut slot = Bitmosaic::from_sorted([3, 7, 11]).to_forest_bytes();
     slot.resize(256, 0xab);
     let before = slot.clone();
-    let mut scratch = PatchScratch::with_capacity(slot.len(), 2);
+    let mut scratch = reserved_scratch(slot.len(), 2);
     let mut witness = ();
     let adds = [17, 1 << 16];
     let prepared =
@@ -1230,7 +1240,7 @@ fn retained_patch_reports_each_witness_once_and_releases_work_borrows() {
             assert!(BitmosaicView::open(&state).unwrap().is_elias_fano());
         }
         state.resize(state.len() + 65536, 0xa9);
-        let mut scratch = PatchScratch::with_capacity(state.len(), 4);
+        let mut scratch = reserved_scratch(state.len(), 4);
         let mut witness = OnceWitness::default();
         let adds = sorted_unique(vec![values[0], values[300] + 1, u32::MAX - 1]);
         let removes = sorted_unique(vec![values[40], values[800], u32::MAX - 1]);
@@ -1283,7 +1293,7 @@ fn retained_patch_reports_each_witness_once_and_releases_work_borrows() {
 
 #[test]
 fn prepared_ranges_include_the_transient_peak_not_just_old_and_new_frames() {
-    let mut scratch = PatchScratch::new();
+    let mut scratch = PatchScratch::try_new().expect("scratch");
     for (shrink, grow, chunks) in tight_slot_layouts() {
         let (mut oracle, adds, removes) = tight_slot_case(shrink, grow, chunks);
         let image = Bitmosaic::from_sorted(oracle.iter().copied()).to_forest_bytes();
@@ -1327,7 +1337,7 @@ fn prepared_patch_has_no_extra_allocations_with_presized_scratch() {
             owned.to_forest_bytes()
         };
         slot.resize(slot.len() + 65536, 0xa5);
-        let mut scratch = PatchScratch::with_capacity(slot.len(), 2);
+        let mut scratch = reserved_scratch(slot.len(), 2);
         let mut witness = ();
         assert_eq!(
             allocations_during(|| {
@@ -1354,7 +1364,7 @@ fn embedded_preparation_refuses_invalid_ranges_before_owner_writes() {
     let mut state = [0xa5; 128];
     state[17..21].copy_from_slice(&bitmosaic::EMPTY_U32_IMAGE);
     let before = state;
-    let mut scratch = PatchScratch::new();
+    let mut scratch = PatchScratch::try_new().expect("scratch");
     let mut witness = ();
     for slot in [17..129, std::ops::Range { start: 33, end: 17 }, 0..3] {
         assert!(matches!(

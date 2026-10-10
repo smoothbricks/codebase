@@ -26,9 +26,9 @@
 //!
 //! Nothing here allocates on a warm [`PatchScratch`]: the plane, the member
 //! buffer and the residual buffer are fixed; the record and byte buffers
-//! keep their high-water mark, and [`PatchScratch::with_capacity`] sizes
+//! keep their high-water mark, and [`PatchScratch::try_reserve_for`] backs
 //! them up front from the slot capacity so the steady path never grows
-//! them at all.
+//! them at all. Both [`PatchScratch::try_new`] and it allocate fallibly.
 //!
 //! The slot is never left half-written. Everything a patch needs to know
 //! before it commits — the new length, whether the slot can hold it — is
@@ -112,7 +112,7 @@ pub struct PatchReport {
 /// ```compile_fail
 /// use bitmosaic::{EMPTY_U32_IMAGE, PatchScratch, prepare_patch_witnessed};
 /// let mut image = EMPTY_U32_IMAGE;
-/// let mut scratch = PatchScratch::new();
+/// let mut scratch = PatchScratch::try_new().unwrap();
 /// let mut witness = ();
 /// let prepared = prepare_patch_witnessed(
 ///     &mut image, &[], &[], &mut scratch, &mut witness,
@@ -125,7 +125,7 @@ pub struct PatchReport {
 /// use bitmosaic::{EMPTY_U32_IMAGE, PatchScratch, prepare_patch_witnessed};
 /// let mut image = EMPTY_U32_IMAGE;
 /// let mut other = EMPTY_U32_IMAGE;
-/// let mut scratch = PatchScratch::new();
+/// let mut scratch = PatchScratch::try_new().unwrap();
 /// let mut witness = ();
 /// let prepared = prepare_patch_witnessed(
 ///     &mut image, &[], &[], &mut scratch, &mut witness,
@@ -474,12 +474,6 @@ struct WordWitness {
     removes: core::ops::Range<usize>,
 }
 
-impl Default for PatchScratch {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl PatchScratch {
     /// A scratch with its fixed planes backed; growable buffers start empty
     /// and are backed by [`Self::try_reserve_for`]. Allocation is fallible.
@@ -501,41 +495,6 @@ impl PatchScratch {
             mutation_ranges: Vec::new(),
             word_witnesses: Vec::new(),
         })
-    }
-
-    pub fn new() -> Self {
-        PatchScratch {
-            plane: Box::new([0u64; CHUNK_WORDS]),
-            members: Vec::with_capacity(ARRAY_MAX),
-            runs: Vec::with_capacity((crate::WORDS_HEAP_BYTES - 1) / 6),
-            residuals: Box::new([0i8; CONE_MAX_LEN]),
-            touched: Vec::new(),
-            rows: Vec::new(),
-            staged: Vec::new(),
-            build: Vec::new(),
-            group_delta: Box::new([0; CHUNK_WORDS / DIR_STRIDE]),
-            mutation_ranges: Vec::new(),
-            word_witnesses: Vec::new(),
-        }
-    }
-
-    /// Pre-size the growable buffers for a slot of `slot_bytes` capacity and
-    /// batches touching up to `touched_chunks` distinct chunks, so the first
-    /// patch is already on the steady path. Both bounds are closed forms of
-    /// the caller's own contract: a rebuilt string never exceeds the slot
-    /// that must hold it, a chunk row costs the string at least 10
-    /// directory bytes, and a batch cannot touch more chunks than it has
-    /// values.
-    pub fn with_capacity(slot_bytes: usize, touched_chunks: usize) -> Self {
-        let mut scratch = Self::new();
-        let targets = Targets::for_patch(slot_bytes, touched_chunks);
-        scratch.touched.reserve(targets.touched);
-        scratch.rows.reserve(targets.rows);
-        scratch.staged.reserve(targets.staged);
-        scratch.build.reserve(targets.build);
-        scratch.mutation_ranges.reserve(targets.mutation_ranges);
-        scratch.word_witnesses.reserve(targets.word_witnesses);
-        scratch
     }
 
     /// Back every growable buffer for patches whose image never exceeds
@@ -583,8 +542,8 @@ impl PatchScratch {
 }
 
 /// Capacity targets for a patch whose image never exceeds `image_bytes` and
-/// which touches at most `touched_chunks` chunks. Both [`PatchScratch::with_capacity`]
-/// and [`PatchScratch::try_reserve_for`] read them, so the two cannot drift.
+/// which touches at most `touched_chunks` chunks, as [`PatchScratch::try_reserve_for`]
+/// backs them.
 struct Targets {
     touched: usize,
     rows: usize,

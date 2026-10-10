@@ -86,7 +86,10 @@ fn main() {
             let image = Bitmosaic::from_sorted(members.iter().copied()).to_forest_bytes();
             let capacity = (n + 8192) * 4 + bitmosaic::IMAGE_ID_LEN;
             let mut slot = vec![0u8; capacity];
-            let mut scratch = PatchScratch::with_capacity(capacity, 4096);
+            let mut scratch = PatchScratch::try_new().expect("scratch");
+            scratch
+                .try_reserve_for(capacity, 4096)
+                .expect("scratch capacity");
             let mut cells: Vec<(&str, Vec<u32>, Vec<u32>)> = Vec::new();
             for &bl in &[1usize, 64, 4096] {
                 let mut s = 0x00AB_CDEF_u64 + bl as u64;

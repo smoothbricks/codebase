@@ -205,7 +205,10 @@ fn bench_patch(c: &mut Criterion) {
         // Native-image slot capacity, excluding the containing VM state's alignment.
         let capacity = (fixture.members.len() + 8192) * 4 + bitmosaic::IMAGE_ID_LEN;
         let mut slot = vec![0u8; capacity];
-        let mut scratch = PatchScratch::with_capacity(capacity, 4096);
+        let mut scratch = PatchScratch::try_new().expect("scratch");
+        scratch
+            .try_reserve_for(capacity, 4096)
+            .expect("scratch capacity");
         let mut group =
             c.benchmark_group(format!("patch/{}[{root},{}B]", fixture.name, image.len()));
         for (cell, adds, removes) in batches(&fixture) {

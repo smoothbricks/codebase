@@ -170,7 +170,7 @@ fn reserved_scratch_absorbs_every_reachable_patch() {
             .filter(|v| !s.contains(v) && !r.contains(v))
             .collect();
         let batch_removes: Vec<u32> = r.intersection(&s).copied().collect();
-        let mut scratch = PatchScratch::new();
+        let mut scratch = PatchScratch::try_new().expect("scratch");
         scratch
             .try_reserve_for(bound, touched_chunks)
             .expect("reserving one patch's scratch");
