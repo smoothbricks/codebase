@@ -679,9 +679,8 @@ impl GitRepository {
     /// Directories are excluded as `name/`; the marker is a file, so it is `/name`, anchored at
     /// the root, where a trailing slash would match only a directory.
     pub async fn ensure_cowshed_excludes(&self) -> Result<()> {
-        let root = self.root.clone();
+        let git_directory = self.trusted_git_directory().await?;
         tokio::task::spawn_blocking(move || {
-            let git_directory = root.join(".git");
             let info_directory = git_directory.join("info");
             for directory in [&git_directory, &info_directory] {
                 let metadata = fs::symlink_metadata(directory).map_err(|error| {
@@ -781,6 +780,36 @@ impl GitRepository {
         })
         .await
         .map_err(|error| CowshedError::internal(format!("Git exclude task failed: {error}")))?
+    }
+
+    /// The common Git directory exclude wiring writes to. A real `.git` directory is its own; a
+    /// `.git` pointer resolves through git, so an inherited source pointer answers with the
+    /// repository it belongs to. Links are never followed.
+    async fn trusted_git_directory(&self) -> Result<PathBuf> {
+        let dot_git = self.root.join(".git");
+        match inspect_path(&dot_git, "inspect Git metadata")? {
+            Some(metadata) if metadata.file_type().is_dir() => Ok(dot_git),
+            Some(metadata) if metadata.file_type().is_file() => {
+                let output = self
+                    .run(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+                    .await?;
+                if !output.status.success() {
+                    return Err(git_internal("resolve common Git directory", &output));
+                }
+                parse_one_path(&output.stdout, "common Git directory")
+            }
+            Some(_) => Err(CowshedError::integrity(
+                format!(
+                    "Git metadata is neither a real directory nor a pointer: {}",
+                    dot_git.display()
+                ),
+                "restore the workspace Git metadata and retry",
+            )),
+            None => Err(CowshedError::integrity(
+                format!("Git metadata is missing: {}", dot_git.display()),
+                "restore the workspace Git metadata and retry",
+            )),
+        }
     }
 
     /// Record that this repository's working tree lives on a case-sensitive volume.
@@ -1491,8 +1520,11 @@ impl GitRepository {
         clean: bool,
         resuming: bool,
     ) -> Result<()> {
-        if clean && self.root.join(".git").is_dir() {
-            timed_async("fork", "head", self.discard_uncommitted()).await?;
+        if self.root.join(".git").is_dir() {
+            timed_async("fork", "excludes", self.ensure_cowshed_excludes()).await?;
+            if clean {
+                timed_async("fork", "head", self.discard_uncommitted()).await?;
+            }
         }
         // Before any branch is checked out, so only what the clone inherited is judged. On resume
         // every link still holds either the source's bytes or the absolute target an earlier pass
@@ -1548,7 +1580,6 @@ impl GitRepository {
         )?;
         let reset = self.run(["reset", "-q", "--hard", "HEAD"]).await?;
         ensure_git_success("reset source edits in the clone", reset)?;
-        self.ensure_cowshed_excludes().await?;
         let clean = self.run(["clean", "-q", "-f", "-d"]).await?;
         ensure_git_success("delete nonignored untracked files in the clone", clean)
     }
@@ -1984,8 +2015,8 @@ impl GitRepository {
             .await
     }
 
-    /// Continue the exact linked-worktree registration left by a pending canonical clone.
-    /// `resuming` is not inferred from Git state: only the storage lifecycle fence may grant it.
+    /// Continue a pending fork's exact registration, then initialize its index and branch.
+    /// `resuming` is granted only by the storage lifecycle fence.
     pub async fn adopt_as_linked_worktree_resumable(
         &self,
         name: &str,
@@ -2020,20 +2051,7 @@ impl GitRepository {
             Some(1) => false,
             _ => return Err(git_internal("check linked-worktree branch", &branch_exists)),
         };
-
         let admin = main.worktree_admin_dir(name).await?;
-        let mount = self.root.clone();
-        let staging = mount.join(WORKTREE_STAGING);
-        let staged = staging.join(name);
-        let staged_dot_git = staged.join(".git");
-        let dot_git = mount.join(".git");
-
-        if admin.exists() && !resuming {
-            return Err(CowshedError::conflict(
-                format!("main already registers a linked worktree named {name}"),
-                format!("cowshed rm {name}"),
-            ));
-        }
         if branch_ready && !admin.is_dir() {
             return Err(CowshedError::integrity(
                 format!(
@@ -2042,39 +2060,118 @@ impl GitRepository {
                 "cowshed doctor --json",
             ));
         }
+        let fallback_head;
+        let head = match source_head.or(start) {
+            Some(head) => head,
+            None => {
+                fallback_head = main.head_oid().await?;
+                fallback_head.as_str()
+            }
+        };
+        self.register_linked_worktree(name, &main, &admin, head, resuming)
+            .await?;
+        let reset = self.run(["reset", "-q"]).await?;
+        ensure_git_success("populate linked worktree index", reset)?;
+        self.ensure_cowshed_excludes().await?;
+        if clean {
+            self.discard_uncommitted().await?;
+        }
+        if branch_ready {
+            self.ensure_workspace_branch_checked_out(&branch, &branch_ref)
+                .await?;
+        } else {
+            self.switch_to_workspace_branch(&branch, start).await?;
+        }
+        Ok(())
+    }
 
-        if !admin.exists() {
-            let fallback_head;
-            let head = match source_head.or(start) {
-                Some(start) => start,
-                None => {
-                    fallback_head = main.head_oid().await?;
-                    fallback_head.as_str()
-                }
-            };
+    /// Rename preserves the linked source's Git administration, including staged-only bytes.
+    /// Only its registration id and counterpart path change; no reset or switch runs.
+    pub async fn preserve_linked_worktree_for_rename(
+        &self,
+        source_name: &str,
+        name: &str,
+        source_mount: &Path,
+        main_mount: &Path,
+        resuming: bool,
+    ) -> Result<()> {
+        let main = Self::from_root(main_mount);
+        let source = Self::from_root(source_mount);
+        let source_admin = main.worktree_admin_dir(source_name).await?;
+        let actual = source.run(["rev-parse", "--absolute-git-dir"]).await?;
+        if !actual.status.success() {
+            return Err(git_internal("read rename source Git directory", &actual));
+        }
+        if parse_one_path(&actual.stdout, "rename source Git directory")? != source_admin {
+            return Err(CowshedError::integrity(
+                "rename source does not own its recorded linked-worktree registration",
+                "leave the foreign registration intact; cowshed doctor --json",
+            ));
+        }
+        let head = source.head_oid().await?;
+        let admin = main.worktree_admin_dir(name).await?;
+        self.register_linked_worktree(name, &main, &admin, head.as_str(), resuming)
+            .await?;
+        tokio::task::spawn_blocking(move || {
+            copy_worktree_administration(&source_admin, &admin, true)
+        })
+        .await
+        .map_err(|error| {
+            CowshedError::internal(format!("preserve renamed worktree Git state: {error}"))
+        })?
+    }
+
+    /// Establish clone-owned Git, without resetting its index or selecting a branch.
+    async fn register_linked_worktree(
+        &self,
+        name: &str,
+        main: &Self,
+        admin: &Path,
+        head: &str,
+        resuming: bool,
+    ) -> Result<()> {
+        let mount = fs::canonicalize(&self.root)
+            .map_err(|error| io_failure("canonicalize linked worktree mount", &self.root, error))?;
+        let staging = mount.join(WORKTREE_STAGING);
+        let staged = staging.join(name);
+        let staged_dot_git = staged.join(".git");
+        let dot_git = mount.join(".git");
+        let admin_present =
+            inspect_path(admin, "inspect linked-worktree administration")?.is_some();
+        if admin_present && !resuming {
+            return Err(CowshedError::conflict(
+                format!("main already registers a linked worktree named {name}"),
+                format!("cowshed rm {name}"),
+            ));
+        }
+        if !admin_present {
             tokio::task::spawn_blocking({
                 let dot_git = dot_git.clone();
                 let staging = staging.clone();
-                move || -> std::io::Result<()> {
-                    if dot_git.is_dir() {
-                        fs::remove_dir_all(&dot_git)?;
-                    } else if dot_git.exists() {
-                        fs::remove_file(&dot_git)?;
+                move || -> Result<()> {
+                    match inspect_path(&dot_git, "inspect clone .git before registration")? {
+                        Some(metadata) if metadata.is_dir() => fs::remove_dir_all(&dot_git)
+                            .map_err(|error| {
+                                io_failure("remove clone .git directory", &dot_git, error)
+                            })?,
+                        Some(_) => fs::remove_file(&dot_git).map_err(|error| {
+                            io_failure("remove clone .git pointer", &dot_git, error)
+                        })?,
+                        None => {}
                     }
-                    if staging.exists() {
-                        fs::remove_dir_all(&staging)?;
+                    if inspect_path(&staging, "inspect worktree staging")?.is_some() {
+                        fs::remove_dir_all(&staging).map_err(|error| {
+                            io_failure("remove worktree staging", &staging, error)
+                        })?;
                     }
                     fs::create_dir_all(&staging)
+                        .map_err(|error| io_failure("create worktree staging", &staging, error))
                 }
             })
             .await
-            .map_err(|error| CowshedError::internal(format!("prepare worktree staging: {error}")))?
             .map_err(|error| {
-                CowshedError::internal(format!(
-                    "prepare worktree staging at {}: {error}",
-                    staging.display()
-                ))
-            })?;
+                CowshedError::internal(format!("prepare worktree staging: {error}"))
+            })??;
             let output = run_git_at_with_objects(
                 &main.root,
                 main.alternate_objects.as_deref(),
@@ -2092,71 +2189,98 @@ impl GitRepository {
             .await?;
             ensure_git_success("register linked worktree", output)?;
         }
-        if !admin.is_dir() {
-            return Err(CowshedError::integrity(
-                format!("git registered the linked worktree for {name} under another id"),
+        match inspect_path(admin, "inspect linked-worktree administration")? {
+            Some(metadata) if metadata.file_type().is_dir() => {}
+            Some(_) => {
+                return Err(CowshedError::integrity(
+                    format!(
+                        "linked-worktree administration {} is not a real directory",
+                        admin.display()
+                    ),
+                    "leave the foreign registration intact; cowshed doctor --json",
+                ));
+            }
+            None => {
+                return Err(CowshedError::integrity(
+                    format!("git registered the linked worktree for {name} under another id"),
+                    "cowshed doctor --json",
+                ));
+            }
+        }
+        let gitdir_file = admin.join("gitdir");
+        let registered = fs::read(&gitdir_file).map_err(|error| {
+            CowshedError::integrity(
+                format!(
+                    "read linked-worktree registration {name} at {}: {error}",
+                    gitdir_file.display()
+                ),
                 "cowshed doctor --json",
+            )
+        })?;
+        let registered = parse_one_path(&registered, "linked worktree gitdir")?;
+        if registered != dot_git && registered != staged_dot_git {
+            return Err(CowshedError::integrity(
+                format!(
+                    "linked-worktree registration {name} belongs to {}",
+                    registered.display()
+                ),
+                "leave the foreign registration intact; cowshed doctor --json",
             ));
         }
-
-        if dot_git.is_dir() {
+        if inspect_path(&dot_git, "inspect clone .git")?.is_some_and(|metadata| metadata.is_dir()) {
             return Err(CowshedError::integrity(
                 format!("linked-worktree registration {name} exists beside a full .git directory"),
                 "cowshed doctor --json",
             ));
         }
-        if !dot_git.exists() {
-            if !staged_dot_git.is_file() {
+        match inspect_path(&staged_dot_git, "inspect staged .git pointer")? {
+            Some(metadata) if metadata.is_file() => {
+                tokio::task::spawn_blocking({
+                    let from = staged_dot_git.clone();
+                    let to = dot_git.clone();
+                    move || -> Result<()> {
+                        fs::rename(&from, &to).map_err(|error| {
+                            io_failure("relocate staged worktree pointer", &from, error)
+                        })
+                    }
+                })
+                .await
+                .map_err(|error| {
+                    CowshedError::internal(format!("relocate worktree pointer: {error}"))
+                })??;
+            }
+            Some(_) => {
                 return Err(CowshedError::integrity(
-                    format!(
-                        "linked-worktree registration {name} has neither canonical nor staged .git pointer"
-                    ),
+                    format!("staged .git for {name} is not a pointer file"),
                     "cowshed doctor --json",
                 ));
             }
+            None => match inspect_path(&dot_git, "inspect clone .git pointer")? {
+                Some(metadata) if metadata.is_file() => {}
+                _ => {
+                    return Err(CowshedError::integrity(
+                        format!(
+                            "linked-worktree registration {name} has neither canonical nor staged .git pointer"
+                        ),
+                        "cowshed doctor --json",
+                    ));
+                }
+            },
+        }
+        if inspect_path(&staging, "inspect worktree staging")?.is_some() {
             tokio::task::spawn_blocking({
-                let dot_git = dot_git.clone();
-                let staged_dot_git = staged_dot_git.clone();
-                move || fs::rename(staged_dot_git, dot_git)
+                let staging = staging.clone();
+                move || -> Result<()> {
+                    fs::remove_dir_all(&staging)
+                        .map_err(|error| io_failure("remove worktree staging", &staging, error))
+                }
             })
             .await
-            .map_err(|error| CowshedError::internal(format!("relocate worktree pointer: {error}")))?
             .map_err(|error| {
-                CowshedError::internal(format!(
-                    "relocate worktree pointer onto {}: {error}",
-                    mount.display()
-                ))
-            })?;
+                CowshedError::internal(format!("remove worktree staging: {error}"))
+            })??;
         }
-        if staging.exists() {
-            let staging_for_remove = staging.clone();
-            tokio::task::spawn_blocking(move || fs::remove_dir_all(staging_for_remove))
-                .await
-                .map_err(|error| {
-                    CowshedError::internal(format!("remove worktree staging: {error}"))
-                })?
-                .map_err(|error| {
-                    CowshedError::internal(format!(
-                        "remove worktree staging at {}: {error}",
-                        staging.display()
-                    ))
-                })?;
-        }
-
-        main.repair_linked_worktree(&mount).await?;
-        let reset = self.run(["reset", "-q"]).await?;
-        ensure_git_success("populate linked worktree index", reset)?;
-        if clean {
-            self.discard_uncommitted().await?;
-        }
-        if branch_ready {
-            let (_, branch_ref) = workspace_branch(name);
-            self.ensure_workspace_branch_checked_out(&branch, &branch_ref)
-                .await?;
-        } else {
-            self.switch_to_workspace_branch(&branch, start).await?;
-        }
-        Ok(())
+        main.repair_linked_worktree(&mount).await
     }
 
     /// Point this repository's registration for `mount` back at the mount, both directions.
@@ -3027,6 +3151,104 @@ fn parse_oid(value: String, description: &str) -> Result<GitOid> {
 fn parse_one_path(bytes: &[u8], description: &str) -> Result<PathBuf> {
     let value = parse_one_line(bytes, description)?;
     Ok(PathBuf::from(OsString::from_vec(value.to_vec())))
+}
+
+/// A registration-step filesystem failure, named by the operation that failed.
+fn io_failure(operation: &str, path: &Path, error: std::io::Error) -> CowshedError {
+    CowshedError::internal(format!("{operation} at {}: {error}", path.display()))
+}
+
+/// Inspect `path` without following links. Absence is `None`; any other failure is an error.
+fn inspect_path(path: &Path, operation: &str) -> Result<Option<fs::Metadata>> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(CowshedError::integrity(
+            format!("{operation} at {}: {error}", path.display()),
+            "cowshed doctor --json",
+        )),
+    }
+}
+
+/// Copy a linked worktree's administration tree into its clone's, skipping only the root `gitdir`
+/// counterpart, so HEAD, index, config and logs travel unchanged. Links are refused rather than
+/// followed, and both ends must be real directories.
+fn copy_worktree_administration(source: &Path, destination: &Path, root: bool) -> Result<()> {
+    const HINT: &str = "finish the journaled cowshed mv; the source is retained";
+    let fail = |operation: &str, path: &Path, error: std::io::Error| {
+        CowshedError::integrity(format!("{operation} at {}: {error}", path.display()), HINT)
+    };
+    for path in [source, destination] {
+        let metadata = fs::symlink_metadata(path)
+            .map_err(|error| fail("inspect worktree administration", path, error))?;
+        if !metadata.file_type().is_dir() {
+            return Err(CowshedError::integrity(
+                format!(
+                    "worktree administration at {} is not a real directory",
+                    path.display()
+                ),
+                HINT,
+            ));
+        }
+    }
+    let entries = fs::read_dir(source)
+        .map_err(|error| fail("read worktree administration", source, error))?;
+    for entry in entries {
+        let entry =
+            entry.map_err(|error| fail("read worktree administration entry", source, error))?;
+        let file_name = entry.file_name();
+        if root && file_name == "gitdir" {
+            continue;
+        }
+        let path = entry.path();
+        let target = destination.join(&file_name);
+        let kind = entry
+            .file_type()
+            .map_err(|error| fail("inspect worktree administration entry", &path, error))?;
+        if kind.is_dir() {
+            fs::create_dir_all(&target).map_err(|error| {
+                fail("create worktree administration directory", &target, error)
+            })?;
+            copy_worktree_administration(&path, &target, false)?;
+        } else if kind.is_file() {
+            match fs::symlink_metadata(&target) {
+                Ok(existing) if !existing.file_type().is_file() => {
+                    return Err(CowshedError::integrity(
+                        format!(
+                            "worktree administration target {} is not a regular file",
+                            target.display()
+                        ),
+                        HINT,
+                    ));
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(fail(
+                        "inspect worktree administration target",
+                        &target,
+                        error,
+                    ));
+                }
+            }
+            fs::copy(&path, &target)
+                .map_err(|error| fail("copy worktree administration file", &path, error))?;
+            fs::File::open(&target)
+                .and_then(|file| file.sync_all())
+                .map_err(|error| fail("sync worktree administration file", &target, error))?;
+        } else {
+            return Err(CowshedError::integrity(
+                format!(
+                    "worktree administration entry {} is not a regular file or directory",
+                    path.display()
+                ),
+                HINT,
+            ));
+        }
+    }
+    fs::File::open(destination)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| fail("sync worktree administration", destination, error))
 }
 
 fn parse_one_line<'a>(bytes: &'a [u8], description: &str) -> Result<&'a [u8]> {
@@ -4073,6 +4295,95 @@ mod tests {
             .unregister_linked_worktree("raven")
             .await
             .expect("second unregister is a no-op");
+    }
+
+    /// Rename carries a linked source's Git state across. A crash before the administration
+    /// handoff and a crash after it both resume to the same bytes, and the source is never touched.
+    #[tokio::test]
+    async fn rename_preserves_linked_source_index_wip_and_branch_across_resumed_handoff() {
+        let main = repository();
+        let scratch = main.parent().expect("scratch root").to_path_buf();
+        let source = scratch.join("raven");
+        let destination = scratch.join("cedar");
+        fs::create_dir_all(main.join(".git/info")).expect("info directory");
+        fs::write(main.join(".git/info/exclude"), "/warm/\n").expect("ignore warm directory");
+        copy_tree(&main, &source);
+        GitRepository::from_root(&source)
+            .adopt_as_linked_worktree("raven", &main, None)
+            .await
+            .expect("adopt source as linked worktree");
+
+        fs::write(source.join("README"), "test\nstaged\n").expect("stage README edit");
+        git(&source, &["add", "README"]);
+        fs::write(source.join("README"), "test\nstaged\nunstaged\n").expect("unstaged README edit");
+        fs::write(source.join("untracked.txt"), "untracked\n").expect("untracked file");
+        fs::create_dir_all(source.join("warm")).expect("warm directory");
+        fs::write(source.join("warm/cache.bin"), [0u8, 1, 2, 255]).expect("ignored warm file");
+
+        type Snapshot = (String, String, Vec<u8>, [Vec<u8>; 3], String);
+        fn snapshot(root: &Path, admin: &Path) -> Snapshot {
+            (
+                git_stdout(root, &["branch", "--show-current"])
+                    .trim()
+                    .to_owned(),
+                git_stdout(root, &["ls-files", "--stage"]),
+                fs::read(admin.join("index")).expect("administration index"),
+                ["README", "untracked.txt", "warm/cache.bin"]
+                    .map(|path| fs::read(root.join(path)).expect("workspace file")),
+                git_stdout(
+                    root,
+                    &[
+                        "--no-optional-locks",
+                        "status",
+                        "--porcelain=v1",
+                        "--ignored",
+                    ],
+                ),
+            )
+        }
+
+        let source_repo = GitRepository::from_root(&source);
+        let head = source_repo.head_oid().await.expect("source head");
+        let source_admin = main.join(".git/worktrees/raven");
+        let cedar_admin = main.join(".git/worktrees/cedar");
+        let original = snapshot(&source, &source_admin);
+        assert_eq!(original.0, "cowshed/raven");
+
+        copy_tree(&source, &destination);
+        let main_repo = GitRepository::from_root(&main);
+        let destination_repo = GitRepository::from_root(&destination);
+        destination_repo
+            .register_linked_worktree("cedar", &main_repo, &cedar_admin, head.as_str(), false)
+            .await
+            .expect("register clone immediately before handoff");
+        destination_repo
+            .preserve_linked_worktree_for_rename("raven", "cedar", &source, &main, true)
+            .await
+            .expect("resume preservation after registration");
+        assert_eq!(snapshot(&destination, &cedar_admin), original);
+        assert_eq!(snapshot(&source, &source_admin), original);
+        assert_eq!(
+            fs::read_to_string(cedar_admin.join("gitdir")).expect("destination gitdir"),
+            format!(
+                "{}\n",
+                fs::canonicalize(&destination)
+                    .expect("canonical destination")
+                    .join(".git")
+                    .display()
+            ),
+        );
+
+        destination_repo
+            .preserve_linked_worktree_for_rename("raven", "cedar", &source, &main, true)
+            .await
+            .expect("repeat preservation after completed handoff");
+        assert_eq!(snapshot(&destination, &cedar_admin), original);
+        assert_eq!(snapshot(&source, &source_admin), original);
+        let names: Vec<OsString> = registrations(&main)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(names, [OsString::from("cedar"), OsString::from("raven")]);
     }
 
     #[tokio::test]
