@@ -5,30 +5,255 @@
 //! `opt-level = 3` (see `scan.rs`'s module doc for the numbers and the
 //! re-measure condition).
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ParserError {
     InvalidJson,
     UnexpectedToken,
     EndOfInput,
     InvalidNumber,
+    /// The parser's nesting stack or a caller's decode scratch could not grow.
+    OutOfMemory,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub enum Token {
+/// A JSON string's text between its quotes, borrowed from the input and
+/// already validated: well-formed escapes, no raw control bytes, UTF-8.
+/// Lexing copies nothing; a consumer that needs the decoded text of an
+/// escaped string decodes it into storage it owns ([`JsonStr::text`]).
+#[derive(Clone, Copy, Debug, Eq)]
+pub enum JsonStr<'a> {
+    /// No escapes: the text is the input bytes themselves.
+    Plain(&'a str),
+    /// The raw text, escapes included.
+    Escaped(&'a str),
+}
+
+impl<'a> JsonStr<'a> {
+    /// The text when it needs no decoding.
+    pub fn as_plain(&self) -> Option<&'a str> {
+        match self {
+            Self::Plain(text) => Some(text),
+            Self::Escaped(_) => None,
+        }
+    }
+
+    /// The decoded text: the input itself when plain, otherwise decoded into
+    /// `scratch`, whose growth is fallible.
+    pub fn text<'s>(&self, scratch: &'s mut Vec<u8>) -> Result<&'s str, ParserError>
+    where
+        'a: 's,
+    {
+        match *self {
+            Self::Plain(text) => Ok(text),
+            Self::Escaped(raw) => {
+                scratch.clear();
+                // Decoding never lengthens: every escape is longer than the
+                // bytes it stands for.
+                scratch
+                    .try_reserve(raw.len())
+                    .map_err(|_| ParserError::OutOfMemory)?;
+                if !decode_escaped(raw, |chunk| scratch.extend_from_slice(chunk)) {
+                    return Err(ParserError::InvalidJson);
+                }
+                std::str::from_utf8(scratch).map_err(|_| ParserError::InvalidJson)
+            }
+        }
+    }
+
+    /// An owned copy of the decoded text, backed fallibly.
+    pub fn to_owned_text(&self) -> Result<String, ParserError> {
+        let mut owned = String::new();
+        match *self {
+            Self::Plain(text) => {
+                owned
+                    .try_reserve_exact(text.len())
+                    .map_err(|_| ParserError::OutOfMemory)?;
+                owned.push_str(text);
+            }
+            Self::Escaped(_) => {
+                // The decoded bytes are backed in `scratch` and become the
+                // string without another copy.
+                let mut scratch = Vec::new();
+                self.text(&mut scratch)?;
+                return String::from_utf8(scratch).map_err(|_| ParserError::InvalidJson);
+            }
+        }
+        Ok(owned)
+    }
+
+    /// The decoded bytes, one at a time, without storing them.
+    pub fn decoded(&self) -> DecodedBytes<'a> {
+        let (raw, escaped) = match *self {
+            Self::Plain(text) => (text.as_bytes(), false),
+            Self::Escaped(text) => (text.as_bytes(), true),
+        };
+        DecodedBytes {
+            raw,
+            at: 0,
+            escaped,
+            pending: [0; 4],
+            pending_at: 0,
+            pending_len: 0,
+        }
+    }
+
+    /// Whether the decoded text is exactly `other`.
+    pub fn is(&self, other: &str) -> bool {
+        match *self {
+            Self::Plain(text) => text == other,
+            Self::Escaped(_) => self.decoded().eq(other.bytes()),
+        }
+    }
+}
+
+impl PartialEq for JsonStr<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.decoded().eq(other.decoded())
+    }
+}
+
+impl PartialEq<&str> for JsonStr<'_> {
+    fn eq(&self, other: &&str) -> bool {
+        self.is(other)
+    }
+}
+
+/// The decoded bytes of a [`JsonStr`]; a decoded escape is buffered here.
+#[derive(Clone, Debug)]
+pub struct DecodedBytes<'a> {
+    raw: &'a [u8],
+    at: usize,
+    escaped: bool,
+    pending: [u8; 4],
+    pending_at: usize,
+    pending_len: usize,
+}
+
+impl Iterator for DecodedBytes<'_> {
+    type Item = u8;
+
+    fn next(&mut self) -> Option<u8> {
+        if self.pending_at < self.pending_len {
+            self.pending_at += 1;
+            return Some(self.pending[self.pending_at - 1]);
+        }
+        let byte = *self.raw.get(self.at)?;
+        if !self.escaped || byte != b'\\' {
+            self.at += 1;
+            return Some(byte);
+        }
+        let escape = *self.raw.get(self.at + 1)?;
+        self.at += 2;
+        Some(match escape {
+            b'"' | b'\\' | b'/' => escape,
+            b'b' => 8,
+            b'f' => 12,
+            b'n' => b'\n',
+            b'r' => b'\r',
+            b't' => b'\t',
+            b'u' => {
+                let (scalar, next) = unicode_escape(self.raw, self.at)?;
+                self.at = next;
+                self.pending_len = scalar.encode_utf8(&mut self.pending).len();
+                self.pending_at = 1;
+                self.pending[0]
+            }
+            // Lexing admits no other escape.
+            _ => return None,
+        })
+    }
+}
+
+/// Feed the decoded bytes of validated escaped text to `emit`, a clean run
+/// or one decoded escape at a time. `false` when the text is not validated
+/// escape syntax, which lexing rules out.
+fn decode_escaped(raw: &str, mut emit: impl FnMut(&[u8])) -> bool {
+    let bytes = raw.as_bytes();
+    let mut at = 0;
+    while at < bytes.len() {
+        let run_end = bytes[at..]
+            .iter()
+            .position(|byte| *byte == b'\\')
+            .map_or(bytes.len(), |offset| at + offset);
+        if run_end > at {
+            emit(&bytes[at..run_end]);
+        }
+        at = run_end;
+        if at == bytes.len() {
+            break;
+        }
+        let Some(&escape) = bytes.get(at + 1) else {
+            return false;
+        };
+        at += 2;
+        let simple = match escape {
+            b'"' | b'\\' | b'/' => escape,
+            b'b' => 8,
+            b'f' => 12,
+            b'n' => b'\n',
+            b'r' => b'\r',
+            b't' => b'\t',
+            b'u' => {
+                let Some((scalar, next)) = unicode_escape(bytes, at) else {
+                    return false;
+                };
+                at = next;
+                let mut encoded = [0; 4];
+                emit(scalar.encode_utf8(&mut encoded).as_bytes());
+                continue;
+            }
+            _ => return false,
+        };
+        emit(&[simple]);
+    }
+    true
+}
+
+/// The scalar of a `\uXXXX` escape whose four hex digits start at `at`,
+/// pairing UTF-16 surrogates, and the index after it; `None` for malformed
+/// hex or an unpaired surrogate.
+fn unicode_escape(bytes: &[u8], at: usize) -> Option<(char, usize)> {
+    let hex4 = |at: usize| -> Option<u32> {
+        bytes
+            .get(at..at.checked_add(4)?)?
+            .iter()
+            .try_fold(0_u32, |acc, byte| {
+                hex(*byte).ok().map(|digit| acc * 16 + digit)
+            })
+    };
+    let code = hex4(at)?;
+    let (scalar, next) = match code {
+        0xD800..=0xDBFF => {
+            if bytes.get(at + 4..at + 6) != Some(b"\\u") {
+                return None;
+            }
+            let low = hex4(at + 6)?;
+            if !(0xDC00..=0xDFFF).contains(&low) {
+                return None;
+            }
+            (0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00), at + 10)
+        }
+        0xDC00..=0xDFFF => return None,
+        _ => (code, at + 4),
+    };
+    Some((char::from_u32(scalar)?, next))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Token<'a> {
     ObjectBegin,
     ObjectEnd,
     ArrayBegin,
     ArrayEnd,
-    String(String),
-    Number(String),
+    String(JsonStr<'a>),
+    Number(&'a str),
     True,
     False,
     Null,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct SpannedToken {
-    pub token: Token,
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct SpannedToken<'a> {
+    pub token: Token<'a>,
     pub start: usize,
     pub end: usize,
 }
@@ -79,7 +304,7 @@ pub struct JsonParser<'a> {
     cursor: usize,
     stack: Vec<Frame>,
     top: Top,
-    peeked: Option<SpannedToken>,
+    peeked: Option<SpannedToken<'a>>,
 }
 
 impl<'a> JsonParser<'a> {
@@ -127,16 +352,18 @@ impl<'a> JsonParser<'a> {
     }
 
     /// Lex one value-start token at the cursor and update structural state.
-    fn read_value_token(&mut self) -> Result<SpannedToken, ParserError> {
+    fn read_value_token(&mut self) -> Result<SpannedToken<'a>, ParserError> {
         let start = self.cursor;
         let token = match self.current_byte()? {
             b'{' => {
+                self.room_to_nest()?;
                 self.note_value_complete();
                 self.cursor += 1;
                 self.stack.push(Frame::Object(ObjectPhase::KeyOrEnd));
                 Token::ObjectBegin
             }
             b'[' => {
+                self.room_to_nest()?;
                 self.note_value_complete();
                 self.cursor += 1;
                 self.stack.push(Frame::Array(ArrayPhase::ValueOrEnd));
@@ -176,7 +403,15 @@ impl<'a> JsonParser<'a> {
         })
     }
 
-    fn read_key_token(&mut self) -> Result<SpannedToken, ParserError> {
+    /// Back one more nesting frame before any state changes, so an opening
+    /// bracket the stack cannot hold is refused as a value.
+    fn room_to_nest(&mut self) -> Result<(), ParserError> {
+        self.stack
+            .try_reserve(1)
+            .map_err(|_| ParserError::OutOfMemory)
+    }
+
+    fn read_key_token(&mut self) -> Result<SpannedToken<'a>, ParserError> {
         let start = self.cursor;
         if self.current_byte()? != b'"' {
             return Err(ParserError::InvalidJson);
@@ -195,7 +430,7 @@ impl<'a> JsonParser<'a> {
     /// One token at the cursor. Whitespace belongs to no token, so it is skipped
     /// before the save point. A failed read rolls back to the token start; the
     /// readers change the stack and phase only after their last fallible step.
-    fn advance(&mut self) -> Result<SpannedToken, ParserError> {
+    fn advance(&mut self) -> Result<SpannedToken<'a>, ParserError> {
         self.skip_whitespace();
         let at = self.cursor;
         let result = self.advance_inner();
@@ -205,7 +440,7 @@ impl<'a> JsonParser<'a> {
         result
     }
 
-    fn advance_inner(&mut self) -> Result<SpannedToken, ParserError> {
+    fn advance_inner(&mut self) -> Result<SpannedToken<'a>, ParserError> {
         match self.stack.last().copied() {
             None => match self.top {
                 Top::NotStarted => self.read_value_token(),
@@ -266,7 +501,7 @@ impl<'a> JsonParser<'a> {
         }
     }
 
-    fn pop_container(&mut self, token: Token) -> Result<SpannedToken, ParserError> {
+    fn pop_container(&mut self, token: Token<'a>) -> Result<SpannedToken<'a>, ParserError> {
         let start = self.cursor;
         self.cursor += 1;
         // The parent phase was already set by note_value_complete() when this
@@ -279,14 +514,14 @@ impl<'a> JsonParser<'a> {
         })
     }
 
-    pub(crate) fn next_spanned(&mut self) -> Result<SpannedToken, ParserError> {
+    pub(crate) fn next_spanned(&mut self) -> Result<SpannedToken<'a>, ParserError> {
         if let Some(token) = self.peeked.take() {
             return Ok(token);
         }
         self.advance()
     }
 
-    pub fn next_token(&mut self) -> Result<Token, ParserError> {
+    pub fn next_token(&mut self) -> Result<Token<'a>, ParserError> {
         Ok(self.next_spanned()?.token)
     }
 
@@ -302,36 +537,42 @@ impl<'a> JsonParser<'a> {
         Ok(())
     }
 
-    fn parse_string(&mut self) -> Result<String, ParserError> {
+    /// Lex one string at the cursor without copying it: validate its
+    /// escapes and encoding, and borrow the text between the quotes.
+    fn parse_string(&mut self) -> Result<JsonStr<'a>, ParserError> {
         debug_assert_eq!(self.input[self.cursor], b'"');
         self.cursor += 1;
-        let mut value = Vec::new();
+        let start = self.cursor;
+        let mut escaped = false;
         loop {
-            // Bulk-copy the clean run up to the next quote/backslash/control
-            // byte, then handle that byte exactly as the per-byte loop did
-            // (the bulk extend_from_slice is what makes this loop fast).
-            let run_end = crate::scan::find_string_special(self.input, self.cursor);
-            value.extend_from_slice(&self.input[self.cursor..run_end]);
-            self.cursor = run_end;
+            self.cursor = crate::scan::find_string_special(self.input, self.cursor);
             let Some(&byte) = self.input.get(self.cursor) else {
                 return Err(ParserError::InvalidJson);
             };
             self.cursor += 1;
             match byte {
-                b'"' => return String::from_utf8(value).map_err(|_| ParserError::InvalidJson),
+                b'"' => {
+                    let text = std::str::from_utf8(&self.input[start..self.cursor - 1])
+                        .map_err(|_| ParserError::InvalidJson)?;
+                    return Ok(if escaped {
+                        JsonStr::Escaped(text)
+                    } else {
+                        JsonStr::Plain(text)
+                    });
+                }
                 b'\\' => {
+                    escaped = true;
                     let Some(&escape) = self.input.get(self.cursor) else {
                         return Err(ParserError::InvalidJson);
                     };
                     self.cursor += 1;
                     match escape {
-                        b'"' | b'\\' | b'/' => value.push(escape),
-                        b'b' => value.push(8),
-                        b'f' => value.push(12),
-                        b'n' => value.push(b'\n'),
-                        b'r' => value.push(b'\r'),
-                        b't' => value.push(b'\t'),
-                        b'u' => self.push_unicode_escape(&mut value)?,
+                        b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' => {}
+                        b'u' => {
+                            let (_, next) = unicode_escape(self.input, self.cursor)
+                                .ok_or(ParserError::InvalidJson)?;
+                            self.cursor = next;
+                        }
                         _ => return Err(ParserError::InvalidJson),
                     }
                 }
@@ -345,44 +586,7 @@ impl<'a> JsonParser<'a> {
         }
     }
 
-    fn read_hex4(&mut self) -> Result<u32, ParserError> {
-        let end = self.cursor.checked_add(4).ok_or(ParserError::InvalidJson)?;
-        let digits = self
-            .input
-            .get(self.cursor..end)
-            .ok_or(ParserError::InvalidJson)?;
-        self.cursor = end;
-        digits
-            .iter()
-            .try_fold(0_u32, |acc, byte| hex(*byte).map(|digit| acc * 16 + digit))
-    }
-
-    /// `\uXXXX` escapes, including UTF-16 surrogate pairs (`😀`).
-    /// Unpaired surrogates are rejected, matching std.json and simdjzon.
-    fn push_unicode_escape(&mut self, output: &mut Vec<u8>) -> Result<(), ParserError> {
-        let code = self.read_hex4()?;
-        let scalar = match code {
-            0xD800..=0xDBFF => {
-                if self.input.get(self.cursor..self.cursor + 2) != Some(b"\\u") {
-                    return Err(ParserError::InvalidJson);
-                }
-                self.cursor += 2;
-                let low = self.read_hex4()?;
-                if !(0xDC00..=0xDFFF).contains(&low) {
-                    return Err(ParserError::InvalidJson);
-                }
-                0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00)
-            }
-            0xDC00..=0xDFFF => return Err(ParserError::InvalidJson),
-            _ => code,
-        };
-        let character = char::from_u32(scalar).ok_or(ParserError::InvalidJson)?;
-        let mut encoded = [0; 4];
-        output.extend_from_slice(character.encode_utf8(&mut encoded).as_bytes());
-        Ok(())
-    }
-
-    fn parse_number(&mut self) -> Result<String, ParserError> {
+    fn parse_number(&mut self) -> Result<&'a str, ParserError> {
         let start = self.cursor;
         if self.input.get(self.cursor) == Some(&b'-') {
             self.cursor += 1;
@@ -419,20 +623,16 @@ impl<'a> JsonParser<'a> {
                 return Err(ParserError::InvalidNumber);
             }
         }
-        std::str::from_utf8(&self.input[start..self.cursor])
-            .map(str::to_owned)
-            .map_err(|_| ParserError::InvalidNumber)
+        std::str::from_utf8(&self.input[start..self.cursor]).map_err(|_| ParserError::InvalidNumber)
     }
 
-    pub fn peek_token(&mut self) -> Result<Token, ParserError> {
-        if self.peeked.is_none() {
-            self.peeked = Some(self.advance()?);
-        }
-        Ok(self
-            .peeked
-            .as_ref()
-            .map(|spanned| spanned.token.clone())
-            .expect("peeked was just populated"))
+    pub fn peek_token(&mut self) -> Result<Token<'a>, ParserError> {
+        let spanned = match self.peeked {
+            Some(spanned) => spanned,
+            None => self.advance()?,
+        };
+        self.peeked = Some(spanned);
+        Ok(spanned.token)
     }
     pub fn expect_object_begin(&mut self) -> Result<(), ParserError> {
         expect(self.next_token()?, Token::ObjectBegin)
@@ -440,14 +640,14 @@ impl<'a> JsonParser<'a> {
     pub fn expect_array_begin(&mut self) -> Result<(), ParserError> {
         expect(self.next_token()?, Token::ArrayBegin)
     }
-    pub fn expect_field_name(&mut self) -> Result<String, ParserError> {
+    pub fn expect_field_name(&mut self) -> Result<JsonStr<'a>, ParserError> {
         match self.next_token()? {
             Token::String(value) => Ok(value),
             Token::ObjectEnd => Err(ParserError::EndOfInput),
             _ => Err(ParserError::UnexpectedToken),
         }
     }
-    pub fn expect_string(&mut self) -> Result<String, ParserError> {
+    pub fn expect_string(&mut self) -> Result<JsonStr<'a>, ParserError> {
         match self.next_token()? {
             Token::String(value) => Ok(value),
             _ => Err(ParserError::UnexpectedToken),
@@ -482,7 +682,7 @@ impl<'a> JsonParser<'a> {
         let first = self.next_spanned()?;
         self.skip_value_from(first).map(|_| ())
     }
-    pub(crate) fn skip_open_container(&mut self, first: Token) -> Result<(), ParserError> {
+    pub(crate) fn skip_open_container(&mut self, first: Token<'a>) -> Result<(), ParserError> {
         let mut depth = match first {
             Token::ObjectBegin | Token::ArrayBegin => 1_u32,
             _ => return Ok(()),
@@ -496,7 +696,10 @@ impl<'a> JsonParser<'a> {
         }
         Ok(())
     }
-    pub(crate) fn skip_value_from(&mut self, first: SpannedToken) -> Result<usize, ParserError> {
+    pub(crate) fn skip_value_from(
+        &mut self,
+        first: SpannedToken<'a>,
+    ) -> Result<usize, ParserError> {
         let mut depth = match first.token {
             Token::ObjectBegin | Token::ArrayBegin => 1_u32,
             _ => return Ok(first.end),
@@ -523,7 +726,7 @@ fn hex(byte: u8) -> Result<u32, ParserError> {
         _ => Err(ParserError::InvalidJson),
     }
 }
-fn expect(token: Token, expected: Token) -> Result<(), ParserError> {
+fn expect(token: Token<'_>, expected: Token<'_>) -> Result<(), ParserError> {
     if token == expected {
         Ok(())
     } else {
@@ -634,8 +837,8 @@ mod tests {
         let mut p = JsonParser::new(br#"{"a":"x"}"#);
         p.expect_object_begin().unwrap();
         p.expect_field_name().unwrap();
-        assert_eq!(p.peek_token(), Ok(Token::String("x".into())));
-        assert_eq!(p.next_token(), Ok(Token::String("x".into())));
+        assert_eq!(p.peek_token(), Ok(Token::String(JsonStr::Plain("x"))));
+        assert_eq!(p.next_token(), Ok(Token::String(JsonStr::Plain("x"))));
         assert_eq!(p.next_token(), Ok(Token::ObjectEnd));
     }
 
@@ -653,7 +856,7 @@ mod tests {
         assert_eq!(p.cursor(), input.len());
     }
 
-    fn drain(input: &[u8]) -> Result<Vec<Token>, ParserError> {
+    fn drain(input: &[u8]) -> Result<Vec<Token<'_>>, ParserError> {
         let mut p = JsonParser::new(input);
         let mut tokens = Vec::new();
         loop {

@@ -3,7 +3,7 @@
 use crate::{
     ArrowType, ColumnValue, DynamicColumns, ExtractionConfig, MemberSchema, ParseError, PlaneKind,
     SignalSchemaField,
-    json_parser::{JsonParser, Token},
+    json_parser::{JsonParser, JsonStr, ParserError, Token},
     validate::{SemanticSchema, encode_path_segment},
 };
 use columine_arrow::VariableValueReservation;
@@ -26,6 +26,32 @@ pub enum ExtractionError {
     /// layout found no cell where the extractor writes its certified bytes;
     /// storing the writer's layout instead would break the column's schema.
     UnwrittenProjection,
+}
+
+/// A lexer refusal at the extraction boundary: memory the lexer could not
+/// back is `MemoryExhausted`, anything else malformed JSON.
+fn lex_error(error: ParserError) -> ExtractionError {
+    match error {
+        ParserError::OutOfMemory => ExtractionError::MemoryExhausted,
+        ParserError::InvalidJson
+        | ParserError::UnexpectedToken
+        | ParserError::EndOfInput
+        | ParserError::InvalidNumber => ExtractionError::InvalidJson,
+    }
+}
+
+/// The decoded text of a JSON string: borrowed from the input when it has
+/// no escapes, otherwise an owned copy backed fallibly.
+fn text_of(text: JsonStr<'_>) -> Result<std::borrow::Cow<'_, str>, ExtractionError> {
+    match text.as_plain() {
+        Some(plain) => Ok(std::borrow::Cow::Borrowed(plain)),
+        None => owned(text).map(std::borrow::Cow::Owned),
+    }
+}
+
+/// The decoded text of a JSON string as an owned copy, backed fallibly.
+fn owned(text: JsonStr<'_>) -> Result<String, ExtractionError> {
+    text.to_owned_text().map_err(lex_error)
 }
 
 /// Sentinel for an unset diagnostic field index.
@@ -399,19 +425,21 @@ fn extract_json_event_open(
     // for it, so routing never depends on key order.
     let mut event_type: Option<String> = None;
     while !parser.is_object_end() {
-        let name = parser
-            .expect_field_name()
-            .map_err(|_| ExtractionError::InvalidJson)?;
+        let name = owned(
+            parser
+                .expect_field_name()
+                .map_err(|_| ExtractionError::InvalidJson)?,
+        )?;
         let is_type = name == "type";
         if config.is_discriminator_key(name.as_bytes()) {
             // A failed read consumes nothing (see `JsonParser::advance`), so one
             // peek settles the discriminant and, spelled `type`, the signal type.
             if let Ok(Token::String(value)) = parser.peek_token() {
                 if is_type {
-                    event_type = Some(value);
+                    event_type = Some(owned(value)?);
                     discriminant_is_event_type = true;
                 } else {
-                    discriminant = Some(value);
+                    discriminant = Some(owned(value)?);
                 }
             }
         } else if is_type
@@ -419,7 +447,7 @@ fn extract_json_event_open(
             && let Ok(Token::String(value)) = parser.peek_token()
         {
             // Only armed routing reads the signal type, so unarmed parsing never decodes it.
-            event_type = Some(value);
+            event_type = Some(owned(value)?);
         }
         if saw_nested_value && name.starts_with("value.")
             || saw_flat_value_key && name == "value" && config.has_value_fields
@@ -461,9 +489,11 @@ fn extract_json_event_open(
             };
             let mut column_name = String::with_capacity(32);
             while !parser.is_object_end() {
-                let member = parser
-                    .expect_field_name()
-                    .map_err(|_| ExtractionError::InvalidJson)?;
+                let member = owned(
+                    parser
+                        .expect_field_name()
+                        .map_err(|_| ExtractionError::InvalidJson)?,
+                )?;
                 column_name.clear();
                 column_name.push_str("value.");
                 column_name.push_str(&member);
@@ -550,9 +580,9 @@ fn lookahead_event_type(parser: &JsonParser<'_>) -> Option<String> {
     ahead.skip_value().ok()?;
     while !ahead.is_object_end() {
         let key = ahead.expect_field_name().ok()?;
-        if key == "type" {
+        if key.is("type") {
             return match ahead.next_token().ok()? {
-                Token::String(value) => Some(value),
+                Token::String(value) => value.to_owned_text().ok(),
                 _ => None,
             };
         }
@@ -738,7 +768,7 @@ fn extract_typed_value_with_capture(
     let kind = field.plane_kind();
     let value = match kind {
         PlaneKind::Text { .. } => match token {
-            Token::String(value) => Some(ColumnValue::Utf8(value)),
+            Token::String(value) => Some(ColumnValue::Utf8(owned(value)?)),
             Token::Null => None,
             _ => {
                 return Err(invalid_field_type(
@@ -762,7 +792,7 @@ fn extract_typed_value_with_capture(
             // holds the ordinal, which is the variant's declared index.
             Token::String(value) if enum_variants.is_some() => Some(ColumnValue::Int(
                 enum_variants
-                    .and_then(|variants| variants.iter().position(|variant| *variant == value))
+                    .and_then(|variants| variants.iter().position(|variant| value.is(variant)))
                     .and_then(|ordinal| i64::try_from(ordinal).ok())
                     .ok_or_else(|| {
                         invalid_field_type(diagnostic, column as u32, arrow_type, actual, row)
@@ -775,16 +805,20 @@ fn extract_typed_value_with_capture(
                     // `1.0` and `4294967296.0` are integers spelled as floats;
                     // the msgpack twin accepts the same values under a float
                     // marker, so this token must too (cross_format::coerce).
-                    .or_else(|| integral_number(&value))
+                    .or_else(|| integral_number(value))
                     .filter(|parsed| kind.holds_int(*parsed))
                     .ok_or_else(|| {
                         invalid_number(diagnostic, column as u32, arrow_type, actual, row)
                     })?,
             )),
             Token::String(value) if width == 8 => Some(ColumnValue::Int(
-                value
-                    .parse()
-                    .or_else(|_| parse_timestamp_to_micros(&value).ok_or(()))
+                Some(text_of(value)?)
+                    .and_then(|text| {
+                        text.parse()
+                            .ok()
+                            .or_else(|| parse_timestamp_to_micros(&text))
+                    })
+                    .ok_or(())
                     .map_err(|_| {
                         invalid_number(diagnostic, column as u32, arrow_type, actual, row)
                     })?,
@@ -805,17 +839,17 @@ fn extract_typed_value_with_capture(
                 value
                     .parse::<u64>()
                     .ok()
-                    .or_else(|| integral_number(&value).and_then(|wide| u64::try_from(wide).ok()))
+                    .or_else(|| integral_number(value).and_then(|wide| u64::try_from(wide).ok()))
                     .filter(|parsed| kind.holds_uint(*parsed))
                     .ok_or_else(|| {
                         invalid_number(diagnostic, column as u32, arrow_type, actual, row)
                     })?,
             )),
-            Token::String(value) if width == 8 => {
-                Some(ColumnValue::UInt(value.parse().map_err(|_| {
+            Token::String(value) if width == 8 => Some(ColumnValue::UInt(
+                text_of(value)?.parse().ok().ok_or(()).map_err(|_| {
                     invalid_number(diagnostic, column as u32, arrow_type, actual, row)
-                })?))
-            }
+                })?,
+            )),
             Token::Null => None,
             _ => {
                 return Err(invalid_field_type(
@@ -861,7 +895,7 @@ fn extract_typed_value_with_capture(
         // pins the byte count with no padding left to interpret.
         PlaneKind::FixedBytes { width } => match token {
             Token::String(value) => Some(ColumnValue::FixedBytes(
-                decode_fixed_hex(&value, width).ok_or_else(|| {
+                decode_fixed_hex(&text_of(value)?, width).ok_or_else(|| {
                     invalid_field_type(diagnostic, column as u32, arrow_type, actual, row)
                 })?,
             )),
@@ -1133,11 +1167,11 @@ impl<'a> MsgpackValueWriter<'a> {
     pub(crate) fn write_value(
         &mut self,
         parser: &mut JsonParser<'_>,
-        token: Token,
+        token: Token<'_>,
     ) -> Result<(), ExtractionError> {
         match token {
-            Token::String(value) => self.write_string(&value),
-            Token::Number(value) => self.write_number(&value),
+            Token::String(value) => self.write_json_str(value),
+            Token::Number(value) => self.write_number(value),
             Token::True => self.write_byte(0xc3),
             Token::False => self.write_byte(0xc2),
             Token::Null => self.write_byte(0xc0),
@@ -1150,7 +1184,7 @@ impl<'a> MsgpackValueWriter<'a> {
     pub(crate) fn write_value_filtered(
         &mut self,
         parser: &mut JsonParser<'_>,
-        token: Token,
+        token: Token<'_>,
         schema: &SemanticSchema,
         path: &mut Vec<String>,
         extra: &mut MsgpackValueWriter<'_>,
@@ -1162,9 +1196,11 @@ impl<'a> MsgpackValueWriter<'a> {
                 self.reserve_map32()?;
                 let mut count = 0_u32;
                 while !parser.is_object_end() {
-                    let name = parser
-                        .expect_field_name()
-                        .map_err(|_| ExtractionError::InvalidJson)?;
+                    let name = owned(
+                        parser
+                            .expect_field_name()
+                            .map_err(|_| ExtractionError::InvalidJson)?,
+                    )?;
                     let known = fields.iter().find(|(field, _)| field == &name);
                     let value = parser
                         .next_token()
@@ -1214,8 +1250,8 @@ impl<'a> MsgpackValueWriter<'a> {
         self.reserve_map32()?;
         let mut count: u32 = 0;
         while !parser.is_object_end() {
-            self.write_string(
-                &parser
+            self.write_json_str(
+                parser
                     .expect_field_name()
                     .map_err(|_| ExtractionError::InvalidJson)?,
             )?;
@@ -1304,7 +1340,33 @@ impl<'a> MsgpackValueWriter<'a> {
         self.write_bytes(&value.to_bits().to_be_bytes())
     }
     pub(crate) fn write_string(&mut self, value: &str) -> Result<(), ExtractionError> {
-        let len = value.len();
+        self.write_str_header(value.len())?;
+        self.write_bytes(value.as_bytes())
+    }
+
+    /// Write a JSON string's decoded text without copying it anywhere else:
+    /// an escaped string is decoded straight into the output.
+    fn write_json_str(&mut self, value: JsonStr<'_>) -> Result<(), ExtractionError> {
+        match value {
+            JsonStr::Plain(text) => self.write_string(text),
+            JsonStr::Escaped(_) => {
+                let len = value.decoded().count();
+                self.write_str_header(len)?;
+                self.reserve(len)?;
+                let offset = self.offset;
+                for (slot, byte) in self.buf()[offset..offset + len]
+                    .iter_mut()
+                    .zip(value.decoded())
+                {
+                    *slot = byte;
+                }
+                self.offset += len;
+                Ok(())
+            }
+        }
+    }
+
+    fn write_str_header(&mut self, len: usize) -> Result<(), ExtractionError> {
         if len <= 31 {
             self.write_byte(0xa0 | len as u8)?;
         } else if u8::try_from(len).is_ok() {
@@ -1319,7 +1381,7 @@ impl<'a> MsgpackValueWriter<'a> {
         } else {
             return Err(ExtractionError::BufferOverflow);
         }
-        self.write_bytes(value.as_bytes())
+        Ok(())
     }
     fn write_bytes(&mut self, values: &[u8]) -> Result<(), ExtractionError> {
         self.reserve(values.len())?;

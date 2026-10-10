@@ -41,7 +41,7 @@ pub use columine_types::vo::{
 
 use crate::{
     UNDECLARED_COLUMN_NAME,
-    json_parser::{JsonParser, Token},
+    json_parser::{JsonParser, ParserError, Token},
     msgpack_scanner::Reader,
 };
 
@@ -264,6 +264,8 @@ pub enum SchemaParseError {
     /// Only the envelope's syntax is judged here; whether root, frame, and
     /// rows describe one coherent schema is the admission capability's call.
     InvalidVoMetadata(VoMetadataField),
+    /// The decoded tree or metadata could not be backed.
+    OutOfMemory,
 }
 
 /// The `vo` schema member that failed envelope decoding.
@@ -1578,18 +1580,67 @@ fn exact_members<'a>(
 /// rules. `instruction_offset` is the counts opcode's byte offset in the whole
 /// program buffer. Whether each link and role names a real field and
 /// instruction, once, is the program loader's check against the program.
+///
+/// Every allocation is backed fallibly: memory that cannot hold the decoded
+/// tree or the metadata refuses with [`SchemaParseError::OutOfMemory`].
 pub fn parse_program_metadata(bytes: &[u8]) -> Result<VoProgramMetadata, SchemaParseError> {
-    let value = JsonValue::parse(bytes).map_err(|_| SchemaParseError::InvalidJson)?;
+    let value = JsonValue::parse(bytes).map_err(|error| match error {
+        ValueParseError::OutOfMemory => SchemaParseError::OutOfMemory,
+        _ => SchemaParseError::InvalidJson,
+    })?;
     let program = exact_members(&value, &["fields", "counts"], &["fields", "counts"])?;
-    let fields = array(field(program, "fields"))?
-        .iter()
-        .map(parse_field_link)
-        .collect::<Result<_, _>>()?;
-    let counts = array(field(program, "counts"))?
-        .iter()
-        .map(parse_counts_role)
-        .collect::<Result<_, _>>()?;
+    let fields = each(array(field(program, "fields"))?, parse_field_link)?;
+    let counts = each(array(field(program, "counts"))?, parse_counts_role)?;
     Ok(VoProgramMetadata { fields, counts })
+}
+
+/// `parse` applied to every item, into exactly backed storage.
+fn each<T, U>(
+    items: &[T],
+    parse: impl Fn(&T) -> Result<U, SchemaParseError>,
+) -> Result<Vec<U>, SchemaParseError> {
+    let mut out = Vec::new();
+    out.try_reserve_exact(items.len())
+        .map_err(|_| SchemaParseError::OutOfMemory)?;
+    for item in items {
+        out.push(parse(item)?);
+    }
+    Ok(out)
+}
+
+/// Why a metadata member could not be decoded: it is malformed, or its
+/// storage could not be backed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Decoding {
+    Invalid,
+    OutOfMemory,
+}
+
+impl Decoding {
+    /// The refusal for `member`.
+    fn at(self, member: VoMetadataField) -> SchemaParseError {
+        match self {
+            Self::Invalid => SchemaParseError::InvalidVoMetadata(member),
+            Self::OutOfMemory => SchemaParseError::OutOfMemory,
+        }
+    }
+}
+
+/// An empty vector backed for `len` elements.
+fn backed<T>(len: usize) -> Result<Vec<T>, Decoding> {
+    let mut out = Vec::new();
+    out.try_reserve_exact(len)
+        .map_err(|_| Decoding::OutOfMemory)?;
+    Ok(out)
+}
+
+/// An owned copy of `text` in exactly backed storage.
+fn owned_text(text: &str) -> Result<String, Decoding> {
+    let mut out = String::new();
+    out.try_reserve_exact(text.len())
+        .map_err(|_| Decoding::OutOfMemory)?;
+    out.push_str(text);
+    Ok(out)
 }
 
 fn parse_field_link(value: &JsonValue) -> Result<VoFieldLink, SchemaParseError> {
@@ -1616,10 +1667,7 @@ fn parse_counts_role(value: &JsonValue) -> Result<VoCountsRole, SchemaParseError
     ];
     let role = exact_members(value, MEMBERS, MEMBERS)?;
     let field_ids = |name: &str| -> Result<Vec<u16>, SchemaParseError> {
-        array(field(role, name))?
-            .iter()
-            .map(|id| unsigned(Some(id)))
-            .collect()
+        each(array(field(role, name))?, |id| unsigned(Some(id)))
     };
     Ok(VoCountsRole {
         instruction_offset: unsigned(field(role, "instruction_offset"))?,
@@ -1630,33 +1678,33 @@ fn parse_counts_role(value: &JsonValue) -> Result<VoCountsRole, SchemaParseError
 }
 
 fn parse_vo_metadata(fields: &[(String, JsonValue)]) -> Result<VoMetadata, SchemaParseError> {
-    let invalid = SchemaParseError::InvalidVoMetadata;
     let root = match field(fields, "root") {
-        Some(JsonValue::String(root)) if is_qualified_root(root) => root.clone(),
-        _ => return Err(invalid(VoMetadataField::Root)),
-    };
+        Some(JsonValue::String(root)) if is_qualified_root(root) => owned_text(root),
+        _ => Err(Decoding::Invalid),
+    }
+    .map_err(|error| error.at(VoMetadataField::Root))?;
     let frame = match field(fields, "frame") {
         Some(JsonValue::String(hex)) => decode_lowercase_hex(hex),
-        _ => None,
+        _ => Err(Decoding::Invalid),
     }
-    .ok_or(invalid(VoMetadataField::Frame))?;
+    .map_err(|error| error.at(VoMetadataField::Frame))?;
     let rows = match field(fields, "rows") {
         Some(JsonValue::Array(rows)) if !rows.is_empty() => decode_hex_rows(rows),
-        _ => None,
+        _ => Err(Decoding::Invalid),
     }
-    .ok_or(invalid(VoMetadataField::Rows))?;
+    .map_err(|error| error.at(VoMetadataField::Rows))?;
     let profile = match field(fields, "profile") {
-        None => Some(VoProfile::default()),
+        None => Ok(VoProfile::default()),
         Some(JsonValue::Object(profile)) => parse_vo_profile(profile),
-        Some(_) => None,
+        Some(_) => Err(Decoding::Invalid),
     }
-    .ok_or(invalid(VoMetadataField::Profile))?;
+    .map_err(|error| error.at(VoMetadataField::Profile))?;
     let retained = match field(fields, "retained") {
-        None => Some(Vec::new()),
+        None => Ok(Vec::new()),
         Some(JsonValue::Array(rows)) => decode_hex_rows(rows),
-        Some(_) => None,
+        Some(_) => Err(Decoding::Invalid),
     }
-    .ok_or(invalid(VoMetadataField::Retained))?;
+    .map_err(|error| error.at(VoMetadataField::Retained))?;
     Ok(VoMetadata {
         root,
         frame,
@@ -1667,13 +1715,15 @@ fn parse_vo_metadata(fields: &[(String, JsonValue)]) -> Result<VoMetadata, Schem
 }
 
 /// Every row as non-empty canonical lowercase hex, decoded.
-fn decode_hex_rows(rows: &[JsonValue]) -> Option<Vec<Vec<u8>>> {
-    rows.iter()
-        .map(|row| match row {
-            JsonValue::String(hex) => decode_lowercase_hex(hex),
-            _ => None,
-        })
-        .collect()
+fn decode_hex_rows(rows: &[JsonValue]) -> Result<Vec<Vec<u8>>, Decoding> {
+    let mut decoded = backed(rows.len())?;
+    for row in rows {
+        decoded.push(match row {
+            JsonValue::String(hex) => decode_lowercase_hex(hex)?,
+            _ => return Err(Decoding::Invalid),
+        });
+    }
+    Ok(decoded)
 }
 
 /// `{"records": [...], "attributes": [...]}`; an absent list is empty. Each
@@ -1681,47 +1731,47 @@ fn decode_hex_rows(rows: &[JsonValue]) -> Option<Vec<Vec<u8>>> {
 /// unique within their list. A definition is the canonical vo1 bytes its
 /// commitment is computed over, decoded and carried verbatim: verifying them
 /// against the rows' commitments is the capability's call.
-fn parse_vo_profile(fields: &[(String, JsonValue)]) -> Option<VoProfile> {
+fn parse_vo_profile(fields: &[(String, JsonValue)]) -> Result<VoProfile, Decoding> {
     if fields
         .iter()
         .any(|(name, _)| name != "records" && name != "attributes")
     {
-        return None;
+        return Err(Decoding::Invalid);
     }
-    Some(VoProfile {
+    Ok(VoProfile {
         records: parse_vo_definitions(field(fields, "records"))?,
         attributes: parse_vo_definitions(field(fields, "attributes"))?,
     })
 }
 
-fn parse_vo_definitions(value: Option<&JsonValue>) -> Option<Vec<VoDefinition>> {
+fn parse_vo_definitions(value: Option<&JsonValue>) -> Result<Vec<VoDefinition>, Decoding> {
     let entries = match value {
-        None => return Some(Vec::new()),
+        None => return Ok(Vec::new()),
         Some(JsonValue::Array(entries)) => entries,
-        Some(_) => return None,
+        Some(_) => return Err(Decoding::Invalid),
     };
-    let mut definitions: Vec<VoDefinition> = Vec::with_capacity(entries.len());
+    let mut definitions: Vec<VoDefinition> = backed(entries.len())?;
     for entry in entries {
         let JsonValue::Object(entry) = entry else {
-            return None;
+            return Err(Decoding::Invalid);
         };
         if entry.len() != 2 {
-            return None;
+            return Err(Decoding::Invalid);
         }
         let (Some(JsonValue::String(name)), Some(JsonValue::String(definition))) =
             (field(entry, "name"), field(entry, "definition"))
         else {
-            return None;
+            return Err(Decoding::Invalid);
         };
         if name.is_empty() || definitions.iter().any(|known| &known.name == name) {
-            return None;
+            return Err(Decoding::Invalid);
         }
         definitions.push(VoDefinition {
-            name: name.clone(),
+            name: owned_text(name)?,
             definition: decode_lowercase_hex(definition)?,
         });
     }
-    Some(definitions)
+    Ok(definitions)
 }
 
 /// `namespace.Record`: two or more dot-separated segments. VO names are
@@ -1759,17 +1809,19 @@ fn is_identifier(segment: &str) -> bool {
 }
 
 /// Canonical lowercase hex: non-empty, even length, `0-9a-f` only.
-fn decode_lowercase_hex(text: &str) -> Option<Vec<u8>> {
+fn decode_lowercase_hex(text: &str) -> Result<Vec<u8>, Decoding> {
     let digits = text.as_bytes();
     if digits.is_empty() || !digits.len().is_multiple_of(2) {
-        return None;
+        return Err(Decoding::Invalid);
     }
-    digits
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|pair| Some((hex_digit(pair[0])? << 4) | hex_digit(pair[1])?))
-        .collect()
+    let mut bytes = backed(digits.len() / 2)?;
+    for pair in digits.as_chunks::<2>().0 {
+        let (Some(high), Some(low)) = (hex_digit(pair[0]), hex_digit(pair[1])) else {
+            return Err(Decoding::Invalid);
+        };
+        bytes.push((high << 4) | low);
+    }
+    Ok(bytes)
 }
 
 fn hex_digit(digit: u8) -> Option<u8> {
@@ -1787,22 +1839,18 @@ fn parse_json_value(
     if depth > MAX_SCHEMA_DEPTH {
         return Err(ValueParseError::TooDeep);
     }
-    match parser
-        .next_token()
-        .map_err(|_| ValueParseError::InvalidJson)?
-    {
+    match parser.next_token()? {
         Token::Null => Ok(JsonValue::Null),
         Token::True => Ok(JsonValue::Boolean(true)),
         Token::False => Ok(JsonValue::Boolean(false)),
-        Token::String(value) => Ok(JsonValue::String(value)),
-        Token::Number(value) => parse_json_number(&value),
+        Token::String(value) => Ok(JsonValue::String(value.to_owned_text()?)),
+        Token::Number(value) => parse_json_number(value),
         Token::ObjectBegin => {
             let mut fields = Vec::new();
             while !parser.is_object_end() {
-                let name = parser
-                    .expect_field_name()
-                    .map_err(|_| ValueParseError::InvalidJson)?;
+                let name = parser.expect_field_name()?.to_owned_text()?;
                 let value = parse_json_value(parser, depth + 1)?;
+                one_more(&mut fields)?;
                 fields.push((name, value));
             }
             parser
@@ -1816,7 +1864,9 @@ fn parse_json_value(
         Token::ArrayBegin => {
             let mut values = Vec::new();
             while !parser.is_array_end() {
-                values.push(parse_json_value(parser, depth + 1)?);
+                let value = parse_json_value(parser, depth + 1)?;
+                one_more(&mut values)?;
+                values.push(value);
             }
             parser
                 .next_token()
@@ -1857,6 +1907,25 @@ pub enum ValueParseError {
     InvalidMsgpack,
     InvalidNumber,
     TooDeep,
+    /// The value tree could not be backed.
+    OutOfMemory,
+}
+
+impl From<ParserError> for ValueParseError {
+    fn from(error: ParserError) -> Self {
+        match error {
+            ParserError::OutOfMemory => Self::OutOfMemory,
+            ParserError::InvalidJson
+            | ParserError::UnexpectedToken
+            | ParserError::EndOfInput
+            | ParserError::InvalidNumber => Self::InvalidJson,
+        }
+    }
+}
+
+/// Back one more element of `buf`, or refuse as out of memory.
+fn one_more<T>(buf: &mut Vec<T>) -> Result<(), ValueParseError> {
+    buf.try_reserve(1).map_err(|_| ValueParseError::OutOfMemory)
 }
 
 /// A MessagePack value borrowed from its input. Strings, keys, and binary
@@ -3035,6 +3104,37 @@ mod tests {
         let minimal = parse_program_metadata(program(LINK, ROLE).as_bytes()).unwrap();
         assert_eq!(minimal.fields[0].schema.profile, VoProfile::default());
         assert!(minimal.fields[0].schema.retained.is_empty());
+
+        // Under a memory ceiling the decode refuses as OutOfMemory, never
+        // traps: about 20 KB of metadata, at every ceiling from nothing up
+        // to what the decode needs.
+        let rows = vec![format!(r#""{}""#, "ab".repeat(150)); 64].join(",");
+        let large = program(
+            &format!(
+                r#"{{"slot":1,"field_idx":2,"schema":{{"root":"orders.Line","frame":"0a1b","rows":[{rows}]}}}}"#
+            ),
+            ROLE,
+        );
+        assert!(large.len() > 19_000);
+        let (decoded, need) =
+            crate::memory::peak_bytes(|| parse_program_metadata(large.as_bytes()));
+        assert_eq!(
+            decoded.expect("unlimited decode").fields[0]
+                .schema
+                .rows
+                .len(),
+            64
+        );
+        let mut refused = 0;
+        for ceiling in (0..need).step_by(256) {
+            match crate::memory::with_ceiling(ceiling, || parse_program_metadata(large.as_bytes()))
+            {
+                Err(SchemaParseError::OutOfMemory) => refused += 1,
+                Ok(_) => {}
+                other => panic!("ceiling {ceiling}: {other:?}"),
+            }
+        }
+        assert!(refused > 0, "a ceiling under the decode's need refuses it");
     }
 
     #[test]

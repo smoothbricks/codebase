@@ -8,6 +8,9 @@ use std::collections::HashMap;
 
 #[cfg(test)]
 mod cross_format;
+#[cfg(test)]
+#[path = "../../columine-vm/tests/common/memory.rs"]
+mod memory;
 
 pub mod json_extractor;
 pub mod json_parser;
@@ -595,7 +598,7 @@ mod properties {
             parser.expect_array_begin().unwrap();
             parser.expect_object_begin().unwrap();
             assert_eq!(parser.expect_field_name().unwrap(), "id");
-            assert_eq!(parser.expect_string().unwrap(), id);
+            assert!(parser.expect_string().unwrap().is(&id));
 
             let mut columns = base_columns(1);
             json_scanner::parse_json_events(document.as_bytes(), &mut columns).unwrap();

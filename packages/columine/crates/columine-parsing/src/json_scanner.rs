@@ -9,9 +9,12 @@ use crate::{
 /// (`columine_arrow::BASE_EVENT_LOG_FIELDS`: id, type, timestamp, value).
 pub fn parse_json_events(input: &[u8], output: &mut DynamicColumns) -> Result<(), ParseError> {
     let mut parser = JsonParser::new(input);
+    // Decoded id and type of an event that spells them with escapes; plain
+    // strings are stored straight from the input.
+    let mut scratch = (Vec::new(), Vec::new());
     parser.expect_array_begin().map_err(json_error)?;
     while !parser.is_array_end() {
-        parse_event_object(&mut parser, output)?;
+        parse_event_object(&mut parser, output, &mut scratch)?;
     }
     match parser.next_token().map_err(json_error)? {
         Token::ArrayEnd => Ok(()),
@@ -22,6 +25,7 @@ pub fn parse_json_events(input: &[u8], output: &mut DynamicColumns) -> Result<()
 fn parse_event_object(
     parser: &mut JsonParser<'_>,
     output: &mut DynamicColumns,
+    (id_scratch, type_scratch): &mut (Vec<u8>, Vec<u8>),
 ) -> Result<(), ParseError> {
     parser.expect_object_begin().map_err(json_error)?;
     let mut id = None;
@@ -30,27 +34,30 @@ fn parse_event_object(
     let mut value = None;
     while !parser.is_object_end() {
         let field = parser.expect_field_name().map_err(json_error)?;
-        match field.as_str() {
-            "id" => {
+        match field {
+            _ if field.is("id") => {
                 id = Some(
                     parser
                         .expect_string()
                         .map_err(|_| ParseError::InvalidFieldType)?,
                 )
             }
-            "type" => {
+            _ if field.is("type") => {
                 event_type = Some(
                     parser
                         .expect_string()
                         .map_err(|_| ParseError::InvalidFieldType)?,
                 )
             }
-            "timestamp" => timestamp_micros = Some(parse_timestamp_token(parser)?),
-            "value" => {
+            // The id scratch is free until the event commits.
+            _ if field.is("timestamp") => {
+                timestamp_micros = Some(parse_timestamp_token(parser, id_scratch)?)
+            }
+            _ if field.is("value") => {
                 let token = parser.next_spanned().map_err(json_error)?;
                 let start = token.start;
                 let end = parser.skip_value_from(token).map_err(json_error)?;
-                value = Some(parser.input()[start..end].to_vec());
+                value = Some(&parser.input()[start..end]);
             }
             _ => parser.skip_value().map_err(json_error)?,
         }
@@ -59,20 +66,30 @@ fn parse_event_object(
         Token::ObjectEnd => {}
         _ => return Err(ParseError::InvalidJson),
     }
+    let id = id
+        .ok_or(ParseError::MissingField)?
+        .text(id_scratch)
+        .map_err(json_error)?;
+    let event_type = event_type
+        .ok_or(ParseError::MissingField)?
+        .text(type_scratch)
+        .map_err(json_error)?;
     crate::commit_base_event(
         output,
-        id.ok_or(ParseError::MissingField)?.as_bytes(),
-        event_type.ok_or(ParseError::MissingField)?.as_bytes(),
+        id.as_bytes(),
+        event_type.as_bytes(),
         timestamp_micros.ok_or(ParseError::MissingField)?,
-        value.as_deref(),
+        value,
     )
 }
 
-fn parse_timestamp_token(parser: &mut JsonParser<'_>) -> Result<i64, ParseError> {
+fn parse_timestamp_token(
+    parser: &mut JsonParser<'_>,
+    scratch: &mut Vec<u8>,
+) -> Result<i64, ParseError> {
     match parser.next_token().map_err(json_error)? {
-        Token::String(value) => {
-            parse_iso8601_to_micros(&value).map_err(|_| ParseError::InvalidFieldType)
-        }
+        Token::String(value) => parse_iso8601_to_micros(value.text(scratch).map_err(json_error)?)
+            .map_err(|_| ParseError::InvalidFieldType),
         Token::Number(value) => value
             .parse::<i64>()
             .map_err(|_| ParseError::InvalidFieldType)
@@ -84,8 +101,14 @@ fn parse_timestamp_token(parser: &mut JsonParser<'_>) -> Result<i64, ParseError>
         _ => Err(ParseError::InvalidFieldType),
     }
 }
-fn json_error(_: ParserError) -> ParseError {
-    ParseError::InvalidJson
+fn json_error(error: ParserError) -> ParseError {
+    match error {
+        ParserError::OutOfMemory => ParseError::OutOfMemory,
+        ParserError::InvalidJson
+        | ParserError::UnexpectedToken
+        | ParserError::EndOfInput
+        | ParserError::InvalidNumber => ParseError::InvalidJson,
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
