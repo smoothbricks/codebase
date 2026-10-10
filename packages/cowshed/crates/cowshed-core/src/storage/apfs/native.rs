@@ -784,7 +784,6 @@ fn restore_adopted_checkout_paths(
     remove_empty_mountpoint(pre_cowshed_checkout)
 }
 
-const MNT_RDONLY: u64 = 0x0000_0001;
 const MNT_DONTBROWSE: u64 = 0x0010_0000;
 const MNT_IGNORE_OWNERS: u64 = 0x0020_0000;
 
@@ -821,11 +820,7 @@ impl KernelMountSnapshot {
 
     /// The access this mount was made with: what mounting the volume again must ask for.
     fn access(&self) -> MountAccess {
-        if self.flags & MNT_RDONLY == 0 {
-            MountAccess::ReadWrite
-        } else {
-            MountAccess::ReadOnly
-        }
+        MountAccess::from_kernel_flags(self.flags)
     }
 
     /// Whether this mount shows in the Finder: what mounting the volume again must ask for.

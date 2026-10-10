@@ -176,11 +176,13 @@ every clone automatically). Main and sessions use identical wiring; only the san
   before detaching them; an old image's apparent file length is not its virtual capacity. The fresh RAW image keeps that
   recorded capacity.
 - **Live source snapshots**: a RAW file has no outer allocation directories, chunk tables, or bitmap that a clone can
-  capture from mixed generations. Source-image snapshots flush the source volume and backing file, then descriptor-clone
-  the live image without unmounting, detaching, sealing, or changing the source's mount flags. The clone is verified
-  with `fsck_apfs` before its first mount. A shell whose cwd is in main, an editor, or a source watcher does not prevent
-  a fork. This is filesystem crash consistency, not an application-state guarantee: build volumes still use the sealed
-  seeds and writer exclusion in 16_build_volumes.md.
+  capture from mixed generations. Source-image snapshots read the source volume's current kernel mount flags, flush the
+  volume only when it is read-write, and flush the backing file before descriptor-cloning the live image. A read-only
+  mount has no dirty volume writes; its volume flush is skipped, not an EROFS error suppressed. Any flush failure on a
+  read-write mount remains an error. Capture never unmounts, detaches, seals, or changes the source's mount flags. The
+  clone is verified with `fsck_apfs` before its first mount. A shell whose cwd is in main, an editor, or a source
+  watcher does not prevent a fork. This is filesystem crash consistency, not an application-state guarantee: build
+  volumes still use the sealed seeds and writer exclusion in 16_build_volumes.md.
 - **Space reclamation**: sparse creation does not imply automatic return of guest-freed space. The measured RAW producer
   retained a deleted 1 GiB payload's host allocation after guest sync, image fsync, clean unmount, and detach.
   `hdiutil compact` supports SPARSE and SPARSEBUNDLE, not RAW. Reclaim guest-freed space by the verified re-adoption

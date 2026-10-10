@@ -71,6 +71,16 @@ pub enum MountAccess {
     ReadOnly,
 }
 
+impl MountAccess {
+    pub(crate) fn from_kernel_flags(flags: u64) -> Self {
+        if flags & 0x0000_0001 == 0 {
+            Self::ReadWrite
+        } else {
+            Self::ReadOnly
+        }
+    }
+}
+
 /// Why a disk child produced no output to judge.
 #[derive(Debug)]
 pub enum CommandRunFailure {
@@ -3235,6 +3245,17 @@ fn is_mount_root(path: &Path) -> bool {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn sync_writable_volume(
+    access: MountAccess,
+    flush: impl FnOnce() -> io::Result<()>,
+) -> io::Result<()> {
+    match access {
+        MountAccess::ReadOnly => Ok(()),
+        MountAccess::ReadWrite => flush(),
+    }
+}
+
 /// Flush one mounted volume and wait for it: the source's dirty data, and nobody else's.
 #[cfg(target_os = "macos")]
 fn sync_volume(mount_point: &Path) -> io::Result<()> {
@@ -3245,13 +3266,23 @@ fn sync_volume(mount_point: &Path) -> io::Result<()> {
     const SYNC_VOLUME_WAIT: libc::c_int = 0x02;
     let path = std::ffi::CString::new(mount_point.as_os_str().as_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "mount point contains NUL"))?;
-    // SAFETY: `path` is NUL-terminated and outlives the call; the flags ask only to wait.
-    match unsafe { sync_volume_np(path.as_ptr(), SYNC_VOLUME_WAIT) } {
-        0 => Ok(()),
-        // It answers the errno itself, or -1 with errno set, depending on where it failed.
-        -1 => Err(io::Error::last_os_error()),
-        errno => Err(io::Error::from_raw_os_error(errno)),
+    let mut facts = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: `path` is NUL-terminated; `facts` is writable for exactly one statfs value.
+    if unsafe { libc::statfs(path.as_ptr(), facts.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
     }
+    // SAFETY: a successful statfs initialized `facts`, and no borrow escaped the call.
+    let access =
+        MountAccess::from_kernel_flags(u64::from(unsafe { facts.assume_init_ref() }.f_flags));
+    sync_writable_volume(access, || {
+        // SAFETY: `path` is NUL-terminated and outlives the call; the flags ask only to wait.
+        match unsafe { sync_volume_np(path.as_ptr(), SYNC_VOLUME_WAIT) } {
+            0 => Ok(()),
+            // It answers the errno itself, or -1 with errno set, depending on where it failed.
+            -1 => Err(io::Error::last_os_error()),
+            errno => Err(io::Error::from_raw_os_error(errno)),
+        }
+    })
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -6097,6 +6128,35 @@ mod tests {
         ));
         assert!(image.exists());
         fs::remove_file(image).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn source_sync_skips_read_only_mounts_and_preserves_read_write_errors() {
+        for (flags, expected_access) in [
+            (0, MountAccess::ReadWrite),
+            (1, MountAccess::ReadOnly),
+            (0x0010_0000, MountAccess::ReadWrite),
+            (0x0010_0001, MountAccess::ReadOnly),
+        ] {
+            let access = MountAccess::from_kernel_flags(flags);
+            assert_eq!(access, expected_access);
+            let mut flushed = false;
+            let result = sync_writable_volume(access, || {
+                flushed = true;
+                Err(io::Error::from_raw_os_error(libc::EROFS))
+            });
+            match expected_access {
+                MountAccess::ReadOnly => {
+                    assert!(!flushed, "read-only kernel mount must not be flushed");
+                    assert!(result.is_ok());
+                }
+                MountAccess::ReadWrite => {
+                    assert!(flushed, "read-write kernel mount must be flushed");
+                    assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::EROFS));
+                }
+            }
+        }
     }
 
     #[test]
