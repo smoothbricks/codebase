@@ -378,6 +378,23 @@ impl From<PublicationError> for ApfsStorageError {
     }
 }
 
+/// How naming an image's volume went (01_storage.md, "Ownership, identity, and the volume
+/// label"). The target is always the volume device the kernel's attachment inventory maps an
+/// image under the store to, never a path; every case but `Renamed` renamed nothing.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Labelled {
+    /// The kernel holds no attachment of the image: a create that was refused, or a workspace
+    /// detached. Whatever directory it would mount at belongs to another volume.
+    NotAttached,
+    /// The image is attached, but its volume is mounted nowhere, and APFS renames only mounted
+    /// volumes.
+    NotMounted,
+    /// The file system already reports the label.
+    Already,
+    /// Renamed to the label through the image's pinned volume device.
+    Renamed,
+}
+
 /// Synchronous macOS/filesystem boundary. Implementations must use the primitives in
 /// `crate::apfs`; the storage executor calls this trait only through [`ApfsBlockingLane`].
 pub trait ApfsExecutionHost: Send + Sync + 'static {
@@ -483,7 +500,13 @@ pub trait ApfsExecutionHost: Send + Sync + 'static {
             },
         }
     }
-    fn rename_volume(&self, mount_point: &Path, volume_name: &str) -> Result<(), ApfsStorageError>;
+    /// Rename the volume of `attachment`, a verified attachment of an image under the store,
+    /// through its device: never a path, which names whatever volume holds it.
+    fn rename_volume(
+        &self,
+        attachment: &Self::Attachment,
+        volume_name: &str,
+    ) -> Result<(), ApfsStorageError>;
     fn mint_workspace_credentials(
         &self,
         workspace: &LifecycleWorkspace,
@@ -2902,7 +2925,7 @@ fn prepare_restore_stage<H: ApfsExecutionHost>(
         .mount(&attachment, &staging_mount, MountAccess::ReadWrite, false)
         .and_then(|()| {
             host.rename_volume(
-                &staging_mount,
+                &attachment,
                 &volume_label(replacement.repo(), replacement.name()),
             )?;
             host.mint_workspace_credentials(

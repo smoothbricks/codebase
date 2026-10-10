@@ -642,10 +642,22 @@ clone inherits its source volume's name **and its volume UUID**, so a volume UUI
 workspace from the fork made out of it; that is why cloning rewrites the marker inside the staging fence, before the
 clone is ever published. Volume UUIDs are therefore not recorded and not used. The label is not rewritten there: a clone
 is published under the label it inherited, and the workspace's supervisor, once it serves, reads the file system's own
-name for the volume (`getattrlist`, no Disk Arbitration round trip) and relabels it in the background when it differs. A
-rename is a Disk Arbitration round trip, and Disk Arbitration serializes every client on the host — measured at 9.5 s
-and 27.8 s under load against 13–22 ms on a quiet queue — so it stays off the provisioning path. Replacement restores
-and identity changes still relabel synchronously.
+name for its image's mounted volume (`getattrlist`, no Disk Arbitration round trip) and relabels it in the background
+when it differs. A rename is a Disk Arbitration round trip, and Disk Arbitration serializes every client on the host —
+measured at 9.5 s and 27.8 s under load against 13–22 ms on a quiet queue — so it stays off the provisioning path.
+Replacement restores and identity changes still relabel synchronously.
+
+A rename targets a volume device, never a path. `diskutil renameVolume` handed a path renames whatever volume holds that
+path, and a mountpoint nothing is mounted at (a workspace whose create was refused, one that is detached, one whose
+supervisor outlived its mount) is a plain directory of the host's own Data volume: a supervisor that relabelled by its
+checkout's path once renamed the host's Data volume that way. So every rename (the supervisor's, the build volume's
+after a land, the restore staging relabel, the identity change's) names an image, never a mountpoint, and that image
+must lie under the store root. The rename acts only on the volume device that the kernel's attachment inventory maps
+that image to. It runs under the image's lease and a raw IOMedia pin that re-proves the mapping, exactly as a release
+proves it before `umount` ("Mounts"). An image the kernel does not hold names nothing (`NotAttached`), and neither does
+one whose volume is mounted nowhere (`NotMounted`; APFS renames only mounted volumes). Both are typed outcomes, not
+errors. No internal disk is an attachment of an image under the store, so the host's own volumes can never be a rename
+target, whatever is mounted at, or missing from, a workspace's path.
 
 What follows: volume labels are free to be plain, and manual renaming is harmless rather than unsupported. Cowshed still
 derives an internal per-workspace key from `repo_id` and workspace name to pair a storage fact with a kernel mount fact

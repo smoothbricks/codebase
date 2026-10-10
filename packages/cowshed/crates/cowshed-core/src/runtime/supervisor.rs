@@ -37,6 +37,7 @@ use crate::sandbox::{
     SandboxConfig, SandboxProfileRole, sandbox_runtime_dir, sandbox_runtime_link, seatbelt_profile,
     shared_daemon_runtime_dir, shared_daemon_runtime_link,
 };
+use crate::storage::apfs::Labelled;
 use crate::storage::audit::AuditSinkError;
 use crate::workspace_environment::{PORT_BASE_ENV, PORT_BLOCK_SIZE_ENV, WORKSPACE_TOKEN_ENV};
 use cowshed_gateway_types::WorkspaceToken;
@@ -120,22 +121,13 @@ pub struct WorkspaceSupervisorConfig {
     pub workspace_volume: Option<VolumeMountpoint>,
 }
 
-/// How a volume's label stood when its supervisor looked.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Labelled {
-    /// Nothing is mounted at the path: the directory belongs to another volume, never renamed.
-    NotMounted,
-    /// The file system already reports the label.
-    Already,
-    /// Renamed to the label.
-    Renamed,
-}
-
-/// Names the volume mounted at a path: reads the file system's own name for it and renames it
-/// through the APFS host (Disk Arbitration) when it differs. Injected, so the supervisor names
-/// its checkout's volumes without owning the storage backend.
+/// Names the volume of a workspace's image through the APFS host, which renames only the volume
+/// device the kernel's attachment inventory maps that image under the store to, and only when the
+/// file system's own name differs (01_storage.md, "Ownership, identity, and the volume label").
+/// Handed an image, never a mount path, so a checkout nothing is mounted at names nothing.
+/// Injected, so the supervisor names its checkout's volumes without owning the storage backend.
 pub trait VolumeLabeller: Send + Sync + 'static {
-    fn ensure_label(&self, mount: &Path, label: &str) -> std::io::Result<Labelled>;
+    fn ensure_label(&self, image: &Path, label: &str) -> std::io::Result<Labelled>;
 }
 
 /// The labels of one checkout's two volumes (16_build_volumes.md, "Substrate"): the workspace
@@ -146,6 +138,8 @@ pub trait VolumeLabeller: Send + Sync + 'static {
 /// so it runs in the background and never on a command's path; the outcome goes to stderr.
 #[derive(Clone)]
 pub struct VolumeLabels {
+    /// The workspace's canonical image, whose volume `workspace` names.
+    pub workspace_image: PathBuf,
     pub workspace: String,
     pub build: String,
     pub labeller: Arc<dyn VolumeLabeller>,
@@ -155,6 +149,7 @@ impl std::fmt::Debug for VolumeLabels {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("VolumeLabels")
+            .field("workspace_image", &self.workspace_image)
             .field("workspace", &self.workspace)
             .field("build", &self.build)
             .finish_non_exhaustive()
@@ -3605,30 +3600,36 @@ impl SupervisorActor {
     }
 
     /// Name the checkout's volumes in the background (see [`VolumeLabels`]): its workspace
-    /// volume when `workspace`, and the build volume mounted at `build` unless this supervisor
-    /// already named that one. A Disk Arbitration rename is queued only when the file system's
-    /// own name differs; the outcome goes to stderr.
+    /// image's volume when `workspace`, and the build volume mounted at `build` unless this
+    /// supervisor already named that one. Each is named by its image, never by the path it is
+    /// mounted at; a Disk Arbitration rename is queued only when the file system's own name
+    /// differs, and the outcome goes to stderr.
     fn relabel(&mut self, workspace: bool, build: Option<&Path>) {
         let Some(labels) = &self.volume_labels else {
             return;
         };
+        // What each is, the build link that authorizes it, the image named, and its label.
         let mut volumes = Vec::new();
         if workspace {
             volumes.push((
                 "volume",
-                self.workspace_root.clone(),
+                None,
+                labels.workspace_image.clone(),
                 labels.workspace.clone(),
             ));
         }
         if let Some(build) = build
             && self.labelled_build.as_deref() != Some(build)
-            && self
-                .build_volume_layout
-                .as_ref()
-                .is_some_and(|layout| layout.volume_at(build).is_some())
+            && let Some(layout) = &self.build_volume_layout
+            && let Some(id) = layout.volume_at(build)
         {
             self.labelled_build = Some(build.to_owned());
-            volumes.push(("build volume", build.to_owned(), labels.build.clone()));
+            volumes.push((
+                "build volume",
+                Some(build.to_owned()),
+                layout.image(&id),
+                labels.build.clone(),
+            ));
         }
         if volumes.is_empty() {
             return;
@@ -3638,10 +3639,10 @@ impl SupervisorActor {
         let checkout = self.workspace_root.clone();
         let layout = self.build_volume_layout.clone();
         self.labelling.spawn_blocking(move || {
-            for (what, mount, label) in volumes {
+            for (what, linked, image, label) in volumes {
                 // Links are not authority. After a land, this checkout may still link the
                 // adopted volume, but its sidecar belongs to the target, so it cannot name it.
-                if what == "build volume" {
+                if let Some(mount) = linked {
                     let Some(layout) = &layout else {
                         continue;
                     };
@@ -3658,15 +3659,19 @@ impl SupervisorActor {
                     }
                 }
                 let started = Instant::now();
-                match labeller.ensure_label(&mount, &label) {
+                match labeller.ensure_label(&image, &label) {
                     Ok(Labelled::Renamed) => eprintln!(
                         "cowshed: named workspace {name}'s {what} {label:?} in {:?}",
                         started.elapsed()
                     ),
-                    Ok(Labelled::Already | Labelled::NotMounted) => {}
+                    Ok(Labelled::Already) => {}
+                    Ok(skipped @ (Labelled::NotAttached | Labelled::NotMounted)) => eprintln!(
+                        "cowshed: named no {what} for workspace {name}: its image {} is {skipped:?}",
+                        image.display()
+                    ),
                     Err(error) => eprintln!(
-                        "cowshed: could not name workspace {name}'s {what} at {} {label:?} after {:?}: {error}",
-                        mount.display(),
+                        "cowshed: could not name workspace {name}'s {what} {} {label:?} after {:?}: {error}",
+                        image.display(),
                         started.elapsed()
                     ),
                 }

@@ -1049,7 +1049,6 @@ pub enum ApfsError {
     InvalidStagedStem(PathBuf),
     InvalidCreateRequest(&'static str),
     InvalidDetachTarget(PathBuf),
-    InvalidMountPoint(PathBuf),
     InvalidVolumeName(String),
     InvalidVolumeDevice(String),
     CommandRun(CommandRunError),
@@ -1135,9 +1134,6 @@ impl fmt::Display for ApfsError {
             Self::InvalidCreateRequest(message) => f.write_str(message),
             Self::InvalidDetachTarget(target) => {
                 write!(f, "invalid APFS detach target: {}", target.display())
-            }
-            Self::InvalidMountPoint(path) => {
-                write!(f, "invalid APFS mount point: {}", path.display())
             }
             Self::InvalidVolumeName(name) => {
                 write!(f, "invalid APFS volume name: {name:?}")
@@ -1340,7 +1336,12 @@ pub trait ApfsBackend {
         destination: &Path,
         capture: ImageCapture,
     ) -> Result<(), CloneFileError>;
-    fn rename_volume(&self, mount_point: &Path, volume_name: &str) -> Result<(), ApfsError>;
+    /// Rename `attachment`'s volume through its device, never through a path: `diskutil
+    /// renameVolume` handed a path renames whatever volume holds it, and a path nothing is
+    /// mounted at lies on the host's own volume. Under the image's lease and a raw pin, the device
+    /// is proven still to be that image's before the rename runs, as an unmount proves it.
+    fn rename_volume(&self, attachment: &AttachedImage, volume_name: &str)
+    -> Result<(), ApfsError>;
     fn attach_verified(&self, image: &Path) -> Result<AttachedImage, ApfsError>;
     fn mount(
         &self,
@@ -2484,20 +2485,23 @@ impl<R: CommandRunner, S: Sleeper> ApfsBackend for MacOsApfsBackend<R, S> {
         }
     }
 
-    fn rename_volume(&self, mount_point: &Path, volume_name: &str) -> Result<(), ApfsError> {
-        if !is_canonical_mount_point(mount_point) {
-            return Err(ApfsError::InvalidMountPoint(mount_point.to_owned()));
-        }
+    fn rename_volume(
+        &self,
+        attachment: &AttachedImage,
+        volume_name: &str,
+    ) -> Result<(), ApfsError> {
         if !is_valid_apfs_volume_name(volume_name) {
             return Err(ApfsError::InvalidVolumeName(volume_name.to_owned()));
         }
+        let _lease = self.image_lease(&attachment.image)?;
+        let _pin = self.pin_attached_volume(attachment)?;
         self.run_checked(
             "rename APFS volume",
             CommandRequest::new(
                 DISKUTIL,
                 [
                     OsString::from("renameVolume"),
-                    mount_point.as_os_str().to_owned(),
+                    OsString::from(&attachment.volume_device),
                     OsString::from(volume_name),
                 ],
             ),
@@ -3130,17 +3134,6 @@ fn attached_apfs_volumes(entities: &[(String, String)]) -> Result<(String, Vec<S
         }
     }
     Ok((container, volumes))
-}
-
-fn is_canonical_mount_point(path: &Path) -> bool {
-    let bytes = path.as_os_str().as_encoded_bytes();
-    bytes.starts_with(b"/")
-        && bytes != b"/"
-        && !bytes.contains(&0)
-        && !path.starts_with("/dev")
-        && bytes[1..]
-            .split(|byte| *byte == b'/')
-            .all(|segment| !segment.is_empty() && segment != b"." && segment != b"..")
 }
 
 fn is_valid_apfs_volume_name(name: &str) -> bool {
@@ -6334,69 +6327,78 @@ mod tests {
         }
     }
 
+    /// What attaching `image` through the verified path asks: no prior attachment, the attach
+    /// answering the fixture's devices, the inventory mapping them to the image, and a clean fsck.
+    fn verified_attachment_replies(image: &str) -> [Reply; 4] {
+        [
+            no_images(),
+            ok(ATTACH_PLIST),
+            holding_verified_volume(image),
+            ok([]),
+        ]
+    }
+
+    /// A verified attachment of `session.dmg`, with `then` scripted for what follows it.
+    fn attached_session(
+        then: impl IntoIterator<Item = Reply>,
+    ) -> (MacOsApfsBackend<RecordingRunner>, AttachedImage) {
+        let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs(
+            verified_attachment_replies("session.dmg")
+                .into_iter()
+                .chain(then),
+        ));
+        let attachment = backend
+            .attach_verified(Path::new("session.dmg"))
+            .expect("verified attachment");
+        (backend, attachment)
+    }
+
+    fn renames(backend: &MacOsApfsBackend<RecordingRunner>) -> Vec<CommandRequest> {
+        backend
+            .runner()
+            .requests()
+            .into_iter()
+            .filter(|request| {
+                request
+                    .args
+                    .first()
+                    .is_some_and(|verb| verb == "renameVolume")
+            })
+            .collect()
+    }
+
     #[test]
-    fn rename_volume_records_checked_diskutil_rename_volume_command() {
-        let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([ok([])]));
+    fn rename_volume_names_the_attachments_pinned_volume_device() {
+        let (backend, attachment) =
+            attached_session([holding_verified_volume("session.dmg"), ok([])]);
 
         backend
-            .rename_volume(
-                Path::new("/Volumes/cowshed-stage"),
-                "cowshed.acme--widget.main",
-            )
+            .rename_volume(&attachment, "cowshed.acme--widget.main")
             .unwrap();
 
-        let requests = backend.runner().requests();
-        assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].program, Path::new(DISKUTIL));
+        let steps = backend.runner().steps();
         assert_eq!(
-            argv(&requests[0]),
-            [
-                "renameVolume",
-                "/Volumes/cowshed-stage",
-                "cowshed.acme--widget.main",
-            ]
+            steps[steps.len() - 2],
+            Seen::Inventory,
+            "the device is proven the image's before the rename"
+        );
+        let rename = steps[steps.len() - 1].command();
+        assert_eq!(rename.program, Path::new(DISKUTIL));
+        assert_eq!(
+            argv(rename),
+            ["renameVolume", "/dev/disk5s1", "cowshed.acme--widget.main"]
         );
     }
 
     #[test]
     fn rename_volume_accepts_a_255_byte_path_safe_name() {
         let name = "a".repeat(255);
-        let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([ok([])]));
+        let (backend, attachment) =
+            attached_session([holding_verified_volume("session.dmg"), ok([])]);
 
-        backend
-            .rename_volume(Path::new("/Volumes/cowshed-stage"), &name)
-            .unwrap();
+        backend.rename_volume(&attachment, &name).unwrap();
 
-        let requests = backend.runner().requests();
-        assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].args[2], OsString::from(name));
-    }
-
-    #[test]
-    fn rename_volume_rejects_noncanonical_mountpoints_before_spawning() {
-        let backend = MacOsApfsBackend::new(RecordingRunner::default());
-        for mount_point in [
-            "",
-            ".",
-            "Volumes/main",
-            "/",
-            "/dev",
-            "/dev/disk12s3",
-            "/Volumes/../private/tmp",
-            "/Volumes/./main",
-            "/Volumes//main",
-            "/Volumes/main/",
-            "/Volumes/\0main",
-        ] {
-            let error = backend
-                .rename_volume(Path::new(mount_point), "main")
-                .unwrap_err();
-            assert!(matches!(
-                error,
-                ApfsError::InvalidMountPoint(path) if path == Path::new(mount_point)
-            ));
-        }
-        assert!(backend.runner().requests().is_empty());
+        assert_eq!(renames(&backend)[0].args[2], OsString::from(name));
     }
 
     #[test]
@@ -6413,27 +6415,26 @@ mod tests {
             "a".repeat(256),
             "é".repeat(128),
         ];
-        let backend = MacOsApfsBackend::new(RecordingRunner::default());
+        let (backend, attachment) = attached_session([]);
+        let attached = backend.runner().steps().len();
         for name in invalid {
-            let error = backend
-                .rename_volume(Path::new("/Volumes/cowshed-stage"), &name)
-                .unwrap_err();
+            let error = backend.rename_volume(&attachment, &name).unwrap_err();
             assert!(matches!(
                 error,
                 ApfsError::InvalidVolumeName(rejected) if rejected == name
             ));
         }
-        assert!(backend.runner().requests().is_empty());
+        assert_eq!(backend.runner().steps().len(), attached);
     }
 
     #[test]
     fn rename_volume_propagates_checked_diskutil_failure() {
-        let backend =
-            MacOsApfsBackend::new(RecordingRunner::with_outputs([failed(7, "rename failed")]));
+        let (backend, attachment) = attached_session([
+            holding_verified_volume("session.dmg"),
+            failed(7, "rename failed"),
+        ]);
 
-        let error = backend
-            .rename_volume(Path::new("/Volumes/cowshed-stage"), "main")
-            .unwrap_err();
+        let error = backend.rename_volume(&attachment, "main").unwrap_err();
 
         assert!(matches!(
             error,
@@ -6445,9 +6446,34 @@ mod tests {
                     ..
                 },
             } if request.program == Path::new(DISKUTIL)
-                && argv(&request) == ["renameVolume", "/Volumes/cowshed-stage", "main"]
+                && argv(&request) == ["renameVolume", "/dev/disk5s1", "main"]
         ));
-        assert_eq!(backend.runner().requests().len(), 1);
+        assert_eq!(renames(&backend).len(), 1);
+    }
+
+    /// A device name is reusable, not an identity. Once the image no longer holds the device its
+    /// attachment recorded (ejected, or the name handed to another image's volume, or to the
+    /// host's own), no rename may reach that device.
+    #[test]
+    fn rename_volume_never_reaches_a_device_no_store_image_holds() {
+        let foreign = || {
+            images(&[(
+                "/private/tmp/foreign.dmg",
+                &["/dev/disk4", "/dev/disk5", "/dev/disk5s1"][..],
+            )])
+        };
+        for now in [no_images(), foreign()] {
+            let (backend, attachment) = attached_session([now]);
+
+            let renamed =
+                backend.rename_volume(&attachment, "[cowshed] fixture · intents — slotted");
+
+            assert!(
+                matches!(renamed, Err(ApfsError::InvalidAttachmentInventory(_))),
+                "{renamed:?}"
+            );
+            assert!(renames(&backend).is_empty(), "ran {:?}", renames(&backend));
+        }
     }
 
     #[test]

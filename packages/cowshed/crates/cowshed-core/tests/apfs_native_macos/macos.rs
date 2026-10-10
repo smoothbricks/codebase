@@ -26,8 +26,8 @@ use cowshed_core::storage::apfs::native::{
     blank_template_staged_stem,
 };
 use cowshed_core::storage::apfs::{
-    ApfsExecutionHost, ApfsStorageError, ApfsSubstrateConfig, LockMode, MarkerExpectation,
-    MetadataPolicy,
+    ApfsExecutionHost, ApfsStorageError, ApfsSubstrateConfig, Labelled, LockMode,
+    MarkerExpectation, MetadataPolicy,
 };
 use cowshed_core::storage::lifecycle::{
     LifecycleFact, LifecycleWorkspace, OperationIdentity, Pin, RetiredRef, Revision,
@@ -2541,27 +2541,186 @@ fn real_apfs_release_detaches_a_volume_held_open_after_its_grace() {
     );
 }
 
+/// Kernel mounts a test states outright, so a rename's target is proven from the fake inventory
+/// and these mounts alone.
+struct FixedMounts(Vec<KernelMountSnapshot>);
+
+impl KernelMountSource for FixedMounts {
+    fn mounts(&self) -> Result<Vec<KernelMountSnapshot>, ApfsStorageError> {
+        Ok(self.0.clone())
+    }
+}
+
+/// A host over `runner` that sees `mounts` and nothing else mounted.
+fn host_seeing(
+    fixture: &Fixture,
+    runner: RecordingRunner,
+    mounts: Vec<KernelMountSnapshot>,
+) -> MacOsApfsExecutionHost<RecordingRunner> {
+    MacOsApfsExecutionHost::with_mount_source(runner, fixture.config(), FixedMounts(mounts))
+        .expect("native APFS host")
+}
+
+/// The session image a workspace `slotted` of this fixture's store would be.
+fn slotted_image(fixture: &Fixture) -> PathBuf {
+    StorageLayout::new(&fixture.root, &repo())
+        .expect("layout")
+        .canonical_image(&WorkspaceName::new("slotted").expect("workspace name"))
+        .expect("image path")
+        .image()
+        .to_owned()
+}
+
+/// `image`, held attached by the fake kernel inventory.
+fn attach(runner: &RecordingRunner, image: &Path) {
+    runner
+        .inventory
+        .0
+        .lock()
+        .expect("fake inventory")
+        .push(image.to_string_lossy().into_owned());
+}
+
+fn renames(runner: &RecordingRunner) -> Vec<CommandRequest> {
+    runner
+        .requests()
+        .into_iter()
+        .filter(|request| {
+            request
+                .args
+                .first()
+                .is_some_and(|verb| verb == "renameVolume")
+        })
+        .collect()
+}
+
+const SLOTTED: &str = "[cowshed] fixture · intents — slotted";
+
 #[test]
-fn native_volume_rename_crosses_the_backend_boundary() {
+fn native_volume_rename_names_the_image_volume_device_never_its_mount_path() {
     let fixture = Fixture::new("rename-volume");
     let runner = RecordingRunner::default();
-    let host = native_host(&fixture, runner.clone());
-    let mount = fixture.root.join("mounted");
+    let image = slotted_image(&fixture);
+    attach(&runner, &image);
+    let mount = fixture.root.join("mount").join("slotted");
+    std::fs::create_dir_all(&mount).expect("mountpoint");
+    let host = host_seeing(
+        &fixture,
+        runner.clone(),
+        vec![KernelMountSnapshot::new(
+            7,
+            &mount,
+            "/dev/disk10s1",
+            true,
+            true,
+        )],
+    );
 
-    host.rename_volume(&mount, "cowshed.acme--widget.session")
-        .expect("rename volume");
-
-    let requests = runner.requests();
-    assert_eq!(requests.len(), 1);
-    assert_eq!(requests[0].program, Path::new("/usr/sbin/diskutil"));
     assert_eq!(
-        requests[0].args,
+        host.label_image_volume(&image, SLOTTED).expect("rename"),
+        Labelled::Renamed
+    );
+
+    let renames = renames(&runner);
+    assert_eq!(renames.len(), 1);
+    assert_eq!(renames[0].program, Path::new("/usr/sbin/diskutil"));
+    assert_eq!(
+        renames[0].args,
         [
             std::ffi::OsString::from("renameVolume"),
-            mount.into_os_string(),
-            std::ffi::OsString::from("cowshed.acme--widget.session"),
+            std::ffi::OsString::from("/dev/disk10s1"),
+            std::ffi::OsString::from(SLOTTED),
         ]
     );
+}
+
+/// A workspace whose create was refused, or that is not mounted, has only a directory where it
+/// would mount, and that directory lies on whatever volume holds the store: here the host's own.
+/// Its image names nothing, and its mountpoint is no rename target at all.
+#[test]
+fn an_unmounted_workspace_names_no_volume_through_its_mount_path() {
+    let fixture = Fixture::new("rename-unmounted");
+    let runner = RecordingRunner::default();
+    let mount = fixture.root.join("mount").join("slotted");
+    std::fs::create_dir_all(&mount).expect("an empty mountpoint on the host volume");
+    // The volume that holds that directory, as the kernel lists it: the host's own.
+    let host = host_seeing(
+        &fixture,
+        runner.clone(),
+        vec![KernelMountSnapshot::new(
+            1,
+            "/System/Volumes/Data",
+            "/dev/disk3s5",
+            true,
+            true,
+        )],
+    );
+
+    assert_eq!(
+        host.label_image_volume(&slotted_image(&fixture), SLOTTED)
+            .expect("a refused create is a typed skip"),
+        Labelled::NotAttached
+    );
+    assert!(
+        host.label_image_volume(&mount, SLOTTED).is_err(),
+        "a mountpoint is no image under the store"
+    );
+    assert!(
+        runner.requests().is_empty(),
+        "a rename reached the volume holding {}: {:?}",
+        mount.display(),
+        runner.requests()
+    );
+}
+
+/// Attached but mounted nowhere: APFS renames only mounted volumes, so nothing is named.
+#[test]
+fn an_attached_image_mounted_nowhere_names_no_volume() {
+    let fixture = Fixture::new("rename-unmounted-attachment");
+    let runner = RecordingRunner::default();
+    let image = slotted_image(&fixture);
+    attach(&runner, &image);
+    let host = host_seeing(&fixture, runner.clone(), Vec::new());
+
+    assert_eq!(
+        host.label_image_volume(&image, SLOTTED)
+            .expect("typed skip"),
+        Labelled::NotMounted
+    );
+    assert!(runner.requests().is_empty(), "ran {:?}", runner.requests());
+}
+
+/// An image outside the store is never a rename target, even one the kernel holds and mounts:
+/// the host's disks, and any image cowshed did not make, are not cowshed's to name.
+#[test]
+fn an_image_outside_the_store_is_refused_as_a_rename_target() {
+    let fixture = Fixture::new("rename-foreign-image");
+    let runner = RecordingRunner::default();
+    let foreign =
+        std::env::temp_dir().join(format!("cowshed-foreign-{}.dmg", uuid::Uuid::new_v4()));
+    attach(&runner, &foreign);
+    let host = host_seeing(
+        &fixture,
+        runner.clone(),
+        vec![KernelMountSnapshot::new(
+            7,
+            fixture.root.join("mounted"),
+            "/dev/disk10s1",
+            true,
+            true,
+        )],
+    );
+
+    let refused = host.label_image_volume(&foreign, SLOTTED).unwrap_err();
+
+    assert!(
+        matches!(
+            refused,
+            ApfsStorageError::Layout(StorageLayoutError::EscapesStoreRoot)
+        ),
+        "{refused}"
+    );
+    assert!(runner.requests().is_empty(), "ran {:?}", runner.requests());
 }
 
 #[test]
@@ -3046,9 +3205,12 @@ fn real_apfs_kernel_mount_facts_survive_host_restart_and_detach_by_mountpoint() 
     drop(first);
 
     let restarted = fixture.host();
-    restarted
-        .rename_volume(&mount, "hand-renamed")
-        .expect("rename the volume behind cowshed's back");
+    assert_eq!(
+        restarted
+            .label_image_volume(canonical.image(), "hand-renamed")
+            .expect("rename the volume behind cowshed's back"),
+        Labelled::Renamed
+    );
     assert_eq!(
         restarted.mounts(&repo()).expect("restart facts")[0].mount_id,
         kernel_id,

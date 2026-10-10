@@ -1509,6 +1509,49 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
             .map_err(Into::into)
     }
 
+    /// Name the volume of `image`, an image under the store, `label` (01_storage.md,
+    /// "Ownership, identity, and the volume label"). The target is the volume device the kernel's
+    /// attachment inventory maps the image to, re-proved under the image's lease and a raw pin
+    /// when the rename runs; never a path, which `diskutil` resolves to whatever volume holds it.
+    /// An image the kernel does not hold, or whose volume is mounted nowhere, names nothing; one
+    /// it holds twice is ambiguous and refused.
+    pub fn label_image_volume(
+        &self,
+        image: &Path,
+        label: &str,
+    ) -> Result<super::Labelled, ApfsStorageError> {
+        self.require_store_image(image)?;
+        // An unformatted attachment has no volume to name.
+        let Some(RecoveredImageAttachment::Apfs(attachment)) =
+            self.backend.recovered_image_attachment(image)?
+        else {
+            return Ok(super::Labelled::NotAttached);
+        };
+        let mounts = self.mount_source.mounts()?;
+        let Some(mount) = mounts
+            .iter()
+            .find(|mount| mount.source_device == attachment.volume_device())
+        else {
+            return Ok(super::Labelled::NotMounted);
+        };
+        if carries_label(&mount.mount_point, label)? {
+            return Ok(super::Labelled::Already);
+        }
+        self.backend.rename_volume(&attachment, label)?;
+        Ok(super::Labelled::Renamed)
+    }
+
+    /// Refuse every path but an image under this host's store: a rename may name only a volume of
+    /// cowshed's own images, and the host's disks are none of them.
+    fn require_store_image(&self, image: &Path) -> Result<(), ApfsStorageError> {
+        if image == self.config.store_root || !image.starts_with(&self.config.store_root) {
+            return Err(ApfsStorageError::Layout(
+                super::super::StorageLayoutError::EscapesStoreRoot,
+            ));
+        }
+        self.verify_controller_path(image)
+    }
+
     fn find_canonical_image(
         &self,
         repo: &RepoId,
@@ -4363,10 +4406,14 @@ where
         }
     }
 
-    fn rename_volume(&self, mount_point: &Path, volume_name: &str) -> Result<(), ApfsStorageError> {
-        self.verify_controller_path(mount_point)?;
+    fn rename_volume(
+        &self,
+        attachment: &AttachedImage,
+        volume_name: &str,
+    ) -> Result<(), ApfsStorageError> {
+        self.require_store_image(attachment.image())?;
         self.backend
-            .rename_volume(mount_point, volume_name)
+            .rename_volume(attachment, volume_name)
             .map_err(Into::into)
     }
 
@@ -6712,6 +6759,25 @@ fn swap_paths(left: &Path, right: &Path) -> Result<(), ApfsStorageError> {
         let _ = (left, right);
         Err(ApfsStorageError::Host(
             "atomic APFS restore swap requires macOS renameatx_np".to_owned(),
+        ))
+    }
+}
+
+/// Whether the volume mounted at `mount_point` already carries `label`. It is read straight from
+/// the kernel (`getattrlist`), so a name already right costs no Disk Arbitration round trip. A
+/// read that raced an unmount costs only a rename that the device pin then refuses.
+fn carries_label(mount_point: &Path, label: &str) -> Result<bool, ApfsStorageError> {
+    #[cfg(target_os = "macos")]
+    {
+        crate::apfs::volume_name(mount_point)
+            .map(|name| name == label)
+            .map_err(|error| io_error("read volume name", mount_point, error))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (mount_point, label);
+        Err(ApfsStorageError::Host(
+            "reading an APFS volume's name requires macOS getattrlist".to_owned(),
         ))
     }
 }

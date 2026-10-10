@@ -19,6 +19,7 @@ use cowshed_core::metadata::{PortBlock, WorkspaceIncarnation, WorkspaceName};
 use cowshed_core::repository::{OwnedRepoIds, RepoId};
 use cowshed_core::runtime::job_groups::Birth;
 use cowshed_core::sandbox::{SandboxConfig, SandboxGrants};
+use cowshed_core::storage::apfs::Labelled;
 use cowshed_core::storage::job_artifact::{
     AdmissionLookup, ArtifactConfig, ArtifactStore, FIRST_KEYED_LAYOUT, JobAdmission, JobEnding,
     StreamKind,
@@ -27,7 +28,7 @@ use tokio::sync::mpsc;
 
 use cowshed_core::runtime::supervisor::{
     ArtifactSeal, ArtifactSink, ArtifactStoreSink, ArtifactWrite, CheckpointBarrier,
-    CommitmentDraft, CommitmentSink, Labelled, OwnedProcess, ProcessEvent, ProcessSignal,
+    CommitmentDraft, CommitmentSink, OwnedProcess, ProcessEvent, ProcessSignal,
     ProcessSpawnRequest, RunningProcess, SessionToken, SpawnCommand, SpawnSink, VolumeLabeller,
     VolumeLabels, WorkspaceAuthoritySnapshot, WorkspaceSupervisor, WorkspaceSupervisorConfig,
     WorkspaceSupervisorHandle,
@@ -2133,7 +2134,7 @@ async fn quiesce_does_not_wait_for_background_volume_labels() {
         release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
     }
     impl VolumeLabeller for BlockedLabeller {
-        fn ensure_label(&self, _mount: &Path, _label: &str) -> std::io::Result<Labelled> {
+        fn ensure_label(&self, _image: &Path, _label: &str) -> std::io::Result<Labelled> {
             self.entered.send(()).map_err(std::io::Error::other)?;
             self.release
                 .lock()
@@ -2148,6 +2149,7 @@ async fn quiesce_does_not_wait_for_background_volume_labels() {
     let (release, gate) = std::sync::mpsc::channel();
     let mut supervisor = config(&root);
     supervisor.volume_labels = Some(VolumeLabels {
+        workspace_image: root.join("store").join("main.dmg"),
         workspace: "[cowshed] acme · widget — main".into(),
         build: "[cowshed] acme · widget — build main".into(),
         labeller: std::sync::Arc::new(BlockedLabeller {
@@ -2172,9 +2174,9 @@ async fn a_build_volume_label_request_cannot_name_a_host_mount_outside_its_layou
 
     struct RecordingLabeller(mpsc::UnboundedSender<PathBuf>);
     impl VolumeLabeller for RecordingLabeller {
-        fn ensure_label(&self, mount: &Path, _label: &str) -> std::io::Result<Labelled> {
+        fn ensure_label(&self, image: &Path, _label: &str) -> std::io::Result<Labelled> {
             self.0
-                .send(mount.to_owned())
+                .send(image.to_owned())
                 .map_err(std::io::Error::other)?;
             Ok(Labelled::Renamed)
         }
@@ -2193,7 +2195,9 @@ async fn a_build_volume_label_request_cannot_name_a_host_mount_outside_its_layou
     std::fs::create_dir_all(&host_mount).unwrap();
     link::point(&checkout, &host_mount).unwrap();
     let (named, mut labels) = mpsc::unbounded_channel();
+    let image = root.join("store").join("main.dmg");
     supervisor.volume_labels = Some(VolumeLabels {
+        workspace_image: image.clone(),
         workspace: "[cowshed] acme · widget — main".into(),
         build: "[cowshed] acme · widget — build main".into(),
         labeller: std::sync::Arc::new(RecordingLabeller(named)),
@@ -2201,8 +2205,8 @@ async fn a_build_volume_label_request_cannot_name_a_host_mount_outside_its_layou
     let h = harness_with_config(supervisor, 1, 1024, false, false);
     assert_eq!(
         labels.recv().await.unwrap(),
-        checkout,
-        "the initial workspace label runs"
+        image,
+        "the initial workspace label names the workspace's image, never its checkout path"
     );
     let refused = h
         .handle

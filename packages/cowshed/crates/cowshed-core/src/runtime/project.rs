@@ -6228,6 +6228,12 @@ impl NativeProjectRuntimeHost {
             // Filled from the lost predecessor's ledger once this process holds the socket.
             inherited_groups: Vec::new(),
             volume_labels: Some(super::supervisor::VolumeLabels {
+                workspace_image: self
+                    .layout
+                    .canonical_image(name)
+                    .map_err(native_integrity_error)?
+                    .image()
+                    .to_owned(),
                 workspace: crate::storage::apfs::volume_label(&self.descriptor.repo_id, name),
                 build: crate::storage::apfs::build_volume_label(&self.descriptor.repo_id, name),
                 labeller: std::sync::Arc::new(ApfsLabeller(self.substrate.shared_host())),
@@ -8979,7 +8985,6 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
     /// live half: refuse what must not proceed, get the volumes down, cross the fence, and bring the
     /// project back up under its new name.
     async fn change_repo_id(&mut self, new_repo_id: RepoId) -> Result<WorkspaceSnapshot> {
-        use crate::storage::apfs::ApfsExecutionHost;
         use crate::storage::lifecycle::{MountIntent, MountState, Substrate};
         use crate::storage::recovery::{LifecycleIntentPhase, RepositoryIdentityIntent};
 
@@ -9139,14 +9144,32 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         // The volume label is human-facing and carries no identity — nothing parses it and nothing
         // classifies a volume by it — so relabelling is cosmetic and needs no recovery. It is done
         // here, with main mounted, because Finder shows this string in place of the checkout
-        // directory's name and leaving the old repository name there is simply wrong.
-        self.substrate
+        // directory's name and leaving the old repository name there is simply wrong. It names
+        // main's image, never the checkout path: a path names whatever volume holds it.
+        let main_image = self
+            .layout
+            .main_image()
+            .map_err(native_integrity_error)?
+            .image()
+            .to_owned();
+        match self
+            .substrate
             .host()
-            .rename_volume(
-                &main_mount,
+            .label_image_volume(
+                &main_image,
                 &crate::storage::apfs::volume_label(&self.descriptor.repo_id, &main_name()),
             )
-            .map_err(native_storage_error)?;
+            .map_err(native_storage_error)?
+        {
+            crate::storage::apfs::Labelled::Renamed | crate::storage::apfs::Labelled::Already => {}
+            skipped @ (crate::storage::apfs::Labelled::NotAttached
+            | crate::storage::apfs::Labelled::NotMounted) => {
+                return Err(CowshedError::internal(format!(
+                    "main was just mounted, yet its image {} is {skipped:?}",
+                    main_image.display()
+                )));
+            }
+        }
         self.ensure_supervisor(&main_name()).await?;
         RepositoryIdentityIntent::clear(&self.substrate_config.store_root)?;
         self.snapshot_named(&main_name()).await
@@ -15256,35 +15279,24 @@ fn is_mount_point(path: &Path) -> std::io::Result<bool> {
     }
 }
 
-/// Names a mounted volume through the APFS host's Disk Arbitration rename, after reading the
-/// file system's own name for it so a name already right costs no round trip.
+/// Names a workspace image's volume through the APFS host, which renames only the volume device
+/// the kernel maps that image under the store to.
 #[cfg(target_os = "macos")]
-struct ApfsLabeller(
-    std::sync::Arc<
-        crate::storage::apfs::native::MacOsApfsExecutionHost<crate::apfs::SystemCommandRunner>,
-    >,
-);
+struct ApfsLabeller<R>(std::sync::Arc<crate::storage::apfs::native::MacOsApfsExecutionHost<R>>);
 
 #[cfg(target_os = "macos")]
-impl super::supervisor::VolumeLabeller for ApfsLabeller {
+impl<R> super::supervisor::VolumeLabeller for ApfsLabeller<R>
+where
+    R: crate::apfs::CommandRunner + Send + Sync + 'static,
+{
     fn ensure_label(
         &self,
-        mount: &Path,
+        image: &Path,
         label: &str,
-    ) -> std::io::Result<super::supervisor::Labelled> {
-        use super::supervisor::Labelled;
-        use crate::storage::apfs::ApfsExecutionHost;
-        // A path nothing is mounted at names the volume that holds the directory: never renamed.
-        if !is_mount_point(mount)? {
-            return Ok(Labelled::NotMounted);
-        }
-        if crate::apfs::volume_name(mount)? == label {
-            return Ok(Labelled::Already);
-        }
+    ) -> std::io::Result<crate::storage::apfs::Labelled> {
         self.0
-            .rename_volume(mount, label)
-            .map_err(|error| std::io::Error::other(error.to_string()))?;
-        Ok(Labelled::Renamed)
+            .label_image_volume(image, label)
+            .map_err(|error| std::io::Error::other(error.to_string()))
     }
 }
 
@@ -19352,5 +19364,116 @@ mod session_reopen_tests {
     fn a_reopened_named_session_is_never_closed_as_its_own_predecessor() {
         assert_eq!(superseded_session(token(7), 7), None);
         assert_eq!(superseded_session(token(7), 8), Some(token(7)));
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod volume_labeller_tests {
+    use super::*;
+    use crate::apfs::{AttachedDiskImage, CommandOutput, CommandRequest, CommandRunError};
+    use crate::fork_lock::Fenced;
+    use crate::runtime::supervisor::VolumeLabeller as _;
+    use crate::storage::apfs::ApfsSubstrateConfig;
+    use crate::storage::apfs::native::{MacOsApfsExecutionHost, SystemKernelMountSource};
+
+    /// Records every disk command instead of running it, and reports no image attached.
+    #[derive(Clone, Default)]
+    struct RecordedDiskCommands(std::sync::Arc<std::sync::Mutex<Vec<CommandRequest>>>);
+
+    impl RecordedDiskCommands {
+        fn commands(&self) -> Vec<CommandRequest> {
+            self.0.lock().expect("recorded disk commands").clone()
+        }
+    }
+
+    impl crate::apfs::CommandRunner for RecordedDiskCommands {
+        fn run(
+            &self,
+            request: &CommandRequest,
+        ) -> std::result::Result<CommandOutput, CommandRunError> {
+            self.0
+                .lock()
+                .expect("recorded disk commands")
+                .push(request.clone());
+            Ok(CommandOutput::success([]))
+        }
+        fn image_lease(&self, _: &Path) -> std::io::Result<Option<Fenced<std::fs::File>>> {
+            Ok(None)
+        }
+        fn pin_raw_device(&self, _: &Path) -> std::io::Result<Option<Fenced<std::fs::File>>> {
+            Ok(None)
+        }
+        fn attached_disk_images(&self) -> std::io::Result<Vec<AttachedDiskImage>> {
+            Ok(Vec::new())
+        }
+        fn grow_image(
+            &self,
+            image: &Path,
+            _: crate::metadata::ImageCapacity,
+        ) -> std::io::Result<()> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                format!("the recorded runner grows no image: {}", image.display()),
+            ))
+        }
+    }
+
+    /// A fixture's `slotted`, whose create was refused, names the host's own Data volume through its
+    /// mountpoint. The labeller is handed the workspace's image now: an image the kernel does not
+    /// hold names nothing, and a path that is no image under the store (the empty mountpoint, a
+    /// host volume) is refused. No case runs a disk command.
+    #[test]
+    fn the_labeller_renames_no_volume_for_a_workspace_mounted_from_no_store_image() {
+        let root = std::env::temp_dir().join(format!(
+            "cowshed-labeller-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let store = root.join("store");
+        std::fs::create_dir_all(&store).expect("the store root");
+        let runner = RecordedDiskCommands::default();
+        let host = MacOsApfsExecutionHost::with_mount_source(
+            runner.clone(),
+            ApfsSubstrateConfig::new(&store, root.join("mnt")),
+            SystemKernelMountSource,
+        )
+        .expect("native APFS host");
+        let labeller = ApfsLabeller(std::sync::Arc::new(host));
+        let repo =
+            crate::repository::RepoId::parse("fixture/intents").expect("repository identity");
+        let slotted = crate::storage::StorageLayout::new(&store, &repo)
+            .expect("layout")
+            .canonical_image(
+                &crate::metadata::WorkspaceName::new("slotted").expect("workspace name"),
+            )
+            .expect("image path")
+            .image()
+            .to_owned();
+        let refused = root
+            .join("mnt")
+            .join("fixture")
+            .join("intents")
+            .join("slotted");
+        std::fs::create_dir_all(&refused).expect("an empty mountpoint on the host volume");
+        let label = "[cowshed] fixture · intents — slotted";
+
+        let named = labeller.ensure_label(&slotted, label);
+        let foreign = [
+            refused.as_path(),
+            Path::new("/System/Volumes/Preboot"),
+            Path::new("/System/Volumes/Data"),
+        ]
+        .map(|path| labeller.ensure_label(path, label).is_err());
+        std::fs::remove_dir_all(&root).expect("remove the fixture");
+
+        assert_eq!(
+            named.expect("an unattached image is a typed skip"),
+            crate::storage::apfs::Labelled::NotAttached
+        );
+        assert_eq!(foreign, [true; 3], "a path outside the store is refused");
+        assert!(
+            runner.commands().is_empty(),
+            "the labeller ran {:?}",
+            runner.commands()
+        );
     }
 }
