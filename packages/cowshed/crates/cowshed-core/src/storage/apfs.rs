@@ -736,6 +736,12 @@ pub enum ApfsStorageError {
         #[source]
         source: io::Error,
     },
+    #[error("build volume {image} has shared ownership holds on {hold}: {open:?}")]
+    BuildVolumeHeld {
+        image: PathBuf,
+        hold: PathBuf,
+        open: Vec<crate::build_volume::nx::Holder>,
+    },
     #[error("lifecycle conflict: {0}")]
     Conflict(#[from] super::lifecycle::Conflict),
     #[error("derived APFS state is inconsistent: {0}")]

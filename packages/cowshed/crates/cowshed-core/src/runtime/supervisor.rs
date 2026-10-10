@@ -4101,7 +4101,8 @@ impl SupervisorActor {
     /// Hold the build volume mounted at `grant` for one job (16_build_volumes.md, "Garbage
     /// collection"): a land that moves the checkout's link meanwhile leaves the volume unlinked,
     /// and the hold is what tells its release that this job still runs there. Refused while a
-    /// release claims the volume, since the job would start on a volume being deleted.
+    /// release or direct seed capture claims the volume, so no job starts during deletion or
+    /// canonical restoration before the seed's freshness mark.
     fn hold_build_volume(
         &self,
         grant: Option<&Path>,

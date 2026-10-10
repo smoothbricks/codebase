@@ -290,9 +290,14 @@ which hits by construction, and miss everything the target runs later.
 
 **Behind is one comparison of two modification times.** An image's modification time is the instant of the last write it
 holds: the image driver writes the image file as its volume is written, and a clone keeps its source's modification time
-(cowshed restores it after the clone's own first write). A seed is behind when the live volume's image, its volume
-flushed first, was modified after the seed's image. A fork sets its own seed's time to its new live volume's, so a new
-workspace starts with a fresh seed rather than one behind by its own mount.
+(cowshed restores it after the clone's own first write). Cowshed's own capture and restore metadata is not build state
+the seed lacks. A mounted-source capture restores the canonical mount while holding admission closed: a direct capture
+claims the source's build hold exclusively; a land retains its stopped supervisor socket lease and shared GC hold. It
+flushes the restored volume and image, and fixes that post-mount image clock as the seed's freshness mark before
+reopening admission. The immutable mark survives the clone's own first write; no live image is re-sampled after
+admission reopens. A seed is behind when the live volume's image, its volume flushed first, was modified after the
+seed's image. A fork sets its own seed's time to its new live volume's, so a new workspace starts with a fresh seed
+rather than one behind by its own mount.
 
 **A reseed clones the live volume only while it has no writer**, because a clone of a volume being written can hold a
 half-written Cargo unit or Nx database. It runs under the target's image lock, which every fork of the target holds
@@ -304,16 +309,34 @@ while it clones the seed, so a reseed never deletes a seed a fork is cloning:
    its whole build, so a held one skips the reseed with its lock path and processes;
 3. those admission-check descriptors are closed before sealing, because their open files would themselves prevent
    unmount. Enumeration cannot fence a previously absent profile or a build starting afterwards;
-4. the APFS source is unmounted and detached without force. A late Cargo build, a new profile, an editor or any other
-   filesystem holder refuses that seal; it is reported as a busy-volume skip and the old seed remains. The detached
-   image is flushed and its source inode held against reattachment while it is cloned;
-5. the live volume is restored with the same mount flags and current attachment identity, then the new seed replaces the
-   old one. A process starting after restoration cannot invalidate the already-sealed capture; later writes make the
-   seed behind again rather than requiring another holder query.
+4. the source's build hold (`<id>.dmg.hold`, outside its mounted filesystem) is taken exclusively without waiting; an
+   admitted job holding it skips the capture before any image mutation, retaining the old seed. The APFS source is then
+   unmounted and detached without force. A late host Cargo build, a new profile, an editor or any other filesystem
+   holder refuses that seal; it is reported as a busy-volume skip and the old seed remains. The detached image is
+   flushed and its source inode held against reattachment while it is cloned;
+5. the live volume is restored at canonical with the same mount flags and current attachment identity, still under the
+   exclusive build hold. Its volume and image are flushed and the post-restore image clock is marked on the seed. The
+   clone's extent-map write and owner-record publication complete before the hold is released. Reopening admission is
+   publication to admitted jobs, not the mount command: a job admitted afterwards cannot invalidate the sealed capture;
+   its later writes make the seed behind again rather than requiring another holder query. Dropping this claim only
+   unlocks the source's hold; it never retires or deletes the source.
+
+Land already owns a shared GC hold on its quiet source. Its typed quiet capture retains the stopped supervisor socket
+lease that refuses replacement admission, from before the jobs stop through capture and adoption. It does not take a
+second exclusive claim, nor upgrade the shared hold: Darwin flock upgrades release and retake the lock and would reopen
+the gap. The socket lease is released only before replacement supervisors start, after the immutable seed mark and
+adoption (and a kept workspace's refork). The shared GC hold remains through the rest of the build-volume steps.
 
 This kernel boundary also covers writers outside Cargo and Nx protocols. A Rust analyzer holding a proc-macro library or
 a script with a file open can leave the fork colder by refusing the seal; neither is forced off the volume and no
 attached-image crash-consistency claim substitutes for the refusal.
+
+The restore-publication contract is scoped to admitted cowshed jobs. An unmanaged host Cargo process, editor or script
+that writes the canonical build mount during restore is outside that admission protocol. The build hold is not a kernel
+filesystem-writer barrier: such a write may be absorbed into the seed's freshness mark even though it occurred after the
+sealed capture. The earlier non-forced kernel seal still guarantees quiet captured bytes; no additional fence is claimed
+for unmanaged post-seal writes. The source's owner record, tree, creation time, file bytes and file modification times
+are otherwise unchanged.
 
 Every fork reseeds its target first (Fork step 2). A skip names each holder and leaves the seed as it was: the fork is
 colder, never wrong, and the next fork tries again. `cowshed reseed <ws>` does the same on its own, and `cowshed doctor`
@@ -323,6 +346,10 @@ reports each target whose seed is behind its live volume, with both instants (`s
   refreezes its seed and a fork hits that task; real Cargo build-script rendezvous tests for both an existing profile
   and a profile created after quiescence and lock enumeration; and the sealed-source holder and attachment-exclusion
   tests.
+- **Freshness boundary enforced by**: real APFS capture without a job write remains Fresh without tolerance; actual job
+  admission is refused during canonical restore, both by a direct capture's exclusive claim and a land's retained
+  stopped socket lease; an admitted shell job after admission reopens writes bytes absent from the seed and makes it
+  behind; an already-held admission skips direct capture without mutating images or replacing the old seed.
 
 ## Fork: `cowshed new` / `cowshed fork`
 
@@ -362,9 +389,11 @@ same for main and for an integration workspace; "the target" is whichever one it
 4. **Quiesce the landing workspace.** The land holds the landing build volume (the shared `<id>.dmg.hold` a job holds,
    GC below) from before the workspace's jobs stop until its build-volume steps end (after step 7), so no collection in
    any process releases it while step 6 renames the target's link and records the target as its owner. Its supervisor
-   stops the workspace's jobs and its sandboxed Nx daemon, and the landing build volume's Nx task database must have no
-   open file descriptors. If it still does, adoption is **skipped** and reported, as for the target below. This settles
-   supervised jobs and Nx; the later seed seal excludes host builds and other filesystem holders.
+   stops the workspace's jobs and its sandboxed Nx daemon, and the stopped supervisor socket lease stays with the quiet
+   volume through capture and adoption, refusing a replacement supervisor's job admission. The landing build volume's Nx
+   task database must have no open file descriptors. If it still does, adoption is **skipped** and reported, as for the
+   target below. This settles supervised jobs and Nx; the later seed seal excludes host builds and other filesystem
+   holders.
 5. **Close the target, carry, and freeze the seed.** Under the same lock (rule "The adoption needs the target's Nx
    database closed"):
    1. **stage the carry** (below) while the target still runs: copy into the landing volume the target's Nx cache

@@ -3954,11 +3954,10 @@ impl NativeProjectRuntimeHost {
         // name it, so no collection takes it between, whatever links that collection read.
         let stopped = self.stop_supervisor_for_removal(workspace, true).await?;
         require_lost_groups_released(workspace, &stopped, "quiesce").await?;
-        drop(stopped);
         let quiet = match timed_async(
             "land",
             "quiesce",
-            volumes.quiesce(landing_volume, into.mount.clone()),
+            volumes.quiesce(landing_volume, stopped, into.mount.clone()),
         )
         .await?
         {
@@ -4063,6 +4062,7 @@ impl NativeProjectRuntimeHost {
                             .await?;
                     }
                     drop(locked);
+                    let _landing_hold = quiet.release_admission();
                     // Each moved link's volume carries the label of the checkout that built it:
                     // the target's supervisor names the adopted one now, in the background, and a
                     // kept workspace's supervisor, started on its fresh clone, names that one as

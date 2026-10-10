@@ -71,13 +71,27 @@ pub(crate) struct Landing {
     hold: BuildVolumeHold,
 }
 
-/// The landing volume after supervised jobs and Nx settle (Land step 4), still held against GC.
+/// The landing volume after supervised jobs and Nx settle (Land step 4), held against GC and
+/// replacement job admission until capture and adoption finish.
 #[derive(Clone, Debug)]
 pub(crate) struct Quiet {
     id: BuildVolumeId,
     mount: PathBuf,
     state: BuildVolumeState,
-    _hold: Arc<BuildVolumeHold>,
+    hold: Arc<BuildVolumeHold>,
+    _stopped: Arc<super::supervisor_socket::BoundSocket>,
+}
+
+impl Quiet {
+    pub(crate) fn id(&self) -> &BuildVolumeId {
+        &self.id
+    }
+
+    /// Reopen admission before replacement supervisors start, retaining the landing's GC hold
+    /// through the remaining build-volume steps (16_build_volumes.md, Land steps 4–7).
+    pub(crate) fn release_admission(self) -> Arc<BuildVolumeHold> {
+        self.hold
+    }
 }
 
 /// A fork's live volume, cloned from its source's latest seed and mounted while the source's
@@ -803,10 +817,11 @@ impl BuildVolumes {
     /// volume then grows to the target's capacity when it is smaller, before the seed is frozen
     /// from it, so an adoption never shrinks the target and the seed inherits the larger cap: a
     /// workspace forked before a resize of its target lands at the target's capacity. The
-    /// landing hold goes with the quiet volume.
+    /// landing hold and stopped socket lease go with the quiet volume.
     pub async fn quiesce(
         &self,
         landing: Landing,
+        stopped: super::supervisor_socket::BoundSocket,
         target_checkout: PathBuf,
     ) -> Result<std::result::Result<Quiet, AdoptionSkip>> {
         let target = self.layout.linked(&target_checkout)?;
@@ -839,7 +854,8 @@ impl BuildVolumes {
                 id,
                 mount,
                 state,
-                _hold: Arc::new(hold),
+                hold: Arc::new(hold),
+                _stopped: Arc::new(stopped),
             }))
         })
         .await
@@ -942,9 +958,9 @@ impl BuildVolumes {
             // Existing profiles are checked, not future directories fenced. Close our own
             // descriptors before unmount; the non-forced detached capture excludes late writers.
             drop(builds);
-            match host.clone_build_volume(
+            match host.clone_quiet_build_volume(
                 layout,
-                &quiet.id,
+                &quiet,
                 &BuildVolumeId::mint(),
                 &BuildVolumeRecord::new(
                     Some(tree),
@@ -1852,6 +1868,11 @@ fn reseed(host: &Host, layout: &BuildVolumeLayout, target: &Owner, age: SeedAge)
         ),
     ) {
         Ok(()) => {}
+        Err(error @ ApfsStorageError::BuildVolumeHeld { .. }) => {
+            return skipped(ReseedSkip::VolumeBusy {
+                reason: error.to_string(),
+            });
+        }
         Err(ApfsStorageError::Apfs(error)) if crate::apfs::detach_was_dissented(&error) => {
             return skipped(ReseedSkip::VolumeBusy {
                 reason: error.to_string(),
@@ -2657,6 +2678,20 @@ mod tests {
                 .expect("the landing checkout links a volume")
         }
 
+        /// The stopped supervisor's actual admission lease, kept by Quiet through capture.
+        async fn stopped(&self, checkout: &Path) -> super::super::supervisor_socket::BoundSocket {
+            let workspace =
+                WorkspaceName::new(checkout.file_name().unwrap().to_str().unwrap()).unwrap();
+            let socket = super::super::supervisor_socket::socket_path(
+                &self.root.path().join("store"),
+                &RepoId::parse("acme/widget").unwrap(),
+                &workspace,
+            );
+            super::super::supervisor_socket::bind(&socket)
+                .await
+                .expect("bind the stopped workspace's supervisor socket")
+        }
+
         /// Where `name`'s image lock is: the one its forks, reseeds and lands take.
         fn image_lock(&self, name: &WorkspaceName) -> PathBuf {
             crate::storage::StorageLayout::with_mount_root(
@@ -2767,7 +2802,11 @@ fn main() {
         fs::write(mount.join("target/debug/.cargo-lock"), b"").unwrap();
         let quiet = scratch
             .volumes
-            .quiesce(scratch.landing(&topic_checkout), main_checkout)
+            .quiesce(
+                scratch.landing(&topic_checkout),
+                scratch.stopped(&topic_checkout).await,
+                main_checkout,
+            )
             .await
             .unwrap()
             .expect("the supervised jobs and Nx state are quiet");
@@ -2858,7 +2897,11 @@ fn main() {
         let (topic_checkout, _, mount) = scratch.linked_checkout("topic", 1);
         let quiet = scratch
             .volumes
-            .quiesce(scratch.landing(&topic_checkout), main_checkout)
+            .quiesce(
+                scratch.landing(&topic_checkout),
+                scratch.stopped(&topic_checkout).await,
+                main_checkout,
+            )
             .await
             .unwrap()
             .expect("the landing volume was quiet");
@@ -3048,7 +3091,11 @@ fn main() {
         let (topic_checkout, topic, _) = scratch.linked_checkout("topic", 1);
         let quiet = scratch
             .volumes
-            .quiesce(scratch.landing(&topic_checkout), main_checkout.clone())
+            .quiesce(
+                scratch.landing(&topic_checkout),
+                scratch.stopped(&topic_checkout).await,
+                main_checkout.clone(),
+            )
             .await
             .unwrap()
             .expect("nothing holds the landing volume");
@@ -3101,7 +3148,11 @@ fn main() {
         let (other_checkout, other, _) = scratch.linked_checkout("other", 3);
         scratch
             .volumes
-            .quiesce(scratch.landing(&other_checkout), main_checkout)
+            .quiesce(
+                scratch.landing(&other_checkout),
+                scratch.stopped(&other_checkout).await,
+                main_checkout,
+            )
             .await
             .unwrap()
             .expect("nothing holds the landing volume");
@@ -3533,7 +3584,11 @@ fn main() {
 
         let quiet = scratch
             .volumes
-            .quiesce(scratch.landing(&topic_checkout), main_checkout.clone())
+            .quiesce(
+                scratch.landing(&topic_checkout),
+                scratch.stopped(&topic_checkout).await,
+                main_checkout.clone(),
+            )
             .await
             .unwrap()
             .expect("nothing holds the landing volume");
@@ -3683,7 +3738,11 @@ fn main() {
         let (topic_checkout, topic, _) = scratch.linked_checkout("topic", 1);
         let quiet = scratch
             .volumes
-            .quiesce(scratch.landing(&topic_checkout), main_checkout.clone())
+            .quiesce(
+                scratch.landing(&topic_checkout),
+                scratch.stopped(&topic_checkout).await,
+                main_checkout.clone(),
+            )
             .await
             .unwrap()
             .expect("nothing holds the landing volume");

@@ -562,6 +562,7 @@ fn gc_candidate_failure_is_fatal(error: &ApfsStorageError) -> bool {
         } => gc_candidate_failure_is_fatal(primary) || gc_candidate_failure_is_fatal(cleanup),
         ApfsStorageError::Apfs(_)
         | ApfsStorageError::Io { .. }
+        | ApfsStorageError::BuildVolumeHeld { .. }
         | ApfsStorageError::Host(_)
         | ApfsStorageError::Quarantined { .. } => false,
         ApfsStorageError::CapacityNotGrowing { .. }
