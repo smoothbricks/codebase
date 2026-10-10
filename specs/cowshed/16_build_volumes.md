@@ -476,7 +476,6 @@ allocation gives a per-image net estimate, not a container-free-space measuremen
   filesystem readers; then replace the volume, report deleted allocation and verify dirty tracked source, untracked
   files, Git state and index bytes unchanged. A stale source seed is used without refreshing or mounting it. Focused
   directory tests refuse absent seeds, unfinished lifecycle journal entries, held image locks and stale plans.
-
 ## Fork: `cowshed fork [<src>] <ws>`
 
 A fork names its source: absent `<src>` defaults to main; an explicit source may be any session or integration
@@ -671,48 +670,14 @@ closed only for as long as it was before:
 Entries cross from one image to another, so they are copied, never cloned. Their volume is the delta of what other lands
 and the target ran since the landing workspace forked, which is what a fork would otherwise rebuild. Copies run before
 the target's database is closed and cost no window; a failed copy (a full volume) stops the carry, keeps every entry
-carried until then, and is reported (`carried.stopped`); the land still succeeds. Carry preserves the cache entry's
-bytes, mode and times exactly; a later restore by the checkout's pinned Nx stamps workspace outputs with the restore
-time so mtime-based consumers invalidate. A landing Nx root with no task database never ran Nx, and it is initialized
-after build-state admission and before checks/fast-forward: every detected Nx root of the landing workspace is
-initialized before the step 2 check and before the fast-forward (step 3), in the legacy and no-check lands alike. An
-initialization failure, or a found Nx version other than 23.2.1, is recorded as `carried.stopped` naming the found and
-23.2.1 versions or the failure; the land continues, and its checks, fast-forward and adoption policy are unchanged. One
-`cache_adapter.js` loads the checkout's own exact Nx 23.2.1 and constructs its internal `DbCache` with
-`{nxCloudRemoteCache: null, skipRemoteCache: true}`. That constructor creates the complete database schema Nx itself
-defines. The adapter never invokes remote initialization, and Nx-entry carry writes no DDL and no `VACUUM`, and copies
-no schema, header, journal, version or history metadata from the target. A carry requires an existing Nx-initialized v3
-database and refuses one it cannot recognize. Nx's own get, restore, store and eviction of the carried entries are
-proved through that same pinned `DbCache` (`native/cache/cache.rs`); a changed schema or version is refused, never
-guessed or silently defaulted.
-
-An unavailable Nx cache stops only Nx-entry carry; the independent code-graph index carry below still runs.
-
-One exception remains: a minimal v3 SQL row publication for `cache_outputs` and `task_details`, the two tables the carry
-places rows into. It recognizes exactly those two tables, with their constraints and foreign key as Nx 23.2.1 defines
-them, and refuses loudly, naming the database, on any change to either. Its rows are inserted after the files, in the
-one transaction described above. Measured against a staged fixture (output 4 B plus terminal 8 B, 12 B staged), the
-native APIs each fail, so none is used for publication:
-
-- `applyRemoteCacheResults` with no outputs records 8 B, not 12 B, while keeping the staged inode.
-- With outputs it records 12 B, but also writes the 4 B restored output and the 8 B terminal again, a second copy.
-- With `workspaceRoot` equal to the staged directory it deletes the staged output and then records 8 B; it is neither a
-  rename nor a no-op.
-- `put([], ...)` deletes the staged output and records 8 B.
-
-The actual NxCache method enumeration has no `register(existing-dir, size)`. The SQL row publication is therefore the
-approved minimal measured exception: it preserves the staged file's size, `created_at` and `accessed_at`, and needs no
-second file copy. No timings are claimed beyond these counts. Selection stays All; the carry adds no graph pass and no
-waiver.
+carried until then, and is reported (`carried.stopped`); the land still succeeds. A landing Nx state with no task
+database never ran Nx, and first takes a copy of the target's database without its cache rows (`VACUUM INTO`, one
+consistent snapshot), so the carry has a schema Nx wrote to index into; one whose database has another name runs an Nx
+of another schema and gets nothing. A carry that crashes leaves only `.carry/`, which the next stage on that volume
+deletes before it starts.
 
 - **Enforced by**: a real-APFS test in which one workspace lands and warms an Nx task in main, a second, forked before
-  that land and changing nothing the task hashes, lands without running it, and a fork of main hits the task; a
-  real-APFS test in which a workspace forks before main indexes, lands, and main's `.codegraph/codegraph.db` on the
-  adopted volume opens with main's rows; a unit test in which the copy includes rows still in the target's write-ahead
-  log, a landing database of its own is kept, and a target without one gives none; initialization tests through the
-  pinned `DbCache` (creation, get, restore, store, eviction) and refusals of a changed schema or version; indexed
-  row-publication plans; unchanged/rewritten/evicted/late-row tests; and byte, mode, time and one-walk/two-phase copy
-  receipts.
+  that land and changing nothing the task hashes, lands without running it, and a fork of main hits the task.
 
 ### Rebase carry
 
@@ -778,10 +743,9 @@ above either reserve. A sparse RAW image's virtual free space does not prove its
 filesystem object is charged and both free-space values checked before its write. A failed store-space query stops the
 carry, never falls back to image space alone. A cache row understating a file's size cannot hide an unbounded data copy.
 Files are walked once, not sized in a preliminary second traversal; regular-file reads are pinned and length-limited,
-growth or shrinkage refuses the partial entry, and metadata is copied through those same open file descriptors, never by
-reopening a possibly replaced path. Directory metadata is restored after children. Hitting a bound stops with
-`carried.stopped`, keeps whole entries already carried, removes the partial entry, and leaves the rebase successful.
-Moving staged entries at commit consumes neither a second copy allowance nor another file walk.
+growth or shrinkage refuses the partial entry, and directory metadata is restored after children. Hitting a bound stops
+with `carried.stopped`, keeps whole entries already carried, removes the partial entry, and leaves the rebase
+successful. Moving staged entries at commit consumes no second copy allowance.
 
 A skip deletes what was staged and names the side, the database and each process with its pid and command; the rebase
 itself has happened and stands. A copy that fails stops the carry and keeps what was carried until then, as at a land.
@@ -1051,39 +1015,15 @@ An Nx task hash must not change between checkouts of the same tree.
   that reaches the project, depending on whether a build ran in that checkout.
 - A target that runs no package from `node_modules` declares `externalDependencies: []`; otherwise a lockfile edit
   re-keys it.
-- **Enforced by**: step 2b of every land (100% hits on main) and the fork test (100% hits in a fresh fork). A
-  project-contained developer-link declaration selects its directory in the current checkout and refuses physical
-  symlink escapes, including an escaping existing ancestor of a not-yet-existing declared directory. Genuine sibling
-  declarations retain their main-checkout anchor. Neither the containment nor the sibling rule grants the main checkout
-  or an ancestor dependency store to a cowshed sandbox. Genuine sibling links already carried by a fork retain their
-  absolute targets; the mint grants reads only on their captured canonical sibling targets, never a target named by a
-  later workspace-mutated symlink. Live developer package links, including owned relative aliases and the executable
-  aliases that select those packages, are restored by cowshed across installs under the exact managed-command coverage
-  of 15_capabilities.md ("Bootstrap executables"). An absolute manager bypass receives terminal cleanup only. Cowshed's
-  job-time restoration never broadens the mint's read authority; a later foreign target remains denied. A workspace
-  whose marker predates the owned-link revision has its absolute owned aliases into the donor root re-spelled relative
-  to its own tree once, under the admission that verifies the marker (01_storage.md, "In-image marker"). Relative
-  escaping job links and the mint's read grants are not touched by that migration.
+- **Enforced by**: step 2b of every land (100% hits on main) and the fork test (100% hits in a fresh fork).
 
 A project-contained developer-link declaration selects its directory in the current checkout and refuses physical
 symlink escapes, including an escaping existing ancestor of a not-yet-existing declared directory. Genuine sibling
-declarations retain their main-checkout anchor. An explicit declaration naming an available checkout is authoritative:
-it repoints an existing external binding, including a developer's previous choice. A declaration whose checkout is
-absent, or whose directory has no `package.json`, is reported as unavailable: its installed version and any existing
-undeclared binding keep their captured bytes. Neither the containment nor the sibling rule grants the main checkout or
-an ancestor dependency store to a cowshed sandbox. Genuine sibling links already carried by a fork retain their absolute
-targets; the mint grants reads only on their captured canonical sibling targets, never a target named by a later
-workspace-mutated symlink. Live developer package links, including owned relative aliases and the executable aliases
-that select those packages, are restored by cowshed across installs under the exact managed-command coverage of
-15_capabilities.md ("Bootstrap executables"). An absolute manager bypass receives terminal cleanup only. Cowshed's
-job-time restoration never broadens the mint's read authority; a later foreign target remains denied. A workspace whose
-marker predates the owned-link revision has its absolute owned aliases into the donor root re-spelled relative to its
-own tree once, under the admission that verifies the marker (01_storage.md, "In-image marker"). Relative escaping job
-links and the mint's read grants are not touched by that migration.
+declarations retain their main-checkout anchor. Neither the containment nor the sibling rule grants the main checkout or
+an ancestor dependency store to a cowshed sandbox.
 
 A project-contained developer alias is a relative link within its checkout. A source-image fork therefore selects its
-own copy without borrowing its donor's tree. Ordinary activation normalizes absolute aliases into this checkout. Genuine
-sibling links retain their distinct host-local authority.
+own copy without borrowing its donor's tree. Genuine sibling links retain their distinct host-local authority.
 
 ### The adoption needs the target's Nx database closed
 
