@@ -471,6 +471,9 @@ describe('Cowshed attachment Node-API boundary', () => {
     `;
     const node = Bun.spawn(['node', '--input-type=module', '--eval', controller], {
       cwd: join(import.meta.dir, '..'),
+      // Drops only the outer Nx's FORCE_COLOR: with NO_COLOR also set, Node warns on stderr, which the
+      // assertion below requires empty. Same environment as nodeFixtureEnvironment in native.test.ts.
+      env: Object.fromEntries(Object.entries(process.env).filter(([name]) => name !== 'FORCE_COLOR')),
       stdin: 'ignore',
       stdout: 'pipe',
       stderr: 'pipe',

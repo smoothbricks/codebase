@@ -33,6 +33,19 @@ function requireCowshedError(error: unknown, code: ErrorCode): CowshedError {
 
 const moduleUrl = pathToFileURL(join(import.meta.dir, '..', 'dist', 'ts', 'index.js')).href;
 
+/**
+ * The environment a scripted Node fixture runs under: `base` without FORCE_COLOR. An outer Nx exports
+ * FORCE_COLOR, and Node warns on stderr under its own pid when FORCE_COLOR and NO_COLOR are both set.
+ * These fixtures' stdout is machine output and they assert stderr is empty, so FORCE_COLOR goes;
+ * NO_COLOR keeps its intent and every other variable passes through. A nested Node peer inherits this
+ * environment from its controller, so the whole chain sees one environment.
+ */
+function nodeFixtureEnvironment(
+  base: Readonly<Record<string, string | undefined>> = process.env,
+): Record<string, string | undefined> {
+  return Object.fromEntries(Object.entries(base).filter(([name]) => name !== 'FORCE_COLOR'));
+}
+
 /** What the scripted job wrote to stdout; `job.logs` and `job.tail` serve it. */
 const scriptedStdout = 'prefix\nrest\n';
 
@@ -249,6 +262,7 @@ async function scriptedController(client: string): Promise<ScriptedRun> {
   `;
   const node = Bun.spawn(['node', '--input-type=module', '--eval', controller], {
     cwd: join(import.meta.dir, '..'),
+    env: nodeFixtureEnvironment(),
     stdin: 'ignore',
     stdout: 'pipe',
     stderr: 'pipe',
@@ -322,6 +336,7 @@ describe('Cowshed Node-API bindings', () => {
     `;
     const node = Bun.spawn(['node', '--input-type=module', '--eval', script], {
       cwd: join(import.meta.dir, '..'),
+      env: nodeFixtureEnvironment(),
       stdin: 'ignore',
       stdout: 'pipe',
       stderr: 'pipe',
@@ -775,6 +790,7 @@ async function scriptedPair(
   `;
   const node = Bun.spawn(['node', '--input-type=module', '--eval', controller], {
     cwd: join(import.meta.dir, '..'),
+    env: nodeFixtureEnvironment(),
     stdin: 'ignore',
     stdout: 'pipe',
     stderr: 'pipe',
@@ -789,3 +805,11 @@ async function scriptedPair(
   ]);
   return { exitCode, stdout: stdout.trim(), stderr };
 }
+
+describe('Node fixture environment', () => {
+  it('drops only FORCE_COLOR, so NO_COLOR and every other variable reach the fixture', () => {
+    expect(
+      nodeFixtureEnvironment({ FORCE_COLOR: 'true', NO_COLOR: '1', PATH: '/usr/bin', CARGO_HOME: '/cargo' }),
+    ).toEqual({ NO_COLOR: '1', PATH: '/usr/bin', CARGO_HOME: '/cargo' });
+  });
+});
