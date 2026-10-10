@@ -143,13 +143,14 @@ Throws and rejected thenables use the existing exception path. Because automatic
 `Result | Promise<Result>` behavior cannot alter the public Promise API's microtask scheduling. No performance magnitude
 is asserted here.
 
-## Shipped clean cutover: registered structured vocabulary
+## Vocabulary registry and Op-local messages
 
-This section is the authoritative compiler/runtime ABI. It replaces the former Op-local `u16` representation rather than
-layering another ID space over it. The clean cutover removes the per-Op template table and its private lane after every
-caller uses the registration ABI. No compatibility alias or dual write survives the cutover.
+`packages/lmao/src/lib/vocabularyRegistry.ts` accepts schema version `1` with `idAlgorithm: 'sha256-24-v1'`. It
+validates each fragment's arrays, record bytes and content hash before returning a runtime-owned vocabulary binding. The
+registry rejects incompatible algorithms and distinct records that share an ID.
 
-### Checker recognition and source policy
+The compiler's checker-proved Op-local literal log templates still use private `u16` message IDs and decode their
+strings at cold conversion. Span names remain strings.
 
 The compiler recognizes a call by checker semantics, not by the spelling `ctx.log` or by containment in `defineOp`. The
 resolved receiver must be LMAO `SpanLogger`/`GeneratedSpanLogger`, and the invoked `info`/`debug`/`warn`/`error`/`trace`
