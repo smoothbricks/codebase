@@ -5826,6 +5826,12 @@ impl Vm {
     /// Begin an inactive speculation window over an admitted image span.
     /// An active window must be ended first; refusal changes no journal state.
     ///
+    /// The window's change-flag savepoint is backed here. A memory that cannot
+    /// back it does not refuse the opening: the window opens already refused
+    /// with `OutOfMemory`, so its first write answers that refusal before it
+    /// writes, as any refused window does, and ending it clears the refusal.
+    /// Opening a window therefore fails only on its arguments.
+    ///
     /// ```
     /// use columine_types::types::ErrorCode;
     /// let mut vm = columine_vm::vm::Vm::default();
@@ -5839,20 +5845,15 @@ impl Vm {
         }
         let state_size = u32::try_from(state.len()).map_err(|_| ErrorCode::InvalidState)?;
         let (slots, _) = state_init::state_geometry(state)?;
-        // The window's change-flag savepoint is backed before any journal
-        // state changes, so a refusal leaves the journal as it was. An
-        // inactive window holds no saved flags.
         let u = &mut self.undo;
         debug_assert!(u.saved_change_flags.is_empty());
-        u.saved_change_flags
-            .try_reserve(slots as usize + 1)
-            .map_err(|_| ErrorCode::OutOfMemory)?;
+        let backed = u.saved_change_flags.try_reserve(slots as usize + 1).is_ok();
         u.enabled = true;
         u.entries.clear();
         u.redo.clear();
         u.redo_active = false;
         u.delta_count = 0;
-        u.refused = None;
+        u.refused = (!backed).then_some(ErrorCode::OutOfMemory);
         u.export_start = 0;
         u.export_count = 0;
         u.export_overflow = false;

@@ -391,14 +391,18 @@ fn paired_window_admits_the_redo_lane_and_exports_a_replayable_range() {
     let mut state = init(&prog);
     let before = state.clone();
     let mut vm = Vm::default();
-    // A window backs its change-flag savepoint before it opens: without the
-    // memory for it, opening is refused and the journal is unchanged.
-    let closed = vm.undo_status();
+    // A window whose change-flag savepoint the memory cannot back opens
+    // already refused with OutOfMemory: its first write answers it before
+    // writing, and ending the window clears it.
+    assert_eq!(Ok(()), without_memory(|| vm.undo_enable(&state)));
+    assert_eq!(Some(ErrorCode::OutOfMemory), vm.undo_refusal());
     assert_eq!(
-        Err(ErrorCode::OutOfMemory),
-        without_memory(|| vm.undo_enable(&state))
+        ErrorCode::OutOfMemory,
+        upsert(&mut vm, &mut state, 42, 100, true)
     );
-    assert_eq!(closed, vm.undo_status());
+    assert_eq!(before, state, "the refused window wrote nothing");
+    vm.undo_commit();
+    assert_eq!(None, vm.undo_refusal());
     vm.undo_enable(&state).expect("undo window opens");
 
     assert_eq!(ErrorCode::Ok, upsert(&mut vm, &mut state, 42, 100, true));
