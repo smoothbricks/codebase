@@ -74,6 +74,13 @@ pub(crate) struct CapacityScratch {
     demand: Vec<Demand>,
     touched: Vec<u32>,
     operands: Vec<u32>,
+    /// The reduce code `effects` was decoded from. A batch over the same
+    /// code replays them: one comparison instead of decoding every
+    /// instruction again.
+    program: Vec<u8>,
+    /// Tier 1's capacity effects of `program` in program order, each with
+    /// whether it runs over the whole batch (outside every `FLAT_MAP`).
+    effects: Vec<(Effect, bool)>,
     /// Tier 2's `(outer, inner)` keys of one nested slot.
     pairs: Vec<(u32, u32)>,
     /// The tier-3 state copy.
@@ -144,7 +151,7 @@ impl Domain<'_> {
 }
 
 /// A capacity effect of one instruction, as admission reads it.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum Effect {
     /// One new key per execution whose key cell the slot lacks.
     Key { slot: u32, col: u32 },
@@ -507,7 +514,9 @@ impl CapacityScratch {
         )?;
 
         // Tier 1: the row-count bound, in program order.
-        let mut operands = core::mem::take(&mut self.operands);
+        if self.program != code {
+            self.decode(code)?;
+        }
         let tier1 = Tier1 {
             state,
             cols,
@@ -515,30 +524,26 @@ impl CapacityScratch {
             slots,
             scratch_card: scratch_members(env),
         };
-        let demand = &mut self.demand;
-        let touched = &mut self.touched;
-        let walked = walk(code, Domain::TOP, &mut operands, &mut |op, o, domain| {
-            let mut ok = Some(());
-            effects(op, o, &mut |effect| {
-                if ok.is_some() {
-                    ok = tier1.account(effect, domain, demand, touched);
-                }
-            });
-            ok
-        });
-        self.operands = operands;
-        walked?;
+        for &(effect, whole_batch) in &self.effects {
+            tier1.account(effect, whole_batch, &mut self.demand, &mut self.touched)?;
+        }
 
         // Working memory: a TTL slot's planner storage follows its rows. A
         // TTL slot whose rows have no row-free bound is left to the dry run,
-        // which grows that storage before the batch's first write.
+        // which grows that storage before the batch's first write. The same
+        // pass checks the bound: every early answer is a dry run, so the
+        // order of the two decisions cannot change the admission.
         self.scratch = ScratchDemand::default();
+        let mut cleared = true;
         for index in 0..self.touched.len() {
             let slot = self.touched[index];
             let d = self.demand[usize::try_from(slot).ok()?];
+            if d.opaque {
+                return Some(Admission::DryRun);
+            }
             let meta = slot_meta(state, slot)?;
             if meta.slot_type() == SlotType::Bitmap {
-                if d.rows || d.opaque {
+                if d.rows {
                     return Some(Admission::DryRun);
                 }
                 let mut patch =
@@ -561,7 +566,7 @@ impl CapacityScratch {
                 self.scratch.bitmap.get_or_insert_default().widen(patch);
             }
             if meta.has_ttl() {
-                if d.rows || d.opaque {
+                if d.rows {
                     return Some(Admission::DryRun);
                 }
                 self.scratch.ttl.widen(crate::ttl_plan::plan_demand(
@@ -570,16 +575,7 @@ impl CapacityScratch {
                     d.units.max(d.touches),
                 ));
             }
-        }
-
-        let mut cleared = true;
-        for index in 0..self.touched.len() {
-            let slot = self.touched[index];
-            let d = self.demand[usize::try_from(slot).ok()?];
-            if d.opaque {
-                return Some(Admission::DryRun);
-            }
-            if d.rows || !fits(state, slot, &d)? {
+            if d.rows || !fits(state, slot, &meta, &d)? {
                 cleared = false;
             }
         }
@@ -592,16 +588,46 @@ impl CapacityScratch {
         for index in 0..self.touched.len() {
             let slot = self.touched[index];
             let d = self.demand[usize::try_from(slot).ok()?];
-            if !d.rows && fits(state, slot, &d)? {
+            let meta = slot_meta(state, slot)?;
+            if !d.rows && fits(state, slot, &meta, &d)? {
                 continue;
             }
             let probed = self.probe(state, code, cols, batch_len, slot, d)?;
-            if probed.opaque || !fits(state, slot, &probed)? {
+            if probed.opaque || !fits(state, slot, &meta, &probed)? {
                 return Some(Admission::DryRun);
             }
         }
         self.counts.probed += 1;
         Some(Admission::Fits)
+    }
+
+    /// Decode `code`'s tier-1 effects into `effects` and remember `code`.
+    /// An undecodable program caches nothing, so every batch over it is
+    /// left to the dry run, which reports what execution would.
+    fn decode(&mut self, code: &[u8]) -> Option<()> {
+        self.program.clear();
+        self.effects.clear();
+        let mut operands = core::mem::take(&mut self.operands);
+        let out_of_memory = &mut self.out_of_memory;
+        let decoded = &mut self.effects;
+        let walked = walk(code, Domain::TOP, &mut operands, &mut |op, o, domain| {
+            let mut ok = Some(());
+            effects(op, o, &mut |effect| {
+                if ok.is_some() {
+                    ok = Self::room(out_of_memory, decoded, 1)
+                        .map(|()| decoded.push((effect, domain.depth == 0)));
+                }
+            });
+            ok
+        });
+        self.operands = operands;
+        if walked.is_none() {
+            self.effects.clear();
+            return None;
+        }
+        Self::room(&mut self.out_of_memory, &mut self.program, code.len())?;
+        self.program.extend_from_slice(code);
+        Some(())
     }
 
     /// Recount `target`'s demand from the rows. Algebra bounds carry over
@@ -796,8 +822,7 @@ fn slot_meta(state: &[u8], slot: u32) -> Option<SlotMetaView> {
 
 /// Whether `d` fits `slot` as the slot is now. A TTL slot's eviction index
 /// holds one entry per live key, so its new keys must fit there too.
-fn fits(state: &[u8], slot: u32, d: &Demand) -> Option<bool> {
-    let meta = slot_meta(state, slot)?;
+fn fits(state: &[u8], slot: u32, meta: &SlotMetaView, d: &Demand) -> Option<bool> {
     if meta.has_ttl()
         && u64::from(meta.eviction_index_size(state)) + d.units
             > u64::from(meta.eviction_index_capacity(state))
@@ -806,11 +831,11 @@ fn fits(state: &[u8], slot: u32, d: &Demand) -> Option<bool> {
     }
     Some(match meta.slot_type() {
         SlotType::HashMap => {
-            let table = bind_slot_map(&meta);
+            let table = bind_slot_map(meta);
             u64::from(table.size(state)) + d.units <= u64::from(table.max_load())
         }
         SlotType::HashSet => {
-            let table = bind_slot_set(&meta);
+            let table = bind_slot_set(meta);
             u64::from(table.size(state)) + d.units <= u64::from(table.max_load())
         }
         SlotType::StructMap => {
@@ -830,7 +855,7 @@ fn fits(state: &[u8], slot: u32, d: &Demand) -> Option<bool> {
             u64::from(map.size(state)) + d.units <= u64::from(max_load_for_cap(map.capacity))
         }
         SlotType::Bitmap => {
-            let storage = get_bitmap_storage(&meta);
+            let storage = get_bitmap_storage(meta);
             let image = storage.serialized_data(state).ok()?;
             u64::from(meta.size(state)) + d.units <= u64::from(meta.capacity)
                 && patched_len_bound(image, d.units, d.touches)?
@@ -940,8 +965,8 @@ impl Tier1<'_> {
     /// under `FLAT_MAP` the cells of its key column (distinct keys are bounded
     /// by the cells naming them; executions are not). `None` when no
     /// row-free bound exists.
-    fn executions(&self, domain: &Domain<'_>, col: Option<u32>) -> Option<u64> {
-        if domain.depth == 0 {
+    fn executions(&self, whole_batch: bool, col: Option<u32>) -> Option<u64> {
+        if whole_batch {
             Some(u64::from(self.batch_len))
         } else {
             col.map(|col| cells(self.cols, col))
@@ -961,7 +986,7 @@ impl Tier1<'_> {
     fn account(
         &self,
         effect: Effect,
-        domain: &Domain<'_>,
+        whole_batch: bool,
         demand: &mut [Demand],
         touched: &mut Vec<u32>,
     ) -> Option<()> {
@@ -999,10 +1024,10 @@ impl Tier1<'_> {
         }
         let bound = match effect {
             Effect::Key { col, .. } | Effect::Routed { col, .. } => {
-                self.executions(domain, Some(col))
+                self.executions(whole_batch, Some(col))
             }
-            Effect::Pair { col1, .. } => self.executions(domain, Some(col1)),
-            _ => self.executions(domain, None),
+            Effect::Pair { col1, .. } => self.executions(whole_batch, Some(col1)),
+            _ => self.executions(whole_batch, None),
         };
         let d = &mut demand[usize::try_from(slot).ok()?];
         mark(touched, d, slot);
@@ -1018,7 +1043,7 @@ impl Tier1<'_> {
             (Effect::Arena { col, .. }, _) => {
                 // Rows are bounded like any key; the array bytes need rows.
                 d.rows = true;
-                if let Some(n) = self.executions(domain, Some(col)) {
+                if let Some(n) = self.executions(whole_batch, Some(col)) {
                     d.units = d.units.saturating_add(n);
                 }
             }

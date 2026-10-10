@@ -138,8 +138,12 @@ impl TtlBatchScratch {
     }
 
     /// Back the largest plan a batch can build, before the batch's first
-    /// write; each of its plans then fits the storage it finds.
+    /// write; each of its plans then fits the storage it finds. A batch that
+    /// touches no TTL slot builds no plan, so its empty demand backs nothing.
     pub(crate) fn reserve_for(&mut self, demand: TtlPlanDemand) -> Result<(), ErrorCode> {
+        if demand == TtlPlanDemand::default() {
+            return Ok(());
+        }
         back(&mut self.mutations, demand.mutations)?;
         self.reserve(demand.originals, demand.mutations)
     }

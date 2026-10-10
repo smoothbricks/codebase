@@ -377,6 +377,43 @@ fn each_tier_answers_only_what_the_tier_before_cannot() {
         without_memory(|| vm.execute_batch(&mut state, &prog, &cols, 1))
     );
     assert_eq!(Some(30), CheckedMap::bind(&state, 1).unwrap().get(3));
+
+    // One VM admits each program by its own instructions: two programs of
+    // the same shape and length that upsert different maps are not mistaken
+    // for each other, so a batch into the full map is refused unwritten
+    // after one into the empty map was cleared.
+    let two_maps = [
+        vec![Opcode::SlotDef as u8, 0, SlotType::HashMap as u8, 16, 0],
+        vec![Opcode::SlotDef as u8, 1, SlotType::HashMap as u8, 16, 0],
+    ]
+    .concat();
+    let into_empty = program(
+        2,
+        2,
+        &two_maps,
+        &[Opcode::BatchMapUpsertLast as u8, 0, 0, 1],
+    );
+    let into_full = program(
+        2,
+        2,
+        &two_maps,
+        &[Opcode::BatchMapUpsertLast as u8, 1, 0, 1],
+    );
+    let mut state = init(&into_full);
+    let mut key = 1;
+    let mut filler = Vm::default();
+    while upsert(&mut filler, &mut state, &into_full, &[key]) == OK {
+        key += 1;
+    }
+    let mut vm = Vm::default();
+    assert_eq!(OK, upsert(&mut vm, &mut state, &into_empty, &[key]));
+    let before = state.clone();
+    assert_eq!(
+        NEEDS_GROWTH,
+        upsert(&mut vm, &mut state, &into_full, &[key + 1])
+    );
+    assert_eq!(before, state);
+    assert_eq!(1, needs_growth_slot());
 }
 
 /// A state a host supplies (a restored checkpoint, an uploaded image) is
