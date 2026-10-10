@@ -212,6 +212,20 @@
         "@smoothbricks/validation": "workspace:*",
       },
     },
+    "packages/nx-cache-server": {
+      "name": "@smoothbricks/nx-cache-server",
+      "version": "0.1.0",
+      "bin": {
+        "nx-cache-server": "./dist/ts/main.js",
+      },
+      "dependencies": {
+        "tslib": "^2.8.1",
+      },
+      "devDependencies": {
+        "@smoothbricks/lmao": "workspace:*",
+        "typia": "14.0.6",
+      },
+    },
     "packages/nx-plugin": {
       "name": "@smoothbricks/nx-plugin",
       "version": "0.4.27-next.0",
@@ -1765,6 +1779,8 @@
     "@smoothbricks/lmao-ttsc": ["@smoothbricks/lmao-ttsc@workspace:packages/lmao-ttsc"],
 
     "@smoothbricks/money": ["@smoothbricks/money@workspace:packages/money"],
+
+    "@smoothbricks/nx-cache-server": ["@smoothbricks/nx-cache-server@workspace:packages/nx-cache-server"],
 
     "@smoothbricks/nx-plugin": ["@smoothbricks/nx-plugin@workspace:packages/nx-plugin"],
 

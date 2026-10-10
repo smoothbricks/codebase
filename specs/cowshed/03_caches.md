@@ -412,6 +412,78 @@ surface named explicitly in 04_sandbox.md: the unsandboxed daemon reads sources 
 a sandboxed client's request, accepted under the same threat model that already concedes layer-3 poisoning (below)
 because it adds immediacy, not new reach, while the store's write surface strictly narrows.
 
+### Nx accepted-task artifact service
+
+Nx's live database and local cache remain private to each checkout/build volume. Accepted task archives are a separate
+host-owned store, not a shared `.nx` directory, blob CAS, or Cargo warm volume. Cowshed reuses the public
+`@smoothbricks/nx-cache-server` Bun server and its stock `GET`/`PUT /v1/cache/{hash}` protocol. Each project has one
+backend listener and one flat entries directory under cowshed's host cache directory; the gateway maps project identity
+to that backend. A hash in one project cannot name another project's archive.
+
+The gateway service owns the backend lifecycle, outside every workspace sandbox, using an installed foreground
+executable rather than a workspace's source files. One process exclusively owns each entries directory. Its
+configuration and labelled read/write bearer principals are host-owned; no repository, workspace child environment, or
+sandbox receives a backend secret or filesystem grant. The host-owned backend necessarily holds its own host
+credentials. Clients receive only their own gateway authority (05_gateway.md). Normal iteration always reads accepted
+project results with read-only authority. Only an accepted landing may publish its successful current task hashes,
+including existing local hits without rebuilding, under temporary gateway write authority; exact-head/task-hash
+eligibility belongs to 05_gateway.md and 16_build_volumes.md. There is no scratch store. Read-only authority denies
+publication, not necessarily archive creation or an attempted PUT by the stock client: measure that cost separately, and
+never describe a server-side 403 as zero upload overhead.
+
+The installed gateway starts the backend's foreground executable with `--exit-on-stdin-eof` and retains the write end of
+its stdin pipe for the child's lifetime. On hard parent death the kernel closes that pipe, and EOF drains and stops the
+backend. Normal standalone invocation without the flag keeps signal supervision. EOF changes lifecycle only; it is not
+the store-exclusion mechanism.
+
+The backend opens `<project>/entries/.owner.lock` and takes a nonblocking exclusive kernel `flock` (`LOCK_EX | LOCK_NB`)
+through a minimal Bun FFI binding to libc, before any staging reclamation. The lock file is persistent and is never
+unlinked; no stale-PID or exclusive-create substitute exists. The backend holds the lease through listener, handler, and
+publication drain until stop; hard process death releases it in the kernel. A busy lock is a typed store-locked startup
+refusal before listening. Any other errno, or unavailable FFI, fails startup loudly with no fallback. Normal standalone
+mode takes the same lease. A replacement backend cannot open or reclaim the store until its predecessor exits and
+releases the lock.
+
+The server treats archives as opaque binary bytes in Nx's native format: no unpacking, repacking, database import, or
+whole-history copy. Publication streams into `.staging` on the same filesystem, verifies the declared positive byte
+length, then atomically hard-links to the final task key without replacement. Concurrent same-key writers produce one
+200 and conflicts produce 409, preserving the winner's whole archive. Different keys proceed independently. Read-only
+PUT is 403; missing/evicted GET is 404; GET success is 200 with `application/octet-stream` as a standard chunked
+complete binary body; a pinned GET stream uses chunked HTTP framing with archive bytes unchanged. Authentication failure
+is 401 with exactly `text/plain`. Successful PUT requires a positive `Content-Length` and returns 200 (the native Nx
+client and the current official Nx self-hosted caching OpenAPI both use 200). Failed or interrupted uploads never become
+cache hits. Startup removes abandoned staging files and reports the count; graceful stop drains requests, and hard death
+leaves only reclaimable staging.
+
+Retention reuses filesystem SIEVE: insertion order is mtime, `atime > mtime` is the visited bit, clearing restores atime
+to mtime, and a sibling `sieve.hand` persists the cursor. A measured real APFS GET left atime unchanged even after
+clearing it to mtime; relying on mount access-clock behavior would turn SIEVE into FIFO. Therefore a successful GET
+explicitly marks the opened inode's visited bit when clear, preserving its modification-time cursor through `utimes`; it
+never retimes a path that could name a replacement inode. No shared live cache database is introduced. Streaming stages
+proceed in parallel. Complete staged values enter one serialized publication section: never-replace hard link, then
+SIEVE sweep, then successful completion. No publication interleaves a sweep's listing and cap enforcement. A sweep also
+runs before listening. Each successful commit restores the configured `capBytes` sum of published archive lengths before
+replying 200. `maxBytes` independently bounds one upload and cannot exceed `capBytes`.
+
+The sweep never evicts the archive its own commit just published. The protected just-linked key remains in used-byte
+accounting, while other keys undergo SIEVE. Each PUT 200 still has its own archive immediately retrievable. There is no
+capacity enlargement or bypass.
+
+Before reading an authenticated writer's body, the server reserves its positive declared length from an independent
+staging budget, also `capBytes`. If outstanding reservations would exceed that budget it refuses 403 before streaming;
+there is no admission queue or retry service. The reservation covers streaming and completed uploads awaiting commit,
+and is released after cleanup. Live archives and in-flight staging each have their own logical bound, not one combined
+disk cap; filesystem allocation and metadata are measured separately. Startup reclaims abandoned staging. Eviction and
+reclamation report bytes/counts and failures, never silent success. A failed staging cleanup retains its reservation and
+reports the path/reason; it is not reusable budget. Restart reclaims those files before accepting requests and fails
+closed if reclamation fails. This is ownership of retained bytes, not a background retry path. An evicted archive
+remains an honest miss, and the gateway's post-adoption check requires all accepted cacheable hashes to hit
+(16_build_volumes.md).
+
+The package follows the repository's public-package release conventions (`npm:public`, generated conventional-commit
+versions, normal build/release targets). Existing external consumers retain their source until a real published
+dependency is available; that cutover removes the old source rather than leaving two permanent implementations.
+
 ## Convention table
 
 Cache classification is a built-in table keyed by well-known names — never configuration:
