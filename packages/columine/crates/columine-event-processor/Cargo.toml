@@ -16,3 +16,9 @@ columine-types = { path = "../columine-types" }
 arrow-array = { workspace = true }
 arrow-ipc = { workspace = true }
 arrow-schema = { workspace = true }
+
+# Event processing by input format and batch size.
+# Run: `cargo bench -p columine-event-processor --bench batch_scale`
+[[bench]]
+name = "batch_scale"
+harness = false
