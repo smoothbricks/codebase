@@ -1298,8 +1298,14 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
 
     /// Land step 5.1, carry phase 1 (16_build_volumes.md, "Carry"), while the target still runs:
     /// stage in the quiet landing volume every Nx cache entry the target's volume indexes and
-    /// the landing volume lacks.
-    pub async fn stage(&self, quiet: &Quiet, target_checkout: PathBuf) -> Result<Staging> {
+    /// the landing volume lacks, and give it the target's code-graph index when it has none.
+    /// A `stopped` reason stages no Nx entries; independent index carry still runs.
+    pub async fn stage(
+        &self,
+        quiet: &Quiet,
+        target_checkout: PathBuf,
+        stopped: Option<String>,
+    ) -> Result<Staging> {
         let target = self.layout.linked(&target_checkout)?;
         let quiet = quiet.clone();
         self.blocking(move |host, layout| {
@@ -1320,9 +1326,21 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
                 Some(target) => {
                     let mount = host.mount_build_volume(layout, &target).map_err(storage)?;
                     let state = BuildVolumeState::read(&mount)?;
-                    carry::stage(&mount, &state, &quiet.mount, &quiet.state)
+                    let staged = match stopped {
+                        Some(reason) => carry::Staged::stopped(reason),
+                        None => carry::stage(&mount, &state, &quiet.mount, &quiet.state),
+                    };
+                    if let Err(error) =
+                        carry::codegraph(&mount, &state, &quiet.mount, &quiet.state)
+                    {
+                        eprintln!(
+                            "cowshed: landing build volume {} takes no code-graph index from {target}: {error}; the target adopts it without one, and its indexer starts over",
+                            quiet.id
+                        );
+                    }
+                    staged
                 }
-                None => carry::Staged::default(),
+                None => stopped.map_or_else(carry::Staged::default, carry::Staged::stopped),
             };
             Ok(Staging {
                 staged,

@@ -1162,7 +1162,11 @@ pub struct OutputMiss {
 
 /// The program that names what the tree at an Nx root looks up: `node - <root>` with this on
 /// stdin, run as a job of the workspace (`task_hashes.js` says how it hashes).
-pub const TASK_HASHES_SCRIPT: &str = include_str!("task_hashes.js");
+pub fn task_hashes_script() -> bytes::Bytes {
+    static SCRIPT: std::sync::LazyLock<bytes::Bytes> =
+        std::sync::LazyLock::new(|| super::cache_adapter::script(include_str!("task_hashes.js")));
+    SCRIPT.clone()
+}
 
 /// One Nx task as its `task_details` rows name it: a `configuration` of `None` is the row's
 /// `NULL`, a task run without one.
@@ -1199,7 +1203,7 @@ impl TaskSelection {
     }
 }
 
-/// The selection [`TASK_HASHES_SCRIPT`] printed. Nx names a cache entry by a decimal hash, the
+/// The selection [`task_hashes_script`] printed. Nx names a cache entry by a decimal hash, the
 /// only name the carry joins to a path, and every task by a non-empty project and target;
 /// anything else is an error naming what was read.
 pub fn task_selection(stdout: &[u8]) -> Result<TaskSelection, String> {

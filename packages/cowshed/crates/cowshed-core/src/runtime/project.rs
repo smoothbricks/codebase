@@ -4450,6 +4450,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         into: &NativeLandingInto,
         checks: &CheckedLandChecks,
         retire: bool,
+        carry_stopped: Option<String>,
     ) -> Result<crate::api::dto::LandBuildVolume> {
         use crate::api::dto::{Adoption, AdoptionSkip, LandBuildVolume, LandSeed};
         let volumes = self.build_volumes()?;
@@ -4490,7 +4491,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         let staging = timed_async(
             "land",
             "carry-stage",
-            volumes.stage(&quiet, into.mount.clone()),
+            volumes.stage(&quiet, into.mount.clone(), carry_stopped),
         )
         .await?;
         let closed = timed_async(
@@ -11371,6 +11372,19 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         let retire = options.retire;
         let (handle, build_volume) =
             timed_async("land", "supervisor", self.admit_build_state(&workspace)).await?;
+        // A failed cache initialization is the carry's stop reason, not a refused land: checks and
+        // the fast-forward still run, and the carry copies nothing.
+        #[cfg(target_os = "macos")]
+        let carry_stopped = match timed_async(
+            "land",
+            "nx-cache-init",
+            initialize_nx_caches(&handle, build_volume.clone(), &source_mount),
+        )
+        .await
+        {
+            Ok(()) => None,
+            Err(error) => Some(error.message),
+        };
         let checks = options.check.unwrap_or_default();
         let mut checked = CheckedLandChecks::default();
         for check in &checks {
@@ -11473,7 +11487,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         let build_volume = timed_async(
             "land",
             "build-volume",
-            self.land_build_volume(&workspace, &source_mount, &into, &checked, retire),
+            self.land_build_volume(&workspace, &source_mount, &into, &checked, retire, carry_stopped),
         )
         .await
         .map_err(|failed| {
@@ -15092,10 +15106,125 @@ async fn read_job_stdout(
     }
 }
 
+/// Land's cache-schema prerequisite (16_build_volumes.md, "Carry"), before checks/fast-forward
+/// and before quiescence. Even a no-check land initializes every detected Nx root through that
+/// checkout's pinned Nx, without computing a project/task graph or copying another DB's history.
+/// A failure here is not a refused land: the caller records it as the carry's stop reason, and
+/// checks and the fast-forward still run.
+#[cfg(target_os = "macos")]
+async fn initialize_nx_caches(
+    handle: &crate::runtime::supervisor::WorkspaceSupervisorHandle,
+    build_volume: Option<PathBuf>,
+    mount: &Path,
+) -> Result<()> {
+    let state =
+        crate::build_volume::BuildVolumeState::read(&mount.join(crate::build_volume::BUILD_LINK))?;
+    for parent in nx_state_paths(&state) {
+        let root = parent.parent().unwrap_or(Path::new(""));
+        let request = nx_probe_request(
+            mount,
+            root,
+            crate::build_volume::cache_adapter::initialize_script(),
+        )?;
+        let initialized = nx_probe_stdout(handle, build_volume.clone(), request)
+            .await
+            .and_then(|stdout| {
+                crate::build_volume::cache_adapter::initialized(&stdout, &mount.join(root))
+            });
+        if let Err(reason) = initialized {
+            return Err(CowshedError::environment_missing(
+                format!(
+                    "initialize the checkout's Nx cache at {} for the land carry: {reason}",
+                    parent.display()
+                ),
+                "install the checkout's pinned Nx 23.2.1 native product; the land's carry was skipped and the land itself is unaffected",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The directories the Nx states of `state` sit in, one per Nx tool state, in order.
+#[cfg(target_os = "macos")]
+fn nx_state_paths(
+    state: &crate::build_volume::BuildVolumeState,
+) -> std::collections::BTreeSet<&Path> {
+    state
+        .paths
+        .iter()
+        .filter(|path| {
+            crate::build_volume::BuildStateTool::of(path) == crate::build_volume::BuildStateTool::Nx
+        })
+        .filter_map(|path| path.checkout.as_path().parent())
+        .collect()
+}
+
+/// The one `node -` job that runs `script` in the Nx root `root` of the workspace mounted at
+/// `mount`, as the root's own directory so its `.envrc` gives its toolchain. Read-write, as a
+/// run: stock Nx records task details in the root's database.
+#[cfg(target_os = "macos")]
+fn nx_probe_request(mount: &Path, root: &Path, script: bytes::Bytes) -> Result<ExecRequest> {
+    let cwd = if root.as_os_str().is_empty() {
+        None
+    } else {
+        Some(crate::api::dto::WorkspacePath::new(root).map_err(|error| {
+            CowshedError::integrity(error.to_string(), "use a workspace-relative Nx project")
+        })?)
+    };
+    Ok(ExecRequest {
+        command: crate::api::dto::ExecCommand::Argv(vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "exec node - \"$1\"".into(),
+            "sh".into(),
+            crate::api::dto::CommandArg::new(mount.join(root)),
+        ]),
+        cwd,
+        mode: RunSandboxMode::ReadWrite,
+        env: std::collections::HashMap::new(),
+        trace: None,
+        stdin: StdinSource::Inline(script),
+        stdout_copy: None,
+        stderr_copy: None,
+        admission_key: None,
+        class: crate::api::dto::JobserverClass::Background,
+        want: NonZeroUsize::MIN,
+        wait_ms: None,
+        scope: crate::api::dto::ExecScope::Workspace,
+    })
+}
+
+/// Run one probe job and read its stdout. A job that cannot start, be waited on, or exit 0 is
+/// that root's failure, with the supervisor's diagnosis.
+#[cfg(target_os = "macos")]
+async fn nx_probe_stdout(
+    handle: &crate::runtime::supervisor::WorkspaceSupervisorHandle,
+    build_volume: Option<PathBuf>,
+    request: ExecRequest,
+) -> std::result::Result<Vec<u8>, String> {
+    let job = handle
+        .exec(None, build_volume, request, AdmissionSource::Coordinator)
+        .await
+        .map_err(|error| format!("cannot start the probe: {error}"))?;
+    let info = handle
+        .wait(job)
+        .await
+        .map_err(|error| format!("cannot wait for the probe, job {job:?}: {error}"))?;
+    match &info.exit {
+        Some(crate::api::dto::ExitStatus::Exited { code: 0 }) => read_job_stdout(handle, job)
+            .await
+            .map_err(|error| format!("cannot read the probe's output {error}")),
+        exit => Err(format!(
+            "the probe ended {exit:?}: {}",
+            read_job_stderr_tail(handle, job).await
+        )),
+    }
+}
+
 /// Rebase carry's selection (16_build_volumes.md, "Rebase carry"): for each Nx state the build
 /// volume of `workspace` (mounted at `mount`) holds, keyed by its `.nx` relative to the checkout,
 /// the task hashes stock Nx computes up front for the tree now checked out at that state's root
-/// and the tasks it defers ([`crate::build_volume::nx::TASK_HASHES_SCRIPT`], run there as a job
+/// and the tasks it defers ([`crate::build_volume::nx::task_hashes_script`], run there as a job
 /// of the workspace). A root whose selection cannot be computed is the carry's skip, naming it:
 /// no root is ever given a selection it did not compute, so the carry never copies an entry the
 /// tree will not look up.
@@ -15112,93 +15241,26 @@ async fn rebased_task_hashes(
 > {
     let state =
         crate::build_volume::BuildVolumeState::read(&mount.join(crate::build_volume::BUILD_LINK))?;
-    let states = state
-        .paths
-        .iter()
-        .filter(|path| {
-            crate::build_volume::BuildStateTool::of(path) == crate::build_volume::BuildStateTool::Nx
-        })
-        .filter_map(|path| path.checkout.as_path().parent())
-        .collect::<std::collections::BTreeSet<_>>();
     let mut selections = std::collections::BTreeMap::new();
-    for state in states {
-        // The Nx root the state sits in, and the job's directory there: a root's `.envrc` gives
-        // its own toolchain, as to any command run in it.
-        let root = state.parent().unwrap_or(Path::new(""));
-        let cwd = if root.as_os_str().is_empty() {
-            None
-        } else {
-            Some(crate::api::dto::WorkspacePath::new(root).map_err(|error| {
-                CowshedError::integrity(error.to_string(), "use a workspace-relative Nx project")
-            })?)
-        };
-        // Read-write, as a run: stock Nx records the hashes' task details in the root's database.
-        let request = ExecRequest {
-            command: crate::api::dto::ExecCommand::Argv(vec![
-                "/bin/sh".into(),
-                "-c".into(),
-                "exec node - \"$1\"".into(),
-                "sh".into(),
-                crate::api::dto::CommandArg::new(mount.join(root)),
-            ]),
-            cwd,
-            mode: RunSandboxMode::ReadWrite,
-            env: std::collections::HashMap::new(),
-            trace: None,
-            stdin: StdinSource::Inline(bytes::Bytes::from_static(
-                crate::build_volume::nx::TASK_HASHES_SCRIPT.as_bytes(),
-            )),
-            stdout_copy: None,
-            stderr_copy: None,
-            admission_key: None,
-            class: crate::api::dto::JobserverClass::Background,
-            want: NonZeroUsize::MIN,
-            wait_ms: None,
-            scope: crate::api::dto::ExecScope::Workspace,
-        };
-        let selection = probe_task_hashes(handle, build_volume.clone(), request).await;
+    for parent in nx_state_paths(&state) {
+        let root = parent.parent().unwrap_or(Path::new(""));
+        let request = nx_probe_request(mount, root, crate::build_volume::nx::task_hashes_script())?;
+        let selection = nx_probe_stdout(handle, build_volume.clone(), request)
+            .await
+            .and_then(|stdout| crate::build_volume::nx::task_selection(&stdout));
         match selection {
             Ok(selection) => {
-                selections.insert(state.to_owned(), selection);
+                selections.insert(parent.to_owned(), selection);
             }
             Err(reason) => {
                 return Ok(Err(crate::api::dto::RebaseCarrySkip::TaskHashes {
-                    state: state.to_owned(),
+                    state: parent.to_owned(),
                     reason,
                 }));
             }
         }
     }
     Ok(Ok(selections))
-}
-
-/// One root's [`crate::build_volume::nx::TASK_HASHES_SCRIPT`] job: its selection, or why there
-/// is none. A job that could not start or be waited on is that root's failure too, with the
-/// supervisor's diagnosis: the rebase has happened, and only the carry is skipped.
-#[cfg(target_os = "macos")]
-async fn probe_task_hashes(
-    handle: &crate::runtime::supervisor::WorkspaceSupervisorHandle,
-    build_volume: Option<PathBuf>,
-    request: ExecRequest,
-) -> std::result::Result<crate::build_volume::nx::TaskSelection, String> {
-    let job = handle
-        .exec(None, build_volume, request, AdmissionSource::Coordinator)
-        .await
-        .map_err(|error| format!("cannot start the probe: {error}"))?;
-    let info = handle
-        .wait(job)
-        .await
-        .map_err(|error| format!("cannot wait for the probe, job {job:?}: {error}"))?;
-    match (&info.exit, read_job_stdout(handle, job).await) {
-        (_, Err(error)) => Err(format!("cannot read the probe's output {error}")),
-        (Some(crate::api::dto::ExitStatus::Exited { code: 0 }), Ok(stdout)) => {
-            crate::build_volume::nx::task_selection(&stdout)
-        }
-        (exit, Ok(_)) => Err(format!(
-            "the probe ended {exit:?}: {}",
-            read_job_stderr_tail(handle, job).await
-        )),
-    }
 }
 
 #[cfg(target_os = "macos")]
