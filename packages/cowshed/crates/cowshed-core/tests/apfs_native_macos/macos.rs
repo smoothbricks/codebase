@@ -2856,6 +2856,108 @@ fn an_image_held_twice_is_refused_as_ambiguous_and_never_renamed() {
     );
 }
 
+/// A kernel holding one image attached unformatted, its whole device alone with no APFS volume,
+/// recording any command run against it.
+#[derive(Clone)]
+struct UnformattedAttachment {
+    image: PathBuf,
+    requests: Arc<Mutex<Vec<CommandRequest>>>,
+}
+
+impl CommandRunner for UnformattedAttachment {
+    fn run(&self, request: &CommandRequest) -> Result<CommandOutput, CommandRunError> {
+        self.requests
+            .lock()
+            .expect("requests")
+            .push(request.clone());
+        Ok(CommandOutput::success([]))
+    }
+    fn image_lease(&self, _: &Path) -> std::io::Result<Option<Fenced<std::fs::File>>> {
+        Ok(None)
+    }
+    fn pin_raw_device(&self, _: &Path) -> std::io::Result<Option<Fenced<std::fs::File>>> {
+        Ok(None)
+    }
+    fn attached_disk_images(&self) -> std::io::Result<Vec<AttachedDiskImage>> {
+        Ok(vec![AttachedDiskImage::file(
+            &self.image,
+            Some(ImageCapacity::from_gibibytes(1)),
+            [("/dev/disk9", "")],
+        )])
+    }
+    fn grow_image(&self, image: &Path, _: ImageCapacity) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            format!("the unformatted double grows no image: {}", image.display()),
+        ))
+    }
+}
+
+/// An image the kernel holds unformatted has no volume to name, yet it is held: an inventory
+/// fault, refused, never reported as `NotAttached`.
+#[test]
+fn an_image_held_unformatted_is_refused_rather_than_reported_unattached() {
+    let fixture = Fixture::new("rename-unformatted");
+    let image = slotted_image(&fixture);
+    let runner = UnformattedAttachment {
+        image: image.clone(),
+        requests: Arc::default(),
+    };
+    let host = MacOsApfsExecutionHost::with_mount_source(
+        runner.clone(),
+        fixture.config(),
+        FixedMounts(Vec::new()),
+    )
+    .expect("native APFS host");
+
+    let refused = host
+        .label_image_volume(&image, SLOTTED)
+        .expect_err("an unformatted attachment is no skip");
+
+    assert!(
+        matches!(
+            refused,
+            ApfsStorageError::Apfs(ApfsError::InvalidAttachmentInventory(_))
+        ),
+        "{refused}"
+    );
+    assert!(
+        runner.requests.lock().expect("requests").is_empty(),
+        "ran {:?}",
+        runner.requests.lock().expect("requests")
+    );
+}
+
+/// The host's own rename refuses an attachment of an image outside the store, even one the
+/// kernel holds and that attached verified: only cowshed's images are cowshed's to name.
+#[test]
+fn the_host_rename_refuses_an_attachment_of_an_image_outside_the_store() {
+    let fixture = Fixture::new("rename-foreign-attachment");
+    let runner = RecordingRunner::default();
+    let host = native_host(&fixture, runner.clone());
+    let foreign =
+        std::env::temp_dir().join(format!("cowshed-foreign-{}.dmg", uuid::Uuid::new_v4()));
+    let attachment = host
+        .backend()
+        .attach_verified(&foreign)
+        .expect("a verified attachment of a foreign image");
+
+    let refused = ApfsExecutionHost::rename_volume(&host, &attachment, SLOTTED).unwrap_err();
+
+    assert!(
+        matches!(
+            refused,
+            ApfsStorageError::Layout(StorageLayoutError::EscapesStoreRoot)
+        ),
+        "{refused}"
+    );
+    assert!(
+        renames(&runner).is_empty(),
+        "renamed {:?}",
+        renames(&runner)
+    );
+}
+
 #[test]
 fn gc_distinguishes_a_missing_store_from_a_non_directory_store() {
     let fixture = Fixture::new("gc-store");

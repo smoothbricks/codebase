@@ -1504,17 +1504,14 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
     /// attachment inventory maps the image to, re-proved under the image's lease and a raw pin
     /// when the rename runs; never a path, which `diskutil` resolves to whatever volume holds it.
     /// An image the kernel does not hold, or whose volume is mounted nowhere, names nothing; one
-    /// it holds twice is ambiguous and refused.
+    /// it holds twice, or holds unformatted, is an inventory fault and refused.
     pub fn label_image_volume(
         &self,
         image: &Path,
         label: &str,
     ) -> Result<super::Labelled, ApfsStorageError> {
         self.require_store_image(image)?;
-        // An unformatted attachment has no volume to name.
-        let Some(RecoveredImageAttachment::Apfs(attachment)) =
-            self.backend.recovered_image_attachment(image)?
-        else {
+        let Some(attachment) = self.backend.existing_attachment(image)? else {
             return Ok(super::Labelled::NotAttached);
         };
         let mounts = self.mount_source.mounts()?;

@@ -401,25 +401,26 @@ Disk device names are reusable, not image identities. Each image has its own pri
 single-link file, opened without following symlinks, in a 0700 directory this user owns. The identity is the absolute
 path produced by `attachment_inventory_path`, matched against the kernel's `DiskImageURL` backing-file path; the lease
 hashes that same normalized identity, never a separately resolved alias. An alias with another identity fails closed.
-Every cooperating create, attach, format, `fsck_apfs`, mount, unmount, recovery and detach of one image holds that
-image's lease, so independent processes serialize on one image while operations on different images overlap. There is no
-host-wide device lock. A cooperating process acts on a device only after the inventory positively maps the identity to
-it under the lease (or while a raw pin holds it), and a device is freed only by a detach the same lease covers, so no
-same-user cowshed process recycles it inside the critical section. A contended lease is awaited on a helper thread that
-hands the locked descriptor back when the holder releases it, bounded by the 120 s disk-child deadline; expiry names the
-lease file, the image and the holder's recorded pid. The lease does **not** constrain another user's disk tools or a
-manual eject during the two mutations that cannot run raw-pinned, `newfs_apfs` and `hdiutil detach`, because a read-only
-raw pin makes both fail with EBUSY. Before `fsck_apfs` or `mount_apfs`, cowshed opens the reported raw volume read-only,
-then verifies that the attachment inventory maps **both** its whole container and its volume to the exact image. A
-verified attachment owns that raw descriptor across the `attach_verified` → `mount` method boundary. It is released
-after `mount_apfs` finishes, before intentional detach, or before the exclusive `diskutil apfs resizeContainer` writer,
-which cannot run with a raw descriptor open. Independent device ejects during container resize after pin release are not
-covered. While held, the descriptor prevents even external `diskutil eject force` or `hdiutil detach -force` from
-releasing the image and recycling its device name. If the image lost the reported device before the descriptor could be
-pinned, cowshed performs at most one fresh attachment, and only when inventory shows no remaining attachment for that
-image. A conflicting or unreadable mapping fails closed, without running fsck on the reported device. No live-fsck
-option authorizes touching a foreign mounted container. Blank-image formatting keeps its image-to-whole-device check
-under the image's lease; its exclusive formatter cannot share a raw-device descriptor with another opener.
+Every cooperating create, attach, format, `fsck_apfs`, mount, unmount, rename, recovery and detach of one image holds
+that image's lease, so independent processes serialize on one image while operations on different images overlap. There
+is no host-wide device lock. A cooperating process acts on a device only after the inventory positively maps the
+identity to it under the lease (or while a raw pin holds it), and a device is freed only by a detach the same lease
+covers, so no same-user cowshed process recycles it inside the critical section. A contended lease is awaited on a
+helper thread that hands the locked descriptor back when the holder releases it, bounded by the 120 s disk-child
+deadline; expiry names the lease file, the image and the holder's recorded pid. The lease does **not** constrain another
+user's disk tools or a manual eject during the two mutations that cannot run raw-pinned, `newfs_apfs` and
+`hdiutil detach`, because a read-only raw pin makes both fail with EBUSY. Before `fsck_apfs` or `mount_apfs`, cowshed
+opens the reported raw volume read-only, then verifies that the attachment inventory maps **both** its whole container
+and its volume to the exact image. A verified attachment owns that raw descriptor across the `attach_verified` → `mount`
+method boundary. It is released after `mount_apfs` finishes, before intentional detach, or before the exclusive
+`diskutil apfs resizeContainer` writer, which cannot run with a raw descriptor open. Independent device ejects during
+container resize after pin release are not covered. While held, the descriptor prevents even external
+`diskutil eject force` or `hdiutil detach -force` from releasing the image and recycling its device name. If the image
+lost the reported device before the descriptor could be pinned, cowshed performs at most one fresh attachment, and only
+when inventory shows no remaining attachment for that image. A conflicting or unreadable mapping fails closed, without
+running fsck on the reported device. No live-fsck option authorizes touching a foreign mounted container. Blank-image
+formatting keeps its image-to-whole-device check under the image's lease; its exclusive formatter cannot share a
+raw-device descriptor with another opener.
 
 For every mounted attachment:
 
@@ -653,13 +654,25 @@ A rename targets a volume device, never a path. `diskutil renameVolume` handed a
 path, and a mountpoint nothing is mounted at (a workspace whose create was refused, one that is detached, one whose
 supervisor outlived its mount) is a plain directory of the host's own Data volume: a supervisor that relabelled by its
 checkout's path once renamed the host's Data volume that way. So every rename (the supervisor's, the build volume's
-after a land, the restore staging relabel, the identity change's) names an image, never a mountpoint, and that image
-must lie under the store root. The rename acts only on the volume device that the kernel's attachment inventory maps
-that image to. It runs under the image's lease and a raw IOMedia pin that re-proves the mapping, exactly as a release
-proves it before `umount` ("Mounts"). An image the kernel does not hold names nothing (`NotAttached`), and neither does
-one whose volume is mounted nowhere (`NotMounted`; APFS renames only mounted volumes). Both are typed outcomes, not
-errors. No internal disk is an attachment of an image under the store, so the host's own volumes can never be a rename
-target, whatever is mounted at, or missing from, a workspace's path.
+after a land, the restore staging relabel, the identity change's) names an image, never a mountpoint. The native host
+refuses an image outside the store root; the backend beneath it renames only through a verified attachment, so its
+target is always some image's volume device, never a host disk. The rename acts only on the volume device that the
+kernel's attachment inventory maps that image to. An image no attachment holds names nothing (`NotAttached`); one held
+twice, or held unformatted, is an inventory fault and is refused. One whose volume the kernel mount table does not list
+names nothing (`NotMounted`). Both skips are typed outcomes, not errors, and the supervisor says each one in the daemon
+log. The rename runs under the image's lease and a raw IOMedia pin that re-proves the mapping, as a release proves it
+before `umount` ("Mounts"), and the pin is held across the `diskutil` call. The mount check is read before the pin and
+not re-proven under it: an unmount racing the rename can let it reach that image's own unmounted volume, which is still
+cowshed's and never another's. Cowshed renames only a volume it found mounted; what `diskutil renameVolume` does to an
+unmounted APFS volume is not measured here. No internal disk is an attachment of an image under the store, so the host's
+own volumes can never be a rename target, whatever is mounted at, or missing from, a workspace's path.
+
+Open item: the rename holds the image's lease for the whole `diskutil renameVolume` call, and Disk Arbitration's queue
+sits inside that call (9.5–27.8 s under load, bounded by the 120 s disk-child deadline). Meanwhile a mount, unmount or
+detach of the same image waits on the lease. That only delays lifecycle work on one image; it is not a safety problem,
+and no lease wait under a queued rename has been measured. Releasing the lease cannot be split from the wait, because
+the wait is the command itself. Holding only the raw pin across it would turn that wait into the concurrent detach's
+EBUSY refusal, so the trade-off is left as it stands until it is measured.
 
 What follows: volume labels are free to be plain, and manual renaming is harmless rather than unsupported. Cowshed still
 derives an internal per-workspace key from `repo_id` and workspace name to pair a storage fact with a kernel mount fact

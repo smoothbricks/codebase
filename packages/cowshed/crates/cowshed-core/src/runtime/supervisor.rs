@@ -3659,21 +3659,11 @@ impl SupervisorActor {
                     }
                 }
                 let started = Instant::now();
-                match labeller.ensure_label(&image, &label) {
-                    Ok(Labelled::Renamed) => eprintln!(
-                        "cowshed: named workspace {name}'s {what} {label:?} in {:?}",
-                        started.elapsed()
-                    ),
-                    Ok(Labelled::Already) => {}
-                    Ok(skipped @ (Labelled::NotAttached | Labelled::NotMounted)) => eprintln!(
-                        "cowshed: named no {what} for workspace {name}: its image {} is {skipped:?}",
-                        image.display()
-                    ),
-                    Err(error) => eprintln!(
-                        "cowshed: could not name workspace {name}'s {what} {} {label:?} after {:?}: {error}",
-                        image.display(),
-                        started.elapsed()
-                    ),
+                let outcome = labeller.ensure_label(&image, &label);
+                if let Some(line) =
+                    label_report(&name, what, &image, &label, &outcome, started.elapsed())
+                {
+                    eprintln!("{line}");
                 }
             }
         });
@@ -5749,6 +5739,32 @@ fn retiring_error() -> CowshedError {
     )
 }
 
+/// The daemon log's line for naming a checkout's `what` (its workspace volume or a build volume)
+/// after `image`. Every outcome is said, a typed skip included, except a name already right.
+fn label_report(
+    name: &WorkspaceName,
+    what: &str,
+    image: &Path,
+    label: &str,
+    outcome: &io::Result<Labelled>,
+    elapsed: Duration,
+) -> Option<String> {
+    match outcome {
+        Ok(Labelled::Renamed) => Some(format!(
+            "cowshed: named workspace {name}'s {what} {label:?} in {elapsed:?}"
+        )),
+        Ok(Labelled::Already) => None,
+        Ok(skipped @ (Labelled::NotAttached | Labelled::NotMounted)) => Some(format!(
+            "cowshed: named no {what} for workspace {name}: its image {} is {skipped:?}",
+            image.display()
+        )),
+        Err(error) => Some(format!(
+            "cowshed: could not name workspace {name}'s {what} {} {label:?} after {elapsed:?}: {error}",
+            image.display()
+        )),
+    }
+}
+
 #[cfg(test)]
 mod workspace_toolchain_tests {
     use super::*;
@@ -7449,5 +7465,41 @@ mod stdin_lane_tests {
             observed.recv().await.is_none(),
             "nothing reported after the break"
         );
+    }
+}
+
+#[cfg(test)]
+mod label_report_tests {
+    use super::*;
+
+    /// A skipped volume label is said in the daemon log, with the image and why; only a name
+    /// already right is silent.
+    #[test]
+    fn a_skipped_volume_label_is_said_and_only_a_right_one_is_silent() {
+        let name = WorkspaceName::new("slotted").expect("workspace name");
+        let image = Path::new("/private/cowshed/store/acme/widget/sessions/slotted.dmg");
+        let report = |outcome: io::Result<Labelled>| {
+            label_report(
+                &name,
+                "volume",
+                image,
+                "[cowshed] acme · widget — slotted",
+                &outcome,
+                Duration::from_millis(5),
+            )
+        };
+        for skipped in [Labelled::NotAttached, Labelled::NotMounted] {
+            let line = report(Ok(skipped)).expect("a skip is said");
+            assert!(
+                line.contains(&format!("{skipped:?}"))
+                    && line.contains(&image.display().to_string()),
+                "{line}"
+            );
+        }
+        assert!(report(Ok(Labelled::Renamed)).is_some());
+        assert!(
+            report(Err(io::Error::other("refused"))).is_some_and(|line| line.contains("refused"))
+        );
+        assert_eq!(report(Ok(Labelled::Already)), None);
     }
 }

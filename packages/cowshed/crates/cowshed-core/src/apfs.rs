@@ -6551,6 +6551,99 @@ mod tests {
         }
     }
 
+    /// Pins with a real `flock`ed descriptor, one file per pin, and notes whether the newest pin
+    /// is still held when `renameVolume` runs: a second descriptor's non-blocking lock on the
+    /// same file fails only while the pin's own descriptor is open.
+    struct PinWitness {
+        recorded: RecordingRunner,
+        pins: PathBuf,
+        taken: std::cell::Cell<usize>,
+        newest: RefCell<Option<PathBuf>>,
+        held_at_rename: RefCell<Option<bool>>,
+    }
+
+    impl PinWitness {
+        fn new(recorded: RecordingRunner) -> Self {
+            let pins = std::env::temp_dir().join(format!(
+                "cowshed-pin-witness-{}",
+                uuid::Uuid::new_v4().simple()
+            ));
+            fs::create_dir(&pins).expect("pin directory");
+            Self {
+                recorded,
+                pins,
+                taken: std::cell::Cell::new(0),
+                newest: RefCell::new(None),
+                held_at_rename: RefCell::new(None),
+            }
+        }
+
+        fn newest_pin_held(&self) -> bool {
+            use std::os::fd::AsRawFd as _;
+            let newest = self.newest.borrow();
+            let pin = newest.as_deref().expect("a pin was taken");
+            let probe = File::open(pin).expect("open the pin's file");
+            // SAFETY: `probe` owns a live descriptor for the duration of the call.
+            unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) != 0 }
+        }
+    }
+
+    impl CommandRunner for PinWitness {
+        fn run(&self, request: &CommandRequest) -> Result<CommandOutput, CommandRunError> {
+            if request
+                .args
+                .first()
+                .is_some_and(|verb| verb == "renameVolume")
+            {
+                self.held_at_rename.replace(Some(self.newest_pin_held()));
+            }
+            self.recorded.run(request)
+        }
+        fn image_lease(&self, identity: &Path) -> io::Result<Option<Fenced<File>>> {
+            self.recorded.image_lease(identity)
+        }
+        fn pin_raw_device(&self, _: &Path) -> io::Result<Option<Fenced<File>>> {
+            use std::os::fd::AsRawFd as _;
+            let pin = self.pins.join(format!("pin-{}", self.taken.get()));
+            self.taken.set(self.taken.get() + 1);
+            let file = File::create(&pin)?;
+            // SAFETY: `file` owns a live descriptor for the duration of the call.
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            self.newest.replace(Some(pin));
+            Ok(Some(Fenced::new(file)))
+        }
+        fn attached_disk_images(&self) -> io::Result<Vec<AttachedDiskImage>> {
+            self.recorded.attached_disk_images()
+        }
+        fn grow_image(&self, image: &Path, capacity: ImageCapacity) -> io::Result<()> {
+            self.recorded.grow_image(image, capacity)
+        }
+    }
+
+    /// The rename's raw pin outlives the `diskutil` call. Dropped any earlier, the kernel could
+    /// recycle the device between the mapping proof and the rename.
+    #[test]
+    fn rename_volume_holds_its_device_pin_across_the_rename() {
+        let backend = MacOsApfsBackend::new(PinWitness::new(RecordingRunner::with_outputs(
+            verified_attachment_replies("session.dmg")
+                .into_iter()
+                .chain([holding_verified_volume("session.dmg"), ok([])]),
+        )));
+        let attachment = backend
+            .attach_verified(Path::new("session.dmg"))
+            .expect("verified attachment");
+
+        let renamed = backend.rename_volume(&attachment, "cowshed.acme--widget.main");
+        let held = backend.runner().held_at_rename.take();
+        drop(attachment);
+        fs::remove_dir_all(&backend.runner().pins).expect("remove the pins");
+
+        renamed.expect("rename");
+        assert_eq!(held, Some(true), "the rename ran without its device pin");
+    }
+
     #[test]
     fn delete_image_removes_files_ignores_absence_and_reports_other_io() {
         let backend = MacOsApfsBackend::new(RecordingRunner::default());

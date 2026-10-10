@@ -9152,24 +9152,15 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             .map_err(native_integrity_error)?
             .image()
             .to_owned();
-        match self
+        let named = self
             .substrate
             .host()
             .label_image_volume(
                 &main_image,
                 &crate::storage::apfs::volume_label(&self.descriptor.repo_id, &main_name()),
             )
-            .map_err(native_storage_error)?
-        {
-            crate::storage::apfs::Labelled::Renamed | crate::storage::apfs::Labelled::Already => {}
-            skipped @ (crate::storage::apfs::Labelled::NotAttached
-            | crate::storage::apfs::Labelled::NotMounted) => {
-                return Err(CowshedError::internal(format!(
-                    "main was just mounted, yet its image {} is {skipped:?}",
-                    main_image.display()
-                )));
-            }
-        }
+            .map_err(native_storage_error)?;
+        require_named_after_mount(named, &main_image)?;
         self.ensure_supervisor(&main_name()).await?;
         RepositoryIdentityIntent::clear(&self.substrate_config.store_root)?;
         self.snapshot_named(&main_name()).await
@@ -15279,6 +15270,22 @@ fn is_mount_point(path: &Path) -> std::io::Result<bool> {
     }
 }
 
+/// Main was just mounted from `image`, so naming it must find its volume. A skip says the mount
+/// is not the one cowshed just made: an internal error, never a silent success.
+#[cfg(target_os = "macos")]
+fn require_named_after_mount(named: crate::storage::apfs::Labelled, image: &Path) -> Result<()> {
+    use crate::storage::apfs::Labelled;
+    match named {
+        Labelled::Renamed | Labelled::Already => Ok(()),
+        skipped @ (Labelled::NotAttached | Labelled::NotMounted) => {
+            Err(CowshedError::internal(format!(
+                "main was just mounted, yet its image {} is {skipped:?}",
+                image.display()
+            )))
+        }
+    }
+}
+
 /// Names a workspace image's volume through the APFS host, which renames only the volume device
 /// the kernel maps that image under the store to.
 #[cfg(target_os = "macos")]
@@ -19475,5 +19482,29 @@ mod volume_labeller_tests {
             "the labeller ran {:?}",
             runner.commands()
         );
+    }
+
+    /// An identity change mounts main and then names it: a skip there is refused as an internal
+    /// error rather than passed off as a named volume.
+    #[test]
+    fn naming_a_just_mounted_main_refuses_a_skip() {
+        use crate::storage::apfs::Labelled;
+        let image = Path::new("/private/cowshed/store/acme/widget/main.dmg");
+        for named in [Labelled::Renamed, Labelled::Already] {
+            assert!(require_named_after_mount(named, image).is_ok(), "{named:?}");
+        }
+        for skipped in [Labelled::NotAttached, Labelled::NotMounted] {
+            let refused = require_named_after_mount(skipped, image).expect_err("a skip is refused");
+            assert_eq!(
+                refused.code,
+                crate::error::ErrorCode::Internal,
+                "{skipped:?}"
+            );
+            assert!(
+                refused.message.contains(&format!("{skipped:?}")),
+                "{}",
+                refused.message
+            );
+        }
     }
 }
