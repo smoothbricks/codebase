@@ -67,6 +67,13 @@ pub struct ByteCapture {
     pub(crate) frame: Option<CaptureFrame>,
 }
 
+impl ByteCapture {
+    /// The capture of a journal that is not recording: no frame, nothing to
+    /// finish. A batch kernel that read the recording state once uses it in
+    /// place of a bracket, so its unjournaled loop carries no capture work.
+    pub(crate) const UNRECORDED: Self = Self { frame: None };
+}
+
 #[derive(Debug)]
 pub(crate) struct CaptureFrame {
     pub(crate) generation: u64,
@@ -159,7 +166,7 @@ impl VmHooks for NoVm {
                 return Err(ErrorCode::InvalidState);
             }
         }
-        Ok(ByteCapture { frame: None })
+        Ok(ByteCapture::UNRECORDED)
     }
 
     fn finish_capture(&mut self, _delta_mode: bool, _state: &[u8], capture: ByteCapture) {

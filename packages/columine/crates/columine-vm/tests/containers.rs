@@ -519,6 +519,28 @@ fn batch_upsert_last_inserts_and_overwrites() {
     assert_eq!(r, ErrorCode::Ok);
     assert_eq!(tbl.get_u32(&state, 20), Some(999));
     assert_eq!(meta.size(&state), 3); // overwrite — size unchanged
+
+    // One batch that updates and then inserts reports both changes, though
+    // it writes each flag bit only once.
+    state[(meta.meta_base + SlotMetaOffset::CHANGE_FLAGS) as usize] = 0;
+    let r = batch_map_upsert(
+        Strategy::Last,
+        false,
+        &mut state,
+        &meta,
+        0,
+        &[30, 40, 10, 50],
+        &[301, 400, 101, 500],
+        None,
+        CmpType::F64,
+        &mut hooks,
+    );
+    assert_eq!(r, ErrorCode::Ok);
+    assert_eq!(
+        meta.change_flags(&state),
+        ChangeFlag::UPDATED | ChangeFlag::INSERTED
+    );
+    assert_eq!(meta.size(&state), 5);
 }
 
 ///  `test "batchMapUpsert — first strategy skips existing"`

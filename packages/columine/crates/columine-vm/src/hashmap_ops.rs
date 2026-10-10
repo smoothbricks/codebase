@@ -13,9 +13,9 @@
 //! bytes instead. TTL helpers never append a second logical journal.
 
 use crate::bytes;
-use crate::hash_table::{ENTRY_U32, ErasePlan, FlatTable};
-use crate::hooks::{TtlMutation, VmHooks};
-use crate::meta::SlotMetaView;
+use crate::hash_table::{ENTRY_U32, ErasePlan, EraseRanges, FlatTable};
+use crate::hooks::{ByteCapture, TtlMutation, VmHooks};
+use crate::meta::{BatchFlags, SlotMetaView};
 use columine_types::types::{ChangeFlag, ErrorCode, SlotMetaOffset};
 
 pub use columine_types::CmpType;
@@ -141,11 +141,39 @@ pub fn batch_map_upsert(
     if compares_values && !meta.has_hashmap_timestamp_storage() {
         return ErrorCode::InvalidProgram;
     }
-    let stores_aux = compares_values || meta.has_ttl();
+    // One recording decision per batch: the unrecorded loop is compiled
+    // without any capture code.
+    if hooks.undo_enabled() {
+        upsert_rows::<true>(
+            strategy, delta_mode, state, meta, keys, vals, cmp_col, cmp_type, hooks,
+        )
+    } else {
+        upsert_rows::<false>(
+            strategy, delta_mode, state, meta, keys, vals, cmp_col, cmp_type, hooks,
+        )
+    }
+}
+
+/// [`batch_map_upsert`]'s row loop; `RECORDING` is the journal's state.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn upsert_rows<const RECORDING: bool>(
+    strategy: Strategy,
+    delta_mode: bool,
+    state: &mut [u8],
+    meta: &SlotMetaView,
+    keys: &[u32],
+    vals: &[u32],
+    cmp_col: Option<&[u8]>,
+    cmp_type: CmpType,
+    hooks: &mut impl VmHooks,
+) -> ErrorCode {
+    let stores_aux = strategy.needs_timestamps() || meta.has_ttl();
 
     let tbl = bind_slot_map(meta);
     let mut local_size = tbl.size(state);
     let max_load = tbl.max_load();
+    let mut flags = BatchFlags::default();
 
     for (i, (&key, &val)) in keys.iter().zip(vals).enumerate() {
         let i = i as u32;
@@ -198,27 +226,31 @@ pub fn batch_map_upsert(
         } else {
             None
         };
-        let capture = match hooks.begin_capture(state, || {
-            let ttl = ttl_plan.as_ref().map_or(&[(0, 0); 2], |plan| plan.ranges());
-            [
-                (
-                    tbl.keys_off + probe.pos * 4,
-                    if probe.found { 0 } else { 4 },
-                ),
-                (tbl.entries_off + probe.pos * 4, 4),
-                if stores_aux {
-                    (cmp_lane_off(meta) + probe.pos * 8, 8)
-                } else {
-                    (0, 0)
-                },
-                (tbl.size_off, if probe.found { 0 } else { 4 }),
-                (meta.meta_base + SlotMetaOffset::CHANGE_FLAGS, 1),
-                ttl[0],
-                ttl[1],
-            ]
-        }) {
-            Ok(capture) => capture,
-            Err(error) => return error,
+        let capture = if !RECORDING {
+            ByteCapture::UNRECORDED
+        } else {
+            match hooks.begin_capture(state, || {
+                let ttl = ttl_plan.as_ref().map_or(&[(0, 0); 2], |plan| plan.ranges());
+                [
+                    (
+                        tbl.keys_off + probe.pos * 4,
+                        if probe.found { 0 } else { 4 },
+                    ),
+                    (tbl.entries_off + probe.pos * 4, 4),
+                    if stores_aux {
+                        (cmp_lane_off(meta) + probe.pos * 8, 8)
+                    } else {
+                        (0, 0)
+                    },
+                    (tbl.size_off, if probe.found { 0 } else { 4 }),
+                    (meta.meta_base + SlotMetaOffset::CHANGE_FLAGS, 1),
+                    ttl[0],
+                    ttl[1],
+                ]
+            }) {
+                Ok(capture) => capture,
+                Err(error) => return error,
+            }
         };
         if !probe.found {
             tbl.set_key_at(state, probe.pos, key);
@@ -229,8 +261,9 @@ pub fn batch_map_upsert(
         if stores_aux {
             write_cmp_slot(state, meta, probe.pos, new_cmp);
         }
-        meta.set_change_flag(
+        flags.set(
             state,
+            meta,
             if probe.found {
                 ChangeFlag::UPDATED
             } else {
@@ -296,62 +329,98 @@ pub fn batch_map_remove(
         return ErrorCode::InvalidState;
     }
     let mut scratch = hooks.take_erase_scratch();
-    let result = (|| {
-        let ranges = &mut scratch.ranges;
-        for &key in keys {
-            let Some(pos) = tbl.find(state, key) else {
-                continue;
-            };
+    // One recording decision per batch: the unrecorded loop is compiled
+    // without any capture code.
+    let result = if hooks.undo_enabled() {
+        remove_rows::<true>(
+            delta_mode,
+            state,
+            meta,
+            &tbl,
+            has_ts,
+            keys,
+            &mut scratch.ranges,
+            hooks,
+        )
+    } else {
+        remove_rows::<false>(
+            delta_mode,
+            state,
+            meta,
+            &tbl,
+            has_ts,
+            keys,
+            &mut scratch.ranges,
+            hooks,
+        )
+    };
+    hooks.restore_erase_scratch(scratch);
+    result
+}
 
-            let erase = tbl.plan_erase_at(state, pos);
-            let ttl_plan = if meta.has_ttl() {
-                match hooks.plan_ttl_batch(
-                    state,
-                    meta,
-                    core::iter::once(TtlMutation::Remove { key }),
-                ) {
-                    Ok(plan) => Some(plan),
-                    Err(error) => return error,
-                }
-            } else {
-                None
-            };
-            let capture = match hooks.begin_capture(state, || {
-                // The plan buffer is reborrowed into the closure; the erase
-                // and TTL plans stay borrowed for the write that follows.
-                let plan_ranges = &mut *ranges;
-                plan_ranges.clear();
-                tbl.erase_ranges(&erase, plan_ranges);
+/// [`batch_map_remove`]'s row loop over a checked table; `RECORDING` is the
+/// journal's state.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn remove_rows<const RECORDING: bool>(
+    delta_mode: bool,
+    state: &mut [u8],
+    meta: &SlotMetaView,
+    tbl: &FlatTable,
+    has_ts: bool,
+    keys: &[u32],
+    ranges: &mut EraseRanges,
+    hooks: &mut impl VmHooks,
+) -> ErrorCode {
+    let mut flags = BatchFlags::default();
+    for &key in keys {
+        let Some(pos) = tbl.find(state, key) else {
+            continue;
+        };
+
+        let erase = tbl.plan_erase_at(state, pos);
+        let ttl_plan = if meta.has_ttl() {
+            match hooks.plan_ttl_batch(state, meta, core::iter::once(TtlMutation::Remove { key })) {
+                Ok(plan) => Some(plan),
+                Err(error) => return error,
+            }
+        } else {
+            None
+        };
+        let capture = if !RECORDING {
+            ByteCapture::UNRECORDED
+        } else {
+            match hooks.begin_capture(state, || {
+                ranges.clear();
+                tbl.erase_ranges(&erase, ranges);
                 if has_ts {
                     erase.for_each_destination_run(|start, len| {
-                        plan_ranges.push((cmp_lane_off(meta) + start * 8, len * 8));
+                        ranges.push((cmp_lane_off(meta) + start * 8, len * 8));
                     });
                 }
-                plan_ranges.push((tbl.size_off, 4));
-                plan_ranges.push((meta.meta_base + SlotMetaOffset::CHANGE_FLAGS, 1));
+                ranges.push((tbl.size_off, 4));
+                ranges.push((meta.meta_base + SlotMetaOffset::CHANGE_FLAGS, 1));
                 if let Some(plan) = &ttl_plan {
                     for &range in plan.ranges() {
-                        plan_ranges.push(range);
+                        ranges.push(range);
                     }
                 }
-                plan_ranges.as_slice()
+                ranges.as_slice()
             }) {
                 Ok(capture) => capture,
                 Err(error) => return error,
-            };
-            erase_slot_map_planned(state, meta, &tbl, &erase);
-            let size = tbl.size(state);
-            tbl.set_size(state, size - 1);
-            meta.set_change_flag(state, ChangeFlag::REMOVED);
-            if let Some(plan) = ttl_plan {
-                hooks.consume_ttl_batch_plan(state, meta, plan);
             }
-            hooks.finish_capture(delta_mode, state, capture);
+        };
+        erase_slot_map_planned(state, meta, tbl, &erase);
+        let size = tbl.size(state);
+        tbl.set_size(state, size - 1);
+        flags.set(state, meta, ChangeFlag::REMOVED);
+        if let Some(plan) = ttl_plan {
+            hooks.consume_ttl_batch_plan(state, meta, plan);
         }
-        ErrorCode::Ok
-    })();
-    hooks.restore_erase_scratch(scratch);
-    result
+        hooks.finish_capture(delta_mode, state, capture);
+    }
+    ErrorCode::Ok
 }
 
 /// Upsert one key/value pair for the per-element dispatch.

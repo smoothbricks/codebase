@@ -5,9 +5,9 @@
 //! Each accepted primitive owns one bounded prior-byte capture, including its
 //! TTL index. An enclosing VM boundary owns flag bytes instead of this capture.
 
-use crate::hash_table::{ENTRY_NONE, FlatTable};
-use crate::hooks::{TtlMutation, VmHooks};
-use crate::meta::SlotMetaView;
+use crate::hash_table::{ENTRY_NONE, EraseRanges, FlatTable};
+use crate::hooks::{ByteCapture, TtlMutation, VmHooks};
+use crate::meta::{BatchFlags, SlotMetaView};
 use columine_types::types::{ChangeFlag, ErrorCode, SlotMetaOffset, SlotType};
 
 /// Bind the key-only table for a HASHSET slot.
@@ -34,10 +34,29 @@ pub fn batch_set_insert(
     if meta.slot_type() == SlotType::Bitmap {
         columine_types::die!("BITMAP slot reached hashset_ops — the VM routes it to bitmap_ops");
     }
+    // One recording decision per batch: the unrecorded loop is compiled
+    // without any capture code.
+    if hooks.undo_enabled() {
+        insert_rows::<true>(delta_mode, state, meta, elems, ts_col, hooks)
+    } else {
+        insert_rows::<false>(delta_mode, state, meta, elems, ts_col, hooks)
+    }
+}
 
+/// [`batch_set_insert`]'s row loop; `RECORDING` is the journal's state.
+#[inline(always)]
+fn insert_rows<const RECORDING: bool>(
+    delta_mode: bool,
+    state: &mut [u8],
+    meta: &SlotMetaView,
+    elems: &[u32],
+    ts_col: Option<&[f64]>,
+    hooks: &mut impl VmHooks,
+) -> ErrorCode {
     let tbl = bind_slot_set(meta);
     let mut local_size = tbl.size(state);
     let max_load = tbl.max_load();
+    let mut flags = BatchFlags::default();
 
     for (i, &elem) in elems.iter().enumerate() {
         let ts = if meta.has_ttl() {
@@ -75,30 +94,34 @@ pub fn batch_set_insert(
         } else {
             None
         };
-        let capture = match hooks.begin_capture(state, || {
-            let ttl = ttl_plan.as_ref().map_or(&[(0, 0); 2], |plan| plan.ranges());
-            [
-                (
-                    tbl.keys_off + probe.pos * 4,
-                    if probe.found { 0 } else { 4 },
-                ),
-                (tbl.size_off, if probe.found { 0 } else { 4 }),
-                (
-                    meta.meta_base + SlotMetaOffset::CHANGE_FLAGS,
-                    if probe.found { 0 } else { 1 },
-                ),
-                ttl[0],
-                ttl[1],
-            ]
-        }) {
-            Ok(capture) => capture,
-            Err(error) => return error,
+        let capture = if !RECORDING {
+            ByteCapture::UNRECORDED
+        } else {
+            match hooks.begin_capture(state, || {
+                let ttl = ttl_plan.as_ref().map_or(&[(0, 0); 2], |plan| plan.ranges());
+                [
+                    (
+                        tbl.keys_off + probe.pos * 4,
+                        if probe.found { 0 } else { 4 },
+                    ),
+                    (tbl.size_off, if probe.found { 0 } else { 4 }),
+                    (
+                        meta.meta_base + SlotMetaOffset::CHANGE_FLAGS,
+                        if probe.found { 0 } else { 1 },
+                    ),
+                    ttl[0],
+                    ttl[1],
+                ]
+            }) {
+                Ok(capture) => capture,
+                Err(error) => return error,
+            }
         };
         if !probe.found {
             tbl.set_key_at(state, probe.pos, elem);
             local_size += 1;
             tbl.set_size(state, local_size);
-            meta.set_change_flag(state, ChangeFlag::INSERTED);
+            flags.set(state, meta, ChangeFlag::INSERTED);
         }
         if let Some(plan) = ttl_plan {
             hooks.consume_ttl_batch_plan(state, meta, plan);
@@ -136,55 +159,91 @@ pub fn batch_set_remove(
         return ErrorCode::InvalidState;
     }
     let mut scratch = hooks.take_erase_scratch();
-    let result = (|| {
-        let ranges = &mut scratch.ranges;
-        for &elem in elems {
-            let Some(pos) = tbl.find(state, elem) else {
-                continue;
-            };
+    // One recording decision per batch: the unrecorded loop is compiled
+    // without any capture code.
+    let result = if hooks.undo_enabled() {
+        remove_rows::<true>(
+            delta_mode,
+            state,
+            meta,
+            &tbl,
+            elems,
+            &mut scratch.ranges,
+            hooks,
+        )
+    } else {
+        remove_rows::<false>(
+            delta_mode,
+            state,
+            meta,
+            &tbl,
+            elems,
+            &mut scratch.ranges,
+            hooks,
+        )
+    };
+    hooks.restore_erase_scratch(scratch);
+    result
+}
 
-            let erase = tbl.plan_erase_at(state, pos);
-            let ttl_plan = if meta.has_ttl() {
-                match hooks.plan_ttl_batch(
-                    state,
-                    meta,
-                    core::iter::once(TtlMutation::Remove { key: elem }),
-                ) {
-                    Ok(plan) => Some(plan),
-                    Err(error) => return error,
-                }
-            } else {
-                None
-            };
-            let capture = match hooks.begin_capture(state, || {
-                // The plan buffer is reborrowed into the closure; the erase
-                // and TTL plans stay borrowed for the write that follows.
-                let plan_ranges = &mut *ranges;
-                plan_ranges.clear();
-                tbl.erase_ranges(&erase, plan_ranges);
-                plan_ranges.push((tbl.size_off, 4));
-                plan_ranges.push((meta.meta_base + SlotMetaOffset::CHANGE_FLAGS, 1));
+/// [`batch_set_remove`]'s row loop over a checked table; `RECORDING` is the
+/// journal's state.
+#[inline(always)]
+fn remove_rows<const RECORDING: bool>(
+    delta_mode: bool,
+    state: &mut [u8],
+    meta: &SlotMetaView,
+    tbl: &FlatTable,
+    elems: &[u32],
+    ranges: &mut EraseRanges,
+    hooks: &mut impl VmHooks,
+) -> ErrorCode {
+    let mut flags = BatchFlags::default();
+    for &elem in elems {
+        let Some(pos) = tbl.find(state, elem) else {
+            continue;
+        };
+
+        let erase = tbl.plan_erase_at(state, pos);
+        let ttl_plan = if meta.has_ttl() {
+            match hooks.plan_ttl_batch(
+                state,
+                meta,
+                core::iter::once(TtlMutation::Remove { key: elem }),
+            ) {
+                Ok(plan) => Some(plan),
+                Err(error) => return error,
+            }
+        } else {
+            None
+        };
+        let capture = if !RECORDING {
+            ByteCapture::UNRECORDED
+        } else {
+            match hooks.begin_capture(state, || {
+                ranges.clear();
+                tbl.erase_ranges(&erase, ranges);
+                ranges.push((tbl.size_off, 4));
+                ranges.push((meta.meta_base + SlotMetaOffset::CHANGE_FLAGS, 1));
                 if let Some(plan) = &ttl_plan {
                     for &range in plan.ranges() {
-                        plan_ranges.push(range);
+                        ranges.push(range);
                     }
                 }
-                plan_ranges.as_slice()
+                ranges.as_slice()
             }) {
                 Ok(capture) => capture,
                 Err(error) => return error,
-            };
-            tbl.erase_planned(state, &erase, |_, _, _| {});
-            let size = tbl.size(state);
-            tbl.set_size(state, size - 1);
-            meta.set_change_flag(state, ChangeFlag::REMOVED);
-            if let Some(plan) = ttl_plan {
-                hooks.consume_ttl_batch_plan(state, meta, plan);
             }
-            hooks.finish_capture(delta_mode, state, capture);
+        };
+        tbl.erase_planned(state, &erase, |_, _, _| {});
+        let size = tbl.size(state);
+        tbl.set_size(state, size - 1);
+        flags.set(state, meta, ChangeFlag::REMOVED);
+        if let Some(plan) = ttl_plan {
+            hooks.consume_ttl_batch_plan(state, meta, plan);
         }
-        ErrorCode::Ok
-    })();
-    hooks.restore_erase_scratch(scratch);
-    result
+        hooks.finish_capture(delta_mode, state, capture);
+    }
+    ErrorCode::Ok
 }

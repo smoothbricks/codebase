@@ -753,7 +753,7 @@ impl UndoState {
         plan: impl FnOnce() -> P,
     ) -> Result<ByteCapture, ErrorCode> {
         if !self.enabled {
-            return Ok(ByteCapture { frame: None });
+            return Ok(ByteCapture::UNRECORDED);
         }
         self.begin_recording(state, plan().as_ref())
     }

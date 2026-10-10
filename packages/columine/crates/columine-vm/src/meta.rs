@@ -162,3 +162,20 @@ impl SlotMetaView {
         self.type_flags.has_evict_trigger()
     }
 }
+
+/// Change-flag bits one batch kernel has already set on its slot. Nothing
+/// clears a flag inside a batch, so each bit is written once per batch and
+/// rows carry no read-modify-write chain through the same flag byte.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct BatchFlags(u8);
+
+impl BatchFlags {
+    /// OR `flag` into the slot's change flags unless this batch already did.
+    #[inline(always)]
+    pub(crate) fn set(&mut self, state: &mut [u8], meta: &SlotMetaView, flag: u8) {
+        if self.0 & flag != flag {
+            meta.set_change_flag(state, flag);
+            self.0 |= flag;
+        }
+    }
+}
