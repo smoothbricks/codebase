@@ -618,7 +618,10 @@ impl UndoState {
         Err(code)
     }
 
-    fn reserve_entries(&mut self, count: u32) -> Result<(), ErrorCode> {
+    /// Refuse `count` more records past the record budget, before any storage
+    /// is reserved for them: a write over budget is `JournalOverflow` whether
+    /// or not the memory could have backed it.
+    fn within_budget(&mut self, count: u32) -> Result<(), ErrorCode> {
         if let Some(code) = self.refused {
             return Err(code);
         }
@@ -630,6 +633,11 @@ impl UndoState {
         {
             return self.refuse(ErrorCode::JournalOverflow);
         }
+        Ok(())
+    }
+
+    fn reserve_entries(&mut self, count: u32) -> Result<(), ErrorCode> {
+        self.within_budget(count)?;
         // Back the admitted entries with storage now, grown geometrically to
         // actual demand, so no later push allocates. Storage that cannot be
         // had refuses as `OutOfMemory`: before any write, and sticky, so the
@@ -786,8 +794,11 @@ impl UndoState {
             return Err(ErrorCode::InvalidState);
         }
         let count = self.validate_ranges(state, ranges)?;
-        // Before-bytes and their ranges never exceed the declared bytes and
-        // the reserved chunks; both are backed before the budget is taken.
+        // The budget is judged first, so a capture over it is
+        // `JournalOverflow` and never the scratch's `OutOfMemory`. Before-bytes
+        // and their ranges never exceed the declared bytes and the reserved
+        // chunks; both are backed before the entries are.
+        self.within_budget(count)?;
         let bytes: usize = ranges.iter().map(|&(_, len)| len as usize).sum();
         if self.capture_scratch.try_reserve(bytes).is_err()
             || self.capture_ranges.try_reserve(count as usize).is_err()
@@ -5921,6 +5932,13 @@ impl Vm {
     /// Return whether the window refused a write: its budget or its storage.
     pub fn undo_has_overflow(&self) -> bool {
         self.undo.refused.is_some()
+    }
+
+    /// Which refusal the window holds, if it refused a write: the record
+    /// budget (`JournalOverflow`) or the memory backing its storage
+    /// (`OutOfMemory`). A host names the operator's next move from it.
+    pub fn undo_refusal(&self) -> Option<ErrorCode> {
+        self.undo.refused
     }
 
     /// Observe a journal without being able to reset its live window or refusal.

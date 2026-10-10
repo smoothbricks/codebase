@@ -920,6 +920,7 @@ fn unbacked_capture_storage_refuses_before_any_write_and_stays_refused() {
     );
     assert_eq!(original, state, "the refusal wrote nothing");
     assert_eq!(open(true, true, 0, 0), vm.undo_status());
+    assert_eq!(Some(ErrorCode::OutOfMemory), vm.undo_refusal());
 
     assert_eq!(
         Err(ErrorCode::OutOfMemory),
@@ -993,4 +994,29 @@ fn unbacked_redo_lane_refuses_the_paired_write_and_stays_refused() {
         lookup(&state, 1),
         "rollback still restores the window"
     );
+}
+
+/// The record budget is judged before any storage is backed: a capture over
+/// it is `JournalOverflow` even when the memory could not have backed its
+/// scratch either, so the host is told the budget, not the memory, ran out.
+#[test]
+fn a_capture_over_budget_is_journal_overflow_even_without_memory() {
+    let prog = map_program(16);
+    let mut state = init(&prog);
+    let mut vm = Vm::default();
+    vm.undo_enable(&state).expect("undo window opens");
+    let last = image_len(&state) - 1;
+    for _ in 0..UNDO_CAPACITY {
+        vm.capture_mutation(false, &mut state, &[(last, 1)], |image| {
+            image[last as usize] ^= 1;
+        })
+        .expect("within the record budget");
+    }
+    assert!(image_len(&state) > 256, "the wide range fits the image");
+    let before = state.clone();
+    // Wider than any capture so far: its scratch would need new storage.
+    let refused = without_memory(|| vm.capture_mutation(false, &mut state, &[(0, 256)], |_| {}));
+    assert_eq!(Err(ErrorCode::JournalOverflow), refused);
+    assert_eq!(Some(ErrorCode::JournalOverflow), vm.undo_refusal());
+    assert_eq!(before, state);
 }
