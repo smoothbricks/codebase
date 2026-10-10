@@ -422,18 +422,16 @@ where
     })
 }
 
-/// Replace each planned link with its restored target.
+/// Replace each planned link with its restored target. Links are grouped by their held parent:
+/// each parent is opened once, every link in it is repointed through that handle, and a parent
+/// that changed is synced once before `apply` returns. A marker written after `apply` therefore
+/// never names a link the disk does not yet hold.
 pub fn apply(tree_root: &Path, plan: &LinkPlan) -> Result<()> {
-    for rewrite in &plan.rewrites {
-        let path = tree_root.join(&rewrite.at);
-        let parent = path.parent().expect("a planned link has a parent");
-        let name = path.file_name().expect("a planned link has a name");
-        let name = CString::new(name.as_bytes()).map_err(|_| {
-            CowshedError::integrity(
-                format!("link name at {} contains NUL", path.display()),
-                "repair the workspace link name",
-            )
-        })?;
+    let mut rewrites: Vec<&Rewrite> = plan.rewrites.iter().collect();
+    rewrites.sort_by(|left, right| left.at.parent().cmp(&right.at.parent()));
+    for group in rewrites.chunk_by(|left, right| left.at.parent() == right.at.parent()) {
+        let first = tree_root.join(&group[0].at);
+        let parent = first.parent().expect("a planned link has a parent");
         let directory = AnchoredDirectory::open(parent).map_err(|source| {
             CowshedError::integrity(
                 format!(
@@ -443,18 +441,42 @@ pub fn apply(tree_root: &Path, plan: &LinkPlan) -> Result<()> {
                 "check the workspace mount is writable, then retry",
             )
         })?;
-        directory
-            .exact_symlink(&name, &rewrite.restored)
-            .map_err(|source| {
+        let mut changed = false;
+        for rewrite in group {
+            let name = rewrite.at.file_name().expect("a planned link has a name");
+            let name = CString::new(name.as_bytes()).map_err(|_| {
                 CowshedError::integrity(
                     format!(
-                        "could not point {} at {}: {source}",
-                        path.display(),
-                        rewrite.restored.display()
+                        "link name at {} contains NUL",
+                        tree_root.join(&rewrite.at).display()
+                    ),
+                    "repair the workspace link name",
+                )
+            })?;
+            changed |= directory
+                .exact_symlink(&name, &rewrite.restored)
+                .map_err(|source| {
+                    CowshedError::integrity(
+                        format!(
+                            "could not point {} at {}: {source}",
+                            tree_root.join(&rewrite.at).display(),
+                            rewrite.restored.display()
+                        ),
+                        "check the workspace mount is writable, then retry",
+                    )
+                })?;
+        }
+        if changed {
+            directory.sync().map_err(|source| {
+                CowshedError::integrity(
+                    format!(
+                        "could not sync {} after repointing its links: {source}",
+                        parent.display()
                     ),
                     "check the workspace mount is writable, then retry",
                 )
             })?;
+        }
     }
     Ok(())
 }
@@ -494,21 +516,31 @@ pub fn migrate_owned_links(
             "repair the workspace marker, then retry",
         )
     })?;
-    if marker.repo_id != *expected_repo
-        || marker.workspace_incarnation != *expected_incarnation
-        || marker.project_root != donor
-    {
+    if marker.repo_id != *expected_repo || marker.workspace_incarnation != *expected_incarnation {
         return Err(CowshedError::integrity(
             format!(
-                "workspace marker {} does not name this repository, incarnation and donor",
+                "workspace marker {} does not name this repository and incarnation",
                 marker_path.display()
             ),
-            "refuse the migration; the marker and the donor disagree",
+            "refuse the migration; the marker and this workspace disagree",
         ));
     }
     if marker.owned_links_revision >= OWNED_LINKS_REVISION {
         return Ok(None);
     }
+    if marker.project_root != donor {
+        return Err(CowshedError::integrity(
+            format!(
+                "workspace marker {} names a different donor than {}",
+                marker_path.display(),
+                donor.display()
+            ),
+            "refuse the migration; the marker and the donor disagree",
+        ));
+    }
+    // A legacy tree is applied one held parent at a time. A crash between parents leaves some of
+    // them done, and the next run plans only the links still naming the donor: a rewritten link is
+    // relative, so it is never planned again.
     let plan = plan(root, donor, RestoreScope::OwnedAbsolute)?;
     apply(root, &plan)?;
     marker.owned_links_revision = OWNED_LINKS_REVISION;
@@ -527,6 +559,7 @@ pub fn migrate_owned_links(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fsio::{Syncs, take_syncs};
     use std::os::unix::fs::symlink;
 
     /// A scratch tree removed when dropped, so a failed assertion — or the deliberate panic one
@@ -987,6 +1020,99 @@ mod tests {
         assert_eq!(
             fs::read_link(tree.join("node_modules/late")).expect("late link"),
             donor.join(".cache/owned")
+        );
+    }
+
+    #[test]
+    fn an_interrupted_owned_migration_converges_on_the_next_run_without_absence() {
+        let donor = temp_tree("owned-prefix-donor");
+        let tree = temp_tree("owned-prefix-tree");
+        fs::create_dir_all(donor.join(".cache/a")).expect("donor a");
+        fs::create_dir_all(donor.join(".cache/b")).expect("donor b");
+        fs::create_dir_all(tree.join(".cowshed")).expect("marker parent");
+        fs::create_dir_all(tree.join("node_modules")).expect("tree modules");
+        symlink(donor.join(".cache/a"), tree.join("node_modules/a")).expect("a");
+        symlink(donor.join(".cache/b"), tree.join("node_modules/b")).expect("b");
+        let marker: WorkspaceMarker = serde_json::from_value(serde_json::json!({
+            "version": 1,
+            "repoId": "acme/widget",
+            "projectRoot": donor.display().to_string(),
+            "workspace": "raven",
+            "workspaceIncarnation": "0198f2c0b7e34dc795f17b238b331c80",
+            "role": "workspace",
+            "baseCommit": "8f31c2d",
+            "createdAt": "2026-07-11T12:00:00Z",
+            "forkedFrom": null,
+            "createdTrace": "4bf92f"
+        }))
+        .expect("legacy marker");
+        write_json(&tree.join(WORKSPACE_MARKER_PATH), &marker).expect("write legacy marker");
+        let repo = RepoId::parse("acme/widget").expect("repo");
+        let incarnation =
+            WorkspaceIncarnation::new("0198f2c0b7e34dc795f17b238b331c80").expect("incarnation");
+        // A crash after the first link and before the marker: only that prefix is applied.
+        let mut partial = plan(&tree, &donor, RestoreScope::OwnedAbsolute).expect("plan");
+        assert_eq!(partial.rewrites.len(), 2);
+        partial.rewrites.truncate(1);
+        apply(&tree, &partial).expect("first link only");
+        assert_eq!(
+            WorkspaceMarker::read_from(&tree.join(WORKSPACE_MARKER_PATH))
+                .expect("marker")
+                .owned_links_revision,
+            0,
+            "the marker still names the legacy revision"
+        );
+        let rest = migrate_owned_links(&tree, &donor, &repo, &incarnation)
+            .expect("converge")
+            .expect("the next run runs");
+        assert_eq!(rest.rewrites.len(), 1, "only the remaining link is planned");
+        for name in ["a", "b"] {
+            assert_eq!(
+                fs::read_link(tree.join("node_modules").join(name)).expect("link never absent"),
+                Path::new(&format!("../.cache/{name}"))
+            );
+        }
+        assert_eq!(
+            WorkspaceMarker::read_from(&tree.join(WORKSPACE_MARKER_PATH))
+                .expect("marker")
+                .owned_links_revision,
+            OWNED_LINKS_REVISION
+        );
+    }
+
+    /// Each parent holding a changed link is synced once, after its last repoint and before `apply`
+    /// returns. A parent whose links already name their targets is not synced at all.
+    #[test]
+    fn apply_syncs_each_touched_parent_once_before_returning() {
+        let donor = temp_tree("apply-sync-donor");
+        let tree = temp_tree("apply-sync-tree");
+        fs::create_dir_all(tree.join("node_modules/@scope")).expect("tree modules");
+        let mut rewrites = Vec::new();
+        for at in ["node_modules/a", "node_modules/b", "node_modules/@scope/c"] {
+            symlink(donor.join("old"), tree.join(at)).expect("inherited link");
+            rewrites.push(Rewrite {
+                at: PathBuf::from(at),
+                inherited: donor.join("old"),
+                restored: donor.join("new"),
+            });
+        }
+        let plan = LinkPlan {
+            rewrites,
+            refusals: Vec::new(),
+            symlinks_seen: 3,
+        };
+        take_syncs();
+        apply(&tree, &plan).expect("apply");
+        assert_eq!(
+            take_syncs(),
+            Syncs { fsync: 0, full: 2 },
+            "one sync for node_modules and one for node_modules/@scope"
+        );
+        apply(&tree, &plan).expect("apply again");
+        assert_eq!(
+            take_syncs(),
+            Syncs::default(),
+            "links that already name their targets are kept without a sync"
         );
     }
 }

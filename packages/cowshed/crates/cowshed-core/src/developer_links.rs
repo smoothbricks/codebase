@@ -251,18 +251,22 @@ impl DeveloperLinks {
         if self.is_empty() {
             return Ok(Vec::new());
         }
+        // Phase one plans every link before any mutation, so alias and owner decisions read the
+        // installer's pre-restore state.
         let mut decisions = Vec::with_capacity(self.links.len());
         for link in &self.links {
             decisions.push(plan(root, &self.links, link, mode)?);
         }
         let mut findings = Vec::new();
+        let mut restores = Vec::new();
         for (link, decision) in self.links.iter().zip(decisions) {
             match decision {
                 Plan::Keep => {}
                 Plan::Finding(message) => findings.push(message),
-                Plan::Restore => restore_link(root, link, mode)?,
+                Plan::Restore => restores.push(link),
             }
         }
+        restore_links(root, restores, mode)?;
         crate::build_volume::discard::reap(root);
         Ok(findings)
     }
@@ -405,15 +409,17 @@ fn preserved(
             let alias_at = root.join(&link.at);
             let canonical = match fs::canonicalize(&alias_at) {
                 Ok(canonical) => canonical,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+                Err(error) if unprobeable(&error) => return Ok(false),
                 Err(error) => return Err(link_error(&alias_at, error)),
             };
-            if registry_store(root, &canonical)
-                || !fs::metadata(&canonical)
-                    .map_err(|error| link_error(&alias_at, error))?
-                    .is_file()
-            {
+            if registry_store(root, &canonical) {
                 return Ok(false);
+            }
+            match fs::metadata(&canonical) {
+                Ok(metadata) if metadata.is_file() => {}
+                Ok(_) => return Ok(false),
+                Err(error) if unprobeable(&error) => return Ok(false),
+                Err(error) => return Err(link_error(&alias_at, error)),
             }
             let Some(owner_link) = links.iter().find(|candidate| candidate.at == *owner) else {
                 return Ok(false);
@@ -458,37 +464,65 @@ fn live_binding(root: &Path, relative: &Path, target: &[u8]) -> io::Result<bool>
     }
     let canonical = match fs::canonicalize(root.join(relative)) {
         Ok(canonical) => canonical,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) if unprobeable(&error) => return Ok(false),
         Err(error) => return Err(error),
     };
-    Ok(fs::metadata(&canonical)?.is_dir())
+    match fs::metadata(&canonical) {
+        Ok(metadata) => Ok(metadata.is_dir()),
+        Err(error) if unprobeable(&error) => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
-fn restore_link(root: &Path, link: &DeveloperLink, mode: RestoreMode) -> Result<()> {
-    let at = root.join(&link.at);
-    let parent = at.parent().expect("a package link has a parent");
-    let directory = match mode {
-        RestoreMode::CoveredInstall | RestoreMode::JobTerminalObservedInstall => {
-            AnchoredDirectory::create(parent)
+/// A target this restoration cannot probe is not a live developer binding: a sandboxed job's
+/// denied target, or one that is gone. The exact snapshot restores it without reading it.
+fn unprobeable(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
+    )
+}
+
+/// Restores the planned links one held parent at a time. The parent is opened once, every link
+/// planned under it is restored through that handle, and it is synced once if any entry changed,
+/// before the next parent is opened, so one parent handle is held at a time.
+fn restore_links(root: &Path, mut restores: Vec<&DeveloperLink>, mode: RestoreMode) -> Result<()> {
+    restores.sort_by(|left, right| left.at.parent().cmp(&right.at.parent()));
+    for group in restores.chunk_by(|left, right| left.at.parent() == right.at.parent()) {
+        let parent = root.join(group[0].at.parent().expect("a package link has a parent"));
+        let directory = match mode {
+            RestoreMode::CoveredInstall | RestoreMode::JobTerminalObservedInstall => {
+                AnchoredDirectory::create(&parent)
+            }
+            RestoreMode::JobTerminal => AnchoredDirectory::open(&parent),
         }
-        RestoreMode::JobTerminal => AnchoredDirectory::open(parent),
-    }
-    .map_err(|error| link_error(parent, error))?;
-    let name = leaf_name(&at)?;
-    let changed = directory
-        .restore_symlink(&name, &link.target, || {
-            let discard = AnchoredDirectory::create(
-                &root.join(crate::build_volume::discard::DISCARD_DIRECTORY),
-            )?;
-            Ok((discard, discard_leaf(&link.at)?))
-        })
-        .map_err(|error| link_error(&at, error))?;
-    if changed {
-        eprintln!(
-            "cowshed: restored developer link {} -> {}",
-            link.at.display(),
-            link.target.display()
-        );
+        .map_err(|error| link_error(&parent, error))?;
+        let mut touched = false;
+        for link in group {
+            let at = root.join(&link.at);
+            let name = leaf_name(&at)?;
+            let restored = directory
+                .restore_symlink(&name, &link.target, || {
+                    let discard = AnchoredDirectory::create(
+                        &root.join(crate::build_volume::discard::DISCARD_DIRECTORY),
+                    )?;
+                    Ok((discard, discard_leaf(&link.at)?))
+                })
+                .map_err(|error| link_error(&at, error))?;
+            if restored {
+                eprintln!(
+                    "cowshed: restored developer link {} -> {}",
+                    link.at.display(),
+                    link.target.display()
+                );
+                touched = true;
+            }
+        }
+        if touched {
+            directory
+                .sync()
+                .map_err(|error| link_error(&parent, error))?;
+        }
     }
     Ok(())
 }
@@ -1073,15 +1107,16 @@ mod tests {
         );
     }
 
-    /// The sandbox proof for B3: a real `sandbox-exec` denial makes the target's canonicalize fail
-    /// with the kernel's own error, not a substituted one. The parent sets up the fixture and runs
-    /// this same test again inside the profile; the child asserts the job-side behaviour and writes
-    /// proof beside the checkout. The `--exact` child never spawns another process.
+    /// The sandbox proof that a job snapshot keeps an unreadable target unclassified: a real
+    /// `sandbox-exec` denial makes the target's canonicalize fail with the kernel's own error, not
+    /// a substituted one. The parent sets up the fixture and runs this same test again inside the
+    /// profile; the child asserts the job-side behaviour and writes proof beside the checkout. The
+    /// `--exact` child never spawns another process.
     #[cfg(target_os = "macos")]
     #[test]
     fn job_snapshot_keeps_an_unreadable_target_unclassified_without_grants() {
-        const FIXTURE_ENV: &str = "COWSHED_B3_FIXTURE_ROOT";
-        const PROOF: &str = "b3-proof";
+        const FIXTURE_ENV: &str = "COWSHED_UNREADABLE_LINK_FIXTURE_ROOT";
+        const PROOF: &str = "unreadable-link-proof";
         if let Some(root) = std::env::var_os(FIXTURE_ENV) {
             let root = PathBuf::from(root);
             let links = DeveloperLinks::capture_job(&root)
@@ -1113,7 +1148,7 @@ mod tests {
             .unwrap();
             return;
         }
-        let scratch = crate::temp_root::TempRoot::new("developer-links-b3");
+        let scratch = crate::temp_root::TempRoot::new("developer-links-unreadable-link");
         let root = scratch.join("checkout");
         fs::create_dir_all(root.join("node_modules")).unwrap();
         fs::write(root.join("package.json"), "{}\n").unwrap();
@@ -1216,6 +1251,130 @@ mod tests {
         assert_eq!(
             fs::read_link(root.join("node_modules/.bin/owner-cli")).unwrap(),
             Path::new("../@scope/owner/bin/cli")
+        );
+    }
+
+    /// Under a real sandbox, a job that replaces a registry payload and relinks a package to a
+    /// target the sandbox denies must have both repaired by terminal cleanup. The child captures
+    /// while the targets are still readable, then the job makes its changes, then the denial
+    /// applies to the restore: the denied relink is restored to its captured bytes without
+    /// reading its target. `/usr/bin/sandbox-exec` is the real seatbelt, not a mocked errno.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn job_terminal_repairs_a_registry_replacement_and_a_relink_to_a_denied_target() {
+        const FIXTURE_ENV: &str = "COWSHED_DENIED_RELINK_FIXTURE_ROOT";
+        const PROOF: &str = "denied-relink-proof";
+        if let Some(root) = std::env::var_os(FIXTURE_ENV) {
+            let root = PathBuf::from(root);
+            let links = DeveloperLinks::capture_job(&root).expect("the job snapshot");
+            let allowed = root.parent().unwrap().join("allowed");
+            let denied_other = root.parent().unwrap().join("denied/other");
+            let sibling = root.parent().unwrap().join("sibling");
+            let original_cli = PathBuf::from("../foreign/bin/cli");
+            // The job's own changes: a registry payload replaces the sibling link, the foreign
+            // package is relinked into the denied subtree, and its .bin alias is retargeted to the
+            // denied subtree's cli, so both denied links differ from their captured bytes.
+            fs::remove_file(root.join("node_modules/@scope/dev")).unwrap();
+            fs::create_dir_all(root.join("node_modules/@scope/dev")).unwrap();
+            fs::write(
+                root.join("node_modules/@scope/dev/registry-payload"),
+                "installed\n",
+            )
+            .unwrap();
+            fs::remove_file(root.join("node_modules/foreign")).unwrap();
+            symlink(&denied_other, root.join("node_modules/foreign")).unwrap();
+            fs::remove_file(root.join("node_modules/.bin/pkg")).unwrap();
+            symlink(
+                denied_other.join("bin/cli"),
+                root.join("node_modules/.bin/pkg"),
+            )
+            .unwrap();
+            let findings = links
+                .restore(&root, RestoreMode::JobTerminal)
+                .expect("terminal cleanup repairs all three without reading the denied targets");
+            assert!(findings.is_empty());
+            assert_eq!(
+                fs::read_link(root.join("node_modules/@scope/dev")).unwrap(),
+                sibling
+            );
+            assert_eq!(
+                fs::read_link(root.join("node_modules/foreign")).unwrap(),
+                allowed
+            );
+            assert_eq!(
+                fs::read_link(root.join("node_modules/.bin/pkg")).unwrap(),
+                original_cli,
+                "the denied alias is restored to its captured bytes"
+            );
+            fs::write(
+                root.parent().unwrap().join(PROOF),
+                "denied-relink-repaired\n",
+            )
+            .unwrap();
+            return;
+        }
+        let scratch = crate::temp_root::TempRoot::new("developer-links-denied-relink");
+        let root = scratch.join("checkout");
+        fs::create_dir_all(root.join("node_modules/@scope")).unwrap();
+        fs::create_dir_all(root.join("node_modules/.bin")).unwrap();
+        fs::write(root.join("package.json"), "{}\n").unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "--quiet"])
+                .current_dir(&root)
+                .status_locked()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args(["add", "package.json"])
+                .current_dir(&root)
+                .status_locked()
+                .unwrap()
+                .success()
+        );
+        let sibling = scratch.join("sibling");
+        let allowed = scratch.join("allowed");
+        let denied = scratch.join("denied");
+        for directory in [
+            &sibling,
+            &allowed,
+            &denied.join("other"),
+            &denied.join("original"),
+        ] {
+            fs::create_dir_all(directory).unwrap();
+        }
+        fs::create_dir_all(allowed.join("bin")).unwrap();
+        fs::create_dir_all(denied.join("other/bin")).unwrap();
+        fs::write(allowed.join("bin/cli"), "#!/bin/sh\n").unwrap();
+        fs::write(denied.join("other/bin/cli"), "#!/bin/sh\n").unwrap();
+        symlink(&sibling, root.join("node_modules/@scope/dev")).unwrap();
+        symlink(&allowed, root.join("node_modules/foreign")).unwrap();
+        symlink("../foreign/bin/cli", root.join("node_modules/.bin/pkg")).unwrap();
+        let denied_canonical = fs::canonicalize(&denied).unwrap();
+        let profile = format!(
+            "(version 1)(allow default)(deny file-read* (subpath {}))",
+            serde_json::to_string(denied_canonical.to_str().unwrap()).unwrap()
+        );
+        let status = Command::new("/usr/bin/sandbox-exec")
+            .arg("-p")
+            .arg(profile)
+            .arg(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "developer_links::tests::job_terminal_repairs_a_registry_replacement_and_a_relink_to_a_denied_target",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(FIXTURE_ENV, &root)
+            .status_locked()
+            .unwrap();
+        assert!(status.success(), "sandboxed child failed: {status}");
+        assert_eq!(
+            fs::read_to_string(scratch.join(PROOF)).unwrap(),
+            "denied-relink-repaired\n",
+            "the child reached its assertions"
         );
     }
 }

@@ -3549,10 +3549,12 @@ enum Conclusion {
     Unsealed(CowshedError),
 }
 
-/// The per-job marker a covered install wrapper writes once its install ran, named by the job's
-/// `COWSHED_INSTALL_OBSERVED` environment. Created before launch; its presence alone lets terminal
-/// cleanup restore a link the install removed. A job can write it, so forging it only restores
-/// links the cleanup would otherwise report: it grants and attests nothing.
+/// The per-job marker the covered install wrapper writes before it runs the install, named by the
+/// job's `COWSHED_INSTALL_OBSERVED` environment (`developer_links::dispatch` writes it before
+/// `status_locked`). Terminal cleanup inspects it and attempts its removal after restoration, so
+/// a removal failure is reported after the restore, never before it. An unreadable, non-regular or
+/// otherwise unexpected marker counts as unobserved, with a finding. A job can write it, so forging
+/// it only restores links the cleanup would otherwise report: it grants and attests nothing.
 struct InstallObservation {
     directory: AnchoredDirectory,
     name: std::ffi::CString,
@@ -3592,6 +3594,121 @@ impl InstallObservation {
     }
 }
 
+/// Why a job's terminal cleanup failed. Each cause keeps its own error and label; the two together
+/// are one typed value, never a string the caller must parse.
+enum TerminalCleanupFailure {
+    /// Restoring the developer links failed.
+    Links(CowshedError),
+    /// Removing the install observation marker failed (its own cleanup, after the restore).
+    InstallObservation(CowshedError),
+    /// Both failed; the restore's error and the marker's are kept, in that order.
+    Both {
+        links: CowshedError,
+        observation: CowshedError,
+    },
+}
+
+impl TerminalCleanupFailure {
+    /// The job's stderr line for this failure, with the label of each cause that occurred.
+    fn label(&self) -> String {
+        match self {
+            Self::Links(error) => format!("developer-link restoration failed: {error}"),
+            Self::InstallObservation(error) => {
+                format!("install observation cleanup failed: {error}")
+            }
+            Self::Both { links, observation } => format!(
+                "developer-link restoration failed: {links}; install observation cleanup failed: {observation}"
+            ),
+        }
+    }
+
+    /// The one error waiters and the sealed record carry. Each single cause keeps its own code and
+    /// hint and is labelled with its cause; when both occurred, the message names both labels.
+    fn into_error(self) -> CowshedError {
+        match self {
+            Self::Links(error) => relabel(error, "developer-link restoration failed"),
+            Self::InstallObservation(error) => relabel(error, "install observation cleanup failed"),
+            Self::Both { links, observation } => CowshedError::new(
+                links.code,
+                format!(
+                    "developer-link restoration failed: {}; install observation cleanup also failed: {}",
+                    links.message, observation.message
+                ),
+                links.hint,
+            ),
+        }
+    }
+}
+
+/// `error` under a cause label: its code and hint kept, its message prefixed with `label`.
+fn relabel(error: CowshedError, label: &str) -> CowshedError {
+    CowshedError::new(
+        error.code,
+        format!("{label}: {}", error.message),
+        error.hint,
+    )
+}
+
+/// What terminal restoration reports: the findings for the job's stderr, and the cleanup failure,
+/// if any, with each cause kept distinct until the caller classifies it.
+struct JobFinish {
+    findings: Vec<String>,
+    failure: Option<TerminalCleanupFailure>,
+}
+
+/// Terminal restoration of one job's developer links. The wrapper's marker decides the mode.
+/// Restoration always runs: an unreadable or non-regular marker counts as unobserved, with a
+/// finding, and a marker that cannot be removed is reported after the restore, never before it.
+fn finish_terminal_restore(
+    root: &Path,
+    links: crate::developer_links::DeveloperLinks,
+    observation: Option<InstallObservation>,
+) -> JobFinish {
+    let mut findings = Vec::new();
+    // Inspect only: the marker is consumed after the restore, so a failure to remove it is reported
+    // after the repair, never before it.
+    let observed = match observation.as_ref() {
+        Some(marker) => match marker.observed() {
+            Ok(observed) => observed,
+            Err(error) => {
+                findings.push(format!(
+                    "developer-link-ambiguous: install observation is unreadable ({error}); treated as unobserved"
+                ));
+                false
+            }
+        },
+        None => false,
+    };
+    let mode = if observed {
+        crate::developer_links::RestoreMode::JobTerminalObservedInstall
+    } else {
+        crate::developer_links::RestoreMode::JobTerminal
+    };
+    let restore_failure = match links.restore(root, mode) {
+        Ok(restored) => {
+            findings.extend(restored);
+            None
+        }
+        Err(error) => Some(error),
+    };
+    let removal_failure = match observation {
+        Some(marker) => marker
+            .remove()
+            .err()
+            .map(|error| install_observation_error(&error)),
+        None => None,
+    };
+    let failure = match (restore_failure, removal_failure) {
+        (None, None) => None,
+        (Some(links), None) => Some(TerminalCleanupFailure::Links(links)),
+        (None, Some(observation)) => Some(TerminalCleanupFailure::InstallObservation(observation)),
+        (Some(links), Some(observation)) => {
+            Some(TerminalCleanupFailure::Both { links, observation })
+        }
+    };
+    JobFinish { findings, failure }
+}
+
 fn install_observation_error(error: &std::io::Error) -> CowshedError {
     CowshedError::integrity(
         format!("install observation: {error}"),
@@ -3616,7 +3733,8 @@ struct JobStateRecord {
     wait_failure: Option<CowshedError>,
     developer_links: crate::developer_links::DeveloperLinks,
     install_observation: Option<InstallObservation>,
-    restoration_failure: Option<CowshedError>,
+    /// The terminal cleanup failure of this job, kept as its one error for waiters and the record.
+    terminal_cleanup_failure: Option<CowshedError>,
     /// Set once the job ended, whatever became of its record.
     conclusion: Option<Conclusion>,
     /// The job's process as its parent observed it, once its pid is known. Never observed again.
@@ -3738,7 +3856,7 @@ impl JobStateRecord {
         let failure = self
             .wait_failure
             .as_ref()
-            .or(self.restoration_failure.as_ref())
+            .or(self.terminal_cleanup_failure.as_ref())
             .or(match &self.conclusion {
                 Some(Conclusion::Sealed {
                     commitment,
@@ -5059,7 +5177,7 @@ impl SupervisorActor {
             wait_failure: None,
             developer_links,
             install_observation,
-            restoration_failure: None,
+            terminal_cleanup_failure: None,
             conclusion: None,
             birth: None,
             sampling: Sampling::Unowned,
@@ -6093,58 +6211,31 @@ impl SupervisorActor {
         };
         if !links.is_empty() || observation.is_some() {
             let root = self.workspace_root.clone();
-            let restored = tokio::task::spawn_blocking(move || {
-                // The wrapper's marker decides the mode before anything is restored. It is removed
-                // on every path, so a finished run leaves none behind.
-                let (inspected, removed) = match observation {
-                    Some(marker) => (marker.observed(), marker.remove()),
-                    None => (Ok(false), Ok(())),
-                };
-                let observed = match (inspected, removed) {
-                    (Ok(observed), Ok(())) => observed,
-                    (Err(inspection), Ok(())) => return Err(install_observation_error(&inspection)),
-                    (Ok(_), Err(removal)) => return Err(install_observation_error(&removal)),
-                    (Err(inspection), Err(removal)) => {
-                        return Err(CowshedError::integrity(
-                            format!("install observation: {inspection}; removing it also failed: {removal}"),
-                            "inspect the job's install-observed directory, then retry",
-                        ));
-                    }
-                };
-                let mode = if observed {
-                    crate::developer_links::RestoreMode::JobTerminalObservedInstall
-                } else {
-                    crate::developer_links::RestoreMode::JobTerminal
-                };
-                links.restore(&root, mode)
+            let finish = tokio::task::spawn_blocking(move || {
+                finish_terminal_restore(&root, links, observation)
             })
-            .await;
-            let failure = match restored {
-                Ok(Ok(findings)) => {
-                    for finding in findings {
-                        self.process_output(
-                            job_id,
-                            StreamKind::Stderr,
-                            Bytes::from(format!("cowshed: {finding}\n")),
-                        );
-                    }
-                    None
-                }
-                Ok(Err(error)) => Some(error),
-                Err(error) => Some(CowshedError::internal(format!(
-                    "developer-link restoration failed: {error}"
+            .await
+            .unwrap_or_else(|error| JobFinish {
+                findings: Vec::new(),
+                failure: Some(TerminalCleanupFailure::Links(CowshedError::internal(
+                    format!("terminal cleanup panicked: {error}"),
                 ))),
-            };
-            if let Some(error) = failure {
+            });
+            for finding in finish.findings {
                 self.process_output(
                     job_id,
                     StreamKind::Stderr,
-                    Bytes::from(format!(
-                        "cowshed: developer-link restoration failed: {error}\n"
-                    )),
+                    Bytes::from(format!("cowshed: {finding}\n")),
+                );
+            }
+            if let Some(failure) = finish.failure {
+                self.process_output(
+                    job_id,
+                    StreamKind::Stderr,
+                    Bytes::from(format!("cowshed: {}\n", failure.label())),
                 );
                 if let Some(job) = self.jobs.get_mut(&job_id) {
-                    job.restoration_failure = Some(error);
+                    job.terminal_cleanup_failure = Some(failure.into_error());
                 }
             }
         }
@@ -6155,7 +6246,7 @@ impl SupervisorActor {
             return;
         }
         let state = forced_state.unwrap_or_else(|| {
-            if job.restoration_failure.is_some() {
+            if job.terminal_cleanup_failure.is_some() {
                 JobState::Failed
             } else {
                 match job.kill_reason {
@@ -9297,5 +9388,204 @@ mod install_observation_tests {
         marker.remove().unwrap();
         assert_eq!(fs::read(foreign_dir.join(&leaf)).unwrap(), b"foreign\n");
         assert!(fs::symlink_metadata(moved.join(&leaf)).is_err());
+    }
+
+    /// A tracked checkout with one scoped package link to a live sibling, captured as a job would.
+    fn captured_checkout(
+        scratch: &Path,
+    ) -> (PathBuf, PathBuf, crate::developer_links::DeveloperLinks) {
+        use crate::fork_lock::Run as _;
+        let root = scratch.join("checkout");
+        fs::create_dir_all(root.join("node_modules/@scope")).unwrap();
+        fs::write(root.join("package.json"), "{}\n").unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "--quiet"])
+                .current_dir(&root)
+                .status_locked()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            std::process::Command::new("git")
+                .args(["add", "package.json"])
+                .current_dir(&root)
+                .status_locked()
+                .unwrap()
+                .success()
+        );
+        let sibling = scratch.join("sibling");
+        fs::create_dir_all(&sibling).unwrap();
+        symlink(&sibling, root.join("node_modules/@scope/dev")).unwrap();
+        let links = crate::developer_links::DeveloperLinks::capture_job(&root).unwrap();
+        (root, sibling, links)
+    }
+
+    #[test]
+    fn an_unreadable_marker_counts_unobserved_and_still_restores_a_registry_replacement() {
+        let scratch = crate::temp_root::TempRoot::new("install-observation-directory-marker");
+        let (root, sibling, links) = captured_checkout(&scratch);
+        fs::remove_file(root.join("node_modules/@scope/dev")).unwrap();
+        fs::create_dir_all(root.join("node_modules/@scope/dev")).unwrap();
+        fs::write(
+            root.join("node_modules/@scope/dev/registry-payload"),
+            "installed\n",
+        )
+        .unwrap();
+        let exec = scratch.join("exec");
+        fs::create_dir_all(&exec).unwrap();
+        let marker = InstallObservation::new(&exec).unwrap();
+        fs::create_dir(&marker.path).unwrap();
+        let finish = finish_terminal_restore(&root, links, Some(marker));
+        assert!(
+            finish
+                .findings
+                .iter()
+                .any(|finding| finding.contains("unreadable")),
+            "an unreadable marker is a finding: {:?}",
+            finish.findings
+        );
+        assert_eq!(
+            fs::read_link(root.join("node_modules/@scope/dev")).unwrap(),
+            sibling
+        );
+        assert!(
+            finish.failure.is_some(),
+            "a marker that cannot be removed is reported explicitly, after the restore"
+        );
+    }
+
+    #[test]
+    fn a_read_only_marker_parent_cannot_disable_the_restore_and_its_removal_is_reported() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let scratch = crate::temp_root::TempRoot::new("install-observation-read-only");
+        let (root, sibling, links) = captured_checkout(&scratch);
+        fs::remove_file(root.join("node_modules/@scope/dev")).unwrap();
+        let exec = scratch.join("exec");
+        fs::create_dir_all(&exec).unwrap();
+        let marker = InstallObservation::new(&exec).unwrap();
+        fs::write(&marker.path, b"observed\n").unwrap();
+        let parent = exec.join(INSTALL_OBSERVATION_DIRECTORY);
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o500)).unwrap();
+        let finish = finish_terminal_restore(&root, links, Some(marker));
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            fs::read_link(root.join("node_modules/@scope/dev")).unwrap(),
+            sibling,
+            "the observed install's removed link is restored despite the read-only marker"
+        );
+        assert!(
+            finish.failure.is_some(),
+            "the marker that could not be removed is reported"
+        );
+    }
+
+    /// A link restoration that cannot open its parent fails as the links cause alone, labelled as
+    /// developer-link restoration, with the marker removed and no observation cleanup failure.
+    #[test]
+    fn a_refused_link_parent_is_a_links_failure_and_nothing_else() {
+        let scratch = crate::temp_root::TempRoot::new("terminal-cleanup-links-only");
+        let (root, _sibling, links) = captured_checkout(&scratch);
+        fs::remove_file(root.join("node_modules/@scope/dev")).unwrap();
+        fs::remove_dir_all(root.join("node_modules/@scope")).unwrap();
+        fs::write(root.join("node_modules/@scope"), b"not a directory\n").unwrap();
+        let finish = finish_terminal_restore(&root, links, None);
+        match &finish.failure {
+            Some(TerminalCleanupFailure::Links(_)) => {}
+            other => panic!(
+                "expected a links failure, got {:?}",
+                other.as_ref().map(|f| f.label())
+            ),
+        }
+        let error = finish.failure.unwrap().into_error();
+        assert!(
+            error
+                .message
+                .starts_with("developer-link restoration failed: "),
+            "{}",
+            error.message
+        );
+    }
+
+    /// A marker that cannot be removed, with the links restorable, fails as the observation cleanup
+    /// alone. The registry replacement is still repaired first.
+    #[test]
+    fn a_marker_removal_failure_is_an_observation_failure_after_a_real_restore() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let scratch = crate::temp_root::TempRoot::new("terminal-cleanup-marker-only");
+        let (root, sibling, links) = captured_checkout(&scratch);
+        fs::remove_file(root.join("node_modules/@scope/dev")).unwrap();
+        fs::create_dir_all(root.join("node_modules/@scope/dev")).unwrap();
+        fs::write(
+            root.join("node_modules/@scope/dev/registry-payload"),
+            "installed\n",
+        )
+        .unwrap();
+        let exec = scratch.join("exec");
+        fs::create_dir_all(&exec).unwrap();
+        let marker = InstallObservation::new(&exec).unwrap();
+        fs::write(&marker.path, b"observed\n").unwrap();
+        let parent = exec.join(INSTALL_OBSERVATION_DIRECTORY);
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o500)).unwrap();
+        let finish = finish_terminal_restore(&root, links, Some(marker));
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            fs::read_link(root.join("node_modules/@scope/dev")).unwrap(),
+            sibling
+        );
+        match &finish.failure {
+            Some(TerminalCleanupFailure::InstallObservation(_)) => {}
+            other => panic!(
+                "expected an observation failure, got {:?}",
+                other.as_ref().map(|f| f.label())
+            ),
+        }
+        let error = finish.failure.unwrap().into_error();
+        assert!(
+            error
+                .message
+                .starts_with("install observation cleanup failed: "),
+            "{}",
+            error.message
+        );
+    }
+
+    /// Both causes at once keep both errors: the label names each, and the one error carries both.
+    #[test]
+    fn both_cleanup_causes_are_kept_and_named() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let scratch = crate::temp_root::TempRoot::new("terminal-cleanup-both");
+        let (root, _sibling, links) = captured_checkout(&scratch);
+        fs::remove_file(root.join("node_modules/@scope/dev")).unwrap();
+        fs::remove_dir_all(root.join("node_modules/@scope")).unwrap();
+        fs::write(root.join("node_modules/@scope"), b"not a directory\n").unwrap();
+        let exec = scratch.join("exec");
+        fs::create_dir_all(&exec).unwrap();
+        let marker = InstallObservation::new(&exec).unwrap();
+        fs::write(&marker.path, b"observed\n").unwrap();
+        let parent = exec.join(INSTALL_OBSERVATION_DIRECTORY);
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o500)).unwrap();
+        let finish = finish_terminal_restore(&root, links, Some(marker));
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+        let failure = finish.failure.expect("both causes fail");
+        assert!(matches!(failure, TerminalCleanupFailure::Both { .. }));
+        let label = failure.label();
+        assert!(label.contains("developer-link restoration failed"));
+        assert!(label.contains("install observation cleanup failed"));
+        let error = failure.into_error();
+        assert!(
+            error
+                .message
+                .starts_with("developer-link restoration failed: "),
+            "{}",
+            error.message
+        );
+        assert!(
+            error
+                .message
+                .contains("install observation cleanup also failed: "),
+            "{}",
+            error.message
+        );
     }
 }

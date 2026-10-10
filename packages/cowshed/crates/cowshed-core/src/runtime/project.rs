@@ -6976,12 +6976,6 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                 "cowshed: migrated {} owned absolute link(s) to relative paths",
                 plan.rewrites.len()
             );
-            if !plan.refusals.is_empty() {
-                eprintln!(
-                    "cowshed: owned links not migrated: {}",
-                    plan.refusal_report()
-                );
-            }
         }
         Ok(())
     }

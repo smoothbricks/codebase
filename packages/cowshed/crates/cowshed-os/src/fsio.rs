@@ -207,7 +207,13 @@ impl AnchoredDirectory {
         validate_directory_leaf(source)?;
         validate_directory_leaf(destination)?;
         rename_noreplace(self.0.as_raw_fd(), source, self.0.as_raw_fd(), destination)?;
-        self.0.sync_all()
+        self.sync()
+    }
+
+    /// Make the entries this held directory changed durable. Callers issue it once after their
+    /// last change in the directory, not once per entry.
+    pub(crate) fn sync(&self) -> io::Result<()> {
+        full_sync(&self.0)
     }
 
     /// Keep real private cache entries, preserve matching links, and replace stale links and empty
@@ -270,6 +276,7 @@ impl AnchoredDirectory {
 
     /// Restore one developer alias through held parents, never through a job-mutated path.
     /// A replaced registry directory joins the existing discard lifecycle without overwriting it.
+    /// The caller syncs this held directory once after its last restore in it, see [`Self::sync`].
     pub(crate) fn restore_symlink(
         &self,
         name: &CStr,
@@ -346,7 +353,7 @@ impl AnchoredDirectory {
             {
                 return Err(io::Error::last_os_error());
             }
-            self.0.sync_all()
+            self.sync()
         })();
         if published.is_err() {
             // SAFETY: removes this directory's own temp entry, never a link target.
@@ -362,7 +369,7 @@ impl AnchoredDirectory {
         validate_directory_leaf(name)?;
         // SAFETY: unlinkat removes this directory's own entry, not a link target.
         if unsafe { libc::unlinkat(self.0.as_raw_fd(), name.as_ptr(), 0) } == 0 {
-            return self.0.sync_all();
+            return self.sync();
         }
         let error = io::Error::last_os_error();
         if error.kind() == io::ErrorKind::NotFound {
@@ -443,7 +450,7 @@ impl AnchoredDirectory {
             self.exact_symlink(name.as_ref(), target)?;
         }
         self.publish_file(manifest, &encode(&mut current))?;
-        self.0.sync_all()
+        self.sync()
     }
 
     /// Read the target of the symlink `name` through the held directory into `buffer`, returning
@@ -473,28 +480,59 @@ impl AnchoredDirectory {
         Ok(&buffer[..count])
     }
 
-    /// `name` as a symlink to exactly `target`: a matching link is kept, anything else but a
-    /// directory is unlinked (never followed) and the link created anew.
+    /// `name` as a symlink to exactly `target`. A matching link is kept and nothing is written.
+    /// Anything else is replaced atomically: the new link is made under a unique temp leaf and
+    /// renamed over `name`, so the old entry is never removed first. A directory at `name`
+    /// refuses the rename. The rename is not synced here: a caller that changed links in this
+    /// directory issues one [`Self::sync`] after its last change, before any durable write.
     pub(crate) fn exact_symlink(&self, name: &CStr, target: &Path) -> io::Result<bool> {
         let mut buffer = [0u8; 4096];
         match self.read_link(name, &mut buffer) {
             Ok(bytes) if bytes == target.as_os_str().as_bytes() => return Ok(false),
-            Ok(_) => self.unlink_entry(name)?,
-            // Not a link: a regular file is replaced; a directory refuses the unlink.
+            Ok(_) => {}
+            // Absent, or not a link at all (a regular file the rename replaces).
             Err(error) => match error.raw_os_error() {
-                Some(libc::ENOENT) => {}
-                Some(libc::EINVAL) => self.unlink_entry(name)?,
+                Some(libc::ENOENT | libc::EINVAL) => {}
                 _ => return Err(error),
             },
         }
+        // The NUL checks run before any entry is created, so a refused target mutates nothing.
         let target = CString::new(target.as_os_str().as_bytes())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "link target contains NUL"))?;
-        // SAFETY: the target and leaf are NUL-terminated; the held parent anchors creation.
-        if unsafe { libc::symlinkat(target.as_ptr(), self.0.as_raw_fd(), name.as_ptr()) } == 0 {
-            Ok(true)
-        } else {
-            Err(io::Error::last_os_error())
+        let leaf = temp_name(
+            OsStr::from_bytes(name.to_bytes()),
+            uuid::Uuid::new_v4().simple(),
+        );
+        let temp = CString::new(leaf.as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "link name contains NUL"))?;
+        // SAFETY: the target and temp leaf are NUL-terminated; the held parent anchors creation.
+        if unsafe { libc::symlinkat(target.as_ptr(), self.0.as_raw_fd(), temp.as_ptr()) } != 0 {
+            return Err(io::Error::last_os_error());
         }
+        // SAFETY: both names are leaves beneath the same held directory fd.
+        if unsafe {
+            libc::renameat(
+                self.0.as_raw_fd(),
+                temp.as_ptr(),
+                self.0.as_raw_fd(),
+                name.as_ptr(),
+            )
+        } == 0
+        {
+            return Ok(true);
+        }
+        let error = io::Error::last_os_error();
+        // SAFETY: removes this directory's own temp entry, never a link target.
+        if unsafe { libc::unlinkat(self.0.as_raw_fd(), temp.as_ptr(), 0) } != 0 {
+            let cleanup = io::Error::last_os_error();
+            if cleanup.kind() != io::ErrorKind::NotFound {
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!("{error}; removing the temporary link also failed: {cleanup}"),
+                ));
+            }
+        }
+        Err(error)
     }
 
     /// Unlink the non-directory entry `name`; an absent entry is already gone.
@@ -556,10 +594,17 @@ fn validate_directory_leaf(name: &CStr) -> io::Result<()> {
 
 /// The one temp-artifact grammar: `.{final_name}.tmp.{discriminator}`.
 ///
-/// Dot-prefixed so crash residue hides from listings, with a `.tmp.` infix so a sweeper needs
-/// exactly one recognizer ([`is_temp_artifact`]) instead of per-writer spellings. Applied only in
-/// cowshed-owned directories (project roots, `sessions/`, config and trace directories) — never
-/// to workspace content, which is what keeps the loose recognizer safe.
+/// Dot-prefixed so crash residue hides from listings, with a `.tmp.` infix so one recognizer
+/// ([`is_temp_artifact`]) names every writer's residue. Every writer creates its temp beside the
+/// final name it renames over. The publishers here write regular files into the directory they
+/// are handed. [`AnchoredDirectory::exact_symlink`] can also run in workspace content: it repoints
+/// a link where the link is, such as a package's `node_modules/.bin` alias (developer-link
+/// restoration) or an inherited link's directory (`inherited_links::apply`). A crash between
+/// creating its temp symlink and renaming it leaves an inert, dot-hidden symlink in that
+/// directory, so workspace content can hold residue as well as controller metadata. Creating the
+/// symlink runs nothing. No sweeper or watcher exists, so this residue is never swept on its own:
+/// it is reclaimed only when the tree holding it is removed whole, by `remove_owned_tree` or the
+/// removal that owns that tree.
 pub fn temp_name(final_name: &OsStr, discriminator: impl fmt::Display) -> OsString {
     let mut name = OsString::from(".");
     name.push(final_name);
@@ -1517,6 +1562,66 @@ mod tests {
         assert_eq!(
             fs::read(scratch.join("discard/occupied/keep")).unwrap(),
             b"earlier\n"
+        );
+    }
+
+    #[test]
+    fn exact_symlink_replaces_a_wrong_link_atomically_and_refuses_a_nul_target_untouched() {
+        let scratch = crate::temp_root::TempRoot::new("fsio-exact-symlink");
+        let held = AnchoredDirectory::create(&scratch.join("links")).unwrap();
+        std::os::unix::fs::symlink(scratch.join("old"), scratch.join("links/alias")).unwrap();
+        assert!(held.exact_symlink(c"alias", &scratch.join("new")).unwrap());
+        assert_eq!(
+            fs::read_link(scratch.join("links/alias")).unwrap(),
+            scratch.join("new")
+        );
+        assert!(!held.exact_symlink(c"alias", &scratch.join("new")).unwrap());
+        let nul = Path::new(OsStr::from_bytes(b"a\0b"));
+        let error = held.exact_symlink(c"alias", nul).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            fs::read_link(scratch.join("links/alias")).unwrap(),
+            scratch.join("new"),
+            "the old link is intact after a refused target"
+        );
+        let leftovers = fs::read_dir(scratch.join("links")).unwrap().count();
+        assert_eq!(leftovers, 1, "no temporary link is left behind");
+    }
+
+    #[test]
+    fn exact_symlink_refuses_a_directory_at_the_name_without_removing_it() {
+        let scratch = crate::temp_root::TempRoot::new("fsio-exact-symlink-dir");
+        let held = AnchoredDirectory::create(&scratch.join("links")).unwrap();
+        fs::create_dir(scratch.join("links/alias")).unwrap();
+        fs::write(scratch.join("links/alias/keep"), "real\n").unwrap();
+        assert!(held.exact_symlink(c"alias", &scratch.join("new")).is_err());
+        assert_eq!(
+            fs::read(scratch.join("links/alias/keep")).unwrap(),
+            b"real\n"
+        );
+        assert_eq!(fs::read_dir(scratch.join("links")).unwrap().count(), 1);
+    }
+
+    /// The rename is atomic and carries no sync of its own: a batch of link changes costs the one
+    /// barrier its caller issues, and a link that already matches costs none.
+    #[test]
+    fn exact_symlink_defers_its_directory_sync_to_the_caller() {
+        let scratch = crate::temp_root::TempRoot::new("fsio-deferred-sync");
+        let held = AnchoredDirectory::create(&scratch.join("links")).unwrap();
+        take_syncs();
+        assert!(held.exact_symlink(c"one", &scratch.join("a")).unwrap());
+        assert!(held.exact_symlink(c"two", &scratch.join("b")).unwrap());
+        assert!(!held.exact_symlink(c"one", &scratch.join("a")).unwrap());
+        assert_eq!(
+            take_syncs(),
+            Syncs::default(),
+            "a link change issues no sync of its own"
+        );
+        held.sync().unwrap();
+        assert_eq!(
+            take_syncs(),
+            Syncs { fsync: 0, full: 1 },
+            "the held directory is synced once"
         );
     }
 }

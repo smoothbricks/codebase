@@ -3860,6 +3860,7 @@ async fn prove_re_adoption(proof: ReAdoptionProof) {
                 kept.display()
             );
         }
+
         service.shutdown().await.expect("stop the runtime");
         prove_published_build_loss(&mut fixture).await;
         return;
