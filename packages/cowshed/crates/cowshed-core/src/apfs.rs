@@ -8344,6 +8344,26 @@ mod tests {
         );
     }
 
+    /// A release under `WhenIdle` hands a held volume's dissent straight back: no wait, no forced
+    /// unmount, and no detach of the container.
+    #[test]
+    fn a_when_idle_release_returns_a_held_volumes_dissent_without_forcing_or_detaching() {
+        let image = temp_path("two-volume-held", IMAGE_EXTENSION);
+        let backend = graced_backend([
+            Reply::Inventory(Ok(two_volume_image(&image))),
+            Reply::Inventory(Ok(two_volume_image(&image))),
+            failed(1, "umount: unmount(/private/tmp/sibling): Resource busy"),
+        ]);
+        let mounted = BTreeSet::from(["/dev/disk5s2".to_owned()]);
+        let error = backend
+            .release_image(&image, &mounted, DetachIntent::WhenIdle)
+            .unwrap_err();
+        assert!(detach_was_dissented(&error), "{error}");
+        let commands: Vec<Vec<String>> = backend.runner().requests().iter().map(argv).collect();
+        assert_eq!(commands, [["/dev/disk5s2"]]);
+        assert!(backend.sleeper.waits().is_empty());
+    }
+
     /// What attaches, verifies or looks up one attachment still refuses a container with two
     /// volumes: the attach report, the single-attachment lookup and the unmount identity check.
     #[test]

@@ -7533,4 +7533,124 @@ mod tests {
             Err(ApfsStorageError::Io { .. })
         ));
     }
+
+    /// One image whose container holds two volumes, in the kernel inventory until a detach is
+    /// recorded, and in it no longer once one is. Every command is recorded and succeeds.
+    struct TwoVolumeImage {
+        image: PathBuf,
+        commands: std::sync::Mutex<Vec<crate::apfs::CommandRequest>>,
+    }
+
+    impl TwoVolumeImage {
+        fn argv(&self) -> Vec<Vec<String>> {
+            self.commands
+                .lock()
+                .expect("recorded commands")
+                .iter()
+                .map(|request| {
+                    request
+                        .args
+                        .iter()
+                        .map(|arg| arg.to_string_lossy().into_owned())
+                        .collect()
+                })
+                .collect()
+        }
+    }
+
+    impl CommandRunner for TwoVolumeImage {
+        fn run(
+            &self,
+            request: &crate::apfs::CommandRequest,
+        ) -> Result<crate::apfs::CommandOutput, crate::apfs::CommandRunError> {
+            self.commands
+                .lock()
+                .expect("recorded commands")
+                .push(request.clone());
+            Ok(crate::apfs::CommandOutput::success([]))
+        }
+        fn image_lease(&self, _: &Path) -> io::Result<Option<crate::fork_lock::Fenced<fs::File>>> {
+            Ok(None)
+        }
+        fn pin_raw_device(
+            &self,
+            _: &Path,
+        ) -> io::Result<Option<crate::fork_lock::Fenced<fs::File>>> {
+            Ok(None)
+        }
+        fn attached_disk_images(&self) -> io::Result<Vec<crate::apfs::AttachedDiskImage>> {
+            let detached = self
+                .commands
+                .lock()
+                .expect("recorded commands")
+                .iter()
+                .any(|request| request.args.first().is_some_and(|arg| arg == "detach"));
+            Ok(if detached {
+                Vec::new()
+            } else {
+                vec![crate::apfs::AttachedDiskImage::file(
+                    &self.image,
+                    None,
+                    [
+                        ("/dev/disk4", ""),
+                        ("/dev/disk5", "EF57347C-0000-11AA-AA11-00306543ECAC"),
+                        ("/dev/disk5s1", "41504653-0000-11AA-AA11-00306543ECAC"),
+                        ("/dev/disk5s2", "41504653-0000-11AA-AA11-00306543ECAC"),
+                    ],
+                )]
+            })
+        }
+        fn grow_image(&self, image: &Path, _: ImageCapacity) -> io::Result<()> {
+            panic!("a release grows no image: {}", image.display());
+        }
+    }
+
+    /// The kernel mount table, fixed.
+    struct FixedMounts(Vec<KernelMountSnapshot>);
+
+    impl KernelMountSource for FixedMounts {
+        fn mounts(&self) -> Result<Vec<KernelMountSnapshot>, ApfsStorageError> {
+            Ok(self.0.clone())
+        }
+    }
+
+    /// Detaching an existing image unmounts exactly the volumes the kernel mount table names, here
+    /// the added sibling and not the unmounted image volume, then detaches the container once.
+    #[test]
+    fn detaching_an_existing_image_unmounts_only_its_mounted_volumes_then_detaches_it_once() {
+        let root = std::env::temp_dir().join(format!(
+            "cowshed-two-volume-detach-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(root.join("store")).unwrap();
+        let root = fs::canonicalize(root).unwrap();
+        let store = root.join("store");
+        let image = store.join("lane.dmg");
+        fs::write(&image, b"").unwrap();
+        let host = MacOsApfsExecutionHost::with_mount_source(
+            TwoVolumeImage {
+                image: image.clone(),
+                commands: std::sync::Mutex::new(Vec::new()),
+            },
+            ApfsSubstrateConfig::new(&store, root.join("mnt")),
+            FixedMounts(vec![KernelMountSnapshot::new(
+                1,
+                root.join("sibling"),
+                "/dev/disk5s2",
+                true,
+                true,
+            )]),
+        )
+        .unwrap();
+        host.detach_existing_image(&image, DetachIntent::Release)
+            .unwrap();
+        assert_eq!(
+            host.backend().runner().argv(),
+            [
+                vec!["/dev/disk5s2".to_owned()],
+                vec!["detach".into(), "-verbose".into(), "/dev/disk5".into()],
+            ]
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
 }
