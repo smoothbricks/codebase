@@ -639,7 +639,11 @@ user's own repository. The profile carries that hole as a distinct, controller-o
 `<main-canonical-mount>/.git` and nothing wider, emitted after every deny that would otherwise close it (04_sandbox.md).
 It cannot be an ordinary read/write grant: grants are refused outright when they intersect a protected path, and main's
 mount is one — the denied project root under direct mount. Main's working tree stays as unreachable as any other
-workspace's, and a workspace that did not ask for `--git-worktree` never has any of it.
+workspace's, and a workspace that did not ask for `--git-worktree` never has any of it. The controller's own Git for
+such a workspace (mint, attach, `rm`, `gc`) reads main's shared config through that carve-back, and Git refuses to run
+when a file the config includes cannot be read: a relative include such as `../tooling/workspace.gitconfig` lands in
+main's working tree. So the controller resolves the config's `include.path` and `includeIf.*.path` targets itself,
+transitively, and grants its Git read of each existing target file, nothing else of main's tree.
 
 The controller's own Git for such a workspace (mint, attach, `rm`, `gc`, `rebase`, `land`) reads main's shared config
 through that carve-back, and Git refuses to run when a file the config includes cannot be read: a relative include such
