@@ -35,3 +35,9 @@ harness = false
 [[bench]]
 name = "capacity_admission"
 harness = false
+
+# Batch map upserts into four maps by batch size, journal off and on.
+# Run: `cargo bench -p columine-vm --bench map_upsert_scale`
+[[bench]]
+name = "map_upsert_scale"
+harness = false
