@@ -1222,7 +1222,7 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
 
     /// Fork step 2 (16_build_volumes.md, "Which volume a seed holds"): when neither `target`'s
     /// seed nor the live volume `checkout` links was built at `aim`'s tree, capture the volume of
-    /// a live workspace that has it checked out ([`Self::seed_from_landed_now`]); otherwise, or
+    /// a live workspace that has it checked out ([`seed_from_landed`]); otherwise, or
     /// when none is captured, reseed from the live volume when that is nearer the tree, or as near
     /// and written since, and has no writer. The caller holds `target`'s image lock, which every
     /// fork of `target` holds while it clones the seed.
@@ -1255,28 +1255,6 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
         })
         .await
         .map_err(|error| CowshedError::internal(format!("build volume task failed: {error}")))?
-    }
-
-    /// The external-land half of [`Self::refresh_seed`] alone, on the calling thread, for `rm` of a
-    /// workspace that may be the landed one: it never reseeds from the target's live volume. The
-    /// caller holds `target`'s image lock. `Kept` when a volume at `aim`'s tree already seeds or
-    /// is `target`'s, or when no live workspace was captured.
-    pub fn seed_from_landed_now(
-        &self,
-        target: &Owner,
-        checkout: &Path,
-        aim: &Aim,
-    ) -> Result<Refreshed> {
-        let mut passed = Vec::new();
-        let outcome = match self.age_now(target, checkout, &aim.tree)? {
-            None => Refresh::NoBuildVolume,
-            Some(age) if age.unlanded() => {
-                seed_from_landed(&self.host, &self.layout, target, aim, &mut passed)?
-                    .unwrap_or(Refresh::Kept)
-            }
-            Some(_) => Refresh::Kept,
-        };
-        Ok(Refreshed { passed, outcome })
     }
 
     fn age_now(&self, target: &Owner, checkout: &Path, tree: &GitOid) -> Result<Option<SeedAge>> {
@@ -1728,6 +1706,9 @@ fn collect_legacy_seed_sidecars(
                         &error,
                     )
                 })?;
+                let hold = crate::metadata::append_suffix(&candidate.image, ".hold");
+                std::fs::remove_file(&hold)
+                    .map_err(|error| io("remove legacy seed hold", &hold, &error))?;
                 crate::fsio::sync_directory(layout.images()).map_err(|error| {
                     io(
                         "sync legacy seed metadata collection",
@@ -3122,6 +3103,10 @@ mod tests {
             !orphan.image.exists(),
             "metadata cleanup never creates or attaches a payload"
         );
+        assert!(
+            !hold_path.exists(),
+            "collection releases the hold with the sidecar"
+        );
 
         let retained = candidate(&record);
         fs::write(&retained.image, "retained legacy payload").unwrap();
@@ -3137,6 +3122,15 @@ mod tests {
                 .unwrap(),
         );
         holder.lock_shared().unwrap();
+        let mut held_preview = Collection::default();
+        collect_legacy_seed_sidecars(&store.layout, &links, true, &mut held_preview).unwrap();
+        assert!(
+            held_preview
+                .deferred
+                .iter()
+                .any(|entry| matches!(entry.deferral, Deferral::Held(_)))
+        );
+        assert!(held.sidecar.exists() && held_path.exists());
         let mut refused = Collection::default();
         collect_legacy_seed_sidecars(&store.layout, &links, false, &mut refused).unwrap();
         assert_eq!(refused.reclaimed, 0);
@@ -3210,6 +3204,7 @@ mod tests {
         collect_legacy_seed_sidecars(&store.layout, &links, false, &mut finished).unwrap();
         assert_eq!(finished.reclaimed, 1);
         assert!(!held.sidecar.exists());
+        assert!(!held_path.exists());
         assert!(retained.sidecar.exists() && retained.image.exists());
         assert!(nonseed.sidecar.exists());
     }
