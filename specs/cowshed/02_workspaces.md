@@ -139,14 +139,21 @@ ASIF-to-RAW transition and the RAW guest-space reclaim operation, not an image c
    hole-aware copies; do not materialize the nominal image capacity or use an intermediate full checkout on Data. The
    main's build-volume identity and owner record are preserved verbatim, including its built-at tree and creation time;
    its contents are carried into a sparse RAW backing image by the same staged, verified copy at the recorded capacity.
-   Nothing substitutes an empty build volume for the recorded warm one, except for a missing main (below). Leave
-   old-incarnation seed images unchanged as retained evidence; publish one fresh RAW seed from the verified warm
-   replacement for the new incarnation. A resumed copy leaves already-correct hard-link topology untouched. It relinks
-   only missing, mismatched or recopied-primary aliases and restores every changed alias's ancestor metadata after the
-   subtree is complete. Already-mirrored file payloads are not recopied merely because the transaction was interrupted;
-   full content and metadata verification still runs before publication. The exclusive claim on the recorded source
-   build image's `<image>.hold` stays held through retention, copy, seed capture and publication. A RAW-to-RAW
-   replacement captures under that same typed claim rather than opening a second exclusive claim on the same resource. A
+   Nothing substitutes an empty build volume for the recorded warm one, except for a missing main (below) and a lost
+   build input. A recorded build volume or old-incarnation seed whose image is at neither its original nor its retained
+   path is lost: retention moves only its record, if one is beside the original. Past retention, a build volume with no
+   retained image is published as an empty RAW volume under the recorded ID, `Linked main` owner and creation time, with
+   its built-at tree cleared, and any staged copy an earlier attempt made of it is discarded wherever the replay meets
+   it, because nothing can verify it any more. A build replacement already published at the build image path under the
+   recorded owner record verbatim no longer reads its retained image: losing that image afterwards keeps the published
+   replacement and its record. A lost main image refuses as before. Leave old-incarnation seed images unchanged as
+   retained evidence; publish one fresh RAW seed from the verified warm replacement for the new incarnation. A resumed
+   copy leaves already-correct hard-link topology untouched. It relinks only missing, mismatched or recopied-primary
+   aliases and restores every changed alias's ancestor metadata after the subtree is complete. Already-mirrored file
+   payloads are not recopied merely because the transaction was interrupted; full content and metadata verification
+   still runs before publication. The exclusive claim on the recorded source build image's `<image>.hold` stays held
+   through retention, copy, seed capture and publication. A seed of a volume published at that image's own path, warm or
+   empty, captures under that same typed claim rather than opening a second exclusive claim on the same resource. A
    legacy ASIF source's hold is distinct from the published RAW hold: the old claim remains alive while seed capture
    independently claims the new RAW resource.
 4. Verify the copied content before publication, including tracked and untracked-not-ignored file checksums, the entire

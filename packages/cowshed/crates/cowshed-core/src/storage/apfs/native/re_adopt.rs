@@ -100,18 +100,43 @@ where
                 ));
             }
         }
-        if let Some(build) = &source.build {
-            self.retain_image(
-                source,
-                &build.image.original,
-                &build.image.retained,
-                &[RECORD_SUFFIX],
-            )?;
-        }
-        for seed in &source.old_seeds {
-            self.retain_image(source, &seed.original, &seed.retained, &[RECORD_SUFFIX])?;
+        // A build volume or seed whose image is at neither recorded path is lost: its cache
+        // content is gone, and only its record, if any, moves to the retained name.
+        let built = source
+            .build
+            .iter()
+            .map(|build| (&build.image.original, &build.image.retained))
+            .chain(
+                source
+                    .old_seeds
+                    .iter()
+                    .map(|seed| (&seed.original, &seed.retained)),
+            );
+        for (original, retained) in built {
+            if exists(original)? || exists(retained)? {
+                self.retain_image(source, original, retained, &[RECORD_SUFFIX])?;
+            } else {
+                self.retain_lost_record(original, retained)?;
+            }
         }
         Ok(())
+    }
+
+    /// Move a lost build input's record beside its original to its retained name. A record
+    /// already retained is a replay's finished step; one at both names refuses.
+    fn retain_lost_record(&self, original: &Path, retained: &Path) -> Result<(), ApfsStorageError> {
+        self.verify_controller_path(original)?;
+        self.verify_controller_path(retained)?;
+        let from = append_suffix(original, RECORD_SUFFIX);
+        if !regular_file_exists(&from)? {
+            return Ok(());
+        }
+        let directory = retained
+            .parent()
+            .ok_or(ApfsStorageError::InvalidPlan("retained path has no parent"))?;
+        fs::create_dir_all(directory)
+            .map_err(|error| io_error("create the retained directory", directory, error))?;
+        self.move_companions(&[(from, append_suffix(retained, RECORD_SUFFIX))])
     }
 
     /// The capacity the kernel's IOMedia mapping reports for attached `image`
@@ -157,7 +182,7 @@ where
                 &source.checkout,
             )?;
         }
-        if let Some(build) = &source.build {
+        if let Some(build) = retained_build(source)? {
             let layout = BuildVolumeLayout::new(
                 super::layout(&self.config, &source.metadata.repo_id)?.project(),
             )?;
@@ -183,7 +208,7 @@ where
             .map(|image| (&image.retained, &image.source_mount))
             .into_iter()
             .collect();
-        if let Some(build) = &source.build {
+        if let Some(build) = retained_build(source)? {
             images.push((&build.image.retained, &build.image.source_mount));
         }
         for (retained, mount) in images {
@@ -198,7 +223,9 @@ where
     /// build images collection reads, mounted at its staging mount, and filled from the retained
     /// volume's read-only mount by the same convergent copy and verification adopt uses. A
     /// replay resumes the copy on the image an earlier attempt left. Nothing for a re-adoption
-    /// with no build volume.
+    /// with no build volume. A lost build volume has nothing to copy from: whatever staged copy
+    /// an earlier attempt left can no longer be verified against its source and is discarded,
+    /// and the volume is published empty ([`Self::publish_re_adopt_build`]).
     pub(crate) fn copy_re_adopt_build(
         &self,
         source: &ReAdoptSource,
@@ -206,6 +233,9 @@ where
         let Some(build) = &source.build else {
             return Ok(());
         };
+        if retained_build(source)?.is_none() {
+            return self.discard_staged_build(build);
+        }
         let (new, old) = self.copy_replacement(
             &build.replacement_image,
             &build.replacement_mount,
@@ -217,6 +247,25 @@ where
             "cowshed: re-adoption build replacement allocates {new} bytes; the retained image {old}"
         );
         Ok(())
+    }
+
+    /// Detach without force and delete a lost build volume's staged copy, then its emptied
+    /// staging mountpoint. A copy already gone is a replay's finished step.
+    fn discard_staged_build(&self, build: &ReAdoptBuild) -> Result<(), ApfsStorageError> {
+        let staged = &build.replacement_image;
+        self.verify_controller_path(staged)?;
+        if exists(staged)? {
+            self.detach_without_force(staged)?;
+            fs::remove_file(staged)
+                .map_err(|error| io_error("discard a lost build's staged copy", staged, error))?;
+            sync_parent_path(staged)?;
+            eprintln!(
+                "cowshed: re-adoption discarded {}, a staged copy of a build volume whose retained \
+                 image is gone",
+                staged.display()
+            );
+        }
+        remove_empty_directory(&build.replacement_mount)
     }
 
     /// Mint (or resume) the RAW replacement at `image`, mount it read-write at `mount`, copy the
@@ -296,7 +345,8 @@ where
     /// main's build volume identity (detached without force, renamed to the build image path the
     /// retained volume left, its recorded owner record written verbatim, mounted where main's
     /// build link points; 16_build_volumes.md, "Targets and seeds"); for a missing main, its
-    /// surviving build volume kept as it is, or else the recorded build volume empty
+    /// surviving build volume kept as it is, or else the recorded build volume empty; for a lost
+    /// build volume (its retained image gone), the recorded build volume empty
     /// ([`Self::publish_empty_build`]). Then freeze one seed of it for the replacement
     /// incarnation; the old incarnation's seeds stay retained. Converges from whichever step a
     /// crash interrupted. `build_claim` is the exclusive claim on the recorded source build
@@ -311,7 +361,12 @@ where
     ) -> Result<(), ApfsStorageError> {
         match (&source.main, &source.build, build_claim) {
             (ReAdoptMain::Missing(missing), None, None) => match &missing.build {
-                Some(MissingMainBuild::Empty(build)) => self.publish_empty_build(layout, source, build),
+                Some(MissingMainBuild::Empty(build)) => self.publish_empty_build(
+                    layout,
+                    source,
+                    build,
+                    SeedSource::Unclaimed(&build.id),
+                ),
                 // Main's own volume outlived main's image: it is mounted where main's build link
                 // points and seeded as it is, under its own claim.
                 Some(MissingMainBuild::Kept(build)) => {
@@ -327,9 +382,26 @@ where
             },
             (ReAdoptMain::Retained(_), None, None) => Ok(()),
             (ReAdoptMain::Retained(_), Some(build), Some(claim)) if claim.id() == &build.id => {
-                self.publish_build_replacement(layout, build)?;
                 let seed = SeedSource::of_published(layout, build, claim);
-                self.seed_replacement(layout, source, seed, &build.owner_record)
+                // Once published, the replacement no longer reads its retained input: losing
+                // that image afterwards changes nothing, and the replay converges on what it
+                // published.
+                if retained_build(source)?.is_some() || replacement_published(layout, build)? {
+                    self.publish_build_replacement(layout, build)?;
+                    return self.seed_replacement(layout, source, seed, &build.owner_record);
+                }
+                // Lost before publication. Copy is not run again once main is published, so its
+                // staged copy, which nothing can verify any more, is discarded here too.
+                self.discard_staged_build(build)?;
+                let lost = ReAdoptEmptyBuild {
+                    id: build.id.clone(),
+                    record: BuildVolumeRecord {
+                        tree: None,
+                        ..build.owner_record.clone()
+                    },
+                    capacity_bytes: build.image.capacity_bytes,
+                };
+                self.publish_empty_build(layout, source, &lost, seed)
             }
             _ => Err(ApfsStorageError::InvalidPlan(
                 "the build claim does not hold the recorded build volume",
@@ -337,18 +409,19 @@ where
         }
     }
 
-    /// A missing main's build volume (02_workspaces.md, "Missing main image"): an empty RAW
-    /// volume minted under the recorded id at the recorded capacity and mounted where main's
-    /// build link points, its owner record written last, then one seed of it for the
-    /// replacement incarnation. Converges from an attempt interrupted after the image was minted
-    /// and before its record was written. An image holding another record, or a record that
-    /// names no image, refuses: nothing is published over either. Nothing else claims a volume
-    /// minted here, so its seed takes the volume's own ordinary claim.
+    /// A build volume published empty (02_workspaces.md, "Re-adoption" step 3 and "Missing main
+    /// image"): an empty RAW volume minted under the recorded id at the recorded capacity and
+    /// mounted where main's build link points, its owner record written last, then one seed of
+    /// it for the replacement incarnation, captured under `seed`'s claim. Converges from an
+    /// attempt interrupted after the image was minted and before its record was written. An
+    /// image holding another record, or a record that names no image, refuses: nothing is
+    /// published over either.
     fn publish_empty_build(
         &self,
         layout: &BuildVolumeLayout,
         source: &ReAdoptSource,
         build: &ReAdoptEmptyBuild,
+        seed: SeedSource<'_>,
     ) -> Result<(), ApfsStorageError> {
         let image = layout.image(&build.id);
         self.verify_controller_path(&image)?;
@@ -383,12 +456,7 @@ where
         layout
             .write_record(&build.id, &build.record)
             .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
-        self.seed_replacement(
-            layout,
-            source,
-            SeedSource::Unclaimed(&build.id),
-            &build.record,
-        )
+        self.seed_replacement(layout, source, seed, &build.record)
     }
 
     /// Freeze one seed of main's published build volume for the replacement incarnation, under
@@ -782,4 +850,33 @@ fn remove_empty_directory(path: &Path) -> Result<(), ApfsStorageError> {
             error,
         )),
     }
+}
+
+/// Main's recorded build volume while its retained image is there to copy from. Retention moves
+/// a build volume's image to its retained name before anything reads it, so past retention a
+/// recorded build volume with no retained image is lost (02_workspaces.md, "Re-adoption" step 3):
+/// `None`, and, unless its replacement was already published ([`replacement_published`]), it is
+/// published empty.
+fn retained_build(source: &ReAdoptSource) -> Result<Option<&ReAdoptBuild>, ApfsStorageError> {
+    match &source.build {
+        Some(build) if exists(&build.image.retained)? => Ok(Some(build)),
+        Some(_) | None => Ok(None),
+    }
+}
+
+/// Whether an earlier attempt published `build`'s verified replacement: no staged copy is left,
+/// and the build image path holds an image whose record is the recorded owner record verbatim.
+/// An empty volume published for a lost build carries a record with its built-at tree cleared,
+/// which is the owner record only when that had no tree either, and then the two are the same.
+fn replacement_published(
+    layout: &BuildVolumeLayout,
+    build: &ReAdoptBuild,
+) -> Result<bool, ApfsStorageError> {
+    if exists(&build.replacement_image)? || !exists(&layout.image(&build.id))? {
+        return Ok(false);
+    }
+    let recorded = layout
+        .read_record_present(&build.id)
+        .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
+    Ok(recorded.as_ref() == Some(&build.owner_record))
 }

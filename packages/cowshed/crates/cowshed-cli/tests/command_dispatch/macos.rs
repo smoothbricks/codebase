@@ -4248,3 +4248,326 @@ async fn real_apfs_a_missing_main_replay_publishes_a_commit_made_after_a_refused
     resumed.shutdown().await.expect("stop the resumed runtime");
     fixture.stop_gateway().await;
 }
+
+/// 02_workspaces.md, "Re-adoption" step 3: an interrupted re-adoption whose retained build image
+/// is gone resumes from its retained main, publishes the recorded build volume empty under its
+/// id, and discards the staged build copy nothing can verify any more.
+#[tokio::test]
+async fn real_apfs_a_resumed_re_adopt_whose_retained_build_is_gone_publishes_it_empty() {
+    let mut fixture = Fixture::with(Project::Declared);
+    let mut service = fixture.open().await;
+    adopt(&fixture, &mut service).await;
+    let storage = cowshed_core::storage::StorageLayout::new(
+        fixture.storage.store(),
+        &RepoId::parse("fixture/dispatch").expect("repository identity"),
+    )
+    .expect("fixture storage layout");
+    let project_root = storage.project().project_root.clone();
+    let journal_path = project_root.join("lifecycle-intents.json");
+    let main_image = project_root.join("main.dmg");
+    let layout = build_volumes(&fixture);
+    let main_volume = linked_volume(&layout, &fixture.checkout);
+    let record = layout
+        .read_record(&main_volume)
+        .expect("main's build record");
+    let cache_marker = layout.mount(&main_volume).join("lost-cache");
+    fs::write(&cache_marker, b"cached payload\n").expect("warm the build cache");
+    fs::write(fixture.checkout.join("tracked"), b"uncommitted work\n").expect("dirty main");
+    let head = git_stdout(&fixture.checkout, &["rev-parse", "HEAD"]);
+    let status = git_stdout(&fixture.checkout, &["status", "--porcelain"]);
+    service.shutdown().await.expect("stop the runtime");
+
+    // An underlay file at the checkout blocks publication after the build copy: the
+    // prepublication crash boundary, with main's own image attached back over it.
+    let host = MacOsApfsExecutionHost::new(
+        SystemCommandRunner,
+        ApfsSubstrateConfig::new(fixture.storage.store(), &fixture.checkout),
+    )
+    .expect("fixture controller");
+    host.detach_existing_image(&main_image, DetachIntent::WhenIdle)
+        .expect("detach main without force");
+    fs::write(
+        fixture.checkout.join("publication-blocker"),
+        b"operator data\n",
+    )
+    .expect("hold the publication boundary");
+    let attach = cowshed_core::apfs::CommandRequest::new(
+        "/usr/sbin/diskutil",
+        [
+            OsString::from("image"),
+            OsString::from("attach"),
+            OsString::from("--nobrowse"),
+            OsString::from("--mountOptions"),
+            OsString::from("owners"),
+            OsString::from("--mountPoint"),
+            fixture.checkout.as_os_str().to_os_string(),
+            main_image.as_os_str().to_os_string(),
+        ],
+    );
+    let attached = SystemCommandRunner.run(&attach).expect("reattach main");
+    assert!(attached.succeeded(), "reattach main: {attached:?}");
+    let mut interrupted = fixture.open().await;
+    let (refused, _, _) = run(
+        &mut interrupted,
+        [
+            OsString::from("adopt"),
+            fixture.checkout.as_os_str().to_os_string(),
+            OsString::from("--re-adopt"),
+        ],
+    )
+    .await;
+    refused.expect_err("the underlay refuses publication after the build copy");
+    interrupted
+        .shutdown()
+        .await
+        .expect("stop the interrupted runtime");
+    let journal = cowshed_core::storage::recovery::LifecycleIntentJournal::load(&journal_path)
+        .expect("the interrupted journal");
+    let entry = journal
+        .get(&WorkspaceName::main())
+        .expect("main's re-adoption is recorded");
+    assert!(entry.completion.is_none(), "the re-adoption is unfinished");
+    let cowshed_core::storage::recovery::LifecycleIntent::ReAdopt { source, .. } = &entry.operation
+    else {
+        panic!("main's journal entry is a re-adoption")
+    };
+    let source = source.clone();
+    let build = source.build.clone().expect("the recorded build volume");
+    assert!(
+        build.replacement_image.exists(),
+        "the build-copy-complete boundary"
+    );
+
+    // The retained build image and the old seeds' images are lost; their records survive.
+    host.detach_existing_image(&build.image.retained, DetachIntent::WhenIdle)
+        .expect("detach the retained build without force");
+    fs::remove_file(&build.image.retained).expect("lose the retained build image");
+    for seed in &source.old_seeds {
+        if seed.retained.exists() {
+            fs::remove_file(&seed.retained).expect("lose an old seed image");
+        }
+    }
+    fs::remove_file(fixture.checkout.join("publication-blocker"))
+        .expect("release the publication boundary");
+
+    // Opening the project replays the unfinished re-adoption, as `adopt --re-adopt` does.
+    let resumed = fixture.open().await;
+
+    let journal = cowshed_core::storage::recovery::LifecycleIntentJournal::load(&journal_path)
+        .expect("the resumed journal");
+    let entry = journal
+        .get(&WorkspaceName::main())
+        .expect("main's re-adoption is recorded");
+    assert!(
+        entry.completion.is_some(),
+        "the resumed re-adoption completed"
+    );
+    assert_eq!(
+        cowshed_core::metadata::DetachedWorkspaceMetadata::read_for_image(&main_image)
+            .expect("the replacement's sidecar")
+            .workspace_incarnation,
+        source.replacement,
+        "the recorded replacement is published"
+    );
+    assert_eq!(git_stdout(&fixture.checkout, &["rev-parse", "HEAD"]), head);
+    assert_eq!(
+        git_stdout(&fixture.checkout, &["status", "--porcelain"]),
+        status
+    );
+    assert_eq!(
+        linked_volume(&layout, &fixture.checkout),
+        main_volume,
+        "main links its recorded build volume id"
+    );
+    assert_eq!(
+        layout
+            .read_record(&main_volume)
+            .expect("the published build record"),
+        BuildVolumeRecord {
+            tree: None,
+            ..record.clone()
+        },
+        "the empty build keeps its id, Linked main owner and createdAt, with no built-at tree"
+    );
+    assert!(
+        SystemKernelMountSource
+            .mounts()
+            .expect("observe the build mount")
+            .iter()
+            .any(|mount| mount.mount_point == layout.mount(&main_volume)),
+        "the empty build volume is mounted where main's link points"
+    );
+    assert!(!cache_marker.exists(), "the lost cache is never recovered");
+    assert!(
+        !build.replacement_image.exists(),
+        "the unverifiable staged build copy is discarded"
+    );
+    let cowshed_core::storage::recovery::ReAdoptMain::Retained(image) = &source.main else {
+        panic!("the re-adoption retains main's image")
+    };
+    assert!(image.retained.exists(), "main's retained image is kept");
+    // The empty volume sits at the RAW original's own build image path, so its hold file is the
+    // one the re-adoption's source build claim already locks. Its seed is captured under that
+    // claim; a second exclusive claim on the same hold would refuse the seed, and the replay with
+    // it (16_build_volumes.md, "Targets and seeds").
+    let (seed, seed_record) = layout
+        .seed_of(&WorkspaceName::main(), &source.replacement)
+        .expect("main's seed lookup")
+        .expect("the replacement has a seed of its empty build");
+    assert_eq!(
+        seed_record.tree, None,
+        "a seed of an empty build has no tree"
+    );
+    assert!(
+        layout.image(&seed).exists(),
+        "the seed of the empty build is captured"
+    );
+    resumed.shutdown().await.expect("stop the resumed runtime");
+    fixture.stop_gateway().await;
+}
+
+/// 02_workspaces.md, "Re-adoption" step 3: a re-adoption that published main's build replacement
+/// under its owner record, then stopped before the replacement's seed and its conclusion, resumes
+/// even when its retained build image is lost after that publication. Nothing reads the retained
+/// image past publication: the published warm replacement and its owner record are kept, and the
+/// replacement's seed is captured from it under the source build claim.
+#[tokio::test]
+async fn real_apfs_a_re_adopt_whose_build_was_published_resumes_after_its_retained_build_is_lost() {
+    let mut fixture = Fixture::with(Project::Declared);
+    let mut service = fixture.open().await;
+    adopt(&fixture, &mut service).await;
+    let storage = cowshed_core::storage::StorageLayout::new(
+        fixture.storage.store(),
+        &RepoId::parse("fixture/dispatch").expect("repository identity"),
+    )
+    .expect("fixture storage layout");
+    let journal_path = storage
+        .project()
+        .project_root
+        .join("lifecycle-intents.json");
+    let layout = build_volumes(&fixture);
+    let main_volume = linked_volume(&layout, &fixture.checkout);
+    let cache_marker = layout.mount(&main_volume).join("published-cache");
+    fs::write(&cache_marker, b"cached payload\n").expect("warm the build cache");
+    // Main's volume was built at its tree, so its owner record differs from the empty record a lost
+    // build is published under, whose built-at tree is cleared.
+    let mut built = layout
+        .read_record(&main_volume)
+        .expect("main's build record");
+    built.tree = Some(
+        cowshed_core::api::GitOid::new(git_stdout(
+            &fixture.checkout,
+            &["rev-parse", "HEAD^{tree}"],
+        ))
+        .expect("a tree oid"),
+    );
+    layout
+        .write_record(&main_volume, &built)
+        .expect("record main's built-at tree");
+    succeed(
+        &mut service,
+        [
+            OsString::from("adopt"),
+            fixture.checkout.as_os_str().to_os_string(),
+            OsString::from("--re-adopt"),
+        ],
+    )
+    .await;
+    service.shutdown().await.expect("stop the runtime");
+    let main = WorkspaceName::main();
+    let journal = cowshed_core::storage::recovery::LifecycleIntentJournal::load(&journal_path)
+        .expect("the completed journal");
+    let cowshed_core::storage::recovery::LifecycleIntent::ReAdopt { source, .. } = &journal
+        .get(&main)
+        .expect("main's re-adoption is recorded")
+        .operation
+    else {
+        panic!("main's journal entry is a re-adoption")
+    };
+    let source = source.clone();
+    let build = source.build.clone().expect("the recorded build volume");
+    let owner = layout
+        .read_record(&main_volume)
+        .expect("the published build record");
+    assert_eq!(
+        owner, build.owner_record,
+        "published under its owner record"
+    );
+    assert!(
+        owner.tree.is_some(),
+        "the owner record names a built-at tree"
+    );
+
+    // The crash boundary: the build replacement is published with its owner record, and neither
+    // the replacement's seed nor the conclusion happened.
+    let (seed, _) = layout
+        .seed_of(&main, &source.replacement)
+        .expect("main's seed lookup")
+        .expect("the completed re-adoption froze a seed");
+    for path in [
+        layout.image(&seed),
+        layout.record(&seed),
+        layout.hold_path(&seed),
+    ] {
+        if path.exists() {
+            fs::remove_file(&path)
+                .unwrap_or_else(|error| panic!("unwind {}: {error}", path.display()));
+        }
+    }
+    cowshed_core::storage::recovery::LifecycleIntentJournal::update(&journal_path, |state| {
+        let operation = state
+            .get(&main)
+            .expect("main's re-adoption is recorded")
+            .operation
+            .clone();
+        state.clear(&main);
+        state.begin(operation);
+        state.mark_mutating(&main)
+    })
+    .expect("reopen main's re-adoption at the crash boundary");
+
+    // After publication, the retained build image is lost.
+    let host = MacOsApfsExecutionHost::new(
+        SystemCommandRunner,
+        ApfsSubstrateConfig::new(fixture.storage.store(), &fixture.checkout),
+    )
+    .expect("fixture controller");
+    host.detach_existing_image(&build.image.retained, DetachIntent::WhenIdle)
+        .expect("detach the retained build without force");
+    fs::remove_file(&build.image.retained).expect("lose the retained build image");
+
+    // Opening the project replays the unfinished re-adoption, as `adopt --re-adopt` does.
+    let resumed = fixture.open().await;
+
+    let journal = cowshed_core::storage::recovery::LifecycleIntentJournal::load(&journal_path)
+        .expect("the resumed journal");
+    assert!(
+        journal
+            .get(&main)
+            .expect("main's re-adoption is recorded")
+            .completion
+            .is_some(),
+        "the resumed re-adoption completed"
+    );
+    assert_eq!(
+        layout
+            .read_record(&main_volume)
+            .expect("the build record after the replay"),
+        owner,
+        "the published replacement keeps its owner record, built-at tree included"
+    );
+    assert_eq!(
+        fs::read(&cache_marker).expect("the published warm cache"),
+        b"cached payload\n",
+        "the published replacement is kept, not replaced by an empty volume"
+    );
+    assert!(
+        layout
+            .seed_of(&main, &source.replacement)
+            .expect("main's seed lookup")
+            .is_some(),
+        "the replacement's seed is captured under the source build claim"
+    );
+    resumed.shutdown().await.expect("stop the resumed runtime");
+    fixture.stop_gateway().await;
+}

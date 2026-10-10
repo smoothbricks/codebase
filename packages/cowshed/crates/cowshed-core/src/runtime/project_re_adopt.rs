@@ -590,10 +590,12 @@ impl NativeProjectRuntimeHost {
                 .await
                 .map_err(native_storage_error)?;
         }
+        // Read before the conclusion, so a retained path that cannot be inspected refuses while
+        // the intent is still open and a replay reports it again.
+        let retained = retained_paths(&source)?;
         let snapshot = self
             .conclude_adoption(&workspace, super::super::build_volumes::FirstMint::Nothing)
             .await?;
-        let retained = retained_paths(&source);
         eprintln!(
             "cowshed: re-adopted main as {}; this re-adoption kept what it replaced at:",
             source.replacement.as_str()
@@ -829,8 +831,10 @@ struct ReplacedMain {
 }
 
 /// Every path this re-adoption retained, companions included, and nothing else: what the user
-/// may remove once the replacement is checked.
-fn retained_paths(source: &ReAdoptSource) -> Vec<PathBuf> {
+/// may remove once the replacement is checked. A lost build input retained only its record, or
+/// nothing, so only what is there is named; a path that cannot be inspected is an error, never
+/// silently left out of the report.
+fn retained_paths(source: &ReAdoptSource) -> Result<Vec<PathBuf>> {
     use crate::metadata::append_suffix;
     let mut paths = match &source.main {
         ReAdoptMain::Retained(image) => vec![
@@ -849,7 +853,20 @@ fn retained_paths(source: &ReAdoptSource) -> Vec<PathBuf> {
         paths.push(image.clone());
         paths.push(append_suffix(image, crate::build_volume::RECORD_SUFFIX));
     }
-    paths
+    let mut present = Vec::with_capacity(paths.len());
+    for path in paths {
+        match path.symlink_metadata() {
+            Ok(_) => present.push(path),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(CowshedError::environment_missing(
+                    format!("cannot inspect retained {}: {error}", path.display()),
+                    "cowshed doctor --json",
+                ));
+            }
+        }
+    }
+    Ok(present)
 }
 
 /// Refuse outright when this shell's working directory is inside `checkout`, which the
