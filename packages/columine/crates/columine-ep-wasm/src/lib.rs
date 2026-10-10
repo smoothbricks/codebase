@@ -33,22 +33,25 @@ pub const VERSION: u32 = 2;
 ///
 /// It is a guard, not a guarantee. The column plane a capacity implies scales
 /// with schema width, so a request well under this ceiling can still exhaust
-/// linear memory — and a wasm allocation failure aborts, so it surfaces as a
-/// trap in the host rather than as any [`CreateFailure`] code. Measured: 32
-/// utf8 columns create at capacity 61440 and trap at 61932.
+/// linear memory; creation then refuses with
+/// [`CreateFailure::MemoryExhausted`] and builds nothing.
 pub const MAX_EVENT_CAPACITY: u32 = 1 << 20;
 
 struct EpInstance {
     ep: EventProcessor,
 }
 
-const NO_INSTANCE: Option<Box<EpInstance>> = None;
-static mut HANDLES: [Option<Box<EpInstance>>; 256] = [NO_INSTANCE; 256];
+const NO_INSTANCE: Option<Slot> = None;
+/// One boxed instance. The array form lets the box be built from fallibly
+/// backed storage: stable Rust has no fallible `Box::new`.
+type Slot = Box<[EpInstance; 1]>;
+
+static mut HANDLES: [Option<Slot>; 256] = [NO_INSTANCE; 256];
 static mut NEXT_HANDLE: u32 = 1;
 
 /// Single-threaded wasm: the handle table is the sole mutable global.
 #[allow(static_mut_refs)]
-fn handles() -> &'static mut [Option<Box<EpInstance>>; 256] {
+fn handles() -> &'static mut [Option<Slot>; 256] {
     unsafe { &mut HANDLES }
 }
 
@@ -57,7 +60,7 @@ fn handles() -> &'static mut [Option<Box<EpInstance>>; 256] {
 /// Handle 0 is the creation-failure sentinel and is permanently reserved.
 /// Keeping it out of the allocation ring makes every successful creation
 /// unambiguous, including after the ring wraps during long-lived use.
-fn alloc_handle(ep: Box<EpInstance>) -> Result<u32, CreateFailure> {
+fn alloc_handle(ep: Slot) -> Result<u32, CreateFailure> {
     let table = handles();
     #[allow(static_mut_refs)]
     let next = unsafe { &mut NEXT_HANDLE };
@@ -76,13 +79,12 @@ fn get_processor(handle: u32) -> Option<&'static mut EpInstance> {
     if !(1..=255).contains(&handle) {
         return None;
     }
-    handles()[handle as usize].as_deref_mut()
+    handles()[handle as usize]
+        .as_deref_mut()
+        .map(|[instance]| instance)
 }
 
-fn new_instance(
-    capacity: u32,
-    schema_config: DynamicSchemaConfig,
-) -> Result<Box<EpInstance>, CreateFailure> {
+fn new_instance(capacity: u32, schema_config: DynamicSchemaConfig) -> Result<Slot, CreateFailure> {
     let ep = EventProcessor::new(
         ParseOptions {
             base_path: true,
@@ -92,7 +94,13 @@ fn new_instance(
         capacity,
         schema_config,
     )?;
-    Ok(Box::new(EpInstance { ep }))
+    let mut storage = Vec::new();
+    storage
+        .try_reserve_exact(1)
+        .map_err(|_| CreateFailure::MemoryExhausted)?;
+    storage.push(EpInstance { ep });
+    let slot: Result<Slot, _> = storage.into_boxed_slice().try_into();
+    Ok(slot.unwrap_or_else(|_| unreachable!("one pushed instance boxes as one")))
 }
 
 // =============================================================================

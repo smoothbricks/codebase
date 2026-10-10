@@ -68,7 +68,7 @@ pub(crate) fn commit_base_event(
 /// with the base schema the scanners write by index.
 #[cfg(test)]
 pub(crate) fn base_columns(capacity: u32) -> DynamicColumns {
-    DynamicColumns::new(&BASE_EVENT_LOG_FIELDS, capacity)
+    DynamicColumns::new(&BASE_EVENT_LOG_FIELDS, capacity).expect("column plane fits")
 }
 
 /// A base event as a row view over the base event-log columns (scanner tests
@@ -341,6 +341,23 @@ pub enum ConfigError {
     InvalidPresenceField,
     /// A [`PayloadDiscriminator`] member names a column the schema lacks.
     InvalidDiscriminatedColumn,
+    /// The configuration's storage could not be backed.
+    OutOfMemory,
+}
+
+/// Back `additional` more elements of `buf`, or refuse as out of memory.
+fn room<T>(buf: &mut Vec<T>, additional: usize) -> Result<(), ConfigError> {
+    buf.try_reserve_exact(additional)
+        .map_err(|_| ConfigError::OutOfMemory)
+}
+
+/// An owned copy of `text` in exactly backed storage.
+fn owned(text: &str) -> Result<String, ConfigError> {
+    let mut out = String::new();
+    out.try_reserve_exact(text.len())
+        .map_err(|_| ConfigError::OutOfMemory)?;
+    out.push_str(text);
+    Ok(out)
 }
 
 const VALUE_PRESENCE_PREFIX: &str = "event_value_present.";
@@ -353,7 +370,9 @@ fn decode_presence_source(name: &str) -> Result<Option<String>, ConfigError> {
         return Ok(None);
     };
     let bytes = encoded.as_bytes();
-    let mut decoded = Vec::with_capacity(bytes.len());
+    // Decoding never lengthens: every byte or `%XX` triple yields one byte.
+    let mut decoded = Vec::new();
+    room(&mut decoded, bytes.len())?;
     let mut index = 0;
     while index < bytes.len() {
         if bytes[index] == b'%' {
@@ -390,9 +409,16 @@ pub fn build_extraction_config_with_semantic_schemas(
     if fields.len() != names.len() {
         return Err(ConfigError::FieldNameCountMismatch);
     }
-    let mut field_entries = Vec::with_capacity(fields.len());
-    let mut field_map = HashMap::with_capacity(fields.len());
+    // Each field adds at most one entry to each table, so every table is
+    // backed for all fields before the first is read.
+    let mut field_entries = Vec::new();
+    room(&mut field_entries, fields.len())?;
+    let mut field_map = HashMap::new();
+    field_map
+        .try_reserve(fields.len())
+        .map_err(|_| ConfigError::OutOfMemory)?;
     let mut unresolved_presence = Vec::new();
+    room(&mut unresolved_presence, fields.len())?;
     let mut open_paths = Vec::new();
     if let Some(semantic_schemas) = semantic_schemas {
         for schema in semantic_schemas.values() {
@@ -413,7 +439,7 @@ pub fn build_extraction_config_with_semantic_schemas(
         }
         if field_map
             .insert(
-                (*name).to_owned(),
+                owned(name)?,
                 FieldLookup {
                     column,
                     field: *field,
@@ -428,7 +454,8 @@ pub fn build_extraction_config_with_semantic_schemas(
         }
         field_entries.push((column, *field));
     }
-    let mut presence_entries = Vec::with_capacity(unresolved_presence.len());
+    let mut presence_entries = Vec::new();
+    room(&mut presence_entries, unresolved_presence.len())?;
     for (presence_column, source_name) in unresolved_presence {
         let source = field_map
             .get(&source_name)
@@ -607,7 +634,7 @@ mod properties {
             let config = build_extraction_config(&fields, &["id", "type", "timestamp", "quantity"]).unwrap();
             // An exactly-capacity batch is legal; this input has spare
             // capacity and therefore must be accepted.
-            let mut typed = DynamicColumns::new(&fields, 2);
+            let mut typed = DynamicColumns::new(&fields, 2).expect("column plane fits");
             let mut work = [0_u8; 128];
             assert_eq!(msgpack_extractor::extract_msgpack_events(&input, &config, &mut typed, &mut work, true).unwrap(), 1);
             assert_eq!(read_cell(&typed, 0, 0), Some(ColumnValue::Utf8(id)));
@@ -649,7 +676,7 @@ mod properties {
                 SignalSchemaField::new(ArrowType::Binary, true),
             ];
             let config = build_extraction_config(&fields, &["id", "qty", UNDECLARED_COLUMN_NAME]).unwrap();
-            let mut typed = DynamicColumns::new(&fields, 2);
+            let mut typed = DynamicColumns::new(&fields, 2).expect("column plane fits");
             let mut work = [0_u8; 256];
             assert_eq!(
                 json_extractor::extract_json_events(document.as_bytes(), &config, &mut typed, &mut work, &mut json_extractor::ExtractionDiagnostic::default()).unwrap(),

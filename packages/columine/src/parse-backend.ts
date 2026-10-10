@@ -105,7 +105,7 @@ const MAX_EVENTS_PER_BATCH = 65_536;
  * wasm heap 8.06 MiB and the seven-field compact schema needs 26.06 MiB, where
  * the same schema at 256 needs 0.10 MiB; past roughly 32 variable-width
  * columns the eager plane exceeds the artifact's 256 MiB memory maximum and
- * the allocator traps. Rows beyond it are not lost: `encode` hands the native
+ * creation is refused as `MEMORY_EXHAUSTED`. Rows beyond it are not lost: `encode` hands the native
  * compact path a caller-owned batch of up to `MAX_EVENTS_PER_BATCH` rows
  * without touching the parse plane.
  */
@@ -113,6 +113,7 @@ const EP_EVENT_CAPACITY = 256;
 
 const MAX_FIELDS = 256;
 const MAX_VARIABLE_DATA_BYTES = 16 * 1024 * 1024;
+const MAX_SCHEMA_MESSAGE_BYTES = 64 * 1024;
 const MIN_COMPACT_ARROW_CAPACITY = 4 * 1024;
 const UINT32_MAX = 0xffff_ffff;
 const INPUT_FORMAT_JSON = 0;
@@ -164,6 +165,7 @@ const EP_CREATE_FAILURE = {
   2147483658: 'INIT',
   2147483659: 'HANDLES_EXHAUSTED',
   2147483660: 'MEMORY_EXHAUSTED',
+  2147483661: 'SCHEMA_TOO_LARGE',
 } as const;
 
 const EP_CREATE_FAILURE_DETAIL = {
@@ -179,6 +181,7 @@ const EP_CREATE_FAILURE_DETAIL = {
   INIT: 'retained-metadata or extraction-config limits refused the schema',
   HANDLES_EXHAUSTED: `all ${EP_MAX_HANDLE} EventProcessor handle slots are in use`,
   MEMORY_EXHAUSTED: 'the memory to build the handle could not be had; the same call may succeed with more room',
+  SCHEMA_TOO_LARGE: `schemaBytes is longer than the ${MAX_SCHEMA_MESSAGE_BYTES}-byte Schema message limit`,
 } as const satisfies Record<(typeof EP_CREATE_FAILURE)[keyof typeof EP_CREATE_FAILURE], string>;
 
 export type EventProcessorCreateErrorCode =
@@ -211,6 +214,8 @@ function epCreateFailureCode(status: number): EventProcessorCreateErrorCode {
       return EP_CREATE_FAILURE[0x8000_000b];
     case 0x8000_000c:
       return EP_CREATE_FAILURE[0x8000_000c];
+    case 0x8000_000d:
+      return EP_CREATE_FAILURE[0x8000_000d];
     default:
       return 'UNKNOWN_FAILURE';
   }

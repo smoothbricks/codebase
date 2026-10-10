@@ -44,7 +44,7 @@ fn write_stream(
 ) -> std::path::PathBuf {
     let schema_bytes = logical_schema_ipc_bytes(logical).expect("encode schema message");
     let config = DynamicSchemaConfig::new(&schema_bytes, fields).expect("validate schema");
-    let mut columns = DynamicColumns::new(fields, rows);
+    let mut columns = DynamicColumns::new(fields, rows).expect("column plane fits");
     write(&mut columns);
     let mut metadata =
         MetadataStorage::for_fields(fields, MetadataLimits::default()).expect("size metadata");

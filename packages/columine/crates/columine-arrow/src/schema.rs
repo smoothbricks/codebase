@@ -4,6 +4,7 @@
 //! decoded once during processor creation so the retained four-byte physical
 //! metadata cannot disagree with the logical Arrow schema copied to output.
 
+use crate::fallible::copied;
 use arrow_ipc::{
     MessageHeader, convert::try_schema_from_ipc_buffer, root_as_message, writer::StreamWriter,
 };
@@ -446,11 +447,25 @@ pub fn schema_ipc_bytes(fields: &[SignalSchemaField]) -> Result<Vec<u8>, SchemaE
 pub enum SchemaError {
     InvalidMessage,
     TooManyFields,
-    InvalidFieldMetadata { field_index: usize },
-    FieldCountMismatch { schema: usize, metadata: usize },
-    TypeMismatch { field_index: usize },
-    NullabilityMismatch { field_index: usize },
+    InvalidFieldMetadata {
+        field_index: usize,
+    },
+    FieldCountMismatch {
+        schema: usize,
+        metadata: usize,
+    },
+    TypeMismatch {
+        field_index: usize,
+    },
+    NullabilityMismatch {
+        field_index: usize,
+    },
     InvalidFieldNames,
+    /// The Schema message is longer than [`MAX_SCHEMA_MESSAGE_BYTES`]; it is
+    /// refused before it is read, however well formed.
+    MessageTooLarge,
+    /// The decoded schema's storage could not be backed.
+    OutOfMemory,
 }
 
 /// Payload members whose column depends on the value of one envelope member.
@@ -535,7 +550,8 @@ impl DynamicSchemaConfig {
     ) -> Result<Self, SchemaError> {
         validate_typed_metadata(field_metadata)?;
         let names = parse_field_names(field_names_raw)?;
-        Self::build(schema_bytes, field_metadata.to_vec(), names)
+        let fields = copied(field_metadata).ok_or(SchemaError::OutOfMemory)?;
+        Self::build(schema_bytes, fields, names)
     }
 
     pub fn from_wire_with_field_names(
@@ -567,7 +583,10 @@ impl DynamicSchemaConfig {
             return Err(SchemaError::InvalidFieldNames);
         }
 
-        let mut logical_types = Vec::with_capacity(field_metadata.len());
+        let mut logical_types = Vec::new();
+        logical_types
+            .try_reserve_exact(field_metadata.len())
+            .map_err(|_| SchemaError::OutOfMemory)?;
         for (field_index, (field, metadata)) in schema
             .fields()
             .iter()
@@ -600,7 +619,7 @@ impl DynamicSchemaConfig {
         Ok(Self {
             is_base_event_log,
             payload_discriminator: None,
-            schema_bytes: schema_bytes.to_vec(),
+            schema_bytes: copied(schema_bytes).ok_or(SchemaError::OutOfMemory)?,
             field_metadata,
             logical_types,
             semantic_schema: None,
@@ -625,7 +644,20 @@ impl DynamicSchemaConfig {
     }
 }
 
+/// The largest Schema message a handle accepts, framing included.
+///
+/// Decoding goes through the arrow-ipc reader, whose allocations are
+/// infallible. This cap bounds them before the call: a message at the cap
+/// with [`MAX_SCHEMA_FIELDS`] fields decodes within a small multiple of its
+/// own size (pinned by `schema_decode_at_the_message_cap_stays_bounded`), so
+/// the one infallible decode a handle performs, once at creation, stays far
+/// below any memory ceiling a host can usefully run with.
+pub const MAX_SCHEMA_MESSAGE_BYTES: usize = 64 * 1024;
+
 fn decode_schema_message(bytes: &[u8]) -> Result<arrow_schema::Schema, SchemaError> {
+    if bytes.len() > MAX_SCHEMA_MESSAGE_BYTES {
+        return Err(SchemaError::MessageTooLarge);
+    }
     if bytes.len() < 8 || bytes[..4] != [0xff; 4] {
         return Err(SchemaError::InvalidMessage);
     }
@@ -751,7 +783,10 @@ fn decode_field_metadata(bytes: &[u8]) -> Result<Vec<SignalSchemaField>, SchemaE
             SchemaError::InvalidFieldMetadata { field_index: 0 }
         });
     }
-    let mut fields = Vec::with_capacity(bytes.len() / 4);
+    let mut fields = Vec::new();
+    fields
+        .try_reserve_exact(bytes.len() / 4)
+        .map_err(|_| SchemaError::OutOfMemory)?;
     for (field_index, raw) in bytes.as_chunks::<4>().0.iter().enumerate() {
         let Some(arrow_type) = ArrowType::from_u8(raw[0]) else {
             return Err(SchemaError::InvalidFieldMetadata { field_index });
@@ -776,17 +811,30 @@ fn parse_field_names(raw: &[u8]) -> Result<Vec<String>, SchemaError> {
     if raw.last() != Some(&0) {
         return Err(SchemaError::InvalidFieldNames);
     }
-    raw[..raw.len() - 1]
-        .split(|byte| *byte == 0)
-        .map(|name| {
-            if name.is_empty() {
-                return Err(SchemaError::InvalidFieldNames);
-            }
-            std::str::from_utf8(name)
-                .map(str::to_owned)
-                .map_err(|_| SchemaError::InvalidFieldNames)
-        })
-        .collect()
+    let raw = &raw[..raw.len() - 1];
+    // One name per terminator, counted before any is copied: a blob naming
+    // more fields than a schema may hold is refused without allocating.
+    let count = raw.iter().filter(|byte| **byte == 0).count() + 1;
+    if count > MAX_SCHEMA_FIELDS {
+        return Err(SchemaError::InvalidFieldNames);
+    }
+    let mut names = Vec::new();
+    names
+        .try_reserve_exact(count)
+        .map_err(|_| SchemaError::OutOfMemory)?;
+    for name in raw.split(|byte| *byte == 0) {
+        let name = std::str::from_utf8(name)
+            .ok()
+            .filter(|name| !name.is_empty())
+            .ok_or(SchemaError::InvalidFieldNames)?;
+        let mut owned = String::new();
+        owned
+            .try_reserve_exact(name.len())
+            .map_err(|_| SchemaError::OutOfMemory)?;
+        owned.push_str(name);
+        names.push(owned);
+    }
+    Ok(names)
 }
 
 #[cfg(test)]

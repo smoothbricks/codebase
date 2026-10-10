@@ -720,7 +720,7 @@ mod tests {
         let lent = &input[frame_at..frame_at + 2];
         let certified = [9_u8, 9, 9];
         let pairs = [(lent, &certified[..])];
-        let mut columns = DynamicColumns::new(&fields, 1);
+        let mut columns = DynamicColumns::new(&fields, 1).expect("column plane fits");
         let mut work = [0; 64];
         assert_eq!(
             extract_msgpack_events_with_projections(
@@ -750,7 +750,7 @@ mod tests {
         let pairs = [(&nested[inner_at..], &certified[..])];
         let one = [field(ArrowType::Binary)];
         let config_one = config(&one, &["frame"]);
-        let mut columns = DynamicColumns::new(&one, 1);
+        let mut columns = DynamicColumns::new(&one, 1).expect("column plane fits");
         assert_eq!(
             extract_msgpack_events_with_projections(
                 &nested,
@@ -809,7 +809,7 @@ mod tests {
             0xdf, 0, 0, 0, 1, 0xa4, b'n', b'o', b't', b'e', 0xa1, b'x',
         ]);
         for type_first in [true, false] {
-            let mut columns = DynamicColumns::new(&fields, 1);
+            let mut columns = DynamicColumns::new(&fields, 1).expect("column plane fits");
             let mut work = [0; 64];
             extract_msgpack_events(
                 &event("a", type_first),
@@ -822,7 +822,7 @@ mod tests {
             assert_eq!(columns.cell(1, 0), None, "b's column stays empty");
             assert_eq!(columns.cell(2, 0), Some(captured.clone()));
         }
-        let mut columns = DynamicColumns::new(&fields, 1);
+        let mut columns = DynamicColumns::new(&fields, 1).expect("column plane fits");
         let mut work = [0; 64];
         extract_msgpack_events(&event("b", true), &config, &mut columns, &mut work, true).unwrap();
         assert_eq!(columns.cell(1, 0), Some(ColumnValue::Utf8("x".into())));
@@ -841,7 +841,7 @@ mod tests {
         str_(&mut input, "timestamp");
         input.push(0xcb);
         input.extend(4_294_967_296.0_f64.to_be_bytes());
-        let mut columns = DynamicColumns::new(&fields, 2);
+        let mut columns = DynamicColumns::new(&fields, 2).expect("column plane fits");
         let mut work = [0; 64];
         let config = config(&fields, &["id", "timestamp"]);
         assert_eq!(
@@ -856,7 +856,7 @@ mod tests {
         str_(&mut fraction, "timestamp");
         fraction.push(0xcb);
         fraction.extend(1.5_f64.to_be_bytes());
-        let mut columns = DynamicColumns::new(&fields, 2);
+        let mut columns = DynamicColumns::new(&fields, 2).expect("column plane fits");
         assert_eq!(
             extract_msgpack_events(&fraction, &config, &mut columns, &mut work, true),
             Err(ExtractionError::InvalidFieldType)
@@ -921,7 +921,7 @@ mod tests {
         str_(&mut input, "human");
         str_(&mut input, "outcome");
         str_(&mut input, "stuck");
-        let mut columns = DynamicColumns::new(&fields, 2);
+        let mut columns = DynamicColumns::new(&fields, 2).expect("column plane fits");
         let mut work = [0; 256];
         assert_eq!(
             extract_msgpack_events(&input, &config, &mut columns, &mut work, true),
@@ -953,7 +953,7 @@ mod tests {
         other.push(0x81);
         str_(&mut other, "authorRole");
         str_(&mut other, "agent");
-        let mut columns = DynamicColumns::new(&fields, 2);
+        let mut columns = DynamicColumns::new(&fields, 2).expect("column plane fits");
         assert_eq!(
             extract_msgpack_events(&other, &config, &mut columns, &mut work, true),
             Ok(1)
@@ -971,7 +971,7 @@ mod tests {
         bad.push(0x81);
         str_(&mut bad, "outcome");
         str_(&mut bad, "abandoned");
-        let mut columns = DynamicColumns::new(&fields, 2);
+        let mut columns = DynamicColumns::new(&fields, 2).expect("column plane fits");
         assert_eq!(
             extract_msgpack_events(&bad, &config, &mut columns, &mut work, true),
             Err(ExtractionError::InvalidFieldType)
@@ -990,7 +990,7 @@ mod tests {
         str_(&mut row, "value.amount");
         // ext 8, length 2, type 20, sign 1, magnitude 7 → -7
         row.extend([0xc7, 2, 20, 1, 7]);
-        let mut columns = DynamicColumns::new(&fields, 2);
+        let mut columns = DynamicColumns::new(&fields, 2).expect("column plane fits");
         let mut work = [0; 64];
         assert_eq!(
             extract_msgpack_events(&row, &config, &mut columns, &mut work, true),
@@ -1004,7 +1004,7 @@ mod tests {
         str_(&mut wide, "value.amount");
         wide.extend([0xc7, 10, 20, 0]);
         wide.extend([1; 9]);
-        let mut columns = DynamicColumns::new(&fields, 2);
+        let mut columns = DynamicColumns::new(&fields, 2).expect("column plane fits");
         assert_eq!(
             extract_msgpack_events(&wide, &config, &mut columns, &mut work, true),
             Err(ExtractionError::InvalidFieldType)
@@ -1035,7 +1035,7 @@ mod tests {
                 input.push(5)
             }
         }
-        let mut columns = DynamicColumns::new(&fields, 10);
+        let mut columns = DynamicColumns::new(&fields, 10).expect("column plane fits");
         let mut work = [0; 1024];
         assert_eq!(
             extract_msgpack_events(
@@ -1070,7 +1070,7 @@ mod tests {
         input.push(0x81);
         str_(&mut input, "id");
         str_(&mut input, "second");
-        let mut columns = DynamicColumns::new(&fields, 2);
+        let mut columns = DynamicColumns::new(&fields, 2).expect("column plane fits");
         let mut work = [0; 64];
         let config = config(
             &fields,
@@ -1102,7 +1102,7 @@ mod tests {
         let mut input = vec![0x81];
         str_(&mut input, "id");
         str_(&mut input, "x");
-        let mut columns = DynamicColumns::new(&fields, 1);
+        let mut columns = DynamicColumns::new(&fields, 1).expect("column plane fits");
         let mut work = [0; 64];
         assert_eq!(
             extract_msgpack_events(
@@ -1116,7 +1116,7 @@ mod tests {
         );
         let mut two = input.clone();
         two.extend_from_slice(&input);
-        let mut columns2 = DynamicColumns::new(&fields, 1);
+        let mut columns2 = DynamicColumns::new(&fields, 1).expect("column plane fits");
         assert_eq!(
             extract_msgpack_events(
                 &two,
@@ -1139,7 +1139,7 @@ mod tests {
             let mut input = vec![0x81];
             str_(&mut input, &names[width - 1]);
             str_(&mut input, "present");
-            let mut columns = DynamicColumns::new(&fields, 1);
+            let mut columns = DynamicColumns::new(&fields, 1).expect("column plane fits");
             let mut work = [0; 64];
 
             assert_eq!(
@@ -1178,7 +1178,7 @@ mod tests {
         input.push(0x81);
         str_(&mut input, "id");
         str_(&mut input, "second");
-        let mut columns = DynamicColumns::new(&fields, 2);
+        let mut columns = DynamicColumns::new(&fields, 2).expect("column plane fits");
         let mut work = [0; 64];
 
         assert_eq!(
@@ -1201,7 +1201,7 @@ mod tests {
         str_(&mut input, "first");
         str_(&mut input, "id");
         str_(&mut input, "last");
-        let mut columns = DynamicColumns::new(&fields, 1);
+        let mut columns = DynamicColumns::new(&fields, 1).expect("column plane fits");
         let mut work = [0; 64];
 
         assert_eq!(
@@ -1222,7 +1222,7 @@ mod tests {
         str_(&mut input, "x");
         str_(&mut input, "undeclared");
         input.push(7);
-        let mut columns = DynamicColumns::new(&fields, 10);
+        let mut columns = DynamicColumns::new(&fields, 10).expect("column plane fits");
         let mut work = [0; 4];
         assert_eq!(
             extract_msgpack_events(
@@ -1243,7 +1243,7 @@ mod tests {
         str_(&mut input, "x");
         str_(&mut input, "qty");
         input.push(42);
-        let mut columns = DynamicColumns::new(&fields, 10);
+        let mut columns = DynamicColumns::new(&fields, 10).expect("column plane fits");
         let mut work = [0; 128];
         extract_msgpack_events(
             &input,
@@ -1271,7 +1271,7 @@ mod tests {
         str_(&mut input, "x");
         str_(&mut input, "a.b");
         input.push(7);
-        let mut columns = DynamicColumns::new(&fields, 10);
+        let mut columns = DynamicColumns::new(&fields, 10).expect("column plane fits");
         let mut work = [0; 128];
         extract_msgpack_events(
             &input,
@@ -1299,7 +1299,7 @@ mod tests {
         input.push(0x81);
         str_(&mut input, "note");
         str_(&mut input, "hello");
-        let mut columns = DynamicColumns::new(&fields, 10);
+        let mut columns = DynamicColumns::new(&fields, 10).expect("column plane fits");
         let mut work = [0; 128];
         assert_eq!(
             extract_msgpack_events(
@@ -1328,7 +1328,7 @@ mod tests {
         input.push(0x81);
         str_(&mut input, "bogus");
         input.push(7);
-        let mut columns = DynamicColumns::new(&fields, 10);
+        let mut columns = DynamicColumns::new(&fields, 10).expect("column plane fits");
         let mut work = [0; 128];
         assert_eq!(
             extract_msgpack_events(
@@ -1359,7 +1359,7 @@ mod tests {
         str_(&mut input, "a");
         str_(&mut input, "value.note");
         str_(&mut input, "b");
-        let mut columns = DynamicColumns::new(&fields, 10);
+        let mut columns = DynamicColumns::new(&fields, 10).expect("column plane fits");
         let mut work = [0; 128];
         assert!(
             extract_msgpack_events(
@@ -1382,7 +1382,7 @@ mod tests {
         input.push(0xa2);
         input.extend([0xff, 0xfe]);
         input.push(1);
-        let mut columns = DynamicColumns::new(&fields, 10);
+        let mut columns = DynamicColumns::new(&fields, 10).expect("column plane fits");
         let mut work = [0; 64];
         assert_eq!(
             extract_msgpack_events(
@@ -1400,7 +1400,7 @@ mod tests {
     #[test]
     fn extract_msgpack_events_empty_stream() {
         let fields = [field(ArrowType::Utf8)];
-        let mut columns = DynamicColumns::new(&fields, 10);
+        let mut columns = DynamicColumns::new(&fields, 10).expect("column plane fits");
         let mut work = [0; 64];
         assert_eq!(
             extract_msgpack_events(
@@ -1417,7 +1417,7 @@ mod tests {
     #[test]
     fn extract_msgpack_events_empty_array() {
         let fields = [field(ArrowType::Utf8)];
-        let mut columns = DynamicColumns::new(&fields, 10);
+        let mut columns = DynamicColumns::new(&fields, 10).expect("column plane fits");
         let mut work = [0; 64];
         assert_eq!(
             extract_msgpack_events(

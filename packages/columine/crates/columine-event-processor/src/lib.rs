@@ -89,8 +89,9 @@ pub enum ResultCode {
 /// compact schema, creating one handle at capacity 65536 grows the wasm heap
 /// from 145 to 532 pages — 24.19 MiB for a 26.06 MiB layout — while the same
 /// schema at 256 needs 0.10 MiB and grows the heap by nothing. Width
-/// multiplies it: 32 utf8 columns create cleanly at 61440 and trap at 61932,
-/// where the plane crosses the artifact's `--max-memory=256MiB`.
+/// multiplies it: 32 utf8 columns create cleanly at 61440 and are refused as
+/// `CreateFailure::MemoryExhausted` at 61932, where the plane crosses the
+/// artifact's `--max-memory=256MiB`.
 ///
 /// Rows above this capacity are not lost: the compact path encodes a
 /// caller-supplied batch of up to `MAX_EVENTS_PER_BATCH` rows without touching
@@ -131,6 +132,8 @@ pub enum CreateFailure {
     HandlesExhausted = 0x8000_000b,
     /// The memory to build the handle could not be had; nothing was created.
     MemoryExhausted = 0x8000_000c,
+    /// The Schema message is longer than `columine_arrow::MAX_SCHEMA_MESSAGE_BYTES`.
+    SchemaTooLarge = 0x8000_000d,
 }
 
 impl CreateFailure {
@@ -151,6 +154,7 @@ impl CreateFailure {
         Self::Init,
         Self::HandlesExhausted,
         Self::MemoryExhausted,
+        Self::SchemaTooLarge,
     ];
 }
 
@@ -165,13 +169,31 @@ impl From<columine_arrow::SchemaError> for CreateFailure {
             E::TypeMismatch { .. } => Self::SchemaTypeMismatch,
             E::NullabilityMismatch { .. } => Self::SchemaNullability,
             E::InvalidFieldNames => Self::SchemaFieldNames,
+            E::MessageTooLarge => Self::SchemaTooLarge,
+            E::OutOfMemory => Self::MemoryExhausted,
         }
     }
 }
 
 impl From<EpInitError> for CreateFailure {
-    fn from(_: EpInitError) -> Self {
-        Self::Init
+    fn from(error: EpInitError) -> Self {
+        match error {
+            EpInitError::MemoryExhausted
+            | EpInitError::Metadata(columine_arrow::MetadataError::OutOfMemory)
+            | EpInitError::Config(columine_parsing::ConfigError::OutOfMemory) => {
+                Self::MemoryExhausted
+            }
+            EpInitError::Metadata(_)
+            | EpInitError::Config(_)
+            | EpInitError::SemanticSchema(_)
+            | EpInitError::VoAdmission(_) => Self::Init,
+        }
+    }
+}
+
+impl From<columine_arrow::PlaneOutOfMemory> for EpInitError {
+    fn from(_: columine_arrow::PlaneOutOfMemory) -> Self {
+        Self::MemoryExhausted
     }
 }
 
@@ -238,6 +260,8 @@ pub enum EpInitError {
     SemanticSchema(columine_parsing::validate::SchemaParseError),
     /// The value-object capability refused to prepare a declared schema.
     VoAdmission(VoPreparationError),
+    /// The processor's storage could not be backed; nothing was built.
+    MemoryExhausted,
 }
 
 /// Structured diagnostic for a semantic payload refusal. The result header
@@ -360,11 +384,11 @@ impl<A: VoAdmission> EventProcessor<A> {
         let extraction_config = if schema_config.field_names.is_empty() {
             None
         } else {
-            let names: Vec<&str> = schema_config
-                .field_names
-                .iter()
-                .map(String::as_str)
-                .collect();
+            let mut names: Vec<&str> = Vec::new();
+            names
+                .try_reserve_exact(schema_config.field_names.len())
+                .map_err(|_| EpInitError::MemoryExhausted)?;
+            names.extend(schema_config.field_names.iter().map(String::as_str));
             Some(
                 columine_parsing::build_extraction_config_with_semantic_schemas(
                     &schema_config.field_metadata,
@@ -384,15 +408,13 @@ impl<A: VoAdmission> EventProcessor<A> {
             && semantic
                 .as_ref()
                 .is_none_or(|prepared| prepared.presence() == VoPresence::Absent);
+        let dynamic_columns = DynamicColumns::new(&schema_config.field_metadata, column_capacity)?;
         Ok(Self {
             semantic,
             last_validation_diagnostic: None,
             plane: Plane {
                 use_base_scanners,
-                dynamic_columns: DynamicColumns::new(
-                    &schema_config.field_metadata,
-                    column_capacity,
-                ),
+                dynamic_columns,
                 record_batch_metadata,
                 extraction_config,
                 schema_config,
@@ -405,10 +427,12 @@ impl<A: VoAdmission> EventProcessor<A> {
 
     /// Replace the retained column plane with one sized for `rows`, under
     /// the same clamp as construction. The prepared capability, schema
-    /// metadata, extraction configuration, and work buffers are kept.
-    pub fn grow_plane(&mut self, rows: u32) {
+    /// metadata, extraction configuration, and work buffers are kept. A plane
+    /// that cannot be backed is refused and the current one is kept.
+    pub fn grow_plane(&mut self, rows: u32) -> Result<(), columine_arrow::PlaneOutOfMemory> {
         let plane = &mut self.plane;
-        plane.dynamic_columns = DynamicColumns::new(&plane.schema_config.field_metadata, rows);
+        plane.dynamic_columns = DynamicColumns::new(&plane.schema_config.field_metadata, rows)?;
+        Ok(())
     }
 
     /// Last semantic validation refusal, if the most recent append was refused
@@ -1517,7 +1541,7 @@ mod tests {
         let mut ep =
             EventProcessor::new(admission_options(), 2, semantic_schema(envelope)).unwrap();
         ep.plane.fallback_work_buffer.resize(64, 0);
-        ep.grow_plane(16);
+        ep.grow_plane(16).expect("plane fits");
         assert_eq!(ep.plane.dynamic_columns.capacity, 16);
         assert_eq!(
             ep.plane.fallback_work_buffer.len(),

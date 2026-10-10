@@ -1385,7 +1385,7 @@ mod tests {
         SignalSchemaField::new(kind, true)
     }
     fn one_value(json: &[u8], kind: ArrowType) -> DynamicColumns {
-        let mut c = DynamicColumns::new(&[field(kind)], 1);
+        let mut c = DynamicColumns::new(&[field(kind)], 1).expect("column plane fits");
         c.begin_row();
         let mut p = JsonParser::new(json);
         extract_typed_value(
@@ -1400,7 +1400,7 @@ mod tests {
         c
     }
     fn try_one_value(json: &[u8], kind: ArrowType) -> Result<(), ExtractionError> {
-        let mut c = DynamicColumns::new(&[field(kind)], 1);
+        let mut c = DynamicColumns::new(&[field(kind)], 1).expect("column plane fits");
         c.begin_row();
         let mut p = JsonParser::new(json);
         extract_typed_value(
@@ -1442,7 +1442,7 @@ mod tests {
             Some(&discriminator()),
         )
         .unwrap();
-        let mut columns = DynamicColumns::new(&fields, 2);
+        let mut columns = DynamicColumns::new(&fields, 2).expect("column plane fits");
         let mut work = [0; 256];
         let mut diagnostic = ExtractionDiagnostic::default();
         assert_eq!(
@@ -1459,7 +1459,7 @@ mod tests {
         assert_eq!(columns.cell(3, 0), Some(ColumnValue::Int(0)));
         assert_eq!(columns.cell(4, 0), None);
 
-        let mut columns = DynamicColumns::new(&fields, 2);
+        let mut columns = DynamicColumns::new(&fields, 2).expect("column plane fits");
         assert_eq!(
             extract_json_events(
                 br#"[{"id":"e2","type":"open","value":{"authorRole":"agent"}}]"#,
@@ -1472,7 +1472,7 @@ mod tests {
         );
         assert_eq!(columns.cell(4, 0), Some(ColumnValue::Utf8("agent".into())));
 
-        let mut columns = DynamicColumns::new(&fields, 2);
+        let mut columns = DynamicColumns::new(&fields, 2).expect("column plane fits");
         assert_eq!(
             extract_json_events(
                 br#"[{"id":"e3","type":"close","value":{"outcome":"abandoned"}}]"#,
@@ -1486,7 +1486,7 @@ mod tests {
         // `value` before `type`: the lookahead picks the payload schema, but the
         // discriminant stays undiscriminated, so no enum ordinal resolves and the
         // string is refused.
-        let mut columns = DynamicColumns::new(&fields, 2);
+        let mut columns = DynamicColumns::new(&fields, 2).expect("column plane fits");
         assert_eq!(
             extract_json_events(
                 br#"[{"id":"e4","value":{"outcome":"stuck"},"type":"close"}]"#,
@@ -1499,7 +1499,7 @@ mod tests {
         );
         // An escaped `type` key is the same member: `\u0074ype` decodes to `type`,
         // so it discriminates the payload exactly as the plain spelling does.
-        let mut columns = DynamicColumns::new(&fields, 2);
+        let mut columns = DynamicColumns::new(&fields, 2).expect("column plane fits");
         assert_eq!(
             extract_json_events(
                 br#"[{"id":"e5","\u0074ype":"close","value":{"authorRole":"human","outcome":"stuck"}}]"#,
@@ -1533,7 +1533,7 @@ mod tests {
                 "event_value_present.%24value%24schema%2Etype%2Eflag",
             ],
         );
-        let mut columns = DynamicColumns::new(&fields, 2);
+        let mut columns = DynamicColumns::new(&fields, 2).expect("column plane fits");
         let mut work = [0; 64];
 
         assert_eq!(
@@ -1639,7 +1639,7 @@ mod tests {
     #[test]
     fn extra_produces_typed_msgpack() {
         let fields = [field(ArrowType::Utf8), field(ArrowType::Binary)];
-        let mut c = DynamicColumns::new(&fields, 10);
+        let mut c = DynamicColumns::new(&fields, 10).expect("column plane fits");
         let mut work = [0; 1024];
         extract_json_events(
             br#"[{"id":"1","count":42}]"#,
@@ -1664,7 +1664,7 @@ mod tests {
             field(ArrowType::Int64),
             field(ArrowType::Binary),
         ];
-        let mut c = DynamicColumns::new(&fields, 10);
+        let mut c = DynamicColumns::new(&fields, 10).expect("column plane fits");
         let mut work = [0; 4096];
         let extra_fields = (1..=40)
             .map(|index| format!(r#""k{index:02}":"v""#))
@@ -1692,7 +1692,7 @@ mod tests {
             field(ArrowType::Int64),
             field(ArrowType::Binary),
         ];
-        let mut c = DynamicColumns::new(&fields, 1);
+        let mut c = DynamicColumns::new(&fields, 1).expect("column plane fits");
         let mut work = [0; 16];
         assert_eq!(
             extract_json_events(
@@ -1714,7 +1714,7 @@ mod tests {
             field(ArrowType::Utf8),
             field(ArrowType::Binary),
         ];
-        let mut c = DynamicColumns::new(&fields, 10);
+        let mut c = DynamicColumns::new(&fields, 10).expect("column plane fits");
         let mut work = [0; 1024];
         assert_eq!(extract_json_events(br#"[{"id":"1","type":"order","timestamp":1000,"orderId":"A"},{"id":"2","type":"order","timestamp":2000,"orderId":"B"}]"#,&config(&fields,&["id","type","timestamp","orderId",crate::UNDECLARED_COLUMN_NAME]),&mut c,&mut work,&mut ExtractionDiagnostic::default()).unwrap(),2);
     }
@@ -1727,7 +1727,7 @@ mod tests {
             field(ArrowType::Utf8),
             field(ArrowType::Binary),
         ];
-        let mut c = DynamicColumns::new(&fields, 10);
+        let mut c = DynamicColumns::new(&fields, 10).expect("column plane fits");
         let mut work = [0; 1024];
         assert_eq!(
             extract_json_events(
@@ -1748,7 +1748,7 @@ mod tests {
         let fields = vec![field(ArrowType::Utf8); 65];
         let names: Vec<String> = (0..65).map(|i| format!("f{i:02}")).collect();
         let borrowed: Vec<&str> = names.iter().map(String::as_str).collect();
-        let mut c = DynamicColumns::new(&fields, 2);
+        let mut c = DynamicColumns::new(&fields, 2).expect("column plane fits");
         let mut work = [0; 256];
         assert_eq!(
             extract_json_events(
@@ -1770,7 +1770,7 @@ mod tests {
         // nested object. Each payload member resolves its `value.<member>`
         // column exactly as the flattened spelling would have.
         let fields = [field(ArrowType::Utf8), field(ArrowType::Utf8)];
-        let mut c = DynamicColumns::new(&fields, 2);
+        let mut c = DynamicColumns::new(&fields, 2).expect("column plane fits");
         let mut work = [0; 128];
         assert_eq!(
             extract_json_events(
@@ -1791,7 +1791,7 @@ mod tests {
         // An unknown payload member captures under its payload-relative key,
         // not under a `value.`-prefixed spelling.
         let fields = [field(ArrowType::Utf8), field(ArrowType::Binary)];
-        let mut c = DynamicColumns::new(&fields, 2);
+        let mut c = DynamicColumns::new(&fields, 2).expect("column plane fits");
         let mut work = [0; 128];
         assert_eq!(
             extract_json_events(
@@ -1817,7 +1817,7 @@ mod tests {
         // event: the validator judges the nested form, so a second spelling
         // would let the judged bytes and the stored bytes diverge.
         let fields = [field(ArrowType::Utf8), field(ArrowType::Utf8)];
-        let mut c = DynamicColumns::new(&fields, 2);
+        let mut c = DynamicColumns::new(&fields, 2).expect("column plane fits");
         let mut work = [0; 128];
         let mut diagnostic = ExtractionDiagnostic::default();
         assert!(
@@ -1839,7 +1839,7 @@ mod tests {
         // the carrier cell directly: the member routes to capture like any
         // other unknown, so the carrier stays a projection artifact.
         let fields = [field(ArrowType::Utf8), field(ArrowType::Binary)];
-        let mut c = DynamicColumns::new(&fields, 2);
+        let mut c = DynamicColumns::new(&fields, 2).expect("column plane fits");
         let mut work = [0; 128];
         assert_eq!(
             extract_json_events(
@@ -1910,7 +1910,7 @@ mod tests {
     #[test]
     fn extract_json_events_accepts_exactly_capacity_batch() {
         let fields = [field(ArrowType::Utf8)];
-        let mut c = DynamicColumns::new(&fields, 1);
+        let mut c = DynamicColumns::new(&fields, 1).expect("column plane fits");
         let mut work = [0; 64];
         assert_eq!(
             extract_json_events(
@@ -1944,7 +1944,7 @@ mod tests {
     #[test]
     fn extract_json_events_tiny_work_buffer_ok_without_undeclared_fields() {
         let fields = [field(ArrowType::Utf8), field(ArrowType::Binary)];
-        let mut c = DynamicColumns::new(&fields, 2);
+        let mut c = DynamicColumns::new(&fields, 2).expect("column plane fits");
         let mut work = [0; 2];
         assert_eq!(
             extract_json_events(
@@ -1963,7 +1963,7 @@ mod tests {
     #[test]
     fn extract_json_events_error_abandons_partial_row() {
         let fields = [field(ArrowType::Int64)];
-        let mut c = DynamicColumns::new(&fields, 2);
+        let mut c = DynamicColumns::new(&fields, 2).expect("column plane fits");
         let mut work = [0; 64];
         assert_eq!(
             extract_json_events(
@@ -1996,7 +1996,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let mut columns = DynamicColumns::new(&fields, 1);
+        let mut columns = DynamicColumns::new(&fields, 1).expect("column plane fits");
         let mut work = [0; 512];
         extract_json_events(
             br#"[{"type":"order","value":{"user":{"id":"u","nickname":"n"}}}]"#,
@@ -2051,7 +2051,7 @@ mod tests {
             &br#"[{"value":{"note":"x"},"type":"a"}]"#[..],
             &br#"[{"\u0074ype":"a","value":{"note":"x"}}]"#[..],
         ] {
-            let mut columns = DynamicColumns::new(&fields, 1);
+            let mut columns = DynamicColumns::new(&fields, 1).expect("column plane fits");
             let mut work = [0; 512];
             extract_json_events(
                 input,
@@ -2064,7 +2064,7 @@ mod tests {
             assert_eq!(columns.cell(1, 0), None, "b's column stays empty");
             assert_eq!(columns.cell(2, 0), Some(captured_note.clone()));
         }
-        let mut columns = DynamicColumns::new(&fields, 1);
+        let mut columns = DynamicColumns::new(&fields, 1).expect("column plane fits");
         let mut work = [0; 512];
         extract_json_events(
             br#"[{"type":"b","value":{"note":"x"}}]"#,
@@ -2132,7 +2132,7 @@ mod tests {
                 (&armed, &two[..]),
                 (&discriminated, &five[..]),
             ] {
-                let mut columns = DynamicColumns::new(fields, 1);
+                let mut columns = DynamicColumns::new(fields, 1).expect("column plane fits");
                 let mut work = [0; 64];
                 assert_eq!(
                     extract_json_events(

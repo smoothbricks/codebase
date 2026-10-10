@@ -60,6 +60,8 @@ impl Default for MetadataLimits {
 pub enum MetadataError {
     TooManyFields,
     TooManyBuffers,
+    /// The storage could not be backed.
+    OutOfMemory,
 }
 
 /// Schema-sized retained storage for field nodes and buffer descriptors
@@ -90,8 +92,10 @@ impl MetadataStorage {
             return Err(MetadataError::TooManyBuffers);
         }
         Ok(Self {
-            field_nodes: vec![FieldNode::default(); field_count],
-            buffer_descs: vec![BufferDesc::default(); buffer_count],
+            field_nodes: crate::fallible::filled(FieldNode::default(), field_count)
+                .ok_or(MetadataError::OutOfMemory)?,
+            buffer_descs: crate::fallible::filled(BufferDesc::default(), buffer_count)
+                .ok_or(MetadataError::OutOfMemory)?,
         })
     }
 }

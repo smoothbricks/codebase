@@ -13,10 +13,12 @@
 //!
 
 pub mod columns;
+mod fallible;
 pub mod ipc;
 pub mod record_batch;
 pub mod schema;
 
+pub use columns::PlaneOutOfMemory;
 pub use columns::{
     ColumnStorage, DynamicColumns, MAX_EVENTS_PER_BATCH, MAX_STRING_BYTES, MAX_VALUE_BYTES,
     ParseError, VariableValueError, VariableValueReservation,
@@ -32,6 +34,7 @@ pub use record_batch::{
 };
 pub use schema::{
     ArrowType, BASE_EVENT_LOG_FIELDS, BASE_EVENT_LOG_NAMES, DynamicSchemaConfig,
-    MAX_FIXED_SIZE_BINARY_WIDTH, MAX_SCHEMA_FIELDS, PlaneKind, SchemaError, SignalSchemaField,
-    compute_buffer_count, logical_schema_ipc_bytes, schema_ipc_bytes,
+    MAX_FIXED_SIZE_BINARY_WIDTH, MAX_SCHEMA_FIELDS, MAX_SCHEMA_MESSAGE_BYTES, PlaneKind,
+    SchemaError, SignalSchemaField, compute_buffer_count, logical_schema_ipc_bytes,
+    schema_ipc_bytes,
 };

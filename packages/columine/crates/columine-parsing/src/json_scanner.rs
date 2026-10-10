@@ -180,7 +180,7 @@ fn epoch_days(year: i32, month: u32, day: u32) -> i64 {
 mod tests {
     use super::*;
     fn columns() -> DynamicColumns {
-        DynamicColumns::new(&crate::BASE_EVENT_LOG_FIELDS, 10)
+        DynamicColumns::new(&crate::BASE_EVENT_LOG_FIELDS, 10).expect("column plane fits")
     }
     #[test]
     fn parse_iso8601_to_micros_full_format_with_millis() {

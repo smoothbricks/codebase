@@ -8,6 +8,9 @@
 //! The values chosen are the boundaries that distinguish planes of equal
 //! width, because equal width is exactly where a physical-tag mistake hides.
 
+#[path = "../../columine-vm/tests/common/memory.rs"]
+mod memory;
+
 use std::io::Cursor;
 
 use arrow_array::{
@@ -20,8 +23,9 @@ use arrow_array::{
 use arrow_ipc::reader::StreamReader;
 use arrow_schema::{DataType, Field, IntervalUnit, TimeUnit};
 use columine_arrow::{
-    ArrowType, DynamicColumns, DynamicSchemaConfig, MetadataLimits, MetadataStorage,
-    SignalSchemaField, logical_schema_ipc_bytes, write_arrow_ipc_from_dynamic_columns,
+    ArrowType, DynamicColumns, DynamicSchemaConfig, MAX_SCHEMA_FIELDS, MAX_SCHEMA_MESSAGE_BYTES,
+    MetadataLimits, MetadataStorage, SchemaError, SignalSchemaField, logical_schema_ipc_bytes,
+    write_arrow_ipc_from_dynamic_columns,
 };
 
 /// Write `rows` rows through the typed append surface, emit Arrow IPC, and
@@ -35,7 +39,7 @@ fn round_trip(
     let schema_bytes = logical_schema_ipc_bytes(logical).expect("encode schema message");
     let config = DynamicSchemaConfig::new(&schema_bytes, fields).expect("validate schema");
 
-    let mut columns = DynamicColumns::new(fields, rows);
+    let mut columns = DynamicColumns::new(fields, rows).expect("column plane fits");
     write(&mut columns);
     assert_eq!(columns.count, rows, "producer wrote the wrong row count");
 
@@ -209,7 +213,7 @@ fn unsigned_integer_planes_round_trip_the_upper_half() {
 #[test]
 fn unsigned_planes_reject_a_value_wider_than_the_plane() {
     let fields = [plane(ArrowType::UInt8)];
-    let mut columns = DynamicColumns::new(&fields, 1);
+    let mut columns = DynamicColumns::new(&fields, 1).expect("column plane fits");
     assert!(columns.begin_row());
     // 256 does not fit a byte. Storing it as 0 would be a silently wrong
     // number, so the append fails instead.
@@ -378,7 +382,7 @@ fn fixed_size_binary_round_trips_at_its_declared_width() {
     assert_eq!(fixed.value(1), &[0u8; 16]);
 
     // A short or long cell is a different value, not a padded one.
-    let mut columns = DynamicColumns::new(&[field], 1);
+    let mut columns = DynamicColumns::new(&[field], 1).expect("column plane fits");
     assert!(columns.begin_row());
     assert!(columns.append_fixed_bytes(0, &[0u8; 15]).is_err());
     assert!(columns.append_fixed_bytes(0, &[0u8; 17]).is_err());
@@ -664,4 +668,44 @@ fn every_plane_emits_a_readable_stream_in_one_schema() {
         let expected_nulls = usize::from(*arrow_type == ArrowType::Null) * 2;
         assert_eq!(array.logical_null_count(), expected_nulls, "{arrow_type:?}");
     }
+}
+
+/// The one infallible decode a handle performs is bounded by the message
+/// cap: the widest schema whose message fits the cap (every field named as
+/// long as fits) decodes within a pinned multiple of the cap, and one byte
+/// past the cap is refused before the reader runs.
+#[test]
+fn schema_decode_at_the_message_cap_stays_bounded() {
+    let schema = |name_len: usize| {
+        logical_schema_ipc_bytes(
+            (0..MAX_SCHEMA_FIELDS)
+                .map(|index| Field::new(format!("{index:0>name_len$}"), DataType::Utf8, true))
+                .collect(),
+        )
+        .expect("schema encodes")
+    };
+    let mut name_len = 1;
+    while schema(name_len + 1).len() <= MAX_SCHEMA_MESSAGE_BYTES {
+        name_len += 1;
+    }
+    let widest = schema(name_len);
+    let metadata: Vec<u8> = (0..MAX_SCHEMA_FIELDS)
+        .flat_map(|_| [ArrowType::Utf8 as u8, 1, 0, 0])
+        .collect();
+    let (config, peak) = memory::peak_bytes(|| DynamicSchemaConfig::from_wire(&widest, &metadata));
+    config.expect("the widest schema under the cap is admitted");
+    assert!(
+        peak <= 4 * MAX_SCHEMA_MESSAGE_BYTES,
+        "decoding a {}-byte schema held {peak} bytes live",
+        widest.len()
+    );
+    let over = schema(name_len + 1);
+    assert!(over.len() > MAX_SCHEMA_MESSAGE_BYTES);
+    let (refused, refused_peak) =
+        memory::peak_bytes(|| DynamicSchemaConfig::from_wire(&over, &metadata));
+    assert_eq!(refused.err(), Some(SchemaError::MessageTooLarge));
+    assert!(
+        refused_peak < MAX_SCHEMA_MESSAGE_BYTES / 16,
+        "a refused message allocates no decode: {refused_peak} bytes"
+    );
 }

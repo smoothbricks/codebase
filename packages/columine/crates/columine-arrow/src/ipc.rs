@@ -316,7 +316,7 @@ mod tests {
             "utf8/utf8/int64/binary IS the base event log"
         );
 
-        let mut columns = DynamicColumns::new(&fields, 8);
+        let mut columns = DynamicColumns::new(&fields, 8).expect("column plane fits");
         assert!(columns.begin_row());
         columns.append_variable(0, b"id-1").unwrap();
         columns.append_variable(1, b"click").unwrap();
@@ -399,7 +399,7 @@ mod tests {
             SignalSchemaField::new(ArrowType::Bool, true),
         ];
         let config = DynamicSchemaConfig::new(&schema_bytes(&fields), &fields).unwrap();
-        let mut cols = DynamicColumns::new(&fields, 4);
+        let mut cols = DynamicColumns::new(&fields, 4).expect("column plane fits");
         assert!(cols.begin_row());
         cols.append_variable(0, b"row-1").unwrap();
         cols.append_int(1, 7).unwrap();
@@ -595,7 +595,7 @@ mod tests {
     fn too_small_output_refuses() {
         let fields = base_fields();
         let config = DynamicSchemaConfig::new(&schema_bytes(&fields), &fields).unwrap();
-        let cols = DynamicColumns::new(&fields, 4);
+        let cols = DynamicColumns::new(&fields, 4).expect("column plane fits");
         let mut meta = MetadataStorage::for_fields(&fields, MetadataLimits::default()).unwrap();
         let mut out = vec![0u8; 1024]; // < 4096 hard floor
         assert_eq!(

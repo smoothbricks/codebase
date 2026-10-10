@@ -163,8 +163,20 @@ pub struct ColumnStorage {
     max_data_bytes: u32,
 }
 
+/// A column plane's storage could not be backed; nothing of it is kept.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PlaneOutOfMemory;
+
+impl From<PlaneOutOfMemory> for ParseError {
+    fn from(_: PlaneOutOfMemory) -> Self {
+        ParseError::OutOfMemory
+    }
+}
+
 impl ColumnStorage {
-    pub fn new(kind: PlaneKind, capacity: u32) -> Self {
+    /// Storage for `capacity` rows of `kind`, or [`PlaneOutOfMemory`] when
+    /// it cannot be backed.
+    pub fn new(kind: PlaneKind, capacity: u32) -> Result<Self, PlaneOutOfMemory> {
         Self::with_variable_limit(kind, capacity, MAX_VALUE_BYTES)
     }
 
@@ -181,28 +193,33 @@ impl ColumnStorage {
     ///   kind that needs one, because it is the only kind whose per-row cost
     ///   the schema does not state.
     /// - `Empty`: nothing at all.
-    pub fn with_variable_limit(kind: PlaneKind, capacity: u32, max_data_bytes: u32) -> Self {
+    pub fn with_variable_limit(
+        kind: PlaneKind,
+        capacity: u32,
+        max_data_bytes: u32,
+    ) -> Result<Self, PlaneOutOfMemory> {
         let cap = capacity.min(MAX_EVENTS_PER_BATCH) as usize;
+        let zeroed = |len: usize| filled(0u8, len).ok_or(PlaneOutOfMemory);
         let (offsets, values) = match kind {
             PlaneKind::Empty => (Vec::new(), Vec::new()),
-            PlaneKind::Bool => (Vec::new(), vec![0; cap.div_ceil(8)]),
+            PlaneKind::Bool => (Vec::new(), zeroed(cap.div_ceil(8))?),
             PlaneKind::SignedInt { width }
             | PlaneKind::UnsignedInt { width }
             | PlaneKind::Float { width }
-            | PlaneKind::FixedBytes { width } => (Vec::new(), vec![0; cap * width as usize]),
+            | PlaneKind::FixedBytes { width } => (Vec::new(), zeroed(cap * width as usize)?),
             PlaneKind::Text { offset_width } | PlaneKind::Bytes { offset_width } => (
-                vec![0; (cap + 1) * offset_width as usize],
-                vec![0; (max_data_bytes as usize).min(cap * 128)],
+                zeroed((cap + 1) * offset_width as usize)?,
+                zeroed((max_data_bytes as usize).min(cap * 128))?,
             ),
         };
-        Self {
+        Ok(Self {
             kind,
-            validity: vec![0; cap.div_ceil(8)],
+            validity: zeroed(cap.div_ceil(8))?,
             offsets,
             values,
             data_len: 0,
             max_data_bytes,
-        }
+        })
     }
 
     /// Reset for reuse. Grown variable-width allocations are retained rather
@@ -248,7 +265,7 @@ impl ColumnStorage {
             };
         }
 
-        let mut replacement = vec![0u8; new_capacity];
+        let mut replacement = filled(0u8, new_capacity).ok_or(ParseError::OutOfMemory)?;
         debug_assert!(preserve_end <= self.values.len());
         replacement[..preserve_end].copy_from_slice(&self.values[..preserve_end]);
         self.values = replacement;
@@ -531,29 +548,36 @@ pub struct DynamicColumns {
     pub capacity: u32,
 }
 
+use crate::fallible::filled;
 use crate::schema::{PlaneKind, SignalSchemaField};
 
 impl DynamicColumns {
     /// Initialize from schema field metadata: every field's storage follows
     /// from its plane kind, including the byte width, so there is no per-type
     /// dispatch left to get wrong.
-    pub fn new(field_metadata: &[SignalSchemaField], capacity: u32) -> Self {
+    /// [`PlaneOutOfMemory`] when any column's storage cannot be backed;
+    /// nothing is kept of a plane that could not be built whole.
+    pub fn new(
+        field_metadata: &[SignalSchemaField],
+        capacity: u32,
+    ) -> Result<Self, PlaneOutOfMemory> {
         let cap = capacity.min(MAX_EVENTS_PER_BATCH);
-        let columns = field_metadata
-            .iter()
-            // The Null plane allocates nothing: it has no buffers in the Arrow
-            // body and every row of it is null. It used to be stored as an
-            // empty utf8 column, paying for offsets and a payload no reader
-            // could ever reach.
-            .map(|field| ColumnStorage::new(field.plane_kind(), cap))
-            .collect::<Vec<_>>();
-        Self {
+        let mut columns = Vec::new();
+        columns
+            .try_reserve_exact(field_metadata.len())
+            .map_err(|_| PlaneOutOfMemory)?;
+        for field in field_metadata {
+            // The Null plane's values and offsets are empty: it has no
+            // buffers in the Arrow body and every row of it is null.
+            columns.push(ColumnStorage::new(field.plane_kind(), cap)?);
+        }
+        Ok(Self {
             count: 0,
-            columns_seen: vec![false; field_metadata.len()],
+            columns_seen: filled(false, field_metadata.len()).ok_or(PlaneOutOfMemory)?,
             field_count: field_metadata.len() as u32,
             capacity: cap,
             columns,
-        }
+        })
     }
 
     /// Reset all columns for reuse.
@@ -814,7 +838,7 @@ mod tests {
             field(ArrowType::Int64, false),
             field(ArrowType::Binary, true),
         ];
-        let cols = DynamicColumns::new(&fields, 100);
+        let cols = DynamicColumns::new(&fields, 100).expect("column plane fits");
         assert_eq!(cols.count, 0);
         assert_eq!(cols.field_count, 4);
     }
@@ -830,7 +854,7 @@ mod tests {
             field(ArrowType::Bool, true),
             field(ArrowType::Null, true),
         ];
-        let mut cols = DynamicColumns::new(&fields, 10);
+        let mut cols = DynamicColumns::new(&fields, 10).expect("column plane fits");
         for row in 0..6u32 {
             assert!(cols.begin_row());
             cols.append_variable(0, format!("id-{row}").as_bytes())
@@ -876,7 +900,7 @@ mod tests {
             field(ArrowType::Float64, true),
             field(ArrowType::Bool, true),
         ];
-        let mut cols = DynamicColumns::new(&fields, 10);
+        let mut cols = DynamicColumns::new(&fields, 10).expect("column plane fits");
         assert!(cols.begin_row());
         cols.append_variable(0, b"id-001").unwrap();
         cols.append_int(1, 42).unwrap();
@@ -900,7 +924,7 @@ mod tests {
             field(ArrowType::Utf8, false),
             field(ArrowType::Float64, true),
         ];
-        let mut cols = DynamicColumns::new(&fields, 10);
+        let mut cols = DynamicColumns::new(&fields, 10).expect("column plane fits");
         assert!(cols.begin_row());
         cols.append_variable(0, b"id-001").unwrap();
         cols.append_null(1).unwrap();
@@ -916,7 +940,7 @@ mod tests {
             field(ArrowType::Utf8, false),
             field(ArrowType::Int32, false),
         ];
-        let mut cols = DynamicColumns::new(&fields, 10);
+        let mut cols = DynamicColumns::new(&fields, 10).expect("column plane fits");
         for (name, count) in [("alice", 10), ("bob", 20), ("charlie", 30)] {
             assert!(cols.begin_row());
             cols.append_variable(0, name.as_bytes()).unwrap();
@@ -932,7 +956,7 @@ mod tests {
     #[test]
     fn int32_column_is_signed_end_to_end() {
         let fields = [field(ArrowType::Int32, false)];
-        let mut cols = DynamicColumns::new(&fields, 8);
+        let mut cols = DynamicColumns::new(&fields, 8).expect("column plane fits");
         for value in [0, -1, i64::from(i32::MIN), i64::from(i32::MAX)] {
             assert!(cols.begin_row());
             cols.append_int(0, value).unwrap();
@@ -959,7 +983,7 @@ mod tests {
     #[test]
     fn dynamic_reset() {
         let fields = [field(ArrowType::Utf8, false)];
-        let mut cols = DynamicColumns::new(&fields, 10);
+        let mut cols = DynamicColumns::new(&fields, 10).expect("column plane fits");
         assert!(cols.begin_row());
         cols.append_variable(0, b"test").unwrap();
         cols.end_row();
@@ -977,7 +1001,7 @@ mod tests {
     #[test]
     fn dynamic_invalid_type() {
         let fields = [field(ArrowType::Int32, false)];
-        let mut cols = DynamicColumns::new(&fields, 10);
+        let mut cols = DynamicColumns::new(&fields, 10).expect("column plane fits");
         assert!(cols.begin_row());
         assert_eq!(
             cols.append_variable(0, b"not an int"),
@@ -989,7 +1013,7 @@ mod tests {
     #[test]
     fn dynamic_retains_grown_binary_capacity() {
         let fields = [field(ArrowType::Binary, true)];
-        let mut cols = DynamicColumns::new(&fields, 2);
+        let mut cols = DynamicColumns::new(&fields, 2).expect("column plane fits");
         let payload = [0x5a_u8; 48_000];
         for _ in 0..2 {
             assert!(cols.begin_row());
@@ -1020,7 +1044,7 @@ mod tests {
             field(ArrowType::Int64, false),
             field(ArrowType::Bool, true),
         ];
-        let mut cols = DynamicColumns::new(&fields, 4);
+        let mut cols = DynamicColumns::new(&fields, 4).expect("column plane fits");
         let first = [b'a'; 40_000];
         let second = [b'b'; 40_000];
 
@@ -1056,7 +1080,8 @@ mod tests {
     #[test]
     fn column_storage_configured_maximum() {
         let mut col =
-            ColumnStorage::with_variable_limit(PlaneKind::Bytes { offset_width: 4 }, 2, 1024);
+            ColumnStorage::with_variable_limit(PlaneKind::Bytes { offset_width: 4 }, 2, 1024)
+                .expect("column plane fits");
         col.ensure_variable_capacity(1024).unwrap();
         assert_eq!(col.data_capacity(), 1024);
         for _ in 0..20 {
@@ -1080,7 +1105,7 @@ mod tests {
     #[test]
     fn duplicate_append_leaves_dead_bytes() {
         let fields = [field(ArrowType::Utf8, false)];
-        let mut cols = DynamicColumns::new(&fields, 4);
+        let mut cols = DynamicColumns::new(&fields, 4).expect("column plane fits");
         assert!(cols.begin_row());
         cols.append_variable(0, b"first").unwrap();
         cols.append_variable(0, b"second").unwrap();
@@ -1097,7 +1122,7 @@ mod tests {
     #[test]
     fn fallback_null_then_binary_is_clean() {
         let fields = [field(ArrowType::Binary, true)];
-        let mut cols = DynamicColumns::new(&fields, 4);
+        let mut cols = DynamicColumns::new(&fields, 4).expect("column plane fits");
         assert!(cols.begin_row());
         cols.append_null(0).unwrap();
         cols.append_variable(0, b"\xdf\0\0\0\0").unwrap();
@@ -1111,7 +1136,7 @@ mod tests {
     #[test]
     fn reservation_commit_publishes() {
         let fields = [field(ArrowType::Binary, true)];
-        let mut cols = DynamicColumns::new(&fields, 4);
+        let mut cols = DynamicColumns::new(&fields, 4).expect("column plane fits");
         assert!(cols.begin_row());
         let reservation = cols.reserve_binary_value(0).unwrap();
         reservation.ensure_capacity(&mut cols, 3).unwrap();
@@ -1128,7 +1153,7 @@ mod tests {
     #[test]
     fn reservation_requires_binary() {
         let fields = [field(ArrowType::Utf8, false)];
-        let mut cols = DynamicColumns::new(&fields, 4);
+        let mut cols = DynamicColumns::new(&fields, 4).expect("column plane fits");
         assert_eq!(
             cols.reserve_binary_value(0).unwrap_err(),
             VariableValueError::InvalidFieldType
@@ -1201,7 +1226,7 @@ mod tests {
             // whose per-row cost the schema does not state.
             (PlaneKind::Text { offset_width: 4 }, 131_072),
         ] {
-            let storage = ColumnStorage::new(kind, capacity);
+            let storage = ColumnStorage::new(kind, capacity).expect("column plane fits");
             assert_eq!(storage.data_capacity(), expected, "{kind:?}");
         }
     }

@@ -6,7 +6,8 @@
 //! host table, fail if a Rust number moves and TS does not.
 
 use columine_arrow::{
-    ArrowType, MAX_EVENTS_PER_BATCH, MAX_SCHEMA_FIELDS, MAX_VALUE_BYTES, MIN_ARROW_OUTPUT_CAPACITY,
+    ArrowType, MAX_EVENTS_PER_BATCH, MAX_SCHEMA_FIELDS, MAX_SCHEMA_MESSAGE_BYTES, MAX_VALUE_BYTES,
+    MIN_ARROW_OUTPUT_CAPACITY,
 };
 use columine_event_processor::{
     COMPACT_ABI_VERSION, COMPACT_BATCH_MAGIC, COMPACT_DESCRIPTOR_SIZE, COMPACT_DIAGNOSTIC_STAGE,
@@ -71,6 +72,7 @@ fn ts_create_failure_name(failure: CreateFailure) -> &'static str {
         CreateFailure::Init => "INIT",
         CreateFailure::HandlesExhausted => "HANDLES_EXHAUSTED",
         CreateFailure::MemoryExhausted => "MEMORY_EXHAUSTED",
+        CreateFailure::SchemaTooLarge => "SCHEMA_TOO_LARGE",
     }
 }
 
@@ -105,6 +107,10 @@ fn parse_backend_ts_compact_abi_matches_rust() {
     );
     assert_ne!(WASM_EVENT_CAPACITY, MAX_EVENTS_PER_BATCH);
     assert_eq!(ts_const(&source, "MAX_FIELDS"), MAX_SCHEMA_FIELDS as u64);
+    assert_eq!(
+        ts_const(&source, "MAX_SCHEMA_MESSAGE_BYTES"),
+        MAX_SCHEMA_MESSAGE_BYTES as u64
+    );
     assert_eq!(
         ts_const(&source, "MAX_VARIABLE_DATA_BYTES"),
         u64::from(MAX_VALUE_BYTES)

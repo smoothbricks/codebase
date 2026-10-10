@@ -146,7 +146,7 @@ fn via_json(kind: ArrowType, literal: &str) -> Result<Option<ColumnValue>, Extra
     let document = format!("[{{\"v\":{literal}}}]");
     let fields = schema(kind);
     let config = build_extraction_config(&fields, &["v"]).expect("single-field schema is valid");
-    let mut columns = DynamicColumns::new(&fields, 4);
+    let mut columns = DynamicColumns::new(&fields, 4).expect("column plane fits");
     let mut work = [0_u8; 1 << 12];
     let mut diagnostic = ExtractionDiagnostic::default();
     extract_json_events(
@@ -164,7 +164,7 @@ fn via_msgpack(kind: ArrowType, literal: &str) -> Result<Option<ColumnValue>, Ex
     let document = canonical_msgpack(&format!("[{{\"v\":{literal}}}]"));
     let fields = schema(kind);
     let config = build_extraction_config(&fields, &["v"]).expect("single-field schema is valid");
-    let mut columns = DynamicColumns::new(&fields, 4);
+    let mut columns = DynamicColumns::new(&fields, 4).expect("column plane fits");
     let mut work = [0_u8; 1 << 12];
     extract_msgpack_events(&document, &config, &mut columns, &mut work, false)?;
     Ok(read_cell(&columns, 0, 0))

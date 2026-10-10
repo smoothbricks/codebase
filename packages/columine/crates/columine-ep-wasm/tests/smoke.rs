@@ -2,6 +2,9 @@
 //! parse-backend.ts drives (fixed offsets it chose; header + Arrow IPC read
 //! back from the output span).
 
+#[path = "../../columine-vm/tests/common/memory.rs"]
+mod memory;
+
 use arrow_array::{Array, BinaryArray, Int64Array, StringArray};
 use arrow_ipc::reader::StreamReader;
 use arrow_ipc::writer::StreamWriter;
@@ -350,6 +353,39 @@ fn creation_failures_name_their_cause() {
     let create = |schema: &[u8], meta: *const u8, count: u32| unsafe {
         ep_create_with_schema(256, schema.as_ptr(), schema.len() as u32, meta, count)
     };
+
+    // Under a memory ceiling, creation refuses with MemoryExhausted and
+    // builds nothing, never traps. The schema decode is the one bounded
+    // infallible step, so every ceiling from its need up to a whole handle's
+    // answers either a handle or MemoryExhausted.
+    let (decoded, decode_need) = memory::peak_bytes(|| {
+        columine_arrow::DynamicSchemaConfig::from_wire_with_field_names(
+            &SCHEMA_BYTES,
+            unsafe { std::slice::from_raw_parts(meta_ptr, 16) },
+            names,
+        )
+    });
+    decoded.expect("the base schema decodes");
+    let (handle, whole) = memory::peak_bytes(|| create_processor(256));
+    assert!(
+        (1..=255).contains(&handle),
+        "unlimited creation: {handle:#x}"
+    );
+    ep_destroy(handle);
+    let mut refused = 0;
+    for ceiling in (decode_need..=whole).step_by(64) {
+        let handle = memory::with_ceiling(ceiling, || create_processor(256));
+        if handle == CreateFailure::MemoryExhausted as u32 {
+            refused += 1;
+        } else {
+            assert!(
+                (1..=255).contains(&handle),
+                "ceiling {ceiling}: {handle:#x}"
+            );
+            ep_destroy(handle);
+        }
+    }
+    assert!(refused > 0, "some ceiling under a whole handle is refused");
 
     assert_eq!(create_processor(0), CreateFailure::Capacity as u32);
     assert_eq!(
