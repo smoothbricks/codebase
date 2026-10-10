@@ -696,20 +696,11 @@ impl UndoState {
             .unwrap_or(max)
     }
 
-    /// Reserve all possible changed chunks before copying any before-bytes.
-    /// Frames are disjoint and LIFO; a child cannot overwrite a parent's scratch.
-    pub(crate) fn begin_capture(
-        &mut self,
-        state: &[u8],
-        ranges: &[(u32, u32)],
-    ) -> Result<ByteCapture, ErrorCode> {
+    /// Check that `ranges` lie within the image and overlap neither each other
+    /// nor an open capture frame's ranges; answers how many chunks a recording
+    /// journal must reserve for them.
+    fn validate_ranges(&self, state: &[u8], ranges: &[(u32, u32)]) -> Result<u32, ErrorCode> {
         let state_size = u32::try_from(state.len()).map_err(|_| ErrorCode::InvalidState)?;
-        if self.enabled && self.overflow {
-            return Err(ErrorCode::JournalOverflow);
-        }
-        if self.enabled && state_size != self.state_size {
-            return Err(ErrorCode::InvalidState);
-        }
         let mut count = 0u32;
         for (index, &(offset, len)) in ranges.iter().enumerate() {
             let end = offset.checked_add(len).ok_or(ErrorCode::InvalidState)?;
@@ -730,9 +721,6 @@ impl UndoState {
                     return Err(ErrorCode::InvalidState);
                 }
             }
-            if !self.enabled {
-                continue;
-            }
             let mut cursor = offset;
             while cursor < end {
                 if self.boundary_flag(cursor) {
@@ -743,9 +731,31 @@ impl UndoState {
                 }
             }
         }
+        Ok(count)
+    }
+
+    /// Reserve all possible changed chunks before copying any before-bytes.
+    /// Frames are disjoint and LIFO; a child cannot overwrite a parent's scratch.
+    ///
+    /// A journal that is not recording does no capture work at all: no frame,
+    /// no range check. The VM derives every range it captures from geometry it
+    /// already checked, and a recording window checks them; an external
+    /// writer's ranges are checked by [`Vm::capture_mutation`] in either mode.
+    pub(crate) fn begin_capture(
+        &mut self,
+        state: &[u8],
+        ranges: &[(u32, u32)],
+    ) -> Result<ByteCapture, ErrorCode> {
         if !self.enabled {
             return Ok(ByteCapture { frame: None });
         }
+        if self.overflow {
+            return Err(ErrorCode::JournalOverflow);
+        }
+        if u32::try_from(state.len()).ok() != Some(self.state_size) {
+            return Err(ErrorCode::InvalidState);
+        }
+        let count = self.validate_ranges(state, ranges)?;
         // Before-bytes and their ranges never exceed the declared bytes and
         // the reserved chunks; both are backed before the budget is taken.
         let bytes: usize = ranges.iter().map(|&(_, len)| len as usize).sum();
@@ -1007,6 +1017,9 @@ impl Vm {
         ranges: &[(u32, u32)],
         mutate: impl FnOnce(&mut [u8]) -> T,
     ) -> Result<T, ErrorCode> {
+        // An external writer's ranges are checked whether or not the journal
+        // records them: the VM did not derive them.
+        self.undo.validate_ranges(state, ranges)?;
         self.undo.prepare_redo(delta_mode)?;
         let capture = self.undo.begin_capture(state, ranges)?;
         let result = mutate(state);
@@ -6428,6 +6441,7 @@ mod tests {
     use super::Vm;
     use crate::state_init::{DEFAULT_ACCEPTED_PROGRAM_MAGICS, calculate_state_size, init_state};
     use columine_types::PROGRAM_MAGIC;
+    use columine_types::types::ErrorCode;
     use columine_types::types::{AggType, Opcode, SlotType};
 
     /// A state holding one COUNT aggregate slot.
@@ -6454,6 +6468,36 @@ mod tests {
         let mut state = vec![0u8; usize::try_from(size).expect("size fits usize")];
         init_state(&mut state, &prog, DEFAULT_ACCEPTED_PROGRAM_MAGICS).expect("init_state");
         state
+    }
+
+    /// A journal that is not recording does no capture work: ranges a
+    /// recording window would refuse (past the image, overlapping) open no
+    /// frame and are not even checked, so an unjournaled batch pays nothing
+    /// per capture. An external writer's ranges are still checked.
+    #[test]
+    fn an_unrecorded_capture_does_no_work() {
+        let mut state = count_state();
+        let len = u32::try_from(state.len()).unwrap();
+        let unchecked = [(0, 8), (4, 8), (len, 1)];
+        let mut vm = Vm::default();
+        let capture = vm
+            .undo
+            .begin_capture(&state, &unchecked)
+            .expect("no work, no refusal");
+        assert!(capture.frame.is_none());
+        vm.undo.finish_capture(false, &state, &unchecked, capture);
+        assert_eq!(
+            vm.capture_mutation(false, &mut state, &unchecked, |_| ()),
+            Err(ErrorCode::InvalidState),
+            "an external writer's ranges are checked even unrecorded"
+        );
+
+        vm.undo_enable(&state).expect("window opens");
+        assert_eq!(
+            vm.undo.begin_capture(&state, &unchecked).err(),
+            Some(ErrorCode::InvalidState),
+            "a recording window checks every range"
+        );
     }
 
     /// Generations are unique across journals: a frame begun in one VM's
