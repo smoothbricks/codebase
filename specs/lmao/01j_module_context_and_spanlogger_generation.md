@@ -47,8 +47,10 @@ storage. The lease pins the buffer arena and exact immutable vocabulary dictiona
 releases it; it never pins a module's caller-owned fragment arrays. This permits near-zero-allocation
 request→trace→Arrow conversion without recycling memory still observed by a consumer.
 
-The flush unit is one request. After linear-memory growth, WASM views are re-derived. Growth while a lease pins the
-previous WASM memory epoch fails with an explicit error; it never invalidates pinned views silently.
+The flush unit is one request. After linear-memory growth, WASM views are re-derived. While a lease pins the current
+WASM memory epoch, growth is delayed, or the leased output is copied to Arrow-owned buffers and the lease released
+first; growth never invalidates pinned views
+([WASM Memory Architecture](./01q_wasm_memory_architecture.md#smoo/lmao!n/wasm-mem.lifecycle)).
 
 ## Compiler-Emitted Vocabulary Registration
 
@@ -838,7 +840,8 @@ An ESLint rule prevents capturing `tag` or `log` in variables.
 
 - **Build/Startup**: Schema compilation and class generation (~1-5ms per module)
 - **Runtime**: Warmed, in-capacity entry calls use fixed monomorphic stores with zero allocation
-- **Memory**: Shared OpMetadata across all ops in same module
+- **Memory**: The compiled TagWriter/SpanLogger classes and the `LogBinding` are shared by every op in an op context;
+  `OpMetadata` is per op
 
 ### Generated Code Efficiency
 
@@ -863,7 +866,8 @@ setAttribute(name, value) {
 - **Direct lineNumber writes**: lineNumber passed as argument to span(), written directly to `line_values[0]` (NO
   intermediate object storage, NO lineNumber property on any context)
 - **Span names**: `spanName` is interned during Arrow conversion; the stored value is a bound dense index
-- **Reference to OpMetadata**: References to shared OpMetadata (no duplication)
+- **Reference to OpMetadata**: Each buffer references its op's `OpMetadata` rather than copying it; the compiled classes
+  and the `LogBinding` are shared per op context
 
 ## Integration Points
 

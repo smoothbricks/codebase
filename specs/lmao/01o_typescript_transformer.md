@@ -181,9 +181,11 @@ await ctx.span1(
 A checker-proven literal span name lowers its name operand to the registered vocabulary index `$$lmaoVocabulary[N]`
 (§6.2). The member form registers the name at `plugin/driver/optimization.go:900-903` and lowers it at
 `plugin/driver/lmao.go:418-421`; the re-rooted form (§3) follows the same rule. A dynamic span name is not registered
-and keeps its string operand. The child context is exactly `callsitePlan.newCtx0(receiver)` — the plan's
-prototype-inheriting child constructor (`packages/lmao/src/lib/spanContext.ts:1123-1126`) — not a copied or merged
-object. Because `spanN` remains Promise-based, the lowered call preserves the public `span()` scheduling contract.
+and keeps its string operand. The child context's source is exactly `callsitePlan.newCtx0(receiver)`: with no overrides
+the plan's factory returns the receiver itself (`packages/lmao/src/lib/physicalLayoutPlan.ts:139`), and `_spanPre`
+builds the child `SpanContextClass` over it (`packages/lmao/src/lib/spanContext.ts:1179-1216`). It is not a copied or
+merged object. Because `spanN` remains Promise-based, the lowered call preserves the public `span()` scheduling
+contract.
 
 #### Evaluation and safety bailouts
 

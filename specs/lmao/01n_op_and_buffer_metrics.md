@@ -284,7 +284,7 @@ async invoke(parentCtx, spanName, line, ...args) {
 ## Metrics Flush <a id="smoo/lmao!n/op-metrics-collection.metrics-flush"></a>
 
 The `period-start` and `buffer-*` rows are written at each flush by `arrow/capacityStats.ts`
-(`n/buffer-tuning-stats-logging`). The per-op rows (step 2b below) are written by the same flush.
+(`n/buffer-tuning-stats-logging`). The per-op rows (step 2.2 below) are written by the same flush.
 
 ### When <a id="smoo/lmao!n/op-metrics-collection.when"></a>
 
@@ -298,17 +298,20 @@ Metrics flush alongside trace data using the same `FlushScheduler` triggers:
 ### Process <a id="smoo/lmao!n/op-metrics-collection.process"></a>
 
 1. Capture current timestamp as `period_end` (this becomes `timestamp` for all metric rows)
-2. For each module: a. Write `period-start` row with `periodStartNs` as `uint64_value` b. For each Op in module:
-   - Write `op-invocations` row
-   - Write `op-errors` row (if > 0)
-   - Write `op-exceptions` row (if > 0)
-   - Write `op-duration-total` row
-   - Write `op-duration-ok` row (if > 0)
-   - Write `op-duration-err` row (if > 0)
-   - Write `op-duration-min` row
-
-- Write `op-duration-max` row c. Write `buffer-writes` row d. Write `buffer-spans` row e. Write `buffer-capacity` row
-
+2. For each module:
+   1. Write `period-start` row with `periodStartNs` as `uint64_value`
+   2. For each Op in module:
+      - Write `op-invocations` row
+      - Write `op-errors` row (if > 0)
+      - Write `op-exceptions` row (if > 0)
+      - Write `op-duration-total` row
+      - Write `op-duration-ok` row (if > 0)
+      - Write `op-duration-err` row (if > 0)
+      - Write `op-duration-min` row
+      - Write `op-duration-max` row
+   3. Write `buffer-writes` row
+   4. Write `buffer-spans` row
+   5. Write `buffer-capacity` row
 3. Reset all counters to zero
 4. Update `periodStartNs` to current timestamp (start of next period)
 

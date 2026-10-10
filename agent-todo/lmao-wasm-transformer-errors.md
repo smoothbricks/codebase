@@ -3,9 +3,9 @@
 This file covers four lmao specs: `specs/lmao/01q_wasm_memory_architecture.md`,
 `specs/lmao/01r_transient_errors_and_retry.md`, `specs/lmao/01k_tree_walker_and_arrow_conversion.md`, and
 `specs/lmao/01o_typescript_transformer.md`. Each item cites the current spec lines and the current code lines. The items
-are independent unless stated. Items under "Open decisions" need a choice before anyone implements them. The four
-Deferred Work items that the 01q spec removed (WasmTracer, string pooling, per-capacity freelists, hot-path inlining)
-have no entry, because the spec no longer states their design.
+are independent unless stated. Items under "Open decisions" need a choice before anyone implements them. Three of the
+four Deferred Work items that the 01q spec removed (WasmTracer, string pooling, hot-path inlining) are briefed under
+"WASM memory follow-ups" below. The fourth, per-capacity freelists, was dropped, as that section explains.
 
 ## Blocked `resource` reason variant
 
@@ -68,6 +68,8 @@ have no entry, because the spec no longer states their design.
   passes `$$lmaoVocabulary[n]` as its name operand.
 - Acceptance: a destructured `span('x', op)` emits `$$lmaoVocabulary[n]` as the name operand. A Go golden test asserts
   it.
+- Cost: interning re-rooted names adds them to the vocabulary catalog, which moves catalog ordinals, so it is not a free
+  change. Update every test that pins an ordinal in the same commit.
 
 ## logTemplateIds missing from compile metadata
 

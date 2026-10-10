@@ -270,8 +270,10 @@ rather than every row.
 
 - `trace_id`: Branded `TraceId` string, validated (non-empty, max 128 chars, ASCII). Shared by reference across all
   spans in a trace (no per-span string payload copy).
-- `thread_id` + `span_id`: Extracted from `SpanIdentity` 25-byte ArrayBuffer during Arrow conversion.
-- `parent_thread_id` + `parent_span_id`: Also from `SpanIdentity`, null for root spans (hasParent flag = 0).
+- `thread_id` + `span_id`: Read from the buffer's packed identity section during Arrow conversion
+  ([Span Identity](./01b4_span_identity.md#spanbuffer-integration)).
+- `parent_thread_id` + `parent_span_id`: Read through the parent pointer (or the trace root's remote parent), null for
+  rows of a span with no parent.
 
 ## Module Identification <a id="smoo/lmao!n/arrow-table-module-id"></a>
 
@@ -406,10 +408,10 @@ This happens in several scenarios:
 - **Distributed services**: Same trace spanning multiple machines
 - **Serverless**: Multiple Lambda invocations for the same request
 
-### Chosen Approach: SpanIdentity + TraceId <a id="smoo/lmao!n/arrow-table-span-id.chosen"></a>
+### Chosen Approach: Packed Identity + TraceId <a id="smoo/lmao!n/arrow-table-span-id.chosen"></a>
 
-LMAO uses a combination of `SpanIdentity` (25-byte ArrayBuffer) and `TraceId` (branded string) for span identification.
-In the Arrow output, these are expanded to separate columns for query flexibility:
+LMAO uses a packed identity section in each buffer's `_system` ArrayBuffer and a `TraceId` (branded string) for span
+identification. In the Arrow output, these are expanded to separate columns for query flexibility:
 
 | Column             | Type                 | Description                                           |
 | ------------------ | -------------------- | ----------------------------------------------------- |
@@ -419,20 +421,32 @@ In the Arrow output, these are expanded to separate columns for query flexibilit
 | `parent_thread_id` | `uint64` (nullable)  | Parent span's thread                                  |
 | `parent_span_id`   | `uint32` (nullable)  | Parent span's ID                                      |
 
-### SpanIdentity Memory Layout <a id="smoo/lmao!n/arrow-table-span-id.layout"></a>
+### Identity Memory Layout <a id="smoo/lmao!n/arrow-table-span-id.layout"></a>
 
-In memory, span identification is packed into a 25-byte `SpanIdentity` ArrayBuffer:
+In memory, span identification is a packed byte section at the end of the buffer's `_system` ArrayBuffer, after the
+timestamp and entry-type storage, 8-byte aligned. [Span Identity](./01b4_span_identity.md#spanbuffer-integration) owns
+the layout:
 
 ```
-SpanIdentity (25 bytes):
+CHILD identity (12 bytes):
 ┌──────────────────────────────────────────────────────────────────────────┐
-│ Byte 0:      flags           (bit 0 = hasParent)                         │
-│ Bytes 1-8:   thread_id        (8 bytes, crypto-secure random)             │
-│ Bytes 9-12:  span_id          (4 bytes, thread-local counter)             │
-│ Bytes 13-20: parentThreadId  (8 bytes, zeroed if root)                   │
-│ Bytes 21-24: parentSpanId    (4 bytes, zeroed if root)                   │
+│ Bytes 0-7:   thread_id       (8 bytes, crypto-secure random, per thread) │
+│ Bytes 8-11:  span_id         (4 bytes, thread-local counter)             │
+└──────────────────────────────────────────────────────────────────────────┘
+
+ROOT identity (13 + N bytes):
+┌──────────────────────────────────────────────────────────────────────────┐
+│ Bytes 0-7:   thread_id       (8 bytes)                                   │
+│ Bytes 8-11:  span_id         (4 bytes)                                   │
+│ Byte 12:     traceIdLen      (1 byte, N)                                 │
+│ Bytes 13-:   trace_id        (N bytes)                                   │
 └──────────────────────────────────────────────────────────────────────────┘
 ```
+
+A CHAINED overflow buffer shares its first buffer's identity reference and adds no bytes. The identity stores no parent
+ids and no hasParent flag: the parent ids are read through the `_parent` pointer, or through the trace root's remote
+parent for a root that continues a remote trace
+([Remote Parent of a Root Span](./01b4_span_identity.md#smoo/lmao!n/span-identity.remote-parent)).
 
 ### TraceId: Branded String <a id="smoo/lmao!n/arrow-table-span-id.traceid"></a>
 
@@ -464,12 +478,11 @@ To find a parent span, you need:
 - Same `trace_id` (parent is always in same trace)
 - Match `thread_id = parent_thread_id` AND `span_id = parent_span_id`
 
-SpanBuffer provides convenience methods:
+SpanBuffer provides convenience methods. They compare the parent pointer in O(1); they read no identity bytes:
 
 ```typescript
-// These check BOTH trace_id equality AND SpanIdentity relationship
-spanA.isParentOf(spanB); // true if spanA is spanB's parent
-spanB.isChildOf(spanA); // true if spanB is spanA's child
+spanA.isParentOf(spanB); // spanA === spanB._parent
+spanB.isChildOf(spanA); // spanB._parent === spanA
 ```
 
 ### Why This Design <a id="smoo/lmao!n/arrow-table-span-id.why"></a>
@@ -479,7 +492,7 @@ spanB.isChildOf(spanA); // true if spanB is spanA's child
 - `span_id` is just `i++` - no random generation, no BigInt operations per span
 - Thread ID generated once at worker startup using crypto-secure random (cold path)
 - TraceId shared by reference - no string copies per span
-- SpanIdentity comparison uses simple byte loop (6x faster than DataView)
+- Parent relationships are pointer comparisons; no identity bytes are compared
 
 **Collision Resistance**:
 
@@ -501,7 +514,8 @@ spanB.isChildOf(spanA); // true if spanB is spanA's child
 
 **JavaScript Compatibility**:
 
-- `thread_id` (64-bit): Stored as raw bytes in SpanIdentity, converted to BigUint64 for Arrow
+- `thread_id` (64-bit): Stored as raw bytes in the packed identity, held as a `bigint` on the buffer, written to Arrow
+  as `uint64`
 - `span_id` (32-bit): Fits in `number`, used per span (no BigInt in hot path)
 - `trace_id`: Plain string reference (branded for type safety)
 
@@ -604,47 +618,28 @@ ORDER BY span_id;
 -- trace_id: req-2, span_id: 5    (req-2 continues)
 ```
 
-### SpanIdentity to Arrow Conversion <a id="smoo/lmao!n/arrow-table-span-id.to-arrow"></a>
+### Identity to Arrow Conversion <a id="smoo/lmao!n/arrow-table-span-id.to-arrow"></a>
 
-During Arrow conversion, the `SpanIdentity` 25-byte ArrayBuffer is expanded to separate columns:
+During Arrow conversion, each identity column is one TypedArray over every row of the batch. Each buffer fills its own
+`_writeIndex` rows from its identity getters, so the identity is read once per buffer, never per row
+(`buildNonDictIdentityColumns` in `packages/lmao/src/lib/convertToArrow.ts`):
 
 ```typescript
-function convertSpanIdentityToArrowColumns(spanIdentity: SpanIdentity, rowCount: number): ArrowColumns {
-  // Thread ID: extract 8 bytes, convert to BigUint64
-  const threadIdBytes = spanIdentity.threadId; // Uint8Array view of bytes 1-8
-  const threadIdView = new DataView(threadIdBytes.buffer, threadIdBytes.byteOffset, 8);
-  const threadIdValue = threadIdView.getBigUint64(0, true); // little-endian
-  const threadIdData = new BigUint64Array(rowCount).fill(threadIdValue);
+// thread_id and span_id: constant per buffer, never null
+threadIds.fill(buf.thread_id, offset, offset + buf._writeIndex);
+spanIds.fill(buf.span_id, offset, offset + buf._writeIndex);
 
-  // Span ID: direct 32-bit value
-  const spanIdData = new Uint32Array(rowCount).fill(spanIdentity.spanId);
-
-  // Parent columns (nullable based on hasParent flag)
-  if (spanIdentity.hasParent) {
-    const parentThreadIdBytes = spanIdentity.parentThreadId;
-    const parentThreadIdView = new DataView(parentThreadIdBytes.buffer, parentThreadIdBytes.byteOffset, 8);
-    const parentThreadIdValue = parentThreadIdView.getBigUint64(0, true);
-    const parentThreadIdData = new BigUint64Array(rowCount).fill(parentThreadIdValue);
-    const parentSpanIdData = new Uint32Array(rowCount).fill(spanIdentity.parentSpanId);
-
-    return {
-      thread_id: { data: threadIdData, nullBitmap: null },
-      span_id: { data: spanIdData, nullBitmap: null },
-      parent_thread_id: { data: parentThreadIdData, nullBitmap: null },
-      parent_span_id: { data: parentSpanIdData, nullBitmap: null },
-    };
-  } else {
-    // Root span: parent columns are all null
-    const nullBitmap = new Uint8Array(Math.ceil(rowCount / 8)); // All zeros = all null
-    return {
-      thread_id: { data: threadIdData, nullBitmap: null },
-      span_id: { data: spanIdData, nullBitmap: null },
-      parent_thread_id: { data: new BigUint64Array(rowCount), nullBitmap, nullCount: rowCount },
-      parent_span_id: { data: new Uint32Array(rowCount), nullBitmap, nullCount: rowCount },
-    };
-  }
+// parent columns: filled when the span has a parent (pointer or remote parent), else null for its rows
+if (buf._hasParent) {
+  parentThreadIds.fill(buf.parent_thread_id, offset, offset + buf._writeIndex);
+  parentSpanIds.fill(buf.parent_span_id, offset, offset + buf._writeIndex);
+} else {
+  clearBitRange(parentThreadIdNulls, offset, buf._writeIndex);
+  clearBitRange(parentSpanIdNulls, offset, buf._writeIndex);
 }
 ```
+
+A parent column carries a null bitmap only when some row is null.
 
 ### Library-Specific Attribute Columns (Sparse/Nullable) <a id="smoo/lmao!n/arrow-table-schema.library-attrs"></a>
 
@@ -1327,7 +1322,8 @@ This Arrow table structure integrates with:
   and low-level logging API
 - **[Columnar Buffer Architecture](./01b_columnar_buffer_architecture.md)**: Direct conversion from SpanBuffer columns.
   Also documents:
-  - **SpanIdentity**: 25-byte ArrayBuffer with comparison methods (`equals()`, `isParentOf()`, `isChildOf()`)
+  - **Span identity**: packed `[threadId][spanId]` section in `_system` (plus the trace id for a root), with O(1)
+    pointer-based `isParentOf()` / `isChildOf()`
   - **TraceId**: Branded string type with validation and W3C format generation
   - **ColumnBuffer Extension**: Mechanism for lmao to inject span-specific code into arrow-builder generated classes
 - **[Library Integration Pattern](./01e_library_integration_pattern.md)**: Prefixed columns from different libraries

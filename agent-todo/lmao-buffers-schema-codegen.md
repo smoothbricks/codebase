@@ -70,6 +70,18 @@ independent unless stated. DECIDE items need a spec-or-code choice first, so the
   declared in the `SpanContext` type of `packages/lmao/src/lib/opContext/spanContextTypes.ts`, and no others.
 - Acceptance: a grep of the spec block and a grep of the code's `SpanContext` declaration list the same members.
 
+## Codegen follow-ups outside the 01g design
+
+- Spec: `specs/lmao/01g_trace_context_api_codegen.md` "Out of Scope" (end of file) lists dynamic schema updates
+  (hot-reload, schema evolution for stored traces, versioning and migration), advanced type features (union attribute
+  types, generic constraints for library composition, conditional types by operation context), and performance work
+  (SIMD bulk attribute writes, memory pools for large traces, compression-aware column layouts). The 01g codegen does
+  not design them; each is a follow-up, not a silent stub.
+- Code: none of them exists in `packages/lmao/src`; nothing claims them.
+- Work: each follow-up starts with a spec section that states its design, before any code.
+- Acceptance: a follow-up leaves this list only when its spec section lands; any code that needs one of them fails with
+  an explicit error until then, never a stub that silently ignores the request.
+
 ## Open decisions
 
 ### Dynamic reference lanes or raw `string[]` for CATEGORY and TEXT
