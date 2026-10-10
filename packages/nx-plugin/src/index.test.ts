@@ -18,7 +18,7 @@ import { createTaskGraph } from 'nx/src/tasks-runner/create-task-graph.js';
 import { getOutputsForTargetAndConfiguration } from 'nx/src/tasks-runner/utils.js';
 import { useFixtureCargoHome } from './__tests__/fixture-cargo-home.js';
 import { runtimeInputValue } from './__tests__/runtime-input.js';
-import { BOUNDED_TEST_TIMEOUT_MS } from './bounded-test-policy.js';
+import { BOUNDED_TEST_KILL_AFTER_MS, BOUNDED_TEST_TIMEOUT_MS } from './bounded-test-policy.js';
 import { exceptionalTestFilter, packageNameFromCargoTestTarget } from './cargo-workspace.js';
 import { CARGO_CROSS_LINT_COMMAND, CARGO_CROSS_LINT_TARGET, CARGO_LINT_CLIPPY_COMMAND } from './cross-check-policy.js';
 import { cargoCommandNpmPackages, createNodesV2, createNodesV2ForPlatform } from './index.js';
@@ -2042,6 +2042,87 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(targets['cargo-test-big-exceptions-shard1']?.inputs).toEqual(targets['cargo-test-big-shard1']?.inputs);
       // Exceptional pieces fan out like the ordinary ones: nothing is exclusive.
       expectNoSchedulerThrottle(targets);
+    } finally {
+      await workspace.cleanup();
+    }
+  });
+
+  it('runs the serial test group once, unpartitioned, and excludes its tests from every crate piece on macOS', async () => {
+    const workspace = await createWorkspace();
+    try {
+      await workspace.write('packages/rusty/package.json', '{"name":"rusty"}\n');
+      await workspace.write('packages/rusty/Cargo.toml', '[workspace]\nmembers = ["crates/big", "crates/small"]\n');
+      await workspace.write(
+        'packages/rusty/crates/big/Cargo.toml',
+        '[package]\nname = "big"\n\n[package.metadata.smoothbricks.test]\nshards = 3\n',
+      );
+      await workspace.write('packages/rusty/crates/small/Cargo.toml', '[package]\nname = "small"\n');
+      await workspace.write(
+        'packages/rusty/.config/nextest.toml',
+        [
+          '[test-groups.real-apfs]',
+          'max-threads = 1',
+          '',
+          '[[profile.default.overrides]]',
+          "filter = 'test(/real_apfs_/)'",
+          `platform = 'cfg(target_os="macos")'`,
+          "test-group = 'real-apfs'",
+          '',
+        ].join('\n'),
+      );
+
+      const macos = await inferProjectTargets(
+        workspace,
+        'packages/rusty/package.json',
+        createNodesV2ForPlatform('darwin', 'arm64'),
+      );
+      const serial = '(test(/real_apfs_/))';
+      const group = macos['cargo-test-group-real-apfs'];
+      // One runner for the workspace, owned by the cargo root beside the archive it executes. Its count
+      // stage sizes the bound, so it carries no fixed timeout, no partition and no thread flag.
+      expect(group?.executor).toBe('@smoothbricks/nx-plugin:nextest-group');
+      expect(group?.dependsOn).toEqual(['cargo-fetch', 'cargo-test-archive']);
+      expect(String(group?.options?.command)).toContain('nextest run ');
+      expect(String(group?.options?.command)).toContain(`-E '${serial}' --no-tests=pass --user-config-file none`);
+      expect(String(group?.options?.listCommand)).toContain('nextest list ');
+      expect(String(group?.options?.listCommand)).toContain(
+        `-E '${serial}' --message-format=json --user-config-file none`,
+      );
+      expect(group?.options).not.toHaveProperty('timeoutMs');
+      expect(group?.options?.killAfterMs).toBe(BOUNDED_TEST_KILL_AFTER_MS);
+      expect(group?.inputs).toContain('{workspaceRoot}/packages/rusty/.config/nextest.toml');
+      for (const command of [group?.options?.command, group?.options?.listCommand]) {
+        expect(String(command)).not.toMatch(/--partition|test-threads|parallelism/);
+      }
+
+      // Every crate piece excludes the group's tests, so each test is selected by exactly one target.
+      const exceptional = exceptionalTestFilter(fileURLToPath(new URL('../nextest.toml', import.meta.url)));
+      if (exceptional === null) {
+        throw new Error('nextest.toml declares no overrides; this test asserts the pin that protects them');
+      }
+      expect(macos['cargo-test-small']?.options?.command).toContain(
+        `-E 'package(small) and not ((test(/real_apfs_/)))' --no-tests=pass`,
+      );
+      for (const index of [1, 2, 3]) {
+        expect(macos[`cargo-test-big-shard${index}`]?.options?.command).toContain(
+          `-E 'package(big) and not (${exceptional}) and not ((test(/real_apfs_/)))' --partition hash:${index}/3 --no-tests=pass`,
+        );
+        expect(macos[`cargo-test-big-exceptions-shard${index}`]?.options?.command).toContain(
+          `-E 'package(big) and (${exceptional}) and not ((test(/real_apfs_/)))' --partition hash:${index}/3 --no-tests=pass`,
+        );
+      }
+      // The root's aggregate reaches the group beside every crate piece.
+      expect(macos['cargo-test']?.dependsOn).toContain('cargo-test-group-real-apfs');
+
+      // Off macOS nextest applies the group nowhere, so it is not inferred and no piece excludes its tests.
+      const linux = await inferProjectTargets(
+        workspace,
+        'packages/rusty/package.json',
+        createNodesV2ForPlatform('linux', 'x64'),
+      );
+      expect(linux['cargo-test-group-real-apfs']).toBeUndefined();
+      expect(linux['cargo-test-small']?.options?.command).toContain(`-E 'package(small)' --no-tests=pass`);
+      expect(linux['cargo-test']?.dependsOn).not.toContain('cargo-test-group-real-apfs');
     } finally {
       await workspace.cleanup();
     }

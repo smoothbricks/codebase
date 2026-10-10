@@ -35,13 +35,17 @@ import {
   type CargoCrossTestTarget,
   type CargoInputsCache,
   cargoPackageTestInputs,
+  cargoTestGroupTargetName,
   cargoTestPackageTargetName,
   createCargoInputsCache,
   exceptionalTestFilter,
   listCargoCrossTestTargets,
   listCargoWorkspacePackages,
+  NEXTEST_GROUP_EXECUTOR,
   NEXTEST_REPO_CONFIG_PATH,
   nextestToolConfigArg,
+  type SerialTestGroup,
+  serialTestGroups,
 } from './cargo-workspace.js';
 import {
   CARGO_CROSS_LINT_COMMAND,
@@ -939,7 +943,7 @@ function createNodesHandler(hostPlatform: NapiPlatform | null): CreateNodesHandl
     const errors: Array<[file: string | null, error: Error]> = [];
     let cargoWorkspaces: CargoWorkspace[];
     try {
-      cargoWorkspaces = await resolveCargoWorkspaces(projectConfigurationFiles, context.workspaceRoot);
+      cargoWorkspaces = await resolveCargoWorkspaces(projectConfigurationFiles, context.workspaceRoot, hostPlatform);
     } catch (error) {
       throw new AggregateCreateNodesError([[null, error instanceof Error ? error : new Error(String(error))]], results);
     }
@@ -1353,14 +1357,32 @@ async function createProjectTargets(
         ]),
       );
     }
-    const aggregateDependencies = cargoWorkspace.packages.flatMap((plan) =>
-      plan.pieces.map((piece) =>
-        cargoTargetDependency(projectName, {
-          projectName: plan.package.projectName,
-          targetName: piece.targetName,
-        }),
+    // A serial group runs one filter across every member, so no single crate owns
+    // it. The root owns each group's runner beside the archive it executes, and
+    // gives it every member's inputs, as the archive itself has.
+    for (const group of cargoWorkspace.serialGroups) {
+      targets[cargoTestGroupTargetName(group.group)] = cargoTestGroupTarget(
+        cargoWorkspace,
+        await cargoTestRunnerInputs(
+          workspaceRoot,
+          cargoWorkspace,
+          cargoWorkspace.packages.map((plan) => plan.package.dir),
+        ),
+        group,
+      );
+    }
+    const aggregateDependencies = [
+      ...cargoWorkspace.packages.flatMap((plan) =>
+        plan.pieces.map((piece) =>
+          cargoTargetDependency(projectName, {
+            projectName: plan.package.projectName,
+            targetName: piece.targetName,
+          }),
+        ),
       ),
-    );
+      // Reachable from the root's `test` aggregate: the root runs every member's tests.
+      ...cargoWorkspace.serialGroups.map((group) => cargoTestGroupTargetName(group.group)),
+    ];
     targets[CARGO_TEST_TARGET] =
       aggregateDependencies.length > 0
         ? { executor: 'nx:noop', cache: true, outputs: [], dependsOn: aggregateDependencies }
@@ -1464,7 +1486,17 @@ async function createProjectTargets(
         executor: 'nx:noop',
         cache: true,
         outputs: [],
-        dependsOn: packageTargetNames,
+        // A member's `test` runs its own crates and reaches every serial group runner too, so its tests
+        // are never dropped from a member-level run.
+        dependsOn: [
+          ...packageTargetNames,
+          ...cargoWorkspace.serialGroups.map((group) =>
+            cargoTargetDependency(projectName, {
+              projectName: cargoWorkspace.rootProjectName,
+              targetName: cargoTestGroupTargetName(group.group),
+            }),
+          ),
+        ],
       };
     }
     if (!isCargoWorkspaceRoot && cargoPackagePlans.length > 0) {
@@ -1618,12 +1650,17 @@ async function createProjectTargets(
     // A crate whose project also builds the debug cdylib runs its tests after
     // that build: the tests dlopen what `napi-debug` writes into `target/debug`,
     // and an archived test binary still loads it from this tree.
-    for (const plan of cargoPackagePlans) {
-      for (const piece of plan.pieces) {
-        const target = targets[piece.targetName];
-        if (target && !hasCargoTargetDependency(target.dependsOn ?? [], 'napi-debug')) {
-          target.dependsOn = [...(target.dependsOn ?? []), 'napi-debug'];
-        }
+    const runners = [
+      ...cargoPackagePlans.flatMap((plan) => plan.pieces.map((piece) => piece.targetName)),
+      // The root owns the serial groups' runners, so they take its build as its pieces do.
+      ...(ownsCargoWorkspaceTargets
+        ? cargoWorkspace.serialGroups.map((group) => cargoTestGroupTargetName(group.group))
+        : []),
+    ];
+    for (const name of runners) {
+      const target = targets[name];
+      if (target && !hasCargoTargetDependency(target.dependsOn ?? [], 'napi-debug')) {
+        target.dependsOn = [...(target.dependsOn ?? []), 'napi-debug'];
       }
     }
   } else if (napiDebug) {
@@ -2343,6 +2380,8 @@ interface CargoWorkspace {
   packages: CargoPackagePlan[];
   rootProjectName: string;
   projectRoot: string;
+  /** The repository's serial test groups, each with one runner beside the archive (see `serialTestGroups`). */
+  serialGroups: SerialTestGroup[];
   /** One derivation memo for the whole graph computation (see cargoPackageTestInputs). */
   inputsCache: CargoInputsCache;
   /** The content-keyed Cargo resolve, checked before publishing any project's closure. */
@@ -2360,6 +2399,7 @@ function cargoTargetDependency(currentProjectName: string, target: CargoTargetRe
 async function resolveCargoWorkspaces(
   packageJsonPaths: readonly string[],
   workspaceRoot: string,
+  hostPlatform: NapiPlatform | null,
 ): Promise<CargoWorkspace[]> {
   const projects: Array<{ name: string; root: string }> = [];
   for (const packageJsonPath of packageJsonPaths) {
@@ -2392,16 +2432,26 @@ async function resolveCargoWorkspaces(
     ).map((pkg) => ({ ...pkg, dir: posix.relative(rootProject.root, pkg.dir) || '.' }));
     const packages: CargoPackagePlan[] = [];
     const exceptional = exceptionalTestFilter(PLUGIN_NEXTEST_CONFIG);
+    // A serial group runs only where its declared cfg holds, macOS. Elsewhere it is not inferred and
+    // no piece excludes its tests: nextest does not apply the group there, so the pieces select them.
+    const serialGroups =
+      hostPlatform?.targetFamily === 'macos'
+        ? serialTestGroups(join(workspaceRoot, rootProject.root, NEXTEST_REPO_CONFIG_PATH))
+        : [];
+    // A serial group's tests belong to that group's one runner, so every per-crate
+    // piece excludes them: each test is selected by exactly one target.
+    const serialExclusion = serialGroups.length === 0 ? null : serialGroups.map((group) => group.filter).join(' or ');
+    const notSerial = serialExclusion === null ? [] : [`not (${serialExclusion})`];
     for (const pkg of attributed) {
       const pieces: CargoTestPiece[] = [];
       const sharded = pkg.testShards > 1;
       const pin = sharded && exceptional !== null ? exceptional : null;
-      const shardable = pin === null ? `package(${pkg.name})` : `package(${pkg.name}) and not (${pin})`;
+      const ordinary = [`package(${pkg.name})`, ...(pin === null ? [] : [`not (${pin})`]), ...notSerial].join(' and ');
       for (let index = 1; index <= pkg.testShards; index += 1) {
         const targetName = cargoTestPackageTargetName(pkg.name, sharded ? `shard${index}` : undefined);
         pieces.push({
           extra: sharded ? ` --partition hash:${index}/${pkg.testShards}` : '',
-          selector: shardable,
+          selector: ordinary,
           targetName,
         });
       }
@@ -2409,7 +2459,7 @@ async function resolveCargoWorkspaces(
         for (let index = 1; index <= pkg.testShards; index += 1) {
           pieces.push({
             extra: ` --partition hash:${index}/${pkg.testShards}`,
-            selector: `package(${pkg.name}) and (${pin})`,
+            selector: [`package(${pkg.name}) and (${pin})`, ...notSerial].join(' and '),
             targetName: cargoTestPackageTargetName(pkg.name, `${CARGO_TEST_EXCEPTIONS_SUFFIX}-shard${index}`),
           });
         }
@@ -2421,6 +2471,7 @@ async function resolveCargoWorkspaces(
       rootProjectName: rootProject.name,
       projectRoot: rootProject.root,
       inputsCache: createCargoInputsCache(),
+      serialGroups,
     });
   }
   if (found.length === 0) return [];
@@ -2516,6 +2567,78 @@ async function addCargoTestTargets(
   workspace: CargoWorkspace,
 ): Promise<string[]> {
   const targetNames: string[] = [];
+  for (const plan of workspace.packages) {
+    if (plan.package.projectRoot !== projectRoot) {
+      continue;
+    }
+    const inputs = await cargoTestRunnerInputs(workspaceRoot, workspace, [plan.package.dir]);
+    const archive = cargoTargetDependency(currentProjectName, {
+      projectName: workspace.rootProjectName,
+      targetName: CARGO_TEST_ARCHIVE_TARGET,
+    });
+    for (const piece of plan.pieces) {
+      targetNames.push(piece.targetName);
+      targets[piece.targetName] = cargoTestRunnerTarget(workspace, archive, inputs, piece);
+    }
+  }
+  return targetNames;
+}
+
+/**
+ * The inputs of the runners that select crates from one cargo workspace: the
+ * sources of the crates they select, every member manifest, and the repository's
+ * nextest config.
+ *
+ * Workspace-anchored for the reason `cargoPackageTestInputs` gives: a
+ * `{projectRoot}` glob hashes only files this project owns, and sibling manifests
+ * belong to whichever nested project holds them. A workspace nextest build unifies
+ * features across every selected member, so a sibling manifest can change a crate's
+ * tests without being a path dependency: track those manifests, not unrelated
+ * sibling sources.
+ *
+ * The repository's own nextest config layers OVER the plugin's tool config, so it
+ * decides timeouts, groups and archive contents: a cached verdict that ignored it
+ * would survive the change that invalidates it.
+ */
+async function cargoTestRunnerInputs(
+  workspaceRoot: string,
+  workspace: CargoWorkspace,
+  memberDirs: readonly string[],
+): Promise<NonNullable<TargetConfiguration['inputs']>> {
+  const inputRoot = posix.join('{workspaceRoot}', workspace.projectRoot);
+  const sources = await Promise.all(
+    memberDirs.map((memberDir) =>
+      cargoPackageTestInputs({
+        workspaceRoot,
+        absoluteProjectRoot: join(workspaceRoot, workspace.projectRoot),
+        memberDir,
+        cache: workspace.inputsCache,
+      }),
+    ),
+  );
+  return [
+    ...new Set([
+      ...sources.flat(),
+      ...workspace.packages.map((member) => posix.join(inputRoot, member.package.dir, 'Cargo.toml')),
+      posix.join(inputRoot, NEXTEST_REPO_CONFIG_PATH),
+    ]),
+    runtimeInput(
+      `bun -e 'console.log(new Bun.CryptoHasher("sha256").update(require("node:fs").readFileSync(process.argv[1])).digest("hex"))' ${shellWord(PLUGIN_NEXTEST_CONFIG)}`,
+    ),
+  ];
+}
+
+/**
+ * One `nextest` invocation over a filterset against the workspace's archive. Every runner of the
+ * workspace builds its command here, so the extraction, reuse-build, tool config and cwd cannot
+ * drift between the per-crate pieces and the serial group's count and run stages.
+ */
+function nextestRunnerCommand(
+  workspace: CargoWorkspace,
+  verb: 'run' | 'list',
+  selector: string,
+  flags: string,
+): string {
   const toolConfig = nextestToolConfigArg(workspace.projectRoot);
   // Relative to the runner's cwd, so the hashed command is the same in every checkout.
   const extractBin = posix.join(posix.relative(workspace.projectRoot, '.'), NEXTEST_EXTRACT_BIN);
@@ -2523,61 +2646,57 @@ async function addCargoTestTargets(
     `--binaries-metadata "$extracted/${EXTRACTED_BINARIES_METADATA}" ` +
     `--cargo-metadata "$extracted/${EXTRACTED_CARGO_METADATA}" ` +
     `--target-dir-remap "$extracted/${EXTRACTED_TARGET_DIR}"`;
-  for (const plan of workspace.packages) {
-    if (plan.package.projectRoot !== projectRoot) {
-      continue;
-    }
-    // Workspace-anchored for the reason `cargoPackageTestInputs` gives: a
-    // `{projectRoot}` glob hashes only files this project owns, and sibling
-    // manifests belong to whichever nested project holds them.
-    const inputRoot = posix.join('{workspaceRoot}', workspace.projectRoot);
-    // A workspace nextest build unifies features across every selected member.
-    // A sibling manifest can therefore change this crate's tests without being
-    // a path dependency. Track those manifests, not unrelated sibling sources.
-    //
-    // The repository's own nextest config layers OVER the plugin's tool config,
-    // so it decides timeouts, groups and archive contents: a cached verdict that
-    // ignored it would survive the change that invalidates it.
-    const inputs: NonNullable<TargetConfiguration['inputs']> = [
-      ...new Set([
-        ...(await cargoPackageTestInputs({
-          workspaceRoot,
-          absoluteProjectRoot: join(workspaceRoot, workspace.projectRoot),
-          memberDir: plan.package.dir,
-          cache: workspace.inputsCache,
-        })),
-        ...workspace.packages.map((member) => posix.join(inputRoot, member.package.dir, 'Cargo.toml')),
-        posix.join(inputRoot, NEXTEST_REPO_CONFIG_PATH),
-      ]),
-      runtimeInput(
-        `bun -e 'console.log(new Bun.CryptoHasher("sha256").update(require("node:fs").readFileSync(process.argv[1])).digest("hex"))' ${shellWord(PLUGIN_NEXTEST_CONFIG)}`,
-      ),
-    ];
-    const archive = cargoTargetDependency(currentProjectName, {
-      projectName: workspace.rootProjectName,
-      targetName: CARGO_TEST_ARCHIVE_TARGET,
-    });
-    for (const piece of plan.pieces) {
-      targetNames.push(piece.targetName);
-      targets[piece.targetName] = {
-        executor: '@smoothbricks/nx-plugin:bounded-exec',
-        cache: true,
-        inputs,
-        dependsOn: [archive],
-        options: {
-          command:
-            `extracted="$(node ${extractBin} ${CARGO_TEST_ARCHIVE_FILE})" && ` +
-            cargoFrozen(
-              `nextest run ${reuseExtraction} --workspace-remap . -E '${piece.selector}'${piece.extra} --no-tests=pass --user-config-file none ${toolConfig}`,
-            ),
-          cwd: workspace.projectRoot,
-          timeoutMs: BOUNDED_TEST_TIMEOUT_MS,
-          killAfterMs: BOUNDED_TEST_KILL_AFTER_MS,
-        },
-      };
-    }
-  }
-  return targetNames;
+  return (
+    `extracted="$(node ${extractBin} ${CARGO_TEST_ARCHIVE_FILE})" && ` +
+    cargoFrozen(
+      `nextest ${verb} ${reuseExtraction} --workspace-remap . -E ${shellWord(selector)}${flags} --user-config-file none ${toolConfig}`,
+    )
+  );
+}
+
+/** One per-crate piece: a bounded run of its partition of the archive's tests. */
+function cargoTestRunnerTarget(
+  workspace: CargoWorkspace,
+  archive: CargoTargetDependency,
+  inputs: NonNullable<TargetConfiguration['inputs']>,
+  piece: CargoTestPiece,
+): TargetConfiguration {
+  return {
+    executor: '@smoothbricks/nx-plugin:bounded-exec',
+    cache: true,
+    inputs,
+    dependsOn: [archive],
+    options: {
+      command: nextestRunnerCommand(workspace, 'run', piece.selector, `${piece.extra} --no-tests=pass`),
+      cwd: workspace.projectRoot,
+      timeoutMs: BOUNDED_TEST_TIMEOUT_MS,
+      killAfterMs: BOUNDED_TEST_KILL_AFTER_MS,
+    },
+  };
+}
+
+/**
+ * A serial group's runner. Its count stage lists the group's selection and sizes the bound from
+ * it; its run stage is the same nextest run every piece uses, with no partition and no thread flag:
+ * the group is serial because its test-group declares `max-threads = 1`.
+ */
+function cargoTestGroupTarget(
+  workspace: CargoWorkspace,
+  inputs: NonNullable<TargetConfiguration['inputs']>,
+  group: SerialTestGroup,
+): TargetConfiguration {
+  return {
+    executor: NEXTEST_GROUP_EXECUTOR,
+    cache: true,
+    inputs,
+    dependsOn: [CARGO_TEST_ARCHIVE_TARGET],
+    options: {
+      command: nextestRunnerCommand(workspace, 'run', group.filter, ' --no-tests=pass'),
+      listCommand: nextestRunnerCommand(workspace, 'list', group.filter, ' --message-format=json'),
+      cwd: workspace.projectRoot,
+      killAfterMs: BOUNDED_TEST_KILL_AFTER_MS,
+    },
+  };
 }
 
 function hasCargoTargetDependency(

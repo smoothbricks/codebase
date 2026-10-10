@@ -6,6 +6,7 @@ import {
   CARGO_TEST_COMPILE_TARGET,
   CARGO_TEST_TARGET,
   listCargoWorkspacePackages,
+  NEXTEST_GROUP_EXECUTOR,
   packageNameFromCargoTestTarget,
 } from './cargo-workspace.js';
 import { writeJsonFile } from './managed-files/managed-format.js';
@@ -411,6 +412,9 @@ function isPositiveSafeInteger(value: unknown): value is number {
 }
 
 function isBoundedExecutionTarget(executor: unknown, rawOptions: unknown, allowedCwds: ReadonlySet<string>): boolean {
+  if (executor === NEXTEST_GROUP_EXECUTOR) {
+    return isBoundedNextestGroupTarget(rawOptions);
+  }
   if (executor !== BOUNDED_TEST_EXECUTOR || !isRecord(rawOptions)) {
     return false;
   }
@@ -427,6 +431,22 @@ function isBoundedExecutionTarget(executor: unknown, rawOptions: unknown, allowe
     // per-crate nextest legs run from the workspace root, which no member project owns, and a gate may run a script
     // that lives in another project; both are bounded by their timeouts alone.
     (!BUN_TEST_PREFIX.test(command) || allowedCwds.has(rawOptions.cwd)) &&
+    isPositiveSafeInteger(rawOptions.killAfterMs)
+  );
+}
+
+/**
+ * A serial group's runner names no timeout: `nextest-group` sizes its bound from the tests its list
+ * selects, and its schema refuses any other option. What the policy checks is what that executor
+ * requires: both commands and a kill grace.
+ */
+function isBoundedNextestGroupTarget(rawOptions: unknown): boolean {
+  return (
+    isRecord(rawOptions) &&
+    typeof rawOptions.command === 'string' &&
+    rawOptions.command.length > 0 &&
+    typeof rawOptions.listCommand === 'string' &&
+    rawOptions.listCommand.length > 0 &&
     isPositiveSafeInteger(rawOptions.killAfterMs)
   );
 }

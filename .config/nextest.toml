@@ -1,0 +1,19 @@
+# The one declaration of the real-APFS serial group. The nx plugin derives its
+# runner `cargo-test-group-real-apfs` and every per-crate exclusion from these
+# two tables, so the filter is stated here and nowhere else.
+#
+# `max-threads = 1` serializes the group within its one runner process; ordinary
+# per-crate runners exclude these tests with `not (…)` so each runs in exactly one
+# target. The platform is the one the plugin honours: the group applies on macOS
+# hosts, where the host disk lease exists, and the planner infers no runner elsewhere.
+#
+# The exact-name clause is nextest's fully qualified name (module path included),
+# because `test(=…)` matches the whole name. Two inventory rows are deliberately
+# `#[ignore]`d host-controller and contention lanes and stay out of this group.
+[test-groups.real-apfs]
+max-threads = 1
+
+[[profile.default.overrides]]
+filter = 'test(/real_apfs_/) or binary(apfs_native_macos) or binary(clone_intent_recovery) or test(=storage::apfs::native::build_volumes::tests::a_jobs_volumes_count_from_admission_through_its_command_to_its_sealed_record)'
+platform = 'cfg(target_os="macos")'
+test-group = 'real-apfs'

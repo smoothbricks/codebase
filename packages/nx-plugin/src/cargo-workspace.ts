@@ -727,13 +727,32 @@ export function listCargoCrossTestTargets(absoluteProjectRoot: string): CargoCro
  */
 export const CARGO_TEST_EXCEPTIONS_SUFFIX = 'exceptions';
 
+/** Name prefix of the runner a serial test group gets; see `serialTestGroups`. */
+export const CARGO_TEST_GROUP_PREFIX = 'cargo-test-group-';
+
+/** The executor a serial group's runner uses: its bound is sized from the tests it selects. */
+export const NEXTEST_GROUP_EXECUTOR = '@smoothbricks/nx-plugin:nextest-group';
+
 /**
  * A crate on one target keeps the bare name; a split crate suffixes the piece,
  * so `cargo-test-example-core-shard2` still reads as "example-core's tests".
  */
 export function cargoTestPackageTargetName(packageName: string, piece?: string): string {
   const base = `cargo-test-${packageName}`;
-  return piece === undefined ? base : `${base}-${piece}`;
+  const name = piece === undefined ? base : `${base}-${piece}`;
+  // A crate named `group-*` would take the name of a serial group's runner.
+  if (name.startsWith(CARGO_TEST_GROUP_PREFIX)) {
+    throw new Error(`cargo crate ${packageName} would be named ${name}, reserved for a nextest test group runner`);
+  }
+  return name;
+}
+
+/**
+ * A serial group's runner. It selects by filter across the whole workspace, so
+ * it is no crate: `packageNameFromCargoTestTarget` reads it as none.
+ */
+export function cargoTestGroupTargetName(group: string): string {
+  return `${CARGO_TEST_GROUP_PREFIX}${group}`;
 }
 
 /**
@@ -741,15 +760,17 @@ export function cargoTestPackageTargetName(packageName: string, piece?: string):
  * check that the per-crate targets cover every workspace member. Pieces of one
  * crate collapse back to that crate, so a split crate counts as covered once.
  *
- * The two workspace-wide `cargo-test-*` targets are not crates: reading them as
- * one would invent members named "compile" and "archive" and report every real
- * crate's coverage against a set that can never match.
+ * The workspace-wide `cargo-test-*` targets are not crates: reading them as one
+ * would invent members named "compile" and "archive", and a serial group's runner
+ * would invent one named after its group. Each reports every crate's coverage
+ * against a set that can never match.
  */
 export function packageNameFromCargoTestTarget(targetName: string): string | null {
   if (
     !targetName.startsWith('cargo-test-') ||
     targetName === CARGO_TEST_COMPILE_TARGET ||
-    targetName === CARGO_TEST_ARCHIVE_TARGET
+    targetName === CARGO_TEST_ARCHIVE_TARGET ||
+    targetName.startsWith(CARGO_TEST_GROUP_PREFIX)
   ) {
     return null;
   }
@@ -791,8 +812,87 @@ export function exceptionalTestFilter(nextestConfigPath: string): string | null 
       }
     }
   }
+  return filterUnion(filters);
+}
+
+/** The filters as one filterset that any of them matches, or null for none. */
+function filterUnion(filters: readonly string[]): string | null {
   const unique = [...new Set(filters)];
   return unique.length === 0 ? null : unique.map((filter) => `(${filter})`).join(' or ');
+}
+
+/**
+ * The only `platform` a serial group's overrides may declare: nextest's cfg for macOS. The group
+ * runs on macOS hosts only, a host decision made by the planner, never a cfg parse here.
+ */
+export const SERIAL_TEST_GROUP_PLATFORM = 'cfg(target_os="macos")';
+
+/**
+ * One nextest test group capped at a single thread, and the tests its overrides
+ * assign it.
+ */
+export interface SerialTestGroup {
+  /** The group's name, as `[test-groups]` declares it. */
+  group: string;
+  /** Every default-profile override filter that names the group, as one filterset. */
+  filter: string;
+}
+
+/**
+ * The repository's test groups capped at one thread (`max-threads = 1`), each
+ * with the tests its default-profile overrides assign it.
+ *
+ * A serial group is declared exactly once, in `.config/nextest.toml`: the name
+ * under `[test-groups]` plus the overrides that name it. Its runner's filter is
+ * derived from those overrides rather than restated, so the runner and the
+ * per-crate exclusions cannot drift from what nextest actually serializes.
+ *
+ * Every override naming a serial group must declare `SERIAL_TEST_GROUP_PLATFORM`.
+ * This plugin has no cfg evaluator, so it honours exactly that platform and
+ * refuses any other rather than guessing where the group applies.
+ *
+ * Returns [] when the file is absent or declares no serial group, so a workspace
+ * without one keeps exactly its existing targets.
+ */
+export function serialTestGroups(nextestConfigPath: string): SerialTestGroup[] {
+  if (!existsSync(nextestConfigPath)) {
+    return [];
+  }
+  const parsed: unknown = parseToml(readFileSync(nextestConfigPath, 'utf-8'));
+  if (!isRecord(parsed)) {
+    return [];
+  }
+  const declaredValue = parsed['test-groups'];
+  const declaredGroups: Record<string, unknown> = isRecord(declaredValue) ? declaredValue : {};
+  const serial = Object.keys(declaredGroups)
+    .filter((name) => {
+      const declared = declaredGroups[name];
+      return isRecord(declared) && declared['max-threads'] === 1;
+    })
+    .sort((left, right) => left.localeCompare(right));
+  const profiles: Record<string, unknown> = isRecord(parsed.profile) ? parsed.profile : {};
+  const defaults: Record<string, unknown> = isRecord(profiles.default) ? profiles.default : {};
+  const overridesValue: unknown = defaults.overrides;
+  const overrides: unknown[] = Array.isArray(overridesValue) ? overridesValue : [];
+  return serial.flatMap((group) => {
+    const filters: string[] = [];
+    for (const override of overrides) {
+      if (!isRecord(override) || override['test-group'] !== group) {
+        continue;
+      }
+      if (override.platform !== SERIAL_TEST_GROUP_PLATFORM) {
+        throw new Error(
+          `${nextestConfigPath}: test-group "${group}" overrides must declare platform = '${SERIAL_TEST_GROUP_PLATFORM}' ` +
+            `(the only platform a serial group runs on here), got ${JSON.stringify(override.platform ?? null)}`,
+        );
+      }
+      if (typeof override.filter === 'string' && override.filter.length > 0) {
+        filters.push(override.filter);
+      }
+    }
+    const filter = filterUnion(filters);
+    return filter === null ? [] : [{ group, filter }];
+  });
 }
 
 /** The plugin's nextest.toml as the workspace root's `node_modules` links it. */

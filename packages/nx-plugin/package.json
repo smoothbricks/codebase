@@ -217,7 +217,8 @@
           "test-shard1",
           "test-shard2",
           "test-shard3",
-          "test-shard4"
+          "test-shard4",
+          "test-host"
         ]
       },
       "test-shard1": {
@@ -235,7 +236,7 @@
           }
         ],
         "options": {
-          "command": "bun test --timeout=30000 --timings=test-timings.json --shard=1/4",
+          "command": "bun test --timeout=30000 --timings=test-timings.json --shard=1/4 --path-ignore-patterns='**/ram-temp-host.test.ts'",
           "cwd": "{projectRoot}",
           "timeoutMs": 120000,
           "killAfterMs": 10000
@@ -256,7 +257,7 @@
           }
         ],
         "options": {
-          "command": "bun test --timeout=30000 --timings=test-timings.json --shard=2/4",
+          "command": "bun test --timeout=30000 --timings=test-timings.json --shard=2/4 --path-ignore-patterns='**/ram-temp-host.test.ts'",
           "cwd": "{projectRoot}",
           "timeoutMs": 120000,
           "killAfterMs": 10000
@@ -277,7 +278,7 @@
           }
         ],
         "options": {
-          "command": "bun test --timeout=30000 --timings=test-timings.json --shard=3/4",
+          "command": "bun test --timeout=30000 --timings=test-timings.json --shard=3/4 --path-ignore-patterns='**/ram-temp-host.test.ts'",
           "cwd": "{projectRoot}",
           "timeoutMs": 120000,
           "killAfterMs": 10000
@@ -298,7 +299,34 @@
           }
         ],
         "options": {
-          "command": "bun test --timeout=30000 --timings=test-timings.json --shard=4/4",
+          "command": "bun test --timeout=30000 --timings=test-timings.json --shard=4/4 --path-ignore-patterns='**/ram-temp-host.test.ts'",
+          "cwd": "{projectRoot}",
+          "timeoutMs": 120000,
+          "killAfterMs": 10000
+        }
+      },
+      "test-host": {
+        "executor": "@smoothbricks/nx-plugin:bounded-exec",
+        "dependsOn": [
+          "...",
+          "@smoothbricks/codebase:patched-nx",
+          "@smoothbricks/codebase:patched-nx-bindings",
+          {
+            "projects": [
+              "@smoothbricks/codebase"
+            ],
+            "target": "cargo-test-group-real-apfs"
+          }
+        ],
+        "inputs": [
+          "...",
+          {
+            "dependentTasksOutputFiles": "**/*",
+            "transitive": false
+          }
+        ],
+        "options": {
+          "command": "bun test --timeout=30000 src/executors/bounded-exec/ram-temp-host.test.ts",
           "cwd": "{projectRoot}",
           "timeoutMs": 120000,
           "killAfterMs": 10000

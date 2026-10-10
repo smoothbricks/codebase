@@ -5,12 +5,13 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { TargetConfiguration } from 'nx/src/devkit-exports.js';
 import { useFixtureCargoHome } from './__tests__/fixture-cargo-home.js';
-import { createNodesV2 } from './index.js';
+import { selectedRunnableTestCount } from './executors/nextest-group/executor.js';
+import { createNodesV2ForPlatform } from './index.js';
 import { NEXTEST_EXTRACTION_DIRECTORY, nextestArchiveKey } from './nextest-extraction.js';
 
 useFixtureCargoHome();
 
-it('executes every archived test once across ordinary and exceptional partitions', async () => {
+it('executes every archived test once across ordinary, exceptional and serial-group runners', async () => {
   const root = await realpath(await mkdtemp(join(tmpdir(), 'smoo-nextest-partitions-')));
   fixtureRoot = root;
   const ordinary = Array.from({ length: 13 }, (_, index) => `ordinary_${index}`);
@@ -22,12 +23,27 @@ it('executes every archived test once across ordinary and exceptional partitions
     ...Array.from({ length: 6 }, (_, index) => `partition_${index}_fail_to_compile`),
     'real_apfs_partition_substrate_lifecycle',
   ];
-  const expected = [...ordinary, ...exceptional];
+  const serial = Array.from({ length: 4 }, (_, index) => `serial_probe_${index}`);
+  const expected = [...ordinary, ...exceptional, ...serial];
   await writeFile(join(root, 'package.json'), '{"name":"partition-fixture","private":true}\n');
   await writeFile(join(root, '.gitignore'), 'node_modules/\ntarget/\n.nx/\n*.log\n');
   await writeFile(
     join(root, 'Cargo.toml'),
     '[workspace]\nresolver = "2"\n\n[package]\nname = "partition-probe"\nversion = "0.1.0"\nedition = "2021"\n\n[package.metadata.smoothbricks.test]\nshards = 3\n',
+  );
+  await mkdir(join(root, '.config'));
+  await writeFile(
+    join(root, '.config/nextest.toml'),
+    [
+      '[test-groups.serial-probe]',
+      'max-threads = 1',
+      '',
+      '[[profile.default.overrides]]',
+      "filter = 'test(/serial_probe_/)'",
+      `platform = 'cfg(target_os="macos")'`,
+      "test-group = 'serial-probe'",
+      '',
+    ].join('\n'),
   );
   await mkdir(join(root, 'src'));
   await writeFile(
@@ -46,30 +62,32 @@ ${expected.map((name) => `    #[test] fn ${name}() { record("${name}"); }`).join
   await symlink(join(import.meta.dir, '../../../node_modules'), join(root, 'node_modules'), 'dir');
   await run(root, ['git', 'init', '--quiet']);
   await run(root, ['cargo', 'generate-lockfile', '--offline']);
-  const [, infer] = createNodesV2;
+  const [, infer] = createNodesV2ForPlatform('darwin', 'arm64');
   const result = await infer(['package.json'], undefined, { workspaceRoot: root, nxJsonConfiguration: {} });
   const targets = result[0]?.[1].projects?.['.']?.targets;
   if (targets === undefined) throw new Error('Cargo fixture inferred no targets');
   // The archive is the one real prerequisite: every runner executes its binaries.
   await run(root, ['sh', '-c', command(targets, 'cargo-test-archive')]);
-  // One log per partition kind, so the proof is exact selection and not only
-  // coverage: the ordinary shards ran every ordinary test once and nothing
-  // else, and the exceptional shards did the same for theirs. The six runners
-  // are independent, so they run side by side exactly as Nx fans them out.
+  // One log per runner kind, so the proof is exact selection and not only coverage: the ordinary
+  // shards ran every ordinary test once and nothing else, the exceptional shards did the same for
+  // theirs, and the serial group ran its class once in one unpartitioned runner. The runners are
+  // independent, so they run side by side exactly as Nx fans them out.
+  const serialLog = join(root, 'serial.log');
   const partitions = [
     { kind: 'shard', log: join(root, 'ordinary.log'), tests: ordinary },
     { kind: 'exceptions-shard', log: join(root, 'exceptional.log'), tests: exceptional },
   ];
-  await Promise.all(
-    partitions.flatMap(({ kind, log }) =>
+  await Promise.all([
+    ...partitions.flatMap(({ kind, log }) =>
       [1, 2, 3].map((index) =>
         run(root, ['sh', '-c', command(targets, `cargo-test-partition-probe-${kind}${index}`)], {
           PARTITION_EXECUTIONS: log,
         }),
       ),
     ),
-  );
-  for (const { log, tests } of partitions) {
+    run(root, ['sh', '-c', command(targets, 'cargo-test-group-serial-probe')], { PARTITION_EXECUTIONS: serialLog }),
+  ]);
+  for (const { log, tests } of [...partitions, { log: serialLog, tests: serial }]) {
     const observed = (await readFile(log, 'utf8')).trim().split('\n').sort();
     expect(observed).toEqual([...tests].sort());
   }
@@ -79,6 +97,14 @@ ${expected.map((name) => `    #[test] fn ${name}() { record("${name}"); }`).join
     await nextestArchiveKey(join(root, '.cache/nextest/archive.tar.zst')),
   ]);
   expect(await readdir(join(root, '.cache/nextest'))).toEqual(['archive.tar.zst']);
+  // The serial group is one unpartitioned runner. Its count stage lists exactly the probes, and the
+  // parser its executor sizes the bound with counts the same class the run executed.
+  expect(command(targets, 'cargo-test-group-serial-probe')).not.toContain('--partition');
+  const listCommand: unknown = targets['cargo-test-group-serial-probe']?.options?.listCommand;
+  if (typeof listCommand !== 'string') throw new Error('cargo-test-group-serial-probe inferred no listCommand');
+  const listing = join(root, 'serial-listing.json');
+  await run(root, ['sh', '-c', `${listCommand} > '${listing}'`]);
+  expect(selectedRunnableTestCount(await readFile(listing, 'utf8'))).toEqual({ ok: true, count: serial.length });
 });
 
 function command(targets: Readonly<Record<string, TargetConfiguration>>, name: string): string {

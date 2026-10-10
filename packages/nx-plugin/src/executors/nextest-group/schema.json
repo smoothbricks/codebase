@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/schema",
+  "version": 2,
+  "title": "Nextest Group Executor",
+  "description": "Run one serial nextest test group under a bound sized from the tests its filter selects.",
+  "type": "object",
+  "cli": "nx",
+  "outputCapture": "pipe",
+  "required": ["command", "listCommand"],
+  "properties": {
+    "command": {
+      "type": "string",
+      "description": "The group's nextest run. Runs unchanged once the count stage has sized its bound."
+    },
+    "listCommand": {
+      "type": "string",
+      "description": "The same selection listed as JSON (nextest list --message-format=json). Its selected, non-ignored tests size the bound."
+    },
+    "cwd": {
+      "type": "string",
+      "description": "Working directory. Relative paths are resolved from the workspace root."
+    },
+    "killAfterMs": {
+      "type": "number",
+      "minimum": 0,
+      "default": 10000,
+      "description": "Most milliseconds a timed-out command gets after graceful termination before its process group is force-killed."
+    }
+  },
+  "additionalProperties": false
+}

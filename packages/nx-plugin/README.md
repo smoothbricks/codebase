@@ -466,8 +466,22 @@ Concrete targets come from concrete files:
   scheduling. The exceptional filter is derived from the overrides in `nextest.toml`, so adding an override is the whole
   classification change. Only sharded crates need these targets; an unsharded crate already runs its whole suite in one
   process. Empty partitions pass, including platforms where the tests are `cfg`-ed out. `nextest-partitions.test.ts`
-  executes the inferred archive and shard commands over 26 tests and asserts that the ordinary shards ran exactly the 13
-  ordinary tests once and the exceptional shards exactly the 13 exceptional ones.
+  executes the inferred archive and shard commands over 30 tests and asserts that the ordinary shards ran exactly the 13
+  ordinary tests once, the exceptional shards exactly the 13 exceptional ones, and the serial group exactly its 4
+  probes.
+- A repository's serial test groups each run in one runner, `cargo-test-group-<group>`, owned by the cargo workspace
+  root beside `cargo-test-archive`. A group is declared once, in `<cargo-workspace>/.config/nextest.toml`: a
+  `[test-groups.<group>]` table with `max-threads = 1`, and default-profile overrides that name it with `test-group` and
+  `platform = 'cfg(target_os="macos")'`. The runner's filter is the union of those overrides, so the runner and the
+  per-crate exclusions cannot drift; every crate piece excludes it with `not (…)`, so each test is selected by exactly
+  one target. The runner is not inferred off macOS, where nextest applies the group nowhere and no piece excludes its
+  tests. Its executor, `@smoothbricks/nx-plugin:nextest-group`, lists the selection
+  (`nextest list --message-format=json`, same archive and reuse flags) under the existing bounded runner, counts the
+  matching non-ignored tests, and runs the group under a bound of that count × 30 s. A listing that fails, does not
+  parse, or selects no test fails the group rather than running it unbounded. A test whose own `slow-timeout` exceeds 30
+  s (the real-APFS lifecycle override is 60 s) is not covered by that per-test share. Ignored tests keep their explicit
+  lane. The root's `cargo-test` and every member's `cargo-test` depend on the group. A crate named `group-*` is refused,
+  since its runner name would collide.
 - Canonical `napi` package metadata provides a host `cargo-napi` target and named release targets for each configured
   triple. Linux `--use-napi-cross` targets compile C/C++ dependencies with Clang; the NAPI CLI supplies its downloaded
   GNU sysroot and toolchain flags. This avoids the bundled GCC's unsupported diagnostics-color flag without disabling

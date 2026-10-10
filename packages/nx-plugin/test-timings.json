@@ -6,6 +6,7 @@
     "src/ensure-built.test.ts": 25998,
     "src/cargo-resolve-cache.test.ts": 25726,
     "src/cargo-closure-input.test.ts": 19270,
+    "src/executors/bounded-exec/ram-temp.test.ts": 10727,
     "src/typecheck-test-policy.test.ts": 7183,
     "src/executors/bounded-exec/executor.test.ts": 5980,
     "src/nextest-partitions.test.ts": 3481,

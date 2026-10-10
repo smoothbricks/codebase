@@ -38,6 +38,8 @@ export interface BoundedExecContext {
   root: string;
   /** The Nx task this run executes as, and the directory its verdict and report go to. */
   record?: { task: BoundedExecTask; directory: string };
+  /** Owns child stdout when present; otherwise it is retained and forwarded normally. */
+  stdout?: (chunk: string) => void;
 }
 
 /** The part of Nx's executor context that names the running task. */
@@ -84,12 +86,20 @@ export default function boundedExecExecutor(
   options: BoundedExecOptions,
   context: NxTaskContext,
 ): Promise<BoundedExecResult> {
+  return runDefaultBoundedExec(options, recordContext(context));
+}
+
+/** Runs with the normal process, RAM lease and CPU-budget owners, with an optional stdout sink. */
+export function runDefaultBoundedExec(
+  options: BoundedExecOptions,
+  context: BoundedExecContext,
+): Promise<BoundedExecResult> {
   // Only macOS has `hdiutil ram://`; elsewhere the command keeps the inherited TMPDIR.
   const tempVolume =
     process.platform === 'darwin'
       ? new RamTempVolume(ramTempPaths(userInfo()), RAM_TEMP_CAPACITY_BYTES, createHostCommands())
       : null;
-  return runBoundedExec(options, recordContext(context), createProcessTreeKiller(), tempVolume, gatewayCpuBudget());
+  return runBoundedExec(options, context, createProcessTreeKiller(), tempVolume, gatewayCpuBudget());
 }
 
 /**
@@ -141,8 +151,12 @@ export async function runBoundedExec(
   const state: RunState = { settled: false, expiry: null, forceKillNeeded: false };
   const appendStdout = (chunk: Buffer | string): void => {
     const text = chunk.toString();
-    outputChunks.push(text);
-    process.stdout.write(text);
+    if (context.stdout !== undefined) {
+      context.stdout(text);
+    } else {
+      outputChunks.push(text);
+      process.stdout.write(text);
+    }
   };
   const appendStderr = (chunk: Buffer | string): void => {
     const text = chunk.toString();

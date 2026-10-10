@@ -7,7 +7,12 @@ import { Glob } from 'bun';
 import {
   attributeCargoWorkspacePackages,
   cargoPackageTestInputs,
+  cargoTestGroupTargetName,
+  cargoTestPackageTargetName,
   listCargoWorkspacePackages,
+  packageNameFromCargoTestTarget,
+  SERIAL_TEST_GROUP_PLATFORM,
+  serialTestGroups,
 } from './cargo-workspace.js';
 
 describe('Cargo workspace layouts', () => {
@@ -293,3 +298,79 @@ async function write(root: string, path: string, contents: string): Promise<void
   await mkdir(dirname(absolutePath), { recursive: true });
   await writeFile(absolutePath, contents);
 }
+
+describe('nextest serial test groups', () => {
+  it('derives one serial filter from the default-profile overrides that name a group capped at one thread', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'nx-serial-groups-'));
+    try {
+      const config = join(root, 'nextest.toml');
+      await write(
+        root,
+        'nextest.toml',
+        [
+          '[test-groups.real-apfs]',
+          'max-threads = 1',
+          '',
+          '[test-groups.wide]',
+          'max-threads = 4',
+          '',
+          '[[profile.default.overrides]]',
+          "filter = 'test(/real_apfs_/)'",
+          `platform = '${SERIAL_TEST_GROUP_PLATFORM}'`,
+          "test-group = 'real-apfs'",
+          '',
+          '[[profile.default.overrides]]',
+          "filter = 'binary(apfs_native_macos)'",
+          `platform = '${SERIAL_TEST_GROUP_PLATFORM}'`,
+          "test-group = 'real-apfs'",
+          '',
+          '[[profile.default.overrides]]',
+          "filter = 'test(/wide_/)'",
+          "test-group = 'wide'",
+          '',
+          '[[profile.ci.overrides]]',
+          "filter = 'test(/ci_only/)'",
+          `platform = '${SERIAL_TEST_GROUP_PLATFORM}'`,
+          "test-group = 'real-apfs'",
+          '',
+        ].join('\n'),
+      );
+      expect(serialTestGroups(config)).toEqual([
+        { group: 'real-apfs', filter: '(test(/real_apfs_/)) or (binary(apfs_native_macos))' },
+      ]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('declares no serial group when the config is absent or names no group capped at one thread', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'nx-serial-none-'));
+    try {
+      expect(serialTestGroups(join(root, 'missing.toml'))).toEqual([]);
+      await write(root, 'nextest.toml', '[test-groups.wide]\nmax-threads = 4\n');
+      expect(serialTestGroups(join(root, 'nextest.toml'))).toEqual([]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('refuses a serial override that declares no macOS platform rather than guessing where the group applies', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'nx-serial-platform-'));
+    try {
+      await write(
+        root,
+        'nextest.toml',
+        "[test-groups.real-apfs]\nmax-threads = 1\n\n[[profile.default.overrides]]\nfilter = 'test(/real_apfs_/)'\ntest-group = 'real-apfs'\n",
+      );
+      expect(() => serialTestGroups(join(root, 'nextest.toml'))).toThrow(/must declare platform/);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('never reads a serial group runner as a crate, and refuses a crate that would take its name', () => {
+    expect(packageNameFromCargoTestTarget(cargoTestGroupTargetName('real-apfs'))).toBeNull();
+    expect(packageNameFromCargoTestTarget(cargoTestPackageTargetName('big', 'shard1'))).toBe('big');
+    expect(() => cargoTestPackageTargetName('group-real-apfs')).toThrow(/reserved/);
+  });
+});
