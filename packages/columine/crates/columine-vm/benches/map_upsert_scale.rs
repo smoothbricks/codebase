@@ -4,9 +4,10 @@
 //! Every row names a live key, so the batch is all updates: the cells time
 //! the batch entry checks, capacity admission and the row loop, never growth.
 //! The same image is restored before every timed batch. A cell whose batch is
-//! refused prints its status instead: with the journal on, 10000 rows change
-//! 40000 value cells, past the journal's 16384-record budget, so that batch
-//! is refused with `JournalOverflow` before it writes.
+//! refused prints its status instead. With the journal on, 10000 rows change
+//! 40000 value cells, past the journal's 16384-record budget: that batch is
+//! not refused. Its window overflows into a shadow, one copy of the image
+//! taken inside the timed batch, and every later write runs unrecorded.
 //!
 //! Run: `cargo bench -p columine-vm --bench map_upsert_scale`.
 

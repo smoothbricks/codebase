@@ -10,6 +10,7 @@ import {
   PROGRAM_MAGIC,
   SlotType,
   SlotTypeFlag,
+  UNDO_POSITION_OVERFLOWED,
   ValueType,
 } from '../types.js';
 import { loadColumineWasm, VmProgramAdmissionError } from '../wasm-backend.js';
@@ -30,6 +31,7 @@ const TRIGGER_CAPACITY = 1024;
 const ENTRY_SIZE = 16;
 const UPDATED = 0x02;
 const JOURNAL_CAPACITY = 16384;
+
 const ALGEBRA = [Opcode.BATCH_BITMAP_OR, Opcode.BATCH_BITMAP_AND, Opcode.BATCH_BITMAP_ANDNOT, Opcode.BATCH_BITMAP_XOR];
 
 type Member = { readonly key: number; readonly expiry: bigint | undefined };
@@ -406,7 +408,7 @@ describe('real WASM bitmap TTL algebra', () => {
       backend.undoCommit(state, checkpoint);
     });
 
-    it(`keeps the exact accepted prefix when TTL-algebra capture exhausts the journal, paired ${delta}`, async () => {
+    it(`shadows a TTL-algebra capture that overflows the journal, rolls back exactly, paired ${delta}`, async () => {
       const backend = await loadColumineWasm(WASM_PATH);
       const init = initCode();
       const a = Array.from({ length: 12 }, (_, index) => ({ key: index + 1, expiry: bits(index + 1) }));
@@ -428,14 +430,23 @@ describe('real WASM bitmap TTL algebra', () => {
       }
       const prefix = backend.serialize(state, reducer);
       const segment = delta ? exportSegment(backend, state, from, checkpoint) : undefined;
-      expect(run(state, algebra, [], 1)).toBe(ErrorCode.JOURNAL_OVERFLOW);
+      expect(run(state, algebra, [], 1)).toBe(ErrorCode.OK);
       expect(backend.undoHasOverflow()).toBe(true);
-      expect(backend.undoCheckpoint(state)).toBe(checkpoint);
+      expect(backend.undoCheckpoint(state)).toBe(UNDO_POSITION_OVERFLOWED);
+      // The overflow lands the algebra's writes in the shadow.
+      assertModel(backend, state, reducer, model(Opcode.BATCH_BITMAP_OR, a, b));
+      // A pre-overflow savepoint restores the exact prefix image and ends the overflow.
+      backend.undoRollback(state, checkpoint);
       expect(backend.serialize(state, reducer)).toEqual(prefix);
+      expect(backend.undoHasOverflow()).toBe(false);
+      expect(backend.undoCheckpoint(state)).toBe(checkpoint);
       backend.undoRollback(state, from);
       expect(backend.serialize(state, reducer)).toEqual(before);
-      expect(backend.undoHasOverflow()).toBe(true);
-      expect(run(state, algebra, [], 1)).toBe(ErrorCode.JOURNAL_OVERFLOW);
+      // The rollback emptied the journal, so the same capture fits and journals again.
+      expect(run(state, algebra, [], 1)).toBe(ErrorCode.OK);
+      expect(backend.undoHasOverflow()).toBe(false);
+      expect(backend.undoCheckpoint(state)).toBeGreaterThan(from);
+      backend.undoRollback(state, from);
       expect(backend.serialize(state, reducer)).toEqual(before);
       backend.undoCommit(state, from);
       expect(backend.undoHasOverflow()).toBe(false);

@@ -23,7 +23,7 @@ use columine_vm::bytes;
 use columine_vm::hashmap_ops::{CmpType, Strategy, bind_slot_map};
 use columine_vm::meta::SlotMetaView;
 use columine_vm::state_init::{DEFAULT_ACCEPTED_PROGRAM_MAGICS, calculate_state_size, init_state};
-use columine_vm::vm::{RedoLaneStatus, UNDO_CAPACITY, UndoStatus, Vm};
+use columine_vm::vm::{RedoLaneStatus, UNDO_CAPACITY, UNDO_POSITION_OVERFLOWED, UndoStatus, Vm};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
@@ -240,6 +240,7 @@ fn pure_window_writes_undo_only_and_never_admits_the_redo_lane() {
         UndoStatus {
             enabled: false,
             overflow: false,
+            refused: false,
             checkpoint: 0,
             delta_count: 0
         },
@@ -259,6 +260,7 @@ fn pure_window_writes_undo_only_and_never_admits_the_redo_lane() {
         UndoStatus {
             enabled: true,
             overflow: false,
+            refused: false,
             checkpoint: 0,
             delta_count: 0
         },
@@ -273,6 +275,7 @@ fn pure_window_writes_undo_only_and_never_admits_the_redo_lane() {
         UndoStatus {
             enabled: true,
             overflow: false,
+            refused: false,
             checkpoint: end,
             delta_count: 0
         },
@@ -412,6 +415,7 @@ fn paired_window_admits_the_redo_lane_and_exports_a_replayable_range() {
         UndoStatus {
             enabled: true,
             overflow: false,
+            refused: false,
             checkpoint: end,
             delta_count: end
         },
@@ -505,6 +509,7 @@ fn mixed_window_refuses_a_range_with_an_undo_only_record_and_keeps_the_last_sele
         UndoStatus {
             enabled: true,
             overflow: false,
+            refused: false,
             checkpoint: mixed_end,
             delta_count: paired_end
         },
@@ -571,6 +576,7 @@ fn paired_suffix_after_an_undo_only_prefix_exports_only_its_own_range() {
         UndoStatus {
             enabled: true,
             overflow: false,
+            refused: false,
             checkpoint: end,
             delta_count: end
         },
@@ -635,6 +641,7 @@ fn ended_paired_window_retains_lane_storage_but_a_reopened_pure_window_stays_ina
         UndoStatus {
             enabled: false,
             overflow: false,
+            refused: false,
             checkpoint: 0,
             delta_count: 0
         },
@@ -746,16 +753,18 @@ fn enable_on_an_active_window_is_refused_and_preserves_status_checkpoint_and_sel
     vm.undo_commit();
 }
 
-/// The journal refusal is sticky. A capture whose reservation exceeds the
-/// remaining budget returns `JournalOverflow` before its writer runs. Rolling
-/// back and freeing every entry does not reopen the window; only `undo_commit`
-/// followed by `undo_enable` does.
+/// A window past its record budget overflows instead of refusing. The first
+/// write the journal cannot record copies the image into a shadow and runs;
+/// every later write runs unrecorded. Rollback to any savepoint taken before
+/// the overflow restores the shadow, replays the records in reverse, lands
+/// byte-exact on that savepoint's image and ends the overflow, so the window
+/// records again. A savepoint taken while overflowed names no restorable image.
 ///
 /// The budget is reached by real writes: each one advances the COUNT aggregate,
 /// so each changes its cell and journals exactly one entry. No padding or
 /// oversized state is used to create journal pressure.
 #[test]
-fn journal_budget_refusal_is_sticky_until_the_window_ends_and_reopens() {
+fn a_window_past_its_budget_overflows_into_a_shadow_and_rolls_back_exactly() {
     let prog = count_program();
     let mut state = init(&prog);
     let cell = count_cell(&state);
@@ -763,89 +772,75 @@ fn journal_budget_refusal_is_sticky_until_the_window_ends_and_reopens() {
     let mut vm = Vm::default();
     vm.undo_enable(&state).expect("undo window opens");
 
+    let midpoint = UNDO_CAPACITY / 2;
+    let mut midpoint_image = Vec::new();
     for value in 1..=u64::from(UNDO_CAPACITY) {
         set_count(&mut vm, &mut state, cell, value).expect("write within the budget");
+        if value == u64::from(midpoint) {
+            midpoint_image = state.clone();
+        }
     }
-    assert_eq!(
-        UndoStatus {
-            enabled: true,
-            overflow: false,
-            checkpoint: UNDO_CAPACITY,
-            delta_count: 0
-        },
-        vm.undo_status()
-    );
-    assert_eq!(u64::from(UNDO_CAPACITY), count_value(&state, cell));
-    let full = state.clone();
+    assert_eq!(open(true, false, UNDO_CAPACITY, 0), vm.undo_status());
 
-    // The next write needs one entry the journal no longer has.
-    let mut writer_ran = false;
-    let refused = vm.capture_mutation(false, &mut state, &[(cell, 8)], |image| {
-        writer_ran = true;
-        bytes::write_u64(image, cell, u64::from(UNDO_CAPACITY) + 1)
-    });
-    assert_eq!(Err(ErrorCode::JournalOverflow), refused);
-    assert!(
-        !writer_ran,
-        "a refused reservation never reaches the writer"
-    );
-    assert_eq!(full, state, "the refused writer changed nothing");
+    // The next write needs a record the budget no longer has: it overflows and runs.
+    let past = u64::from(UNDO_CAPACITY) + 1;
+    set_count(&mut vm, &mut state, cell, past)
+        .expect("a write past the budget overflows, not refuses");
+    assert_eq!(past, count_value(&state, cell));
     assert_eq!(
         UndoStatus {
             enabled: true,
             overflow: true,
-            checkpoint: UNDO_CAPACITY,
+            refused: false,
+            checkpoint: UNDO_POSITION_OVERFLOWED,
             delta_count: 0
         },
         vm.undo_status()
     );
 
-    // Refused again for any capture, however small: the diagnostic is sticky.
+    // Later writes run unrecorded; a savepoint taken now restores nothing.
+    set_count(&mut vm, &mut state, cell, u64::MAX).expect("an overflowed window keeps writing");
+    assert_eq!(u64::MAX, count_value(&state, cell));
+    let overflowed = state.clone();
     assert_eq!(
-        Err(ErrorCode::JournalOverflow),
-        set_count(&mut vm, &mut state, cell, u64::MAX)
+        Err(ErrorCode::InvalidState),
+        vm.undo_rollback(&mut state, UNDO_POSITION_OVERFLOWED)
     );
+    assert_eq!(overflowed, state, "a refused rollback changes nothing");
 
-    // Rolling back frees every entry, yet the window stays refused.
+    // Back to a pre-overflow savepoint: exact, and the window records again.
+    assert_eq!(
+        Ok(image_len(&state)),
+        vm.undo_rollback(&mut state, midpoint)
+    );
+    assert_eq!(
+        midpoint_image, state,
+        "rollback through the shadow restores the midpoint image"
+    );
+    assert_eq!(open(true, false, midpoint, 0), vm.undo_status());
+    set_count(&mut vm, &mut state, cell, 7).expect("the window records again");
+    assert_eq!(midpoint + 1, vm.undo_checkpoint());
+
+    // Overflow again, then back to the window's start.
+    for value in 0..u64::from(UNDO_CAPACITY) {
+        set_count(&mut vm, &mut state, cell, value).expect("writes past the budget overflow");
+    }
+    assert!(vm.undo_has_overflow());
     assert_eq!(Ok(image_len(&state)), vm.undo_rollback(&mut state, 0));
     assert_eq!(original, state, "rollback restores the pre-window image");
-    assert_eq!(
-        UndoStatus {
-            enabled: true,
-            overflow: true,
-            checkpoint: 0,
-            delta_count: 0
-        },
-        vm.undo_status(),
-        "freed entries do not reopen a refused window"
-    );
-    assert_eq!(
-        Err(ErrorCode::JournalOverflow),
-        set_count(&mut vm, &mut state, cell, u64::MAX)
-    );
+    assert_eq!(open(true, false, 0, 0), vm.undo_status());
 
+    for value in 1..=u64::from(UNDO_CAPACITY) + 1 {
+        set_count(&mut vm, &mut state, cell, value).expect("writes past the budget overflow");
+    }
+    assert!(vm.undo_has_overflow());
     vm.undo_commit();
     assert_eq!(
-        UndoStatus {
-            enabled: false,
-            overflow: false,
-            checkpoint: 0,
-            delta_count: 0
-        },
+        open(false, false, 0, 0),
         vm.undo_status(),
-        "end clears the refusal and the journal"
+        "end clears the overflow and the journal"
     );
-
     vm.undo_enable(&state).expect("a committed window reopens");
-    assert_eq!(
-        UndoStatus {
-            enabled: true,
-            overflow: false,
-            checkpoint: 0,
-            delta_count: 0
-        },
-        vm.undo_status()
-    );
     set_count(&mut vm, &mut state, cell, 1).expect("the reopened window accepts writes");
     assert_eq!(1, vm.undo_checkpoint());
 }
@@ -888,10 +883,12 @@ fn status_snapshot_is_a_value_copy_that_cannot_steer_the_journal() {
     vm.undo_commit();
 }
 
-fn open(enabled: bool, overflow: bool, checkpoint: u32, delta_count: u32) -> UndoStatus {
+/// A window's status with no overflow; `refused` is an OutOfMemory refusal.
+fn open(enabled: bool, refused: bool, checkpoint: u32, delta_count: u32) -> UndoStatus {
     UndoStatus {
         enabled,
-        overflow,
+        overflow: false,
+        refused,
         checkpoint,
         delta_count,
     }
@@ -1000,11 +997,11 @@ fn unbacked_redo_lane_refuses_the_paired_write_and_stays_refused() {
     );
 }
 
-/// The record budget is judged before any storage is backed: a capture over
-/// it is `JournalOverflow` even when the memory could not have backed its
-/// scratch either, so the host is told the budget, not the memory, ran out.
+/// The overflow shadow is backed like every other journal storage: a write
+/// past the budget whose shadow the memory cannot back refuses as
+/// `OutOfMemory` before its writer runs, sticky until the window ends.
 #[test]
-fn a_capture_over_budget_is_journal_overflow_even_without_memory() {
+fn an_overflow_the_memory_cannot_shadow_refuses_out_of_memory() {
     let prog = map_program(16);
     let mut state = init(&prog);
     let mut vm = Vm::default();
@@ -1016,43 +1013,83 @@ fn a_capture_over_budget_is_journal_overflow_even_without_memory() {
         })
         .expect("within the record budget");
     }
-    assert!(image_len(&state) > 256, "the wide range fits the image");
     let before = state.clone();
-    // Wider than any capture so far: its scratch would need new storage.
-    let refused = without_memory(|| vm.capture_mutation(false, &mut state, &[(0, 256)], |_| {}));
-    assert_eq!(Err(ErrorCode::JournalOverflow), refused);
-    assert_eq!(Some(ErrorCode::JournalOverflow), vm.undo_refusal());
+    let mut writer_ran = false;
+    let refused = without_memory(|| {
+        vm.capture_mutation(false, &mut state, &[(0, 256)], |_| {
+            writer_ran = true;
+        })
+    });
+    assert_eq!(Err(ErrorCode::OutOfMemory), refused);
+    assert!(!writer_ran, "a refused overflow never reaches the writer");
+    assert_eq!(Some(ErrorCode::OutOfMemory), vm.undo_refusal());
+    assert_eq!(open(true, true, UNDO_CAPACITY, 0), vm.undo_status());
     assert_eq!(before, state);
+    assert_eq!(
+        Err(ErrorCode::OutOfMemory),
+        vm.capture_mutation(false, &mut state, &[(last, 1)], |_| {}),
+        "memory coming back does not reopen a refused window"
+    );
 }
 
-/// The first paired write of a window whose budget undo-only writes spent is
-/// over budget: it answers `JournalOverflow` before the redo lane asks for
-/// storage, even with no memory. A window that refused keeps its first code:
-/// a later paired write at no memory still answers `JournalOverflow`.
+/// A paired window past its budget overflows like an undo-only one. Its
+/// pre-overflow prefix still exports and replays exactly; an export taken
+/// while overflowed reports the overflow, so a fork materializes from a
+/// snapshot rather than trusting the range to replay the step.
 #[test]
-fn a_paired_write_over_budget_is_journal_overflow_and_keeps_that_code() {
+fn a_paired_window_past_its_budget_overflows_and_its_export_says_so() {
     let prog = map_program(16);
     let mut state = init(&prog);
+    let original = state.clone();
     let mut vm = Vm::default();
     vm.undo_enable(&state).expect("undo window opens");
     let last = image_len(&state) - 1;
-    for _ in 0..UNDO_CAPACITY {
-        vm.capture_mutation(false, &mut state, &[(last, 1)], |image| {
+    let flip = |vm: &mut Vm, state: &mut Vec<u8>| {
+        vm.capture_mutation(true, state, &[(last, 1)], |image| {
             image[last as usize] ^= 1;
         })
-        .expect("within the record budget");
-    }
-    let before = state.clone();
-    let paired = |vm: &mut Vm, state: &mut Vec<u8>| {
-        without_memory(|| {
-            vm.capture_mutation(true, state, &[(last, 1)], |image| {
-                image[last as usize] ^= 1;
-            })
-        })
     };
-    assert_eq!(Err(ErrorCode::JournalOverflow), paired(&mut vm, &mut state));
-    assert_eq!(Some(ErrorCode::JournalOverflow), vm.undo_refusal());
-    assert_eq!(Err(ErrorCode::JournalOverflow), paired(&mut vm, &mut state));
-    assert_eq!(Some(ErrorCode::JournalOverflow), vm.undo_refusal());
-    assert_eq!(before, state);
+    for _ in 0..UNDO_CAPACITY {
+        flip(&mut vm, &mut state).expect("within the record budget");
+    }
+    let full = state.clone();
+    assert_eq!(Ok(UNDO_CAPACITY), vm.delta_export_segment(0, UNDO_CAPACITY));
+    assert!(!vm.delta_export_overflow());
+
+    flip(&mut vm, &mut state).expect("a paired write past the budget overflows");
+    assert_ne!(full, state, "the overflowing write ran");
+    assert!(vm.undo_has_overflow());
+    assert_eq!(
+        Err(ErrorCode::InvalidState),
+        vm.delta_export_segment(0, UNDO_POSITION_OVERFLOWED)
+    );
+    assert_eq!(Ok(UNDO_CAPACITY), vm.delta_export_segment(0, UNDO_CAPACITY));
+    assert!(
+        vm.delta_export_overflow(),
+        "an export from an overflowed window says so"
+    );
+    let undo = vm.delta_export_undo().to_vec();
+    let redo = vm.delta_export_redo().to_vec();
+    let entry = Vm::delta_export_entry_size();
+
+    assert_eq!(Ok(image_len(&state)), vm.undo_rollback(&mut state, 0));
+    assert_eq!(
+        original, state,
+        "rollback through the shadow restores the window's start"
+    );
+    assert!(!vm.undo_has_overflow());
+
+    // The exported pre-overflow prefix replays exactly from the window's start.
+    let mut replay = Vm::default();
+    let mut rolled = original.clone();
+    assert_eq!(
+        Ok(image_len(&rolled)),
+        replay.delta_apply_rollforward_segment(&mut rolled, &redo, entry)
+    );
+    assert_eq!(full, rolled);
+    assert_eq!(
+        Ok(image_len(&rolled)),
+        replay.delta_apply_rollback_segment(&mut rolled, &undo, entry)
+    );
+    assert_eq!(original, rolled);
 }

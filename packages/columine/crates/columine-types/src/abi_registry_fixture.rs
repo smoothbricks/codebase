@@ -142,7 +142,6 @@ pub const ERROR_CODES: &[(&str, u32)] = &[
     ("invalidslot", 3),
     ("invalidstate", 4),
     ("deltalanemismatch", 13),
-    ("journaloverflow", 12),
     ("metadataconflict", 11),
     ("needsgrowth", 5),
     ("ok", 0),

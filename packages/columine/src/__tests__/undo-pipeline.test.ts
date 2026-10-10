@@ -23,6 +23,7 @@ import {
   PROGRAM_HASH_PREFIX,
   PROGRAM_MAGIC,
   SlotType,
+  UNDO_POSITION_OVERFLOWED,
   ValueType,
 } from '../index.js';
 import { loadColumineWasm } from '../wasm-backend.js';
@@ -469,10 +470,10 @@ describe('Pipeline undo integration', () => {
   });
 
   // ---------------------------------------------------------------------------
-  // 7. undo overflow: prewrite refusal, sticky window, exact rollback, fitting retry
+  // 7. undo overflow: shadow lands writes, sticky window, exact rollback, fitting retry
   // ---------------------------------------------------------------------------
 
-  it('overflow refuses the batch atomically, keeps the window rollbackable, and a fitting retry commits', async () => {
+  it('overflow lands the batch in a shadow, keeps the window rollbackable, and a fitting retry commits', async () => {
     const stages = createPipeline({ backend, parseBackend: TEST_PARSE_BACKEND });
 
     // Bytecode cap 16384 -> actual cap 32768 -> ~524KB state.
@@ -508,7 +509,8 @@ describe('Pipeline undo integration', () => {
     const checkpointImage = backend.serialize(state, program);
 
     // Every new key journals at least one entry, so 16385 rows exceed UNDO_CAPACITY (16384) whatever the
-    // per-row count. The journal refuses the entry before its write, and the batch reports JOURNAL_OVERFLOW.
+    // per-row count. The journal cannot record the window, so the batch overflows it into the shadow: the
+    // batch returns OK, its writes land, and the window stays overflowed until a rollback or commit.
     const OVERFLOW_COUNT = 16385;
     const keys = new Uint32Array(OVERFLOW_COUNT);
     const values = new Uint32Array(OVERFLOW_COUNT);
@@ -526,25 +528,30 @@ describe('Pipeline undo integration', () => {
         ],
         OVERFLOW_COUNT,
       ),
-    ).toBe(ErrorCode.JOURNAL_OVERFLOW);
+    ).toBe(ErrorCode.OK);
 
-    // The refusal is sticky, and the failed attempt was rolled back to the exact checkpoint image.
+    // The window is overflowed: its checkpoint is the u32::MAX sentinel, and every row landed in the shadow.
     expect(backend.undoHasOverflow()).toBe(true);
-    expect(backend.serialize(state, program)).toEqual(checkpointImage);
-    expect(backend.getMapSize(state, program, 0)).toBe(3);
+    expect(backend.undoCheckpoint(state)).toBe(UNDO_POSITION_OVERFLOWED);
+    expect(backend.getMapSize(state, program, 0)).toBe(3 + OVERFLOW_COUNT);
     expect(backend.mapGet(state, program, 0, 1)).toStrictEqual({ ok: true, value: 10 });
     expect(backend.mapGet(state, program, 0, 2)).toStrictEqual({ ok: true, value: 20 });
     expect(backend.mapGet(state, program, 0, 3)).toStrictEqual({ ok: true, value: 30 });
-    expect(backend.mapGet(state, program, 0, 100)).toStrictEqual({ ok: true, value: undefined });
+    expect(backend.mapGet(state, program, 0, 100)).toStrictEqual({ ok: true, value: 1000 });
+    expect(backend.mapGet(state, program, 0, 100 + OVERFLOW_COUNT - 1)).toStrictEqual({
+      ok: true,
+      value: 1000 + OVERFLOW_COUNT - 1,
+    });
 
-    // The window stays rollbackable: rollback reports the refusal and restores the full image.
-    expect(stages.undo.rollback(state, token)).toBe('overflow');
+    // Rolling back to the pre-overflow checkpoint restores the exact image and ends the overflow.
+    stages.undo.rollback(state, token);
     expect(backend.serialize(state, program)).toEqual(checkpointImage);
     expect(backend.getMapSize(state, program, 0)).toBe(3);
-
-    // Ending the window clears the refusal.
-    stages.undo.commit(state, token);
     expect(backend.undoHasOverflow()).toBe(false);
+    expect(backend.undoCheckpoint(state)).toBe(getUndoPosition(token));
+
+    // Ending the window closes it.
+    stages.undo.commit(state, token);
 
     // Retry the same rows in windows that fit. Each chunk's OK status is asserted, so a chunk that
     // overflows fails here instead of being assumed to fit from a per-row entry count.
@@ -806,7 +813,7 @@ describe('Pipeline undo integration', () => {
     expect(backend.deltaExportSegment(state, fromPos, toPos)).toStrictEqual(exported);
 
     // The original token still rolls back to the image before its checkpoint.
-    expect(stages.undo.rollback(state, token)).toBe('ok');
+    stages.undo.rollback(state, token);
     expect(backend.serialize(state, program)).toEqual(imageBefore);
     expect(backend.getMapSize(state, program, 0)).toBe(0);
   });

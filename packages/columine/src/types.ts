@@ -308,11 +308,7 @@ export enum ErrorCode {
   COUNT_OVERFLOW = 10,
   /** A keyed fold's immutable metadata differs from its init value. */
   METADATA_CONFLICT = 11,
-  /**
-   * Physical journal record budget refused a write before it was made. Writes earlier in the window stand as an exact
-   * accepted prefix that the window's rollback restores; the window refuses every later write until ended or reset.
-   */
-  JOURNAL_OVERFLOW = 12,
+  // 12 is unassigned: a window past its record budget overflows into a shadow instead of refusing.
   /** A paired delta export was refused because the range contains an undo-only mutation. */
   DELTA_LANE_MISMATCH = 13,
   /** Beginning a window refused because another speculation window is still active. */
@@ -320,12 +316,15 @@ export enum ErrorCode {
   /**
    * Working memory could not be allocated. Not a request to grow. Outside a recording window every buffer a batch or
    * call can grow is reserved before its first write, so the refused batch or call wrote nothing and can be run again
-   * as it is. Inside one, the journal backs its storage capture by capture, so the refusal behaves like
-   * `JOURNAL_OVERFLOW`: the refused write and every later one wrote nothing, earlier writes stand as an exact accepted
-   * prefix, and the batch may run again only after the window is rolled back past it.
+   * as it is. Inside one, the journal backs its storage and its overflow shadow write by write: the refused write and
+   * every later one wrote nothing, earlier writes stand as an exact accepted prefix, and the batch may run again only
+   * after the window is rolled back past it.
    */
   OUT_OF_MEMORY = 15,
 }
+
+/** The undo position `undoCheckpoint` answers while the window is overflowed: no rollback can restore it. */
+export const UNDO_POSITION_OVERFLOWED = 0xffff_ffff;
 
 // =============================================================================
 // Bytecode Constants

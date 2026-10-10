@@ -83,8 +83,6 @@ pub(crate) struct CapacityScratch {
     effects: Vec<(Effect, bool)>,
     /// Tier 2's `(outer, inner)` keys of one nested slot.
     pairs: Vec<(u32, u32)>,
-    /// The tier-3 state copy.
-    pub(crate) image: Vec<u8>,
     pub(crate) counts: CapacityCounts,
     /// The working memory the last batch admitted by tiers 1 and 2 needs;
     /// a dry run grows scratch itself.

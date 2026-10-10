@@ -541,9 +541,18 @@ pub fn write_derived_facts_header(
 // Undo/delta runtime state
 // =============================================================================
 
-/// Maximum number of undo entries one window may hold. A logical budget:
-/// journal storage grows to actual demand and is admitted before any write.
+/// Records one window journals before it overflows. The first write the
+/// journal would have to record past it overflows the window instead of
+/// being refused: the image is copied, once, into a shadow sized to the
+/// state, and from then on the window records nothing new. Journal and
+/// shadow storage grow to actual demand and are admitted before any write.
 pub const UNDO_CAPACITY: u32 = 16384;
+
+/// What [`Vm::undo_checkpoint`] answers while the window is overflowed.
+/// Unrecorded writes may precede such a savepoint, so no rollback can restore
+/// it: rolling back to it is `InvalidState`. A savepoint taken before the
+/// overflow stays exact.
+pub const UNDO_POSITION_OVERFLOWED: u32 = u32::MAX;
 
 /// Source of window generations, unique across every journal in the process,
 /// so a capture frame names exactly one window of exactly one journal.
@@ -565,10 +574,14 @@ pub struct RedoLaneStatus {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct UndoStatus {
     pub enabled: bool,
-    /// The window refused a write and refuses every later one: its record
-    /// budget is spent (`JournalOverflow`) or the memory could not back its
-    /// storage (`OutOfMemory`); the refusing call answered which.
+    /// The window passed its record budget: the writes since are covered by
+    /// the shadow taken before the first of them, not by records. A rollback
+    /// to any earlier savepoint restores the shadow, replays the records in
+    /// reverse and ends the overflow.
     pub overflow: bool,
+    /// The memory could not back the journal or its shadow (`OutOfMemory`):
+    /// the refused write and every later one in the window wrote nothing.
+    pub refused: bool,
     pub checkpoint: u32,
     pub delta_count: u32,
 }
@@ -580,10 +593,18 @@ pub(crate) struct UndoState {
     redo: Vec<Option<FlatUndoEntry>>,
     redo_active: bool,
     delta_count: u32,
-    /// The window's sticky refusal: `JournalOverflow` when the record budget
-    /// (`UNDO_CAPACITY`) is spent, `OutOfMemory` when the memory cannot back
-    /// the journal's storage. Every later write in the window answers it.
-    refused: Option<ErrorCode>,
+    /// The window passed `UNDO_CAPACITY`: `image` holds the state as it stood
+    /// before the first write the journal did not record.
+    overflowed: bool,
+    /// The VM's one state-sized image buffer: the overflow shadow while
+    /// `overflowed`, otherwise the scratch copy capacity admission dry-runs a
+    /// batch on (10h tier 3). Sharing it means an overflow adds no resident
+    /// memory beyond the largest image the VM has already held.
+    image: Vec<u8>,
+    /// The window's sticky refusal: the memory could not back the journal's
+    /// storage or its shadow. Every later write in the window answers
+    /// `OutOfMemory` until the window ends.
+    out_of_memory: bool,
     enabled: bool,
     state_size: u32,
     saved_change_flags: Vec<u8>,
@@ -612,32 +633,39 @@ impl UndoState {
         self.delta_count
     }
 
-    /// Refuse every later write in the window, and answer it now. The first
-    /// refusal is the window's: a later one never replaces its code.
-    fn refuse(&mut self, code: ErrorCode) -> Result<(), ErrorCode> {
-        Err(*self.refused.get_or_insert(code))
+    /// Refuse every later write in the window, and answer it now.
+    fn refuse(&mut self) -> Result<(), ErrorCode> {
+        self.out_of_memory = true;
+        Err(ErrorCode::OutOfMemory)
     }
 
-    /// Refuse `count` more records past the record budget, before any storage
-    /// is reserved for them: a write over budget is `JournalOverflow` whether
-    /// or not the memory could have backed it.
-    fn within_budget(&mut self, count: u32) -> Result<(), ErrorCode> {
-        if let Some(code) = self.refused {
-            return Err(code);
-        }
-        if self
-            .count()
+    /// Whether `count` more records stay within the record budget.
+    fn within_budget(&self, count: u32) -> bool {
+        self.count()
             .checked_add(self.reserved_entries)
             .and_then(|total| total.checked_add(count))
-            .is_none_or(|total| total > UNDO_CAPACITY)
-        {
-            return self.refuse(ErrorCode::JournalOverflow);
+            .is_some_and(|total| total <= UNDO_CAPACITY)
+    }
+
+    /// Overflow the window: copy `state` into the shadow before the first
+    /// write the journal will not record. A capture open at that moment keeps
+    /// its reservation and records on close the bytes it saw on opening, so
+    /// replaying the records in reverse over the restored shadow is exact.
+    /// Memory that cannot back the shadow refuses as `OutOfMemory`, before
+    /// the write.
+    fn overflow(&mut self, state: &[u8]) -> Result<(), ErrorCode> {
+        debug_assert!(!self.overflowed);
+        self.image.clear();
+        if self.image.try_reserve(state.len()).is_err() {
+            return self.refuse();
         }
+        self.image.extend_from_slice(state);
+        self.overflowed = true;
         Ok(())
     }
 
     fn reserve_entries(&mut self, count: u32) -> Result<(), ErrorCode> {
-        self.within_budget(count)?;
+        debug_assert!(self.within_budget(count));
         // Back the admitted entries with storage now, grown geometrically to
         // actual demand, so no later push allocates. Storage that cannot be
         // had refuses as `OutOfMemory`: before any write, and sticky, so the
@@ -649,7 +677,7 @@ impl UndoState {
             .is_err()
             || (self.redo_active && self.redo.try_reserve(total - self.redo.len()).is_err())
         {
-            return self.refuse(ErrorCode::OutOfMemory);
+            return self.refuse();
         }
         self.reserved_entries += count;
         Ok(())
@@ -657,18 +685,19 @@ impl UndoState {
 
     /// Admit scenario storage before its first writer, and before any entry
     /// reservation that must cover it. Pure production windows allocate and
-    /// write no redo buffer. A refused window answers its own refusal, and a
-    /// window with no record of budget left answers `JournalOverflow`, before
-    /// any redo storage is asked for: every recording write needs a record.
+    /// write no redo buffer, and neither does an overflowed window: it
+    /// records nothing new.
     fn prepare_redo(&mut self, delta_mode: bool) -> Result<(), ErrorCode> {
-        if !self.enabled || !delta_mode || self.redo_active {
+        if !self.enabled || !delta_mode || self.redo_active || self.overflowed {
             return Ok(());
         }
-        self.within_budget(1)?;
+        if self.out_of_memory {
+            return Err(ErrorCode::OutOfMemory);
+        }
         debug_assert!(self.redo.is_empty());
         let total = self.entries.len() + self.reserved_entries as usize;
         if self.redo.try_reserve(total).is_err() {
-            return self.refuse(ErrorCode::OutOfMemory);
+            return self.refuse();
         }
         self.redo.resize(self.entries.len(), None);
         self.redo_active = true;
@@ -777,36 +806,38 @@ impl UndoState {
         state: &[u8],
         plan: impl FnOnce() -> P,
     ) -> Result<ByteCapture, ErrorCode> {
-        if !self.enabled {
+        if !self.enabled || self.overflowed {
             return Ok(ByteCapture::UNRECORDED);
         }
         self.begin_recording(state, plan().as_ref())
     }
 
-    /// [`Self::begin_capture`] while the journal records.
+    /// [`Self::begin_capture`] while the journal records. A capture the
+    /// record budget cannot cover overflows the window and goes unrecorded.
     #[inline(never)]
     fn begin_recording(
         &mut self,
         state: &[u8],
         ranges: &[(u32, u32)],
     ) -> Result<ByteCapture, ErrorCode> {
-        if let Some(code) = self.refused {
-            return Err(code);
+        if self.out_of_memory {
+            return Err(ErrorCode::OutOfMemory);
         }
         if u32::try_from(state.len()).ok() != Some(self.state_size) {
             return Err(ErrorCode::InvalidState);
         }
         let count = self.validate_ranges(state, ranges)?;
-        // The budget is judged first, so a capture over it is
-        // `JournalOverflow` and never the scratch's `OutOfMemory`. Before-bytes
-        // and their ranges never exceed the declared bytes and the reserved
-        // chunks; both are backed before the entries are.
-        self.within_budget(count)?;
+        if !self.within_budget(count) {
+            self.overflow(state)?;
+            return Ok(ByteCapture::UNRECORDED);
+        }
+        // Before-bytes and their ranges never exceed the declared bytes and
+        // the reserved chunks; both are backed before the entries are.
         let bytes: usize = ranges.iter().map(|&(_, len)| len as usize).sum();
         if self.capture_scratch.try_reserve(bytes).is_err()
             || self.capture_ranges.try_reserve(count as usize).is_err()
         {
-            self.refuse(ErrorCode::OutOfMemory)?;
+            self.refuse()?;
         }
         self.reserve_entries(count)?;
         let frame = CaptureFrame {
@@ -894,11 +925,11 @@ impl UndoState {
     }
 
     fn open_change_flags(&mut self, state: &[u8]) -> Result<bool, ErrorCode> {
-        if !self.enabled {
+        if !self.enabled || self.overflowed {
             return Ok(false);
         }
-        if let Some(code) = self.refused {
-            return Err(code);
+        if self.out_of_memory {
+            return Err(ErrorCode::OutOfMemory);
         }
         if state.len() != self.state_size as usize
             || state.len() < columine_types::types::STATE_HEADER_SIZE as usize
@@ -917,6 +948,12 @@ impl UndoState {
             return Err(ErrorCode::InvalidState);
         }
         let count = slots.checked_add(1).ok_or(ErrorCode::InvalidState)?;
+        if !self.within_budget(count) {
+            // The shadow holds the flags as they stand: an overflowed window
+            // owns no flag boundary.
+            self.overflow(state)?;
+            return Ok(false);
+        }
         self.reserve_entries(count)?;
         self.saved_change_flags.extend(
             (0..slots)
@@ -3398,19 +3435,29 @@ impl Vm {
         batch_len: u32,
         live: Option<&mut LiveColumns<'_, '_>>,
     ) -> u32 {
-        let mut image = core::mem::take(&mut self.capacity.image);
+        // The image is the journal's buffer: while the window is overflowed
+        // it is the shadow, so this batch's copy gets storage of its own.
+        let shadowed = self.undo.overflowed;
+        let mut image = if shadowed {
+            Vec::new()
+        } else {
+            core::mem::take(&mut self.undo.image)
+        };
         image.clear();
-        // The image grows to the largest state this VM has dry-run; memory
-        // that cannot back it refuses before any write, never an abort.
-        if image.try_reserve(state.len()).is_err() {
-            self.capacity.image = image;
-            return OUT_OF_MEMORY;
+        // The image grows to the largest state this VM has held; memory that
+        // cannot back it refuses before any write, never an abort.
+        let result = if image.try_reserve(state.len()).is_err() {
+            OUT_OF_MEMORY
+        } else {
+            image.extend_from_slice(state);
+            let enabled = core::mem::replace(&mut self.undo.enabled, false);
+            let result = self.execute_ops(false, &mut image, code, cols, batch_len, live);
+            self.undo.enabled = enabled;
+            result
+        };
+        if !shadowed {
+            self.undo.image = image;
         }
-        image.extend_from_slice(state);
-        let enabled = core::mem::replace(&mut self.undo.enabled, false);
-        let result = self.execute_ops(false, &mut image, code, cols, batch_len, live);
-        self.undo.enabled = enabled;
-        self.capacity.image = image;
         result
     }
 
@@ -5886,7 +5933,8 @@ impl Vm {
         u.redo.clear();
         u.redo_active = false;
         u.delta_count = 0;
-        u.refused = (!backed).then_some(ErrorCode::OutOfMemory);
+        u.out_of_memory = !backed;
+        u.overflowed = false;
         u.export_start = 0;
         u.export_count = 0;
         u.export_overflow = false;
@@ -5905,12 +5953,22 @@ impl Vm {
         Ok(())
     }
 
-    /// Return the current undo checkpoint position.
+    /// Return the current undo checkpoint position, or
+    /// [`UNDO_POSITION_OVERFLOWED`] while the window is overflowed.
     pub fn undo_checkpoint(&self) -> u32 {
-        self.undo.count()
+        if self.undo.overflowed {
+            UNDO_POSITION_OVERFLOWED
+        } else {
+            self.undo.count()
+        }
     }
 
     /// Roll back to a checkpoint, restoring the state and change flags.
+    ///
+    /// An overflowed window first restores its shadow, which undoes every
+    /// write it did not record, then replays its records in reverse; the
+    /// state is then exactly the savepoint's image, so the overflow ends and
+    /// the window records again.
     pub fn undo_rollback(
         &mut self,
         state: &mut [u8],
@@ -5920,6 +5978,11 @@ impl Vm {
         let u = &mut self.undo;
         if checkpoint_pos > u.count() || (u.enabled && u.state_size != size) {
             return Err(ErrorCode::InvalidState);
+        }
+        if u.overflowed {
+            debug_assert_eq!(u.image.len(), state.len());
+            state.copy_from_slice(&u.image);
+            u.overflowed = false;
         }
         let mut i = u.count();
         while i > checkpoint_pos {
@@ -5956,7 +6019,8 @@ impl Vm {
         u.redo.clear();
         u.redo_active = false;
         u.delta_count = 0;
-        u.refused = None;
+        u.out_of_memory = false;
+        u.overflowed = false;
         u.export_start = 0;
         u.export_count = 0;
         u.export_overflow = false;
@@ -5966,16 +6030,16 @@ impl Vm {
         u.enabled = false;
     }
 
-    /// Return whether the window refused a write: its budget or its storage.
+    /// Whether the window passed its record budget and holds a shadow: some of
+    /// its writes are covered by the shadow, not by records.
     pub fn undo_has_overflow(&self) -> bool {
-        self.undo.refused.is_some()
+        self.undo.overflowed
     }
 
-    /// Which refusal the window holds, if it refused a write: the record
-    /// budget (`JournalOverflow`) or the memory backing its storage
-    /// (`OutOfMemory`). A host names the operator's next move from it.
+    /// The refusal the window holds, if the memory could not back its journal
+    /// or shadow: `OutOfMemory`. A host names the operator's next move from it.
     pub fn undo_refusal(&self) -> Option<ErrorCode> {
-        self.undo.refused
+        self.undo.out_of_memory.then_some(ErrorCode::OutOfMemory)
     }
 
     /// Observe a journal without being able to reset its live window or refusal.
@@ -5989,7 +6053,7 @@ impl Vm {
     /// They cannot clear a refusal:
     /// ```compile_fail,E0616
     /// let mut vm = columine_vm::vm::Vm::default();
-    /// vm.undo.refused = None;
+    /// vm.undo.out_of_memory = false;
     /// ```
     ///
     /// They cannot change the journal's image extent:
@@ -6000,8 +6064,9 @@ impl Vm {
     pub fn undo_status(&self) -> UndoStatus {
         UndoStatus {
             enabled: self.undo.enabled,
-            overflow: self.undo.refused.is_some(),
-            checkpoint: self.undo.count(),
+            overflow: self.undo.overflowed,
+            refused: self.undo.out_of_memory,
+            checkpoint: self.undo_checkpoint(),
             delta_count: self.undo.delta_count(),
         }
     }
@@ -6060,7 +6125,7 @@ impl Vm {
         serialize_entries(&mut u.export_redo, redo.iter().copied());
         u.export_start = from_pos;
         u.export_count = count;
-        u.export_overflow = u.refused.is_some();
+        u.export_overflow = u.overflowed;
         Ok(count)
     }
 
@@ -6079,7 +6144,9 @@ impl Vm {
         self.undo.export_count * FLAT_UNDO_ENTRY_SIZE
     }
 
-    /// Return whether delta export overflowed.
+    /// Whether the window had overflowed when the range was exported: its
+    /// writes past the budget are in no record, so the range does not
+    /// replay the step and a fork materializes from a snapshot instead.
     pub fn delta_export_overflow(&self) -> bool {
         self.undo.export_overflow
     }

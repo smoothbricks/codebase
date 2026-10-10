@@ -13,7 +13,9 @@ use columine_vm::state_init::{
     ARENA_HEADER_SIZE, DEFAULT_ACCEPTED_PROGRAM_MAGICS, ProgramInvalidCause, SizingRefusal,
     calculate_grown_state_size, calculate_state_size, grow_state, init_state, struct_field_offset,
 };
-use columine_vm::vm::{CheckedStructMap, Vm, f64s_as_bytes, u32s_as_bytes};
+use columine_vm::vm::{
+    CheckedStructMap, UNDO_POSITION_OVERFLOWED, Vm, f64s_as_bytes, u32s_as_bytes,
+};
 
 const OK: u32 = ErrorCode::Ok as u32;
 const INVALID_PROGRAM: u32 = ErrorCode::InvalidProgram as u32;
@@ -1315,8 +1317,9 @@ fn ts_struct_map_upsert_first_keeps_first_row_and_rolls_back() {
     );
 }
 
-// Element-family refusal proofs use a separate real COUNT reducer to fill the
-// journal without overflowing its window before the element body is attempted.
+// Element-family overflow proofs use a separate real COUNT reducer to fill the
+// journal to a known budget without overflowing its window before the element
+// body is attempted.
 fn element_refusal_programs(
     kind: SlotType,
     ttl: bool,
@@ -1426,7 +1429,7 @@ fn assert_element_exported_window(vm: &mut Vm, before: &[u8], after: &[u8], star
     assert_eq!(Ok(end - start), vm.delta_export_segment(start, end));
     assert!(
         vm.delta_export_overflow(),
-        "refusal diagnostic must not erase the valid prefix"
+        "overflow diagnostic must not erase the pre-overflow records"
     );
     let undo = vm.delta_export_undo().to_vec();
     let redo = vm.delta_export_redo().to_vec();
@@ -1443,9 +1446,11 @@ fn assert_element_exported_window(vm: &mut Vm, before: &[u8], after: &[u8], star
     assert_eq!(forward, after, "every allocated byte must redo");
 }
 
+/// Each element family past the record budget overflows the window: its write
+/// lands, the window reports overflow and no savepoint, and rollback to the
+/// pre-overflow savepoint restores the image byte-exact on both lanes.
 #[test]
-fn element_upsert_arms_preserve_journal_overflow_cause() {
-    const JOURNAL_OVERFLOW: u32 = ErrorCode::JournalOverflow as u32;
+fn element_upsert_arms_overflow_lands_and_rolls_back_byte_exact() {
     const F64_CMP: u8 = columine_types::types::CmpType::F64 as u8;
     const FRESH_KEY: u32 = 7;
     const RETRY_KEY: u32 = 9;
@@ -1580,13 +1585,14 @@ fn element_upsert_arms_preserve_journal_overflow_cause() {
                 let initial = state.clone();
 
                 // Four records of room remain. The root boundary reserves
-                // slots + derived flag (3) and is admitted; the family needs
-                // at least two records and must refuse.
+                // slots + derived flag (3) and is admitted; the family's first
+                // capture then exhausts the budget. The shadow takes the image
+                // before that write, and the write lands unrecorded.
                 fill_element_journal(&mut vm, &mut state, &count, delta, 4);
                 let checkpoint = vm.undo_checkpoint();
-                let accepted = state.clone();
+                let before = state.clone();
 
-                let refused = execute_element_rows(
+                let landed = execute_element_rows(
                     &mut vm,
                     &mut state,
                     &target,
@@ -1600,24 +1606,31 @@ fn element_upsert_arms_preserve_journal_overflow_cause() {
                     },
                 );
                 assert_eq!(
-                    JOURNAL_OVERFLOW, refused,
-                    "{label} flattened={flattened} delta={delta}: family must refuse with JournalOverflow"
+                    OK, landed,
+                    "{label} flattened={flattened} delta={delta}: overflowing family must land its write"
                 );
-                assert_eq!(
-                    accepted, state,
-                    "{label} flattened={flattened} delta={delta}: refusal wrote bytes"
-                );
-                assert_eq!(
-                    checkpoint,
-                    vm.undo_checkpoint(),
-                    "{label} flattened={flattened} delta={delta}: refusal moved the checkpoint"
+                assert_ne!(
+                    before, state,
+                    "{label} flattened={flattened} delta={delta}: overflowing write must change the image"
                 );
                 assert!(
-                    vm.undo_status().overflow,
-                    "{label} flattened={flattened} delta={delta}: refusal must set the sticky diagnostic"
+                    vm.undo_has_overflow(),
+                    "{label} flattened={flattened} delta={delta}: budget exhaustion must overflow the window"
                 );
+                assert_eq!(
+                    None,
+                    vm.undo_refusal(),
+                    "{label} flattened={flattened} delta={delta}: overflow is not a refusal"
+                );
+                assert_eq!(
+                    UNDO_POSITION_OVERFLOWED,
+                    vm.undo_checkpoint(),
+                    "{label} flattened={flattened} delta={delta}: overflowed window has no savepoint"
+                );
+                let overflowed = state.clone();
 
-                let retry = execute_element_rows(
+                // A later write in the overflowed window lands unrecorded too.
+                let later = execute_element_rows(
                     &mut vm,
                     &mut state,
                     &target,
@@ -1631,29 +1644,41 @@ fn element_upsert_arms_preserve_journal_overflow_cause() {
                     },
                 );
                 assert_eq!(
-                    JOURNAL_OVERFLOW, retry,
-                    "{label} flattened={flattened} delta={delta}: overflow must stay sticky"
+                    OK, later,
+                    "{label} flattened={flattened} delta={delta}: write past overflow must land"
+                );
+                assert_ne!(
+                    overflowed, state,
+                    "{label} flattened={flattened} delta={delta}: write past overflow must change the image"
+                );
+                assert!(
+                    vm.undo_has_overflow(),
+                    "{label} flattened={flattened} delta={delta}: overflow must stay set"
                 );
                 assert_eq!(
-                    accepted, state,
-                    "{label} flattened={flattened} delta={delta}: sticky retry wrote bytes"
-                );
-                assert_eq!(
-                    checkpoint,
+                    UNDO_POSITION_OVERFLOWED,
                     vm.undo_checkpoint(),
-                    "{label} flattened={flattened} delta={delta}: sticky retry moved the checkpoint"
+                    "{label} flattened={flattened} delta={delta}: window must stay without savepoint"
                 );
 
                 if delta {
-                    assert_element_exported_window(&mut vm, &initial, &accepted, 0, checkpoint);
+                    assert_element_exported_window(&mut vm, &initial, &before, 0, checkpoint);
                 }
+                vm.undo_rollback(&mut state, checkpoint)
+                    .expect("pre-overflow savepoint stays valid");
+                assert_eq!(
+                    before, state,
+                    "{label} flattened={flattened} delta={delta}: rollback to the pre-overflow savepoint must restore its image byte-exact"
+                );
+                assert!(!vm.undo_has_overflow());
+                assert_eq!(checkpoint, vm.undo_checkpoint());
+
                 vm.undo_rollback(&mut state, 0).expect("valid checkpoint");
                 assert_eq!(
                     initial, state,
                     "{label} flattened={flattened} delta={delta}: rollback to 0 must restore the initial image"
                 );
                 assert_eq!(0, vm.undo_checkpoint());
-
                 vm.undo_commit();
                 vm.undo_enable(&state).expect("undo window opens");
                 let fitting = execute_element_rows(
@@ -1683,15 +1708,16 @@ fn element_upsert_arms_preserve_journal_overflow_cause() {
     }
 }
 
+/// A 128-row batch past the record budget lands whole: the window overflows, later
+/// writes land unrecorded, and rollback to the pre-batch savepoint restores its image.
 #[test]
-fn nested_element_journal_overflow_retains_exact_accepted_prefix() {
+fn nested_element_journal_overflow_lands_whole_batch_and_rolls_back_exactly() {
     // Real MAP_UPSERT_LAST (slot 0, key column 1, value column 2) over 128 fresh keys.
     let body = [Opcode::BatchMapUpsertLast as u8, 0, 1, 2];
     let keys: Vec<u32> = (1..=128).collect();
     let values: Vec<u32> = (1000..1128).collect();
     let comparisons = vec![0.0f64; keys.len()];
     let predicates = vec![1u32; keys.len()];
-    let rows = keys.len();
     for flattened in [false, true] {
         for delta in [false, true] {
             let (prog, count_prog) =
@@ -1705,8 +1731,9 @@ fn nested_element_journal_overflow_retains_exact_accepted_prefix() {
             let before = state.clone();
             let checkpoint = vm.undo_checkpoint();
 
-            // 128 valid fresh keys in one body batch: the window runs out mid-batch.
-            let refused = execute_element_rows(
+            // 128 valid fresh keys in one body batch: the window runs out mid-batch,
+            // and the rest of the batch lands unrecorded behind the shadow.
+            let landed = execute_element_rows(
                 &mut vm,
                 &mut state,
                 &prog,
@@ -1719,21 +1746,22 @@ fn nested_element_journal_overflow_retains_exact_accepted_prefix() {
                     predicates: &predicates,
                 },
             );
-            assert_eq!(ErrorCode::JournalOverflow as u32, refused);
-            let after = state.clone();
-            let end = vm.undo_checkpoint();
+            assert_eq!(OK, landed, "the overflowing batch must land");
             assert!(
-                end > checkpoint,
-                "the accepted prefix must journal its mutations"
+                vm.undo_has_overflow(),
+                "the batch must exhaust the record budget"
             );
-            assert!(vm.undo_status().overflow);
+            assert_eq!(UNDO_POSITION_OVERFLOWED, vm.undo_checkpoint());
+            let after = state.clone();
 
-            // The refusal is sticky: a retry neither writes nor journals.
-            let retry = execute_element_rows(
-                &mut vm,
-                &mut state,
+            // The overflowed batch lands exactly what an undo-off run of it lands.
+            let mut reference = before.clone();
+            let mut reference_vm = Vm::default();
+            let reference_landed = execute_element_rows(
+                &mut reference_vm,
+                &mut reference,
                 &prog,
-                delta,
+                false,
                 flattened,
                 ElementRows {
                     keys: &keys,
@@ -1742,60 +1770,44 @@ fn nested_element_journal_overflow_retains_exact_accepted_prefix() {
                     predicates: &predicates,
                 },
             );
-            assert_eq!(ErrorCode::JournalOverflow as u32, retry);
-            assert_eq!(state, after, "the sticky refusal must not write");
+            assert_eq!(OK, reference_landed, "the undo-off reference must land");
             assert_eq!(
-                vm.undo_checkpoint(),
-                end,
-                "the sticky refusal must not journal"
+                reference, after,
+                "the overflowed batch must land every row exactly"
             );
 
-            // Exactly one undo-off prefix from the same COUNT image reproduces the refusal.
-            let accepted_prefixes: Vec<usize> = (1..rows)
-                .filter(|&k| {
-                    let mut reference = before.clone();
-                    let mut reference_vm = Vm::default();
-                    let prefix = ElementRows {
-                        keys: &keys[..k],
-                        values: &values[..k],
-                        comparisons: &comparisons[..k],
-                        predicates: &predicates[..k],
-                    };
-                    let reference_result = execute_element_rows(
-                        &mut reference_vm,
-                        &mut reference,
-                        &prog,
-                        false,
-                        flattened,
-                        prefix,
-                    );
-                    assert_eq!(
-                        OK, reference_result,
-                        "a prefix of the body batch applies cleanly"
-                    );
-                    reference == after
-                })
-                .collect();
-            assert_eq!(
-                accepted_prefixes.len(),
-                1,
-                "exactly one prefix reproduces the refused image"
+            // A later write in the overflowed window lands unrecorded as well.
+            let later = execute_element_rows(
+                &mut vm,
+                &mut state,
+                &prog,
+                delta,
+                flattened,
+                ElementRows {
+                    keys: &[200],
+                    values: &[7],
+                    comparisons: &[0.0],
+                    predicates: &[1],
+                },
             );
+            assert_eq!(OK, later, "a write past overflow must land");
+            assert_ne!(after, state, "a write past overflow must change the image");
+            assert!(vm.undo_has_overflow());
+            assert_eq!(UNDO_POSITION_OVERFLOWED, vm.undo_checkpoint());
 
             if delta {
-                // Replay every window before any live rollback touches the journal.
+                // The pre-overflow prefix exports while overflowed and replays exactly.
                 assert_element_exported_window(&mut vm, &initial, &before, 0, checkpoint);
-                assert_element_exported_window(&mut vm, &before, &after, checkpoint, end);
-                assert_element_exported_window(&mut vm, &initial, &after, 0, end);
             }
 
             vm.undo_rollback(&mut state, checkpoint)
-                .expect("the accepted-prefix checkpoint stays valid after overflow");
+                .expect("the pre-overflow checkpoint stays valid after overflow");
             assert_eq!(
-                state, before,
-                "rollback to the checkpoint restores its image"
+                before, state,
+                "rollback to the checkpoint restores its image byte-exact"
             );
-            assert_eq!(vm.undo_checkpoint(), checkpoint);
+            assert_eq!(checkpoint, vm.undo_checkpoint());
+            assert!(!vm.undo_has_overflow());
             vm.undo_rollback(&mut state, 0)
                 .expect("the origin checkpoint stays valid");
             assert_eq!(

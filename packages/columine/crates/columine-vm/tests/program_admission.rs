@@ -175,7 +175,8 @@ fn ordinary_owned_program_executes_and_rolls_back_without_a_vo_capability() {
 /// A recording window whose storage the memory cannot back refuses the write
 /// as `OutOfMemory` before its writer runs, the image unchanged, and keeps
 /// refusing it: the host is told to raise its memory, not to shrink the
-/// batch. The record budget's refusal stays `JournalOverflow` (undo_intern).
+/// batch. The record budget does not refuse: a window past it overflows into a
+/// shadow that rollback restores exactly (undo_intern).
 #[test]
 fn journal_storage_the_memory_cannot_back_is_out_of_memory_and_sticky() {
     let bitmap = assemble(&[0x10, 0, SlotType::Bitmap as u8, 64, 0, 0], &[0]);
@@ -201,7 +202,7 @@ fn journal_storage_the_memory_cannot_back_is_out_of_memory_and_sticky() {
                     Err(code) => {
                         assert!(!ran, "the writer never runs under a refusal");
                         assert_eq!(state, empty, "a refused write leaves the image");
-                        assert!(vm.undo_has_overflow(), "the refusal is sticky");
+                        assert!(vm.undo_refusal().is_some(), "the refusal is sticky");
                         let again = vm.capture_mutation(delta, &mut state, &[(byte, 1)], |_| {});
                         assert_eq!(again, Err(code), "a later write answers the same refusal");
                         Err(code)
@@ -226,10 +227,11 @@ fn journal_storage_the_memory_cannot_back_is_out_of_memory_and_sticky() {
 
 /// A recording window backs its journal storage capture by capture, so a
 /// memory that refuses it in the middle of a batch answers `OutOfMemory` with
-/// the rows before the refused one written: an exact accepted prefix, as with
-/// `JournalOverflow`. Rolling the window back to the checkpoint taken before
-/// the batch restores the image byte for byte; only then may the batch run
-/// again. Every refusal here is that one, and some land mid-batch.
+/// the rows before the refused one written: an exact accepted prefix. Rolling
+/// the window back to the checkpoint taken before the batch restores the image
+/// byte for byte; the same rollback restores a window that overflowed its
+/// record budget into a shadow. Only then may the batch run again. Every
+/// refusal here is that one, and some land mid-batch.
 #[test]
 fn a_batch_refused_for_journal_storage_leaves_a_prefix_the_window_rolls_back() {
     let map = assemble(

@@ -12,8 +12,10 @@
 //!
 //! Undo and delta use bounded actual-prior-byte StateBytes records, including
 //! overwritten dead cells, unused auxiliary lanes and payload/index tails.
-//! Journal budget and storage are reserved before writes; JournalOverflow
-//! (budget) or OutOfMemory (storage) refuses the first unlogged mutation and
+//! Journal storage is reserved before writes. A window that passes its
+//! record budget copies the image into a shadow once and records nothing
+//! further; rollback restores the shadow, then replays the records in
+//! reverse. OutOfMemory (storage) refuses the first unbacked mutation and
 //! leaves the accepted prefix exactly reversible.
 //! Change-flag boundaries return a typed Result before running a refused writer.
 //! Layout growth has no journal: roll back and end the complete speculative

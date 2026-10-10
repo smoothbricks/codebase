@@ -12,6 +12,7 @@ import {
   SlotType,
   SlotTypeFlag,
   StructFieldType,
+  UNDO_POSITION_OVERFLOWED,
   ValueType,
 } from '../types.js';
 import { loadColumineWasm, VmStateAdmissionError } from '../wasm-backend.js';
@@ -415,7 +416,7 @@ describe('real wasm state geometry and committed-boundary growth', () => {
     expect(new Uint8Array(memory.buffer, statePtr, size)).toEqual(initial);
   });
 
-  it('returns typed journal and TTL-eviction refusal while preserving serialized rollback and replay', async () => {
+  it('lands overflowed writes and TTL eviction in the shadow, with exact serialized rollback and replay', async () => {
     const ttl = new Uint8Array(8);
     new DataView(ttl.buffer).setFloat32(0, 10, true);
     for (const delta of [false, true]) {
@@ -451,18 +452,17 @@ describe('real wasm state geometry and committed-boundary growth', () => {
       // Every alternating value is a real mutation of the same bounded slot.
       // Exhaust the actual native journal; no fabricated entries or codec.
       const values = Uint32Array.from({ length: 20_000 }, (_, i) => (i % 2 === 0 ? 80 : 90));
-      expect(execute(values)).toBe(ErrorCode.JOURNAL_OVERFLOW);
+      expect(execute(values)).toBe(ErrorCode.OK);
       expect(backend.undoHasOverflow()).toBe(true);
-      expect(backend.undoCheckpoint(state)).toBe(attemptCheckpoint);
-      expect(backend.serialize(state, reducer)).toEqual(accepted);
-      expect(execute(new Uint32Array([100]))).toBe(ErrorCode.JOURNAL_OVERFLOW);
-      expect(backend.serialize(state, reducer)).toEqual(accepted);
-      expect(backend.evictExpired(state, reducer, 100, delta)).toEqual({
-        ok: false,
-        error: ErrorCode.JOURNAL_OVERFLOW,
-      });
-      expect(backend.serialize(state, reducer)).toEqual(accepted);
-      expect(backend.undoCheckpoint(state)).toBe(attemptCheckpoint);
+      expect(backend.undoCheckpoint(state)).toBe(UNDO_POSITION_OVERFLOWED);
+      expect(backend.mapGet(state, reducer, 0, 7)).toStrictEqual({ ok: true, value: 90 });
+      // The overflowed window still lands writes, and TTL eviction runs in the shadow.
+      expect(execute(new Uint32Array([100]))).toBe(ErrorCode.OK);
+      expect(backend.mapGet(state, reducer, 0, 7)).toStrictEqual({ ok: true, value: 100 });
+      expect(backend.evictExpired(state, reducer, 100, delta)).toMatchObject({ ok: true, count: 1 });
+      expect(backend.mapGet(state, reducer, 0, 7)).toStrictEqual({ ok: true, value: undefined });
+      expect(backend.undoHasOverflow()).toBe(true);
+      expect(backend.undoCheckpoint(state)).toBe(UNDO_POSITION_OVERFLOWED);
       const exported = backend.deltaExportSegment(state, checkpoint, attemptCheckpoint);
       if (!delta) {
         // Undo-only rows have no redo lane: a paired export is refused, never returned as empty.
@@ -471,6 +471,8 @@ describe('real wasm state geometry and committed-boundary growth', () => {
 
       backend.undoRollback(state, checkpoint);
       expect(backend.serialize(state, reducer)).toEqual(committed);
+      expect(backend.undoHasOverflow()).toBe(false);
+      expect(backend.undoCheckpoint(state)).toBe(checkpoint);
       backend.undoCommit(state, checkpoint);
       if (delta) {
         if (!exported.ok) throw new Error(`unexpected delta export error ${exported.error}`);
@@ -763,7 +765,7 @@ describe('real wasm state geometry and committed-boundary growth', () => {
     expect(() => backend.deserialize(bitmapProgram, badBitmap)).toThrow(VmStateAdmissionError);
   });
 
-  it('propagates nested element journal refusal with an exact real-WASM accepted prefix', async () => {
+  it('lands nested element writes in the overflow shadow with exact real-WASM rollback', async () => {
     const wasmBytes = await Bun.file(WASM_PATH).arrayBuffer();
     for (const flat of [false, true]) {
       for (const delta of [false, true]) {
@@ -872,68 +874,32 @@ describe('real wasm state geometry and committed-boundary growth', () => {
         const columns = flat
           ? [new Uint32Array([typeId]), new Uint32Array([0, 128]), keys, values]
           : [new Uint32Array(128).fill(typeId), keys, values];
-        expect(execute(nestedProgram, columns, flat ? 1 : 128)).toBe(ErrorCode.JOURNAL_OVERFLOW);
+        expect(execute(nestedProgram, columns, flat ? 1 : 128)).toBe(ErrorCode.OK);
         expect(invoke(exports, 'vm_undo_has_overflow')).toBe(1);
-        const end = invoke(exports, 'vm_undo_checkpoint', statePtr);
-        expect(end).toBeGreaterThan(checkpoint);
-        const after = new Uint8Array(memory.buffer, statePtr, size).slice();
-        const accepted = new DataView(after.buffer).getUint32(32 + 8, true);
-        expect(accepted).toBeGreaterThan(0);
-        expect(accepted).toBeLessThan(128);
+        // The sentinel crosses the JS boundary as a signed i32, so it is normalised before comparison.
+        expect(invoke(exports, 'vm_undo_checkpoint', statePtr) >>> 0).toBe(UNDO_POSITION_OVERFLOWED);
+        // The shadow lands every nested element of the batch: the overflow is in the window, not the writes.
         for (const key of keys) {
           expect(invoke(exports, 'vm_map_get', statePtr, size, 0, key, outPtr)).toBe(ErrorCode.OK);
           const record = new DataView(memory.buffer, outPtr, 8);
-          expect(record.getUint32(0, true)).toBe(key <= accepted ? 1 : 0);
-          if (key <= accepted) expect(record.getUint32(4, true)).toBe(key * 10);
+          expect(record.getUint32(0, true)).toBe(1);
+          expect(record.getUint32(4, true)).toBe(key * 10);
         }
-        const exported = {
-          undo: new Uint8Array(),
-          redo: new Uint8Array(),
-        };
         if (delta) {
-          expect(invoke(exports, 'vm_delta_export_segment', statePtr, size, checkpoint, end, outPtr)).toBe(
-            ErrorCode.OK,
-          );
-          expect(new DataView(memory.buffer).getUint32(outPtr, true)).toBe(end - checkpoint);
-          const bytes = invoke(exports, 'vm_delta_export_len_bytes');
-          exported.undo = new Uint8Array(memory.buffer, invoke(exports, 'vm_delta_export_undo_ptr'), bytes).slice();
-          exported.redo = new Uint8Array(memory.buffer, invoke(exports, 'vm_delta_export_redo_ptr'), bytes).slice();
+          // An overflowed window has no savepoint to export: the sentinel `to` is refused as InvalidState.
+          expect(
+            invoke(exports, 'vm_delta_export_segment', statePtr, size, checkpoint, UNDO_POSITION_OVERFLOWED, outPtr),
+          ).toBe(ErrorCode.INVALID_STATE);
         }
         expect(invoke(exports, 'vm_undo_rollback', statePtr, size, checkpoint, outPtr)).toBe(ErrorCode.OK);
         expect(new Uint8Array(memory.buffer, statePtr, size)).toEqual(before);
-        expect(execute(nestedProgram, columns, flat ? 1 : 128)).toBe(ErrorCode.JOURNAL_OVERFLOW);
+        expect(invoke(exports, 'vm_undo_has_overflow')).toBe(0);
+        expect(invoke(exports, 'vm_undo_checkpoint', statePtr)).toBe(checkpoint);
+        // The rollback ended the overflow: the same batch from the same image overflows again.
+        expect(execute(nestedProgram, columns, flat ? 1 : 128)).toBe(ErrorCode.OK);
+        expect(invoke(exports, 'vm_undo_has_overflow')).toBe(1);
+        expect(invoke(exports, 'vm_undo_rollback', statePtr, size, checkpoint, outPtr)).toBe(ErrorCode.OK);
         expect(new Uint8Array(memory.buffer, statePtr, size)).toEqual(before);
-        if (delta) {
-          const segmentPtr = dataStart;
-          new Uint8Array(memory.buffer).set(exported.redo, segmentPtr);
-          expect(
-            invoke(
-              exports,
-              'vm_delta_apply_rollforward_segment',
-              statePtr,
-              size,
-              segmentPtr,
-              exported.redo.length,
-              24,
-              outPtr,
-            ),
-          ).toBe(ErrorCode.OK);
-          expect(new Uint8Array(memory.buffer, statePtr, size)).toEqual(after);
-          new Uint8Array(memory.buffer).set(exported.undo, segmentPtr);
-          expect(
-            invoke(
-              exports,
-              'vm_delta_apply_rollback_segment',
-              statePtr,
-              size,
-              segmentPtr,
-              exported.undo.length,
-              24,
-              outPtr,
-            ),
-          ).toBe(ErrorCode.OK);
-          expect(new Uint8Array(memory.buffer, statePtr, size)).toEqual(before);
-        }
         expect(invoke(exports, 'vm_undo_rollback', statePtr, size, 0, outPtr)).toBe(ErrorCode.OK);
         expect(new Uint8Array(memory.buffer, statePtr, size)).toEqual(initial);
       }

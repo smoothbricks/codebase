@@ -26,7 +26,7 @@ import type {
   StructMapArenaField,
   VoProgramMetadata,
 } from './types.js';
-import { AggType, ErrorCode, SlotType, SlotTypeFlag, StructFieldType } from './types.js';
+import { AggType, ErrorCode, SlotType, SlotTypeFlag, StructFieldType, UNDO_POSITION_OVERFLOWED } from './types.js';
 import { VoProgramAdmissionUnavailableError } from './vo-program-metadata.js';
 import { align8, loadWasmBytes, WasmHostRegion } from './wasm-memory-contract.js';
 
@@ -337,8 +337,6 @@ function vmErrorCode(status: number): ErrorCode {
       return ErrorCode.COUNT_OVERFLOW;
     case ErrorCode.METADATA_CONFLICT:
       return ErrorCode.METADATA_CONFLICT;
-    case ErrorCode.JOURNAL_OVERFLOW:
-      return ErrorCode.JOURNAL_OVERFLOW;
     case ErrorCode.DELTA_LANE_MISMATCH:
       return ErrorCode.DELTA_LANE_MISMATCH;
     case ErrorCode.SPECULATION_ACTIVE:
@@ -448,6 +446,13 @@ export async function createColumineWasmBackend(wasmBytes: BufferSource): Promis
     return status;
   };
 
+  /**
+   * Undo a failed attempt back to the position taken before it. An attempt that began in an overflowed window has no
+   * restorable start: its writes stay for the window's owner, who rolls back past the overflow.
+   */
+  const rollbackAttempt = (state: WasmStateHandle, attemptCheckpoint: number): number =>
+    attemptCheckpoint === UNDO_POSITION_OVERFLOWED ? ErrorCode.OK : rollback(state, attemptCheckpoint);
+
   // Columns are uploaded after the program, then two parallel u32 tables:
   // each column's pointer, then its exact uploaded byte length, so the VM
   // bounds every column read by its source rather than by linear memory.
@@ -516,7 +521,7 @@ export async function createColumineWasmBackend(wasmBytes: BufferSource): Promis
     const state = assertWasmStateHandle(stateHandle);
     for (;;) {
       const { statePtr, programPtr, colPtrsPtr, colLengthsPtr } = prepareExecution(state, program, columns);
-      const attemptCheckpoint = wasmInstance.exports.vm_undo_checkpoint(statePtr);
+      const attemptCheckpoint = wasmInstance.exports.vm_undo_checkpoint(statePtr) >>> 0;
       const result = delta
         ? wasmInstance.exports.vm_execute_batch_delta(
             statePtr,
@@ -544,7 +549,7 @@ export async function createColumineWasmBackend(wasmBytes: BufferSource): Promis
         // persist it, so the rollback below undoes exactly the mutations it logged.
         // Without it, the unmodified host handle is the committed authority.
         if (undoEnabled) copyStateOut(state, statePtr, state.size, state.size);
-        const rolledBack = rollback(state, attemptCheckpoint);
+        const rolledBack = rollbackAttempt(state, attemptCheckpoint);
         if (rolledBack !== ErrorCode.OK) return rolledBack;
         if (result !== ErrorCode.NEEDS_GROWTH || undoEnabled) return result;
         const growthResult = growFromAuthority(state, program);
@@ -840,11 +845,11 @@ export async function createColumineWasmBackend(wasmBytes: BufferSource): Promis
     evictExpired(stateHandle, program, now, delta) {
       const state = assertWasmStateHandle(stateHandle);
       const statePtr = stageState(state, 0);
-      const attemptCheckpoint = wasmInstance.exports.vm_undo_checkpoint(statePtr);
+      const attemptCheckpoint = wasmInstance.exports.vm_undo_checkpoint(statePtr) >>> 0;
       const status = wasmInstance.exports.vm_evict_all_expired(statePtr, state.size, now, delta ? 1 : 0);
       if (status !== ErrorCode.OK) {
         if (undoEnabled) copyStateOut(state, statePtr, state.size, state.size);
-        const rolledBack = rollback(state, attemptCheckpoint);
+        const rolledBack = rollbackAttempt(state, attemptCheckpoint);
         return { ok: false, error: vmErrorCode(rolledBack === ErrorCode.OK ? status : rolledBack) };
       }
       const count = wasmInstance.exports.vm_get_evicted_count();
@@ -878,7 +883,8 @@ export async function createColumineWasmBackend(wasmBytes: BufferSource): Promis
 
     undoCheckpoint(stateHandle) {
       assertWasmStateHandle(stateHandle);
-      return wasmInstance.exports.vm_undo_checkpoint(wasmInstance.region.offset);
+      // The wasm u32 arrives as an i32; positions are u32, the overflow sentinel included.
+      return wasmInstance.exports.vm_undo_checkpoint(wasmInstance.region.offset) >>> 0;
     },
 
     undoRollback(stateHandle, checkpointPos) {

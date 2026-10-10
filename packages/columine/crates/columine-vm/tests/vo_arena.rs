@@ -33,7 +33,7 @@ use columine_vm::state_init::{
     calculate_grown_state_size, calculate_state_size, init_state,
 };
 use columine_vm::struct_map::StructMapSlot;
-use columine_vm::vm::{UNDO_CAPACITY, Vm, u32s_as_bytes};
+use columine_vm::vm::{UNDO_POSITION_OVERFLOWED, Vm, u32s_as_bytes};
 use proptest::prelude::*;
 
 // Wire bytes of the program and descriptor contract.
@@ -1126,10 +1126,11 @@ fn empty_payload_after_abandoned_frame_survives_growth_compaction() {
     assert_tightly_compacted(&next, &[1, 2]);
 }
 
-/// Budget exhaustion refuses the first unjournaled row. The accepted prefix
-/// remains an exact physical segment, and the window stays unusable until end.
+/// Budget exhaustion lands the whole batch. The window overflows at its first
+/// unjournaled row, the shadow keeps the pre-batch image, and rollback to the
+/// pre-batch savepoint restores that image byte-exact on both lanes.
 #[test]
-fn journal_overflow_refuses_before_write_and_restores_the_exact_prefix_on_both_lanes() {
+fn journal_overflow_lands_the_batch_and_rolls_back_byte_exact_on_both_lanes() {
     const ROWS: u32 = 10_000;
     const ONE: &[u8] = &[1];
     let prog = program(
@@ -1152,59 +1153,80 @@ fn journal_overflow_refuses_before_write_and_restores_the_exact_prefix_on_both_l
         let checkpoint = vm.undo_checkpoint();
         let rows = Rows::new(&[], (1..=ROWS).map(|key| (key, key, ONE)));
         assert_eq!(
-            ErrorCode::JournalOverflow,
+            ErrorCode::Ok,
             run_lane(&mut vm, &mut state, &prog, &rows, delta),
+            "delta={delta}: the batch must land past the record budget"
         );
         assert!(
-            vm.undo_status().overflow,
+            vm.undo_has_overflow(),
             "delta={delta}: real journal budget exhausted"
         );
-        let end = vm.undo_checkpoint();
-        assert!(end <= UNDO_CAPACITY);
-        let accepted = StructMapSlot::bind(&state, SLOT).size(&state) - 1;
-        assert!(
-            accepted > 0 && accepted < ROWS,
-            "a genuine accepted prefix precedes refusal"
-        );
-        assert_eq!(3 + accepted, arena_used(&state));
         assert_eq!(
             None,
-            StructMapSlot::bind(&state, SLOT).find(&state, accepted + 1)
+            vm.undo_refusal(),
+            "delta={delta}: overflow is not a refusal"
         );
-        let after_prefix = state.clone();
+        assert_eq!(UNDO_POSITION_OVERFLOWED, vm.undo_checkpoint());
+        assert_eq!(ROWS + 1, StructMapSlot::bind(&state, SLOT).size(&state));
+        assert_eq!(3 + ROWS, arena_used(&state));
+        let after_batch = state.clone();
+
+        // The overflowed batch lands exactly what an undo-off run of it lands.
+        let mut reference = before_attempt.clone();
+        let mut reference_vm = Vm::default();
+        assert_eq!(
+            ErrorCode::Ok,
+            run(&mut reference_vm, &mut reference, &prog, &rows)
+        );
+        assert_eq!(
+            reference, after_batch,
+            "delta={delta}: the overflowed batch must land every row exactly"
+        );
+
         if delta {
+            // The pre-overflow prefix exports while overflowed and replays exactly.
             assert_eq!(
-                Ok(end - checkpoint),
-                vm.delta_export_segment(checkpoint, end)
+                Ok(checkpoint - window),
+                vm.delta_export_segment(window, checkpoint)
             );
             assert!(vm.delta_export_overflow());
             let undo = vm.delta_export_undo().to_vec();
             let redo = vm.delta_export_redo().to_vec();
             let mut replay = Vm::default();
-            let mut undone = after_prefix.clone();
+            let mut undone = before_attempt.clone();
             replay_rollback(&mut replay, &mut undone, &undo);
-            assert_eq!(undone, before_attempt);
-            let mut redone = before_attempt.clone();
+            assert_eq!(undone, committed);
+            let mut redone = committed.clone();
             replay_rollforward(&mut replay, &mut redone, &redo);
-            assert_eq!(redone, after_prefix);
+            assert_eq!(redone, before_attempt);
         }
+
+        // A write past overflow lands unrecorded; the overflow stays set.
         let next = Rows::of([(1, &[0u8, 1, 255][..])]);
         assert_eq!(
-            ErrorCode::JournalOverflow,
+            ErrorCode::Ok,
             run_lane(&mut vm, &mut state, &prog, &next, delta)
         );
-        assert_eq!(after_prefix, state, "sticky refusal writes no bytes");
-        assert_eq!(end, vm.undo_checkpoint());
+        assert_ne!(
+            after_batch, state,
+            "delta={delta}: a write past overflow must change the image"
+        );
+        assert!(vm.undo_has_overflow());
+        assert_eq!(UNDO_POSITION_OVERFLOWED, vm.undo_checkpoint());
+
+        // Rollback to the pre-batch savepoint restores its image byte-exact.
         rollback(&mut vm, &mut state, checkpoint);
         assert_eq!(
             before_attempt, state,
-            "rollback preserves the earlier window"
+            "rollback to the pre-batch savepoint restores its image byte-exact"
         );
+        assert!(!vm.undo_has_overflow());
+        assert_eq!(checkpoint, vm.undo_checkpoint());
         assert_eq!(
-            ErrorCode::JournalOverflow,
+            ErrorCode::Ok,
             run_lane(&mut vm, &mut state, &prog, &next, delta)
         );
-        assert_eq!(before_attempt, state);
+        assert!(vm.undo_checkpoint() > checkpoint);
         rollback(&mut vm, &mut state, window);
         assert_eq!(
             committed, state,

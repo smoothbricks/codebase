@@ -21,7 +21,7 @@ use columine_vm::hashset_ops::{batch_set_insert, batch_set_remove, bind_slot_set
 use columine_vm::hooks::NoVm;
 use columine_vm::meta::SlotMetaView;
 use columine_vm::slot_growth::slot_data_size;
-use columine_vm::vm::{UNDO_CAPACITY, Vm};
+use columine_vm::vm::{UNDO_CAPACITY, UNDO_POSITION_OVERFLOWED, Vm};
 use proptest::prelude::*;
 // The `hashmap_ops::Strategy` ENUM above shadows the prelude's `Strategy`
 // TRAIT (explicit import beats glob); re-import the trait under an alias so
@@ -1874,7 +1874,7 @@ fn map_and_set_ttl_refresh_remove_restore_live_index_and_dead_destinations() {
 }
 
 #[test]
-fn map_overflow_mid_batch_refuses_current_operation_and_preserves_exact_prefix() {
+fn map_overflow_mid_batch_lands_whole_batch_and_rolls_back_exact() {
     for delta in [false, true] {
         let mut state = mk_slot_state(16, 0x00);
         let meta = meta_of(&state);
@@ -1909,16 +1909,13 @@ fn map_overflow_mid_batch_refuses_current_operation_and_preserves_exact_prefix()
                 CmpType::U32,
                 delta,
             ),
-            ErrorCode::JournalOverflow,
+            ErrorCode::Ok,
         );
-        let accepted = bind_slot_map(&meta)
-            .get_u32(&state, 3)
-            .expect("seed remains") as usize;
         assert!(
-            accepted > 0 && accepted < keys.len(),
-            "the overflow must occur mid-batch"
+            vm.undo_status().overflow,
+            "the batch overflowed the journal into a shadow"
         );
-        assert!(vm.undo_checkpoint() <= UNDO_CAPACITY);
+        assert_eq!(UNDO_POSITION_OVERFLOWED, vm.undo_checkpoint());
         let mut expected = before.clone();
         assert_eq!(
             batch_map_upsert(
@@ -1927,20 +1924,22 @@ fn map_overflow_mid_batch_refuses_current_operation_and_preserves_exact_prefix()
                 &mut expected,
                 &meta,
                 0,
-                &keys[..accepted],
-                &values[..accepted],
+                &keys,
+                &values,
                 None,
                 CmpType::U32,
                 &mut NoVm::default(),
             ),
             ErrorCode::Ok,
         );
+        assert_eq!(state, expected, "the overflowing batch lands in full");
         assert_eq!(
-            state, expected,
-            "the first refusing update performs no write"
+            bind_slot_map(&meta)
+                .get_u32(&state, 3)
+                .expect("key 3 remains"),
+            *values.last().expect("batch is non-empty"),
         );
-        let prefix = state.clone();
-        let checkpoint = vm.undo_checkpoint();
+        // Overflow is sticky: a later update also lands and stays unrecorded.
         assert_eq!(
             journal_map_upsert(
                 &mut vm,
@@ -1952,27 +1951,37 @@ fn map_overflow_mid_batch_refuses_current_operation_and_preserves_exact_prefix()
                 CmpType::U32,
                 delta,
             ),
-            ErrorCode::JournalOverflow,
+            ErrorCode::Ok,
+        );
+        assert_eq!(UNDO_POSITION_OVERFLOWED, vm.undo_checkpoint());
+        assert_eq!(
+            bind_slot_map(&meta)
+                .get_u32(&state, 3)
+                .expect("key 3 remains"),
+            u32::MAX,
+        );
+        let overflowed = state.clone();
+        assert_eq!(
+            Err(ErrorCode::InvalidState),
+            vm.undo_rollback(&mut state, UNDO_POSITION_OVERFLOWED),
         );
         assert_eq!(
-            state, prefix,
-            "overflow remains a refusal until the window ends"
+            overflowed, state,
+            "an overflowed savepoint rollback changes nothing"
         );
-        assert_eq!(vm.undo_checkpoint(), checkpoint);
-        if delta {
-            assert_exported_images(&mut vm, 0, &before, &state);
-        }
         vm.undo_rollback(&mut state, 0)
-            .expect("overflowed window still owns its valid prefix");
+            .expect("overflowed window still owns its savepoint");
         assert_eq!(
             state, before,
-            "valid-prefix rollback includes allocated aux and flags"
+            "shadow restore and journal replay return the byte-exact image"
         );
+        assert!(!vm.undo_has_overflow());
+        assert_eq!(0, vm.undo_checkpoint());
     }
 }
 
 #[test]
-fn set_overflow_mid_batch_preserves_only_the_accepted_physical_prefix() {
+fn set_overflow_mid_batch_lands_whole_batch_and_rolls_back_exact() {
     for delta in [false, true] {
         let mut state = mk_slot_state(32768, 0x01);
         let meta = meta_of(&state);
@@ -1983,11 +1992,13 @@ fn set_overflow_mid_batch_preserves_only_the_accepted_physical_prefix() {
         let keys: Vec<u32> = (1..=UNDO_CAPACITY + 10).collect();
         assert_eq!(
             vm.set_insert(delta, &mut state, 0, &keys, None),
-            ErrorCode::JournalOverflow,
+            ErrorCode::Ok,
         );
-        let accepted = meta.size(&state) as usize;
-        assert!(accepted > 0 && accepted < keys.len());
-        assert!(vm.undo_checkpoint() <= UNDO_CAPACITY);
+        assert!(
+            vm.undo_status().overflow,
+            "the insertion overflowed the journal into a shadow"
+        );
+        assert_eq!(UNDO_POSITION_OVERFLOWED, vm.undo_checkpoint());
         let mut expected = before.clone();
         assert_eq!(
             batch_set_insert(
@@ -1995,33 +2006,39 @@ fn set_overflow_mid_batch_preserves_only_the_accepted_physical_prefix() {
                 &mut expected,
                 &meta,
                 0,
-                &keys[..accepted],
+                &keys,
                 None,
                 &mut NoVm::default()
             ),
             ErrorCode::Ok,
         );
+        assert_eq!(state, expected, "the overflowing insertion lands in full");
+        assert_eq!(meta.size(&state) as usize, keys.len());
+        // Overflow is sticky: a later erase also lands and stays unrecorded.
+        assert_eq!(vm.set_remove(delta, &mut state, 0, &[1]), ErrorCode::Ok,);
+        assert_eq!(UNDO_POSITION_OVERFLOWED, vm.undo_checkpoint());
         assert_eq!(
-            state, expected,
-            "the refusing insertion never touches its EMPTY cell"
+            meta.size(&state) as usize,
+            keys.len() - 1,
+            "the erase lands after overflow"
         );
-        let prefix = state.clone();
-        let checkpoint = vm.undo_checkpoint();
+        let overflowed = state.clone();
         assert_eq!(
-            vm.set_remove(delta, &mut state, 0, &[1]),
-            ErrorCode::JournalOverflow,
+            Err(ErrorCode::InvalidState),
+            vm.undo_rollback(&mut state, UNDO_POSITION_OVERFLOWED),
         );
-        assert_eq!(state, prefix, "no erase runs after journal refusal");
-        assert_eq!(vm.undo_checkpoint(), checkpoint);
-        if delta {
-            assert_exported_images(&mut vm, 0, &before, &state);
-        }
+        assert_eq!(
+            overflowed, state,
+            "an overflowed savepoint rollback changes nothing"
+        );
         vm.undo_rollback(&mut state, 0)
-            .expect("set valid-prefix checkpoint");
+            .expect("overflowed set window still owns its savepoint");
         assert_eq!(
             state, before,
             "all EMPTY cells and metadata restore byte-exact"
         );
+        assert!(!vm.undo_has_overflow());
+        assert_eq!(0, vm.undo_checkpoint());
     }
 }
 

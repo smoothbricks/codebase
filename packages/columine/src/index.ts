@@ -87,6 +87,7 @@ export {
   SlotTypeFlag,
   StructFieldType,
   TtlStartOf,
+  UNDO_POSITION_OVERFLOWED,
   ValueType,
 } from './types.js';
 export { encodeVoProgramMetadata, VoProgramAdmissionUnavailableError } from './vo-program-metadata.js';

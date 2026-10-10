@@ -15,7 +15,8 @@ use columine_vm::meta::SlotMetaView;
 use columine_vm::state_init::{DEFAULT_ACCEPTED_PROGRAM_MAGICS, calculate_state_size, init_state};
 use columine_vm::undo_log::{FLAT_UNDO_ENTRY_SIZE, FlatUndoEntry, FlatUndoOp};
 use columine_vm::vm::{
-    UNDO_CAPACITY, Vm, f64s_as_bytes, u32s_as_bytes, write_derived_facts_header,
+    UNDO_CAPACITY, UNDO_POSITION_OVERFLOWED, Vm, f64s_as_bytes, u32s_as_bytes,
+    write_derived_facts_header,
 };
 use proptest::prelude::*;
 use proptest::strategy::Strategy as PropStrategy;
@@ -582,11 +583,15 @@ fn derived_fact_insert_update_and_retract_restore_full_identity_and_dead_values(
     }
 }
 
-/// The capture reserves its records before its closure runs. Two real flag bytes
-/// need two records and one remains, so the refusal writes no flag, no image
-/// byte, and no journal entry, and leaves the last paired segment intact.
+/// Two real flag bytes need two records and one remains, so the capture
+/// overflows the window: the image is copied into a shadow before its closure
+/// runs, the closure writes both flags unrecorded, and the window reports the
+/// overflow at the sentinel checkpoint. Rollback restores every flag and byte
+/// exactly, to the midpoint savepoint taken before the capture and then to the
+/// pre-fill savepoint. The prefix still exports as a paired segment, marked
+/// overflowed, and its redo lane replays.
 #[test]
-fn capture_budget_refusal_never_runs_the_closure_or_changes_flags_image_or_journal() {
+fn capture_past_the_record_budget_overflows_to_a_shadow_and_rolls_back_exactly() {
     for delta in [false, true] {
         let mut state = mk_slot_state(16, SlotType::HashMap);
         let slot_flag = STATE_HEADER_SIZE + SlotMetaOffset::CHANGE_FLAGS;
@@ -623,23 +628,49 @@ fn capture_budget_refusal_never_runs_the_closure_or_changes_flags_image_or_journ
             image[slot_flag as usize] = 0;
             image[derived_flag as usize] = 0;
         });
-        assert_eq!(result, Err(ErrorCode::JournalOverflow));
+        assert_eq!(result, Ok(()), "a capture past the budget succeeds");
         assert!(
-            !called,
-            "a refused reservation must precede arbitrary callback effects"
+            called,
+            "the overflowing capture runs its closure unrecorded"
         );
+        assert!(vm.undo_has_overflow());
+        assert_eq!(vm.undo_checkpoint(), UNDO_POSITION_OVERFLOWED);
+        assert_eq!(state[slot_flag as usize], 0, "the slot flag write lands");
         assert_eq!(
-            state, before,
-            "flags, derived flags and every emitted byte are unchanged"
+            state[derived_flag as usize], 0,
+            "the derived flag write lands"
         );
-        assert_eq!(vm.undo_checkpoint(), checkpoint);
         if delta {
             assert_eq!(Ok(checkpoint), vm.delta_export_segment(0, checkpoint));
+            assert!(
+                vm.delta_export_overflow(),
+                "an export taken while overflowed says so"
+            );
             assert_eq!(vm.delta_export_undo().to_vec(), undo);
             assert_eq!(vm.delta_export_redo().to_vec(), redo);
+            let mut replay = Vm::default();
+            let mut redone = initial.clone();
+            replay
+                .delta_apply_rollforward_segment(&mut redone, &redo, FLAT_UNDO_ENTRY_SIZE)
+                .expect("the pre-overflow redo lane replays");
+            assert_eq!(
+                redone, before,
+                "redo restores the pre-overflow prefix exactly"
+            );
         }
+        vm.undo_rollback(&mut state, checkpoint)
+            .expect("the midpoint savepoint before the overflow is exact");
+        assert_eq!(
+            state, before,
+            "the shadow restores the midpoint image and flags"
+        );
+        assert!(!vm.undo_has_overflow());
+        assert_eq!(vm.undo_checkpoint(), checkpoint);
         vm.undo_rollback(&mut state, 0)
-            .expect("real prefix still rolls back");
-        assert_eq!(state, initial);
+            .expect("the pre-fill savepoint is exact");
+        assert_eq!(
+            state, initial,
+            "the pre-fill savepoint restores every flag and byte"
+        );
     }
 }

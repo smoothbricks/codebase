@@ -140,15 +140,13 @@ export interface UndoStage {
    */
   checkpoint(state: StateHandle): VmReadResult<UndoToken>;
   /**
-   * Roll back all state mutations since the checkpoint token.
-   * Replays the undo log in reverse to restore pre-speculation state.
+   * Roll back all state mutations since the checkpoint token: an overflowed window restores its shadow first, then the
+   * undo log replays in reverse, so the state is exactly the checkpoint's image either way.
    *
    * @param state - State handle to roll back
    * @param token - Token from a prior checkpoint() call
-   * @returns 'ok' if every write in the window was journaled; 'overflow' if the window refused a write or was opened
-   *   refused (its memory could not back it), in which case the exact valid prefix was rolled back (no snapshot restore)
    */
-  rollback(state: StateHandle, token: UndoToken): 'ok' | 'overflow';
+  rollback(state: StateHandle, token: UndoToken): void;
   /**
    * Commit speculative changes — discards undo entries since the token.
    * After commit, the mutations become permanent and cannot be rolled back.
@@ -241,11 +239,10 @@ function createUndoStage(backend: ColumineBackend): UndoStage {
       return { ok: true, value: token };
     },
 
-    rollback(state: StateHandle, token: UndoToken): 'ok' | 'overflow' {
+    rollback(state: StateHandle, token: UndoToken): void {
       const internal = assertInternalUndoToken(token);
 
       backend.undoRollback(state, internal.position);
-      return backend.undoHasOverflow() ? 'overflow' : 'ok';
     },
 
     commit(state: StateHandle, token: UndoToken): void {

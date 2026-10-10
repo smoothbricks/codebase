@@ -15,13 +15,12 @@ use columine_vm::state_init::{
 };
 use columine_vm::struct_map::{StructMap2Slot, StructMapSlot};
 use columine_vm::vm::{
-    CheckedMap, CheckedSet, CheckedStructMap, UNDO_CAPACITY, Vm, f64s_as_bytes, i64s_as_bytes,
-    u32s_as_bytes,
+    CheckedMap, CheckedSet, CheckedStructMap, UNDO_CAPACITY, UNDO_POSITION_OVERFLOWED, Vm,
+    f64s_as_bytes, i64s_as_bytes, u32s_as_bytes,
 };
 
 const OK: u32 = ErrorCode::Ok as u32;
 const NEEDS_GROWTH: u32 = ErrorCode::NeedsGrowth as u32;
-const JOURNAL_OVERFLOW: u32 = ErrorCode::JournalOverflow as u32;
 
 // =============================================================================
 // Program builders (, 1200-1293, 1530-1600, 1957-2036,
@@ -2691,11 +2690,13 @@ fn assert_full_image_roundtrip(vm: &mut Vm, before: &[u8], after: &[u8], checkpo
 }
 
 /// Real alternating writes fill the journal through `execute_batch_delta`. The
-/// first refused write changes nothing and returns JournalOverflow, the refusal
-/// is sticky, and the accepted prefix still rolls back and redoes to exact
-/// images from its start and from its midpoint.
+/// first write the budget cannot cover overflows the window into a shadow: it
+/// still returns Ok and lands, and every later write runs unrecorded. The
+/// pre-overflow prefix still rolls back and redoes to exact images from its
+/// start and from its midpoint, and the overflowed window rolls back to a
+/// pre-overflow savepoint byte for byte.
 #[test]
-fn journal_overflow_refuses_prewrite_and_accepted_prefix_stays_exact() {
+fn journal_overflow_shadows_and_prefix_stays_exact() {
     let mut init_code = Vec::new();
     init_code.extend(slot_def(0, 0x00, 16, 0));
     let reduce = [0x22, 0, 0, 1]; // BATCH_MAP_UPSERT_LAST slot=0 key=c0 val=c1
@@ -2715,12 +2716,12 @@ fn journal_overflow_refuses_prewrite_and_accepted_prefix_stays_exact() {
     assert_eq!(0, window_start);
 
     let mut midpoint: Option<(u32, Vec<u8>)> = None;
-    let mut refused: Option<(u32, Vec<u8>)> = None;
+    let mut prefix: Option<(u32, Vec<u8>)> = None;
     let mut writes = 0u32;
-    while refused.is_none() {
+    while !vm.undo_has_overflow() {
         assert!(
             writes < 2 * UNDO_CAPACITY,
-            "journal never refused a real write"
+            "journal never overflowed on a real write"
         );
         let checkpoint = vm.undo_checkpoint();
         let image = state.clone();
@@ -2734,41 +2735,41 @@ fn journal_overflow_refuses_prewrite_and_accepted_prefix_stays_exact() {
             0xBBBB_0002
         }];
         let cols: Vec<&[u8]> = vec![u32s_as_bytes(&keys), u32s_as_bytes(&vals)];
-        match vm.execute_batch_delta(&mut state, &prog, &cols, 1) {
-            OK => {}
-            JOURNAL_OVERFLOW => refused = Some((checkpoint, image)),
-            status => panic!("write {writes}: unexpected status {status}"),
+        assert_eq!(OK, vm.execute_batch_delta(&mut state, &prog, &cols, 1));
+        if vm.undo_has_overflow() {
+            prefix = Some((checkpoint, image));
         }
         writes += 1;
     }
-    let (refused_checkpoint, image_at_refusal) = refused.expect("the journal refused a write");
+    let (prefix_checkpoint, image_at_prefix) = prefix.expect("the overflowing write was recorded");
     let (midpoint_checkpoint, midpoint_image) = midpoint.expect("the window passed its midpoint");
     assert!(
-        refused_checkpoint + 4 >= UNDO_CAPACITY,
-        "refusal must come at capacity, not earlier (checkpoint {refused_checkpoint})"
+        prefix_checkpoint + 4 >= UNDO_CAPACITY,
+        "overflow must come at capacity, not earlier (checkpoint {prefix_checkpoint})"
     );
-    assert!(midpoint_checkpoint < refused_checkpoint);
+    assert!(midpoint_checkpoint < prefix_checkpoint);
     assert!(vm.undo_status().overflow);
-    // The refused write left the image and the checkpoint exactly as they were.
-    assert_eq!(image_at_refusal, state);
-    assert_eq!(refused_checkpoint, vm.undo_checkpoint());
+    assert_eq!(UNDO_POSITION_OVERFLOWED, vm.undo_checkpoint());
+    // The overflowing write itself landed in the image.
+    let overflowing_write = state.clone();
+    assert_ne!(
+        image_at_prefix, overflowing_write,
+        "the overflowing write landed"
+    );
 
-    // Sticky: a further write is refused and still changes nothing.
+    // Sticky overflow: a further write still lands and stays unrecorded.
     let keys = [7u32];
     let vals = [0xCCCC_0003u32];
     let cols: Vec<&[u8]> = vec![u32s_as_bytes(&keys), u32s_as_bytes(&vals)];
-    assert_eq!(
-        JOURNAL_OVERFLOW,
-        vm.execute_batch_delta(&mut state, &prog, &cols, 1)
-    );
-    assert_eq!(image_at_refusal, state);
-    assert_eq!(refused_checkpoint, vm.undo_checkpoint());
+    assert_eq!(OK, vm.execute_batch_delta(&mut state, &prog, &cols, 1));
+    assert_eq!(UNDO_POSITION_OVERFLOWED, vm.undo_checkpoint());
+    let overflowed = state.clone();
 
-    // Export the accepted prefix before any rollback truncates it.
+    // Export the pre-overflow prefix before any rollback truncates the journal.
     let entry = Vm::delta_export_entry_size();
     assert_eq!(
-        Ok(refused_checkpoint),
-        vm.delta_export_segment(window_start, refused_checkpoint)
+        Ok(prefix_checkpoint),
+        vm.delta_export_segment(window_start, prefix_checkpoint)
     );
     assert!(
         vm.delta_export_overflow(),
@@ -2777,14 +2778,14 @@ fn journal_overflow_refuses_prewrite_and_accepted_prefix_stays_exact() {
     let window_undo = vm.delta_export_undo().to_vec();
     let window_redo = vm.delta_export_redo().to_vec();
     assert_eq!(
-        Ok(refused_checkpoint - midpoint_checkpoint),
-        vm.delta_export_segment(midpoint_checkpoint, refused_checkpoint)
+        Ok(prefix_checkpoint - midpoint_checkpoint),
+        vm.delta_export_segment(midpoint_checkpoint, prefix_checkpoint)
     );
     let tail_undo = vm.delta_export_undo().to_vec();
     let tail_redo = vm.delta_export_redo().to_vec();
 
     let mut replay = Vm::default();
-    let mut at_midpoint = image_at_refusal.clone();
+    let mut at_midpoint = image_at_prefix.clone();
     replay
         .delta_apply_rollback_segment(&mut at_midpoint, &tail_undo, entry)
         .expect("valid tail undo");
@@ -2796,11 +2797,11 @@ fn journal_overflow_refuses_prewrite_and_accepted_prefix_stays_exact() {
         .delta_apply_rollforward_segment(&mut at_midpoint, &tail_redo, entry)
         .expect("valid tail redo");
     assert_eq!(
-        image_at_refusal, at_midpoint,
-        "the tail redo reaches the refusal image"
+        image_at_prefix, at_midpoint,
+        "the tail redo reaches the prefix image"
     );
 
-    let mut at_start = image_at_refusal.clone();
+    let mut at_start = image_at_prefix.clone();
     replay
         .delta_apply_rollback_segment(&mut at_start, &window_undo, entry)
         .expect("valid window undo");
@@ -2812,17 +2813,148 @@ fn journal_overflow_refuses_prewrite_and_accepted_prefix_stays_exact() {
         .delta_apply_rollforward_segment(&mut at_start, &window_redo, entry)
         .expect("valid window redo");
     assert_eq!(
-        image_at_refusal, at_start,
+        image_at_prefix, at_start,
         "the accepted window redoes exactly"
+    );
+
+    // The overflowed window rejects the overflow savepoint and changes nothing.
+    assert_eq!(
+        Err(ErrorCode::InvalidState),
+        vm.undo_rollback(&mut state, UNDO_POSITION_OVERFLOWED)
+    );
+    assert_eq!(
+        overflowed, state,
+        "an overflowed savepoint rollback changes nothing"
     );
 
     // The live journal rolls back to the midpoint, then to the start, exactly.
     vm.undo_rollback(&mut state, midpoint_checkpoint)
         .expect("valid checkpoint");
     assert_eq!(midpoint_image, state);
+    assert!(!vm.undo_has_overflow());
+    assert_eq!(midpoint_checkpoint, vm.undo_checkpoint());
     vm.undo_rollback(&mut state, window_start)
         .expect("valid checkpoint");
     assert_eq!(pristine, state);
+    assert!(!vm.undo_has_overflow());
+    assert_eq!(window_start, vm.undo_checkpoint());
+    vm.undo_commit();
+}
+
+/// Journal exhaustion inside one multi-row batch. Real alternating single-row
+/// writes first bring the journal to within a few entries of capacity. Then one
+/// batch of distinct rows runs past it: the batch returns Ok and every row
+/// lands, with the window overflowed into a shadow mid-batch. The savepoint
+/// before the batch and the window start each roll back to exact full images.
+#[test]
+fn journal_exhaustion_mid_batch_lands_whole_batch_and_rolls_back_exact() {
+    const FILL_MARGIN: u32 = 16;
+    const ROWS: u32 = 24;
+    let mut init_code = Vec::new();
+    init_code.extend(slot_def(0, 0x00, 16, 0));
+    let reduce = [0x22, 0, 0, 1]; // BATCH_MAP_UPSERT_LAST slot=0 key=c0 val=c1
+    let prog = program(1, 2, &init_code, &reduce);
+    let mut state = init(&prog);
+    let mut vm = Vm::default();
+
+    let seed_keys = [7u32];
+    let seed_vals = [1u32];
+    let seed_cols: Vec<&[u8]> = vec![u32s_as_bytes(&seed_keys), u32s_as_bytes(&seed_vals)];
+    assert_eq!(OK, vm.execute_batch(&mut state, &prog, &seed_cols, 1));
+    let pristine = state.clone();
+
+    vm.undo_enable(&state).expect("undo window opens");
+    let window_start = vm.undo_checkpoint();
+
+    // Real alternating writes until the journal has only a little room left.
+    let mut writes = 0u32;
+    while vm.undo_checkpoint() + FILL_MARGIN < UNDO_CAPACITY {
+        assert!(
+            writes < 2 * UNDO_CAPACITY,
+            "the fill never reached the margin"
+        );
+        let keys = [7u32];
+        let vals = [if writes.is_multiple_of(2) {
+            0xAAAA_0001u32
+        } else {
+            0xBBBB_0002
+        }];
+        let cols: Vec<&[u8]> = vec![u32s_as_bytes(&keys), u32s_as_bytes(&vals)];
+        assert_eq!(OK, vm.execute_batch_delta(&mut state, &prog, &cols, 1));
+        writes += 1;
+    }
+    let before_cp = vm.undo_checkpoint();
+    let image_before = state.clone();
+
+    // One batch of distinct values: each row changes the value cell, so every
+    // row prefix has its own image.
+    let keys = vec![7u32; ROWS as usize];
+    let values: Vec<u32> = (0..ROWS).map(|row| 0x1000_0000 + row).collect();
+    let cols: Vec<&[u8]> = vec![u32s_as_bytes(&keys), u32s_as_bytes(&values)];
+    assert_eq!(OK, vm.execute_batch_delta(&mut state, &prog, &cols, ROWS));
+    assert!(
+        vm.undo_status().overflow,
+        "the batch overflowed the journal mid-batch"
+    );
+    assert_eq!(UNDO_POSITION_OVERFLOWED, vm.undo_checkpoint());
+
+    // Every row landed: the image equals the same batch applied to a fresh VM
+    // from the pre-batch image.
+    let mut expected = image_before.clone();
+    let mut reference_vm = Vm::default();
+    assert_eq!(
+        OK,
+        reference_vm.execute_batch(&mut expected, &prog, &cols, ROWS)
+    );
+    assert_eq!(expected, state, "every row of the overflowing batch lands");
+
+    // Overflow is sticky: the next write also lands and stays unrecorded.
+    let next_keys = [7u32];
+    let next_vals = [0x2000_0000u32];
+    let next_cols: Vec<&[u8]> = vec![u32s_as_bytes(&next_keys), u32s_as_bytes(&next_vals)];
+    assert_eq!(OK, vm.execute_batch_delta(&mut state, &prog, &next_cols, 1));
+    assert_eq!(UNDO_POSITION_OVERFLOWED, vm.undo_checkpoint());
+    let overflowed = state.clone();
+
+    // An export naming the overflowed position is refused; one of the
+    // recorded prefix succeeds and is flagged as from an overflowed window.
+    assert_eq!(
+        Err(ErrorCode::InvalidState),
+        vm.delta_export_segment(before_cp, UNDO_POSITION_OVERFLOWED)
+    );
+    assert_eq!(
+        Ok(before_cp - window_start),
+        vm.delta_export_segment(window_start, before_cp)
+    );
+    assert!(
+        vm.delta_export_overflow(),
+        "an export from an overflowed window says so"
+    );
+    assert_eq!(
+        Err(ErrorCode::InvalidState),
+        vm.undo_rollback(&mut state, UNDO_POSITION_OVERFLOWED)
+    );
+    assert_eq!(
+        overflowed, state,
+        "an overflowed savepoint rollback changes nothing"
+    );
+
+    // Live rollbacks: the savepoint before the batch, then the window start.
+    vm.undo_rollback(&mut state, before_cp)
+        .expect("valid checkpoint");
+    assert_eq!(
+        image_before, state,
+        "the savepoint before the batch restores its image"
+    );
+    assert!(!vm.undo_has_overflow());
+    assert_eq!(before_cp, vm.undo_checkpoint());
+    vm.undo_rollback(&mut state, window_start)
+        .expect("valid checkpoint");
+    assert_eq!(
+        pristine, state,
+        "the window start restores the pristine image"
+    );
+    assert!(!vm.undo_has_overflow());
     vm.undo_commit();
 }
 
@@ -3627,136 +3759,6 @@ fn guarded_scatter_stale_stamp_bitset_nested_savepoints_roll_back_to_exact_image
     assert_eq!(
         before, state,
         "the outer window restores the stale stamp byte for byte"
-    );
-    vm.undo_commit();
-}
-
-/// Journal exhaustion inside one multi-row batch. Real alternating single-row
-/// writes first bring the journal to within a few entries of capacity. Then one
-/// batch of distinct rows runs into it. The accepted rows form an exact prefix:
-/// the image equals exactly that many rows applied, and the refused row onward
-/// changed nothing. No whole-batch atomicity is assumed. The pre-batch window
-/// and the accepted prefix each roll back and redo to exact full images.
-#[test]
-fn journal_exhaustion_mid_batch_keeps_accepted_prefix_exact() {
-    const FILL_MARGIN: u32 = 16;
-    const ROWS: u32 = 24;
-    let mut init_code = Vec::new();
-    init_code.extend(slot_def(0, 0x00, 16, 0));
-    let reduce = [0x22, 0, 0, 1]; // BATCH_MAP_UPSERT_LAST slot=0 key=c0 val=c1
-    let prog = program(1, 2, &init_code, &reduce);
-    let mut state = init(&prog);
-    let mut vm = Vm::default();
-
-    let seed_keys = [7u32];
-    let seed_vals = [1u32];
-    let seed_cols: Vec<&[u8]> = vec![u32s_as_bytes(&seed_keys), u32s_as_bytes(&seed_vals)];
-    assert_eq!(OK, vm.execute_batch(&mut state, &prog, &seed_cols, 1));
-    let pristine = state.clone();
-
-    vm.undo_enable(&state).expect("undo window opens");
-    let window_start = vm.undo_checkpoint();
-
-    // Real alternating writes until the journal has only a little room left.
-    let mut writes = 0u32;
-    while vm.undo_checkpoint() + FILL_MARGIN < UNDO_CAPACITY {
-        assert!(
-            writes < 2 * UNDO_CAPACITY,
-            "the fill never reached the margin"
-        );
-        let keys = [7u32];
-        let vals = [if writes.is_multiple_of(2) {
-            0xAAAA_0001u32
-        } else {
-            0xBBBB_0002
-        }];
-        let cols: Vec<&[u8]> = vec![u32s_as_bytes(&keys), u32s_as_bytes(&vals)];
-        assert_eq!(OK, vm.execute_batch_delta(&mut state, &prog, &cols, 1));
-        writes += 1;
-    }
-    let before_cp = vm.undo_checkpoint();
-    let image_before = state.clone();
-
-    // One batch of distinct values: each row changes the value cell, so every
-    // row prefix has its own image.
-    let keys = vec![7u32; ROWS as usize];
-    let values: Vec<u32> = (0..ROWS).map(|row| 0x1000_0000 + row).collect();
-    let cols: Vec<&[u8]> = vec![u32s_as_bytes(&keys), u32s_as_bytes(&values)];
-    assert_eq!(
-        JOURNAL_OVERFLOW,
-        vm.execute_batch_delta(&mut state, &prog, &cols, ROWS)
-    );
-    let after_cp = vm.undo_checkpoint();
-    assert!(vm.undo_status().overflow);
-    assert!(
-        before_cp < after_cp && after_cp <= UNDO_CAPACITY,
-        "some rows fit before the refusal"
-    );
-    let accepted_image = state.clone();
-
-    // The accepted image must be exactly one row prefix of this batch, applied
-    // through the same dispatch on a fresh VM from the pre-batch image.
-    let mut matching = Vec::new();
-    for rows in 0..=ROWS {
-        let mut reference = image_before.clone();
-        if rows > 0 {
-            let r_keys = &keys[..rows as usize];
-            let r_values = &values[..rows as usize];
-            let r_cols: Vec<&[u8]> = vec![u32s_as_bytes(r_keys), u32s_as_bytes(r_values)];
-            let mut reference_vm = Vm::default();
-            assert_eq!(
-                OK,
-                reference_vm.execute_batch(&mut reference, &prog, &r_cols, rows)
-            );
-        }
-        if reference == accepted_image {
-            matching.push(rows);
-        }
-    }
-    assert_eq!(
-        1,
-        matching.len(),
-        "the accepted image is exactly one row prefix"
-    );
-    let accepted = matching[0];
-    assert!(
-        (1..ROWS).contains(&accepted),
-        "rows fit, then the next row is refused: accepted {accepted} of {ROWS}"
-    );
-
-    // The refusal is sticky: the next write changes nothing either.
-    let next_keys = [7u32];
-    let next_vals = [0x2000_0000u32];
-    let next_cols: Vec<&[u8]> = vec![u32s_as_bytes(&next_keys), u32s_as_bytes(&next_vals)];
-    assert_eq!(
-        JOURNAL_OVERFLOW,
-        vm.execute_batch_delta(&mut state, &prog, &next_cols, 1)
-    );
-    assert_eq!(accepted_image, state);
-    assert_eq!(after_cp, vm.undo_checkpoint());
-
-    // Export both windows before any rollback truncates the journal.
-    let (undo_batch, redo_batch) = export_window(&mut vm, before_cp, after_cp);
-    let (undo_all, redo_all) = export_window(&mut vm, window_start, after_cp);
-    assert!(
-        vm.delta_export_overflow(),
-        "the overflow diagnostic stays set on export"
-    );
-    assert_window_replays(&image_before, &accepted_image, &undo_batch, &redo_batch);
-    assert_window_replays(&pristine, &accepted_image, &undo_all, &redo_all);
-
-    // Live nested rollbacks: the batch window, then the whole window.
-    vm.undo_rollback(&mut state, before_cp)
-        .expect("valid checkpoint");
-    assert_eq!(
-        image_before, state,
-        "the savepoint before the batch restores its image"
-    );
-    vm.undo_rollback(&mut state, window_start)
-        .expect("valid checkpoint");
-    assert_eq!(
-        pristine, state,
-        "the window start restores the pristine image"
     );
     vm.undo_commit();
 }

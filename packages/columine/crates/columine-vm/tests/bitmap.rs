@@ -18,7 +18,9 @@ use columine_vm::state_init::{
     calculate_grown_state_size, calculate_state_size, grow_state, init_state,
 };
 use columine_vm::undo_log::{FlatUndoEntry, FlatUndoOp};
-use columine_vm::vm::{UNDO_CAPACITY, Vm, find_latest_eviction_timestamp_for_key};
+use columine_vm::vm::{
+    UNDO_CAPACITY, UNDO_POSITION_OVERFLOWED, Vm, find_latest_eviction_timestamp_for_key,
+};
 use proptest::prelude::*;
 
 use columine_types::types::{
@@ -1878,10 +1880,11 @@ fn eviction_of_every_member_empties_the_slot_and_rolls_back() {
     assert_ttl_slot_restored(&state, &initial, &meta);
 }
 
-/// Refusal happens before the first unlogged write; earlier accepted operations
-/// remain a valid, byte-exact journal prefix in both lanes.
+/// Overflow shadows the image before the first unlogged write; the batch lands,
+/// later writes in the window succeed unrecorded, and rollback restores the
+/// accepted prefix byte-exact.
 #[test]
-fn bitmap_insert_journal_overflow_refuses_before_mutation() {
+fn bitmap_insert_journal_overflow_shadows_and_rolls_back_exactly() {
     let prog = bitmap_program(128);
     for delta in [false, true] {
         let mut state = init_program_state(&prog);
@@ -1898,39 +1901,44 @@ fn bitmap_insert_journal_overflow_refuses_before_mutation() {
             assert_delta_segment_replays(&mut vm, &base, &applied, 0);
         }
         fill_journal_until(&mut vm, &mut state, 0, delta);
-        let before = vm.undo_checkpoint();
         let batch: Vec<u32> = (1..=40).collect();
         assert_eq!(
             vm.set_insert(delta, &mut state, 0, &batch, None),
-            ErrorCode::JournalOverflow
+            ErrorCode::Ok
         );
         assert!(
             vm.undo_has_overflow(),
             "delta={delta}: overflow is explicit"
         );
-        assert_eq!(state, applied, "refused insert wrote bytes");
+        assert_eq!(vm.undo_checkpoint(), UNDO_POSITION_OVERFLOWED);
+        let mut expected = applied.clone();
         assert_eq!(
-            vm.undo_checkpoint(),
-            before,
-            "refused insert appended records"
+            Vm::default().set_insert(delta, &mut expected, 0, &batch, None),
+            ErrorCode::Ok
+        );
+        assert_eq!(state, expected, "delta={delta}: overflowed insert lands");
+        assert_eq!(
+            vm.set_remove(delta, &mut state, 0, &[1000]),
+            ErrorCode::Ok,
+            "later writes in the overflowed window succeed unrecorded"
+        );
+        assert!(
+            vm.undo_has_overflow(),
+            "overflow stays sticky until rollback or commit"
         );
         rollback(&mut vm, &mut state, applied_at);
         assert_eq!(applied, state, "delta={delta}: rollback keeps valid prefix");
-        assert_eq!(
-            vm.set_remove(delta, &mut state, 0, &[1000]),
-            ErrorCode::JournalOverflow,
-            "overflow stays sticky until the speculation is ended"
-        );
-        assert_eq!(state, applied, "post-overflow operation wrote bytes");
+        assert!(!vm.undo_has_overflow());
+        assert_eq!(vm.undo_checkpoint(), applied_at);
         rollback(&mut vm, &mut state, 0);
         assert_eq!(base, state, "delta={delta}: complete prefix rollback");
     }
 }
 
-/// Flag capacity is reserved before the payload changes, rather than discovering
-/// overflow at an outer boundary after the removal landed.
+/// Overflow shadows the image before the removal writes its payload and flags;
+/// the removal lands, and rollback restores the accepted insert exactly.
 #[test]
-fn bitmap_remove_journal_overflow_preserves_payload_and_flags() {
+fn bitmap_remove_journal_overflow_shadows_and_lands_payload_and_flags() {
     let prog = bitmap_program(128);
     for delta in [false, true] {
         let mut state = init_program_state(&prog);
@@ -1945,21 +1953,18 @@ fn bitmap_remove_journal_overflow_preserves_payload_and_flags() {
         let applied = state.clone();
         let applied_at = vm.undo_checkpoint();
         fill_journal_until(&mut vm, &mut state, 0, delta);
-        let before = vm.undo_checkpoint();
-        assert_eq!(
-            vm.set_remove(delta, &mut state, 0, &members),
-            ErrorCode::JournalOverflow
-        );
+        assert_eq!(vm.set_remove(delta, &mut state, 0, &members), ErrorCode::Ok);
         assert!(
             vm.undo_has_overflow(),
             "delta={delta}: overflow is explicit"
         );
-        assert_eq!(state, applied, "refused removal wrote bytes or flags");
+        assert_eq!(vm.undo_checkpoint(), UNDO_POSITION_OVERFLOWED);
+        let mut expected = applied.clone();
         assert_eq!(
-            vm.undo_checkpoint(),
-            before,
-            "refused removal appended records"
+            Vm::default().set_remove(delta, &mut expected, 0, &members),
+            ErrorCode::Ok
         );
+        assert_eq!(state, expected, "delta={delta}: overflowed removal lands");
         rollback(&mut vm, &mut state, applied_at);
         assert_eq!(applied, state, "delta={delta}: rollback to accepted insert");
         rollback(&mut vm, &mut state, 0);
@@ -1967,10 +1972,10 @@ fn bitmap_remove_journal_overflow_preserves_payload_and_flags() {
     }
 }
 
-/// A nested caller cannot mutate after its first typed overflow, even when
-/// rollback subsequently frees journal space.
+/// Operations after overflow succeed unrecorded; rolling back to the savepoint
+/// taken before the overflow still restores the exact image.
 #[test]
-fn nested_operations_after_overflow_leave_state_and_journal_unchanged() {
+fn operations_after_overflow_run_unrecorded_and_roll_back_exactly() {
     let prog = bitmap_program(128);
     for delta in [false, true] {
         let mut state = init_program_state(&prog);
@@ -1984,35 +1989,36 @@ fn nested_operations_after_overflow_leave_state_and_journal_unchanged() {
         vm.undo_enable(&state).expect("valid speculation admission");
         let initial = state.clone();
         fill_journal_until(&mut vm, &mut state, 1, delta);
-        let before = vm.undo_checkpoint();
-        let flags = [
-            (meta.meta_base + SlotMetaOffset::CHANGE_FLAGS, 1),
-            (StateHeaderOffset::DERIVED_FACTS_CHANGE_FLAG, 1),
-        ];
-        let refused: Result<(), ErrorCode> = vm.capture_mutation(delta, &mut state, &flags, |_| {
-            panic!("a refused capture reservation must never run its writer")
-        });
-        assert_eq!(refused, Err(ErrorCode::JournalOverflow));
-        assert_eq!(
-            vm.set_remove(delta, &mut state, 0, &members),
-            ErrorCode::JournalOverflow
-        );
+        let meta_flag = meta.meta_base + SlotMetaOffset::CHANGE_FLAGS;
+        let derived_flag = StateHeaderOffset::DERIVED_FACTS_CHANGE_FLAG;
+        let flags = [(meta_flag, 1), (derived_flag, 1)];
+        let flagged: Result<(), ErrorCode> =
+            vm.capture_mutation(delta, &mut state, &flags, |image| {
+                image[usize::try_from(meta_flag).expect("offset fits usize")] = 1;
+                image[usize::try_from(derived_flag).expect("offset fits usize")] = 1;
+            });
+        assert_eq!(flagged, Ok(()));
+        assert_eq!(vm.set_remove(delta, &mut state, 0, &members), ErrorCode::Ok);
         assert_eq!(
             vm.set_insert(delta, &mut state, 0, &[7], None),
-            ErrorCode::JournalOverflow
+            ErrorCode::Ok
         );
         assert!(
             vm.undo_has_overflow(),
             "delta={delta}: overflow is explicit"
         );
-        assert_eq!(state, initial, "nested refusal wrote bytes");
-        assert_eq!(
-            vm.undo_checkpoint(),
-            before,
-            "nested refusal appended records"
+        assert_eq!(vm.undo_checkpoint(), UNDO_POSITION_OVERFLOWED);
+        assert_ne!(
+            state, initial,
+            "delta={delta}: later operations landed unrecorded"
         );
         rollback(&mut vm, &mut state, 0);
-        assert_eq!(state, initial, "delta={delta}");
+        assert_eq!(
+            state, initial,
+            "delta={delta}: rollback restores the exact image"
+        );
+        assert!(!vm.undo_has_overflow());
+        assert_eq!(vm.undo_checkpoint(), 0);
     }
 }
 
@@ -2312,7 +2318,7 @@ fn real_bitmap_algebra_restores_framing_cleared_tail_and_both_delta_lanes() {
 }
 
 #[test]
-fn bitmap_overflow_mid_reducer_preserves_the_accepted_prefix_and_redo() {
+fn bitmap_overflow_mid_reducer_lands_the_batch_and_rolls_back_exactly() {
     let init = [
         Opcode::SlotDef as u8,
         0,
@@ -2346,11 +2352,6 @@ fn bitmap_overflow_mid_reducer_preserves_the_accepted_prefix_and_redo() {
         );
         seed_bitmap_dead_tails(&mut state, &target);
         let initial = state.clone();
-        let mut accepted = initial.clone();
-        assert_eq!(
-            Vm::default().set_insert(false, &mut accepted, 0, &[7], None),
-            ErrorCode::Ok
-        );
         vm.undo_enable(&state).expect("valid speculation admission");
         fill_journal_until(&mut vm, &mut state, 32, delta);
         let checkpoint = vm.undo_checkpoint();
@@ -2359,41 +2360,37 @@ fn bitmap_overflow_mid_reducer_preserves_the_accepted_prefix_and_redo() {
         } else {
             vm.execute_batch(&mut state, &prog, &[&column], 60)
         };
-        assert_eq!(result, ErrorCode::JournalOverflow as u32, "delta={delta}");
+        assert_eq!(result, ErrorCode::Ok as u32, "delta={delta}");
         assert!(
             vm.undo_has_overflow(),
-            "the refusing algebra sets typed overflow"
+            "the overflowing algebra shadows the image"
         );
-        assert_eq!(state, accepted, "only the fitting first opcode applies");
-        let end = vm.undo_checkpoint();
-        assert!(
-            end > checkpoint,
-            "the accepted prefix journals physical bytes"
+        assert_eq!(vm.undo_checkpoint(), UNDO_POSITION_OVERFLOWED);
+        let mut expected = initial.clone();
+        let oracle = if delta {
+            Vm::default().execute_batch_delta(&mut expected, &prog, &[&column], 60)
+        } else {
+            Vm::default().execute_batch(&mut expected, &prog, &[&column], 60)
+        };
+        assert_eq!(oracle, ErrorCode::Ok as u32);
+        assert_eq!(
+            state, expected,
+            "delta={delta}: overflowed batch writes land"
         );
         if delta {
+            // The overflowed window names no restorable end, and its paired
+            // prefix exports flagged as overflowed: a fork materializes instead.
             assert_eq!(
-                Ok(end - checkpoint),
-                vm.delta_export_segment(checkpoint, end)
+                vm.delta_export_segment(checkpoint, UNDO_POSITION_OVERFLOWED),
+                Err(ErrorCode::InvalidState)
             );
-            let undo = vm.delta_export_undo().to_vec();
-            let redo = vm.delta_export_redo().to_vec();
-            let entry_size = Vm::delta_export_entry_size();
-            let mut replay = Vm::default();
-            let mut backward = accepted.clone();
-            assert_eq!(
-                replay.delta_apply_rollback_segment(&mut backward, &undo, entry_size),
-                Ok(initial.len() as u32)
-            );
-            assert_eq!(backward, initial, "valid prefix undo after overflow");
-            let mut forward = initial.clone();
-            assert_eq!(
-                replay.delta_apply_rollforward_segment(&mut forward, &redo, entry_size),
-                Ok(accepted.len() as u32)
-            );
-            assert_eq!(forward, accepted, "valid prefix redo after overflow");
+            assert_eq!(vm.delta_export_segment(0, checkpoint), Ok(checkpoint));
+            assert!(vm.delta_export_overflow());
         }
         rollback(&mut vm, &mut state, checkpoint);
         assert_eq!(state, initial, "delta={delta}: exact prefix rollback");
+        assert!(!vm.undo_has_overflow());
+        assert_eq!(vm.undo_checkpoint(), checkpoint);
     }
 }
 
@@ -2425,27 +2422,27 @@ fn small_bitmap_patch_reserves_encoded_extent_not_slot_capacity() {
 }
 
 #[test]
-fn ttl_capture_overflow_is_refused_before_bitmap_payload_rewrite() {
+fn ttl_capture_overflow_shadows_then_writes_bitmap_payload() {
     for delta in [false, true] {
         let (mut state, meta, mut vm) = seeded_ttl_slot();
         seed_bitmap_dead_tails(&mut state, &meta);
         vm.undo_enable(&state).expect("valid speculation admission");
         fill_journal_until(&mut vm, &mut state, 8, delta);
         let before = state.clone();
-        let checkpoint = vm.undo_checkpoint();
         assert_eq!(
             vm.set_insert(delta, &mut state, 0, &[sparse_key(61)], Some(&[-1.0])),
-            ErrorCode::JournalOverflow
+            ErrorCode::Ok
         );
-        assert_eq!(state, before, "TTL admission must precede primary mutation");
-        assert_eq!(
-            vm.undo_checkpoint(),
-            checkpoint,
-            "no partial capture records"
+        assert_ne!(state, before, "delta={delta}: the TTL insert wrote");
+        assert!(
+            vm.undo_has_overflow(),
+            "delta={delta}: overflow is explicit"
         );
-        assert!(vm.undo_has_overflow());
+        assert_eq!(vm.undo_checkpoint(), UNDO_POSITION_OVERFLOWED);
         rollback(&mut vm, &mut state, 0);
         assert_eq!(state, before, "delta={delta}: exact prefix rollback");
+        assert!(!vm.undo_has_overflow());
+        assert_eq!(vm.undo_checkpoint(), 0);
     }
 }
 
@@ -2808,7 +2805,7 @@ fn timestamp_only_algebra_overflow_preserves_the_real_accepted_prefix_and_redo()
             state, accepted,
             "real filler cycles preserve the accepted image"
         );
-        let before = vm.undo_checkpoint();
+        let mut expected = accepted.clone();
         assert_eq!(
             vm.bitmap_algebra(
                 delta,
@@ -2817,13 +2814,23 @@ fn timestamp_only_algebra_overflow_preserves_the_real_accepted_prefix_and_redo()
                 0,
                 BitmapSource::Slot(1)
             ),
-            ErrorCode::JournalOverflow
+            ErrorCode::Ok
         );
         assert_eq!(
-            state, accepted,
-            "timestamp-only refusal writes no clock, flag or payload"
+            Vm::default().bitmap_algebra(
+                delta,
+                BitmapAlgebraOp::Or,
+                &mut expected,
+                0,
+                BitmapSource::Slot(1)
+            ),
+            ErrorCode::Ok
         );
-        assert_eq!(vm.undo_checkpoint(), before);
+        assert_eq!(
+            state, expected,
+            "delta={delta}: overflowed clock, flag and payload writes land"
+        );
+        assert_eq!(vm.undo_checkpoint(), UNDO_POSITION_OVERFLOWED);
         assert!(vm.undo_has_overflow());
         if delta {
             assert_eq!(

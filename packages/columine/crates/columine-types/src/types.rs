@@ -872,11 +872,8 @@ pub enum ErrorCode {
     CountOverflow = 10,
     /// A keyed fold's immutable frame metadata differs from its init value.
     MetadataConflict = 11,
-    /// The physical journal's record budget refused a write before it was
-    /// made. Writes earlier in the window stand as an exact accepted prefix,
-    /// which the window's rollback restores; the window refuses every later
-    /// write until it is ended or reset.
-    JournalOverflow = 12,
+    // 12 was `JournalOverflow`, a record-budget refusal. A window past its
+    // record budget now overflows into a shadow instead; the code is retired.
     /// A paired delta export contains an undo-only mutation without redo.
     DeltaLaneMismatch = 13,
     /// A new speculation window cannot replace an active window's checkpoints.
@@ -887,11 +884,10 @@ pub enum ErrorCode {
     /// Outside a recording window, every buffer a batch or call can grow is
     /// reserved before its first write, so the refused batch or call wrote
     /// nothing and can be run again as it is. Inside one, the journal backs
-    /// its storage capture by capture, so the refusal behaves as
-    /// `JournalOverflow` does: the refused write and every later one in the
-    /// window wrote nothing, writes before it stand as an exact accepted
-    /// prefix, and the batch may run again only after the window is rolled
-    /// back past it.
+    /// its storage and its overflow shadow write by write: the refused write
+    /// and every later one in the window wrote nothing, writes before it
+    /// stand as an exact accepted prefix, and the batch may run again only
+    /// after the window is rolled back past it.
     OutOfMemory = 15,
 }
 
@@ -913,7 +909,6 @@ impl ErrorCode {
             9 => Self::InvalidCellValue,
             10 => Self::CountOverflow,
             11 => Self::MetadataConflict,
-            12 => Self::JournalOverflow,
             13 => Self::DeltaLaneMismatch,
             14 => Self::SpeculationActive,
             15 => Self::OutOfMemory,
