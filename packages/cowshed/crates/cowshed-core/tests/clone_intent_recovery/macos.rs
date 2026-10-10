@@ -470,6 +470,13 @@ async fn a_create_refused_for_want_of_a_port_block_leaves_nothing_for_gc_to_crea
         None,
         "a refusal before the first mutation leaves no intent"
     );
+    refused(
+        fixture
+            .fork(&runtime, "main", "refused-fork")
+            .await
+            .expect_err("every port block is claimed"),
+    );
+    assert_eq!(fixture.intent("refused-fork"), None);
     runtime.shutdown().await.expect("stop the refusing runtime");
 
     // With blocks free again, a replayed intent would now succeed: gc must find none.
@@ -477,28 +484,7 @@ async fn a_create_refused_for_want_of_a_port_block_leaves_nothing_for_gc_to_crea
     let gc = fixture.gc().await;
     assert_eq!(fixture.listed(&gc).await, ["main"]);
     assert_eq!(fixture.intent("refused"), None);
-    gc.shutdown().await.expect("stop gc");
-}
-
-#[tokio::test]
-async fn a_fork_refused_for_want_of_a_port_block_leaves_nothing_for_gc_to_create() {
-    let fixture = Fixture::new("refused-fork");
-    let runtime = fixture.adopt().await;
-    let claims = fixture.claim_every_port_block();
-
-    refused(
-        fixture
-            .fork(&runtime, "main", "refused")
-            .await
-            .expect_err("every port block is claimed"),
-    );
-    assert_eq!(fixture.intent("refused"), None);
-    runtime.shutdown().await.expect("stop the refusing runtime");
-
-    claims.release();
-    let gc = fixture.gc().await;
-    assert_eq!(fixture.listed(&gc).await, ["main"]);
-    assert_eq!(fixture.intent("refused"), None);
+    assert_eq!(fixture.intent("refused-fork"), None);
     gc.shutdown().await.expect("stop gc");
 }
 
@@ -749,7 +735,9 @@ async fn rm_retires_a_clone_intent_that_left_no_clone_and_can_never_be_replayed(
 #[tokio::test]
 async fn a_created_workspaces_port_block_is_free_for_its_gateway_session_once_published() {
     let fixture = Fixture::new("published-create");
+    let main_gateway = fixture.gateway_at_hello("main");
     let runtime = fixture.adopt().await;
+    assert_eq!(main_gateway.claimed().await, [0_u16; 0]);
     let gateway = fixture.gateway_at_hello("published");
 
     fixture
@@ -757,29 +745,12 @@ async fn a_created_workspaces_port_block_is_free_for_its_gateway_session_once_pu
         .await
         .expect("create");
     assert_eq!(gateway.claimed().await, [0_u16; 0]);
-    runtime.shutdown().await.expect("stop the runtime");
-}
 
-#[tokio::test]
-async fn a_forked_workspaces_port_block_is_free_for_its_gateway_session_once_published() {
-    let fixture = Fixture::new("published-fork");
-    let runtime = fixture.adopt().await;
-    let gateway = fixture.gateway_at_hello("published");
-
+    let gateway = fixture.gateway_at_hello("forked");
     fixture
-        .fork(&runtime, "main", "published")
+        .fork(&runtime, "main", "forked")
         .await
         .expect("fork");
-    assert_eq!(gateway.claimed().await, [0_u16; 0]);
-    runtime.shutdown().await.expect("stop the runtime");
-}
-
-#[tokio::test]
-async fn an_adopted_mains_port_block_is_free_for_its_gateway_session_once_published() {
-    let fixture = Fixture::new("published-adopt");
-    let gateway = fixture.gateway_at_hello("main");
-
-    let runtime = fixture.adopt().await;
     assert_eq!(gateway.claimed().await, [0_u16; 0]);
     runtime.shutdown().await.expect("stop the runtime");
 }

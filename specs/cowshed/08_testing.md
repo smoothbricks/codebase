@@ -236,6 +236,17 @@ test is charged only what is left of the sweep once its body is done: nothing a 
 sweep selects a live pid's root. Inside the first scratch root of every test process, the sweep cost 2 s on a quiet run
 and 13 s after a run whose tests timed out, and every other test process of the run waited on its lock for as long.
 
+Coverage pays for an attachment only when the kernel behavior is the oracle. The image-growth witness also checks
+normalized whole/volume device names; live capture keeps a real source holder while checking success and destination
+refusal; restart-derived mount facts also check an idle-detach dissent before successful release. Workspace grant
+refusal, workspace grant persistence and project-policy persistence share one adopted CLI fixture, retaining both
+refused and successful restart checks. Create/fork refusal and adopt/create/fork port-publication checks likewise share
+an adopted project without omitting any entry point. Busy resize and defrag each run their original refusal oracles on
+one held volume. Capacity-only refusal uses the existing recording host over a sparse RAW file, and an invalid
+first-mint capacity uses the pure filesystem store: neither needs an attached volume. Distinct adoption crash windows,
+registered-versus-restarted detach paths, writer-admission boundaries and durable deletion records remain separate
+oracles.
+
 Staging GC derives backing-image and mountpoint paths in one preallocated buffer each. Both orphan branches borrow the
 parsed workspace for the deletion record rather than allocating a second name; mount GC also retains its parsed stem.
 

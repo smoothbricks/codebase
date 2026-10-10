@@ -2984,18 +2984,18 @@ fn main() {
         }
     }
 
-    /// A resize that asks for no growth is the caller's mistake, decided from the image's own
-    /// limits before anything is detached.
+    /// A non-growing resize is Usage before detach; a file held open then refuses growth as a
+    /// Conflict. Both refusals leave the image at its original capacity.
     #[cfg(target_os = "macos")]
     #[tokio::test]
-    async fn real_apfs_build_resize_that_does_not_grow_is_usage() {
-        let scratch = Scratch::new("build-resize-usage");
-        let (checkout, id, _) = scratch.linked_checkout("main", 1);
+    async fn real_apfs_build_resize_of_a_held_volume_is_a_conflict() {
+        let scratch = Scratch::new("build-resize-held");
+        let (checkout, id, mount) = scratch.linked_checkout("main", 1);
         let refused = scratch
             .volumes
             .resize(
                 owner("main", '0'),
-                checkout,
+                checkout.clone(),
                 ImageCapacity::from_gibibytes(1),
             )
             .await
@@ -3008,16 +3008,6 @@ fn main() {
                 .unwrap(),
             ImageCapacity::from_gibibytes(1)
         );
-        scratch.release_all();
-    }
-
-    /// A volume with a file held open refuses the resize as a Conflict: the kernel will not let
-    /// go of it, and the image keeps its capacity.
-    #[cfg(target_os = "macos")]
-    #[tokio::test]
-    async fn real_apfs_build_resize_of_a_held_volume_is_a_conflict() {
-        let scratch = Scratch::new("build-resize-held");
-        let (checkout, id, mount) = scratch.linked_checkout("main", 1);
         let held = fs::File::create(mount.join("held")).unwrap();
         let refused = scratch
             .volumes
@@ -3119,12 +3109,12 @@ fn main() {
         scratch.release_all();
     }
 
-    /// A git checkout under `scratch` with `tracked` files (each `{}`) and a `.cowshed.toml`
+    /// A git checkout under `root` with `tracked` files (each `{}`) and a `.cowshed.toml`
     /// asking `toml`, everything added to the index.
     #[cfg(target_os = "macos")]
-    fn tracked_checkout(scratch: &Scratch, name: &str, toml: &str, tracked: &[&str]) -> PathBuf {
+    fn tracked_checkout(root: &Path, name: &str, toml: &str, tracked: &[&str]) -> PathBuf {
         use crate::fork_lock::Run as _;
-        let checkout = scratch.root.path().join(name);
+        let checkout = root.join(name);
         fs::create_dir_all(checkout.join(".cowshed")).unwrap();
         fs::write(checkout.join(".cowshed.toml"), toml).unwrap();
         for file in tracked {
@@ -3182,14 +3172,14 @@ fn main() {
             ("go", &["go.mod"][..]),
             ("cargo-config", &[".cargo/config.toml"][..]),
         ] {
-            let checkout = tracked_checkout(&scratch, name, AT_THE_CAP, tracked);
+            let checkout = tracked_checkout(scratch.root.path(), name, AT_THE_CAP, tracked);
             let first = scratch.volumes.mint_first(checkout.clone(), checkout).await;
             assert!(matches!(first, FirstMint::Nothing), "{name}");
         }
         assert_eq!(scratch.layout.list().unwrap(), []);
 
         // A tracked package that is not installed: discovery may name its caches, and names none.
-        let checkout = tracked_checkout(&scratch, "main", AT_THE_CAP, &["package.json"]);
+        let checkout = tracked_checkout(scratch.root.path(), "main", AT_THE_CAP, &["package.json"]);
         let first = scratch
             .volumes
             .mint_first(checkout.clone(), checkout.clone())
@@ -3264,9 +3254,14 @@ fn main() {
     async fn real_apfs_main_releases_the_volume_minted_beside_its_image_its_first_touch_left() {
         let scratch = Scratch::new("build-minted-left");
         let main = owner("main", '0');
-        let source = tracked_checkout(&scratch, "source", AT_THE_CAP, &["package.json"]);
+        let source = tracked_checkout(scratch.root.path(), "source", AT_THE_CAP, &["package.json"]);
 
-        let refusing = tracked_checkout(&scratch, "refusing", AT_THE_CAP, &["target/lib.rs"]);
+        let refusing = tracked_checkout(
+            scratch.root.path(),
+            "refusing",
+            AT_THE_CAP,
+            &["target/lib.rs"],
+        );
         let first = scratch
             .volumes
             .mint_first(source.clone(), refusing.clone())
@@ -3308,7 +3303,7 @@ fn main() {
         assert!(!scratch.layout.image(&unused.id).exists());
         assert!(scratch.layout.image(&held).exists());
 
-        let interrupted = tracked_checkout(&scratch, "interrupted", AT_THE_CAP, &[]);
+        let interrupted = tracked_checkout(scratch.root.path(), "interrupted", AT_THE_CAP, &[]);
         let first = scratch
             .volumes
             .mint_first(source.clone(), interrupted.clone())
@@ -3329,7 +3324,7 @@ fn main() {
     #[tokio::test]
     async fn real_apfs_main_mints_its_own_when_the_volume_minted_beside_it_is_another_capacity() {
         let scratch = Scratch::new("build-minted-resized");
-        let source = tracked_checkout(&scratch, "source", AT_THE_CAP, &["package.json"]);
+        let source = tracked_checkout(scratch.root.path(), "source", AT_THE_CAP, &["package.json"]);
         // The source asked 1 GiB when main's volume was minted and asks 2 GiB once copied.
         let capacity = |id: &BuildVolumeId| {
             scratch
@@ -3337,7 +3332,7 @@ fn main() {
                 .build_volume_capacity(&scratch.layout, id)
                 .unwrap()
         };
-        let resized = tracked_checkout(&scratch, "resized", AT_THE_CAP, &[]);
+        let resized = tracked_checkout(scratch.root.path(), "resized", AT_THE_CAP, &[]);
         let first = scratch
             .volumes
             .mint_first(source.clone(), resized.clone())
@@ -3374,24 +3369,28 @@ fn main() {
     /// discovered) is not failed by it.
     #[cfg(target_os = "macos")]
     #[tokio::test]
-    async fn real_apfs_a_failed_mint_beside_main_fails_only_a_first_touch_that_needs_it() {
-        let scratch = Scratch::new("build-minted-failed");
+    async fn a_failed_mint_beside_main_fails_only_a_first_touch_that_needs_it() {
+        let store = Store::new();
         let checkout = tracked_checkout(
-            &scratch,
+            &store.root,
             "main",
             "[build]\ncapacity = \"not a size\"\n",
             &["package.json"],
         );
-        let first = scratch
-            .volumes
-            .mint_first(checkout.clone(), checkout.clone())
-            .await;
+        let host = Arc::new(
+            MacOsApfsExecutionHost::new(
+                SystemCommandRunner,
+                crate::storage::apfs::ApfsSubstrateConfig::new(&store.root, &checkout),
+            )
+            .unwrap(),
+        );
+        let volumes = BuildVolumes::new(host, store.layout.clone());
+        let first = volumes.mint_first(checkout.clone(), checkout.clone()).await;
         let FirstMint::Failed(cause) = &first else {
             panic!("an unreadable capacity fails the mint");
         };
         let cause = cause.clone();
-        let refresh = scratch
-            .volumes
+        let refresh = volumes
             .refresh(
                 owner("main", '0'),
                 checkout.clone(),
@@ -3402,8 +3401,7 @@ fn main() {
             .unwrap()
             .unwrap();
         assert_eq!(refresh.volume, None);
-        let failed = scratch
-            .volumes
+        let failed = volumes
             .refresh(
                 owner("main", '0'),
                 checkout.clone(),
@@ -3413,8 +3411,8 @@ fn main() {
             .await
             .unwrap_err();
         assert_eq!(failed, cause);
-        assert_eq!(scratch.layout.list().unwrap(), [], "no second mint");
-        assert_eq!(scratch.layout.linked(&checkout).unwrap(), None);
+        assert_eq!(store.layout.list().unwrap(), [], "no second mint");
+        assert_eq!(store.layout.linked(&checkout).unwrap(), None);
         first.abandon().await;
     }
 
@@ -3429,7 +3427,7 @@ fn main() {
     fn real_apfs_a_dropped_adopt_releases_the_volume_minted_beside_main() {
         use std::task::Poll;
         let scratch = Scratch::new("build-minted-dropped");
-        let checkout = tracked_checkout(&scratch, "main", AT_THE_CAP, &["package.json"]);
+        let checkout = tracked_checkout(scratch.root.path(), "main", AT_THE_CAP, &["package.json"]);
 
         // The runtime's one blocking thread is held, so the mint is queued behind it: one poll
         // leaves it unanswered, and it runs only once the adopt is gone.

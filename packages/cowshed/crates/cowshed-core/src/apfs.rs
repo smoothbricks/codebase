@@ -6320,24 +6320,6 @@ mod tests {
         fs::remove_dir(directory).unwrap();
     }
 
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn real_apfs_image_attach_normalizes_bare_devices_and_verifies_the_volume() {
-        let root = ScratchRoot::new("image-resolution").expect("scratch root");
-        let image = root.path().join("image").with_extension(IMAGE_EXTENSION);
-        let backend = MacOsApfsBackend::new(SystemCommandRunner);
-        let mut cleanup = RealImageCleanup::new(&backend, image.clone());
-        let result = (|| -> Result<(), ApfsError> {
-            crate::blank_image::blank_image(&image);
-            let attachment = backend.attach_verified(&image)?;
-            let attachment = cleanup.track(attachment);
-            assert!(attachment.whole_device().starts_with("/dev/disk"));
-            assert!(attachment.volume_device().starts_with("/dev/disk"));
-            Ok(())
-        })();
-        finish_real_image_test(result, cleanup);
-    }
-
     /// A real attachment holds its image file exclusively, so growing it is refused outright and
     /// nothing is written; once detached, the grow lands and Apple's own limits report it.
     #[cfg(target_os = "macos")]
@@ -6351,6 +6333,8 @@ mod tests {
             crate::blank_image::blank_image(&image);
             let created = image.as_path();
             let attachment = cleanup.track(backend.attach_verified(created)?);
+            assert!(attachment.whole_device().starts_with("/dev/disk"));
+            assert!(attachment.volume_device().starts_with("/dev/disk"));
             let refused = SystemCommandRunner
                 .grow_image(created, capacity("2g"))
                 .expect_err("an attached image's file is held exclusively");

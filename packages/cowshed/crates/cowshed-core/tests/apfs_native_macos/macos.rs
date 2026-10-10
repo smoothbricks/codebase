@@ -538,6 +538,8 @@ fn real_apfs_live_capture_leaves_its_source_unchanged_on_success_and_refusal() {
         let fixture = RealFixture::new(label);
         let (host, source, mount) = live_capture_source(&fixture, access, browse);
         let before = live_source_state(&source, &mount);
+        let held = std::fs::File::open(mount.join("sealed-payload"))
+            .expect("hold source during live capture");
         let destination = fixture.root().join("snapshot.dmg");
         host.clone_image(&source, Some(&mount), &destination)
             .expect("live capture");
@@ -567,32 +569,11 @@ fn real_apfs_live_capture_leaves_its_source_unchanged_on_success_and_refusal() {
         );
 
         assert_capture_carries_source(&host, &destination, &fixture.root().join("snapshot"));
+        drop(held);
         host.detach_mounted(&workspace(), DetachIntent::WhenIdle)
             .expect("source registry mapping");
         assert!(kernel_mount_at(&mount).is_none());
     }
-}
-
-/// The live rule (01_storage.md, "Live source snapshots"): a source something holds open is still
-/// captured, because a live capture neither unmounts nor detaches it. The holder is not a refusal.
-#[test]
-fn real_apfs_live_capture_is_not_refused_by_a_holder_of_its_source() {
-    let fixture = RealFixture::new("capture-held-source");
-    let (host, source, mount) = live_capture_source(&fixture, MountAccess::ReadWrite, false);
-    let before = live_source_state(&source, &mount);
-    let held = std::fs::File::open(mount.join("sealed-payload")).expect("hold source");
-    let destination = fixture.root().join("snapshot.dmg");
-    host.clone_image(&source, Some(&mount), &destination)
-        .expect("a live capture is not refused by a holder");
-    assert_eq!(
-        live_source_state(&source, &mount),
-        before,
-        "the held source keeps its mount, device, flags and attachment"
-    );
-    assert_capture_carries_source(&host, &destination, &fixture.root().join("snapshot"));
-    drop(held);
-    host.detach_mounted(&workspace(), DetachIntent::WhenIdle)
-        .expect("source registry released once its holder lets go");
 }
 
 /// A detached capture (the blank template and build seeds, 16_build_volumes.md) holds its source's
@@ -3073,27 +3054,10 @@ fn real_apfs_kernel_mount_facts_survive_host_restart_and_detach_by_mountpoint() 
         kernel_id,
         "mount identity is read from the in-image marker, never from the volume label"
     );
-    restarted
-        .detach_mounted(&workspace(), DetachIntent::Release)
-        .expect("restart-safe detach");
-    assert!(kernel_mount_at(&mount).is_none());
-    assert!(!attached(canonical.image()));
-}
-
-/// A mount the host only knows from kernel facts is detached by mountpoint, and a `WhenIdle`
-/// detach of it reports the dissent rather than forcing a volume the user may still be in.
-#[test]
-fn real_apfs_restart_safe_when_idle_detach_reports_a_dissent_without_forcing() {
-    let fixture = RealFixture::new("kernel-restart-dissent");
-    let canonical = fixture.layout().main_image().expect("canonical");
-    fixture.published_image(canonical.image());
-    let mount = fixture.main_mount();
-    fixture.mount_left_behind(canonical.image(), &mount, "nobrowse,owners");
-    fixture.plant_marker(&mount, &workspace());
-    let host = fixture.host();
     let holder = std::fs::File::create(mount.join("held")).expect("hold the volume");
 
-    host.detach_mounted(&workspace(), DetachIntent::WhenIdle)
+    restarted
+        .detach_mounted(&workspace(), DetachIntent::WhenIdle)
         .expect_err("a dissented WhenIdle detach must not escalate");
     assert!(
         kernel_mount_at(&mount).is_some(),
@@ -3101,9 +3065,12 @@ fn real_apfs_restart_safe_when_idle_detach_reports_a_dissent_without_forcing() {
     );
 
     drop(holder);
-    host.detach_mounted(&workspace(), DetachIntent::Release)
-        .expect("the mountpoint is free once the holder lets go");
+
+    restarted
+        .detach_mounted(&workspace(), DetachIntent::Release)
+        .expect("restart-safe detach");
     assert!(kernel_mount_at(&mount).is_none());
+    assert!(!attached(canonical.image()));
 }
 
 #[test]
@@ -5403,24 +5370,31 @@ fn real_apfs_resizing_a_detached_workspace_grows_the_image_then_the_container() 
         .expect("detach the probe");
 }
 
+/// Pure (08_testing.md, "Unit tests": no mounts): a refused grow reads the image's length and runs no disk command.
 #[test]
-fn real_apfs_resize_refuses_a_capacity_that_does_not_grow_before_touching_the_image() {
-    let fixture = RealFixture::new("resize-shrink");
-    let image = fixture.layout().main_image().expect("image");
-    fixture.published_image(image.image());
-    let host = fixture.host();
+fn resize_refuses_a_capacity_that_does_not_grow_before_touching_the_image() {
+    let fixture = Fixture::new("resize-shrink");
+    let image = StorageLayout::new(&fixture.root, &repo())
+        .expect("layout")
+        .main_image()
+        .expect("image");
+    create_image(image.image());
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(image.image())
+        .expect("fixture image")
+        .set_len(ImageCapacity::from_gibibytes(1).bytes())
+        .expect("sparse RAW capacity");
+    let runner = RecordingRunner::default();
+    let host = native_host(&fixture, runner.clone());
+    let mount = fixture.config().checkout_path;
 
     for requested in [
         ImageCapacity::parse("512m").expect("half a gibibyte"),
         ImageCapacity::from_gibibytes(1),
     ] {
         let error = host
-            .resize(
-                &workspace(),
-                image.image(),
-                &fixture.main_mount(),
-                requested,
-            )
+            .resize(&workspace(), image.image(), &mount, requested)
             .expect_err("resize only ever grows");
 
         assert!(
@@ -5439,8 +5413,15 @@ fn real_apfs_resize_refuses_a_capacity_that_does_not_grow_before_touching_the_im
             "a refused resize must not have grown anything"
         );
     }
+
+    let requests = runner.requests();
+    assert!(
+        requests.is_empty(),
+        "a refused resize runs no disk command: {requests:?}"
+    );
 }
 
+/// The same holder also refuses a defragment, leaving the image as it was.
 #[test]
 fn real_apfs_resize_refuses_a_busy_workspace_before_growing_the_image() {
     let fixture = RealFixture::new("resize-busy");
@@ -5481,6 +5462,27 @@ fn real_apfs_resize_refuses_a_busy_workspace_before_growing_the_image() {
         kernel_attachments(&image),
         before,
         "a workspace that would not detach keeps its one attachment, devices and capacity"
+    );
+    let defrag_host = fixture.host();
+    let inode_before = std::fs::metadata(&image).expect("image").ino();
+    defrag_host
+        .defragment(&workspace(), &image, &mount)
+        .expect_err("a busy volume refuses the rewrite rather than being torn out");
+    assert_eq!(
+        std::fs::metadata(&image).expect("image").ino(),
+        inode_before,
+        "a workspace that would not detach keeps its image"
+    );
+    assert!(
+        !std::fs::exists(cowshed_core::storage::apfs::extents::rewrite_sibling(
+            &image
+        ))
+        .expect("stat sibling"),
+        "a refused rewrite never starts a copy"
+    );
+    assert!(
+        kernel_mount_at(&mount).is_some(),
+        "the workspace stays mounted"
     );
     drop(holder);
 }
@@ -5657,35 +5659,6 @@ fn real_apfs_a_refused_resize_leaves_the_image_ungrown_and_puts_the_workspace_ba
         "a refused resize grows nothing and leaves one fresh attachment: {after:?}"
     );
     assert_back_on_its_mount(&host, &image, &mount);
-}
-
-#[test]
-fn real_apfs_defragment_refuses_a_busy_workspace_before_touching_the_image() {
-    let fixture = RealFixture::new("defragment-busy");
-    let (image, mount) = mounted_main(&fixture);
-    let host = fixture.host();
-    let before = std::fs::metadata(&image).expect("image").ino();
-    let holder = std::fs::File::open(mount.join("payload")).expect("hold the volume");
-
-    host.defragment(&workspace(), &image, &mount)
-        .expect_err("a busy volume refuses the rewrite rather than being torn out");
-    assert_eq!(
-        std::fs::metadata(&image).expect("image").ino(),
-        before,
-        "a workspace that would not detach keeps its image"
-    );
-    assert!(
-        !std::fs::exists(cowshed_core::storage::apfs::extents::rewrite_sibling(
-            &image
-        ))
-        .expect("stat sibling"),
-        "a refused rewrite never starts a copy"
-    );
-    assert!(
-        kernel_mount_at(&mount).is_some(),
-        "the workspace stays mounted"
-    );
-    drop(holder);
 }
 
 #[test]

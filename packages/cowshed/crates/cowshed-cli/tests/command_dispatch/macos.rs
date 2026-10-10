@@ -362,6 +362,26 @@ async fn real_apfs_dispatch_grant_persists_across_runtime_restart() {
     let fixture = Fixture::new();
     let mut service = fixture.open().await;
     adopt(&fixture, &mut service).await;
+    let before = service.grants("main").await.expect("baseline grants");
+    let (result, stdout, _) = run(
+        &mut service,
+        [
+            OsString::from("grant"),
+            OsString::from("main"),
+            OsString::from("--read"),
+            fixture.storage.store().as_os_str().to_os_string(),
+        ],
+    )
+    .await;
+    let error = result.expect_err("store itself cannot be granted to a workspace");
+    assert_eq!(error.code, ErrorCode::SandboxDenied);
+    assert!(stdout.is_empty(), "a refusal has no machine answer");
+    service.shutdown().await.expect("shutdown runtime");
+    let mut service = fixture.reopen().await;
+    assert_eq!(
+        service.grants("main").await.expect("persisted grants"),
+        before
+    );
     let path = fixture.granted.as_os_str().to_os_string();
     let (result, _, _) = run(
         &mut service,
@@ -385,6 +405,17 @@ async fn real_apfs_dispatch_grant_persists_across_runtime_restart() {
             .contains("1 denied writes"),
         "the summary must report the deny recorded by the real grant store"
     );
+    let (result, _, _) = run(
+        &mut service,
+        [
+            OsString::from("grant"),
+            OsString::from("--project-wide"),
+            OsString::from("--deny-write"),
+            OsString::from("generated"),
+        ],
+    )
+    .await;
+    assert_eq!(result.expect("record deny-write in project grant store"), 0);
     service
         .shutdown()
         .await
@@ -399,61 +430,12 @@ async fn real_apfs_dispatch_grant_persists_across_runtime_restart() {
     assert!(grants.read.contains(&fixture.granted));
     assert!(grants.write.contains(&fixture.granted));
     assert!(grants.deny_write.contains(&PathBuf::from("generated")));
-    service.shutdown().await.expect("shutdown runtime");
-}
-
-#[tokio::test]
-async fn real_apfs_dispatch_denied_grant_does_not_change_persisted_grants() {
-    let fixture = Fixture::new();
-    let mut service = fixture.open().await;
-    adopt(&fixture, &mut service).await;
-    let before = service.grants("main").await.expect("baseline grants");
-    let (result, stdout, _) = run(
-        &mut service,
-        [
-            OsString::from("grant"),
-            OsString::from("main"),
-            OsString::from("--read"),
-            fixture.storage.store().as_os_str().to_os_string(),
-        ],
-    )
-    .await;
-    let error = result.expect_err("store itself cannot be granted to a workspace");
-    assert_eq!(error.code, ErrorCode::SandboxDenied);
-    assert!(stdout.is_empty(), "a refusal has no machine answer");
-    service.shutdown().await.expect("shutdown runtime");
-    let mut service = fixture.reopen().await;
-    assert_eq!(
-        service.grants("main").await.expect("persisted grants"),
-        before
-    );
-    service.shutdown().await.expect("shutdown reopened runtime");
-}
-
-#[tokio::test]
-async fn real_apfs_dispatch_project_deny_write_is_persisted_not_just_echoed() {
-    let fixture = Fixture::new();
-    let mut service = fixture.open().await;
-    adopt(&fixture, &mut service).await;
-    let (result, _, _) = run(
-        &mut service,
-        [
-            OsString::from("grant"),
-            OsString::from("--project-wide"),
-            OsString::from("--deny-write"),
-            OsString::from("generated"),
-        ],
-    )
-    .await;
-    assert_eq!(result.expect("record deny-write in project grant store"), 0);
-    service.shutdown().await.expect("shutdown runtime");
-    let mut service = fixture.reopen().await;
     let project = service
         .project_grants()
         .await
         .expect("durable project policy");
     assert!(project.deny_write.contains(&PathBuf::from("generated")));
-    service.shutdown().await.expect("shutdown reopened runtime");
+    service.shutdown().await.expect("shutdown runtime");
 }
 
 /// Every macOS port block of `fixture`'s store claimed for this process except `kept`, exactly
