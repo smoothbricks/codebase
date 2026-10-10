@@ -23,7 +23,10 @@ pub struct RemoteUrl {
 /// A value only: it carries no authority and grants nothing.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RenameWorkState {
-    pub status: [u8; 32],
+    /// SHA-256 of the length-framed status, index-vs-HEAD diff, working-vs-index diff, untracked
+    /// and restored-link sections; see `GitRepository::rename_work_state`.
+    pub work: [u8; 32],
+    /// SHA-256 of a linked worktree's index file bytes; `None` for a standalone clone.
     pub index: Option<[u8; 32]>,
 }
 
@@ -567,23 +570,79 @@ impl GitRepository {
         parse_oid(value, "HEAD")
     }
 
-    /// Read-only digest of a workspace's working state for rename preservation: the exact
-    /// porcelain status bytes, and for a linked worktree the digest of its index file. It grants
-    /// nothing and copies nothing; callers compare it before and after a rename.
-    pub(crate) async fn rename_work_state(&self, linked: bool) -> Result<RenameWorkState> {
-        let status = self
-            .run([
-                "--no-optional-locks",
-                "status",
-                "--porcelain=v1",
-                "-z",
-                "--untracked-files=all",
-            ])
-            .await?;
+    /// Read-only digest of a workspace's working state for rename preservation. Without optional
+    /// locks it covers the porcelain status with its branch header, the binary index-against-HEAD
+    /// diff, the binary working-against-index diff, and the path, mode and bytes of every
+    /// untracked non-ignored file; a linked worktree also digests its index file. Inherited links
+    /// restored by the clone compare by path and symlink presence only, and only those Git sees as
+    /// tracked or untracked non-ignored; ignored links are never part of it. It grants nothing and
+    /// copies nothing; callers compare it before and after a rename.
+    pub(crate) async fn rename_work_state(
+        &self,
+        linked: bool,
+        restored_links: &[PathBuf],
+    ) -> Result<RenameWorkState> {
+        let restored = self.git_visible_restored_links(restored_links).await?;
+        let mut pathspecs = vec![OsString::from("--"), OsString::from(".")];
+        pathspecs.extend(restored.iter().map(|path| {
+            let mut spec = OsString::from(":(top,literal,exclude)");
+            spec.push(path.as_os_str());
+            spec
+        }));
+        let mut status_args: Vec<OsString> = [
+            "--no-optional-locks",
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--branch",
+            "--untracked-files=all",
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect();
+        status_args.extend(pathspecs.iter().cloned());
+        let status = self.run(status_args).await?;
         if !status.status.success() {
             return Err(git_internal("read rename work state", &status));
         }
-        let status_digest = Sha256Digest::compute(&status.stdout);
+        let cached = self.run(diff_args(true, &pathspecs)).await?;
+        if !cached.status.success() {
+            return Err(git_internal("diff rename index against HEAD", &cached));
+        }
+        let working = self.run(diff_args(false, &pathspecs)).await?;
+        if !working.status.success() {
+            return Err(git_internal(
+                "diff rename working tree against index",
+                &working,
+            ));
+        }
+        let untracked: Vec<PathBuf> = porcelain_records(&status.stdout)
+            .filter(|(code, _)| *code == b"??".as_slice())
+            .map(|(_, path)| PathBuf::from(OsStr::from_bytes(path)))
+            .filter(|path| restored.binary_search(path).is_err())
+            .collect();
+        let root = self.root.clone();
+        let extras =
+            tokio::task::spawn_blocking(move || hash_work_extras(&root, &untracked, &restored))
+                .await
+                .map_err(|error| {
+                    CowshedError::internal(format!("hash rename work extras: {error}"))
+                })??;
+
+        use sha2::{Digest as _, Sha256};
+        let mut hasher = Sha256::new();
+        for section in [
+            status.stdout.as_slice(),
+            cached.stdout.as_slice(),
+            working.stdout.as_slice(),
+            extras.as_slice(),
+        ] {
+            let length = u64::try_from(section.len())
+                .expect("a digest section length fits in u64 on every supported platform");
+            hasher.update(length.to_le_bytes());
+            hasher.update(section);
+        }
+        let work_digest = Sha256Digest::from_bytes(hasher.finalize().into());
         let index = if linked {
             let output = self
                 .run(["rev-parse", "--path-format=absolute", "--git-path", "index"])
@@ -593,7 +652,6 @@ impl GitRepository {
             }
             let index_path = parse_one_path(&output.stdout, "linked worktree index")?;
             let digest = tokio::task::spawn_blocking(move || -> Result<Sha256Digest> {
-                use sha2::{Digest as _, Sha256};
                 use std::io::Read as _;
                 let mut file = fs::File::open(&index_path).map_err(|error| {
                     io_failure("open linked worktree index", &index_path, error)
@@ -620,9 +678,76 @@ impl GitRepository {
             None
         };
         Ok(RenameWorkState {
-            status: *status_digest.as_bytes(),
+            work: *work_digest.as_bytes(),
             index: index.map(|digest| *digest.as_bytes()),
         })
+    }
+
+    /// The restored links Git itself reports as tracked or untracked non-ignored, sorted. Ignored
+    /// links are not Git's work, so they are neither exempted nor hashed.
+    async fn git_visible_restored_links(&self, restored: &[PathBuf]) -> Result<Vec<PathBuf>> {
+        if restored.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut args: Vec<OsString> = [
+            "--no-optional-locks",
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "--",
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect();
+        for path in restored {
+            let mut spec = OsString::from(":(literal)");
+            spec.push(path.as_os_str());
+            args.push(spec);
+        }
+        let output = self.run(args).await?;
+        if !output.status.success() {
+            return Err(git_internal("list inherited links Git sees", &output));
+        }
+        let visible: std::collections::BTreeSet<PathBuf> = output
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|field| !field.is_empty())
+            .map(|field| PathBuf::from(OsStr::from_bytes(field)))
+            .collect();
+        let mut sorted: Vec<PathBuf> = restored
+            .iter()
+            .filter(|path| visible.contains(*path))
+            .cloned()
+            .collect();
+        sorted.sort();
+        sorted.dedup();
+        Ok(sorted)
+    }
+
+    /// The plan that restores this tree's inherited links, as the paths it would rewrite, in order.
+    /// Refuses, naming each link, when any link cannot be restored.
+    pub(crate) async fn rename_link_paths(&self) -> Result<Vec<PathBuf>> {
+        let root = self.root.clone();
+        let plan = tokio::task::spawn_blocking(move || crate::inherited_links::plan(&root, &root))
+            .await
+            .map_err(|error| CowshedError::internal(format!("plan inherited links: {error}")))??;
+        if !plan.refusals.is_empty() {
+            return Err(CowshedError::integrity(
+                format!(
+                    "{} inherited link(s) cannot be restored: {}",
+                    plan.refusals.len(),
+                    plan.refusal_report()
+                ),
+                "repair the link in the source checkout — for a package manager `link:` dependency, re-run its install there — then retry",
+            ));
+        }
+        Ok(plan
+            .rewrites
+            .into_iter()
+            .map(|rewrite| rewrite.at)
+            .collect())
     }
 
     pub async fn current_branch(&self) -> Result<Option<String>> {
@@ -745,8 +870,9 @@ impl GitRepository {
     /// Directories are excluded as `name/`; the marker is a file, so it is `/name`, anchored at
     /// the root, where a trailing slash would match only a directory.
     pub async fn ensure_cowshed_excludes(&self) -> Result<()> {
-        let git_directory = self.trusted_git_directory().await?;
+        let root = self.root.clone();
         tokio::task::spawn_blocking(move || {
+            let git_directory = root.join(".git");
             let info_directory = git_directory.join("info");
             for directory in [&git_directory, &info_directory] {
                 let metadata = fs::symlink_metadata(directory).map_err(|error| {
@@ -846,23 +972,6 @@ impl GitRepository {
         })
         .await
         .map_err(|error| CowshedError::internal(format!("Git exclude task failed: {error}")))?
-    }
-
-    /// The Git directory exclude wiring writes to: only a real `.git` directory is authority. A
-    /// `.git` pointer, even a valid linked-worktree one, is never a source of exclude writes; the
-    /// caller must reach the repository's own root. Links are never followed.
-    async fn trusted_git_directory(&self) -> Result<PathBuf> {
-        let dot_git = self.root.join(".git");
-        match inspect_path(&dot_git, "inspect Git metadata")? {
-            Some(metadata) if metadata.file_type().is_dir() => Ok(dot_git),
-            _ => Err(CowshedError::integrity(
-                format!(
-                    "Git metadata path is not a real directory: {}",
-                    dot_git.display()
-                ),
-                "restore the standalone workspace Git metadata and retry",
-            )),
-        }
     }
 
     /// Record that this repository's working tree lives on a case-sensitive volume.
@@ -3019,6 +3128,107 @@ fn porcelain_records(stdout: &[u8]) -> impl Iterator<Item = (&[u8], &[u8])> {
     })
 }
 
+/// `git diff` arguments for the rename work digest: no optional locks, no external or textconv
+/// filters, binary bytes, and the pathspecs the caller built (`--`, `.`, and literal exclusions).
+fn diff_args(cached: bool, pathspecs: &[OsString]) -> Vec<OsString> {
+    let mut args: Vec<OsString> = ["--no-optional-locks", "diff"]
+        .into_iter()
+        .map(OsString::from)
+        .collect();
+    if cached {
+        args.push(OsString::from("--cached"));
+    }
+    args.extend(
+        ["--binary", "--no-ext-diff", "--no-textconv", "--no-color"]
+            .into_iter()
+            .map(OsString::from),
+    );
+    args.extend(pathspecs.iter().cloned());
+    args
+}
+
+/// Hash the bytes of untracked non-ignored paths and the presence of restored links. Each path
+/// contributes its raw bytes, mode and content (a symlink contributes its target; a regular file
+/// is streamed without following links). Any other entry type, or any read failure, refuses.
+/// `restored` must be sorted and holds only links Git reports, whose targets are not digested.
+fn hash_work_extras(root: &Path, untracked: &[PathBuf], restored: &[PathBuf]) -> Result<[u8; 32]> {
+    use sha2::{Digest as _, Sha256};
+    use std::os::unix::fs::MetadataExt as _;
+    fn absorb(hasher: &mut Sha256, bytes: &[u8]) {
+        let length = u64::try_from(bytes.len())
+            .expect("a byte slice length fits in u64 on every supported platform");
+        hasher.update(length.to_le_bytes());
+        hasher.update(bytes);
+    }
+    let mut hasher = Sha256::new();
+    for relative in untracked {
+        let path = root.join(relative);
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|error| io_failure("inspect untracked path", &path, error))?;
+        absorb(&mut hasher, relative.as_os_str().as_bytes());
+        hasher.update(metadata.mode().to_le_bytes());
+        let kind = metadata.file_type();
+        if kind.is_symlink() {
+            hasher.update(b"link");
+            let target = fs::read_link(&path)
+                .map_err(|error| io_failure("read untracked link target", &path, error))?;
+            absorb(&mut hasher, target.as_os_str().as_bytes());
+        } else if kind.is_file() {
+            hasher.update(b"file");
+            let length = metadata.len();
+            hasher.update(length.to_le_bytes());
+            let mut file = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(&path)
+                .map_err(|error| io_failure("open untracked file", &path, error))?;
+            let mut buffer = [0_u8; 64 * 1024];
+            let mut total = 0_u64;
+            loop {
+                let read = file
+                    .read(&mut buffer)
+                    .map_err(|error| io_failure("read untracked file", &path, error))?;
+                if read == 0 {
+                    break;
+                }
+                hasher.update(&buffer[..read]);
+                total +=
+                    u64::try_from(read).expect("a read of at most the 64 KiB buffer fits in u64");
+            }
+            if total != length {
+                return Err(CowshedError::conflict(
+                    format!(
+                        "untracked file changed while the rename digest read it: {}",
+                        path.display()
+                    ),
+                    "stop writing to the file and retry the rename",
+                ));
+            }
+        } else {
+            return Err(CowshedError::integrity(
+                format!("untracked path has an unsupported type: {}", path.display()),
+                "move it out of the workspace and retry the rename",
+            ));
+        }
+    }
+    for relative in restored {
+        let path = root.join(relative);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {}
+            Ok(_) => {
+                return Err(CowshedError::integrity(
+                    format!("inherited link is no longer a symlink: {}", path.display()),
+                    "restore the inherited links and retry",
+                ));
+            }
+            Err(error) => return Err(io_failure("inspect inherited link", &path, error)),
+        }
+        absorb(&mut hasher, relative.as_os_str().as_bytes());
+        hasher.update(b"restored-link");
+    }
+    Ok(hasher.finalize().into())
+}
+
 /// An untracked path with a hidden component: junk, never work.
 /// Whether main's `checkout` holds exactly what this workspace's `root` holds at the untracked
 /// `relative` path: a regular file with the same bytes, or a symlink with the same target.
@@ -4168,6 +4378,157 @@ mod tests {
         assert_eq!(
             fs::read(&main_exclude).expect("main exclude after refusal"),
             before
+        );
+    }
+
+    /// Cached and untracked bytes are workspace work a rename must preserve. A digest of the
+    /// porcelain status alone reads the same before and after both change, so it cannot prove
+    /// the preserved state is the one that was captured.
+    #[tokio::test]
+    async fn rename_work_digest_changes_when_dirty_and_untracked_bytes_change() {
+        let root = repository();
+        let repo = GitRepository::from_root(&root);
+
+        fs::write(root.join("README"), "stage1\n").expect("stage README");
+        git(&root, &["add", "README"]);
+        fs::write(root.join("README"), "two\n").expect("unstaged README");
+        fs::write(root.join("u"), "u1\n").expect("untracked file");
+        let state1 = repo
+            .rename_work_state(false, &[])
+            .await
+            .expect("first work state");
+
+        fs::write(root.join("README"), "stage2\n").expect("restage README");
+        git(&root, &["add", "README"]);
+        fs::write(root.join("README"), "five\n").expect("unstaged README again");
+        fs::write(root.join("u"), "u2\n").expect("untracked file rewritten");
+        let state2 = repo
+            .rename_work_state(false, &[])
+            .await
+            .expect("second work state");
+
+        assert_eq!(
+            git_stdout(&root, &["status", "--porcelain=v1"]),
+            "MM README\n?? u\n",
+            "fixture keeps the same status codes"
+        );
+        assert_ne!(
+            state2, state1,
+            "a rename work digest must change when cached or untracked bytes change"
+        );
+    }
+
+    /// An untracked symlink's target bytes are work, so retargeting it changes the digest.
+    #[tokio::test]
+    async fn rename_work_digest_covers_untracked_symlink_targets() {
+        let root = repository();
+        let repo = GitRepository::from_root(&root);
+        symlink("a", root.join("ln")).expect("untracked link");
+        let first = repo
+            .rename_work_state(false, &[])
+            .await
+            .expect("first state");
+        fs::remove_file(root.join("ln")).expect("replace link");
+        symlink("b", root.join("ln")).expect("retargeted link");
+        let second = repo
+            .rename_work_state(false, &[])
+            .await
+            .expect("second state");
+        assert_ne!(
+            second, first,
+            "an untracked symlink's target is work a rename must preserve"
+        );
+    }
+
+    /// The branch header is part of the digest: a switch at the same HEAD changes it.
+    #[tokio::test]
+    async fn rename_work_digest_covers_the_branch_header() {
+        let root = repository();
+        let repo = GitRepository::from_root(&root);
+        let first = repo
+            .rename_work_state(false, &[])
+            .await
+            .expect("main state");
+        git(&root, &["checkout", "-q", "-b", "other"]);
+        let second = repo
+            .rename_work_state(false, &[])
+            .await
+            .expect("other state");
+        assert_ne!(
+            second, first,
+            "a branch switch at the same HEAD must change the digest"
+        );
+    }
+
+    /// Restored inherited links compare by path and presence, not target, on two copied trees at
+    /// different depths; the branch survives restoration.
+    #[tokio::test]
+    async fn restored_inherited_links_compare_by_path_and_branch_survives_restoration() {
+        let source = repository();
+        let scratch = source.parent().expect("scratch root").to_path_buf();
+        fs::create_dir_all(source.join("deps")).expect("deps directory");
+        fs::write(scratch.join("shared"), "shared\n").expect("source-side target");
+        symlink("../../shared", source.join("deps/tracked")).expect("tracked link");
+        git(&source, &["add", "deps/tracked"]);
+        git(&source, &["commit", "-qm", "link"]);
+        symlink("../../shared", source.join("deps/untracked")).expect("untracked link");
+
+        let clone = scratch.join("nested").join("deep").join("clone");
+        fs::create_dir_all(clone.parent().expect("clone parent")).expect("clone parent");
+        copy_tree(&source, &clone);
+        let repo = GitRepository::from_root(&clone);
+        let branch = repo.current_branch().await.expect("clone branch");
+        repo.restore_inherited_links(&source)
+            .await
+            .expect("restore inherited links");
+        assert_eq!(
+            repo.current_branch().await.expect("branch after restore"),
+            branch
+        );
+        for link in ["deps/tracked", "deps/untracked"] {
+            assert!(
+                fs::read_link(clone.join(link))
+                    .expect("restored link")
+                    .is_absolute(),
+                "{link} must be restored to an absolute source-tree target"
+            );
+        }
+        let restored = vec![
+            PathBuf::from("deps/tracked"),
+            PathBuf::from("deps/untracked"),
+        ];
+        let source_state = GitRepository::from_root(&source)
+            .rename_work_state(false, &restored)
+            .await
+            .expect("source state");
+        let clone_state = repo
+            .rename_work_state(false, &restored)
+            .await
+            .expect("clone state right after restoration");
+        assert_eq!(
+            clone_state, source_state,
+            "a restored clone digests as its source"
+        );
+
+        let restored = vec![
+            PathBuf::from("deps/tracked"),
+            PathBuf::from("deps/untracked"),
+        ];
+        let before = repo
+            .rename_work_state(false, &restored)
+            .await
+            .expect("state before retarget");
+        for link in ["deps/tracked", "deps/untracked"] {
+            fs::remove_file(clone.join(link)).expect("drop restored link");
+            symlink(scratch.join("elsewhere"), clone.join(link)).expect("retarget link");
+        }
+        let after = repo
+            .rename_work_state(false, &restored)
+            .await
+            .expect("state after retarget");
+        assert_eq!(
+            after, before,
+            "restored links compare by path and presence only"
         );
     }
 
