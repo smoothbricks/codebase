@@ -5,7 +5,7 @@
 //! `Err` — never "no rows matched". A count that silently becomes 0 makes `never()`
 //! report that an event never appeared and `all_children_of()` report that every child
 //! is correctly parented, so a coerced error here answers the caller's assertion with
-//! its PASS value (minigraf PERFORMANCE-HANDBOOK §7.10f).
+//! its PASS value.
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::{
@@ -120,8 +120,8 @@ impl ArrowTraceQuery {
 
     /// Validates presence AND type before any row is read. Checking lazily per row
     /// would leave a mistyped column undetected whenever no row reaches it — the
-    /// selector would be answered from a schema the reader cannot actually interpret
-    /// (§7.7: validate once, then trust).
+    /// selector would be answered from a schema the reader cannot actually interpret.
+    /// Validate once, then trust.
     fn validate_selector(&self, selector: &Selector) -> Result<(), ArrowError> {
         self.require_columns(&selector_columns(selector))?;
         for batch in &self.batches {

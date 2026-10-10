@@ -32,6 +32,9 @@
 
 cd "$(git rev-parse --show-toplevel)"
 TOOLING="$PWD/tooling"
+# A push to the `backup` remote is a private mirror, not publication: both
+# gates below guard publication only, so they do not apply.
+if [ "${1:-}" = backup ]; then exit 0; fi
 
 export PATH="$("$TOOLING/direnv/repo-path")"
 # ttsc compiles with this checkout's native TypeScript compiler into this

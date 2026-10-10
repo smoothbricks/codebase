@@ -14302,7 +14302,7 @@ mod grant_unit_tests {
         let mount_root = canonical_dir(&root.join("mnt"));
         let workspace = canonical_dir(&mount_root.join("acme/widget/workspaces/raven/mount"));
         let project = canonical_dir(&root.join("project"));
-        let allowed = canonical_dir(&root.join("fork/minigraf"));
+        let allowed = canonical_dir(&root.join("fork/consumer"));
         let secret = canonical_dir(&home.join(".ssh"));
         let alias = root.join("alias-ssh");
         std::os::unix::fs::symlink(&secret, &alias).unwrap();

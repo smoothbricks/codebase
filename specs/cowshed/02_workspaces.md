@@ -132,8 +132,8 @@ because the checkout's own resolved gitdir would already live inside the store. 
 look for it; direct mount is the only faithful option.
 
 Git identity inheritance follows each `includeIf gitdir:` rule's anchor. Rules anchored at an ancestor shared by both
-the checkout and the mount root (for example `gitdir:~/Dev/` when checkouts live in `~/Dev` and the root is
-`~/Dev/.cowshed`) match workspaces with zero additional configuration — the expected setup. Rules anchored exactly at a
+the checkout and the mount root (for example `gitdir:<checkouts>/` when checkouts live in `<checkouts>` and the root is
+`<checkouts>/.cowshed`) match workspaces with zero additional configuration — the expected setup. Rules anchored exactly at a
 project root do not reach into the mount root; cowshed surfaces that divergence instead of letting identities silently
 drift: `cowshed setup` (every adopted checkout, after a repair and after `--mount-root`) and `cowshed doctor` (the
 current project) run `git config --list --show-origin` in the checkout and in a throwaway probe repository under the

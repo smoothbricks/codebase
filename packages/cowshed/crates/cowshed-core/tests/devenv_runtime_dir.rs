@@ -40,8 +40,9 @@ use tokio::sync::mpsc;
 /// the `devenv-<7 hex>` component plus a socket name is a base devenv cannot use.
 const SUN_PATH_BYTES: usize = 104;
 const LONGEST_RUNTIME_SUFFIX: &str = "/devenv-1234567/x.sock";
-/// `/Users/<user>/Dev/.cowshed/<owner>/<repo>/<workspace>` at the lengths this host actually
-/// has (`/Users/danny/Dev/.cowshed/example-org/minigraf/minigraf-query-deps` is 66 bytes).
+/// A synthetic production-shaped mount, `<checkouts>/.cowshed/<owner>/<repo>/<workspace>` at the
+/// lengths a real host has, fixed here at 66 bytes. The budget is that figure, not the length of
+/// any path spelled in this file.
 const PRODUCTION_MOUNT_BYTES: usize = 66;
 
 /// Shell-entry probes run under the same profile as the command, not in the supervisor.
@@ -213,8 +214,9 @@ async fn host_controller_shell_activation_owns_a_runtime_directory_the_profile_l
     );
     // Short enough for the unix-domain sockets devenv puts under it. The scratch mount here is
     // arbitrarily long, so the budget is checked on what the runtime base ADDS to the mount: a
-    // production mount (`~/Dev/.cowshed/<owner>/<repo>/<workspace>`) is about 65 bytes, and the
-    // suffix plus devenv's own `devenv-<7 hex>/<socket>` must fit in what remains.
+    // synthetic production-shaped mount (`<checkouts>/.cowshed/<owner>/<repo>/<workspace>`) is
+    // `PRODUCTION_MOUNT_BYTES` (66 bytes), and the suffix plus devenv's own
+    // `devenv-<7 hex>/<socket>` must fit in what remains.
     let added = runtime_base
         .strip_prefix(&sandbox.workspace_mount)
         .expect("inside the mount")

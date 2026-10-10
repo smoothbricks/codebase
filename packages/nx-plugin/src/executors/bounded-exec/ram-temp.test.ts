@@ -51,16 +51,16 @@ describe('RAM temp volume output parsing', () => {
       'images          : 3',
       '================================================',
       'image-path      : /private/cowshed/store/x/main.asif',
-      'mounting user   : danny',
+      'mounting user   : example',
       'framework name  : DiskImages2',
       '/dev/disk10\t\t',
       '/dev/disk11\tEF57347C-0000-11AA-AA11-00306543ECAC\t',
-      '/dev/disk11s1\t41504653-0000-11AA-AA11-00306543ECAC\t/Users/danny/Dev/x',
+      '/dev/disk11s1\t41504653-0000-11AA-AA11-00306543ECAC\t/Users/example/checkout',
       '================================================',
       'image-path      : ram://16777216',
       'image-type      : read/write',
       'blockcount      : 16777216',
-      'mounting user   : danny',
+      'mounting user   : example',
       'mounting mode   : <unknown>',
       'process ID      : 91006',
       'framework name  : DiskImages',
@@ -74,7 +74,7 @@ describe('RAM temp volume output parsing', () => {
       '',
     ].join('\n');
     expect(ramDisksIn(info)).toEqual([
-      { physical: '/dev/disk138', sectors: 16777216, user: 'danny', mountpoints: ['/Volumes/smoo-ram-502 1'] },
+      { physical: '/dev/disk138', sectors: 16777216, user: 'example', mountpoints: ['/Volumes/smoo-ram-502 1'] },
       { physical: '/dev/disk159', sectors: 16777216, user: 'root', mountpoints: [] },
     ]);
   });
@@ -94,7 +94,7 @@ describe('RAM temp volume output parsing', () => {
     const table = [
       '/dev/disk3s1s1 on / (apfs, sealed, local, read-only, journaled)',
       '/dev/disk271s1 on /private/tmp/smoo-ram-501 (apfs, local, nodev, nosuid, journaled, noowners, nobrowse)',
-      '/dev/disk290s1 on /private/tmp/smoo-ram-501/501-a1b2c3/checkout (apfs, local, nobrowse, mounted by danny)',
+      '/dev/disk290s1 on /private/tmp/smoo-ram-501/501-a1b2c3/checkout (apfs, local, nobrowse, mounted by example)',
       '/dev/disk291s1 on /private/tmp/smoo-ram-501/501-a1b2c3x/other (apfs, local)',
     ].join('\n');
     expect(mountsBelow(table, '/private/tmp/smoo-ram-501/501-a1b2c3/')).toEqual([

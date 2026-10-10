@@ -17,8 +17,8 @@
 //!    asserted from one.
 //!
 //! Both arms are compiled into this one binary and pinned by
-//! `bitmosaic::skew::force` at runtime, alternated inside one process run
-//! (handbook §4.5). Forcing the DRIVE arm BELOW the crossover is what makes
+//! `bitmosaic::skew::force` at runtime, alternated inside one process run.
+//! Forcing the DRIVE arm BELOW the crossover is what makes
 //! the bracket two-sided: the merge has to be shown winning the range it
 //! keeps, not merely chosen there. Like-arm spread is reported beside every
 //! cross-arm delta as the in-run null.

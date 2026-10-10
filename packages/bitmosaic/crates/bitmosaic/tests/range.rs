@@ -14,7 +14,7 @@
 //!    allocator brackets the walks. This is a claim about zero, so the
 //!    counter is proved capable of reporting non-zero in the same test — an
 //!    instrument that cannot see a violation cannot certify its absence.
-//!    A count is worth more than a timing here (handbook §4.4b): it does not
+//!    A count is worth more than a timing here: it does not
 //!    expire when either arm is rewritten and does not care what else the
 //!    machine was doing.
 //! 3. **The protocol's own contract.** `front` is idempotent, `save` is a
@@ -965,7 +965,7 @@ fn adaptors_compose_without_a_buffer_between_stages() {
 /// into a scalar. Nothing here may reach the allocator — not construction,
 /// not alignment, not a nested chain, and not the `Iterator` bridge.
 ///
-/// A count, not a timing (handbook §4.4b): it is exact, reproducible, and
+/// A count, not a timing: it is exact, reproducible, and
 /// survives any rewrite of the code under it.
 #[test]
 fn lazy_ranges_allocate_nothing_on_a_steady_state_traversal() {

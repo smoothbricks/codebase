@@ -15,7 +15,7 @@ git fetch main
 git rebase --onto main/main <fork-base> cowshed/<name>
 cargo test -p <crate> && cargo clippy -p <crate> --all-targets --config 'build.warnings="deny"'
 # in the host checkout
-git fetch /Users/danny/Dev/.cowshed/smoothbricks/codebase/<name> cowshed/<name>
+git fetch <checkouts>/.cowshed/<owner>/<repo>/<ws> cowshed/<name>
 git merge --ff-only FETCH_HEAD
 ```
 

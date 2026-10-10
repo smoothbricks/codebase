@@ -71,9 +71,9 @@ export default defineConfig({
       ],
     }),
     // Starlight inserts Expressive Code immediately after itself; explicit MDX must
-    // follow so code blocks register first (mirrors conloca.com's own config).
+    // follow so code blocks register first.
     mdx({ optimize: true, extendMarkdownConfig: false }),
-    // Conloca CMS. It authors no Puck pages here — `mdxPages` in
+    // CMS integration. It authors no Puck pages here — `mdxPages` in
     // content/sites.json points it at Starlight's docs collection, so the CMS
     // edits the existing .mdx files in place and Starlight keeps rendering them.
     conlocaCMS({

@@ -12,9 +12,8 @@
 //! Expressed over `Iterator` that needs `Peekable`, which buffers an
 //! `Option<T>` per source and adds a branch and a store per step — and the
 //! buffer holds *state the cursor already had*, copied. With `front`
-//! idempotent the merge body is the plain three-way compare the
-//! `PERFORMANCE-HANDBOOK` §7.4 measured at 0.68 ns/iter against 1.66 for the
-//! branchless form:
+//! idempotent the merge body is the plain three-way compare, measured at
+//! 0.68 ns/iter against 1.66 for the branchless form:
 //!
 //! ```text
 //! while !a.empty() && !b.empty() {
@@ -911,8 +910,8 @@ enum Side {
 /// It is a const parameter, so each arm monomorphizes to its own kernel with
 /// no runtime branch, and both live in ONE binary — which is what lets a
 /// caller interleave them per sample against a shared A/A floor instead of
-/// comparing two builds (handbook §4.5), and what keeps the displaced kernel
-/// measurable forever (§7.10c).
+/// comparing two builds, and what keeps the displaced kernel measurable
+/// forever.
 ///
 /// - `true` ([`AndRange::new`], the default): close the gap with
 ///   [`Range::seek`]. A source that can jump — both wire cursors can — makes
@@ -921,7 +920,7 @@ enum Side {
 ///   kernel `and_len` has had since G261.
 /// - `false` ([`AndRange::lockstep`]): close the gap one `pop_front` at a
 ///   time. The CONTROL, and what this adaptor did unconditionally while
-///   CAMPAIGN-10X §14 recorded it as "cardinality-blind": stepping costs
+///   an audit recorded it as "cardinality-blind": stepping costs
 ///   `|A| + |B| - |A ∩ B|` cursor advances whatever the skew is, and no
 ///   call-site cardinality test can change that, because the blindness is
 ///   in the ALIGNER and not in the argument order.
@@ -964,8 +963,8 @@ where
         (&self.a, &self.b)
     }
 
-    /// The three-way compare, branchy on purpose (handbook §7.4: 0.68
-    /// ns/iter against 1.66 for the branchless form on this shape).
+    /// The three-way compare, branchy on purpose (measured 0.68 ns/iter
+    /// against 1.66 for the branchless form on this shape).
     ///
     /// `LEAPFROG` is a compile-time constant, so the arm below is folded and
     /// neither kernel pays a test for the other's existence.

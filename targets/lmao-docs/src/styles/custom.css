@@ -26,8 +26,7 @@
 /* =============================================================================
  * Landing motion + depth
  *
- * Borrowed from Conloca (conloca.com): the same lightweight CSS keyframes and a
- * soft accent glow for depth — but on LMAO's amber accent, not Conloca's cyan.
+ * Lightweight CSS keyframes plus a soft glow for depth, on LMAO's amber accent.
  * Everything here is scoped to the splash home via `:has(.hero)` (the `.hero`
  * element only renders on splash pages) and gated behind prefers-reduced-motion,
  * so docs pages and reduced-motion users are unaffected.
@@ -92,7 +91,7 @@
 }
 
 :root[data-theme="dark"]:has(.hero) {
-  /* Deepen the splash backdrop toward a slate near-black (Conloca-style depth). */
+  /* Deepen the splash backdrop toward a slate near-black for depth. */
   --sl-color-bg: #0a0b10;
 }
 

@@ -1,8 +1,8 @@
 # Rust audit — index
 
 Read-only audit of every Rust crate in the monorepo: 19 crates across 3 cargo workspaces (`packages/cowshed`,
-`packages/columine`, `packages/lmao`), 133k lines of Rust. 45 slices, one report each. Rubric:
-`_fork/minigraf/BYPRODUCT-ENGINEERING.md` + `PERFORMANCE-HANDBOOK.md`. Every finding carries `path:line` evidence.
+`packages/columine`, `packages/lmao`), 133k lines of Rust. 45 slices, one report each. Rubric: repository engineering
+and performance review criteria. Every finding carries `path:line` evidence.
 
 509 findings: **10 CRITICAL / 154 HIGH / 234 MEDIUM / 111 LOW**.
 

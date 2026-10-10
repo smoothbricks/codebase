@@ -23,9 +23,9 @@
 //! so a leapfrog join can run over mapped bytes. It has no production caller
 //! in this tree today: `AndRange` and friends align by `pop_front`, not by
 //! `seek`, and the FTS lane drives owned forests. So this example is the
-//! honest cell for a plane whose consumer is filed, not shipped — the D-a
-//! demand masks of `10x-docs/datalog-eval-brief.md` §1, where a magic-set
-//! demand window is exactly a range predicate against a chunk.
+//! honest cell for a plane whose consumer is filed, not shipped — demand
+//! masks, where a magic-set demand window is exactly a range predicate
+//! against a chunk.
 //!
 //! ## Acceptance is COUNTS FIRST
 //!
@@ -37,7 +37,7 @@
 //! clock, same binary, arms switched at runtime, interleaved, MIN per arm,
 //! with an in-run A/A floor — and it is CORROBORATION, not the claim.
 //!
-//! ## Residues (§7.14e), enumerated rather than carried in a formula
+//! ## Residues, enumerated rather than carried in a formula
 //!
 //! Every seek against a `Words` chunk falls in exactly one of three classes,
 //! and panel 1 prints the histogram rather than a rate:
@@ -237,7 +237,7 @@ fn cell(label: &str, values: &[u32], probe_stride: u32) -> (String, String) {
     // taken from POSITIONS 0 AND 1 — the same two slots the comparison above
     // occupies. A null read off positions 2 and 3 bounds late-slot drift and
     // says nothing about the first-versus-second bias that the comparison is
-    // actually exposed to, which is the harness trap in §7.14e: an A/A floor
+    // actually exposed to, which is the harness trap: an A/A floor
     // measured somewhere other than where the arms ran is not that comparison's
     // floor. The larger of the two is taken, so neither can flatter a verdict.
     let aa = race(

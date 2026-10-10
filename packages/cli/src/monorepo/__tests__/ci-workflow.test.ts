@@ -83,8 +83,8 @@ describe('CI workflow definition', () => {
           tokenEnv: 'SOURCE_READ_TOKEN',
         },
         {
-          path: '../_fork/minigraf',
-          repository: 'https://git.example.net/codebase/minigraf.git',
+          path: '../vendor/consumer',
+          repository: 'https://git.example.net/codebase/consumer.git',
           ref: 'def456',
           tokenEnv: 'SOURCE_READ_TOKEN',
         },
@@ -107,9 +107,9 @@ describe('CI workflow definition', () => {
     );
     expect(rendered).toContain('git -C "$root/../smoothbricks" checkout --detach abc123');
     expect(rendered).toContain(
-      'git clone --filter=blob:none https://git.example.net/codebase/minigraf.git "$root/../_fork/minigraf"',
+      'git clone --filter=blob:none https://git.example.net/codebase/consumer.git "$root/../vendor/consumer"',
     );
-    expect(rendered).toContain('git -C "$root/../_fork/minigraf" checkout --detach def456');
+    expect(rendered).toContain('git -C "$root/../vendor/consumer" checkout --detach def456');
     // Credential hygiene: no token in any URL or argv; authorization is
     // per-command env config whose key is scoped to the exact origin, so
     // nothing leaks to other hosts or into the sibling's .git/config.

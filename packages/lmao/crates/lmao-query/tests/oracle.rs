@@ -10,7 +10,7 @@
 //! batch — an oracle built by reading the artifact under test is wrong in exactly the
 //! ways that artifact is wrong.
 //!
-//! **Error parity is asserted, not just value parity** (handbook §7.10f). The previous
+//! **Error parity is asserted, not just value parity.** The previous
 //! oracle's SQLite arm ended its count in `.unwrap_or(0)`, so a failed query returned
 //! 0 rows, which made `never()` report "this event never appears" and
 //! `all_children_of()` report "every child is correctly parented". A value-only
