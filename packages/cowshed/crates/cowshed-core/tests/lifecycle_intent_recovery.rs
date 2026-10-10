@@ -68,6 +68,51 @@ fn historical_create_and_fork_tags_remain_readable_without_public_aliases() {
     assert_eq!(serde_json::to_value(fork).unwrap(), old_fork);
 }
 
+#[test]
+fn rename_flag_is_distinct_and_an_absent_flag_stays_a_raw_fork() {
+    let old_fork = serde_json::json!({ "kind": "fork", "source": "main", "destination": "raven" });
+    let historical: LifecycleIntent =
+        serde_json::from_value(old_fork.clone()).expect("historical fork");
+    assert_eq!(
+        serde_json::to_value(&historical).unwrap(),
+        old_fork,
+        "an absent flag decodes false and re-encodes without the field"
+    );
+    assert_eq!(historical.verb(), "fork");
+
+    let explicit: LifecycleIntent = serde_json::from_value(serde_json::json!({
+        "kind": "fork",
+        "source": "main",
+        "destination": "raven",
+        "rename": false,
+    }))
+    .expect("explicit false fork");
+    assert_eq!(explicit, historical);
+
+    let rename = LifecycleIntent::Fork {
+        source: workspace("main"),
+        destination: workspace("raven"),
+        rename: true,
+    };
+    let encoded = serde_json::to_value(&rename).expect("encode rename");
+    assert_eq!(
+        encoded,
+        serde_json::json!({
+            "kind": "fork",
+            "source": "main",
+            "destination": "raven",
+            "rename": true,
+        })
+    );
+    let decoded: LifecycleIntent = serde_json::from_value(encoded).expect("decode rename");
+    assert_eq!(decoded, rename);
+    assert_eq!(decoded.verb(), "rename");
+    assert_ne!(
+        decoded, historical,
+        "replay must not confuse a rename with a fork of the same names"
+    );
+}
+
 fn intent(operation: &str) -> LifecycleIntent {
     match operation {
         "create" => LifecycleIntent::Create {
@@ -77,6 +122,7 @@ fn intent(operation: &str) -> LifecycleIntent {
         "fork" => LifecycleIntent::Fork {
             source: workspace("main"),
             destination: workspace("forked"),
+            rename: false,
         },
         "remove" => LifecycleIntent::Retire {
             workspace: workspace("removed"),
@@ -401,6 +447,7 @@ fn refused_pending_retirement_restores_the_clone_and_a_new_removal_can_be_author
     let clone = LifecycleIntent::Fork {
         source: workspace("main"),
         destination: name.clone(),
+        rename: false,
     };
     LifecycleIntentJournal::update(&path, |journal| {
         journal.begin(clone.clone());

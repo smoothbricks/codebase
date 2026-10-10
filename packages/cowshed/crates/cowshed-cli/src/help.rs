@@ -401,10 +401,8 @@ mod tests {
                 spec.name
             );
         }
-        // Fork's creation flags are discoverable in the command map, not only its help page.
-        assert!(map.contains(
-            "fork [<src>] <ws> [--clean|--ref|--browse|--slot|--register|--git-worktree]"
-        ));
+        // Fork's creation flags use its full help page when they exceed the map budget.
+        assert!(map.contains("fork [<src>] <ws> [options]"));
         // `exec`'s eleven flags do not fit a scannable line, so the map defers to the page.
         assert!(map.contains("exec <ws> [options] -- <cmd...>"));
         assert!(map.lines().all(|line| line.len() <= WIDTH));

@@ -551,6 +551,10 @@ pub enum LifecycleIntent {
     Fork {
         source: WorkspaceName,
         destination: WorkspaceName,
+        /// True only for the clone/registration/retire rename transaction. Older fork tags
+        /// omit it and retain their raw-clone recovery behavior.
+        #[serde(default, skip_serializing_if = "not_rename")]
+        rename: bool,
     },
     Retire {
         workspace: WorkspaceName,
@@ -560,6 +564,10 @@ pub enum LifecycleIntent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         origin: Option<Box<LifecycleIntent>>,
     },
+}
+
+fn not_rename(rename: &bool) -> bool {
+    !*rename
 }
 
 impl LifecycleIntent {
@@ -576,7 +584,8 @@ impl LifecycleIntent {
         match self {
             Self::Adopt { .. } | Self::ReAdopt { .. } => "adopt",
             Self::Create { .. } => "create",
-            Self::Fork { .. } => "fork",
+            Self::Fork { rename: true, .. } => "rename",
+            Self::Fork { rename: false, .. } => "fork",
             Self::Retire { .. } => "retire",
         }
     }

@@ -4442,8 +4442,7 @@ mod tests {
     #[test]
     fn missing_positionals_use_the_same_words_as_require_helpers() {
         let cases = [
-            (["new"].as_slice(), "new requires a workspace name"),
-            (&["fork"], "fork requires a source workspace"),
+            (["fork"].as_slice(), "fork requires a destination workspace"),
             (&["mv"], "mv requires a workspace"),
             (&["restore"], "restore requires a workspace"),
             (&["exec", "--", "true"], "exec requires a workspace"),

@@ -689,13 +689,24 @@ impl ProjectRuntimeHost for FakeHost {
         &mut self,
         source: WorkspaceName,
         destination: WorkspaceName,
+        rename: bool,
     ) -> Result<WorkspaceSnapshot> {
         self.workspace(&source)?;
-        self.resume_fork(
-            destination,
-            cowshed_core::storage::recovery::MintOptions::default(),
-        )
-        .await
+        let snapshot = self
+            .resume_fork(
+                destination,
+                cowshed_core::storage::recovery::MintOptions::default(),
+            )
+            .await?;
+        if rename {
+            // The modeled source retires only once the modeled destination exists.
+            self.state
+                .workspaces
+                .retain(|current| current.name != source);
+            self.events.send(Event::Retire(source)).ok();
+            self.persist()?;
+        }
+        Ok(snapshot)
     }
 
     async fn rename(
@@ -704,7 +715,7 @@ impl ProjectRuntimeHost for FakeHost {
         destination: WorkspaceName,
     ) -> Result<WorkspaceSnapshot> {
         self.workspace(&source)?;
-        self.clone_for_rename(source, destination).await
+        self.clone_for_rename(source, destination, true).await
     }
 
     async fn move_checkout(&mut self, destination: PathBuf) -> Result<WorkspaceSnapshot> {
