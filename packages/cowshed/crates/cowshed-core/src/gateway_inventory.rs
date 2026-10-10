@@ -98,6 +98,9 @@ pub struct GatewaySessionFact {
     pub workspace: WorkspaceName,
     pub incarnation: WorkspaceIncarnation,
     pub revision: u64,
+    /// When the workspace was created, as its metadata records it: of two sessions sharing a
+    /// port, the older is served.
+    pub created_at: String,
     pub mount_id: u64,
     pub mount: PathBuf,
     pub grants: GrantSet,
@@ -164,6 +167,7 @@ impl fmt::Debug for GatewaySessionFact {
             .field("workspace", &self.workspace)
             .field("incarnation", &self.incarnation)
             .field("revision", &self.revision)
+            .field("created_at", &self.created_at)
             .field("mount_id", &self.mount_id)
             .field("mount", &self.mount)
             .field("grants", &self.grants)
@@ -200,8 +204,6 @@ pub enum GatewayInventoryError {
         first: RepoId,
         second: RepoId,
     },
-    #[error("macOS port block {claimed} shares ports with {held}, assigned to another workspace")]
-    OverlappingPortBlocks { held: PortBlock, claimed: PortBlock },
     #[error("project root {0} is claimed by more than one repository binding")]
     AmbiguousProjectRoot(PathBuf),
     #[error("gateway inventory has duplicate or ambiguous mount fact for {0}")]
@@ -504,18 +506,222 @@ impl fmt::Debug for NativeGatewayInventory {
     }
 }
 
-/// Holds `block` among the store's reserved blocks, refusing one that shares a port with a block
-/// another workspace holds: blocks of different sizes are compared by the ports they cover.
-fn reserve_port_block(
-    blocks: &mut ReservedPortBlocks,
-    block: PortBlock,
-) -> Result<(), GatewayInventoryError> {
-    blocks
-        .insert(block)
-        .map_err(|held| GatewayInventoryError::OverlappingPortBlocks {
-            held,
-            claimed: block,
+/// One macOS port block the store names, the workspace that names it, and the record it is in.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PortClaim {
+    pub repo: RepoId,
+    pub workspace: WorkspaceName,
+    /// When the workspace was created, as its metadata records it (RFC 3339 UTC): of two
+    /// workspaces claiming one port, the older keeps it.
+    pub created_at: String,
+    pub block: PortBlock,
+    pub record: ClaimRecord,
+}
+
+impl PortClaim {
+    fn same_workspace(&self, other: &Self) -> bool {
+        self.repo == other.repo && self.workspace == other.workspace
+    }
+}
+
+/// The record a claim is read from. Only a published grant is the workspace's own to rewrite;
+/// every other record changes when the operation that wrote it finishes or is retired.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ClaimRecord {
+    /// The grants of a published workspace.
+    Published,
+    /// The grants fenced into an unpublished clone's canonical image, at this sidecar.
+    PendingFence(PathBuf),
+    /// The grants an unfinished lifecycle intent in this journal carries.
+    Intent(PathBuf),
+    /// A grants sidecar whose image is outside the canonical inventory.
+    Sidecar(PathBuf),
+}
+
+impl fmt::Display for ClaimRecord {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Published => formatter.write_str("its published grants"),
+            Self::PendingFence(path) => {
+                write!(
+                    formatter,
+                    "the unpublished clone's grants {}",
+                    path.display()
+                )
+            }
+            Self::Intent(path) => {
+                write!(
+                    formatter,
+                    "an unfinished lifecycle intent in {}",
+                    path.display()
+                )
+            }
+            Self::Sidecar(path) => write!(formatter, "the grants sidecar {}", path.display()),
+        }
+    }
+}
+
+/// Two workspaces whose blocks share a port. `held` belongs to the older workspace, which keeps
+/// the port; `claimed` belongs to the newer one, which `cowshed doctor --repair` moves.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PortCollision {
+    pub held: PortClaim,
+    pub claimed: PortClaim,
+}
+
+impl PortCollision {
+    /// Whether `workspace` of `repo` is the newer member, the one not served.
+    pub fn claims(&self, repo: &RepoId, workspace: &WorkspaceName) -> bool {
+        self.claimed.repo == *repo && self.claimed.workspace == *workspace
+    }
+}
+
+impl fmt::Display for PortCollision {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self { held, claimed } = self;
+        write!(
+            formatter,
+            "macOS port block {} of {}/{} ({}) shares ports with block {} of {}/{} ({}), an older workspace",
+            claimed.block,
+            claimed.repo,
+            claimed.workspace,
+            claimed.record,
+            held.block,
+            held.repo,
+            held.workspace,
+            held.record
+        )
+    }
+}
+
+/// What the store's records name: every claim, and every record that could not be read, which
+/// names a block nobody can know. Allocation proceeds without it and says so.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PortClaims {
+    pub claims: Vec<PortClaim>,
+    pub unreadable: Vec<(PathBuf, String)>,
+}
+
+/// Every collision among the store's claims, and the records that could not be read.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PortCollisions {
+    pub collisions: Vec<PortCollision>,
+    pub unreadable: Vec<(PathBuf, String)>,
+}
+
+/// Every block `metadata` grants — the current one and each retained one — claimed by its
+/// workspace in `repo`, as `record` names them.
+fn port_claims<'a>(
+    repo: &'a RepoId,
+    metadata: &'a DetachedWorkspaceMetadata,
+    record: &'a ClaimRecord,
+) -> impl Iterator<Item = PortClaim> + 'a {
+    metadata.grants.port_blocks().map(move |block| PortClaim {
+        repo: repo.clone(),
+        workspace: metadata.workspace.clone(),
+        created_at: metadata.info_snapshot.created_at.clone(),
+        block,
+        record: record.clone(),
+    })
+}
+
+/// The attached sessions the gateway serves, and the collisions whose newer member it does not
+/// serve (04_sandbox.md, `portBlock`; 05_gateway.md). `attached` is every attached session on
+/// the host: two sessions whose blocks share a port would answer on one endpoint, so the older
+/// workspace's is served and the newer one's waits for `cowshed doctor --repair` to move it.
+pub fn served_sessions(
+    attached: Vec<GatewaySessionFact>,
+) -> (Vec<GatewaySessionFact>, Vec<PortCollision>) {
+    let refused = port_collisions(attached.iter().flat_map(|fact| {
+        std::iter::once(fact.port_block)
+            .chain(fact.grants.retained_port_blocks.iter().copied())
+            .map(|block| PortClaim {
+                repo: fact.repo_id.clone(),
+                workspace: fact.workspace.clone(),
+                created_at: fact.created_at.clone(),
+                block,
+                record: ClaimRecord::Published,
+            })
+    }));
+    let served = attached
+        .into_iter()
+        .filter(|fact| {
+            !refused
+                .iter()
+                .any(|collision| collision.claims(&fact.repo_id, &fact.workspace))
         })
+        .collect();
+    (served, refused)
+}
+
+/// The claims among `claims` that share a port with an older workspace's claim. Claims are held
+/// oldest first — by recorded creation time, then by repository and workspace so a tie still has
+/// one answer — and a claim reaching into a held claim of another workspace is that workspace's
+/// collision instead of a holding. One workspace's own blocks never collide: a block it outgrew
+/// nests inside the one that replaced it, and a block its intent carries is the one it holds.
+pub fn port_collisions(claims: impl IntoIterator<Item = PortClaim>) -> Vec<PortCollision> {
+    let mut claims = claims.into_iter().collect::<Vec<_>>();
+    claims.sort_by(|left, right| {
+        (
+            &left.created_at,
+            &left.repo,
+            &left.workspace,
+            left.block.base(),
+        )
+            .cmp(&(
+                &right.created_at,
+                &right.repo,
+                &right.workspace,
+                right.block.base(),
+            ))
+    });
+    let mut held: Vec<PortClaim> = Vec::with_capacity(claims.len());
+    let mut collisions = Vec::new();
+    for claim in claims {
+        match held
+            .iter()
+            .find(|holder| holder.block.overlaps(claim.block) && !holder.same_workspace(&claim))
+        {
+            Some(holder) => collisions.push(PortCollision {
+                held: holder.clone(),
+                claimed: claim,
+            }),
+            None => held.push(claim),
+        }
+    }
+    collisions.dedup();
+    collisions
+}
+
+/// The images whose grants sidecars sit directly in `directory`; none when it does not exist.
+fn sidecar_images(directory: &Path) -> Result<Vec<PathBuf>, GatewayInventoryError> {
+    match fs::symlink_metadata(directory) {
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(source) => return Err(io_error("inspecting grants sidecars", directory, source)),
+    }
+    Ok(read_directory(directory, "enumerating grants sidecars")?
+        .iter()
+        .filter_map(|path| crate::metadata::image_from_sidecar_path(path))
+        .collect())
+}
+
+/// Claims `metadata`'s current and retained blocks for its workspace, refusing a canonical grant
+/// that holds no current block.
+fn claim_granted_blocks(
+    claims: &mut Vec<PortClaim>,
+    repo: &RepoId,
+    metadata: &DetachedWorkspaceMetadata,
+    record: &ClaimRecord,
+) -> Result<(), GatewayInventoryError> {
+    if metadata.grants.port_block.is_none() {
+        return Err(GatewayInventoryError::MissingPortBlock {
+            repo: repo.clone(),
+            workspace: metadata.workspace.clone(),
+        });
+    }
+    claims.extend(port_claims(repo, metadata, record));
+    Ok(())
 }
 
 /// Which store backend an inventory reads, chosen by the caller that opened the store:
@@ -628,7 +834,6 @@ impl NativeGatewayInventory {
                 Ok(project) => projects.push(project),
                 Err(
                     error @ (GatewayInventoryError::DuplicateRepository(_)
-                    | GatewayInventoryError::OverlappingPortBlocks { .. }
                     | GatewayInventoryError::AmbiguousProjectRoot(_)
                     | GatewayInventoryError::ForeignBinding { .. }),
                 ) => return Err(error),
@@ -899,6 +1104,14 @@ impl NativeGatewayInventory {
         })
         .await
         .map_err(|error| GatewayInventoryError::Blocking(error.to_string()))?
+    }
+
+    /// Every pair of workspaces whose recorded blocks share a port, the newer one claiming.
+    pub async fn port_collisions(&self) -> Result<PortCollisions, GatewayInventoryError> {
+        let inventory = self.clone();
+        crate::storage::lifecycle::dispatch_blocking(move || inventory.port_collisions_blocking())
+            .await
+            .map_err(|error| GatewayInventoryError::Blocking(error.to_string()))?
     }
 
     pub async fn repository_for_project_root(
@@ -1198,52 +1411,89 @@ impl NativeGatewayInventory {
     fn all_reserved_port_blocks_blocking(
         &self,
     ) -> Result<ReservedPortBlocks, GatewayInventoryError> {
-        let repositories = discover_repositories(self.storage.store())?;
+        let PortClaims { claims, unreadable } = self.port_claims_blocking()?;
+        for (path, error) in unreadable {
+            eprintln!(
+                "cowshed: {} cannot be used ({error}); a port block it names may be handed out again",
+                path.display()
+            );
+        }
         let mut blocks = ReservedPortBlocks::default();
-        for repo in repositories {
-            // A block is held attached or detached, so the records alone decide it: a fault in a
-            // project's kernel mounts is that project's to report, never every `new`'s refusal.
-            let published = self.source.project_storage(&self.storage, &repo)?;
-            let layout = StorageLayout::new(self.storage.store(), &repo).map_err(|error| {
+        for claim in claims {
+            blocks.insert(claim.block);
+        }
+        Ok(blocks)
+    }
+
+    fn port_collisions_blocking(&self) -> Result<PortCollisions, GatewayInventoryError> {
+        let PortClaims { claims, unreadable } = self.port_claims_blocking()?;
+        Ok(PortCollisions {
+            collisions: port_collisions(claims),
+            unreadable,
+        })
+    }
+
+    /// Every macOS port block the store names, with the workspace naming it (04_sandbox.md,
+    /// `portBlock`): the grant every unfinished lifecycle intent carries; each published grant;
+    /// the grant fenced into a pending clone, which owns it even after its creator exits; and
+    /// every grants sidecar whose image is outside the canonical inventory — retained, staged, or
+    /// not yet published from staging. A port is in use while any record names it, so no
+    /// allocation is handed a block before that record is gone. The journal is read first:
+    /// an image leaves the canonical inventory only after its intent is journaled, and is
+    /// published before that intent completes, so a block moving between the two is seen in one
+    /// of them. A sidecar outside the canonical inventory that cannot be read is reported rather
+    /// than failing every allocation on the host.
+    fn port_claims_blocking(&self) -> Result<PortClaims, GatewayInventoryError> {
+        let store = self.storage.store();
+        let mut claims = Vec::new();
+        let mut unreadable = Vec::new();
+        for repo in discover_repositories(store)? {
+            let layout = StorageLayout::new(store, &repo).map_err(|error| {
                 GatewayInventoryError::InvalidMetadata {
-                    path: self.storage.store().to_owned(),
+                    path: store.to_owned(),
                     message: error.to_string(),
                 }
             })?;
+            let project = &layout.project().project_root;
+            let sessions = &layout.project().sessions;
+            // An unfinished lifecycle intent carries the grant of the workspace it rebuilds: a
+            // re-adoption's main. Its image may be anywhere until the intent completes —
+            // retained, staged, or gone with the grant recorded only here.
+            let journal_path = project.join(crate::storage::recovery::LIFECYCLE_INTENTS_FILE);
+            let journal = crate::storage::recovery::LifecycleIntentJournal::load(&journal_path)
+                .map_err(|error| GatewayInventoryError::InvalidMetadata {
+                    path: journal_path.clone(),
+                    message: error.to_string(),
+                })?;
+            let intent = ClaimRecord::Intent(journal_path);
+            for (_, record) in journal.records() {
+                if record.completion.is_none()
+                    && let Some(metadata) = record.operation.carried_metadata()
+                {
+                    claims.extend(port_claims(&repo, metadata, &intent));
+                }
+            }
+            // A block is held attached or detached: kernel mount faults do not refuse every new.
+            let published = self.source.project_storage(&self.storage, &repo)?;
             let active_names = published
                 .iter()
                 .map(|fact| fact.workspace.name())
                 .collect::<BTreeSet<_>>();
             for fact in &published {
                 let image = canonical_image_paths(&layout, &fact.workspace)?;
-                let metadata =
-                    read_current_metadata(self.storage.store(), image.image(), &fact.workspace)?;
-                let block = metadata.grants.port_block.ok_or_else(|| {
-                    GatewayInventoryError::MissingPortBlock {
-                        repo: repo.clone(),
-                        workspace: fact.workspace.name().clone(),
-                    }
-                })?;
-                reserve_port_block(&mut blocks, block)?;
-                for retained in metadata.grants.retained_port_blocks {
-                    reserve_port_block(&mut blocks, retained)?;
-                }
+                let metadata = read_current_metadata(store, image.image(), &fact.workspace)?;
+                claim_granted_blocks(&mut claims, &repo, &metadata, &ClaimRecord::Published)?;
             }
             // Incomplete clones cannot be served, but a canonical pending payload owns its
-            // stored grant even after its creator exits. Sidecar-only fences are reclaimed
-            // during recovery; until the payload exists, the live PID marker protects the claim.
+            // stored grant even after its creator exits.
             if !active_names.contains(&WorkspaceName::main())
                 && let Some(image) = existing_main_image(&layout)?
+                && let Some(metadata) =
+                    Self::pending_metadata(store, &repo, &WorkspaceName::main(), &image)?
             {
-                Self::reserve_pending_port_block(
-                    self.storage.store(),
-                    &repo,
-                    &WorkspaceName::main(),
-                    &image,
-                    &mut blocks,
-                )?;
+                let record = ClaimRecord::PendingFence(sidecar_path(&image));
+                claim_granted_blocks(&mut claims, &repo, &metadata, &record)?;
             }
-            let sessions = &layout.project().sessions;
             let entries = match fs::read_dir(sessions) {
                 Ok(entries) => entries
                     .map(|entry| {
@@ -1260,27 +1510,75 @@ impl NativeGatewayInventory {
             for image in crate::storage::discover_session_images(entries) {
                 // Published images were already validated above. Only pending sidecars
                 // need reading after the canonical directory enumeration.
-                if !active_names.contains(image.workspace()) {
-                    Self::reserve_pending_port_block(
-                        self.storage.store(),
-                        &repo,
-                        image.workspace(),
-                        image.path(),
-                        &mut blocks,
-                    )?;
+                if !active_names.contains(image.workspace())
+                    && let Some(metadata) =
+                        Self::pending_metadata(store, &repo, image.workspace(), image.path())?
+                {
+                    let record = ClaimRecord::PendingFence(sidecar_path(image.path()));
+                    claim_granted_blocks(&mut claims, &repo, &metadata, &record)?;
+                }
+            }
+            // A sidecar names its workspace's grant wherever its image is: a fence whose payload
+            // is still staged, a legacy session image, an image re-adoption retained or staged.
+            // The canonical images above are read already.
+            for (directory, canonical) in [
+                (project.clone(), true),
+                (sessions.clone(), true),
+                (
+                    project.join(crate::storage::recovery::RETAINED_NAMESPACE),
+                    false,
+                ),
+                (
+                    project.join(crate::storage::recovery::STAGING_NAMESPACE),
+                    false,
+                ),
+            ] {
+                for image in sidecar_images(&directory)? {
+                    if canonical
+                        && crate::metadata::is_image_path(&image)
+                        && fs::symlink_metadata(&image).is_ok()
+                    {
+                        continue;
+                    }
+                    let sidecar = sidecar_path(&image);
+                    // Read as the sidecar it is: `read_for_image` refuses the legacy image
+                    // extensions a legacy session image still carries.
+                    let read = verify_no_symlinks(store, &sidecar)
+                        .map_err(|error| error.to_string())
+                        .and_then(|()| {
+                            crate::metadata::read_json::<DetachedWorkspaceMetadata>(&sidecar)
+                                .map_err(|error| error.to_string())
+                        });
+                    match read {
+                        Ok(metadata) if metadata.repo_id == repo => {
+                            let record = ClaimRecord::Sidecar(sidecar);
+                            claims.extend(port_claims(&repo, &metadata, &record));
+                        }
+                        // A record naming another repository cannot name a party of this
+                        // project's collision: it is reported, not trusted.
+                        Ok(metadata) => unreadable.push((
+                            sidecar,
+                            format!(
+                                "it names repository {}, not the project it sits in",
+                                metadata.repo_id
+                            ),
+                        )),
+                        Err(error) => unreadable.push((sidecar, error)),
+                    }
                 }
             }
         }
-        Ok(blocks)
+        Ok(PortClaims { claims, unreadable })
     }
 
-    fn reserve_pending_port_block(
+    /// The metadata of a canonical image nothing has published: its pending fence, or `None` for
+    /// an orphan session image that has no sidecar.
+    fn pending_metadata(
         store_root: &Path,
         repo: &RepoId,
         workspace: &WorkspaceName,
         image: &Path,
-        blocks: &mut ReservedPortBlocks,
-    ) -> Result<(), GatewayInventoryError> {
+    ) -> Result<Option<DetachedWorkspaceMetadata>, GatewayInventoryError> {
         verify_image_path(store_root, image)?;
         let sidecar = sidecar_path(image);
         verify_no_symlinks(store_root, &sidecar).map_err(|error| {
@@ -1299,7 +1597,7 @@ impl NativeGatewayInventory {
                 image.display(),
                 sidecar.display()
             );
-            return Ok(());
+            return Ok(None);
         }
         let metadata = DetachedWorkspaceMetadata::read_for_image(image).map_err(|error| {
             GatewayInventoryError::InvalidMetadata {
@@ -1319,36 +1617,15 @@ impl NativeGatewayInventory {
                 message: "canonical image was not present in the published inventory".to_owned(),
             });
         }
-        let block =
-            metadata
-                .grants
-                .port_block
-                .ok_or_else(|| GatewayInventoryError::MissingPortBlock {
-                    repo: repo.clone(),
-                    workspace: workspace.clone(),
-                })?;
-        reserve_port_block(blocks, block)?;
-        for retained in metadata.grants.retained_port_blocks {
-            reserve_port_block(blocks, retained)?;
-        }
-        Ok(())
+        Ok(Some(metadata))
     }
 
     fn all_attached_blocking(&self) -> Result<Vec<GatewaySessionFact>, GatewayInventoryError> {
         let repositories = discover_repositories(self.storage.store())?;
         let mut facts = Vec::new();
-        let mut port_blocks = ReservedPortBlocks::default();
         for repo in repositories {
             match self.load_project(&repo) {
-                Ok(project) => {
-                    for fact in &project {
-                        reserve_port_block(&mut port_blocks, fact.port_block)?;
-                        for retained in &fact.grants.retained_port_blocks {
-                            reserve_port_block(&mut port_blocks, *retained)?;
-                        }
-                    }
-                    facts.extend(project);
-                }
+                Ok(project) => facts.extend(project),
                 Err(error) => {
                     // Store-wide identity collisions stay fatal. A single project's
                     // mount/metadata mismatch is a doctor finding and must not take
@@ -1356,7 +1633,6 @@ impl NativeGatewayInventory {
                     if matches!(
                         error,
                         GatewayInventoryError::DuplicateRepository(_)
-                            | GatewayInventoryError::OverlappingPortBlocks { .. }
                             | GatewayInventoryError::AmbiguousProjectRoot(_)
                             | GatewayInventoryError::ForeignBinding { .. }
                     ) {
@@ -1517,6 +1793,7 @@ impl NativeGatewayInventory {
                 workspace: workspace.workspace.name().clone(),
                 incarnation: workspace.workspace.incarnation().clone(),
                 revision: grants.revision,
+                created_at: metadata.info_snapshot.created_at.clone(),
                 mount_id,
                 mount: mount.clone(),
                 grants,
@@ -2974,43 +3251,284 @@ mod tests {
     /// A macOS port belongs to at most one workspace host-wide: a block's base is the workspace's
     /// gateway endpoint and its other ports are the workspace's own, so two workspaces whose
     /// blocks share a port — the same block, or a live 16-port block inside another's 64 —
-    /// answer on one port. Both readers of the store refuse — the allocator's scan, and the
-    /// session listing the `RunAtLoad` gateway builds — because installing the second session is
-    /// the harm.
+    /// answer on one port. The store names that as a collision the newer workspace claims, and
+    /// the allocator holds every port either names. The attached listing every other reader uses
+    /// (the mount-root guard among them) still lists both; only the gateway's session path
+    /// serves the older one alone, at startup and per project, so the gateway stays up.
     #[tokio::test]
-    async fn one_port_claimed_twice_is_refused_by_every_store_wide_reader() {
+    async fn one_port_claimed_twice_is_served_only_to_the_older_workspace() {
+        use crate::gateway_sessions::SessionInventory as _;
+
         let fixture = Fixture::new("duplicate-port");
         let live = PortBlock::new(MACOS_PORT_MIN + 16, 16).expect("live 16-port block");
         fixture.plant_port_block(live);
-        let (_repo_a, _repo_b, source) = two_project_store(&fixture);
+        let (repo_a, repo_b, source) = two_project_store(&fixture);
         let inventory = NativeGatewayInventory::with_source(
             fixture.storage.clone(),
             source as Arc<dyn InventorySource>,
         );
 
-        // The fixture hands out disjoint blocks, so the collision has to be planted: one main
-        // holds a live 16-port block inside the 64-port block the other main is issued.
+        // The fixture hands out disjoint blocks, so the collision has to be planted: beta's main
+        // holds a live 16-port block inside the 64-port block alpha's main is issued. Both record
+        // one creation time, so the tie goes to the repository named first: alpha keeps it.
         let fresh = PortBlock::new(MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE).expect("new block");
-        let collision = |error: GatewayInventoryError| match error {
-            GatewayInventoryError::OverlappingPortBlocks { held, claimed } => {
-                let mut pair = [held, claimed];
-                pair.sort_by_key(|block| block.size());
-                pair == [live, fresh]
-            }
-            _ => false,
-        };
-        assert!(collision(
+        let PortCollisions {
+            collisions,
+            unreadable,
+        } = inventory.port_collisions().await.expect("collisions");
+        assert!(unreadable.is_empty(), "{unreadable:?}");
+        assert_eq!(collisions.len(), 1, "{collisions:?}");
+        let collision = &collisions[0];
+        assert_eq!(
+            (&collision.held.repo, collision.held.block),
+            (&repo_a, fresh)
+        );
+        assert_eq!(
+            (&collision.claimed.repo, collision.claimed.block),
+            (&repo_b, live)
+        );
+        assert_eq!(collision.claimed.record, ClaimRecord::Published);
+        let message = collision.to_string();
+        assert!(
+            message.contains("acme/alpha/main") && message.contains("acme/beta/main"),
+            "{message}"
+        );
+        assert_eq!(
             inventory
                 .all_reserved_port_blocks()
                 .await
-                .expect_err("overlapping global port assignment"),
-        ));
-        assert!(collision(
+                .expect("reserved blocks")
+                .blocks()
+                .collect::<Vec<_>>(),
+            [fresh],
+            "every port either workspace names stays out of allocation"
+        );
+        assert_eq!(
             inventory
                 .all_attached()
                 .await
-                .expect_err("a colliding endpoint must not be installed"),
-        ));
+                .expect("attached listing")
+                .iter()
+                .map(|fact| (&fact.repo_id, fact.port_block))
+                .collect::<Vec<_>>(),
+            [(&repo_a, fresh), (&repo_b, live)],
+            "every reader but the gateway's session path sees every attached workspace"
+        );
+        let alpha = crate::gateway_sessions::stable_workspace_id(
+            &repo_a,
+            "main",
+            &WorkspaceIncarnation::new("00000000000000000000000000000001").expect("incarnation"),
+        );
+        let sessions = crate::gateway_sessions::NativeSessionInventory::from_inventory(inventory);
+        let ids = |sessions: Vec<cowshed_gateway_types::WorkspaceSession>| {
+            sessions
+                .into_iter()
+                .map(|session| session.workspace_id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            ids(sessions.all_sessions().await.expect("startup listing")),
+            std::slice::from_ref(&alpha),
+            "the gateway starts serving the older workspace"
+        );
+        assert_eq!(
+            ids(sessions.project_sessions(&repo_a).await.expect("alpha")),
+            [alpha]
+        );
+        assert!(ids(sessions.project_sessions(&repo_b).await.expect("beta")).is_empty());
+    }
+
+    /// The gateway's control socket as a reconcile sees it: one status, then the writes it
+    /// accepts, recorded.
+    struct RecordingControl {
+        status: Mutex<Option<cowshed_gateway_types::DaemonStatus>>,
+        installs: Mutex<Vec<String>>,
+        removes: Mutex<Vec<String>>,
+    }
+
+    impl RecordingControl {
+        fn serving(sessions: Vec<cowshed_gateway_types::SessionStatus>) -> Self {
+            Self {
+                status: Mutex::new(Some(cowshed_gateway_types::DaemonStatus {
+                    version: "test".to_owned(),
+                    draining: false,
+                    drain_cause: None,
+                    executable_sha256: None,
+                    healing: None,
+                    recovering: None,
+                    sessions,
+                    active: 0,
+                    queued: 0,
+                })),
+                installs: Mutex::default(),
+                removes: Mutex::default(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl crate::gateway_sessions::GatewayControl for RecordingControl {
+        async fn status(
+            &self,
+        ) -> std::result::Result<
+            cowshed_gateway_types::DaemonStatus,
+            crate::gateway_sessions::GatewayStatusError,
+        > {
+            Ok(self
+                .status
+                .lock()
+                .expect("status")
+                .take()
+                .expect("a reconcile reads status once"))
+        }
+
+        async fn install(
+            &self,
+            session: &cowshed_gateway_types::WorkspaceSession,
+        ) -> std::result::Result<(), crate::gateway_sessions::ControlRefusal> {
+            self.installs
+                .lock()
+                .expect("installs")
+                .push(session.workspace_id.clone());
+            Ok(())
+        }
+
+        async fn remove(
+            &self,
+            workspace_id: &str,
+            _expected_revision: u64,
+        ) -> std::result::Result<(), crate::gateway_sessions::ControlRefusal> {
+            self.removes
+                .lock()
+                .expect("removes")
+                .push(workspace_id.to_owned());
+            Ok(())
+        }
+    }
+
+    /// Two projects' mains on one block, the older one served: the newer one's project still
+    /// reconciles, installing its other session, instead of refusing over an endpoint a live
+    /// workspace of another project holds (05_gateway.md).
+    #[tokio::test]
+    async fn a_project_with_a_colliding_workspace_still_reconciles_its_other_sessions() {
+        use crate::gateway_sessions::SessionInventory as _;
+
+        let fixture = Fixture::new("collision-reconcile");
+        let shared = PortBlock::new(MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE).expect("shared block");
+        fixture.plant_port_block(shared);
+        let (repo_a, repo_b, source) = two_project_store(&fixture);
+        let (topic, mounted) = fixture.workspace(
+            &repo_b,
+            WorkspaceName::session("topic").expect("topic"),
+            "00000000000000000000000000000003",
+            8,
+            true,
+        );
+        let (mount, path) = mounted.expect("mounted topic");
+        {
+            let mut projects = source.projects.lock().expect("source");
+            let beta = projects.get_mut(&repo_b).expect("beta facts");
+            beta.storage.push(topic);
+            beta.mounts.push(mount.clone());
+            beta.mount_paths.insert(mount.volume_key, path);
+        }
+        let sessions = crate::gateway_sessions::NativeSessionInventory::from_inventory(
+            NativeGatewayInventory::with_source(
+                fixture.storage.clone(),
+                source as Arc<dyn InventorySource>,
+            ),
+        );
+        let alpha = sessions
+            .project_sessions(&repo_a)
+            .await
+            .expect("alpha sessions");
+        assert_eq!(alpha.len(), 1, "alpha serves its main");
+        let control = RecordingControl::serving(vec![cowshed_gateway_types::SessionStatus {
+            workspace_id: alpha[0].workspace_id.clone(),
+            revision: alpha[0].revision,
+            endpoint: alpha[0].endpoint.to_string(),
+            active: 0,
+            queued: 0,
+        }]);
+        let report = crate::gateway_sessions::reconcile_project(&control, &sessions, &repo_b, 501)
+            .await
+            .expect("beta reconciles around its colliding main");
+        let topic = crate::gateway_sessions::stable_workspace_id(
+            &repo_b,
+            "topic",
+            &WorkspaceIncarnation::new("00000000000000000000000000000003").expect("incarnation"),
+        );
+        assert_eq!(*control.installs.lock().expect("installs"), [topic]);
+        assert!(control.removes.lock().expect("removes").is_empty());
+        assert_eq!(report.installed, 1);
+    }
+
+    /// A newer workspace's block shares a port with an older one's whatever order the store
+    /// lists them in; the older keeps it, a third disjoint workspace is no party to it, and one
+    /// workspace's own nested current and retained blocks never collide with each other.
+    #[test]
+    fn collisions_name_the_newer_workspace_as_claimant() {
+        let claim =
+            |repo: &str, workspace: &str, created_at: &str, base: u16, size: u16| PortClaim {
+                repo: RepoId::parse(repo).expect("repo"),
+                workspace: WorkspaceName::new(workspace).expect("workspace"),
+                created_at: created_at.to_owned(),
+                block: PortBlock::new(base, size).expect("block"),
+                record: ClaimRecord::Published,
+            };
+        let older = claim("acme/one", "main", "2026-07-01T00:00:00Z", 40_960, 64);
+        let newer = claim("acme/two", "topic", "2026-07-02T00:00:00Z", 40_960, 64);
+        let own_retained = claim("acme/two", "topic", "2026-07-02T00:00:00Z", 41_024, 16);
+        let own_current = claim("acme/two", "topic", "2026-07-02T00:00:00Z", 41_024, 64);
+        let other = claim("acme/three", "main", "2026-07-03T00:00:00Z", 41_088, 64);
+        let collisions = port_collisions([
+            other,
+            own_current,
+            newer.clone(),
+            own_retained,
+            older.clone(),
+        ]);
+        assert_eq!(
+            collisions,
+            [PortCollision {
+                held: older,
+                claimed: newer,
+            }]
+        );
+    }
+
+    /// A grants sidecar outside the canonical inventory that names another repository is not
+    /// trusted as a claim of this project: it is reported with its reason, and claims nothing.
+    #[tokio::test]
+    async fn a_retained_sidecar_naming_another_repository_is_reported_not_claimed() {
+        let fixture = Fixture::new("foreign-sidecar");
+        let (repo_a, _repo_b, source) = two_project_store(&fixture);
+        let inventory = NativeGatewayInventory::with_source(
+            fixture.storage.clone(),
+            source as Arc<dyn InventorySource>,
+        );
+        let layout = StorageLayout::new(fixture.storage.store(), &repo_a).expect("layout");
+        let main = layout.main_image().expect("main image");
+        let mut foreign =
+            DetachedWorkspaceMetadata::read_for_image(main.image()).expect("alpha main sidecar");
+        foreign.repo_id = RepoId::parse("acme/other").expect("foreign repo");
+        let retained = layout
+            .project()
+            .project_root
+            .join(crate::storage::recovery::RETAINED_NAMESPACE);
+        fs::create_dir_all(&retained).expect("retained");
+        let sidecar = sidecar_path(&retained.join("main-foreign.dmg"));
+        write_json(&sidecar, &foreign).expect("foreign sidecar");
+        let found = inventory.port_collisions().await.expect("collisions");
+        assert!(found.collisions.is_empty(), "{:?}", found.collisions);
+        assert!(
+            matches!(
+                found.unreadable.as_slice(),
+                [(path, reason)] if *path == sidecar && reason.contains("acme/other")
+            ),
+            "{:?}",
+            found.unreadable
+        );
     }
 
     #[tokio::test]

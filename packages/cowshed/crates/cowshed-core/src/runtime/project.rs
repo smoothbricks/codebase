@@ -2492,7 +2492,29 @@ async fn reserve_port_grants(
     reservation_root: &Path,
     used: crate::metadata::ReservedPortBlocks,
 ) -> Result<PortGrantReservation> {
-    for block in crate::metadata::PortBlock::macos_candidates(inventory.port_allocation()) {
+    reserve_port_grants_of_size(
+        inventory,
+        reservation_root,
+        used,
+        crate::metadata::NEW_PORT_BLOCK_SIZE,
+    )
+    .await
+}
+
+/// Claims the lowest `size`-port block disjoint from every block `used` holds.
+#[cfg(target_os = "macos")]
+async fn reserve_port_grants_of_size(
+    inventory: &crate::gateway_inventory::NativeGatewayInventory,
+    reservation_root: &Path,
+    used: crate::metadata::ReservedPortBlocks,
+    size: u16,
+) -> Result<PortGrantReservation> {
+    for block in crate::metadata::PortBlock::macos_candidates_with_size(
+        inventory.port_allocation(),
+        size,
+    )
+    .map_err(native_integrity_error)?
+    {
         if used.overlapping(block).is_some() {
             continue;
         }
@@ -2506,6 +2528,45 @@ async fn reserve_port_grants(
         "no macOS workspace port block remains",
         "remove an unused workspace",
     ))
+}
+
+/// What `owned` holds once it gives up `colliding`, the blocks it shares with an older workspace
+/// (04_sandbox.md, `portBlock`): a colliding current block becomes the lowest free block of its
+/// size, claimed by the returned reservation until the grants publish, and a colliding retained
+/// block is dropped, since its ports are the older workspace's. Answers the current block after.
+#[cfg(target_os = "macos")]
+async fn reserve_port_collision_repair(
+    inventory: &crate::gateway_inventory::NativeGatewayInventory,
+    reservation_root: &Path,
+    owned: &GrantSet,
+    colliding: &[crate::metadata::PortBlock],
+) -> Result<(
+    crate::metadata::PortBlock,
+    GrantSet,
+    Option<PortGrantReservation>,
+)> {
+    let current = owned.port_block.ok_or_else(|| {
+        CowshedError::integrity("workspace has no port block", "cowshed doctor --json")
+    })?;
+    let mut repaired = owned.clone();
+    repaired
+        .retained_port_blocks
+        .retain(|block| !colliding.contains(block));
+    if !colliding.contains(&current) {
+        return Ok((current, repaired, None));
+    }
+    let used = inventory
+        .all_reserved_port_blocks()
+        .await
+        .map_err(native_integrity_error)?;
+    let reservation =
+        reserve_port_grants_of_size(inventory, reservation_root, used, current.size()).await?;
+    let block = reservation
+        .grants
+        .port_block
+        .ok_or_else(|| CowshedError::internal("a macOS port reservation holds no block"))?;
+    repaired.port_block = Some(block);
+    Ok((block, repaired, Some(reservation)))
 }
 
 #[cfg(target_os = "macos")]
@@ -6566,17 +6627,179 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                 .into_iter()
                 .find(|(_, metadata)| &metadata.workspace == destination)
         {
-            // A pending sidecar owns this grant; an independently published duplicate must
-            // refuse before the pending workspace can be activated or served.
+            // A pending sidecar owns this grant; a duplicate published since must refuse before
+            // the pending workspace can be activated or served.
             let storage = self.descriptor.storage.clone();
-            crate::gateway_inventory::NativeGatewayInventory::new(storage)
-                .all_reserved_port_blocks()
+            let collisions = crate::gateway_inventory::NativeGatewayInventory::new(storage)
+                .port_collisions()
                 .await
                 .map_err(native_integrity_error)?;
+            if let Some(collision) = collisions.iter().find(|collision| {
+                [&collision.held, &collision.claimed]
+                    .into_iter()
+                    .any(|claim| {
+                        claim.repo == self.descriptor.repo_id && claim.workspace == *destination
+                    })
+            }) {
+                return Err(CowshedError::integrity(
+                    collision.to_string(),
+                    "cowshed doctor --repair",
+                ));
+            }
             return Ok((metadata.grants, None));
         }
         let reservation = self.fresh_grants().await?;
         Ok((reservation.grants.clone(), Some(reservation)))
+    }
+
+    /// The doctor findings for every macOS port block collision a workspace of this project is
+    /// part of (04_sandbox.md, `portBlock`). Under `--repair` the newer member of each collision
+    /// this project owns is first moved off the shared ports and reported by where it went.
+    async fn port_collision_findings(&mut self) -> Vec<crate::api::dto::Finding> {
+        let collisions = match crate::gateway_inventory::NativeGatewayInventory::new(
+            self.descriptor.storage.clone(),
+        )
+        .port_collisions()
+        .await
+        {
+            Ok(collisions) => collisions,
+            Err(error) => {
+                return vec![native_finding(
+                    "port-block-collision",
+                    crate::api::dto::FindingSeverity::Error,
+                    native_integrity_error(error),
+                )];
+            }
+        };
+        let repo = self.descriptor.repo_id.clone();
+        let mut findings = Vec::new();
+        let mut repairs = std::collections::BTreeMap::<
+            WorkspaceName,
+            Vec<crate::gateway_inventory::PortCollision>,
+        >::new();
+        for collision in collisions {
+            if collision.claimed.repo == repo && self.recovery_scope.repairs() {
+                repairs
+                    .entry(collision.claimed.workspace.clone())
+                    .or_default()
+                    .push(collision);
+            } else if collision.claimed.repo == repo || collision.held.repo == repo {
+                findings.push(port_collision_finding(&collision));
+            }
+        }
+        for (workspace, collisions) in repairs {
+            let colliding = collisions
+                .iter()
+                .map(|collision| collision.claimed.block)
+                .collect::<Vec<_>>();
+            match self.repair_port_collision(&workspace, &colliding).await {
+                Ok(block) => findings.push(crate::api::dto::Finding {
+                    code: "port-block-collision-repaired".into(),
+                    severity: crate::api::dto::FindingSeverity::Info,
+                    message: format!(
+                        "{}; {repo}/{workspace} now holds port block {block}",
+                        collisions
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join("; ")
+                    ),
+                    hint: String::new(),
+                    path: None,
+                }),
+                Err(error) => {
+                    findings.extend(collisions.iter().map(port_collision_finding));
+                    findings.push(crate::api::dto::Finding {
+                        code: "port-block-repair".into(),
+                        severity: crate::api::dto::FindingSeverity::Error,
+                        message: format!(
+                            "cannot move {repo}/{workspace} off its shared port blocks: {}",
+                            error.message
+                        ),
+                        hint: error.hint,
+                        path: None,
+                    });
+                }
+            }
+        }
+        findings
+    }
+
+    /// Moves `workspace` off `colliding`, the blocks it shares with an older workspace
+    /// (04_sandbox.md, `portBlock`), and answers the block it holds afterwards. Like a capacity
+    /// grant that relocates a block it needs an idle workspace: a mounted one's supervisor is
+    /// stopped across the change and started again from the new grants, which republishes
+    /// `.cowshed/env`; a detached one's environment is written from them at its next attach.
+    async fn repair_port_collision(
+        &mut self,
+        workspace: &WorkspaceName,
+        colliding: &[crate::metadata::PortBlock],
+    ) -> Result<crate::metadata::PortBlock> {
+        self.validate_binding().await?;
+        let current = self.current(workspace).await?;
+        let port_lease = if matches!(
+            current.derived.mount_state,
+            crate::storage::lifecycle::MountState::Mounted { .. }
+        ) {
+            self.ensure_supervisor(workspace)
+                .await?
+                .quiesce_if_idle()
+                .await?;
+            Some(self.stop_supervisor(workspace).await?)
+        } else {
+            None
+        };
+        let inventory =
+            crate::gateway_inventory::NativeGatewayInventory::new(self.descriptor.storage.clone());
+        let (block, repaired, reservation) = reserve_port_collision_repair(
+            &inventory,
+            &self.descriptor.storage.store().join(".staging"),
+            &current.metadata.grants,
+            colliding,
+        )
+        .await?;
+        let previous = current.metadata.grants;
+        let lock_path = self
+            .layout
+            .canonical_image(workspace)
+            .map_err(native_integrity_error)?
+            .lock()
+            .to_owned();
+        let image = current.image;
+        self.substrate
+            .dispatch_with_image_lock(lock_path, move || -> Result<()> {
+                let mut metadata =
+                    crate::metadata::DetachedWorkspaceMetadata::read_for_image(&image)
+                        .map_err(native_integrity_error)?;
+                if metadata.grants.port_block != previous.port_block
+                    || metadata.grants.retained_port_blocks != previous.retained_port_blocks
+                {
+                    return Err(CowshedError::conflict(
+                        "workspace port allocation changed during its collision repair",
+                        "run cowshed doctor --repair again",
+                    ));
+                }
+                metadata.grants.port_block = repaired.port_block;
+                metadata.grants.retained_port_blocks = repaired.retained_port_blocks;
+                metadata.grants.revision = metadata
+                    .grants
+                    .revision
+                    .checked_add(1)
+                    .ok_or_else(|| CowshedError::internal("grant revision overflow"))?;
+                metadata
+                    .write_for_image(&image)
+                    .map_err(native_integrity_error)
+            })
+            .await
+            .map_err(native_storage_error)??;
+        // Ownership is durable before the kernel reservations are released, and only then is
+        // the new authority served.
+        drop(reservation);
+        if let Some(lease) = port_lease {
+            drop(lease);
+            self.ensure_supervisor(workspace).await?;
+        }
+        Ok(block)
     }
 
     async fn snapshot_named(&self, name: &WorkspaceName) -> Result<WorkspaceSnapshot> {
@@ -11728,6 +11951,9 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                 error,
             )),
         }
+        // A collision names two workspaces of possibly two projects; each project reports its own
+        // part and, under --repair, moves its newer member.
+        findings.extend(self.port_collision_findings().await);
         // A blocked collection sends the operator here, so this reads gc's own preview rather than a
         // second scan that could disagree with the command that forwarded to it. A preview that
         // cannot be taken at all is itself the finding — reporting a healthy host while `gc` refuses
@@ -16802,6 +17028,23 @@ async fn resolve_checkout_identity_path(
     ))
 }
 
+/// A macOS port block collision a workspace of this project is part of, as doctor reports it.
+#[cfg(target_os = "macos")]
+fn port_collision_finding(
+    collision: &crate::gateway_inventory::PortCollision,
+) -> crate::api::dto::Finding {
+    crate::api::dto::Finding {
+        code: "port-block-collision".into(),
+        severity: crate::api::dto::FindingSeverity::Error,
+        message: format!("{collision}; while both are attached the gateway serves only the older"),
+        hint: format!(
+            "cowshed doctor --repair, run in {}'s checkout, moves {} to a free block",
+            collision.claimed.repo, collision.claimed.workspace
+        ),
+        path: None,
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn native_finding(
     code: &str,
@@ -19814,12 +20057,13 @@ mod port_reservation_tests {
         published
             .write_for_image(main.image())
             .expect("conflicting published grant");
+        // A published grant naming the pending clone's block is a collision, not a second
+        // holding: the newer of the two workspaces is named as claiming the older one's ports.
+        let collisions = inventory.port_collisions().await.expect("collisions");
         assert!(matches!(
-            inventory.all_reserved_port_blocks().await,
-            Err(crate::gateway_inventory::GatewayInventoryError::OverlappingPortBlocks {
-                held,
-                claimed,
-            }) if held.base() == first_base && claimed.base() == first_base
+            collisions.as_slice(),
+            [collision] if collision.held.block.base() == first_base
+                && collision.claimed.block.base() == first_base
         ));
         std::fs::remove_file(main.image()).expect("remove conflicting payload");
         std::fs::remove_file(crate::metadata::sidecar_path(main.image()))
@@ -19836,6 +20080,66 @@ mod port_reservation_tests {
                 crate::storage::apfs::ApfsStorageError::Host(_)
             ))
         ));
+    }
+
+    /// A re-adoption's main sits retained outside the canonical inventory until its replacement
+    /// publishes, so the grant its unfinished intent carries is the only record of main's block.
+    /// A new allocation must not be handed that block.
+    #[tokio::test]
+    async fn an_unfinished_intent_keeps_the_block_it_carries() {
+        use crate::storage::recovery::{LifecycleIntentJournal, re_adopt_tests::Fixture};
+
+        let fixture = Fixture::new();
+        let repo = RepoId::parse("acme/widget").expect("repo");
+        let layout = StorageLayout::new(fixture.store(), &repo).expect("layout");
+        let binding = RepositoryBinding::new(vec![BoundIdentity {
+            repo_id: repo,
+            remote_name: None,
+            remote_url: None,
+            primary: true,
+        }])
+        .expect("binding");
+        crate::metadata::write_json(&layout.project().repository_binding, &binding)
+            .expect("publish binding");
+        let intent = fixture.intent(None);
+        let carried = intent
+            .carried_metadata()
+            .and_then(|metadata| metadata.grants.port_block)
+            .expect("the re-adoption carries main's block");
+        LifecycleIntentJournal::update(&fixture.journal_path(), |journal| {
+            journal.begin(intent);
+            Ok(())
+        })
+        .expect("journal the re-adoption");
+        let home = fixture.store().with_file_name("home");
+        std::fs::create_dir_all(&home).expect("home");
+        let inventory = NativeGatewayInventory::new(ValidatedHostStorage::new(
+            home,
+            CanonicalRoots::at(fixture.store().to_owned()),
+        ));
+        let staging = fixture.store().join(".staging");
+
+        let used = inventory
+            .all_reserved_port_blocks()
+            .await
+            .expect("reserved blocks");
+        assert_eq!(
+            used.overlapping(carried),
+            Some(carried),
+            "the unfinished re-adoption's block is in use"
+        );
+        let next = reserve_port_grants(&inventory, &staging, used)
+            .await
+            .expect("allocation beside the re-adoption");
+        assert!(
+            !next
+                .grants
+                .port_block
+                .expect("next block")
+                .overlaps(carried),
+            "a new allocation is not handed the block an unfinished intent carries"
+        );
+        drop(next);
     }
 
     #[tokio::test]
@@ -20005,7 +20309,7 @@ mod port_reservation_tests {
         for candidate in PortBlock::macos_candidates(inventory.port_allocation())
             .filter(|candidate| *candidate != block)
         {
-            others.insert(candidate).expect("disjoint candidate blocks");
+            others.insert(candidate);
         }
         let refused = match reserve_port_grants(&inventory, &staging, others).await {
             Ok(granted) => panic!(
@@ -20030,7 +20334,7 @@ mod port_reservation_tests {
         let held = || PortBlock::macos_candidates(allocation).skip(count / 2);
         let mut used = crate::metadata::ReservedPortBlocks::default();
         for block in held() {
-            used.insert(block).expect("disjoint held blocks");
+            used.insert(block);
         }
         let granted = reserve_port_grants(&inventory, &staging, used)
             .await

@@ -669,6 +669,123 @@ async fn real_apfs_adopt_initializes_mains_spotlight_marker() {
     assert_eq!(marker.len(), 0);
 }
 
+/// Two workspaces recorded with one port block — what an allocator that missed an unfinished
+/// intent's block handed out — are a `port-block-collision` doctor names with both, and
+/// `doctor --repair` moves the newer one to a free block: its grants publish the new block and
+/// its served `.cowshed/env` exports it.
+#[tokio::test]
+async fn real_apfs_doctor_repair_moves_the_newer_of_two_workspaces_sharing_a_port_block() {
+    let mut fixture = Fixture::new();
+    let mut service = fixture.open().await;
+    adopt(&fixture, &mut service).await;
+    fixture.start_gateway().await;
+    service
+        .reconcile_gateway()
+        .await
+        .expect("install main gateway session");
+    let topic = new_workspace(&mut service, "topic").await;
+    let main_block = service
+        .grants("main")
+        .await
+        .expect("main grants")
+        .port_block
+        .expect("main block");
+    service
+        .shutdown()
+        .await
+        .expect("stop runtime before planting");
+
+    // Plant the duplicate the allocator once handed out: topic's grants name main's block.
+    let layout = cowshed_core::storage::StorageLayout::new(
+        fixture.storage.store(),
+        &RepoId::parse("fixture/dispatch").expect("repository identity"),
+    )
+    .expect("project layout");
+    let image = layout
+        .session_image(&WorkspaceName::session("topic").expect("topic"))
+        .expect("topic image")
+        .image()
+        .to_owned();
+    let mut metadata = cowshed_core::metadata::DetachedWorkspaceMetadata::read_for_image(&image)
+        .expect("topic metadata");
+    metadata.grants.port_block = Some(main_block);
+    metadata
+        .write_for_image(&image)
+        .expect("plant the duplicate block");
+
+    let findings = |stdout: &[u8], code: &str| -> Vec<String> {
+        let doctor: serde_json::Value = serde_json::from_slice(stdout).expect("doctor --json");
+        doctor["result"]["findings"]
+            .as_array()
+            .expect("doctor findings")
+            .iter()
+            .filter(|finding| finding["code"] == code)
+            .map(|finding| finding["message"].as_str().unwrap_or_default().to_owned())
+            .collect()
+    };
+    // Plain doctor opens as an inspection, the way the CLI opens it, and changes nothing.
+    let mut inspection = ActorBridge::open_existing_at(
+        &fixture.checkout,
+        RecoveryScope::Inspect,
+        fixture.storage.clone(),
+    )
+    .await
+    .expect("open the project for inspection");
+    // Doctor exits 5 on any error finding the scratch host has; only its report matters here.
+    let (_, stdout, _) = run(&mut inspection, ["--json", "doctor"]).await;
+    let collisions = findings(&stdout, "port-block-collision");
+    assert!(
+        matches!(collisions.as_slice(), [message]
+            if message.contains("fixture/dispatch/topic") && message.contains("fixture/dispatch/main")),
+        "doctor names both workspaces of the collision: {collisions:?}"
+    );
+    inspection.shutdown().await.expect("close the inspection");
+
+    let mut service = fixture.reopen().await;
+    let (_, stdout, _) = run(&mut service, ["--json", "doctor", "--repair"]).await;
+    let repaired = findings(&stdout, "port-block-collision-repaired");
+    assert_eq!(
+        repaired.len(),
+        1,
+        "doctor --repair moves topic: {repaired:?}"
+    );
+    let moved = service
+        .grants("topic")
+        .await
+        .expect("topic grants")
+        .port_block
+        .expect("topic block");
+    assert!(
+        !moved.overlaps(main_block),
+        "{moved} still shares ports with {main_block}"
+    );
+    assert_eq!(moved.size(), main_block.size());
+    assert_eq!(
+        service
+            .grants("main")
+            .await
+            .expect("main grants")
+            .port_block,
+        Some(main_block),
+        "the older workspace keeps its block"
+    );
+    service
+        .path("topic", false)
+        .await
+        .expect("topic is served from its repaired grants");
+    let environment =
+        fs::read_to_string(topic.join(".cowshed/env")).expect("topic's workspace environment");
+    assert!(
+        environment.contains(&format!("export COWSHED_PORT_BASE={}\n", moved.base())),
+        "{environment}"
+    );
+    let (_, stdout, _) = run(&mut service, ["--json", "doctor"]).await;
+    assert!(findings(&stdout, "port-block-collision").is_empty());
+    service.shutdown().await.expect("shutdown runtime");
+    fixture.stop_gateway().await;
+
+}
+
 /// A plain Git repository, adopted and served through a real gateway, with one workspace,
 /// `topic`. Its exec runs with no shell hook. Push preserves the workspace branch as
 /// `refs/cowshed/topic/heads/cowshed/topic` in main's repository and never moves main's

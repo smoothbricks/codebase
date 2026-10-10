@@ -799,8 +799,9 @@ impl fmt::Display for PortBlock {
     }
 }
 
-/// The port blocks live workspaces hold at their currently granted sizes. A block that
-/// shares a port with a held one is refused, so the set is disjoint by construction.
+/// Every port the store's workspaces hold, as the fewest disjoint blocks covering them. Aligned
+/// blocks nest or stay disjoint, never straddle, so the union of held blocks is itself a set of
+/// disjoint blocks: the allocator asks it which candidate is free, whoever named a held port.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ReservedPortBlocks(BTreeMap<u16, PortBlock>);
 
@@ -815,15 +816,17 @@ impl ReservedPortBlocks {
             .filter(|held| held.overlaps(block))
     }
 
-    /// Holds `block`, or names the held block it would share a port with.
-    pub fn insert(&mut self, block: PortBlock) -> Result<(), PortBlock> {
-        match self.overlapping(block) {
-            Some(held) => Err(held),
-            None => {
-                self.0.insert(block.base, block);
-                Ok(())
-            }
+    /// Holds every port of `block`. A held block that shares a port with it either contains it,
+    /// and already holds those ports, or lies inside it and is replaced by it.
+    pub fn insert(&mut self, block: PortBlock) {
+        if self
+            .overlapping(block)
+            .is_some_and(|held| held.base <= block.base && block.last() <= held.last())
+        {
+            return;
         }
+        self.0.retain(|_, held| !held.overlaps(block));
+        self.0.insert(block.base, block);
     }
 
     pub fn is_empty(&self) -> bool {
@@ -1849,39 +1852,39 @@ mod tests {
         }
     }
 
-    /// Live blocks of several sizes share the store; the reserved set holds any of them and
-    /// refuses exactly the blocks that share a port with a held one, naming that one.
+    /// Live blocks of several sizes share the store; the reserved set holds every port any of
+    /// them names, as the fewest disjoint blocks: a block inside a held one adds nothing, and a
+    /// block containing held ones replaces them.
     #[test]
-    fn reserved_blocks_of_mixed_sizes_never_overlap() {
+    fn reserved_blocks_of_mixed_sizes_hold_their_union() {
         let block = |base: u16, size: u16| PortBlock::new(base, size).unwrap();
         let mut reserved = ReservedPortBlocks::default();
         let live = block(MACOS_PORT_MIN + 16, 16);
-        reserved.insert(live).unwrap();
-        reserved.insert(block(MACOS_PORT_MIN + 128, 16)).unwrap();
+        reserved.insert(live);
+        reserved.insert(block(MACOS_PORT_MIN + 128, 16));
+        assert_eq!(reserved.overlapping(block(MACOS_PORT_MIN, 16)), None);
         assert_eq!(
-            reserved.insert(block(MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE)),
-            Err(live)
+            reserved.overlapping(block(MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE)),
+            Some(live)
         );
-        assert_eq!(reserved.insert(block(MACOS_PORT_MIN + 16, 16)), Err(live));
-        reserved.insert(block(MACOS_PORT_MIN, 16)).unwrap();
-        reserved
-            .insert(block(MACOS_PORT_MIN + 64, NEW_PORT_BLOCK_SIZE))
-            .unwrap();
+        reserved.insert(block(MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE));
+        reserved.insert(live);
+        reserved.insert(block(MACOS_PORT_MIN, 16));
+        reserved.insert(block(MACOS_PORT_MIN + 64 + 48, 16));
+        reserved.insert(block(MACOS_PORT_MIN + 64, NEW_PORT_BLOCK_SIZE));
         assert_eq!(
-            reserved.insert(block(MACOS_PORT_MIN + 64 + 48, 16)),
-            Err(block(MACOS_PORT_MIN + 64, NEW_PORT_BLOCK_SIZE))
+            reserved.blocks().collect::<Vec<_>>(),
+            [
+                block(MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE),
+                block(MACOS_PORT_MIN + 64, NEW_PORT_BLOCK_SIZE),
+                block(MACOS_PORT_MIN + 128, 16),
+            ]
         );
         assert_eq!(
             PortBlock::macos_candidates(PortAllocation::Host)
                 .find(|candidate| reserved.overlapping(*candidate).is_none()),
             Some(block(MACOS_PORT_MIN + 192, NEW_PORT_BLOCK_SIZE))
         );
-        let held = reserved.blocks().collect::<Vec<_>>();
-        for (index, first) in held.iter().enumerate() {
-            for second in &held[index + 1..] {
-                assert!(!first.overlaps(*second), "{first} and {second} overlap");
-            }
-        }
     }
 
     #[test]
