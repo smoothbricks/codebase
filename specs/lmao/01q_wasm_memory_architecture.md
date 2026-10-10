@@ -852,9 +852,12 @@ Code generation in `wasmSpanBuffer.ts`:
   - Write values directly into those WASM-memory views
   - Set null bits in the null bitmap at the start of family storage
 - `generateStringSetter()` - generates string writers to JS arrays
-- Column methods generated at class construction via `new Function()`
+- The schema-specific class (constructor + column members) is built on first use per schema by the compiled renderer
+  (`new Function()`) or by `wasmSpanBufferClosureMaterializer.ts`, which composes the same members from closures with no
+  source text, as selected by
+  [01b6 Materializer Selection](./01b6_buffer_codegen_extension.md#smoo/lmao!n/buffer-codegen.materializer-selection)
 - Fluent API preserved (all methods return `this`)
-- Supports both numeric (float64, uint32, uint8) and string (category, text) column types
+- Supports both numeric (float64, uint64, uint8) and string (category, text) column types
 
 ### Span Lifecycle Writer <a id="smoo/lmao!n/wasm-mem.trace-root"></a>
 

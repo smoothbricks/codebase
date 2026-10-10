@@ -11,7 +11,7 @@
  */
 
 import type { ColumnValueType } from '@smoothbricks/arrow-builder';
-import { getSchemaType } from '@smoothbricks/arrow-builder';
+import { activeMaterializerMode, getSchemaType } from '@smoothbricks/arrow-builder';
 import { checkCapacityTuning } from '../capacityTuning.js';
 import { installLifecycleAppenders } from '../lifecycleAppenders.js';
 import type { OpMetadata } from '../op.js';
@@ -33,6 +33,7 @@ import {
   type WasmNumericFamily,
   type WasmPhysicalLayoutDescriptor,
 } from './wasmPhysicalLayout.js';
+import { materializeWasmSpanBufferClass } from './wasmSpanBufferClosureMaterializer.js';
 
 // Spec link (88): realizes specs/lmao/01q_wasm_memory_architecture.md#smoo/lmao!n/wasm-mem (SpanBuffer + SpanLogger codegen).
 //#region smoo/lmao!n/wasm-mem.spanbuffer
@@ -175,12 +176,12 @@ export interface WasmSpanBufferConstructor<T extends LogSchema = LogSchema> {
 /**
  * Size class for WASM allocation (determines which freelist to use).
  */
-type SizeClass = '1b' | '4b' | '8b' | 'string';
+type SizeClass = '1b' | '8b' | 'string';
 
 /**
- * Metadata for a single column - used during code generation.
+ * Metadata for a single column, shared by the compiled and closure-composed materializers.
  */
-interface ColumnMeta {
+export interface WasmColumnMeta {
   /** Column name from schema */
   name: string;
   /** WASM allocation size class */
@@ -242,7 +243,8 @@ function getWasmSpanBufferConstructor<T extends LogSchema>(
   return instance.constructor;
 }
 
-function isWasmSpanBufferFactory(value: unknown): value is () => WasmSpanBufferConstructor {
+/** Narrows a materializer's class shell; getWasmSpanBufferClass installs the shared members and statics next. */
+function isWasmSpanBufferClassShell(value: unknown): value is WasmSpanBufferConstructor {
   return typeof value === 'function';
 }
 
@@ -250,8 +252,8 @@ function isWasmSpanBufferFactory(value: unknown): value is () => WasmSpanBufferC
  * Build column metadata array from schema.
  * Maps each schema field to its storage characteristics.
  */
-function buildColumnMeta(schema: LogSchema, eagerColumns: EagerColumnDescriptor): ColumnMeta[] {
-  const result: ColumnMeta[] = [];
+function buildColumnMeta(schema: LogSchema, eagerColumns: EagerColumnDescriptor): WasmColumnMeta[] {
+  const result: WasmColumnMeta[] = [];
   const fields = schema.fields;
   const preallocatedColumns = new Set(eagerColumns.names);
   let columnIndex = 0;
@@ -542,7 +544,7 @@ function wasmInspect(this: WasmSpanBufferInstance): string {
  * Generate eager column initialization code for constructor.
  * Eager columns are pre-allocated, lazy columns start as undefined/-1.
  */
-function generateColumnInit(columnMeta: ColumnMeta[]): string {
+function generateColumnInit(columnMeta: WasmColumnMeta[]): string {
   const lines: string[] = [];
   for (const col of columnMeta) {
     if (col.name === 'message' || col.sizeClass !== 'string') continue;
@@ -559,7 +561,7 @@ function generateColumnInit(columnMeta: ColumnMeta[]): string {
   return lines.join('\n    ');
 }
 
-function generateNumericViewBinding(col: ColumnMeta, layoutIndex: number): string {
+function generateNumericViewBinding(col: WasmColumnMeta, layoutIndex: number): string {
   const arrayType =
     col.schemaType === 'number'
       ? 'Float64Array'
@@ -567,9 +569,7 @@ function generateNumericViewBinding(col: ColumnMeta, layoutIndex: number): strin
         ? 'BigUint64Array'
         : col.sizeClass === '1b'
           ? 'Uint8Array'
-          : col.sizeClass === '4b'
-            ? 'Uint32Array'
-            : 'Float64Array';
+          : 'Float64Array';
   return `const column = this._layout.columns[${layoutIndex}];
       const familyPtr = this._familyPtrs[column.family];
       this._${col.name}_nulls = new Uint8Array(memory, familyPtr + column.nullOffset, column.nullByteLength);
@@ -577,7 +577,7 @@ function generateNumericViewBinding(col: ColumnMeta, layoutIndex: number): strin
       this._columnPtrs[${col.columnIndex}] = familyPtr + column.nullOffset;`;
 }
 
-function generateEnsureNumericView(col: ColumnMeta, layoutIndex: number): string {
+function generateEnsureNumericView(col: WasmColumnMeta, layoutIndex: number): string {
   if (col.isSchemaEager || col.isPreallocated) return '';
   return `if (this._columnPtrs[${col.columnIndex}] === -1) {
       const memory = this._allocator.memory.buffer;
@@ -585,7 +585,7 @@ function generateEnsureNumericView(col: ColumnMeta, layoutIndex: number): string
     }`;
 }
 
-function generateNumericSetter(col: ColumnMeta, layoutIndex: number): string {
+function generateNumericSetter(col: WasmColumnMeta, layoutIndex: number): string {
   const ensureView = generateEnsureNumericView(col, layoutIndex);
   const validity = col.isSchemaEager
     ? `this._${col.name}_values[idx] = value;`
@@ -603,7 +603,7 @@ function generateNumericSetter(col: ColumnMeta, layoutIndex: number): string {
   }`;
 }
 
-function generateNumericValuesGetter(col: ColumnMeta, layoutIndex: number): string {
+function generateNumericValuesGetter(col: WasmColumnMeta, layoutIndex: number): string {
   return `get ${col.name}_values() {
     this._ensureWasmViews();
     ${generateEnsureNumericView(col, layoutIndex)}
@@ -611,7 +611,7 @@ function generateNumericValuesGetter(col: ColumnMeta, layoutIndex: number): stri
   }`;
 }
 
-function generateNumericNullsGetter(col: ColumnMeta, layoutIndex: number): string {
+function generateNumericNullsGetter(col: WasmColumnMeta, layoutIndex: number): string {
   if (col.isSchemaEager) {
     return `get ${col.name}_nulls() { return undefined; }`;
   }
@@ -623,7 +623,7 @@ function generateNumericNullsGetter(col: ColumnMeta, layoutIndex: number): strin
 }
 
 function generateViewRefresh(
-  columnMeta: ColumnMeta[],
+  columnMeta: WasmColumnMeta[],
   messageLayoutFamily: MessageLayoutFamily,
   messagePhysicalLayout: MessagePhysicalLayout,
 ): string {
@@ -655,9 +655,11 @@ function generateViewRefresh(
       this._identityView = new Uint8Array(memory, this._identityPtr, 128);
       this._identityData = new DataView(memory, this._identityPtr, 128);
     } else {
-      this._identitySource._ensureWasmViews();
-      this._identityView = this._identitySource._identityView;
-      this._identityData = this._identitySource._identityData;
+      const identitySource = this._identitySource;
+      if (!identitySource) throw new Error('Overflow buffer requires an identity owner');
+      identitySource._ensureWasmViews();
+      this._identityView = identitySource._identityView;
+      this._identityData = identitySource._identityData;
     }`);
   let layoutIndex = 0;
   for (const col of columnMeta) {
@@ -674,7 +676,7 @@ function generateViewRefresh(
   return lines.join('\n    ');
 }
 
-function generateColumnLookup(columnMeta: ColumnMeta[], nulls: boolean): string {
+function generateColumnLookup(columnMeta: WasmColumnMeta[], nulls: boolean): string {
   const cases: string[] = [];
   for (const col of columnMeta) {
     if (col.name === 'message') continue;
@@ -687,7 +689,7 @@ function generateColumnLookup(columnMeta: ColumnMeta[], nulls: boolean): string 
   return `switch (columnIndex) { ${cases.join(' ')} default: return undefined; }`;
 }
 
-function generateEnsureStringStorage(col: ColumnMeta): string {
+function generateEnsureStringStorage(col: WasmColumnMeta): string {
   if (col.isSchemaEager || col.isPreallocated) return '';
   return `if (this._${col.name}_values === undefined) {
       this._${col.name}_values = new Array(this._capacity);
@@ -698,7 +700,7 @@ function generateEnsureStringStorage(col: ColumnMeta): string {
 /**
  * Generate setter method for a string column (stored in JS).
  */
-function generateStringSetter(col: ColumnMeta): string {
+function generateStringSetter(col: WasmColumnMeta): string {
   const ensureStorage = generateEnsureStringStorage(col);
   if (col.isSchemaEager) {
     return `${col.name}(idx, value) {
@@ -739,7 +741,7 @@ function generateStringSetter(col: ColumnMeta): string {
 /**
  * Generate getter for string column values.
  */
-function generateStringValuesGetter(col: ColumnMeta): string {
+function generateStringValuesGetter(col: WasmColumnMeta): string {
   const ensureStorage = generateEnsureStringStorage(col);
   return `get ${col.name}_values() {
     if (this._descriptor.state !== 'live') throw new Error('Cannot read a released WASM buffer');
@@ -751,7 +753,7 @@ function generateStringValuesGetter(col: ColumnMeta): string {
 /**
  * Generate getter for string column nulls.
  */
-function generateStringNullsGetter(col: ColumnMeta): string {
+function generateStringNullsGetter(col: WasmColumnMeta): string {
   if (col.isSchemaEager) {
     return `get ${col.name}_nulls() {
     return undefined;
@@ -770,7 +772,7 @@ function generateStringNullsGetter(col: ColumnMeta): string {
  * Generate column methods for all schema columns.
  * Note: 'message' column is handled specially by generateMessageMethods() and excluded here.
  */
-function generateColumnMethods(columnMeta: ColumnMeta[]): string {
+function generateColumnMethods(columnMeta: WasmColumnMeta[]): string {
   const methods: string[] = [];
   let layoutIndex = 0;
 
@@ -795,31 +797,12 @@ function generateColumnMethods(columnMeta: ColumnMeta[]): string {
 // Class Cache and Generation
 // =============================================================================
 
-/** Cache for generated WASM SpanBuffer classes, partitioned by schema and message family. */
-const wasmSpanBufferClassCache = new WeakMap<LogSchema, Map<string, object>>();
-
-/**
- * Generate a WASM SpanBuffer class for the given schema.
- *
- * Generates minimal constructor + column methods, then assigns common methods to prototype.
- *
- * @param schema - LogSchema defining the buffer structure
- * @returns WasmSpanBufferConstructor for creating buffer instances
- */
-export function getWasmSpanBufferClass<T extends LogSchema>(
-  schema: T,
-  messageLayoutFamily: MessageLayoutFamily = 'mixed',
-  messagePhysicalLayout: MessagePhysicalLayout = 'current',
-  eagerColumns: EagerColumnDescriptor = EMPTY_EAGER_COLUMNS,
-): WasmSpanBufferConstructor<T> {
-  const cacheKey = `${messageLayoutFamily}:${messagePhysicalLayout}:${eagerColumns.key}`;
-  let familyClasses = wasmSpanBufferClassCache.get(schema);
-  const cached = familyClasses?.get(cacheKey);
-  if (cached !== undefined && isWasmSpanBufferConstructor(cached, schema, messageLayoutFamily, messagePhysicalLayout))
-    return cached;
-
-  const columnMeta = buildColumnMeta(schema, eagerColumns);
-
+/** Compiled materializer: render the schema-specific class source and evaluate it with `new Function`. */
+function compileWasmSpanBufferClass(
+  columnMeta: WasmColumnMeta[],
+  messageLayoutFamily: MessageLayoutFamily,
+  messagePhysicalLayout: MessagePhysicalLayout,
+): unknown {
   // Generate ONLY schema-specific code (constructor + column methods)
   const classCode = `
 class WasmSpanBuffer {
@@ -943,13 +926,47 @@ class WasmSpanBuffer {
 
 return WasmSpanBuffer;
 `;
+  const factory: unknown = new Function(classCode);
+  if (typeof factory !== 'function') throw new Error('Expected WasmSpanBuffer factory function');
+  return factory();
+}
 
-  // Create the class using Function constructor
-  const factory = new Function(classCode);
-  if (!isWasmSpanBufferFactory(factory)) {
-    throw new Error('Expected WasmSpanBuffer factory function');
+/** Cache for generated WASM SpanBuffer classes, partitioned by schema and message family. */
+const wasmSpanBufferClassCache = new WeakMap<LogSchema, Map<string, object>>();
+
+/**
+ * Generate a WASM SpanBuffer class for the given schema.
+ *
+ * Builds the schema-specific shell (constructor + column members) with the materializer
+ * activeMaterializerMode() selects (specs/lmao/01b6 §Materializer Selection), then assigns
+ * the schema-independent members to its prototype.
+ *
+ * @param schema - LogSchema defining the buffer structure
+ * @returns WasmSpanBufferConstructor for creating buffer instances
+ */
+export function getWasmSpanBufferClass<T extends LogSchema>(
+  schema: T,
+  messageLayoutFamily: MessageLayoutFamily = 'mixed',
+  messagePhysicalLayout: MessagePhysicalLayout = 'current',
+  eagerColumns: EagerColumnDescriptor = EMPTY_EAGER_COLUMNS,
+): WasmSpanBufferConstructor<T> {
+  const mode = activeMaterializerMode();
+  // Mode-prefixed like arrow-builder's class caches: parity suites flip the mode via override.
+  const cacheKey = `${mode}:${messageLayoutFamily}:${messagePhysicalLayout}:${eagerColumns.key}`;
+  let familyClasses = wasmSpanBufferClassCache.get(schema);
+  const cached = familyClasses?.get(cacheKey);
+  if (cached !== undefined && isWasmSpanBufferConstructor(cached, schema, messageLayoutFamily, messagePhysicalLayout))
+    return cached;
+
+  const columnMeta = buildColumnMeta(schema, eagerColumns);
+  const generatedClass =
+    mode === 'compiled'
+      ? compileWasmSpanBufferClass(columnMeta, messageLayoutFamily, messagePhysicalLayout)
+      : materializeWasmSpanBufferClass(columnMeta, messageLayoutFamily, messagePhysicalLayout);
+  if (!isWasmSpanBufferClassShell(generatedClass)) {
+    throw new Error('Expected a generated WasmSpanBuffer class');
   }
-  const WasmSpanBufferClass = factory();
+  const WasmSpanBufferClass = generatedClass;
 
   // Assign common methods to prototype (shared by all schemas)
   Object.defineProperty(WasmSpanBufferClass.prototype, 'timestamp', {

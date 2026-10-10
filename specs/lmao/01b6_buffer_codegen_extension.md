@@ -17,16 +17,13 @@ materializer for runtimes where a class build may not run string codegen
 
 ### Materializer Selection <a id="smoo/lmao!n/buffer-codegen.materializer-selection"></a>
 
-arrow-builder's `ColumnBuffer`/`ColumnWriter` and lmao's `SpanLogger`/`ResultWriter` classes are each built by one of
-two materializers from the same schema-derived plan:
+arrow-builder's `ColumnBuffer`/`ColumnWriter` and lmao's `SpanLogger`/`ResultWriter`/`WasmSpanBuffer` classes are each
+built by one of two materializers from the same schema-derived plan:
 
 - **compiled**: renders class source and evaluates it with `new Function`;
 - **closure**: installs per-field closures on one shared prototype per schema, with no source text. It produces
   byte-identical buffers (pinned by the parity suites) and rejects code-string extension fields that have no
   `closureInit`/`closureMethods` counterpart.
-
-lmao's `WasmSpanBuffer` class (`packages/lmao/src/lib/wasm/wasmSpanBuffer.ts`) has only the compiled form and does not
-consult the selection, so it cannot be built inside a workerd request.
 
 Classes are built lazily, per schema, on first use; on a server that first use is usually inside a request. The choice
 therefore answers "may every context that builds a class run `new Function`", not "may module init run it". workerd
