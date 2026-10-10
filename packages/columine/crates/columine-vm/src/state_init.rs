@@ -333,18 +333,31 @@ fn valid_scalar_subtype(byte: u8) -> bool {
 /// The init grammar: every slot claimed once with the type its record declares,
 /// then the reduce section's bitmap algebra checked against those declarations
 /// at the successful `HALT`, where the declarations are complete.
-fn validate_init_code(view: &ProgramView<'_>) -> Result<(), ProgramInvalidCause> {
-    let code = view.init_code;
+fn validate_init_code(view: &ProgramView<'_>) -> Result<(), SizingRefusal> {
     // Every slot is defined exactly once, by an init instruction of at least
     // five bytes, so a header counting more slots than the init section has
     // bytes is refused before the bookkeeping for it is allocated.
+    let malformed = SizingRefusal::Invalid(ProgramInvalidCause::MalformedProgram);
     let Ok(num_slots) = usize::try_from(view.num_slots) else {
-        return Err(ProgramInvalidCause::MalformedProgram);
+        return Err(malformed);
     };
-    if num_slots > code.len() {
-        return Err(ProgramInvalidCause::MalformedProgram);
+    if num_slots > view.init_code.len() {
+        return Err(malformed);
     }
-    let mut declared: Vec<Option<SlotTypeFlags>> = vec![None; num_slots];
+    let mut declared: Vec<Option<SlotTypeFlags>> = Vec::new();
+    declared
+        .try_reserve_exact(num_slots)
+        .map_err(|_| SizingRefusal::OutOfMemory)?;
+    declared.resize(num_slots, None);
+    check_init_code(view, &mut declared).map_err(SizingRefusal::Invalid)
+}
+
+/// [`validate_init_code`] over its backed per-slot declaration table.
+fn check_init_code(
+    view: &ProgramView<'_>,
+    declared: &mut [Option<SlotTypeFlags>],
+) -> Result<(), ProgramInvalidCause> {
+    let code = view.init_code;
     let mut pc = 0usize;
 
     while pc < code.len() {
@@ -356,9 +369,9 @@ fn validate_init_code(view: &ProgramView<'_>) -> Result<(), ProgramInvalidCause>
             if pc != code.len() || !declared.iter().all(Option::is_some) {
                 return Err(ProgramInvalidCause::MalformedProgram);
             }
-            return bitmap_algebra_admitted(view.reduce_code, &declared);
+            return bitmap_algebra_admitted(view.reduce_code, declared);
         }
-        let Some((_, after_slot)) = claim_slot(code, pc, op, &mut declared) else {
+        let Some((_, after_slot)) = claim_slot(code, pc, op, declared) else {
             return Err(ProgramInvalidCause::MalformedProgram);
         };
         pc = after_slot;
@@ -557,9 +570,10 @@ fn declared_bitmap(declared: &[Option<SlotTypeFlags>], slot: u32) -> Option<Slot
 fn validated_program<'a>(
     program: &'a [u8],
     accepted_program_magics: &[u32],
-) -> Result<ProgramView<'a>, ProgramInvalidCause> {
-    let view = parse_program(program, accepted_program_magics)
-        .ok_or(ProgramInvalidCause::MalformedProgram)?;
+) -> Result<ProgramView<'a>, SizingRefusal> {
+    let view = parse_program(program, accepted_program_magics).ok_or(SizingRefusal::Invalid(
+        ProgramInvalidCause::MalformedProgram,
+    ))?;
     validate_init_code(&view)?;
     Ok(view)
 }
@@ -567,13 +581,15 @@ fn validated_program<'a>(
 // State Size Calculation — vm_calculate_state_size
 // =============================================================================
 
-/// Calculate the required state-buffer size or retain the actual admission cause.
+/// Calculate the required state-buffer size, or retain the actual admission
+/// cause, or `OutOfMemory` when checking the program's declarations could not
+/// be backed.
 pub fn calculate_state_size(
     program: &[u8],
     accepted_program_magics: &[u32],
-) -> Result<u32, ProgramInvalidCause> {
+) -> Result<u32, SizingRefusal> {
     let view = validated_program(program, accepted_program_magics)?;
-    calculate_state_size_from_view(&view)
+    calculate_state_size_from_view(&view).map_err(SizingRefusal::Invalid)
 }
 
 fn calculate_state_size_from_view(view: &ProgramView<'_>) -> Result<u32, ProgramInvalidCause> {
@@ -836,8 +852,7 @@ pub fn init_state(
     program: &[u8],
     accepted_program_magics: &[u32],
 ) -> Result<(), ErrorCode> {
-    let view = validated_program(program, accepted_program_magics)
-        .map_err(|_| ErrorCode::InvalidProgram)?;
+    let view = validated_program(program, accepted_program_magics).map_err(SizingRefusal::code)?;
     let required = calculate_state_size_from_view(&view).map_err(|_| ErrorCode::InvalidProgram)?;
     if state.len() < required as usize {
         return Err(ErrorCode::InvalidState);
@@ -1270,8 +1285,7 @@ pub fn reset_state(
     program: &[u8],
     accepted_program_magics: &[u32],
 ) -> Result<(), ErrorCode> {
-    let view = validated_program(program, accepted_program_magics)
-        .map_err(|_| ErrorCode::InvalidProgram)?;
+    let view = validated_program(program, accepted_program_magics).map_err(SizingRefusal::code)?;
     let required = calculate_state_size_from_view(&view).map_err(|_| ErrorCode::InvalidProgram)?;
     if state.len() < required as usize {
         return Err(ErrorCode::InvalidState);
@@ -2678,6 +2692,25 @@ impl From<InvalidSource> for ProgramInvalidCause {
     }
 }
 
+/// Why a program could not be sized: it is invalid, or the memory to check
+/// its declarations could not be had. Only the first is a property of the
+/// program; the same program may size with more room.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SizingRefusal {
+    Invalid(ProgramInvalidCause),
+    OutOfMemory,
+}
+
+impl SizingRefusal {
+    /// The status an `ErrorCode` boundary reports for this refusal.
+    pub fn code(self) -> ErrorCode {
+        match self {
+            Self::Invalid(_) => ErrorCode::InvalidProgram,
+            Self::OutOfMemory => ErrorCode::OutOfMemory,
+        }
+    }
+}
+
 /// Byte length of the sizing record a status-plus-record export writes: four
 /// little-endian u32 words.
 pub const SIZING_RECORD_LEN: u32 = 16;
@@ -2688,16 +2721,21 @@ pub const SIZING_CAUSE_MALFORMED: u32 = 1;
 pub const SIZING_CAUSE_BITMAP_TTL_SOURCE: u32 = 2;
 
 /// Status and record words for one sizing result. `Ok` names `[size, 0, 0, 0]`;
-/// a refusal names `[0, kind, source, target]`, where source and target are
-/// meaningful only for the TTL-layout cause. The status discriminates the
-/// record; no word is read as absence.
-pub fn sizing_record(result: Result<u32, ProgramInvalidCause>) -> (ErrorCode, [u32; 4]) {
+/// an `InvalidProgram` refusal names `[0, kind, source, target]`, where source
+/// and target are meaningful only for the TTL-layout cause; `OutOfMemory`
+/// names no words. The status discriminates the record; no word is read as
+/// absence.
+pub fn sizing_record(result: Result<u32, SizingRefusal>) -> (ErrorCode, [u32; 4]) {
     match result {
         Ok(size) => (ErrorCode::Ok, [size, 0, 0, 0]),
-        Err(ProgramInvalidCause::MalformedProgram) => {
+        Err(SizingRefusal::OutOfMemory) => (ErrorCode::OutOfMemory, [0; 4]),
+        Err(SizingRefusal::Invalid(ProgramInvalidCause::MalformedProgram)) => {
             (ErrorCode::InvalidProgram, [0, SIZING_CAUSE_MALFORMED, 0, 0])
         }
-        Err(ProgramInvalidCause::BitmapTtlSourceToUntrackedTarget { source, target }) => (
+        Err(SizingRefusal::Invalid(ProgramInvalidCause::BitmapTtlSourceToUntrackedTarget {
+            source,
+            target,
+        })) => (
             ErrorCode::InvalidProgram,
             [0, SIZING_CAUSE_BITMAP_TTL_SOURCE, source, target],
         ),

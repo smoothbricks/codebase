@@ -73,6 +73,19 @@ export class VmProgramAdmissionError extends Error {
   }
 }
 
+/**
+ * The VM could not back the memory an operation needs. Nothing was written,
+ * and the same call may succeed once the host has more room.
+ */
+export class VmOutOfMemoryError extends Error {
+  readonly code = ErrorCode.OUT_OF_MEMORY;
+
+  constructor(readonly operation: string) {
+    super(`Out of memory: ${operation}`);
+    this.name = 'VmOutOfMemoryError';
+  }
+}
+
 /** A host-supplied state image the native VM refused where it entered. */
 export class VmStateAdmissionError extends Error {
   constructor(readonly code: ErrorCode) {
@@ -383,6 +396,7 @@ export async function createColumineWasmBackend(wasmBytes: BufferSource): Promis
       if (size < STATE_HEADER_SIZE) throw new Error(`WASM admission returned invalid state size ${size}`);
       return size;
     }
+    if (status === ErrorCode.OUT_OF_MEMORY) throw new VmOutOfMemoryError('sizing the program');
     if (status === ErrorCode.INVALID_PROGRAM) {
       switch (output.getUint32(4, true)) {
         case 1:
@@ -666,6 +680,7 @@ export async function createColumineWasmBackend(wasmBytes: BufferSource): Promis
       wasmU8.fill(0, statePtr, statePtr + stateSize);
       wasmU8.set(program.bytecode, programPtr);
       const initResult = wasmInstance.exports.vm_init_state(statePtr, programPtr, program.bytecode.length);
+      if (initResult === ErrorCode.OUT_OF_MEMORY) throw new VmOutOfMemoryError('initializing state');
       if (initResult !== ErrorCode.OK) {
         throw new Error(`Failed to initialize state: error code ${initResult}`);
       }
@@ -680,6 +695,7 @@ export async function createColumineWasmBackend(wasmBytes: BufferSource): Promis
       const programPtr = align8(statePtr + state.size);
       new Uint8Array(wasmInstance.memory.buffer).set(program.bytecode, programPtr);
       const result = wasmInstance.exports.vm_reset_state(statePtr, programPtr, program.bytecode.length);
+      if (result === ErrorCode.OUT_OF_MEMORY) throw new VmOutOfMemoryError('resetting state');
       if (result !== ErrorCode.OK) throw new Error(`Failed to reset state: error code ${result}`);
       new Uint8Array(state.buffer).set(new Uint8Array(wasmInstance.memory.buffer, statePtr, state.size));
     },

@@ -95,6 +95,7 @@ export type { VmProgramInvalidCause } from './wasm-backend.js';
 export {
   createColumineWasmBackend,
   loadColumineWasm,
+  VmOutOfMemoryError,
   VmProgramAdmissionError,
   VmStateAdmissionError,
 } from './wasm-backend.js';

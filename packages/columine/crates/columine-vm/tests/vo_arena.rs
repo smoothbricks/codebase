@@ -29,7 +29,7 @@ use columine_types::types::{
 use columine_vm::bytes;
 use columine_vm::meta::slot_meta_base;
 use columine_vm::state_init::{
-    ARENA_HEADER_SIZE, DEFAULT_ACCEPTED_PROGRAM_MAGICS, ProgramInvalidCause,
+    ARENA_HEADER_SIZE, DEFAULT_ACCEPTED_PROGRAM_MAGICS, ProgramInvalidCause, SizingRefusal,
     calculate_grown_state_size, calculate_state_size, init_state, needs_growth_slot,
 };
 use columine_vm::struct_map::StructMapSlot;
@@ -2071,7 +2071,13 @@ fn unsupported_vo_descriptors_refuse_initialization() {
     for (name, init_code) in refused {
         let prog = program(0, &init_code, &[]);
         let size = calculate_state_size(&prog, DEFAULT_ACCEPTED_PROGRAM_MAGICS);
-        assert_eq!(Err(ProgramInvalidCause::MalformedProgram), size, "{name}");
+        assert_eq!(
+            Err(SizingRefusal::Invalid(
+                ProgramInvalidCause::MalformedProgram
+            )),
+            size,
+            "{name}"
+        );
         let mut state = vec![0u8; 1 << 16];
         let status = init_state(&mut state, &prog, DEFAULT_ACCEPTED_PROGRAM_MAGICS);
         assert_eq!(Err(ErrorCode::InvalidProgram), status, "{name}");

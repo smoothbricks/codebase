@@ -2,6 +2,8 @@
 //! refuses missing VO capability/schema declarations before an image exists.
 //! Positive VO kernel certification lives with the runtime's real capability.
 
+mod common;
+
 use columine_types::PROGRAM_MAGIC;
 use columine_types::vo::{
     UnavailableVoAdmission, VoAdmissionError, VoFieldLink, VoMetadata, VoProfile, VoProgramMetadata,
@@ -9,9 +11,12 @@ use columine_types::vo::{
 use columine_vm::program_admission::{
     AdmittedProgram, ProgramAdmissionError, ProgramScratch, declares_vo,
 };
-use columine_vm::state_init::{DEFAULT_ACCEPTED_PROGRAM_MAGICS, ProgramInvalidCause};
+use columine_vm::state_init::{
+    DEFAULT_ACCEPTED_PROGRAM_MAGICS, ProgramInvalidCause, SizingRefusal,
+};
 use columine_vm::struct_map::StructMapSlot;
 use columine_vm::vm::{Vm, u32s_as_bytes};
+use common::memory::{at_every_allocation, with_allocations};
 
 /// Wrap an init and a reduce section in a real program header: one slot,
 /// three inputs, each section's length taken from its bytes.
@@ -115,6 +120,28 @@ fn ordinary_owned_program_executes_and_rolls_back_without_a_vo_capability() {
     // bitsets equal the pre-batch image, byte for byte.
     assert!(StructMapSlot::bind(&state, 0).find(&state, 7).is_none());
     assert_eq!(state, before);
+
+    // Load draws its plans from the host's memory. Under a memory ceiling
+    // each allocation it makes can be refused, and each refusal answers
+    // OutOfMemory with nothing loaded, never an abort; with room it loads.
+    let array_bool = assemble(&struct_map_init(&[9]), &CSR_UPSERT);
+    for code in [program(0), array_bool] {
+        let (_, needed) = at_every_allocation(
+            || (code.clone(), VoProgramMetadata::default()),
+            |(code, metadata)| {
+                AdmittedProgram::load(
+                    code,
+                    metadata,
+                    UnavailableVoAdmission,
+                    DEFAULT_ACCEPTED_PROGRAM_MAGICS,
+                )
+            },
+            |budget, error| {
+                assert_eq!(error, ProgramAdmissionError::OutOfMemory, "budget {budget}");
+            },
+        );
+        assert!(needed > 0, "load draws on the host's memory");
+    }
 }
 
 #[test]
@@ -144,6 +171,31 @@ fn vo_load_requires_both_schema_link_and_real_capability() {
         Some(ProgramAdmissionError::Preparation(error))
             if error.error == VoAdmissionError::Unavailable
     ));
+
+    // The refusal allocates nothing of its own: under every budget a load
+    // the capability refuses answers OutOfMemory or that same refusal.
+    for budget in 0..64 {
+        let (code, metadata) = (program(10), metadata());
+        let refusal = with_allocations(budget, || {
+            AdmittedProgram::load(
+                code,
+                metadata,
+                UnavailableVoAdmission,
+                DEFAULT_ACCEPTED_PROGRAM_MAGICS,
+            )
+            .err()
+        });
+        assert!(
+            matches!(&refusal, Some(ProgramAdmissionError::OutOfMemory))
+                || matches!(
+                    &refusal,
+                    Some(ProgramAdmissionError::Preparation(error))
+                        if error.error == VoAdmissionError::Unavailable
+                            && error.root == "example.Counter"
+                ),
+            "budget {budget}: {refusal:?}"
+        );
+    }
 }
 
 #[test]
@@ -354,7 +406,9 @@ fn struct_map_opcode_cannot_alias_another_declared_slot_kind() {
     code[58] = 5; // StructMap opcode, Array type flags: no historical alias.
     assert_eq!(
         columine_vm::state_init::calculate_state_size(&code, DEFAULT_ACCEPTED_PROGRAM_MAGICS),
-        Err(ProgramInvalidCause::MalformedProgram)
+        Err(SizingRefusal::Invalid(
+            ProgramInvalidCause::MalformedProgram
+        ))
     );
     assert_eq!(
         AdmittedProgram::load(

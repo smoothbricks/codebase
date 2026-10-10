@@ -4,7 +4,8 @@ use columine_types::operand::encode_index;
 use columine_types::types::{ChangeFlag, ErrorCode, STATE_HEADER_SIZE, SlotMetaOffset};
 use columine_vm::bytes;
 use columine_vm::state_init::{
-    DEFAULT_ACCEPTED_PROGRAM_MAGICS, ProgramInvalidCause, calculate_state_size, init_state,
+    DEFAULT_ACCEPTED_PROGRAM_MAGICS, ProgramInvalidCause, SizingRefusal, calculate_state_size,
+    init_state,
 };
 use columine_vm::struct_map::StructMapSlot;
 use columine_vm::vm::{CheckedStructMap, Vm, u32s_as_bytes};
@@ -345,7 +346,9 @@ fn top_level_max_rejects_unmapped_invalid_and_non_scalar_comparisons() {
     // exists; execution of it against a valid state still refuses cleanly.
     assert_eq!(
         calculate_state_size(&truncated, DEFAULT_ACCEPTED_PROGRAM_MAGICS),
-        Err(ProgramInvalidCause::MalformedProgram)
+        Err(SizingRefusal::Invalid(
+            ProgramInvalidCause::MalformedProgram
+        ))
     );
     let layout = program(3, &[0, 0], &[]);
     assert_invalid_without_mutation(&layout, &truncated, &1u32.to_le_bytes());

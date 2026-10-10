@@ -58,6 +58,18 @@ pub enum ProgramAdmissionError {
         instruction_offset: u32,
         cause: VoProgramRefusal,
     },
+    /// The memory to admit the program could not be had: nothing was
+    /// loaded, and the same load may succeed with more room.
+    OutOfMemory,
+}
+
+impl From<state_init::SizingRefusal> for ProgramAdmissionError {
+    fn from(refusal: state_init::SizingRefusal) -> Self {
+        match refusal {
+            state_init::SizingRefusal::Invalid(cause) => Self::InvalidProgram(cause),
+            state_init::SizingRefusal::OutOfMemory => Self::OutOfMemory,
+        }
+    }
 }
 
 /// Bytecode and schema declarations certified together by a native capability.
@@ -79,7 +91,7 @@ pub struct AdmittedProgram<A: VoProgramAdmission> {
 impl<A: VoProgramAdmission> AdmittedProgram<A> {
     pub fn load(
         bytecode: Box<[u8]>,
-        metadata: VoProgramMetadata,
+        mut metadata: VoProgramMetadata,
         mut admission: A,
         accepted_magics: &[u32],
     ) -> Result<Self, ProgramAdmissionError> {
@@ -87,8 +99,7 @@ impl<A: VoProgramAdmission> AdmittedProgram<A> {
             ProgramHeader::sections(&bytecode).ok_or(ProgramAdmissionError::InvalidProgram(
                 state_init::ProgramInvalidCause::MalformedProgram,
             ))?;
-        let state_size = state_init::calculate_state_size(&bytecode, accepted_magics)
-            .map_err(ProgramAdmissionError::InvalidProgram)?;
+        let state_size = state_init::calculate_state_size(&bytecode, accepted_magics)?;
         let magic = sections.header.magic;
         let binds_rows = row_table(&bytecode)
             .map_err(|_| {
@@ -134,11 +145,21 @@ impl<A: VoProgramAdmission> AdmittedProgram<A> {
             }
         })?;
         let inputs = InputPlan::compile(sections.init_code, sections.reduce_code, &metadata)?;
-        prepare_each(&mut admission, metadata.schemas())
-            .map_err(ProgramAdmissionError::Preparation)?;
+        if let Err(refused) = prepare_each(&mut admission, metadata.schemas()) {
+            // The refused schema's root is moved out of the declarations this
+            // load owns: naming the refusal allocates nothing.
+            let root = core::mem::take(&mut metadata.fields[refused.index].schema.root);
+            return Err(ProgramAdmissionError::Preparation(VoPreparationError {
+                root,
+                error: refused.error,
+            }));
+        }
 
         let reduce_base = sections.reduce_code.as_ptr() as usize - bytecode.as_ptr() as usize;
-        let mut found_roles = Vec::with_capacity(metadata.counts.len());
+        let mut found_roles = Vec::new();
+        found_roles
+            .try_reserve_exact(metadata.counts.len())
+            .map_err(|_| ProgramAdmissionError::OutOfMemory)?;
         visit_counts(sections.reduce_code, reduce_base, &mut |offset, op| {
             if declared_field(sections.init_code, op.slot, op.field_idx)?
                 != Some(StructFieldType::Vo)

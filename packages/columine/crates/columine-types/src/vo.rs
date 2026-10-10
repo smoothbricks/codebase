@@ -189,29 +189,36 @@ pub struct VoPreparationError {
     pub error: VoAdmissionError,
 }
 
+/// The first declared schema a capability refused: its position in the
+/// declaration order and the refusal. It owns nothing, so a refusal never
+/// allocates; the caller, which owns the declarations, names the root.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VoRefusedSchema {
+    pub index: usize,
+    pub error: VoAdmissionError,
+}
+
 /// Prepare `admission` once for each distinct metadata in `declared`, in
 /// order; a repeat of an already prepared metadata is skipped. The first
-/// refusal stops preparation and names its root. Returns how many distinct
-/// schemas were prepared, so a consumer can tell an empty declaration from a
-/// prepared one.
+/// refusal stops preparation and names its position. Returns how many
+/// distinct schemas were prepared, so a consumer can tell an empty
+/// declaration from a prepared one. Repeats are found by comparing with the
+/// earlier declarations, so preparation allocates nothing.
 pub fn prepare_each<'m, A: VoAdmission>(
     admission: &mut A,
-    declared: impl IntoIterator<Item = &'m VoMetadata>,
-) -> Result<usize, VoPreparationError> {
-    let mut prepared: Vec<&VoMetadata> = Vec::new();
-    for metadata in declared {
-        if prepared.contains(&metadata) {
+    declared: impl Iterator<Item = &'m VoMetadata> + Clone,
+) -> Result<usize, VoRefusedSchema> {
+    let mut prepared = 0;
+    for (index, metadata) in declared.clone().enumerate() {
+        if declared.clone().take(index).any(|prior| prior == metadata) {
             continue;
         }
         admission
             .prepare(metadata)
-            .map_err(|error| VoPreparationError {
-                root: metadata.root.clone(),
-                error,
-            })?;
-        prepared.push(metadata);
+            .map_err(|error| VoRefusedSchema { index, error })?;
+        prepared += 1;
     }
-    Ok(prepared.len())
+    Ok(prepared)
 }
 
 /// Admit `bytes` through `admission` and check its proof: it must name the
@@ -284,7 +291,7 @@ pub struct VoProgramMetadata {
 impl VoProgramMetadata {
     /// Every schema the program declares, repeats included; feed it to
     /// [`prepare_each`].
-    pub fn schemas(&self) -> impl Iterator<Item = &VoMetadata> {
+    pub fn schemas(&self) -> impl Iterator<Item = &VoMetadata> + Clone {
         self.fields.iter().map(|link| &link.schema)
     }
 
@@ -523,9 +530,9 @@ mod tests {
     fn the_unavailable_capability_refuses_every_request() {
         let line = metadata("orders.Line");
         assert_eq!(
-            prepare_each(&mut UnavailableVoAdmission, [&line, &line]),
-            Err(VoPreparationError {
-                root: "orders.Line".into(),
+            prepare_each(&mut UnavailableVoAdmission, [&line, &line].into_iter()),
+            Err(VoRefusedSchema {
+                index: 0,
                 error: VoAdmissionError::Unavailable,
             })
         );

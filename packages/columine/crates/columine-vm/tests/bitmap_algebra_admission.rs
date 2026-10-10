@@ -13,7 +13,8 @@ use columine_types::types::{
 use columine_types::vo::{UnavailableVoAdmission, VoProgramMetadata};
 use columine_vm::program_admission::{AdmittedProgram, ProgramAdmissionError};
 use columine_vm::state_init::{
-    DEFAULT_ACCEPTED_PROGRAM_MAGICS, ProgramInvalidCause, calculate_state_size, init_state,
+    DEFAULT_ACCEPTED_PROGRAM_MAGICS, ProgramInvalidCause, SizingRefusal, calculate_state_size,
+    init_state,
 };
 
 const HASH_PREFIX: usize = PROGRAM_HASH_PREFIX as usize;
@@ -117,7 +118,7 @@ fn nested_flat_maps(body: &[u8], levels: usize) -> Vec<u8> {
 fn assert_refused(prog: &[u8], cause: ProgramInvalidCause) {
     assert_eq!(
         calculate_state_size(prog, DEFAULT_ACCEPTED_PROGRAM_MAGICS),
-        Err(cause)
+        Err(SizingRefusal::Invalid(cause))
     );
     let mut image = vec![0xa5u8; 4096];
     assert_eq!(

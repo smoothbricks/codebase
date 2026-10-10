@@ -823,7 +823,14 @@ impl<A: VoAdmission> PreparedSchemas<A> {
         for schema in schemas.values() {
             collect_vo_metadata(schema, &mut declared);
         }
-        let presence = match prepare_each(&mut admission, declared)? {
+        let prepared =
+            prepare_each(&mut admission, declared.iter().copied()).map_err(|refused| {
+                VoPreparationError {
+                    root: declared[refused.index].root.clone(),
+                    error: refused.error,
+                }
+            })?;
+        let presence = match prepared {
             0 => VoPresence::Absent,
             _ => VoPresence::Present,
         };

@@ -12,9 +12,10 @@ use columine_vm::meta::SlotMetaView;
 use columine_vm::nested::nested_slot_data_size;
 use columine_vm::slot_growth::slot_data_size;
 use columine_vm::state_init::{
-    EVICTED_BUFFER_CAP, EVICTION_ENTRY_SIZE, ProgramInvalidCause, arena_initial_capacity_64,
-    calculate_grown_state_size, calculate_state_size, compute_struct_row_layout_padded, grow_state,
-    init_state, reset_state, struct_map_slot_data_size, ttl_side_buffer_size,
+    EVICTED_BUFFER_CAP, EVICTION_ENTRY_SIZE, ProgramInvalidCause, SizingRefusal,
+    arena_initial_capacity_64, calculate_grown_state_size, calculate_state_size,
+    compute_struct_row_layout_padded, grow_state, init_state, reset_state,
+    struct_map_slot_data_size, ttl_side_buffer_size,
 };
 use columine_vm::{aggregates, bytes};
 use proptest::prelude::*;
@@ -104,7 +105,9 @@ fn assert_invalid_init_without_mutation(num_slots: u32, init: &[u8]) {
             &prog,
             columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS
         ),
-        Err(ProgramInvalidCause::MalformedProgram)
+        Err(SizingRefusal::Invalid(
+            ProgramInvalidCause::MalformedProgram
+        ))
     );
 
     let mut state = vec![0xa5; 256];
@@ -147,7 +150,9 @@ fn program_magic_acceptance_uses_embedder_set() {
             &foreign,
             columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS
         ),
-        Err(ProgramInvalidCause::MalformedProgram)
+        Err(SizingRefusal::Invalid(
+            ProgramInvalidCause::MalformedProgram
+        ))
     );
     let accepted = [PROGRAM_MAGIC, foreign_magic];
     assert!(calculate_state_size(&foreign, &accepted).expect("valid program admission") > 0);
@@ -546,7 +551,9 @@ fn hashmap_no_timestamp_plus_ttl_combination_rejected() {
             &prog,
             columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS
         ),
-        Err(ProgramInvalidCause::MalformedProgram)
+        Err(SizingRefusal::Invalid(
+            ProgramInvalidCause::MalformedProgram
+        ))
     );
 
     let mut state = vec![0u8; 256];
@@ -569,14 +576,18 @@ fn calculate_state_size_rejects_bad_magic_and_short_programs() {
             &prog,
             columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS
         ),
-        Err(ProgramInvalidCause::MalformedProgram)
+        Err(SizingRefusal::Invalid(
+            ProgramInvalidCause::MalformedProgram
+        ))
     );
     assert_eq!(
         calculate_state_size(
             &[0u8; 8],
             columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS
         ),
-        Err(ProgramInvalidCause::MalformedProgram)
+        Err(SizingRefusal::Invalid(
+            ProgramInvalidCause::MalformedProgram
+        ))
     );
 }
 
@@ -1258,7 +1269,9 @@ fn condition_tree_capacity_must_be_a_power_of_two() {
                 &program,
                 columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
             ),
-            Err(ProgramInvalidCause::MalformedProgram),
+            Err(SizingRefusal::Invalid(
+                ProgramInvalidCause::MalformedProgram
+            )),
             "capacity {cap}"
         );
         // Sizing refused the program, so init is probed on a fixed image.

@@ -114,6 +114,41 @@ struct ForEachFilter {
     match_ids: Box<[u32]>,
 }
 
+impl Scope {
+    /// A copy whose storage is backed fallibly: admission refuses as out of
+    /// memory rather than aborting.
+    fn try_clone(&self) -> Result<Self, ProgramAdmissionError> {
+        let filter = match &self.filter {
+            Some(filter) => Some(ForEachFilter {
+                type_col: filter.type_col,
+                match_ids: backed(filter.match_ids.iter().copied())?,
+            }),
+            None => None,
+        };
+        let mut flat_maps = Vec::new();
+        flat_maps
+            .try_reserve_exact(self.flat_maps.len())
+            .map_err(|_| ProgramAdmissionError::OutOfMemory)?;
+        flat_maps.extend_from_slice(&self.flat_maps);
+        Ok(Self { filter, flat_maps })
+    }
+}
+
+/// Collect `items` into exactly backed storage, or refuse as out of memory.
+fn backed(items: impl ExactSizeIterator<Item = u32>) -> Result<Box<[u32]>, ProgramAdmissionError> {
+    let mut out = Vec::new();
+    out.try_reserve_exact(items.len())
+        .map_err(|_| ProgramAdmissionError::OutOfMemory)?;
+    out.extend(items);
+    Ok(out.into_boxed_slice())
+}
+
+/// Back one more element of `buf`, or refuse as out of memory.
+fn one_more<T>(buf: &mut Vec<T>) -> Result<(), ProgramAdmissionError> {
+    buf.try_reserve(1)
+        .map_err(|_| ProgramAdmissionError::OutOfMemory)
+}
+
 impl InputPlan {
     /// Link every value-object CSR pair the reduce section `code` reads to a
     /// schema of `metadata`, then refuse any operand that would observe a
@@ -219,12 +254,12 @@ impl Builder<'_> {
                     let body = r.bytes(body_len).ok_or(invalid.clone())?;
                     scope.filter = Some(ForEachFilter {
                         type_col,
-                        match_ids: ids
-                            .as_chunks::<4>()
-                            .0
-                            .iter()
-                            .map(|id| u32::from_le_bytes(*id))
-                            .collect(),
+                        match_ids: backed(
+                            ids.as_chunks::<4>()
+                                .0
+                                .iter()
+                                .map(|id| u32::from_le_bytes(*id)),
+                        )?,
                     });
                     self.collect(body, scope, depth + 1)?;
                     scope.filter = None;
@@ -236,6 +271,7 @@ impl Builder<'_> {
                     r.index().ok_or(invalid.clone())?;
                     let body_len = usize::from(r.u16().ok_or(invalid.clone())?);
                     let body = r.bytes(body_len).ok_or(invalid.clone())?;
+                    one_more(&mut scope.flat_maps)?;
                     scope.flat_maps.push(offsets_col);
                     self.collect(body, scope, depth + 1)?;
                     scope.flat_maps.pop();
@@ -373,7 +409,8 @@ impl Builder<'_> {
                     return Err(invalid);
                 }
                 if !input.scopes.contains(scope) {
-                    input.scopes.push(scope.clone());
+                    one_more(&mut input.scopes)?;
+                    input.scopes.push(scope.try_clone()?);
                 }
                 return Ok(());
             }
@@ -385,13 +422,17 @@ impl Builder<'_> {
                 return Err(invalid);
             }
         }
+        let mut scopes = Vec::new();
+        one_more(&mut scopes)?;
+        scopes.push(scope.try_clone()?);
+        one_more(&mut self.inputs)?;
         self.inputs.push(Input {
             link,
             slot: field.slot,
             field_idx: field.field_idx,
             offsets_col,
             values_col,
-            scopes: vec![scope.clone()],
+            scopes,
         });
         Ok(())
     }

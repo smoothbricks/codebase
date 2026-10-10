@@ -10,7 +10,7 @@ use columine_types::types::{
 };
 use columine_vm::bytes;
 use columine_vm::state_init::{
-    ARENA_HEADER_SIZE, DEFAULT_ACCEPTED_PROGRAM_MAGICS, ProgramInvalidCause,
+    ARENA_HEADER_SIZE, DEFAULT_ACCEPTED_PROGRAM_MAGICS, ProgramInvalidCause, SizingRefusal,
     calculate_grown_state_size, calculate_state_size, grow_state, init_state, needs_growth_slot,
     struct_field_offset,
 };
@@ -151,7 +151,9 @@ fn unknown_and_truncated_block_opcodes_reject_before_mutation_or_undo() {
         let prog = program(1, 2, &init_code, &for_each(TYPE_A, &body));
         assert_eq!(
             calculate_state_size(&prog, DEFAULT_ACCEPTED_PROGRAM_MAGICS),
-            Err(ProgramInvalidCause::MalformedProgram)
+            Err(SizingRefusal::Invalid(
+                ProgramInvalidCause::MalformedProgram
+            ))
         );
         let mut state = layout.clone();
         let before = state.clone();
@@ -181,7 +183,9 @@ fn truncated_top_level_opcode_rejects_before_mutation_or_undo() {
     let prog = program(1, 0, &init_code, &[Opcode::BatchMapUpsertLatest as u8, 0]);
     assert_eq!(
         calculate_state_size(&prog, DEFAULT_ACCEPTED_PROGRAM_MAGICS),
-        Err(ProgramInvalidCause::MalformedProgram)
+        Err(SizingRefusal::Invalid(
+            ProgramInvalidCause::MalformedProgram
+        ))
     );
     let mut state = init(&program(1, 0, &init_code, &[]));
     let before = state.clone();
