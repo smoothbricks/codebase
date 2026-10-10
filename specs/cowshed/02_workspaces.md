@@ -391,10 +391,15 @@ source nor destination may start new work while the rename is unfinished, and th
 ownership transfer and source retirement complete. Recovery resumes the exact journaled source/destination pair rather
 than creating another incarnation or discarding staged state. A rename intent still `Prepared` with no `PendingFence`
 destination is discarded and named, like a refused fork; only a mutating rename or one with durable destination facts
-resumes. Before source retirement, including a retry with an existing destination, the destination's HEAD and
-non-optional-locking porcelain-status digest must equal the source fence; linked worktrees must also have equal
-index-byte digests. A mismatch keeps both workspaces and the unfinished intent, with a rename-specific preservation
-refusal.
+resumes. Before source retirement, including a retry with an existing destination, the destination's HEAD and a
+read-only work digest must equal the source fence. Without optional locks, the digest covers the porcelain status with
+its branch header, the binary diff of the index against HEAD, the binary diff of the working tree against the index, and
+the path, mode and bytes of every untracked non-ignored file. Links rewritten by inherited-link restoration compare by
+path only. Linked worktrees must also have equal index-byte digests. A mismatch keeps both workspaces and the unfinished
+intent, with a rename-specific preservation refusal. An untracked nested repository is Git's `??dir/` entry: its
+contents are not a path the rename can carry by bytes, so the workspace rename refuses it with `conflict` before any
+capture, naming the directory and the way out — commit it, move it out of the workspace, or exclude it, then retry.
+Untracked files are preserved by path, mode and bytes; a nested repository is never recursed into.
 
 Moving an adopted checkout is always cowshed-mediated (`mv <ws> <new-path>`): the image is detached, published at the
 new path, and reattached — no unmount-and-remount gap at the user's path, no relink to maintain.
