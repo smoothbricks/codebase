@@ -5267,7 +5267,6 @@ async fn real_apfs_rename_keeps_edits_written_after_clone_publication() {
 }
 
 #[tokio::test]
-
 async fn real_apfs_managed_install_restores_developer_links_before_nx_and_cleans_absolute_bypass() {
     cowshed_core::runtime::shell_host::register(
         cowshed_core::runtime::shell_host::ShellHostProgram::with_arguments(
@@ -5397,6 +5396,40 @@ async fn real_apfs_managed_install_restores_developer_links_before_nx_and_cleans
         nx,
         "terminal cleanup restored the absolute bypass"
     );
+    // A tool that a covered install ran may not replace the wrapper or the real binary it execs.
+    let links_before = (
+        fs::read_link(topic.join("node_modules/nx")).unwrap(),
+        fs::read_link(topic.join("node_modules/.bin/nx")).unwrap(),
+    );
+    for script in [
+        "rm .cowshed/tools/bin/bun",
+        ": > .cowshed/tools/real-bin/bun",
+    ] {
+        let (exit, _, stderr) = run(
+            &mut service,
+            ["exec", "links", "--", "/bin/sh", "-c", script],
+        )
+        .await;
+        let stderr = String::from_utf8_lossy(&stderr).into_owned();
+        assert_ne!(
+            exit.expect("the admitted child returned an exit code"),
+            0,
+            "{script} was refused: {stderr}"
+        );
+        assert!(
+            stderr.contains("Operation not permitted"),
+            "{script} names the kernel refusal: {stderr}"
+        );
+    }
+    assert_eq!(
+        (
+            fs::read_link(topic.join("node_modules/nx")).unwrap(),
+            fs::read_link(topic.join("node_modules/.bin/nx")).unwrap(),
+        ),
+        links_before,
+        "a denied tool write leaves the developer links byte-identical"
+    );
+    sh(&mut service, "links", "bun --version").await;
     let link_grants = service.grants("links").await.expect("baseline grants").read;
     sh(
         &mut service,
@@ -5427,12 +5460,221 @@ async fn real_apfs_managed_install_restores_developer_links_before_nx_and_cleans
         ["exec", "links", "--", "/bin/sh", "-c", &denied],
     )
     .await;
-    assert_ne!(exit.unwrap_or(-1), 0);
-    assert!(
-        String::from_utf8_lossy(&stderr).contains("Operation not permitted"),
-        "kernel denied the later foreign target: {}",
+    let code = exit.expect("the admitted child returned an exit code");
+    assert_ne!(
+        code,
+        0,
+        "the foreign read was refused: {}",
         String::from_utf8_lossy(&stderr)
     );
+    let stderr = String::from_utf8_lossy(&stderr);
+    assert!(
+        stderr.contains("cat:"),
+        "cat reported the refusal: {stderr}"
+    );
+    assert!(
+        stderr.contains("Operation not permitted"),
+        "kernel denied the later foreign target: {stderr}"
+    );
+    sh(&mut service, "links", "true").await;
     drop(service);
+    fixture.stop_gateway().await;
+}
+
+/// A covered `bun install` that a real root postinstall displaces the developer links of and then
+/// stays alive in, killed through the public job API before it finishes: terminal cleanup must
+/// restore the links it removed, because the wrapper recorded the install, and leave no marker.
+#[tokio::test]
+async fn real_apfs_killed_covered_install_restores_links_its_postinstall_removed() {
+    cowshed_core::runtime::shell_host::register(
+        cowshed_core::runtime::shell_host::ShellHostProgram::with_arguments(
+            env!("CARGO_BIN_EXE_cowshed"),
+            vec![cowshed_core::runtime::shell_host::SHELL_HOST_ARGUMENT.into()],
+        ),
+    );
+    let (nx, node) = repository_nx();
+    let mut fixture = Fixture::with(Project::Build {
+        nx: Some((&nx, &node)),
+        rust: None,
+    });
+    // Real Bun runs the root's postinstall for `bun install` without --ignore-scripts. The script
+    // removes the developer links, records its TMPDIR in `ready`, then stays alive.
+    fs::create_dir_all(fixture.checkout.join("scripts")).unwrap();
+    fs::create_dir_all(fixture.checkout.join("fixture-dependency")).unwrap();
+    fs::write(
+        fixture.checkout.join("fixture-dependency/package.json"),
+        r#"{"name":"fixture-dependency","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    fs::write(
+        fixture.checkout.join("scripts/post.js"),
+        "const fs = require('fs');\nfs.rmSync('node_modules/nx', { force: true });\nfs.rmSync('node_modules/.bin/nx', { force: true });\nfs.writeFileSync('ready', process.env.TMPDIR);\nsetInterval(() => {}, 1000);\n",
+    )
+    .unwrap();
+    fs::write(
+        fixture.checkout.join("package.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "name": "fixture",
+            "private": true,
+            "dependencies": { "fixture-dependency": "file:./fixture-dependency" },
+            "scripts": { "postinstall": format!("{} scripts/post.js", node.display()) }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    // Bun's own lockfile, written without running any lifecycle script, so `bun.lock` is real and
+    // Bun detection (capabilities/bun.rs) activates on it. Resolved as the managed-install test does.
+    let bun = Command::new("bun")
+        .args(["--print", "process.execPath"])
+        .output()
+        .expect("actual Bun");
+    assert!(
+        bun.status.success(),
+        "{}",
+        String::from_utf8_lossy(&bun.stderr)
+    );
+    let bun = PathBuf::from(String::from_utf8(bun.stdout).unwrap().trim())
+        .canonicalize()
+        .unwrap();
+    let lockfile = Command::new(&bun)
+        .args(["install", "--ignore-scripts", "--lockfile-only"])
+        .current_dir(&fixture.checkout)
+        .output()
+        .expect("generate the actual Bun lockfile");
+    assert!(
+        lockfile.status.success(),
+        "{}",
+        String::from_utf8_lossy(&lockfile.stderr)
+    );
+    assert!(
+        fixture.checkout.join("bun.lock").is_file(),
+        "Bun wrote bun.lock"
+    );
+    git(
+        &fixture.checkout,
+        &[
+            "add",
+            "package.json",
+            "scripts",
+            "fixture-dependency",
+            "bun.lock",
+        ],
+    );
+    git(
+        &fixture.checkout,
+        &["commit", "-q", "-m", "fixture postinstall"],
+    );
+    let mut service = serve_project(&mut fixture, &nx_read_paths(&nx)).await;
+    let topic = new_workspace(&mut service, "links").await;
+    let nx_link = fs::read_link(topic.join("node_modules/nx")).unwrap();
+    let bin_link = fs::read_link(topic.join("node_modules/.bin/nx")).unwrap();
+    service
+        .shutdown()
+        .await
+        .expect("stop the CLI bridge so the job's runtime is the only controller");
+
+    let runtime = cowshed_core::runtime::ProjectRuntime::open_existing_at(
+        &fixture.checkout,
+        cowshed_core::runtime::RecoveryScope::Workspaces(std::collections::BTreeSet::from([
+            WorkspaceName::new("links").expect("workspace name"),
+        ])),
+        fixture.storage.clone(),
+    )
+    .await
+    .expect("reopen the project runtime");
+    let (client, server) = std::os::unix::net::UnixStream::pair().expect("socket pair");
+    let connection = tokio::spawn(cowshed_core::api::server::serve_controller_connection(
+        server.into(),
+        cowshed_core::api::server::ConnectionAuthority::Coordinator {
+            repo_id: runtime.descriptor().repo_id.clone(),
+        },
+        runtime.router(),
+    ));
+    let (cowshed, token) = cowshed_core::Cowshed::connect(client.into())
+        .await
+        .expect("controller handshake");
+    let project = cowshed
+        .open(&fixture.checkout)
+        .await
+        .expect("open the project");
+    let coordinator = cowshed.coordinator(&project, token).expect("coordinator");
+    let worker = coordinator.worker("links").await.expect("links worker");
+    let job = worker
+        .exec(cowshed_core::api::ExecRequest {
+            command: cowshed_core::api::dto::ExecCommand::Argv(vec![
+                cowshed_core::api::CommandArg::from("/bin/sh"),
+                cowshed_core::api::CommandArg::from("-c"),
+                cowshed_core::api::CommandArg::from("bun install"),
+            ]),
+            cwd: None,
+            mode: cowshed_core::api::RunSandboxMode::ReadWrite,
+            env: std::collections::HashMap::new(),
+            trace: None,
+            stdin: cowshed_core::api::StdinSource::Empty,
+            stdout_copy: None,
+            stderr_copy: None,
+            admission_key: None,
+        })
+        .await
+        .expect("start bun install as a covered job");
+
+    let ready = topic.join("ready");
+    // The wait keeps the original deadline, but a job that ends before writing `ready` is reported
+    // with its actual state and stderr instead of a silent timeout.
+    let started = Instant::now();
+    while !fs::read_to_string(&ready).is_ok_and(|text| !text.is_empty()) {
+        let status = job.status().await.expect("the covered job's status");
+        if !matches!(status.state, cowshed_core::api::dto::JobState::Running) {
+            let mut logs = job
+                .logs(cowshed_core::api::JobStream::Stderr, 0, false)
+                .await
+                .expect("read ended install stderr");
+            let mut stderr = Vec::new();
+            while let Some(chunk) = logs.next().await {
+                stderr.extend_from_slice(&chunk.expect("stderr chunk"));
+            }
+            panic!(
+                "the covered install ended before its postinstall was ready: state {:?}, exit {:?}, stderr: {}",
+                status.state,
+                status.exit,
+                String::from_utf8_lossy(&stderr)
+            );
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(300),
+            "the postinstall never wrote its ready sentinel within 300s"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        fs::symlink_metadata(topic.join("node_modules/nx")).is_err(),
+        "the real postinstall displaced the developer link"
+    );
+    let tmp = PathBuf::from(fs::read_to_string(&ready).unwrap());
+    job.kill().await.expect("kill the covered install");
+    job.wait().await.expect("the killed job's terminal record");
+
+    assert_eq!(
+        fs::read_link(topic.join("node_modules/nx")).unwrap(),
+        nx_link,
+        "terminal cleanup restored the link the observed install removed"
+    );
+    assert_eq!(
+        fs::read_link(topic.join("node_modules/.bin/nx")).unwrap(),
+        bin_link,
+        "terminal cleanup restored the executable alias"
+    );
+    let leftovers: Vec<PathBuf> = fs::read_dir(tmp.join("install-observed"))
+        .expect("the observation directory")
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "terminal cleanup removed the install marker: {leftovers:?}"
+    );
+    drop(worker);
+    drop(coordinator);
+    connection.abort();
+    runtime.shutdown().await.expect("stop the runtime");
     fixture.stop_gateway().await;
 }

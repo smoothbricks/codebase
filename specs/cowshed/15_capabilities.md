@@ -154,9 +154,10 @@ Each detector returns data through one `CapabilityContribution`:
   not one of those verbs, and unregistered library-only one-shot hosts bypass immediate wrapping and get terminal
   cleanup only; chained-command preservation is not promised for those bypasses. No snapshot taken by a job or wrapper
   grants a new target. Only the mint captures canonical sibling read grants from its source. Terminal cleanup repairs
-  developer-link registry replacements only: a link a job displaced with a real directory is discarded and restored to
-  its snapshot. A different live developer binding is preserved, with no new grant or attestation. A link absent with no
-  observed install produces a `developer-link-ambiguous` finding in the job's stderr and stays absent.
+  developer-link registry replacements, and a link an observed install removed, are restored to their snapshot. The
+  wrapper records an install in a per-job marker the supervisor creates before launch and removes at cleanup. A
+  different live developer binding is preserved, with no new grant or attestation. A link absent with no observed
+  install produces a `developer-link-ambiguous` finding in the job's stderr and stays absent.
 
 - **HOME probes:** the sandboxed supervisor repeats detection beneath the HOME-wide read deny (04_sandbox.md), so every
   HOME path a detector inspects is also one it grants read: each bootstrap candidate beneath HOME as its literal program

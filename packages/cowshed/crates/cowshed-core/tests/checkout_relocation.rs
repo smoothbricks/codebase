@@ -122,6 +122,7 @@ impl Relocated {
             forked_from: None,
             created_trace: "00000000000000000000000000000001".to_owned(),
             lineage: None,
+            owned_links_revision: 0,
         };
         let marker_path = self.session.join(WORKSPACE_MARKER_PATH);
         fs::create_dir_all(marker_path.parent().expect("marker parent")).expect("marker parent");

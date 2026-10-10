@@ -6956,6 +6956,36 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         self.ensure_supervisor_for(current).await
     }
 
+    /// The one-time owned-link migration of a workspace whose marker predates the current
+    /// revision. The donor is the sidecar's own project root; the protected marker must name it,
+    /// the repository and the incarnation, or the migration refuses before walking anything.
+    async fn migrate_owned_links_for(&self, current: &NativeWorkspace, mount: &Path) -> Result<()> {
+        let repo = self.descriptor.repo_id.clone();
+        let incarnation = current.derived.workspace.incarnation().clone();
+        let donor = current.metadata.info_snapshot.project_root.clone();
+        let root = mount.to_path_buf();
+        let plan = tokio::task::spawn_blocking(move || {
+            crate::inherited_links::migrate_owned_links(&root, &donor, &repo, &incarnation)
+        })
+        .await
+        .map_err(|error| {
+            CowshedError::internal(format!("owned-link migration panicked: {error}"))
+        })??;
+        if let Some(plan) = plan {
+            eprintln!(
+                "cowshed: migrated {} owned absolute link(s) to relative paths",
+                plan.rewrites.len()
+            );
+            if !plan.refusals.is_empty() {
+                eprintln!(
+                    "cowshed: owned links not migrated: {}",
+                    plan.refusal_report()
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Start or reuse the supervisor for a workspace whose current state the caller already
     /// read under a validated binding.
     async fn ensure_supervisor_for(
@@ -7003,6 +7033,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             self.advance_gateway_revision(&current).await?;
             current = self.current(name).await?;
         }
+        self.migrate_owned_links_for(&current, &mount).await?;
         // The effective revision covers the project's standing grants too, so a project grant
         // change relaunches the supervisor exactly as a workspace grant change does.
         let grants = effective_workspace_grants(&self.layout, &current.metadata.grants)?;
@@ -9289,6 +9320,8 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                 self.bind_slot(&workspace, slot).await?;
                 self.mark_lifecycle_intent_mutating(&workspace).await?;
             }
+            self.migrate_owned_links_for(&source, &self.workspace_mount_path(&source_name)?)
+                .await?;
             let (grants, reservation) = self.destination_grants(&workspace, resuming).await?;
             let grants = if reservation.is_some() {
                 inherited_developer_read_grants(self.workspace_mount_path(&source_name)?, grants)
@@ -9655,6 +9688,8 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
             self.mark_lifecycle_intent_mutating(&destination).await?;
         }
         let outcome = async {
+                    self.migrate_owned_links_for(&source_fact, &self.workspace_mount_path(&source)?)
+                .await?;
             let (_stopped, rename_head) = if let Some(initial) = initial.as_ref() {
                 let (current, fence, stopped) = self
                     .revalidated_removal_fence(&source, initial, false, RetirementPurpose::Rename { destination: &destination })
@@ -15105,7 +15140,10 @@ async fn inherited_developer_read_grants(
     mut grants: GrantSet,
 ) -> Result<GrantSet> {
     let links = tokio::task::spawn_blocking(move || {
-        crate::developer_links::DeveloperLinks::capture(&source)
+        crate::developer_links::DeveloperLinks::capture(
+            &source,
+            crate::developer_links::CaptureMode::Mint,
+        )
     })
     .await
     .map_err(|error| {
@@ -18299,6 +18337,7 @@ mod doctor_hint_tests {
             forked_from: None,
             created_trace: "trace".into(),
             lineage: None,
+            owned_links_revision: 0,
         }
     }
 
@@ -19169,6 +19208,7 @@ mod workspace_origin_tests {
                 forked_from: None,
                 created_trace: "fixture".to_owned(),
                 lineage: Some(Vec::new()),
+                owned_links_revision: 0,
             },
         )
         .expect("write marker");

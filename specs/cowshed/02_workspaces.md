@@ -511,12 +511,15 @@ image remains live and mounted throughout capture.
    a directory the checkout owns) names the source checkout's own files, which the workspace's sandbox cannot read and
    whose edits belong to another checkout; it is rewritten to the same path under the clone's root, spelled relative to
    the link, so it names the clone's own copy at every later depth. In-tree links and absolute links outside the source
-   root are left alone. Finding them reads every directory of the fresh volume, concurrently, and is the largest setup
-   cost after the clone's first write (about 5 s over a million entries). Then, inside the mount, under the workspace's
-   closed sandbox: configure the `main` remote (see "The `main` remote") and `git switch -c cowshed/<ws>` from the
-   checked-out state. The `.git` directory arrived complete via CoW — the workspace is a standalone repository with **no
-   linked-worktree registration and no back-references** into the host checkout, unless it was created with
-   `--git-worktree` (see "Git-worktree workspaces").
+   root are left alone. Before any private job runs, the mint's identity adds exactly the canonical sibling targets of
+   the source's developer package links to its read grants (16_build_volumes.md, "Hash inputs"); it never adds an
+   ancestor dependency store or the source's main root, and the source's owned-link marker is migrated first. Finding
+   them reads every directory of the fresh volume, concurrently, and is the largest setup cost after the clone's first
+   write (about 5 s over a million entries). Then, inside the mount, under the workspace's closed sandbox: configure the
+   `main` remote (see "The `main` remote") and `git switch -c cowshed/<name>` from the checked-out state. The `.git`
+   directory arrived complete via CoW — the workspace is a standalone repository with **no linked-worktree registration
+   and no back-references** into the host checkout, unless it was created with `--git-worktree` (see "Git-worktree
+   workspaces").
 7. Record the audit
    `ControllerCommitment::Fork(ForkCommitment { version, order, repo_id, source_incarnation, destination_incarnation })`;
    the new marker carries `lineage` = source incarnation followed by the source's own lineage, which authorizes the job
