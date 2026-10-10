@@ -106,7 +106,7 @@ impl Fixture {
         .expect("store-scope recovery opens the project")
     }
 
-    /// What `cowshed new <workspace>` and other verbs naming it open: their own intents and
+    /// What `cowshed fork <workspace>` and other verbs naming it open: their own intents and
     /// main's are replayed, and a failed replay fails the opening.
     async fn open_naming(&self, workspace: &str) -> Result<ProjectRuntime> {
         ProjectRuntime::open_directory_existing_at(
@@ -439,7 +439,7 @@ fn completed(record: Option<LifecycleIntentRecord>) -> bool {
     )
 }
 
-/// A short commit id main does not hold, spelled as `cowshed new --ref` passes it.
+/// A short commit id main does not hold, spelled as `cowshed fork --ref` passes it.
 const MISSING_REVISION: &str = "2f9cfc74";
 
 fn missing_revision() -> ForkOptions {

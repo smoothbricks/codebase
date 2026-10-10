@@ -6,7 +6,7 @@ import { $ } from 'bun';
 // clonefile the image repeatedly (alternating sync / no-sync), then attach each clone
 // -nomount, fsck_apfs -q AND -n on the volume device, and confirm it mounts + reads.
 // Answers: is crash-consistent live cloning reliably fsck-clean; does sync-before-clone matter;
-// what should `cowshed new` require.
+// what should `cowshed fork` require.
 // hdiutil and diskutil run only through `cowshed disk-command` (cowshed must be on PATH).
 
 const ROOT = '/private/tmp/cowshed-fork-bench';

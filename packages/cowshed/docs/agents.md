@@ -9,9 +9,9 @@ command map. This guide focuses on deeper automation contracts.
 
 ## Select the repository before the workspace
 
-`main` is repository-scoped. cwd or `--project <git-root>` selects one adopted repository; then `new` clones that
-repository's `main` unless `--from <workspace>` selects another source inside the same repository. A host can therefore
-run agents against many warm repositories without a host-global main.
+`main` is repository-scoped. cwd or `--project <git-root>` selects one adopted repository; `fork [<src>] <ws>` clones
+that repository's main by default or the named source inside the same repository. A host can therefore run agents
+against many warm repositories without a host-global main.
 
 Harnesses should pass `--project` explicitly rather than make correctness depend on their process cwd:
 

@@ -2472,11 +2472,11 @@ mod tests {
         );
     }
 
-    /// The `cowshed new` that another process's `rm` broke, on real APFS: a fork clones main's
+    /// The `cowshed fork` that another process's `rm` broke, on real APFS: a fork clones main's
     /// seed into a staged checkout, and a collection runs before the workspace is published.
     /// Told the workspace is forming, collection keeps its live volume and its seed, and the
     /// fork owns what its link names. Without that, the same collection deletes both, and the
-    /// fork's mount refuses its link exactly as the broken `cowshed new` did.
+    /// fork's mount refuses its link exactly as the broken `cowshed fork` did.
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn directory_collection_keeps_a_forming_forks_volume_and_seed() {
@@ -2560,7 +2560,7 @@ mod tests {
             "the fork owns the volume its link names"
         );
 
-        // The collection that ran beside the broken `cowshed new`, which knew nothing of the fork.
+        // The collection that ran beside the broken `cowshed fork`, which knew nothing of the fork.
         let collected = scratch
             .volumes
             .collect(scratch.layout.list().unwrap(), links(&[]), false)
@@ -4237,7 +4237,7 @@ fn main() {
         scratch.release_all();
     }
 
-    /// A land into main while a `cowshed new` of main forks: the new reads main's seed and link
+    /// A land into main while a `cowshed fork` of main runs: the fork reads main's seed and link
     /// under main's image lock, and clones that seed after. A land that froze main's seed and
     /// released main's previous volume in between deleted both under the new, which failed on
     /// the seed it read ('sync source image …: No such file or directory'). The land waits for

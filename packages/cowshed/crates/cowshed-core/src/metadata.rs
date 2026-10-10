@@ -990,7 +990,7 @@ pub struct WorkspaceInfoSnapshot {
     pub captured_at: String,
     pub stale: bool,
     /// This workspace is a registered linked worktree of main's repository rather than a
-    /// standalone clone (`cowshed new --git-worktree`).
+    /// standalone clone (`cowshed fork --git-worktree`).
     ///
     /// Store-side, because every decision it drives — refusing checkpoint, pruning the
     /// registration out of main at retirement, requiring main mounted before attach — has to be

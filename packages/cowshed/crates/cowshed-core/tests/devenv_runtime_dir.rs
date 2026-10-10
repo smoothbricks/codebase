@@ -1668,7 +1668,7 @@ const timer = setInterval(async () => {
 }
 
 /// A workspace sandbox built by the production builder, [`workspace_sandbox`], for a mount the
-/// fixture prepares the way `cowshed new` leaves one: private bin and token in place. `deny` is
+/// fixture prepares the way `cowshed fork` leaves one: private bin and token in place. `deny` is
 /// the workspace's granted read+write deny, `repository_deny` main's `[sandbox] deny`.
 #[expect(
     clippy::too_many_arguments,
