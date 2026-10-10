@@ -2564,7 +2564,7 @@ async fn directory_what_main_runs_after_a_land_reaches_its_seed_and_a_fork_hits_
     fixture.stop_gateway().await;
 }
 
-/// `cowshed fork` reseeds its source as `fork` does (16_build_volumes.md, "Fork"): `w1` runs on
+/// `cowshed fork` reseeds its source first (16_build_volumes.md, "Fork"): `w1` runs on
 /// its own volume after its seed was frozen at its creation, and a fork of `w1` hits that run
 /// instead of cloning the older seed and running everything again.
 /// Before either fork, doctor diagnoses main's displaced workspace-data link and an exec restores
