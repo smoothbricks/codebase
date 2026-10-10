@@ -13,7 +13,7 @@
 //! current task hash and, for the tasks Nx hashes only after their dependencies ran, by task
 //! (its latest entry), including during commit; one row/byte/free-space budget bounds all copies
 //! in both phases. Regular file data is copied through a length-limited reader, with
-//! `copyfile(3)` preserving metadata.
+//! `fcopyfile(3)` preserving metadata on the same pinned file descriptors.
 //!
 //! Stock Nx 23.2.1 keeps an entry in three places (`native/cache/cache.rs`): the directory
 //! `<cache>/<hash>` with the task's outputs, the file `<cache>/terminalOutputs/<hash>`, and a
@@ -92,8 +92,21 @@ const SELECTED: &str = "SELECT p.hash, p.code, p.size, p.created_at, 0, p.access
        AND NOT EXISTS (SELECT 1 FROM temp.wanted w WHERE w.hash = l.hash) \
      ORDER BY 6 DESC";
 
+// Publication must also probe by the small carried set, not walk either historical table.
+const INDEX_DETAILS: &str = "INSERT OR IGNORE INTO main.task_details (hash, project, target, configuration) \
+     SELECT d.hash, d.project, d.target, d.configuration \
+     FROM temp.carried c CROSS JOIN previous.task_details d WHERE d.hash = c.hash";
+const INDEX_OUTPUTS: &str = "INSERT OR IGNORE INTO main.cache_outputs (hash, code, size, created_at, accessed_at) \
+     SELECT p.hash, p.code, p.size, p.created_at, p.accessed_at \
+     FROM temp.carried c CROSS JOIN previous.cache_outputs p WHERE p.hash = c.hash";
+
+// The only schema this row shim understands: pinned Nx 23.2.1's cache foreign-key pair.
+// These statements are recognized, never executed. The checkout's Nx owns initialization.
+const TASK_DETAILS_SCHEMA: &str = "CREATE TABLE task_details (hash TEXT PRIMARY KEY NOT NULL, project TEXT NOT NULL, target TEXT NOT NULL, configuration TEXT)";
+const CACHE_OUTPUTS_SCHEMA: &str = "CREATE TABLE cache_outputs (hash TEXT PRIMARY KEY NOT NULL, code INTEGER NOT NULL, size INTEGER NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, accessed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY (hash) REFERENCES task_details (hash))";
+
 /// One entry's row in the target's database, as phase 1 read it.
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Debug, Eq, PartialEq)]
 struct Row {
     hash: String,
     code: i64,
@@ -148,6 +161,16 @@ impl Staged {
     }
 }
 
+impl Staged {
+    /// Staging that stopped before any entry was staged, naming why.
+    pub fn stopped(reason: String) -> Self {
+        Self {
+            stopped: Some(reason),
+            ..Self::default()
+        }
+    }
+}
+
 /// What a carry put into the landing volume.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Carried {
@@ -171,8 +194,9 @@ struct NxState<'state> {
 /// Phase 1: stage every Nx cache entry the volume at `from` indexes and the quiet volume at
 /// `into` does not, for each Nx state both volumes hold under the same checkout path and each
 /// task database both hold under the same name. A landing Nx state with a task database of
-/// another name belongs to an Nx of another schema, so the target's is not carried into it; one
-/// with none never ran Nx, and takes the target's database without its cache rows first.
+/// another name belongs to an Nx of another schema, so the target's is not carried into it.
+/// One with none is left untouched: the carry creates no schema, so the checkout's Nx must
+/// initialize it first. A failed initialization is the land's carry stop reason, not a refused land.
 pub fn stage(
     from: &Path,
     from_state: &BuildVolumeState,
@@ -288,24 +312,12 @@ fn stage_with(
             let from_database = from.join(source.data).join(&name);
             let into_database = into.join(destination.data).join(&name);
             if !into_database.is_file() {
-                if ran_nx {
-                    continue;
-                }
-                if matches!(selected, Selection::Only(_)) {
-                    staged.stopped = Some(format!(
-                        "rebase carry destination {} has no task database after current-tree hashing; refusing to copy the target's unbounded task history",
-                        into_database.display()
-                    ));
-                    return staged;
-                }
-                if let Err(error) = empty_copy(&from_database, &into_database) {
-                    staged.stopped = Some(format!(
-                        "copy {} without its cache rows to {}: {error}",
-                        from_database.display(),
-                        into_database.display()
-                    ));
-                    return staged;
-                }
+                staged.stopped = Some(format!(
+                    "carry from {} into {} stopped: destination task database is missing; refusing to skip it or copy the target's unbounded task history",
+                    from_database.display(),
+                    into_database.display()
+                ));
+                return staged;
             }
             let mut database = StagedDatabase {
                 selection: owned.clone(),
@@ -376,29 +388,60 @@ fn selection<'a>(
     }
 }
 
-/// Write a consistent copy of the task database `from` at `into` without its cache rows and its
-/// records of running processes: what remains is the target's task details and history, in its
-/// own Nx's schema, indexing no entry the landing volume lacks.
-fn empty_copy(from: &Path, into: &Path) -> io::Result<()> {
-    snapshot(from, into, |copy| {
-        for table in ["cache_outputs", "running_tasks", "task_invocations"] {
-            if table_definition(copy, "main", table)?.is_some() {
-                copy.execute(&format!("DELETE FROM {table}"), &[])?;
+/// Land step 5.1 for the code-graph index (16_build_volumes.md, "Carry"), while the target
+/// still runs: for each `.codegraph` directory both volumes hold under the same checkout path,
+/// where the quiet volume at `into` holds no database and the volume at `from` holds one, write
+/// a consistent copy of `from`'s at `into`. A landing volume's own database is kept: either is an
+/// index of a nearby tree the indexer reconciles, where none is a reindex from scratch. Placed
+/// whole, it needs no commit and nothing to unstage.
+pub fn codegraph(
+    from: &Path,
+    from_state: &BuildVolumeState,
+    into: &Path,
+    into_state: &BuildVolumeState,
+) -> io::Result<()> {
+    for source in codegraph_indexes(from_state) {
+        let Some(destination) =
+            codegraph_indexes(into_state).find(|path| path.checkout == source.checkout)
+        else {
+            continue;
+        };
+        let from_database = from.join(source.volume.as_path()).join(CODEGRAPH_DATABASE);
+        let into_database = into
+            .join(destination.volume.as_path())
+            .join(CODEGRAPH_DATABASE);
+        let copied = (|| {
+            if into_database.try_exists()? || !from_database.try_exists()? {
+                return Ok(());
             }
-        }
-        Ok(())
-    })
+            snapshot(&from_database, &into_database)
+        })();
+        copied.map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "copy {} to {}: {error}",
+                    from_database.display(),
+                    into_database.display()
+                ),
+            )
+        })?;
+    }
+    Ok(())
+}
+
+/// The `.codegraph` directories the state names.
+fn codegraph_indexes(state: &BuildVolumeState) -> impl Iterator<Item = &super::BuildStatePath> {
+    state
+        .paths
+        .iter()
+        .filter(|path| super::BuildStateTool::of(path) == super::BuildStateTool::Codegraph)
 }
 
 /// Write a consistent copy of the SQLite database `from` at `into` (`VACUUM INTO`, which reads
 /// one snapshot of a database another process may be writing, its write-ahead log included),
-/// changed by `edit`. Built beside `into` and renamed onto it, so `into` is either absent or
-/// whole.
-fn snapshot(
-    from: &Path,
-    into: &Path,
-    edit: impl FnOnce(&Connection) -> io::Result<()>,
-) -> io::Result<()> {
+/// built beside `into` and renamed onto it, so `into` is either absent or whole.
+fn snapshot(from: &Path, into: &Path) -> io::Result<()> {
     let mut partial = into.as_os_str().to_owned();
     partial.push(".carry");
     let partial = PathBuf::from(partial);
@@ -408,7 +451,6 @@ fn snapshot(
     }
     let result = (|| {
         Connection::open(from)?.execute("VACUUM INTO ?1", &[&partial.to_string_lossy()])?;
-        edit(&Connection::open(&partial)?)?;
         fs::rename(&partial, into)
     })();
     if result.is_err() {
@@ -512,25 +554,68 @@ fn stage_database(
     Ok(true)
 }
 
-/// Open the landing database with the target's attached as `previous`. Stock Nx creates
-/// `cache_outputs` only once a task runs through its cache (`CREATE TABLE IF NOT EXISTS` in
-/// `native/cache/cache.rs`), so a database whose checkout never ran one lacks it: the landing
-/// side then takes each table the carry writes from the target's own definition, which is the
-/// one its Nx wrote.
+/// Open two existing Nx-owned v3 databases. The pinned adapter already created the destination:
+/// this minimal compatibility shim recognizes its row schema, but never manufactures one.
 fn attached(into_database: &Path, from_database: &Path) -> io::Result<Connection> {
+    for path in [into_database, from_database] {
+        if !path
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().ends_with("-v3.db"))
+        {
+            return Err(io::Error::other(format!(
+                "Nx 23.2.1 carry row shim requires a v3 database, not {}",
+                path.display()
+            )));
+        }
+    }
     let connection = Connection::open(into_database)?;
     connection.execute(
         "ATTACH DATABASE ?1 AS previous",
         &[&from_database.to_string_lossy()],
     )?;
-    for table in ["task_details", "cache_outputs"] {
-        if table_definition(&connection, "main", table)?.is_none()
-            && let Some(definition) = table_definition(&connection, "previous", table)?
-        {
-            connection.execute(&definition, &[])?;
+    validate_row_schema(&connection, "main", true)?;
+    validate_row_schema(&connection, "previous", false)?;
+    Ok(connection)
+}
+
+fn validate_row_schema(
+    connection: &Connection,
+    schema: &str,
+    require_cache: bool,
+) -> io::Result<()> {
+    let mut definitions = connection.prepare(&format!(
+        "SELECT sql FROM {schema}.sqlite_master \
+         WHERE tbl_name IN ('task_details', 'cache_outputs') AND sql IS NOT NULL"
+    ))?;
+    let same = |left: &str, right: &str| {
+        left.bytes()
+            .filter(|byte| !byte.is_ascii_whitespace())
+            .map(|byte| byte.to_ascii_lowercase())
+            .eq(right
+                .bytes()
+                .filter(|byte| !byte.is_ascii_whitespace())
+                .map(|byte| byte.to_ascii_lowercase()))
+    };
+    let mut details = false;
+    let mut cache = false;
+    while definitions.step()? {
+        let definition = definitions.text(0);
+        if same(&definition, TASK_DETAILS_SCHEMA) {
+            details = true;
+        } else if same(&definition, CACHE_OUTPUTS_SCHEMA) {
+            cache = true;
+        } else {
+            return Err(io::Error::other(format!(
+                "Nx 23.2.1 carry row schema changed in {schema}: {definition}"
+            )));
         }
     }
-    Ok(connection)
+    if !details || (require_cache && !cache) {
+        return Err(io::Error::other(format!(
+            "Nx 23.2.1 carry needs Nx-initialized task_details/cache_outputs in {schema}"
+        )));
+    }
+    Ok(())
 }
 
 /// The `CREATE TABLE` statement of `table` in the attached `schema`, if it has the table.
@@ -651,25 +736,28 @@ fn commit_database(
     let connection = attached(&database.into_database, &database.from_database)?;
     // Rebase selection also fences entries indexed since phase 1.
     let now = rows(&connection, selected)?;
-    let current: BTreeSet<&Row> = now.iter().collect();
-    let unchanged: BTreeSet<&str> = database
+    let staged_rows: BTreeMap<&str, &Row> = database
         .rows
         .iter()
-        .filter(|staged| current.contains(staged))
-        .map(|staged| staged.hash.as_str())
+        .map(|row| (row.hash.as_str(), row))
         .collect();
     // Each entry is named here before its files move, so a failure removes it with the rest.
     let mut placed: BTreeSet<&str> = BTreeSet::new();
     let mut stopped = None;
     let result = (|| {
-        for &hash in &unchanged {
-            placed.insert(hash);
-            place(&database.staging, &database.into_cache, hash)?;
+        for row in &now {
+            if staged_rows
+                .get(row.hash.as_str())
+                .is_some_and(|staged| *staged == row)
+            {
+                placed.insert(row.hash.as_str());
+                place(&database.staging, &database.into_cache, &row.hash)?;
+            }
         }
         if complete {
             for row in now
                 .iter()
-                .filter(|row| !unchanged.contains(row.hash.as_str()))
+                .filter(|row| !staged_rows.contains_key(row.hash.as_str()))
             {
                 match copy_row(
                     &database.from_cache,
@@ -765,18 +853,8 @@ fn index(connection: &Connection, placed: &BTreeSet<&str>) -> io::Result<()> {
             while insert.step()? {}
         }
     }
-    connection.execute(
-        "INSERT OR IGNORE INTO main.task_details (hash, project, target, configuration) \
-         SELECT d.hash, d.project, d.target, d.configuration \
-         FROM previous.task_details d JOIN temp.carried c ON c.hash = d.hash",
-        &[],
-    )?;
-    connection.execute(
-        "INSERT OR IGNORE INTO main.cache_outputs (hash, code, size, created_at, accessed_at) \
-         SELECT p.hash, p.code, p.size, p.created_at, p.accessed_at \
-         FROM previous.cache_outputs p JOIN temp.carried c ON c.hash = p.hash",
-        &[],
-    )?;
+    connection.execute(INDEX_DETAILS, &[])?;
+    connection.execute(INDEX_OUTPUTS, &[])?;
     connection.execute("COMMIT", &[])
 }
 
@@ -865,6 +943,8 @@ impl Budget {
         destination: &Path,
         metadata: &fs::Metadata,
     ) -> io::Result<()> {
+        #[cfg(test)]
+        tests::record_walk();
         if metadata.is_dir() {
             self.charge(0)?;
             fs::create_dir(destination)?;
@@ -894,12 +974,7 @@ impl Budget {
                 .create_new(true)
                 .open(destination)?;
             copy_data(&mut input, &mut output, bytes)?;
-            drop(output);
-            copyfile(
-                source,
-                destination,
-                libc::COPYFILE_METADATA | libc::COPYFILE_NOFOLLOW,
-            )
+            copy_metadata(&input, &output)
         } else {
             self.charge(metadata.len())?;
             copyfile(source, destination, COPYFILE_ALL | libc::COPYFILE_NOFOLLOW)
@@ -911,6 +986,8 @@ impl Budget {
 /// probe reads one byte without writing it; the caller removes the rejected partial entry.
 fn copy_data(input: &mut fs::File, output: &mut fs::File, bytes: u64) -> io::Result<()> {
     let copied = io::copy(&mut (&mut *input).take(bytes), output)?;
+    #[cfg(test)]
+    tests::record_bytes(copied);
     if copied != bytes {
         return Err(io::Error::other(
             "rebase carry source shrank below its admitted copy size",
@@ -1112,6 +1189,29 @@ fn databases_in(data: &Path) -> io::Result<Vec<std::ffi::OsString>> {
     Ok(names)
 }
 
+/// Keep metadata tied to the same inodes as the bounded data copy. Reopening either path
+/// would add work and could copy attributes from a replacement made during staging.
+fn copy_metadata(input: &fs::File, output: &fs::File) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    // SAFETY: both files keep their descriptors open for the entire metadata-only call.
+    let status = unsafe {
+        libc::fcopyfile(
+            input.as_raw_fd(),
+            output.as_raw_fd(),
+            std::ptr::null_mut(),
+            libc::COPYFILE_METADATA,
+        )
+    };
+    if status == 0 {
+        #[cfg(test)]
+        tests::record_metadata();
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
 fn copyfile(source: &Path, destination: &Path, flags: libc::copyfile_flags_t) -> io::Result<()> {
     let source = super::sqlite::c_path(source)?;
     let destination = super::sqlite::c_path(destination)?;
@@ -1125,6 +1225,8 @@ fn copyfile(source: &Path, destination: &Path, flags: libc::copyfile_flags_t) ->
         )
     };
     if status == 0 {
+        #[cfg(test)]
+        tests::record_metadata();
         Ok(())
     } else {
         Err(io::Error::last_os_error())
@@ -1135,6 +1237,46 @@ fn copyfile(source: &Path, destination: &Path, flags: libc::copyfile_flags_t) ->
 mod tests {
     use super::super::nx::TaskIdentity;
     use super::*;
+
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    struct CopyWork {
+        objects: u64,
+        bytes: u64,
+        metadata_calls: u64,
+    }
+
+    thread_local! {
+        static WORK: std::cell::Cell<CopyWork> = const { std::cell::Cell::new(CopyWork {
+            objects: 0, bytes: 0, metadata_calls: 0,
+        }) };
+    }
+
+    pub(super) fn record_walk() {
+        WORK.with(|work| {
+            work.set(CopyWork {
+                objects: work.get().objects + 1,
+                ..work.get()
+            })
+        });
+    }
+
+    pub(super) fn record_bytes(bytes: u64) {
+        WORK.with(|work| {
+            work.set(CopyWork {
+                bytes: work.get().bytes + bytes,
+                ..work.get()
+            })
+        });
+    }
+
+    pub(super) fn record_metadata() {
+        WORK.with(|work| {
+            work.set(CopyWork {
+                metadata_calls: work.get().metadata_calls + 1,
+                ..work.get()
+            })
+        });
+    }
 
     /// Stock Nx 23.2.1's two tables the carry writes, as its own `CREATE` statements read.
     const SCHEMA: &str = "CREATE TABLE task_details (hash TEXT PRIMARY KEY NOT NULL, \
@@ -1186,7 +1328,7 @@ mod tests {
             let into = root.join("into");
             for volume in [&from, &into] {
                 fs::create_dir_all(volume.join("nx/workspace-data")).unwrap();
-                database(&volume.join("nx/workspace-data/task.db"), SCHEMA);
+                database(&volume.join("nx/workspace-data/task-v3.db"), SCHEMA);
             }
             Self {
                 root,
@@ -1211,7 +1353,7 @@ mod tests {
         }
 
         fn entry_at(&self, namespace: &Path, hash: &str, size: i64, output: &[u8]) {
-            let database = self.from.join(namespace).join("workspace-data/task.db");
+            let database = self.from.join(namespace).join("workspace-data/task-v3.db");
             let connection = Connection::open(&database).unwrap();
             connection
                 .execute(
@@ -1307,7 +1449,7 @@ mod tests {
 
         fn carried_hashes(&self) -> BTreeSet<String> {
             let connection =
-                Connection::open(&self.into.join("nx/workspace-data/task.db")).unwrap();
+                Connection::open(&self.into.join("nx/workspace-data/task-v3.db")).unwrap();
             let mut statement = connection
                 .prepare("SELECT hash FROM cache_outputs")
                 .unwrap();
@@ -1321,6 +1463,7 @@ mod tests {
 
     impl Drop for Fixture {
         fn drop(&mut self) {
+            remove(&self.into).expect("remove carry destination fixture");
             fs::remove_dir_all(&self.root).expect("remove carry fixture");
         }
     }
@@ -1408,6 +1551,135 @@ mod tests {
         );
         assert!(!fixture.into.join("nx/cache/999").exists());
         assert!(!fixture.into.join(STAGING).exists());
+    }
+
+    #[test]
+    fn stage_and_commit_walk_and_copy_each_selected_file_once() {
+        let fixture = Fixture::new();
+        fixture.entry("1", 4, b"warm");
+        WORK.with(|work| work.set(CopyWork::default()));
+        let staged = fixture.stage(&["1", "2"]);
+        let stage_work = WORK.with(|work| work.get());
+        assert_eq!(
+            stage_work,
+            CopyWork {
+                objects: 2,
+                bytes: 4,
+                metadata_calls: 2
+            }
+        );
+        assert!(
+            fixture.carried_hashes().is_empty(),
+            "stage publishes no cache rows"
+        );
+        fixture.entry("2", 4, b"late");
+        let carried = commit(staged, &fixture.into);
+        let all_work = WORK.with(|work| work.get());
+        assert_eq!(
+            all_work,
+            CopyWork {
+                objects: 4,
+                bytes: 8,
+                metadata_calls: 4
+            }
+        );
+        assert_eq!(carried.entries, 2);
+        assert!(carried.stopped.is_none(), "{carried:?}");
+        eprintln!("carry measured work: stage={stage_work:?}, both phases={all_work:?}");
+    }
+
+    #[test]
+    fn changed_and_evicted_staged_rows_are_dropped_without_recopying_but_late_hashes_survive() {
+        let fixture = Fixture::new();
+        for hash in ["1", "2", "3"] {
+            fixture.entry(hash, 4, b"warm");
+        }
+        WORK.with(|work| work.set(CopyWork::default()));
+        let mut staged = fixture.stage(&["1", "2", "3", "4"]);
+        // A recopy would fit: exhaustion cannot be what prevents stale-entry publication.
+        staged.budget.as_mut().unwrap().rows = 10;
+        let before = WORK.with(|work| work.get());
+        let source = Connection::open(&fixture.from.join("nx/workspace-data/task-v3.db")).unwrap();
+        source
+            .execute(
+                "UPDATE cache_outputs SET created_at = 'rewritten' WHERE hash = '2'",
+                &[],
+            )
+            .unwrap();
+        source
+            .execute("DELETE FROM cache_outputs WHERE hash = '3'", &[])
+            .unwrap();
+        drop(source);
+        fixture.entry("4", 4, b"late");
+        let carried = commit(staged, &fixture.into);
+        let after = WORK.with(|work| work.get());
+        assert_eq!(after.bytes - before.bytes, 4);
+        assert_eq!(after.objects - before.objects, 2);
+        assert_eq!(
+            fixture.carried_hashes(),
+            BTreeSet::from(["1".into(), "4".into()])
+        );
+        assert_eq!(carried.entries, 2);
+        assert!(carried.stopped.is_none(), "{carried:?}");
+        assert!(!fixture.into.join("nx/cache/2").exists());
+        assert!(!fixture.into.join("nx/cache/3").exists());
+        assert!(!fixture.into.join(STAGING).exists());
+    }
+
+    #[test]
+    fn legacy_selection_all_stage_and_commit_drops_changed_stages_and_keeps_late_hashes() {
+        let fixture = Fixture::new();
+        fixture.entry("1", 4, b"whole");
+        fixture.entry("2", 4, b"stale");
+        let staged = stage_with(
+            &fixture.from,
+            &fixture.state,
+            &fixture.into,
+            &fixture.state,
+            None,
+            Staged::default(),
+        );
+        assert!(staged.stopped.is_none(), "{:?}", staged.stopped);
+        let source = Connection::open(&fixture.from.join("nx/workspace-data/task-v3.db")).unwrap();
+        source
+            .execute(
+                "UPDATE cache_outputs SET created_at = 'rewritten' WHERE hash = '2'",
+                &[],
+            )
+            .unwrap();
+        drop(source);
+        fixture.entry("3", 4, b"late");
+        let carried = commit(staged, &fixture.into);
+        assert!(carried.stopped.is_none(), "{carried:?}");
+        assert_eq!(
+            fixture.carried_hashes(),
+            BTreeSet::from(["1".into(), "3".into()])
+        );
+        assert!(!fixture.into.join("nx/cache/2").exists());
+        assert!(!fixture.into.join(STAGING).exists());
+    }
+
+    #[test]
+    fn bounded_metadata_stays_with_the_pinned_data_inode_when_source_is_replaced() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = Fixture::new();
+        let source = fixture.from.join("source");
+        let destination = fixture.into.join("copy");
+        fs::write(&source, b"old!").unwrap();
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o440)).unwrap();
+        let mut input = fs::File::open(&source).unwrap();
+        let original_time = input.metadata().unwrap().modified().unwrap();
+        let mut output = fs::File::create(&destination).unwrap();
+        copy_data(&mut input, &mut output, 4).unwrap();
+        fs::rename(&source, fixture.from.join("original")).unwrap();
+        fs::write(&source, b"replacement").unwrap();
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o777)).unwrap();
+        copy_metadata(&input, &output).unwrap();
+        let copied = output.metadata().unwrap();
+        assert_eq!(copied.permissions().mode() & 0o777, 0o440);
+        assert_eq!(copied.modified().unwrap(), original_time);
+        assert_eq!(fs::read(&destination).unwrap(), b"old!");
     }
 
     #[test]
@@ -1583,14 +1855,14 @@ mod tests {
         fixture.entry("1", 4, b"warm");
         fixture.entry("2", 4, b"old!");
         let staged = fixture.stage(&["1", "2"]);
-        Connection::open(&fixture.from.join("nx/workspace-data/task.db"))
+        Connection::open(&fixture.from.join("nx/workspace-data/task-v3.db"))
             .unwrap()
             .execute("UPDATE cache_outputs SET code = 1 WHERE hash = '2'", &[])
             .unwrap();
         let carried = commit(staged, &fixture.into);
         assert_eq!(carried.entries, 1);
         assert_eq!(fixture.carried_hashes(), BTreeSet::from(["1".into()]));
-        assert!(carried.stopped.as_ref().unwrap().contains("0 rows"));
+        assert!(carried.stopped.is_none(), "{carried:?}");
         assert!(!fixture.into.join("nx/cache/2").exists());
         assert!(!fixture.into.join(STAGING).exists());
     }
@@ -1781,7 +2053,7 @@ mod tests {
         for volume in [&fixture.from, &fixture.into] {
             let data = volume.join("tools/widget/nx/workspace-data");
             fs::create_dir_all(&data).unwrap();
-            database(&data.join("task.db"), SCHEMA);
+            database(&data.join("task-v3.db"), SCHEMA);
         }
         fixture.state.paths.extend([
             super::super::BuildStatePath::new("tools/widget/.nx/cache", "tools/widget/nx/cache")
@@ -1827,7 +2099,7 @@ mod tests {
     #[test]
     fn rebase_selection_probes_indexes_and_never_scans_task_history() {
         let fixture = Fixture::new();
-        let source = Connection::open(&fixture.from.join("nx/workspace-data/task.db")).unwrap();
+        let source = Connection::open(&fixture.from.join("nx/workspace-data/task-v3.db")).unwrap();
         source
             .execute(
                 "WITH RECURSIVE hashes(n) AS (VALUES(1) UNION ALL SELECT n + 1 FROM hashes WHERE n < 10000) \
@@ -1845,8 +2117,8 @@ mod tests {
         source.execute("ANALYZE", &[]).unwrap();
         drop(source);
         let connection = attached(
-            &fixture.into.join("nx/workspace-data/task.db"),
-            &fixture.from.join("nx/workspace-data/task.db"),
+            &fixture.into.join("nx/workspace-data/task-v3.db"),
+            &fixture.from.join("nx/workspace-data/task-v3.db"),
         )
         .unwrap();
         let selected = TaskSelection {
@@ -1889,6 +2161,49 @@ mod tests {
                 "{scanned}: {plan:?}"
             );
         }
+    }
+
+    #[test]
+    fn publication_probes_both_source_indexes_instead_of_scanning_task_history() {
+        let fixture = Fixture::new();
+        let source = Connection::open(&fixture.from.join("nx/workspace-data/task-v3.db")).unwrap();
+        source.execute(
+            "WITH RECURSIVE hashes(n) AS (VALUES(1) UNION ALL SELECT n + 1 FROM hashes WHERE n < 10000) \
+             INSERT INTO task_details SELECT CAST(n AS TEXT), 'a', 'build', NULL FROM hashes", &[],
+        ).unwrap();
+        source.execute(
+            "INSERT INTO cache_outputs (hash, code, size) SELECT hash, 0, 1024 FROM task_details", &[],
+        ).unwrap();
+        let connection = attached(
+            &fixture.into.join("nx/workspace-data/task-v3.db"),
+            &fixture.from.join("nx/workspace-data/task-v3.db"),
+        )
+        .unwrap();
+        index(&connection, &BTreeSet::from(["1"])).unwrap();
+        for (query, alias) in [(INDEX_DETAILS, "d"), (INDEX_OUTPUTS, "p")] {
+            let mut explain = connection
+                .prepare(&format!("EXPLAIN QUERY PLAN {query}"))
+                .unwrap();
+            let mut plan = Vec::new();
+            while explain.step().unwrap() {
+                plan.push(explain.text(3));
+            }
+            assert!(
+                plan.iter().any(
+                    |detail| detail.starts_with(&format!("SEARCH {alias} USING "))
+                        && detail.contains("(hash=?)")
+                ),
+                "{plan:?}"
+            );
+            assert!(
+                !plan
+                    .iter()
+                    .any(|detail| detail.starts_with(&format!("SCAN {alias}"))),
+                "{plan:?}"
+            );
+            eprintln!("publication indexed plan: {plan:?}");
+        }
+        assert_eq!(fixture.carried_hashes(), BTreeSet::from(["1".into()]));
     }
 
     #[test]
@@ -1937,7 +2252,7 @@ mod tests {
     fn rebase_never_copies_an_unbounded_task_database_to_initialize_a_new_cache() {
         let fixture = Fixture::new();
         fixture.entry("1", 4, b"warm");
-        fs::remove_file(fixture.into.join("nx/workspace-data/task.db")).unwrap();
+        fs::remove_file(fixture.into.join("nx/workspace-data/task-v3.db")).unwrap();
         let staged = fixture.stage(&["1"]);
         assert!(staged.databases.is_empty());
         assert!(
@@ -1947,8 +2262,55 @@ mod tests {
                 .unwrap()
                 .contains("unbounded task history")
         );
-        assert!(!fixture.into.join("nx/workspace-data/task.db").exists());
+        assert!(!fixture.into.join("nx/workspace-data/task-v3.db").exists());
         assert!(!fixture.into.join("nx/cache/1").exists());
+    }
+
+    #[test]
+    fn a_differently_named_destination_database_stops_the_carry_and_names_both_paths() {
+        let fixture = Fixture::new();
+        fixture.entry("1", 4, b"warm");
+        fs::rename(
+            fixture.into.join("nx/workspace-data/task-v3.db"),
+            fixture.into.join("nx/workspace-data/other-v3.db"),
+        )
+        .unwrap();
+        let staged = fixture.stage(&["1"]);
+        assert!(staged.databases.is_empty());
+        let stopped = staged.stopped.as_ref().unwrap();
+        assert!(
+            stopped.contains(
+                &fixture
+                    .from
+                    .join("nx/workspace-data/task-v3.db")
+                    .display()
+                    .to_string()
+            ),
+            "{stopped}"
+        );
+        assert!(
+            stopped.contains(
+                &fixture
+                    .into
+                    .join("nx/workspace-data/task-v3.db")
+                    .display()
+                    .to_string()
+            ),
+            "{stopped}"
+        );
+        let carried = commit(staged, &fixture.into);
+        assert_eq!(carried.entries, 0);
+        assert!(carried.stopped.is_some());
+        assert!(!fixture.into.join("nx/cache/1").exists());
+    }
+
+    #[test]
+    fn staged_stop_reason_reaches_the_carried_report_verbatim() {
+        let fixture = Fixture::new();
+        let reason = "Nx cache directory changed: expected a, actual b";
+        let carried = commit(Staged::stopped(reason.into()), &fixture.into);
+        assert_eq!(carried.stopped.as_deref(), Some(reason));
+        assert_eq!(carried.entries, 0);
     }
 
     /// A target row the carry would index without its task details stops the carry and
@@ -1960,8 +2322,8 @@ mod tests {
             uuid::Uuid::new_v4().simple()
         ));
         fs::create_dir_all(&root).unwrap();
-        let from = root.join("from.db");
-        let into = root.join("into.db");
+        let from = root.join("from-v3.db");
+        let into = root.join("into-v3.db");
         // Foreign keys are off on this connection, as on any SQLite connection by default.
         database(
             &from,
@@ -1993,5 +2355,404 @@ mod tests {
         drop(connection);
         assert_eq!(indexed(&into), 1);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The code-graph index (16_build_volumes.md, "Carry"): a target without one gives nothing;
+    /// a landing `.codegraph` without a database takes a copy of the target's that opens with the
+    /// rows the target's still-open writer holds in its write-ahead log; a landing database of
+    /// its own is kept.
+    #[test]
+    fn a_landing_volume_without_a_code_graph_index_takes_the_targets() {
+        let root = std::env::temp_dir().join(format!(
+            "cowshed-carry-codegraph-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let from = root.join("from");
+        let into = root.join("into");
+        for volume in [&from, &into] {
+            fs::create_dir_all(volume.join("codegraph")).unwrap();
+        }
+        let state = BuildVolumeState {
+            paths: vec![super::super::BuildStatePath::new(".codegraph", "codegraph").unwrap()],
+            fingerprint: None,
+        };
+        let nodes = |database: &Path| {
+            let connection = Connection::open(database).unwrap();
+            let mut statement = connection.prepare("SELECT id FROM nodes").unwrap();
+            let mut ids = Vec::new();
+            while statement.step().unwrap() {
+                ids.push(statement.text(0));
+            }
+            ids
+        };
+
+        codegraph(&from, &state, &into, &state).unwrap();
+        assert!(!into.join("codegraph").join(CODEGRAPH_DATABASE).exists());
+
+        let target = from.join("codegraph").join(CODEGRAPH_DATABASE);
+        database(
+            &target,
+            "PRAGMA journal_mode = WAL; CREATE TABLE nodes (id TEXT PRIMARY KEY)",
+        );
+        let writer = Connection::open(&target).unwrap();
+        writer
+            .execute("INSERT INTO nodes VALUES ('target')", &[])
+            .unwrap();
+        assert!(from.join("codegraph/codegraph.db-wal").exists());
+        codegraph(&from, &state, &into, &state).unwrap();
+        drop(writer);
+        let landing = into.join("codegraph").join(CODEGRAPH_DATABASE);
+        assert_eq!(nodes(&landing), ["target"]);
+        assert!(!into.join("codegraph/codegraph.db.carry").exists());
+
+        Connection::open(&landing)
+            .unwrap()
+            .execute("UPDATE nodes SET id = 'landing'", &[])
+            .unwrap();
+        codegraph(&from, &state, &into, &state).unwrap();
+        assert_eq!(
+            nodes(&landing),
+            ["landing"],
+            "a landing index of its own is kept"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn the_pinned_row_shim_refuses_schema_or_version_changes_before_publication() {
+        let fixture = Fixture::new();
+        let source = fixture.from.join("nx/workspace-data/task-v3.db");
+        let destination = fixture.into.join("nx/workspace-data/task-v3.db");
+        let changed = Connection::open(&source).unwrap();
+        changed
+            .execute(
+                "ALTER TABLE cache_outputs ADD COLUMN future_required_data TEXT",
+                &[],
+            )
+            .unwrap();
+        drop(changed);
+        let error = match attached(&destination, &source) {
+            Ok(_) => panic!("a changed schema must not be admitted"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("row schema changed"), "{error}");
+        assert!(fixture.carried_hashes().is_empty());
+        let future = fixture.from.join("nx/workspace-data/task-v4.db");
+        fs::rename(&source, &future).unwrap();
+        let error = match attached(&destination, &future) {
+            Ok(_) => panic!("a changed schema version must not be admitted"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("requires a v3 database"),
+            "{error}"
+        );
+        assert!(fixture.carried_hashes().is_empty());
+    }
+
+    #[test]
+    fn the_pinned_row_shim_refuses_source_indexes_and_triggers_before_any_cache_row() {
+        let fixture = Fixture::new();
+        fixture.entry("1", 4, b"warm");
+        let source = fixture.from.join("nx/workspace-data/task-v3.db");
+        let destination = fixture.into.join("nx/workspace-data/task-v3.db");
+        let changed = Connection::open(&source).unwrap();
+        changed
+            .execute(
+                "CREATE INDEX cache_outputs_size ON cache_outputs (size)",
+                &[],
+            )
+            .unwrap();
+        drop(changed);
+        let error = match attached(&destination, &source) {
+            Ok(_) => panic!("an explicit index on cache_outputs must not be admitted"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("row schema changed"), "{error}");
+        assert!(fixture.carried_hashes().is_empty());
+        let changed = Connection::open(&source).unwrap();
+        changed
+            .execute("DROP INDEX cache_outputs_size", &[])
+            .unwrap();
+        changed
+            .execute(
+                "CREATE TRIGGER cache_outputs_audit AFTER INSERT ON cache_outputs BEGIN SELECT 1; END",
+                &[],
+            )
+            .unwrap();
+        drop(changed);
+        let error = match attached(&destination, &source) {
+            Ok(_) => panic!("a trigger on cache_outputs must not be admitted"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("row schema changed"), "{error}");
+        assert!(fixture.carried_hashes().is_empty());
+        assert!(!fixture.into.join("nx/cache/1").exists());
+    }
+
+    #[test]
+    fn the_destination_row_schema_change_refuses_attachment_before_any_publication() {
+        let fixture = Fixture::new();
+        fixture.entry("1", 4, b"warm");
+        let source = fixture.from.join("nx/workspace-data/task-v3.db");
+        let destination = fixture.into.join("nx/workspace-data/task-v3.db");
+        let changed = Connection::open(&destination).unwrap();
+        changed
+            .execute(
+                "ALTER TABLE task_details ADD COLUMN future_required_data TEXT",
+                &[],
+            )
+            .unwrap();
+        drop(changed);
+        let error = match attached(&destination, &source) {
+            Ok(_) => panic!("a changed destination row schema must not be admitted"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("row schema changed in main"),
+            "{error}"
+        );
+        assert!(fixture.carried_hashes().is_empty());
+        assert!(!fixture.into.join("nx/cache/1").exists());
+    }
+
+    /// Consumes the real existing pinned Nx product through the same adapter as production.
+    #[test]
+    #[ignore = "unsandboxed host-controller RAW/Nx compatibility proof; run with `nx run cowshed:host-controller-test`; requires the existing patched-nx product"]
+    fn host_controller_raw_carry_opens_restores_stores_and_evicts_with_native_nx() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        use std::process::Command;
+
+        let checkout = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap())
+            .join("../../../..")
+            .canonicalize()
+            .unwrap();
+        let build = checkout
+            .join(".cowshed/build")
+            .canonicalize()
+            .expect("run this proof from its owned warm RAW checkout");
+        let proof = format!(".carry-proof-{}", uuid::Uuid::new_v4().simple());
+        let from = std::env::temp_dir().join(&proof);
+        let into = build.join(&proof);
+        fs::create_dir_all(&from).unwrap();
+        fs::create_dir_all(&into).unwrap();
+        let fixture = Fixture {
+            root: from.clone(),
+            from: from.clone(),
+            into: into.clone(),
+            state: BuildVolumeState {
+                paths: vec![
+                    super::super::BuildStatePath::new(".nx/cache", ".nx/cache").unwrap(),
+                    super::super::BuildStatePath::new(".nx/workspace-data", ".nx/workspace-data")
+                        .unwrap(),
+                ],
+                fingerprint: None,
+            },
+        };
+        assert_ne!(
+            fs::metadata(&from).unwrap().dev(),
+            fs::metadata(&into).unwrap().dev(),
+            "copy source and destination must be separate mounted RAW volumes"
+        );
+        let product = checkout
+            .join(".cache/patched-nx/node_modules/nx")
+            .canonicalize()
+            .expect("the existing patched-nx producer must supply the product");
+        for root in [&from, &into] {
+            fs::write(
+                root.join("package.json"),
+                br#"{"name":"carry-proof","private":true}"#,
+            )
+            .unwrap();
+            fs::create_dir(root.join("node_modules")).unwrap();
+            std::os::unix::fs::symlink(&product, root.join("node_modules/nx")).unwrap();
+        }
+        const BODY: &str = r#"
+const assert = require('node:assert/strict'), fs = require('node:fs'), path = require('node:path');
+const root = process.argv[1], phase = process.argv[2];
+fs.writeFileSync(path.join(root, 'nx.json'), JSON.stringify({maxCacheSize: phase === 'verify' ? 1 : 0}));
+const {requireNx, cache, cacheDir, getLocal} = openNxCache(root);
+const nx = requireNx('nx/src/native');
+const db = requireNx('nx/src/utils/db-connection').getDbConnection();
+const details = new nx.TaskDetails(db);
+const task = {id:'a:build', target:{project:'a',target:'build'}, projectRoot:'.',
+  overrides:{}, outputs:['output'], cache:true, parallelism:true, continuous:false, inputs:[]};
+async function main() {
+  if (phase === 'create') {
+    fs.writeFileSync(path.join(root, 'output'), 'warm');
+    fs.chmodSync(path.join(root, 'output'), 0o440);
+    details.recordTaskDetails([{hash:'1', project:'a', target:'build'}]);
+    await cache.put({...task, hash:'1'}, 'terminal', ['output'], 0);
+    new nx.NxTaskHistory(db).recordTaskRuns([{hash:'1', status:'success', code:0, start:1, end:2}]);
+    assert.equal(getLocal('1').code, 0);
+  } else if (phase === 'verify') {
+    const hit = getLocal('1');
+    assert.equal(hit.code, 0);
+    assert.equal(hit.terminalOutput, 'terminal');
+    assert.equal(hit.size, 12);
+    const cachedEntryPath = path.join(cacheDir, '1/output');
+    const cacheBytesBefore = fs.readFileSync(cachedEntryPath);
+    const cachedBefore = fs.statSync(cachedEntryPath, {bigint:true});
+    const beforeMs = Date.now();
+    const copiedBytes = await cache.copyFilesFromCache({...task, hash:'1'}, hit, ['output']);
+    const afterMs = Date.now();
+    assert.equal(copiedBytes, 4);
+    assert.equal(fs.readFileSync(path.join(root, 'output'), 'utf8'), 'warm');
+    const restored = fs.statSync(path.join(root, 'output'));
+    assert.equal(restored.mode & 0o777, 0o440);
+    assert.ok(restored.mtimeMs >= beforeMs && restored.mtimeMs <= afterMs,
+      `restored mtime ${restored.mtimeMs} outside [${beforeMs}, ${afterMs}]`);
+    const cachedAfter = fs.statSync(cachedEntryPath, {bigint:true});
+    assert.deepEqual(fs.readFileSync(cachedEntryPath), cacheBytesBefore);
+    assert.equal(cachedAfter.mode, cachedBefore.mode);
+    assert.equal(cachedAfter.mtimeNs, cachedBefore.mtimeNs);
+    details.recordTaskDetails([{hash:'2', project:'a', target:'build'}]);
+    fs.chmodSync(path.join(root, 'output'), 0o640);
+    fs.writeFileSync(path.join(root, 'output'), 'new output');
+    await cache.put({...task, hash:'2'}, 'new terminal', ['output'], 0);
+    assert.equal(cache.getUsedCacheSpace(), 0);
+    assert.equal(getLocal('1'), null);
+    assert.equal(getLocal('2'), null);
+    assert.equal(fs.existsSync(path.join(cacheDir, '1')), false);
+    assert.equal(fs.existsSync(path.join(cacheDir, '2')), false);
+    console.log('pinned DbCache open/get/restore/store/eviction: passed; restore copied 4 bytes');
+  } else if (phase === 'add3' || phase === 'add4') {
+    const hash = phase === 'add3' ? '3' : '4';
+    details.recordTaskDetails([{hash, project:'a', target:'build'}]);
+    const output = path.join(root, 'output');
+    if (fs.existsSync(output)) fs.chmodSync(output, 0o640);
+    fs.writeFileSync(output, 'warm');
+    await cache.put({...task, hash}, 'terminal', ['output'], 0);
+    assert.equal(getLocal(hash).code, 0);
+  } else if (phase !== 'initialize') {
+    throw new Error(`unknown test phase ${phase}`);
+  }
+}
+main().catch(error => { console.error(error); process.exitCode = 1; });
+"#;
+        let script = super::super::cache_adapter::script(BODY);
+        let script = std::str::from_utf8(&script).unwrap();
+        let run = |root: &Path, phase: &str| {
+            let output = Command::new("node")
+                .args(["-e", script])
+                .arg(root)
+                .arg(phase)
+                .env("NX_SKIP_NATIVE_FILE_CACHE", "true")
+                .output()
+                .expect("spawn real Node with the accepted Nx product");
+            assert!(
+                output.status.success(),
+                "pinned Nx {phase}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            eprint!("{}", String::from_utf8_lossy(&output.stdout));
+        };
+        run(&from, "create");
+        run(&into, "initialize");
+        let names = databases_in(&from.join(".nx/workspace-data")).unwrap();
+        assert_eq!(names.len(), 1);
+        let source_db = from.join(".nx/workspace-data").join(&names[0]);
+        let destination_db = into.join(".nx/workspace-data").join(&names[0]);
+        assert_eq!(indexed(&destination_db), 0);
+        let initialized = Connection::open(&destination_db).unwrap();
+        for table in [
+            "task_details",
+            "task_history",
+            "running_tasks",
+            "task_invocations",
+            "metadata",
+        ] {
+            let mut count = initialized
+                .prepare(&format!("SELECT count(*) FROM {table}"))
+                .unwrap();
+            assert!(count.step().unwrap());
+            assert_eq!(
+                count.integer(0),
+                0,
+                "Nx initializes {table}, not a foreign-history copy"
+            );
+        }
+        drop(initialized);
+        let original = fs::metadata(from.join(".nx/cache/1/output")).unwrap();
+        WORK.with(|work| work.set(CopyWork::default()));
+        let started = std::time::Instant::now();
+        let staged = stage_rebase(
+            &from,
+            &fixture.state,
+            &into,
+            &fixture.state,
+            &Fixture::selections(&["1"]),
+            Path::new(crate::storage::bootstrap::STORE_ROOT),
+        );
+        assert!(staged.stopped.is_none(), "{staged:?}");
+        assert_eq!(indexed(&destination_db), 0, "files first, row last");
+        let stage_work = WORK.with(|work| work.get());
+        let carried = commit(staged, &into);
+        assert_eq!(carried.entries, 1);
+        assert_eq!(carried.bytes, 12);
+        assert!(carried.stopped.is_none(), "{carried:?}");
+        assert_eq!(
+            WORK.with(|work| work.get()),
+            stage_work,
+            "commit renames without a second walk or copy"
+        );
+        assert_eq!(
+            stage_work,
+            CopyWork {
+                objects: 3,
+                bytes: 12,
+                metadata_calls: 3
+            }
+        );
+        let copied = fs::metadata(into.join(".nx/cache/1/output")).unwrap();
+        assert_eq!(copied.modified().unwrap(), original.modified().unwrap());
+        assert_eq!(
+            copied.permissions().mode() & 0o777,
+            original.permissions().mode() & 0o777
+        );
+        let published = Connection::open(&destination_db).unwrap();
+        let source = Connection::open(&source_db).unwrap();
+        for column in ["code", "size", "created_at", "accessed_at"] {
+            let mut original = source
+                .prepare(&format!(
+                    "SELECT {column} FROM cache_outputs WHERE hash='1'"
+                ))
+                .unwrap();
+            let mut copied = published
+                .prepare(&format!(
+                    "SELECT {column} FROM cache_outputs WHERE hash='1'"
+                ))
+                .unwrap();
+            assert!(original.step().unwrap() && copied.step().unwrap());
+            assert_eq!(original.text(0), copied.text(0), "{column}");
+        }
+        drop(published);
+        drop(source);
+        run(&from, "add3");
+        let all = stage(&from, &fixture.state, &into, &fixture.state);
+        assert!(all.stopped.is_none(), "{all:?}");
+        run(&from, "add4");
+        let legacy = commit(all, &into);
+        assert_eq!(legacy.entries, 2, "{legacy:?}");
+        assert_eq!(legacy.bytes, 24, "{legacy:?}");
+        assert!(legacy.stopped.is_none(), "{legacy:?}");
+        for hash in ["3", "4"] {
+            assert_eq!(
+                fs::read(into.join(format!(".nx/cache/{hash}/output"))).unwrap(),
+                b"warm"
+            );
+            assert_eq!(
+                fs::read(into.join(format!(".nx/cache/terminalOutputs/{hash}"))).unwrap(),
+                b"terminal"
+            );
+        }
+        eprintln!(
+            "real RAW carry: {stage_work:?}, rows={}, elapsed={:?}, Nx-initialized DB={} bytes",
+            carried.entries,
+            started.elapsed(),
+            fs::metadata(&destination_db).unwrap().len()
+        );
+        run(&into, "verify");
+        drop(fixture);
     }
 }

@@ -13,22 +13,9 @@
 const answer = process.stdout.write.bind(process.stdout);
 process.stdout.write = process.stderr.write.bind(process.stderr);
 
-const path = require('node:path');
-const { createRequire } = require('node:module');
-
 const root = process.argv[2];
-if (!root || !path.isAbsolute(root)) {
-  throw new Error(`usage: node - <absolute Nx root>, given ${JSON.stringify(root)}`);
-}
-// The environment the Nx capability gives a job of the project at `root`
-// (capabilities/nx.rs), set before Nx loads: Nx fixes its workspace root at module load. Whether
-// a daemon serves the graph stays Nx's own decision, as for any run.
-process.env.NX_WORKSPACE_ROOT_PATH = root;
-process.env.NX_WORKSPACE_DATA_DIRECTORY = path.join(root, '.nx', 'workspace-data');
-process.env.NX_CACHE_DIRECTORY = path.join(root, '.nx', 'cache');
-
-// The root's own Nx: a hash is only a hit for the Nx that wrote it.
-const requireNx = createRequire(path.join(root, 'package.json'));
+// The one pinned adapter opens Nx's own complete cache schema in this same hashing job.
+const { requireNx } = openNxCache(root);
 const { readNxJson } = requireNx('nx/src/config/nx-json');
 const { createProjectGraphAsync, readProjectsConfigurationFromProjectGraph } = requireNx(
   'nx/src/project-graph/project-graph',

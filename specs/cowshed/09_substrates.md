@@ -221,6 +221,11 @@ write slow until `cowshed defrag main` (01a_apfs.md, "Clone cost follows extents
 until every sharer is released (01a_apfs.md, "Space reclamation"). Timing budgets are in 08_testing.md ("Performance
 budgets").
 
+Whole RAW backing images can share host APFS blocks through `clonefile`; files inside two separately mounted RAW images
+cannot. Each image contains its own APFS volume, and `clonefile` does not cross those volume boundaries. Land/rebase
+cache carry therefore copies the missing entry files with their metadata (16_build_volumes.md, "Carry"), while a fork
+clones the sealed backing image. A same-host store is not evidence that its guest files can be reflinked across mounts.
+
 ## ZFS substrate
 
 ### Mapping
