@@ -145,8 +145,8 @@ export interface UndoStage {
    *
    * @param state - State handle to roll back
    * @param token - Token from a prior checkpoint() call
-   * @returns 'ok' if every write in the window was journaled; 'overflow' if a prior write was refused,
-   *   in which case the exact valid prefix was rolled back (no snapshot restore)
+   * @returns 'ok' if every write in the window was journaled; 'overflow' if the window refused a write or was opened
+   *   refused (its memory could not back it), in which case the exact valid prefix was rolled back (no snapshot restore)
    */
   rollback(state: StateHandle, token: UndoToken): 'ok' | 'overflow';
   /**
