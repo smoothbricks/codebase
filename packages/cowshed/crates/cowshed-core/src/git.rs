@@ -2751,6 +2751,147 @@ fn registered_worktree_git_dir(root: &Path) -> Result<Option<PathBuf>> {
     Ok(Some(common.to_owned()))
 }
 
+/// Git stops following includes this deep (`MAX_INCLUDE_DEPTH` in Git's `config.c`).
+#[cfg(target_os = "macos")]
+const MAX_GIT_INCLUDE_DEPTH: usize = 10;
+
+/// The files `config` includes, transitively, which Git reads on every command that reads it.
+///
+/// A linked worktree's common config lives in main's `.git`, and an include it names by a
+/// relative path (`include.path = ../tooling/workspace.gitconfig`) lands in main's working tree,
+/// outside every root the worktree's sandboxed Git otherwise reads, so Git fails before it reads
+/// `HEAD`. The controller resolves them from the config it already grants and grants each file,
+/// never its directory. An include that does not exist is skipped, as Git skips it; a
+/// conditional include is granted whether or not its condition holds, since reading a file the
+/// condition then ignores grants nothing.
+#[cfg(target_os = "macos")]
+fn included_config_files(config: &Path, home: &Path) -> Result<Vec<PathBuf>> {
+    let mut files: Vec<PathBuf> = Vec::new();
+    let mut pending = vec![(config.to_owned(), 0)];
+    while let Some((file, depth)) = pending.pop() {
+        let text = match fs::read(&file) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(CowshedError::integrity(
+                    format!("cannot read Git config {}: {error}", file.display()),
+                    "repair the repository's Git config",
+                ));
+            }
+        };
+        let directory = file.parent().unwrap_or(Path::new("/"));
+        for path in config_include_paths(&String::from_utf8_lossy(&text)) {
+            let target = match path.strip_prefix("~/") {
+                Some(relative) => home.join(relative),
+                None => directory.join(path),
+            };
+            let target = match fs::canonicalize(&target) {
+                Ok(target) => target,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(CowshedError::integrity(
+                        format!(
+                            "cannot resolve Git config include {} of {}: {error}",
+                            target.display(),
+                            file.display()
+                        ),
+                        "repair the repository's Git config",
+                    ));
+                }
+            };
+            if !files.contains(&target) {
+                if depth + 1 < MAX_GIT_INCLUDE_DEPTH {
+                    pending.push((target.clone(), depth + 1));
+                }
+                files.push(target);
+            }
+        }
+    }
+    Ok(files)
+}
+
+/// The values of `include.path` and every `includeIf.<condition>.path` in one Git config file,
+/// in file order, read with Git's syntax: section and key names are case-insensitive, a
+/// `key = value` may follow a section header on its line, a value may be double-quoted with
+/// backslash escapes, and an unquoted `#` or `;` starts a comment.
+#[cfg(target_os = "macos")]
+fn config_include_paths(text: &str) -> Vec<String> {
+    let mut including = false;
+    let mut paths = Vec::new();
+    for line in text.lines() {
+        let mut rest = line.trim_start();
+        if let Some(header) = rest.strip_prefix('[') {
+            let mut quoted = false;
+            let Some(end) = header.char_indices().find_map(|(index, character)| {
+                match character {
+                    '"' => quoted = !quoted,
+                    ']' if !quoted => return Some(index),
+                    _ => {}
+                }
+                None
+            }) else {
+                including = false;
+                continue;
+            };
+            let name = header[..end]
+                .split(|character: char| character.is_whitespace() || character == '"')
+                .next()
+                .unwrap_or_default();
+            including =
+                name.eq_ignore_ascii_case("include") || name.eq_ignore_ascii_case("includeif");
+            rest = header[end + 1..].trim_start();
+        }
+        if !including {
+            continue;
+        }
+        if let Some((key, value)) = rest.split_once('=')
+            && key.trim().eq_ignore_ascii_case("path")
+        {
+            paths.push(config_value(value));
+        }
+    }
+    paths
+}
+
+/// One Git config value as Git reads it: quotes removed, escapes applied, a trailing comment
+/// and the unquoted whitespace around the value dropped.
+#[cfg(target_os = "macos")]
+fn config_value(raw: &str) -> String {
+    let mut value = String::new();
+    let mut quoted = false;
+    let mut spaces = String::new();
+    let mut characters = raw.trim_start().chars();
+    while let Some(character) = characters.next() {
+        match character {
+            '"' => {
+                value.push_str(&spaces);
+                spaces.clear();
+                quoted = !quoted;
+            }
+            '\\' => {
+                let escaped = match characters.next() {
+                    Some('n') => '\n',
+                    Some('t') => '\t',
+                    Some('b') => '\u{8}',
+                    Some(other) => other,
+                    None => break,
+                };
+                value.push_str(&spaces);
+                spaces.clear();
+                value.push(escaped);
+            }
+            '#' | ';' if !quoted => break,
+            character if character.is_whitespace() && !quoted => spaces.push(character),
+            character => {
+                value.push_str(&spaces);
+                spaces.clear();
+                value.push(character);
+            }
+        }
+    }
+    value
+}
+
 /// Controller Git can consume repository-selected filters, merge drivers and
 /// transports. Run it with the GitDiscovery policy: writable only in this
 /// checkout; other trees require controller-supplied, explicit roots.
@@ -2815,7 +2956,11 @@ fn sandboxed_git_command_with_paths(
             "set HOME to the operator's home directory",
         )
     })?;
-    let mut read = Vec::new();
+    let common = registered_worktree_git_dir(&canonical)?;
+    let mut read = match &common {
+        Some(common) => included_config_files(&common.join("config"), &home)?,
+        None => Vec::new(),
+    };
     if let Some(path) = readable {
         read.push(fs::canonicalize(path).map_err(|error| {
             CowshedError::integrity(
@@ -2853,7 +2998,7 @@ fn sandboxed_git_command_with_paths(
                 })
                 .transpose()?
                 .into_iter()
-                .chain(registered_worktree_git_dir(&canonical)?)
+                .chain(common)
                 .collect(),
             ..SandboxGrants::default()
         },
@@ -3629,6 +3774,72 @@ mod tests {
             admitted.status.success(),
             "trusted source fetch: {}",
             String::from_utf8_lossy(&admitted.stderr)
+        );
+    }
+
+    /// Main's config is a linked worktree's config, and a file it includes by a path relative to
+    /// main's `.git` is in main's working tree, which the worktree's sandboxed Git cannot
+    /// otherwise read: every controller verb on a git-worktree workspace failed at its first Git
+    /// command with "unable to access …/.git/../tooling/workspace.gitconfig".
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_linked_worktree_reads_the_files_its_common_config_includes() {
+        let main = repository();
+        fs::create_dir_all(main.join("tooling")).expect("tooling");
+        fs::write(
+            main.join("tooling/workspace.gitconfig"),
+            "[core]\n\tabbrev = 12\n",
+        )
+        .expect("included config");
+        git(
+            &main,
+            &["config", "include.path", "../tooling/workspace.gitconfig"],
+        );
+        let workspace = main.with_extension("linked");
+        let added = Command::new("git")
+            .arg("-C")
+            .arg(&*main)
+            .args(["worktree", "add", "-q", "--detach"])
+            .arg(&workspace)
+            .status_locked()
+            .expect("add linked worktree");
+        assert!(added.success());
+        let workspace = workspace.canonicalize().expect("canonical workspace");
+        let output = super::sandboxed_git_command_at(&workspace)
+            .expect("narrow Git")
+            .args(["config", "core.abbrev"])
+            .output_locked()
+            .expect("sandboxed Git");
+        assert!(
+            output.status.success(),
+            "the include is readable: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.stdout, b"12\n");
+        let head = super::sandboxed_git_command_at(&workspace)
+            .expect("narrow Git")
+            .args(["rev-parse", "HEAD"])
+            .output_locked()
+            .expect("sandboxed Git");
+        assert!(
+            head.status.success(),
+            "HEAD reads: {}",
+            String::from_utf8_lossy(&head.stderr)
+        );
+    }
+
+    /// Include paths are read with Git's own syntax, and only from include sections.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn config_include_paths_follow_git_syntax() {
+        let config = "[core]\n\tpath = not-an-include\n[include]\n\tpath = ../tooling/a.gitconfig ; comment\n[Include] PATH = \"b c.gitconfig\"\n[includeIf \"gitdir:~/Dev/]x\"]\n\tpath = ~/work.gitconfig\n\tother = d\n[user]\n\tname = x\n";
+        assert_eq!(
+            super::config_include_paths(config),
+            [
+                "../tooling/a.gitconfig",
+                "b c.gitconfig",
+                "~/work.gitconfig"
+            ]
         );
     }
 
