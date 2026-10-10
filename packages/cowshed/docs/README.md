@@ -38,7 +38,7 @@ machines; stderr is for humans and agents deciding what to do next.**
 - **Isolated.** Every workspace is an independent volume with a standalone Git checkout. `cowshed exec` applies the
   workspace sandbox, sanitized environment, controller-selected caches, and gateway endpoint.
 - **Repository-aware.** A host may adopt many repositories. cwd or `--project <git-root>` selects which repository's
-  `main` to clone; `--from <workspace>` selects another source inside that repository.
+  `main` to clone by default; `fork <src> <ws>` selects another source inside that repository.
 - **Inode-friendly.** Dependency and build trees live inside image files rather than expanding the host Data volume's
   inode namespace.
 

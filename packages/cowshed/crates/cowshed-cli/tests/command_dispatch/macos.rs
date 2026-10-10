@@ -1697,7 +1697,7 @@ fn assert_target_on_build_volume(checkout: &Path) {
     );
 }
 
-/// The moment `cowshed new` returns, `fork`'s build state resolves into a volume of its own and
+/// The moment `cowshed fork` returns, `fork`'s build state resolves into a volume of its own and
 /// never into the one `target` links: a process the fork starts at once must not open the
 /// target's task database, or the target's next land cannot adopt.
 fn assert_on_own_build_volume(fork: &Path, target: &Path) {
