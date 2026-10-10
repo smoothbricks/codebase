@@ -796,18 +796,20 @@ impl<A: VoAdmission> EventProcessor<A> {
 impl Plane {
     /// Grow a workspace geometrically toward `MAX_WORK_BUFFER_SIZE`
     /// (`ensureWorkBufferCapacity`). Err means already at the cap.
-    fn grow_work_buffer(&mut self, fallback: bool) -> Result<(), ()> {
+    /// Double one workspace up to its ceiling: `BufferOverflow` at the
+    /// ceiling, `MemoryExhausted` when the larger workspace cannot be backed
+    /// (the current one is kept either way).
+    fn grow_work_buffer(&mut self, fallback: bool) -> Result<(), json_extractor::ExtractionError> {
         let buffer = if fallback {
             &mut self.fallback_work_buffer
         } else {
             &mut self.work_buffer
         };
         if buffer.len() >= MAX_WORK_BUFFER_SIZE {
-            return Err(());
+            return Err(json_extractor::ExtractionError::BufferOverflow);
         }
         let target = (buffer.len() * 2).min(MAX_WORK_BUFFER_SIZE);
-        buffer.resize(target, 0);
-        Ok(())
+        zero_extend(buffer, target)
     }
 
     /// BASE PATH: the base event-log scanners, which write the four
@@ -825,22 +827,12 @@ impl Plane {
 
         let parse_result = match format {
             InputFormat::Json => {
-                json_scanner::parse_json_events(input, cols).map_err(|_| ProcessError {
-                    code: ResultCode::ParseError,
-                    diagnostic: None,
-                })
+                json_scanner::parse_json_events(input, cols).map_err(base_scan_error)
             }
-            InputFormat::Msgpack => {
-                msgpack_scanner::parse_msgpack_events(input, cols).map_err(|_| ProcessError {
-                    code: ResultCode::ParseError,
-                    diagnostic: None,
-                })
-            }
+            InputFormat::Msgpack => msgpack_scanner::parse_msgpack_events(input, cols)
+                .map_err(|error| base_scan_error(error.into())),
             InputFormat::MsgpackStream => msgpack_scanner::parse_msgpack_stream(input, cols)
-                .map_err(|_| ProcessError {
-                    code: ResultCode::ParseError,
-                    diagnostic: None,
-                }),
+                .map_err(|error| base_scan_error(error.into())),
             // Arrow passthrough is unsupported on the base path.
             InputFormat::ArrowPassthrough => Err(ProcessError {
                 code: ResultCode::InvalidFormat,
@@ -972,8 +964,11 @@ impl Plane {
         } else {
             &mut self.work_buffer
         };
-        if buffer.is_empty() {
-            buffer.resize(INITIAL_WORK_BUFFER_SIZE, 0);
+        if buffer.is_empty()
+            && let Err(error) = zero_extend(buffer, INITIAL_WORK_BUFFER_SIZE)
+        {
+            diagnostic.workspace_exhausted();
+            return Err(error);
         }
         loop {
             self.dynamic_columns.reset();
@@ -1008,8 +1003,14 @@ impl Plane {
                         || (diagnostic.stage == diagnostic_stage::MSGPACK
                             && diagnostic.detail == diagnostic_detail::BUFFER_OVERFLOW);
                     let may_grow = workspace_overflow && (fallback || self.options.msgpack_growth);
-                    if !may_grow || self.grow_work_buffer(fallback).is_err() {
+                    if !may_grow {
                         return Err(json_extractor::ExtractionError::BufferOverflow);
+                    }
+                    if let Err(error) = self.grow_work_buffer(fallback) {
+                        if error == json_extractor::ExtractionError::MemoryExhausted {
+                            diagnostic.workspace_exhausted();
+                        }
+                        return Err(error);
                     }
                 }
                 other => return other,
@@ -1017,6 +1018,28 @@ impl Plane {
         }
     }
 }
+/// Grow `buffer` to `len` zeroed bytes, backed fallibly.
+fn zero_extend(buffer: &mut Vec<u8>, len: usize) -> Result<(), json_extractor::ExtractionError> {
+    buffer
+        .try_reserve_exact(len.saturating_sub(buffer.len()))
+        .map_err(|_| json_extractor::ExtractionError::MemoryExhausted)?;
+    buffer.resize(len, 0);
+    Ok(())
+}
+
+/// A base scanner refusal: a column that could not grow is the memory
+/// refusal, every other failure a parse error.
+fn base_scan_error(error: columine_arrow::ParseError) -> ProcessError {
+    ProcessError {
+        code: if error == columine_arrow::ParseError::OutOfMemory {
+            ResultCode::MemoryExhausted
+        } else {
+            ResultCode::ParseError
+        },
+        diagnostic: None,
+    }
+}
+
 /// Write the 32-byte result header (`writeResultHeader`). The code is a raw
 /// u32: this is the byte primitive every header writer casts into, so a
 /// status vocabulary extension (admission codes 8 and 9) composes on

@@ -67,7 +67,7 @@ impl Logical {
 /// - `Bool` takes booleans only.
 /// - `Binary` takes anything and stores its canonical MessagePack bytes.
 /// - `Null` columns consume the value and store nothing.
-pub(crate) fn coerce(kind: ArrowType, value: &Logical) -> Result<Option<ColumnValue>, ()> {
+pub(crate) fn coerce(kind: ArrowType, value: &Logical) -> Result<Option<ColumnValue<'_>>, ()> {
     if kind == ArrowType::Null {
         return Ok(None);
     }
@@ -75,7 +75,7 @@ pub(crate) fn coerce(kind: ArrowType, value: &Logical) -> Result<Option<ColumnVa
         return Ok(None);
     }
     match (kind, value) {
-        (ArrowType::Utf8, Logical::Text(text)) => Ok(Some(ColumnValue::Utf8(text.clone()))),
+        (ArrowType::Utf8, Logical::Text(text)) => Ok(Some(ColumnValue::Utf8(text.clone().into()))),
         (ArrowType::Int32, Logical::Int(value)) => i32::try_from(*value)
             .map(|narrow| Some(ColumnValue::Int(i64::from(narrow))))
             .map_err(|_| ()),
@@ -111,9 +111,9 @@ pub(crate) fn coerce(kind: ArrowType, value: &Logical) -> Result<Option<ColumnVa
         (ArrowType::Float64, Logical::Int(value)) => Ok(Some(ColumnValue::Float(*value as f64))),
         (ArrowType::Float64, Logical::Float(value)) => Ok(Some(ColumnValue::Float(*value))),
         (ArrowType::Bool, Logical::Bool(value)) => Ok(Some(ColumnValue::Bool(*value))),
-        (ArrowType::Binary, value) => {
-            Ok(Some(ColumnValue::Binary(canonical_msgpack(&value.json()))))
-        }
+        (ArrowType::Binary, value) => Ok(Some(ColumnValue::Binary(
+            canonical_msgpack(&value.json()).into(),
+        ))),
         _ => Err(()),
     }
 }
@@ -142,7 +142,10 @@ fn schema(kind: ArrowType) -> [SignalSchemaField; 1] {
 }
 
 /// Extract a single-field document through the JSON pipeline.
-fn via_json(kind: ArrowType, literal: &str) -> Result<Option<ColumnValue>, ExtractionError> {
+fn via_json(
+    kind: ArrowType,
+    literal: &str,
+) -> Result<Option<ColumnValue<'static>>, ExtractionError> {
     let document = format!("[{{\"v\":{literal}}}]");
     let fields = schema(kind);
     let config = build_extraction_config(&fields, &["v"]).expect("single-field schema is valid");
@@ -160,7 +163,10 @@ fn via_json(kind: ArrowType, literal: &str) -> Result<Option<ColumnValue>, Extra
 }
 
 /// Extract the canonical MessagePack encoding of the same document.
-fn via_msgpack(kind: ArrowType, literal: &str) -> Result<Option<ColumnValue>, ExtractionError> {
+fn via_msgpack(
+    kind: ArrowType,
+    literal: &str,
+) -> Result<Option<ColumnValue<'static>>, ExtractionError> {
     let document = canonical_msgpack(&format!("[{{\"v\":{literal}}}]"));
     let fields = schema(kind);
     let config = build_extraction_config(&fields, &["v"]).expect("single-field schema is valid");

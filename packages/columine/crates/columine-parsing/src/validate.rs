@@ -1329,15 +1329,37 @@ fn field_path(parent: &str, segment: &str) -> String {
 /// Presence columns use percent-encoded bytes for path segments. Percent is
 /// escaped first so a literal `%2E` cannot be confused with a literal dot.
 pub(crate) fn encode_path_segment(segment: &str) -> String {
-    let mut output = String::with_capacity(segment.len());
-    for byte in segment.bytes() {
-        match byte {
-            b'.' => output.push_str("%2E"),
-            b'%' => output.push_str("%25"),
-            _ => output.push(byte as char),
-        }
+    let mut output = Vec::with_capacity(encoded_segment_len(segment));
+    encode_segment_into(segment, |chunk| output.extend_from_slice(chunk));
+    // Splitting only at the ASCII `.` and `%` keeps every chunk UTF-8.
+    String::from_utf8(output).unwrap_or_else(|_| unreachable!("ASCII splits keep UTF-8"))
+}
+
+/// The length of `segment`'s carrier spelling.
+pub(crate) fn encoded_segment_len(segment: &str) -> usize {
+    segment.len()
+        + 2 * segment
+            .bytes()
+            .filter(|byte| matches!(byte, b'.' | b'%'))
+            .count()
+}
+
+/// Feed `segment`'s carrier spelling to `emit`: `.` as `%2E`, `%` as `%25`,
+/// and every other byte, a non-ASCII one included, as itself.
+pub(crate) fn encode_segment_into(segment: &str, mut emit: impl FnMut(&[u8])) {
+    let bytes = segment.as_bytes();
+    let mut start = 0;
+    for (index, byte) in bytes.iter().enumerate() {
+        let escape: &[u8] = match byte {
+            b'.' => b"%2E",
+            b'%' => b"%25",
+            _ => continue,
+        };
+        emit(&bytes[start..index]);
+        emit(escape);
+        start = index + 1;
     }
-    output
+    emit(&bytes[start..]);
 }
 
 struct StringValue<'a>(&'a str);
@@ -2233,6 +2255,13 @@ mod tests {
         assert_eq!(
             validate_value(&closed, &dotted).unwrap_err().path,
             "value.dot%2Ekey"
+        );
+        // Only `.` and `%` are escaped; every other byte, a non-ASCII one
+        // included, is kept as itself, so UTF-8 keys stay UTF-8.
+        let accented = json(r#"{"caf\u00e9.%":1}"#);
+        assert_eq!(
+            validate_value(&closed, &accented).unwrap_err().path,
+            "value.caf\u{e9}%2E%25"
         );
     }
 

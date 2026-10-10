@@ -4,7 +4,7 @@ use crate::{
     ArrowType, ColumnValue, DynamicColumns, ExtractionConfig, MemberSchema, ParseError, PlaneKind,
     SignalSchemaField,
     json_parser::{JsonParser, JsonStr, ParserError, Token},
-    validate::{SemanticSchema, encode_path_segment},
+    validate::{SemanticSchema, encode_path_segment, encode_segment_into, encoded_segment_len},
 };
 use columine_arrow::VariableValueReservation;
 
@@ -38,6 +38,32 @@ fn lex_error(error: ParserError) -> ExtractionError {
         | ParserError::EndOfInput
         | ParserError::InvalidNumber => ExtractionError::InvalidJson,
     }
+}
+
+/// Record a lexer refusal at the JSON stage: memory the lexer could not back
+/// as `MEMORY_EXHAUSTED`, anything else as invalid JSON.
+fn json_refusal(
+    diagnostic: &mut ExtractionDiagnostic,
+    error: ParserError,
+    field_index: u16,
+    expected: u8,
+    row: u32,
+) -> ExtractionError {
+    let refusal = lex_error(error);
+    let detail = if refusal == ExtractionError::MemoryExhausted {
+        diagnostic_detail::MEMORY_EXHAUSTED
+    } else {
+        diagnostic_detail::INVALID_JSON
+    };
+    diagnostic.set(
+        diagnostic_stage::JSON,
+        detail,
+        field_index,
+        expected,
+        json_value_type::UNKNOWN,
+        row,
+    );
+    refusal
 }
 
 /// The decoded text of a JSON string: borrowed from the input when it has
@@ -160,6 +186,19 @@ impl ExtractionDiagnostic {
             actual_type: actual,
             row_index: row.min(u16::MAX as u32) as u16,
         };
+    }
+
+    /// The extraction workspace could not be backed: replaces whatever the
+    /// attempt that asked for more workspace recorded.
+    pub fn workspace_exhausted(&mut self) {
+        self.set(
+            diagnostic_stage::MSGPACK,
+            diagnostic_detail::MEMORY_EXHAUSTED,
+            NO_FIELD,
+            0,
+            0,
+            0,
+        );
     }
 
     /// Complete a diagnostic from the error when no failure site filled it in.
@@ -331,16 +370,8 @@ pub fn extract_json_events(
 ) -> Result<usize, ExtractionError> {
     *diagnostic = ExtractionDiagnostic::default();
     let mut parser = JsonParser::new(input);
-    if parser.expect_array_begin().is_err() {
-        diagnostic.set(
-            diagnostic_stage::JSON,
-            diagnostic_detail::INVALID_JSON,
-            NO_FIELD,
-            0,
-            json_value_type::UNKNOWN,
-            0,
-        );
-        return Err(ExtractionError::InvalidJson);
+    if let Err(error) = parser.expect_array_begin() {
+        return Err(json_refusal(diagnostic, error, NO_FIELD, 0, 0));
     }
     let mut count = 0;
     while !parser.is_array_end() {
@@ -352,9 +383,7 @@ pub fn extract_json_events(
         }
         count += 1;
     }
-    parser
-        .next_token()
-        .map_err(|_| ExtractionError::InvalidJson)?;
+    parser.next_token().map_err(lex_error)?;
     Ok(count)
 }
 
@@ -391,16 +420,8 @@ fn extract_json_event_open(
     work_buffer: &mut [u8],
     diagnostic: &mut ExtractionDiagnostic,
 ) -> Result<(), ExtractionError> {
-    if parser.expect_object_begin().is_err() {
-        diagnostic.set(
-            diagnostic_stage::JSON,
-            diagnostic_detail::INVALID_JSON,
-            NO_FIELD,
-            0,
-            json_value_type::UNKNOWN,
-            columns.count,
-        );
-        return Err(ExtractionError::InvalidJson);
+    if let Err(error) = parser.expect_object_begin() {
+        return Err(json_refusal(diagnostic, error, NO_FIELD, 0, columns.count));
     }
     // Track presence across the declared schema. A schema-sized tracker avoids
     // rejecting schemas wider than a fixed implementation limit.
@@ -425,11 +446,7 @@ fn extract_json_event_open(
     // for it, so routing never depends on key order.
     let mut event_type: Option<String> = None;
     while !parser.is_object_end() {
-        let name = owned(
-            parser
-                .expect_field_name()
-                .map_err(|_| ExtractionError::InvalidJson)?,
-        )?;
+        let name = owned(parser.expect_field_name().map_err(lex_error)?)?;
         let is_type = name == "type";
         if config.is_discriminator_key(name.as_bytes()) {
             // A failed read consumes nothing (see `JsonParser::advance`), so one
@@ -479,24 +496,16 @@ fn extract_json_event_open(
             if event_type.is_none() && config.semantic_schemas.is_some() {
                 event_type = lookahead_event_type(parser);
             }
-            parser
-                .expect_object_begin()
-                .map_err(|_| ExtractionError::InvalidJson)?;
+            parser.expect_object_begin().map_err(lex_error)?;
             let discriminant_name = if discriminant_is_event_type {
                 event_type.as_deref()
             } else {
                 discriminant.as_deref()
             };
-            let mut column_name = String::with_capacity(32);
+            let mut column_name = String::new();
             while !parser.is_object_end() {
-                let member = owned(
-                    parser
-                        .expect_field_name()
-                        .map_err(|_| ExtractionError::InvalidJson)?,
-                )?;
-                column_name.clear();
-                column_name.push_str("value.");
-                column_name.push_str(&member);
+                let member = owned(parser.expect_field_name().map_err(lex_error)?)?;
+                crate::spell_payload_column(&mut column_name, &member)?;
                 extract_named_member(
                     parser,
                     config,
@@ -510,9 +519,7 @@ fn extract_json_event_open(
                     &member,
                 )?;
             }
-            parser
-                .next_token()
-                .map_err(|_| ExtractionError::InvalidJson)?;
+            parser.next_token().map_err(lex_error)?;
             continue;
         }
         extract_named_member(
@@ -534,9 +541,7 @@ fn extract_json_event_open(
             &name,
         )?;
     }
-    parser
-        .next_token()
-        .map_err(|_| ExtractionError::InvalidJson)?;
+    parser.next_token().map_err(lex_error)?;
     for (presence_column, source_column) in &config.presence_entries {
         let present = columns.columns_seen[*source_column];
         append(columns, *presence_column, Some(ColumnValue::Bool(present)))?;
@@ -694,8 +699,7 @@ fn extract_named_member(
                 )
             })?;
         }
-        let path_key = encode_path_segment(payload_name);
-        writer.write_string(&path_key).map_err(|err| {
+        writer.write_path_segment(payload_name).map_err(|err| {
             msgpack_failure(
                 diagnostic,
                 fallback as u32,
@@ -704,16 +708,17 @@ fn extract_named_member(
                 err,
             )
         })?;
-        let Ok(token) = parser.next_token() else {
-            diagnostic.set(
-                diagnostic_stage::JSON,
-                diagnostic_detail::INVALID_JSON,
-                fallback as u16,
-                ArrowType::Binary as u8,
-                json_value_type::UNKNOWN,
-                row,
-            );
-            return Err(ExtractionError::InvalidJson);
+        let token = match parser.next_token() {
+            Ok(token) => token,
+            Err(error) => {
+                return Err(json_refusal(
+                    diagnostic,
+                    error,
+                    fallback as u16,
+                    ArrowType::Binary as u8,
+                    row,
+                ));
+            }
         };
         let actual = json_value_type_of(&token);
         writer
@@ -722,9 +727,7 @@ fn extract_named_member(
         *extra_count += 1;
         return Ok(());
     }
-    parser
-        .skip_value()
-        .map_err(|_| ExtractionError::InvalidJson)
+    parser.skip_value().map_err(lex_error)
 }
 
 /// Coerce one JSON value into one column.
@@ -760,15 +763,13 @@ fn extract_typed_value_with_capture(
     enum_variants: Option<&[String]>,
 ) -> Result<(), ExtractionError> {
     let arrow_type = field.arrow_type;
-    let token = parser
-        .next_token()
-        .map_err(|_| ExtractionError::InvalidJson)?;
+    let token = parser.next_token().map_err(lex_error)?;
     let actual = json_value_type_of(&token);
     let row = columns.count;
     let kind = field.plane_kind();
     let value = match kind {
         PlaneKind::Text { .. } => match token {
-            Token::String(value) => Some(ColumnValue::Utf8(owned(value)?)),
+            Token::String(value) => Some(ColumnValue::Utf8(text_of(value)?)),
             Token::Null => None,
             _ => {
                 return Err(invalid_field_type(
@@ -894,11 +895,11 @@ fn extract_typed_value_with_capture(
         // of exactly `2 * width` hex digits. Hex over base64 because its length
         // pins the byte count with no padding left to interpret.
         PlaneKind::FixedBytes { width } => match token {
-            Token::String(value) => Some(ColumnValue::FixedBytes(
-                decode_fixed_hex(&text_of(value)?, width).ok_or_else(|| {
+            Token::String(value) => Some(ColumnValue::FixedBytes(std::borrow::Cow::Owned(
+                decode_fixed_hex(&text_of(value)?, width)?.ok_or_else(|| {
                     invalid_field_type(diagnostic, column as u32, arrow_type, actual, row)
                 })?,
-            )),
+            ))),
             Token::Null => None,
             _ => {
                 return Err(invalid_field_type(
@@ -966,9 +967,7 @@ fn extract_typed_value_with_capture(
             // stays coherent; this is especially important for nested objects
             // and arrays.
             if matches!(token, Token::ObjectBegin | Token::ArrayBegin) {
-                parser
-                    .skip_open_container(token)
-                    .map_err(|_| ExtractionError::InvalidJson)?;
+                parser.skip_open_container(token).map_err(lex_error)?;
             }
             None
         }
@@ -1006,17 +1005,24 @@ fn hex_nibble(byte: u8) -> Option<u8> {
 
 /// Decode a hex string into exactly `width` bytes, or `None` when the string
 /// is not exactly `2 * width` hex digits.
-fn decode_fixed_hex(text: &str, width: u32) -> Option<Vec<u8>> {
-    let bytes = text.as_bytes();
-    if bytes.len() != width as usize * 2 {
-        return None;
+/// `width` bytes from exactly `2 * width` hex digits; `Ok(None)` for any
+/// other text, which is checked before the bytes are backed.
+fn decode_fixed_hex(text: &str, width: u32) -> Result<Option<Vec<u8>>, ExtractionError> {
+    let digits = text.as_bytes();
+    if digits.len() != width as usize * 2 || digits.iter().any(|digit| hex_nibble(*digit).is_none())
+    {
+        return Ok(None);
     }
+    let mut bytes = Vec::new();
     bytes
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|pair| Some(hex_nibble(pair[0])? << 4 | hex_nibble(pair[1])?))
-        .collect()
+        .try_reserve_exact(width as usize)
+        .map_err(|_| ExtractionError::MemoryExhausted)?;
+    for pair in digits.as_chunks::<2>().0 {
+        if let (Some(high), Some(low)) = (hex_nibble(pair[0]), hex_nibble(pair[1])) {
+            bytes.push(high << 4 | low);
+        }
+    }
+    Ok(Some(bytes))
 }
 
 /// Record an invalid field-type diagnostic.
@@ -1076,10 +1082,11 @@ fn encode_path_segments(path: &[String]) -> String {
 fn append(
     columns: &mut DynamicColumns,
     column: usize,
-    value: Option<ColumnValue>,
+    value: Option<ColumnValue<'_>>,
 ) -> Result<(), ExtractionError> {
     crate::append_cell(columns, column, value).map_err(|error| match error {
         ParseError::BufferOverflow => ExtractionError::BufferOverflow,
+        ParseError::OutOfMemory => ExtractionError::MemoryExhausted,
         _ => ExtractionError::InvalidFieldType,
     })
 }
@@ -1196,15 +1203,9 @@ impl<'a> MsgpackValueWriter<'a> {
                 self.reserve_map32()?;
                 let mut count = 0_u32;
                 while !parser.is_object_end() {
-                    let name = owned(
-                        parser
-                            .expect_field_name()
-                            .map_err(|_| ExtractionError::InvalidJson)?,
-                    )?;
+                    let name = owned(parser.expect_field_name().map_err(lex_error)?)?;
                     let known = fields.iter().find(|(field, _)| field == &name);
-                    let value = parser
-                        .next_token()
-                        .map_err(|_| ExtractionError::InvalidJson)?;
+                    let value = parser.next_token().map_err(lex_error)?;
                     if let Some((_, child_schema)) = known {
                         self.write_string(&name)?;
                         path.push(name);
@@ -1233,9 +1234,7 @@ impl<'a> MsgpackValueWriter<'a> {
                         count += 1;
                     }
                 }
-                parser
-                    .next_token()
-                    .map_err(|_| ExtractionError::InvalidJson)?;
+                parser.next_token().map_err(lex_error)?;
                 self.buf()[header + 1..header + 5].copy_from_slice(&count.to_be_bytes());
                 Ok(())
             }
@@ -1250,20 +1249,12 @@ impl<'a> MsgpackValueWriter<'a> {
         self.reserve_map32()?;
         let mut count: u32 = 0;
         while !parser.is_object_end() {
-            self.write_json_str(
-                parser
-                    .expect_field_name()
-                    .map_err(|_| ExtractionError::InvalidJson)?,
-            )?;
-            let value = parser
-                .next_token()
-                .map_err(|_| ExtractionError::InvalidJson)?;
+            self.write_json_str(parser.expect_field_name().map_err(lex_error)?)?;
+            let value = parser.next_token().map_err(lex_error)?;
             self.write_value(parser, value)?;
             count += 1;
         }
-        parser
-            .next_token()
-            .map_err(|_| ExtractionError::InvalidJson)?;
+        parser.next_token().map_err(lex_error)?;
         self.buf()[header + 1..header + 5].copy_from_slice(&count.to_be_bytes());
         Ok(())
     }
@@ -1274,15 +1265,11 @@ impl<'a> MsgpackValueWriter<'a> {
         self.offset += 5;
         let mut count: u32 = 0;
         while !parser.is_array_end() {
-            let value = parser
-                .next_token()
-                .map_err(|_| ExtractionError::InvalidJson)?;
+            let value = parser.next_token().map_err(lex_error)?;
             self.write_value(parser, value)?;
             count += 1;
         }
-        parser
-            .next_token()
-            .map_err(|_| ExtractionError::InvalidJson)?;
+        parser.next_token().map_err(lex_error)?;
         self.buf()[header + 1..header + 5].copy_from_slice(&count.to_be_bytes());
         Ok(())
     }
@@ -1364,6 +1351,22 @@ impl<'a> MsgpackValueWriter<'a> {
                 Ok(())
             }
         }
+    }
+
+    /// Write one path segment in its carrier spelling straight into the
+    /// output, building no intermediate string.
+    fn write_path_segment(&mut self, segment: &str) -> Result<(), ExtractionError> {
+        let len = encoded_segment_len(segment);
+        self.write_str_header(len)?;
+        self.reserve(len)?;
+        let mut at = self.offset;
+        let buf = self.buf();
+        encode_segment_into(segment, |chunk| {
+            buf[at..at + chunk.len()].copy_from_slice(chunk);
+            at += chunk.len();
+        });
+        self.offset = at;
+        Ok(())
     }
 
     fn write_str_header(&mut self, len: usize) -> Result<(), ExtractionError> {
@@ -1713,9 +1716,9 @@ mod tests {
         .unwrap();
         assert_eq!(
             c.cell(1, 0),
-            Some(ColumnValue::Binary(vec![
+            Some(ColumnValue::Binary(std::borrow::Cow::Owned(vec![
                 0xdf, 0, 0, 0, 1, 0xa5, b'c', b'o', b'u', b'n', b't', 42
-            ]))
+            ])))
         );
     }
     #[test]
@@ -1868,9 +1871,9 @@ mod tests {
         );
         assert_eq!(
             c.cell(1, 0),
-            Some(ColumnValue::Binary(vec![
+            Some(ColumnValue::Binary(std::borrow::Cow::Owned(vec![
                 0xdf, 0, 0, 0, 1, 0xa5, b'b', b'o', b'g', b'u', b's', 7
-            ]))
+            ])))
         );
     }
     #[test]
@@ -1916,10 +1919,10 @@ mod tests {
         );
         assert_eq!(
             c.cell(1, 0),
-            Some(ColumnValue::Binary(vec![
+            Some(ColumnValue::Binary(std::borrow::Cow::Owned(vec![
                 0xdf, 0, 0, 0, 1, 0xab, b'$', b'u', b'n', b'd', b'e', b'c', b'l', b'a', b'r', b'e',
                 b'd', 9
-            ]))
+            ])))
         );
     }
     #[test]
@@ -1927,9 +1930,9 @@ mod tests {
         let c = one_value(br#"{"nested":true}"#, ArrowType::Binary);
         assert_eq!(
             c.cell(0, 0),
-            Some(ColumnValue::Binary(vec![
+            Some(ColumnValue::Binary(std::borrow::Cow::Owned(vec![
                 0xdf, 0, 0, 0, 1, 0xa6, b'n', b'e', b's', b't', b'e', b'd', 0xc3
-            ]))
+            ])))
         );
     }
     #[test]
@@ -2070,16 +2073,16 @@ mod tests {
         .unwrap();
         assert_eq!(
             columns.cell(1, 0),
-            Some(ColumnValue::Binary(vec![
+            Some(ColumnValue::Binary(std::borrow::Cow::Owned(vec![
                 0xdf, 0, 0, 0, 1, 0xa2, b'i', b'd', 0xa1, b'u'
-            ]))
+            ])))
         );
         assert_eq!(
             columns.cell(2, 0),
-            Some(ColumnValue::Binary(vec![
+            Some(ColumnValue::Binary(std::borrow::Cow::Owned(vec![
                 0xdf, 0, 0, 0, 1, 0xad, b'u', b's', b'e', b'r', b'.', b'n', b'i', b'c', b'k', b'n',
                 b'a', b'm', b'e', 0xa1, b'n'
-            ]))
+            ])))
         );
     }
 
@@ -2105,9 +2108,9 @@ mod tests {
             None,
         )
         .unwrap();
-        let captured_note = ColumnValue::Binary(vec![
+        let captured_note = ColumnValue::Binary(std::borrow::Cow::Owned(vec![
             0xdf, 0, 0, 0, 1, 0xa4, b'n', b'o', b't', b'e', 0xa1, b'x',
-        ]);
+        ]));
         for input in [
             &br#"[{"type":"a","value":{"note":"x"}}]"#[..],
             &br#"[{"value":{"note":"x"},"type":"a"}]"#[..],

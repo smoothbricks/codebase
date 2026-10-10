@@ -11,6 +11,8 @@ pub enum MsgpackScannerError {
     InvalidFieldType,
     TooManyEvents,
     BufferOverflow,
+    /// A column could not grow to hold the batch.
+    OutOfMemory,
 }
 impl From<MsgpackScannerError> for ParseError {
     fn from(value: MsgpackScannerError) -> Self {
@@ -20,8 +22,19 @@ impl From<MsgpackScannerError> for ParseError {
             MsgpackScannerError::InvalidFieldType => Self::InvalidFieldType,
             MsgpackScannerError::TooManyEvents => Self::TooManyEvents,
             MsgpackScannerError::BufferOverflow => Self::BufferOverflow,
+            MsgpackScannerError::OutOfMemory => Self::OutOfMemory,
         }
     }
+}
+
+/// A UTF-8 string value borrowed from the input.
+fn read_text<'a>(reader: &mut Reader<'a>) -> Result<&'a str, MsgpackScannerError> {
+    std::str::from_utf8(
+        reader
+            .read_string()
+            .ok_or(MsgpackScannerError::InvalidFieldType)?,
+    )
+    .map_err(|_| MsgpackScannerError::InvalidFieldType)
 }
 
 pub fn parse_msgpack_events(
@@ -67,28 +80,10 @@ fn parse_event_map(
             .read_string()
             .ok_or(MsgpackScannerError::InvalidMsgpack)?;
         match key {
-            b"id" => {
-                id = Some(
-                    std::str::from_utf8(
-                        reader
-                            .read_string()
-                            .ok_or(MsgpackScannerError::InvalidFieldType)?,
-                    )
-                    .map_err(|_| MsgpackScannerError::InvalidFieldType)?
-                    .to_owned(),
-                )
-            }
-            b"type" => {
-                event_type = Some(
-                    std::str::from_utf8(
-                        reader
-                            .read_string()
-                            .ok_or(MsgpackScannerError::InvalidFieldType)?,
-                    )
-                    .map_err(|_| MsgpackScannerError::InvalidFieldType)?
-                    .to_owned(),
-                )
-            }
+            // Id, type and value are stored straight from the input: the
+            // scanner checks them and copies nothing.
+            b"id" => id = Some(read_text(reader)?),
+            b"type" => event_type = Some(read_text(reader)?),
             b"timestamp" => {
                 timestamp = Some(
                     reader
@@ -102,11 +97,7 @@ fn parse_event_map(
                     .skip_value()
                     .ok_or(MsgpackScannerError::InvalidMsgpack)?;
                 let raw = &reader.input()[start..reader.position()];
-                value = if raw == [0xc0] {
-                    None
-                } else {
-                    Some(raw.to_vec())
-                };
+                value = if raw == [0xc0] { None } else { Some(raw) };
             }
             _ => reader
                 .skip_value()
@@ -120,11 +111,12 @@ fn parse_event_map(
             .ok_or(MsgpackScannerError::MissingField)?
             .as_bytes(),
         timestamp.ok_or(MsgpackScannerError::MissingField)?,
-        value.as_deref(),
+        value,
     )
     .map_err(|error| match error {
         ParseError::TooManyEvents => MsgpackScannerError::TooManyEvents,
         ParseError::BufferOverflow => MsgpackScannerError::BufferOverflow,
+        ParseError::OutOfMemory => MsgpackScannerError::OutOfMemory,
         _ => MsgpackScannerError::InvalidMsgpack,
     })
 }

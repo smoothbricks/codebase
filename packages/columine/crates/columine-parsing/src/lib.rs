@@ -4,6 +4,7 @@
 //! and schema metadata live in [`columine-arrow`]. [`ColumnValue`] remains the
 //! extractors' typed-token carrier and the tests' readable cell view.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 #[cfg(test)]
@@ -112,12 +113,16 @@ pub fn parsed_event(columns: &DynamicColumns, row: u32) -> Option<ParsedEvent> {
 /// One variant per plane KIND, not per plane: the column knows its own width,
 /// so a producer says "this is a signed integer" and the plane decides whether
 /// that integer fits. Twenty-three planes therefore need seven carriers.
+///
+/// Text and bytes borrow the input wherever it already holds them, so a
+/// value reaches its column with one copy, the column's own; only a JSON
+/// string with escapes or a hex-decoded width carries owned bytes.
 #[derive(Clone, Debug, PartialEq)]
-pub enum ColumnValue {
+pub enum ColumnValue<'v> {
     /// Text for the Utf8 and LargeUtf8 planes.
-    Utf8(String),
+    Utf8(Cow<'v, str>),
     /// Opaque bytes for the Binary and LargeBinary planes.
-    Binary(Vec<u8>),
+    Binary(Cow<'v, [u8]>),
     /// Signed integer for the Int8/16/32/64 and IntervalYearMonth planes,
     /// which is also every temporal plane.
     Int(i64),
@@ -128,7 +133,7 @@ pub enum ColumnValue {
     Bool(bool),
     /// Exactly-width bytes for the decimal, wide-interval and fixed-size
     /// binary planes, which the plane does not interpret.
-    FixedBytes(Vec<u8>),
+    FixedBytes(Cow<'v, [u8]>),
 }
 
 /// Dispatch an extracted value to the matching typed append operation.
@@ -138,7 +143,7 @@ pub enum ColumnValue {
 pub(crate) fn append_cell(
     columns: &mut DynamicColumns,
     column: usize,
-    value: Option<ColumnValue>,
+    value: Option<ColumnValue<'_>>,
 ) -> Result<(), ParseError> {
     let column = column as u32;
     match value {
@@ -155,7 +160,11 @@ pub(crate) fn append_cell(
 
 /// Read one cell back out of the real columnar storage as a typed value
 /// (test/differential view; production consumers read the Arrow buffers).
-pub fn read_cell(columns: &DynamicColumns, column: usize, row: usize) -> Option<ColumnValue> {
+pub fn read_cell(
+    columns: &DynamicColumns,
+    column: usize,
+    row: usize,
+) -> Option<ColumnValue<'static>> {
     let (col_idx, row_idx) = (column as u32, row as u32);
     if columns.is_null(col_idx, row_idx) {
         return None;
@@ -171,12 +180,14 @@ pub fn read_cell(columns: &DynamicColumns, column: usize, row: usize) -> Option<
         PlaneKind::UnsignedInt { .. } => ColumnValue::UInt(storage.read_uint(row_idx)?),
         PlaneKind::Float { .. } => ColumnValue::Float(storage.read_float(row_idx)?),
         PlaneKind::FixedBytes { .. } => {
-            ColumnValue::FixedBytes(storage.read_fixed_bytes(row_idx)?.to_vec())
+            ColumnValue::FixedBytes(Cow::Owned(storage.read_fixed_bytes(row_idx)?.to_vec()))
         }
-        PlaneKind::Text { .. } => {
-            ColumnValue::Utf8(String::from_utf8_lossy(storage.read_variable(row_idx)?).into_owned())
+        PlaneKind::Text { .. } => ColumnValue::Utf8(Cow::Owned(
+            String::from_utf8_lossy(storage.read_variable(row_idx)?).into_owned(),
+        )),
+        PlaneKind::Bytes { .. } => {
+            ColumnValue::Binary(Cow::Owned(storage.read_variable(row_idx)?.to_vec()))
         }
-        PlaneKind::Bytes { .. } => ColumnValue::Binary(storage.read_variable(row_idx)?.to_vec()),
     })
 }
 
@@ -193,6 +204,9 @@ pub(crate) struct FieldLookup {
 pub struct ExtractionConfig {
     pub(crate) field_entries: Vec<(usize, SignalSchemaField)>,
     pub(crate) field_map: HashMap<String, FieldLookup>,
+    /// Every `value.<member>` column keyed by `<member>`, so resolving a bare
+    /// member name against its payload column builds no string.
+    pub(crate) payload_map: HashMap<String, FieldLookup>,
     pub(crate) fallback_column: Option<usize>,
     pub(crate) presence_entries: Vec<(usize, usize)>,
     /// Relative payload paths whose object schemas opt into capture.
@@ -290,10 +304,9 @@ impl ExtractionConfig {
     }
 
     pub(crate) fn lookup_field(&self, name: &str) -> Option<&FieldLookup> {
-        self.field_map.get(name).or_else(|| {
-            let prefixed = format!("value.{name}");
-            self.field_map.get(&prefixed)
-        })
+        self.field_map
+            .get(name)
+            .or_else(|| self.payload_map.get(name))
     }
 
     /// Whether `name` is the envelope member carrying the discriminant.
@@ -469,7 +482,16 @@ pub fn build_extraction_config_with_semantic_schemas(
     // columns: a pure system schema has no `value.<field>` names, and its
     // `value` member (an op result's unwrapped scalar, say) must keep its
     // undeclared handling instead of being walked as a payload object.
-    let has_value_fields = field_map.keys().any(|name| name.starts_with("value."));
+    let mut payload_map = HashMap::new();
+    payload_map
+        .try_reserve(field_map.len())
+        .map_err(|_| ConfigError::OutOfMemory)?;
+    for (name, lookup) in &field_map {
+        if let Some(member) = name.strip_prefix("value.") {
+            payload_map.insert(owned(member)?, *lookup);
+        }
+    }
+    let has_value_fields = !payload_map.is_empty();
     // Discriminated resolution arms only when the caller names the key: the
     // enum-ordinal table is keyed by discriminant, so without one there is
     // no way to pick the schema an admitted string is judged against.
@@ -500,6 +522,7 @@ pub fn build_extraction_config_with_semantic_schemas(
     Ok(ExtractionConfig {
         field_entries,
         field_map,
+        payload_map,
         fallback_column,
         presence_entries,
         open_paths,
@@ -511,6 +534,20 @@ pub fn build_extraction_config_with_semantic_schemas(
     })
 }
 
+/// Spell the `value.<member>` column name into `name`, reusing its storage;
+/// growing it is fallible.
+pub(crate) fn spell_payload_column(
+    name: &mut String,
+    member: &str,
+) -> Result<(), json_extractor::ExtractionError> {
+    name.clear();
+    name.try_reserve("value.".len() + member.len())
+        .map_err(|_| json_extractor::ExtractionError::MemoryExhausted)?;
+    name.push_str("value.");
+    name.push_str(member);
+    Ok(())
+}
+
 /// Release an extraction configuration.
 pub fn free_extraction_config(config: ExtractionConfig) {
     drop(config);
@@ -518,12 +555,12 @@ pub fn free_extraction_config(config: ExtractionConfig) {
 
 /// Method-style cell/count views for tests and differential assertions.
 pub trait CellExt {
-    fn cell(&self, column: usize, row: usize) -> Option<ColumnValue>;
+    fn cell(&self, column: usize, row: usize) -> Option<ColumnValue<'static>>;
     fn count(&self) -> usize;
 }
 
 impl CellExt for DynamicColumns {
-    fn cell(&self, column: usize, row: usize) -> Option<ColumnValue> {
+    fn cell(&self, column: usize, row: usize) -> Option<ColumnValue<'static>> {
         read_cell(self, column, row)
     }
     fn count(&self) -> usize {
@@ -640,8 +677,8 @@ mod properties {
             let mut typed = DynamicColumns::new(&fields, 2).expect("column plane fits");
             let mut work = [0_u8; 128];
             assert_eq!(msgpack_extractor::extract_msgpack_events(&input, &config, &mut typed, &mut work, true).unwrap(), 1);
-            assert_eq!(read_cell(&typed, 0, 0), Some(ColumnValue::Utf8(id)));
-            assert_eq!(read_cell(&typed, 1, 0), Some(ColumnValue::Utf8(event_type)));
+            assert_eq!(read_cell(&typed, 0, 0), Some(ColumnValue::Utf8(id.into())));
+            assert_eq!(read_cell(&typed, 1, 0), Some(ColumnValue::Utf8(event_type.into())));
             assert_eq!(read_cell(&typed, 2, 0), Some(ColumnValue::Int(timestamp)));
             assert_eq!(read_cell(&typed, 3, 0), Some(ColumnValue::Int(quantity)));
         }
@@ -685,14 +722,14 @@ mod properties {
                 json_extractor::extract_json_events(document.as_bytes(), &config, &mut typed, &mut work, &mut json_extractor::ExtractionDiagnostic::default()).unwrap(),
                 1
             );
-            prop_assert_eq!(read_cell(&typed, 0, 0), Some(ColumnValue::Utf8(id)));
+            prop_assert_eq!(read_cell(&typed, 0, 0), Some(ColumnValue::Utf8(id.into())));
             prop_assert_eq!(read_cell(&typed, 1, 0), Some(ColumnValue::Int(quantity)));
             let mut expected = vec![0xdf, 0, 0, 0, 1];
             expected.push(0xa0 | u8::try_from(extra_key.len() + 1).unwrap());
             expected.push(b'x');
             expected.extend(extra_key.as_bytes());
             expected.push(if extra_flag { 0xc3 } else { 0xc2 });
-            prop_assert_eq!(read_cell(&typed, 2, 0), Some(ColumnValue::Binary(expected)));
+            prop_assert_eq!(read_cell(&typed, 2, 0), Some(ColumnValue::Binary(expected.into())));
         }
     }
 

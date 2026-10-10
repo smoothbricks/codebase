@@ -15,8 +15,8 @@ use columine_ep_wasm::{
     ep_create_with_schema_and_names, ep_destroy, ep_version,
 };
 use columine_event_processor::{
-    COMPACT_ABI_VERSION, COMPACT_BATCH_MAGIC, COMPACT_DESCRIPTOR_SIZE, CreateFailure, ResultCode,
-    read_result_header,
+    COMPACT_ABI_VERSION, COMPACT_BATCH_MAGIC, COMPACT_DESCRIPTOR_SIZE, CreateFailure,
+    EventProcessor, InputFormat, ParseOptions, ResultCode, diagnostic_detail, read_result_header,
 };
 use std::io::Cursor;
 use std::sync::{LazyLock, Mutex, MutexGuard};
@@ -107,6 +107,173 @@ fn create_log_entry_via_caller_buffers() {
     assert_eq!(events_processed, 1);
     assert!(arrow_len > 0, "arrow IPC bytes expected");
     ep_destroy(handle);
+
+    // Under a memory ceiling a batch refuses with MemoryExhausted, never
+    // traps, on the base scanner and on the named extractor, JSON and
+    // MessagePack: values long enough to grow the columns, every ceiling
+    // from nothing up to what a fresh handle's first batch needs.
+    let label = "x".repeat(3000);
+    let json: Vec<u8> = format!(
+        "[{}]",
+        (0..24)
+            .map(|row| format!(
+                r#"{{"id":"{row}-{label}","type":"t","timestamp":{row},"value":{{"amount":{row},"label":"{label}"}}}}"#
+            ))
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+    .into_bytes();
+    let text = |out: &mut Vec<u8>, value: &str| {
+        out.push(0xda);
+        out.extend(u16::try_from(value.len()).unwrap().to_be_bytes());
+        out.extend(value.bytes());
+    };
+    let mut msgpack = vec![0xdc, 0, 24];
+    for row in 0..24i64 {
+        msgpack.push(0x84);
+        text(&mut msgpack, "id");
+        text(&mut msgpack, &format!("{row}-{label}"));
+        text(&mut msgpack, "type");
+        text(&mut msgpack, "t");
+        text(&mut msgpack, "timestamp");
+        msgpack.push(0xd3);
+        msgpack.extend(row.to_be_bytes());
+        text(&mut msgpack, "value");
+        msgpack.push(0x82);
+        text(&mut msgpack, "amount");
+        msgpack.push(0xd3);
+        msgpack.extend(row.to_be_bytes());
+        text(&mut msgpack, "label");
+        text(&mut msgpack, &label);
+    }
+    let named_fields = [
+        SignalSchemaField::new(ArrowType::Utf8, false),
+        SignalSchemaField::new(ArrowType::Utf8, false),
+        SignalSchemaField::new(ArrowType::Int64, false),
+        SignalSchemaField::new(ArrowType::Int64, true),
+        SignalSchemaField::new(ArrowType::Utf8, true),
+    ];
+    let named_schema = ipc_schema_bytes(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("type", DataType::Utf8, false),
+        Field::new("timestamp", DataType::Int64, false),
+        Field::new("value.amount", DataType::Int64, true),
+        Field::new("value.label", DataType::Utf8, true),
+    ]);
+    let named = || unsafe {
+        let names = b"id\0type\0timestamp\0value.amount\0value.label\0";
+        ep_create_with_schema_and_names(
+            256,
+            named_schema.as_ptr(),
+            named_schema.len() as u32,
+            named_fields.as_ptr().cast(),
+            named_fields.len() as u32,
+            names.as_ptr(),
+            names.len() as u32,
+        )
+    };
+    let create_base = || create_processor(256);
+    let creators: [&dyn Fn() -> u32; 2] = [&create_base, &named];
+    for (create, (format, input)) in creators
+        .iter()
+        .flat_map(|create| [(create, (0, &json)), (create, (1, &msgpack))])
+    {
+        let process = |handle: u32, output: &mut [u8]| unsafe {
+            ep_create_log_entry(
+                handle,
+                input.as_ptr(),
+                input.len() as u32,
+                format,
+                output.as_mut_ptr(),
+                output.len() as u32,
+            )
+        };
+        let mut output = vec![0u8; 4 << 20];
+        let handle = create();
+        let (code, whole) = memory::peak_bytes(|| process(handle, &mut output));
+        assert_eq!(
+            code,
+            ResultCode::Ok as u32,
+            "unlimited batch, format {format}"
+        );
+        ep_destroy(handle);
+        let mut refused = 0;
+        for ceiling in (0..=whole).step_by(1024) {
+            let handle = create();
+            let code = memory::with_ceiling(ceiling, || process(handle, &mut output));
+            ep_destroy(handle);
+            if code == ResultCode::MemoryExhausted as u32 {
+                refused += 1;
+            } else {
+                assert_eq!(
+                    code,
+                    ResultCode::Ok as u32,
+                    "format {format}, ceiling {ceiling}"
+                );
+            }
+        }
+        assert!(refused > 0, "a ceiling under the batch's need refuses it");
+    }
+
+    // A processor that reports diagnostics names the refusal it returns:
+    // a JSON carrier workspace that cannot grow is MEMORY_EXHAUSTED, not the
+    // overflow that asked for the growth. Each event carries an undeclared
+    // member longer than the starting workspace.
+    let carried: Vec<u8> = format!(
+        "[{}]",
+        (0..8)
+            .map(|row| format!(
+                r#"{{"id":"{row}","type":"t","timestamp":{row},"value":{{"amount":{row},"note":"{label}"}}}}"#
+            ))
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+    .into_bytes();
+    let carrier_fields = [
+        SignalSchemaField::new(ArrowType::Utf8, false),
+        SignalSchemaField::new(ArrowType::Utf8, false),
+        SignalSchemaField::new(ArrowType::Int64, false),
+        SignalSchemaField::new(ArrowType::Int64, true),
+        SignalSchemaField::new(ArrowType::Binary, true),
+    ];
+    let processor = || {
+        let config = columine_arrow::DynamicSchemaConfig::from_physical_fields_with_names(
+            &carrier_fields,
+            b"id\0type\0timestamp\0value.amount\0value.$undeclared\0",
+        )
+        .expect("carrier schema");
+        EventProcessor::new(
+            ParseOptions {
+                base_path: true,
+                msgpack_growth: true,
+                diagnostics: true,
+            },
+            256,
+            config,
+        )
+        .expect("named processor")
+    };
+    let (parsed, whole) =
+        memory::peak_bytes(|| processor().parse(&carried, InputFormat::Json).map(|_| ()));
+    parsed.expect("unlimited carrier batch");
+    let mut refused = 0;
+    for ceiling in (0..=whole).step_by(1024) {
+        let mut ep = processor();
+        let outcome = memory::with_ceiling(ceiling, || {
+            ep.parse(&carried, InputFormat::Json).map(|_| ())
+        });
+        if let Err(error) = outcome {
+            assert_eq!(error.code, ResultCode::MemoryExhausted, "ceiling {ceiling}");
+            let detail = error.diagnostic.map(|diagnostic| diagnostic.detail);
+            assert_eq!(
+                detail,
+                Some(diagnostic_detail::MEMORY_EXHAUSTED),
+                "ceiling {ceiling}"
+            );
+            refused += 1;
+        }
+    }
+    assert!(refused > 0);
 }
 
 /// Schema-without-names path creates, but JSON parsing has no key mapping.

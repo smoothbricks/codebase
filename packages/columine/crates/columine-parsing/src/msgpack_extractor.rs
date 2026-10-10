@@ -1,7 +1,9 @@
 //! MessagePack event extraction into typed columns.
 
+use std::borrow::Cow;
+
 use crate::msgpack_scanner::{BIGINT_EXTENSION, Reader, bigint_ext_i64, bigint_ext_u64};
-use crate::validate::encode_path_segment;
+use crate::validate::{encode_segment_into, encoded_segment_len};
 use crate::{
     ColumnValue, DynamicColumns, ExtractionConfig, FrameProjections, MemberSchema, ParseError,
     PlaneKind, SignalSchemaField, json_extractor::ExtractionError,
@@ -192,9 +194,7 @@ fn extract_msgpack_fields(
                 let member_end = reader.position();
                 let lookup_name = match std::str::from_utf8(member) {
                     Ok(name) => {
-                        column_name.clear();
-                        column_name.push_str("value.");
-                        column_name.push_str(name);
+                        crate::spell_payload_column(&mut column_name, name)?;
                         Some(column_name.as_str())
                     }
                     // A non-UTF-8 member is undeclared by construction.
@@ -254,7 +254,9 @@ fn extract_msgpack_fields(
             append(
                 columns,
                 column,
-                Some(ColumnValue::Binary(work_buffer[..extra_end].to_vec())),
+                Some(ColumnValue::Binary(Cow::Borrowed(
+                    &work_buffer[..extra_end],
+                ))),
             )?;
         }
     }
@@ -289,34 +291,30 @@ const fn msgpack_str_header_len(len: usize) -> usize {
     }
 }
 
-/// Write one MessagePack-encoded string at `at`, returning the position past
-/// it. The caller has already bounds-checked header + payload.
-fn write_msgpack_str(buffer: &mut [u8], at: usize, value: &str) -> usize {
-    let bytes = value.as_bytes();
-    let mut cursor = at;
-    match bytes.len() {
-        len @ 0..=31 => {
-            buffer[cursor] = 0xa0 | len as u8;
-            cursor += 1;
+/// Write a MessagePack string header for `len` bytes at `at`, returning the
+/// position past it. The caller has already bounds-checked header + payload.
+fn write_msgpack_str_header(buffer: &mut [u8], at: usize, len: usize) -> usize {
+    match len {
+        0..=31 => {
+            buffer[at] = 0xa0 | len as u8;
+            at + 1
         }
-        len @ 32..=255 => {
-            buffer[cursor] = 0xd9;
-            buffer[cursor + 1] = len as u8;
-            cursor += 2;
+        32..=255 => {
+            buffer[at] = 0xd9;
+            buffer[at + 1] = len as u8;
+            at + 2
         }
-        len @ 256..=65535 => {
-            buffer[cursor] = 0xda;
-            buffer[cursor + 1..cursor + 3].copy_from_slice(&(len as u16).to_be_bytes());
-            cursor += 3;
+        256..=65535 => {
+            buffer[at] = 0xda;
+            buffer[at + 1..at + 3].copy_from_slice(&(len as u16).to_be_bytes());
+            at + 3
         }
-        len => {
-            buffer[cursor] = 0xdb;
-            buffer[cursor + 1..cursor + 5].copy_from_slice(&(len as u32).to_be_bytes());
-            cursor += 5;
+        _ => {
+            buffer[at] = 0xdb;
+            buffer[at + 1..at + 5].copy_from_slice(&(len as u32).to_be_bytes());
+            at + 5
         }
     }
-    buffer[cursor..cursor + bytes.len()].copy_from_slice(bytes);
-    cursor + bytes.len()
 }
 
 /// Bounded carrier accumulation state threaded through one row's members.
@@ -395,9 +393,9 @@ fn extract_msgpack_member(
     let escaped = std::str::from_utf8(key)
         .ok()
         .filter(|name| name.contains(['%', '.']))
-        .map(encode_path_segment);
-    let key_len = match &escaped {
-        Some(name) => msgpack_str_header_len(name.len()) + name.len(),
+        .map(|name| (name, encoded_segment_len(name)));
+    let key_len = match escaped {
+        Some((_, len)) => msgpack_str_header_len(len) + len,
         None => raw_key.len(),
     };
     let end = state
@@ -407,8 +405,15 @@ fn extract_msgpack_member(
     if end > work_buffer.len() {
         return Err(ExtractionError::BufferOverflow);
     }
-    let value_at = match &escaped {
-        Some(name) => write_msgpack_str(work_buffer, state.end, name),
+    let value_at = match escaped {
+        Some((name, len)) => {
+            let mut at = write_msgpack_str_header(work_buffer, state.end, len);
+            encode_segment_into(name, |chunk| {
+                work_buffer[at..at + chunk.len()].copy_from_slice(chunk);
+                at += chunk.len();
+            });
+            at
+        }
         None => {
             work_buffer[state.end..state.end + raw_key.len()].copy_from_slice(raw_key);
             state.end + raw_key.len()
@@ -445,15 +450,14 @@ fn extract_typed_value(
                 reader.skip_value();
                 None
             } else {
-                Some(ColumnValue::Utf8(
+                Some(ColumnValue::Utf8(Cow::Borrowed(
                     std::str::from_utf8(
                         reader
                             .read_string()
                             .ok_or(ExtractionError::InvalidFieldType)?,
                     )
-                    .map_err(|_| ExtractionError::InvalidFieldType)?
-                    .to_owned(),
-                ))
+                    .map_err(|_| ExtractionError::InvalidFieldType)?,
+                )))
             }
         }
         // Integer planes take integers only, range-checked to the plane's
@@ -617,7 +621,7 @@ fn extract_typed_value(
                 if payload.len() != width as usize {
                     return Err(ExtractionError::InvalidFieldType);
                 }
-                Some(ColumnValue::FixedBytes(payload.to_vec()))
+                Some(ColumnValue::FixedBytes(Cow::Borrowed(payload)))
             } else {
                 return Err(ExtractionError::InvalidFieldType);
             }
@@ -640,16 +644,16 @@ fn extract_typed_value(
                     }
                     None => payload,
                 };
-                Some(ColumnValue::Binary(payload.to_vec()))
+                Some(ColumnValue::Binary(Cow::Borrowed(payload)))
             } else {
                 // External standard MessagePack may provide a structured value
                 // directly. Preserve its exact document bytes for normal
                 // Binary materialization.
                 let start = reader.position();
                 reader.skip_value().ok_or(ExtractionError::InvalidJson)?;
-                Some(ColumnValue::Binary(
-                    reader.input()[start..reader.position()].to_vec(),
-                ))
+                Some(ColumnValue::Binary(Cow::Borrowed(
+                    &reader.input()[start..reader.position()],
+                )))
             }
         }
         PlaneKind::Empty => {
@@ -662,10 +666,11 @@ fn extract_typed_value(
 fn append(
     columns: &mut DynamicColumns,
     column: usize,
-    value: Option<ColumnValue>,
+    value: Option<ColumnValue<'_>>,
 ) -> Result<(), ExtractionError> {
     crate::append_cell(columns, column, value).map_err(|error| match error {
         ParseError::BufferOverflow => ExtractionError::BufferOverflow,
+        ParseError::OutOfMemory => ExtractionError::MemoryExhausted,
         _ => ExtractionError::InvalidFieldType,
     })
 }
@@ -733,10 +738,13 @@ mod tests {
             ),
             Ok(1)
         );
-        assert_eq!(columns.cell(0, 0), Some(ColumnValue::Binary(vec![9, 9, 9])));
+        assert_eq!(
+            columns.cell(0, 0),
+            Some(ColumnValue::Binary(std::borrow::Cow::Owned(vec![9, 9, 9])))
+        );
         assert_eq!(
             columns.cell(1, 0),
-            Some(ColumnValue::Binary(vec![1, 2])),
+            Some(ColumnValue::Binary(std::borrow::Cow::Owned(vec![1, 2]))),
             "an equal slice elsewhere is not the lent frame"
         );
 
@@ -805,9 +813,9 @@ mod tests {
             }
             input
         };
-        let captured = ColumnValue::Binary(vec![
+        let captured = ColumnValue::Binary(std::borrow::Cow::Owned(vec![
             0xdf, 0, 0, 0, 1, 0xa4, b'n', b'o', b't', b'e', 0xa1, b'x',
-        ]);
+        ]));
         for type_first in [true, false] {
             let mut columns = DynamicColumns::new(&fields, 1).expect("column plane fits");
             let mut work = [0; 64];
@@ -1255,9 +1263,9 @@ mod tests {
         .unwrap();
         assert_eq!(
             columns.cell(1, 0),
-            Some(ColumnValue::Binary(vec![
+            Some(ColumnValue::Binary(std::borrow::Cow::Owned(vec![
                 0xdf, 0, 0, 0, 1, 0xa3, b'q', b't', b'y', 42
-            ]))
+            ])))
         );
     }
     #[test]
@@ -1283,9 +1291,9 @@ mod tests {
         .unwrap();
         assert_eq!(
             columns.cell(1, 0),
-            Some(ColumnValue::Binary(vec![
+            Some(ColumnValue::Binary(std::borrow::Cow::Owned(vec![
                 0xdf, 0, 0, 0, 1, 0xa5, b'a', b'%', b'2', b'E', b'b', 7
-            ]))
+            ])))
         );
     }
     #[test]
@@ -1343,9 +1351,9 @@ mod tests {
         );
         assert_eq!(
             columns.cell(1, 0),
-            Some(ColumnValue::Binary(vec![
+            Some(ColumnValue::Binary(std::borrow::Cow::Owned(vec![
                 0xdf, 0, 0, 0, 1, 0xa5, b'b', b'o', b'g', b'u', b's', 7
-            ]))
+            ])))
         );
     }
     #[test]
