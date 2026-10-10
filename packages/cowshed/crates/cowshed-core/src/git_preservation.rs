@@ -157,18 +157,24 @@ impl GitPreservationSnapshot {
     #[cfg(test)]
     /// Compare the exact probes, mapping only each checkout's own root entry.
     pub(crate) fn compare(&self, actual: &Self) -> std::result::Result<(), GitPreservationDiff> {
-        let status_differs =
-            self.porcelain_sha256 != actual.porcelain_sha256 || self.porcelain != actual.porcelain;
-        self.compare_with_status(actual, status_differs)
+        self.compare_live(
+            actual,
+            Live {
+                status_differs: self.porcelain_sha256 != actual.porcelain_sha256
+                    || self.porcelain != actual.porcelain,
+                resolved_config_differs: self.local_config_resolved != actual.local_config_resolved,
+            },
+        )
     }
 
-    /// Every probe except status, whose verdict the caller passes as `status_differs`. Recorded
-    /// status is capture-time evidence: a copy is judged by live filter-free status, never by
-    /// replaying those bytes as if they were its current output.
-    fn compare_with_status(
+    /// Every probe except the two whose verdicts the caller passes in `live`. Recorded status
+    /// and resolved config are capture-time evidence: a copy is judged by live filter-free
+    /// status and live resolved config, never by replaying those bytes as if they were its
+    /// current output.
+    fn compare_live(
         &self,
         actual: &Self,
-        status_differs: bool,
+        live: Live,
     ) -> std::result::Result<(), GitPreservationDiff> {
         use GitPreservationComponent as Component;
         let predicates = [
@@ -178,7 +184,7 @@ impl GitPreservationSnapshot {
                     || self.head_probe != actual.head_probe
                     || self.symbolic_head != actual.symbolic_head,
             ),
-            (Component::Porcelain, status_differs),
+            (Component::Porcelain, live.status_differs),
             (
                 Component::CountObjects,
                 self.count_objects != actual.count_objects,
@@ -189,10 +195,7 @@ impl GitPreservationSnapshot {
                 Component::LocalConfigRaw,
                 self.local_config_raw != actual.local_config_raw,
             ),
-            (
-                Component::LocalConfigResolved,
-                self.local_config_resolved != actual.local_config_resolved,
-            ),
+            (Component::LocalConfigResolved, live.resolved_config_differs),
             (
                 Component::WorktreeRegistrations,
                 !worktrees_equal(self, actual),
@@ -211,6 +214,16 @@ impl GitPreservationSnapshot {
             Err(GitPreservationDiff { components })
         }
     }
+}
+
+/// The verdicts a copy is judged on live, against its retained source as both read now, rather
+/// than against what was recorded. Status depends on the worktree and its filters. Resolved config
+/// depends on included files, which can live outside `.git`, even at an absolute path inside the
+/// canonical checkout, which is an empty mountpoint until the copy is published there.
+#[cfg(any(target_os = "macos", test))]
+struct Live {
+    status_differs: bool,
+    resolved_config_differs: bool,
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -441,11 +454,7 @@ pub(crate) fn capture(root: &Path, canonical_checkout: &Path) -> Result<GitPrese
             "make the retained local Git config readable before retrying",
         )
     })?;
-    let local_config_resolved = probe(
-        root,
-        &["config", "--local", "--includes", "--list", "-z"],
-        &[0],
-    )?;
+    let local_config_resolved = resolved_local_config(root)?;
     let worktrees = probe(root, &["worktree", "list", "--porcelain", "-z"], &[0])?;
     // A nonzero fsck is evidence. Source admission and verify own the refusal.
     let fsck = probe(root, &["fsck", "--full"], &[])?;
@@ -465,6 +474,16 @@ pub(crate) fn capture(root: &Path, canonical_checkout: &Path) -> Result<GitPrese
         canonical_checkout: canonical_checkout.as_os_str().as_bytes().to_vec(),
         fsck,
     })
+}
+
+/// The repository's local config at `root` with its includes resolved, as Git reads it now.
+#[cfg(any(target_os = "macos", test))]
+fn resolved_local_config(root: &Path) -> Result<Probe> {
+    probe(
+        root,
+        &["config", "--local", "--includes", "--list", "-z"],
+        &[0],
+    )
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -685,9 +704,11 @@ fn require_fsck(root: &Path, actual: &GitPreservationSnapshot) -> Result<()> {
 }
 
 /// Verifies the copy at `root`, published at `canonical_checkout`, against `expected` and the
-/// source still retained at `retained_source`. Every recorded non-status probe must match the
-/// copy's live capture. Filter-free status must match between source and copy; the recorded
-/// status is never replayed as current output, because it predates this copy. A standalone
+/// source still retained at `retained_source`. Every recorded probe but status and resolved
+/// config must match the copy's live capture. Those two must match between source and copy as
+/// both read now ([`Live`]); the recorded ones are never replayed as current output. The raw
+/// local config still matches the record byte for byte, and an included file inside the tree is
+/// compared byte for byte with every other path. A standalone
 /// `.git` directory must match the source byte for byte. A linked worktree's `.git` file must
 /// match byte for byte and reach the same administrative directory and index, which are read in
 /// place and never written. Every tracked and untracked-not-ignored path must match too.
@@ -720,9 +741,12 @@ pub(crate) fn verify_copy(
         ));
     }
     let actual = capture(root, canonical_checkout)?;
-    let source_status = filter_free_status(retained_source)?;
-    let status_differs = actual.porcelain != source_status;
-    if let Err(diff) = expected.compare_with_status(&actual, status_differs) {
+    let live = Live {
+        status_differs: actual.porcelain != filter_free_status(retained_source)?,
+        resolved_config_differs: actual.local_config_resolved
+            != resolved_local_config(retained_source)?,
+    };
+    if let Err(diff) = expected.compare_live(&actual, live) {
         return Err(CowshedError::integrity(
             format!(
                 "{diff} at {}, compared with retained source {}",
@@ -1456,5 +1480,52 @@ mod tests {
             admin_index_before,
             "linked admin index unchanged"
         );
+    }
+
+    /// A local config that includes a file at an absolute path inside its own checkout resolves
+    /// that include to nothing while the checkout is an empty mountpoint, as it is when a
+    /// re-adoption verifies its staged copy. The copy verifies against its retained source as
+    /// both resolve now, and the included file's bytes are still compared with the tree.
+    #[test]
+    fn a_config_including_a_file_in_its_own_checkout_verifies_from_a_staged_copy() {
+        let repository = Repository::new();
+        let included = repository.root.join("tooling/workspace.gitconfig");
+        fs::create_dir_all(included.parent().expect("tooling directory")).expect("tooling");
+        fs::write(&included, b"[core]\n\tabbrev = 12\n").expect("write the included config");
+        repository.git(&["add", "tooling/workspace.gitconfig"]);
+        repository.git(&["commit", "-qm", "workspace config"]);
+        repository.git(&[
+            "config",
+            "include.path",
+            included.to_str().expect("a UTF-8 include path"),
+        ]);
+        let before = repository.snapshot();
+        assert!(
+            before
+                .local_config_resolved
+                .stdout
+                .windows(b"core.abbrev\n12".len())
+                .any(|bytes| bytes == b"core.abbrev\n12"),
+            "the include resolves while the checkout holds it"
+        );
+
+        // The checkout's tree moves to its retained source, leaving the checkout path empty.
+        let retained = repository.scratch.join("retained");
+        fs::rename(&repository.root, &retained).expect("retain the source");
+        fs::create_dir(&repository.root).expect("the empty checkout mountpoint");
+        let staging = repository.scratch.join("stage");
+        fs::create_dir(&staging).expect("create copy destination");
+        crate::copy::copy_until_quiescent_blocking(&retained, &staging).expect("copy checkout");
+        let verify = || verify_copy(&staging, &repository.root, &before, &retained);
+        verify().expect("the copy verifies while its include cannot resolve");
+
+        let original = plant(
+            &staging.join("tooling/workspace.gitconfig"),
+            b"[core]\n\tabbrev = 7\n",
+        );
+        let error = verify().expect_err("the included file's bytes are verified");
+        assert_eq!(error.code, crate::ErrorCode::Integrity, "{}", error.message);
+        plant(&staging.join("tooling/workspace.gitconfig"), &original);
+        verify().expect("restored bytes verify again");
     }
 }

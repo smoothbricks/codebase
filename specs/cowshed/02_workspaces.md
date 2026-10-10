@@ -162,9 +162,11 @@ ASIF-to-RAW transition and the RAW guest-space reclaim operation, not an image c
    credentials are regenerated as part of the new incarnation. Check host allocation with `du` and `st_blocks * 512`,
    not apparent file length. Any mismatch refuses publication and leaves the retained source available. Preservation
    probes never execute an external clean, smudge or process driver: status runs with every configured filter driver
-   disabled. The verifier compares the copy's filter-free status with the source's, then the `.git` directory byte for
-   byte (a linked worktree's `.git` file must reach the same administrative directory and index, which are read in place
-   and never written), and every tracked and untracked-not-ignored path's raw bytes.
+   disabled. The verifier compares the copy's filter-free status and its include-resolved local config with the
+   source's, both read at verification time, because an include can name a file inside the checkout, which is an empty
+   mountpoint until publication. The raw local config is compared with the recorded one, then the `.git` directory byte
+   for byte (a linked worktree's `.git` file must reach the same administrative directory and index, which are read in
+   place and never written), and every tracked and untracked-not-ignored path's raw bytes.
 5. Reuse adopt's atomic `PendingFence` activation and mount the verified replacement at the exact original checkout
    path. Recovery resumes the recorded replacement; it never starts an unrelated adopt or deletes a retained source.
    Verify the remounted content, Git state and build identity against the recorded before-state. Return the retained
