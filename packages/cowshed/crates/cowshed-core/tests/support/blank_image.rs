@@ -29,7 +29,14 @@ static TEMPLATE: LazyLock<PathBuf> = LazyLock::new(mint_once);
 
 /// Put a formatted, detached, one-volume RAW image of [`CAPACITY`] at `destination`, which must
 /// not exist yet, creating its directory: an APFS clone of this run's template.
+///
+/// Refused first once this boot's disk-image attach pool is spent (08_testing.md, "Host limit"):
+/// after the first error code 150 of a run, every later fixture fails here with
+/// `AttachPoolExhausted` and its `next:` step instead of spending one more attach.
 pub fn blank_image(destination: &Path) {
+    if let Err(exhausted) = super::attach_budget::harness_gate() {
+        panic!("{exhausted}");
+    }
     let directory = destination.parent().expect("an image has a directory");
     fs::create_dir_all(directory)
         .unwrap_or_else(|error| panic!("image directory {}: {error}", directory.display()));

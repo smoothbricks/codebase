@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
+use crate::attach_budget;
 use crate::device::{DISKUTIL, container_of, identifier_depth};
 
 /// The disk-image driver's detach interface. Creation and attachment of RAW images use
@@ -186,22 +187,80 @@ pub trait CommandRunner {
 ///
 /// Without it a hung `hdiutil`/`diskutil` child wedges the store operation that spawned it
 /// forever — one stuck workspace takes down every other workspace's verbs, and the daemon
-/// startup pass with them. On expiry the child is killed and the item reports a timeout
+/// startup pass with them. On expiry a child is killed and the item reports a timeout
 /// ("deferred") so the queue continues and the next pass retries it; the per-leg
 /// [`timed_apfs_step`] span such a child was stuck inside terminates with `status=err` and
 /// the waited elapsed instead of never closing.
+///
+/// A disk-image command (`diskutil image …`, `hdiutil`) is the exception: killed mid-operation,
+/// its device can stay leaked in the kernel until reboot (01_storage.md, "How the APFS host
+/// degrades" §2). For it this deadline is a warning point: it is waited for, still holding its
+/// leases, and says what it is waiting on every [`DISK_IMAGE_WARNING_INTERVAL`], until
+/// [`DISK_IMAGE_HARD_DEADLINE`] kills it and records a probable leaked device in the attach-pool
+/// record ([`crate::attach_budget`]).
 ///
 /// 120 seconds is generous against normally sub-second disk children and stays inside the
 /// enclosing per-operation budgets even when a pass pays it once per workspace; tests
 /// override it through [`SystemCommandRunner::run_with_deadline`].
 pub const DISK_CHILD_DEADLINE: Duration = Duration::from_secs(120);
 
+/// How often a disk-image command past [`DISK_CHILD_DEADLINE`] says what it is still waiting on.
+pub const DISK_IMAGE_WARNING_INTERVAL: Duration = Duration::from_secs(30);
+
+/// When a disk-image command is killed after all: past this a hung verb would wedge the gateway
+/// and its leases indefinitely, which costs more than the device its kill probably leaks.
+pub const DISK_IMAGE_HARD_DEADLINE: Duration = Duration::from_secs(15 * 60);
+
+/// When a running disk child is warned about and when it is killed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DeadlinePolicy {
+    /// Every child is killed here, except a disk-image command, which is warned about.
+    pub deadline: Duration,
+    pub warn_every: Duration,
+    /// Where every child is killed.
+    pub hard: Duration,
+}
+
+impl DeadlinePolicy {
+    /// `request`'s policy at `deadline`: a disk-image command waits up to
+    /// [`DISK_IMAGE_HARD_DEADLINE`]; every other disk child is killed at `deadline`.
+    pub fn for_request(request: &CommandRequest, deadline: Duration) -> Self {
+        Self {
+            deadline,
+            warn_every: DISK_IMAGE_WARNING_INTERVAL,
+            hard: if is_disk_image_command(request) {
+                DISK_IMAGE_HARD_DEADLINE.max(deadline)
+            } else {
+                deadline
+            },
+        }
+    }
+
+    /// What the waiter does `elapsed` into the child's run, having warned `warned` times.
+    fn step(&self, elapsed: Duration, warned: u32) -> DeadlineStep {
+        if elapsed >= self.hard {
+            DeadlineStep::Kill
+        } else if elapsed >= self.deadline + self.warn_every * warned {
+            DeadlineStep::Warn
+        } else {
+            DeadlineStep::Wait
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DeadlineStep {
+    Wait,
+    Warn,
+    Kill,
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SystemCommandRunner;
 
 impl SystemCommandRunner {
-    /// Spawn `request` and collect its output, killing the child when `deadline` passes
-    /// first. [`CommandRunner::run`] is this with [`DISK_CHILD_DEADLINE`]; tests pass a
+    /// Spawn `request` and collect its output under [`DeadlinePolicy::for_request`] at
+    /// `deadline`. [`CommandRunner::run`] is this with [`DISK_CHILD_DEADLINE`]; tests pass a
     /// short deadline to prove a hung child is reaped promptly.
     ///
     /// A disk tool runs under the host disk-lifecycle lease of its class ([`crate::disk_lease`]):
@@ -212,14 +271,26 @@ impl SystemCommandRunner {
         request: &CommandRequest,
         deadline: Duration,
     ) -> Result<CommandOutput, CommandRunError> {
-        crate::disk_lease::leased(&request.program, &request.args, || {
-            Self::run_unleased(request, deadline)
-        })
+        let policy = DeadlinePolicy::for_request(request, deadline);
+        let output = crate::disk_lease::leased(&request.program, &request.args, || {
+            Self::run_unleased(
+                request,
+                policy,
+                &mut |elapsed| warn_outlived(request, policy, elapsed),
+                &mut || record_killed(request),
+            )
+        })?;
+        record_pool_outcome(request, &output);
+        Ok(output)
     }
 
+    /// Run `request` under `policy`, calling `warn` each time it is due and `killed` after a
+    /// kill.
     fn run_unleased(
         request: &CommandRequest,
-        deadline: Duration,
+        policy: DeadlinePolicy,
+        warn: &mut dyn FnMut(Duration),
+        killed: &mut dyn FnMut(),
     ) -> Result<CommandOutput, CommandRunError> {
         use std::io::Read;
         let mut child = spawn_disk_child(request).map_err(|source| CommandRunError {
@@ -251,6 +322,7 @@ impl SystemCommandRunner {
             }
         });
         let started = std::time::Instant::now();
+        let mut warned = 0;
         loop {
             match child.try_wait().map_err(|source| CommandRunError {
                 request: request.clone(),
@@ -264,8 +336,13 @@ impl SystemCommandRunner {
                     };
                     return Ok(CommandOutput::from(output));
                 }
-                None => {
-                    if started.elapsed() >= deadline {
+                None => match policy.step(started.elapsed(), warned) {
+                    DeadlineStep::Wait => std::thread::sleep(Duration::from_millis(25)),
+                    DeadlineStep::Warn => {
+                        warned += 1;
+                        warn(started.elapsed());
+                    }
+                    DeadlineStep::Kill => {
                         kill_disk_child_group(&mut child);
                         let _ = child.wait();
                         let _ = stdout.join();
@@ -273,15 +350,72 @@ impl SystemCommandRunner {
                         if let Some(image) = deferred_image_target(request) {
                             record_deferred_image(image);
                         }
+                        killed();
                         return Err(CommandRunError {
                             request: request.clone(),
-                            failure: CommandRunFailure::Deadline(deadline),
+                            failure: CommandRunFailure::Deadline(policy.hard),
                         });
                     }
-                    std::thread::sleep(Duration::from_millis(25));
-                }
+                },
             }
         }
+    }
+}
+
+/// Say that a disk-image command outlived its deadline and is still waited for.
+fn warn_outlived(request: &CommandRequest, policy: DeadlinePolicy, elapsed: Duration) {
+    let target = request
+        .args
+        .last()
+        .map_or_else(String::new, |target| target.to_string_lossy().into_owned());
+    eprintln!(
+        "cowshed: warning: {} {} on {target} is still running after {}s, past its {}s deadline; \
+         a disk-image command killed mid-operation can leak its device until reboot, so it is \
+         waited for, holding its leases, until {}s",
+        request.program.display(),
+        request
+            .args
+            .first()
+            .map_or_else(String::new, |verb| verb.to_string_lossy().into_owned()),
+        elapsed.as_secs(),
+        policy.deadline.as_secs(),
+        policy.hard.as_secs()
+    );
+}
+
+/// Record a disk-image command killed at its hard deadline as a probable leaked device.
+fn record_killed(request: &CommandRequest) {
+    if !is_disk_image_command(request) {
+        return;
+    }
+    if let Err(error) = attach_budget::record_killed() {
+        eprintln!(
+            "cowshed: warning: a disk-image command was killed at its hard deadline, and \
+             recording the probable leaked device failed: {error}"
+        );
+    }
+}
+
+/// Tell the attach-pool record what the host answered a disk-image command: error code 150
+/// spends the boot, a successful attach ends a spent boot. A failed record is said aloud; the
+/// command's own outcome still reaches the caller.
+fn record_pool_outcome(request: &CommandRequest, output: &CommandOutput) {
+    if !is_disk_image_command(request) {
+        return;
+    }
+    let recorded = if attach_budget::reports_pool_exhausted(&output.stderr) {
+        attach_budget::record_exhaustion()
+    } else if output.succeeded() && is_image_attach(request) {
+        attach_budget::record_attach()
+    } else {
+        return;
+    };
+    if let Err(error) = recorded {
+        eprintln!(
+            "cowshed: warning: could not record the disk-image attach pool's answer to {}: \
+             {error}",
+            request.program.display()
+        );
     }
 }
 
@@ -395,44 +529,59 @@ mod raw {
 /// path. Lock files are never removed: unlinking one another process still has open would split
 /// one lease into two.
 fn image_lease_path(identity: &Path) -> io::Result<PathBuf> {
+    // SAFETY: `geteuid` reads this process's credentials; it takes no pointers and cannot fail.
+    let uid = unsafe { libc::geteuid() };
+    let directory = PathBuf::from(format!("/private/tmp/cowshed-apfs-image-leases-{uid}"));
+    private_user_directory(&directory, "APFS image lease directory")?;
+    let digest = crate::api::dto::Sha256Digest::compute(identity.as_os_str().as_encoded_bytes());
+    Ok(directory.join(format!("{}.lock", digest.to_hex())))
+}
+
+/// Create `directory` 0700 unless it exists, and refuse it unless it is a real directory this
+/// user owns with exactly that mode, so no other user can plant or swap a file in it. `what`
+/// names it in the refusal.
+pub(crate) fn private_user_directory(directory: &Path, what: &str) -> io::Result<()> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 
     // SAFETY: `geteuid` reads this process's credentials; it takes no pointers and cannot fail.
     let uid = unsafe { libc::geteuid() };
-    let directory = PathBuf::from(format!("/private/tmp/cowshed-apfs-image-leases-{uid}"));
-    match fs::DirBuilder::new().mode(0o700).create(&directory) {
+    match fs::DirBuilder::new().mode(0o700).create(directory) {
         Ok(()) => {}
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
         Err(error) => return Err(error),
     }
-    let metadata = fs::symlink_metadata(&directory)?;
+    let metadata = fs::symlink_metadata(directory)?;
     if !metadata.is_dir() || metadata.uid() != uid || metadata.mode() & 0o777 != 0o700 {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!(
-                "APFS image lease directory {} is not a private directory owned by this user",
+                "{what} {} is not a private directory owned by this user",
                 directory.display()
             ),
         ));
     }
-    let digest = crate::api::dto::Sha256Digest::compute(identity.as_os_str().as_encoded_bytes());
-    Ok(directory.join(format!("{}.lock", digest.to_hex())))
+    Ok(())
 }
 
 /// Open a lease file without following a link, refusing anything but this user's private
 /// regular file.
 fn open_image_lease(lease: &Path) -> io::Result<Fenced<File>> {
+    open_private_file(lease, "APFS image lease").map(Fenced::new)
+}
+
+/// Open, creating it 0600, the file at `path` without following a link, refusing anything but
+/// this user's private regular file with one link. `what` names it in the refusal.
+fn open_private_file(path: &Path, what: &str) -> io::Result<File> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
-    let file = Fenced::new(
-        OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .mode(0o600)
-            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
-            .open(lease)?,
-    );
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)?;
     let metadata = file.metadata()?;
     // SAFETY: `geteuid` reads this process's credentials; it takes no pointers and cannot fail.
     let uid = unsafe { libc::geteuid() };
@@ -444,11 +593,18 @@ fn open_image_lease(lease: &Path) -> io::Result<Fenced<File>> {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!(
-                "APFS image lease {} is not a private regular file owned by this user",
-                lease.display()
+                "{what} {} is not a private regular file owned by this user",
+                path.display()
             ),
         ));
     }
+    Ok(file)
+}
+
+/// [`open_private_file`] at `path`, held under an exclusive `flock` until the answer is dropped.
+pub(crate) fn locked_private_file(path: &Path) -> io::Result<File> {
+    let file = open_private_file(path, "lock file")?;
+    lock_file(&file, libc::LOCK_EX)?;
     Ok(file)
 }
 
@@ -1071,6 +1227,10 @@ pub enum ApfsError {
     /// Boxed: the evidence is rare, and every `Result` carrying this error would otherwise pay
     /// for it.
     DiskImageHelperUnreachable(Box<DiskImageHelperFailure>),
+    /// A disk-image command the host refused with error code 150 because its attach pool is
+    /// spent (attach_budget.rs): a host finding that only a reboot clears, not the request's
+    /// failure. Boxed like the helper failure.
+    AttachPoolExhausted(Box<AttachPoolFailure>),
     InvalidAttachmentPlist(String),
     /// The attach succeeded but reported no APFS volume at all: the image was never formatted,
     /// or its formatting never finished. Distinct from a malformed report, which proves nothing
@@ -1130,6 +1290,14 @@ pub struct DiskImageHelperFailure {
     pub load: Option<HostLoad>,
 }
 
+/// The command the spent attach pool refused.
+#[derive(Debug)]
+pub struct AttachPoolFailure {
+    pub operation: &'static str,
+    pub request: CommandRequest,
+    pub output: CommandOutput,
+}
+
 impl fmt::Display for ApfsError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -1170,6 +1338,19 @@ impl fmt::Display for ApfsError {
                     None => f.write_str("load average unavailable")?,
                 }
                 f.write_str(" at the failure); ")?;
+                fmt_command_failure(
+                    f,
+                    failure.operation,
+                    failure.request.program.as_os_str(),
+                    &failure.request.args,
+                    &failure.output,
+                )
+            }
+            Self::AttachPoolExhausted(failure) => {
+                f.write_str(
+                    "AttachPoolExhausted: the host's disk-image attach pool is spent (error code \
+                     150, kIOReturnNoResources); ",
+                )?;
                 fmt_command_failure(
                     f,
                     failure.operation,
@@ -2587,6 +2768,7 @@ impl<R: CommandRunner, S: Sleeper> ApfsBackend for MacOsApfsBackend<R, S> {
                 timed_apfs_step(apfs_step_leg(&attachment.image), "event-log", || {
                     self.opt_out_of_event_log(attachment, mount_point, options)
                 })
+                .inspect(|()| report_spotlight_opt_out(mount_point))
             }
             _ => Ok(()),
         };
@@ -2707,16 +2889,23 @@ fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
 /// skips the apostrophe, which the framework spells U+2019.
 const DISK_IMAGE_HELPER_UNREACHABLE: &[u8] = b"t communicate with a helper application";
 
-/// A failed command, typed by what failed: a disk-image command whose framework lost its helper
-/// carries the host load at the failure; every other failure is the command's own.
+/// A failed command, typed by what failed: a disk-image command the spent attach pool refused
+/// is the host's finding; one whose framework lost its helper carries the host load at the
+/// failure; every other failure is the command's own.
 fn command_failed(
     operation: &'static str,
     request: CommandRequest,
     output: CommandOutput,
 ) -> ApfsError {
-    let disk_image_command =
-        request.program == Path::new(DISKUTIL) || request.program == Path::new(HDIUTIL);
-    if disk_image_command && contains_bytes(&output.stderr, DISK_IMAGE_HELPER_UNREACHABLE) {
+    if is_disk_image_command(&request) && attach_budget::reports_pool_exhausted(&output.stderr) {
+        ApfsError::AttachPoolExhausted(Box::new(AttachPoolFailure {
+            operation,
+            request,
+            output,
+        }))
+    } else if (request.program == Path::new(DISKUTIL) || request.program == Path::new(HDIUTIL))
+        && contains_bytes(&output.stderr, DISK_IMAGE_HELPER_UNREACHABLE)
+    {
         ApfsError::DiskImageHelperUnreachable(Box::new(DiskImageHelperFailure {
             operation,
             request,
@@ -2730,6 +2919,23 @@ fn command_failed(
             output,
         }
     }
+}
+
+/// A DiskImages2 verb: `diskutil image …` or any `hdiutil`.
+fn is_disk_image_command(request: &CommandRequest) -> bool {
+    request.program == Path::new(HDIUTIL)
+        || (request.program == Path::new(DISKUTIL)
+            && request.args.first().is_some_and(|verb| verb == "image"))
+}
+
+/// `diskutil image attach …` or `hdiutil attach …`.
+fn is_image_attach(request: &CommandRequest) -> bool {
+    let verb = if request.program == Path::new(HDIUTIL) {
+        request.args.first()
+    } else {
+        request.args.get(1)
+    };
+    is_disk_image_command(request) && verb.is_some_and(|verb| verb == "attach")
 }
 
 /// One walk of the kernel inventory for one image: whether it is attached, its whole devices,
@@ -2841,6 +3047,12 @@ pub const EVENT_LOG_DIRECTORY: &str = ".fseventsd";
 /// The marker fseventsd reads when a volume mounts: present, it keeps no log of the volume and
 /// still delivers the volume's live events to every stream.
 pub const EVENT_LOG_OPT_OUT: &str = "no_log";
+/// The marker at a volume's root that keeps Spotlight off it. Measured on macOS 26: a
+/// browsable mount of a marked volume reads `mdutil -s` "Indexing and searching disabled"
+/// against "Indexing disabled" unmarked; a `nobrowse` mount reads "unknown indexing state"
+/// either way. It does not stop the departed-volume leak (01_storage.md, "How the APFS host
+/// degrades" §2).
+pub const SPOTLIGHT_OPT_OUT: &str = ".metadata_never_index";
 
 /// What macOS keeps at every volume's root for itself: the event log, the Spotlight index, the
 /// trash, temporary items and document revisions. They describe the volume they live on, not
@@ -2872,6 +3084,7 @@ enum EventLog {
 /// calls take.
 const EVENT_LOG_DIRECTORY_C: &std::ffi::CStr = c".fseventsd";
 const EVENT_LOG_OPT_OUT_C: &std::ffi::CStr = c"no_log";
+const SPOTLIGHT_OPT_OUT_C: &std::ffi::CStr = c".metadata_never_index";
 /// Opening a directory for lookups alone needs only search permission: root's 0700 refuses
 /// it, the 0711 a retirement leaves grants it. Linux names the same access `O_PATH`.
 #[cfg(target_vendor = "apple")]
@@ -2934,7 +3147,27 @@ fn opt_out_of_event_log(mount_point: &Path) -> io::Result<EventLog> {
 
 /// Plant the marker in the open `.fseventsd`, exclusively, unless an empty regular one is there.
 fn opt_out_in(directory: &File) -> io::Result<EventLog> {
-    let marker = EVENT_LOG_OPT_OUT_C;
+    Ok(match plant_empty_marker(directory, EVENT_LOG_OPT_OUT_C)? {
+        Marker::Planted => EventLog::OptedOut,
+        Marker::Refused => EventLog::Inherited,
+        Marker::Squatted => EventLog::Squatted,
+    })
+}
+
+/// Where one empty marker file stands.
+#[derive(Debug, Eq, PartialEq)]
+enum Marker {
+    /// An empty regular file holds the name, planted now or before.
+    Planted,
+    /// The directory refuses this user a new entry.
+    Refused,
+    /// Anything but an empty regular file holds the name: left as found.
+    Squatted,
+}
+
+/// Plant the empty `marker` in the open `directory`, exclusively and never through a symlink,
+/// unless an empty regular one is there.
+fn plant_empty_marker(directory: &File, marker: &std::ffi::CStr) -> io::Result<Marker> {
     let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC;
     // SAFETY: `directory` is an open directory fd and `marker` a NUL-terminated component. A
     // non-negative answer is a new descriptor, closed at once.
@@ -2942,11 +3175,11 @@ fn opt_out_in(directory: &File) -> io::Result<EventLog> {
     if fd >= 0 {
         // SAFETY: `fd` is the fresh descriptor just opened.
         unsafe { libc::close(fd) };
-        return Ok(EventLog::OptedOut);
+        return Ok(Marker::Planted);
     }
     let error = io::Error::last_os_error();
     match error.kind() {
-        io::ErrorKind::PermissionDenied => Ok(EventLog::Inherited),
+        io::ErrorKind::PermissionDenied => Ok(Marker::Refused),
         io::ErrorKind::AlreadyExists => {
             // SAFETY: an all-zero `stat` is a valid buffer for `fstatat` to fill.
             let mut stat: libc::stat = unsafe { std::mem::zeroed() };
@@ -2964,13 +3197,40 @@ fn opt_out_in(directory: &File) -> io::Result<EventLog> {
             }
             Ok(
                 if stat.st_mode & libc::S_IFMT == libc::S_IFREG && stat.st_size == 0 {
-                    EventLog::OptedOut
+                    Marker::Planted
                 } else {
-                    EventLog::Squatted
+                    Marker::Squatted
                 },
             )
         }
         _ => Err(error),
+    }
+}
+
+/// Plant [`SPOTLIGHT_OPT_OUT`] at the root of the volume mounted at `mount_point`.
+fn opt_out_of_spotlight(mount_point: &Path) -> io::Result<Marker> {
+    plant_empty_marker(&open_volume_root(mount_point)?, SPOTLIGHT_OPT_OUT_C)
+}
+
+/// Keep Spotlight off the read-write volume just mounted at `mount_point` ([`SPOTLIGHT_OPT_OUT`]).
+/// Like the event log, indexing is host load and the mount is what the caller asked for, so a
+/// failure to opt out is reported and the volume stays mounted.
+fn report_spotlight_opt_out(mount_point: &Path) {
+    match opt_out_of_spotlight(mount_point) {
+        Ok(Marker::Planted) => {}
+        Ok(Marker::Refused) => eprintln!(
+            "cowshed: apfs {} refuses this user a {SPOTLIGHT_OPT_OUT}; Spotlight may index it",
+            mount_point.display()
+        ),
+        Ok(Marker::Squatted) => eprintln!(
+            "cowshed: apfs {} has a {SPOTLIGHT_OPT_OUT} that is not an empty regular file; left \
+             as found, not written through",
+            mount_point.display()
+        ),
+        Err(error) => eprintln!(
+            "cowshed: apfs {} keeps Spotlight indexing: {error}",
+            mount_point.display()
+        ),
     }
 }
 
@@ -3622,9 +3882,9 @@ pub(crate) struct RegisteredApfsVolume {
 }
 
 #[cfg(target_os = "macos")]
-pub(crate) use io_registry::disk_image_user_client_creators;
-#[cfg(target_os = "macos")]
 pub(crate) use io_registry::registered_apfs_containers;
+#[cfg(target_os = "macos")]
+pub(crate) use io_registry::{disk_image_class_counts, disk_image_user_client_creators};
 
 /// What one `AppleAPFSMedia` registers. `reference` is absent until the media's BSD client has
 /// published the device node: such a container is arriving, not yet addressable.
@@ -3888,6 +4148,8 @@ mod io_registry {
             allocator: CfType,
             options: u32,
         ) -> CfType;
+        fn IORegistryGetRootEntry(main_port: libc::mach_port_t) -> IoObject;
+        fn IOObjectGetClass(object: IoObject, class_name: *mut c_char) -> KernReturn;
     }
 
     #[link(name = "CoreFoundation", kind = "framework")]
@@ -3917,6 +4179,8 @@ mod io_registry {
             used: *mut CfIndex,
         ) -> CfIndex;
         fn CFNumberGetValue(number: CfType, number_type: CfIndex, value: *mut c_void) -> u8;
+        fn CFDictionaryGetTypeID() -> usize;
+        fn CFDictionaryGetValue(dictionary: CfType, key: CfType) -> CfType;
     }
 
     /// One owned registry reference.
@@ -4158,6 +4422,122 @@ mod io_registry {
             settle(record_user_client_creators(&mut creators, &device, &key))?;
         }
         Ok(creators)
+    }
+
+    /// The image devices, their user clients, APFS volumes and media, each as its live kernel
+    /// instances against the registry entries that account for them (attach_budget.rs). The
+    /// registry is read first and the instances after, so each count can be off by the disk
+    /// commands in flight between the two reads.
+    pub(crate) fn disk_image_class_counts() -> io::Result<crate::attach_budget::KernelReading> {
+        use crate::attach_budget::{ClassCount, KernelReading};
+        let registered = [
+            registered_exactly(c"AppleDiskImageDevice")?,
+            u64::try_from(disk_image_user_client_creators()?.len())
+                .map_err(|_| invalid("more user clients than a u64 counts"))?,
+            registered_exactly(c"AppleAPFSVolume")?,
+            registered_exactly(c"IOMedia")?,
+        ];
+        let instances = class_instances([
+            "AppleDiskImageDevice",
+            "DIDeviceIOUserClient",
+            "AppleAPFSVolume",
+            "IOMedia",
+        ])?;
+        let [image_devices, user_clients, apfs_volumes, media] =
+            std::array::from_fn(|class| ClassCount {
+                instances: instances[class],
+                registered: registered[class],
+            });
+        Ok(KernelReading {
+            image_devices,
+            user_clients,
+            apfs_volumes,
+            media,
+        })
+    }
+
+    /// Registered entries whose class is exactly `class`, subclasses excluded, as the kernel's
+    /// instance counts count them. An entry that leaves the registry mid-read is departing.
+    fn registered_exactly(class: &CStr) -> io::Result<u64> {
+        let mut count = 0;
+        for entry in registered(class)? {
+            let mut name: [c_char; 128] = [0; 128];
+            // SAFETY: `entry` is a registry reference and `name` is an `io_name_t`, the 128
+            // bytes the call writes a NUL-terminated class name into.
+            let status = unsafe { IOObjectGetClass(entry.0, name.as_mut_ptr()) };
+            match checked("read a registry entry's class", status) {
+                Ok(()) => {}
+                Err(Unread::Gone) => continue,
+                Err(Unread::Failed(error)) => return Err(error),
+            }
+            let bytes = name.map(|byte| byte.to_ne_bytes()[0]);
+            let named = CStr::from_bytes_until_nul(&bytes)
+                .map_err(|_| invalid("a registry class name is not NUL-terminated"))?;
+            if named == class {
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
+    /// The live kernel instances of each of `classes`, as `ioclasscount` reads them: the
+    /// `Classes` dictionary of the registry root's `IOKitDiagnostics`, one exact-class count per
+    /// class, registered or not. A class the kernel never loaded counts none.
+    fn class_instances<const N: usize>(classes: [&str; N]) -> io::Result<[u64; N]> {
+        // SAFETY: the default main port names the kernel's registry; a null answer is refused.
+        let root = unsafe { IORegistryGetRootEntry(MAIN_PORT_DEFAULT) };
+        if root == 0 {
+            return Err(io::Error::other("IORegistryGetRootEntry answered no root"));
+        }
+        let root = Object(root);
+        let diagnostics = match property(&root, &key("IOKitDiagnostics")?) {
+            Ok(Some(diagnostics)) => diagnostics,
+            Ok(None) => return Err(invalid("the registry root publishes no IOKitDiagnostics")),
+            Err(Unread::Gone) => return Err(io::Error::other("the registry root is gone")),
+            Err(Unread::Failed(error)) => return Err(error),
+        };
+        let counts = dictionary_value(diagnostics.0, &key("Classes")?, "IOKitDiagnostics")?
+            .ok_or_else(|| invalid("IOKitDiagnostics names no Classes"))?;
+        let mut instances = [0; N];
+        for (slot, class) in instances.iter_mut().zip(classes) {
+            if let Some(count) = dictionary_value(counts, &key(class)?, "IOKitDiagnostics Classes")?
+            {
+                *slot = borrowed_u64(count, class)?;
+            }
+        }
+        Ok(instances)
+    }
+
+    /// `dictionary[key]`, borrowed from `dictionary`: valid while it is, and never released.
+    fn dictionary_value(dictionary: CfType, key: &Cf, name: &str) -> io::Result<Option<CfType>> {
+        // SAFETY: `dictionary` is a live CF object.
+        if unsafe { CFGetTypeID(dictionary) != CFDictionaryGetTypeID() } {
+            return Err(invalid(format!("{name} is not a dictionary")));
+        }
+        // SAFETY: `dictionary` is a live CFDictionary and `key` a CFString; the answer is
+        // borrowed or null.
+        let value = unsafe { CFDictionaryGetValue(dictionary, key.0) };
+        Ok((!value.is_null()).then_some(value))
+    }
+
+    /// A borrowed CFNumber as a non-negative 64-bit integer.
+    fn borrowed_u64(value: CfType, name: &str) -> io::Result<u64> {
+        // SAFETY: `value` is a live CF object borrowed from its dictionary.
+        if unsafe { CFGetTypeID(value) != CFNumberGetTypeID() } {
+            return Err(invalid(format!(
+                "the instance count of {name} is not a number"
+            )));
+        }
+        let mut number = 0i64;
+        // SAFETY: `value` is a live CFNumber and `number` is writable storage for an SInt64.
+        if unsafe { CFNumberGetValue(value, CF_NUMBER_SINT64_TYPE, (&raw mut number).cast()) } == 0
+        {
+            return Err(invalid(format!(
+                "the instance count of {name} is not an exact 64-bit integer"
+            )));
+        }
+        u64::try_from(number)
+            .map_err(|_| invalid(format!("the instance count of {name} is negative")))
     }
 
     /// Record one device's user client creators, walking its children again whenever a
@@ -5115,12 +5495,13 @@ mod tests {
     }
     #[test]
     fn system_runner_hung_disk_child_is_killed_at_the_deadline() {
-        // Hang injection: a shell-builtin spin stands in for a hung disk-image child
-        // that never answers. Absolute coreutils paths (`/bin/sleep`, `/bin/echo`)
-        // do not exist on all Linux runners (NixOS provides only `/bin/sh`), so
-        // the hang and the follow-up probe must use `/bin/sh` builtins only.
-        // The store must kill the child at the deadline, mark the item deferred,
-        // and let the queue continue — never wait forever.
+        // Hang injection: a shell-builtin spin stands in for a hung disk child that never
+        // answers. Absolute coreutils paths (`/bin/sleep`, `/bin/echo`) do not exist on all
+        // Linux runners (NixOS provides only `/bin/sh`), so the hang and the follow-up probe
+        // must use `/bin/sh` builtins only. A child that is no disk-image command is killed at
+        // the deadline, its item marked deferred, and the queue continues; a disk-image command
+        // is waited for up to its hard deadline and then killed the same way (the tests below)
+        // — never wait forever.
         let started = std::time::Instant::now();
         let error = SystemCommandRunner
             .run_with_deadline(
@@ -5147,6 +5528,134 @@ mod tests {
             .run(&CommandRequest::new("/bin/sh", ["-c", "printf 'next\\n'"]))
             .unwrap();
         assert_eq!(output.stdout, b"next\n");
+    }
+
+    fn disk_image_request() -> CommandRequest {
+        CommandRequest::new(DISKUTIL, ["image", "attach", "/private/tmp/x.dmg"])
+    }
+
+    /// The policy itself, at its real constants: a disk-image command past the 120 s deadline
+    /// is warned about every 30 s and killed only at 15 minutes; every other disk child is
+    /// killed at the deadline.
+    #[test]
+    fn a_disk_image_command_is_warned_about_at_the_deadline_and_killed_only_at_the_ceiling() {
+        let policy = DeadlinePolicy::for_request(&disk_image_request(), DISK_CHILD_DEADLINE);
+        let at = Duration::from_secs;
+        assert_eq!(policy.step(at(119), 0), DeadlineStep::Wait);
+        assert_eq!(policy.step(at(120), 0), DeadlineStep::Warn);
+        assert_eq!(policy.step(at(121), 1), DeadlineStep::Wait);
+        assert_eq!(policy.step(at(150), 1), DeadlineStep::Warn);
+        assert_eq!(policy.step(at(899), 26), DeadlineStep::Wait);
+        assert_eq!(policy.step(at(900), 26), DeadlineStep::Kill);
+        assert_eq!(DISK_IMAGE_HARD_DEADLINE, at(15 * 60));
+        for detach in [
+            CommandRequest::new(HDIUTIL, ["detach", "/dev/disk9"]),
+            CommandRequest::new(DISKUTIL, ["image", "info", "/private/tmp/x.dmg"]),
+        ] {
+            assert_eq!(
+                DeadlinePolicy::for_request(&detach, DISK_CHILD_DEADLINE).hard,
+                DISK_IMAGE_HARD_DEADLINE
+            );
+        }
+        for other in [
+            CommandRequest::new("/sbin/mount_apfs", ["-o", "nobrowse"]),
+            CommandRequest::new(DISKUTIL, ["apfs", "resizeContainer", "disk9s1", "0"]),
+        ] {
+            let policy = DeadlinePolicy::for_request(&other, DISK_CHILD_DEADLINE);
+            assert_eq!(policy.step(at(120), 0), DeadlineStep::Kill, "{other:?}");
+        }
+    }
+
+    /// Past its deadline a disk-image command is not signalled: the waiter warns and the child
+    /// finishes on its own, exit status and output intact, returned as success. At the hard
+    /// deadline it is killed and the kill reported, which the runner records as a probable
+    /// leaked device.
+    #[test]
+    fn a_disk_image_command_outliving_its_deadline_is_waited_for_then_killed_at_the_ceiling() {
+        let request = CommandRequest::new(
+            "/bin/sh",
+            [
+                "-c",
+                "i=0; while [ $i -lt 20000 ]; do i=$((i+1)); done; printf done",
+            ],
+        );
+        let waiting = DeadlinePolicy {
+            deadline: Duration::from_millis(1),
+            warn_every: Duration::from_millis(5),
+            hard: Duration::from_secs(60),
+        };
+        let mut warnings = 0;
+        let mut kills = 0;
+        let output = SystemCommandRunner::run_unleased(
+            &request,
+            waiting,
+            &mut |_| warnings += 1,
+            &mut || kills += 1,
+        )
+        .expect("the child finishes on its own");
+        assert_eq!(output.status, ProcessStatus::Exit(0));
+        assert_eq!(output.stdout, b"done");
+        assert!(warnings >= 1, "the deadline passed without a warning");
+        assert_eq!(kills, 0);
+
+        let ceiling = DeadlinePolicy {
+            deadline: Duration::from_millis(1),
+            warn_every: Duration::from_millis(50),
+            hard: Duration::from_millis(300),
+        };
+        let directory = std::env::temp_dir().join(format!(
+            "cowshed-apfs-hard-deadline-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let record = directory.join("pool.json");
+        let error = SystemCommandRunner::run_unleased(
+            &CommandRequest::new("/bin/sh", ["-c", "while true; do :; done"]),
+            ceiling,
+            &mut |_| {},
+            &mut || {
+                attach_budget::record_killed_at(&record, "this-boot").unwrap();
+            },
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error.failure, CommandRunFailure::Deadline(hard) if hard == Duration::from_millis(300)),
+            "{error:?}"
+        );
+        assert_eq!(
+            attach_budget::load(&record)
+                .unwrap()
+                .probable_leaks
+                .map(|leaks| leaks.killed),
+            Some(1)
+        );
+        fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn every_read_write_mount_plants_the_spotlight_opt_out_and_refuses_a_squatter() {
+        let root = temp_path("spotlight-opt-out", "mnt");
+        fs::create_dir_all(&root).unwrap();
+        assert_eq!(opt_out_of_spotlight(&root).unwrap(), Marker::Planted);
+        let marker = root.join(SPOTLIGHT_OPT_OUT);
+        assert_eq!(fs::metadata(&marker).unwrap().len(), 0);
+        assert_eq!(
+            opt_out_of_spotlight(&root).unwrap(),
+            Marker::Planted,
+            "idempotent"
+        );
+        fs::remove_file(&marker).unwrap();
+        let elsewhere = root.with_extension("elsewhere");
+        std::os::unix::fs::symlink(&elsewhere, &marker).unwrap();
+        assert_eq!(opt_out_of_spotlight(&root).unwrap(), Marker::Squatted);
+        assert!(
+            !elsewhere.exists(),
+            "nothing is written through the symlink"
+        );
+        fs::remove_file(&marker).unwrap();
+        fs::write(&marker, b"not empty").unwrap();
+        assert_eq!(opt_out_of_spotlight(&root).unwrap(), Marker::Squatted);
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
@@ -5607,6 +6116,49 @@ mod tests {
             }
         ));
         assert_eq!(backend.runner().steps().len(), 5);
+    }
+
+    /// The host limit this type exists for: `diskutil image attach` exiting 1 with error code
+    /// 150 because the kernel attach pool is spent. It must arrive as the typed host finding that
+    /// names the reboot, not as one more generic exit 1, and nothing else may.
+    #[test]
+    fn an_attach_the_spent_pool_refused_is_the_typed_host_finding() {
+        let spent = "Error: Disk image operation failed with error code 150\n";
+        let attach = |stderr: &'static str| {
+            let stem = temp_path("image-pool-spent", "stem").with_extension("");
+            let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
+                ok([]),
+                no_images(),
+                failed(1, stderr),
+                no_images(),
+                no_images(),
+            ]));
+            backend
+                .create_staged_image(&CreateImageRequest {
+                    staged_stem: stem,
+                    capacity: capacity("5g"),
+                    volume_name: "main".into(),
+                    owner_uid: 502,
+                    owner_gid: 20,
+                })
+                .unwrap_err()
+        };
+
+        let error = attach(spent);
+        let ApfsError::AttachPoolExhausted(failure) = &error else {
+            panic!("expected the typed pool exhaustion, got {error:?}");
+        };
+        assert_eq!(failure.operation, "attach blank RAW image");
+        assert_eq!(failure.output.stderr, spent.as_bytes());
+        let report = error.to_string();
+        assert!(report.starts_with("AttachPoolExhausted: "), "{report}");
+        assert!(report.contains("attach pool is spent"), "{report}");
+        assert!(report.contains("error code 150"), "{report}");
+
+        assert!(matches!(
+            attach("Error: Disk image operation failed with error code 15\n"),
+            ApfsError::CommandFailed { .. }
+        ));
     }
 
     /// The gate failure this type exists for: `diskutil image attach` exiting 1 because the

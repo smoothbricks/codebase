@@ -363,7 +363,9 @@ exclude each other rather than N interchangeable tokens.
   evicted from the phase: it no longer counts, the phase hands over once its other holders leave, and the gateway's
   stderr names it — `disk-lease evicted a <class> holder after <held> while <class> waited`, with its pid and the
   command line it asked for. Its command may still be running beside the next phase; a hung `umount` costs that one
-  overlap, not every attach on the host. A client's own deadline still kills its child at 120 s.
+  overlap, not every attach on the host. A client's own deadline still kills its child at 120 s, except a disk-image
+  command (`diskutil image …`, `hdiutil`), which it warns about from 120 s every 30 s and kills only at 15 minutes,
+  because a killed one can leak its device until reboot (01_storage.md, "How the APFS host degrades" §2).
 - **Wire.** The client writes `{"op":"disk-lease","class":"storage"|"namespace","command":"<argv>"}` and does not
   half-close. The gateway answers `{"ok":true,"lease":"queued"}` at once and `{"ok":true,"lease":"granted"}` when the
   command may run; the lease lasts until the client closes the connection, so a client that dies holding one releases it

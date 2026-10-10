@@ -437,13 +437,26 @@ command line: a command that kept its phase ten seconds while the other class wa
 ## Every attach fails with `error code 150`
 
 `Failed to initialize IO manager … error code 150` (`kIOReturnNoResources`) from every image attach,
-`diskutil image info`, `cowshed new` and cold mount, while images already attached keep working, means the kernel has no
-room left to map one more disk image helper's IO buffers. Every attached image has its own `diskimagesiod`, which maps
-72 MiB into the kernel; detach does not always end it, and a helper that outlived its image keeps its mapping.
-`cowshed doctor` reports them as `orphaned-disk-image-helpers`: the count, the pids (running helpers that no attached
-`AppleDiskImageDevice`'s user client names as its creator), the mapping they hold, and the root command that frees it,
-`sudo kill -9 <pids>`. `launchctl kill` refuses them, and no reboot is needed. A helper whose attach is still under way
-is named until its device registers, so kill the pids a second `cowshed doctor` still names. cowshed never signals a
+`diskutil image info`, `cowshed new` and cold mount, while images already attached keep working, means the host's
+disk-image attach pool is spent. A command that meets it fails with `AttachPoolExhausted`, and `cowshed doctor` says
+which of two causes spent it.
+
+`disk-image-attach-budget` reports leaked disk-image devices: `AppleDiskImageDevice` and `DIDeviceIOUserClient`
+instances (`ioclasscount`) that no attached image accounts for, which only a reboot frees. It also reports leaked
+`AppleAPFSVolume` and `IOMedia`, which `sudo killall diskarbitrationd` frees, the ceiling at which this host's pool last
+ran out (1024 leaked devices until one is recorded: an observation from one host and boot, not a documented limit), the
+headroom left, and any disk-image command killed at its 15-minute hard deadline, each a probable leaked device. "attach
+pool exhausted, reboot required" means an attach failed with error code 150 this boot with the leaked devices at the
+ceiling: reboot.
+
+The other cause is helpers that outlived their image. Every attached image has its own `diskimagesiod`, which maps 72
+MiB into the kernel; detach does not always end it, and a helper that outlived its image keeps its mapping.
+`cowshed doctor` reports them as `orphaned-disk-image-helpers`: the count, the pids (running helpers that two reads in a
+row find no attached `AppleDiskImageDevice`'s user client naming as its creator, with no `diskutil` or `hdiutil` running
+during either), the mapping they hold, and the root command that frees it, `sudo kill -9 <pids>`. `launchctl kill`
+refuses them, and no reboot is needed for them. While a disk-image tool runs, a helper may still be attaching, so no pid
+is named until a later `cowshed doctor`. Killing orphans frees their mappings, never a leaked device. Once they are
+gone, `attach-budget --clear` (or any successful cowshed attach) ends the recorded exhaustion. cowshed never signals a
 helper itself.
 
 ## `cowshed path` or `cowshed exec` is slow

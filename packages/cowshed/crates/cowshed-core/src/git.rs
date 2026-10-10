@@ -672,9 +672,12 @@ impl GitRepository {
             .collect())
     }
 
-    /// Exclude cowshed's runtime metadata and the volume's own bookkeeping
-    /// ([`crate::apfs::VOLUME_METADATA`]) in `.git/info/exclude`: a checkout is its volume's root,
-    /// so neither is the repository's work, for a dirty check or for a clean.
+    /// Exclude cowshed's runtime metadata, the volume's own bookkeeping
+    /// ([`crate::apfs::VOLUME_METADATA`]) and the Spotlight opt-out each mount plants at the
+    /// volume root ([`crate::apfs::SPOTLIGHT_OPT_OUT`]) in `.git/info/exclude`: a checkout is its
+    /// volume's root, so none of it is the repository's work, for a dirty check or for a clean.
+    /// Directories are excluded as `name/`; the marker is a file, so it is `/name`, anchored at
+    /// the root, where a trailing slash would match only a directory.
     pub async fn ensure_cowshed_excludes(&self) -> Result<()> {
         let root = self.root.clone();
         tokio::task::spawn_blocking(move || {
@@ -727,8 +730,10 @@ impl GitRepository {
                 )
             })?;
             let mut addition = Vec::new();
-            for name in std::iter::once(".cowshed").chain(crate::apfs::VOLUME_METADATA) {
-                let pattern = format!("{name}/");
+            let directories = std::iter::once(".cowshed")
+                .chain(crate::apfs::VOLUME_METADATA)
+                .map(|name| format!("{name}/"));
+            for pattern in directories.chain([format!("/{}", crate::apfs::SPOTLIGHT_OPT_OUT)]) {
                 let pattern = pattern.as_bytes();
                 if !existing
                     .split(|byte| *byte == b'\n')
@@ -3517,7 +3522,7 @@ mod tests {
             .expect("idempotent wiring");
         assert_eq!(
             fs::read(&exclude).expect("read excludes"),
-            b"user-pattern\n.cowshed/\n.DocumentRevisions-V100/\n.Spotlight-V100/\n.TemporaryItems/\n.Trashes/\n.fseventsd/\n"
+            b"user-pattern\n.cowshed/\n.DocumentRevisions-V100/\n.Spotlight-V100/\n.TemporaryItems/\n.Trashes/\n.fseventsd/\n/.metadata_never_index\n"
         );
         fs::create_dir(root.join(".cowshed")).expect("runtime metadata");
         fs::write(root.join(".cowshed/state"), b"").expect("runtime state");
@@ -3525,7 +3530,30 @@ mod tests {
             fs::create_dir(root.join(metadata)).expect("APFS metadata");
             fs::write(root.join(metadata).join("entry"), b"").expect("APFS metadata entry");
         }
+        fs::write(root.join(crate::apfs::SPOTLIGHT_OPT_OUT), b"").expect("Spotlight opt-out");
         assert!(!repo.is_dirty().await.expect("runtime state is ignored"));
+        // Ignored by the exclude itself, not merely as hidden junk, so `git add -A` leaves it,
+        // and anchored at the root: a same-named file deeper in the tree is the repository's.
+        fs::create_dir(root.join("nested")).expect("nested directory");
+        fs::write(
+            root.join("nested").join(crate::apfs::SPOTLIGHT_OPT_OUT),
+            b"",
+        )
+        .expect("nested");
+        let ignored = |path: &str| {
+            Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(["check-ignore", "-q", "--no-index", path])
+                .status_locked()
+                .expect("git check-ignore")
+                .success()
+        };
+        assert!(ignored(crate::apfs::SPOTLIGHT_OPT_OUT));
+        assert!(!ignored(&format!(
+            "nested/{}",
+            crate::apfs::SPOTLIGHT_OPT_OUT
+        )));
     }
 
     #[tokio::test]

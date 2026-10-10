@@ -806,11 +806,13 @@ fn classify(metadata: &fs::Metadata) -> Option<EntryKind> {
     }
 }
 
-/// The volume's own bookkeeping ([`crate::apfs::VOLUME_METADATA`]): the image volume grows its
-/// own, so it is neither copied from the source nor deleted from the destination.
+/// The volume's own bookkeeping ([`crate::apfs::VOLUME_METADATA`], and the Spotlight opt-out
+/// [`crate::apfs::SPOTLIGHT_OPT_OUT`] each mount plants): the image volume grows its own, so it
+/// is neither copied from the source nor deleted from the destination.
 fn is_apfs_volume_metadata(name: &OsStr) -> bool {
     crate::apfs::VOLUME_METADATA
         .iter()
+        .chain([&crate::apfs::SPOTLIGHT_OPT_OUT])
         .any(|reserved| name == OsStr::new(reserved))
 }
 

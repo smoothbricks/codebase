@@ -220,8 +220,25 @@ their 120s bound and the default per-test 30s bound stays unchanged. The existin
 remain explicit; they can exceed a single test's 30s share of the outer budget. The RAM host walk runs after this group
 in `test-host`, outside the four pure Bun shards, with its own existing target and case bounds.
 
-**The suite spends a finite host budget.** Every attach→detach cycle a test makes costs one AppleDiskImages2 attach slot
-that the host's live sheds lose until reboot (01_storage.md, "How the APFS host degrades"), so a test pays the fewest
+**Host limit.** The host's disk-image attach pool runs out (01_storage.md, "How the APFS host degrades" §2), and the
+suite stops spending into a spent one. Fixtures attach an image once and share it across the assertions that need it
+rather than each re-attaching. Every real-APFS fixture image (`tests/support/blank_image.rs`) first passes
+`attach_budget::harness_gate`, which reads only the boot and the pool record: once any test process meets error code
+150, the system runner that met it records it, and every later fixture of the run, in whichever process, fails with
+`AttachPoolExhausted` and its `next:` step without attaching. A record the gate cannot read proves nothing about the
+pool, so it warns and the fixture proceeds. The lane stays `--no-fail-fast`, so its ordinary failures still run to the
+end; the refusal is the harness's own error, not a scheduler flag. Before the real-APFS lane starts,
+`cargo run -q -p cowshed-core --bin attach-budget -- --need <N>` prints the pool as one JSON line (the four classes'
+instances, registered and leaked counts, the ceiling and its source, the headroom, whether this boot is spent) and
+refuses, exit 3 with `AttachPoolExhausted` and a `next:` hint, when the boot is spent or the headroom is below `N`; a
+pool it cannot read is exit 0 with an `unread` line and a warning, never a claim of headroom; `--clear` ends a recorded
+150 after the operator freed what spent it. `N` is the lane's measured attach count, one per `apfs-command attach image`
+line of a lane run under `COWSHED_TIMING=1` with its output shown, plus a fixed margin, and is measured again whenever
+the lane's test set changes. The leaked-device delta across a lane run (`ioclasscount AppleDiskImageDevice` against the
+registered devices, before and after) is the check that no disk-image command still leaks on a clean run; it must be 0.
+
+**The suite spends a finite host budget.** Every attach→detach cycle a test makes can leak an AppleDiskImages2 device
+that the host's live sheds lose until reboot (01_storage.md, "How the APFS host degrades" §2), so a test pays the fewest
 attach cycles that prove its behavior. A run that killed a test leaves that test's images attached until the next run's
 sweep, which `real_apfs_fixture_runs_leave_nothing_attached_or_running_however_they_end` proves for both panic and kill.
 A scratch root's teardown and the sweep release a root's images concurrently, one holder per image: each release is an

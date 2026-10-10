@@ -4125,17 +4125,32 @@ fn vnode_table_finding(
 
 /// `diskimagesiod` helpers that outlived their disk image, each still holding the 72 MiB of
 /// kernel mapping whose exhaustion fails every attach with error code 150. Only root can end
-/// them, so the finding names the pids and the command, and cowshed signals nothing itself.
+/// them, so the finding names the pids and the command, and cowshed signals nothing itself. A
+/// pid is named only when two reads agree with no disk-image tool running; while one runs, a
+/// helper may be attaching, and the finding says so without naming any.
 fn orphaned_disk_image_helpers_finding(
-    orphans: std::io::Result<cowshed_core::disk_image_helpers::OrphanedHelpers>,
+    reading: std::io::Result<cowshed_core::disk_image_helpers::HelperReading>,
 ) -> Option<Finding> {
-    match orphans {
-        Ok(orphans) if orphans.is_empty() => None,
-        Ok(orphans) => Some(Finding {
+    use cowshed_core::disk_image_helpers::HelperReading;
+    match reading {
+        Ok(HelperReading::Settled(orphans)) if orphans.is_empty() => None,
+        Ok(HelperReading::Settled(orphans)) => Some(Finding {
             code: "orphaned-disk-image-helpers".into(),
             severity: FindingSeverity::Warning,
             message: orphans.to_string(),
             hint: orphans.remedy(),
+            path: None,
+        }),
+        Ok(HelperReading::Busy { suspected: 0 }) => None,
+        Ok(HelperReading::Busy { suspected }) => Some(Finding {
+            code: "orphaned-disk-image-helpers".into(),
+            severity: FindingSeverity::Info,
+            message: format!(
+                "{suspected} diskimagesiod helper(s) serve no attached disk image, but a diskutil \
+                 or hdiutil was running, so they may still be attaching: no pid is named, \
+                 because killing a helper mid-attach leaks its device until reboot"
+            ),
+            hint: "cowshed doctor once no diskutil or hdiutil is running".into(),
             path: None,
         }),
         Err(error) if error.kind() == std::io::ErrorKind::Unsupported => None,
@@ -4147,6 +4162,39 @@ fn orphaned_disk_image_helpers_finding(
                  disk images: {error}"
             ),
             hint: "ioreg -r -c DIDeviceIOUserClient -l | grep IOUserClientCreator".into(),
+            path: None,
+        }),
+    }
+}
+
+/// The host's disk-image attach pool (attach_budget.rs): the leaked image devices, user
+/// clients, volumes and media, the ceiling the leaked devices run out at and the headroom left.
+/// A pool spent this boot is an error; low headroom or a volume leak warns. The hint names what
+/// frees each leak.
+fn disk_image_attach_budget_finding(
+    budget: std::io::Result<cowshed_core::attach_budget::Budget>,
+) -> Option<Finding> {
+    match budget {
+        Ok(budget) => Some(Finding {
+            code: "disk-image-attach-budget".into(),
+            severity: if budget.spent.is_some() {
+                FindingSeverity::Error
+            } else if budget.is_low() {
+                FindingSeverity::Warning
+            } else {
+                FindingSeverity::Info
+            },
+            message: budget.to_string(),
+            hint: budget.remedy(),
+            path: None,
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::Unsupported => None,
+        Err(error) => Some(Finding {
+            code: "disk-image-attach-budget".into(),
+            severity: FindingSeverity::Warning,
+            message: format!("could not read the disk-image attach pool: {error}"),
+            hint: "ioclasscount AppleDiskImageDevice DIDeviceIOUserClient AppleAPFSVolume IOMedia"
+                .into(),
             path: None,
         }),
     }
@@ -4202,6 +4250,9 @@ async fn diagnose_host() -> Result<HostDiagnosis> {
         .extend(orphaned_disk_image_helpers_finding(
             cowshed_core::disk_image_helpers::OrphanedHelpers::read(),
         ));
+    diagnosis.findings.extend(disk_image_attach_budget_finding(
+        cowshed_core::attach_budget::observe(),
+    ));
     match crate::capabilities::sccache::service::service_status().await {
         Ok(status) => diagnosis.findings.push(sccache_finding(&status)),
         Err(error) => diagnosis.findings.push(Finding {
@@ -5252,22 +5303,116 @@ mod tests {
     }
 
     #[test]
+    fn doctor_reports_the_attach_budget_and_says_reboot_once_the_pool_ran_out() {
+        use cowshed_core::attach_budget::{
+            Boot, ClassCount, KernelReading, PoolRecord, REBOOT_HINT, RESTART_DISK_ARBITRATION_HINT,
+        };
+        let count = |instances, registered| ClassCount {
+            instances,
+            registered,
+        };
+        let boot = Boot {
+            session: "C979D80A-3BC4-4F57-A9E2-1FE362B935C7".into(),
+            booted_at: 1_791_515_025,
+        };
+        let next = "0E3E6D1C-6C7B-4B53-8A1E-6C5C1E0D1F00";
+        // This host at its first 150 on 2026-10-10, and just after the reboot.
+        let spent_host = KernelReading {
+            image_devices: count(1090, 66),
+            user_clients: count(1077, 66),
+            apfs_volumes: count(1065, 81),
+            media: count(1075, 80),
+        };
+        let rebooted_host = KernelReading {
+            image_devices: count(178, 178),
+            user_clients: count(178, 178),
+            apfs_volumes: count(193, 193),
+            media: count(185, 185),
+        };
+        let finding = |record: &PoolRecord, session: &str, reading: KernelReading| {
+            disk_image_attach_budget_finding(Ok(record.budget(session, reading)))
+                .expect("the budget is always reported")
+        };
+
+        let fresh = finding(&PoolRecord::default(), next, rebooted_host);
+        assert_eq!(fresh.code, "disk-image-attach-budget");
+        assert_eq!(fresh.severity, FindingSeverity::Info);
+        assert_eq!(fresh.hint, "nothing to free");
+        assert!(
+            fresh.message.starts_with(
+                "AppleDiskImageDevice 178 instances, 178 registered, 0 leaked; DIDeviceIOUserClient"
+            ),
+            "{fresh:?}"
+        );
+        assert!(fresh.message.contains("headroom 1024"), "{fresh:?}");
+
+        // The first 150 is recorded with its counts, and the next doctor says what it means.
+        let spent = PoolRecord::default().exhausted(&boot, Some(spent_host.image_devices), Some(0));
+        let exhausted = finding(&spent, &boot.session, spent_host);
+        assert_eq!(exhausted.severity, FindingSeverity::Error);
+        assert!(
+            exhausted
+                .message
+                .starts_with("attach pool exhausted, reboot required"),
+            "{exhausted:?}"
+        );
+        assert!(
+            exhausted
+                .message
+                .contains("66 disk images attached and 1024 leaked image devices"),
+            "{exhausted:?}"
+        );
+        assert_eq!(
+            exhausted.hint,
+            format!("{RESTART_DISK_ARBITRATION_HINT}; then {REBOOT_HINT}")
+        );
+
+        // After the reboot the recorded leak is the ceiling; headroom near it warns.
+        let rebooted = finding(&spent, next, rebooted_host);
+        assert_eq!(rebooted.severity, FindingSeverity::Info);
+        assert!(rebooted.message.contains("observed here"), "{rebooted:?}");
+        let near = KernelReading {
+            image_devices: count(178 + 800, 178),
+            ..rebooted_host
+        };
+        let near = finding(&spent, next, near);
+        assert_eq!(near.severity, FindingSeverity::Warning);
+        assert!(near.message.contains("headroom 224"), "{near:?}");
+        assert_eq!(near.hint, REBOOT_HINT);
+
+        let linux = std::io::Error::new(std::io::ErrorKind::Unsupported, "no pool");
+        assert!(disk_image_attach_budget_finding(Err(linux)).is_none());
+        let refused = std::io::Error::other("IOServiceMatching refused");
+        let unread = disk_image_attach_budget_finding(Err(refused)).expect("a failed read");
+        assert_eq!(unread.severity, FindingSeverity::Warning);
+    }
+
+    #[test]
     fn doctor_names_orphaned_disk_image_helpers_and_the_root_command() {
-        use cowshed_core::disk_image_helpers::OrphanedHelpers;
+        use cowshed_core::disk_image_helpers::{HelperReading, OrphanedHelpers};
         use std::collections::BTreeSet;
         let helpers = BTreeSet::from([4353, 25101, 75251]);
-        let finding = orphaned_disk_image_helpers_finding(Ok(OrphanedHelpers::among(
-            &helpers,
-            &BTreeSet::from([25101]),
-        )))
-        .expect("orphans are a finding");
+        let orphans = OrphanedHelpers::among(&helpers, &BTreeSet::from([25101]));
+        let finding =
+            orphaned_disk_image_helpers_finding(Ok(HelperReading::Settled(orphans.clone())))
+                .expect("orphans are a finding");
         assert_eq!(finding.code, "orphaned-disk-image-helpers");
         assert_eq!(finding.severity, FindingSeverity::Warning);
         assert_eq!(finding.hint, "sudo kill -9 4353 75251");
         assert!(finding.message.contains("(pid 4353, 75251)"), "{finding:?}");
 
+        // While a disk-image tool runs, no pid is named.
+        let busy = orphaned_disk_image_helpers_finding(Ok(HelperReading::from_reads(
+            (orphans.clone(), true),
+            (orphans, false),
+        )))
+        .expect("suspects are said");
+        assert_eq!(busy.severity, FindingSeverity::Info);
+        assert!(!busy.message.contains("4353"), "{busy:?}");
+        assert!(!busy.hint.contains("kill"), "{busy:?}");
+
         let served = OrphanedHelpers::among(&helpers, &helpers);
-        assert!(orphaned_disk_image_helpers_finding(Ok(served)).is_none());
+        assert!(orphaned_disk_image_helpers_finding(Ok(HelperReading::Settled(served))).is_none());
         let linux = std::io::Error::new(std::io::ErrorKind::Unsupported, "no helpers");
         assert!(orphaned_disk_image_helpers_finding(Err(linux)).is_none());
         let refused = std::io::Error::other("proc_pidpath(1): refused");

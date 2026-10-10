@@ -11,6 +11,7 @@ use cowshed_core::apfs::{
     ApfsBackend, AttachedImage, CommandRunner, CreateImageRequest, DetachIntent, DiskImageSource,
     ImageCapture, MacOsApfsBackend, MountAccess, SystemCommandRunner, volume_name,
 };
+use cowshed_core::attach_budget;
 use cowshed_core::fork_lock::Run as _;
 use cowshed_core::metadata::{
     GrantSet, ImageCapacity, MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE, PortBlock, WorkspaceIncarnation,

@@ -10,6 +10,7 @@ use cowshed_core::api::dto::{
     Adoption, AdoptionSkip, CarrySide, DatabaseHolder, GcReport, LandReport, RebaseBuildVolume,
     RebaseCarrySkip, RebaseReport, Reseed, ReseedResult,
 };
+use cowshed_core::attach_budget;
 use cowshed_core::build_volume::{
     BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord, BuildVolumeRole, link, nx,
 };

@@ -598,6 +598,12 @@ impl CowshedError {
                     "rerun the command from a shell whose sandbox allows writing the cowshed store",
                 );
             }
+            if let Some(crate::apfs::ApfsError::AttachPoolExhausted(_)) =
+                error.downcast_ref::<crate::apfs::ApfsError>()
+            {
+                // The host's finding, not storage's: no storage repair frees the attach pool.
+                return Self::environment_missing(message, crate::attach_budget::EXHAUSTED_HINT);
+            }
             starved |= errno == Some(libc::ENFILE)
                 || error.is::<crate::apfs::CommandRunError>()
                 || matches!(
@@ -968,6 +974,28 @@ mod tests {
             panic!("the table is read only for disk-child and ENFILE failures")
         });
         assert_eq!(error.hint, "repair");
+    }
+
+    #[test]
+    fn a_spent_attach_pool_sends_the_caller_to_doctor_not_storage_repair() {
+        use crate::apfs::{
+            ApfsError, AttachPoolFailure, CommandOutput, CommandRequest, ProcessStatus,
+        };
+        let spent = ApfsError::AttachPoolExhausted(Box::new(AttachPoolFailure {
+            operation: "attach image without mounting",
+            request: CommandRequest::new("/usr/sbin/diskutil", ["image", "attach"]),
+            output: CommandOutput {
+                status: ProcessStatus::Exit(1),
+                stdout: Vec::new(),
+                stderr: b"Error: Disk image operation failed with error code 150\n".to_vec(),
+            },
+        }));
+        let error = CowshedError::storage_failure_under("build volume", &spent, "repair", || {
+            panic!("a spent pool is not blamed on the vnode table")
+        });
+        assert_eq!(error.code, ErrorCode::EnvironmentMissing);
+        assert_eq!(error.hint, crate::attach_budget::EXHAUSTED_HINT);
+        assert_eq!(error.message, "build volume");
     }
 
     #[test]

@@ -32,10 +32,11 @@ pub const STAGING_SUFFIX: &str = ".cowshed-retiring";
 
 /// What the volume's own filesystem keeps at its root: cowshed's marker and macOS's per-volume
 /// bookkeeping. None of it is a cache, and none of it outlives the volume.
-const BOOKKEEPING: [&str; 7] = [
+const BOOKKEEPING: [&str; 8] = [
     VOLUME_MARKER_FILE,
     ".fseventsd",
     ".Spotlight-V100",
+    crate::apfs::SPOTLIGHT_OPT_OUT,
     ".Trashes",
     ".TemporaryItems",
     ".DocumentRevisions-V100",

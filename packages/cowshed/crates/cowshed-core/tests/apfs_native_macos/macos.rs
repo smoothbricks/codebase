@@ -13,6 +13,7 @@ use cowshed_core::apfs::{
     CommandRunError, CommandRunner, DetachIntent, DiskImageSource, ImageCapture, MacOsApfsBackend,
     MountAccess, SystemCommandRunner,
 };
+use cowshed_core::attach_budget;
 use cowshed_core::fork_lock::{Fenced, Spawn as _};
 use cowshed_core::metadata::{
     DetachedWorkspaceMetadata, GrantSet, ImageCapacity, MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE,

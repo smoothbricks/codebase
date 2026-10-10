@@ -2,6 +2,7 @@
 
 pub mod apfs;
 pub mod api;
+pub mod attach_budget;
 pub mod build_volume;
 pub mod caches_retirement;
 pub mod capabilities;

@@ -20,6 +20,12 @@ path = "src/bin/apfs_benchmark.rs"
 test = false
 bench = false
 
+[[bin]]
+name = "attach-budget"
+path = "src/bin/attach_budget.rs"
+test = false
+bench = false
+
 [dependencies]
 arrow-array = "56"
 arrow-buffer = "56"

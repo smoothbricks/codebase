@@ -677,7 +677,10 @@ mod tests {
                 let path = entry.unwrap().path();
                 let metadata = fs::symlink_metadata(&path).unwrap();
                 let relative = path.strip_prefix(root).unwrap().to_path_buf();
-                if relative.starts_with(".fseventsd") || relative.starts_with(".Spotlight-V100") {
+                if relative.starts_with(".fseventsd")
+                    || relative.starts_with(".Spotlight-V100")
+                    || relative == Path::new(crate::apfs::SPOTLIGHT_OPT_OUT)
+                {
                     continue;
                 }
                 if metadata.is_dir() {
