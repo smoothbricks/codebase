@@ -280,6 +280,9 @@ async fn handle_request(
         .await);
     }
     if health == UpstreamHealth::Offline {
+        if admission.nx_token.is_some() {
+            return Ok(nx_backend_unavailable(&context, admission, "offline", audit_kind).await);
+        }
         complete_now(
             &context,
             admission,
@@ -319,6 +322,15 @@ async fn handle_request(
     {
         Ok(Ok(connection)) => connection,
         Ok(Err(_)) => {
+            if admission.nx_token.is_some() {
+                return Ok(nx_backend_unavailable(
+                    &context,
+                    admission,
+                    "connect-failed",
+                    audit_kind,
+                )
+                .await);
+            }
             complete_now(
                 &context,
                 admission,
@@ -336,6 +348,15 @@ async fn handle_request(
             ));
         }
         Err(_) => {
+            if admission.nx_token.is_some() {
+                return Ok(nx_backend_unavailable(
+                    &context,
+                    admission,
+                    "connect-timeout",
+                    audit_kind,
+                )
+                .await);
+            }
             let classification = if Instant::now() >= request_deadline {
                 "request-total-timeout"
             } else {
@@ -359,6 +380,11 @@ async fn handle_request(
         }
     };
     if upstream.transport == NegotiatedTransport::Raw {
+        if admission.nx_token.is_some() {
+            return Ok(
+                nx_backend_unavailable(&context, admission, "raw-transport", audit_kind).await,
+            );
+        }
         complete_now(
             &context,
             admission,
@@ -412,6 +438,15 @@ async fn handle_request(
     {
         Ok(Ok(sender)) => sender,
         Ok(Err(_)) => {
+            if admission.nx_token.is_some() {
+                return Ok(nx_backend_unavailable(
+                    &context,
+                    admission,
+                    "handshake-failed",
+                    audit_kind,
+                )
+                .await);
+            }
             complete_now(
                 &context,
                 admission,
@@ -429,6 +464,15 @@ async fn handle_request(
             ));
         }
         Err(_) => {
+            if admission.nx_token.is_some() {
+                return Ok(nx_backend_unavailable(
+                    &context,
+                    admission,
+                    "handshake-timeout",
+                    audit_kind,
+                )
+                .await);
+            }
             let classification = if Instant::now() >= request_deadline {
                 "request-total-timeout"
             } else {
@@ -458,8 +502,20 @@ async fn handle_request(
     .await
     {
         Ok(Ok(response)) => response,
-        Ok(Err(_)) => {
+        Ok(Err(error)) => {
             let request_timeout = request_timeout.try_recv().ok();
+            if request_timeout.is_none()
+                && admission.nx_token.is_some()
+                && !request_body_cause(&error)
+            {
+                return Ok(nx_backend_unavailable(
+                    &context,
+                    admission,
+                    "upstream-send-failed",
+                    audit_kind,
+                )
+                .await);
+            }
             let (audit_status, http_status, classification, message) = request_timeout.map_or(
                 (
                     AuditStatus::Failed,
@@ -490,6 +546,15 @@ async fn handle_request(
         }
         Err(_) => {
             let body_timeout = request_timeout.try_recv().ok();
+            if body_timeout.is_none() && admission.nx_token.is_some() {
+                return Ok(nx_backend_unavailable(
+                    &context,
+                    admission,
+                    "response-headers-timeout",
+                    audit_kind,
+                )
+                .await);
+            }
             let classification = body_timeout.map_or_else(
                 || {
                     if Instant::now() >= request_deadline {
@@ -518,6 +583,9 @@ async fn handle_request(
         }
     };
     let status = response.status();
+    if admission.nx_token.is_some() && status.is_server_error() {
+        return Ok(nx_backend_unavailable(&context, admission, "upstream-5xx", audit_kind).await);
+    }
     let (mut parts, body) = response.into_parts();
     strip_upstream_response_headers(&mut parts.headers);
     let total_deadline = admitted_at + response_total_duration(&parts.headers, context.timeouts);
@@ -2625,6 +2693,52 @@ impl Drop for AdmissionCancellation {
     }
 }
 
+/// Whether a failed upstream send was caused by the client's request body. Typed checks only: an
+/// aborted body write, a user body error, or the body-limit error anywhere in the cause chain. Such
+/// a failure is the client's and never an outage; any other send failure is the backend's.
+fn request_body_cause(error: &hyper::Error) -> bool {
+    if error.is_body_write_aborted()
+        || (error.is_user() && std::error::Error::source(error).is_some())
+    {
+        return true;
+    }
+    let mut cause = std::error::Error::source(error);
+    while let Some(current) = cause {
+        if current.is::<http_body_util::LengthLimitError>() {
+            return true;
+        }
+        cause = current.source();
+    }
+    false
+}
+
+/// An Nx route whose backend cannot answer before the response head: a read is a miss and a write
+/// is refused (`nx_cache::unavailable_status`), audited as a failed outage and never as a hit. The
+/// reason names the stage for the server-side log only.
+async fn nx_backend_unavailable(
+    context: &AcceptContext,
+    admission: Admission,
+    reason: &str,
+    audit_kind: AuditKind,
+) -> Response<ResponseBody> {
+    let status = crate::nx_cache::unavailable_status(&admission.method);
+    eprintln!(
+        "cowshed: nx-backend-unavailable repo={} workspace={} method={} reason={reason}",
+        admission.repo_id, admission.workspace_id, admission.method,
+    );
+    complete_now(
+        context,
+        admission,
+        AuditStatus::Failed,
+        Some(status),
+        Some("nx-backend-unavailable"),
+        0,
+        audit_kind,
+    )
+    .await;
+    problem(status, "Nx backend unavailable", None)
+}
+
 async fn complete_now(
     _context: &AcceptContext,
     admission: Admission,
@@ -2677,6 +2791,8 @@ fn completion_draft(
 struct Completion {
     lease: Option<CompletionLease>,
     draft: Option<AuditDraft>,
+    /// An Nx route's response: a body that does not complete is a failed transfer, never a hit.
+    nx: bool,
 }
 
 impl Completion {
@@ -2695,9 +2811,11 @@ impl Completion {
             admission.audit_kind,
         );
         draft.mirror_cache_status = mirror_cache_status;
+        let nx = admission.nx_token.is_some();
         Self {
             lease: Some(admission.take_completion()),
             draft: Some(draft),
+            nx,
         }
     }
 
@@ -2705,9 +2823,23 @@ impl Completion {
         let (Some(lease), Some(mut draft)) = (self.lease.take(), self.draft.take()) else {
             return;
         };
-        draft.status = status;
-        if let Some(classification) = classification {
-            draft.classification = Some(classification.to_owned());
+        // An Nx response head is already committed as 200, so a body that does not complete is
+        // audited as a failed transfer, never as a completed or hit read.
+        if self.nx && !matches!(status, AuditStatus::Completed) {
+            eprintln!(
+                "cowshed: nx-transfer-failed repo={} workspace={} method={} reason={}",
+                draft.repo_id,
+                draft.workspace_id,
+                draft.method.as_deref().unwrap_or(""),
+                classification.unwrap_or(""),
+            );
+            draft.status = AuditStatus::Failed;
+            draft.classification = Some("nx-transfer-failed".to_owned());
+        } else {
+            draft.status = status;
+            if let Some(classification) = classification {
+                draft.classification = Some(classification.to_owned());
+            }
         }
         draft.bytes = bytes;
         lease.finish(draft);

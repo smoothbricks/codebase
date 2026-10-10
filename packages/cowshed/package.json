@@ -205,7 +205,11 @@
           "!{projectRoot}/**/target/**",
           "{projectRoot}/package.json",
           "{workspaceRoot}/bun.lock",
-          "cargoToolchain"
+          "cargoToolchain",
+          {
+            "dependentTasksOutputFiles": "**/nx-cache-server",
+            "transitive": false
+          }
         ],
         "outputs": [
           "{projectRoot}/dist/bin/darwin-arm64"
@@ -244,7 +248,11 @@
           "!{projectRoot}/**/target/**",
           "{projectRoot}/package.json",
           "{workspaceRoot}/bun.lock",
-          "cargoToolchain"
+          "cargoToolchain",
+          {
+            "dependentTasksOutputFiles": "**/nx-cache-server",
+            "transitive": false
+          }
         ],
         "outputs": [
           "{projectRoot}/dist/bin/darwin-x64"
@@ -283,7 +291,11 @@
           "!{projectRoot}/**/target/**",
           "{projectRoot}/package.json",
           "{workspaceRoot}/bun.lock",
-          "cargoToolchain"
+          "cargoToolchain",
+          {
+            "dependentTasksOutputFiles": "**/nx-cache-server",
+            "transitive": false
+          }
         ],
         "outputs": [
           "{projectRoot}/dist/bin/linux-arm64-gnu"
@@ -325,7 +337,11 @@
           "!{projectRoot}/**/target/**",
           "{projectRoot}/package.json",
           "{workspaceRoot}/bun.lock",
-          "cargoToolchain"
+          "cargoToolchain",
+          {
+            "dependentTasksOutputFiles": "**/nx-cache-server",
+            "transitive": false
+          }
         ],
         "outputs": [
           "{projectRoot}/dist/bin/linux-x64-gnu"

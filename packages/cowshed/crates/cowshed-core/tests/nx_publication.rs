@@ -233,7 +233,9 @@ impl Drop for Server {
 }
 
 fn repository_root() -> PathBuf {
-    std::fs::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../.."))
+    let manifest = std::env::var_os("CARGO_MANIFEST_DIR")
+        .expect("cargo or nextest supplies CARGO_MANIFEST_DIR");
+    std::fs::canonicalize(Path::new(&manifest).join("../../../.."))
         .expect("repository root from the crate manifest")
 }
 
@@ -253,10 +255,8 @@ fn write_file(path: &Path, contents: impl AsRef<[u8]>) {
 /// `app:other` is an unrelated cached task; `app:fail` always exits 3 and is never cached.
 fn write_workspace(root: &Path) {
     let repository = repository_root();
-    let plugin = std::fs::canonicalize(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../nx-plugin/loader.js"),
-    )
-    .expect("this repository's nx-plugin loader");
+    let plugin = std::fs::canonicalize(repository.join("packages/nx-plugin/loader.js"))
+        .expect("this repository's nx-plugin loader");
     std::os::unix::fs::symlink(repository.join("node_modules"), root.join("node_modules"))
         .expect("link the repository's node_modules");
     std::fs::create_dir(root.join("app")).expect("create the app project");
@@ -712,4 +712,86 @@ fn host_controller_bridge_publishes_and_reads_through_the_production_server() {
     println!("nx-publication-proof {proof}");
     // Closing the lease ends the server with success: no retry, no sleep, no poll.
     server.close();
+}
+
+const ROOT_PROBE: &str = "COWSHED_NX_PUBLICATION_ROOT_PROBE";
+
+/// The repository root is resolved from the manifest directory at runtime, never baked in at
+/// compile time: a child test process whose `CARGO_MANIFEST_DIR` names another fixture resolves
+/// that fixture. The child is given its environment on its own `Command`, so no test mutates the
+/// shared environment that parallel tests read.
+#[test]
+fn repository_root_resolves_the_manifest_at_runtime_not_at_compile_time() {
+    if std::env::var_os(ROOT_PROBE).is_some() {
+        println!("probe-root {}", repository_root().display());
+        return;
+    }
+    let fixture = Fixture::new();
+    let manifest = fixture.0.join("packages/cowshed/crates/cowshed-core");
+    std::fs::create_dir_all(&manifest).expect("fixture manifest directory");
+    let expected = std::fs::canonicalize(&fixture.0).expect("canonical fixture root");
+    let output = Command::new(std::env::current_exe().expect("this test binary"))
+        .args([
+            "--exact",
+            "repository_root_resolves_the_manifest_at_runtime_not_at_compile_time",
+            "--nocapture",
+        ])
+        .env("CARGO_MANIFEST_DIR", &manifest)
+        .env(ROOT_PROBE, "1")
+        .output()
+        .expect("run the root probe child");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{}", text(&output));
+    let resolved = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("probe-root "))
+        .unwrap_or_else(|| panic!("the probe reported no root: {stdout}"));
+    assert_eq!(resolved, expected.display().to_string());
+}
+
+fn read_manifest(path: &Path) -> Value {
+    let bytes =
+        std::fs::read(path).unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+    serde_json::from_slice(&bytes)
+        .unwrap_or_else(|error| panic!("parse {}: {error}", path.display()))
+}
+
+/// Each cowshed CLI build depends on the packaged server producer for its platform, and hashes that
+/// producer's output file as an input, so a server change rebuilds the CLI that ships it. All four
+/// platforms are checked; a single target is not enough.
+#[test]
+fn every_cli_target_depends_on_and_inputs_its_platforms_nx_cache_server() {
+    let root = repository_root();
+    let cowshed = read_manifest(&root.join("packages/cowshed/package.json"));
+    let server = read_manifest(&root.join("packages/nx-cache-server/package.json"));
+    let cli_targets = [
+        ("cli-arm64-macos", "bun-arm64-macos"),
+        ("cli-x64-macos", "bun-x64-macos"),
+        ("cli-arm64-linux", "bun-arm64-linux"),
+        ("cli-x64-linux", "bun-x64-linux"),
+    ];
+    for (cli, producer) in cli_targets {
+        let target = &cowshed["nx"]["targets"][cli];
+        assert!(target.is_object(), "{cli} is a cowshed target");
+        assert!(
+            server["nx"]["targets"][producer].is_object(),
+            "{producer} is a nx-cache-server target"
+        );
+        let depends = target["dependsOn"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{cli} declares dependsOn"));
+        assert!(
+            depends.contains(&json!({"projects": ["nx-cache-server"], "target": producer})),
+            "{cli} must depend on {producer}: {depends:?}"
+        );
+        let inputs = target["inputs"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{cli} declares inputs"));
+        assert!(
+            inputs.contains(
+                &json!({"dependentTasksOutputFiles": "**/nx-cache-server", "transitive": false})
+            ),
+            "{cli} must hash the packaged nx-cache-server output: {inputs:?}"
+        );
+    }
 }

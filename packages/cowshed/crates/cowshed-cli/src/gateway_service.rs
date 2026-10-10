@@ -1785,21 +1785,14 @@ pub async fn refresh_gateway_binary(
         Err(_) => None,
     };
     let mut executor = LaunchdExecutor::new(NativeFilesystem::new(), NativeLaunchctlCommand);
-    let refreshed = refresh_gateway_from(
+    refresh_gateway_from(
         home,
         &candidate,
         cfg!(debug_assertions),
         downgrade,
         daemon.as_ref(),
         &mut executor,
-    )?;
-    if !matches!(
-        refreshed,
-        Some(ServiceBinaryRefresh::Refused { .. } | ServiceBinaryRefresh::Downgrade { .. })
-    ) {
-        install_nx_cache_server(&mut executor, home, &candidate.source)?;
-    }
-    Ok(refreshed)
+    )
 }
 
 fn refresh_gateway_from<C: LaunchctlCommand>(
@@ -1831,9 +1824,6 @@ fn refresh_gateway_from<C: LaunchctlCommand>(
     let daemon_is_stale = daemon.is_some_and(|status| {
         status.executable_sha256.as_deref() != Some(candidate.digest.as_str())
     });
-    if !binary_is_stale && !daemon_is_stale && plan.is_noop() {
-        return Ok(None);
-    }
     // Refuse only a binary replacement: reconciling an agent definition, or restarting a daemon
     // onto the copy already installed, does not install this invocation's bytes. Preserve the
     // existing supervised binary when it already matches.
@@ -1852,6 +1842,13 @@ fn refresh_gateway_from<C: LaunchctlCommand>(
                 remedy: refusal.hint,
             }));
         }
+    }
+    // The packaged Nx cache server is part of this build's install. A current agent is still
+    // repaired, so this runs before the no-op return and before any activation: a missing
+    // companion fails here rather than after the host has changed.
+    install_nx_cache_server(executor, home, &candidate.source)?;
+    if !binary_is_stale && !daemon_is_stale && plan.is_noop() {
+        return Ok(None);
     }
     let plist = executor.execute_install(&plan).map_err(launchd_error)?;
     if binary_is_stale {
@@ -2232,6 +2229,12 @@ mod tests {
         fs::create_dir_all(&directory).expect("builds directory");
         let path = directory.join(name);
         fs::write(&path, bytes).expect("build");
+        // The packaged Nx cache server beside every build, as a release distribution ships it.
+        fs::write(
+            directory.join("nx-cache-server"),
+            b"the packaged nx cache server",
+        )
+        .expect("companion");
         Candidate::of(
             path,
             commit_time.map(|commit_time| BuildRecord {
@@ -2723,6 +2726,42 @@ mod tests {
         );
         assert_eq!(executable_digest(executable.path()).unwrap(), first.digest);
         assert_eq!(executable_digest(&launcher).unwrap(), first.digest);
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    /// A build with no packaged Nx cache server beside it cannot be installed: the refresh names the
+    /// missing companion and stops before any launchctl call or change to the stable name.
+    #[test]
+    fn a_refresh_without_the_packaged_companion_fails_before_activation() {
+        let (home, executable, _) = host_with_agent("missing-companion");
+        let candidate = build(
+            &home,
+            "no-companion",
+            b"a build with no server beside it",
+            None,
+        );
+        fs::remove_file(candidate.source.with_file_name("nx-cache-server")).unwrap();
+        let mut executor: RecordingExecutor = LaunchdExecutor::new(
+            NativeFilesystem::new(),
+            RecordingGatewayLaunchctl::default(),
+        );
+        let error = refresh_gateway_from(
+            &home,
+            &candidate,
+            false,
+            Downgrade::Refuse,
+            None,
+            &mut executor,
+        )
+        .expect_err("the companion is required");
+        assert!(
+            error.message.contains("nx-cache-server"),
+            "{}",
+            error.message
+        );
+        let (_, command) = executor.into_parts();
+        assert!(command.argv.is_empty(), "{:?}", command.argv);
+        assert!(!executable.path().exists(), "the stable name is untouched");
         fs::remove_dir_all(home).unwrap();
     }
 
