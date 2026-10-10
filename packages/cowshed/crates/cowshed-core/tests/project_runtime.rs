@@ -32,8 +32,8 @@ use cowshed_core::runtime::supervisor::{
     WorkspaceSupervisor, WorkspaceSupervisorConfig, WorkspaceSupervisorHandle,
 };
 use cowshed_core::runtime::{
-    JobAnswer, ProjectDescriptor, ProjectRuntime, ProjectRuntimeHost, RuntimeLogChunk,
-    WorkspaceSnapshot,
+    ClonePurpose, JobAnswer, ProjectDescriptor, ProjectRuntime, ProjectRuntimeHost,
+    RuntimeLogChunk, WorkspaceSnapshot,
 };
 use cowshed_core::sandbox::{SandboxConfig, SandboxGrants};
 #[cfg(target_os = "macos")]
@@ -689,7 +689,7 @@ impl ProjectRuntimeHost for FakeHost {
         &mut self,
         source: WorkspaceName,
         destination: WorkspaceName,
-        rename: bool,
+        purpose: ClonePurpose,
     ) -> Result<WorkspaceSnapshot> {
         self.workspace(&source)?;
         let snapshot = self
@@ -698,7 +698,7 @@ impl ProjectRuntimeHost for FakeHost {
                 cowshed_core::storage::recovery::MintOptions::default(),
             )
             .await?;
-        if rename {
+        if purpose == ClonePurpose::Rename {
             // The modeled source retires only once the modeled destination exists.
             self.state
                 .workspaces
@@ -715,7 +715,8 @@ impl ProjectRuntimeHost for FakeHost {
         destination: WorkspaceName,
     ) -> Result<WorkspaceSnapshot> {
         self.workspace(&source)?;
-        self.clone_for_rename(source, destination, true).await
+        self.clone_for_rename(source, destination, ClonePurpose::Rename)
+            .await
     }
 
     async fn move_checkout(&mut self, destination: PathBuf) -> Result<WorkspaceSnapshot> {

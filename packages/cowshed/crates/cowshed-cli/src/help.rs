@@ -443,4 +443,12 @@ mod tests {
         assert!(rest[1..].starts_with(command_map()));
         assert!(page.find("warm git workspaces").unwrap() < page.find("commands:").unwrap());
     }
+
+    #[test]
+    fn current_help_pages_do_not_name_the_deleted_clone_command() {
+        for command in ["defrag", "reseed"] {
+            let page = command_named(command).unwrap().page();
+            assert!(!page.contains("`new`"), "{command}: {page}");
+        }
+    }
 }

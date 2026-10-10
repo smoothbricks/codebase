@@ -898,7 +898,7 @@ where
     };
     // Observed only on a run that finished, like the mains: git identity at the mount root depends
     // on the host's git configuration and that root alone, so the host's repair is where to check
-    // it, not every `new`.
+    // it, not every `fork`.
     let identity = match &failure {
         Some(_) => None,
         None => Some(setup.git_identity().await?),

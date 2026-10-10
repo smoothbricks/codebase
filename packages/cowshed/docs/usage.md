@@ -366,7 +366,7 @@ images are unaffected.
 | Preserve Git work                | `cowshed push <workspace>`, `cowshed rebase <workspace>`, `cowshed land <workspace>` |
 | Remove a workspace               | `cowshed rm <workspace>`                                                             |
 | Preview / run reclamation        | `cowshed gc --dry-run`, `cowshed gc`                                                 |
-| Make `new` fast on an old main   | `cowshed defrag main` (idle checkout; `doctor` warns `main-extents` when it is due)  |
+| Make `fork` fast on an old main  | `cowshed defrag main` (idle checkout; `doctor` warns `main-extents` when it is due)  |
 | Diagnose host state              | `cowshed doctor`                                                                     |
 | Manage the gateway               | `cowshed gateway start`, `status`, `stop`                                            |
 

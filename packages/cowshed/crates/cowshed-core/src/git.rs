@@ -8,7 +8,7 @@ use std::process::Output;
 
 use tokio::process::Command;
 
-use crate::api::dto::GitOid;
+use crate::api::dto::{GitOid, Sha256Digest};
 use crate::error::{CowshedError, Result};
 use cowshed_os::fork_lock::{Run as _, RunAsync as _, Spawn as _};
 use cowshed_os::timing::timed_async;
@@ -17,6 +17,14 @@ use cowshed_os::timing::timed_async;
 pub struct RemoteUrl {
     pub name: String,
     pub url: PathBuf,
+}
+
+/// The working-state digest a rename compares before and after handing a linked worktree across.
+/// A value only: it carries no authority and grants nothing.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RenameWorkState {
+    pub status: [u8; 32],
+    pub index: Option<[u8; 32]>,
 }
 
 /// The name a workspace's upstream carries: the main workspace, so `main`.
@@ -559,6 +567,64 @@ impl GitRepository {
         parse_oid(value, "HEAD")
     }
 
+    /// Read-only digest of a workspace's working state for rename preservation: the exact
+    /// porcelain status bytes, and for a linked worktree the digest of its index file. It grants
+    /// nothing and copies nothing; callers compare it before and after a rename.
+    pub(crate) async fn rename_work_state(&self, linked: bool) -> Result<RenameWorkState> {
+        let status = self
+            .run([
+                "--no-optional-locks",
+                "status",
+                "--porcelain=v1",
+                "-z",
+                "--untracked-files=all",
+            ])
+            .await?;
+        if !status.status.success() {
+            return Err(git_internal("read rename work state", &status));
+        }
+        let status_digest = Sha256Digest::compute(&status.stdout);
+        let index = if linked {
+            let output = self
+                .run(["rev-parse", "--path-format=absolute", "--git-path", "index"])
+                .await?;
+            if !output.status.success() {
+                return Err(git_internal("resolve linked worktree index", &output));
+            }
+            let index_path = parse_one_path(&output.stdout, "linked worktree index")?;
+            let digest = tokio::task::spawn_blocking(move || -> Result<Sha256Digest> {
+                use sha2::{Digest as _, Sha256};
+                use std::io::Read as _;
+                let mut file = fs::File::open(&index_path).map_err(|error| {
+                    io_failure("open linked worktree index", &index_path, error)
+                })?;
+                let mut hasher = Sha256::new();
+                let mut buffer = [0_u8; 64 * 1024];
+                loop {
+                    let read = file.read(&mut buffer).map_err(|error| {
+                        io_failure("read linked worktree index", &index_path, error)
+                    })?;
+                    if read == 0 {
+                        break;
+                    }
+                    hasher.update(&buffer[..read]);
+                }
+                Ok(Sha256Digest::from_bytes(hasher.finalize().into()))
+            })
+            .await
+            .map_err(|error| {
+                CowshedError::internal(format!("hash linked worktree index: {error}"))
+            })??;
+            Some(digest)
+        } else {
+            None
+        };
+        Ok(RenameWorkState {
+            status: *status_digest.as_bytes(),
+            index: index.map(|digest| *digest.as_bytes()),
+        })
+    }
+
     pub async fn current_branch(&self) -> Result<Option<String>> {
         let output = self
             .run(["symbolic-ref", "--quiet", "--short", "HEAD"])
@@ -782,32 +848,19 @@ impl GitRepository {
         .map_err(|error| CowshedError::internal(format!("Git exclude task failed: {error}")))?
     }
 
-    /// The common Git directory exclude wiring writes to. A real `.git` directory is its own; a
-    /// `.git` pointer resolves through git, so an inherited source pointer answers with the
-    /// repository it belongs to. Links are never followed.
+    /// The Git directory exclude wiring writes to: only a real `.git` directory is authority. A
+    /// `.git` pointer, even a valid linked-worktree one, is never a source of exclude writes; the
+    /// caller must reach the repository's own root. Links are never followed.
     async fn trusted_git_directory(&self) -> Result<PathBuf> {
         let dot_git = self.root.join(".git");
         match inspect_path(&dot_git, "inspect Git metadata")? {
             Some(metadata) if metadata.file_type().is_dir() => Ok(dot_git),
-            Some(metadata) if metadata.file_type().is_file() => {
-                let output = self
-                    .run(["rev-parse", "--path-format=absolute", "--git-common-dir"])
-                    .await?;
-                if !output.status.success() {
-                    return Err(git_internal("resolve common Git directory", &output));
-                }
-                parse_one_path(&output.stdout, "common Git directory")
-            }
-            Some(_) => Err(CowshedError::integrity(
+            _ => Err(CowshedError::integrity(
                 format!(
-                    "Git metadata is neither a real directory nor a pointer: {}",
+                    "Git metadata path is not a real directory: {}",
                     dot_git.display()
                 ),
-                "restore the workspace Git metadata and retry",
-            )),
-            None => Err(CowshedError::integrity(
-                format!("Git metadata is missing: {}", dot_git.display()),
-                "restore the workspace Git metadata and retry",
+                "restore the standalone workspace Git metadata and retry",
             )),
         }
     }
@@ -2072,7 +2125,7 @@ impl GitRepository {
             .await?;
         let reset = self.run(["reset", "-q"]).await?;
         ensure_git_success("populate linked worktree index", reset)?;
-        self.ensure_cowshed_excludes().await?;
+        main.ensure_cowshed_excludes().await?;
         if clean {
             self.discard_uncommitted().await?;
         }
@@ -4083,6 +4136,38 @@ mod tests {
         assert_eq!(
             fs::read(&unrelated).expect("unrelated bytes"),
             b"preserve\n"
+        );
+    }
+
+    /// A registered linked worktree's `.git` is a pointer, not the repository's authority, so the
+    /// standalone exclude writer must refuse it even though git itself accepts the registration.
+    /// Main's exclude file has to read exactly as it did before the refusal.
+    #[tokio::test]
+    async fn cowshed_exclude_wiring_refuses_a_linked_pointer_root_and_leaves_main_untouched() {
+        let main = repository();
+        let scratch = main.parent().expect("scratch root").to_path_buf();
+        let pointer_root = scratch.join("raven");
+        copy_tree(&main, &pointer_root);
+        GitRepository::from_root(&pointer_root)
+            .adopt_as_linked_worktree("raven", &main, None)
+            .await
+            .expect("adopt raven as a linked worktree");
+        assert!(
+            pointer_root.join(".git").is_file(),
+            "fixture root must be a pointer"
+        );
+
+        let main_exclude = main.join(".git/info/exclude");
+        let before = fs::read(&main_exclude).expect("main exclude bytes");
+
+        let error = GitRepository::from_root(&pointer_root)
+            .ensure_cowshed_excludes()
+            .await
+            .expect_err("a pointer root is not the exclude authority");
+        assert_eq!(error.code.as_str(), "integrity");
+        assert_eq!(
+            fs::read(&main_exclude).expect("main exclude after refusal"),
+            before
         );
     }
 
