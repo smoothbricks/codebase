@@ -6,26 +6,6 @@ Span scope attributes allow setting attributes at the span level that automatica
 and are inherited by child spans. This eliminates repetitive attribute setting, ensures consistency, and provides
 zero-hot-path allocation.
 
-> **Implementation status** (system state). Realized across four sites, with these names:
->
-> - **Storage** — the buffer field is **`_scopeValues`** (underscore-prefixed per the SpanBuffer property convention),
->   defaulting to the shared frozen singleton **`EMPTY_SCOPE`** (`packages/lmao/src/lib/spanBuffer.ts`), not a
->   fresh-per-buffer `Object.freeze({})`. Child inheritance is by reference in the generated constructor
->   (`this._scopeValues = parent ? parent._scopeValues : EMPTY_SCOPE`).
-> - **Merge** — the immutable merge (`null` deletes, `undefined` ignored, new frozen object) is the generated
->   **`_setScope`** method (`packages/lmao/src/lib/codegen/spanLoggerGenerator.ts: generateSetScopeMethod`, region
->   `smoo/lmao!n/codegen-spanlogger.scope`).
-> - **Public API** — `ctx.setScope(attributes: ScopeUpdate<T> | null)` and the read-only `ctx.scope` getter are wired in
->   `packages/lmao/src/lib/spanContext.ts` (the destructured-context region `smoo/lmao!n/codegen-destructured-context`
->   for `setScope`, plus the `scope` getter). The parameter type is `ScopeUpdate<T>` (a per-field-nullable map), not
->   `Partial<SchemaValues<Schema> | null>`.
-> - **Arrow fill** — the cold-path NULL-cell fill is in `packages/lmao/src/lib/convertToArrow.ts` (`getStringScopeValue`
->   / `getNumberScopeValue` / `getBooleanScopeValue` + the per-column fill).
->
-> Behaviour is pinned by `packages/lmao/src/lib/__tests__/scope-attributes.test.ts`. The `scopeValues` /
-> `createSpanBuffer(capacity)` sketches below are illustrative of the contract; the realized names are `_scopeValues` +
-> `EMPTY_SCOPE`.
-
 **Key differences from direct writes**:
 
 - `tag.userId('123')` → writes to row 0 only (span-start)
@@ -104,19 +84,19 @@ this._scopeValues = parent ? parent._scopeValues : EMPTY_SCOPE;
 The existing scope object is never mutated.
 
 ```typescript
-function setScope(ctx: SpanContext, values: Record<string, unknown>): void {
-  const current = ctx.buffer.scopeValues;
+function _setScope(buffer: SpanBuffer, attributes: Record<string, unknown>): void {
+  const current = buffer._scopeValues;
   const next: Record<string, unknown> = { ...current };
 
-  for (const [key, value] of Object.entries(values)) {
+  for (const [key, value] of Object.entries(attributes)) {
     if (value === null) {
       delete next[key];
-    } else {
+    } else if (value !== undefined) {
       next[key] = value;
     }
   }
 
-  ctx.buffer.scopeValues = Object.freeze(next); // Replace with new frozen object
+  buffer._scopeValues = Object.freeze(next); // Replace with new frozen object
 }
 ```
 
@@ -138,7 +118,7 @@ ctx.setScope({ userId: null }); // scope = { orderId: 'x' } (new object, userId 
 ```typescript
 interface SpanContext<Schema> {
   // Set scope values (merge semantics, null to clear)
-  setScope(values: Partial<SchemaValues<Schema> | null>): void;
+  setScope(attributes: ScopeUpdate<Schema> | null): void;
 
   // Read-only view of current scope
   readonly scope: Readonly<SchemaValues<Schema>>;
@@ -158,7 +138,7 @@ interface SpanContext<Schema> {
 ### Usage Example
 
 ```typescript
-const handleRequest = op(async (ctx, req) => {
+const handleRequest = defineOp('handleRequest', async (ctx, req) => {
   // Set scoped attributes - these appear on ALL rows
   ctx.setScope({
     userId: req.user.id,
@@ -184,7 +164,7 @@ const handleRequest = op(async (ctx, req) => {
 ### setScope vs tag
 
 ```typescript
-const handleRequest = op(async (ctx, req) => {
+const handleRequest = defineOp('handleRequest', async (ctx, req) => {
   // SCOPE: Context for ALL rows - correlation, identification
   ctx.setScope({
     requestId: req.id, // Every row needs this for filtering
@@ -218,21 +198,21 @@ calls `setScope`, they get a NEW object - the shared reference is unaffected.
 **Example**:
 
 ```typescript
-const parentOp = op(async (ctx) => {
+const parentOp = defineOp('parentOp', async (ctx) => {
   ctx.setScope({ requestId: 'req-1', userId: 'u1' });
-  // ctx.scopeValues = Object A: { requestId: 'req-1', userId: 'u1' }
+  // buffer._scopeValues = Object A: { requestId: 'req-1', userId: 'u1' }
 
   await ctx.span('child-operation', async (childCtx) => {
-    // childCtx.scopeValues = Object A (same reference as parent)
+    // child buffer._scopeValues = Object A (same reference as parent)
 
     // Child adds more scope - creates NEW object
     childCtx.setScope({ orderId: 'ord-1' });
-    // childCtx.scopeValues = Object B: { requestId: 'req-1', userId: 'u1', orderId: 'ord-1' }
+    // child buffer._scopeValues = Object B: { requestId: 'req-1', userId: 'u1', orderId: 'ord-1' }
     // Parent still references Object A
 
     // Child overrides - creates another NEW object
     childCtx.setScope({ userId: 'u2' });
-    // childCtx.scopeValues = Object C: { requestId: 'req-1', userId: 'u2', orderId: 'ord-1' }
+    // child buffer._scopeValues = Object C: { requestId: 'req-1', userId: 'u2', orderId: 'ord-1' }
   });
 
   // Parent scope still references Object A: { requestId: 'req-1', userId: 'u1' }
@@ -249,7 +229,7 @@ This provides **snapshot semantics** that are critical for async code safety.
 Consider this async scenario with mutable scope (BAD):
 
 ```typescript
-// ❌ MUTABLE (hypothetical) - Race condition!
+// ❌ MUTABLE - Race condition!
 ctx.span('query', async (ctx) => {
   ctx.setScope({ status: 'pending' }); // Mutates shared object
 
@@ -270,17 +250,17 @@ With immutable scope (GOOD):
 // ✅ IMMUTABLE - Snapshot semantics, no race condition
 ctx.span('query', async (ctx) => {
   ctx.setScope({ status: 'pending' });
-  // ctx.scopeValues = Object A: { status: 'pending' }
+  // buffer._scopeValues = Object A: { status: 'pending' }
 
   const childPromise = ctx.span('validate', async (childCtx) => {
-    // childCtx.scopeValues = Object A (reference to parent's current object)
+    // child buffer._scopeValues = Object A (reference to parent's current object)
     await someAsyncWork();
     console.log(childCtx.scope.status); // Always 'pending' ✅
     // Child still references Object A, which is frozen/immutable
   });
 
   ctx.setScope({ status: 'completed' });
-  // ctx.scopeValues = Object B: { status: 'pending', status: 'completed' } (NEW object!)
+  // buffer._scopeValues = Object B: { status: 'pending', status: 'completed' } (NEW object!)
   // Object A still exists, child still references it
 
   await childPromise;
@@ -304,7 +284,7 @@ Scope provides default values for all rows, but **direct writes always win** on 
 - **Rows 2+ (log entries)**: `ctx.log.info().X()` wins over scope for that specific row
 
 ```typescript
-const processOrder = op(async (ctx, order) => {
+const processOrder = defineOp('processOrder', async (ctx, order) => {
   // Scope: default for all rows
   ctx.setScope({ status: 'processing', orderId: order.id });
 
@@ -388,14 +368,14 @@ Each `setScope` call creates a new immutable object. Since columns are filled at
 **latest** scope value (the final object at span completion):
 
 ```typescript
-const processOp = op(async (ctx) => {
+const processOp = defineOp('processOp', async (ctx) => {
   ctx.setScope({ phase: 'init' }); // Object A
   ctx.log.info('msg1');
   ctx.log.info('msg2');
   ctx.setScope({ phase: 'processing' }); // Object B (replaces A)
   ctx.log.info('msg3');
   return ctx.ok('done');
-  // At Arrow conversion, ctx.scopeValues = Object B
+  // At Arrow conversion, buffer._scopeValues = Object B
 });
 ```
 
@@ -423,7 +403,7 @@ change retain their snapshot of the parent's scope at creation time (see
 ### E-commerce Order Processing
 
 ```typescript
-const fulfillOrder = op(async (ctx, orderId: string) => {
+const fulfillOrder = defineOp('fulfillOrder', async (ctx, orderId: string) => {
   const order = await loadOrder(orderId);
 
   // SCOPE: Context for all rows - enables filtering by orderId across entire trace
@@ -462,7 +442,7 @@ const fulfillOrder = op(async (ctx, orderId: string) => {
 ### API Gateway / Request Handler
 
 ```typescript
-const handleRequest = op(async (ctx, req: Request) => {
+const handleRequest = defineOp('handleRequest', async (ctx, req: Request) => {
   // SCOPE: Request context flows through EVERYTHING
   ctx.setScope({
     requestId: req.headers['x-request-id'] ?? crypto.randomUUID(),
@@ -490,7 +470,7 @@ const handleRequest = op(async (ctx, req: Request) => {
 ### Payment Processing
 
 ```typescript
-const processPayment = op(async (ctx, paymentRequest: PaymentRequest) => {
+const processPayment = defineOp('processPayment', async (ctx, paymentRequest: PaymentRequest) => {
   // SCOPE: Non-sensitive context for correlation
   ctx.setScope({
     merchantId: paymentRequest.merchantId,
@@ -524,7 +504,7 @@ const processPayment = op(async (ctx, paymentRequest: PaymentRequest) => {
 ### Background Job Processing
 
 ```typescript
-const processJob = op(async (ctx, job: QueueJob) => {
+const processJob = defineOp('processJob', async (ctx, job: QueueJob) => {
   // SCOPE: Job context for all processing
   ctx.setScope({
     jobId: job.id,
@@ -573,7 +553,7 @@ const processJob = op(async (ctx, job: QueueJob) => {
 
 ```typescript
 // WITHOUT scope - O(m) per log operation, m allocations
-const withoutScope = op(async (ctx) => {
+const withoutScope = defineOp('withoutScope', async (ctx) => {
   ctx.tag.userId('user123').requestId('req456');
   ctx.log.info('Step 1');
   ctx.tag.userId('user123').requestId('req456');
@@ -584,7 +564,7 @@ const withoutScope = op(async (ctx) => {
 });
 
 // WITH scope - O(1) per log operation, 1 small object allocation
-const withScope = op(async (ctx) => {
+const withScope = defineOp('withScope', async (ctx) => {
   ctx.setScope({ userId: 'user123', requestId: 'req456' }); // One small object
   ctx.log.info('Step 1'); // No scope overhead
   ctx.log.info('Step 2'); // No scope overhead

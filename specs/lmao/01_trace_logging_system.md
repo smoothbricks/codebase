@@ -5,26 +5,26 @@
 **Observation**: Most logging systems are either too slow (string concatenation at runtime) or too hard to query
 (unstructured). We need something that's blazing fast at runtime but produces rich, queryable data.
 
-## Performance Contract and Status <a id="smoo/lmao!n/lmao-trace-performance-contract"></a>
+## Performance Contract <a id="smoo/lmao!n/lmao-trace-performance-contract"></a>
 
 Performance claims are phase-specific. “Zero” never means that an entire request, trace, or Arrow flush performs no
 work, allocation, or copy.
 
-| Phase                        | Shipped behavior                                                                                                | Enforceable target                                                                                                                                                                               |
+| Phase                        | What happens                                                                                                    | Contract                                                                                                                                                                                         |
 | ---------------------------- | --------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | Startup / vocabulary binding | Generated classes, schemas, dictionaries, and accessors are created before steady-state writes.                 | Charge `PhysicalLayoutPlan` construction and versioned `VocabularyBinding` registration here; report time, allocations, code size, and shared memory separately.                                 |
-| Span setup                   | A SpanBuffer, views, identity bytes, tree links, and some string arrays are created.                            | Bounded setup allocations with stable generated shapes; setup is never described as allocation-free.                                                                                             |
+| Span setup                   | A SpanBuffer, views, identity bytes, and tree links are created.                                                | Bounded setup allocations with stable generated shapes; setup is never described as allocation-free.                                                                                             |
 | Warmed entry write           | Fixed stores append timestamps, entry types, and already-selected fields. Dynamic strings remain JS references. | Zero **new heap allocations for the warmed fixed-capacity case**, fixed monomorphic stores, stable hidden classes/ICs, and one predictable capacity branch. First-use lazy columns are excluded. |
 | Overflow / other slow paths  | A continuation or lazy column may allocate; WASM may bump-allocate or grow.                                     | Explicit, bounded, observable slow path, measured separately from warmed writes.                                                                                                                 |
-| Per-request Arrow flush      | Tree walking, dictionaries/UTF-8, null handling, wrappers, and sometimes concatenation allocate or copy.        | Few/no avoidable allocations, maximal Arrow-native reuse, and an explicit `ArrowLease` for borrowed-buffer lifetime.                                                                             |
+| Per-request Arrow flush      | Tree walking, dictionaries/UTF-8, null handling, and wrappers.                                                  | Few/no avoidable allocations, maximal Arrow-native reuse, and an explicit `ArrowLease` for borrowed-buffer lifetime.                                                                             |
 
 **Effective memory** is the maximum request-attributable live set: JavaScript heap and backing stores, external
 `ArrayBuffer`/TypedArray bytes, committed WASM pages (including free/stranded space), Arrow-owned output, borrowed
 buffers pinned by an `ArrowLease`, temporary dictionaries/UTF-8/null bitmaps, caches, and allocator/GC metadata. Shared
 startup state MAY be amortized only when its raw size and divisor are emitted.
 
-The shipped implementation separates hot writes from cold conversion and generates fixed-shape buffers. The target
-contract above is accepted only when the repository-standard Mitata scenarios follow
+The implementation separates hot writes from cold conversion and generates fixed-shape buffers. An implementation meets
+the contract above only when the repository-standard Mitata scenarios follow
 [01b1 §Required Mitata Protocol](./01b1_buffer_performance_optimizations.md#smoo/lmao!n/buffer-perf-benchmark-protocol):
 plugin-off, plugin-on/current, and candidates use identical semantic checksums, position-balanced ordering, and
 machine-readable raw samples. Report p50/p95/p99/p99.9 for every phase. Allocation, GC, IC/hidden-class, and branch

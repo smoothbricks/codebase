@@ -2,25 +2,22 @@
 
 ## Overview
 
-The module context system provides the foundation for creating ops with generated TagAPI and SpanLogger classes. It
+The op context system provides the foundation for creating ops with generated TagWriter and SpanLogger classes. It
 handles:
 
-1. **ModuleContext** - module-level configuration shared across all ops
-2. **SpanBuffer** - per-span buffer with span name, line number, and module reference
+1. **OpMetadata** - per-op configuration and source attribution, one per `defineOp`
+2. **SpanBuffer** - per-span buffer with span name, line number, and op metadata reference
 3. **Op class generation** for traced operations with proper type parameters
-4. **TagAPI class generation** with typed attribute methods (for `tag`)
+4. **TagWriter class generation** with typed attribute methods (for `tag`)
 5. **SpanLogger class generation** with log methods (for `log`)
 6. **Schema compilation** for both standard and library modules
-7. **User-extensible context** via `.ctx<Extra>()` for custom properties
+7. **User-extensible context** via the `ctx` field of `defineOpContext()` for custom properties
 
-This system performs code generation at build/startup time; the target makes warmed, in-capacity entry writes
-allocation-free.
+This system performs code generation at build/startup time; warmed, in-capacity entry writes are allocation-free.
 
-## Physicalization and Cache Lifecycle (Target, Not Yet Shipped)
+## Physicalization and Cache Lifecycle
 
-The shipped system generates Op-local `SpanBuffer`/writer classes and remapped library views as described in the
-implementation-status notes below. The clean-cutover target moves all schema- and backend-dependent decisions to
-startup. It does not claim that the current structures already have this shape.
+All schema- and backend-dependent decisions move to startup.
 
 Startup canonicalizes the schema and creates one immutable `PhysicalLayoutPlan` containing concrete columns, offsets,
 widths, null bitmaps, eager/lazy decisions, static message-index lanes, dynamic reference lanes, and backend factories.
@@ -37,7 +34,7 @@ helper and must not pollute the in-capacity path with changing shapes.
 
 Allocation claims are phase-specific:
 
-| Phase                  | Target contract                                                                                                   |
+| Phase                  | Contract                                                                                                          |
 | ---------------------- | ----------------------------------------------------------------------------------------------------------------- |
 | **Startup**            | May allocate heavily to canonicalize schemas, register vocabulary, build plans/classes, and reserve arenas.       |
 | **Span setup**         | Minimize and amortize allocations; do not describe it as the warmed entry path.                                   |
@@ -50,12 +47,10 @@ storage. The lease pins the buffer arena and exact immutable vocabulary dictiona
 releases it; it never pins a module's caller-owned fragment arrays. This permits near-zero-allocation
 request→trace→Arrow conversion without recycling memory still observed by a consumer.
 
-The shipped scheduler currently may coalesce roots, so its flush unit is not necessarily one request. It also does not
-yet provide the target async Arrow/WASM lease pinning, and the current WASM backend recreates JavaScript views after
-linear-memory growth. These are measured shipped costs; they MUST NOT be described as properties of the target
-per-request `ArrowLease` lifecycle.
+The flush unit is one request. After linear-memory growth, WASM views are re-derived. Growth while a lease pins the
+previous WASM memory epoch fails with an explicit error; it never invalidates pinned views silently.
 
-## Compiler-Emitted Vocabulary Registration (Target ABI)
+## Compiler-Emitted Vocabulary Registration
 
 Compiled application modules and precompiled JS libraries self-register their own vocabulary fragment inputs. The
 application bootstrap MUST import and evaluate the LMAO runtime installer before evaluating any registering module. The
@@ -142,30 +137,22 @@ evaluation is idempotent for the same schema version, algorithm, content hash, a
 incompatible input fails during startup rather than falling back to hot-path string lookup. Detailed transformer
 emission is specified elsewhere.
 
-Target template placeholders use `{field}`; `{{` and `}}` encode literal braces. This replaces the shipped `{{field}}`
-grammar. `info`/`warn`/`error` callsites bind literal templates and object-literal fields; `debug`/`trace` may bind a
-literal template or use an existing raw dynamic string reference, but avoidable interpolation remains invalid. Callsite
-classes are static, structured, or dynamic. A physical layout may be mixed when it carries both static-index and
+Template placeholders use `{field}`; `{{` and `}}` encode literal braces. `{{field}}` is not accepted as an alias.
+`info`/`warn`/`error` callsites bind literal templates and object-literal fields; `debug`/`trace` may bind a literal
+template or use an existing raw dynamic string reference, but avoidable interpolation remains invalid. Callsite classes
+are static, structured, or dynamic. A physical layout may be mixed when it carries both static-index and
 dynamic-reference lanes.
 
 ## Context Hierarchy <a id="smoo/lmao!n/opcontext-hierarchy"></a>
 
-> **Implementation status**: The three-level hierarchy is realized, but renamed. The per-module `ModuleContext` is
-> **`OpMetadata`** (`packages/lmao/src/lib/op.ts`): `package_name`/`package_file`/`git_sha` + pre-encoded `*_entry`
-> (`PreEncodedEntry`) fields, carried per-Op. `SpanBuffer` is `packages/lmao/src/lib/spanBuffer.ts`. `SpanContext` is
-> the `SpanContextImpl`/`SpanContextInstance` in `packages/lmao/src/lib/spanContext.ts`. The dual source-attribution
-> refs (callsiteModule for row 0, module for rows 1+) are the
-> `callee_package`/`callee_file`/`callee_line`/`callee_git_sha` getters on `SpanContextImpl`. `lineNumber` is written
-> straight to the `line_values` TypedArray, never held as a property.
-
 ```
-ModuleContext (class) - ONE per module definition
-├── packageName: string
-├── packagePath: string
-├── gitSha: string
-├── packageEntry: PreEncodedEntry (UTF-8 cached)
-├── packagePathEntry: PreEncodedEntry (UTF-8 cached)
-├── gitShaEntry: PreEncodedEntry (UTF-8 cached)
+OpMetadata (class) - ONE per defineOp
+├── package_name: string
+├── package_file: string
+├── git_sha: string
+├── package_name_entry: PreEncodedEntry (UTF-8 cached)
+├── package_file_entry: PreEncodedEntry (UTF-8 cached)
+├── git_sha_entry: PreEncodedEntry (UTF-8 cached)
 ├── logSchema (tag attribute definitions)
 ├── sb_capacity: number (buffer capacity)
 ├── sb_totalWrites: number (total writes across all buffers)
@@ -173,10 +160,10 @@ ModuleContext (class) - ONE per module definition
 └── sb_totalCreated: number (total buffers created)
 
 SpanBuffer - ONE per span (internal interface)
-├── _callsiteModule?: ModuleContext ← caller's module (where span() was invoked) - for row 0 metadata
-├── _module: ModuleContext          ← op's module (what code is executing) - for rows 1+ metadata
+├── _callsiteModule?: OpMetadata ← caller's metadata (where span() was invoked) - for row 0 metadata
+├── _opMetadata: OpMetadata         ← op's metadata (what code is executing) - for rows 1+ metadata
 ├── message_values[0]: string       ← span name written by writeSpanStart()
-├── lineNumber_values: Int32Array  ← line numbers per row (written directly, NOT stored as property)
+├── line_values: Float64Array       ← line numbers per row (written directly, NOT stored as property)
 ├── _parent?: SpanBuffer            ← reference to parent (child spans walk this for trace_id)
 ├── _children: SpanBuffer[]         ← child spans
 ├── trace_id (getter)               ← root stores it, children walk parent chain
@@ -185,7 +172,7 @@ SpanBuffer - ONE per span (internal interface)
 SpanContext (interface) - user-facing, what ops receive
 ├── tag: TagWriter<T>
 ├── log: SpanLogger<T>
-├── scope()
+├── setScope()
 ├── ok() / err()
 ├── span()
 ├── buffer (getter)
@@ -198,9 +185,9 @@ SpanContext (interface) - user-facing, what ops receive
 Each SpanBuffer has TWO module references for different purposes:
 
 - **`callsiteModule`**: The caller's module - where `span()` was invoked. Used for **row 0 (span-start)** metadata
-  (`gitSha`, `packageName`, `packagePath`).
+  (`git_sha`, `package_name`, `package_file`).
 - **`module`**: The Op's module - what code is executing. Used for **rows 1+ (span-ok/err/exception, logs)** metadata
-  (`gitSha`, `packageName`, `packagePath`).
+  (`git_sha`, `package_name`, `package_file`).
 
 This enables accurate source attribution: the span-start entry records WHERE the span was invoked from (callsite), while
 subsequent entries record WHERE the code is actually executing (the Op's module).
@@ -215,14 +202,14 @@ await span(42, 'fetch-user', userLib.fetchUser, userId);
 //         ^^ lineNumber argument
 
 // Inside span():
-buffer.lineNumber_values[0] = 42; // Direct TypedArray write for row 0, that's it
+buffer.line_values[0] = 42; // Direct TypedArray write for row 0, that's it
 
 // For logs:
-log.info('Processing').line(55); // .line(N) writes to lineNumber_values[writeIndex]
+log.info('Processing').line(55); // .line(N) writes to line_values[writeIndex]
 ```
 
-The lineNumber is passed as an argument and written directly to `lineNumber_values` TypedArray at the appropriate row
-index. There is NO intermediate storage of lineNumber on any context object.
+The lineNumber is passed as an argument and written directly to `line_values` TypedArray at the appropriate row index.
+There is NO intermediate storage of lineNumber on any context object.
 
 ## Design Rationale: From ctx to Destructured SpanContext
 
@@ -232,7 +219,7 @@ An alternative approach would pass a monolithic `ctx` object:
 
 ```typescript
 // Alternative approach (rejected): ctx drilling everywhere
-const createUser = op(async (ctx, userData) => {
+const createUser = defineOp('createUser', async (ctx, userData) => {
   ctx.tag.userId(userData.id);
   ctx.log.info('Creating user');
   await ctx.span('validate', validateUser, userData); // Pass ctx to everything
@@ -245,7 +232,7 @@ The chosen design uses ops with destructuring:
 
 ```typescript
 // Destructure what you need
-const createUser = op(async ({ span, log, tag }, userData: UserData) => {
+const createUser = defineOp('createUser', async ({ span, log, tag }, userData: UserData) => {
   tag.userId(userData.id);
   log.info('Creating user');
   await span('validate', validateUser, userData); // span() handles context
@@ -258,74 +245,57 @@ const createUser = op(async ({ span, log, tag }, userData: UserData) => {
 - **Span name at call site**: `span('validate', ...)` - caller names it
 - **Clean signatures**: `({ span, log, tag }, userData)` instead of `(ctx, userData)`
 - **Deps destructuring**: `const { retry, auth } = deps`
-- **User-extensible**: Add `env` or other properties via `.ctx<Extra>()`
+- **User-extensible**: Add `env` or other properties via the `ctx` config field
 
-## Module Definition with defineModule() <a id="smoo/lmao!n/opcontext-definition"></a>
-
-> **Implementation status**: The shipped entry point is **`defineOpContext({ logSchema, deps, flags, ctx })` →
-> `{ defineOp, defineOps }`** (`packages/lmao/src/lib/defineOpContext.ts`, assembled by `buildOpContextFactory`), NOT
-> `defineModule(...).ctx<Extra>().make()`. Key renames: `defineModule`→`defineOpContext`; the `op()` factory
-> →`defineOp(name, fn)`; user context is the **`ctx` config field** (a runtime object of defaults/required values,
-> validated against reserved keys) instead of a type-only `.ctx<Extra>()` method; `metadata.gitSha` etc. become
-> `OpMetadata` (see Context Hierarchy). `deps` carry their own prefix via `xOps.prefix('x')`. The full rename of
-> 01a/01g/01j to this surface is staged as `smoo/lmao!n/spec-reconcile-define-op-context`.
+## Module Definition with defineOpContext() <a id="smoo/lmao!n/opcontext-definition"></a>
 
 **Purpose**: Set up module-level configuration shared across all ops in the module.
 
 ```typescript
-// Define module with logSchema, dependencies, feature flags, and user context
-const userModule = defineModule({
-  metadata: {
-    packageName: '@my-company/user-service',
-    packagePath: 'src/user.ts',
-  },
+// Define op context with logSchema, dependencies, feature flags, and user context
+const { defineOp, defineOps } = defineOpContext({
   logSchema: {
     userId: S.category(),
     operation: S.enum(['CREATE', 'UPDATE', 'DELETE']),
   },
   deps: {
-    db: dbLib,
-    cache: cacheLib,
+    db: dbOps.prefix('db'),
+    cache: cacheOps.prefix('cache'),
   },
-  ff: {
+  flags: {
     advancedValidation: ff.boolean(),
   },
-}).ctx<{ env: { dbTimeout: number } }>();
-
-// Destructure op factory
-const { op } = userModule;
+  ctx: {
+    env: null as { dbTimeout: number }, // Must provide at createTrace()
+  },
+});
 ```
 
-**Key Design: `.ctx<Extra>()`**
+**Key Design: the `ctx` config field**
 
-The `.ctx<Extra>()` method specifies user-extensible context properties beyond the built-in `span`, `log`, `tag`,
-`deps`, and `ff`. These properties are spread into SpanContext and can be destructured by ops.
+The `ctx` field specifies user-extensible context properties beyond the built-in `span`, `log`, `tag`, `deps`, and `ff`.
+It holds runtime defaults and required values, validated against reserved keys. These properties are spread into
+SpanContext and can be destructured by ops.
 
 ### Internal Implementation
 
 ```typescript
-interface ModuleMetadata {
-  packageName: string;
-  packagePath: string;
-  gitSha?: string; // Optional - injected by transformer at build time
-}
-
-class ModuleContext {
-  // Metadata (strings)
-  packageName: string;
-  packagePath: string;
-  gitSha: string;
+class OpMetadata {
+  // Source attribution (strings), one per defineOp
+  package_name: string;
+  package_file: string;
+  git_sha: string;
 
   // Pre-encoded UTF-8 for zero-copy writes
-  packageEntry: PreEncodedEntry;
-  packagePathEntry: PreEncodedEntry;
-  gitShaEntry: PreEncodedEntry;
+  package_name_entry: PreEncodedEntry;
+  package_file_entry: PreEncodedEntry;
+  git_sha_entry: PreEncodedEntry;
 
   // Log schema definition
   logSchema: LogSchema;
 
   // Generated classes
-  TagAPI: TagAPIClass;
+  TagWriter: TagWriterClass;
   SpanLogger: SpanLoggerClass;
 
   // Self-tuning buffer stats (flat properties, not nested object)
@@ -335,79 +305,42 @@ class ModuleContext {
   sb_totalCreated: number = 0;
 }
 
-function defineModule<Schema, Deps, FF>(config: { metadata: ModuleMetadata; logSchema: Schema; deps?: Deps; ff?: FF }) {
-  // Compile logSchema to generate TagAPI and SpanLogger classes
+function defineOpContext<Schema, Deps, FF, Ctx>(config: { logSchema: Schema; deps?: Deps; flags?: FF; ctx?: Ctx }) {
+  // Compile logSchema to generate TagWriter and SpanLogger classes
   const compiledTagOps = compileTagOperations(config.logSchema);
 
-  // Create module context
-  const moduleContext = new ModuleContext();
-  moduleContext.packageName = config.metadata.packageName;
-  moduleContext.packagePath = config.metadata.packagePath;
-  moduleContext.gitSha = config.metadata.gitSha || '';
-  moduleContext.logSchema = config.logSchema;
-  moduleContext.TagAPI = compiledTagOps.TagAPI;
-  moduleContext.SpanLogger = compiledTagOps.SpanLogger;
-
-  // Pre-encode metadata for zero-copy writes
-  const encoder = new TextEncoder();
-  moduleContext.packageEntry = { utf8: encoder.encode(config.metadata.packageName) };
-  moduleContext.packagePathEntry = { utf8: encoder.encode(config.metadata.packagePath) };
-  moduleContext.gitShaEntry = { utf8: encoder.encode(config.metadata.gitSha || '') };
-
   return {
-    metadata: config.metadata,
-    logSchema: config.logSchema,
     deps: config.deps || {},
-    ff: config.ff || {},
+    flags: config.flags || {},
+    ctx: config.ctx || {},
 
-    // Add user-extensible context properties
-    ctx<Extra>() {
-      return {
-        // Op factory - creates Op instances with full context type
-        op: <Args extends unknown[], Result>(
-          fn: (ctx: SpanContext<Schema, Deps, FF, Extra>, ...args: Args) => Promise<Result>
-        ): Op<SpanContext<Schema, Deps, FF, Extra>, Args, Result> => new Op(moduleContext, fn),
-
-        // Fluent API for composition
-        prefix<P extends string>(p: P) {
-          return createPrefixedModule(this, p);
-        },
-
-        use(wiredDeps: WiredDeps) {
-          return createRootContext(this, wiredDeps);
-        },
-      };
-    },
+    // Op factory - creates Op instances with full context type
+    defineOp: <Args extends unknown[], Result>(
+      name: string,
+      fn: (ctx: SpanContext<Schema, Deps, FF, Ctx>, ...args: Args) => Promise<Result>
+    ): Op<SpanContext<Schema, Deps, FF, Ctx>, Args, Result> => new Op(name, compiledTagOps, fn),
   };
 }
 ```
 
 ## Op Class Generation <a id="smoo/lmao!n/op-class"></a>
 
-> **Implementation status**: The `Op` class is `packages/lmao/src/lib/op.ts` (carries `OpMetadata`, the
-> `SpanBufferClass`, the user `fn`, and an optional `remappedViewClass` for prefixed ops). The `_invoke` flow sketched
-> below is split across `Tracer` (root spans) and `SpanContextImpl._spanPre` + the monomorphic `span0`–`span8` dispatch
-> (`packages/lmao/src/lib/spanContext.ts`): buffer creation, parent/child registration, `writeSpanStart` (row 0),
-> execute under try/catch, `writeSpanEnd(buffer, ENTRY_TYPE_SPAN_OK/ERR)` (ok) and `SpanContextImpl._spanException`
-> (throw) (row 1). The op factory is `defineOp` (`packages/lmao/src/lib/opContext/defineOp.ts`), not `op()`.
-
-The `op()` factory creates Op instances that wrap user functions. Type parameters are ordered to match the function
-signature `(ctx, ...args) => Promise<Result>`:
+The `defineOp()` factory creates Op instances that wrap user functions. Type parameters are ordered to match the
+function signature `(ctx, ...args) => Promise<Result>`:
 
 ```typescript
 class Op<Ctx, Args extends unknown[], Result> {
   constructor(
     readonly name: string, // For Op metrics (invocations, errors, duration)
-    private module: ModuleContext, // For gitSha/packageName/packagePath attribution
+    private module: OpMetadata, // For git_sha/package_name/package_file attribution
     private fn: (ctx: Ctx, ...args: Args) => Promise<Result>
   ) {}
 
   /**
    * Internal invocation - called by span() or Tracer.trace()
    *
-   * NOTE: This is pseudo-code for illustration. The actual implementation is in:
-   * - Root spans: Tracer._createRootContext() and _executeWithContext() (tracer.ts)
-   * - Child spans: SpanContext._spanPre() and span0-span8 methods (spanContext.ts)
+   * Root spans: Tracer._createRootContext() and _executeResultWithContext() (tracer.ts)
+   * Child spans: SpanContext._spanPre() and span0-span8 methods (spanContext.ts)
    *
    * @param parentBuffer - Parent span's buffer (null for root - Tracer handles root)
    * @param callsiteModule - The CALLER's module (where span() was invoked)
@@ -417,14 +350,14 @@ class Op<Ctx, Args extends unknown[], Result> {
    */
   async _invoke(
     parentBuffer: SpanBuffer | null,
-    callsiteModule: ModuleContext,
+    callsiteModule: OpMetadata,
     spanName: string,
     lineNumber: number,
     args: Args
   ): Promise<Result> {
     // 1. Create SpanBuffer with callsiteModule reference
-    //    - callsiteModule: where span() was called (for row 0's gitSha/packageName/packagePath)
-    //    - this.module: the Op's module (for rows 1+ gitSha/packageName/packagePath)
+    //    - callsiteModule: where span() was called (for row 0's git_sha/package_name/package_file)
+    //    - this.module: the Op's module (for rows 1+ git_sha/package_name/package_file)
     //    - For root spans, Tracer creates TraceRoot FIRST with trace_id, anchors, tracer reference
     const buffer = parentBuffer
       ? createChildSpanBuffer(parentBuffer, callsiteModule, this.module, spanName)
@@ -444,9 +377,9 @@ class Op<Ctx, Args extends unknown[], Result> {
     }
 
     // 3. Write span-start (row 0)
-    //    - Uses callsiteModule for gitSha/packageName/packagePath
-    //    - lineNumber written DIRECTLY to lineNumber_values[0] (NO intermediate object storage)
-    buffer.lineNumber_values[0] = lineNumber; // Direct TypedArray write
+    //    - Uses callsiteModule for git_sha/package_name/package_file
+    //    - lineNumber written DIRECTLY to line_values[0] (NO intermediate object storage)
+    buffer.line_values[0] = lineNumber; // Direct TypedArray write
     buffer.writeSpanStart(); // Writes timestamp, operation, uses callsiteModule for metadata
 
     // 4. Create SpanContext (satisfies Ctx constraint)
@@ -456,7 +389,7 @@ class Op<Ctx, Args extends unknown[], Result> {
       span: (childLineNumber, name, childOp, ...childArgs) =>
         childOp._invoke(buffer, this.module, name, childLineNumber, childArgs),
       log: new this.module.SpanLogger(buffer),
-      tag: new this.module.TagAPI(buffer),
+      tag: new this.module.TagWriter(buffer),
       deps: this.module.boundDeps,
       ff: flagEvaluator?.forContext(opCtx) ?? {},
       ok: (value) => ({ success: true, value }),
@@ -471,7 +404,7 @@ class Op<Ctx, Args extends unknown[], Result> {
     } as Ctx;
 
     // 5. Execute with try/catch
-    //    Rows 1+ use this.module for gitSha/packageName/packagePath
+    //    Rows 1+ use this.module for git_sha/package_name/package_file
     try {
       const result = await this.fn(opCtx, ...args);
       buffer.writeSpanOk(); // Row 1 - uses module metadata
@@ -484,27 +417,19 @@ class Op<Ctx, Args extends unknown[], Result> {
 }
 ```
 
-## TagAPI Class Generation <a id="smoo/lmao!n/codegen-architecture"></a>
+## TagWriter Class Generation <a id="smoo/lmao!n/codegen-architecture"></a>
 
-> **Implementation status**: The "TagAPI" is the shipped **`TagWriter`**, generated by
-> `generateFixedPositionWriterClass` (position 0) in `packages/lmao/src/lib/codegen/fixedPositionWriterGenerator.ts` —
-> the same generator anchored from [01g](./01g_trace_context_api_codegen.md#smoo/lmao!n/codegen-architecture). It emits
-> the object `with({...})` body and per-field setters with compile-time enum→index mapping. The **Library (Prefixed)
-> Compilation** path below is the RemappedBufferView / RemappedSpanLogger codegen in `packages/lmao/src/lib/library.ts`
-> (`createPrefixMapping`, `generateRemappedSpanLoggerClass`, `generateRemappedBufferViewClass`) — see
-> `smoo/lmao!n/codegen-prefixed-remap`.
-
-The TagAPI class provides typed attribute methods for `tag`:
+The TagWriter class provides typed attribute methods for `tag`:
 
 ### Standard Compilation
 
 ```typescript
 function compileTagOperations(logSchema: LogSchema) {
   const attributeNames = Object.keys(logSchema);
-  const TagAPI = generateTagAPIClass(attributeNames, attributeNames, logSchema);
-  const SpanLogger = generateSpanLoggerClass(attributeNames, logSchema);
+  const TagWriter = generateFixedPositionWriterClass(attributeNames, attributeNames, logSchema);
+  const SpanLogger = createSpanLoggerClass(attributeNames, logSchema);
 
-  return { logSchema, TagAPI, SpanLogger };
+  return { logSchema, TagWriter, SpanLogger };
 }
 ```
 
@@ -514,23 +439,23 @@ function compileTagOperations(logSchema: LogSchema) {
 function compilePrefixedTagOperations(cleanSchema: LogSchema, prefix: string) {
   const cleanNames = Object.keys(cleanSchema);
   const prefixedNames = cleanNames.map((name) => `${prefix}_${name}`);
-  const prefixedSchema = createPrefixedSchema(cleanSchema, prefix);
+  const prefixedSchema = prefixSchema(cleanSchema, prefix);
 
-  const LibraryTagAPI = generateTagAPIClass(cleanNames, prefixedNames, prefixedSchema);
-  const LibrarySpanLogger = generateSpanLoggerClass(cleanNames, prefixedSchema);
+  const LibraryTagWriter = generateFixedPositionWriterClass(cleanNames, prefixedNames, prefixedSchema);
+  const LibrarySpanLogger = createSpanLoggerClass(cleanNames, prefixedSchema);
 
   return {
     logSchema: prefixedSchema,
-    TagAPI: LibraryTagAPI,
+    TagWriter: LibraryTagWriter,
     SpanLogger: LibrarySpanLogger,
   };
 }
 ```
 
-### TagAPI Generation Logic
+### TagWriter Generation Logic
 
 ```typescript
-function generateTagAPIClass(methodNames: string[], columnNames: string[], schema: LogSchema) {
+function generateFixedPositionWriterClass(methodNames: string[], columnNames: string[], schema: LogSchema) {
   // Generate individual attribute methods
   const attributeMethods = methodNames
     .map(
@@ -555,9 +480,9 @@ function generateTagAPIClass(methodNames: string[], columnNames: string[], schem
     .join('\n');
 
   return new Function(
-    'BaseTagAPI',
+    'BaseTagWriter',
     `
-    return class extends BaseTagAPI {
+    return class extends BaseTagWriter {
       // Object-based API: tag({ status: 200, method: 'GET' })
       call(attributes) {
         ${callableBody}
@@ -567,18 +492,18 @@ function generateTagAPIClass(methodNames: string[], columnNames: string[], schem
       ${attributeMethods}
     }
   `
-  )(BaseTagAPI);
+  )(BaseTagWriter);
 }
 ```
 
 ## Generated Code Examples
 
-### Standard Module TagAPI
+### Standard Module TagWriter
 
 ```typescript
 // Input: { userId: S.category(), operation: S.enum(['INSERT', 'UPDATE', 'DELETE']) }
-// Generated TagAPI:
-class StandardTagAPI extends BaseTagAPI {
+// Generated TagWriter:
+class StandardTagWriter extends BaseTagWriter {
   // Object API: tag({ userId: "123", operation: "INSERT" })
   call(attributes) {
     if (attributes.userId !== undefined) {
@@ -603,12 +528,12 @@ class StandardTagAPI extends BaseTagAPI {
 }
 ```
 
-### Library Module TagAPI (with prefix 'http')
+### Library Module TagWriter (with prefix 'http')
 
 ```typescript
 // Input: { status: S.number(), method: S.category() }, prefix: 'http'
-// Generated TagAPI:
-class LibraryTagAPI extends BaseTagAPI {
+// Generated TagWriter:
+class LibraryTagWriter extends BaseTagWriter {
   call(attributes) {
     if (attributes.status !== undefined) {
       this.buffer.writeHttpStatus(attributes.status); // Clean → prefixed
@@ -633,17 +558,10 @@ class LibraryTagAPI extends BaseTagAPI {
 
 ## SpanLogger Class Generation <a id="smoo/lmao!n/codegen-spanlogger"></a>
 
-> **Implementation status**: Realized by `buildSpanLoggerExtension` / `createSpanLoggerClass` in
-> `packages/lmao/src/lib/codegen/spanLoggerGenerator.ts` (extends arrow-builder's `ColumnWriter`) — the same node
-> anchored from [01g](./01g_trace_context_api_codegen.md#smoo/lmao!n/codegen-spanlogger.scope). The generated class adds
-> info/debug/warn/error/trace + `with` + the internal ffAccess/ffUsage, uint64_value, and immutable `_setScope`. The
-> `scope(attributes)` method drawn below maps to `_setScope`, which builds a new frozen object rather than pre-filling
-> the buffer.
-
 The SpanLogger handles log methods (info/debug/warn/error):
 
 ```typescript
-function generateSpanLoggerClass(attributeNames: string[], schema: LogSchema) {
+function createSpanLoggerClass(attributeNames: string[], schema: LogSchema) {
   // Generate with() method body for attributes
   const withBody = attributeNames
     .map(
@@ -696,12 +614,6 @@ function generateSpanLoggerClass(attributeNames: string[], schema: LogSchema) {
 
 ## SpanContext Type Definition <a id="smoo/lmao!n/spancontext-type"></a>
 
-> **Implementation status**: The shipped types are `SpanContext<Ctx>` and `SpanContextInstance<Ctx>` in
-> `packages/lmao/src/lib/spanContext.ts`, parameterised by a single bundled `OpContext` type
-> (`{ logSchema, flags, deps, ... }`) rather than the separate `Schema, Deps, FF, Extra` params drawn below; user
-> `Extra` fields arrive via the op-context `ctx`. `SpanFn` is realized as the monomorphic `span0`–`span8` overloads plus
-> the variadic `span()` dispatcher (line-number-aware, per the transformer), not the 3-overload sketch below.
-
 The context destructured by op functions. The `Extra` type parameter allows user-defined fields (like `env` with CF
 Worker bindings):
 
@@ -715,7 +627,7 @@ type SpanContext<Schema, Deps, FF, Extra = {}> = {
   log: SpanLogger;
 
   // Span attributes (chainable)
-  tag: TagAPI<Schema>;
+  tag: TagWriter<Schema>;
 
   // Dependencies - can be destructured!
   deps: Deps;
@@ -762,9 +674,9 @@ type MinimalContext<S> = Pick<SpanContext<S, {}, {}>, 'span' | 'log' | 'tag'>;
 ### Basic Op
 
 ```typescript
-const { op } = userModule;
+const { defineOp } = userModule;
 
-const createUser = op(async ({ span, log, tag }, userData: UserData) => {
+const createUser = defineOp('createUser', async ({ span, log, tag }, userData: UserData) => {
   tag.userId(userData.id).operation('INSERT');
   log.info('Creating new user');
 
@@ -781,9 +693,9 @@ const createUser = op(async ({ span, log, tag }, userData: UserData) => {
 ### Op with Dependencies
 
 ```typescript
-const { op } = httpModule;
+const { defineOp } = httpModule;
 
-const GET = op(async ({ span, log, tag, deps }, url: string) => {
+const GET = defineOp('GET', async ({ span, log, tag, deps }, url: string) => {
   const { retry, auth } = deps; // Destructure deps!
 
   tag.method('GET').url(url);
@@ -808,7 +720,7 @@ const GET = op(async ({ span, log, tag, deps }, url: string) => {
 ### Op with Feature Flags
 
 ```typescript
-const processOrder = op(async ({ span, log, tag, deps, ff }, order: Order) => {
+const processOrder = defineOp('processOrder', async ({ span, log, tag, deps, ff }, order: Order) => {
   const { premiumProcessing, newPaymentFlow } = ff;
 
   tag.orderId(order.id);
@@ -829,24 +741,19 @@ const processOrder = op(async ({ span, log, tag, deps, ff }, order: Order) => {
 });
 ```
 
-## Library Definition with defineModule
+## Library Definition with defineOpContext
 
 Libraries define their logSchema and dependencies:
 
-> **Status note**: The example below documents the shipped/legacy `defineModule`-style library surface. In the target
-> architecture, the precompiled library additionally emits and owns its versioned vocabulary registration fragment;
-> application wiring consumes its `VocabularyBinding` while continuing to own prefix/remap composition.
+The precompiled library emits and owns its versioned vocabulary registration fragment; application wiring consumes its
+`VocabularyBinding` while continuing to own prefix/remap composition.
 
 ```typescript
 // @my-company/http-tracing/src/index.ts
-import { defineModule, S } from '@smoothbricks/lmao';
+import { defineOpContext, S } from '@smoothbricks/lmao';
 
 // Define library module
-export const httpLib = defineModule({
-  metadata: {
-    packageName: '@my-company/http-tracing',
-    packagePath: 'src/index.ts',
-  },
+export const httpLib = defineOpContext({
   logSchema: {
     status: S.number(),
     method: S.enum(['GET', 'POST', 'PUT', 'DELETE', 'PATCH']),
@@ -859,10 +766,10 @@ export const httpLib = defineModule({
 });
 
 // Get op factory
-const { op } = httpLib;
+const { defineOp } = httpLib;
 
 // Define ops
-export const request = op(async ({ span, log, tag, deps }, url: string, opts: RequestInit) => {
+export const request = defineOp('request', async ({ span, log, tag, deps }, url: string, opts: RequestInit) => {
   const startTime = performance.now();
 
   tag.method(opts.method || 'GET').url(url);
@@ -885,11 +792,11 @@ export const request = op(async ({ span, log, tag, deps }, url: string, opts: Re
   }
 });
 
-export const GET = op(async ({ span }, url: string) => {
+export const GET = defineOp('GET', async ({ span }, url: string) => {
   return await span('request', request, url, { method: 'GET' });
 });
 
-export const POST = op(async ({ span }, url: string, body: unknown) => {
+export const POST = defineOp('POST', async ({ span }, url: string, body: unknown) => {
   return await span('request', request, url, {
     method: 'POST',
     body: JSON.stringify(body),
@@ -900,20 +807,17 @@ export const POST = op(async ({ span }, url: string, body: unknown) => {
 ### Application Wiring
 
 ```typescript
-// Application wires deps with prefixes
-const httpRoot = httpLib.prefix('http').use({
-  retry: retryLib.prefix('http_retry').use(),
-});
+// Application wires deps with prefixes: each dep carries its own prefix
+const appDeps = {
+  http: httpLib.prefix('http'),
+  retry: retryLib.prefix('http_retry'),
+};
 
 // Invoke via span()
 const result = await httpRoot.span('fetch-users', GET, 'https://api.example.com/users');
 ```
 
 ## ESLint Rule: No Capturing Fluent Interface <a id="smoo/lmao!n/eslint-no-capture-fluent"></a>
-
-> **Implementation status: NOT IMPLEMENTED.** The repo's root `eslint.config.ts` carries no custom rule preventing
-> `tag`/`log` capture, and there is no lmao ESLint plugin. The invariant below is documented but unenforced. Tracked as
-> `smoo/lmao!n/eslint-no-capture-fluent`.
 
 Because `tag` writes entries, users must not capture the fluent interface:
 
@@ -926,26 +830,26 @@ tagRef.userId(123); // Won't work as expected
 tag.userId(123).operation('INSERT');
 ```
 
-An ESLint rule should prevent capturing `tag` or `log` in variables.
+An ESLint rule prevents capturing `tag` or `log` in variables.
 
 ## Performance Characteristics
 
 ### Build-Time vs Runtime Costs
 
 - **Build/Startup**: Schema compilation and class generation (~1-5ms per module)
-- **Runtime target**: Warmed, in-capacity entry calls use fixed monomorphic stores with zero allocation
-- **Memory**: Shared ModuleContext across all ops in same module
+- **Runtime**: Warmed, in-capacity entry calls use fixed monomorphic stores with zero allocation
+- **Memory**: Shared OpMetadata across all ops in same module
 
 ### Generated Code Efficiency
 
 ```typescript
-// Target warmed method (fixed stores, zero allocation):
+// Warmed method (fixed stores, zero allocation):
 userId(value) {
   this.buffer.writeUserId(value);  // Direct method call
   return this;
 }
 
-// vs hypothetical runtime mapping (overhead):
+// vs runtime mapping (overhead):
 setAttribute(name, value) {
   const columnName = this.schema.getColumnName(name);  // Runtime lookup
   this.buffer[`write${columnName}`](value);           // Dynamic method
@@ -955,11 +859,11 @@ setAttribute(name, value) {
 
 ### SpanBuffer Efficiency
 
-- **Dual module references**: `callsiteModule` for row 0's gitSha/packageName/packagePath, `module` for rows 1+
-- **Direct lineNumber writes**: lineNumber passed as argument to span(), written directly to `lineNumber_values[0]` (NO
+- **Dual module references**: `callsiteModule` for row 0's git_sha/package_name/package_file, `module` for rows 1+
+- **Direct lineNumber writes**: lineNumber passed as argument to span(), written directly to `line_values[0]` (NO
   intermediate object storage, NO lineNumber property on any context)
-- **Shipped span names**: `spanName` is interned during Arrow conversion; the target stores a bound dense index
-- **Reference to ModuleContext**: References to shared module metadata (no duplication)
+- **Span names**: `spanName` is interned during Arrow conversion; the stored value is a bound dense index
+- **Reference to OpMetadata**: References to shared OpMetadata (no duplication)
 
 ## Integration Points
 

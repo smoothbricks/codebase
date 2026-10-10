@@ -1,14 +1,5 @@
 # Query Engine <a id="smoo/lmao!n/query-engine"></a>
 
-> **Implementation status (unbuilt — server-side).** This spec describes the **server-side** DuckDB-on-Lambda + S3 query
-> path and the custom `msgpack_extract()` DuckDB C extension. As of this audit **neither exists** in the repo: there is
-> no Lambda deployment, no `read_ipc`/`httpfs` S3 wiring, and no DuckDB C extension. The repo's only DuckDB usage is the
-> **browser** DuckDB-WASM engine in `packages/lmao-inspector` (spec 03), which has no `msgpack_extract` either (it
-> queries Arrow primitive/standard columns only). The server-side path here is staged as `smoo/lmao` action nodes — it
-> is intended infrastructure, not shipped. The Rust `columine` msgpack scanner in
-> `packages/columine/crates/columine-parsing` is a columnar-runtime payload extractor in a VM, a different artifact from
-> the DuckDB scalar function this spec specifies.
-
 ## Overview <a id="smoo/lmao!n/query-engine.overview"></a>
 
 DuckDB is the query engine for lmao traces. It natively reads Arrow IPC, runs on AWS Lambda reading S3, and has an
@@ -123,7 +114,7 @@ Binary columns (where msgpack data lives) are read as `BLOB` type.
 Query msgpack-encoded values inside Arrow Binary columns without deserializing the entire payload. This is what makes
 `S.unknown()` queryable despite using msgpack instead of JSON.
 
-### Target API <a id="smoo/lmao!n/query-engine-msgpack-extract.target-api"></a>
+### API <a id="smoo/lmao!n/query-engine-msgpack-extract.api"></a>
 
 ```sql
 -- Extract a scalar value by path
@@ -216,7 +207,7 @@ WHERE package_name = '@mycompany/api-gateway'
   AND msgpack_extract_string(custom_payload, '$.correlationId') IS NOT NULL;
 ```
 
-## Future Considerations <a id="smoo/lmao!n/query-engine.future-considerations"></a>
+## Storage and Runtime Variants <a id="smoo/lmao!n/query-engine.variants"></a>
 
 - **Parquet export**: Arrow IPC files on S3 could be periodically compacted into Parquet for long-term storage with
   better compression. DuckDB reads both formats natively.

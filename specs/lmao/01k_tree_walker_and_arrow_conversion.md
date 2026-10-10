@@ -192,7 +192,8 @@ class ColumnDictionary {
   }
 
   /**
-   * Compute UTF-8 byte length without allocating.
+   * Compute UTF-8 byte length without allocating. This is the one byte-count function the cached and uncached
+   * paths share, and it counts exactly what TextEncoder writes: a lone surrogate encodes as U+FFFD (3 bytes).
    */
   private utf8ByteLength(str: string): number {
     // Check cache first - if already encoded, use that length
@@ -205,11 +206,19 @@ class ColumnDictionary {
       const code = str.charCodeAt(i);
       if (code < 0x80) bytes += 1;
       else if (code < 0x800) bytes += 2;
-      else if (code < 0xd800 || code >= 0xe000) bytes += 3;
-      else {
-        // Surrogate pair
-        i++;
-        bytes += 4;
+      else if (code >= 0xd800 && code < 0xdc00 && i + 1 < str.length) {
+        const next = str.charCodeAt(i + 1);
+        if (next >= 0xdc00 && next < 0xe000) {
+          // High surrogate followed by low surrogate: one 4-byte code point
+          i++;
+          bytes += 4;
+        } else {
+          // Lone high surrogate: U+FFFD
+          bytes += 3;
+        }
+      } else {
+        // BMP code point, or a lone surrogate (U+FFFD)
+        bytes += 3;
       }
     }
     return bytes;
@@ -287,7 +296,12 @@ function finalizeDictionary(dict: ColumnDictionary, utf8Cache: Utf8Cache): Final
     } else {
       // Not cached: encode directly into buffer (zero intermediate allocation)
       const result = encoder.encodeInto(str, data.subarray(offset));
-      offset += result.written!;
+      if (result.read !== str.length) {
+        // The byte count sized `data` exactly, so a short write is a broken invariant (a byte-count bug),
+        // never an input condition: fail loudly instead of truncating this entry and shifting every later one.
+        throw new DictionaryEncodeInvariantError(str, result.read, result.written);
+      }
+      offset += result.written;
     }
   }
   offsets[uniqueCount] = offset;

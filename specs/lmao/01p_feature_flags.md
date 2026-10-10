@@ -143,12 +143,12 @@ trace('request', {                  ctx.setScope({ region })          ctx.ff.pre
 
 **Purpose**: Handle feature flag evaluation with full span context for logging, tracing, and analytics.
 
-**Implementation status:** Realized in `schema/evaluator.ts` (the `FlagEvaluator` interface, the abstract
-`FeatureFlagEvaluator` per-span wrapper, `createFeatureFlagEvaluator`, the `FlagValue` / `SpanContextWithoutFf` /
-`BooleanFlagContext` / `VariantFlagContext` / `ConfigFlagContext` types, and the built-in `InMemoryFlagEvaluator`),
-`tracer.ts:_createFlagEvaluator` (wires the evaluator from `TracerOptions`), and the generated per-span getter class in
-`codegen/evaluatorGenerator.ts`. These source spans are fenced under `smoo/lmao!n/flag-evaluator*`; the spec
-relationship is `n/op-context-flag-evaluator` (evaluator) and `n/schema-feature-flags` (schema entry point).
+The evaluator is defined in `schema/evaluator.ts`: the `FlagEvaluator` interface, the `FeatureFlagEvaluator` per-span
+wrapper, `createFeatureFlagEvaluator`, the `FlagValue` / `SpanContextWithoutFf` / `BooleanFlagContext` /
+`VariantFlagContext` / `ConfigFlagContext` types, and the built-in `InMemoryFlagEvaluator`.
+`tracer.ts:_createFlagEvaluator` wires the evaluator from `TracerOptions`, and `codegen/evaluatorGenerator.ts` generates
+the per-span getter class. Source regions are marked under `smoo/lmao!n/flag-evaluator*`; the spec relationship is
+`n/op-context-flag-evaluator` (evaluator) and `n/schema-feature-flags` (schema entry point).
 
 ### Ctx-First Evaluator Pattern <a id="smoo/lmao!n/op-context-flag-evaluator.ctx-first-evaluator-pattern"></a>
 

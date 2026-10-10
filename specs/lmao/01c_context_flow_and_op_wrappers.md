@@ -122,7 +122,7 @@ SpanContext (interface) - user-facing, what ops receive
 ├── buffer: SpanBuffer (underlying storage)
 ├── tag: TagWriter<T> (writes to row 0)
 ├── log: SpanLogger<T> (writes to rows 2+)
-├── ok() / err() → FluentOk / FluentErr (writes to row 1)
+├── ok() / err() → Ok / Err (writes to row 1)
 ├── span() (creates child span)
 ├── scope / setScope()
 ├── ff: FeatureFlagEvaluator
@@ -244,7 +244,7 @@ Tracer (abstract class) - ONE per application entry point
 
 trace('create-user', { env, requestId }, createUserOp, userData) creates:
 ├── Root SpanContext (create-user span buffer)
-├── tag: TagAPI (writes to create-user buffer)
+├── tag: TagWriter (writes to create-user buffer)
 ├── log: SpanLogger (logs to create-user buffer)
 ├── span: ChildSpanCreator (creates child spans)
 ├── deps: BoundDeps (references to dep Op instances)
@@ -253,7 +253,7 @@ trace('create-user', { env, requestId }, createUserOp, userData) creates:
 ├── requestId: from overrides (user-defined)
 └── ctx.span('validate-user', validateOp) creates:
     ├── Child SpanContext (validate-user span buffer)
-    ├── tag: TagAPI (writes to validate-user buffer)
+    ├── tag: TagWriter (writes to validate-user buffer)
     ├── log: SpanLogger (logs to validate-user buffer)
     ├── span: ChildSpanCreator (for nested ops)
     ├── deps: SAME deps references
@@ -265,7 +265,7 @@ trace('create-user', { env, requestId }, createUserOp, userData) creates:
 
 - `span(name, op, ...args)`: Invoke an op as a child span
 - `log`: SpanLogger for info/debug/warn/error
-- `tag`: TagAPI for span attributes
+- `tag`: TagWriter for span attributes
 - `deps`: Bound dependency ops (can be destructured: `const { retry } = deps`)
 - `ff`: Feature flag evaluator bound to current span's buffer
 - User context properties (e.g., `env`, `requestId`, `userId` - defined via `ctx` in `defineOpContext()`)
@@ -413,14 +413,14 @@ class Op<Ctx, Args extends unknown[], Result> {
    * @param args - User arguments to the op
    */
   /**
-   * NOTE: This is pseudo-code for illustration. The actual implementation is in:
-   * - Root spans: Tracer._createRootContext() and _executeWithContext() (tracer.ts)
-   * - Child spans: SpanContext._spanPre() and span0-span8 methods (spanContext.ts)
+   * NOTE: This is pseudo-code for illustration. The implementation is in:
+   * - Root spans: Tracer._createRootContext(); _executeResultWithContext() and _executeUnknownWithContext() (tracer.ts)
+   * - Child spans: SpanContextInstance._spanPre() and span0-span8 methods (spanContext.ts)
    *
-   * The flow below shows the CONCEPTUAL structure. Key differences in real code:
+   * The flow below shows the CONCEPTUAL structure. The implementation arranges the steps as follows:
    * - Root spans create TraceRoot BEFORE createSpanBuffer (in Tracer)
    * - Child spans use createChildSpanBuffer with SpanBufferClass from Op
-   * - FluentOk/FluentErr detection happens in execution wrappers
+   * - Ok/Err detection happens in execution wrappers
    * - Context setup happens via SpanContext class factory pattern
    */
   async _invoke(parentCtx: SpanContext | null, spanName: string, lineNumber: number, args: Args): Promise<Result> {
@@ -478,14 +478,14 @@ class Op<Ctx, Args extends unknown[], Result> {
     spanCtx.ff = this.flagEvaluator?.forContext(spanCtx) ?? {};
     Object.assign(spanCtx, resolvedUserCtx); // Spread user context (env, etc.)
 
-    // 4. Execute function with FluentOk/FluentErr detection
+    // 4. Execute function with Ok/Err detection
     // Tracer calls onSpanStart/onSpanEnd hooks for lifecycle events
     try {
       const result = await this.fn(spanCtx, ...args);
 
-      // If result is FluentOk/FluentErr (from ctx.ok()/ctx.err()),
+      // If result is Ok/Err (from ctx.ok()/ctx.err()),
       // entry type was already written by constructor. Skip overwriting.
-      if (!(result instanceof FluentOk || result instanceof FluentErr)) {
+      if (!(result instanceof Ok || result instanceof Err)) {
         // Fallback: write span-ok to row 1 for non-FluentResult returns
         buffer.entry_type[1] = ENTRY_TYPE_SPAN_OK;
         buffer.timestamp[1] = getTimestampNanos(buffer._traceRoot.anchorEpochNanos, buffer._traceRoot.anchorPerfNow);
@@ -531,46 +531,43 @@ class Op<Ctx, Args extends unknown[], Result> {
 
 The context passed to op functions combines built-in properties with user-extensible `Ctx`:
 
-> **Implementation status**: the shipped type is `SpanContext<Ctx>` (a single bundled `OpContext` type parameter
-> carrying `logSchema`/`flags`/`deps`/`userCtx`), not the separate `<Schema, Deps, FF, Ctx>` list shown below — see
-> `SpanContextInstance` in `packages/lmao/src/lib/spanContext.ts` (node `smoo/lmao!n/spancontext-type`).
-> `ctx.ok()`/`ctx.err()` return the `Ok<V>`/`Err<E>` classes from `result.ts` (the spec's `FluentOk`/`FluentErr` are
-> illustrative names); they are both the type-safe result and the fluent row-1 writer.
-
 ```typescript
-type SpanContext<Schema, Deps, FF, Ctx> = {
+type SpanContext<Ctx extends OpContext> = {
   // Invoke another op as a child span - supports multiple overloads
-  span: SpanFn<SpanContext<Schema, Deps, FF, Ctx>>;
+  span: SpanFn<Ctx>;
 
   // Log messages (info/debug/warn/error)
-  log: LogAPI;
+  log: SpanLogger<Ctx['logSchema']>;
 
   // Span attributes (chainable)
-  tag: TagAPI<Schema>;
+  tag: TagWriter<Ctx['logSchema']>;
 
   // Dependencies - can be destructured!
-  deps: BoundDeps<Deps>;
+  deps: ResolvedDeps<Ctx['deps']>;
 
   // Feature flags (logs access to current span)
-  ff: FeatureFlagEvaluator<FF>;
+  ff: FeatureFlagEvaluator<Ctx> & InferFeatureFlagsWithContext<Ctx>;
 
   // Result helpers
-  ok<T>(value: T): OkResult<T>;
+  ok<S>(value: S): OkResult<S, Ctx['logSchema']>;
   err<E>(code: string, data?: E): ErrResult<E>;
 
   // Scoped attributes (read-only view)
-  scope: Readonly<Partial<Schema>>;
+  scope: Readonly<Partial<InferSchema<Ctx['logSchema']>>>;
 
   // Set scoped attributes (merge semantics, null to clear)
-  setScope(values: Partial<Schema>): void;
+  setScope(values: Partial<InferSchema<Ctx['logSchema']>> | null): void;
 
   // Access to underlying buffer (advanced use)
-  buffer: SpanBuffer;
-} & Ctx; // User-extensible properties via ctx in defineOpContext()
+  buffer: SpanBuffer<Ctx['logSchema']>;
+} & Ctx['userCtx']; // User-extensible properties via ctx in defineOpContext()
 ```
 
-**Key Design**: The `Ctx` type is spread directly into the context, so properties like `env` become top-level and can be
-accessed directly: `ctx.env.apiTimeout`.
+**Key Design**: The `Ctx['userCtx']` type is spread directly into the context, so properties like `env` become top-level
+and can be accessed directly: `ctx.env.apiTimeout`.
+
+`ctx.ok()` and `ctx.err()` return the `Ok` and `Err` classes from `result.ts`. Each is both the type-safe result and the
+fluent row-1 writer.
 
 ### Destructuring Pattern
 
@@ -914,7 +911,7 @@ await trace('process-order', { env: myEnv }, processOrder, order);
 ### Memory Usage
 
 - **Shared references**: OpMetadata and deps shared across all ops
-- **Direct buffer access**: TagAPI/SpanLogger hold buffer reference directly
+- **Direct buffer access**: TagWriter/SpanLogger hold buffer reference directly
 - **Buffer management**: Self-tuning capacity per op context
 
 ## Integration Points
@@ -922,7 +919,7 @@ await trace('process-order', { env: myEnv }, processOrder, order);
 This context flow system integrates with:
 
 - **[Module Context and SpanLogger Generation](./01j_module_context_and_spanlogger_generation.md)**: Provides the
-  SpanLogger/TagAPI class generation
+  SpanLogger/TagWriter class generation
 - **[Op Context Pattern](./01l_op_context_pattern.md)**: Defines `defineOpContext()`, `defineOp()` API, and Tracer usage
 - **[Span Scope Attributes](./01i_span_scope_attributes.md)**: Provides span-level attribute scoping
 - **[Library Integration Pattern](./01e_library_integration_pattern.md)**: Shows how libraries define ops

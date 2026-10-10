@@ -55,15 +55,8 @@ interface TraceChunkBuilder {
 }
 ```
 
-`chunk_id` must be deterministic from envelope content identity (not random per retry).
-
-> **Implementation status (shipped, leaner contract).** `packages/lmao/src/lib/archive/chunkEnvelope.ts` ships
-> `buildTraceChunkEnvelope(input)` — the deterministic `chunk_id` (FNV-1a over a stable-serialized canonical body) is
-> implemented as specified. The shipped envelope addresses an already-flushed chunk **by reference** (`file_ref` +
-> `chunk_ref`) rather than carrying inline `payload_bytes` / `codec` / `format`, and its time bounds are numeric
-> `started_at_ms` / `ended_at_ms` (not ISO `emitted_at` / `first_ts`). The inline-Arrow-payload envelope
-> (`payload_bytes` Arrow IPC, `codec`, `schema_hash`, `group_hints`) below is the future shape — staged as a `smoo/lmao`
-> node, not yet built.
+`chunk_id` must be deterministic from envelope content identity (not random per retry), computed as FNV-1a over a
+stable-serialized canonical body.
 
 ## Primitive 2: Partition Shape Inspection <a id="smoo/lmao!n/trace-archive-partition-inspect"></a>
 
@@ -84,9 +77,7 @@ interface ChunkPartitionInspector {
 This primitive does not derive routing groups or delivery destinations for the consuming system. It only reports whether
 rows are single-partition, mixed-partition, or unresolvable from provided columns.
 
-> **Implementation status (shipped).** `packages/lmao/src/lib/archive/chunkRouting.ts:inspectPartitionCardinality`
-> reports `'single' | 'mixed' | 'unknown'` over rows + a `partitionOf` accessor, exactly as specified (an empty/missing
-> partition value yields `'unknown'`). It derives no routing destinations.
+An empty or missing partition value yields `unknown`.
 
 ## Primitive 3: Partition Split Helper <a id="smoo/lmao!n/trace-archive-partition-split"></a>
 
@@ -110,11 +101,7 @@ interface ChunkPartitioner {
 
 Split output must be deterministic for the same input chunk and partition-column configuration.
 
-> **Implementation status (shipped, leaner contract).**
-> `packages/lmao/src/lib/archive/chunkRouting.ts:splitChunkByPartition` splits rows deterministically (sorted partition
-> keys) and emits, per partition, the row indexes, the materialized rows, and a stable string `selector`
-> (`group == "value"`). It returns the rows directly rather than a `row_bitmap` + `chunk_ref` indirection; the
-> compact-bitmap selector below is a future optimization, not yet built.
+Partitions are emitted in sorted partition-key order.
 
 ## Primitive 4: Compaction <a id="smoo/lmao!n/trace-archive-compaction"></a>
 
@@ -149,13 +136,6 @@ interface TraceChunkCompactor {
 
 Compaction must be append-only: source chunks remain immutable, output emits new chunk identity + lineage.
 
-> **Implementation status (shipped, identity-only).**
-> `packages/lmao/src/lib/archive/chunkCompaction.ts:compactTraceChunks` ships the append-only **identity + lineage**
-> half: a deterministic `compaction_id` and `source_set_hash` stable by `(window, sorted source_chunk_ids)`, plus
-> `total_rows`. It does **not** yet read source payloads, re-encode to Arrow/Parquet, or emit `payload_bytes` — i.e. it
-> computes the compaction manifest, not the compacted bytes. The payload-producing compaction (`targetFormat` →
-> `payload_bytes`) below is staged as a `smoo/lmao` node, not yet built.
-
 ## Primitive 5: Chunk Stats Extraction <a id="smoo/lmao!n/trace-archive-stats"></a>
 
 ```typescript
@@ -173,10 +153,7 @@ interface TraceChunkStats {
 
 These stats are optional optimization primitives for downstream predicate pre-filtering.
 
-> **Implementation status (shipped, chunk-level).** `packages/lmao/src/lib/archive/chunkStats.ts:extractChunkStats`
-> ships **chunk-level** rollups — `chunk_id`, `row_count`, `partition_count`, time bounds, and `duration_ms`. The
-> **per-column** min/max/null_count stats below (for predicate pre-filtering) are not yet built; they are staged as a
-> `smoo/lmao` node. Both are optional optimization primitives.
+Chunk-level rollups carry `chunk_id`, `row_count`, `partition_count`, time bounds, and `duration_ms`.
 
 ## Determinism and Retry Invariants <a id="smoo/lmao!n/trace-archive-determinism"></a>
 

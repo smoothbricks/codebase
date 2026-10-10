@@ -1,7 +1,5 @@
 # Op Context Pattern <a id="smoo/lmao!n/op-context-pattern"></a>
 
-> **Status**: This spec REPLACES `01l_module_builder_pattern.md` which should be DELETED.
-
 ## Quick Reference
 
 ```typescript
@@ -282,13 +280,11 @@ async (ctx, ...args) => {
 LMAO provides two result patterns:
 
 1. **`Result` class** - For type-safe error handling with `isErr(Tag)` discrimination
-2. **`FluentOk`/`FluentErr`** - For fluent result builders with deferred tag application (returned by
-   `ctx.ok()`/`ctx.err()`)
+2. **`Ok`/`Err`** - For fluent result builders with deferred tag application (returned by `ctx.ok()`/`ctx.err()`)
 
-> **Implementation status**: the shipped classes are `Ok<V>` and `Err<E>` in `packages/lmao/src/lib/result.ts` (the
-> `FluentOk`/`FluentErr` names above are illustrative). `Result<V, E>` is the union `Ok<V> | Err<E>`. The same
-> `Ok`/`Err` instances are both the type-safe result (`isOk`/`isErr(Tag)`/`map`/`match`/`unwrapOr`) and the fluent
-> buffer-row-1 writer (`.with()`/`.message()`/`.line()`) — there is no separate fluent-builder class.
+`Result<V, E>` is the union `Ok<V> | Err<E>` (`packages/lmao/src/lib/result.ts`). The same `Ok`/`Err` instances are both
+the type-safe result (`isOk`/`isErr(Tag)`/`map`/`match`/`unwrapOr`) and the fluent buffer-row-1 writer
+(`.with()`/`.message()`/`.line()`) — there is no separate fluent-builder class.
 
 ### Result Class
 
@@ -402,7 +398,7 @@ return ctx
 
 ### Entry Type Detection <a id="smoo/lmao!n/op-context-entry-detection"></a>
 
-The Tracer detects if a function returns `FluentOk` or `FluentErr`:
+The Tracer detects if a function returns a fluent `Ok` or `Err`:
 
 - If yes: Entry type already written, Tracer doesn't overwrite
 - If no (plain Result): Tracer writes `span-ok` to row 1
@@ -451,12 +447,6 @@ export const myOps = defineOps({ ... });
 The Tracer is an abstract base class that manages trace execution and lifecycle. Concrete implementations define how
 trace data is collected, batched, and processed.
 
-> **Implementation status**: `Tracer` is `abstract class Tracer<B extends OpContextBinding>` in
-> `packages/lmao/src/lib/tracer.ts`. The constructor signature is `(binding, options)` where `TracerOptions` carries
-> `bufferStrategy` (required) and `createTraceRoot` (the platform time-anchor factory, 01b3) in addition to the optional
-> `flagEvaluator` — the spec's `options.flagEvaluator`-only sketch is incomplete. `trace`/`trace_op`/`trace_fn`/`flush`
-> are bound in the constructor for destructuring.
-
 ### Abstract Tracer Class
 
 The `Tracer` class provides the foundation for all trace collection:
@@ -464,11 +454,15 @@ The `Tracer` class provides the foundation for all trace collection:
 **Constructor Signature:**
 
 ```typescript
-constructor(binding: OpContextBinding, options?: TracerOptions)
+constructor(binding: B, options: TracerOptions<B['logBinding']['logSchema']>)
 ```
 
 - `binding` - The OpContextBinding returned from `defineOpContext()`
+- `options.bufferStrategy` - Buffer strategy for memory management and Arrow conversion (required)
+- `options.createTraceRoot` - Factory for platform-specific TraceRoot instances (time anchors, 01b3) (required)
 - `options.flagEvaluator` - Optional feature flag evaluator for runtime flag resolution
+
+The constructor binds `trace`, `trace_op`, `trace_fn`, and `flush` so they can be destructured.
 
 **Lifecycle Hooks (Abstract Methods):**
 
@@ -520,7 +514,7 @@ const table = convertSpanTreeToArrowTable(tracer.rootBuffers[0]);
 
 **NoOpTracer:**
 
-`NoOpTracer` still exists in `@smoothbricks/lmao` for API proof, comparison, and overhead benchmarking, but this repo's
+`NoOpTracer` in `@smoothbricks/lmao` is provided for API proof, comparison, and overhead benchmarking, but this repo's
 default policy is to use `TestTracer`, `ArrayQueueTracer`, or `StdioTracer` so tracing stays observable during tests and
 runtime debugging.
 

@@ -1,37 +1,32 @@
 # 01q: WASM Memory Architecture for SpanBuffer Storage <a id="smoo/lmao!n/wasm-mem"></a>
 
-> **Implementation status (partial realization).** The allocator, TypeScript wrapper, `PhysicalLayoutPlan`, generated
-> WASM buffer strategy, packed span-superblock setup, trace-root writer, synchronous conversion/release flow, and
-> current Mitata benchmarks are shipped under `packages/lmao/src/lib/wasm/`. The implementation map identifies their
-> source regions. `VocabularyBinding`, `ArrowLease`, memory-epoch ownership, and lease-pinned asynchronous Arrow
-> borrowing below are target contracts, not assertions about the shipped implementation. Deferred Work lists the
-> remaining allocator/runtime follow-ups; the phase/ownership gates in this document are additional acceptance
-> requirements.
+This spec defines the WASM memory architecture for SpanBuffer storage. The allocator, TypeScript wrapper,
+`PhysicalLayoutPlan`, generated WASM buffer strategy, packed span-superblock setup, trace-root writer, and synchronous
+conversion/release flow live under `packages/lmao/src/lib/wasm/`. `VocabularyBinding`, `ArrowLease`, and memory-epoch
+ownership govern asynchronous Arrow borrowing below. The Implementation Map names the source regions.
 
-## Status and Phase Contract <a id="smoo/lmao!n/wasm-mem.status-contract"></a>
+## Phase Contract <a id="smoo/lmao!n/wasm-mem.status-contract"></a>
 
-The implementation-map WASM allocator and synchronous lifecycle are shipped; current JS-buffer and WASM behavior are
-benchmarked separately.
+The phases below govern the WASM allocator and the synchronous lifecycle. JS-buffer and WASM behavior are benchmarked
+separately.
 
-**Shipped phases:** startup instantiates the memory/allocator and generated accessors. A cached physical descriptor
-packs each root or child span's identity, system rows, and present numeric-family slabs into one aligned superblock;
-overflow buffers allocate one identity-free superblock and retain their owner's identity pointer. One
-`create_and_start_span` call allocates, clears, initializes identity, stamps row 0, and pre-arms row 1; one
-`create_overflow_span` call creates overflow storage. JavaScript then creates the generated buffer object and its WASM
-views, while string arrays remain on the JS heap. Warmed writes use fixed stores; freelist miss, overflow, and
-`memory.grow()` are slow paths. Conversion reads WASM views synchronously, constructs or copies Arrow-owned output as
-required, and `releaseBuffer()` immediately returns each span tree superblock after conversion. Cached TypedArray views
-are recreated after growth. Shipped code does not expose asynchronous borrowed WASM Arrow data and does not implement
-`VocabularyBinding`, `ArrowLease`, or memory-epoch ownership.
+**Phases:** startup instantiates the memory/allocator and generated accessors. A cached physical descriptor packs each
+root or child span's identity, system rows, and present numeric-family slabs into one aligned superblock; overflow
+buffers allocate one identity-free superblock and retain their owner's identity pointer. One `create_and_start_span`
+call allocates, clears, initializes identity, stamps row 0, and pre-arms row 1; one `create_overflow_span` call creates
+overflow storage. JavaScript then creates the generated buffer object and its WASM views, while string arrays remain on
+the JS heap. Warmed writes use fixed stores; freelist miss, overflow, and `memory.grow()` are slow paths. Conversion
+reads WASM views synchronously, constructs or copies Arrow-owned output as required, and `releaseBuffer()` immediately
+returns each span tree superblock after conversion. Cached TypedArray views are recreated after growth.
 
-**Target phases:** startup performs `VocabularyBinding`; warmed fixed-capacity writes introduce zero new JS heap
-allocations with monomorphic stores and one predictable branch; and per-request flush may borrow compatible WASM regions
-only under `ArrowLease`, otherwise retaining the shipped Arrow-owned copy boundary.
+**Write and flush contract:** startup performs `VocabularyBinding`; warmed fixed-capacity writes introduce zero new JS
+heap allocations with monomorphic stores and one predictable branch; and per-request flush may borrow compatible WASM
+regions only under `ArrowLease`, otherwise retaining the Arrow-owned copy boundary.
 
-For shipped measurement and target gates, effective memory includes JS heap/view objects, every committed WASM page
-(live, free, fragmented, or orphaned), Arrow output, temporary conversion buffers, caches, and allocator/GC metadata.
-Target measurements additionally include lease-pinned blocks/pages. Logical block bytes or freelist counters alone are
-not memory usage.
+For measurement and acceptance gates, effective memory includes JS heap/view objects, every committed WASM page (live,
+free, fragmented, or orphaned), Arrow output, temporary conversion buffers, caches, and allocator/GC metadata.
+Measurements also include lease-pinned blocks/pages. Logical block bytes or freelist counters alone are not memory
+usage.
 
 ## Overview <a id="smoo/lmao!n/wasm-mem.overview"></a>
 
@@ -41,7 +36,7 @@ data in JavaScript.
 
 ## Motivation <a id="smoo/lmao!n/wasm-mem.motivation"></a>
 
-### Current Architecture <a id="smoo/lmao!n/wasm-mem.current-architecture"></a>
+### JavaScript-Heap Buffer Architecture <a id="smoo/lmao!n/wasm-mem.current-architecture"></a>
 
 Each SpanBuffer owns separate JavaScript TypedArrays:
 
@@ -56,7 +51,7 @@ Each SpanBuffer owns separate JavaScript TypedArrays:
 - Memory fragmentation across heap
 - 64KB minimum for WASM Memory means per-SpanBuffer WASM is wasteful
 
-### Target/Realized WASM Architecture <a id="smoo/lmao!n/wasm-mem.proposed-architecture"></a>
+### WASM Architecture <a id="smoo/lmao!n/wasm-mem.proposed-architecture"></a>
 
 One `WebAssembly.Memory` per `OpContext`:
 
@@ -587,15 +582,15 @@ This naturally adapts to the OpContext's usage pattern without pre-reservation.
 
 ## SpanBuffer Changes <a id="smoo/lmao!n/wasm-mem.spanbuffer-changes"></a>
 
-### Current SpanBuffer Properties <a id="smoo/lmao!n/wasm-mem.current-spanbuffer-properties"></a>
+### JavaScript-Heap SpanBuffer Properties <a id="smoo/lmao!n/wasm-mem.current-spanbuffer-properties"></a>
 
 ```typescript
-// Per-column TypedArrays (current)
+// Per-column TypedArrays (JavaScript-heap lane)
 this._userId_values: Float64Array;
 this._userId_nulls: Uint8Array;
 ```
 
-### Proposed SpanBuffer Properties <a id="smoo/lmao!n/wasm-mem.proposed-spanbuffer-properties"></a>
+### SpanBuffer Properties <a id="smoo/lmao!n/wasm-mem.proposed-spanbuffer-properties"></a>
 
 ```typescript
 // Offset into OpContext's WASM memory
@@ -657,16 +652,16 @@ userId(value: string) {
 
 ## Library Integration (No Write-Time Remapping) <a id="smoo/lmao!n/wasm-mem.library-integration-no-write-time-remapping"></a>
 
-### Current Flow <a id="smoo/lmao!n/wasm-mem.current-flow"></a>
+### Library Composition Flow <a id="smoo/lmao!n/wasm-mem.current-flow"></a>
 
 Library defines ops with its own schema. When composed into app with `prefix()`:
 
 - `RemappedSpanLogger` generated with prefixed column names baked in
 - `RemappedBufferView` generated for Arrow conversion
 
-### Proposed Flow <a id="smoo/lmao!n/wasm-mem.proposed-flow"></a>
+### Remapping Flow <a id="smoo/lmao!n/wasm-mem.proposed-flow"></a>
 
-Same as current - **no change to remapping**:
+Remapping happens only on read, at Arrow conversion:
 
 1. **Library writes to its own columns** using library column IDs (0, 1, 2...)
 2. **Library columns stored in library's OpContext WASM memory**
@@ -676,13 +671,13 @@ Same as current - **no change to remapping**:
 This works because each OpContext (library vs app) has its own WASM memory. Library code writes to library memory with
 library column IDs. No cross-OpContext coordination needed at write time.
 
-## Target Lifecycle and Asynchronous Ownership <a id="smoo/lmao!n/wasm-mem.lifecycle"></a>
+## Lifecycle and Asynchronous Ownership <a id="smoo/lmao!n/wasm-mem.lifecycle"></a>
 
-The following state machine is a **target**, not shipped behavior. Shipped conversion is synchronous and releases/copies
-before `releaseBuffer()` recycles blocks; therefore shipped Arrow output MUST NOT retain views into recycled WASM
-blocks.
+Arrow output never retains a view into a recycled WASM block: a block Arrow borrows is pinned by an `ArrowLease` until
+the lease is released, and everything else is released or copied to Arrow-owned storage before `releaseBuffer()`
+recycles it.
 
-The target gives each block an ownership state and each `WebAssembly.Memory.buffer` an epoch:
+The state machine gives each block an ownership state and each `WebAssembly.Memory.buffer` an epoch:
 
 `FREE → BUFFER_OWNED → FLUSH_PINNED → FREE`
 
@@ -712,12 +707,10 @@ On first write to numeric column:
 
 ### Trace Completion <a id="smoo/lmao!n/wasm-mem.trace-completion"></a>
 
-**Shipped:** conversion consumes the frozen tree synchronously, produces Arrow-owned output where lifetime isolation is
-required, then `releaseBuffer()` returns system, identity, and numeric blocks to freelists. No returned Arrow value may
-retain a view of those recycled blocks.
-
-**Target:** blocks borrowed by Arrow transition to `FLUSH_PINNED` and return only when their `ArrowLease` is released.
-Blocks not exposed to Arrow may return immediately. JS string arrays remain GC-owned unless an explicit pool owns them.
+Conversion consumes the frozen tree, produces Arrow-owned output where lifetime isolation is required, then
+`releaseBuffer()` returns system, identity, and numeric blocks that Arrow did not borrow to freelists. Blocks borrowed
+by Arrow transition to `FLUSH_PINNED` and return only when their `ArrowLease` is released. JS string arrays remain
+GC-owned unless an explicit pool owns them.
 
 ## Capacity Tuning Considerations <a id="smoo/lmao!n/wasm-mem.capacity-tuning-considerations"></a>
 
@@ -777,7 +770,7 @@ oldest lease age, pinned/reusable/orphaned bytes, committed pages, fragmentation
 
 ### Write Cost <a id="smoo/lmao!n/wasm-mem.write-cost"></a>
 
-- Same as current: array index write
+- Same as the JavaScript-buffer write: array index write
 - One extra indirection: `_columnOffsets[colId]` lookup
 - Offset cached after first write per column
 
@@ -882,16 +875,15 @@ In `WasmBufferStrategy` (`packages/lmao/src/lib/wasm/WasmBufferStrategy.ts`):
 
 ### Benchmarking <a id="smoo/lmao!n/wasm-mem.bench"></a>
 
-The existing `js-vs-wasm.bench.ts` Mitata comparison is shipped evidence, not the complete protocol. WASM scenarios MUST
-follow
+`js-vs-wasm.bench.ts` provides the Mitata comparison. WASM scenarios MUST follow
 [01b1 §Required Mitata Protocol](./01b1_buffer_performance_optimizations.md#smoo/lmao!n/buffer-perf-benchmark-protocol):
-compare plugin-off, plugin-on/current JS, current WASM, and candidates with semantic checksums, position-balanced order,
+compare plugin-off, plugin-on/JS, WASM, and candidates with semantic checksums, position-balanced order,
 machine-readable raw samples, and p50/p95/p99/p99.9 for startup, span setup/freelist hit, warmed writes, lazy
 allocation/overflow/growth, recycle, and request Arrow flush. Effective-memory, allocation/GC, epoch/view recreation,
 lease duration/pinned bytes, copied bytes, IC/shape, branch, and chunk observations are auxiliary instrumentation beside
 Mitata and may be unavailable. Reject semantic differences, warmed-write allocations, unstable hot shapes/branches,
-growth during a target borrowed lease, shipped output retaining recycled WASM views, or regressions beyond the declared
-noise threshold.
+growth during a borrowed lease, output retaining recycled WASM views, or regressions beyond the declared noise
+threshold.
 
 ## Resolved Decisions <a id="smoo/lmao!n/wasm-mem.resolved-decisions"></a>
 
@@ -900,28 +892,14 @@ Three earlier questions are settled, and their resolutions are commitments:
 - **Capacity tuning** — on a capacity change, orphaned freelist blocks are discarded rather than tracked per capacity;
   capacity stabilizes quickly, so the waste is transient (see
   [Capacity Tuning Considerations](#capacity-tuning-considerations)).
-- **View invalidation** — shipped cached views are recreated after `memory.grow()`. The target `ArrowLease` adds the
-  cross-consumer guarantee: delay growth or copy leased data before invalidating the old epoch.
+- **View invalidation** — cached views are recreated after `memory.grow()`. The `ArrowLease` adds the cross-consumer
+  guarantee: delay growth or copy leased data before invalidating the old epoch.
 - **Overflow buffers** — `createWasmOverflowBuffer()` allocates from the same allocator, so overflow buffers reuse the
   OpContext's memory.
 
-## Deferred Work <a id="smoo/lmao!n/wasm-mem-deferred"></a>
-
-Each item below is genuinely open and is tracked as a node under `smoo/lmao!n/wasm-mem` (not a silent gap):
-`n/wasm-mem-string-pooling`, `n/wasm-mem-per-capacity-freelists`, `n/wasm-mem-hotpath-inline`, `n/wasm-mem-wasm-tracer`.
-
-- **String array pooling** (`n/wasm-mem-string-pooling`) — pool `string[]` arrays to cut GC pressure in long-running
-  processes. Strings are cold-path, so this is an optimization, not a correctness requirement.
-- **Per-capacity freelists** (`n/wasm-mem-per-capacity-freelists`) — track blocks by capacity to avoid orphaning during
-  self-tuning, replacing the discard-on-tune decision above.
-- **Hot-path inlining** (`n/wasm-mem-hotpath-inline`) — further inline the WASM exports and elide bounds checking via
-  capacity constraints.
-- **`WasmTracer`** (`n/wasm-mem-wasm-tracer`) — a tracer reading directly from WASM memory; the disabled
-  `wasmTracer.test.ts.disabled` is the seam.
-
 ## References <a id="smoo/lmao!n/wasm-mem.references"></a>
 
-- [01b_columnar_buffer_architecture.md](./01b_columnar_buffer_architecture.md) - Current buffer architecture
+- [01b_columnar_buffer_architecture.md](./01b_columnar_buffer_architecture.md) - Buffer architecture
 - [01b6_buffer_codegen_extension.md](./01b6_buffer_codegen_extension.md) - Buffer code generation
 - [01e_library_integration_pattern.md](./01e_library_integration_pattern.md) - RemappedBufferView pattern
 - [01l_op_context_pattern.md](./01l_op_context_pattern.md) - OpContext and defineOpContext

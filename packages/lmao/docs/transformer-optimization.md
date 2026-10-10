@@ -387,18 +387,19 @@ The refuted micro-batching staged values and paid `.set()` overhead. A possible 
 constants** such as entry type, the already-implemented Op-local template ID, and line number into one u32/u64 literal
 and emit one element write instead of separate lane writes. No packed row header is implemented or measured.
 
-### F. Template/name dictionaries: shipped Op-local store versus specified global target
+### F. Template/name dictionaries: Op-local store and the global vocabulary ABI
 
 **Implemented subset.** Literal log messages eligible under the shipped checker rules use private per-Op `u16` IDs in
 the hot store. This subset deduplicates and avoids the per-row literal string write, then restores the exact public
 string at cold conversion. It does **not** create a program-wide dictionary, a stable trace vocabulary, or a new Arrow
 column. The local-store benchmark did not meet the promotion gate, so no performance win is claimed.
 
-**Specified, not shipped.** The clean-cutover ABI above expands checker-semantic coverage to `static`/`structured`
-logger callsites and literal `SPAN_NAME` records, emits stable content-derived `u24` identities, and registers fragments
-into append-only runtime-dense Arrow bindings. Independently compiled libraries self-register without source at the
-consuming build. None of stable IDs, fragment registration, `VocabularyBinding`, registered span names, or runtime-owned
-immutable dictionary generations is shipped. The target cannot be promoted until its phase-specific gates pass.
+**Global vocabulary ABI.** The clean-cutover ABI above expands checker-semantic coverage to `static`/`structured` logger
+callsites and literal `SPAN_NAME` records, emits stable content-derived `u24` identities, and registers fragments into
+append-only runtime-dense Arrow bindings: `plugin/driver/vocabulary_registration.go` emits the registration and
+`packages/lmao/src/lib/vocabularyRegistry.ts` returns each fragment's `VocabularyBinding`. Independently compiled
+libraries self-register without source at the consuming build. It replaces the Op-local store once its phase-specific
+gates pass.
 
 ### G. Smaller, cheap wins
 

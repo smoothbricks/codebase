@@ -45,7 +45,7 @@ The unit of proof is a phase, never the whole logging system:
    pre-encodes fixed dictionaries. Time, allocations, code size, and shared memory are reported independently.
 2. **Span setup** creates the buffer object, backing storage/views, identity, tree links, and initial rows. It has a
    bounded allocation budget but is not allocation-free.
-3. **Warmed entry writes** target zero new heap allocations after warmup for an existing fixed-capacity buffer. Stores
+3. **Warmed entry writes** make zero new heap allocations after warmup for an existing fixed-capacity buffer. Stores
    MUST stay monomorphic with stable hidden classes/inline caches; the common capacity decision MUST be one predictable
    not-overflow branch. First write to a lazy column is a slow path.
 4. **Overflow and other slow paths** MAY allocate a continuation, grow WASM, encode an uncached string, or update tuning
@@ -68,14 +68,15 @@ summaries MUST be commit-message-ready.
 
 ## V8 Optimization Patterns <a id="smoo/lmao!n/buffer-perf-v8-patterns"></a>
 
-**Implementation status**: These six patterns (monomorphic access, hidden-class stability + in-object property ordering,
-inline caching, cache-line alignment, sequential access) are realized structurally by the **generated** SpanBuffer class
-— `getSpanBufferClass` orders the hottest properties first in its `constructorPreamble`
-([01b5](./01b5_spanbuffer_memory_layout.md#smoo/lmao!n/spanbuffer-layout.constructor)), and arrow-builder's
-`generateColumnBufferClass` emits monomorphic per-column getters/setters with a fixed hidden-class shape
+These six patterns (monomorphic access, hidden-class stability + in-object property ordering, inline caching, cache-line
+alignment, sequential access) are structural properties of the **generated** SpanBuffer class. `getSpanBufferClass`
+(`packages/lmao/src/lib/spanBuffer.ts`) orders the hottest properties first in its `constructorPreamble`, which
+`generateColumnBufferClass` (`packages/arrow-builder/src/lib/buffer/columnBufferGenerator.ts:268`) places at the top of
+the generated constructor ([01b5](./01b5_spanbuffer_memory_layout.md#smoo/lmao!n/spanbuffer-layout.constructor)), and
+emits monomorphic per-column getters/setters with a fixed hidden-class shape
 ([01b6](./01b6_buffer_codegen_extension.md#smoo/lmao!n/buffer-codegen.generate-class)). Cache-line alignment is
-`getAlignedCapacity` in arrow-builder. The code blocks below are illustrative `BAD`/`GOOD` teaching examples, not
-literal source.
+`getAlignedCapacity` (`packages/arrow-builder/src/lib/buffer/bufferHelpers.ts:26`). The code blocks below are
+**Example** `BAD`/`GOOD` teaching snippets, not literal source.
 
 ### 1. Monomorphic Array Access
 
@@ -246,10 +247,10 @@ class BufferWriter {
 
 **WHY**: CPUs load memory in 64-byte cache lines. Aligned access = fewer cache misses.
 
-**Implementation status**: Realized as `getAlignedCapacity` (`packages/arrow-builder/src/lib/buffer/bufferHelpers.ts`) —
-rounds capacity up to a multiple of 8, which is both the null-bitmap byte-boundary requirement
+`getAlignedCapacity` (`packages/arrow-builder/src/lib/buffer/bufferHelpers.ts`) rounds capacity up to a multiple of 8,
+which is both the null-bitmap byte-boundary requirement
 ([01b2 §Multiple of 8](./01b2_buffer_self_tuning.md#smoo/lmao!n/buffer-tuning-multiple-of-8)) and 64-byte cache-line
-alignment for `BigInt64Array`. The `alignedCapacity` / `byteOffset % 64` sketch below is illustrative.
+alignment for `BigInt64Array`. The `alignedCapacity` / `byteOffset % 64` sketch below is an **Example**.
 
 ```typescript
 // Cache line aware sizing
@@ -430,11 +431,11 @@ class GeneratedEnumColumn {
 
 **Performance Characteristics:**
 
-| Operation                   | Cost                                | Allocations                       |
-| --------------------------- | ----------------------------------- | --------------------------------- |
-| Startup                     | O(n log n) sort + O(n) UTF-8 encode | Dictionary arrays                 |
-| Warmed fixed-capacity write | O(1) switch + array write           | Target: zero new heap allocations |
-| Cold path flush             | O(1) slice                          | Index array copy                  |
+| Operation                   | Cost                                | Allocations               |
+| --------------------------- | ----------------------------------- | ------------------------- |
+| Startup                     | O(n log n) sort + O(n) UTF-8 encode | Dictionary arrays         |
+| Warmed fixed-capacity write | O(1) switch + array write           | Zero new heap allocations |
+| Cold path flush             | O(1) slice                          | Index array copy          |
 
 #### 2. CATEGORY: Raw String Storage + Cold-Path Dictionary (Repeated Values)
 
@@ -545,7 +546,7 @@ export const globalUtf8Cache = new Utf8Cache();
 
 | Operation                   | Cost                         | Allocations                                              |
 | --------------------------- | ---------------------------- | -------------------------------------------------------- |
-| Warmed fixed-capacity write | O(1) array assignment        | Target: zero new heap allocations                        |
+| Warmed fixed-capacity write | O(1) array assignment        | Zero new heap allocations                                |
 | Per-request flush           | O(n log n) sort + O(n) UTF-8 | Dictionary/Arrow output arrays                           |
 | UTF-8 cache hit             | O(1) SIEVE get               | No required new encoded-byte buffer; lookup work remains |
 | UTF-8 miss                  | O(k) encode + O(1) SIEVE set | Uint8Array                                               |
@@ -670,7 +671,7 @@ class TextColumn {
 
 | Operation                   | Cost                                      | Allocations                                         |
 | --------------------------- | ----------------------------------------- | --------------------------------------------------- |
-| Warmed fixed-capacity write | O(1) array assignment                     | Target: zero new heap allocations                   |
+| Warmed fixed-capacity write | O(1) array assignment                     | Zero new heap allocations                           |
 | Per-request flush           | O(n) count + O(n log n) sort + O(n) UTF-8 | Dictionary/values arrays                            |
 | Post-flush                  | Strings array reference cleared           | GC/reclamation is observable, not immediate or free |
 
@@ -1455,5 +1456,5 @@ Buffer performance optimizations leverage:
 - **Sequential access** - Prefetch friendly
 - **Hot path isolation** - Fast common case
 
-Result target: warmed fixed-capacity writes introduce zero new heap allocations and use fixed monomorphic stores with a
+Result: warmed fixed-capacity writes introduce zero new heap allocations and use fixed monomorphic stores with a
 predictable capacity branch. Startup, span setup, overflow, and request flush retain separate measured budgets.

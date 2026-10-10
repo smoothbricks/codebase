@@ -1,14 +1,5 @@
 # LMAO Inspector <a id="smoo/lmao!n/inspector"></a>
 
-> **Implementation status (partial — data layer shipped, UI not).** `packages/lmao-inspector/src` ships the **data
-> layer**: the stream source (`createStreamSource`, WebSocket + SSE with reconnect/backoff), the archive source
-> (`createArchiveSource`), and the DuckDB-WASM query engine (`createQueryEngine`). **Not yet built:** the Tamagui
-> **components** (`TraceViewer` / `TraceTimeline` / `SpanDetail` / `LogSearch`), the host-app cross-linking callbacks,
-> and the `msgpack_extract` integration in the WASM engine. Two **contract drifts** from the spec's Public API are noted
-> inline at each affected heading (the shipped `createStreamSource`/`createArchiveSource` signatures differ, and SSE is
-> folded into `createStreamSource` rather than a separate `createSseSource`). The shipped, missing, and drift items are
-> staged as `smoo/lmao` nodes.
-
 ## Overview <a id="smoo/lmao!n/inspector.overview"></a>
 
 `packages/lmao-inspector` is a standalone trace viewer package built with Tamagui. It provides components for searching,
@@ -40,11 +31,8 @@ processes them client-side.
 
 ### Live Stream Source <a id="smoo/lmao!n/inspector-stream-source"></a>
 
-> **Implementation status (shipped, with a config drift).** `packages/lmao-inspector/src/sources/stream-source.ts` ships
-> `createStreamSource` — it opens a WebSocket **or** SSE connection (the `transport` field selects), receives Arrow IPC
-> frames (binary over WS; base64-decoded over SSE), parses them with flechette, and auto-reconnects with exponential
-> backoff capped at 30s. **Drift:** the shipped config is `{ url, transport: 'websocket' | 'sse', topic }`, not the
-> Public-API section's `{ wsUrl, groupId }`; reconcile the two (see `n/inspector-public-api`).
+`createStreamSource` opens a WebSocket or SSE connection, receives Arrow IPC frames (binary over WebSocket,
+base64-encoded over SSE), parses them with flechette, and auto-reconnects with exponential backoff capped at 30 s.
 
 Connects to a MessageRelay Durable Object (see `extern/graphql/src/message-relay.ts`) via WebSocket. The relay pattern:
 
@@ -60,12 +48,9 @@ For Bun backends: direct SSE endpoint that pushes RecordBatches as they arrive (
 
 ### Archive Source <a id="smoo/lmao!n/inspector-archive-source"></a>
 
-> **Implementation status (shipped, with a config drift).** `packages/lmao-inspector/src/sources/archive-source.ts`
-> ships `createArchiveSource`, whose `fetchRange(startTime, endTime)` HTTP-GETs the archive endpoint and yields Arrow
-> IPC buffers as an async iterable (progressive loading; splits on the Arrow IPC continuation/EOS framing, falling back
-> to a single batch for non-stream responses). **Drift:** the shipped factory takes
-> `createArchiveSource(baseUrl: string)`, not the Public-API section's `createArchiveSource({ fetchUrl })`; reconcile
-> the two (see `n/inspector-public-api`).
+`createArchiveSource` fetches archive Arrow IPC buffers over HTTP GET and yields them as an async iterable for
+progressive loading. The response is split on Arrow IPC continuation and end-of-stream framing; a response that is not
+an IPC stream is yielded as a single batch.
 
 Fetches historical Arrow IPC or Parquet files from object storage (R2, S3) by time range. Used for:
 
@@ -77,13 +62,10 @@ Archive files follow the existing LMAO flush path: `{prefix}/{date}/{batch-id}.a
 
 ## Arrow Query Engine <a id="smoo/lmao!n/inspector-query-engine"></a>
 
-> **Implementation status (shipped, minus msgpack_extract).** `packages/lmao-inspector/src/engine/query-engine.ts` ships
-> `createQueryEngine` — a lazy singleton DuckDB-WASM engine (CDN-hosted bundle, dynamic-imported so import-time cost is
-> zero; `registerArrowBatch` registers an Arrow IPC buffer as a named table via `arrow_scan`; `query` runs SQL; `close`
-> tears down files/worker; init failure resets the singleton for retry). **Not yet built:** the `msgpack_extract` path
-> for `S.unknown()` Binary columns (neither a WASM extension nor a client-side msgpack pre-deserialize) — tracked as
-> `n/inspector-msgpack-wasm`, and it shares the subset/decoder design with the server-side extension (spec 02
-> `n/query-engine-msgpack-extract`).
+`createQueryEngine` returns a lazy singleton DuckDB-WASM engine, created on first use. The CDN-hosted bundle is
+dynamically imported, so import-time cost is zero. `registerArrowBatch` registers an Arrow IPC buffer as a named table
+via `arrow_scan`, `query` runs SQL, and `close` drops registered files, closes the connection, and terminates the
+worker. An init failure resets the singleton so a later call can retry.
 
 Client-side engine that processes Arrow RecordBatches in the browser. The engine is **DuckDB-WASM**. Candidates
 considered:
@@ -103,11 +85,6 @@ the `msgpack_extract()` extension from `02_query_engine.md` applies here too —
 client-side msgpack deserialization before query.
 
 ## Components <a id="smoo/lmao!n/inspector-components"></a>
-
-> **Implementation status (not built).** None of the Tamagui components below exist in `packages/lmao-inspector/src` —
-> the package currently exports only the data layer (sources + engine). All four are staged as one missing-work node
-> `n/inspector-components`; the per-component headings (`TraceViewer` / `TraceTimeline` / `SpanDetail` / `LogSearch`)
-> anchor to its `.sub` regions.
 
 All components are Tamagui-based (cross-platform). The Arrow query engine is web-only — on native, components show a
 simplified list view without client-side SQL.
@@ -164,20 +141,6 @@ The inspector queries LMAO's Arrow column schema (`01f_arrow_table_structure.md`
 | \*             | S.unknown | Queryable via msgpack extraction              |
 
 ## Public API <a id="smoo/lmao!n/inspector-public-api"></a>
-
-> **Implementation status (partial + drift).** `packages/lmao-inspector/src/index.ts` exports the **data layer only**:
-> `createStreamSource`, `createArchiveSource`, `createQueryEngine` (+ their types and a test-only
-> `_resetEngineForTesting`). The component exports (`TraceViewer` / `TraceTimeline` / `SpanDetail` / `LogSearch`) are
-> **absent** (unbuilt). The signatures below also **drift** from what shipped, and the drift must be reconciled
-> (`n/inspector-public-api`):
->
-> - shipped `createStreamSource({ url, transport, topic })` vs. spec `({ wsUrl, groupId })`;
-> - shipped `createArchiveSource(baseUrl: string)` vs. spec `({ fetchUrl })`;
-> - **no** separate `createSseSource` — SSE is the `transport: 'sse'` mode of `createStreamSource`;
-> - sources return an `onBatch`/`fetchRange` shape, not the spec's abstract `TraceSource`.
->
-> Decide which is canonical (the running code, or the `{ wsUrl, groupId }` / `createSseSource` design) and converge the
-> spec block + the source together — do not leave both.
 
 ```typescript
 // Sources

@@ -13,24 +13,24 @@ The Arrow Table Structure defines the final queryable format produced by the tra
 
 ## Arrow Ownership and Copy Contract <a id="smoo/lmao!n/arrow-table-zero-copy"></a>
 
-Conversion does not guarantee payload borrowing across all columns. It uses the cheapest correct mode per physical
-column:
+**CRITICAL**: All Arrow conversions MUST wrap direct TypedArray references as bounded `subarray()` views and pass them
+to `arrow.makeData()` (flechette's direct `Batch`). A copy needs a measured reason: a benchmark against the borrow. Each
+physical column uses the cheapest correct mode:
 
-| Input / boundary                                      | Required mode                                          | Owner and lifetime                                                           |
-| ----------------------------------------------------- | ------------------------------------------------------ | ---------------------------------------------------------------------------- |
-| Contiguous primitive or compatible null region        | Borrow bounded `subarray()` payload when supported     | SpanBuffer/WASM owns bytes; `ArrowLease` pins backing store and memory epoch |
-| Overflow chain accepted as Arrow chunks               | Wrap each physical chunk                               | One lease pins every source chunk; wrapper/view allocations still count      |
-| Consumer requires one contiguous region               | Allocate once and bulk-copy chunks                     | Arrow owns output; charge allocation and copied bytes to flush               |
-| Dictionary/category/text                              | Build required indices, UTF-8, offsets, and dictionary | Arrow owns constructed buffers; immutable shared dictionaries may be leased  |
-| Mutable/incompatible input or unpinned async lifetime | Copy to Arrow-owned storage                            | Lifetime correctness overrides copy avoidance                                |
+| Input / boundary                                      | Required mode                                               | Owner and lifetime                                                           |
+| ----------------------------------------------------- | ----------------------------------------------------------- | ---------------------------------------------------------------------------- |
+| Contiguous primitive or compatible null region        | Borrow bounded `subarray()` payload                         | SpanBuffer/WASM owns bytes; `ArrowLease` pins backing store and memory epoch |
+| Overflow chain accepted as Arrow chunks               | Wrap each physical chunk                                    | One lease pins every source chunk; wrapper/view allocations still count      |
+| Consumer requires one contiguous region               | Allocate once and bulk-copy chunks, measured against borrow | Arrow owns output; charge allocation and copied bytes to flush               |
+| Dictionary/category/text                              | Build required indices, UTF-8, offsets, and dictionary      | Arrow owns constructed buffers; immutable shared dictionaries may be leased  |
+| Mutable/incompatible input or unpinned async lifetime | Copy to Arrow-owned storage                                 | Lifetime correctness overrides copy avoidance                                |
 
 Per-value builder `append()` is PROHIBITED for bulk columns. Direct wrapping can still allocate JS view/wrapper objects;
 those count toward flush allocations.
 
-**Shipped versus target.** Shipped flechette wraps final TypedArrays and bulk-concatenates overflow/null data when
-contiguity is required; dictionary/UTF-8 construction allocates. The target preserves Arrow-native chunks wherever
-consumers accept them and carries explicit `ArrowLease` ownership through asynchronous consumption. Until that lifetime
-contract is end to end, borrowed views cannot outlive synchronous consumption.
+Conversion preserves Arrow-native chunks wherever consumers accept them and carries explicit `ArrowLease` ownership
+through asynchronous consumption, so a borrowed view lives exactly as long as its lease; overflow and null data are
+bulk-concatenated only for a consumer that requires one contiguous region.
 
 `PhysicalLayoutPlan` determines direct compatibility/chunk/copy policy. Versioned `VocabularyBinding` occurs at startup
 and may supply immutable dictionaries/layout fragments; request flush does not mutate the plan.
@@ -1270,9 +1270,9 @@ efficiency and shared dictionaries.
 
 The conversion lives in `packages/lmao/src/lib/convertToArrow.ts` (`convertSpanTreeToArrowTable`, the two-pass tree walk
 of [01k](./01k_tree_walker_and_arrow_conversion.md)). The back-end is `@uwdata/flechette`. Final contiguous TypedArrays
-are wrapped by bounded views; overflow/null concatenation performs one explicit bulk copy, and UTF-8/dictionary
-construction owns its output. This is the shipped ownership behavior; every copied boundary remains explicit. Helpers
-live in `packages/arrow-builder/src/lib/arrow/data.ts`:
+are wrapped by bounded views; overflow chains are wrapped chunk by chunk, and the one explicit bulk copy is for a
+consumer that requires one contiguous region (the copy contract above). UTF-8/dictionary construction owns its output,
+and every copied boundary is explicit. Helpers live in `packages/arrow-builder/src/lib/arrow/data.ts`:
 
 - `createUint8Data` / `createUint16Data` / `createUint32Data` / `createInt32Data` / `createFloat64Data` /
   `createBoolData` — primitive columns borrow bounded `values.subarray(0, length)` payloads under the applicable
@@ -1296,7 +1296,7 @@ system columns. Dictionary building (`DictionaryBuilder`, `createSortedDictionar
 ```typescript
 // Borrow bounded views from each physical chunk.
 const valueArrays = buffers.map((buf) => buf.column.subarray(0, buf._writeIndex));
-// Shipped contiguous fallback: one Arrow-owned bulk concatenation copy.
+// Contiguous-consumer path: one Arrow-owned bulk concatenation copy, measured against the borrow.
 const allValues = concatenateFloat64Arrays(valueArrays);
 const { nullBitmap, nullCount } = concatenateNullBitmaps(buffers, columnName);
 // Wrap as a flechette Batch; the bounded payload is borrowed, while view/Batch wrappers are counted
