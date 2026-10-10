@@ -69,7 +69,7 @@ export function isTestRunnerTargetName(name: string): boolean {
 const nxJsTypescriptPlugin = '@nx/js/typescript';
 const smoothBricksNxPlugin = '@smoothbricks/nx-plugin';
 const cleanOutputsExecutor = '@smoothbricks/nx-plugin:clean-outputs';
-const expectedSharedGlobalsNamedInput = ['{workspaceRoot}/.github/workflows/ci.yml'];
+const ciWorkflowNamedInput = ['{workspaceRoot}/.github/workflows/ci.yml'];
 const inferredTestTypecheckTarget = 'typecheck-tests';
 const defaultProductionNamedInput = [
   '{projectRoot}/src/**/*',
@@ -333,10 +333,14 @@ function validateNamedInputDefaults(
       message: 'namedInputs.default must be an array; smoo allows it to remain broad for non-production tasks.',
     });
   }
-  if (!stringArrayEquals(namedInputs.sharedGlobals, expectedSharedGlobalsNamedInput)) {
+  if (
+    Array.isArray(namedInputs.default) &&
+    namedInputs.default.includes('sharedGlobals') &&
+    stringArrayEquals(namedInputs.sharedGlobals, ciWorkflowNamedInput)
+  ) {
     issues.push({
       path: nxJsonPath,
-      message: 'namedInputs.sharedGlobals must include only {workspaceRoot}/.github/workflows/ci.yml',
+      message: 'namedInputs.default must not include CI-only sharedGlobals; workflow targets declare their own inputs.',
     });
   }
   const production = namedInputs.production;
@@ -437,11 +441,14 @@ function applyCleanTargetDefault(nxJson: Record<string, unknown>): boolean {
 function applyNamedInputDefaults(nxJson: Record<string, unknown>): boolean {
   const namedInputs = getOrCreateRecord(nxJson, 'namedInputs');
   let changed = false;
-  if (!Array.isArray(namedInputs.default)) {
-    namedInputs.default = ['{projectRoot}/**/*', 'sharedGlobals'];
+  const defaults = namedInputs.default;
+  if (!Array.isArray(defaults)) {
+    namedInputs.default = ['{projectRoot}/**/*'];
+    changed = true;
+  } else if (defaults.includes('sharedGlobals') && stringArrayEquals(namedInputs.sharedGlobals, ciWorkflowNamedInput)) {
+    namedInputs.default = defaults.filter((input) => input !== 'sharedGlobals');
     changed = true;
   }
-  changed = setStringArrayProperty(namedInputs, 'sharedGlobals', expectedSharedGlobalsNamedInput) || changed;
   const production = namedInputs.production;
   if (!Array.isArray(production) || !isPreciseProductionNamedInput(production)) {
     namedInputs.production = defaultProductionNamedInput;
@@ -527,15 +534,6 @@ function setBooleanProperty(record: Record<string, unknown>, key: string, value:
 
 function setStringProperty(record: Record<string, unknown>, key: string, value: string): boolean {
   if (record[key] === value) {
-    return false;
-  }
-  record[key] = value;
-  return true;
-}
-
-function setStringArrayProperty(record: Record<string, unknown>, key: string, value: string[]): boolean {
-  const current = record[key];
-  if (stringArrayEquals(current, value)) {
     return false;
   }
   record[key] = value;

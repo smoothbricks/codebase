@@ -4,14 +4,13 @@ import { collectBuildInputs, resolveBuildInputPatterns } from '../build-inputs.j
 
 const nxJson: NxJson = {
   namedInputs: {
-    default: ['{projectRoot}/**/*', 'sharedGlobals'],
+    default: ['{projectRoot}/**/*'],
     production: [
       '{projectRoot}/src/**/*',
       '{projectRoot}/package.json',
       '!{projectRoot}/**/__tests__/**',
       '!{projectRoot}/**/*.test.*',
     ],
-    sharedGlobals: ['{workspaceRoot}/.github/workflows/ci.yml'],
   },
 };
 

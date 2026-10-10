@@ -225,9 +225,8 @@ describe('root smoo monorepo policy', () => {
       await writeJson(join(root, 'nx.json'), {
         ...validConfiguredNxJson(),
         namedInputs: {
-          default: ['{projectRoot}/**/*', 'sharedGlobals'],
+          default: ['{projectRoot}/**/*'],
           production: ['default', '{projectRoot}/**/*'],
-          sharedGlobals: ['{workspaceRoot}/.github/workflows/ci.yml'],
         },
       });
       const errors = captureConsoleErrors();
@@ -245,6 +244,55 @@ describe('root smoo monorepo policy', () => {
     }
   });
 
+  it('migrates CI-only default inputs without discarding explicit workflow or custom named inputs', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'smoo-package-policy-'));
+    try {
+      await writeJson(join(root, 'package.json'), validRootPackage());
+      await writeJson(join(root, 'nx.json'), {
+        ...validConfiguredNxJson(),
+        namedInputs: {
+          ...validNamedInputs(),
+          default: ['{projectRoot}/**/*', 'sharedGlobals', 'custom'],
+          sharedGlobals: ['{workspaceRoot}/.github/workflows/ci.yml'],
+          custom: ['{workspaceRoot}/config/shared.json'],
+        },
+        targetDefaults: {
+          ...validTargetDefaults(),
+          workflowLint: { inputs: ['sharedGlobals'] },
+        },
+      });
+      const errors = captureConsoleErrors();
+      expect(validateNxReleaseConfig(root)).toBe(1);
+      expect(errors.join('\n')).toContain('CI-only sharedGlobals');
+      applyNxPluginDefaults(root);
+      const nxJson = await readJson(join(root, 'nx.json'));
+      expect(nxJson.namedInputs.default).toEqual(['{projectRoot}/**/*', 'custom']);
+      expect(nxJson.namedInputs.sharedGlobals).toEqual(['{workspaceRoot}/.github/workflows/ci.yml']);
+      expect(nxJson.namedInputs.custom).toEqual(['{workspaceRoot}/config/shared.json']);
+      expect(nxJson.targetDefaults.workflowLint.inputs).toEqual(['sharedGlobals']);
+      expect(validateNxReleaseConfig(root)).toBe(0);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('leaves committed nx.json unchanged through the shared prebuild and update defaults', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'smoo-package-policy-'));
+    try {
+      await writeJson(join(root, 'package.json'), validRootPackage());
+      const nxJsonPath = join(root, 'nx.json');
+      const committed = await readFile(join(import.meta.dir, '../../../../nx.json'), 'utf8');
+      await writeFile(nxJsonPath, committed);
+      applyFixableMonorepoDefaults(root);
+      expect(await readFile(nxJsonPath, 'utf8')).toBe(committed);
+      expect(validateNxReleaseConfig(root)).toBe(0);
+      applyFixableMonorepoDefaults(root);
+      expect(await readFile(nxJsonPath, 'utf8')).toBe(committed);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it('accepts custom precise production named inputs for non-TypeScript tools', async () => {
     const root = await mkdtemp(join(tmpdir(), 'smoo-package-policy-'));
     try {
@@ -252,14 +300,13 @@ describe('root smoo monorepo policy', () => {
       await writeJson(join(root, 'nx.json'), {
         ...validConfiguredNxJson(),
         namedInputs: {
-          default: ['{projectRoot}/**/*', 'sharedGlobals'],
+          default: ['{projectRoot}/**/*'],
           production: [
             '{projectRoot}/Cargo.toml',
             '{projectRoot}/src/**/*.rs',
             '{projectRoot}/pyproject.toml',
             '{projectRoot}/python/**/*.py',
           ],
-          sharedGlobals: ['{workspaceRoot}/.github/workflows/ci.yml'],
         },
       });
 
@@ -1670,9 +1717,8 @@ function validRootPackage(extra: Record<string, unknown> = {}): Record<string, u
 function validNxJson(): Record<string, unknown> {
   return {
     namedInputs: {
-      default: ['{projectRoot}/**/*', 'sharedGlobals'],
+      default: ['{projectRoot}/**/*'],
       production: ['default'],
-      sharedGlobals: ['{workspaceRoot}/.github/workflows/ci.yml'],
     },
     targetDefaults: {
       'lint:fix': { executor: 'nx:run-commands' },
@@ -1727,7 +1773,7 @@ function validTargetDefaults(): Record<string, unknown> {
 
 function validNamedInputs(): Record<string, unknown> {
   return {
-    default: ['{projectRoot}/**/*', 'sharedGlobals'],
+    default: ['{projectRoot}/**/*'],
     production: [
       '{projectRoot}/src/**/*',
       '{projectRoot}/package.json',
@@ -1735,7 +1781,6 @@ function validNamedInputs(): Record<string, unknown> {
       '!{projectRoot}/**/*.test.*',
       '!{projectRoot}/**/*.spec.*',
     ],
-    sharedGlobals: ['{workspaceRoot}/.github/workflows/ci.yml'],
   };
 }
 
