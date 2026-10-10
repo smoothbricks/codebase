@@ -9,7 +9,7 @@ import {
   symlinkSync,
   writeFileSync,
 } from 'node:fs';
-import { dirname, join, relative, resolve } from 'node:path';
+import { dirname, join, parse, relative, resolve } from 'node:path';
 import { $ } from 'bun';
 import { decode, run } from '../lib/run.js';
 
@@ -47,33 +47,13 @@ export async function applyWorkspaceGitConfig(root: string): Promise<void> {
 }
 
 async function wireWorkspaceGit(root: string): Promise<void> {
-  const gitDirResult = await $`git rev-parse --git-dir`.cwd(root).quiet().nothrow();
-  if (gitDirResult.exitCode !== 0) {
-    throw new Error(
-      `git rev-parse --git-dir in ${root} failed with exit code ${gitDirResult.exitCode}: ${decode(gitDirResult.stderr).trim()}`,
-    );
-  }
+  // Located on disk, never through `git rev-parse`: a stale include or a denied config must not be
+  // followed to find where the repository's config and hooks live.
+  const config = repositoryConfig(root);
+  const gitDir = dirname(config.file);
+  const tooling = join(config.checkout, 'tooling');
 
-  const gitDir = resolve(root, decode(gitDirResult.stdout).trim());
-  const tooling = join(root, 'tooling');
-
-  await run('git', ['config', '--local', 'include.path', join(tooling, 'workspace.gitconfig')], root);
-
-  // Keep the newer runtime version pins on any merge (nvfetcher overlay +
-  // devenv.lock) so a mirror sync's `git am --3way` never stalls on a version
-  // conflict. Mapped by the managed .gitattributes (merge=smoo-newer-pins);
-  // implemented in tooling/direnv/merge-newer-pins.sh. Runtime package.json
-  // pin repair is explicit via `smoo monorepo init --runtime-only`.
-  await run(
-    'git',
-    ['config', '--local', 'merge.smoo-newer-pins.name', 'keep the newer devenv/nvfetcher runtime pins'],
-    root,
-  );
-  await run(
-    'git',
-    ['config', '--local', 'merge.smoo-newer-pins.driver', 'bash tooling/direnv/merge-newer-pins.sh %O %A %B %P'],
-    root,
-  );
+  await keepRepositoryConfig(config);
   linkHook(gitDir, tooling, 'pre-commit');
   installPostCommitHook(gitDir, tooling);
   linkHook(gitDir, tooling, 'commit-msg');
@@ -149,6 +129,34 @@ function stripBlock(content: string, begin: string, end: string): string {
   return [...lines.slice(0, start), ...lines.slice(resume)].join('\n');
 }
 
+/** The config file whose include it owns: a standalone checkout's own, or a linked worktree's primary. */
+interface RepositoryConfig {
+  file: string;
+  checkout: string;
+}
+
+/**
+ * Locates the config on disk as the managed setup does: a `.git` directory, or a gitdir pointer
+ * whose `commondir` names the primary repository. Never a git command, so a broken include or a
+ * denied config is not followed to find it.
+ */
+function repositoryConfig(root: string): RepositoryConfig {
+  const dotGit = join(root, '.git');
+  if (statSync(dotGit).isDirectory()) {
+    return { file: join(dotGit, 'config'), checkout: root };
+  }
+  const pointer = /^gitdir: (.+)$/m.exec(readFileSync(dotGit, 'utf8'));
+  if (pointer?.[1] === undefined) {
+    throw new Error(`${dotGit} is neither a git directory nor a gitdir pointer`);
+  }
+  const gitDir = resolve(root, pointer[1].trim());
+  if (!existsSync(join(gitDir, 'commondir'))) {
+    return { file: join(gitDir, 'config'), checkout: root };
+  }
+  const common = resolve(gitDir, readFileSync(join(gitDir, 'commondir'), 'utf8').trim());
+  return { file: join(common, 'config'), checkout: dirname(common) };
+}
+
 function readLinkOrNull(path: string): string | null {
   try {
     return readlinkSync(path);
@@ -158,3 +166,50 @@ function readLinkOrNull(path: string): string | null {
 }
 
 export const postCommitHookFileForTest = postCommitHookFile;
+
+/**
+ * Converges the checkout's repository config on the managed settings, as the managed direnv setup
+ * does: the config file is read and written with `--file` from outside the repository, so no
+ * stale or write-denied include is followed during repair. Only keys that differ are written;
+ * `include.path` is spelled relative to the config's own directory, so a copy-on-write clone
+ * names its own workspace file wherever it sits.
+ */
+async function keepRepositoryConfig(config: RepositoryConfig): Promise<void> {
+  const configFile = config.file;
+  const outside = parse(configFile).root;
+  const settings: { key: string; value: string; replaces?: string }[] = [
+    {
+      key: 'include.path',
+      value: relative(dirname(configFile), join(config.checkout, 'tooling', 'workspace.gitconfig')),
+      replaces: '(^|/)tooling/workspace\\.gitconfig$',
+    },
+    { key: 'merge.smoo-newer-pins.name', value: 'keep the newer devenv/nvfetcher runtime pins' },
+    { key: 'merge.smoo-newer-pins.driver', value: 'bash tooling/direnv/merge-newer-pins.sh %O %A %B %P' },
+  ];
+  const keys = `^(${settings.map((setting) => setting.key.replaceAll('.', '\\.')).join('|')})$`;
+  const read = await $`git config --file ${configFile} --get-regexp ${keys}`.cwd(outside).quiet().nothrow();
+  // Exit 1 is git's "no such key": nothing is set yet.
+  if (read.exitCode !== 0 && read.exitCode !== 1) {
+    throw new Error(
+      `git config --file ${configFile} --get-regexp failed with exit code ${read.exitCode}: ${decode(read.stderr).trim()}`,
+    );
+  }
+  const current = new Map<string, string[]>();
+  for (const line of decode(read.stdout).split('\n')) {
+    if (line === '') continue;
+    const space = line.indexOf(' ');
+    const key = space === -1 ? line : line.slice(0, space);
+    current.set(key, [...(current.get(key) ?? []), space === -1 ? '' : line.slice(space + 1)]);
+  }
+  for (const setting of settings) {
+    const replaced = setting.replaces === undefined ? null : new RegExp(setting.replaces);
+    const owned = (current.get(setting.key) ?? []).filter((value) => replaced?.test(value) ?? true);
+    if (owned.length === 1 && owned[0] === setting.value) continue;
+    const pattern = setting.replaces === undefined ? [] : [setting.replaces];
+    await run(
+      'git',
+      ['config', '--file', configFile, '--replace-all', setting.key, setting.value, ...pattern],
+      outside,
+    );
+  }
+}

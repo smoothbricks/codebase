@@ -1058,7 +1058,8 @@ An Nx task hash must not change between checkouts of the same tree.
   escaping job links and the mint's read grants are not touched by that migration.
 
 A project-contained developer alias is a relative link within its checkout. A source-image fork therefore selects its
-own copy without borrowing its donor's tree. Genuine sibling links retain their distinct host-local authority.
+own copy without borrowing its donor's tree. Ordinary activation normalizes absolute aliases into this checkout. Genuine
+sibling links retain their distinct host-local authority.
 
 ### The adoption needs the target's Nx database closed
 
