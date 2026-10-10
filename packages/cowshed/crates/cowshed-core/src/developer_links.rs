@@ -10,6 +10,9 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 
+use crate::capabilities::bun::BUN_HOME;
+use crate::capabilities::cache::SharedToolHome;
+use crate::capabilities::pnpm::PNPM_HOME;
 use crate::fork_lock::Run as _;
 use crate::fsio::AnchoredDirectory;
 use crate::{CowshedError, Result};
@@ -18,9 +21,110 @@ pub const ROOT_ENV: &str = "COWSHED_PACKAGE_MANAGER_ROOT";
 pub const TOOL_BIN_ENV: &str = "COWSHED_TOOL_BIN";
 pub const INSTALL_OBSERVED_ENV: &str = "COWSHED_INSTALL_OBSERVED";
 
+/// The shared package-store roots a checkout's installers write to. A link into one is the
+/// installer's own entry, never a developer binding. Classification only: a root grants no read.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PackageStores {
+    bun: Option<StoreRoot>,
+    pnpm: Option<StoreRoot>,
+}
+
+/// One package-store root as its tool home names it, and its canonical form when the root exists.
+///
+/// The raw path matches a link spelled the way the home names the store. The canonical form
+/// matches a link that spells the physical directory, which is how a symlinked home's store is
+/// reached. Both come from the configured root alone, never from a link found in the tree being
+/// captured.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct StoreRoot {
+    raw: PathBuf,
+    canonical: Option<PathBuf>,
+}
+
+impl StoreRoot {
+    /// Resolve `raw` for classification. A root that is absent, or whose ancestors this user cannot
+    /// search, keeps its raw form alone: no ancestor or default is guessed in its place. Any other
+    /// failure is an error, because the root cannot be classified against.
+    fn resolve(raw: PathBuf) -> Result<Self> {
+        let canonical = match fs::canonicalize(&raw) {
+            Ok(canonical) => Some(canonical),
+            Err(error) if unprobeable(&error) => None,
+            Err(error) => {
+                return Err(CowshedError::integrity(
+                    format!(
+                        "cannot resolve package store root {}: {error}",
+                        raw.display()
+                    ),
+                    "repair the tool home variable or its directory permissions, then retry",
+                ));
+            }
+        };
+        Ok(Self { raw, canonical })
+    }
+
+    /// Whether `path` lies inside this root, by whole path components, in either spelling.
+    fn contains(&self, path: &Path) -> bool {
+        path.starts_with(&self.raw)
+            || self
+                .canonical
+                .as_deref()
+                .is_some_and(|canonical| path.starts_with(canonical))
+    }
+}
+
+impl PackageStores {
+    /// The stores of a controller home: each shared tool home's own host path under it.
+    pub fn from_home(home: &Path) -> Result<Self> {
+        Self::from_roots(
+            Some(BUN_HOME.host_path(home)),
+            Some(PNPM_HOME.host_path(home)),
+        )
+    }
+
+    /// The stores a wrapper names in its environment: each shared tool home's existing variable.
+    /// An unset variable leaves its store inactive.
+    pub fn from_environment() -> Result<Self> {
+        Self::from_roots(environment_root(&BUN_HOME), environment_root(&PNPM_HOME))
+    }
+
+    /// The stores named by explicit roots. A present root must be absolute: an empty or relative
+    /// root would match everything, so it is refused rather than read. Each present root is then
+    /// resolved to its canonical form where it exists, so a link spelled either way is recognized.
+    pub fn from_roots(bun: Option<PathBuf>, pnpm: Option<PathBuf>) -> Result<Self> {
+        for root in bun.iter().chain(pnpm.iter()) {
+            if !root.is_absolute() {
+                return Err(CowshedError::integrity(
+                    format!(
+                        "package store root {} is not an absolute path",
+                        root.display()
+                    ),
+                    "repair the tool home variable, or unset it",
+                ));
+            }
+        }
+        Ok(Self {
+            bun: bun.map(StoreRoot::resolve).transpose()?,
+            pnpm: pnpm.map(StoreRoot::resolve).transpose()?,
+        })
+    }
+
+    /// Whether `path` lies inside one of the roots, by whole path components.
+    fn contains(&self, path: &Path) -> bool {
+        [self.bun.as_ref(), self.pnpm.as_ref()]
+            .into_iter()
+            .flatten()
+            .any(|root| root.contains(path))
+    }
+}
+
+fn environment_root(home: &SharedToolHome) -> Option<PathBuf> {
+    home.variable.and_then(std::env::var_os).map(PathBuf::from)
+}
+
 #[derive(Debug, Default)]
 pub struct DeveloperLinks {
     links: Vec<DeveloperLink>,
+    stores: PackageStores,
 }
 
 #[derive(Debug)]
@@ -70,13 +174,16 @@ enum Plan {
 
 impl DeveloperLinks {
     /// Job-time snapshot: an unreadable target is kept as an unclassified, restorable link.
-    pub fn capture_job(root: &Path) -> Result<Self> {
-        Self::capture(root, CaptureMode::Job)
+    pub fn capture_job(root: &Path, stores: PackageStores) -> Result<Self> {
+        Self::capture(root, CaptureMode::Job, stores)
     }
 
-    pub fn capture(root: &Path, mode: CaptureMode) -> Result<Self> {
+    pub fn capture(root: &Path, mode: CaptureMode, stores: PackageStores) -> Result<Self> {
         let root = fs::canonicalize(root).map_err(|error| link_error(root, error))?;
-        let mut snapshot = Self::default();
+        let mut snapshot = Self {
+            links: Vec::new(),
+            stores,
+        };
         crate::capabilities::installed_javascript_trees(&root, |tree| {
             let directory = root.join(tree);
             crate::storage::verify_no_symlinks(&root, &directory)
@@ -124,7 +231,7 @@ impl DeveloperLinks {
         let parent = relative.parent().expect("a package link has a parent");
         let resolved = crate::inherited_links::resolve_in_source(root, parent, &target);
         // Bun and pnpm's own package-store entries are installer state, not developer choices.
-        if registry_store(root, &resolved) {
+        if registry_store(root, &self.stores, &resolved) {
             return Ok(());
         }
         let canonical = match fs::canonicalize(&at) {
@@ -135,6 +242,10 @@ impl DeveloperLinks {
             }
             Err(error) => return Err(link_error(&at, error)),
         };
+        // A developer alias into a physical package store is the store's entry, not a binding.
+        if self.stores.contains(&canonical) {
+            return Ok(());
+        }
         let metadata = match fs::metadata(&canonical) {
             Ok(metadata) => metadata,
             Err(error) if unreadable(&error, mode) => {
@@ -255,7 +366,7 @@ impl DeveloperLinks {
         // installer's pre-restore state.
         let mut decisions = Vec::with_capacity(self.links.len());
         for link in &self.links {
-            decisions.push(plan(root, &self.links, link, mode)?);
+            decisions.push(plan(root, &self.stores, &self.links, link, mode)?);
         }
         let mut findings = Vec::new();
         let mut restores = Vec::new();
@@ -279,33 +390,14 @@ fn link_error(path: &Path, error: impl std::fmt::Display) -> CowshedError {
     )
 }
 
-/// Registry replacements are links into the checkout's own `.bun`/`.pnpm` or a known global cache.
-fn registry_store(root: &Path, resolved: &Path) -> bool {
+/// The installer's own entries: a link into the checkout's own `.bun`/`.pnpm`, or into a shared
+/// package store the tool homes name. A registry replacement is one of these, never a binding.
+fn registry_store(root: &Path, stores: &PackageStores, resolved: &Path) -> bool {
     (resolved.starts_with(root)
         && resolved
             .components()
             .any(|part| matches!(part.as_os_str().to_str(), Some(".bun" | ".pnpm"))))
-        || global_store(resolved)
-}
-
-/// Bun's install cache and pnpm's store are the installer's global registries. Bun's global
-/// registrations and other global directories are developer choices, not registry.
-fn global_store(resolved: &Path) -> bool {
-    let mut earlier = None;
-    let mut previous = None;
-    for name in resolved
-        .components()
-        .filter_map(|part| part.as_os_str().to_str())
-    {
-        if (earlier == Some(".bun") && previous == Some("install") && name == "cache")
-            || (previous == Some("pnpm") && name == "store")
-        {
-            return true;
-        }
-        earlier = previous;
-        previous = Some(name);
-    }
-    false
+        || stores.contains(resolved)
 }
 
 /// Job capture keeps a permission-denied target restorable instead of refusing admission.
@@ -317,6 +409,7 @@ fn unreadable(error: &io::Error, mode: CaptureMode) -> bool {
 /// is decided from the installer's pre-restore state rather than restoration order.
 fn plan(
     root: &Path,
+    stores: &PackageStores,
     links: &[DeveloperLink],
     link: &DeveloperLink,
     mode: RestoreMode,
@@ -348,7 +441,7 @@ fn plan(
             RestoreMode::JobTerminal | RestoreMode::JobTerminalObservedInstall,
             Current::Link(current),
         ) => {
-            if preserved(root, links, link, current)? {
+            if preserved(root, stores, links, link, current)? {
                 Plan::Keep
             } else {
                 Plan::Restore
@@ -386,6 +479,7 @@ fn leaf_name(at: &Path) -> Result<CString> {
 /// owner was relinked to a live directory, so the explicit relink and its alias survive together.
 fn preserved(
     root: &Path,
+    stores: &PackageStores,
     links: &[DeveloperLink],
     link: &DeveloperLink,
     current: &[u8],
@@ -393,7 +487,7 @@ fn preserved(
     match &link.binding {
         Binding::Owned(_) | Binding::Sibling(_) => {
             let at = root.join(&link.at);
-            live_binding(root, &link.at, current).map_err(|error| link_error(&at, error))
+            live_binding(root, stores, &link.at, current).map_err(|error| link_error(&at, error))
         }
         Binding::Unclassified => Ok(false),
         Binding::Executable(owner) => {
@@ -403,7 +497,7 @@ fn preserved(
                 parent,
                 Path::new(OsStr::from_bytes(current)),
             );
-            if registry_store(root, &resolved) {
+            if registry_store(root, stores, &resolved) {
                 return Ok(false);
             }
             let alias_at = root.join(&link.at);
@@ -412,7 +506,7 @@ fn preserved(
                 Err(error) if unprobeable(&error) => return Ok(false),
                 Err(error) => return Err(link_error(&alias_at, error)),
             };
-            if registry_store(root, &canonical) {
+            if registry_store(root, stores, &canonical) {
                 return Ok(false);
             }
             match fs::metadata(&canonical) {
@@ -433,7 +527,8 @@ fn preserved(
             if owner_current.as_slice() == owner_link.target.as_os_str().as_bytes() {
                 return Ok(false);
             }
-            live_binding(root, owner, &owner_current).map_err(|error| link_error(&owner_at, error))
+            live_binding(root, stores, owner, &owner_current)
+                .map_err(|error| link_error(&owner_at, error))
         }
     }
 }
@@ -452,14 +547,19 @@ fn current_target(path: &Path) -> io::Result<Option<Vec<u8>>> {
     }
 }
 
-fn live_binding(root: &Path, relative: &Path, target: &[u8]) -> io::Result<bool> {
+fn live_binding(
+    root: &Path,
+    stores: &PackageStores,
+    relative: &Path,
+    target: &[u8],
+) -> io::Result<bool> {
     let parent = relative.parent().expect("a package link has a parent");
     let resolved = crate::inherited_links::resolve_in_source(
         root,
         parent,
         Path::new(OsStr::from_bytes(target)),
     );
-    if registry_store(root, &resolved) {
+    if registry_store(root, stores, &resolved) {
         return Ok(false);
     }
     let canonical = match fs::canonicalize(root.join(relative)) {
@@ -467,6 +567,9 @@ fn live_binding(root: &Path, relative: &Path, target: &[u8]) -> io::Result<bool>
         Err(error) if unprobeable(&error) => return Ok(false),
         Err(error) => return Err(error),
     };
+    if stores.contains(&canonical) {
+        return Ok(false);
+    }
     match fs::metadata(&canonical) {
         Ok(metadata) => Ok(metadata.is_dir()),
         Err(error) if unprobeable(&error) => Ok(false),
@@ -579,7 +682,11 @@ pub fn dispatch() -> io::Result<Option<ExitStatus>> {
     let root = std::env::var_os(ROOT_ENV)
         .ok_or_else(|| io::Error::other("managed package manager has no workspace root"))?;
     let root = Path::new(&root);
-    let snapshot = DeveloperLinks::capture_job(root).map_err(io::Error::other)?;
+    let snapshot = DeveloperLinks::capture_job(
+        root,
+        PackageStores::from_environment().map_err(io::Error::other)?,
+    )
+    .map_err(io::Error::other)?;
     if let Some(path) = std::env::var_os(INSTALL_OBSERVED_ENV) {
         fs::write(path, b"observed\n")?;
     }
@@ -607,8 +714,23 @@ pub fn dispatch() -> io::Result<Option<ExitStatus>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::capabilities::bun::BUN_HOME as BUN;
+    use crate::capabilities::pnpm::PNPM_HOME as PNPM;
     use crate::fork_lock::Run;
+    use crate::fsio::{Syncs, take_syncs};
     use std::os::unix::fs::symlink;
+
+    /// The stores of the fixture home beside a checkout. No fixture link names a store root, so
+    /// the existing fixtures classify exactly as they did before stores were explicit.
+    fn fixture_stores(checkout: &Path) -> PackageStores {
+        PackageStores::from_home(
+            &checkout
+                .parent()
+                .expect("a checkout has a parent")
+                .join("home"),
+        )
+        .expect("an absolute fixture home")
+    }
 
     #[test]
     fn developer_links_are_restored_without_borrowing_dependency_store_links() {
@@ -647,7 +769,8 @@ mod tests {
         )
         .unwrap();
         symlink("../@scope/dev/bin/dev", root.join("node_modules/.bin/dev")).unwrap();
-        let links = DeveloperLinks::capture(&root, CaptureMode::Mint).unwrap();
+        let links =
+            DeveloperLinks::capture(&root, CaptureMode::Mint, fixture_stores(&root)).unwrap();
         assert_eq!(links.links.len(), 3);
         assert_eq!(links.sibling_targets().collect::<Vec<_>>(), [&sibling]);
         fs::remove_file(root.join("node_modules/@scope/dev")).unwrap();
@@ -715,7 +838,7 @@ mod tests {
         symlink(&original, root.join("node_modules/@scope/dev")).unwrap();
         symlink(&gone, root.join("node_modules/@scope/removed")).unwrap();
         symlink("../@scope/dev/bin/dev", root.join("node_modules/.bin/dev")).unwrap();
-        let links = DeveloperLinks::capture_job(&root).unwrap();
+        let links = DeveloperLinks::capture_job(&root, fixture_stores(&root)).unwrap();
         assert_eq!(links.links.len(), 3);
         fs::remove_file(root.join("node_modules/@scope/dev")).unwrap();
         symlink(&other, root.join("node_modules/@scope/dev")).unwrap();
@@ -767,7 +890,7 @@ mod tests {
         let sibling = scratch.join("sibling");
         fs::create_dir_all(&sibling).unwrap();
         symlink(&sibling, root.join("node_modules/@scope/dev")).unwrap();
-        let links = DeveloperLinks::capture_job(&root).unwrap();
+        let links = DeveloperLinks::capture_job(&root, fixture_stores(&root)).unwrap();
         fs::remove_dir_all(root.join("node_modules/@scope")).unwrap();
         let foreign = scratch.join("foreign");
         fs::create_dir_all(&foreign).unwrap();
@@ -835,7 +958,7 @@ mod tests {
             root.join("node_modules/.bin/relinked-cli"),
         )
         .unwrap();
-        let links = DeveloperLinks::capture_job(&root).unwrap();
+        let links = DeveloperLinks::capture_job(&root, fixture_stores(&root)).unwrap();
         assert_eq!(links.links.len(), 6);
         fs::remove_file(root.join("node_modules/@scope/payload")).unwrap();
         fs::create_dir_all(root.join("node_modules/@scope/payload")).unwrap();
@@ -916,6 +1039,7 @@ mod tests {
                 target: target.clone(),
                 binding: Binding::Unclassified,
             }],
+            stores: PackageStores::default(),
         };
         assert_eq!(links.sibling_targets().count(), 0);
         links.restore(&root, RestoreMode::CoveredInstall).unwrap();
@@ -950,7 +1074,7 @@ mod tests {
         let sibling = scratch.join("sibling");
         fs::create_dir_all(&sibling).unwrap();
         symlink(&sibling, root.join("node_modules/@scope/dev")).unwrap();
-        let links = DeveloperLinks::capture_job(&root).unwrap();
+        let links = DeveloperLinks::capture_job(&root, fixture_stores(&root)).unwrap();
         fs::remove_file(root.join("node_modules/@scope/dev")).unwrap();
         let findings = links.restore(&root, RestoreMode::JobTerminal).unwrap();
         assert_eq!(findings.len(), 1);
@@ -979,9 +1103,49 @@ mod tests {
         );
     }
 
+    /// Restores are grouped by held parent: a parent with a changed entry is synced once, and a
+    /// parent whose links already name their targets is not synced at all.
     #[test]
-    fn global_caches_are_registry_and_global_registrations_stay_developer_siblings() {
-        let scratch = crate::temp_root::TempRoot::new("developer-links-global");
+    fn restore_syncs_each_changed_parent_once() {
+        let scratch = crate::temp_root::TempRoot::new("developer-links-one-sync");
+        let root = scratch.join("checkout");
+        fs::create_dir_all(root.join("node_modules/@scope")).unwrap();
+        let target = scratch.join("target");
+        let names = ["node_modules/a", "node_modules/b", "node_modules/@scope/c"];
+        let links = DeveloperLinks {
+            links: names
+                .into_iter()
+                .map(|at| DeveloperLink {
+                    at: PathBuf::from(at),
+                    target: target.clone(),
+                    binding: Binding::Unclassified,
+                })
+                .collect(),
+            stores: PackageStores::default(),
+        };
+        take_syncs();
+        links.restore(&root, RestoreMode::CoveredInstall).unwrap();
+        assert_eq!(
+            take_syncs(),
+            Syncs { fsync: 0, full: 2 },
+            "one sync for node_modules and one for node_modules/@scope"
+        );
+        for name in names {
+            assert_eq!(fs::read_link(root.join(name)).unwrap(), target);
+        }
+        links.restore(&root, RestoreMode::CoveredInstall).unwrap();
+        assert_eq!(
+            take_syncs(),
+            Syncs::default(),
+            "links that already name their targets are kept without a sync"
+        );
+    }
+
+    #[test]
+    fn package_store_roots_are_registry_and_developer_siblings_outside_them_are_bindings() {
+        let scratch_root = crate::temp_root::TempRoot::new("developer-links-stores");
+        let scratch = fs::canonicalize(&*scratch_root).unwrap();
+        let home = scratch.join("home");
         let root = scratch.join("checkout");
         fs::create_dir_all(root.join("node_modules/@scope")).unwrap();
         fs::write(root.join("package.json"), "{}\n").unwrap();
@@ -1001,15 +1165,96 @@ mod tests {
                 .unwrap()
                 .success()
         );
-        let cache = scratch.join(".bun/install/cache/pkg");
-        let registration = scratch.join(".bun/install/global/pkg");
-        fs::create_dir_all(&cache).unwrap();
-        fs::create_dir_all(&registration).unwrap();
-        symlink(&cache, root.join("node_modules/@scope/cached")).unwrap();
+        let bun_store = BUN.host_path(&home).join("pkg");
+        let pnpm_store = PNPM.host_path(&home).join("pkg");
+        let sibling = home.join("Dev/pnpm/store/pkg");
+        let registration = home.join(".bun/install/global/pkg");
+        let alias = home.join("alias-into-store");
+        for directory in [&bun_store, &pnpm_store, &sibling, &registration] {
+            fs::create_dir_all(directory).unwrap();
+        }
+        symlink(&bun_store, &alias).unwrap();
+        symlink(&bun_store, root.join("node_modules/@scope/bun-cache")).unwrap();
+        symlink(&pnpm_store, root.join("node_modules/@scope/pnpm-cache")).unwrap();
+        symlink(&alias, root.join("node_modules/@scope/aliased")).unwrap();
+        symlink(&sibling, root.join("node_modules/@scope/dev")).unwrap();
         symlink(&registration, root.join("node_modules/@scope/registered")).unwrap();
-        let links = DeveloperLinks::capture(&root, CaptureMode::Mint).unwrap();
-        assert_eq!(links.links.len(), 1);
-        assert_eq!(links.sibling_targets().collect::<Vec<_>>(), [&registration]);
+        let stores = PackageStores::from_home(&home).unwrap();
+        let links = DeveloperLinks::capture(&root, CaptureMode::Mint, stores).unwrap();
+        assert_eq!(
+            links.links.len(),
+            2,
+            "only the two real developer bindings are captured"
+        );
+        assert_eq!(
+            links.sibling_targets().collect::<Vec<_>>(),
+            [&sibling, &registration]
+        );
+    }
+
+    /// A home reached through a symlink names its stores by the raw path, and a link that spells
+    /// the physical store is still that store's entry. A developer sibling outside both spellings
+    /// stays a binding.
+    #[test]
+    fn a_symlinked_home_recognizes_its_store_by_the_physical_path() {
+        let scratch_root = crate::temp_root::TempRoot::new("developer-links-home-alias");
+        let scratch = fs::canonicalize(&*scratch_root).unwrap();
+        let physical_home = scratch.join("physical-home");
+        let home = scratch.join("home");
+        let root = scratch.join("checkout");
+        fs::create_dir_all(&physical_home).unwrap();
+        symlink(&physical_home, &home).unwrap();
+        fs::create_dir_all(root.join("node_modules/@scope")).unwrap();
+        fs::write(root.join("package.json"), "{}\n").unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "--quiet"])
+                .current_dir(&root)
+                .status_locked()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args(["add", "package.json"])
+                .current_dir(&root)
+                .status_locked()
+                .unwrap()
+                .success()
+        );
+        let store = BUN.host_path(&physical_home).join("pkg");
+        let sibling = physical_home.join("Dev/pnpm/store/pkg");
+        for directory in [&store, &sibling] {
+            fs::create_dir_all(directory).unwrap();
+        }
+        symlink(&store, root.join("node_modules/@scope/store-entry")).unwrap();
+        symlink(&sibling, root.join("node_modules/@scope/dev")).unwrap();
+        let stores = PackageStores::from_home(&home).unwrap();
+        let links = DeveloperLinks::capture(&root, CaptureMode::Mint, stores).unwrap();
+        assert_eq!(
+            links.links.len(),
+            1,
+            "the store's own entry is not captured"
+        );
+        assert_eq!(links.sibling_targets().collect::<Vec<_>>(), [&sibling]);
+    }
+
+    #[test]
+    fn package_store_roots_must_be_absolute_and_never_match_everything() {
+        assert!(PackageStores::from_roots(Some(PathBuf::new()), None).is_err());
+        assert!(PackageStores::from_roots(None, Some(PathBuf::from("relative/store"))).is_err());
+        let stores = PackageStores::from_roots(Some(PathBuf::from("/store/bun")), None).unwrap();
+        assert!(stores.contains(Path::new("/store/bun/pkg")));
+        assert!(
+            !stores.contains(Path::new("/store/bunny/pkg")),
+            "whole components only"
+        );
+        assert!(!stores.contains(Path::new("/elsewhere/pkg")));
+        assert!(
+            !PackageStores::default().contains(Path::new("/anything")),
+            "no stores match nothing"
+        );
+        assert!(DeveloperLinks::default().is_empty());
     }
 
     #[test]
@@ -1085,7 +1330,9 @@ mod tests {
         let real_root = fs::canonicalize(real_root).expect("repository root");
         let (unix_before, mach_before) = own_syscalls().expect("counters before");
         let started = std::time::Instant::now();
-        let links = DeveloperLinks::capture_job(&real_root).expect("admission snapshot");
+        let home = PathBuf::from(std::env::var_os("HOME").expect("the host has a home"));
+        let stores = PackageStores::from_home(&home).expect("an absolute host home");
+        let links = DeveloperLinks::capture_job(&real_root, stores).expect("admission snapshot");
         let wall = started.elapsed();
         let (unix_after, mach_after) = own_syscalls().expect("counters after");
         let unix_syscalls = counter_delta(unix_before, unix_after).expect("unix delta");
@@ -1119,7 +1366,7 @@ mod tests {
         const PROOF: &str = "unreadable-link-proof";
         if let Some(root) = std::env::var_os(FIXTURE_ENV) {
             let root = PathBuf::from(root);
-            let links = DeveloperLinks::capture_job(&root)
+            let links = DeveloperLinks::capture_job(&root, fixture_stores(&root))
                 .expect("a job snapshot of an unreadable link is admitted");
             assert_eq!(links.links.len(), 1, "exactly the foreign link");
             assert!(matches!(links.links[0].binding, Binding::Unclassified));
@@ -1138,7 +1385,7 @@ mod tests {
                 target
             );
             assert!(
-                DeveloperLinks::capture(&root, CaptureMode::Mint).is_err(),
+                DeveloperLinks::capture(&root, CaptureMode::Mint, fixture_stores(&root)).is_err(),
                 "the mint refuses the same unreadable target"
             );
             fs::write(
@@ -1232,7 +1479,7 @@ mod tests {
             root.join("node_modules/.bin/owner-cli"),
         )
         .unwrap();
-        let links = DeveloperLinks::capture_job(&root).unwrap();
+        let links = DeveloperLinks::capture_job(&root, fixture_stores(&root)).unwrap();
         assert_eq!(links.links.len(), 2);
         fs::remove_file(root.join("node_modules/@scope/owner")).unwrap();
         symlink(&other, root.join("node_modules/@scope/owner")).unwrap();
@@ -1266,7 +1513,8 @@ mod tests {
         const PROOF: &str = "denied-relink-proof";
         if let Some(root) = std::env::var_os(FIXTURE_ENV) {
             let root = PathBuf::from(root);
-            let links = DeveloperLinks::capture_job(&root).expect("the job snapshot");
+            let links = DeveloperLinks::capture_job(&root, fixture_stores(&root))
+                .expect("the job snapshot");
             let allowed = root.parent().unwrap().join("allowed");
             let denied_other = root.parent().unwrap().join("denied/other");
             let sibling = root.parent().unwrap().join("sibling");

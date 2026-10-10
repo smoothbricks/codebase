@@ -248,6 +248,12 @@ them there; they contain the endpoint URL, whose userinfo is the workspace token
   `UV_CACHE_DIR=<host home>/.cache/uv`, `GOMODCACHE`, `GOCACHE` and the rest — and a caller's own value for these
   variables never reaches it.
 
+  Restoration classifies a developer's package links against these same roots, and grants nothing for them: the
+  controller derives each root from the host home (`BUN_HOME` and `PNPM_HOME` through `host_path`), and a job's wrapper
+  reads the variables the sandbox was given. A link into a root is the installer's own entry, and a link to a real
+  directory outside every root, such as a sibling checkout's package at `~/Dev/pnpm/store/pkg`, stays a developer
+  binding. An unset variable leaves its root inactive, and a present root that is empty or relative is refused.
+
   **Repository-placed caches.** A cache that no detector names — one a repository's own tooling places, such as a
   TypeScript compiler plugin cache or a prebuilt runtime store — is declared by the repository in main's
   `.cowshed.toml`, trusted only from main exactly like `[sandbox] deny`:
