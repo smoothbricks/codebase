@@ -619,7 +619,6 @@ impl GitRepository {
         let untracked: Vec<PathBuf> = porcelain_records(&status.stdout)
             .filter(|(code, _)| *code == b"??".as_slice())
             .map(|(_, path)| PathBuf::from(OsStr::from_bytes(path)))
-            .filter(|path| restored.binary_search(path).is_err())
             .collect();
         let root = self.root.clone();
         let extras =
@@ -3204,6 +3203,17 @@ fn hash_work_extras(root: &Path, untracked: &[PathBuf], restored: &[PathBuf]) ->
                     "stop writing to the file and retry the rename",
                 ));
             }
+        } else if kind.is_dir() {
+            return Err(CowshedError::conflict(
+                format!(
+                    "untracked nested repository {} cannot be carried by a rename",
+                    relative.display()
+                ),
+                format!(
+                    "commit it, move it out of the workspace, or exclude it, then retry the rename of {}",
+                    relative.display()
+                ),
+            ));
         } else {
             return Err(CowshedError::integrity(
                 format!("untracked path has an unsupported type: {}", path.display()),
@@ -4415,6 +4425,53 @@ mod tests {
         assert_ne!(
             state2, state1,
             "a rename work digest must change when cached or untracked bytes change"
+        );
+    }
+
+    /// An untracked nested repository is Git's `??dir/` entry. Its work is not something a rename
+    /// can carry by path, so the digest refuses it before any capture, naming it and the way out.
+    #[tokio::test]
+    async fn rename_work_refuses_an_untracked_nested_repository() {
+        let root = repository();
+        let nested = root.join("nested");
+        fs::create_dir_all(&nested).expect("nested directory");
+        git(&nested, &["init", "-q"]);
+        fs::write(nested.join("tracked.txt"), "nested\n").expect("nested file");
+        git(&nested, &["add", "tracked.txt"]);
+        git(&nested, &["commit", "-qm", "nested"]);
+
+        let status = git_stdout(
+            &root,
+            &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+        );
+        assert!(
+            status.contains("?? nested/\0"),
+            "premise: Git lists the nested repository as an untracked directory: {status:?}"
+        );
+        let before_index = fs::read(root.join(".git/index")).expect("source index");
+        let before_nested = fs::read(nested.join("tracked.txt")).expect("nested bytes");
+
+        let error = GitRepository::from_root(&root)
+            .rename_work_state(false, &[])
+            .await
+            .expect_err("an untracked nested repository must refuse before capture");
+        assert_eq!(error.code.as_str(), "conflict", "{}", error.message);
+        assert!(error.message.contains("nested"), "{}", error.message);
+        for word in ["commit", "move", "exclude", "retry"] {
+            assert!(
+                error.hint.contains(word),
+                "hint names {word}: {}",
+                error.hint
+            );
+        }
+        assert_eq!(
+            fs::read(root.join(".git/index")).expect("source index"),
+            before_index
+        );
+        assert_eq!(
+            fs::read(nested.join("tracked.txt")).expect("nested bytes after refusal"),
+            before_nested,
+            "nested work is untouched"
         );
     }
 

@@ -1555,9 +1555,9 @@ async fn a_refused_existing_destination_resume_keeps_mutating_phase() {
             destination: name("b"),
             rename: true,
         });
-        journal.mark_mutating(&name("b"))
+        Ok(())
     })
-    .expect("journal the mutating rename");
+    .expect("journal the prepared rename over a published destination");
 
     refused_by_conflict(fixture.open_naming("a").await);
     refused_by_conflict(fixture.open_naming("b").await);

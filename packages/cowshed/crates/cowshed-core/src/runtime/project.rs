@@ -5693,7 +5693,9 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             if !self.claim_intent_lease(&destination)? {
                 return Err(CowshedError::conflict(
                     format!("the rename into {destination} is running in another cowshed process"),
-                    cancel,
+                    format!(
+                        "wait for the cowshed process running the rename into {destination} to finish, then retry: cowshed rm {workspace}"
+                    ),
                 ));
             }
             // Re-read under the lease: the owner may have finished or advanced the record.
