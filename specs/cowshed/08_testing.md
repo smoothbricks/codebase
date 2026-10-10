@@ -91,8 +91,10 @@ No mounts, no root, no network — pure functions with table-driven cases:
 
 Run `nx run cowshed:host-controller-test` from the owned checkout in an unsandboxed host-controller shell. This single
 uncached target selects `test(/host_controller_/)` across `cowshed-core`, `cowshed-cli`, and `cowshed-shell` with
-`--run-ignored only`, without a second list of fixture names. Its owning `cargo-test-archive` dependency compiles once
-before the run, and the target hashes the archive output bytes. The host runner consumes that prebuilt archive with
+`--run-ignored only`, without a second list of fixture names. Its `build` dependency, the existing inferred host build
+aggregate, completes first and refreshes the JS and host-platform native addon the worker proofs load, so they never
+load a stale `dist/native` addon from an earlier build. Its owning `cargo-test-archive` dependency compiles once before
+the run, and the target hashes the archive output bytes. The host runner consumes that prebuilt archive with
 `--archive-file` and remaps its workspace to the exact owned checkout; it never recompiles under the test guard or lets
 its private runtime `TMPDIR` change compiled artifacts. An empty selection fails. Controller-owned filesystem and
 kernel-profile fixtures carry that prefix and an explicit ignore reason naming this target. Ordinary sandboxed nextest

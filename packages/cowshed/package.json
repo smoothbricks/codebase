@@ -499,6 +499,7 @@
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "cache": false,
         "dependsOn": [
+          "build",
           {
             "target": "cargo-test-archive",
             "projects": [
