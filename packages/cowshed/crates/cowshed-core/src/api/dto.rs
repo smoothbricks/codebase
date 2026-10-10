@@ -3395,6 +3395,8 @@ pub enum AdoptionSkip {
     },
     /// The landing workspace's Nx daemon outlived its stop.
     LandingDaemonStayed { daemon: DatabaseHolder },
+    /// The landing daemon record or its job ledger cannot establish a safe stop plan.
+    LandingDaemonUnverifiable { record: PathBuf, reason: String },
     /// A host Cargo build holds a landing profile's lock immediately before the seed freezes.
     LandingBuilding {
         lock: PathBuf,
@@ -3427,6 +3429,7 @@ impl AdoptionSkip {
             Self::LandingHeld { .. } => "landingHeld",
             Self::LandingOpening { .. } => "landingOpening",
             Self::LandingDaemonStayed { .. } => "landingDaemonStayed",
+            Self::LandingDaemonUnverifiable { .. } => "landingDaemonUnverifiable",
             Self::LandingBuilding { .. } => "landingBuilding",
             Self::TargetHeld { .. } => "targetHeld",
             Self::TargetOpening { .. } => "targetOpening",
@@ -3506,16 +3509,20 @@ impl fmt::Display for AdoptionSkip {
                 )?;
                 holders(formatter, held)
             }
-            Self::LandingDaemonStayed { daemon } | Self::TargetDaemonStayed { daemon } => write!(
+            Self::LandingDaemonStayed { daemon } => write!(
                 formatter,
-                "the {} Nx daemon pid {} ({}) did not exit after SIGTERM",
-                if matches!(self, Self::LandingDaemonStayed { .. }) {
-                    "landing workspace's"
-                } else {
-                    "target's"
-                },
-                daemon.pid,
-                daemon.command
+                "the landing workspace's Nx daemon pid {} ({}) is still running; it was not stopped",
+                daemon.pid, daemon.command
+            ),
+            Self::LandingDaemonUnverifiable { record, reason } => write!(
+                formatter,
+                "the landing workspace's Nx daemon record {} could not be verified: {reason}; no process was signalled",
+                record.display()
+            ),
+            Self::TargetDaemonStayed { daemon } => write!(
+                formatter,
+                "the target's Nx daemon pid {} ({}) did not exit after SIGTERM",
+                daemon.pid, daemon.command
             ),
             Self::LandingVolumeBusy { reason } => write!(
                 formatter,

@@ -2111,6 +2111,23 @@
       "targetBranch": "main",
       "targetWasCheckedOut": false
     },
+    "landingDaemonUnverifiable": {
+      "buildVolume": {
+        "adoption": {
+          "kind": "skipped",
+          "reason": {
+            "kind": "landingDaemonUnverifiable",
+            "reason": "the daemon record is unreadable; no signal was sent",
+            "record": "/fixture/Dev/widget/.nx/workspace-data/d/server-process.json"
+          }
+        },
+        "seeded": false
+      },
+      "landedHead": "1111111111111111111111111111111111111111",
+      "retired": false,
+      "targetBranch": "main",
+      "targetWasCheckedOut": false
+    },
     "retired": {
       "buildVolume": {
         "adoption": {

@@ -152,15 +152,16 @@ Each detector returns data through one `CapabilityContribution`:
   or killed installs. Terminal cleanup has two distinct failures, each labelled in the sealed job's stderr: a link
   restoration that fails is `developer-link restoration failed`, and a marker that cannot be removed is
   `install observation cleanup failed`. Either one, or both together, leaves the job in the failed state, and the
-  waiters receive one error that names every cause that occurred. Neither is a finding: only a link absent with no
-  observed install is one. Explicit absolute host/devenv executable paths, invocations whose first argument is not one
-  of those verbs, and unregistered library-only one-shot hosts bypass immediate wrapping and get terminal cleanup only;
-  chained-command preservation is not promised for those bypasses. No snapshot taken by a job or wrapper grants a new
-  target. Only the mint captures canonical sibling read grants from its source. Terminal cleanup repairs developer-link
-  registry replacements, and a link an observed install removed, are restored to their snapshot. The wrapper records an
-  install in a per-job marker the supervisor creates before launch and removes at cleanup. A different live developer
-  binding is preserved, with no new grant or attestation. A link absent with no observed install produces a
-  `developer-link-ambiguous` finding in the job's stderr and stays absent.
+  waiters receive one error that names every cause that occurred. A blocking cleanup task failure is instead labelled
+  `terminal cleanup task failed`: it proves neither filesystem cause. These failures are not findings: only a link
+  absent with no observed install is one. Explicit absolute host/devenv executable paths, invocations whose first
+  argument is not one of those verbs, and unregistered library-only one-shot hosts bypass immediate wrapping and get
+  terminal cleanup only; chained-command preservation is not promised for those bypasses. No snapshot taken by a job or
+  wrapper grants a new target. Only the mint captures canonical sibling read grants from its source. Terminal cleanup
+  repairs developer-link registry replacements, and a link an observed install removed, are restored to their snapshot.
+  The wrapper records an install in a per-job marker the supervisor creates before launch and removes at cleanup. A
+  different live developer binding is preserved, with no new grant or attestation. A link absent with no observed
+  install produces a `developer-link-ambiguous` finding in the job's stderr and stays absent.
 
 - **HOME probes:** the sandboxed supervisor repeats detection beneath the HOME-wide read deny (04_sandbox.md), so every
   HOME path a detector inspects is also one it grants read: each bootstrap candidate beneath HOME as its literal program
