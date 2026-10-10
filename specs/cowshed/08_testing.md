@@ -62,7 +62,9 @@ No mounts, no root, no network — pure functions with table-driven cases:
   `Conflict` before mutation; a fresh unchanged plan reclaims exactly its candidates. A preview and reclaim over a
   retired workspace whose 100 GiB sparse checkpoint images are mode 000 succeed, because identity is taken from `stat`
   and never opens an image; a same-size, same-time replacement image and a same-length, same-time rewritten record each
-  change the identity.
+  change the identity. The unreadable-inventory fixture uses ordinary RAW `.dmg` candidates: the first candidate is
+  deferred on its inventory error while the later candidate is reclaimed. Legacy `.sparseimage` files remain excluded
+  from GC.
 - **Push CAS and preservation model**: pure state-machine tables cover each omitted/satisfied/mismatched combination of
   expected workspace incarnation, source head, and destination ref head (including expected-missing). A mismatch is a
   `Conflict` that preserves the old destination exactly and leaves the source live; success reports one source object ID

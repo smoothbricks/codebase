@@ -1361,9 +1361,9 @@ fn gc_defers_an_unreadable_inventory_and_reclaims_later_candidates() {
     let fixture = Fixture::new("gc-inventory-unreadable");
     let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
     std::fs::create_dir_all(&layout.project().sessions).expect("sessions directory");
-    let deferred_image = layout.project().sessions.join("a-deferred.sparseimage");
+    let deferred_image = layout.project().sessions.join("a-deferred.dmg");
     std::fs::write(&deferred_image, b"inventory unreadable").expect("deferred image");
-    let later_image = layout.project().sessions.join("z-reclaim.sparseimage");
+    let later_image = layout.project().sessions.join("z-reclaim.dmg");
     std::fs::write(&later_image, b"later candidate").expect("later image");
     let config = fixture.config();
     let host = MacOsApfsExecutionHost::with_mount_source(
