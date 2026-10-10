@@ -6,6 +6,8 @@ workspace policy registers it as a global sync generator, so `nx sync` and `nx s
 The plugin owns the templates and workflow renderers. Repository manifests are read from Nx's `Tree`; inferred target
 information comes from the resolved Nx graph passed at the boundary. `getProjects(Tree)` is used for workspace manifest
 locations, not as a substitute for plugin-inferred targets. No generator installs dependencies or resolves secrets.
+Generated workflows explicitly retain checkout credentials only when a job needs authenticated Git remote access after
+checkout (push, fetch, or lazy blob fetch), and disable persistence elsewhere.
 
 Test-runner packages also reconcile `tsconfig.test.json` through this generator. The shared test-typecheck policy
 supplies no-emit defaults and workspace references from Tree, preserves declared test runtime options and `extends`, and

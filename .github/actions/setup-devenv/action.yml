@@ -176,7 +176,7 @@ runs:
     # still finds them.
     - name: ❄️ Install Nix
       if: steps.runner-kind.outputs.host != 'true'
-      uses: nixbuild/nix-quick-install-action@v35
+      uses: nixbuild/nix-quick-install-action@9f63be77f412a248c9d9a65a4c82cf066cdf8f0c # v35
       with:
         nix_conf: |
           keep-outputs = true
@@ -210,7 +210,7 @@ runs:
     - name: 🧊 Cache Nix store
       id: nix-cache
       if: steps.runner-kind.outputs.host != 'true'
-      uses: nix-community/cache-nix-action@v7
+      uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569 # v7
       with:
         paths: |
           /nix
@@ -231,7 +231,7 @@ runs:
       run: |
         mkdir -p "$HOME/.cache"
         if [ -O "$HOME/.cache" ]; then
-          echo "~/.cache is already the runner's"
+          echo "$HOME/.cache is already the runner's"
         else
           ls -ld "$HOME/.cache"
           sudo chown "$(id -u):$(id -g)" "$HOME/.cache"
@@ -240,7 +240,7 @@ runs:
 
     - name: ⚡ Enable Cachix
       if: steps.runner-kind.outputs.host != 'true'
-      uses: cachix/cachix-action@v17
+      uses: cachix/cachix-action@38b082610b782e7e93e209c35fd730d399dee866 # v17
       with:
         name: devenv
 

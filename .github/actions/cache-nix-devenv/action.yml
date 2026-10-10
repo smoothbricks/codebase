@@ -20,7 +20,7 @@ runs:
     - name: Restore devenv and direnv state
       id: restore-devenv
       if: inputs.mode == 'restore'
-      uses: actions/cache/restore@v5.0.5
+      uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
       with:
         path: |
           ${{ github.workspace }}/tooling/direnv/.devenv
@@ -34,7 +34,7 @@ runs:
 
     - name: Save devenv and direnv state
       if: inputs.mode == 'save'
-      uses: actions/cache/save@v5.0.5
+      uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
       with:
         path: |
           ${{ github.workspace }}/tooling/direnv/.devenv

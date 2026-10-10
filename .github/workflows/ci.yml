@@ -38,10 +38,12 @@ jobs:
       # Step 1: GitHub adds "Set up job" automatically
       # Step 2
       - name: 📥 Checkout
-        uses: actions/checkout@v6.0.2
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           filter: blob:none
           fetch-depth: 0
+          # nx affected lazily fetches blobs from the partial clone
+          persist-credentials: true
 
       # Step 3. Composite action internals do not affect top-level job step
       # anchors; update the nx-smart --step values below if top-level steps move.
@@ -55,7 +57,7 @@ jobs:
       # Sets the base and head SHAs required for the nx affected commands
       - name: 🧭 Set Nx SHAs
         if: github.server_url == 'https://github.com' || endsWith(github.api_url, '/api/v3')
-        uses: nrwl/nx-set-shas@v5.0.1
+        uses: nrwl/nx-set-shas@afb73a62d26e41464e9254689e1fd6122ee683c1 # v5.0.1
         with:
           workflow-id: ci.yml
 
@@ -109,7 +111,7 @@ jobs:
           ${{ steps.setup.outputs.host-runner != 'true' && github.event_name == 'push' && github.ref ==
           format('refs/heads/{0}', github.event.repository.default_branch) && steps.nx-cache.outputs.cache-hit != 'true'
           }}
-        uses: actions/cache/save@v5.0.5
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: |
             .nx/cache
@@ -119,7 +121,7 @@ jobs:
       # Step 13
       - name: 📎 Upload trace DBs
         if: always()
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: trace-results-${{ github.run_id }}
           path: packages/*/.cache/lmao/trace-results.db*

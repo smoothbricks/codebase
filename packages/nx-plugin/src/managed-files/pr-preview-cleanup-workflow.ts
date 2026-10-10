@@ -13,6 +13,7 @@ import {
   cargoCredentialStepLines,
   cloudflareCredentialEnvLines,
   environmentLine,
+  githubActionPins,
   privateNpmReadTokenJobEnv,
   sourceCheckoutsStepLines,
 } from './ci-workflow.js';
@@ -86,10 +87,11 @@ ${environmentLine(options.environments?.staging)}    defaults:
         working-directory: tooling/direnv
 ${setupJobEnv(options)}    steps:
       - name: Checkout
-        uses: actions/checkout@v6.0.2
+        uses: ${githubActionPins.checkout.ref} # ${githubActionPins.checkout.version}
         with:
           filter: blob:none
           fetch-depth: 1
+          persist-credentials: false
 ${preflightSteps(options)}
       - name: Setup Nix/devenv
         uses: ./.github/actions/setup-devenv

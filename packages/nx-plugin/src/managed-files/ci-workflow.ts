@@ -20,6 +20,37 @@ import type {
 } from '../workspace-manifest.js';
 import { renderRunsOnLine } from './github-runs-on.js';
 
+export const githubActionPins: Readonly<
+  Record<
+    'checkout' | 'nxSetShas' | 'cacheSave' | 'uploadArtifact' | 'downloadArtifact',
+    {
+      readonly ref: string;
+      readonly version: string;
+    }
+  >
+> = {
+  checkout: {
+    ref: 'actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd',
+    version: 'v6.0.2',
+  },
+  nxSetShas: {
+    ref: 'nrwl/nx-set-shas@afb73a62d26e41464e9254689e1fd6122ee683c1',
+    version: 'v5.0.1',
+  },
+  cacheSave: {
+    ref: 'actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae',
+    version: 'v5.0.5',
+  },
+  uploadArtifact: {
+    ref: 'actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a',
+    version: 'v7.0.1',
+  },
+  downloadArtifact: {
+    ref: 'actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c',
+    version: 'v8.0.1',
+  },
+};
+
 export enum CiWorkflowStepKind {
   Checkout = 'checkout',
   SourceCheckouts = 'source-checkouts',
@@ -377,10 +408,12 @@ function yamlLinesForStep(step: CiWorkflowStep, options: CiWorkflowDefinitionOpt
     case CiWorkflowStepKind.Checkout:
       return [
         `      - name: ${step.name}`,
-        '        uses: actions/checkout@v6.0.2',
+        `        uses: ${githubActionPins.checkout.ref} # ${githubActionPins.checkout.version}`,
         '        with:',
         '          filter: blob:none',
         '          fetch-depth: 0',
+        '          # nx affected lazily fetches blobs from the partial clone',
+        '          persist-credentials: true',
       ];
     case CiWorkflowStepKind.SourceCheckouts:
       return sourceCheckoutsStepLines(step, options.sourceCheckouts ?? []);
@@ -395,7 +428,7 @@ function yamlLinesForStep(step: CiWorkflowStep, options: CiWorkflowDefinitionOpt
       return [
         `      - name: ${step.name}`,
         "        if: github.server_url == 'https://github.com' || endsWith(github.api_url, '/api/v3')",
-        '        uses: nrwl/nx-set-shas@v5.0.1',
+        `        uses: ${githubActionPins.nxSetShas.ref} # ${githubActionPins.nxSetShas.version}`,
         '        with:',
         '          workflow-id: ci.yml',
       ];
@@ -515,7 +548,7 @@ function yamlLinesForStep(step: CiWorkflowStep, options: CiWorkflowDefinitionOpt
         "          ${{ steps.setup.outputs.host-runner != 'true' && github.event_name == 'push' && github.ref ==",
         "          format('refs/heads/{0}', github.event.repository.default_branch) && steps.nx-cache.outputs.cache-hit != 'true'",
         '          }}',
-        '        uses: actions/cache/save@v5.0.5',
+        `        uses: ${githubActionPins.cacheSave.ref} # ${githubActionPins.cacheSave.version}`,
         '        with:',
         '          path: |',
         '            .nx/cache',
@@ -1391,8 +1424,8 @@ export function artifactStepLines(
         ? 'https://code.forgejo.org/forgejo/upload-artifact@cb8afe72b42edc798abfb8fcb556cf660d894245'
         : 'https://code.forgejo.org/forgejo/download-artifact@769f970437aa3291b13f35dc23fc87967d7fb19f'
       : kind === 'upload'
-        ? 'actions/upload-artifact@v7.0.1'
-        : 'actions/download-artifact@v8.0.1';
+        ? `${githubActionPins.uploadArtifact.ref} # ${githubActionPins.uploadArtifact.version}`
+        : `${githubActionPins.downloadArtifact.ref} # ${githubActionPins.downloadArtifact.version}`;
   return [
     `      - name: ${name}`,
     `        if: ${condition}`,
