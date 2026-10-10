@@ -749,10 +749,18 @@ pub enum ApfsStorageError {
         #[source]
         source: io::Error,
     },
-    #[error("build volume {image} has shared ownership holds on {hold}: {open:?}")]
+    /// A job admitted on the build volume holds it, so it cannot be claimed. `holds` names each
+    /// process holding `hold` (a job's supervisor), `open` each that has the volume open; either
+    /// is empty when none of this user's processes is visible there.
+    #[error(
+        "build volume {image} is held by a job admitted on it: {hold} is held by {}{}",
+        held_by(.holds),
+        open_in(.open)
+    )]
     BuildVolumeHeld {
         image: PathBuf,
         hold: PathBuf,
+        holds: Vec<cowshed_os::process::Holder>,
         open: Vec<cowshed_os::process::Holder>,
     },
     #[error("lifecycle conflict: {0}")]
@@ -868,6 +876,28 @@ impl From<cowshed_apfs::template::TemplateError> for ApfsStorageError {
                 cleanup: Box::new((*cleanup).into()),
             },
         }
+        }
+    }
+}
+
+/// [`ApfsStorageError::BuildVolumeHeld`]'s holders of the hold file.
+fn held_by(holds: &[cowshed_os::process::Holder]) -> String {
+    if holds.is_empty() {
+        "nothing this user can see".to_owned()
+    } else {
+        crate::build_volume::nx::Holders(holds).to_string()
+    }
+}
+
+/// [`ApfsStorageError::BuildVolumeHeld`]'s processes with the volume open, when there are any.
+fn open_in(open: &[cowshed_os::process::Holder]) -> String {
+    if open.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "; its volume is open in {}",
+            crate::build_volume::nx::Holders(open)
+        )
     }
 }
 

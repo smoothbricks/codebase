@@ -24,6 +24,21 @@ const DAEMON_EXIT_GRACE: Duration = Duration::from_secs(10);
 
 use cowshed_os::process::Holder;
 
+/// Processes, each as `pid <n> (<argv>)`, joined by `; `.
+pub struct Holders<'a>(pub &'a [Holder]);
+
+impl std::fmt::Display for Holders<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (index, holder) in self.0.iter().enumerate() {
+            if index > 0 {
+                formatter.write_str("; ")?;
+            }
+            write!(formatter, "{holder}")?;
+        }
+        Ok(())
+    }
+}
+
 /// Every Nx task database in the volume rooted at `volume`: each `*.db` file directly in a
 /// `workspace-data` directory the volume holds.
 pub fn task_databases(volume: &Path, state: &BuildVolumeState) -> io::Result<Vec<PathBuf>> {

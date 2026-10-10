@@ -1506,8 +1506,7 @@ impl std::fmt::Display for Deferral {
                     "a job admitted on it still runs, or a land or clone making it someone's still holds it",
                 )?;
                 if !open.is_empty() {
-                    formatter.write_str(", open in ")?;
-                    write_holders(formatter, open)?;
+                    write!(formatter, ", open in {}", nx::Holders(open))?;
                 }
                 Ok(())
             }
@@ -1866,7 +1865,7 @@ fn say_release(id: &BuildVolumeId, whose: &str, release: &BuildVolumeRelease) {
             refused: Some(BuildVolumeRefusal { open, forced }),
         } => eprintln!(
             "cowshed: {whose} build volume {id} was open in {} when its unforced unmount was refused; {}",
-            Holders(open),
+            nx::Holders(open),
             outcome(*forced)
         ),
         BuildVolumeRelease::Held { open } if open.is_empty() => eprintln!(
@@ -1874,35 +1873,13 @@ fn say_release(id: &BuildVolumeId, whose: &str, release: &BuildVolumeRelease) {
         ),
         BuildVolumeRelease::Held { open } => eprintln!(
             "cowshed: {whose} build volume {id} stays while a job admitted on it runs (open in {}); the next rm, land or gc after it ends reclaims it",
-            Holders(open)
+            nx::Holders(open)
         ),
     }
 }
 
-/// Processes, each as `pid <n> (<argv>)`, joined by `; `.
-struct Holders<'a>(&'a [cowshed_os::process::Holder]);
-
-impl std::fmt::Display for Holders<'_> {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write_holders(formatter, self.0)
-    }
-}
-
-fn write_holders(
-    formatter: &mut std::fmt::Formatter<'_>,
-    holders: &[cowshed_os::process::Holder],
-) -> std::fmt::Result {
-    for (index, holder) in holders.iter().enumerate() {
-        if index > 0 {
-            formatter.write_str("; ")?;
-        }
-        write!(formatter, "{holder}")?;
-    }
-    Ok(())
-}
-
-/// `target`'s seed against its live volume `live`, or `None` when `live` is an interrupted
-/// first touch's, unpublished: only a fresh discovery finishes that one.
+/// `target`'s seed against its live volume `live`, or `None` when `live` is an interrupted first
+/// touch's, unpublished: only a fresh discovery finishes that one.
 fn seed_age(
     host: &impl RuntimeStorageHost,
     layout: &BuildVolumeLayout,
