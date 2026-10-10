@@ -1720,6 +1720,122 @@ fn marker_validation_checks_every_detached_identity_dimension() {
     }
 }
 
+/// `write_marker` stamps the owned-link revision a marker's history earns: the current revision for
+/// a fresh image and for a fork, a source's own revision for a same-workspace copy. Each case
+/// writes into a fresh destination with a new incarnation, so no case takes the idempotent branch.
+#[test]
+fn write_marker_owned_links_revision_follows_the_copy_that_produced_the_marker() {
+    use cowshed_core::metadata::{MARKER_VERSION, OWNED_LINKS_REVISION, WorkspaceMarker};
+
+    let fixture = Fixture::new("owned-links-revision");
+    let host = native_host(&fixture, RecordingRunner::default());
+    let main = workspace();
+    let topic = session_workspace("topic", "00000000000000000000000000000002");
+    let fork_source = WorkspaceName::main();
+
+    // A marker a copy carried in, as the copied tree's own: `revision` is what the source recorded.
+    let copied = |mount: &Path, name: &str, incarnation: &str, revision: u8| {
+        std::fs::create_dir_all(mount.join(".cowshed")).expect("copied marker directory");
+        let legacy = WorkspaceMarker {
+            version: MARKER_VERSION,
+            repo_id: repo(),
+            project_root: fixture.root.join("project"),
+            workspace: WorkspaceName::new(name).expect("workspace"),
+            workspace_incarnation: WorkspaceIncarnation::new(incarnation).expect("incarnation"),
+            role: if name == "main" {
+                WorkspaceRole::Main
+            } else {
+                WorkspaceRole::Workspace
+            },
+            base_commit: "0123456789abcdef".to_owned(),
+            created_at: "2026-07-13T00:00:00Z".to_owned(),
+            forked_from: None,
+            created_trace: "trace-apfs-boundary".to_owned(),
+            lineage: None,
+            owned_links_revision: revision,
+        };
+        cowshed_core::metadata::write_json(&mount.join(".cowshed/workspace.json"), &legacy)
+            .expect("copied marker");
+    };
+    let read_revision = |mount: &Path| {
+        WorkspaceMarker::read_from(&mount.join(".cowshed/workspace.json"))
+            .expect("marker")
+            .owned_links_revision
+    };
+
+    // (1) A fresh image with no copied marker starts at the current revision.
+    let fresh = fixture.root.join("fresh");
+    host.write_marker(&fresh, &main, None, &identity(&fixture))
+        .expect("fresh marker");
+    assert_eq!(read_revision(&fresh), OWNED_LINKS_REVISION, "fresh image");
+
+    // (2) A fork whose clone carried a legacy source-main marker starts at the current revision: a
+    // fork is a new mint, whatever its source's marker says.
+    let forked = fixture.root.join("forked");
+    copied(&forked, "main", "00000000000000000000000000000001", 0);
+    let fork_identity = OperationIdentity {
+        forked_from: Some(fork_source.clone()),
+        ..identity(&fixture)
+    };
+    host.write_marker(&forked, &topic, Some(&fork_source), &fork_identity)
+        .expect("fork marker");
+    assert_eq!(
+        read_revision(&forked),
+        OWNED_LINKS_REVISION,
+        "fork of a legacy source"
+    );
+
+    // (3) A same-workspace copy with a new incarnation and no fork keeps the source's legacy 0.
+    let legacy_copy = fixture.root.join("legacy-copy");
+    copied(&legacy_copy, "main", "00000000000000000000000000000001", 0);
+    host.write_marker(
+        &legacy_copy,
+        &main_with_incarnation("00000000000000000000000000000003"),
+        None,
+        &identity(&fixture),
+    )
+    .expect("legacy restore copy");
+    assert_eq!(
+        read_revision(&legacy_copy),
+        0,
+        "a legacy copy still migrates once"
+    );
+
+    // (4) A same-workspace copy of a marker already at the current revision keeps it.
+    let current_copy = fixture.root.join("current-copy");
+    copied(
+        &current_copy,
+        "main",
+        "00000000000000000000000000000001",
+        OWNED_LINKS_REVISION,
+    );
+    host.write_marker(
+        &current_copy,
+        &main_with_incarnation("00000000000000000000000000000004"),
+        None,
+        &identity(&fixture),
+    )
+    .expect("current restore copy");
+    assert_eq!(
+        read_revision(&current_copy),
+        OWNED_LINKS_REVISION,
+        "a current copy stays current"
+    );
+}
+
+/// The main workspace with a different incarnation: a copy's new timeline, never its source's.
+fn main_with_incarnation(incarnation: &str) -> LifecycleWorkspace {
+    LifecycleWorkspace::new(
+        repo(),
+        WorkspaceName::new("main").expect("main"),
+        WorkspaceIncarnation::new(incarnation).expect("incarnation"),
+        Revision::new(1),
+        Revision::new(1),
+        WorkspaceRole::Main,
+    )
+    .expect("workspace")
+}
+
 #[test]
 fn retirement_moves_image_and_sidecar_atomically_and_reclaim_is_idempotent() {
     let fixture = Fixture::new("retire");
