@@ -129,10 +129,11 @@ const COMPACT_STATUS_CODE = {
   1: 'INVALID_HANDLE',
   2: 'PARSE_ERROR',
   3: 'ENCODE_ERROR',
-  4: 'OUT_OF_MEMORY',
+  4: 'OUTPUT_TOO_SMALL',
   5: 'INVALID_FORMAT',
   6: 'INVALID_INPUT',
   7: 'SCHEMA_MISMATCH',
+  8: 'MEMORY_EXHAUSTED',
 } as const;
 
 /**
@@ -162,6 +163,7 @@ const EP_CREATE_FAILURE = {
   2147483657: 'SCHEMA_FIELD_NAMES',
   2147483658: 'INIT',
   2147483659: 'HANDLES_EXHAUSTED',
+  2147483660: 'MEMORY_EXHAUSTED',
 } as const;
 
 const EP_CREATE_FAILURE_DETAIL = {
@@ -176,6 +178,7 @@ const EP_CREATE_FAILURE_DETAIL = {
   SCHEMA_FIELD_NAMES: 'the field-name blob is malformed or does not carry one name per field',
   INIT: 'retained-metadata or extraction-config limits refused the schema',
   HANDLES_EXHAUSTED: `all ${EP_MAX_HANDLE} EventProcessor handle slots are in use`,
+  MEMORY_EXHAUSTED: 'the memory to build the handle could not be had; the same call may succeed with more room',
 } as const satisfies Record<(typeof EP_CREATE_FAILURE)[keyof typeof EP_CREATE_FAILURE], string>;
 
 export type EventProcessorCreateErrorCode =
@@ -206,6 +209,8 @@ function epCreateFailureCode(status: number): EventProcessorCreateErrorCode {
       return EP_CREATE_FAILURE[0x8000_000a];
     case 0x8000_000b:
       return EP_CREATE_FAILURE[0x8000_000b];
+    case 0x8000_000c:
+      return EP_CREATE_FAILURE[0x8000_000c];
     default:
       return 'UNKNOWN_FAILURE';
   }
@@ -272,6 +277,8 @@ function compactStatusCode(status: number): CompactEncodingErrorCode {
       return COMPACT_STATUS_CODE[6];
     case 7:
       return COMPACT_STATUS_CODE[7];
+    case 8:
+      return COMPACT_STATUS_CODE[8];
     default:
       return 'UNKNOWN_STATUS';
   }

@@ -70,6 +70,7 @@ fn ts_create_failure_name(failure: CreateFailure) -> &'static str {
         CreateFailure::SchemaFieldNames => "SCHEMA_FIELD_NAMES",
         CreateFailure::Init => "INIT",
         CreateFailure::HandlesExhausted => "HANDLES_EXHAUSTED",
+        CreateFailure::MemoryExhausted => "MEMORY_EXHAUSTED",
     }
 }
 
@@ -133,6 +134,59 @@ fn parse_backend_ts_compact_abi_matches_rust() {
         COMPACT_DESCRIPTOR_SIZE as u64
     );
     assert_eq!(ts_const(&source, "RESULT_OK"), ResultCode::Ok as u64);
+}
+
+/// The TypeScript `COMPACT_STATUS_CODE` name for one status. Wildcard-free,
+/// so a status added on the Rust side does not compile until it is named.
+fn ts_status_name(code: ResultCode) -> Option<&'static str> {
+    match code {
+        ResultCode::Ok => None,
+        ResultCode::InvalidHandle => Some("INVALID_HANDLE"),
+        ResultCode::ParseError => Some("PARSE_ERROR"),
+        ResultCode::EncodeError => Some("ENCODE_ERROR"),
+        ResultCode::OutputTooSmall => Some("OUTPUT_TOO_SMALL"),
+        ResultCode::InvalidFormat => Some("INVALID_FORMAT"),
+        ResultCode::InvalidInput => Some("INVALID_INPUT"),
+        ResultCode::SchemaMismatch => Some("SCHEMA_MISMATCH"),
+        ResultCode::MemoryExhausted => Some("MEMORY_EXHAUSTED"),
+    }
+}
+
+/// Every refusal status is named in the TypeScript decoder at its Rust code,
+/// and the decoder names no status Rust does not return.
+#[test]
+fn parse_backend_ts_statuses_match_rust() {
+    let source = read();
+    let block = source
+        .split("const COMPACT_STATUS_CODE = {")
+        .nth(1)
+        .expect("COMPACT_STATUS_CODE not declared")
+        .split('}')
+        .next()
+        .expect("COMPACT_STATUS_CODE is not closed");
+    let mut named = 0;
+    for code in [
+        ResultCode::Ok,
+        ResultCode::InvalidHandle,
+        ResultCode::ParseError,
+        ResultCode::EncodeError,
+        ResultCode::OutputTooSmall,
+        ResultCode::InvalidFormat,
+        ResultCode::InvalidInput,
+        ResultCode::SchemaMismatch,
+        ResultCode::MemoryExhausted,
+    ] {
+        let Some(name) = ts_status_name(code) else {
+            continue;
+        };
+        named += 1;
+        let line = format!("{}: '{name}',", code as u32);
+        assert!(block.contains(&line), "COMPACT_STATUS_CODE lacks `{line}`");
+    }
+    assert_eq!(
+        named,
+        block.lines().filter(|line| line.contains(": '")).count()
+    );
 }
 
 /// The plane table is the seam between the two implementations, so the audit

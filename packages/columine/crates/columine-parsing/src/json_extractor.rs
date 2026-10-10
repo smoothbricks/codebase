@@ -17,7 +17,11 @@ pub enum ExtractionError {
     BufferOverflow,
     MsgpackError,
     TooManyEvents,
-    OutOfMemory,
+    /// A workspace too small to hold even one capture header: a
+    /// configuration refusal, not an allocation failure.
+    WorkBufferTooSmall,
+    /// The memory a column needed could not be had.
+    MemoryExhausted,
     /// A value-object frame the admission projected into the reader's
     /// layout found no cell where the extractor writes its certified bytes;
     /// storing the writer's layout instead would break the column's schema.
@@ -54,7 +58,8 @@ pub mod diagnostic_detail {
     pub const BUFFER_OVERFLOW: u8 = 4;
     pub const TOO_MANY_FIELDS: u8 = 5;
     pub const TOO_MANY_EVENTS: u8 = 6;
-    pub const OUT_OF_MEMORY: u8 = 7;
+    /// The memory a column needed could not be had.
+    pub const MEMORY_EXHAUSTED: u8 = 7;
     /// A semantic schema-layer payload violation.
     pub const PAYLOAD_VIOLATION: u8 = 8;
     /// One event spelled its payload both ways (a nested `value` object AND
@@ -62,6 +67,8 @@ pub mod diagnostic_detail {
     /// the nested form: two spellings in one event would let the judged bytes
     /// and the stored bytes diverge.
     pub const MIXED_PAYLOAD_SPELLING: u8 = 9;
+    /// The extraction workspace cannot hold even one capture header.
+    pub const WORK_BUFFER_TOO_SMALL: u8 = 10;
 }
 
 /// Compact validation details, namespaced by [`diagnostic_stage::COMPACT`].
@@ -140,7 +147,8 @@ impl ExtractionDiagnostic {
             ExtractionError::MsgpackError => diagnostic_stage::MSGPACK,
             ExtractionError::BufferOverflow
             | ExtractionError::TooManyEvents
-            | ExtractionError::OutOfMemory => diagnostic_stage::COLUMN,
+            | ExtractionError::MemoryExhausted => diagnostic_stage::COLUMN,
+            ExtractionError::WorkBufferTooSmall => diagnostic_stage::MSGPACK,
             ExtractionError::UnwrittenProjection => diagnostic_stage::VALIDATION,
         };
         self.detail = match failure {
@@ -149,7 +157,8 @@ impl ExtractionDiagnostic {
             ExtractionError::BufferOverflow => diagnostic_detail::BUFFER_OVERFLOW,
             ExtractionError::MsgpackError => diagnostic_detail::INVALID_JSON,
             ExtractionError::TooManyEvents => diagnostic_detail::TOO_MANY_EVENTS,
-            ExtractionError::OutOfMemory => diagnostic_detail::OUT_OF_MEMORY,
+            ExtractionError::MemoryExhausted => diagnostic_detail::MEMORY_EXHAUSTED,
+            ExtractionError::WorkBufferTooSmall => diagnostic_detail::WORK_BUFFER_TOO_SMALL,
             ExtractionError::UnwrittenProjection => diagnostic_detail::PAYLOAD_VIOLATION,
         };
     }
@@ -183,8 +192,8 @@ fn column_failure(
             ExtractionError::BufferOverflow,
         ),
         ParseError::OutOfMemory => (
-            diagnostic_detail::OUT_OF_MEMORY,
-            ExtractionError::OutOfMemory,
+            diagnostic_detail::MEMORY_EXHAUSTED,
+            ExtractionError::MemoryExhausted,
         ),
         _ => (
             diagnostic_detail::TYPE_MISMATCH,
@@ -237,9 +246,9 @@ fn msgpack_failure(
             diagnostic_detail::INVALID_NUMBER,
             ExtractionError::InvalidFieldType,
         ),
-        ExtractionError::OutOfMemory => (
-            diagnostic_detail::OUT_OF_MEMORY,
-            ExtractionError::OutOfMemory,
+        ExtractionError::MemoryExhausted => (
+            diagnostic_detail::MEMORY_EXHAUSTED,
+            ExtractionError::MemoryExhausted,
         ),
         _ => (
             diagnostic_detail::INVALID_JSON,
@@ -275,7 +284,7 @@ fn direct_msgpack_failure(
             row,
             ParseError::BufferOverflow,
         ),
-        ExtractionError::OutOfMemory => column_failure(
+        ExtractionError::MemoryExhausted => column_failure(
             diagnostic,
             col_idx,
             ArrowType::Binary,
@@ -936,7 +945,7 @@ fn extract_typed_value_with_capture(
         if diagnostic.stage == diagnostic_stage::NONE {
             let parse_error = match err {
                 ExtractionError::BufferOverflow => ParseError::BufferOverflow,
-                ExtractionError::OutOfMemory => ParseError::OutOfMemory,
+                ExtractionError::MemoryExhausted => ParseError::OutOfMemory,
                 _ => ParseError::InvalidFieldType,
             };
             return column_failure(
@@ -1014,11 +1023,11 @@ fn invalid_number(
     ExtractionError::InvalidFieldType
 }
 /// Map variable-value errors to extraction errors while preserving
-/// BufferOverflow and OutOfMemory.
+/// BufferOverflow and MemoryExhausted.
 fn variable_write_error(error: columine_arrow::VariableValueError) -> ExtractionError {
     match error {
         columine_arrow::VariableValueError::BufferOverflow => ExtractionError::BufferOverflow,
-        columine_arrow::VariableValueError::OutOfMemory => ExtractionError::OutOfMemory,
+        columine_arrow::VariableValueError::OutOfMemory => ExtractionError::MemoryExhausted,
         columine_arrow::VariableValueError::InvalidFieldType => ExtractionError::InvalidJson,
     }
 }

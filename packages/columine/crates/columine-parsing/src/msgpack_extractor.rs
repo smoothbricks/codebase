@@ -123,7 +123,7 @@ fn extract_msgpack_fields(
     // even the MessagePack header cannot fit) is a configuration error. Refuse
     // rather than silently dropping undeclared fields.
     if config.fallback_column.is_some() && work_buffer.len() < 5 {
-        return Err(ExtractionError::OutOfMemory);
+        return Err(ExtractionError::WorkBufferTooSmall);
     }
     let extra_active = config.fallback_column.is_some();
     let mut state = ExtraState {
@@ -1232,7 +1232,7 @@ mod tests {
                 &mut work,
                 true
             ),
-            Err(ExtractionError::OutOfMemory)
+            Err(ExtractionError::WorkBufferTooSmall)
         );
     }
     #[test]

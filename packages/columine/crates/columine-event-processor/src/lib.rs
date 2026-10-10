@@ -68,10 +68,15 @@ pub enum ResultCode {
     InvalidHandle = 1,
     ParseError = 2,
     EncodeError = 3,
-    OutOfMemory = 4,
+    /// The caller's output buffer cannot hold the result header or the
+    /// encoded batch; the same call succeeds with a larger buffer.
+    OutputTooSmall = 4,
     InvalidFormat = 5,
     InvalidInput = 6,
     SchemaMismatch = 7,
+    /// The memory to process the batch could not be had: nothing was
+    /// produced, and the same call may succeed once the host has more room.
+    MemoryExhausted = 8,
 }
 
 /// Event capacity every wasm `ep_create_*` handle is built with.
@@ -124,6 +129,8 @@ pub enum CreateFailure {
     Init = 0x8000_000a,
     /// All 255 handle slots are in use.
     HandlesExhausted = 0x8000_000b,
+    /// The memory to build the handle could not be had; nothing was created.
+    MemoryExhausted = 0x8000_000c,
 }
 
 impl CreateFailure {
@@ -143,6 +150,7 @@ impl CreateFailure {
         Self::SchemaFieldNames,
         Self::Init,
         Self::HandlesExhausted,
+        Self::MemoryExhausted,
     ];
 }
 
@@ -523,7 +531,7 @@ impl<A: VoAdmission> EventProcessor<A> {
         output: &mut [u8],
     ) -> ResultCode {
         if output.len() < RESULT_HEADER_SIZE {
-            return ResultCode::OutOfMemory;
+            return ResultCode::OutputTooSmall;
         }
         match self.parse(input, format) {
             Ok(batch) => batch.encode(output),
@@ -664,7 +672,7 @@ impl<A: VoAdmission> EventProcessor<A> {
     /// `InvalidFormat` rather than writing value objects it never admitted.
     pub fn compact(&mut self, batch: &[u8], output: &mut [u8]) -> ResultCode {
         if output.len() < RESULT_HEADER_SIZE {
-            return ResultCode::OutOfMemory;
+            return ResultCode::OutputTooSmall;
         }
         if self
             .semantic
@@ -707,7 +715,7 @@ impl<A: VoAdmission> EventProcessor<A> {
         let Some(required_output) =
             RESULT_HEADER_SIZE.checked_add(required_ipc.max(MIN_ARROW_OUTPUT_CAPACITY))
         else {
-            return ResultCode::OutOfMemory;
+            return ResultCode::OutputTooSmall;
         };
         if output.len() < required_output {
             let diagnostic = compact_encode_diagnostic();
@@ -861,7 +869,8 @@ impl Plane {
                 return Err(unwritten_projection());
             }
             let code = match err {
-                json_extractor::ExtractionError::OutOfMemory => ResultCode::OutOfMemory,
+                json_extractor::ExtractionError::WorkBufferTooSmall => ResultCode::OutputTooSmall,
+                json_extractor::ExtractionError::MemoryExhausted => ResultCode::MemoryExhausted,
                 _ => ResultCode::ParseError,
             };
             // JSON carries a per-field diagnostic; MessagePack derives
@@ -881,8 +890,11 @@ impl Plane {
                 // carries the plane's capacity — the batch size a
                 // caller can retry with — as the JSON path's does.
                 let (detail, row_index) = match err {
-                    json_extractor::ExtractionError::OutOfMemory => {
-                        (diagnostic_detail::OUT_OF_MEMORY, 0)
+                    json_extractor::ExtractionError::WorkBufferTooSmall => {
+                        (diagnostic_detail::WORK_BUFFER_TOO_SMALL, 0)
+                    }
+                    json_extractor::ExtractionError::MemoryExhausted => {
+                        (diagnostic_detail::MEMORY_EXHAUSTED, 0)
                     }
                     json_extractor::ExtractionError::BufferOverflow => {
                         (diagnostic_detail::BUFFER_OVERFLOW, 0)
@@ -1256,7 +1268,11 @@ mod tests {
             field_index: 7,
             row_index: 9,
         };
-        write_result_header_with_diagnostic(&mut out, ResultCode::OutOfMemory as u32, &diagnostic);
+        write_result_header_with_diagnostic(
+            &mut out,
+            ResultCode::OutputTooSmall as u32,
+            &diagnostic,
+        );
         // Diagnostic detail byte 4 is buffer_overflow in the ABI order decoded
         // by the TypeScript diagnostic vocabulary.
         assert_eq!(

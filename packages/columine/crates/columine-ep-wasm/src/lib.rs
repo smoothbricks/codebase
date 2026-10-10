@@ -250,7 +250,7 @@ pub unsafe extern "C" fn ep_create_log_entry(
         return ResultCode::InvalidHandle as u32;
     };
     if (output_len as usize) < RESULT_HEADER_SIZE {
-        return ResultCode::OutOfMemory as u32;
+        return ResultCode::OutputTooSmall as u32;
     }
     // Reject format bytes outside the ABI enum rather than interpreting them
     // as an unchecked value.
@@ -279,11 +279,11 @@ pub unsafe extern "C" fn ep_compact(
     output_len: u32,
 ) -> u32 {
     if (output_len as usize) < RESULT_HEADER_SIZE || output_ptr.is_null() {
-        return ResultCode::OutOfMemory as u32;
+        return ResultCode::OutputTooSmall as u32;
     }
     let output_start = output_ptr as usize;
     let Some(output_end) = output_start.checked_add(output_len as usize) else {
-        return ResultCode::OutOfMemory as u32;
+        return ResultCode::OutputTooSmall as u32;
     };
     let output = unsafe { std::slice::from_raw_parts_mut(output_ptr, output_len as usize) };
     let Some(instance) = get_processor(handle) else {
