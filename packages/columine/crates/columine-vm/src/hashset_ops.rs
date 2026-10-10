@@ -6,7 +6,7 @@
 //! TTL index. An enclosing VM boundary owns flag bytes instead of this capture.
 
 use crate::hash_table::{ENTRY_NONE, EraseRanges, FlatTable};
-use crate::hooks::{ByteCapture, TtlMutation, VmHooks};
+use crate::hooks::{ByteCapture, TtlMutation, VmHooks, batch_rows};
 use crate::meta::{BatchFlags, SlotMetaView};
 use columine_types::types::{ChangeFlag, ErrorCode, SlotMetaOffset, SlotType};
 
@@ -34,18 +34,17 @@ pub fn batch_set_insert(
     if meta.slot_type() == SlotType::Bitmap {
         columine_types::die!("BITMAP slot reached hashset_ops — the VM routes it to bitmap_ops");
     }
-    // One recording decision per batch: the unrecorded loop is compiled
-    // without any capture code.
-    if hooks.undo_enabled() {
-        insert_rows::<true>(delta_mode, state, meta, elems, ts_col, hooks)
-    } else {
-        insert_rows::<false>(delta_mode, state, meta, elems, ts_col, hooks)
-    }
+    batch_rows!(
+        hooks.undo_enabled(),
+        meta.has_ttl(),
+        insert_rows(delta_mode, state, meta, elems, ts_col, hooks)
+    )
 }
 
-/// [`batch_set_insert`]'s row loop; `RECORDING` is the journal's state.
+/// [`batch_set_insert`]'s row loop; `RECORDING` is the journal's state
+/// and `TTL` the slot's.
 #[inline(always)]
-fn insert_rows<const RECORDING: bool>(
+fn insert_rows<const RECORDING: bool, const TTL: bool>(
     delta_mode: bool,
     state: &mut [u8],
     meta: &SlotMetaView,
@@ -59,7 +58,7 @@ fn insert_rows<const RECORDING: bool>(
     let mut flags = BatchFlags::default();
 
     for (i, &elem) in elems.iter().enumerate() {
-        let ts = if meta.has_ttl() {
+        let ts = if TTL {
             ts_col.unwrap_or_else(|| columine_types::die!("TTL slot requires a timestamp column"))
                 [i]
         } else {
@@ -74,11 +73,11 @@ fn insert_rows<const RECORDING: bool>(
         if !probe.found && local_size >= max_load {
             return ErrorCode::CapacityExceeded;
         }
-        if probe.found && !meta.has_ttl() {
+        if probe.found && !TTL {
             continue;
         }
 
-        let ttl_plan = if meta.has_ttl() {
+        let ttl_plan = if TTL {
             match hooks.plan_ttl_batch(
                 state,
                 meta,
@@ -159,10 +158,10 @@ pub fn batch_set_remove(
         return ErrorCode::InvalidState;
     }
     let mut scratch = hooks.take_erase_scratch();
-    // One recording decision per batch: the unrecorded loop is compiled
-    // without any capture code.
-    let result = if hooks.undo_enabled() {
-        remove_rows::<true>(
+    let result = batch_rows!(
+        hooks.undo_enabled(),
+        meta.has_ttl(),
+        remove_rows(
             delta_mode,
             state,
             meta,
@@ -171,25 +170,15 @@ pub fn batch_set_remove(
             &mut scratch.ranges,
             hooks,
         )
-    } else {
-        remove_rows::<false>(
-            delta_mode,
-            state,
-            meta,
-            &tbl,
-            elems,
-            &mut scratch.ranges,
-            hooks,
-        )
-    };
+    );
     hooks.restore_erase_scratch(scratch);
     result
 }
 
 /// [`batch_set_remove`]'s row loop over a checked table; `RECORDING` is the
-/// journal's state.
+/// journal's state and `TTL` the slot's.
 #[inline(always)]
-fn remove_rows<const RECORDING: bool>(
+fn remove_rows<const RECORDING: bool, const TTL: bool>(
     delta_mode: bool,
     state: &mut [u8],
     meta: &SlotMetaView,
@@ -205,7 +194,7 @@ fn remove_rows<const RECORDING: bool>(
         };
 
         let erase = tbl.plan_erase_at(state, pos);
-        let ttl_plan = if meta.has_ttl() {
+        let ttl_plan = if TTL {
             match hooks.plan_ttl_batch(
                 state,
                 meta,

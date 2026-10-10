@@ -14,7 +14,7 @@
 
 use crate::bytes;
 use crate::hash_table::{ENTRY_U32, ErasePlan, EraseRanges, FlatTable};
-use crate::hooks::{ByteCapture, TtlMutation, VmHooks};
+use crate::hooks::{ByteCapture, TtlMutation, VmHooks, batch_rows};
 use crate::meta::{BatchFlags, SlotMetaView};
 use columine_types::types::{ChangeFlag, ErrorCode, SlotMetaOffset};
 
@@ -141,23 +141,20 @@ pub fn batch_map_upsert(
     if compares_values && !meta.has_hashmap_timestamp_storage() {
         return ErrorCode::InvalidProgram;
     }
-    // One recording decision per batch: the unrecorded loop is compiled
-    // without any capture code.
-    if hooks.undo_enabled() {
-        upsert_rows::<true>(
+    batch_rows!(
+        hooks.undo_enabled(),
+        meta.has_ttl(),
+        upsert_rows(
             strategy, delta_mode, state, meta, keys, vals, cmp_col, cmp_type, hooks,
         )
-    } else {
-        upsert_rows::<false>(
-            strategy, delta_mode, state, meta, keys, vals, cmp_col, cmp_type, hooks,
-        )
-    }
+    )
 }
 
-/// [`batch_map_upsert`]'s row loop; `RECORDING` is the journal's state.
+/// [`batch_map_upsert`]'s row loop; `RECORDING` is the journal's state
+/// and `TTL` the slot's.
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
-fn upsert_rows<const RECORDING: bool>(
+fn upsert_rows<const RECORDING: bool, const TTL: bool>(
     strategy: Strategy,
     delta_mode: bool,
     state: &mut [u8],
@@ -168,7 +165,7 @@ fn upsert_rows<const RECORDING: bool>(
     cmp_type: CmpType,
     hooks: &mut impl VmHooks,
 ) -> ErrorCode {
-    let stores_aux = strategy.needs_timestamps() || meta.has_ttl();
+    let stores_aux = strategy.needs_timestamps() || TTL;
 
     let tbl = bind_slot_map(meta);
     let mut local_size = tbl.size(state);
@@ -210,7 +207,7 @@ fn upsert_rows<const RECORDING: bool>(
             continue;
         }
 
-        let ttl_plan = if meta.has_ttl() {
+        let ttl_plan = if TTL {
             match hooks.plan_ttl_batch(
                 state,
                 meta,
@@ -329,10 +326,10 @@ pub fn batch_map_remove(
         return ErrorCode::InvalidState;
     }
     let mut scratch = hooks.take_erase_scratch();
-    // One recording decision per batch: the unrecorded loop is compiled
-    // without any capture code.
-    let result = if hooks.undo_enabled() {
-        remove_rows::<true>(
+    let result = batch_rows!(
+        hooks.undo_enabled(),
+        meta.has_ttl(),
+        remove_rows(
             delta_mode,
             state,
             meta,
@@ -342,27 +339,16 @@ pub fn batch_map_remove(
             &mut scratch.ranges,
             hooks,
         )
-    } else {
-        remove_rows::<false>(
-            delta_mode,
-            state,
-            meta,
-            &tbl,
-            has_ts,
-            keys,
-            &mut scratch.ranges,
-            hooks,
-        )
-    };
+    );
     hooks.restore_erase_scratch(scratch);
     result
 }
 
 /// [`batch_map_remove`]'s row loop over a checked table; `RECORDING` is the
-/// journal's state.
+/// journal's state and `TTL` the slot's.
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
-fn remove_rows<const RECORDING: bool>(
+fn remove_rows<const RECORDING: bool, const TTL: bool>(
     delta_mode: bool,
     state: &mut [u8],
     meta: &SlotMetaView,
@@ -379,7 +365,7 @@ fn remove_rows<const RECORDING: bool>(
         };
 
         let erase = tbl.plan_erase_at(state, pos);
-        let ttl_plan = if meta.has_ttl() {
+        let ttl_plan = if TTL {
             match hooks.plan_ttl_batch(state, meta, core::iter::once(TtlMutation::Remove { key })) {
                 Ok(plan) => Some(plan),
                 Err(error) => return error,

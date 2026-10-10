@@ -97,6 +97,23 @@ pub enum TtlMutation {
     },
 }
 
+/// Run a batch kernel's row loop `$rows::<RECORDING, TTL>` specialized on
+/// the journal's recording state and the slot's TTL flag, both fixed for
+/// the whole batch: an unrecorded loop carries no capture code, and a loop
+/// over a slot without TTL no planner calls, so neither pays for them per
+/// row in branches or in registers saved around a call.
+macro_rules! batch_rows {
+    ($recording:expr, $ttl:expr, $rows:ident($($arg:expr),* $(,)?)) => {
+        match ($recording, $ttl) {
+            (true, true) => $rows::<true, true>($($arg),*),
+            (true, false) => $rows::<true, false>($($arg),*),
+            (false, true) => $rows::<false, true>($($arg),*),
+            (false, false) => $rows::<false, false>($($arg),*),
+        }
+    };
+}
+pub(crate) use batch_rows;
+
 /// Services container operations may request from the VM.
 pub trait VmHooks {
     /// Whether undo logging is enabled.
