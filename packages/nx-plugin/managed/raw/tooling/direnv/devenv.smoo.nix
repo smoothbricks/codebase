@@ -92,6 +92,12 @@
   # its path, so plain builds keep their units. The profile still carries the
   # same files for anything that names it.
   rustToolchainBin = "${config.languages.rust.toolchainPackage}/bin";
+
+  # Expose pyflakes without propagating a second interpreter into the shell.
+  pyflakesBin = pkgs.runCommandLocal "pyflakes-${pkgs.python3Packages.pyflakes.version}" {} ''
+    mkdir -p "$out/bin"
+    ln -s ${pkgs.python3Packages.pyflakes}/bin/pyflakes "$out/bin/pyflakes"
+  '';
 in {
   # nixpkgs carries actionlint, not the jdx fork. Supply the immutable upstream
   # release as a normal package, with the same pin in developer shells and CI.
@@ -380,6 +386,9 @@ in {
       pkgs.binaryen
       # Smoo's GitHub Actions validator uses the managed prebuilt package above.
       pkgs.jactionlint
+      # Keep jactionlint's default shell and Python checks in the same pinned closure.
+      pkgs.shellcheck-minimal
+      pyflakesBin
       # Test runner for inferred Cargo test targets. Generated targets must never
       # depend on an ambient host installation that CI does not reproduce.
       pkgs.cargo-nextest
