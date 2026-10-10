@@ -33,6 +33,10 @@ use cowshed_core::workspace_environment::{PORT_BASE_ENV, PORT_BLOCK_SIZE_ENV};
 use cowshed_gateway_types::WorkspaceToken;
 use cowshed_os::fork_lock::Run as _;
 
+#[path = "support/nx_reads.rs"]
+mod nx_dependencies;
+use nx_dependencies::nx_read_paths;
+
 use tokio::sync::mpsc;
 
 /// `sun_path` on macOS is 104 bytes; devenv keeps its default runtime base short for exactly
@@ -1557,49 +1561,17 @@ async fn host_controller_native_file_watching_observes_allowed_updates_without_p
     .canonicalize()
     .expect("Nx test dependencies");
     sandbox.grants.read.push(modules.clone());
-    // Bun may link the Nx package and its declared platform dependency into its host cache,
-    // which only a Bun project's sandbox reads. Grant each resolved package, not the whole host
-    // cache or user home: Nx's with the `node_modules` beside it, whose links name its
-    // dependencies, and the native binding's.
     let nx = modules
         .join("nx")
         .canonicalize()
         .expect("canonical Nx package");
-    sandbox
-        .grants
-        .read
-        .push(nx.parent().expect("Nx's node_modules").to_path_buf());
-    let resolved = std::process::Command::new("node")
-        .args([
-            "-p",
-            "require.resolve(`@nx/nx-${process.platform}-${process.arch}`, { paths: [process.argv[1]] })",
-        ])
-        .arg(&nx).output_locked()
-        .expect("resolve the native watcher dependency");
-    assert!(
-        resolved.status.success(),
-        "{}",
-        String::from_utf8_lossy(&resolved.stderr)
-    );
-    let binding = PathBuf::from(
-        String::from_utf8(resolved.stdout)
-            .expect("native binding path UTF-8")
-            .trim(),
-    );
-    sandbox.grants.read.push(
-        binding
-            .parent()
-            .expect("native binding package")
-            .canonicalize()
-            .expect("canonical native binding package"),
-    );
+    sandbox.grants.read.extend(nx_read_paths(&nx));
     let mount = &sandbox.workspace_mount;
     let private = mount.join("private");
     std::fs::create_dir(&private).expect("private fixture directory");
     std::fs::write(private.join("secret.txt"), b"synthetic-before").expect("private fixture");
     std::fs::write(mount.join("own.txt"), b"before").expect("allowed fixture");
     sandbox.additional_denies.push(private.clone());
-    let ready = mount.join("watch-ready");
     let script = mount.join("watch.cjs");
     std::fs::write(
         &script,
@@ -1613,68 +1585,100 @@ assert.throws(
 );
 let sawAllowedUpdate = false;
 let failure = null;
+let callbackMilliseconds;
+let readyAt;
+let acknowledge;
+let refuse;
+const observed = new Promise((resolve, reject) => {
+  acknowledge = resolve;
+  refuse = reject;
+});
 function collect(events) {
   for (const event of events) {
-    if (event.path.startsWith('private/')) failure = new Error('private path exposed by watcher');
+    if (event.path.startsWith('private/')) {
+      failure = new Error('private path exposed by watcher');
+      refuse(failure);
+    }
     if (event.path === 'own.txt' && fs.readFileSync('own.txt', 'utf8') === 'after') {
+      callbackMilliseconds ??= Number(process.hrtime.bigint() - readyAt) / 1e6;
       sawAllowedUpdate = true;
+      acknowledge();
     }
   }
 }
 const watcher = new Watcher(process.cwd(), [], false);
 watcher.watch((error, events) => {
-  if (error) failure = new Error(error);
-  else collect(events);
+  if (error) {
+    failure = new Error(error);
+    refuse(failure);
+  } else collect(events);
 });
-fs.writeFileSync('watch-ready', '');
-let polls = 0;
-const timer = setInterval(async () => {
-  collect(watcher.forceFlushPending());
-  if (++polls === 30) {
-    clearInterval(timer);
+readyAt = process.hrtime.bigint();
+process.stdout.write(`${process.argv[3]}watch-ready\n`);
+(async () => {
+  const deadline = setTimeout(
+    () => refuse(new Error('native callback for the allowed source change did not arrive')),
+    10000,
+  );
+  try {
+    await observed;
+    collect(watcher.forceFlushPending());
+  } finally {
+    clearTimeout(deadline);
     await watcher.stop();
-    assert.equal(failure, null);
-    assert.ok(sawAllowedUpdate, 'the allowed source change must produce a notification');
   }
-}, 100);
+  assert.equal(failure, null);
+  assert.ok(sawAllowedUpdate, 'the allowed source change must produce a notification');
+  console.error(`native watcher time-to-callback: ${callbackMilliseconds.toFixed(3)}ms`);
+  process.stdout.write(`${process.argv[3]}source-observed\n`);
+})().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});
 "#,
     )
     .expect("watcher probe");
-    let publish = async {
-        if tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            while !ready.exists() {
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .is_err()
-        {
-            return false;
-        }
-        std::fs::write(mount.join("own.txt"), b"after").expect("publish allowed change");
-        std::fs::write(private.join("secret.txt"), b"synthetic-after")
-            .expect("publish private negative control");
-        true
-    };
-    let ((exit, _, stderr), started) = tokio::join!(
-        run_in_sandbox(
-            &sandbox,
-            mount,
-            vec![
-                "node".into(),
-                script.into_os_string(),
-                modules.join("nx/dist/src/native").into_os_string(),
-            ],
-        ),
-        publish,
-    );
+    let mut watcher = SandboxedChild::spawn(spawn_request(
+        &sandbox,
+        mount,
+        vec![
+            "node".into(),
+            script.into_os_string(),
+            modules.join("nx/dist/src/native").into_os_string(),
+            TCP_PROBE_LINE.into(),
+        ],
+    ))
+    .await;
+    watcher.close_stdin();
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        watcher.until_probe_line(&format!("{TCP_PROBE_LINE}watch-ready")),
+    )
+    .await
+    .expect("watcher must start before publishing changes");
+    // The positive acknowledgement follows the private mutation; no earlier denied event may be exposed.
+    std::fs::write(private.join("secret.txt"), b"synthetic-after")
+        .expect("publish private negative control");
+    let next_source = mount.join("own.txt.next");
+    std::fs::write(&next_source, b"after").expect("prepare allowed change");
+    std::fs::rename(&next_source, mount.join("own.txt"))
+        .expect("publish allowed change atomically");
+    let (exit, stdout, stderr) = watcher.wait().await;
+    eprintln!("{}", String::from_utf8_lossy(&stderr));
     assert_eq!(
         exit,
         ExitStatus::Exited { code: 0 },
         "watcher must report allowed changes without exposing denied paths: {}",
         String::from_utf8_lossy(&stderr),
     );
-    assert!(started, "watcher must start before publishing changes");
+    assert_eq!(
+        probe_lines(&stdout),
+        [
+            format!("{TCP_PROBE_LINE}watch-ready"),
+            format!("{TCP_PROBE_LINE}source-observed"),
+        ],
+        "watcher must start before publishing changes and acknowledge the native callback"
+    );
     std::fs::remove_dir_all(root).expect("remove watcher fixture");
 }
 

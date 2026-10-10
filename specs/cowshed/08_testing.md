@@ -254,6 +254,16 @@ and worktree metadata grants. The probe executes Git through the system-selected
 `/usr/bin/git` launcher: the launcher requires xcrun host-cache writes even for read-only operations. Publication
 fixtures provide the existing `.cowshed` directory that workspace creation owns.
 
+Nx-backed host-controller probes share `tests/support/nx_reads.rs`: it walks the checkout's pinned Bun-installed Nx
+package and its reachable package-private namespaces, admitting only the required external Bun-store payloads and
+namespaces. Patched packages remain local to the checkout; no generated release closure, binary copy, hoist or
+whole-HOME grant is introduced. Both CLI volume walks and the native-file-watching walk use that same helper. The
+watcher walk advances on the child's ready stdout and the allowed change's native callback, not a guessed
+subscription/debounce sleep or repeated flush polling. It publishes the denied private control first, then atomically
+renames the allowed source change into place, drains pending events and stops the watcher before retaining all privacy
+and notification assertions. Its 10-second deadline is only a hang fail-safe; it never retries or enables diagnostic
+flags to make the test pass.
+
 No outer sandbox installation or permission change is required for this target: the authority boundary is unchanged.
 Updating the checkout's sandbox source cannot change an already-running outer supervisor; separately testing a changed
 runtime policy requires the controller to install the intended release and start a fresh supervisor. Never broaden
