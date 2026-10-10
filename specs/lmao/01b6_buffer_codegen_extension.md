@@ -7,11 +7,51 @@ span-specific functionality while maintaining V8 optimization.
 
 ## Overview
 
-The system uses runtime code generation (`new Function()`) to create specialized buffer classes:
+The system uses runtime code generation (`new Function()`) to create specialized buffer classes, with a closure-composed
+materializer for runtimes where a class build may not run string codegen
+([Materializer Selection](#smoo/lmao!n/buffer-codegen.materializer-selection)):
 
 1. **arrow-builder** provides the extension interface and class generator
 2. **lmao** provides span-specific code via callbacks
 3. Generated classes have fixed hidden class shapes for V8 optimization
+
+### Materializer Selection <a id="smoo/lmao!n/buffer-codegen.materializer-selection"></a>
+
+arrow-builder's `ColumnBuffer`/`ColumnWriter` and lmao's `SpanLogger`/`ResultWriter` classes are each built by one of
+two materializers from the same schema-derived plan:
+
+- **compiled**: renders class source and evaluates it with `new Function`;
+- **closure**: installs per-field closures on one shared prototype per schema, with no source text. It produces
+  byte-identical buffers (pinned by the parity suites) and rejects code-string extension fields that have no
+  `closureInit`/`closureMethods` counterpart.
+
+lmao's `WasmSpanBuffer` class (`packages/lmao/src/lib/wasm/wasmSpanBuffer.ts`) has only the compiled form and does not
+consult the selection, so it cannot be built inside a workerd request.
+
+Classes are built lazily, per schema, on first use; on a server that first use is usually inside a request. The choice
+therefore answers "may every context that builds a class run `new Function`", not "may module init run it". workerd
+allows code generation while a worker's top-level modules evaluate and refuses it inside a request
+(`EvalError: Code generation from strings disallowed for this context`), so a module-init probe alone answers wrongly
+there.
+
+`packages/arrow-builder/src/lib/buffer/codegenCapability.ts` decides once, at module init, and every build site reads
+that single decision through `activeMaterializerMode()`:
+
+1. workerd selects **closure** without probing. Either of two documented Workers runtime signals identifies it:
+   `navigator.userAgent === 'Cloudflare-Workers'` (global_navigator, default since compatibility date 2022-03-21;
+   miniflare reports the same) and the `WebSocketPair` global, which the Workers WebSockets API defines under every
+   compatibility date and flag. `WebSocketPair` identifies the isolates that have no `navigator` (compatibility date
+   before 2022-03-21, or `no_global_navigator`).
+2. Otherwise a `new Function` probe selects **compiled** when it succeeds and **closure** when it fails (strict CSP).
+   Runtimes that allow codegen at init allow it everywhere (bun, node, browsers).
+
+The decision is fixed for the process, so one schema never has both class kinds live. Build sites do not catch
+`EvalError`: a refusal on the compiled path is a selection bug and surfaces as one. `setMaterializerModeOverride` forces
+a mode for parity suites (forcing `compiled` where codegen is unsupported throws), and class caches are keyed by mode.
+`packages/lmao/src/lib/__tests__/workerd-request-codegen.test.ts` reproduces workerd's policy in a fresh process —
+codegen allowed while modules evaluate, refused afterwards — and requires every class to build and write, both when
+`navigator` identifies workerd and when only `WebSocketPair` does. With neither signal the same process fails with
+`EvalError` on its first class build, which shows that the refusal reaches the compiled path.
 
 ## ColumnBuffer Extension Mechanism <a id="smoo/lmao!n/buffer-codegen-extension-mechanism"></a>
 

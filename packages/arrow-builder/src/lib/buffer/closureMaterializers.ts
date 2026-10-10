@@ -2,8 +2,9 @@
  * Closure-composed (no-eval) materializers for ColumnBuffer and ColumnWriter
  * classes.
  *
- * Production workerd forbids code generation from strings, so the compiled
- * materializer (`new Function` over rendered class source) cannot run there.
+ * workerd refuses code generation from strings inside a request, where classes
+ * are first built, so the compiled materializer (`new Function` over rendered
+ * class source) cannot run there (selection: codegenCapability.ts).
  * This module builds the SAME classes from an accessor plan without any
  * source text: one shared prototype per schema, methods installed with
  * Object.defineProperty as per-field lambdas closing over (storage kind,

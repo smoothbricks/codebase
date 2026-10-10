@@ -2,8 +2,10 @@
 /**
  * Closure-composed (no-eval) materializer for state-bound SpanLogger classes.
  *
- * Production workerd forbids code generation from strings (EvalError), so the
- * compiled renderer in spanLoggerGenerator.ts cannot run there. This module
+ * workerd refuses code generation from strings inside a request (EvalError),
+ * where SpanLogger classes are first built, so the compiled renderer in
+ * spanLoggerGenerator.ts cannot run there (selection: arrow-builder's
+ * codegenCapability.ts). This module
  * assembles the SAME class shape from per-field closures instead of source
  * text, mirroring arrow-builder's closureMaterializers.ts:
  * - one shared prototype per schema/config plan,

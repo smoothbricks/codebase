@@ -105,11 +105,14 @@ const processUser = op(async ({ tag }, userData) => {
 > **Implementation status**: The runtime codegen lives in `packages/lmao/src/lib/codegen/`.
 > `fixedPositionWriterGenerator.ts` generates the **TagWriter** (row 0) and **ResultWriter** (row 1) fluent setters —
 > both the object-based `with({...})` and the per-field `tag.userId()` setters, with compile-time enum→index mapping,
-> all via `new Function()` at schema-definition time and cached per schema (`WeakMap`). `spanLoggerGenerator.ts`
-> generates the **SpanLogger** (rows 2+: info/debug/warn/error/trace + `with`) by extending arrow-builder's
-> `ColumnWriter`. The "entry-type-bound" split in the prose below maps to: TagWriter (fixed row 0) vs SpanLogger
-> (advancing rows) — not a per-entry-type class. The illustrative class names below (`TagAPI`/`LogAPI`) are the shipped
-> `TagWriter`/`SpanLogger`.
+> cached per schema (`WeakMap`). The TagWriter class is a source-authored constructor with schema-driven prototype
+> methods and runs no `new Function()` under either materializer; the ResultWriter class is built via `new Function()`
+> or the closure-composed materializer chosen by
+> [01b6 Materializer Selection](./01b6_buffer_codegen_extension.md#smoo/lmao!n/buffer-codegen.materializer-selection).
+> `spanLoggerGenerator.ts` generates the **SpanLogger** (rows 2+: info/debug/warn/error/trace + `with`) by extending
+> arrow-builder's `ColumnWriter`, under the same selection. The "entry-type-bound" split in the prose below maps to:
+> TagWriter (fixed row 0) vs SpanLogger (advancing rows) — not a per-entry-type class. The illustrative class names
+> below (`TagAPI`/`LogAPI`) are the shipped `TagWriter`/`SpanLogger`.
 
 ### 1. Schema-Driven Column Writers
 

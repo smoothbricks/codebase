@@ -95,6 +95,16 @@ class GeneratedColumnBuffer {
 // - Predictable memory layout
 ```
 
+The same classes are also built without string codegen: a closure-composed materializer installs per-field closures on
+one shared prototype per schema and produces byte-identical buffers. The materializer is chosen once, at module init:
+workerd always gets the closure path, because it allows `new Function` at startup but refuses it inside a request, where
+classes are first built. workerd is identified by `navigator.userAgent === 'Cloudflare-Workers'` or by the
+`WebSocketPair` global, which Workers defines under every compatibility date and flag and so also identifies isolates
+without `navigator` (compatibility date before 2022-03-21, or `no_global_navigator`). Elsewhere a `new Function` probe
+decides (strict-CSP hosts get the closure path). `activeMaterializerMode()` reports the choice and
+`setMaterializerModeOverride('closure')` reproduces workerd locally. Extensions that carry code strings need their
+`closureInit`/`closureMethods` counterparts on the closure path.
+
 ## Architecture
 
 ### Column Layout
