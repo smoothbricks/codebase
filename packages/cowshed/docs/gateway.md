@@ -168,7 +168,7 @@ the same package version, so the daemon reports the SHA-256 of its own executabl
 remedy `cowshed setup`, run from the cowshed you mean to use: it installs that build and restarts a gateway that runs
 other bytes. `start` restarts a daemon it finds running other bytes once, and refuses with that remedy if the mismatch
 survives the restart. A daemon of another build also refuses every command that would reach a workspace supervisor
-(`exec`, `rm`, `new`, `land`, …): the CLI asks it before the command changes anything, so the refusal — "the cowshed
+(`exec`, `rm`, `fork`, `land`, …): the CLI asks it before the command changes anything, so the refusal — "the cowshed
 daemon is build X; this cowshed is build Y" — leaves the host as it was, and its hint is the same `cowshed setup`.
 
 Every ordinary `exec`, `attach`, and `doctor` invocation reconciles the current project before use. Attach, detach,
@@ -219,7 +219,7 @@ followed. Credential rotation is observed on next use; nothing inside a workspac
 
 ## Client wiring (files, not hand-written env)
 
-Wiring is written at adopt/new/fork and revalidated by `attach`. `portBlock` is optional and macOS-only. Every client
+Wiring is written at adopt/fork and revalidated by `attach`. `portBlock` is optional and macOS-only. Every client
 reaches the gateway at one URL:
 
 | Client                | macOS                                           | Linux                                   |

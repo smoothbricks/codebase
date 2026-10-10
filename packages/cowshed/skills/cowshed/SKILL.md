@@ -3,8 +3,8 @@ name: cowshed
 description:
   Give each agent, fork, or subtask an instant warm copy-on-write clone of a repository instead of a cold git worktree.
   Use when spawning parallel agents that each need their own checkout, when a worktree would force a multi-minute cold
-  rebuild, when isolating risky or destructive work, or when running any cowshed command (adopt, setup, new, fork, path,
-  exec, grant, land, push, rm, gc, rebase, checkpoint, restore, attach, detach, defrag, reseed, doctor, sccache).
+  rebuild, when isolating risky or destructive work, or when running any cowshed command (adopt, setup, fork, path,
+  exec, grant, land, push, rm, gc, rebase, doctor).
 ---
 
 # cowshed — warm workspaces for parallel agents
@@ -125,5 +125,5 @@ paths; `--ref <rev>` implies clean. Ignored dependencies and build state stay wa
   store" means your shell is sandboxed — no grant helps; rerun from an unsandboxed shell.
 - Attach failures with `AttachPoolExhausted` / error 150: run `cowshed doctor`. Leaked `AppleDiskImageDevice`s free only
   on reboot; orphaned `diskimagesiod` helpers are freed by the `sudo kill -9` doctor names, then
-  `attach-budget --clear`. Detaching sheds does not free leaked devices — do not retry-spawn into a spent pool.
+  `cowshed doctor --clear-attach-budget`. Detaching sheds does not free leaked devices — do not retry-spawn into a spent pool.
 - "the cowshed daemon is build X; this cowshed is build Y": run `cowshed setup` from the build you mean, then retry.

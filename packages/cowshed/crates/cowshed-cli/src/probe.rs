@@ -10,7 +10,7 @@
 //! never a gap.
 //!
 //! The answer depends on the host's git configuration and the mount root, never on a workspace,
-//! so `setup` and `doctor` run it and `new` does not.
+//! so `setup` and `doctor` run it and `fork` does not.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;

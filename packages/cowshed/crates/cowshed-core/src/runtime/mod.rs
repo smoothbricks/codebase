@@ -37,7 +37,7 @@ pub mod supervisor_socket;
 pub mod volume_usage;
 
 pub use project::{
-    JobAnswer, ProjectDescriptor, ProjectRuntime, ProjectRuntimeHost, RecoveryScope,
+    ClonePurpose, JobAnswer, ProjectDescriptor, ProjectRuntime, ProjectRuntimeHost, RecoveryScope,
     RuntimeLogChunk, WorkspaceSnapshot,
 };
 pub use supervisor::{

@@ -81,7 +81,7 @@ log show --last 2m --predicate 'sender == "Sandbox"' | grep deny
 and the gateway audit events for egress (Arrow segments under `/private/cowshed/store/telemetry/gateway/`,
 [telemetry.md](telemetry.md)). Common cases:
 
-- **A lifecycle verb (`new`, `rm`, …) exits 6 with "the process running cowshed is sandboxed away from cowshed's
+- **A lifecycle verb (`fork`, `rm`, …) exits 6 with "the process running cowshed is sandboxed away from cowshed's
   store"**: the shell that ran cowshed — an agent harness shell, or a `cowshed exec` child calling cowshed again — is
   itself sandboxed, and the kernel answered EPERM on a store path (such a sandbox typically lets the store's existing
   lock files open but refuses the temp file every durable write starts with). The store is intact and no grant helps:
@@ -163,7 +163,7 @@ $ cowshed gc
 ```
 
 A main that has taken years of writes under clones is slow to clone, not large: `cowshed doctor` reports `main-extents`
-and names `cowshed defrag main` when the next `new` would pay for it.
+and names `cowshed defrag main` when the next `fork` would pay for it.
 
 Attribution: `du` on the images directory tells you per-workspace cost; _inside_ a mounted workspace, normal `du` works
 — it's just APFS. Remember clones share extents: ten fresh workspaces cost ~zero until they diverge, so "sum of image
@@ -202,7 +202,7 @@ unit that rebuilt:
   cause is a `test` profile that differs from `dev`, so every dependency has two units and main held the other one, or a
   toolchain bump since main was last warmed: let `test` inherit `dev`, and warm main with
   `cowshed exec main -- <canonical build>`), or main built it after its seed was frozen and the fork's reseed was
-  skipped because something was writing main's build volume: `new` says so on stderr, `cowshed doctor` reports
+  skipped because something was writing main's build volume: `fork` says so on stderr, `cowshed doctor` reports
   `seed-age`, and `cowshed reseed main` refreezes the seed once main's build is done.
 - **`PathToSourceChanged`** — a dependency was built under another `$CARGO_HOME`; see the shared cargo caches above.
 - **`the rerun-if-changed instructions changed`** — a build script watches a path outside its package by absolute path;
@@ -218,7 +218,7 @@ The one path problem cargo never reports is the opposite one: a unit that compil
 fresh in every clone, so a test built in main reads main's files from inside the workspace. Read the variable at run
 time (cargo and nextest set it for every test).
 
-Xcode DerivedData does key on absolute paths: slot mounts (`new --slot`) recycle a stable path for it. `bun install`,
+Xcode DerivedData does key on absolute paths: slot mounts (`fork --slot`) recycle a stable path for it. `bun install`,
 `node_modules`, zig, and gradle caches are path-independent.
 
 ## A workspace misses Nx entries main has, and `.nx/workspace-data` is a directory
@@ -400,7 +400,7 @@ step, so the slow step is named on stderr. On a large repository two steps carry
   s on a busy one, one with 470 thousand costs 4 s, and a freshly written 4 GiB file with 256 extents costs 5 ms. A
   one-byte write into a plain `cp -c` clone of the image file reproduces the cost with no disk image attached, so it is
   not the mount itself and does not depend on how many images are attached. Deleting a written clone (`cowshed rm`,
-  `cowshed gc`) pays about half as much per extent. `new --from <ws>` pays the same cost for the source workspace's
+  `cowshed gc`) pays about half as much per extent. `fork <ws> <name>` pays the same cost for the source workspace's
   image. `cowshed doctor` reports main's extent count and the cost it predicts as `main-extents`, and warns once that
   cost reaches a second. Only rewriting main's image file contiguously lowers it: `cowshed defrag main`, run while the
   checkout is idle, since main has to leave the kernel for the copy and a busy volume refuses. It needs as much free

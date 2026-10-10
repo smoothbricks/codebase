@@ -583,7 +583,7 @@ impl LifecycleIntent {
     pub fn verb(&self) -> &'static str {
         match self {
             Self::Adopt { .. } | Self::ReAdopt { .. } => "adopt",
-            Self::Create { .. } => "create",
+            Self::Create { .. } => "fork",
             Self::Fork { rename: true, .. } => "rename",
             Self::Fork { rename: false, .. } => "fork",
             Self::Retire { .. } => "retire",

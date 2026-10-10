@@ -109,7 +109,7 @@ installed and both builds; it repairs everything else, prints the reason and the
 install. `--downgrade` installs the invoking build anyway; it is refused with `--uninstall`, `--force` and
 `--mount-root`, which install nothing.
 
-The commands that change a workspace or run work in one — `adopt`, `new`, `fork`, `mv`, `checkpoint`, `restore`, `path`,
+The commands that change a workspace or run work in one — `adopt`, `fork`, `mv`, `checkpoint`, `restore`, `path`,
 `exec`, `grant`, `rm`, `attach`, `detach`, `resize`, `defrag`, `reseed`, `rekey`, `gc`, `push`, `rebase`, `land` — first
 ask the daemon whether it runs their build, before they open the project or change anything. A daemon of another build
 refuses them up front (exit 4), naming both builds, with the remedy this verb provides:
@@ -134,8 +134,8 @@ After a repair, and after `--mount-root`, setup probes git identity for every ad
 reported on stderr, prefixed with its project, by name with the `includeIf` condition that pulled it in, plus the
 remedy: add a pattern covering the mount root. A file the repository's own config includes by a relative path inside the
 repository (`include.path = ../tooling/workspace.gitconfig`) travels with every clone and is not reported.
-`cowshed doctor` reports the same finding for the current project. `new` does not probe: the answer depends only on your
-git configuration and the mount root.
+`cowshed doctor` reports the same finding for the current project. `fork` does not probe: the answer depends only on
+your git configuration and the mount root.
 
 Anything that can escalate happens inside one authorization session, and **the exact intent for every volume is printed
 before the dialog appears** — name, UUID, size, and where it is going. When the plan creates and deletes nothing, that
@@ -336,11 +336,11 @@ a machine may display one administrator authorization prompt from `diskutil` whi
 space-sharing `cowshed.store` APFS volume. Once it is present and correctly mounted, later adopts only validate it and
 do not prompt.
 
-Every other command (`new`, `ls`, `path`, `exec`, `rm`, `attach`, `detach`, and `doctor`) opens storage in existing-only
-mode. If the store volume is absent or needs mounting, the command exits with `environment-missing`, lists the required
-setup actions, and prints `next: cowshed setup`; it never creates a volume, repairs a mount, or requests administrator
-authorization. Launchd agents and future background services use the same existing-only entrypoint, so a background
-process can report missing setup but can never cause a macOS authorization prompt.
+Every other command (`fork`, `ls`, `path`, `exec`, `rm`, `attach`, `detach`, and `doctor`) opens storage in
+existing-only mode. If the store volume is absent or needs mounting, the command exits with `environment-missing`, lists
+the required setup actions, and prints `next: cowshed setup`; it never creates a volume, repairs a mount, or requests
+administrator authorization. Launchd agents and future background services use the same existing-only entrypoint, so a
+background process can report missing setup but can never cause a macOS authorization prompt.
 
 Storage guidance points at `cowshed setup`, never at adopting a directory: a host with no volumes has no checkout to
 adopt, and `adopt` would ask for one.
@@ -779,8 +779,7 @@ named, before anything is touched. A mounted workspace is detached, grown, and p
 volume is busy refuses the resize rather than being torn out from under running work.
 
 Capacity itself is chosen once, at `cowshed adopt --capacity <size>` (default `100g`), because that is the only verb
-that mints an image — `new` and `fork` clone main's and inherit its capacity, so `resize` is how a clone gets a bigger
-one.
+that mints an image — `fork` clones main's and inherits its capacity, so `resize` is how a clone gets a bigger one.
 
 ### `cowshed defrag <name|main>`
 
@@ -792,8 +791,8 @@ $ cowshed defrag main
 cowshed: workspace main rewritten contiguously: 2110000 extents -> 6, 239059476480 bytes copied; a clone's first write now copies a map predicted at 72.0µs instead of 25.3s
 ```
 
-`new` and `fork` clone an image in milliseconds because the clone shares the source's extent map, but the first write to
-the clone copies that map, at about 12 µs per extent. Main fragments with every write it takes while clones share its
+`fork` clones an image in milliseconds because the clone shares the source's extent map, but the first write to the
+clone copies that map, at about 12 µs per extent. Main fragments with every write it takes while clones share its
 blocks, so a long-used main can hold millions of extents and make every new workspace wait tens of seconds inside its
 attach. `cowshed doctor` reports main's extent count and the first-write cost it predicts as `main-extents`, and warns
 with this verb as the hint once that cost reaches a second.
@@ -822,9 +821,9 @@ cowshed: main's seed was 1093412 ms behind its build volume and is a clone of it
 
 A fork clones its target's seed, never the target's live build volume, because something may be writing that. A land
 freezes the seed from the landing workspace's volume, so whatever the target runs afterwards — its own builds and gates,
-the land's adoption check — is in its live volume and not in the seed. Every `new` and `fork` reseeds its source first;
-this verb does the same on its own. A seed that already holds every write the live volume has had is left alone
-(`fresh`); `cowshed doctor` reports a seed that is behind as `seed-age`.
+the land's adoption check — is in its live volume and not in the seed. Every `fork` reseeds its source first; this verb
+does the same on its own. A seed that already holds every write the live volume has had is left alone (`fresh`);
+`cowshed doctor` reports a seed that is behind as `seed-age`.
 
 The workspace's Nx daemon is stopped the way a land stops it (it restarts on the next Nx command). A foreign task
 database holder or a Cargo build holding an existing profile's shared `.cargo-lock` leaves the old seed unchanged and is
