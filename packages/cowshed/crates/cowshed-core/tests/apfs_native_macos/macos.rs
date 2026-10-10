@@ -2723,6 +2723,47 @@ fn an_image_outside_the_store_is_refused_as_a_rename_target() {
     assert!(runner.requests().is_empty(), "ran {:?}", runner.requests());
 }
 
+/// An image the kernel holds twice (a dead process's attach that landed after its file was
+/// replaced) is ambiguous: no rename picks one of its devices.
+#[test]
+fn an_image_held_twice_is_refused_as_ambiguous_and_never_renamed() {
+    let fixture = Fixture::new("rename-held-twice");
+    let runner = RecordingRunner::default();
+    let image = slotted_image(&fixture);
+    attach(&runner, &image);
+    attach(&runner, &image);
+    let mount = fixture.root.join("mount").join("slotted");
+    std::fs::create_dir_all(&mount).expect("mountpoint");
+    let host = host_seeing(
+        &fixture,
+        runner.clone(),
+        vec![KernelMountSnapshot::new(
+            7,
+            &mount,
+            "/dev/disk10s1",
+            true,
+            true,
+        )],
+    );
+
+    let refused = host
+        .label_image_volume(&image, SLOTTED)
+        .expect_err("an image held twice names no volume");
+
+    assert!(
+        matches!(
+            refused,
+            ApfsStorageError::Apfs(ApfsError::InvalidAttachmentInventory(_))
+        ),
+        "{refused}"
+    );
+    assert!(
+        renames(&runner).is_empty(),
+        "renamed {:?}",
+        renames(&runner)
+    );
+}
+
 #[test]
 fn gc_distinguishes_a_missing_store_from_a_non_directory_store() {
     let fixture = Fixture::new("gc-store");
