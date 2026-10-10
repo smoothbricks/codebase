@@ -2541,6 +2541,83 @@ fn real_apfs_release_detaches_a_volume_held_open_after_its_grace() {
     );
 }
 
+/// On real APFS: a refused create (`slotted`, never attached) and an attached volume mounted
+/// nowhere are typed skips, the empty mountpoint is refused as no store image, and nothing the
+/// host owns changes name. The mounted workspace is renamed through its device, under the raw pin
+/// the rename takes, and the kernel then reports the label.
+#[test]
+fn real_apfs_rename_names_the_pinned_device_and_skips_what_is_not_mounted() {
+    let fixture = RealFixture::new("native-rename-pinned");
+    let layout = fixture.layout();
+    let image = layout.main_image().expect("image");
+    fixture.published_image(image.image());
+    let host = fixture.host();
+    let host_data = cowshed_core::apfs::volume_name(Path::new("/System/Volumes/Data"))
+        .expect("the host's Data volume name");
+    let label = "[cowshed] fixture · intents — main";
+
+    let slotted = layout
+        .canonical_image(&WorkspaceName::new("slotted").expect("workspace name"))
+        .expect("slotted image path");
+    let refused_mount = fixture.root().join("mount").join("slotted");
+    std::fs::create_dir_all(&refused_mount).expect("an empty mountpoint");
+    let holding_volume =
+        cowshed_core::apfs::volume_name(&refused_mount).expect("the volume holding it");
+    assert_eq!(
+        host.label_image_volume(slotted.image(), label)
+            .expect("a refused create is a typed skip"),
+        Labelled::NotAttached
+    );
+    assert!(
+        host.label_image_volume(&refused_mount, label).is_err(),
+        "a mountpoint is no image under the store"
+    );
+    assert_eq!(
+        cowshed_core::apfs::volume_name(&refused_mount).expect("the volume holding it"),
+        holding_volume,
+        "the volume holding the empty mountpoint keeps its name"
+    );
+
+    let mount = fixture.main_mount();
+    std::fs::create_dir_all(&mount).expect("mount point");
+    let attachment = host.attach_verified(image.image()).expect("attachment");
+    assert_eq!(
+        host.label_image_volume(image.image(), label)
+            .expect("an attached, unmounted volume is a typed skip"),
+        Labelled::NotMounted
+    );
+    host.mount(&attachment, &mount, MountAccess::ReadWrite, false)
+        .expect("mount");
+    host.retain_mounted(&workspace(), attachment)
+        .expect("retain");
+
+    assert_eq!(
+        host.label_image_volume(image.image(), label)
+            .expect("rename under the device's raw pin"),
+        Labelled::Renamed
+    );
+    assert_eq!(
+        cowshed_core::apfs::volume_name(&mount).expect("the renamed volume's name"),
+        label
+    );
+    assert_eq!(
+        host.label_image_volume(image.image(), label)
+            .expect("an already-named volume"),
+        Labelled::Already
+    );
+    assert_eq!(
+        cowshed_core::apfs::volume_name(Path::new("/System/Volumes/Data"))
+            .expect("the host's Data volume name"),
+        host_data,
+        "the host's Data volume keeps its name"
+    );
+
+    host.detach_mounted(&workspace(), DetachIntent::Release)
+        .expect("release");
+    assert!(kernel_mount_at(&mount).is_none());
+    assert!(!attached(image.image()));
+}
+
 /// Kernel mounts a test states outright, so a rename's target is proven from the fake inventory
 /// and these mounts alone.
 struct FixedMounts(Vec<KernelMountSnapshot>);
