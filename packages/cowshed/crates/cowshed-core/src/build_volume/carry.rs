@@ -2520,6 +2520,7 @@ mod tests {
     #[test]
     #[ignore = "unsandboxed host-controller RAW/Nx compatibility proof; run with `nx run cowshed:host-controller-test`; requires the existing patched-nx product"]
     fn host_controller_raw_carry_opens_restores_stores_and_evicts_with_native_nx() {
+        use crate::fork_lock::Run as _;
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
         use std::process::Command;
 
@@ -2638,7 +2639,7 @@ main().catch(error => { console.error(error); process.exitCode = 1; });
                 .arg(root)
                 .arg(phase)
                 .env("NX_SKIP_NATIVE_FILE_CACHE", "true")
-                .output()
+                .output_locked()
                 .expect("spawn real Node with the accepted Nx product");
             assert!(
                 output.status.success(),
