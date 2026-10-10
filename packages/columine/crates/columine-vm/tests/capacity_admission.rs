@@ -468,6 +468,69 @@ fn a_corrupt_host_state_is_refused_at_entry_in_both_modes() {
         );
         assert_eq!(bad, state, "a refused state is not written");
     }
+
+    // A valid pointer to an inner set whose capacity reaches past its
+    // arena: an insert would probe and write another slot's storage. The
+    // kernel checks the whole container it follows and refuses.
+    let prog = program(
+        2,
+        3,
+        &[
+            vec![
+                Opcode::SlotNested as u8,
+                0,
+                SlotType::Nested as u8,
+                4,
+                0,
+                SlotType::HashSet as u8,
+                2,
+                0,
+                0,
+            ],
+            vec![Opcode::SlotDef as u8, 1, SlotType::HashMap as u8, 4, 0],
+        ]
+        .concat(),
+        &for_each(&[Opcode::NestedSetInsert as u8, 0, 0, 1]),
+    );
+    let mut whole = init(&prog);
+    let (keys, values) = ([5u32], [50u32]);
+    let cols = [
+        u32s_as_bytes(&keys),
+        u32s_as_bytes(&values),
+        u32s_as_bytes(&types),
+    ];
+    assert_eq!(OK, Vm::default().execute_batch(&mut whole, &prog, &cols, 1));
+    let meta = SlotMetaView::read(&whole, 0);
+    let keys_at = outer_keys_offset(meta.offset);
+    let ptrs_at = outer_ptrs_offset(meta.offset, meta.capacity);
+    let live = (0..meta.capacity)
+        .find(|&pos| columine_vm::bytes::read_u32(&whole, keys_at + pos * 4) == 5)
+        .expect("outer key 5 is live");
+    let inner = columine_vm::bytes::read_u32(&whole, ptrs_at + live * 4);
+    let mut wide = whole.clone();
+    columine_vm::bytes::write_u32(&mut wide, inner, 1 << 10);
+    assert_eq!(Err(ErrorCode::InvalidState), validate_state(&wide));
+    for recording in [false, true] {
+        for value in 1000..1064u32 {
+            let mut state = wide.clone();
+            let mut vm = Vm::default();
+            if recording {
+                vm.undo_enable(&state).expect("window opens");
+            }
+            let (keys, values) = ([5u32], [value]);
+            let cols = [
+                u32s_as_bytes(&keys),
+                u32s_as_bytes(&values),
+                u32s_as_bytes(&types),
+            ];
+            assert_eq!(
+                ErrorCode::InvalidState as u32,
+                vm.execute_batch(&mut state, &prog, &cols, 1),
+                "value {value}, recording {recording}"
+            );
+            assert_eq!(wide, state, "neither slot is written");
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

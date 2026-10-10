@@ -95,6 +95,50 @@ pub fn inner_container_size(inner_type: SlotType, capacity: u32, inner_agg_type_
     }
 }
 
+/// Check the inner container at `pointer` lies whole in an arena whose data
+/// starts at `data` and whose used bytes are `used`: a table's capacity is a
+/// power of two, its size within its load, and its whole extent (header,
+/// keys and entries, or an aggregate's cells) inside the used bytes. A
+/// container that reached past them would let an insert probe or write into
+/// another slot's storage.
+pub(crate) fn check_inner(
+    state: &[u8],
+    data: u32,
+    used: u32,
+    pointer: u32,
+    prefix: &NestedPrefix,
+) -> Result<(), ErrorCode> {
+    let invalid = ErrorCode::InvalidState;
+    let relative = pointer.checked_sub(data).ok_or(invalid)?;
+    let room = used.checked_sub(relative).ok_or(invalid)?;
+    let extent = match prefix.inner_type {
+        SlotType::HashMap | SlotType::HashSet => {
+            if room < hash_table::HDR_BYTES {
+                return Err(invalid);
+            }
+            let cap = bytes::read_u32(state, pointer);
+            let size = bytes::read_u32(state, pointer.checked_add(4).ok_or(invalid)?);
+            if cap == 0 || !cap.is_power_of_two() || size > hash_table::max_load_for_cap(cap) {
+                return Err(invalid);
+            }
+            let entry = if prefix.inner_type == SlotType::HashMap {
+                hash_table::ENTRY_U32
+            } else {
+                hash_table::ENTRY_NONE
+            };
+            u64::from(hash_table::HDR_BYTES) + u64::from(cap) * u64::from(4 + entry)
+        }
+        SlotType::Aggregate => {
+            u64::from(aggregates::agg_slot_byte_size(prefix.inner_agg_type_byte))
+        }
+        _ => return Err(invalid),
+    };
+    if extent > u64::from(room) {
+        return Err(invalid);
+    }
+    Ok(())
+}
+
 /// Compute nested slot data size: prefix + outer keys + outer pointers + arena
 /// header + pre-sized inner containers, each rounded to eight-byte alignment.
 pub fn nested_slot_data_size(
@@ -213,21 +257,31 @@ impl OuterTable {
         bytes::read_u32(state, self.ptrs_off + pos * 4)
     }
 
-    /// The inner container a live outer cell points to, checked to lie in the
-    /// arena's used bytes: a batch checks a host image's layout, not every
-    /// outer pointer, so a kernel checks each pointer it follows.
-    fn inner_at(&self, state: &[u8], pos: u32) -> Result<u32, ErrorCode> {
+    /// The inner container a live outer cell points to, checked whole: a
+    /// batch checks a host image's layout, not every outer pointer, so a
+    /// kernel checks each pointer it follows (see [`check_inner`]).
+    fn inner_at(&self, state: &[u8], pos: u32, prefix: &NestedPrefix) -> Result<u32, ErrorCode> {
         let pointer = self.ptr_at(state, pos);
-        match pointer.checked_sub(self.arena.data_offset) {
-            Some(relative) if relative < self.arena.used(state) => Ok(pointer),
-            _ => Err(ErrorCode::InvalidState),
-        }
+        check_inner(
+            state,
+            self.arena.data_offset,
+            self.arena.used(state),
+            pointer,
+            prefix,
+        )?;
+        Ok(pointer)
     }
 
-    /// [`Self::lookup`] with the pointer checked as [`Self::inner_at`] does.
-    fn lookup_checked(&self, state: &[u8], outer_key: u32) -> Result<u32, ErrorCode> {
+    /// [`Self::lookup`] with the inner container checked as
+    /// [`Self::inner_at`] does.
+    fn lookup_checked(
+        &self,
+        state: &[u8],
+        outer_key: u32,
+        prefix: &NestedPrefix,
+    ) -> Result<u32, ErrorCode> {
         match hash_table::find_key(state, self.keys_off, self.cap, outer_key) {
-            Some(pos) => self.inner_at(state, pos),
+            Some(pos) => self.inner_at(state, pos, prefix),
             None => Ok(0),
         }
     }
@@ -656,7 +710,7 @@ fn prepare_outer<'state, 'work>(
     }
     let mut plan = NestedMutation {
         inner_offset: if probe.found {
-            outer.inner_at(state, probe.pos)?
+            outer.inner_at(state, probe.pos, &prefix)?
         } else {
             0
         },
@@ -1039,7 +1093,7 @@ pub(crate) fn batch_demand(
         if key >= TOMBSTONE || (!aggregate && pairs[at..end].iter().any(|p| p.1 >= TOMBSTONE)) {
             return None;
         }
-        let offset = outer.lookup_checked(state, key).ok()?;
+        let offset = outer.lookup_checked(state, key, &prefix).ok()?;
         let existing = (offset != 0 && !aggregate)
             .then(|| hash_table::FlatTable::bind(state, offset, entry_size));
         let (mut cap, mut size) = match existing {

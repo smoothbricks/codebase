@@ -444,6 +444,33 @@ fn ttl_eviction_index_overflow_returns_needs_growth_instead_of_dropping() {
         ErrorCode::InvalidState as u32,
         vm.execute_batch(&mut state, &prog, &cols, 1)
     );
+
+    // Eviction is an entry too: an image cut inside its expiry index is
+    // refused before any eviction reads it, with or without a journal.
+    let mut whole = init(&prog);
+    let keys = [1u32, 2, 3];
+    let vals = [10u32, 20, 30];
+    let tss = [100.0f64, 101.0, 102.0];
+    let cols: Vec<&[u8]> = vec![
+        u32s_as_bytes(&keys),
+        u32s_as_bytes(&vals),
+        f64s_as_bytes(&tss),
+    ];
+    assert_eq!(OK, Vm::default().execute_batch(&mut whole, &prog, &cols, 3));
+    let cut = whole[..whole.len() - 16].to_vec();
+    for recording in [false, true] {
+        let mut state = cut.clone();
+        let mut vm = Vm::default();
+        if recording {
+            vm.undo_enable(&state).expect("window opens");
+        }
+        assert_eq!(
+            Err(ErrorCode::InvalidState),
+            vm.evict_all_expired(false, &mut state, 1_000.0),
+            "recording {recording}"
+        );
+        assert_eq!(cut, state, "a refused image is not written");
+    }
 }
 
 // =============================================================================

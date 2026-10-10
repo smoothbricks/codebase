@@ -1581,6 +1581,20 @@ fn validate_slot_geometry(
         {
             return Err(ErrorCode::InvalidState);
         }
+        // The prefix names the inner kind every kernel reads; one no
+        // kernel builds is no valid geometry.
+        let inner = state
+            .get(m.offset as usize)
+            .and_then(|byte| SlotType::from_u8(byte & 0x0f))
+            .filter(|kind| {
+                matches!(
+                    kind,
+                    SlotType::HashMap | SlotType::HashSet | SlotType::Aggregate
+                )
+            })
+            .ok_or(ErrorCode::InvalidState)?;
+        let prefix = nested::read_nested_prefix(state, m.offset);
+        debug_assert_eq!(prefix.inner_type, inner);
         let keys = nested::outer_keys_offset(m.offset);
         let pointers = nested::outer_ptrs_offset(m.offset, m.capacity);
         let walked = if outer == OuterPointers::Walk {
@@ -1594,12 +1608,13 @@ fn validate_slot_geometry(
                 continue;
             }
             let pointer = bytes::read_u32(state, pointers + pos * 4);
-            let relative = pointer
-                .checked_sub(header + ARENA_HEADER_SIZE)
-                .ok_or(ErrorCode::InvalidState)?;
-            if relative >= arena.used {
-                return Err(ErrorCode::InvalidState);
-            }
+            nested::check_inner(
+                state,
+                header + ARENA_HEADER_SIZE,
+                arena.used,
+                pointer,
+                &prefix,
+            )?;
         }
     }
     if kind == SlotType::Bitmap {

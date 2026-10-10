@@ -3167,6 +3167,9 @@ impl Vm {
         {
             return Err(ErrorCode::InvalidState);
         }
+        // The image is the host's, as at batch entry: check its layout
+        // before eviction trusts the slot metadata it reads.
+        state_init::validate_layout(state)?;
         let slots = state_num_slots(state);
         self.change_flag_boundary(delta_mode, state, |vm, state| {
             let mut total = 0u32;
