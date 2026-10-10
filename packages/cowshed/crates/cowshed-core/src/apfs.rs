@@ -2050,6 +2050,24 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
         Ok(())
     }
 
+    /// Release `image` from every attachment the kernel holds for it: each volume of each
+    /// attachment's container whose device is in `mounted` (the kernel's mount sources) is
+    /// unmounted through its own pinned identity ([`Self::unmount_released`]), then every whole
+    /// device is detached once ([`Self::release_every_attachment`]), taking the unmounted rest.
+    pub(crate) fn release_image(
+        &self,
+        image: &Path,
+        mounted: &BTreeSet<String>,
+        intent: DetachIntent,
+    ) -> Result<(), ApfsError> {
+        for view in self.release_views(image)? {
+            for volume in view.mounted_volumes(mounted) {
+                self.unmount_released(&volume, intent)?;
+            }
+        }
+        self.release_every_attachment(image, intent)
+    }
+
     /// The devices `image` holds before an attach, which must be none. The image driver refuses
     /// a second attach of one file, but not of a new file at the same path: once the file a live
     /// attachment registered is replaced, attaching the path again gives it two attachments, and
@@ -3067,28 +3085,29 @@ impl ReleaseView {
         &self.whole_device
     }
 
-    /// Each volume the container holds, as the release unmounts it.
-    pub(crate) fn volumes(&self) -> impl Iterator<Item = ReleasedVolume> + '_ {
-        self.volumes.iter().map(|volume| {
-            ReleasedVolume(AttachedImage {
-                image: self.image.clone(),
-                whole_device: self.whole_device.clone(),
-                volume_device: volume.clone(),
-                pin: std::sync::Mutex::new(None),
+    /// Each volume of the container that `mounted` (the kernel's mount sources) names, as the
+    /// release unmounts it. An unmounted volume goes with the container's detach.
+    pub(crate) fn mounted_volumes<'a>(
+        &'a self,
+        mounted: &'a BTreeSet<String>,
+    ) -> impl Iterator<Item = ReleasedVolume> + 'a {
+        self.volumes
+            .iter()
+            .filter(|volume| mounted.contains(*volume))
+            .map(|volume| {
+                ReleasedVolume(AttachedImage {
+                    image: self.image.clone(),
+                    whole_device: self.whole_device.clone(),
+                    volume_device: volume.clone(),
+                    pin: std::sync::Mutex::new(None),
+                })
             })
-        })
     }
 }
 
 /// One volume of a [`ReleaseView`]. Only a release view names one, and only
 /// [`MacOsApfsBackend::unmount_released`] acts on it, revalidating it against the driver first.
 pub(crate) struct ReleasedVolume(AttachedImage);
-
-impl ReleasedVolume {
-    pub(crate) fn volume_device(&self) -> &str {
-        &self.0.volume_device
-    }
-}
 
 /// Every attachment the kernel holds for `image`, in inventory order, as its release sees it.
 fn release_views_of(
@@ -8116,7 +8135,8 @@ mod tests {
             panic!("one attachment is one release view");
         };
         assert_eq!(view.whole_device(), "/dev/disk5");
-        let volumes: Vec<ReleasedVolume> = view.volumes().collect();
+        let both = BTreeSet::from(["/dev/disk5s1".to_owned(), "/dev/disk5s2".to_owned()]);
+        let volumes: Vec<ReleasedVolume> = view.mounted_volumes(&both).collect();
         let backend = graced_backend([
             Reply::Inventory(Ok(two_volume_image(&image))),
             ok([]),
@@ -8145,6 +8165,34 @@ mod tests {
         );
         let commands: Vec<Vec<String>> = backend.runner().requests().iter().map(argv).collect();
         assert_eq!(commands, [["/dev/disk5s1"], ["/dev/disk5s2"]]);
+    }
+
+    /// A release unmounts exactly the container's mounted volumes, each under its own
+    /// revalidation, and leaves the unmounted one to the container's single detach.
+    #[test]
+    fn a_release_unmounts_only_the_mounted_volumes_then_detaches_the_container_once() {
+        let image = temp_path("two-volume-mixed", IMAGE_EXTENSION);
+        let backend = graced_backend([
+            Reply::Inventory(Ok(two_volume_image(&image))),
+            Reply::Inventory(Ok(two_volume_image(&image))),
+            ok([]),
+            Reply::Inventory(Ok(two_volume_image(&image))),
+            Reply::Inventory(Ok(two_volume_image(&image))),
+            ok([]),
+            no_images(),
+        ]);
+        let mounted = BTreeSet::from(["/dev/disk5s2".to_owned(), "/dev/disk9s1".to_owned()]);
+        backend
+            .release_image(&image, &mounted, DetachIntent::Release)
+            .unwrap();
+        let commands: Vec<Vec<String>> = backend.runner().requests().iter().map(argv).collect();
+        assert_eq!(
+            commands,
+            [
+                vec!["/dev/disk5s2".to_owned()],
+                vec!["detach".into(), "-verbose".into(), "/dev/disk5".into()],
+            ]
+        );
     }
 
     /// What attaches, verifies or looks up one attachment still refuses a container with two
@@ -8217,6 +8265,7 @@ mod tests {
             panic!("one attachment is one release view");
         };
         assert_eq!(view.whole_device(), "/dev/disk4");
-        assert_eq!(view.volumes().count(), 0);
+        let whole = BTreeSet::from(["/dev/disk4".to_owned()]);
+        assert_eq!(view.mounted_volumes(&whole).count(), 0);
     }
 }

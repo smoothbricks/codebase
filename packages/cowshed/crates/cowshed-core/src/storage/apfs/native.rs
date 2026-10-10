@@ -1493,19 +1493,14 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         intent: DetachIntent,
     ) -> Result<(), ApfsStorageError> {
         self.verify_controller_path(image)?;
-        let mounts = self.mount_source.mounts()?;
-        for view in self.backend.release_views(image)? {
-            for volume in view.volumes() {
-                if mounts
-                    .iter()
-                    .any(|mount| mount.source_device == volume.volume_device())
-                {
-                    self.backend.unmount_released(&volume, intent)?;
-                }
-            }
-        }
+        let mounted: std::collections::BTreeSet<String> = self
+            .mount_source
+            .mounts()?
+            .into_iter()
+            .map(|mount| mount.source_device)
+            .collect();
         self.backend
-            .release_every_attachment(image, intent)
+            .release_image(image, &mounted, intent)
             .map_err(Into::into)
     }
 
