@@ -42,8 +42,7 @@ function validTargetDefaults(): Record<string, unknown> {
 
 function validNamedInputs(): Record<string, unknown> {
   return {
-    default: ['{projectRoot}/**/*', 'sharedGlobals'],
-    sharedGlobals: ['{workspaceRoot}/.github/workflows/ci.yml'],
+    default: ['{projectRoot}/**/*'],
     production: [
       '{projectRoot}/src/**/*',
       '{projectRoot}/package.json',
@@ -204,16 +203,31 @@ describe('pure core: checkWorkspaceConfig', () => {
     expect(issues.some((i) => i.message.includes('targetDefaults.test.dependsOn must not be set'))).toBe(true);
   });
 
-  it('detects missing sharedGlobals', () => {
-    const issues = checkWorkspaceConfig({
-      plugins: validPlugins(),
-      targetDefaults: validTargetDefaults(),
-      namedInputs: {
+  it('accepts absent or custom non-CI shared globals', () => {
+    for (const globals of [undefined, [], ['{workspaceRoot}/config/shared.json']]) {
+      const nxJson = validNxJson();
+      nxJson.namedInputs = {
         ...validNamedInputs(),
-        sharedGlobals: [],
-      },
-    });
-    expect(issues.some((i) => i.message.includes('sharedGlobals'))).toBe(true);
+        ...(globals === undefined ? {} : { default: ['{projectRoot}/**/*', 'sharedGlobals'], sharedGlobals: globals }),
+      };
+      expect(checkWorkspaceConfig(nxJson)).toEqual([]);
+    }
+  });
+
+  it('rejects CI-only shared globals in default but allows explicit workflow inputs', () => {
+    const nxJson = validNxJson();
+    nxJson.namedInputs = {
+      ...validNamedInputs(),
+      default: ['{projectRoot}/**/*', 'sharedGlobals'],
+      sharedGlobals: ['{workspaceRoot}/.github/workflows/ci.yml'],
+    };
+    expect(checkWorkspaceConfig(nxJson).some((issue) => issue.message.includes('CI-only sharedGlobals'))).toBe(true);
+    nxJson.namedInputs = {
+      ...validNamedInputs(),
+      sharedGlobals: ['{workspaceRoot}/.github/workflows/ci.yml'],
+    };
+    nxJson.targetDefaults = { ...validTargetDefaults(), workflowLint: { inputs: ['sharedGlobals'] } };
+    expect(checkWorkspaceConfig(nxJson)).toEqual([]);
   });
 
   it("requires the checkout's own Nx cache directory", () => {
@@ -415,6 +429,42 @@ describe('pure core: applyWorkspaceConfig', () => {
       },
     };
     expect(applyWorkspaceConfig(nxJson)).toBe(false);
+  });
+
+  it('migrates only a CI-only sharedGlobals reference and retains explicit workflow targets', () => {
+    const nxJson = validNxJson();
+    nxJson.namedInputs = {
+      ...validNamedInputs(),
+      default: ['{projectRoot}/**/*', 'sharedGlobals', 'custom'],
+      sharedGlobals: ['{workspaceRoot}/.github/workflows/ci.yml'],
+      custom: ['{workspaceRoot}/config/shared.json'],
+      lint: ['sharedGlobals'],
+    };
+    nxJson.targetDefaults = { ...validTargetDefaults(), workflowLint: { inputs: ['sharedGlobals'] } };
+    expect(applyWorkspaceConfig(nxJson)).toBe(true);
+    expect(expectRecord(nxJson.namedInputs)).toEqual({
+      ...validNamedInputs(),
+      default: ['{projectRoot}/**/*', 'custom'],
+      sharedGlobals: ['{workspaceRoot}/.github/workflows/ci.yml'],
+      custom: ['{workspaceRoot}/config/shared.json'],
+      lint: ['sharedGlobals'],
+    });
+    expect(expectRecord(nxJson.targetDefaults).workflowLint).toEqual({ inputs: ['sharedGlobals'] });
+    expect(expectRecord(nxJson.namedInputs).lint).toEqual(['sharedGlobals']);
+    expect(applyWorkspaceConfig(nxJson)).toBe(false);
+    expect(checkWorkspaceConfig(nxJson)).toEqual([]);
+  });
+
+  it('preserves a custom non-CI sharedGlobals definition and its default reference', () => {
+    const nxJson = validNxJson();
+    nxJson.namedInputs = {
+      ...validNamedInputs(),
+      default: ['{projectRoot}/**/*', 'sharedGlobals'],
+      sharedGlobals: ['{workspaceRoot}/config/shared.json'],
+    };
+    expect(applyWorkspaceConfig(nxJson)).toBe(false);
+    expect(expectRecord(nxJson.namedInputs).sharedGlobals).toEqual(['{workspaceRoot}/config/shared.json']);
+    expect(expectRecord(nxJson.namedInputs).default).toEqual(['{projectRoot}/**/*', 'sharedGlobals']);
   });
 });
 

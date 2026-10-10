@@ -180,6 +180,11 @@ configurations and parallelism of every target in the project, plus its tags and
 `dependsOn`, `cache` or `//`). An edit to one target's command therefore re-keys every target of that project, including
 each inferred `cargo-test-*` runner. Only the project a target lives in decides that sensitivity.
 
+Workspace policy defaults non-production tasks to `["{projectRoot}/**/*"]`, without a forced CI workflow input. It
+migrates the old CI-only `sharedGlobals` reference out of `default` and never re-injects that definition. Custom non-CI
+named globals and explicit workflow-target inputs remain repository-owned and unchanged; workflow checks can still name
+their own CI inputs.
+
 Cargo keeps the caller's `CARGO_HOME`. Moving configuration into an isolated home can change relative paths or lose
 source replacement, credentials, and toolchain settings; forwarding it with `--config` changes precedence. Registry
 access may consequently wait on Cargo's package-cache lock, which Cargo arbitrates itself; Nx adds no ordering for it.
