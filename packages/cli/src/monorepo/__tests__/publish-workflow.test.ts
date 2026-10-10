@@ -3,6 +3,7 @@
 import { describe, expect, it } from 'bun:test';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { githubActionPins } from '@smoothbricks/nx-plugin/managed-files/ci-workflow';
 import { formatManagedContent } from '@smoothbricks/nx-plugin/managed-files/managed-format';
 import {
   definePublishWorkflow,
@@ -116,10 +117,10 @@ describe('publish workflow definition', () => {
     const rendered = renderPublishWorkflowYaml(codebaseWorkflowOptions);
 
     expect(foldedRunCommand(rendered, '🔢 Version release')).toBe(
-      'smoo release version --bump "${{ inputs.bump }}" --projects "${{ inputs.projects }}" --dry-run "${{ inputs.dry_run }}" --github-output "$GITHUB_OUTPUT"',
+      'smoo release version --bump "${{ inputs.bump }}" --projects "$SMOO_RELEASE_PROJECTS" --dry-run "${{ inputs.dry_run }}" --github-output "$GITHUB_OUTPUT"',
     );
     expect(foldedRunCommand(rendered, '🍎 Build selected macOS and iOS release outputs')).toContain(
-      '--projects "${{ inputs.projects }}"',
+      '--projects "$SMOO_RELEASE_PROJECTS"',
     );
     expect(rendered).toContain("default: ''");
   });
@@ -439,7 +440,7 @@ describe('publish workflow definition', () => {
       macosPlatform.indexOf('- name: 🍎 Build selected macOS and iOS release outputs'),
     );
     expect(foldedRunCommand(macosPlatform, '🍎 Build selected macOS and iOS release outputs')).toBe(
-      `smoo release build-platform-outputs --bump "\${{ inputs.bump }}" --projects "\${{ inputs.projects }}" --ref "\${{ github.sha }}" --targets "${MACOS_PLATFORM_TARGET_GLOBS.join(
+      `smoo release build-platform-outputs --bump "\${{ inputs.bump }}" --projects "$SMOO_RELEASE_PROJECTS" --ref "\${{ github.sha }}" --targets "${MACOS_PLATFORM_TARGET_GLOBS.join(
         ',',
       )}" --output "\${{ runner.temp }}/macos-platform-outputs" --github-output "$GITHUB_OUTPUT"`,
     );
@@ -461,8 +462,12 @@ describe('publish workflow definition', () => {
         '"${{ runner.temp }}/publish-artifacts/publish-macos-outputs-${{ github.run_id }}/repairs" ' +
         '--dry-run "${{ inputs.dry_run }}"',
     );
-    expect(native).toContain('uses: actions/upload-artifact@v7.0.1');
-    expect(native).toContain('uses: actions/download-artifact@v8.0.1');
+    expect(native).toContain(
+      `uses: ${githubActionPins.uploadArtifact.ref} # ${githubActionPins.uploadArtifact.version}`,
+    );
+    expect(native).toContain(
+      `uses: ${githubActionPins.downloadArtifact.ref} # ${githubActionPins.downloadArtifact.version}`,
+    );
     expect(native).toContain('name: publish-release-state-${{ github.run_id }}');
     expect(native).toContain('name: publish-release-outputs-${{ github.run_id }}');
     expect(native).toContain('name: publish-linux-outputs-${{ github.run_id }}');
@@ -481,6 +486,99 @@ describe('publish workflow definition', () => {
       'smoo github-ci apply-outputs --source-sha "${{ github.sha }}" ' +
         '"${{ runner.temp }}/publish-artifacts/publish-macos-outputs-${{ github.run_id }}/current"',
     );
+  });
+
+  it('pins checkouts, scopes persisted credentials, bounds job time, and keeps the projects selector out of run lines', () => {
+    const rendered = renderPublishWorkflowYaml({
+      repoName: '@smoothbricks/codebase',
+      platformTargetGlobs: PLATFORM_TARGET_GLOBS,
+      runsOn: [...nixosRunsOn],
+    });
+    const workflow = typia.assert<{
+      jobs: Record<
+        string,
+        {
+          'timeout-minutes'?: number;
+          steps: Array<{
+            name?: string;
+            uses?: string;
+            env?: Record<string, string>;
+            run?: string;
+            with?: { 'persist-credentials'?: boolean };
+          }>;
+        }
+      >;
+    }>(Bun.YAML.parse(rendered));
+    const expectedTimeouts: Record<string, number> = {
+      'linux-release-candidate': 45,
+      'macos-platform': 90,
+      'publish-on-linux': 45,
+    };
+    for (const [job, minutes] of Object.entries(expectedTimeouts)) {
+      expect(workflow.jobs[job]['timeout-minutes']).toBe(minutes);
+    }
+    const expectedPersist: Record<string, boolean> = {
+      'linux-release-candidate': true,
+      'macos-platform': true,
+      'publish-on-linux': true,
+    };
+    for (const [job, persist] of Object.entries(expectedPersist)) {
+      const checkouts = workflow.jobs[job].steps.filter((step) => step.uses?.startsWith('actions/checkout@'));
+      expect(checkouts.length).toBe(1);
+      for (const step of checkouts) {
+        expect(step.uses).toBe(githubActionPins.checkout.ref);
+        expect(step.with?.['persist-credentials']).toBe(persist);
+      }
+    }
+    expect(rendered).toContain('# release version lazily fetches historical package manifests from the partial clone');
+    expect(rendered).toContain('# build-platform-outputs fetches the release branch and tags from origin');
+    expect(rendered).toContain('# smoo publish and pending-release repair push release refs.');
+    const steps = Object.values(workflow.jobs).flatMap((job) => job.steps);
+    expect(steps.some((step) => (step.run ?? '').includes('inputs.projects'))).toBe(false);
+    const projectEnvSteps = steps.filter((step) => step.env?.SMOO_RELEASE_PROJECTS !== undefined);
+    expect(projectEnvSteps.length).toBeGreaterThan(0);
+    for (const step of projectEnvSteps) {
+      expect(step.env?.SMOO_RELEASE_PROJECTS).toBe('${{ inputs.projects }}');
+    }
+  });
+
+  it('sizes the single-job publish timeout by platform targets and keeps release:false credentials off', () => {
+    const withPlatforms = typia.assert<{
+      jobs: {
+        publish: {
+          'timeout-minutes': number;
+          steps: Array<{ uses?: string; with?: { 'persist-credentials'?: boolean } }>;
+        };
+      };
+    }>(
+      Bun.YAML.parse(
+        renderPublishWorkflowYaml({
+          repoName: '@smoothbricks/codebase',
+          platformTargetGlobs: PLATFORM_TARGET_GLOBS,
+          release: false,
+        }),
+      ),
+    );
+    expect(withPlatforms.jobs.publish['timeout-minutes']).toBe(90);
+    const checkout = withPlatforms.jobs.publish.steps.find((step) => step.uses?.startsWith('actions/checkout@'));
+    expect(checkout?.with?.['persist-credentials']).toBe(false);
+    const withoutPlatforms = typia.assert<{ jobs: { publish: { 'timeout-minutes': number } } }>(
+      Bun.YAML.parse(renderPublishWorkflowYaml({ repoName: '@smoothbricks/codebase', release: false })),
+    );
+    expect(withoutPlatforms.jobs.publish['timeout-minutes']).toBe(45);
+    const singleReleaseJob = typia.assert<{ jobs: { publish: { 'timeout-minutes': number } } }>(
+      Bun.YAML.parse(renderPublishWorkflowYaml({ repoName: '@smoothbricks/codebase' })),
+    );
+    expect(singleReleaseJob.jobs.publish['timeout-minutes']).toBe(45);
+    const singleReleaseWithPlatforms = typia.assert<{ jobs: { publish: { 'timeout-minutes': number } } }>(
+      Bun.YAML.parse(
+        renderPublishWorkflowYaml({
+          repoName: '@smoothbricks/codebase',
+          platformTargetGlobs: LINUX_PLATFORM_TARGET_GLOBS,
+        }),
+      ),
+    );
+    expect(singleReleaseWithPlatforms.jobs.publish['timeout-minutes']).toBe(90);
   });
 
   it('emits only the selected provider action references before evaluating artifact step eligibility', () => {
@@ -555,7 +653,7 @@ describe('publish workflow definition', () => {
     expect(macosPlatform).toContain('      fail-fast: false');
     expect(macosPlatform).toContain('        arch: [arm64, x64]');
     expect(foldedRunCommand(macosPlatform, '🍎 Build selected macOS and iOS release outputs')).toBe(
-      'smoo release build-platform-outputs --bump "${{ inputs.bump }}" --projects "${{ inputs.projects }}" --ref "${{ github.sha }}" ' +
+      'smoo release build-platform-outputs --bump "${{ inputs.bump }}" --projects "$SMOO_RELEASE_PROJECTS" --ref "${{ github.sha }}" ' +
         '--targets "*-${{ matrix.arch }}-macos,*-${{ matrix.arch }}-ios" ' +
         '--output "${{ runner.temp }}/macos-platform-outputs" --github-output "$GITHUB_OUTPUT"',
     );

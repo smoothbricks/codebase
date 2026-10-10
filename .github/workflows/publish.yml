@@ -37,6 +37,7 @@ jobs:
     runs-on:
       ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) &&
       fromJSON('["nixos-latest-x64","self-hosted"]') || 'ubuntu-latest' }}
+    timeout-minutes: 45
     permissions:
       contents: write
       id-token: none
@@ -52,11 +53,13 @@ jobs:
       # Step 1: GitHub adds "Set up job" automatically
       # Step 2
       - name: 📥 Checkout
-        uses: actions/checkout@v6.0.2
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           ref: ${{ github.sha }}
           filter: blob:none
           fetch-depth: 0
+          # release version lazily fetches historical package manifests from the partial clone
+          persist-credentials: true
 
       # Step 3. Composite action internals do not affect top-level job step
       # anchors; update these comments if top-level steps move.
@@ -87,8 +90,10 @@ jobs:
       # Step 6
       - name: 🧭 Plan release
         id: plan
+        env:
+          SMOO_RELEASE_PROJECTS: ${{ inputs.projects }}
         run:
-          smoo release version --bump "${{ inputs.bump }}" --projects "${{ inputs.projects }}" --dry-run "true"
+          smoo release version --bump "${{ inputs.bump }}" --projects "$SMOO_RELEASE_PROJECTS" --dry-run "true"
           --github-output "$GITHUB_OUTPUT"
 
       # --- Validation ---------------------------------------------------------
@@ -116,8 +121,10 @@ jobs:
       # Step 10
       - name: 🔢 Version release
         id: version
+        env:
+          SMOO_RELEASE_PROJECTS: ${{ inputs.projects }}
         run:
-          smoo release version --bump "${{ inputs.bump }}" --projects "${{ inputs.projects }}" --dry-run "${{
+          smoo release version --bump "${{ inputs.bump }}" --projects "$SMOO_RELEASE_PROJECTS" --dry-run "${{
           inputs.dry_run }}" --github-output "$GITHUB_OUTPUT"
 
       # Step 11
@@ -142,7 +149,7 @@ jobs:
       # Step 14
       - name: 📎 Upload trace DBs
         if: failure()
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: trace-results-${{ github.run_id }}
           path: packages/*/.cache/lmao/trace-results.db*
@@ -167,7 +174,7 @@ jobs:
       # Step 17
       - name: 📤 Upload validated release state
         if: success()
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: publish-release-state-${{ github.run_id }}
           path: ${{ runner.temp }}/publish-release-state
@@ -177,7 +184,7 @@ jobs:
       # Step 18
       - name: 📤 Upload validated build outputs
         if: steps.version.outputs.mode != 'none'
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: publish-release-outputs-${{ github.run_id }}
           path: ${{ runner.temp }}/release-build-outputs
@@ -188,7 +195,7 @@ jobs:
       # Step 19
       - name: 📤 Upload supplemental Linux outputs
         if: steps.version.outputs.mode != 'none'
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: publish-linux-outputs-${{ github.run_id }}
           path: ${{ runner.temp }}/linux-platform-outputs
@@ -214,6 +221,7 @@ jobs:
       fail-fast: false
       matrix:
         arch: [arm64, x64]
+    timeout-minutes: 90
     permissions:
       contents: read
       id-token: none
@@ -227,11 +235,13 @@ jobs:
       # Step 1: GitHub adds "Set up job" automatically
       # Step 2
       - name: 📥 Checkout dispatch commit
-        uses: actions/checkout@v6.0.2
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           ref: ${{ github.sha }}
           filter: blob:none
           fetch-depth: 0
+          # build-platform-outputs fetches the release branch and tags from origin
+          persist-credentials: true
 
       # Step 3. Composite action internals do not affect top-level job step
       # anchors; update these comments if top-level steps move.
@@ -262,15 +272,19 @@ jobs:
       # Step 6
       - name: 🔢 Version release
         id: version
+        env:
+          SMOO_RELEASE_PROJECTS: ${{ inputs.projects }}
         run:
-          smoo release version --bump "${{ inputs.bump }}" --projects "${{ inputs.projects }}" --dry-run "${{
+          smoo release version --bump "${{ inputs.bump }}" --projects "$SMOO_RELEASE_PROJECTS" --dry-run "${{
           inputs.dry_run }}" --github-output "$GITHUB_OUTPUT"
 
       # Step 7
       - name: 🍎 Build selected macOS and iOS release outputs (${{ matrix.arch }})
         id: platform-outputs
+        env:
+          SMOO_RELEASE_PROJECTS: ${{ inputs.projects }}
         run:
-          smoo release build-platform-outputs --bump "${{ inputs.bump }}" --projects "${{ inputs.projects }}" --ref "${{
+          smoo release build-platform-outputs --bump "${{ inputs.bump }}" --projects "$SMOO_RELEASE_PROJECTS" --ref "${{
           github.sha }}" --targets "*-${{ matrix.arch }}-macos" --output "${{ runner.temp }}/macos-platform-outputs"
           --github-output "$GITHUB_OUTPUT"
 
@@ -284,7 +298,7 @@ jobs:
       # Step 9
       - name: 📤 Upload macOS platform outputs (${{ matrix.arch }})
         if: success()
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: publish-macos-${{ matrix.arch }}-outputs-${{ github.run_id }}
           path: ${{ runner.temp }}/macos-platform-outputs
@@ -305,6 +319,7 @@ jobs:
   publish-on-linux:
     needs: [linux-release-candidate, macos-platform]
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     permissions:
       contents: write
       id-token: write
@@ -318,11 +333,13 @@ jobs:
       # Step 1: GitHub adds "Set up job" automatically
       # Step 2
       - name: 📥 Checkout dispatch commit
-        uses: actions/checkout@v6.0.2
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           ref: ${{ github.sha }}
           filter: blob:none
           fetch-depth: 0
+          # smoo publish and pending-release repair push release refs.
+          persist-credentials: true
 
       # Step 3
       - name: 🧱 Setup Nix/devenv
@@ -335,7 +352,7 @@ jobs:
       # Step 4
       - name: 📥 Download candidate artifacts
         if: success()
-        uses: actions/download-artifact@v8.0.1
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: publish-*-${{ github.run_id }}
           path: ${{ runner.temp }}/publish-artifacts

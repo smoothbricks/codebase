@@ -20,6 +20,7 @@ import {
   cargoCredentialStepLines,
   type DeployStepSecretConfig,
   deployStepSecretEnvLines,
+  githubActionPins,
   remoteCacheJobEnvLines,
   sourceCheckoutsStepLines,
   TRACE_DB_ARTIFACT_GLOB,
@@ -499,6 +500,7 @@ defaults:
 jobs:
   publish:
 ${options.release === false ? renderRunsOnLine(options.runsOn) : publishJobRunsOnLine(options)}
+    timeout-minutes: ${options.platformTargetGlobs?.length ? 90 : 45}
     env:
       LMAO_GIT_REVISION: ${githubExpression('github.sha')}
       GH_TOKEN: ${githubExpression('github.token')}${remoteCacheJobEnv(options)}${cargoCredentialsJobEnv(options)}${privateNpmInstallJobEnv(options)}${platformProducerJobEnv(options)}
@@ -559,10 +561,16 @@ function yamlLinesForStep(step: PublishWorkflowStep, options: PublishWorkflowDef
     case PublishWorkflowStepKind.Checkout:
       return [
         `      - name: ${step.name}`,
-        '        uses: actions/checkout@v6.0.2',
+        `        uses: ${githubActionPins.checkout.ref} # ${githubActionPins.checkout.version}`,
         '        with:',
         '          filter: blob:none',
         '          fetch-depth: 0',
+        ...(options.release === false
+          ? ['          persist-credentials: false']
+          : [
+              '          # smoo publish and pending-release repair push release refs.',
+              '          persist-credentials: true',
+            ]),
       ];
     case PublishWorkflowStepKind.SourceCheckouts:
       return siblingSourceCheckoutStepLines(options);
@@ -604,16 +612,20 @@ function yamlLinesForStep(step: PublishWorkflowStep, options: PublishWorkflowDef
       return [
         `      - name: ${step.name}`,
         '        id: plan',
+        '        env:',
+        `          SMOO_RELEASE_PROJECTS: ${githubExpression('inputs.projects')}`,
         '        run:',
-        `          smoo release version --bump "${githubExpression('inputs.bump')}" --projects "${githubExpression('inputs.projects')}" --dry-run "true" --github-output`,
+        `          smoo release version --bump "${githubExpression('inputs.bump')}" --projects "$SMOO_RELEASE_PROJECTS" --dry-run "true" --github-output`,
         '          "$GITHUB_OUTPUT"',
       ];
     case PublishWorkflowStepKind.VersionRelease:
       return [
         `      - name: ${step.name}`,
         '        id: version',
+        '        env:',
+        `          SMOO_RELEASE_PROJECTS: ${githubExpression('inputs.projects')}`,
         '        run:',
-        `          smoo release version --bump "${githubExpression('inputs.bump')}" --projects "${githubExpression('inputs.projects')}" --dry-run "${githubExpression('inputs.dry_run')}" --github-output`,
+        `          smoo release version --bump "${githubExpression('inputs.bump')}" --projects "$SMOO_RELEASE_PROJECTS" --dry-run "${githubExpression('inputs.dry_run')}" --github-output`,
         '          "$GITHUB_OUTPUT"',
       ];
     case PublishWorkflowStepKind.CheckManagedMonorepoFiles:
@@ -879,6 +891,7 @@ defaults:
 jobs:
   linux-release-candidate:
 ${renderRunsOnLine(options.runsOn)}
+    timeout-minutes: 45
     permissions:
       contents: write
       id-token: none
@@ -893,6 +906,7 @@ ${renderLinuxReleaseCandidateSteps(steps, options)}
 
   ${options.platformProducer?.kind === 'linux-cross' ? 'cross-platform' : 'macos-platform'}:
 ${renderMacosJobHeaderLines(options)}
+    timeout-minutes: 90
     permissions:
       contents: read
       id-token: none
@@ -908,6 +922,7 @@ ${renderMacosPlatformSteps(options)}
   publish-on-linux:
     needs: [linux-release-candidate, ${options.platformProducer?.kind === 'linux-cross' ? 'cross-platform' : 'macos-platform'}]
 ${publishJobRunsOnLine(options)}
+    timeout-minutes: 45
     permissions:
       contents: write
       id-token: write
@@ -950,11 +965,13 @@ function renderLinuxReleaseCandidateSteps(
     if (step.kind === PublishWorkflowStepKind.Checkout) {
       lines.push(
         `      - name: ${step.name}`,
-        '        uses: actions/checkout@v6.0.2',
+        `        uses: ${githubActionPins.checkout.ref} # ${githubActionPins.checkout.version}`,
         '        with:',
         `          ref: ${githubExpression('github.sha')}`,
         '          filter: blob:none',
         '          fetch-depth: 0',
+        '          # release version lazily fetches historical package manifests from the partial clone',
+        '          persist-credentials: true',
       );
     } else if (step.kind === PublishWorkflowStepKind.Build) {
       lines.push(
@@ -1071,11 +1088,13 @@ function renderMacosPlatformSteps(options: PublishWorkflowDefinitionOptions): st
     '      # Step 1: GitHub adds "Set up job" automatically',
     '      # Step 2',
     '      - name: 📥 Checkout dispatch commit',
-    '        uses: actions/checkout@v6.0.2',
+    `        uses: ${githubActionPins.checkout.ref} # ${githubActionPins.checkout.version}`,
     '        with:',
     `          ref: ${githubExpression('github.sha')}`,
     '          filter: blob:none',
     '          fetch-depth: 0',
+    '          # build-platform-outputs fetches the release branch and tags from origin',
+    '          persist-credentials: true',
   ];
   if (options.platformProducer) {
     if (!options.platformProducer.preflight.trim()) {
@@ -1136,8 +1155,10 @@ function renderMacosPlatformSteps(options: PublishWorkflowDefinitionOptions): st
     `      # Step ${stepNumber++}`,
     '      - name: 🔢 Version release',
     '        id: version',
+    '        env:',
+    `          SMOO_RELEASE_PROJECTS: ${githubExpression('inputs.projects')}`,
     '        run:',
-    `          smoo release version --bump "${githubExpression('inputs.bump')}" --projects "${githubExpression('inputs.projects')}" --dry-run "${githubExpression('inputs.dry_run')}" --github-output`,
+    `          smoo release version --bump "${githubExpression('inputs.bump')}" --projects "$SMOO_RELEASE_PROJECTS" --dry-run "${githubExpression('inputs.dry_run')}" --github-output`,
     '          "$GITHUB_OUTPUT"',
   );
   const architectures = macosPlatformArchitectures(options);
@@ -1153,10 +1174,12 @@ function renderMacosPlatformSteps(options: PublishWorkflowDefinitionOptions): st
     `      # Step ${stepNumber++}`,
     `      - name: 🍎 Build selected macOS and iOS release outputs${legLabel}`,
     '        id: platform-outputs',
+    '        env:',
+    `          SMOO_RELEASE_PROJECTS: ${githubExpression('inputs.projects')}`,
     '        run:',
     `          smoo release build-platform-outputs --bump "${githubExpression(
       'inputs.bump',
-    )}" --projects "${githubExpression('inputs.projects')}" --ref "${githubExpression('github.sha')}" --targets "${macosPlatformTargetSelector(options)}" --output`,
+    )}" --projects "$SMOO_RELEASE_PROJECTS" --ref "${githubExpression('github.sha')}" --targets "${macosPlatformTargetSelector(options)}" --output`,
     `          "${githubExpression('runner.temp')}/macos-platform-outputs" --github-output "$GITHUB_OUTPUT"`,
   );
   if (options.platformProducer?.kind !== 'linux-cross') {
@@ -1211,11 +1234,13 @@ function renderFinalLinuxPublishSteps(options: PublishWorkflowDefinitionOptions)
     '      # Step 1: GitHub adds "Set up job" automatically',
     `      # Step ${stepNumber++}`,
     '      - name: 📥 Checkout dispatch commit',
-    '        uses: actions/checkout@v6.0.2',
+    `        uses: ${githubActionPins.checkout.ref} # ${githubActionPins.checkout.version}`,
     '        with:',
     `          ref: ${githubExpression('github.sha')}`,
     '          filter: blob:none',
     '          fetch-depth: 0',
+    '          # smoo publish and pending-release repair push release refs.',
+    '          persist-credentials: true',
   ];
   const publishCargoCredentials = cargoCredentialsStepLines(options);
   if (publishCargoCredentials.length > 0) {
