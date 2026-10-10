@@ -5,19 +5,6 @@ mounts, sandbox profiles, grants) and every client that runs commands (CLI, MCP,
 supervisor per workspace holding warm exec hosts with the workspace shell already activated, a framed stdio protocol
 over a Unix socket, job control, and the single exec-record capture that all clients consume.
 
-> **Implementation status — job monitoring:** the supervisor owns durable numeric jobs, protected stdout/stderr
-> journals, offset-addressed reads, bounded cursor tails, attach resumed at a journal cursor, detach, and complete-group
-> termination. Core job resource samples, terminal persistence and keyed admission/lookup are implemented, and periodic
-> progress subscriptions stream over the controller and through N-API. Controller and N-API operation bindings derive
-> from one API declaration, group-owned TCP-listener queries among them. Explicit Open stdin, bounded delivered-byte
-> writes and exactly-once EOF are implemented in Rust and through the generated N-API attachment input view. The
-> process-group ownership ledger identifies groups for sampling and termination. On macOS each sample carries the job's
-> CPU share over the supervisor's sampling clock window, its leader/children rusage totals reconciled against a polled
-> census of the group, and the census's CPU-winning leaf. Complete fork/exec tree observation, per-process usage and
-> blocker streams, process event streams, and process/job resource spans are unbuilt as well. Complete cgroup job totals
-> (so Linux samples, which have no accounting source yet), charged-memory measurements, and event-source
-> coverage/overhead measurement are unbuilt too.
-
 ## Shell activation and process reuse
 
 A fresh workspace is a CoW clone of main, including its `.direnv`/`.devenv` caches. These are inputs to canonical
@@ -425,8 +412,8 @@ spawn-before-reply crash window as specified in 07_api.md.
   checkpoint uses the barrier/manifest protocol below.
 - **`--background`** detaches and promotes immediately, and the caller gets the job id.
 - **Hard timeout** (`[shell] hard_timeout`, unset by default, set by CI — 10_ci.md) sends SIGTERM, then SIGKILL after a
-  grace, drains both pipes to EOF, and marks the job `killed:timeout`. **Implementation status:** this configured
-  job-killing timeout is unbuilt; the implemented CLI `--timeout` detaches and never kills.
+  grace, drains both pipes to EOF, and marks the job `killed:timeout`. It is distinct from the CLI's `--timeout`, which
+  bounds how long the caller waits before the job is backgrounded and never kills.
 - **Combined output quota.** Each job has one configurable quota across stdout and stderr, default **1 GiB**. Accounting
   includes protected bytes plus bytes read from either child pipe but still buffered/in flight. The first read whose
   inclusion would cross the quota atomically trips the limit: the supervisor admits no payload beyond the exact
@@ -523,6 +510,9 @@ complete batches written by the trusted supervisor are authoritative for capture
 unlink, link, or replace protected records or artifacts. Terminal completion is a record-batch boundary. After an
 unclean supervisor exit, recovery may discard only an incomplete trailing batch or uncommitted bytes beyond a checkpoint
 manifest; malformed or mismatched complete data is `Integrity`, never child-authored input to reinterpret.
+
+Every job's record carries `envHash`, the hash of the environment the job was spawned with, beside its `grantRevision`:
+a consumer sees the same `grantRevision` and `envHash` needed to reproduce a run.
 
 The shared DTO is exact:
 

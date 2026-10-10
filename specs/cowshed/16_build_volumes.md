@@ -668,6 +668,9 @@ again at any level above it.
   intent journal, not the kernel's refusal to unmount. Every admitted cowshed job holds a shared flock on the build
   volume's `<id>.dmg.hold` for its lifetime; release must claim it exclusively. A running job therefore keeps main's
   previous volume across a swap.
+- A held lifecycle or image lock likewise defers release. A superseded seed is retired only under its target's image
+  lock, which the land and reseed paths hold while they replace it, and seed retirement takes that lock as a typed
+  witness, so collection never releases a seed that a land or reseed is replacing.
 - Collection decides from a snapshot, and a land can move a target's link onto a volume after it: an `rm` that retired
   the landing workspace while that workspace's land still ran saw the landing volume linked by nothing, and once it
   released it, main's link named a volume that no longer existed. So each release claims the volume first and reads

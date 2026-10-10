@@ -29,14 +29,8 @@ span's lmao address is span 1 of the thread derived from the durable key `(repo_
 first eight bytes of a domain-separated BLAKE3), never the workspace-local `job_id` alone: jobs of two workspaces under
 one adopted trace context stay distinct spans. The writes run off the supervisor's actor; a refused write is counted in
 the supervisor's trace health, which every supervisor handle reads, in process or over its socket, and never fails or
-delays the job. This job span is the anchor `process.run` spans parent from. `env_hash` is not yet computed by the
-supervisor, so job spans do not carry it.
-
-> **Implementation status — process monitoring:** the job span segments above are being built (86 B26a0). Fork/exec tree
-> observation, per-process resource/blocker events, `process.run` spans, their on-change/heartbeat rows, and job-span
-> host/volume columns below are unbuilt. Existing gateway trace segments and controller commitments do not implement
-> that process tree. Cgroup job-total and charged-memory columns and unattributed-usage reconciliation rows are unbuilt
-> as well.
+delays the job. This job span is the anchor `process.run` spans parent from. The terminal row carries the job's
+`env_hash` (the same environment identity as the job record's `envHash`, 11_shell.md).
 
 ## Trace context propagation
 

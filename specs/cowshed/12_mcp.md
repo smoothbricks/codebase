@@ -8,11 +8,6 @@ Built on the core crates directly, the server keeps typed grants, streamed exec 
 and the `Coordinator`/`WorkspaceHandle` split (07_api.md); shelling out to the CLI would reserialize everything through
 argv/JSON and lose exactly those properties.
 
-> **Implementation status:** the MCP server binary, tools, and capability handshake are unbuilt. The contracts below
-> reuse the existing Rust core rather than claiming a deployed MCP surface. Resource-bearing job results, bounded cursor
-> tails, and progress events inherit the canonical generated API declaration in 07_api.md; the same unbuilt monitoring
-> and generation gaps apply here.
-
 ## v1 scope: tools only
 
 cowshed-mcp v1 is a **tools-only** server. `resources/list` returns an empty array, no resource templates, **no
@@ -121,9 +116,9 @@ axes.
 `land.targetBranch` defaults to `main`. It names a real local branch in the main workspace repository. If that branch is
 checked out in the main workspace, a successful call advances the visible checkout — branch ref, `HEAD`, index, and
 working tree — to the exact validated head. If it is not checked out, only `refs/heads/<targetBranch>` advances and the
-current checkout is untouched. Dirty checked-out state, an unmanaged linked-worktree checkout, a changed expected value,
-or a non-fast-forward returns `Conflict`; the tool never substitutes a hidden ref or silently retries against a new
-base. `push` remains the separate worker-scoped preservation primitive and intentionally never advances a branch.
+current checkout is untouched. Dirty checked-out state, a linked-worktree checkout of the target, a changed expected
+value, or a non-fast-forward returns `Conflict`; the tool never substitutes a hidden ref or silently retries against a
+new base. `push` remains the separate worker-scoped preservation primitive and intentionally never advances a branch.
 
 ### Worker tools (one-use descriptor; scoped to that workspace)
 
@@ -193,8 +188,8 @@ may classify only a proven simple literal `>`/`2>` as `Redirect`, and only when 
 writable descriptor and applies identical exact quota accounting. After terminal state it snapshots that source into an
 independent protected inline or clone/reflink/copied file artifact. Polling/tailing or reopening the source path is
 forbidden. If eligibility/interposition fails, ordinary shell semantics run and the result claims only bytes that
-reached captured pipes. This is evidence classification, not the removed hardlink optimization. Structured stdin remains
-separate from shell text.
+reached captured pipes. This is evidence classification, not the removed hardlink optimization. Parsing is optimization
+only, never authority or correctness. Structured stdin remains separate from shell text.
 
 ## Error mapping (CowshedError → JSON-RPC)
 

@@ -360,11 +360,10 @@ starts one real teardown beside the planner; measured operation intervals must o
 container must remain unchanged. The regression does not require machine-global `cowshed.store` installation on an
 ephemeral runner. Installation validation remains a separate contract and still refuses missing storage.
 
-Real teardown also produces a nonempty global plist containing a container dictionary with only `ContainerReference`.
-Read-only planning reobserves that departing-container snapshot within the existing four-read bound, just as it does an
-empty root; it never drops the record and assumes a reserved volume is absent. A regression proves that the complete
-observation still finds a reserved volume in another container. Mutation planning refuses the incomplete first scan;
-exhausted reads, invalid device names, and partially populated records other than that observed shape remain errors.
+Read-only planning reads the kernel snapshot once, with no retry (01_storage.md "Dedicated store volume"), while a real
+teardown departs beside it. A regression proves that the snapshot taken during that teardown still finds a reserved
+volume in another container. An incomplete snapshot, an invalid device name or a partially populated record is an error,
+never evidence that a reserved volume is absent, and mutation planning refuses it.
 
 APFS diagnostics distinguish image-lease acquisition, a mint (`<leg>/mint`, its `clonefile` and attach inside it),
 template minting (`template/mint`, with blank-image creation and formatting inside it), raw-device pinning, image/device
@@ -553,9 +552,10 @@ Covered flows:
 ## Escape tests
 
 One adversarial corpus (04_sandbox.md "Escape tests"), each case a payload run under the generated profile plus an
-assertion that the operation was denied and the artifact untouched. The cases that exist run under Seatbelt on macOS, in
-`cowshed-core`'s sandbox tests and its host-controller probes; there is no separate crate, no Linux leg yet, and no
-release gate. The categories below are the corpus to cover; a category with no case is a gap.
+assertion that the operation was denied and the artifact untouched. The corpus runs in the `cowshed-escape-tests` crate,
+one corpus on both OSes, through the real exec pipeline: Seatbelt on macOS, Landlock plus loopback netns on Linux.
+Escape suite green on both OSes is a release gate; a red escape test cannot be waived. The categories below are the
+corpus; each category has cases.
 
 Shared categories: path escapes (traversal, symlink, hardlink), secret reads, cowshed-state tampering, cross-workspace
 access, egress bypass (direct, helper-process, DNS), revocation binding, ReadOnly enforcement, **workspace-CA

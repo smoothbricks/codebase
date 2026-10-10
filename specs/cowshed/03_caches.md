@@ -102,12 +102,13 @@ them there; they contain the endpoint URL, whose userinfo is the workspace token
     `CARGO_HOME`: the same crate reached through another path, even a symlink to the same bytes, recompiles it and
     everything above it. So there is no per-workspace `$CARGO_HOME/config.toml` to carry a crates.io source replacement,
     and `~/.cargo/config.toml` stays host-owned and denied. Cargo reaches crates.io through the proxy variables (below),
-    intercepted, trusting the workspace trust bundle through `CARGO_HTTP_CAINFO` (04_sandbox.md); `index.crates.io` and
-    `static.crates.io` are project-standing egress grants. Downloads land once per host in the shared registry. Git
-    dependencies resolve through the fetch mappings to local clones when their checkouts are granted, and otherwise
-    through intercepted `github.com`. A host whose toolchain is rustup's lends it read-only: the proxies in
-    `~/.cargo/bin`, and `~/.rustup`'s settings and toolchains through an owned `RUSTUP_HOME`; nothing a sandbox runs
-    installs or updates a toolchain there.
+    intercepted, trusting the workspace trust bundle through `CARGO_HTTP_CAINFO` (04_sandbox.md): rustup's cargo on
+    macOS verifies through SecureTransport, which ignores `SSL_CERT_FILE`, so cargo needs its own variable.
+    `index.crates.io` and `static.crates.io` are project-standing egress grants. Downloads land once per host in the
+    shared registry. Git dependencies resolve through the fetch mappings to local clones when their checkouts are
+    granted, and otherwise through intercepted `github.com`. A host whose toolchain is rustup's lends it read-only: the
+    proxies in `~/.cargo/bin`, and `~/.rustup`'s settings and toolchains through an owned `RUSTUP_HOME`; nothing a
+    sandbox runs installs or updates a toolchain there.
   - No git remote config or credential helper is written into the image: git reaches the network through the proxy
     variables like every other client, fetch-only (05_gateway.md "Egress modes"), and the fetch routes rewrite a bound
     repository's URLs onto its local clone (02_workspaces.md "Remote code ingress").
@@ -116,10 +117,13 @@ them there; they contain the endpoint URL, whose userinfo is the workspace token
     (`~/Library/Caches/go-build` on macOS, `~/.cache/go-build` on Linux) — shared, layer 3: a module downloads once per
     host, and the host's own `go` uses the same two directories without any configuration. `GOPATH`, and with it
     `go install`'s binaries, stays at Go's default under the private `HOME`, in the image and per workspace, never in
-    the host HOME. `GOPROXY`, `GOSUMDB` and `GOTOOLCHAIN` are Go's defaults or the project's own setting. Go reaches
-    `proxy.golang.org` and `sum.golang.org` through the proxy variables (below) as **opaque** tunnels: Go on macOS
-    verifies TLS with the platform verifier and never trusts the workspace CA. No Go client presents the workspace token
-    to a gateway route: `cmd/go` attaches credentials (netrc, `GOAUTH`, URL userinfo) only to HTTPS URLs.
+    the host HOME. The Go capability exports `GOPROXY=https://proxy.golang.org` with no `direct` fallback, so a module
+    the public proxy does not serve fails the fetch and nothing connects to a VCS host directly;
+    `GOSUMDB=sum.golang.org`; and `GOTOOLCHAIN=local`, so a `go.mod` `toolchain` line cannot make `go` download a
+    toolchain. They are environment actions, not a GOENV file. Go reaches `proxy.golang.org` and `sum.golang.org`
+    through the proxy variables (below) as **opaque** tunnels: Go on macOS verifies TLS with the platform verifier and
+    never trusts the workspace CA. No Go client presents the workspace token to a gateway route: `cmd/go` attaches
+    credentials (netrc, `GOAUTH`, URL userinfo) only to HTTPS URLs.
 - **Generic proxy variables.** Workspace env wiring sets `HTTP_PROXY`, `HTTPS_PROXY`, `http_proxy`, and `https_proxy` to
   `<GATEWAY_HTTP>` with the workspace token as its userinfo (`http://cowshed:<token>@…`), and configures
   `NO_PROXY`/`no_proxy` only for the workspace's own local services. On Linux these variables therefore resolve to
@@ -257,11 +261,12 @@ them there; they contain the endpoint URL, whose userinfo is the workspace token
       the checkout's host shells; for a read-only job its exec temp dir; a caller's `NX_DAEMON` withheld so Nx's own
       default decides, 04_sandbox.md) and `NX_WORKSPACE_ROOT_PATH`; for a cargo project `CARGO_HOME` (above, naming the
       host's own default path only to undo the private `HOME`), `CARGO_NET_GIT_FETCH_WITH_CLI=true` and on a rustup host
-      `RUSTUP_HOME`; for a Go project `GOMODCACHE` and `GOCACHE`; the other shared tool homes of detected package
-      managers and toolchains (`BUN_INSTALL_CACHE_DIR`, `NPM_CONFIG_CACHE`, `PNPM_CONFIG_STORE_DIR`, `UV_CACHE_DIR`,
-      `ZIG_GLOBAL_CACHE_DIR`), each naming the host's own path; and for a Gradle project a private `GRADLE_USER_HOME`
-      under the private cache whose `caches` links to the host's `~/.gradle/caches`, so the daemon, wrapper
-      distributions, native libraries and JDKs stay private and no other part of the host `~/.gradle` is granted;
+      `RUSTUP_HOME`; for a Go project `GOMODCACHE`, `GOCACHE`, `GOPROXY`, `GOSUMDB` and `GOTOOLCHAIN` (above); the other
+      shared tool homes of detected package managers and toolchains (`BUN_INSTALL_CACHE_DIR`, `NPM_CONFIG_CACHE`,
+      `PNPM_CONFIG_STORE_DIR`, `UV_CACHE_DIR`, `ZIG_GLOBAL_CACHE_DIR`), each naming the host's own path; and for a
+      Gradle project a private `GRADLE_USER_HOME` under the private cache whose `caches` links to the host's
+      `~/.gradle/caches`, so the daemon, wrapper distributions, native libraries and JDKs stay private and no other part
+      of the host `~/.gradle` is granted;
     - the `.cowshed/env` set again (the token, the port pair), `SCCACHE_SERVER_UDS` and `SCCACHE_DIR` (the host sccache
       daemon, below), and `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` in both cases, carrying the token as proxy userinfo;
     - the build wiring: `SCCACHE_BASEDIR_CWD=1`, `SCCACHE_BASEDIR=<workspace root>`, and `RUSTC_WRAPPER` naming

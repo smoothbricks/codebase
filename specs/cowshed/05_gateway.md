@@ -472,8 +472,9 @@ parallel, and the total runnable work stays near the core count.
   output (`status=err … runs unbudgeted: <reason>` without a grant), so a slow or failing task says how long it waited
   and how many threads it ran with. With `COWSHED_TIMING` set, the gateway prints each grant: tokens, want, the wait,
   the checkout, and the client's pid and command.
-- **Not budgeted.** Processes outside `bounded-exec` — Nx's own `nx:run-commands` builds, a host shell's `cargo` — run
-  as before; Cargo's make-protocol jobserver is the path for those builds and is not built.
+- **Outside `bounded-exec`.** Processes outside `bounded-exec` — Nx's own `nx:run-commands` builds, a host shell's
+  `cargo` — take no lease; the budget reaches them through Cargo's make-protocol jobserver, which hands out the same
+  tokens.
 
 Tests: `cowshed-gateway`'s `cpu_budget` ledger unit tests (fairness, share, starvation, leave) and `tests/cpu_budget.rs`
 over a real socket (`SIGKILL` of a holding client returns its tokens to the waiter at once; checkouts share the host;
@@ -588,7 +589,10 @@ names the grant that would permit it — the audit store doubles as the debuggin
 
 **Per-workspace CA interception.** A workspace-scoped CA limits a signing-key compromise to one workspace and lives with
 the gateway, which already mediates upstream credentials. The explicit costs are per-tool trust-anchor wiring, opaque
-fallback for pinned clients, and gateway visibility into intercepted plaintext.
+fallback for pinned clients, and gateway visibility into intercepted plaintext. A single machine-wide CA trusted inside
+every workspace is rejected: one key whose compromise silently breaks all transport security, shared by every workspace.
+A MITM broker that substitutes placeholder tokens at that shared boundary is the same design and is rejected for the
+same reason.
 
 **Registry mirrors retained.** Protocol-aware mirrors provide digest validation, fleet-wide deduplication, bounded cache
 storage, and offline reads that generic interception cannot.

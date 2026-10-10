@@ -4,20 +4,6 @@ Two surfaces over one core: the `cowshed-core` Rust crate and `@smoothbricks/cow
 is a thin third client of the same core — anything the CLI can do is assembled from the same capability-scoped APIs,
 with identical semantics and error taxonomy.
 
-> **Implementation status — monitoring and generation:** core jobs expose numeric lookup, leader pid, start and terminal
-> duration, protected per-stream output, offset reads, bounded cursor tails, attach resumed at a journal cursor, detach,
-> and complete-group termination. Core job resource samples, terminal persistence and keyed admission/lookup are
-> implemented, and `progress` streams samples over the controller and through N-API as an `AsyncIterable`. Controller
-> request/result codecs, TypeScript types and validators, and N-API operation bindings derive from one Rust API
-> declaration. The addon exposes the declared offset log reads, the bounded `job.tail` operation and
-> `job.listeningPorts`. Rust stdin `write`/`close` and generated N-API attachment `write`/`end` are implemented.
-> Backpressured byte-stream iterables for logs and attachment output, and abort plumbing remain separate work. Complete
-> fork/exec process-tree observation, per-process CPU/RSS/I/O and blocker facts, process event streams, leaf-work
-> identity, and the compact process/job spans in 13_telemetry.md are also unbuilt. The ownership ledger identifies
-> groups for safe termination; it does not yet provide these observations. Per-job cgroup-v2 accounting, measured Linux
-> fork/exec event-source selection, macOS exit observation and rusage reconciliation, charged-memory counters, and
-> explicit unattributed-usage rows are also unbuilt.
-
 ## Authority model (frozen)
 
 Four handle types, one rule: **a handle reachable from inside a sandbox must not authorize escalation or select another
@@ -536,11 +522,14 @@ impl Coordinator {
 ```
 
 `Coordinator::land` fast-forwards a real `refs/heads/<target_branch>`, not a hidden integration ref, in the target's
-repository: main's, or with `into` the lane base's. The target branch must be the one the target's checkout has checked
-out; the operation updates it through that checkout so its `HEAD`, index, and working tree all resolve to `landed_head`,
-and dirty state causes `Conflict`. Any other branch, or a detached checkout, is refused. All expected values are
-revalidated under the target lock immediately before the fast-forward. A mismatch or non-fast-forward retains the source
-workspace and leaves the target branch and visible working state unchanged.
+repository: main's, or with `into` the lane base's. When the target's checkout has the target branch checked out, the
+operation updates it through that checkout so its `HEAD`, index, and working tree all resolve to `landed_head`, and
+dirty state causes `Conflict`. When the target branch is not checked out, Cowshed compares-and-swaps
+`refs/heads/<target_branch>` to the validated head without disturbing the checkout's current branch, index, or working
+tree; a failed compare-and-swap fails the operation and changes nothing. A target branch held by a linked worktree, or a
+detached checkout with no `target_branch`, is refused. All expected values are revalidated under the target lock
+immediately before the update. A mismatch or non-fast-forward retains the source workspace and leaves the target branch
+and visible working state unchanged.
 
 `into` is a `WorkspaceRef`, not a name, so it carries the incarnation it was resolved at: a lane base removed and
 recreated under the same name since is refused with `Conflict`, and naming the workspace itself, or `into` together with
@@ -1504,7 +1493,7 @@ export interface JobHandle {
   tail(cursor: JobJournalCursor | undefined, limits: JobTailLimits): Promise<JobTail>;
   // Without follow, continue at nextOffset until bytes is empty or eof is true.
   // Follow waits for output notifications at the current end while the job is running.
-  logs(args: { stream: JobStream; offset: number; follow: boolean }): Promise<JobLogs>;
+  logs(args: { stream: JobStream; offset: number; follow: boolean; signal?: AbortSignal }): Promise<JobLogs>;
   attach(opts?: { cursor?: JobJournalCursor; signal?: AbortSignal }): Promise<JobAttachment>;
   detach(): Promise<void>;
   kill(): Promise<void>;
