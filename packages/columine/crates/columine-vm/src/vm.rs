@@ -5,7 +5,11 @@
 //! long-lived instance per module instance.
 //!
 //! Mutations reserve bounded physical before-byte records before writing.
-//! Budget refusal leaves the accepted prefix exact and rollbackable.
+//! Overflow snapshots use exact-size allocations for every state size, so
+//! mutations remain recoverable after overflow without a wasm-specific size
+//! cap: the first write past the record budget copies the image into the
+//! VM's one retained image buffer, and rollback restores it before replaying
+//! the records in reverse.
 //!
 //! The allocator handles temporary bitmap storage; no separate scratch reset
 //! step is observable at entrypoint boundaries.

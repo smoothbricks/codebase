@@ -543,8 +543,8 @@ describe('Pipeline undo integration', () => {
       value: 1000 + OVERFLOW_COUNT - 1,
     });
 
-    // Rolling back to the pre-overflow checkpoint restores the exact image and ends the overflow.
-    stages.undo.rollback(state, token);
+    // Rolling back to the pre-overflow checkpoint goes through the shadow, restores the exact image and ends the overflow.
+    expect(stages.undo.rollback(state, token)).toBe('overflow');
     expect(backend.serialize(state, program)).toEqual(checkpointImage);
     expect(backend.getMapSize(state, program, 0)).toBe(3);
     expect(backend.undoHasOverflow()).toBe(false);
@@ -813,7 +813,7 @@ describe('Pipeline undo integration', () => {
     expect(backend.deltaExportSegment(state, fromPos, toPos)).toStrictEqual(exported);
 
     // The original token still rolls back to the image before its checkpoint.
-    stages.undo.rollback(state, token);
+    expect(stages.undo.rollback(state, token)).toBe('ok');
     expect(backend.serialize(state, program)).toEqual(imageBefore);
     expect(backend.getMapSize(state, program, 0)).toBe(0);
   });

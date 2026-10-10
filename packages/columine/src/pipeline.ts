@@ -145,8 +145,9 @@ export interface UndoStage {
    *
    * @param state - State handle to roll back
    * @param token - Token from a prior checkpoint() call
+   * @returns 'ok' if undo log replay was sufficient, 'overflow' if the shadow buffer was needed (a perf signal)
    */
-  rollback(state: StateHandle, token: UndoToken): void;
+  rollback(state: StateHandle, token: UndoToken): 'ok' | 'overflow';
   /**
    * Commit speculative changes — discards undo entries since the token.
    * After commit, the mutations become permanent and cannot be rolled back.
@@ -239,10 +240,12 @@ function createUndoStage(backend: ColumineBackend): UndoStage {
       return { ok: true, value: token };
     },
 
-    rollback(state: StateHandle, token: UndoToken): void {
+    rollback(state: StateHandle, token: UndoToken): 'ok' | 'overflow' {
       const internal = assertInternalUndoToken(token);
-
+      // Read before the rollback: a rollback through the shadow ends the overflow.
+      const overflowed = backend.undoHasOverflow();
       backend.undoRollback(state, internal.position);
+      return overflowed ? 'overflow' : 'ok';
     },
 
     commit(state: StateHandle, token: UndoToken): void {
