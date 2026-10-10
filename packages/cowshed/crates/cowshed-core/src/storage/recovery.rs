@@ -64,7 +64,10 @@ pub struct ReAdoptRetained {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ReAdoptSource {
     pub checkout: PathBuf,
-    pub image: ReAdoptImage,
+    /// Main's copy input. The key stays `image`, which every journal written before a missing
+    /// main could be re-adopted holds as a retained image.
+    #[serde(rename = "image")]
+    pub main: ReAdoptMain,
     pub metadata: crate::metadata::DetachedWorkspaceMetadata,
     /// The incarnation the replacement is published as, chosen before the first mutation: the
     /// only one the intent may complete with.
@@ -74,6 +77,97 @@ pub struct ReAdoptSource {
     #[serde(deserialize_with = "Option::deserialize")]
     pub build: Option<ReAdoptBuild>,
     pub old_seeds: Vec<ReAdoptRetained>,
+}
+
+/// What a re-adoption copies main from, recorded before the first mutation so a replay never
+/// guesses its input (02_workspaces.md, "Re-adoption" and "Missing main image").
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ReAdoptMain {
+    /// Main's image, retained and copied from its read-only staging mount.
+    Retained(ReAdoptImage),
+    /// Main's image is missing: the plain Git checkout at the checkout path is copied.
+    Missing(ReAdoptMissingMain),
+}
+
+impl ReAdoptMain {
+    /// The retained main image; `None` for a missing main, which retains none.
+    pub fn retained(&self) -> Option<&ReAdoptImage> {
+        match self {
+            Self::Retained(image) => Some(image),
+            Self::Missing(_) => None,
+        }
+    }
+}
+
+/// A re-adoption of a main whose image is missing (02_workspaces.md, "Missing main image").
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReAdoptMissingMain {
+    /// `<project>/main.dmg`, absent when recorded: the replacement is published there.
+    pub canonical: PathBuf,
+    /// [`preserved_checkout`]: where the plain checkout moves when the replacement takes its path.
+    pub preserved: PathBuf,
+    pub capacity_bytes: u64,
+    /// Main's build volume: the surviving one kept, or one published empty under the id main's
+    /// completed re-adoption recorded. `None` when neither exists.
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub build: Option<MissingMainBuild>,
+}
+
+/// Main's build volume in a missing main's re-adoption (02_workspaces.md, "Missing main image").
+/// A build volume is an image of its own, so main's can outlive main's image; and every land
+/// gives main the landing workspace's volume, so the id main's completed re-adoption recorded may
+/// be long gone. Main's volume is therefore the project's one build record owned by
+/// `Linked main`, whatever its id; only when none survives is one published empty.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum MissingMainBuild {
+    /// No build record names `Linked main`: an empty RAW volume is published under the id the
+    /// completed re-adoption recorded. Journals from before a surviving volume could be kept hold
+    /// only this shape.
+    Empty(ReAdoptEmptyBuild),
+    /// The project's one build record owned by `Linked main` survived: the volume is kept as it
+    /// is, and main's build link names it.
+    Kept(ReAdoptKeptBuild),
+}
+
+impl MissingMainBuild {
+    /// The build volume main's build link names.
+    pub fn id(&self) -> &crate::build_volume::BuildVolumeId {
+        match self {
+            Self::Empty(build) => &build.id,
+            Self::Kept(build) => &build.kept,
+        }
+    }
+}
+
+/// Main's surviving build volume, kept as it is: `record` is its `Linked main` owner record as
+/// read when the re-adoption was recorded.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReAdoptKeptBuild {
+    pub kept: crate::build_volume::BuildVolumeId,
+    pub record: crate::build_volume::BuildVolumeRecord,
+}
+
+/// An empty RAW build volume published under a recorded identity: `record` is the recorded
+/// `Linked main` owner record with its built-at tree cleared.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReAdoptEmptyBuild {
+    pub id: crate::build_volume::BuildVolumeId,
+    pub record: crate::build_volume::BuildVolumeRecord,
+    pub capacity_bytes: u64,
+}
+
+/// `<checkout>.readopt-<replacement>`: the sibling a plain checkout moves to when a missing
+/// main's replacement takes its path. Never `.pre-cowshed`, which a first adoption keeps.
+pub fn preserved_checkout(checkout: &Path, replacement: &WorkspaceIncarnation) -> Option<PathBuf> {
+    let mut name = checkout.file_name()?.to_os_string();
+    name.push(".readopt-");
+    name.push(replacement.as_str());
+    Some(checkout.with_file_name(name))
 }
 
 impl ReAdoptSource {
@@ -88,15 +182,14 @@ impl ReAdoptSource {
             ))
         };
         let old = self.metadata.workspace_incarnation.as_str();
-        let Some(project) = self
-            .image
-            .original
-            .parent()
-            .filter(|root| root.is_absolute())
-        else {
+        let main_image = match &self.main {
+            ReAdoptMain::Retained(image) => &image.original,
+            ReAdoptMain::Missing(missing) => &missing.canonical,
+        };
+        let Some(project) = main_image.parent().filter(|root| root.is_absolute()) else {
             return refuse(format!(
                 "main image {} is not an absolute path",
-                self.image.original.display()
+                main_image.display()
             ));
         };
         if !self.checkout.is_absolute() || self.checkout != self.metadata.info_snapshot.project_root
@@ -117,53 +210,112 @@ impl ReAdoptSource {
             return refuse(format!("replacement reuses the incarnation {old}"));
         }
         let retained = project.join(RETAINED_NAMESPACE);
-        check_image(
-            &self.image,
-            project,
-            "main",
-            &retained,
-            &format!("main-{old}"),
-            &format!("readopt-{old}-main"),
-        )
-        .or_else(refuse)?;
         let images = project.join(crate::build_volume::IMAGES_DIRECTORY);
-        if let Some(build) = &self.build {
-            let id = build.id.as_str();
-            check_image(
-                &build.image,
-                &images,
-                id,
-                &retained,
-                &format!("build-{id}"),
-                &format!("readopt-{old}-build"),
-            )
-            .or_else(refuse)?;
-            let new = self.replacement.as_str();
-            let staged_image = project
-                .join(STAGING_NAMESPACE)
-                .join(format!("readopt-{new}-build"))
-                .with_extension(crate::metadata::IMAGE_EXTENSION);
-            if build.replacement_image != staged_image {
-                return refuse(format!(
-                    "replacement build image {} is not {}",
-                    build.replacement_image.display(),
-                    staged_image.display()
-                ));
+        match &self.main {
+            ReAdoptMain::Retained(image) => {
+                check_image(
+                    image,
+                    project,
+                    "main",
+                    &retained,
+                    &format!("main-{old}"),
+                    &format!("readopt-{old}-main"),
+                )
+                .or_else(refuse)?;
+                if let Some(build) = &self.build {
+                    let id = build.id.as_str();
+                    check_image(
+                        &build.image,
+                        &images,
+                        id,
+                        &retained,
+                        &format!("build-{id}"),
+                        &format!("readopt-{old}-build"),
+                    )
+                    .or_else(refuse)?;
+                    let new = self.replacement.as_str();
+                    let staged_image = project
+                        .join(STAGING_NAMESPACE)
+                        .join(format!("readopt-{new}-build"))
+                        .with_extension(crate::metadata::IMAGE_EXTENSION);
+                    if build.replacement_image != staged_image {
+                        return refuse(format!(
+                            "replacement build image {} is not {}",
+                            build.replacement_image.display(),
+                            staged_image.display()
+                        ));
+                    }
+                    let mounts = image.source_mount.parent();
+                    if build.image.source_mount.parent() != mounts
+                        || build.replacement_mount.parent() != mounts
+                        || build
+                            .replacement_mount
+                            .file_name()
+                            .is_none_or(|name| *name != *format!("readopt-{new}-build"))
+                    {
+                        return refuse(format!(
+                            "build mounts {} and {} are not readopt mounts beside {}",
+                            build.image.source_mount.display(),
+                            build.replacement_mount.display(),
+                            image.source_mount.display()
+                        ));
+                    }
+                }
             }
-            let mounts = self.image.source_mount.parent();
-            if build.image.source_mount.parent() != mounts
-                || build.replacement_mount.parent() != mounts
-                || build
-                    .replacement_mount
-                    .file_name()
-                    .is_none_or(|name| *name != *format!("readopt-{new}-build"))
-            {
-                return refuse(format!(
-                    "build mounts {} and {} are not readopt mounts beside {}",
-                    build.image.source_mount.display(),
-                    build.replacement_mount.display(),
-                    self.image.source_mount.display()
-                ));
+            ReAdoptMain::Missing(missing) => {
+                let canonical = project
+                    .join("main")
+                    .with_extension(crate::metadata::IMAGE_EXTENSION);
+                if missing.canonical != canonical {
+                    return refuse(format!(
+                        "missing main image {} is not {}",
+                        missing.canonical.display(),
+                        canonical.display()
+                    ));
+                }
+                if preserved_checkout(&self.checkout, &self.replacement).as_ref()
+                    != Some(&missing.preserved)
+                {
+                    return refuse(format!(
+                        "preserved checkout {} is not the checkout's readopt sibling",
+                        missing.preserved.display()
+                    ));
+                }
+                if missing.capacity_bytes == 0 {
+                    return refuse("missing main's replacement capacity is zero".to_owned());
+                }
+                if self.build.is_some() {
+                    return refuse(
+                        "a missing main's re-adoption copies no build volume".to_owned(),
+                    );
+                }
+                let linked_main = |record: &crate::build_volume::BuildVolumeRecord| {
+                    matches!(
+                        &record.role,
+                        crate::build_volume::BuildVolumeRole::Linked { checkout }
+                            if checkout.is_main()
+                    )
+                };
+                match &missing.build {
+                    Some(MissingMainBuild::Empty(build))
+                        if !linked_main(&build.record)
+                            || build.record.tree.is_some()
+                            || build.capacity_bytes == 0 =>
+                    {
+                        return refuse(format!(
+                            "empty build volume {} is not main's linked volume with no built-at \
+                             tree and a capacity",
+                            build.id.as_str()
+                        ));
+                    }
+                    Some(MissingMainBuild::Kept(build)) if !linked_main(&build.record) => {
+                        return refuse(format!(
+                            "kept build volume {} is not main's linked volume",
+                            build.kept.as_str()
+                        ));
+                    }
+                    None | Some(MissingMainBuild::Empty(_) | MissingMainBuild::Kept(_)) => {}
+                }
             }
         }
         for seed in &self.old_seeds {
@@ -196,17 +348,19 @@ impl ReAdoptSource {
     }
 
     /// Every staging mountpoint this re-adoption uses, exactly as recorded: the read-only
-    /// source mounts of main and its build volume, and the build replacement's copy mount.
+    /// source mounts of a retained main and its build volume, and the build replacement's copy mount.
     /// Staging collection leaves these alone while the intent forms.
     pub fn staging_mounts(&self) -> impl Iterator<Item = &Path> {
-        std::iter::once(self.image.source_mount.as_path()).chain(self.build.iter().flat_map(
-            |build| {
+        self.main
+            .retained()
+            .map(|image| image.source_mount.as_path())
+            .into_iter()
+            .chain(self.build.iter().flat_map(|build| {
                 [
                     build.image.source_mount.as_path(),
                     build.replacement_mount.as_path(),
                 ]
-            },
-        ))
+            }))
     }
 
     /// Every staged image this re-adoption mints outside the canonical names: the build
@@ -731,6 +885,39 @@ impl LifecycleIntentJournal {
         })?;
         record.completion = Some(completion);
         self.validate()
+    }
+
+    /// Replace the Git state an unfinished missing-main re-adoption recorded with `git_before`,
+    /// captured again from its plain checkout before a replay copies it (02_workspaces.md,
+    /// "Missing main image"). While nothing is published the checkout is the user's live tree,
+    /// so a commit or a fetch made after an earlier attempt refused must not wedge every replay
+    /// against the state that attempt recorded. The journaled record must still be exactly
+    /// `expected`, unfinished and a missing main's; otherwise the journal moved underneath the
+    /// capture and nothing is written. Only `git_before` changes.
+    #[cfg(any(target_os = "macos", test))]
+    pub(crate) fn rerecord_missing_main_git(
+        &mut self,
+        expected: &ReAdoptSource,
+        git_before: crate::git_preservation::GitPreservationSnapshot,
+    ) -> CowshedResult<ReAdoptSource> {
+        let moved = || {
+            CowshedError::integrity(
+                "main's re-adoption record moved before its checkout's Git state was recorded again",
+                "reopen cowshed to reconcile lifecycle state, then retry the re-adoption",
+            )
+        };
+        let record = self.entries.get_mut(main_name()).ok_or_else(moved)?;
+        if record.completion.is_some() {
+            return Err(moved());
+        }
+        let LifecycleIntent::ReAdopt { source, .. } = &mut record.operation else {
+            return Err(moved());
+        };
+        if source.as_ref() != expected || !matches!(source.main, ReAdoptMain::Missing(_)) {
+            return Err(moved());
+        }
+        source.git_before = git_before;
+        Ok(source.as_ref().clone())
     }
 
     pub fn clear(&mut self, workspace: &WorkspaceName) {

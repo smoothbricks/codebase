@@ -1256,7 +1256,8 @@ supervisor that ran the job retires.
   such as `HEAD~1` never fall back to another resolver. `ExpectedRefHead` projects as `{missing:true}` or `{oid}`. Oids
   are validated lowercase 40- or 64-hex strings.
 - `AdoptOptions = { path?, repoId?, capacity?, quarantine, reAdopt }`; `reAdopt: false` keeps default adoption
-  idempotent, while `true` selects the verified retained-source replacement in 02_workspaces.md §Re-adoption.
+  idempotent, while `true` selects the verified retained-source replacement in 02_workspaces.md §Re-adoption, or, when
+  main's image is missing, the plain-checkout recovery in §Missing main image.
   `CreateOptions = { revision?, fromWorkspace?, browse, slot? }`; `AttachOptions = { browse }`;
   `RemoveOptions = { force }`; `GcOptions = { dryRun }`; `RebaseOptions`, `LandOptions`, and `PushOptions` use the
   expectation fields shown above. All booleans are explicit in JSON; absence never silently means authority was granted.

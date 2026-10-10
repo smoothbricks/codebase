@@ -3502,6 +3502,9 @@ async fn prove_re_adoption(proof: ReAdoptionProof) {
         panic!("the same re-adoption is recorded")
     };
     let replacement = source.replacement.clone();
+    let cowshed_core::storage::recovery::ReAdoptMain::Retained(source_image) = &source.main else {
+        panic!("a healthy re-adoption retains main's image")
+    };
     let replacement_build = source.build.as_ref().expect("recorded warm build");
     assert!(
         replacement_build.replacement_image.exists(),
@@ -3512,7 +3515,7 @@ async fn prove_re_adoption(proof: ReAdoptionProof) {
         "the replacement main is not published yet"
     );
     assert!(
-        source.image.retained.exists(),
+        source_image.retained.exists(),
         "the original source remains retained"
     );
     assert!(
@@ -3577,7 +3580,7 @@ async fn prove_re_adoption(proof: ReAdoptionProof) {
         .mounts()
         .expect("own retained fixture mounts");
     for (from, to) in [
-        (&source.image.source_mount, fixture.checkout.clone()),
+        (&source_image.source_mount, fixture.checkout.clone()),
         (
             &replacement_build.image.source_mount,
             layout.mount(&main_volume),
@@ -3735,4 +3738,513 @@ async fn prove_re_adoption(proof: ReAdoptionProof) {
         .shutdown()
         .await
         .expect("stop recovered fixture runtime");
+}
+
+/// `path`'s host allocation is below its apparent length: a sparse image, not a materialised one.
+fn assert_host_sparse(path: &Path) {
+    use std::os::unix::fs::MetadataExt as _;
+    let metadata = fs::metadata(path).expect("an image's metadata");
+    assert!(
+        metadata.blocks() * 512 < metadata.len(),
+        "{} is materialised on the host: {} of {} bytes allocated",
+        path.display(),
+        metadata.blocks() * 512,
+        metadata.len()
+    );
+}
+
+/// 02_workspaces.md, "Missing main image": main's image and its build volume are both gone, and
+/// a plain Git checkout of main's repository sits at main's path. `adopt --re-adopt` publishes a
+/// fresh RAW main from that checkout and an empty RAW build under the recorded id.
+#[tokio::test]
+async fn real_apfs_re_adopt_of_a_missing_main_publishes_its_plain_checkout_and_an_empty_build() {
+    const REMOTE: &str = "https://github.com/fixture/dispatch.git";
+    let mut fixture = Fixture::with(Project::Declared);
+    let mut service = fixture.open().await;
+    adopt(&fixture, &mut service).await;
+    let storage = cowshed_core::storage::StorageLayout::new(
+        fixture.storage.store(),
+        &RepoId::parse("fixture/dispatch").expect("repository identity"),
+    )
+    .expect("fixture storage layout");
+    let project_root = storage.project().project_root.clone();
+    let journal_path = project_root.join("lifecycle-intents.json");
+    let main_image = project_root.join("main.dmg");
+    let pre_cowshed = PathBuf::from(format!("{}.pre-cowshed", fixture.checkout.display()));
+    let layout = build_volumes(&fixture);
+    let main_volume = linked_volume(&layout, &fixture.checkout);
+    let cache_marker = layout.mount(&main_volume).join("discarded-cache");
+    fs::write(&cache_marker, b"old cached payload\n").expect("warm the original build cache");
+
+    // The completed healthy re-adoption is the journal authority for main's build volume.
+    succeed(
+        &mut service,
+        [
+            OsString::from("adopt"),
+            fixture.checkout.as_os_str().to_os_string(),
+            OsString::from("--re-adopt"),
+        ],
+    )
+    .await;
+    let healthy = cowshed_core::storage::recovery::LifecycleIntentJournal::load(&journal_path)
+        .expect("the lifecycle journal after the healthy re-adoption");
+    let cowshed_core::storage::recovery::LifecycleIntent::ReAdopt {
+        source: healthy_source,
+        ..
+    } = &healthy
+        .get(&WorkspaceName::main())
+        .expect("main's completed re-adoption is journaled")
+        .operation
+    else {
+        panic!("main's journal entry is a re-adoption")
+    };
+    let record = layout
+        .read_record(&main_volume)
+        .expect("main's build record before its loss");
+    let pre_cowshed_head =
+        fs::read(pre_cowshed.join(".git/HEAD")).expect("the original tree is retained");
+
+    // A commit makes the plain checkout's HEAD exist only in that checkout.
+    fs::write(
+        fixture.checkout.join("tracked"),
+        b"changed before recovery\n",
+    )
+    .expect("change tracked");
+    git(
+        &fixture.checkout,
+        &["commit", "-q", "-am", "change tracked"],
+    );
+    service
+        .shutdown()
+        .await
+        .expect("stop the runtime before main is lost");
+    let lost_incarnation =
+        cowshed_core::metadata::DetachedWorkspaceMetadata::read_for_image(&main_image)
+            .expect("main's Active sidecar before the loss")
+            .workspace_incarnation;
+    let scratch = fixture._scratch.path();
+    let plain_source = scratch.join("plain-source");
+    git(
+        scratch,
+        &[
+            "clone",
+            "-q",
+            fixture.checkout.to_str().expect("a UTF-8 checkout path"),
+            plain_source.to_str().expect("a UTF-8 source path"),
+        ],
+    );
+
+    // Lose main's image with its sidecar and key, and the build volume's image, record and
+    // retained contents. Only the journal survives as authority.
+    let host = MacOsApfsExecutionHost::new(
+        SystemCommandRunner,
+        ApfsSubstrateConfig::new(fixture.storage.store(), &fixture.checkout),
+    )
+    .expect("fixture controller");
+    host.detach_existing_image(&main_image, DetachIntent::WhenIdle)
+        .expect("detach main without force");
+    let build_image = layout.image(&main_volume);
+    host.detach_existing_image(&build_image, DetachIntent::WhenIdle)
+        .expect("detach the build volume without force");
+    for lost in [
+        main_image.clone(),
+        cowshed_core::metadata::sidecar_path(&main_image),
+        PathBuf::from(format!("{}.ca.key", main_image.display())),
+        build_image.clone(),
+        layout.record(&main_volume),
+        healthy_source
+            .build
+            .as_ref()
+            .expect("the old build is recorded")
+            .image
+            .retained
+            .clone(),
+    ] {
+        fs::remove_file(&lost).unwrap_or_else(|error| panic!("lose {}: {error}", lost.display()));
+    }
+
+    // A plain checkout of main's repository at main's path, with uncommitted work.
+    fs::remove_dir(&fixture.checkout).expect("the detached mountpoint is an empty directory");
+    git(
+        scratch,
+        &[
+            "clone",
+            "-q",
+            plain_source.to_str().expect("a UTF-8 source path"),
+            fixture.checkout.to_str().expect("a UTF-8 checkout path"),
+        ],
+    );
+    git(&fixture.checkout, &["remote", "set-url", "origin", REMOTE]);
+    fs::write(fixture.checkout.join("tracked"), b"unstaged plain work\n")
+        .expect("dirty the plain tracked file");
+    fs::write(
+        fixture.checkout.join("notes.txt"),
+        b"untracked plain work\n",
+    )
+    .expect("create plain untracked work");
+    let plain_head = git_stdout(&fixture.checkout, &["rev-parse", "HEAD"]);
+
+    let mut recovered = fixture.open().await;
+    succeed(
+        &mut recovered,
+        [
+            OsString::from("adopt"),
+            fixture.checkout.as_os_str().to_os_string(),
+            OsString::from("--re-adopt"),
+        ],
+    )
+    .await;
+
+    let replacement =
+        cowshed_core::metadata::DetachedWorkspaceMetadata::read_for_image(&main_image)
+            .expect("the replacement's Active sidecar")
+            .workspace_incarnation;
+    assert_ne!(
+        replacement, lost_incarnation,
+        "a new incarnation is published"
+    );
+    let journal = cowshed_core::storage::recovery::LifecycleIntentJournal::load(&journal_path)
+        .expect("the lifecycle journal after recovery");
+    let entry = journal
+        .get(&WorkspaceName::main())
+        .expect("main's recovery is journaled");
+    assert!(entry.completion.is_some(), "the recovery completed");
+    let cowshed_core::storage::recovery::LifecycleIntent::ReAdopt {
+        source: recovered_source,
+        ..
+    } = &entry.operation
+    else {
+        panic!("main's recovery is a re-adoption")
+    };
+    assert_eq!(recovered_source.replacement, replacement);
+    let cowshed_core::storage::recovery::ReAdoptMain::Missing(missing) = &recovered_source.main
+    else {
+        panic!("the journal records a missing main")
+    };
+    assert_eq!(
+        git_stdout(&missing.preserved, &["rev-parse", "HEAD"]),
+        plain_head,
+        "the plain checkout is preserved beside main"
+    );
+    assert_eq!(
+        linked_volume(&layout, &fixture.checkout),
+        main_volume,
+        "main links its recorded build volume id"
+    );
+    assert_eq!(
+        layout
+            .read_record(&main_volume)
+            .expect("the published build record"),
+        BuildVolumeRecord {
+            tree: None,
+            ..record.clone()
+        },
+        "the empty build keeps its id, Linked main owner and createdAt, with no built-at tree"
+    );
+    assert_host_sparse(&main_image);
+    assert_host_sparse(&build_image);
+    assert!(
+        SystemKernelMountSource
+            .mounts()
+            .expect("observe the build mount")
+            .iter()
+            .any(|mount| mount.mount_point == layout.mount(&main_volume)),
+        "the empty build volume is mounted where main's link points"
+    );
+    assert!(!cache_marker.exists(), "the lost cache is never recovered");
+    assert_eq!(
+        git_stdout(&fixture.checkout, &["rev-parse", "HEAD"]),
+        plain_head,
+        "main holds the plain checkout's HEAD"
+    );
+    assert_eq!(
+        fs::read(fixture.checkout.join("tracked")).expect("tracked work"),
+        b"unstaged plain work\n"
+    );
+    assert_eq!(
+        fs::read(fixture.checkout.join("notes.txt")).expect("untracked work"),
+        b"untracked plain work\n"
+    );
+    assert_eq!(
+        git_stdout(&fixture.checkout, &["remote", "get-url", "origin"]),
+        REMOTE
+    );
+    assert_eq!(
+        fs::read(pre_cowshed.join(".git/HEAD")).expect("the original tree is retained"),
+        pre_cowshed_head,
+        "recovery never touches .pre-cowshed"
+    );
+    recovered
+        .shutdown()
+        .await
+        .expect("stop the recovered runtime");
+    fixture.stop_gateway().await;
+}
+
+/// Main's image, sidecar and CA key lost after a completed healthy re-adoption, with a plain Git
+/// checkout of main's repository cloned at main's path in their place, its origin naming the
+/// project. The build volumes are left as the caller arranged them. Answers the plain HEAD.
+fn lose_main_to_a_plain_checkout(fixture: &Fixture, main_image: &Path) -> String {
+    const REMOTE: &str = "https://github.com/fixture/dispatch.git";
+    let scratch = fixture._scratch.path();
+    let plain_source = scratch.join("plain-source");
+    git(
+        scratch,
+        &[
+            "clone",
+            "-q",
+            fixture.checkout.to_str().expect("a UTF-8 checkout path"),
+            plain_source.to_str().expect("a UTF-8 source path"),
+        ],
+    );
+    let host = MacOsApfsExecutionHost::new(
+        SystemCommandRunner,
+        ApfsSubstrateConfig::new(fixture.storage.store(), &fixture.checkout),
+    )
+    .expect("fixture controller");
+    host.detach_existing_image(main_image, DetachIntent::WhenIdle)
+        .expect("detach main without force");
+    for lost in [
+        main_image.to_owned(),
+        cowshed_core::metadata::sidecar_path(main_image),
+        PathBuf::from(format!("{}.ca.key", main_image.display())),
+    ] {
+        fs::remove_file(&lost).unwrap_or_else(|error| panic!("lose {}: {error}", lost.display()));
+    }
+    fs::remove_dir(&fixture.checkout).expect("the detached mountpoint is an empty directory");
+    git(
+        scratch,
+        &[
+            "clone",
+            "-q",
+            plain_source.to_str().expect("a UTF-8 source path"),
+            fixture.checkout.to_str().expect("a UTF-8 checkout path"),
+        ],
+    );
+    git(&fixture.checkout, &["remote", "set-url", "origin", REMOTE]);
+    git_stdout(&fixture.checkout, &["rev-parse", "HEAD"])
+}
+
+/// 02_workspaces.md, "Missing main image": main's build volume is the project's one record owned
+/// by `Linked main`, whatever its id. A land gives main the landing workspace's volume and
+/// releases the one main's completed re-adoption recorded, so after main's image is lost the
+/// recorded id names nothing while main's real volume survives. Re-adoption keeps that surviving
+/// volume, warm and with its owner record, links main to it and seeds it; it never mints an empty
+/// volume under the dead id.
+#[tokio::test]
+async fn real_apfs_re_adopt_of_a_missing_main_keeps_its_surviving_build_volume() {
+    let mut fixture = Fixture::with(Project::Declared);
+    let mut service = fixture.open().await;
+    adopt(&fixture, &mut service).await;
+    let storage = cowshed_core::storage::StorageLayout::new(
+        fixture.storage.store(),
+        &RepoId::parse("fixture/dispatch").expect("repository identity"),
+    )
+    .expect("fixture storage layout");
+    let main_image = storage.project().project_root.join("main.dmg");
+    let layout = build_volumes(&fixture);
+    succeed(
+        &mut service,
+        [
+            OsString::from("adopt"),
+            fixture.checkout.as_os_str().to_os_string(),
+            OsString::from("--re-adopt"),
+        ],
+    )
+    .await;
+    service
+        .shutdown()
+        .await
+        .expect("stop the runtime before main is lost");
+
+    // A land moved main onto another volume: main's warm volume now has an id the completed
+    // re-adoption never recorded, and the recorded id names nothing.
+    let recorded = linked_volume(&layout, &fixture.checkout);
+    fs::write(
+        layout.mount(&recorded).join("warm-cache"),
+        b"main's warm build state\n",
+    )
+    .expect("warm main's build volume");
+    let host = MacOsApfsExecutionHost::new(
+        SystemCommandRunner,
+        ApfsSubstrateConfig::new(fixture.storage.store(), &fixture.checkout),
+    )
+    .expect("fixture controller");
+    host.detach_existing_image(&layout.image(&recorded), DetachIntent::WhenIdle)
+        .expect("detach main's build volume without force");
+    let surviving = BuildVolumeId::mint();
+    for (from, to) in [
+        (layout.image(&recorded), layout.image(&surviving)),
+        (layout.record(&recorded), layout.record(&surviving)),
+        (layout.hold_path(&recorded), layout.hold_path(&surviving)),
+    ] {
+        if from.exists() {
+            fs::rename(&from, &to).expect("move main's volume to its landed id");
+        }
+    }
+    let owner = layout
+        .read_record(&surviving)
+        .expect("main's surviving build record");
+    assert!(
+        matches!(&owner.role, BuildVolumeRole::Linked { checkout } if checkout.is_main()),
+        "the surviving volume is main's: {owner:?}"
+    );
+    let plain_head = lose_main_to_a_plain_checkout(&fixture, &main_image);
+
+    let mut recovered = fixture.open().await;
+    succeed(
+        &mut recovered,
+        [
+            OsString::from("adopt"),
+            fixture.checkout.as_os_str().to_os_string(),
+            OsString::from("--re-adopt"),
+        ],
+    )
+    .await;
+
+    assert_eq!(
+        git_stdout(&fixture.checkout, &["rev-parse", "HEAD"]),
+        plain_head
+    );
+    assert_eq!(
+        linked_volume(&layout, &fixture.checkout),
+        surviving,
+        "main links its surviving build volume, not the recorded id"
+    );
+    assert_eq!(
+        layout
+            .read_record(&surviving)
+            .expect("the kept build record"),
+        owner,
+        "the kept volume keeps its owner record, built-at tree included"
+    );
+    assert_eq!(
+        fs::read(layout.mount(&surviving).join("warm-cache")).expect("the kept warm state"),
+        b"main's warm build state\n"
+    );
+    assert!(
+        !layout.image(&recorded).exists() && !layout.record(&recorded).exists(),
+        "nothing is minted under the dead recorded id"
+    );
+    let replacement =
+        cowshed_core::metadata::DetachedWorkspaceMetadata::read_for_image(&main_image)
+            .expect("the replacement's Active sidecar")
+            .workspace_incarnation;
+    let (_, seed) = layout
+        .seed_of(&WorkspaceName::main(), &replacement)
+        .expect("main's seed lookup")
+        .expect("the kept volume is seeded for the replacement");
+    assert_eq!(seed.tree, owner.tree, "the seed carries the kept tree");
+    recovered
+        .shutdown()
+        .await
+        .expect("stop the recovered runtime");
+    fixture.stop_gateway().await;
+}
+
+/// 02_workspaces.md, "Missing main image": until the handoff swaps it aside, a missing main's copy
+/// source is the user's live checkout. An attempt that refuses after it is journaled and before
+/// anything is published (here, a file the copy cannot read) leaves the user free to commit; the
+/// replay records the checkout's Git state again before it copies, so it publishes the new HEAD
+/// instead of refusing against the state the first attempt recorded, on every run.
+#[tokio::test]
+async fn real_apfs_a_missing_main_replay_publishes_a_commit_made_after_a_refused_attempt() {
+    let mut fixture = Fixture::with(Project::Declared);
+    let mut service = fixture.open().await;
+    adopt(&fixture, &mut service).await;
+    let storage = cowshed_core::storage::StorageLayout::new(
+        fixture.storage.store(),
+        &RepoId::parse("fixture/dispatch").expect("repository identity"),
+    )
+    .expect("fixture storage layout");
+    let project_root = storage.project().project_root.clone();
+    let journal_path = project_root.join("lifecycle-intents.json");
+    let main_image = project_root.join("main.dmg");
+    succeed(
+        &mut service,
+        [
+            OsString::from("adopt"),
+            fixture.checkout.as_os_str().to_os_string(),
+            OsString::from("--re-adopt"),
+        ],
+    )
+    .await;
+    service
+        .shutdown()
+        .await
+        .expect("stop the runtime before main is lost");
+    lose_main_to_a_plain_checkout(&fixture, &main_image);
+
+    // An ignored file the copy cannot read: the attempt is journaled, then refuses at the copy.
+    let excludes = fixture.checkout.join(".git/info/exclude");
+    let mut excluded = fs::read(&excludes).unwrap_or_default();
+    excluded.extend_from_slice(b"\nunreadable.bin\n");
+    fs::write(&excludes, excluded).expect("ignore the unreadable file");
+    let unreadable = fixture.checkout.join("unreadable.bin");
+    fs::write(&unreadable, b"no one may read this\n").expect("write the unreadable file");
+    fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000))
+        .expect("make the file unreadable");
+    let mut refused = fixture.open().await;
+    let (result, _, _) = run(
+        &mut refused,
+        [
+            OsString::from("adopt"),
+            fixture.checkout.as_os_str().to_os_string(),
+            OsString::from("--re-adopt"),
+        ],
+    )
+    .await;
+    assert!(
+        !matches!(result, Ok(0)),
+        "the unreadable file refuses the copy: {result:?}"
+    );
+    refused.shutdown().await.expect("stop the refused runtime");
+    let journal = cowshed_core::storage::recovery::LifecycleIntentJournal::load(&journal_path)
+        .expect("the refused journal");
+    let entry = journal
+        .get(&WorkspaceName::main())
+        .expect("main's re-adoption is recorded");
+    assert!(
+        entry.completion.is_none(),
+        "the refused re-adoption was journaled and left unfinished"
+    );
+    assert!(!main_image.exists(), "nothing was published");
+
+    // The user repairs the file and goes on working: a commit moves HEAD and the refs.
+    fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o644))
+        .expect("make the file readable again");
+    fs::write(
+        fixture.checkout.join("tracked"),
+        b"committed after the refusal\n",
+    )
+    .expect("change tracked");
+    git(
+        &fixture.checkout,
+        &["commit", "-q", "-am", "work after the refusal"],
+    );
+    let new_head = git_stdout(&fixture.checkout, &["rev-parse", "HEAD"]);
+
+    // Opening the project replays the unfinished re-adoption, as `adopt --re-adopt` does.
+    let resumed = fixture.open().await;
+    assert_eq!(
+        git_stdout(&fixture.checkout, &["rev-parse", "HEAD"]),
+        new_head,
+        "main holds the commit made after the refused attempt"
+    );
+    assert_eq!(
+        fs::read(fixture.checkout.join("tracked")).expect("tracked work"),
+        b"committed after the refusal\n"
+    );
+    let journal = cowshed_core::storage::recovery::LifecycleIntentJournal::load(&journal_path)
+        .expect("the resumed journal");
+    assert!(
+        journal
+            .get(&WorkspaceName::main())
+            .expect("main's re-adoption is recorded")
+            .completion
+            .is_some(),
+        "the replay completed"
+    );
+    resumed.shutdown().await.expect("stop the resumed runtime");
+    fixture.stop_gateway().await;
 }

@@ -603,6 +603,15 @@ pub trait ApfsExecutionHost: Send + Sync + 'static {
         source_checkout: &Path,
         pre_cowshed_checkout: &Path,
     ) -> Result<(), PublicationError>;
+    /// Hand the checkout path over to a plain re-adoption's replacement: the same atomic swap as
+    /// `vacate_adopted_checkout`, retaining the displaced tree at `preserved`, a distinct sibling
+    /// of `checkout` the caller has validated. Converges from an interrupted swap and never moves
+    /// an already-mounted replacement.
+    fn vacate_plain_checkout(
+        &self,
+        checkout: &Path,
+        preserved: &Path,
+    ) -> Result<(), PublicationError>;
     /// Refuse unless `checkout` is an empty directory nothing is mounted at: the mountpoint a
     /// replaced main left, which a re-adoption's replacement mounts on (02_workspaces.md,
     /// "Re-adoption" step 5). A volume still mounted there, or anything written into the
@@ -2244,6 +2253,15 @@ fn prepare_adopt_stage<H: ApfsExecutionHost>(
                 ));
             }
         }
+        // A plain replacement copies from the checkout the user still owns, which stays in place
+        // until the verified replacement is published, so only its retained name must be free.
+        AdoptHandoff::PlainReplacement { preserved, .. } => {
+            if preserved.exists() {
+                return Err(ApfsStorageError::InvalidPlan(
+                    "plain replacement's preserved checkout already exists",
+                ));
+            }
+        }
         // The replaced main is gone from the checkout: nothing may be mounted there, or main
         // would mount over it.
         AdoptHandoff::Replacement { .. } => host.require_vacant_checkout(source_checkout)?,
@@ -2263,7 +2281,8 @@ fn prepare_adopt_stage<H: ApfsExecutionHost>(
             && pending.info.base_commit == requested.base_commit
             && match handoff {
                 AdoptHandoff::Checkout { .. } => true,
-                AdoptHandoff::Replacement { incarnation, .. } => {
+                AdoptHandoff::Replacement { incarnation, .. }
+                | AdoptHandoff::PlainReplacement { incarnation, .. } => {
                     pending.incarnation == *incarnation
                 }
             };
@@ -2302,7 +2321,8 @@ fn prepare_adopt_stage<H: ApfsExecutionHost>(
         None => {
             let incarnation = match handoff {
                 AdoptHandoff::Checkout { .. } => incarnations.mint()?,
-                AdoptHandoff::Replacement { incarnation, .. } => incarnation.clone(),
+                AdoptHandoff::Replacement { incarnation, .. }
+                | AdoptHandoff::PlainReplacement { incarnation, .. } => incarnation.clone(),
             };
             let workspace = adopted_workspace(repo, incarnation, topology)?;
             let staging = staging_mount(config, &workspace)?;
@@ -2483,8 +2503,9 @@ fn commit_prepared_adopt<H: ApfsExecutionHost>(
     }
     // Only now does the checkout path change hands: for a first adoption in one atomic swap (the
     // mountpoint *is* the checkout path and cannot exist until the swap creates it, so the swap
-    // comes first and the mount follows); for a re-adoption the replaced main left the checkout
-    // an empty mountpoint, which must still be one. A failure leaves a published main that
+    // comes first and the mount follows); a plain re-adoption swaps the user's checkout aside to
+    // its preserved sibling the same way; a replacement of an adopted main finds the checkout an
+    // empty mountpoint, which must still be one. A failure leaves a published main that
     // `ApfsSubstrate::finish_adoption` completes.
     hand_over_checkout(host, &source_checkout, &handoff)?;
     if let Err(primary) = host
@@ -2521,6 +2542,9 @@ fn hand_over_checkout<H: ApfsExecutionHost>(
         } => host
             .vacate_adopted_checkout(checkout, pre_cowshed_checkout)
             .map_err(PublicationError::into_source),
+        AdoptHandoff::PlainReplacement { preserved, .. } => host
+            .vacate_plain_checkout(checkout, preserved)
+            .map_err(PublicationError::into_source),
         AdoptHandoff::Replacement { .. } => host.require_vacant_checkout(checkout),
     }
 }
@@ -2534,10 +2558,14 @@ fn finish_adoption<H: ApfsExecutionHost>(
     handoff: &AdoptHandoff,
 ) -> Result<(), ApfsStorageError> {
     let checkout = mount_point(config, workspace)?;
-    // A first adoption's swap converges idempotently, a leftover staging name included, whether
-    // or not main is mounted yet.
-    if let AdoptHandoff::Checkout { .. } = handoff {
-        hand_over_checkout(host, &checkout, handoff)?;
+    // A first adoption's swap and a plain re-adoption's vacate converge whether or not main is
+    // mounted yet, a leftover staging name included. A replacement's handoff follows the mount
+    // check below.
+    match handoff {
+        AdoptHandoff::Checkout { .. } | AdoptHandoff::PlainReplacement { .. } => {
+            hand_over_checkout(host, &checkout, handoff)?;
+        }
+        AdoptHandoff::Replacement { .. } => {}
     }
     let derived = super::lifecycle::derive_workspaces(
         host.list(workspace.repo())?,

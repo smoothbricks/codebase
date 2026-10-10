@@ -979,15 +979,15 @@ impl<'a> RetainedInput<'a> {
         path: &'a Path,
     ) -> crate::Result<Self> {
         source.validate()?;
-        let named = path == source.image.original.as_path()
-            || path == source.image.retained.as_path()
-            || source.build.as_ref().is_some_and(|build| {
-                path == build.image.original.as_path() || path == build.image.retained.as_path()
-            })
-            || source
-                .old_seeds
-                .iter()
-                .any(|seed| path == seed.original.as_path() || path == seed.retained.as_path());
+        // A missing main retains no main image: only its build inputs can be named.
+        let named = source.main.retained().is_some_and(|image| {
+            path == image.original.as_path() || path == image.retained.as_path()
+        }) || source.build.as_ref().is_some_and(|build| {
+            path == build.image.original.as_path() || path == build.image.retained.as_path()
+        }) || source
+            .old_seeds
+            .iter()
+            .any(|seed| path == seed.original.as_path() || path == seed.retained.as_path());
         if !named {
             return Err(crate::CowshedError::integrity(
                 format!(
@@ -5253,11 +5253,15 @@ mod tests {
 
         let fixture = Fixture::new();
         let mut source = fixture.source(Some(fixture.build()));
-        source.image.original.set_extension("asif");
-        source.image.retained.set_extension("asif");
-        fs::create_dir_all(source.image.retained.parent().unwrap()).unwrap();
-        let input = RetainedInput::from_record(&source, &source.image.retained).unwrap();
-        let unrelated = source.image.retained.with_file_name("unrecorded.asif");
+        let crate::storage::recovery::ReAdoptMain::Retained(image) = &mut source.main else {
+            panic!("the fixture retains main's image")
+        };
+        image.original.set_extension("asif");
+        image.retained.set_extension("asif");
+        let retained = image.retained.clone();
+        fs::create_dir_all(retained.parent().unwrap()).unwrap();
+        let input = RetainedInput::from_record(&source, &retained).unwrap();
+        let unrelated = retained.with_file_name("unrecorded.asif");
         let refused = RetainedInput::from_record(&source, &unrelated).unwrap_err();
         assert_eq!(refused.code, crate::ErrorCode::Integrity);
         assert!(

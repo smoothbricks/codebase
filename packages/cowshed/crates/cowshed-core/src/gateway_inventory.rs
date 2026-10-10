@@ -852,11 +852,14 @@ impl NativeGatewayInventory {
     /// The primary identity of the bound project whose main sits at `checkout`, for an explicit
     /// `adopt --re-adopt` that names no repository. Read-only: nothing is repaired or written.
     ///
-    /// Four facts must agree before a project is named: the in-image marker at the checkout is the
-    /// main workspace's and records that checkout; the controller's RAW `main.dmg` sidecar for the
-    /// marker's repo is the Active main, at the same incarnation, recording the same checkout; a
-    /// binding owns that repo; and no other project's RAW main claims the checkout. `Ok(None)` means
-    /// no main marker sits at `checkout` or its owner holds no RAW `main.dmg`; adopt step 1 then
+    /// Four facts must agree before a project is named for a mounted main: the in-image marker at
+    /// the checkout is the main workspace's and records that checkout; the controller's main sidecar
+    /// for the marker's repo is the Active main, at the same incarnation, recording the same checkout
+    /// (a RAW `main.dmg`); a binding owns that repo; and no other project's RAW main claims the
+    /// checkout. Without a marker the main is unmounted, and the store alone names the owner: the
+    /// project it recorded for this checkout root, or the one whose main sidecar names it. The
+    /// adoption path proves that the checkout's remotes name that repo. `Ok(None)` means nothing in
+    /// the store claims `checkout`, or its marker's owner holds no RAW `main.dmg`; adopt step 1 then
     /// names the identity.
     pub async fn re_adoption_primary_for_checkout(
         &self,
@@ -1011,7 +1014,10 @@ impl NativeGatewayInventory {
             Err(crate::metadata::MetadataError::Io { source, .. })
                 if source.kind() == io::ErrorKind::NotFound =>
             {
-                return Ok(None);
+                // An unmounted main has no in-image marker. The store names its owner by the root it
+                // recorded for this checkout or by the main sidecar that names it. The remote identity
+                // proof is the adoption path's job, because it owns the async Git handle.
+                return self.repository_for_project_root_blocking(checkout);
             }
             Err(error) => {
                 return Err(GatewayInventoryError::InvalidMetadata {
@@ -3077,6 +3083,37 @@ mod tests {
                 .await
                 .expect("resolve a project with no main image"),
             Some(repo)
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unmounted_checkout_names_only_the_owner_its_store_records() {
+        let fixture = Fixture::new("unmounted-primary");
+        let repo = RepoId::parse("acme/widget").expect("repo");
+        fixture.bind(&repo);
+        let checkout = fixture.root.join("checkout-widget");
+        fs::create_dir_all(&checkout).expect("unmounted checkout");
+        StorageLayout::new(fixture.storage.store(), &repo)
+            .expect("layout")
+            .record_checkout_root(&checkout)
+            .expect("checkout root record");
+        let stranger = fixture.root.join("stranger");
+        fs::create_dir_all(&stranger).expect("unrecorded checkout");
+        let inventory = NativeGatewayInventory::new(fixture.storage.clone());
+
+        assert_eq!(
+            inventory
+                .re_adoption_primary_for_checkout(&checkout)
+                .await
+                .expect("unmounted primary"),
+            Some(repo)
+        );
+        assert_eq!(
+            inventory
+                .re_adoption_primary_for_checkout(&stranger)
+                .await
+                .expect("unrecorded primary"),
+            None
         );
     }
 

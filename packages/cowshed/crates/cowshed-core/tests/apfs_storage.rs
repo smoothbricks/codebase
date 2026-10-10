@@ -581,6 +581,16 @@ impl ApfsExecutionHost for FakeHost {
         self.record_path(pre_cowshed_checkout);
         Ok(())
     }
+    fn vacate_plain_checkout(
+        &self,
+        checkout: &Path,
+        preserved: &Path,
+    ) -> Result<(), PublicationError> {
+        self.record("atomic-plain-checkout-vacate");
+        self.record_path(checkout);
+        self.record_path(preserved);
+        Ok(())
+    }
     fn require_vacant_checkout(&self, checkout: &Path) -> Result<(), ApfsStorageError> {
         self.record("replacement-checkout-vacant");
         self.record_path(checkout);

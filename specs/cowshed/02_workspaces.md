@@ -139,15 +139,16 @@ ASIF-to-RAW transition and the RAW guest-space reclaim operation, not an image c
    hole-aware copies; do not materialize the nominal image capacity or use an intermediate full checkout on Data. The
    main's build-volume identity and owner record are preserved verbatim, including its built-at tree and creation time;
    its contents are carried into a sparse RAW backing image by the same staged, verified copy at the recorded capacity.
-   Nothing substitutes an empty build volume for the recorded warm one. Leave old-incarnation seed images unchanged as
-   retained evidence; publish one fresh RAW seed from the verified warm replacement for the new incarnation. A resumed
-   copy leaves already-correct hard-link topology untouched. It relinks only missing, mismatched or recopied-primary
-   aliases and restores every changed alias's ancestor metadata after the subtree is complete. Already-mirrored file
-   payloads are not recopied merely because the transaction was interrupted; full content and metadata verification
-   still runs before publication. The exclusive claim on the recorded source build image's `<image>.hold` stays held
-   through retention, copy, seed capture and publication. A RAW-to-RAW replacement captures under that same typed claim
-   rather than opening a second exclusive claim on the same resource. A legacy ASIF source's hold is distinct from the
-   published RAW hold: the old claim remains alive while seed capture independently claims the new RAW resource.
+   Nothing substitutes an empty build volume for the recorded warm one, except for a missing main (below). Leave
+   old-incarnation seed images unchanged as retained evidence; publish one fresh RAW seed from the verified warm
+   replacement for the new incarnation. A resumed copy leaves already-correct hard-link topology untouched. It relinks
+   only missing, mismatched or recopied-primary aliases and restores every changed alias's ancestor metadata after the
+   subtree is complete. Already-mirrored file payloads are not recopied merely because the transaction was interrupted;
+   full content and metadata verification still runs before publication. The exclusive claim on the recorded source
+   build image's `<image>.hold` stays held through retention, copy, seed capture and publication. A RAW-to-RAW
+   replacement captures under that same typed claim rather than opening a second exclusive claim on the same resource. A
+   legacy ASIF source's hold is distinct from the published RAW hold: the old claim remains alive while seed capture
+   independently claims the new RAW resource.
 4. Verify the copied content before publication, including tracked and untracked-not-ignored file checksums, the entire
    `.git` state above, `git fsck`, and the build contents and identity. Re-adoption does not normalize Git
    configuration, delete lock files, prune worktree registrations or replace user hooks. Only cowshed's own marker and
@@ -170,6 +171,29 @@ ASIF-to-RAW transition and the RAW guest-space reclaim operation, not an image c
    old repository, checkout, workspace and incarnation match its marker, and the kernel joins that exact retained image
    to a read-only mount at that checkout. Recorded main/build inputs restored read-only at their canonical paths move
    back to their recorded copy stages without force. Foreign paths and read-write retained mounts refuse.
+
+#### Missing main image
+
+When main's recorded image is missing (no canonical image, sidecar or CA key, and no legacy image) and a plain Git
+checkout sits unmounted at main's checkout path, `adopt <checkout> --re-adopt` re-adopts main from that checkout. It
+refuses unless the checkout is the root of a Git repository one of whose remotes names the project's `repo_id`, and
+unless main's completed re-adoption journal for that checkout names the lost incarnation. That journal is the only
+authority left for main's metadata, image capacity (unless `--capacity` is given) and recorded build-volume identity.
+The repository identity and project records are kept. The checkout is the copy source of the same staged copy, step 4
+verification and `PendingFence` publication as adopt, and it must have no holders, as in step 1: a process with a file,
+its working directory or its executable inside the checkout refuses, named by PID and command, and nothing is stopped.
+At handoff the checkout is swapped aside to `<checkout>.readopt-<replacement incarnation>`, never `.pre-cowshed`, and
+kept there as the retained evidence. Main's build volume is the project's one build record owned by `Linked main`,
+whatever its ID: a build volume is an image of its own, so it can outlive main's image, and every land gives main a new
+one. A surviving one is kept as it is, its holders refused as in step 1, and seeded for the new incarnation. More than
+one build record owned by `Linked main` refuses with integrity. Only when none survives is main's build volume published
+as an empty RAW volume under the recorded ID, `Linked main` owner and creation time, with its built-at tree cleared; a
+build image or record still present at that ID then refuses: this recovery never publishes over a build volume. Before
+the Git state is recorded, the checkout takes main's cowshed excludes and a build link naming main's build volume, so
+the copy verifies and carries the link. Old-incarnation seeds are retained and one fresh seed is frozen as in step 3.
+The journal records the copy mode, so a replay resumes the same recovery. While nothing is published, the checkout is
+the user's live tree: a replay before the handoff proves it unheld again and records its Git state again before it
+copies, so a commit or a fetch made after an earlier attempt refused never wedges the recovery.
 
 Re-adoption copies filesystem entries, not allocated-but-free guest blocks. Space returns only after verification and
 explicit release of the old image and any snapshots sharing its blocks (01_storage.md, "Space reclamation"). Existing

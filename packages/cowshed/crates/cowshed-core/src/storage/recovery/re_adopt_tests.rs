@@ -32,7 +32,9 @@ use crate::temp_root::TempRoot;
 
 use super::{
     LIFECYCLE_INTENTS_FILE, LifecycleIntent, LifecycleIntentCompletion, LifecycleIntentJournal,
-    ReAdoptBuild, ReAdoptImage, ReAdoptRetained, ReAdoptSource, STAGING_NAMESPACE,
+    LifecycleIntentPhase, MissingMainBuild, ReAdoptBuild, ReAdoptEmptyBuild, ReAdoptImage,
+    ReAdoptKeptBuild, ReAdoptMain, ReAdoptMissingMain, ReAdoptRetained, ReAdoptSource,
+    STAGING_NAMESPACE, preserved_checkout,
 };
 
 const OLD_INCARNATION: &str = "0198f2c0b7e34dc795f17b238b331c80";
@@ -139,7 +141,7 @@ impl Fixture {
         }
     }
 
-    fn main_image(&self) -> ReAdoptImage {
+    pub(crate) fn main_image(&self) -> ReAdoptImage {
         ReAdoptImage {
             original: self.project.join("main.dmg"),
             retained: self
@@ -196,7 +198,7 @@ impl Fixture {
     pub(crate) fn source(&self, build: Option<ReAdoptBuild>) -> ReAdoptSource {
         ReAdoptSource {
             checkout: self.checkout.clone(),
-            image: self.main_image(),
+            main: ReAdoptMain::Retained(self.main_image()),
             metadata: self.main_metadata(),
             git_before: self.git_before.clone(),
             build,
@@ -721,14 +723,17 @@ fn re_adopt_journal_updates_never_overwrite_original_retained_or_pre_cowshed_inp
 
     let mut planted = vec![
         plant(
-            &source.image.original,
+            &fixture.main_image().original,
             b"original main backing image, pre-cowshed",
         ),
         plant(
-            &sidecar_path(&source.image.original),
+            &sidecar_path(&fixture.main_image().original),
             b"original main grants sidecar",
         ),
-        plant(&source.image.retained, b"retained main backing image"),
+        plant(
+            &fixture.main_image().retained,
+            b"retained main backing image",
+        ),
         plant(&build.image.original, b"original build volume image"),
         plant(&build.image.retained, b"retained build volume image"),
         plant(
@@ -819,4 +824,142 @@ fn forming_re_adoptions_name_exactly_their_recorded_staging_paths() {
     .expect("complete re-adoption");
     let complete = LifecycleIntentJournal::load(&journal).expect("load completed journal");
     assert_eq!(complete.forming_re_adoptions().count(), 0);
+}
+
+/// A missing main's source as its re-adoption records it (02_workspaces.md, "Missing main
+/// image"): the plain checkout is the copy source, the replacement is published at `main.dmg`,
+/// and the checkout moves aside to its readopt sibling at handoff.
+fn missing_source(fixture: &Fixture, build: Option<MissingMainBuild>) -> ReAdoptSource {
+    let mut source = fixture.source(None);
+    source.main = ReAdoptMain::Missing(ReAdoptMissingMain {
+        canonical: fixture.project.join("main.dmg"),
+        preserved: preserved_checkout(&fixture.checkout, &source.replacement)
+            .expect("the fixture checkout has a name"),
+        capacity_bytes: MAIN_CAPACITY_BYTES,
+        build,
+    });
+    source
+}
+
+fn linked_main(tree: Option<GitOid>) -> BuildVolumeRecord {
+    BuildVolumeRecord::new(
+        tree,
+        BuildVolumeRole::Linked {
+            checkout: WorkspaceName::main(),
+        },
+    )
+}
+
+/// While nothing is published, a missing main's replay records the checkout's Git state again:
+/// a commit made after an earlier attempt refused replaces only `git_before`, and the record stays
+/// unfinished and mutating. A replay holding a stale record, or a retained main's record, writes
+/// nothing.
+#[test]
+fn a_missing_main_replay_records_the_checkouts_git_state_again_and_nothing_else() {
+    let fixture = Fixture::new();
+    let journal = fixture.journal_path();
+    let source = missing_source(&fixture, None);
+    begin_and_mark_mutating(&journal, fixture.intent_for(source.clone()));
+
+    fs::write(
+        fixture.checkout.join("README"),
+        b"committed after a refusal\n",
+    )
+    .expect("change README");
+    git(&fixture.checkout, &["commit", "-qam", "after a refusal"]);
+    let recaptured = git_preservation::capture(&fixture.checkout, &fixture.checkout)
+        .expect("capture the moved checkout");
+    assert!(
+        source.git_before.compare(&recaptured).is_err(),
+        "the commit moved the checkout's Git state"
+    );
+
+    let (_, rerecorded) = LifecycleIntentJournal::update(&journal, |state| {
+        state.rerecord_missing_main_git(&source, recaptured.clone())
+    })
+    .expect("record the checkout's Git state again");
+    let mut expected = source.clone();
+    expected.git_before = recaptured.clone();
+    assert_eq!(rerecorded, expected, "only git_before changes");
+    let loaded = LifecycleIntentJournal::load(&journal).expect("reload the journal");
+    let record = loaded
+        .get(&WorkspaceName::main())
+        .expect("main's re-adoption is recorded");
+    assert!(record.completion.is_none(), "the record stays unfinished");
+    assert_eq!(record.phase, LifecycleIntentPhase::Mutating);
+    let LifecycleIntent::ReAdopt { source: stored, .. } = &record.operation else {
+        panic!("main's record is a re-adoption")
+    };
+    assert_eq!(stored.as_ref(), &expected);
+
+    let stale = LifecycleIntentJournal::update(&journal, |state| {
+        state.rerecord_missing_main_git(&source, recaptured.clone())
+    });
+    assert!(
+        stale.is_err(),
+        "a replay holding a stale record writes nothing"
+    );
+
+    let retained = Fixture::new();
+    let retained_journal = retained.journal_path();
+    begin_and_mark_mutating(&retained_journal, retained.intent(None));
+    let refused = LifecycleIntentJournal::update(&retained_journal, |state| {
+        state.rerecord_missing_main_git(&retained.source(None), retained.git_before.clone())
+    });
+    assert!(
+        refused.is_err(),
+        "a retained main's recorded Git state is never replaced"
+    );
+}
+
+/// A missing main's build volume decodes in both shapes: the empty volume journals held before a
+/// surviving one could be kept (a golden record of that shape), and a kept volume. Each round-trips
+/// and validates; a kept volume that is not main's is refused.
+#[test]
+fn a_missing_mains_build_volume_round_trips_empty_or_kept() {
+    let fixture = Fixture::new();
+    let id = BuildVolumeId::parse(BUILD_ID).expect("fixture build id");
+    let empty_record = linked_main(None);
+    let empty = MissingMainBuild::Empty(ReAdoptEmptyBuild {
+        id: id.clone(),
+        record: empty_record.clone(),
+        capacity_bytes: BUILD_CAPACITY_BYTES,
+    });
+    let golden = json!({
+        "id": BUILD_ID,
+        "record": serde_json::to_value(&empty_record).expect("encode the empty record"),
+        "capacityBytes": BUILD_CAPACITY_BYTES,
+    });
+    assert_eq!(
+        serde_json::from_value::<MissingMainBuild>(golden).expect("decode the empty shape"),
+        empty,
+        "an empty-volume record written before kept volumes still decodes as empty"
+    );
+    let kept = MissingMainBuild::Kept(ReAdoptKeptBuild {
+        kept: BuildVolumeId::parse(SEED_IDS[0]).expect("kept build id"),
+        record: linked_main(Some(fixture.head_tree.clone())),
+    });
+    for build in [empty, kept] {
+        let source = missing_source(&fixture, Some(build));
+        source.validate().expect("a missing main's record is valid");
+        let encoded = serde_json::to_value(&source).expect("encode the source");
+        let decoded: ReAdoptSource = serde_json::from_value(encoded).expect("decode the source");
+        assert_eq!(decoded, source);
+    }
+    let foreign = missing_source(
+        &fixture,
+        Some(MissingMainBuild::Kept(ReAdoptKeptBuild {
+            kept: id,
+            record: BuildVolumeRecord::new(
+                None,
+                BuildVolumeRole::Linked {
+                    checkout: WorkspaceName::new("topic").expect("a session name"),
+                },
+            ),
+        })),
+    );
+    assert!(
+        foreign.validate().is_err(),
+        "a kept volume another checkout owns is refused"
+    );
 }

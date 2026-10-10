@@ -16,9 +16,12 @@ use crate::api::dto::AdoptOptions;
 use crate::build_volume::BuildVolumeId;
 use crate::error::{CowshedError, ErrorCode, Result};
 use crate::metadata::{IMAGE_EXTENSION, WorkspaceName};
+use crate::storage::apfs::COMPANION_SUFFIX;
+use crate::storage::lifecycle::AdoptHandoff;
 use crate::storage::recovery::{
-    LifecycleIntent, RETAINED_NAMESPACE, ReAdoptBuild, ReAdoptImage, ReAdoptRetained,
-    ReAdoptSource, STAGING_NAMESPACE,
+    LifecycleIntent, LifecycleIntentCompletion, MissingMainBuild, RETAINED_NAMESPACE, ReAdoptBuild,
+    ReAdoptEmptyBuild, ReAdoptImage, ReAdoptKeptBuild, ReAdoptMain, ReAdoptMissingMain,
+    ReAdoptRetained, ReAdoptSource, STAGING_NAMESPACE,
 };
 
 impl NativeProjectRuntimeHost {
@@ -37,24 +40,14 @@ impl NativeProjectRuntimeHost {
         }
         self.validate_binding().await?;
         let checkout = self.descriptor.git_root.to_path_buf();
-        let replaced = self.replaced_main(&checkout).await?;
         // Step 1: the caller is outside the checkout, the source has no holders, and nothing is
         // ended to make it so.
-        let cwd = std::env::current_dir().map_err(|error| {
-            CowshedError::environment_missing(
-                format!("cannot read the working directory: {error}"),
-                "retry from an existing directory",
-            )
-        })?;
-        if cwd.starts_with(&checkout) {
-            return Err(CowshedError::usage(
-                format!(
-                    "re-adoption replaces the volume at {}, which this shell's working directory is inside",
-                    checkout.display()
-                ),
-                format!("cd out of {} and retry", checkout.display()),
-            ));
-        }
+        require_outside(&checkout)?;
+        let Some(replaced) = self.replaced_main(&checkout).await? else {
+            // Main's image is missing: its plain checkout is the copy input.
+            let source = self.record_missing_main(&options, &checkout).await?;
+            return self.begin_re_adopt(options, source, None).await;
+        };
         // Admission closes only if main runs no job; a running job refuses, and nothing ends it.
         // A legacy main's supervisor, if any, is of another build and cannot prove itself idle
         // here: nothing of it is stopped, and the holder gate below refuses, naming its
@@ -97,25 +90,25 @@ impl NativeProjectRuntimeHost {
                     "cowshed doctor --json",
                 )
             })?;
-            if !holders.is_empty() {
-                let named = holders
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                return Err(CowshedError::conflict(
-                    format!(
-                        "{} is in use by {named}; no running job or user process was stopped and \
-                         nothing was forced",
-                        mount.display()
-                    ),
-                    "close those processes, then retry",
-                ));
-            }
+            refuse_held(mount, &holders)?;
         }
         let source = self
             .record_re_adopt_source(&replaced, &checkout, build.as_ref())
             .await?;
+        self.begin_re_adopt(options, source, supervisor).await
+    }
+
+    /// Record `source` and mark it mutating in one journal update, then run it. `supervisor` is
+    /// the retired supervisor's socket lease, held until the re-adoption is recorded so no
+    /// replacement supervisor starts on the source while it is measured.
+    async fn begin_re_adopt(
+        &mut self,
+        options: AdoptOptions,
+        source: ReAdoptSource,
+        supervisor: Option<super::super::supervisor_socket::BoundSocket>,
+    ) -> Result<WorkspaceSnapshot> {
+        let main = main_name();
+        let checkout = source.checkout.clone();
         let intent = LifecycleIntent::ReAdopt {
             options,
             source: Box::new(source.clone()),
@@ -128,9 +121,8 @@ impl NativeProjectRuntimeHost {
         // Recovery can locate this exact project after the source and its sidecar leave the
         // canonical names, before a PendingFence replacement exists or Git is mounted.
         let recorded_layout = self.layout.clone();
-        let recorded_checkout = checkout.clone();
         crate::storage::lifecycle::dispatch_blocking(move || {
-            recorded_layout.record_checkout_root(&recorded_checkout)
+            recorded_layout.record_checkout_root(&checkout)
         })
         .await
         .map_err(|error| CowshedError::internal(error.to_string()))?
@@ -144,6 +136,218 @@ impl NativeProjectRuntimeHost {
         // replay does, so the gate's lease ends here.
         drop(supervisor);
         self.resume_re_adopt(source).await
+    }
+
+    /// Everything a missing main's re-adoption records before its first mutation
+    /// (02_workspaces.md, "Missing main image"). The plain checkout at main's path is the copy
+    /// input; main's completed re-adoption journal is the only authority left for main's
+    /// metadata and its build volume, whose image is gone with main's.
+    async fn record_missing_main(
+        &self,
+        options: &AdoptOptions,
+        checkout: &Path,
+    ) -> Result<ReAdoptSource> {
+        let main = main_name();
+        let inspect = |path: &Path, error: std::io::Error| {
+            CowshedError::environment_missing(
+                format!("cannot inspect {}: {error}", path.display()),
+                "cowshed doctor --json",
+            )
+        };
+        if super::is_mount_point(checkout).map_err(|error| inspect(checkout, error))? {
+            return Err(CowshedError::conflict(
+                format!(
+                    "main's image is missing, but a volume is mounted at {}",
+                    checkout.display()
+                ),
+                "unmount it, leaving main's plain Git checkout at that path, then retry",
+            ));
+        }
+        let git = crate::git::GitRepository::discover(checkout).await?;
+        let root = std::fs::canonicalize(git.root()).map_err(|error| inspect(git.root(), error))?;
+        let named = std::fs::canonicalize(checkout).map_err(|error| inspect(checkout, error))?;
+        require_checkout_of(
+            &root,
+            &named,
+            &git.remotes().await?,
+            &self.descriptor.repo_id,
+        )?;
+        let canonical = self
+            .layout
+            .canonical_image(&main)
+            .map_err(native_integrity_error)?
+            .image()
+            .to_owned();
+        for path in [
+            canonical.clone(),
+            crate::metadata::sidecar_path(&canonical),
+            crate::metadata::append_suffix(&canonical, COMPANION_SUFFIX),
+        ] {
+            if present(&path)? {
+                return Err(CowshedError::integrity(
+                    format!("main's image is missing, but {} remains", path.display()),
+                    "cowshed doctor --json",
+                ));
+            }
+        }
+        let authority = self.lifecycle_intents.get(&main).and_then(|record| {
+            match (&record.operation, &record.completion) {
+                (
+                    LifecycleIntent::ReAdopt { source, .. },
+                    Some(LifecycleIntentCompletion::Workspace(published)),
+                ) if *published == source.replacement && source.checkout == checkout => {
+                    Some(source.as_ref())
+                }
+                _ => None,
+            }
+        });
+        let Some(completed) = authority else {
+            return Err(CowshedError::integrity(
+                format!(
+                    "main's image is missing, and no completed re-adoption of main at {} records \
+                     its metadata and build volume",
+                    checkout.display()
+                ),
+                "cowshed doctor --json",
+            ));
+        };
+        completed.validate()?;
+        // The lost main is the incarnation that completed re-adoption published.
+        let mut metadata = completed.metadata.clone();
+        metadata.workspace_incarnation = completed.replacement.clone();
+        let layout = self.build_volume_layout()?;
+        // Main's build volume is the project's one build record owned by `Linked main`, whatever
+        // its id: an image of its own, it outlives main's image, and every land gives main a new
+        // one. Only when none survives is one published empty under the recorded id.
+        let build = match linked_main_volumes(&layout)?.as_slice() {
+            [] => match published_build(completed) {
+                None => None,
+                Some((id, record, capacity_bytes)) => {
+                    for path in [layout.image(&id), layout.record(&id)] {
+                        if present(&path)? {
+                            return Err(CowshedError::conflict(
+                                format!(
+                                    "main's build volume {} is not missing: {} remains; a missing \
+                                     main's re-adoption publishes only a missing build volume",
+                                    id.as_str(),
+                                    path.display()
+                                ),
+                                "cowshed doctor --json",
+                            ));
+                        }
+                    }
+                    Some(MissingMainBuild::Empty(ReAdoptEmptyBuild {
+                        id,
+                        record: crate::build_volume::BuildVolumeRecord {
+                            tree: None,
+                            ..record
+                        },
+                        capacity_bytes,
+                    }))
+                }
+            },
+            [(kept, record)] => {
+                // A volume census of a directory that is no mount point would name every
+                // process on the volume holding it, so only a mounted volume is censused.
+                let mount = layout.mount(kept);
+                if super::is_mount_point(&mount).map_err(|error| inspect(&mount, error))? {
+                    let holders =
+                        crate::build_volume::nx::volume_holders(&mount).map_err(|error| {
+                            CowshedError::environment_missing(
+                                format!("cannot list what holds {}: {error}", mount.display()),
+                                "cowshed doctor --json",
+                            )
+                        })?;
+                    refuse_held(&mount, &holders)?;
+                }
+                Some(MissingMainBuild::Kept(ReAdoptKeptBuild {
+                    kept: kept.clone(),
+                    record: record.clone(),
+                }))
+            }
+            several => {
+                return Err(CowshedError::integrity(
+                    format!(
+                        "main's image is missing, and build volumes {} each record `Linked main`; \
+                         main has one build volume",
+                        several
+                            .iter()
+                            .map(|(id, _)| id.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                    "cowshed doctor --json",
+                ));
+            }
+        };
+        if let Some(build) = &build
+            && let Some(linked) = layout.linked(checkout)?
+            && &linked != build.id()
+        {
+            return Err(CowshedError::conflict(
+                format!(
+                    "{} links build volume {}, not main's {}",
+                    checkout.display(),
+                    linked.as_str(),
+                    build.id().as_str()
+                ),
+                "remove that build link, then retry",
+            ));
+        }
+        let capacity_bytes = match options.capacity.as_deref() {
+            Some(requested) => super::parse_capacity(requested)?.bytes(),
+            None => main_capacity(completed),
+        };
+        let replacement = {
+            use crate::storage::apfs::IncarnationSource as _;
+            crate::storage::apfs::UuidIncarnationSource
+                .mint()
+                .map_err(native_storage_error)?
+        };
+        let preserved = crate::storage::recovery::preserved_checkout(checkout, &replacement)
+            .ok_or_else(|| {
+                CowshedError::usage(
+                    format!("checkout {} has no name", checkout.display()),
+                    "re-adopt main at its named checkout",
+                )
+            })?;
+        let retained = self.layout.project().project_root.join(RETAINED_NAMESPACE);
+        let old_seeds = old_seeds(
+            build_inputs(layout.images())?,
+            &metadata.workspace_incarnation,
+            &retained,
+        )?;
+        // Step 1: the plain checkout is the copy source, so nothing may hold it while its state
+        // is recorded and copied; nothing is ended to make it so.
+        refuse_tree_held(checkout)?;
+        // Main's volume root holds cowshed's runtime state and macOS's bookkeeping, which main's
+        // excludes hide. The checkout takes them now, so its Git state verifies against its copy.
+        git.ensure_cowshed_excludes().await?;
+        // The plain checkout links main's build volume before its Git state is recorded, so its
+        // copy carries that link and main's first touch keeps the id. A kept volume is main's
+        // already; an empty one is published under the recorded id once main is.
+        if let Some(build) = &build {
+            let (linked, mount) = (checkout.to_owned(), layout.mount(build.id()));
+            crate::storage::lifecycle::dispatch_blocking(move || {
+                crate::build_volume::link::point(&linked, &mount)
+            })
+            .await
+            .map_err(|error| CowshedError::internal(error.to_string()))??;
+        }
+        Ok(ReAdoptSource {
+            checkout: checkout.to_owned(),
+            main: ReAdoptMain::Missing(ReAdoptMissingMain {
+                canonical,
+                preserved,
+                capacity_bytes,
+                build,
+            }),
+            metadata,
+            replacement,
+            git_before: capture_git(checkout).await?,
+            build: None,
+            old_seeds,
+        })
     }
 
     /// Everything step 1 records: exact paths, kernel capacities, the Git state and the build
@@ -227,44 +431,11 @@ impl NativeProjectRuntimeHost {
             }
             None => None,
         };
-        let mut old_seeds = Vec::new();
-        for (id, original) in inputs {
-            // An image with no record yet is an interrupted creation, never a seed.
-            if read_build_record_present(&original)?
-                .is_some_and(|record| record.is_seed_of(&WorkspaceName::main(), &old))
-            {
-                old_seeds.push(ReAdoptRetained {
-                    retained: retained_beside(
-                        &retained,
-                        &format!("seed-{}", id.as_str()),
-                        &original,
-                    ),
-                    original,
-                });
-            }
-        }
-        let git_before = {
-            let checkout = checkout.to_owned();
-            crate::storage::lifecycle::dispatch_blocking(move || {
-                crate::git_preservation::capture(&checkout, &checkout)
-            })
-            .await
-            .map_err(|error| CowshedError::internal(error.to_string()))??
-        };
-        // A source whose own repository fails fsck has nothing a verified copy could preserve:
-        // refuse before anything is recorded or detached.
-        if !git_before.fsck_succeeded() {
-            return Err(CowshedError::integrity(
-                format!(
-                    "git fsck fails in {}; re-adoption copies a repository only as it verifies",
-                    checkout.display()
-                ),
-                "repair the repository, then retry",
-            ));
-        }
+        let old_seeds = old_seeds(inputs, &old, &retained)?;
+        let git_before = capture_git(checkout).await?;
         Ok(ReAdoptSource {
             checkout: checkout.to_owned(),
-            image: ReAdoptImage {
+            main: ReAdoptMain::Retained(ReAdoptImage {
                 retained: retained_beside(
                     &retained,
                     &format!("main-{}", old.as_str()),
@@ -273,7 +444,7 @@ impl NativeProjectRuntimeHost {
                 original: main_image,
                 source_mount: staging.join(format!("readopt-{}-main", old.as_str())),
                 capacity_bytes: main_capacity,
-            },
+            }),
             metadata: replaced.metadata.clone(),
             replacement,
             git_before,
@@ -343,16 +514,24 @@ impl NativeProjectRuntimeHost {
             Err(error) if error.code == ErrorCode::NotFound => None,
             Err(error) => return Err(error),
         };
+        // Until the handoff swaps it aside, a missing main's copy source is the user's live
+        // checkout. A commit or a fetch made after an earlier attempt refused must not wedge
+        // every replay against the Git state that attempt recorded, so an unpublished replay
+        // proves the checkout unheld and records its state again before copying it.
+        let rerecord = published.is_none()
+            && match &source.main {
+                ReAdoptMain::Missing(missing) => !present(&missing.preserved)?,
+                ReAdoptMain::Retained(_) => false,
+            };
+        let source = if rerecord {
+            std::sync::Arc::new(self.rerecord_missing_main_git(&source).await?)
+        } else {
+            source
+        };
         let workspace = match published {
             Some(current) => {
                 self.substrate
-                    .finish_adoption(
-                        &current.derived.workspace,
-                        &crate::storage::lifecycle::AdoptHandoff::Replacement {
-                            copy_source: source.image.source_mount.clone(),
-                            incarnation: source.replacement.clone(),
-                        },
-                    )
+                    .finish_adoption(&current.derived.workspace, &handoff(&source))
                     .await
                     .map_err(native_storage_error)?;
                 current.derived.workspace
@@ -365,13 +544,14 @@ impl NativeProjectRuntimeHost {
         // The replacement's build volume takes main's build identity, under main's lock. The
         // build claim moves into that publication and is released when its closure returns,
         // still under main's image lock: until then it keeps every new job hold on the recorded
-        // old build volume out, and the lock is released only after the claim is gone. No build
-        // volume means no claim and nothing to publish, so the publication is skipped.
-        if let Some(build_claim) = build_claim {
+        // old build volume out, and the lock is released only after the claim is gone. A missing
+        // main records no source build and so holds no claim; its recorded build volume is
+        // published empty.
+        {
             let source = source.clone();
             self.substrate
                 .dispatch_on_host_with_image_lock(lock.clone(), move |host| {
-                    host.publish_re_adopt_build(&layout, &source, &build_claim)
+                    host.publish_re_adopt_build(&layout, &source, build_claim.as_ref())
                 })
                 .await
                 .map_err(native_storage_error)?;
@@ -395,7 +575,7 @@ impl NativeProjectRuntimeHost {
                     &source.checkout,
                     &source.checkout,
                     &source.git_before,
-                    &source.image.source_mount,
+                    published_source(&source),
                 )
             })
             .await
@@ -423,7 +603,7 @@ impl NativeProjectRuntimeHost {
         }
         eprintln!(
             "cowshed: once you have checked the replacement, removing exactly those paths returns \
-             their space: rm -- {}",
+             their space: rm -R -- {}",
             retained
                 .iter()
                 .map(|path| path.display().to_string())
@@ -431,6 +611,23 @@ impl NativeProjectRuntimeHost {
                 .join(" ")
         );
         Ok(snapshot)
+    }
+
+    /// The recorded missing-main re-adoption `source`, its plain checkout first proved unheld and
+    /// its Git state captured again (02_workspaces.md, "Missing main image"). An unchanged state
+    /// writes nothing; a changed one replaces only the recorded `git_before`, under the journal's
+    /// lock and only while the record is still exactly `source`.
+    async fn rerecord_missing_main_git(&mut self, source: &ReAdoptSource) -> Result<ReAdoptSource> {
+        refuse_tree_held(&source.checkout)?;
+        let git_before = capture_git(&source.checkout).await?;
+        if git_before == source.git_before {
+            return Ok(source.clone());
+        }
+        let expected = source.clone();
+        self.update_lifecycle_intents(move |journal| {
+            journal.rerecord_missing_main_git(&expected, git_before)
+        })
+        .await
     }
 
     /// Steps 2-4: retain the replaced inputs under main's lock, copy the build volume, then run
@@ -444,16 +641,17 @@ impl NativeProjectRuntimeHost {
         let main = main_name();
         // A RAW main's own supervisor is retired again here, as on a replay; a legacy main's is
         // never stopped by this build, and the retention's unforced unmount refuses, naming its
-        // processes, while anything of it still works in the volume.
-        let legacy = source
-            .image
-            .original
-            .extension()
-            .is_none_or(|extension| extension != IMAGE_EXTENSION);
-        let _supervisor = if legacy {
-            None
-        } else {
-            Some(self.stop_supervisor(&main).await?)
+        // processes, while anything of it still works in the volume. A missing main has none.
+        let _supervisor = match &source.main {
+            ReAdoptMain::Retained(image)
+                if image
+                    .original
+                    .extension()
+                    .is_some_and(|extension| extension == IMAGE_EXTENSION) =>
+            {
+                Some(self.stop_supervisor(&main).await?)
+            }
+            ReAdoptMain::Retained(_) | ReAdoptMain::Missing(_) => None,
         };
         {
             let source = source.clone();
@@ -481,13 +679,10 @@ impl NativeProjectRuntimeHost {
             .substrate
             .plan_adopt(crate::storage::lifecycle::AdoptRequest {
                 repo: self.descriptor.repo_id.clone(),
-                capacity: crate::metadata::ImageCapacity::from_bytes(source.image.capacity_bytes),
+                capacity: crate::metadata::ImageCapacity::from_bytes(main_capacity(&source)),
                 topology_revision: crate::storage::lifecycle::Revision::new(0),
                 source_checkout: source.checkout.clone(),
-                handoff: crate::storage::lifecycle::AdoptHandoff::Replacement {
-                    copy_source: source.image.source_mount.clone(),
-                    incarnation: source.replacement.clone(),
-                },
+                handoff: handoff(&source),
                 identity,
             })
             .map_err(native_integrity_error)?;
@@ -513,19 +708,21 @@ impl NativeProjectRuntimeHost {
                             &stage.mount_point,
                             &evidence.checkout,
                             &evidence.git_before,
-                            &evidence.image.source_mount,
+                            staged_source(&evidence),
                         )?;
-                        let (new, old) = host
-                            .require_sparse_replacement(
-                                &replacement,
-                                &evidence.image.retained,
-                                evidence.image.capacity_bytes,
-                            )
-                            .map_err(native_storage_error)?;
-                        eprintln!(
-                            "cowshed: re-adoption replacement allocates {new} bytes; the retained \
-                             image {old}"
-                        );
+                        if let ReAdoptMain::Retained(image) = &evidence.main {
+                            let (new, old) = host
+                                .require_sparse_replacement(
+                                    &replacement,
+                                    &image.retained,
+                                    image.capacity_bytes,
+                                )
+                                .map_err(native_storage_error)?;
+                            eprintln!(
+                                "cowshed: re-adoption replacement allocates {new} bytes; the \
+                                 retained image {old}"
+                            );
+                        }
                         Ok::<(), CowshedError>(())
                     })
                     .await
@@ -540,8 +737,8 @@ impl NativeProjectRuntimeHost {
     /// The main a re-adoption replaces: the RAW main the store enumerates, or else a main left in
     /// a format this runtime no longer enumerates, read from its own sidecar only here, for its
     /// explicit replacement (02_workspaces.md, "Re-adoption": existing ASIF images are retained
-    /// inputs to this transaction). Either must be mounted at the checkout.
-    async fn replaced_main(&self, checkout: &Path) -> Result<ReplacedMain> {
+    /// inputs to this transaction). Either must be mounted at the checkout. `None` when main has no image at all.
+    async fn replaced_main(&self, checkout: &Path) -> Result<Option<ReplacedMain>> {
         let replaced = match self.current(&main_name()).await {
             Ok(current) => ReplacedMain {
                 mounted: matches!(
@@ -552,9 +749,9 @@ impl NativeProjectRuntimeHost {
                 metadata: current.metadata,
                 legacy: false,
             },
-            Err(error) if error.code == ErrorCode::NotFound => {
+            Err(missing) if missing.code == ErrorCode::NotFound => {
                 let Some(image) = self.legacy_main_image()? else {
-                    return Err(error);
+                    return Ok(None);
                 };
                 // Explicit transition input only: strict deserialization still validates the
                 // sidecar schema, grants and role. Ordinary RAW path validation stays intact.
@@ -595,7 +792,7 @@ impl NativeProjectRuntimeHost {
                 "mount main at its checkout, then retry",
             ));
         }
-        Ok(replaced)
+        Ok(Some(replaced))
     }
 
     /// Main's image in a format this runtime does not enumerate, if the project directory holds
@@ -635,12 +832,14 @@ struct ReplacedMain {
 /// may remove once the replacement is checked.
 fn retained_paths(source: &ReAdoptSource) -> Vec<PathBuf> {
     use crate::metadata::append_suffix;
-    let main = &source.image.retained;
-    let mut paths = vec![
-        main.clone(),
-        append_suffix(main, crate::metadata::GRANTS_SIDECAR_SUFFIX),
-        append_suffix(main, ".ca.key"),
-    ];
+    let mut paths = match &source.main {
+        ReAdoptMain::Retained(image) => vec![
+            image.retained.clone(),
+            append_suffix(&image.retained, crate::metadata::GRANTS_SIDECAR_SUFFIX),
+            append_suffix(&image.retained, COMPANION_SUFFIX),
+        ],
+        ReAdoptMain::Missing(missing) => vec![missing.preserved.clone()],
+    };
     let built = source
         .build
         .iter()
@@ -651,6 +850,240 @@ fn retained_paths(source: &ReAdoptSource) -> Vec<PathBuf> {
         paths.push(append_suffix(image, crate::build_volume::RECORD_SUFFIX));
     }
     paths
+}
+
+/// Refuse outright when this shell's working directory is inside `checkout`, which the
+/// re-adoption replaces (02_workspaces.md, "Re-adoption" step 1).
+fn require_outside(checkout: &Path) -> Result<()> {
+    let cwd = std::env::current_dir().map_err(|error| {
+        CowshedError::environment_missing(
+            format!("cannot read the working directory: {error}"),
+            "retry from an existing directory",
+        )
+    })?;
+    if cwd.starts_with(checkout) {
+        return Err(CowshedError::usage(
+            format!(
+                "re-adoption replaces the volume at {}, which this shell's working directory is inside",
+                checkout.display()
+            ),
+            format!("cd out of {} and retry", checkout.display()),
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse a plain checkout unless `root`, its repository's root, is `checkout` itself and one
+/// of its remotes names `repo`: a missing main is re-adopted only from a checkout of its own
+/// repository (02_workspaces.md, "Missing main image"). Both paths arrive canonical.
+/// Refuse when anything holds `path`, naming each holder by PID and command (02_workspaces.md,
+/// "Re-adoption" step 1). Nothing is stopped, killed or forced.
+fn refuse_held(path: &Path, holders: &[crate::build_volume::nx::Holder]) -> Result<()> {
+    if holders.is_empty() {
+        return Ok(());
+    }
+    let named = holders
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(CowshedError::conflict(
+        format!(
+            "{} is in use by {named}; no running job or user process was stopped and nothing was \
+             forced",
+            path.display()
+        ),
+        "close those processes, then retry",
+    ))
+}
+
+/// Refuse when anything holds a file, a working directory or an executable inside the plain
+/// checkout tree at `checkout`, a missing main's copy source.
+fn refuse_tree_held(checkout: &Path) -> Result<()> {
+    let holders = crate::build_volume::nx::tree_holders(checkout).map_err(|error| {
+        CowshedError::environment_missing(
+            format!("cannot list what holds {}: {error}", checkout.display()),
+            "cowshed doctor --json",
+        )
+    })?;
+    refuse_held(checkout, &holders)
+}
+
+/// Every published build volume whose record names `Linked main`, with that record: main's
+/// build volume, whatever its id (02_workspaces.md, "Missing main image").
+fn linked_main_volumes(
+    layout: &crate::build_volume::BuildVolumeLayout,
+) -> Result<Vec<(BuildVolumeId, crate::build_volume::BuildVolumeRecord)>> {
+    let mut found = Vec::new();
+    for id in layout.list()? {
+        if let Some(record) = layout.read_record_present(&id)?
+            && matches!(
+                &record.role,
+                crate::build_volume::BuildVolumeRole::Linked { checkout } if checkout.is_main()
+            )
+        {
+            found.push((id, record));
+        }
+    }
+    Ok(found)
+}
+
+fn require_checkout_of(
+    root: &Path,
+    checkout: &Path,
+    remotes: &[crate::git::RemoteUrl],
+    repo: &crate::repository::RepoId,
+) -> Result<()> {
+    if root != checkout {
+        return Err(CowshedError::conflict(
+            format!(
+                "{} is not the root of a Git checkout; its repository root is {}",
+                checkout.display(),
+                root.display()
+            ),
+            "restore main's plain Git checkout at that path, then retry",
+        ));
+    }
+    let names_repo = remotes.iter().any(|remote| {
+        matches!(
+            remote.url.to_str().map(crate::repository::normalize_remote_url),
+            Some(Ok(derived)) if derived == *repo
+        )
+    });
+    if !names_repo {
+        return Err(CowshedError::conflict(
+            format!(
+                "no remote of {} names {repo}; a missing main is re-adopted only from a checkout \
+                 of its own repository",
+                checkout.display()
+            ),
+            "re-adopt from a checkout of that repository",
+        ));
+    }
+    Ok(())
+}
+
+/// Whether anything is at `path`, read without following a link.
+fn present(path: &Path) -> Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(CowshedError::environment_missing(
+            format!("cannot inspect {}: {error}", path.display()),
+            "check controller storage permissions and retry",
+        )),
+    }
+}
+
+/// The Git state of `checkout` while it is quiet. A source whose own repository fails fsck has
+/// nothing a verified copy could preserve: refuse before anything is recorded or detached.
+async fn capture_git(checkout: &Path) -> Result<crate::git_preservation::GitPreservationSnapshot> {
+    let captured = {
+        let checkout = checkout.to_owned();
+        crate::storage::lifecycle::dispatch_blocking(move || {
+            crate::git_preservation::capture(&checkout, &checkout)
+        })
+        .await
+        .map_err(|error| CowshedError::internal(error.to_string()))??
+    };
+    if !captured.fsck_succeeded() {
+        return Err(CowshedError::integrity(
+            format!(
+                "git fsck fails in {}; re-adoption copies a repository only as it verifies",
+                checkout.display()
+            ),
+            "repair the repository, then retry",
+        ));
+    }
+    Ok(captured)
+}
+
+/// Every image in `inputs` recorded as a seed of main's `old` incarnation, with the retained
+/// path it moves to. An image with no record yet is an interrupted creation, never a seed.
+fn old_seeds(
+    inputs: Vec<(BuildVolumeId, PathBuf)>,
+    old: &crate::metadata::WorkspaceIncarnation,
+    retained: &Path,
+) -> Result<Vec<ReAdoptRetained>> {
+    let mut seeds = Vec::new();
+    for (id, original) in inputs {
+        if read_build_record_present(&original)?
+            .is_some_and(|record| record.is_seed_of(&WorkspaceName::main(), old))
+        {
+            seeds.push(ReAdoptRetained {
+                retained: retained_beside(retained, &format!("seed-{}", id.as_str()), &original),
+                original,
+            });
+        }
+    }
+    Ok(seeds)
+}
+
+/// Main's image capacity as `source` records it.
+fn main_capacity(source: &ReAdoptSource) -> u64 {
+    match &source.main {
+        ReAdoptMain::Retained(image) => image.capacity_bytes,
+        ReAdoptMain::Missing(missing) => missing.capacity_bytes,
+    }
+}
+
+/// Main's build volume as `source` publishes it: its id, owner record and capacity.
+fn published_build(
+    source: &ReAdoptSource,
+) -> Option<(BuildVolumeId, crate::build_volume::BuildVolumeRecord, u64)> {
+    match &source.main {
+        ReAdoptMain::Retained(_) => source.build.as_ref().map(|build| {
+            (
+                build.id.clone(),
+                build.owner_record.clone(),
+                build.image.capacity_bytes,
+            )
+        }),
+        ReAdoptMain::Missing(missing) => missing.build.as_ref().map(|build| match build {
+            MissingMainBuild::Empty(build) => {
+                (build.id.clone(), build.record.clone(), build.capacity_bytes)
+            }
+            // A kept volume's capacity was never recorded: it was not minted here. Should it be
+            // lost too, its replacement takes a fresh build volume's default capacity.
+            MissingMainBuild::Kept(build) => (
+                build.kept.clone(),
+                build.record.clone(),
+                crate::build_volume::DEFAULT_BUILD_VOLUME_CAPACITY.bytes(),
+            ),
+        }),
+    }
+}
+
+/// The handoff a re-adoption publishes through: a retained main's copy comes from its staging
+/// mount onto the emptied checkout; a missing main's plain checkout moves to its preserved
+/// sibling.
+fn handoff(source: &ReAdoptSource) -> AdoptHandoff {
+    match &source.main {
+        ReAdoptMain::Retained(image) => AdoptHandoff::Replacement {
+            copy_source: image.source_mount.clone(),
+            incarnation: source.replacement.clone(),
+        },
+        ReAdoptMain::Missing(missing) => AdoptHandoff::PlainReplacement {
+            preserved: missing.preserved.clone(),
+            incarnation: source.replacement.clone(),
+        },
+    }
+}
+
+/// The tree the staged copy is read from and verified against before publication.
+fn staged_source(source: &ReAdoptSource) -> &Path {
+    match &source.main {
+        ReAdoptMain::Retained(image) => &image.source_mount,
+        ReAdoptMain::Missing(_) => &source.checkout,
+    }
+}
+
+/// The tree the published replacement is verified against after its handoff.
+fn published_source(source: &ReAdoptSource) -> &Path {
+    match &source.main {
+        ReAdoptMain::Retained(image) => &image.source_mount,
+        ReAdoptMain::Missing(missing) => &missing.preserved,
+    }
 }
 
 /// Every build volume image in `images`, RAW or written before RAW, with the identity its file
@@ -733,5 +1166,54 @@ fn retained_beside(retained: &Path, stem: &str, original: &Path) -> PathBuf {
     match original.extension() {
         Some(extension) => path.with_extension(extension),
         None => path,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::{Path, PathBuf};
+
+    use super::require_checkout_of;
+    use crate::error::ErrorCode;
+    use crate::git::RemoteUrl;
+    use crate::repository::RepoId;
+
+    fn remote(name: &str, url: &str) -> RemoteUrl {
+        RemoteUrl {
+            name: name.to_owned(),
+            url: PathBuf::from(url),
+        }
+    }
+
+    /// 02_workspaces.md, "Missing main image": a missing main is re-adopted only from the root
+    /// of a checkout one of whose remotes names the project's repository.
+    #[test]
+    fn a_missing_main_is_re_adopted_only_from_a_checkout_of_its_own_repository() {
+        let repo = RepoId::parse("acme.sc/widget").expect("repository identity");
+        let checkout = Path::new("/work/widget");
+        let own = [
+            remote("github", "https://github.com/former/widget.git"),
+            remote("origin", "ssh://git@forge.example:2223/acme.sc/widget.git"),
+        ];
+        require_checkout_of(checkout, checkout, &own, &repo)
+            .expect("a remote names the repository");
+
+        let foreign = [remote("origin", "https://github.com/other/widget.git")];
+        let refused = require_checkout_of(checkout, checkout, &foreign, &repo)
+            .expect_err("no remote names the repository");
+        assert_eq!(refused.code, ErrorCode::Conflict);
+        assert!(
+            refused.message.contains("acme.sc/widget"),
+            "{}",
+            refused.message
+        );
+
+        let unremoted = require_checkout_of(checkout, checkout, &[], &repo)
+            .expect_err("a checkout without remotes names nothing");
+        assert_eq!(unremoted.code, ErrorCode::Conflict);
+
+        let nested = require_checkout_of(Path::new("/work"), checkout, &own, &repo)
+            .expect_err("a directory inside another repository is not a checkout root");
+        assert_eq!(nested.code, ErrorCode::Conflict);
     }
 }

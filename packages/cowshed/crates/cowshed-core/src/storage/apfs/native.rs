@@ -3993,6 +3993,108 @@ where
         }
         Ok(())
     }
+
+    /// The one atomic swap behind every handoff of a checkout to main's mountpoint: the checkout
+    /// path goes from the user's tree to an empty mountpoint, and the displaced tree is renamed to
+    /// `retained`. Each caller validates its own handoff name first. Converges from whatever an
+    /// interrupted attempt left on disk, and never moves an already-mounted replacement.
+    fn vacate_checkout_to(
+        &self,
+        source_checkout: &Path,
+        retained: &Path,
+    ) -> Result<(), PublicationError> {
+        let staging = checkout_mountpoint_staging_path(source_checkout);
+
+        // A Git checkout cannot be empty. Resume an empty mountpoint only when its displaced
+        // nonempty tree exists at a handoff name; an unrelated empty directory proves nothing.
+        let already_swapped = self
+            .mount_source
+            .mounts()
+            .map_err(PublicationError::rolled_back)?
+            .iter()
+            .any(|mount| mount.mount_point == source_checkout)
+            || (empty_mountpoint(source_checkout).map_err(PublicationError::rolled_back)?
+                && [staging.as_path(), retained]
+                    .into_iter()
+                    .try_fold(false, |found, path| {
+                        Ok::<_, ApfsStorageError>(
+                            found || (path_exists(path)? && !empty_mountpoint(path)?),
+                        )
+                    })
+                    .map_err(PublicationError::rolled_back)?);
+        if already_swapped {
+            if !path_exists(&staging).map_err(PublicationError::forward_only)? {
+                return Ok(());
+            }
+            if path_exists(retained).map_err(PublicationError::forward_only)? {
+                return Err(PublicationError::forward_only(
+                    ApfsStorageError::InvalidPlan(
+                        "displaced adopted checkout and retained tree both exist",
+                    ),
+                ));
+            }
+            return fs::rename(&staging, retained)
+                .map_err(|error| io_error("retain displaced checkout", retained, error))
+                .and_then(|()| sync_parent_path(retained))
+                .map_err(PublicationError::forward_only);
+        }
+
+        let metadata = fs::symlink_metadata(source_checkout).map_err(|error| {
+            PublicationError::rolled_back(io_error(
+                "inspect adopted checkout",
+                source_checkout,
+                error,
+            ))
+        })?;
+        if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+            return Err(PublicationError::rolled_back(
+                ApfsStorageError::InvalidPlan("adopted checkout is not the original directory"),
+            ));
+        }
+        if path_exists(retained).map_err(PublicationError::rolled_back)? {
+            return Err(PublicationError::rolled_back(
+                ApfsStorageError::InvalidPlan("retained checkout already exists"),
+            ));
+        }
+        remove_checkout_staging_mountpoint(&staging).map_err(PublicationError::rolled_back)?;
+        self.ensure_adopt_mountpoint(&staging)
+            .map_err(PublicationError::rolled_back)?;
+
+        // The one step that changes what the user sees, and the same primitive the symlink layout
+        // uses: `renameatx_np(RENAME_SWAP)` exchanges the original directory with the staged
+        // mountpoint atomically, so the checkout path goes straight from the user's tree to an
+        // empty mountpoint — never absent, never a half-built directory.
+        if let Err(primary) = swap_paths(source_checkout, &staging) {
+            return Err(match remove_checkout_staging_mountpoint(&staging) {
+                Ok(()) => PublicationError::rolled_back(primary),
+                Err(cleanup) => PublicationError::forward_only(ApfsStorageError::Cleanup {
+                    operation: "remove staged adopted mountpoint",
+                    primary: Box::new(primary),
+                    cleanup: Box::new(cleanup),
+                }),
+            });
+        }
+
+        // The original tree now sits at the staging name; give it the retained name.
+        match fs::rename(&staging, retained)
+            .map_err(|error| io_error("retain displaced checkout", retained, error))
+            .and_then(|()| sync_parent_path(retained))
+        {
+            Ok(()) => Ok(()),
+            Err(primary) => {
+                let cleanup = swap_paths(source_checkout, &staging)
+                    .and_then(|()| remove_checkout_staging_mountpoint(&staging));
+                Err(match cleanup {
+                    Ok(()) => PublicationError::rolled_back(primary),
+                    Err(cleanup) => PublicationError::forward_only(ApfsStorageError::Cleanup {
+                        operation: "restore adopted checkout after failed retention",
+                        primary: Box::new(primary),
+                        cleanup: Box::new(cleanup),
+                    }),
+                })
+            }
+        }
+    }
 }
 
 impl<R> ApfsExecutionHost for MacOsApfsExecutionHost<R>
@@ -4902,97 +5004,25 @@ where
                 ApfsStorageError::InvalidPlan("invalid adopt checkout or pre-cowshed handoff"),
             ));
         }
-        let staging = checkout_mountpoint_staging_path(source_checkout);
+        self.vacate_checkout_to(source_checkout, pre_cowshed_checkout)
+    }
 
-        // A Git checkout cannot be empty. Resume an empty mountpoint only when its displaced
-        // nonempty tree exists at a handoff name; an unrelated empty directory proves nothing.
-        let already_swapped = self
-            .mount_source
-            .mounts()
-            .map_err(PublicationError::rolled_back)?
-            .iter()
-            .any(|mount| mount.mount_point == source_checkout)
-            || (empty_mountpoint(source_checkout).map_err(PublicationError::rolled_back)?
-                && [staging.as_path(), pre_cowshed_checkout]
-                    .into_iter()
-                    .try_fold(false, |found, path| {
-                        Ok::<_, ApfsStorageError>(
-                            found || (path_exists(path)? && !empty_mountpoint(path)?),
-                        )
-                    })
-                    .map_err(PublicationError::rolled_back)?);
-        if already_swapped {
-            if !path_exists(&staging).map_err(PublicationError::forward_only)? {
-                return Ok(());
-            }
-            if path_exists(pre_cowshed_checkout).map_err(PublicationError::forward_only)? {
-                return Err(PublicationError::forward_only(
-                    ApfsStorageError::InvalidPlan(
-                        "displaced adopted checkout and retained pre-cowshed tree both exist",
-                    ),
-                ));
-            }
-            return fs::rename(&staging, pre_cowshed_checkout)
-                .map_err(|error| io_error("retain displaced checkout", pre_cowshed_checkout, error))
-                .and_then(|()| sync_parent_path(pre_cowshed_checkout))
-                .map_err(PublicationError::forward_only);
-        }
-
-        let metadata = fs::symlink_metadata(source_checkout).map_err(|error| {
-            PublicationError::rolled_back(io_error(
-                "inspect adopted checkout",
-                source_checkout,
-                error,
-            ))
-        })?;
-        if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
-            return Err(PublicationError::rolled_back(
-                ApfsStorageError::InvalidPlan("adopted checkout is not the original directory"),
-            ));
-        }
-        if path_exists(pre_cowshed_checkout).map_err(PublicationError::rolled_back)? {
-            return Err(PublicationError::rolled_back(
-                ApfsStorageError::InvalidPlan("pre-cowshed checkout already exists"),
-            ));
-        }
-        remove_checkout_staging_mountpoint(&staging).map_err(PublicationError::rolled_back)?;
-        self.ensure_adopt_mountpoint(&staging)
-            .map_err(PublicationError::rolled_back)?;
-
-        // The one step that changes what the user sees, and the same primitive the symlink layout
-        // uses: `renameatx_np(RENAME_SWAP)` exchanges the original directory with the staged
-        // mountpoint atomically, so the checkout path goes straight from the user's tree to an
-        // empty mountpoint — never absent, never a half-built directory.
-        if let Err(primary) = swap_paths(source_checkout, &staging) {
-            return Err(match remove_checkout_staging_mountpoint(&staging) {
-                Ok(()) => PublicationError::rolled_back(primary),
-                Err(cleanup) => PublicationError::forward_only(ApfsStorageError::Cleanup {
-                    operation: "remove staged adopted mountpoint",
-                    primary: Box::new(primary),
-                    cleanup: Box::new(cleanup),
-                }),
-            });
-        }
-
-        // The original tree now sits at the staging name; give it the retained name.
-        match fs::rename(&staging, pre_cowshed_checkout)
-            .map_err(|error| io_error("retain displaced checkout", pre_cowshed_checkout, error))
-            .and_then(|()| sync_parent_path(pre_cowshed_checkout))
+    fn vacate_plain_checkout(
+        &self,
+        checkout: &Path,
+        preserved: &Path,
+    ) -> Result<(), PublicationError> {
+        if !checkout.is_absolute()
+            || !preserved.is_absolute()
+            || preserved == checkout
+            || preserved == pre_cowshed_path(checkout)
+            || preserved.parent() != checkout.parent()
         {
-            Ok(()) => Ok(()),
-            Err(primary) => {
-                let cleanup = swap_paths(source_checkout, &staging)
-                    .and_then(|()| remove_checkout_staging_mountpoint(&staging));
-                Err(match cleanup {
-                    Ok(()) => PublicationError::rolled_back(primary),
-                    Err(cleanup) => PublicationError::forward_only(ApfsStorageError::Cleanup {
-                        operation: "restore adopted checkout after failed retention",
-                        primary: Box::new(primary),
-                        cleanup: Box::new(cleanup),
-                    }),
-                })
-            }
+            return Err(PublicationError::rolled_back(
+                ApfsStorageError::InvalidPlan("invalid plain checkout or preserved handoff"),
+            ));
         }
+        self.vacate_checkout_to(checkout, preserved)
     }
 
     fn require_vacant_checkout(&self, checkout: &Path) -> Result<(), ApfsStorageError> {
@@ -6817,7 +6847,8 @@ mod tests {
         for mount in source.staging_mounts() {
             fs::create_dir_all(mount).unwrap();
         }
-        let retained = &source.image.retained;
+        let image = fixture.main_image();
+        let retained = &image.retained;
         fs::create_dir_all(retained.parent().unwrap()).unwrap();
         fs::write(retained, b"retained source evidence").unwrap();
         let config = ApfsSubstrateConfig::new(fixture.store(), &fixture.checkout);
@@ -6985,7 +7016,7 @@ mod tests {
         for (label, grants, companion, expect) in CASES {
             let fixture = Fixture::new();
             let source = fixture.source(None);
-            let image = &source.image;
+            let image = fixture.main_image();
             fs::create_dir_all(image.retained.parent().unwrap()).unwrap();
             fs::write(&image.retained, b"retained main image").unwrap();
             for seed in &source.old_seeds {

@@ -250,6 +250,9 @@ unfinished journal owns the exact repository and checkout. No Git checkout is re
 recorded replacement incarnation, never a second reclaim; a checkout-path record without that journal is not recovery
 authority.
 
+When main's image is missing, `adopt <checkout> --re-adopt` re-adopts it from the plain Git checkout at its path (02
+§Missing main image); a checkout whose remotes do not name the project's repository is refused (exit 4).
+
 `gc` never lets a candidate-local failure prevent later candidates from being tried; it reports each deferred path and
 diagnostic on stderr and in the structured result, alongside actual bytes freed. `doctor` diagnoses sidecarless session
 images by name rather than treating them as live workspaces or failing the inventory. Store-wide `ls --all` and

@@ -458,20 +458,38 @@ pub fn holders(path: &Path) -> io::Result<Vec<Holder>> {
 /// listing, shows none.
 #[cfg(target_os = "linux")]
 pub fn volume_holders(mount: &Path) -> io::Result<Vec<Holder>> {
-    let mount = match fs::canonicalize(mount) {
-        Ok(mount) => mount,
+    holders_under(mount)
+}
+
+/// Every process holding anything inside the directory tree at `root` -- an open file, a mapped
+/// file, its working directory, its root, its executable -- whether or not `root` is a volume's
+/// mount point. A plain checkout's holders, which `volume_holders` cannot name without naming its
+/// whole volume. From procfs, so a process of another user, or one that exited since the listing,
+/// shows none. A missing `root` has none.
+#[cfg(target_os = "linux")]
+pub fn tree_holders(root: &Path) -> io::Result<Vec<Holder>> {
+    holders_under(root)
+}
+
+/// The procfs census behind `volume_holders` and `tree_holders`: a process holds `root`'s tree
+/// when a link or mapping names a path at or under it. `root` is canonicalized first, so a
+/// symlinked path names the tree its target does.
+#[cfg(target_os = "linux")]
+fn holders_under(root: &Path) -> io::Result<Vec<Holder>> {
+    let root = match fs::canonicalize(root) {
+        Ok(root) => root,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(error),
     };
-    let on_volume = |link: PathBuf| link.starts_with(&mount);
+    let under_root = |link: PathBuf| link.starts_with(&root);
     procfs_holders(|process| {
         ["cwd", "root", "exe"]
             .iter()
-            .any(|name| fs::read_link(process.join(name)).is_ok_and(on_volume))
+            .any(|name| fs::read_link(process.join(name)).is_ok_and(under_root))
             || fs::read_dir(process.join("fd")).is_ok_and(|descriptors| {
                 descriptors
                     .flatten()
-                    .any(|descriptor| fs::read_link(descriptor.path()).is_ok_and(on_volume))
+                    .any(|descriptor| fs::read_link(descriptor.path()).is_ok_and(under_root))
             })
             // A mapping's path is its line's last field and the line's first `/`: the
             // address range, permissions, offset, device and inode before it hold none.
@@ -479,7 +497,7 @@ pub fn volume_holders(mount: &Path) -> io::Result<Vec<Holder>> {
                 maps.lines().any(|mapping| {
                     mapping
                         .find('/')
-                        .is_some_and(|start| Path::new(&mapping[start..]).starts_with(&mount))
+                        .is_some_and(|start| Path::new(&mapping[start..]).starts_with(&root))
                 })
             })
     })
@@ -549,6 +567,231 @@ pub fn volume_holders(mount: &Path) -> io::Result<Vec<Holder>> {
     )
 }
 
+/// Every process holding anything inside the directory tree at `root` -- an open file, its
+/// working directory or root directory, its executable -- whether or not `root` is a volume's
+/// mount point. A plain checkout's holders, which `volume_holders` cannot name without naming its
+/// whole volume. A process the kernel withholds from this user, or that exited since the listing,
+/// shows none. A missing `root` has none.
+#[cfg(target_os = "macos")]
+pub fn tree_holders(root: &Path) -> io::Result<Vec<Holder>> {
+    let root = match fs::canonicalize(root) {
+        Ok(root) => root,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let mut holders = Vec::new();
+    for pid in all_pids()? {
+        if holds_tree(pid, &root)? {
+            holders.push(Holder {
+                pid,
+                command: command_line(pid),
+            });
+        }
+    }
+    Ok(holders)
+}
+
+/// Whether `pid` holds anything inside `root`. Cheapest first: the directories cost one call, the
+/// executable one more, and the descriptors a listing plus one call per vnode.
+#[cfg(target_os = "macos")]
+fn holds_tree(pid: libc::pid_t, root: &Path) -> io::Result<bool> {
+    Ok(directories(pid)?.iter().any(|path| path.starts_with(root))
+        || executable(pid).is_some_and(|path| path.starts_with(root))
+        || open_vnodes(pid)?.iter().any(|path| path.starts_with(root)))
+}
+
+/// `pid`'s working directory and root directory (`PROC_PIDVNODEPATHINFO`). A process the kernel
+/// withholds from this user, or that exited, names none.
+#[cfg(target_os = "macos")]
+fn directories(pid: libc::pid_t) -> io::Result<Vec<PathBuf>> {
+    let size = c_size::<libc::proc_vnodepathinfo>()?;
+    // SAFETY: `proc_vnodepathinfo` is plain C data (integers and byte arrays), for which all
+    // zeros is a valid value; it is read only when the kernel fills all of it, as checked below.
+    let mut info: libc::proc_vnodepathinfo = unsafe { std::mem::zeroed() };
+    // SAFETY: `info` is writable for exactly `size` bytes, its whole size.
+    let filled = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDVNODEPATHINFO,
+            0,
+            std::ptr::from_mut(&mut info).cast(),
+            size,
+        )
+    };
+    if filled != size {
+        return Ok(Vec::new());
+    }
+    Ok([
+        c_path(info.pvi_cdir.vip_path.as_flattened()),
+        c_path(info.pvi_rdir.vip_path.as_flattened()),
+    ]
+    .into_iter()
+    .flatten()
+    .collect())
+}
+
+/// The path of each open vnode descriptor of `pid`: one listing (`PROC_PIDLISTFDS`), then one
+/// `PROC_PIDFDVNODEPATHINFO` call per vnode. A descriptor closed since the listing names none, and
+/// an event-only open (`O_EVTONLY`: FSEvents, Spotlight, a file watcher) holds nothing, as
+/// `volume_holders` leaves it out.
+#[cfg(target_os = "macos")]
+fn open_vnodes(pid: libc::pid_t) -> io::Result<Vec<PathBuf>> {
+    // Descriptors opened between the sizing call and the listing still fit.
+    const HEADROOM: usize = 32;
+    let entry = size_of::<libc::proc_fdinfo>();
+    let vinfo_size = c_size::<VnodeFdinfoWithPath>()?;
+    // SAFETY: a null buffer of zero bytes asks only how many bytes the listing needs.
+    let needed =
+        unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0) };
+    // Negative: the process exited or is withheld from this user, so it holds no descriptor here.
+    let Ok(needed) = usize::try_from(needed) else {
+        return Ok(Vec::new());
+    };
+    let mut capacity = needed / entry + HEADROOM;
+    loop {
+        let mut fds = vec![
+            libc::proc_fdinfo {
+                proc_fd: 0,
+                proc_fdtype: 0
+            };
+            capacity
+        ];
+        let bytes = libc::c_int::try_from(capacity * entry).map_err(io::Error::other)?;
+        // SAFETY: `fds` is writable for `bytes` bytes, its whole length.
+        let filled = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDLISTFDS,
+                0,
+                fds.as_mut_ptr().cast(),
+                bytes,
+            )
+        };
+        let Ok(filled) = usize::try_from(filled) else {
+            return Ok(Vec::new());
+        };
+        let count = filled / entry;
+        // A listing that filled the buffer may have been cut short: grow it and list again.
+        if count >= capacity {
+            capacity *= 4;
+            continue;
+        }
+        fds.truncate(count);
+        return Ok(fds
+            .into_iter()
+            .filter(|fd| {
+                libc::c_int::try_from(fd.proc_fdtype)
+                    .is_ok_and(|kind| kind == libc::PROX_FDTYPE_VNODE)
+            })
+            .filter_map(|fd| vnode_fd_path(pid, fd.proc_fd, vinfo_size))
+            .collect());
+    }
+}
+
+/// The path of vnode descriptor `fd` of `pid` (`PROC_PIDFDVNODEPATHINFO`), or `None` if the kernel
+/// names none or the descriptor is an event-only open. `size` is `VnodeFdinfoWithPath`'s size:
+/// the kernel fills exactly that or nothing.
+#[cfg(target_os = "macos")]
+fn vnode_fd_path(pid: libc::pid_t, fd: libc::c_int, size: libc::c_int) -> Option<PathBuf> {
+    // libc 0.2 binds neither this flavor nor `vnode_fdinfowithpath`; `sys/proc_info.h` defines
+    // the flavor as 2.
+    const PROC_PIDFDVNODEPATHINFO: libc::c_int = 2;
+    let mut info = VnodeFdinfoWithPath {
+        pfi_openflags: 0,
+        _pfi_rest: [0; 20],
+        // SAFETY: `vnode_info_path` is plain C data (integers and byte arrays), for which all
+        // zeros is a valid value; it is read only when the kernel fills all of it, as checked.
+        pvip: unsafe { std::mem::zeroed() },
+    };
+    // SAFETY: `info` is writable for exactly `size` bytes, its whole size.
+    let filled = unsafe {
+        libc::proc_pidfdinfo(
+            pid,
+            fd,
+            PROC_PIDFDVNODEPATHINFO,
+            std::ptr::from_mut(&mut info).cast(),
+            size,
+        )
+    };
+    if filled != size || info.pfi_openflags & O_EVTONLY != 0 {
+        return None;
+    }
+    c_path(info.pvip.vip_path.as_flattened())
+}
+
+/// `sys/proc_info.h`'s `struct vnode_fdinfowithpath`, which libc 0.2 does not bind: a 24-byte
+/// `proc_fileinfo` head whose first field is the descriptor's open flags, then the vnode's path.
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct VnodeFdinfoWithPath {
+    pfi_openflags: u32,
+    _pfi_rest: [u8; 20],
+    pvip: libc::vnode_info_path,
+}
+
+/// `fcntl.h`'s `O_EVTONLY` as `proc_fileinfo.fi_openflags` carries it: an open for event
+/// notification only, which holds no data and never blocks an unmount.
+#[cfg(target_os = "macos")]
+const O_EVTONLY: u32 = 0x0000_8000;
+
+/// Every live pid the kernel lists (`proc_listallpids`, which answers a count of pids, not bytes),
+/// except pid 0. The listing grows until it fits, as `listpidspath`'s does.
+#[cfg(target_os = "macos")]
+fn all_pids() -> io::Result<Vec<libc::pid_t>> {
+    let mut capacity = 256usize;
+    loop {
+        let mut pids: Vec<libc::pid_t> = vec![0; capacity];
+        let bytes =
+            libc::c_int::try_from(capacity * size_of::<libc::pid_t>()).map_err(io::Error::other)?;
+        // SAFETY: `pids` is writable for `bytes` bytes, its whole length.
+        let filled = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), bytes) };
+        if filled < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let count = usize::try_from(filled).map_err(io::Error::other)?;
+        if count < capacity {
+            pids.truncate(count);
+            return Ok(pids.into_iter().filter(|&pid| pid > 0).collect());
+        }
+        capacity *= 4;
+    }
+}
+
+/// `T`'s byte size as the `c_int` the kernel's buffer arguments take.
+#[cfg(target_os = "macos")]
+fn c_size<T>() -> io::Result<libc::c_int> {
+    libc::c_int::try_from(size_of::<T>()).map_err(io::Error::other)
+}
+
+/// The path a NUL-terminated `c_char` buffer holds, or `None` if it holds none. `c_char` is signed
+/// on x86-64 Apple and unsigned on arm64 Apple; `to_ne_bytes` reads either as the same byte.
+#[cfg(target_os = "macos")]
+fn c_path(bytes: &[libc::c_char]) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+    let path: Vec<u8> = bytes
+        .iter()
+        .take_while(|&&byte| byte != 0)
+        .map(|&byte| u8::from_ne_bytes(byte.to_ne_bytes()))
+        .collect();
+    if path.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(std::ffi::OsString::from_vec(path)))
+}
+
+/// `pid`'s executable path (`proc_pidpath`), or `None` if the kernel names none.
+#[cfg(target_os = "macos")]
+fn executable(pid: libc::pid_t) -> Option<PathBuf> {
+    let mut path: Vec<libc::c_char> =
+        vec![0; usize::try_from(libc::PROC_PIDPATHINFO_MAXSIZE).ok()?];
+    let capacity = u32::try_from(path.len()).ok()?;
+    // SAFETY: `path` is writable for `capacity` bytes, its whole length.
+    let length = unsafe { libc::proc_pidpath(pid, path.as_mut_ptr().cast(), capacity) };
+    // A negative length is the kernel naming nothing: the conversion fails and `None` follows.
+    path.truncate(usize::try_from(length).ok()?);
+    c_path(&path)
+}
+
 #[cfg(target_os = "macos")]
 fn listpidspath(path: &Path, pathflags: u32) -> io::Result<Vec<Holder>> {
     use std::os::unix::ffi::OsStrExt;
@@ -615,13 +858,10 @@ fn command_line(pid: libc::pid_t) -> String {
             .collect::<Vec<_>>()
             .join(" ");
     }
-    let mut path = [0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
-    // SAFETY: `path` is writable for its whole length.
-    let length = unsafe { libc::proc_pidpath(pid, path.as_mut_ptr().cast(), path.len() as u32) };
-    if length > 0 {
-        return String::from_utf8_lossy(&path[..length as usize]).into_owned();
-    }
-    "command unreadable".to_owned()
+    executable(pid).map_or_else(
+        || "command unreadable".to_owned(),
+        |path| path.display().to_string(),
+    )
 }
 
 /// The last Nx run recorded in a cache directory.
@@ -1318,6 +1558,48 @@ mod tests {
             root.display()
         );
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A plain checkout's holders are the processes inside its tree, which `volume_holders`
+    /// cannot name: a process working in a subdirectory of the tree, with no file open, is one of
+    /// them; a process working in a sibling tree is not.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn a_process_working_inside_a_plain_tree_is_one_of_its_holders() {
+        let root = scratch("tree-holders");
+        let sub = root.join("checkout/sub");
+        fs::create_dir_all(&sub).unwrap();
+        let sibling = scratch("tree-holders-sibling");
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .current_dir(&sub)
+            .spawn_locked()
+            .unwrap();
+        let pid = i32::try_from(child.id()).unwrap();
+        // Asked while the child lives; the child is killed before anything is asserted.
+        let inside = tree_holders(&root).unwrap();
+        let outside = tree_holders(&sibling).unwrap();
+        let missing = tree_holders(&root.join("missing")).unwrap();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(
+            inside.iter().any(|holder| holder.pid == pid),
+            "pid {pid} (cwd {}) is not among the {} holders of {}",
+            sub.display(),
+            inside.len(),
+            root.display()
+        );
+        assert!(
+            !outside.iter().any(|holder| holder.pid == pid),
+            "pid {pid} is among the holders of the sibling tree {}",
+            sibling.display()
+        );
+        assert!(
+            missing.is_empty(),
+            "a missing root has holders: {missing:?}"
+        );
+        fs::remove_dir_all(&root).unwrap();
+        fs::remove_dir_all(&sibling).unwrap();
     }
 
     /// A checkout of the repository's own stock Nx, its daemon enabled, under a scratch root:

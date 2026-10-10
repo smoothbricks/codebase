@@ -18,11 +18,42 @@ use crate::build_volume::{
 };
 use crate::metadata::{ImageCapacity, append_suffix};
 use crate::storage::apfs::{ApfsExecutionHost, ApfsStorageError, COMPANION_SUFFIX};
-use crate::storage::recovery::{ReAdoptBuild, ReAdoptSource};
+use crate::storage::recovery::{
+    MissingMainBuild, ReAdoptBuild, ReAdoptEmptyBuild, ReAdoptMain, ReAdoptSource,
+};
 
 /// The files beside a workspace image: its grants sidecar and its CA companion.
 const MAIN_COMPANION_SUFFIXES: [&str; 2] =
     [crate::metadata::GRANTS_SIDECAR_SUFFIX, COMPANION_SUFFIX];
+
+/// The claim a seed of main's published build volume is captured under (16_build_volumes.md,
+/// "Targets and seeds"). A volume the caller's re-adoption claim already holds is captured under
+/// that claim, borrowed: a second exclusive claim on the same hold file would conflict with it.
+/// Any other volume takes its own ordinary claim.
+enum SeedSource<'a> {
+    /// The published volume is the one this claim holds.
+    Claimed(&'a ReleaseClaim),
+    /// No claim of the caller's holds this volume.
+    Unclaimed(&'a BuildVolumeId),
+}
+
+impl<'a> SeedSource<'a> {
+    /// The published volume of `build`, which `claim` claimed at `build.image.original`. A RAW
+    /// original is the published volume, so `claim` holds the very hold file a fresh claim would
+    /// lock, and the seed borrows it. A legacy original holds `<original>.hold`, a different file:
+    /// the caller's claim keeps that resource, and the published volume takes its own claim.
+    fn of_published(
+        layout: &BuildVolumeLayout,
+        build: &'a ReAdoptBuild,
+        claim: &'a ReleaseClaim,
+    ) -> Self {
+        if build.image.original == layout.image(&build.id) {
+            Self::Claimed(claim)
+        } else {
+            Self::Unclaimed(&build.id)
+        }
+    }
+}
 
 impl<R> MacOsApfsExecutionHost<R>
 where
@@ -39,31 +70,35 @@ where
         &self,
         source: &ReAdoptSource,
     ) -> Result<(), ApfsStorageError> {
-        self.retain_image(
-            source,
-            &source.image.original,
-            &source.image.retained,
-            &MAIN_COMPANION_SUFFIXES,
-        )?;
-        // The kernel source has been released and moved. Its old cached main registration
-        // must leave with it, otherwise staged publication sees a duplicate mounted main.
-        // Do this only after successful retention: a busy-source refusal keeps its registration.
-        let key = (
-            source.metadata.repo_id.clone(),
-            source.metadata.workspace.clone(),
-        );
-        if let Some(entry) = self.mounted.remove(key.clone())?
-            && entry.attachment.image() != source.image.original.as_path()
-        {
-            let restored = self.mounted.restore(key, entry)?;
-            if restored.is_err() {
+        // A missing main retains no image: nothing of it is attached or registered.
+        if let Some(image) = source.main.retained() {
+            self.retain_image(
+                source,
+                &image.original,
+                &image.retained,
+                &MAIN_COMPANION_SUFFIXES,
+            )?;
+            // The kernel source has been released and moved. Its old cached main registration
+            // must leave with it, otherwise staged publication sees a duplicate mounted main.
+            // Do this only after successful retention: a busy-source refusal keeps its registration.
+            let key = (
+                source.metadata.repo_id.clone(),
+                source.metadata.workspace.clone(),
+            );
+            if let Some(entry) = self.mounted.remove(key.clone())?
+                && entry.attachment.image() != image.original.as_path()
+            {
+                let restored = self.mounted.restore(key, entry)?;
+                if restored.is_err() {
+                    return Err(ApfsStorageError::Host(
+                        "main's mount registration changed during retained-source handoff"
+                            .to_owned(),
+                    ));
+                }
                 return Err(ApfsStorageError::Host(
-                    "main's mount registration changed during retained-source handoff".to_owned(),
+                    "main's cached attachment does not name the recorded source image".to_owned(),
                 ));
             }
-            return Err(ApfsStorageError::Host(
-                "main's cached attachment does not name the recorded source image".to_owned(),
-            ));
         }
         if let Some(build) = &source.build {
             self.retain_image(
@@ -92,8 +127,11 @@ where
         &self,
         source: &ReAdoptSource,
     ) -> Result<bool, ApfsStorageError> {
-        self.verify_controller_path(&source.image.retained)?;
-        let input = retained_input(source, &source.image.retained)?;
+        let Some(image) = source.main.retained() else {
+            return Ok(false);
+        };
+        self.verify_controller_path(&image.retained)?;
+        let input = retained_input(source, &image.retained)?;
         let Some(attachment) = self.backend.existing_retained_attachment(&input)? else {
             return Ok(false);
         };
@@ -111,12 +149,14 @@ where
         &self,
         source: &ReAdoptSource,
     ) -> Result<(), ApfsStorageError> {
-        self.mount_retained(
-            source,
-            &source.image.retained,
-            &source.image.source_mount,
-            &source.checkout,
-        )?;
+        if let Some(image) = source.main.retained() {
+            self.mount_retained(
+                source,
+                &image.retained,
+                &image.source_mount,
+                &source.checkout,
+            )?;
+        }
         if let Some(build) = &source.build {
             let layout = BuildVolumeLayout::new(
                 super::layout(&self.config, &source.metadata.repo_id)?.project(),
@@ -137,7 +177,12 @@ where
         &self,
         source: &ReAdoptSource,
     ) -> Result<(), ApfsStorageError> {
-        let mut images = vec![(&source.image.retained, &source.image.source_mount)];
+        let mut images: Vec<_> = source
+            .main
+            .retained()
+            .map(|image| (&image.retained, &image.source_mount))
+            .into_iter()
+            .collect();
         if let Some(build) = &source.build {
             images.push((&build.image.retained, &build.image.source_mount));
         }
@@ -247,51 +292,134 @@ where
         Ok((new, old))
     }
 
-    /// Publish the verified build replacement under main's build volume identity: detach it
-    /// without force (an attached image is never renamed), rename it to the build image path the
-    /// retained volume left, write the recorded owner record verbatim, and mount it where main's
-    /// build link points (16_build_volumes.md, "Targets and seeds"). Then freeze one seed of it
-    /// for the replacement incarnation; the old incarnation's seeds stay retained. Converges
-    /// from whichever step a crash interrupted. `build_claim` is the exclusive claim on the
-    /// recorded build volume's hold, held by the caller across this whole publication; it must
-    /// name that volume. A RAW original's seed borrows it rather than locking the same hold file
-    /// again, and a legacy original's seed takes the published volume's own claim.
+    /// Publish main's build volume for the replacement: the verified build replacement under
+    /// main's build volume identity (detached without force, renamed to the build image path the
+    /// retained volume left, its recorded owner record written verbatim, mounted where main's
+    /// build link points; 16_build_volumes.md, "Targets and seeds"); for a missing main, its
+    /// surviving build volume kept as it is, or else the recorded build volume empty
+    /// ([`Self::publish_empty_build`]). Then freeze one seed of it for the replacement
+    /// incarnation; the old incarnation's seeds stay retained. Converges from whichever step a
+    /// crash interrupted. `build_claim` is the exclusive claim on the recorded source build
+    /// volume's hold, held by the caller across this whole publication: present exactly when a
+    /// retained main records a build volume, and naming that volume. A missing main records no
+    /// source build, so it has none.
     pub(crate) fn publish_re_adopt_build(
         &self,
         layout: &BuildVolumeLayout,
         source: &ReAdoptSource,
-        build_claim: &ReleaseClaim,
+        build_claim: Option<&ReleaseClaim>,
     ) -> Result<(), ApfsStorageError> {
-        let Some(build) = &source.build else {
-            return Ok(());
-        };
-        if build_claim.id() != &build.id {
-            return Err(ApfsStorageError::InvalidPlan(
+        match (&source.main, &source.build, build_claim) {
+            (ReAdoptMain::Missing(missing), None, None) => match &missing.build {
+                Some(MissingMainBuild::Empty(build)) => self.publish_empty_build(layout, source, build),
+                // Main's own volume outlived main's image: it is mounted where main's build link
+                // points and seeded as it is, under its own claim.
+                Some(MissingMainBuild::Kept(build)) => {
+                    self.mount_build_volume(layout, &build.kept)?;
+                    self.seed_replacement(
+                        layout,
+                        source,
+                        SeedSource::Unclaimed(&build.kept),
+                        &build.record,
+                    )
+                }
+                None => Ok(()),
+            },
+            (ReAdoptMain::Retained(_), None, None) => Ok(()),
+            (ReAdoptMain::Retained(_), Some(build), Some(claim)) if claim.id() == &build.id => {
+                self.publish_build_replacement(layout, build)?;
+                let seed = SeedSource::of_published(layout, build, claim);
+                self.seed_replacement(layout, source, seed, &build.owner_record)
+            }
+            _ => Err(ApfsStorageError::InvalidPlan(
                 "the build claim does not hold the recorded build volume",
-            ));
+            )),
         }
-        self.publish_build_replacement(layout, build)?;
-        let published = layout.image(&build.id);
+    }
+
+    /// A missing main's build volume (02_workspaces.md, "Missing main image"): an empty RAW
+    /// volume minted under the recorded id at the recorded capacity and mounted where main's
+    /// build link points, its owner record written last, then one seed of it for the
+    /// replacement incarnation. Converges from an attempt interrupted after the image was minted
+    /// and before its record was written. An image holding another record, or a record that
+    /// names no image, refuses: nothing is published over either. Nothing else claims a volume
+    /// minted here, so its seed takes the volume's own ordinary claim.
+    fn publish_empty_build(
+        &self,
+        layout: &BuildVolumeLayout,
+        source: &ReAdoptSource,
+        build: &ReAdoptEmptyBuild,
+    ) -> Result<(), ApfsStorageError> {
+        let image = layout.image(&build.id);
+        self.verify_controller_path(&image)?;
+        let recorded = layout
+            .read_record_present(&build.id)
+            .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
+        match (exists(&image)?, recorded) {
+            (false, None) => {
+                self.create_build_volume(
+                    layout,
+                    &build.id,
+                    ImageCapacity::from_bytes(build.capacity_bytes),
+                )?;
+            }
+            (true, None) => {
+                self.mount_build_volume(layout, &build.id)?;
+            }
+            (true, Some(found)) if found == build.record => {
+                self.mount_build_volume(layout, &build.id)?;
+            }
+            (true, Some(_)) => {
+                return Err(ApfsStorageError::InvalidPlan(
+                    "main's build volume image holds another owner record; refusing to publish over it",
+                ));
+            }
+            (false, Some(_)) => {
+                return Err(ApfsStorageError::InvalidPlan(
+                    "main's build volume record names a missing image; refusing to publish over it",
+                ));
+            }
+        }
+        layout
+            .write_record(&build.id, &build.record)
+            .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
+        self.seed_replacement(
+            layout,
+            source,
+            SeedSource::Unclaimed(&build.id),
+            &build.record,
+        )
+    }
+
+    /// Freeze one seed of main's published build volume for the replacement incarnation, under
+    /// the claim `seed` says it is captured with; the old incarnation's seeds stay retained. A
+    /// seed an earlier attempt froze is kept.
+    fn seed_replacement(
+        &self,
+        layout: &BuildVolumeLayout,
+        source: &ReAdoptSource,
+        seed: SeedSource<'_>,
+        owner: &BuildVolumeRecord,
+    ) -> Result<(), ApfsStorageError> {
         let seeded = layout
             .seed_of(&crate::metadata::WorkspaceName::main(), &source.replacement)
             .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
         if seeded.is_none() {
             let destination = BuildVolumeId::mint();
             let record = BuildVolumeRecord::new(
-                build.owner_record.tree.clone(),
+                owner.tree.clone(),
                 BuildVolumeRole::Seed {
                     target: crate::metadata::WorkspaceName::main(),
                     incarnation: source.replacement.clone(),
                 },
             );
-            if build.image.original == published {
-                // The RAW original is the published volume, so the caller's claim holds the very
-                // hold file a fresh claim would lock: the seed borrows it.
-                self.clone_claimed_build_volume(layout, build_claim, &destination, &record)?;
-            } else {
-                // A legacy original holds `<original>.hold`, a different file. The caller's claim
-                // keeps that resource; the published volume takes its own ordinary claim.
-                self.clone_build_volume(layout, &build.id, &destination, &record)?;
+            match seed {
+                SeedSource::Claimed(claim) => {
+                    self.clone_claimed_build_volume(layout, claim, &destination, &record)?;
+                }
+                SeedSource::Unclaimed(id) => {
+                    self.clone_build_volume(layout, id, &destination, &record)?;
+                }
             }
         }
         Ok(())

@@ -292,13 +292,22 @@ pub enum AdoptHandoff {
         copy_source: PathBuf,
         incarnation: WorkspaceIncarnation,
     },
+    /// A plain re-adoption: main is copied from the user's plain checkout at the adopted path,
+    /// which stays intact through staging and verification. Publication then swaps the checkout
+    /// aside to `preserved`, a distinct sibling of the checkout (never `.pre-cowshed`), and mounts
+    /// the replacement at the checkout path. The replacement is published as exactly
+    /// `incarnation`, which the recovery intent recorded before its first mutation.
+    PlainReplacement {
+        preserved: PathBuf,
+        incarnation: WorkspaceIncarnation,
+    },
 }
 
 impl AdoptHandoff {
     /// The tree main's image is copied from.
     pub fn copy_source<'a>(&'a self, checkout: &'a Path) -> &'a Path {
         match self {
-            Self::Checkout { .. } => checkout,
+            Self::Checkout { .. } | Self::PlainReplacement { .. } => checkout,
             Self::Replacement { copy_source, .. } => copy_source,
         }
     }
@@ -399,6 +408,7 @@ impl LifecyclePlanner for PurePlanner {
             AdoptHandoff::Checkout {
                 pre_cowshed_checkout,
             } => pre_cowshed_checkout,
+            AdoptHandoff::PlainReplacement { preserved, .. } => preserved,
             AdoptHandoff::Replacement { copy_source, .. } => copy_source,
         };
         if !request.source_checkout.is_absolute()
