@@ -924,6 +924,7 @@ describe('what shell entry keeps linked', () => {
           const legacy = await checkout(join(main, '.cache', 'package'), '@fixture/lib');
           await mkdir(join(root, '.cowshed'), { recursive: true });
           await writeFile(join(root, '.cowshed', 'workspace.json'), JSON.stringify({ projectRoot: main }));
+
           await rm(join(root, LINKED));
           symlinkSync(legacy, join(root, LINKED));
           // A missing local directory refuses an inherited Main binding, without rewriting it.
@@ -938,13 +939,14 @@ describe('what shell entry keeps linked', () => {
           expect(readlinkSync(join(root, LINKED))).toBe(relative(dirname(join(root, LINKED)), local));
           expect(readFileSync(join(legacy, 'package.json'), 'utf8')).toContain('@fixture/lib');
           expect((await enter({ links: true, check: true })).exitCode).toBe(0);
-          // A genuinely unrelated checkout remains the developer's independent choice.
+          // The explicit declaration is authoritative: an external binding to an independent checkout is
+          // repointed to the declared local product.
           const independent = await checkout(join(dirname(root), 'independent-lib'), '@fixture/lib');
           await rm(join(root, LINKED));
           symlinkSync(independent, join(root, LINKED));
-          expect((await enter({ links: true, check: true })).exitCode).toBe(0);
+          expect((await enter({ links: true, check: true })).exitCode).toBe(1);
           expect((await enter({ links: true })).exitCode).toBe(0);
-          expect(readlinkSync(join(root, LINKED))).toBe(independent);
+          expect(readlinkSync(join(root, LINKED))).toBe(relative(dirname(join(root, LINKED)), local));
         },
       );
     });
@@ -966,24 +968,87 @@ describe('what shell entry keeps linked', () => {
       );
     });
 
-    it("keeps a developer's own link, and the installed version where this machine lacks the checkout", async () => {
+    it('repoints a foreign link to the declared checkout, and keeps the installed version where this machine lacks it', async () => {
       await withManagedRepository(
         { ...WORKSPACE, developerLinks: { '@fixture/lib': '../absent-lib', util: '../declared-util' } },
         async ({ root, enterShell: enter }) => {
           expect(await enter()).toEqual(HEALTHY);
-          await checkout(join(dirname(root), 'declared-util'), 'util');
+          const declared = await checkout(join(dirname(root), 'declared-util'), 'util');
           const mine = await checkout(join(dirname(root), 'my-util'), 'util');
           await rm(join(root, UNLINKED));
           symlinkSync(mine, join(root, UNLINKED));
 
-          expect((await enter({ links: true, check: true })).exitCode).toBe(0);
+          // The explicit declaration is authoritative: the old external binding is repointed.
+          const check = await enter({ links: true, check: true });
+          expect(check.exitCode).toBe(1);
+          expect(check.stderr).toContain('does not exist on this machine');
           const entered = await enter({ links: true });
           expect(entered.exitCode).toBe(0);
           expect(entered.stderr).toContain(
             `! smoo.developerLinks @fixture/lib: ${join(dirname(root), 'absent-lib')} does not exist on this machine; the installed version stays`,
           );
           expect(readlinkSync(join(root, LINKED))).toBe('../../../lib');
-          expect(readlinkSync(join(root, UNLINKED))).toBe(mine);
+          const final = await enter({ links: true, check: true });
+          expect(final.exitCode).toBe(1);
+          expect(final.stderr).toContain('does not exist on this machine');
+          expect(readlinkSync(join(root, UNLINKED))).toBe(declared);
+        },
+      );
+    });
+
+    it('replaces an old declared binding when the declaration changes to another checkout', async () => {
+      await withManagedRepository(
+        { ...WORKSPACE, developerLinks: { '@fixture/lib': '../lib-a' } },
+        async ({ root, enterShell: enter }) => {
+          expect(await enter()).toEqual(HEALTHY);
+          const a = await checkout(join(dirname(root), 'lib-a'), '@fixture/lib');
+          const b = await checkout(join(dirname(root), 'lib-b'), '@fixture/lib');
+          expect((await enter({ links: true })).exitCode).toBe(0);
+          expect(readlinkSync(join(root, LINKED))).toBe(a);
+
+          const manifest = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
+          manifest.smoo.developerLinks['@fixture/lib'] = '../lib-b';
+          await writeFile(join(root, 'package.json'), JSON.stringify(manifest));
+          expect((await enter({ links: true, check: true })).exitCode).toBe(1);
+          expect((await enter({ links: true })).exitCode).toBe(0);
+          expect(readlinkSync(join(root, LINKED))).toBe(b);
+        },
+      );
+    });
+
+    it('keeps an absent declared checkout as an unavailable finding, leaving the existing absolute binding bytes unchanged', async () => {
+      await withManagedRepository(
+        { ...WORKSPACE, developerLinks: { '@fixture/lib': '../absent-lib' } },
+        async ({ root, enterShell: enter }) => {
+          expect(await enter()).toEqual(HEALTHY);
+          const sibling = await checkout(join(dirname(root), 'donor-side/lib'), '@fixture/lib');
+          await rm(join(root, LINKED));
+          symlinkSync(sibling, join(root, LINKED));
+          const check = await enter({ links: true, check: true });
+          expect(check.exitCode).toBe(1);
+          expect(check.stderr).toContain('does not exist on this machine');
+          const applied = await enter({ links: true });
+          expect(applied.exitCode).toBe(0);
+          expect(applied.stderr).toContain('does not exist on this machine');
+          expect(readlinkSync(join(root, LINKED))).toBe(sibling);
+        },
+      );
+    });
+
+    it('reports a present checkout without a package.json as unavailable, never as an unhandled ENOENT', async () => {
+      await withManagedRepository(
+        { ...WORKSPACE, developerLinks: { '@fixture/lib': '../bare-lib' } },
+        async ({ root, enterShell: enter }) => {
+          expect(await enter()).toEqual(HEALTHY);
+          await mkdir(join(dirname(root), 'bare-lib'), { recursive: true });
+          const entered = await enter({ links: true });
+          expect(entered.exitCode).toBe(0);
+          expect(entered.stderr).toContain('has no package.json here');
+          expect(entered.stderr).not.toContain('ENOENT');
+          const check = await enter({ links: true, check: true });
+          expect(check.exitCode).toBe(1);
+          expect(check.stderr).toContain('has no package.json here');
+          expect(check.stderr).not.toContain('ENOENT');
         },
       );
     });
@@ -2504,6 +2569,94 @@ describe('explicit missing-payload repair', () => {
       });
     } finally {
       registry.close();
+    }
+  });
+});
+
+describe('the project root a shell entry owns', () => {
+  /**
+   * A fresh git checkout holding the full managed direnv directory, so the real script and its
+   * imports run. `manifest` writes the repository's package.json; without it, the checkout has none.
+   */
+  async function freshCheckout(scratch: string, manifest: boolean): Promise<string> {
+    const checkout = join(scratch, 'checkout');
+    await mkdir(join(checkout, 'tooling', 'direnv'), { recursive: true });
+    await cp(join(MANAGED, 'tooling', 'direnv'), join(checkout, 'tooling', 'direnv'), { recursive: true });
+    await copyFile(join(MANAGED, 'envrc'), join(checkout, '.envrc'));
+    if (manifest) {
+      await writeFile(join(checkout, 'package.json'), '{"name":"fixture","version":"0.0.0","private":true}\n');
+    }
+    expect(Bun.spawnSync(['git', 'init', '--quiet'], { cwd: checkout }).exitCode).toBe(0);
+    return checkout;
+  }
+
+  function startOwned(
+    checkout: string,
+    cwd: string,
+    devenvRoot: string | undefined,
+    args: string[] = [],
+  ): ShellProcess {
+    return Bun.spawn({
+      cmd: ['bun', join(checkout, 'tooling', 'direnv', 'setup-environment.ts'), ...args],
+      cwd,
+      env: {
+        PATH: process.env['PATH'] ?? '',
+        HOME: process.env['HOME'],
+        ...(devenvRoot === undefined ? {} : { DEVENV_ROOT: devenvRoot }),
+      },
+      stdout: 'pipe',
+      stderr: 'pipe',
+      stdin: 'ignore',
+    });
+  }
+
+  it('refuses a DEVENV_ROOT that names another checkout, naming both roots, with no ENOENT', async () => {
+    const scratch = realpathSync(await mkdtemp(join(tmpdir(), 'smoo-owning-root-')));
+    try {
+      const checkout = await freshCheckout(scratch, true);
+      const foreign = join(scratch, 'foreign', 'tooling', 'direnv');
+      await mkdir(foreign, { recursive: true });
+
+      const entry = await finished(startOwned(checkout, checkout, foreign));
+
+      expect(entry.exitCode).toBe(1);
+      expect(entry.stderr).toContain(`DEVENV_ROOT names ${resolve(foreign, '../..')}`);
+      expect(entry.stderr).toContain(`this checkout's root is ${checkout}`);
+      expect(entry.stderr).not.toContain('ENOENT');
+    } finally {
+      await rm(scratch, { recursive: true, force: true });
+    }
+  });
+
+  it('accepts a DEVENV_ROOT that names its own checkout when run from a nested directory', async () => {
+    const scratch = realpathSync(await mkdtemp(join(tmpdir(), 'smoo-owned-root-')));
+    try {
+      const checkout = await freshCheckout(scratch, true);
+      const nested = join(checkout, 'packages', 'member');
+      await mkdir(nested, { recursive: true });
+
+      const entry = await finished(startOwned(checkout, nested, join(checkout, 'tooling', 'direnv')));
+
+      expect(entry.stderr).not.toContain('DEVENV_ROOT names');
+      expect(entry.stderr).not.toContain('cannot locate the project root');
+    } finally {
+      await rm(scratch, { recursive: true, force: true });
+    }
+  });
+
+  it('reports an unavailable root with a hint and exit 1 when the checkout has no manifest', async () => {
+    const scratch = realpathSync(await mkdtemp(join(tmpdir(), 'smoo-no-manifest-')));
+    try {
+      const checkout = await freshCheckout(scratch, false);
+
+      const entry = await finished(startOwned(checkout, checkout, undefined));
+
+      expect(entry.exitCode).toBe(1);
+      expect(entry.stderr).toContain('cannot locate the project root');
+      expect(entry.stderr).toContain('has no package.json');
+      expect(entry.stderr).not.toContain('ENOENT');
+    } finally {
+      await rm(scratch, { recursive: true, force: true });
     }
   });
 });

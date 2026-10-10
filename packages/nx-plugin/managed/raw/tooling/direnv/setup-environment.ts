@@ -30,6 +30,7 @@ import {
   keepDeveloperLinks,
   planDeclaredLinks,
   reportDeveloperLinks,
+  reportUnavailableDeclaredLinks,
 } from './developer-links.ts';
 import {
   type DeferredSecret,
@@ -39,11 +40,8 @@ import {
   SHELL_GROUP,
 } from './secret-references.ts';
 
-// DEVENV_ROOT is set by the devenv shell, which is how this script normally
-// runs. CI jobs that install dependencies without building that shell (the
-// publishing job installs Bun and Node directly) have no such variable, so fall
-// back to the git top level rather than resolving "undefined/../.." two levels
-// above the repository and failing with "could not find a package.json".
+// DEVENV_ROOT is set by the devenv shell. It is only checked against the checkout this script runs
+// in, never trusted to select the root: see resolveProjectRoot.
 const devenvRoot = process.env.DEVENV_ROOT;
 
 /** What a setup command printed, as captured. */
@@ -102,26 +100,68 @@ const resolvedSecretValues: string[] = [];
 // and a 401 is one of the things it might have been.
 const deferredSecrets: DeferredSecret[] = [];
 
-async function resolveProjectRoot(): Promise<string> {
-  if (devenvRoot) {
-    return path.resolve(`${devenvRoot}/../..`);
-  }
+type ProjectRootResult =
+  | { readonly kind: 'ready'; readonly root: string }
+  | { readonly kind: 'unavailable'; readonly reason: string; readonly hint: string }
+  | { readonly kind: 'rootMismatch'; readonly owned: string; readonly declared: string; readonly hint: string };
 
-  const result = await $`git rev-parse --show-toplevel`.quiet().nothrow();
-  if (result.exitCode !== 0) {
-    const error = new CapturedCommandError(
-      'git rev-parse --show-toplevel',
-      result.exitCode,
-      result.stdout,
-      result.stderr,
-    );
-    replayCapturedOutput(error);
-    throw error;
+// The root is the checkout's own git top level, derived from the working directory, or from this
+// script's directory when the working directory is not a repository. DEVENV_ROOT never selects
+// the root: a value naming another root is refused with a finding, not followed silently.
+async function resolveProjectRoot(): Promise<ProjectRootResult> {
+  const fromCwd = await $`git rev-parse --show-toplevel`.quiet().nothrow();
+  let owned: string | null = null;
+  if (fromCwd.exitCode === 0) {
+    owned = new TextDecoder().decode(fromCwd.stdout).trim();
+  } else {
+    const fromScript = await $`git -C ${path.dirname(new URL(import.meta.url).pathname)} rev-parse --show-toplevel`
+      .quiet()
+      .nothrow();
+    if (fromScript.exitCode === 0) {
+      owned = new TextDecoder().decode(fromScript.stdout).trim();
+    }
   }
-  return new TextDecoder().decode(result.stdout).trim();
+  if (owned === null) {
+    return {
+      kind: 'unavailable',
+      reason: 'this directory is not inside a git repository',
+      hint: 'run the shell entry from inside the repository checkout',
+    };
+  }
+  if (devenvRoot !== undefined && devenvRoot !== '') {
+    const declared = path.resolve(`${devenvRoot}/../..`);
+    // Compare canonical paths only when both exist: a missing foreign path is still a mismatch,
+    // reported by its lexical name, never an ENOENT.
+    const same = existsSync(declared) && realpathSync(declared) === realpathSync(owned);
+    if (!same) {
+      return {
+        kind: 'rootMismatch',
+        owned,
+        declared,
+        hint: 'unset DEVENV_ROOT or re-enter the shell from this checkout',
+      };
+    }
+  }
+  if (!existsSync(path.join(owned, 'package.json'))) {
+    return {
+      kind: 'unavailable',
+      reason: `${owned} has no package.json`,
+      hint: 'run the shell entry from a checkout that contains the repository manifest',
+    };
+  }
+  return { kind: 'ready', root: owned };
 }
 
-const projectRoot = await resolveProjectRoot();
+const rootResult = await resolveProjectRoot();
+if (rootResult.kind !== 'ready') {
+  const message =
+    rootResult.kind === 'unavailable'
+      ? `setup-environment: cannot locate the project root: ${rootResult.reason}`
+      : `setup-environment: DEVENV_ROOT names ${rootResult.declared} but this checkout's root is ${rootResult.owned}`;
+  console.error(`${message}\n  hint: ${rootResult.hint}`);
+  process.exit(1);
+}
+const projectRoot = rootResult.root;
 
 // Unscoped require("typescript") must expose the TS6 compiler API for Nx.
 // @typescript/native installs another package also named "typescript" (TS7). Bun's

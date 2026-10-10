@@ -168,7 +168,10 @@ Each detector returns data through one `CapabilityContribution`:
   path, rustup's settings file, the compiler-cache GC root. The sandboxed search then sees what the host's saw. These
   grants are never HOME itself and never a directory listing; their ancestors beneath HOME are metadata-only.
 - **Shell activation:** an optional contained direnv directory. Absence leaves the ordinary sandbox environment and
-  supports argv and script jobs.
+  supports argv and script jobs. The shell entry owns its project root: the checkout's own git top level, derived from
+  the working directory or the script's directory, never `DEVENV_ROOT`. A `DEVENV_ROOT` naming another root is refused
+  with a typed finding that names both roots and a hint; it grants nothing and selects nothing. A checkout without its
+  repository manifest is typed unavailable before any directory change.
 
 Shared caches stay at each tool's own default in the host HOME, so host checkouts and clones reach the same bytes
 through identical path spellings with no host-side relocation: a sandboxed `bun install` extracts into
