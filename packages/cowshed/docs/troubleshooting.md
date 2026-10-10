@@ -405,8 +405,8 @@ step, so the slow step is named on stderr. On a large repository two steps carry
   cost reaches a second. Only rewriting main's image file contiguously lowers it: `cowshed defrag main`, run while the
   checkout is idle, since main has to leave the kernel for the copy and a busy volume refuses. It needs as much free
   space as main's image has allocated and keeps it while older clones still share the old blocks.
-- **`new links`**, the walk over the whole tree for symlinks that point outside it, which costs about 5 s over a million
-  entries.
+- **`fork links`**, the walk over the whole tree for symlinks that point outside it, which costs about 5 s over a
+  million entries.
 
 ## A disk child `did not finish within 120s`
 
