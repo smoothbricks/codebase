@@ -223,12 +223,61 @@ pub struct ExtractionConfig {
     /// between discriminants lives in a column of its own on the flat lane,
     /// and an admitted nested payload must land in that same column or the
     /// member is silently lost to the carrier.
-    pub(crate) variant_map: HashMap<(String, String), FieldLookup>,
+    pub(crate) variant_map: MemberTable<FieldLookup>,
     /// `(discriminant, payload member)` → the enum's variants in ordinal
     /// order, from the semantic schema armed under that discriminant. The
     /// admission wire spells an enum as its string; the column holds the
     /// ordinal, which is the variant's index in the declared list.
-    pub(crate) enum_variants: HashMap<(String, String), Vec<String>>,
+    pub(crate) enum_variants: MemberTable<Vec<String>>,
+}
+
+/// Values keyed by `(discriminant, payload member)`, held sorted so a lookup
+/// by borrowed text builds no key.
+#[derive(Clone, Debug)]
+pub(crate) struct MemberTable<T> {
+    entries: Vec<(String, String, T)>,
+}
+
+impl<T> Default for MemberTable<T> {
+    fn default() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
+}
+
+impl<T> MemberTable<T> {
+    fn position(&self, discriminant: &str, member: &str) -> Result<usize, usize> {
+        self.entries.binary_search_by(|(at, named, _)| {
+            (at.as_str(), named.as_str()).cmp(&(discriminant, member))
+        })
+    }
+
+    /// Bind `(discriminant, member)` to `value`; a later binding of the same
+    /// pair replaces the earlier one. Growing the table is fallible.
+    fn bind(&mut self, discriminant: &str, member: &str, value: T) -> Result<(), ConfigError> {
+        match self.position(discriminant, member) {
+            Ok(index) => self.entries[index].2 = value,
+            Err(index) => {
+                self.entries
+                    .try_reserve(1)
+                    .map_err(|_| ConfigError::OutOfMemory)?;
+                self.entries
+                    .insert(index, (owned(discriminant)?, owned(member)?, value));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn get(&self, discriminant: &str, member: &str) -> Option<&T> {
+        self.position(discriminant, member)
+            .ok()
+            .map(|index| &self.entries[index].2)
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
 }
 
 /// A nested payload member as its event's own schema declares it.
@@ -324,9 +373,7 @@ impl ExtractionConfig {
     ) -> Option<&FieldLookup> {
         if let Some(discriminant) = discriminant
             && !self.variant_map.is_empty()
-            && let Some(lookup) = self
-                .variant_map
-                .get(&(discriminant.to_owned(), member.to_owned()))
+            && let Some(lookup) = self.variant_map.get(discriminant, member)
         {
             return Some(lookup);
         }
@@ -345,7 +392,7 @@ impl ExtractionConfig {
             return None;
         }
         self.enum_variants
-            .get(&(discriminant.to_owned(), member.to_owned()))
+            .get(discriminant, member)
             .map(Vec::as_slice)
     }
 }
@@ -437,10 +484,11 @@ pub fn build_extraction_config_with_semantic_schemas(
     room(&mut unresolved_presence, fields.len())?;
     let mut open_paths = Vec::new();
     if let Some(semantic_schemas) = semantic_schemas {
+        let mut path = String::new();
         for schema in semantic_schemas.values() {
-            crate::validate::collect_open_paths(schema, "", &mut open_paths);
+            crate::validate::collect_open_paths(schema, &mut path, &mut open_paths)?;
         }
-        open_paths.sort();
+        open_paths.sort_unstable();
         open_paths.dedup();
     }
     let mut fallback_column = None;
@@ -495,27 +543,32 @@ pub fn build_extraction_config_with_semantic_schemas(
     // Discriminated resolution arms only when the caller names the key: the
     // enum-ordinal table is keyed by discriminant, so without one there is
     // no way to pick the schema an admitted string is judged against.
-    let mut variant_map = HashMap::new();
-    let mut enum_variants = HashMap::new();
+    let mut variant_map = MemberTable::default();
+    let mut enum_variants = MemberTable::default();
     if let Some(discriminator) = discriminator {
         for member in &discriminator.members {
             let field = fields
                 .get(member.column)
                 .ok_or(ConfigError::InvalidDiscriminatedColumn)?;
-            variant_map.insert(
-                (member.discriminant.clone(), member.member.clone()),
+            variant_map.bind(
+                &member.discriminant,
+                &member.member,
                 FieldLookup {
                     column: member.column,
                     field: *field,
                 },
-            );
+            )?;
         }
         if let Some(semantic_schemas) = semantic_schemas {
             for (discriminant, schema) in semantic_schemas {
                 crate::validate::collect_enum_members(schema, |member, variants| {
-                    enum_variants
-                        .insert((discriminant.clone(), member.to_owned()), variants.to_vec());
-                });
+                    let mut ordinals = Vec::new();
+                    room(&mut ordinals, variants.len())?;
+                    for variant in variants {
+                        ordinals.push(owned(variant)?);
+                    }
+                    enum_variants.bind(discriminant, member, ordinals)
+                })?;
             }
         }
     }
@@ -526,9 +579,14 @@ pub fn build_extraction_config_with_semantic_schemas(
         fallback_column,
         presence_entries,
         open_paths,
-        semantic_schemas: semantic_schemas.cloned(),
+        semantic_schemas: semantic_schemas
+            .map(crate::validate::SemanticSchemaSet::try_clone)
+            .transpose()
+            .map_err(|_| ConfigError::OutOfMemory)?,
         has_value_fields,
-        discriminator_key: discriminator.map(|discriminator| discriminator.key.clone()),
+        discriminator_key: discriminator
+            .map(|discriminator| owned(&discriminator.key))
+            .transpose()?,
         variant_map,
         enum_variants,
     })

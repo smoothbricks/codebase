@@ -31,7 +31,7 @@
 //! [`UnavailableVoAdmission`] is the explicit refusal capability the ordinary
 //! entry points use, so a `vo` schema is refused there rather than accepted
 //! unchecked.
-use std::{cmp::Ordering, collections::BTreeMap, fmt};
+use std::{cmp::Ordering, fmt};
 
 pub use columine_types::vo::{
     UnavailableVoAdmission, VoAdmission, VoAdmissionError, VoCountsRole, VoDefinition, VoFieldLink,
@@ -295,82 +295,6 @@ pub struct PayloadViolation {
     pub vo: Option<VoRefusal>,
 }
 
-impl PayloadViolation {
-    fn new(path: impl Into<String>, expected: impl Into<String>, observed: ValueKind) -> Self {
-        Self {
-            path: path.into(),
-            expected: expected.into(),
-            observed: observed.as_str().to_owned(),
-            vo: None,
-        }
-    }
-
-    fn shape(path: &str, expected: &str, value: &dyn ValueView) -> Self {
-        Self::new(path, expected, value.kind())
-    }
-
-    fn vo(path: &str, metadata: &VoMetadata, refusal: VoRefusal) -> Self {
-        Self {
-            vo: Some(refusal),
-            ..Self::new(path, vo_expected(metadata), ValueKind::Binary)
-        }
-    }
-
-    /// An event whose `type` names no declared signal type: the refusal
-    /// every lane that admits events against a semantic schema gives it.
-    pub fn undeclared_type() -> Self {
-        Self::unmodeled("undeclared")
-    }
-
-    /// An event the judgment cannot place: its `type` is missing, not a
-    /// string, or names no declared signal type.
-    fn unmodeled(observed: &str) -> Self {
-        Self {
-            path: "type".into(),
-            expected: "signal type declared by the semantic schema".into(),
-            observed: observed.into(),
-            vo: None,
-        }
-    }
-
-    /// A top-level `value.<member>` key: the admission payload is the nested
-    /// `value` object, and a flat member would reach its column unjudged.
-    fn flat_payload_key(key: &str) -> Self {
-        Self {
-            path: key.to_owned(),
-            expected: "payload member nested under value".into(),
-            observed: "flat payload key".into(),
-            vo: None,
-        }
-    }
-
-    /// A key spelled twice in one object: the judgment reads one spelling and
-    /// the extractor stores the other, so judged and stored bytes diverge.
-    fn repeated_key(path: &str) -> Self {
-        Self {
-            path: path.to_owned(),
-            expected: "each member spelled once".into(),
-            observed: "repeated key".into(),
-            vo: None,
-        }
-    }
-
-    fn closed_unknown(path: &str, fields: &[(String, SemanticSchema)]) -> Self {
-        let declared = fields
-            .iter()
-            .map(|(name, _)| name.as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
-        Self {
-            path: path.to_owned(),
-            expected: format!(
-                "not declared (declared: {declared}); declare the enclosing object open — S.object({{…}}, {{ open: true }}) — to capture undeclared keys into {UNDECLARED_COLUMN_NAME}"
-            ),
-            observed: "undeclared".into(),
-            vo: None,
-        }
-    }
-}
 impl fmt::Display for PayloadViolation {
     fn fmt(&self, output: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
@@ -385,8 +309,223 @@ impl fmt::Display for PayloadViolation {
     }
 }
 
-fn vo_expected(metadata: &VoMetadata) -> String {
-    format!("vo {}", metadata.root)
+/// Why a value was not admitted.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ValueRefusal {
+    /// The value violates the schema.
+    Violation(PayloadViolation),
+    /// The judgment's path, or the diagnostic naming the violation, could
+    /// not be backed.
+    OutOfMemory,
+}
+
+/// Storage the judgment needed could not be backed.
+#[derive(Clone, Copy, Debug)]
+struct Exhausted;
+
+/// What the judgment expected where it refused, borrowed from the schema and
+/// spelled only once the refusal is reported.
+#[derive(Clone, Copy, Debug)]
+enum Expected<'s> {
+    Text(&'static str),
+    Enum(&'s [String]),
+    Range(NumericRange),
+    Length(u32),
+    /// An undeclared key below a closed object, with the declared members.
+    Declared(&'s [(String, SemanticSchema)]),
+    Vo(&'s VoMetadata),
+}
+
+impl fmt::Display for Expected<'_> {
+    fn fmt(&self, output: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            Self::Text(text) => output.write_str(text),
+            Self::Enum(variants) => {
+                output.write_str("enum {")?;
+                write_list(output, variants.iter().map(String::as_str))?;
+                output.write_str("}")
+            }
+            Self::Range(range) => {
+                let kind = if range.integer {
+                    "safe integer"
+                } else {
+                    "finite number"
+                };
+                write!(output, "{kind} in [{}, {}]", range.min, range.max)
+            }
+            Self::Length(length) => write!(output, "array of length {length}"),
+            Self::Declared(fields) => {
+                output.write_str("not declared (declared: ")?;
+                write_list(output, fields.iter().map(|(name, _)| name.as_str()))?;
+                write!(
+                    output,
+                    "); declare the enclosing object open — S.object({{…}}, {{ open: true }}) — to capture undeclared keys into {UNDECLARED_COLUMN_NAME}"
+                )
+            }
+            Self::Vo(metadata) => write!(output, "vo {}", metadata.root),
+        }
+    }
+}
+
+fn write_list<'a>(
+    output: &mut fmt::Formatter<'_>,
+    items: impl Iterator<Item = &'a str>,
+) -> fmt::Result {
+    for (index, item) in items.enumerate() {
+        if index != 0 {
+            output.write_str(", ")?;
+        }
+        output.write_str(item)?;
+    }
+    Ok(())
+}
+
+/// What the judgment saw where it refused.
+#[derive(Clone, Copy, Debug)]
+enum Observed {
+    Kind(ValueKind),
+    Text(&'static str),
+    Length(u64),
+}
+
+impl fmt::Display for Observed {
+    fn fmt(&self, output: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            Self::Kind(kind) => output.write_str(kind.as_str()),
+            Self::Text(text) => output.write_str(text),
+            Self::Length(length) => write!(output, "array of length {length}"),
+        }
+    }
+}
+
+/// A refusal as the judgment finds it: nothing is spelled, so a judgment
+/// that tries a union variant and moves on builds no string.
+#[derive(Clone, Copy, Debug)]
+struct Fault<'s> {
+    expected: Expected<'s>,
+    observed: Observed,
+    vo: Option<VoRefusal>,
+}
+
+impl<'s> Fault<'s> {
+    fn seen(expected: Expected<'s>, observed: ValueKind) -> Self {
+        Self {
+            expected,
+            observed: Observed::Kind(observed),
+            vo: None,
+        }
+    }
+
+    fn shape(expected: &'static str, value: &dyn ValueView) -> Self {
+        Self::seen(Expected::Text(expected), value.kind())
+    }
+
+    fn text(expected: &'static str, observed: &'static str) -> Self {
+        Self {
+            expected: Expected::Text(expected),
+            observed: Observed::Text(observed),
+            vo: None,
+        }
+    }
+
+    /// A key spelled twice in one object: the judgment reads one spelling and
+    /// the extractor stores the other, so judged and stored bytes diverge.
+    fn repeated_key() -> Self {
+        Self::text("each member spelled once", "repeated key")
+    }
+
+    /// The owned diagnostic for this refusal at `path`.
+    fn spell(self, path: &str) -> Result<PayloadViolation, Exhausted> {
+        Ok(PayloadViolation {
+            path: spelled(path)?,
+            expected: spelled(self.expected)?,
+            observed: spelled(self.observed)?,
+            vo: self.vo,
+        })
+    }
+}
+
+/// Why a judgment stopped short of admitting.
+#[derive(Clone, Copy, Debug)]
+enum Stop<'s> {
+    Fault(Fault<'s>),
+    OutOfMemory,
+}
+
+impl<'s> From<Fault<'s>> for Stop<'s> {
+    fn from(fault: Fault<'s>) -> Self {
+        Self::Fault(fault)
+    }
+}
+
+impl From<Exhausted> for Stop<'_> {
+    fn from(_: Exhausted) -> Self {
+        Self::OutOfMemory
+    }
+}
+
+/// A string writer whose growth is fallible: a write that cannot be backed
+/// fails, and the failure surfaces as [`Exhausted`].
+struct Backed<'a>(&'a mut String);
+
+impl fmt::Write for Backed<'_> {
+    fn write_str(&mut self, text: &str) -> fmt::Result {
+        self.0.try_reserve(text.len()).map_err(|_| fmt::Error)?;
+        self.0.push_str(text);
+        Ok(())
+    }
+}
+
+/// `text` spelled into fallibly backed storage.
+fn spelled(text: impl fmt::Display) -> Result<String, Exhausted> {
+    let mut output = String::new();
+    fmt::Write::write_fmt(&mut Backed(&mut output), format_args!("{text}"))
+        .map_err(|_| Exhausted)?;
+    Ok(output)
+}
+
+/// The path of the value under judgment, grown in place as the judgment
+/// descends and cut back as it returns, so a judgment that admits builds no
+/// string. A judgment that refuses leaves it naming the refused value.
+#[derive(Default)]
+struct JudgedPath {
+    text: String,
+}
+
+impl JudgedPath {
+    /// Restart at `root`.
+    fn at(&mut self, root: &str) -> Result<(), Exhausted> {
+        self.text.clear();
+        self.text.try_reserve(root.len()).map_err(|_| Exhausted)?;
+        self.text.push_str(root);
+        Ok(())
+    }
+
+    fn mark(&self) -> usize {
+        self.text.len()
+    }
+
+    fn cut(&mut self, mark: usize) {
+        self.text.truncate(mark);
+    }
+
+    /// Descend into member `name`, in its carrier spelling; returns the mark
+    /// that ascends again.
+    fn field(&mut self, name: &str) -> Result<usize, Exhausted> {
+        push_path_segment(&mut self.text, name).map_err(|_| Exhausted)
+    }
+
+    /// Descend into array item `index`.
+    fn index(&mut self, index: usize) -> Result<usize, Exhausted> {
+        let mark = self.mark();
+        fmt::Write::write_fmt(&mut Backed(&mut self.text), format_args!("[{index}]"))
+            .map_err(|_| Exhausted)?;
+        Ok(mark)
+    }
+
+    fn as_str(&self) -> &str {
+        &self.text
+    }
 }
 
 /// Whether a schema set declares any `vo` node.
@@ -445,15 +584,6 @@ impl NumericRange {
     fn contains_integer(self, value: ExactInteger) -> bool {
         value.cmp_integral(self.min.ceil()) != Ordering::Less
             && value.cmp_integral(self.max.floor()) != Ordering::Greater
-    }
-
-    fn expected(self) -> String {
-        let kind = if self.integer {
-            "safe integer"
-        } else {
-            "finite number"
-        };
-        format!("{kind} in [{}, {}]", self.min, self.max)
     }
 }
 
@@ -519,7 +649,7 @@ pub enum SemanticSchema {
     Enum(Vec<String>),
     /// Items of one schema; `length` demands exactly that many when present.
     Array {
-        item: Box<Self>,
+        item: Node<Self>,
         length: Option<u32>,
     },
     Object {
@@ -528,15 +658,56 @@ pub enum SemanticSchema {
     },
     Union(Vec<Self>),
     Map {
-        key: Box<Self>,
-        value: Box<Self>,
+        key: Node<Self>,
+        value: Node<Self>,
     },
-    Record(Box<Self>),
-    Optional(Box<Self>),
-    Nullable(Box<Self>),
+    Record(Node<Self>),
+    Optional(Node<Self>),
+    Nullable(Node<Self>),
     /// One canonical value-object frame, admitted only through a
     /// [`VoAdmission`] capability prepared for this metadata.
-    Vo(Box<VoMetadata>),
+    Vo(Node<VoMetadata>),
+}
+
+/// One owned value in a box backed fallibly: a schema tree's children, a
+/// batch refusal's violation. Stable Rust has no fallible `Box::new`, so the
+/// box is built from exactly backed storage and a value that does not fit
+/// refuses with [`SchemaParseError::OutOfMemory`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Node<T>(Box<[T; 1]>);
+
+impl<T> Node<T> {
+    pub fn new(value: T) -> Result<Self, SchemaParseError> {
+        let mut storage = Vec::new();
+        storage
+            .try_reserve_exact(1)
+            .map_err(|_| SchemaParseError::OutOfMemory)?;
+        storage.push(value);
+        let boxed: Result<Box<[T; 1]>, _> = storage.into_boxed_slice().try_into();
+        Ok(Self(boxed.unwrap_or_else(|_| {
+            unreachable!("one pushed value boxes as one")
+        })))
+    }
+
+    pub fn into_inner(self) -> T {
+        let [value] = *self.0;
+        value
+    }
+}
+
+impl<T> std::ops::Deref for Node<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        let [value] = &*self.0;
+        value
+    }
+}
+
+impl<T> AsRef<T> for Node<T> {
+    fn as_ref(&self) -> &T {
+        self
+    }
 }
 
 impl SemanticSchema {
@@ -544,7 +715,10 @@ impl SemanticSchema {
     /// artifact. The optional `open` member is meaningful only on objects;
     /// absent and `false` are both closed.
     pub fn from_tree_bytes(bytes: &[u8]) -> Result<Self, SchemaParseError> {
-        let value = JsonValue::parse(bytes).map_err(|_| SchemaParseError::InvalidJson)?;
+        let value = JsonValue::parse(bytes).map_err(|error| match error {
+            ValueParseError::OutOfMemory => SchemaParseError::OutOfMemory,
+            _ => SchemaParseError::InvalidJson,
+        })?;
         Self::from_tree_value(&value)
     }
 
@@ -582,12 +756,12 @@ impl SemanticSchema {
 
 /// Visit every top-level payload member declared as an enum (directly or
 /// under `optional`/`nullable`) with its variants in ordinal order.
-pub(crate) fn collect_enum_members(
+pub(crate) fn collect_enum_members<E>(
     schema: &SemanticSchema,
-    mut visit: impl FnMut(&str, &[String]),
-) {
+    mut visit: impl FnMut(&str, &[String]) -> Result<(), E>,
+) -> Result<(), E> {
     let SemanticSchema::Object { fields, .. } = schema else {
-        return;
+        return Ok(());
     };
     for (name, field) in fields {
         let mut inner = field;
@@ -595,37 +769,52 @@ pub(crate) fn collect_enum_members(
             inner = next;
         }
         if let SemanticSchema::Enum(variants) = inner {
-            visit(name, variants);
+            visit(name, variants)?;
         }
     }
+    Ok(())
 }
 
-pub(crate) fn collect_open_paths(schema: &SemanticSchema, path: &str, output: &mut Vec<String>) {
+/// Append the dotted path of every open object in `schema` to `output`.
+/// `path` spells the schema's own path and is restored before returning;
+/// growing either is fallible.
+pub(crate) fn collect_open_paths(
+    schema: &SemanticSchema,
+    path: &mut String,
+    output: &mut Vec<String>,
+) -> Result<(), crate::ConfigError> {
+    let out_of_memory = |_| crate::ConfigError::OutOfMemory;
     match schema {
         SemanticSchema::Object { fields, open } => {
             if *open {
-                output.push(path.to_owned());
+                output.try_reserve(1).map_err(out_of_memory)?;
+                output.push(owned_text(path).map_err(|_| crate::ConfigError::OutOfMemory)?);
             }
+            let parent = path.len();
             for (name, child) in fields {
-                let child_path = if path.is_empty() {
-                    name.clone()
-                } else {
-                    format!("{path}.{name}")
-                };
-                collect_open_paths(child, &child_path, output);
+                let separator = usize::from(parent != 0);
+                path.try_reserve(separator + name.len())
+                    .map_err(out_of_memory)?;
+                if separator != 0 {
+                    path.push('.');
+                }
+                path.push_str(name);
+                let collected = collect_open_paths(child, path, output);
+                path.truncate(parent);
+                collected?;
             }
         }
         SemanticSchema::Array { item, .. }
         | SemanticSchema::Record(item)
         | SemanticSchema::Optional(item)
-        | SemanticSchema::Nullable(item) => collect_open_paths(item, path, output),
+        | SemanticSchema::Nullable(item) => collect_open_paths(item, path, output)?,
         SemanticSchema::Map { key, value } => {
-            collect_open_paths(key, path, output);
-            collect_open_paths(value, path, output);
+            collect_open_paths(key, path, output)?;
+            collect_open_paths(value, path, output)?;
         }
         SemanticSchema::Union(variants) => {
             for variant in variants {
-                collect_open_paths(variant, path, output);
+                collect_open_paths(variant, path, output)?;
             }
         }
         SemanticSchema::Unknown
@@ -640,6 +829,7 @@ pub(crate) fn collect_open_paths(schema: &SemanticSchema, path: &str, output: &m
         | SemanticSchema::Enum(_)
         | SemanticSchema::Vo(_) => {}
     }
+    Ok(())
 }
 
 /// Every `vo` metadata below `schema`, repeats included.
@@ -687,7 +877,7 @@ fn collect_vo_metadata<'a>(schema: &'a SemanticSchema, output: &mut Vec<&'a VoMe
 pub fn validate_value<V: ValueView>(
     schema: &SemanticSchema,
     value: &V,
-) -> Result<(), PayloadViolation> {
+) -> Result<(), ValueRefusal> {
     validate_value_with_admission(schema, value, &UnavailableVoAdmission)
 }
 
@@ -697,25 +887,43 @@ pub fn validate_value_with_admission<V: ValueView, A: VoAdmission>(
     schema: &SemanticSchema,
     value: &V,
     admission: &A,
-) -> Result<(), PayloadViolation> {
-    validate_at(schema, value, "value", 0, &mut JudgeOnly(admission))
+) -> Result<(), ValueRefusal> {
+    let mut path = JudgedPath::default();
+    path.at("value").map_err(|_| ValueRefusal::OutOfMemory)?;
+    validate_at(schema, value, &mut path, 0, &mut JudgeOnly(admission)).map_err(|stop| match stop {
+        Stop::Fault(fault) => fault
+            .spell(path.as_str())
+            .map_or(ValueRefusal::OutOfMemory, ValueRefusal::Violation),
+        Stop::OutOfMemory => ValueRefusal::OutOfMemory,
+    })
 }
 
 /// Where the judgment sends each value-object frame it reaches. A judgment
 /// that tries several union variants marks the sink before each one and
 /// rolls back what a refused variant admitted.
 trait FrameAdmission<'s> {
-    fn admit(&mut self, metadata: &'s VoMetadata, frame: &[u8]) -> Result<(), VoRefusal>;
+    fn admit(&mut self, metadata: &'s VoMetadata, frame: &[u8]) -> Result<(), Unadmitted>;
     fn mark(&self) -> usize;
     fn rollback(&mut self, mark: usize);
+}
+
+/// Why a frame sink did not take a frame.
+#[derive(Clone, Copy, Debug)]
+enum Unadmitted {
+    /// The capability refused the frame.
+    Refused(VoRefusal),
+    /// The sink could not back the proof it keeps.
+    OutOfMemory,
 }
 
 /// Admits each frame and keeps nothing: the judgment alone.
 struct JudgeOnly<'a, A>(&'a A);
 
 impl<'s, A: VoAdmission> FrameAdmission<'s> for JudgeOnly<'_, A> {
-    fn admit(&mut self, metadata: &'s VoMetadata, frame: &[u8]) -> Result<(), VoRefusal> {
-        admit_frame(self.0, metadata, frame).map(drop)
+    fn admit(&mut self, metadata: &'s VoMetadata, frame: &[u8]) -> Result<(), Unadmitted> {
+        admit_frame(self.0, metadata, frame)
+            .map(drop)
+            .map_err(Unadmitted::Refused)
     }
 
     fn mark(&self) -> usize {
@@ -736,12 +944,15 @@ struct RetainProjections<'x, A: VoAdmission + 'x> {
 }
 
 impl<'s: 'x, 'x, A: VoAdmission + 'x> FrameAdmission<'s> for RetainProjections<'x, A> {
-    fn admit(&mut self, metadata: &'s VoMetadata, frame: &[u8]) -> Result<(), VoRefusal> {
+    fn admit(&mut self, metadata: &'s VoMetadata, frame: &[u8]) -> Result<(), Unadmitted> {
         let Some(lent) = batch_slice(self.input, frame) else {
             columine_types::die!("a MessagePack value-object frame is a slice of its batch")
         };
-        let proof = admit_frame(self.admission, metadata, lent)?;
+        let proof = admit_frame(self.admission, metadata, lent).map_err(Unadmitted::Refused)?;
         if !core::ptr::eq(proof.bytes(), proof.lent()) {
+            self.projected
+                .try_reserve(1)
+                .map_err(|_| Unadmitted::OutOfMemory)?;
             self.projected.push(proof);
         }
         Ok(())
@@ -764,8 +975,135 @@ fn batch_slice<'i>(input: &'i [u8], frame: &[u8]) -> Option<&'i [u8]> {
     core::ptr::eq(slice, frame).then_some(slice)
 }
 
-/// Semantic schemas keyed by event type as carried at EP creation.
-pub type SemanticSchemaSet = BTreeMap<String, SemanticSchema>;
+/// Semantic schemas keyed by event type as carried at EP creation, held
+/// sorted by event type in storage backed fallibly.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SemanticSchemaSet {
+    entries: Vec<(String, SemanticSchema)>,
+}
+
+impl SemanticSchemaSet {
+    /// The schema declared for `event_type`.
+    pub fn get(&self, event_type: &str) -> Option<&SemanticSchema> {
+        self.entries
+            .binary_search_by(|(name, _)| name.as_str().cmp(event_type))
+            .ok()
+            .map(|index| &self.entries[index].1)
+    }
+
+    /// Every declared schema, by event type.
+    pub fn values(&self) -> impl Iterator<Item = &SemanticSchema> {
+        self.entries.iter().map(|(_, schema)| schema)
+    }
+
+    /// Every `(event type, schema)`, by event type.
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &SemanticSchema)> {
+        self.entries.iter().map(|(name, schema)| (name, schema))
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+impl SemanticSchemaSet {
+    /// A copy whose storage is backed fallibly.
+    pub fn try_clone(&self) -> Result<Self, SchemaParseError> {
+        let entries = each(&self.entries, |(name, schema)| {
+            Ok((
+                owned_text(name).map_err(|_| SchemaParseError::OutOfMemory)?,
+                schema.try_clone()?,
+            ))
+        })?;
+        Ok(Self { entries })
+    }
+}
+
+impl SemanticSchema {
+    /// A deep copy whose storage is backed fallibly.
+    pub fn try_clone(&self) -> Result<Self, SchemaParseError> {
+        let node = |child: &Self| Node::new(child.try_clone()?);
+        Ok(match self {
+            Self::Unknown => Self::Unknown,
+            Self::String => Self::String,
+            Self::Number => Self::Number,
+            Self::Boolean => Self::Boolean,
+            Self::Binary => Self::Binary,
+            Self::BigInt => Self::BigInt,
+            Self::I32 => Self::I32,
+            Self::U32 => Self::U32,
+            Self::Range(range) => Self::Range(*range),
+            Self::Enum(variants) => Self::Enum(each(variants, |variant| {
+                owned_text(variant).map_err(|_| SchemaParseError::OutOfMemory)
+            })?),
+            Self::Array { item, length } => Self::Array {
+                item: node(item)?,
+                length: *length,
+            },
+            Self::Object { fields, open } => Self::Object {
+                fields: each(fields, |(name, schema)| {
+                    Ok((
+                        owned_text(name).map_err(|_| SchemaParseError::OutOfMemory)?,
+                        schema.try_clone()?,
+                    ))
+                })?,
+                open: *open,
+            },
+            Self::Union(variants) => Self::Union(each(variants, Self::try_clone)?),
+            Self::Map { key, value } => Self::Map {
+                key: node(key)?,
+                value: node(value)?,
+            },
+            Self::Record(value) => Self::Record(node(value)?),
+            Self::Optional(value) => Self::Optional(node(value)?),
+            Self::Nullable(value) => Self::Nullable(node(value)?),
+            Self::Vo(metadata) => Self::Vo(Node::new(try_clone_vo(metadata)?)?),
+        })
+    }
+}
+
+/// A copy of value-object metadata whose storage is backed fallibly.
+fn try_clone_vo(metadata: &VoMetadata) -> Result<VoMetadata, SchemaParseError> {
+    let bytes = |bytes: &Vec<u8>| -> Result<Vec<u8>, SchemaParseError> {
+        let mut out = backed(bytes.len()).map_err(|_| SchemaParseError::OutOfMemory)?;
+        out.extend_from_slice(bytes);
+        Ok(out)
+    };
+    let definitions = |definitions: &Vec<VoDefinition>| {
+        each(definitions, |definition| {
+            Ok(VoDefinition {
+                name: owned_text(&definition.name).map_err(|_| SchemaParseError::OutOfMemory)?,
+                definition: bytes(&definition.definition)?,
+            })
+        })
+    };
+    Ok(VoMetadata {
+        root: owned_text(&metadata.root).map_err(|_| SchemaParseError::OutOfMemory)?,
+        frame: bytes(&metadata.frame)?,
+        rows: each(&metadata.rows, bytes)?,
+        profile: VoProfile {
+            records: definitions(&metadata.profile.records)?,
+            attributes: definitions(&metadata.profile.attributes)?,
+        },
+        retained: each(&metadata.retained, bytes)?,
+    })
+}
+
+impl<'a> IntoIterator for &'a SemanticSchemaSet {
+    type Item = (&'a String, &'a SemanticSchema);
+    type IntoIter = std::iter::Map<
+        std::slice::Iter<'a, (String, SemanticSchema)>,
+        fn(&'a (String, SemanticSchema)) -> (&'a String, &'a SemanticSchema),
+    >;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.entries.iter().map(|(name, schema)| (name, schema))
+    }
+}
 
 /// A validation failure tied to one event in an input batch.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -775,24 +1113,67 @@ pub enum BatchValidationError {
         event_index: usize,
         /// The event's signal type, when it named one.
         event_type: Option<String>,
-        violation: Box<PayloadViolation>,
+        violation: Node<PayloadViolation>,
     },
+    /// The batch's decoded events, the judgment's path, or the diagnostic
+    /// naming a violation could not be backed.
+    OutOfMemory,
+}
+
+impl From<Exhausted> for BatchValidationError {
+    fn from(_: Exhausted) -> Self {
+        Self::OutOfMemory
+    }
+}
+
+/// The refusal of event `event_index` for `fault` at `path`.
+fn refused(
+    event_index: usize,
+    event_type: Option<&str>,
+    fault: Fault<'_>,
+    path: &str,
+) -> BatchValidationError {
+    let spell = || -> Result<BatchValidationError, Exhausted> {
+        Ok(BatchValidationError::Violation {
+            event_index,
+            event_type: event_type.map(spelled).transpose()?,
+            violation: Node::new(fault.spell(path)?).map_err(|_| Exhausted)?,
+        })
+    };
+    spell().unwrap_or(BatchValidationError::OutOfMemory)
+}
+
+/// A batch judgment's refusal for `stop`, with the judgment's `path`.
+fn stopped(
+    event_index: usize,
+    event_type: Option<&str>,
+    stop: Stop<'_>,
+    path: &JudgedPath,
+) -> BatchValidationError {
+    match stop {
+        Stop::Fault(fault) => refused(event_index, event_type, fault, path.as_str()),
+        Stop::OutOfMemory => BatchValidationError::OutOfMemory,
+    }
 }
 
 /// Decode `{"<eventType>": <tree>, ...}` once at processor creation.
 pub fn parse_schema_envelope(bytes: &[u8]) -> Result<SemanticSchemaSet, SchemaParseError> {
-    let value = JsonValue::parse(bytes).map_err(|_| SchemaParseError::InvalidJson)?;
+    let value = JsonValue::parse(bytes).map_err(|error| match error {
+        ValueParseError::OutOfMemory => SchemaParseError::OutOfMemory,
+        _ => SchemaParseError::InvalidJson,
+    })?;
     let fields = object_fields(&value)?;
-    let mut schemas = BTreeMap::new();
-    for (event_type, tree) in fields {
-        if schemas
-            .insert(event_type.clone(), SemanticSchema::from_tree_value(tree)?)
-            .is_some()
-        {
-            return Err(SchemaParseError::DuplicateField);
-        }
+    let mut entries = each(fields, |(event_type, tree)| {
+        Ok((
+            owned_text(event_type).map_err(|_| SchemaParseError::OutOfMemory)?,
+            SemanticSchema::from_tree_value(tree)?,
+        ))
+    })?;
+    entries.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+    if entries.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+        return Err(SchemaParseError::DuplicateField);
     }
-    Ok(schemas)
+    Ok(SemanticSchemaSet { entries })
 }
 
 /// A semantic envelope whose value-object capability is prepared for every
@@ -813,25 +1194,68 @@ pub struct PreparedSchemas<A> {
     presence: VoPresence,
 }
 
+/// Why a semantic envelope could not be prepared.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PrepareRefusal {
+    /// The capability refused a declared schema.
+    Refused(VoPreparationError),
+    /// The storage to prepare could not be backed.
+    OutOfMemory,
+}
+
+/// How many `vo` nodes `schema` holds.
+fn count_vo_metadata(schema: &SemanticSchema) -> usize {
+    match schema {
+        SemanticSchema::Vo(_) => 1,
+        SemanticSchema::Object { fields, .. } => fields
+            .iter()
+            .map(|(_, child)| count_vo_metadata(child))
+            .sum(),
+        SemanticSchema::Array { item, .. }
+        | SemanticSchema::Record(item)
+        | SemanticSchema::Optional(item)
+        | SemanticSchema::Nullable(item) => count_vo_metadata(item),
+        SemanticSchema::Map { key, value } => count_vo_metadata(key) + count_vo_metadata(value),
+        SemanticSchema::Union(variants) => variants.iter().map(count_vo_metadata).sum(),
+        SemanticSchema::Unknown
+        | SemanticSchema::String
+        | SemanticSchema::Number
+        | SemanticSchema::Boolean
+        | SemanticSchema::Binary
+        | SemanticSchema::BigInt
+        | SemanticSchema::I32
+        | SemanticSchema::U32
+        | SemanticSchema::Range(_)
+        | SemanticSchema::Enum(_) => 0,
+    }
+}
+
 impl<A: VoAdmission> PreparedSchemas<A> {
     /// Prepare `admission` once for every distinct `vo` metadata declared
     /// anywhere in `schemas`. The first refusal stops preparation and names
     /// its root; a set with no `vo` node never consults the capability.
-    pub fn prepare(
-        schemas: SemanticSchemaSet,
-        mut admission: A,
-    ) -> Result<Self, VoPreparationError> {
+    pub fn prepare(schemas: SemanticSchemaSet, mut admission: A) -> Result<Self, PrepareRefusal> {
+        // Counted before it is collected: the list of declared metadata is
+        // backed whole, so collecting it never grows it.
+        let count = schemas.values().map(count_vo_metadata).sum();
         let mut declared = Vec::new();
+        declared
+            .try_reserve_exact(count)
+            .map_err(|_| PrepareRefusal::OutOfMemory)?;
         for schema in schemas.values() {
             collect_vo_metadata(schema, &mut declared);
         }
-        let prepared =
-            prepare_each(&mut admission, declared.iter().copied()).map_err(|refused| {
-                VoPreparationError {
-                    root: declared[refused.index].root.clone(),
+        let prepared = match prepare_each(&mut admission, declared.iter().copied()) {
+            Ok(prepared) => prepared,
+            Err(refused) => {
+                let root = owned_text(&declared[refused.index].root)
+                    .map_err(|_| PrepareRefusal::OutOfMemory)?;
+                return Err(PrepareRefusal::Refused(VoPreparationError {
+                    root,
                     error: refused.error,
-                }
-            })?;
+                }));
+            }
+        };
         let presence = match prepared {
             0 => VoPresence::Absent,
             _ => VoPresence::Present,
@@ -858,7 +1282,10 @@ impl<A: VoAdmission> PreparedSchemas<A> {
     /// Validate a JSON batch: an array of event objects. JSON cannot spell a
     /// binary frame, so no value-object frame is ever admitted here.
     pub fn validate_json_batch(&self, input: &[u8]) -> Result<(), BatchValidationError> {
-        let batch = JsonValue::parse(input).map_err(|_| BatchValidationError::InvalidInput)?;
+        let batch = JsonValue::parse(input).map_err(|error| match error {
+            ValueParseError::OutOfMemory => BatchValidationError::OutOfMemory,
+            _ => BatchValidationError::InvalidInput,
+        })?;
         let JsonValue::Array(events) = batch else {
             return Err(BatchValidationError::InvalidInput);
         };
@@ -880,24 +1307,26 @@ impl<A: VoAdmission> PreparedSchemas<A> {
         if input.is_empty() {
             return Ok(Vec::new());
         }
+        let unparsed = |error| match error {
+            ValueParseError::OutOfMemory => BatchValidationError::OutOfMemory,
+            _ => BatchValidationError::InvalidInput,
+        };
         let mut reader = Reader::new(input);
         let mut events = Vec::new();
         if stream {
             while !reader.at_end() {
-                events.push(
-                    parse_msgpack_event(&mut reader)
-                        .map_err(|_| BatchValidationError::InvalidInput)?,
-                );
+                let event = parse_msgpack_event(&mut reader).map_err(unparsed)?;
+                one_more(&mut events).map_err(unparsed)?;
+                events.push(event);
             }
         } else {
             let count = reader
                 .read_array_header()
                 .ok_or(BatchValidationError::InvalidInput)?;
+            events = backed_values(&reader, count).map_err(unparsed)?;
             for _ in 0..count {
-                events.push(
-                    parse_msgpack_event(&mut reader)
-                        .map_err(|_| BatchValidationError::InvalidInput)?,
-                );
+                let event = parse_msgpack_event(&mut reader).map_err(unparsed)?;
+                events.push(event);
             }
             if !reader.at_end() {
                 return Err(BatchValidationError::InvalidInput);
@@ -917,6 +1346,7 @@ impl<A: VoAdmission> PreparedSchemas<A> {
         events: &[V],
         frames: &mut dyn FrameAdmission<'s>,
     ) -> Result<(), BatchValidationError> {
+        let mut path = JudgedPath::default();
         for (event_index, event) in events.iter().enumerate() {
             if event.kind() != ValueKind::Object {
                 return Err(BatchValidationError::InvalidInput);
@@ -925,44 +1355,63 @@ impl<A: VoAdmission> PreparedSchemas<A> {
             let event_type = type_value
                 .filter(|value| value.kind() == ValueKind::String)
                 .and_then(|value| value.as_str());
-            let refuse = |violation| BatchValidationError::Violation {
-                event_index,
-                event_type: event_type.map(str::to_owned),
-                violation: Box::new(violation),
-            };
             // A repeated `type` or `value` is judged by one spelling and stored
             // from another, so the judged and stored bytes diverge.
             if let Some(name) = ["type", "value"]
                 .into_iter()
                 .find(|name| key_count(event, name) > 1)
             {
-                return Err(refuse(PayloadViolation::repeated_key(name)));
+                return Err(refused(
+                    event_index,
+                    event_type,
+                    Fault::repeated_key(),
+                    name,
+                ));
             }
             let Some(schema) = event_type.and_then(|name| self.schemas.get(name)) else {
-                return Err(refuse(match (event_type, type_value) {
-                    (Some(_), _) => PayloadViolation::undeclared_type(),
-                    (None, Some(value)) => PayloadViolation::unmodeled(value.kind().as_str()),
-                    (None, None) => PayloadViolation::unmodeled("absent"),
-                }));
+                let observed = match (event_type, type_value) {
+                    (Some(_), _) => Observed::Text("undeclared"),
+                    (None, Some(value)) => Observed::Kind(value.kind()),
+                    (None, None) => Observed::Text("absent"),
+                };
+                let fault = Fault {
+                    expected: Expected::Text("signal type declared by the semantic schema"),
+                    observed,
+                    vo: None,
+                };
+                return Err(refused(event_index, event_type, fault, "type"));
             };
-            refuse_flat_payload_keys(event).map_err(refuse)?;
+            refuse_flat_payload_keys(event, &mut path)
+                .map_err(|stop| stopped(event_index, event_type, stop, &path))?;
+            path.at("value")?;
             let value = event.object_field("value").unwrap_or(&AbsentValue);
-            validate_at(schema, value, "value", 0, frames).map_err(refuse)?;
+            validate_at(schema, value, &mut path, 0, frames)
+                .map_err(|stop| stopped(event_index, event_type, stop, &path))?;
         }
         Ok(())
     }
 }
 
 /// The admission shape is nested: a top-level `value.<member>` key is a
-/// payload member the judgment never sees.
-fn refuse_flat_payload_keys(event: &dyn ValueView) -> Result<(), PayloadViolation> {
-    let mut violation = None;
+/// payload member the judgment never sees. A refusal leaves `path` naming the
+/// key.
+fn refuse_flat_payload_keys(
+    event: &dyn ValueView,
+    path: &mut JudgedPath,
+) -> Result<(), Stop<'static>> {
+    let mut stop = None;
     event.visit_object(&mut |key, _| {
-        if violation.is_none() && key.starts_with("value.") {
-            violation = Some(PayloadViolation::flat_payload_key(key));
+        if stop.is_none() && key.starts_with("value.") {
+            stop = Some(match path.at(key) {
+                Ok(()) => Stop::Fault(Fault::text(
+                    "payload member nested under value",
+                    "flat payload key",
+                )),
+                Err(exhausted) => exhausted.into(),
+            });
         }
     });
-    violation.map_or(Ok(()), Err)
+    stop.map_or(Ok(()), Err)
 }
 
 /// How many members of `object` are spelled `name`.
@@ -981,113 +1430,116 @@ impl ValueView for AbsentValue {
     }
 }
 
+/// Judge `value` at `path` against `schema`. An admitted value leaves `path`
+/// as it found it; a refused one leaves it naming the refused value.
 fn validate_at<'s>(
     schema: &'s SemanticSchema,
     value: &dyn ValueView,
-    path: &str,
+    path: &mut JudgedPath,
     depth: usize,
     frames: &mut dyn FrameAdmission<'s>,
-) -> Result<(), PayloadViolation> {
+) -> Result<(), Stop<'s>> {
     if depth > MAX_VALUE_DEPTH {
-        return Err(PayloadViolation::new(
-            path,
-            "value depth <= 256",
-            value.kind(),
-        ));
+        return Err(Fault::shape("value depth <= 256", value).into());
     }
     match schema {
         SemanticSchema::Unknown => Ok(()),
-        SemanticSchema::String => require_kind(path, value, ValueKind::String),
-        SemanticSchema::Boolean => require_kind(path, value, ValueKind::Boolean),
-        SemanticSchema::Binary => require_kind(path, value, ValueKind::Binary),
-        SemanticSchema::BigInt => validate_bigint(path, value),
-        SemanticSchema::Number => validate_number(path, value),
-        SemanticSchema::I32 => validate_i32(path, value),
-        SemanticSchema::U32 => validate_u32(path, value),
-        SemanticSchema::Range(range) => validate_range(path, *range, value),
-        SemanticSchema::Vo(metadata) => validate_vo(path, metadata, value, frames),
+        SemanticSchema::String => require_kind(value, ValueKind::String),
+        SemanticSchema::Boolean => require_kind(value, ValueKind::Boolean),
+        SemanticSchema::Binary => require_kind(value, ValueKind::Binary),
+        SemanticSchema::BigInt => validate_bigint(value),
+        SemanticSchema::Number => validate_number(value),
+        SemanticSchema::I32 => validate_i32(value),
+        SemanticSchema::U32 => validate_u32(value),
+        SemanticSchema::Range(range) => validate_range(*range, value),
+        SemanticSchema::Vo(metadata) => validate_vo(metadata, value, frames),
         SemanticSchema::Enum(variants) => {
-            if value.kind() != ValueKind::String {
-                return Err(PayloadViolation::shape(path, "enum string", value));
-            }
-            let Some(actual) = value.as_str() else {
-                return Err(PayloadViolation::shape(path, "enum string", value));
+            let actual = match (value.kind(), value.as_str()) {
+                (ValueKind::String, Some(actual)) => actual,
+                _ => return Err(Fault::shape("enum string", value).into()),
             };
             if variants.iter().any(|variant| variant == actual) {
                 Ok(())
             } else {
-                Err(PayloadViolation::new(
-                    path,
-                    format!("enum {{{}}}", variants.join(", ")),
-                    value.kind(),
-                ))
+                Err(Fault::seen(Expected::Enum(variants), value.kind()).into())
             }
         }
         SemanticSchema::Array { item, length } => {
             if value.kind() != ValueKind::Array {
-                return Err(PayloadViolation::shape(path, "array", value));
+                return Err(Fault::shape("array", value).into());
             }
+            let array = path.mark();
             let mut count = 0_u64;
-            let mut violation = None;
+            let mut stop = None;
             value.visit_array(&mut |index, item_value| {
                 count += 1;
-                if violation.is_some() {
+                if stop.is_some() {
                     return;
                 }
-                let item_path = format!("{path}[{index}]");
-                violation = validate_at(item, item_value, &item_path, depth + 1, frames).err();
+                let judged = path.index(index).map_err(Stop::from).and_then(|mark| {
+                    validate_at(item, item_value, path, depth + 1, frames)?;
+                    path.cut(mark);
+                    Ok(())
+                });
+                stop = judged.err();
             });
+            if let Some(Stop::OutOfMemory) = stop {
+                return Err(Stop::OutOfMemory);
+            }
             if let Some(expected) = *length
                 && count != u64::from(expected)
             {
-                return Err(PayloadViolation {
-                    path: path.to_owned(),
-                    expected: format!("array of length {expected}"),
-                    observed: format!("array of length {count}"),
+                path.cut(array);
+                return Err(Fault {
+                    expected: Expected::Length(expected),
+                    observed: Observed::Length(count),
                     vo: None,
-                });
+                }
+                .into());
             }
-            violation.map_or(Ok(()), Err)
+            stop.map_or(Ok(()), Err)
         }
         SemanticSchema::Object { fields, open } => {
             if value.kind() != ValueKind::Object {
-                return Err(PayloadViolation::shape(path, "object", value));
+                return Err(Fault::shape("object", value).into());
             }
             for (name, field_schema) in fields {
                 let Some(field_value) = value.object_field(name) else {
                     if !matches!(field_schema, SemanticSchema::Optional(_)) {
-                        return Err(PayloadViolation {
-                            path: field_path(path, name),
-                            expected: field_schema.kind().into(),
-                            observed: "absent".into(),
-                            vo: None,
-                        });
+                        path.field(name)?;
+                        return Err(Fault::text(field_schema.kind(), "absent").into());
                     }
                     continue;
                 };
-                let child_path = field_path(path, name);
+                let mark = path.field(name)?;
                 if key_count(value, name) > 1 {
-                    return Err(PayloadViolation::repeated_key(&child_path));
+                    return Err(Fault::repeated_key().into());
                 }
-                validate_at(field_schema, field_value, &child_path, depth + 1, frames)?;
+                validate_at(field_schema, field_value, path, depth + 1, frames)?;
+                path.cut(mark);
             }
             if !open {
-                let mut violation = None;
+                let mut stop = None;
                 value.visit_object(&mut |name, _| {
-                    if violation.is_none() && !fields.iter().any(|(field, _)| field == name) {
-                        violation = Some(PayloadViolation::closed_unknown(
-                            &field_path(path, name),
-                            fields,
-                        ));
+                    if stop.is_none() && !fields.iter().any(|(field, _)| field == name) {
+                        stop = Some(match path.field(name) {
+                            Ok(_) => Stop::Fault(Fault {
+                                expected: Expected::Declared(fields),
+                                observed: Observed::Text("undeclared"),
+                                vo: None,
+                            }),
+                            Err(exhausted) => exhausted.into(),
+                        });
                     }
                 });
-                if let Some(error) = violation {
-                    return Err(error);
+                if let Some(stop) = stop {
+                    return Err(stop);
                 }
             }
             Ok(())
         }
         SemanticSchema::Union(variants) => {
+            let union = path.mark();
             let mut matches = 0;
             // A union that admits nothing keeps the first value-object cause
             // so a capability refusal stays observable through the union.
@@ -1096,53 +1548,61 @@ fn validate_at<'s>(
                 let mark = frames.mark();
                 match validate_at(variant, value, path, depth + 1, frames) {
                     Ok(()) => matches += 1,
-                    Err(violation) => {
+                    Err(Stop::Fault(fault)) => {
                         frames.rollback(mark);
-                        vo = vo.or(violation.vo);
+                        path.cut(union);
+                        vo = vo.or(fault.vo);
                     }
+                    Err(Stop::OutOfMemory) => return Err(Stop::OutOfMemory),
                 }
             }
             if matches == 1 {
                 Ok(())
             } else {
-                Err(PayloadViolation {
+                Err(Fault {
                     vo: if matches == 0 { vo } else { None },
-                    ..PayloadViolation::new(path, "exactly one union variant", value.kind())
-                })
+                    ..Fault::shape("exactly one union variant", value)
+                }
+                .into())
             }
         }
         SemanticSchema::Map { key, value: item } => {
             if value.kind() != ValueKind::Object {
-                return Err(PayloadViolation::shape(path, "map", value));
+                return Err(Fault::shape("map", value).into());
             }
-            let mut violation = None;
+            let mut stop = None;
             value.visit_object(&mut |name, item_value| {
-                if violation.is_some() {
+                if stop.is_some() {
                     return;
                 }
                 let key_value = StringValue(name);
-                violation = validate_at(key, &key_value, path, depth + 1, frames)
-                    .err()
-                    .or_else(|| {
-                        validate_at(item, item_value, &field_path(path, name), depth + 1, frames)
-                            .err()
-                    });
+                let judged = validate_at(key, &key_value, path, depth + 1, frames).and_then(|()| {
+                    let mark = path.field(name)?;
+                    validate_at(item, item_value, path, depth + 1, frames)?;
+                    path.cut(mark);
+                    Ok(())
+                });
+                stop = judged.err();
             });
-            violation.map_or(Ok(()), Err)
+            stop.map_or(Ok(()), Err)
         }
         SemanticSchema::Record(item) => {
             if value.kind() != ValueKind::Object {
-                return Err(PayloadViolation::shape(path, "record", value));
+                return Err(Fault::shape("record", value).into());
             }
-            let mut violation = None;
+            let mut stop = None;
             value.visit_object(&mut |name, item_value| {
-                if violation.is_none() {
-                    violation =
-                        validate_at(item, item_value, &field_path(path, name), depth + 1, frames)
-                            .err();
+                if stop.is_some() {
+                    return;
                 }
+                let judged = path.field(name).map_err(Stop::from).and_then(|mark| {
+                    validate_at(item, item_value, path, depth + 1, frames)?;
+                    path.cut(mark);
+                    Ok(())
+                });
+                stop = judged.err();
             });
-            violation.map_or(Ok(()), Err)
+            stop.map_or(Ok(()), Err)
         }
         SemanticSchema::Optional(item) => validate_at(item, value, path, depth + 1, frames),
         SemanticSchema::Nullable(item) => {
@@ -1159,35 +1619,30 @@ fn validate_at<'s>(
 /// checks the capability's proof names exactly the borrowed bytes under the
 /// declared root and frame table.
 fn validate_vo<'s>(
-    path: &str,
     metadata: &'s VoMetadata,
     value: &dyn ValueView,
     frames: &mut dyn FrameAdmission<'s>,
-) -> Result<(), PayloadViolation> {
+) -> Result<(), Stop<'s>> {
     let bytes = match (value.kind(), value.as_bytes()) {
         (ValueKind::Binary, Some(bytes)) => bytes,
-        _ => {
-            return Err(PayloadViolation::new(
-                path,
-                vo_expected(metadata),
-                value.kind(),
-            ));
-        }
+        _ => return Err(Fault::seen(Expected::Vo(metadata), value.kind()).into()),
     };
     frames
         .admit(metadata, bytes)
-        .map_err(|refusal| PayloadViolation::vo(path, metadata, refusal))
+        .map_err(|unadmitted| match unadmitted {
+            Unadmitted::Refused(refusal) => Stop::Fault(Fault {
+                vo: Some(refusal),
+                ..Fault::seen(Expected::Vo(metadata), ValueKind::Binary)
+            }),
+            Unadmitted::OutOfMemory => Stop::OutOfMemory,
+        })
 }
 
 /// A range admits numbers exactly as `number` does — any finite JSON or
 /// MessagePack number, and a canonical int64 only within the safe-integer
 /// range — and then requires the value inside its bounds. Integer tokens and
 /// canonical int64 values are compared exactly, never through a double.
-fn validate_range(
-    path: &str,
-    range: NumericRange,
-    value: &dyn ValueView,
-) -> Result<(), PayloadViolation> {
+fn validate_range<'s>(range: NumericRange, value: &dyn ValueView) -> Result<(), Stop<'s>> {
     let admitted = match value.kind() {
         ValueKind::Number => match value.as_number() {
             Some(NumberValue::Float(number)) => range.contains_float(number),
@@ -1208,19 +1663,15 @@ fn validate_range(
     if admitted {
         Ok(())
     } else {
-        Err(PayloadViolation::new(path, range.expected(), value.kind()))
+        Err(Fault::seen(Expected::Range(range), value.kind()).into())
     }
 }
 
-fn require_kind(
-    path: &str,
-    value: &dyn ValueView,
-    expected: ValueKind,
-) -> Result<(), PayloadViolation> {
+fn require_kind<'s>(value: &dyn ValueView, expected: ValueKind) -> Result<(), Stop<'s>> {
     if value.kind() == expected {
         Ok(())
     } else {
-        Err(PayloadViolation::shape(path, expected.as_str(), value))
+        Err(Fault::shape(expected.as_str(), value).into())
     }
 }
 
@@ -1233,7 +1684,7 @@ fn require_kind(
 ///
 /// A canonical int64 is also sufficient evidence: its adapter retained every
 /// bit, but the canonical codec erased the originating host's numeric type.
-fn validate_bigint(path: &str, value: &dyn ValueView) -> Result<(), PayloadViolation> {
+fn validate_bigint<'s>(value: &dyn ValueView) -> Result<(), Stop<'s>> {
     match value.kind() {
         ValueKind::BigInt => Ok(()),
         ValueKind::CanonicalInt64 if value.as_canonical_i64().is_some() => Ok(()),
@@ -1244,31 +1695,31 @@ fn validate_bigint(path: &str, value: &dyn ValueView) -> Result<(), PayloadViola
             if decimal && (text.parse::<i64>().is_ok() || text.parse::<u64>().is_ok()) {
                 Ok(())
             } else {
-                Err(PayloadViolation::shape(path, "bigint", value))
+                Err(Fault::shape("bigint", value).into())
             }
         }
-        _ => Err(PayloadViolation::shape(path, "bigint", value)),
+        _ => Err(Fault::shape("bigint", value).into()),
     }
 }
 
 /// A number is any finite JSON/MessagePack number. A canonical int64 is a
 /// number only within the safe-integer range `±(2^53 − 1)`; wider values fit
 /// `bigint` alone, even when an individual value is representable as a double.
-fn validate_number(path: &str, value: &dyn ValueView) -> Result<(), PayloadViolation> {
+fn validate_number<'s>(value: &dyn ValueView) -> Result<(), Stop<'s>> {
     let kind = value.kind();
     if !matches!(kind, ValueKind::Number | ValueKind::CanonicalInt64) {
-        return Err(PayloadViolation::shape(path, "number", value));
+        return Err(Fault::shape("number", value).into());
     }
     if kind == ValueKind::CanonicalInt64 {
         return match value.as_canonical_i64() {
             Some(number) if (-MAX_SAFE_INTEGER..=MAX_SAFE_INTEGER).contains(&number) => Ok(()),
-            _ => Err(PayloadViolation::shape(path, "safe number", value)),
+            _ => Err(Fault::shape("safe number", value).into()),
         };
     }
     match value.as_number() {
         Some(NumberValue::Float(number)) if number.is_finite() => Ok(()),
         Some(NumberValue::Signed(_) | NumberValue::Unsigned(_)) => Ok(()),
-        _ => Err(PayloadViolation::shape(path, "finite number", value)),
+        _ => Err(Fault::shape("finite number", value).into()),
     }
 }
 
@@ -1284,7 +1735,7 @@ fn numeric_value(value: &dyn ValueView) -> Option<NumberValue> {
     }
 }
 
-fn validate_i32(path: &str, value: &dyn ValueView) -> Result<(), PayloadViolation> {
+fn validate_i32<'s>(value: &dyn ValueView) -> Result<(), Stop<'s>> {
     let valid = match numeric_value(value) {
         Some(NumberValue::Signed(number)) => i32::try_from(number).is_ok(),
         Some(NumberValue::Unsigned(number)) => i32::try_from(number).is_ok(),
@@ -1299,11 +1750,11 @@ fn validate_i32(path: &str, value: &dyn ValueView) -> Result<(), PayloadViolatio
     if valid {
         Ok(())
     } else {
-        Err(PayloadViolation::shape(path, "i32", value))
+        Err(Fault::shape("i32", value).into())
     }
 }
 
-fn validate_u32(path: &str, value: &dyn ValueView) -> Result<(), PayloadViolation> {
+fn validate_u32<'s>(value: &dyn ValueView) -> Result<(), Stop<'s>> {
     let valid = match numeric_value(value) {
         Some(NumberValue::Signed(number)) => u32::try_from(number).is_ok(),
         Some(NumberValue::Unsigned(number)) => u32::try_from(number).is_ok(),
@@ -1318,21 +1769,25 @@ fn validate_u32(path: &str, value: &dyn ValueView) -> Result<(), PayloadViolatio
     if valid {
         Ok(())
     } else {
-        Err(PayloadViolation::shape(path, "u32", value))
+        Err(Fault::shape("u32", value).into())
     }
 }
 
-fn field_path(parent: &str, segment: &str) -> String {
-    format!("{parent}.{}", encode_path_segment(segment))
-}
-
-/// Presence columns use percent-encoded bytes for path segments. Percent is
-/// escaped first so a literal `%2E` cannot be confused with a literal dot.
-pub(crate) fn encode_path_segment(segment: &str) -> String {
-    let mut output = Vec::with_capacity(encoded_segment_len(segment));
-    encode_segment_into(segment, |chunk| output.extend_from_slice(chunk));
-    // Splitting only at the ASCII `.` and `%` keeps every chunk UTF-8.
-    String::from_utf8(output).unwrap_or_else(|_| unreachable!("ASCII splits keep UTF-8"))
+/// Append `segment` to the dotted `path` in its carrier spelling, after a
+/// `.` unless `path` is empty; returns the length that removes it again.
+/// Growing `path` is fallible.
+pub(crate) fn push_path_segment(
+    path: &mut String,
+    segment: &str,
+) -> Result<usize, std::collections::TryReserveError> {
+    let mark = path.len();
+    let separator = usize::from(mark != 0);
+    path.try_reserve(separator + encoded_segment_len(segment))?;
+    if separator != 0 {
+        path.push('.');
+    }
+    encode_segment_into(segment, |chunk| path.push_str(chunk));
+    Ok(mark)
 }
 
 /// The length of `segment`'s carrier spelling.
@@ -1346,20 +1801,20 @@ pub(crate) fn encoded_segment_len(segment: &str) -> usize {
 
 /// Feed `segment`'s carrier spelling to `emit`: `.` as `%2E`, `%` as `%25`,
 /// and every other byte, a non-ASCII one included, as itself.
-pub(crate) fn encode_segment_into(segment: &str, mut emit: impl FnMut(&[u8])) {
-    let bytes = segment.as_bytes();
+pub(crate) fn encode_segment_into(segment: &str, mut emit: impl FnMut(&str)) {
     let mut start = 0;
-    for (index, byte) in bytes.iter().enumerate() {
-        let escape: &[u8] = match byte {
-            b'.' => b"%2E",
-            b'%' => b"%25",
+    for (index, byte) in segment.bytes().enumerate() {
+        let escape = match byte {
+            b'.' => "%2E",
+            b'%' => "%25",
             _ => continue,
         };
-        emit(&bytes[start..index]);
+        // `.` and `%` are ASCII, so every split falls on a char boundary.
+        emit(&segment[start..index]);
         emit(escape);
         start = index + 1;
     }
-    emit(&bytes[start..]);
+    emit(&segment[start..]);
 }
 
 struct StringValue<'a>(&'a str);
@@ -1394,13 +1849,13 @@ fn parse_schema(value: &JsonValue, depth: usize) -> Result<SemanticSchema, Schem
         ))?)),
         "range" => Ok(SemanticSchema::Range(parse_range(fields)?)),
         "array" => Ok(SemanticSchema::Array {
-            item: Box::new(parse_schema(
+            item: Node::new(parse_schema(
                 field(fields, "item").ok_or(SchemaParseError::MissingOperand)?,
                 depth + 1,
-            )?),
+            )?)?,
             length: parse_array_length(field(fields, "length"))?,
         }),
-        "vo" => Ok(SemanticSchema::Vo(Box::new(parse_vo_metadata(fields)?))),
+        "vo" => Ok(SemanticSchema::Vo(Node::new(parse_vo_metadata(fields)?)?)),
         "object" => {
             let object_fields =
                 object_fields(field(fields, "fields").ok_or(SchemaParseError::MissingOperand)?)?;
@@ -1409,12 +1864,16 @@ fn parse_schema(value: &JsonValue, depth: usize) -> Result<SemanticSchema, Schem
                 Some(JsonValue::Boolean(value)) => *value,
                 Some(_) => return Err(SchemaParseError::InvalidOperand),
             };
-            let mut parsed = Vec::with_capacity(object_fields.len());
+            let mut parsed = Vec::new();
+            parsed
+                .try_reserve_exact(object_fields.len())
+                .map_err(|_| SchemaParseError::OutOfMemory)?;
             for (name, field_schema) in object_fields {
                 if parsed.iter().any(|(known, _)| known == name) {
                     return Err(SchemaParseError::DuplicateField);
                 }
-                parsed.push((name.clone(), parse_schema(field_schema, depth + 1)?));
+                let name = owned_text(name).map_err(|_| SchemaParseError::OutOfMemory)?;
+                parsed.push((name, parse_schema(field_schema, depth + 1)?));
             }
             Ok(SemanticSchema::Object {
                 fields: parsed,
@@ -1429,27 +1888,27 @@ fn parse_schema(value: &JsonValue, depth: usize) -> Result<SemanticSchema, Schem
             Ok(SemanticSchema::Union(variants))
         }
         "map" => Ok(SemanticSchema::Map {
-            key: Box::new(parse_schema(
+            key: Node::new(parse_schema(
                 field(fields, "key").ok_or(SchemaParseError::MissingOperand)?,
                 depth + 1,
-            )?),
-            value: Box::new(parse_schema(
+            )?)?,
+            value: Node::new(parse_schema(
                 field(fields, "value").ok_or(SchemaParseError::MissingOperand)?,
                 depth + 1,
-            )?),
+            )?)?,
         }),
-        "record" => Ok(SemanticSchema::Record(Box::new(parse_schema(
+        "record" => Ok(SemanticSchema::Record(Node::new(parse_schema(
             field(fields, "value").ok_or(SchemaParseError::MissingOperand)?,
             depth + 1,
-        )?))),
-        "optional" => Ok(SemanticSchema::Optional(Box::new(parse_schema(
+        )?)?)),
+        "optional" => Ok(SemanticSchema::Optional(Node::new(parse_schema(
             field(fields, "value").ok_or(SchemaParseError::MissingOperand)?,
             depth + 1,
-        )?))),
-        "nullable" => Ok(SemanticSchema::Nullable(Box::new(parse_schema(
+        )?)?)),
+        "nullable" => Ok(SemanticSchema::Nullable(Node::new(parse_schema(
             field(fields, "value").ok_or(SchemaParseError::MissingOperand)?,
             depth + 1,
-        )?))),
+        )?)?)),
         _ => Err(SchemaParseError::UnknownKind),
     }
 }
@@ -1485,7 +1944,10 @@ fn parse_string_array(value: Option<&JsonValue>) -> Result<Vec<String>, SchemaPa
             SchemaParseError::InvalidOperand
         }));
     };
-    let mut output = Vec::with_capacity(values.len());
+    let mut output: Vec<String> = Vec::new();
+    output
+        .try_reserve_exact(values.len())
+        .map_err(|_| SchemaParseError::OutOfMemory)?;
     for value in values {
         let JsonValue::String(value) = value else {
             return Err(SchemaParseError::InvalidOperand);
@@ -1493,7 +1955,7 @@ fn parse_string_array(value: Option<&JsonValue>) -> Result<Vec<String>, SchemaPa
         if output.iter().any(|known| known == value) {
             return Err(SchemaParseError::DuplicateField);
         }
-        output.push(value.clone());
+        output.push(owned_text(value).map_err(|_| SchemaParseError::OutOfMemory)?);
     }
     Ok(output)
 }
@@ -1507,10 +1969,7 @@ fn parse_schema_array(
             SchemaParseError::InvalidOperand
         }));
     };
-    values
-        .iter()
-        .map(|value| parse_schema(value, depth + 1))
-        .collect()
+    each(values, |value| parse_schema(value, depth + 1))
 }
 
 fn parse_range(fields: &[(String, JsonValue)]) -> Result<NumericRange, SchemaParseError> {
@@ -2029,10 +2488,18 @@ impl ValueView for MsgpackValue<'_> {
     }
 }
 
-/// Capacity for `count` decoded elements: every element takes at least one
-/// input byte, so a header cannot reserve more than the bytes left behind it.
-fn element_capacity(reader: &Reader<'_>, count: u32) -> usize {
-    (count as usize).min(reader.input().len().saturating_sub(reader.position()))
+/// Storage for `count` decoded elements, backed fallibly. Every element
+/// takes at least one input byte, so a header reserves no more than the bytes
+/// left behind it, and decoding the elements that follow never grows it.
+fn backed_values<T>(reader: &Reader<'_>, count: u32) -> Result<Vec<T>, ValueParseError> {
+    let capacity = usize::try_from(count)
+        .unwrap_or(usize::MAX)
+        .min(reader.input().len().saturating_sub(reader.position()));
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(capacity)
+        .map_err(|_| ValueParseError::OutOfMemory)?;
+    Ok(values)
 }
 
 /// One event map. `type` and `value` are decoded; every other key is kept
@@ -2041,7 +2508,7 @@ fn parse_msgpack_event<'a>(reader: &mut Reader<'a>) -> Result<MsgpackValue<'a>, 
     let fields = reader
         .read_map_header()
         .ok_or(ValueParseError::InvalidMsgpack)?;
-    let mut event = Vec::with_capacity(element_capacity(reader, fields));
+    let mut event = backed_values(reader, fields)?;
     for _ in 0..fields {
         let key = reader
             .read_string()
@@ -2125,7 +2592,7 @@ fn parse_msgpack_value<'a>(
             let count = reader
                 .read_map_header()
                 .ok_or(ValueParseError::InvalidMsgpack)?;
-            let mut fields = Vec::with_capacity(element_capacity(reader, count));
+            let mut fields = backed_values(reader, count)?;
             for _ in 0..count {
                 let key = reader
                     .read_string()
@@ -2139,7 +2606,7 @@ fn parse_msgpack_value<'a>(
             let count = reader
                 .read_array_header()
                 .ok_or(ValueParseError::InvalidMsgpack)?;
-            let mut values = Vec::with_capacity(element_capacity(reader, count));
+            let mut values = backed_values(reader, count)?;
             for _ in 0..count {
                 values.push(parse_msgpack_value(reader, depth + 1)?);
             }
@@ -2151,6 +2618,14 @@ fn parse_msgpack_value<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The violation a refused judgment names.
+    fn violation_of(result: Result<(), ValueRefusal>) -> PayloadViolation {
+        match result {
+            Err(ValueRefusal::Violation(violation)) => violation,
+            other => panic!("expected a violation, got {other:?}"),
+        }
+    }
 
     fn schema(tree: &str) -> SemanticSchema {
         SemanticSchema::from_tree_bytes(tree.as_bytes()).unwrap()
@@ -2179,7 +2654,7 @@ mod tests {
         assert!(validate_value(&bigint, &json(r#""-42""#)).is_ok());
         assert!(validate_value(&bigint, &JsonValue::BigInt).is_ok());
         for bad in [r#""1.5""#, r#""abc""#, "5000000000", "1.5", "true", r#""""#] {
-            let error = validate_value(&bigint, &json(bad)).unwrap_err();
+            let error = violation_of(validate_value(&bigint, &json(bad)));
             assert_eq!(error.expected, "bigint", "{bad} must refuse");
         }
     }
@@ -2211,12 +2686,12 @@ mod tests {
         let result = validate_value(&schema(r#"{"kind":"string"}"#), &json("42"));
         assert_eq!(
             result,
-            Err(PayloadViolation {
+            Err(ValueRefusal::Violation(PayloadViolation {
                 path: "value".into(),
                 expected: "string".into(),
                 observed: "number".into(),
                 vo: None,
-            })
+            }))
         );
     }
     #[test]
@@ -2226,7 +2701,7 @@ mod tests {
             r#"{"kind":"object","fields":{"name":{"kind":"optional","value":{"kind":"string"}}}}"#,
         );
         let empty = json("{}");
-        let required_error = validate_value(&required, &empty).unwrap_err();
+        let required_error = violation_of(validate_value(&required, &empty));
         assert_eq!(required_error.path, "value.name");
         assert_eq!(required_error.observed, "absent");
         assert!(validate_value(&optional, &empty).is_ok());
@@ -2237,10 +2712,37 @@ mod tests {
         let closed = schema(r#"{"kind":"object","fields":{"name":{"kind":"string"}}}"#);
         let open = schema(r#"{"kind":"object","fields":{"name":{"kind":"string"}},"open":true}"#);
         let value = json(r#"{"name":"ok","bogus_field":true}"#);
-        let closed_error = validate_value(&closed, &value).unwrap_err();
+        let closed_error = violation_of(validate_value(&closed, &value));
         assert_eq!(closed_error.path, "value.bogus_field");
         assert_eq!(closed_error.observed, "undeclared");
         assert!(validate_value(&open, &value).is_ok());
+
+        // A judgment that admits spells nothing: what it allocates does not
+        // grow with the members and items it walks. At every allocation a
+        // judgment makes it refuses as OutOfMemory, never traps, and with
+        // the memory it needs it names the same violation.
+        let items = schema(
+            r#"{"kind":"array","item":{"kind":"object","fields":{"name":{"kind":"string"}}}}"#,
+        );
+        let admitted = |count: usize| {
+            let value = json(&format!("[{}]", vec![r#"{"name":"ok"}"#; count].join(",")));
+            crate::memory::at_every_allocation(
+                || (),
+                |()| validate_value(&items, &value),
+                |_, refusal| assert_eq!(refusal, ValueRefusal::OutOfMemory),
+            )
+            .1
+        };
+        assert_eq!(admitted(1), admitted(64));
+        let (refused, _) = crate::memory::at_every_allocation(
+            || (),
+            |()| match validate_value(&closed, &value) {
+                Err(ValueRefusal::OutOfMemory) => Err(()),
+                verdict => Ok(verdict),
+            },
+            |_, ()| {},
+        );
+        assert_eq!(refused, Err(ValueRefusal::Violation(closed_error)));
     }
 
     #[test]
@@ -2253,14 +2755,14 @@ mod tests {
         let closed = schema(r#"{"kind":"object","fields":{}}"#);
         let dotted = json(r#"{"dot.key":1}"#);
         assert_eq!(
-            validate_value(&closed, &dotted).unwrap_err().path,
+            violation_of(validate_value(&closed, &dotted)).path,
             "value.dot%2Ekey"
         );
         // Only `.` and `%` are escaped; every other byte, a non-ASCII one
         // included, is kept as itself, so UTF-8 keys stay UTF-8.
         let accented = json(r#"{"caf\u00e9.%":1}"#);
         assert_eq!(
-            validate_value(&closed, &accented).unwrap_err().path,
+            violation_of(validate_value(&closed, &accented)).path,
             "value.caf\u{e9}%2E%25"
         );
     }
@@ -2294,9 +2796,11 @@ mod tests {
             .is_ok()
         );
         assert_eq!(
-            validate_value(&schema, &json(r#"{"items":[1],"labels":{}}"#))
-                .unwrap_err()
-                .path,
+            violation_of(validate_value(
+                &schema,
+                &json(r#"{"items":[1],"labels":{}}"#)
+            ))
+            .path,
             "value.items[0]"
         );
     }
@@ -2334,7 +2838,7 @@ mod tests {
                     assert!(result.is_ok(), "{verdict} vector refused: {result:?}")
                 }
                 "refuse" => {
-                    let violation = result.expect_err("refuse vector accepted");
+                    let violation = violation_of(result);
                     let expected_path = match field(&fields, "path").expect("path") {
                         JsonValue::String(value) => value,
                         _ => panic!("path must be a string"),
@@ -2597,7 +3101,7 @@ mod tests {
             (payload(None, i64::from(i32::MAX) + 1, 0), "value.marks[1]"),
             (payload(None, 0, -1), "value.limits.a"),
         ] {
-            assert_eq!(validate_value(&schema, &value).unwrap_err().path, path);
+            assert_eq!(violation_of(validate_value(&schema, &value)).path, path);
         }
     }
 
@@ -2678,12 +3182,12 @@ mod tests {
         assert!(validate_value(&range, &ExactInt64(6)).is_err());
         assert_eq!(
             validate_value(&range, &json("6")),
-            Err(PayloadViolation {
+            Err(ValueRefusal::Violation(PayloadViolation {
                 path: "value".into(),
                 expected: "safe integer in [-3, 5]".into(),
                 observed: "number".into(),
                 vo: None,
-            })
+            }))
         );
     }
 
@@ -2725,7 +3229,7 @@ mod tests {
         assert_eq!(
             pair,
             SemanticSchema::Array {
-                item: Box::new(SemanticSchema::I32),
+                item: Node::new(SemanticSchema::I32).unwrap(),
                 length: Some(2),
             }
         );
@@ -2733,17 +3237,17 @@ mod tests {
         for (value, observed) in [("[1]", 1), ("[1,2,3]", 3), (r#"["x"]"#, 1)] {
             assert_eq!(
                 validate_value(&pair, &json(value)),
-                Err(PayloadViolation {
+                Err(ValueRefusal::Violation(PayloadViolation {
                     path: "value".into(),
                     expected: "array of length 2".into(),
                     observed: format!("array of length {observed}"),
                     vo: None,
-                }),
+                })),
                 "{value}"
             );
         }
         assert_eq!(
-            validate_value(&pair, &json(r#"[1,"x"]"#)).unwrap_err().path,
+            violation_of(validate_value(&pair, &json(r#"[1,"x"]"#))).path,
             "value[1]"
         );
 
@@ -2778,13 +3282,16 @@ mod tests {
     fn vo_metadata_decodes_canonical_hex_once() {
         assert_eq!(
             schema(&line_tree()),
-            SemanticSchema::Vo(Box::new(VoMetadata {
-                root: "orders.Line".into(),
-                frame: vec![0x0a, 0x1b],
-                rows: vec![vec![0x00, 0xff], vec![0x10]],
-                profile: VoProfile::default(),
-                retained: Vec::new(),
-            }))
+            SemanticSchema::Vo(
+                Node::new(VoMetadata {
+                    root: "orders.Line".into(),
+                    frame: vec![0x0a, 0x1b],
+                    rows: vec![vec![0x00, 0xff], vec![0x10]],
+                    profile: VoProfile::default(),
+                    retained: Vec::new(),
+                })
+                .unwrap()
+            )
         );
         assert!(matches!(
             schema(&vo_tree("_a.b_2.C", "00", r#"["00"]"#)),
@@ -2961,7 +3468,7 @@ mod tests {
             line_tree()
         ));
         let frame = JsonValue::object(vec![("line".to_owned(), JsonValue::Binary(vec![1, 2, 3]))]);
-        let violation = validate_value(&tree, &frame).unwrap_err();
+        let violation = violation_of(validate_value(&tree, &frame));
         assert_eq!(
             violation,
             PayloadViolation {
@@ -2973,7 +3480,7 @@ mod tests {
         );
         assert_eq!(
             validate_value_with_admission(&tree, &frame, &UnavailableVoAdmission),
-            Err(violation.clone())
+            Err(ValueRefusal::Violation(violation.clone()))
         );
         assert_eq!(
             violation.to_string(),
@@ -2982,7 +3489,7 @@ mod tests {
 
         // A frame must be binary before any capability is consulted.
         let text = JsonValue::object(vec![("line".to_owned(), JsonValue::String("0001".into()))]);
-        let shape = validate_value(&tree, &text).unwrap_err();
+        let shape = violation_of(validate_value(&tree, &text));
         assert_eq!((shape.observed.as_str(), shape.vo), ("string", None));
 
         // Through a union that admits nothing, the cause stays observable.
@@ -2991,9 +3498,7 @@ mod tests {
             line_tree()
         ));
         assert_eq!(
-            validate_value(&union, &JsonValue::Binary(vec![0]))
-                .unwrap_err()
-                .vo,
+            violation_of(validate_value(&union, &JsonValue::Binary(vec![0]))).vo,
             Some(VoRefusal::Admission(VoAdmissionError::Unavailable))
         );
     }
@@ -3007,10 +3512,10 @@ mod tests {
         let schemas = parse_schema_envelope(envelope.as_bytes()).unwrap();
         assert_eq!(
             PreparedSchemas::prepare(schemas, UnavailableVoAdmission).err(),
-            Some(VoPreparationError {
+            Some(PrepareRefusal::Refused(VoPreparationError {
                 root: "orders.Line".into(),
                 error: VoAdmissionError::Unavailable,
-            })
+            }))
         );
         let plain = parse_schema_envelope(br#"{"plain":{"kind":"string"}}"#).unwrap();
         assert_eq!(
@@ -3067,7 +3572,10 @@ mod tests {
                         ("type", observed)
                     );
                     if event_type.is_some() {
-                        assert_eq!(*violation, PayloadViolation::undeclared_type());
+                        assert_eq!(
+                            violation.expected,
+                            "signal type declared by the semantic schema"
+                        );
                     }
                 }
                 result => panic!("an unknown type must refuse: {result:?}"),
@@ -3079,6 +3587,117 @@ mod tests {
             prepared.validate_msgpack_batch(&[0xdd, 0xff, 0xff, 0xff, 0xff], false),
             Err(BatchValidationError::InvalidInput)
         );
+
+        // With a capability that projects every frame, preparing the envelope,
+        // configuring extraction over it, and judging a batch whose frames
+        // are all retained refuse as OutOfMemory at every allocation they
+        // make, never trap, and with the memory they need retain each frame.
+        let envelope = format!(
+            r#"{{"line":{{"kind":"object","fields":{{"frames":{{"kind":"array","item":{line}}}}}}},"lines":{{"kind":"array","item":{line}}}}}"#,
+            line = line_tree()
+        );
+        let mut batch = Vec::new();
+        for _ in 0..4 {
+            batch.extend([
+                0x82, 0xa4, b't', b'y', b'p', b'e', 0xa4, b'l', b'i', b'n', b'e',
+            ]);
+            batch.extend([0xa5, b'v', b'a', b'l', b'u', b'e', 0x81]);
+            batch.extend([0xa6, b'f', b'r', b'a', b'm', b'e', b's', 0x93]);
+            for _ in 0..3 {
+                batch.extend([0xc4, 0x02, 0x00, 0xff]);
+            }
+        }
+        #[derive(Debug)]
+        enum Refusal {
+            Schema(SchemaParseError),
+            Prepare(PrepareRefusal),
+            Config(crate::ConfigError),
+            Batch(BatchValidationError),
+        }
+        let (retained, _) = crate::memory::at_every_allocation(
+            || (),
+            |()| {
+                let schemas =
+                    parse_schema_envelope(envelope.as_bytes()).map_err(Refusal::Schema)?;
+                let prepared = PreparedSchemas::prepare(schemas, Projecting([0x0a, 0x1b]))
+                    .map_err(Refusal::Prepare)?;
+                crate::build_extraction_config_with_semantic_schemas(
+                    &[],
+                    &[],
+                    Some(prepared.schemas()),
+                    None,
+                )
+                .map_err(Refusal::Config)?;
+                prepared
+                    .validate_msgpack_batch(&batch, true)
+                    .map(|frames| frames.len())
+                    .map_err(Refusal::Batch)
+            },
+            |budget, refusal| {
+                assert!(
+                    matches!(
+                        refusal,
+                        Refusal::Schema(SchemaParseError::OutOfMemory)
+                            | Refusal::Prepare(PrepareRefusal::OutOfMemory)
+                            | Refusal::Config(crate::ConfigError::OutOfMemory)
+                            | Refusal::Batch(BatchValidationError::OutOfMemory)
+                    ),
+                    "budget {budget}: {refusal:?}"
+                );
+            },
+        );
+        assert_eq!(retained, 12);
+    }
+
+    /// Admits every frame and certifies it as a projection: bytes of its
+    /// own, never the lent slice.
+    struct Projecting([u8; 2]);
+
+    struct Projected<'a> {
+        lent: &'a [u8],
+        certified: &'a [u8],
+        metadata: &'a VoMetadata,
+    }
+
+    impl VoFrameProof for Projected<'_> {
+        fn lent(&self) -> &[u8] {
+            self.lent
+        }
+
+        fn bytes(&self) -> &[u8] {
+            self.certified
+        }
+
+        fn schema_ref(&self) -> VoSchemaRef<'_> {
+            VoSchemaRef {
+                root: &self.metadata.root,
+                frame: &self.metadata.frame,
+                ordinal: 0,
+            }
+        }
+    }
+
+    impl VoAdmission for Projecting {
+        type Frame<'a>
+            = Projected<'a>
+        where
+            Self: 'a;
+
+        fn prepare(&mut self, _metadata: &VoMetadata) -> Result<(), VoAdmissionError> {
+            Ok(())
+        }
+
+        fn admit<'a>(
+            &'a self,
+            metadata: &'a VoMetadata,
+            bytes: &'a [u8],
+        ) -> Result<Projected<'a>, VoAdmissionError> {
+            Ok(Projected {
+                lent: bytes,
+                certified: &self.0,
+                metadata,
+            })
+        }
     }
 
     const LINK: &str = r#"{"slot":0,"field_idx":2,"schema":{"root":"orders.Line","frame":"0a1b","rows":["00ff"]}}"#;
@@ -3362,8 +3981,11 @@ mod tests {
         ));
         let input = [0x81, 0xa4, b'l', b'i', b'n', b'e', 0xa2, 0xff, 0xfe];
         let value = parse_msgpack_value(&mut Reader::new(&input), 0).unwrap();
-        let violation =
-            validate_value_with_admission(&tree, &value, &UnavailableVoAdmission).unwrap_err();
+        let violation = violation_of(validate_value_with_admission(
+            &tree,
+            &value,
+            &UnavailableVoAdmission,
+        ));
         assert_eq!(
             (
                 violation.path.as_str(),

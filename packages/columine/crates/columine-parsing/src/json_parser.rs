@@ -298,7 +298,6 @@ enum Top {
     Done,
 }
 
-#[derive(Clone)]
 pub struct JsonParser<'a> {
     input: &'a [u8],
     cursor: usize,
@@ -321,6 +320,23 @@ impl<'a> JsonParser<'a> {
             peeked: None,
         }
     }
+    /// A parser at the same position, to read ahead without moving this
+    /// one; copying the nesting stack is fallible.
+    pub fn try_clone(&self) -> Result<Self, ParserError> {
+        let mut stack = Vec::new();
+        stack
+            .try_reserve_exact(self.stack.len())
+            .map_err(|_| ParserError::OutOfMemory)?;
+        stack.extend_from_slice(&self.stack);
+        Ok(Self {
+            input: self.input,
+            cursor: self.cursor,
+            stack,
+            top: self.top,
+            peeked: self.peeked,
+        })
+    }
+
     pub fn input(&self) -> &'a [u8] {
         self.input
     }

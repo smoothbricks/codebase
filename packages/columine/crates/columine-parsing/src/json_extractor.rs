@@ -4,7 +4,7 @@ use crate::{
     ArrowType, ColumnValue, DynamicColumns, ExtractionConfig, MemberSchema, ParseError, PlaneKind,
     SignalSchemaField,
     json_parser::{JsonParser, JsonStr, ParserError, Token},
-    validate::{SemanticSchema, encode_path_segment, encode_segment_into, encoded_segment_len},
+    validate::{SemanticSchema, encode_segment_into, encoded_segment_len, push_path_segment},
 };
 use columine_arrow::VariableValueReservation;
 
@@ -494,7 +494,7 @@ fn extract_json_event_open(
         {
             saw_nested_value = true;
             if event_type.is_none() && config.semantic_schemas.is_some() {
-                event_type = lookahead_event_type(parser);
+                event_type = lookahead_event_type(parser)?;
             }
             parser.expect_object_begin().map_err(lex_error)?;
             let discriminant_name = if discriminant_is_event_type {
@@ -578,22 +578,41 @@ fn extract_json_event_open(
 }
 
 /// The string `type` member of the event whose nested `value` object the
-/// parser is positioned at, read from a clone so the real parser does not
-/// move. Only producers that spell `value` before `type` pay for it.
-fn lookahead_event_type(parser: &JsonParser<'_>) -> Option<String> {
-    let mut ahead = parser.clone();
-    ahead.skip_value().ok()?;
+/// parser is positioned at, read from a copy so the real parser does not
+/// move. Only producers that spell `value` before `type` pay for it. Input
+/// the read-ahead cannot follow names no type; the real parser refuses it
+/// when it gets there. Memory the read-ahead cannot back is refused here.
+fn lookahead_event_type(parser: &JsonParser<'_>) -> Result<Option<String>, ExtractionError> {
+    // A malformed token ends the read-ahead with no type; only exhausted
+    // memory is a refusal.
+    let unread = |error| match error {
+        ParserError::OutOfMemory => Err(ExtractionError::MemoryExhausted),
+        ParserError::InvalidJson
+        | ParserError::UnexpectedToken
+        | ParserError::EndOfInput
+        | ParserError::InvalidNumber => Ok(None),
+    };
+    let mut ahead = parser.try_clone().map_err(lex_error)?;
+    if let Err(error) = ahead.skip_value() {
+        return unread(error);
+    }
     while !ahead.is_object_end() {
-        let key = ahead.expect_field_name().ok()?;
+        let key = match ahead.expect_field_name() {
+            Ok(key) => key,
+            Err(error) => return unread(error),
+        };
         if key.is("type") {
-            return match ahead.next_token().ok()? {
-                Token::String(value) => value.to_owned_text().ok(),
-                _ => None,
+            return match ahead.next_token() {
+                Ok(Token::String(value)) => owned(value).map(Some),
+                Ok(_) => Ok(None),
+                Err(error) => unread(error),
             };
         }
-        ahead.skip_value().ok()?;
+        if let Err(error) = ahead.skip_value() {
+            return unread(error);
+        }
     }
-    None
+    Ok(None)
 }
 
 /// Handle one named member of the event or its nested payload: a declared
@@ -638,7 +657,9 @@ fn extract_named_member(
         let variants = config.enum_ordinals(discriminant, payload_name);
         let extraction_result = match (capture_schema, extra.as_mut()) {
             (Some(schema), Some(extra_writer)) => {
-                let mut path = vec![payload_name.to_owned()];
+                let mut path = String::new();
+                push_path_segment(&mut path, payload_name)
+                    .map_err(|_| ExtractionError::MemoryExhausted)?;
                 extract_typed_value_with_capture(
                     parser,
                     lookup.field,
@@ -757,7 +778,7 @@ fn extract_typed_value_with_capture(
     capture: Option<(
         &mut MsgpackValueWriter<'_>,
         &mut u32,
-        &mut Vec<String>,
+        &mut String,
         &SemanticSchema,
     )>,
     enum_variants: Option<&[String]>,
@@ -1072,13 +1093,6 @@ fn variable_write_error(error: columine_arrow::VariableValueError) -> Extraction
     }
 }
 
-fn encode_path_segments(path: &[String]) -> String {
-    path.iter()
-        .map(|segment| encode_path_segment(segment))
-        .collect::<Vec<_>>()
-        .join(".")
-}
-
 fn append(
     columns: &mut DynamicColumns,
     column: usize,
@@ -1193,7 +1207,8 @@ impl<'a> MsgpackValueWriter<'a> {
         parser: &mut JsonParser<'_>,
         token: Token<'_>,
         schema: &SemanticSchema,
-        path: &mut Vec<String>,
+        // The carrier key of the value being written, in carrier spelling.
+        path: &mut String,
         extra: &mut MsgpackValueWriter<'_>,
         extra_count: &mut u32,
     ) -> Result<(), ExtractionError> {
@@ -1208,7 +1223,8 @@ impl<'a> MsgpackValueWriter<'a> {
                     let value = parser.next_token().map_err(lex_error)?;
                     if let Some((_, child_schema)) = known {
                         self.write_string(&name)?;
-                        path.push(name);
+                        let mark = push_path_segment(path, &name)
+                            .map_err(|_| ExtractionError::MemoryExhausted)?;
                         self.write_value_filtered(
                             parser,
                             value,
@@ -1217,17 +1233,18 @@ impl<'a> MsgpackValueWriter<'a> {
                             extra,
                             extra_count,
                         )?;
-                        path.pop();
+                        path.truncate(mark);
                         count += 1;
                     } else if *open {
-                        path.push(name);
+                        let mark = push_path_segment(path, &name)
+                            .map_err(|_| ExtractionError::MemoryExhausted)?;
                         if *extra_count == 0 {
                             extra.reserve_map32()?;
                         }
-                        extra.write_string(&encode_path_segments(path))?;
+                        extra.write_string(path)?;
                         extra.write_value(parser, value)?;
                         *extra_count += 1;
-                        path.pop();
+                        path.truncate(mark);
                     } else {
                         self.write_string(&name)?;
                         self.write_value(parser, value)?;
@@ -1362,7 +1379,7 @@ impl<'a> MsgpackValueWriter<'a> {
         let mut at = self.offset;
         let buf = self.buf();
         encode_segment_into(segment, |chunk| {
-            buf[at..at + chunk.len()].copy_from_slice(chunk);
+            buf[at..at + chunk.len()].copy_from_slice(chunk.as_bytes());
             at += chunk.len();
         });
         self.offset = at;

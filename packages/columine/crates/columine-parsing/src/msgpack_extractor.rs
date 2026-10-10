@@ -409,7 +409,7 @@ fn extract_msgpack_member(
         Some((name, len)) => {
             let mut at = write_msgpack_str_header(work_buffer, state.end, len);
             encode_segment_into(name, |chunk| {
-                work_buffer[at..at + chunk.len()].copy_from_slice(chunk);
+                work_buffer[at..at + chunk.len()].copy_from_slice(chunk.as_bytes());
                 at += chunk.len();
             });
             at

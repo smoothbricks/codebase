@@ -274,6 +274,176 @@ fn create_log_entry_via_caller_buffers() {
         }
     }
     assert!(refused > 0);
+
+    // A processor that judges batches against a semantic envelope refuses as
+    // MemoryExhausted, never traps, at every allocation it makes: creating
+    // it (envelope, discriminated members, open paths), judging and
+    // extracting admitted JSON and MessagePack batches (nested objects,
+    // enums, ranges, unions, records, a captured open member, a lookahead
+    // for a `type` spelled after `value`), and spelling the diagnostic of a
+    // refused one.
+    semantic_batches_refuse_exhausted_memory();
+}
+
+fn semantic_batches_refuse_exhausted_memory() {
+    use columine_arrow::schema::{DiscriminatedMember, PayloadDiscriminator};
+    use columine_event_processor::{CreateFailure, EpInitError, ProcessError};
+
+    let fields = [
+        SignalSchemaField::new(ArrowType::Utf8, false),
+        SignalSchemaField::new(ArrowType::Utf8, false),
+        SignalSchemaField::new(ArrowType::Int64, false),
+        SignalSchemaField::new(ArrowType::Int32, true),
+        SignalSchemaField::new(ArrowType::Binary, true),
+        SignalSchemaField::new(ArrowType::Binary, true),
+        SignalSchemaField::new(ArrowType::Int32, true),
+        SignalSchemaField::new(ArrowType::Binary, true),
+    ];
+    let envelope = br#"{"close":{"kind":"object","fields":{"outcome":{"kind":"optional","value":{"kind":"enum","variants":["achieved","stuck"]}},"authorRole":{"kind":"optional","value":{"kind":"enum","variants":["human"]}},"items":{"kind":"array","item":{"kind":"object","fields":{"sku":{"kind":"string"},"qty":{"kind":"range","min":0,"max":9,"integer":true}}}},"meta":{"kind":"object","open":true,"fields":{"note":{"kind":"optional","value":{"kind":"string"}}}},"tally":{"kind":"optional","value":{"kind":"record","value":{"kind":"number"}}},"pick":{"kind":"optional","value":{"kind":"union","variants":[{"kind":"string"},{"kind":"i32"}]}}}}}"#;
+    let config = || {
+        columine_arrow::DynamicSchemaConfig {
+        semantic_schema: Some(envelope.to_vec()),
+        payload_discriminator: Some(PayloadDiscriminator {
+            key: "type".into(),
+            members: vec![DiscriminatedMember {
+                discriminant: "close".into(),
+                member: "authorRole".into(),
+                column: 6,
+            }],
+        }),
+        ..columine_arrow::DynamicSchemaConfig::from_physical_fields_with_names(
+            &fields,
+            b"id\0type\0timestamp\0value.outcome\0value.items\0value.meta\0authorRole@close\0value.$undeclared\0",
+        )
+        .expect("semantic schema")
+    }
+    };
+    let admitted_json = br#"[{"id":"a","type":"close","timestamp":1,"value":{"outcome":"stuck","authorRole":"human","items":[{"sku":"s1","qty":3},{"sku":"s2","qty":9}],"meta":{"note":"n","extra.key":"x"},"tally":{"a":1,"b":2.5},"pick":"p"}},{"id":"b","timestamp":2,"value":{"items":[],"meta":{},"pick":7},"type":"close"}]"#;
+    let refused_json = br#"[{"id":"a","type":"close","timestamp":1,"value":{"items":[{"sku":"s1","qty":3},{"sku":"s2","qty":12}],"meta":{}}}]"#;
+
+    // A minimal MessagePack writer for the same events.
+    fn text(out: &mut Vec<u8>, value: &str) {
+        out.push(0xd9);
+        out.push(u8::try_from(value.len()).unwrap());
+        out.extend(value.bytes());
+    }
+    fn int(out: &mut Vec<u8>, value: i64) {
+        out.push(0xd3);
+        out.extend(value.to_be_bytes());
+    }
+    let event = |out: &mut Vec<u8>, id: &str, qty: i64| {
+        out.push(0x84);
+        text(out, "id");
+        text(out, id);
+        text(out, "timestamp");
+        int(out, 1);
+        text(out, "type");
+        text(out, "close");
+        text(out, "value");
+        out.push(0x84);
+        text(out, "outcome");
+        text(out, "achieved");
+        text(out, "items");
+        out.push(0x91);
+        out.push(0x82);
+        text(out, "sku");
+        text(out, "s1");
+        text(out, "qty");
+        int(out, qty);
+        text(out, "meta");
+        out.push(0x82);
+        text(out, "note");
+        text(out, "n");
+        text(out, "extra.key");
+        text(out, "x");
+        text(out, "tally");
+        out.push(0x81);
+        text(out, "a");
+        int(out, 1);
+    };
+    let mut admitted_msgpack = vec![0x92];
+    event(&mut admitted_msgpack, "a", 3);
+    event(&mut admitted_msgpack, "b", 9);
+    let mut refused_msgpack = vec![0x91];
+    event(&mut refused_msgpack, "a", 12);
+
+    #[derive(Debug)]
+    enum Refusal {
+        Init(EpInitError),
+        Batch(ProcessError),
+    }
+    let batches = [
+        (
+            InputFormat::Json,
+            &admitted_json[..],
+            &refused_json[..],
+            "value.items[1].qty",
+        ),
+        (
+            InputFormat::Msgpack,
+            &admitted_msgpack,
+            &refused_msgpack,
+            "value.items[0].qty",
+        ),
+    ];
+    for (format, admitted, refused, refused_path) in batches {
+        let ((rows, ep), budget) = memory::at_every_allocation(
+            config,
+            |config| {
+                let mut ep = EventProcessor::new(
+                    ParseOptions {
+                        base_path: false,
+                        msgpack_growth: true,
+                        diagnostics: true,
+                    },
+                    16,
+                    config,
+                )
+                .map_err(Refusal::Init)?;
+                let rows = ep
+                    .parse(admitted, format)
+                    .map_err(Refusal::Batch)?
+                    .row_count();
+                match ep.parse(refused, format) {
+                    Ok(_) => panic!("{format:?}: a quantity outside its range is admitted"),
+                    Err(error) if error.code == ResultCode::ParseError => {}
+                    Err(error) => return Err(Refusal::Batch(error)),
+                }
+                // Read once the budget is lifted: copying the diagnostic
+                // here would spend the budget under test.
+                Ok((rows, ep))
+            },
+            |budget, refusal| match refusal {
+                Refusal::Init(error) => assert_eq!(
+                    CreateFailure::from(error),
+                    CreateFailure::MemoryExhausted,
+                    "{format:?}, budget {budget}"
+                ),
+                Refusal::Batch(error) => {
+                    assert_eq!(
+                        error.code,
+                        ResultCode::MemoryExhausted,
+                        "{format:?}, budget {budget}"
+                    );
+                    assert_eq!(
+                        error.diagnostic.map(|diagnostic| diagnostic.detail),
+                        Some(diagnostic_detail::MEMORY_EXHAUSTED),
+                        "{format:?}, budget {budget}"
+                    );
+                }
+            },
+        );
+        assert_eq!(rows, 2, "{format:?}");
+        let diagnostic = ep
+            .payload_validation_diagnostic()
+            .expect("a refused batch names its violation");
+        assert_eq!(
+            (diagnostic.path.as_str(), diagnostic.expected.as_str()),
+            (refused_path, "safe integer in [0, 9]"),
+            "{format:?}"
+        );
+        assert!(budget > 0, "{format:?}");
+    }
 }
 
 /// Schema-without-names path creates, but JSON parsing has no key mapping.

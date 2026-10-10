@@ -39,9 +39,9 @@ use columine_parsing::{
     ExtractionConfig, FrameProjections, json_extractor, json_scanner, msgpack_extractor,
     msgpack_scanner,
     validate::{
-        BatchValidationError, PayloadViolation, PreparedSchemas, UnavailableVoAdmission,
-        VoAdmission, VoFrameProof, VoPreparationError, VoPresence, VoRefusal,
-        parse_schema_envelope,
+        BatchValidationError, PayloadViolation, PrepareRefusal, PreparedSchemas,
+        UnavailableVoAdmission, VoAdmission, VoFrameProof, VoPreparationError, VoPresence,
+        VoRefusal, parse_schema_envelope,
     },
 };
 
@@ -180,9 +180,10 @@ impl From<EpInitError> for CreateFailure {
         match error {
             EpInitError::MemoryExhausted
             | EpInitError::Metadata(columine_arrow::MetadataError::OutOfMemory)
-            | EpInitError::Config(columine_parsing::ConfigError::OutOfMemory) => {
-                Self::MemoryExhausted
-            }
+            | EpInitError::Config(columine_parsing::ConfigError::OutOfMemory)
+            | EpInitError::SemanticSchema(
+                columine_parsing::validate::SchemaParseError::OutOfMemory,
+            ) => Self::MemoryExhausted,
             EpInitError::Metadata(_)
             | EpInitError::Config(_)
             | EpInitError::SemanticSchema(_)
@@ -368,10 +369,12 @@ impl<A: VoAdmission> EventProcessor<A> {
             Some(envelope) => {
                 let schemas =
                     parse_schema_envelope(envelope).map_err(EpInitError::SemanticSchema)?;
-                Some(
-                    PreparedSchemas::prepare(schemas, admission)
-                        .map_err(EpInitError::VoAdmission)?,
-                )
+                Some(PreparedSchemas::prepare(schemas, admission).map_err(
+                    |refusal| match refusal {
+                        PrepareRefusal::Refused(error) => EpInitError::VoAdmission(error),
+                        PrepareRefusal::OutOfMemory => EpInitError::MemoryExhausted,
+                    },
+                )?)
             }
         };
 
@@ -506,6 +509,17 @@ impl<A: VoAdmission> EventProcessor<A> {
                         });
                     }
                 }
+                Err(BatchValidationError::OutOfMemory) => {
+                    return Err(ProcessError {
+                        code: ResultCode::MemoryExhausted,
+                        diagnostic: Some(ResultDiagnostic {
+                            stage: diagnostic_stage::VALIDATION,
+                            detail: diagnostic_detail::MEMORY_EXHAUSTED,
+                            field_index: NO_FIELD,
+                            ..ResultDiagnostic::default()
+                        }),
+                    });
+                }
                 Err(BatchValidationError::Violation {
                     event_index,
                     event_type,
@@ -514,7 +528,7 @@ impl<A: VoAdmission> EventProcessor<A> {
                     *last_validation_diagnostic = Some(PayloadValidationDiagnostic::new(
                         event_index,
                         event_type,
-                        *violation,
+                        violation.into_inner(),
                     ));
                     return Err(ProcessError {
                         code: ResultCode::ParseError,
