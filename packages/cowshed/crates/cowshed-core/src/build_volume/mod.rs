@@ -584,16 +584,7 @@ impl BuildVolumeLayout {
     /// reports in place of a release. The probe's own momentary lock is fenced too, so no child
     /// spawned meanwhile keeps it and refuses a hold taken after this answer.
     pub fn held(&self, id: &BuildVolumeId) -> io::Result<bool> {
-        let file = match fs::File::open(self.hold_path(id)) {
-            Ok(file) => Fenced::new(file),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-            Err(error) => return Err(error),
-        };
-        match file.try_lock() {
-            Ok(()) => Ok(false),
-            Err(fs::TryLockError::WouldBlock) => Ok(true),
-            Err(fs::TryLockError::Error(error)) => Err(error),
-        }
+        hold_is_held(&self.hold_path(id))
     }
 
     /// Claim `id` for its release: `None` while a job holds it. The claim keeps every new hold
@@ -610,16 +601,37 @@ impl BuildVolumeLayout {
         }
     }
 
-    /// Claim build volume `id` for re-adoption's move by the hold file beside the image it
-    /// actually is, `image` in this layout's images in whatever format it was written
-    /// (`<image>.hold`): a job admitted on a volume written before RAW holds that file, not the
-    /// RAW name. `None` while a job holds it; the claim keeps every new hold out until dropped.
+    /// Claim build volume `id` by the hold file beside its actual image, in whatever format it
+    /// was written (`<image>.hold`). Re-adoption and payload-absent legacy seed metadata GC use
+    /// this same claim; a pre-RAW job holds this file, not the RAW name. `None` while held.
     #[cfg(target_os = "macos")]
     pub(crate) fn claim_re_adopt_source(
         &self,
         id: &BuildVolumeId,
         image: &Path,
     ) -> io::Result<Option<ReleaseClaim>> {
+        let path = self.source_hold_path(id, image)?;
+        let file = open_hold(&path)?;
+        match file.try_lock() {
+            Ok(()) => Ok(Some(ReleaseClaim {
+                id: id.clone(),
+                _file: file,
+            })),
+            Err(fs::TryLockError::WouldBlock) => Ok(None),
+            Err(fs::TryLockError::Error(error)) => Err(error),
+        }
+    }
+
+    /// The same actual-image hold probed for preview, without creating a missing hold file.
+    pub(crate) fn held_re_adopt_source(
+        &self,
+        id: &BuildVolumeId,
+        image: &Path,
+    ) -> io::Result<bool> {
+        hold_is_held(&self.source_hold_path(id, image)?)
+    }
+
+    fn source_hold_path(&self, id: &BuildVolumeId, image: &Path) -> io::Result<PathBuf> {
         if image.parent() != Some(self.images.as_path())
             || image.file_stem().and_then(|stem| stem.to_str()) != Some(id.as_str())
         {
@@ -629,19 +641,11 @@ impl BuildVolumeLayout {
                     "{} is not build volume {} in {}",
                     image.display(),
                     id.as_str(),
-                    self.images.display()
+                    self.images.display(),
                 ),
             ));
         }
-        let file = open_hold(&crate::metadata::append_suffix(image, HOLD_SUFFIX))?;
-        match file.try_lock() {
-            Ok(()) => Ok(Some(ReleaseClaim {
-                id: id.clone(),
-                _file: file,
-            })),
-            Err(fs::TryLockError::WouldBlock) => Ok(None),
-            Err(fs::TryLockError::Error(error)) => Err(error),
-        }
+        Ok(crate::metadata::append_suffix(image, HOLD_SUFFIX))
     }
 
     /// The volume a build link's target names, or `None` when the target is not one of this
@@ -899,6 +903,19 @@ fn open_hold(path: &Path) -> io::Result<Fenced<fs::File>> {
         .truncate(false)
         .open(path)
         .map(Fenced::new)
+}
+
+fn hold_is_held(path: &Path) -> io::Result<bool> {
+    let file = match fs::File::open(path) {
+        Ok(file) => Fenced::new(file),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    match file.try_lock() {
+        Ok(()) => Ok(false),
+        Err(fs::TryLockError::WouldBlock) => Ok(true),
+        Err(fs::TryLockError::Error(error)) => Err(error),
+    }
 }
 
 fn unknown_version(path: &Path, version: u32) -> crate::CowshedError {
