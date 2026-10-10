@@ -1421,6 +1421,17 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
         &self,
         attachment: &AttachedImage,
     ) -> Result<Option<Fenced<File>>, ApfsError> {
+        self.pin_volume(attachment, |attachment| {
+            self.require_attached_mapping(attachment)
+        })
+    }
+
+    /// Hold `attachment`'s raw volume open, then prove `identity` of it under that pin.
+    fn pin_volume(
+        &self,
+        attachment: &AttachedImage,
+        identity: impl FnOnce(&AttachedImage) -> Result<(), ApfsError>,
+    ) -> Result<Option<Fenced<File>>, ApfsError> {
         let raw = PathBuf::from(raw_device_from(&attachment.volume_device));
         let pin = timed_apfs_step(apfs_step_leg(&attachment.image), "pin", || {
             self.runner
@@ -1434,7 +1445,7 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
         // A pre-check without this pin leaves a gap where an unrelated process can eject
         // the image and the kernel can hand diskN to a foreign mounted volume.
         timed_apfs_step(apfs_step_leg(&attachment.image), "identity", || {
-            self.require_attached_mapping(attachment)
+            identity(attachment)
         })?;
         Ok(pin)
     }
@@ -1453,16 +1464,29 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
         }) {
             Ok(())
         } else {
-            Err(ApfsError::InvalidAttachmentInventory(format!(
-                "{} no longer owns {} / {} (holds {:?}); refusing a reused device",
-                attachment.image.display(),
-                attachment.whole_device,
-                attachment.volume_device,
-                actual
-                    .iter()
-                    .map(RecoveredImageAttachment::whole_device)
-                    .collect::<Vec<_>>()
-            )))
+            Err(reused_device(
+                attachment,
+                actual.iter().map(RecoveredImageAttachment::whole_device),
+            ))
+        }
+    }
+
+    /// Whether `attachment`'s volume is still one of the volumes its image's driver holds under
+    /// that whole device: what a release revalidates before each unmount, however many volumes
+    /// the driver's container holds.
+    fn require_released_volume(&self, attachment: &AttachedImage) -> Result<(), ApfsError> {
+        let image = attachment_inventory_path(&attachment.image)?;
+        let views = release_views_of(&image, &self.attached_disk_images()?)?;
+        if views.iter().any(|view| {
+            view.whole_device == attachment.whole_device
+                && view.volumes.contains(&attachment.volume_device)
+        }) {
+            Ok(())
+        } else {
+            Err(reused_device(
+                attachment,
+                views.iter().map(ReleaseView::whole_device),
+            ))
         }
     }
 
@@ -1493,6 +1517,24 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
         let _lease = self.image_lease(&attachment.image)?;
         let _pin = self.pin_attached_volume(attachment)?;
         self.unmount_volume_unlocked(attachment, intent, "unmount verified APFS volume")
+    }
+
+    /// Unmount one volume of a released image's driver under the image's lease and a fresh raw
+    /// pin of that volume, once the pin proves the driver still holds it
+    /// ([`Self::require_released_volume`]): the single-volume identity check would refuse every
+    /// volume of a container that holds more than one.
+    pub(crate) fn unmount_released(
+        &self,
+        volume: &ReleasedVolume,
+        intent: DetachIntent,
+    ) -> Result<(), ApfsError> {
+        let attachment = &volume.0;
+        let _lease = self.image_lease(&attachment.image)?;
+        let _pin = self.pin_volume(attachment, |attachment| {
+            self.require_released_volume(attachment)
+        })?;
+        self.unmount_volume_unlocked(attachment, intent, "unmount verified APFS volume")
+            .map(|_| ())
     }
 
     /// `umount` the attachment's volume, the caller holding its image lease and pin. A volume
@@ -1966,14 +2008,12 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
         existing_image_attachment(&image, &self.attached_disk_images()?)
     }
 
-    /// Every attachment the kernel holds for `image`, however many: what a release has to undo.
-    pub(crate) fn recovered_image_attachments(
-        &self,
-        image: &Path,
-    ) -> Result<Vec<RecoveredImageAttachment>, ApfsError> {
+    /// Every driver the kernel holds for `image`, however many, each as its whole device and
+    /// every volume its container holds: what a release has to undo.
+    pub(crate) fn release_views(&self, image: &Path) -> Result<Vec<ReleaseView>, ApfsError> {
         validate_image_path(image)?;
         let image = attachment_inventory_path(image)?;
-        image_attachments(&image, &self.attached_disk_images()?)
+        release_views_of(&image, &self.attached_disk_images()?)
     }
 
     /// The backing file of every attached disk image, each once, by the path its attach was
@@ -1993,17 +2033,18 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
     /// device that attachment is detached through, re-reading the image's own mapping before
     /// each one. A path held twice is released twice; a path held by nothing is already
     /// released. One attachment is one detach: an APFS attachment shows two whole devices (the
-    /// image's and its synthesized container), and detaching one takes both. Nothing here
-    /// unmounts first: a mounted volume's caller unmounts it ([`Self::unmount_verified`]), and an
-    /// unmounted one, such as a template's staging image, has nothing to unmount.
+    /// image's and its synthesized container), and detaching one takes both, with every volume
+    /// the container holds. Nothing here unmounts first: a mounted volume's caller unmounts it
+    /// ([`Self::unmount_released`]), and an unmounted one, such as a template's staging image,
+    /// has nothing to unmount.
     pub(crate) fn release_every_attachment(
         &self,
         image: &Path,
         intent: DetachIntent,
     ) -> Result<(), ApfsError> {
         let _lease = self.image_lease(image)?;
-        for attachment in self.recovered_image_attachments(image)? {
-            self.detach_image_device_unlocked(image, attachment.whole_device(), intent)?;
+        for view in self.release_views(image)? {
+            self.detach_image_device_unlocked(image, view.whole_device(), intent)?;
         }
         Ok(())
     }
@@ -2948,7 +2989,36 @@ fn existing_image_attachment(
     Ok(attachments.pop())
 }
 
-/// Every attachment the kernel holds for `image`, in inventory order.
+/// Each media node an attached image reports: its device as a `/dev/` path, and its content hint.
+fn attachment_entities(attached: &AttachedDiskImage) -> Vec<(String, String)> {
+    attached
+        .media
+        .iter()
+        .map(|media| {
+            (
+                device_path(&media.device).unwrap_or_else(|| media.device.clone()),
+                media.content.clone(),
+            )
+        })
+        .collect()
+}
+
+/// The whole device of an attachment that is nothing but one unformatted whole device.
+fn unformatted_whole_device(entities: &[(String, String)]) -> Option<&str> {
+    match entities {
+        [(device, hint)]
+            if device_depth(device) == 0
+                && is_kernel_device_path(device)
+                && (hint.is_empty() || hint == "GUID_partition_scheme") =>
+        {
+            Some(device)
+        }
+        _ => None,
+    }
+}
+
+/// Every attachment the kernel holds for `image`, in inventory order, each as the one volume it
+/// exposes ([`attached_apfs_volume`]).
 fn image_attachments(
     image: &Path,
     images: &[AttachedDiskImage],
@@ -2957,28 +3027,13 @@ fn image_attachments(
         .iter()
         .filter(|attached| attached.is_backed_by(image))
         .map(|attached| {
-            let entities: Vec<(String, String)> = attached
-                .media
-                .iter()
-                .map(|media| {
-                    (
-                        device_path(&media.device).unwrap_or_else(|| media.device.clone()),
-                        media.content.clone(),
-                    )
-                })
-                .collect();
-            Ok(match entities.as_slice() {
-                [(device, hint)]
-                    if device_depth(device) == 0
-                        && is_kernel_device_path(device)
-                        && (hint.is_empty() || hint == "GUID_partition_scheme") =>
-                {
-                    RecoveredImageAttachment::Unformatted {
-                        image: image.to_owned(),
-                        whole_device: device.clone(),
-                    }
-                }
-                _ => {
+            let entities = attachment_entities(attached);
+            Ok(match unformatted_whole_device(&entities) {
+                Some(whole_device) => RecoveredImageAttachment::Unformatted {
+                    image: image.to_owned(),
+                    whole_device: whole_device.to_owned(),
+                },
+                None => {
                     let (whole_device, volume_device) = attached_apfs_volume(&entities)
                         .map_err(ApfsError::InvalidAttachmentInventory)?;
                     RecoveredImageAttachment::Apfs(AttachedImage {
@@ -2991,6 +3046,90 @@ fn image_attachments(
             })
         })
         .collect()
+}
+
+/// One attachment of an image as its release undoes it: the whole device whose one detach takes
+/// the attachment, and every APFS volume its container holds, none for an unformatted image.
+/// Cowshed's images hold one volume, but a release also takes a container something added a
+/// volume to: each mounted volume is unmounted, then the whole device detached once.
+pub(crate) struct ReleaseView {
+    image: PathBuf,
+    whole_device: String,
+    volumes: Vec<String>,
+}
+
+impl ReleaseView {
+    pub(crate) fn whole_device(&self) -> &str {
+        &self.whole_device
+    }
+
+    /// Each volume the container holds, as the release unmounts it.
+    pub(crate) fn volumes(&self) -> impl Iterator<Item = ReleasedVolume> + '_ {
+        self.volumes.iter().map(|volume| {
+            ReleasedVolume(AttachedImage {
+                image: self.image.clone(),
+                whole_device: self.whole_device.clone(),
+                volume_device: volume.clone(),
+                pin: std::sync::Mutex::new(None),
+            })
+        })
+    }
+}
+
+/// One volume of a [`ReleaseView`]. Only a release view names one, and only
+/// [`MacOsApfsBackend::unmount_released`] acts on it, revalidating it against the driver first.
+pub(crate) struct ReleasedVolume(AttachedImage);
+
+impl ReleasedVolume {
+    pub(crate) fn volume_device(&self) -> &str {
+        &self.0.volume_device
+    }
+}
+
+/// Every attachment the kernel holds for `image`, in inventory order, as its release sees it.
+fn release_views_of(
+    image: &Path,
+    images: &[AttachedDiskImage],
+) -> Result<Vec<ReleaseView>, ApfsError> {
+    images
+        .iter()
+        .filter(|attached| attached.is_backed_by(image))
+        .map(|attached| {
+            let entities = attachment_entities(attached);
+            let (whole_device, volumes) = match unformatted_whole_device(&entities) {
+                Some(whole_device) => (whole_device.to_owned(), Vec::new()),
+                None => attached_apfs_volumes(&entities)
+                    .map_err(ApfsError::InvalidAttachmentInventory)?,
+            };
+            Ok(ReleaseView {
+                image: image.to_owned(),
+                whole_device,
+                volumes,
+            })
+        })
+        .collect()
+}
+
+/// A formatted attachment's container and every APFS volume it reports in it. Refused when it
+/// reports no volume, a volume without its container, or volumes in two containers.
+fn attached_apfs_volumes(entities: &[(String, String)]) -> Result<(String, Vec<String>), String> {
+    let volumes: Vec<String> = entities
+        .iter()
+        .filter(|(_, hint)| is_apfs_volume_hint(hint))
+        .map(|(device, _)| device.clone())
+        .collect();
+    let Some((first, rest)) = volumes.split_first() else {
+        return Err("expected an APFS volume, reported none".into());
+    };
+    let container = reported_container(entities, first)?;
+    for volume in rest {
+        if reported_container(entities, volume)? != container {
+            return Err(format!(
+                "APFS volumes {volumes:?} are in more than one container"
+            ));
+        }
+    }
+    Ok((container, volumes))
 }
 
 fn is_canonical_mount_point(path: &Path) -> bool {
@@ -3211,13 +3350,14 @@ fn is_apfs_container_hint(hint: &str) -> bool {
 /// The APFS volume an attached image exposes, and the synthesized container it hangs from — the
 /// whole device whose detach releases the image — read from the image's own system entities.
 ///
-/// Every image holds one volume in one container, and both reports of an attachment name the
-/// two: `diskutil image attach --plist` with string hints (`Apple_APFS_Container`,
+/// Cowshed's images hold one volume in one container, and both reports of an attachment name
+/// the two: `diskutil image attach --plist` with string hints (`Apple_APFS_Container`,
 /// `Apple_APFS_Volume`), the kernel inventory with Apple's partition-type GUIDs. The answer
 /// therefore needs no Disk Arbitration query: `diskutil info` and `diskutil apfs list` queue
 /// behind every arbitration client on the host, and under contention answered before Disk
 /// Arbitration had announced the attach at all. Anything but exactly one volume inside a
-/// reported container is refused, naming what was reported.
+/// reported container is refused, naming what was reported; only a release takes more
+/// ([`attached_apfs_volumes`]).
 fn attached_apfs_volume(entities: &[(String, String)]) -> Result<(String, String), String> {
     let volumes: Vec<&str> = entities
         .iter()
@@ -3227,17 +3367,34 @@ fn attached_apfs_volume(entities: &[(String, String)]) -> Result<(String, String
     let [volume] = volumes.as_slice() else {
         return Err(format!("expected one APFS volume, reported {volumes:?}"));
     };
+    Ok((reported_container(entities, volume)?, (*volume).to_owned()))
+}
+
+/// The container `volume` is a slice of, once the report names it as an APFS container.
+fn reported_container(entities: &[(String, String)], volume: &str) -> Result<String, String> {
     let container = whole_device_from(volume)
         .ok_or_else(|| format!("APFS volume {volume} is not a slice of a container"))?;
-    if !entities
+    if entities
         .iter()
         .any(|(device, hint)| *device == container && is_apfs_container_hint(hint))
     {
-        return Err(format!(
+        Ok(container)
+    } else {
+        Err(format!(
             "APFS volume {volume} was reported without its container {container}"
-        ));
+        ))
     }
-    Ok((container, (*volume).to_owned()))
+}
+
+/// The refusal of a device its image no longer holds, naming the whole devices it holds now.
+fn reused_device<'a>(attachment: &AttachedImage, held: impl Iterator<Item = &'a str>) -> ApfsError {
+    ApfsError::InvalidAttachmentInventory(format!(
+        "{} no longer owns {} / {} (holds {:?}); refusing a reused device",
+        attachment.image.display(),
+        attachment.whole_device,
+        attachment.volume_device,
+        held.collect::<Vec<_>>()
+    ))
 }
 
 /// Each reported entity's device, as a `/dev/` path, and its content hint.
@@ -4835,12 +4992,7 @@ mod tests {
             }
             // Creation can fail after attach but before the caller receives an AttachedImage.
             // No tracked handle is not proof of a detached fixture or permission to unlink it.
-            if self.image.exists()
-                && self
-                    .backend
-                    .recovered_image_attachments(&self.image)?
-                    .is_empty()
-            {
+            if self.image.exists() && self.backend.release_views(&self.image)?.is_empty() {
                 return Err(ApfsError::InvalidAttachmentInventory(format!(
                     "cannot prove fixture image {} was released; retaining its backing file",
                     self.image.display()
@@ -7894,5 +8046,151 @@ mod tests {
                 "expected {expected:?} in {error}"
             );
         }
+    }
+
+    /// One attachment whose container holds two volumes, as the kernel registry reports it.
+    fn two_volume_image(image: &Path) -> Vec<AttachedDiskImage> {
+        vec![AttachedDiskImage::file(
+            image,
+            None,
+            [
+                ("/dev/disk4", ""),
+                ("/dev/disk5", APFS_CONTAINER_CONTENT),
+                ("/dev/disk5s1", APFS_VOLUME_CONTENT),
+                ("/dev/disk5s2", APFS_VOLUME_CONTENT),
+            ],
+        )]
+    }
+
+    /// A release of an image whose container holds two volumes detaches the container once,
+    /// neither refusing it as ambiguous nor detaching a volume on its own.
+    #[test]
+    fn a_release_detaches_a_two_volume_container_once() {
+        let image = temp_path("two-volume-release", IMAGE_EXTENSION);
+        let backend = graced_backend([
+            Reply::Inventory(Ok(two_volume_image(&image))),
+            Reply::Inventory(Ok(two_volume_image(&image))),
+            ok([]),
+            no_images(),
+        ]);
+        backend
+            .release_every_attachment(&image, DetachIntent::Release)
+            .unwrap();
+        let commands: Vec<Vec<String>> = backend.runner().requests().iter().map(argv).collect();
+        assert_eq!(commands, [["detach", "-verbose", "/dev/disk5"]]);
+    }
+
+    /// A release unmounts each volume of the container under its own revalidation against the
+    /// driver, and refuses a volume the driver does not hold without unmounting anything.
+    #[test]
+    fn a_release_revalidates_each_volume_it_unmounts_and_refuses_a_stranger() {
+        let image = temp_path("two-volume-unmount", IMAGE_EXTENSION);
+        let views = release_views_of(&image, &two_volume_image(&image)).unwrap();
+        let [view] = views.as_slice() else {
+            panic!("one attachment is one release view");
+        };
+        assert_eq!(view.whole_device(), "/dev/disk5");
+        let volumes: Vec<ReleasedVolume> = view.volumes().collect();
+        let backend = graced_backend([
+            Reply::Inventory(Ok(two_volume_image(&image))),
+            ok([]),
+            Reply::Inventory(Ok(two_volume_image(&image))),
+            ok([]),
+            Reply::Inventory(Ok(two_volume_image(&image))),
+        ]);
+        for volume in &volumes {
+            backend
+                .unmount_released(volume, DetachIntent::Release)
+                .unwrap();
+        }
+        let stranger = ReleasedVolume(AttachedImage {
+            image: image.clone(),
+            whole_device: "/dev/disk5".into(),
+            volume_device: "/dev/disk5s3".into(),
+            pin: std::sync::Mutex::new(None),
+        });
+        let refused = backend
+            .unmount_released(&stranger, DetachIntent::Release)
+            .unwrap_err();
+        assert!(
+            matches!(&refused, ApfsError::InvalidAttachmentInventory(message)
+                if message.contains("no longer owns /dev/disk5 / /dev/disk5s3")),
+            "{refused}"
+        );
+        let commands: Vec<Vec<String>> = backend.runner().requests().iter().map(argv).collect();
+        assert_eq!(commands, [["/dev/disk5s1"], ["/dev/disk5s2"]]);
+    }
+
+    /// What attaches, verifies or looks up one attachment still refuses a container with two
+    /// volumes: the attach report, the single-attachment lookup and the unmount identity check.
+    #[test]
+    fn single_attachment_projections_still_refuse_two_volumes() {
+        let image = temp_path("two-volume-single", IMAGE_EXTENSION);
+        let refusal = r#"expected one APFS volume, reported ["/dev/disk5s1", "/dev/disk5s2"]"#;
+        let entities: Vec<(String, String)> = two_volume_image(&image)[0]
+            .media
+            .iter()
+            .map(|media| (media.device.clone(), media.content.clone()))
+            .collect();
+        assert_eq!(attached_apfs_volume(&entities).unwrap_err(), refusal);
+        assert!(matches!(
+            existing_image_attachment(&image, &two_volume_image(&image)),
+            Err(ApfsError::InvalidAttachmentInventory(message)) if message == refusal
+        ));
+        let backend = graced_backend([Reply::Inventory(Ok(two_volume_image(&image)))]);
+        let attachment = AttachedImage {
+            image: image.clone(),
+            whole_device: "/dev/disk5".into(),
+            volume_device: "/dev/disk5s1".into(),
+            pin: std::sync::Mutex::new(None),
+        };
+        assert!(matches!(
+            backend.unmount_verified(&attachment, DetachIntent::Release),
+            Err(ApfsError::InvalidAttachmentInventory(message)) if message == refusal
+        ));
+        assert!(backend.runner().requests().is_empty());
+    }
+
+    /// A release view refuses what it cannot name exactly: a formatted attachment with no
+    /// volume, a volume whose container is not reported, and volumes in two containers. An
+    /// unformatted image is its whole device with no volume to unmount.
+    #[test]
+    fn a_release_view_refuses_what_it_cannot_name_and_takes_an_unformatted_image() {
+        let image = temp_path("release-view-refusals", IMAGE_EXTENSION);
+        let cases: [(&[(&str, &str)], &str); 3] = [
+            (
+                &[("/dev/disk4", ""), ("/dev/disk5", APFS_CONTAINER_CONTENT)],
+                "expected an APFS volume, reported none",
+            ),
+            (
+                &[("/dev/disk4", ""), ("/dev/disk5s1", APFS_VOLUME_CONTENT)],
+                "APFS volume /dev/disk5s1 was reported without its container /dev/disk5",
+            ),
+            (
+                &[
+                    ("/dev/disk4", ""),
+                    ("/dev/disk5", APFS_CONTAINER_CONTENT),
+                    ("/dev/disk5s1", APFS_VOLUME_CONTENT),
+                    ("/dev/disk6", APFS_CONTAINER_CONTENT),
+                    ("/dev/disk6s1", APFS_VOLUME_CONTENT),
+                ],
+                r#"APFS volumes ["/dev/disk5s1", "/dev/disk6s1"] are in more than one container"#,
+            ),
+        ];
+        for (media, refusal) in cases {
+            let images = [AttachedDiskImage::file(&image, None, media.iter().copied())];
+            assert!(
+                matches!(release_views_of(&image, &images),
+                    Err(ApfsError::InvalidAttachmentInventory(message)) if message == refusal),
+                "{media:?}"
+            );
+        }
+        let unformatted = [AttachedDiskImage::file(&image, None, [("/dev/disk4", "")])];
+        let views = release_views_of(&image, &unformatted).unwrap();
+        let [view] = views.as_slice() else {
+            panic!("one attachment is one release view");
+        };
+        assert_eq!(view.whole_device(), "/dev/disk4");
+        assert_eq!(view.volumes().count(), 0);
     }
 }

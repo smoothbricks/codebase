@@ -1482,18 +1482,26 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
     }
 
     /// Release a controller-owned image from every attachment the kernel holds for it now, not
-    /// from a cached diskN: each mounted volume is unmounted through its pinned identity, then
-    /// every whole device is detached. A path held twice — a dead process's attach that landed
-    /// after its file was replaced — is released twice rather than refused as ambiguous.
+    /// from a cached diskN: each mounted volume of each attachment's container is unmounted
+    /// through its own pinned identity, then every whole device is detached once. A path held
+    /// twice — a dead process's attach that landed after its file was replaced — is released
+    /// twice rather than refused as ambiguous, and a container holding a volume something added
+    /// beside the image's own is released with it.
     pub fn detach_existing_image(
         &self,
         image: &Path,
         intent: DetachIntent,
     ) -> Result<(), ApfsStorageError> {
         self.verify_controller_path(image)?;
-        for attachment in self.backend.recovered_image_attachments(image)? {
-            if let RecoveredImageAttachment::Apfs(attachment) = attachment {
-                self.unmount_attached(&attachment, intent)?;
+        let mounts = self.mount_source.mounts()?;
+        for view in self.backend.release_views(image)? {
+            for volume in view.volumes() {
+                if mounts
+                    .iter()
+                    .any(|mount| mount.source_device == volume.volume_device())
+                {
+                    self.backend.unmount_released(&volume, intent)?;
+                }
             }
         }
         self.backend

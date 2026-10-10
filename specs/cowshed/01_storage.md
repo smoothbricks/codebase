@@ -381,6 +381,14 @@ grace before `umount -f`. Other errors remain errors. Only after filesystem remo
 release the device. Local real mounted-image probes measured 29–42 ms for native unmount; hosted deadline closure is not
 implied.
 
+Attach, verification and every lookup that answers one attachment require exactly one APFS volume in one reported
+container, and refuse anything else by naming what was reported. A release reads each of the image's attachments as its
+whole device plus every APFS volume in that container, so it can also take an owned image whose container gained a
+volume (for example, one a dead test added). Each mounted volume is unmounted under the image's lease and its own raw
+pin, once that volume is rechecked as a member of the attachment. The whole device is then detached once, taking the
+unmounted volumes with it. A formatted attachment that reports no volume, reports a volume without its container, or
+spans two containers is still refused.
+
 Concurrent mount-table reads use `getfsstat(MNT_NOWAIT)` into a buffer each call owns: count first, allocate checked
 space with room for new mounts, and grow and reread if the returned buffer is full. No reader borrows `getmntinfo`'s
 process-static array, which another thread can overwrite during iteration. Every snapshot retains complete mountpoint

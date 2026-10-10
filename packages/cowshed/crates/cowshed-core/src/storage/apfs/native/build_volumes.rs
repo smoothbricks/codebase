@@ -847,31 +847,15 @@ mod tests {
         String::from_utf8(output.stdout).expect("diskutil answers UTF-8")
     }
 
-    /// A volume the test added to a scratch image's container. The scratch sweep releases only
-    /// one-volume images, so it is deleted before the scratch root drops, on a panic too.
-    struct AddedVolume(Option<String>);
-
-    impl AddedVolume {
-        fn device(&self) -> &str {
-            self.0.as_deref().expect("the volume is not deleted yet")
-        }
-
-        fn delete(mut self) {
-            let device = self.0.take().expect("the volume is not deleted yet");
-            diskutil(&["apfs", "deleteVolume", &device]);
-        }
-    }
-
-    impl Drop for AddedVolume {
-        fn drop(&mut self) {
-            if let Some(device) = self.0.take() {
-                use crate::fork_lock::Run as _;
-                let deleted = std::process::Command::new("/usr/sbin/diskutil")
-                    .args(["apfs", "deleteVolume", &device])
-                    .output_locked();
-                eprintln!("deleting the added volume {device} after a failure: {deleted:?}");
-            }
-        }
+    /// Add an unmounted APFS volume named `name` to `container`, answering its device. A scratch
+    /// root's release takes it with the container's other volumes, on a panic too.
+    fn add_volume(container: &str, name: &str) -> String {
+        diskutil(&["apfs", "addVolume", container, "APFS", name, "-nomount"])
+            .lines()
+            .find_map(|line| line.strip_prefix("Created new APFS Volume "))
+            .expect("diskutil names the volume it added")
+            .trim()
+            .to_owned()
     }
 
     /// The APFS volume stat a job's samples read: a job writes 64 MiB into its workspace and 32
@@ -901,30 +885,10 @@ mod tests {
             .rsplit_once('s')
             .map(|(container, _)| container)
             .expect("an APFS volume device is <container>s<n>");
-        let added = diskutil(&[
-            "apfs",
-            "addVolume",
-            container,
-            "APFS",
-            "sibling",
-            "-nomount",
-        ]);
-        let added = AddedVolume(Some(
-            added
-                .lines()
-                .find_map(|line| line.strip_prefix("Created new APFS Volume "))
-                .expect("diskutil names the volume it added")
-                .trim()
-                .to_owned(),
-        ));
+        let added = add_volume(container, "sibling");
         let sibling = root.path().join("sibling");
         fs::create_dir_all(&sibling).unwrap();
-        diskutil(&[
-            "mount",
-            "-mountPoint",
-            sibling.to_str().unwrap(),
-            added.device(),
-        ]);
+        diskutil(&["mount", "-mountPoint", sibling.to_str().unwrap(), &added]);
 
         job(checkout, &write("predates.bin", 16));
         let captured = |mount: &Path, what: &str| {
@@ -996,7 +960,7 @@ mod tests {
         // A mountpoint whose volume has gone answers for its parent volume: refused, not read.
         // Deleting the added volume unmounts it first; a separate unmount storagekitd may dissent.
         let (left, _) = ApfsVolume::capture(&sibling).expect("the sibling volume");
-        added.delete();
+        diskutil(&["apfs", "deleteVolume", &added]);
         assert!(matches!(
             ApfsVolumeStat.used_bytes(&left),
             Err(VolumeStatError::Read(_))
@@ -1007,6 +971,83 @@ mod tests {
         );
 
         lane.release(&host, &layout);
+    }
+
+    /// A release takes an image whose container holds a volume beside the image's own, as a test
+    /// that adds one leaves it when it dies: each mounted volume, the added one too, is unmounted
+    /// through its own pinned identity, and the whole disk is detached once, leaving no
+    /// attachment and no mount. (A 1 GiB test container holds at most two volumes.) What attaches,
+    /// verifies or looks up one attachment still refuses the image, attached before the release
+    /// and attached afresh after.
+    #[test]
+    fn real_apfs_release_takes_every_volume_of_an_image_and_its_whole_disk_once() {
+        use crate::apfs::ApfsError;
+        let one_volume_refusal = |error: &ApfsError| {
+            matches!(error,
+                ApfsError::InvalidAttachmentInventory(message)
+                | ApfsError::InvalidAttachmentPlist(message)
+                    if message.starts_with("expected one APFS volume, reported [")
+                        && message.matches("/dev/disk").count() == 2)
+        };
+
+        let root =
+            crate::scratch_apfs::ScratchRoot::new("two-volume-release").expect("scratch root");
+        let (host, _) = fixture(root.path());
+        let image = root.path().join("store/lane.dmg");
+        crate::blank_image::blank_image(&image);
+        let attachment = host
+            .backend
+            .attach_verified(&image)
+            .expect("attach the image");
+        let checkout = root.path().join("lane");
+        fs::create_dir_all(&checkout).unwrap();
+        host.backend
+            .mount(&attachment, &checkout, MountAccess::ReadWrite, false)
+            .expect("mount the image");
+        let sibling = add_volume(attachment.whole_device(), "sibling");
+        let sibling_mount = root.path().join("sibling");
+        fs::create_dir_all(&sibling_mount).unwrap();
+        diskutil(&[
+            "mount",
+            "-mountPoint",
+            sibling_mount.to_str().unwrap(),
+            &sibling,
+        ]);
+
+        let looked_up = host.backend.recovered_image_attachment(&image).err();
+        assert!(
+            looked_up.as_ref().is_some_and(one_volume_refusal),
+            "{looked_up:?}"
+        );
+        let unmounted = host
+            .backend
+            .unmount_verified(&attachment, DetachIntent::WhenIdle);
+        assert!(
+            unmounted.as_ref().is_err_and(one_volume_refusal),
+            "{unmounted:?}"
+        );
+
+        host.detach_existing_image(&image, DetachIntent::Release)
+            .expect("release every volume of the image");
+        let held = host.backend.attached_whole_devices(&image).unwrap();
+        assert!(held.is_empty(), "the image is still attached as {held:?}");
+        let scratch = fs::canonicalize(root.path()).unwrap();
+        let left: Vec<_> = host
+            .mount_source
+            .mounts()
+            .unwrap()
+            .into_iter()
+            .filter(|mount| mount.mount_point.starts_with(&scratch))
+            .collect();
+        assert_eq!(left, [], "the released volumes are still mounted");
+
+        let attached = host.backend.attach_verified(&image);
+        assert!(
+            attached.as_ref().is_err_and(one_volume_refusal),
+            "{attached:?}"
+        );
+        let held = host.backend.attached_whole_devices(&image).unwrap();
+        assert!(held.is_empty(), "the refused attach left {held:?}");
     }
 
     /// A process group of its own the test leads, standing in for a job's activation or command:
