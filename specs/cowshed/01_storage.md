@@ -169,16 +169,9 @@ Written at adopt/fork/restore, at the volume root; travels with every clone:
   "baseCommit": "8f31c2d…", // main's HEAD at creation
   "createdAt": "2026-07-11T12:00:00Z",
   "forkedFrom": null, // workspace name when created by `cowshed fork`
-  "createdTrace": "4bf92f…", // trace id of the new/fork/restore that created this image (13_telemetry.md)
-  "ownedLinksRevision": 1 // 0 for a marker written before the owned-link migration; see below
+  "createdTrace": "4bf92f…" // trace id of the fork/restore that created this image (13_telemetry.md)
 }
 ```
-
-`ownedLinksRevision` records the one-time owned-link migration. A marker written before it is 0, and a fresh mint or
-fork writes 1. The first admission that verifies the marker's repository, incarnation and recorded main donor re-spells
-the workspace's absolute owned aliases into main once and publishes 1, so a later admission walks nothing. A restore or
-re-adopt of the same workspace keeps the revision of the marker it copies, so a legacy copy migrates on its own first
-admission.
 
 `workspaceIncarnation` identifies one mutable workspace timeline. Checkpoints retain the incarnation in their copied job
 records; a fork destination and every restore result mint a fresh incarnation, so a reused numeric job id cannot collide

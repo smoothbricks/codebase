@@ -113,6 +113,77 @@ This companion owns the macOS/APFS implementation.
   `[Excluded]` though cowshed applies no exclusion (it runs no `tmutil`). Durability is git (`cowshed push`), never
   backup.
 
+## Historical format measurements
+
+The image-format prototype (`specs/cowshed/prototypes/image-format-bench/`: harness, `results/`) compared three
+candidates on the store's APFS container, all created and mounted without root: case-sensitive ASIF (the historical
+pre-RAW format), case-insensitive ASIF (`newfs_apfs -i`, otherwise identical), and case-sensitive SPARSE
+(`hdiutil create -type SPARSE -fs "Case-sensitive APFS"`, attached with `hdiutil attach -owners on -nomount`). The data
+set is one real Bun `node_modules` (3.6 GB, 34k files, 6.5k symlinks), 40,000 further symlinks, 2 GiB of
+cargo-target-like files (24 × 64 MiB, 512 × 1 MiB), and a git repository tracking all but the target files (80,744 index
+entries, 0.75 GB of loose objects): 6.3 GB, 55,821 files, 46,575 symlinks. One churn round rewrites every target file
+(write a new file, rename it over the old) and relinks every symlink — 2 GiB and 46,575 relinks. Extents are counted as
+`doctor` counts them; the first write is one byte rewritten in place in a fresh `clonefile` of the image. The host ran a
+fleet throughout (load average 10–35), so single timings carry about ±20 %; the I/O rows interleave the three candidates
+round by round.
+
+| Metric                                                                   | ASIF, case-sensitive (historical choice)                                          | ASIF, case-insensitive                                                   | SPARSE, case-sensitive                                           |
+| ------------------------------------------------------------------------ | --------------------------------------------------------------------------------- | ------------------------------------------------------------------------ | ---------------------------------------------------------------- |
+| Create, unprivileged (median of 5)                                       | 441 ms                                                                            | 448 ms                                                                   | 1,046 ms                                                         |
+| Attach + `fsck_apfs -q` + mount (median of 5)                            | 228 ms                                                                            | 204 ms                                                                   | 308 ms                                                           |
+| Detach (median of 5)                                                     | 337 ms                                                                            | 277 ms                                                                   | 360 ms                                                           |
+| Fill with the 6.3 GB data set (`ditto`, two runs)                        | 21.7 s / 16.5 s                                                                   | 17.2 s / 20.8 s                                                          | 34.7 s / 57.5 s                                                  |
+| Source extents, filled → 3 churn rounds, 4 clones held                   | 385 → 511 → 5,137 → 8,871                                                         | 425 → 550 → 5,323 → 8,952                                                | 593 → 2,244 → 5,822 → 9,441                                      |
+| First write into a fresh clone at those counts                           | 2.7 / 3 / 18.4 / 30.7 ms                                                          | 2.5 / 2.4 / 17.3 / 29.3 ms                                               | 2.8 / 9.4 / 20.6 / 36 ms                                         |
+| Source extents, same churn, no clone held                                | 468 → 576 → 629 → 655                                                             | 445 → 586 → 621 → 624                                                    | 583 → 778 → 884 → 888                                            |
+| Source extents, same churn inside a clone of it                          | 356 → 356 → 356 → 356 (shed: 472 → 5,003 → 8,699)                                 | —                                                                        | —                                                                |
+| Allocated after 3 rounds (5.9 GiB data)                                  | 8.87 GiB                                                                          | 8.87 GiB                                                                 | 9.06 GiB                                                         |
+| Defrag copy of the 4-clone image (8.9 GiB)                               | 2.0 s, 4.7 GB/s → 579 extents                                                     | 1.8 s, 5.4 GB/s → 576 extents                                            | 3.1 s, 3.1 GB/s → 598 extents                                    |
+| `git status`, 80,744 entries (interleaved median of 7)                   | 315 ms                                                                            | 344 ms                                                                   | 319 ms                                                           |
+| 20k small files: create / symlink / unlink ops/s                         | 13,811 / 26,684 / 31,149                                                          | 14,516 / 25,955 / 28,200                                                 | 1,331 / 1,690 / 4,382                                            |
+| 1 GiB sequential write (`F_FULLFSYNC`) / read (`F_NOCACHE`)              | 3,201 / 15,022 MB/s                                                               | 3,202 / 15,258 MB/s                                                      | 751 / 2,012 MB/s                                                 |
+| Space returned after 3.3 GiB written then deleted                        | 1.3 GiB on its own; `diskutil image create from` copy is 15 MiB (0.18 s)          | 1.3 GiB on its own; `diskutil image create from` copy is 15 MiB (0.13 s) | none on its own; `hdiutil compact` 0.7 s returned 57 MiB         |
+| Capacity 100 GiB vs 7.3 TiB (the store volume): create                   | 710 vs 463 ms                                                                     | —                                                                        | 1,050 vs 1,032 ms                                                |
+| … attach + fsck + mount                                                  | 288 vs 241 ms                                                                     | —                                                                        | 287 vs 525 ms                                                    |
+| … image allocated when empty                                             | 14 vs 17 MiB                                                                      | —                                                                        | 15 vs 17 MiB                                                     |
+| … `df` inside the volume (size / available)                              | 100 / 100 vs 7,449 / 2,686 GiB                                                    | —                                                                        | 100 / 100 vs 7,449 / 2,674 GiB                                   |
+| … filled, then one churn round: allocated, extents                       | 7.93 GiB, 455 vs 7.93 GiB, 932                                                    | —                                                                        | 7.92 GiB, 785 vs 7.93 GiB, 777                                   |
+| … grow 100 GiB → 7.3 TiB, detached                                       | 542 ms                                                                            | —                                                                        | 1,171 ms                                                         |
+| Rewrite of the 4-clone image: plain copy vs `diskutil image create from` | 2.4 s → 792 extents, 8.83 GiB vs 2.8 s → 217 extents, 7.95 GiB, same content: yes | —                                                                        | —                                                                |
+| Rewrite, resize, or convert while attached                               | refused: file held under exclusive lock (`EAGAIN`)                                | refused: file held under exclusive lock (`EAGAIN`)                       | refused: file held under exclusive lock (`EAGAIN`)               |
+| Grow 100 → 200 GB, detached                                              | 460 ms; volume grows with it                                                      | 539 ms; volume grows with it                                             | 498 ms; volume grows with it                                     |
+| Volume and its clone case-sensitive                                      | yes / yes                                                                         | no / no                                                                  | yes / yes                                                        |
+| Work per fork for case sensitivity                                       | none                                                                              | none                                                                     | none                                                             |
+| Largest capacity (documented / reverse-engineered)                       | just under 4 PiB                                                                  | just under 4 PiB                                                         | 128 PB (`man hdiutil`)                                           |
+| Host dies mid-write (docs)                                               | allocation directory is versioned and switched atomically                         | allocation directory is versioned and switched atomically                | power loss during `compact` can damage the image (`man hdiutil`) |
+
+The detached-grow timings above measured Apple's content resize, before the native header-growth cutover.
+
+ASIF's 1 MiB chunks, its capacity limit, and its versioned allocation directory come from reverse engineering
+(<https://schamper.dev/dissecting-apples-sparse-image-format-asif/>), not from Apple; SPARSE's limits and its compaction
+warning come from `man hdiutil`. APFS's journal does not make the enclosing image driver's mutable allocation map a
+snapshot: `sync_volume_np(WAIT)` followed by image `fsync` and `clonefile` can capture mixed ASIF map generations. The
+pre-RAW ASIF implementation therefore captured only detached images, holding each inode with a shared no-follow lock,
+validating its allocation map and cloning through that descriptor. It unmounted and detached a mounted source without
+force and restored it afterwards; a source holder refused the capture. That policy blocked live-main forks, and the
+cause of the observed inconsistent maps was not established by the earlier successful smoke reads. It is historical, not
+the current RAW source-capture contract. RAW has no outer map; source captures remain live, while build seeds retain the
+separate writer exclusion in "Images" and 16_build_volumes.md. `fsck_apfs -q` still checks the inner filesystem before a
+mount, but cannot establish the outer ASIF map's consistency. ASIF's chunk table can mark a chunk unmapped, which fits
+it returning part of deleted space on its own; SPARSE returns nothing until `hdiutil compact`, and little then.
+`diskutil image create from` rewrites a detached ASIF image from its allocated chunks only: on the churned four-clone
+image it took 2.8 s against the plain copy's 2.4 s and left 217 extents and 7.95 GiB against 792 and 8.83 GiB, with the
+same content, case sensitivity, and owner. An ASIF capacity as large as the store volume measured no cost against 100
+GiB: creation, attach, empty allocation, and the allocation after a fill and a churn round match within noise, the
+churned image held 932 extents against 455 (about 1.5 ms more first write), and `df` inside the volume reports the
+store's own free space as available. SPARSE at that capacity attached slower (525 against 287 ms) and once refused its
+first detach with `EBUSY`.
+
+Case-sensitive ASIF therefore costs nothing that case-insensitive ASIF does not: the flag is set once at creation, no
+step recurs per fork, and every measured difference between the two sits inside the noise. SPARSE loses on creation,
+attach, fill, small-file and sequential I/O, ties on `git status`, fragments under clones exactly as ASIF does, and
+gives back less space.
+
 ## Mounts
 
 APFS image attach uses `diskutil image attach --nobrowse --noMount --plist <image>` exactly once, naming the exact
