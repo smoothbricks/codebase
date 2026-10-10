@@ -867,18 +867,53 @@ fn collect_vo_metadata<'a>(schema: &'a SemanticSchema, output: &mut Vec<&'a VoMe
     }
 }
 
-/// Judge one value against one semantic schema with no value-object
-/// capability: any `vo` node is refused as [`VoAdmissionError::Unavailable`].
-///
-/// Unknown members below an open object are intentionally not traversed: the
-/// extractor owns bounded carrier capture, while this function owns only the
-/// admission judgment. No mutation, deduplication, or output allocation is
-/// performed here beyond diagnostics for the first violation.
+/// Judges values one after another, keeping the storage of the path it
+/// walks: once that storage has held the deepest path judged, admitting a
+/// value allocates nothing. Unknown members below an open object are not
+/// traversed: the extractor owns bounded carrier capture, a judge only the
+/// admission judgment. A refusal spells its diagnostic, fallibly.
+#[derive(Default)]
+pub struct Judge {
+    path: JudgedPath,
+}
+
+impl Judge {
+    /// Judge `value` against `schema` with no value-object capability: any
+    /// `vo` node is refused as [`VoAdmissionError::Unavailable`].
+    pub fn validate<V: ValueView>(
+        &mut self,
+        schema: &SemanticSchema,
+        value: &V,
+    ) -> Result<(), ValueRefusal> {
+        self.validate_with_admission(schema, value, &UnavailableVoAdmission)
+    }
+
+    /// [`Self::validate`] with a value-object capability already prepared
+    /// for every `vo` node of `schema`.
+    pub fn validate_with_admission<V: ValueView, A: VoAdmission>(
+        &mut self,
+        schema: &SemanticSchema,
+        value: &V,
+        admission: &A,
+    ) -> Result<(), ValueRefusal> {
+        let path = &mut self.path;
+        path.at("value").map_err(|_| ValueRefusal::OutOfMemory)?;
+        validate_at(schema, value, path, 0, &mut JudgeOnly(admission)).map_err(|stop| match stop {
+            Stop::Fault(fault) => fault
+                .spell(path.as_str())
+                .map_or(ValueRefusal::OutOfMemory, ValueRefusal::Violation),
+            Stop::OutOfMemory => ValueRefusal::OutOfMemory,
+        })
+    }
+}
+
+/// Judge one value with a fresh [`Judge`]; a caller judging many values
+/// keeps one judge instead.
 pub fn validate_value<V: ValueView>(
     schema: &SemanticSchema,
     value: &V,
 ) -> Result<(), ValueRefusal> {
-    validate_value_with_admission(schema, value, &UnavailableVoAdmission)
+    Judge::default().validate(schema, value)
 }
 
 /// [`validate_value`] with a value-object capability already prepared for
@@ -888,14 +923,7 @@ pub fn validate_value_with_admission<V: ValueView, A: VoAdmission>(
     value: &V,
     admission: &A,
 ) -> Result<(), ValueRefusal> {
-    let mut path = JudgedPath::default();
-    path.at("value").map_err(|_| ValueRefusal::OutOfMemory)?;
-    validate_at(schema, value, &mut path, 0, &mut JudgeOnly(admission)).map_err(|stop| match stop {
-        Stop::Fault(fault) => fault
-            .spell(path.as_str())
-            .map_or(ValueRefusal::OutOfMemory, ValueRefusal::Violation),
-        Stop::OutOfMemory => ValueRefusal::OutOfMemory,
-    })
+    Judge::default().validate_with_admission(schema, value, admission)
 }
 
 /// Where the judgment sends each value-object frame it reaches. A judgment
@@ -2734,6 +2762,24 @@ mod tests {
             .1
         };
         assert_eq!(admitted(1), admitted(64));
+        // A judge kept across values allocates nothing once warm: its path
+        // storage is reused, for admitted values and refused ones alike.
+        let mut judge = Judge::default();
+        let wide = json(&format!("[{}]", vec![r#"{"name":"ok"}"#; 64].join(",")));
+        assert_eq!(judge.validate(&items, &wide), Ok(()));
+        assert_eq!(
+            crate::memory::with_allocations(0, || judge.validate(&items, &wide)),
+            Ok(())
+        );
+        assert_eq!(
+            crate::memory::with_allocations(0, || judge.validate(&closed, &value)),
+            Err(ValueRefusal::OutOfMemory),
+            "spelling a refusal is the only allocation a warm judge makes"
+        );
+        assert_eq!(
+            judge.validate(&closed, &value),
+            Err(ValueRefusal::Violation(closed_error.clone()))
+        );
         let (refused, _) = crate::memory::at_every_allocation(
             || (),
             |()| match validate_value(&closed, &value) {
