@@ -38,3 +38,7 @@ overlay, pinned to the immutable upstream v2.0.2 release with per-archive SHA-25
 and arm64. The existing managed-file checks detect a missing or stale module, and `smoo monorepo update` provisions that
 same module. Nix installs the prebuilt executable with the shell; no validation-time download or Go compilation occurs.
 CI puts the same devenv profile bin on PATH, so CI uses the same pin.
+
+The managed package list also provides `shellcheck-minimal` and an executable-only `pyflakes` package, pinned by the
+existing devenv lockfile. The pyflakes package exposes only its checker executable, leaving the repository's configured
+Python interpreter and build environment unchanged. Both default integrations remain enabled locally and in CI.
