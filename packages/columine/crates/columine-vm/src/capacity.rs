@@ -607,6 +607,9 @@ impl CapacityScratch {
     fn decode(&mut self, code: &[u8]) -> Option<()> {
         self.program.clear();
         self.effects.clear();
+        // The copy is backed first: a cache whose effects outlive a failed
+        // copy would match an empty reduce section.
+        Self::room(&mut self.out_of_memory, &mut self.program, code.len())?;
         let mut operands = core::mem::take(&mut self.operands);
         let out_of_memory = &mut self.out_of_memory;
         let decoded = &mut self.effects;
@@ -625,7 +628,6 @@ impl CapacityScratch {
             self.effects.clear();
             return None;
         }
-        Self::room(&mut self.out_of_memory, &mut self.program, code.len())?;
         self.program.extend_from_slice(code);
         Some(())
     }

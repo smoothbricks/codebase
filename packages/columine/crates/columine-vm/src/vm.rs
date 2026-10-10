@@ -944,8 +944,9 @@ pub struct Vm {
     pub(crate) undo: UndoState,
     pub bitmap_env: BitmapEnv,
     accepted_program_magics: &'static [u32],
-    /// Reused physical program/shape declaration admission scratch.
-    declared_slots: Vec<bool>,
+    /// The current program's init declarations, decoded once and compared
+    /// with each batch's image.
+    declarations: state_init::Declarations,
     /// The plan of the FOR_EACH body being run (`element_body`), made once
     /// per batch; kept so a batch reuses its allocations.
     element_plan: BodyPlan,
@@ -974,7 +975,7 @@ impl Vm {
             undo: UndoState::default(),
             bitmap_env: BitmapEnv::default(),
             accepted_program_magics,
-            declared_slots: Vec::new(),
+            declarations: state_init::Declarations::default(),
             element_plan: BodyPlan::default(),
             element_struct_map: StructMapUpsertOperands::EMPTY,
             element_struct_map2: StructMap2UpsertOperands::EMPTY,
@@ -3253,21 +3254,13 @@ impl Vm {
         if self.element_plan.reserve_for(sections.reduce_code).is_err() {
             return OUT_OF_MEMORY;
         }
-        // The declaration check's storage is backed first, so it reports a
-        // mismatch, never a failed allocation.
-        if usize::try_from(sections.header.num_slots)
-            .ok()
-            .is_none_or(|slots| self.declared_slots.try_reserve(slots).is_err())
+        match self
+            .declarations
+            .matches(sections.init_code, sections.header.num_slots, state)
         {
-            return OUT_OF_MEMORY;
-        }
-        if !state_init::program_matches_state(
-            sections.init_code,
-            sections.header.num_slots,
-            state,
-            &mut self.declared_slots,
-        ) {
-            return INVALID_PROGRAM;
+            Ok(true) => {}
+            Ok(false) => return INVALID_PROGRAM,
+            Err(error) => return error as u32,
         }
         self.change_flag_boundary(delta_mode, state, |vm, state| {
             let mut live = live;

@@ -2297,169 +2297,249 @@ pub fn grow_state(
     Ok(())
 }
 
-/// Admission compares the declared physical kinds with the actual state image.
-/// Capacity is deliberately not compared: a grown image has the same shape.
-/// This walk borrows the descriptor and reuses the VM's declaration scratch.
-pub(crate) fn program_matches_state(
-    init: &[u8],
-    num_slots: u32,
-    state: &[u8],
-    seen: &mut Vec<bool>,
-) -> bool {
-    let Ok(slot_count) = usize::try_from(num_slots) else {
-        return false;
-    };
-    if state.len() < STATE_HEADER_SIZE as usize
-        || state_num_slots(state) != num_slots
-        || u64::from(STATE_HEADER_SIZE) + u64::from(num_slots) * u64::from(SLOT_META_SIZE)
-            > state.len() as u64
-        || slot_count > init.len()
-    {
-        return false;
+/// One slot's declaration in a program's init section, as admission compares
+/// it with an image: everything the init section alone decides is decided
+/// when it is decoded.
+#[derive(Clone, Copy, Debug)]
+struct Declared {
+    /// Byte offset of the slot's metadata record.
+    meta: u32,
+    /// The declared slot-type nibble.
+    kind: u8,
+    check: DeclaredShape,
+}
+
+/// What a declaration compares beyond the slot-type nibble.
+#[derive(Clone, Copy, Debug)]
+enum DeclaredShape {
+    /// Kind only (arrays, lists, nested slots, keyed containers).
+    Kind,
+    /// An aggregate or scalar's subtype byte.
+    Subtype(u8),
+    /// A struct map's field descriptor, the `fields` span of the init
+    /// section, and the row layout it implies.
+    Struct {
+        pair: bool,
+        fields: (usize, usize),
+        layout: columine_types::types::StructRowLayout,
+    },
+}
+
+/// A program's init declarations, decoded once per init section and compared
+/// with every image a batch is handed. Capacity is deliberately not
+/// compared: a grown image has the same shape.
+#[derive(Debug, Default)]
+pub(crate) struct Declarations {
+    /// The init section `slots` was decoded from, and its slot count;
+    /// `None` until a decode succeeds, so a failed one is never matched.
+    init: Vec<u8>,
+    num_slots: Option<u32>,
+    slots: Vec<Declared>,
+    /// Decode scratch: which slots the init section has declared.
+    seen: Vec<bool>,
+}
+
+impl Declarations {
+    /// Whether `state` has the slots `init` declares. A different init
+    /// section is decoded first; `OutOfMemory` when its storage cannot be
+    /// backed, so a refusal is never a failed allocation.
+    pub(crate) fn matches(
+        &mut self,
+        init: &[u8],
+        num_slots: u32,
+        state: &[u8],
+    ) -> Result<bool, ErrorCode> {
+        if self.num_slots != Some(num_slots) || self.init != init {
+            self.num_slots = None;
+            self.init.clear();
+            self.init
+                .try_reserve(init.len())
+                .map_err(|_| ErrorCode::OutOfMemory)?;
+            if !self.decode(init, num_slots)? {
+                return Ok(false);
+            }
+            self.init.extend_from_slice(init);
+            self.num_slots = Some(num_slots);
+        }
+        Ok(self.compare(state, num_slots))
     }
-    seen.clear();
-    seen.resize(slot_count, false);
-    let mut r = Operands::at(init, 0);
-    while r.pos() < init.len() {
-        let Some(op) = r.byte().and_then(Opcode::from_u8) else {
-            return false;
+
+    /// Decode `init` into `slots`: every slot declared exactly once, then
+    /// `HALT` at the section's end, each declaration well formed.
+    fn decode(&mut self, init: &[u8], num_slots: u32) -> Result<bool, ErrorCode> {
+        self.slots.clear();
+        self.seen.clear();
+        let Ok(slot_count) = usize::try_from(num_slots) else {
+            return Ok(false);
         };
-        if op == Opcode::Halt {
-            return r.pos() == init.len() && seen.iter().all(|defined| *defined);
+        if slot_count > init.len() {
+            return Ok(false);
         }
-        let Some(slot) = r.index().filter(|slot| *slot < num_slots) else {
-            return false;
-        };
-        let Ok(slot_index) = usize::try_from(slot) else {
-            return false;
-        };
-        if seen[slot_index] {
-            return false;
+        if self.slots.try_reserve(slot_count).is_err() || self.seen.try_reserve(slot_count).is_err()
+        {
+            return Err(ErrorCode::OutOfMemory);
         }
-        seen[slot_index] = true;
-        let meta = STATE_HEADER_SIZE + slot * SLOT_META_SIZE;
-        let Some(flags) = r.byte().map(SlotTypeFlags::from_byte) else {
-            return false;
-        };
-        let Some(cap_lo) = r.byte() else {
-            return false;
-        };
-        if r.byte().is_none()
-            || flags.slot_type().is_none()
-            || state[(meta + SlotMetaOffset::TYPE_FLAGS) as usize] & 0x0f != flags.to_byte() & 0x0f
+        self.seen.resize(slot_count, false);
+        let mut r = Operands::at(init, 0);
+        while r.pos() < init.len() {
+            let Some(op) = r.byte().and_then(Opcode::from_u8) else {
+                return Ok(false);
+            };
+            if op == Opcode::Halt {
+                return Ok(r.pos() == init.len() && self.seen.iter().all(|defined| *defined));
+            }
+            let Some(slot) = r.index().filter(|slot| *slot < num_slots) else {
+                return Ok(false);
+            };
+            let Ok(slot_index) = usize::try_from(slot) else {
+                return Ok(false);
+            };
+            if self.seen[slot_index] {
+                return Ok(false);
+            }
+            self.seen[slot_index] = true;
+            let Some(flags) = r.byte().map(SlotTypeFlags::from_byte) else {
+                return Ok(false);
+            };
+            let Some(cap_lo) = r.byte() else {
+                return Ok(false);
+            };
+            let Some(slot_type) = flags.slot_type().filter(|_| r.byte().is_some()) else {
+                return Ok(false);
+            };
+            let kind = flags.to_byte() & 0x0f;
+            let check = match op {
+                Opcode::SlotStructMap | Opcode::SlotStructMap2 => {
+                    let pair = op == Opcode::SlotStructMap2;
+                    let expected = if pair {
+                        SlotType::StructMap2
+                    } else {
+                        SlotType::StructMap
+                    };
+                    if slot_type != expected || flags.has_ttl() || kind != expected as u8 {
+                        return Ok(false);
+                    }
+                    let Some(nf) = r.byte() else {
+                        return Ok(false);
+                    };
+                    let start = r.pos();
+                    let Some(fields) = r.bytes(usize::from(nf)) else {
+                        return Ok(false);
+                    };
+                    if fields.iter().any(|&field| {
+                        StructFieldType::from_u8(field).is_none()
+                            || (pair && field == StructFieldType::Vo as u8)
+                    }) {
+                        return Ok(false);
+                    }
+                    DeclaredShape::Struct {
+                        pair,
+                        fields: (start, r.pos()),
+                        layout: compute_struct_row_layout_padded(nf, fields),
+                    }
+                }
+                Opcode::SlotDef => {
+                    if flags.has_ttl() {
+                        let Some((_, next)) = TtlParams::read(init, r.pos()) else {
+                            return Ok(false);
+                        };
+                        r = Operands::at(init, next);
+                    }
+                    if matches!(slot_type, SlotType::Aggregate | SlotType::Scalar) {
+                        DeclaredShape::Subtype(cap_lo)
+                    } else {
+                        DeclaredShape::Kind
+                    }
+                }
+                Opcode::SlotArray => DeclaredShape::Kind,
+                Opcode::SlotOrderedList => {
+                    let Some(elem) = r.byte() else {
+                        return Ok(false);
+                    };
+                    if elem == StructFieldType::Vo as u8 {
+                        return Ok(false);
+                    }
+                    if elem == 0xff {
+                        let Some(nf) = r.byte() else {
+                            return Ok(false);
+                        };
+                        for _ in 0..nf {
+                            let Some(field) = r.byte() else {
+                                return Ok(false);
+                            };
+                            if field == StructFieldType::Vo as u8
+                                || StructFieldType::from_u8(field).is_none()
+                            {
+                                return Ok(false);
+                            }
+                        }
+                    }
+                    DeclaredShape::Kind
+                }
+                Opcode::SlotNested => {
+                    if r.bytes(4).is_none() {
+                        return Ok(false);
+                    }
+                    DeclaredShape::Kind
+                }
+                _ => return Ok(false),
+            };
+            self.slots.push(Declared {
+                meta: STATE_HEADER_SIZE + slot * SLOT_META_SIZE,
+                kind,
+                check,
+            });
+        }
+        Ok(false)
+    }
+
+    /// Compare the decoded declarations with `state`'s metadata and struct
+    /// descriptors.
+    fn compare(&self, state: &[u8], num_slots: u32) -> bool {
+        if state.len() < STATE_HEADER_SIZE as usize
+            || state_num_slots(state) != num_slots
+            || u64::from(STATE_HEADER_SIZE) + u64::from(num_slots) * u64::from(SLOT_META_SIZE)
+                > state.len() as u64
         {
             return false;
         }
-        match op {
-            Opcode::SlotStructMap | Opcode::SlotStructMap2 => {
-                let expected = if op == Opcode::SlotStructMap {
-                    SlotType::StructMap
-                } else {
-                    SlotType::StructMap2
-                };
-                if flags.slot_type() != Some(expected)
-                    || flags.has_ttl()
-                    || state[(meta + SlotMetaOffset::TYPE_FLAGS) as usize] & 0x0f != expected as u8
-                {
-                    return false;
+        self.slots.iter().all(|declared| {
+            let meta = declared.meta;
+            if state[(meta + SlotMetaOffset::TYPE_FLAGS) as usize] & 0x0f != declared.kind {
+                return false;
+            }
+            match declared.check {
+                DeclaredShape::Kind => true,
+                DeclaredShape::Subtype(subtype) => {
+                    state[(meta + SlotMetaOffset::AGG_TYPE) as usize] == subtype
                 }
-                let Some(nf) = r.byte() else {
-                    return false;
-                };
-                if state[(meta + STRUCT_NUM_FIELDS) as usize] != nf {
-                    return false;
-                }
-                let off = bytes::read_u32(state, meta + SlotMetaOffset::OFFSET);
-                let Some(end) = off.checked_add(u32::from(nf)) else {
-                    return false;
-                };
-                let Some(descriptor) = state.get(off as usize..end as usize) else {
-                    return false;
-                };
-                for &field_type in descriptor {
-                    if StructFieldType::from_u8(field_type).is_none()
-                        || (expected == SlotType::StructMap2
-                            && field_type == StructFieldType::Vo as u8)
-                        || r.byte() != Some(field_type)
-                    {
-                        return false;
-                    }
-                }
-                let layout = compute_struct_row_layout_padded(nf, descriptor);
-                if overlay_row_size(state, meta) != layout.row_size
-                    || u32::from(state[(meta + STRUCT_BITSET_BYTES) as usize])
-                        != layout.bitset_bytes
-                {
-                    return false;
-                }
-                let capacity = bytes::read_u32(state, meta + SlotMetaOffset::CAPACITY);
-                let Some(primary_end) = capacity
-                    .checked_mul(
-                        layout.row_size
-                            + if expected == SlotType::StructMap2 {
-                                8
-                            } else {
-                                4
-                            },
-                    )
-                    .and_then(|bytes| off.checked_add(layout.descriptor_size)?.checked_add(bytes))
-                else {
-                    return false;
-                };
-                if primary_end as usize > state.len() {
-                    return false;
+                DeclaredShape::Struct {
+                    pair,
+                    fields: (start, end),
+                    layout,
+                } => {
+                    let fields = &self.init[start..end];
+                    let off = bytes::read_u32(state, meta + SlotMetaOffset::OFFSET);
+                    let descriptor = u32::try_from(fields.len())
+                        .ok()
+                        .and_then(|len| off.checked_add(len))
+                        .and_then(|end| state.get(off as usize..end as usize));
+                    let primary = layout.row_size + if pair { 8 } else { 4 };
+                    usize::from(state[(meta + STRUCT_NUM_FIELDS) as usize]) == fields.len()
+                        && descriptor == Some(fields)
+                        && overlay_row_size(state, meta) == layout.row_size
+                        && u32::from(state[(meta + STRUCT_BITSET_BYTES) as usize])
+                            == layout.bitset_bytes
+                        && bytes::read_u32(state, meta + SlotMetaOffset::CAPACITY)
+                            .checked_mul(primary)
+                            .and_then(|bytes| {
+                                off.checked_add(layout.descriptor_size)?.checked_add(bytes)
+                            })
+                            .is_some_and(|primary_end| primary_end as usize <= state.len())
                 }
             }
-            Opcode::SlotDef => {
-                if matches!(
-                    flags.slot_type(),
-                    Some(SlotType::Aggregate | SlotType::Scalar)
-                ) && state[(meta + SlotMetaOffset::AGG_TYPE) as usize] != cap_lo
-                {
-                    return false;
-                }
-                if flags.has_ttl() {
-                    let Some((_, next)) = TtlParams::read(init, r.pos()) else {
-                        return false;
-                    };
-                    r = Operands::at(init, next);
-                }
-            }
-            Opcode::SlotArray => {}
-            Opcode::SlotOrderedList => {
-                let Some(elem) = r.byte() else {
-                    return false;
-                };
-                if elem == StructFieldType::Vo as u8 {
-                    return false;
-                }
-                if elem == 0xff {
-                    let Some(nf) = r.byte() else {
-                        return false;
-                    };
-                    for _ in 0..nf {
-                        let Some(field) = r.byte() else {
-                            return false;
-                        };
-                        if field == StructFieldType::Vo as u8
-                            || StructFieldType::from_u8(field).is_none()
-                        {
-                            return false;
-                        }
-                    }
-                }
-            }
-            Opcode::SlotNested => {
-                for _ in 0..4 {
-                    if r.byte().is_none() {
-                        return false;
-                    }
-                }
-            }
-            _ => return false,
-        }
+        })
     }
-    false
 }
 
 /// Geometry was checked by sizing; validate live references and compaction span

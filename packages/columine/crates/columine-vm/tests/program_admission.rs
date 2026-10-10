@@ -202,6 +202,24 @@ fn omitted_shape_declarations_refuse_before_raw_vm_mutation() {
     assert_eq!(vm.execute_batch_delta(&mut state, &malformed, &cols, 1), 2);
     assert_eq!(state, before);
     assert_eq!(vm.undo_checkpoint(), 0);
+
+    // A VM that admitted the real program decodes each other init section
+    // anew, however often it runs: the declarations it last matched never
+    // stand in for a malformed section, an empty one, or another field kind.
+    let mut empty = original[..56].to_vec();
+    empty[48..52].copy_from_slice(&0u32.to_le_bytes());
+    empty.extend_from_slice(&original[64..]);
+    let other_kind = assemble(&struct_map_init(&[1]), &original[64..]);
+    let mut vm = Vm::default();
+    let mut admitted = state.clone();
+    assert_eq!(vm.execute_batch(&mut admitted, &original, &cols, 1), 0);
+    for refused in [&malformed[..], &empty[..], &other_kind[..]] {
+        for _ in 0..2 {
+            let mut image = before.clone();
+            assert_eq!(vm.execute_batch(&mut image, refused, &cols, 1), 2);
+            assert_eq!(image, before);
+        }
+    }
 }
 
 #[test]
