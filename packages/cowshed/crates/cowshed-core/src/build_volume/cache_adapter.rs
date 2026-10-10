@@ -114,6 +114,7 @@ mod tests {
 
     #[test]
     fn unsupported_nx_metadata_is_refused_before_any_cache_side_effect() {
+        use crate::fork_lock::Spawn as _;
         use std::io::Write;
         use std::process::{Command, Stdio};
 
@@ -136,7 +137,7 @@ mod tests {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .spawn()
+            .spawn_locked()
             .expect("run Nx cache adapter with node");
         child
             .stdin
