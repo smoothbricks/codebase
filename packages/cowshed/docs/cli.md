@@ -351,7 +351,7 @@ cowshed: created dedicated volume cowshed.store (space-sharing, excluded from ba
 cowshed: creating image /private/cowshed/store/acme/widget/main.dmg (capacity 100g)
 cowshed: copying 8,357,293 objects into the image (this is the one-time cost)
 cowshed: verifying tree against source ... ok
-cowshed: swapping <project-root> -> mountpoint (stub .envrc written beneath)
+cowshed: swapping <project-root> -> mountpoint
 next: cowshed new <name>
 <project-root>
 ```
@@ -367,6 +367,12 @@ as they are: nothing is normalized, pruned or deleted, and only cowshed's own ma
 Each image's capacity is read from the kernel before the old image is detached, and the fresh image keeps that capacity;
 the old file's apparent length is not used.
 
+Without `--repo-id`, re-adoption binds the checkout's existing primary identity from the store instead of deriving one
+from the remotes. The in-image marker must record this checkout as main's, the controller's Active RAW `main.dmg`
+sidecar must record the same checkout and incarnation, a binding must own that repository, and no other project's RAW
+main may claim the checkout; any disagreement refuses. With no main marker, or no RAW `main.dmg` for the repository it
+names, the identity comes from the remotes as for a first adopt.
+
 The build volume keeps its identity, owner record, built-at tree and creation time. Its warm contents are carried into a
 sparse RAW image at the recorded capacity; an empty build volume is never substituted. Old-incarnation seeds are left
 unchanged as retained evidence, and the new main gets one fresh RAW seed captured from the verified warm replacement.
@@ -374,7 +380,8 @@ The workspaces' links to main's checkout path are preserved.
 
 Before publication, cowshed verifies tracked and untracked-not-ignored file checksums, the full Git state, `git fsck`,
 and the build contents and identity, and checks host allocation with `du` and `st_blocks * 512`. Any mismatch refuses
-publication and leaves the source available. The verified replacement then mounts at the original checkout path.
+publication and leaves the source available. Git is compared filter-free, so no external clean, smudge or process driver
+runs. The verified replacement then mounts at the original checkout path.
 
 If interrupted before the replacement mounts, retry the same `adopt <checkout> --re-adopt` from outside the checkout, or
 run `cowshed mount main --repo-id <owner/repo>`. Both routes admit a checkout without Git only when the controller's

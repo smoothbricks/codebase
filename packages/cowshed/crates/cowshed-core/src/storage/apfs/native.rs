@@ -6890,6 +6890,177 @@ mod tests {
         assert_eq!(fs::read(retained).unwrap(), b"retained source evidence");
     }
 
+    /// Re-adoption step 2 (02_workspaces.md, "Re-adoption"): a replay whose main image already
+    /// moved finishes each companion a crash left beside the original, and refuses, moving nothing,
+    /// when a companion is absent from both names, present at both, or not a regular file. Every
+    /// refusing companion is the second one, so the first, still beside its original, proves that
+    /// every name is read before the first rename. Each refusal compares the whole project tree
+    /// before and after. The image itself has already moved, so no kernel step runs.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn retained_companions_converge_on_replay_and_move_nothing_on_refusal() {
+        use crate::apfs::SystemCommandRunner;
+        use crate::build_volume::RECORD_SUFFIX;
+        use crate::metadata::{GRANTS_SIDECAR_SUFFIX, append_suffix};
+        use crate::storage::apfs::COMPANION_SUFFIX;
+        use crate::storage::recovery::re_adopt_tests::Fixture;
+        use std::os::unix::fs::symlink;
+
+        #[derive(Clone, Copy)]
+        enum At {
+            Original,
+            Retained,
+            Both,
+            Neither,
+            DirectoryAtOriginal,
+            LinkAtRetained,
+        }
+        #[derive(Clone, Copy, Debug)]
+        enum Expect {
+            Converged,
+            Missing,
+            Overwrite,
+            NotRegular,
+        }
+        #[derive(Debug, PartialEq, Eq)]
+        enum Seen {
+            Dir,
+            File(Vec<u8>),
+            Link(PathBuf),
+        }
+        fn snapshot(path: &Path, seen: &mut BTreeMap<PathBuf, Seen>) {
+            let metadata = fs::symlink_metadata(path).unwrap();
+            let entry = if metadata.file_type().is_symlink() {
+                Seen::Link(fs::read_link(path).unwrap())
+            } else if metadata.is_dir() {
+                for child in fs::read_dir(path).unwrap() {
+                    snapshot(&child.unwrap().path(), seen);
+                }
+                Seen::Dir
+            } else {
+                Seen::File(fs::read(path).unwrap())
+            };
+            seen.insert(path.to_path_buf(), entry);
+        }
+        const CASES: [(&str, At, At, Expect); 7] = [
+            (
+                "both_beside_the_original",
+                At::Original,
+                At::Original,
+                Expect::Converged,
+            ),
+            (
+                "crash_between_companions",
+                At::Retained,
+                At::Original,
+                Expect::Converged,
+            ),
+            (
+                "already_retained",
+                At::Retained,
+                At::Retained,
+                Expect::Converged,
+            ),
+            (
+                "absent_from_both",
+                At::Original,
+                At::Neither,
+                Expect::Missing,
+            ),
+            ("present_at_both", At::Original, At::Both, Expect::Overwrite),
+            (
+                "directory_at_the_original",
+                At::Original,
+                At::DirectoryAtOriginal,
+                Expect::NotRegular,
+            ),
+            (
+                "link_at_the_retained",
+                At::Original,
+                At::LinkAtRetained,
+                Expect::NotRegular,
+            ),
+        ];
+
+        for (label, grants, companion, expect) in CASES {
+            let fixture = Fixture::new();
+            let source = fixture.source(None);
+            let image = &source.image;
+            fs::create_dir_all(image.retained.parent().unwrap()).unwrap();
+            fs::write(&image.retained, b"retained main image").unwrap();
+            for seed in &source.old_seeds {
+                fs::write(&seed.retained, b"retained seed image").unwrap();
+                fs::write(append_suffix(&seed.retained, RECORD_SUFFIX), b"seed record").unwrap();
+            }
+            let link_target = fixture.project.join("link-target");
+            fs::write(&link_target, b"not a companion").unwrap();
+            let companions = [
+                (GRANTS_SIDECAR_SUFFIX, grants, b"grants sidecar".as_slice()),
+                (COMPANION_SUFFIX, companion, b"ca companion".as_slice()),
+            ];
+            for (suffix, at, bytes) in companions {
+                let original = append_suffix(&image.original, suffix);
+                let retained = append_suffix(&image.retained, suffix);
+                match at {
+                    At::Original => fs::write(&original, bytes).unwrap(),
+                    At::Retained => fs::write(&retained, bytes).unwrap(),
+                    At::Both => {
+                        fs::write(&original, bytes).unwrap();
+                        fs::write(&retained, bytes).unwrap();
+                    }
+                    At::Neither => {}
+                    At::DirectoryAtOriginal => fs::create_dir(&original).unwrap(),
+                    At::LinkAtRetained => symlink(&link_target, &retained).unwrap(),
+                }
+            }
+            let config = ApfsSubstrateConfig::new(fixture.store(), &fixture.checkout);
+            let host = MacOsApfsExecutionHost::new(SystemCommandRunner, config).unwrap();
+            let mut before = BTreeMap::new();
+            snapshot(&fixture.project, &mut before);
+
+            let result = host.retain_re_adopt_source(&source);
+
+            let mut after = BTreeMap::new();
+            snapshot(&fixture.project, &mut after);
+            match (expect, result) {
+                (Expect::Converged, Ok(())) => {
+                    for (suffix, _, bytes) in companions {
+                        assert!(
+                            !append_suffix(&image.original, suffix).exists(),
+                            "{label}: {suffix} left beside the original"
+                        );
+                        assert_eq!(
+                            fs::read(append_suffix(&image.retained, suffix)).unwrap(),
+                            bytes,
+                            "{label}: {suffix} retained"
+                        );
+                    }
+                    host.retain_re_adopt_source(&source)
+                        .unwrap_or_else(|error| panic!("{label}: replay refused: {error}"));
+                    let mut replayed = BTreeMap::new();
+                    snapshot(&fixture.project, &mut replayed);
+                    assert_eq!(replayed, after, "{label}: a replay changes nothing");
+                }
+                (Expect::Missing, Err(ApfsStorageError::Host(message)))
+                    if message.starts_with("the replaced image's required companion")
+                        && message
+                            .ends_with("is missing, and nothing was retained in its place") => {}
+                (
+                    Expect::Overwrite,
+                    Err(ApfsStorageError::InvalidPlan(
+                        "a retained companion already exists beside its original; refusing to overwrite it",
+                    )),
+                ) => {}
+                (Expect::NotRegular, Err(ApfsStorageError::Host(message)))
+                    if message.starts_with("a re-adoption companion is not a regular file:") => {}
+                (expect, result) => panic!("{label}: expected {expect:?}, got {result:?}"),
+            }
+            if !matches!(expect, Expect::Converged) {
+                assert_eq!(after, before, "{label}: a refusal moves nothing");
+            }
+        }
+    }
+
     /// Concurrent-reader smoke coverage of kernel snapshot invariants; race timing is not forced.
     #[cfg(target_os = "macos")]
     #[test]

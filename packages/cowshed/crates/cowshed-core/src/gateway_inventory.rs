@@ -849,6 +849,28 @@ impl NativeGatewayInventory {
         .map_err(|error| GatewayInventoryError::Blocking(error.to_string()))?
     }
 
+    /// The primary identity of the bound project whose main sits at `checkout`, for an explicit
+    /// `adopt --re-adopt` that names no repository. Read-only: nothing is repaired or written.
+    ///
+    /// Four facts must agree before a project is named: the in-image marker at the checkout is the
+    /// main workspace's and records that checkout; the controller's RAW `main.dmg` sidecar for the
+    /// marker's repo is the Active main, at the same incarnation, recording the same checkout; a
+    /// binding owns that repo; and no other project's RAW main claims the checkout. `Ok(None)` means
+    /// no main marker sits at `checkout` or its owner holds no RAW `main.dmg`; adopt step 1 then
+    /// names the identity.
+    pub async fn re_adoption_primary_for_checkout(
+        &self,
+        checkout: &Path,
+    ) -> Result<Option<RepoId>, GatewayInventoryError> {
+        let inventory = self.clone();
+        let checkout = checkout.to_owned();
+        crate::storage::lifecycle::dispatch_blocking(move || {
+            inventory.re_adoption_primary_for_checkout_blocking(&checkout)
+        })
+        .await
+        .map_err(|error| GatewayInventoryError::Blocking(error.to_string()))?
+    }
+
     /// The exact checkout an unfinished, validated re-adoption owns, even before its new
     /// main image is published. A recorded checkout alone never authorizes this recovery.
     pub async fn forming_re_adoption_root(
@@ -977,6 +999,139 @@ impl NativeGatewayInventory {
             }
         }
         Ok(matched)
+    }
+
+    fn re_adoption_primary_for_checkout_blocking(
+        &self,
+        checkout: &Path,
+    ) -> Result<Option<RepoId>, GatewayInventoryError> {
+        let marker_path = checkout.join(crate::storage::WORKSPACE_MARKER_PATH);
+        let marker = match crate::metadata::WorkspaceMarker::read_from(&marker_path) {
+            Ok(marker) => marker,
+            Err(crate::metadata::MetadataError::Io { source, .. })
+                if source.kind() == io::ErrorKind::NotFound =>
+            {
+                return Ok(None);
+            }
+            Err(error) => {
+                return Err(GatewayInventoryError::InvalidMetadata {
+                    path: marker_path,
+                    message: error.to_string(),
+                });
+            }
+        };
+        let refused = |message: String| GatewayInventoryError::InvalidMetadata {
+            path: marker_path.clone(),
+            message,
+        };
+        if marker.role != crate::metadata::WorkspaceRole::Main || !marker.workspace.is_main() {
+            return Err(refused(format!(
+                "in-image marker names {} with role {:?}, not the main workspace",
+                marker.workspace, marker.role
+            )));
+        }
+        let canonical = fs::canonicalize(checkout)
+            .map_err(|source| io_error("resolving re-adoption checkout", checkout, source))?;
+        if fs::canonicalize(&marker.project_root).ok().as_deref() != Some(canonical.as_path()) {
+            return Err(refused(format!(
+                "in-image marker records {}, not the checkout it sits in",
+                marker.project_root.display()
+            )));
+        }
+        let mut owner: Option<OwnedRepoIds> = None;
+        for owned in discover_owned_identities(self.storage.store())? {
+            if !owned.accepts(&marker.repo_id) {
+                continue;
+            }
+            if let Some(first) = owner {
+                return Err(GatewayInventoryError::AmbiguousIdentity {
+                    repo_id: marker.repo_id.clone(),
+                    first: first.current().clone(),
+                    second: owned.current().clone(),
+                });
+            }
+            owner = Some(owned);
+        }
+        let Some(owner) = owner else {
+            return Err(refused(format!(
+                "in-image marker names {}, which no adopted project owns",
+                marker.repo_id
+            )));
+        };
+        let layout =
+            StorageLayout::new(self.storage.store(), owner.current()).map_err(|error| {
+                GatewayInventoryError::InvalidMetadata {
+                    path: self.storage.store().to_owned(),
+                    message: error.to_string(),
+                }
+            })?;
+        let image = layout
+            .main_image()
+            .map_err(|error| refused(error.to_string()))?
+            .image()
+            .to_owned();
+        match fs::symlink_metadata(&image) {
+            Ok(metadata) if metadata.file_type().is_file() => {}
+            // No RAW main to bind through: adopt step 1 names the identity from the remotes.
+            Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Ok(_) => {
+                return Err(refused(format!(
+                    "main image {} is not a regular file",
+                    image.display()
+                )));
+            }
+            Err(source) => return Err(io_error("inspecting main image", &image, source)),
+        }
+        verify_no_symlinks(self.storage.store(), &image).map_err(|error| {
+            GatewayInventoryError::InvalidMetadata {
+                path: image.clone(),
+                message: error.to_string(),
+            }
+        })?;
+        let sidecar = sidecar_path(&image);
+        let metadata = DetachedWorkspaceMetadata::read_for_image(&image).map_err(|error| {
+            GatewayInventoryError::InvalidMetadata {
+                path: sidecar.clone(),
+                message: error.to_string(),
+            }
+        })?;
+        if metadata.repo_id != marker.repo_id
+            || !metadata.workspace.is_main()
+            || metadata.publication_state != PublicationState::Active
+        {
+            return Err(refused(format!(
+                "main sidecar {} is not the active main of {}",
+                sidecar.display(),
+                marker.repo_id
+            )));
+        }
+        if metadata.workspace_incarnation != marker.workspace_incarnation {
+            return Err(refused(format!(
+                "main sidecar records incarnation {}, but the in-image marker records {}",
+                metadata.workspace_incarnation, marker.workspace_incarnation
+            )));
+        }
+        if fs::canonicalize(&metadata.info_snapshot.project_root)
+            .ok()
+            .as_deref()
+            != Some(canonical.as_path())
+        {
+            return Err(refused(format!(
+                "main sidecar {} records {}, not this checkout",
+                sidecar.display(),
+                metadata.info_snapshot.project_root.display()
+            )));
+        }
+        // The RAW enumeration is the only other claimant this controller reads. A different project
+        // it names for this root is an ambiguity, never a tie to break.
+        if let Some(claimant) = self.repository_for_project_root_blocking(&canonical)?
+            && claimant != *owner.current()
+        {
+            return Err(GatewayInventoryError::AmbiguousProjectRoot(
+                checkout.to_owned(),
+            ));
+        }
+        Ok(Some(owner.current().clone()))
     }
 
     fn all_reserved_port_blocks_blocking(
@@ -2162,6 +2317,229 @@ mod tests {
                 "{identity} is free once the project holding it is retired"
             );
         }
+    }
+
+    /// `re_adoption_primary_for_checkout` names the recorded primary through a RAW main and an
+    /// ambiguous remote binding, and names nothing when the owner holds no RAW `main.dmg`. Each
+    /// single mutation of the facts it reads fails on the check that reads that fact, every mutation
+    /// starts from the restored world, and the read leaves every source byte as it found it.
+    #[tokio::test]
+    async fn re_adoption_primary_names_the_raw_main_and_refuses_each_mutation() {
+        let fixture = Fixture::new("re-adoption-lifecycle");
+        let repo = RepoId::parse("acme/alpha").expect("repo");
+        let fork = RepoId::parse("acme/alpha-fork").expect("fork identity");
+        let other = RepoId::parse("acme/beta").expect("other repo");
+        let unowned = RepoId::parse("acme/gamma").expect("unowned repo");
+        let incarnation = "00000000000000000000000000000001";
+        fixture.bind(&repo);
+        let (_storage, mounted) = fixture.workspace(
+            &repo,
+            WorkspaceName::new("main").expect("main"),
+            incarnation,
+            3,
+            true,
+        );
+        let (_mount, checkout) = mounted.expect("mounted main");
+        let layout = StorageLayout::new(fixture.storage.store(), &repo).expect("layout");
+        let project = layout.project().clone();
+        let raw = layout.main_image().expect("main image").image().to_owned();
+        let raw_sidecar = crate::metadata::sidecar_path(&raw);
+        let aside = project.project_root.join("main-aside.dmg");
+        let aside_sidecar = crate::metadata::sidecar_path(&aside);
+
+        let binding = RepositoryBinding::new(vec![
+            BoundIdentity {
+                repo_id: repo.clone(),
+                remote_name: None,
+                remote_url: None,
+                primary: true,
+            },
+            BoundIdentity {
+                repo_id: fork.clone(),
+                remote_name: Some(String::from("origin")),
+                remote_url: Some(String::from("https://example.invalid/acme/alpha-fork.git")),
+                primary: false,
+            },
+        ])
+        .expect("ambiguous binding");
+        write_json(&project.repository_binding, &binding).expect("binding file");
+
+        let marker = crate::metadata::WorkspaceMarker {
+            version: crate::metadata::MARKER_VERSION,
+            repo_id: repo.clone(),
+            project_root: checkout.clone(),
+            workspace: WorkspaceName::new("main").expect("main"),
+            workspace_incarnation: crate::metadata::WorkspaceIncarnation::new(incarnation)
+                .expect("incarnation"),
+            role: WorkspaceRole::Main,
+            base_commit: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+            created_at: "2026-07-14T00:00:00Z".to_owned(),
+            forked_from: None,
+            created_trace: "re-adoption-lifecycle".to_owned(),
+            lineage: Some(Vec::new()),
+        };
+        let marker_path = checkout.join(crate::storage::WORKSPACE_MARKER_PATH);
+        fs::create_dir_all(marker_path.parent().expect("marker parent")).expect("marker dir");
+        write_json(&marker_path, &marker).expect("marker");
+
+        let original_marker = fs::read(&marker_path).expect("marker bytes");
+        let original_binding = fs::read(&project.repository_binding).expect("binding bytes");
+        let original_image = fs::read(&raw).expect("image bytes");
+        let original_sidecar = fs::read(&raw_sidecar).expect("sidecar bytes");
+        let restore = || {
+            fs::write(&marker_path, &original_marker).expect("restore marker");
+            fs::write(&project.repository_binding, &original_binding).expect("restore binding");
+            fs::write(&raw, &original_image).expect("restore image");
+            fs::write(&raw_sidecar, &original_sidecar).expect("restore sidecar");
+        };
+        // Every refusal below is the check it names, reported against the marker it judged.
+        let refusal = |result: Result<Option<RepoId>, GatewayInventoryError>| match result {
+            Err(GatewayInventoryError::InvalidMetadata { path, message })
+                if path == marker_path =>
+            {
+                message
+            }
+            other => panic!(
+                "expected a refusal of {}, got {other:?}",
+                marker_path.display()
+            ),
+        };
+        let inventory = NativeGatewayInventory::new(fixture.storage.clone());
+
+        // RAW main with an ambiguous remote binding names the recorded primary.
+        assert_eq!(
+            inventory
+                .re_adoption_primary_for_checkout(&checkout)
+                .await
+                .expect("raw primary"),
+            Some(repo.clone())
+        );
+
+        // With no RAW `main.dmg` the store binds nothing, so adopt step 1 names the identity.
+        fs::rename(&raw, &aside).expect("move main image aside");
+        fs::rename(&raw_sidecar, &aside_sidecar).expect("move main sidecar aside");
+        assert_eq!(
+            inventory
+                .re_adoption_primary_for_checkout(&checkout)
+                .await
+                .expect("no raw main"),
+            None
+        );
+        fs::rename(&aside, &raw).expect("return main image");
+        fs::rename(&aside_sidecar, &raw_sidecar).expect("return main sidecar");
+        assert_eq!(fs::read(&marker_path).expect("marker"), original_marker);
+        assert_eq!(
+            fs::read(&project.repository_binding).expect("binding"),
+            original_binding
+        );
+
+        // `main.dmg` exists but is not a regular file.
+        fs::remove_file(&raw).expect("remove main image");
+        fs::create_dir(&raw).expect("main image directory");
+        let message = refusal(inventory.re_adoption_primary_for_checkout(&checkout).await);
+        assert!(message.ends_with("is not a regular file"), "{message}");
+        fs::remove_dir(&raw).expect("remove main image directory");
+        restore();
+
+        // The marker names a workspace other than main.
+        let mut demoted = marker.clone();
+        demoted.workspace = WorkspaceName::new("feature").expect("workspace");
+        demoted.role = WorkspaceRole::Workspace;
+        write_json(&marker_path, &demoted).expect("demoted marker");
+        let message = refusal(inventory.re_adoption_primary_for_checkout(&checkout).await);
+        assert!(message.ends_with("not the main workspace"), "{message}");
+        restore();
+
+        // The marker records another checkout.
+        let mut displaced = marker.clone();
+        displaced.project_root = fixture.root.clone();
+        write_json(&marker_path, &displaced).expect("displaced marker");
+        let message = refusal(inventory.re_adoption_primary_for_checkout(&checkout).await);
+        assert!(
+            message.ends_with("not the checkout it sits in"),
+            "{message}"
+        );
+        restore();
+
+        // The marker names a repository no adopted project owns.
+        let mut stray = marker.clone();
+        stray.repo_id = unowned.clone();
+        write_json(&marker_path, &stray).expect("stray marker");
+        let message = refusal(inventory.re_adoption_primary_for_checkout(&checkout).await);
+        assert!(
+            message.ends_with("which no adopted project owns"),
+            "{message}"
+        );
+        restore();
+
+        // The main sidecar is not the Active main.
+        let mut fenced = DetachedWorkspaceMetadata::read_for_image(&raw).expect("sidecar");
+        fenced.publication_state = PublicationState::PendingFence;
+        fenced.write_for_image(&raw).expect("fenced sidecar");
+        let message = refusal(inventory.re_adoption_primary_for_checkout(&checkout).await);
+        assert!(message.contains("is not the active main of"), "{message}");
+        restore();
+
+        // Incarnation drift between marker and sidecar.
+        let mut drifted = marker.clone();
+        drifted.workspace_incarnation =
+            crate::metadata::WorkspaceIncarnation::new("00000000000000000000000000000002")
+                .expect("other incarnation");
+        write_json(&marker_path, &drifted).expect("drifted marker");
+        let message = refusal(inventory.re_adoption_primary_for_checkout(&checkout).await);
+        assert!(
+            message.starts_with("main sidecar records incarnation"),
+            "{message}"
+        );
+        restore();
+
+        // The sidecar records a different checkout root.
+        let mut moved = DetachedWorkspaceMetadata::read_for_image(&raw).expect("sidecar");
+        moved.info_snapshot.project_root = fixture.root.clone();
+        moved.write_for_image(&raw).expect("moved sidecar");
+        let message = refusal(inventory.re_adoption_primary_for_checkout(&checkout).await);
+        assert!(message.ends_with("not this checkout"), "{message}");
+        restore();
+
+        // A second project's RAW main claims the same checkout.
+        fixture.bind(&other);
+        let (_other_storage, _) = fixture.workspace(
+            &other,
+            WorkspaceName::new("main").expect("main"),
+            "00000000000000000000000000000003",
+            4,
+            false,
+        );
+        let other_layout = StorageLayout::new(fixture.storage.store(), &other).expect("layout");
+        let other_root = other_layout.project().project_root.clone();
+        let other_raw = other_layout
+            .main_image()
+            .expect("main image")
+            .image()
+            .to_owned();
+        let mut claiming = DetachedWorkspaceMetadata::read_for_image(&other_raw).expect("sidecar");
+        claiming.info_snapshot.project_root = checkout.clone();
+        claiming
+            .write_for_image(&other_raw)
+            .expect("claiming sidecar");
+        let result = inventory.re_adoption_primary_for_checkout(&checkout).await;
+        assert!(
+            matches!(result, Err(GatewayInventoryError::AmbiguousProjectRoot(_))),
+            "a second project's main claiming the checkout must be ambiguous, got {result:?}"
+        );
+        fs::remove_dir_all(&other_root).expect("remove second project");
+        restore();
+
+        // Restored, the primary is named again.
+        assert_eq!(
+            inventory
+                .re_adoption_primary_for_checkout(&checkout)
+                .await
+                .expect("restored primary"),
+            Some(repo.clone())
+        );
+        assert_eq!(fs::read(&raw).expect("image"), original_image);
+        assert_eq!(fs::read(&raw_sidecar).expect("sidecar"), original_sidecar);
     }
 
     /// Two adopted projects, each with one mounted main, plus a repository binding planted in

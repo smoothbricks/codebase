@@ -77,7 +77,8 @@ not a best-effort script:
    break a tie only among remotes for that same identity. Record the selected remote name and its credential-, query-,
    and fragment-free URL, and validate that URL still normalizes to the recorded primary `repo_id`. Programmatic callers
    supply the same explicit identity as `AdoptOptions.repo_id`; the coordinator rejects any disagreement with the
-   provisional binding before image mutation. Load trusted policy only from
+   provisional binding before image mutation. An explicit `--re-adopt` with no `--repo-id` binds the checkout's existing
+   primary identity instead (see Re-adoption, step 1). Load trusted policy only from
    `/private/cowshed/store/<owner>/<repo>/policy.json`. Also require that `<root>.pre-cowshed` does **not** already
    exist (exit 4 — a previous adopt left state behind; resolve it first). Ensure host setup is present — declaratively
    validated when home-manager/nix-darwin owns it (`programs.cowshed`/`services.cowshed`, 14_nix.md), imperatively
@@ -122,7 +123,12 @@ ASIF-to-RAW transition and the RAW guest-space reclaim operation, not an image c
    path, incarnation, original checkout path, build-volume identity, current kernel IOMedia capacities and retained
    paths in the durable adoption intent before changing any of them. Preserve an existing `<checkout>.pre-cowshed` tree
    without overwriting or deleting it. Source and build copy mounts use the project's recorded adoption staging
-   namespace, with source and destination names that cannot be parsed as BuildVolumeIds.
+   namespace, with source and destination names that cannot be parsed as BuildVolumeIds. Without `--repo-id`, the
+   replacement binds the checkout's existing primary `repo_id` from the store rather than deriving one from the remotes.
+   It does so only when the in-image marker at the checkout records this checkout as main's, the controller's Active RAW
+   `main.dmg` sidecar for that repository records the same checkout and incarnation, a binding owns that repository, and
+   no other project's RAW main claims the checkout. Any disagreement refuses. With no main marker at the checkout, or no
+   RAW `main.dmg` for the repository it names, the identity rules of adopt step 1 apply.
 2. Record the source's complete content and Git state while it is quiescent: HEAD, porcelain, count-objects, local
    config including includes, every ref, packed refs or reftables, reflogs and stash, hooks, `info/`, index and worktree
    registrations. Preserve the sheds' links to the same main checkout path. Detach the exact old source without force,

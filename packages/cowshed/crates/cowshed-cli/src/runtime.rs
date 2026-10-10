@@ -300,6 +300,28 @@ fn runtime_open_repo_id(command: &Command) -> Result<Option<RepoId>> {
     }
 }
 
+/// The primary identity of the project an explicit `adopt --re-adopt` with no `--repo-id` replaces.
+///
+/// The checkout's in-image marker, the controller's Active main sidecar and the owning binding must
+/// agree on it, so no remote chooses between several identities (02_workspaces.md, "Re-adoption"
+/// step 1, explicit `--re-adopt` only). The opened project still reconciles
+/// its recorded remotes with Git. `None` when no main marker sits at `checkout` or its owner holds
+/// no RAW `main.dmg`, which leaves the ordinary derivation from the remotes in charge.
+async fn re_adoption_primary(checkout: &Path) -> Result<Option<RepoId>> {
+    NativeGatewayInventory::new(host_storage().await?)
+        .re_adoption_primary_for_checkout(checkout)
+        .await
+        .map_err(project_inventory_error)
+}
+
+/// Whether this open binds the checkout's recorded primary instead of deriving one from the
+/// remotes: only for a fresh `adopt --re-adopt` that names no repository. A resumed re-adoption is
+/// named by its journal (`resolved`), never by the marker.
+fn binds_re_adoption_primary(command: &Command, resuming_re_adoption: bool) -> bool {
+    !resuming_re_adoption
+        && matches!(command, Command::Adopt(args) if args.re_adopt && args.repo_id.is_none())
+}
+
 /// The workspaces whose unfinished lifecycle work this verb's open may finish (see
 /// [`RecoveryScope`]): the ones it names. A name the verb itself will reject cannot name a
 /// journaled intent, so it adds nothing; a removal alone refuses one before opening, because
@@ -4606,6 +4628,12 @@ where
         let mut setup = NativeAdoptHostSetup::for_canonical_home()?;
         let _ = prepare_adopt_host_storage(&mut setup, output).await?;
     }
+    let requested_repo_id =
+        if binds_re_adoption_primary(&cli.command, resolved.resuming_re_adoption) {
+            re_adoption_primary(root).await?
+        } else {
+            requested_repo_id
+        };
     let open_span = cowshed_core::timing::span("cli", "open");
     let bridge = match mode {
         RuntimeOpenMode::Provision => ActorBridge::open_for_adopt(root, requested_repo_id).await,
@@ -4752,6 +4780,33 @@ mod tests {
             &["skill", "install"],
         ] {
             assert!(!needs(argv), "{argv:?} must work while the builds disagree");
+        }
+    }
+
+    /// Only a fresh `adopt --re-adopt` that names no repository asks the store for main's recorded
+    /// primary. A resumed one is named by its journal, `--repo-id` names its own, and a plain adopt
+    /// or any other verb derives nothing from the marker.
+    #[test]
+    fn only_a_fresh_re_adoption_without_a_repo_id_binds_the_recorded_primary() {
+        let binds = |argv: &[&str], resuming| {
+            let cli = crate::args::parse_args(argv.iter().copied()).expect("a valid command line");
+            binds_re_adoption_primary(&cli.command, resuming)
+        };
+        assert!(binds(&["adopt", "--re-adopt"], false));
+        assert!(binds(&["adopt", "checkout", "--re-adopt"], false));
+        for (argv, resuming) in [
+            (&["adopt", "--re-adopt"][..], true),
+            (&["adopt", "checkout", "--re-adopt"], true),
+            (&["adopt", "--re-adopt", "--repo-id", "acme/widget"], false),
+            (&["adopt", "--re-adopt", "--repo-id", "acme/widget"], true),
+            (&["adopt"], false),
+            (&["adopt", "--repo-id", "acme/widget"], false),
+            (&["mount", "main", "--repo-id", "acme/widget"], false),
+        ] {
+            assert!(
+                !binds(argv, resuming),
+                "{argv:?} (resuming: {resuming}) must not bind the recorded primary"
+            );
         }
     }
 

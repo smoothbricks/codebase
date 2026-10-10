@@ -648,7 +648,7 @@ fn retained_paths(source: &ReAdoptSource) -> Vec<PathBuf> {
         .chain(source.old_seeds.iter().map(|seed| &seed.retained));
     for image in built {
         paths.push(image.clone());
-        paths.push(append_suffix(image, ".json"));
+        paths.push(append_suffix(image, crate::build_volume::RECORD_SUFFIX));
     }
     paths
 }
@@ -695,7 +695,7 @@ fn build_inputs(images: &Path) -> Result<Vec<(BuildVolumeId, PathBuf)>> {
 fn read_build_record_present(
     image: &Path,
 ) -> Result<Option<crate::build_volume::BuildVolumeRecord>> {
-    let record = crate::metadata::append_suffix(image, ".json");
+    let record = crate::metadata::append_suffix(image, crate::build_volume::RECORD_SUFFIX);
     match crate::metadata::read_json::<crate::build_volume::BuildVolumeRecord>(&record) {
         Ok(read) if read.version == crate::build_volume::RECORD_VERSION => Ok(Some(read)),
         Ok(read) => Err(CowshedError::integrity(

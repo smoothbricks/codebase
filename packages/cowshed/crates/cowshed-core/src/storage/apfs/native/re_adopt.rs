@@ -11,18 +11,18 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use super::{MacOsApfsExecutionHost, allocated_file_bytes, io_error, sync_parent_path};
-use crate::apfs::{ApfsBackend, CommandRunner, DetachIntent, MountAccess};
+use crate::apfs::{ApfsBackend, CommandRunner, DetachIntent, MountAccess, RetainedInput};
 use crate::build_volume::{
-    BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord, BuildVolumeRole, ReleaseClaim,
+    BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord, BuildVolumeRole, RECORD_SUFFIX,
+    ReleaseClaim,
 };
 use crate::metadata::{ImageCapacity, append_suffix};
-use crate::storage::apfs::{ApfsExecutionHost, ApfsStorageError};
-use crate::storage::recovery::ReAdoptSource;
+use crate::storage::apfs::{ApfsExecutionHost, ApfsStorageError, COMPANION_SUFFIX};
+use crate::storage::recovery::{ReAdoptBuild, ReAdoptSource};
 
-/// The file beside a build volume image that records it (`BuildVolumeLayout::record`).
-const BUILD_RECORD_SUFFIX: &str = ".json";
 /// The files beside a workspace image: its grants sidecar and its CA companion.
-const MAIN_COMPANION_SUFFIXES: [&str; 2] = [crate::metadata::GRANTS_SIDECAR_SUFFIX, ".ca.key"];
+const MAIN_COMPANION_SUFFIXES: [&str; 2] =
+    [crate::metadata::GRANTS_SIDECAR_SUFFIX, COMPANION_SUFFIX];
 
 impl<R> MacOsApfsExecutionHost<R>
 where
@@ -70,16 +70,11 @@ where
                 source,
                 &build.image.original,
                 &build.image.retained,
-                &[BUILD_RECORD_SUFFIX],
+                &[RECORD_SUFFIX],
             )?;
         }
         for seed in &source.old_seeds {
-            self.retain_image(
-                source,
-                &seed.original,
-                &seed.retained,
-                &[BUILD_RECORD_SUFFIX],
-            )?;
+            self.retain_image(source, &seed.original, &seed.retained, &[RECORD_SUFFIX])?;
         }
         Ok(())
     }
@@ -116,9 +111,22 @@ where
         &self,
         source: &ReAdoptSource,
     ) -> Result<(), ApfsStorageError> {
-        self.mount_retained(source, &source.image.retained, &source.image.source_mount)?;
+        self.mount_retained(
+            source,
+            &source.image.retained,
+            &source.image.source_mount,
+            &source.checkout,
+        )?;
         if let Some(build) = &source.build {
-            self.mount_retained(source, &build.image.retained, &build.image.source_mount)?;
+            let layout = BuildVolumeLayout::new(
+                super::layout(&self.config, &source.metadata.repo_id)?.project(),
+            )?;
+            self.mount_retained(
+                source,
+                &build.image.retained,
+                &build.image.source_mount,
+                &layout.mount(&build.id),
+            )?;
         }
         Ok(())
     }
@@ -153,8 +161,31 @@ where
         let Some(build) = &source.build else {
             return Ok(());
         };
-        let image = &build.replacement_image;
-        let mount = &build.replacement_mount;
+        let (new, old) = self.copy_replacement(
+            &build.replacement_image,
+            &build.replacement_mount,
+            build.image.capacity_bytes,
+            &build.image.source_mount,
+            &build.image.retained,
+        )?;
+        eprintln!(
+            "cowshed: re-adoption build replacement allocates {new} bytes; the retained image {old}"
+        );
+        Ok(())
+    }
+
+    /// Mint (or resume) the RAW replacement at `image`, mount it read-write at `mount`, copy the
+    /// tree the read-only `source_mount` holds into it, and check its allocation against
+    /// `capacity_bytes` (02_workspaces.md, "Re-adoption" steps 3-4). Answers the replacement's and
+    /// the retained original's allocated bytes.
+    fn copy_replacement(
+        &self,
+        image: &Path,
+        mount: &Path,
+        capacity_bytes: u64,
+        source_mount: &Path,
+        retained: &Path,
+    ) -> Result<(u64, u64), ApfsStorageError> {
         self.verify_controller_path(image)?;
         if exists(image)? {
             self.mount_staged(image, mount, MountAccess::ReadWrite)?;
@@ -164,8 +195,7 @@ where
             ))?;
             fs::create_dir_all(directory)
                 .map_err(|error| io_error("create the staged image directory", directory, error))?;
-            let attachment =
-                self.mint(ImageCapacity::from_bytes(build.image.capacity_bytes), image)?;
+            let attachment = self.mint(ImageCapacity::from_bytes(capacity_bytes), image)?;
             if let Err(primary) =
                 self.backend
                     .mount(&attachment, mount, MountAccess::ReadWrite, false)
@@ -174,7 +204,7 @@ where
                     match self.backend.detach(&attachment, DetachIntent::WhenIdle) {
                         Ok(()) => primary.into(),
                         Err(cleanup) => ApfsStorageError::Cleanup {
-                            operation: "mount a re-adoption build replacement",
+                            operation: "mount a replacement image",
                             primary: Box::new(primary.into()),
                             cleanup: Box::new(cleanup.into()),
                         },
@@ -184,16 +214,8 @@ where
         }
         // Per-file hole preservation is the copy verifier's to prove, in the walk it already
         // makes; here only the image as a whole is checked against its nominal capacity.
-        self.copy_tree(&build.image.source_mount, mount)?;
-        let (new, old) = self.require_sparse_replacement(
-            image,
-            &build.image.retained,
-            build.image.capacity_bytes,
-        )?;
-        eprintln!(
-            "cowshed: re-adoption build replacement allocates {new} bytes; the retained image {old}"
-        );
-        Ok(())
+        self.copy_tree(source_mount, mount)?;
+        self.require_sparse_replacement(image, retained, capacity_bytes)
     }
 
     /// Re-adoption's allocation check (02_workspaces.md, "Re-adoption" step 4), by `st_blocks *
@@ -248,9 +270,46 @@ where
                 "the build claim does not hold the recorded build volume",
             ));
         }
+        self.publish_build_replacement(layout, build)?;
         let published = layout.image(&build.id);
-        // The replacement is RAW at the build image path of main's build volume identity,
-        // whatever format the retained input was.
+        let seeded = layout
+            .seed_of(&crate::metadata::WorkspaceName::main(), &source.replacement)
+            .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
+        if seeded.is_none() {
+            let destination = BuildVolumeId::mint();
+            let record = BuildVolumeRecord::new(
+                build.owner_record.tree.clone(),
+                BuildVolumeRole::Seed {
+                    target: crate::metadata::WorkspaceName::main(),
+                    incarnation: source.replacement.clone(),
+                },
+            );
+            if build.image.original == published {
+                // The RAW original is the published volume, so the caller's claim holds the very
+                // hold file a fresh claim would lock: the seed borrows it.
+                self.clone_claimed_build_volume(layout, build_claim, &destination, &record)?;
+            } else {
+                // A legacy original holds `<original>.hold`, a different file. The caller's claim
+                // keeps that resource; the published volume takes its own ordinary claim.
+                self.clone_build_volume(layout, &build.id, &destination, &record)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Publish a verified build replacement under its build volume identity: detach it without
+    /// force (an attached image is never renamed), rename it to the build image path the retained
+    /// volume left, write the recorded owner record verbatim, and mount it where the build link
+    /// points (16_build_volumes.md, "Targets and seeds"). Converges from whichever step a crash
+    /// interrupted.
+    fn publish_build_replacement(
+        &self,
+        layout: &BuildVolumeLayout,
+        build: &ReAdoptBuild,
+    ) -> Result<(), ApfsStorageError> {
+        let published = layout.image(&build.id);
+        // The replacement is RAW at the build image path of its build volume identity, whatever
+        // format the retained input was.
         if build
             .image
             .original
@@ -258,13 +317,13 @@ where
             != published
         {
             return Err(ApfsStorageError::InvalidPlan(
-                "the recorded build image is not main's build volume path in this layout",
+                "the recorded build image is not its build volume path in this layout",
             ));
         }
         match (exists(&build.replacement_image)?, exists(&published)?) {
             (true, true) => {
                 return Err(ApfsStorageError::InvalidPlan(
-                    "main's build image path is occupied while its replacement is unpublished",
+                    "the build image path is occupied while its replacement is unpublished",
                 ));
             }
             (true, false) => {
@@ -293,49 +352,25 @@ where
             .write_record(&build.id, &build.owner_record)
             .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
         self.mount_build_volume(layout, &build.id)?;
-        let seeded = layout
-            .seed_of(&crate::metadata::WorkspaceName::main(), &source.replacement)
-            .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
-        if seeded.is_none() {
-            let destination = BuildVolumeId::mint();
-            let record = BuildVolumeRecord::new(
-                build.owner_record.tree.clone(),
-                BuildVolumeRole::Seed {
-                    target: crate::metadata::WorkspaceName::main(),
-                    incarnation: source.replacement.clone(),
-                },
-            );
-            if build.image.original == published {
-                // The RAW original is the published volume, so the caller's claim holds the very
-                // hold file a fresh claim would lock: the seed borrows it.
-                self.clone_claimed_build_volume(layout, build_claim, &destination, &record)?;
-            } else {
-                // A legacy original holds `<original>.hold`, a different file. The caller's claim
-                // keeps that resource; the published volume takes its own ordinary claim.
-                self.clone_build_volume(layout, &build.id, &destination, &record)?;
-            }
-        }
+
         Ok(())
     }
 
-    fn retain_image(
+    fn retain_image<const N: usize>(
         &self,
         source: &ReAdoptSource,
         original: &Path,
         retained: &Path,
-        companions: &[&str],
+        companions: &[&str; N],
     ) -> Result<(), ApfsStorageError> {
         self.verify_controller_path(original)?;
         self.verify_controller_path(retained)?;
-        let moves: Vec<(PathBuf, PathBuf)> = companions
-            .iter()
-            .map(|suffix| {
-                (
-                    append_suffix(original, suffix),
-                    append_suffix(retained, suffix),
-                )
-            })
-            .collect();
+        let moves: [(PathBuf, PathBuf); N] = std::array::from_fn(|index| {
+            (
+                append_suffix(original, companions[index]),
+                append_suffix(retained, companions[index]),
+            )
+        });
         if !exists(original)? {
             if !exists(retained)? {
                 return Err(ApfsStorageError::InvalidPlan(
@@ -367,22 +402,20 @@ where
 
     /// Move each required companion to its retained name. Each must be at exactly one of the two:
     /// absent from both, the replaced input was incomplete, and nothing stands in for it.
-    fn move_companions(&self, moves: &[(PathBuf, PathBuf)]) -> Result<(), ApfsStorageError> {
-        for (from, to) in moves {
-            match (exists(from)?, exists(to)?) {
+    fn move_companions<const N: usize>(
+        &self,
+        moves: &[(PathBuf, PathBuf); N],
+    ) -> Result<(), ApfsStorageError> {
+        // Every name is read before the first rename, so a companion absent from both names, present
+        // at both, or not a regular file moves nothing.
+        let mut beside_original = [false; N];
+        for ((from, to), present) in moves.iter().zip(beside_original.iter_mut()) {
+            *present = match (regular_file_exists(from)?, regular_file_exists(to)?) {
                 (true, true) => {
                     return Err(ApfsStorageError::InvalidPlan(
                         "a retained companion already exists beside its original; refusing to overwrite it",
                     ));
                 }
-                (true, false) => {
-                    rename_exclusive(from, to).map_err(|error| {
-                        io_error("retain the replaced image's companion", from, error)
-                    })?;
-                    sync_parent_path(to)?;
-                    sync_parent_path(from)?;
-                }
-                (false, true) => {}
                 (false, false) => {
                     return Err(ApfsStorageError::Host(format!(
                         "the replaced image's required companion {} is missing, and nothing was \
@@ -390,6 +423,18 @@ where
                         from.display()
                     )));
                 }
+                (beside_original_only, _) => beside_original_only,
+            };
+        }
+        for ((from, to), present) in moves.iter().zip(beside_original) {
+            // Only a companion still beside its original moves; one already retained is a replay's
+            // finished step.
+            if present {
+                rename_exclusive(from, to).map_err(|error| {
+                    io_error("retain the replaced image's companion", from, error)
+                })?;
+                sync_parent_path(to)?;
+                sync_parent_path(from)?;
             }
         }
         Ok(())
@@ -447,14 +492,16 @@ where
         }
     }
 
-    /// Attach the retained input at `path` read-only and mount it at `mount`. An exact
-    /// read-only staging mount is kept. An operator-restored read-only canonical main/build
-    /// is moved back without force; every foreign or read-write mount still refuses.
+    /// Attach the retained input at `path` read-only and mount it at `mount`. An exact read-only
+    /// staging mount is kept. An input restored read-only at `canonical`, where it was mounted
+    /// before it was retained, is moved back without force; every foreign or read-write mount
+    /// still refuses.
     fn mount_retained(
         &self,
         source: &ReAdoptSource,
         path: &Path,
         mount: &Path,
+        canonical: &Path,
     ) -> Result<(), ApfsStorageError> {
         let input = retained_input(source, path)?;
         if let Some(attachment) = self.backend.existing_retained_attachment(&input)? {
@@ -471,21 +518,9 @@ where
                     return Ok(());
                 }
                 Some(mounted) if mounted.access() == MountAccess::ReadOnly => {
-                    let canonical = if path == source.image.retained {
-                        mounted.mount_point == source.checkout
-                    } else if let Some(build) = &source.build
-                        && path == build.image.retained
-                    {
-                        let layout = BuildVolumeLayout::new(
-                            super::layout(&self.config, &source.metadata.repo_id)?.project(),
-                        )?;
-                        mounted.mount_point == layout.mount(&build.id)
-                    } else {
-                        false
-                    };
-                    if !canonical {
+                    if mounted.mount_point != canonical {
                         return Err(ApfsStorageError::InvalidPlan(
-                            "a retained re-adoption input is mounted outside its recorded canonical or staging path",
+                            "a retained input is mounted outside its recorded canonical or staging path",
                         ));
                     }
                     self.backend.unmount_retained_when_idle(&attachment)?;
@@ -493,7 +528,7 @@ where
                 }
                 Some(_) => {
                     return Err(ApfsStorageError::InvalidPlan(
-                        "a retained re-adoption source is mounted somewhere other than its recorded read-only staging mount",
+                        "a retained source is mounted somewhere other than its recorded read-only staging mount",
                     ));
                 }
                 None => self.backend.detach_retained_when_idle(&attachment)?,
@@ -504,7 +539,7 @@ where
             return Err(match self.backend.detach_retained_when_idle(&attachment) {
                 Ok(()) => primary.into(),
                 Err(cleanup) => ApfsStorageError::Cleanup {
-                    operation: "mount a retained re-adoption source read-only",
+                    operation: "mount a retained source read-only",
                     primary: Box::new(primary.into()),
                     cleanup: Box::new(cleanup.into()),
                 },
@@ -563,8 +598,8 @@ where
 fn retained_input<'a>(
     source: &'a ReAdoptSource,
     path: &'a Path,
-) -> Result<crate::apfs::RetainedInput<'a>, ApfsStorageError> {
-    crate::apfs::RetainedInput::from_record(source, path)
+) -> Result<RetainedInput<'a>, ApfsStorageError> {
+    RetainedInput::from_record(source, path)
         .map_err(|error| ApfsStorageError::Host(error.to_string()))
 }
 
@@ -590,6 +625,20 @@ fn rename_exclusive(from: &Path, to: &Path) -> io::Result<()> {
 fn exists(path: &Path) -> Result<bool, ApfsStorageError> {
     match fs::symlink_metadata(path) {
         Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(io_error("inspect a re-adoption path", path, error)),
+    }
+}
+
+/// Whether a companion is present at `path`. Only a regular file counts: a link, a directory or any
+/// other entry at a companion name is refused, never moved or read through.
+fn regular_file_exists(path: &Path) -> Result<bool, ApfsStorageError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(true),
+        Ok(_) => Err(ApfsStorageError::Host(format!(
+            "a re-adoption companion is not a regular file: {}",
+            path.display()
+        ))),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(io_error("inspect a re-adoption path", path, error)),
     }

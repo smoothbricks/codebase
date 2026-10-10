@@ -46,7 +46,7 @@ pub(crate) const IMAGES_DIRECTORY: &str = "build";
 /// workspace mount: `<host mount root>/.build/<owner>/<repo>/<id>`.
 const MOUNTS_DIRECTORY: &str = ".build";
 /// The record beside each image: `<id>.dmg.json`.
-const RECORD_SUFFIX: &str = ".json";
+pub(crate) const RECORD_SUFFIX: &str = ".json";
 /// The lock beside each image that every job admitted on the volume holds shared for its whole
 /// run, and that a release takes exclusively: `<id>.dmg.hold` ([`BuildVolumeHold`]).
 const HOLD_SUFFIX: &str = ".hold";
