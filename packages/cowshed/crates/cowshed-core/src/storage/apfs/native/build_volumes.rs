@@ -97,9 +97,10 @@ where
     /// clone is held from before its image exists until its record is written, so a collection
     /// that lists it in between never releases it as an interrupted creation.
     ///
-    /// The clone keeps the source's flushed post-restore clock. A mounted source is held
-    /// exclusively against job admission until the seed is marked; an admitted job after that
-    /// hold is released makes it behind (16_build_volumes.md, "Targets and seeds").
+    /// The clone keeps the source's flushed post-restore clock. A mounted source is claimed
+    /// ([`Self::claim_capture_source`]) and held exclusively against job admission until the
+    /// seed is marked; an admitted job after that hold is released makes it behind
+    /// (16_build_volumes.md, "Targets and seeds").
     pub fn clone_build_volume(
         &self,
         layout: &BuildVolumeLayout,
@@ -107,41 +108,44 @@ where
         destination: &BuildVolumeId,
         record: &BuildVolumeRecord,
     ) -> Result<(), ApfsStorageError> {
-        let mount = layout.mount(source);
-        let mounted = self.mounted_at(&mount)?.is_some();
-        let _restoring = if mounted {
-            match self.claim_build_volume(layout, source)? {
-                Claim::Claimed(claim) => Some(claim),
-                Claim::Held { open } => {
-                    // The admitted jobs' supervisors hold the hold file. The failed claim's own
-                    // descriptor is closed, so this process is named only for a hold of its own.
-                    let hold = layout.hold_path(source);
-                    let holds = crate::build_volume::nx::holders(&hold).map_err(|error| {
-                        io_error(
-                            "list the processes holding a build volume's hold",
-                            &hold,
-                            error,
-                        )
-                    })?;
-                    return Err(ApfsStorageError::BuildVolumeHeld {
-                        image: layout.image(source),
-                        hold,
-                        holds,
-                        open,
-                    });
-                }
+        if self.mounted_at(&layout.mount(source))?.is_some() {
+            let claim = self.claim_capture_source(layout, source)?;
+            return self.clone_claimed_build_volume(layout, &claim, destination, record);
+        }
+        self.verify_controller_path(&layout.image(source))?;
+        self.clone_build_volume_under_hold(layout, source, destination, record, None)
+    }
+
+    /// Claim build volume `source` exclusively for a seed capture (16_build_volumes.md, "Targets
+    /// and seeds", reseed step 1): from here no job is admitted on it until the claim is dropped.
+    /// A job already admitted is [`ApfsStorageError::BuildVolumeHeld`], naming each process
+    /// that holds the hold file (an admitted job's supervisor) and each that has the volume open.
+    pub fn claim_capture_source(
+        &self,
+        layout: &BuildVolumeLayout,
+        source: &BuildVolumeId,
+    ) -> Result<ReleaseClaim, ApfsStorageError> {
+        match self.claim_build_volume(layout, source)? {
+            Claim::Claimed(claim) => Ok(claim),
+            Claim::Held { open } => {
+                // The failed claim's own descriptor is closed, so this process is named only
+                // for a hold of its own.
+                let hold = layout.hold_path(source);
+                let holds = crate::build_volume::nx::holders(&hold).map_err(|error| {
+                    io_error(
+                        "list the processes holding a build volume's hold",
+                        &hold,
+                        error,
+                    )
+                })?;
+                Err(ApfsStorageError::BuildVolumeHeld {
+                    image: layout.image(source),
+                    hold,
+                    holds,
+                    open,
+                })
             }
-        } else {
-            self.verify_controller_path(&layout.image(source))?;
-            None
-        };
-        self.clone_build_volume_under_hold(
-            layout,
-            source,
-            destination,
-            record,
-            mounted.then_some(mount.as_path()),
-        )
+        }
     }
 
     /// Quiet retains the stopped supervisor's socket lease against replacement admission and
@@ -173,8 +177,7 @@ where
     /// all run under it. A second exclusive claim on the same hold file would conflict with it,
     /// and an upgrade would reopen admission (16_build_volumes.md, "Targets and seeds"). The source
     /// is the claim's own volume, so no caller can pair a claim with another volume's id.
-    #[cfg(target_os = "macos")]
-    pub(crate) fn clone_claimed_build_volume(
+    pub fn clone_claimed_build_volume(
         &self,
         layout: &BuildVolumeLayout,
         claim: &ReleaseClaim,

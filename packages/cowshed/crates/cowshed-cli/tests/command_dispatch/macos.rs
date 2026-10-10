@@ -2237,8 +2237,9 @@ async fn directory_a_fork_of_a_workspace_reseeds_it_and_hits_its_latest_run_subs
         "w1 runs a:build and a:test itself: {ran:?}"
     );
 
-    let (_, stderr) = succeed(&mut service, ["fork", "w1", "w2"]).await;
-    assert!(!stderr.contains("seed stays"), "{stderr}");
+    // A skipped reseed is said on the process's stderr, which nextest shows beside a failure;
+    // the command's own captured stderr never carries it, so only the hits below can tell.
+    succeed(&mut service, ["fork", "w1", "w2"]).await;
     let w2 = service
         .path("w2", false)
         .await
