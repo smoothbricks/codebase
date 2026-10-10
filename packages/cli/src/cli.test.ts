@@ -370,3 +370,55 @@ describe('smoo wrangler cleanup-pr --json', () => {
     }
   });
 });
+
+describe('smoo monorepo validate GitHub Actions gate', () => {
+  it('reaches the real checker from a project cwd and preserves the new-package short circuit', async () => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), 'smoo-cli-jactionlint-')));
+    try {
+      const init = Bun.spawnSync(['git', 'init', '--quiet'], { cwd: root, env: gitFreeEnvironment() });
+      expect(init.exitCode).toBe(0);
+      await writeFile(join(root, 'nx.json'), '{}\n');
+      await writeFile(join(root, 'package.json'), '{ "name": "@acme/app", "workspaces": ["packages/*"] }\n');
+      const project = join(root, 'packages/web');
+      await mkdir(project, { recursive: true });
+      await mkdir(join(root, '.github/workflows'), { recursive: true });
+      const invalid = `name: Invalid expression
+on: push
+permissions: {}
+concurrency:
+  group: validate-\${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - run: printf '%s\\n' '\${{ github. }}'
+`;
+      const path = join(root, '.github/workflows/validate.yml');
+      await writeFile(path, invalid);
+      const skipped = Bun.spawnSync(
+        ['bun', SMOO, 'monorepo', 'validate', '--fail-fast', '--only-if-new-workspace-package'],
+        { cwd: project, env: gitFreeEnvironment() },
+      );
+      expect(skipped.exitCode).toBe(0);
+      expect(skipped.stdout.toString()).not.toContain('github-actions');
+      expect(skipped.stderr.toString()).toBe('');
+
+      const child = Bun.spawnSync(
+        ['bun', SMOO, 'monorepo', 'validate', '--fail-fast', '--projects', 'unrelated-package'],
+        { cwd: project, env: gitFreeEnvironment() },
+      );
+      expect(child.exitCode).toBe(1);
+      expect(child.stdout.toString()).toContain('github-actions (pre-build)');
+      expect(child.stdout.toString()).toContain('.github/workflows/validate.yml:');
+      expect(child.stdout.toString()).not.toContain('core (pre-build)');
+      expect(child.stdout.toString()).not.toContain('build (');
+      expect(child.stdout.toString()).toContain('jactionlint GitHub Actions validation failed with exit code 1');
+      expect(child.stderr.toString()).toContain('1 check failed with 1 problem');
+      expect(await Bun.file(path).text()).toBe(invalid);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
