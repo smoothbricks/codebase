@@ -481,6 +481,28 @@ impl Default for PatchScratch {
 }
 
 impl PatchScratch {
+    /// A scratch with its fixed planes backed; growable buffers start empty
+    /// and are backed by [`Self::try_reserve_for`]. Allocation is fallible.
+    pub fn try_new() -> Result<Self, std::collections::TryReserveError> {
+        let mut members = Vec::new();
+        members.try_reserve_exact(ARRAY_MAX)?;
+        let mut runs = Vec::new();
+        runs.try_reserve_exact((crate::WORDS_HEAP_BYTES - 1) / 6)?;
+        Ok(PatchScratch {
+            plane: zeroed()?,
+            members,
+            runs,
+            residuals: zeroed()?,
+            touched: Vec::new(),
+            rows: Vec::new(),
+            staged: Vec::new(),
+            build: Vec::new(),
+            group_delta: zeroed()?,
+            mutation_ranges: Vec::new(),
+            word_witnesses: Vec::new(),
+        })
+    }
+
     pub fn new() -> Self {
         PatchScratch {
             plane: Box::new([0u64; CHUNK_WORDS]),
@@ -589,6 +611,17 @@ impl Targets {
             word_witnesses: if touched_chunks != 0 { CHUNK_WORDS } else { 0 },
         }
     }
+}
+
+/// A zeroed array on the heap, backed fallibly and built in place rather
+/// than on the stack.
+fn zeroed<T: Copy + Default, const N: usize>()
+-> Result<Box<[T; N]>, std::collections::TryReserveError> {
+    let mut storage = Vec::new();
+    storage.try_reserve_exact(N)?;
+    storage.resize(N, T::default());
+    let boxed: Result<Box<[T; N]>, _> = storage.into_boxed_slice().try_into();
+    Ok(boxed.unwrap_or_else(|_| unreachable!("N elements box as [T; N]")))
 }
 
 /// Reserve so `buffer` can hold `total` elements without growing again.
