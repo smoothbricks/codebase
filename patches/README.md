@@ -3,21 +3,21 @@
 Patches this repository applies to its dependencies. `bun install` applies the root `package.json`'s
 `patchedDependencies`. `nx@23.2.1.patch` is the exception: `tooling/patched-nx.ts` applies it to the registry tarball
 and packs the result as an immutable GitHub release, which the root `overrides.nx` installs. The Patched Nx workflow
-builds that release twice, byte for byte, and verifies the published asset against `bun.lock`.
+builds that release twice, byte for byte, and verifies the published asset against `bun.lock`. The root
+`overrides["@nx/js"]` holds every `@nx/js` at 23.2.1, the version its patch applies to: nx-plugin declares
+`"@nx/js": "latest"`, and any lock change would otherwise nest the newest release beside it, unpatched.
 
-## Local package activation
+## Activating a patch change
 
-Local dogfood does not wait for publication. Build `@smoothbricks/codebase:patched-nx` and `nx-plugin:build`, then
-register the actual packages with `bun link --cwd .cache/patched-nx/package` and `bun link --cwd packages/nx-plugin`.
-The root's maintained `smoo.developerLinks.nx` selects that generated package;
-`bun tooling/direnv/setup-environment.ts --links` applies the declaration after installation. This explicit local choice
-is necessary while the registry override still selects the previous served release. A sibling consumer declares the
-generated package's path relative to its main checkout and the plugin's ordinary package path through the same
-maintained developer-link boundary.
-
-The registry override and lockfile remain publication records, not claims that a local package was published. Local
-acceptance measures the actual resolved package and graph; the served-byte verification and pin remain a later release
-boundary. Library source links retain the consumer's dependency-scoped input contract.
+Nx is never developer-linked: this repository and its consumers install only the served release, which `overrides.nx`
+names and `bun.lock` pins by integrity. A tarball dependency lands in Bun's read-only global store
+(`~/.bun/install/cache/links`) like every other package. A `node_modules/nx` link to `.cache/patched-nx/package` would
+put a writable, unpinned Nx in its place, and a consumer that admits only a store realpath for the Nx it runs refuses
+that. A patch change therefore reaches local acceptance as a release. Land the patch on main and the Patched Nx workflow
+publishes the new content-addressed tag; `bun tooling/patched-nx.ts build <out-dir>` prints that tag and integrity
+beforehand. Then point `overrides.nx` at the new URL and run `bun install`, here and in each consumer.
+`bun tooling/patched-nx.ts lock <integrity>` confirms the lock matches the served asset. The library packages
+(`@smoothbricks/*`) keep their `smoo.developerLinks` path before publication (packages/cli README, "Declared Links").
 
 ## Canonical daemon workspace roots
 
