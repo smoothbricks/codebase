@@ -389,7 +389,12 @@ A rename preserves the source branch, staged-only index state, working-tree edit
 state. Linked registration handoff is resumable before and after its durable publication, never an index reset. Neither
 source nor destination may start new work while the rename is unfinished, and the destination is not served before
 ownership transfer and source retirement complete. Recovery resumes the exact journaled source/destination pair rather
-than creating another incarnation or discarding staged state.
+than creating another incarnation or discarding staged state. A rename intent still `Prepared` with no `PendingFence`
+destination is discarded and named, like a refused fork; only a mutating rename or one with durable destination facts
+resumes. Before source retirement, including a retry with an existing destination, the destination's HEAD and
+non-optional-locking porcelain-status digest must equal the source fence; linked worktrees must also have equal
+index-byte digests. A mismatch keeps both workspaces and the unfinished intent, with a rename-specific preservation
+refusal.
 
 Moving an adopted checkout is always cowshed-mediated (`mv <ws> <new-path>`): the image is detached, published at the
 new path, and reattached — no unmount-and-remount gap at the user's path, no relink to maintain.
