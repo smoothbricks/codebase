@@ -4951,8 +4951,9 @@ impl SupervisorActor {
             let exec_temp = child.exec_temp_dir.clone();
             let observation = InstallObservation::new(&exec_temp)?;
             let root = self.workspace_root.clone();
+            let stores = crate::developer_links::PackageStores::from_home(&child.home)?;
             let links = tokio::task::spawn_blocking(move || {
-                crate::developer_links::DeveloperLinks::capture_job(&root)
+                crate::developer_links::DeveloperLinks::capture_job(&root, stores)
             })
             .await
             .map_err(|error| {
@@ -9417,7 +9418,9 @@ mod install_observation_tests {
         let sibling = scratch.join("sibling");
         fs::create_dir_all(&sibling).unwrap();
         symlink(&sibling, root.join("node_modules/@scope/dev")).unwrap();
-        let links = crate::developer_links::DeveloperLinks::capture_job(&root).unwrap();
+        let stores =
+            crate::developer_links::PackageStores::from_home(&scratch.join("home")).unwrap();
+        let links = crate::developer_links::DeveloperLinks::capture_job(&root, stores).unwrap();
         (root, sibling, links)
     }
 
