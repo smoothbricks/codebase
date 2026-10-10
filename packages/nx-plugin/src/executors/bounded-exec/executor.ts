@@ -1,9 +1,24 @@
-import { spawn } from 'node:child_process';
+import { type ChildProcess, spawn } from 'node:child_process';
 import { availableParallelism, userInfo } from 'node:os';
 import { isAbsolute, join } from 'node:path';
 import { workspaceDataDirectoryForWorkspace } from 'nx/src/utils/cache-directory.js';
 
-import { type CpuBudget, gatewayCpuBudget, runnerDemand, sizeRunner, type TokenGrant } from './cpu-tokens.js';
+import {
+  CPU_POOL_ENV,
+  type CpuPool,
+  createCpuPool,
+  type InheritedCpuPool,
+  readInheritedCpuPool,
+  takeParentCpuTokens,
+} from './cpu-pool.js';
+import {
+  CPU_TOKENS_ENV,
+  type CpuBudget,
+  gatewayCpuBudget,
+  runnerDemand,
+  sizeRunner,
+  type TokenGrant,
+} from './cpu-tokens.js';
 import {
   createHostCommands,
   describeRamTempError,
@@ -19,6 +34,7 @@ import {
   clearTaskDirectory,
   JUNIT_FILE,
   JUNIT_REPORT_ENV,
+  judgeOperationalFailure,
   judgeRun,
   readJunitReport,
   taskDirectory,
@@ -33,6 +49,9 @@ const EXIT_CODE_BY_SIGNAL: Partial<Record<NodeJS.Signals, number>> = {
   SIGINT: 130,
   SIGTERM: 143,
 };
+
+/** The variables the CPU budget sets for the command it grants: no target's environment may set them. */
+const BUDGET_ENV = [CPU_TOKENS_ENV, CPU_POOL_ENV];
 
 export interface BoundedExecContext {
   root: string;
@@ -73,7 +92,13 @@ interface RunState {
   settled: boolean;
   expiry: ExpiredBound | null;
   forceKillNeeded: boolean;
+  /** Set when a borrowed grant closed while the command ran, and the command was stopped as a lost grant. */
+  grantLost: boolean;
+  /** The sub-pool's close error when it did not close cleanly: the run fails. */
+  poolCloseError: string | null;
 }
+
+type GrantedTokens = Extract<TokenGrant, { granted: true }>;
 
 export interface ProcessTreeKiller {
   kill(pid: number, signal: NodeJS.Signals): Promise<void>;
@@ -99,7 +124,10 @@ export function runDefaultBoundedExec(
     process.platform === 'darwin'
       ? new RamTempVolume(ramTempPaths(userInfo()), RAM_TEMP_CAPACITY_BYTES, createHostCommands())
       : null;
-  return runBoundedExec(options, context, createProcessTreeKiller(), tempVolume, gatewayCpuBudget());
+  // A command a parent's CPU pool started draws its tokens from that pool. The pool is named by the environment the
+  // parent set for this command; a run no parent started has none.
+  const inherited = readInheritedCpuPool(process.env);
+  return runBoundedExec(options, context, createProcessTreeKiller(), tempVolume, gatewayCpuBudget(), inherited);
 }
 
 /**
@@ -129,6 +157,11 @@ export function recordContext(context: NxTaskContext): BoundedExecContext {
  * Run the command once its runner holds CPU tokens from `budget` (`cpu-tokens.ts`), sized to the
  * grant; `null`, or a budget nobody serves, runs it as asked. Both bounds start once it is
  * granted: a wait for the host is not the command's time.
+ *
+ * `inherited` is the parent's CPU pool (`cpu-pool.ts`) that lends this run its tokens. The run asks that pool first
+ * and the host budget only when the pool refuses. Whatever it is granted, the run serves its own sub-pool to its
+ * descendants, closed before the grant returns. A borrowed grant that closes while the command runs stops the command
+ * as a lost grant, which is a failure.
  */
 export async function runBoundedExec(
   options: BoundedExecOptions,
@@ -136,6 +169,7 @@ export async function runBoundedExec(
   killer: ProcessTreeKiller,
   tempVolume: TempVolume | null,
   budget: CpuBudget | null,
+  inherited: InheritedCpuPool | null = null,
 ): Promise<BoundedExecResult> {
   const cwd = resolveCwd(options.cwd, context.root);
   const directory = context.record?.directory ?? null;
@@ -148,7 +182,13 @@ export async function runBoundedExec(
   const idleTimeoutMs = options.idleTimeoutMs;
   const killAfterMs = options.killAfterMs ?? DEFAULT_KILL_AFTER_MS;
   const outputChunks: string[] = [];
-  const state: RunState = { settled: false, expiry: null, forceKillNeeded: false };
+  const state: RunState = {
+    settled: false,
+    expiry: null,
+    forceKillNeeded: false,
+    grantLost: false,
+    poolCloseError: null,
+  };
   const appendStdout = (chunk: Buffer | string): void => {
     const text = chunk.toString();
     if (context.stdout !== undefined) {
@@ -210,43 +250,135 @@ export async function runBoundedExec(
 
   // The wait is one span line, as cowshed's own spans read. With no gateway listening, as on any
   // host without cowshed, the command runs exactly as asked and nothing is said.
-  let tokens: TokenGrant | null = null;
-  let cpu: BoundedExecRecord['cpu'];
-  let sized: { command: string; env: Record<string, string> } = { command: requested, env: {} };
-  if (budget !== null) {
-    const demand = runnerDemand(requested, options.parallelism, availableParallelism());
-    const asked = Date.now();
-    tokens = await budget.take(demand.want, context.root, requested);
-    const waitedMs = Date.now() - asked;
-    if (tokens.granted) {
-      sized = sizeRunner(demand.kind, requested, tokens.tokens);
-      cpu = { tokens: tokens.tokens, want: demand.want, waitedMs };
-      appendStderr(
-        `cowshed: cpu-tokens wait done elapsed=${waitedMs}ms status=ok tokens=${tokens.tokens}/${demand.want} runner=${demand.kind}\n`,
-      );
-    } else if (tokens.cause !== 'absent') {
-      appendStderr(
-        `cowshed: cpu-tokens wait done elapsed=${waitedMs}ms status=err runner=${demand.kind} runs unbudgeted: ${tokens.reason}\n`,
-      );
+  const cores = availableParallelism();
+  const demand = runnerDemand(requested, options.parallelism, cores);
+  const asked = Date.now();
+  // A run a parent's CPU pool lent tokens to takes them there. Only an absent pool leaves the host budget to ask.
+  // A pool that answered and refused still holds tokens of its own: asking the host then would hold them while waiting
+  // on another budget, so the run fails instead.
+  let grant: GrantedTokens | null = null;
+  let parentRefusal: string | null = null;
+  if (inherited !== null) {
+    const fromParent = await takeParentCpuTokens(inherited, demand.want, cores);
+    if (fromParent.granted) {
+      grant = fromParent;
+    } else if (fromParent.cause === 'absent') {
+      appendStderr(`cowshed: cpu-tokens parent pool refused: ${fromParent.reason}; asking the host budget\n`);
+    } else {
+      parentRefusal = fromParent.reason;
     }
   }
+  let unbudgeted: string | null = null;
+  if (grant === null && parentRefusal === null && budget !== null) {
+    const fromHost = await budget.take(demand.want, context.root, requested);
+    if (fromHost.granted) {
+      grant = fromHost;
+    } else if (fromHost.cause !== 'absent') {
+      unbudgeted = fromHost.reason;
+    }
+  }
+  const waitedMs = Date.now() - asked;
+  let cpu: BoundedExecRecord['cpu'];
+  let sized: { command: string; env: Record<string, string> } = { command: requested, env: {} };
+  if (grant !== null) {
+    sized = sizeRunner(demand.kind, requested, grant.tokens);
+    cpu = { tokens: grant.tokens, want: demand.want, waitedMs, ...(grant.inherited ? { inherited: true } : {}) };
+    appendStderr(
+      `cowshed: cpu-tokens wait done elapsed=${waitedMs}ms status=ok ${grant.inherited ? 'inherited=true ' : ''}tokens=${grant.tokens}/${demand.want} runner=${demand.kind}\n`,
+    );
+  } else if (unbudgeted !== null) {
+    appendStderr(
+      `cowshed: cpu-tokens wait done elapsed=${waitedMs}ms status=err runner=${demand.kind} runs unbudgeted: ${unbudgeted}\n`,
+    );
+  }
+  // The run's sub-pool and grant are given back exactly once, however the run ends. The sub-pool closes first, so no
+  // descendant still draws on tokens the grant has returned.
+  let pool: CpuPool | null = null;
+  let cpuReleased: Promise<void> | null = null;
+  const releaseCpu = (): Promise<void> => {
+    cpuReleased ??= (async () => {
+      try {
+        const outcome = await pool?.close();
+        if (outcome !== undefined && !outcome.ok) {
+          state.poolCloseError = outcome.error;
+          appendStderr(`cowshed: cpu pool did not close cleanly: ${outcome.error}\n`);
+        }
+      } finally {
+        grant?.release();
+      }
+    })();
+    return cpuReleased;
+  };
+  // Records the run's verdict when it has a task to record as. An `expiry` is set only when a bound ended the run.
+  // An `operational` run failed on its CPU budget (a lost grant, or a sub-pool that did not close): an ordinary
+  // failure, whatever bound also fired, so it is never judged as a bound.
+  const recordRun = async (
+    exitCode: number,
+    expiry: ExpiredBound | null,
+    elapsedMs: number,
+    operational: boolean,
+  ): Promise<void> => {
+    if (context.record === undefined) {
+      return;
+    }
+    const { task, directory: recordDirectory } = context.record;
+    const report = await readJunitReport(recordDirectory);
+    const verdict = operational
+      ? judgeOperationalFailure(exitCode, report)
+      : judgeRun({ exitCode, elapsedMs, expiry, report });
+    if (verdict.outcome === 'bound' && verdict.bound === 'test') {
+      appendStderr(`Every failing test failed only on its per-test timeout: ${verdict.tests.join(', ')}\n`);
+    }
+    await writeRecord(recordDirectory, { task: task.id, hash: task.hash, verdict, ...(cpu ? { cpu } : {}) });
+  };
+  // A run refused before its command starts says why, gives back its grant and RAM, and records the failure.
+  const refuse = async (message: string): Promise<BoundedExecResult> => {
+    appendStderr(message);
+    await releaseCpu();
+    await releaseLease();
+    await recordRun(1, null, Date.now() - asked, false);
+    return { success: false, terminalOutput: outputChunks.join('') };
+  };
+  if (parentRefusal !== null) {
+    return refuse(
+      `cowshed: cpu-tokens parent pool refused: ${parentRefusal}; refusing to run the command without asking the host budget\n`,
+    );
+  }
+
+  // A granted run serves a sub-pool of its own grant, so its descendants draw from that and never from above it.
+  // A pool that cannot be set up refuses the run: no command runs unbudgeted.
+  if (grant !== null) {
+    const created = await createCpuPool(grant.tokens, grant.closed);
+    if (!created.ok) {
+      return refuse(`cowshed: cpu pool unavailable: ${created.error}; refusing to run the command\n`);
+    }
+    pool = created.pool;
+  }
   const command = directory === null ? sized.command : await withJunitReport(sized.command, directory);
-  // A runner bounded-exec cannot see in the command (a script that spawns `bun test`) writes
-  // its JUnit report to this path when it is set. The grant's sizing outranks the target's own
-  // environment: the runner may use what it was granted, not what it was configured with.
-  const env = {
+  // A runner bounded-exec cannot see in the command (a script that spawns `bun test`) writes its JUnit report to this
+  // path when it is set. The grant's sizing outranks the target's own environment: the runner may use what it was
+  // granted, not what it was configured with. The sub-pool's environment comes last: a descendant reads only the pool
+  // this run serves.
+  const env: Record<string, string> = {
     ...(directory === null ? {} : { [JUNIT_REPORT_ENV]: join(directory, JUNIT_FILE) }),
-    ...options.env,
+    ...targetEnv(options.env, appendStderr),
     ...sized.env,
+    ...(pool?.environment ?? {}),
   };
   const startedAt = Date.now();
-  const child = spawn(command, [], {
-    cwd,
-    env: mergeEnv(lease, env),
-    shell: true,
-    detached: process.platform !== 'win32',
-    windowsHide: true,
-  });
+  let child: ChildProcess;
+  try {
+    child = spawn(command, [], {
+      cwd,
+      env: mergeEnv(lease, env),
+      shell: true,
+      detached: process.platform !== 'win32',
+      windowsHide: true,
+    });
+  } catch (error) {
+    // Nothing started, so nothing runs under the grant: it goes back here, with the RAM lease.
+    return refuse(`cowshed: could not start the command: ${error instanceof Error ? error.message : String(error)}\n`);
+  }
 
   let idleTimer: NodeJS.Timeout | undefined;
   const armIdleTimer = (): void => {
@@ -283,6 +415,7 @@ export async function runBoundedExec(
   const onTerminationSignal = (signal: NodeJS.Signals): void => {
     removeSignalHandlers();
     void killChildTree(false)
+      .finally(releaseCpu)
       .finally(releaseLease)
       .finally(() => process.kill(process.pid, signal));
   };
@@ -323,7 +456,7 @@ export async function runBoundedExec(
   // two have opposite fixes.
   let termination: Promise<void> = Promise.resolve();
   const expire = (bound: ExpiredBound): void => {
-    if (state.settled || state.expiry !== null) {
+    if (state.settled || state.expiry !== null || state.grantLost) {
       return;
     }
     state.expiry = bound;
@@ -352,13 +485,17 @@ export async function runBoundedExec(
     if (state.settled) {
       if (child.pid !== undefined && processGroupHasMembers(child.pid)) {
         state.forceKillNeeded = true;
-        appendStderr(`Force-killing what the timed-out command left in its process group: ${command}\n`);
+        appendStderr(
+          `Force-killing what the ${state.expiry === null ? 'command' : 'timed-out command'} left in its process group: ${command}\n`,
+        );
         await ignoreKillError(killChildTree(true));
       }
       return;
     }
     state.forceKillNeeded = true;
-    appendStderr(`Force-killing timed out command after killAfterMs=${killAfterMs}: ${command}\n`);
+    appendStderr(
+      `Force-killing ${state.expiry === null ? 'command' : 'timed out command'} after killAfterMs=${killAfterMs}: ${command}\n`,
+    );
     await ignoreKillError(killChildTree(true));
     await settledWithin(exitPromise, REAP_AFTER_FORCE_KILL_MS);
     if (!state.settled) {
@@ -369,16 +506,33 @@ export async function runBoundedExec(
   const totalTimer = setTimeout(() => expire({ kind: 'total', limitMs: timeoutMs }), timeoutMs);
   armIdleTimer();
 
+  // A borrowed grant ends with the ancestor that lent it, and the command runs on tokens that ancestor takes back
+  // then. Stopping the command is a lost grant: a failure, not a bound. Our own release after the command settled
+  // is not a loss; `cpuReleased` marks it.
+  const onGrantLost = (): void => {
+    if (state.settled || state.grantLost || cpuReleased !== null) {
+      return;
+    }
+    state.grantLost = true;
+    appendStderr(
+      `cowshed: cpu-tokens grant lost: its parent pool closed while the command ran; stopping it: ${command}\n`,
+    );
+    // A bound may already be terminating the still-running command. The loss remains an ordinary
+    // operational failure, but that existing termination owns the signals and grace.
+    if (state.expiry === null) termination = terminate();
+  };
+  if (grant?.inherited) {
+    void grant.closed.then(onGrantLost);
+  }
+
   const { code: exitCode, signal: exitSignal } = await exitPromise;
   await termination;
   clearTimeout(totalTimer);
   clearTimeout(idleTimer);
   removeSignalHandlers();
-  // The runner is gone; its tokens are the next one's. Killed instead, this process's socket
-  // closes with it and the gateway takes them back the same way.
-  if (tokens?.granted) {
-    tokens.release();
-  }
+  // The runner is gone. Its sub-pool closes first, so no descendant still draws on tokens the grant returns;
+  // then the grant goes back to its parent or the host.
+  await releaseCpu();
 
   const code = exitCode ?? signalToExitCode(exitSignal);
   if (code !== 0 && state.expiry === null) {
@@ -396,22 +550,13 @@ export async function runBoundedExec(
   }
   await releaseLease();
 
-  if (context.record !== undefined) {
-    const { task, directory: recordDirectory } = context.record;
-    const verdict = judgeRun({
-      exitCode: code,
-      elapsedMs: Date.now() - startedAt,
-      expiry: state.expiry,
-      report: await readJunitReport(recordDirectory),
-    });
-    if (verdict.outcome === 'bound' && verdict.bound === 'test') {
-      appendStderr(`Every failing test failed only on its per-test timeout: ${verdict.tests.join(', ')}\n`);
-    }
-    await writeRecord(recordDirectory, { task: task.id, hash: task.hash, verdict, ...(cpu ? { cpu } : {}) });
-  }
+  // A run whose grant was lost, or whose sub-pool did not close cleanly, fails even when the command exited 0, and
+  // whatever bound also fired: its verdict is an ordinary failure, never a bound.
+  const operationalFailure = state.grantLost || state.poolCloseError !== null;
+  await recordRun(code, state.expiry, Date.now() - startedAt, operationalFailure);
 
   return {
-    success: state.expiry === null && code === 0,
+    success: !operationalFailure && state.expiry === null && code === 0,
     terminalOutput: outputChunks.join(''),
   };
 }
@@ -478,11 +623,33 @@ function buildCommand(options: BoundedExecOptions): string {
 }
 
 /** The lease's directory is the command's TMPDIR unless the target names one itself. */
-function mergeEnv(lease: RamTempLease | null, env: Record<string, string> | undefined): NodeJS.ProcessEnv {
-  if (lease === null) {
-    return env ? { ...process.env, ...env } : process.env;
+function mergeEnv(lease: RamTempLease | null, env: Record<string, string>): NodeJS.ProcessEnv {
+  const inherited = withoutBudgetEnv(process.env);
+  return lease === null ? { ...inherited, ...env } : { ...inherited, TMPDIR: lease.directory, ...env };
+}
+
+/** The process's environment without the CPU budget's variables: a pool and its count only a grant may give. */
+function withoutBudgetEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const kept = { ...env };
+  for (const name of BUDGET_ENV) {
+    delete kept[name];
   }
-  return { ...process.env, TMPDIR: lease.directory, ...env };
+  return kept;
+}
+
+/**
+ * The target's environment without the CPU budget's variables: the budget sets those for the command it grants,
+ * so a value the target names is ignored, and `say` tells the reader so.
+ */
+function targetEnv(env: Record<string, string> | undefined, say: (text: string) => void): Record<string, string> {
+  const kept = { ...env };
+  for (const name of BUDGET_ENV) {
+    if (name in kept) {
+      say(`cowshed: ${name} in the target's env is ignored: the CPU budget sets it\n`);
+      delete kept[name];
+    }
+  }
+  return kept;
 }
 
 function signalToExitCode(signal: NodeJS.Signals | null): number {

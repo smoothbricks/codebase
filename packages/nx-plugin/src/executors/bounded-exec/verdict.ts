@@ -30,7 +30,13 @@ export interface BoundedExecRecord {
    * how long it waited. Absent when it ran unbudgeted; written for the reader of a slow run,
    * never read back.
    */
-  readonly cpu?: { readonly tokens: number; readonly want: number; readonly waitedMs: number };
+  readonly cpu?: {
+    readonly tokens: number;
+    readonly want: number;
+    readonly waitedMs: number;
+    /** Set when the tokens came from an ancestor's CPU pool, not the host budget; `waitedMs` is the wait for that pool. */
+    readonly inherited?: true;
+  };
 }
 
 /** The Nx task a run executes as. Nx gives an executor no task id, only its parts. */
@@ -189,6 +195,16 @@ export function judgeRun(run: RunEnd): BoundedExecVerdict {
     return { outcome: 'bound', bound: 'test', tests: run.report.timedOut };
   }
   return { outcome: 'failed', exitCode: run.exitCode, tests: [] };
+}
+
+/**
+ * A run that failed for a reason its command did not cause: its CPU grant was lost, or its sub-pool did not close
+ * cleanly. It is an ordinary failure whatever the command exited with and whatever bound also fired, and the tests it
+ * reports are failures, never bounds. A failed run never records exit 0.
+ */
+export function judgeOperationalFailure(exitCode: number, report: JunitFailures | null): BoundedExecVerdict {
+  const tests = report === null ? [] : [...report.failed, ...report.timedOut, ...report.cancelled];
+  return { outcome: 'failed', exitCode: exitCode === 0 ? 1 : exitCode, tests };
 }
 
 /** Where `task`'s verdict and report live: this checkout's own Nx workspace-data directory. */

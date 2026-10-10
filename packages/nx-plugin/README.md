@@ -855,17 +855,28 @@ before the command's deadline. Without a grant the command runs unleased and std
 running is said once per process. A gateway from before disk leases answers only after 2 s of silence, so once one is
 found the process stops asking it for a minute, as cowshed's own commands do.
 
-Every `bounded-exec` command takes CPU tokens from cowshed's host CPU budget before it starts, when the gateway answers
-on the same socket (`specs/cowshed/05_gateway.md`, "Host CPU budget"), so concurrent gates on one host keep their
-runnable work near the core count instead of each sizing its runners to the whole machine. It asks for as many tokens as
-the command's runner runs at once — a `nextest run` its `--test-threads` or one per core, `bun test --parallel=N` N, a
-cargo build one per core, anything else one, or the target's `parallelism` option — and sizes the runner to the grant:
-`NEXTEST_TEST_THREADS`, a rewritten `--test-threads=`/`--parallel=` count, `CARGO_BUILD_JOBS` and `RUST_TEST_THREADS`,
-and `BOUNDED_EXEC_CPU_TOKENS` for every command. The gateway shares tokens fairly between checkouts (Nx workspace
-roots). `timeoutMs` and `idleTimeoutMs` start at the grant. The tokens go back when the command exits, or with the
-executor's socket when it is killed. The wait prints one
+Without an inherited parent pool, a `bounded-exec` command takes CPU tokens from cowshed's host budget before it starts,
+when the gateway answers on the same socket (`specs/cowshed/05_gateway.md`, "Host CPU budget"), so concurrent gates on
+one host keep their runnable work near the core count instead of each sizing its runners to the whole machine. It asks
+for as many tokens as the command's runner runs at once — a `nextest run` its `--test-threads` or one per core,
+`bun test --parallel=N` N, a cargo build one per core, anything else one, or the target's `parallelism` option — and
+sizes the runner to the grant: `NEXTEST_TEST_THREADS`, a rewritten `--test-threads=`/`--parallel=` count,
+`CARGO_BUILD_JOBS` and `RUST_TEST_THREADS`, and `BOUNDED_EXEC_CPU_TOKENS` for every command. The gateway shares tokens
+fairly between checkouts (Nx workspace roots). `timeoutMs` and `idleTimeoutMs` start at the grant. The tokens go back
+when the command exits, or with the executor's socket when it is killed. The wait prints one
 `cowshed: cpu-tokens wait done elapsed=… tokens=<granted>/<asked>` line. With no gateway listening, the command runs
 exactly as configured and nothing is said; a gateway from before the budget runs it unbudgeted and stderr says so.
+
+A granted executor serves a private `BOUNDED_EXEC_CPU_POOL` with its actual token count. A nested default executor takes
+from that immediate parent pool, capped at `min(asked, inherited, ceil(cores/2))`, instead of taking from the host while
+the parent holds its grant. The pool accounts for siblings together; each admitted child serves only its own allocation
+to grandchildren. Closing a child's connection returns its local allocation, never the parent's upstream grant. Upstream
+loss revokes the downstream pool; losing a borrowed grant stops the command and records an ordinary failure, not a
+timeout. A bare count or absent endpoint follows normal host admission. A connected parent pool's refusal or protocol
+failure instead fails admission: taking from the host then could wait on the parent's own grant. `options.env` cannot
+inject either marker. Parent-pool grants record `cpu.inherited: true` and their actual local wait; the span also says
+`inherited=true`. Pool setup, listener and cleanup errors fail rather than bypassing accounting. Command bounds stay
+unchanged.
 
 Every `bounded-exec` task records why it ended in `.nx/workspace-data/bounded-exec/<task>/verdict.json`, keyed by the
 task id and the hash it ran at:

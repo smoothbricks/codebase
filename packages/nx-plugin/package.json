@@ -236,7 +236,7 @@
           }
         ],
         "options": {
-          "command": "bun test --timeout=30000 --timings=test-timings.json --shard=1/4 --path-ignore-patterns='**/ram-temp-host.test.ts'",
+          "command": "bun test --timeout=30000 --timings=test-timings.json --shard=1/4 --path-ignore-patterns='**/*-host.test.ts'",
           "cwd": "{projectRoot}",
           "timeoutMs": 120000,
           "killAfterMs": 10000
@@ -257,7 +257,7 @@
           }
         ],
         "options": {
-          "command": "bun test --timeout=30000 --timings=test-timings.json --shard=2/4 --path-ignore-patterns='**/ram-temp-host.test.ts'",
+          "command": "bun test --timeout=30000 --timings=test-timings.json --shard=2/4 --path-ignore-patterns='**/*-host.test.ts'",
           "cwd": "{projectRoot}",
           "timeoutMs": 120000,
           "killAfterMs": 10000
@@ -278,7 +278,7 @@
           }
         ],
         "options": {
-          "command": "bun test --timeout=30000 --timings=test-timings.json --shard=3/4 --path-ignore-patterns='**/ram-temp-host.test.ts'",
+          "command": "bun test --timeout=30000 --timings=test-timings.json --shard=3/4 --path-ignore-patterns='**/*-host.test.ts'",
           "cwd": "{projectRoot}",
           "timeoutMs": 120000,
           "killAfterMs": 10000
@@ -299,7 +299,7 @@
           }
         ],
         "options": {
-          "command": "bun test --timeout=30000 --timings=test-timings.json --shard=4/4 --path-ignore-patterns='**/ram-temp-host.test.ts'",
+          "command": "bun test --timeout=30000 --timings=test-timings.json --shard=4/4 --path-ignore-patterns='**/*-host.test.ts'",
           "cwd": "{projectRoot}",
           "timeoutMs": 120000,
           "killAfterMs": 10000
@@ -326,7 +326,7 @@
           }
         ],
         "options": {
-          "command": "bun test --timeout=30000 src/executors/bounded-exec/ram-temp-host.test.ts",
+          "command": "bun test --timeout=30000 src/executors/bounded-exec/ram-temp-host.test.ts src/executors/bounded-exec/executor-host.test.ts",
           "cwd": "{projectRoot}",
           "timeoutMs": 120000,
           "killAfterMs": 10000

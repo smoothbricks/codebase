@@ -3,7 +3,7 @@ import { rmSync } from 'node:fs';
 import { createServer, type Server, type Socket } from 'node:net';
 import { join } from 'node:path';
 import { ownedSocketDirectory } from '../../testing.js';
-import { CPU_TOKENS_ENV, gatewayCpuBudget, runnerDemand, sizeRunner } from './cpu-tokens.js';
+import { CPU_TOKENS_ENV, gatewayCpuBudget, parseInheritedTokens, runnerDemand, sizeRunner } from './cpu-tokens.js';
 
 const servers: Server[] = [];
 const directories: string[] = [];
@@ -101,6 +101,20 @@ describe('cowshed CPU budget client', () => {
     });
   });
 
+  it('reads an inherited count only as a positive safe integer', () => {
+    expect(parseInheritedTokens(undefined)).toBeNull();
+    for (const invalid of ['', '0', '-1', '1.5', '2e3', '0x10', ' 3', '3 ', '03', 'three', '9007199254740993']) {
+      expect(parseInheritedTokens(invalid)).toBeNull();
+    }
+    expect(parseInheritedTokens('1')).toBe(1);
+    expect(parseInheritedTokens('16')).toBe(16);
+    expect(parseInheritedTokens(String(Number.MAX_SAFE_INTEGER))).toBe(Number.MAX_SAFE_INTEGER);
+  });
+
+  it('reads back the count a runner was sized to', () => {
+    expect(parseInheritedTokens(sizeRunner('process', 'bun scripts/x.ts', 5).env[CPU_TOKENS_ENV])).toBe(5);
+  });
+
   it('asks the gateway with one line, takes the granted count, and holds until released', async () => {
     const { promise: request, resolve: requested } = Promise.withResolvers<string>();
     const { promise: closed, resolve: close } = Promise.withResolvers<void>();
@@ -123,8 +137,24 @@ describe('cowshed CPU budget client', () => {
     expect(grant.granted && grant.tokens).toBe(6);
     if (grant.granted) {
       grant.release();
+      // The client's side of the connection really closed, not merely its release call.
+      await grant.closed;
     }
     await closed;
+  });
+
+  it('closes a granted lease when the gateway ends the connection', async () => {
+    const socket = await gateway((client) => {
+      client.once('data', () => {
+        client.write('{"ok":true,"lease":"queued"}\n{"ok":true,"lease":"granted","tokens":2}\n');
+        client.end();
+      });
+    });
+    const grant = await gatewayCpuBudget(socket).take(2, '/w', 'x');
+    if (!grant.granted) {
+      throw new Error(grant.reason);
+    }
+    await grant.closed;
   });
 
   it('runs unbudgeted, said as absent, when no gateway listens', async () => {

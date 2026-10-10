@@ -19,9 +19,9 @@ export interface BoundedExecOptions {
   killAfterMs?: number;
   /**
    * The most threads or processes the command runs at once, which is how many CPU tokens it asks
-   * the cowshed host budget for. Absent, the runner in the command decides: nextest and cargo one
-   * per core, `bun test --parallel=N` N, anything else one. The grant reaches the command as
-   * `BOUNDED_EXEC_CPU_TOKENS`.
+   * its live parent pool or the cowshed host budget for. Absent, the runner in the command decides:
+   * nextest and cargo one per core, `bun test --parallel=N` N, anything else one. The actual grant
+   * reaches the command as `BOUNDED_EXEC_CPU_TOKENS`, with its sub-pool in `BOUNDED_EXEC_CPU_POOL`.
    */
   parallelism?: number;
   forwardAllArgs?: boolean;

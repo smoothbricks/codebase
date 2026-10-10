@@ -37,12 +37,12 @@
       "type": "number",
       "minimum": 0,
       "default": 10000,
-      "description": "Most milliseconds a timed-out command gets after graceful termination before its process group is force-killed. The grace ends early when the command exits; whatever it leaves in its process group is force-killed then."
+      "description": "Most milliseconds a timed-out or CPU-grant-revoked command gets after graceful termination before its process group is force-killed. The grace ends early when the command exits; whatever it leaves in its process group is force-killed then."
     },
     "parallelism": {
       "type": "integer",
       "minimum": 1,
-      "description": "Most threads or processes the command runs at once: the CPU tokens it asks the cowshed host budget for before it starts. Omit to let the runner in the command decide (nextest and cargo one per core, `bun test --parallel=N` N, anything else one). The grant reaches the command as BOUNDED_EXEC_CPU_TOKENS."
+      "description": "Most threads or processes the command runs at once: the CPU tokens it asks its live parent pool or the cowshed host budget for before it starts. Omit to let the runner in the command decide (nextest and cargo one per core, `bun test --parallel=N` N, anything else one). The actual grant reaches the command as BOUNDED_EXEC_CPU_TOKENS, with its sub-pool in BOUNDED_EXEC_CPU_POOL."
     },
     "forwardAllArgs": {
       "type": "boolean",

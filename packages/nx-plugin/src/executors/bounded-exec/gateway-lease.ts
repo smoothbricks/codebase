@@ -30,9 +30,13 @@ export interface LeaseBounds {
  */
 export type UnleasedCause = 'absent' | 'predates' | 'other';
 
-/** A granted lease with its `granted` answer, held until released, or why there is none. */
+/**
+ * A granted lease with its `granted` answer, held until released, or why there is none. `closed`
+ * resolves when the connection really closes: after `release`, when the gateway ends it, or when
+ * the client process dies.
+ */
 export type HeldLease =
-  | { granted: true; answer: Readonly<Record<string, unknown>>; release: () => void }
+  | { granted: true; answer: Readonly<Record<string, unknown>>; release: () => void; closed: Promise<void> }
   | { granted: false; cause: UnleasedCause; reason: string };
 
 /**
@@ -55,6 +59,11 @@ export function holdLease(
     resolve = settled;
   });
   const connection = connect(socket);
+  // `closed` is made when a consumer reads it, so a lease nobody watches allocates no promise. The
+  // flag, not `connection.destroyed`, says the socket really closed: `destroy()` sets that flag before
+  // the `close` event fires.
+  let socketClosed = false;
+  let closed: Promise<void> | undefined;
   let state: 'connecting' | 'asked' | 'half-closed' | 'queued' | 'settled' = 'connecting';
   let buffered = '';
   let timer: NodeJS.Timeout | undefined;
@@ -107,7 +116,17 @@ export function holdLease(
         wait(grantMs, () => unleased(`the gateway granted nothing within ${grantMs} ms`));
       }
     } else if (state === 'queued' && lease === 'granted') {
-      settle({ granted: true, answer: fields, release: () => connection.destroy() });
+      settle({
+        granted: true,
+        answer: fields,
+        release: () => connection.destroy(),
+        get closed() {
+          closed ??= socketClosed
+            ? Promise.resolve()
+            : new Promise<void>((done) => connection.once('close', () => done()));
+          return closed;
+        },
+      });
     } else {
       unleased(`the gateway answered out of turn: ${line}`);
     }
@@ -136,6 +155,9 @@ export function holdLease(
       unleased(error.message);
     }
   });
-  connection.on('close', () => unleased('the gateway closed the lease connection'));
+  connection.on('close', () => {
+    socketClosed = true;
+    unleased('the gateway closed the lease connection');
+  });
   return promise;
 }

@@ -217,8 +217,9 @@ Before the group runs, nextest lists runnable, nonignored matches from the same 
 matches, the target logs `N` and its `N * 30000` millisecond outer budget. Empty or malformed listings, listing failure,
 and a budget exceeding Node's timer range fail closed; the budget is never silently clamped. The ordinary targets keep
 their 120s bound and the default per-test 30s bound stays unchanged. The existing full-lifecycle 60s class overrides
-remain explicit; they can exceed a single test's 30s share of the outer budget. The RAM host walk runs after this group
-in `test-host`, outside the four pure Bun shards, with its own existing target and case bounds.
+remain explicit; they can exceed a single test's 30s share of the outer budget. The RAM host walk and real-process
+CPU-pool production-wiring proofs run after this group in `test-host`, outside the four pure Bun shards, with the
+existing target and case bounds. The shards exclude `*-host.test.ts`; the host target names both owned host files.
 
 **Host limit.** The host's disk-image attach pool runs out (01_storage.md, "How the APFS host degrades" §2), and the
 suite stops spending into a spent one. Fixtures attach an image once and share it across the assertions that need it

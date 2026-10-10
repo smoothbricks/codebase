@@ -8,6 +8,7 @@ import {
   type BoundedExecVerdict,
   failedTasksOfRun,
   JUNIT_FILE,
+  judgeOperationalFailure,
   judgeRun,
   junitFailures,
   readRecord,
@@ -213,6 +214,26 @@ ${abort('t::crash', '11 (SIGSEGV)')}
         report: { timedOut: ['nt t::slow'], cancelled, failed: [] },
       }),
     ).toMatchObject({ outcome: 'bound', bound: 'total' });
+  });
+
+  it('keeps CPU operational failures ordinary even beside test timeouts or a successful command exit', () => {
+    expect(
+      judgeOperationalFailure(0, {
+        failed: ['nt t::assert'],
+        timedOut: ['nt t::slow'],
+        cancelled: ['nt t::cut'],
+      }),
+    ).toEqual({
+      outcome: 'failed',
+      exitCode: 1,
+      tests: ['nt t::assert', 'nt t::slow', 'nt t::cut'],
+    });
+    expect(judgeOperationalFailure(143, { failed: [], timedOut: ['nt t::slow'], cancelled: [] })).toEqual({
+      outcome: 'failed',
+      exitCode: 143,
+      tests: ['nt t::slow'],
+    });
+    expect(judgeOperationalFailure(0, null)).toEqual({ outcome: 'failed', exitCode: 1, tests: [] });
   });
 
   it('records a runner that reports its own abort at the total ceiling as a bound, end to end', async () => {

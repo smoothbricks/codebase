@@ -38,6 +38,7 @@ const CARGO_BUILD =
   /(?<=^|[\s;&|()])(?:cargo(?:\s+-\S+)*\s+(?:build|test|check|clippy|rustc|doc|run|nextest\s+archive)|napi\s+build)(?=\s|$)/;
 const TEST_THREADS = /--test-threads(?:=|\s+)(\d+)/g;
 const BUN_PARALLEL = /--parallel(?:=(\d+))?(?=\s|$)/g;
+const INHERITED_COUNT = /^[1-9]\d*$/;
 
 /**
  * What `command` asks for: its kind by invocation, and `declared` (the target's `parallelism`)
@@ -89,9 +90,27 @@ export function sizeRunner(
   }
 }
 
-/** Tokens held until released, or why the runner starts without the budget. */
+/**
+ * The count `CPU_TOKENS_ENV` names, as a positive safe integer, or `null` when absent or malformed. It is
+ * descriptor input only: a count proves nothing about a live pool and grants nothing. A missing or malformed
+ * descriptor follows normal host admission; a valid one still needs a grant from its endpoint. Connection
+ * absence follows the host path, while a connected parent's refusal fails admission to avoid hold-and-wait.
+ */
+export function parseInheritedTokens(value: string | undefined): number | null {
+  if (value === undefined || !INHERITED_COUNT.test(value)) {
+    return null;
+  }
+  const tokens = Number(value);
+  return Number.isSafeInteger(tokens) ? tokens : null;
+}
+
+/**
+ * Tokens held until released, or why the runner starts without the budget. `closed` resolves when
+ * the grant's connection closes, however it closes, so a sub-pool built on the grant ends with it.
+ * `inherited` marks tokens a parent's CPU pool lent, not tokens the host gateway granted.
+ */
 export type TokenGrant =
-  | { granted: true; tokens: number; release: () => void }
+  | { granted: true; tokens: number; release: () => void; closed: Promise<void>; inherited?: true }
   | { granted: false; cause: UnleasedCause; reason: string };
 
 /** Where bounded-exec takes its tokens; the gateway in production, a fake in tests. */
@@ -124,7 +143,7 @@ export function gatewayCpuBudget(socket: string = GATEWAY_SOCKET): CpuBudget {
           reason: `the gateway granted ${JSON.stringify(tokens)} tokens for ${want}`,
         };
       }
-      return { granted: true, tokens, release: lease.release };
+      return { granted: true, tokens, release: lease.release, closed: lease.closed };
     },
   };
 }

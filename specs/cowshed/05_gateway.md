@@ -406,6 +406,33 @@ parallel, and the total runnable work stays near the core count.
   sets `NEXTEST_TEST_THREADS` for nextest, rewrites a `--test-threads=`/`--parallel=` count the command names (a flag
   outranks the environment), sets `CARGO_BUILD_JOBS` and `RUST_TEST_THREADS` for cargo, and gives every command
   `BOUNDED_EXEC_CPU_TOKENS`, so a script that starts a runner itself can size it.
+- **Nested runners use a parent-held sub-ledger.** A granted executor serves its T tokens on a private socket and
+  publishes that endpoint as `BOUNDED_EXEC_CPU_POOL`, beside its `BOUNDED_EXEC_CPU_TOKENS` count. A default nested
+  executor connects to its immediate parent's live pool, requests at most `min(want, inherited, ceil(N/2))`, and holds
+  one complete local grant on that connection. The pool accounts for every holding sibling, so their sum never exceeds
+  T. It serves its own FIFO queue, granting the head `min(requested, free)` once at least one token is free; that count
+  is final, not a partial holding awaiting more tokens. Queued siblings wait only for that pool's own holders. Host
+  checkout fairness remains the upstream ledger's concern. An admitted child serves its granted count as its own pool,
+  and grandchildren draw only from that pool: no holder waits for another grant from an ancestor or the host. The parent
+  remains the owner of its upstream grant. A child returns only its local allocation by closing its connection; it never
+  releases the parent's connection. Upstream loss revokes the downstream pool and its connections, so a dead parent
+  cannot grant tokens to a descendant. Losing a borrowed grant ends its still-running command through the normal
+  TERM/grace/KILL path and reports an ordinary CPU-grant-loss failure, never a timeout. If a bound already started
+  terminating the command, the loss still makes its verdict an ordinary failure; the existing termination owns the
+  signals and grace, so losing the grant starts no second teardown. A bare or invalid count proves no allocation; an
+  absent endpoint follows normal host admission. Once connected to the parent, refusal, silence or protocol failure is
+  an ordinary admission failure, never a second host take while that parent may still hold its grant. A stale descriptor
+  whose endpoint no longer connects is treated as absent. Only the executor publishes its actual live pool;
+  `options.env` cannot inject either marker into a command. The span and `cpu.inherited: true` record identify a
+  parent-pool grant and its actual local wait. Pool setup or cleanup failure is an ordinary failure, never a successful
+  unaccounted run. Real-process default-runner proofs live in `executor-host.test.ts` under `test-host`, because the
+  default macOS runner acquires a real RAM volume. Node peers import the built executor artifact named by
+  `executors.json`; the host target's existing build dependency produces it, rather than compiling TypeScript inside a
+  test's guard. Pure pool and executor unit cases never attach images. **Known admission ambiguity:** a connect error is
+  currently classified as an absent endpoint. A full listen backlog or local file-descriptor exhaustion can also prevent
+  connection to a live pool, so this classification does not yet prove that its parent has released the upstream grant.
+  Distinguishing those cases before any host fallback remains an admission follow-up; connected refusals and protocol
+  errors already fail without a second take.
 - **Fair between checkouts.** The checkout is the Nx workspace root the request names. A checkout's share is N divided
   among the checkouts holding or waiting (at least 1). The next grant goes to the waiting checkout that holds the fewest
   tokens (the older head request on a tie), to its oldest request. While another checkout waits, that grant is
