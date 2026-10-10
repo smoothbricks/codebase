@@ -79,8 +79,8 @@ fn assert_delta_roundtrip(vm: &mut Vm, before: &[u8], after: &[u8], checkpoint: 
         Ok(end - checkpoint),
         vm.delta_export_segment(checkpoint, end)
     );
-    let undo = vm.delta_export_undo_bytes();
-    let redo = vm.delta_export_redo_bytes();
+    let undo = vm.delta_export_undo().to_vec();
+    let redo = vm.delta_export_redo().to_vec();
 
     let mut production = after.to_vec();
     vm.undo_rollback(&mut production, checkpoint)
@@ -1429,8 +1429,8 @@ fn assert_element_exported_window(vm: &mut Vm, before: &[u8], after: &[u8], star
         vm.delta_export_overflow(),
         "refusal diagnostic must not erase the valid prefix"
     );
-    let undo = vm.delta_export_undo_bytes();
-    let redo = vm.delta_export_redo_bytes();
+    let undo = vm.delta_export_undo().to_vec();
+    let redo = vm.delta_export_redo().to_vec();
     let mut replay = Vm::default();
     let mut backward = after.to_vec();
     replay

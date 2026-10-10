@@ -1508,8 +1508,8 @@ fn assert_delta_segment_replays(vm: &mut Vm, before: &[u8], after: &[u8], checkp
         Ok(end - checkpoint),
         vm.delta_export_segment(checkpoint, end)
     );
-    let undo = vm.delta_export_undo_bytes();
-    let redo = vm.delta_export_redo_bytes();
+    let undo = vm.delta_export_undo().to_vec();
+    let redo = vm.delta_export_redo().to_vec();
     let entry = Vm::delta_export_entry_size();
     let size = after.len() as u32;
 
@@ -1650,7 +1650,7 @@ fn sequential_public_owners_each_journal_their_changed_flag_once() {
         if delta {
             let end = vm.undo_checkpoint();
             assert_eq!(Ok(end), vm.delta_export_segment(0, end));
-            let undo = vm.delta_export_undo_bytes();
+            let undo = vm.delta_export_undo().to_vec();
             let flag_offset = meta.meta_base + SlotMetaOffset::CHANGE_FLAGS;
             let flag_entries = undo
                 .as_chunks::<{ Vm::delta_export_entry_size() as usize }>()
@@ -2375,8 +2375,8 @@ fn bitmap_overflow_mid_reducer_preserves_the_accepted_prefix_and_redo() {
                 Ok(end - checkpoint),
                 vm.delta_export_segment(checkpoint, end)
             );
-            let undo = vm.delta_export_undo_bytes();
-            let redo = vm.delta_export_redo_bytes();
+            let undo = vm.delta_export_undo().to_vec();
+            let redo = vm.delta_export_redo().to_vec();
             let entry_size = Vm::delta_export_entry_size();
             let mut replay = Vm::default();
             let mut backward = accepted.clone();
@@ -2830,8 +2830,8 @@ fn timestamp_only_algebra_overflow_preserves_the_real_accepted_prefix_and_redo()
                 vm.delta_export_segment(start, accepted_at),
                 Ok(accepted_at - start)
             );
-            let undo = vm.delta_export_undo_bytes();
-            let redo = vm.delta_export_redo_bytes();
+            let undo = vm.delta_export_undo().to_vec();
+            let redo = vm.delta_export_redo().to_vec();
             let entry_size = Vm::delta_export_entry_size();
             let mut replay = Vm::default();
             let mut backward = accepted.clone();

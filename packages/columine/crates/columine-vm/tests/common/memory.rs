@@ -81,6 +81,10 @@ pub fn with_allocations<T>(allocations: u64, run: impl FnOnce() -> T) -> T {
 /// `setup` runs outside the budget. `refused` must accept each error; a site
 /// that aborts instead ends the test process. Returns the first success and
 /// the budget it needed.
+#[allow(
+    dead_code,
+    reason = "shared by test binaries that use only some helpers"
+)]
 pub fn at_every_allocation<I, T, E>(
     mut setup: impl FnMut() -> I,
     mut run: impl FnMut(I) -> Result<T, E>,

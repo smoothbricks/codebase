@@ -42,10 +42,6 @@ use columine_vm::vm::{CheckedMap, CheckedSet, CheckedStructMap2, Vm};
 
 struct Runtime {
     vm: Vm,
-    /// Serialized delta-segment lanes. Rust materializes them after export so
-    /// the `_ptr` results remain stable until the next export.
-    delta_undo: Vec<u8>,
-    delta_redo: Vec<u8>,
     /// Count from the last successful `vm_evict_all_expired` call.
     last_evicted_count: u32,
     #[cfg(not(target_arch = "wasm32"))]
@@ -55,8 +51,6 @@ impl Runtime {
     fn new() -> Self {
         Runtime {
             vm: Vm::default(),
-            delta_undo: Vec::new(),
-            delta_redo: Vec::new(),
             last_evicted_count: 0,
             #[cfg(not(target_arch = "wasm32"))]
             regions: Vec::new(),
@@ -171,7 +165,9 @@ unsafe fn cols_vec<'a>(
     {
         return Err(ErrorCode::ColumnUnderrun);
     }
-    let mut cols = Vec::with_capacity(count);
+    let mut cols = Vec::new();
+    cols.try_reserve_exact(count)
+        .map_err(|_| ErrorCode::OutOfMemory)?;
     for i in 0..count {
         let ptr = unsafe { *col_ptrs.add(i) };
         let len = unsafe { *col_lengths.add(i) };
@@ -788,8 +784,6 @@ pub unsafe extern "C" fn vm_delta_export_segment(
         Ok(count) => count,
         Err(error) => return error as u32,
     };
-    runtime.delta_undo = runtime.vm.delta_export_undo_bytes();
-    runtime.delta_redo = runtime.vm.delta_export_redo_bytes();
     let output = unsafe { core::slice::from_raw_parts_mut(out_ptr, 4) };
     bytes::write_u32(output, 0, count);
     ErrorCode::Ok as u32
@@ -797,12 +791,13 @@ pub unsafe extern "C" fn vm_delta_export_segment(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn vm_delta_export_undo_ptr() -> u32 {
-    rt().delta_undo.as_ptr() as usize as u32
+    // Stable until the next export: the VM keeps the serialized lanes.
+    rt().vm.delta_export_undo().as_ptr() as usize as u32
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn vm_delta_export_redo_ptr() -> u32 {
-    rt().delta_redo.as_ptr() as usize as u32
+    rt().vm.delta_export_redo().as_ptr() as usize as u32
 }
 
 #[unsafe(no_mangle)]

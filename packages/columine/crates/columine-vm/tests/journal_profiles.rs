@@ -293,6 +293,13 @@ fn pure_window_writes_undo_only_and_never_admits_the_redo_lane() {
         vm.delta_export_segment(0, end),
         "a pure window has no redo lane to export"
     );
+    assert_eq!(
+        Ok(0),
+        vm.delta_export_segment(end, end),
+        "an empty range names no record, so it needs no redo lane"
+    );
+    assert_eq!(0, vm.delta_export_len_bytes());
+    assert!(vm.delta_export_undo().is_empty() && vm.delta_export_redo().is_empty());
     assert_eq!(Some(100), lookup(&state, 42));
     assert_eq!(Some(200), lookup(&state, 43));
 
@@ -384,6 +391,14 @@ fn paired_window_admits_the_redo_lane_and_exports_a_replayable_range() {
     let mut state = init(&prog);
     let before = state.clone();
     let mut vm = Vm::default();
+    // A window backs its change-flag savepoint before it opens: without the
+    // memory for it, opening is refused and the journal is unchanged.
+    let closed = vm.undo_status();
+    assert_eq!(
+        Err(ErrorCode::OutOfMemory),
+        without_memory(|| vm.undo_enable(&state))
+    );
+    assert_eq!(closed, vm.undo_status());
     vm.undo_enable(&state).expect("undo window opens");
 
     assert_eq!(ErrorCode::Ok, upsert(&mut vm, &mut state, 42, 100, true));
@@ -414,9 +429,17 @@ fn paired_window_admits_the_redo_lane_and_exports_a_replayable_range() {
         "the lane grows to actual demand, not to the window budget"
     );
 
+    // An export backs both lanes before it replaces the last one: without
+    // the memory, it is refused and nothing is exported.
+    assert_eq!(
+        Err(ErrorCode::OutOfMemory),
+        without_memory(|| vm.delta_export_segment(0, end))
+    );
+    assert_eq!(0, vm.delta_export_len_bytes());
+    assert!(vm.delta_export_undo().is_empty() && vm.delta_export_redo().is_empty());
     assert_eq!(Ok(end), vm.delta_export_segment(0, end));
-    let undo = vm.delta_export_undo_bytes();
-    let redo_bytes = vm.delta_export_redo_bytes();
+    let undo = vm.delta_export_undo().to_vec();
+    let redo_bytes = vm.delta_export_redo().to_vec();
     let after = state.clone();
     let entry = Vm::delta_export_entry_size();
 
@@ -442,6 +465,11 @@ fn paired_window_admits_the_redo_lane_and_exports_a_replayable_range() {
 
     assert_eq!(Ok(image_len(&after)), vm.undo_rollback(&mut state, 0));
     assert_eq!(before, state);
+    assert_eq!(0, vm.delta_export_len_bytes());
+    assert!(
+        vm.delta_export_undo().is_empty() && vm.delta_export_redo().is_empty(),
+        "a rollback before the export takes it back"
+    );
 }
 
 /// A window may hold both profiles. A range containing any undo-only record
@@ -458,8 +486,8 @@ fn mixed_window_refuses_a_range_with_an_undo_only_record_and_keeps_the_last_sele
     assert_eq!(ErrorCode::Ok, upsert(&mut vm, &mut state, 42, 100, true));
     let paired_end = vm.undo_checkpoint();
     assert_eq!(Ok(paired_end), vm.delta_export_segment(0, paired_end));
-    let previous_undo = vm.delta_export_undo_bytes();
-    let previous_redo = vm.delta_export_redo_bytes();
+    let previous_undo = vm.delta_export_undo().to_vec();
+    let previous_redo = vm.delta_export_redo().to_vec();
     let previous_len = vm.delta_export_len_bytes();
     let previous_overflow = vm.delta_export_overflow();
 
@@ -492,12 +520,12 @@ fn mixed_window_refuses_a_range_with_an_undo_only_record_and_keeps_the_last_sele
     );
     assert_eq!(
         previous_undo,
-        vm.delta_export_undo_bytes(),
+        vm.delta_export_undo().to_vec(),
         "refusal keeps the previous undo bytes"
     );
     assert_eq!(
         previous_redo,
-        vm.delta_export_redo_bytes(),
+        vm.delta_export_redo().to_vec(),
         "refusal keeps the previous redo bytes"
     );
     assert_eq!(previous_len, vm.delta_export_len_bytes());
@@ -508,8 +536,8 @@ fn mixed_window_refuses_a_range_with_an_undo_only_record_and_keeps_the_last_sele
         vm.delta_export_segment(0, paired_end),
         "the paired prefix stays exportable"
     );
-    assert_eq!(previous_undo, vm.delta_export_undo_bytes());
-    assert_eq!(previous_redo, vm.delta_export_redo_bytes());
+    assert_eq!(previous_undo, vm.delta_export_undo().to_vec());
+    assert_eq!(previous_redo, vm.delta_export_redo().to_vec());
 }
 
 /// Activation after undo-only writes pads the redo lane with the earlier
@@ -553,8 +581,8 @@ fn paired_suffix_after_an_undo_only_prefix_exports_only_its_own_range() {
         Ok(end - prefix_end),
         vm.delta_export_segment(prefix_end, end)
     );
-    let undo = vm.delta_export_undo_bytes();
-    let redo_bytes = vm.delta_export_redo_bytes();
+    let undo = vm.delta_export_undo().to_vec();
+    let redo_bytes = vm.delta_export_redo().to_vec();
     let entry = Vm::delta_export_entry_size();
     let after = state.clone();
 
@@ -654,8 +682,8 @@ fn enable_on_an_active_window_is_refused_and_preserves_status_checkpoint_and_sel
 
     let status = vm.undo_status();
     let lane = vm.undo_redo_lane_status();
-    let selected_undo = vm.delta_export_undo_bytes();
-    let selected_redo = vm.delta_export_redo_bytes();
+    let selected_undo = vm.delta_export_undo().to_vec();
+    let selected_redo = vm.delta_export_redo().to_vec();
     let selected_len = vm.delta_export_len_bytes();
     let selected_overflow = vm.delta_export_overflow();
     let image = state.clone();
@@ -678,12 +706,12 @@ fn enable_on_an_active_window_is_refused_and_preserves_status_checkpoint_and_sel
     );
     assert_eq!(
         selected_undo,
-        vm.delta_export_undo_bytes(),
+        vm.delta_export_undo().to_vec(),
         "the refusal keeps the selected undo bytes"
     );
     assert_eq!(
         selected_redo,
-        vm.delta_export_redo_bytes(),
+        vm.delta_export_redo().to_vec(),
         "the refusal keeps the selected redo bytes"
     );
     assert_eq!(selected_len, vm.delta_export_len_bytes());
@@ -697,7 +725,7 @@ fn enable_on_an_active_window_is_refused_and_preserves_status_checkpoint_and_sel
     );
     assert_eq!(
         selected_undo,
-        vm.delta_export_undo_bytes(),
+        vm.delta_export_undo().to_vec(),
         "a write does not move the selected export"
     );
 

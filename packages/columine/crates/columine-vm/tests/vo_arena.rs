@@ -427,8 +427,8 @@ fn assert_exported_delta_replays(vm: &mut Vm, before: &[u8], after: &[u8], check
         Ok(end - checkpoint),
         vm.delta_export_segment(checkpoint, end)
     );
-    let undo = vm.delta_export_undo_bytes();
-    let redo = vm.delta_export_redo_bytes();
+    let undo = vm.delta_export_undo().to_vec();
+    let redo = vm.delta_export_redo().to_vec();
 
     let mut replay = Vm::default();
     let mut rolled_back = after.to_vec();
@@ -1176,8 +1176,8 @@ fn journal_overflow_refuses_before_write_and_restores_the_exact_prefix_on_both_l
                 vm.delta_export_segment(checkpoint, end)
             );
             assert!(vm.delta_export_overflow());
-            let undo = vm.delta_export_undo_bytes();
-            let redo = vm.delta_export_redo_bytes();
+            let undo = vm.delta_export_undo().to_vec();
+            let redo = vm.delta_export_redo().to_vec();
             let mut replay = Vm::default();
             let mut undone = after_prefix.clone();
             replay_rollback(&mut replay, &mut undone, &undo);
@@ -1396,7 +1396,7 @@ fn new_key_rollback_restores_an_empty_cell_not_a_tombstone() {
 
     let end = vm.undo_checkpoint();
     assert_eq!(Ok(end), vm.delta_export_segment(0, end));
-    let undo = vm.delta_export_undo_bytes();
+    let undo = vm.delta_export_undo().to_vec();
     let mut replayed = after.clone();
     replay_rollback(&mut Vm::default(), &mut replayed, &undo);
     assert_eq!(EMPTY_KEY, bytes::read_u32(&replayed, cell), "exported undo");

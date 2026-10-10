@@ -1561,8 +1561,8 @@ fn assert_exported_images(vm: &mut Vm, checkpoint: u32, before: &[u8], after: &[
         vm.delta_export_segment(checkpoint, end),
         Ok(end - checkpoint)
     );
-    let undo = vm.delta_export_undo_bytes();
-    let redo = vm.delta_export_redo_bytes();
+    let undo = vm.delta_export_undo().to_vec();
+    let redo = vm.delta_export_redo().to_vec();
     let mut replay = Vm::default();
     let mut undone = after.to_vec();
     replay
@@ -2913,8 +2913,8 @@ proptest! {
             if delta && scalar_vm.undo_checkpoint() != 0 {
                 assert_exported_images(&mut scalar_vm, 0, &before, &scalar);
                 assert_exported_images(&mut public_vm, 0, &before, &public);
-                prop_assert_eq!(scalar_vm.delta_export_undo_bytes(), public_vm.delta_export_undo_bytes());
-                prop_assert_eq!(scalar_vm.delta_export_redo_bytes(), public_vm.delta_export_redo_bytes());
+                prop_assert_eq!(scalar_vm.delta_export_undo().to_vec(), public_vm.delta_export_undo().to_vec());
+                prop_assert_eq!(scalar_vm.delta_export_redo().to_vec(), public_vm.delta_export_redo().to_vec());
             }
             scalar_vm.undo_rollback(&mut scalar, 0).expect("scalar checkpoint");
             public_vm.undo_rollback(&mut public, 0).expect("public checkpoint");

@@ -1,5 +1,8 @@
 //! Actual native extern bounds and committed-boundary growth between undo windows.
 //! Tests share the export runtime's statics, so each one takes the serial lock.
+#[path = "../../columine-vm/tests/common/memory.rs"]
+mod memory;
+
 use columine_types::types::{
     ErrorCode, Opcode, PROGRAM_FORMAT_VERSION, PROGRAM_MAGIC, ProgramHeader, STATE_HEADER_SIZE,
     SlotMetaOffset, SlotType, StructFieldType,
@@ -124,6 +127,25 @@ fn actual_bounds_and_committed_growth_preserve_both_window_authorities() {
         },
         ErrorCode::Ok as u32
     );
+    // The column table is backed before the batch reads it: without the
+    // memory, the batch is refused as OutOfMemory with the image unchanged.
+    let seeded = state.clone();
+    assert_eq!(
+        memory::with_allocations(0, || unsafe {
+            vm_execute_batch(
+                state.as_mut_ptr(),
+                size,
+                program.as_ptr(),
+                program.len() as u32,
+                seed_columns.as_ptr(),
+                seed_lengths.as_ptr(),
+                2,
+                1,
+            )
+        }),
+        ErrorCode::OutOfMemory as u32
+    );
+    assert_eq!(seeded, state);
     let initial = state.clone();
     assert_eq!(
         unsafe { vm_undo_enable(state.as_mut_ptr(), size) },

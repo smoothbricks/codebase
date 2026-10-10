@@ -587,6 +587,10 @@ pub(crate) struct UndoState {
     export_start: u32,
     export_count: u32,
     export_overflow: bool,
+    /// The exported range's undo and redo lanes, serialized when it was
+    /// exported; storage is kept for the next export.
+    export_undo: Vec<u8>,
+    export_redo: Vec<u8>,
     capture_scratch: Vec<u8>,
     capture_ranges: Vec<(u32, u32)>,
     ttl_batch_scratch: TtlBatchScratch,
@@ -5813,7 +5817,14 @@ impl Vm {
         }
         let state_size = u32::try_from(state.len()).map_err(|_| ErrorCode::InvalidState)?;
         let (slots, _) = state_init::state_geometry(state)?;
+        // The window's change-flag savepoint is backed before any journal
+        // state changes, so a refusal leaves the journal as it was. An
+        // inactive window holds no saved flags.
         let u = &mut self.undo;
+        debug_assert!(u.saved_change_flags.is_empty());
+        u.saved_change_flags
+            .try_reserve(slots as usize + 1)
+            .map_err(|_| ErrorCode::OutOfMemory)?;
         u.enabled = true;
         u.entries.clear();
         u.redo.clear();
@@ -5823,6 +5834,8 @@ impl Vm {
         u.export_start = 0;
         u.export_count = 0;
         u.export_overflow = false;
+        u.export_undo.clear();
+        u.export_redo.clear();
         u.generation = next_generation();
         u.capture_depth = 0;
         u.reserved_entries = 0;
@@ -5831,7 +5844,6 @@ impl Vm {
         u.ttl_batch_scratch.reset();
         u.erase_scratch.ranges.clear();
         u.erase_scratch.payload_ranges.clear();
-        u.saved_change_flags.reserve(slots as usize + 1);
         u.saved_change_flags.clear();
         u.state_size = state_size;
         Ok(())
@@ -5867,6 +5879,11 @@ impl Vm {
         }
         u.export_start = u.export_start.min(u.count());
         u.export_count = u.export_count.min(u.count() - u.export_start);
+        // The rolled-back records were never before the export's end, so
+        // what stays exported is a prefix of what was serialized.
+        let exported = (u.export_count * FLAT_UNDO_ENTRY_SIZE) as usize;
+        u.export_undo.truncate(exported);
+        u.export_redo.truncate(exported);
         Ok(size)
     }
 
@@ -5887,6 +5904,8 @@ impl Vm {
         u.export_start = 0;
         u.export_count = 0;
         u.export_overflow = false;
+        u.export_undo.clear();
+        u.export_redo.clear();
         u.saved_change_flags.clear();
         u.enabled = false;
     }
@@ -5937,8 +5956,9 @@ impl Vm {
     // Delta export and apply
     // =========================================================================
 
-    /// Export exactly the requested complete paired range. Refuse an invalid
-    /// range or any undo-only record before changing the previous export.
+    /// Export exactly the requested complete paired range, serializing both
+    /// lanes. Refuse an invalid range, any undo-only record, or storage that
+    /// cannot be backed (`OutOfMemory`) before changing the previous export.
     pub fn delta_export_segment(&mut self, from_pos: u32, to_pos: u32) -> Result<u32, ErrorCode> {
         let u = &mut self.undo;
         if from_pos > to_pos || to_pos > u.count() {
@@ -5956,36 +5976,39 @@ impl Vm {
                 return Err(ErrorCode::DeltaLaneMismatch);
             }
         }
+        let count = to_pos - from_pos;
+        let len = (count * FLAT_UNDO_ENTRY_SIZE) as usize;
+        back_export(&mut u.export_undo, len)?;
+        back_export(&mut u.export_redo, len)?;
+        // An empty range reads no lane: a window without a redo lane exports
+        // it as empty, as the lane checks above let it.
+        let range = from_pos as usize..to_pos as usize;
+        let (undo, redo) = if range.is_empty() {
+            (&[][..], &[][..])
+        } else {
+            (
+                u.entries
+                    .get(range.clone())
+                    .ok_or(ErrorCode::InvalidState)?,
+                u.redo.get(range).ok_or(ErrorCode::InvalidState)?,
+            )
+        };
+        serialize_entries(&mut u.export_undo, undo.iter().copied().map(Some));
+        serialize_entries(&mut u.export_redo, redo.iter().copied());
         u.export_start = from_pos;
-        u.export_count = to_pos - from_pos;
+        u.export_count = count;
         u.export_overflow = u.overflow;
-        Ok(u.export_count)
+        Ok(count)
     }
 
-    /// The exported undo lane as serialized 24-byte entries (bindings expose
-    /// the raw pointer; core code returns owned bytes).
-    pub fn delta_export_undo_bytes(&self) -> Vec<u8> {
-        serialize_entries(
-            self.undo
-                .entries
-                .iter()
-                .skip(self.undo.export_start as usize)
-                .copied()
-                .map(Some),
-            self.undo.export_count,
-        )
+    /// The exported undo lane as serialized 24-byte entries.
+    pub fn delta_export_undo(&self) -> &[u8] {
+        &self.undo.export_undo
     }
 
-    /// The exported redo lane.
-    pub fn delta_export_redo_bytes(&self) -> Vec<u8> {
-        serialize_entries(
-            self.undo
-                .redo
-                .iter()
-                .skip(self.undo.export_start as usize)
-                .copied(),
-            self.undo.export_count,
-        )
+    /// The exported redo lane as serialized 24-byte entries.
+    pub fn delta_export_redo(&self) -> &[u8] {
+        &self.undo.export_redo
     }
 
     /// Return the byte length of the exported delta segment.
@@ -6078,17 +6101,32 @@ impl Vm {
     }
 }
 
-fn serialize_entries(entries: impl Iterator<Item = Option<FlatUndoEntry>>, count: u32) -> Vec<u8> {
-    let mut out = vec![0u8; (count * FLAT_UNDO_ENTRY_SIZE) as usize];
-    for (index, entry) in entries.take(count as usize).enumerate() {
-        if let Some(entry) = entry {
-            let mut encoded = [0u8; FLAT_UNDO_ENTRY_SIZE as usize];
-            entry.write_to(&mut encoded);
-            out[index * FLAT_UNDO_ENTRY_SIZE as usize..(index + 1) * FLAT_UNDO_ENTRY_SIZE as usize]
-                .copy_from_slice(&encoded);
-        }
+/// Back `len` bytes of an export lane without touching its contents: a
+/// refusal leaves the previous export whole.
+fn back_export(lane: &mut Vec<u8>, len: usize) -> Result<(), ErrorCode> {
+    match len.checked_sub(lane.len()) {
+        Some(more) if lane.capacity() < len => lane
+            .try_reserve_exact(more)
+            .map_err(|_| ErrorCode::OutOfMemory),
+        _ => Ok(()),
     }
-    out
+}
+
+/// Serialize `entries` into `lane`, whose storage is already backed; an
+/// absent redo record is written as zeroes.
+fn serialize_entries(lane: &mut Vec<u8>, entries: impl Iterator<Item = Option<FlatUndoEntry>>) {
+    lane.clear();
+    for entry in entries {
+        let mut encoded = [0u8; FLAT_UNDO_ENTRY_SIZE as usize];
+        if let Some(entry) = entry {
+            entry.write_to(&mut encoded);
+        }
+        debug_assert!(
+            lane.capacity() - lane.len() >= encoded.len(),
+            "export storage must be backed before serializing"
+        );
+        lane.extend_from_slice(&encoded);
+    }
 }
 
 fn parse_entry(segment: &[u8], i: usize) -> Result<FlatUndoEntry, ErrorCode> {

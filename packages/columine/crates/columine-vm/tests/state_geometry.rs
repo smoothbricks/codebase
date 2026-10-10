@@ -262,8 +262,8 @@ proptest::proptest! {
         let fork = after.clone();
         let end = vm.undo_checkpoint();
         proptest::prop_assert_eq!(vm.delta_export_segment(checkpoint, end), Ok(end - checkpoint));
-        let undo = vm.delta_export_undo_bytes();
-        let redo = vm.delta_export_redo_bytes();
+        let undo = vm.delta_export_undo().to_vec();
+        let redo = vm.delta_export_redo().to_vec();
         let entry = Vm::delta_export_entry_size();
         let logical = vm.undo_rollback(&mut state, checkpoint).expect("current-layout checkpoint");
         proptest::prop_assert_eq!(logical, state.len() as u32);

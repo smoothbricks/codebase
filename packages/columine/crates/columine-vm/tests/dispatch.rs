@@ -2577,8 +2577,8 @@ proptest! {
         let end = vm.undo_checkpoint();
         prop_assert_eq!(vm.delta_export_segment(0, end), Ok(end));
         prop_assert!(end > 0);
-        let undo_seg = vm.delta_export_undo_bytes();
-        let redo_seg = vm.delta_export_redo_bytes();
+        let undo_seg = vm.delta_export_undo().to_vec();
+        let redo_seg = vm.delta_export_redo().to_vec();
         let entry_size = Vm::delta_export_entry_size();
 
         // Roll the LIVE state back via the exported undo segment → the pre-batch image.
@@ -2656,8 +2656,8 @@ fn assert_full_image_roundtrip(vm: &mut Vm, before: &[u8], after: &[u8], checkpo
         Ok(end - checkpoint),
         vm.delta_export_segment(checkpoint, end)
     );
-    let undo = vm.delta_export_undo_bytes();
-    let redo = vm.delta_export_redo_bytes();
+    let undo = vm.delta_export_undo().to_vec();
+    let redo = vm.delta_export_redo().to_vec();
     let entry = Vm::delta_export_entry_size();
 
     let mut production = after.to_vec();
@@ -2775,14 +2775,14 @@ fn journal_overflow_refuses_prewrite_and_accepted_prefix_stays_exact() {
         vm.delta_export_overflow(),
         "the overflow diagnostic stays set on export"
     );
-    let window_undo = vm.delta_export_undo_bytes();
-    let window_redo = vm.delta_export_redo_bytes();
+    let window_undo = vm.delta_export_undo().to_vec();
+    let window_redo = vm.delta_export_redo().to_vec();
     assert_eq!(
         Ok(refused_checkpoint - midpoint_checkpoint),
         vm.delta_export_segment(midpoint_checkpoint, refused_checkpoint)
     );
-    let tail_undo = vm.delta_export_undo_bytes();
-    let tail_redo = vm.delta_export_redo_bytes();
+    let tail_undo = vm.delta_export_undo().to_vec();
+    let tail_redo = vm.delta_export_redo().to_vec();
 
     let mut replay = Vm::default();
     let mut at_midpoint = image_at_refusal.clone();
@@ -3131,8 +3131,8 @@ fn nested_savepoints_roll_back_innermost_first_to_exact_images() {
     // The middle window [checkpoints[1], checkpoints[2]) replays exactly from its export.
     let (from, to) = (checkpoints[1], checkpoints[2]);
     assert_eq!(Ok(to - from), vm.delta_export_segment(from, to));
-    let undo = vm.delta_export_undo_bytes();
-    let redo = vm.delta_export_redo_bytes();
+    let undo = vm.delta_export_undo().to_vec();
+    let redo = vm.delta_export_redo().to_vec();
     let entry = Vm::delta_export_entry_size();
     let mut replay = Vm::default();
     let mut middle = images[2].clone();
@@ -3394,7 +3394,10 @@ fn growth_reports_and_grows_a_slot_past_one_byte() {
 /// One exported delta window `[from, to)`: its undo and redo segments.
 fn export_window(vm: &mut Vm, from: u32, to: u32) -> (Vec<u8>, Vec<u8>) {
     assert_eq!(Ok(to - from), vm.delta_export_segment(from, to));
-    (vm.delta_export_undo_bytes(), vm.delta_export_redo_bytes())
+    (
+        vm.delta_export_undo().to_vec(),
+        vm.delta_export_redo().to_vec(),
+    )
 }
 
 /// Reverse, then forward, one exported window from its end image. Each step

@@ -86,8 +86,8 @@ fn assert_roundtrip(vm: &mut Vm, state: &mut [u8], before: &[u8], checkpoint: u3
             Ok(end - checkpoint),
             vm.delta_export_segment(checkpoint, end)
         );
-        let undo = vm.delta_export_undo_bytes();
-        let redo = vm.delta_export_redo_bytes();
+        let undo = vm.delta_export_undo().to_vec();
+        let redo = vm.delta_export_redo().to_vec();
         let mut replay = Vm::default();
         let mut undone = after.clone();
         replay
@@ -424,8 +424,8 @@ fn mixed_lane_ttl_window_refuses_full_export_and_keeps_the_previous_one() {
     let paired_end = vm.undo_checkpoint();
     assert!(paired_end > 0, "the TTL insert journals paired entries");
     assert_eq!(Ok(paired_end), vm.delta_export_segment(0, paired_end));
-    let previous_undo = vm.delta_export_undo_bytes();
-    let previous_redo = vm.delta_export_redo_bytes();
+    let previous_undo = vm.delta_export_undo().to_vec();
+    let previous_redo = vm.delta_export_redo().to_vec();
     let previous_len = vm.delta_export_len_bytes();
     let previous_overflow = vm.delta_export_overflow();
 
@@ -439,8 +439,8 @@ fn mixed_lane_ttl_window_refuses_full_export_and_keeps_the_previous_one() {
         Err(ErrorCode::DeltaLaneMismatch),
         vm.delta_export_segment(0, mixed_end)
     );
-    assert_eq!(previous_undo, vm.delta_export_undo_bytes());
-    assert_eq!(previous_redo, vm.delta_export_redo_bytes());
+    assert_eq!(previous_undo, vm.delta_export_undo().to_vec());
+    assert_eq!(previous_redo, vm.delta_export_redo().to_vec());
     assert_eq!(previous_len, vm.delta_export_len_bytes());
     assert_eq!(previous_overflow, vm.delta_export_overflow());
 
@@ -451,8 +451,8 @@ fn mixed_lane_ttl_window_refuses_full_export_and_keeps_the_previous_one() {
         "undo-only entries never advance the paired prefix"
     );
     assert_eq!(Ok(paired), vm.delta_export_segment(0, paired));
-    assert_eq!(previous_undo, vm.delta_export_undo_bytes());
-    assert_eq!(previous_redo, vm.delta_export_redo_bytes());
+    assert_eq!(previous_undo, vm.delta_export_undo().to_vec());
+    assert_eq!(previous_redo, vm.delta_export_redo().to_vec());
 
     vm.undo_rollback(&mut state, 0)
         .expect("the live journal still rolls back through the refusal");
@@ -609,7 +609,10 @@ fn capture_budget_refusal_never_runs_the_closure_or_changes_flags_image_or_journ
         let before = state.clone();
         let (undo, redo) = if delta {
             assert_eq!(Ok(checkpoint), vm.delta_export_segment(0, checkpoint));
-            (vm.delta_export_undo_bytes(), vm.delta_export_redo_bytes())
+            (
+                vm.delta_export_undo().to_vec(),
+                vm.delta_export_redo().to_vec(),
+            )
         } else {
             (Vec::new(), Vec::new())
         };
@@ -632,8 +635,8 @@ fn capture_budget_refusal_never_runs_the_closure_or_changes_flags_image_or_journ
         assert_eq!(vm.undo_checkpoint(), checkpoint);
         if delta {
             assert_eq!(Ok(checkpoint), vm.delta_export_segment(0, checkpoint));
-            assert_eq!(vm.delta_export_undo_bytes(), undo);
-            assert_eq!(vm.delta_export_redo_bytes(), redo);
+            assert_eq!(vm.delta_export_undo().to_vec(), undo);
+            assert_eq!(vm.delta_export_redo().to_vec(), redo);
         }
         vm.undo_rollback(&mut state, 0)
             .expect("real prefix still rolls back");
