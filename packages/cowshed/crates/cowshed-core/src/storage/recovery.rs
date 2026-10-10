@@ -589,6 +589,18 @@ impl LifecycleIntent {
             Self::Retire { .. } => "retire",
         }
     }
+
+    /// The detached metadata this intent carries for the workspace it rebuilds. A re-adoption's
+    /// main keeps its grants, port block included, here while its image sits retained or staged
+    /// outside the canonical inventory (04_sandbox.md, `portBlock`).
+    pub fn carried_metadata(&self) -> Option<&crate::metadata::DetachedWorkspaceMetadata> {
+        match self {
+            Self::ReAdopt { source, .. } => Some(&source.metadata),
+            Self::Adopt { .. } | Self::Create { .. } | Self::Fork { .. } | Self::Retire { .. } => {
+                None
+            }
+        }
+    }
 }
 
 /// The result needed to make an idempotent re-issue indistinguishable from the first call.
