@@ -4565,76 +4565,6 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         Ok(peers)
     }
 
-    /// An external land's retire (16_build_volumes.md, "Which volume a seed holds"): before
-    /// `current` is removed, each target it may have landed in outside `cowshed land` (the
-    /// workspace it was forked from, and main) whose `HEAD^{tree}` is the one `current` has
-    /// checked out, and whose seed and live volume were not built at that tree, takes `current`'s
-    /// build volume as its seed under its image lock. `current`'s supervisor has stopped.
-    async fn seed_targets_from_retiring(&mut self, current: &NativeWorkspace) -> Result<()> {
-        let workspace = current.derived.workspace.name().clone();
-        let checkout = self.workspace_mount_path(&workspace)?;
-        let Some(tree) = git_optional_ref_oid(&checkout, "HEAD^{tree}").await? else {
-            return Ok(());
-        };
-        let peer = super::build_volumes::Peer {
-            name: workspace.clone(),
-            checkout,
-            lock: self
-                .layout
-                .canonical_image(&workspace)
-                .map_err(native_integrity_error)?
-                .lock()
-                .to_owned(),
-        };
-        let mut targets = Vec::from([main_name()]);
-        if let Some(source) = current.metadata.info_snapshot.forked_from.clone()
-            && !targets.contains(&source)
-        {
-            targets.insert(0, source);
-        }
-        for target in targets {
-            let fact = match self.current(&target).await {
-                Ok(fact) => fact,
-                Err(error) if error.code == ErrorCode::NotFound => continue,
-                Err(error) => return Err(error),
-            };
-            if !matches!(
-                fact.derived.mount_state,
-                crate::storage::lifecycle::MountState::Mounted { .. }
-            ) {
-                continue;
-            }
-            let target_mount = self.workspace_mount_path(&target)?;
-            if git_revision_oid(&target_mount, "HEAD^{tree}").await? != tree {
-                continue;
-            }
-            let owner = super::build_volumes::Owner {
-                name: target.clone(),
-                incarnation: fact.derived.workspace.incarnation().clone(),
-            };
-            let aim = super::build_volumes::Aim {
-                tree: tree.clone(),
-                landed: vec![peer.clone()],
-            };
-            let lock_path = self
-                .layout
-                .canonical_image(&target)
-                .map_err(native_integrity_error)?
-                .lock()
-                .to_owned();
-            let volumes = self.build_volumes()?;
-            let refreshed = self
-                .substrate
-                .dispatch_with_image_lock(lock_path, move || {
-                    volumes.seed_from_landed_now(&owner, &target_mount, &aim)
-                })
-                .await
-                .map_err(native_storage_error)??;
-            super::build_volumes::say_refresh(&target, &workspace, &refreshed);
-        }
-        Ok(())
-    }
-
     /// Land step 7 (2b): each landed check re-run in the target on the adopted volume. Hits and
     /// misses come from the run summary stock Nx writes into the target's cache directory, and
     /// only from one attributed to the check itself (`nx::attribute`); each miss carries the
@@ -6201,17 +6131,6 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                 ),
                 None => None,
             };
-            // A workspace removed right after its branch was fast-forwarded into a target outside
-            // `cowshed land` is that land's only warm build volume: it seeds the target first
-            // (16_build_volumes.md, "Which volume a seed holds"). Warmth is not what removal
-            // promises, so a failure is said and the removal goes on.
-            if !workspace.is_main()
-                && let Err(error) = self.seed_targets_from_retiring(&current).await
-            {
-                eprintln!(
-                    "cowshed: {workspace}'s build volume seeds no target it may have landed in: {error}"
-                );
-            }
             self.finish_retirement(current).await?;
             // The workspace's build volume and seed retire with it, unless a target adopted the
             // volume (16_build_volumes.md, "Garbage collection"), and with them whatever else no
@@ -16980,8 +16899,8 @@ async fn seed_tree_findings(
                 recorded(age.tree.as_ref()),
                 recorded(age.seed.as_ref().and_then(|seed| seed.tree.as_ref())),
             ),
-            hint: "a plain Git fast-forward forfeits carry, output restoration and adoption; \
-                   the next fork attempts tree-matched seed capture without building"
+            hint: "a branch moved outside `cowshed land` may have skipped its capture and \
+                   adoption, or plain Git moved it; the next fork tries a matching seed"
                 .into(),
             path: Some(checkout.to_owned()),
         });
