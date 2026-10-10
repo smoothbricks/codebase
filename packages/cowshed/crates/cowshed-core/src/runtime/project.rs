@@ -3732,16 +3732,25 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                         }
                     }
                     LifecycleIntent::Fork { source, destination, rename: true } => {
-                        if self.discard_unmutated_clone_intent(&destination, None).await? {
-                            eprintln!(
-                                "cowshed: discarded the unfinished {verb} of {destination}: it ended before changing anything, so nothing is left to finish"
-                            );
-                        } else if retiring {
+                        if retiring {
                             eprintln!(
                                 "cowshed: leaving the unfinished {verb} of {destination} to the rm retiring it"
                             );
                         } else {
-                            self.rename(source, destination).await?;
+                            match self.current(&destination).await {
+                                // A published destination is the rename's own resume.
+                                Ok(_) => { self.rename(source, destination).await?; }
+                                Err(error) if error.code == ErrorCode::NotFound => {
+                                    if self.discard_unmutated_clone_intent(&destination, None).await? {
+                                        eprintln!(
+                                            "cowshed: discarded the unfinished {verb} of {destination}: it ended before changing anything, so nothing is left to finish"
+                                        );
+                                    } else {
+                                        self.rename(source, destination).await?;
+                                    }
+                                }
+                                Err(error) => return Err(error),
+                            }
                         }
                     }
                     LifecycleIntent::Fork {
@@ -5392,7 +5401,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         workspace: &WorkspaceName,
         initial: &NativeRemovalGitFence,
         force: bool,
-        purpose: RetirementPurpose,
+        purpose: RetirementPurpose<'_>,
     ) -> Result<(
         NativeWorkspace,
         NativeRemovalGitFence,
@@ -5408,8 +5417,8 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                 RetirementPurpose::Removal => {
                     removal_head_moved_refusal(workspace, &initial.head, &fence.head)
                 }
-                RetirementPurpose::Rename => {
-                    rename_head_moved_refusal(workspace, &initial.head, &fence.head)
+                RetirementPurpose::Rename { destination } => {
+                    rename_head_moved_refusal(workspace, destination, &initial.head, &fence.head)
                 }
             });
         }
@@ -5663,20 +5672,90 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         }
         self.validate_binding().await?;
         self.reload_lifecycle_intents().await?;
-        for (_, record) in self.lifecycle_intents.records() {
-            if record.completion.is_none()
-                && let crate::storage::recovery::LifecycleIntent::Fork {
+        let pending_renames = self
+            .lifecycle_intents
+            .records()
+            .filter_map(|(_, record)| match &record.operation {
+                crate::storage::recovery::LifecycleIntent::Fork {
                     source,
                     destination,
                     rename: true,
-                } = &record.operation
-                && *source == workspace
+                } if record.completion.is_none() && *source == workspace => {
+                    Some(destination.clone())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        for destination in pending_renames {
+            let cancel = format!(
+                "cancel the rename with cowshed rm {destination} --force, which keeps {workspace}; then retry"
+            );
+            if !self.claim_intent_lease(&destination)? {
+                return Err(CowshedError::conflict(
+                    format!("the rename into {destination} is running in another cowshed process"),
+                    cancel,
+                ));
+            }
+            // Re-read under the lease: the owner may have finished or advanced the record.
+            self.reload_lifecycle_intents().await?;
+            let still_pending = self
+                .lifecycle_intents
+                .get(&destination)
+                .is_some_and(|record| {
+                    record.completion.is_none()
+                        && matches!(
+                            &record.operation,
+                            crate::storage::recovery::LifecycleIntent::Fork {
+                                source,
+                                destination: record_destination,
+                                rename: true,
+                            } if *source == workspace && *record_destination == destination
+                        )
+                });
+            if !still_pending {
+                continue;
+            }
+            match self.current(&destination).await {
+                Ok(_) => {
+                    return Err(CowshedError::conflict(
+                        format!(
+                            "workspace {workspace} is the source of the unfinished rename into {destination}, which is already published"
+                        ),
+                        cancel,
+                    ));
+                }
+                Err(error) if error.code == ErrorCode::NotFound => {}
+                Err(error) => return Err(error),
+            }
+            let safe_prepared = self
+                .lifecycle_intents
+                .get(&destination)
+                .is_some_and(|record| {
+                    record.completion.is_none()
+                        && record.phase == crate::storage::recovery::LifecycleIntentPhase::Prepared
+                        && matches!(
+                            &record.operation,
+                            crate::storage::recovery::LifecycleIntent::Fork {
+                                source,
+                                rename: true,
+                                ..
+                            } if *source == workspace
+                        )
+                });
+            if safe_prepared
+                && self
+                    .discard_unmutated_clone_intent(&destination, None)
+                    .await?
             {
+                eprintln!(
+                    "cowshed: discarded the unfinished rename of {workspace} into {destination}: it ended before changing anything, so nothing is left to finish"
+                );
+            } else {
                 return Err(CowshedError::conflict(
                     format!(
-                        "workspace {workspace} is the source of the unfinished rename {source} -> {destination}"
+                        "workspace {workspace} is the source of the unfinished rename into {destination}, which may have changed it"
                     ),
-                    format!("finish the rename: cowshed mv {source} {destination}"),
+                    cancel,
                 ));
             }
         }
@@ -9119,13 +9198,16 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
     ) -> Result<WorkspaceSnapshot> {
         use super::supervisor::{CommitmentDraft, CommitmentSink};
         use crate::storage::lifecycle::LifecyclePlanner;
-        let rename = purpose == ClonePurpose::Rename;
+        let journal_rename = match purpose {
+            ClonePurpose::HistoricalFork => false,
+            ClonePurpose::Rename => true,
+        };
         self.validate_binding().await?;
         self.reload_lifecycle_intents().await?;
         let intent = crate::storage::recovery::LifecycleIntent::Fork {
             source: source.clone(),
             destination: destination.clone(),
-            rename,
+            rename: journal_rename,
         };
         if let Some(expected) = self.completed_workspace_intent(&intent).cloned() {
             let current = self.current(&destination).await?;
@@ -9138,7 +9220,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
             .get(&destination)
             .is_some_and(|record| record.operation == intent && record.completion.is_none());
         let existing = match self.current(&destination).await {
-            Ok(current) if rename && resuming => Some(current),
+            Ok(current) if matches!(purpose, ClonePurpose::Rename) && resuming => Some(current),
             Ok(_) => {
                 return Err(CowshedError::conflict(
                     format!("workspace {destination} already exists"),
@@ -9150,7 +9232,11 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         };
         let mut source_fact = match self.current(&source).await {
             Ok(current) => current,
-            Err(error) if error.code == ErrorCode::NotFound && rename && resuming => {
+            Err(error)
+                if error.code == ErrorCode::NotFound
+                    && matches!(purpose, ClonePurpose::Rename)
+                    && resuming =>
+            {
                 let current = existing.ok_or(error)?;
                 if current.metadata.info_snapshot.forked_from.as_ref() != Some(&source) {
                     return Err(CowshedError::integrity(
@@ -9181,17 +9267,20 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
             Err(error) => return Err(error),
         };
         require_mounted_source(&source, &source_fact)?;
-        let initial = if rename {
-            let fence = self.removal_git_fence(&source_fact).await?;
-            if let Some(operation) = fence.in_progress.as_deref() {
-                return Err(CowshedError::conflict(
-                    format!("workspace {source} has an in-progress {operation}"),
-                    format!("finish {operation}, then retry: cowshed mv {source} {destination}"),
-                ));
+        let initial = match purpose {
+            ClonePurpose::HistoricalFork => None,
+            ClonePurpose::Rename => {
+                let fence = self.removal_git_fence(&source_fact).await?;
+                if let Some(operation) = fence.in_progress.as_deref() {
+                    return Err(CowshedError::conflict(
+                        format!("workspace {source} has an in-progress {operation}"),
+                        format!(
+                            "finish {operation}, then retry: cowshed mv {source} {destination}"
+                        ),
+                    ));
+                }
+                Some(fence)
             }
-            Some(fence)
-        } else {
-            None
         };
         // A fork of a git-worktree workspace is one too, and has to be: the cloned image carries
         // a pointer file naming the *source's* registration, so the destination is re-registered
@@ -9204,10 +9293,14 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         // `Prepared` until just before the staged clone writes its `PendingFence` sidecar, so a
         // refusal before it (no port block left, say) withdraws the intent; see `resume_fork`.
         let superseded = self.begin_lifecycle_intent(intent).await?;
+        if existing.is_some() {
+            // A published destination is past its clone: its record must replay as `Mutating`.
+            self.mark_lifecycle_intent_mutating(&destination).await?;
+        }
         let outcome = async {
             let (_stopped, rename_head) = if let Some(initial) = initial.as_ref() {
                 let (current, fence, stopped) = self
-                    .revalidated_removal_fence(&source, initial, false, RetirementPurpose::Rename)
+                    .revalidated_removal_fence(&source, initial, false, RetirementPurpose::Rename { destination: &destination })
                     .await?;
                 if let Some(operation) = fence.in_progress.as_deref() {
                     return Err(CowshedError::conflict(
@@ -9218,40 +9311,38 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                     ));
                 }
                 source_fact = current;
-                let work = crate::git::GitRepository::from_root(
+                let source_git = crate::git::GitRepository::from_root(
                     &self.workspace_mount_path(&source)?,
-                )
-                .rename_work_state(source_is_git_worktree)
-                .await?;
-                (Some(stopped), Some((fence.head, work)))
+                );
+                // The source's planned restored links, read once after the fence and used by every
+                // digest of this rename: only those exact links may differ, nothing else.
+                let restored_links = source_git.rename_link_paths().await?;
+                let work = source_git
+                    .rename_work_state(source_is_git_worktree, &restored_links)
+                    .await?;
+                (Some(stopped), Some((fence.head, work, restored_links)))
             } else {
                 (None, None)
             };
-            let destination_incarnation = if let Some(current) = existing {
+            let (destination_incarnation, captured_source) = if let Some(current) = existing {
                 if current.metadata.info_snapshot.forked_from.as_ref() != Some(&source) {
                     return Err(CowshedError::integrity(
                         "rename destination does not record its source",
                         "cowshed doctor --json",
                     ));
                 }
-                let source_incarnation = self.clone_source_incarnation(&current).await?;
-                self.commitments
-                    .record(CommitmentDraft::Fork {
-                        repo_id: self.descriptor.repo_id.clone(),
-                        source_incarnation,
-                        destination_incarnation: current.derived.workspace.incarnation().clone(),
-                    })
-                    .await?;
-                current.derived.workspace.incarnation().clone()
+                let captured_source = self.clone_source_incarnation(&current).await?;
+                (current.derived.workspace.incarnation().clone(), captured_source)
             } else {
                 let (grants, reservation) = self.destination_grants(&destination, resuming).await?;
                 let source_mount = self.workspace_mount_path(&source)?;
-                let branch = if rename {
-                    crate::git::GitRepository::from_root(&source_mount)
-                        .current_branch()
-                        .await?
-                } else {
-                    Some(format!("cowshed/{destination}"))
+                let branch = match purpose {
+                    ClonePurpose::HistoricalFork => Some(format!("cowshed/{destination}")),
+                    ClonePurpose::Rename => {
+                        crate::git::GitRepository::from_root(&source_mount)
+                            .current_branch()
+                            .await?
+                    }
                 };
                 let identity = self
                     .operation_identity(
@@ -9329,27 +9420,30 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                                 crate::git::GitRepository::from_root(&stage.mount_point);
                             repository.restore_inherited_links(&source_mount).await?;
                             if source_is_git_worktree {
-                                if rename {
-                                    repository
-                                        .preserve_linked_worktree_for_rename(
-                                            source_name_for_callback.as_str(),
-                                            forked.as_str(),
-                                            &source_mount,
-                                            &main_mount,
-                                            stage.resuming,
-                                        )
-                                        .await?;
-                                } else {
-                                    repository
-                                        .adopt_as_linked_worktree_resumable(
-                                            forked.as_str(),
-                                            &main_mount,
-                                            None,
-                                            None,
-                                            false,
-                                            stage.resuming,
-                                        )
-                                        .await?;
+                                match purpose {
+                                    ClonePurpose::Rename => {
+                                        repository
+                                            .preserve_linked_worktree_for_rename(
+                                                source_name_for_callback.as_str(),
+                                                forked.as_str(),
+                                                &source_mount,
+                                                &main_mount,
+                                                stage.resuming,
+                                            )
+                                            .await?;
+                                    }
+                                    ClonePurpose::HistoricalFork => {
+                                        repository
+                                            .adopt_as_linked_worktree_resumable(
+                                                forked.as_str(),
+                                                &main_mount,
+                                                None,
+                                                None,
+                                                false,
+                                                stage.resuming,
+                                            )
+                                            .await?;
+                                    }
                                 }
                             }
                             Ok::<_, CowshedError>(())
@@ -9360,16 +9454,21 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                 // Published, the image owns its block; see `resume_fork`.
                 drop(reservation);
                 self.mark_lifecycle_fence_complete(&destination).await;
-                self.commitments
-                    .record(CommitmentDraft::Fork {
-                        repo_id: self.descriptor.repo_id.clone(),
-                        source_incarnation: source_fact.derived.workspace.incarnation().clone(),
-                        destination_incarnation: receipt.workspace.incarnation().clone(),
-                    })
-                    .await?;
-                receipt.workspace.incarnation().clone()
+                match purpose {
+                    ClonePurpose::HistoricalFork => {
+                        self.commitments
+                            .record(CommitmentDraft::Fork {
+                                repo_id: self.descriptor.repo_id.clone(),
+                                source_incarnation: source_fact.derived.workspace.incarnation().clone(),
+                                destination_incarnation: receipt.workspace.incarnation().clone(),
+                            })
+                            .await?;
+                    }
+                    ClonePurpose::Rename => {}
+                }
+                (receipt.workspace.incarnation().clone(), source_fact.derived.workspace.incarnation().clone())
             };
-            if let Some((head, fenced_work)) = rename_head {
+            if let Some((head, fenced_work, restored_links)) = rename_head {
                 let current = self.current(&source).await?;
                 Self::require_exact_incarnation(
                     &current,
@@ -9377,7 +9476,10 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                 )?;
                 let fence = self.removal_git_fence(&current).await?;
                 if fence.head != head {
-                    return Err(rename_head_moved_refusal(&source, &head, &fence.head));
+                    return Err(CowshedError::conflict(
+                        format!("workspace {source} HEAD changed from {head} to {} after {destination} was published", fence.head),
+                        format!("cancel the rename with cowshed rm {destination} --force, which keeps {source}; a commit no branch holds may still need --abandon"),
+                    ));
                 }
                 if let Some(operation) = fence.in_progress.as_deref() {
                     return Err(CowshedError::conflict(
@@ -9392,13 +9494,13 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                 );
                 let destination_head = destination_git.head_oid().await?;
                 let destination_work = destination_git
-                    .rename_work_state(source_is_git_worktree)
+                    .rename_work_state(source_is_git_worktree, &restored_links)
                     .await?;
                 let source_git = crate::git::GitRepository::from_root(
                     &self.workspace_mount_path(&source)?,
                 );
                 let fresh_work = source_git
-                    .rename_work_state(source_is_git_worktree)
+                    .rename_work_state(source_is_git_worktree, &restored_links)
                     .await?;
                 if destination_head != head
                     || destination_work != fenced_work
@@ -9407,10 +9509,17 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                     return Err(CowshedError::conflict(
                         format!("the source {source} was not retired: {destination} does not yet hold its HEAD and work"),
                         format!(
-                            "inspect both workspaces; the source was not retired; cowshed mv {source} {destination} only after preservation matches"
+                            "inspect both workspaces; the source was not retired; cowshed mv {source} {destination} only after preservation matches, or cancel with cowshed rm {destination} --force, which keeps the source (a commit no branch holds may still need --abandon)"
                         ),
                     ));
                 }
+                self.commitments
+                    .record(CommitmentDraft::Fork {
+                        repo_id: self.descriptor.repo_id.clone(),
+                        source_incarnation: captured_source.clone(),
+                        destination_incarnation: destination_incarnation.clone(),
+                    })
+                    .await?;
                 self.finish_retirement(current).await?;
             }
             self.complete_lifecycle_intent(
@@ -13265,6 +13374,23 @@ mod removal_refusal_tests {
         }
     }
 
+    /// A head that moves before the clone is published names only the retry of the same rename:
+    /// no destination is published yet, so there is nothing to cancel.
+    #[test]
+    fn a_preclone_rename_head_move_names_only_the_actual_retry() {
+        let destination = WorkspaceName::new("renamed").expect("fixed destination name");
+        let error = rename_head_moved_refusal(&workspace(), &destination, &oid('1'), &oid('2'));
+        assert_eq!(error.code.as_str(), "conflict", "{}", error.message);
+        assert!(
+            error.hint.contains("cowshed mv raven renamed"),
+            "the hint names the actual retry, got {}",
+            error.hint
+        );
+        assert!(!error.hint.contains("<destination>"), "{}", error.hint);
+        assert!(!error.hint.contains("retry removal"), "{}", error.hint);
+        assert!(!error.hint.contains("cowshed rm"), "{}", error.hint);
+    }
+
     /// The refusal has to be actionable on its own: it names the head that is at risk, how much of
     /// it is unheld, the branch that does not hold it, and where that branch stands.
     #[test]
@@ -16233,10 +16359,17 @@ fn removal_head_moved_refusal(
 }
 
 #[cfg(target_os = "macos")]
-fn rename_head_moved_refusal(source: &WorkspaceName, from: &GitOid, to: &GitOid) -> CowshedError {
+fn rename_head_moved_refusal(
+    source: &WorkspaceName,
+    destination: &WorkspaceName,
+    from: &GitOid,
+    to: &GitOid,
+) -> CowshedError {
     CowshedError::conflict(
-        format!("workspace {source} HEAD changed from {from} to {to} during rename"),
-        format!("review the new HEAD, then retry: cowshed mv {source} <destination>"),
+        format!(
+            "workspace {source} HEAD changed from {from} to {to} during rename into {destination}"
+        ),
+        format!("review the new HEAD, then retry: cowshed mv {source} {destination}"),
     )
 }
 
@@ -16244,9 +16377,9 @@ fn rename_head_moved_refusal(source: &WorkspaceName, from: &GitOid, to: &GitOid)
 /// the move; every other check of the fence is the same for both.
 #[cfg(target_os = "macos")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RetirementPurpose {
+enum RetirementPurpose<'a> {
     Removal,
-    Rename,
+    Rename { destination: &'a WorkspaceName },
 }
 
 /// Removing main without `--restore` throws the project's warm image away for good, so the gate

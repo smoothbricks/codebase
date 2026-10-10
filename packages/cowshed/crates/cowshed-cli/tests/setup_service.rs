@@ -1909,7 +1909,7 @@ async fn setup_mount_root_refuses_while_workspaces_are_attached() {
 
 /// Git identity at a workspace depends on the host's git configuration and the mount root, not on
 /// the workspace, so setup — which configures the root — is where each adopted checkout is probed
-/// (`new` never is). Every gap names its project and the pattern that would cover the root; a
+/// (`fork` never is). Every gap names its project and the pattern that would cover the root; a
 /// checkout that could not be probed says so instead of passing for one without gaps.
 #[tokio::test]
 async fn setup_names_every_checkout_config_file_a_workspace_would_not_inherit() {

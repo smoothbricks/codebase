@@ -882,7 +882,7 @@ async fn directory_plain_git_repository_adopts_clones_executes_and_lands_without
     for directory in [&fixture.checkout, &topic.mount] {
         assert!(
             !directory.join(".envrc").exists(),
-            "adopt/new/exec/land never creates a shell hook"
+            "adopt/fork/exec/land never creates a shell hook"
         );
         assert!(!directory.join(".envrc-local").exists());
         assert!(!directory.join(".gitignore").exists());
@@ -2043,7 +2043,8 @@ async fn nx_statuses(
 /// volume, is behind; doctor says so, `cowshed reseed main` refreezes it, and a fork hits
 /// main's run. A fork that reseeds its source on its own is
 /// [`directory_a_fork_of_a_workspace_reseeds_it_and_hits_its_latest_run_substrate_lifecycle`]:
-/// `new` and `fork` reseed through the same fork path.
+/// `fork` reseeds through the one fork path, so a second fork of main here would only pay two more
+/// attaches for it.
 #[tokio::test]
 async fn directory_what_main_runs_after_a_land_reaches_its_seed_and_a_fork_hits_it_substrate_lifecycle()
  {
@@ -2176,7 +2177,7 @@ async fn directory_what_main_runs_after_a_land_reaches_its_seed_and_a_fork_hits_
     fixture.stop_gateway().await;
 }
 
-/// `cowshed fork` reseeds its source as `new` does (16_build_volumes.md, "Fork"): `w1` runs on
+/// `cowshed fork` reseeds its source as `fork` does (16_build_volumes.md, "Fork"): `w1` runs on
 /// its own volume after its seed was frozen at its creation, and a fork of `w1` hits that run
 /// instead of cloning the older seed and running everything again.
 /// Before either fork, doctor diagnoses main's displaced workspace-data link and an exec restores
@@ -4724,4 +4725,159 @@ async fn prove_published_build_loss(fixture: &mut Fixture) {
         "the replacement's seed is captured under the source build claim"
     );
     resumed.shutdown().await.expect("stop the resumed runtime");
+}
+
+/// A rename whose source is edited after the destination's canonical clone is published. The
+/// observer waits for the canonical sidecar to turn `Active` (the publication the rename's
+/// preservation guard starts after), then writes the source. The rename must refuse with the
+/// `rm <destination> --force` cancel, keep both images, and keep the edits it raced.
+#[tokio::test]
+async fn real_apfs_rename_keeps_edits_written_after_clone_publication() {
+    let mut fixture = Fixture::new();
+    let mut service = fixture.open().await;
+    adopt(&fixture, &mut service).await;
+    fixture.start_gateway().await;
+    service
+        .reconcile_gateway()
+        .await
+        .expect("install main gateway session");
+    let (created, _, stderr) = run(&mut service, ["fork", "a"]).await;
+    assert_eq!(
+        created.unwrap_or_else(|error| panic!(
+            "create a: {error}; {}",
+            String::from_utf8_lossy(&stderr)
+        )),
+        0
+    );
+    let a_mount = service.path("a", false).await.expect("mounted a").mount;
+    fs::write(a_mount.join("tracked.txt"), b"one\n").expect("tracked file");
+    git(&a_mount, &["add", "tracked.txt"]);
+    git(&a_mount, &["commit", "-qm", "tracked"]);
+    fs::write(a_mount.join("tracked.txt"), b"two\n").expect("tracked edit");
+    fs::write(a_mount.join("u"), b"u1\n").expect("untracked file");
+
+    let layout = cowshed_core::storage::StorageLayout::new(
+        fixture.storage.store(),
+        &RepoId::parse("fixture/dispatch").expect("repository identity"),
+    )
+    .expect("project layout");
+    let name_a = WorkspaceName::new("a").expect("workspace name");
+    let name_b = WorkspaceName::new("b").expect("workspace name");
+    let image_a = layout.canonical_image(&name_a).expect("source image path");
+    let image_b = layout
+        .canonical_image(&name_b)
+        .expect("destination image path");
+    let sidecar_b = image_b.sidecar().to_path_buf();
+    let image_b_path = image_b.image().to_path_buf();
+    let image_a_path = image_a.image().to_path_buf();
+
+    let observer = tokio::task::spawn_blocking({
+        let tracked = a_mount.join("tracked.txt");
+        let untracked = a_mount.join("u");
+        move || -> Instant {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            loop {
+                assert!(
+                    Instant::now() < deadline,
+                    "the destination's canonical clone never published"
+                );
+                match cowshed_core::metadata::read_json::<
+                    cowshed_core::metadata::DetachedWorkspaceMetadata,
+                >(&sidecar_b)
+                {
+                    Ok(metadata)
+                        if metadata.publication_state
+                            == cowshed_core::metadata::PublicationState::Active =>
+                    {
+                        break;
+                    }
+                    Ok(_) => std::thread::sleep(Duration::from_millis(1)),
+                    Err(cowshed_core::metadata::MetadataError::Io { source, .. })
+                        if source.kind() == std::io::ErrorKind::NotFound =>
+                    {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) => panic!("read the destination sidecar: {error}"),
+                }
+            }
+            fs::write(&tracked, b"five\n").expect("edit tracked after publication");
+            fs::write(&untracked, b"u2\n").expect("edit untracked after publication");
+            Instant::now()
+        }
+    });
+
+    let (result, _, _) = run(&mut service, ["mv", "a", "b"]).await;
+    let finished = Instant::now();
+    let written = observer.await.expect("publication observer");
+    assert!(
+        written <= finished,
+        "the source edits must race the live rename, not follow it"
+    );
+    let error = result.expect_err("a rename whose source changed after clone must refuse");
+    assert_eq!(error.code.as_str(), "conflict", "{}", error.message);
+    assert!(error.hint.contains("rm b --force"), "{}", error.hint);
+
+    assert_eq!(
+        fs::read(a_mount.join("tracked.txt")).expect("source tracked"),
+        b"five\n"
+    );
+    assert_eq!(
+        fs::read(a_mount.join("u")).expect("source untracked"),
+        b"u2\n"
+    );
+    assert!(
+        image_a_path.exists(),
+        "the source image survives the refusal"
+    );
+    assert!(
+        image_b_path.exists(),
+        "the destination image survives the refusal"
+    );
+
+    let b_mount = layout
+        .workspace_mount(&name_b)
+        .expect("destination mount path");
+    assert_eq!(
+        fs::read(b_mount.join("tracked.txt")).expect("destination tracked"),
+        b"two\n",
+        "the destination keeps the bytes captured at its clone, not the post-publication edit"
+    );
+    assert_eq!(
+        fs::read(b_mount.join("u")).expect("destination untracked"),
+        b"u1\n",
+        "the destination keeps the untracked bytes captured at its clone"
+    );
+
+    let journal = cowshed_core::storage::recovery::LifecycleIntentJournal::load(
+        &layout
+            .project()
+            .project_root
+            .join(cowshed_core::storage::recovery::LIFECYCLE_INTENTS_FILE),
+    )
+    .expect("lifecycle intent journal");
+    let record = journal
+        .get(&name_b)
+        .expect("the unfinished rename stays journaled under its destination");
+    assert!(
+        record.completion.is_none(),
+        "the rename must stay unfinished"
+    );
+    assert!(
+        matches!(
+            &record.operation,
+            cowshed_core::storage::recovery::LifecycleIntent::Fork {
+                source,
+                destination,
+                rename: true,
+            } if *source == name_a && *destination == name_b
+        ),
+        "the journaled operation must be the rename of a into b"
+    );
+    assert_eq!(
+        record.phase,
+        cowshed_core::storage::recovery::LifecycleIntentPhase::Mutating
+    );
+
+    service.shutdown().await.expect("stop the dispatch service");
+    fixture.stop_gateway().await;
 }

@@ -837,16 +837,22 @@ mod parity_tests {
     /// seam it is named after.
     #[test]
     fn no_two_verbs_claim_one_operation() {
-        let mut claimed: Vec<&str> = SAMPLES
+        let pairs: BTreeSet<(&str, &str)> = SAMPLES
             .iter()
-            .filter_map(|(_, operations)| *operations)
-            .flatten()
-            .copied()
+            .filter_map(|(argv, operations)| Some((argv, (*operations)?)))
+            .flat_map(|(argv, operations)| {
+                operations
+                    .iter()
+                    .map(move |operation| (argv[0], *operation))
+            })
             .collect();
-        let distinct: BTreeSet<&str> = claimed.iter().copied().collect();
-        claimed.sort_unstable();
+        let operations: BTreeSet<&str> = pairs.iter().map(|(_, operation)| *operation).collect();
 
-        assert_eq!(claimed.len(), distinct.len(), "duplicate operation claim");
+        assert_eq!(
+            operations.len(),
+            pairs.len(),
+            "two different verbs claim one operation; repeated samples of one verb may name it"
+        );
     }
 }
 

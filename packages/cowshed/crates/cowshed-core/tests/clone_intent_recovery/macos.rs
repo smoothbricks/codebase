@@ -844,10 +844,27 @@ async fn a_prepared_rename_is_discarded_by_its_source_and_creates_nothing() {
     opened.shutdown().await.expect("stop the opened runtime");
 }
 
-/// Removing the source of a prepared rename must not retire the source while the rename's
-/// claim stands, and must not create the destination.
+/// Journals a rename `a -> b` for `b`, `Prepared` or, with `mutating`, past its clone's mark.
+fn journal_rename(fixture: &Fixture, mutating: bool) {
+    LifecycleIntentJournal::update(&fixture.journal_path(), |journal| {
+        journal.begin(LifecycleIntent::Fork {
+            source: name("a"),
+            destination: name("b"),
+            rename: true,
+        });
+        if mutating {
+            journal.mark_mutating(&name("b"))
+        } else {
+            Ok(())
+        }
+    })
+    .expect("journal the rename");
+}
+
+/// A prepared rename that never changed anything is discarded by removing its source, which
+/// then retires like any other workspace, and no destination is ever created.
 #[tokio::test]
-async fn removing_the_source_of_a_prepared_rename_refuses_and_keeps_both_intent_and_image() {
+async fn removes_source_after_discarding_unpublished_prepared_rename() {
     let fixture = Fixture::new("ren-rm");
     let runtime = fixture.adopt().await;
     fixture
@@ -855,46 +872,87 @@ async fn removing_the_source_of_a_prepared_rename_refuses_and_keeps_both_intent_
         .await
         .expect("mint a");
     runtime.shutdown().await.expect("stop the runtime");
-    LifecycleIntentJournal::update(&fixture.journal_path(), |journal| {
-        journal.begin(LifecycleIntent::Fork {
-            source: name("a"),
-            destination: name("b"),
-            rename: true,
-        });
-        Ok(())
-    })
-    .expect("journal the prepared rename");
+    journal_rename(&fixture, false);
 
-    match fixture.open_removing("a").await {
-        Err(error) => assert_eq!(error.code.as_str(), "conflict", "{}", error.message),
-        Ok(rm) => {
-            refused_by_conflict(fixture.remove(&rm, "a").await);
-            rm.shutdown().await.expect("stop the removing runtime");
-        }
-    }
-    assert!(
-        fixture
-            .intent("b")
-            .is_some_and(|record| record.completion.is_none()),
-        "the pending rename stays journaled"
+    let rm = fixture
+        .open_removing("a")
+        .await
+        .expect("rm a opens and discards the prepared rename");
+    fixture
+        .remove(&rm, "a")
+        .await
+        .expect("rm a removes the source");
+    assert_eq!(
+        fixture.intent("b"),
+        None,
+        "the prepared rename is discarded"
     );
+    assert_eq!(fixture.listed(&rm).await, ["main"]);
+    let layout = fixture.layout();
     assert!(
-        fixture
-            .layout()
+        !layout
             .canonical_image(&name("a"))
             .expect("source image path")
             .image()
-            .exists(),
-        "the source image is kept"
+            .exists()
     );
     assert!(
-        !fixture
-            .layout()
+        !layout
             .canonical_image(&name("b"))
             .expect("destination image path")
             .image()
-            .exists(),
-        "no destination is created"
+            .exists()
+    );
+    rm.shutdown().await.expect("stop the removing runtime");
+}
+
+/// A rename past its clone's mark is owned by its claim: removing its source is refused by name,
+/// keeps the source image and the unfinished intent, and creates no destination.
+#[tokio::test]
+async fn removing_source_of_mutating_rename_refuses_and_keeps_claim() {
+    let fixture = Fixture::new("ren-mut");
+    let runtime = fixture.adopt().await;
+    fixture
+        .mint(&runtime, "a", ForkOptions::default())
+        .await
+        .expect("mint a");
+    runtime.shutdown().await.expect("stop the runtime");
+    journal_rename(&fixture, true);
+
+    let refusal = match fixture.open_removing("a").await {
+        Err(error) => error,
+        Ok(rm) => {
+            let error = fixture
+                .remove(&rm, "a")
+                .await
+                .expect_err("rm a must refuse the mutating rename's source");
+            rm.shutdown().await.expect("stop the removing runtime");
+            error
+        }
+    };
+    assert_eq!(refusal.code.as_str(), "conflict", "{}", refusal.message);
+    assert!(
+        refusal.hint.contains("rm b --force"),
+        "the refusal names the cancellation, got {}",
+        refusal.hint
+    );
+    let record = fixture.intent("b").expect("the rename stays journaled");
+    assert_eq!(record.phase, LifecycleIntentPhase::Mutating);
+    assert_eq!(record.completion, None);
+    let layout = fixture.layout();
+    assert!(
+        layout
+            .canonical_image(&name("a"))
+            .expect("source image path")
+            .image()
+            .exists()
+    );
+    assert!(
+        !layout
+            .canonical_image(&name("b"))
+            .expect("destination image path")
+            .image()
+            .exists()
     );
 }
 
@@ -903,9 +961,75 @@ fn incarnation_of(view: &Value) -> WorkspaceIncarnation {
         .expect("workspace incarnation")
 }
 
-/// Fork commitments recorded for `destination` across every sealed telemetry segment, read the
-/// way the audit sink's own tests read them.
+/// A historical create journaled over a published workspace completes as a workspace
+/// introduction, never as a fork: the replay appends one introduced commitment for the
+/// destination and no fork commitment for it.
+#[tokio::test]
+async fn a_historical_create_completion_records_introduction_not_fork() {
+    let fixture = Fixture::new("hist-create");
+    let runtime = fixture.adopt().await;
+    fixture
+        .mint(&runtime, "a", ForkOptions::default())
+        .await
+        .expect("mint a");
+    let forked = fixture
+        .fork(&runtime, "main", "b")
+        .await
+        .expect("fork b published");
+    let destination = incarnation_of(&forked);
+    runtime.shutdown().await.expect("stop the runtime");
+    let forks_before = fork_commitments(&fixture, &destination);
+    let introduced_before = introduced_commitments(&fixture, &destination);
+
+    LifecycleIntentJournal::update(&fixture.journal_path(), |journal| {
+        journal.begin(LifecycleIntent::Create {
+            workspace: name("b"),
+            options: cowshed_core::storage::recovery::MintOptions::default(),
+        });
+        journal.mark_mutating(&name("b"))
+    })
+    .expect("journal the historical create over the published b");
+
+    let reopened = fixture
+        .open_naming("b")
+        .await
+        .expect("the historical create completes");
+    assert!(completed(fixture.intent("b")));
+    assert_eq!(
+        introduced_commitments(&fixture, &destination),
+        introduced_before + 1,
+        "the completion records one workspace introduction"
+    );
+    assert_eq!(
+        fork_commitments(&fixture, &destination),
+        forks_before,
+        "a historical create appends no fork commitment for b"
+    );
+    reopened
+        .shutdown()
+        .await
+        .expect("stop the completing runtime");
+}
+
+/// Fork commitments recorded for `destination` across every sealed telemetry segment.
 fn fork_commitments(fixture: &Fixture, destination: &WorkspaceIncarnation) -> usize {
+    commitments_counted(
+        fixture,
+        |commitment| matches!(commitment, ControllerCommitment::Fork(fork) if fork.destination_incarnation == *destination),
+    )
+}
+
+/// Workspace-introduced commitments recorded for `incarnation`.
+fn introduced_commitments(fixture: &Fixture, incarnation: &WorkspaceIncarnation) -> usize {
+    commitments_counted(
+        fixture,
+        |commitment| matches!(commitment, ControllerCommitment::WorkspaceIntroduced(introduced) if introduced.workspace_incarnation == *incarnation),
+    )
+}
+
+/// Every sealed commitment telemetry segment's commitments that `counts` accepts, read the way
+/// the audit sink's own tests read them.
+fn commitments_counted(fixture: &Fixture, counts: impl Fn(&ControllerCommitment) -> bool) -> usize {
     let Ok(dates) = fs::read_dir(fixture.storage.telemetry()) else {
         return 0;
     };
@@ -930,13 +1054,7 @@ fn fork_commitments(fixture: &Fixture, destination: &WorkspaceIncarnation) -> us
                 count += decode_controller_commitments(&batch)
                     .expect("decode commitments")
                     .iter()
-                    .filter(|commitment| {
-                        matches!(
-                            commitment,
-                            ControllerCommitment::Fork(fork)
-                                if fork.destination_incarnation == *destination
-                        )
-                    })
+                    .filter(|commitment| counts(commitment))
                     .count();
             }
         }
@@ -954,10 +1072,7 @@ async fn a_replayed_rename_with_a_live_source_appends_its_fork_commitment() {
         .mint(&runtime, "a", ForkOptions::default())
         .await
         .expect("mint a");
-    let forked = fixture
-        .fork(&runtime, "a", "b")
-        .await
-        .expect("fork a to b at H1");
+    let forked = capture_rename(&fixture, &runtime).await;
     let destination = incarnation_of(&forked);
     let before = fork_commitments(&fixture, &destination);
     runtime.shutdown().await.expect("stop the runtime");
@@ -996,10 +1111,7 @@ async fn a_replayed_rename_with_a_retired_source_appends_its_fork_commitment() {
         .mint(&runtime, "a", ForkOptions::default())
         .await
         .expect("mint a");
-    let forked = fixture
-        .fork(&runtime, "a", "b")
-        .await
-        .expect("fork a to b at H1");
+    let forked = capture_rename(&fixture, &runtime).await;
     let destination = incarnation_of(&forked);
     let before = fork_commitments(&fixture, &destination);
     fixture
@@ -1277,4 +1389,179 @@ async fn a_dirty_native_rename_preserves_branch_index_and_warm_state() {
         }
         runtime.shutdown().await.expect("stop the runtime");
     }
+}
+
+/// `git status --porcelain` in `directory`: the codes and paths, not the bytes.
+fn porcelain(directory: &Path) -> String {
+    let output = Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(directory)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .output_locked()
+        .expect("git process");
+    assert!(output.status.success(), "git status --porcelain");
+    String::from_utf8(output.stdout).expect("status is UTF-8")
+}
+
+/// Captures the rename's clone of `a` as `b`, then switches `b` onto `cowshed/a`, the branch the
+/// clone carries from its source. This is the raw rename's original-branch shape: the source
+/// repository is left alone, and nothing is forced.
+async fn capture_rename(fixture: &Fixture, runtime: &ProjectRuntime) -> Value {
+    let forked = fixture
+        .fork(runtime, "a", "b")
+        .await
+        .expect("fork a to b at the captured state");
+    let b_mount = PathBuf::from(forked["info"]["mount"].as_str().expect("b mount"));
+    git(&b_mount, &["switch", "cowshed/a"]);
+    forked
+}
+
+/// A prepared rename whose destination is already published must resume: nothing is discarded,
+/// and the source is retired by the completing replay.
+#[tokio::test]
+async fn a_prepared_rename_with_a_published_destination_resumes_without_discard() {
+    let fixture = Fixture::new("b-pub");
+    let runtime = fixture.adopt().await;
+    fixture
+        .mint(&runtime, "a", ForkOptions::default())
+        .await
+        .expect("mint a");
+    let _b_mount = capture_rename(&fixture, &runtime).await;
+    runtime.shutdown().await.expect("stop the runtime");
+
+    LifecycleIntentJournal::update(&fixture.journal_path(), |journal| {
+        journal.begin(LifecycleIntent::Fork {
+            source: name("a"),
+            destination: name("b"),
+            rename: true,
+        });
+        Ok(())
+    })
+    .expect("journal the prepared rename over a published destination");
+
+    let opened = fixture
+        .open_naming("a")
+        .await
+        .expect("the prepared rename resumes");
+    assert!(completed(fixture.intent("b")), "the rename completes");
+    assert_eq!(fixture.listed(&opened).await, ["b", "main"]);
+    opened.shutdown().await.expect("stop the resuming runtime");
+}
+
+/// A captured rename whose source is then edited must refuse, and keep the source's later bytes:
+/// tracked and untracked content changed after capture, with the same HEAD and the same status.
+#[tokio::test]
+async fn a_captured_rename_keeps_later_dirty_and_untracked_bytes() {
+    let fixture = Fixture::new("b-dirty");
+    let runtime = fixture.adopt().await;
+    let minted = fixture
+        .mint(&runtime, "a", ForkOptions::default())
+        .await
+        .expect("mint a");
+    let a_mount = PathBuf::from(minted["info"]["mount"].as_str().expect("a mount"));
+    fs::write(a_mount.join("tracked"), b"two\n").expect("dirty tracked file");
+    fs::write(a_mount.join("u1"), b"u1\n").expect("untracked file");
+    let captured = capture_rename(&fixture, &runtime).await;
+    let captured_status = porcelain(&a_mount);
+    let captured_head = head(&a_mount);
+    runtime.shutdown().await.expect("stop the runtime");
+    let before = fork_commitments(&fixture, &incarnation_of(&captured));
+
+    fs::write(a_mount.join("tracked"), b"five\n").expect("rewrite tracked after capture");
+    fs::write(a_mount.join("u1"), b"u2\n").expect("rewrite untracked after capture");
+    assert_eq!(head(&a_mount), captured_head);
+    assert_eq!(porcelain(&a_mount), captured_status, "same codes and paths");
+
+    LifecycleIntentJournal::update(&fixture.journal_path(), |journal| {
+        journal.begin(LifecycleIntent::Fork {
+            source: name("a"),
+            destination: name("b"),
+            rename: true,
+        });
+        journal.mark_mutating(&name("b"))
+    })
+    .expect("journal the mutating rename");
+
+    refused_by_conflict(fixture.open_naming("a").await);
+    refused_by_conflict(fixture.open_naming("a").await);
+    assert_eq!(
+        fork_commitments(&fixture, &incarnation_of(&captured)),
+        before,
+        "refused opens append no fork commitment for the captured rename"
+    );
+    assert_eq!(fs::read(a_mount.join("tracked")).unwrap(), b"five\n");
+    assert_eq!(fs::read(a_mount.join("u1")).unwrap(), b"u2\n");
+    let record = fixture.intent("b").expect("the rename stays journaled");
+    assert_eq!(record.phase, LifecycleIntentPhase::Mutating);
+    assert_eq!(record.completion, None);
+}
+
+/// A captured rename whose source gains only a new untracked path, with an unchanged HEAD, must
+/// refuse and keep that path's bytes and the intent.
+#[tokio::test]
+async fn a_captured_rename_keeps_new_untracked_path_without_head_change() {
+    let fixture = Fixture::new("b-new");
+    let runtime = fixture.adopt().await;
+    let minted = fixture
+        .mint(&runtime, "a", ForkOptions::default())
+        .await
+        .expect("mint a");
+    let a_mount = PathBuf::from(minted["info"]["mount"].as_str().expect("a mount"));
+    let _b_mount = capture_rename(&fixture, &runtime).await;
+    runtime.shutdown().await.expect("stop the runtime");
+
+    fs::write(a_mount.join("new.txt"), b"fresh\n").expect("new untracked path in a");
+
+    LifecycleIntentJournal::update(&fixture.journal_path(), |journal| {
+        journal.begin(LifecycleIntent::Fork {
+            source: name("a"),
+            destination: name("b"),
+            rename: true,
+        });
+        journal.mark_mutating(&name("b"))
+    })
+    .expect("journal the mutating rename");
+
+    refused_by_conflict(fixture.open_naming("a").await);
+    assert_eq!(fs::read(a_mount.join("new.txt")).unwrap(), b"fresh\n");
+    assert!(
+        fixture
+            .intent("b")
+            .is_some_and(|record| record.completion.is_none())
+    );
+}
+
+/// A refused resume of an existing destination must leave the rename `Mutating`: a refusal that
+/// resets the phase lets the next open discard a rename whose clone is already published.
+#[tokio::test]
+async fn a_refused_existing_destination_resume_keeps_mutating_phase() {
+    let fixture = Fixture::new("b-phase");
+    let runtime = fixture.adopt().await;
+    let minted = fixture
+        .mint(&runtime, "a", ForkOptions::default())
+        .await
+        .expect("mint a");
+    let a_mount = PathBuf::from(minted["info"]["mount"].as_str().expect("a mount"));
+    let _b_mount = capture_rename(&fixture, &runtime).await;
+    fs::write(a_mount.join("tracked"), b"H2\n").expect("H2 change in a");
+    git(&a_mount, &["add", "tracked"]);
+    git(&a_mount, &["commit", "-q", "-m", "H2"]);
+    runtime.shutdown().await.expect("stop the runtime");
+
+    LifecycleIntentJournal::update(&fixture.journal_path(), |journal| {
+        journal.begin(LifecycleIntent::Fork {
+            source: name("a"),
+            destination: name("b"),
+            rename: true,
+        });
+        journal.mark_mutating(&name("b"))
+    })
+    .expect("journal the mutating rename");
+
+    refused_by_conflict(fixture.open_naming("a").await);
+    refused_by_conflict(fixture.open_naming("b").await);
+    let record = fixture.intent("b").expect("the rename stays journaled");
+    assert_eq!(record.phase, LifecycleIntentPhase::Mutating);
+    assert_eq!(record.completion, None);
 }

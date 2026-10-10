@@ -502,8 +502,8 @@ fn killed_remove_reopens_reconciles_and_retries_exactly_once() {
 
 #[test]
 fn a_killed_create_keeps_its_intent_when_another_process_updates_the_journal() {
-    // Another cowshed process opened this project before `new` began and records its own
-    // lifecycle step after `new` was killed mid-flight. The killed create's intent is the only
+    // Another cowshed process opened this project before `fork` began and records its own
+    // lifecycle step after `fork` was killed mid-flight. The killed create's intent is the only
     // authority that can finish or retire its unpublished clone, so an update about a different
     // workspace must not erase it.
     let root = TestRoot::new("concurrent-update");
