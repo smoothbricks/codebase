@@ -5698,20 +5698,23 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
     /// fetch in the user's own checkout — the one piece of this teardown that lives where they can
     /// see it.
     ///
-    /// The checkout's Nx daemon is stopped as `detach` stops it before the image's volume is
-    /// unmounted. Stopping the supervisor does not end it: the daemon detaches from the job that
-    /// started it, and its cwd is the checkout, so every removal of a shed waited out the whole
-    /// unmount grace and then forced (measured: 43 refused unmounts, 12.8 s, per `rm`). Anything
-    /// else holding the volume is still the unmount's to wait for and force, as removal always
-    /// has; it is named here instead of refused.
-    async fn finish_retirement(&mut self, current: NativeWorkspace) -> Result<()> {
+    /// Non-land removal stops the checkout's recorded Nx daemon as `detach` does. A land only
+    /// inspects holders here: its ledger-owned stop and honest adoption skip must never be
+    /// followed by a record-nominated signal during retirement (16_build_volumes.md, Land 8).
+    /// Anything else holding the volume is still the unmount's to wait for and force, as removal
+    /// always has; it is named here instead of refused.
+    async fn finish_retirement(
+        &mut self,
+        current: NativeWorkspace,
+        nx_check: CheckoutNxCheck,
+    ) -> Result<()> {
         let workspace = current.derived.workspace.name().clone();
         if matches!(
             current.derived.mount_state,
             crate::storage::lifecycle::MountState::Mounted { .. }
         ) {
             let mount = self.workspace_mount_path(&workspace)?;
-            if let Err(busy) = close_checkout_nx(&workspace, &mount).await? {
+            if let Err(busy) = check_checkout_nx(&workspace, &mount, nx_check).await? {
                 eprintln!(
                     "cowshed: {workspace}'s Nx state is in use: {busy}; its unmount waits, then forces"
                 );
@@ -5908,6 +5911,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         workspace: WorkspaceName,
         options: RemoveOptions,
         containment: &NativeContainment,
+        nx_check: CheckoutNxCheck,
     ) -> Result<RemoveReport> {
         use crate::storage::lifecycle::{MountIntent, MountState, Substrate};
 
@@ -6360,7 +6364,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                 ),
                 None => None,
             };
-            self.finish_retirement(current).await?;
+            self.finish_retirement(current, nx_check).await?;
             // The workspace's build volume and seed retire with it, unless a target adopted the
             // volume (16_build_volumes.md, "Garbage collection"), and with them whatever else no
             // checkout links.
@@ -10453,7 +10457,8 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         if matches!(
             current.derived.mount_state,
             crate::storage::lifecycle::MountState::Mounted { .. }
-        ) && let Err(busy) = close_checkout_nx(&workspace, &mount).await?
+        ) && let Err(busy) =
+            check_checkout_nx(&workspace, &mount, CheckoutNxCheck::CloseRecorded).await?
         {
             return Err(CowshedError::conflict(
                 format!("{workspace} cannot detach while its Nx state is in use: {busy}"),
@@ -10768,8 +10773,13 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         options: RemoveOptions,
     ) -> Result<RemoveReport> {
         let containment = self.main_containment()?;
-        self.remove_contained_in(workspace, options, &containment)
-            .await
+        self.remove_contained_in(
+            workspace,
+            options,
+            &containment,
+            CheckoutNxCheck::CloseRecorded,
+        )
+        .await
     }
 
     async fn gc(&mut self, options: GcOptions) -> Result<GcReport> {
@@ -11712,18 +11722,23 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
             // the retry its hint names would land nothing. Containment is measured against the
             // branch the unit landed on, so a lane unit whose commits are in its lane base retires.
             let containment = into.containment(target_branch.clone());
-            self.remove_contained_in(workspace.clone(), RemoveOptions::default(), &containment)
-                .await
-                .map_err(|kept| {
-                    CowshedError::new(
-                        kept.code,
-                        format!(
-                            "landed {source_head} on {target_branch}, but workspace {workspace} was kept: {}",
-                            kept.message
-                        ),
-                        kept.hint,
-                    )
-                })?;
+            self.remove_contained_in(
+                workspace.clone(),
+                RemoveOptions::default(),
+                &containment,
+                CheckoutNxCheck::Held,
+            )
+            .await
+            .map_err(|kept| {
+                CowshedError::new(
+                    kept.code,
+                    format!(
+                        "landed {source_head} on {target_branch}, but workspace {workspace} was kept: {}",
+                        kept.message
+                    ),
+                    kept.hint,
+                )
+            })?;
         } else {
             // Retiring collects; a land that keeps the workspace collects here, so the target's
             // previous volume and whatever else no checkout links goes with every land.
@@ -17023,29 +17038,43 @@ fn native_storage_error(error: crate::storage::apfs::ApfsStorageError) -> Cowshe
     }
 }
 
-/// Stop the Nx daemon `workspace`'s checkout at `mount` records, as a land stops it, before its
-/// volume detaches: the daemon's cwd is the checkout, so a live one alone keeps it busy.
+/// Land retirement only inspects holders: Land 4 already owns any signal authority. Other
+/// callers retain their existing record-nominated close, whose ownership hardening remains
+/// open (04_sandbox.md, "Trusted supervisor and child profiles").
+#[cfg(target_os = "macos")]
+enum CheckoutNxCheck {
+    Held,
+    CloseRecorded,
+}
+
+/// Inspect or close the checkout's Nx state before its volume detaches.
 /// `.nx/workspace-data` is read through the checkout, so a build-volume link is followed.
 /// [`crate::build_volume::nx::Busy`] is the caller's to judge: `detach` refuses on it, while a
 /// retirement unmounts with its grace and force as it always has.
 #[cfg(target_os = "macos")]
-async fn close_checkout_nx(
+async fn check_checkout_nx(
     workspace: &WorkspaceName,
     mount: &Path,
+    check: CheckoutNxCheck,
 ) -> Result<std::result::Result<(), crate::build_volume::nx::Busy>> {
     let data = mount.join(".nx/workspace-data");
+    let operation = match check {
+        CheckoutNxCheck::Held => "inspect",
+        CheckoutNxCheck::CloseRecorded => "close",
+    };
     let closed = {
         let data = data.clone();
-        crate::storage::lifecycle::dispatch_blocking(move || {
-            crate::build_volume::nx::close_workspace_data(&data)
+        crate::storage::lifecycle::dispatch_blocking(move || match check {
+            CheckoutNxCheck::Held => crate::build_volume::nx::held_workspace_data(&data),
+            CheckoutNxCheck::CloseRecorded => crate::build_volume::nx::close_workspace_data(&data),
         })
         .await
-        .map_err(|error| CowshedError::internal(format!("Nx close task failed: {error}")))?
+        .map_err(|error| CowshedError::internal(format!("Nx {operation} task failed: {error}")))?
     };
     closed.map_err(|error| {
         CowshedError::environment_missing(
             format!(
-                "cannot close {workspace}'s Nx state at {}: {error}",
+                "cannot {operation} {workspace}'s Nx state at {}: {error}",
                 data.display()
             ),
             "cowshed doctor --json",

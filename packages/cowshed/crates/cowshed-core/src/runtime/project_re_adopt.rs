@@ -71,7 +71,9 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                     _ => error,
                 })?;
             let lease = self.stop_supervisor(&main).await?;
-            if let Err(busy) = close_checkout_nx(&main, &checkout).await? {
+            if let Err(busy) =
+                check_checkout_nx(&main, &checkout, CheckoutNxCheck::CloseRecorded).await?
+            {
                 return Err(CowshedError::conflict(
                     format!("main cannot be re-adopted while its Nx state is in use: {busy}"),
                     "stop those processes, then retry",
