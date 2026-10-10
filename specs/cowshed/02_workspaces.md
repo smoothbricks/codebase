@@ -138,7 +138,10 @@ ASIF-to-RAW transition and the RAW guest-space reclaim operation, not an image c
    copy leaves already-correct hard-link topology untouched. It relinks only missing, mismatched or recopied-primary
    aliases and restores every changed alias's ancestor metadata after the subtree is complete. Already-mirrored file
    payloads are not recopied merely because the transaction was interrupted; full content and metadata verification
-   still runs before publication.
+   still runs before publication. The exclusive claim on the recorded source build image's `<image>.hold` stays held
+   through retention, copy, seed capture and publication. A RAW-to-RAW replacement captures under that same typed claim
+   rather than opening a second exclusive claim on the same resource. A legacy ASIF source's hold is distinct from the
+   published RAW hold: the old claim remains alive while seed capture independently claims the new RAW resource.
 4. Verify the copied content before publication, including tracked and untracked-not-ignored file checksums, the entire
    `.git` state above, `git fsck`, and the build contents and identity. Re-adoption does not normalize Git
    configuration, delete lock files, prune worktree registrations or replace user hooks. Only cowshed's own marker and

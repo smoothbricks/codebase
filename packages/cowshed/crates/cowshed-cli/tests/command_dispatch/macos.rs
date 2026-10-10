@@ -2753,13 +2753,16 @@ async fn real_apfs_rm_evicts_and_names_a_host_process_holding_an_unlinked_build_
 #[tokio::test]
 async fn real_apfs_re_adopt_replaces_main_keeps_its_build_identity_and_retains_the_old_image() {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-    struct RestoreStderr(Option<OwnedFd>);
+    struct RestoreStderr {
+        saved: Option<OwnedFd>,
+        report_path: PathBuf,
+    }
     impl RestoreStderr {
         fn restore(&mut self) -> std::io::Result<()> {
-            if let Some(saved) = self.0.take() {
+            if let Some(saved) = self.saved.take() {
                 // SAFETY: saved owns the descriptor until duplication completes.
                 if unsafe { libc::dup2(saved.as_raw_fd(), libc::STDERR_FILENO) } < 0 {
-                    self.0 = Some(saved);
+                    self.saved = Some(saved);
                     return Err(std::io::Error::last_os_error());
                 }
             }
@@ -2768,8 +2771,18 @@ async fn real_apfs_re_adopt_replaces_main_keeps_its_build_identity_and_retains_t
     }
     impl Drop for RestoreStderr {
         fn drop(&mut self) {
-            if let Err(error) = self.restore() {
-                eprintln!("replacement proof could not restore stderr: {error}");
+            if self.saved.is_some() {
+                if let Err(error) = self.restore() {
+                    eprintln!("replacement proof could not restore stderr: {error}");
+                    return;
+                }
+                match fs::read_to_string(&self.report_path) {
+                    Ok(report) => eprint!("{report}"),
+                    Err(error) => eprintln!(
+                        "replacement proof could not read captured stderr {}: {error}",
+                        self.report_path.display()
+                    ),
+                }
             }
         }
     }
@@ -2850,14 +2863,17 @@ async fn real_apfs_re_adopt_replaces_main_keeps_its_build_identity_and_retains_t
         std::io::Error::last_os_error()
     );
     // SAFETY: the successful duplication returned an owned, non-stdio descriptor.
-    let mut restore = RestoreStderr(Some(unsafe { OwnedFd::from_raw_fd(saved) }));
+    let mut restore = RestoreStderr {
+        saved: Some(unsafe { OwnedFd::from_raw_fd(saved) }),
+        report_path,
+    };
     // SAFETY: report_file stays open until stderr is restored.
     assert!(
         unsafe { libc::dup2(report_file.as_raw_fd(), libc::STDERR_FILENO) } >= 0,
         "capture stderr: {}",
         std::io::Error::last_os_error()
     );
-    let (_, stderr) = succeed(
+    let (replacement, stdout, stderr) = run(
         &mut service,
         [
             OsString::from("adopt"),
@@ -2868,7 +2884,17 @@ async fn real_apfs_re_adopt_replaces_main_keeps_its_build_identity_and_retains_t
     .await;
     restore.restore().expect("restore stderr after replacement");
     drop(report_file);
-    let core_report = fs::read_to_string(&report_path).expect("read actual replacement guidance");
+    let core_report =
+        fs::read_to_string(&restore.report_path).expect("read actual replacement guidance");
+    // Restore the real channel before asserting: neither an operational refusal nor
+    // a panic may disappear into a private capture deleted by fixture teardown.
+    eprint!("{core_report}");
+    let stderr = String::from_utf8_lossy(&stderr);
+    assert!(
+        matches!(replacement, Ok(0)),
+        "cowshed adopt --re-adopt: {replacement:?}\nstdout: {}\nstderr: {stderr}",
+        String::from_utf8_lossy(&stdout)
+    );
 
     let new = cowshed_core::metadata::DetachedWorkspaceMetadata::read_for_image(&main_image)
         .expect("the replacement's sidecar")

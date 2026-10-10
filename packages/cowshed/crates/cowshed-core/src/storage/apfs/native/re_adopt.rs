@@ -12,7 +12,9 @@ use std::path::{Path, PathBuf};
 
 use super::{MacOsApfsExecutionHost, allocated_file_bytes, io_error, sync_parent_path};
 use crate::apfs::{ApfsBackend, CommandRunner, DetachIntent, MountAccess};
-use crate::build_volume::{BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord, BuildVolumeRole};
+use crate::build_volume::{
+    BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord, BuildVolumeRole, ReleaseClaim,
+};
 use crate::metadata::{ImageCapacity, append_suffix};
 use crate::storage::apfs::{ApfsExecutionHost, ApfsStorageError};
 use crate::storage::recovery::ReAdoptSource;
@@ -228,15 +230,24 @@ where
     /// retained volume left, write the recorded owner record verbatim, and mount it where main's
     /// build link points (16_build_volumes.md, "Targets and seeds"). Then freeze one seed of it
     /// for the replacement incarnation; the old incarnation's seeds stay retained. Converges
-    /// from whichever step a crash interrupted.
+    /// from whichever step a crash interrupted. `build_claim` is the exclusive claim on the
+    /// recorded build volume's hold, held by the caller across this whole publication; it must
+    /// name that volume. A RAW original's seed borrows it rather than locking the same hold file
+    /// again, and a legacy original's seed takes the published volume's own claim.
     pub(crate) fn publish_re_adopt_build(
         &self,
         layout: &BuildVolumeLayout,
         source: &ReAdoptSource,
+        build_claim: &ReleaseClaim,
     ) -> Result<(), ApfsStorageError> {
         let Some(build) = &source.build else {
             return Ok(());
         };
+        if build_claim.id() != &build.id {
+            return Err(ApfsStorageError::InvalidPlan(
+                "the build claim does not hold the recorded build volume",
+            ));
+        }
         let published = layout.image(&build.id);
         // The replacement is RAW at the build image path of main's build volume identity,
         // whatever format the retained input was.
@@ -286,18 +297,23 @@ where
             .seed_of(&crate::metadata::WorkspaceName::main(), &source.replacement)
             .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
         if seeded.is_none() {
-            self.clone_build_volume(
-                layout,
-                &build.id,
-                &BuildVolumeId::mint(),
-                &BuildVolumeRecord::new(
-                    build.owner_record.tree.clone(),
-                    BuildVolumeRole::Seed {
-                        target: crate::metadata::WorkspaceName::main(),
-                        incarnation: source.replacement.clone(),
-                    },
-                ),
-            )?;
+            let destination = BuildVolumeId::mint();
+            let record = BuildVolumeRecord::new(
+                build.owner_record.tree.clone(),
+                BuildVolumeRole::Seed {
+                    target: crate::metadata::WorkspaceName::main(),
+                    incarnation: source.replacement.clone(),
+                },
+            );
+            if build.image.original == published {
+                // The RAW original is the published volume, so the caller's claim holds the very
+                // hold file a fresh claim would lock: the seed borrows it.
+                self.clone_claimed_build_volume(layout, build_claim, &destination, &record)?;
+            } else {
+                // A legacy original holds `<original>.hold`, a different file. The caller's claim
+                // keeps that resource; the published volume takes its own ordinary claim.
+                self.clone_build_volume(layout, &build.id, &destination, &record)?;
+            }
         }
         Ok(())
     }

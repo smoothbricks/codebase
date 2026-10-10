@@ -155,6 +155,31 @@ where
         )
     }
 
+    /// Clone the build volume `claim` holds to `destination`, borrowing that claim for the whole
+    /// capture: the seal, the canonical restore, the freshness mark and the destination's record
+    /// all run under it. A second exclusive claim on the same hold file would conflict with it,
+    /// and an upgrade would reopen admission (16_build_volumes.md, "Targets and seeds"). The source
+    /// is the claim's own volume, so no caller can pair a claim with another volume's id.
+    pub(super) fn clone_claimed_build_volume(
+        &self,
+        layout: &BuildVolumeLayout,
+        claim: &ReleaseClaim,
+        destination: &BuildVolumeId,
+        record: &BuildVolumeRecord,
+    ) -> Result<(), ApfsStorageError> {
+        let source = claim.id();
+        self.verify_controller_path(&layout.image(source))?;
+        let mount = layout.mount(source);
+        let mounted = self.mounted_at(&mount)?.is_some();
+        self.clone_build_volume_under_hold(
+            layout,
+            source,
+            destination,
+            record,
+            mounted.then_some(mount.as_path()),
+        )
+    }
+
     fn clone_build_volume_under_hold(
         &self,
         layout: &BuildVolumeLayout,

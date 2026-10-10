@@ -278,7 +278,11 @@ Re-adoption preserves the live BuildVolumeId, its owner record, tree and creatio
 into RAW at the capacity recorded from the kernel before detach (02_workspaces.md §Re-adoption). It leaves every
 old-incarnation seed unchanged as retained evidence, rather than relabeling it as a seed of the new incarnation. The new
 main receives one fresh RAW seed captured from its verified warm replacement under the same writer exclusion as every
-seed. This explicit retained evidence is not an active latest seed and is never silently collected as one.
+seed. This explicit retained evidence is not an active latest seed and is never silently collected as one. Re-adoption
+carries its existing exclusive source `ReleaseClaim` into build publication. A RAW source and its RAW replacement share
+the canonical hold resource, so capture borrows that claim through seal, restore and the immutable seed mark instead of
+taking a conflicting second claim. A legacy source's `<id>.asif.hold` is a different resource: its retained claim stays
+alive while capture takes the replacement's `<id>.dmg.hold` normally.
 
 **Why a reseed.** A land freezes the seed before the target runs anything on the adopted volume. Everything the target
 runs afterwards (its own builds and gates, the land's adoption check, a developer's build in main) is written to its

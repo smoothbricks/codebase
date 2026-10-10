@@ -296,9 +296,10 @@ impl NativeProjectRuntimeHost {
             .lock()
             .to_owned();
         let layout = self.build_volume_layout()?;
-        // This is the build volume's job-admission resource claim, not a metadata mutex:
-        // keep the recorded old image's exact hold across retain/copy/staged publication.
-        // A legacy job holds `<old>.asif.hold`, not the new RAW-derived hold path.
+        // This is the build volume's job-admission resource claim, not a metadata mutex. It holds
+        // the recorded old image's exact hold from here until the build publication below, across
+        // `replace_main` and `finish_adoption`. A legacy job holds `<old>.asif.hold`, not the new
+        // RAW-derived hold path.
         let build_claim = if let Some(build) = &source.build {
             let held_layout = layout.clone();
             let id = build.id.clone();
@@ -361,19 +362,20 @@ impl NativeProjectRuntimeHost {
                     .await?
             }
         };
-        // The replacement's build volume takes main's build identity, under main's lock.
-        {
+        // The replacement's build volume takes main's build identity, under main's lock. The
+        // build claim moves into that publication and is released when its closure returns,
+        // still under main's image lock: until then it keeps every new job hold on the recorded
+        // old build volume out, and the lock is released only after the claim is gone. No build
+        // volume means no claim and nothing to publish, so the publication is skipped.
+        if let Some(build_claim) = build_claim {
             let source = source.clone();
             self.substrate
                 .dispatch_on_host_with_image_lock(lock.clone(), move |host| {
-                    host.publish_re_adopt_build(&layout, &source)
+                    host.publish_re_adopt_build(&layout, &source, &build_claim)
                 })
                 .await
                 .map_err(native_storage_error)?;
         }
-        // The new canonical payload, unchanged owner record and link are now published.
-        // Release the old resource claim before the ordinary first-touch admission.
-        drop(build_claim);
         // Step 5: the mounted replacement holds exactly the recorded Git state.
         {
             let source = std::sync::Arc::clone(&source);
