@@ -1,7 +1,7 @@
 import { expect, it } from 'bun:test';
 import { execFileSync } from 'node:child_process';
-import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from 'node:fs/promises';
+import { homedir, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { useFixtureCargoHome } from './__tests__/fixture-cargo-home.js';
 import { runtimeInputValue } from './__tests__/runtime-input.js';
@@ -340,6 +340,65 @@ it('hashes a Cargo workspace that lives inside a directory its enclosing reposit
     expect(await hashCargoPathInputs(manifest, workspace, options)).not.toBe(initial);
   } finally {
     await rm(repository, { recursive: true, force: true });
+  }
+});
+
+it('the runtime input reads no git configuration from the operator home', async () => {
+  // A host client's runtime input runs in a workspace's sandboxed daemon with the host's HOME
+  // (cowshed 04_sandbox.md). Git must not read that home: the sandbox denies its global
+  // configuration, and git dies on any error but a missing file; its global ignore file would
+  // decide which sources the key covers.
+  const root = await mkdtemp(join(tmpdir(), 'cargo-hash-operator-git-'));
+  try {
+    const { workspace } = await workspaceCargoFixture(root);
+    execFileSync('git', ['init', '--quiet', workspace], { stdio: 'pipe' });
+    const bin = join(import.meta.dir, '../dist/bin/smoo-nx-cargo-hash.js');
+    const run = async (home: string) => {
+      // The operator's environment, as a host client sends it: its HOME, and none of the
+      // git isolation a sandboxed job would carry.
+      const env: Record<string, string | undefined> = { ...process.env, HOME: home };
+      for (const name of [
+        'GIT_CONFIG_GLOBAL',
+        'GIT_CONFIG_NOSYSTEM',
+        'GIT_CONFIG_SYSTEM',
+        'GIT_CONFIG_COUNT',
+        'XDG_CONFIG_HOME',
+      ]) {
+        delete env[name];
+      }
+      env.RUSTUP_HOME = process.env.RUSTUP_HOME ?? join(homedir(), '.rustup');
+      const child = Bun.spawn(['node', bin, '--include-workspace'], {
+        cwd: workspace,
+        env,
+        stdout: 'pipe',
+        stderr: 'pipe',
+      });
+      const [exitCode, stdout, stderr] = await Promise.all([
+        child.exited,
+        new Response(child.stdout).text(),
+        new Response(child.stderr).text(),
+      ]);
+      return { exitCode, stdout, stderr };
+    };
+    const clean = join(root, 'clean-home');
+    await mkdir(clean);
+    const baseline = await run(clean);
+    expect(baseline.exitCode, baseline.stderr).toBe(0);
+
+    // A global configuration git cannot access. A self-referential link fails access() with
+    // ELOOP where the sandbox fails it with EPERM; git dies on either.
+    const denied = join(root, 'denied-home');
+    await mkdir(join(denied, '.config/git'), { recursive: true });
+    await symlink('config', join(denied, '.config/git/config'));
+    expect(await run(denied)).toEqual(baseline);
+
+    // A global ignore file that would hide every source the key covers.
+    const ignoring = join(root, 'ignoring-home');
+    await mkdir(join(ignoring, '.config/git'), { recursive: true });
+    await writeFile(join(ignoring, '.config/git/ignore'), '*.rs\n');
+    expect(await run(ignoring)).toEqual(baseline);
+  } finally {
+    await rm(root, { recursive: true, force: true });
   }
 });
 

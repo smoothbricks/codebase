@@ -282,6 +282,20 @@ export const CARGO_ANCESTOR_INPUTS = ['Cargo.toml', '.cargo/config', '.cargo/con
 // rejected error. Git runs under the same rule.
 const CHILD_STDIO: ['ignore', 'pipe', 'pipe'] = ['ignore', 'pipe', 'pipe'];
 
+/**
+ * Git reads only the repository, never the operator's home (cowshed
+ * `04_sandbox.md`, runtime inputs). A host client's runtime input runs in a
+ * workspace's sandboxed daemon with the host's HOME: git dies on the global
+ * configuration the sandbox denies, and its global ignore file
+ * (`~/.config/git/ignore`, read even without a global configuration) would
+ * decide which sources the key covers. Neither belongs to the tree.
+ */
+const ISOLATED_GIT_ARGS = ['-c', 'core.excludesFile=/dev/null'] as const;
+
+function isolatedGitEnv(): NodeJS.ProcessEnv {
+  return { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' };
+}
+
 /** A Cargo resolution refusal: no stale closure or runtime whole-workspace substitute is safe. */
 export class CargoMetadataError extends Error {
   readonly manifestPath: string;
@@ -749,6 +763,7 @@ function gitIgnoredBeneath(directories: readonly string[]): (path: string) => bo
     const listing = execFileSync(
       'git',
       [
+        ...ISOLATED_GIT_ARGS,
         '--literal-pathspecs',
         '-C',
         repository,
@@ -761,7 +776,7 @@ function gitIgnoredBeneath(directories: readonly string[]): (path: string) => bo
         '--',
         ...sourceRoots,
       ],
-      { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, stdio: CHILD_STDIO },
+      { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, stdio: CHILD_STDIO, env: isolatedGitEnv() },
     );
     for (const entry of listing.split('\0')) {
       if (entry.length === 0) continue;
@@ -779,10 +794,11 @@ function gitIgnoredBeneath(directories: readonly string[]): (path: string) => bo
 
 /** The members of `paths` (relative to `repository`) that git ignores, own patterns or an ancestor's. */
 function gitCheckIgnore(repository: string, paths: readonly string[]): string[] {
-  const result = spawnSync('git', ['-C', repository, 'check-ignore', '-z', '--stdin'], {
+  const result = spawnSync('git', [...ISOLATED_GIT_ARGS, '-C', repository, 'check-ignore', '-z', '--stdin'], {
     input: `${paths.join('\0')}\0`,
     encoding: 'utf8',
     maxBuffer: 64 * 1024 * 1024,
+    env: isolatedGitEnv(),
   });
   // check-ignore answers 1 when nothing is ignored; only 0 carries a listing.
   if (result.status === 1) return [];
@@ -797,9 +813,10 @@ function gitRepository(directory: string): string | undefined {
   try {
     // The walk compares realpaths, so git's answer is canonicalized the same way.
     return realpathSync(
-      execFileSync('git', ['-C', directory, 'rev-parse', '--show-toplevel'], {
+      execFileSync('git', [...ISOLATED_GIT_ARGS, '-C', directory, 'rev-parse', '--show-toplevel'], {
         encoding: 'utf8',
         stdio: CHILD_STDIO,
+        env: isolatedGitEnv(),
       }).trim(),
     );
   } catch (error) {

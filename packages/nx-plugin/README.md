@@ -195,7 +195,8 @@ An input that runs inside a cowshed workspace's sandboxed daemon gets the client
 included, but not the client's filesystem view (cowshed `04_sandbox.md`). An input that reads the operator's home fails
 there, so a runtime input reads only the checkout and its declared environment. A `git` command in one sets
 `GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1`: the key is a function of the repository, not of the operator's git
-configuration.
+configuration. Git reads the global ignore file (`~/.config/git/ignore`) even then, so `smoo-nx-cargo-hash`, whose git
+queries decide which package sources the key covers, also passes `-c core.excludesFile=/dev/null`.
 
 ### Cargo source runtime inputs
 
