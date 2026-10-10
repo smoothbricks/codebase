@@ -27,7 +27,9 @@ use sha2::{Digest as _, Sha256};
 
 use crate::api::dto::hex_lower;
 use crate::error::{CowshedError, Result};
-use crate::gateway_inventory::{GatewaySessionFact, NativeGatewayInventory};
+use crate::gateway_inventory::{
+    GatewaySessionFact, NativeGatewayInventory, PortCollision, served_sessions,
+};
 use crate::metadata::{EgressMode as CoreEgressMode, GrantSet, WorkspaceIncarnation};
 use crate::repository::RepoId;
 use crate::storage::bootstrap::ValidatedHostStorage;
@@ -113,9 +115,29 @@ pub struct NativeSessionInventory {
 
 impl NativeSessionInventory {
     pub fn new(storage: ValidatedHostStorage) -> Self {
-        Self {
-            inventory: NativeGatewayInventory::new(storage),
+        Self::from_inventory(NativeGatewayInventory::new(storage))
+    }
+
+    pub(crate) fn from_inventory(inventory: NativeGatewayInventory) -> Self {
+        Self { inventory }
+    }
+
+    /// Every attached session on the host the gateway serves, and the collisions whose newer
+    /// member it does not (05_gateway.md), each named on stderr with what repairs it.
+    async fn served(&self) -> Result<(Vec<GatewaySessionFact>, Vec<PortCollision>)> {
+        let (served, refused) = served_sessions(
+            self.inventory
+                .all_attached()
+                .await
+                .map_err(inventory_error)?,
+        );
+        for collision in &refused {
+            eprintln!(
+                "cowshed: not serving {}/{}: {collision}; next: cowshed doctor --repair",
+                collision.claimed.repo, collision.claimed.workspace
+            );
         }
+        Ok((served, refused))
     }
     pub fn with_backend(
         storage: ValidatedHostStorage,
@@ -130,21 +152,23 @@ impl NativeSessionInventory {
 #[async_trait]
 impl SessionInventory for NativeSessionInventory {
     async fn all_sessions(&self) -> Result<Vec<WorkspaceSession>> {
-        sessions_from_facts(
-            self.inventory
-                .all_attached()
-                .await
-                .map_err(inventory_error)?,
-        )
+        sessions_from_facts(self.served().await?.0)
     }
 
+    /// One project's sessions, less each one an older workspace of any project holds a port of:
+    /// which member of a collision is served is a host-wide answer.
     async fn project_sessions(&self, repo_id: &RepoId) -> Result<Vec<WorkspaceSession>> {
-        sessions_from_facts(
-            self.inventory
-                .project_attached(repo_id)
-                .await
-                .map_err(inventory_error)?,
-        )
+        let project = self
+            .inventory
+            .project_attached(repo_id)
+            .await
+            .map_err(inventory_error)?;
+        let (_, refused) = self.served().await?;
+        sessions_from_facts(project.into_iter().filter(|fact| {
+            !refused
+                .iter()
+                .any(|collision| collision.claims(&fact.repo_id, &fact.workspace))
+        }))
     }
 }
 
