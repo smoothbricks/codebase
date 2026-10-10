@@ -16899,8 +16899,8 @@ async fn seed_tree_findings(
                 recorded(age.tree.as_ref()),
                 recorded(age.seed.as_ref().and_then(|seed| seed.tree.as_ref())),
             ),
-            hint: "a branch moved outside `cowshed land` may have skipped its capture and \
-                   adoption, or plain Git moved it; the next fork tries a matching seed"
+            hint: "a cowshed land may have skipped its capture and adoption, or plain Git moved \
+                   the branch; the next fork tries a matching seed"
                 .into(),
             path: Some(checkout.to_owned()),
         });
