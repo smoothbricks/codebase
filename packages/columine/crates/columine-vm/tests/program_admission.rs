@@ -5,6 +5,7 @@
 mod common;
 
 use columine_types::PROGRAM_MAGIC;
+use columine_types::types::{ErrorCode, SlotType};
 use columine_types::vo::{
     UnavailableVoAdmission, VoAdmissionError, VoFieldLink, VoMetadata, VoProfile, VoProgramMetadata,
 };
@@ -12,7 +13,8 @@ use columine_vm::program_admission::{
     AdmittedProgram, ProgramAdmissionError, ProgramScratch, declares_vo,
 };
 use columine_vm::state_init::{
-    DEFAULT_ACCEPTED_PROGRAM_MAGICS, ProgramInvalidCause, SizingRefusal,
+    DEFAULT_ACCEPTED_PROGRAM_MAGICS, ProgramInvalidCause, SizingRefusal, calculate_state_size,
+    init_state,
 };
 use columine_vm::struct_map::StructMapSlot;
 use columine_vm::vm::{Vm, u32s_as_bytes};
@@ -142,6 +144,32 @@ fn ordinary_owned_program_executes_and_rolls_back_without_a_vo_capability() {
         );
         assert!(needed > 0, "load draws on the host's memory");
     }
+
+    // A VM draws nothing from the host's memory until a patch needs its
+    // bitmap scratch, so an embedder can build one in a memory that is
+    // already full. The first bitmap patch backs the scratch fallibly: at
+    // every allocation it makes it refuses as OutOfMemory and leaves the
+    // slot as it was, never traps.
+    drop(with_allocations(0, || {
+        Vm::new(DEFAULT_ACCEPTED_PROGRAM_MAGICS)
+    }));
+    let bitmap = assemble(&[0x10, 0, SlotType::Bitmap as u8, 64, 0, 0], &[0]);
+    let size = calculate_state_size(&bitmap, DEFAULT_ACCEPTED_PROGRAM_MAGICS).unwrap();
+    let mut empty = vec![0; usize::try_from(size).unwrap()];
+    init_state(&mut empty, &bitmap, DEFAULT_ACCEPTED_PROGRAM_MAGICS).unwrap();
+    let (inserted, needed) = at_every_allocation(
+        || (Vm::new(DEFAULT_ACCEPTED_PROGRAM_MAGICS), empty.clone()),
+        |(mut vm, mut state)| match vm.set_insert(false, &mut state, 0, &[3, 1, 2], None) {
+            ErrorCode::Ok => Ok(state),
+            code => {
+                assert_eq!(state, empty, "a refused patch leaves the slot");
+                Err(code)
+            }
+        },
+        |budget, code| assert_eq!(code, ErrorCode::OutOfMemory, "budget {budget}"),
+    );
+    assert_ne!(inserted, empty);
+    assert!(needed > 0, "the first patch backs its scratch");
 }
 
 #[test]

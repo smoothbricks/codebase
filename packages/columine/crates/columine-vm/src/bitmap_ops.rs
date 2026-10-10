@@ -119,11 +119,14 @@ pub fn get_bitmap_storage(meta: &SlotMetaView) -> BitmapStorage {
 
 /// Observable bitmap operation state: the patch scratch and the batch
 /// buffers every write reuses, the decision-side algebra result, and the
-/// last diagnostic.
+/// last diagnostic. A default environment allocates nothing.
+#[derive(Default)]
 pub struct BitmapEnv {
     /// `g_bitmap_last_error` — diagnostic code readable after a failure.
     pub last_error: u32,
-    scratch: PatchScratch,
+    /// The kernel's patch scratch, backed by the first patch that needs it:
+    /// a fresh environment, and so a fresh VM, draws nothing from the host.
+    scratch: Option<PatchScratch>,
     eviction_witness: (),
     capture_ranges: Vec<(u32, u32)>,
     /// Staged adds as `elem << 32 | column index`, so one sort orders them by
@@ -219,32 +222,19 @@ fn expiry_rows(state: &[u8], meta: &SlotMetaView) -> usize {
     }
 }
 
+/// The patch scratch in `slot`, backed on first use; refuses with
+/// `OutOfMemory` when it cannot be.
+fn backed(slot: &mut Option<PatchScratch>) -> Result<&mut PatchScratch, ErrorCode> {
+    Ok(match slot {
+        Some(scratch) => scratch,
+        None => slot.insert(PatchScratch::try_new().map_err(|_| ErrorCode::OutOfMemory)?),
+    })
+}
+
 /// Grow `buf` to hold `total` elements, refusing with `OutOfMemory`.
 fn hold<T>(buf: &mut Vec<T>, total: usize) -> Result<(), ErrorCode> {
     buf.try_reserve(total.saturating_sub(buf.len()))
         .map_err(|_| ErrorCode::OutOfMemory)
-}
-
-impl Default for BitmapEnv {
-    fn default() -> Self {
-        BitmapEnv {
-            last_error: 0,
-            scratch: PatchScratch::new(),
-            eviction_witness: (),
-            capture_ranges: Vec::new(),
-            staged_adds: Vec::new(),
-            adds: Vec::new(),
-            removes: Vec::new(),
-            adds_new: Vec::new(),
-            removes_held: Vec::new(),
-            algebra_result: Vec::new(),
-            ttl_mutations: Vec::new(),
-            ttl_algebra_scratch: TtlAlgebraScratch::default(),
-            #[cfg(debug_assertions)]
-            sealed: None,
-            batch_sealed: false,
-        }
-    }
 }
 
 impl core::fmt::Debug for BitmapEnv {
@@ -280,14 +270,12 @@ impl BitmapEnv {
             .saturating_add(demand.touches.saturating_mul(8))
             .saturating_add(6);
         hold(&mut self.capture_ranges, ranges)?;
-        self.scratch
+        backed(&mut self.scratch)?
             .try_reserve_for(demand.image_bytes, demand.touches)
             .map_err(|_| ErrorCode::OutOfMemory)?;
         self.ttl_algebra_scratch.reserve_for(demand.ttl)
     }
 
-    /// From here until [`Self::unseal`], no operation may grow this storage;
-    /// debug builds check it when the batch ends.
     /// Reserve one operation's own demand, unless a batch already reserved
     /// and sealed this storage.
     fn reserve_op(&mut self, demand: BitmapPatchDemand) -> Result<(), ErrorCode> {
@@ -297,6 +285,8 @@ impl BitmapEnv {
         self.reserve_for(demand)
     }
 
+    /// From here until [`Self::unseal`], no operation may grow this storage;
+    /// debug builds check it when the batch ends.
     pub(crate) fn seal(&mut self) {
         self.batch_sealed = true;
         self.ttl_algebra_scratch.seal();
@@ -331,7 +321,9 @@ impl BitmapEnv {
             self.adds_new.capacity(),
             self.removes_held.capacity(),
             self.capture_ranges.capacity(),
-            self.scratch.capacity_bytes(),
+            self.scratch
+                .as_ref()
+                .map_or(0, PatchScratch::capacity_bytes),
         ]
     }
 }
@@ -392,7 +384,7 @@ pub fn prepare_bitmap_patch<'state, 'work>(
         range,
         adds,
         removes,
-        &mut env.scratch,
+        backed(&mut env.scratch)?,
         &mut env.eviction_witness,
     )
     .map_err(|error| bitmap_patch_error(&mut env.last_error, error))
@@ -415,9 +407,15 @@ pub fn bitmap_patch(
     env.adds_new.resize(adds.len().div_ceil(64), 0);
     env.removes_held.resize(removes.len().div_ceil(64), 0);
     let mut outcome = BatchOutcome::new(&mut env.adds_new, &mut env.removes_held);
-    let prepared =
-        prepare_patch_in_witnessed(state, range, adds, removes, &mut env.scratch, &mut outcome)
-            .map_err(|error| bitmap_patch_error(&mut env.last_error, error))?;
+    let prepared = prepare_patch_in_witnessed(
+        state,
+        range,
+        adds,
+        removes,
+        backed(&mut env.scratch)?,
+        &mut outcome,
+    )
+    .map_err(|error| bitmap_patch_error(&mut env.last_error, error))?;
     Ok(prepared.apply_with_cleared_tail().0)
 }
 
@@ -474,9 +472,15 @@ fn capture_bitmap_patch(
     env.adds_new.resize(adds.len().div_ceil(64), 0);
     env.removes_held.resize(removes.len().div_ceil(64), 0);
     let mut outcome = BatchOutcome::new(&mut env.adds_new, &mut env.removes_held);
-    let prepared =
-        prepare_patch_in_witnessed(state, range, adds, removes, &mut env.scratch, &mut outcome)
-            .map_err(|error| bitmap_patch_error(&mut env.last_error, error))?;
+    let prepared = prepare_patch_in_witnessed(
+        state,
+        range,
+        adds,
+        removes,
+        backed(&mut env.scratch)?,
+        &mut outcome,
+    )
+    .map_err(|error| bitmap_patch_error(&mut env.last_error, error))?;
     env.capture_ranges.clear();
     // Merge the single cleared-tail interval into the kernel's already sorted
     // ranges in one pass. No re-sort, duplicate capture, or capacity-sized copy.
