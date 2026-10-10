@@ -30,12 +30,27 @@ impl Drop for FixtureDir {
     }
 }
 
-/// Where every gateway test fixture lives: canonical `/tmp` (`/private/tmp` on macOS), never
-/// TMPDIR. A cowshed workspace exports a TMPDIR deep inside its store, which puts a control
-/// socket under it past `sockaddr_un.sun_path`'s 104 bytes, so `Gateway::start` refused it
-/// ("path must be shorter than SUN_LEN") whenever the tests ran in a workspace.
+/// Where every gateway test fixture lives. `COWSHED_RUNTIME_LINK` names the short alias a
+/// workspace's runtime grant already covers; it is used exactly as spelled, never canonicalized,
+/// because canonicalizing would expand it past `sockaddr_un.sun_path`'s 104 bytes (SUN_LEN).
+/// Otherwise the system temporary directory, which a workspace's TMPDIR never reaches as a
+/// deep store path when the tests run outside it.
 pub fn scratch_parent() -> PathBuf {
-    std::fs::canonicalize("/tmp").unwrap_or_else(|error| panic!("canonical /tmp: {error}"))
+    let path = match std::env::var_os("COWSHED_RUNTIME_LINK") {
+        Some(value) => PathBuf::from(value),
+        None => std::env::temp_dir(),
+    };
+    assert!(
+        path.is_absolute(),
+        "fixture parent {} must be absolute",
+        path.display()
+    );
+    assert!(
+        path.is_dir(),
+        "fixture parent {} must be a directory",
+        path.display()
+    );
+    path
 }
 
 /// A temporary directory every cowshed private-root check accepts.
