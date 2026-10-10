@@ -5360,10 +5360,10 @@ async fn real_apfs_land_leaves_a_stock_detached_landing_daemon_running_and_skips
     fixture.stop_gateway().await;
 }
 
-/// Land 4 authority: a record that names a live process the job ledger does not prove the job's own
-/// is a nomination only. The foreign process is left alive and adoption is skipped by name.
+/// A default land cannot turn Land 4's unproven nominee into signal authority at retirement.
+/// A live socket makes the record-nominated close capable of signalling the foreign process.
 #[tokio::test]
-async fn real_apfs_land_never_signals_a_foreign_process_a_daemon_record_names() {
+async fn real_apfs_default_land_never_signals_a_foreign_nominee_during_retirement() {
     let (nx, node) = repository_nx();
     let mut fixture = Fixture::with(Project::Build {
         nx: Some((&nx, &node)),
@@ -5401,19 +5401,25 @@ async fn real_apfs_land_never_signals_a_foreign_process_a_daemon_record_names() 
         .expect("settled sandboxed foreign nominee");
     assert_eq!(ready.trim(), "READY");
     let foreign_pid = i32::try_from(foreign.id()).expect("pid");
+    let socket = fixture._scratch.path().join("foreign.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).expect("live foreign socket");
     let record = topic.join(".nx/workspace-data/d/server-process.json");
     fs::create_dir_all(record.parent().expect("record directory")).unwrap();
     fs::write(
         &record,
         serde_json::json!({
             "processId": foreign_pid,
-            "socketPath": topic.join(".nx/workspace-data/d/foreign.sock"),
+            "socketPath": socket,
         })
         .to_string(),
     )
     .unwrap();
 
     let report = land(&mut service, "outputs", true, &[]).await;
+    assert!(
+        report.retired,
+        "the default land must exercise retirement: {report:?}"
+    );
     match &report.build_volume.adoption {
         Adoption::Skipped {
             reason: AdoptionSkip::LandingDaemonStayed { daemon },
@@ -5421,13 +5427,16 @@ async fn real_apfs_land_never_signals_a_foreign_process_a_daemon_record_names() 
         other => panic!("a forged nominee skips adoption: {other:?}"),
     }
     assert!(
-        cowshed_core::runtime::job_groups::Process::observe(foreign_pid)
+        foreign
+            .try_wait()
             .expect("observe the foreign process")
-            .is_some(),
-        "the foreign process was never signalled"
+            .is_none(),
+        "the foreign process survived the complete default land, including retirement"
     );
+    std::os::unix::net::UnixStream::connect(&socket).expect("the foreign listener remains live");
     foreign.kill().expect("stop the test's own foreign sleeper");
     foreign.wait().expect("reap the sleeper");
+    drop(listener);
     drop(service);
     fixture.stop_gateway().await;
 }

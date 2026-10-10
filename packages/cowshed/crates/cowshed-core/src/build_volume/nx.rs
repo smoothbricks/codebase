@@ -188,17 +188,27 @@ fn first_held(databases: &[PathBuf], daemon: Option<i32>) -> io::Result<Option<B
     Ok(None)
 }
 
+/// Whether any process holds one `workspace-data` directory's task databases open. This never
+/// reads a daemon record, connects to its socket or signals a process.
+#[cfg(target_os = "macos")]
+pub(crate) fn held_workspace_data(data: &Path) -> io::Result<Result<(), Busy>> {
+    for database in task_databases_in(data)? {
+        let holders = holders(&database)?;
+        if !holders.is_empty() {
+            return Ok(Err(Busy::Held { database, holders }));
+        }
+    }
+    Ok(Ok(()))
+}
+
 /// Whether any process holds one of the volume's task databases open, without stopping
 /// anything: the second look [`close`] takes, for a caller that has to know nothing opened one
 /// since.
 #[cfg(target_os = "macos")]
 pub fn held(volume: &Path, state: &BuildVolumeState) -> io::Result<Result<(), Busy>> {
     for data in state.nx_workspace_data() {
-        for database in task_databases_in(&volume.join(data))? {
-            let holders = holders(&database)?;
-            if !holders.is_empty() {
-                return Ok(Err(Busy::Held { database, holders }));
-            }
+        if let Err(busy) = held_workspace_data(&volume.join(data))? {
+            return Ok(Err(busy));
         }
     }
     Ok(Ok(()))
