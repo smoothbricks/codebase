@@ -113,9 +113,20 @@ where
             match self.claim_build_volume(layout, source)? {
                 Claim::Claimed(claim) => Some(claim),
                 Claim::Held { open } => {
+                    // The admitted jobs' supervisors hold the hold file. The failed claim's own
+                    // descriptor is closed, so this process is named only for a hold of its own.
+                    let hold = layout.hold_path(source);
+                    let holds = crate::build_volume::nx::holders(&hold).map_err(|error| {
+                        io_error(
+                            "list the processes holding a build volume's hold",
+                            &hold,
+                            error,
+                        )
+                    })?;
                     return Err(ApfsStorageError::BuildVolumeHeld {
                         image: layout.image(source),
-                        hold: layout.hold_path(source),
+                        hold,
+                        holds,
                         open,
                     });
                 }
@@ -787,10 +798,17 @@ mod tests {
             .hold(&source)
             .expect("job admission after restore hold release");
         let refused_seed = BuildVolumeId::mint();
-        assert!(matches!(
-            host.clone_build_volume(&layout, &source, &refused_seed, &record),
-            Err(ApfsStorageError::BuildVolumeHeld { .. })
-        ));
+        let me = i32::try_from(std::process::id()).expect("pid");
+        let refused = host.clone_build_volume(&layout, &source, &refused_seed, &record);
+        let Err(ApfsStorageError::BuildVolumeHeld { holds, .. }) = &refused else {
+            panic!("an admitted job refuses the capture: {refused:?}");
+        };
+        assert!(
+            holds.iter().any(|holder| holder.pid == me),
+            "the skip names the admitted job's holder: {holds:?}"
+        );
+        let said = refused.unwrap_err().to_string();
+        assert!(said.contains(&format!("is held by pid {me} (")), "{said}");
         assert!(!layout.image(&refused_seed).exists());
         assert!(!layout.record(&refused_seed).exists());
         assert!(!layout.hold_path(&refused_seed).exists());
