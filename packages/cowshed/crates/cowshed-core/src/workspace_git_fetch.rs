@@ -222,7 +222,8 @@ async fn probe_git(root: &Path, args: &[&str], sandbox: &SandboxConfig) -> Resul
     // /usr/bin/git is an xcrun shim that writes host caches even for read-only probes.
     command
         .args(profile.args())
-        .args(["/var/select/developer_dir/usr/bin/git", "-C"])
+        .arg(format!("{}/usr/bin/git", crate::sandbox::GIT_DEVELOPER_DIR))
+        .arg("-C")
         .arg(root)
         .args([
             "-c",

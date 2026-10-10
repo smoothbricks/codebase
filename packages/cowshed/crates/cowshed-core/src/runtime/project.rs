@@ -11187,7 +11187,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                 .configure_main_remote(&main_mount)
                 .await?;
             let remote = main_remote.remote_name();
-            run_git_with_read(&root, &main_mount, ["fetch", "--no-tags", remote]).await?;
+            run_git_fetch(&root, &main_mount, ["fetch", "--no-tags", remote]).await?;
             options.onto.as_ref().map_or_else(
                 || format!("{remote}/{DEFAULT_LANDING_BRANCH}"),
                 revision_target,
@@ -14214,7 +14214,7 @@ async fn deliver_into(
     target_branch: &str,
 ) -> Result<()> {
     let preservation_ref = format!("refs/cowshed/{unit}/heads/{source_branch}");
-    run_git_with_read(
+    run_git_fetch(
         target_root,
         source_mount,
         [
@@ -14316,7 +14316,7 @@ async fn preserve_workspace_branch(
         "refs/cowshed/{workspace}/staging/{}",
         uuid::Uuid::new_v4().simple()
     );
-    run_git_with_read(
+    run_git_fetch(
         main_root,
         source_mount,
         [
@@ -14413,7 +14413,7 @@ async fn fetch_target_branch(
 ) -> Result<String> {
     let branch = target_checked_out_branch(target_root, target).await?;
     let reference = format!("refs/cowshed/targets/{target}/{branch}");
-    run_git_with_read(
+    run_git_fetch(
         unit_root,
         target_root,
         [
@@ -14540,13 +14540,9 @@ async fn run_git<const N: usize>(root: &Path, args: [&str; N]) -> Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-async fn run_git_with_read<const N: usize>(
-    root: &Path,
-    read: &Path,
-    args: [&str; N],
-) -> Result<()> {
+async fn run_git_fetch<const N: usize>(root: &Path, source: &Path, args: [&str; N]) -> Result<()> {
     let mut command =
-        tokio::process::Command::from(crate::git::sandboxed_git_command_with_read(root, read)?);
+        tokio::process::Command::from(crate::git::sandboxed_git_fetch_command(root, source)?);
     let output = command.args(args).output_locked().await.map_err(|error| {
         CowshedError::environment_missing(
             error.to_string(),
@@ -18444,6 +18440,87 @@ mod git_worktree_tests {
         let decoded: DetachedWorkspaceMetadata =
             serde_json::from_value(wire).expect("decode legacy sidecar");
         assert!(!is_git_worktree(&decoded));
+    }
+
+    /// `rebase <unit> --into <lane>` fetches the lane's branch into the unit. A git-worktree unit
+    /// whose main config includes a file of main's checkout runs Git that may execute only Git,
+    /// and a local fetch runs upload-pack through a shell: the fetch is refused by name before Git
+    /// runs, citing the include and the rule, rather than failing as an opaque exec denial.
+    #[tokio::test]
+    async fn a_lane_fetch_under_main_tree_include_grants_is_refused_by_name() {
+        use crate::fork_lock::Run as _;
+        let scratch = crate::temp_root::TempRoot::new("cowshed-lane-include");
+        let git = |directory: &Path, args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(directory)
+                .args([
+                    "-c",
+                    "user.name=Cowshed Test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                ])
+                .args(args)
+                .status_locked()
+                .expect("run git");
+            assert!(status.success(), "git {args:?}");
+        };
+        let main = scratch.join("main");
+        std::fs::create_dir_all(main.join("tooling")).expect("main tooling");
+        git(&main, &["init", "-q", "-b", "main"]);
+        std::fs::write(main.join("README"), "main\n").expect("README");
+        std::fs::write(
+            main.join("tooling/workspace.gitconfig"),
+            "[core]\n\tabbrev = 12\n",
+        )
+        .expect("included config");
+        git(&main, &["add", "."]);
+        git(&main, &["commit", "-qm", "initial"]);
+        git(
+            &main,
+            &["config", "include.path", "../tooling/workspace.gitconfig"],
+        );
+        let unit = scratch.join("unit");
+        let lane = scratch.join("lane");
+        git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--detach",
+                unit.to_str().expect("UTF-8"),
+            ],
+        );
+        git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "lane",
+                lane.to_str().expect("UTF-8"),
+            ],
+        );
+        let unit = unit.canonicalize().expect("canonical unit");
+        let lane = lane.canonicalize().expect("canonical lane");
+        let error = fetch_target_branch(&unit, &lane, &WorkspaceName::new("lane").expect("lane"))
+            .await
+            .expect_err("a fetch under main-tree include grants is refused");
+        assert_eq!(
+            error.code,
+            crate::error::ErrorCode::SandboxDenied,
+            "{}",
+            error.message
+        );
+        assert!(error.message.contains("cannot fetch"), "{}", error.message);
+        assert!(
+            error.message.contains("tooling/workspace.gitconfig"),
+            "{}",
+            error.message
+        );
+        assert!(error.hint.contains("standalone lane"), "{}", error.hint);
     }
 }
 
