@@ -308,15 +308,21 @@ export enum ErrorCode {
   COUNT_OVERFLOW = 10,
   /** A keyed fold's immutable metadata differs from its init value. */
   METADATA_CONFLICT = 11,
-  /** Physical journal budget refused before mutation; end/reset the undo window before retrying. */
+  /**
+   * Physical journal record budget refused a write before it was made. Writes earlier in the window stand as an exact
+   * accepted prefix that the window's rollback restores; the window refuses every later write until ended or reset.
+   */
   JOURNAL_OVERFLOW = 12,
   /** A paired delta export was refused because the range contains an undo-only mutation. */
   DELTA_LANE_MISMATCH = 13,
   /** Beginning a window refused because another speculation window is still active. */
   SPECULATION_ACTIVE = 14,
   /**
-   * Working memory the batch or call needs could not be allocated. Every buffer it can grow is reserved before its
-   * first write, so the refused batch or call wrote nothing and can be run again as it is. Not a request to grow.
+   * Working memory could not be allocated. Not a request to grow. Outside a recording window every buffer a batch or
+   * call can grow is reserved before its first write, so the refused batch or call wrote nothing and can be run again
+   * as it is. Inside one, the journal backs its storage capture by capture, so the refusal behaves like
+   * `JOURNAL_OVERFLOW`: the refused write and every later one wrote nothing, earlier writes stand as an exact accepted
+   * prefix, and the batch may run again only after the window is rolled back past it.
    */
   OUT_OF_MEMORY = 15,
 }

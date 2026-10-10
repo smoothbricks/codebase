@@ -5,7 +5,7 @@
 mod common;
 
 use columine_types::PROGRAM_MAGIC;
-use columine_types::types::{ErrorCode, SlotType};
+use columine_types::types::{ErrorCode, Opcode, SlotType};
 use columine_types::vo::{
     UnavailableVoAdmission, VoAdmissionError, VoFieldLink, VoMetadata, VoProfile, VoProgramMetadata,
 };
@@ -170,6 +170,128 @@ fn ordinary_owned_program_executes_and_rolls_back_without_a_vo_capability() {
     );
     assert_ne!(inserted, empty);
     assert!(needed > 0, "the first patch backs its scratch");
+}
+
+/// A recording window whose storage the memory cannot back refuses the write
+/// as `OutOfMemory` before its writer runs, the image unchanged, and keeps
+/// refusing it: the host is told to raise its memory, not to shrink the
+/// batch. The record budget's refusal stays `JournalOverflow` (undo_intern).
+#[test]
+fn journal_storage_the_memory_cannot_back_is_out_of_memory_and_sticky() {
+    let bitmap = assemble(&[0x10, 0, SlotType::Bitmap as u8, 64, 0, 0], &[0]);
+    let size = calculate_state_size(&bitmap, DEFAULT_ACCEPTED_PROGRAM_MAGICS).unwrap();
+    let mut empty = vec![0; usize::try_from(size).unwrap()];
+    init_state(&mut empty, &bitmap, DEFAULT_ACCEPTED_PROGRAM_MAGICS).unwrap();
+    let byte = u32::try_from(empty.len() - 1).unwrap();
+    for delta in [false, true] {
+        let (written, needed) = at_every_allocation(
+            || {
+                let mut vm = Vm::new(DEFAULT_ACCEPTED_PROGRAM_MAGICS);
+                vm.undo_enable(&empty)
+                    .expect("the window opens outside the budget");
+                (vm, empty.clone())
+            },
+            |(mut vm, mut state)| {
+                let mut ran = false;
+                match vm.capture_mutation(delta, &mut state, &[(byte, 1)], |image| {
+                    ran = true;
+                    image[byte as usize] ^= 1;
+                }) {
+                    Ok(()) => Ok(state),
+                    Err(code) => {
+                        assert!(!ran, "the writer never runs under a refusal");
+                        assert_eq!(state, empty, "a refused write leaves the image");
+                        assert!(vm.undo_has_overflow(), "the refusal is sticky");
+                        let again = vm.capture_mutation(delta, &mut state, &[(byte, 1)], |_| {});
+                        assert_eq!(again, Err(code), "a later write answers the same refusal");
+                        Err(code)
+                    }
+                }
+            },
+            |budget, code| {
+                assert_eq!(
+                    code,
+                    ErrorCode::OutOfMemory,
+                    "delta {delta}, budget {budget}"
+                );
+            },
+        );
+        assert_ne!(written, empty, "the backed write lands");
+        assert!(
+            needed > 0,
+            "the window backs its storage at the first write"
+        );
+    }
+}
+
+/// A recording window backs its journal storage capture by capture, so a
+/// memory that refuses it in the middle of a batch answers `OutOfMemory` with
+/// the rows before the refused one written: an exact accepted prefix, as with
+/// `JournalOverflow`. Rolling the window back to the checkpoint taken before
+/// the batch restores the image byte for byte; only then may the batch run
+/// again. Every refusal here is that one, and some land mid-batch.
+#[test]
+fn a_batch_refused_for_journal_storage_leaves_a_prefix_the_window_rolls_back() {
+    let map = assemble(
+        &[Opcode::SlotDef as u8, 0, SlotType::HashMap as u8, 16, 0, 0],
+        &[Opcode::BatchMapUpsertLast as u8, 0, 0, 1, 0],
+    );
+    let size = calculate_state_size(&map, DEFAULT_ACCEPTED_PROGRAM_MAGICS).unwrap();
+    let mut empty = vec![0; usize::try_from(size).unwrap()];
+    init_state(&mut empty, &map, DEFAULT_ACCEPTED_PROGRAM_MAGICS).unwrap();
+    let keys: Vec<u32> = (1..=8).collect();
+    let values: Vec<u32> = keys.iter().map(|key| key * 10).collect();
+    let cols = [u32s_as_bytes(&keys), u32s_as_bytes(&values)];
+    let rows = u32::try_from(keys.len()).unwrap();
+    for delta in [false, true] {
+        let mut prefixes = 0;
+        let (written, needed) = at_every_allocation(
+            || {
+                // Boxed outside the budget, so a refusal hands the VM back
+                // to the rollback check without allocating.
+                let mut vm = Box::new(Vm::new(DEFAULT_ACCEPTED_PROGRAM_MAGICS));
+                vm.undo_enable(&empty)
+                    .expect("the window opens outside the budget");
+                (vm, empty.clone())
+            },
+            |(mut vm, mut state)| {
+                let code = if delta {
+                    vm.execute_batch_delta(&mut state, &map, &cols, rows)
+                } else {
+                    vm.execute_batch(&mut state, &map, &cols, rows)
+                };
+                if code == 0 {
+                    Ok(state)
+                } else {
+                    Err((code, vm, state))
+                }
+            },
+            |budget, (code, mut vm, mut state)| {
+                assert_eq!(
+                    code,
+                    ErrorCode::OutOfMemory as u32,
+                    "delta {delta}, budget {budget}"
+                );
+                if state != empty {
+                    prefixes += 1;
+                }
+                assert_eq!(vm.undo_rollback(&mut state, 0), Ok(size));
+                assert_eq!(
+                    state, empty,
+                    "delta {delta}, budget {budget}: rollback restores"
+                );
+            },
+        );
+        assert_ne!(written, empty, "the backed batch lands");
+        assert!(
+            needed > 0,
+            "the window backs its storage while the batch runs"
+        );
+        assert!(
+            prefixes > 0,
+            "delta {delta}: some refusal lands after an accepted prefix"
+        );
+    }
 }
 
 #[test]

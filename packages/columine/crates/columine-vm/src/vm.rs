@@ -565,6 +565,9 @@ pub struct RedoLaneStatus {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct UndoStatus {
     pub enabled: bool,
+    /// The window refused a write and refuses every later one: its record
+    /// budget is spent (`JournalOverflow`) or the memory could not back its
+    /// storage (`OutOfMemory`); the refusing call answered which.
     pub overflow: bool,
     pub checkpoint: u32,
     pub delta_count: u32,
@@ -577,7 +580,10 @@ pub(crate) struct UndoState {
     redo: Vec<Option<FlatUndoEntry>>,
     redo_active: bool,
     delta_count: u32,
-    overflow: bool,
+    /// The window's sticky refusal: `JournalOverflow` when the record budget
+    /// (`UNDO_CAPACITY`) is spent, `OutOfMemory` when the memory cannot back
+    /// the journal's storage. Every later write in the window answers it.
+    refused: Option<ErrorCode>,
     enabled: bool,
     state_size: u32,
     saved_change_flags: Vec<u8>,
@@ -606,9 +612,15 @@ impl UndoState {
         self.delta_count
     }
 
+    /// Refuse every later write in the window with `code`, and answer it now.
+    fn refuse(&mut self, code: ErrorCode) -> Result<(), ErrorCode> {
+        self.refused = Some(code);
+        Err(code)
+    }
+
     fn reserve_entries(&mut self, count: u32) -> Result<(), ErrorCode> {
-        if self.overflow {
-            return Err(ErrorCode::JournalOverflow);
+        if let Some(code) = self.refused {
+            return Err(code);
         }
         if self
             .count()
@@ -616,12 +628,12 @@ impl UndoState {
             .and_then(|total| total.checked_add(count))
             .is_none_or(|total| total > UNDO_CAPACITY)
         {
-            self.overflow = true;
-            return Err(ErrorCode::JournalOverflow);
+            return self.refuse(ErrorCode::JournalOverflow);
         }
         // Back the admitted entries with storage now, grown geometrically to
         // actual demand, so no later push allocates. Storage that cannot be
-        // had refuses like the budget: before any write, and sticky.
+        // had refuses as `OutOfMemory`: before any write, and sticky, so the
+        // host is told to raise its memory, not to shrink the batch.
         let total = self.entries.len() + (self.reserved_entries + count) as usize;
         if self
             .entries
@@ -629,8 +641,7 @@ impl UndoState {
             .is_err()
             || (self.redo_active && self.redo.try_reserve(total - self.redo.len()).is_err())
         {
-            self.overflow = true;
-            return Err(ErrorCode::JournalOverflow);
+            return self.refuse(ErrorCode::OutOfMemory);
         }
         self.reserved_entries += count;
         Ok(())
@@ -646,8 +657,7 @@ impl UndoState {
         debug_assert!(self.redo.is_empty());
         let total = self.entries.len() + self.reserved_entries as usize;
         if self.redo.try_reserve(total).is_err() {
-            self.overflow = true;
-            return Err(ErrorCode::JournalOverflow);
+            return self.refuse(ErrorCode::OutOfMemory);
         }
         self.redo.resize(self.entries.len(), None);
         self.redo_active = true;
@@ -769,8 +779,8 @@ impl UndoState {
         state: &[u8],
         ranges: &[(u32, u32)],
     ) -> Result<ByteCapture, ErrorCode> {
-        if self.overflow {
-            return Err(ErrorCode::JournalOverflow);
+        if let Some(code) = self.refused {
+            return Err(code);
         }
         if u32::try_from(state.len()).ok() != Some(self.state_size) {
             return Err(ErrorCode::InvalidState);
@@ -779,12 +789,10 @@ impl UndoState {
         // Before-bytes and their ranges never exceed the declared bytes and
         // the reserved chunks; both are backed before the budget is taken.
         let bytes: usize = ranges.iter().map(|&(_, len)| len as usize).sum();
-        if self.overflow
-            || self.capture_scratch.try_reserve(bytes).is_err()
+        if self.capture_scratch.try_reserve(bytes).is_err()
             || self.capture_ranges.try_reserve(count as usize).is_err()
         {
-            self.overflow = true;
-            return Err(ErrorCode::JournalOverflow);
+            self.refuse(ErrorCode::OutOfMemory)?;
         }
         self.reserve_entries(count)?;
         let frame = CaptureFrame {
@@ -875,8 +883,8 @@ impl UndoState {
         if !self.enabled {
             return Ok(false);
         }
-        if self.overflow {
-            return Err(ErrorCode::JournalOverflow);
+        if let Some(code) = self.refused {
+            return Err(code);
         }
         if state.len() != self.state_size as usize
             || state.len() < columine_types::types::STATE_HEADER_SIZE as usize
@@ -5830,7 +5838,7 @@ impl Vm {
         u.redo.clear();
         u.redo_active = false;
         u.delta_count = 0;
-        u.overflow = false;
+        u.refused = None;
         u.export_start = 0;
         u.export_count = 0;
         u.export_overflow = false;
@@ -5900,7 +5908,7 @@ impl Vm {
         u.redo.clear();
         u.redo_active = false;
         u.delta_count = 0;
-        u.overflow = false;
+        u.refused = None;
         u.export_start = 0;
         u.export_count = 0;
         u.export_overflow = false;
@@ -5910,9 +5918,9 @@ impl Vm {
         u.enabled = false;
     }
 
-    /// Return whether delta export overflowed.
+    /// Return whether the window refused a write: its budget or its storage.
     pub fn undo_has_overflow(&self) -> bool {
-        self.undo.overflow
+        self.undo.refused.is_some()
     }
 
     /// Observe a journal without being able to reset its live window or refusal.
@@ -5923,10 +5931,10 @@ impl Vm {
     /// vm.undo.enabled = false;
     /// ```
     ///
-    /// They cannot clear an overflow:
+    /// They cannot clear a refusal:
     /// ```compile_fail,E0616
     /// let mut vm = columine_vm::vm::Vm::default();
-    /// vm.undo.overflow = false;
+    /// vm.undo.refused = None;
     /// ```
     ///
     /// They cannot change the journal's image extent:
@@ -5937,7 +5945,7 @@ impl Vm {
     pub fn undo_status(&self) -> UndoStatus {
         UndoStatus {
             enabled: self.undo.enabled,
-            overflow: self.undo.overflow,
+            overflow: self.undo.refused.is_some(),
             checkpoint: self.undo.count(),
             delta_count: self.undo.delta_count(),
         }
@@ -5997,7 +6005,7 @@ impl Vm {
         serialize_entries(&mut u.export_redo, redo.iter().copied());
         u.export_start = from_pos;
         u.export_count = count;
-        u.export_overflow = u.overflow;
+        u.export_overflow = u.refused.is_some();
         Ok(count)
     }
 

@@ -893,8 +893,8 @@ fn open(enabled: bool, overflow: bool, checkpoint: u32, delta_count: u32) -> Und
     }
 }
 
-/// Journal storage the memory cannot back refuses like the budget: the
-/// capture returns `JournalOverflow` before its writer runs, the image is
+/// Journal storage the memory cannot back refuses as `OutOfMemory`, sticky
+/// like the budget: the capture refuses before its writer runs, the image is
 /// unchanged, and the window stays refused once memory is available again.
 /// Only a new window clears it.
 #[test]
@@ -913,7 +913,7 @@ fn unbacked_capture_storage_refuses_before_any_write_and_stays_refused() {
             bytes::write_u64(image, cell, 1)
         })
     });
-    assert_eq!(Err(ErrorCode::JournalOverflow), refused);
+    assert_eq!(Err(ErrorCode::OutOfMemory), refused);
     assert!(
         !writer_ran,
         "a refused reservation never reaches the writer"
@@ -922,7 +922,7 @@ fn unbacked_capture_storage_refuses_before_any_write_and_stays_refused() {
     assert_eq!(open(true, true, 0, 0), vm.undo_status());
 
     assert_eq!(
-        Err(ErrorCode::JournalOverflow),
+        Err(ErrorCode::OutOfMemory),
         set_count(&mut vm, &mut state, cell, 1),
         "memory coming back does not reopen a refused window"
     );
@@ -945,12 +945,12 @@ fn unbacked_paired_write_refuses_before_inserting() {
     vm.undo_enable(&state).expect("undo window opens");
 
     let refused = without_memory(|| upsert(&mut vm, &mut state, 7, 70, true));
-    assert_eq!(ErrorCode::JournalOverflow, refused);
+    assert_eq!(ErrorCode::OutOfMemory, refused);
     assert_eq!(original, state, "the refusal wrote nothing");
     assert_eq!(None, lookup(&state, 7));
     assert_eq!(open(true, true, 0, 0), vm.undo_status());
     assert_eq!(
-        ErrorCode::JournalOverflow,
+        ErrorCode::OutOfMemory,
         upsert(&mut vm, &mut state, 7, 70, false)
     );
     assert_eq!(original, state);
@@ -972,7 +972,7 @@ fn unbacked_redo_lane_refuses_the_paired_write_and_stays_refused() {
     let written = state.clone();
 
     let refused = without_memory(|| upsert(&mut vm, &mut state, 2, 20, true));
-    assert_eq!(ErrorCode::JournalOverflow, refused);
+    assert_eq!(ErrorCode::OutOfMemory, refused);
     assert_eq!(written, state, "the refusal wrote nothing");
     assert_eq!(None, lookup(&state, 2));
     assert!(
@@ -981,7 +981,7 @@ fn unbacked_redo_lane_refuses_the_paired_write_and_stays_refused() {
     );
     assert_eq!(open(true, true, checkpoint, 0), vm.undo_status());
     assert_eq!(
-        ErrorCode::JournalOverflow,
+        ErrorCode::OutOfMemory,
         upsert(&mut vm, &mut state, 3, 30, false),
         "memory coming back does not reopen a refused window"
     );
