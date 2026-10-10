@@ -19,6 +19,9 @@ use super::{
     SystemCommandRunner,
 };
 
+#[path = "scratch_reclaim.rs"]
+mod reclaim;
+
 /// Every scratch root lives directly under this prefix and spells out the pid of the run that
 /// owns it. The pid is the whole ownership protocol: a later run can tell a live root from an
 /// abandoned one without any shared state of its own.
@@ -100,7 +103,17 @@ impl ScratchRoot {
         // A failed test unwinds with its volumes still attached; removing the tree without
         // detaching first strands kernel attachments pointing into a half-deleted root, and
         // leaves their volumes showing up in Finder and `mount` until the machine reboots.
-        if let Err(error) = detach_images(|image| image.starts_with(&self.path)) {
+        if let Err(error) =
+            detach_images(|image| image.starts_with(&self.path)).and_then(|unreleased| {
+                if unreleased.is_empty() {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::other(
+                        "one or more images could not be released",
+                    ))
+                }
+            })
+        {
             eprintln!(
                 "scratch root {} remains intact because its images could not be released: {error}",
                 self.path.display()
@@ -172,24 +185,32 @@ fn sweep_dead_runs() {
     if let Err(error) = end_processes_in(dead) {
         eprintln!("abandoned scratch roots: {error}");
     }
-    if let Err(error) = detach_images(dead) {
-        eprintln!("abandoned scratch roots remain intact after image-release failure: {error}");
-        return;
-    }
+    let unreleased = match detach_images(dead) {
+        Ok(unreleased) => unreleased,
+        Err(error) => {
+            eprintln!(
+                "abandoned scratch roots remain intact because image release could not be inventoried: {error}"
+            );
+            return;
+        }
+    };
     let Ok(entries) = fs::read_dir("/private/tmp") else {
         return;
     };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if dead(&path)
-            && let Err(error) = fs::remove_dir_all(&path)
-        {
+    reclaim::reclaim_dead_roots(
+        entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| dead(path)),
+        &unreleased,
+        |path| fs::remove_dir_all(path),
+        |path, error| {
             eprintln!(
                 "abandoned scratch root {} was not removed: {error}",
                 path.display()
             );
-        }
-    }
+        },
+    );
     if let Err(error) = fs::write(SWEEP_RECORD, run.as_bytes()) {
         eprintln!("this run sweeps again: record its sweep in {SWEEP_RECORD}: {error}");
     }
@@ -260,7 +281,10 @@ fn process_is_gone(pid: i32) -> bool {
 /// lease"). One after another, every unmount and every detach of a root waited for a phase of its
 /// own class on a loaded host; released together, their unmounts can share a namespace phase and
 /// their detaches a storage phase. Each image still has exactly one holder.
-fn detach_images(select: impl Fn(&Path) -> bool) -> std::io::Result<()> {
+///
+/// Returns the backing paths whose individual release failed; an inventory or host-construction
+/// failure is an error because no root can then be proved safe to remove.
+fn detach_images(select: impl Fn(&Path) -> bool) -> std::io::Result<BTreeSet<PathBuf>> {
     let attached = SystemCommandRunner.attached_disk_images()?;
     let root = Path::new("/private/tmp");
     let host =
@@ -275,7 +299,7 @@ fn detach_images(select: impl Fn(&Path) -> bool) -> std::io::Result<()> {
         .filter(|image| select(image))
         .collect::<std::collections::BTreeSet<_>>();
     let release = |image: &Path| host.detach_existing_image(image, DetachIntent::Release);
-    let mut first_error = None;
+    let mut unreleased = BTreeSet::new();
     let mut report = |image: &Path, released: std::thread::Result<Result<(), _>>| {
         let error = match released {
             Ok(Ok(())) => return,
@@ -286,7 +310,7 @@ fn detach_images(select: impl Fn(&Path) -> bool) -> std::io::Result<()> {
             "scratch image {} could not be released: {error}",
             image.display()
         );
-        first_error.get_or_insert(error);
+        unreleased.insert(image.to_owned());
     };
     std::thread::scope(|scope| {
         let mut releasing = Vec::with_capacity(images.len());
@@ -310,10 +334,7 @@ fn detach_images(select: impl Fn(&Path) -> bool) -> std::io::Result<()> {
             report(image, thread.join());
         }
     });
-    match first_error {
-        Some(error) => Err(error),
-        None => Ok(()),
-    }
+    Ok(unreleased)
 }
 
 /// End every process but this one whose working directory `select` picks: `SIGTERM`, as `nx

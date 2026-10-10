@@ -3171,6 +3171,11 @@ fn real_apfs_raw_pin_prevents_foreign_eject_during_fsck() {
     backend
         .mount(&attachment, &mount, MountAccess::ReadWrite, false)
         .expect("pin also holds while mounting");
+    assert_eq!(
+        backend.runner().ejected.load(Ordering::SeqCst),
+        0,
+        "foreign diskutil ejected an image while its raw volume was pinned during mount"
+    );
     backend
         .detach(&attachment, DetachIntent::Release)
         .expect("detach owned image");
@@ -5073,7 +5078,7 @@ fn real_apfs_kernel_mount_flag_truth_table_allows_browse_but_requires_owners() {
             .contains("non-canonical flags")
     );
     // The verification attachment still holds the raw device pin. Hdiutil's detach is refused
-    // while it is held, so release it first, as the standalone wrong-flags test did implicitly.
+    // while it is held, so release it before healing by mountpoint.
     drop(attachment);
 
     host.heal_mount(&workspace(), &mount)

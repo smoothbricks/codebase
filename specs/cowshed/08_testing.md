@@ -220,10 +220,6 @@ their 120s bound and the default per-test 30s bound stays unchanged. The existin
 remain explicit; they can exceed a single test's 30s share of the outer budget. The RAM host walk runs after this group
 in `test-host`, outside the four pure Bun shards, with its own existing target and case bounds.
 
-The attach-budget precheck's expected attach count is remeasured whenever this group's real-APFS test set changes. A
-conservative stand-in is labeled as such, never reported as a measured count; before landing, the configured count is
-pinned to observed attach-command receipts plus an explicitly stated fixed margin.
-
 **The suite spends a finite host budget.** Every attach→detach cycle a test makes costs one AppleDiskImages2 attach slot
 that the host's live sheds lose until reboot (01_storage.md, "How the APFS host degrades"), so a test pays the fewest
 attach cycles that prove its behavior. A run that killed a test leaves that test's images attached until the next run's
@@ -233,10 +229,14 @@ unmount under the host's namespace lease and then a detach under its storage lea
 (05_gateway.md, "Disk-lifecycle lease"), so releasing a CLI fixture's main, build and workspace images one after another
 waited for a phase change at every step on a loaded host. A run sweeps its dead predecessors once, on a thread beside
 each test process's first test: one process sweeps while the others wait on the lock and then find the run's sweep
-recorded, and every scratch root's teardown waits for its process's sweep, so no test process ends with it unfinished. A
-test is charged only what is left of the sweep once its body is done: nothing a test does depends on the sweep, since no
-sweep selects a live pid's root. Inside the first scratch root of every test process, the sweep cost 2 s on a quiet run
-and 13 s after a run whose tests timed out, and every other test process of the run waited on its lock for as long.
+recorded, and every scratch root's teardown waits for its process's sweep, so no test process ends with it unfinished.
+An individual image-release refusal retains only the dead root containing that image; the sweep reports every refusal
+and still removes other dead roots after releasing their images. An inventory failure retains every root, since no
+root's image-release safety can then be proved. Root-local refusal and continued reclamation have a pure,
+platform-independent regression; one unrelated legacy image must not leave another run's already-detached files behind.
+A test is charged only what is left of the sweep once its body is done: nothing a test does depends on the sweep, since
+no sweep selects a live pid's root. Inside the first scratch root of every test process, the sweep cost 2 s on a quiet
+run and 13 s after a run whose tests timed out, and every other test process of the run waited on its lock for as long.
 
 Coverage pays for an attachment only when the kernel behavior is the oracle. The image-growth witness also checks
 normalized whole/volume device names; unheld RW/RO live captures preserve source facts on success and destination
