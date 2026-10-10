@@ -93,6 +93,60 @@
   # same files for anything that names it.
   rustToolchainBin = "${config.languages.rust.toolchainPackage}/bin";
 in {
+  # nixpkgs carries actionlint, not the jdx fork. Supply the immutable upstream
+  # release as a normal package, with the same pin in developer shells and CI.
+  # Nix fetches/verifies it once; validation never installs or compiles a tool.
+  overlays = [
+    (_final: prev: let
+      sources = {
+        aarch64-darwin = {
+          platform = "darwin_arm64";
+          hash = "sha256-GtIQvSH0xwqB4L/+zG0iPayo3RPlf6aJl4cGT4tyTHw=";
+        };
+        x86_64-darwin = {
+          platform = "darwin_amd64";
+          hash = "sha256-A8y1LzvzxrG2NYaJpNMeXwXVWLMsC47a6sfEUqvn//Q=";
+        };
+        aarch64-linux = {
+          platform = "linux_arm64";
+          hash = "sha256-l4qfMsxO0dgblFY/xJZDuLOkjcuk0eoInZugX34X56c=";
+        };
+        x86_64-linux = {
+          platform = "linux_amd64";
+          hash = "sha256-AmvObQ7xlvWyK/Q6yxNI1HxdClrmHW7DvboSKagjFhs=";
+        };
+      };
+      system = prev.stdenv.hostPlatform.system;
+      source = sources.${system} or (throw "jactionlint: unsupported managed shell platform ${system}");
+    in {
+      jactionlint = prev.stdenvNoCC.mkDerivation rec {
+        pname = "jactionlint";
+        version = "2.0.2";
+        src = prev.fetchurl {
+          url = "https://github.com/jdx/jactionlint/releases/download/v${version}/jactionlint_${version}_${source.platform}.tar.gz";
+          inherit (source) hash;
+        };
+        sourceRoot = ".";
+        dontConfigure = true;
+        dontBuild = true;
+        # Preserve the upstream signed macOS executable; no strip/patch phase.
+        dontFixup = true;
+        installPhase = ''
+          runHook preInstall
+          install -Dm755 jactionlint "$out/bin/jactionlint"
+          runHook postInstall
+        '';
+        meta = {
+          description = "Static correctness, security and policy checker for GitHub Actions";
+          homepage = "https://github.com/jdx/jactionlint";
+          license = lib.licenses.mit;
+          mainProgram = "jactionlint";
+          platforms = builtins.attrNames sources;
+        };
+      };
+    })
+  ];
+
   env = lib.mkMerge [
     {
       # Nx otherwise defaults to three workers. Scale to the cores available in each
@@ -324,6 +378,8 @@ in {
       goPkgs.go
       pkgs.nodejs_26
       pkgs.binaryen
+      # Smoo's GitHub Actions validator uses the managed prebuilt package above.
+      pkgs.jactionlint
       # Test runner for inferred Cargo test targets. Generated targets must never
       # depend on an ambient host installation that CI does not reproduce.
       pkgs.cargo-nextest
