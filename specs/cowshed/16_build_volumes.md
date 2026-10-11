@@ -769,6 +769,11 @@ An Nx task hash must not change between checkouts of the same tree.
   `gather_self_inputs` adds the project configuration; `hash_project_config.rs` hashes every target's executor, options,
   outputs and configurations). Input declarations cannot remove it; a project whose target definitions change often
   re-keys all of its tasks.
+- A file list that inference writes into a target (a command, its metadata or its inputs) names only files in Nx's
+  workspace file index: .gitignore and .nxignore applied. A walk of the tree also finds ignored generated modules that a
+  build left on disk and that a fresh checkout lacks. Through the project configuration, such a list re-keys every task
+  that reaches the project, depending on whether a build ran in that checkout (measured in a consumer workspace: 197 of
+  510 gate tasks).
 - A target that runs no package from `node_modules` declares `externalDependencies: []`; otherwise a lockfile edit
   re-keys it.
 - **Enforced by**: step 2b of every land (100% hits on main) and the fork test (100% hits in a fresh fork).

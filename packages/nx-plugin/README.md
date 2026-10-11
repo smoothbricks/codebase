@@ -41,10 +41,12 @@ question, answered only by the deploy tags the CLI reads (`stage-deploy-target` 
 Lint commands are inferred per project. A workspace Biome configuration enables the project-wide Biome check; an ESLint
 flat configuration enables ESLint for existing JavaScript/TypeScript files under that project's `src` and the files its
 `tsconfig.test.json` declares, wherever they live. TypeScript resolves inherited `include`, `files` and `exclude`; the
-same sources, the test declaration and its existing `extends` chain are explicit lint cache inputs. Rust-only source
-trees keep their Cargo validation and manifest checks without invoking ESLint on nonexistent JavaScript inputs. Adding
-JavaScript/TypeScript sources or changing the declared test program updates lint coverage automatically. The target's
-`metadata.eslintFileSet` retains that exact command and workspace-relative file list for cache inspectors.
+same sources, the test declaration and its existing `extends` chain are explicit lint cache inputs. Both lists hold only
+files in Nx's workspace file index (.gitignore and .nxignore applied), so a gitignored generated module that a build
+left on disk is neither linted nor keyed, and the lint target is the same in every checkout of one tree. Rust-only
+source trees keep their Cargo validation and manifest checks without invoking ESLint on nonexistent JavaScript inputs.
+Adding JavaScript/TypeScript sources or changing the declared test program updates lint coverage automatically. The
+target's `metadata.eslintFileSet` retains that exact command and workspace-relative file list for cache inspectors.
 `@smoothbricks/nx-plugin/eslint-file-set` owns its type and generated validator; an inspector can resolve each file's
 actual ESLint parser program instead of guessing from the project or target name.
 

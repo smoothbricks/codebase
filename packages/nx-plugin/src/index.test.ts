@@ -16,6 +16,7 @@ import { createTargetDefaultsResults } from 'nx/src/project-graph/utils/project-
 import { mergeTargetConfigurations } from 'nx/src/project-graph/utils/project-configuration-utils.js';
 import { createTaskGraph } from 'nx/src/tasks-runner/create-task-graph.js';
 import { getOutputsForTargetAndConfiguration } from 'nx/src/tasks-runner/utils.js';
+import { resetWorkspaceContext } from 'nx/src/utils/workspace-context.js';
 import { useFixtureCargoHome } from './__tests__/fixture-cargo-home.js';
 import { runtimeInputValue } from './__tests__/runtime-input.js';
 import { BOUNDED_TEST_KILL_AFTER_MS, BOUNDED_TEST_TIMEOUT_MS } from './bounded-test-policy.js';
@@ -1003,6 +1004,40 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       );
       expect(lint?.inputs).not.toContain('{workspaceRoot}/packages/example/tests/excluded.ts');
       expect(lint?.inputs).not.toContain('{workspaceRoot}/packages/example/other/stray.test.ts');
+    } finally {
+      await workspace.cleanup();
+    }
+  });
+
+  it('lints and keys only the sources Nx indexes, never ignored files a build left on disk', async () => {
+    const workspace = await createWorkspace();
+    try {
+      await workspace.write('eslint.config.mjs', 'export default [{ files: ["**/*.ts"] }];\n');
+      // Generated outputs one build wrote and a fresh checkout lacks: a root ignore, a
+      // project-level one, and an .nxignore, the three ways Nx keeps a file out of its index.
+      await workspace.write('.gitignore', 'packages/example/src/generated/\n');
+      await workspace.write('packages/example/.gitignore', '*.generated.ts\n');
+      await workspace.write('.nxignore', 'packages/example/tests/nx-ignored.ts\n');
+      await workspace.write('packages/example/package.json', '{"name":"example"}\n');
+      await workspace.write('packages/example/tsconfig.test.json', '{"include":["tests/**/*.ts"]}\n');
+      await workspace.write('packages/example/src/index.ts', 'export const value = 1;\n');
+      await workspace.write('packages/example/src/generated/schemas.gen.ts', 'export const schemas = 1;\n');
+      await workspace.write('packages/example/src/catalog.generated.ts', 'export const catalog = 1;\n');
+      await workspace.write('packages/example/tests/check.test.ts', 'export const check = 1;\n');
+      await workspace.write('packages/example/tests/helpers/catalog.generated.ts', 'export const c = 1;\n');
+      await workspace.write('packages/example/tests/nx-ignored.ts', 'export const ignored = 1;\n');
+
+      const { lint } = await inferProjectTargets(workspace, 'packages/example/package.json');
+      const files = ['packages/example/src/index.ts', 'packages/example/tests/check.test.ts'];
+      expect(lint?.metadata?.eslintFileSet).toEqual({
+        command: `eslint ${files.map((file) => `'${file}'`).join(' ')}`,
+        files,
+      });
+      expect(lint?.options?.commands).toEqual([lint?.metadata?.eslintFileSet.command]);
+      const programInputs = (lint?.inputs ?? []).filter(
+        (input): input is string => typeof input === 'string' && input.startsWith('{workspaceRoot}/packages/example/'),
+      );
+      expect(programInputs).toEqual(['{workspaceRoot}/packages/example/tests/check.test.ts']);
     } finally {
       await workspace.cleanup();
     }
@@ -2700,6 +2735,9 @@ async function inferProject(
 ) {
   const [, infer] = createNodes;
   await prepareCargoFixture(workspace.context.workspaceRoot);
+  // Each inference indexes the tree as it is now, as a fresh Nx process would: the
+  // in-process workspace context otherwise keeps the files of the first inference.
+  resetWorkspaceContext();
   const result = await infer([packageJsonPath], undefined, workspace.context);
   return result[0]?.[1].projects?.[dirname(packageJsonPath)];
 }
@@ -2716,6 +2754,7 @@ async function inferProjectWithNxJson(
 ) {
   const [, infer] = createNodesV2;
   await prepareCargoFixture(workspace.context.workspaceRoot);
+  resetWorkspaceContext();
   const result = await infer([packageJsonPath], undefined, {
     workspaceRoot: workspace.context.workspaceRoot,
     nxJsonConfiguration,

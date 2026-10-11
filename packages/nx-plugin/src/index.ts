@@ -75,6 +75,7 @@ import {
   PLATFORM_TARGET_GLOBS,
   RELEASE_CONFIGURATION,
 } from './workspace-config-policy.js';
+import { globIndexedFiles } from './workspace-index.js';
 
 export { CARGO_TEST_COMPILE_TARGET };
 
@@ -311,25 +312,32 @@ const ESLINT_CONFIG_FILES = [
   'eslint.config.cts',
 ];
 
-async function javaScriptSourceFiles(directory: string): Promise<string[]> {
-  if (!existsSync(directory)) return [];
-  const files: string[] = [];
-  for (const entry of await readdir(directory, { withFileTypes: true })) {
-    if (entry.isDirectory()) {
-      if (!isNonSourceDirectory(entry.name)) {
-        files.push(...(await javaScriptSourceFiles(join(directory, entry.name))));
-      }
-    } else if (entry.isFile() && /\.[cm]?[jt]sx?$/.test(entry.name)) {
-      files.push(join(directory, entry.name));
-    }
-  }
-  return files.sort();
+/** Every JavaScript and TypeScript module kind ESLint is handed. */
+const ESLINT_SOURCES_GLOB = '**/*.{js,jsx,cjs,mjs,ts,tsx,cts,mts}';
+
+/**
+ * The JavaScript and TypeScript files of Nx's workspace file index, listed once
+ * per graph computation; `null` when no workspace ESLint config enables ESLint.
+ *
+ * The ESLint file list is part of the lint target's command, metadata and
+ * inputs, and Nx hashes the whole target configuration into every task that
+ * reaches the project. A walk of the tree also listed gitignored generated
+ * modules a build had left on disk, so every such task's key depended on
+ * whether a build had run in that checkout: one workspace's graph listed them
+ * and a fresh fork's did not, which alone re-keyed 197 of 510 gate tasks.
+ * Drawing the list from the index makes the plugin and the hasher agree on one
+ * file set.
+ */
+async function indexedEslintSources(workspaceRoot: string): Promise<ReadonlySet<string> | null> {
+  if (!ESLINT_CONFIG_FILES.some((name) => existsSync(join(workspaceRoot, name)))) return null;
+  return new Set(await globIndexedFiles(workspaceRoot, [ESLINT_SOURCES_GLOB]));
 }
 
-async function projectLintCommands(
+function projectLintCommands(
   projectRoot: string,
   workspaceRoot: string,
-): Promise<{ commands: string[]; inputs: string[]; eslintFileSet: EslintFileSet | null }> {
+  eslintSources: ReadonlySet<string> | null,
+): { commands: string[]; inputs: string[]; eslintFileSet: EslintFileSet | null } {
   const commands: string[] = [];
   const inputs: string[] = [];
   let eslintFileSet: EslintFileSet | null = null;
@@ -338,8 +346,17 @@ async function projectLintCommands(
   if (BIOME_CONFIG_FILES.some((name) => existsSync(join(workspaceRoot, name)))) {
     commands.push(`biome check --files-ignore-unknown=true ${quote(projectRoot)}`);
   }
-  if (ESLINT_CONFIG_FILES.some((name) => existsSync(join(workspaceRoot, name)))) {
-    const sourceFiles = new Set(await javaScriptSourceFiles(join(absoluteProjectRoot, 'src')));
+  if (eslintSources !== null) {
+    const sourcePrefix = projectRoot === '.' ? 'src/' : `${posix.normalize(projectRoot)}/src/`;
+    const sourceFiles = new Set<string>();
+    for (const path of eslintSources) {
+      if (
+        path.startsWith(sourcePrefix) &&
+        !path.slice(sourcePrefix.length).split('/').slice(0, -1).some(isNonSourceDirectory)
+      ) {
+        sourceFiles.add(path);
+      }
+    }
     const testConfig = join(absoluteProjectRoot, 'tsconfig.test.json');
     if (existsSync(testConfig)) {
       // A test program can live anywhere the declaration selects, not just src.
@@ -358,13 +375,15 @@ async function projectLintCommands(
         if (path === '..' || path.startsWith('../') || isAbsolute(path)) {
           throw new Error(`${testConfig}: test source ${file} is outside the workspace and cannot be hashed`);
         }
-        if (!/\.[cm]?[jt]sx?$/.test(path) || path.split('/').some(isNonSourceDirectory)) continue;
-        sourceFiles.add(file);
+        // Only a module Nx indexes is linted and keyed. An ignored one is build
+        // output that a fresh checkout lacks; a JSON file is not ESLint's.
+        if (!eslintSources.has(path) || path.split('/').some(isNonSourceDirectory)) continue;
+        sourceFiles.add(path);
         inputs.push(`{workspaceRoot}/${path}`);
       }
     }
     if (sourceFiles.size > 0) {
-      const files = [...sourceFiles].sort().map((file) => relative(workspaceRoot, file).split(sep).join('/'));
+      const files = [...sourceFiles].sort();
       eslintFileSet = { command: `eslint ${files.map(quote).join(' ')}`, files };
       commands.push(eslintFileSet.command);
     }
@@ -942,8 +961,10 @@ function createNodesHandler(hostPlatform: NapiPlatform | null): CreateNodesHandl
     const results: CreateNodesResultV2 = [];
     const errors: Array<[file: string | null, error: Error]> = [];
     let cargoWorkspaces: CargoWorkspace[];
+    let eslintSources: ReadonlySet<string> | null;
     try {
       cargoWorkspaces = await resolveCargoWorkspaces(projectConfigurationFiles, context.workspaceRoot, hostPlatform);
+      eslintSources = await indexedEslintSources(context.workspaceRoot);
     } catch (error) {
       throw new AggregateCreateNodesError([[null, error instanceof Error ? error : new Error(String(error))]], results);
     }
@@ -969,6 +990,7 @@ function createNodesHandler(hostPlatform: NapiPlatform | null): CreateNodesHandl
               context.workspaceRoot,
               hostPlatform,
               cargoWorkspaces,
+              eslintSources,
               versionless,
             ),
           ]);
@@ -1092,6 +1114,7 @@ async function createProjectTargets(
   workspaceRoot: string,
   hostPlatform: NapiPlatform | null,
   cargoWorkspaces: readonly CargoWorkspace[],
+  eslintSources: ReadonlySet<string> | null,
   versionless: VersionlessManifestPolicy | null,
 ) {
   const projectRoot = dirname(packageJsonPath);
@@ -1840,7 +1863,7 @@ async function createProjectTargets(
     commands: lintCommands,
     inputs: lintProgramInputs,
     eslintFileSet,
-  } = await projectLintCommands(projectRoot, workspaceRoot);
+  } = projectLintCommands(projectRoot, workspaceRoot, eslintSources);
   if (validationTargets.length > 0 || lintCommands.length > 0) {
     targets.lint = {
       executor: lintCommands.length > 0 ? 'nx:run-commands' : 'nx:noop',

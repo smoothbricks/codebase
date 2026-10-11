@@ -2,8 +2,6 @@ import { realpath } from 'node:fs/promises';
 import { isAbsolute, join, posix, relative, sep } from 'node:path';
 
 import type { TargetConfiguration } from 'nx/src/devkit-exports.js';
-import { globWithWorkspaceContext, globWithWorkspaceContextSync } from 'nx/src/utils/workspace-context.js';
-import { workspaceRoot as daemonWorkspaceRoot } from 'nx/src/utils/workspace-root.js';
 
 import {
   CARGO_ANCESTOR_INPUTS,
@@ -13,6 +11,7 @@ import {
   readCargoResolve,
 } from './cargo-source-hash.js';
 import { runtimeInput, shellWord } from './runtime-input.js';
+import { globIndexedFiles } from './workspace-index.js';
 
 /**
  * The named input the plugin infers for every project with crates of a Cargo
@@ -72,11 +71,7 @@ export interface CargoClosureSource {
  * here has no files a fileset input can hash.
  */
 export async function indexedCargoManifests(workspaceRoot: string): Promise<ReadonlySet<string>> {
-  const manifests =
-    workspaceRoot === daemonWorkspaceRoot
-      ? await globWithWorkspaceContext(workspaceRoot, ['**/Cargo.toml'])
-      : globWithWorkspaceContextSync(workspaceRoot, ['**/Cargo.toml']);
-  return new Set(manifests);
+  return new Set(await globIndexedFiles(workspaceRoot, ['**/Cargo.toml']));
 }
 
 /**
