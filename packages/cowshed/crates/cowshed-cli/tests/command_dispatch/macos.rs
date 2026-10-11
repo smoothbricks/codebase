@@ -2662,7 +2662,8 @@ async fn real_apfs_a_foreign_database_holder_skips_adoption_with_its_pid_and_arg
 /// holder lets go `cowshed reseed main` refreezes the seed from it (16_build_volumes.md, Land
 /// step 5.6).
 #[tokio::test]
-async fn real_apfs_a_landing_volume_holder_keeps_the_previous_seed_and_the_land_still_adopts() {
+async fn real_apfs_a_landing_volume_holder_keeps_the_previous_seed_and_the_land_still_adopts_substrate_lifecycle()
+ {
     let (nx, node) = repository_nx();
     let mut fixture = Fixture::with(Project::Build {
         nx: Some((&nx, &node)),
@@ -2671,7 +2672,7 @@ async fn real_apfs_a_landing_volume_holder_keeps_the_previous_seed_and_the_land_
     let nx_reads = nx_read_paths(&fixture_nx(&fixture.checkout));
     let mut service = serve_project(&mut fixture, &nx_reads).await;
     let layout = build_volumes(&fixture);
-    let nx_check = nx_run_many(&node);
+    let nx_check = nx_run_many(&node, "build test");
     let topic = new_workspace(&mut service, "topic").await;
     fs::write(topic.join("a/src.txt"), b"src, changed\n").unwrap();
     git(&topic, &["commit", "-q", "-am", "change a"]);
