@@ -163,9 +163,9 @@ lazy promotion. `Redirect.source` is an AST-proven live shell destination and ne
 representation-transparent logs always read its independent protected `artifact`. `summary` remains deterministic,
 bounded, versioned, redacted diagnostic text and drives no denial, exit, quota, policy, or build-success decision.
 
-Protected content artifacts are authoritative within their origin incarnation/checkpoint boundary. Compact controller
-commitments are authoritative for job existence/status/order/lineage and expected counts/hashes, but contain no output
-payload. A mismatch is typed `integrity`; neither tier silently overwrites the other.
+Protected records and content artifacts are the authoritative evidence of a job; controller commitments are audit
+telemetry and decide nothing (11_shell.md, `ControllerCommitment`). A protected record or artifact that fails its own
+digest, count, counter or lineage check is typed `integrity`; cowshed never silently overwrites it.
 
 ## Exit codes (stable API)
 
@@ -192,9 +192,9 @@ before exec or the child itself returned that status.
 - Wrapper failures are **100** internal, **101** usage, **102** not-found, **103** conflict, **104** env-missing,
   **105** sandbox-denied-pre-spawn, and **106** integrity.
 - Exit/typed **6** is emitted only on authoritative denial evidence (04_sandbox.md), never output string scanning.
-- Exit/typed **7** covers missing/altered committed content, invalid complete Arrow batches, and commitment
-  count/hash/batch/lineage mismatch. Discarding an incomplete trailing batch is successful recovery with a structured
-  recovery report, not exit 7.
+- Exit/typed **7** covers a missing or altered protected artifact, invalid complete Arrow batches, a count/hash/batch or
+  manifest digest mismatch, a checkpoint-barrier counter behind a durable barrier, and an incarnation outside the marker
+  lineage. Discarding an incomplete trailing batch is successful recovery with a structured recovery report, not exit 7.
 - NAPI/MCP surface the same taxonomy as structured errors/outcomes (07_api.md, 12_mcp.md).
 
 ## Commands

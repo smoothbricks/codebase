@@ -77,12 +77,33 @@ done. They are independent of each other.
 
 ## CPU budget through Cargo's jobserver
 
-- Spec: `specs/cowshed/05_gateway.md:443-445`: processes outside `bounded-exec` take the CPU budget through Cargo's
-  make-protocol jobserver, which hands out the same tokens.
+- Spec: `specs/cowshed/05_gateway.md:446-448`: processes outside `bounded-exec` (Nx's own `nx:run-commands` builds, a
+  host shell's `cargo`) take the CPU budget through Cargo's make-protocol jobserver, which hands out the same tokens as
+  the `cpu-budget` ledger. This is the confirmed design: the gateway serves the jobserver, backed by the ledger.
 - Code: `crates/cowshed-cli/src/launchd.rs:411` notes that cargo creates its own jobserver; the gateway serves none.
-- Work: the gateway serves a jobserver backed by the same token ledger, and the managed environment names it to cargo.
+- Work: the gateway serves a make-protocol jobserver whose tokens are leases on the same ledger, and the managed
+  environment names it to cargo through `CARGO_MAKEFLAGS`/`MAKEFLAGS` (`--jobserver-auth=fifo:<path>`). The spec does
+  not say how tokens held by a client killed mid-build return to the ledger (a make-protocol token is a byte the client
+  never writes back); decide and specify that in 05 before building.
 - Acceptance: a host-shell `cargo build` and a `bounded-exec` task running together never hold more tokens than the host
   has cores (`{"op":"cpu-budget"}` shows both).
+
+## Job id in the proxy userinfo
+
+- Spec: `specs/cowshed/03_caches.md:127-135` and `:273-275`: a job's proxy variables carry `job-<job_id>` as the
+  userinfo username and the workspace token as the password. `05_gateway.md:66-70`: the gateway records that username as
+  the request's job attribution and authenticates only the password. `13_telemetry.md` "Attribution tiers" tier 2: proxy
+  traffic is job-exact even when a workspace's jobs overlap.
+- Code: `crates/cowshed-core/src/runtime/supervisor.rs:946-951` (`gateway_proxy_url`) always writes the username
+  `cowshed`, and the URL is built once per sandbox environment (`:1352`), not per job.
+  `crates/cowshed-gateway/src/proxy.rs:2347-2370` decodes `Basic` and deliberately ignores the username.
+- Work: build the four proxy variables per job at spawn, with `job-<job_id>` as the username; a warm shell host is
+  activated before its job exists, so the job's values are applied at the spawn of its command, not at activation. In
+  the gateway, parse the username, accept `job-<decimal job id>` as attribution and anything else as none, keep the
+  password as the only credential, and write the job id on the gateway request span.
+- Acceptance: two overlapping jobs in one workspace each run `curl` through the proxy; each gateway span names its own
+  job id. A request whose username is `job-<id>` with a wrong token is still 401. The existing
+  `proxy_url_carries_the_token_as_basic_auth_userinfo` test is rewritten for the per-job URL.
 
 ## Escape-test crate and release gate
 

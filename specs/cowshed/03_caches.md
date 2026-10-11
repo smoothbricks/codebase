@@ -125,11 +125,14 @@ them there; they contain the endpoint URL, whose userinfo is the workspace token
     never trusts the workspace CA. No Go client presents the workspace token to a gateway route: `cmd/go` attaches
     credentials (netrc, `GOAUTH`, URL userinfo) only to HTTPS URLs.
 - **Generic proxy variables.** Workspace env wiring sets `HTTP_PROXY`, `HTTPS_PROXY`, `http_proxy`, and `https_proxy` to
-  `<GATEWAY_HTTP>` with the workspace token as its userinfo (`http://cowshed:<token>@…`), and configures
-  `NO_PROXY`/`no_proxy` only for the workspace's own local services. On Linux these variables therefore resolve to
-  `http://127.0.0.1:7644`; on macOS they resolve to the workspace block base. Userinfo is the one channel standard
-  clients (curl, libcurl so cargo, reqwest, Go) turn into `Proxy-Authorization: Basic` on the first CONNECT; the token
-  authenticates against nothing but this workspace's own endpoint.
+  `<GATEWAY_HTTP>` with the workspace token as its userinfo password (`http://cowshed:<token>@…`), and configures
+  `NO_PROXY`/`no_proxy` only for the workspace's own local services. A job's environment names the job instead of
+  `cowshed` as the userinfo username (`http://job-<job_id>:<token>@…`), which the gateway records for job-exact
+  attribution (13_telemetry.md "Attribution tiers"); the username is attribution only and authenticates nothing. On
+  Linux these variables therefore resolve to `http://127.0.0.1:7644`; on macOS they resolve to the workspace block base.
+  Userinfo is the one channel standard clients (curl, libcurl so cargo, reqwest, Go) turn into
+  `Proxy-Authorization: Basic` on the first CONNECT; the token authenticates against nothing but this workspace's own
+  endpoint.
 - **Trust bundle.** `.cowshed/ca-bundle.pem` in the private environment holds the platform roots followed by the
   workspace CA. The core points `GIT_SSL_CAINFO` and `SSL_CERT_FILE` at it; each detected capability adds its tool's own
   variable, such as cargo's `CARGO_HTTP_CAINFO` (04_sandbox.md).
@@ -268,7 +271,8 @@ them there; they contain the endpoint URL, whose userinfo is the workspace token
       `~/.gradle/caches`, so the daemon, wrapper distributions, native libraries and JDKs stay private and no other part
       of the host `~/.gradle` is granted;
     - the `.cowshed/env` set again (the token, the port pair), `SCCACHE_SERVER_UDS` and `SCCACHE_DIR` (the host sccache
-      daemon, below), and `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` in both cases, carrying the token as proxy userinfo;
+      daemon, below), and `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` in both cases, carrying `job-<job_id>` and the token as
+      proxy userinfo;
     - the build wiring: `SCCACHE_BASEDIR_CWD=1`, `SCCACHE_BASEDIR=<workspace root>`, and `RUSTC_WRAPPER` naming
       `bin/sccache` inside the store path the host's sccache GC root pins, the program the daemon itself runs (below).
       It is read through the root before every spawn and names the program rather than a `PATH` entry: shell activation

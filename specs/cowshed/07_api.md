@@ -608,11 +608,11 @@ plus one; projected bytes are all of its existing checkpoint allocated bytes (pi
 active image's allocated bytes. `pinned_checkpoint_bytes` is an authoritative reporting subset, not an exclusion from
 quota. Sibling workspaces consume none of the cap. Exact `<=` boundaries pass; `>` is `CowshedError::Conflict` before
 any checkpoint image, fact, metadata, or barrier publication. Only then does cowshed run the 02_workspaces.md barrier,
-clone while held, and publish the controller manifest-digest/lineage commitment. Manifest/commitment mismatch is
-`CowshedError::Integrity`. Restore remains coordinator-only. On controller startup, restore retryability is derived only
-from APFS `PendingPublicationFact`s backed by exact `.restore.json` substrate recovery facts. The coordinator
-idempotently republishes the matching `RestoreCommitment`, activates the pending detached metadata, and removes the
-fact; no runtime journal or `.restore-fences` capability exists.
+clone while held, and record the audit `CheckpointCommitment`. Restore validates the checkpoint's own manifest and
+returns `CowshedError::Integrity` on any mismatch (09_substrates.md). Restore remains coordinator-only. On controller
+startup, restore retryability is derived only from APFS `PendingPublicationFact`s backed by exact `.restore.json`
+substrate recovery facts. The coordinator idempotently republishes the matching `RestoreCommitment`, activates the
+pending detached metadata, and removes the fact; no runtime journal or `.restore-fences` capability exists.
 
 `JobInfo.state = OutputLimit` is the explicit result when the configurable combined stdout+stderr quota (default 1 GiB)
 is crossed. Accounting includes protected and in-flight bytes; the supervisor admits no payload beyond the exact
@@ -621,11 +621,11 @@ remain a separate bounded diagnostic projection.
 
 The shell connection is a reconnectable view over the persistent, permission-checked, multi-client per-workspace
 supervisor socket (11_shell.md). Dropping a `Session`, `JobHandle`, or transport never unlinks that socket or stops the
-job. Protected complete in-volume Arrow batches and sealed artifacts are authoritative captured-content evidence within
-their origin incarnation/checkpoint boundary. Controller commitments are authoritative for existence/status/order/
-lineage and expected counts/hashes, without payload/path duplication. APIs reconcile both and return `Integrity` for a
-missing committed artifact, invalid complete batch, or digest/lineage contradiction; neither side silently wins.
-Authorization, grant, and gateway audit authority remain controller-owned.
+job. Protected complete in-volume Arrow batches and sealed artifacts are the authoritative evidence of a job; controller
+commitments are audit telemetry that no API reads for a decision (11_shell.md). APIs return `Integrity` for a missing or
+altered artifact, an invalid complete batch, a checkpoint-barrier counter behind a durable barrier, or an incarnation
+outside the marker lineage; nothing silently wins. Authorization, grant, and gateway audit authority remain
+controller-owned.
 
 The invariant is the same one that keeps grant files outside the volume (01_storage.md, 04): a capability reachable from
 inside a sandbox must not authorize escalation. `WorkspaceHandle` is that principle expressed in the type system — a

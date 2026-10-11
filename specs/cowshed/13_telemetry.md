@@ -155,15 +155,23 @@ Under interception (05_gateway.md), most granted traffic is request-visible, so 
 1. **Cooperative lmao clients** on the plain-HTTP mirror endpoints or sending `traceparent` on an intercepted host:
    **exact span parentage** — the gateway adopts the inbound context. The in-image `xcrun` wrapper (03_caches.md) is
    first-party code, so `/sim/` broker calls (05_gateway.md) are tier-1 by construction.
-2. **Everything else** — an intercepted host whose client sent no `traceparent`, an `--opaque` tunnel, and the native
-   package managers (bun, cargo, Go): none takes a per-job registry URL, because none is wired to a mirror route that
-   could carry a `/t/<traceparent>` segment — is **workspace-exact** (port identity) and **job-attributed at query
-   time** by an interval join (request timestamp within a job's start/end, same workspace incarnation) over two
-   controller-owned tables. The resulting gateway span links the matching `job_id` to its standard lmao
-   trace/thread/span identity; exact when a workspace's jobs don't overlap, heuristic when they do.
+2. **Proxy clients carrying the job id** — every job's environment names its job id as the proxy userinfo username
+   (`http://job-<job_id>:<token>@…`, 03_caches.md), and the native package managers (bun, cargo, Go) and every other
+   proxy-aware client turn that userinfo into `Proxy-Authorization: Basic` on the request or CONNECT. The gateway
+   authenticates the password as the workspace token (05_gateway.md) and records the username's job id on the gateway
+   span: **job-exact**, whether or not the workspace's jobs overlap. The job id is attribution, never authority: the
+   endpoint and the token select and authenticate the workspace, and a process that rewrites its own proxy URL can
+   misattribute traffic only among its own workspace's jobs. A child inherits its job's environment, so its traffic is
+   the job's.
+3. **Everything else** — an intercepted host whose client sent no `traceparent` and no job userinfo (a shell outside any
+   job, whose wiring names `cowshed` as the username, or a client that drops proxy userinfo) — is **workspace-exact**
+   (port identity) and **job-attributed at query time** by an interval join (request timestamp within a job's start/end,
+   same workspace incarnation) over two controller-owned tables. The resulting gateway span links the matching `job_id`
+   to its standard lmao trace/thread/span identity; exact when a workspace's jobs don't overlap, heuristic when they do.
 
-Interception makes tier 2 richer than a tunnel would: an intercepted request is workspace-exact **with request-level
-detail** (verb, path, bytes) and an outbound-injected `traceparent`, even when the inbound client is silent.
+Interception makes tiers 2 and 3 richer than a tunnel would: an intercepted request is workspace-exact **with
+request-level detail** (verb, path, bytes) and an outbound-injected `traceparent`, even when the inbound client is
+silent.
 
 ## Storage: one authority tier, one audit trail, one Arrow substrate
 

@@ -9,8 +9,9 @@ the repository lock just before the update:
   and changes nothing;
 - a linked worktree holds it: refuse.
 
-Step 4 (build-volume adoption) is skipped for the bare-ref case (`02_workspaces.md:819-821`). The same contract is in
-`07_api.md:524-532`, `06_cli.md:226`, `12_mcp.md:116-121` and the test plan `08_testing.md:295-299`.
+Step 4 (build-volume adoption) is skipped for the bare-ref case (`02_workspaces.md:819-821`), and `16_build_volumes.md`
+"Land" step 3 skips its steps 4 to 7 (quiesce, carry, seed freeze, adoption and its check) for it. The same contract is
+in `07_api.md:524-532`, `06_cli.md:226`, `12_mcp.md:116-121` and the test plan `08_testing.md:295-299`.
 
 ## What the code does
 
@@ -34,7 +35,7 @@ docs repeat it (`packages/cowshed/docs/cli.md:973-974`, `packages/cowshed/skills
 - A race that moves the target between validation and the update returns `Conflict` and changes no ref.
 - A target checked out by a linked worktree is refused.
 
-## Open decision
+## Rebase stays out
 
-The pre-refusal design also rebased the source onto the target before validation. The current spec rejects an implicit
-rebase (`02_workspaces.md:757-760`: it would land a head nobody named). That rejection stays until ruled otherwise.
+The pre-refusal design also rebased the source onto the target before validation. The spec rejects an implicit rebase
+(`02_workspaces.md:757-760`: it would land a head nobody named), and that is the ruling: land never rebases.

@@ -320,12 +320,13 @@ Restore is one fenced transaction on both substrates:
    checkpoint identity, format/dataset, and absence of a concurrent retire. Stop admitting jobs, drain the
    revision-bound supervisor, and detach/unmount the current workspace.
 2. Prepare the replacement at a non-enumerated staging name. Clone the checkpoint, validate it (including fsck on APFS),
-   and validate the complete protected `CheckpointManifestRecord` against the controller `CheckpointCommitment`:
-   `repo_id`, `origin_incarnation`, `barrier_id`, visible stream counts/hashes/paths, `records_sha256`, and
-   `manifest_batch_sha256` must agree. Missing/altered content, invalid complete frames, or digest mismatch is typed
-   `Integrity` before publication; only an incomplete trailing frame may be discarded as reported recovery with its
-   `batch_sha256` retained. Preserve the logical workspace name, grant binding, CA, primary `repo_id`, and macOS
-   `portBlock` only when present. Linux preserves no port block.
+   and validate the clone's own complete protected `CheckpointManifestRecord`: its frame matches its `batch_sha256`,
+   `records_sha256` hashes the record prefix before it, its `repo_id` and `origin_incarnation` match the marker, and
+   every visible stream matches its count, hash and path. The controller's `CheckpointCommitment` is audit telemetry and
+   is not read. Missing/altered content, invalid complete frames, or digest mismatch is typed `Integrity` before
+   publication; only an incomplete trailing frame may be discarded as reported recovery with its `batch_sha256`
+   retained. Preserve the logical workspace name, grant binding, CA, primary `repo_id`, and macOS `portBlock` only when
+   present. Linux preserves no port block.
 3. Mint the fresh `workspaceIncarnation` first. Then mint a fresh gateway token bound to that incarnation and write both
    into staged marker/token files, flush, and verify while undiscoverable. Copied job records retain their producer
    incarnation; allocation in the new incarnation starts above every inherited numeric job ID.

@@ -332,15 +332,14 @@ attached workspace. Admission appends a complete `ProtectedRecord::Job(JobArtifa
 `ControllerCommitment::Admission(AdmissionCommitment)` before process creation, so spawn failure retains durable
 identity. A record's sequence comes from the `records.sequence` counter, published by atomic rename before the record is
 appended under the same lock, so a crash may leave a gap but never hands a sequence out twice. At startup the supervisor
-reconciles the maximum canonical `job_id` across valid complete in-volume allocation batches, controller commitments for
-the active lineage, and canonical spill directories, then chooses `max + 1` (or `1` when none exist). Any disagreement
-or duplicate durable key is `Integrity`, not a reason to reuse a number. Open/recovery requires every record's `repo_id`
-to equal the workspace's bound repository. A record incarnation may differ from the current marker only when controller
-fork/restore/checkpoint lineage and commitments admit it as inherited history; an unknown historical incarnation, or any
-new allocation under a non-current incarnation, is `Integrity`. Thus copied histories are intentional but cannot smuggle
-a foreign repository/timeline. Supervisor replacement and attach otherwise discard only an incomplete trailing Arrow
-batch and never rewrite a complete batch or sealed artifact. Fork/checkpoint/restore copies start above every inherited
-allocation; no separate high-water file exists.
+takes the maximum canonical `job_id` across valid complete in-volume allocation batches, canonical spill directories and
+the checked `records.job-floor` counter, then chooses `max + 1` (or `1` when none exist). Any duplicate durable key is
+`Integrity`, not a reason to reuse a number. Open/recovery requires every record's `repo_id` to equal the workspace's
+bound repository. A record incarnation may differ from the current marker only when the marker's fork/restore lineage
+names it as an ancestor; an unknown historical incarnation, or any new allocation under a non-current incarnation, is
+`Integrity`. Thus copied histories are intentional but cannot smuggle a foreign repository/timeline. Supervisor
+replacement and attach otherwise discard only an incomplete trailing Arrow batch and never rewrite a complete batch or
+sealed artifact. Fork/checkpoint/restore copies start above every inherited allocation.
 
 **Durability of a job's own records.** A job's records — its admission and terminal batches, its spill files (made
 durable when it backgrounds, sealed when it ends), the output copies it publishes, and its admission and terminal
@@ -562,7 +561,7 @@ supervisor clonefiles/reflinks or extent-copies into a temporary destination, fs
 Publication never changes `StreamInfo.storage`; reads and authority never resolve through it. Redirect snapshots and
 publication forbid hardlinks.
 
-Cross-incarnation completeness uses this exact tagged/versioned union:
+Controller commitments, the audit telemetry of job and lineage events, use this exact tagged/versioned union:
 
 ```rust
 enum ControllerCommitment {
@@ -587,14 +586,21 @@ validated on its own row and written to the configured sink (sealed Arrow segmen
 sink), and nothing replays them for a decision. No variant contains inline bytes, protected paths, redirect sources,
 summaries, or raw payload.
 
-Protected in-volume records and artifacts are authoritative captured-content evidence for their origin
-incarnation/checkpoint boundary. Controller commitments are authoritative for existence, lifecycle/status, ordering,
-fork/restore/checkpoint lineage, and the expected hashes/counts that detect omission, mutation, or rollback. Neither
-tier substitutes for the other. A missing committed artifact, unknown commitment, count/hash/terminal-batch/manifest
-digest mismatch, or lineage contradiction returns typed `Integrity`, stops status/restore/export from presenting the
-record as valid, and preserves both sides for diagnosis; cowshed never overwrites one side or chooses whichever appears
-newer. Grant authority remains in controller-owned grant files and gateway decisions remain in controller-owned audit
-segments.
+Protected in-volume records and artifacts are the authoritative evidence of what a workspace ran; the controller
+commitments above are telemetry about it and decide nothing. The protected tier carries its own checks. Every complete
+frame keeps its `batch_sha256`, so a mutated frame is caught. Each terminal job record holds its artifacts' byte counts
+and SHA-256 digests, and opening the store verifies them, as it does the files a checkpoint manifest's visible jobs
+name, so a missing or altered artifact is caught. A checkpoint manifest binds the record prefix it covers through
+`records_sha256`. Rollback is handled by the checked counters beside the records: `records.sequence`,
+`records.job-floor` and each incarnation's `records.barrier.*` are published before the records they number and only
+move forward. A log rolled back behind them (power loss taking a suffix) therefore never reuses a sequence, job id or
+barrier, and a barrier counter that trails a durable checkpoint barrier is detected as a rollback of the counter.
+Nothing in the volume detects a rollback of the whole image, records and counters together: the commitments record what
+happened for whoever reads the audit trail, and cowshed does not read them for a decision. Any detected fault, a
+duplicate durable key, or an incarnation outside the marker lineage returns typed `Integrity`, stops
+status/restore/export from presenting the record as valid, and preserves the evidence for diagnosis; cowshed never
+overwrites it or chooses whichever copy appears newer. Grant authority remains in controller-owned grant files and
+gateway decisions remain in controller-owned audit segments.
 
 Each `StreamInfo.summary` is a deterministic, bounded, versioned **diagnostic summary**, inspired by RTK/ContextCrawler:
 retain a small ordered context window around compiler/test/error signatures plus deterministic head/tail context,

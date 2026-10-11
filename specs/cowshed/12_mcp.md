@@ -100,8 +100,8 @@ even if compromised — escalation is strictly a decision made one level up.
 | `repo_mirror`       | `name`, `url`                                                                                                 | controller-owned read-only mirror path                   |
 
 A coordinator-scoped telemetry query tool (selector/SQL over controller commitments and telemetry, 13_telemetry.md) is
-roadmap, not v1. Workers get only one-workspace job status/log tools: lifecycle is reconciled against controller
-continuity commitments, while captured bytes resolve from protected in-volume artifacts within their origin boundary.
+roadmap, not v1. Workers get only one-workspace job status/log tools: lifecycle and captured bytes both resolve from
+protected in-volume records and artifacts within their origin boundary.
 
 `restore` requires a label — there is no "restore the latest" default. Worker `checkpoint` accepts an optional label.
 `grant`/`revoke` carry `expectedRevision` for compare-and-swap (07_api.md/04_sandbox.md) and a `repo[]` selector for
@@ -150,9 +150,9 @@ plus normal job/trace identity; inline bytes never enter JSON results or telemet
 
 `checkpoint` atomically enforces the coordinator-configured per-workspace checkpoint count and byte quotas. It reaches
 the supervisor barrier before cloning: running memory-only stream prefixes promote, protected files and a complete
-checkpoint-manifest Arrow batch fsync, and the controller publishes the manifest digest/lineage commitment. Quota
-exhaustion is a conflict carrying current usage and limits; it never silently prunes another checkpoint. Restore is
-coordinator-only and rejects any manifest/commitment mismatch as `Integrity`.
+checkpoint-manifest Arrow batch fsync, and the controller records the audit checkpoint commitment. Quota exhaustion is a
+conflict carrying current usage and limits; it never silently prunes another checkpoint. Restore is coordinator-only and
+rejects a checkpoint whose own manifest does not match its records and artifacts as `Integrity`.
 
 `push` has the same preservation and compare-and-swap semantics as `WorkspaceHandle::push` (07_api.md): it installs the
 exact fetched source head under `refs/cowshed/<ws>/heads/<branch>` in the main workspace repository/object store without
@@ -169,11 +169,11 @@ still applies. `stdoutCopy`/`stderrCopy` are the exact per-stream `{path,policy}
 never becomes authority.
 
 Every job result/event includes `(repoId, workspaceIncarnation, jobId)` and standard trace identity. Protected in-volume
-complete Arrow batches and sealed artifacts own captured content within the origin incarnation/checkpoint boundary.
-Compact controller commitments own existence/status/order/lineage and expected counts/hashes, but never output payload
-or artifact paths. The server reconciles both: missing/altered committed content, invalid complete batches, and
-count/hash/batch/lineage mismatch return `Integrity` (`-32006`), preserving both sides rather than trusting whichever
-appears newer. Discarding only an incomplete trailing batch is successful recovery.
+complete Arrow batches and sealed artifacts are the authoritative evidence within the origin incarnation/checkpoint
+boundary. Controller commitments are audit telemetry: they carry no output payload or artifact path, and the server
+reads none of them for a result. Missing/altered content, invalid complete batches, a count/hash/batch digest mismatch
+or a checkpoint-barrier counter behind a durable barrier return `Integrity` (`-32006`), preserving the evidence rather
+than trusting whichever copy appears newer. Discarding only an incomplete trailing batch is successful recovery.
 
 The resource sample is exactly `JobResourceSample` from 07_api.md: wall time, cumulative process-group CPU user/sys time
 and one-core CPU share, current/peak group RSS, immutable start and current/end host load1/cores, separate signed

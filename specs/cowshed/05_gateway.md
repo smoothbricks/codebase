@@ -64,10 +64,13 @@ Every data-plane request additionally carries exactly `Proxy-Authorization: Bear
 random bytes encoded as unpadded base64url, lives at `.cowshed/token` mode 0600, and is defense in depth rather than the
 workspace selector: the already-selected macOS listener or Linux socket chooses the workspace before comparison. A proxy
 client may present it as `Proxy-Authorization: Basic` with the token as password (what curl, libcurl, reqwest and Go
-send for proxy-URL userinfo). No other header carries it: a request's `Authorization` is the client's own and
-authenticates nothing. The gateway accepts no cookie, query parameter, URL userinfo, or path token; it strips
-`Proxy-Authorization` and `Authorization` before any upstream request. It decodes the presented value to bytes, rejects
-malformed or wrong-length values, and compares all 32 bytes in constant time. Missing or mismatched token is 401.
+send for proxy-URL userinfo). The Basic username authenticates nothing: `job-<job_id>` (a job's proxy URL, 03_caches.md)
+is recorded as the request's job attribution (13_telemetry.md "Attribution tiers"), and any other username, `cowshed`
+included, leaves the request to the query-time interval join. No other header carries the token: a request's
+`Authorization` is the client's own and authenticates nothing. The gateway accepts no cookie, query parameter, URL
+userinfo, or path token; it strips `Proxy-Authorization` and `Authorization` before any upstream request. It decodes the
+presented value to bytes, rejects malformed or wrong-length values, and compares all 32 bytes in constant time. Missing
+or mismatched token is 401.
 
 Create and fork mint a token. Restore stops admissions, drains the Linux connector and gateway connections, kills the
 connector cgroup, rotates the token, unlinks/recreates the Linux socket and namespace-local connector when applicable,
