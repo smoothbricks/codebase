@@ -259,7 +259,7 @@ export interface PackageSmooConfig {
    * every checkout gets it. Shell entry links each tree that installed the
    * package, a directory the machine lacks keeps the installed version, and CI
    * links nothing (tooling/direnv/developer-links.ts, which validates the same
-   * shape at runtime).
+   * shape at runtime). Nx is lockfile/patch-owned and cannot be declared here.
    */
   developerLinks?: Record<string, DeveloperLinkDirectory>;
 }

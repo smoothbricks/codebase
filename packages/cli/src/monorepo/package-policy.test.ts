@@ -129,6 +129,12 @@ describe('root smoo monorepo policy', () => {
             '@nx/js': '23.2.1',
             nx: 'https://example.com/releases/nx-23.2.1.tgz',
           },
+          smoo: {
+            developerLinks: {
+              nx: '../provider/.cache/patched-nx/package',
+              '@smoothbricks/lmao': '../provider/packages/lmao',
+            },
+          },
           patchedDependencies: {
             '@nx/js@23.2.1': 'patches/@nx%2Fjs@23.2.1.patch',
             'nx@23.1.0': 'patches/nx@23.1.0.patch',
@@ -144,11 +150,15 @@ describe('root smoo monorepo policy', () => {
         'package.json patchedDependencies.nx@23.2.1 must be patches/nx@23.2.1.patch; run smoo monorepo update',
       );
       expect(errors).toContain('package.json patchedDependencies.nx@23.1.0 is obsolete; run smoo monorepo update');
+      expect(errors).toContain(
+        'package.json smoo.developerLinks.nx is obsolete: the consumer lockfile and patch own Nx; run smoo monorepo update',
+      );
 
       applyNxPatchDefaults(root);
 
       const rootPackage = await readJson(join(root, 'package.json'));
       expect(rootPackage.overrides).toEqual({ typia: '14.0.6', '@nx/js': '23.2.1', nx: '23.2.1' });
+      expect(rootPackage.smoo?.developerLinks).toEqual({ '@smoothbricks/lmao': '../provider/packages/lmao' });
       expect(rootPackage.patchedDependencies).toEqual({
         '@nx/js@23.2.1': 'patches/@nx%2Fjs@23.2.1.patch',
         'nx@23.2.1': 'patches/nx@23.2.1.patch',

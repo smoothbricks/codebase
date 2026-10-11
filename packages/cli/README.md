@@ -477,13 +477,14 @@ root, `bun link <name>` links the root's `node_modules/<name>`. In a workspace m
 ln -sfn ~/src/smoothbricks/packages/cowshed packages/app/node_modules/@smoothbricks/cowshed
 ```
 
-Every install smoo runs keeps such a link: shell entry's install, a CI runner's frozen-lockfile install and
-`smoo monorepo update`. A developer link is any symlink directly in the root's or a workspace member's `node_modules`
-(scoped names included) whose target lies outside the repository. The install records these links first, then puts
-exactly those back afterwards. A link whose target no longer exists is removed with a warning, and that install puts the
-lockfile's version in its place. To unlink, remove the link: the next install puts the lockfile's version there. A
-missing external target also makes a matching stamp stale: the next managed shell entry installs and replaces the
-dangling link, while live external links are preserved.
+Every install smoo runs keeps such a link, except a link to Nx, which those installs replace (see Nx below): shell
+entry's install, a CI runner's frozen-lockfile install and `smoo monorepo update`. A developer link is any symlink
+directly in the root's or a workspace member's `node_modules` (scoped names included) whose target lies outside the
+repository. The install records these links first, then puts back every one except Nx. A link whose target no longer
+exists is removed with a warning, and that install puts the lockfile's version in its place. To unlink, remove the link:
+the next install puts the lockfile's version there. A missing external target, or a live link to Nx, also makes a
+matching stamp stale: the next managed shell entry installs and replaces the dangling or Nx link, while every other live
+external link is preserved.
 
 Only an observed missing target makes a link dangling. Permission or other metadata errors abort the install without
 removing captured links; an unreadable checkout is not a deleted checkout.
@@ -508,6 +509,14 @@ this helper does not promise transactional rollback of new package-manager entri
 linked checkouts on success or failure. `relink` selects links and creates none: a named package without a link to a
 local checkout when the install starts is left as the install leaves it, and a named link whose checkout is gone is
 removed with the usual warning first.
+
+Nx is the one package every managed install replaces. The repository's lockfile owns Nx, so the Nx a shell runs comes
+from `bun install`, never from a developer link to a local Nx checkout. The managed installs (shell entry's, a CI
+runner's frozen-lockfile one, and `smoo monorepo update`) therefore pass `{ relink: ['nx'] }`: a successful install
+leaves Nx as Bun installed it, and every other developer link is still put back. A live Nx link makes a matching
+shell-entry stamp stale, so the next managed shell entry runs one install that replaces it, and the shells after it stay
+current. `smoo.developerLinks.nx` is obsolete and refused: `smoo monorepo update` removes that declaration while keeping
+sibling package declarations. Nx must not be reselected by the developer-links postinstall task.
 
 #### Declared Links
 

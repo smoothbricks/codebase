@@ -159,6 +159,11 @@ export function applyNxPatchDefaults(root: string): void {
       changed = true;
     }
   }
+  const developerLinks = rootPackage.smoo?.developerLinks;
+  if (developerLinks !== undefined && Object.hasOwn(developerLinks, 'nx')) {
+    delete developerLinks.nx;
+    changed = true;
+  }
   rootPackage.overrides = overrides;
   rootPackage.patchedDependencies = patches;
   if (changed) {
@@ -877,6 +882,12 @@ function validateNxPatchPolicy(rootPackage: PackageJson): number {
       console.error(`package.json patchedDependencies.${key} is obsolete; run smoo monorepo update`);
       failures++;
     }
+  }
+  if (rootPackage.smoo?.developerLinks && Object.hasOwn(rootPackage.smoo.developerLinks, 'nx')) {
+    console.error(
+      'package.json smoo.developerLinks.nx is obsolete: the consumer lockfile and patch own Nx; run smoo monorepo update',
+    );
+    failures++;
   }
   return failures;
 }

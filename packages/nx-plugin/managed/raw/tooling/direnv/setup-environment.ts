@@ -22,7 +22,7 @@ import { parseArgs } from 'node:util';
 import { $ } from 'bun';
 import {
   applyDeclaredLinks,
-  hasDanglingDeveloperLinks,
+  hasStaleDeveloperLinks,
   keepDeveloperLinks,
   planDeclaredLinks,
   reportDeveloperLinks,
@@ -201,20 +201,26 @@ try {
     await withInstallLock(async () => {
       let frozenError: unknown;
       let fallbackError: unknown;
-      await keepDeveloperLinks(projectRoot, async () => {
+      try {
+        await keepDeveloperLinks(
+          projectRoot,
+          () => runSetupCommand('bun install --frozen-lockfile', $`bun install --frozen-lockfile`, { quiet: false }),
+          { relink: ['nx'] },
+        );
+      } catch (error) {
+        frozenError = error;
+        console.error('! Failed to install dependencies with frozen lockfile');
+        replayCapturedOutput(error);
         try {
-          await runSetupCommand('bun install --frozen-lockfile', $`bun install --frozen-lockfile`, { quiet: false });
-        } catch (error) {
-          frozenError = error;
-          console.error('! Failed to install dependencies with frozen lockfile');
-          replayCapturedOutput(error);
-          try {
-            await runSetupCommand('bun install', $`bun install`, { quiet: false });
-          } catch (fallback) {
-            fallbackError = fallback;
-          }
+          await keepDeveloperLinks(
+            projectRoot,
+            () => runSetupCommand('bun install', $`bun install`, { quiet: false }),
+            { relink: ['nx'] },
+          );
+        } catch (fallback) {
+          fallbackError = fallback;
         }
-      });
+      }
       if (fallbackError !== undefined) {
         reportSetupFailure(fallbackError);
       }
@@ -412,9 +418,9 @@ interface InstallStamp {
 
 /**
  * What every successful install of node_modules leaves in it, a CI runner's frozen install as well as a
- * developer's: the digest of what it ran on, in `node_modules/.smoo-install`. A developer entry skips the
- * install while the stamp matches, and devenv's smoo:install task lists the file among its inputs, so a
- * checkout without node_modules reads as changed there.
+ * developer's: the digest of what it ran on, in `node_modules/.smoo-install`. A developer entry skips the install
+ * while the stamp matches and no developer link is stale (bunInstaller), and devenv's smoo:install task lists the file
+ * among its inputs, so a checkout without node_modules reads as changed there.
  */
 function bunInstallStamp(inputs: readonly string[]): { isCurrent(): boolean; record(): void } {
   const stampPath = path.join(projectRoot, 'node_modules', '.smoo-install');
@@ -432,8 +438,8 @@ function bunInstallStamp(inputs: readonly string[]): { isCurrent(): boolean; rec
  * copy-on-write clone — is installed exactly when this one is. Besides the
  * stamp, the TypeScript API package must still resolve through its link, the
  * one package every managed repository installs, which catches a cache that
- * was pruned out from under node_modules. A dangling developer target also
- * invalidates a matching stamp, so the normal install replaces it.
+ * was pruned out from under node_modules. A dangling developer target, or a live link to Nx, also invalidates a
+ * matching stamp, so the normal install replaces it: Nx is the lockfile's, and the install relinks it.
  */
 function bunInstaller(inputs: readonly string[]): Installer {
   const stamp = bunInstallStamp(inputs);
@@ -441,10 +447,12 @@ function bunInstaller(inputs: readonly string[]): Installer {
     isCurrent: () =>
       stamp.isCurrent() &&
       findInstalledTypeScriptApiPackage(projectRoot) !== null &&
-      !hasDanglingDeveloperLinks(projectRoot),
+      !hasStaleDeveloperLinks(projectRoot, ['nx']),
     install: async ({ quiet }) => {
-      await keepDeveloperLinks(projectRoot, () =>
-        runSetupCommand('bun install --no-summary', $`bun install --no-summary`, { quiet }),
+      await keepDeveloperLinks(
+        projectRoot,
+        () => runSetupCommand('bun install --no-summary', $`bun install --no-summary`, { quiet }),
+        { relink: ['nx'] },
       );
       stamp.record();
     },

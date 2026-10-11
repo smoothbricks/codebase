@@ -16,8 +16,10 @@ import { DECLARED_LINKS_POSTINSTALL } from './package-policy.js';
  * commands for declared secrets, `bun install` (through the root `prepare`
  * lifecycle it triggers), `uv sync` (through a recording `uv` on PATH) and
  * `cargo fetch` (through a recording `cargo` on PATH).
- * No shell entry runs an install meant to replace developer links, so those
- * cases call `keepDeveloperLinks` directly, in a repository an entry installed.
+ * A shell entry runs an install that replaces developer links only for the Nx
+ * bindings (`relink: ['nx']`), and the Nx cases below measure that through the
+ * real script. The other replacement cases call `keepDeveloperLinks` directly,
+ * in a repository that an entry already installed.
  */
 
 const MANAGED = resolve(
@@ -93,6 +95,8 @@ interface Repository {
 interface RepositoryOptions {
   readonly prepare?: string;
   readonly workspaces?: readonly string[];
+  /** The root manifest's dependencies. */
+  readonly dependencies?: Readonly<Record<string, string>>;
   /** Extra files, relative to the repository root. */
   readonly files?: Readonly<Record<string, string>>;
   /** How long each `git config` write lingers before it runs, to widen a race between entries. */
@@ -137,6 +141,7 @@ async function withManagedRepository(
         version: '0.0.0',
         private: true,
         ...(options.workspaces === undefined ? {} : { workspaces: options.workspaces }),
+        ...(options.dependencies === undefined ? {} : { dependencies: options.dependencies }),
         scripts: { postinstall: DECLARED_LINKS_POSTINSTALL, prepare: options.prepare ?? record('install') },
         smoo: {
           secrets: {
@@ -1041,6 +1046,138 @@ describe('what shell entry keeps linked', () => {
         ).rejects.toBe(failure);
         expect(texts()).toEqual(original);
         expect(readlinkSync(join(root, created))).toBe(provider);
+      });
+    });
+  });
+
+  describe('Nx bindings a developer pointed outside the checkout', () => {
+    // `app` and the root both depend on the workspace member `nx`, so bun binds each `nx` entry to that member by
+    // relative path, as it does `util`. A developer's `nx` entries point at a retired provider outside the checkout.
+    const NX = `${APP}/node_modules/nx`;
+    const NX_BINDING = '../../nx';
+    const ROOT_NX = 'node_modules/nx';
+    const ROOT_NX_BINDING = '../packages/nx';
+    /** Each Nx entry, with the target a fresh install binds it to. */
+    const NX_BINDINGS: Readonly<Record<string, string>> = { [ROOT_NX]: ROOT_NX_BINDING, [NX]: NX_BINDING };
+    const WITH_NX = {
+      ...WORKSPACE,
+      dependencies: { nx: 'workspace:*' },
+      files: {
+        ...WORKSPACE.files,
+        [`${APP}/package.json`]: JSON.stringify({
+          name: 'app',
+          version: '0.0.0',
+          dependencies: { '@fixture/lib': 'workspace:*', nx: 'workspace:*', util: 'workspace:*' },
+        }),
+        'packages/nx/package.json': JSON.stringify({ name: 'nx', version: '0.0.0' }),
+      },
+    };
+    const RUNNER = { SMOO_NPM_TOKEN: 'npm', SMOO_TOKEN: 'token' };
+
+    /** A checkout a developer keeps outside this one: a directory holding its manifest. */
+    async function providerCheckout(at: string, name: string): Promise<string> {
+      await mkdir(at, { recursive: true });
+      await writeFile(join(at, 'package.json'), JSON.stringify({ name, version: '9.9.9' }));
+      return at;
+    }
+
+    /** Each Nx entry, root and app, bound by relative path to its member, as a fresh install leaves it. */
+    function expectNxBindings(root: string): void {
+      for (const [entry, binding] of Object.entries(NX_BINDINGS)) {
+        expect(readlinkSync(join(root, entry))).toBe(binding);
+      }
+    }
+
+    it('replaces external Nx entries that a matching install stamp would keep', async () => {
+      await withManagedRepository(WITH_NX, async ({ root, enterShell: enter, count }) => {
+        expect((await enter()).exitCode).toBe(0);
+        expect(count('install')).toBe(1);
+        expectNxBindings(root);
+
+        // Nothing dangles and the stamp still matches: only the entry can see that Nx left the checkout.
+        const retired = await providerCheckout(join(dirname(root), 'retired-nx'), 'nx');
+        const local = await providerCheckout(join(dirname(root), 'local-lib'), '@fixture/lib');
+        for (const entry of Object.keys(NX_BINDINGS)) await linkEntry(root, entry, retired);
+        await linkEntry(root, LINKED, local);
+
+        expect((await enter()).exitCode).toBe(0);
+        expect(count('install')).toBe(2);
+        expectNxBindings(root);
+        expect(readlinkSync(join(root, LINKED))).toBe(local);
+
+        // The bindings are current now, so a hot second entry installs nothing.
+        expect((await enter()).exitCode).toBe(0);
+        expect(count('install')).toBe(2);
+        expectNxBindings(root);
+      });
+    });
+
+    it("replaces external Nx entries on a CI runner's frozen install", async () => {
+      await withManagedRepository(WITH_NX, async ({ root, enterShell: enter }) => {
+        // The first entry writes the lockfile that the frozen install must match.
+        expect((await enter()).exitCode).toBe(0);
+        const retired = await providerCheckout(join(dirname(root), 'retired-nx'), 'nx');
+        const local = await providerCheckout(join(dirname(root), 'local-lib'), '@fixture/lib');
+        for (const entry of Object.keys(NX_BINDINGS)) await linkEntry(root, entry, retired);
+        await linkEntry(root, LINKED, local);
+
+        expect((await enter({ ciSecrets: RUNNER })).exitCode).toBe(0);
+        expectNxBindings(root);
+        expect(readlinkSync(join(root, LINKED))).toBe(local);
+      });
+    });
+
+    it('refuses a declared Nx link and leaves both Nx bindings where the install put them', async () => {
+      await withManagedRepository(WITH_NX, async ({ root, enterShell: enter }) => {
+        expect(await enter()).toEqual(HEALTHY);
+        expectNxBindings(root);
+
+        // A declared Nx checkout would repoint Bun's binding in postinstall, so smoo refuses the declaration by name.
+        const manifest = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
+        await edit(
+          join(root, 'package.json'),
+          JSON.stringify({ ...manifest, smoo: { ...manifest.smoo, developerLinks: { nx: '.cache/retired-nx' } } }),
+        );
+
+        const checked = await enter({ links: true, check: true });
+        expect(checked.exitCode).toBe(1);
+        expect(checked.stderr).toContain('smoo.developerLinks.nx');
+        expect(checked.stderr).toContain('smoo monorepo update');
+        expectNxBindings(root);
+
+        const linked = await enter({ links: true });
+        expect(linked.exitCode).toBe(1);
+        expect(linked.stderr).toContain('smoo monorepo update');
+        expectNxBindings(root);
+
+        // The ordinary entry's install reads the same declaration in postinstall; it must not repoint Nx either.
+        await enter();
+        expectNxBindings(root);
+      });
+    });
+
+    it("keeps captured Nx and sibling links when a CI runner's install fails", async () => {
+      await withManagedRepository(WITH_NX, async ({ root, enterShell: enter }) => {
+        // The first entry writes the lockfile and stamp that a healthy install leaves.
+        expect(await enter()).toEqual(HEALTHY);
+        const manifest = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
+        await edit(
+          join(root, 'package.json'),
+          JSON.stringify({ ...manifest, scripts: { ...manifest.scripts, prepare: 'exit 1' } }),
+        );
+        const retired = await providerCheckout(join(dirname(root), 'retired-nx'), 'nx');
+        const local = await providerCheckout(join(dirname(root), 'local-lib'), '@fixture/lib');
+        for (const entry of Object.keys(NX_BINDINGS)) await linkEntry(root, entry, retired);
+        await linkEntry(root, LINKED, local);
+
+        // Frozen install fails on prepare, its existing fallback fails too, and the entry reports the refusal.
+        const failed = await enter({ ciSecrets: RUNNER });
+        expect(failed.exitCode).toBe(1);
+        expect(failed.stderr).toContain('! Failed to install dependencies with frozen lockfile');
+        expect(failed.stderr).toContain('--- ERROR: setup-environment.ts failed while running: bun install');
+        expect(failed.stderr).toContain('exit code: 1');
+        for (const entry of Object.keys(NX_BINDINGS)) expect(readlinkSync(join(root, entry))).toBe(retired);
+        expect(readlinkSync(join(root, LINKED))).toBe(local);
       });
     });
   });

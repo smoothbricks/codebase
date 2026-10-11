@@ -10,7 +10,7 @@
  * script runs (measured on Bun 1.4.2), so no lifecycle script ever sees the
  * link. So each install smoo runs (shell entry's, a CI runner's
  * frozen-lockfile one, `smoo monorepo update`'s) records these links before
- * it installs and puts exactly those back afterwards. A plain `bun install`
+ * it installs and puts exactly those back afterwards, except Nx (below). A plain `bun install`
  * still relinks an undeclared link: only a wrapper around bun itself could
  * intercept that. A declared one (below) comes back on its own.
  *
@@ -38,6 +38,14 @@
  * failed relink changes nothing. A named package with no developer link when
  * the install starts has nothing to put back, and a named link that dangled
  * is removed first, as for any install.
+ *
+ * Nx is the one package every managed install relinks. The lockfile owns Nx, so
+ * a developer link to a local Nx checkout is not kept: the managed installs
+ * (shell entry's, a CI runner's frozen-lockfile one, `smoo monorepo update`'s)
+ * pass `{ relink: ['nx'] }`, and a successful one leaves Nx as Bun installed it.
+ * Every other developer link is still kept. A live Nx link makes a matching
+ * stamp stale (`hasStaleDeveloperLinks`), so the next managed shell entry runs
+ * one install that replaces it, and the shells after it stay current.
  *
  * A repository can also DECLARE such links, so every checkout of it on a
  * developer machine gets them without anyone running `bun link`: the root
@@ -150,9 +158,13 @@ export function reportDeveloperLinks(root: string): void {
   describeDeveloperLinks(root, findDeveloperLinks(root).live);
 }
 
-/** A missing external developer target makes the stamped install stale. */
-export function hasDanglingDeveloperLinks(root: string): boolean {
-  return findDeveloperLinks(root).dangling.length > 0;
+/**
+ * A stamped install is stale while a developer link dangles, or while a live one names a package in `relink`: that
+ * is a link the install must replace, so a matching stamp is not trusted.
+ */
+export function hasStaleDeveloperLinks(root: string, relink: readonly string[] = []): boolean {
+  const { live, dangling } = findDeveloperLinks(root);
+  return dangling.length > 0 || live.some((link) => relink.includes(packageName(link)));
 }
 
 /** The package a link stands for in its tree: `name` or `@scope/name`. */
@@ -481,6 +493,11 @@ function readDeclaredLinks(root: string): [string, string][] {
   return Object.entries(declared).map(([name, directory]) => {
     if (!PACKAGE_NAME.test(name)) {
       throw new Error(`${manifestPath}: smoo.developerLinks key ${JSON.stringify(name)} is not a package name`);
+    }
+    if (name === 'nx') {
+      throw new Error(
+        `${manifestPath}: smoo.developerLinks.nx is obsolete: the consumer lockfile and patch own Nx; run smoo monorepo update`,
+      );
     }
     if (typeof directory !== 'string' || directory.length === 0 || path.isAbsolute(directory)) {
       throw new Error(
