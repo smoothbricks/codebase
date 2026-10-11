@@ -158,9 +158,11 @@ mod tests {
 
     use super::*;
     use crate::api::dto::{JobId, UtcTimestamp};
+    use crate::api::process::{JobLeafAttribution, ProcessCoverage, ProcessCoverageGap};
     use crate::api::resources::{
-        HostLoadSample, JobStreamWatermark, JobVolumeUsage, ResidentBytes, StreamBytes,
-        StreamLines, VolumeUnavailable, VolumeUsage, WallMicros,
+        CpuMicros, CpuMicrosDelta, CpuTotals, HostLoadSample, JobAccounting, JobStreamWatermark,
+        JobVolumeUsage, OneCoreCpuPercent, ResidentBytes, StreamBytes, StreamLines,
+        UsageReconciliation, VolumeUnavailable, VolumeUsage, WallMicros,
     };
 
     fn sample(wall_us: u64) -> JobResourceSample {
@@ -177,11 +179,26 @@ mod tests {
             wall_us: wall,
             leader_pid: 4242,
             members: vec![4242],
+            leaf: JobLeafAttribution::NoAccountedCpu,
+            cpu_user_ms: CpuMicros::new(0).expect("cpu").millis(),
+            cpu_sys_ms: CpuMicros::new(0).expect("cpu").millis(),
+            cpu_pct: OneCoreCpuPercent::ZERO,
             host_start: host,
             host,
             rss_bytes: ResidentBytes::ZERO,
             rss_peak_bytes: ResidentBytes::ZERO,
-            accounting: None,
+            accounting: JobAccounting::MacOsRusageChildren {
+                cpu: CpuTotals::ZERO,
+                io: None,
+                reconciliation: UsageReconciliation {
+                    cpu_us: CpuMicrosDelta::new(0).expect("cpu"),
+                    io_read_bytes: None,
+                    io_write_bytes: None,
+                    coverage: ProcessCoverage::Gap {
+                        reason: ProcessCoverageGap::UncountedFork { pid: 4242 },
+                    },
+                },
+            },
             volumes: JobVolumeUsage {
                 workspace: VolumeUsage::Unavailable {
                     reason: VolumeUnavailable::Unconfigured,

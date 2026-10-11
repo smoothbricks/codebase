@@ -31,9 +31,10 @@ use crate::api::dto::{
     WorkspaceRetiredCommitment, validate_command_argv,
 };
 use crate::api::resources::{
-    CpuMicros, CpuTotals, HostLoadSample, JobAccounting, JobResourceSample, JobStreamWatermark,
-    JobVolumeUsage, ResidentBytes, ResourceUnitError, StorageIoBytes, StorageIoTotals, StreamBytes,
-    StreamLines, VolumeUsage, WallMicros,
+    ChargedMemoryBytes, ChargedMemoryUsage, CpuMicros, CpuTotals, HostLoadSample, JobAccounting,
+    JobResourceSample, JobStreamWatermark, JobVolumeUsage, OneCoreCpuPercent, ResidentBytes,
+    ResourceUnitError, StorageIoBytes, StorageIoTotals, StreamBytes, StreamLines,
+    UsageReconciliation, VolumeUsage, WallMicros,
 };
 use crate::fsio::Durability;
 use crate::metadata::WorkspaceIncarnation;
@@ -85,10 +86,10 @@ const JOB_FLOOR: CounterFile = CounterFile {
     magic: b"CSJOB001",
     what: "job id floor",
 };
-/// Layout 8 keeps every resource, accounting and volume column of layout 7, then appends the
-/// keyed admission. A store holding a record in an earlier layout is set aside whole
-/// ([`SetAsideStore`]), never read.
-const RECORD_SCHEMA_VERSION: u64 = 8;
+/// Layout 9 keeps every column of layout 8 -- layout 7's resource, accounting and volume
+/// columns, then the keyed admission -- and appends [`SAMPLE_COLUMNS`]. A store holding a record
+/// in an earlier layout is set aside whole ([`SetAsideStore`]), never read.
+const RECORD_SCHEMA_VERSION: u64 = 9;
 /// The first layout whose job records carry admission keys. A store in it or a later layout set
 /// aside while serving an incarnation took that incarnation's keyed admissions along, so the
 /// keys it named can no longer be proven absent ([`AdmissionLookup::Unprovable`]).
@@ -123,8 +124,8 @@ const RESOURCE_COLUMNS: [&str; 14] = [
 /// The first of [`RESOURCE_COLUMNS`].
 const RESOURCE_COLUMN: usize = EXIT_COLUMN + 4;
 /// The terminal sample's accounting, after [`RESOURCE_COLUMNS`]: its source, its user and system
-/// CPU microseconds, and its storage read and write bytes. All null for a sample without
-/// accounting; the bytes are null together where the source has none.
+/// CPU microseconds, and its storage read and write bytes. All null for a record without a
+/// sample; the bytes are null together where the source has none.
 const ACCOUNTING_COLUMNS: [&str; 5] = [
     "resources_accounting_source",
     "resources_accounting_cpu_user_us",
@@ -144,6 +145,23 @@ const VOLUME_COLUMNS: [&str; 2] = ["resources_volume_workspace", "resources_volu
 const VOLUME_COLUMN: usize = ACCOUNTING_COLUMN + ACCOUNTING_COLUMNS.len();
 /// The first keyed admission column, after every volume column of layout 7.
 const ADMISSION_COLUMN: usize = VOLUME_COLUMN + VOLUME_COLUMNS.len();
+/// How many keyed admission columns layout 8 appended.
+const ADMISSION_COLUMNS: usize = 14;
+/// The terminal sample's columns layout 9 appended after the admission: its CPU share, its leaf
+/// and its accounting's reconciliation as their wire JSON, and a cgroup source's charged memory
+/// now and at its peak. All null for a record without a sample; the charged pair is present
+/// exactly for [`CGROUP_SOURCE`].
+const SAMPLE_COLUMNS: [&str; 5] = [
+    "resources_cpu_pct",
+    "resources_leaf",
+    "resources_accounting_reconciliation",
+    "resources_accounting_charged_current_bytes",
+    "resources_accounting_charged_peak_bytes",
+];
+/// The first of [`SAMPLE_COLUMNS`].
+const SAMPLE_COLUMN: usize = ADMISSION_COLUMN + ADMISSION_COLUMNS;
+/// [`JobAccounting::LinuxCgroupV2`] in its source column: its wire kind.
+const CGROUP_SOURCE: &str = "linuxCgroupV2";
 #[cfg(unix)]
 const SECURE_DIRECTORY_OPEN_FLAGS: libc::c_int =
     libc::O_DIRECTORY + libc::O_NOFOLLOW + libc::O_CLOEXEC;
@@ -3872,6 +3890,11 @@ fn build_protected_record_schema() -> Arc<Schema> {
         field("admission_stdout_copy_policy", DataType::Utf8, true),
         field("admission_stderr_copy_path", DataType::Utf8, true),
         field("admission_stderr_copy_policy", DataType::Utf8, true),
+        field(SAMPLE_COLUMNS[0], DataType::Float64, true),
+        field(SAMPLE_COLUMNS[1], DataType::Utf8, true),
+        field(SAMPLE_COLUMNS[2], DataType::Utf8, true),
+        field(SAMPLE_COLUMNS[3], DataType::UInt64, true),
+        field(SAMPLE_COLUMNS[4], DataType::UInt64, true),
     ]))
 }
 
@@ -4080,22 +4103,44 @@ fn job_record_to_batch(record: &JobArtifactRecord) -> Result<RecordBatch, Artifa
     let stderr = flatten_storage(&record.stderr.storage);
     let (exit_code, exit_signal, exit_core_dumped) = exit_columns(record.exit.as_ref());
     let resources = record.resources.as_ref();
-    let (source, cpu, io) = match resources.and_then(|sample| sample.accounting.as_ref()) {
-        None => (None, None, None),
-        Some(JobAccounting::MacOsRusageChildren { cpu, io }) => {
-            (Some(RUSAGE_CHILDREN_SOURCE), Some(*cpu), *io)
-        }
-    };
-    let volume = |usage: &VolumeUsage| {
-        serde_json::to_string(usage).map_err(|error| ArtifactError::Arrow(error.to_string()))
-    };
+    let (source, cpu, io, charged, reconciliation) =
+        match resources.map(|sample| &sample.accounting) {
+            None => (None, None, None, None, None),
+            Some(JobAccounting::MacOsRusageChildren {
+                cpu,
+                io,
+                reconciliation,
+            }) => (
+                Some(RUSAGE_CHILDREN_SOURCE),
+                Some(*cpu),
+                *io,
+                None,
+                Some(reconciliation),
+            ),
+            Some(JobAccounting::LinuxCgroupV2 {
+                cpu,
+                io,
+                charged_memory,
+                reconciliation,
+            }) => (
+                Some(CGROUP_SOURCE),
+                Some(*cpu),
+                Some(*io),
+                Some(*charged_memory),
+                Some(reconciliation),
+            ),
+        };
     let workspace_volume = resources
-        .map(|sample| volume(&sample.volumes.workspace))
+        .map(|sample| wire_json(&sample.volumes.workspace))
         .transpose()?;
     let build_volume = resources
         .and_then(|sample| sample.volumes.build.as_ref())
-        .map(volume)
+        .map(wire_json)
         .transpose()?;
+    let leaf = resources
+        .map(|sample| wire_json(&sample.leaf))
+        .transpose()?;
+    let reconciliation = reconciliation.map(wire_json).transpose()?;
     let mut columns: Vec<ArrayRef> = vec![
         Arc::new(StringArray::from(vec!["job"])),
         Arc::new(UInt64Array::from(vec![RECORD_SCHEMA_VERSION])),
@@ -4209,8 +4254,26 @@ fn job_record_to_batch(record: &JobArtifactRecord) -> Result<RecordBatch, Artifa
         Arc::new(StringArray::from(vec![build_volume])),
     ];
     columns.extend(admission_columns(record.admission.as_ref())?);
+    columns.extend([
+        Arc::new(Float64Array::from(vec![
+            resources.map(|sample| sample.cpu_pct.get()),
+        ])) as ArrayRef,
+        Arc::new(StringArray::from(vec![leaf])),
+        Arc::new(StringArray::from(vec![reconciliation])),
+        Arc::new(UInt64Array::from(vec![
+            charged.map(|charged| charged.current_bytes.get()),
+        ])),
+        Arc::new(UInt64Array::from(vec![
+            charged.map(|charged| charged.peak_bytes.get()),
+        ])),
+    ]);
     RecordBatch::try_new(protected_record_schema(), columns)
         .map_err(|error| ArtifactError::Arrow(error.to_string()))
+}
+
+/// `value` as its wire JSON: how a sample's union-valued facts sit in one Utf8 column.
+fn wire_json(value: &impl serde::Serialize) -> Result<String, ArtifactError> {
+    serde_json::to_string(value).map_err(|error| ArtifactError::Arrow(error.to_string()))
 }
 
 /// An exit status as its three columns: a code, or a signal and whether it dumped core.
@@ -4318,8 +4381,9 @@ fn batch_to_job_record(batch: &RecordBatch) -> Result<JobArtifactRecord, Artifac
 }
 
 /// The terminal resource sample of a current-layout job batch: absent when every one of
-/// [`RESOURCE_COLUMNS`] is null, and [`ACCOUNTING_COLUMNS`] and [`VOLUME_COLUMNS`] with them; a
-/// partly null sample, or one without its workspace volume, is damage.
+/// [`RESOURCE_COLUMNS`] is null, and [`ACCOUNTING_COLUMNS`], [`VOLUME_COLUMNS`] and
+/// [`SAMPLE_COLUMNS`] with them; a partly null sample, or one without its workspace volume, its
+/// accounting, its CPU share or its leaf, is damage.
 fn decode_resources(
     batch: &RecordBatch,
     job_id: JobId,
@@ -4331,14 +4395,23 @@ fn decode_resources(
         .count();
     let no_workspace_volume = batch.column(VOLUME_COLUMN).is_null(0);
     let no_build_volume = batch.column(VOLUME_COLUMN + 1).is_null(0);
+    let no_cpu_pct = batch.column(SAMPLE_COLUMN).is_null(0);
+    let no_leaf = batch.column(SAMPLE_COLUMN + 1).is_null(0);
     let accounting = decode_accounting(batch)?;
     if nulls == RESOURCE_COLUMNS.len() {
-        return match (no_workspace_volume && no_build_volume, accounting) {
-            (true, None) => Ok(None),
-            (false, _) => Err(ArtifactError::Arrow(
+        return match (
+            no_workspace_volume && no_build_volume,
+            no_cpu_pct && no_leaf,
+            accounting,
+        ) {
+            (true, true, None) => Ok(None),
+            (false, _, _) => Err(ArtifactError::Arrow(
                 "a record without a resource sample has no volume usage".into(),
             )),
-            (true, Some(_)) => Err(ArtifactError::Arrow(
+            (true, false, _) => Err(ArtifactError::Arrow(
+                "a record without a resource sample has no CPU share or leaf".into(),
+            )),
+            (true, true, Some(_)) => Err(ArtifactError::Arrow(
                 "accounting columns belong to a resource sample, and this record has none".into(),
             )),
         };
@@ -4351,6 +4424,16 @@ fn decode_resources(
     if no_workspace_volume {
         return Err(ArtifactError::Arrow(
             "a resource sample always says what its workspace volume is".into(),
+        ));
+    }
+    let Some(accounting) = accounting else {
+        return Err(ArtifactError::Arrow(
+            "a resource sample always carries its accounting".into(),
+        ));
+    };
+    if no_cpu_pct || no_leaf {
+        return Err(ArtifactError::Arrow(
+            "a resource sample always carries its CPU share and its leaf".into(),
         ));
     }
     let unit = |error: ResourceUnitError| ArtifactError::Arrow(error.to_string());
@@ -4399,6 +4482,9 @@ fn decode_resources(
             lines: StreamLines::new(uint64(batch, column + 1)?.value(0)).map_err(unit)?,
         })
     };
+    let cpu_pct =
+        downcast::<Float64Array>(batch.column(SAMPLE_COLUMN).as_ref(), SAMPLE_COLUMNS[0])?.value(0);
+    let cpu = accounting.cpu();
     Ok(Some(JobResourceSample {
         job_id,
         sampled_at,
@@ -4406,6 +4492,10 @@ fn decode_resources(
         wall_us: wall,
         leader_pid,
         members: members.values().to_vec(),
+        leaf: from_wire_json(batch, SAMPLE_COLUMN + 1, "leaf")?,
+        cpu_user_ms: cpu.user_us.millis(),
+        cpu_sys_ms: cpu.sys_us.millis(),
+        cpu_pct: OneCoreCpuPercent::new(cpu_pct).map_err(unit)?,
         host_start: host(RESOURCE_COLUMN + 4)?,
         host: host(RESOURCE_COLUMN + 6)?,
         rss_bytes: rss,
@@ -4417,42 +4507,91 @@ fn decode_resources(
     }))
 }
 
-/// A sample's accounting from [`ACCOUNTING_COLUMNS`]: absent when every one is null. A known
-/// source carries its CPU; its bytes are both present or both absent. Anything else is damage.
+/// The wire JSON value in `column`, named `what` when it is none.
+fn from_wire_json<T: serde::de::DeserializeOwned>(
+    batch: &RecordBatch,
+    column: usize,
+    what: &str,
+) -> Result<T, ArtifactError> {
+    serde_json::from_str(string(batch, column)?.value(0)).map_err(|error| {
+        ArtifactError::Arrow(format!(
+            "{} is no {what}: {error}",
+            batch.schema().field(column).name()
+        ))
+    })
+}
+
+/// A sample's accounting from [`ACCOUNTING_COLUMNS`], its reconciliation and a cgroup's charged
+/// memory from [`SAMPLE_COLUMNS`]: absent when every one is null. A known source carries its CPU
+/// and its reconciliation; the macOS source's bytes are both present or both absent, a cgroup's
+/// bytes and charged memory always present, and charged memory belongs to a cgroup alone.
+/// Anything else is damage.
 fn decode_accounting(batch: &RecordBatch) -> Result<Option<JobAccounting>, ArtifactError> {
-    let present = |offset: usize| !batch.column(ACCOUNTING_COLUMN + offset).is_null(0);
+    const RECONCILIATION: usize = SAMPLE_COLUMN + 2;
+    const CHARGED_CURRENT: usize = SAMPLE_COLUMN + 3;
+    const CHARGED_PEAK: usize = SAMPLE_COLUMN + 4;
+    let present = |column: usize| !batch.column(column).is_null(0);
     let damaged = |why: &str| Err(ArtifactError::Arrow(format!("accounting columns: {why}")));
     let unit = |error: ResourceUnitError| ArtifactError::Arrow(error.to_string());
-    let value = |offset: usize| -> Result<u64, ArtifactError> {
-        Ok(uint64(batch, ACCOUNTING_COLUMN + offset)?.value(0))
-    };
-    if !present(0) {
-        return if (1..ACCOUNTING_COLUMNS.len()).any(present) {
+    let value =
+        |column: usize| -> Result<u64, ArtifactError> { Ok(uint64(batch, column)?.value(0)) };
+    if !present(ACCOUNTING_COLUMN) {
+        return if (ACCOUNTING_COLUMN + 1..ACCOUNTING_COLUMN + ACCOUNTING_COLUMNS.len())
+            .chain([RECONCILIATION, CHARGED_CURRENT, CHARGED_PEAK])
+            .any(present)
+        {
             damaged("counters without a source")
         } else {
             Ok(None)
         };
     }
-    let source = string(batch, ACCOUNTING_COLUMN)?.value(0);
-    if source != RUSAGE_CHILDREN_SOURCE {
-        return damaged(&format!("unknown source {source:?}"));
-    }
-    if !(present(1) && present(2)) {
+    if !(present(ACCOUNTING_COLUMN + 1) && present(ACCOUNTING_COLUMN + 2)) {
         return damaged("a source without its CPU totals");
     }
+    if !present(RECONCILIATION) {
+        return damaged("a source without its reconciliation");
+    }
     let cpu = CpuTotals {
-        user_us: CpuMicros::new(value(1)?).map_err(unit)?,
-        sys_us: CpuMicros::new(value(2)?).map_err(unit)?,
+        user_us: CpuMicros::new(value(ACCOUNTING_COLUMN + 1)?).map_err(unit)?,
+        sys_us: CpuMicros::new(value(ACCOUNTING_COLUMN + 2)?).map_err(unit)?,
     };
-    let io = match (present(3), present(4)) {
+    let io = match (
+        present(ACCOUNTING_COLUMN + 3),
+        present(ACCOUNTING_COLUMN + 4),
+    ) {
         (false, false) => None,
         (true, true) => Some(StorageIoTotals {
-            read_bytes: StorageIoBytes::new(value(3)?).map_err(unit)?,
-            write_bytes: StorageIoBytes::new(value(4)?).map_err(unit)?,
+            read_bytes: StorageIoBytes::new(value(ACCOUNTING_COLUMN + 3)?).map_err(unit)?,
+            write_bytes: StorageIoBytes::new(value(ACCOUNTING_COLUMN + 4)?).map_err(unit)?,
         }),
         (true, false) | (false, true) => return damaged("read bytes without write bytes"),
     };
-    Ok(Some(JobAccounting::MacOsRusageChildren { cpu, io }))
+    let charged = match (present(CHARGED_CURRENT), present(CHARGED_PEAK)) {
+        (false, false) => None,
+        (true, true) => Some(ChargedMemoryUsage {
+            current_bytes: ChargedMemoryBytes::new(value(CHARGED_CURRENT)?).map_err(unit)?,
+            peak_bytes: ChargedMemoryBytes::new(value(CHARGED_PEAK)?).map_err(unit)?,
+        }),
+        (true, false) | (false, true) => return damaged("charged memory without its peak"),
+    };
+    let reconciliation: UsageReconciliation =
+        from_wire_json(batch, RECONCILIATION, "usage reconciliation")?;
+    match (string(batch, ACCOUNTING_COLUMN)?.value(0), io, charged) {
+        (RUSAGE_CHILDREN_SOURCE, io, None) => Ok(Some(JobAccounting::MacOsRusageChildren {
+            cpu,
+            io,
+            reconciliation,
+        })),
+        (RUSAGE_CHILDREN_SOURCE, _, Some(_)) => damaged("charged memory without a cgroup"),
+        (CGROUP_SOURCE, Some(io), Some(charged_memory)) => Ok(Some(JobAccounting::LinuxCgroupV2 {
+            cpu,
+            io,
+            charged_memory,
+            reconciliation,
+        })),
+        (CGROUP_SOURCE, _, _) => damaged("a cgroup without its storage bytes or charged memory"),
+        (source, _, _) => damaged(&format!("unknown source {source:?}")),
+    }
 }
 
 fn admission_env_type() -> DataType {
@@ -4514,7 +4653,7 @@ fn workspace_path_str(path: &WorkspacePath) -> &str {
 fn admission_columns(admission: Option<&JobAdmission>) -> Result<Vec<ArrayRef>, ArtifactError> {
     let Some(admission) = admission else {
         let schema = protected_record_schema();
-        return Ok((ADMISSION_COLUMN..schema.fields().len())
+        return Ok((ADMISSION_COLUMN..SAMPLE_COLUMN)
             .map(|index| new_null_array(schema.field(index).data_type(), 1))
             .collect());
     };
@@ -5765,6 +5904,10 @@ pub fn repair_workspace_record_sequences(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::process::{
+        JobLeafAttribution, JobProcessLeaf, ProcessCoverage, ProcessCoverageGap,
+    };
+    use crate::api::resources::{CpuMicrosDelta, StorageIoBytesDelta};
     use proptest::prelude::*;
     use std::sync::Barrier;
     use std::thread;
@@ -6064,6 +6207,10 @@ mod tests {
     fn sample(job_id: u64, wall_us: u64, leader_pid: u32) -> JobResourceSample {
         use crate::api::resources::{VolumeUnavailable, VolumeUsedBytesDelta};
         let wall = WallMicros::new(wall_us).unwrap();
+        let cpu = CpuTotals {
+            user_us: CpuMicros::new(1_900_000).unwrap(),
+            sys_us: CpuMicros::new(120_000).unwrap(),
+        };
         JobResourceSample {
             job_id: JobId::new(job_id).unwrap(),
             sampled_at: UtcTimestamp::new("2026-10-07T12:00:00Z").unwrap(),
@@ -6071,17 +6218,33 @@ mod tests {
             wall_us: wall,
             leader_pid,
             members: vec![leader_pid, leader_pid + 1],
+            leaf: JobLeafAttribution::Attributed {
+                leaf: JobProcessLeaf {
+                    pid: leader_pid,
+                    program: "/usr/bin/cc".into(),
+                    argv: vec![CommandArg::new("/usr/bin/cc")],
+                },
+                observed_cpu_permille: 955,
+            },
+            cpu_user_ms: cpu.user_us.millis(),
+            cpu_sys_ms: cpu.sys_us.millis(),
+            cpu_pct: OneCoreCpuPercent::new(87.5).unwrap(),
             host_start: HostLoadSample::new(0.5, 4).unwrap(),
             host: HostLoadSample::new(3.75, 10).unwrap(),
             rss_bytes: ResidentBytes::new(128 << 20).unwrap(),
             rss_peak_bytes: ResidentBytes::new(256 << 20).unwrap(),
-            accounting: Some(JobAccounting::MacOsRusageChildren {
-                cpu: CpuTotals {
-                    user_us: CpuMicros::new(1_900_000).unwrap(),
-                    sys_us: CpuMicros::new(120_000).unwrap(),
-                },
+            accounting: JobAccounting::MacOsRusageChildren {
+                cpu,
                 io: None,
-            }),
+                reconciliation: UsageReconciliation {
+                    cpu_us: CpuMicrosDelta::new(-40_000).unwrap(),
+                    io_read_bytes: None,
+                    io_write_bytes: None,
+                    coverage: ProcessCoverage::Gap {
+                        reason: ProcessCoverageGap::UncountedFork { pid: leader_pid },
+                    },
+                },
+            },
             volumes: JobVolumeUsage {
                 workspace: VolumeUsage::Read {
                     delta_bytes: VolumeUsedBytesDelta::new(-(16 << 20)).unwrap(),
@@ -6275,7 +6438,7 @@ mod tests {
     }
 
     /// A sample's accounting survives the record: its source, its CPU, and its storage bytes
-    /// as present or as unavailable -- never zero. A sample without accounting keeps none, and
+    /// as present or as unavailable, never zero. Every sample carries its accounting, and
     /// columns that state part of a source are damage.
     #[test]
     fn the_current_layout_keeps_a_sample_s_accounting_and_its_unavailable_bytes() {
@@ -6288,75 +6451,261 @@ mod tests {
             }),
             ..valid_job_record(9)
         };
-        let with_bytes = Some(JobAccounting::MacOsRusageChildren {
-            cpu: CpuTotals::ZERO,
+        let cpu = sample(9, 1, 1).accounting.cpu();
+        let with_bytes = JobAccounting::MacOsRusageChildren {
+            cpu,
             io: Some(StorageIoTotals {
                 read_bytes: StorageIoBytes::new(4096).unwrap(),
                 write_bytes: StorageIoBytes::new(0).unwrap(),
             }),
-        });
+            reconciliation: UsageReconciliation {
+                cpu_us: CpuMicrosDelta::new(0).unwrap(),
+                io_read_bytes: Some(StorageIoBytesDelta::new(4096).unwrap()),
+                io_write_bytes: Some(StorageIoBytesDelta::new(0).unwrap()),
+                coverage: ProcessCoverage::Complete,
+            },
+        };
         let unavailable = sample(9, 1, 1).accounting;
-        for accounting in [unavailable, None, with_bytes] {
+        for accounting in [unavailable, with_bytes] {
             let sealed = record(accounting);
-            let batch = job_record_to_batch(&sealed).unwrap();
-            let ProtectedRecord::Job(read) = batch_to_protected_record(&batch).unwrap() else {
-                panic!("a job record");
-            };
-            assert_eq!(read, sealed, "{accounting:?} round-trips");
+            assert_eq!(round_trip(&sealed), sealed, "{accounting:?} round-trips");
         }
-        let unavailable_io = job_record_to_batch(&record(unavailable)).unwrap();
+        let unavailable_io = admitted(&record(unavailable));
         assert!(
             unavailable_io.column(ACCOUNTING_COLUMN + 3).is_null(0)
                 && unavailable_io.column(ACCOUNTING_COLUMN + 4).is_null(0),
             "bytes the source has none of are stored as absent, not zero"
         );
 
-        let damaged = |base: &RecordBatch, column: usize, replacement: ArrayRef| {
-            let mut columns = base.columns().to_vec();
-            columns[ACCOUNTING_COLUMN + column] = replacement;
-            let batch = RecordBatch::try_new(base.schema(), columns).unwrap();
-            batch_to_protected_record(&batch).is_err()
-        };
-        let null = |base: &RecordBatch, column: usize| {
-            new_null_array(
-                base.schema().field(ACCOUNTING_COLUMN + column).data_type(),
-                1,
-            )
-        };
-        let accounted = job_record_to_batch(&record(with_bytes)).unwrap();
-        for column in [0, 1, 2, 3, 4] {
-            assert!(
-                damaged(&accounted, column, null(&accounted, column)),
-                "{} alone is null",
-                ACCOUNTING_COLUMNS[column]
+        let accounted = admitted(&record(with_bytes));
+        for (offset, name) in ACCOUNTING_COLUMNS.iter().enumerate() {
+            assert_damage(
+                &null_column(&accounted, ACCOUNTING_COLUMN + offset),
+                &format!("{name} alone is null"),
             );
         }
-        assert!(damaged(
-            &accounted,
-            0,
-            Arc::new(StringArray::from(vec!["liveMembers"]))
-        ));
-        assert!(damaged(
-            &accounted,
-            1,
-            Arc::new(UInt64Array::from(vec![
-                crate::api::resources::MAX_EXACT_INTEGER + 1
-            ]))
-        ));
-        let unaccounted = job_record_to_batch(&record(None)).unwrap();
-        assert!(
-            damaged(&unaccounted, 1, Arc::new(UInt64Array::from(vec![7]))),
-            "CPU without a source"
-        );
-        let sampleless = job_record_to_batch(&valid_job_record(9)).unwrap();
-        assert!(
-            damaged(
-                &sampleless,
-                0,
-                Arc::new(StringArray::from(vec![RUSAGE_CHILDREN_SOURCE]))
+        assert_damage(
+            &replace_column(
+                &accounted,
+                ACCOUNTING_COLUMN,
+                Arc::new(StringArray::from(vec!["liveMembers"])),
             ),
-            "accounting without a sample"
+            "a source the sample does not name",
         );
+        assert!(
+            batch_to_protected_record(&replace_column(
+                &accounted,
+                ACCOUNTING_COLUMN + 1,
+                Arc::new(UInt64Array::from(vec![
+                    crate::api::resources::MAX_EXACT_INTEGER + 1
+                ])),
+            ))
+            .is_err(),
+            "CPU past the exact integer range is damage"
+        );
+        let sampleless = admitted(&valid_job_record(9));
+        assert_damage(
+            &replace_column(
+                &sampleless,
+                ACCOUNTING_COLUMN + 1,
+                Arc::new(UInt64Array::from(vec![7])),
+            ),
+            "CPU without a source",
+        );
+        assert_damage(
+            &replace_column(
+                &sampleless,
+                ACCOUNTING_COLUMN,
+                Arc::new(StringArray::from(vec![RUSAGE_CHILDREN_SOURCE])),
+            ),
+            "a source without a sample",
+        );
+        let mut orphaned = sampleless.columns().to_vec();
+        for column in (ACCOUNTING_COLUMN..ACCOUNTING_COLUMN + ACCOUNTING_COLUMNS.len())
+            .chain([SAMPLE_COLUMN + 2])
+        {
+            orphaned[column] = accounted.column(column).clone();
+        }
+        assert_damage(
+            &RecordBatch::try_new(sampleless.schema(), orphaned).unwrap(),
+            "accounting without a sample",
+        );
+        let mut unaccounted = accounted.clone();
+        for column in (ACCOUNTING_COLUMN..ACCOUNTING_COLUMN + ACCOUNTING_COLUMNS.len())
+            .chain([SAMPLE_COLUMN + 2])
+        {
+            unaccounted = null_column(&unaccounted, column);
+        }
+        assert_damage(&unaccounted, "a sample without accounting");
+    }
+
+    /// `base` with `column` replaced by `replacement`, under the same schema.
+    fn replace_column(base: &RecordBatch, column: usize, replacement: ArrayRef) -> RecordBatch {
+        let mut columns = base.columns().to_vec();
+        columns[column] = replacement;
+        RecordBatch::try_new(base.schema(), columns).unwrap()
+    }
+
+    /// `base` with `column` null in its one row.
+    fn null_column(base: &RecordBatch, column: usize) -> RecordBatch {
+        let nulls = new_null_array(base.schema().field(column).data_type(), 1);
+        replace_column(base, column, nulls)
+    }
+
+    /// `record`'s batch, which decodes: the base a damage test changes one column of.
+    fn admitted(record: &JobArtifactRecord) -> RecordBatch {
+        let batch = job_record_to_batch(record).unwrap();
+        batch_to_protected_record(&batch).expect("the unchanged record decodes");
+        batch
+    }
+
+    /// `batch` -- an admitted batch with only `what` changed -- decodes to layout damage.
+    fn assert_damage(batch: &RecordBatch, what: &str) {
+        match batch_to_protected_record(batch) {
+            Err(ArtifactError::Arrow(_)) => {}
+            Ok(_) => panic!("{what} decodes"),
+            Err(other) => panic!("{what} is no layout damage: {other}"),
+        }
+    }
+
+    /// `record` through its batch and back: the job record the batch holds.
+    fn round_trip(record: &JobArtifactRecord) -> JobArtifactRecord {
+        let batch = job_record_to_batch(record).unwrap();
+        let ProtectedRecord::Job(read) = batch_to_protected_record(&batch).unwrap() else {
+            panic!("a job record");
+        };
+        read
+    }
+
+    /// A job record whose resource sample is `resources`, with the rest of the record valid.
+    fn record_with_sample(resources: JobResourceSample) -> JobArtifactRecord {
+        JobArtifactRecord {
+            exit: Some(ExitStatus::Exited { code: 0 }),
+            duration_ms: Some(1234),
+            resources: Some(resources),
+            ..valid_job_record(9)
+        }
+    }
+
+    /// A sample whose source is a cgroup: its storage bytes, its charged memory now and at its
+    /// peak, and the reconciliation that compares them with the observed processes.
+    fn cgroup_sample() -> JobResourceSample {
+        let base = sample(9, 1_234_567, 4242);
+        JobResourceSample {
+            accounting: JobAccounting::LinuxCgroupV2 {
+                cpu: base.accounting.cpu(),
+                io: StorageIoTotals {
+                    read_bytes: StorageIoBytes::new(4096).unwrap(),
+                    write_bytes: StorageIoBytes::new(8192).unwrap(),
+                },
+                charged_memory: ChargedMemoryUsage {
+                    current_bytes: ChargedMemoryBytes::new(1 << 20).unwrap(),
+                    peak_bytes: ChargedMemoryBytes::new(2 << 20).unwrap(),
+                },
+                reconciliation: UsageReconciliation {
+                    cpu_us: CpuMicrosDelta::new(0).unwrap(),
+                    io_read_bytes: Some(StorageIoBytesDelta::new(0).unwrap()),
+                    io_write_bytes: Some(StorageIoBytesDelta::new(0).unwrap()),
+                    coverage: ProcessCoverage::Complete,
+                },
+            },
+            ..base
+        }
+    }
+
+    /// A cgroup source's accounting survives the record whole: its storage bytes, its charged
+    /// memory now and at its peak, and its reconciliation.
+    #[test]
+    fn a_cgroup_source_s_accounting_and_charged_memory_survive_the_record() {
+        let sealed = record_with_sample(cgroup_sample());
+        assert_eq!(round_trip(&sealed), sealed, "a cgroup source round-trips");
+    }
+
+    /// Charged memory belongs to a cgroup source alone: a macOS source that carries it is damage.
+    #[test]
+    fn charged_memory_on_a_macos_source_is_damage() {
+        let sampled_record = record_with_sample(sample(9, 1_234_567, 4242));
+        let accounted = admitted(&sampled_record);
+        let charged = replace_column(
+            &replace_column(
+                &accounted,
+                SAMPLE_COLUMN + 3,
+                Arc::new(UInt64Array::from(vec![1 << 20])),
+            ),
+            SAMPLE_COLUMN + 4,
+            Arc::new(UInt64Array::from(vec![2 << 20])),
+        );
+        assert_damage(&charged, "charged memory on a macOS source");
+    }
+
+    /// A cgroup source states all of its storage bytes and all of its charged memory, or the
+    /// record is damage.
+    #[test]
+    fn a_cgroup_source_without_its_bytes_or_charged_memory_is_damage() {
+        let cgroup = admitted(&record_with_sample(cgroup_sample()));
+        let (read, write) = (ACCOUNTING_COLUMN + 3, ACCOUNTING_COLUMN + 4);
+        let (current, peak) = (SAMPLE_COLUMN + 3, SAMPLE_COLUMN + 4);
+        assert_damage(
+            &null_column(&cgroup, current),
+            "a cgroup with no current bytes",
+        );
+        assert_damage(&null_column(&cgroup, peak), "a cgroup with no peak");
+        assert_damage(
+            &null_column(&null_column(&cgroup, current), peak),
+            "a cgroup without charged memory",
+        );
+        assert_damage(&null_column(&cgroup, read), "a cgroup with no read bytes");
+        assert_damage(
+            &null_column(&null_column(&cgroup, read), write),
+            "a cgroup without storage bytes",
+        );
+    }
+
+    /// A sample states its CPU share and its leaf together, and its reconciliation with its
+    /// accounting; a record without a sample states none of them.
+    #[test]
+    fn a_sample_s_cpu_share_leaf_and_reconciliation_are_never_partial() {
+        let sampled_record = record_with_sample(sample(9, 1_234_567, 4242));
+        let sampled = admitted(&sampled_record);
+        for column in [SAMPLE_COLUMN, SAMPLE_COLUMN + 1] {
+            assert_damage(
+                &null_column(&sampled, column),
+                &format!("column {column} alone is null"),
+            );
+        }
+        assert_damage(
+            &null_column(&sampled, SAMPLE_COLUMN + 2),
+            "a sample without its reconciliation",
+        );
+        let sampleless = admitted(&valid_job_record(9));
+        for column in [SAMPLE_COLUMN, SAMPLE_COLUMN + 1] {
+            assert_damage(
+                &replace_column(&sampleless, column, sampled.column(column).clone()),
+                &format!("column {column} without a sample"),
+            );
+        }
+    }
+
+    /// The unattributed leaf and the leaf of a job that accounted no CPU survive the record.
+    #[test]
+    fn the_other_leaf_attributions_survive_the_record() {
+        for leaf in [
+            JobLeafAttribution::Unattributed {
+                observed_cpu_permille: 300,
+                required_permille: 500,
+            },
+            JobLeafAttribution::NoAccountedCpu,
+        ] {
+            let sealed = record_with_sample(JobResourceSample {
+                leaf,
+                ..sample(9, 1_234_567, 4242)
+            });
+            assert_eq!(
+                round_trip(&sealed),
+                sealed,
+                "a leaf attribution round-trips"
+            );
+        }
     }
 
     fn valid_job_record(job_id: u64) -> JobArtifactRecord {
@@ -6679,12 +7028,12 @@ mod tests {
             .iter()
             .map(|field| field.name().as_str())
             .collect();
-        assert_eq!(RECORD_SCHEMA_VERSION, 8);
+        assert_eq!(RECORD_SCHEMA_VERSION, 9);
         assert_eq!(FIRST_KEYED_LAYOUT, 8);
         assert_eq!(ADMISSION_COLUMN, 59);
         assert_eq!(names[ADMISSION_COLUMN - 1], "resources_volume_build");
         assert_eq!(
-            &names[ADMISSION_COLUMN..],
+            &names[ADMISSION_COLUMN..SAMPLE_COLUMN],
             &[
                 "admission_key",
                 "admission_cwd",
@@ -6718,6 +7067,51 @@ mod tests {
             earlier_layout(&prior),
             Some(7),
             "layout 7 remains the exact prefix"
+        );
+    }
+
+    /// Layout 9 appends the sample's CPU share, leaf, reconciliation and charged memory after
+    /// layout 8's admission columns, and layout 8 stays the exact prefix.
+    #[test]
+    fn layout_nine_appends_the_sample_columns_after_the_complete_layout_eight_prefix() {
+        let record = JobArtifactRecord {
+            resources: Some(sample(9, 1_234_567, 4242)),
+            ..valid_job_record(9)
+        };
+        let batch = job_record_to_batch(&record).unwrap();
+        let schema = batch.schema();
+        let names: Vec<&str> = schema
+            .fields()
+            .iter()
+            .map(|field| field.name().as_str())
+            .collect();
+        assert_eq!(RECORD_SCHEMA_VERSION, 9);
+        assert_eq!(SAMPLE_COLUMN, 73);
+        assert_eq!(names[SAMPLE_COLUMN - 1], "admission_stderr_copy_policy");
+        assert_eq!(
+            &names[SAMPLE_COLUMN..],
+            &[
+                "resources_cpu_pct",
+                "resources_leaf",
+                "resources_accounting_reconciliation",
+                "resources_accounting_charged_current_bytes",
+                "resources_accounting_charged_peak_bytes",
+            ],
+        );
+        assert_eq!(
+            round_trip(&record),
+            record,
+            "the sample's CPU share, leaf and reconciliation survive"
+        );
+
+        let prefix_schema = Arc::new(Schema::new(schema.fields()[..SAMPLE_COLUMN].to_vec()));
+        let mut prefix_columns = batch.columns()[..SAMPLE_COLUMN].to_vec();
+        prefix_columns[1] = Arc::new(UInt64Array::from(vec![8]));
+        let prior = RecordBatch::try_new(prefix_schema, prefix_columns).unwrap();
+        assert_eq!(
+            earlier_layout(&prior),
+            Some(8),
+            "layout 8 remains the exact prefix"
         );
     }
 

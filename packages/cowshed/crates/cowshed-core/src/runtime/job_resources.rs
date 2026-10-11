@@ -8,11 +8,13 @@
 use std::time::Instant;
 
 use super::job_groups::Birth;
-use super::supervisor::{OwnedProcess, byte_count};
+use super::supervisor::{LeafCoverage, OwnedProcess, byte_count};
 use crate::api::dto::{JobId, UtcTimestamp};
+use crate::api::process::JobLeafAttribution;
 use crate::api::resources::{
-    HostLoadSample, JobAccounting, JobResourceSample, JobStreamWatermark, JobVolumeUsage,
-    ResidentBytes, ResourceUnitError, StreamBytes, StreamLines, WallMicros,
+    CpuMicros, HostLoadSample, JobAccounting, JobResourceSample, JobStreamWatermark,
+    JobVolumeUsage, OneCoreCpuPercent, ResidentBytes, ResourceUnitError, StreamBytes, StreamLines,
+    WallMicros,
 };
 use crate::error::{CowshedError, Result};
 use crate::host_load::HostLoadError;
@@ -38,13 +40,19 @@ impl Sampling {
         matches!(self, Self::Live(_))
     }
 
-    /// The job owns `process`. Its first process starts the sampling; a later one -- its
-    /// command, after its activation -- takes the lead and keeps the spawn's baselines. Returns
-    /// the sampler to observe, or `None` once the job ended.
-    pub(super) fn own(&mut self, job_id: JobId, process: OwnedProcess) -> Option<&mut JobSampler> {
+    /// The job owns `process`. Its first process starts the sampling, which judges the job's
+    /// leaf by `coverage`; a later one -- its command, after its activation -- takes the lead
+    /// and keeps the spawn's baselines. Returns the sampler to observe, or `None` once the job
+    /// ended.
+    pub(super) fn own(
+        &mut self,
+        job_id: JobId,
+        process: OwnedProcess,
+        coverage: LeafCoverage,
+    ) -> Option<&mut JobSampler> {
         match self {
             Self::Unowned => {
-                *self = Self::Live(JobSampler::spawned(job_id, process));
+                *self = Self::Live(JobSampler::spawned(job_id, process, coverage));
                 match self {
                     Self::Live(sampler) => Some(sampler),
                     Self::Unowned | Self::Frozen { .. } => None,
@@ -107,7 +115,6 @@ impl Sampling {
     }
 
     /// The sampler of a job that owns processes and has not ended.
-    #[cfg(target_os = "macos")]
     pub(super) fn live(&mut self) -> Option<&mut JobSampler> {
         match self {
             Self::Live(sampler) => Some(sampler),
@@ -139,9 +146,27 @@ pub(super) struct Observation {
     /// The job's output streams as the supervisor had admitted them by the boundary.
     pub stdout: StreamTally,
     pub stderr: StreamTally,
-    /// The job's CPU totals from its platform's independent source, read at the boundary and
-    /// within that source's named limits; `None` where no source exists yet.
-    pub accounting: Option<JobAccounting>,
+    /// The job's totals from its platform's independent source, read at the boundary and
+    /// reconciled against the processes observed at it.
+    pub accounting: JobAccounting,
+    /// The observed process the job's CPU went to most, or why none is named.
+    pub leaf: JobLeafAttribution,
+}
+
+/// Who takes a sample: the supervisor's own boundaries -- first ownership, a new leader, its
+/// sampling clock, the terminal sample -- close the CPU window and open the next; a read
+/// measures from the open window without moving it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum Boundary {
+    Supervisor,
+    Read,
+}
+
+/// Where the CPU window a sample measures opened: the supervisor's preceding boundary.
+#[derive(Clone, Copy, Debug)]
+struct CpuWindow {
+    at: Instant,
+    cpu: CpuMicros,
 }
 
 /// One process of the job's group, as read at a sample boundary.
@@ -198,27 +223,41 @@ pub(super) struct JobSampler {
     host_start: std::result::Result<HostLoadSample, HostLoadError>,
     /// The largest group resident sum a sample of this job has observed.
     rss_peak: ResidentBytes,
+    /// The CPU window the next sample measures; `None` before the first supervisor boundary.
+    window: Option<CpuWindow>,
+    /// The share of the job's accounted CPU its observed processes must cover for a leaf.
+    coverage: LeafCoverage,
     /// The job's CPU source: each leader's own and reaped-children rusage, the activation's once.
     #[cfg(target_os = "macos")]
     rusage: super::job_accounting::RusageChildren,
+    /// What the sampler saw of the group's processes at its boundaries.
+    #[cfg(target_os = "macos")]
+    census: super::job_attribution::Census,
 }
 
 impl JobSampler {
-    fn spawned(job_id: JobId, first: OwnedProcess) -> Self {
+    fn spawned(job_id: JobId, first: OwnedProcess, coverage: LeafCoverage) -> Self {
         Self {
             job_id,
             spawned: first.spawned,
             #[cfg(target_os = "macos")]
             rusage: super::job_accounting::RusageChildren::charging(first.birth.clone()),
+            #[cfg(target_os = "macos")]
+            census: super::job_attribution::Census::led_by(first.birth.pid()),
             leader: first.birth,
             host_start: first.host,
             rss_peak: ResidentBytes::ZERO,
+            window: None,
+            coverage,
         }
     }
 
     fn lead(&mut self, leader: Birth) {
         #[cfg(target_os = "macos")]
-        self.rusage.lead(leader.clone());
+        {
+            self.rusage.lead(leader.clone());
+            self.census.lead(leader.pid());
+        }
         self.leader = leader;
     }
 
@@ -229,14 +268,32 @@ impl JobSampler {
         &mut self.rusage
     }
 
+    /// What the sampler saw of the group's processes, which the supervisor adds each boundary's
+    /// members to.
+    #[cfg(target_os = "macos")]
+    pub(super) fn census(&mut self) -> &mut super::job_attribution::Census {
+        &mut self.census
+    }
+
+    /// The share of the job's accounted CPU its observed processes must cover for a leaf.
+    #[cfg(target_os = "macos")]
+    pub(super) fn coverage(&self) -> LeafCoverage {
+        self.coverage
+    }
+
     /// The process whose group is the job's now.
     pub(super) fn leader(&self) -> &Birth {
         &self.leader
     }
 
-    /// The job's sample from what was observed of it. Every observation is checked before the
-    /// resident sum joins the job's peak: a sample that cannot be taken leaves the peak as it was.
-    pub(super) fn sample(&mut self, observed: Observation) -> Result<JobResourceSample> {
+    /// The job's sample from what was observed of it at a `boundary`. Every observation is
+    /// checked before the resident sum joins the job's peak and a supervisor boundary moves the
+    /// CPU window: a sample that cannot be taken leaves both as they were.
+    pub(super) fn sample(
+        &mut self,
+        observed: Observation,
+        boundary: Boundary,
+    ) -> Result<JobResourceSample> {
         let host_start = *self.host_start.as_ref().map_err(|error| {
             CowshedError::environment_missing(
                 format!(
@@ -269,7 +326,54 @@ impl JobSampler {
             .stderr
             .watermark()
             .map_err(|error| refused("stderr ", error))?;
+        // The leaf was judged by this job's threshold, or the sample would claim one it was not.
+        if let JobLeafAttribution::Unattributed {
+            required_permille, ..
+        } = observed.leaf
+            && required_permille != self.coverage.permille()
+        {
+            return Err(CowshedError::internal(format!(
+                "job {} cannot be sampled: its leaf was judged by {required_permille}‰, not its \
+                 {}‰",
+                self.job_id.get(),
+                self.coverage.permille()
+            )));
+        }
+        let cpu = observed.accounting.cpu();
+        let cpu_total = cpu
+            .user_us
+            .checked_add(cpu.sys_us)
+            .map_err(|error| refused("CPU ", error))?;
+        // The first supervisor boundary opens the first window: no time has passed in it. A
+        // window with no whole microsecond in it divides nothing and stays open, so the CPU spent
+        // in it is measured by the next.
+        let (cpu_pct, elapsed) = match self.window {
+            None => (OneCoreCpuPercent::ZERO, None),
+            Some(window) => {
+                let spent = cpu_total
+                    .get()
+                    .checked_sub(window.cpu.get())
+                    .ok_or_else(|| {
+                        CowshedError::internal(format!(
+                            "job {} cannot be sampled: its CPU fell from {} us to {} us",
+                            self.job_id.get(),
+                            window.cpu.get(),
+                            cpu_total.get()
+                        ))
+                    })
+                    .and_then(|spent| CpuMicros::new(spent).map_err(|error| refused("", error)))?;
+                let elapsed = WallMicros::of(observed.now.saturating_duration_since(window.at))
+                    .map_err(|error| refused("", error))?;
+                (OneCoreCpuPercent::of_window(spent, elapsed), Some(elapsed))
+            }
+        };
         self.rss_peak = self.rss_peak.max(rss);
+        if boundary == Boundary::Supervisor && elapsed.is_none_or(|elapsed| elapsed.get() > 0) {
+            self.window = Some(CpuWindow {
+                at: observed.now,
+                cpu: cpu_total,
+            });
+        }
         Ok(JobResourceSample {
             job_id: self.job_id,
             sampled_at: observed.sampled_at,
@@ -277,6 +381,10 @@ impl JobSampler {
             wall_us: wall,
             leader_pid: self.leader.pid(),
             members: observed.members.iter().map(|member| member.pid).collect(),
+            leaf: observed.leaf,
+            cpu_user_ms: cpu.user_us.millis(),
+            cpu_sys_ms: cpu.sys_us.millis(),
+            cpu_pct,
             host_start,
             host: observed.host,
             rss_bytes: rss,
@@ -297,6 +405,10 @@ mod tests {
     use crate::api::resources::{
         MAX_EXACT_INTEGER, VolumeUnavailable, VolumeUsage, VolumeUsedBytesDelta,
     };
+
+    fn coverage() -> LeafCoverage {
+        LeafCoverage::new(900).expect("a share")
+    }
 
     fn owned(pid: u32, spawned: Instant) -> OwnedProcess {
         OwnedProcess {
@@ -343,7 +455,35 @@ mod tests {
             },
             stdout: StreamTally::default(),
             stderr: StreamTally::default(),
-            accounting: None,
+            accounting: accounted(0),
+            leaf: JobLeafAttribution::NoAccountedCpu,
+        }
+    }
+
+    /// The macOS source's totals: `user_us` of user CPU, the observed processes reconciled.
+    fn accounted(user_us: u64) -> JobAccounting {
+        JobAccounting::MacOsRusageChildren {
+            cpu: crate::api::resources::CpuTotals {
+                user_us: CpuMicros::new(user_us).expect("exact"),
+                sys_us: CpuMicros::new(0).expect("exact"),
+            },
+            io: None,
+            reconciliation: crate::api::resources::UsageReconciliation {
+                cpu_us: crate::api::resources::CpuMicrosDelta::new(0).expect("exact"),
+                io_read_bytes: None,
+                io_write_bytes: None,
+                coverage: crate::api::process::ProcessCoverage::Gap {
+                    reason: crate::api::process::ProcessCoverageGap::UncountedFork { pid: 100 },
+                },
+            },
+        }
+    }
+
+    /// An observation at `now` of a job whose source counted `user_us` of CPU.
+    fn burned(now: Instant, user_us: u64) -> Observation {
+        Observation {
+            accounting: accounted(user_us),
+            ..seen(now, &[100])
         }
     }
 
@@ -357,7 +497,9 @@ mod tests {
         let spawn = Instant::now();
         let mut sampling = Sampling::Unowned;
         assert_eq!(sampling.leader(), None);
-        sampling.own(job(), owned(100, spawn)).expect("live");
+        sampling
+            .own(job(), owned(100, spawn), coverage())
+            .expect("live");
         assert_eq!(sampling.leader().map(Birth::pid), Some(100));
         let failed = sampling.freeze(|_| {
             Err(CowshedError::environment_missing(
@@ -369,11 +511,13 @@ mod tests {
         assert_eq!(sampling.leader().map(Birth::pid), Some(100));
 
         let mut sampling = Sampling::Unowned;
-        sampling.own(job(), owned(100, spawn)).expect("live");
         sampling
-            .own(job(), owned(200, spawn))
+            .own(job(), owned(100, spawn), coverage())
+            .expect("live");
+        sampling
+            .own(job(), owned(200, spawn), coverage())
             .expect("the command leads");
-        sampling.freeze(|sampler| sampler.sample(seen(spawn, &[])));
+        sampling.freeze(|sampler| sampler.sample(seen(spawn, &[]), Boundary::Supervisor));
         assert_eq!(sampling.leader().map(Birth::pid), Some(200));
     }
 
@@ -383,10 +527,12 @@ mod tests {
     fn the_rss_peak_is_the_largest_group_sum_observed_and_survives_the_end() {
         let spawn = Instant::now();
         let mut sampling = Sampling::Unowned;
-        let sampler = sampling.own(job(), owned(100, spawn)).expect("live");
+        let sampler = sampling
+            .own(job(), owned(100, spawn), coverage())
+            .expect("live");
         let mut fold = |members: &[(u32, u64)]| {
             sampler
-                .sample(held(spawn, members))
+                .sample(held(spawn, members), Boundary::Supervisor)
                 .ok()
                 .map(|sample| (sample.rss_bytes.get(), sample.rss_peak_bytes.get()))
         };
@@ -419,15 +565,18 @@ mod tests {
         };
         assert!(
             sampler
-                .sample(Observation {
-                    stdout: inexact,
-                    ..held(spawn, &[(100, 512 * MIB)])
-                })
+                .sample(
+                    Observation {
+                        stdout: inexact,
+                        ..held(spawn, &[(100, 512 * MIB)])
+                    },
+                    Boundary::Supervisor
+                )
                 .is_err()
         );
 
         let terminal = sampling
-            .freeze(|sampler| sampler.sample(seen(spawn, &[])))
+            .freeze(|sampler| sampler.sample(seen(spawn, &[]), Boundary::Supervisor))
             .expect("a terminal sample");
         assert_eq!(
             (terminal.rss_bytes.get(), terminal.rss_peak_bytes.get()),
@@ -487,13 +636,16 @@ mod tests {
         let spawn = Instant::now();
         let mut sampling = Sampling::Unowned;
         let sample = sampling
-            .own(job(), owned(100, spawn))
+            .own(job(), owned(100, spawn), coverage())
             .expect("live")
-            .sample(Observation {
-                stdout: tally(&[b"a", b"\nb", b"\n", b"c"]),
-                stderr: tally(&[b"oops\n"]),
-                ..seen(spawn, &[100])
-            })
+            .sample(
+                Observation {
+                    stdout: tally(&[b"a", b"\nb", b"\n", b"c"]),
+                    stderr: tally(&[b"oops\n"]),
+                    ..seen(spawn, &[100])
+                },
+                Boundary::Supervisor,
+            )
             .expect("sample");
         assert_eq!(
             (counts(sample.stdout), counts(sample.stderr)),
@@ -507,9 +659,12 @@ mod tests {
         let spawn = Instant::now();
         let mut sampling = Sampling::Unowned;
         let activating = sampling
-            .own(job(), owned(100, spawn))
+            .own(job(), owned(100, spawn), coverage())
             .expect("live")
-            .sample(seen(spawn + Duration::from_micros(2_500), &[100, 101]))
+            .sample(
+                seen(spawn + Duration::from_micros(2_500), &[100, 101]),
+                Boundary::Supervisor,
+            )
             .expect("sample");
         assert_eq!(
             (
@@ -523,9 +678,16 @@ mod tests {
         assert_eq!(activating.members, [100, 101]);
 
         let running = sampling
-            .own(job(), owned(200, spawn + Duration::from_millis(30)))
+            .own(
+                job(),
+                owned(200, spawn + Duration::from_millis(30)),
+                coverage(),
+            )
             .expect("live")
-            .sample(seen(spawn + Duration::from_millis(40), &[200]))
+            .sample(
+                seen(spawn + Duration::from_millis(40), &[200]),
+                Boundary::Supervisor,
+            )
             .expect("sample");
         assert_eq!((running.leader_pid, running.wall_ms.get()), (200, 40));
         assert_eq!(
@@ -558,12 +720,15 @@ mod tests {
             },
         };
         let activating = sampling
-            .own(job(), owned(100, spawn))
+            .own(job(), owned(100, spawn), coverage())
             .expect("live")
-            .sample(Observation {
-                volumes: volumes(8 << 20, failed.clone()),
-                ..seen(spawn, &[100])
-            })
+            .sample(
+                Observation {
+                    volumes: volumes(8 << 20, failed.clone()),
+                    ..seen(spawn, &[100])
+                },
+                Boundary::Supervisor,
+            )
             .expect("sample");
         assert_eq!(activating.volumes, volumes(8 << 20, failed.clone()));
         let read = VolumeUsage::Read {
@@ -571,10 +736,13 @@ mod tests {
         };
         let terminal = sampling
             .freeze(|sampler| {
-                sampler.sample(Observation {
-                    volumes: volumes(24 << 20, read.clone()),
-                    ..seen(spawn, &[])
-                })
+                sampler.sample(
+                    Observation {
+                        volumes: volumes(24 << 20, read.clone()),
+                        ..seen(spawn, &[])
+                    },
+                    Boundary::Supervisor,
+                )
             })
             .expect("a terminal sample");
         assert_eq!(terminal.volumes, volumes(24 << 20, read));
@@ -590,7 +758,7 @@ mod tests {
     #[test]
     fn a_failed_terminal_observation_is_frozen_as_the_failure() {
         let mut sampling = Sampling::Unowned;
-        sampling.own(job(), owned(100, Instant::now()));
+        sampling.own(job(), owned(100, Instant::now()), coverage());
         let failure = CowshedError::internal("the injected observation failed");
         assert_eq!(sampling.freeze(|_| Err(failure.clone())), None);
         for read in [
@@ -604,7 +772,9 @@ mod tests {
             assert_eq!(read.unwrap_err().message, failure.message);
         }
         assert!(
-            sampling.own(job(), owned(300, Instant::now())).is_none(),
+            sampling
+                .own(job(), owned(300, Instant::now()), coverage())
+                .is_none(),
             "an ended job owns nothing new"
         );
     }
@@ -613,9 +783,14 @@ mod tests {
     fn a_terminal_sample_is_frozen_and_a_never_owned_job_has_none() {
         let spawn = Instant::now();
         let mut sampling = Sampling::Unowned;
-        sampling.own(job(), owned(100, spawn));
+        sampling.own(job(), owned(100, spawn), coverage());
         let terminal = sampling
-            .freeze(|sampler| sampler.sample(seen(spawn + Duration::from_millis(7), &[])))
+            .freeze(|sampler| {
+                sampler.sample(
+                    seen(spawn + Duration::from_millis(7), &[]),
+                    Boundary::Supervisor,
+                )
+            })
             .expect("a terminal sample");
         assert_eq!(
             (terminal.leader_pid, terminal.members.len()),
@@ -655,12 +830,16 @@ mod tests {
                     host: Ok(start),
                     ..owned(100, spawn)
                 },
+                coverage(),
             )
             .expect("live")
-            .sample(Observation {
-                host: current,
-                ..seen(spawn + Duration::from_millis(10), &[100])
-            })
+            .sample(
+                Observation {
+                    host: current,
+                    ..seen(spawn + Duration::from_millis(10), &[100])
+                },
+                Boundary::Supervisor,
+            )
             .expect("activation sample");
         assert_eq!((activating.host_start, activating.host), (start, current));
 
@@ -671,12 +850,16 @@ mod tests {
                     host: Ok(later),
                     ..owned(200, spawn + Duration::from_millis(20))
                 },
+                coverage(),
             )
             .expect("live")
-            .sample(Observation {
-                host: later,
-                ..seen(spawn + Duration::from_millis(30), &[200])
-            })
+            .sample(
+                Observation {
+                    host: later,
+                    ..seen(spawn + Duration::from_millis(30), &[200])
+                },
+                Boundary::Supervisor,
+            )
             .expect("command sample");
         assert_eq!((running.host_start, running.host), (start, later));
     }
@@ -692,13 +875,128 @@ mod tests {
                     host: Err(HostLoadError::LoadUnavailable { returned: -1 }),
                     ..owned(100, spawn)
                 },
+                coverage(),
             )
             .expect("live process");
         let failure = sampler
-            .sample(seen(spawn + Duration::from_millis(10), &[100]))
+            .sample(
+                seen(spawn + Duration::from_millis(10), &[100]),
+                Boundary::Supervisor,
+            )
             .expect_err("the spawn baseline is unavailable");
         assert_eq!(failure.code, crate::error::ErrorCode::EnvironmentMissing);
         assert!(failure.message.contains("spawn host observation failed"));
         assert!(failure.message.contains("getloadavg"));
+    }
+
+    /// The share is the CPU spent over the window since the supervisor's preceding boundary:
+    /// 200 for two busy cores, 0 for an idle window, and 0 for the first window, in which no
+    /// time has passed.
+    #[test]
+    fn the_cpu_share_is_the_supervisor_window_s_cpu_over_its_wall_time() {
+        let spawn = Instant::now();
+        let mut sampling = Sampling::Unowned;
+        let sampler = sampling
+            .own(job(), owned(100, spawn), coverage())
+            .expect("live");
+        let mut share = |at_ms: u64, user_us: u64| {
+            let sample = sampler
+                .sample(
+                    burned(spawn + Duration::from_millis(at_ms), user_us),
+                    Boundary::Supervisor,
+                )
+                .expect("sample");
+            assert!(sample.consistent(), "{sample:?}");
+            (sample.cpu_pct.get(), sample.cpu_user_ms.get())
+        };
+        assert_eq!(share(0, 3_000), (0.0, 3), "the first window is zero-length");
+        assert_eq!(
+            share(1_000, 2_003_000),
+            (200.0, 2_003),
+            "two cores for a second"
+        );
+        assert_eq!(share(2_000, 2_003_000), (0.0, 2_003), "an idle second");
+        assert_eq!(
+            share(2_000, 2_003_500),
+            (0.0, 2_003),
+            "a zero-length window"
+        );
+        assert_eq!(
+            share(2_500, 2_253_500),
+            (50.1, 2_253),
+            "the next window measures the CPU the zero-length one held: 250.5 ms in 500 ms"
+        );
+    }
+
+    /// Reads measure from the supervisor's open window and never move it: two readers between
+    /// two boundaries get the same share for the same CPU, and the next boundary measures from
+    /// the previous boundary, not from either read.
+    #[test]
+    fn reads_never_move_the_cpu_window() {
+        let spawn = Instant::now();
+        let mut sampling = Sampling::Unowned;
+        let sampler = sampling
+            .own(job(), owned(100, spawn), coverage())
+            .expect("live");
+        let mut take = |at_ms: u64, user_us: u64, boundary: Boundary| {
+            sampler
+                .sample(
+                    burned(spawn + Duration::from_millis(at_ms), user_us),
+                    boundary,
+                )
+                .expect("sample")
+                .cpu_pct
+                .get()
+        };
+        take(0, 0, Boundary::Supervisor);
+        assert_eq!(take(500, 500_000, Boundary::Read), 100.0);
+        assert_eq!(take(500, 500_000, Boundary::Read), 100.0, "a second reader");
+        assert_eq!(
+            take(1_000, 500_000, Boundary::Read),
+            50.0,
+            "measured from the boundary"
+        );
+        assert_eq!(
+            take(2_000, 1_000_000, Boundary::Supervisor),
+            50.0,
+            "the boundary's window opened at the previous boundary"
+        );
+        assert_eq!(take(3_000, 1_000_000, Boundary::Read), 0.0);
+    }
+
+    /// CPU that falls is a broken source, never a negative share; the window stays where it was.
+    #[test]
+    fn falling_cpu_is_an_error_that_leaves_the_window() {
+        let spawn = Instant::now();
+        let mut sampling = Sampling::Unowned;
+        let sampler = sampling
+            .own(job(), owned(100, spawn), coverage())
+            .expect("live");
+        sampler
+            .sample(burned(spawn, 1_000), Boundary::Supervisor)
+            .expect("sample");
+        let failure = sampler
+            .sample(
+                burned(spawn + Duration::from_millis(10), 999),
+                Boundary::Supervisor,
+            )
+            .expect_err("CPU fell");
+        assert_eq!(
+            failure.code,
+            crate::error::ErrorCode::Internal,
+            "{}",
+            failure.message
+        );
+        let sample = sampler
+            .sample(
+                burned(spawn + Duration::from_millis(20), 11_000),
+                Boundary::Supervisor,
+            )
+            .expect("sample");
+        assert_eq!(
+            sample.cpu_pct.get(),
+            50.0,
+            "measured from the last good boundary"
+        );
     }
 }

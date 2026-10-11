@@ -25,7 +25,7 @@
 //!
 //! [`ActivationEnded`]: super::supervisor::ProcessEvent::ActivationEnded
 
-use crate::api::resources::{CpuTotals, JobAccounting, ResourceUnitError};
+use crate::api::resources::{CpuTotals, ResourceUnitError};
 use crate::runtime::job_groups::Birth;
 use crate::runtime::process_usage::{MachTick, TimebaseError};
 
@@ -255,21 +255,21 @@ impl RusageChildren {
         };
     }
 
-    /// The job's totals now: every closed interval, and the charged leader as `read` finds it.
+    /// The job's CPU totals now: every closed interval, and the charged leader as `read` finds it.
+    /// The source has no storage byte totals.
     pub fn account(
         &mut self,
         read: impl FnOnce(&Birth) -> Result<LeaderRusage, LeaderRusageError>,
-    ) -> Result<JobAccounting, AccountingError> {
+    ) -> Result<CpuTotals, AccountingError> {
         let closed = self.closed.clone()?;
-        let cpu = match &mut self.charged {
-            None => closed,
+        match &mut self.charged {
+            None => Ok(closed),
             Some(charged) => {
                 let reading = charged.checked(read(&charged.leader)?)?;
                 charged.latest = Some(reading);
-                closed.checked_add(reading.total()?)?
+                Ok(closed.checked_add(reading.total()?)?)
             }
-        };
-        Ok(JobAccounting::MacOsRusageChildren { cpu, io: None })
+        }
     }
 
     fn fail(&mut self, error: AccountingError) {
@@ -362,13 +362,8 @@ mod tests {
         }
     }
 
-    fn totals(accounting: Result<JobAccounting, AccountingError>) -> CpuTotals {
-        match accounting.expect("the job's totals") {
-            JobAccounting::MacOsRusageChildren { cpu, io } => {
-                assert_eq!(io, None, "the source has no byte totals, never zero ones");
-                cpu
-            }
-        }
+    fn totals(accounting: Result<CpuTotals, AccountingError>) -> CpuTotals {
+        accounting.expect("the job's totals")
     }
 
     /// The activation counts up to its end and the command from its start, each once: the

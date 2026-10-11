@@ -21,17 +21,19 @@ use std::{collections::BTreeMap, ffi::OsString, os::unix::ffi::OsStringExt, path
 
 use cowshed_core::{
     api::{
-        AbandonedWork, BinaryData, CarrySide, CheckpointInfo, CommandArg, CpuMicros, CpuTotals,
-        DoctorReport, EgressMode, EgressRule, ExitStatus, Finding, FindingSeverity, GcCandidate,
-        GcDeferred, GcReason, GcReport, GitOid, GrantSet, HostLoadSample, JobAccounting, JobId,
-        JobInfo, JobResourceSample, JobState, JobStreamWatermark, JobVolumeUsage, LandReport,
-        LandingCommits, OutputLimitInfo, OutputStorage, OutputSummary, PortBlock, ProtectedOutput,
-        PushReport, RebaseBuildVolume, RebaseCarrySkip, RebaseReport, RemoveReport, RepoRule,
-        ResidentBytes, ResizeResult, ResizeVolume, Sha256Digest, SimVerb, SpanId, StdinInfo,
-        StdinKind, StreamBytes, StreamInfo, StreamLines, TraceContext, TraceId, UtcTimestamp,
-        VolumeUnavailable, VolumeUsage, VolumeUsedBytesDelta, WallMicros, WorkspaceIncarnation,
-        WorkspaceInfo, WorkspaceLanding, WorkspaceName, WorkspacePath, WorkspaceRole,
-        WorkspaceState,
+        AbandonedWork, BinaryData, CarrySide, CheckpointInfo, CommandArg, CpuMicros,
+        CpuMicrosDelta, CpuTotals, DoctorReport, EgressMode, EgressRule, ExitStatus, Finding,
+        FindingSeverity, GcCandidate, GcDeferred, GcReason, GcReport, GitOid, GrantSet,
+        HostLoadSample, JobAccounting, JobId, JobInfo, JobLeafAttribution, JobProcessLeaf,
+        JobResourceSample, JobState, JobStreamWatermark, JobVolumeUsage, LandReport,
+        LandingCommits, OneCoreCpuPercent, OutputLimitInfo, OutputStorage, OutputSummary,
+        PortBlock, ProcessCoverage, ProcessCoverageGap, ProtectedOutput, PushReport,
+        RebaseBuildVolume, RebaseCarrySkip, RebaseReport, RemoveReport, RepoRule, ResidentBytes,
+        ResizeResult, ResizeVolume, Sha256Digest, SimVerb, SpanId, StdinInfo, StdinKind,
+        StreamBytes, StreamInfo, StreamLines, TraceContext, TraceId, UsageReconciliation,
+        UtcTimestamp, VolumeUnavailable, VolumeUsage, VolumeUsedBytesDelta, WallMicros,
+        WorkspaceIncarnation, WorkspaceInfo, WorkspaceLanding, WorkspaceName, WorkspacePath,
+        WorkspaceRole, WorkspaceState,
     },
     repository::RepoId,
 };
@@ -176,18 +178,35 @@ fn ended_sample(job: &JobInfo, volumes: JobVolumeUsage) -> JobResourceSample {
         .and_then(|millis| millis.checked_mul(1_000))
         .expect("an ended fixture job has a duration");
     let wall = WallMicros::new(wall).expect("fixture wall");
+    let leader_pid = job.pid.expect("an ended fixture job had a process");
+    let cpu = CpuTotals::ZERO;
     JobResourceSample {
         job_id: job.job_id,
         sampled_at: timestamp(),
         wall_ms: wall.millis(),
         wall_us: wall,
-        leader_pid: job.pid.expect("an ended fixture job had a process"),
+        leader_pid,
         members: Vec::new(),
+        leaf: JobLeafAttribution::NoAccountedCpu,
+        cpu_user_ms: cpu.user_us.millis(),
+        cpu_sys_ms: cpu.sys_us.millis(),
+        cpu_pct: OneCoreCpuPercent::ZERO,
         host_start: HostLoadSample::new(2.0, 10).expect("fixture host"),
         host: HostLoadSample::new(2.5, 10).expect("fixture host"),
         rss_bytes: ResidentBytes::new(0).expect("fixture resident bytes"),
         rss_peak_bytes: ResidentBytes::new(12 << 20).expect("fixture resident bytes"),
-        accounting: None,
+        accounting: JobAccounting::MacOsRusageChildren {
+            cpu,
+            io: None,
+            reconciliation: UsageReconciliation {
+                cpu_us: CpuMicrosDelta::new(0).expect("fixture cpu delta"),
+                io_read_bytes: None,
+                io_write_bytes: None,
+                coverage: ProcessCoverage::Gap {
+                    reason: ProcessCoverageGap::UncountedFork { pid: leader_pid },
+                },
+            },
+        },
         volumes,
         stdout: watermark(&job.stdout),
         stderr: watermark(&job.stderr),
@@ -218,6 +237,10 @@ fn job_infos() -> BTreeMap<&'static str, Value> {
         failure: None,
     };
 
+    let running_cpu = CpuTotals {
+        user_us: CpuMicros::new(2_180_500).expect("fixture cpu"),
+        sys_us: CpuMicros::new(310_250).expect("fixture cpu"),
+    };
     // A running job with every optional present, its latest resource sample among them, a
     // workspace-file stdin, and both stream storage variants that name a workspace path.
     let running = JobInfo {
@@ -242,18 +265,34 @@ fn job_infos() -> BTreeMap<&'static str, Value> {
             wall_us: WallMicros::new(1_250_400).expect("fixture wall"),
             leader_pid: 4242,
             members: vec![4242, 4243],
+            leaf: JobLeafAttribution::Attributed {
+                leaf: JobProcessLeaf {
+                    pid: 4242,
+                    program: "cargo".into(),
+                    argv: vec![CommandArg::from("cargo")],
+                },
+                observed_cpu_permille: 950,
+            },
+            cpu_user_ms: running_cpu.user_us.millis(),
+            cpu_sys_ms: running_cpu.sys_us.millis(),
+            cpu_pct: OneCoreCpuPercent::new(87.5).expect("fixture cpu percent"),
             host_start: HostLoadSample::new(1.5, 10).expect("fixture host"),
             host: HostLoadSample::new(6.25, 10).expect("fixture host"),
             rss_bytes: ResidentBytes::new(48 << 20).expect("fixture resident bytes"),
             rss_peak_bytes: ResidentBytes::new(96 << 20).expect("fixture resident bytes"),
             // The macOS source: its CPU in named microseconds, its byte totals unavailable.
-            accounting: Some(JobAccounting::MacOsRusageChildren {
-                cpu: CpuTotals {
-                    user_us: CpuMicros::new(2_180_500).expect("fixture cpu"),
-                    sys_us: CpuMicros::new(310_250).expect("fixture cpu"),
-                },
+            accounting: JobAccounting::MacOsRusageChildren {
+                cpu: running_cpu,
                 io: None,
-            }),
+                reconciliation: UsageReconciliation {
+                    cpu_us: CpuMicrosDelta::new(-12_500).expect("fixture cpu delta"),
+                    io_read_bytes: None,
+                    io_write_bytes: None,
+                    coverage: ProcessCoverage::Gap {
+                        reason: ProcessCoverageGap::UncountedFork { pid: 4242 },
+                    },
+                },
+            },
             volumes: JobVolumeUsage {
                 workspace: VolumeUsage::Read {
                     delta_bytes: VolumeUsedBytesDelta::new(64 << 20).expect("fixture delta"),

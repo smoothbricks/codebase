@@ -249,11 +249,20 @@ describe('checked resource units', () => {
 
 describe('job accounting', () => {
   it('names its source and keeps unavailable bytes absent, never zero', () => {
-    const accounting = { kind: 'macOsRusageChildren', cpu: { userUs: 1_250_000, sysUs: 80_000 }, io: null };
+    const accounting = {
+      kind: 'macOsRusageChildren',
+      cpu: { userUs: 1_250_000, sysUs: 80_000 },
+      reconciliation: {
+        cpuUs: -12_500,
+        coverage: { kind: 'gap', reason: { kind: 'uncountedFork', pid: 4242 } },
+      },
+    };
     expect<unknown>(validators.assertJobAccounting(accounting)).toEqual(accounting);
     expect<unknown>(validators.parseJobAccounting(JSON.stringify(accounting))).toEqual(accounting);
     for (const refused of [
-      // The bytes are unavailable, not omitted.
+      // Unavailable bytes are absent, never null.
+      { ...accounting, io: null },
+      // The reconciliation is part of the total, never omitted.
       { kind: 'macOsRusageChildren', cpu: accounting.cpu },
       // No block-operation count stands in for bytes.
       { ...accounting, pageins: 12 },
@@ -262,6 +271,61 @@ describe('job accounting', () => {
       { ...accounting, cpu: { userUs: Number.MAX_SAFE_INTEGER + 1, sysUs: 0 } },
     ]) {
       expect(() => validators.assertJobAccounting(refused)).toThrow();
+    }
+  });
+
+  it('accepts the Linux cgroup source with charged memory and reconciled byte totals', () => {
+    const linux = {
+      kind: 'linuxCgroupV2',
+      cpu: { userUs: 1_250_000, sysUs: 80_000 },
+      io: { readBytes: 4096, writeBytes: 0 },
+      chargedMemory: { currentBytes: 1_048_576, peakBytes: 2_097_152 },
+      reconciliation: {
+        cpuUs: 0,
+        ioReadBytes: 4096,
+        ioWriteBytes: 0,
+        coverage: { kind: 'complete' },
+      },
+    };
+    expect<unknown>(validators.assertJobAccounting(linux)).toEqual(linux);
+  });
+
+  it('attributes CPU to a named leaf, or names why it cannot', () => {
+    const sample = {
+      jobId: 1,
+      sampledAt: '2026-07-13T00:00:00Z',
+      wallMs: 50,
+      wallUs: 50_000,
+      leaderPid: 4242,
+      members: [4242],
+      leaf: { kind: 'noAccountedCpu' },
+      cpuUserMs: 0,
+      cpuSysMs: 0,
+      cpuPct: 0,
+      hostStart: { load1: 1.5, cores: 10 },
+      host: { load1: 2.5, cores: 10 },
+      rssBytes: 4096,
+      rssPeakBytes: 4096,
+      accounting: {
+        kind: 'macOsRusageChildren',
+        cpu: { userUs: 0, sysUs: 0 },
+        reconciliation: {
+          cpuUs: 0,
+          coverage: { kind: 'gap', reason: { kind: 'uncountedFork', pid: 4242 } },
+        },
+      },
+      volumes: { workspace: { kind: 'unavailable', reason: { kind: 'unconfigured' } } },
+      stdout: { bytes: 0, lines: 0 },
+      stderr: { bytes: 0, lines: 0 },
+    };
+    expect<unknown>(validators.assertJobResourceSample(sample)).toEqual(sample);
+    for (const refused of [
+      // A leaf is a named process or a stated reason; no third kind exists.
+      { ...sample, leaf: { kind: 'largest' } },
+      // The leaf is part of the sample, never omitted.
+      { ...sample, leaf: undefined },
+    ]) {
+      expect(() => validators.assertJobResourceSample(refused)).toThrow();
     }
   });
 });

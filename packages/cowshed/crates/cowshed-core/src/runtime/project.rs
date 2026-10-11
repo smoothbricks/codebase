@@ -6239,6 +6239,7 @@ impl NativeProjectRuntimeHost {
                 labeller: std::sync::Arc::new(ApfsLabeller(self.substrate.shared_host())),
             }),
             workspace_volume: Some(workspace_volume),
+            job_sampling: super::supervisor::JobSamplingPolicy::default(),
         };
         // A workspace has one supervisor, its one job allocator: when another controller
         // process already serves it under this authority, or under grants published since this

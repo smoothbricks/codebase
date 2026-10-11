@@ -800,7 +800,12 @@ pub struct ProcessRecord {
 /// reaped or not.
 #[cfg(target_os = "macos")]
 pub(crate) fn process_record(pid: i32) -> io::Result<Option<ProcessRecord>> {
-    Ok(running_info(pid)?.map(|info| ProcessRecord {
+    Ok(running_info(pid)?.map(|info| record_of(&info)))
+}
+
+#[cfg(target_os = "macos")]
+fn record_of(info: &BsdInfoWithUniqueId) -> ProcessRecord {
+    ProcessRecord {
         pid: info.bsd.pbi_pid,
         ppid: info.bsd.pbi_ppid,
         unique_id: info.unique.unique_id,
@@ -808,11 +813,20 @@ pub(crate) fn process_record(pid: i32) -> io::Result<Option<ProcessRecord>> {
         // xnu `proc_pidbsdinfo`: `pbi_uid` is the credential's effective uid.
         uid: info.bsd.pbi_uid,
         started_seconds: info.bsd.pbi_start_tvsec,
-    }))
+    }
 }
 
 #[cfg(target_os = "macos")]
 impl Process {
+    /// This process's record, read now; `None` once it has exited, or once its pid names a later
+    /// process, whose record is never this one's: the pid's running process must still carry this
+    /// process's version.
+    pub(crate) fn record(&self) -> io::Result<Option<ProcessRecord>> {
+        Ok(running_info(self.pid)?
+            .filter(|info| info.unique.id_version.cast_unsigned() == self.version)
+            .map(|info| record_of(&info)))
+    }
+
     /// The process at the other end of a connected Unix socket, as the kernel recorded it when
     /// the connection was made: whatever happens to its pid later, the handle names only it.
     pub(super) fn of_socket_peer(socket: &impl std::os::fd::AsRawFd) -> io::Result<Self> {
@@ -1810,6 +1824,77 @@ mod tests {
             !leader.signal(libc::SIGKILL).unwrap(),
             "a reaped process was signalled"
         );
+        // SAFETY: the test's own group; its backgrounded sleep may still hold the id.
+        unsafe { libc::killpg(pgid, libc::SIGKILL) };
+    }
+
+    /// A member's record is read only through the identity it was found with: under any other
+    /// version of its pid -- the shape a reused pid takes -- the census finds no process, so a
+    /// stranger is never charged the job's CPU or named its leaf.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_census_reads_only_the_member_its_identity_names() {
+        use crate::api::process::JobLeafAttribution;
+        use crate::api::resources::{CpuMicros, CpuTotals};
+        use crate::runtime::job_attribution::{Census, observe};
+        use crate::runtime::supervisor::LeafCoverage;
+
+        let mut job = started_job_group();
+        let pgid = i32::try_from(job.id()).unwrap();
+        let members = super::members_of(pgid).unwrap();
+        let leader = members
+            .iter()
+            .find(|member| member.pid() == pgid)
+            .expect("the running leader holds its group id");
+        let stranger = super::Process {
+            pid: leader.pid,
+            version: leader.version.wrapping_add(1),
+        };
+        assert_eq!(stranger.record().unwrap(), None);
+        assert_eq!(
+            leader.record().unwrap().map(|record| record.pid),
+            Some(leader.pid.cast_unsigned())
+        );
+        // One microsecond accounted: any own CPU of an identified member covers all of it.
+        let total = CpuTotals {
+            user_us: CpuMicros::new(1).unwrap(),
+            sys_us: CpuMicros::new(0).unwrap(),
+        };
+        let coverage = LeafCoverage::new(900).unwrap();
+        let leader_pid = leader.pid.cast_unsigned();
+
+        let mut census = Census::led_by(leader_pid);
+        observe(
+            &mut census,
+            std::slice::from_ref(&stranger),
+            std::time::Instant::now(),
+        )
+        .unwrap();
+        assert_eq!(
+            census.attribute(total, coverage).unwrap().leaf,
+            JobLeafAttribution::Unattributed {
+                observed_cpu_permille: 0,
+                required_permille: 900,
+            },
+            "another life of the pid is no member"
+        );
+
+        let mut census = Census::led_by(leader_pid);
+        observe(
+            &mut census,
+            std::slice::from_ref(leader),
+            std::time::Instant::now(),
+        )
+        .unwrap();
+        let JobLeafAttribution::Attributed { leaf, .. } =
+            census.attribute(total, coverage).unwrap().leaf
+        else {
+            panic!("the member itself is observed");
+        };
+        assert_eq!(leaf.pid, leader_pid);
+
+        assert!(leader.signal(libc::SIGKILL).unwrap());
+        job.wait().unwrap();
         // SAFETY: the test's own group; its backgrounded sleep may still hold the id.
         unsafe { libc::killpg(pgid, libc::SIGKILL) };
     }

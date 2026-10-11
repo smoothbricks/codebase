@@ -242,7 +242,7 @@ pub enum ProcessIoUnavailable {
 
 /// Whether the tree holds every process the job owned. A gap is absorbing: once an observation
 /// was missed, no later one makes the tree complete again.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
 pub enum ProcessCoverage {
     Complete,
@@ -273,4 +273,60 @@ pub enum ProcessCoverageGap {
     /// A member exited with no read of its counters after its exit: its usage is the last one
     /// observed, not its final usage.
     UnreadFinalUsage { pid: u32 },
+}
+
+/// The process a job's CPU went to most: its pid and the image it last ran.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct JobProcessLeaf {
+    pub pid: u32,
+    pub program: String,
+    pub argv: Vec<CommandArg>,
+}
+
+/// Thousandths of a whole: the largest share a coverage can be.
+pub const PERMILLE_WHOLE: u16 = 1_000;
+
+/// Which observed process, live or exited, a job's CPU went to most, named only when the
+/// observed processes' own CPU covers at least the supervisor's configured share of the job's
+/// accounted CPU. Never a guessed winner among processes the observation missed.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum JobLeafAttribution {
+    /// The observed process with the most own CPU (ties to the earlier birth identity, then the
+    /// lower pid), and the thousandths of the job's accounted CPU the observed processes cover.
+    Attributed {
+        leaf: JobProcessLeaf,
+        observed_cpu_permille: u16,
+    },
+    /// The observed processes cover less than the required share: no leaf is named.
+    Unattributed {
+        observed_cpu_permille: u16,
+        required_permille: u16,
+    },
+    /// The job's source has accounted no CPU yet, so nothing has a share of it.
+    NoAccountedCpu,
+}
+
+impl JobLeafAttribution {
+    /// Whether its thousandths are shares of a whole, and an unattributed coverage lies below
+    /// the share it was required to reach.
+    pub fn consistent(&self) -> bool {
+        match self {
+            Self::Attributed {
+                observed_cpu_permille,
+                ..
+            } => *observed_cpu_permille <= PERMILLE_WHOLE,
+            Self::Unattributed {
+                observed_cpu_permille,
+                required_permille,
+            } => observed_cpu_permille < required_permille && *required_permille <= PERMILLE_WHOLE,
+            Self::NoAccountedCpu => true,
+        }
+    }
 }

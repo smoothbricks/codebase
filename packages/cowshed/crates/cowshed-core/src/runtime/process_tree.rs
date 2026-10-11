@@ -279,7 +279,7 @@ impl ProcessTreeFold {
                     )
                 })
                 .collect(),
-            coverage: self.coverage.clone(),
+            coverage: self.coverage,
         }
     }
 

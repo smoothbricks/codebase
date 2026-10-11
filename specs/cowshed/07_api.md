@@ -773,15 +773,19 @@ when it starts. An activation that fails preserves its observed cost in the term
 milliseconds. `hostStart` is captured once at job spawn and survives every later sample; `host` is captured at the
 sample boundary. CPU user/sys time is cumulative across the complete owned process group, retaining exited and reaped
 descendants without double-counting them. `cpuPct` is the user+system delta divided by the elapsed window since the
-preceding supervisor sample, multiplied by 100; it is one-core normalized and may exceed 100. Reading resources or
-starting a second subscriber does not reset that window. The first zero-length window reports zero share, not a division
-by zero. RSS is the simultaneously sampled group sum; peak is its maximum observed sum. `members` retains the complete
-current group, never a truncated membership claim; CPU/RSS accounting covers every member. A sample exceeding the
-generated frame bound is a typed error, not a silently shortened list. `leaderPid` retains the job's observed leader
-after exit; terminal membership may be empty. An incomplete kernel membership read is an operational error, never
-evidence of an empty group. On Linux a retained pidfd judges each procfs read after it completes: a process proven
-departed is no current member, even when its stat read reports `ESRCH`; a read failure for a process still alive remains
-an operational error.
+preceding supervisor sample, multiplied by 100; it is one-core normalized and may exceed 100. Supervisor samples are its
+own boundaries: the job's first owned process, a new leader, the terminal sample, and each tick of its sampling clock,
+which runs every `jobCpuSamplePeriod` while any job owns a process. `jobCpuSamplePeriod` is a supervisor policy value,
+initially one second (to be measured for its cost and `cpuPct`'s stability). Reading resources or starting a second
+subscriber does not reset that window: a read measures from the open window to its own instant and leaves it open. The
+first zero-length window reports zero share, not a division by zero; a later window with no whole elapsed microsecond
+stays open, so its CPU is measured by the next. RSS is the simultaneously sampled group sum; peak is its maximum
+observed sum. `members` retains the complete current group, never a truncated membership claim; CPU/RSS accounting
+covers every member. A sample exceeding the generated frame bound is a typed error, not a silently shortened list.
+`leaderPid` retains the job's observed leader after exit; terminal membership may be empty. An incomplete kernel
+membership read is an operational error, never evidence of an empty group. On Linux a retained pidfd judges each procfs
+read after it completes: a process proven departed is no current member, even when its stat read reports `ESRCH`; a read
+failure for a process still alive remains an operational error.
 
 `volumes` compares the used bytes of the workspace volume and the job's build volume at spawn with those at the sample
 boundary. Deltas are signed and never clamped: deletion can shrink a volume. They describe volume-wide usage, not
@@ -1011,6 +1015,20 @@ measured on real cargo/Nx/Bun gate jobs and reported. Below it, or with no accou
 the sample says why. The rule is the same on Linux and macOS; the unattributed remainder is still stated by
 reconciliation.
 
+Until the event observer feeds the sampler, the observed processes are the sampler's census: at each sample boundary it
+reads every member of the group, its identity, the image it runs (fenced by the identity read after it) and its own
+counters, and keeps each life it found, exited ones with their last counters. A census polls, so its coverage is never
+`Complete`: it names the first observation it lacks -- a member it found whose birth no leader spawn accounts for
+(`UnobservedBirth`), a member that left before a read after its exit (`UnreadFinalUsage`), a member whose image read the
+kernel refused (`UnreadImage`) -- and with none, `UncountedFork` of the current leader, which may have forked between
+boundaries. A member whose current image is unread -- never read, or refused or failed since a read named one -- is not
+an observed process until a read names its image again: its CPU covers nothing and it is never the leaf. Coverage is the
+observed CPU's share of the accounted total, never more than the whole; observed CPU beyond the total stays in the
+signed reconciliation.
+
+A Linux job's accounting source is its own cgroup v2, and until the production spawn path places jobs in one, a Linux
+sample is the typed operational error naming the missing source, not a sample without accounting.
+
 ```rust
 pub enum JobLeafAttribution {
     Attributed { leaf: JobProcessLeaf, observed_cpu_permille: u16 },
@@ -1142,8 +1160,9 @@ no authority and never crosses an incarnation. A successful root JSON `null` is 
 remains an invalid response envelope.
 
 Record layout 8 preserves layout 7's resource, accounting and volume columns, then appends the fourteen admission
-columns. Native error causes are object projections generated from the canonical `CowshedError` declaration, not JSON
-strings or parsed message text; the TypeScript facade validates the generated type directly.
+columns. Layout 9 preserves layout 8 and appends the sample's CPU share, leaf and reconciliation and a cgroup source's
+charged memory (13_telemetry.md). Native error causes are object projections generated from the canonical `CowshedError`
+declaration, not JSON strings or parsed message text; the TypeScript facade validates the generated type directly.
 
 An executor persists its own operation-to-key binding before dispatch, and its operation-to-job binding before
 acknowledging admission. After a crash it looks up the original key or job number, resumes progress/tails, and replays

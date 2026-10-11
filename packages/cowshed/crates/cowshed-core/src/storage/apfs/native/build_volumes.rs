@@ -641,6 +641,7 @@ mod tests {
     use crate::apfs::{
         AttachedDiskImage, CommandOutput, CommandRequest, CommandRunError, SystemCommandRunner,
     };
+    use crate::api::resources::JobAccounting;
     use crate::build_volume::BuildVolumeRole;
     use crate::fork_lock::Fenced;
     use crate::metadata::WorkspaceName;
@@ -1784,8 +1785,15 @@ mod tests {
         near(workspace, 24 * MIB, "the terminal sample's workspace");
         near(build, 4 * MIB, "the terminal sample's build volume");
         assert!(
-            terminal.accounting.is_some(),
+            matches!(
+                terminal.accounting,
+                JobAccounting::MacOsRusageChildren { .. }
+            ),
             "the job's CPU totals ride the same terminal sample as its volumes"
+        );
+        assert!(
+            terminal.consistent(),
+            "the terminal sample agrees with its own CPU totals"
         );
         assert_eq!(
             handle.sealed(job_id).await.unwrap().resources.as_ref(),

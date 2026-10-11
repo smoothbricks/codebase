@@ -171,6 +171,7 @@ impl Workspace {
             inherited_groups: Vec::new(),
             volume_labels: None,
             workspace_volume: None,
+            job_sampling: cowshed_core::runtime::supervisor::JobSamplingPolicy::default(),
         };
         let artifacts = ArtifactStoreSink::open(
             config.workspace_root.clone(),
@@ -1250,7 +1251,7 @@ fn measured(workspace: &Workspace, name: &str) -> u64 {
 /// they are unavailable, never zero.
 fn accounted(info: &JobInfo) -> u64 {
     match info.resources.as_ref().map(|sample| sample.accounting) {
-        Some(Some(JobAccounting::MacOsRusageChildren { cpu, io: None })) => {
+        Some(JobAccounting::MacOsRusageChildren { cpu, io: None, .. }) => {
             cpu.user_us.get() + cpu.sys_us.get()
         }
         other => panic!("a terminal sample of the leader/children rusage source: {other:?}"),

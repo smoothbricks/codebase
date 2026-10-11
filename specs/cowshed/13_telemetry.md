@@ -297,17 +297,22 @@ running record and on a terminal one whose end nothing observed (a job refused b
 `resources_host_start_load1, resources_host_start_cores, resources_host_load1, resources_host_cores` (Float64, UInt16,
 Float64, UInt16), `resources_rss_bytes, resources_rss_peak_bytes` (UInt64), the four UInt64 stream tallies
 `resources_stdout_bytes, resources_stdout_lines, resources_stderr_bytes, resources_stderr_lines`, then the sample's
-`JobAccounting`: `resources_accounting_source` (Utf8, its wire kind, today only `macOsRusageChildren`),
+`JobAccounting`: `resources_accounting_source` (Utf8, its wire kind: `macOsRusageChildren` or `linuxCgroupV2`),
 `resources_accounting_cpu_user_us, resources_accounting_cpu_sys_us` (UInt64), and
 `resources_accounting_io_read_bytes, resources_accounting_io_write_bytes` (UInt64), then, appended in version 7,
 `resources_volume_workspace` and `resources_volume_build`, each that volume's `VolumeUsage` as its 07_api.md wire JSON
-(Utf8). Every resource column is null on a record without a sample. A sample always carries
-`resources_volume_workspace`; `resources_volume_build` is null for a sample of a job that ran with no build volume; the
-accounting columns are all null for a sample without accounting, and its two byte columns are null together where the
-source has no byte totals; any other null combination is rejected. Records are written and read at `record_version` 7
-only: a store holding a record in an earlier layout is set aside whole and never read (11_shell.md), and a batch whose
-layout and version disagree is rejected; version 7 is version 6 with the two volume columns appended, so a version-6
-reader meets it as a newer writer's. A CheckpointManifest row instead uses
+(Utf8). Version 8 appends the fourteen admission columns (07_api.md, "Keyed admission"). Version 9 appends the rest of
+the sample: `resources_cpu_pct` (Float64), `resources_leaf` and `resources_accounting_reconciliation` (the
+`JobLeafAttribution` and `UsageReconciliation` as their wire JSON, Utf8), and
+`resources_accounting_charged_current_bytes, resources_accounting_charged_peak_bytes` (UInt64). `cpuUserMs`/`cpuSysMs`
+and `wallMs` are derived again from their microseconds, never stored twice. Every resource column is null on a record
+without a sample. A sample always carries `resources_volume_workspace`, its accounting source with CPU totals and
+reconciliation, its CPU share and its leaf; `resources_volume_build` is null for a sample of a job that ran with no
+build volume; the macOS source's two byte columns are null together, a cgroup's are present, and the charged pair is
+present exactly for `linuxCgroupV2`; any other null combination is rejected. Records are written and read at
+`record_version` 9 only: a store holding a record in an earlier layout is set aside whole and never read (11_shell.md),
+and a batch whose layout and version disagree is rejected; each version is its predecessor with columns appended, so an
+earlier reader meets a later record as a newer writer's. A CheckpointManifest row instead uses
 `origin_incarnation, barrier_id, visible_jobs, records_sha256`, with
 `visible_jobs: List<Struct<workspace_incarnation,job_id,state,stdout,stderr>>`. Columns outside the selected variant are
 null and validators reject every other null combination. Job recovery validates non-null raw argv elements, the

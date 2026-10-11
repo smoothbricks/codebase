@@ -23,7 +23,12 @@ use crate::api::dto::{
     UtcTimestamp, WorkspacePath,
 };
 use crate::api::journal_tail::tail_journals;
-use crate::api::resources::{HostLoadSample, JobResourceSample, ResidentBytes, SampleInterval};
+use crate::api::process::JobLeafAttribution;
+#[cfg(target_os = "macos")]
+use crate::api::resources::UsageReconciliation;
+use crate::api::resources::{
+    HostLoadSample, JobAccounting, JobResourceSample, ResidentBytes, SampleInterval,
+};
 use crate::error::{AdmissionField, AdmissionRefusal, CowshedError, Result, StdinRefusal};
 use crate::exec::{
     ExecError, SandboxExecRequest, SpawnPlan, classify_spawn_error, plan_exec_under,
@@ -44,7 +49,9 @@ use cowshed_gateway_types::WorkspaceToken;
 
 use crate::runtime::job_groups::Birth;
 use crate::runtime::job_progress::{JobProgressStream, ProgressRead};
-use crate::runtime::job_resources::{JobSampler, Member, Observation, Sampling, StreamTally};
+use crate::runtime::job_resources::{
+    Boundary, JobSampler, Member, Observation, Sampling, StreamTally,
+};
 use crate::runtime::job_spans::{JobSpanEdge, JobSpanPublisher, TraceHealth};
 use crate::runtime::nx_daemon::{NxDaemonKeeper, PROBE_INTERVAL, Probe, Verdict};
 use crate::runtime::volume_usage::{HostVolume, HostVolumeStat, VolumeBaseline, VolumeMountpoint};
@@ -119,6 +126,52 @@ pub struct WorkspaceSupervisorConfig {
     /// the build volume each job's admission grants (07_api.md "Job monitoring"). `None` stats
     /// no volume: every job's volumes are then unconfigured.
     pub workspace_volume: Option<VolumeMountpoint>,
+    /// How each job's resources are sampled.
+    pub job_sampling: JobSamplingPolicy,
+}
+
+/// How the supervisor samples its jobs' resources (07_api.md, "Job monitoring"): policy values,
+/// set from measurement, never facts a job reports.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct JobSamplingPolicy {
+    /// `jobCpuSamplePeriod`: each tick of the supervisor's sampling clock samples every job that
+    /// owns a process, closing its CPU window and opening the next. Positive.
+    pub cpu_sample_period: Duration,
+    /// The share of a job's accounted CPU its observed processes must cover before the one with
+    /// the most own CPU is named its leaf.
+    pub leaf_coverage: LeafCoverage,
+}
+
+impl Default for JobSamplingPolicy {
+    /// The initial settings: one second (pending measurement of its cost and of `cpuPct`'s
+    /// stability), and 900‰ (pending measurement on real cargo, Nx and Bun gate jobs).
+    fn default() -> Self {
+        Self {
+            cpu_sample_period: Duration::from_secs(1),
+            leaf_coverage: LeafCoverage(900),
+        }
+    }
+}
+
+/// The share of a job's accounted CPU its observed processes must cover before the one with the
+/// most own CPU is named its leaf, in thousandths: at least one, at most the whole.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LeafCoverage(u16);
+
+impl LeafCoverage {
+    /// `permille` thousandths, if it is a share no empty observation could meet and no more
+    /// than the whole.
+    pub const fn new(permille: u16) -> Option<Self> {
+        if permille == 0 || permille > crate::api::process::PERMILLE_WHOLE {
+            None
+        } else {
+            Some(Self(permille))
+        }
+    }
+
+    pub const fn permille(self) -> u16 {
+        self.0
+    }
 }
 
 /// Names the volume of a workspace's image through the APFS host, which renames only the volume
@@ -168,6 +221,12 @@ impl WorkspaceSupervisorConfig {
             return Err(CowshedError::usage(
                 "workspace supervisor TERM grace must be positive",
                 "configure a positive TERM grace interval",
+            ));
+        }
+        if self.job_sampling.cpu_sample_period.is_zero() {
+            return Err(CowshedError::usage(
+                "the job CPU sample period must be positive",
+                "configure a positive job CPU sample period",
             ));
         }
         if self.workspace_root != self.sandbox.workspace_mount {
@@ -243,6 +302,7 @@ impl Default for WorkspaceSupervisorConfig {
             inherited_groups: Vec::new(),
             volume_labels: None,
             workspace_volume: None,
+            job_sampling: JobSamplingPolicy::default(),
         }
     }
 }
@@ -2589,6 +2649,8 @@ impl WorkspaceSupervisor {
             nx_daemon,
             labelled_build: None,
             labelling: tokio::task::JoinSet::new(),
+            job_sampling: config.job_sampling,
+            sample_clock: None,
         };
         // Whatever the checkout's volumes were cloned from, they are named for it from here.
         let build = actor.policy.ceiling().build_volume_mount.clone();
@@ -3052,6 +3114,10 @@ struct SupervisorActor {
     labelled_build: Option<PathBuf>,
     /// Background renames, reaped without delaying provisioning or lifecycle commands.
     labelling: tokio::task::JoinSet<()>,
+    /// See [`WorkspaceSupervisorConfig::job_sampling`].
+    job_sampling: JobSamplingPolicy,
+    /// The job sampling clock: running while a job owns a process.
+    sample_clock: Option<tokio::time::Interval>,
 }
 
 /// The actor's run loop ends only once every job is terminal, so an actor dropped with a job still
@@ -3123,6 +3189,9 @@ impl SupervisorActor {
                         eprintln!("cowshed: volume label task failed: {error}");
                     }
                 }
+                () = next_sample_tick(&mut self.sample_clock), if self.sample_clock.is_some() => {
+                    self.sample_jobs();
+                }
                 () = super::nx_daemon::next_probe(&mut self.nx_daemon),
                     if self.nx_daemon.is_some()
                         && self.lifecycle == ActorLifecycle::Running
@@ -3135,6 +3204,43 @@ impl SupervisorActor {
             self.finish_lifecycle_waiters();
         }
         self.labelling.abort_all();
+    }
+
+    /// Arm the sampling clock, if it is not running: a job owns a process now. Its first tick
+    /// is one period away; the ownership itself was a boundary.
+    fn arm_sample_clock(&mut self) {
+        if self.sample_clock.is_none() {
+            let period = self.job_sampling.cpu_sample_period;
+            let mut clock = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+            clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            self.sample_clock = Some(clock);
+        }
+    }
+
+    /// A tick of the sampling clock: a supervisor boundary for every job that owns a process,
+    /// each kept as its latest sample. With none left, the clock stops until a job owns one.
+    /// A failed tick leaves the latest sample standing; every read observes again and returns
+    /// that failure itself.
+    fn sample_jobs(&mut self) {
+        let mut live = false;
+        for job in self.jobs.values_mut() {
+            let Some(sampler) = job.sampling.live() else {
+                continue;
+            };
+            live = true;
+            if let Ok(sample) = observe(
+                sampler,
+                &job.volumes,
+                job.stdout_tally,
+                job.stderr_tally,
+                Boundary::Supervisor,
+            ) {
+                job.info.resources = Some(sample);
+            }
+        }
+        if !live {
+            self.sample_clock = None;
+        }
     }
 
     async fn handle_command(&mut self, command: Command) {
@@ -4061,8 +4167,9 @@ impl SupervisorActor {
             Ok(process) => {
                 if let Some(owned) = process.process() {
                     // A one-shot command is the job's first process.
-                    own_process(&mut job, owned.clone());
+                    own_process(&mut job, owned.clone(), self.job_sampling.leaf_coverage);
                     adopt_birth(&mut job, self.group_ledger.is_some(), owned.birth.clone());
+                    self.arm_sample_clock();
                 }
                 job.process = Some(process);
                 let started = job.birth.is_some();
@@ -4655,8 +4762,10 @@ impl SupervisorActor {
                 let _ = self.begin_kill(job_id, KillReason::StdinFailure);
             }
             ProcessEvent::Activating { job_id, process } => {
+                let coverage = self.job_sampling.leaf_coverage;
                 if let Some(job) = self.jobs.get_mut(&job_id) {
-                    own_process(job, process);
+                    own_process(job, process, coverage);
+                    self.arm_sample_clock();
                 }
             }
             #[cfg(target_os = "macos")]
@@ -4672,11 +4781,13 @@ impl SupervisorActor {
             }
             ProcessEvent::Started { job_id, process } => {
                 let ledger = self.group_ledger.is_some();
+                let coverage = self.job_sampling.leaf_coverage;
                 if let Some(job) = self.jobs.get_mut(&job_id) {
                     let birth = process.birth.clone();
-                    own_process(job, process);
+                    own_process(job, process, coverage);
                     adopt_birth(job, ledger, birth);
                     self.record_groups();
+                    self.arm_sample_clock();
                 }
             }
             ProcessEvent::LaunchFailed { job_id, error } => {
@@ -4890,9 +5001,15 @@ impl SupervisorActor {
             .unwrap_or(u64::MAX);
         // The terminal sample, frozen into the job's record; none for a job that never owned a
         // process, or whose last observation failed -- a read says which.
-        job.info.resources = job
-            .sampling
-            .freeze(|sampler| observe(sampler, &job.volumes, job.stdout_tally, job.stderr_tally));
+        job.info.resources = job.sampling.freeze(|sampler| {
+            observe(
+                sampler,
+                &job.volumes,
+                job.stdout_tally,
+                job.stderr_tally,
+                Boundary::Supervisor,
+            )
+        });
         let ending = JobEnding {
             state,
             exit: job.exit.clone(),
@@ -5262,16 +5379,33 @@ fn sealed_tail(
     )
 }
 
-/// The job owns `process`: its first process starts its sampling, and a later one -- its command,
-/// after its activation -- takes the lead. Either is observed at once as the job's latest sample.
-/// An ended job's sampling stays as it ended, whatever arrives after.
-fn own_process(job: &mut JobStateRecord, process: OwnedProcess) {
+/// The next tick of the job sampling clock; never, while it is stopped.
+async fn next_sample_tick(clock: &mut Option<tokio::time::Interval>) {
+    match clock {
+        Some(clock) => {
+            clock.tick().await;
+        }
+        None => std::future::pending().await,
+    }
+}
+
+/// The job owns `process`: its first process starts its sampling, judging its leaf by
+/// `coverage`, and a later one -- its command, after its activation -- takes the lead. Either is
+/// a supervisor boundary, observed at once as the job's latest sample. An ended job's sampling
+/// stays as it ended, whatever arrives after.
+fn own_process(job: &mut JobStateRecord, process: OwnedProcess, coverage: LeafCoverage) {
     if job.terminal() {
         return;
     }
     let job_id = job.info.job_id;
-    if let Some(sampler) = job.sampling.own(job_id, process) {
-        match observe(sampler, &job.volumes, job.stdout_tally, job.stderr_tally) {
+    if let Some(sampler) = job.sampling.own(job_id, process, coverage) {
+        match observe(
+            sampler,
+            &job.volumes,
+            job.stdout_tally,
+            job.stderr_tally,
+            Boundary::Supervisor,
+        ) {
             Ok(sample) => job.info.resources = Some(sample),
             // The latest sample stands, dated by its own `sampledAt`; a read reports the failure.
             Err(error) => eprintln!(
@@ -5283,16 +5417,17 @@ fn own_process(job: &mut JobStateRecord, process: OwnedProcess) {
     }
 }
 
-/// Observe the job's processes and volumes now, with its streams as admitted so far: the one
-/// imperative step of a sample. Each member's resident memory is read right after the
-/// membership; a member that exited in between holds nothing and is no member any more. Each
-/// volume answers for itself: one that cannot be read is its own unavailability, never the
-/// sample's failure.
+/// Observe the job's processes and volumes now, with its streams as admitted so far, at
+/// `boundary`: the one imperative step of a sample. Each member's resident memory is read right
+/// after the membership; a member that exited in between holds nothing and is no member any
+/// more. Each volume answers for itself: one that cannot be read is its own unavailability,
+/// never the sample's failure.
 fn observe(
     sampler: &mut JobSampler,
     volumes: &VolumeBaseline<HostVolume>,
     stdout: StreamTally,
     stderr: StreamTally,
+    boundary: Boundary,
 ) -> Result<JobResourceSample> {
     let sampled_at = utc_now()?;
     let leader = sampler.leader().pid();
@@ -5329,28 +5464,84 @@ fn observe(
         })?;
         members.push(Member { pid, resident });
     }
-    // The leader's own and reaped-children CPU, read after the membership: a member that exited
-    // and was reaped since is already in its parent's children total.
-    #[cfg(target_os = "macos")]
-    let accounting = Some(
-        sampler
-            .rusage()
-            .account(super::job_accounting::read_leader)
-            .map_err(|error| unaccounted(leader, error))?,
-    );
-    #[cfg(not(target_os = "macos"))]
-    let accounting = None;
+    let (accounting, leaf) = account(sampler, &processes)?;
     let volumes = volumes.sample(&HostVolumeStat);
-    sampler.sample(Observation {
-        now: Instant::now(),
-        sampled_at,
-        members,
-        host,
-        volumes,
-        stdout,
-        stderr,
-        accounting,
-    })
+    sampler.sample(
+        Observation {
+            now: Instant::now(),
+            sampled_at,
+            members,
+            host,
+            volumes,
+            stdout,
+            stderr,
+            accounting,
+            leaf,
+        },
+        boundary,
+    )
+}
+
+/// The job's totals from its independent source, reconciled against the census of `members`
+/// taken now through the identities the membership read found, and the leaf that census names.
+/// The census reads each member's identity, image and own counters after the membership; the
+/// leader's own and reaped-children CPU is read after that, so a member that exited and was
+/// reaped since is already in its parent's children total.
+#[cfg(target_os = "macos")]
+fn account(
+    sampler: &mut JobSampler,
+    members: &[super::job_groups::Process],
+) -> Result<(JobAccounting, JobLeafAttribution)> {
+    let leader = sampler.leader().pid();
+    super::job_attribution::observe(sampler.census(), members, Instant::now()).map_err(
+        |error| {
+            CowshedError::environment_missing(
+                format!("the processes of job group {leader} could not be read: {error}"),
+                "the job runs on; read its resources again",
+            )
+        },
+    )?;
+    let cpu = sampler
+        .rusage()
+        .account(super::job_accounting::read_leader)
+        .map_err(|error| unaccounted(leader, error))?;
+    let coverage = sampler.coverage();
+    let attribution = sampler.census().attribute(cpu, coverage).map_err(|error| {
+        CowshedError::internal(format!(
+            "the CPU of job group {leader} cannot be attributed: {error}"
+        ))
+    })?;
+    Ok((
+        JobAccounting::MacOsRusageChildren {
+            cpu,
+            io: None,
+            reconciliation: UsageReconciliation {
+                cpu_us: attribution.cpu_us,
+                // The source has no storage bytes to compare.
+                io_read_bytes: None,
+                io_write_bytes: None,
+                coverage: attribution.coverage,
+            },
+        },
+        attribution.leaf,
+    ))
+}
+
+/// A Linux job's totals are its own cgroup v2's, and no production spawn places a job in one
+/// yet (07_api.md, "Complete job accounting and observation reconciliation"): with no source,
+/// the sample cannot be stated, and says why rather than inventing totals.
+#[cfg(not(target_os = "macos"))]
+fn account(
+    sampler: &mut JobSampler,
+    _members: &[super::job_groups::Process],
+) -> Result<(JobAccounting, JobLeafAttribution)> {
+    Err(CowshedError::environment_missing(
+        format!(
+            "job group {} has no CPU accounting source: no cgroup v2 of its own holds it",
+            sampler.leader().pid()
+        ),
+        "the job runs on; its resources are stated once jobs run in their own cgroup",
+    ))
 }
 
 /// Why job group `leader`'s CPU totals cannot be stated: the kernel would not answer for a
@@ -5377,7 +5568,13 @@ fn unaccounted(leader: u32, error: super::job_accounting::AccountingError) -> Co
 /// terminal sample or why it has none.
 fn sample_job(job: &mut JobStateRecord) -> Result<JobResourceSample> {
     let sample = job.sampling.read(job.info.job_id, |sampler| {
-        observe(sampler, &job.volumes, job.stdout_tally, job.stderr_tally)
+        observe(
+            sampler,
+            &job.volumes,
+            job.stdout_tally,
+            job.stderr_tally,
+            Boundary::Read,
+        )
     })?;
     if !job.terminal() {
         job.info.resources = Some(sample.clone());
@@ -6820,6 +7017,7 @@ mod lifecycle_commitment_tests {
             inherited_groups: Vec::new(),
             volume_labels: None,
             workspace_volume: None,
+            job_sampling: JobSamplingPolicy::default(),
         };
         // `list()`/`info()` answer from the actor's resident job set, which is this supervisor's
         // own lifetime and deliberately not the durable history: the artifact store holds every

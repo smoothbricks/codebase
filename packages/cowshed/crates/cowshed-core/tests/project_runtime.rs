@@ -2071,6 +2071,7 @@ fn supervisor_config_of(
         inherited_groups: Vec::new(),
         volume_labels: None,
         workspace_volume: None,
+        job_sampling: cowshed_core::runtime::supervisor::JobSamplingPolicy::default(),
     }
 }
 
@@ -3046,6 +3047,7 @@ async fn host_controller_a_keyed_job_distinguishes_unnamed_sessions() {
 /// group of its own, blocked opening the FIFO until the test opens it to write. The test speaks
 /// for the job's lifecycle through its event sender, as [`ScriptedSpawner`] does; its resource
 /// samples read the real group.
+#[cfg(target_os = "macos")]
 struct GatedSpawner {
     gate: PathBuf,
     spawned: mpsc::UnboundedSender<(
@@ -3056,6 +3058,7 @@ struct GatedSpawner {
     start_owned: bool,
 }
 
+#[cfg(target_os = "macos")]
 #[async_trait]
 impl SpawnSink for GatedSpawner {
     async fn spawn(
@@ -3090,6 +3093,7 @@ impl SpawnSink for GatedSpawner {
 /// The direct resource operation follows a real owned group, not a status projection: before
 /// ownership it refuses the read, admitted output advances its next sample, and its sealed
 /// sample remains unchanged even after the parent reaps the child.
+#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn resource_reads_refuse_unowned_then_observe_and_keep_the_sealed_sample() {
     use std::io::Write as _;
@@ -3198,6 +3202,7 @@ async fn resource_reads_refuse_unowned_then_observe_and_keep_the_sealed_sample()
 /// more every interval while the job writes nothing, then its terminal sample exactly once --
 /// the one its sealed record keeps -- and closes. A subscription nobody reads holds up no other
 /// call, and dropping one leaves the job running.
+#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn progress_samples_a_silent_job_periodically_then_its_sealed_terminal_once() {
     use std::io::Write as _;

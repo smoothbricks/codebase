@@ -10,6 +10,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use super::dto::{JobId, MAX_JOB_ID, UtcTimestamp};
+use super::process::{JobLeafAttribution, ProcessCoverage};
 
 /// The largest integer Rust, JSON and a JavaScript `number` all hold exactly.
 pub const MAX_EXACT_INTEGER: u64 = MAX_JOB_ID;
@@ -24,6 +25,8 @@ pub enum ResourceUnitError {
     InvalidHostLoad { value: f64 },
     #[error("host core count must be positive")]
     ZeroHostCores,
+    #[error("a CPU share must be finite and non-negative, got {value}")]
+    InvalidCpuPercent { value: f64 },
     #[error(
         "{unit} {value} exceeds {MAX_EXACT_INTEGER} in magnitude, the largest every projection holds exactly"
     )]
@@ -70,6 +73,187 @@ impl CpuMicros {
     pub fn checked_add(self, other: Self) -> Result<Self, ResourceUnitError> {
         exact("cpuUs", u128::from(self.0) + u128::from(other.0)).map(Self)
     }
+
+    /// The whole milliseconds this CPU time holds: converted once, after aggregation.
+    pub const fn millis(self) -> CpuMillis {
+        CpuMillis(self.0 / 1_000)
+    }
+}
+
+/// CPU time in whole milliseconds; only [`CpuMicros::millis`] makes one.
+#[cfg_attr(
+    any(),
+    cowshed_api(scalar = "number & tags.Type<'uint64'> & tags.Maximum<9007199254740991>")
+)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(try_from = "u64", into = "u64")]
+pub struct CpuMillis(u64);
+
+impl CpuMillis {
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl TryFrom<u64> for CpuMillis {
+    type Error = ResourceUnitError;
+
+    fn try_from(value: u64) -> Result<Self, Self::Error> {
+        exact("cpuMs", u128::from(value)).map(Self)
+    }
+}
+
+impl From<CpuMillis> for u64 {
+    fn from(value: CpuMillis) -> Self {
+        value.0
+    }
+}
+
+/// A signed CPU difference in microseconds: a job's independent total less the CPU its observed
+/// processes counted as their own. Never clamped: observation can miss work, and on macOS it
+/// can also see work its source does not count yet.
+#[cfg_attr(
+    any(),
+    cowshed_api(
+        scalar = "number & tags.Type<'int64'> & tags.Minimum<-9007199254740991> & tags.Maximum<9007199254740991>"
+    )
+)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(try_from = "i64", into = "i64")]
+pub struct CpuMicrosDelta(i64);
+
+impl CpuMicrosDelta {
+    pub fn new(value: i64) -> Result<Self, ResourceUnitError> {
+        exact_signed("cpuUsDelta", i128::from(value)).map(Self)
+    }
+
+    /// `total` less `observed`, exactly.
+    pub fn between(observed: CpuMicros, total: CpuMicros) -> Result<Self, ResourceUnitError> {
+        exact_signed("cpuUsDelta", i128::from(total.0) - i128::from(observed.0)).map(Self)
+    }
+
+    pub const fn get(self) -> i64 {
+        self.0
+    }
+}
+
+impl TryFrom<i64> for CpuMicrosDelta {
+    type Error = ResourceUnitError;
+
+    fn try_from(value: i64) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl From<CpuMicrosDelta> for i64 {
+    fn from(value: CpuMicrosDelta) -> Self {
+        value.0
+    }
+}
+
+/// A signed storage byte difference: a job's independent total less what its observed
+/// processes counted as their own.
+#[cfg_attr(
+    any(),
+    cowshed_api(
+        scalar = "number & tags.Type<'int64'> & tags.Minimum<-9007199254740991> & tags.Maximum<9007199254740991>"
+    )
+)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(try_from = "i64", into = "i64")]
+pub struct StorageIoBytesDelta(i64);
+
+impl StorageIoBytesDelta {
+    pub fn new(value: i64) -> Result<Self, ResourceUnitError> {
+        exact_signed("ioBytesDelta", i128::from(value)).map(Self)
+    }
+
+    /// `total` less `observed`, exactly.
+    pub fn between(
+        observed: StorageIoBytes,
+        total: StorageIoBytes,
+    ) -> Result<Self, ResourceUnitError> {
+        exact_signed("ioBytesDelta", i128::from(total.0) - i128::from(observed.0)).map(Self)
+    }
+
+    pub const fn get(self) -> i64 {
+        self.0
+    }
+}
+
+impl TryFrom<i64> for StorageIoBytesDelta {
+    type Error = ResourceUnitError;
+
+    fn try_from(value: i64) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl From<StorageIoBytesDelta> for i64 {
+    fn from(value: StorageIoBytesDelta) -> Self {
+        value.0
+    }
+}
+
+/// A share of one CPU core over an elapsed window, in percent: 100 is one core kept busy for the
+/// whole window, so a parallel group exceeds it. Finite and non-negative, like [`HostLoad1`].
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "f64", into = "f64")]
+#[cfg_attr(
+    any(),
+    cowshed_api(scalar = "number & tags.Minimum<0> & tags.Maximum<1.7976931348623157e308>")
+)]
+pub struct OneCoreCpuPercent(f64);
+
+impl OneCoreCpuPercent {
+    pub const ZERO: Self = Self(0.0);
+
+    pub fn new(value: f64) -> Result<Self, ResourceUnitError> {
+        if value.is_finite() && value >= 0.0 {
+            Ok(Self(value))
+        } else {
+            Err(ResourceUnitError::InvalidCpuPercent { value })
+        }
+    }
+
+    /// `cpu` spent over a window of `elapsed`, times 100. A window with no whole microsecond
+    /// in it divides nothing: its share is zero.
+    pub fn of_window(cpu: CpuMicros, elapsed: WallMicros) -> Self {
+        if elapsed.get() == 0 {
+            return Self::ZERO;
+        }
+        // Both are exact integers no larger than 2^53 - 1, so each is exactly an f64.
+        Self(exact_f64(cpu.get()) * 100.0 / exact_f64(elapsed.get()))
+    }
+
+    pub const fn get(self) -> f64 {
+        self.0
+    }
+}
+
+// NaN is the only non-reflexive f64 value; the constructor and decoder both refuse it.
+impl Eq for OneCoreCpuPercent {}
+
+impl TryFrom<f64> for OneCoreCpuPercent {
+    type Error = ResourceUnitError;
+
+    fn try_from(value: f64) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl From<OneCoreCpuPercent> for f64 {
+    fn from(value: OneCoreCpuPercent) -> Self {
+        value.get()
+    }
+}
+
+/// `value` as an f64, assembled from its two 32-bit halves, each of which an f64 holds exactly:
+/// exact for every integer up to 2^53.
+fn exact_f64(value: u64) -> f64 {
+    let [a, b, c, d, e, f, g, h] = value.to_be_bytes();
+    f64::from(u32::from_be_bytes([a, b, c, d])) * 4_294_967_296.0
+        + f64::from(u32::from_be_bytes([e, f, g, h]))
 }
 
 impl TryFrom<u64> for CpuMicros {
@@ -192,9 +376,25 @@ pub struct StorageIoTotals {
     pub write_bytes: StorageIoBytes,
 }
 
-/// A job's CPU totals and the independent source that counted them, never a sum of the
-/// processes a sampler happened to see (that sum misses every descendant born and reaped between
-/// two samples). Each variant's documentation names what its source cannot count.
+/// How a job's independent totals compare with what its observed processes counted as their
+/// own: each signed difference is the total less the observed sum, never clamped, and the
+/// coverage says whether the observed processes are all the job ran.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UsageReconciliation {
+    pub cpu_us: CpuMicrosDelta,
+    /// Absent where the source or the observed processes have no storage bytes to compare.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub io_read_bytes: Option<StorageIoBytesDelta>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub io_write_bytes: Option<StorageIoBytesDelta>,
+    pub coverage: ProcessCoverage,
+}
+
+/// A job's totals and the independent source that counted them, never a sum of the processes a
+/// sampler happened to see (that sum misses every descendant born and reaped between two
+/// samples), each reconciled against those processes. Each variant's documentation names what
+/// its source cannot count.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(
     tag = "kind",
@@ -203,6 +403,15 @@ pub struct StorageIoTotals {
     deny_unknown_fields
 )]
 pub enum JobAccounting {
+    /// The job's own cgroup v2, which holds its first process before that process runs and so
+    /// every descendant: `cpu.stat` CPU, `io.stat` storage bytes, and `memory.current` /
+    /// `memory.peak` charged memory.
+    LinuxCgroupV2 {
+        cpu: CpuTotals,
+        io: StorageIoTotals,
+        charged_memory: ChargedMemoryUsage,
+        reconciliation: UsageReconciliation,
+    },
     /// Cumulative leader-own plus reaped-children CPU: macOS `proc_pid_rusage` of each process
     /// that led the job, read while its parent held it unreaped. That is its own CPU
     /// (`ri_user_time`/`ri_system_time`) plus that of every child it reaped
@@ -215,10 +424,29 @@ pub enum JobAccounting {
     MacOsRusageChildren {
         cpu: CpuTotals,
         /// Always absent: the children accumulators carry no disk I/O bytes, so the source has
-        /// no job total. Never zero in its place, and never `ri_child_pageins` operations
-        /// converted into bytes.
+        /// no job total. Never zero or `null` in its place, and never `ri_child_pageins`
+        /// operations converted into bytes.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         io: Option<StorageIoTotals>,
+        reconciliation: UsageReconciliation,
     },
+}
+
+impl JobAccounting {
+    /// The job's CPU totals, whichever source counted them.
+    pub const fn cpu(&self) -> CpuTotals {
+        match self {
+            Self::LinuxCgroupV2 { cpu, .. } | Self::MacOsRusageChildren { cpu, .. } => *cpu,
+        }
+    }
+
+    /// How those totals compare with the observed processes.
+    pub const fn reconciliation(&self) -> &UsageReconciliation {
+        match self {
+            Self::LinuxCgroupV2 { reconciliation, .. }
+            | Self::MacOsRusageChildren { reconciliation, .. } => reconciliation,
+        }
+    }
 }
 
 /// Bytes of memory a cgroup is charged for: anonymous memory, file and page cache, and kernel
@@ -332,6 +560,13 @@ fn exact(unit: &'static str, value: u128) -> Result<u64, ResourceUnitError> {
         .ok()
         .filter(|value| *value <= MAX_EXACT_INTEGER)
         .ok_or(ResourceUnitError::Inexact { unit, value })
+}
+
+fn exact_signed(unit: &'static str, value: i128) -> Result<i64, ResourceUnitError> {
+    i64::try_from(value)
+        .ok()
+        .filter(|value| value.unsigned_abs() <= MAX_EXACT_INTEGER)
+        .ok_or(ResourceUnitError::InexactSigned { unit, value })
 }
 
 /// The host's one-minute run-queue load, never a missing observation filled with zero. Finite:
@@ -511,23 +746,16 @@ pub struct VolumeUsedBytesDelta(i64);
 
 impl VolumeUsedBytesDelta {
     pub fn new(value: i64) -> Result<Self, ResourceUnitError> {
-        Self::exact(i128::from(value))
+        exact_signed("volumeUsedBytesDelta", i128::from(value)).map(Self)
     }
 
     /// `current` less `baseline`, exactly.
     pub fn between(baseline: u64, current: u64) -> Result<Self, ResourceUnitError> {
-        Self::exact(i128::from(current) - i128::from(baseline))
-    }
-
-    fn exact(value: i128) -> Result<Self, ResourceUnitError> {
-        i64::try_from(value)
-            .ok()
-            .filter(|value| value.unsigned_abs() <= MAX_EXACT_INTEGER)
-            .map(Self)
-            .ok_or(ResourceUnitError::InexactSigned {
-                unit: "volumeUsedBytesDelta",
-                value,
-            })
+        exact_signed(
+            "volumeUsedBytesDelta",
+            i128::from(current) - i128::from(baseline),
+        )
+        .map(Self)
     }
 
     pub const fn get(self) -> i64 {
@@ -618,6 +846,15 @@ pub struct JobResourceSample {
     /// this boundary, the leader's among them while it runs: the complete membership, never a
     /// truncated one. Empty once nothing of the group runs.
     pub members: Vec<u32>,
+    /// The observed process with the most own CPU, or why none is named.
+    pub leaf: JobLeafAttribution,
+    /// `accounting`'s user CPU in whole milliseconds, converted once from its microseconds.
+    pub cpu_user_ms: CpuMillis,
+    /// `accounting`'s system CPU in whole milliseconds, converted once from its microseconds.
+    pub cpu_sys_ms: CpuMillis,
+    /// The job's user plus system CPU over the window since the supervisor's preceding sample,
+    /// as a share of one core. A read never opens or closes that window.
+    pub cpu_pct: OneCoreCpuPercent,
     /// Captured once with the first owned process, even when that process is activation.
     pub host_start: HostLoadSample,
     /// The host's load and online cores at this sample boundary.
@@ -627,10 +864,9 @@ pub struct JobResourceSample {
     /// The largest `rssBytes` this job has been sampled at, this sample's included: a group's
     /// peak, never the sum of its processes' separate peaks.
     pub rss_peak_bytes: ResidentBytes,
-    /// The job's CPU totals as of this boundary, from its platform's independent source, within
-    /// the limits that source names. Absent only where no source exists yet (Linux, until its
-    /// cgroup v2 totals).
-    pub accounting: Option<JobAccounting>,
+    /// The job's totals as of this boundary, from its platform's independent source, within the
+    /// limits that source names, reconciled against the processes this sampler observed.
+    pub accounting: JobAccounting,
     /// Each of the job's volumes: its used-bytes change since spawn, or why it has none.
     pub volumes: JobVolumeUsage,
     pub stdout: JobStreamWatermark,
@@ -638,10 +874,16 @@ pub struct JobResourceSample {
 }
 
 impl JobResourceSample {
-    /// Whether the sample's fields agree with each other: `wallMs` projects `wallUs`, no peak
-    /// lies below the sample it includes, and each stream's bytes could hold its lines.
+    /// Whether the sample's fields agree with each other: `wallMs` projects `wallUs`, the CPU
+    /// milliseconds project the accounting source's microseconds, no peak lies below the sample
+    /// it includes, the leaf's coverage is a share of the whole on its side of the threshold,
+    /// and each stream's bytes could hold its lines.
     pub fn consistent(&self) -> bool {
+        let cpu = self.accounting.cpu();
         self.wall_ms == self.wall_us.millis()
+            && self.cpu_user_ms == cpu.user_us.millis()
+            && self.cpu_sys_ms == cpu.sys_us.millis()
+            && self.leaf.consistent()
             && self.rss_bytes <= self.rss_peak_bytes
             && self.stdout.possible()
             && self.stderr.possible()
@@ -696,6 +938,7 @@ mod tests {
     use std::num::NonZeroU32;
 
     use super::*;
+    use crate::api::process::{JobProcessLeaf, ProcessCoverageGap};
 
     fn length(denominator: u32) -> NonZeroU32 {
         NonZeroU32::new(denominator).expect("a tick length's denominator")
@@ -784,6 +1027,27 @@ mod tests {
         }
     }
 
+    fn micros(value: u64) -> CpuMicros {
+        CpuMicros::new(value).expect("exact")
+    }
+
+    /// The macOS source before it has counted any CPU: zero totals, coverage gapped at the
+    /// leader's fork.
+    fn unaccounted(leader_pid: u32) -> JobAccounting {
+        JobAccounting::MacOsRusageChildren {
+            cpu: CpuTotals::ZERO,
+            io: None,
+            reconciliation: UsageReconciliation {
+                cpu_us: CpuMicrosDelta::new(0).expect("exact"),
+                io_read_bytes: None,
+                io_write_bytes: None,
+                coverage: ProcessCoverage::Gap {
+                    reason: ProcessCoverageGap::UncountedFork { pid: leader_pid },
+                },
+            },
+        }
+    }
+
     fn sample(wall: WallMicros, stdout: JobStreamWatermark) -> JobResourceSample {
         JobResourceSample {
             job_id: JobId::new(3).expect("job"),
@@ -792,11 +1056,15 @@ mod tests {
             wall_us: wall,
             leader_pid: 99,
             members: vec![99, 100],
+            leaf: JobLeafAttribution::NoAccountedCpu,
+            cpu_user_ms: micros(0).millis(),
+            cpu_sys_ms: micros(0).millis(),
+            cpu_pct: OneCoreCpuPercent::ZERO,
             host_start: host(),
             host: host(),
             rss_bytes: bytes(0),
             rss_peak_bytes: bytes(0),
-            accounting: None,
+            accounting: unaccounted(99),
             volumes: unconfigured(),
             stdout,
             stderr: stream(0, 0),
@@ -813,11 +1081,15 @@ mod tests {
             wall_us: wall,
             leader_pid: 41,
             members: vec![41],
+            leaf: JobLeafAttribution::NoAccountedCpu,
+            cpu_user_ms: micros(0).millis(),
+            cpu_sys_ms: micros(0).millis(),
+            cpu_pct: OneCoreCpuPercent::ZERO,
             host_start: host(),
             host: host(),
             rss_bytes: bytes(4096),
             rss_peak_bytes: bytes(8192),
-            accounting: None,
+            accounting: unaccounted(41),
             volumes: unconfigured(),
             stdout: stream(0, 0),
             stderr: stream(0, 0),
@@ -839,11 +1111,15 @@ mod tests {
             wall_us: wall,
             leader_pid: 41,
             members: vec![41],
+            leaf: JobLeafAttribution::NoAccountedCpu,
+            cpu_user_ms: micros(0).millis(),
+            cpu_sys_ms: micros(0).millis(),
+            cpu_pct: OneCoreCpuPercent::ZERO,
             host_start: host(),
             host: host(),
             rss_bytes: bytes(8192),
             rss_peak_bytes: bytes(4096),
-            accounting: None,
+            accounting: unaccounted(41),
             volumes: unconfigured(),
             stdout: stream(0, 0),
             stderr: stream(0, 0),
@@ -911,17 +1187,36 @@ mod tests {
             wall_us: wall,
             leader_pid: 99,
             members: vec![99, 100],
+            leaf: JobLeafAttribution::Attributed {
+                leaf: JobProcessLeaf {
+                    pid: 99,
+                    program: "/usr/bin/cc".into(),
+                    argv: vec!["/usr/bin/cc".into()],
+                },
+                observed_cpu_permille: 950,
+            },
+            cpu_user_ms: micros(1_250_000).millis(),
+            cpu_sys_ms: micros(80_000).millis(),
+            cpu_pct: OneCoreCpuPercent::new(87.5).expect("exact"),
             host_start: host(),
             host: host(),
             rss_bytes: bytes(1 << 20),
             rss_peak_bytes: bytes(3 << 20),
-            accounting: Some(JobAccounting::MacOsRusageChildren {
+            accounting: JobAccounting::MacOsRusageChildren {
                 cpu: CpuTotals {
                     user_us: CpuMicros::new(1_250_000).expect("exact"),
                     sys_us: CpuMicros::new(80_000).expect("exact"),
                 },
                 io: None,
-            }),
+                reconciliation: UsageReconciliation {
+                    cpu_us: CpuMicrosDelta::new(66_500).expect("exact"),
+                    io_read_bytes: None,
+                    io_write_bytes: None,
+                    coverage: ProcessCoverage::Gap {
+                        reason: ProcessCoverageGap::UncountedFork { pid: 99 },
+                    },
+                },
+            },
             volumes: JobVolumeUsage {
                 workspace: VolumeUsage::Read {
                     delta_bytes: VolumeUsedBytesDelta::new(-4096).expect("exact"),
@@ -935,6 +1230,10 @@ mod tests {
             stdout: stream(5, 3),
             stderr: stream(0, 0),
         };
+        assert!(
+            sample.consistent(),
+            "the wire sample agrees with its own CPU totals and leaf"
+        );
         let json = serde_json::to_value(&sample).expect("serialize");
         assert_eq!(
             json,
@@ -945,6 +1244,14 @@ mod tests {
                 "wallUs": 1_500,
                 "leaderPid": 99,
                 "members": [99, 100],
+                "leaf": {
+                    "kind": "attributed",
+                    "leaf": {"pid": 99, "program": "/usr/bin/cc", "argv": [{"encoding": "utf8", "data": "/usr/bin/cc"}]},
+                    "observedCpuPermille": 950,
+                },
+                "cpuUserMs": 1_250,
+                "cpuSysMs": 80,
+                "cpuPct": 87.5,
                 "hostStart": { "load1": 1.25, "cores": 8 },
                 "host": { "load1": 1.25, "cores": 8 },
                 "rssBytes": 1_048_576,
@@ -952,7 +1259,10 @@ mod tests {
                 "accounting": {
                     "kind": "macOsRusageChildren",
                     "cpu": {"userUs": 1_250_000, "sysUs": 80_000},
-                    "io": null,
+                    "reconciliation": {
+                        "cpuUs": 66_500,
+                        "coverage": {"kind": "gap", "reason": {"kind": "uncountedFork", "pid": 99}},
+                    },
                 },
                 "volumes": {
                     "workspace": { "kind": "read", "deltaBytes": -4096 },
@@ -1027,6 +1337,29 @@ mod tests {
             serde_json::from_value::<JobResourceSample>(no_volumes).is_err(),
             "a sample always says what each volume is, read or not"
         );
+        for field in ["leaf", "cpuPct"] {
+            let mut missing = json.clone();
+            missing.as_object_mut().expect("an object").remove(field);
+            assert!(
+                serde_json::from_value::<JobResourceSample>(missing).is_err(),
+                "a sample always states {field}"
+            );
+        }
+        let mut no_accounting = json.clone();
+        no_accounting["accounting"] = serde_json::Value::Null;
+        assert!(
+            serde_json::from_value::<JobResourceSample>(no_accounting).is_err(),
+            "a sample always names its accounting source"
+        );
+        let mut unreconciled = json.clone();
+        unreconciled["accounting"]
+            .as_object_mut()
+            .expect("an object")
+            .remove("reconciliation");
+        assert!(
+            serde_json::from_value::<JobResourceSample>(unreconciled).is_err(),
+            "a source's totals are always reconciled"
+        );
         let mut sourceless = json;
         sourceless["accounting"]["kind"] = serde_json::json!("liveMembers");
         assert!(
@@ -1050,6 +1383,88 @@ mod tests {
                 value: u128::from(MAX_EXACT_INTEGER) + 1,
             })
         );
+    }
+
+    #[test]
+    fn cpu_micros_floor_into_whole_milliseconds() {
+        for (value, millis) in [(0, 0), (999, 0), (1_000, 1), (1_999, 1), (2_000, 2)] {
+            assert_eq!(micros(value).millis().get(), millis, "{value} us");
+        }
+    }
+
+    #[test]
+    fn cpu_deltas_are_total_less_observed_exactly_up_to_the_boundary() {
+        let boundary = i64::try_from(MAX_EXACT_INTEGER).expect("fits an i64");
+        let delta = |observed, total| {
+            CpuMicrosDelta::between(micros(observed), micros(total)).map(CpuMicrosDelta::get)
+        };
+        assert_eq!(delta(900, 1_000), Ok(100));
+        assert_eq!(delta(1_000, 900), Ok(-100));
+        // Both operands are bounded CPU totals, so `between` reaches the boundary exactly and
+        // never leaves the exact range.
+        assert_eq!(delta(0, MAX_EXACT_INTEGER), Ok(boundary));
+        assert_eq!(delta(MAX_EXACT_INTEGER, 0), Ok(-boundary));
+        for past in [boundary + 1, -boundary - 1, i64::MIN] {
+            assert!(
+                CpuMicrosDelta::new(past).is_err(),
+                "{past} is past the boundary"
+            );
+        }
+    }
+
+    #[test]
+    fn one_core_percent_is_cpu_over_its_window_times_one_hundred() {
+        let window = WallMicros::new(1_000_000).expect("exact");
+        assert_eq!(
+            OneCoreCpuPercent::of_window(micros(2_000_000), window).get(),
+            200.0
+        );
+        let empty = WallMicros::new(0).expect("exact");
+        assert_eq!(
+            OneCoreCpuPercent::of_window(micros(2_000_000), empty).get(),
+            0.0
+        );
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.5] {
+            assert!(
+                OneCoreCpuPercent::new(value).is_err(),
+                "{value} is no share of one core"
+            );
+        }
+    }
+
+    #[test]
+    fn a_sample_agrees_with_its_cpu_totals_and_its_leaf() {
+        let wall = WallMicros::new(1).expect("exact");
+        let mut resources = sample(wall, stream(0, 0));
+        assert!(resources.consistent());
+        resources.cpu_user_ms = micros(1_000).millis();
+        assert!(
+            !resources.consistent(),
+            "cpuUserMs is the accounting's user CPU, in whole milliseconds"
+        );
+        resources.cpu_user_ms = micros(0).millis();
+        resources.leaf = JobLeafAttribution::Attributed {
+            leaf: JobProcessLeaf {
+                pid: 99,
+                program: "cc".into(),
+                argv: vec!["cc".into()],
+            },
+            observed_cpu_permille: 1_001,
+        };
+        assert!(!resources.consistent(), "no share exceeds the whole");
+        resources.leaf = JobLeafAttribution::Unattributed {
+            observed_cpu_permille: 900,
+            required_permille: 900,
+        };
+        assert!(
+            !resources.consistent(),
+            "an unattributed share lies below the share it was required to reach"
+        );
+        resources.leaf = JobLeafAttribution::Unattributed {
+            observed_cpu_permille: 899,
+            required_permille: 900,
+        };
+        assert!(resources.consistent());
     }
 }
 

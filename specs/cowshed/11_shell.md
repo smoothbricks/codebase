@@ -11,10 +11,12 @@ over a Unix socket, job control, and the single exec-record capture that all cli
 > progress subscriptions stream over the controller and through N-API. Controller and N-API operation bindings derive
 > from one API declaration, group-owned TCP-listener queries among them. Explicit Open stdin, bounded delivered-byte
 > writes and exactly-once EOF are implemented in Rust and through the generated N-API attachment input view. The
-> process-group ownership ledger identifies groups for sampling and termination. Complete fork/exec tree observation,
-> per-process usage and blocker samples, process event streams, CPU-winning leaf identity, and process/job resource
-> spans are unbuilt as well. Complete cgroup job totals, charged-memory measurements, event-source coverage/overhead
-> measurement and unattributed-usage reconciliation are unbuilt too.
+> process-group ownership ledger identifies groups for sampling and termination. On macOS each sample carries the job's
+> CPU share over the supervisor's sampling clock window, its leader/children rusage totals reconciled against a polled
+> census of the group, and the census's CPU-winning leaf. Complete fork/exec tree observation, per-process usage and
+> blocker streams, process event streams, and process/job resource spans are unbuilt as well. Complete cgroup job totals
+> (so Linux samples, which have no accounting source yet), charged-memory measurements, and event-source
+> coverage/overhead measurement are unbuilt too.
 
 ## Shell activation and process reuse
 

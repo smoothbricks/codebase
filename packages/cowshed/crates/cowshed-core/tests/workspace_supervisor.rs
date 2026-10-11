@@ -8,11 +8,13 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use cowshed_core::api::{
     AdmissionKey, CONTROLLER_COMMITMENT_VERSION, CommandArg, ControllerCommitment, ExecCommand,
-    ExecRequest, ExitStatus, JobFailure, JobId, JobJournalCursor, JobState, JobStreamWatermark,
-    JobTailBytes, JobTailLimits, MAX_COMMAND_ARG_BYTES, OutputLimitInfo, OutputPublication,
-    OutputStorage, OutputSummary, ProtectedOutput, PublicationPolicy, RunSandboxMode, Sha256Digest,
-    StdinKind, StdinSource, StreamInfo, WorkspacePath,
+    ExecRequest, ExitStatus, JobFailure, JobId, JobJournalCursor, JobState, JobTailBytes,
+    JobTailLimits, MAX_COMMAND_ARG_BYTES, OutputLimitInfo, OutputPublication, OutputStorage,
+    OutputSummary, ProtectedOutput, PublicationPolicy, RunSandboxMode, Sha256Digest, StdinKind,
+    StdinSource, StreamInfo, WorkspacePath,
 };
+#[cfg(target_os = "macos")]
+use cowshed_core::api::{JobLeafAttribution, ProcessCoverage, ProcessCoverageGap};
 use cowshed_core::error::{AdmissionField, AdmissionRefusal, CowshedError, ErrorCode, Result};
 use cowshed_core::fork_lock::Spawn as _;
 use cowshed_core::metadata::{PortBlock, WorkspaceIncarnation, WorkspaceName};
@@ -432,6 +434,7 @@ fn config(root: &TempRoot) -> WorkspaceSupervisorConfig {
         inherited_groups: Vec::new(),
         volume_labels: None,
         workspace_volume: None,
+        job_sampling: cowshed_core::runtime::supervisor::JobSamplingPolicy::default(),
     }
 }
 
@@ -4236,6 +4239,7 @@ async fn deliver(
 
 /// A sample's wall time is exactly the time since `spawn` when it was taken: read between
 /// `before` and `after`, it lies between their distances from the spawn.
+#[cfg(target_os = "macos")]
 fn assert_wall(
     sample: &cowshed_core::api::JobResourceSample,
     spawn: Instant,
@@ -4252,6 +4256,7 @@ fn assert_wall(
     assert_eq!(sample.wall_ms.get(), sample.wall_us.get() / 1_000);
 }
 
+#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn a_job_is_sampled_from_its_first_owned_process_until_its_sealed_terminal() {
     let (supervisor_config, _root) = isolated_config("resources");
@@ -4344,11 +4349,15 @@ async fn a_job_is_sampled_from_its_first_owned_process_until_its_sealed_terminal
     let ended = handle.wait(job_id).await.unwrap();
     let after = Instant::now();
     let terminal = ended.resources.clone().expect("a terminal sample");
-    assert_eq!(
-        terminal.accounting.is_some(),
-        cfg!(target_os = "macos"),
-        "macOS states the job's totals; Linux has no complete source yet"
+    assert!(
+        matches!(
+            terminal.accounting,
+            cowshed_core::api::JobAccounting::MacOsRusageChildren { io: None, .. }
+        ),
+        "macOS states the job's totals from its leaders' rusage: {:?}",
+        terminal.accounting
     );
+    assert!(terminal.consistent(), "{terminal:?}");
     assert_eq!(
         (terminal.leader_pid, terminal.members.clone()),
         (command.id(), Vec::new()),
@@ -4370,6 +4379,7 @@ async fn a_job_is_sampled_from_its_first_owned_process_until_its_sealed_terminal
 
 /// Through a served supervisor, a progress subscription opened before the job owns a process
 /// sends nothing until it does, then its samples, then the terminal one its sealed record keeps.
+#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn a_served_supervisor_s_progress_starts_at_ownership_and_ends_at_the_sealed_sample() {
     let (supervisor_config, _root) = isolated_config("progress-served");
@@ -4471,6 +4481,7 @@ impl Holder {
 /// A job's resident memory is what its group holds together at a sample, and its peak the
 /// largest such sum read: two processes holding memory at once raise it, two holding the same
 /// amount one after the other do not, and the sealed sample keeps it.
+#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn a_job_s_rss_is_its_group_s_simultaneous_sum_and_its_peak_the_largest_read() {
     let (supervisor_config, _root) = isolated_config("resources-rss");
@@ -4588,13 +4599,15 @@ async fn a_job_that_ends_before_any_process_of_its_own_has_no_sample() {
 }
 
 /// A watermark as the bare numbers its wire projects.
-fn watermark(stream: &JobStreamWatermark) -> (u64, u64) {
+#[cfg(target_os = "macos")]
+fn watermark(stream: &cowshed_core::api::JobStreamWatermark) -> (u64, u64) {
     (stream.bytes.get(), stream.lines.get())
 }
 
 /// A stream counts every chunk the supervisor admits, whatever line the chunk splits: `a`,
 /// `\nb`, `\n` and `c` are five bytes in three lines, the last one unterminated. The count is
 /// the stream's read cursor, live and terminal, and the sealed record keeps it.
+#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn a_stream_counts_the_bytes_and_lines_of_every_admitted_chunk() {
     let (supervisor_config, _root) = isolated_config("resources-lines");
@@ -4670,6 +4683,7 @@ async fn a_stream_counts_the_bytes_and_lines_of_every_admitted_chunk() {
 /// 2 MiB of newlines on stderr spill from the inline buffer to the job's protected file midway;
 /// every one of them is a line, before and after, and the record a later supervisor reads from
 /// the store carries the very terminal sample the job ended with.
+#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn a_streams_counts_survive_its_promotion_to_a_protected_file() {
     const NEWLINES: usize = 2 * 1024 * 1024;
@@ -4855,7 +4869,7 @@ impl Scripted {
 #[cfg(target_os = "macos")]
 fn accounted_us(sample: &cowshed_core::api::JobResourceSample) -> u64 {
     match sample.accounting {
-        Some(cowshed_core::api::JobAccounting::MacOsRusageChildren { cpu, io: None }) => {
+        cowshed_core::api::JobAccounting::MacOsRusageChildren { cpu, io: None, .. } => {
             cpu.user_us.get() + cpu.sys_us.get()
         }
         ref other => panic!("the leader/children rusage source with no byte totals: {other:?}"),
@@ -5017,6 +5031,246 @@ async fn an_activation_and_its_command_each_count_once() {
         (running..both + SLACK_US).contains(&sealed),
         "the terminal {sealed} us keep both intervals once"
     );
+    reap(command);
+}
+
+/// A command line that spins for `seconds` of its own CPU in the very process it runs in,
+/// reporting `spinning <pid>` as it starts and `burned <us>` once done, then waits for a line.
+#[cfg(target_os = "macos")]
+fn spinner(seconds: f64) -> String {
+    format!(
+        "python3 -c 'import os, resource, sys\n\
+         def used():\n    u = resource.getrusage(resource.RUSAGE_SELF)\n    return u.ru_utime + u.ru_stime\n\
+         print(\"spinning\", os.getpid(), flush=True)\n\
+         x = 0\n\
+         while used() < {seconds}:\n    for _ in range(10000):\n        x += 1\n\
+         print(\"burned\", int(used() * 1e6), flush=True)\n\
+         sys.stdin.readline()\n'"
+    )
+}
+
+/// The pid a spinner reported as it started.
+#[cfg(target_os = "macos")]
+fn spinning(leader: &mut Scripted) -> u32 {
+    let line = leader.lines.next().unwrap().unwrap();
+    line.strip_prefix("spinning ")
+        .unwrap_or_else(|| panic!("a spinner's start, not {line:?}"))
+        .parse()
+        .unwrap()
+}
+
+/// A job whose leader keeps one core busy reads about one core's share over the supervisor's
+/// window -- opened by its sampling clock, not by the read -- and names that leader its leaf
+/// from the processes it observed. Once the leader idles, its share falls to nothing while its
+/// accounted CPU keeps what it burned.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn a_busy_job_reads_its_measured_cpu_share_and_its_busy_leader_as_leaf() {
+    let (mut supervisor_config, _root) = isolated_config("cpu-busy");
+    supervisor_config.job_sampling.cpu_sample_period = Duration::from_millis(400);
+    let mut harness = warm_harness(supervisor_config);
+    let (handle, spawned) = (harness.handle.clone(), &mut harness.spawned);
+    let job_id = handle
+        .exec(None, None, request(StdinSource::Empty))
+        .await
+        .unwrap();
+    let job = spawned.recv().await.unwrap();
+    let mut leader = Scripted::start(&format!("exec {}", spinner(3.0)));
+    let pid = spinning(&mut leader);
+    assert_eq!(pid, leader.child.id(), "the spinner is the leader itself");
+    deliver(
+        &handle,
+        &job,
+        ProcessEvent::Started {
+            job_id,
+            process: owned(&leader.child, Instant::now()),
+        },
+        0,
+    )
+    .await;
+    // The clock ticks every 400 ms from ownership: a read at one second lies mid-window.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let busy = handle.resources(job_id).await.unwrap();
+    assert!(busy.consistent(), "{busy:?}");
+    assert!(
+        (50.0..=150.0).contains(&busy.cpu_pct.get()),
+        "one busy core reads about 100 %: {}",
+        busy.cpu_pct.get()
+    );
+    assert!(
+        busy.cpu_user_ms.get() + busy.cpu_sys_ms.get() >= 500,
+        "about a second of the leader's CPU is accounted: {busy:?}"
+    );
+    let JobLeafAttribution::Attributed {
+        leaf,
+        observed_cpu_permille,
+    } = &busy.leaf
+    else {
+        panic!("the leader's own CPU is the job's: {:?}", busy.leaf);
+    };
+    assert_eq!(leaf.pid, pid);
+    assert!(leaf.program.contains("python"), "{}", leaf.program);
+    assert!(
+        *observed_cpu_permille >= 900,
+        "the observed leader covers the job's CPU: {observed_cpu_permille}‰"
+    );
+    assert_eq!(
+        busy.accounting.reconciliation().coverage,
+        ProcessCoverage::Gap {
+            reason: ProcessCoverageGap::UncountedFork { pid }
+        },
+        "a polled census never claims the whole tree"
+    );
+
+    let burned = leader.burned();
+    // Idle now, waiting for its line: the windows after the burn hold almost no CPU.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let idle = handle.resources(job_id).await.unwrap();
+    assert!(
+        idle.cpu_pct.get() < 10.0,
+        "an idle leader reads no share: {}",
+        idle.cpu_pct.get()
+    );
+    let accounted = accounted_us(&idle);
+    assert!(
+        (burned..burned + SLACK_US).contains(&accounted),
+        "the job's {accounted} us hold the {burned} us its leader burned"
+    );
+
+    let leader = leader.exit();
+    complete(&job, b"", b"", ExitStatus::Exited { code: 0 }).await;
+    let terminal = handle
+        .wait(job_id)
+        .await
+        .unwrap()
+        .resources
+        .expect("a terminal sample");
+    assert!(terminal.consistent(), "{terminal:?}");
+    assert_eq!(
+        handle.sealed(job_id).await.unwrap().resources,
+        Some(terminal),
+        "the sealed sample keeps the measured share and leaf"
+    );
+    reap(leader);
+}
+
+/// When a forked child does the work, the leaf is that child: the observed process with the most
+/// own CPU, although the macOS source holds none of a live child's CPU yet. The reconciliation
+/// states that difference, signed. Once the child is reaped the source holds all of it while the
+/// census holds only what it read before the child left, so no leaf is named.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn a_busy_child_is_the_leaf_until_the_census_no_longer_covers_the_job() {
+    let (mut supervisor_config, _root) = isolated_config("cpu-child");
+    supervisor_config.job_sampling.cpu_sample_period = Duration::from_millis(400);
+    let mut harness = warm_harness(supervisor_config);
+    let (handle, spawned) = (harness.handle.clone(), &mut harness.spawned);
+    let job_id = handle
+        .exec(None, None, request(StdinSource::Empty))
+        .await
+        .unwrap();
+    let job = spawned.recv().await.unwrap();
+    let mut leader = Scripted::start(&format!(
+        "{} &\nwait\necho reaped\nread line\n",
+        spinner(2.0)
+    ));
+    let pid = leader.child.id();
+    let child = spinning(&mut leader);
+    deliver(
+        &handle,
+        &job,
+        ProcessEvent::Started {
+            job_id,
+            process: owned(&leader.child, Instant::now()),
+        },
+        0,
+    )
+    .await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let busy = handle.resources(job_id).await.unwrap();
+    assert!(busy.consistent(), "{busy:?}");
+    assert!(busy.members.contains(&child), "{:?}", busy.members);
+    let JobLeafAttribution::Attributed { leaf, .. } = &busy.leaf else {
+        panic!("the busy child is observed: {:?}", busy.leaf);
+    };
+    assert_eq!(
+        leaf.pid, child,
+        "the leaf is the child, not its waiting leader {pid}"
+    );
+    let reconciliation = busy.accounting.reconciliation();
+    assert!(
+        reconciliation.cpu_us.get() < -300_000,
+        "the source lacks the live child's CPU, stated signed: {reconciliation:?}"
+    );
+    assert_eq!(
+        reconciliation.coverage,
+        ProcessCoverage::Gap {
+            reason: ProcessCoverageGap::UnobservedBirth { pid: child }
+        }
+    );
+
+    let burned = leader.burned();
+    leader.expect("reaped");
+    let reaped = handle.resources(job_id).await.unwrap();
+    let accounted = accounted_us(&reaped);
+    assert!(
+        (burned..burned + SLACK_US).contains(&accounted),
+        "reaped, the child's {burned} us are in the source's {accounted} us"
+    );
+    assert!(
+        matches!(
+            reaped.leaf,
+            JobLeafAttribution::Unattributed {
+                required_permille: 900,
+                ..
+            }
+        ),
+        "the census read the child only part-way, so it covers too little: {:?}",
+        reaped.leaf
+    );
+
+    let leader = leader.exit();
+    complete(&job, b"", b"", ExitStatus::Exited { code: 0 }).await;
+    handle.wait(job_id).await.unwrap();
+    reap(leader);
+}
+
+/// Linux has no job accounting source until a job runs in its own cgroup: a sample of an owned
+/// job is that typed operational failure, never a sample with invented totals, and the job's
+/// end keeps no sample.
+#[cfg(not(target_os = "macos"))]
+#[tokio::test]
+async fn a_linux_job_s_sample_names_its_missing_accounting_source() {
+    let (supervisor_config, _root) = isolated_config("linux-unaccounted");
+    let mut harness = warm_harness(supervisor_config);
+    let (handle, spawned) = (harness.handle.clone(), &mut harness.spawned);
+    let job_id = handle
+        .exec(None, None, request(StdinSource::Empty))
+        .await
+        .unwrap();
+    let job = spawned.recv().await.unwrap();
+    let command = lone_group();
+    deliver(
+        &handle,
+        &job,
+        ProcessEvent::Started {
+            job_id,
+            process: owned(&command, Instant::now()),
+        },
+        0,
+    )
+    .await;
+    let unaccounted = handle.resources(job_id).await.unwrap_err();
+    assert_eq!(
+        unaccounted.code,
+        ErrorCode::EnvironmentMissing,
+        "{}",
+        unaccounted.message
+    );
+    assert_eq!(handle.info(job_id).await.unwrap().resources, None);
+    end_group(&command);
+    complete(&job, b"", b"", ExitStatus::Exited { code: 0 }).await;
+    assert_eq!(handle.wait(job_id).await.unwrap().resources, None);
     reap(command);
 }
 
