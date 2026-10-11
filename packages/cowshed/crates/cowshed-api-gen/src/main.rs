@@ -6,13 +6,38 @@ fn run() -> Result<(), String> {
     let mut arguments = std::env::args_os().skip(1);
     let mode = arguments
         .next()
-        .ok_or("usage: cowshed-api-gen <write|check> <cowshed-project-path>")?;
+        .ok_or("usage: cowshed-api-gen <write|check|ir-model> <cowshed-project-path> or <ir-types|ir-validators> <types-module>")?;
+    if mode == "ir-types" || mode == "ir-validators" {
+        let module = arguments
+            .next()
+            .ok_or("missing IR types module specifier")?
+            .into_string()
+            .map_err(|_| "IR types module specifier is not UTF-8")?;
+        if arguments.next().is_some() {
+            return Err("IR type emission takes one module specifier".into());
+        }
+        let output = cowshed_api_gen::ir_types(&module)?;
+        let text = if mode == "ir-types" {
+            output.types
+        } else {
+            output.validators
+        };
+        return std::io::stdout()
+            .lock()
+            .write_all(text.as_bytes())
+            .map_err(|error| format!("writing public IR declarations: {error}"));
+    }
     let project = PathBuf::from(arguments.next().ok_or("missing cowshed project path")?);
     if arguments.next().is_some() {
         return Err(
-            "unexpected argument; usage: cowshed-api-gen <write|check> <cowshed-project-path>"
+            "unexpected argument; usage: cowshed-api-gen <write|check|ir-model> <cowshed-project-path>"
                 .to_owned(),
         );
+    }
+    if mode == "ir-model" {
+        let model = cowshed_api_gen::collect(&project)?;
+        return serde_json::to_writer(std::io::stdout().lock(), &model)
+            .map_err(|error| format!("writing public declaration IR: {error}"));
     }
     let mut files = cowshed_api_gen::generate(&project)?;
     for file in &mut files {
@@ -23,7 +48,7 @@ fn run() -> Result<(), String> {
     } else if mode == "check" {
         cowshed_api_gen::check(&files)
     } else {
-        Err("mode must be write or check".to_owned())
+        Err("mode must be write, check, ir-model, ir-types or ir-validators".to_owned())
     }
 }
 

@@ -649,6 +649,12 @@ names, and validation bounds. They generate the controller protocol, N-API adapt
 and validators as one surface. There is no separate handwritten N-API request or TypeScript DTO field list. Shared
 corpus tests check every generated projection and reject a deliberately changed or omitted field.
 
+The public declaration IR is serializable from its own Rust types. Its serde and projection metadata and normalized Rust
+type graph generate their TypeScript model through the same owner emitter; a consumer never restates those fields or
+parses Rust declarations with a private mirror. Normalized types retain qualified names, type/lifetime/const arguments,
+reference ownership and constant-expression spelling. Unsupported source syntax is refused by name, and a consumer
+requiring a literal bound refuses a symbolic expression rather than guessing its value.
+
 Externally projected types are defined **once** in `cowshed-core` and reused verbatim by the CLI (`--json` bodies),
 NAPI, and MCP — no adapter redefines a field, and contract goldens (08_testing.md) pin their shapes: `WorkspaceInfo`,
 `CheckpointInfo`, `GcReport`, `Finding`, `JobId`, `JobState`, `JobInfo`, `StreamInfo`, `OutputStorage`,

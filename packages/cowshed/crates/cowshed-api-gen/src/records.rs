@@ -1,4 +1,5 @@
-use crate::ir::{Api, Field, Fields, Projection, Record, Serde, Shape, Variant};
+use crate::ir::{Api, Field, Fields, Projection, Record, RustType, Serde, Shape, Variant};
+use syn::spanned::Spanned;
 use syn::{Attribute, Expr, Item, Lit, Meta, Visibility};
 
 pub fn parse(source: &str, api: &mut Api) -> syn::Result<()> {
@@ -16,7 +17,7 @@ pub fn parse_support(source: &str, api: &mut Api) -> syn::Result<()> {
 }
 
 fn parse_items(items: Vec<Item>, api: &mut Api, exported: bool) -> syn::Result<()> {
-    let custom_serializers: std::collections::BTreeSet<_> = items
+    let mut custom_serializers: std::collections::BTreeSet<String> = items
         .iter()
         .filter_map(|item| {
             let Item::Impl(item) = item else {
@@ -37,55 +38,90 @@ fn parse_items(items: Vec<Item>, api: &mut Api, exported: bool) -> syn::Result<(
                 .map(|segment| segment.ident.to_string())
         })
         .collect();
+    // `string_domain_serde!(Name)` writes both serde impls for `Name`, so its argument is a
+    // serialized declaration even though no `impl` written here names it.
+    for item in &items {
+        match item {
+            Item::Macro(item) if item.mac.path.is_ident("string_domain_serde") => {
+                custom_serializers
+                    .insert(syn::parse2::<syn::Ident>(item.mac.tokens.clone())?.to_string());
+            }
+            _ => {}
+        }
+    }
+    let needed = needed_declarations(&items, &custom_serializers)?;
     for item in items {
         let record = match item {
             Item::Struct(item) => {
                 let projection = projection(&item.attrs)?;
-                let shape = Shape::Struct(fields(item.fields, projection.output_only)?);
-                Some(Record {
-                    exported: exported
-                        && is_public(&item.vis)
-                        && item.generics.type_params().next().is_none()
-                        && (is_serialized(&item.attrs)
-                            || custom_serializers.contains(&item.ident.to_string())),
-                    name: item.ident.to_string(),
-                    docs: docs(&item.attrs),
-                    serde: serde(&item.attrs)?,
-                    projection,
-                    shape,
-                })
+                let serialized = is_serialized(&item.attrs)
+                    || custom_serializers.contains(&item.ident.to_string());
+                // Runtime and internal state that no declaration reaches has no wire or projection
+                // shape, so its field types are never normalized.
+                if !serialized
+                    && !is_public_projection(&projection)
+                    && !needed.contains(&item.ident.to_string())
+                {
+                    None
+                } else {
+                    let shape = Shape::Struct(fields(item.fields, projection.output_only)?);
+                    Some(Record {
+                        exported: exported
+                            && is_public(&item.vis)
+                            && item.generics.type_params().next().is_none()
+                            && serialized,
+                        name: item.ident.to_string(),
+                        docs: docs(&item.attrs),
+                        serde: serde(&item.attrs)?,
+                        projection,
+                        shape,
+                    })
+                }
             }
-            Item::Enum(item) => Some(Record {
-                exported: exported
-                    && is_public(&item.vis)
-                    && item.generics.type_params().next().is_none()
-                    && (is_serialized(&item.attrs)
-                        || custom_serializers.contains(&item.ident.to_string())),
-                name: item.ident.to_string(),
-                docs: docs(&item.attrs),
-                serde: serde(&item.attrs)?,
-                projection: projection(&item.attrs)?,
-                shape: Shape::Enum(
-                    item.variants
-                        .into_iter()
-                        .map(|variant| {
-                            Ok(Variant {
-                                name: variant.ident.to_string(),
-                                docs: docs(&variant.attrs),
-                                serde: serde(&variant.attrs)?,
-                                fields: fields(variant.fields, false)?,
-                            })
-                        })
-                        .collect::<syn::Result<_>>()?,
-                ),
-            }),
+            Item::Enum(item) => {
+                let projection = projection(&item.attrs)?;
+                let serialized = is_serialized(&item.attrs)
+                    || custom_serializers.contains(&item.ident.to_string());
+                if !serialized
+                    && !is_public_projection(&projection)
+                    && !needed.contains(&item.ident.to_string())
+                {
+                    None
+                } else {
+                    Some(Record {
+                        exported: exported
+                            && is_public(&item.vis)
+                            && item.generics.type_params().next().is_none()
+                            && serialized,
+                        name: item.ident.to_string(),
+                        docs: docs(&item.attrs),
+                        serde: serde(&item.attrs)?,
+                        projection,
+                        shape: Shape::Enum(
+                            item.variants
+                                .into_iter()
+                                .map(|variant| {
+                                    Ok(Variant {
+                                        name: variant.ident.to_string(),
+                                        docs: docs(&variant.attrs),
+                                        serde: serde(&variant.attrs)?,
+                                        fields: fields(variant.fields, false)?,
+                                    })
+                                })
+                                .collect::<syn::Result<_>>()?,
+                        ),
+                    })
+                }
+            }
+            // Aliases always normalize: each names a real type a declaration may reference, so
+            // dropping one would leave that reference dangling.
             Item::Type(item) => Some(Record {
                 exported: false,
                 name: item.ident.to_string(),
                 docs: docs(&item.attrs),
                 serde: serde(&item.attrs)?,
                 projection: projection(&item.attrs)?,
-                shape: Shape::Alias(*item.ty),
+                shape: Shape::Alias(normalized_type(*item.ty)?),
             }),
             Item::Macro(item) if item.mac.path.is_ident("hex_identifier") => {
                 let identifier = syn::parse2::<HexIdentifier>(item.mac.tokens)?;
@@ -105,7 +141,7 @@ fn parse_items(items: Vec<Item>, api: &mut Api, exported: bool) -> syn::Result<(
                         )),
                         ..Projection::default()
                     },
-                    shape: Shape::Alias(syn::parse_quote!(String)),
+                    shape: Shape::Alias(normalized_type(syn::parse_quote!(String))?),
                     exported,
                 })
             }
@@ -129,6 +165,107 @@ fn parse_items(items: Vec<Item>, api: &mut Api, exported: bool) -> syn::Result<(
         }
     }
     Ok(())
+}
+
+/// Whether a struct or enum is a declaration in its own right: serialized, or carrying a public
+/// projection.
+fn is_declaration(
+    attrs: &[Attribute],
+    name: &syn::Ident,
+    custom: &std::collections::BTreeSet<String>,
+) -> syn::Result<bool> {
+    Ok(is_serialized(attrs)
+        || custom.contains(&name.to_string())
+        || is_public_projection(&projection(attrs)?))
+}
+
+/// The structs and enums of one source list that normalize because a declaration reaches them.
+/// Every serialized or projected struct or enum, and every alias, seeds the walk, since aliases
+/// always normalize. A struct or enum reached through a typed reference is needed, transitively.
+/// Only type positions are references (paths and their generic type arguments, references, arrays,
+/// slices, tuples and parentheses): identifiers in variants, constants and expressions name no
+/// type. A position this walk does not enter, such as a trait object or function pointer, is not
+/// a reference here; a declaration that keeps it refuses it by name when it normalizes. Nested
+/// modules are separate lists.
+fn needed_declarations(
+    items: &[Item],
+    custom: &std::collections::BTreeSet<String>,
+) -> syn::Result<std::collections::BTreeSet<String>> {
+    let mut declared: std::collections::BTreeMap<String, Vec<&syn::Type>> = Default::default();
+    let mut seeds: Vec<&syn::Type> = Vec::new();
+    for item in items {
+        match item {
+            Item::Struct(item) => {
+                let types: Vec<&syn::Type> = item.fields.iter().map(|field| &field.ty).collect();
+                if is_declaration(&item.attrs, &item.ident, custom)? {
+                    seeds.extend(types.iter().copied());
+                }
+                declared.insert(item.ident.to_string(), types);
+            }
+            Item::Enum(item) => {
+                let types: Vec<&syn::Type> = item
+                    .variants
+                    .iter()
+                    .flat_map(|variant| variant.fields.iter().map(|field| &field.ty))
+                    .collect();
+                if is_declaration(&item.attrs, &item.ident, custom)? {
+                    seeds.extend(types.iter().copied());
+                }
+                declared.insert(item.ident.to_string(), types);
+            }
+            Item::Type(item) => seeds.push(&*item.ty),
+            _ => {}
+        }
+    }
+    let mut names = Vec::new();
+    for ty in seeds {
+        type_names(ty, &mut names);
+    }
+    let mut needed = std::collections::BTreeSet::new();
+    while let Some(name) = names.pop() {
+        let Some(types) = declared.get(&name) else {
+            continue;
+        };
+        if needed.insert(name) {
+            for ty in types {
+                type_names(ty, &mut names);
+            }
+        }
+    }
+    Ok(needed)
+}
+
+/// Appends the name of each path segment a type reaches, through its generic type arguments and
+/// the reference, array, slice, tuple and parenthesized types around it.
+fn type_names(ty: &syn::Type, names: &mut Vec<String>) {
+    match ty {
+        syn::Type::Path(path) => {
+            if let Some(qself) = &path.qself {
+                type_names(&qself.ty, names);
+            }
+            for segment in &path.path.segments {
+                names.push(segment.ident.to_string());
+                if let syn::PathArguments::AngleBracketed(arguments) = &segment.arguments {
+                    for argument in &arguments.args {
+                        if let syn::GenericArgument::Type(value) = argument {
+                            type_names(value, names);
+                        }
+                    }
+                }
+            }
+        }
+        syn::Type::Reference(value) => type_names(&value.elem, names),
+        syn::Type::Array(value) => type_names(&value.elem, names),
+        syn::Type::Slice(value) => type_names(&value.elem, names),
+        syn::Type::Paren(value) => type_names(&value.elem, names),
+        syn::Type::Group(value) => type_names(&value.elem, names),
+        syn::Type::Tuple(value) => {
+            for element in &value.elems {
+                type_names(element, names);
+            }
+        }
+        _ => {}
+    }
 }
 
 struct HexIdentifier {
@@ -174,10 +311,10 @@ fn is_serialized(attrs: &[Attribute]) -> bool {
 }
 
 fn fields(fields: syn::Fields, output_only: bool) -> syn::Result<Fields> {
-    let parse_field = |field: syn::Field| {
+    let parse_field = |field: syn::Field| -> syn::Result<Field> {
         Ok(Field {
             name: field.ident.map(|ident| ident.to_string()),
-            ty: field.ty,
+            ty: normalized_type(field.ty)?,
             docs: docs(&field.attrs),
             serde: serde_for(&field.attrs, output_only)?,
         })
@@ -199,6 +336,13 @@ fn fields(fields: syn::Fields, output_only: bool) -> syn::Result<Fields> {
                 .collect::<syn::Result<_>>()?,
         )),
     }
+}
+
+/// Normalizes a declared type once, at the parser boundary. A refused type keeps the span of the
+/// whole declaration and names its unsupported syntax as the cause.
+fn normalized_type(ty: syn::Type) -> syn::Result<RustType> {
+    let span = ty.span();
+    RustType::from_syn(ty).map_err(|cause| syn::Error::new(span, cause))
 }
 
 fn docs(attrs: &[Attribute]) -> Vec<String> {
@@ -373,6 +517,7 @@ fn requires_test(predicate: &Meta) -> syn::Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ir::TypeArgument;
 
     #[test]
     fn unsupported_serde_shapes_are_refused_by_attribute_name() {
@@ -439,5 +584,229 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    fn named(name: &str, arguments: Vec<TypeArgument>) -> RustType {
+        RustType::Named {
+            name: name.to_owned(),
+            arguments,
+        }
+    }
+
+    fn argument(value: RustType) -> TypeArgument {
+        TypeArgument::Type { value }
+    }
+
+    #[test]
+    fn field_and_alias_types_are_normalized_once_at_the_parser_boundary() {
+        let source = r#"
+            #[derive(Serialize)]
+            pub struct Shaped {
+                pub borrowed: &'a mut std::collections::BTreeMap<String, Vec<u8>>,
+                pub path: ::std::path::PathBuf,
+                pub digits: [u8; N + 1],
+                pub pair: (u8, Option<String>),
+                pub holder: Holder<'static, u8>,
+                pub cells: Grid<3>,
+            }
+            pub type Alias = Vec<::std::string::String>;
+            hex_identifier!(TraceId, 16, InvalidTraceId);
+        "#;
+        let mut api = Api::default();
+        parse(source, &mut api).expect("declarations");
+        let Shape::Struct(Fields::Named(fields)) = &api.records["Shaped"].shape else {
+            panic!("Shaped has named fields");
+        };
+        assert_eq!(
+            fields[0].ty,
+            RustType::Reference {
+                element: Box::new(named(
+                    "std::collections::BTreeMap",
+                    vec![
+                        argument(named("String", Vec::new())),
+                        argument(named("Vec", vec![argument(named("u8", Vec::new()))])),
+                    ],
+                )),
+                lifetime: Some("a".to_owned()),
+                mutable: true,
+            }
+        );
+        assert_eq!(fields[1].ty, named("::std::path::PathBuf", Vec::new()));
+        assert_eq!(
+            fields[2].ty,
+            RustType::Array {
+                element: Box::new(named("u8", Vec::new())),
+                length: "N + 1".to_owned(),
+            }
+        );
+        assert_eq!(
+            fields[3].ty,
+            RustType::Tuple {
+                elements: vec![
+                    named("u8", Vec::new()),
+                    named("Option", vec![argument(named("String", Vec::new()))]),
+                ],
+            }
+        );
+        assert_eq!(
+            fields[4].ty,
+            named(
+                "Holder",
+                vec![
+                    TypeArgument::Lifetime {
+                        name: "static".to_owned(),
+                    },
+                    argument(named("u8", Vec::new())),
+                ],
+            )
+        );
+        assert_eq!(
+            fields[5].ty,
+            named(
+                "Grid",
+                vec![TypeArgument::Const {
+                    expression: "3".to_owned(),
+                }],
+            )
+        );
+        let Shape::Alias(alias) = &api.records["Alias"].shape else {
+            panic!("Alias is a type alias");
+        };
+        assert_eq!(
+            *alias,
+            named(
+                "Vec",
+                vec![argument(named("::std::string::String", Vec::new()))]
+            )
+        );
+        let Shape::Alias(digest) = &api.records["TraceId"].shape else {
+            panic!("TraceId is a hex identifier alias");
+        };
+        assert_eq!(*digest, named("String", Vec::new()));
+    }
+
+    #[test]
+    fn unsupported_type_syntax_is_refused_by_name_at_the_parser_boundary() {
+        for (ty, cause) in [
+            (
+                "Box<dyn std::fmt::Debug>",
+                "unsupported Rust declaration type",
+            ),
+            ("fn(u8) -> u8", "unsupported Rust declaration type"),
+            ("*const u8", "unsupported Rust declaration type"),
+            (
+                "<Owner as Trait>::Assoc",
+                "unsupported Rust declaration type",
+            ),
+            (
+                "Outer<u8>::Inner",
+                "generic arguments on an intermediate path segment are unsupported",
+            ),
+            ("Box<Iterator<Item = u8>>", "unsupported generic argument"),
+        ] {
+            let source = format!("#[derive(Serialize)] pub struct Record {{ pub value: {ty} }}");
+            let error =
+                parse(&source, &mut Api::default()).expect_err("unsupported syntax is refused");
+            assert!(error.to_string().contains(cause), "{ty}: {error}");
+        }
+        let error = parse("pub type Callback = fn(u8) -> u8;", &mut Api::default())
+            .expect_err("an unsupported alias is refused");
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported Rust declaration type"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn only_declarations_are_normalized() {
+        let source = r#"
+            pub struct RuntimeHandle {
+                runtime: Arc<dyn Runtime>,
+                completion: std::marker::PhantomData<fn() -> u8>,
+            }
+            pub enum Outcome {
+                Pending(Box<dyn Fn()>),
+            }
+        "#;
+        let mut api = Api::default();
+        parse(source, &mut api).expect("runtime state is not a declaration");
+        assert!(!api.records.contains_key("RuntimeHandle"));
+        assert!(!api.records.contains_key("Outcome"));
+    }
+
+    #[test]
+    fn a_projected_declaration_is_normalized_and_refuses_unsupported_syntax() {
+        let source = r#"
+            #[cfg_attr(any(), cowshed_api(name = "Projected"))]
+            pub struct Handle {
+                runtime: Arc<dyn Runtime>,
+            }
+        "#;
+        let error =
+            parse(source, &mut Api::default()).expect_err("a projected declaration is normalized");
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported Rust declaration type"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_string_domain_declared_by_macro_is_a_serialized_declaration() {
+        let source = r#"
+            pub struct BranchName(String);
+            string_domain_serde!(BranchName);
+            pub struct Unrelated(String);
+        "#;
+        let mut api = Api::default();
+        parse(source, &mut api).expect("declarations");
+        assert!(api.records["BranchName"].exported);
+        assert!(!api.records.contains_key("Unrelated"));
+    }
+
+    #[test]
+    fn a_serialized_declaration_keeps_the_support_types_it_reaches() {
+        let source = r#"
+            #[derive(Serialize)]
+            pub struct Outer { pub inner: Inner }
+            pub struct Inner { pub id: Ident }
+            pub type Ident = Chain;
+            pub type Chain = Deep<u8>;
+            pub struct Deep<T>(pub T);
+        "#;
+        let mut api = Api::default();
+        parse(source, &mut api).expect("reached support types normalize");
+        assert!(api.records["Outer"].exported);
+        assert!(!api.records["Inner"].exported);
+        assert!(api.records.contains_key("Ident"));
+        assert!(api.records.contains_key("Chain"));
+        assert!(api.records.contains_key("Deep"));
+    }
+
+    #[test]
+    fn an_unreached_runtime_holder_is_skipped_and_a_reached_one_is_refused() {
+        let mut api = Api::default();
+        parse(
+            "pub struct RuntimeHolder { runtime: Arc<dyn Runtime> }",
+            &mut api,
+        )
+        .expect("an unreached runtime holder is not normalized");
+        assert!(!api.records.contains_key("RuntimeHolder"));
+        for source in [
+            "#[derive(Serialize)] pub struct Reaches { pub holder: RuntimeHolder } pub struct RuntimeHolder { runtime: Arc<dyn Runtime> }",
+            "pub type Handle = RuntimeHolder; pub struct RuntimeHolder { runtime: Arc<dyn Runtime> }",
+        ] {
+            let error = parse(source, &mut Api::default())
+                .expect_err("a holder a declaration or alias reaches is refused");
+            assert!(
+                error
+                    .to_string()
+                    .contains("unsupported Rust declaration type"),
+                "{error}"
+            );
+        }
     }
 }

@@ -15,7 +15,7 @@
 //! and the adapter's `.d.ts` together.
 
 use crate::capabilities;
-use crate::ir::{Api, Field, Fields, Record, Shape};
+use crate::ir::{Api, Field, Fields, Record, RustType, Shape, TypeArgument};
 use crate::operations::{Lane, Operation, Scope};
 use std::collections::BTreeMap;
 use std::fmt::Write;
@@ -124,7 +124,7 @@ enum Answer {
 
 impl Answer {
     fn of(operation: &Operation, class: &Class) -> Result<Self, String> {
-        let (result, shape) = result_record(&operation.result)
+        let (result, shape) = operation_result_record(&operation.result)
             .map_err(|error| format!("{}: {error}", operation.method))?;
         Ok(
             match (&operation.lane, result.as_str(), shape, class.rust) {
@@ -300,9 +300,9 @@ pub fn export_records(operations: &[Operation], api: &mut Api) -> Result<(), Str
         .iter()
         .filter(|operation| operation.scope != Scope::Internal)
     {
-        let request = path_name(&operation.request)
+        let request = operation_type_name(&operation.request)
             .ok_or_else(|| format!("{}: the request is not a named record", operation.method))?;
-        let (result, shape) = result_record(&operation.result)
+        let (result, shape) = operation_result_record(&operation.result)
             .map_err(|error| format!("{}: {error}", operation.method))?;
         for name in [&request, &result] {
             api.records
@@ -321,7 +321,7 @@ pub fn export_records(operations: &[Operation], api: &mut Api) -> Result<(), Str
 /// The generated construction decodes the caller's fields as a record mirroring this one, so the
 /// declaration may only use the serde spellings that record reproduces exactly.
 fn request<'a>(operation: &Operation, api: &'a Api) -> Result<Request<'a>, String> {
-    let name = path_name(&operation.request)
+    let name = operation_type_name(&operation.request)
         .ok_or_else(|| format!("{}: the request is not a named record", operation.method))?;
     let record = api
         .records
@@ -384,56 +384,64 @@ fn request<'a>(operation: &Operation, api: &'a Api) -> Result<Request<'a>, Strin
     })
 }
 
-/// A request field's type as Rust source: a path whose generic arguments are types, written as
-/// the declaration writes it, so it names what the operation table's scope names.
-fn rust_type(ty: &Type) -> Result<String, String> {
-    let Type::Path(path) = ty else {
-        return Err("a request field's type is a path".to_owned());
+/// A request field's type as Rust source, spelled as the declaration names it: a named path whose
+/// type arguments are types, so the construction names what the operation table's scope names. The
+/// caller's fields decode into an owned record, so a reference, slice, array or tuple, and a
+/// lifetime or const argument, has no spelling here and is refused by name rather than erased.
+fn field_type(ty: &RustType) -> Result<String, String> {
+    let (name, arguments) = match ty {
+        RustType::Named { name, arguments } => (name, arguments),
+        RustType::Array { .. } => {
+            return Err(
+                "an array type is unsupported; a request field must be a named path".to_owned(),
+            );
+        }
+        RustType::Tuple { .. } => {
+            return Err(
+                "a tuple type is unsupported; a request field must be a named path".to_owned(),
+            );
+        }
+        RustType::Reference { .. } => {
+            return Err(
+                "a reference type is unsupported; a request field must be a named path".to_owned(),
+            );
+        }
+        RustType::Slice { .. } => {
+            return Err(
+                "a slice type is unsupported; a request field must be a named path".to_owned(),
+            );
+        }
     };
-    if path.qself.is_some() {
-        return Err("a request field's type is a plain path".to_owned());
-    }
-    let mut source = String::new();
-    if path.path.leading_colon.is_some() {
-        source.push_str("::");
-    }
-    for (index, segment) in path.path.segments.iter().enumerate() {
-        if index > 0 {
-            source.push_str("::");
-        }
-        source.push_str(&segment.ident.to_string());
-        match &segment.arguments {
-            PathArguments::None => {}
-            PathArguments::AngleBracketed(arguments) => {
-                source.push('<');
-                for (index, argument) in arguments.args.iter().enumerate() {
-                    let GenericArgument::Type(argument) = argument else {
-                        return Err(format!(
-                            "{}: a request field's generic arguments are types",
-                            segment.ident
-                        ));
-                    };
-                    if index > 0 {
-                        source.push_str(", ");
-                    }
-                    source.push_str(&rust_type(argument)?);
+    let mut source = name.clone();
+    if !arguments.is_empty() {
+        source.push('<');
+        for (index, argument) in arguments.iter().enumerate() {
+            let value = match argument {
+                TypeArgument::Type { value } => value,
+                TypeArgument::Lifetime { .. } => {
+                    return Err(format!(
+                        "{name}: a lifetime argument is unsupported; a request field's arguments are types"
+                    ));
                 }
-                source.push('>');
+                TypeArgument::Const { .. } => {
+                    return Err(format!(
+                        "{name}: a const argument is unsupported; a request field's arguments are types"
+                    ));
+                }
+            };
+            if index > 0 {
+                source.push_str(", ");
             }
-            PathArguments::Parenthesized(_) => {
-                return Err(format!(
-                    "{}: a request field is not a closure",
-                    segment.ident
-                ));
-            }
+            source.push_str(&field_type(value)?);
         }
+        source.push('>');
     }
     Ok(source)
 }
 
 /// The last path segment of a type with no generic arguments: `JobInfo` for `JobInfo`, none for
 /// `Vec<JobInfo>`.
-fn path_name(ty: &Type) -> Option<String> {
+fn operation_type_name(ty: &Type) -> Option<String> {
     let Type::Path(path) = ty else {
         return None;
     };
@@ -442,14 +450,14 @@ fn path_name(ty: &Type) -> Option<String> {
 }
 
 /// Whether a field's declared type is `Option<…>`. Spelled, not resolved: a type that only looks
-/// optional fails to compile in the generated construction rather than binding the wrong value.
-fn is_option(ty: &Type) -> bool {
-    let Type::Path(path) = ty else {
-        return false;
-    };
-    path.path.segments.last().is_some_and(|segment| {
-        segment.ident == "Option" && matches!(segment.arguments, PathArguments::AngleBracketed(_))
-    })
+/// optional fails to compile in the generated construction rather than binding the wrong value. A
+/// qualified `std::option::Option<…>` is optional by its last segment, as the bare name is.
+fn is_option(ty: &RustType) -> bool {
+    matches!(
+        ty,
+        RustType::Named { name, arguments }
+            if !arguments.is_empty() && name.rsplit("::").next() == Some("Option")
+    )
 }
 
 fn snake(name: &str) -> String {
@@ -609,7 +617,13 @@ fn serve(output: &mut String, class: &Class, method: &Method<'_>) -> Result<(), 
         if !attributes.is_empty() {
             writeln!(output, "            #[serde({})]", attributes.join(", ")).unwrap();
         }
-        writeln!(output, "            {name}: {},", rust_type(&field.ty)?).unwrap();
+        let ty = field_type(&field.ty).map_err(|error| {
+            format!(
+                "{}: request {}: field {name}: {error}",
+                operation.method, request.name
+            )
+        })?;
+        writeln!(output, "            {name}: {ty},").unwrap();
         caller.push(name);
         literal.push(name.to_owned());
     }
@@ -793,7 +807,7 @@ fn typescript(
         )
         .unwrap();
         let request = record_name(
-            &path_name(&operation.request)
+            &operation_type_name(&operation.request)
                 .ok_or_else(|| format!("{}: unnamed request", operation.method))?,
         )?;
         // A handle that binds every field takes exactly `{}`: `Pick<Request, never>` would be the
@@ -832,7 +846,7 @@ fn typescript(
         );
         let (keyword, returns, body) = match method.answer {
             Answer::Json => {
-                let (ty, validator) = result_type(&operation.result, &record_name)?;
+                let (ty, validator) = operation_result_type(&operation.result, &record_name)?;
                 (
                     "async function",
                     format!("Promise<{ty}>"),
@@ -840,7 +854,7 @@ fn typescript(
                 )
             }
             Answer::Download => {
-                let (ty, validator) = result_type(&operation.result, &record_name)?;
+                let (ty, validator) = operation_result_type(&operation.result, &record_name)?;
                 (
                     "async function",
                     format!("Promise<{ty} & {{ readonly bytes: Uint8Array }}>"),
@@ -856,7 +870,7 @@ fn typescript(
             ),
             // Each step of the loop is one demand, and leaving it early closes the call.
             Answer::Stream => {
-                let (ty, validator) = result_type(&operation.result, &record_name)?;
+                let (ty, validator) = operation_result_type(&operation.result, &record_name)?;
                 (
                     "function",
                     format!("EventIterator<{ty}>"),
@@ -882,8 +896,8 @@ enum ResultShape {
 }
 
 /// A result's named record and its structural wrapper, shared by exports and adapters.
-fn result_record(ty: &Type) -> Result<(String, ResultShape), String> {
-    if let Some(name) = path_name(ty) {
+fn operation_result_record(ty: &Type) -> Result<(String, ResultShape), String> {
+    if let Some(name) = operation_type_name(ty) {
         return Ok((name, ResultShape::Record));
     }
     let Type::Path(path) = ty else {
@@ -901,8 +915,8 @@ fn result_record(ty: &Type) -> Result<(String, ResultShape), String> {
         (wrapper @ ("Vec" | "Option"), Some(GenericArgument::Type(element)))
             if arguments.args.len() == 1 =>
         {
-            let element =
-                path_name(element).ok_or("an operation result's element is a named record")?;
+            let element = operation_type_name(element)
+                .ok_or("an operation result's element is a named record")?;
             let shape = if wrapper == "Vec" {
                 ResultShape::List
             } else {
@@ -915,11 +929,11 @@ fn result_record(ty: &Type) -> Result<(String, ResultShape), String> {
 }
 
 /// A JSON result's TypeScript type and the validator that parses it.
-fn result_type(
+fn operation_result_type(
     ty: &Type,
     record_name: &impl Fn(&str) -> Result<String, String>,
 ) -> Result<(String, String), String> {
-    let (record, shape) = result_record(ty)?;
+    let (record, shape) = operation_result_record(ty)?;
     let name = record_name(&record)?;
     Ok(match shape {
         ResultShape::Record => (format!("Api.{name}"), format!("parse{name}")),
@@ -1325,7 +1339,10 @@ mod tests {
             "Vec<Option<JobId>>",
         ] {
             let ty = syn::parse_str::<Type>(source).expect("type");
-            assert!(result_record(&ty).is_err(), "{source} was accepted");
+            assert!(
+                operation_result_record(&ty).is_err(),
+                "{source} was accepted"
+            );
         }
         output(
             r#"operations! {
@@ -1335,5 +1352,122 @@ mod tests {
         )
         .err()
         .expect("optional native job uploads are not supported");
+    }
+
+    /// A caller field is spelled as a named path only. A reference, slice, array or tuple, and a
+    /// lifetime or const argument, is refused by its shape: the caller record it decodes into is
+    /// owned and carries no lifetime, and no other shape is spelled.
+    #[test]
+    fn a_caller_field_of_a_shape_its_native_record_cannot_spell_is_refused() {
+        for (field, refusal) in [
+            ("pub label: &'static str", "a reference type is unsupported"),
+            ("pub digits: [u8; 4]", "an array type is unsupported"),
+            ("pub pair: (u8, u8)", "a tuple type is unsupported"),
+            ("pub slices: Vec<[u8]>", "a slice type is unsupported"),
+            (
+                "pub holder: Holder<'static>",
+                "a lifetime argument is unsupported",
+            ),
+            ("pub cells: Grid<3>", "a const argument is unsupported"),
+        ] {
+            let mut api = api();
+            crate::records::parse(
+                &format!(
+                    "#[derive(Serialize, Deserialize)] #[serde(rename_all = \"camelCase\", deny_unknown_fields)] pub struct ShapedRequest {{ pub repo_id: RepoId, {field} }}"
+                ),
+                &mut api,
+            )
+            .expect("records");
+            let operations = crate::operations::parse(
+                r#"operations! {
+                    /// Shapes a request.
+                    coordinator json "coordinator.shaped" CoordinatorShaped(ShapedRequest) -> EmptyResult;
+                }"#,
+            )
+            .expect("table");
+            let error = emit(&operations, &api, &[])
+                .err()
+                .expect("a caller field the native record cannot spell is refused");
+            assert!(error.contains(refusal), "{field}: {error}");
+        }
+    }
+
+    /// A caller field keeps its path as the declaration writes it: a leading `::` and every type
+    /// argument, nested as written, are spelled exactly.
+    #[test]
+    fn a_caller_field_keeps_its_leading_colon_path_and_nested_arguments() {
+        let mut api = api();
+        crate::records::parse(
+            r#"
+            #[derive(Serialize, Deserialize)]
+            #[serde(rename_all = "camelCase", deny_unknown_fields)]
+            pub struct RootedRequest {
+                pub repo_id: RepoId,
+                pub root: ::std::path::PathBuf,
+                pub index: ::std::collections::BTreeMap<String, Option<Vec<u8>>>,
+            }
+            "#,
+            &mut api,
+        )
+        .expect("records");
+        let operations = crate::operations::parse(
+            r#"operations! {
+                /// Indexes a root.
+                coordinator json "coordinator.index" CoordinatorIndex(RootedRequest) -> EmptyResult;
+            }"#,
+        )
+        .expect("table");
+        let served = emit(&operations, &api, &[]).expect("projection").served;
+        assert!(
+            served.contains(concat!(
+                "            root: ::std::path::PathBuf,\n",
+                "            index: ::std::collections::BTreeMap<String, Option<Vec<u8>>>,\n",
+            )),
+            "{served}"
+        );
+        assert!(
+            served.contains("Ok(RootedRequest { repo_id: owned(authority.repo_id), root, index })"),
+            "{served}"
+        );
+    }
+
+    /// An optional field is recognized through a qualified `std::option::Option` as through the
+    /// bare name: outside the handle's fence it is sent absent, and the caller never names it.
+    #[test]
+    fn a_qualified_option_is_optional_by_its_last_segment() {
+        let mut api = api();
+        crate::records::parse(
+            r#"
+            #[derive(Serialize, Deserialize)]
+            #[serde(rename_all = "camelCase", deny_unknown_fields)]
+            pub struct QualifiedGrantsRequest {
+                pub repo_id: RepoId,
+                pub workspace: WorkspaceName,
+                #[serde(default, skip_serializing_if = "std::option::Option::is_none")]
+                pub workspace_incarnation: std::option::Option<WorkspaceIncarnation>,
+            }
+            "#,
+            &mut api,
+        )
+        .expect("records");
+        let operations = crate::operations::parse(
+            r#"operations! {
+                /// Reads one workspace's grants.
+                coordinator json "workspace.qualifiedGrants" WorkspaceQualifiedGrants(QualifiedGrantsRequest) -> EmptyResult;
+            }"#,
+        )
+        .expect("table");
+        let served = emit(&operations, &api, &[]).expect("projection").served;
+        let implementation = served_impl(&served, "WorkspaceQualifiedGrants", "WorkspaceRef");
+        assert!(
+            implementation.contains("workspace_incarnation: None"),
+            "{implementation}"
+        );
+        assert!(
+            served.contains(
+                r#"check.served::<WorkspaceQualifiedGrants, _>(workspace_ref, &["workspaceIncarnation"]);"#
+            ),
+            "{served}"
+        );
     }
 }
