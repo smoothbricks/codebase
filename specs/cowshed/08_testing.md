@@ -49,6 +49,11 @@ No mounts, no root, no network — pure functions with table-driven cases:
   `WorkspaceHandle` exposes exactly one workspace's exec/shell/jobs/quota-bound checkpoint/push/grant reads; only
   `Coordinator` exposes grant/revoke/restore/destroy/rebase/land/gc/repo-mirror and quota policy. Compile-fail fixtures
   prove forbidden methods and cross-workspace construction are unavailable.
+- **Public declaration IR:** `cowshed:declaration-model-test` admits the actual owner model through its generated Typia
+  Equals guards in one setup, pins `get`/`as-str`/`display` projection metadata, and refuses missing, unknown and extra
+  metadata through both assertion and JSON parsing. It consumes the prebuilt owner generator, without an N-API wire
+  corpus or native runtime fixture. Rust IR tests independently pin every serialized fact and the exact owner-emitted
+  model/validator bytes. The focused target runs Biome and ESLint before the admission oracle.
 - **Authoritative cwd resolution and env wiring**: fake-host/router tables cover deeply nested cwd success, detached and
   cross-project refusal, malicious marker-only refusal, and overlapping active-mount ambiguity, plus macOS/Linux
   `PortBlock` presence. Capability-wire tests freeze `project.workspaceAt` and reject local CLI inference.
