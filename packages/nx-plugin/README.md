@@ -640,6 +640,12 @@ is the patched one.
 ([nrwl/nx#34087](https://github.com/nrwl/nx/issues/34087)). `patches/@nx%2Fjs@23.2.1.patch` declares the peer, so Bun
 binds the same pinned Nx through the package's normal dependency namespace.
 
+Native APFS fixtures install this same pinned package and patch offline into their own checkout, using Bun's local
+cache, and report each installation's elapsed time. They do not borrow another checkout's `node_modules`: a patched
+package's dependency links can traverse lexical `.bun` symlinks outside an explicit sandbox read grant even when the
+resolved payload is granted. The workspace's own read authority covers those local links; only shared dependency
+payloads receive additional bounded store grants. Installation runs once per suite template, which fixtures clone.
+
 The Nx patch repairs upstream Nx runtime behavior, separately from this plugin's workspace-owner checks:
 
 - **Task history uses the client's native database connection.** Task details and history must share that connection; a

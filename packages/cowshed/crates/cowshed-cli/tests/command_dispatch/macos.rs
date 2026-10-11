@@ -973,15 +973,24 @@ struct InstalledPackageIdentity {
     version: String,
 }
 
+/// The fixture checkout's own Bun-installed Nx, canonical: the program each fixture runs.
+fn fixture_nx(checkout: &Path) -> PathBuf {
+    checkout
+        .join("node_modules/nx")
+        .canonicalize()
+        .expect("the fixture's Bun-installed Nx")
+}
+
 /// Read only the installed package-private namespaces reachable from Nx, not a hoist or home.
 /// Bun keeps patched packages in this checkout's `.bun` tree and shares eligible dependencies
 /// through its global store; neither layout requires a generated release closure.
 fn nx_read_paths(nx: &Path) -> Vec<PathBuf> {
-    let manifest = std::env::var_os("CARGO_MANIFEST_DIR").expect("the test manifest directory");
-    let local = PathBuf::from(manifest)
-        .join("../../../../node_modules/.bun")
-        .canonicalize()
-        .expect("the checkout's Bun install namespace");
+    // The namespace is the `.bun` directory above the checkout's own canonical Nx.
+    let local = nx
+        .ancestors()
+        .find(|ancestor| ancestor.file_name() == Some(std::ffi::OsStr::new(".bun")))
+        .expect("Nx must sit in its checkout's Bun install namespace")
+        .to_path_buf();
     let store = std::env::var_os("BUN_INSTALL_CACHE_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
@@ -1065,7 +1074,12 @@ fn nx_read_paths(nx: &Path) -> Vec<PathBuf> {
         "an installed binary binding leaves the package closure"
     );
     reads.extend(namespaces);
-    reads.into_iter().collect()
+    // Local packages already belong to the workspace's read authority. External grants must
+    // never intersect that protected workspace; only shared cache payloads need added reads.
+    reads
+        .into_iter()
+        .filter(|path| !path.starts_with(&local))
+        .collect()
 }
 
 /// Adopt the fixture's checkout as main, let every workspace read `reads` (the toolchains its
@@ -1107,6 +1121,36 @@ async fn succeed(
     }
 }
 
+/// The repository root: the checkout the test binary was built from.
+fn repository_root() -> PathBuf {
+    let manifest = std::env::var_os("CARGO_MANIFEST_DIR")
+        .expect("cargo and nextest export CARGO_MANIFEST_DIR to the test process");
+    PathBuf::from(manifest)
+        .join("../../../..")
+        .canonicalize()
+        .expect("the repository root")
+}
+
+/// The host's Bun, the package manager the repository pins in `packageManager`.
+fn host_bun() -> PathBuf {
+    std::env::var_os("PATH")
+        .and_then(|path| {
+            std::env::split_paths(&path)
+                .map(|directory| directory.join("bun"))
+                .find(|candidate| candidate.is_file())
+        })
+        .expect("bun on the test's PATH")
+}
+
+/// The pins `bun install` applies to Nx, read from the repository's own manifest.
+#[derive(serde::Deserialize)]
+struct NxPins {
+    #[serde(rename = "devDependencies")]
+    dev_dependencies: std::collections::BTreeMap<String, String>,
+    #[serde(rename = "patchedDependencies")]
+    patched_dependencies: std::collections::BTreeMap<String, String>,
+}
+
 /// An Nx project whose `a:build` writes `a/generated.txt` and whose `a:test` reads it (its
 /// default inputs include it). `declared` says whether `a:build` declares that output. Written,
 /// not committed: the caller commits once it has written all it adds.
@@ -1121,9 +1165,29 @@ fn write_nx_project(checkout: &Path, nx: &Path, node: &Path, declared: bool) {
     } else {
         "[]"
     };
+    let root = repository_root();
+    let pins: NxPins = serde_json::from_slice(
+        &fs::read(root.join("package.json")).expect("the repository manifest"),
+    )
+    .expect("the repository manifest's Nx pins");
+    let version = pins
+        .dev_dependencies
+        .get("nx")
+        .expect("the repository pins Nx");
+    let key = format!("nx@{version}");
+    let patch = pins
+        .patched_dependencies
+        .get(&key)
+        .expect("the repository patches Nx");
+    fs::create_dir_all(checkout.join(patch).parent().expect("patch directory")).unwrap();
+    fs::copy(root.join(patch), checkout.join(patch)).expect("the repository's maintained Nx patch");
+    fs::copy(root.join("bunfig.toml"), checkout.join("bunfig.toml"))
+        .expect("the repository's bunfig.toml");
     fs::write(
         checkout.join("package.json"),
-        r#"{"name":"fixture","private":true}"#,
+        format!(
+            r#"{{"name":"fixture","private":true,"dependencies":{{"nx":"{version}"}},"patchedDependencies":{{"{key}":"{patch}"}}}}"#
+        ),
     )
     .unwrap();
     fs::write(checkout.join("nx.json"), r#"{"useDaemonProcess":false}"#).unwrap();
@@ -1141,42 +1205,55 @@ fn write_nx_project(checkout: &Path, nx: &Path, node: &Path, declared: bool) {
         ),
     )
     .unwrap();
-    fs::create_dir_all(checkout.join("node_modules")).unwrap();
-    std::os::unix::fs::symlink(nx, checkout.join("node_modules/nx")).unwrap();
-    // Match the package manager's real executable entry: the keeper starts the same Nx
-    // installation that the fixture's explicit node invocation runs, in every clone.
-    fs::create_dir_all(checkout.join("node_modules/.bin")).unwrap();
-    std::os::unix::fs::symlink(
-        "../nx/dist/bin/nx.js",
-        checkout.join("node_modules/.bin/nx"),
-    )
-    .unwrap();
-    assert_eq!(
-        checkout
-            .join("node_modules/.bin/nx")
-            .canonicalize()
-            .expect("installed Nx executable"),
-        nx.join("dist/bin/nx.js")
-            .canonicalize()
-            .expect("repository Nx executable"),
+    let bun = host_bun();
+    let started = std::time::Instant::now();
+    let install = Command::new(&bun)
+        .args(["install", "--offline"])
+        .current_dir(checkout)
+        .output()
+        .expect("run the host bun");
+    eprintln!(
+        "bun install --offline of Nx {version} in {}: {:?}",
+        checkout.display(),
+        started.elapsed()
     );
+    assert!(
+        install.status.success(),
+        "bun install --offline: {}",
+        String::from_utf8_lossy(&install.stderr)
+    );
+    for file in ["package.json", "dist/bin/nx.js"] {
+        assert_eq!(
+            fs::read(checkout.join("node_modules/nx").join(file))
+                .expect("the fixture's installed Nx"),
+            fs::read(nx.join(file)).expect("the repository's installed Nx"),
+            "the fixture's Nx {file} must match the repository's patched product",
+        );
+    }
 }
 
 /// A cloned Nx project must retain the real package-manager executable entry the keeper runs.
 fn assert_nx_executable(checkout: &Path) {
     let entry = checkout.join("node_modules/.bin/nx");
-    assert_eq!(
-        fs::read_link(&entry).expect("Nx executable link survives image cloning"),
-        Path::new("../nx/dist/bin/nx.js"),
+    let target = fs::read_link(&entry).expect("Nx executable link survives image cloning");
+    assert!(
+        target.is_relative(),
+        "Bun's Nx entry {} must be relative to survive image cloning",
+        target.display()
     );
-    let installed = checkout.join("node_modules/nx/dist/bin/nx.js");
+    let installed = checkout
+        .join("node_modules/nx/dist/bin/nx.js")
+        .canonicalize()
+        .expect("the installed real Nx program resolves");
+    assert!(
+        installed.starts_with(checkout.canonicalize().expect("the checkout resolves")),
+        "the installed Nx program lives inside the checkout"
+    );
     assert_eq!(
         entry
             .canonicalize()
             .expect("the keeper's Nx executable resolves"),
-        installed
-            .canonicalize()
-            .expect("the installed real Nx program resolves"),
+        installed,
     );
     assert_ne!(
         fs::metadata(&entry)
@@ -1231,7 +1308,8 @@ async fn land_nx_project(
         node: &node,
         declared,
     });
-    let mut service = serve_project(&mut fixture, &nx_read_paths(&nx)).await;
+    let nx_reads = nx_read_paths(&fixture_nx(&fixture.checkout));
+    let mut service = serve_project(&mut fixture, &nx_reads).await;
     let (created, _, stderr) = run(&mut service, ["new", "topic"]).await;
     assert_eq!(
         created.unwrap_or_else(|error| panic!(
@@ -1698,7 +1776,8 @@ async fn real_apfs_a_fork_of_a_warm_target_is_all_fresh_and_all_hits() {
         nx: Some((&nx, &node)),
         rust: Some(&rust),
     });
-    let mut service = serve_project(&mut fixture, &nx_read_paths(&nx)).await;
+    let nx_reads = nx_read_paths(&fixture_nx(&fixture.checkout));
+    let mut service = serve_project(&mut fixture, &nx_reads).await;
     assert_target_on_build_volume(&fixture.checkout);
     let nx_check = nx_run_many(&node);
 
@@ -1817,7 +1896,8 @@ async fn real_apfs_a_land_adopts_freezes_the_seed_releases_the_old_volume_and_re
         nx: Some((&nx, &node)),
         rust: None,
     });
-    let mut service = serve_project(&mut fixture, &nx_read_paths(&nx)).await;
+    let nx_reads = nx_read_paths(&fixture_nx(&fixture.checkout));
+    let mut service = serve_project(&mut fixture, &nx_reads).await;
     let layout = build_volumes(&fixture);
     let previous = linked_volume(&layout, &fixture.checkout);
 
@@ -1910,7 +1990,8 @@ async fn real_apfs_what_main_runs_after_a_land_reaches_its_seed_and_a_fork_hits_
         nx: Some((&nx, &node)),
         rust: None,
     });
-    let mut service = serve_project(&mut fixture, &nx_read_paths(&nx)).await;
+    let nx_reads = nx_read_paths(&fixture_nx(&fixture.checkout));
+    let mut service = serve_project(&mut fixture, &nx_reads).await;
     let layout = build_volumes(&fixture);
     let nx_check = nx_run_many(&node);
     let main = fixture.checkout.clone();
@@ -1996,7 +2077,8 @@ async fn real_apfs_a_fork_of_a_workspace_reseeds_it_and_hits_its_latest_run() {
         nx: Some((&nx, &node)),
         rust: None,
     });
-    let mut service = serve_project(&mut fixture, &nx_read_paths(&nx)).await;
+    let nx_reads = nx_read_paths(&fixture_nx(&fixture.checkout));
+    let mut service = serve_project(&mut fixture, &nx_reads).await;
     let nx_check = nx_run_many(&node);
 
     let w1 = new_workspace(&mut service, "w1").await;
@@ -2052,7 +2134,8 @@ async fn real_apfs_doctor_names_a_displaced_build_link_and_an_exec_relinks_it() 
         nx: Some((&nx, &node)),
         rust: None,
     });
-    let mut service = serve_project(&mut fixture, &nx_read_paths(&nx)).await;
+    let nx_reads = nx_read_paths(&fixture_nx(&fixture.checkout));
+    let mut service = serve_project(&mut fixture, &nx_reads).await;
     assert_eq!(build_link_findings(&mut service).await, [""; 0]);
 
     let data = fixture.checkout.join(".nx/workspace-data");
@@ -2092,7 +2175,8 @@ async fn real_apfs_a_land_carries_mains_nx_entries_into_the_volume_main_adopts()
         nx: Some((&nx, &node)),
         rust: None,
     });
-    let mut service = serve_project(&mut fixture, &nx_read_paths(&nx)).await;
+    let nx_reads = nx_read_paths(&fixture_nx(&fixture.checkout));
+    let mut service = serve_project(&mut fixture, &nx_reads).await;
     let nx_check = nx_run_many(&node);
 
     let b = new_workspace(&mut service, "b").await;
@@ -2149,7 +2233,8 @@ async fn real_apfs_a_rebase_carries_mains_nx_entries_into_the_rebased_workspace(
         nx: Some((&nx, &node)),
         rust: None,
     });
-    let mut service = serve_project(&mut fixture, &nx_read_paths(&nx)).await;
+    let nx_reads = nx_read_paths(&fixture_nx(&fixture.checkout));
+    let mut service = serve_project(&mut fixture, &nx_reads).await;
     let nx_check = nx_run_many(&node);
 
     let b = new_workspace(&mut service, "b").await;
@@ -2269,7 +2354,8 @@ async fn database_holder_fixture() -> DatabaseHolderFixture {
         nx: Some((&nx, &node)),
         rust: None,
     });
-    let mut service = serve_project(&mut fixture, &nx_read_paths(&nx)).await;
+    let nx_reads = nx_read_paths(&fixture_nx(&fixture.checkout));
+    let mut service = serve_project(&mut fixture, &nx_reads).await;
     let layout = build_volumes(&fixture);
     let nx_check = nx_run_many(&node);
     let topic = new_workspace(&mut service, "topic").await;
@@ -2748,8 +2834,8 @@ async fn real_apfs_rm_evicts_and_names_a_host_process_holding_an_unlinked_build_
     fixture.stop_gateway().await;
 }
 
-/// Re-adoption (02_workspaces.md, "Re-adoption: format transition and space reclamation"), one
-/// walk over one project:
+/// Re-adoption (02_workspaces.md, "Re-adoption: format transition and space reclamation"):
+/// RAW replacement and interrupted legacy recovery are independent real walks over fresh projects.
 /// - a default adopt over a main in a format this runtime only replaces refuses before it
 ///   records anything, and leaves that main's bytes alone;
 /// - `adopt --re-adopt` replaces an adopted main with a fresh RAW image under a new incarnation,
@@ -2758,6 +2844,20 @@ async fn real_apfs_rm_evicts_and_names_a_host_process_holding_an_unlinked_build_
 /// - the replaced main and build images stay at their retained paths, in their own format.
 #[tokio::test]
 async fn real_apfs_re_adopt_replaces_main_keeps_its_build_identity_and_retains_the_old_image() {
+    prove_re_adoption(ReAdoptionProof::RawReplacement).await;
+}
+
+#[tokio::test]
+async fn real_apfs_re_adopt_resumes_legacy_inputs_without_a_second_replacement() {
+    prove_re_adoption(ReAdoptionProof::LegacyRecovery).await;
+}
+
+enum ReAdoptionProof {
+    RawReplacement,
+    LegacyRecovery,
+}
+
+async fn prove_re_adoption(proof: ReAdoptionProof) {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     struct RestoreStderr {
         saved: Option<OwnedFd>,
@@ -2847,121 +2947,125 @@ async fn real_apfs_re_adopt_replaces_main_keeps_its_build_identity_and_retains_t
     );
     fs::write(fixture.checkout.join("notes.txt"), b"untracked notes\n").unwrap();
     let head = git_stdout(&fixture.checkout, &["rev-parse", "HEAD"]);
-    let status = git_stdout(
-        &fixture.checkout,
-        &["status", "--porcelain", "--untracked-files=all"],
-    );
     let pre_cowshed_head = fs::read(pre_cowshed.join(".git/HEAD")).expect("retained tree");
     let main_image = project_root.join("main.dmg");
-    let old = cowshed_core::metadata::DetachedWorkspaceMetadata::read_for_image(&main_image)
-        .expect("main's sidecar")
-        .workspace_incarnation;
-
-    // Core retention guidance writes to the real stderr descriptor, not the CLI Output buffer.
-    // Observe that actual channel; the isolated nextest process has only this lifecycle walk.
-    let report_path = fixture._scratch.path().join("re-adopt-report.stderr");
-    let report_file = fs::File::create(&report_path).expect("capture core replacement report");
-    // SAFETY: fcntl duplicates the live standard-error descriptor and owns the result.
-    let saved = unsafe { libc::fcntl(libc::STDERR_FILENO, libc::F_DUPFD_CLOEXEC, 3) };
-    assert!(
-        saved >= 0,
-        "save stderr: {}",
-        std::io::Error::last_os_error()
-    );
-    // SAFETY: the successful duplication returned an owned, non-stdio descriptor.
-    let mut restore = RestoreStderr {
-        saved: Some(unsafe { OwnedFd::from_raw_fd(saved) }),
-        report_path,
-    };
-    // SAFETY: report_file stays open until stderr is restored.
-    assert!(
-        unsafe { libc::dup2(report_file.as_raw_fd(), libc::STDERR_FILENO) } >= 0,
-        "capture stderr: {}",
-        std::io::Error::last_os_error()
-    );
-    let (replacement, stdout, stderr) = run(
-        &mut service,
-        [
-            OsString::from("adopt"),
-            fixture.checkout.as_os_str().to_os_string(),
-            OsString::from("--re-adopt"),
-        ],
-    )
-    .await;
-    restore.restore().expect("restore stderr after replacement");
-    drop(report_file);
-    let core_report =
-        fs::read_to_string(&restore.report_path).expect("read actual replacement guidance");
-    // Restore the real channel before asserting: neither an operational refusal nor
-    // a panic may disappear into a private capture deleted by fixture teardown.
-    eprint!("{core_report}");
-    let stderr = String::from_utf8_lossy(&stderr);
-    assert!(
-        matches!(replacement, Ok(0)),
-        "cowshed adopt --re-adopt: {replacement:?}\nstdout: {}\nstderr: {stderr}",
-        String::from_utf8_lossy(&stdout)
-    );
-
-    let new = cowshed_core::metadata::DetachedWorkspaceMetadata::read_for_image(&main_image)
-        .expect("the replacement's sidecar")
-        .workspace_incarnation;
-    assert_ne!(new, old, "the replacement is a new incarnation");
-    assert_eq!(
-        fs::read(fixture.checkout.join("tracked")).unwrap(),
-        b"changed before re-adoption\n"
-    );
-    assert_eq!(
-        fs::read(fixture.checkout.join("notes.txt")).unwrap(),
-        b"untracked notes\n"
-    );
-    assert_eq!(git_stdout(&fixture.checkout, &["rev-parse", "HEAD"]), head);
-    assert_eq!(
-        git_stdout(
+    if let ReAdoptionProof::RawReplacement = proof {
+        let status = git_stdout(
             &fixture.checkout,
-            &["status", "--porcelain", "--untracked-files=all"]
-        ),
-        status
-    );
-    assert_eq!(
-        linked_volume(&layout, &fixture.checkout),
-        main_volume,
-        "the build volume keeps its identity"
-    );
-    assert_eq!(
-        layout
-            .read_record(&main_volume)
-            .expect("the replacement's build record"),
-        record,
-        "the owner record is carried verbatim"
-    );
-    assert_eq!(
-        fs::read(warm.join("build.ninja")).expect("warm build state"),
-        b"warm\n",
-        "the build volume's contents are copied, never substituted"
-    );
-    assert_eq!(
-        fs::read(pre_cowshed.join(".git/HEAD")).expect("retained tree"),
-        pre_cowshed_head,
-        "the original .pre-cowshed tree is never touched"
-    );
-    let retained = project_root.join("retained");
-    for kept in [
-        retained.join(format!("main-{}.dmg", old.as_str())),
-        retained.join(format!("main-{}.dmg.grants.json", old.as_str())),
-        retained.join(format!("build-{}.dmg", main_volume.as_str())),
-        retained.join(format!("build-{}.dmg.json", main_volume.as_str())),
-    ] {
-        assert!(kept.exists(), "{} is retained: {stderr}", kept.display());
-        assert!(
-            core_report.contains(&kept.display().to_string()),
-            "the actual stderr report names {}: {core_report}",
-            kept.display()
+            &["status", "--porcelain", "--untracked-files=all"],
         );
+        let old = cowshed_core::metadata::DetachedWorkspaceMetadata::read_for_image(&main_image)
+            .expect("main's sidecar")
+            .workspace_incarnation;
+
+        // Core retention guidance writes to the real stderr descriptor, not the CLI Output buffer.
+        // Observe that actual channel; the isolated nextest process has only this lifecycle walk.
+        let report_path = fixture._scratch.path().join("re-adopt-report.stderr");
+        let report_file = fs::File::create(&report_path).expect("capture core replacement report");
+        // SAFETY: fcntl duplicates the live standard-error descriptor and owns the result.
+        let saved = unsafe { libc::fcntl(libc::STDERR_FILENO, libc::F_DUPFD_CLOEXEC, 3) };
+        assert!(
+            saved >= 0,
+            "save stderr: {}",
+            std::io::Error::last_os_error()
+        );
+        // SAFETY: the successful duplication returned an owned, non-stdio descriptor.
+        let mut restore = RestoreStderr {
+            saved: Some(unsafe { OwnedFd::from_raw_fd(saved) }),
+            report_path,
+        };
+        // SAFETY: report_file stays open until stderr is restored.
+        assert!(
+            unsafe { libc::dup2(report_file.as_raw_fd(), libc::STDERR_FILENO) } >= 0,
+            "capture stderr: {}",
+            std::io::Error::last_os_error()
+        );
+        let (replacement, stdout, stderr) = run(
+            &mut service,
+            [
+                OsString::from("adopt"),
+                fixture.checkout.as_os_str().to_os_string(),
+                OsString::from("--re-adopt"),
+            ],
+        )
+        .await;
+        restore.restore().expect("restore stderr after replacement");
+        drop(report_file);
+        let core_report =
+            fs::read_to_string(&restore.report_path).expect("read actual replacement guidance");
+        // Restore the real channel before asserting: neither an operational refusal nor
+        // a panic may disappear into a private capture deleted by fixture teardown.
+        eprint!("{core_report}");
+        let stderr = String::from_utf8_lossy(&stderr);
+        assert!(
+            matches!(replacement, Ok(0)),
+            "cowshed adopt --re-adopt: {replacement:?}\nstdout: {}\nstderr: {stderr}",
+            String::from_utf8_lossy(&stdout)
+        );
+
+        let new = cowshed_core::metadata::DetachedWorkspaceMetadata::read_for_image(&main_image)
+            .expect("the replacement's sidecar")
+            .workspace_incarnation;
+        assert_ne!(new, old, "the replacement is a new incarnation");
+        assert_eq!(
+            fs::read(fixture.checkout.join("tracked")).unwrap(),
+            b"changed before re-adoption\n"
+        );
+        assert_eq!(
+            fs::read(fixture.checkout.join("notes.txt")).unwrap(),
+            b"untracked notes\n"
+        );
+        assert_eq!(git_stdout(&fixture.checkout, &["rev-parse", "HEAD"]), head);
+        assert_eq!(
+            git_stdout(
+                &fixture.checkout,
+                &["status", "--porcelain", "--untracked-files=all"]
+            ),
+            status
+        );
+        assert_eq!(
+            linked_volume(&layout, &fixture.checkout),
+            main_volume,
+            "the build volume keeps its identity"
+        );
+        assert_eq!(
+            layout
+                .read_record(&main_volume)
+                .expect("the replacement's build record"),
+            record,
+            "the owner record is carried verbatim"
+        );
+        assert_eq!(
+            fs::read(warm.join("build.ninja")).expect("warm build state"),
+            b"warm\n",
+            "the build volume's contents are copied, never substituted"
+        );
+        assert_eq!(
+            fs::read(pre_cowshed.join(".git/HEAD")).expect("retained tree"),
+            pre_cowshed_head,
+            "the original .pre-cowshed tree is never touched"
+        );
+        let retained = project_root.join("retained");
+        for kept in [
+            retained.join(format!("main-{}.dmg", old.as_str())),
+            retained.join(format!("main-{}.dmg.grants.json", old.as_str())),
+            retained.join(format!("build-{}.dmg", main_volume.as_str())),
+            retained.join(format!("build-{}.dmg.json", main_volume.as_str())),
+        ] {
+            assert!(kept.exists(), "{} is retained: {stderr}", kept.display());
+            assert!(
+                core_report.contains(&kept.display().to_string()),
+                "the actual stderr report names {}: {core_report}",
+                kept.display()
+            );
+        }
+        service.shutdown().await.expect("stop the runtime");
+        return;
     }
     service.shutdown().await.expect("stop the runtime");
 
-    // Reuse this warm checkout for an actual pre-cutover ASIF main and build volume. The OS
-    // converts only detached fixture payloads; no runtime legacy creator/decoder is introduced.
+    // Start the independent legacy recovery walk from this first warm RAW adoption. The OS
+    // converts only detached fixture payloads; no preceding RAW replacement or runtime codec.
     let host = MacOsApfsExecutionHost::new(
         SystemCommandRunner,
         ApfsSubstrateConfig::new(fixture.storage.store(), &fixture.checkout),

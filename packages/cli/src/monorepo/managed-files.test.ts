@@ -197,7 +197,7 @@ describe('nx graph project helpers', () => {
 
 describe('managed raw files', () => {
   it('distributes the exact Nx patch and repairs consumer drift through the managed writer', async () => {
-    expect(managedFileTargetsForTest).toContainEqual({ target: managedNxPatch.path });
+    expect(managedFileTargetsForTest).toContainEqual({ target: managedNxPatch.path, executable: undefined });
     const [authoritative, packaged] = await Promise.all([
       readFile(join(REPO_ROOT, managedNxPatch.path), 'utf8'),
       readFile(join(REPO_ROOT, 'packages/nx-plugin/managed/raw', managedNxPatch.path), 'utf8'),
@@ -205,6 +205,12 @@ describe('managed raw files', () => {
     expect(packaged).toBe(authoritative);
     const root = await mkdtemp(join(tmpdir(), 'smoo-managed-nx-patch-'));
     try {
+      const manifest = `${JSON.stringify({
+        name: '@acme/managed-patch-consumer',
+        private: true,
+        workspaces: ['packages/*'],
+      })}\n`;
+      await writeFile(join(root, 'package.json'), manifest);
       const shape = context({ hasReleasePackages: false });
       await applyManagedFilesForContext(root, 'update', shape);
       const destination = join(root, managedNxPatch.path);
@@ -226,6 +232,7 @@ describe('managed raw files', () => {
           action: 'unchanged',
         }),
       );
+      expect(await readFile(join(root, 'package.json'), 'utf8')).toBe(manifest);
     } finally {
       await rm(root, { recursive: true, force: true });
     }

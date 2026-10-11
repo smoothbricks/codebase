@@ -487,6 +487,7 @@ async function runGroupExecutor(
   const script = `import nextestGroupExecutor from ${JSON.stringify(EXECUTOR_MODULE)};
 console.log('driver ready: calling the default group executor');
 const result = await nextestGroupExecutor(${JSON.stringify(options)}, ${JSON.stringify(context)});
+console.log('driver done: default group executor success=' + result.success);
 process.exitCode = result.success ? 0 : 2;`;
   const result = await runTracked(root, [process.execPath, '--preload', VALIDATION_PRELOAD, '-e', script], {
     graceful: true,

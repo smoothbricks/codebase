@@ -730,19 +730,22 @@ describe('what shell entry keeps linked', () => {
         { ...WORKSPACE, developerLinks: { '@fixture/lib': '.cache/owned-package' } },
         async ({ root, enterShell: enter }) => {
           expect(await enter()).toEqual(HEALTHY);
+          expect(readlinkSync(join(root, LINKED))).toBe('../../../lib');
           const main = join(dirname(root), 'projects', 'main');
           await checkout(join(main, '.cache', 'owned-package'), '@fixture/lib');
           const legacy = await checkout(join(main, '.cache', 'package'), '@fixture/lib');
           await mkdir(join(root, '.cowshed'), { recursive: true });
           await writeFile(join(root, '.cowshed', 'workspace.json'), JSON.stringify({ projectRoot: main }));
 
-          // A missing local directory refuses without borrowing the main checkout's package.
-          expect((await enter({ links: true, check: true })).exitCode).toBe(1);
-          expect(readlinkSync(join(root, LINKED))).toBe('../../../lib');
-          const local = await checkout(join(root, '.cache', 'owned-package'), '@fixture/lib');
-          // The inherited Main payload need not share the declaration's new relative path.
           await rm(join(root, LINKED));
           symlinkSync(legacy, join(root, LINKED));
+          // A missing local directory refuses an inherited Main binding, without rewriting it.
+          const missing = await enter({ links: true, check: true });
+          expect(missing.exitCode).toBe(1);
+          expect(missing.stderr).toContain('restore it in this checkout, never borrow the main checkout');
+          expect(readlinkSync(join(root, LINKED))).toBe(legacy);
+          const local = await checkout(join(root, '.cache', 'owned-package'), '@fixture/lib');
+          // The inherited Main payload need not share the declaration's new relative path.
           expect((await enter({ links: true, check: true })).exitCode).toBe(1);
           expect((await enter({ links: true })).exitCode).toBe(0);
           expect(readlinkSync(join(root, LINKED))).toBe(relative(dirname(join(root, LINKED)), local));
