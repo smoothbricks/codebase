@@ -476,13 +476,27 @@ parallel, and the total runnable work stays near the core count.
   and how many threads it ran with. With `COWSHED_TIMING` set, the gateway prints each grant: tokens, want, the wait,
   the checkout, and the client's pid and command.
 - **Outside `bounded-exec`.** Processes outside `bounded-exec` — Nx's own `nx:run-commands` builds, a host shell's
-  `cargo` — take no lease; the budget reaches them through Cargo's make-protocol jobserver, which hands out the same
-  tokens.
+  `cargo` — take the budget through Cargo's make-protocol jobserver, one fifo per client process. The managed
+  environment's `cargo` is cowshed's jobserver launcher (03_caches.md, in-image tool shims), which runs `cargo` directly
+  inside a `bounded-exec` grant (`BOUNDED_EXEC_CPU_TOKENS` set) or under an inherited jobserver (`CARGO_MAKEFLAGS` names
+  one). Elsewhere it asks the gateway on the control socket
+  (`{"op":"jobserver","checkout":"<workspace root>","command":"<command>"}`), which queues and grants it like a cargo
+  build's `cpu-tokens` request (one per core, the half-host cap, fairness, all at once) and answers
+  `{"ok":true,"lease":"granted","tokens":<g>,"fifo":"<path>"}`. On the grant the gateway creates that fifo in its
+  private runtime directory, mode `0600` and owned by the client's user (from the socket's peer credentials), and writes
+  `g − 1` token bytes into it: the client's implicit make token is the first. The launcher then spawns the real `cargo`
+  with `CARGO_MAKEFLAGS` and `MAKEFLAGS` set to `-j --jobserver-auth=fifo:<path>`, waits for it, and exits with its
+  status. The launcher keeps the connection open, close-on-exec, for as long as it lives. When the connection closes —
+  the build ended, or either process was killed, `SIGKILL` included — the gateway drains the bytes left in the fifo,
+  unlinks it, and returns all `g` tokens to the ledger, so tokens a killed process read and never wrote back are
+  credited too. A `cargo` that outlives a killed launcher keeps its open fifo and runs over budget until it finishes, as
+  a runner does across a gateway restart.
 
 Tests: `cowshed-gateway`'s `cpu_budget` ledger unit tests (fairness, share, starvation, leave) and `tests/cpu_budget.rs`
 over a real socket (`SIGKILL` of a holding client returns its tokens to the waiter at once; checkouts share the host;
 refusals); the plugin's `cpu-tokens.test.ts` (each runner's `want` and sizing, a killed holder closing its grant) and
-`executor.test.ts` (a granted run sized and released, a refused one run as asked).
+`executor.test.ts` (a granted run sized and released, a refused one run as asked); and a jobserver test in which a
+`SIGKILL`ed `cargo` mid-build leaves the ledger whole and its fifo unlinked.
 
 ## Credentials
 

@@ -183,6 +183,49 @@ function generateRemappedBufferViewClass(
 }
 ```
 
+The descriptor and its arrays are frozen. A column mapped to `null` gets no entry, so a dropped column has no output
+column.
+
+```
+Application Root Buffer (schema: { user_id, …, http_status, http_method, auth_token, query, pg_rows, … })
+│
+├── child node: HTTP Library Buffer (schema: { status, method })
+│   │   _remapDescriptor.sourceNames: http_status → status, http_method → method
+│   │
+│   └── child node: Auth Library Buffer (schema: { token })
+│           _remapDescriptor.sourceNames: auth_token → token   (the application's deps.auth: .prefix('auth'))
+│
+├── child node: Postgres Library Buffer (schema: { query, rows })
+│       _remapDescriptor.sourceNames: query → query, pg_rows → rows (shared 'query' column!)
+│
+└── child node: App's own child span buffer (same schema as root, no _remapDescriptor)
+```
+
+Child nodes live in the trace's `TraceTopology` arena (`firstChild`/`nextSibling` node arrays), not in per-buffer child
+arrays. An overflow segment shares its span's node, and the walk hands every segment that span's descriptor.
+
+### How Nested Libraries Compose
+
+- **Chained mapping on one group composes into one descriptor.** `libraryOps.prefix('api').prefix('v1')` yields
+  `sourceNames: { v1_api_metric: 'metric', v1_api_label: 'label' }`: each later `.prefix()` prefixes the earlier output
+  names, and `createRemapDescriptor` builds the descriptor once from the fully composed mapping.
+- **Deps resolve at the root, and descriptors of ancestor spans are not applied.** Every span of a trace sees the `deps`
+  of the Tracer's context, since each child span shares its parent's
+  ([Context Flow](./01c_context_flow_and_op_wrappers.md)). A library's `deps` therefore declares the groups it calls,
+  and the application wires each of them. A child span carries only the descriptor of the Op it runs: the auth spans in
+  the diagram emit `auth_token`, the name the application's `deps.auth` wiring gave them, not `http_auth_token`.
+- **The root wiring must satisfy every included library's deps, checked by the type system.** The application's `deps`
+  must hold, under the same key, a group compatible with each dep that any group it includes declares, transitively.
+  `defineOpContext` rejects a wiring that lacks such a key or wires an incompatible group as a type error, so a library
+  span never reads an unwired dep at runtime and a library never guards a declared dep for presence.
+- **A mapped group contributes only its own schema fields.** `httpOps.prefix('http')` contributes `http_status` and
+  `http_method`, and its descriptor maps only those. The columns of the HTTP library's own deps come from the groups the
+  application wires for them (`auth: authOps.prefix('auth')` contributes `auth_token`), so the application's effective
+  schema lists exactly the columns its spans write.
+- **An Op without a descriptor called inside a remapped span inherits the parent's descriptor** when it shares the
+  parent's schema. A prefixed library calling one of its own unmapped Ops by direct reference therefore still emits the
+  prefixed names (`http_method`, not `method`).
+
 ### Why This Works
 
 **Hot Path (library code execution)**:
@@ -314,8 +357,8 @@ const get = defineOp('get', async (ctx, url: string, options?: RequestInit) => {
     const response = await fetch(url, { signal: AbortSignal.timeout(ctx.timeout), ...options });
     ctx.tag.status(response.status).duration(performance.now() - startTime);
 
-    if (!response.ok && ctx.deps.retry) {
-      // Use dependency via span()
+    if (!response.ok) {
+      // Use dependency via span(); the application's wiring is type-checked to provide `retry`
       await ctx.span('retry', ctx.deps.retry.attempt, 1);
     }
 
@@ -358,6 +401,8 @@ const { defineOp, defineOps, logSchema, flags } = defineOpContext({
   deps: {
     // Simple prefixing
     http: httpOps.prefix('http'),
+    // The HTTP library declares `retry` in its deps; omitting this key is a type error
+    retry: retryOps.prefix('http_retry'),
 
     // Explicit column mapping - pg and mysql share 'query' column
     pg: postgresOps.mapColumns({

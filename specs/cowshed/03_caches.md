@@ -144,6 +144,12 @@ them there; they contain the endpoint URL, whose userinfo is the workspace token
   reach the personal session); personal-session devices appear as explicitly-named remote targets and route through the
   gateway's `/sim/` endpoint (05_gateway.md) under the `sim` grant axis (04_sandbox.md). Tools that hardcode
   `/usr/bin/xcrun` bypass the shim and degrade to dev-local simulators — the safe default.
+- **The `cargo` jobserver launcher** is first on `PATH` in the managed environment, ahead of every directory that can
+  hold a real `cargo` (the private `tools/bin`, `.cowshed/bin/` tool links, shell activation's entries). It takes a
+  jobserver grant from the gateway and runs the next `cargo` on `PATH` under it (05_gateway.md "Host CPU budget",
+  Outside `bounded-exec`). Under a `bounded-exec` grant (`BOUNDED_EXEC_CPU_TOKENS` set) or an inherited jobserver
+  (`CARGO_MAKEFLAGS` names one, as for a `cargo` a build script starts) it runs that `cargo` directly, since that budget
+  already covers it; with no gateway listening it runs it unbudgeted, as `bounded-exec` does.
 - **Tool homes stay where the tool keeps them.** Every layer-3 cache lives at its tool's own default location in the
   host user's HOME, the one place the host's own tools already use without configuration, and cowshed shares that exact
   path into the sandbox of every project whose detector names the tool (15_capabilities.md). There is no cache volume,

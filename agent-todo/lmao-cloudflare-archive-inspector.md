@@ -360,6 +360,19 @@ a dependency. Work items that depend on an open decision name it by number. Ever
 - Options:
   - (a) Add one `TraceSource` interface that both sources implement. `TraceViewer` takes it.
   - (b) The spec drops `TraceSource`. `TraceViewer` takes `StreamSource | ArchiveSource`.
+  - (c) `TraceSource` is the tagged union `StreamSource | ArchiveSource`, discriminated by a `kind` field.
+- Applied: `specs/lmao/03_inspector.md:97-98` says `TraceViewer` accepts a `TraceSource` and switches on `kind`; the
+  public API defines `StreamSource` (`kind: 'stream'`), `ArchiveSource` (`kind: 'archive'`) and
+  `type TraceSource = StreamSource | ArchiveSource`.
+- Work: add `readonly kind: 'stream'` to `StreamSource` (`stream-source.ts:12-19`) and the object `createStreamSource`
+  returns, `readonly kind: 'archive'` to `ArchiveSource` (`archive-source.ts:6-9`) and `createArchiveSource`'s object,
+  and export `type TraceSource` from `packages/lmao-inspector/src/index.ts`. `TraceViewer`, which the package does not
+  have yet, takes a `TraceSource` and narrows on `source.kind` with an exhaustive switch.
+- Acceptance: `package-exports.test.ts` sees `kind` on both created sources; a type test shows a `switch (source.kind)`
+  over `TraceSource` is exhaustive with the two cases and that a source without `kind` is rejected.
+- Decision: keep a `TraceSource` type, as the tagged union (c). The two sources differ in kind, a pushed `onBatch`
+  stream against a pulled `fetchRange` over a time range, so one shared interface would hide the range that the archive
+  needs; a `kind` discriminant lets `TraceViewer` narrow exactly instead of probing members structurally.
 
 ### 8. createStreamSource configuration (03)
 

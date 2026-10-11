@@ -266,7 +266,10 @@ trace('create-user', { env, requestId }, createUserOp, userData) creates:
 - `span(name, op, ...args)`: Invoke an op as a child span
 - `log`: SpanLogger for info/debug/warn/error
 - `tag`: TagWriter for span attributes
-- `deps`: Bound dependency ops (can be destructured: `const { retry } = deps`)
+- `deps`: Bound dependency ops (can be destructured: `const { retry } = deps`). Every span of a trace shares the root's
+  deps, so the root `defineOpContext` must wire, under the same key, a compatible group for every dep that any included
+  group declares, transitively. A missing or incompatible dep is a type error at the root wiring, never an `undefined`
+  read at runtime ([Library Integration](./01e_library_integration_pattern.md)).
 - `ff`: Feature flag evaluator bound to current span's buffer
 - User context properties (e.g., `env`, `requestId`, `userId` - defined via `ctx` in `defineOpContext()`)
 

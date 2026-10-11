@@ -91,7 +91,8 @@ simplified list view without client-side SQL.
 
 ### TraceViewer <a id="smoo/lmao!n/inspector-components.trace-viewer"></a>
 
-Top-level composed component. Accepts a `TraceSource` (live stream or archive) and renders the trace UI.
+Top-level composed component. Accepts a `TraceSource`: a `StreamSource` (`kind: 'stream'`, live) or an `ArchiveSource`
+(`kind: 'archive'`, historical, fetched over the viewer's time range), and switches on `kind` to render the trace UI.
 
 ```typescript
 <TraceViewer
@@ -144,9 +145,24 @@ The inspector queries LMAO's Arrow column schema (`01f_arrow_table_structure.md`
 
 ```typescript
 // Sources
-export function createStreamSource(config: { wsUrl: string; groupId: string }): TraceSource;
-export function createSseSource(config: { url: string }): TraceSource;
-export function createArchiveSource(config: { fetchUrl: string }): TraceSource;
+export interface StreamSourceConfig {
+  url: string;
+  transport: 'websocket' | 'sse';
+  topic: string; // e.g. 'traces:{groupId}'
+}
+export interface StreamSource {
+  readonly kind: 'stream';
+  connect(): void;
+  disconnect(): void;
+  onBatch(callback: (ipcBytes: Uint8Array, parsed: ReturnType<typeof tableFromIPC>) => void): void;
+}
+export interface ArchiveSource {
+  readonly kind: 'archive';
+  fetchRange(startTime: number, endTime: number): AsyncIterable<Uint8Array>;
+}
+export type TraceSource = StreamSource | ArchiveSource;
+export function createStreamSource(config: StreamSourceConfig): StreamSource;
+export function createArchiveSource(baseUrl: string): ArchiveSource;
 
 // Components (Tamagui)
 export function TraceViewer(props: TraceViewerProps): JSX.Element;

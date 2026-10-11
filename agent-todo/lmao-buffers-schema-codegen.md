@@ -82,7 +82,42 @@ independent unless stated. DECIDE items need a spec-or-code choice first, so the
 - Acceptance: a follow-up leaves this list only when its spec section lands; any code that needs one of them fails with
   an explicit error until then, never a stub that silently ignores the request.
 
-## Open decisions
+## Code comments describe superseded designs
+
+- Spec: `specs/lmao/01c_context_flow_and_op_wrappers.md:552` (`err<E>(error: E)`),
+  `specs/lmao/01b2_buffer_self_tuning.md` §Observability Hook (hook called from `getOrCreateOverflow()`), and
+  `specs/lmao/01b5_spanbuffer_memory_layout.md` §Complete SpanBuffer Interface (`OpMetadata`, one per op).
+- Code: `packages/lmao/src/lib/opContext/spanContextTypes.ts:371-372` documents `err` with `@param code` and
+  `@param details`, but the signature takes one `error`. `packages/lmao/src/lib/capacityTuning.ts:63-64` says the hook
+  runs in spanLoggerGenerator's `_getNextBuffer`; it runs in `getOrCreateOverflow`
+  (`packages/lmao/src/lib/spanBuffer.ts`). `packages/lmao/src/lib/op.ts:42` says `OpMetadata` is a renamed
+  `ModuleContext`.
+- Work: rewrite the three comments to the current shape: one `@param error` for `err`, `getOrCreateOverflow` as the hook
+  site, and the `op.ts` region comment without the rename history.
+- Acceptance: `grep -n "@param code\|@param details" packages/lmao/src/lib/opContext/spanContextTypes.ts`,
+  `grep -n "_getNextBuffer" packages/lmao/src/lib/capacityTuning.ts`, and
+  `grep -n "ModuleContext" packages/lmao/src/lib/op.ts` find nothing.
+
+## The root wiring is not checked against the libraries' declared deps
+
+- Spec: `specs/lmao/01c_context_flow_and_op_wrappers.md` §SpanContext Properties (`deps`) and
+  `specs/lmao/01e_library_integration_pattern.md` §How Nested Libraries Compose: every span shares the root's deps, so
+  the root `defineOpContext` must wire, under the same key, a compatible group for every dep that any included group
+  declares, transitively; a missing or incompatible dep is a type error.
+- Code: `packages/lmao/src/lib/opContext/opGroupTypes.ts:286-296` types `DepsConfig` as
+  `Record<string, AnyOpGroupPublic>`, and `packages/lmao/src/lib/defineOpContext.ts:316-342` accepts any such record.
+  Nothing relates an included group's own `Ctx['deps']` to the root's keys, so a library span that calls an unwired
+  `ctx.deps.x` type-checks and reads `undefined` at runtime. The `SpanContext` side types `deps` as
+  `Record<string, any>` (`spanContextTypes.ts:63`) to avoid a recursive type.
+- Work: add a `RequiredDeps<Deps>` type that collects, from each group in `Deps` (through `OpGroup<Ctx, …>` and
+  `MappedOpGroup<Ctx, …>`), the keys and group types of `Ctx['deps']`, recursively, and constrain the root
+  `defineOpContext` overloads so `Deps` must extend it. Report a missing key by name in the error. Keep the recursion
+  out of `SpanContext` (only the root wiring is checked).
+- Acceptance: a type-level test where an application includes `httpOps` (which declares `retry`) without wiring `retry`
+  fails to compile and names `retry`; wiring `retry` with a group of another context type fails; the full wiring
+  compiles, and the 01e library example, which calls `ctx.deps.retry` with no presence guard, type-checks.
+
+## Decisions
 
 ### Dynamic reference lanes or raw `string[]` for CATEGORY and TEXT
 
