@@ -593,6 +593,11 @@ export const assertLandRequestList = typia.createAssertEquals<readonly Api.LandR
 export const parseLandRequestList = (json: string): readonly Api.LandRequest[] =>
   assertLandRequestList(JSON.parse(json));
 
+export const assertLandSeed = typia.createAssertEquals<Api.LandSeed>();
+export const parseLandSeed = (json: string): Api.LandSeed => assertLandSeed(JSON.parse(json));
+export const assertLandSeedList = typia.createAssertEquals<readonly Api.LandSeed[]>();
+export const parseLandSeedList = (json: string): readonly Api.LandSeed[] => assertLandSeedList(JSON.parse(json));
+
 export const assertLandingCommits = typia.createAssertEquals<Api.LandingCommits>();
 export const parseLandingCommits = (json: string): Api.LandingCommits => assertLandingCommits(JSON.parse(json));
 export const assertLandingCommitsList = typia.createAssertEquals<readonly Api.LandingCommits[]>();

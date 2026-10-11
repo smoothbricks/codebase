@@ -17,8 +17,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crate::apfs::SystemCommandRunner;
 use crate::api::dto::{
-    AdoptionSkip, CarrySide, DatabaseHolder, GcCandidate, GcDeferred, GcReason, GitOid, NxCarry,
-    RebaseBuildVolume, RebaseCarrySkip, Reseed, ReseedSkip, Sha256Digest,
+    AdoptionSkip, CarrySide, DatabaseHolder, GcCandidate, GcDeferred, GcReason, GitOid, LandSeed,
+    NxCarry, RebaseBuildVolume, RebaseCarrySkip, Reseed, ReseedSkip, Sha256Digest,
 };
 use crate::build_volume::migrate::{MintedBeside, MintedVolume};
 use crate::build_volume::{
@@ -159,6 +159,25 @@ impl Contended {
             target,
             _guard: guard,
         })
+    }
+}
+
+/// What [`BuildVolumes::freeze_seed`] did with the target's seed when the landing volume had no
+/// Cargo build (Land step 5.6).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum Freeze {
+    /// The seed is captured from the sealed landing volume and every older seed retired.
+    Frozen,
+    /// A filesystem holder refused the seal; the previous seed stays.
+    SealBusy { reason: String },
+}
+
+impl From<Freeze> for LandSeed {
+    fn from(freeze: Freeze) -> Self {
+        match freeze {
+            Freeze::Frozen => Self::Frozen,
+            Freeze::SealBusy { reason } => Self::SealBusy { reason },
+        }
     }
 }
 
@@ -932,13 +951,16 @@ impl BuildVolumes {
     }
 
     /// Land step 5.6, under the target's image lock: admit only an idle Cargo volume, seal it
-    /// without force, capture the target's seed, then retire every older seed.
+    /// without force, capture the target's seed, then retire every older seed. A filesystem
+    /// holder that refuses the seal leaves the previous seed in place and is answered as
+    /// [`Freeze::SealBusy`], not a skip: the seal fences only the captured bytes, so the
+    /// adoption still goes ahead on the restored volume.
     pub async fn freeze_seed(
         &self,
         locked: &TargetLock,
         quiet: &Quiet,
         tree: GitOid,
-    ) -> Result<std::result::Result<(), AdoptionSkip>> {
+    ) -> Result<std::result::Result<Freeze, AdoptionSkip>> {
         let quiet = quiet.clone();
         let target = locked.target.clone();
         self.blocking(move |host, layout| {
@@ -974,14 +996,14 @@ impl BuildVolumes {
             ) {
                 Ok(()) => {}
                 Err(ApfsStorageError::Apfs(error)) if crate::apfs::detach_was_dissented(&error) => {
-                    return Ok(Err(AdoptionSkip::LandingVolumeBusy {
+                    return Ok(Ok(Freeze::SealBusy {
                         reason: error.to_string(),
                     }));
                 }
                 Err(error) => return Err(storage(error)),
             }
             retire_seeds(host, layout, &target, previous)?;
-            Ok(Ok(()))
+            Ok(Ok(Freeze::Frozen))
         })
         .await
     }
@@ -1191,8 +1213,9 @@ impl BuildVolumes {
     }
 
     /// A workspace whose volume a target adopted and that keeps working (`land --no-retire`)
-    /// takes a fresh clone of that target's new seed, so it never writes the target's volume.
-    /// Under the target's image lock, so no reseed of the target deletes the seed it clones.
+    /// takes a fresh clone of that target's latest seed (the one the land froze, or the previous
+    /// one a busy seal kept), so it never writes the target's volume. Under the target's image
+    /// lock, so no reseed of the target deletes the seed it clones.
     pub async fn refork(
         &self,
         locked: &TargetLock,
@@ -1205,7 +1228,7 @@ impl BuildVolumes {
                 .seed_of(&seed_of.name, &seed_of.incarnation)?
                 .ok_or_else(|| {
                     CowshedError::internal(format!(
-                        "{} has no seed right after it was frozen",
+                        "{} has no seed for a kept workspace to refork from",
                         seed_of.name
                     ))
                 })?;
@@ -2814,12 +2837,13 @@ fn main() {
             .expect("the supervised jobs and Nx state are quiet");
         let target = owner("main", '0');
         let locked = scratch.lock(&target).await;
-        scratch
+        let frozen = scratch
             .volumes
             .freeze_seed(&locked, &quiet, GitOid::new("a".repeat(40)).unwrap())
             .await
             .unwrap()
             .expect("the initial capture has no writer");
+        assert_eq!(frozen, Freeze::Frozen);
         let original_seed = scratch
             .layout
             .seed_of(&target.name, &target.incarnation)
@@ -2893,7 +2917,7 @@ fn main() {
 
     #[cfg(target_os = "macos")]
     #[tokio::test]
-    async fn real_apfs_seed_freeze_skips_a_filesystem_holder_arriving_after_quiesce() {
+    async fn real_apfs_seed_freeze_keeps_the_previous_seed_for_a_filesystem_holder_after_quiesce() {
         let scratch = Scratch::new("seed-late-holder");
         let (main_checkout, _, _) = scratch.linked_checkout("main", 1);
         let (topic_checkout, _, mount) = scratch.linked_checkout("topic", 1);
@@ -2909,7 +2933,7 @@ fn main() {
             .expect("the landing volume was quiet");
         let target = owner("main", '0');
         let locked = scratch.lock(&target).await;
-        let held = fs::File::create(mount.join("late-writer")).unwrap();
+        let mut held = fs::File::create(mount.join("late-writer")).unwrap();
         let frozen = scratch
             .volumes
             .freeze_seed(&locked, &quiet, GitOid::new("a".repeat(40)).unwrap())
@@ -2918,19 +2942,28 @@ fn main() {
             .layout
             .seed_of(&target.name, &target.incarnation)
             .unwrap();
+        // The refused seal left the holder's descriptor live on the still-mounted volume, which
+        // the adoption then moves to the target.
+        let still_open = std::io::Write::write_all(&mut held, b"after the refused seal");
+        let still_mounted = mount.join("late-writer").exists();
         drop(held);
         drop(quiet);
         drop(locked);
         scratch.release_all();
         assert!(seed.is_none(), "a refused seal must publish no seed");
-        let Err(AdoptionSkip::LandingVolumeBusy { reason }) = frozen.unwrap() else {
-            panic!("the late filesystem holder must be a typed skip");
+        let Ok(Freeze::SealBusy { reason }) = frozen.unwrap() else {
+            panic!("the late filesystem holder must keep the previous seed, not skip the land");
         };
         assert!(
             reason.contains(&format!("pid {}", std::process::id())),
             "{reason}"
         );
         assert!(reason.contains("nothing was forced"), "{reason}");
+        still_open.expect("the holder's descriptor survives a refused seal");
+        assert!(
+            still_mounted,
+            "the refused seal restores the landing volume's mount"
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -3104,12 +3137,13 @@ fn main() {
         assert!(capacity(&topic) >= ImageCapacity::from_gibibytes(2));
         let tree = GitOid::new("a".repeat(40)).unwrap();
         let locked = scratch.lock(&owner("main", '0')).await;
-        scratch
+        let frozen = scratch
             .volumes
             .freeze_seed(&locked, &quiet, tree.clone())
             .await
             .unwrap()
             .expect("nothing holds the landing volume");
+        assert_eq!(frozen, Freeze::Frozen);
         let (seed, _) = scratch
             .layout
             .seed_of(&WorkspaceName::main(), &owner("main", '0').incarnation)
@@ -3610,12 +3644,13 @@ fn main() {
         );
         let tree = GitOid::new("a".repeat(40)).unwrap();
         let locked = scratch.lock(&main).await;
-        scratch
+        let frozen = scratch
             .volumes
             .freeze_seed(&locked, &quiet, tree.clone())
             .await
             .unwrap()
             .expect("nothing holds the landing volume");
+        assert_eq!(frozen, Freeze::Frozen);
         let closed = scratch
             .volumes
             .close_target(main_checkout.clone())
@@ -3794,10 +3829,11 @@ fn main() {
             tokio::spawn(async move {
                 waiting.send(()).expect("the new waits for the land");
                 let locked = contended.wait().await?;
-                volumes
+                let frozen = volumes
                     .freeze_seed(&locked, &quiet, tree.clone())
                     .await?
                     .expect("nothing holds the landing volume");
+                assert_eq!(frozen, Freeze::Frozen);
                 let adopted = volumes
                     .adopt(&locked, &quiet, closed, main_checkout, tree)
                     .await?

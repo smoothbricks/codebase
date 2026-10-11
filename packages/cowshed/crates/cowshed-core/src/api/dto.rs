@@ -2986,9 +2986,23 @@ pub struct LandReport {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct LandBuildVolume {
-    /// Whether the target's seed was frozen from the landing volume (step 5).
-    pub seeded: bool,
+    /// What step 5.6 did with the target's seed.
+    pub seed: LandSeed,
     pub adoption: Adoption,
+}
+
+/// The target's seed after a land (16_build_volumes.md, Land step 5.6).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
+pub enum LandSeed {
+    /// The land skipped its adoption before freezing a seed; the target's seed is as it was.
+    Unchanged,
+    /// The target's seed is frozen from the landing volume.
+    Frozen,
+    /// A filesystem holder refused the landing volume's seal, so the target keeps its previous
+    /// seed while the adoption goes ahead; the next fork's reseed refreezes it from the target's
+    /// live volume once that holder lets go.
+    SealBusy { reason: String },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -3194,8 +3208,8 @@ pub enum AdoptionSkip {
     },
     /// The target's Nx daemon outlived its stop.
     TargetDaemonStayed { daemon: DatabaseHolder },
-    /// The landing volume could not be sealed for capture or grown to the target's capacity
-    /// without forcing a filesystem holder off it.
+    /// The landing volume could not be grown to the target's capacity without forcing a
+    /// filesystem holder off it (step 4); adopting it would shrink the target.
     LandingVolumeBusy { reason: String },
 }
 
@@ -3290,7 +3304,7 @@ impl fmt::Display for AdoptionSkip {
             ),
             Self::LandingVolumeBusy { reason } => write!(
                 formatter,
-                "the landing build volume could not be sealed or grown to the target's capacity: {reason}"
+                "the landing build volume could not be grown to the target's capacity: {reason}"
             ),
         }
     }

@@ -938,7 +938,7 @@ fn reports_gateway_and_audit_shapes_are_frozen() {
         target_was_checked_out: true,
         retired: true,
         build_volume: cowshed_core::api::dto::LandBuildVolume {
-            seeded: true,
+            seed: cowshed_core::api::dto::LandSeed::Frozen,
             adoption: cowshed_core::api::dto::Adoption::Skipped {
                 reason: cowshed_core::api::dto::AdoptionSkip::TargetHeld {
                     database: PathBuf::from("/m/.nx/workspace-data/A-v3.db"),
@@ -954,7 +954,7 @@ fn reports_gateway_and_audit_shapes_are_frozen() {
     assert_eq!(land["targetWasCheckedOut"], true);
     assert_eq!(
         land["buildVolume"],
-        json!({"seeded":true,"adoption":{"kind":"skipped","reason":{"kind":"targetHeld",
+        json!({"seed":{"kind":"frozen"},"adoption":{"kind":"skipped","reason":{"kind":"targetHeld",
             "database":"/m/.nx/workspace-data/A-v3.db","holders":[{"pid":42,"command":"node nx run-many"}]}}})
     );
 

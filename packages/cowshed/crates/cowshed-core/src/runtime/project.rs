@@ -3936,10 +3936,10 @@ impl NativeProjectRuntimeHost {
         checks: &[String],
         retire: bool,
     ) -> Result<crate::api::dto::LandBuildVolume> {
-        use crate::api::dto::{Adoption, AdoptionSkip, LandBuildVolume};
+        use crate::api::dto::{Adoption, AdoptionSkip, LandBuildVolume, LandSeed};
         let volumes = self.build_volumes()?;
         let skipped = |reason| LandBuildVolume {
-            seeded: false,
+            seed: LandSeed::Unchanged,
             adoption: Adoption::Skipped { reason },
         };
         let Some(landing_volume) = volumes.hold_landing(landing)? else {
@@ -4015,20 +4015,23 @@ impl NativeProjectRuntimeHost {
                 timed_async("land", "target-lock", contended.wait()).await?
             }
         };
-        if let Err(reason) = timed_async(
+        // A busy seal keeps the previous seed and the adoption still runs: the seal fences only
+        // the captured bytes, and the restored volume is as quiet for the target as before.
+        let seed = match timed_async(
             "land",
             "freeze-seed",
             volumes.freeze_seed(&locked, &quiet, tree.clone()),
         )
         .await?
         {
-            return Ok(skipped(reason));
-        }
+            Ok(frozen) => LandSeed::from(frozen),
+            Err(reason) => return Ok(skipped(reason)),
+        };
         let (closed, carried) = match carried {
             Ok(carried) => carried,
             Err(reason) => {
                 return Ok(LandBuildVolume {
-                    seeded: true,
+                    seed,
                     adoption: Adoption::Skipped { reason },
                 });
             }
@@ -4101,10 +4104,7 @@ impl NativeProjectRuntimeHost {
                 }
             }
         };
-        Ok(LandBuildVolume {
-            seeded: true,
-            adoption,
-        })
+        Ok(LandBuildVolume { seed, adoption })
     }
 
     /// Land step 7 (2b): each landed check re-run in the target on the adopted volume. Hits and

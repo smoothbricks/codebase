@@ -91,7 +91,8 @@ writers at once. Content-addressed caches, whose entries are immutable and valid
   capacity. The workspace's jobs and Nx daemon stop first, because the image has to leave the kernel; any other holder
   of the volume refuses the resize before anything changes. A land never shrinks its target: while the landing volume is
   quiet (Land step 4) it grows to the target's capacity when it is smaller, before the seed is frozen from it, so the
-  target and every later fork end at the larger of the two capacities.
+  target and every later fork end at the larger of the two capacities. A filesystem holder that refuses that growth is a
+  `landingVolumeBusy` skip, because adopting the smaller volume would shrink the target.
 - **ZFS**: a build volume is a dataset, `<pool>/cowshed/<owner>/<repo>/build/<id>`; a fork is `snapshot` + `clone`, and
   a seed is a snapshot (09_substrates.md).
 - A directory is never a build volume. Copying a Rust `target/` tree file by file with `clonefile`-backed `cp -c -p -R`
@@ -335,9 +336,11 @@ operations do not depend on that platform-only capability. Re-adoption's retaine
 compile with macOS, while its durable record data, Git evidence schema and pure command-contract and Git-preservation
 tests remain portable.
 
-This kernel boundary also covers writers outside Cargo and Nx protocols. A Rust analyzer holding a proc-macro library or
-a script with a file open can leave the fork colder by refusing the seal; neither is forced off the volume and no
-attached-image crash-consistency claim substitutes for the refusal.
+This kernel boundary also covers writers outside Cargo and Nx protocols. A Rust analyzer holding a proc-macro library,
+an indexer's MCP server holding its SQLite index or a script with a file open can leave the fork colder by refusing the
+seal; neither is forced off the volume and no attached-image crash-consistency claim substitutes for the refusal. The
+seal fences only the seed's captured bytes, never the live volume: a refused seal keeps the previous seed and changes
+nothing else, so a land still adopts the restored volume (Land step 5.6).
 
 The restore-publication contract is scoped to admitted cowshed jobs. An unmanaged host Cargo process, editor or script
 that writes the canonical build mount during restore is outside that admission protocol. The build hold is not a kernel
@@ -352,8 +355,10 @@ reports each target whose seed is behind its live volume, with both instants (`s
 
 - **Enforced by**: a real-APFS test in which main runs an Nx task after adopting a landed volume, `cowshed reseed main`
   refreezes its seed and a fork hits that task; real Cargo build-script rendezvous tests for both an existing profile
-  and a profile created after quiescence and lock enumeration; and the sealed-source holder and attachment-exclusion
-  tests.
+  and a profile created after quiescence and lock enumeration; the sealed-source holder and attachment-exclusion tests;
+  and a real-APFS land whose landing volume a host process holds a file of open, which keeps main's previous seed, still
+  adopts with every re-run Nx task a hit, and whose `cowshed reseed main` after the holder exits refreezes the seed at
+  the landed tree.
 - **Freshness boundary enforced by**: real APFS capture without a job write remains Fresh without tolerance; actual job
   admission is refused during canonical restore, both by a direct capture's exclusive claim and a land's retained
   stopped socket lease; an admitted shell job after admission reopens writes bytes absent from the seed and makes it
@@ -400,8 +405,8 @@ same for main and for an integration workspace; "the target" is whichever one it
    stops the workspace's jobs and its sandboxed Nx daemon, and the stopped supervisor socket lease stays with the quiet
    volume through capture and adoption, refusing a replacement supervisor's job admission. The landing build volume's Nx
    task database must have no open file descriptors. If it still does, adoption is **skipped** and reported, as for the
-   target below. This settles supervised jobs and Nx; the later seed seal excludes host builds and other filesystem
-   holders.
+   target below. This settles supervised jobs and Nx; the later seed seal keeps host builds and other filesystem holders
+   out of the seed.
 5. **Close the target, carry, and freeze the seed.** Under the same lock (rule "The adoption needs the target's Nx
    database closed"):
    1. **stage the carry** (below) while the target still runs: copy into the landing volume the target's Nx cache
@@ -416,9 +421,13 @@ same for main and for an integration workspace; "the target" is whichever one it
    6. take the target's image lock and check the landing volume's Cargo profile locks immediately before freezing. A
       real Cargo holder is a `landingBuilding` skip with its lock and processes, with no seed publication or old-seed
       retirement. Otherwise release the check descriptors and seal the source as above; a late or newly created profile
-      cannot write through the detached capture. A busy seal is a `landingVolumeBusy` skip. On successful capture and
-      source restoration, publish the target's new seed and delete its previous seed. What the target runs afterwards on
-      the adopted volume reaches the seed by a reseed (Targets and seeds).
+      cannot write through the detached capture. On successful capture and source restoration, publish the target's new
+      seed and delete its previous seed. A busy seal (a filesystem holder outside the Cargo and Nx protocols, such as an
+      indexer's MCP server holding its SQLite index open) is not a skip: the restored volume is as quiet for the target
+      as it was, so the land keeps the target's previous seed, reports `sealBusy` with the holders the refusal named,
+      and goes on to the swap. That seed is then behind the adopted volume, so the next fork's reseed (Fork step 2)
+      refreezes it once the holder has let go. What the target runs afterwards on the adopted volume reaches the seed by
+      a reseed (Targets and seeds).
 
    Resolving either build volume for mounting takes its per-image lease **before** reading the attachment inventory. A
    recovered attachment owns a raw IOMedia pin across the subsequent kernel mount-table read and mount, just as a
@@ -429,14 +438,16 @@ same for main and for an integration workspace; "the target" is whichever one it
    but before the build-link swap. No retry or wider target-lock interval substitutes for this identity handoff.
 
    The land holds the target's image lock from 5.6 until 6.4 has renamed the target's link and a kept workspace has its
-   fresh clone of the new seed. Every fork of the target holds the same lock from before it reads the target's seed and
-   link until it links its own (Fork steps 1 to 3), and so does every reseed, so neither reads a seed or a volume the
-   land deletes. Without it, a land that froze main's seed and released main's previous volume while a `cowshed new` of
-   main forked deleted the seed the new had read, and the new failed (`sync source image …: No such file or directory`).
-   A land that finds the lock held says so on stderr and waits for it. It waits with the target's daemon already stopped
-   (5.3), so the longer it waits, the likelier an Nx client restarts it and 6.2 skips the swap, reported as any skip is.
+   fresh clone of the target's latest seed (the new one, or the previous one a busy seal kept). Every fork of the target
+   holds the same lock from before it reads the target's seed and link until it links its own (Fork steps 1 to 3), and
+   so does every reseed, so neither reads a seed or a volume the land deletes. Without it, a land that froze main's seed
+   and released main's previous volume while a `cowshed new` of main forked deleted the seed the new had read, and the
+   new failed (`sync source image …: No such file or directory`). A land that finds the lock held says so on stderr and
+   waits for it. It waits with the target's daemon already stopped (5.3), so the longer it waits, the likelier an Nx
+   client restarts it and 6.2 skips the swap, reported as any skip is.
 
-   A skip at 2 or 4 deletes what was staged, still freezes the seed (5.6), and skips the swap.
+   A skip at 2 or 4 deletes what was staged, still freezes the seed (5.6), and skips the swap. A busy seal at 5.6 keeps
+   the previous seed and still swaps.
 
 6. **Adopt the build volume.** Still under the lock:
    1. take, without waiting, stock Nx's open lock of each of the target's task databases (the database's path with the
@@ -934,6 +945,12 @@ The decisions this spec records, in the order they were taken. It is kept so the
   an unfinished create/fork is the ownership proof; otherwise the last checkout link triggers release with grace then
   force, naming the initial holders and every collection deferral. Seeds are never mounted or named: their image mtime
   is the seed-freshness clock.
+- 2026-10-11: a land into a consumer repository's main skipped its adoption because the global CodeGraph MCP server
+  (1.6.0, which never released a project it had opened for an explicit `projectPath`) held the landing volume's
+  `codegraph/codegraph.db` open, so the seed's seal was refused, and that refusal skipped the swap. The seal fences only
+  the seed's captured bytes, so a busy seal now keeps the previous seed and the land still adopts; the next fork's
+  reseed refreezes the seed once the holder lets go. CodeGraph 1.6.2 releases an idle project after 10 minutes
+  (`CODEGRAPH_PROJECT_IDLE_TIMEOUT_MS`), which bounds how long a reseed can be refused.
 
 ## Open questions
 

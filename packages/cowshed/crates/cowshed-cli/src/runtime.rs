@@ -3066,10 +3066,17 @@ fn rebase_build_volume_line(build: &RebaseBuildVolume) -> String {
 /// What the land did with build volumes, one stderr line each (16_build_volumes.md, Land steps
 /// 4–7); the same value the JSON report and the controller's `LandAdoption` record carry.
 fn land_build_volume_lines(build: &cowshed_core::api::dto::LandBuildVolume) -> Vec<String> {
-    use cowshed_core::api::dto::Adoption;
+    use cowshed_core::api::dto::{Adoption, LandSeed};
     let mut lines = Vec::new();
-    if build.seeded {
-        lines.push("build volume the target's seed is frozen from the landed volume".to_owned());
+    match &build.seed {
+        LandSeed::Unchanged => {}
+        LandSeed::Frozen => {
+            lines
+                .push("build volume the target's seed is frozen from the landed volume".to_owned());
+        }
+        LandSeed::SealBusy { reason } => lines.push(format!(
+            "build volume: the target keeps its previous seed, because the landed volume could not be sealed for capture: {reason}; the next fork's reseed refreezes it once that holder lets go"
+        )),
     }
     match &build.adoption {
         Adoption::Skipped { reason } => {

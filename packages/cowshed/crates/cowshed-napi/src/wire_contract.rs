@@ -604,7 +604,7 @@ fn reports() -> BTreeMap<&'static str, BTreeMap<&'static str, Value>> {
         target_was_checked_out: false,
         retired: false,
         build_volume: cowshed_core::api::dto::LandBuildVolume {
-            seeded: false,
+            seed: cowshed_core::api::dto::LandSeed::Unchanged,
             adoption: cowshed_core::api::dto::Adoption::Skipped {
                 reason: cowshed_core::api::dto::AdoptionSkip::NoLandingVolume,
             },
@@ -615,7 +615,9 @@ fn reports() -> BTreeMap<&'static str, BTreeMap<&'static str, Value>> {
         target_was_checked_out: true,
         retired: true,
         build_volume: cowshed_core::api::dto::LandBuildVolume {
-            seeded: true,
+            seed: cowshed_core::api::dto::LandSeed::SealBusy {
+                reason: "/private/cowshed/store/widget/build/0123.dmg must be detached to be cloned, and its volume is in use by pid 5940 (codegraph serve --mcp); nothing was forced".to_owned(),
+            },
             adoption: cowshed_core::api::dto::Adoption::Adopted {
                 elapsed_ms: 3,
                 carried: cowshed_core::api::dto::NxCarry {
@@ -653,7 +655,7 @@ fn reports() -> BTreeMap<&'static str, BTreeMap<&'static str, Value>> {
     };
     let land_held = LandReport {
         build_volume: cowshed_core::api::dto::LandBuildVolume {
-            seeded: true,
+            seed: cowshed_core::api::dto::LandSeed::Frozen,
             adoption: cowshed_core::api::dto::Adoption::Skipped {
                 reason: cowshed_core::api::dto::AdoptionSkip::TargetHeld {
                     database: PathBuf::from("/Users/fixture/Dev/widget/.nx/workspace-data/A-v3.db"),
@@ -668,7 +670,7 @@ fn reports() -> BTreeMap<&'static str, BTreeMap<&'static str, Value>> {
     };
     let land_opening = LandReport {
         build_volume: cowshed_core::api::dto::LandBuildVolume {
-            seeded: true,
+            seed: cowshed_core::api::dto::LandSeed::Frozen,
             adoption: cowshed_core::api::dto::Adoption::Skipped {
                 reason: cowshed_core::api::dto::AdoptionSkip::TargetOpening {
                     database: PathBuf::from("/Users/fixture/Dev/widget/.nx/workspace-data/A-v3.db"),
@@ -683,7 +685,7 @@ fn reports() -> BTreeMap<&'static str, BTreeMap<&'static str, Value>> {
     };
     let land_building = LandReport {
         build_volume: cowshed_core::api::dto::LandBuildVolume {
-            seeded: false,
+            seed: cowshed_core::api::dto::LandSeed::Unchanged,
             adoption: cowshed_core::api::dto::Adoption::Skipped {
                 reason: cowshed_core::api::dto::AdoptionSkip::LandingBuilding {
                     lock: PathBuf::from("/Users/fixture/Dev/widget/target/guard/.cargo-lock"),

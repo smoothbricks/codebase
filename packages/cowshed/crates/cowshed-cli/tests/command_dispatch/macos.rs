@@ -7,8 +7,8 @@ use cowshed_core::apfs::{
 };
 use cowshed_core::api::JsonEnvelope;
 use cowshed_core::api::dto::{
-    Adoption, AdoptionSkip, CarrySide, DatabaseHolder, GcReport, LandReport, RebaseBuildVolume,
-    RebaseCarrySkip, RebaseReport, Reseed, ReseedResult,
+    Adoption, AdoptionSkip, CarrySide, DatabaseHolder, GcReport, LandReport, LandSeed,
+    RebaseBuildVolume, RebaseCarrySkip, RebaseReport, Reseed, ReseedResult,
 };
 use cowshed_core::attach_budget;
 use cowshed_core::build_volume::{
@@ -1817,7 +1817,7 @@ async fn real_apfs_a_fork_of_a_warm_target_is_all_fresh_and_all_hits_substrate_l
         "w1 forks main's empty first seed, so it builds every unit: {cold:?}"
     );
     let report = land(&mut service, "w1", true, &[&nx_check, CARGO_BUILD]).await;
-    assert!(report.build_volume.seeded, "{report:?}");
+    assert_eq!(report.build_volume.seed, LandSeed::Frozen, "{report:?}");
     assert!(report.build_volume.adoption.is_adopted(), "{report:?}");
 
     let w2 = new_workspace(&mut service, "w2").await;
@@ -1943,7 +1943,7 @@ async fn real_apfs_a_land_adopts_freezes_the_seed_releases_the_old_volume_and_re
     .await;
 
     assert!(report.retired, "{report:?}");
-    assert!(report.build_volume.seeded, "{report:?}");
+    assert_eq!(report.build_volume.seed, LandSeed::Frozen, "{report:?}");
     match &report.build_volume.adoption {
         Adoption::Adopted { check, .. } => {
             assert_eq!(check.hits, 2, "a:build and a:test hit in main: {report:?}");
@@ -2557,8 +2557,9 @@ async fn real_apfs_a_foreign_database_opener_skips_adoption_with_its_pid_and_arg
     }
     let lockf = i32::try_from(opening.0.id()).expect("a pid fits i32");
     let report = land(&mut service, "topic", false, &[&nx_check]).await;
-    assert!(
-        report.build_volume.seeded,
+    assert_eq!(
+        report.build_volume.seed,
+        LandSeed::Frozen,
         "a skipped swap still freezes its seed: {report:?}"
     );
     match report.build_volume.adoption {
@@ -2622,8 +2623,9 @@ async fn real_apfs_a_foreign_database_holder_skips_adoption_with_its_pid_and_arg
     })
     .await;
     let report = land(&mut service, "topic", true, &[&nx_check]).await;
-    assert!(
-        report.build_volume.seeded,
+    assert_eq!(
+        report.build_volume.seed,
+        LandSeed::Frozen,
         "forks still start from the new seed: {report:?}"
     );
     match report.build_volume.adoption {
@@ -2650,6 +2652,99 @@ async fn real_apfs_a_foreign_database_holder_skips_adoption_with_its_pid_and_arg
     }
     assert_eq!(linked_volume(&layout, &fixture.checkout), before);
     drop(holder);
+    service.shutdown().await.expect("stop the runtime");
+    fixture.stop_gateway().await;
+}
+
+/// A host process outside every cowshed and Nx protocol holding a file of the landing volume open
+/// (as an indexer's MCP server holds its SQLite index) refuses the seal, so main keeps its
+/// previous seed; the swap still runs, the re-run check hits on the adopted volume, and once the
+/// holder lets go `cowshed reseed main` refreezes the seed from it (16_build_volumes.md, Land
+/// step 5.6).
+#[tokio::test]
+async fn real_apfs_a_landing_volume_holder_keeps_the_previous_seed_and_the_land_still_adopts() {
+    let (nx, node) = repository_nx();
+    let mut fixture = Fixture::with(Project::Build {
+        nx: Some((&nx, &node)),
+        rust: None,
+    });
+    let nx_reads = nx_read_paths(&fixture_nx(&fixture.checkout));
+    let mut service = serve_project(&mut fixture, &nx_reads).await;
+    let layout = build_volumes(&fixture);
+    let nx_check = nx_run_many(&node);
+    let topic = new_workspace(&mut service, "topic").await;
+    fs::write(topic.join("a/src.txt"), b"src, changed\n").unwrap();
+    git(&topic, &["commit", "-q", "-am", "change a"]);
+    let landed_tree = git_stdout(&topic, &["rev-parse", "HEAD^{tree}"]);
+    // The fork reseeded main first (Fork step 2): that seed is the one the land must keep.
+    let [(previous_seed, _)] = seeds_of_main(&layout)
+        .try_into()
+        .expect("main has one seed");
+    let landing = linked_volume(&layout, &topic);
+    let index = link::linked(&topic)
+        .expect("read the build link")
+        .expect("topic links its build volume")
+        .join("codegraph.db");
+    fs::write(&index, b"an index nothing in the land knows\n").unwrap();
+    let holder = Holder(
+        Command::new("/usr/bin/tail")
+            .arg("-f")
+            .arg(&index)
+            .stdout(Stdio::null())
+            .spawn()
+            .expect("spawn an index holder"),
+    );
+    let pid = i32::try_from(holder.0.id()).expect("a pid fits i32");
+    eventually("tail holds the landing volume's index open", || {
+        nx::holders(&index)
+            .expect("query the index's holders")
+            .iter()
+            .any(|holder| holder.pid == pid)
+    })
+    .await;
+
+    let report = land(&mut service, "topic", true, &[&nx_check]).await;
+    let LandSeed::SealBusy { reason } = &report.build_volume.seed else {
+        panic!("the holder refuses the seal, which keeps main's seed: {report:?}");
+    };
+    assert!(reason.contains(&format!("pid {pid}")), "{reason}");
+    match &report.build_volume.adoption {
+        Adoption::Adopted { check, .. } => {
+            assert_eq!(check.hits, 2, "a:build and a:test hit in main: {report:?}");
+            assert_eq!(check.misses, [], "{report:?}");
+            assert_eq!(check.failed, [], "{report:?}");
+        }
+        Adoption::Skipped { reason } => panic!("a busy seal skipped the adoption: {reason:?}"),
+    }
+    assert_eq!(linked_volume(&layout, &fixture.checkout), landing);
+    let [(kept, _)] = seeds_of_main(&layout)
+        .try_into()
+        .expect("main keeps exactly one seed");
+    assert_eq!(
+        kept, previous_seed,
+        "a busy seal keeps main's previous seed"
+    );
+    assert!(
+        fs::read(&index).is_ok_and(|bytes| bytes == b"an index nothing in the land knows\n"),
+        "main's adopted volume carries the index the holder kept open"
+    );
+
+    drop(holder);
+    let (stdout, stderr) = succeed(&mut service, ["--json", "reseed", "main"]).await;
+    let envelope: JsonEnvelope<ReseedResult> = serde_json::from_slice(&stdout)
+        .unwrap_or_else(|error| panic!("reseed --json ({error}): {stderr}"));
+    let reseeded = envelope.result().cloned().expect("a reseed result");
+    assert!(
+        matches!(reseeded.outcome, Reseed::Reseeded { .. }),
+        "{reseeded:?}"
+    );
+    let [(seed, record)] = seeds_of_main(&layout).try_into().expect("one seed of main");
+    assert_ne!(seed, previous_seed, "the reseed replaced the kept seed");
+    assert_eq!(
+        record.tree.as_ref().map(|tree| tree.as_str()),
+        Some(landed_tree.as_str()),
+        "the reseed records the tree main adopted"
+    );
     service.shutdown().await.expect("stop the runtime");
     fixture.stop_gateway().await;
 }

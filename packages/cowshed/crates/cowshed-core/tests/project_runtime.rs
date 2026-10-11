@@ -1178,7 +1178,7 @@ impl ProjectRuntimeHost for FakeHost {
             target_was_checked_out: true,
             retired: false,
             build_volume: cowshed_core::api::dto::LandBuildVolume {
-                seeded: false,
+                seed: cowshed_core::api::dto::LandSeed::Unchanged,
                 adoption: cowshed_core::api::dto::Adoption::Skipped {
                     reason: cowshed_core::api::dto::AdoptionSkip::NoLandingVolume,
                 },

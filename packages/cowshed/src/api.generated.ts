@@ -1085,9 +1085,9 @@ export type LandAdoptionCommitment = {
  */
 export type LandBuildVolume = {
   /**
-   * Whether the target's seed was frozen from the landing volume (step 5).
+   * What step 5.6 did with the target's seed.
    */
-  readonly seeded: boolean;
+  readonly seed: LandSeed;
   readonly adoption: Adoption;
 };
 
@@ -1122,6 +1122,16 @@ export type LandRequest = {
   readonly into?: WorkspaceTarget;
   readonly options: LandOptions;
 };
+
+/**
+ * The target's seed after a land (16_build_volumes.md, Land step 5.6).
+ */
+export type LandSeed =
+  | { readonly kind: 'unchanged' }
+  | { readonly kind: 'frozen' }
+  | ({ readonly kind: 'sealBusy' } & {
+      readonly reason: string;
+    });
 
 /**
  * Where a workspace's commits stand relative to the branch that outlives it.

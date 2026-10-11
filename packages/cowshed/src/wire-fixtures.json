@@ -1109,7 +1109,9 @@
             "kind": "targetHeld"
           }
         },
-        "seeded": true
+        "seed": {
+          "kind": "frozen"
+        }
       },
       "landedHead": "1111111111111111111111111111111111111111",
       "retired": false,
@@ -1131,7 +1133,9 @@
             "kind": "targetOpening"
           }
         },
-        "seeded": true
+        "seed": {
+          "kind": "frozen"
+        }
       },
       "landedHead": "1111111111111111111111111111111111111111",
       "retired": false,
@@ -1146,7 +1150,9 @@
             "kind": "noLandingVolume"
           }
         },
-        "seeded": false
+        "seed": {
+          "kind": "unchanged"
+        }
       },
       "landedHead": "1111111111111111111111111111111111111111",
       "retired": false,
@@ -1168,7 +1174,9 @@
             "lock": "/Users/fixture/Dev/widget/target/guard/.cargo-lock"
           }
         },
-        "seeded": false
+        "seed": {
+          "kind": "unchanged"
+        }
       },
       "landedHead": "1111111111111111111111111111111111111111",
       "retired": false,
@@ -1216,7 +1224,10 @@
           "elapsedMs": 3,
           "kind": "adopted"
         },
-        "seeded": true
+        "seed": {
+          "kind": "sealBusy",
+          "reason": "/private/cowshed/store/widget/build/0123.dmg must be detached to be cloned, and its volume is in use by pid 5940 (codegraph serve --mcp); nothing was forced"
+        }
       },
       "landedHead": "1111111111111111111111111111111111111111",
       "previousTargetHead": "2222222222222222222222222222222222222222",
