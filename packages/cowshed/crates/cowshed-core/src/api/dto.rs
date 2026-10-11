@@ -3043,9 +3043,15 @@ pub struct RebaseReport {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
 pub enum RebaseBuildVolume {
-    /// The workspace's volume indexes every entry the target's held and it lacked, up to
-    /// `carried.stopped`.
-    Carried { carried: NxCarry },
+    /// The workspace's volume indexes every entry the target's held and it lacked among those the
+    /// rebased tree looks up, up to `carried.stopped`.
+    Carried {
+        carried: NxCarry,
+        /// How many of `carried.entries` were selected by deferred task: the latest entry of a
+        /// task Nx hashes only after its dependencies ran. The others were selected by their
+        /// current hash (16_build_volumes.md, "Rebase carry").
+        deferred: u64,
+    },
     /// Nothing was carried, and nothing was left staged.
     Skipped { reason: RebaseCarrySkip },
 }

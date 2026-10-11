@@ -888,38 +888,74 @@ pub fn task_inputs(
     .collect())
 }
 
-/// The program that names the cache keys the tree at an Nx root looks up: `node - <root>` with
-/// this on stdin, run as a job of the workspace (`task_hashes.js` says how it hashes).
+/// The program that names what the tree at an Nx root looks up: `node - <root>` with this on
+/// stdin, run as a job of the workspace (`task_hashes.js` says how it hashes).
 pub const TASK_HASHES_SCRIPT: &str = include_str!("task_hashes.js");
 
-/// What [`TASK_HASHES_SCRIPT`] prints.
-#[derive(Deserialize)]
+/// One Nx task as its `task_details` rows name it: a `configuration` of `None` is the row's
+/// `NULL`, a task run without one.
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
 #[serde(deny_unknown_fields)]
-struct TaskHashesWire {
-    hashes: Vec<String>,
+pub struct TaskIdentity {
+    pub project: String,
+    pub target: String,
+    /// Required on the wire, `null` included: an absent key is a malformed answer, not a task
+    /// without a configuration.
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub configuration: Option<String>,
 }
 
-/// The task hashes [`TASK_HASHES_SCRIPT`] printed. Nx names a cache entry by a decimal hash, the
-/// only name the carry joins to a path; anything else is an error naming what was read.
-pub fn task_hashes(stdout: &[u8]) -> Result<std::collections::BTreeSet<String>, String> {
-    let wire: TaskHashesWire = serde_json::from_slice(stdout).map_err(|error| {
+/// What the tree at one Nx root looks up (16_build_volumes.md, "Rebase carry"): the hashes of
+/// the tasks stock Nx hashes before any task runs, and the identities of those it defers until
+/// their dependencies have run, whose hashes cover dependency outputs a rebased checkout holds
+/// stale.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct TaskSelection {
+    pub hashes: std::collections::BTreeSet<String>,
+    pub deferred: std::collections::BTreeSet<TaskIdentity>,
+}
+
+impl TaskSelection {
+    /// How many cache rows the selection can name at most: one per hash, one per deferred task.
+    pub fn len(&self) -> usize {
+        self.hashes.len() + self.deferred.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.hashes.is_empty() && self.deferred.is_empty()
+    }
+}
+
+/// The selection [`TASK_HASHES_SCRIPT`] printed. Nx names a cache entry by a decimal hash, the
+/// only name the carry joins to a path, and every task by a non-empty project and target;
+/// anything else is an error naming what was read.
+pub fn task_selection(stdout: &[u8]) -> Result<TaskSelection, String> {
+    let selection: TaskSelection = serde_json::from_slice(stdout).map_err(|error| {
         format!(
-            "the task hash probe printed no hashes ({error}): {}",
+            "the task hash probe printed no selection ({error}): {}",
             String::from_utf8_lossy(&stdout[..stdout.len().min(512)])
         )
     })?;
-    wire.hashes
-        .into_iter()
-        .map(|hash| {
-            if !hash.is_empty() && hash.bytes().all(|byte| byte.is_ascii_digit()) {
-                Ok(hash)
-            } else {
-                Err(format!(
-                    "the task hash probe printed {hash:?}, not an Nx hash"
-                ))
-            }
-        })
-        .collect()
+    if let Some(hash) = selection
+        .hashes
+        .iter()
+        .find(|hash| hash.is_empty() || !hash.bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        return Err(format!(
+            "the task hash probe printed {hash:?}, not an Nx hash"
+        ));
+    }
+    if let Some(task) = selection
+        .deferred
+        .iter()
+        .find(|task| task.project.is_empty() || task.target.is_empty())
+    {
+        return Err(format!(
+            "the task hash probe printed {task:?}, not an Nx task"
+        ));
+    }
+    Ok(selection)
 }
 
 /// Milliseconds since the epoch of `YYYY-MM-DDTHH:MM:SS.mmmZ`, as JavaScript's
@@ -1129,25 +1165,57 @@ mod tests {
         );
     }
 
-    /// The probe's hashes are the only names the carry selects by, so only Nx's decimal hashes
-    /// pass, and an answer of any other shape selects nothing.
+    /// The probe's hashes and deferred tasks are the only names the carry selects by, so only
+    /// Nx's decimal hashes and whole task identities pass, and an answer of any other shape
+    /// selects nothing.
     #[test]
-    fn task_hashes_admit_only_nx_decimal_hashes() {
+    fn task_selection_admits_only_nx_hashes_and_task_identities() {
         assert_eq!(
-            task_hashes(br#"{"hashes":["17526140994862843286","42"]}"#).unwrap(),
-            std::collections::BTreeSet::from(["17526140994862843286".to_owned(), "42".to_owned()])
+            task_selection(
+                br#"{"hashes":["17526140994862843286","42"],"deferred":[
+                    {"project":"a","target":"test","configuration":null},
+                    {"project":"a","target":"test","configuration":"ci"}]}"#
+            )
+            .unwrap(),
+            TaskSelection {
+                hashes: std::collections::BTreeSet::from([
+                    "17526140994862843286".to_owned(),
+                    "42".to_owned()
+                ]),
+                deferred: std::collections::BTreeSet::from([
+                    TaskIdentity {
+                        project: "a".to_owned(),
+                        target: "test".to_owned(),
+                        configuration: None,
+                    },
+                    TaskIdentity {
+                        project: "a".to_owned(),
+                        target: "test".to_owned(),
+                        configuration: Some("ci".to_owned()),
+                    },
+                ]),
+            }
         );
-        assert!(task_hashes(br#"{"hashes":[]}"#).unwrap().is_empty());
+        assert!(
+            task_selection(br#"{"hashes":[],"deferred":[]}"#)
+                .unwrap()
+                .is_empty()
+        );
         for refused in [
-            &br#"{"hashes":["../x"]}"#[..],
-            br#"{"hashes":[""]}"#,
-            br#"{"hashes":[42]}"#,
-            br#"{"hashes":[],"extra":1}"#,
+            &br#"{"hashes":["../x"],"deferred":[]}"#[..],
+            br#"{"hashes":[""],"deferred":[]}"#,
+            br#"{"hashes":[42],"deferred":[]}"#,
+            br#"{"hashes":[],"deferred":[],"extra":1}"#,
+            br#"{"hashes":[]}"#,
+            br#"{"hashes":[],"deferred":[{"project":"a","target":"test"}]}"#,
+            br#"{"hashes":[],"deferred":[{"project":"","target":"test","configuration":null}]}"#,
+            br#"{"hashes":[],"deferred":[{"project":"a","target":"","configuration":null}]}"#,
+            br#"{"hashes":[],"deferred":[{"project":"a","target":"t","configuration":null,"x":1}]}"#,
             b"{}",
             b"",
         ] {
             assert!(
-                task_hashes(refused).is_err(),
+                task_selection(refused).is_err(),
                 "{}",
                 String::from_utf8_lossy(refused)
             );

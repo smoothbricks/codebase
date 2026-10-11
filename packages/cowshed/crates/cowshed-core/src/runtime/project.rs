@@ -13760,10 +13760,11 @@ async fn read_job_stdout(
 
 /// Rebase carry's selection (16_build_volumes.md, "Rebase carry"): for each Nx state the build
 /// volume of `workspace` (mounted at `mount`) holds, keyed by its `.nx` relative to the checkout,
-/// the task hashes stock Nx computes for the tree now checked out at that state's root
-/// ([`crate::build_volume::nx::TASK_HASHES_SCRIPT`], run there as a job of the workspace). A root
-/// whose hashes cannot be computed is the carry's skip, naming it: no root is ever given a
-/// selection it did not compute, so the carry never copies an entry the tree will not look up.
+/// the task hashes stock Nx computes up front for the tree now checked out at that state's root
+/// and the tasks it defers ([`crate::build_volume::nx::TASK_HASHES_SCRIPT`], run there as a job
+/// of the workspace). A root whose selection cannot be computed is the carry's skip, naming it:
+/// no root is ever given a selection it did not compute, so the carry never copies an entry the
+/// tree will not look up.
 #[cfg(target_os = "macos")]
 async fn rebased_task_hashes(
     handle: &crate::runtime::supervisor::WorkspaceSupervisorHandle,
@@ -13771,7 +13772,7 @@ async fn rebased_task_hashes(
     mount: &Path,
 ) -> Result<
     std::result::Result<
-        std::collections::BTreeMap<PathBuf, std::collections::BTreeSet<String>>,
+        std::collections::BTreeMap<PathBuf, crate::build_volume::nx::TaskSelection>,
         crate::api::dto::RebaseCarrySkip,
     >,
 > {
@@ -13817,10 +13818,10 @@ async fn rebased_task_hashes(
             stderr_copy: None,
             admission_key: None,
         };
-        let hashes = probe_task_hashes(handle, build_volume.clone(), request).await;
-        match hashes {
-            Ok(hashes) => {
-                selections.insert(state.to_owned(), hashes);
+        let selection = probe_task_hashes(handle, build_volume.clone(), request).await;
+        match selection {
+            Ok(selection) => {
+                selections.insert(state.to_owned(), selection);
             }
             Err(reason) => {
                 return Ok(Err(crate::api::dto::RebaseCarrySkip::TaskHashes {
@@ -13833,15 +13834,15 @@ async fn rebased_task_hashes(
     Ok(Ok(selections))
 }
 
-/// One root's [`crate::build_volume::nx::TASK_HASHES_SCRIPT`] job: its hashes, or why there are
-/// none. A job that could not start or be waited on is that root's failure too, with the
+/// One root's [`crate::build_volume::nx::TASK_HASHES_SCRIPT`] job: its selection, or why there
+/// is none. A job that could not start or be waited on is that root's failure too, with the
 /// supervisor's diagnosis: the rebase has happened, and only the carry is skipped.
 #[cfg(target_os = "macos")]
 async fn probe_task_hashes(
     handle: &crate::runtime::supervisor::WorkspaceSupervisorHandle,
     build_volume: Option<PathBuf>,
     request: ExecRequest,
-) -> std::result::Result<std::collections::BTreeSet<String>, String> {
+) -> std::result::Result<crate::build_volume::nx::TaskSelection, String> {
     let job = handle
         .exec(None, build_volume, request)
         .await
@@ -13853,7 +13854,7 @@ async fn probe_task_hashes(
     match (&info.exit, read_job_stdout(handle, job).await) {
         (_, Err(error)) => Err(format!("cannot read the probe's output {error}")),
         (Some(crate::api::dto::ExitStatus::Exited { code: 0 }), Ok(stdout)) => {
-            crate::build_volume::nx::task_hashes(&stdout)
+            crate::build_volume::nx::task_selection(&stdout)
         }
         (exit, Ok(_)) => Err(format!(
             "the probe ended {exit:?}: {}",

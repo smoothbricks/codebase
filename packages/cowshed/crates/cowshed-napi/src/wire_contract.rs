@@ -717,6 +717,7 @@ fn reports() -> BTreeMap<&'static str, BTreeMap<&'static str, Value>> {
                 elapsed_ms: 40,
                 stopped: None,
             },
+            deferred: 8,
         },
     };
     let rebase_skipped = |reason| RebaseReport {

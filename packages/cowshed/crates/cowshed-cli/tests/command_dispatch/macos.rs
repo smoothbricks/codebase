@@ -2294,11 +2294,15 @@ async fn real_apfs_a_rebase_carries_mains_nx_entries_into_the_rebased_workspace_
     let rebased = rebase(&mut service, "b").await;
     assert_eq!(rebased.oid.as_str(), git_stdout(&b, &["rev-parse", "HEAD"]));
     match &rebased.build_volume {
-        RebaseBuildVolume::Carried { carried } => {
+        RebaseBuildVolume::Carried { carried, deferred } => {
             assert_eq!(carried.stopped, None, "{rebased:?}");
             assert_eq!(
                 carried.entries, 2,
                 "a:build and a:test at the landed tree, and neither entry of the original: {rebased:?}"
+            );
+            assert_eq!(
+                *deferred, 0,
+                "neither task hashes another's outputs: {rebased:?}"
             );
         }
         RebaseBuildVolume::Skipped { reason } => panic!("the carry was skipped: {reason}"),
@@ -2361,6 +2365,105 @@ async fn real_apfs_a_rebase_carries_mains_nx_entries_into_the_rebased_workspace_
         }
         build_volume => panic!("a held database skips the carry: {build_volume:?}"),
     }
+}
+
+/// A task that hashes its dependency's outputs is carried by task (16_build_volumes.md, "Rebase
+/// carry"): stock Nx hashes `a:test`, whose inputs name `dependentTasksOutputFiles`, only once
+/// `a:build` has written or restored `a/generated.txt`, and `b`'s copy of that file is stale. `b`
+/// runs the check at the original tree, so its `a/generated.txt` says what the original
+/// `a/src.txt` built; `a` changes `a/src.txt` and lands; `b` rebases. A hash of `a:test` from the
+/// file on disk would be a key no run looks up, so the carry takes main's latest `a:test` entry by
+/// task instead, and `b`'s run of the landed check hits both tasks.
+#[tokio::test]
+async fn real_apfs_a_rebase_carries_a_task_that_hashes_its_dependencys_stale_outputs() {
+    let (nx, node) = repository_nx();
+    let mut fixture = Fixture::with(Project::Build {
+        nx: Some((&nx, &node)),
+        rust: None,
+    });
+    let node_path = node.display().to_string();
+    let project = serde_json::json!({
+        "name": "a",
+        "targets": {
+            "build": {
+                "executor": "nx:run-commands",
+                "cache": true,
+                "inputs": ["{projectRoot}/src.txt"],
+                "outputs": ["{projectRoot}/generated.txt"],
+                "options": {
+                    "command": format!(
+                        "{node_path} -e \"const fs = require('fs'); fs.writeFileSync('a/generated.txt', 'built from ' + fs.readFileSync('a/src.txt'))\""
+                    ),
+                },
+            },
+            "test": {
+                "executor": "nx:run-commands",
+                "cache": true,
+                "inputs": ["default", {"dependentTasksOutputFiles": "**/*.txt"}],
+                "dependsOn": ["build"],
+                "outputs": [],
+                "options": {
+                    "command": format!(
+                        "{node_path} -e \"require('fs').readFileSync('a/generated.txt')\""
+                    ),
+                },
+            },
+        },
+    });
+    fs::write(
+        fixture.checkout.join("a/project.json"),
+        serde_json::to_vec_pretty(&project).unwrap(),
+    )
+    .unwrap();
+    git(
+        &fixture.checkout,
+        &["commit", "-q", "-am", "a:test hashes a:build's outputs"],
+    );
+    let nx_reads = nx_read_paths(&fixture_nx(&fixture.checkout));
+    let mut service = serve_project(&mut fixture, &nx_reads).await;
+    let nx_check = nx_run_many(&node);
+
+    let b = new_workspace(&mut service, "b").await;
+    fs::write(b.join("unrelated.txt"), b"nothing a hashes\n").unwrap();
+    git(&b, &["add", "unrelated.txt"]);
+    git(&b, &["commit", "-q", "-m", "add an unrelated file"]);
+    sh(&mut service, "b", &nx_check).await;
+
+    let a = new_workspace(&mut service, "a").await;
+    fs::write(a.join("a/src.txt"), b"src, landed by a\n").unwrap();
+    git(&a, &["commit", "-q", "-am", "change a"]);
+    let report = land(&mut service, "a", true, &[&nx_check]).await;
+    assert!(report.build_volume.adoption.is_adopted(), "{report:?}");
+
+    let rebased = rebase(&mut service, "b").await;
+    let stale = fs::read(b.join("a/generated.txt")).expect("b's own build output");
+    let hits = nx_statuses(&mut service, "b", &b, &nx_check).await;
+    let built = fs::read(b.join("a/generated.txt")).expect("the restored build output");
+    service.shutdown().await.expect("stop the runtime");
+    fixture.stop_gateway().await;
+
+    assert_eq!(
+        stale, b"built from src\n",
+        "b's output on disk is the original tree's"
+    );
+    assert_eq!(built, b"built from src, landed by a\n");
+    match &rebased.build_volume {
+        RebaseBuildVolume::Carried { carried, deferred } => {
+            assert_eq!(carried.stopped, None, "{rebased:?}");
+            assert_eq!(
+                (carried.entries, *deferred),
+                (2, 1),
+                "a:build by its hash, a:test by task: {rebased:?}"
+            );
+        }
+        RebaseBuildVolume::Skipped { reason } => panic!("the carry was skipped: {reason}"),
+    }
+    assert_eq!(hits.len(), 2, "{hits:?}");
+    assert!(
+        hits.iter()
+            .all(|(_, status)| *status == nx::CacheStatus::LocalHit),
+        "b hits a:test though its own a/generated.txt was stale when it rebased: {hits:?}"
+    );
 }
 
 /// `cowshed rebase --json <workspace>`; answers the report the CLI printed.

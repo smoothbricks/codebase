@@ -3047,10 +3047,11 @@ fn rebase_build_volume_line(build: &RebaseBuildVolume) -> String {
         RebaseBuildVolume::Skipped { reason } => {
             format!("build volume: carried nothing of the target's Nx cache: {reason}")
         }
-        RebaseBuildVolume::Carried { carried } => format!(
-            "build volume: carried {} Nx cache entr{} ({} bytes) the target held into the rebased workspace in {} ms{}",
+        RebaseBuildVolume::Carried { carried, deferred } => format!(
+            "build volume: carried {} Nx cache entr{} ({} by hash, {deferred} by deferred task; {} bytes) the target held into the rebased workspace in {} ms{}",
             carried.entries,
             if carried.entries == 1 { "y" } else { "ies" },
+            carried.entries - deferred,
             carried.bytes,
             carried.elapsed_ms,
             carried

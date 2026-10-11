@@ -864,17 +864,17 @@ impl BuildVolumes {
     /// Rebase carry (16_build_volumes.md, "Rebase carry"): index in the volume `checkout` links
     /// the Nx cache entries the target's volume indexes and it lacks, among those `selections`
     /// names: for each Nx state of the workspace's volume (its `.nx`, relative to the checkout),
-    /// the task hashes stock Nx computed for the rebased tree there. A selection that could not
-    /// be computed is the skip it carries, after the volume skips. The copies are staged while
-    /// both sides run. Then each side's Nx state is closed as a land closes the target's (its
-    /// idle daemon stopped, any other holder a skip), and the commit runs under both sides' Nx
-    /// open locks once neither database has a holder, so nothing but the carry writes either
-    /// while it indexes. A skip deletes what was staged.
+    /// the task hashes stock Nx computed for the rebased tree there and the tasks it defers. A
+    /// selection that could not be computed is the skip it carries, after the volume skips. The
+    /// copies are staged while both sides run. Then each side's Nx state is closed as a land
+    /// closes the target's (its idle daemon stopped, any other holder a skip), and the commit
+    /// runs under both sides' Nx open locks once neither database has a holder, so nothing but
+    /// the carry writes either while it indexes. A skip deletes what was staged.
     pub async fn rebase_carry(
         &self,
         checkout: PathBuf,
         target_checkout: PathBuf,
-        selections: std::result::Result<BTreeMap<PathBuf, BTreeSet<String>>, RebaseCarrySkip>,
+        selections: std::result::Result<BTreeMap<PathBuf, nx::TaskSelection>, RebaseCarrySkip>,
     ) -> Result<RebaseBuildVolume> {
         let workspace = self.layout.linked(&checkout)?;
         let target = self.layout.linked(&target_checkout)?;
@@ -922,8 +922,10 @@ impl BuildVolumes {
             let committing = Instant::now();
             let carried = carry::commit(staged, &into);
             drop(opens);
+            let deferred = carried.deferred;
             Ok(RebaseBuildVolume::Carried {
                 carried: nx_carry(carried, staged_in + committing.elapsed(), &workspace),
+                deferred,
             })
         })
         .await

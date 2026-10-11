@@ -1496,6 +1496,12 @@ export type QuotaRequest = {
 export type RebaseBuildVolume =
   | ({ readonly kind: 'carried' } & {
       readonly carried: NxCarry;
+      /**
+       * How many of `carried.entries` were selected by deferred task: the latest entry of a
+       * task Nx hashes only after its dependencies ran. The others were selected by their
+       * current hash (16_build_volumes.md, "Rebase carry").
+       */
+      readonly deferred: number & tags.Type<'uint64'>;
     })
   | ({ readonly kind: 'skipped' } & {
       readonly reason: RebaseCarrySkip;

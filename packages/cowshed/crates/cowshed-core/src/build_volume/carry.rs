@@ -9,9 +9,11 @@
 //! every other land's entries, and a fork made after the next land missed tasks main had already
 //! run at that very tree.
 //!
-//! Rebase uses [`stage_rebase`] instead: only current-tree task hashes are selected, including
-//! during commit, and one row/byte/free-space budget bounds all copies in both phases. Regular
-//! file data is copied through a length-limited reader, with `copyfile(3)` preserving metadata.
+//! Rebase uses [`stage_rebase`] instead: only what the rebased tree looks up is selected, by
+//! current task hash and, for the tasks Nx hashes only after their dependencies ran, by task
+//! (its latest entry), including during commit; one row/byte/free-space budget bounds all copies
+//! in both phases. Regular file data is copied through a length-limited reader, with
+//! `copyfile(3)` preserving metadata.
 //!
 //! Stock Nx 23.2.1 keeps an entry in three places (`native/cache/cache.rs`): the directory
 //! `<cache>/<hash>` with the task's outputs, the file `<cache>/terminalOutputs/<hash>`, and a
@@ -45,6 +47,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use super::BuildVolumeState;
+use super::nx::TaskSelection;
 use super::sqlite::Connection;
 
 /// The landing volume's staging directory for entries not yet indexed, at its root and outside
@@ -57,17 +60,37 @@ const COPYFILE_ALL: libc::copyfile_flags_t = libc::COPYFILE_METADATA | libc::COP
 
 /// The target's entries the landing volume lacks, most recently used first, so a carry that
 /// stops has carried the ones most likely to hit. Nx names an entry by a decimal hash
-/// (`^\d+$`); any other row names no directory the carry could safely join.
-const MISSING: &str = "SELECT p.hash, p.code, p.size, p.created_at FROM previous.cache_outputs p \
+/// (`^\d+$`); any other row names no directory the carry could safely join. Every row reads
+/// `hash, code, size, created_at, by task, accessed_at`, as [`SELECTED`]'s do.
+const MISSING: &str = "SELECT p.hash, p.code, p.size, p.created_at, 0, p.accessed_at \
+     FROM previous.cache_outputs p \
      WHERE p.hash <> '' AND p.hash NOT GLOB '*[^0-9]*' \
        AND NOT EXISTS (SELECT 1 FROM main.cache_outputs m WHERE m.hash = p.hash) \
      ORDER BY p.accessed_at DESC";
-// CROSS JOIN fixes the loop order: wanted hashes probe p's primary key, never scan its history.
-const SELECTED: &str = "SELECT p.hash, p.code, p.size, p.created_at FROM temp.wanted w \
-     CROSS JOIN previous.cache_outputs p \
+/// Rebase's selection (16_build_volumes.md, "Rebase carry"), both classes, most recently used
+/// first. By hash: CROSS JOIN fixes the loop order, so the wanted hashes probe `p`'s primary key
+/// and never scan its history. By task: the one entry of each deferred task with the latest use.
+/// `task_details` has no index by task and the target's database is never written, so the
+/// cache `c`, which Nx's eviction bounds, is read once, probing `d`'s primary key and the
+/// deferred tasks' index. The latest entry is ranked before the landing side is consulted: a
+/// landing database that already holds it takes nothing for that task, never an older entry.
+const SELECTED: &str = "SELECT p.hash, p.code, p.size, p.created_at, 0, p.accessed_at \
+     FROM temp.wanted w CROSS JOIN previous.cache_outputs p \
      WHERE p.hash = w.hash AND p.hash <> '' AND p.hash NOT GLOB '*[^0-9]*' \
        AND NOT EXISTS (SELECT 1 FROM main.cache_outputs m WHERE m.hash = p.hash) \
-     ORDER BY p.accessed_at DESC";
+     UNION ALL \
+     SELECT l.hash, l.code, l.size, l.created_at, 1, l.accessed_at FROM ( \
+       SELECT c.hash, c.code, c.size, c.created_at, c.accessed_at, row_number() OVER ( \
+           PARTITION BY d.project, d.target, d.configuration \
+           ORDER BY c.accessed_at DESC, c.created_at DESC, c.hash DESC) AS rank \
+       FROM previous.cache_outputs c CROSS JOIN previous.task_details d \
+         CROSS JOIN temp.deferred t \
+       WHERE d.hash = c.hash AND t.project = d.project AND t.target = d.target \
+         AND t.configuration IS d.configuration) l \
+     WHERE l.rank = 1 AND l.hash <> '' AND l.hash NOT GLOB '*[^0-9]*' \
+       AND NOT EXISTS (SELECT 1 FROM main.cache_outputs m WHERE m.hash = l.hash) \
+       AND NOT EXISTS (SELECT 1 FROM temp.wanted w WHERE w.hash = l.hash) \
+     ORDER BY 6 DESC";
 
 /// One entry's row in the target's database, as phase 1 read it.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -76,6 +99,8 @@ struct Row {
     code: i64,
     size: i64,
     created_at: String,
+    /// Selected by its deferred task's identity rather than by its hash (rebase only).
+    by_task: bool,
 }
 
 /// Phase 1's work for one pair of task databases.
@@ -106,6 +131,8 @@ pub struct Staged {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Carried {
     pub entries: u64,
+    /// How many of `entries` a rebase selected by deferred task rather than by hash.
+    pub deferred: u64,
     /// The bytes Nx recorded for the carried entries.
     pub bytes: u64,
     /// Why the carry stopped short, naming the database or entry.
@@ -134,20 +161,21 @@ pub fn stage(
     stage_with(from, from_state, into, into_state, None, Staged::default())
 }
 
-/// Rebase carry admits only hashes Nx computed for the rebased tree, across both phases.
-/// Historical entries consume no copy bandwidth or destination space. The entire carry shares
-/// one row and byte budget; missing selection information stops it, never widens it.
+/// Rebase carry admits only what Nx names for the rebased tree, across both phases: each current
+/// hash, and each deferred task's latest entry. Historical entries consume no copy bandwidth or
+/// destination space. The entire carry shares one row and byte budget; missing selection
+/// information stops it, never widens it.
 pub fn stage_rebase(
     from: &Path,
     from_state: &BuildVolumeState,
     into: &Path,
     into_state: &BuildVolumeState,
-    selections: &BTreeMap<PathBuf, BTreeSet<String>>,
+    selections: &BTreeMap<PathBuf, TaskSelection>,
     backing_store: &Path,
 ) -> Staged {
     let rows = selections
         .values()
-        .try_fold(0_usize, |sum, hashes| sum.checked_add(hashes.len()));
+        .try_fold(0_usize, |sum, selection| sum.checked_add(selection.len()));
     let budget = rows
         .ok_or_else(|| io::Error::other("rebase carry task-hash count overflow"))
         .and_then(|rows| Budget::new(into, backing_store, rows));
@@ -181,7 +209,7 @@ fn stage_with(
     from_state: &BuildVolumeState,
     into: &Path,
     into_state: &BuildVolumeState,
-    selections: Option<&BTreeMap<PathBuf, BTreeSet<String>>>,
+    selections: Option<&BTreeMap<PathBuf, TaskSelection>>,
     mut staged: Staged,
 ) -> Staged {
     let staging = into.join(STAGING);
@@ -205,12 +233,12 @@ fn stage_with(
         };
         let selected = selection(selections, source.checkout)
             .expect("each destination selection was checked before staging");
-        if matches!(selected, Selection::Only(hashes) if hashes.is_empty()) {
+        if matches!(selected, Selection::Only(selection) if selection.is_empty()) {
             continue;
         }
         let owned = match selected {
             Selection::All => OwnedSelection::All,
-            Selection::Only(hashes) => OwnedSelection::Only(Arc::new(hashes.clone())),
+            Selection::Only(selection) => OwnedSelection::Only(Arc::new(selection.clone())),
         };
         let databases = match databases_in(&from.join(source.data)) {
             Ok(databases) => databases,
@@ -278,26 +306,26 @@ fn stage_with(
 #[derive(Clone, Copy)]
 enum Selection<'a> {
     All,
-    Only(&'a BTreeSet<String>),
+    Only(&'a TaskSelection),
 }
 
 #[derive(Clone, Debug)]
 enum OwnedSelection {
     All,
-    Only(Arc<BTreeSet<String>>),
+    Only(Arc<TaskSelection>),
 }
 
 impl OwnedSelection {
     fn borrowed(&self) -> Selection<'_> {
         match self {
             Self::All => Selection::All,
-            Self::Only(hashes) => Selection::Only(hashes),
+            Self::Only(selection) => Selection::Only(selection),
         }
     }
 }
 
 fn selection<'a>(
-    selections: Option<&'a BTreeMap<PathBuf, BTreeSet<String>>>,
+    selections: Option<&'a BTreeMap<PathBuf, TaskSelection>>,
     checkout: &Path,
 ) -> io::Result<Selection<'a>> {
     match selections {
@@ -360,10 +388,11 @@ pub fn commit(mut staged: Staged, into: &Path) -> Carried {
             staged.budget.as_mut(),
         );
         match result {
-            Ok((entries, bytes, stopped)) => {
-                carried.entries += entries;
-                carried.bytes += bytes;
-                if let Some(stopped) = stopped {
+            Ok(committed) => {
+                carried.entries += committed.entries;
+                carried.deferred += committed.deferred;
+                carried.bytes += committed.bytes;
+                if let Some(stopped) = committed.stopped {
                     carried.stopped.get_or_insert(stopped);
                     break;
                 }
@@ -478,7 +507,8 @@ fn missing(
     rows(&connection, selected)
 }
 
-/// [`MISSING`]: none when the target's database has no `cache_outputs`, so indexes nothing.
+/// [`MISSING`], or [`SELECTED`] for a rebase: none when the target's database has no
+/// `cache_outputs`, so indexes nothing.
 fn rows(connection: &Connection, selected: Selection<'_>) -> io::Result<Vec<Row>> {
     let mut rows = Vec::new();
     if table_definition(connection, "previous", "cache_outputs")?.is_none() {
@@ -486,11 +516,38 @@ fn rows(connection: &Connection, selected: Selection<'_>) -> io::Result<Vec<Row>
     }
     let query = match selected {
         Selection::All => MISSING,
-        Selection::Only(hashes) => {
+        Selection::Only(selection) => {
             connection.execute("CREATE TEMP TABLE wanted (hash TEXT PRIMARY KEY)", &[])?;
             let mut insert = connection.prepare("INSERT INTO temp.wanted (hash) VALUES (?1)")?;
-            for hash in hashes {
+            for hash in &selection.hashes {
                 insert.bind(&[hash])?;
+                while insert.step()? {}
+            }
+            drop(insert);
+            connection.execute(
+                "CREATE TEMP TABLE deferred (project TEXT NOT NULL, target TEXT NOT NULL, \
+                 configuration TEXT, UNIQUE (project, target, configuration))",
+                &[],
+            )?;
+            // The binding speaks only text, so a task without a configuration is its own
+            // statement, writing the `NULL` its `task_details` rows hold.
+            let mut configured = connection.prepare(
+                "INSERT INTO temp.deferred (project, target, configuration) VALUES (?1, ?2, ?3)",
+            )?;
+            let mut unconfigured = connection.prepare(
+                "INSERT INTO temp.deferred (project, target, configuration) VALUES (?1, ?2, NULL)",
+            )?;
+            for task in &selection.deferred {
+                let insert = match &task.configuration {
+                    Some(configuration) => {
+                        configured.bind(&[&task.project, &task.target, configuration])?;
+                        &mut configured
+                    }
+                    None => {
+                        unconfigured.bind(&[&task.project, &task.target])?;
+                        &mut unconfigured
+                    }
+                };
                 while insert.step()? {}
             }
             SELECTED
@@ -503,18 +560,29 @@ fn rows(connection: &Connection, selected: Selection<'_>) -> io::Result<Vec<Row>
             code: statement.integer(1),
             size: statement.integer(2),
             created_at: statement.text(3),
+            by_task: statement.integer(4) == 1,
         });
     }
     Ok(rows)
 }
 
-/// Phase 2 for one pair of databases: answers the entries indexed and their recorded bytes.
+/// What phase 2 indexed for one pair of databases.
+struct Committed {
+    entries: u64,
+    /// How many of `entries` were selected by deferred task.
+    deferred: u64,
+    /// The bytes Nx recorded for them.
+    bytes: u64,
+    stopped: Option<String>,
+}
+
+/// Phase 2 for one pair of databases.
 fn commit_database(
     database: &StagedDatabase,
     complete: bool,
     selected: Selection<'_>,
     mut budget: Option<&mut Budget>,
-) -> io::Result<(u64, u64, Option<String>)> {
+) -> io::Result<Committed> {
     let connection = attached(&database.into_database, &database.from_database)?;
     // Rebase selection also fences entries indexed since phase 1.
     let now = rows(&connection, selected)?;
@@ -573,14 +641,20 @@ fn commit_database(
         }
         return Err(error);
     }
-    let bytes = now
-        .iter()
-        .filter(|row| placed.contains(row.hash.as_str()))
+    let placed_rows = || now.iter().filter(|row| placed.contains(row.hash.as_str()));
+    let bytes = placed_rows()
         .map(|row| u64::try_from(row.size).unwrap_or(0))
         .sum();
-    let entries = u64::try_from(placed.len())
-        .map_err(|error| io::Error::other(format!("carried entry count: {error}")))?;
-    Ok((entries, bytes, stopped))
+    let count = |count: usize| {
+        u64::try_from(count)
+            .map_err(|error| io::Error::other(format!("carried entry count: {error}")))
+    };
+    Ok(Committed {
+        entries: count(placed.len())?,
+        deferred: count(placed_rows().filter(|row| row.by_task).count())?,
+        bytes,
+        stopped,
+    })
 }
 
 /// Move staged entry `hash` from `staging` into the cache `cache`, replacing whatever stood
@@ -994,6 +1068,7 @@ fn copyfile(source: &Path, destination: &Path, flags: libc::copyfile_flags_t) ->
 
 #[cfg(test)]
 mod tests {
+    use super::super::nx::TaskIdentity;
     use super::*;
 
     /// Stock Nx 23.2.1's two tables the carry writes, as its own `CREATE` statements read.
@@ -1019,6 +1094,14 @@ mod tests {
             .unwrap();
         assert!(count.step().unwrap());
         count.integer(0)
+    }
+
+    fn task(project: &str, target: &str, configuration: Option<&str>) -> TaskIdentity {
+        TaskIdentity {
+            project: project.to_owned(),
+            target: target.to_owned(),
+            configuration: configuration.map(str::to_owned),
+        }
     }
 
     struct Fixture {
@@ -1082,10 +1165,47 @@ mod tests {
             fs::write(entry.join("output"), output).unwrap();
         }
 
-        fn selections(hashes: &[&str]) -> BTreeMap<PathBuf, BTreeSet<String>> {
+        /// An entry of `task` that Nx last used at `accessed_at` (`YYYY-MM-DD HH:MM:SS`, as
+        /// SQLite's `CURRENT_TIMESTAMP` stamps it), in the target's root Nx state.
+        fn task_entry(&self, hash: &str, task: &TaskIdentity, accessed_at: &str, output: &[u8]) {
+            let connection =
+                Connection::open(&self.from.join("nx/workspace-data/task.db")).unwrap();
+            match &task.configuration {
+                Some(configuration) => connection.execute(
+                    "INSERT INTO task_details VALUES (?1, ?2, ?3, ?4)",
+                    &[hash, &task.project, &task.target, configuration],
+                ),
+                None => connection.execute(
+                    "INSERT INTO task_details VALUES (?1, ?2, ?3, NULL)",
+                    &[hash, &task.project, &task.target],
+                ),
+            }
+            .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO cache_outputs (hash, code, size, accessed_at) VALUES (?1, 0, ?2, ?3)",
+                    &[hash, &output.len().to_string(), accessed_at],
+                )
+                .unwrap();
+            let entry = self.from.join("nx/cache").join(hash);
+            fs::create_dir_all(&entry).unwrap();
+            fs::write(entry.join("output"), output).unwrap();
+        }
+
+        fn selections(hashes: &[&str]) -> BTreeMap<PathBuf, TaskSelection> {
+            Self::selecting(hashes, &[])
+        }
+
+        fn selecting(
+            hashes: &[&str],
+            deferred: &[TaskIdentity],
+        ) -> BTreeMap<PathBuf, TaskSelection> {
             BTreeMap::from([(
                 PathBuf::from(".nx"),
-                hashes.iter().map(|hash| (*hash).to_owned()).collect(),
+                TaskSelection {
+                    hashes: hashes.iter().map(|hash| (*hash).to_owned()).collect(),
+                    deferred: deferred.iter().cloned().collect(),
+                },
             )])
         }
 
@@ -1410,6 +1530,116 @@ mod tests {
         assert!(!fixture.into.join(STAGING).exists());
     }
 
+    /// A deferred task carries the one entry of its identity the target used last, out of all
+    /// its historical entries, and a configuration is part of the identity: three entries of
+    /// `a:test`, two of `a:test:ci` and one of an unselected task carry two, beside the hash.
+    #[test]
+    fn rebase_carries_one_latest_entry_per_deferred_task() {
+        let fixture = Fixture::new();
+        fixture.entry("1", 4, b"hash");
+        let test = task("a", "test", None);
+        let ci = task("a", "test", Some("ci"));
+        fixture.task_entry("11", &test, "2026-10-11 10:00:01", b"old test");
+        fixture.task_entry("13", &test, "2026-10-11 10:00:03", b"head test");
+        fixture.task_entry("12", &test, "2026-10-11 10:00:02", b"mid test");
+        fixture.task_entry("21", &ci, "2026-10-11 10:00:05", b"head ci");
+        fixture.task_entry("22", &ci, "2026-10-11 10:00:04", b"old ci");
+        fixture.task_entry(
+            "31",
+            &task("b", "test", None),
+            "2026-10-11 10:00:09",
+            b"other",
+        );
+        let staged = stage_rebase(
+            &fixture.from,
+            &fixture.state,
+            &fixture.into,
+            &fixture.state,
+            &Fixture::selecting(&["1"], &[test, ci]),
+            fixture.backing_store(),
+        );
+        let copied: BTreeSet<_> = staged
+            .databases
+            .iter()
+            .flat_map(|database| database.rows.iter().map(|row| row.hash.clone()))
+            .collect();
+        assert_eq!(
+            copied,
+            BTreeSet::from(["1".into(), "13".into(), "21".into()]),
+            "only one entry per deferred task is staged"
+        );
+        let carried = commit(staged, &fixture.into);
+        assert!(carried.stopped.is_none(), "{carried:?}");
+        assert_eq!((carried.entries, carried.deferred), (3, 2));
+        assert_eq!(
+            fixture.carried_hashes(),
+            BTreeSet::from(["1".into(), "13".into(), "21".into()])
+        );
+        assert_eq!(
+            fs::read(fixture.into.join("nx/cache/13/output")).unwrap(),
+            b"head test"
+        );
+    }
+
+    /// The latest entry is chosen before the workspace is consulted: a workspace that already
+    /// holds it takes nothing for that task, never the entry before it.
+    #[test]
+    fn rebase_deferred_task_whose_latest_entry_the_workspace_holds_takes_nothing() {
+        let fixture = Fixture::new();
+        let test = task("a", "test", None);
+        fixture.task_entry("12", &test, "2026-10-11 10:00:02", b"old test");
+        fixture.task_entry("13", &test, "2026-10-11 10:00:03", b"head test");
+        database(
+            &fixture.into.join("nx/workspace-data/task.db"),
+            &format!(
+                "{SCHEMA}; INSERT INTO task_details VALUES ('13', 'a', 'test', NULL); \
+                 INSERT INTO cache_outputs (hash, code, size) VALUES ('13', 0, 9)"
+            ),
+        );
+        let staged = stage_rebase(
+            &fixture.from,
+            &fixture.state,
+            &fixture.into,
+            &fixture.state,
+            &Fixture::selecting(&[], &[test]),
+            fixture.backing_store(),
+        );
+        let carried = commit(staged, &fixture.into);
+        assert!(carried.stopped.is_none(), "{carried:?}");
+        assert_eq!((carried.entries, carried.deferred), (0, 0));
+        assert_eq!(fixture.carried_hashes(), BTreeSet::from(["13".into()]));
+        assert!(!fixture.into.join("nx/cache/12").exists());
+    }
+
+    /// Commit keeps the by-task selection: a deferred task the target used again since the stage
+    /// selects its new latest entry, so the staged one is never indexed, and the one row the task
+    /// was budgeted stops the second copy, as for any changed row.
+    #[test]
+    fn rebase_deferred_task_used_again_after_stage_never_indexes_its_superseded_entry() {
+        let fixture = Fixture::new();
+        let test = task("a", "test", None);
+        fixture.task_entry("13", &test, "2026-10-11 10:00:03", b"head test");
+        let staged = stage_rebase(
+            &fixture.from,
+            &fixture.state,
+            &fixture.into,
+            &fixture.state,
+            &Fixture::selecting(&[], std::slice::from_ref(&test)),
+            fixture.backing_store(),
+        );
+        assert_eq!(staged.databases[0].rows.len(), 1);
+        fixture.task_entry("14", &test, "2026-10-11 10:00:04", b"newer test");
+        let carried = commit(staged, &fixture.into);
+        assert_eq!(carried.entries, 0);
+        assert!(fixture.carried_hashes().is_empty());
+        assert!(
+            carried.stopped.as_ref().unwrap().contains("entry 14"),
+            "{carried:?}"
+        );
+        assert!(!fixture.into.join("nx/cache/13").exists());
+        assert!(!fixture.into.join(STAGING).exists());
+    }
+
     #[test]
     fn rebase_empty_selection_carries_nothing_and_missing_selection_never_widens() {
         let fixture = Fixture::new();
@@ -1459,9 +1689,10 @@ mod tests {
         fixture.entry("2", 4, b"old!");
         fixture.entry_at(Path::new("tools/widget/nx"), "2", 4, b"nest");
         let mut selections = Fixture::selections(&["1"]);
-        selections.insert(
-            PathBuf::from("tools/widget/.nx"),
-            BTreeSet::from(["2".into()]),
+        selections.extend(
+            Fixture::selections(&["2"])
+                .into_values()
+                .map(|selection| (PathBuf::from("tools/widget/.nx"), selection)),
         );
         let staged = stage_rebase(
             &fixture.from,
@@ -1482,8 +1713,12 @@ mod tests {
         assert!(!fixture.into.join("nx/cache/2").exists());
     }
 
+    /// Both classes read the target's database through its indexes: the hash class probes the
+    /// cache's primary key, and the task class reads only the cache Nx's eviction bounds,
+    /// probing `task_details` by primary key and the deferred tasks by their index. Neither
+    /// scans the `task_details` history of entries Nx evicted.
     #[test]
-    fn selected_hashes_probe_the_source_index_without_scanning_historical_rows() {
+    fn rebase_selection_probes_indexes_and_never_scans_task_history() {
         let fixture = Fixture::new();
         let source = Connection::open(&fixture.from.join("nx/workspace-data/task.db")).unwrap();
         source
@@ -1495,7 +1730,8 @@ mod tests {
             .unwrap();
         source
             .execute(
-                "INSERT INTO cache_outputs (hash, code, size) SELECT hash, 0, 1024 FROM task_details",
+                "INSERT INTO cache_outputs (hash, code, size) SELECT hash, 0, 1024 FROM task_details \
+                 WHERE hash = '1' OR CAST(hash AS INTEGER) > 9900",
                 &[],
             )
             .unwrap();
@@ -1506,10 +1742,18 @@ mod tests {
             &fixture.from.join("nx/workspace-data/task.db"),
         )
         .unwrap();
-        let selected = BTreeSet::from(["1".to_owned()]);
+        let selected = TaskSelection {
+            hashes: BTreeSet::from(["1".to_owned()]),
+            deferred: BTreeSet::from([task("a", "build", None)]),
+        };
+        let selected = rows(&connection, Selection::Only(&selected)).unwrap();
         assert_eq!(
-            rows(&connection, Selection::Only(&selected)).unwrap().len(),
-            1
+            selected
+                .iter()
+                .map(|row| (row.hash.as_str(), row.by_task))
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([("1", false), ("9999", true)]),
+            "the hash, and the one latest entry of the deferred task"
         );
         let mut explain = connection
             .prepare(&format!("EXPLAIN QUERY PLAN {SELECTED}"))
@@ -1518,16 +1762,26 @@ mod tests {
         while explain.step().unwrap() {
             plan.push(explain.text(3));
         }
+        for searched in ["p", "d"] {
+            assert!(
+                plan.iter().any(|detail| {
+                    detail.starts_with(&format!("SEARCH {searched} USING "))
+                        && detail.contains("(hash=?)")
+                }),
+                "{searched}: {plan:?}"
+            );
+        }
         assert!(
-            plan.iter().any(|detail| {
-                detail.starts_with("SEARCH p USING ") && detail.contains("(hash=?)")
-            }),
+            plan.iter()
+                .any(|detail| detail.starts_with("SEARCH t USING ")),
             "{plan:?}"
         );
-        assert!(
-            !plan.iter().any(|detail| detail.starts_with("SCAN p")),
-            "{plan:?}"
-        );
+        for scanned in ["SCAN p", "SCAN d", "SCAN t"] {
+            assert!(
+                !plan.iter().any(|detail| detail.starts_with(scanned)),
+                "{scanned}: {plan:?}"
+            );
+        }
     }
 
     #[test]

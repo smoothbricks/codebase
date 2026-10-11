@@ -1,9 +1,13 @@
-// The Nx cache keys the tree at the Nx root `process.argv[2]` looks up (16_build_volumes.md,
-// "Rebase carry"): the hash of every cacheable task, computed by the root's own stock Nx the way
-// `nx run-many` computes it before it reads the cache. Run as `node - <root>` with this script on
-// stdin; answers one JSON object on stdout, `{"hashes": ["<hash>", ...]}`, and fails with a
-// non-zero exit and its reason on stderr for anything it cannot hash. It writes what a run writes
-// before its first task: the root's task database, and a `task_details` row per hash.
+// What the tree at the Nx root `process.argv[2]` looks up in the Nx cache (16_build_volumes.md,
+// "Rebase carry"), computed by the root's own stock Nx the way `nx run-many` computes it before it
+// reads the cache. A cacheable task Nx hashes up front is named by its hash. A deferred one, which
+// stock Nx hashes only after its dependencies ran, is named by its identity instead: its hash
+// covers its dependencies' outputs, and those on disk in a rebased checkout are stale. Run as
+// `node - <root>` with this script on stdin; answers one JSON object on stdout,
+// `{"hashes": ["<hash>", ...], "deferred": [{"project", "target", "configuration"}, ...]}`
+// (`configuration` null for none, as `task_details` records it), and fails with a non-zero exit
+// and its reason on stderr for anything it cannot hash. It writes what a run writes before its
+// first task: the root's task database, and a `task_details` row per hash.
 
 // Nx prints with `process.stdout.write`; the answer is the only thing on stdout.
 const answer = process.stdout.write.bind(process.stdout);
@@ -26,14 +30,18 @@ process.env.NX_CACHE_DIRECTORY = path.join(root, '.nx', 'cache');
 // The root's own Nx: a hash is only a hit for the Nx that wrote it.
 const requireNx = createRequire(path.join(root, 'package.json'));
 const { readNxJson } = requireNx('nx/src/config/nx-json');
-const { createProjectGraphAsync } = requireNx('nx/src/project-graph/project-graph');
+const { createProjectGraphAsync, readProjectsConfigurationFromProjectGraph } = requireNx(
+  'nx/src/project-graph/project-graph',
+);
 const { splitArgsIntoNxArgsAndOverrides } = requireNx('nx/src/utils/command-line-utils');
 const { getRunnerOptions, setEnvVarsBasedOnArgs } = requireNx('nx/src/tasks-runner/run-command');
 const { createTaskGraph } = requireNx('nx/src/tasks-runner/create-task-graph');
 const { findCycle, makeAcyclic } = requireNx('nx/src/tasks-runner/task-graph-utils');
 const { createTaskHasher } = requireNx('nx/src/hasher/create-task-hasher');
+const { getInputs } = requireNx('nx/src/hasher/task-hasher');
 const { getTaskDetails, hashTasks } = requireNx('nx/src/hasher/hash-task');
 const { getTaskSpecificEnv } = requireNx('nx/src/tasks-runner/task-env');
+const { getCustomHasher } = requireNx('nx/src/tasks-runner/utils');
 const { projectHasTarget } = requireNx('nx/src/utils/project-graph-utils');
 const hooks = requireNx('nx/src/project-graph/plugins/tasks-execution-hooks');
 const { daemonClient } = requireNx('nx/src/daemon/client/client');
@@ -56,7 +64,7 @@ async function main() {
   const projects = Object.values(projectGraph.nodes);
   const targets = [...new Set(projects.flatMap((project) => Object.keys(project.data.targets ?? {})))].sort();
   if (targets.length === 0) {
-    return [];
+    return { hashes: [], deferred: [] };
   }
   // A run names at most one configuration; each target without it runs its default. Every name
   // any target declares is a run some gate may make, and its graph hashes differently: a task's
@@ -90,11 +98,11 @@ async function main() {
   };
   const startTime = Date.now();
   await hooks.runPreTasksExecution(run);
-  let hashes;
+  let selection;
   // `{ error }` only on failure: a hasher may throw any value, `undefined` included.
   let failed = null;
   try {
-    hashes = await hashRuns(nxJson, projectGraph, projects, targets, runs, taskDetails);
+    selection = await hashRuns(nxJson, projectGraph, projects, targets, runs, taskDetails);
   } catch (error) {
     failed = { error };
   }
@@ -109,14 +117,20 @@ async function main() {
   if (failed !== null) {
     throw failed.error;
   }
-  return hashes;
+  return selection;
 }
 
-/** The sorted union of every cacheable task's hash over `runs`, each run's graph hashed as Nx's own. */
+/**
+ * Over `runs`, each run's graph read as Nx's own: the sorted union of the hashes of every cacheable
+ * task Nx hashes up front, and the sorted union of the identities of every cacheable task it defers.
+ */
 async function hashRuns(nxJson, projectGraph, projects, targets, runs, taskDetails) {
   const hasher = createTaskHasher(projectGraph, nxJson, getRunnerOptions('default', nxJson, runs[0].nxArgs, false));
+  const projectConfigurations = readProjectsConfigurationFromProjectGraph(projectGraph).projects;
   const runnable = projects.filter((project) => targets.some((target) => projectHasTarget(project, target)));
   const hashes = new Set();
+  // Keyed by the identity's JSON: one entry per task, whichever runs defer it.
+  const deferred = new Map();
   for (const { nxArgs, overrides } of runs) {
     const taskGraph = createTaskGraph(
       projectGraph,
@@ -137,24 +151,46 @@ async function hashRuns(nxJson, projectGraph, projects, targets, runs, taskDetai
     }
     // Only a cacheable task's hash is ever looked up.
     const tasks = Object.values(taskGraph.tasks).filter((task) => task.cache && !task.continuous);
-    const perTaskEnvs = {};
+    // Nx's own rule, `hashTasksThatDoNotDependOnOutputsOfOtherTasks`: a custom hasher may read
+    // other tasks' outputs, and a `dependentTasksOutputFiles` input of a task with dependencies
+    // does.
+    const upFront = [];
     for (const task of tasks) {
+      const defers =
+        getCustomHasher(task, projectConfigurations) ||
+        (taskGraph.dependencies[task.id].length > 0 && getInputs(task, projectGraph, nxJson).depsOutputs.length > 0);
+      if (defers) {
+        const identity = {
+          project: task.target.project,
+          target: task.target.target,
+          configuration: task.target.configuration ?? null,
+        };
+        deferred.set(JSON.stringify(identity), identity);
+      } else {
+        upFront.push(task);
+      }
+    }
+    const perTaskEnvs = {};
+    for (const task of upFront) {
       perTaskEnvs[task.id] = getTaskSpecificEnv(task, projectGraph);
     }
     // Recorded as a run records them, through the task database's connection.
-    await hashTasks(hasher, projectGraph, taskGraph, perTaskEnvs, taskDetails, tasks);
-    for (const task of tasks) {
+    await hashTasks(hasher, projectGraph, taskGraph, perTaskEnvs, taskDetails, upFront);
+    for (const task of upFront) {
       if (!task.hash) {
         throw new Error(`Nx answered no hash for ${task.id}`);
       }
       hashes.add(task.hash);
     }
   }
-  return [...hashes].sort();
+  return {
+    hashes: [...hashes].sort(),
+    deferred: [...deferred.keys()].sort().map((key) => deferred.get(key)),
+  };
 }
 
 main().then(
-  (hashes) => answer(`${JSON.stringify({ hashes })}\n`),
+  (selection) => answer(`${JSON.stringify(selection)}\n`),
   (error) => {
     // Node's own rendering: an AggregateError's `errors` and any `cause` are printed with it.
     console.error(error);
