@@ -482,9 +482,11 @@ entry's install, a CI runner's frozen-lockfile install and `smoo monorepo update
 directly in the root's or a workspace member's `node_modules` (scoped names included) whose target lies outside the
 repository. The install records these links first, then puts back every one except Nx. A link whose target no longer
 exists is removed with a warning, and that install puts the lockfile's version in its place. To unlink, remove the link:
-the next install puts the lockfile's version there. A missing external target, or a live link to Nx, also makes a
-matching stamp stale: the next managed shell entry installs and replaces the dangling or Nx link, while every other live
-external link is preserved.
+the next install puts the lockfile's version there. A missing external target, or a live link to Nx, also makes the
+install stamp stale: the next managed install replaces the dangling or Nx link, while every other live external link is
+preserved. An ordinary local setup invocation runs `bun install` unless the install stamp matches, the TypeScript API
+package resolves and no developer link is stale; a successful install records the stamp, so a later ordinary local setup
+invocation with current bindings runs no `bun install`.
 
 Only an observed missing target makes a link dangling. Permission or other metadata errors abort the install without
 removing captured links; an unreadable checkout is not a deleted checkout.
@@ -513,10 +515,14 @@ removed with the usual warning first.
 Nx is the one package every managed install replaces. The repository's lockfile owns Nx, so the Nx a shell runs comes
 from `bun install`, never from a developer link to a local Nx checkout. The managed installs (shell entry's, a CI
 runner's frozen-lockfile one, and `smoo monorepo update`) therefore pass `{ relink: ['nx'] }`: a successful install
-leaves Nx as Bun installed it, and every other developer link is still put back. A live Nx link makes a matching
-shell-entry stamp stale, so the next managed shell entry runs one install that replaces it, and the shells after it stay
-current. `smoo.developerLinks.nx` is obsolete and refused: `smoo monorepo update` removes that declaration while keeping
-sibling package declarations. Nx must not be reselected by the developer-links postinstall task.
+leaves Nx as Bun installed it, and every other developer link is still put back. A live Nx link makes the install stamp
+stale, so the next managed install replaces it; a later ordinary local setup invocation with current bindings runs no
+`bun install`. `smoo.developerLinks.nx` is obsolete and refused: `smoo monorepo update` removes that declaration while
+keeping sibling package declarations. Nx must not be reselected by the developer-links postinstall task.
+
+Gap: `smoo:install` runs setup only when one of its listed inputs changed, and the `smoo:developer-links` status covers
+only the packages `smoo.developerLinks` declares. So a new external Nx alias in the root's or a workspace member's
+`node_modules`, with no changed input, is not detected until setup runs.
 
 #### Declared Links
 

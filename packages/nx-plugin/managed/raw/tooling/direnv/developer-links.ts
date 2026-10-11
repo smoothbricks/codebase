@@ -43,9 +43,10 @@
  * a developer link to a local Nx checkout is not kept: the managed installs
  * (shell entry's, a CI runner's frozen-lockfile one, `smoo monorepo update`'s)
  * pass `{ relink: ['nx'] }`, and a successful one leaves Nx as Bun installed it.
- * Every other developer link is still kept. A live Nx link makes a matching
- * stamp stale (`hasStaleDeveloperLinks`), so the next managed shell entry runs
- * one install that replaces it, and the shells after it stay current.
+ * Every other developer link is still kept. A live Nx link makes the install
+ * stamp stale (`hasStaleDeveloperLinks`), so the next managed install replaces
+ * it; an ordinary local setup invocation with current bindings then runs no
+ * `bun install`.
  *
  * A repository can also DECLARE such links, so every checkout of it on a
  * developer machine gets them without anyone running `bun link`: the root
