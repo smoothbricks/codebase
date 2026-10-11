@@ -428,7 +428,6 @@ fn mixed_lane_ttl_window_refuses_full_export_and_keeps_the_previous_one() {
     let previous_undo = vm.delta_export_undo().to_vec();
     let previous_redo = vm.delta_export_redo().to_vec();
     let previous_len = vm.delta_export_len_bytes();
-    let previous_overflow = vm.delta_export_overflow();
 
     // Real expiry on the undo-only lane: 100 + ttl 10 <= 111.
     assert_eq!(Ok(1), vm.evict_all_expired(false, &mut state, 111.0));
@@ -443,7 +442,6 @@ fn mixed_lane_ttl_window_refuses_full_export_and_keeps_the_previous_one() {
     assert_eq!(previous_undo, vm.delta_export_undo().to_vec());
     assert_eq!(previous_redo, vm.delta_export_redo().to_vec());
     assert_eq!(previous_len, vm.delta_export_len_bytes());
-    assert_eq!(previous_overflow, vm.delta_export_overflow());
 
     // The paired prefix remains the exact previous export.
     let paired = vm.undo_status().delta_count;
@@ -642,10 +640,6 @@ fn capture_past_the_record_budget_overflows_to_a_shadow_and_rolls_back_exactly()
         );
         if delta {
             assert_eq!(Ok(checkpoint), vm.delta_export_segment(0, checkpoint));
-            assert!(
-                vm.delta_export_overflow(),
-                "an export taken while overflowed says so"
-            );
             assert_eq!(vm.delta_export_undo().to_vec(), undo);
             assert_eq!(vm.delta_export_redo().to_vec(), redo);
             let mut replay = Vm::default();

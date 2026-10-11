@@ -628,7 +628,6 @@ describe('Pipeline undo integration', () => {
     expect(segment.undoBytes.byteLength).toBeGreaterThan(0);
     expect(segment.redoBytes.byteLength).toBe(segment.undoBytes.byteLength);
     expect(segment.entrySize).toBeGreaterThan(0);
-    expect(segment.overflow).toBeFalse();
 
     backend.deltaApplyRollbackSegment(state, segment.undoBytes, segment.entrySize);
     expect(backend.getMapSize(state, program, 0)).toBe(0);

@@ -617,7 +617,6 @@ pub(crate) struct UndoState {
     generation: u64,
     export_start: u32,
     export_count: u32,
-    export_overflow: bool,
     /// The exported range's undo and redo lanes, serialized when it was
     /// exported; storage is kept for the next export.
     export_undo: Vec<u8>,
@@ -5949,7 +5948,6 @@ impl Vm {
         u.overflowed = false;
         u.export_start = 0;
         u.export_count = 0;
-        u.export_overflow = false;
         u.export_undo.clear();
         u.export_redo.clear();
         u.generation = next_generation();
@@ -6035,7 +6033,6 @@ impl Vm {
         u.overflowed = false;
         u.export_start = 0;
         u.export_count = 0;
-        u.export_overflow = false;
         u.export_undo.clear();
         u.export_redo.clear();
         u.saved_change_flags.clear();
@@ -6137,7 +6134,6 @@ impl Vm {
         serialize_entries(&mut u.export_redo, redo.iter().copied());
         u.export_start = from_pos;
         u.export_count = count;
-        u.export_overflow = u.overflowed;
         Ok(count)
     }
 
@@ -6154,13 +6150,6 @@ impl Vm {
     /// Return the byte length of the exported delta segment.
     pub fn delta_export_len_bytes(&self) -> u32 {
         self.undo.export_count * FLAT_UNDO_ENTRY_SIZE
-    }
-
-    /// Whether the window had overflowed when the range was exported: its
-    /// writes past the budget are in no record, so the range does not
-    /// replay the step and a fork materializes from a snapshot instead.
-    pub fn delta_export_overflow(&self) -> bool {
-        self.undo.export_overflow
     }
 
     /// Validate a serialized delta before mutation. Physical entries cannot

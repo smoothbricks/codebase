@@ -241,7 +241,6 @@ function assertModel(
 function exportSegment(backend: ColumineBackend, state: StateHandle, from: number, to: number): DeltaSegmentExport {
   const result = backend.deltaExportSegment(state, from, to);
   if (!result.ok) throw new Error(`real paired export refused ${result.error}`);
-  expect(result.value.overflow).toBe(false);
   expect(result.value.undoBytes.byteLength).toBe((to - from) * result.value.entrySize);
   expect(result.value.redoBytes.byteLength).toBe(result.value.undoBytes.byteLength);
   for (let at = 0; at < result.value.undoBytes.byteLength; at += result.value.entrySize) {

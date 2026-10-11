@@ -1427,10 +1427,6 @@ fn assert_element_exported_window(vm: &mut Vm, before: &[u8], after: &[u8], star
         "the accepted window must contain actual mutations"
     );
     assert_eq!(Ok(end - start), vm.delta_export_segment(start, end));
-    assert!(
-        vm.delta_export_overflow(),
-        "overflow diagnostic must not erase the pre-overflow records"
-    );
     let undo = vm.delta_export_undo().to_vec();
     let redo = vm.delta_export_redo().to_vec();
     let mut replay = Vm::default();
@@ -1900,10 +1896,6 @@ fn malformed_bitmap_element_preserves_invalid_state_cause() {
             assert!(
                 !vm.undo_status().overflow,
                 "a malformed image is not a journal refusal"
-            );
-            assert!(
-                !vm.delta_export_overflow(),
-                "no overflow diagnostic may be exported"
             );
         }
     }

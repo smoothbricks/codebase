@@ -815,11 +815,6 @@ pub extern "C" fn vm_delta_export_entry_size() -> u32 {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn vm_delta_export_overflow() -> u32 {
-    u32::from(rt().vm.delta_export_overflow())
-}
-
-#[unsafe(no_mangle)]
 pub unsafe extern "C" fn vm_delta_required_state_size(
     segment_ptr: *const u8,
     segment_len: u32,

@@ -482,7 +482,7 @@ fn paired_window_admits_the_redo_lane_and_exports_a_replayable_range() {
 
 /// A window may hold both profiles. A range containing any undo-only record
 /// returns `DeltaLaneMismatch`, and the refusal leaves the previously exported
-/// selection in place: its undo bytes, redo bytes, length, and overflow flag.
+/// selection in place: its undo bytes, redo bytes, and length.
 /// The earlier paired prefix stays exportable.
 #[test]
 fn mixed_window_refuses_a_range_with_an_undo_only_record_and_keeps_the_last_selection() {
@@ -497,7 +497,6 @@ fn mixed_window_refuses_a_range_with_an_undo_only_record_and_keeps_the_last_sele
     let previous_undo = vm.delta_export_undo().to_vec();
     let previous_redo = vm.delta_export_redo().to_vec();
     let previous_len = vm.delta_export_len_bytes();
-    let previous_overflow = vm.delta_export_overflow();
 
     assert_eq!(ErrorCode::Ok, upsert(&mut vm, &mut state, 43, 200, false));
     let mixed_end = vm.undo_checkpoint();
@@ -538,7 +537,6 @@ fn mixed_window_refuses_a_range_with_an_undo_only_record_and_keeps_the_last_sele
         "refusal keeps the previous redo bytes"
     );
     assert_eq!(previous_len, vm.delta_export_len_bytes());
-    assert_eq!(previous_overflow, vm.delta_export_overflow());
 
     assert_eq!(
         Ok(paired_end),
@@ -696,7 +694,6 @@ fn enable_on_an_active_window_is_refused_and_preserves_status_checkpoint_and_sel
     let selected_undo = vm.delta_export_undo().to_vec();
     let selected_redo = vm.delta_export_redo().to_vec();
     let selected_len = vm.delta_export_len_bytes();
-    let selected_overflow = vm.delta_export_overflow();
     let image = state.clone();
 
     assert_eq!(
@@ -726,7 +723,6 @@ fn enable_on_an_active_window_is_refused_and_preserves_status_checkpoint_and_sel
         "the refusal keeps the selected redo bytes"
     );
     assert_eq!(selected_len, vm.delta_export_len_bytes());
-    assert_eq!(selected_overflow, vm.delta_export_overflow());
     assert_eq!(image, state, "the refusal touches no state");
 
     assert_eq!(ErrorCode::Ok, upsert(&mut vm, &mut state, 43, 200, true));
@@ -1069,11 +1065,11 @@ fn an_overflow_the_memory_cannot_shadow_refuses_out_of_memory() {
 }
 
 /// A paired window past its budget overflows like an undo-only one. Its
-/// pre-overflow prefix still exports and replays exactly; an export taken
-/// while overflowed reports the overflow, so a fork materializes from a
-/// snapshot rather than trusting the range to replay the step.
+/// pre-overflow prefix still exports and replays exactly; the overflowed
+/// window names no restorable end, so no range can claim to replay the
+/// writes past the overflow.
 #[test]
-fn a_paired_window_past_its_budget_overflows_and_its_export_says_so() {
+fn a_paired_window_past_its_budget_overflows_and_its_prefix_replays_exactly() {
     let prog = map_program(16);
     let mut state = init(&prog);
     let original = state.clone();
@@ -1090,7 +1086,6 @@ fn a_paired_window_past_its_budget_overflows_and_its_export_says_so() {
     }
     let full = state.clone();
     assert_eq!(Ok(UNDO_CAPACITY), vm.delta_export_segment(0, UNDO_CAPACITY));
-    assert!(!vm.delta_export_overflow());
 
     flip(&mut vm, &mut state).expect("a paired write past the budget overflows");
     assert_ne!(full, state, "the overflowing write ran");
@@ -1100,10 +1095,6 @@ fn a_paired_window_past_its_budget_overflows_and_its_export_says_so() {
         vm.delta_export_segment(0, UNDO_POSITION_OVERFLOWED)
     );
     assert_eq!(Ok(UNDO_CAPACITY), vm.delta_export_segment(0, UNDO_CAPACITY));
-    assert!(
-        vm.delta_export_overflow(),
-        "an export from an overflowed window says so"
-    );
     let undo = vm.delta_export_undo().to_vec();
     let redo = vm.delta_export_redo().to_vec();
     let entry = Vm::delta_export_entry_size();

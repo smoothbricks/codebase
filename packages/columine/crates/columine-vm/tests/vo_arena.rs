@@ -1189,7 +1189,6 @@ fn journal_overflow_lands_the_batch_and_rolls_back_byte_exact_on_both_lanes() {
                 Ok(checkpoint - window),
                 vm.delta_export_segment(window, checkpoint)
             );
-            assert!(vm.delta_export_overflow());
             let undo = vm.delta_export_undo().to_vec();
             let redo = vm.delta_export_redo().to_vec();
             let mut replay = Vm::default();

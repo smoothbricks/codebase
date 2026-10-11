@@ -2771,10 +2771,6 @@ fn journal_overflow_shadows_and_prefix_stays_exact() {
         Ok(prefix_checkpoint),
         vm.delta_export_segment(window_start, prefix_checkpoint)
     );
-    assert!(
-        vm.delta_export_overflow(),
-        "the overflow diagnostic stays set on export"
-    );
     let window_undo = vm.delta_export_undo().to_vec();
     let window_redo = vm.delta_export_redo().to_vec();
     assert_eq!(
@@ -2916,8 +2912,8 @@ fn journal_exhaustion_mid_batch_lands_whole_batch_and_rolls_back_exact() {
     assert_eq!(UNDO_POSITION_OVERFLOWED, vm.undo_checkpoint());
     let overflowed = state.clone();
 
-    // An export naming the overflowed position is refused; one of the
-    // recorded prefix succeeds and is flagged as from an overflowed window.
+    // An export naming the overflowed position is refused; the recorded
+    // prefix succeeds.
     assert_eq!(
         Err(ErrorCode::InvalidState),
         vm.delta_export_segment(before_cp, UNDO_POSITION_OVERFLOWED)
@@ -2925,10 +2921,6 @@ fn journal_exhaustion_mid_batch_lands_whole_batch_and_rolls_back_exact() {
     assert_eq!(
         Ok(before_cp - window_start),
         vm.delta_export_segment(window_start, before_cp)
-    );
-    assert!(
-        vm.delta_export_overflow(),
-        "an export from an overflowed window says so"
     );
     assert_eq!(
         Err(ErrorCode::InvalidState),

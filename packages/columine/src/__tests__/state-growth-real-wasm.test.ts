@@ -140,7 +140,6 @@ describe('real wasm state geometry and committed-boundary growth', () => {
     const exported = backend.deltaExportSegment(state, checkpoint, backend.undoCheckpoint(state));
     if (!exported.ok) throw new Error(`unexpected delta export error ${exported.error}`);
     const segment = exported.value;
-    expect(segment.overflow).toBe(false);
     expect(segment.undoBytes.byteLength).toBeGreaterThan(0);
     for (let at = 0; at < segment.undoBytes.byteLength; at += segment.entrySize) {
       expect(segment.undoBytes[at]).toBe(15);
@@ -194,7 +193,6 @@ describe('real wasm state geometry and committed-boundary growth', () => {
     const exported = backend.deltaExportSegment(state, checkpoint, backend.undoCheckpoint(state));
     if (!exported.ok) throw new Error(`unexpected delta export error ${exported.error}`);
     const segment = exported.value;
-    expect(segment.overflow).toBe(false);
     backend.undoRollback(state, checkpoint);
     expect(backend.mapGet(state, reducer, 0, 7)).toStrictEqual({ ok: true, value: 30 });
     expect(backend.serialize(state, reducer)).toEqual(beforeBegin);
@@ -477,7 +475,6 @@ describe('real wasm state geometry and committed-boundary growth', () => {
       if (delta) {
         if (!exported.ok) throw new Error(`unexpected delta export error ${exported.error}`);
         const segment = exported.value;
-        expect(segment.overflow).toBe(true);
         expect(segment.redoBytes.byteLength).toBeGreaterThan(0);
         backend.deltaApplyRollforwardSegment(state, segment.redoBytes, segment.entrySize);
         expect(backend.serialize(state, reducer)).toEqual(accepted);
@@ -525,7 +522,6 @@ describe('real wasm state geometry and committed-boundary growth', () => {
       // The paired prefix is complete, so it exports exactly and is the earlier successful selection.
       const pairedPrefix = backend.deltaExportSegment(state, checkpoint, middle);
       if (!pairedPrefix.ok) throw new Error(`unexpected paired prefix export error ${pairedPrefix.error}`);
-      expect(pairedPrefix.value.overflow).toBe(false);
       expect(pairedPrefix.value.undoBytes.byteLength).toBeGreaterThan(0);
 
       if (pairedEviction) {
@@ -534,7 +530,6 @@ describe('real wasm state geometry and committed-boundary growth', () => {
         const end = backend.undoCheckpoint(state);
         const full = backend.deltaExportSegment(state, checkpoint, end);
         if (!full.ok) throw new Error(`unexpected paired eviction export error ${full.error}`);
-        expect(full.value.overflow).toBe(false);
         expect(full.value.redoBytes.byteLength).toBe(full.value.undoBytes.byteLength);
 
         backend.undoRollback(state, checkpoint);
@@ -622,7 +617,7 @@ describe('real wasm state geometry and committed-boundary growth', () => {
     const middle = invoke(exports, 'vm_undo_checkpoint', statePtr);
     expect(middle).toBeGreaterThan(checkpoint);
 
-    // Every raw selection output: cursor pointers, length, lane bytes, diagnostics and the caller's out record.
+    // Every raw selection output: cursor pointers, length, lane bytes and the caller's out record.
     const selection = () => {
       const len = invoke(exports, 'vm_delta_export_len_bytes');
       const undoPtr = invoke(exports, 'vm_delta_export_undo_ptr');
@@ -632,7 +627,6 @@ describe('real wasm state geometry and committed-boundary growth', () => {
         redoPtr,
         len,
         entrySize: invoke(exports, 'vm_delta_export_entry_size'),
-        overflow: invoke(exports, 'vm_delta_export_overflow'),
         undo: new Uint8Array(memory.buffer, undoPtr, len).slice(),
         redo: new Uint8Array(memory.buffer, redoPtr, len).slice(),
         out: new Uint8Array(memory.buffer, outPtr, 4).slice(),
@@ -643,7 +637,6 @@ describe('real wasm state geometry and committed-boundary growth', () => {
     const prefix = selection();
     expect(prefix.len).toBeGreaterThan(0);
     expect(prefix.entrySize).toBe(24);
-    expect(prefix.overflow).toBe(0);
 
     // Undo-only eviction on the ordinary lane (delta_mode 0) appends a record with no redo partner after `middle`.
     expect(invoke(exports, 'vm_evict_all_expired', statePtr, size, 100, 0)).toBe(ErrorCode.OK);

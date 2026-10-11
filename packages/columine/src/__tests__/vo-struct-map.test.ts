@@ -190,7 +190,6 @@ describe('STRUCT_MAP VO fields through the built WASM VM', () => {
     const exported = backend.deltaExportSegment(state, fromPos, backend.undoCheckpoint(state));
     if (!exported.ok) throw new Error(`unexpected delta export error ${exported.error}`);
     const segment = exported.value;
-    expect(segment.overflow).toBe(false);
     expect(segment.undoBytes.byteLength).toBeGreaterThan(0);
 
     backend.deltaApplyRollbackSegment(state, segment.undoBytes, segment.entrySize);

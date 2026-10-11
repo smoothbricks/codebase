@@ -79,7 +79,6 @@ function createMockColumineBackend(overrides: Partial<ColumineBackend> = {}): Co
         undoBytes: new Uint8Array(0),
         redoBytes: new Uint8Array(0),
         entrySize: 24,
-        overflow: false,
       },
     }),
     deltaApplyRollbackSegment: () => {},

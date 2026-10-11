@@ -178,7 +178,6 @@ interface VmExports {
   vm_delta_export_redo_ptr(): number;
   vm_delta_export_len_bytes(): number;
   vm_delta_export_entry_size(): number;
-  vm_delta_export_overflow(): number;
   vm_delta_apply_rollback_segment(
     stateBase: number,
     stateLen: number,
@@ -250,7 +249,6 @@ const VM_EXPORT_NAMES = [
   'vm_delta_export_redo_ptr',
   'vm_delta_export_len_bytes',
   'vm_delta_export_entry_size',
-  'vm_delta_export_overflow',
   'vm_delta_required_state_size',
   'vm_delta_apply_rollback_segment',
   'vm_delta_apply_rollforward_segment',
@@ -922,14 +920,12 @@ export async function createColumineWasmBackend(wasmBytes: BufferSource): Promis
       const redoPtr = wasmInstance.exports.vm_delta_export_redo_ptr();
       const len = wasmInstance.exports.vm_delta_export_len_bytes();
       const entrySize = wasmInstance.exports.vm_delta_export_entry_size();
-      const overflow = wasmInstance.exports.vm_delta_export_overflow() !== 0;
       return {
         ok: true,
         value: {
           undoBytes: new Uint8Array(wasmInstance.memory.buffer, undoPtr, len).slice(),
           redoBytes: new Uint8Array(wasmInstance.memory.buffer, redoPtr, len).slice(),
           entrySize,
-          overflow,
         },
       };
     },

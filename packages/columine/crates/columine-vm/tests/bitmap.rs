@@ -2378,14 +2378,13 @@ fn bitmap_overflow_mid_reducer_lands_the_batch_and_rolls_back_exactly() {
             "delta={delta}: overflowed batch writes land"
         );
         if delta {
-            // The overflowed window names no restorable end, and its paired
-            // prefix exports flagged as overflowed: a fork materializes instead.
+            // The overflowed window names no restorable end: only its
+            // recorded prefix exports.
             assert_eq!(
                 vm.delta_export_segment(checkpoint, UNDO_POSITION_OVERFLOWED),
                 Err(ErrorCode::InvalidState)
             );
             assert_eq!(vm.delta_export_segment(0, checkpoint), Ok(checkpoint));
-            assert!(vm.delta_export_overflow());
         }
         rollback(&mut vm, &mut state, checkpoint);
         assert_eq!(state, initial, "delta={delta}: exact prefix rollback");

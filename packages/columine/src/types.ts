@@ -668,6 +668,4 @@ export interface DeltaSegmentExport {
   undoBytes: Uint8Array;
   redoBytes: Uint8Array;
   entrySize: number;
-  /** The export came from an overflowed window: its writes past the budget are in no record, so a fork materializes. */
-  overflow: boolean;
 }

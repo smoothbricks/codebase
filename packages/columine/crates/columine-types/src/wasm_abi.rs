@@ -25,7 +25,6 @@ pub const COLUMINE_VM_EXPORTS: &[&str] = &[
     "vm_delta_apply_rollforward_segment",
     "vm_delta_export_entry_size",
     "vm_delta_export_len_bytes",
-    "vm_delta_export_overflow",
     "vm_delta_export_redo_ptr",
     "vm_delta_export_segment",
     "vm_delta_export_undo_ptr",
