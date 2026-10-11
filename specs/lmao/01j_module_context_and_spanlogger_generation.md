@@ -64,7 +64,7 @@ The runtime type contract is:
 ```typescript
 interface VocabularyFragmentV1 {
   schemaVersion: 1;
-  idAlgorithm: 'sha256-24-v1';
+  idAlgorithm: 'sha256-32-v1';
   contentHash: ContentHash;
   ids: Uint32Array;
   kindTags: Uint8Array;
@@ -103,8 +103,10 @@ repeat fieldCount times:
   u8[columnLength] columnUtf8
 ```
 
-For record `i`, `ids[i]` is the first 24 SHA-256 bits, interpreted big-endian, over `kindTags[i] || recordBytes`.
-`contentHash` is lowercase SHA-256 hex over this exact canonical byte stream:
+For record `i`, `ids[i]` is the first 32 SHA-256 bits, interpreted big-endian, over `kindTags[i] || recordBytes`. An id
+is a hash, not a unique key: two distinct records may share one, and registration resolves that by deterministic probing
+([01o](./01o_typescript_transformer.md#vocabulary-fragment-and-library-without-source-contract)); a collision is never
+fatal. `contentHash` is lowercase SHA-256 hex over this exact canonical byte stream:
 
 ```text
 u8 schemaVersion
@@ -125,9 +127,9 @@ The registry validates versions, lengths, offsets, record grammar, IDs, kind tag
 the fragment into a runtime-owned immutable dictionary generation. Caller-owned typed arrays are registration inputs,
 not borrowed mutable Arrow storage. Dense Arrow indices are process-local and append-only in fragment registration
 order. A new generation preserves the previous generation as an unchanged prefix and appends only unseen decoded values,
-so old bindings remain prefix-valid. Stable IDs and decoded values are deterministic; dense indices and dictionary
-ordering are not deterministic across processes. Dense index `0` is valid; null is represented only by the Arrow
-validity bitmap.
+so old bindings remain prefix-valid. Ids, record bytes and decoded values are deterministic; dense indices and
+dictionary ordering are not deterministic across processes. Dense index `0` is valid; null is represented only by the
+Arrow validity bitmap.
 
 The returned `VocabularyBinding` maps each fragment-local ordinal through direct `binding[ordinal]` indexing. Generated
 code MUST NOT call a warmed `messageIndex()` helper. An `ArrowLease` pins the exact runtime-owned immutable dictionary

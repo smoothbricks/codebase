@@ -536,7 +536,7 @@ import '@smoothbricks/lmao/vocabulary/register/v1';
 const REGISTER_VOCABULARY = Symbol.for('@smoothbricks/lmao/vocabulary/register/v1');
 const $$lmaoVocabulary = globalThis[REGISTER_VOCABULARY]({
   schemaVersion: 1,
-  idAlgorithm: 'sha256-24-v1',
+  idAlgorithm: 'sha256-32-v1',
   contentHash: $$contentHash,
   ids: new Uint32Array($$ids),
   kindTags: new Uint8Array([1, 1, 2]),
@@ -575,7 +575,7 @@ The runtime type contract is separate from the emitted JavaScript above:
 ```typescript
 type VocabularyFragmentV1 = {
   readonly schemaVersion: 1;
-  readonly idAlgorithm: 'sha256-24-v1';
+  readonly idAlgorithm: 'sha256-32-v1';
   readonly contentHash: string;
   readonly ids: Uint32Array;
   readonly kindTags: Uint8Array;
@@ -596,7 +596,7 @@ repeated(u16le nameLen | name UTF8 | u16le columnLen | column UTF8)
 ```
 
 `kindTags[i]` is `1` (`LOG_TEMPLATE`) or `2` (`SPAN_NAME`); these are semantic entry kinds, not
-`static`/`structured`/`dynamic` or physical `mixed`. `ids[i]` is the first 24 bits, interpreted big-endian, of
+`static`/`structured`/`dynamic` or physical `mixed`. `ids[i]` is the first 32 bits, interpreted big-endian, of
 `SHA-256(kindTag || recordBytes)`. `contentHash` is lowercase SHA-256 hex of this canonical byte stream:
 
 ```text
@@ -633,11 +633,16 @@ alignment, and chunk policy are immutable once live. `VocabularyBinding` maps fr
 An `ArrowLease` pins the exact backing store, WASM epoch, chunks, and dictionary generation used by a batch until
 explicit release after flush consumption.
 
-Registration is idempotent for byte-identical fragments and deduplicates equal `(kindTag,id,recordBytes)` records.
-Reusing an ID for different kind/record bytes, or `contentHash` for another canonical fragment, is fatal before the
-fragment is writable. Stable IDs and content bytes—not dense indices—provide deterministic identity and semantic
-checksums across registration orders. Cross-process dense-index stability is not promised; decoded values and schema
-semantics remain deterministic.
+An id is a 32-bit hash of its record, not a unique key: two distinct records can share one, and a collision is never
+fatal. Registration keeps every registered record in a table keyed by id and probes it deterministically: it walks the
+records already filed under the id and compares `(kindTag, recordBytes)` with each. An equal record reuses that record's
+dense index, which makes registration idempotent for byte-identical fragments and deduplicates equal records; a record
+no entry equals is appended, even when its id is taken. The transformer's whole-program catalog follows the same rule,
+so a collision between two records of one compilation is not an error either. Which record a dense index decodes to
+depends only on its bytes, never on which colliding record registered first. Reusing `contentHash` for another canonical
+fragment is fatal before the fragment is writable. Ids and content bytes—not dense indices—provide deterministic
+identity and semantic checksums across registration orders. Cross-process dense-index stability is not promised; decoded
+values and schema semantics remain deterministic.
 
 ##### Diagnostics, fallback, and evaluation order
 
@@ -670,8 +675,8 @@ optimization may select `spanAutoN` or change Promise-assimilation/microtask tur
 Promotion from the Op-local representation to the global vocabulary requires repo-standard Mitata scenarios to compare
 `plugin-off`, `plugin-on/current`, and global-vocabulary variants with a position-balanced schedule in independent
 order-reversed processes. Every run emits machine-readable raw samples, semantic checksums, p50/p95/p99/p99.9, and
-allocation/GC metadata when the host exposes it. A checksum mismatch, collision, decode difference, or evaluation-order
-difference is an unconditional fail.
+allocation/GC metadata when the host exposes it. A checksum mismatch, decode difference, or evaluation-order difference
+is an unconditional fail.
 
 Semantic acceptance covers `static` log templates, `structured` fields and brace escaping, dynamic debug/trace text,
 literal `SPAN_NAME` registration, and dynamic span-name fallback. It verifies binding length/append-only prefix

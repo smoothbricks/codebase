@@ -120,6 +120,31 @@ four Deferred Work items that the 01q spec removed (WasmTracer, string pooling, 
 - Acceptance: the bench writes raw samples and semantic checksums for all three variants. A checksum mismatch fails the
   run.
 
+## 32-bit vocabulary ids; a collision is never fatal
+
+- Spec: `specs/lmao/01o_typescript_transformer.md` "Vocabulary fragment and library-without-source contract":
+  `idAlgorithm: 'sha256-32-v1'`; `ids[i]` is the first 32 bits of `SHA-256(kindTag || recordBytes)`; an id is a hash,
+  not a unique key; registration probes the records filed under an id, reuses an equal record's dense index and appends
+  any other; the transformer's whole-program catalog follows the same rule.
+  `01j_module_context_and_spanlogger_generation.md` states the same id definition.
+- Code: the 24-bit algorithm and the fatal collision live in the runtime registry and the transformer catalog
+  (`packages/lmao/docs/transformer-optimization.md` already states the 32-bit design).
+  - `packages/lmao/src/lib/vocabularyRegistry.ts:5-6` (`'sha256-24-v1'`, `MAX_VOCABULARY_ID = 0x00ff_ffff`), `:299`
+    (rejects id 0 and ids above 24 bits), `:309` (24-bit derivation), `:312-318` (`LMAO_VOCABULARY_ID_COLLISION` within
+    a fragment), `:371-377` (the same across fragments), `:386-394` (`entriesById` maps one id to one entry).
+  - `packages/lmao-ttsc/plugin/driver/vocabulary.go:20` (`"sha256-24-v1"`) and `:246`
+    (`LMAO1009 vocabulary id collision`, fatal to the compilation).
+- Work: change both sides to `sha256-32-v1` with a 32-bit derivation, and accept every 32-bit value, zero included (with
+  a 32-bit hash, rejecting zero is itself a rare fatal case). Make `entriesById` map an id to the list of entries filed
+  under it; registration walks that list comparing `(kindTag, recordBytes)`, reuses an equal entry and appends
+  otherwise. Drop `LMAO_VOCABULARY_ID_COLLISION` and `LMAO1009`, and change the Go catalog's `byID` the same way. Keep
+  the `contentHash` reuse check fatal. Bump nothing else: `schemaVersion` stays 1 and the record grammar is unchanged,
+  but every emitted fragment and golden test changes ids.
+- Acceptance: the existing collision fixture (`vocabulary_test.go:259-287`, `vocabularyRegistry.test.ts:305-309`)
+  becomes a pair of records that share a 32-bit id, found by deterministic search as the fixture is today: both register
+  in either order, each decodes to its own text, and re-registering either is idempotent. A Go catalog holding the two
+  records compiles.
+
 ## WASM memory follow-ups
 
 These were listed as open work in `specs/lmao/01q_wasm_memory_architecture.md` and now live here. Each is an

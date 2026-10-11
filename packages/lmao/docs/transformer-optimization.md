@@ -208,7 +208,7 @@ The runtime type contract, separate from emitted JavaScript, is:
 ```typescript
 type VocabularyFragmentV1 = {
   schemaVersion: 1;
-  idAlgorithm: 'sha256-24-v1';
+  idAlgorithm: 'sha256-32-v1';
   contentHash: string;
   ids: Uint32Array;
   kindTags: Uint8Array;
@@ -228,7 +228,7 @@ u32le textLen | text UTF8 | u16le fieldCount |
 repeated(u16le nameLen | name UTF8 | u16le columnLen | column UTF8)
 ```
 
-`kindTags[i]` is `1` (`LOG_TEMPLATE`) or `2` (`SPAN_NAME`). `ids[i]` is the first 24 bits, interpreted big-endian, of
+`kindTags[i]` is `1` (`LOG_TEMPLATE`) or `2` (`SPAN_NAME`). `ids[i]` is the first 32 bits, interpreted big-endian, of
 `SHA-256(kindTag || recordBytes)`. `contentHash` is lowercase SHA-256 hex of:
 
 ```text
@@ -250,15 +250,16 @@ transform. Bundling retains installation/registration side effects and each call
 The runtime validates then copies or merges inputs into a runtime-owned immutable dictionary generation. New fragments
 append unseen values in registration order; dense indices are not sorted or canonical. Existing bindings remain
 prefix-valid forever, and each generation is exactly its predecessor plus appended values. An `ArrowLease` pins the
-exact backing store, WASM epoch, chunks, and dictionary generation used by its batch until explicit release. Stable IDs
-and content bytes—not dense indices—provide deterministic cross-order identity and checksums; only decoded values and
-schema semantics are deterministic across registration orders.
+exact backing store, WASM epoch, chunks, and dictionary generation used by its batch until explicit release. Ids and
+content bytes—not dense indices—provide deterministic cross-order identity and checksums; only decoded values and schema
+semantics are deterministic across registration orders.
 
-Registration is idempotent for byte-identical fragments and deduplicates equal `(kindTag,id,recordBytes)` records.
-Reusing an ID for different kind/bytes, or `contentHash` for another fragment, is fatal before the fragment is writable.
-An unavailable/incompatible callback is a strict-build diagnostic or startup failure, never a guessed index. Startup
-contributes bindings to the immutable `PhysicalLayoutPlan`; live shapes never mutate and warmed writes have no
-registration/version branch.
+Registration is idempotent for byte-identical fragments and deduplicates equal `(kindTag,recordBytes)` records. An id is
+a hash, not a unique key: registration probes the records filed under an id deterministically, reuses an equal record's
+dense index and appends any other, so an id collision is never fatal (01o). Reusing `contentHash` for another fragment
+is fatal before the fragment is writable. An unavailable/incompatible callback is a strict-build diagnostic or startup
+failure, never a guessed index. Startup contributes bindings to the immutable `PhysicalLayoutPlan`; live shapes never
+mutate and warmed writes have no registration/version branch.
 
 ### Diagnostics, fallbacks, and order
 
