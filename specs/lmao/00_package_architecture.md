@@ -358,8 +358,8 @@ The string representation separates vocabulary from dynamic data:
 
 Dense Arrow indices are process-local and append-only in fragment registration order. Each new immutable dictionary
 generation retains the previous generation as an unchanged prefix and appends only unseen decoded values, so old
-bindings remain prefix-valid. Stable IDs and decoded values are deterministic; dense indices and dictionary order are
-not deterministic across processes. Dense index `0` is valid; nullability is represented only by the Arrow bitmap.
+bindings remain prefix-valid. Ids and decoded values are deterministic; dense indices and dictionary order are not
+deterministic across processes. Dense index `0` is valid; nullability is represented only by the Arrow bitmap.
 
 Per-request flush walks the already physicalized buffers and reuses schema/layout/backend classes, vocabulary bindings,
 dictionary generations, scratch storage, and Arrow-compatible views. It makes few or no allocations and maximal

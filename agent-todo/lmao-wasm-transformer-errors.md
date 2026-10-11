@@ -132,18 +132,26 @@ four Deferred Work items that the 01q spec removed (WasmTracer, string pooling, 
   - `packages/lmao/src/lib/vocabularyRegistry.ts:5-6` (`'sha256-24-v1'`, `MAX_VOCABULARY_ID = 0x00ff_ffff`), `:299`
     (rejects id 0 and ids above 24 bits), `:309` (24-bit derivation), `:312-318` (`LMAO_VOCABULARY_ID_COLLISION` within
     a fragment), `:371-377` (the same across fragments), `:386-394` (`entriesById` maps one id to one entry).
-  - `packages/lmao-ttsc/plugin/driver/vocabulary.go:20` (`"sha256-24-v1"`) and `:246`
-    (`LMAO1009 vocabulary id collision`, fatal to the compilation).
+  - `packages/lmao-ttsc/plugin/driver/vocabulary.go:20` (`"sha256-24-v1"`), `:240-241` (`LMAO1008`, fatal for a record
+    whose id is 0) and `:243-248` (`LMAO1009 vocabulary id collision`, fatal to the compilation).
+  - Past the catalog, the transformer keys by id in three more places, so colliding records would silently share one
+    operand: `vocabulary.go:341-357` (`resolveVocabularyIDs` resolves each call to an id), `lmao.go:145` and `:258-268`
+    (`vocabularyOrdinals` maps an id to its fragment ordinal; `staticVocabularyOperand` also treats id 0 as "none"), and
+    `optimization.go:246-262` (`localIDsByGlobalID` keys the Op-local message dictionary by id).
 - Work: change both sides to `sha256-32-v1` with a 32-bit derivation, and accept every 32-bit value, zero included (with
   a 32-bit hash, rejecting zero is itself a rare fatal case). Make `entriesById` map an id to the list of entries filed
   under it; registration walks that list comparing `(kindTag, recordBytes)`, reuses an equal entry and appends
-  otherwise. Drop `LMAO_VOCABULARY_ID_COLLISION` and `LMAO1009`, and change the Go catalog's `byID` the same way. Keep
-  the `contentHash` reuse check fatal. Bump nothing else: `schemaVersion` stays 1 and the record grammar is unchanged,
-  but every emitted fragment and golden test changes ids.
+  otherwise. Drop `LMAO_VOCABULARY_ID_COLLISION`, `LMAO1008` and `LMAO1009`, and change the Go catalog's `byID` the same
+  way. In the transformer, key the per-call resolution, the per-file ordinals and the Op-local dictionary by the record
+  key (`vocabularyKey`), not by id, and give `staticVocabularyOperand` an explicit "no entry" instead of id 0. Keep the
+  `contentHash` reuse check fatal. Bump nothing else: `schemaVersion` stays 1 and the record grammar is unchanged, but
+  every emitted fragment and golden test changes ids.
 - Acceptance: the existing collision fixture (`vocabulary_test.go:259-287`, `vocabularyRegistry.test.ts:305-309`)
-  becomes a pair of records that share a 32-bit id, found by deterministic search as the fixture is today: both register
-  in either order, each decodes to its own text, and re-registering either is idempotent. A Go catalog holding the two
-  records compiles.
+  becomes a pair of records that share a 32-bit id, found by a deterministic search over a range wide enough to contain
+  one (100,000 candidates finds a 32-bit collision only about 69 % of the time, so widen it and pin the found pair):
+  both register in either order, each decodes to its own text, and re-registering either is idempotent. A Go catalog
+  holding the two records compiles. Two colliding templates logged in one Op in one file each emit their own
+  `$$lmaoVocabulary[n]` operand and resolve to their own text in the Arrow output.
 
 ## WASM memory follow-ups
 

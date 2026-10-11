@@ -395,10 +395,11 @@ The identity is a **packed byte section** inside the buffer's `_system` ArrayBuf
 `[threadId(8)][spanId(4)][traceIdLen(1)][traceId(N)]` for a ROOT (13 + N bytes). A CHAINED overflow buffer **shares**
 the parent's `_identity` reference. `span_id` is a `uint32` getter reading bytes `[8:12]`. `thread_id` returns the
 buffer's `_threadId` field, the same `uint64` the identity holds at bytes `[0:8]` (`copyThreadIdTo` copies those bytes
-into Arrow output). `trace_id` returns `_traceRoot.trace_id`, the one string every buffer of the trace shares through
-its trace root. `parent_span_id` / `parent_thread_id` delegate to the parent **pointer** (no copied bytes), and to the
-trace root's remote parent for a root that continues a remote trace. `isParentOf` / `isChildOf` are O(1) **pointer**
-comparisons (`this === other._parent`), the "parent ancestry via pointer" decision below, not a `SpanIdentity` method.
+into a destination the caller supplies). `trace_id` returns `_traceRoot.trace_id`, the one string every buffer of the
+trace shares through its trace root. `parent_span_id` / `parent_thread_id` delegate to the parent **pointer** (no copied
+bytes), and to the trace root's remote parent for a root that continues a remote trace. `isParentOf` / `isChildOf` are
+O(1) **pointer** comparisons (`this === other._parent`), the "parent ancestry via pointer" decision below, not a
+`SpanIdentity` method.
 
 ```typescript
 // Generated getters (packages/lmao/src/lib/spanBuffer.ts):
