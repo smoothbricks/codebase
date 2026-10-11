@@ -39,10 +39,12 @@ command = { command-line = "node_modules/@smoothbricks/nx-plugin/src/nextest-cod
 command = { command-line = "node_modules/@smoothbricks/nx-plugin/src/nextest-code-bound.ts 60", relative-to = "workspace-root" }
 
 # The full-lifecycle real-APFS tests cannot meet the default class. The 3× rule
-# of specs/cowshed/08_testing.md over the lifecycle's worst idle measurement
-# (14.8s when `apfs_integration.rs` still ran a second image format: 44.4s)
-# rounds up to 60s; the one-format lifecycle measures 6.6-10.6s idle. Its cost
-# is a multiple of the irreducible ~235-400ms attach (08_testing.md, "Attach
+# of specs/cowshed/08_testing.md over the raw lifecycle's worst idle measurement,
+# 14.8s when `apfs_integration.rs` still ran a second image format, is 44.4s,
+# rounded up to 60s; the one-format lifecycle measures 6.6-10.6s idle. The two
+# genuine-Nx walks named with the same suffix sit in this class without an idle
+# median of their own. The lifecycle's cost is a multiple of the irreducible
+# ~235-400ms attach (08_testing.md, "Attach
 # floor verdict: not flag-reducible"), and splitting the lifecycle into
 # phase-scoped tests would pay that attach again per piece to buy a smaller
 # number. Membership is by name: the fast `real_apfs_*` unit tests keep 30s.

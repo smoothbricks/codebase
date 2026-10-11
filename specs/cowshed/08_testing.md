@@ -244,11 +244,12 @@ wait whose process died: the start is written before the wait, so a start with n
 waiting, or still waiting — counts to the test's end and is named. A record that cannot be written is said once per
 process and its waits then count as code time; an end with no start counts as code time and is named; a record the
 wrapper cannot parse fails the test. The classes are declared once, as the wrapper rules of `.config/nextest.toml`: 60s
-for `test(/real_apfs_.*_substrate_lifecycle/)` (3× the lifecycle's worst idle measurement, 44.4s, rounded up), and 30s
-for every other group test; the 30s rule names exactly the group's filter. The group's nextest `slow-timeout` is 180s
-with `terminate-after = 1`: the hang backstop that ends a test which never returns, not its performance bound. It is the
-only killer: a test over its class runs to its own teardown and fails after it, since a killed test leaves its images
-attached until the next run's sweep (01_storage.md, "How the APFS host degrades" §2).
+for `test(/real_apfs_.*_substrate_lifecycle/)`, and 30s for every other group test; the 30s rule names exactly the
+group's filter. The 60s class is the raw lifecycle's: 3× its worst idle measurement, 14.8s, is 44.4s, rounded up. The
+two genuine-Nx walks whose names carry the same suffix sit in it without an idle median of their own. The group's
+nextest `slow-timeout` is 180s with `terminate-after = 1`: the hang backstop that ends a test which never returns, not
+its performance bound. It is the only killer: a test over its class runs to its own teardown and fails after it, since a
+killed test leaves its images attached until the next run's sweep (01_storage.md, "How the APFS host degrades" §2).
 
 **Host limit.** The host's disk-image attach pool runs out (01_storage.md, "How the APFS host degrades" §2), and the
 suite stops spending into a spent one. Fixtures attach an image once and share it across the assertions that need it
