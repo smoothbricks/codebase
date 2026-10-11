@@ -1190,7 +1190,9 @@ fn write_nx_project(checkout: &Path, nx: &Path, node: &Path, declared: bool) {
         ),
     )
     .unwrap();
-    fs::write(checkout.join("nx.json"), r#"{"useDaemonProcess":false}"#).unwrap();
+    // The genuine fixture uses the normal daemon: checks must share the keeper's warm graph,
+    // not race its detached startup while bypassing it (16_build_volumes.md, daemon stays on).
+    fs::write(checkout.join("nx.json"), "{}").unwrap();
     fs::write(checkout.join(".gitignore"), "node_modules\n.nx\n.cowshed\n").unwrap();
     fs::create_dir_all(checkout.join("a")).unwrap();
     fs::write(checkout.join("a/src.txt"), b"src\n").unwrap();
@@ -1339,27 +1341,13 @@ async fn land_nx_project(
             node.display()
         )
     };
-    let (landed, _, stderr) = run(
-        &mut service,
-        [
-            "land".to_owned(),
-            "topic".to_owned(),
-            // The undeclared output is untracked work in the topic, which a retire refuses.
-            "--no-retire".to_owned(),
-            "--check".to_owned(),
-            check("build"),
-            "--check".to_owned(),
-            check("test"),
-        ],
-    )
-    .await;
-    let stderr = String::from_utf8_lossy(&stderr).into_owned();
-    assert_eq!(
-        landed.unwrap_or_else(|error| panic!("land: {error}; {stderr}")),
-        0,
-        "{stderr}"
-    );
-    eprintln!("land report: {stderr}");
+    let build = check("build");
+    let test = check("test");
+    // The undeclared output is untracked work in the topic, which a retire refuses.
+    let report = land(&mut service, "topic", false, &[&build, &test]).await;
+    assert!(report.build_volume.seeded, "{report:?}");
+    assert!(report.build_volume.adoption.is_adopted(), "{report:?}");
+    eprintln!("land report: {report:?}");
     service.shutdown().await.expect("stop the runtime");
     fixture.stop_gateway().await;
     (land_adoptions(fixture.storage.telemetry()), landed_head)
@@ -1369,6 +1357,8 @@ async fn land_nx_project(
 /// miss is a durable `landAdoption` commitment naming the task (13_telemetry.md). Declaring the
 /// output makes the miss, and the record, disappear. The two projects are independent, each on
 /// its own scratch store, so they land side by side.
+// With the normal daemon and both actual-adoption oracles, this paired walk completed in
+// 48.335 s at load 22.47/27.00/20.01 on one CPU token; use the existing 60 s lifecycle class.
 #[tokio::test(flavor = "multi_thread")]
 async fn real_apfs_an_undeclared_nx_output_lands_as_a_land_adoption_commitment_substrate_lifecycle()
 {
@@ -2231,6 +2221,8 @@ async fn real_apfs_a_land_carries_mains_nx_entries_into_the_volume_main_adopts_s
 /// the landed tree's two and none of the original's, and its run of the landed check hits both
 /// without re-running either. A rebase while a process holds `b`'s task database carries nothing
 /// and names that process.
+// Exact-main completion at load 1.68/2.75/5.82 took 34.983 s with one CPU token;
+// this full adopt/new/land/rebase walk belongs to the existing bounded 60 s lifecycle class.
 #[tokio::test]
 async fn real_apfs_a_rebase_carries_mains_nx_entries_into_the_rebased_workspace_substrate_lifecycle()
  {

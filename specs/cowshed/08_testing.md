@@ -258,6 +258,15 @@ host is a regression to find, not a bound to raise. The group's nextest `slow-ti
 killer: a test over its class runs to its own teardown and fails after it, since a killed test leaves its images
 attached until the next run's sweep (01_storage.md, "How the APFS host degrades" §2).
 
+The genuine-Nx CLI fixtures use the normal enabled daemon (16_build_volumes.md, "The Nx daemon stays on"). Both halves
+of the declared-versus-undeclared output witness require a seeded, actually adopted build volume through the typed land
+report: an empty findings list after a busy-volume skip is not evidence that a declared output restored and hit.
+
+The carry/rebase walk and the paired declared/undeclared adoption walk use the existing 60s lifecycle class. The former
+completed in 34.983s on a low-load host and 45.446s at load 33.20; the latter, with both actual-adoption oracles, took
+48.335s at load 22.47. These are complete-run samples, not quiet medians; neither the default nor aggregate bound
+changes.
+
 **Host limit.** The host's disk-image attach pool runs out (01_storage.md, "How the APFS host degrades" §2), and the
 suite stops spending into a spent one. Fixtures attach an image once and share it across the assertions that need it
 rather than each re-attaching. Every real-APFS fixture image (`tests/support/blank_image.rs`) first passes
