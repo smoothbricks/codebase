@@ -2019,16 +2019,20 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
         Ok(())
     }
 
-    /// Create a blank sparse RAW image, attach it without mounting, and format its whole device as one
-    /// case-sensitive APFS volume (`newfs_apfs -e`) owned by the invoking user (`-U`/`-G`).
-    /// Nothing here runs as root.
+    /// Create a blank sparse RAW image, attach it without mounting, format its whole device as one
+    /// case-sensitive APFS volume (`newfs_apfs -e`) owned by the invoking user (`-U`/`-G`), verify
+    /// it and detach it: the blank template mint's sequence (01_storage.md), so no caller detaches
+    /// a volume the template path would have checked first. Nothing here runs as root.
     fn create_raw(&self, path: &Path, request: &CreateImageRequest) -> Result<(), ApfsError> {
         validate_image_path(path)?;
         let _lease = self.image_lease(path)?;
         self.create_blank_unlocked(path, request)?;
         let whole_device = self.attach_and_format_unlocked(path, request)?;
-        self.detach_image_device_unlocked(path, &whole_device, DetachIntent::Release)?;
-        Ok(())
+        let attachment = self
+            .verify_formatted_unlocked(path)
+            .map_err(|primary| self.release_failed_format(path, &whole_device, primary))?;
+        attachment.release_pin();
+        self.detach_image_device_unlocked(path, &whole_device, DetachIntent::Release)
     }
 
     fn create_blank_unlocked(
@@ -5214,6 +5218,16 @@ mod tests {
         )])
     }
 
+    /// The mapping a blank image's attach on `/dev/disk8` shows once `newfs_apfs` put its
+    /// container and volume on it: what the verify before the final detach reads.
+    fn formatted_on_disk8(image: impl AsRef<Path>) -> Reply {
+        let image = attachment_inventory_path(image.as_ref()).unwrap();
+        images(&[(
+            image.to_str().unwrap(),
+            &["/dev/disk8", "/dev/disk5", "/dev/disk5s1"][..],
+        )])
+    }
+
     /// One command-contract walk covers strict recorded input selection, readonly attach and
     /// fsck, then a retained-source cleanup dissent that must never escalate to force.
     #[test]
@@ -6323,21 +6337,29 @@ mod tests {
             ok(BLANK_IMAGE_PLIST),
             holding(&image, "/dev/disk8"),
             ok([]),
-            holding(&image, "/dev/disk8"),
+            formatted_on_disk8(&image),
+            formatted_on_disk8(&image),
+            ok([]),
+            formatted_on_disk8(&image),
             ok([]),
             no_images(),
         ]);
         backend.create_staged_image(&blank_request(stem)).unwrap();
 
         let steps = backend.runner().steps();
-        assert_eq!(steps.len(), 8);
+        assert_eq!(steps.len(), 11);
         assert_eq!(steps[4].command().program, Path::new(NEWFS_APFS));
         assert_eq!(steps[5], Seen::Inventory);
+        assert_eq!(steps[6], Seen::Inventory);
+        // The formatted volume is verified before its detach, as the template mint does.
+        assert_eq!(steps[7].command().program, Path::new(FSCK_APFS));
+        assert_eq!(argv(steps[7].command()), ["-q", "/dev/rdisk5s1"]);
+        assert_eq!(steps[8], Seen::Inventory);
         assert_eq!(
-            argv(steps[6].command()),
+            argv(steps[9].command()),
             ["detach", "-verbose", "/dev/disk8"]
         );
-        assert_eq!(steps[7], Seen::Inventory);
+        assert_eq!(steps[10], Seen::Inventory);
         assert!(
             !commands(&steps)
                 .iter()
@@ -6442,6 +6464,9 @@ mod tests {
             no_images(),
             ok(BLANK_IMAGE_PLIST),
             holding(&image, "/dev/disk8"),
+            ok([]),
+            formatted_on_disk8(&image),
+            formatted_on_disk8(&image),
             ok([]),
             unreadable_inventory(),
         ]);
@@ -6690,7 +6715,10 @@ mod tests {
             ok(BLANK_IMAGE_PLIST),
             holding(&image, "/dev/disk8"),
             ok([]),
-            holding(&image, "/dev/disk8"),
+            formatted_on_disk8(&image),
+            formatted_on_disk8(&image),
+            ok([]),
+            formatted_on_disk8(&image),
             failed(16, "busy"),
         ]));
         let error = backend
