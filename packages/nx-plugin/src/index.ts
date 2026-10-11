@@ -105,9 +105,18 @@ const WORKSPACE_TSCONFIG_BASE_INPUT = '{workspaceRoot}/tsconfig.base.json';
  * name, version and dependency specifiers — and every one of those is already
  * hashed from the member's own `package.json`. Dropping that section keeps the
  * resolution table, which is the reason the lockfile is an input at all.
+ *
+ * The root manifest also drops `scripts`, `smoo` and `nx`. No lint or
+ * typecheck reads them: `scripts` are commands a developer runs, `smoo` holds
+ * the developer links whose linked bytes reach the hash only through their own
+ * inputs, and the root project's `nx` configuration is hashed as that
+ * project's configuration. Hashing them made a root `postinstall` edit or a
+ * developer-link edit re-key every lint task (74, measured in a consumer
+ * workspace). The dependency fields, `overrides`, `patchedDependencies` and
+ * `workspaces` stay hashed.
  */
 const VERSIONLESS_TOOLCHAIN_MANIFEST_INPUTS = [
-  { json: '{workspaceRoot}/package.json', excludeFields: ['version'] },
+  { json: '{workspaceRoot}/package.json', excludeFields: ['version', 'scripts', 'smoo', 'nx'] },
   { json: '{workspaceRoot}/bun.lock', excludeFields: ['workspaces'] },
 ];
 

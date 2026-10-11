@@ -191,7 +191,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       const checkToolchainInputs = [
         '{workspaceRoot}/patches/**/*',
         '{workspaceRoot}/tsconfig.base.json',
-        { json: '{workspaceRoot}/package.json', excludeFields: ['version'] },
+        { json: '{workspaceRoot}/package.json', excludeFields: ['version', 'scripts', 'smoo', 'nx'] },
         { json: '{workspaceRoot}/bun.lock', excludeFields: ['workspaces'] },
       ];
       expect(targets.typecheck?.inputs).toEqual([
@@ -259,7 +259,9 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         '{workspaceRoot}/tsconfig.base.json',
         // Hashed by Nx itself: a `json` input costs no process, and neither
         // does the crate digest that replaces the manifests below.
-        { json: '{workspaceRoot}/package.json', excludeFields: ['version'] },
+        // The root manifest's scripts, smoo and nx sections are read by no check: an
+        // edit to a script or a developer link must not re-key every lint and typecheck.
+        { json: '{workspaceRoot}/package.json', excludeFields: ['version', 'scripts', 'smoo', 'nx'] },
         { json: '{workspaceRoot}/bun.lock', excludeFields: ['workspaces'] },
       ];
 
@@ -380,7 +382,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         '^production',
         '{workspaceRoot}/patches/**/*',
         '{workspaceRoot}/tsconfig.base.json',
-        { json: '{workspaceRoot}/package.json', excludeFields: ['version'] },
+        { json: '{workspaceRoot}/package.json', excludeFields: ['version', 'scripts', 'smoo', 'nx'] },
         { json: '{workspaceRoot}/bun.lock', excludeFields: ['workspaces'] },
         '{projectRoot}/tsconfig.lib.json',
       ]);
@@ -417,7 +419,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       const checkToolchain = [
         '{workspaceRoot}/patches/**/*',
         ...configChain,
-        { json: '{workspaceRoot}/package.json', excludeFields: ['version'] },
+        { json: '{workspaceRoot}/package.json', excludeFields: ['version', 'scripts', 'smoo', 'nx'] },
         { json: '{workspaceRoot}/bun.lock', excludeFields: ['workspaces'] },
       ];
       expect(targets.typecheck?.inputs).toEqual([
@@ -506,7 +508,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         '{workspaceRoot}/tsconfig.base.json',
         '{workspaceRoot}/packages/example/tsconfig.cycle.json',
         '{workspaceRoot}/packages/example/tsconfig.lib.json',
-        { json: '{workspaceRoot}/package.json', excludeFields: ['version'] },
+        { json: '{workspaceRoot}/package.json', excludeFields: ['version', 'scripts', 'smoo', 'nx'] },
         { json: '{workspaceRoot}/bun.lock', excludeFields: ['workspaces'] },
         '{projectRoot}/tsconfig.lib.json',
       ]);
@@ -548,7 +550,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         '{workspaceRoot}/patches/**/*',
         '{workspaceRoot}/tsconfig.base.json',
         '{workspaceRoot}/packages/tsconfig/base.json',
-        { json: '{workspaceRoot}/package.json', excludeFields: ['version'] },
+        { json: '{workspaceRoot}/package.json', excludeFields: ['version', 'scripts', 'smoo', 'nx'] },
         { json: '{workspaceRoot}/bun.lock', excludeFields: ['workspaces'] },
         '{projectRoot}/tsconfig.lib.json',
       ]);
@@ -583,7 +585,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         '^production',
         '{workspaceRoot}/patches/**/*',
         '{workspaceRoot}/tsconfig.base.json',
-        { json: '{workspaceRoot}/package.json', excludeFields: ['version'] },
+        { json: '{workspaceRoot}/package.json', excludeFields: ['version', 'scripts', 'smoo', 'nx'] },
         { json: '{workspaceRoot}/bun.lock', excludeFields: ['workspaces'] },
         '{projectRoot}/tsconfig.lib.json',
       ]);

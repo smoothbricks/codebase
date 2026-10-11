@@ -357,6 +357,11 @@ them by field instead: a `json` input with `excludeFields` for `package.json#ver
 this costs no process. Everything else still counts: a dependency range, an export map, and the lockfile's resolution
 table.
 
+The workspace root manifest also drops `scripts`, `smoo` and `nx` from these three targets' hash. No check reads them:
+scripts are commands a developer runs, `smoo.developerLinks` names links whose linked bytes reach a hash only through
+their own inputs, and the root project's `nx` configuration is hashed as that project's configuration. Hashing them made
+a root `postinstall` or developer-link edit re-key every lint and typecheck in the workspace.
+
 Crate manifests are the one kind Nx cannot hash by field, because TOML has no such input. The plugin hashes them itself,
 in the process that builds the graph and is already reading them: a single forward scan over the bytes feeds the hasher
 every run it keeps, dropping `[package].version` and the `[workspace.package].version` members inherit and nothing else
