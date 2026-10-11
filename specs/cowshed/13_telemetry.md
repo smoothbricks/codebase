@@ -466,7 +466,7 @@ as its own spans.
 
 - **Real distributions.** Every attach/clonefile/fsck ever run is the dataset; the n=20 benchmark problem dissolves.
 - **Query-time correlation** links the numeric `job_id` to standard lmao trace/thread/span identity and replaces runtime
-  ID-plumbing through uncooperative tools (the tier-2 interval join, lineage walks, "what could this workspace reach at
+  ID-plumbing through uncooperative tools (the tier-3 interval join, lineage walks, "what could this workspace reach at
   time T vs what it tried").
 - **Fleet questions, zero infra** — egress-denial hot spots, mirror hit rates, image-growth trajectories, grant churn,
   per-task cost — as queries over local files.

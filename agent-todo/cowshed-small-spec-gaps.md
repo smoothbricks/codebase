@@ -100,7 +100,9 @@ done. They are independent of each other.
 - Work: build the four proxy variables per job at spawn, with `job-<job_id>` as the username; a warm shell host is
   activated before its job exists, so the job's values are applied at the spawn of its command, not at activation. In
   the gateway, parse the username, accept `job-<decimal job id>` as attribution and anything else as none, keep the
-  password as the only credential, and write the job id on the gateway request span.
+  password as the only credential, and write the job id on the gateway request span. Update the user docs that state the
+  fixed `cowshed` username: `packages/cowshed/docs/gateway.md:30-36` and `:224`, and
+  `packages/cowshed/docs/troubleshooting.md:105`.
 - Acceptance: two overlapping jobs in one workspace each run `curl` through the proxy; each gateway span names its own
   job id. A request whose username is `job-<id>` with a wrong token is still 401. The existing
   `proxy_url_carries_the_token_as_basic_auth_userinfo` test is rewritten for the per-job URL.
@@ -117,9 +119,13 @@ done. They are independent of each other.
 
 ## cowshed-helper
 
-- Spec: `specs/cowshed/09_substrates.md:277`, `00_overview.md:137`, `08_testing.md:177`, `10_ci.md:22,143`: Linux ZFS
-  mutations go through `cowshed-helper`, a minimal root binary with a fixed verb set that refuses any dataset outside
-  `<pool>/cowshed/`.
+- Spec: `specs/cowshed/09_substrates.md:278-287`, `00_overview.md:137`, `08_testing.md:177`, `10_ci.md:22,152`: Linux
+  ZFS mutations go through `cowshed-helper`, a minimal root binary with a fixed verb set that refuses any dataset
+  outside `<pool>/cowshed/`. Its `promote` verb serves only the CI refresh promotion (`10_ci.md:71-79`,
+  `09_substrates.md:271`).
 - Code: no crate; an argument parser was started and removed (`29f212088`).
-- Work: the crate, its fixed verbs, and dataset validation; part of the Linux substrate.
-- Acceptance: the helper refuses a dataset outside `<pool>/cowshed/` and any verb outside its set.
+- Work: the crate, its fixed verbs, and dataset validation; part of the Linux substrate. `promote` accepts only a
+  refresh clone whose origin is a snapshot of the project's main.
+- Acceptance: the helper refuses a dataset outside `<pool>/cowshed/`, any verb outside its set, and a `promote` of any
+  dataset but a refresh clone of main. A refresh promotion followed by `rm` of every job clone leaves the previous main
+  reclaimable by `gc`, and the snapshot graph is again main at the center.
