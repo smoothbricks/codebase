@@ -219,6 +219,17 @@ export const parseCpuMicros = (json: string): Api.CpuMicros => assertCpuMicros(J
 export const assertCpuMicrosList = typia.createAssertEquals<readonly Api.CpuMicros[]>();
 export const parseCpuMicrosList = (json: string): readonly Api.CpuMicros[] => assertCpuMicrosList(JSON.parse(json));
 
+export const assertCpuMicrosDelta = typia.createAssertEquals<Api.CpuMicrosDelta>();
+export const parseCpuMicrosDelta = (json: string): Api.CpuMicrosDelta => assertCpuMicrosDelta(JSON.parse(json));
+export const assertCpuMicrosDeltaList = typia.createAssertEquals<readonly Api.CpuMicrosDelta[]>();
+export const parseCpuMicrosDeltaList = (json: string): readonly Api.CpuMicrosDelta[] =>
+  assertCpuMicrosDeltaList(JSON.parse(json));
+
+export const assertCpuMillis = typia.createAssertEquals<Api.CpuMillis>();
+export const parseCpuMillis = (json: string): Api.CpuMillis => assertCpuMillis(JSON.parse(json));
+export const assertCpuMillisList = typia.createAssertEquals<readonly Api.CpuMillis[]>();
+export const parseCpuMillisList = (json: string): readonly Api.CpuMillis[] => assertCpuMillisList(JSON.parse(json));
+
 export const assertCpuTotals = typia.createAssertEquals<Api.CpuTotals>();
 export const parseCpuTotals = (json: string): Api.CpuTotals => assertCpuTotals(JSON.parse(json));
 export const assertCpuTotalsList = typia.createAssertEquals<readonly Api.CpuTotals[]>();
@@ -480,6 +491,13 @@ export const assertJobJournalCursorList = typia.createAssertEquals<readonly Api.
 export const parseJobJournalCursorList = (json: string): readonly Api.JobJournalCursor[] =>
   assertJobJournalCursorList(JSON.parse(json));
 
+export const assertJobLeafAttribution = typia.createAssertEquals<Api.JobLeafAttribution>();
+export const parseJobLeafAttribution = (json: string): Api.JobLeafAttribution =>
+  assertJobLeafAttribution(JSON.parse(json));
+export const assertJobLeafAttributionList = typia.createAssertEquals<readonly Api.JobLeafAttribution[]>();
+export const parseJobLeafAttributionList = (json: string): readonly Api.JobLeafAttribution[] =>
+  assertJobLeafAttributionList(JSON.parse(json));
+
 export const assertJobListeningPorts = typia.createAssertEquals<Api.JobListeningPorts>();
 export const parseJobListeningPorts = (json: string): Api.JobListeningPorts =>
   assertJobListeningPorts(JSON.parse(json));
@@ -498,6 +516,12 @@ export const parseJobProcessEvent = (json: string): Api.JobProcessEvent => asser
 export const assertJobProcessEventList = typia.createAssertEquals<readonly Api.JobProcessEvent[]>();
 export const parseJobProcessEventList = (json: string): readonly Api.JobProcessEvent[] =>
   assertJobProcessEventList(JSON.parse(json));
+
+export const assertJobProcessLeaf = typia.createAssertEquals<Api.JobProcessLeaf>();
+export const parseJobProcessLeaf = (json: string): Api.JobProcessLeaf => assertJobProcessLeaf(JSON.parse(json));
+export const assertJobProcessLeafList = typia.createAssertEquals<readonly Api.JobProcessLeaf[]>();
+export const parseJobProcessLeafList = (json: string): readonly Api.JobProcessLeaf[] =>
+  assertJobProcessLeafList(JSON.parse(json));
 
 export const assertJobProcessSample = typia.createAssertEquals<Api.JobProcessSample>();
 export const parseJobProcessSample = (json: string): Api.JobProcessSample => assertJobProcessSample(JSON.parse(json));
@@ -648,6 +672,13 @@ export const assertNxCarry = typia.createAssertEquals<Api.NxCarry>();
 export const parseNxCarry = (json: string): Api.NxCarry => assertNxCarry(JSON.parse(json));
 export const assertNxCarryList = typia.createAssertEquals<readonly Api.NxCarry[]>();
 export const parseNxCarryList = (json: string): readonly Api.NxCarry[] => assertNxCarryList(JSON.parse(json));
+
+export const assertOneCoreCpuPercent = typia.createAssertEquals<Api.OneCoreCpuPercent>();
+export const parseOneCoreCpuPercent = (json: string): Api.OneCoreCpuPercent =>
+  assertOneCoreCpuPercent(JSON.parse(json));
+export const assertOneCoreCpuPercentList = typia.createAssertEquals<readonly Api.OneCoreCpuPercent[]>();
+export const parseOneCoreCpuPercentList = (json: string): readonly Api.OneCoreCpuPercent[] =>
+  assertOneCoreCpuPercentList(JSON.parse(json));
 
 export const assertOtherBuild = typia.createAssertEquals<Api.OtherBuild>();
 export const parseOtherBuild = (json: string): Api.OtherBuild => assertOtherBuild(JSON.parse(json));
@@ -1121,6 +1152,13 @@ export const assertStorageIoBytesList = typia.createAssertEquals<readonly Api.St
 export const parseStorageIoBytesList = (json: string): readonly Api.StorageIoBytes[] =>
   assertStorageIoBytesList(JSON.parse(json));
 
+export const assertStorageIoBytesDelta = typia.createAssertEquals<Api.StorageIoBytesDelta>();
+export const parseStorageIoBytesDelta = (json: string): Api.StorageIoBytesDelta =>
+  assertStorageIoBytesDelta(JSON.parse(json));
+export const assertStorageIoBytesDeltaList = typia.createAssertEquals<readonly Api.StorageIoBytesDelta[]>();
+export const parseStorageIoBytesDeltaList = (json: string): readonly Api.StorageIoBytesDelta[] =>
+  assertStorageIoBytesDeltaList(JSON.parse(json));
+
 export const assertStorageIoTotals = typia.createAssertEquals<Api.StorageIoTotals>();
 export const parseStorageIoTotals = (json: string): Api.StorageIoTotals => assertStorageIoTotals(JSON.parse(json));
 export const assertStorageIoTotalsList = typia.createAssertEquals<readonly Api.StorageIoTotals[]>();
@@ -1206,6 +1244,13 @@ export const parseUnattributedRun = (json: string): Api.UnattributedRun => asser
 export const assertUnattributedRunList = typia.createAssertEquals<readonly Api.UnattributedRun[]>();
 export const parseUnattributedRunList = (json: string): readonly Api.UnattributedRun[] =>
   assertUnattributedRunList(JSON.parse(json));
+
+export const assertUsageReconciliation = typia.createAssertEquals<Api.UsageReconciliation>();
+export const parseUsageReconciliation = (json: string): Api.UsageReconciliation =>
+  assertUsageReconciliation(JSON.parse(json));
+export const assertUsageReconciliationList = typia.createAssertEquals<readonly Api.UsageReconciliation[]>();
+export const parseUsageReconciliationList = (json: string): readonly Api.UsageReconciliation[] =>
+  assertUsageReconciliationList(JSON.parse(json));
 
 export const assertUtcTimestamp = typia.createAssertEquals<Api.UtcTimestamp>();
 export const parseUtcTimestamp = (json: string): Api.UtcTimestamp => assertUtcTimestamp(JSON.parse(json));

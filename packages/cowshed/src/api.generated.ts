@@ -363,6 +363,21 @@ export type CowshedError = {
 export type CpuMicros = number & tags.Type<'uint64'> & tags.Maximum<9007199254740991>;
 
 /**
+ * A signed CPU difference in microseconds: a job's independent total less the CPU its observed
+ * processes counted as their own. Never clamped: observation can miss work, and on macOS it
+ * can also see work its source does not count yet.
+ */
+export type CpuMicrosDelta = number &
+  tags.Type<'int64'> &
+  tags.Minimum<-9007199254740991> &
+  tags.Maximum<9007199254740991>;
+
+/**
+ * CPU time in whole milliseconds; only [`CpuMicros::millis`] makes one.
+ */
+export type CpuMillis = number & tags.Type<'uint64'> & tags.Maximum<9007199254740991>;
+
+/**
  * User and system CPU time, each cumulative from the start of whatever it counts.
  */
 export type CpuTotals = {
@@ -774,19 +789,28 @@ export type IdentityReport = {
 };
 
 /**
- * A job's CPU totals and the independent source that counted them, never a sum of the
- * processes a sampler happened to see (that sum misses every descendant born and reaped between
- * two samples). Each variant's documentation names what its source cannot count.
+ * A job's totals and the independent source that counted them, never a sum of the processes a
+ * sampler happened to see (that sum misses every descendant born and reaped between two
+ * samples), each reconciled against those processes. Each variant's documentation names what
+ * its source cannot count.
  */
-export type JobAccounting = { readonly kind: 'macOsRusageChildren' } & {
-  readonly cpu: CpuTotals;
-  /**
-   * Always absent: the children accumulators carry no disk I/O bytes, so the source has
-   * no job total. Never zero in its place, and never `ri_child_pageins` operations
-   * converted into bytes.
-   */
-  readonly io: StorageIoTotals | null;
-};
+export type JobAccounting =
+  | ({ readonly kind: 'linuxCgroupV2' } & {
+      readonly cpu: CpuTotals;
+      readonly io: StorageIoTotals;
+      readonly chargedMemory: ChargedMemoryUsage;
+      readonly reconciliation: UsageReconciliation;
+    })
+  | ({ readonly kind: 'macOsRusageChildren' } & {
+      readonly cpu: CpuTotals;
+      /**
+       * Always absent: the children accumulators carry no disk I/O bytes, so the source has
+       * no job total. Never zero or `null` in its place, and never `ri_child_pageins`
+       * operations converted into bytes.
+       */
+      readonly io?: StorageIoTotals;
+      readonly reconciliation: UsageReconciliation;
+    });
 
 /**
  * Why a job failed when no command's own status explains it.
@@ -828,6 +852,22 @@ export type JobJournalCursor = {
   readonly stdout: number & tags.Type<'uint64'>;
   readonly stderr: number & tags.Type<'uint64'>;
 };
+
+/**
+ * Which observed process, live or exited, a job's CPU went to most, named only when the
+ * observed processes' own CPU covers at least the supervisor's configured share of the job's
+ * accounted CPU. Never a guessed winner among processes the observation missed.
+ */
+export type JobLeafAttribution =
+  | ({ readonly kind: 'attributed' } & {
+      readonly leaf: JobProcessLeaf;
+      readonly observedCpuPermille: number & tags.Type<'uint32'> & tags.Maximum<65535>;
+    })
+  | ({ readonly kind: 'unattributed' } & {
+      readonly observedCpuPermille: number & tags.Type<'uint32'> & tags.Maximum<65535>;
+      readonly requiredPermille: number & tags.Type<'uint32'> & tags.Maximum<65535>;
+    })
+  | { readonly kind: 'noAccountedCpu' };
 
 /**
  * The TCP ports on which processes of the job's group listen, read from the kernel at
@@ -881,6 +921,15 @@ export type JobProcessEvent =
       readonly index: number & tags.Type<'uint32'>;
       readonly process: JobProcessSample;
     });
+
+/**
+ * The process a job's CPU went to most: its pid and the image it last ran.
+ */
+export type JobProcessLeaf = {
+  readonly pid: number & tags.Type<'uint32'>;
+  readonly program: string;
+  readonly argv: ReadonlyArray<CommandArg>;
+};
 
 /**
  * One life of one process: the image it runs now (or ran last), its parent, and how it ended.
@@ -967,6 +1016,23 @@ export type JobResourceSample = {
    */
   readonly members: ReadonlyArray<number & tags.Type<'uint32'>>;
   /**
+   * The observed process with the most own CPU, or why none is named.
+   */
+  readonly leaf: JobLeafAttribution;
+  /**
+   * `accounting`'s user CPU in whole milliseconds, converted once from its microseconds.
+   */
+  readonly cpuUserMs: CpuMillis;
+  /**
+   * `accounting`'s system CPU in whole milliseconds, converted once from its microseconds.
+   */
+  readonly cpuSysMs: CpuMillis;
+  /**
+   * The job's user plus system CPU over the window since the supervisor's preceding sample,
+   * as a share of one core. A read never opens or closes that window.
+   */
+  readonly cpuPct: OneCoreCpuPercent;
+  /**
    * Captured once with the first owned process, even when that process is activation.
    */
   readonly hostStart: HostLoadSample;
@@ -984,11 +1050,10 @@ export type JobResourceSample = {
    */
   readonly rssPeakBytes: ResidentBytes;
   /**
-   * The job's CPU totals as of this boundary, from its platform's independent source, within
-   * the limits that source names. Absent only where no source exists yet (Linux, until its
-   * cgroup v2 totals).
+   * The job's totals as of this boundary, from its platform's independent source, within the
+   * limits that source names, reconciled against the processes this sampler observed.
    */
-  readonly accounting: JobAccounting | null;
+  readonly accounting: JobAccounting;
   /**
    * Each of the job's volumes: its used-bytes change since spawn, or why it has none.
    */
@@ -1235,6 +1300,12 @@ export type NxCarry = {
    */
   readonly stopped?: string;
 };
+
+/**
+ * A share of one CPU core over an elapsed window, in percent: 100 is one core kept busy for the
+ * whole window, so a parallel group exceeds it. Finite and non-negative, like [`HostLoad1`].
+ */
+export type OneCoreCpuPercent = number & tags.Minimum<0> & tags.Maximum<1.7976931348623157e308>;
 
 /**
  * The daemon serves only its own build, and refused a request from another (11_shell.md
@@ -2002,6 +2073,15 @@ export type StepReport =
 export type StorageIoBytes = number & tags.Type<'uint64'> & tags.Maximum<9007199254740991>;
 
 /**
+ * A signed storage byte difference: a job's independent total less what its observed
+ * processes counted as their own.
+ */
+export type StorageIoBytesDelta = number &
+  tags.Type<'int64'> &
+  tags.Minimum<-9007199254740991> &
+  tags.Maximum<9007199254740991>;
+
+/**
  * Bytes a job's accounting source counted as read from and written to storage.
  */
 export type StorageIoTotals = {
@@ -2115,6 +2195,21 @@ export type UnattributedRun =
   | ({ readonly kind: 'uncovered' } & {
       readonly targets: ReadonlyArray<string>;
     });
+
+/**
+ * How a job's independent totals compare with what its observed processes counted as their
+ * own: each signed difference is the total less the observed sum, never clamped, and the
+ * coverage says whether the observed processes are all the job ran.
+ */
+export type UsageReconciliation = {
+  readonly cpuUs: CpuMicrosDelta;
+  /**
+   * Absent where the source or the observed processes have no storage bytes to compare.
+   */
+  readonly ioReadBytes?: StorageIoBytesDelta;
+  readonly ioWriteBytes?: StorageIoBytesDelta;
+  readonly coverage: ProcessCoverage;
+};
 
 export type UtcTimestamp = string;
 

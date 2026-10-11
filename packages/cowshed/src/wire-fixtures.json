@@ -179,7 +179,26 @@
       "pid": 4243,
       "repoId": "smoothbricks/codebase",
       "resources": {
-        "accounting": null,
+        "accounting": {
+          "cpu": {
+            "sysUs": 0,
+            "userUs": 0
+          },
+          "kind": "macOsRusageChildren",
+          "reconciliation": {
+            "coverage": {
+              "kind": "gap",
+              "reason": {
+                "kind": "uncountedFork",
+                "pid": 4243
+              }
+            },
+            "cpuUs": 0
+          }
+        },
+        "cpuPct": 0.0,
+        "cpuSysMs": 0,
+        "cpuUserMs": 0,
         "host": {
           "cores": 10,
           "load1": 2.5
@@ -190,6 +209,9 @@
         },
         "jobId": 3,
         "leaderPid": 4243,
+        "leaf": {
+          "kind": "noAccountedCpu"
+        },
         "members": [],
         "rssBytes": 0,
         "rssPeakBytes": 12582912,
@@ -573,9 +595,21 @@
               "sysUs": 310250,
               "userUs": 2180500
             },
-            "io": null,
-            "kind": "macOsRusageChildren"
+            "kind": "macOsRusageChildren",
+            "reconciliation": {
+              "coverage": {
+                "kind": "gap",
+                "reason": {
+                  "kind": "uncountedFork",
+                  "pid": 4242
+                }
+              },
+              "cpuUs": -12500
+            }
           },
+          "cpuPct": 87.5,
+          "cpuSysMs": 310,
+          "cpuUserMs": 2180,
           "host": {
             "cores": 10,
             "load1": 6.25
@@ -586,6 +620,20 @@
           },
           "jobId": 2,
           "leaderPid": 4242,
+          "leaf": {
+            "kind": "attributed",
+            "leaf": {
+              "argv": [
+                {
+                  "data": "cargo",
+                  "encoding": "utf8"
+                }
+              ],
+              "pid": 4242,
+              "program": "cargo"
+            },
+            "observedCpuPermille": 950
+          },
           "members": [4242, 4243],
           "rssBytes": 50331648,
           "rssPeakBytes": 100663296,
@@ -815,9 +863,21 @@
             "sysUs": 310250,
             "userUs": 2180500
           },
-          "io": null,
-          "kind": "macOsRusageChildren"
+          "kind": "macOsRusageChildren",
+          "reconciliation": {
+            "coverage": {
+              "kind": "gap",
+              "reason": {
+                "kind": "uncountedFork",
+                "pid": 4242
+              }
+            },
+            "cpuUs": -12500
+          }
         },
+        "cpuPct": 87.5,
+        "cpuSysMs": 310,
+        "cpuUserMs": 2180,
         "host": {
           "cores": 10,
           "load1": 6.25
@@ -828,6 +888,20 @@
         },
         "jobId": 2,
         "leaderPid": 4242,
+        "leaf": {
+          "kind": "attributed",
+          "leaf": {
+            "argv": [
+              {
+                "data": "cargo",
+                "encoding": "utf8"
+              }
+            ],
+            "pid": 4242,
+            "program": "cargo"
+          },
+          "observedCpuPermille": 950
+        },
         "members": [4242, 4243],
         "rssBytes": 50331648,
         "rssPeakBytes": 100663296,
@@ -1003,7 +1077,26 @@
       "pid": 4244,
       "repoId": "smoothbricks/codebase",
       "resources": {
-        "accounting": null,
+        "accounting": {
+          "cpu": {
+            "sysUs": 0,
+            "userUs": 0
+          },
+          "kind": "macOsRusageChildren",
+          "reconciliation": {
+            "coverage": {
+              "kind": "gap",
+              "reason": {
+                "kind": "uncountedFork",
+                "pid": 4244
+              }
+            },
+            "cpuUs": 0
+          }
+        },
+        "cpuPct": 0.0,
+        "cpuSysMs": 0,
+        "cpuUserMs": 0,
         "host": {
           "cores": 10,
           "load1": 2.5
@@ -1014,6 +1107,9 @@
         },
         "jobId": 4,
         "leaderPid": 4244,
+        "leaf": {
+          "kind": "noAccountedCpu"
+        },
         "members": [],
         "rssBytes": 0,
         "rssPeakBytes": 12582912,
