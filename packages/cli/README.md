@@ -64,6 +64,8 @@ smoo github-ci ensure-pull-request --head <branch> --base <branch> --title <titl
 
 smoo playwright ensure chromium
 smoo playwright run <command> [args...]
+
+smoo nx refresh-test-timings <project>
 ```
 
 An option value smoo cannot honour is refused before the command runs, as one line naming the option, the value given
@@ -316,6 +318,14 @@ Concrete targets use `{tool}-{output}` names and describe the tool that runs and
 This CLI's `cli:test` target runs the slow shell-entry integration file on its own and divides every other Bun test file
 across four native `--shard` targets. All five bounded targets must pass; the four shards ignore only the shell-entry
 file, so new tests discovered under `src/` remain in the suite without maintaining a file list or extending its timeout.
+
+`smoo nx refresh-test-timings <project>` rewrites a project's `--timings` manifest. It runs the project's `bun test`
+shard command once without `--shard`, plus `--update-timings`, in the shards' cwd, so Bun writes every test file's
+measured duration into the first `--timings` manifest. Bun merges into that manifest, so entries for deleted files stay
+and are harmless. If the suite fails, the command exits non-zero without checking coverage; Bun still writes that run's
+durations, so fix the suite and run the command again. Otherwise the command fails listing any test file the manifest
+still does not name. The nx-plugin's inferred `shard-timings` check, which `lint` depends on, prints this command when a
+test file is missing from the manifest.
 
 Release fixtures enable Nx performance and verbose daemon logging in their child environment. A body failure or a test
 ending before its fixture is released prints the fixture's daemon log into the retained test output before cleanup. This

@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/schema",
+  "version": 2,
+  "title": "Shard Timings Executor",
+  "description": "Fail when a timings-sharded bun test suite runs a file its --timings manifest does not name.",
+  "type": "object",
+  "cli": "nx",
+  "required": ["cwd", "args"],
+  "properties": {
+    "cwd": {
+      "type": "string",
+      "description": "Where the shards run bun test, relative to the workspace root."
+    },
+    "args": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "The bun test arguments every shard shares, without --shard."
+    }
+  },
+  "additionalProperties": false
+}

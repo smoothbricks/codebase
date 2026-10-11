@@ -1888,6 +1888,25 @@ async function createProjectTargets(
     }
   }
 
+  // A Bun suite that `--shard` splits and a `--timings` manifest balances gets a
+  // check, which `lint` depends on, that the manifest names every file the
+  // shards run: Bun charges an unnamed file the median, and unnamed files
+  // cluster into one shard. Uncached, because Bun's discovery also finds
+  // gitignored files that no Nx input keys, and the check only walks a tree.
+  const sharded = timingsShardedSuite(projectRoot, declaredTargets);
+  if (!sharded.ok) {
+    throw new Error(`${packageJsonPath}: ${sharded.error}`);
+  }
+  if (sharded.suite !== null) {
+    targets[SHARD_TIMINGS_TARGET] = {
+      executor: SHARD_TIMINGS_EXECUTOR,
+      cache: false,
+      outputs: [],
+      options: { cwd: sharded.suite.cwd, args: sharded.suite.args },
+    };
+    validationTargets.push(SHARD_TIMINGS_TARGET);
+  }
+
   const {
     commands: lintCommands,
     inputs: lintProgramInputs,

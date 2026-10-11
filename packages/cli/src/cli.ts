@@ -461,6 +461,12 @@ function buildProgram(): Command {
       const { listProjects } = await import('./nx/index.js');
       await listProjects(await findRepoRoot(), options);
     });
+  nx.command('refresh-test-timings <project>')
+    .description("Rewrite a project's Bun --timings manifest from one unsharded run of its sharded suite")
+    .action(async (project: string) => {
+      const { refreshTestTimings } = await import('./nx/index.js');
+      await refreshTestTimings(await findRepoRoot(), project);
+    });
 
   const githubCi = program.command('github-ci').description('GitHub Actions helpers');
   githubCi

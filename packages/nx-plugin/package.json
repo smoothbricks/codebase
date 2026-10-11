@@ -69,6 +69,12 @@
       "import": "./dist/typecheck-test-policy.js",
       "default": "./dist/typecheck-test-policy.js"
     },
+    "./test-timings": {
+      "types": "./dist/test-timings.d.ts",
+      "development": "./src/test-timings.ts",
+      "import": "./dist/test-timings.js",
+      "default": "./dist/test-timings.js"
+    },
     "./ensure-built": {
       "types": "./dist/ensure-built.d.ts",
       "development": "./src/ensure-built.ts",
