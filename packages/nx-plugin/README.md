@@ -60,9 +60,12 @@ override precedence.
 The plugin's own `nx run nx-plugin:test` aggregates four bounded Bun targets. Each uses Bun's native
 `--timings=test-timings.json --shard=N/4` partition to balance measured per-file work, while normal discovery still runs
 every test file (including newly added files) exactly once. A failed shard fails the aggregate. The shard count and
-standard 120-second target deadline stay unchanged. Refresh the portable timing manifest from this package directory
-with `bun test --timeout=30000 --timings=test-timings.json --update-timings`; it is scheduling data, not a test
-allowlist.
+standard 120-second target deadline stay unchanged. Bun cuts the path-sorted files into four contiguous runs and costs a
+file the manifest does not name at the manifest's median, so files added without a refresh cluster into one shard and
+can push it past its deadline. Refresh the portable timing manifest from this package directory after adding or slowing
+a test file, with
+`bun test --timeout=30000 --timings=test-timings.json --update-timings --path-ignore-patterns='**/*-host.test.ts'`; it
+is scheduling data, not a test allowlist.
 
 Real Nx fixtures own their cache and workspace-data directories and stop their daemon before removing the fixture.
 Fixtures that intentionally strip caller directory overrides declare `cacheDirectory: ".nx/cache"` in their own
