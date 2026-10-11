@@ -14,6 +14,7 @@ import {
   leaseProcessesOn,
   mountsBelow,
   operationDisk,
+  RAM_TEMP_CAPACITY_BYTES,
   ramDisksIn,
   ramTempPaths,
 } from './ram-temp.js';
@@ -89,12 +90,18 @@ describe('RAM temp volume output parsing', () => {
   it('mounts where DiskArbitration puts it, short enough to hold sockets', () => {
     // sun_path is 104 bytes; a lease directory leaves room for nested fixture paths.
     expect(ramTempPaths({ uid: 501, username: 'ada' })).toEqual({
-      mountpoint: '/Volumes/smoo-ram-501',
-      lockFile: '/private/tmp/smoo-ram-501.lock',
-      volumeName: 'smoo-ram-501',
-      stagingName: 'smoo-ram-501-new',
+      mountpoint: '/Volumes/smoo-ram2-501',
+      lockFile: '/private/tmp/smoo-ram2-501.lock',
+      volumeName: 'smoo-ram2-501',
+      stagingName: 'smoo-ram2-501-new',
       user: 'ada',
     });
+  });
+
+  it("never shares a volume or a RAM disk size with revision 1's checkouts", () => {
+    // Revision 1 used /Volumes/smoo-ram-<uid> and ram://16777216; a creator's stray reclaim matches
+    // user and size, so equal sizes would let either revision detach the other's attaching disk.
+    expect(RAM_TEMP_CAPACITY_BYTES / 512).toBe(16777218);
   });
 });
 

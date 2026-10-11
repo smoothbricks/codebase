@@ -45,6 +45,7 @@ interface SharedFixture {
   readonly root: string;
   readonly targets: Readonly<Record<string, TargetConfiguration>>;
   readonly listCommand: string;
+  readonly passingSeed: BoundedExecRecord;
 }
 
 /** A child this test started and has not yet seen close, with the command line that names it. */
@@ -120,7 +121,9 @@ ${expected.map((name) => `    #[test] fn ${name}() { record("${name}");${serial.
     if (typeof listCommand !== 'string') throw new Error(`${GROUP_TARGET} inferred no listCommand`);
     // The archive is the one real prerequisite: every runner executes its binaries.
     await run(root, ['sh', '-c', command(targets, 'cargo-test-archive')]);
-    shared = { root, targets, listCommand };
+    const source = { root, targets, listCommand };
+    const passingSeed = await groupSucceeds(source);
+    shared = { ...source, passingSeed };
   }),
 );
 
@@ -282,13 +285,15 @@ async function executesEveryTestOnce(): Promise<void> {
 
 /**
  * The real default group executor, run for real on this fixture in a driver process. Its verdict is typed
- * passed and returned to its caller: each refusal establishes its own seed, independent of every other case.
+ * passed and returned to its caller: fixture setup retains one real seed before any case runs.
  */
-async function groupSucceeds(): Promise<BoundedExecRecord> {
-  const { root, targets, listCommand } = fixture();
+async function groupSucceeds(
+  source: Pick<SharedFixture, 'root' | 'targets' | 'listCommand'> = fixture(),
+): Promise<BoundedExecRecord> {
+  const { root, targets, listCommand } = source;
   const directory = groupDirectory(root);
   const realCommand = command(targets, GROUP_TARGET);
-  // Main insists on --no-fail-fast: ordinary failures must not stop the remaining tests. Checked before any run.
+  // Group policy requires --no-fail-fast: ordinary failures must not stop the remaining tests. Checked before any run.
   expect(realCommand).toContain('--no-fail-fast');
   expect(realCommand).not.toContain('max-fail');
   // The probes read PARTITION_EXECUTIONS and PARTITION_FAIL_SERIAL from the environment. Each run sets them on the
@@ -316,16 +321,17 @@ async function groupSucceeds(): Promise<BoundedExecRecord> {
 }
 
 /**
- * Refuses one listing before any probe runs. The case first establishes its own passing verdict, then seeds
- * the stale verdict and report whose removal it observes. A timeout in another case cannot remove this
- * precondition. The marker log proves the refused run started no probe.
+ * Refuses one listing before any probe runs. The fixture's real passing run seeds the stale
+ * verdict and report whose removal each case observes, independent of every other case.
+ * The per-case marker log proves the refused run started no probe.
  */
 async function refuses(listCommand: string, reason: string): Promise<void> {
-  const { root, targets } = fixture();
+  const { root, targets, passingSeed } = fixture();
   const directory = groupDirectory(root);
-  await writeRecord(directory, await groupSucceeds());
+  await writeRecord(directory, passingSeed);
   await writeFile(join(directory, JUNIT_FILE), 'stale report\n');
   const refusalLog = join(root, 'group-refused.log');
+  await rm(refusalLog, { force: true });
   const refused = await runGroupExecutor(
     root,
     { command: command(targets, GROUP_TARGET), listCommand, cwd: root },

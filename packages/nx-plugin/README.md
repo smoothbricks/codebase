@@ -472,10 +472,11 @@ Concrete targets come from concrete files:
   tests once and the exceptional shards exactly the 13 exceptional ones. The suite builds one shared fixture and
   archive, then runs separate bounded cases through the real default serial-group executor: a successful count and run
   with the group's probes exactly once each, three refusals that run nothing and clear the task's previous verdict, and
-  a failing run whose ordinary failures still run the group's remaining probes. Each refusal establishes its own passing
-  verdict through the real executor before seeding stale evidence; it never relies on another case passing or running
-  first. Each case settles its owned processes before the next case starts; the fixture is removed only after the final
-  settlement.
+  a failing run whose ordinary failures still run the group's remaining probes. The shared fixture first produces one
+  real passing verdict, before any case runs. Each refusal copies that seed and removes its own marker log, so neither a
+  timed-out success case nor a prior refusal that wrongly ran can become another case's precondition. The success case
+  still runs and verifies the real executor independently. Each case settles its owned processes before the next case
+  starts; the fixture is removed only after the final settlement.
 - A repository's serial test groups each run in one runner, `cargo-test-group-<group>`, owned by the cargo workspace
   root beside `cargo-test-archive`. A group is declared once, in `<cargo-workspace>/.config/nextest.toml`: a
   `[test-groups.<group>]` table with `max-threads = 1`, and default-profile overrides that name it with `test-group` and
@@ -827,13 +828,35 @@ those belong to whoever attached them, so the lease and the volume are kept and 
 own `env.TMPDIR` wins over the lease. Inside a cowshed sandbox, which cannot write the lock in `/private/tmp`, the task
 keeps its inherited `TMPDIR` and says so once. A failed task that left the volume nearly full names the volume.
 
-The volume's kernel `O_EXLOCK` still admits only one mutation at a time and releases on process death. Contended opens
-use `O_NONBLOCK` and yield for 50 ms before retrying: a blocking open occupies a libuv filesystem worker, and four
-waiters can exhaust the pool while the holder's marker read or close needs a worker. A real Node host proof makes five
-concurrent lease requests with four filesystem workers and a one-token CPU pool; only one command runs at a time. The
-five-request production reproduction previously timed out at 15.002 s while the event loop stayed live and the holder's
-marker read never completed; after the fix, acquisition completed in 3.087 s and all releases in 6.581 s. No command or
-test timeout is raised to conceal this deadlock.
+The volume's kernel `O_EXLOCK` admits ledger mutations and releases on process death. It is held only for cheap lease
+and operation claims and their publication: host-wide process and disk-inventory probes, directory cleanup, provisioning
+and detach run outside it. A caller re-takes the lock and revalidates the volume, lease identity and its owned claim
+before publishing a mutation; another caller can take a lease while a dead lease is being inspected. An acquire that
+fails after taking its lease directory gives it back, and detaches the volume if that was the last lease, as the last
+release would have.
+
+Checkouts of this plugin from before the ledger lease under the kernel lock alone and never read the claims, so the two
+protocols must never share a volume. The protocol's revision (2) names the volume, its lock and its ledger, and adds as
+many sectors to the RAM disk: the creator's stray reclaim matches user and size, so neither revision detaches the
+other's disk, mounted or still attaching. On a host running both, each revision has its own volume.
+
+A creation or detach claim is void once its owner's pid is gone. A crashed owner whose pid was reused holds every caller
+waiting on the volume, and macOS gives no cheap way to tell the new process from the old without running `ps` under the
+lock. So every 15 s that a caller waits on the same claim, stderr names its kind, owner pid, token, ledger and the wait
+so far.
+
+Each reclaim pass reads at most one I/O Registry and mount-table snapshot, not one per lease. A dead lease held only by
+mounted filesystems keeps a positive verdict with stable mount and lease identities. A valid positive still names and
+retains it without another host-wide probe; an unmount exposes the underlying RAM device and triggers a fresh probe.
+Image-backed and otherwise unkeyable holds stay uncached: device-node reuse has no proven cheap incarnation key. Every
+pass that claims such a lease probes it again, with a process census and the pass's inventory, which take seconds on a
+busy host; that latency falls on the claiming task, outside the lock. A negative verdict is never cached, probe errors
+never stand in for an empty holder set, and held directories stay unchanged.
+
+Contended lock opens also use `O_NONBLOCK` and yield for 50 ms, avoiding a separate latent filesystem-worker deadlock
+when one Node process makes five concurrent requests with four workers. The observed gate failures instead came from
+cross-process waits behind long host-wide probes under the RAM lock. Real nested and sibling default-executor proofs run
+with background single-lease processes to cover that shape. No case or target timeout is raised.
 
 Once the process and holder checks permit removal, cleanup restores owner read/write/search permission on directories
 through no-follow directory handles before deleting the lease. Read-only fixture directories cannot strand a dead lease
@@ -841,9 +864,9 @@ and block later tasks. File modes and symlink targets stay untouched; a director
 instead of changing an attached volume. Held leases undergo no permission changes.
 
 The real RAM-volume regression walks one volume's lifecycle in a single test: unmarked debris and a live-lease refusal,
-recovery over the debris, concurrent leases, read-only directory removal, a held dead lease, owner detach and reclaim,
-and the final detach. It checks that external symlink targets and held directory modes stay unchanged, while avoiding
-duplicate provision and teardown; its 60 s case and 120 s shard bounds are unchanged.
+recovery over the debris, concurrent leases, failed-acquire lease/claim rollback, read-only cleanup, a held dead lease,
+owner detach and reclaim, and the final detach. External symlink targets and held directory modes stay unchanged,
+without duplicate provision and teardown; its 60 s case and 120 s shard bounds are unchanged.
 
 Whatever still works in a lease when its task ends is a leak, and is stopped before the lease goes. The usual one is a
 fixture's Nx daemon: Nx detaches it into a session of its own, so the process-group kill that ends a timed-out command
@@ -861,12 +884,12 @@ including an empty one, which recovers children reparented out of the tree. This
 stopped-table quiescence is still being established. The line is the leak check: a suite that prints it has a fixture to
 fix.
 
-The volume mounts at `/Volumes/smoo-ram-<uid>`, where DiskArbitration puts it: asking for any other mountpoint escalates
-to an administrator dialog that blocks every `diskutil` on the host. That mount is `noowners`, and launchd refuses a
-plist from it, so a test that bootstraps a launchd job keeps the plist outside `TMPDIR`.
+The volume mounts at `/Volumes/smoo-ram2-<uid>`, where DiskArbitration puts it: asking for any other mountpoint
+escalates to an administrator dialog that blocks every `diskutil` on the host. That mount is `noowners`, and launchd
+refuses a plist from it, so a test that bootstraps a launchd job keeps the plist outside `TMPDIR`.
 
-The volume is formatted, mounted and marked as `smoo-ram-<uid>-new`, then renamed into place, so a creator that dies
-part way never leaves an unmarked volume at `/Volumes/smoo-ram-<uid>` for the next one to dodge as `smoo-ram-<uid> 1`.
+The volume is formatted, mounted and marked as `smoo-ram2-<uid>-new`, then renamed into place, so a creator that dies
+part way never leaves an unmarked volume at `/Volumes/smoo-ram2-<uid>` for the next one to dodge as `smoo-ram2-<uid> 1`.
 Before creating, a task detaches every RAM disk of the same user and size that is mounted nowhere but those two names:
 the debris of a creator that was killed or ran into its deadline. One that still carries a lease directory, or has
 something attached below it, is named in the task's error instead. A disk command that runs past its deadline is killed

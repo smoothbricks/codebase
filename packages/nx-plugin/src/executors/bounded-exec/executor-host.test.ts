@@ -33,6 +33,18 @@ const EVENT = /^(start|end) ([a-z]+) ([0-9]+)$/;
 /** The marker a runner's SIGUSR2 handler prints before the Node resources it still has active, as JSON. */
 const ACTIVE_RESOURCES = 'cowshed-test active-resources ';
 
+/** Churn workers a foreground proof runs beside: two, each cycling one lease at a time. */
+const CHURN_NAMES = ['churna', 'churnb'] as const;
+/** Written into a case's root to stop its churn workers; each checks it between runs, never mid-run. */
+const CHURN_STOP = 'churn.stop';
+/** One churn run: `true` on one token, so each lease is a real acquire, run and release. */
+const CHURN_OPTIONS: BoundedExecOptions = { command: 'true', timeoutMs: 20_000, parallelism: 1 };
+/** A churn worker's stdout: a `begin` line before each run it starts, a `ran` line after each run that succeeded. */
+const CHURN_BEGIN = /^cowshed-test churn [a-z]+ begin [0-9]+$/gm;
+const CHURN_RAN = /^cowshed-test churn [a-z]+ ran [0-9]+$/gm;
+/** The stderr line a run logs when its one token came from the inherited parent pool. */
+const INHERITED_GRANT = /inherited=true tokens=1\/1/g;
+
 interface ChildRun {
   /** The script's file name, so an attribution names the case its child ran. */
   readonly label: string;
@@ -62,6 +74,14 @@ interface Barrier {
   until(ready: (events: readonly SiblingEvent[]) => boolean): Promise<void>;
   go(name: string): void;
   close(): Promise<void>;
+}
+
+/** What a foreground proof saw of its churn while its body ran. */
+interface Churn<T> {
+  readonly value: T;
+  /** Lease attempts in flight at body entry or begun while it ran: traffic sharing the ledger with the foreground. */
+  readonly begun: number;
+  readonly workers: readonly ChildRun[];
 }
 
 /** Parent pools a case has opened and not yet closed; afterEach closes what a case left open. */
@@ -111,13 +131,19 @@ describe('@smoothbricks/nx-plugin:bounded-exec host proofs', () => {
       );
       const nestedDirectory = join(root, 'nested');
       const nestedCommand = `node ${JSON.stringify(leafScript)}`;
-      const nested = await startRunner(
-        root,
-        'nested',
-        { command: nestedCommand, cwd: PACKAGE_ROOT, timeoutMs: 20_000, parallelism: 2 },
-        nestedDirectory,
-        childEnv(pool.environment),
-      );
+      // Churn draws from this pool beside the nested run. It can delay the nested grant, never widen the pool.
+      const churn = await withChurn(root, pool.environment, async () => {
+        const run = await startRunner(
+          root,
+          'nested',
+          { command: nestedCommand, cwd: PACKAGE_ROOT, timeoutMs: 20_000, parallelism: 2 },
+          nestedDirectory,
+          childEnv(pool.environment),
+        );
+        await run.exited;
+        return run;
+      });
+      const nested = churn.value;
       expect(await nested.exited, nested.stderr()).toBe(0);
 
       // The nested run logs its own grant before its command starts; the leaf's grant reaches the same stderr.
@@ -131,6 +157,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec host proofs', () => {
       for (const directory of [nestedDirectory, leafDirectory]) {
         expect(await readFile(join(directory, VERDICT_FILE), 'utf8')).toMatch(/"inherited":\s*true/);
       }
+      await expectChurn(churn);
     });
   }, 30_000);
 
@@ -172,33 +199,38 @@ describe('@smoothbricks/nx-plugin:bounded-exec host proofs', () => {
     await withPool(2, async (pool) => {
       const barrier = await startBarrier();
       try {
-        const siblings = await Promise.all(
-          ['a', 'b', 'c'].map((name) =>
-            startRunner(
-              root,
-              name,
-              { command: siblingCommand(barrier.port, name), timeoutMs: 20_000, parallelism: 1 },
-              join(root, name),
-              childEnv(pool.environment),
+        // Churn draws from this pool beside the siblings. It can delay a sibling's admission, never widen the pool, so
+        // the two-token peak below is still the pool's own count.
+        const churn = await withChurn(root, pool.environment, async () => {
+          const siblings = await Promise.all(
+            ['a', 'b', 'c'].map((name) =>
+              startRunner(
+                root,
+                name,
+                { command: siblingCommand(barrier.port, name), timeoutMs: 20_000, parallelism: 1 },
+                join(root, name),
+                childEnv(pool.environment),
+              ),
             ),
-          ),
-        );
+          );
 
-        // Two siblings are admitted together and the third waits for a release. Which two is not fixed, so the proof
-        // releases whichever started first, then every other started sibling in turn.
-        await barrier.until((events) => namesOf(events, 'start').length >= 2);
-        const [first = ''] = namesOf(barrier.events(), 'start');
-        barrier.go(first);
-        await barrier.until((events) => events.some((event) => event.kind === 'end' && event.name === first));
-        await barrier.until((events) => namesOf(events, 'start').length >= 3);
-        const ended = new Set(namesOf(barrier.events(), 'end'));
-        for (const name of namesOf(barrier.events(), 'start')) {
-          if (!ended.has(name)) {
-            barrier.go(name);
+          // Two siblings are admitted together and the third waits for a release. Which two is not fixed, so the proof
+          // releases whichever started first, then every other started sibling in turn.
+          await barrier.until((events) => namesOf(events, 'start').length >= 2);
+          const [first = ''] = namesOf(barrier.events(), 'start');
+          barrier.go(first);
+          await barrier.until((events) => events.some((event) => event.kind === 'end' && event.name === first));
+          await barrier.until((events) => namesOf(events, 'start').length >= 3);
+          const ended = new Set(namesOf(barrier.events(), 'end'));
+          for (const name of namesOf(barrier.events(), 'start')) {
+            if (!ended.has(name)) {
+              barrier.go(name);
+            }
           }
-        }
-        await barrier.until((events) => namesOf(events, 'end').length >= 3);
-        for (const sibling of siblings) {
+          await barrier.until((events) => namesOf(events, 'end').length >= 3);
+          return siblings;
+        });
+        for (const sibling of churn.value) {
           expect(await sibling.exited).toBe(0);
         }
 
@@ -219,6 +251,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec host proofs', () => {
         }
         expect(peak).toBe(2);
         expect(held).toBe(0);
+        await expectChurn(churn);
       } finally {
         await barrier.close();
       }
@@ -490,6 +523,91 @@ function siblingCommand(port: number, name: string): string {
     `if (got.includes('go\\n')) s.end('end ${name} ' + ${tokens} + '\\n'); });`,
   ].join(' ');
   return `node -e ${JSON.stringify(script)}`;
+}
+
+/**
+ * Writes one churn worker: a loop that runs `CHURN_OPTIONS` through the production runner, one lease after another,
+ * until `stopFile` exists. It prints a `begin` line before each run and a `ran` line after each success, so the parent
+ * reads its progress from stdout, with no socket and no clock. A failed run exits the worker with the run's output.
+ */
+async function writeChurnWorker(root: string, name: string, stopFile: string): Promise<string> {
+  const script = join(root, `${name}.mjs`);
+  await writeFile(
+    script,
+    [
+      "import { existsSync } from 'node:fs';",
+      `import { runDefaultBoundedExec } from ${JSON.stringify(EXECUTOR)};`,
+      RESOURCES_HANDLER,
+      `const options = ${JSON.stringify(CHURN_OPTIONS)};`,
+      `const context = ${JSON.stringify({ root })};`,
+      `for (let run = 1; !existsSync(${JSON.stringify(stopFile)}); run += 1) {`,
+      `  process.stdout.write('cowshed-test churn ${name} begin ' + run + '\\n');`,
+      '  const result = await runDefaultBoundedExec(options, context);',
+      '  if (!result.success) {',
+      `    process.stderr.write('cowshed host proof churn ${name} failed at run ' + run + ':\\n');`,
+      '    process.stderr.write(result.terminalOutput);',
+      '    process.exitCode = 1;',
+      '    break;',
+      '  }',
+      `  process.stdout.write('cowshed-test churn ${name} ran ' + run + '\\n');`,
+      '}',
+      '',
+    ].join('\n'),
+  );
+  return script;
+}
+
+/**
+ * Runs `body` beside two churn workers that draw from `poolEnvironment`'s parent pool, so churn competes for the same
+ * tokens and the same RAM ledger as the foreground. `body` starts only after each worker has completed a run. The
+ * workers are stopped and awaited before this returns, whatever `body` did, so no assertion sees a live churn child.
+ */
+async function withChurn<T>(
+  root: string,
+  poolEnvironment: Readonly<Record<string, string>>,
+  body: () => Promise<T>,
+): Promise<Churn<T>> {
+  const stopFile = join(root, CHURN_STOP);
+  const workers: { readonly name: string; readonly run: ChildRun }[] = [];
+  try {
+    for (const name of CHURN_NAMES) {
+      const script = await writeChurnWorker(root, name, stopFile);
+      workers.push({ name, run: startChild(script, childEnv(poolEnvironment)) });
+    }
+    for (const { name, run } of workers) {
+      await run.printed(`cowshed-test churn ${name} ran 1`);
+    }
+    const marks = workers.map(({ run }) => {
+      const output = run.stdout();
+      const inFlight = [...output.matchAll(CHURN_BEGIN)].length - [...output.matchAll(CHURN_RAN)].length;
+      return { run, mark: output.length, inFlight };
+    });
+    const value = await body();
+    const begun = marks.reduce(
+      (sum, { run, mark, inFlight }) => sum + inFlight + [...run.stdout().slice(mark).matchAll(CHURN_BEGIN)].length,
+      0,
+    );
+    return { value, begun, workers: workers.map(({ run }) => run) };
+  } finally {
+    await writeFile(stopFile, '');
+    await Promise.all(workers.map(({ run }) => run.exited));
+  }
+}
+
+/**
+ * Asserts, after `withChurn` has returned, that the churn ran on the parent pool and stopped cleanly. Each worker exited
+ * 0 and completed a run, and logged an inherited grant for every run it completed: no churn run took tokens the fixture
+ * pool did not hold. At least one lease was in flight at body entry or began while the foreground body was running.
+ */
+async function expectChurn(churn: Churn<unknown>): Promise<void> {
+  const report = churn.workers.map((worker) => attribution(worker, 'after the churn stopped')).join('\n');
+  expect(churn.begun, report).toBeGreaterThanOrEqual(1);
+  for (const worker of churn.workers) {
+    expect(await worker.exited, report).toBe(0);
+    const ran = [...worker.stdout().matchAll(CHURN_RAN)];
+    expect(ran.length, report).toBeGreaterThanOrEqual(1);
+    expect([...worker.stderr().matchAll(INHERITED_GRANT)], report).toHaveLength(ran.length);
+  }
 }
 
 /**

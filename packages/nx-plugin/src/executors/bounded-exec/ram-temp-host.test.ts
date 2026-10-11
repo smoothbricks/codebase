@@ -5,6 +5,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   rmdirSync,
   rmSync,
@@ -104,9 +105,13 @@ describe('RAM temp volume on this host', () => {
     chmodSync(outside, 0o555);
     // The host's own commands, with one injectable image in the I/O Registry listing.
     const host = createHostCommands();
-    const attachedBelow: { image: string | null } = { image: null };
+    const attachedBelow: { image: string | null; failInventory: boolean } = { image: null, failInventory: false };
     const commands: HostCommands = {
       async run(file, args) {
+        if (file === '/usr/sbin/ioreg' && attachedBelow.failInventory) {
+          attachedBelow.failInventory = false;
+          return { status: 1, stdout: '', stderr: 'injected holder inventory failure' };
+        }
         const output = await host.run(file, args);
         return file === '/usr/sbin/ioreg' && attachedBelow.image !== null
           ? {
@@ -204,6 +209,22 @@ describe('RAM temp volume on this host', () => {
       const image = join(leaseB.directory, 'store', 'main.asif');
       attachedBelow.image = image;
       const third = new RamTempVolume(paths, capacity, commands, 101, (pid) => alive.has(pid));
+      // A failed acquire must not leave its new live-pid lease or reclaim claim behind. Reuse
+      // this mounted volume: no extra attach is needed to cover the failed-publication path.
+      attachedBelow.failInventory = true;
+      const failedAcquire = await third.acquire();
+      expect(failedAcquire).toMatchObject({
+        ok: false,
+        error: { kind: 'provision-failed', step: 'ioreg (attached disk images)' },
+      });
+      expect(JSON.stringify(failedAcquire)).toContain('injected holder inventory failure');
+      expect(readdirSync(paths.mountpoint).filter((name) => /^\d+-[A-Za-z0-9]{6}$/.test(name))).toEqual([
+        leaseB.directory.slice(paths.mountpoint.length + 1),
+      ]);
+      expect(JSON.parse(readFileSync(`${paths.lockFile}.ledger`, 'utf8'))).toMatchObject({
+        lifecycle: null,
+        claims: [],
+      });
       const c = await third.acquire();
       if (!c.ok || c.value.kind !== 'leased') {
         throw new Error(`third lease failed: ${JSON.stringify(c)}`);
