@@ -17,15 +17,15 @@ const assertPublicModel = typia.createAssertEquals<DeclarationModel>();
  * extra key, a missing key or an unknown argument kind is refused by Typia, never filtered by hand.
  *
  * The real cowshed-core model is admitted unchanged. Refusals run on a scratch model whose probe declaration
- * guarantees the nodes being broken (a reference, a `from` attribute and a typed argument) exist, so each refusal
- * is caused by its own mutation and by nothing else.
+ * guarantees the nodes being broken (a reference, a `from` attribute, a typed argument and a scalar accessor)
+ * exist, so each refusal is caused by its own mutation and by nothing else.
  */
 
 const sourceDirectory = dirname(fileURLToPath(import.meta.url));
 const project = fileURLToPath(new URL('..', import.meta.url));
 const generator = fileURLToPath(new URL('../.cache/api-generator/cowshed-api-gen', import.meta.url));
 
-/** One declaration carrying every node the refusals break. The mutations address it by name. */
+/** The declarations the refusals break: a structural probe and one scalar per accessor spelling, addressed by name. */
 const PROBE = `#[derive(Serialize)]
 #[serde(rename_all = "camelCase", from = "AdmissionSource")]
 pub struct AdmissionProbe<'a> {
@@ -33,6 +33,24 @@ pub struct AdmissionProbe<'a> {
     pub bounded: Option<Vec<u8>>,
     pub token: Token<'static, 32>,
 }
+#[cfg_attr(
+    any(),
+    cowshed_api(
+        accessor = "get",
+        scalar = "number & tags.Type<'uint64'> & tags.Maximum<9007199254740991>"
+    )
+)]
+pub struct ProbeCount(u64);
+#[cfg_attr(any(), cowshed_api(accessor = "as-str", scalar = "string"))]
+pub struct ProbeText(String);
+#[cfg_attr(
+    any(),
+    cowshed_api(
+        accessor = "display",
+        scalar = "string & tags.Pattern<'^[0-9a-f]{64}$'>"
+    )
+)]
+pub struct ProbeDigest([u8; 32]);
 `;
 
 /** Runs the owner CLI. A failing generator fails the test with its own diagnostics attached. */
@@ -79,6 +97,16 @@ interface Refusal {
 
 const RECORD: Path = ['api', 'records', 'AdmissionProbe'];
 const FIELDS: Path = [...RECORD, 'shape', 'data', 'data'];
+const COUNT_PROJECTION: Path = ['api', 'records', 'ProbeCount', 'projection'];
+const TEXT_PROJECTION: Path = ['api', 'records', 'ProbeText', 'projection'];
+const DIGEST_PROJECTION: Path = ['api', 'records', 'ProbeDigest', 'projection'];
+
+/** The closed accessor spellings, each with the exact scalar text its probe declares. */
+const SCALARS = [
+  ['ProbeCount', 'get', "number & tags.Type<'uint64'> & tags.Maximum<9007199254740991>"],
+  ['ProbeText', 'as-str', 'string'],
+  ['ProbeDigest', 'display', "string & tags.Pattern<'^[0-9a-f]{64}$'>"],
+] as const;
 
 const refusals: readonly Refusal[] = [
   {
@@ -103,6 +131,24 @@ const refusals: readonly Refusal[] = [
     name: 'an unknown type argument kind',
     mutate: (model) => {
       objectAt(model, [...FIELDS, 1, 'ty', 'arguments', 0]).kind = 'unknown';
+    },
+  },
+  {
+    name: 'an unknown scalar accessor',
+    mutate: (model) => {
+      objectAt(model, COUNT_PROJECTION).accessor = 'unknown';
+    },
+  },
+  {
+    name: 'a missing scalar accessor',
+    mutate: (model) => {
+      Reflect.deleteProperty(objectAt(model, TEXT_PROJECTION), 'accessor');
+    },
+  },
+  {
+    name: 'an extra accessor fact beside the display accessor',
+    mutate: (model) => {
+      objectAt(model, DIGEST_PROJECTION).guessedAccessor = 'get';
     },
   },
 ];
@@ -181,6 +227,15 @@ describe('declaration model admission', () => {
   it('admits the probe model unmutated, so each refusal below is caused by its mutation', () => {
     const model: Json = JSON.parse(probe);
     expect(admission.assertDeclarationModel(model)).toEqual(model);
+  });
+
+  it('admits each scalar accessor spelling with the exact owner value and scalar text', () => {
+    const admitted = assertPublicModel(admission.parseDeclarationModel(probe));
+    for (const [name, accessor, scalar] of SCALARS) {
+      const { projection } = admitted.api.records[name];
+      expect(projection.accessor).toBe(accessor);
+      expect(projection.scalar).toBe(scalar);
+    }
   });
 
   for (const { name, mutate } of refusals) {
