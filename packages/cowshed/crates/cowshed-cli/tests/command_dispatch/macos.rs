@@ -1297,13 +1297,25 @@ fn land_adoptions(telemetry: &Path) -> Vec<cowshed_core::api::dto::LandAdoptionC
     found
 }
 
+/// The fixture's check running `targets` across its projects with the repository's Nx and Node.
+fn nx_run_many(node: &Path, targets: &str) -> String {
+    format!(
+        "{} node_modules/nx/dist/bin/nx.js run-many -t {targets}",
+        node.display()
+    )
+}
+
 /// A land whose checks build `a` and then test it, from a topic forked off main: the build's
 /// output reaches the test in the topic, where the build wrote it. In main, after adoption, the
-/// build hits the cache and restores only what it declares. Answers the `landAdoption`
-/// commitments the land sealed and the topic's landed head.
+/// build hits the cache and restores only what it declares. Answers the adopted volume's step-7
+/// check, the `landAdoption` commitments the land sealed and the topic's landed head.
 async fn land_nx_project(
     declared: bool,
-) -> (Vec<cowshed_core::api::dto::LandAdoptionCommitment>, String) {
+) -> (
+    cowshed_core::api::dto::AdoptionCheck,
+    Vec<cowshed_core::api::dto::LandAdoptionCommitment>,
+    String,
+) {
     let (nx, node) = repository_nx();
     let mut fixture = Fixture::with(Project::Nx {
         nx: &nx,
@@ -1335,36 +1347,58 @@ async fn land_nx_project(
     .unwrap()
     .trim()
     .to_owned();
-    let check = |target: &str| {
-        format!(
-            "{} node_modules/nx/dist/bin/nx.js run-many -t {target}",
-            node.display()
-        )
-    };
-    let build = check("build");
-    let test = check("test");
+    let build = nx_run_many(&node, "build");
+    let test = nx_run_many(&node, "test");
     // The undeclared output is untracked work in the topic, which a retire refuses.
     let report = land(&mut service, "topic", false, &[&build, &test]).await;
-    assert!(report.build_volume.seeded, "{report:?}");
-    assert!(report.build_volume.adoption.is_adopted(), "{report:?}");
     eprintln!("land report: {report:?}");
+    assert!(report.build_volume.seeded, "{report:?}");
+    let cowshed_core::api::dto::Adoption::Adopted { check: rerun, .. } =
+        &report.build_volume.adoption
+    else {
+        panic!("the land adopted no build volume: {report:?}");
+    };
+    let rerun = rerun.clone();
     service.shutdown().await.expect("stop the runtime");
     fixture.stop_gateway().await;
-    (land_adoptions(fixture.storage.telemetry()), landed_head)
+    (
+        rerun,
+        land_adoptions(fixture.storage.telemetry()),
+        landed_head,
+    )
 }
 
 /// A task output Nx is not told about is a 2b miss (16_build_volumes.md, Land step 7), and each
 /// miss is a durable `landAdoption` commitment naming the task (13_telemetry.md). Declaring the
 /// output makes the miss, and the record, disappear. The two projects are independent, each on
 /// its own scratch store, so they land side by side.
-// With the normal daemon and both actual-adoption oracles, this paired walk completed in
-// 48.335 s at load 22.47/27.00/20.01 on one CPU token; use the existing 60 s lifecycle class.
+// Admitted to the 60 s lifecycle class below its 3× rule and kept paired, because split halves
+// cost more; its samples are load-dependent (08_testing.md, Integration tests).
 #[tokio::test(flavor = "multi_thread")]
 async fn real_apfs_an_undeclared_nx_output_lands_as_a_land_adoption_commitment_substrate_lifecycle()
 {
     let undeclared = tokio::spawn(land_nx_project(false));
     let declared = tokio::spawn(land_nx_project(true));
-    let (adoptions, landed_head) = undeclared.await.expect("undeclared-output land");
+    let (rerun, adoptions, landed_head) = undeclared.await.expect("undeclared-output land");
+    assert_eq!(rerun.hits, 2, "{rerun:?}");
+    assert_eq!(
+        rerun
+            .misses
+            .iter()
+            .map(|miss| miss.task.as_str())
+            .collect::<Vec<_>>(),
+        ["a:test"],
+        "only the undeclared output's task misses: {rerun:?}"
+    );
+    assert_eq!(rerun.unattributed, [], "{rerun:?}");
+    assert_eq!(
+        rerun.failed,
+        [cowshed_core::api::dto::FailedCheck {
+            check: nx_run_many(&repository_nx().1, "test"),
+            exit: Some(1),
+        }],
+        "main's a:test cannot read the output a:build's hit did not restore: {rerun:?}"
+    );
     assert_eq!(
         adoptions
             .iter()
@@ -1379,8 +1413,16 @@ async fn real_apfs_an_undeclared_nx_output_lands_as_a_land_adoption_commitment_s
     );
     assert!(!adoptions[0].task_hash.is_empty());
 
-    let (adoptions, _) = declared.await.expect("declared-output land");
-    assert_eq!(adoptions, [], "a declared output restores in main and hits");
+    let (rerun, adoptions, _) = declared.await.expect("declared-output land");
+    assert_eq!(
+        rerun,
+        cowshed_core::api::dto::AdoptionCheck {
+            hits: 3,
+            ..Default::default()
+        },
+        "a declared output restores in main and every task hits"
+    );
+    assert_eq!(adoptions, [], "a hit leaves no landAdoption commitment");
 }
 
 /// A real-Nx test that fails mid-way leaves no Nx daemon under its root. A daemon started in a
@@ -1568,13 +1610,6 @@ fn assert_on_own_build_volume(fork: &Path, target: &Path) {
         fork.display(),
         own.display()
     );
-}
-
-fn nx_run_many(node: &Path) -> String {
-    format!(
-        "{} node_modules/nx/dist/bin/nx.js run-many -t build test",
-        node.display()
-    )
 }
 
 /// Each `compiler-artifact` Cargo reported on `stdout`: its package id and whether it was fresh.
@@ -1770,7 +1805,7 @@ async fn real_apfs_a_fork_of_a_warm_target_is_all_fresh_and_all_hits_substrate_l
     let nx_reads = nx_read_paths(&fixture_nx(&fixture.checkout));
     let mut service = serve_project(&mut fixture, &nx_reads).await;
     assert_target_on_build_volume(&fixture.checkout);
-    let nx_check = nx_run_many(&node);
+    let nx_check = nx_run_many(&node, "build test");
 
     let w1 = new_workspace(&mut service, "w1").await;
     fs::write(w1.join("a/src.txt"), b"src, changed\n").unwrap();
@@ -1899,7 +1934,13 @@ async fn real_apfs_a_land_adopts_freezes_the_seed_releases_the_old_volume_and_re
     let landing = linked_volume(&layout, &topic);
     assert_ne!(landing, previous);
     let landed_tree = git_stdout(&topic, &["rev-parse", "HEAD^{tree}"]);
-    let report = land(&mut service, "topic", true, &[&nx_run_many(&node)]).await;
+    let report = land(
+        &mut service,
+        "topic",
+        true,
+        &[&nx_run_many(&node, "build test")],
+    )
+    .await;
 
     assert!(report.retired, "{report:?}");
     assert!(report.build_volume.seeded, "{report:?}");
@@ -1986,7 +2027,7 @@ async fn real_apfs_what_main_runs_after_a_land_reaches_its_seed_and_a_fork_hits_
     let nx_reads = nx_read_paths(&fixture_nx(&fixture.checkout));
     let mut service = serve_project(&mut fixture, &nx_reads).await;
     let layout = build_volumes(&fixture);
-    let nx_check = nx_run_many(&node);
+    let nx_check = nx_run_many(&node, "build test");
     let main = fixture.checkout.clone();
 
     let topic = new_workspace(&mut service, "topic").await;
@@ -2072,7 +2113,7 @@ async fn real_apfs_a_fork_of_a_workspace_reseeds_it_and_hits_its_latest_run_subs
     });
     let nx_reads = nx_read_paths(&fixture_nx(&fixture.checkout));
     let mut service = serve_project(&mut fixture, &nx_reads).await;
-    let nx_check = nx_run_many(&node);
+    let nx_check = nx_run_many(&node, "build test");
 
     let w1 = new_workspace(&mut service, "w1").await;
     fs::write(w1.join("a/src.txt"), b"src, changed in w1\n").unwrap();
@@ -2172,7 +2213,7 @@ async fn real_apfs_a_land_carries_mains_nx_entries_into_the_volume_main_adopts_s
     });
     let nx_reads = nx_read_paths(&fixture_nx(&fixture.checkout));
     let mut service = serve_project(&mut fixture, &nx_reads).await;
-    let nx_check = nx_run_many(&node);
+    let nx_check = nx_run_many(&node, "build test");
 
     let b = new_workspace(&mut service, "b").await;
     fs::write(b.join("unrelated.txt"), b"nothing a hashes\n").unwrap();
@@ -2221,8 +2262,9 @@ async fn real_apfs_a_land_carries_mains_nx_entries_into_the_volume_main_adopts_s
 /// the landed tree's two and none of the original's, and its run of the landed check hits both
 /// without re-running either. A rebase while a process holds `b`'s task database carries nothing
 /// and names that process.
-// Exact-main completion at load 1.68/2.75/5.82 took 34.983 s with one CPU token;
-// this full adopt/new/land/rebase walk belongs to the existing bounded 60 s lifecycle class.
+// Admitted to the 60 s lifecycle class below its 3× rule: its one low-load sample (34.983 s) ran
+// with the daemon off, and its daemon-on samples are load-dependent (08_testing.md, Integration
+// tests).
 #[tokio::test]
 async fn real_apfs_a_rebase_carries_mains_nx_entries_into_the_rebased_workspace_substrate_lifecycle()
  {
@@ -2233,7 +2275,7 @@ async fn real_apfs_a_rebase_carries_mains_nx_entries_into_the_rebased_workspace_
     });
     let nx_reads = nx_read_paths(&fixture_nx(&fixture.checkout));
     let mut service = serve_project(&mut fixture, &nx_reads).await;
-    let nx_check = nx_run_many(&node);
+    let nx_check = nx_run_many(&node, "build test");
 
     let b = new_workspace(&mut service, "b").await;
     fs::write(b.join("unrelated.txt"), b"nothing a hashes\n").unwrap();
@@ -2355,7 +2397,7 @@ async fn database_holder_fixture() -> DatabaseHolderFixture {
     let nx_reads = nx_read_paths(&fixture_nx(&fixture.checkout));
     let mut service = serve_project(&mut fixture, &nx_reads).await;
     let layout = build_volumes(&fixture);
-    let nx_check = nx_run_many(&node);
+    let nx_check = nx_run_many(&node, "build test");
     let topic = new_workspace(&mut service, "topic").await;
     fs::write(topic.join("a/src.txt"), b"src, changed\n").unwrap();
     git(&topic, &["commit", "-q", "-am", "change a"]);
