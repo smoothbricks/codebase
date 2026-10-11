@@ -6,6 +6,7 @@ import base64
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -34,8 +35,15 @@ def locked_nx(root: Path) -> tuple[str, str, Path]:
     return version, locked[-1], patch
 
 
+# The patch bytes must not depend on the caller's git configuration (diff.context, interHunkContext, textconv, ...),
+# whether it comes from the global/system files or from GIT_CONFIG_* / GIT_CONFIG_PARAMETERS in the environment.
+GIT_ENV = {key: value for key, value in os.environ.items() if not key.startswith("GIT_CONFIG")}
+GIT_ENV |= {"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+
+
 def git(source: Path, *arguments: str) -> bytes:
-    return subprocess.run(["git", "-C", str(source), *arguments], check=True, stdout=subprocess.PIPE).stdout
+    return subprocess.run(["git", "-C", str(source), *arguments], check=True, stdout=subprocess.PIPE,
+                          env=GIT_ENV).stdout
 
 
 def generate(root: Path, prepared: Path, archive: bytes) -> bytes:
