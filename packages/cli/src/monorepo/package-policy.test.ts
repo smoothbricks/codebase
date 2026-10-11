@@ -158,7 +158,9 @@ describe('root smoo monorepo policy', () => {
 
       const rootPackage = await readJson(join(root, 'package.json'));
       expect(rootPackage.overrides).toEqual({ typia: '14.0.6', '@nx/js': '23.2.1', nx: '23.2.1' });
-      expect(rootPackage.smoo?.developerLinks).toEqual({ '@smoothbricks/lmao': '../provider/packages/lmao' });
+      expect(rootPackage.smoo).toEqual({
+        developerLinks: { '@smoothbricks/lmao': '../provider/packages/lmao' },
+      });
       expect(rootPackage.patchedDependencies).toEqual({
         '@nx/js@23.2.1': 'patches/@nx%2Fjs@23.2.1.patch',
         'nx@23.2.1': 'patches/nx@23.2.1.patch',
