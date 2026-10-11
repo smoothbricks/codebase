@@ -1,9 +1,11 @@
 import { afterEach, describe, expect, it } from 'bun:test';
 import { rmSync } from 'node:fs';
+import { mkdtemp, readFile } from 'node:fs/promises';
 import { createServer, type Server, type Socket } from 'node:net';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ownedSocketDirectory } from '../../testing.js';
-import { diskClassOf, takeDiskLease } from './disk-lease.js';
+import { diskClassOf, takeDiskLease, unixMicros, waitRecord } from './disk-lease.js';
 
 /**
  * Real, short bounds: the client's half-close and grant expiry are socket behavior against the
@@ -45,6 +47,13 @@ async function gateway(serve: (client: Socket) => void): Promise<string> {
   server.off('error', reject);
   servers.push(server);
   return socket;
+}
+
+/** A fresh directory under the OS temp dir, removed after the test. */
+async function scratchDirectory(): Promise<string> {
+  const directory = await mkdtemp(join(tmpdir(), 'disk-lease-record-'));
+  directories.push(directory);
+  return directory;
 }
 
 describe('cowshed disk-lifecycle lease client', () => {
@@ -106,5 +115,40 @@ describe('cowshed disk-lifecycle lease client', () => {
     });
     const lease = await takeDiskLease(socket, 'storage', 'x', QUICK);
     expect(lease).toEqual({ granted: false, cause: 'other', reason: 'the gateway granted nothing within 500 ms' });
+  });
+
+  it('appends a start and an end line per wait, numbered per record and stamped in microseconds', async () => {
+    const file = join(await scratchDirectory(), 'waits');
+    const record = waitRecord(file);
+
+    const before = unixMicros();
+    record.begin('storage')();
+    record.begin('namespace')();
+    const after = unixMicros();
+
+    const text = await readFile(file, 'utf8');
+    expect(text.endsWith('\n')).toBe(true);
+    const lines = text.slice(0, -1).split('\n');
+    // The stamp follows the seq on every line; blanking it leaves each line's shape exact.
+    const shapes = lines.map((line) => line.replace(/^(\S+ \S+ \S+) \d+/, '$1 <stamp>'));
+    expect(shapes).toEqual([
+      `start ${process.pid} 0 <stamp> storage`,
+      `end ${process.pid} 0 <stamp>`,
+      `start ${process.pid} 1 <stamp> namespace`,
+      `end ${process.pid} 1 <stamp>`,
+    ]);
+    for (const line of lines) {
+      const stamp = line.split(' ')[3];
+      expect(stamp).toMatch(/^\d+$/);
+      expect(Number(stamp)).toBeGreaterThanOrEqual(before);
+      expect(Number(stamp)).toBeLessThanOrEqual(after);
+    }
+  });
+
+  it('never fails a wait for a record it cannot write', async () => {
+    // A directory cannot be appended to, so every write to this record fails.
+    const record = waitRecord(await scratchDirectory());
+    expect(() => record.begin('storage')()).not.toThrow();
+    expect(() => record.begin('namespace')()).not.toThrow();
   });
 });
