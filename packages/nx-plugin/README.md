@@ -472,8 +472,10 @@ Concrete targets come from concrete files:
   tests once and the exceptional shards exactly the 13 exceptional ones. The suite builds one shared fixture and
   archive, then runs separate bounded cases through the real default serial-group executor: a successful count and run
   with the group's probes exactly once each, three refusals that run nothing and clear the task's previous verdict, and
-  a failing run whose ordinary failures still run the group's remaining probes. Each case settles its owned processes
-  before the next case starts; the fixture is removed only after the final settlement.
+  a failing run whose ordinary failures still run the group's remaining probes. Each refusal establishes its own passing
+  verdict through the real executor before seeding stale evidence; it never relies on another case passing or running
+  first. Each case settles its owned processes before the next case starts; the fixture is removed only after the final
+  settlement.
 - A repository's serial test groups each run in one runner, `cargo-test-group-<group>`, owned by the cargo workspace
   root beside `cargo-test-archive`. A group is declared once, in `<cargo-workspace>/.config/nextest.toml`: a
   `[test-groups.<group>]` table with `max-threads = 1`, and default-profile overrides that name it with `test-group` and
@@ -482,8 +484,9 @@ Concrete targets come from concrete files:
   one target. The runner is not inferred off macOS, where nextest applies the group nowhere and no piece excludes its
   tests. Its executor, `@smoothbricks/nx-plugin:nextest-group`, lists the selection
   (`nextest list --message-format=json`, same archive and reuse flags) under the existing bounded runner, counts the
-  matching non-ignored tests, and runs the group under a bound of that count × 30 s. The bound is an aggregate for the
-  whole group, not a per-test limit; the real-APFS lifecycle override stays at 60 s and is unchanged. The run carries
+  matching non-ignored tests, and runs the group under a bound of that count × 30 s. Both stages ask the bounded
+  executor for one CPU token, matching the group's one runnable test process instead of reserving idle host capacity.
+  The bound is aggregate, not a per-test limit; the real-APFS lifecycle override stays at 60 s. The run carries
   `--no-fail-fast`: an ordinary test failure does not stop the group's remaining tests, and a failed verdict lists the
   failed ones. A listing that fails, does not parse, or selects no test refuses before anything runs, clears this task's
   previous verdict and report, and fails the group rather than running it unbounded. Ignored tests keep their explicit
@@ -823,6 +826,14 @@ died is reclaimed by the next task, unless an image is still attached from a fil
 those belong to whoever attached them, so the lease and the volume are kept and every new task names them. A target's
 own `env.TMPDIR` wins over the lease. Inside a cowshed sandbox, which cannot write the lock in `/private/tmp`, the task
 keeps its inherited `TMPDIR` and says so once. A failed task that left the volume nearly full names the volume.
+
+The volume's kernel `O_EXLOCK` still admits only one mutation at a time and releases on process death. Contended opens
+use `O_NONBLOCK` and yield for 50 ms before retrying: a blocking open occupies a libuv filesystem worker, and four
+waiters can exhaust the pool while the holder's marker read or close needs a worker. A real Node host proof makes five
+concurrent lease requests with four filesystem workers and a one-token CPU pool; only one command runs at a time. The
+five-request production reproduction previously timed out at 15.002 s while the event loop stayed live and the holder's
+marker read never completed; after the fix, acquisition completed in 3.087 s and all releases in 6.581 s. No command or
+test timeout is raised to conceal this deadlock.
 
 Once the process and holder checks permit removal, cleanup restores owner read/write/search permission on directories
 through no-follow directory handles before deleting the lease. Read-only fixture directories cannot strand a dead lease

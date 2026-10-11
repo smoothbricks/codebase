@@ -42,6 +42,7 @@ export default async function nextestGroupExecutor(
       cwd: options.cwd,
       timeoutMs: BOUNDED_TEST_TIMEOUT_MS,
       killAfterMs: options.killAfterMs,
+      parallelism: 1,
     },
     { root: context.root, stdout: (chunk: string) => chunks.push(chunk) },
   );
@@ -60,8 +61,15 @@ export default async function nextestGroupExecutor(
     return refuse(context, `nextest-group: ${budget.error}; refusing to run unbounded\n`);
   }
   process.stdout.write(`nextest-group: ${selected.count} selected tests, bounded at ${budget.timeoutMs}ms\n`);
+  // Derived groups have max-threads=1: reserve one runnable test process, not an idle host-wide grant.
   return boundedExecExecutor(
-    { command: options.command, cwd: options.cwd, timeoutMs: budget.timeoutMs, killAfterMs: options.killAfterMs },
+    {
+      command: options.command,
+      cwd: options.cwd,
+      timeoutMs: budget.timeoutMs,
+      killAfterMs: options.killAfterMs,
+      parallelism: 1,
+    },
     context,
   );
 }

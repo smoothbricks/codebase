@@ -134,6 +134,39 @@ describe('@smoothbricks/nx-plugin:bounded-exec host proofs', () => {
     });
   }, 30_000);
 
+  it('admits five concurrent RAM leases without blocking the lock holder behind filesystem workers', async () => {
+    const root = await createRoot();
+    await withPool(1, async (pool) => {
+      const script = join(root, 'contended.mjs');
+      await writeFile(
+        script,
+        [
+          `import { runDefaultBoundedExec } from ${JSON.stringify(EXECUTOR)};`,
+          RESOURCES_HANDLER,
+          `const options = ${JSON.stringify({
+            command: `node -e "console.log('lease')"`,
+            cwd: PACKAGE_ROOT,
+            timeoutMs: 20_000,
+            parallelism: 1,
+          })};`,
+          `const context = ${JSON.stringify({ root })};`,
+          'const results = await Promise.all(Array.from({ length: 5 }, () => runDefaultBoundedExec(options, context)));',
+          "console.log('leases-complete');",
+          'process.exitCode = results.every((result) => result.success) ? 0 : 1;',
+          '',
+        ].join('\n'),
+      );
+      // Five requests leave four contended opens beside the holder. Blocking opens consume all
+      // four libuv workers, so even the holder's marker read cannot finish. The one-token pool
+      // still serializes actual commands: five lease requests are not five runnable commands.
+      const run = startChild(script, childEnv({ ...pool.environment, UV_THREADPOOL_SIZE: '4' }));
+      expect(await run.exited, run.stderr()).toBe(0);
+      expect(run.stdout().match(/^lease$/gm)).toHaveLength(5);
+      expect(run.stdout()).toContain('leases-complete');
+      expect([...run.stderr().matchAll(/inherited=true tokens=1\/1/g)]).toHaveLength(5);
+    });
+  }, 30_000);
+
   it('holds a parent pool to its count: three siblings on a pool of two never hold more than two', async () => {
     const root = await createRoot();
     await withPool(2, async (pool) => {

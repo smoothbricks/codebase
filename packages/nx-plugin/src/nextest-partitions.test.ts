@@ -58,8 +58,6 @@ interface OpenChild {
 let fixtureRoot: string | undefined;
 /** Set last in beforeAll: the fixture every case reads. */
 let shared: SharedFixture | undefined;
-/** The success case's typed passing verdict, which the refusal cases seed from. */
-let passedVerdict: BoundedExecRecord | undefined;
 const openChildren = new Map<ChildProcess, OpenChild>();
 /** Set once teardown begins: a body still running then may not start a child, nor keep the result of one. */
 let ending = false;
@@ -233,13 +231,6 @@ function groupDirectory(root: string): string {
   return taskDirectory(join(root, '.nx/workspace-data'), GROUP_ID);
 }
 
-function retainedPassingVerdict(): BoundedExecRecord {
-  if (passedVerdict === undefined) {
-    throw new Error('the success case retained no passing verdict; the refusals seed from it, so run in file order');
-  }
-  return passedVerdict;
-}
-
 /** The empty-selection listing: the plugin's own count stage with its serial filter replaced by `none()`. */
 function emptySelectionListing(listCommand: string): string {
   const emptied = listCommand.replace(SERIAL_FILTER_ARG, "-E 'none()'");
@@ -291,9 +282,9 @@ async function executesEveryTestOnce(): Promise<void> {
 
 /**
  * The real default group executor, run for real on this fixture in a driver process. Its verdict is typed
- * passed, and the refusals start from it, so a missing success fails them loudly rather than being faked.
+ * passed and returned to its caller: each refusal establishes its own seed, independent of every other case.
  */
-async function groupSucceeds(): Promise<void> {
+async function groupSucceeds(): Promise<BoundedExecRecord> {
   const { root, targets, listCommand } = fixture();
   const directory = groupDirectory(root);
   const realCommand = command(targets, GROUP_TARGET);
@@ -304,6 +295,7 @@ async function groupSucceeds(): Promise<void> {
   // driver's spawn; the runner inherits them, since bounded-exec merges process.env into every runner. The command
   // stays the byte-identical one the plan generates.
   const successLog = join(root, 'group-success.log');
+  await rm(successLog, { force: true });
   const success = await runGroupExecutor(root, { command: realCommand, listCommand, cwd: root }, groupContext(root), {
     PARTITION_EXECUTIONS: successLog,
   });
@@ -315,19 +307,23 @@ async function groupSucceeds(): Promise<void> {
   const passed = await readRecord(directory);
   if (passed === null) throw new Error('a group run that passed wrote no verdict');
   expect(passed).toMatchObject({ task: GROUP_ID, hash: GROUP_HASH, verdict: { outcome: 'passed' } });
+  // Budgeted runs reserve only the group's one runnable test; unbudgeted hosts have no receipt.
+  if (passed.cpu !== undefined) {
+    expect(passed.cpu).toMatchObject({ tokens: 1, want: 1 });
+  }
   expect((await readFile(successLog, 'utf8')).trim().split('\n').sort()).toEqual([...serial].sort());
-  passedVerdict = passed;
+  return passed;
 }
 
 /**
- * Refuses one listing before any probe runs. The case starts from the passing verdict and a stale report, so the
- * refusal's clearing of both is visible. The marker log proves no run started: a run would have written probe
- * names to it.
+ * Refuses one listing before any probe runs. The case first establishes its own passing verdict, then seeds
+ * the stale verdict and report whose removal it observes. A timeout in another case cannot remove this
+ * precondition. The marker log proves the refused run started no probe.
  */
 async function refuses(listCommand: string, reason: string): Promise<void> {
   const { root, targets } = fixture();
   const directory = groupDirectory(root);
-  await writeRecord(directory, retainedPassingVerdict());
+  await writeRecord(directory, await groupSucceeds());
   await writeFile(join(directory, JUNIT_FILE), 'stale report\n');
   const refusalLog = join(root, 'group-refused.log');
   const refused = await runGroupExecutor(
@@ -379,7 +375,12 @@ it(
   'executes every archived test once across ordinary, exceptional and serial-group runners',
   caseBody(executesEveryTestOnce),
 );
-it('runs the serial group through the real default executor and keeps its passing verdict', caseBody(groupSucceeds));
+it(
+  'runs the serial group through the real default executor and keeps its passing verdict',
+  caseBody(async () => {
+    await groupSucceeds();
+  }),
+);
 it(
   'refuses a failed listing before any run, clearing the previous verdict and report',
   caseBody(() => refuses('exit 7', 'count stage failed')),

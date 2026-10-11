@@ -13,6 +13,7 @@ import {
   writeFile,
 } from 'node:fs/promises';
 import { join } from 'node:path';
+import { setTimeout as sleep } from 'node:timers/promises';
 import {
   awaitExit,
   type ProcessEntry,
@@ -88,6 +89,8 @@ import { GATEWAY_SOCKET } from './gateway-lease.js';
 
 /** macOS `open(2)` flag: take an exclusive flock atomically with the open. Absent from `fs.constants`. */
 const O_EXLOCK = 0x20;
+/** Contended opens yield without occupying a filesystem worker needed by the lock holder. */
+const LOCK_RETRY_MS = 50;
 const SECTOR_BYTES = 512;
 const MIB = 1024 * 1024;
 const GIB = 1024 * MIB;
@@ -460,15 +463,23 @@ export class RamTempVolume {
   }
 
   private async lock(): Promise<Result<{ close(): Promise<void> }, { code: string | undefined; message: string }>> {
-    try {
-      const handle = await open(
-        this.paths.lockFile,
-        constants.O_RDWR | constants.O_CREAT | constants.O_NOFOLLOW | O_EXLOCK,
-        0o600,
-      );
-      return { ok: true, value: handle };
-    } catch (error) {
-      return { ok: false, error: { code: errorCode(error), message: errorText(error) } };
+    for (;;) {
+      try {
+        const handle = await open(
+          this.paths.lockFile,
+          constants.O_RDWR | constants.O_CREAT | constants.O_NOFOLLOW | constants.O_NONBLOCK | O_EXLOCK,
+          0o600,
+        );
+        return { ok: true, value: handle };
+      } catch (error) {
+        const code = errorCode(error);
+        if (code !== 'EAGAIN' && code !== 'EWOULDBLOCK') {
+          return { ok: false, error: { code, message: errorText(error) } };
+        }
+        // Blocking O_EXLOCK opens consume libuv workers. Four waiters can occupy the entire
+        // pool while the holder's read/close waits for a worker, deadlocking every host task.
+        await sleep(LOCK_RETRY_MS);
+      }
     }
   }
 
