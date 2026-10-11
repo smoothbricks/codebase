@@ -1352,7 +1352,7 @@ async fn land_nx_project(
     // The undeclared output is untracked work in the topic, which a retire refuses.
     let report = land(&mut service, "topic", false, &[&build, &test]).await;
     eprintln!("land report: {report:?}");
-    assert!(report.build_volume.seeded, "{report:?}");
+    assert_eq!(report.build_volume.seed, LandSeed::Frozen, "{report:?}");
     let cowshed_core::api::dto::Adoption::Adopted { check: rerun, .. } =
         &report.build_volume.adoption
     else {
