@@ -511,9 +511,9 @@ lands and the target itself ran in the meantime. Adopting the landing volume as 
 entries are content-addressed and every one is a correct hit for any tree that computes its hash. Measured on a consumer
 repository: a fork made right after a land hit 78 of 108 tasks, and among the misses were tasks main's previous volume
 held at that very tree. So before the target adopts the landing volume, every Nx cache entry the target's task database
-indexes and the landing volume's does not is copied into the landing volume and indexed there. Only Nx's state is
-carried: a Cargo target directory is per tree and mtime-fresh, so the landing volume's is the one that matches the
-landed tree.
+indexes and the landing volume's does not is copied into the landing volume and indexed there. Only Nx's state and an
+absent code-graph index (below) are carried: a Cargo target directory is per tree and mtime-fresh, so the landing
+volume's is the one that matches the landed tree.
 
 Stock Nx (pinned 23.2.1, `native/cache/cache.rs`) keeps an entry in three places: the directory `<cache>/<hash>` with
 the task's outputs, the file `<cache>/terminalOutputs/<hash>`, and a `cache_outputs` row in the task database
@@ -542,8 +542,23 @@ consistent snapshot), so the carry has a schema Nx wrote to index into; one whos
 of another schema and gets nothing. A carry that crashes leaves only `.carry/`, which the next stage on that volume
 deletes before it starts.
 
+The code-graph indexer keeps its whole index in one SQLite database, `.codegraph/codegraph.db` (stock
+`@colbymchenry/codegraph` 1.6); a checkout without it answers "not initialized" until it is indexed again from scratch.
+Any index of a nearby tree is cheap to bring up to date: the indexer reconciles the index against the tree it opens on
+(size and modification time, then content hash) and reindexes only the files that differ. So at the stage (5.1), for
+each `.codegraph/` both volumes hold under the same checkout path, a landing volume whose directory holds no database
+takes a copy of the target's: `VACUUM INTO`, one consistent snapshot of a database the target's indexer may be writing,
+built beside the destination and renamed into place. A landing volume with a database of its own keeps it. The copy is
+whole when placed, so it needs no commit and stays when the swap is skipped; the seed frozen at 5.6 holds it, so forks
+of the target start with an index too. A failed copy is said on stderr and the land still succeeds: the target then
+adopts the landing volume without an index. The indexer's daemon lock and socket beside the database are not copied and
+need no handling: a client verifies the daemon a lock names by a hello over its socket before it uses it.
+
 - **Enforced by**: a real-APFS test in which one workspace lands and warms an Nx task in main, a second, forked before
-  that land and changing nothing the task hashes, lands without running it, and a fork of main hits the task.
+  that land and changing nothing the task hashes, lands without running it, and a fork of main hits the task; a
+  real-APFS test in which a workspace forks before main indexes, lands, and main's `.codegraph/codegraph.db` on the
+  adopted volume opens with main's rows; and a unit test in which the copy includes rows still in the target's
+  write-ahead log, a landing database of its own is kept, and a target without one gives none.
 
 ### Rebase carry
 
@@ -964,6 +979,9 @@ The decisions this spec records, in the order they were taken. It is kept so the
   (`CODEGRAPH_PROJECT_IDLE_TIMEOUT_MS`), which bounds how long a reseed can be refused. Review then found the landing
   checkout's own Nx daemon refusing the seal and being adopted with it as a busy seal, its record deleted at 6.3; a
   refusal is now put to the landing volume's Nx and Cargo protocols again, and only one that outlasts both is busy.
+- 2026-10-12: `codegraph init` in two consumers' main checkouts was undone by the next land into each: the landing
+  workspaces had forked from seeds frozen before main indexed, so their `.codegraph/` held no database, and main adopted
+  an empty index directory. A land now copies the target's code-graph database into a landing volume that has none.
 
 ## Open questions
 

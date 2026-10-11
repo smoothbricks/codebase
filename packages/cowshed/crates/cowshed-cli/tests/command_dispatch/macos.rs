@@ -2255,6 +2255,69 @@ async fn real_apfs_a_land_carries_mains_nx_entries_into_the_volume_main_adopts_s
     );
 }
 
+/// Run `sql` against the SQLite database `database` with the system's `sqlite3`; it must
+/// succeed. Answers its stdout.
+fn sqlite3(database: &Path, sql: &str) -> String {
+    let output = Command::new("/usr/bin/sqlite3")
+        .arg(database)
+        .arg(sql)
+        .output()
+        .expect("sqlite3 process");
+    assert!(
+        output.status.success(),
+        "sqlite3 {} {sql:?}: {}",
+        database.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).expect("sqlite3 prints UTF-8")
+}
+
+/// A land carries main's code-graph index into a landing volume that has none
+/// (16_build_volumes.md, "Carry"): `w` forks before main indexes, so its volume's `.codegraph/`
+/// holds no database; main then indexes, `w` lands, and main's `.codegraph/codegraph.db`, now on
+/// the adopted volume, opens with main's rows. Adopting `w`'s volume as it was left main's
+/// `.codegraph/` empty after every such land.
+#[tokio::test]
+async fn real_apfs_a_land_carries_mains_code_graph_index_into_the_volume_main_adopts() {
+    let mut fixture = Fixture::new();
+    fs::create_dir(fixture.checkout.join(".codegraph")).unwrap();
+    let mut service = serve_project(&mut fixture, &[]).await;
+    let layout = build_volumes(&fixture);
+
+    let workspace = new_workspace(&mut service, "w").await;
+    fs::write(workspace.join("notes.txt"), b"notes\n").unwrap();
+    git(&workspace, &["add", "notes.txt"]);
+    git(&workspace, &["commit", "-q", "-m", "notes"]);
+    let landing = linked_volume(&layout, &workspace);
+    let index = fixture.checkout.join(".codegraph/codegraph.db");
+    sqlite3(
+        &index,
+        "PRAGMA journal_mode = WAL; CREATE TABLE nodes (id TEXT PRIMARY KEY); \
+         INSERT INTO nodes VALUES ('main');",
+    );
+    assert!(
+        !layout
+            .mount(&landing)
+            .join("codegraph/codegraph.db")
+            .exists()
+    );
+
+    let report = land(&mut service, "w", true, &[]).await;
+    let adopted = linked_volume(&layout, &fixture.checkout);
+    let nodes = index
+        .is_file()
+        .then(|| sqlite3(&index, "SELECT id FROM nodes;"));
+    service.shutdown().await.expect("stop the runtime");
+    fixture.stop_gateway().await;
+    assert!(report.build_volume.adoption.is_adopted(), "{report:?}");
+    assert_eq!(adopted, landing);
+    assert_eq!(
+        nodes.as_deref(),
+        Some("main\n"),
+        "main's .codegraph/ on the adopted volume holds main's index"
+    );
+}
+
 /// A rebase carries main's Nx cache entries into the rebased workspace's volume
 /// (16_build_volumes.md, "Rebase carry"), and only those the rebased tree looks up: `b`, forked
 /// before main runs the check at the original tree and before `a` lands and warms `a:build` and

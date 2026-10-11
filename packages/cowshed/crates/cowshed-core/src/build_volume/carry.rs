@@ -38,6 +38,10 @@
 //! The entries cross from one image to another, so they are copied, never cloned;
 //! `copyfile(3)` keeps every file's bytes, mode and times. A crashed carry leaves only the
 //! staging directory, which the next [`stage`] or [`unstage`] on that volume deletes.
+//!
+//! The code-graph index rides the same phase 1 ([`codegraph`]): a landing `.codegraph/` with no
+//! database takes a consistent copy of the target's, so the target never adopts a volume
+//! without the index it had. The indexer reconciles a carried index against the tree it opens on.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -57,6 +61,10 @@ pub const STAGING: &str = ".carry";
 const TERMINAL_OUTPUTS: &str = "terminalOutputs";
 /// Data plus every attribute `copyfile(3)` carries, mode and times included.
 const COPYFILE_ALL: libc::copyfile_flags_t = libc::COPYFILE_METADATA | libc::COPYFILE_DATA;
+/// The code-graph indexer's whole index inside its `.codegraph/` directory (stock
+/// `@colbymchenry/codegraph` 1.6, `db/index.js` `DATABASE_FILENAME`). A checkout without it is
+/// not initialized, and indexes from scratch.
+const CODEGRAPH_DATABASE: &str = "codegraph.db";
 
 /// The target's entries the landing volume lacks, most recently used first, so a carry that
 /// stops has carried the ones most likely to hit. Nx names an entry by a decimal hash
@@ -342,12 +350,79 @@ fn selection<'a>(
     }
 }
 
-/// Write a consistent copy of the task database `from` at `into` (`VACUUM INTO`, which reads
-/// one snapshot of a database another process may be writing), then delete its cache rows and
-/// its records of running processes: what remains is the target's task details and history,
-/// in its own Nx's schema, indexing no entry the landing volume lacks. Built beside `into` and
-/// renamed onto it, so `into` is either absent or whole.
+/// Land step 5.1 for the code-graph index (16_build_volumes.md, "Carry"), while the target
+/// still runs: for each `.codegraph` directory both volumes hold under the same checkout path,
+/// where the quiet volume at `into` holds no database and the volume at `from` holds one, write
+/// a consistent copy of `from`'s at `into`. A landing volume's own database is kept: either is an
+/// index of a nearby tree the indexer reconciles, where none is a reindex from scratch. Placed
+/// whole, it needs no commit and nothing to unstage.
+pub fn codegraph(
+    from: &Path,
+    from_state: &BuildVolumeState,
+    into: &Path,
+    into_state: &BuildVolumeState,
+) -> io::Result<()> {
+    for source in codegraph_indexes(from_state) {
+        let Some(destination) =
+            codegraph_indexes(into_state).find(|path| path.checkout == source.checkout)
+        else {
+            continue;
+        };
+        let from_database = from.join(source.volume.as_path()).join(CODEGRAPH_DATABASE);
+        let into_database = into
+            .join(destination.volume.as_path())
+            .join(CODEGRAPH_DATABASE);
+        let copied = (|| {
+            if into_database.try_exists()? || !from_database.try_exists()? {
+                return Ok(());
+            }
+            snapshot(&from_database, &into_database, |_| Ok(()))
+        })();
+        copied.map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "copy {} to {}: {error}",
+                    from_database.display(),
+                    into_database.display()
+                ),
+            )
+        })?;
+    }
+    Ok(())
+}
+
+/// The `.codegraph` directories the state names.
+fn codegraph_indexes(state: &BuildVolumeState) -> impl Iterator<Item = &super::BuildStatePath> {
+    state
+        .paths
+        .iter()
+        .filter(|path| super::BuildStateTool::of(path) == super::BuildStateTool::Codegraph)
+}
+
+/// Write a consistent copy of the task database `from` at `into` without its cache rows and its
+/// records of running processes: what remains is the target's task details and history, in its
+/// own Nx's schema, indexing no entry the landing volume lacks.
 fn empty_copy(from: &Path, into: &Path) -> io::Result<()> {
+    snapshot(from, into, |copy| {
+        for table in ["cache_outputs", "running_tasks", "task_invocations"] {
+            if table_definition(copy, "main", table)?.is_some() {
+                copy.execute(&format!("DELETE FROM {table}"), &[])?;
+            }
+        }
+        Ok(())
+    })
+}
+
+/// Write a consistent copy of the SQLite database `from` at `into` (`VACUUM INTO`, which reads
+/// one snapshot of a database another process may be writing, its write-ahead log included),
+/// changed by `edit`. Built beside `into` and renamed onto it, so `into` is either absent or
+/// whole.
+fn snapshot(
+    from: &Path,
+    into: &Path,
+    edit: impl FnOnce(&Connection) -> io::Result<()>,
+) -> io::Result<()> {
     let mut partial = into.as_os_str().to_owned();
     partial.push(".carry");
     let partial = PathBuf::from(partial);
@@ -357,13 +432,7 @@ fn empty_copy(from: &Path, into: &Path) -> io::Result<()> {
     }
     let result = (|| {
         Connection::open(from)?.execute("VACUUM INTO ?1", &[&partial.to_string_lossy()])?;
-        let copy = Connection::open(&partial)?;
-        for table in ["cache_outputs", "running_tasks", "task_invocations"] {
-            if table_definition(&copy, "main", table)?.is_some() {
-                copy.execute(&format!("DELETE FROM {table}"), &[])?;
-            }
-        }
-        drop(copy);
+        edit(&Connection::open(&partial)?)?;
         fs::rename(&partial, into)
     })();
     if result.is_err() {
@@ -1885,6 +1954,67 @@ mod tests {
         index(&connection, &BTreeSet::from(["whole"])).unwrap();
         drop(connection);
         assert_eq!(indexed(&into), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The code-graph index (16_build_volumes.md, "Carry"): a target without one gives nothing;
+    /// a landing `.codegraph` without a database takes a copy of the target's that opens with the
+    /// rows the target's still-open writer holds in its write-ahead log; a landing database of
+    /// its own is kept.
+    #[test]
+    fn a_landing_volume_without_a_code_graph_index_takes_the_targets() {
+        let root = std::env::temp_dir().join(format!(
+            "cowshed-carry-codegraph-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let from = root.join("from");
+        let into = root.join("into");
+        for volume in [&from, &into] {
+            fs::create_dir_all(volume.join("codegraph")).unwrap();
+        }
+        let state = BuildVolumeState {
+            paths: vec![super::super::BuildStatePath::new(".codegraph", "codegraph").unwrap()],
+            fingerprint: None,
+        };
+        let nodes = |database: &Path| {
+            let connection = Connection::open(database).unwrap();
+            let mut statement = connection.prepare("SELECT id FROM nodes").unwrap();
+            let mut ids = Vec::new();
+            while statement.step().unwrap() {
+                ids.push(statement.text(0));
+            }
+            ids
+        };
+
+        codegraph(&from, &state, &into, &state).unwrap();
+        assert!(!into.join("codegraph").join(CODEGRAPH_DATABASE).exists());
+
+        let target = from.join("codegraph").join(CODEGRAPH_DATABASE);
+        database(
+            &target,
+            "PRAGMA journal_mode = WAL; CREATE TABLE nodes (id TEXT PRIMARY KEY)",
+        );
+        let writer = Connection::open(&target).unwrap();
+        writer
+            .execute("INSERT INTO nodes VALUES ('target')", &[])
+            .unwrap();
+        assert!(from.join("codegraph/codegraph.db-wal").exists());
+        codegraph(&from, &state, &into, &state).unwrap();
+        drop(writer);
+        let landing = into.join("codegraph").join(CODEGRAPH_DATABASE);
+        assert_eq!(nodes(&landing), ["target"]);
+        assert!(!into.join("codegraph/codegraph.db.carry").exists());
+
+        Connection::open(&landing)
+            .unwrap()
+            .execute("UPDATE nodes SET id = 'landing'", &[])
+            .unwrap();
+        codegraph(&from, &state, &into, &state).unwrap();
+        assert_eq!(
+            nodes(&landing),
+            ["landing"],
+            "a landing index of its own is kept"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 }
