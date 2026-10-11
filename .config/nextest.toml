@@ -38,15 +38,16 @@ command = { command-line = "node_modules/@smoothbricks/nx-plugin/src/nextest-cod
 [scripts.wrapper.real-apfs-code-60s]
 command = { command-line = "node_modules/@smoothbricks/nx-plugin/src/nextest-code-bound.ts 60", relative-to = "workspace-root" }
 
-# The full-lifecycle real-APFS tests cannot meet the default class. The 3× rule
-# of specs/cowshed/08_testing.md over the raw lifecycle's worst idle measurement,
-# 14.8s when `apfs_integration.rs` still ran a second image format, is 44.4s,
-# rounded up to 60s; the one-format lifecycle measures 6.6-10.6s idle. The
-# lifecycle's cost is a multiple of the irreducible ~235-400ms attach
-# (08_testing.md, "Attach floor verdict: not flag-reducible"), and splitting the lifecycle into
-# phase-scoped tests would pay that attach again per piece to buy a smaller
-# number. Membership is by name: the fast `real_apfs_*` unit tests keep 30s.
-# The first matching rule wins, so this one precedes the group's default class.
+# The 60s class is defined by what a test runs: the raw substrate lifecycle and
+# every genuine-Nx CLI walk (a fixture that installs the pinned Nx and runs it or
+# its daemon), each named `*_substrate_lifecycle`. For the raw lifecycle, the 3×
+# rule of specs/cowshed/08_testing.md over its worst idle measurement, 14.8s, is
+# 44.4s, rounded up to 60s; its cost is a multiple of the irreducible ~235-400ms
+# attach (08_testing.md, "Attach floor verdict: not flag-reducible"), so splitting
+# it would pay that attach again per piece. The genuine-Nx walks measured up to
+# 45.4s of code time on a loaded host, lease waits excluded; 08_testing.md has the
+# numbers. The fast `real_apfs_*` unit tests keep 30s. The first matching rule
+# wins, so this one precedes the group's default class.
 [[profile.default.scripts]]
 filter = 'test(/real_apfs_.*_substrate_lifecycle/)'
 platform = 'cfg(target_os="macos")'

@@ -1370,7 +1370,8 @@ async fn land_nx_project(
 /// output makes the miss, and the record, disappear. The two projects are independent, each on
 /// its own scratch store, so they land side by side.
 #[tokio::test(flavor = "multi_thread")]
-async fn real_apfs_an_undeclared_nx_output_lands_as_a_land_adoption_commitment() {
+async fn real_apfs_an_undeclared_nx_output_lands_as_a_land_adoption_commitment_substrate_lifecycle()
+{
     let undeclared = tokio::spawn(land_nx_project(false));
     let declared = tokio::spawn(land_nx_project(true));
     let (adoptions, landed_head) = undeclared.await.expect("undeclared-output land");
@@ -1398,7 +1399,7 @@ async fn real_apfs_an_undeclared_nx_output_lands_as_a_land_adoption_commitment()
 /// The fixture's scratch root ends every process working in its tree as the test unwinds, before
 /// it releases the fixture's images and removes the tree.
 #[test]
-fn real_apfs_a_failed_nx_test_leaves_no_daemon_under_its_root() {
+fn real_apfs_a_failed_nx_test_leaves_no_daemon_under_its_root_substrate_lifecycle() {
     let (nx, node) = repository_nx();
     let started = std::cell::RefCell::new(None);
     let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1769,7 +1770,7 @@ impl Drop for Holder {
 /// sources the checkout's environment; the sandbox build must reuse those same units. Main's
 /// first seed was frozen empty at first touch; a land is what warms it.
 #[tokio::test]
-async fn real_apfs_a_fork_of_a_warm_target_is_all_fresh_and_all_hits() {
+async fn real_apfs_a_fork_of_a_warm_target_is_all_fresh_and_all_hits_substrate_lifecycle() {
     let (nx, node) = repository_nx();
     let rust = rust_toolchain();
     let mut fixture = Fixture::with(Project::Build {
@@ -1890,7 +1891,8 @@ fn write_declared_project(checkout: &Path) {
 /// onto that volume, releases main's previous volume, and re-runs the check in main: every task
 /// hits (16_build_volumes.md, Land steps 5–7).
 #[tokio::test]
-async fn real_apfs_a_land_adopts_freezes_the_seed_releases_the_old_volume_and_reports_2b() {
+async fn real_apfs_a_land_adopts_freezes_the_seed_releases_the_old_volume_and_reports_2b_substrate_lifecycle()
+ {
     let (nx, node) = repository_nx();
     let mut fixture = Fixture::with(Project::Build {
         nx: Some((&nx, &node)),
@@ -1980,11 +1982,12 @@ async fn nx_statuses(
 /// main changes `a` and runs it on the adopted volume, so its seed, frozen from the landing
 /// volume, is behind; doctor says so, `cowshed reseed main` refreezes it, and a fork hits
 /// main's run. A fork that reseeds its source on its own is
-/// [`real_apfs_a_fork_of_a_workspace_reseeds_it_and_hits_its_latest_run`]: `new` and `fork`
+/// [`real_apfs_a_fork_of_a_workspace_reseeds_it_and_hits_its_latest_run_substrate_lifecycle`]: `new` and `fork`
 /// reseed through the one fork path, so a second fork of main here would only pay two more
 /// attaches for it.
 #[tokio::test]
-async fn real_apfs_what_main_runs_after_a_land_reaches_its_seed_and_a_fork_hits_it() {
+async fn real_apfs_what_main_runs_after_a_land_reaches_its_seed_and_a_fork_hits_it_substrate_lifecycle()
+ {
     let (nx, node) = repository_nx();
     let mut fixture = Fixture::with(Project::Build {
         nx: Some((&nx, &node)),
@@ -2071,7 +2074,7 @@ async fn real_apfs_what_main_runs_after_a_land_reaches_its_seed_and_a_fork_hits_
 /// its own volume after its seed was frozen at its creation, and a fork of `w1` hits that run
 /// instead of cloning the older seed and running everything again.
 #[tokio::test]
-async fn real_apfs_a_fork_of_a_workspace_reseeds_it_and_hits_its_latest_run() {
+async fn real_apfs_a_fork_of_a_workspace_reseeds_it_and_hits_its_latest_run_substrate_lifecycle() {
     let (nx, node) = repository_nx();
     let mut fixture = Fixture::with(Project::Build {
         nx: Some((&nx, &node)),
@@ -2128,7 +2131,8 @@ async fn build_link_findings(service: &mut ActorBridge) -> Vec<String> {
 /// build volume, and every new workspace clones that directory. Doctor names it, and the refresh
 /// before the next exec puts the link back.
 #[tokio::test]
-async fn real_apfs_doctor_names_a_displaced_build_link_and_an_exec_relinks_it() {
+async fn real_apfs_doctor_names_a_displaced_build_link_and_an_exec_relinks_it_substrate_lifecycle()
+{
     let (nx, node) = repository_nx();
     let mut fixture = Fixture::with(Project::Build {
         nx: Some((&nx, &node)),
@@ -2169,7 +2173,8 @@ async fn real_apfs_doctor_names_a_displaced_build_link_and_an_exec_relinks_it() 
 /// git, since `cowshed rebase` would carry `a`'s entries into its volume first. Main then adopts
 /// `b`'s volume, which never held `a`'s entries, and a fork of main still hits both.
 #[tokio::test]
-async fn real_apfs_a_land_carries_mains_nx_entries_into_the_volume_main_adopts() {
+async fn real_apfs_a_land_carries_mains_nx_entries_into_the_volume_main_adopts_substrate_lifecycle()
+{
     let (nx, node) = repository_nx();
     let mut fixture = Fixture::with(Project::Build {
         nx: Some((&nx, &node)),
@@ -2227,7 +2232,8 @@ async fn real_apfs_a_land_carries_mains_nx_entries_into_the_volume_main_adopts()
 /// without re-running either. A rebase while a process holds `b`'s task database carries nothing
 /// and names that process.
 #[tokio::test]
-async fn real_apfs_a_rebase_carries_mains_nx_entries_into_the_rebased_workspace() {
+async fn real_apfs_a_rebase_carries_mains_nx_entries_into_the_rebased_workspace_substrate_lifecycle()
+ {
     let (nx, node) = repository_nx();
     let mut fixture = Fixture::with(Project::Build {
         nx: Some((&nx, &node)),
@@ -2383,7 +2389,8 @@ async fn database_holder_fixture() -> DatabaseHolderFixture {
 /// Stock Nx's open lock fences the look-to-rename window: an opener skips the swap and is
 /// named, while the target keeps its volume and the landing tree still freezes its seed.
 #[tokio::test]
-async fn real_apfs_a_foreign_database_opener_skips_adoption_with_its_pid_and_argv() {
+async fn real_apfs_a_foreign_database_opener_skips_adoption_with_its_pid_and_argv_substrate_lifecycle()
+ {
     let DatabaseHolderFixture {
         mut fixture,
         mut service,
@@ -2450,7 +2457,8 @@ async fn real_apfs_a_foreign_database_opener_skips_adoption_with_its_pid_and_arg
 /// A process other than main's daemon holding its task database open skips the swap and is
 /// named (16_build_volumes.md, "The adoption needs the target's Nx database closed").
 #[tokio::test]
-async fn real_apfs_a_foreign_database_holder_skips_adoption_with_its_pid_and_argv() {
+async fn real_apfs_a_foreign_database_holder_skips_adoption_with_its_pid_and_argv_substrate_lifecycle()
+ {
     let DatabaseHolderFixture {
         mut fixture,
         mut service,

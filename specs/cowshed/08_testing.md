@@ -245,11 +245,18 @@ waiting, or still waiting — counts to the test's end and is named. A record th
 process and its waits then count as code time; an end with no start counts as code time and is named; a record the
 wrapper cannot parse fails the test. The classes are declared once, as the wrapper rules of `.config/nextest.toml`: 60s
 for `test(/real_apfs_.*_substrate_lifecycle/)`, and 30s for every other group test; the 30s rule names exactly the
-group's filter. The 60s class is the raw lifecycle's: 3× its worst idle measurement, 14.8s, is 44.4s, rounded up. The
-group's nextest `slow-timeout` is 180s with `terminate-after = 1`: the hang backstop that ends a test which never
-returns, not its performance bound. It is the only killer: a test over its class runs to its own teardown and fails
-after it, since a killed test leaves its images attached until the next run's sweep (01_storage.md, "How the APFS host
-degrades" §2).
+group's filter. The 60s class is defined by what a test runs: the raw substrate lifecycle and every genuine-Nx CLI walk,
+a test whose fixture installs the repository's pinned Nx and runs it or its daemon (`Project::Nx`, or `Project::Build`
+with Nx), each named with the `_substrate_lifecycle` suffix. For the raw lifecycle, 3× its worst idle measurement,
+14.8s, is 44.4s, rounded up. The genuine-Nx walks have no idle median; the warm-fork walk took about 25s when nothing
+waited. With their lease waits excluded, one full serial lane at load 15-84 (median 37) measured them at 2.3-45.4s of
+code time: land-carries 45.4s, the foreign database opener 38.1s, rebase-carries 36.0s, warm fork 30.9s, the foreign
+database holder 30.2s, against at most 5.8s of lease wait each. Five were over 30s, so that class cannot hold them under
+ordinary host load; 60s holds every measurement. It is below 3× their ~25s idle floor (75s): a walk past it on a loaded
+host is a regression to find, not a bound to raise. The group's nextest `slow-timeout` is 180s with
+`terminate-after = 1`: the hang backstop that ends a test which never returns, not its performance bound. It is the only
+killer: a test over its class runs to its own teardown and fails after it, since a killed test leaves its images
+attached until the next run's sweep (01_storage.md, "How the APFS host degrades" §2).
 
 **Host limit.** The host's disk-image attach pool runs out (01_storage.md, "How the APFS host degrades" §2), and the
 suite stops spending into a spent one. Fixtures attach an image once and share it across the assertions that need it
