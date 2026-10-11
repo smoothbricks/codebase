@@ -245,6 +245,13 @@ struct DerivedInventory {
 }
 
 trait InventorySource: Send + Sync {
+    /// The workspaces one project's records publish, read without the kernel mount table: what a
+    /// workspace holds attached or detached (its port blocks) is decided from these alone.
+    fn project_storage(
+        &self,
+        storage: &ValidatedHostStorage,
+        repo: &RepoId,
+    ) -> Result<Vec<StorageFact>, GatewayInventoryError>;
     fn project_facts(
         &self,
         storage: &ValidatedHostStorage,
@@ -267,24 +274,21 @@ impl KernelMountSource for CapturedKernelMountSource {
 }
 
 impl InventorySource for NativeInventorySource {
+    fn project_storage(
+        &self,
+        storage: &ValidatedHostStorage,
+        repo: &RepoId,
+    ) -> Result<Vec<StorageFact>, GatewayInventoryError> {
+        let (_, config) = project_layout_and_config(storage, repo)?;
+        Ok(MacOsApfsExecutionHost::new(SystemCommandRunner, config)?.list(repo)?)
+    }
+
     fn project_facts(
         &self,
         storage: &ValidatedHostStorage,
         repo: &RepoId,
     ) -> Result<ProjectInventoryFacts, GatewayInventoryError> {
-        let layout = StorageLayout::new(storage.store(), repo).map_err(|error| {
-            GatewayInventoryError::InvalidMetadata {
-                path: storage.store().to_owned(),
-                message: error.to_string(),
-            }
-        })?;
-        let checkout_path = authoritative_checkout_path(&layout, repo)?.unwrap_or_else(|| {
-            storage
-                .store()
-                .join("gateway")
-                .join(UNRESOLVED_CHECKOUT_PATH)
-        });
-        let config = project_substrate_config(storage, checkout_path);
+        let (layout, config) = project_layout_and_config(storage, repo)?;
         let captured = SystemKernelMountSource.mounts()?;
         let host = MacOsApfsExecutionHost::with_mount_source(
             SystemCommandRunner,
@@ -305,6 +309,27 @@ impl InventorySource for NativeInventorySource {
             mount_paths,
         })
     }
+}
+
+/// One project's layout and the substrate configuration for the checkout its records name.
+fn project_layout_and_config(
+    storage: &ValidatedHostStorage,
+    repo: &RepoId,
+) -> Result<(StorageLayout, ApfsSubstrateConfig), GatewayInventoryError> {
+    let layout = StorageLayout::new(storage.store(), repo).map_err(|error| {
+        GatewayInventoryError::InvalidMetadata {
+            path: storage.store().to_owned(),
+            message: error.to_string(),
+        }
+    })?;
+    let checkout_path = authoritative_checkout_path(&layout, repo)?.unwrap_or_else(|| {
+        storage
+            .store()
+            .join("gateway")
+            .join(UNRESOLVED_CHECKOUT_PATH)
+    });
+    let config = project_substrate_config(storage, checkout_path);
+    Ok((layout, config))
 }
 
 /// The substrate configuration for one project checked out at `checkout_path`.
@@ -1146,19 +1171,20 @@ impl NativeGatewayInventory {
         let repositories = discover_repositories(self.storage.store())?;
         let mut blocks = ReservedPortBlocks::default();
         for repo in repositories {
-            let authoritative = self.source.project_facts(&self.storage, &repo)?;
+            // A block is held attached or detached, so the records alone decide it: a fault in a
+            // project's kernel mounts is that project's to report, never every `new`'s refusal.
+            let published = self.source.project_storage(&self.storage, &repo)?;
             let layout = StorageLayout::new(self.storage.store(), &repo).map_err(|error| {
                 GatewayInventoryError::InvalidMetadata {
                     path: self.storage.store().to_owned(),
                     message: error.to_string(),
                 }
             })?;
-            let active_names = authoritative
-                .storage
+            let active_names = published
                 .iter()
                 .map(|fact| fact.workspace.name())
                 .collect::<BTreeSet<_>>();
-            for fact in &authoritative.storage {
+            for fact in &published {
                 let image = canonical_image_paths(&layout, &fact.workspace)?;
                 let metadata =
                     read_current_metadata(self.storage.store(), image.image(), &fact.workspace)?;
@@ -2020,14 +2046,13 @@ mod tests {
     #[derive(Default)]
     struct FixtureSource {
         projects: Mutex<BTreeMap<RepoId, ProjectInventoryFacts>>,
+        /// Projects whose kernel mount reading fails the way a volume without the workspace's
+        /// marker, mounted at its checkout, fails it. Their records stay readable.
+        unidentifiable_mounts: Mutex<BTreeSet<RepoId>>,
     }
 
-    impl InventorySource for FixtureSource {
-        fn project_facts(
-            &self,
-            _storage: &ValidatedHostStorage,
-            repo: &RepoId,
-        ) -> Result<ProjectInventoryFacts, GatewayInventoryError> {
+    impl FixtureSource {
+        fn recorded(&self, repo: &RepoId) -> Result<ProjectInventoryFacts, GatewayInventoryError> {
             self.projects
                 .lock()
                 .expect("fixture source")
@@ -2037,6 +2062,36 @@ mod tests {
                     path: PathBuf::from("/missing-fixture"),
                     message: format!("missing fixture for {repo}"),
                 })
+        }
+    }
+
+    impl InventorySource for FixtureSource {
+        fn project_storage(
+            &self,
+            _storage: &ValidatedHostStorage,
+            repo: &RepoId,
+        ) -> Result<Vec<StorageFact>, GatewayInventoryError> {
+            self.recorded(repo).map(|facts| facts.storage)
+        }
+
+        fn project_facts(
+            &self,
+            _storage: &ValidatedHostStorage,
+            repo: &RepoId,
+        ) -> Result<ProjectInventoryFacts, GatewayInventoryError> {
+            if self
+                .unidentifiable_mounts
+                .lock()
+                .expect("fixture source")
+                .contains(repo)
+            {
+                return Err(GatewayInventoryError::Apfs(ApfsStorageError::Host(
+                    format!(
+                        "workspace mount identity mismatch: {repo}'s checkout carries no marker"
+                    ),
+                )));
+            }
+            self.recorded(repo)
         }
     }
 
@@ -2670,6 +2725,39 @@ mod tests {
         );
     }
 
+    /// A volume mounted at one project's checkout that carries no marker for it — another store's
+    /// image a test left behind — faults that project's mount reading, not its records. A block is
+    /// held attached or detached (04_sandbox.md, `portBlock`), so the store-wide reservation reads
+    /// records alone: it still holds the faulted project's block, and refuses no other project's
+    /// `new` over a mount it never needed to read.
+    #[tokio::test]
+    async fn an_unidentifiable_mount_does_not_block_store_wide_port_reservations() {
+        let fixture = Fixture::new("unidentifiable-mount-ports");
+        let (_repo_a, repo_b, source) = two_project_store(&fixture);
+        source
+            .unidentifiable_mounts
+            .lock()
+            .expect("fixture source")
+            .insert(repo_b);
+        let inventory = NativeGatewayInventory::with_source(
+            fixture.storage.clone(),
+            source as Arc<dyn InventorySource>,
+        );
+        assert_eq!(
+            inventory
+                .all_reserved_port_blocks()
+                .await
+                .expect("one project's mount fault leaves every block readable")
+                .blocks()
+                .collect::<Vec<_>>(),
+            [
+                PortBlock::new(MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE).expect("first block"),
+                PortBlock::new(MACOS_PORT_MIN + NEW_PORT_BLOCK_SIZE, NEW_PORT_BLOCK_SIZE)
+                    .expect("second block"),
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn one_unreadable_project_does_not_hide_others_in_store_wide_listing() {
         let fixture = Fixture::new("unreadable-list");
@@ -2887,6 +2975,7 @@ mod tests {
                     },
                 ),
             ])),
+            ..Default::default()
         });
         let inventory = NativeGatewayInventory::with_source(
             fixture.storage.clone(),
@@ -3176,6 +3265,7 @@ mod tests {
                     mount_paths: BTreeMap::new(),
                 },
             )])),
+            ..Default::default()
         });
         let inventory = NativeGatewayInventory::with_source(
             fixture.storage.clone(),
@@ -3218,6 +3308,7 @@ mod tests {
                     mount_paths: BTreeMap::from([(mount.volume_key, path)]),
                 },
             )])),
+            ..Default::default()
         });
         let inventory = NativeGatewayInventory::with_source(
             fixture.storage.clone(),
