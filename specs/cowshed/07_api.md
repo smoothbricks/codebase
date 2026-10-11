@@ -658,7 +658,9 @@ exact lexical Rust module, including inline and path-included modules, and its i
 modules keep a public item from being exported globally. The module bindings derive from those declarations, and
 duplicate names refuse collection rather than selecting the first or last source. Full metadata JSON and owner-emitted
 TypeScript model/validator goldens pin every field; the generated Equals validators admit actual owner JSON and refuse
-omitted, changed and extra facts.
+omitted, changed and extra facts. Normal owner generation publishes that model as `src/declaration-ir.generated.ts`,
+exposed through `@smoothbricks/cowshed/declaration-ir`. Consumers import these public types through their declared
+package dependency; no consumer generator produces an input to its own generic schema library's build.
 
 The public CLI health summary `GatewayStatus` and the daemon snapshot `DaemonStatus` are distinct declarations with
 distinct names. API and support collection share the same duplicate-name refusal; neither source shadows the other. This

@@ -17,6 +17,11 @@
       "types": "./dist/ts/index.d.ts",
       "import": "./dist/ts/index.js",
       "default": "./dist/ts/index.js"
+    },
+    "./declaration-ir": {
+      "types": "./dist/ts/declaration-ir.generated.d.ts",
+      "import": "./dist/ts/declaration-ir.generated.js",
+      "default": "./dist/ts/declaration-ir.generated.js"
     }
   },
   "files": [
@@ -90,6 +95,7 @@
           "{projectRoot}/src/api.generated.ts",
           "{projectRoot}/src/validators.generated.ts",
           "{projectRoot}/src/native.generated.ts",
+          "{projectRoot}/src/declaration-ir.generated.ts",
           "{projectRoot}/crates/cowshed-napi/src/operations.generated.rs",
           "{projectRoot}/crates/cowshed-core/src/api/served.generated.rs"
         ],
@@ -116,6 +122,7 @@
           "{projectRoot}/src/api.generated.ts",
           "{projectRoot}/src/validators.generated.ts",
           "{projectRoot}/src/native.generated.ts",
+          "{projectRoot}/src/declaration-ir.generated.ts",
           "{projectRoot}/crates/cowshed-napi/src/operations.generated.rs",
           "{projectRoot}/crates/cowshed-core/src/api/served.generated.rs",
           "cargoToolchain",

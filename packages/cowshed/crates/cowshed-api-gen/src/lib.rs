@@ -276,6 +276,7 @@ pub fn generate(project: &Path) -> Result<Vec<GeneratedFile>, String> {
         "./api.generated.js",
     )?;
     let projection = napi::emit(&operations, &api, &capabilities)?;
+    let declaration_ir = ir_types("./declaration-ir.generated.js")?;
     Ok(vec![
         GeneratedFile {
             path: project.join("src/api.generated.ts"),
@@ -296,6 +297,10 @@ pub fn generate(project: &Path) -> Result<Vec<GeneratedFile>, String> {
         GeneratedFile {
             path: project.join("src/native.generated.ts"),
             contents: projection.typescript,
+        },
+        GeneratedFile {
+            path: project.join("src/declaration-ir.generated.ts"),
+            contents: declaration_ir.types,
         },
     ])
 }

@@ -6,7 +6,10 @@ import { spawnSync } from 'node:child_process';
 import { cpSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import type { DeclarationModel } from '@smoothbricks/cowshed/declaration-ir';
 import typia, { TypeGuardError } from 'typia';
+
+const assertPublicModel = typia.createAssertEquals<DeclarationModel>();
 
 /**
  * The owner's public declaration IR, admitted as JSON. The validators are compiled from the owner CLI's own
@@ -170,7 +173,9 @@ describe('declaration model admission', () => {
 
   it('admits the model the owner emits for the real cowshed-core declarations', () => {
     const real = generate(['ir-model', project]);
-    expect(admission.parseDeclarationModel(real)).toEqual(JSON.parse(real));
+    const publicModel = assertPublicModel(admission.parseDeclarationModel(real));
+    expect(publicModel).toEqual(JSON.parse(real));
+    expect(Object.keys(publicModel.api.records).length).toBeGreaterThan(0);
   });
 
   it('admits the probe model unmutated, so each refusal below is caused by its mutation', () => {
