@@ -271,7 +271,8 @@ held with a shared no-follow lock excluding attachment while descriptor cloning 
 
 A target's seed is made when the target is created (a clone of the seed it was forked from, or of its first build volume
 at its first touch), during every land into it (below), by sealing and cloning the landing workspace's build volume
-before the target adopts it, and again by a **reseed** whenever the target's live volume holds a write its seed does
+before the target adopts it unless a holder outside the Cargo and Nx protocols refuses that seal (a busy seal, Land step
+5.6, keeps the previous seed), and again by a **reseed** whenever the target's live volume holds a write its seed does
 not. Stopping supervised jobs alone is not writer exclusion: a host Cargo build or editor may still hold the volume.
 Each target keeps only its latest seed; a target's seed is deleted when the target retires.
 
@@ -302,7 +303,11 @@ flushes the restored volume and image, and fixes that post-mount image clock as 
 reopening admission. The immutable mark survives the clone's own first write; no live image is re-sampled after
 admission reopens. A seed is behind when the live volume's image, its volume flushed first, was modified after the
 seed's image. A fork sets its own seed's time to its new live volume's, so a new workspace starts with a fresh seed
-rather than one behind by its own mount.
+rather than one behind by its own mount. After a busy seal the kept seed and the adopted volume come from different
+lineages, and the comparison still decides: the adoption check (Land step 7) runs on the adopted volume after the land
+took the target's image lock, so whatever it writes there (an Nx run writes its task database and run summary) is after
+every earlier seed's mark. A land whose check writes nothing there leaves the seed current until the target's next
+write, when it is behind and a reseed refreezes it.
 
 **A reseed clones the live volume only while it has no writer**, because a clone of a volume being written can hold a
 half-written Cargo unit or Nx database. It runs under the target's image lock, which every fork of the target holds
@@ -386,7 +391,8 @@ never stages releases the volume made for it.
 
 The fork is warm for everything the target's volume held when the seed was last frozen: at the latest land, or at the
 latest reseed, which is this fork's own step 2 unless the target's volume had a writer. If the target's tree has moved
-past its seed's (a land skipped its swap, below), the fork builds the difference incrementally, as an edit would.
+past its seed's (a land skipped its swap, or a busy seal kept the previous seed, below), the fork builds the difference
+incrementally, as an edit would.
 
 ## Land: `cowshed land`
 
@@ -422,12 +428,17 @@ same for main and for an integration workspace; "the target" is whichever one it
       real Cargo holder is a `landingBuilding` skip with its lock and processes, with no seed publication or old-seed
       retirement. Otherwise release the check descriptors and seal the source as above; a late or newly created profile
       cannot write through the detached capture. On successful capture and source restoration, publish the target's new
-      seed and delete its previous seed. A busy seal (a filesystem holder outside the Cargo and Nx protocols, such as an
-      indexer's MCP server holding its SQLite index open) is not a skip: the restored volume is as quiet for the target
-      as it was, so the land keeps the target's previous seed, reports `sealBusy` with the holders the refusal named,
-      and goes on to the swap. That seed is then behind the adopted volume, so the next fork's reseed (Fork step 2)
-      refreezes it once the holder has let go. What the target runs afterwards on the adopted volume reaches the seed by
-      a reseed (Targets and seeds).
+      seed and delete its previous seed. A refused seal is first put to the landing side's own protocols again, because
+      an Nx or Cargo process may have reached the volume since step 4 (measured: the landing checkout's own Nx daemon
+      held it at the seal): the landing volume's Nx state is closed as at step 4, its recorded daemon stopped and any
+      other task-database holder a `landingHeld` skip (a daemon that stays, `landingDaemonStayed`), and the seal is
+      asked once more behind a fresh Cargo admission, a held profile lock a `landingBuilding` skip. Only a refusal that
+      outlasts both is a busy seal (a filesystem holder outside the Cargo and Nx protocols, such as an indexer's MCP
+      server holding its SQLite index open), and it is not a skip: the restored volume is as quiet for the target as it
+      was, so the land keeps the target's previous seed, reports `sealBusy` with the holders the refusal named, and goes
+      on to the swap. That seed is then behind the adopted volume, so the next fork's reseed (Fork step 2) refreezes it
+      once the holder has let go. What the target runs afterwards on the adopted volume reaches the seed by a reseed
+      (Targets and seeds).
 
    Resolving either build volume for mounting takes its per-image lease **before** reading the attachment inventory. A
    recovered attachment owns a raw IOMedia pin across the subsequent kernel mount-table read and mount, just as a
@@ -950,7 +961,9 @@ The decisions this spec records, in the order they were taken. It is kept so the
   `codegraph/codegraph.db` open, so the seed's seal was refused, and that refusal skipped the swap. The seal fences only
   the seed's captured bytes, so a busy seal now keeps the previous seed and the land still adopts; the next fork's
   reseed refreezes the seed once the holder lets go. CodeGraph 1.6.2 releases an idle project after 10 minutes
-  (`CODEGRAPH_PROJECT_IDLE_TIMEOUT_MS`), which bounds how long a reseed can be refused.
+  (`CODEGRAPH_PROJECT_IDLE_TIMEOUT_MS`), which bounds how long a reseed can be refused. Review then found the landing
+  checkout's own Nx daemon refusing the seal and being adopted with it as a busy seal, its record deleted at 6.3; a
+  refusal is now put to the landing volume's Nx and Cargo protocols again, and only one that outlasts both is busy.
 
 ## Open questions
 

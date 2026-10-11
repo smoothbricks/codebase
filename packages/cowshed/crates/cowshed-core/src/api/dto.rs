@@ -2999,9 +2999,9 @@ pub enum LandSeed {
     Unchanged,
     /// The target's seed is frozen from the landing volume.
     Frozen,
-    /// A filesystem holder refused the landing volume's seal, so the target keeps its previous
-    /// seed while the adoption goes ahead; the next fork's reseed refreezes it from the target's
-    /// live volume once that holder lets go.
+    /// A holder outside the Cargo and Nx protocols refused the landing volume's seal, so the
+    /// target keeps its previous seed while the adoption goes ahead; the next fork's reseed
+    /// refreezes it from the target's live volume once that holder lets go.
     SealBusy { reason: String },
 }
 

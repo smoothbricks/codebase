@@ -168,7 +168,7 @@ impl Contended {
 pub(crate) enum Freeze {
     /// The seed is captured from the sealed landing volume and every older seed retired.
     Frozen,
-    /// A filesystem holder refused the seal; the previous seed stays.
+    /// A holder outside the Cargo and Nx protocols refused the seal; the previous seed stays.
     SealBusy { reason: String },
 }
 
@@ -951,10 +951,13 @@ impl BuildVolumes {
     }
 
     /// Land step 5.6, under the target's image lock: admit only an idle Cargo volume, seal it
-    /// without force, capture the target's seed, then retire every older seed. A filesystem
-    /// holder that refuses the seal leaves the previous seed in place and is answered as
-    /// [`Freeze::SealBusy`], not a skip: the seal fences only the captured bytes, so the
-    /// adoption still goes ahead on the restored volume.
+    /// without force, capture the target's seed, then retire every older seed. A refused seal is
+    /// first put to the landing side's own protocols again: its Nx state is closed once more (a
+    /// recorded daemon stopped, any other task-database holder a skip) and the seal is asked once
+    /// more behind a fresh Cargo admission (a held profile lock a skip). Only a refusal that both
+    /// protocols leave standing is a holder outside them, answered as [`Freeze::SealBusy`]: the
+    /// seal fences only the captured bytes, so the adoption still goes ahead on the restored
+    /// volume with the previous seed kept.
     pub async fn freeze_seed(
         &self,
         locked: &TargetLock,
@@ -964,46 +967,33 @@ impl BuildVolumes {
         let quiet = quiet.clone();
         let target = locked.target.clone();
         self.blocking(move |host, layout| {
-            let builds = match cargo::hold(&quiet.mount, &quiet.state)
-                .map_err(|error| io("take the landing Cargo profile locks", &quiet.mount, &error))?
-            {
-                Ok(held) => held,
-                Err(lock) => {
-                    let holders = nx::holders(&lock).map_err(|error| {
-                        io("list the landing Cargo build's processes", &lock, &error)
-                    })?;
-                    return Ok(Err(AdoptionSkip::LandingBuilding {
-                        lock,
-                        holders: holders.into_iter().map(database_holder).collect(),
-                    }));
-                }
-            };
+            let record = BuildVolumeRecord::new(
+                Some(tree),
+                BuildVolumeRole::Seed {
+                    target: target.name.clone(),
+                    incarnation: target.incarnation.clone(),
+                },
+            );
             let previous = seeds_of(layout, &target)?;
-            // Existing profiles are checked, not future directories fenced. Close our own
-            // descriptors before unmount; the non-forced detached capture excludes late writers.
-            drop(builds);
-            match host.clone_quiet_build_volume(
-                layout,
-                &quiet,
-                &BuildVolumeId::mint(),
-                &BuildVolumeRecord::new(
-                    Some(tree),
-                    BuildVolumeRole::Seed {
-                        target: target.name.clone(),
-                        incarnation: target.incarnation.clone(),
-                    },
-                ),
-            ) {
-                Ok(()) => {}
-                Err(ApfsStorageError::Apfs(error)) if crate::apfs::detach_was_dissented(&error) => {
-                    return Ok(Ok(Freeze::SealBusy {
-                        reason: error.to_string(),
-                    }));
+            let sealed = match seal(host, layout, &quiet, &record)? {
+                Ok(Sealed::Refused { .. }) => {
+                    if let Err(busy) = nx::close(&quiet.mount, &quiet.state).map_err(|error| {
+                        io("close the landing volume's Nx state", &quiet.mount, &error)
+                    })? {
+                        return Ok(Err(skip(busy, Side::Landing)));
+                    }
+                    seal(host, layout, &quiet, &record)?
                 }
-                Err(error) => return Err(storage(error)),
+                first => first,
+            };
+            match sealed {
+                Ok(Sealed::Captured) => {
+                    retire_seeds(host, layout, &target, previous)?;
+                    Ok(Ok(Freeze::Frozen))
+                }
+                Ok(Sealed::Refused { reason }) => Ok(Ok(Freeze::SealBusy { reason })),
+                Err(skipped) => Ok(Err(skipped)),
             }
-            retire_seeds(host, layout, &target, previous)?;
-            Ok(Ok(Freeze::Frozen))
         })
         .await
     }
@@ -1684,6 +1674,50 @@ fn seeds_of(layout: &BuildVolumeLayout, owner: &Owner) -> Result<Vec<BuildVolume
         }
     }
     Ok(seeds)
+}
+
+/// What one seal of the quiet landing volume did (Land step 5.6).
+enum Sealed {
+    /// The seed is captured from the sealed volume and the volume restored.
+    Captured,
+    /// A filesystem holder refused the non-forced seal; the volume stays mounted.
+    Refused { reason: String },
+}
+
+/// Seal the quiet landing volume once and capture a seed recorded as `record` from it, admitted
+/// only while no Cargo build holds one of its profile locks (a [`AdoptionSkip::LandingBuilding`]
+/// skip). The admission checks existing profiles; it does not fence future ones, so its
+/// descriptors are closed before the unmount and the non-forced detached capture excludes late
+/// writers.
+fn seal(
+    host: &Host,
+    layout: &BuildVolumeLayout,
+    quiet: &Quiet,
+    record: &BuildVolumeRecord,
+) -> Result<std::result::Result<Sealed, AdoptionSkip>> {
+    let builds = match cargo::hold(&quiet.mount, &quiet.state)
+        .map_err(|error| io("take the landing Cargo profile locks", &quiet.mount, &error))?
+    {
+        Ok(held) => held,
+        Err(lock) => {
+            let holders = nx::holders(&lock)
+                .map_err(|error| io("list the landing Cargo build's processes", &lock, &error))?;
+            return Ok(Err(AdoptionSkip::LandingBuilding {
+                lock,
+                holders: holders.into_iter().map(database_holder).collect(),
+            }));
+        }
+    };
+    drop(builds);
+    match host.clone_quiet_build_volume(layout, quiet, &BuildVolumeId::mint(), record) {
+        Ok(()) => Ok(Ok(Sealed::Captured)),
+        Err(ApfsStorageError::Apfs(error)) if crate::apfs::detach_was_dissented(&error) => {
+            Ok(Ok(Sealed::Refused {
+                reason: error.to_string(),
+            }))
+        }
+        Err(error) => Err(storage(error)),
+    }
 }
 
 /// Delete `previous`, the seeds of `target` a new one replaced. A seed is never mounted and no
@@ -2964,6 +2998,172 @@ fn main() {
             still_mounted,
             "the refused seal restores the landing volume's mount"
         );
+    }
+
+    /// An Nx client that opens the landing volume's task database after quiesce refuses the seal
+    /// as any holder does, but it is inside the Nx protocol: the refusal is put to that protocol
+    /// again, which names it as a `landingHeld` skip instead of a busy seal that would adopt the
+    /// volume with the client still in it (16_build_volumes.md, Land step 5.6).
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn real_apfs_seed_freeze_skips_a_late_nx_database_holder_after_quiesce() {
+        use crate::fork_lock::Spawn as _;
+
+        let scratch = Scratch::new("seed-late-nx-holder");
+        let (main_checkout, _, _) = scratch.linked_checkout("main", 1);
+        let (topic_checkout, _, mount) = scratch.linked_checkout("topic", 1);
+        let state = BuildVolumeState {
+            paths: vec![BuildStatePath::new(".nx/workspace-data", "nx/workspace-data").unwrap()],
+            fingerprint: None,
+        };
+        state.write(&mount).unwrap();
+        fs::create_dir_all(mount.join("nx/workspace-data")).unwrap();
+        let database = mount.join("nx/workspace-data/T-v3.db");
+        fs::write(&database, b"").unwrap();
+        let quiet = scratch
+            .volumes
+            .quiesce(
+                scratch.landing(&topic_checkout),
+                scratch.stopped(&topic_checkout).await,
+                main_checkout,
+            )
+            .await
+            .unwrap()
+            .expect("the landing volume's task database had no holder at quiesce");
+        let mut holder = std::process::Command::new("/usr/bin/tail")
+            .arg("-f")
+            .arg(&database)
+            .stdout(std::process::Stdio::null())
+            .spawn_locked()
+            .unwrap();
+        let pid = i32::try_from(holder.id()).expect("a pid fits i32");
+        let started = Instant::now();
+        while !nx::holders(&database)
+            .unwrap()
+            .iter()
+            .any(|held| held.pid == pid)
+        {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "tail never opened {}",
+                database.display()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let target = owner("main", '0');
+        let locked = scratch.lock(&target).await;
+        let frozen = scratch
+            .volumes
+            .freeze_seed(&locked, &quiet, GitOid::new("a".repeat(40)).unwrap())
+            .await;
+        let seed = scratch
+            .layout
+            .seed_of(&target.name, &target.incarnation)
+            .unwrap();
+        holder.kill().unwrap();
+        holder.wait().unwrap();
+        drop(quiet);
+        drop(locked);
+        scratch.release_all();
+        assert!(seed.is_none(), "a skipped freeze must publish no seed");
+        let Err(AdoptionSkip::LandingHeld {
+            database: held,
+            holders,
+        }) = frozen.unwrap()
+        else {
+            panic!("a late Nx database holder on the landing volume skips the adoption");
+        };
+        assert_eq!(held, database);
+        assert_eq!(
+            holders,
+            [DatabaseHolder {
+                pid,
+                command: format!("/usr/bin/tail -f {}", database.display()),
+            }]
+        );
+    }
+
+    /// The landing checkout's own Nx daemon, recorded in the landing volume and started by a
+    /// client after quiesce, holds the volume (its working directory is in it) and refuses the
+    /// seal. The refusal is put to the Nx protocol again, which stops that daemon as step 4 does,
+    /// and the second seal freezes the seed: the daemon is not a holder outside the protocols
+    /// (16_build_volumes.md, Land step 5.6).
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn real_apfs_seed_freeze_stops_a_late_landing_daemon_and_seals_again() {
+        use crate::fork_lock::Spawn as _;
+        use std::os::unix::process::ExitStatusExt as _;
+
+        let scratch = Scratch::new("seed-late-daemon");
+        let (main_checkout, _, _) = scratch.linked_checkout("main", 1);
+        let (topic_checkout, _, mount) = scratch.linked_checkout("topic", 1);
+        let state = BuildVolumeState {
+            paths: vec![BuildStatePath::new(".nx/workspace-data", "nx/workspace-data").unwrap()],
+            fingerprint: None,
+        };
+        state.write(&mount).unwrap();
+        let data = mount.join("nx/workspace-data");
+        fs::create_dir_all(data.join(nx::DAEMON_DIRECTORY)).unwrap();
+        let quiet = scratch
+            .volumes
+            .quiesce(
+                scratch.landing(&topic_checkout),
+                scratch.stopped(&topic_checkout).await,
+                main_checkout,
+            )
+            .await
+            .unwrap()
+            .expect("the landing volume had no Nx client at quiesce");
+        // Short, under /tmp: a Unix socket path is bounded at 104 bytes on macOS.
+        let sockets = Path::new("/tmp").join(format!(
+            "cs-seal-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..12]
+        ));
+        fs::create_dir_all(&sockets).unwrap();
+        let socket = sockets.join("d.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let mut daemon = std::process::Command::new("/bin/sleep")
+            .arg("600")
+            .current_dir(&data)
+            .spawn_locked()
+            .unwrap();
+        fs::write(
+            data.join(nx::DAEMON_DIRECTORY).join("server-process.json"),
+            serde_json::json!({ "processId": daemon.id(), "socketPath": socket }).to_string(),
+        )
+        .unwrap();
+        let target = owner("main", '0');
+        let locked = scratch.lock(&target).await;
+        let frozen = scratch
+            .volumes
+            .freeze_seed(&locked, &quiet, GitOid::new("a".repeat(40)).unwrap())
+            .await;
+        let seed = scratch
+            .layout
+            .seed_of(&target.name, &target.incarnation)
+            .unwrap();
+        let stopped = daemon.try_wait().unwrap();
+        if stopped.is_none() {
+            daemon.kill().unwrap();
+            daemon.wait().unwrap();
+        }
+        drop(listener);
+        fs::remove_dir_all(&sockets).unwrap();
+        drop(quiet);
+        drop(locked);
+        scratch.release_all();
+        assert_eq!(
+            stopped.and_then(|status| status.signal()),
+            Some(libc::SIGTERM),
+            "the recorded landing daemon is stopped as `nx daemon --stop` stops it"
+        );
+        assert_eq!(
+            frozen.unwrap(),
+            Ok(Freeze::Frozen),
+            "with its own daemon stopped the landing volume seals"
+        );
+        let (_, record) = seed.expect("the second seal publishes the seed");
+        assert_eq!(record.tree, Some(GitOid::new("a".repeat(40)).unwrap()));
     }
 
     #[cfg(target_os = "macos")]
