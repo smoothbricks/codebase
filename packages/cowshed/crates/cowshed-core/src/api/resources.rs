@@ -39,7 +39,10 @@ pub enum ResourceUnitError {
 /// user or system time, or a job's total from its accounting source.
 #[cfg_attr(
     any(),
-    cowshed_api(scalar = "number & tags.Type<'uint64'> & tags.Maximum<9007199254740991>")
+    cowshed_api(
+        accessor = "get",
+        scalar = "number & tags.Type<'uint64'> & tags.Maximum<9007199254740991>"
+    )
 )]
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(try_from = "u64", into = "u64")]
@@ -83,7 +86,10 @@ impl CpuMicros {
 /// CPU time in whole milliseconds; only [`CpuMicros::millis`] makes one.
 #[cfg_attr(
     any(),
-    cowshed_api(scalar = "number & tags.Type<'uint64'> & tags.Maximum<9007199254740991>")
+    cowshed_api(
+        accessor = "get",
+        scalar = "number & tags.Type<'uint64'> & tags.Maximum<9007199254740991>"
+    )
 )]
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(try_from = "u64", into = "u64")]
@@ -115,6 +121,7 @@ impl From<CpuMillis> for u64 {
 #[cfg_attr(
     any(),
     cowshed_api(
+        accessor = "get",
         scalar = "number & tags.Type<'int64'> & tags.Minimum<-9007199254740991> & tags.Maximum<9007199254740991>"
     )
 )]
@@ -156,6 +163,7 @@ impl From<CpuMicrosDelta> for i64 {
 #[cfg_attr(
     any(),
     cowshed_api(
+        accessor = "get",
         scalar = "number & tags.Type<'int64'> & tags.Minimum<-9007199254740991> & tags.Maximum<9007199254740991>"
     )
 )]
@@ -201,7 +209,10 @@ impl From<StorageIoBytesDelta> for i64 {
 #[serde(try_from = "f64", into = "f64")]
 #[cfg_attr(
     any(),
-    cowshed_api(scalar = "number & tags.Minimum<0> & tags.Maximum<1.7976931348623157e308>")
+    cowshed_api(
+        accessor = "get",
+        scalar = "number & tags.Minimum<0> & tags.Maximum<1.7976931348623157e308>"
+    )
 )]
 pub struct OneCoreCpuPercent(f64);
 
@@ -274,7 +285,10 @@ impl From<CpuMicros> for u64 {
 /// elsewhere (a cgroup's `memory.current` counts page cache and kernel charges too).
 #[cfg_attr(
     any(),
-    cowshed_api(scalar = "number & tags.Type<'uint64'> & tags.Maximum<9007199254740991>")
+    cowshed_api(
+        accessor = "get",
+        scalar = "number & tags.Type<'uint64'> & tags.Maximum<9007199254740991>"
+    )
 )]
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(try_from = "u64", into = "u64")]
@@ -315,7 +329,10 @@ impl From<ResidentBytes> for u64 {
 /// volume-allocation deltas, or operation counts converted into bytes.
 #[cfg_attr(
     any(),
-    cowshed_api(scalar = "number & tags.Type<'uint64'> & tags.Maximum<9007199254740991>")
+    cowshed_api(
+        accessor = "get",
+        scalar = "number & tags.Type<'uint64'> & tags.Maximum<9007199254740991>"
+    )
 )]
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(try_from = "u64", into = "u64")]
@@ -454,7 +471,10 @@ impl JobAccounting {
 /// of it maps a page.
 #[cfg_attr(
     any(),
-    cowshed_api(scalar = "number & tags.Type<'uint64'> & tags.Maximum<9007199254740991>")
+    cowshed_api(
+        accessor = "get",
+        scalar = "number & tags.Type<'uint64'> & tags.Maximum<9007199254740991>"
+    )
 )]
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(try_from = "u64", into = "u64")]
@@ -489,7 +509,10 @@ impl From<ChargedMemoryBytes> for u64 {
 #[serde(try_from = "u64", into = "u64")]
 #[cfg_attr(
     any(),
-    cowshed_api(scalar = "number & tags.Type<'uint64'> & tags.Maximum<9007199254740991>")
+    cowshed_api(
+        accessor = "get",
+        scalar = "number & tags.Type<'uint64'> & tags.Maximum<9007199254740991>"
+    )
 )]
 pub struct WallMicros(u64);
 
@@ -531,7 +554,10 @@ impl From<WallMicros> for u64 {
 #[serde(try_from = "u64", into = "u64")]
 #[cfg_attr(
     any(),
-    cowshed_api(scalar = "number & tags.Type<'uint64'> & tags.Maximum<9007199254740991>")
+    cowshed_api(
+        accessor = "get",
+        scalar = "number & tags.Type<'uint64'> & tags.Maximum<9007199254740991>"
+    )
 )]
 pub struct WallMillis(u64);
 
@@ -576,7 +602,10 @@ fn exact_signed(unit: &'static str, value: i128) -> Result<i64, ResourceUnitErro
 #[serde(try_from = "f64", into = "f64")]
 #[cfg_attr(
     any(),
-    cowshed_api(scalar = "number & tags.Minimum<0> & tags.Maximum<1.7976931348623157e308>")
+    cowshed_api(
+        accessor = "get",
+        scalar = "number & tags.Minimum<0> & tags.Maximum<1.7976931348623157e308>"
+    )
 )]
 pub struct HostLoad1(f64);
 
@@ -616,7 +645,10 @@ impl From<HostLoad1> for f64 {
 #[serde(transparent)]
 #[cfg_attr(
     any(),
-    cowshed_api(scalar = "number & tags.Type<\"uint32\"> & tags.Minimum<1> & tags.Maximum<65535>")
+    cowshed_api(
+        accessor = "get",
+        scalar = "number & tags.Type<\"uint32\"> & tags.Minimum<1> & tags.Maximum<65535>"
+    )
 )]
 pub struct HostCores(NonZeroU16);
 
@@ -653,7 +685,10 @@ impl HostLoadSample {
 #[serde(try_from = "u64", into = "u64")]
 #[cfg_attr(
     any(),
-    cowshed_api(scalar = "number & tags.Type<'uint64'> & tags.Maximum<9007199254740991>")
+    cowshed_api(
+        accessor = "get",
+        scalar = "number & tags.Type<'uint64'> & tags.Maximum<9007199254740991>"
+    )
 )]
 pub struct StreamBytes(u64);
 
@@ -687,7 +722,10 @@ impl From<StreamBytes> for u64 {
 #[serde(try_from = "u64", into = "u64")]
 #[cfg_attr(
     any(),
-    cowshed_api(scalar = "number & tags.Type<'uint64'> & tags.Maximum<9007199254740991>")
+    cowshed_api(
+        accessor = "get",
+        scalar = "number & tags.Type<'uint64'> & tags.Maximum<9007199254740991>"
+    )
 )]
 pub struct StreamLines(u64);
 
@@ -739,6 +777,7 @@ impl JobStreamWatermark {
 #[cfg_attr(
     any(),
     cowshed_api(
+        accessor = "get",
         scalar = "number & tags.Type<'int64'> & tags.Minimum<-9007199254740991> & tags.Maximum<9007199254740991>"
     )
 )]
@@ -897,6 +936,7 @@ impl JobResourceSample {
 #[cfg_attr(
     any(),
     cowshed_api(
+        accessor = "get",
         scalar = "number & tags.Type<'uint64'> & tags.Minimum<1> & tags.Maximum<9007199254740991>"
     )
 )]
@@ -910,7 +950,7 @@ impl SampleInterval {
         }
     }
 
-    pub const fn millis(self) -> u64 {
+    pub const fn get(self) -> u64 {
         self.0
     }
 

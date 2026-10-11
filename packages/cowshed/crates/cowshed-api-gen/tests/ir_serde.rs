@@ -4,7 +4,7 @@
 
 use cowshed_api_gen::ir::{
     Api, DeclarationModel, DeclarationVisibility, Field, Fields, Projection, Record, RustType,
-    Serde, Shape, TypeArgument, Variant,
+    ScalarAccessor, Serde, Shape, TypeArgument, Variant,
 };
 use cowshed_api_gen::{records, typescript};
 use serde_json::{Value, json};
@@ -396,11 +396,12 @@ fn every_serde_fact() -> Serde {
     }
 }
 
-/// Every projection fact set to a non-default value. The literal names all six facts.
+/// Every projection fact set to a non-default value. The literal names every actual owner field.
 fn every_projection_fact() -> Projection {
     Projection {
         wire: Some("WireForm".to_owned()),
         scalar: Some("number & tags.Minimum<1>".to_owned()),
+        accessor: Some(ScalarAccessor::Get),
         exclusive: vec!["a".to_owned(), "b".to_owned()],
         name: Some("PublicName".to_owned()),
         unit_value: Some("true".to_owned()),

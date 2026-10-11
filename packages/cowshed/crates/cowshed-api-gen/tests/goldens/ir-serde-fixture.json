@@ -27,6 +27,7 @@
         "projection": {
           "wire": null,
           "scalar": null,
+          "accessor": null,
           "exclusive": [],
           "name": null,
           "unitValue": null,
@@ -69,6 +70,7 @@
         "projection": {
           "wire": null,
           "scalar": null,
+          "accessor": null,
           "exclusive": [],
           "name": null,
           "unitValue": "false",
@@ -230,6 +232,7 @@
         "projection": {
           "wire": null,
           "scalar": null,
+          "accessor": null,
           "exclusive": [],
           "name": null,
           "unitValue": null,
@@ -326,6 +329,7 @@
         "projection": {
           "wire": null,
           "scalar": null,
+          "accessor": null,
           "exclusive": [],
           "name": null,
           "unitValue": null,
@@ -360,6 +364,7 @@
         "projection": {
           "wire": "WireForm",
           "scalar": "number & tags.Minimum<1>",
+          "accessor": "get",
           "exclusive": ["a", "b"],
           "name": "PublicName",
           "unitValue": "true",

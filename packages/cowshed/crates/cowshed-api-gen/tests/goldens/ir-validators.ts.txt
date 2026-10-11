@@ -42,6 +42,11 @@ export const parseRustType = (json: string): Api.RustType => assertRustType(JSON
 export const assertRustTypeList = typia.createAssertEquals<readonly Api.RustType[]>();
 export const parseRustTypeList = (json: string): readonly Api.RustType[] => assertRustTypeList(JSON.parse(json));
 
+export const assertScalarAccessor = typia.createAssertEquals<Api.ScalarAccessor>();
+export const parseScalarAccessor = (json: string): Api.ScalarAccessor => assertScalarAccessor(JSON.parse(json));
+export const assertScalarAccessorList = typia.createAssertEquals<readonly Api.ScalarAccessor[]>();
+export const parseScalarAccessorList = (json: string): readonly Api.ScalarAccessor[] => assertScalarAccessorList(JSON.parse(json));
+
 export const assertSerde = typia.createAssertEquals<Api.Serde>();
 export const parseSerde = (json: string): Api.Serde => assertSerde(JSON.parse(json));
 export const assertSerdeList = typia.createAssertEquals<readonly Api.Serde[]>();

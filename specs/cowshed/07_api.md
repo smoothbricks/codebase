@@ -666,6 +666,9 @@ The public CLI health summary `GatewayStatus` and the daemon snapshot `DaemonSta
 distinct names. API and support collection share the same duplicate-name refusal; neither source shadows the other. This
 naming cutover changes no serialized field or status wire envelope.
 
+Scalar projection accessor metadata is the closed get/as-str/display contract owned by the declaration. Opaque numeric
+and byte-backed string units use their actual Display, never a guessed as_str or consumer formatter.
+
 Externally projected types are defined **once** in `cowshed-core` and reused verbatim by the CLI (`--json` bodies),
 NAPI, and MCP — no adapter redefines a field, and contract goldens (08_testing.md) pin their shapes: `WorkspaceInfo`,
 `CheckpointInfo`, `GcReport`, `Finding`, `JobId`, `JobState`, `JobInfo`, `StreamInfo`, `OutputStorage`,

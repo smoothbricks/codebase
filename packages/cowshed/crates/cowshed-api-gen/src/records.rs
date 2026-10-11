@@ -1,5 +1,6 @@
 use crate::ir::{
-    Api, DeclarationVisibility, Field, Fields, Projection, Record, RustType, Serde, Shape, Variant,
+    Api, DeclarationVisibility, Field, Fields, Projection, Record, RustType, ScalarAccessor, Serde,
+    Shape, Variant,
 };
 use syn::spanned::Spanned;
 use syn::{Attribute, Expr, Item, Lit, Meta, Visibility};
@@ -162,6 +163,7 @@ fn parse_items(items: Vec<Item>, api: &mut Api, module: &str, exported: bool) ->
                         scalar: Some(format!(
                             "string & tags.Pattern<'^(?!0{{{digits}}}$)[0-9a-f]{{{digits}}}$'>"
                         )),
+                        accessor: Some(ScalarAccessor::AsStr),
                         ..Projection::default()
                     },
                     shape: Shape::Alias(normalized_type(syn::parse_quote!(String))?),
@@ -520,6 +522,13 @@ fn projection(attrs: &[Attribute]) -> syn::Result<Projection> {
                         result.wire = Some(value);
                     } else if meta.path.is_ident("scalar") {
                         result.scalar = Some(value);
+                    } else if meta.path.is_ident("accessor") {
+                        result.accessor = Some(match value.as_str() {
+                            "get" => ScalarAccessor::Get,
+                            "as-str" => ScalarAccessor::AsStr,
+                            "display" => ScalarAccessor::Display,
+                            _ => return Err(meta.error("accessor must be get, as-str or display")),
+                        });
                     } else if meta.path.is_ident("exclusive") {
                         result.exclusive = value
                             .split(',')
@@ -543,6 +552,12 @@ fn projection(attrs: &[Attribute]) -> syn::Result<Projection> {
             }
             Ok(())
         })?;
+    }
+    if result.accessor.is_some() && result.scalar.is_none() {
+        return Err(syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "a scalar accessor requires a scalar projection",
+        ));
     }
     Ok(result)
 }

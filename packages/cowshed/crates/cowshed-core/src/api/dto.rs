@@ -89,6 +89,7 @@ pub enum DtoError {
 #[cfg_attr(
     any(),
     cowshed_api(
+        accessor = "get",
         scalar = "number & tags.Type<'uint64'> & tags.Minimum<1> & tags.Maximum<9007199254740991>"
     )
 )]
@@ -137,7 +138,10 @@ impl<'de> Deserialize<'de> for JobId {
 
 #[cfg_attr(
     any(),
-    cowshed_api(scalar = "string & tags.Pattern<'^([0-9a-f]{40}|[0-9a-f]{64})$'>")
+    cowshed_api(
+        accessor = "as-str",
+        scalar = "string & tags.Pattern<'^([0-9a-f]{40}|[0-9a-f]{64})$'>"
+    )
 )]
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct GitOid(String);
@@ -196,6 +200,7 @@ pub const MAX_ADMISSION_KEY_BYTES: usize = 4096;
 #[cfg_attr(
     any(),
     cowshed_api(
+        accessor = "as-str",
         scalar = "string & tags.MinLength<1> & tags.TagBase<{ kind: 'utf8Bytes'; target: 'string'; value: 4096; validate: '(() => { let bytes = 0; for (let index = 0; index < $input.length; index += 1) { const code = $input.charCodeAt(index); if (code < 0x80) bytes += 1; else if (code < 0x800) bytes += 2; else if (code >= 0xd800 && code <= 0xdbff && index + 1 < $input.length) { const low = $input.charCodeAt(index + 1); if (low >= 0xdc00 && low <= 0xdfff) { bytes += 4; index += 1; } else bytes += 3; } else bytes += 3; if (bytes > 4096) return false; } return true; })()' }>"
     )
 )]
@@ -381,7 +386,7 @@ fn is_published_leap_second(
     })
 }
 
-#[cfg_attr(any(), cowshed_api(scalar = "string"))]
+#[cfg_attr(any(), cowshed_api(accessor = "as-str", scalar = "string"))]
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct UtcTimestamp(String);
 
@@ -419,7 +424,7 @@ impl<'de> Deserialize<'de> for UtcTimestamp {
     }
 }
 
-#[cfg_attr(any(), cowshed_api(scalar = "string"))]
+#[cfg_attr(any(), cowshed_api(accessor = "as-str", scalar = "string"))]
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct WorkspacePath(PathBuf);
 
@@ -442,6 +447,14 @@ impl WorkspacePath {
         }
     }
 
+    /// The path's spelling as UTF-8 text, borrowed. `new` admits only paths whose bytes are valid
+    /// UTF-8, so this never fails, never allocates, and never replaces a byte lossily.
+    pub fn as_str(&self) -> &str {
+        self.0
+            .to_str()
+            .expect("WorkspacePath construction guarantees UTF-8")
+    }
+
     pub fn as_path(&self) -> &Path {
         &self.0
     }
@@ -456,11 +469,7 @@ impl Serialize for WorkspacePath {
     where
         S: Serializer,
     {
-        serializer.serialize_str(
-            self.0
-                .to_str()
-                .expect("WorkspacePath construction guarantees UTF-8"),
-        )
+        serializer.serialize_str(self.as_str())
     }
 }
 
@@ -1146,7 +1155,13 @@ impl<'de> Deserialize<'de> for BinaryData {
 }
 
 /// A fixed-width SHA-256 digest, serialized as 64 lowercase hexadecimal characters.
-#[cfg_attr(any(), cowshed_api(scalar = "string & tags.Pattern<'^[0-9a-f]{64}$'>"))]
+#[cfg_attr(
+    any(),
+    cowshed_api(
+        accessor = "display",
+        scalar = "string & tags.Pattern<'^[0-9a-f]{64}$'>"
+    )
+)]
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Sha256Digest([u8; 32]);
 
@@ -1397,7 +1412,10 @@ pub struct JobJournalCursor {
 /// How many bytes a tail returns per stream: at least one, at most 64 KiB.
 #[cfg_attr(
     any(),
-    cowshed_api(scalar = "number & tags.Type<'uint32'> & tags.Minimum<1> & tags.Maximum<65536>")
+    cowshed_api(
+        accessor = "get",
+        scalar = "number & tags.Type<'uint32'> & tags.Minimum<1> & tags.Maximum<65536>"
+    )
 )]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct JobTailBytes(u32);

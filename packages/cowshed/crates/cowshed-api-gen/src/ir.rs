@@ -110,10 +110,20 @@ pub struct Serde {
 pub struct Projection {
     pub wire: Option<String>,
     pub scalar: Option<String>,
+    /// The source-owned native scalar projection API, never guessed by a consumer.
+    pub accessor: Option<ScalarAccessor>,
     pub exclusive: Vec<String>,
     pub name: Option<String>,
     pub unit_value: Option<String>,
     pub output_only: bool,
+}
+
+#[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ScalarAccessor {
+    Get,
+    AsStr,
+    Display,
 }
 
 /// The source-owned normalized Rust type graph used by every declaration projection.

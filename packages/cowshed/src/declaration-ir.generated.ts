@@ -43,6 +43,10 @@ export type Fields =
 export type Projection = {
   readonly wire: string | null;
   readonly scalar: string | null;
+  /**
+   * The source-owned native scalar projection API, never guessed by a consumer.
+   */
+  readonly accessor: ScalarAccessor | null;
   readonly exclusive: ReadonlyArray<string>;
   readonly name: string | null;
   readonly unitValue: string | null;
@@ -90,6 +94,8 @@ export type RustType =
   | ({ readonly kind: 'slice' } & {
       readonly element: RustType;
     });
+
+export type ScalarAccessor = 'get' | 'as-str' | 'display';
 
 /**
  * Facts from serde attributes, without guessing whether a record is an input or an output.
