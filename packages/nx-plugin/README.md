@@ -900,6 +900,12 @@ The Nx patch repairs upstream Nx runtime behavior, separately from this plugin's
   directory): those are the bytes the watcher's rules came from. An event stops the daemon unless its file is one of
   those and still hashes the same; a file changed between the watcher's read and the context's, or one the context never
   held, stops it as before. Not yet proposed upstream.
+- **A failure before execution does not crash the run-information lifecycle.** A discrete worker can fail hashing before
+  `startTasks`, yet the orchestrator reports that failure through `endTasks` with an `endTime`. Stock
+  `StoreRunInformationLifeCycle` dereferenced the absent timing entry and threw a `TypeError` over the hash error. The
+  patch creates an entry only when absent, preserves the failed result and completion time, and leaves its start absent
+  unless a start notification or task timestamp supplied one. `nx-run-information.test.ts` guards this ordering and
+  normal execution/cache-hit timing. Not yet proposed upstream.
 
 Publishing or installing `@smoothbricks/nx-plugin` alone does **not** change a consumer's Nx. `smoo monorepo update`
 distributes the managed `patches/nx@23.2.1.patch` and maintains the root registry override `nx = "23.2.1"` plus its
@@ -910,10 +916,10 @@ resetting the database or disabling the daemon.
 The patch is keyed to `nx@23.2.1`; a different Nx version needs its own patch file. On an Nx upgrade, remove each hunk
 only when the installed upstream release contains that repair and the task-history namespace, cache-bound,
 resident-worker, store-resolution, task-graph, restore-time, racy-archive, skipped-task exit, daemon-claim,
-incomplete-run summary, foreign-environment and ignore-file regressions pass; preserve any repair not yet released. The
-restore-time regression fails without its hunk only on macOS, where the copy clones (on Linux `std::fs::copy` writes a
-fresh mtime), so run it on macOS before dropping the hunk. When every hunk is upstream, remove the `nx@23.2.1` and
-`@nx/js@23.2.1` entries from `patchedDependencies` and delete their patch files.
+incomplete-run summary, foreign-environment, ignore-file and run-information regressions pass; preserve any repair not
+yet released. The restore-time regression fails without its hunk only on macOS, where the copy clones (on Linux
+`std::fs::copy` writes a fresh mtime), so run it on macOS before dropping the hunk. When every hunk is upstream, remove
+the `nx@23.2.1` and `@nx/js@23.2.1` entries from `patchedDependencies` and delete their patch files.
 
 ## Bun Test Tracing Generator
 

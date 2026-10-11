@@ -2005,6 +2005,20 @@ index 4b3ae70c8af939f85e02dc5de8afefc62d6d20d4..88857f50b46fe34ad9e8330aa4e6f3ab
      endTasks(taskResults) {
          for (let t of taskResults) {
              this.allCompletedTasks.set(t.task.id, t.task);
+diff --git a/dist/src/tasks-runner/life-cycles/store-run-information-life-cycle.js b/dist/src/tasks-runner/life-cycles/store-run-information-life-cycle.js
+index 55e70337fe2026cc992620d12bfa37bc99e70cd6..201e796074e03df8625a05726116d9c725e7e127 100644
+--- a/dist/src/tasks-runner/life-cycles/store-run-information-life-cycle.js
++++ b/dist/src/tasks-runner/life-cycles/store-run-information-life-cycle.js
+@@ -22,6 +22,9 @@ class StoreRunInformationLifeCycle {
+     }
+     endTasks(taskResults) {
+         for (let tr of taskResults) {
++            // A worker may fail hashing before startTasks. Record its failure
++            // without inventing an execution start or masking the original error.
++            this.timings[tr.task.id] ??= { start: undefined, end: undefined };
+             if (tr.task.startTime) {
+                 this.timings[tr.task.id].start = new Date(tr.task.startTime).toISOString();
+             }
 diff --git a/dist/src/tasks-runner/run-command.js b/dist/src/tasks-runner/run-command.js
 index 4e64afa4fb985191ac8bc0e31a1e380bcecf9427..14723620cb7d8094bff0eb70214442dd39fe9131 100644
 --- a/dist/src/tasks-runner/run-command.js

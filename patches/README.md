@@ -19,14 +19,31 @@ number; its physical payload remains `BigInt64Array`, with the same i64 round-tr
 
 ## Activating a patch change
 
-Generate Nx changes with `bun patch nx@23.2.1` and `bun patch --commit nx@23.2.1`, against the pinned registry package.
-This records the exact hunk coordinates Bun applies; a diff that only works after Git relocates its context can corrupt
-the installed product. Keep the managed consumer copy identical, then run ordinary `bun install` and commit the patch
-with Bun's lock changes. Nx is never developer-linked and needs no release publication, generated tarball or
-package-activation target. Bun's isolated global store deliberately keeps patched entries project-local under
-`node_modules/.bun`; their installed patch marker and cached patch identity distinguish the patched bytes. Do not
-replace that package with a writable generated-product link or hand-edit its installed files. The installed-product
-regression runs `node --check` on every patched JavaScript file as well as checking the five-minute inactivity policy.
+Prepare Nx changes with `bun patch nx@23.2.1`, then use the registry-index regeneration flow:
+
+```sh
+bun patch nx@23.2.1
+python3 tooling/nx_patch.py --check
+# Edit the Bun-prepared node_modules/nx package only after the no-op check passes.
+python3 tooling/nx_patch.py
+bun install
+```
+
+The no-op check must reproduce the current patch byte-identically before editing. The script verifies the pristine
+registry archive against `bun.lock`, indexes that package in an isolated temporary Git root, and diffs the prepared
+package against that index. It preserves full deletion hunks and package-relative paths, excludes only Bun's install
+markers and dependency directory, and writes the root patch and its byte-identical managed consumer copy. Its temporary
+root is retired on success or failure. `tooling/test_nx_patch.py` guards deletions, additions, installer metadata and
+archive/package identity.
+
+Do not use `bun patch --commit` for this carried patch with Bun 1.4.2: it emits absolute registry-cache paths and
+discards the bodies of deleted-file hunks, and includes a `.bun-tag-*` installer marker. Nor hand-edit the generated
+patch. Ordinary `bun install` still owns activation and all lock changes; commit them with the patch. Nx is never
+developer-linked and needs no release publication, generated tarball or package-activation target. Bun's isolated global
+store deliberately keeps patched entries project-local under `node_modules/.bun`; their installed patch marker and
+cached identity distinguish the patched bytes. Do not replace that package with a writable generated-product link or
+edit an installed package without first preparing it. The installed-product regression runs `node --check` on every
+patched JavaScript file as well as checking the five-minute inactivity policy.
 
 The nx-plugin managed files distribute the same Nx patch to consumers. The root monorepo policy maintains
 `overrides.nx = "23.2.1"` and `patchedDependencies["nx@23.2.1"] = "patches/nx@23.2.1.patch"`. Run `smoo monorepo update`
@@ -161,6 +178,17 @@ Nx instead, whatever a client sends, so it starts no package manager and asks no
 `nx-use-local.test.ts` starts a fixture daemon from a library client without the variable and then runs the bare
 `node_modules/.bin/nx` entry against it, with every package manager on `PATH` replaced by one that records its run. The
 daemon must take the branch that pulled `nx@latest`, pull nothing, and start no package manager.
+
+## Run information after a pre-start failure
+
+Stock Nx's discrete worker reports a hash failure through `endTasks` even when `startTasks` never ran. Its
+`StoreRunInformationLifeCycle` dereferenced the absent timing entry and threw a `TypeError` over the original error. The
+run-information hunk creates that entry only when absent, retaining the failed result and its completion time. An
+execution start stays absent unless `startTasks` or the task's own `startTime` supplied one; no start is fabricated.
+
+`packages/nx-plugin/src/nx-run-information.test.ts` exercises the actual installed lifecycle with pre-start failures,
+absent timestamps, supplied task timestamps and normal started/cache-hit controls. Drop this hunk only when the
+installed upstream package handles the same ordering, retaining the regression.
 
 ## Requested task closure after dummy normalization
 
