@@ -2375,7 +2375,8 @@ async fn real_apfs_a_rebase_carries_mains_nx_entries_into_the_rebased_workspace_
 /// file on disk would be a key no run looks up, so the carry takes main's latest `a:test` entry by
 /// task instead, and `b`'s run of the landed check hits both tasks.
 #[tokio::test]
-async fn real_apfs_a_rebase_carries_a_task_that_hashes_its_dependencys_stale_outputs() {
+async fn real_apfs_a_rebase_carries_a_task_that_hashes_its_dependencys_stale_outputs_substrate_lifecycle()
+ {
     let (nx, node) = repository_nx();
     let mut fixture = Fixture::with(Project::Build {
         nx: Some((&nx, &node)),
