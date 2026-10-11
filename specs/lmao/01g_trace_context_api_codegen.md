@@ -200,18 +200,18 @@ class SpanLogger {
 The trace context assembles all entry type APIs for destructuring:
 
 ```typescript
-// Generated trace context (destructurable)
-// Extra is spread in for user-defined fields (e.g., env with CF Worker bindings)
-type SpanContext<Schema, Deps, FF, Extra = {}> = {
-  readonly tag: TagWriter<Schema>;
-  readonly log: SpanLogger<Schema>;
-  readonly scope: ScopeAPI<Schema>;
-  readonly span: SpanFn<SpanContext<Schema, Deps, FF, Extra>>;
-  readonly deps: Deps;
-  readonly ff: FeatureFlagEvaluator<FF>;
-  readonly ok: <V>(value: V) => FluentSuccessResult<V>;
-  readonly err: <E>(code: string, details?: E) => FluentErrorResult<E>;
-} & Extra;
+// Generated trace context (destructurable); full shape in 01c "SpanContext Interface"
+// Ctx['userCtx'] is spread in for user-defined fields (e.g., env with CF Worker bindings)
+type SpanContext<Ctx extends OpContext> = {
+  readonly tag: TagWriter<Ctx['logSchema']>;
+  readonly log: SpanLogger<Ctx['logSchema']>;
+  readonly scope: Readonly<Partial<InferSchema<Ctx['logSchema']>>>;
+  readonly span: SpanFn<Ctx>;
+  readonly deps: ResolvedDeps<Ctx['deps']>;
+  readonly ff: FeatureFlagEvaluator<Ctx> & InferFeatureFlagsWithContext<Ctx>;
+  readonly ok: <S>(value: S) => OkResult<S, Ctx['logSchema']>;
+  readonly err: <E>(error: E) => ErrResult<E, Ctx['logSchema']>;
+} & Ctx['userCtx'];
 
 // Usage in op signature - destructure what you need
 const processUser = defineOp('processUser', async ({ log, tag, scope, span, ok, err }, userData) => {

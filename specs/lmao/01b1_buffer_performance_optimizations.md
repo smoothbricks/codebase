@@ -1200,15 +1200,18 @@ const moduleCtx = new ModuleContext(
 );
 
 // At span creation (per-span, but span names are finite)
-// SpanName is passed to op via span(lineNumber, 'name', op, args)
-// lineNumber is written directly to lineNumber_values[0] inside _invoke()
-// spanName is interned for UTF-8 encoding
-const buffer = createSpanBuffer(
-  callsiteModule, // Caller's module for row 0 metadata
-  opModule, // Op's module for rows 1+ metadata
-  'processOrder' // intern(spanName) → UTF-8 bytes cached
+// span(lineNumber, 'name', op, ...args) runs SpanContext._spanPre(), which creates the child buffer,
+// writes row 0 with the span name, and writes lineNumber directly to row 0's line column
+const buffer = createChildSpanBuffer(
+  parentBuffer,
+  callsiteMetadata, // Caller's OpMetadata for row 0
+  opMetadata, // Op's OpMetadata for rows 1+
+  capacityTier,
+  schema,
+  SpanBufferClass
 );
-buffer.lineNumber_values[0] = lineNumber; // Direct TypedArray write, NOT stored as property
+buffer._appenders.writeSpanStart(buffer, 'processOrder'); // intern(spanName) → UTF-8 bytes cached
+buffer.line(0, lineNumber); // Direct TypedArray write, NOT stored as property
 ```
 
 ### Utf8Cache (lmao owns) <a id="smoo/lmao!n/buffer-perf-utf8-cache"></a>
