@@ -2421,7 +2421,7 @@ async fn real_apfs_a_rebase_carries_a_task_that_hashes_its_dependencys_stale_out
     );
     let nx_reads = nx_read_paths(&fixture_nx(&fixture.checkout));
     let mut service = serve_project(&mut fixture, &nx_reads).await;
-    let nx_check = nx_run_many(&node);
+    let nx_check = nx_run_many(&node, "build test");
 
     let b = new_workspace(&mut service, "b").await;
     fs::write(b.join("unrelated.txt"), b"nothing a hashes\n").unwrap();
