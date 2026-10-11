@@ -113,18 +113,19 @@ describe('nextest-code-bound wrapper', () => {
     }
   };
 
+  // Real processes and real time, so the cases sleep as little as proves each verdict: 0.75s in all.
   it('passes a test whose wall time is over the bound only by its lease waits', () => {
-    const run = runWrapped('1', 1.5, 0.2, 0);
+    const run = runWrapped('0.3', 0.4, 0, 0);
     expect(run.stdout).toContain('argument --exact');
     expect(run.stderr).toMatch(
-      /nextest-code-bound: code 0\.\d+s of 1\.0s, within its bound \(wall [12]\.\d+s less 1\.\ds waiting/,
+      /nextest-code-bound: code 0\.\d+s of 0\.3s, within its bound \(wall \d+\.\d+s less \d+\.\ds waiting/,
     );
     expect(run.status).toBe(0);
     expect(run.recordsLeft).toBe(0);
   });
 
   it('fails a passing test whose code time is over the bound', () => {
-    const run = runWrapped('1', 0, 1.5, 0);
+    const run = runWrapped('0.3', 0, 0.35, 0);
     expect(run.stderr).toContain('OVER its bound');
     expect(run.status).toBe(1);
   });
