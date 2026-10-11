@@ -900,12 +900,14 @@ The Nx patch repairs upstream Nx runtime behavior, separately from this plugin's
   directory): those are the bytes the watcher's rules came from. An event stops the daemon unless its file is one of
   those and still hashes the same; a file changed between the watcher's read and the context's, or one the context never
   held, stops it as before. Not yet proposed upstream.
-- **A failure before execution does not crash the run-information lifecycle.** A discrete worker can fail hashing before
+- **A failure before execution does not crash a completion lifecycle.** A discrete worker can fail hashing before
   `startTasks`, yet the orchestrator reports that failure through `endTasks` with an `endTime`. Stock
   `StoreRunInformationLifeCycle` dereferenced the absent timing entry and threw a `TypeError` over the hash error. The
-  patch creates an entry only when absent, preserves the failed result and completion time, and leaves its start absent
-  unless a start notification or task timestamp supplied one. `nx-run-information.test.ts` guards this ordering and
-  normal execution/cache-hit timing. Not yet proposed upstream.
+  patch retains the failed result and completion time without inventing a start. Native and legacy task history omit
+  results lacking a hash or real execution start; valid-row database failures still propagate. Optional timing reports
+  show an unstarted task's duration as `null`, and profiling emits no executed interval without a start. Supplied
+  timestamps (including zero) and normal started/cache-hit timing remain intact. `nx-run-information.test.ts` and
+  `nx-failure-life-cycles.test.ts` guard the individual and composed installed lifecycles. Not yet proposed upstream.
 
 Publishing or installing `@smoothbricks/nx-plugin` alone does **not** change a consumer's Nx. `smoo monorepo update`
 distributes the managed `patches/nx@23.2.1.patch` and maintains the root registry override `nx = "23.2.1"` plus its
