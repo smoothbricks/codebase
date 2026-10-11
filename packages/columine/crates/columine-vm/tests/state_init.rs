@@ -15,7 +15,10 @@ use columine_vm::state_init::{
     EVICTED_BUFFER_CAP, EVICTION_ENTRY_SIZE, ProgramInvalidCause, SizingRefusal,
     arena_initial_capacity_64, calculate_grown_state_size, calculate_state_size,
     compute_struct_row_layout_padded, grow_state, init_state, reset_state,
-    struct_map_slot_data_size, ttl_side_buffer_size,
+    struct_map_slot_data_size, ttl_side_buffer_size, validate_state,
+};
+use columine_vm::vm::{
+    get_derived_facts_capacity, get_derived_facts_occupied_at, get_derived_facts_slot,
 };
 use columine_vm::{aggregates, bytes};
 use proptest::prelude::*;
@@ -355,13 +358,10 @@ fn condition_tree_derived_facts_use_sixteen_bytes_per_cell() {
 
     let derived_offset = bytes::read_u32(&state, StateHeaderOffset::DERIVED_FACTS_OFFSET);
     assert_eq!(derived_offset % 8, 0);
-    assert_eq!(
-        u32::from(bytes::read_u16(
-            &state,
-            StateHeaderOffset::DERIVED_FACTS_CAPACITY,
-        )),
-        capacity,
-    );
+    assert_eq!(get_derived_facts_slot(&state), Some(0));
+    assert_eq!(get_derived_facts_capacity(&state), capacity);
+    let occupied_at = get_derived_facts_occupied_at(&state).expect("the table names its slot");
+    assert_eq!(bytes::read_u32(&state, occupied_at), 0);
     for pos in 0..capacity {
         assert_eq!(
             bytes::read_u64(&state, derived_offset + pos * 8),
@@ -377,6 +377,31 @@ fn condition_tree_derived_facts_use_sixteen_bytes_per_cell() {
         );
     }
     assert_ne!(DERIVED_FACT_EMPTY_IDENTITY, DERIVED_FACT_TOMBSTONE_IDENTITY,);
+}
+
+/// A CONDITION_TREE's SIZE counts the fact table's occupied cells, so an image
+/// claiming more occupied cells than the table has is no valid geometry.
+#[test]
+fn condition_tree_occupancy_past_its_capacity_is_invalid_state() {
+    let capacity = 16u32;
+    let prog = build_single_slot_program(0x04, capacity as u8, 0);
+    let size = calculate_state_size(
+        &prog,
+        columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
+    )
+    .expect("valid program admission");
+    let mut state = vec![0u8; size as usize];
+    init_state(
+        &mut state,
+        &prog,
+        columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
+    )
+    .expect("init must succeed");
+    let occupied_at = get_derived_facts_occupied_at(&state).expect("the table names its slot");
+    bytes::write_u32(&mut state, occupied_at, capacity);
+    assert_eq!(validate_state(&state), Ok(()), "a full count is a geometry");
+    bytes::write_u32(&mut state, occupied_at, capacity + 1);
+    assert_eq!(validate_state(&state), Err(ErrorCode::InvalidState));
 }
 
 // ---------------------------------------------------------------------------

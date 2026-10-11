@@ -19,8 +19,11 @@ pub const RETE_HEADER_SIZE: u32 = 16;
 ///
 /// Version 2 counts slots in a `u32` and keeps a TTL slot's timestamp column
 /// as a `u32` (see [`StateHeaderOffset::NUM_SLOTS`] and
-/// [`SlotMetaOffset::TIMESTAMP_COL`]).
-pub const STATE_FORMAT_VERSION: u8 = 2;
+/// [`SlotMetaOffset::TIMESTAMP_COL`]). Version 3 names the derived-facts
+/// table's CONDITION_TREE slot ([`StateHeaderOffset::DERIVED_FACTS_SLOT`])
+/// instead of copying its capacity into a `u16`: the slot's metadata holds
+/// the table's `u32` capacity and its occupied-cell count.
+pub const STATE_FORMAT_VERSION: u8 = 3;
 /// Program-format magic in little-endian wire order: ASCII bytes `C L M 1`.
 pub const PROGRAM_MAGIC: u32 = 0x314D_4C43;
 /// The default program-magic acceptance set for public embedders.
@@ -181,11 +184,15 @@ impl StateHeaderOffset {
     pub const NUM_BITVECS: u32 = 11;
     pub const FLAGS: u32 = 12;
     pub const DERIVED_FACTS_OFFSET: u32 = 13;
-    pub const DERIVED_FACTS_CAPACITY: u32 = 17;
     pub const NUM_DERIVED_FACT_SCHEMAS: u32 = 19;
     pub const DERIVED_FACTS_CHANGE_FLAG: u32 = 20;
     /// Slot count, `u32` little-endian: the program header's `num_slots`.
     pub const NUM_SLOTS: u32 = 24;
+    /// The CONDITION_TREE slot owning the derived-facts table, `u32`, meaningful
+    /// when [`StateFlags::HAS_RETE`] is set. Its metadata's `CAPACITY` is the
+    /// table's cell count and its `SIZE` the occupied cells (live facts plus
+    /// tombstones).
+    pub const DERIVED_FACTS_SLOT: u32 = 28;
 }
 
 /// Slot count of an initialised state ([`StateHeaderOffset::NUM_SLOTS`]).

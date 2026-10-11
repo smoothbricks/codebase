@@ -14,10 +14,7 @@ use columine_vm::hashset_ops::bind_slot_set;
 use columine_vm::meta::SlotMetaView;
 use columine_vm::state_init::{DEFAULT_ACCEPTED_PROGRAM_MAGICS, calculate_state_size, init_state};
 use columine_vm::undo_log::{FLAT_UNDO_ENTRY_SIZE, FlatUndoEntry, FlatUndoOp};
-use columine_vm::vm::{
-    UNDO_CAPACITY, UNDO_POSITION_OVERFLOWED, Vm, f64s_as_bytes, u32s_as_bytes,
-    write_derived_facts_header,
-};
+use columine_vm::vm::{UNDO_CAPACITY, UNDO_POSITION_OVERFLOWED, Vm, f64s_as_bytes, u32s_as_bytes};
 use proptest::prelude::*;
 use proptest::strategy::Strategy as PropStrategy;
 use std::collections::{BTreeMap, BTreeSet};
@@ -519,8 +516,6 @@ fn mk_derived_state(capacity: u32) -> Vec<u8> {
     state[..STATE_HEADER_SIZE as usize].fill(0);
     bytes::write_u32(&mut state, StateHeaderOffset::MAGIC, STATE_MAGIC);
     state[StateHeaderOffset::FORMAT_VERSION as usize] = STATE_FORMAT_VERSION;
-    let header_capacity = u16::try_from(capacity).expect("derived capacity fits its u16 header");
-    write_derived_facts_header(&mut state, STATE_HEADER_SIZE, header_capacity, 1);
     for pos in 0..capacity {
         bytes::write_u64(
             &mut state,
@@ -586,8 +581,8 @@ fn derived_fact_insert_update_and_retract_restore_full_identity_and_dead_values(
 /// runs, the closure writes both flags unrecorded, and the window reports the
 /// overflow at the sentinel checkpoint. Rollback restores every flag and byte
 /// exactly, to the midpoint savepoint taken before the capture and then to the
-/// pre-fill savepoint. The prefix still exports as a paired segment, marked
-/// overflowed, and its redo lane replays.
+/// pre-fill savepoint. The prefix still exports as a paired segment, and its
+/// redo lane replays.
 #[test]
 fn capture_past_the_record_budget_overflows_to_a_shadow_and_rolls_back_exactly() {
     for delta in [false, true] {

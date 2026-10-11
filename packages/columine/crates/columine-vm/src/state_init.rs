@@ -860,7 +860,9 @@ fn init_state_from_view(
 
     // State header: magic(4) + format_version(1) + program_version(2)
     // + ruleset_version(2) + reserved(1) + num_vars(1) + num_bitvecs(1)
-    // + flags(1) + derived facts(8) + reserved(3) + num_slots(4) + reserved(4).
+    // + flags(1) + derived facts offset(4) + reserved(2) + derived fact
+    // schemas(1) + derived facts change flag(1) + reserved(3) + num_slots(4)
+    // + derived facts slot(4).
     state[..STATE_HEADER_SIZE as usize].fill(0);
     bytes::write_u32(state, 0, STATE_MAGIC);
     state[StateHeaderOffset::FORMAT_VERSION as usize] = STATE_FORMAT_VERSION;
@@ -943,13 +945,9 @@ fn init_state_from_view(
                             StateHeaderOffset::DERIVED_FACTS_OFFSET,
                             derived_facts_offset,
                         );
-                        bytes::write_u16(
-                            state,
-                            StateHeaderOffset::DERIVED_FACTS_CAPACITY,
-                            u16::try_from(capacity).unwrap_or_else(|_| {
-                                columine_types::die!("derived facts capacity fits u16")
-                            }),
-                        );
+                        // The slot's metadata, written below, holds the table's
+                        // u32 capacity and its occupied-cell count (SIZE, 0).
+                        bytes::write_u32(state, StateHeaderOffset::DERIVED_FACTS_SLOT, slot);
                         state[StateHeaderOffset::FLAGS as usize] |= StateFlags::HAS_RETE;
                     }
                 }
@@ -1563,12 +1561,13 @@ fn validate_slot_geometry(
     let flags = SlotTypeFlags::from_byte(state[(meta + SlotMetaOffset::TYPE_FLAGS) as usize]);
     let kind = flags.slot_type().ok_or(ErrorCode::InvalidState)?;
     let m = read_old_slot_meta(state, slot);
-    if !matches!(
-        kind,
-        SlotType::Aggregate | SlotType::Scalar | SlotType::ConditionTree
-    ) && ((m.capacity == 0 && kind != SlotType::Bitmap)
-        || (m.capacity != 0 && !m.capacity.is_power_of_two())
-        || bytes::read_u32(state, meta + SlotMetaOffset::SIZE) > m.capacity)
+    // A CONDITION_TREE's capacity is its derived-facts cell count (0 for no
+    // table) and its SIZE counts the occupied cells, so it is checked as a
+    // table; only the fixed-size AGGREGATE and SCALAR slots are exempt.
+    if !matches!(kind, SlotType::Aggregate | SlotType::Scalar)
+        && ((m.capacity == 0 && !matches!(kind, SlotType::Bitmap | SlotType::ConditionTree))
+            || (m.capacity != 0 && !m.capacity.is_power_of_two())
+            || bytes::read_u32(state, meta + SlotMetaOffset::SIZE) > m.capacity)
     {
         return Err(ErrorCode::InvalidState);
     }
@@ -2135,15 +2134,12 @@ pub fn grow_state(
                     );
                 }
                 _ => {
-                    // Non-hash slot: copy data. The "aggregates/condition
-                    // trees are never the grown slot" assumption is VERIFIED
-                    // against the dispatch loop: no vm.rs arm ever signals
-                    // CAPACITY_EXCEEDED/NEEDS_GROWTH for AGGREGATE, SCALAR,
-                    // or CONDITION_TREE slots (fixed-size data; only hash
-                    // containers, struct maps, ordered lists, nested slots,
-                    // arenas, and TTL eviction indexes overflow). RETE
-                    // (stage 3) owns condition-tree writes and must keep it
-                    // that way or teach this arm to grow them.
+                    // Non-hash slot: copy data. No vm.rs arm signals
+                    // CAPACITY_EXCEEDED/NEEDS_GROWTH for AGGREGATE or SCALAR
+                    // slots. A CONDITION_TREE grows only through the RETE
+                    // layer that owns its derived-facts table: this copy
+                    // carries its condition state, and RETE rehashes the
+                    // table's lanes and recounts its SIZE afterwards.
                     let old_data_size = slot_growth::slot_data_size(
                         m.slot_type,
                         old_cap,

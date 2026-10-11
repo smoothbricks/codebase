@@ -46,7 +46,7 @@ use crate::element_body::{
 use columine_types::types::{
     AggType, ChangeFlag, EMPTY_KEY, ErrorCode, MAX_GUARD_COMPONENTS, MAX_SCATTER_ROUTES,
     NO_PARENT_TS_COL, Opcode, ProgramHeader, SLOT_META_SIZE, STATE_FORMAT_VERSION, STATE_MAGIC,
-    SlotMetaOffset, SlotType, StateHeaderOffset, StructFieldType, TOMBSTONE, align8,
+    SlotMetaOffset, SlotType, StateFlags, StateHeaderOffset, StructFieldType, TOMBSTONE, align8,
     arena_elem_size, is_arena_field_type, state_num_slots, struct_field_size,
 };
 use core::sync::atomic::Ordering;
@@ -504,8 +504,29 @@ pub fn get_derived_facts_offset(state: &[u8]) -> u32 {
     bytes::read_u32(state, StateHeaderOffset::DERIVED_FACTS_OFFSET)
 }
 
-pub fn get_derived_facts_capacity(state: &[u8]) -> u16 {
-    bytes::read_u16(state, StateHeaderOffset::DERIVED_FACTS_CAPACITY)
+/// The CONDITION_TREE slot that owns the derived-facts table, or `None` when
+/// the state has no table or names a slot its metadata table does not hold.
+pub fn get_derived_facts_slot(state: &[u8]) -> Option<u32> {
+    if state[StateHeaderOffset::FLAGS as usize] & StateFlags::HAS_RETE == 0 {
+        return None;
+    }
+    let slot = bytes::read_u32(state, StateHeaderOffset::DERIVED_FACTS_SLOT);
+    let meta_end = u64::from(slot_meta_base(slot)) + u64::from(SLOT_META_SIZE);
+    (slot < state_num_slots(state) && meta_end <= state.len() as u64).then_some(slot)
+}
+
+/// The derived-facts table's cell count: its slot's `u32` capacity, 0 when
+/// the state has no table.
+pub fn get_derived_facts_capacity(state: &[u8]) -> u32 {
+    get_derived_facts_slot(state).map_or(0, |slot| {
+        bytes::read_u32(state, slot_meta_base(slot) + SlotMetaOffset::CAPACITY)
+    })
+}
+
+/// Where the table's occupied-cell count (live facts plus tombstones) lives:
+/// its slot's `SIZE` field, or `None` when the state has no table.
+pub fn get_derived_facts_occupied_at(state: &[u8]) -> Option<u32> {
+    get_derived_facts_slot(state).map(|slot| slot_meta_base(slot) + SlotMetaOffset::SIZE)
 }
 
 pub fn get_num_derived_fact_schemas(state: &[u8]) -> u8 {
@@ -521,23 +542,6 @@ pub fn set_derived_facts_change_flag(state: &mut [u8], flag: u8) {
 }
 
 pub fn clear_derived_facts_change_flag(state: &mut [u8]) {
-    state[StateHeaderOffset::DERIVED_FACTS_CHANGE_FLAG as usize] = 0;
-}
-
-/// Write the derived-facts header used when loading a RETE program.
-pub fn write_derived_facts_header(
-    state: &mut [u8],
-    derived_offset: u32,
-    capacity: u16,
-    num_schemas: u8,
-) {
-    bytes::write_u32(
-        state,
-        StateHeaderOffset::DERIVED_FACTS_OFFSET,
-        derived_offset,
-    );
-    bytes::write_u16(state, StateHeaderOffset::DERIVED_FACTS_CAPACITY, capacity);
-    state[StateHeaderOffset::NUM_DERIVED_FACT_SCHEMAS as usize] = num_schemas;
     state[StateHeaderOffset::DERIVED_FACTS_CHANGE_FLAG as usize] = 0;
 }
 
