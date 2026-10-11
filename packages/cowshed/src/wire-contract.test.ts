@@ -4,7 +4,7 @@
 import { describe, expect, it } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import typia from 'typia';
 import type { JobKillArguments } from './native.generated.js';
@@ -296,11 +296,22 @@ const assertGeneratedModule = typia.createAssert<{
   readonly parseWorkspaceInfo: (json: string) => unknown;
 }>();
 
+const project = fileURLToPath(new URL('..', import.meta.url));
+
+/**
+ * Where a generation run makes its throwaway project: the package's `.cache/`, never `src/`.
+ * `cowshed:lint` runs beside `wire-test`, and a Biome pass that met the compact
+ * `tsconfig.test.json` the generation test writes failed the gate. `.cache/` is gitignored, so
+ * Biome (`vcs.useIgnoreFile`) and Nx's file index never list what is in it. It stays inside the
+ * package because the compiler preload finds Typia's transform through the nearest `package.json`
+ * and resolves `typia` through the nearest `node_modules`.
+ */
+const scratchPrefix = join(project, '.cache', 'api-generation-');
+
 describe('canonical DTO generation', () => {
   it('a declared field changes the generated type and the executed validator', async () => {
     const sourceDirectory = dirname(fileURLToPath(import.meta.url));
-    const project = fileURLToPath(new URL('..', import.meta.url));
-    const scratch = mkdtempSync(join(sourceDirectory, '.api-generation-'));
+    const scratch = mkdtempSync(scratchPrefix);
     try {
       const core = join(scratch, 'crates/cowshed-core/src');
       const gateway = join(scratch, 'crates/cowshed-gateway-types/src');
@@ -356,6 +367,25 @@ describe('canonical DTO generation', () => {
       expect(changedValidators.assertWorkspaceInfo(withField)).toEqual(withField);
       expect(changedValidators.parseWorkspaceInfo(JSON.stringify(withField))).toEqual(withField);
       expect(() => validators.assertWorkspaceInfo(withField)).toThrow();
+    } finally {
+      rmSync(scratch, { recursive: true });
+    }
+  });
+
+  it('keeps its scratch project out of the Biome pass that lints this package', () => {
+    const scratch = mkdtempSync(scratchPrefix);
+    try {
+      // The file that failed the gate: compact JSON, which Biome's formatter rejects wherever it can see it.
+      writeFileSync(join(scratch, 'tsconfig.test.json'), JSON.stringify({ include: ['./*.ts'] }));
+      const lint = spawnSync('biome', ['check', '--files-ignore-unknown=true', '.'], {
+        cwd: project,
+        encoding: 'utf8',
+      });
+      expect(lint.error).toBeUndefined();
+      const report = `${lint.stdout}${lint.stderr}`;
+      // The pass ran to the end and never named the scratch, so it did not read it.
+      expect(report).toContain('Checked ');
+      expect(report).not.toContain(basename(scratch));
     } finally {
       rmSync(scratch, { recursive: true });
     }
