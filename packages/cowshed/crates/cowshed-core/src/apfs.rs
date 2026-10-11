@@ -939,9 +939,9 @@ pub struct AttachedImage {
     image: PathBuf,
     whole_device: String,
     volume_device: String,
-    /// An attachment verified but not yet mounted holds its raw IOMedia open. The kernel
-    /// refuses even forced ejects until mount finishes; no second process can reuse diskN
-    /// between the two backend method calls. Existing mounted attachments have no pin.
+    /// An attachment verified or recovered for mounting holds its raw IOMedia open. The
+    /// kernel refuses even forced ejects until mount finishes or the handle is dropped;
+    /// an observation-only recovered attachment has no pin.
     pin: std::sync::Mutex<Option<Fenced<File>>>,
 }
 
@@ -2215,6 +2215,23 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
                 )))
             }
         }
+    }
+
+    /// Resolve a mount's existing attachment under its image lease and hand the raw pin to
+    /// mount. A reseed may have replaced the device while the lease was being awaited.
+    pub(crate) fn existing_attachment_for_mount(
+        &self,
+        image: &Path,
+    ) -> Result<Option<AttachedImage>, ApfsError> {
+        let _lease = self.image_lease(image)?;
+        let Some(mut attachment) = self.existing_attachment(image)? else {
+            return Ok(None);
+        };
+        *attachment
+            .pin
+            .get_mut()
+            .expect("attachment pin mutex poisoned") = self.pin_attached_volume(&attachment)?;
+        Ok(Some(attachment))
     }
 
     pub(crate) fn recovered_image_attachment(
@@ -7261,6 +7278,146 @@ mod tests {
 
         renamed.expect("rename");
         assert_eq!(held, Some(true), "the rename ran without its device pin");
+    }
+
+    /// A target reseed finishes while mount waits for its image lease. The old device then
+    /// disappears; a descriptor-backed pin excludes the next reseed until mount consumes it.
+    struct ReseedBeforeMount {
+        pins: PinWitness,
+        reseeded: std::cell::Cell<bool>,
+    }
+
+    impl ReseedBeforeMount {
+        fn new() -> Self {
+            Self {
+                pins: PinWitness::new(RecordingRunner::with_outputs([ok([])])),
+                reseeded: std::cell::Cell::new(false),
+            }
+        }
+
+        fn reseed(&self) -> io::Result<()> {
+            if self.pins.newest.borrow().is_some() && self.pins.newest_pin_held() {
+                return Err(io::Error::from(io::ErrorKind::ResourceBusy));
+            }
+            self.reseeded.set(true);
+            Ok(())
+        }
+    }
+
+    impl CommandRunner for ReseedBeforeMount {
+        fn run(&self, request: &CommandRequest) -> Result<CommandOutput, CommandRunError> {
+            assert_eq!(request.program, Path::new(MOUNT_APFS));
+            assert!(request.args.iter().any(|arg| arg == "/dev/disk25s1"));
+            assert!(
+                self.pins.newest_pin_held(),
+                "mount must keep the recovered pin"
+            );
+            self.pins.run(request)
+        }
+
+        fn image_lease(&self, identity: &Path) -> io::Result<Option<Fenced<File>>> {
+            if !self.reseeded.get() {
+                self.reseed()?;
+            }
+            self.pins.image_lease(identity)
+        }
+
+        fn pin_raw_device(&self, device: &Path) -> io::Result<Option<Fenced<File>>> {
+            let current = if self.reseeded.get() {
+                "/dev/rdisk25s1"
+            } else {
+                "/dev/rdisk15s1"
+            };
+            if device != Path::new(current) {
+                return Err(io::Error::from(io::ErrorKind::NotFound));
+            }
+            self.pins.pin_raw_device(device)
+        }
+
+        fn attached_disk_images(&self) -> io::Result<Vec<AttachedDiskImage>> {
+            let media = if self.reseeded.get() {
+                [
+                    ("/dev/disk24", ""),
+                    ("/dev/disk25", APFS_CONTAINER_CONTENT),
+                    ("/dev/disk25s1", APFS_VOLUME_CONTENT),
+                ]
+            } else {
+                [
+                    ("/dev/disk14", ""),
+                    ("/dev/disk15", APFS_CONTAINER_CONTENT),
+                    ("/dev/disk15s1", APFS_VOLUME_CONTENT),
+                ]
+            };
+            Ok(vec![AttachedDiskImage::file(
+                "/tmp/cowshed-target.dmg",
+                None,
+                media,
+            )])
+        }
+
+        fn grow_image(&self, image: &Path, _: ImageCapacity) -> io::Result<()> {
+            panic!("mount grew {}", image.display());
+        }
+    }
+
+    #[test]
+    fn recovered_mount_survives_a_reseed_before_its_image_lease() {
+        let backend = MacOsApfsBackend::new(ReseedBeforeMount::new());
+        let mount = temp_path("recovered-mount-reseed", "mount");
+        let attachment = backend
+            .existing_attachment_for_mount(Path::new("/tmp/cowshed-target.dmg"))
+            .expect("recover the target")
+            .expect("the target is attached");
+        assert_eq!(attachment.volume_device(), "/dev/disk25s1");
+        assert_eq!(
+            backend.runner().reseed().unwrap_err().kind(),
+            io::ErrorKind::ResourceBusy,
+            "the recovered pin must exclude a reseed before mount"
+        );
+        let mounted = backend.mount(&attachment, &mount, MountAccess::ReadOnly, false);
+        assert!(
+            !backend.runner().pins.newest_pin_held(),
+            "mount must release the recovered pin"
+        );
+        drop(attachment);
+        if mount.exists() {
+            fs::remove_dir(&mount).expect("remove mountpoint");
+        }
+        fs::remove_dir_all(&backend.runner().pins.pins).expect("remove pins");
+        mounted.expect("a reseed must not leave mount pinning the departed device");
+    }
+
+    #[test]
+    fn recovered_mount_pin_is_released_when_the_handle_is_dropped() {
+        let backend = MacOsApfsBackend::new(PinWitness::new(RecordingRunner::with_outputs([
+            Reply::Inventory(Ok(vec![live_capture()])),
+            Reply::Inventory(Ok(vec![live_capture()])),
+        ])));
+        let attachment = backend
+            .existing_attachment_for_mount(Path::new("/tmp/cowshed-target.dmg"))
+            .unwrap()
+            .unwrap();
+        assert!(backend.runner().newest_pin_held());
+        drop(attachment);
+        assert!(!backend.runner().newest_pin_held());
+        assert!(backend.runner().recorded.requests().is_empty());
+        fs::remove_dir_all(&backend.runner().pins).unwrap();
+    }
+
+    #[test]
+    fn recovered_mount_conflicting_identity_drops_the_pin_without_mounting() {
+        let backend = MacOsApfsBackend::new(PinWitness::new(RecordingRunner::with_outputs([
+            Reply::Inventory(Ok(vec![live_capture()])),
+            no_images(),
+        ])));
+        let result = backend.existing_attachment_for_mount(Path::new("/tmp/cowshed-target.dmg"));
+        assert!(matches!(
+            result,
+            Err(ApfsError::InvalidAttachmentInventory(_))
+        ));
+        assert!(!backend.runner().newest_pin_held());
+        assert!(backend.runner().recorded.requests().is_empty());
+        fs::remove_dir_all(&backend.runner().pins).unwrap();
     }
 
     #[test]

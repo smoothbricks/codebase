@@ -412,7 +412,9 @@ user's disk tools or a manual eject during the two mutations that cannot run raw
 `hdiutil detach`, because a read-only raw pin makes both fail with EBUSY. Before `fsck_apfs` or `mount_apfs`, cowshed
 opens the reported raw volume read-only, then verifies that the attachment inventory maps **both** its whole container
 and its volume to the exact image. A verified attachment owns that raw descriptor across the `attach_verified` → `mount`
-method boundary. It is released after `mount_apfs` finishes, before intentional detach, or before the exclusive
+method boundary. A mount lookup of an existing attachment likewise takes the image lease before reading inventory and
+returns a handle owning its raw pin through the kernel mount-table read and mount decision. It is released when an
+already-mounted handle is dropped, after `mount_apfs` finishes, before intentional detach, or before the exclusive
 `diskutil apfs resizeContainer` writer, which cannot run with a raw descriptor open. Independent device ejects during
 container resize after pin release are not covered. While held, the descriptor prevents even external
 `diskutil eject force` or `hdiutil detach -force` from releasing the image and recycling its device name. If the image

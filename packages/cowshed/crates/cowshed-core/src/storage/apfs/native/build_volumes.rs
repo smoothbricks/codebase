@@ -277,7 +277,7 @@ where
         let image = layout.image(id);
         let mount = layout.mount(id);
         self.verify_controller_path(&image)?;
-        let attachment = match self.backend.existing_attachment(&image)? {
+        let attachment = match self.backend.existing_attachment_for_mount(&image)? {
             Some(attachment) => attachment,
             None => self.backend.attach_verified(&image)?,
         };

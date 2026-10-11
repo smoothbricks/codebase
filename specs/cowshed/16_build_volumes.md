@@ -420,6 +420,14 @@ same for main and for an integration workspace; "the target" is whichever one it
       source restoration, publish the target's new seed and delete its previous seed. What the target runs afterwards on
       the adopted volume reaches the seed by a reseed (Targets and seeds).
 
+   Resolving either build volume for mounting takes its per-image lease **before** reading the attachment inventory. A
+   recovered attachment owns a raw IOMedia pin across the subsequent kernel mount-table read and mount, just as a
+   freshly verified attachment does (01_storage.md, "Mounts"). A concurrent fork's reseed may finish while that lease is
+   awaited: the lookup then resolves its restored device, not the earlier device name. Once pinned, a reseed cannot
+   detach that attachment before the mount decision completes. Reading the attachment before awaiting the lease once
+   left a land's `close-target` pin opening a device a concurrent `cowshed new` had already detached, after Git delivery
+   but before the build-link swap. No retry or wider target-lock interval substitutes for this identity handoff.
+
    The land holds the target's image lock from 5.6 until 6.4 has renamed the target's link and a kept workspace has its
    fresh clone of the new seed. Every fork of the target holds the same lock from before it reads the target's seed and
    link until it links its own (Fork steps 1 to 3), and so does every reseed, so neither reads a seed or a volume the
