@@ -2006,19 +2006,143 @@ index 4b3ae70c8af939f85e02dc5de8afefc62d6d20d4..88857f50b46fe34ad9e8330aa4e6f3ab
          for (let t of taskResults) {
              this.allCompletedTasks.set(t.task.id, t.task);
 diff --git a/dist/src/tasks-runner/life-cycles/store-run-information-life-cycle.js b/dist/src/tasks-runner/life-cycles/store-run-information-life-cycle.js
-index 55e70337fe2026cc992620d12bfa37bc99e70cd6..201e796074e03df8625a05726116d9c725e7e127 100644
+index 55e70337fe2026cc992620d12bfa37bc99e70cd6..21b08d74572c79e0101df75f9f13a2e4712b85cd 100644
 --- a/dist/src/tasks-runner/life-cycles/store-run-information-life-cycle.js
 +++ b/dist/src/tasks-runner/life-cycles/store-run-information-life-cycle.js
-@@ -22,6 +22,9 @@ class StoreRunInformationLifeCycle {
+@@ -22,10 +22,13 @@ class StoreRunInformationLifeCycle {
      }
      endTasks(taskResults) {
          for (let tr of taskResults) {
+-            if (tr.task.startTime) {
 +            // A worker may fail hashing before startTasks. Record its failure
 +            // without inventing an execution start or masking the original error.
 +            this.timings[tr.task.id] ??= { start: undefined, end: undefined };
-             if (tr.task.startTime) {
++            if (tr.task.startTime !== undefined) {
                  this.timings[tr.task.id].start = new Date(tr.task.startTime).toISOString();
              }
+-            if (tr.task.endTime) {
++            if (tr.task.endTime !== undefined) {
+                 this.timings[tr.task.id].end = new Date(tr.task.endTime).toISOString();
+             }
+             else {
+diff --git a/dist/src/tasks-runner/life-cycles/task-history-life-cycle-old.js b/dist/src/tasks-runner/life-cycles/task-history-life-cycle-old.js
+index 18411f17b945ced007a0605a2b371239c205fc43..a1dfabc9a90042140de26c4b8d717a4a179a809e 100644
+--- a/dist/src/tasks-runner/life-cycles/task-history-life-cycle-old.js
++++ b/dist/src/tasks-runner/life-cycles/task-history-life-cycle-old.js
+@@ -23,10 +23,16 @@ class LegacyTaskHistoryLifeCycle {
+         }
+     }
+     async endCommand() {
+-        // Build TaskRun objects now — task.hash is guaranteed to be set by this point
++        // History contains hashed execution intervals, not pre-start failures.
++        // Those failures remain in run information without a fabricated hash/start.
+         const taskRuns = [];
+         const cacheableHashes = new Set();
+         for (const taskResult of this.pendingResults) {
++            const start = taskResult.task.startTime ?? this.startTimings[taskResult.task.id];
++            delete this.startTimings[taskResult.task.id];
++            if (taskResult.task.hash === undefined || start === undefined) {
++                continue;
++            }
+             if (taskResult.task.cache === true) {
+                 cacheableHashes.add(taskResult.task.hash);
+             }
+@@ -37,7 +43,7 @@ class LegacyTaskHistoryLifeCycle {
+                 hash: taskResult.task.hash,
+                 code: taskResult.code.toString(),
+                 status: taskResult.status,
+-                start: (taskResult.task.startTime ?? this.startTimings[taskResult.task.id]).toString(),
++                start: start.toString(),
+                 end: (taskResult.task.endTime ?? new Date().getTime()).toString(),
+             });
+         }
+diff --git a/dist/src/tasks-runner/life-cycles/task-history-life-cycle.js b/dist/src/tasks-runner/life-cycles/task-history-life-cycle.js
+index 4824a4ad117bec083da7502891f88651dba1b48f..ea27b2edf6dd505db797ca590c0d0d9471a980cf 100644
+--- a/dist/src/tasks-runner/life-cycles/task-history-life-cycle.js
++++ b/dist/src/tasks-runner/life-cycles/task-history-life-cycle.js
+@@ -48,18 +48,23 @@ class TaskHistoryLifeCycle {
+         if (!this.taskHistory) {
+             return;
+         }
+-        // Build TaskRun objects now — task.hash is guaranteed to be set by this point
++        // History contains hashed execution intervals, not pre-start failures.
++        // Those failures remain in run information without a fabricated hash/start.
+         for (const { task, code, status } of pendingResults) {
++            const start = task.startTime ?? this.startTimings[task.id];
++            delete this.startTimings[task.id];
++            if (task.hash === undefined || start === undefined) {
++                continue;
++            }
+             this.taskRuns.set(task.hash, {
+                 hash: task.hash,
+                 target: task.target,
+                 code,
+                 status,
+-                start: task.startTime ?? this.startTimings[task.id],
++                start,
+                 end: task.endTime ?? Date.now(),
+                 cacheable: task.cache === true,
+             });
+-            delete this.startTimings[task.id];
+         }
+         const runs = [];
+         // Only check for flaky tasks among cacheable tasks
+diff --git a/dist/src/tasks-runner/life-cycles/task-profiling-life-cycle.js b/dist/src/tasks-runner/life-cycles/task-profiling-life-cycle.js
+index d806bce7abd862fca0e73289d04c01d223f4a1e5..bffb669ffb511ec469b9bf62a29726b5c5aedcfe 100644
+--- a/dist/src/tasks-runner/life-cycles/task-profiling-life-cycle.js
++++ b/dist/src/tasks-runner/life-cycles/task-profiling-life-cycle.js
+@@ -22,10 +22,11 @@ class TaskProfilingLifeCycle {
+     }
+     endTasks(taskResults, metadata) {
+         for (let tr of taskResults) {
+-            if (tr.task.startTime) {
++            this.timings[tr.task.id] ??= { perfStart: undefined, perfEnd: undefined };
++            if (tr.task.startTime !== undefined) {
+                 this.timings[tr.task.id].perfStart = tr.task.startTime;
+             }
+-            if (tr.task.endTime) {
++            if (tr.task.endTime !== undefined) {
+                 this.timings[tr.task.id].perfEnd = tr.task.endTime;
+             }
+             else {
+@@ -41,6 +42,10 @@ class TaskProfilingLifeCycle {
+     recordTaskCompletions(tasks, { groupId }) {
+         for (const { task, status } of tasks) {
+             const { perfStart, perfEnd } = this.timings[task.id];
++            // A failure before execution has no executed profile interval.
++            if (perfStart === undefined) {
++                continue;
++            }
+             this.profile.push({
+                 name: task.id,
+                 cat: Object.values(task.target).join(','),
+diff --git a/dist/src/tasks-runner/life-cycles/task-timings-life-cycle.js b/dist/src/tasks-runner/life-cycles/task-timings-life-cycle.js
+index ab0d47a6d12a4ce8cb6b140364b1ada923fab95a..894bbfc883a7108a9fdd118691d6e2bcb69a06da 100644
+--- a/dist/src/tasks-runner/life-cycles/task-timings-life-cycle.js
++++ b/dist/src/tasks-runner/life-cycles/task-timings-life-cycle.js
+@@ -15,10 +15,11 @@ class TaskTimingsLifeCycle {
+     }
+     endTasks(taskResults) {
+         for (let tr of taskResults) {
+-            if (tr.task.startTime) {
++            this.timings[tr.task.id] ??= { start: undefined, end: undefined };
++            if (tr.task.startTime !== undefined) {
+                 this.timings[tr.task.id].start = tr.task.startTime;
+             }
+-            if (tr.task.endTime) {
++            if (tr.task.endTime !== undefined) {
+                 this.timings[tr.task.id].end = tr.task.endTime;
+             }
+             else {
+@@ -31,7 +32,7 @@ class TaskTimingsLifeCycle {
+         const timings = {};
+         Object.keys(this.timings).forEach((p) => {
+             const t = this.timings[p];
+-            timings[p] = t.end ? t.end - t.start : null;
++            timings[p] = t.start !== undefined && t.end !== undefined ? t.end - t.start : null;
+         });
+         console.log(JSON.stringify(timings, null, 2));
+     }
 diff --git a/dist/src/tasks-runner/run-command.js b/dist/src/tasks-runner/run-command.js
 index 4e64afa4fb985191ac8bc0e31a1e380bcecf9427..14723620cb7d8094bff0eb70214442dd39fe9131 100644
 --- a/dist/src/tasks-runner/run-command.js

@@ -26,6 +26,7 @@ bun patch nx@23.2.1
 python3 tooling/nx_patch.py --check
 # Edit the Bun-prepared node_modules/nx package only after the no-op check passes.
 python3 tooling/nx_patch.py
+rm -rf node_modules/nx # Retire Bun's prepared copy before restoring its isolated dependency links.
 bun install
 ```
 
@@ -38,12 +39,14 @@ archive/package identity.
 
 Do not use `bun patch --commit` for this carried patch with Bun 1.4.2: it emits absolute registry-cache paths and
 discards the bodies of deleted-file hunks, and includes a `.bun-tag-*` installer marker. Nor hand-edit the generated
-patch. Ordinary `bun install` still owns activation and all lock changes; commit them with the patch. Nx is never
-developer-linked and needs no release publication, generated tarball or package-activation target. Bun's isolated global
-store deliberately keeps patched entries project-local under `node_modules/.bun`; their installed patch marker and
-cached identity distinguish the patched bytes. Do not replace that package with a writable generated-product link or
-edit an installed package without first preparing it. The installed-product regression runs `node --check` on every
-patched JavaScript file as well as checking the five-minute inactivity policy.
+patch. Retire the Bun-prepared `node_modules/nx` copy after regeneration: even `bun install --force` leaves that
+dependency-less copy in place. Ordinary `bun install` then restores the isolated package and owns activation and all
+lock changes; commit them with the patch. Nx is never developer-linked and needs no release publication, generated
+tarball or package-activation target. Bun's isolated global store deliberately keeps patched entries project-local under
+`node_modules/.bun`; their installed patch marker and cached identity distinguish the patched bytes. Do not replace that
+package with a writable generated-product link or edit an installed package without first preparing it. The
+installed-product regression runs `node --check` on every patched JavaScript file as well as checking the five-minute
+inactivity policy.
 
 The nx-plugin managed files distribute the same Nx patch to consumers. The root monorepo policy maintains
 `overrides.nx = "23.2.1"` and `patchedDependencies["nx@23.2.1"] = "patches/nx@23.2.1.patch"`. Run `smoo monorepo update`
@@ -186,9 +189,17 @@ Stock Nx's discrete worker reports a hash failure through `endTasks` even when `
 run-information hunk creates that entry only when absent, retaining the failed result and its completion time. An
 execution start stays absent unless `startTasks` or the task's own `startTime` supplied one; no start is fabricated.
 
+The composed lifecycle must also complete `endCommand`: native task history requires a hash and an execution start;
+legacy history stringifies the start. Both now exclude results lacking either, rather than inventing a history row or
+crashing after the run information was saved. Genuine database failures for valid execution rows still propagate.
+Optional timing diagnostics retain an unstarted result with a `null` duration; profiling emits no executed interval
+without a real start. Supplied timestamps, including zero, and normal started tasks retain their timing.
+
 `packages/nx-plugin/src/nx-run-information.test.ts` exercises the actual installed lifecycle with pre-start failures,
-absent timestamps, supplied task timestamps and normal started/cache-hit controls. Drop this hunk only when the
-installed upstream package handles the same ordering, retaining the regression.
+absent timestamps, supplied task timestamps and normal started/cache-hit controls.
+`packages/nx-plugin/src/nx-failure-life-cycles.test.ts` composes it with native/legacy history and both optional timing
+reporters, checks actual SQLite/CSV/profile output and includes a genuine native database-error control. Drop these
+hunks only when the installed upstream package handles the same ordering, retaining the regressions.
 
 ## Requested task closure after dummy normalization
 
