@@ -31,8 +31,9 @@ processes them client-side.
 
 ### Live Stream Source <a id="smoo/lmao!n/inspector-stream-source"></a>
 
-`createStreamSource` opens a WebSocket or SSE connection, receives Arrow IPC frames (binary over WebSocket,
-base64-encoded over SSE), parses them with flechette, and auto-reconnects with exponential backoff capped at 30 s.
+`createStreamSource` opens a WebSocket or SSE connection, chosen by its `transport` option, subscribes to its `topic`,
+receives Arrow IPC frames (binary over WebSocket, base64-encoded over SSE), parses them with flechette, and
+auto-reconnects with exponential backoff capped at 30 s.
 
 Connects to a MessageRelay Durable Object (see `extern/graphql/src/message-relay.ts`) via WebSocket. The relay pattern:
 
@@ -44,13 +45,15 @@ Connects to a MessageRelay Durable Object (see `extern/graphql/src/message-relay
 The DO acts as a hibernatable WebSocket proxy — the Worker keeps the connection alive but the DO can sleep between
 publishes. This is the existing MessageRelay pattern, not a new infrastructure piece.
 
-For Bun backends: direct SSE endpoint that pushes RecordBatches as they arrive (no DO relay needed).
+For Bun backends: a direct SSE endpoint (`transport: 'sse'`, subscribed at `{url}/subscribe?topic=`) that pushes
+RecordBatches as they arrive (no DO relay needed).
 
 ### Archive Source <a id="smoo/lmao!n/inspector-archive-source"></a>
 
-`createArchiveSource` fetches archive Arrow IPC buffers over HTTP GET and yields them as an async iterable for
-progressive loading. The response is split on Arrow IPC continuation and end-of-stream framing; a response that is not
-an IPC stream is yielded as a single batch.
+`createArchiveSource(baseUrl)` returns an `ArchiveSource`. Its `fetchRange(startTime, endTime)` requests
+`{baseUrl}?start=&end=` over HTTP GET and yields the archive Arrow IPC buffers as an async iterable for progressive
+loading. The response is split on Arrow IPC continuation and end-of-stream framing; a response that is not an IPC stream
+is yielded as a single batch.
 
 Fetches historical Arrow IPC or Parquet files from object storage (R2, S3) by time range. Used for:
 
@@ -96,7 +99,7 @@ Top-level composed component. Accepts a `TraceSource`: a `StreamSource` (`kind: 
 
 ```typescript
 <TraceViewer
-  source={createStreamSource({ wsUrl, groupId })}
+  source={createStreamSource({ url, transport: 'websocket', topic: `traces:${groupId}` })}
   onOpenEvent={(id) => { /* host app navigation */ }}
 />
 ```

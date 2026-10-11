@@ -148,7 +148,8 @@ class GeneratedSpanBuffer {
   _callsiteMetadata: OpMetadata | undefined;
   _opMetadata: OpMetadata;
   _vocabularyGeneration: VocabularyGeneration;
-  _children: SpanBuffer[];
+  _nodeIndex: number; // Node in _traceRoot._topology; child links live in the topology arena
+  _topologyGeneration: number;
 
   // Identity accessors (lmao)
   get span_id() {
@@ -306,7 +307,10 @@ interface ComposedSpanBuffer extends SpanBuffer {
 runtime hint is decoded. Direct calls resolve capacity with `resolveSpanBufferCapacity`, which applies
 `MIN_ADAPTIVE_BUFFER_CAPACITY` (8) when no explicit capacity is given and rejects explicit capacities below 2. The
 8-aligned capacity rounding lives in arrow-builder's `getAlignedCapacity`, invoked inside the generated constructor, not
-in this factory. The root buffer is registered with its trace's topology (`traceRoot._topology.registerRoot`).
+in this factory. The root buffer is registered with its trace's topology (`traceRoot._topology.registerRoot`). The
+factory counts the span in the class's `stats.spansCreated`; `createChildSpanBuffer` counts the same way and registers
+the child with `_topology.registerChild`, and `createOverflowBuffer` never counts, because an overflow buffer continues
+an existing span.
 
 ```typescript
 /**

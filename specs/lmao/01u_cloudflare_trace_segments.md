@@ -98,12 +98,12 @@ transactional-storage commit is the durability point; the collector reduces, sta
 uploads to R2. **Rows on the wire is normative for this lane**, not a convenience: the segment layout's sort and
 row-group requirements mean the collector must encode at seal time — it alone sees the merged multi-client stream — so
 Arrow-on-wire would be pure decode-then-re-encode overhead; rows also keep browser clients Arrow-free (crash-path
-emitters must stay dumb). Arrow remains the storage format and the Queues-fallback envelope format. If row-parse CPU
-ever becomes measurable, msgpack encoding of the same row shape is the mitigation — the architecture is unchanged by it.
-The obvious caution — "a self-built collector lane is self-building Pipelines" — is answered, not ignored: the collector
-is justified precisely because it is NOT transport. It does compute on the stream (incremental aggregate reduction,
-threshold alerting, the hot-window freshness surface) that Pipelines cannot do; if it were only moving bytes, it would
-still be disqualified.
+emitters must stay dumb). Arrow remains the storage format; the Queues fallback carries rows as well, batched under a
+01t chunk envelope. If row-parse CPU ever becomes measurable, msgpack encoding of the same row shape is the mitigation —
+the architecture is unchanged by it. The obvious caution — "a self-built collector lane is self-building Pipelines" — is
+answered, not ignored: the collector is justified precisely because it is NOT transport. It does compute on the stream
+(incremental aggregate reduction, threshold alerting, the hot-window freshness surface) that Pipelines cannot do; if it
+were only moving bytes, it would still be disqualified.
 
 **Diagnostic primary: Cloudflare Pipelines** (open beta; Workers Paid). Ingestion via Worker **stream binding**
 (`env.TRACE_STREAM.send(rows)` — array of JSON-serializable records, promise resolves on confirmed ingest) or HTTP
@@ -126,9 +126,9 @@ just get no live aggregates.
 
 **Fallback: Queues** if Pipelines' limits or post-beta pricing disqualify it — a drop-in behind the same sink seam.
 Messages are 128 KB max and operations are billed per 64 KB (write+read+delete ≈ 3 ops), so the fallback MUST ship
-batched chunk envelopes (01s/01t), never per-span messages: 100 M spans/month as ~250 k chunked messages ≈ 0.75 M ops ≈
-within the 1 M included; per-span would be ~300 M ops ≈ $120/month. ($0.40/M ops after 1 M included.) At-least-once +
-`chunk_id` dedup.
+batched chunk messages (01s `TraceChunkQueueMessage`: one 01t envelope plus its rows), never per-span messages: 100 M
+spans/month as ~250 k chunked messages ≈ 0.75 M ops ≈ within the 1 M included; per-span would be ~300 M ops ≈
+$120/month. ($0.40/M ops after 1 M included.) At-least-once + `chunk_id` dedup.
 
 **Bootstrap only: direct R2 per request.** A worker PUTting its own rows/chunks straight to R2. Works on day one with
 zero dependencies, but Class A ops are $4.50/M (per-request PUTs at 10 M requests/month ≈ $45 — dwarfing every other
@@ -373,8 +373,8 @@ The OLAP job owns heavy historical rollups. Both write aggregate segments back u
 
 No new abstraction: the base `Tracer` sink lifecycle (`onTraceEnd`/`flush`) already models this. The Cloudflare sink is
 a `Tracer` subclass whose `flush()` drains completed buffers and sends **rows** through the pipeline binding; the 01s
-wrapper schedules `flush()` via `ctx.waitUntil`. The Queues-fallback sink instead builds 01t chunk envelopes. Both are
-constructor-injected transports — the tracer API is unchanged.
+wrapper schedules `flush()` via `ctx.waitUntil`. The Queues-fallback sink instead batches the rows into messages, each
+one 01t chunk envelope plus its rows. Both are constructor-injected transports — the tracer API is unchanged.
 
 Exported as `@smoothbricks/lmao/cloudflare` from `packages/lmao/src/lib/cloudflare/`: `DiagnosticDrainTracer` +
 `PipelinesStreamTransport`/`QueuesFallbackTransport` (this section), `CollectorClient`/`FakeCollectorClient` (§Delivery
@@ -399,8 +399,8 @@ not the classification mechanism, so the row→class mapping stays a constructor
   parameter-drift rejection) is what makes at-least-once sufficient, and an outcome-based billability contract is what
   the crash-net rows feed.
 - [01s](./01s_cloudflare_fetch_trace_wrapper.md) carries the matching lane note (§Trace Chunk Envelope): the `enqueue`
-  seam sends **rows** on the primary Pipelines rung; the Arrow chunk envelope remains the Queues-fallback and compactor
-  format.
+  seam sends **rows** on every lane; the Queues fallback batches them under a 01t chunk envelope, and the compactor
+  works on 01t envelopes.
 
 ## Related <a id="smoo/lmao!n/cf-trace-segments-related"></a>
 

@@ -27,15 +27,16 @@ The wrapper records traces on request path and flushes asynchronously via `ctx.w
 ## Wrapper API <a id="smoo/lmao!n/cf-fetch-wrapper-api"></a>
 
 The wrapper composes the tracer primitives: `ArrayQueueTracer`, `JsBufferStrategy`, `createTraceRoot`, `Tracer.trace`,
-`drain`, and `bufferStrategy.toArrowTable` / `releaseBuffer`.
+`drain`, `spanBufferToTraceRows`, and `bufferStrategy.releaseBuffer`.
 
 ```typescript
 import type { OpContextBinding } from '@smoothbricks/lmao';
 import { ArrayQueueTracer } from '@smoothbricks/lmao';
+import type { TraceRow } from '@smoothbricks/lmao/cloudflare';
 
 type TraceWrapperConfig<B extends OpContextBinding> = {
   tracer: ArrayQueueTracer<B>;
-  enqueue: (chunk: TraceChunkEnvelope) => Promise<void>;
+  enqueue: (rows: readonly TraceRow[]) => Promise<void>;
   maxRowsPerChunk: number;
   maxBytesPerChunk: number;
   maxChunkAgeMs: number;
@@ -67,39 +68,43 @@ const tracer = new ArrayQueueTracer(opContext, {
 
 1. Wrapper opens a root trace for the fetch request via `await tracer.trace('fetch', ...)`.
 2. Handler executes and returns response.
-3. Wrapper drains completed root buffers via `tracer.drain()`.
-4. Wrapper converts drained buffers to Arrow payloads via `tracer.bufferStrategy.toArrowTable(...)`.
-5. Wrapper releases converted buffers via `tracer.bufferStrategy.releaseBuffer(...)`.
-6. Wrapper schedules enqueue via `ctx.waitUntil(config.enqueue(chunk))`.
+3. When a flush trigger (§Flush Triggers) is met, wrapper drains completed root buffers via `tracer.drain()`. Otherwise
+   the completed buffers stay queued in the tracer for a later request, and steps 4-6 are skipped.
+4. Wrapper flattens each drained buffer to rows via `spanBufferToTraceRows(...)`.
+5. Wrapper releases each flattened buffer via `tracer.bufferStrategy.releaseBuffer(...)`.
+6. Wrapper schedules enqueue via `ctx.waitUntil(config.enqueue(rows))`.
 7. Response is returned immediately without waiting for enqueue completion.
 
 ## Trace Chunk Envelope <a id="smoo/lmao!n/cf-fetch-wrapper-chunk-envelope"></a>
 
 **Lane note** (per
-[01u §Collection Lanes and Fallbacks](./01u_cloudflare_trace_segments.md#smoo/lmao!n/cf-trace-segments-hop)): on the
-primary diagnostic lane — the Cloudflare Pipelines stream binding — the `enqueue` seam sends **rows** (JSON-serializable
-records), because Pipelines owns batching and Parquet encoding for the raw tier. The `TraceChunkEnvelope` below remains
-the payload format for the Queues fallback lane and for the compactor's archive primitives
-([01t](./01t_trace_archive_pipeline.md)); the flush triggers, delivery semantics, and failure handling in this spec
-apply to both payload shapes.
+[01u §Collection Lanes and Fallbacks](./01u_cloudflare_trace_segments.md#smoo/lmao!n/cf-trace-segments-hop)): the
+`enqueue` seam sends **rows** (JSON-serializable records) on every lane. On the primary diagnostic lane — the Cloudflare
+Pipelines stream binding — the rows go to the stream as they are, because Pipelines owns batching and Parquet encoding
+for the raw tier. On the Queues fallback lane, rows are batched into `TraceChunkQueueMessage`s: each message carries one
+`TraceChunkEnvelope` ([01t](./01t_trace_archive_pipeline.md#smoo/lmao!n/trace-archive-envelope)) and the rows it
+describes. The flush triggers, delivery semantics, and failure handling in this spec apply to both lanes.
 
 ```typescript
 type TraceChunkEnvelope = {
   chunk_id: string; // idempotency key
-  emitted_at: string; // ISO timestamp
-  domain: string;
-  runtime: 'cloudflare-worker';
-  trace_format: 'arrow';
-  compression?: 'zstd' | 'gzip' | 'none';
-  payload_bytes: Uint8Array; // Arrow table or IPC payload
-  metadata: {
-    batch_count: number;
-    row_count: number;
-    first_ts?: string;
-    last_ts?: string;
-  };
+  file_ref: string; // the Queues lane uses a logical ref, e.g. 'queue://worker-name'
+  chunk_ref: string; // the Queues lane uses a content hash of the message's rows
+  row_count: number;
+  started_at_ms: number;
+  ended_at_ms: number;
+  partition_keys: readonly string[];
+  metadata?: Record<string, unknown>;
+};
+
+type TraceChunkQueueMessage = {
+  envelope: TraceChunkEnvelope;
+  rows: readonly TraceRow[];
 };
 ```
+
+`QueuesFallbackTransport` slices each flush into messages of at most its `maxRowsPerMessage` rows. The caller sizes that
+bound so a message stays under the 128 KB Queues limit.
 
 ## Flush Triggers <a id="smoo/lmao!n/cf-fetch-wrapper-flush-triggers"></a>
 
@@ -111,15 +116,20 @@ Flush when any trigger is met:
 
 If none are met during a request, implementation MAY keep best-effort in-memory accumulation for warm isolates.
 
+The triggers decide when the wrapper flushes; they do not size messages. On the Queues lane, `maxRowsPerMessage` slices
+one flush into messages.
+
 ## Delivery Semantics <a id="smoo/lmao!n/cf-fetch-wrapper-delivery-semantics"></a>
 
 - Queue delivery is at-least-once.
 - `chunk_id` must be stable and dedupe-safe.
 - Consumers must deduplicate by `chunk_id`.
 
-`chunk_id` is a deterministic FNV-1a hash of a canonical, sorted serialization of the chunk (`buildTraceChunkEnvelope`
-in `packages/lmao/src/lib/archive/chunkEnvelope.ts`), so identical chunk content yields an identical id. At-least-once
-delivery and consumer dedup are queue-transport contracts, satisfied by the consumer keying on this `chunk_id`.
+`chunk_id` is a deterministic FNV-1a hash of a canonical, sorted serialization of the envelope fields
+(`buildTraceChunkEnvelope` in `packages/lmao/src/lib/archive/chunkEnvelope.ts`). The Queues lane sets `chunk_ref` to a
+content hash of the message's rows (`QueuesFallbackTransport` in `packages/lmao/src/lib/cloudflare/diagnosticDrain.ts`),
+so a retried send of the same rows yields an identical id. At-least-once delivery and consumer dedup are queue-transport
+contracts, satisfied by the consumer keying on this `chunk_id`.
 
 ## Failure Handling <a id="smoo/lmao!n/cf-fetch-wrapper-failure-handling"></a>
 
@@ -132,7 +142,8 @@ delivery and consumer dedup are queue-transport contracts, satisfied by the cons
 The archive control plane (listener registration, wake/fan-out, per-consumer cursor) is owned by the consuming system,
 not this package.
 
-Queue consumers should route drained chunk envelopes into an archival flow built on LMAO's data-plane primitives:
+Queue consumers should route drained `TraceChunkQueueMessage`s into an archival flow built on LMAO's data-plane
+primitives:
 
 - LMAO owns data-plane chunk primitives in `packages/lmao/src/lib/archive/`: `buildTraceChunkEnvelope` (`chunk_id`),
   `inspectPartitionCardinality` / `splitChunkByPartition` (partition inspection and split), and `compactTraceChunks`
@@ -159,20 +170,24 @@ export default {
 ```typescript
 async function flushTraceBatch<B extends OpContextBinding>(
   tracer: ArrayQueueTracer<B>,
-  enqueue: (chunk: TraceChunkEnvelope) => Promise<void>
+  enqueue: (rows: readonly TraceRow[]) => Promise<void>
 ): Promise<void> {
   const buffers = tracer.drain();
   for (const buffer of buffers) {
+    let rows: TraceRow[];
     try {
-      const table = await tracer.bufferStrategy.toArrowTable(buffer);
-      const chunk = encodeArrowTableAsChunkEnvelope(table);
-      await enqueue(chunk);
+      rows = spanBufferToTraceRows(buffer);
     } finally {
       tracer.bufferStrategy.releaseBuffer(buffer);
     }
+    await enqueue(rows);
   }
 }
 ```
+
+`DiagnosticDrainTracer.flush()` (`packages/lmao/src/lib/cloudflare/diagnosticDrain.ts`) runs this routine with the
+`enqueue` seam as its constructor-injected transport, and reports a failed send through its `onSendError` hook instead
+of rejecting.
 
 ## Related <a id="smoo/lmao!n/cf-fetch-wrapper-related"></a>
 

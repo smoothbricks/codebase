@@ -98,7 +98,7 @@ OpMetadata (object) - ONE per Op, injected by transformer
 
 LogBinding (object) - ONE per defineOpContext() call
 ├── logSchema: LogSchema (tag attribute definitions)
-└── remappedViewClass?: RemappedViewConstructor (for prefixed libraries)
+└── remapDescriptor?: RemapDescriptor (prefixed/remapped libraries; read at Arrow conversion)
 
 Tracer (abstract class) - ONE per application/test
 ├── binding: OpContextBinding (from defineOpContext)
@@ -111,7 +111,7 @@ SpanBuffer - ONE per span (internal)
 ├── _opMetadata: OpMetadata        ← THIS OP's metadata (for rows 1+)
 ├── message_values[0]: string      ← span name written by writeSpanStart()
 ├── _parent?: SpanBuffer           ← reference to parent
-├── _children: SpanBuffer[]        ← child spans
+├── _nodeIndex: number             ← node in _traceRoot._topology (child links live there)
 ├── _scopeValues: Record<string, unknown> ← scope values for this span
 ├── timestamp: BigInt64Array       ← nanosecond timestamps
 ├── entry_type: Uint8Array         ← entry type enum
@@ -489,7 +489,7 @@ type SpanContext<Ctx extends OpContext> = {
 
   // Result helpers
   ok<S>(value: S): OkResult<S, Ctx['logSchema']>;
-  err<E>(code: string, data?: E): ErrResult<E>;
+  err<E>(error: E): ErrResult<E, Ctx['logSchema']>;
 
   // Scoped attributes (read-only view)
   scope: Readonly<Partial<InferSchema<Ctx['logSchema']>>>;
@@ -569,8 +569,9 @@ const createUser = defineOp('createUser', async (ctx, userData: UserData) => {
 4. **Args passed through**: Remaining arguments go to the op function
 5. **lineNumber written directly**: Written to `line_values[0]` inside `_spanPre()` (NO intermediate object storage)
 6. **SpanBuffer created with \_callsiteMetadata**: `_callsiteMetadata` for row 0's metadata, `metadata` for rows 1+
-7. **Buffer linking**: Child buffer registered with parent's children array
-8. **RemappedBufferView**: If op has prefix, view maps prefixed columns for Arrow
+7. **Buffer linking**: Child buffer registered in the trace topology (`_traceRoot._topology.registerChild`)
+8. **RemapDescriptor**: If op has prefix, the callsite plan's descriptor is attached to the child buffer and maps
+   prefixed columns for Arrow
 
 ### Example: Multiple Child Spans
 
@@ -733,7 +734,7 @@ const createUser = opContext.defineOp('createUser', async (ctx, userData: UserDa
   const validated = await ctx.span('validate', validateUser, userData);
   if (!validated.success) {
     ctx.log.warn('Validation failed');
-    return ctx.err('VALIDATION_FAILED', validated.error);
+    return ctx.err(validated.error);
   }
 
   const user = await ctx.span('save', saveUser, userData);
@@ -851,7 +852,7 @@ await trace('process-order', { env: myEnv }, processOrder, order);
 
 - **Shared references**: OpMetadata and deps shared across all ops
 - **Direct buffer access**: TagWriter/SpanLogger hold buffer reference directly
-- **Buffer management**: Self-tuning capacity per op context
+- **Buffer management**: Self-tuning capacity per generated span buffer class (`SpanBufferClass.stats`)
 
 ## Integration Points
 

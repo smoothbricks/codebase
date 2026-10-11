@@ -20,23 +20,10 @@ four Deferred Work items that the 01q spec removed (WasmTracer, string pooling, 
 - Acceptance: `Blocked.resource('lease', 'L1').reason` deep-equals
   `{ type: 'resource', resourceType: 'lease', resourceId: 'L1' }`. Its `.message` contains `lease/L1`.
 
-## RetriesExhausted for an exhausted Blocked budget
-
-- Spec: `specs/lmao/01r_transient_errors_and_retry.md:40-41` and `:232-233`: when an Op returns `Blocked` and
-  `maxAttempts` is spent, the final failure becomes `RetriesExhausted`. `BlockedConfig` holds `maxAttempts` and
-  `nextRetry`. The exhausted-attempts return is at `:310-312`.
-- Code: `packages/lmao/src/lib/errors/RetriesExhausted.ts:50` (class), `:64-65` (message).
-  `grep 'new RetriesExhausted' packages/lmao/src` → no hits. `packages/lmao/src/lib/spanContext.ts:205-212`
-  (`getRetryableError`) returns only `TransientError`, so no code path converts `Blocked`.
-- Work: convert the final `Blocked` to `Err(new RetriesExhausted(...))` when the attempt count reaches `maxAttempts`.
-  Place the conversion in the layer chosen under "Layer that owns the Blocked budget" below.
-- Acceptance: `Blocked.service('x', { maxAttempts: 2, nextRetry: () => 0 })`, driven through the retry budget, yields
-  `Err(RetriesExhausted)`. Its message contains `after 2 attempts`.
-
 ## UTF-8 surrogate byte count
 
-- Spec: `specs/lmao/01k_tree_walker_and_arrow_conversion.md:209-222` (`utf8ByteLength` surrogate branch) and `:196`: a
-  surrogate pair counts as 4 bytes. A lone surrogate encodes as U+FFFD, which is 3 bytes.
+- Spec: `specs/lmao/01k_tree_walker_and_arrow_conversion.md:152-165` (`utf8ByteLength` surrogate branch) and `:143-144`:
+  a surrogate pair counts as 4 bytes. A lone surrogate encodes as U+FFFD, which is 3 bytes.
 - Code: `packages/arrow-builder/src/lib/arrow/utf8.ts:25-39`. The surrogate branch at `:32-36` adds 4 bytes for any
   surrogate. It does not check for a following low surrogate. A lone surrogate is counted as 4.
 - Work: when a high surrogate is followed by a low surrogate, count 4 and consume both code units. For any other lone
@@ -46,8 +33,8 @@ four Deferred Work items that the 01q spec removed (WasmTracer, string pooling, 
 
 ## Encode truncation check in dictionary finalize
 
-- Spec: `specs/lmao/01k_tree_walker_and_arrow_conversion.md:298-304`: finalize calls `encodeInto` and advances `offset`
-  by `result.written`. The check at `:299-302` throws `DictionaryEncodeInvariantError` when the encoding is short.
+- Spec: `specs/lmao/01k_tree_walker_and_arrow_conversion.md:263-269`: finalize calls `encodeInto` and advances `offset`
+  by `result.written`. The check at `:264-268` throws `DictionaryEncodeInvariantError` when the encoding is short.
 - Code: `packages/arrow-builder/src/lib/arrow/dictionary.ts:216` (`encodeInto(...).written ?? 0`, with no `read` check)
   and `:217` (`offset += written`). `packages/arrow-builder/src/lib/arrow/utf8.ts:51-54` (`encodeInto` returns
   `written ?? 0`). `grep DictionaryEncodeInvariantError packages/arrow-builder packages/lmao/src` → no hits.
@@ -70,20 +57,6 @@ four Deferred Work items that the 01q spec removed (WasmTracer, string pooling, 
   it.
 - Cost: interning re-rooted names adds them to the vocabulary catalog, which moves catalog ordinals, so it is not a free
   change. Update every test that pins an ordinal in the same commit.
-
-## logTemplateIds missing from compile metadata
-
-- Spec: `specs/lmao/01o_typescript_transformer.md:238-239` (`defineOp` fourth argument
-  `{ runtimeHint, logTemplateIds }`), `:244-245` (copies the frozen template table to `OpMetadata.logTemplateIds`).
-  Example at `:442`.
-- Code: `packages/lmao-ttsc/plugin/driver/optimization.go:949-962` (`baseCompileMetadataProperties`) emits `runtimeHint`
-  (`:951`) and `eagerColumns` (`:953-960`), never `logTemplateIds`. The runtime reads `localMessageDictionary` instead:
-  `packages/lmao/src/lib/resolveMessage.ts:49-52` and `packages/lmao/src/lib/opContext/defineOp.ts:73-84`.
-  `grep logTemplateIds packages/lmao/src packages/lmao-ttsc` → no hits.
-- Work: emit the frozen template table in the compile metadata. Copy it to `OpMetadata.logTemplateIds` when the Op is
-  defined. This item does not change spec text. Renaming to `localMessageDictionary` is a separate spec change.
-- Acceptance: a `defineOp` with a log template compiles to an object with `logTemplateIds`. A Bun test asserts
-  `buffer._opMetadata.logTemplateIds[0] === 'cache\nhit'`.
 
 ## Structured field writers
 
@@ -109,16 +82,15 @@ four Deferred Work items that the 01q spec removed (WasmTracer, string pooling, 
 
 ## Benchmark gate variants
 
-- Spec: `specs/lmao/01o_typescript_transformer.md:668-672`: the gate runs `plugin-off`, `plugin-on/current`, and the
-  global-vocabulary variants in position-balanced, order-reversed runs. A checksum mismatch fails the gate (`:686`).
-- Code: no Mitata scenario carries the labels `plugin-off` or `plugin-on/current`. Similar labels appear only in tests
-  and docs: `packages/lmao/src/lib/__tests__/eager-columns.test.ts:334`,
+- Spec: `specs/lmao/01o_typescript_transformer.md:614-617`: the gate runs `plugin-off` and the global-vocabulary
+  variants in position-balanced, order-reversed runs. A checksum mismatch fails the gate (`:617`).
+- Code: no Mitata scenario carries the label `plugin-off`. Similar labels appear only in tests and docs:
+  `packages/lmao/src/lib/__tests__/eager-columns.test.ts:334`,
   `packages/lmao/src/lib/__tests__/message-buffer-families.test.ts:802-803` (`plugin-off-current`, `plugin-on-current`),
-  and `packages/lmao/docs/transformer-optimization.md:279`.
-- Work: add Mitata scenarios for all three variants. Emit raw samples and a semantic checksum for each variant.
-  Alternate the run order. Fail the run when checksums differ.
-- Acceptance: the bench writes raw samples and semantic checksums for all three variants. A checksum mismatch fails the
-  run.
+  and `packages/lmao/docs/transformer-optimization.md:282`.
+- Work: add Mitata scenarios for both variants. Emit raw samples and a semantic checksum for each variant. Alternate the
+  run order. Fail the run when checksums differ.
+- Acceptance: the bench writes raw samples and semantic checksums for both variants. A checksum mismatch fails the run.
 
 ## 32-bit vocabulary ids; a collision is never fatal
 
@@ -143,9 +115,10 @@ four Deferred Work items that the 01q spec removed (WasmTracer, string pooling, 
   under it; registration walks that list comparing `(kindTag, recordBytes)`, reuses an equal entry and appends
   otherwise. Drop `LMAO_VOCABULARY_ID_COLLISION`, `LMAO1008` and `LMAO1009`, and change the Go catalog's `byID` the same
   way. In the transformer, key the per-call resolution, the per-file ordinals and the Op-local dictionary by the record
-  key (`vocabularyKey`), not by id, and give `staticVocabularyOperand` an explicit "no entry" instead of id 0. Keep the
-  `contentHash` reuse check fatal. Bump nothing else: `schemaVersion` stays 1 and the record grammar is unchanged, but
-  every emitted fragment and golden test changes ids.
+  key (`vocabularyKey`), not by id (the Op-local dictionary goes away instead if the Op-local lane cutover below lands
+  first), and give `staticVocabularyOperand` an explicit "no entry" instead of id 0. Keep the `contentHash` reuse check
+  fatal. Bump nothing else: `schemaVersion` stays 1 and the record grammar is unchanged, but every emitted fragment and
+  golden test changes ids.
 - Acceptance: the existing collision fixture (`vocabulary_test.go:259-287`, `vocabularyRegistry.test.ts:305-309`)
   becomes a pair of records that share a 32-bit id, found by a deterministic search over a range wide enough to contain
   one (100,000 candidates finds a 32-bit collision only about 69 % of the time, so widen it and pin the found pair):
@@ -168,7 +141,7 @@ optimization, not a correctness requirement. Per-capacity freelists are not list
 - **Hot-path inlining.** Inline the WASM exports further and elide bounds checks through capacity constraints.
   Acceptance: the warmed-write Mitata scenario improves with an unchanged semantic checksum.
 
-## Open decisions
+## Decisions
 
 ### Warmed-write zero-allocation claim
 
@@ -184,6 +157,17 @@ optimization, not a correctness requirement. Per-capacity freelists are not list
 - Options: (a) add a JS allocation-counting gate that runs warmed writes and asserts zero new heap allocations, then
   remove the per-view allocations that fail it; (b) narrow the sentence to the Rust core, and say JS writes are not
   covered.
+- Work: add a Bun allocation gate for warmed writes on the JS and the WASM buffer strategies. Build a span buffer, write
+  every column once so its views are bound, then run N more writes to the same columns between
+  `Bun.gc(true)`/`heapStats()` (`bun:jsc`) samples and assert the object count does not grow. The per-view
+  `Float64Array(1)` fields at `packages/lmao/src/lib/wasm/threadSpanView.ts:341-350` and the identity views at
+  `packages/lmao/src/lib/wasm/wasmSpanBuffer.ts:655-656` are span-setup and view-refresh cost, which 01q's Packed Span
+  Superblocks section already excludes ("this is allocation-call batching, not a zero-allocation claim"); remove an
+  allocation only when the gate finds it on the warmed path.
+- Acceptance: `bun test` runs the gate for both strategies and passes; a control setter that allocates one object per
+  write makes the gate fail.
+- Decision: keep the spec. Narrowing the claim to the Rust core would drop the one hot-path property the JS write path
+  promises, and nothing cited shows a warmed write allocating, only span setup.
 
 ### Per-block lifecycle states vs pin counter
 
@@ -197,6 +181,9 @@ optimization, not a correctness requirement. Per-capacity freelists are not list
   `packages/lmao/src/lib/convertToArrow.ts:1309`.
 - Options: (a) add per-block states (`FREE`, `BUFFER_OWNED`, `FLUSH_PINNED`) to the allocator; (b) rewrite `:675-687` to
   the pin-counter design that the code has.
+- Decision: adopt the shipped shape. A per-tree topology lease plus an epoch pin held only for the synchronous build
+  covers every case the per-block states did, with no per-block state to keep consistent; 01q "Lifecycle and
+  Asynchronous Ownership" now describes it.
 
 ### WASM borrow under ArrowLease
 
@@ -207,6 +194,9 @@ optimization, not a correctness requirement. Per-capacity freelists are not list
   code always copies.
 - Options: (a) implement borrowing under `ArrowLease`, using the pin to keep the region valid; (b) delete the borrow
   sentence and keep the copy boundary.
+- Decision: adopt the shipped shape. `memory.grow()` detaches every view of the old buffer, so borrowing WASM regions
+  would force growth to wait on lease release; the copy boundary keeps Arrow output valid with no such coupling, and 01q
+  now states it.
 
 ### Lazy per-column alloc8B vs packed superblock
 
@@ -219,6 +209,9 @@ optimization, not a correctness requirement. Per-capacity freelists are not list
   `packages/lmao/crates/lmao-arena/src/raw.rs:732`, and `packages/lmao/crates/lmao-wasm/src/lib.rs:354`.
 - Options: (a) delete the lazy design (`:698-709`, and the `:614-616` call), and keep the packed superblock; (b)
   describe the packed path the code takes.
+- Decision: adopt the shipped shape. One packed superblock per span holds every numeric family slab, and a lazy column
+  only binds views over its slot on first write, so 01q's write path, span start, and allocator export list now describe
+  that instead of `alloc8B`.
 
 ### Blocked snippet members
 
@@ -227,6 +220,8 @@ optimization, not a correctness requirement. Per-capacity freelists are not list
 - Code does: the instance members are not in the snippet. `packages/lmao/src/lib/errors/Blocked.ts:109-111`
   (`get _tag`), `:116-125` (constructor), and `:146-164` (`toJSON` and inspect).
 - Options: (a) list the instance members in the spec snippet; (b) state that the snippet is an excerpt.
+- Decision: adopt the shipped shape. The snippet in 01r now lists `get _tag`, the constructor, `toJSON`, and the inspect
+  hook as `Blocked.ts` declares them.
 
 ### Layer that owns the Blocked budget
 
@@ -235,7 +230,15 @@ optimization, not a correctness requirement. Per-capacity freelists are not list
 - Code does: `packages/lmao/src/lib/errors/RetriesExhausted.ts:4-5` says "the retry layer" converts the final failure.
   `packages/lmao/src/lib/spanContext.ts:205-212` (`getRetryableError`) retries only `TransientError`.
 - Options: (a) convert at the engine level, as the spec says; (b) convert in the span retry layer, as the code comment
-  says. The acceptance for the RetriesExhausted item holds under either.
+  says.
+- Work: correct the doc comment at `packages/lmao/src/lib/errors/RetriesExhausted.ts:4-5` to say that the engine
+  re-executing a blocked Op converts its final `Blocked`, never the span retry layer. `getRetryableError`
+  (`packages/lmao/src/lib/spanContext.ts:200-213`) already returns a `Blocked` unchanged. The engine is the consumer's;
+  see "Where the Blocked budget lives".
+- Acceptance: a Bun test runs a span whose Op returns `Blocked.service('x', { maxAttempts: 3 })` and observes one Op
+  invocation, no `span-retry` row, and `Err(Blocked)` as the span result.
+- Decision: keep the spec. Converting in the span loop would make that loop retry `Blocked`, which erases the
+  `TransientError`/`Blocked` distinction 01r is built on.
 
 ### executeWithRetry shape
 
@@ -245,6 +248,8 @@ optimization, not a correctness requirement. Per-capacity freelists are not list
   `packages/lmao/src/lib/spanContext.ts:333, 350, 368, 387, 407, 428, 450, 473, 506`. Call sites are at `:1890-2137`.
 - Options: (a) one generic `executeWithRetry` that matches the spec signature; (b) keep the arity variants and document
   them in the spec.
+- Decision: adopt the shipped shape. Fixed-arity loops pass the context and arguments straight through, so a span call
+  allocates no closure, and they mirror `span0`–`span8`; 01r now shows `executeWithRetry1` and `getRetryableError`.
 
 ### Name ColumnDictionary
 
@@ -255,6 +260,15 @@ optimization, not a correctness requirement. Per-capacity freelists are not list
   `ColumnDictionary`.
 - Options: (a) rename the spec to `DictionaryBuilder`; (b) rename the TS class and the Rust struct to
   `ColumnDictionary`.
+- Work: rename the Rust port's `ColumnDictionary` to `DictionaryBuilder`: the struct at
+  `packages/lmao/crates/lmao-arrow/src/dict.rs:408`, its doc comment at `:401-402` (which should name arrow-builder's
+  `DictionaryBuilder`), the re-export in `packages/lmao/crates/lmao-arrow/src/lib.rs`, and the uses in
+  `packages/lmao/crates/lmao-arrow/src/convert.rs:19`, `:172-175`,
+  `packages/lmao/crates/lmao-arrow/tests/properties.rs`, and `packages/lmao/crates/lmao-arrow/benches/flush.rs`. The
+  Rust `FinalizedDictionary` already shares the TS name.
+- Acceptance: `grep -rn ColumnDictionary packages/lmao/crates` finds no hits, and the lmao-arrow tests pass.
+- Decision: adopt the shipped shape. `DictionaryBuilder` is the TS class every caller uses, so 01k now names it (and
+  places it in `arrow-builder`), and the Rust port takes the same name so one concept has one name in both languages.
 
 ### Name finalizeDictionary
 
@@ -263,6 +277,8 @@ optimization, not a correctness requirement. Per-capacity freelists are not list
   `packages/arrow-builder/src/lib/arrow/dictionary.ts:185-223`. `grep finalizeDictionary packages/` → no hits.
 - Options: (a) rename the spec to `DictionaryBuilder.finalize`; (b) add a free function `finalizeDictionary` that calls
   `finalize`. Either way, `['a', '\u00E9']` finalizes to values bytes `[0x61, 0xc3, 0xa9]`.
+- Decision: adopt the shipped shape. `DictionaryBuilder.finalize(sorted)` returns a `FinalizedDictionary` class, and a
+  free-function alias would be a second name for one operation; 01k now shows the method.
 
 ### Utf8Cache shortcut in utf8ByteLength
 
@@ -272,6 +288,8 @@ optimization, not a correctness requirement. Per-capacity freelists are not list
   `packages/arrow-builder/src/lib/arrow/dictionary.ts:169-171` calls `utf8ByteLength(str)` directly.
   `packages/lmao/src/lib/utf8Cache.ts:82` has `byteLength`, not `get`.
 - Options: (a) route the byte count through `Utf8Cache.byteLength`; (b) drop the shortcut from the spec.
+- Decision: adopt the shipped shape. `Utf8Cache.byteLength` encodes and caches on a miss, so routing first occurrences
+  through it would allocate for strings seen once; 01k now counts bytes with `utf8ByteLength` directly.
 
 ### Utf8Cache API names
 
@@ -283,6 +301,8 @@ optimization, not a correctness requirement. Per-capacity freelists are not list
   `packages/arrow-builder/src/lib/arrow/dictionary.ts:129`.
 - Options: (a) pick the method set in the code and align the spec names to it; (b) keep the spec names and add them to
   `Utf8Cache`.
+- Decision: adopt the shipped shape. The shipped `Utf8Cache` is a bounded SIEVE cache implementing `Utf8Encoder`
+  (`encode`, `byteLength`, `encodeInto`, `encodeMany`), which beats an unbounded `Map`; 01k now lists that API.
 
 ### convertSpanTreeToArrowTable signature and multi-root
 
@@ -294,6 +314,8 @@ optimization, not a correctness requirement. Per-capacity freelists are not list
   input. The leased variant is `convertSpanTreeToLeasedArrowTable` at `:1645-1657`.
 - Options: (a) implement the spec signature with multi-root input, and throw on mismatched schemas as `:779-780` says;
   (b) keep the single-root signature and rewrite `:439-443`, `:749`, and `:779-780` to match it.
+- Decision: adopt the shipped shape. One tree per call matches the per-trace `ArrowLease`, isolates a failing trace, and
+  lets library spans keep their own schema through the Pass 0 merge; 01k now documents the single-root signature.
 
 ### RemappedBufferView wrapper vs RemapDescriptor
 
@@ -308,6 +330,8 @@ optimization, not a correctness requirement. Per-capacity freelists are not list
   `packages/lmao/src/lib/__tests__/remap-descriptor-integration.test.ts:225`.
 - Options: (a) rewrite `:642-664` to describe the realized model: canonical buffers, with the descriptor applied during
   the cold traversal; (b) add a `RemappedBufferView` wrapper class to the code.
+- Decision: adopt the shipped shape. A `RemapDescriptor` on the canonical child buffer keeps one object shape on the hot
+  path and needs no wrapper class; 01k and 01q now describe the descriptor and the topology registration.
 
 ### Dynamic span name under a proven Op
 
@@ -319,6 +343,8 @@ optimization, not a correctness requirement. Per-capacity freelists are not list
   with its string operand. The spec at `:183` cites `lmao.go:418-421` for the same code.
 - Options: (a) keep `spanN(name, ...)` with the string operand, and update `:561-563` to say so; (b) emit the public
   `span(name, ...)` form, so the lowering matches `:561-563`.
+- Decision: adopt the shipped shape. The fixed-arity `spanN` call with a string operand skips the variadic dispatcher
+  and keeps the Promise schedule; 01o and `packages/lmao/docs/transformer-optimization.md` now say so.
 
 ### Op-local u16 lane removal and cutover
 
@@ -334,6 +360,23 @@ optimization, not a correctness requirement. Per-capacity freelists are not list
   - `packages/lmao/src/lib/convertToArrow.ts:391-392`.
 - Options: (a) cut over in one change, removing the lane and its readers together; (b) stage the cutover. Staging needs
   a temporary dual path, which §6.1 forbids, so the spec would need a named exception.
+- Work: remove the lane and every reader in one change, which must pass the §6.2 gates (see "Benchmark gate variants"):
+  `currentLogLocalIDs` (`packages/lmao-ttsc/plugin/driver/lmao.go:126`, `:249`), the local dictionary build and its
+  `localMessageDictionary` emission (`packages/lmao-ttsc/plugin/driver/optimization.go:147`, `:246-266`,
+  `compileMetadataNode`), `localMessageID` (`packages/lmao-ttsc/plugin/driver/loginline.go:68-69`),
+  `OpCompileMetadata.localMessageDictionary` (`packages/lmao/src/lib/op.ts:49`) and its normalization
+  (`packages/lmao/src/lib/opContext/defineOp.ts:73-84`), and the `_messageIds` lane readers
+  (`packages/lmao/src/lib/resolveMessage.ts:49-52`, `packages/lmao/src/lib/convertToArrow.ts:391-392`,
+  `packages/lmao/src/lib/wasm/threadSpanView.ts:410-414`). Static log writes then store the dense vocabulary index in
+  the packed row header.
+- Acceptance:
+  `grep -rn 'localMessageDictionary\|currentLogLocalIDs\|localMessageID\|_messageIds' packages/lmao/src packages/lmao-ttsc/plugin`
+  finds no hits, and a Bun test logs a literal message through the transformer and reads it back from Arrow through the
+  global vocabulary.
+- Decision: keep the spec. One static-message representation is simpler than a `u16` lane indirecting into the global
+  vocabulary, and a staged dual path is the shim §6.1 forbids. 01o no longer describes the lane: the §6 Op-local
+  subsection, the intro's `u16` phrase, the `logTemplateIds` compile-metadata field, and the `plugin-on/current` gate
+  baseline were removed, and the "logTemplateIds missing from compile metadata" work item was dropped.
 
 ### eagerColumns undocumented
 
@@ -342,6 +385,8 @@ optimization, not a correctness requirement. Per-capacity freelists are not list
 - Code does: `packages/lmao-ttsc/plugin/driver/optimization.go:953-960` emits `eagerColumns`.
   `packages/lmao/src/lib/opContext/defineOp.ts:77-80` reads it.
 - Options: (a) document `eagerColumns` as a compile-metadata field in §2; (b) remove the emission and the reader.
+- Decision: adopt the shipped shape. Preallocating the columns every path writes is a real compile-time win the runtime
+  already consumes; 01o §2 now documents `eagerColumns`.
 
 ### Metadata injection site
 
@@ -356,6 +401,17 @@ optimization, not a correctness requirement. Per-capacity freelists are not list
 - Options: (a) inject at `defineModule`, as the code does, and update `01l` `:795` and `:804`, the `defineOp.ts:21-23`
   comment, and the `:374-378` blockquote; (b) inject at `defineOpContext`, and change the transformer to match `01l` and
   the comment.
+- Work: replace `tryDefineModuleMetadata` (`packages/lmao-ttsc/plugin/driver/lmao.go:314-353`) and its one-per-file
+  panic with injection into the third argument of each proven `defineOp` call:
+  `{ package_name, package_file, git_sha, line }`, where `applyHintRewrites` now inserts `undefined`
+  (`packages/lmao-ttsc/plugin/driver/optimization.go:1011-1013`). A call that already has a third argument keeps it.
+  Correct the comment at `packages/lmao/src/lib/opContext/defineOp.ts:21-23` to name that argument.
+- Acceptance: a Go golden test shows `defineOp('x', fn)` compiling to
+  `defineOp('x', fn, { package_name, package_file, git_sha, line: N }, …)`, and a Bun test reads `line === N` from the
+  Op's `OpMetadata` without the stack fallback.
+- Decision: adopt the shipped shape. The runtime has no `defineModule` and no context-level metadata key; its only
+  intake is `defineOp`'s per-Op `metadata` argument, so 01o §5 (and 01l, 01a, 01g) now name that argument, and the
+  transformer moves to it.
 
 ### V8 table rows vs §6.1
 
@@ -365,3 +421,66 @@ optimization, not a correctness requirement. Per-capacity freelists are not list
 - Code does: the code still uses the Op-local lane. See "Op-local u16 lane removal and cutover" above.
 - Options: (a) update the table rows to the global vocabulary; (b) keep the table as a "current" column and add a
   "target" column for §6.1.
+- Work: none beyond "Op-local u16 lane removal and cutover"; the rows now describe the global vocabulary and eager
+  columns.
+- Acceptance: the V8 table in 01o names no Op-local template or `u16` lane.
+- Decision: keep the spec. §6.1 makes the global vocabulary the design, and a current/target column pair is the status
+  overlay specs must not carry, so the rows were updated to §6.1.
+
+### Where the Blocked budget lives
+
+- Spec says: the budget is enforced "at the engine level", and `RetriesExhausted` is the terminal error once a `Blocked`
+  budget is consumed, without naming who owns that engine (`specs/lmao/01r_transient_errors_and_retry.md:39-42`,
+  `:205-210`).
+- Code does: lmao ships `Blocked`, `BlockedConfig`, and `RetriesExhausted` (`packages/lmao/src/lib/errors/`) and no
+  engine. `grep 'new RetriesExhausted' packages/lmao/src` → no hits, and no package in this repo reads `blockedConfig`.
+- Options: (a) 01r names an lmao helper that converts an exhausted `Blocked`; (b) the engine is the consumer's, and lmao
+  ships only the classes.
+- Decision: adopt the shipped shape. lmao has no engine, and the spec gives no delay for a `Blocked` without
+  `nextRetry`, so a helper would invent schedule semantics; 01r now says the engine is the consumer's and lists what it
+  applies, and the "RetriesExhausted for an exhausted Blocked budget" work item left this briefing because its
+  conversion is not lmao code.
+
+### `task()` line injection without a runtime `task`
+
+- Spec says: 01o §7 described `tryTaskLine`, which appends the call-site line to `task('name', fn)` calls.
+  `specs/lmao/01_trace_logging_system.md:40-62` records `task('name', fn)` as an alternative considered and rejected in
+  favor of `defineOp`.
+- Code does: `packages/lmao-ttsc/plugin/driver/lmao.go:453-466` (`tryTaskLine`, dispatched at `:280`) rewrites any
+  two-argument call named `task` whose first argument is a string literal, with no checker provenance.
+  `packages/lmao/src` has no `task` API.
+- Options: (a) add a runtime `task` API; (b) delete §7 and the transform.
+- Work: delete `tryTaskLine` (`packages/lmao-ttsc/plugin/driver/lmao.go:453-466`), its dispatch at `:280`, and the §7
+  line of the header comment at `:22`. Drop the `task` cases from `packages/lmao-ttsc/plugin/driver/corpus_test.go` and
+  `packages/lmao-ttsc/plugin/driver/corpus_dump_test.go`.
+- Acceptance: `grep -rn tryTaskLine packages/lmao-ttsc/plugin` finds no hits, and a Go test shows a foreign
+  `task('x', fn)` call emitted unchanged.
+- Decision: adopt the shipped shape. The runtime has no `task` API and 01 rejected that design, so the transform can
+  only append an argument to an unrelated same-named function; 01o §7 is deleted, and the transform goes with it.
+
+### Output names a remapped span does not map
+
+- Spec says: a mapped span exposes only its descriptor's output columns; an output name missing from `sourceNames` reads
+  as null cells for that span, and scope values follow the same rule (`specs/lmao/01e_library_integration_pattern.md`,
+  "Columns the library doesn't own" and "Arrow Conversion Example"). Before this pass 01e said a missing name is read
+  under its own name.
+- Code does: `resolveColumnName` (`packages/lmao/src/lib/convertToArrow.ts:258-259`) returns
+  `remaps.get(buffer)?.sourceNames[outputName] ?? outputName`, so for a remapped buffer an unmapped output name falls
+  back to itself. Every column pass reads through it: string and unknown columns (`:267`, `:280`), scope values
+  (`:290-306`), binary (`:758-760`), number (`:1942-1945`, `:1969-1973`), boolean (`:2045-2049`) and enum
+  (`:2132-2136`). With an application `status` column next to `httpOps.prefix('http')`, the HTTP span's own `status`
+  values (and its `status` scope value) are written into the application's `status` column as well as `http_status`. The
+  same fallback lets a library column dropped with `mapColumns({ x: null })` reach an application column named `x`.
+- Options: (a) a remapped buffer resolves only names in its `sourceNames`, and any other name is an unallocated column;
+  (b) keep the fallback and require applications to avoid output names equal to a library's source names.
+- Work: `resolveColumnName` returns `string | undefined`: a buffer without a descriptor resolves to the output name, a
+  remapped buffer to `sourceNames[outputName]`. Every caller listed above treats `undefined` as an unallocated column
+  with no scope value, so the rows stay null.
+- Acceptance: a Bun test gives the application schema `status: S.number()` and wires a library whose schema also has
+  `status` as `libOps.prefix('http')`. The library op writes `tag.status(200)` and sets scope `status: 500`; the
+  application op writes its own `status`. In the Arrow table the library span's rows have `http_status` 200 and a null
+  `status`, and the application span keeps its own `status`. A second case drops a library column with
+  `mapColumns({ debug: null })` next to an application `debug` column and finds `debug` null on the library rows.
+- Decision: keep the spec, option (a). A column's meaning is the application's wiring; a fallback that depends on
+  whether two schemas happen to share a field name leaks one library's data into an unrelated column, and the
+  `defineOpContext` conflict check cannot see it because the library's source names are not output names.

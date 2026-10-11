@@ -28,9 +28,6 @@ const opContext = defineOpContext({
     db: dbOps.mapColumns({ query: 'query', rows: 'db_rows' }),
   },
   flags,
-  flagEvaluator: async (ctx, flag, defaultValue) => {
-    return launchDarkly.variation(flag, defaultValue, { user: ctx.userId });
-  },
   ctx: {
     env: null as Env, // REQUIRED at trace()
     requestId: null as string, // REQUIRED at trace()
@@ -44,21 +41,23 @@ const { defineOp, defineOps } = opContext;
 // 4. Define ops
 const fetchUser = defineOp('fetchUser', async (ctx, id: string) => {
   ctx.tag.user_id(id).operation('read');
-  const user = await ctx.deps.db.query(ctx, `SELECT * FROM users WHERE id = ?`, [id]);
-  return ctx.ok(user);
+  const user = await ctx.span('db-query', ctx.deps.db.query, `SELECT * FROM users WHERE id = ?`, [id]);
+  return user.isOk() ? ctx.ok(user.value) : ctx.err(user.error); // Rebuild the child's outcome on this context
 });
 
 // 5. Export as group (for other packages to use)
 export const userOps = defineOps({ fetchUser, updateUser, deleteUser });
 
-// 6. Create tracer and trace at request boundary
-import { TestTracer } from '@smoothbricks/lmao';
+// 6. Create tracer and trace at request boundary; the flag evaluator is a TracerOptions value
+import { InMemoryFlagEvaluator, TestTracer } from '@smoothbricks/lmao';
 
-const { trace } = new TestTracer(opContext);
+const { trace } = new TestTracer(opContext, {
+  flagEvaluator: new InMemoryFlagEvaluator(flags.schema, { newCheckoutFlow: true }),
+});
 
 export default {
   async fetch(req: Request, env: Env) {
-    return trace(
+    const user = await trace(
       'request',
       {
         env, // required
@@ -69,6 +68,7 @@ export default {
       fetchUser,
       req.params.id
     );
+    return user.isOk() ? Response.json(user.value) : new Response('Not found', { status: 404 });
   },
 };
 ```
@@ -82,7 +82,7 @@ export default {
 ```typescript
 interface OpContextBinding<T, FF, Deps, UserCtx> {
   readonly [opContextType]: OpContext<T, FF, Deps, UserCtx>; // Phantom type for inference
-  readonly logBinding: LogBinding<T>; // Schema + capacity stats
+  readonly logBinding: LogBinding<T>; // Schema + optional remap descriptor
   readonly ctxDefaults: UserCtx; // User context defaults (with null sentinels)
   readonly deps: Deps; // Wired dependencies
 }
@@ -209,19 +209,23 @@ The **effective schema** = `appSchema & http_* & pg_* & mysql_* & query`.
 
 ### Feature Flag Evaluator <a id="smoo/lmao!n/op-context-flag-evaluator"></a>
 
-Ctx-first pattern. Receives SpanContext without `ff` (prevents recursion):
+The evaluator is a `FlagEvaluator<Ctx>` object passed as `TracerOptions.flagEvaluator`
+([Feature Flags](./01p_feature_flags.md#smoo/lmao!n/op-context-flag-evaluator.evaluator-interface)). Its methods are
+ctx-first and receive SpanContext without `ff` (prevents recursion):
 
 ```typescript
-flagEvaluator: async (ctx, flag, defaultValue) => {
+// Inside a class implementing FlagEvaluator<AppCtx>
+async getAsync(ctx: SpanContextWithoutFf<AppCtx>, flag: string) {
   // Can log
-  ctx.log.debug(`Evaluating ${flag}`);
+  ctx.log.debug('Evaluating flag');
 
   // Can create child spans for external calls
-  return ctx.span('launchDarkly', async (child) => {
+  const evaluated = await ctx.span('launchDarkly', async (child) => {
     child.tag.flag(flag);
-    return launchDarkly.variation(flag, defaultValue, { user: ctx.userId });
+    return child.ok(await launchDarkly.variation(flag, null, { user: ctx.userId }));
   });
-};
+  return evaluated.isOk() ? evaluated.value : null;
+}
 ```
 
 ### SpanContext API <a id="smoo/lmao!n/op-context-spancontext-api"></a>
@@ -266,9 +270,9 @@ async (ctx, ...args) => {
 
   // Results
   return ctx.ok(data); // Success
-  return ctx.err('NOT_FOUND', { id }); // Error with code
+  return ctx.err(NOT_FOUND({ id })); // Error with code (NOT_FOUND from defineCodeError)
   return ctx.ok(data).with({ cached: true }); // With attributes
-  return ctx.err('TIMEOUT', {}).message('Request timed out');
+  return ctx.err(TIMEOUT({})).message('Request timed out');
 
   // Buffer access (for Arrow conversion)
   const table = convertToArrowTable(ctx.buffer);
@@ -277,25 +281,26 @@ async (ctx, ...args) => {
 
 ## Result Types <a id="smoo/lmao!n/op-context-result-types"></a>
 
-LMAO provides two result patterns:
+LMAO results serve two purposes with one pair of classes:
 
-1. **`Result` class** - For type-safe error handling with `isErr(Tag)` discrimination
-2. **`Ok`/`Err`** - For fluent result builders with deferred tag application (returned by `ctx.ok()`/`ctx.err()`)
+1. **`Result<V, E>` type** - For type-safe error handling with `isErr(Tag)` discrimination
+2. **`Ok`/`Err`** - For fluent result builders that write row 1 eagerly (returned by `ctx.ok()`/`ctx.err()`)
 
 `Result<V, E>` is the union `Ok<V> | Err<E>` (`packages/lmao/src/lib/result.ts`). The same `Ok`/`Err` instances are both
 the type-safe result (`isOk`/`isErr(Tag)`/`map`/`match`/`unwrapOr`) and the fluent buffer-row-1 writer
 (`.with()`/`.message()`/`.line()`) — there is no separate fluent-builder class.
 
-### Result Class
+### Result Type
 
-The `Result` class wraps success/error values and provides methods for type-safe error handling:
+A span returns a `Result<V, E>`, and its methods provide type-safe error handling. An op completes only with a result
+from its own `ctx.ok()` or `ctx.err()`; to propagate a child's outcome, rebuild it on the receiving context
+([Entry Types](./01h_entry_types_and_logging_primitives.md#smoo/lmao!n/lmao-entry-fluent-result-integration)):
 
 ```typescript
-import { Result } from '@smoothbricks/lmao';
+import type { Result } from '@smoothbricks/lmao';
 
-// Creating results
-const success = Result.ok(user);
-const failure = Result.err(new NotFoundError('user', userId));
+// Receiving a child's result (inside an op)
+const result: Result<User, NotFound> = await ctx.span('fetch-user', fetchUser, userId);
 
 // Basic checks
 if (result.isOk()) {
@@ -307,10 +312,10 @@ if (result.isErr()) {
 
 // Tagged error discrimination (for use with a workflow engine or custom error types)
 if (result.isErr(Blocked)) {
-  return result; // Pass through - engine handles retry
+  return ctx.err(result.error); // Propagate on this context - engine handles retry
 }
 if (result.isErr(NotFound)) {
-  return Result.ok(null); // Handle specifically
+  return ctx.ok(null); // Handle specifically
 }
 
 // Predicate-based checks
@@ -329,7 +334,7 @@ const matched = result.match({
 
 ### Tagged Errors <a id="smoo/lmao!n/op-context-tagged-errors"></a>
 
-Tagged errors implement `TaggedError<Tag>` for use with `Result.isErr(Tag)`:
+Tagged errors implement `TaggedError<Tag>` for use with `result.isErr(Tag)`:
 
 ```typescript
 import { TaggedError } from '@smoothbricks/lmao';
@@ -363,13 +368,13 @@ import { Blocked, RetriesExhausted } from '@smoothbricks/lmao';
 // In an Op that calls external services
 const result = await ctx.deps.indexStore.query(args);
 if (result.isErr(Blocked)) {
-  return result; // Pass through - the engine handles retry
+  return ctx.err(result.error); // Propagate on this context - the engine handles retry
 }
 
 // After max retries exhausted
 if (result.isErr(RetriesExhausted)) {
   // Service was unavailable too long - compensate
-  return ctx.err('SERVICE_UNAVAILABLE', { service: result.error.reason });
+  return ctx.err(SERVICE_UNAVAILABLE({ service: result.error.reason }));
 }
 ```
 
@@ -383,7 +388,7 @@ return ctx.ok(user).with({ cached: true }).message('User fetched from cache');
 
 // Error with attributes
 return ctx
-  .err('NOT_FOUND', { id })
+  .err(NOT_FOUND({ id }))
   .message('User not found')
   .with({ searched_tables: ['users', 'archived_users'] });
 ```
@@ -398,11 +403,13 @@ return ctx
 
 ### Entry Type Detection <a id="smoo/lmao!n/op-context-entry-detection"></a>
 
-The Tracer detects if a function returns a fluent `Ok` or `Err`:
+The Tracer writes the span-end entry for every completion:
 
-- If yes: Entry type already written, Tracer doesn't overwrite
-- If no (plain Result): Tracer writes `span-ok` to row 1
-- If throws: Tracer writes `span-exception` to row 1
+- If the function returns an `Ok` or `Err` created by its own context: the chained methods already wrote row 1's
+  attributes, message, and line; the Tracer writes `span-ok` or `span-err`, the timestamp, and `error_code` to row 1
+- If it returns anything else, including an `Ok`/`Err` from another context: the Tracer throws a `TypeError` and writes
+  `span-exception` to row 1
+- If it throws: the Tracer writes `span-exception` to row 1
 
 ### Error Handling Policy (Return vs Throw)
 
@@ -422,17 +429,18 @@ const myOp = defineOp('opName', async (ctx, arg1: string, arg2: number) => {
 });
 ```
 
-**Batch with `this` binding:**
+**Batch:** `defineOps` wraps each function with `defineOp` under its key and returns an `OpGroup`. An op calls a sibling
+through the sibling's own `Op` value; nothing binds `this`.
 
 ```typescript
-const ops = defineOps({
-  fetchUser: async (ctx, id: string) => { ... },
-  updateUser: async (ctx, id: string, data: Data) => {
-    // Can reference other ops in batch via this
-    const user = await ctx.span('fetch', this.fetchUser, id);
-    return ctx.ok(updated);
-  },
+const fetchUser = defineOp('fetchUser', async (ctx, id: string) => { ... });
+
+const updateUser = defineOp('updateUser', async (ctx, id: string, data: Data) => {
+  const user = await ctx.span('fetch', fetchUser, id);
+  return ctx.ok(updated);
 });
+
+const ops = defineOps({ fetchUser, updateUser });
 ```
 
 **Export for other packages:**
@@ -478,10 +486,10 @@ All subclasses must implement these five lifecycle hooks:
 
 All hooks receive the `SpanBuffer` as their argument, providing access to:
 
-- `buffer._stats` - Current stats (writes, overflows, capacity)
+- `buffer._stats` - Current stats (totalWrites, spansCreated, capacity)
 - `buffer._opMetadata` - Which Op/module this buffer belongs to
 - `buffer.trace_id` - The trace identifier
-- `buffer._children` - Child span tree (for root buffers)
+- `walkSpanTree(buffer, visitor)` - Child span tree, from the trace's topology
 
 **Public Methods:**
 
@@ -501,7 +509,8 @@ All hooks receive the `SpanBuffer` as their argument, providing access to:
 
 **TestTracer:**
 
-Accumulates root buffers for inspection and Arrow table conversion. Child spans accessible via `buffer._children` tree.
+Accumulates root buffers for inspection and Arrow table conversion. Child spans are reached with
+`walkSpanTree(root, visitor)`.
 
 ```typescript
 const tracer = new TestTracer(opContext);
@@ -647,7 +656,7 @@ export default {
     const tracer = new ArrayQueueTracer(opContext);
     const { trace } = tracer;
 
-    const response = await trace('request', { env }, handleRequest, req);
+    const result = await trace('request', { env }, handleRequest, req); // handleRequest returns ctx.ok(Response)
 
     // Batch send in background
     execCtx.waitUntil(
@@ -660,7 +669,7 @@ export default {
       })()
     );
 
-    return response;
+    return result.isOk() ? result.value : new Response('Internal error', { status: 500 });
   },
 };
 ```
@@ -677,9 +686,7 @@ await trace('server-start', initializeServer);
 
 ```typescript
 const tracer = new TestTracer(opContext, {
-  flagEvaluator: async (ctx, flag, defaultValue) => {
-    return launchDarkly.variation(flag, defaultValue, { user: ctx.userId });
-  },
+  flagEvaluator: new LaunchDarklyEvaluator(ldClient, flags.schema), // A FlagEvaluator<Ctx> (see 01p)
 });
 ```
 
@@ -712,7 +719,7 @@ const request = defineOp('request', async (ctx, url: string, opts: RequestOpts) 
   ctx.tag.url(url).method(opts.method ?? 'GET');
   const res = await fetch(url, { signal: AbortSignal.timeout(ctx.timeout), ...opts });
   ctx.tag.status(res.status);
-  return res.ok ? ctx.ok(res) : ctx.err('HTTP_ERROR', { status: res.status });
+  return res.ok ? ctx.ok(res) : ctx.err(HTTP_ERROR({ status: res.status }));
 });
 
 export const httpOps = defineOps({ request, get, post, put, delete: del });
@@ -792,24 +799,22 @@ The `null as T` / `undefined as T | undefined` patterns ensure:
 
 ## Metadata Injection (Transformer) <a id="smoo/lmao!n/metadata-injection"></a>
 
-The TypeScript transformer injects metadata at the `defineOpContext` call site:
+The TypeScript transformer injects metadata as the third argument of each `defineOp` call:
 
 ```typescript
 // Before transform
-const { defineOp } = defineOpContext({ logSchema });
+const fetchUser = defineOp('fetchUser', fn);
 
 // After transform
-const { defineOp } = defineOpContext({
-  logSchema,
-  __metadata: {
-    package_name: '@myorg/mypackage',
-    package_file: 'src/operations.ts',
-    git_sha: 'abc123',
-  },
+const fetchUser = defineOp('fetchUser', fn, {
+  package_name: '@myorg/mypackage',
+  package_file: 'src/operations.ts',
+  git_sha: 'abc123',
+  line: 12,
 });
 ```
 
-This metadata flows to all Ops created from this context, enabling:
+This metadata becomes the Op's `OpMetadata`, enabling:
 
 - Package attribution in traces
 - Source file tracking
