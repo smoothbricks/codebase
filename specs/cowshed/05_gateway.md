@@ -335,8 +335,8 @@ next attach. A write refused with `revision-fence` or `not-installed` lost a rac
 snapshot; that decision stands, and the write counts as superseded rather than failing the command that ran the
 reconcile.
 
-Every request is one line. A one-shot request is followed by the client's EOF and answered with one line; a `disk-lease`
-or `cpu-tokens` request is held for as long as its client keeps the connection open.
+Every request is one line. A one-shot request is followed by the client's EOF and answered with one line; a
+`disk-lease`, `cpu-tokens` or `jobserver` request is held for as long as its client keeps the connection open.
 
 ## Disk-lifecycle lease
 
@@ -477,26 +477,50 @@ parallel, and the total runnable work stays near the core count.
   the checkout, and the client's pid and command.
 - **Outside `bounded-exec`.** Processes outside `bounded-exec` — Nx's own `nx:run-commands` builds, a host shell's
   `cargo` — take the budget through Cargo's make-protocol jobserver, one fifo per client process. The managed
-  environment's `cargo` is cowshed's jobserver launcher (03_caches.md, in-image tool shims), which runs `cargo` directly
-  inside a `bounded-exec` grant (`BOUNDED_EXEC_CPU_TOKENS` set) or under an inherited jobserver (`CARGO_MAKEFLAGS` names
-  one). Elsewhere it asks the gateway on the control socket
-  (`{"op":"jobserver","checkout":"<workspace root>","command":"<command>"}`), which queues and grants it like a cargo
-  build's `cpu-tokens` request (one per core, the half-host cap, fairness, all at once) and answers
-  `{"ok":true,"lease":"granted","tokens":<g>,"fifo":"<path>"}`. On the grant the gateway creates that fifo in its
-  private runtime directory, mode `0600` and owned by the client's user (from the socket's peer credentials), and writes
-  `g − 1` token bytes into it: the client's implicit make token is the first. The launcher then spawns the real `cargo`
-  with `CARGO_MAKEFLAGS` and `MAKEFLAGS` set to `-j --jobserver-auth=fifo:<path>`, waits for it, and exits with its
-  status. The launcher keeps the connection open, close-on-exec, for as long as it lives. When the connection closes —
-  the build ended, or either process was killed, `SIGKILL` included — the gateway drains the bytes left in the fifo,
-  unlinks it, and returns all `g` tokens to the ledger, so tokens a killed process read and never wrote back are
-  credited too. A `cargo` that outlives a killed launcher keeps its open fifo and runs over budget until it finishes, as
-  a runner does across a gateway restart.
+  environment's `cargo` is cowshed's jobserver launcher (03_caches.md, "The `cargo` jobserver launcher"). It reads its
+  environment and its subcommand, the first argument after cargo's global options and a `+toolchain`, in this order:
+  - **An inherited jobserver** (`CARGO_MAKEFLAGS` names a live one; for a `fifo:` one, its path exists), as for a
+    `cargo` a build script starts: it runs `cargo` as asked, since that jobserver already counts it.
+  - **A `bounded-exec` grant** (`BOUNDED_EXEC_CPU_TOKENS` set): it takes no second grant and runs `cargo` with
+    `CARGO_BUILD_JOBS`, `RUST_TEST_THREADS` and `NEXTEST_TEST_THREADS` set to `BOUNDED_EXEC_CPU_TOKENS` where they are
+    unset. `bounded-exec` sets the cargo variables only for a cargo runner, so a `cargo` that a `process` runner's
+    script starts under a one-token grant would otherwise run one job per core.
+  - **A subcommand that compiles nothing** — `metadata`, `fmt`, `locate-project`, `tree`, `pkgid`, `read-manifest`,
+    `verify-project`, `version`, `help`, `config`, `search`, `info`, `new`, `init`, `add`, `remove`, `update`, `fetch`,
+    `vendor`, `generate-lockfile`, `clean`, `login`, `logout`, `owner`, `yank`, `report`, or none at all (`--version`,
+    `--list`): it runs `cargo` directly without asking. These runs are short and nearly idle, and a queue would make
+    rust-analyzer's frequent `cargo metadata` wait behind gates whenever the host is saturated.
+  - **Any other subcommand**, aliases and third-party `cargo-*` subcommands included, is a build. The launcher asks the
+    gateway on the control socket (`{"op":"jobserver","want":<n>,"checkout":"<workspace root>","command":"<command>"}`)
+    with `want` one per core, as for a cargo build under `bounded-exec`. The gateway queues and grants it like a
+    `cpu-tokens` request (the half-host cap, fairness, all at once), refuses the same malformed requests, and answers
+    `{"ok":true,"lease":"granted","tokens":<g>,"fifo":"<path>"}`.
+- **The jobserver fifo.** On the grant the gateway creates that fifo in its private runtime directory, mode `0600` and
+  owned by the client's user (from the socket's peer credentials). It opens the fifo `O_RDWR` and keeps that descriptor
+  until the drain, so the bytes survive while no client has it open, and writes `g − 1` token bytes into it: the
+  client's implicit make token is the first. At startup the gateway removes every fifo left in that directory, since a
+  restart forgets every grant.
+- **The jobserver run.** The launcher spawns the real `cargo` with `CARGO_MAKEFLAGS` and `MAKEFLAGS` set to
+  `-j --jobserver-auth=fifo:<path>`, and with `RUST_TEST_THREADS`, `NEXTEST_TEST_THREADS` and `BOUNDED_EXEC_CPU_TOKENS`
+  set to `g` where they are unset: libtest and nextest test threads take no jobserver token, so without them a
+  `cargo test` or `cargo nextest run` holding `g` tokens still runs one test thread per core. A `--test-threads` count
+  the command names outranks them, as a flag outranks the environment. The launcher waits for `cargo` and exits with its
+  status, and keeps the connection open, close-on-exec, for as long as it lives. When the connection closes — the build
+  ended, or either process was killed, `SIGKILL` included — the gateway drains the bytes left in the fifo, unlinks it,
+  and returns all `g` tokens to the ledger, so tokens a killed process read and never wrote back are credited too. A
+  `cargo` that outlives a killed launcher keeps its open fifo and runs over budget until it finishes, as a runner does
+  across a gateway restart.
+- **Where the launcher cannot budget.** With no gateway listening it runs `cargo` unbudgeted, as `bounded-exec` does. A
+  sandboxed process cannot reach the control socket (above), so its `cargo` runs unbudgeted too. A daemon that inherited
+  `BOUNDED_EXEC_CPU_TOKENS` from a grant and outlives it starts later `cargo` runs capped to that count but outside any
+  grant; an inherited `CARGO_MAKEFLAGS` whose fifo is gone counts as no jobserver.
 
 Tests: `cowshed-gateway`'s `cpu_budget` ledger unit tests (fairness, share, starvation, leave) and `tests/cpu_budget.rs`
 over a real socket (`SIGKILL` of a holding client returns its tokens to the waiter at once; checkouts share the host;
 refusals); the plugin's `cpu-tokens.test.ts` (each runner's `want` and sizing, a killed holder closing its grant) and
-`executor.test.ts` (a granted run sized and released, a refused one run as asked); and a jobserver test in which a
-`SIGKILL`ed `cargo` mid-build leaves the ledger whole and its fifo unlinked.
+`executor.test.ts` (a granted run sized and released, a refused one run as asked); a jobserver test in which a
+`SIGKILL`ed `cargo` mid-build leaves the ledger whole and its fifo unlinked; and the launcher's tests (each of its four
+cases, the `want` it sends, and the variables it sets or leaves on each path).
 
 ## Credentials
 
