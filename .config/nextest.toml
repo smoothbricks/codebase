@@ -1,6 +1,7 @@
 # The one declaration of the real-APFS serial group. The nx plugin derives its
 # runner `cargo-test-group-real-apfs` and every per-crate exclusion from these
-# two tables, so the filter is stated here and nowhere else.
+# two tables, so the filter is stated here and nowhere else but the group's
+# 30s wrapper rule below, which must name exactly the same tests.
 #
 # `max-threads = 1` serializes the group within its one runner process; ordinary
 # per-crate runners exclude these tests with `not (…)` so each runs in exactly one
@@ -10,6 +11,16 @@
 # The exact-name clause is nextest's fully qualified name (module path included),
 # because `test(=…)` matches the whole name. Two inventory rows are deliberately
 # `#[ignore]`d host-controller and contention lanes and stay out of this group.
+#
+# A test's performance bound is on its code time, not its wall time
+# (specs/cowshed/08_testing.md, "Integration tests (real substrate)"): part of
+# its wall time is queued for the host-wide disk-lifecycle lease behind every
+# other cowshed process on the host. Its run-wrapper records those waits and
+# fails a test whose wall time less their union exceeds its class. The 180s
+# slow-timeout is the hang backstop that ends a test nextest would otherwise
+# wait on forever, not the performance bound.
+experimental = ["wrapper-scripts"]
+
 [test-groups.real-apfs]
 max-threads = 1
 
@@ -17,3 +28,31 @@ max-threads = 1
 filter = 'test(/real_apfs_/) or binary(apfs_native_macos) or binary(clone_intent_recovery) or test(=storage::apfs::native::build_volumes::tests::a_jobs_volumes_count_from_admission_through_its_command_to_its_sealed_record)'
 platform = 'cfg(target_os="macos")'
 test-group = 'real-apfs'
+slow-timeout = { period = "180s", terminate-after = 1 }
+
+# The two performance classes. The wrapper is run from the plugin's shipped
+# source, which the group's runner hashes as an input.
+[scripts.wrapper.real-apfs-code-30s]
+command = { command-line = "node_modules/@smoothbricks/nx-plugin/src/nextest-code-bound.ts 30", relative-to = "workspace-root" }
+
+[scripts.wrapper.real-apfs-code-60s]
+command = { command-line = "node_modules/@smoothbricks/nx-plugin/src/nextest-code-bound.ts 60", relative-to = "workspace-root" }
+
+# The full-lifecycle real-APFS tests cannot meet the default class. The 3× rule
+# of specs/cowshed/08_testing.md over the lifecycle's worst idle measurement
+# (14.8s when `apfs_integration.rs` still ran a second image format: 44.4s)
+# rounds up to 60s; the one-format lifecycle measures 6.6-10.6s idle. Its cost
+# is a multiple of the irreducible ~235-400ms attach (08_testing.md, "Attach
+# floor verdict: not flag-reducible"), and splitting the lifecycle into
+# phase-scoped tests would pay that attach again per piece to buy a smaller
+# number. Membership is by name: the fast `real_apfs_*` unit tests keep 30s.
+# The first matching rule wins, so this one precedes the group's default class.
+[[profile.default.scripts]]
+filter = 'test(/real_apfs_.*_substrate_lifecycle/)'
+platform = 'cfg(target_os="macos")'
+run-wrapper = 'real-apfs-code-60s'
+
+[[profile.default.scripts]]
+filter = 'test(/real_apfs_/) or binary(apfs_native_macos) or binary(clone_intent_recovery) or test(=storage::apfs::native::build_volumes::tests::a_jobs_volumes_count_from_admission_through_its_command_to_its_sealed_record)'
+platform = 'cfg(target_os="macos")'
+run-wrapper = 'real-apfs-code-30s'

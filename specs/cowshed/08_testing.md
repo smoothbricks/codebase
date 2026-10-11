@@ -215,17 +215,40 @@ runner's `TMPDIR`. The lease never detaches an image attached from below it; it 
 
 On macOS, real-APFS coverage runs once in the dedicated root `cargo-test-group-real-apfs` target. Its nextest group has
 `max-threads = 1`: the host-global storage lease is serialized by one runner rather than contested by independent
-per-crate shards. `.config/nextest.toml` declares the group's filter once: `real_apfs_*`, the `apfs_native_macos` and
-`clone_intent_recovery` binaries, and the exact qualified job-volume accounting witness. Both ordinary and exceptions
-shards exclude that same declared filter, so no test is duplicated or dropped. Non-macOS planning creates no APFS group.
+per-crate shards. `.config/nextest.toml` declares the group's filter once for the plugin, and its 30s wrapper rule
+(below) restates it exactly: `real_apfs_*`, the `apfs_native_macos` and `clone_intent_recovery` binaries, and the exact
+qualified job-volume accounting witness. Both ordinary and exceptions shards exclude that same declared filter, so no
+test is duplicated or dropped. Non-macOS planning creates no APFS group.
 
 Before the group runs, nextest lists runnable, nonignored matches from the same compiled archive and filter. For `N`
 matches, the target logs `N` and its `N * 30000` millisecond outer budget. Empty or malformed listings, listing failure,
 and a budget exceeding Node's timer range fail closed; the budget is never silently clamped. The ordinary targets keep
-their 120s bound and the default per-test 30s bound stays unchanged. The existing full-lifecycle 60s class overrides
-remain explicit; they can exceed a single test's 30s share of the outer budget. The RAM host walk and real-process
-CPU-pool production-wiring proofs run after this group in `test-host`, outside the four pure Bun shards, with the
-existing target and case bounds. The shards exclude `*-host.test.ts`; the host target names both owned host files.
+their 120s bound and the ordinary per-test 30s bound stays unchanged. The group's 60s lifecycle class can exceed a
+single test's 30s share of the outer budget. The RAM host walk and real-process CPU-pool production-wiring proofs run
+after this group in `test-host`, outside the four pure Bun shards, with the existing target and case bounds. The shards
+exclude `*-host.test.ts`; the host target names both owned host files.
+
+**A real-APFS test's bound is on its code time.** Every disk command a test's process tree runs first queues for the
+host-wide disk-lifecycle lease (05_gateway.md, "Disk-lifecycle lease") behind every other cowshed process on the host:
+the same warm-fork walk took 37-70s on a loaded host with 0.2-28s of it spent waiting for grants, against a 25s run when
+nothing waited, and one 7.7s wait admitted a 73ms unmount. A wall-clock bound measured that queue, not the test. So each
+group test runs under the `nextest-code-bound.ts` run-wrapper the `@smoothbricks/nx-plugin` ships, named in
+`.config/nextest.toml`. The wrapper creates a fresh lease-wait record, names it in `COWSHED_LEASE_WAIT_RECORD`, which
+every process of the test inherits, and runs the test binary. Every disk-lease client — cowshed-core's `leased` and the
+plugin's `takeDiskLease` — appends `start <pid> <seq> <unix-µs> <class>` before it asks and `end <pid> <seq> <unix-µs>`
+when the wait ends, granted or not, unwinding included; each line is one append, so concurrent writers never interleave.
+After the test exits, the wrapper prints its wall time, the union of its waits clipped to the run (waits of concurrent
+threads and processes, as a sweep beside a teardown, count once) and their difference, its code time, and fails a
+passing test whose code time exceeds its class. A failing test keeps its own exit status. The record cannot undercount a
+wait whose process died: the start is written before the wait, so a start with no end — its process killed while
+waiting, or still waiting — counts to the test's end and is named. A record that cannot be written is said once per
+process and its waits then count as code time; an end with no start counts as code time and is named; a record the
+wrapper cannot parse fails the test. The classes are declared once, as the wrapper rules of `.config/nextest.toml`: 60s
+for `test(/real_apfs_.*_substrate_lifecycle/)` (3× the lifecycle's worst idle measurement, 44.4s, rounded up), and 30s
+for every other group test; the 30s rule names exactly the group's filter. The group's nextest `slow-timeout` is 180s
+with `terminate-after = 1`: the hang backstop that ends a test which never returns, not its performance bound. It is the
+only killer: a test over its class runs to its own teardown and fails after it, since a killed test leaves its images
+attached until the next run's sweep (01_storage.md, "How the APFS host degrades" §2).
 
 **Host limit.** The host's disk-image attach pool runs out (01_storage.md, "How the APFS host degrades" §2), and the
 suite stops spending into a spent one. Fixtures attach an image once and share it across the assertions that need it

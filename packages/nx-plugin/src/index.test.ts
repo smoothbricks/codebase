@@ -2130,6 +2130,8 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(group?.options).not.toHaveProperty('timeoutMs');
       expect(group?.options?.killAfterMs).toBe(BOUNDED_TEST_KILL_AFTER_MS);
       expect(group?.inputs).toContain('{workspaceRoot}/packages/rusty/.config/nextest.toml');
+      expect(JSON.stringify(group?.inputs)).toContain('nextest-code-bound.ts');
+      expect(JSON.stringify(macos['cargo-test-small']?.inputs)).not.toContain('nextest-code-bound.ts');
       for (const command of [group?.options?.command, group?.options?.listCommand]) {
         expect(String(command)).not.toMatch(/--partition|test-threads|parallelism|max-fail/);
       }

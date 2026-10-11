@@ -469,24 +469,24 @@ Concrete targets come from concrete files:
   and a stale `N` can only make a target slow — never drop a test. Omitting the key means one target, as before.
 - Tests that a `nextest.toml` override singles out run separately in `cargo-test-<package>-exceptions-shard1..N`, using
   the same declared partition count. Ordinary shards run the complement of that class and of every declared serial group
-  (below), so the union still covers every test exactly once. The plugin's own overrides raise `slow-timeout` for
-  compile-fail tests and for the real-APFS full-lifecycle tests; lifting them out keeps their raised bound from delaying
-  an ordinary shard, and partitioning the class keeps every target inside its deadline without relaxing it. The
-  remaining non-group exceptional tests stay normally schedulable under the existing bounds. Every piece runs
-  `--no-fail-fast`, so a failing test does not stop the rest of its piece. The exceptional filter is the union of the
-  overrides in the plugin's own `nextest.toml`, so adding one there is the whole change to that class. Serial groups are
-  classified separately, by `test-group` overrides in the workspace's `.config/nextest.toml`; the plugin's file declares
-  none. Only sharded crates need these targets; an unsharded crate already runs all its non-group tests in one process.
-  Empty partitions pass, including platforms where the tests are `cfg`-ed out. `nextest-partitions.test.ts` executes the
-  inferred archive and shard commands over 30 tests and asserts that the ordinary shards ran exactly the 13 ordinary
-  tests once and the exceptional shards exactly the 13 exceptional ones. The suite builds one shared fixture and
-  archive, then runs separate bounded cases through the real default serial-group executor: a successful count and run
-  with the group's probes exactly once each, three refusals that run nothing and clear the task's previous verdict, and
-  a failing run whose ordinary failures still run the group's remaining probes. The shared fixture first produces one
-  real passing verdict, before any case runs. Each refusal copies that seed and removes its own marker log, so neither a
-  timed-out success case nor a prior refusal that wrongly ran can become another case's precondition. The success case
-  still runs and verifies the real executor independently. Each case settles its owned processes before the next case
-  starts; the fixture is removed only after the final settlement.
+  (below), so the union still covers every test exactly once. The plugin's own override raises `slow-timeout` for
+  compile-fail tests; lifting them out keeps their raised bound from delaying an ordinary shard, and partitioning the
+  class keeps every target inside its deadline without relaxing it. The remaining non-group exceptional tests stay
+  normally schedulable under the existing bounds. Every piece runs `--no-fail-fast`, so a failing test does not stop the
+  rest of its piece. The exceptional filter is the union of the overrides in the plugin's own `nextest.toml`, so adding
+  one there is the whole change to that class. Serial groups are classified separately, by `test-group` overrides in the
+  workspace's `.config/nextest.toml`; the plugin's file declares none. Only sharded crates need these targets; an
+  unsharded crate already runs all its non-group tests in one process. Empty partitions pass, including platforms where
+  the tests are `cfg`-ed out. `nextest-partitions.test.ts` executes the inferred archive and shard commands over 29
+  tests and asserts that the ordinary shards ran exactly the 13 ordinary tests once and the exceptional shards exactly
+  the 12 exceptional ones. The suite builds one shared fixture and archive, then runs separate bounded cases through the
+  real default serial-group executor: a successful count and run with the group's probes exactly once each, three
+  refusals that run nothing and clear the task's previous verdict, and a failing run whose ordinary failures still run
+  the group's remaining probes. The shared fixture first produces one real passing verdict, before any case runs. Each
+  refusal copies that seed and removes its own marker log, so neither a timed-out success case nor a prior refusal that
+  wrongly ran can become another case's precondition. The success case still runs and verifies the real executor
+  independently. Each case settles its owned processes before the next case starts; the fixture is removed only after
+  the final settlement.
 - A repository's serial test groups each run in one runner, `cargo-test-group-<group>`, owned by the cargo workspace
   root beside `cargo-test-archive`. A group is declared once, in `<cargo-workspace>/.config/nextest.toml`: a
   `[test-groups.<group>]` table with `max-threads = 1`, and default-profile overrides that name it with `test-group` and
@@ -497,12 +497,15 @@ Concrete targets come from concrete files:
   (`nextest list --message-format=json`, same archive and reuse flags) under the existing bounded runner, counts the
   matching non-ignored tests, and runs the group under a bound of that count × 30 s. Both stages ask the bounded
   executor for one CPU token, matching the group's one runnable test process instead of reserving idle host capacity.
-  The bound is aggregate, not a per-test limit; the real-APFS lifecycle override stays at 60 s. The run carries
-  `--no-fail-fast`: an ordinary test failure does not stop the group's remaining tests, and a failed verdict lists the
-  failed ones. A listing that fails, does not parse, or selects no test refuses before anything runs, clears this task's
-  previous verdict and report, and fails the group rather than running it unbounded. Ignored tests keep their explicit
-  lane. The root's `cargo-test` and every member's `cargo-test` depend on the group. A crate named `group-*` is refused,
-  since its runner name would collide.
+  The bound is aggregate, not a per-test limit; the real-APFS lifecycle tests keep their 60 s code bound in the
+  repository's run-wrapper. The run carries `--no-fail-fast`: an ordinary test failure does not stop the group's
+  remaining tests, and a failed verdict lists the failed ones. A listing that fails, does not parse, or selects no test
+  refuses before anything runs, clears this task's previous verdict and report, and fails the group rather than running
+  it unbounded. Ignored tests keep their explicit lane. The root's `cargo-test` and every member's `cargo-test` depend
+  on the group. A crate named `group-*` is refused, since its runner name would collide. A repository's serial group may
+  bound each test's code time with a nextest run-wrapper from the plugin's source (`src/nextest-code-bound.ts`); the
+  group's target hashes that file as an input, so changing it reruns the group (`specs/cowshed/08_testing.md`,
+  "Integration tests (real substrate)").
 - Canonical `napi` package metadata provides a host `cargo-napi` target and named release targets for each configured
   triple. Linux `--use-napi-cross` targets compile C/C++ dependencies with Clang; the NAPI CLI supplies its downloaded
   GNU sysroot and toolchain flags. This avoids the bundled GCC's unsupported diagnostics-color flag without disabling

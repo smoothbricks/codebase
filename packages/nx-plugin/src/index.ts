@@ -498,6 +498,13 @@ function cargoRuntimeInput(projectRoot: string, command: string): { runtime: str
   return runtimeInput(`sh -c ${shellWord(`cd "$0" && ${command}`)} ${shellWord(projectRoot)}`);
 }
 
+/** A runtime input that changes when the file's bytes do: the runtime hashes the file itself. */
+function fileHashInput(path: string): { runtime: string } {
+  return runtimeInput(
+    `bun -e 'console.log(new Bun.CryptoHasher("sha256").update(require("node:fs").readFileSync(process.argv[1])).digest("hex"))' ${shellWord(path)}`,
+  );
+}
+
 /**
  * One shell command that runs `steps` in order and stops at the first failure.
  *
@@ -859,6 +866,11 @@ function createCargoTestTarget(projectRoot: string): TargetConfiguration {
 }
 
 const PLUGIN_NEXTEST_CONFIG = fileURLToPath(new URL('../nextest.toml', import.meta.url));
+/**
+ * The nextest run-wrapper a serial group names to bound each test's code time.
+ * The group's target hashes it, so changing the wrapper reruns the group.
+ */
+const PLUGIN_NEXTEST_CODE_BOUND = fileURLToPath(new URL('../src/nextest-code-bound.ts', import.meta.url));
 
 const PLUGIN_PACKAGE = '@smoothbricks/nx-plugin';
 /**
@@ -2654,9 +2666,7 @@ async function cargoTestRunnerInputs(
       ...workspace.packages.map((member) => posix.join(inputRoot, member.package.dir, 'Cargo.toml')),
       posix.join(inputRoot, NEXTEST_REPO_CONFIG_PATH),
     ]),
-    runtimeInput(
-      `bun -e 'console.log(new Bun.CryptoHasher("sha256").update(require("node:fs").readFileSync(process.argv[1])).digest("hex"))' ${shellWord(PLUGIN_NEXTEST_CONFIG)}`,
-    ),
+    fileHashInput(PLUGIN_NEXTEST_CONFIG),
   ];
 }
 
@@ -2721,7 +2731,7 @@ function cargoTestGroupTarget(
   return {
     executor: NEXTEST_GROUP_EXECUTOR,
     cache: true,
-    inputs,
+    inputs: [...inputs, fileHashInput(PLUGIN_NEXTEST_CODE_BOUND)],
     dependsOn: [CARGO_TEST_ARCHIVE_TARGET],
     options: {
       command: nextestRunnerCommand(workspace, 'run', group.filter, ' --no-fail-fast --no-tests=pass'),

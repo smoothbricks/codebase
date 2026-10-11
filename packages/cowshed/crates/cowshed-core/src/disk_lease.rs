@@ -10,15 +10,21 @@
 //! gateway that predates leases, a refusal, or a wait past [`DISK_CHILD_DEADLINE`], the command
 //! runs unleased and the wait span ends `status=err` with the reason beside it — except a gateway
 //! that is not running at all, which is said once per process rather than once per command.
+//!
+//! A test's lease waits are the host's queue, not its code. When [`LEASE_WAIT_RECORD_ENV`] names
+//! a file, every wait is also appended to it (08_testing.md, "Integration tests (real
+//! substrate)"), so the real-APFS lane's wrapper can judge the test's code time without them.
 
 use std::ffi::OsStr;
 use std::fmt;
+use std::fs::OpenOptions;
 use std::io::{self, BufRead, BufReader, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::UnixStream;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cowshed_gateway_types::{DiskClass, DiskLeaseAnswer, DiskLeaseRequest, LeaseState};
 
@@ -84,6 +90,7 @@ fn lease_then<T, E: fmt::Display>(
     unleased_by: impl FnOnce(&Unleased),
     run: impl FnOnce() -> Result<T, E>,
 ) -> Result<T, E> {
+    let waiting = RECORD.as_ref().map(|record| record.begin(class));
     let stream = match UnixStream::connect(socket) {
         Ok(stream) => stream,
         Err(error) => {
@@ -94,12 +101,14 @@ fn lease_then<T, E: fmt::Display>(
                     socket.display()
                 );
             }
+            drop(waiting);
             return run();
         }
     };
     let lease = crate::timing::timed("disk-lease", format_args!("{class} wait"), || {
         acquire(stream, class, command, Bounds::PRODUCTION)
     });
+    drop(waiting);
     match lease {
         Ok(_lease) => crate::timing::timed("disk-lease", format_args!("{class} phase"), run),
         Err(unleased) => {
@@ -208,6 +217,89 @@ fn remember_predates(unleased: &Unleased) {
     if matches!(unleased, Unleased::Predates(_)) {
         PREDATES_SEEN.store(since_epoch() + 1, Ordering::Relaxed);
     }
+}
+
+/// Names the file a test's lease waits are appended to; unset outside the real-APFS lane.
+pub const LEASE_WAIT_RECORD_ENV: &str = "COWSHED_LEASE_WAIT_RECORD";
+
+/// This process's lease-wait record, when its environment names one.
+static RECORD: LazyLock<Option<WaitRecord>> =
+    LazyLock::new(|| std::env::var_os(LEASE_WAIT_RECORD_ENV).map(WaitRecord::new));
+
+/// The file every lease wait of one test's process tree is appended to, one line per edge:
+/// `start <pid> <seq> <unix-µs> <class>` before the client asks, and `end <pid> <seq> <unix-µs>`
+/// once the wait is over, granted or not. Each line is one append, so the lines of concurrent
+/// processes never interleave. The start goes first so that a process killed while waiting still
+/// leaves its wait in the record, open, for the judge to name.
+#[derive(Debug)]
+struct WaitRecord {
+    path: PathBuf,
+    next: AtomicU64,
+    failed: AtomicBool,
+}
+
+/// One wait in progress; dropping it, on any path, unwinding included, appends its end.
+struct Waiting<'a> {
+    record: &'a WaitRecord,
+    seq: u64,
+}
+
+impl WaitRecord {
+    fn new(path: std::ffi::OsString) -> Self {
+        Self {
+            path: PathBuf::from(path),
+            next: AtomicU64::new(0),
+            failed: AtomicBool::new(false),
+        }
+    }
+
+    fn begin(&self, class: DiskClass) -> Waiting<'_> {
+        let seq = self.next.fetch_add(1, Ordering::Relaxed);
+        self.append(&format!(
+            "start {} {seq} {} {class}\n",
+            std::process::id(),
+            unix_micros()
+        ));
+        Waiting { record: self, seq }
+    }
+
+    /// Append one line. A record that cannot be written is said once per process: this process's
+    /// waits then count as the test's code time, which can only fail the bound, never pass it.
+    fn append(&self, line: &str) {
+        let written = OpenOptions::new()
+            .append(true)
+            .create(true)
+            .mode(0o600)
+            .open(&self.path)
+            .and_then(|mut file| file.write_all(line.as_bytes()));
+        if let Err(error) = written
+            && !self.failed.swap(true, Ordering::Relaxed)
+        {
+            eprintln!(
+                "cowshed: disk-lease wait record {} is unwritable ({error}); this process's lease \
+                 waits count as its test's code time",
+                self.path.display()
+            );
+        }
+    }
+}
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        self.record.append(&format!(
+            "end {} {} {}\n",
+            std::process::id(),
+            self.seq,
+            unix_micros()
+        ));
+    }
+}
+
+/// Wall-clock microseconds since the Unix epoch: the one clock every process of a test shares.
+fn unix_micros() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_micros())
 }
 
 /// Ask for a `class` lease on `stream` for `command` and wait for the grant.
@@ -474,5 +566,46 @@ mod tests {
             Err(Unleased::NotGranted(_))
         ));
         server.join().expect("server");
+    }
+
+    #[test]
+    fn a_wait_is_recorded_as_a_start_before_it_and_an_end_after_it_however_it_ends() {
+        let path = std::path::PathBuf::from(format!(
+            "/tmp/cowshed-dl-{}.waits",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let record = WaitRecord::new(path.clone().into_os_string());
+        let before = unix_micros();
+        let first = record.begin(DiskClass::Storage);
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _second = record.begin(DiskClass::Namespace);
+            panic!("the command's wait unwinds");
+        }));
+        assert!(unwound.is_err());
+        drop(first);
+        let after = unix_micros();
+        let text = std::fs::read_to_string(&path).expect("record");
+        std::fs::remove_file(&path).expect("remove record");
+        let pid = std::process::id().to_string();
+        let lines: Vec<Vec<&str>> = text.lines().map(|line| line.split(' ').collect()).collect();
+        let edges: Vec<(&str, &str, &str)> = lines
+            .iter()
+            .map(|fields| (fields[0], fields[1], fields[2]))
+            .collect();
+        assert_eq!(
+            edges,
+            [
+                ("start", pid.as_str(), "0"),
+                ("start", pid.as_str(), "1"),
+                ("end", pid.as_str(), "1"),
+                ("end", pid.as_str(), "0"),
+            ]
+        );
+        assert_eq!(lines[0].get(4), Some(&"storage"));
+        assert_eq!(lines[1].get(4), Some(&"namespace"));
+        for fields in &lines {
+            let at: u128 = fields[3].parse().expect("microseconds");
+            assert!((before..=after).contains(&at), "{fields:?}");
+        }
     }
 }

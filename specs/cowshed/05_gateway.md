@@ -379,6 +379,9 @@ exclude each other rather than N interchangeable tokens.
   with an `unleased=<reason>` line, when the command runs unleased), and `disk-lease <class> phase`, around the command
   the grant admitted. With `COWSHED_TIMING` set, the gateway prints each phase as it drains: its class, how long it ran,
   its members, and how many it evicted.
+- **A test's waits are recorded.** When `COWSHED_LEASE_WAIT_RECORD` names a file, every client also appends each wait's
+  start before it asks and its end once the wait is over, so the real-APFS lane can bound a test's code time without the
+  host's queue (08_testing.md, "Integration tests (real substrate)"). Nothing on the wire changes.
 
 The regression is `cowshed-gateway`'s `contention_attaches_stay_fast_beside_mount_churn_only_under_the_lease`, run by
 name with `--ignored`: eight real attach/detach loops beside two real mount loops for 40 s, first through a real

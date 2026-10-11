@@ -29,13 +29,12 @@ const GROUP_HASH = 'serial-probe-hash';
 const SERIAL_FILTER_ARG = "-E '(test(/serial_probe_/))'";
 
 const ordinary = Array.from({ length: 13 }, (_, index) => `ordinary_${index}`);
-// The classes the plugin's nextest.toml singles out with an override: a
-// compile-fail test and the real-APFS lifecycle test each carry a raised
-// slow-timeout, so each is lifted out of the ordinary hash.
+// The class the plugin's nextest.toml singles out with an override: the
+// compile-fail tests carry a raised slow-timeout, so they are lifted out of the
+// ordinary hash.
 const exceptional = [
   ...Array.from({ length: 6 }, (_, index) => `compile_fail_partition_${index}`),
   ...Array.from({ length: 6 }, (_, index) => `partition_${index}_fail_to_compile`),
-  'real_apfs_partition_substrate_lifecycle',
 ];
 const serial = Array.from({ length: 4 }, (_, index) => `serial_probe_${index}`);
 const expected = [...ordinary, ...exceptional, ...serial];
