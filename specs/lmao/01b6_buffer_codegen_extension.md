@@ -45,10 +45,11 @@ that single decision through `activeMaterializerMode()`:
 The decision is fixed for the process, so one schema never has both class kinds live. Build sites do not catch
 `EvalError`: a refusal on the compiled path is a selection bug and surfaces as one. `setMaterializerModeOverride` forces
 a mode for parity suites (forcing `compiled` where codegen is unsupported throws), and class caches are keyed by mode.
-`packages/lmao/src/lib/__tests__/workerd-request-codegen.test.ts` reproduces workerd's policy in a fresh process —
-codegen allowed while modules evaluate, refused afterwards — and requires every class to build and write, both when
-`navigator` identifies workerd and when only `WebSocketPair` does. With neither signal the same process fails with
-`EvalError` on its first class build, which shows that the refusal reaches the compiled path.
+`packages/arrow-builder/src/lib/buffer/__tests__/workerdRequestCodegen.test.ts` (ColumnBuffer/ColumnWriter) and
+`packages/lmao/src/lib/__tests__/workerd-request-codegen.test.ts` (every class above) reproduce workerd's policy in a
+fresh process — codegen allowed while modules evaluate, refused afterwards — and require each class to build and write,
+both when `navigator` identifies workerd and when only `WebSocketPair` does. With neither signal the same process fails
+with `EvalError` on its first class build, which shows that the refusal reaches the compiled path.
 
 ## ColumnBuffer Extension Mechanism <a id="smoo/lmao!n/buffer-codegen-extension-mechanism"></a>
 
