@@ -22,6 +22,8 @@ with `tsconfig.lib.json` receives transformer-aware `tsc-js` and native `typeche
 - `test-watch` from explicit `test` commands for Bun and Vitest packages
 - Cargo workspace targets from a neighboring workspace-root `Cargo.toml`
 - aggregate `build` and `lint` targets
+- an uncached `shard-timings` check, which `lint` depends on, beside `bun test` targets sharded with `--shard` and
+  balanced with `--timings`
 - an uncached `deploy` for a PRIVATE project with a wrangler manifest, running
   `smoo wrangler deploy-stage --stage {args.stage}`
 
@@ -71,10 +73,14 @@ The plugin's own `nx run nx-plugin:test` aggregates four bounded Bun targets. Ea
 every test file (including newly added files) exactly once. A failed shard fails the aggregate. The shard count and
 standard 120-second target deadline stay unchanged. Bun cuts the path-sorted files into four contiguous runs and costs a
 file the manifest does not name at the manifest's median, so files added without a refresh cluster into one shard and
-can push it past its deadline. Refresh the portable timing manifest from this package directory after adding or slowing
-a test file, with
-`bun test --timeout=30000 --timings=test-timings.json --update-timings --path-ignore-patterns='**/*-host.test.ts'`; it
-is scheduling data, not a test allowlist.
+can push it past its deadline. The inferred `shard-timings` target makes that loud instead: for any project whose
+`bun test` targets carry both `--shard=N/M` and `--timings=<file>`, it replays Bun's discovery rules without running a
+test and fails naming every file the shards would run that the manifest does not name, with the refresh command
+`smoo nx refresh-test-timings <project>`. That command runs the suite once without `--shard`, adding `--update-timings`,
+and then repeats the check. Refresh after adding or slowing a test file; the manifest is scheduling data, not a test
+allowlist. The shards of one suite must share one cwd and every argument but `--shard`, pass flag values as
+`--flag=value`, and use no shell syntax beyond quoting; a shard command that breaks this fails graph construction,
+because the files it runs could only be guessed.
 
 Real Nx fixtures own their cache and workspace-data directories and stop their daemon before removing the fixture.
 Retirement also drains processes whose working directory is inside the fixture when no daemon record exists: startup may

@@ -1,9 +1,16 @@
+import { join, posix } from 'node:path';
+import {
+  refreshTestTimingsCommand,
+  timingsCoverage,
+  timingsShardedSuite,
+  untimedTestFilesReport,
+} from '@smoothbricks/nx-plugin/test-timings';
 // Nx package exports are CLI-oriented; this is the module the CLI uses for graph + daemon IPC.
 import { createProjectGraphAsync } from 'nx/src/project-graph/project-graph.js';
 import { workspaceRoot as primaryWorkspaceRoot } from 'nx/src/utils/workspace-root.js';
 import typia from 'typia';
 import type { NxDependsOn, NxProjectJson, NxTargetConfig, NxTargetOptions } from '../lib/json.js';
-import { printCommandOutput, runResult } from '../lib/run.js';
+import { printCommandOutput, runResult, runStatus } from '../lib/run.js';
 
 export interface ProjectTargets {
   project: string;
@@ -188,6 +195,41 @@ export async function listProjects(root: string, options: { withTarget?: string 
   if (projects) {
     console.log(projects);
   }
+}
+
+/**
+ * Runs the project's timings-sharded Bun suite once, unsharded, with `--update-timings`, so Bun rewrites the first
+ * `--timings` manifest with every file's measured duration, then proves the manifest names every file the shards run.
+ */
+export async function refreshTestTimings(root: string, projectName: string): Promise<void> {
+  const projects = await loadNxProjects(root);
+  const project = projects[projectName];
+  if (project === undefined) {
+    throw new Error(`No Nx project is named ${projectName}`);
+  }
+  const found = timingsShardedSuite(project.root ?? '.', project.targets ?? {});
+  if (!found.ok) {
+    throw new Error(`${projectName}: ${found.error}`);
+  }
+  if (found.suite === null) {
+    throw new Error(`${projectName} has no bun test target with both --shard and --timings`);
+  }
+  const status = await runStatus('bun', ['test', ...found.suite.args, '--update-timings'], join(root, found.suite.cwd));
+  if (status !== 0) {
+    throw new Error(
+      `bun test exited ${status}; Bun still wrote this failing run's durations, so fix the suite and run ${refreshTestTimingsCommand(projectName)} again`,
+    );
+  }
+  const checked = await timingsCoverage(root, found.suite);
+  if (!checked.ok) {
+    throw new Error(checked.error);
+  }
+  if (checked.coverage.untimed.length > 0) {
+    throw new Error(untimedTestFilesReport(projectName, found.suite.cwd, checked.coverage));
+  }
+  console.log(
+    `${posix.join(found.suite.cwd, checked.coverage.manifests[0] ?? '')} now times all ${checked.coverage.files.length} test files of ${projectName}`,
+  );
 }
 
 export type NxProjects = Readonly<Record<string, NxProjectJson>>;

@@ -717,6 +717,42 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
     }
   });
 
+  it('makes lint check that the timing manifest names every file a timings-sharded Bun suite runs', async () => {
+    const workspace = await createWorkspace();
+    try {
+      const shard = (n: number) => ({
+        executor: '@smoothbricks/nx-plugin:bounded-exec',
+        options: { command: `bun test --timings=test-timings.json --shard=${n}/2`, cwd: '{projectRoot}' },
+      });
+      await workspace.write(
+        'packages/sharded/package.json',
+        JSON.stringify({ name: 'sharded', nx: { targets: { 'test-a': shard(1), 'test-b': shard(2) } } }),
+      );
+      await workspace.write(
+        'packages/counted/package.json',
+        JSON.stringify({
+          name: 'counted',
+          nx: { targets: { 'test-a': { options: { command: 'bun test --shard=1/1', cwd: '{projectRoot}' } } } },
+        }),
+      );
+
+      const sharded = await inferProjectTargets(workspace, 'packages/sharded/package.json');
+      const counted = await inferProjectTargets(workspace, 'packages/counted/package.json');
+
+      expect(sharded['shard-timings']).toEqual({
+        executor: '@smoothbricks/nx-plugin:shard-timings',
+        cache: false,
+        outputs: [],
+        options: { cwd: 'packages/sharded', args: ['--timings=test-timings.json'] },
+      });
+      expect(sharded.lint?.dependsOn).toEqual(['shard-timings']);
+      expect(counted['shard-timings']).toBeUndefined();
+      expect(counted.lint).toBeUndefined();
+    } finally {
+      await workspace.cleanup();
+    }
+  });
+
   it('infers aggregate build for package-local output targets without owning them', async () => {
     const workspace = await createWorkspace();
     try {
