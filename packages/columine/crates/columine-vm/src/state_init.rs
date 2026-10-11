@@ -4,7 +4,6 @@
 //! - [`init_state`] initializes the state buffer.
 //! - [`reset_state`] reinitializes it in place.
 //! - [`calculate_grown_state_size`] and [`grow_state`] resize one slot.
-//! - [`needs_growth_slot`] reports the slot that requested growth.
 //!
 //! Struct-layout helpers used by initialization and execution live here.
 //! Their formulas intentionally differ from the general type helpers:
@@ -35,21 +34,11 @@ use columine_types::types::{
     has_arena_fields, is_arena_field_type, next_power_of_2, state_num_slots,
 };
 use core::mem::size_of;
-use core::sync::atomic::{AtomicU32, Ordering};
 
-/// [`needs_growth_slot`] when no growth is pending: no slot has this index.
+/// The `vm_get_needs_growth_slot` ABI value for a VM whose last batch did not
+/// ask for growth ([`crate::vm::Vm::needs_growth_slot`] is `None`): no slot
+/// has this index.
 pub const NO_GROWTH_SLOT: u32 = u32::MAX;
-
-/// Slot that triggered `NEEDS_GROWTH`, or [`NO_GROWTH_SLOT`] when none is
-/// pending. Relaxed atomics preserve the single-threaded wasm global without
-/// `static mut`.
-pub static NEEDS_GROWTH_SLOT: AtomicU32 = AtomicU32::new(NO_GROWTH_SLOT);
-
-/// `vm_get_needs_growth_slot` — the slot that triggered NEEDS_GROWTH, or
-/// [`NO_GROWTH_SLOT`].
-pub fn needs_growth_slot() -> u32 {
-    NEEDS_GROWTH_SLOT.load(Ordering::Relaxed)
-}
 
 pub const EVICTION_ENTRY_SIZE: u32 = size_of::<EvictionEntry>() as u32;
 /// Closed-form capacity of the optional evicted-row side buffer.

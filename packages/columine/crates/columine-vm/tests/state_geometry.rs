@@ -231,7 +231,7 @@ proptest::proptest! {
             let result = vm.execute_batch_delta(&mut state, &program, &[&keys, &values], pairs.len() as u32);
             if result == ErrorCode::Ok as u32 { break; }
             proptest::prop_assert_eq!(result, ErrorCode::NeedsGrowth as u32);
-            let slot = state_init::needs_growth_slot();
+            let slot = vm.needs_growth_slot().expect("NEEDS_GROWTH names its slot");
             let required = state_init::calculate_grown_state_size(&committed, slot).expect("checked growth");
             let mut grown = vec![0; required as usize];
             let active_checkpoint = vm.undo_checkpoint();

@@ -20,7 +20,6 @@ use columine_types::PROGRAM_MAGIC;
 use columine_types::types::{ErrorCode, Opcode, SlotType};
 use columine_vm::state_init::{
     DEFAULT_ACCEPTED_PROGRAM_MAGICS, calculate_grown_state_size, calculate_state_size, init_state,
-    needs_growth_slot,
 };
 use columine_vm::vm::{Vm, u32s_as_bytes};
 
@@ -179,7 +178,7 @@ fn stream(batches: u32, rows: usize, new_percent: u64) {
             match run(&mut vm, &mut state, &prog, &keys) {
                 OK => break,
                 NEEDS_GROWTH => {
-                    let slot = needs_growth_slot();
+                    let slot = vm.needs_growth_slot().expect("NEEDS_GROWTH names its slot");
                     let size = calculate_grown_state_size(&state, slot).expect("grown size");
                     let mut next = vec![0u8; size as usize];
                     vm.grow_state(&state, &mut next, slot).expect("grow");

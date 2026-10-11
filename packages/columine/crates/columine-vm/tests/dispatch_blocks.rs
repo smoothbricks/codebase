@@ -11,8 +11,7 @@ use columine_types::types::{
 use columine_vm::bytes;
 use columine_vm::state_init::{
     ARENA_HEADER_SIZE, DEFAULT_ACCEPTED_PROGRAM_MAGICS, ProgramInvalidCause, SizingRefusal,
-    calculate_grown_state_size, calculate_state_size, grow_state, init_state, needs_growth_slot,
-    struct_field_offset,
+    calculate_grown_state_size, calculate_state_size, grow_state, init_state, struct_field_offset,
 };
 use columine_vm::vm::{CheckedStructMap, Vm, f64s_as_bytes, u32s_as_bytes};
 
@@ -769,7 +768,7 @@ fn top_level_struct_map_array_overflow_requests_slot_growth() {
         u32s_as_bytes(&values),
     ];
     assert_eq!(NEEDS_GROWTH, vm.execute_batch(&mut state, &prog, &cols, 1),);
-    assert_eq!(0, needs_growth_slot());
+    assert_eq!(Some(0), vm.needs_growth_slot());
 }
 
 #[test]

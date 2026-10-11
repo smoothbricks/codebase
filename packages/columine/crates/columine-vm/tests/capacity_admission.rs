@@ -23,7 +23,7 @@ use columine_vm::meta::SlotMetaView;
 use columine_vm::nested::{outer_keys_offset, outer_ptrs_offset};
 use columine_vm::state_init::{
     DEFAULT_ACCEPTED_PROGRAM_MAGICS, calculate_grown_state_size, calculate_state_size, init_state,
-    needs_growth_slot, validate_state,
+    validate_state,
 };
 use columine_vm::vm::{CheckedMap, Vm, f64s_as_bytes, u32s_as_bytes};
 use proptest::prelude::*;
@@ -143,7 +143,8 @@ fn run_growing(vm: &mut Vm, state: &mut Vec<u8>, prog: &[u8], cols: &[&[u8]], ro
             OK => return,
             NEEDS_GROWTH => {
                 assert_eq!(&before, state, "a refused batch wrote state");
-                *state = grow(vm, state, needs_growth_slot());
+                let slot = vm.needs_growth_slot().expect("NEEDS_GROWTH names its slot");
+                *state = grow(vm, state, slot);
             }
             other => panic!("batch refused with {other}"),
         }
@@ -227,7 +228,7 @@ fn each_tier_answers_only_what_the_tier_before_cannot() {
         upsert(&mut vm, &mut state, &prog, &[1, 2, 200])
     );
     assert_eq!(before, state);
-    assert_eq!(0, needs_growth_slot());
+    assert_eq!(Some(0), vm.needs_growth_slot());
     assert_eq!(1, counts(&vm).refused);
 
     vm.undo_enable(&state).expect("window");
@@ -413,7 +414,7 @@ fn each_tier_answers_only_what_the_tier_before_cannot() {
         upsert(&mut vm, &mut state, &into_full, &[key + 1])
     );
     assert_eq!(before, state);
-    assert_eq!(1, needs_growth_slot());
+    assert_eq!(Some(1), vm.needs_growth_slot());
 }
 
 /// A state a host supplies (a restored checkpoint, an uploaded image) is
@@ -1081,9 +1082,15 @@ fn nested_initial_containers_are_admitted_against_the_spent_arena() {
     ];
     loop {
         let mut trial = state.clone();
-        match Vm::default().execute_batch(&mut trial, &prog, &cols, 160) {
+        let mut trial_vm = Vm::default();
+        match trial_vm.execute_batch(&mut trial, &prog, &cols, 160) {
             OK => break,
-            NEEDS_GROWTH => state = grow(&mut vm, &state, needs_growth_slot()),
+            NEEDS_GROWTH => {
+                let slot = trial_vm
+                    .needs_growth_slot()
+                    .expect("NEEDS_GROWTH names its slot");
+                state = grow(&mut vm, &state, slot);
+            }
             other => panic!("trial batch refused with {other}"),
         }
     }

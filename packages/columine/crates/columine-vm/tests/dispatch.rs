@@ -12,7 +12,6 @@ use columine_vm::bytes;
 use columine_vm::meta::SlotMetaView;
 use columine_vm::state_init::{
     EVICTION_ENTRY_SIZE, calculate_grown_state_size, calculate_state_size, grow_state, init_state,
-    needs_growth_slot,
 };
 use columine_vm::struct_map::{StructMap2Slot, StructMapSlot};
 use columine_vm::vm::{
@@ -429,7 +428,7 @@ fn ttl_eviction_index_overflow_returns_needs_growth_instead_of_dropping() {
     ];
     let before = state.clone();
     assert_eq!(NEEDS_GROWTH, vm.execute_batch(&mut state, &prog, &cols, 1));
-    assert_eq!(0, needs_growth_slot());
+    assert_eq!(Some(0), vm.needs_growth_slot());
     assert_eq!(before, state, "the refused batch writes nothing");
 
     // An index capacity that disagrees with its slot is no valid geometry:
@@ -498,7 +497,7 @@ fn slot_growth_hashmap_capacity_exceeded_triggers_needs_growth() {
     let val = [1000u32];
     let cols: Vec<&[u8]> = vec![u32s_as_bytes(&key), u32s_as_bytes(&val)];
     assert_eq!(NEEDS_GROWTH, vm.execute_batch(&mut state, &prog, &cols, 1));
-    assert_eq!(0, needs_growth_slot());
+    assert_eq!(Some(0), vm.needs_growth_slot());
 }
 
 #[test]
@@ -3376,7 +3375,7 @@ fn growth_reports_and_grows_a_slot_past_one_byte() {
     let cols: Vec<&[u8]> = vec![u32s_as_bytes(&elems)];
     let mut vm = Vm::default();
     assert_eq!(NEEDS_GROWTH, vm.execute_batch(&mut state, &prog, &cols, 40));
-    assert_eq!(needs_growth_slot(), 299);
+    assert_eq!(vm.needs_growth_slot(), Some(299));
 
     while vm.execute_batch(&mut state, &prog, &cols, 40) == NEEDS_GROWTH {
         let mut grown = vec![
@@ -3389,6 +3388,35 @@ fn growth_reports_and_grows_a_slot_past_one_byte() {
     }
     let set = CheckedSet::bind(&state, 299).expect("valid set slot");
     assert!(elems.iter().all(|&e| set.contains(e)));
+}
+
+/// Each VM owns its growth register: a second VM's refusal does not rename
+/// the first VM's slot, and a batch that does not ask for growth clears it.
+#[test]
+fn each_vm_names_only_its_own_growth_slot() {
+    const SLOTS: u32 = 300;
+    let wide = wide_set_program(SLOTS, &[(299, 0)]);
+    let narrow = wide_set_program(SLOTS, &[(7, 0)]);
+    let elems: Vec<u32> = (1..=40).collect();
+    let cols: Vec<&[u8]> = vec![u32s_as_bytes(&elems)];
+    let (mut wide_state, mut narrow_state) = (init(&wide), init(&narrow));
+    let (mut wide_vm, mut narrow_vm) = (Vm::default(), Vm::default());
+    assert_eq!(
+        NEEDS_GROWTH,
+        wide_vm.execute_batch(&mut wide_state, &wide, &cols, 40)
+    );
+    assert_eq!(
+        NEEDS_GROWTH,
+        narrow_vm.execute_batch(&mut narrow_state, &narrow, &cols, 40)
+    );
+    assert_eq!(Some(299), wide_vm.needs_growth_slot());
+    assert_eq!(Some(7), narrow_vm.needs_growth_slot());
+
+    let one = [1u32];
+    let cols: Vec<&[u8]> = vec![u32s_as_bytes(&one)];
+    assert_eq!(OK, wide_vm.execute_batch(&mut wide_state, &wide, &cols, 1));
+    assert_eq!(None, wide_vm.needs_growth_slot());
+    assert_eq!(Some(7), narrow_vm.needs_growth_slot());
 }
 
 /// One exported delta window `[from, to)`: its undo and redo segments.

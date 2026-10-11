@@ -30,7 +30,7 @@ use columine_vm::bytes;
 use columine_vm::meta::slot_meta_base;
 use columine_vm::state_init::{
     ARENA_HEADER_SIZE, DEFAULT_ACCEPTED_PROGRAM_MAGICS, ProgramInvalidCause, SizingRefusal,
-    calculate_grown_state_size, calculate_state_size, init_state, needs_growth_slot,
+    calculate_grown_state_size, calculate_state_size, init_state,
 };
 use columine_vm::struct_map::StructMapSlot;
 use columine_vm::vm::{UNDO_CAPACITY, Vm, u32s_as_bytes};
@@ -463,7 +463,8 @@ fn restore_lane(vm: &mut Vm, state: &mut [u8], before: &[u8], checkpoint: u32, d
     assert_eq!(before, &*state, "undo rollback must restore the image");
 }
 
-/// Refused before any row write or journal entry.
+/// Refused before any row write or journal entry. Answers the refusing VM's
+/// growth slot.
 fn assert_refused_untouched(
     what: &str,
     prog: &[u8],
@@ -471,7 +472,7 @@ fn assert_refused_untouched(
     cols: &[&[u8]],
     len: u32,
     expected: ErrorCode,
-) {
+) -> Option<u32> {
     let before = state.to_vec();
     let mut vm = Vm::default();
     vm.undo_enable(state).expect("undo window opens");
@@ -487,6 +488,7 @@ fn assert_refused_untouched(
         vm.undo_checkpoint(),
         "{what}: refusal must not journal"
     );
+    vm.needs_growth_slot()
 }
 
 /// Refused; the host's undo rollback must restore the unchanged image.
@@ -1049,7 +1051,7 @@ fn arena_overflow_refuses_without_row_write_then_growth_compacts_live_bytes() {
     let over = vec![255u8; at(free + 1)];
     let overflowing = Rows::of([(4, over.as_slice())]);
     let growth = ErrorCode::NeedsGrowth;
-    assert_refused_untouched(
+    let refused_slot = assert_refused_untouched(
         "one byte past capacity",
         &prog,
         &mut state,
@@ -1057,7 +1059,7 @@ fn arena_overflow_refuses_without_row_write_then_growth_compacts_live_bytes() {
         overflowing.len(),
         growth,
     );
-    assert_eq!(SLOT, needs_growth_slot());
+    assert_eq!(Some(SLOT), refused_slot);
 
     // Each row fits alone; the pair does not. Capacity admission sums the
     // rows' array bytes before the first write, so the batch refuses with
@@ -1074,7 +1076,7 @@ fn arena_overflow_refuses_without_row_write_then_growth_compacts_live_bytes() {
     vm.undo_enable(&state).expect("undo window opens");
     let checkpoint = vm.undo_checkpoint();
     assert_eq!(growth, run(&mut vm, &mut state, &prog, &summed));
-    assert_eq!(SLOT, needs_growth_slot());
+    assert_eq!(Some(SLOT), vm.needs_growth_slot());
     assert_eq!(before_summed, state, "a refused batch writes nothing");
     assert_eq!(checkpoint, vm.undo_checkpoint(), "and journals nothing");
     rollback(&mut vm, &mut state, checkpoint);
@@ -1939,7 +1941,7 @@ proptest! {
                 // Earlier rows of the batch may have applied: the caller rolls
                 // back to its checkpoint, ends the window, grows through the VM,
                 // and replays the whole batch.
-                prop_assert_eq!(SLOT, needs_growth_slot());
+                prop_assert_eq!(Some(SLOT), vm.needs_growth_slot());
                 rollback(&mut vm, &mut state, checkpoint);
                 vm.undo_commit();
                 prop_assert_eq!(&before, &state);

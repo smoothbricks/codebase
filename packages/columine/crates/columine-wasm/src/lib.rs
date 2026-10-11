@@ -349,9 +349,13 @@ pub unsafe extern "C" fn vm_validate_state(state_ptr: *const u8, state_len: u32)
     }
 }
 
+/// The slot that asked for growth when the runtime VM's last batch returned
+/// `NEEDS_GROWTH`, or `NO_GROWTH_SLOT`.
 #[unsafe(no_mangle)]
 pub extern "C" fn vm_get_needs_growth_slot() -> u32 {
-    state_init::needs_growth_slot()
+    rt().vm
+        .needs_growth_slot()
+        .unwrap_or(state_init::NO_GROWTH_SLOT)
 }
 
 #[unsafe(no_mangle)]

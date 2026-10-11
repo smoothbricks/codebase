@@ -25,7 +25,7 @@ use crate::meta::{SlotMetaView, slot_meta_base};
 use crate::nested;
 use crate::row_exprs::LiveColumns;
 use crate::scratch::ScratchDemand;
-use crate::state_init::{self, EVICTION_ENTRY_SIZE, NEEDS_GROWTH_SLOT};
+use crate::state_init::{self, EVICTION_ENTRY_SIZE};
 use crate::struct_map::{
     ArenaRegion, StructMap2Slot, StructMapSlot, scalar_cell_encoded, scalar_cell_order_key,
     scalar_order_key,
@@ -989,6 +989,10 @@ pub struct Vm {
     /// Whether the batch now running reserved and sealed its scratch: a
     /// container call it makes runs inside that reservation.
     scratch_sealed: bool,
+    /// The slot whose capacity refused the last batch with `NEEDS_GROWTH`, or
+    /// `None` when it did not ask for growth. Each VM owns its register, so
+    /// VMs that run on different threads never read each other's refusals.
+    needs_growth_slot: Option<u32>,
 }
 
 impl Vm {
@@ -1010,6 +1014,7 @@ impl Vm {
             nested_scratch: nested::NestedScratch::default(),
             capacity: CapacityScratch::default(),
             scratch_sealed: false,
+            needs_growth_slot: None,
         }
     }
 }
@@ -1034,6 +1039,36 @@ impl Vm {
         VmCtx {
             undo: &mut self.undo,
         }
+    }
+
+    /// The slot that asked for growth when the last batch returned
+    /// `NEEDS_GROWTH`, or `None` when it did not.
+    pub fn needs_growth_slot(&self) -> Option<u32> {
+        self.needs_growth_slot
+    }
+
+    /// Record that `slot` refused for capacity. A layer that writes this VM's
+    /// state outside its kernels (a RETE derived-facts table) and answers
+    /// `NEEDS_GROWTH` names its slot here, as the kernels do.
+    pub fn signal_needs_growth(&mut self, slot: u32) {
+        self.needs_growth_slot = Some(slot);
+    }
+
+    /// Map a capacity failure to `NEEDS_GROWTH` and record its slot.
+    fn signal_growth(&mut self, slot: u32, result: ErrorCode) -> u32 {
+        if result == ErrorCode::CapacityExceeded {
+            self.needs_growth_slot = Some(slot);
+            return NEEDS_GROWTH;
+        }
+        result as u32
+    }
+
+    /// Record `slot` when a kernel answered `NEEDS_GROWTH` for it.
+    fn growth_of(&mut self, slot: u32, result: u32) -> u32 {
+        if result == NEEDS_GROWTH {
+            self.needs_growth_slot = Some(slot);
+        }
+        result
     }
 
     /// Reserve the declared physical ranges before calling the writer and
@@ -2371,7 +2406,6 @@ fn single_struct_map2_upsert_last(
         return err;
     }
     let Some(result) = smap.plan_upsert(state, key1, key2) else {
-        NEEDS_GROWTH_SLOT.store(slot, Ordering::Relaxed);
         return ErrorCode::CapacityExceeded;
     };
     let row = smap.row_off(result.pos);
@@ -2521,7 +2555,6 @@ fn single_struct_map_upsert_from_probe(
         }
     }
     let Some(result) = out.plan_upsert(state, out_key) else {
-        NEEDS_GROWTH_SLOT.store(out_slot, Ordering::Relaxed);
         return ErrorCode::CapacityExceeded;
     };
 
@@ -2722,6 +2755,7 @@ impl ArenaWrites {
 }
 
 /// Both batch and nested execution apply the same row replacement and arena journal.
+/// `NEEDS_GROWTH` names `slot_idx`; the calling VM records it.
 #[allow(clippy::too_many_arguments)]
 fn upsert_struct_map_row(
     undo: &mut UndoState,
@@ -2750,10 +2784,7 @@ fn upsert_struct_map_row(
         element_idx,
     ) {
         Ok(row) => row,
-        Err(ErrorCode::CapacityExceeded) => {
-            NEEDS_GROWTH_SLOT.store(slot_idx, Ordering::Relaxed);
-            return NEEDS_GROWTH;
-        }
+        Err(ErrorCode::CapacityExceeded) => return NEEDS_GROWTH,
         Err(error) => return error as u32,
     };
     let arrays = if array_fields.is_empty() {
@@ -2761,10 +2792,7 @@ fn upsert_struct_map_row(
     } else {
         match ArenaWrites::prepare(state, &row, array_fields) {
             Ok(plan) => Some(plan),
-            Err(ErrorCode::ArenaOverflow) => {
-                NEEDS_GROWTH_SLOT.store(slot_idx, Ordering::Relaxed);
-                return NEEDS_GROWTH;
-            }
+            Err(ErrorCode::ArenaOverflow) => return NEEDS_GROWTH,
             Err(error) => return error as u32,
         }
     };
@@ -2788,6 +2816,7 @@ fn counts_error(error: crate::counts_fold::CountsFoldError) -> ErrorCode {
 
 /// Apply one physically planned fold. Schema-role certification belongs to
 /// the admitted program; this mutation owns its exact physical journal.
+/// `NEEDS_GROWTH` names `op.slot`; the calling VM records it.
 fn fold_counts_row(
     undo: &mut UndoState,
     delta_mode: bool,
@@ -2817,7 +2846,6 @@ fn fold_counts_row(
         Err(error) => return counts_error(error) as u32,
     };
     let Some(upsert) = map.plan_upsert(state, key) else {
-        NEEDS_GROWTH_SLOT.store(op.slot, Ordering::Relaxed);
         return NEEDS_GROWTH;
     };
     let stored = if upsert.is_new {
@@ -2844,11 +2872,9 @@ fn fold_counts_row(
                 return ErrorCode::InvalidCellValue as u32;
             };
             let Some(next_used) = arena.used.checked_add(len) else {
-                NEEDS_GROWTH_SLOT.store(op.slot, Ordering::Relaxed);
                 return NEEDS_GROWTH;
             };
             if next_used > arena.capacity {
-                NEEDS_GROWTH_SLOT.store(op.slot, Ordering::Relaxed);
                 return NEEDS_GROWTH;
             }
             (arena.data + arena.used, len, next_used)
@@ -3173,15 +3199,6 @@ const INVALID_PROGRAM: u32 = ErrorCode::InvalidProgram as u32;
 const NEEDS_GROWTH: u32 = ErrorCode::NeedsGrowth as u32;
 const OUT_OF_MEMORY: u32 = ErrorCode::OutOfMemory as u32;
 
-/// Map a capacity failure to NEEDS_GROWTH and record its slot.
-fn signal_growth(slot_idx: u32, result: ErrorCode) -> u32 {
-    if result == ErrorCode::CapacityExceeded {
-        NEEDS_GROWTH_SLOT.store(slot_idx, Ordering::Relaxed);
-        return NEEDS_GROWTH;
-    }
-    result as u32
-}
-
 impl Vm {
     /// Execute one batch using the VM's normal mutation lane, over a batch
     /// with no live derived columns (`row_exprs`).
@@ -3282,6 +3299,7 @@ impl Vm {
         batch_len: u32,
         live: Option<&mut LiveColumns<'_, '_>>,
     ) -> u32 {
+        self.needs_growth_slot = None;
         if state.len() < columine_types::types::STATE_HEADER_SIZE as usize
             || bytes::read_u32(state, 0) != STATE_MAGIC
             || state[StateHeaderOffset::FORMAT_VERSION as usize] != STATE_FORMAT_VERSION
@@ -3453,7 +3471,7 @@ impl Vm {
                         &mut self.ctx(),
                     );
                     if result != ErrorCode::Ok {
-                        return signal_growth(slot, result);
+                        return self.signal_growth(slot, result);
                     }
                 }
 
@@ -3478,7 +3496,7 @@ impl Vm {
                         &mut self.ctx(),
                     );
                     if result != ErrorCode::Ok {
-                        return signal_growth(slot, result);
+                        return self.signal_growth(slot, result);
                     }
                 }
 
@@ -3512,7 +3530,7 @@ impl Vm {
                         &mut self.ctx(),
                     );
                     if result != ErrorCode::Ok {
-                        return signal_growth(slot, result);
+                        return self.signal_growth(slot, result);
                     }
                 }
 
@@ -3542,7 +3560,7 @@ impl Vm {
                         &mut self.ctx(),
                     );
                     if result != ErrorCode::Ok {
-                        return signal_growth(slot, result);
+                        return self.signal_growth(slot, result);
                     }
                 }
 
@@ -3559,7 +3577,7 @@ impl Vm {
                         &mut self.ctx(),
                     );
                     if result != ErrorCode::Ok {
-                        return signal_growth(slot, result);
+                        return self.signal_growth(slot, result);
                     }
                 }
 
@@ -3597,7 +3615,7 @@ impl Vm {
                         &mut self.ctx(),
                     );
                     if result != ErrorCode::Ok {
-                        return signal_growth(slot, result);
+                        return self.signal_growth(slot, result);
                     }
                 }
 
@@ -3621,7 +3639,7 @@ impl Vm {
                         ts,
                     );
                     if result != ErrorCode::Ok {
-                        return signal_growth(slot, result);
+                        return self.signal_growth(slot, result);
                     }
                 }
 
@@ -3643,7 +3661,7 @@ impl Vm {
                         ))),
                     );
                     if result != ErrorCode::Ok {
-                        return signal_growth(slot, result);
+                        return self.signal_growth(slot, result);
                     }
                 }
 
@@ -3657,7 +3675,7 @@ impl Vm {
                         batch_col!(col_u32_exact(col_at(cols, elem_col as usize), batch_len)),
                     );
                     if result != ErrorCode::Ok {
-                        return signal_growth(slot, result);
+                        return self.signal_growth(slot, result);
                     }
                 }
 
@@ -3681,7 +3699,7 @@ impl Vm {
                         ts,
                     );
                     if result != ErrorCode::Ok {
-                        return signal_growth(slot, result);
+                        return self.signal_growth(slot, result);
                     }
                 }
 
@@ -3695,7 +3713,7 @@ impl Vm {
                         batch_col!(col_u32_exact(col_at(cols, elem_col as usize), batch_len)),
                     );
                     if result != ErrorCode::Ok {
-                        return signal_growth(slot, result);
+                        return self.signal_growth(slot, result);
                     }
                 }
 
@@ -3719,7 +3737,7 @@ impl Vm {
                         BitmapSource::Slot(source_slot),
                     );
                     if result == ErrorCode::CapacityExceeded {
-                        return signal_growth(target_slot, result);
+                        return self.signal_growth(target_slot, result);
                     }
                     if result != ErrorCode::Ok {
                         return result as u32;
@@ -3746,7 +3764,7 @@ impl Vm {
                         BitmapSource::Scratch,
                     );
                     if result == ErrorCode::CapacityExceeded {
-                        return signal_growth(target_slot, result);
+                        return self.signal_growth(target_slot, result);
                     }
                     if result != ErrorCode::Ok {
                         return result as u32;
@@ -3910,7 +3928,7 @@ impl Vm {
                             i,
                         );
                         if result != OK {
-                            return result;
+                            return self.growth_of(operands.slot, result);
                         }
                     }
                 }
@@ -3931,7 +3949,7 @@ impl Vm {
                             row,
                         );
                         if result != OK {
-                            return result;
+                            return self.growth_of(operands.slot, result);
                         }
                     }
                 }
@@ -3963,11 +3981,8 @@ impl Vm {
                             cols,
                             i,
                         );
-                        if result == ErrorCode::CapacityExceeded {
-                            return NEEDS_GROWTH;
-                        }
                         if result != ErrorCode::Ok {
-                            return result as u32;
+                            return self.signal_growth(operands.slot, result);
                         }
                     }
                 }
@@ -4001,11 +4016,8 @@ impl Vm {
                             cols,
                             i,
                         );
-                        if result == ErrorCode::CapacityExceeded {
-                            return NEEDS_GROWTH;
-                        }
                         if result != ErrorCode::Ok {
-                            return result as u32;
+                            return self.signal_growth(operands.row.slot, result);
                         }
                     }
                 }
@@ -4390,7 +4402,7 @@ impl Vm {
                         &mut self.ctx(),
                     );
                     if result != ErrorCode::Ok {
-                        return signal_growth(slot, result);
+                        return self.signal_growth(slot, result);
                     }
                 }
 
@@ -4416,7 +4428,7 @@ impl Vm {
                         &mut self.ctx(),
                     );
                     if result != ErrorCode::Ok {
-                        return signal_growth(slot, result);
+                        return self.signal_growth(slot, result);
                     }
                 }
 
@@ -4447,7 +4459,7 @@ impl Vm {
                         &mut self.ctx(),
                     );
                     if result != ErrorCode::Ok {
-                        return signal_growth(slot, result);
+                        return self.signal_growth(slot, result);
                     }
                 }
 
@@ -4481,7 +4493,7 @@ impl Vm {
                         &mut self.ctx(),
                     );
                     if result != ErrorCode::Ok {
-                        return signal_growth(slot, result);
+                        return self.signal_growth(slot, result);
                     }
                 }
 
@@ -4499,7 +4511,7 @@ impl Vm {
                         &mut self.ctx(),
                     );
                     if result != ErrorCode::Ok {
-                        return signal_growth(slot, result);
+                        return self.signal_growth(slot, result);
                     }
                 }
 
@@ -4539,7 +4551,7 @@ impl Vm {
                         &mut self.ctx(),
                     );
                     if result != ErrorCode::Ok {
-                        return signal_growth(slot, result);
+                        return self.signal_growth(slot, result);
                     }
                 }
 
@@ -4580,7 +4592,7 @@ impl Vm {
                         &mut self.ctx(),
                     );
                     if result != ErrorCode::Ok {
-                        return signal_growth(slot, result);
+                        return self.signal_growth(slot, result);
                     }
                 }
 
@@ -4620,7 +4632,7 @@ impl Vm {
                         &mut self.ctx(),
                     );
                     if result != ErrorCode::Ok {
-                        return signal_growth(slot, result);
+                        return self.signal_growth(slot, result);
                     }
                 }
 
@@ -4643,7 +4655,7 @@ impl Vm {
                         &mut self.ctx(),
                     );
                     if result != ErrorCode::Ok {
-                        return signal_growth(slot, result);
+                        return self.signal_growth(slot, result);
                     }
                 }
 
@@ -4687,7 +4699,7 @@ impl Vm {
                         &mut self.ctx(),
                     );
                     if result != ErrorCode::Ok {
-                        return signal_growth(slot, result);
+                        return self.signal_growth(slot, result);
                     }
                 }
 
@@ -4709,7 +4721,7 @@ impl Vm {
                         meta.has_ttl().then_some(&[ts][..]),
                     );
                     if result != ErrorCode::Ok {
-                        return signal_growth(slot, result);
+                        return self.signal_growth(slot, result);
                     }
                 }
 
@@ -4735,7 +4747,7 @@ impl Vm {
                         meta.has_ttl().then_some(&[ts][..]),
                     );
                     if result != ErrorCode::Ok {
-                        return signal_growth(slot, result);
+                        return self.signal_growth(slot, result);
                     }
                 }
 
@@ -4762,7 +4774,7 @@ impl Vm {
                         meta.has_ttl().then_some(&[ts][..]),
                     );
                     if result != ErrorCode::Ok {
-                        return signal_growth(slot, result);
+                        return self.signal_growth(slot, result);
                     }
                 }
 
@@ -4777,7 +4789,7 @@ impl Vm {
                         &[cell_u32(cols, elem_col, child_idx)],
                     );
                     if result != ErrorCode::Ok {
-                        return signal_growth(slot, result);
+                        return self.signal_growth(slot, result);
                     }
                 }
 
@@ -4846,7 +4858,8 @@ impl Vm {
                             child_idx,
                         );
                         if result != OK {
-                            return result;
+                            let slot = operands.slot;
+                            return self.growth_of(slot, result);
                         }
                     }
                 }
@@ -4866,7 +4879,7 @@ impl Vm {
                         child_idx,
                     );
                     if result != OK {
-                        return result;
+                        return self.growth_of(operands.slot, result);
                     }
                 }
 
@@ -4889,11 +4902,9 @@ impl Vm {
                         cols,
                         child_idx,
                     );
-                    if result == ErrorCode::CapacityExceeded {
-                        return NEEDS_GROWTH;
-                    }
                     if result != ErrorCode::Ok {
-                        return result as u32;
+                        let slot = operands.slot;
+                        return self.signal_growth(slot, result);
                     }
                 }
                 Opcode::BatchStructMap2UpsertMaxI64x2 | Opcode::BatchStructMap2UpsertMinI64x2 => {
@@ -4916,11 +4927,9 @@ impl Vm {
                         cols,
                         child_idx,
                     );
-                    if result == ErrorCode::CapacityExceeded {
-                        return NEEDS_GROWTH;
-                    }
                     if result != ErrorCode::Ok {
-                        return result as u32;
+                        let slot = operands.row.slot;
+                        return self.signal_growth(slot, result);
                     }
                 }
                 Opcode::BatchStructMap2Remove => {
@@ -4988,12 +4997,8 @@ impl Vm {
                         &probe_fis[..num_fields],
                         &out_fis[..num_fields],
                     );
-                    if result == ErrorCode::CapacityExceeded {
-                        NEEDS_GROWTH_SLOT.store(out_slot, Ordering::Relaxed);
-                        return NEEDS_GROWTH;
-                    }
                     if result != ErrorCode::Ok {
-                        return result as u32;
+                        return self.signal_growth(out_slot, result);
                     }
                 }
                 //#endregion reduce-typed-state.probe-exec
@@ -5111,7 +5116,7 @@ impl Vm {
                                 is_retract,
                             );
                             if code != ErrorCode::Ok {
-                                return signal_growth(dest_slot, code);
+                                return self.signal_growth(dest_slot, code);
                             }
                         }
                         // kind 1: card-many set — element is the precomputed
@@ -5131,7 +5136,7 @@ impl Vm {
                             if is_retract {
                                 let result = self.set_remove(delta_mode, state, dest_slot, &[v]);
                                 if result != ErrorCode::Ok {
-                                    return signal_growth(dest_slot, result);
+                                    return self.signal_growth(dest_slot, result);
                                 }
                             } else {
                                 let set_result = self.set_insert(
@@ -5142,7 +5147,7 @@ impl Vm {
                                     meta.has_ttl().then_some(&[0.0][..]),
                                 );
                                 if set_result != ErrorCode::Ok {
-                                    return signal_growth(dest_slot, set_result);
+                                    return self.signal_growth(dest_slot, set_result);
                                 }
                             }
                         }
@@ -5230,7 +5235,7 @@ impl Vm {
                                 is_retract,
                             );
                             if code != ErrorCode::Ok {
-                                return signal_growth(dest_slot, code);
+                                return self.signal_growth(dest_slot, code);
                             }
                         }
                         // kind 1: card-many set — element is the precomputed
@@ -5247,7 +5252,7 @@ impl Vm {
                             if is_retract {
                                 let result = self.set_remove(delta_mode, state, dest_slot, &[v]);
                                 if result != ErrorCode::Ok {
-                                    return signal_growth(dest_slot, result);
+                                    return self.signal_growth(dest_slot, result);
                                 }
                             } else {
                                 let set_result = self.set_insert(
@@ -5258,7 +5263,7 @@ impl Vm {
                                     meta.has_ttl().then_some(&[0.0][..]),
                                 );
                                 if set_result != ErrorCode::Ok {
-                                    return signal_growth(dest_slot, set_result);
+                                    return self.signal_growth(dest_slot, set_result);
                                 }
                             }
                         }
@@ -5386,7 +5391,7 @@ impl Vm {
                             .map(|pos| crate::struct_map::Upsert { pos, is_new: false })
                     } else {
                         let Some(planned) = guarded.plan_upsert(state, key) else {
-                            return signal_growth(guard_slot, ErrorCode::CapacityExceeded);
+                            return self.signal_growth(guard_slot, ErrorCode::CapacityExceeded);
                         };
                         Some(planned)
                     };
@@ -5510,7 +5515,7 @@ impl Vm {
                             self.undo.finish_capture(delta_mode, state, capture);
                         }
                         if set_result != ErrorCode::Ok {
-                            return signal_growth(dest_slot, set_result);
+                            return self.signal_growth(dest_slot, set_result);
                         }
                         if guard_result != ErrorCode::Ok {
                             return guard_result as u32;
@@ -5540,7 +5545,7 @@ impl Vm {
                     ));
 
                     if count >= capacity {
-                        NEEDS_GROWTH_SLOT.store(slot, Ordering::Relaxed);
+                        self.needs_growth_slot = Some(slot);
                         return NEEDS_GROWTH;
                     }
 
@@ -5633,7 +5638,7 @@ impl Vm {
                     }
 
                     if count >= capacity {
-                        NEEDS_GROWTH_SLOT.store(slot, Ordering::Relaxed);
+                        self.needs_growth_slot = Some(slot);
                         return NEEDS_GROWTH;
                     }
 
@@ -5762,7 +5767,7 @@ impl Vm {
                         &mut self.nested_scratch,
                     ) {
                         Ok(plan) => plan,
-                        Err(error) => return signal_growth(slot, error),
+                        Err(error) => return self.signal_growth(slot, error),
                     };
                     let capture = match self.undo.begin_capture(plan.state(), || plan.ranges()) {
                         Ok(capture) => capture,
@@ -5791,7 +5796,7 @@ impl Vm {
                         &mut self.nested_scratch,
                     ) {
                         Ok(plan) => plan,
-                        Err(error) => return signal_growth(slot, error),
+                        Err(error) => return self.signal_growth(slot, error),
                     };
                     let capture = match self.undo.begin_capture(plan.state(), || plan.ranges()) {
                         Ok(capture) => capture,
@@ -5818,7 +5823,7 @@ impl Vm {
                         &mut self.nested_scratch,
                     ) {
                         Ok(plan) => plan,
-                        Err(error) => return signal_growth(slot, error),
+                        Err(error) => return self.signal_growth(slot, error),
                     };
                     let capture = match self.undo.begin_capture(plan.state(), || plan.ranges()) {
                         Ok(capture) => capture,
