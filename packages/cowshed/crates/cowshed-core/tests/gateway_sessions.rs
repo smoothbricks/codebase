@@ -13,7 +13,7 @@ use cowshed_core::metadata::{EgressMode, EgressRule, GrantSet, WorkspaceIncarnat
 use cowshed_core::repository::RepoId;
 use cowshed_core::{CowshedError, Result};
 use cowshed_gateway_types::{
-    CanonicalTarget, EgressMode as GatewayEgressMode, GatewayStatus, SessionStatus, TargetScheme,
+    CanonicalTarget, DaemonStatus, EgressMode as GatewayEgressMode, SessionStatus, TargetScheme,
     WorkspaceCa, WorkspaceEndpoint, WorkspacePolicy, WorkspaceSession, WorkspaceToken,
 };
 use std::collections::BTreeMap;
@@ -50,8 +50,8 @@ fn session_at(identity: &str, revision: u64, token_byte: u8, port: u16) -> Works
     }
 }
 
-fn status(sessions: Vec<SessionStatus>) -> GatewayStatus {
-    GatewayStatus {
+fn status(sessions: Vec<SessionStatus>) -> DaemonStatus {
+    DaemonStatus {
         version: env!("CARGO_PKG_VERSION").to_owned(),
         draining: false,
         drain_cause: None,
@@ -94,7 +94,7 @@ fn host_with(live: Vec<WorkspaceSession>) -> FakeInventory {
 
 #[derive(Default)]
 struct FakeControl {
-    status: Mutex<Option<std::result::Result<GatewayStatus, GatewayStatusError>>>,
+    status: Mutex<Option<std::result::Result<DaemonStatus, GatewayStatusError>>>,
     installs: Mutex<Vec<(String, u64)>>,
     removes: Mutex<Vec<(String, u64)>>,
     refuse_installs: Mutex<Vec<String>>,
@@ -102,7 +102,7 @@ struct FakeControl {
 
 #[async_trait]
 impl GatewayControl for FakeControl {
-    async fn status(&self) -> std::result::Result<GatewayStatus, GatewayStatusError> {
+    async fn status(&self) -> std::result::Result<DaemonStatus, GatewayStatusError> {
         self.status
             .lock()
             .expect("status lock")
@@ -254,7 +254,7 @@ async fn a_gateway_still_healing_refuses_reconcile_by_type() {
         projects: std::num::NonZeroUsize::new(4).expect("four"),
     };
     let control = FakeControl {
-        status: Mutex::new(Some(Ok(GatewayStatus {
+        status: Mutex::new(Some(Ok(DaemonStatus {
             healing: Some(mounting),
             ..status(Vec::new())
         }))),
@@ -480,7 +480,7 @@ impl FencedGateway {
 
 #[async_trait]
 impl GatewayControl for FencedGateway {
-    async fn status(&self) -> std::result::Result<GatewayStatus, GatewayStatusError> {
+    async fn status(&self) -> std::result::Result<DaemonStatus, GatewayStatusError> {
         self.status_read.store(true, Ordering::SeqCst);
         Ok(status(
             self.live()

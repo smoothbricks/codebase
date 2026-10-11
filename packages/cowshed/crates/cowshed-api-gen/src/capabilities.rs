@@ -327,10 +327,7 @@ mod tests {
             }
         "#;
         let mut api = Api::default();
-        crate::records::parse(
-            "#[derive(Serialize, Deserialize)] pub struct JobJournalCursor { pub stdout: u64, pub stderr: u64 }",
-            &mut api,
-        ).expect("cursor declaration");
+        crate::records::parse("#[derive(Serialize, Deserialize)] pub struct JobJournalCursor { pub stdout: u64, pub stderr: u64 }", &mut api, "cowshed_core::api::fixture").expect("cursor declaration");
         let methods = parse(source).expect("capability declarations");
         let (rust, typescript) = emit(&methods, &api).expect("projection");
         assert!(

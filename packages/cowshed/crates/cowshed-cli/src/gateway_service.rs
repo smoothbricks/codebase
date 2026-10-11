@@ -24,9 +24,9 @@ use cowshed_core::{
     ValidatedHostStorage, validate_existing_host_storage,
 };
 use cowshed_gateway::{
-    ArrowAuditConfig, ControlError, ControlFailureCode, Gateway, GatewayConfig,
-    GatewayControlClient, GatewayHandle, GatewayStatus, MirrorCacheConfig, StartupHeal,
-    StartupProbe, SupervisorRecovery, WorkspaceSession,
+    ArrowAuditConfig, ControlError, ControlFailureCode, DaemonStatus, Gateway, GatewayConfig,
+    GatewayControlClient, GatewayHandle, MirrorCacheConfig, StartupHeal, StartupProbe,
+    SupervisorRecovery, WorkspaceSession,
 };
 use sha2::{Digest as _, Sha256};
 use std::fs;
@@ -65,7 +65,7 @@ impl ControlSocket {
 
 #[async_trait]
 impl GatewayControl for ControlSocket {
-    async fn status(&self) -> std::result::Result<GatewayStatus, GatewayStatusError> {
+    async fn status(&self) -> std::result::Result<DaemonStatus, GatewayStatusError> {
         self.0.status().await.map_err(|error| match error {
             // A missing socket is not a fault: no daemon is running, and the remedy is to start
             // one rather than to report a broken control plane.
@@ -1050,7 +1050,7 @@ async fn wait_for_shutdown_signal() -> Result<()> {
 fn cli_status(
     installed: bool,
     socket: PathBuf,
-    status: Option<&GatewayStatus>,
+    status: Option<&DaemonStatus>,
     cli_sha256: &str,
 ) -> CliGatewayStatus {
     CliGatewayStatus {
@@ -1656,7 +1656,7 @@ fn refresh_gateway_from<C: LaunchctlCommand>(
     candidate: &Candidate,
     debug_build: bool,
     downgrade: Downgrade,
-    daemon: Option<&GatewayStatus>,
+    daemon: Option<&DaemonStatus>,
     executor: &mut LaunchdExecutor<NativeFilesystem, C>,
 ) -> Result<Option<ServiceBinaryRefresh>> {
     let executable = HostStableExecutable::new(home, COWSHED_BINARY_NAME).map_err(launchd_error)?;
@@ -2324,7 +2324,7 @@ mod tests {
             NativeFilesystem::new(),
             RecordingGatewayLaunchctl::default(),
         );
-        let refresh = |executor: &mut RecordingExecutor, daemon: Option<&GatewayStatus>| {
+        let refresh = |executor: &mut RecordingExecutor, daemon: Option<&DaemonStatus>| {
             refresh_gateway_from(
                 &home,
                 &candidate,
@@ -2613,8 +2613,8 @@ mod tests {
         fs::remove_dir_all(&root).ok();
     }
 
-    fn daemon(draining: bool, cause: Option<&str>, sha256: Option<&str>) -> GatewayStatus {
-        GatewayStatus {
+    fn daemon(draining: bool, cause: Option<&str>, sha256: Option<&str>) -> DaemonStatus {
+        DaemonStatus {
             version: "0.1.0".into(),
             draining,
             drain_cause: cause.map(str::to_owned),
@@ -2839,7 +2839,7 @@ mod tests {
         }
 
         /// What `gateway status` prints for the daemon's answer.
-        fn rendered(socket: &Path, status: &GatewayStatus) -> String {
+        fn rendered(socket: &Path, status: &DaemonStatus) -> String {
             let mut output = Output::new(Vec::new(), Vec::new(), false);
             emit_gateway_status(
                 &mut output,

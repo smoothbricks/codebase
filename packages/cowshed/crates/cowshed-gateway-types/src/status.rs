@@ -8,7 +8,7 @@ use std::num::NonZeroUsize;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct GatewayStatus {
+pub struct DaemonStatus {
     /// Version of the daemon process that answered the control request.
     pub version: String,
     pub draining: bool,

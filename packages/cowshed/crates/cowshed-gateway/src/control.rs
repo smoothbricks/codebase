@@ -19,8 +19,8 @@ use tokio::{
 use zeroize::{Zeroize, Zeroizing};
 
 use cowshed_gateway_types::{
-    CPU_TOKENS_OP, CpuBudgetStatus, DISK_LEASE_OP, DiskClass, EgressGrant, EgressMode,
-    GatewayStatus, HostPattern, LeaseState, MirrorRoute, WorkspaceCa, WorkspaceEndpoint,
+    CPU_TOKENS_OP, CpuBudgetStatus, DISK_LEASE_OP, DaemonStatus, DiskClass, EgressGrant,
+    EgressMode, HostPattern, LeaseState, MirrorRoute, WorkspaceCa, WorkspaceEndpoint,
     WorkspacePolicy, WorkspaceSession, WorkspaceToken,
 };
 
@@ -85,7 +85,7 @@ impl GatewayControlClient {
         })
     }
 
-    pub async fn status(&self) -> Result<GatewayStatus, ControlError> {
+    pub async fn status(&self) -> Result<DaemonStatus, ControlError> {
         self.send(&ControlRequest::Status)
             .await?
             .status
@@ -380,7 +380,7 @@ struct AuthenticatedControlRequestIn {
 struct ControlResponse {
     ok: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    status: Option<GatewayStatus>,
+    status: Option<DaemonStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
     audit_events: Option<Vec<AuditEvent>>,
     #[serde(skip_serializing_if = "Option::is_none")]

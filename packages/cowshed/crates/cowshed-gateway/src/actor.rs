@@ -16,7 +16,7 @@ use tokio::{
 };
 
 use cowshed_gateway_types::{
-    CanonicalHost, CanonicalTarget, ConfigError, EgressMode, GatewayStatus, MirrorProtocol,
+    CanonicalHost, CanonicalTarget, ConfigError, DaemonStatus, EgressMode, MirrorProtocol,
     PolicyDenial, SessionStatus, TargetScheme, WorkspaceEndpoint, WorkspacePolicy,
     WorkspaceSession, WorkspaceToken,
 };
@@ -92,7 +92,7 @@ impl GatewayHandle {
         receive.await.map_err(|_| GatewayError::Stopped)?
     }
 
-    pub async fn status(&self) -> Result<GatewayStatus, GatewayError> {
+    pub async fn status(&self) -> Result<DaemonStatus, GatewayError> {
         let (reply, receive) = oneshot::channel();
         self.send(Command::Status { reply }).await?;
         receive.await.map_err(|_| GatewayError::Stopped)
@@ -431,7 +431,7 @@ pub(crate) enum Command {
         reply: oneshot::Sender<Result<Arc<rustls::ServerConfig>, GatewayError>>,
     },
     Status {
-        reply: oneshot::Sender<GatewayStatus>,
+        reply: oneshot::Sender<DaemonStatus>,
     },
     BeginDrain {
         reply: oneshot::Sender<()>,
@@ -1655,7 +1655,7 @@ impl Actor {
         }
     }
 
-    fn status(&self) -> GatewayStatus {
+    fn status(&self) -> DaemonStatus {
         let mut sessions: Vec<_> = self
             .sessions
             .iter()
@@ -1668,7 +1668,7 @@ impl Actor {
             })
             .collect();
         sessions.sort_by(|left, right| left.workspace_id.cmp(&right.workspace_id));
-        GatewayStatus {
+        DaemonStatus {
             version: env!("CARGO_PKG_VERSION").to_owned(),
             draining: self.draining,
             drain_cause: self.draining.then(|| match &self.audit_failure {

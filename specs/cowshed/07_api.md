@@ -653,7 +653,16 @@ The public declaration IR is serializable from its own Rust types. Its serde and
 type graph generate their TypeScript model through the same owner emitter; a consumer never restates those fields or
 parses Rust declarations with a private mirror. Normalized types retain qualified names, type/lifetime/const arguments,
 reference ownership and constant-expression spelling. Unsupported source syntax is refused by name, and a consumer
-requiring a literal bound refuses a symbolic expression rather than guessing its value.
+requiring a literal bound refuses a symbolic expression rather than guessing its value. Each declaration retains its
+exact lexical Rust module, including inline and path-included modules, and its item visibility. Non-public ancestor
+modules keep a public item from being exported globally. The module bindings derive from those declarations, and
+duplicate names refuse collection rather than selecting the first or last source. Full metadata JSON and owner-emitted
+TypeScript model/validator goldens pin every field; the generated Equals validators admit actual owner JSON and refuse
+omitted, changed and extra facts.
+
+The public CLI health summary `GatewayStatus` and the daemon snapshot `DaemonStatus` are distinct declarations with
+distinct names. API and support collection share the same duplicate-name refusal; neither source shadows the other. This
+naming cutover changes no serialized field or status wire envelope.
 
 Externally projected types are defined **once** in `cowshed-core` and reused verbatim by the CLI (`--json` bodies),
 NAPI, and MCP — no adapter redefines a field, and contract goldens (08_testing.md) pin their shapes: `WorkspaceInfo`,

@@ -442,7 +442,7 @@
         ],
         "options": {
           "comment": "Runs from source under the typia transform because the validators under test are the point. Depends on wire-fixtures (the corpus is a generated output, current by construction) and not on cargo-test: the Rust half proves the same corpus through include_str!, and cowshed:test already joins both legs; a cargo-test edge here only meant an unrelated Rust failure deleted this target from the run.",
-          "command": "bun test --config=../bunfig.toml --timeout=30000 wire-contract.test.ts exec.test.ts",
+          "command": "bun test --config=../bunfig.toml --timeout=30000 wire-contract.test.ts exec.test.ts declaration-model.test.ts",
           "cwd": "{projectRoot}/src",
           "timeoutMs": 120000,
           "killAfterMs": 10000

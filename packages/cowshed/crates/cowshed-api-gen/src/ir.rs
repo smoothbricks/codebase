@@ -2,8 +2,13 @@ use quote::ToTokens;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 
+/// The wire-name segment of one already-normalized qualified Rust path.
+pub fn last_segment(path: &str) -> &str {
+    path.rsplit_once("::").map_or(path, |(_, last)| last)
+}
+
 #[derive(Default, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct Api {
     pub records: BTreeMap<String, Record>,
     /// Canonical records named as Option roots by public operations.
@@ -12,16 +17,19 @@ pub struct Api {
 
 /// Actual declarations plus their source module bindings, without a mirrored record schema.
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct DeclarationModel {
     pub api: Api,
     pub modules: BTreeMap<String, String>,
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct Record {
     pub name: String,
+    /// Lexical module that owns the declaration, including inline module components.
+    pub module: String,
+    pub visibility: DeclarationVisibility,
     pub docs: Vec<String>,
     pub serde: Serde,
     pub projection: Projection,
@@ -29,13 +37,18 @@ pub struct Record {
     pub exported: bool,
 }
 
+#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum DeclarationVisibility {
+    Public,
+    Crate,
+    Super,
+    Private,
+    Restricted { path: String },
+}
+
 #[derive(Serialize)]
-#[serde(
-    tag = "kind",
-    content = "data",
-    rename_all = "camelCase",
-    deny_unknown_fields
-)]
+#[serde(tag = "kind", content = "data", rename_all = "camelCase")]
 pub enum Shape {
     Struct(Fields),
     Enum(Vec<Variant>),
@@ -43,12 +56,7 @@ pub enum Shape {
 }
 
 #[derive(Serialize)]
-#[serde(
-    tag = "kind",
-    content = "data",
-    rename_all = "camelCase",
-    deny_unknown_fields
-)]
+#[serde(tag = "kind", content = "data", rename_all = "camelCase")]
 pub enum Fields {
     Unit,
     Named(Vec<Field>),
@@ -56,7 +64,7 @@ pub enum Fields {
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct Field {
     pub name: Option<String>,
     pub ty: RustType,
@@ -65,7 +73,7 @@ pub struct Field {
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct Variant {
     pub name: String,
     pub docs: Vec<String>,
@@ -75,7 +83,7 @@ pub struct Variant {
 
 /// Facts from serde attributes, without guessing whether a record is an input or an output.
 #[derive(Default, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct Serde {
     pub rename: Option<String>,
     pub rename_all: Option<String>,
@@ -98,7 +106,7 @@ pub struct Serde {
 
 /// Metadata for custom serializers. Kept on the canonical Rust declaration, never in an adapter.
 #[derive(Default, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct Projection {
     pub wire: Option<String>,
     pub scalar: Option<String>,
@@ -117,8 +125,7 @@ pub struct Projection {
 #[serde(
     tag = "kind",
     rename_all = "camelCase",
-    rename_all_fields = "camelCase",
-    deny_unknown_fields
+    rename_all_fields = "camelCase"
 )]
 pub enum RustType {
     Named {
@@ -147,8 +154,7 @@ pub enum RustType {
 #[serde(
     tag = "kind",
     rename_all = "camelCase",
-    rename_all_fields = "camelCase",
-    deny_unknown_fields
+    rename_all_fields = "camelCase"
 )]
 pub enum TypeArgument {
     Type { value: RustType },

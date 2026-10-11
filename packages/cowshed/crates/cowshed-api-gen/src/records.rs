@@ -1,22 +1,36 @@
-use crate::ir::{Api, Field, Fields, Projection, Record, RustType, Serde, Shape, Variant};
+use crate::ir::{
+    Api, DeclarationVisibility, Field, Fields, Projection, Record, RustType, Serde, Shape, Variant,
+};
 use syn::spanned::Spanned;
 use syn::{Attribute, Expr, Item, Lit, Meta, Visibility};
 
-pub fn parse(source: &str, api: &mut Api) -> syn::Result<()> {
-    parse_items(syn::parse_file(source)?.items, api, true)
+/// Parses one API source file. `module` is the Rust module the file defines, such as
+/// `cowshed_core::api::dto`: every retained record carries it, extended by each inline `mod` that
+/// encloses the record.
+pub fn parse(source: &str, api: &mut Api, module: &str) -> syn::Result<()> {
+    parse_file(syn::parse_file(source)?, api, module, true)
 }
 
-/// API declarations have lexical priority over equally named implementation/support records.
-pub fn parse_support(source: &str, api: &mut Api) -> syn::Result<()> {
-    let mut support = Api::default();
-    parse_items(syn::parse_file(source)?.items, &mut support, false)?;
-    for (name, record) in support.records {
-        api.records.entry(name).or_insert(record);
-    }
-    Ok(())
+pub(crate) fn parse_file(
+    source: syn::File,
+    api: &mut Api,
+    module: &str,
+    exported: bool,
+) -> syn::Result<()> {
+    parse_items(source.items, api, module, exported)
 }
 
-fn parse_items(items: Vec<Item>, api: &mut Api, exported: bool) -> syn::Result<()> {
+/// Parses one support source (implementation records outside the API surface) into `api`. Its
+/// records are never exported. A name that an API source or another source already declares is
+/// refused as a duplicate, so support records neither shadow nor get shadowed by API declarations.
+/// `module` is the Rust module the source defines, as for `parse`.
+pub fn parse_support(source: &str, api: &mut Api, module: &str) -> syn::Result<()> {
+    parse_items(syn::parse_file(source)?.items, api, module, false)
+}
+
+/// Parses the items of one module. `module` is that module's path; `exported` is whether its items
+/// are public API: the source is an API source and every inline module enclosing them is `pub`.
+fn parse_items(items: Vec<Item>, api: &mut Api, module: &str, exported: bool) -> syn::Result<()> {
     let mut custom_serializers: std::collections::BTreeSet<String> = items
         .iter()
         .filter_map(|item| {
@@ -71,6 +85,8 @@ fn parse_items(items: Vec<Item>, api: &mut Api, exported: bool) -> syn::Result<(
                             && item.generics.type_params().next().is_none()
                             && serialized,
                         name: item.ident.to_string(),
+                        module: module.to_owned(),
+                        visibility: declaration_visibility(&item.vis),
                         docs: docs(&item.attrs),
                         serde: serde(&item.attrs)?,
                         projection,
@@ -94,6 +110,8 @@ fn parse_items(items: Vec<Item>, api: &mut Api, exported: bool) -> syn::Result<(
                             && item.generics.type_params().next().is_none()
                             && serialized,
                         name: item.ident.to_string(),
+                        module: module.to_owned(),
+                        visibility: declaration_visibility(&item.vis),
                         docs: docs(&item.attrs),
                         serde: serde(&item.attrs)?,
                         projection,
@@ -118,6 +136,8 @@ fn parse_items(items: Vec<Item>, api: &mut Api, exported: bool) -> syn::Result<(
             Item::Type(item) => Some(Record {
                 exported: false,
                 name: item.ident.to_string(),
+                module: module.to_owned(),
+                visibility: declaration_visibility(&item.vis),
                 docs: docs(&item.attrs),
                 serde: serde(&item.attrs)?,
                 projection: projection(&item.attrs)?,
@@ -133,6 +153,9 @@ fn parse_items(items: Vec<Item>, api: &mut Api, exported: bool) -> syn::Result<(
                 })?;
                 Some(Record {
                     name: identifier.name.to_string(),
+                    module: module.to_owned(),
+                    // `hex_identifier!` expands to a `pub struct` (api/dto.rs), so it is public.
+                    visibility: DeclarationVisibility::Public,
                     docs: docs(&item.attrs),
                     serde: Serde::default(),
                     projection: Projection {
@@ -147,7 +170,8 @@ fn parse_items(items: Vec<Item>, api: &mut Api, exported: bool) -> syn::Result<(
             }
             Item::Mod(item) if !is_test_only(&item.attrs)? => {
                 if let Some((_, items)) = item.content {
-                    parse_items(items, api, exported)?;
+                    let nested = format!("{module}::{}", item.ident);
+                    parse_items(items, api, &nested, exported && is_public(&item.vis))?;
                 }
                 None
             }
@@ -155,12 +179,21 @@ fn parse_items(items: Vec<Item>, api: &mut Api, exported: bool) -> syn::Result<(
         };
         if let Some(mut record) = record {
             record.exported |= exported && is_public_projection(&record.projection);
-            let name = record.name.clone();
-            if api.records.insert(name.clone(), record).is_some() {
-                return Err(syn::Error::new(
-                    proc_macro2::Span::call_site(),
-                    format!("duplicate API record {name}"),
-                ));
+            match api.records.entry(record.name.clone()) {
+                std::collections::btree_map::Entry::Occupied(existing) => {
+                    return Err(syn::Error::new(
+                        proc_macro2::Span::call_site(),
+                        format!(
+                            "duplicate API record {}: already declared in {}, redeclared in {}",
+                            existing.key(),
+                            existing.get().module,
+                            record.module
+                        ),
+                    ));
+                }
+                std::collections::btree_map::Entry::Vacant(slot) => {
+                    slot.insert(record);
+                }
             }
         }
     }
@@ -284,8 +317,40 @@ impl syn::parse::Parse for HexIdentifier {
     }
 }
 
-fn is_public(visibility: &Visibility) -> bool {
+pub(crate) fn is_public(visibility: &Visibility) -> bool {
     matches!(visibility, Visibility::Public(_))
+}
+
+/// The visibility keyword an item carries, as written. Enclosing inline modules are not folded in:
+/// `Record.module` carries that path, so a `pub` item under a private module is `Public` here.
+fn declaration_visibility(visibility: &Visibility) -> DeclarationVisibility {
+    match visibility {
+        Visibility::Public(_) => DeclarationVisibility::Public,
+        Visibility::Inherited => DeclarationVisibility::Private,
+        Visibility::Restricted(restricted) => {
+            let path = &restricted.path;
+            if path.is_ident("crate") {
+                DeclarationVisibility::Crate
+            } else if path.is_ident("super") {
+                DeclarationVisibility::Super
+            } else if path.is_ident("self") {
+                DeclarationVisibility::Private
+            } else {
+                let segments = path
+                    .segments
+                    .iter()
+                    .map(|segment| segment.ident.to_string())
+                    .collect::<Vec<_>>()
+                    .join("::");
+                let path = if path.leading_colon.is_some() {
+                    format!("::{segments}")
+                } else {
+                    segments
+                };
+                DeclarationVisibility::Restricted { path }
+            }
+        }
+    }
 }
 
 fn is_public_projection(projection: &Projection) -> bool {
@@ -482,7 +547,7 @@ fn projection(attrs: &[Attribute]) -> syn::Result<Projection> {
     Ok(result)
 }
 
-fn is_test_only(attrs: &[Attribute]) -> syn::Result<bool> {
+pub(crate) fn is_test_only(attrs: &[Attribute]) -> syn::Result<bool> {
     for attr in attrs.iter().filter(|attr| attr.path().is_ident("cfg")) {
         if requires_test(&attr.parse_args::<Meta>()?)? {
             return Ok(true);
@@ -519,6 +584,8 @@ mod tests {
     use super::*;
     use crate::ir::TypeArgument;
 
+    const FIXTURE: &str = "cowshed_core::api::fixture";
+
     #[test]
     fn unsupported_serde_shapes_are_refused_by_attribute_name() {
         for attribute in [
@@ -536,8 +603,8 @@ mod tests {
             let source = format!(
                 "#[derive(Serialize)] #[serde({attribute})] pub struct Record {{ pub value: String }}"
             );
-            let error =
-                parse(&source, &mut Api::default()).expect_err("unsupported shape must fail");
+            let error = parse(&source, &mut Api::default(), FIXTURE)
+                .expect_err("unsupported shape must fail");
             assert!(
                 error
                     .to_string()
@@ -553,9 +620,16 @@ mod tests {
             mod tests { #[derive(Serialize)] pub struct Production { pub value: String } }
         "#;
         let mut api = Api::default();
-        parse(source, &mut api).unwrap();
+        parse(source, &mut api, FIXTURE).unwrap();
         assert!(!api.records.contains_key("Fixture"));
-        assert!(api.records["Production"].exported);
+        assert_eq!(
+            api.records["Production"].module,
+            "cowshed_core::api::fixture::tests"
+        );
+        assert!(
+            !api.records["Production"].exported,
+            "a public item in a private inline module is not a global export"
+        );
     }
 
     #[test]
@@ -569,7 +643,7 @@ mod tests {
             }
         "#;
         let mut api = Api::default();
-        parse(source, &mut api).unwrap();
+        parse(source, &mut api, FIXTURE).unwrap();
         let Shape::Struct(Fields::Named(fields)) = &api.records["ErrorReceipt"].shape else {
             panic!("receipt has named fields");
         };
@@ -580,7 +654,8 @@ mod tests {
         assert!(
             parse(
                 &source.replace("deserialize_with", "serialize_with"),
-                &mut Api::default()
+                &mut Api::default(),
+                FIXTURE
             )
             .is_err()
         );
@@ -613,7 +688,7 @@ mod tests {
             hex_identifier!(TraceId, 16, InvalidTraceId);
         "#;
         let mut api = Api::default();
-        parse(source, &mut api).expect("declarations");
+        parse(source, &mut api, FIXTURE).expect("declarations");
         let Shape::Struct(Fields::Named(fields)) = &api.records["Shaped"].shape else {
             panic!("Shaped has named fields");
         };
@@ -705,12 +780,16 @@ mod tests {
             ("Box<Iterator<Item = u8>>", "unsupported generic argument"),
         ] {
             let source = format!("#[derive(Serialize)] pub struct Record {{ pub value: {ty} }}");
-            let error =
-                parse(&source, &mut Api::default()).expect_err("unsupported syntax is refused");
+            let error = parse(&source, &mut Api::default(), FIXTURE)
+                .expect_err("unsupported syntax is refused");
             assert!(error.to_string().contains(cause), "{ty}: {error}");
         }
-        let error = parse("pub type Callback = fn(u8) -> u8;", &mut Api::default())
-            .expect_err("an unsupported alias is refused");
+        let error = parse(
+            "pub type Callback = fn(u8) -> u8;",
+            &mut Api::default(),
+            FIXTURE,
+        )
+        .expect_err("an unsupported alias is refused");
         assert!(
             error
                 .to_string()
@@ -731,7 +810,7 @@ mod tests {
             }
         "#;
         let mut api = Api::default();
-        parse(source, &mut api).expect("runtime state is not a declaration");
+        parse(source, &mut api, FIXTURE).expect("runtime state is not a declaration");
         assert!(!api.records.contains_key("RuntimeHandle"));
         assert!(!api.records.contains_key("Outcome"));
     }
@@ -744,8 +823,8 @@ mod tests {
                 runtime: Arc<dyn Runtime>,
             }
         "#;
-        let error =
-            parse(source, &mut Api::default()).expect_err("a projected declaration is normalized");
+        let error = parse(source, &mut Api::default(), FIXTURE)
+            .expect_err("a projected declaration is normalized");
         assert!(
             error
                 .to_string()
@@ -762,7 +841,7 @@ mod tests {
             pub struct Unrelated(String);
         "#;
         let mut api = Api::default();
-        parse(source, &mut api).expect("declarations");
+        parse(source, &mut api, FIXTURE).expect("declarations");
         assert!(api.records["BranchName"].exported);
         assert!(!api.records.contains_key("Unrelated"));
     }
@@ -778,7 +857,7 @@ mod tests {
             pub struct Deep<T>(pub T);
         "#;
         let mut api = Api::default();
-        parse(source, &mut api).expect("reached support types normalize");
+        parse(source, &mut api, FIXTURE).expect("reached support types normalize");
         assert!(api.records["Outer"].exported);
         assert!(!api.records["Inner"].exported);
         assert!(api.records.contains_key("Ident"));
@@ -792,6 +871,7 @@ mod tests {
         parse(
             "pub struct RuntimeHolder { runtime: Arc<dyn Runtime> }",
             &mut api,
+            FIXTURE,
         )
         .expect("an unreached runtime holder is not normalized");
         assert!(!api.records.contains_key("RuntimeHolder"));
@@ -799,7 +879,7 @@ mod tests {
             "#[derive(Serialize)] pub struct Reaches { pub holder: RuntimeHolder } pub struct RuntimeHolder { runtime: Arc<dyn Runtime> }",
             "pub type Handle = RuntimeHolder; pub struct RuntimeHolder { runtime: Arc<dyn Runtime> }",
         ] {
-            let error = parse(source, &mut Api::default())
+            let error = parse(source, &mut Api::default(), FIXTURE)
                 .expect_err("a holder a declaration or alias reaches is refused");
             assert!(
                 error
@@ -808,5 +888,101 @@ mod tests {
                 "{error}"
             );
         }
+    }
+
+    #[test]
+    fn records_carry_the_module_their_source_defines_and_their_visibility_keyword() {
+        let source = r#"
+            #[derive(Serialize)] pub struct Top { pub value: u8 }
+            #[derive(Serialize)] pub(crate) struct Crate { pub value: u8 }
+            #[derive(Serialize)] pub(super) struct Super { pub value: u8 }
+            #[derive(Serialize)] pub(in crate::api) struct Scoped { pub value: u8 }
+            #[derive(Serialize)] pub(self) struct Own { pub value: u8 }
+            #[derive(Serialize)] struct Private { pub value: u8 }
+            hex_identifier!(Digest, 8, InvalidDigest);
+            pub mod open {
+                #[derive(Serialize)] pub struct Deep { pub value: u8 }
+                pub mod deeper {
+                    #[derive(Serialize)] pub enum Choice { First }
+                }
+            }
+        "#;
+        let mut api = Api::default();
+        parse(source, &mut api, FIXTURE).expect("declarations");
+        let deeper = "cowshed_core::api::fixture::open::deeper";
+        for (name, module, visibility) in [
+            ("Top", FIXTURE, DeclarationVisibility::Public),
+            ("Crate", FIXTURE, DeclarationVisibility::Crate),
+            ("Super", FIXTURE, DeclarationVisibility::Super),
+            (
+                "Scoped",
+                FIXTURE,
+                DeclarationVisibility::Restricted {
+                    path: "crate::api".to_owned(),
+                },
+            ),
+            ("Own", FIXTURE, DeclarationVisibility::Private),
+            ("Private", FIXTURE, DeclarationVisibility::Private),
+            ("Digest", FIXTURE, DeclarationVisibility::Public),
+            (
+                "Deep",
+                "cowshed_core::api::fixture::open",
+                DeclarationVisibility::Public,
+            ),
+            ("Choice", deeper, DeclarationVisibility::Public),
+        ] {
+            assert_eq!(api.records[name].module, module, "{name}");
+            assert_eq!(api.records[name].visibility, visibility, "{name}");
+        }
+        for name in ["Top", "Deep", "Choice"] {
+            assert!(
+                api.records[name].exported,
+                "{name} is public all the way down"
+            );
+        }
+        for name in ["Crate", "Super", "Scoped", "Own", "Private"] {
+            assert!(!api.records[name].exported, "{name} is not a global export");
+        }
+    }
+
+    #[test]
+    fn a_public_item_under_a_non_public_inline_module_is_not_a_global_export() {
+        let source = r#"
+            mod hidden { #[derive(Serialize)] pub struct Hidden { pub value: u8 } }
+            pub(crate) mod shared { #[derive(Serialize)] pub struct Shared { pub value: u8 } }
+            pub mod open {
+                mod inner { #[derive(Serialize)] pub struct Closed { pub value: u8 } }
+                #[derive(Serialize)] pub struct Open { pub value: u8 }
+            }
+        "#;
+        let mut api = Api::default();
+        parse(source, &mut api, FIXTURE).expect("declarations");
+        for (name, module, exported) in [
+            ("Hidden", "cowshed_core::api::fixture::hidden", false),
+            ("Shared", "cowshed_core::api::fixture::shared", false),
+            ("Closed", "cowshed_core::api::fixture::open::inner", false),
+            ("Open", "cowshed_core::api::fixture::open", true),
+        ] {
+            assert_eq!(api.records[name].module, module, "{name}");
+            assert_eq!(
+                api.records[name].visibility,
+                DeclarationVisibility::Public,
+                "{name}"
+            );
+            assert_eq!(api.records[name].exported, exported, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_support_source_keeps_its_module_and_is_never_a_global_export() {
+        let mut api = Api::default();
+        parse_support(
+            "#[derive(Serialize)] pub struct Supported { pub value: u8 }",
+            &mut api,
+            "cowshed_core::metadata",
+        )
+        .expect("support declarations");
+        assert_eq!(api.records["Supported"].module, "cowshed_core::metadata");
+        assert!(!api.records["Supported"].exported);
     }
 }

@@ -1,0 +1,479 @@
+{
+  "api": {
+    "records": {
+      "Borrowed": {
+        "name": "Borrowed",
+        "module": "cowshed_core::api::fixture",
+        "visibility": { "kind": "super" },
+        "docs": [],
+        "serde": {
+          "rename": null,
+          "renameAll": null,
+          "renameAllFields": null,
+          "tag": null,
+          "content": null,
+          "untagged": false,
+          "transparent": false,
+          "default": false,
+          "defaultWith": null,
+          "skipSerializingIf": null,
+          "skip": false,
+          "flatten": false,
+          "denyUnknownFields": false,
+          "into": null,
+          "from": null,
+          "deserializeWith": null
+        },
+        "projection": {
+          "wire": null,
+          "scalar": null,
+          "exclusive": [],
+          "name": null,
+          "unitValue": null,
+          "outputOnly": false
+        },
+        "shape": {
+          "kind": "alias",
+          "data": {
+            "kind": "reference",
+            "element": { "kind": "named", "name": "str", "arguments": [] },
+            "lifetime": null,
+            "mutable": false
+          }
+        },
+        "exported": false
+      },
+      "Choice": {
+        "name": "Choice",
+        "module": "cowshed_core::api::fixture",
+        "visibility": { "kind": "restricted", "path": "crate::api::fixture" },
+        "docs": ["An externally tagged enum."],
+        "serde": {
+          "rename": null,
+          "renameAll": null,
+          "renameAllFields": "kebab-case",
+          "tag": "kind",
+          "content": "data",
+          "untagged": false,
+          "transparent": false,
+          "default": false,
+          "defaultWith": null,
+          "skipSerializingIf": null,
+          "skip": false,
+          "flatten": false,
+          "denyUnknownFields": false,
+          "into": null,
+          "from": null,
+          "deserializeWith": null
+        },
+        "projection": {
+          "wire": null,
+          "scalar": null,
+          "exclusive": [],
+          "name": null,
+          "unitValue": "false",
+          "outputOnly": false
+        },
+        "shape": {
+          "kind": "enum",
+          "data": [
+            {
+              "name": "Off",
+              "docs": ["Disabled."],
+              "serde": {
+                "rename": "wireName",
+                "renameAll": "camelCase",
+                "renameAllFields": "kebab-case",
+                "tag": "kind",
+                "content": "data",
+                "untagged": true,
+                "transparent": true,
+                "default": true,
+                "defaultWith": "make_default",
+                "skipSerializingIf": "Option::is_none",
+                "skip": true,
+                "flatten": true,
+                "denyUnknownFields": true,
+                "into": "Target",
+                "from": "Source",
+                "deserializeWith": "decode"
+              },
+              "fields": { "kind": "unit" }
+            },
+            {
+              "name": "On",
+              "docs": [],
+              "serde": {
+                "rename": null,
+                "renameAll": null,
+                "renameAllFields": null,
+                "tag": null,
+                "content": null,
+                "untagged": false,
+                "transparent": false,
+                "default": false,
+                "defaultWith": null,
+                "skipSerializingIf": null,
+                "skip": false,
+                "flatten": false,
+                "denyUnknownFields": false,
+                "into": null,
+                "from": null,
+                "deserializeWith": null
+              },
+              "fields": {
+                "kind": "named",
+                "data": [
+                  {
+                    "name": "level",
+                    "ty": { "kind": "named", "name": "u8", "arguments": [] },
+                    "docs": [],
+                    "serde": {
+                      "rename": "wireName",
+                      "renameAll": "camelCase",
+                      "renameAllFields": "kebab-case",
+                      "tag": "kind",
+                      "content": "data",
+                      "untagged": true,
+                      "transparent": true,
+                      "default": true,
+                      "defaultWith": "make_default",
+                      "skipSerializingIf": "Option::is_none",
+                      "skip": true,
+                      "flatten": true,
+                      "denyUnknownFields": true,
+                      "into": "Target",
+                      "from": "Source",
+                      "deserializeWith": "decode"
+                    }
+                  }
+                ]
+              }
+            },
+            {
+              "name": "Pair",
+              "docs": ["Tuple payload."],
+              "serde": {
+                "rename": null,
+                "renameAll": null,
+                "renameAllFields": null,
+                "tag": null,
+                "content": null,
+                "untagged": false,
+                "transparent": false,
+                "default": false,
+                "defaultWith": null,
+                "skipSerializingIf": null,
+                "skip": false,
+                "flatten": false,
+                "denyUnknownFields": false,
+                "into": null,
+                "from": null,
+                "deserializeWith": null
+              },
+              "fields": {
+                "kind": "tuple",
+                "data": [
+                  {
+                    "name": null,
+                    "ty": { "kind": "named", "name": "u16", "arguments": [] },
+                    "docs": [],
+                    "serde": {
+                      "rename": null,
+                      "renameAll": null,
+                      "renameAllFields": null,
+                      "tag": null,
+                      "content": null,
+                      "untagged": false,
+                      "transparent": false,
+                      "default": false,
+                      "defaultWith": null,
+                      "skipSerializingIf": null,
+                      "skip": false,
+                      "flatten": false,
+                      "denyUnknownFields": false,
+                      "into": null,
+                      "from": null,
+                      "deserializeWith": null
+                    }
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "exported": true
+      },
+      "Coordinates": {
+        "name": "Coordinates",
+        "module": "cowshed_core::api::fixture::inner",
+        "visibility": { "kind": "crate" },
+        "docs": [],
+        "serde": {
+          "rename": null,
+          "renameAll": null,
+          "renameAllFields": null,
+          "tag": null,
+          "content": null,
+          "untagged": false,
+          "transparent": false,
+          "default": false,
+          "defaultWith": null,
+          "skipSerializingIf": null,
+          "skip": false,
+          "flatten": false,
+          "denyUnknownFields": false,
+          "into": null,
+          "from": null,
+          "deserializeWith": null
+        },
+        "projection": {
+          "wire": null,
+          "scalar": null,
+          "exclusive": [],
+          "name": null,
+          "unitValue": null,
+          "outputOnly": false
+        },
+        "shape": {
+          "kind": "struct",
+          "data": {
+            "kind": "tuple",
+            "data": [
+              {
+                "name": null,
+                "ty": {
+                  "kind": "tuple",
+                  "elements": [
+                    { "kind": "named", "name": "String", "arguments": [] },
+                    {
+                      "kind": "slice",
+                      "element": { "kind": "named", "name": "u8", "arguments": [] }
+                    }
+                  ]
+                },
+                "docs": ["Tuple field."],
+                "serde": {
+                  "rename": null,
+                  "renameAll": null,
+                  "renameAllFields": null,
+                  "tag": null,
+                  "content": null,
+                  "untagged": false,
+                  "transparent": false,
+                  "default": false,
+                  "defaultWith": null,
+                  "skipSerializingIf": null,
+                  "skip": true,
+                  "flatten": false,
+                  "denyUnknownFields": false,
+                  "into": null,
+                  "from": null,
+                  "deserializeWith": null
+                }
+              },
+              {
+                "name": null,
+                "ty": { "kind": "tuple", "elements": [] },
+                "docs": [],
+                "serde": {
+                  "rename": null,
+                  "renameAll": null,
+                  "renameAllFields": null,
+                  "tag": null,
+                  "content": null,
+                  "untagged": false,
+                  "transparent": false,
+                  "default": false,
+                  "defaultWith": null,
+                  "skipSerializingIf": null,
+                  "skip": false,
+                  "flatten": false,
+                  "denyUnknownFields": false,
+                  "into": null,
+                  "from": null,
+                  "deserializeWith": null
+                }
+              }
+            ]
+          }
+        },
+        "exported": false
+      },
+      "Marker": {
+        "name": "Marker",
+        "module": "cowshed_core::api::fixture",
+        "visibility": { "kind": "private" },
+        "docs": [],
+        "serde": {
+          "rename": null,
+          "renameAll": null,
+          "renameAllFields": null,
+          "tag": null,
+          "content": null,
+          "untagged": false,
+          "transparent": false,
+          "default": false,
+          "defaultWith": null,
+          "skipSerializingIf": null,
+          "skip": false,
+          "flatten": false,
+          "denyUnknownFields": false,
+          "into": null,
+          "from": null,
+          "deserializeWith": null
+        },
+        "projection": {
+          "wire": null,
+          "scalar": null,
+          "exclusive": [],
+          "name": null,
+          "unitValue": null,
+          "outputOnly": false
+        },
+        "shape": { "kind": "struct", "data": { "kind": "unit" } },
+        "exported": false
+      },
+      "Wire": {
+        "name": "Wire",
+        "module": "cowshed_core::api::fixture",
+        "visibility": { "kind": "public" },
+        "docs": ["A source-owned declaration.", "Second docs line."],
+        "serde": {
+          "rename": "wireName",
+          "renameAll": "camelCase",
+          "renameAllFields": "kebab-case",
+          "tag": "kind",
+          "content": "data",
+          "untagged": true,
+          "transparent": true,
+          "default": true,
+          "defaultWith": "make_default",
+          "skipSerializingIf": "Option::is_none",
+          "skip": true,
+          "flatten": true,
+          "denyUnknownFields": true,
+          "into": "Target",
+          "from": "Source",
+          "deserializeWith": "decode"
+        },
+        "projection": {
+          "wire": "WireForm",
+          "scalar": "number & tags.Minimum<1>",
+          "exclusive": ["a", "b"],
+          "name": "PublicName",
+          "unitValue": "true",
+          "outputOnly": true
+        },
+        "shape": {
+          "kind": "struct",
+          "data": {
+            "kind": "named",
+            "data": [
+              {
+                "name": "answer",
+                "ty": {
+                  "kind": "named",
+                  "name": "Option",
+                  "arguments": [
+                    {
+                      "kind": "type",
+                      "value": {
+                        "kind": "named",
+                        "name": "qualified::Token",
+                        "arguments": [{ "kind": "lifetime", "name": "static" }, { "kind": "const", "expression": "32" }]
+                      }
+                    }
+                  ]
+                },
+                "docs": ["First field."],
+                "serde": {
+                  "rename": "wireName",
+                  "renameAll": "camelCase",
+                  "renameAllFields": "kebab-case",
+                  "tag": "kind",
+                  "content": "data",
+                  "untagged": true,
+                  "transparent": true,
+                  "default": true,
+                  "defaultWith": "make_default",
+                  "skipSerializingIf": "Option::is_none",
+                  "skip": true,
+                  "flatten": true,
+                  "denyUnknownFields": true,
+                  "into": "Target",
+                  "from": "Source",
+                  "deserializeWith": "decode"
+                }
+              },
+              {
+                "name": "bytes",
+                "ty": {
+                  "kind": "array",
+                  "element": { "kind": "named", "name": "u8", "arguments": [] },
+                  "length": "LIMIT + 1"
+                },
+                "docs": [],
+                "serde": {
+                  "rename": null,
+                  "renameAll": null,
+                  "renameAllFields": null,
+                  "tag": null,
+                  "content": null,
+                  "untagged": false,
+                  "transparent": false,
+                  "default": false,
+                  "defaultWith": null,
+                  "skipSerializingIf": null,
+                  "skip": false,
+                  "flatten": false,
+                  "denyUnknownFields": false,
+                  "into": null,
+                  "from": null,
+                  "deserializeWith": null
+                }
+              },
+              {
+                "name": "borrowed",
+                "ty": {
+                  "kind": "reference",
+                  "element": { "kind": "named", "name": "Token", "arguments": [] },
+                  "lifetime": "a",
+                  "mutable": true
+                },
+                "docs": [],
+                "serde": {
+                  "rename": null,
+                  "renameAll": null,
+                  "renameAllFields": null,
+                  "tag": null,
+                  "content": null,
+                  "untagged": false,
+                  "transparent": false,
+                  "default": false,
+                  "defaultWith": null,
+                  "skipSerializingIf": null,
+                  "skip": false,
+                  "flatten": false,
+                  "denyUnknownFields": false,
+                  "into": null,
+                  "from": null,
+                  "deserializeWith": null
+                }
+              }
+            ]
+          }
+        },
+        "exported": true
+      }
+    },
+    "nullableResults": ["Choice", "Wire"]
+  },
+  "modules": {
+    "Borrowed": "cowshed_core::api::fixture",
+    "Choice": "cowshed_core::api::fixture",
+    "Coordinates": "cowshed_core::api::fixture::inner",
+    "Marker": "cowshed_core::api::fixture",
+    "Wire": "cowshed_core::api::fixture"
+  }
+}

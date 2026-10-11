@@ -35,7 +35,7 @@ pub use control::{ControlError, ControlFailureCode, GatewayControlClient};
 /// The control-plane data model is re-exported at this root so `cowshed_gateway::WorkspaceSession`
 /// and friends name the same items whether a caller links the daemon or only the types crate.
 pub use cowshed_gateway_types::{
-    CanonicalHost, CanonicalTarget, ConfigError, EgressGrant, EgressMode, GatewayStatus,
+    CanonicalHost, CanonicalTarget, ConfigError, DaemonStatus, EgressGrant, EgressMode,
     HostPattern, InvalidRepoId, MACOS_PORT_MAX, MACOS_PORT_MIN, MirrorProtocol, MirrorRoute,
     NEW_PORT_BLOCK_SIZE, PolicyError, ResolvedMirrorRoute, SessionStatus, StartupHeal,
     SupervisorRecovery, TOKEN_BYTES, TargetScheme, WorkspaceCa, WorkspaceEndpoint, WorkspacePolicy,

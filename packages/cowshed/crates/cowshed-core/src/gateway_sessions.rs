@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use cowshed_gateway_types::{
-    CanonicalHost, EgressGrant, GatewayStatus, WorkspaceCa, WorkspaceEndpoint, WorkspacePolicy,
+    CanonicalHost, DaemonStatus, EgressGrant, WorkspaceCa, WorkspaceEndpoint, WorkspacePolicy,
     WorkspaceSession, WorkspaceToken,
 };
 use sha2::{Digest as _, Sha256};
@@ -94,7 +94,7 @@ impl std::fmt::Display for ControlRefusal {
 /// write another reconcile already overtook from a write that failed.
 #[async_trait]
 pub trait GatewayControl: Send + Sync {
-    async fn status(&self) -> std::result::Result<GatewayStatus, GatewayStatusError>;
+    async fn status(&self) -> std::result::Result<DaemonStatus, GatewayStatusError>;
     async fn install(&self, session: &WorkspaceSession) -> std::result::Result<(), ControlRefusal>;
     async fn remove(
         &self,
@@ -389,7 +389,7 @@ pub async fn reconcile_against_status<C, I>(
     host: &I,
     project_prefix: &str,
     desired: Vec<WorkspaceSession>,
-    status: GatewayStatus,
+    status: DaemonStatus,
 ) -> Result<ReconcileReport>
 where
     C: GatewayControl + ?Sized,
@@ -403,7 +403,7 @@ async fn reconcile_against_status_inner<C, I>(
     host: &I,
     project_prefix: &str,
     desired: Vec<WorkspaceSession>,
-    status: GatewayStatus,
+    status: DaemonStatus,
     reallocator: Option<&dyn GatewayPortReallocator>,
 ) -> Result<ReconcileReport>
 where

@@ -50,7 +50,7 @@ mod tests {
 
     fn declaration(source: &str) -> Api {
         let mut api = Api::default();
-        crate::records::parse(source, &mut api).expect("canonical error");
+        crate::records::parse(source, &mut api, "cowshed_core::error").expect("canonical error");
         api
     }
 

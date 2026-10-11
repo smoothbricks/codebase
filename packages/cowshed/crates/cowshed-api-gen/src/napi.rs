@@ -15,7 +15,7 @@
 //! and the adapter's `.d.ts` together.
 
 use crate::capabilities;
-use crate::ir::{Api, Field, Fields, Record, RustType, Shape, TypeArgument};
+use crate::ir::{Api, Field, Fields, Record, RustType, Shape, TypeArgument, last_segment};
 use crate::operations::{Lane, Operation, Scope};
 use std::collections::BTreeMap;
 use std::fmt::Write;
@@ -456,7 +456,7 @@ fn is_option(ty: &RustType) -> bool {
     matches!(
         ty,
         RustType::Named { name, arguments }
-            if !arguments.is_empty() && name.rsplit("::").next() == Some("Option")
+            if !arguments.is_empty() && last_segment(name) == "Option"
     )
 }
 
@@ -950,62 +950,63 @@ mod tests {
         let mut api = Api::default();
         crate::records::parse(
             r#"
-            #[derive(Serialize, Deserialize)]
-            #[serde(rename_all = "camelCase", deny_unknown_fields)]
-            pub struct JobRequest {
-                pub repo_id: RepoId,
-                pub workspace: WorkspaceName,
-                pub workspace_incarnation: WorkspaceIncarnation,
-                pub job_id: JobId,
-            }
-            #[derive(Serialize, Deserialize)]
-            #[serde(rename_all = "camelCase", deny_unknown_fields)]
-            pub struct LogsRequest {
-                pub repo_id: RepoId,
-                pub workspace: WorkspaceName,
-                pub workspace_incarnation: WorkspaceIncarnation,
-                pub job_id: JobId,
-                pub offset: u64,
-            }
-            #[derive(Serialize, Deserialize)]
-            #[serde(rename_all = "camelCase", deny_unknown_fields)]
-            pub struct WorkspaceRequest {
-                pub repo_id: RepoId,
-                pub workspace: WorkspaceName,
-            }
-            #[derive(Serialize, Deserialize)]
-            #[serde(rename_all = "camelCase", deny_unknown_fields)]
-            pub struct RepoRequest {
-                pub repo_id: RepoId,
-            }
-            #[derive(Serialize, Deserialize)]
-            #[serde(rename_all = "camelCase", deny_unknown_fields)]
-            pub struct GrantsRequest {
-                pub repo_id: RepoId,
-                pub workspace: WorkspaceName,
-                #[serde(default, skip_serializing_if = "Option::is_none")]
-                pub workspace_incarnation: Option<WorkspaceIncarnation>,
-            }
-            #[derive(Serialize, Deserialize)]
-            #[serde(rename_all = "camelCase", deny_unknown_fields)]
-            pub struct WorkerScope {
-                pub repo_id: RepoId,
-                pub workspace: WorkspaceName,
-                pub workspace_incarnation: WorkspaceIncarnation,
-            }
-            #[derive(Serialize, Deserialize)]
-            pub struct EmptyResult {}
-            #[derive(Serialize, Deserialize)]
-            #[serde(rename_all = "camelCase")]
-            pub struct LogsChunk { pub eof: bool, pub next_offset: u64 }
-            #[derive(Serialize, Deserialize)]
-            pub struct CowshedError {
-                pub code: ErrorCode,
-                pub message: String,
-                pub hint: String,
-            }
-            "#,
+        #[derive(Serialize, Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        pub struct JobRequest {
+            pub repo_id: RepoId,
+            pub workspace: WorkspaceName,
+            pub workspace_incarnation: WorkspaceIncarnation,
+            pub job_id: JobId,
+        }
+        #[derive(Serialize, Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        pub struct LogsRequest {
+            pub repo_id: RepoId,
+            pub workspace: WorkspaceName,
+            pub workspace_incarnation: WorkspaceIncarnation,
+            pub job_id: JobId,
+            pub offset: u64,
+        }
+        #[derive(Serialize, Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        pub struct WorkspaceRequest {
+            pub repo_id: RepoId,
+            pub workspace: WorkspaceName,
+        }
+        #[derive(Serialize, Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        pub struct RepoRequest {
+            pub repo_id: RepoId,
+        }
+        #[derive(Serialize, Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        pub struct GrantsRequest {
+            pub repo_id: RepoId,
+            pub workspace: WorkspaceName,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            pub workspace_incarnation: Option<WorkspaceIncarnation>,
+        }
+        #[derive(Serialize, Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        pub struct WorkerScope {
+            pub repo_id: RepoId,
+            pub workspace: WorkspaceName,
+            pub workspace_incarnation: WorkspaceIncarnation,
+        }
+        #[derive(Serialize, Deserialize)]
+        pub struct EmptyResult {}
+        #[derive(Serialize, Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        pub struct LogsChunk { pub eof: bool, pub next_offset: u64 }
+        #[derive(Serialize, Deserialize)]
+        pub struct CowshedError {
+            pub code: ErrorCode,
+            pub message: String,
+            pub hint: String,
+        }
+        "#,
             &mut api,
+            "cowshed_core::api::fixture",
         )
         .expect("records");
         api
@@ -1231,19 +1232,20 @@ mod tests {
         let mut api = api();
         crate::records::parse(
             r#"
-            #[derive(Serialize, Deserialize)]
-            #[serde(rename_all = "camelCase", deny_unknown_fields)]
-            pub struct MoveRequest {
-                pub repo_id: RepoId,
-                #[serde(rename = "to")]
-                pub destination: WorkspaceName,
-                #[serde(default, skip_serializing_if = "Option::is_none")]
-                pub into: Option<std::collections::BTreeMap<String, Vec<u8>>>,
-                #[serde(default = "default_depth")]
-                pub depth: u32,
-            }
-            "#,
+        #[derive(Serialize, Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        pub struct MoveRequest {
+            pub repo_id: RepoId,
+            #[serde(rename = "to")]
+            pub destination: WorkspaceName,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            pub into: Option<std::collections::BTreeMap<String, Vec<u8>>>,
+            #[serde(default = "default_depth")]
+            pub depth: u32,
+        }
+        "#,
             &mut api,
+            "cowshed_core::api::fixture",
         )
         .expect("records");
         let operations = crate::operations::parse(
@@ -1280,15 +1282,16 @@ mod tests {
         let mut api = api();
         crate::records::parse(
             r#"
-            #[derive(Serialize, Deserialize)]
-            #[serde(rename_all = "camelCase", deny_unknown_fields)]
-            pub struct SkippingRequest {
-                pub repo_id: RepoId,
-                #[serde(skip_serializing)]
-                pub hidden: u32,
-            }
-            "#,
+        #[derive(Serialize, Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        pub struct SkippingRequest {
+            pub repo_id: RepoId,
+            #[serde(skip_serializing)]
+            pub hidden: u32,
+        }
+        "#,
             &mut api,
+            "cowshed_core::api::fixture",
         )
         .expect("records");
         let operations = crate::operations::parse(
@@ -1371,12 +1374,9 @@ mod tests {
             ("pub cells: Grid<3>", "a const argument is unsupported"),
         ] {
             let mut api = api();
-            crate::records::parse(
-                &format!(
-                    "#[derive(Serialize, Deserialize)] #[serde(rename_all = \"camelCase\", deny_unknown_fields)] pub struct ShapedRequest {{ pub repo_id: RepoId, {field} }}"
-                ),
-                &mut api,
-            )
+            crate::records::parse(&format!(
+                "#[derive(Serialize, Deserialize)] #[serde(rename_all = \"camelCase\", deny_unknown_fields)] pub struct ShapedRequest {{ pub repo_id: RepoId, {field} }}"
+            ), &mut api, "cowshed_core::api::fixture")
             .expect("records");
             let operations = crate::operations::parse(
                 r#"operations! {
@@ -1399,15 +1399,16 @@ mod tests {
         let mut api = api();
         crate::records::parse(
             r#"
-            #[derive(Serialize, Deserialize)]
-            #[serde(rename_all = "camelCase", deny_unknown_fields)]
-            pub struct RootedRequest {
-                pub repo_id: RepoId,
-                pub root: ::std::path::PathBuf,
-                pub index: ::std::collections::BTreeMap<String, Option<Vec<u8>>>,
-            }
-            "#,
+        #[derive(Serialize, Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        pub struct RootedRequest {
+            pub repo_id: RepoId,
+            pub root: ::std::path::PathBuf,
+            pub index: ::std::collections::BTreeMap<String, Option<Vec<u8>>>,
+        }
+        "#,
             &mut api,
+            "cowshed_core::api::fixture",
         )
         .expect("records");
         let operations = crate::operations::parse(
@@ -1438,16 +1439,17 @@ mod tests {
         let mut api = api();
         crate::records::parse(
             r#"
-            #[derive(Serialize, Deserialize)]
-            #[serde(rename_all = "camelCase", deny_unknown_fields)]
-            pub struct QualifiedGrantsRequest {
-                pub repo_id: RepoId,
-                pub workspace: WorkspaceName,
-                #[serde(default, skip_serializing_if = "std::option::Option::is_none")]
-                pub workspace_incarnation: std::option::Option<WorkspaceIncarnation>,
-            }
-            "#,
+        #[derive(Serialize, Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        pub struct QualifiedGrantsRequest {
+            pub repo_id: RepoId,
+            pub workspace: WorkspaceName,
+            #[serde(default, skip_serializing_if = "std::option::Option::is_none")]
+            pub workspace_incarnation: std::option::Option<WorkspaceIncarnation>,
+        }
+        "#,
             &mut api,
+            "cowshed_core::api::fixture",
         )
         .expect("records");
         let operations = crate::operations::parse(
