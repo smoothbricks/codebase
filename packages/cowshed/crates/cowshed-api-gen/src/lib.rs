@@ -1,4 +1,3 @@
-pub mod arrow;
 pub mod capabilities;
 pub mod errors;
 pub mod ir;
@@ -278,7 +277,7 @@ pub fn generate(project: &Path) -> Result<Vec<GeneratedFile>, String> {
     )?;
     let projection = napi::emit(&operations, &api, &capabilities)?;
     let declaration_ir = ir_types("./declaration-ir.generated.js")?;
-    let mut files = vec![
+    let files = vec![
         GeneratedFile {
             path: project.join("src/api.generated.ts"),
             contents: output.types,
@@ -304,34 +303,9 @@ pub fn generate(project: &Path) -> Result<Vec<GeneratedFile>, String> {
             contents: declaration_ir.types,
         },
     ];
-    files.extend(column_files(&core)?);
     Ok(files)
 }
 
-pub fn column_files(core: &Path) -> Result<Vec<GeneratedFile>, String> {
-    let owners = [
-        (
-            "runtime/job_unattributed.rs",
-            "runtime/job_unattributed_columns.generated.rs",
-        ),
-        (
-            "runtime/job_boundary.rs",
-            "runtime/job_boundary_columns.generated.rs",
-        ),
-    ];
-    owners
-        .into_iter()
-        .map(|(source, generated)| {
-            let source = core.join(source);
-            let record = arrow::parse_arrow_record(&read_source(&source)?)
-                .map_err(|error| format!("{}: {error}", source.display()))?;
-            Ok(GeneratedFile {
-                path: core.join(generated),
-                contents: arrow::emit_columns(&record),
-            })
-        })
-        .collect()
-}
 
 fn read_source(path: &Path) -> Result<String, String> {
     std::fs::read_to_string(path).map_err(|error| format!("{}: {error}", path.display()))

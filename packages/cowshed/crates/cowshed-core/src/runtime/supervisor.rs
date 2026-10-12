@@ -4398,10 +4398,11 @@ impl SupervisorActor {
             )
         };
         if let Some(job_spans) = &self.job_spans {
-            job_spans.record_boundary(
+            job_spans.record(
                 &info,
-                JobSpanEdge::Start,
-                &super::job_boundary::sample_job_boundary(&volumes),
+                JobSpanEdge::Start {
+                    host: admission_host(job_id),
+                },
             );
         }
         let spawn_span = cowshed_os::timing::span("admit", "spawn");
@@ -5332,21 +5333,10 @@ impl SupervisorActor {
                 job.monitor.as_ref(),
             )
         });
-        // Read and queue the terminal boundary while the admitted build volume is still held.
-        // A successful final resource read already owns these facts; do not sample them twice.
+        // State the terminal sample while the admitted build volume is still held. A missing
+        // sample stays absent: no fresh boundary read invents host or volume facts for it.
         if let Some(job_spans) = &self.job_spans {
-            if let Some(sample) = &job.info.resources {
-                job_spans.record_terminal_accounting(&job.info, sample.accounting);
-            }
-            let edge = JobSpanEdge::end(state, job.exit.as_ref());
-            match &job.info.resources {
-                Some(sample) => job_spans.record_sample_boundary(&job.info, edge, sample),
-                None => job_spans.record_boundary(
-                    &job.info,
-                    edge,
-                    &super::job_boundary::sample_job_boundary(&job.volumes),
-                ),
-            }
+            job_spans.record(&job.info, JobSpanEdge::end(state, job.exit.as_ref()));
         }
         let ending = JobEnding {
             state,

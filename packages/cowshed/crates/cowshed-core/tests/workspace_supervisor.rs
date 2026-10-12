@@ -5968,6 +5968,17 @@ async fn main_leaves_its_nx_daemon_to_the_host() {
     );
 }
 
+/// The unattributed-usage cells of a sealed job-span row: null on every row but that one.
+#[derive(Debug, Default, Eq, PartialEq)]
+struct Unattributed {
+    cpu_us: Option<i64>,
+    io_read_bytes: Option<i64>,
+    io_write_bytes: Option<i64>,
+    source: Option<String>,
+    coverage: Option<String>,
+    gap_pid: Option<u32>,
+}
+
 /// One row of a sealed job-span segment, decoded from the columns a reader of lmao's trace
 /// schema sees.
 #[derive(Debug, Eq, PartialEq)]
@@ -5984,6 +5995,7 @@ struct JobSpanRow {
     grant_revision: u64,
     w3c_span_id: u64,
     job_state: Option<String>,
+    unattributed: Unattributed,
 }
 
 /// Every job-span segment under `telemetry`, in the order its writer sealed them: its name and its
@@ -6021,7 +6033,7 @@ fn job_span_batches(telemetry: &Path) -> Vec<(String, arrow_array::RecordBatch)>
 fn job_spans(telemetry: &Path) -> Vec<(String, JobSpanRow)> {
     use arrow_array::Array as _;
     use arrow_array::cast::AsArray as _;
-    use arrow_array::types::{UInt8Type, UInt32Type, UInt64Type};
+    use arrow_array::types::{Int64Type, UInt8Type, UInt16Type, UInt32Type, UInt64Type};
 
     job_span_batches(telemetry)
         .into_iter()
@@ -6045,6 +6057,21 @@ fn job_spans(telemetry: &Path) -> Vec<(String, JobSpanRow)> {
             let parent = parent.as_primitive::<UInt32Type>();
             let state = column("job_state");
             let state = state.as_string::<i32>();
+            let signed = |name: &str| {
+                let column = column(name);
+                let column = column.as_primitive::<Int64Type>();
+                column.is_valid(0).then(|| column.value(0))
+            };
+            let enum_text = |name: &str| {
+                let column = column(name);
+                let dictionary = column.as_dictionary::<UInt16Type>();
+                dictionary.is_valid(0).then(|| {
+                    let key = usize::from(dictionary.keys().value(0));
+                    dictionary.values().as_string::<i32>().value(key).to_owned()
+                })
+            };
+            let gap_pid = column("unattributed_gap_pid");
+            let gap_pid = gap_pid.as_primitive::<UInt32Type>();
             let row = JobSpanRow {
                 trace_id: text("trace_id"),
                 thread_id: number("thread_id"),
@@ -6062,19 +6089,68 @@ fn job_spans(telemetry: &Path) -> Vec<(String, JobSpanRow)> {
                 grant_revision: number("grant_revision"),
                 w3c_span_id: number("w3c_span_id"),
                 job_state: state.is_valid(0).then(|| state.value(0).to_owned()),
+                unattributed: Unattributed {
+                    cpu_us: signed("unattributed_cpu_us"),
+                    io_read_bytes: signed("unattributed_io_read_bytes"),
+                    io_write_bytes: signed("unattributed_io_write_bytes"),
+                    source: enum_text("unattributed_source"),
+                    coverage: enum_text("unattributed_coverage"),
+                    gap_pid: gap_pid.is_valid(0).then(|| gap_pid.value(0)),
+                },
             };
             (name, row)
         })
         .collect()
 }
 
-/// The two rows of `job`'s span: its start, then its end as `entry_type` in `state`.
+/// The unattributed-usage cells 13_telemetry.md says `accounting`'s reconciliation states, written
+/// here from the specification rather than read from the writer's projection: the source and the
+/// coverage by their wire kinds, the differences signed and unclamped, a comparison the source
+/// could not make null. None for a complete tree that agrees with the totals in every comparison
+/// its source could make.
+fn stated_unattributed(accounting: &cowshed_core::api::JobAccounting) -> Option<Unattributed> {
+    use cowshed_core::api::{JobAccounting, ProcessCoverage, ProcessCoverageGap};
+
+    let (source, reconciliation) = match accounting {
+        JobAccounting::LinuxCgroupV2 { reconciliation, .. } => ("linuxCgroupV2", reconciliation),
+        JobAccounting::MacOsRusageChildren { reconciliation, .. } => {
+            ("macOsRusageChildren", reconciliation)
+        }
+    };
+    let (coverage, gap_pid) = match reconciliation.coverage {
+        ProcessCoverage::Complete => ("complete", None),
+        ProcessCoverage::Gap { reason } => match reason {
+            ProcessCoverageGap::EventsLost => ("eventsLost", None),
+            ProcessCoverageGap::UnobservedBirth { pid } => ("unobservedBirth", Some(pid)),
+            ProcessCoverageGap::UnobservedExit { pid } => ("unobservedExit", Some(pid)),
+            ProcessCoverageGap::UncountedFork { pid } => ("uncountedFork", Some(pid)),
+            ProcessCoverageGap::UnreadImage { pid } => ("unreadImage", Some(pid)),
+            ProcessCoverageGap::UnreadFinalUsage { pid } => ("unreadFinalUsage", Some(pid)),
+        },
+    };
+    let cells = Unattributed {
+        cpu_us: Some(reconciliation.cpu_us.get()),
+        io_read_bytes: reconciliation.io_read_bytes.map(|bytes| bytes.get()),
+        io_write_bytes: reconciliation.io_write_bytes.map(|bytes| bytes.get()),
+        source: Some(source.to_owned()),
+        coverage: Some(coverage.to_owned()),
+        gap_pid,
+    };
+    let agrees = coverage == "complete"
+        && cells.cpu_us == Some(0)
+        && cells.io_read_bytes.is_none_or(|bytes| bytes == 0)
+        && cells.io_write_bytes.is_none_or(|bytes| bytes == 0);
+    (!agrees).then_some(cells)
+}
+
+/// The rows of `job`'s span: its start, the usage its terminal sample states as unattributed if
+/// it states any, then its end as `entry_type` in `state`.
 fn expected_span(
     job: &cowshed_core::api::JobInfo,
     entry_type: &str,
     state: &str,
-) -> [JobSpanRow; 2] {
-    let row = |entry_type: &str, job_state: Option<&str>| JobSpanRow {
+) -> Vec<JobSpanRow> {
+    let row = |entry_type: &str, message: &str, job_state: Option<&str>| JobSpanRow {
         trace_id: job.trace.trace_id.as_str().to_owned(),
         thread_id: cowshed_core::runtime::job_spans::job_span_thread(
             &job.repo_id,
@@ -6084,20 +6160,36 @@ fn expected_span(
         span_id: 1,
         parent_span_id: None,
         entry_type: entry_type.to_owned(),
-        message: "cowshed.job".to_owned(),
+        message: message.to_owned(),
         repo_id: job.repo_id.as_str().to_owned(),
         workspace_incarnation: job.workspace_incarnation.as_str().to_owned(),
         job_id: job.job_id.get(),
         grant_revision: job.grant_revision,
         w3c_span_id: u64::from_str_radix(job.trace.span_id.as_str(), 16).unwrap(),
         job_state: job_state.map(str::to_owned),
+        unattributed: Unattributed::default(),
     };
-    [row("span-start", None), row(entry_type, Some(state))]
+    let unattributed = job
+        .resources
+        .as_ref()
+        .and_then(|sample| stated_unattributed(&sample.accounting))
+        .map(|unattributed| JobSpanRow {
+            unattributed,
+            ..row("info", "job.unattributed", None)
+        });
+    [
+        Some(row("span-start", "cowshed.job", None)),
+        unattributed,
+        Some(row(entry_type, "cowshed.job", Some(state))),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
 }
 
-/// The job rows are exactly `spans` in sealing order. Process/reconciliation rows share this
-/// writer's monotonically increasing sequence; they do not occupy additional job-span rows.
-fn assert_job_spans(telemetry: &Path, spans: &[[JobSpanRow; 2]]) {
+/// Asserts the segments under `telemetry` are exactly `spans`, each job's rows in sealing order,
+/// each named `job-<order>-<writer>.arrow` by one writer counting from 1.
+fn assert_job_spans(telemetry: &Path, spans: &[Vec<JobSpanRow>]) {
     let sealed = job_spans(telemetry);
     let names = sealed
         .iter()
@@ -6105,8 +6197,8 @@ fn assert_job_spans(telemetry: &Path, spans: &[[JobSpanRow; 2]]) {
         .collect::<Vec<_>>();
     assert_eq!(
         names.len(),
-        spans.len() * 2,
-        "two sealed segments per job: {names:?}"
+        spans.iter().map(Vec::len).sum::<usize>(),
+        "one sealed segment per row of each job's span: {names:?}"
     );
     let writer = &names[0]["job-00000000000000000001-".len()..];
     let mut previous = 0;
@@ -6358,7 +6450,9 @@ async fn a_served_supervisor_answers_its_trace_health() {
 }
 
 /// The production supervisor's own spawn path, real `true` and `false` under seatbelt: each
-/// exec and its terminal leave one sealed job span carrying the trace context it was given.
+/// exec and its terminal leave one sealed job span carrying the trace context it was given: its
+/// start, the usage its terminal sample states as unattributed -- a polled census never covers
+/// the whole tree -- and its end.
 #[cfg(target_os = "macos")]
 #[tokio::test]
 #[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
@@ -6409,6 +6503,10 @@ async fn host_controller_a_real_exec_seals_one_job_span_through_the_production_s
     let clean = handle.wait(job).await.unwrap();
     assert_eq!(clean.exit, Some(ExitStatus::Exited { code: 0 }));
     assert_eq!(clean.trace, adopted_trace());
+    assert!(
+        clean.resources.is_some(),
+        "a real exec owns a process: {clean:?}"
+    );
     let health = handle.trace_health().await.unwrap();
     assert_eq!(health.failed, 0, "{health:?}");
     assert_eq!(health.recorded, sealed_trace_count(&telemetry));
@@ -6420,6 +6518,10 @@ async fn host_controller_a_real_exec_seals_one_job_span_through_the_production_s
         .unwrap();
     let failed = handle.wait(job).await.unwrap();
     assert_eq!(failed.exit, Some(ExitStatus::Exited { code: 1 }));
+    assert!(
+        failed.resources.is_some(),
+        "a real exec owns a process: {failed:?}"
+    );
     let health = handle.trace_health().await.unwrap();
     assert_eq!(health.failed, 0, "{health:?}");
     assert_eq!(health.recorded, sealed_trace_count(&telemetry));
@@ -6486,7 +6588,7 @@ async fn a_job_span_states_the_admission_host_and_the_terminal_sample_s_host() {
         terminal.volumes
     );
     let health = handle.trace_health().await.unwrap();
-    assert_eq!((health.recorded, health.failed), (2, 0), "{health:?}");
+    assert_eq!((health.recorded, health.failed), (3, 0), "{health:?}");
 
     let facts = |batch: &arrow_array::RecordBatch| {
         let cell = |name: &str| batch.column_by_name(name).expect(name).clone();
@@ -6506,7 +6608,12 @@ async fn a_job_span_states_the_admission_host_and_the_terminal_sample_s_host() {
         )
     };
     let batches = job_span_batches(&telemetry);
-    assert_eq!(batches.len(), 2, "a start and an end row");
+    assert_eq!(
+        batches.len(),
+        3,
+        "a start row, the unattributed usage its terminal sample states -- a polled census never \\
+         covers the whole tree -- and an end row"
+    );
 
     // The start row's host lies between independent reads taken around admission.
     let milli = |host| HostColumns::of(host).expect("a host in range");
@@ -6522,10 +6629,101 @@ async fn a_job_span_states_the_admission_host_and_the_terminal_sample_s_host() {
     assert_eq!(start_cores, Some(before.cores.get()));
     assert_eq!((start_workspace, start_build), (None, None));
 
+    // The unattributed-usage row states no host or volume fact of its own.
+    assert_eq!(facts(&batches[1].1), (None, None, None, None));
+
     // The end row is the terminal sample's host, and no volume change it did not state.
     let host = milli(terminal.host);
     assert_eq!(
-        facts(&batches[1].1),
+        facts(&batches[2].1),
         (Some(host.load1_milli), Some(host.cores), None, None)
     );
+}
+
+/// What the job's totals hold and no observed process counted -- children that forked, burned CPU
+/// and were reaped between two samples -- is stated whole by the job's span: one unattributed
+/// row, just before its end, whose cells are the terminal sample's own reconciliation. The macOS
+/// source has no storage bytes to compare, so those cells are null, never zero.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn cpu_the_observed_processes_never_counted_is_the_job_span_s_unattributed_row() {
+    let (mut supervisor_config, root) = isolated_config("unattributed-row");
+    let telemetry = root.join("telemetry");
+    std::fs::create_dir(&telemetry).unwrap();
+    supervisor_config.telemetry_root = Some(telemetry.clone());
+    let mut harness = warm_harness(supervisor_config);
+    let (handle, spawned) = (harness.handle.clone(), &mut harness.spawned);
+    let job_id = handle
+        .exec(None, None, request(StdinSource::Empty))
+        .await
+        .unwrap();
+    let job = spawned.recv().await.unwrap();
+    let mut leader = Scripted::start(&format!(
+        "{burner} &\n{burner} &\nwait\necho reaped\nread line\n",
+        burner = burner()
+    ));
+    deliver(
+        &handle,
+        &job,
+        ProcessEvent::Started {
+            job_id,
+            process: owned(&leader.child, Instant::now()),
+        },
+        0,
+    )
+    .await;
+    let burned = leader.burned() + leader.burned();
+    leader.expect("reaped");
+
+    let leader = leader.exit();
+    complete(&job, b"", b"", ExitStatus::Exited { code: 0 }).await;
+    let ended = handle.wait(job_id).await.unwrap();
+    let terminal = ended.resources.clone().expect("a terminal sample");
+    let reconciliation = *terminal.accounting.reconciliation();
+    assert!(
+        reconciliation.cpu_us.get() > i64::try_from(burned / 2).unwrap(),
+        "the reaped children's {burned} us are in the job's totals and in no observed process: \
+         {reconciliation:?}"
+    );
+    assert!(
+        matches!(reconciliation.coverage, ProcessCoverage::Gap { .. }),
+        "a polled census never claims the whole tree: {reconciliation:?}"
+    );
+
+    let health = handle.trace_health().await.unwrap();
+    assert_eq!((health.recorded, health.failed), (3, 0), "{health:?}");
+    assert_job_spans(&telemetry, &[expected_span(&ended, "span-ok", "exited")]);
+    let rows = job_spans(&telemetry);
+    let stated = &rows[1].1;
+    assert_eq!(
+        (stated.entry_type.as_str(), stated.message.as_str()),
+        ("info", "job.unattributed")
+    );
+    assert_eq!(
+        stated.unattributed.cpu_us,
+        Some(reconciliation.cpu_us.get())
+    );
+    assert_eq!(
+        (
+            stated.unattributed.io_read_bytes,
+            stated.unattributed.io_write_bytes
+        ),
+        (None, None),
+        "the source counts no storage bytes: they are unavailable, not zero"
+    );
+    assert_eq!(
+        stated.unattributed.source.as_deref(),
+        Some("macOsRusageChildren")
+    );
+    assert_ne!(
+        stated.unattributed.coverage.as_deref(),
+        Some("complete"),
+        "the span states the gap the sample states"
+    );
+    assert!(
+        stated.unattributed.gap_pid.is_some(),
+        "every gap a macOS census names has the process it is about: {:?}",
+        stated.unattributed
+    );
+    reap(leader);
 }
