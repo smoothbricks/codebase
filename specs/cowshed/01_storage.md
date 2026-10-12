@@ -607,23 +607,34 @@ are host facts, not cowshed bugs, and every rule that budgets disk-tool calls ex
    finding whose next step is `cowshed doctor`, never "repair storage", and the system runner records the boot's first:
    the boot is spent, with the image devices' counts and the orphaned helpers at that moment when they can be read,
    until a later attach in the same boot succeeds (killing orphans frees the pool without a reboot) or
-   `attach-budget --clear` ends it. That first 150's leaked count becomes the ceiling only when no orphaned helper could
-   have caused it; until one does, the ceiling is the observed 1024, and headroom is the ceiling minus the devices
-   leaked now. A ceiling only moves down and survives reboots, so `attach-budget --clear` also forgets it, back to the
-   observed 1024, and keeps the last exhaustion as evidence. A record that does not parse proves nothing: it reads as
-   empty with a warning naming the file, the kernel is still reported, and the next write (a 150, a kill, a clear)
-   replaces it. A refusal of the lane gate always names what frees enough: the orphaned helpers for a spent boot the
-   leaked devices do not explain, `attach-budget --clear` when the recorded ceiling alone is below the need, and
-   otherwise a reboot, preceded by the `diskarbitrationd` restart when volumes or media leaked. `doctor` reports
-   `disk-image-attach-budget`: the four classes' instances against their registered entries, the ceiling and its source,
-   the headroom, and the disk-image commands killed at their hard deadline this boot, each a probable leaked device. It
-   is an error while the boot is spent ("attach pool exhausted", with "reboot required" only when the leaked devices
-   account for it), a warning when the headroom falls to a quarter of the ceiling, 64 volumes or media have leaked, or a
-   command was killed, and its hint names what frees each: `sudo killall diskarbitrationd` for volumes and media, a
-   reboot for image devices, and the orphaned helpers first for a 150 the leaked devices do not explain. Orphaned
-   helpers are named only when two reads in a row agree and no `diskutil` or `hdiutil` ran during either, since a helper
-   whose attach is under way has no device yet and killing it mid-attach is what leaks one; killing orphans frees their
-   mappings, never a leaked device.
+   `cowshed doctor --clear-attach-budget` ends it. That first 150's leaked count becomes the ceiling only when no
+   orphaned helper could have caused it; until one does, the ceiling is the observed 1024, and headroom is the ceiling
+   minus the devices leaked now. A ceiling only moves down and survives reboots, so
+   `cowshed doctor --clear-attach-budget` also forgets it, back to the observed 1024, and keeps the last exhaustion as
+   evidence. A record that does not parse proves nothing: it reads as empty with a warning naming the file, the kernel
+   is still reported, and the next write (a 150, a kill, a clear) replaces it. A refusal of the lane gate always names
+   what frees enough: the orphaned helpers for a spent boot the leaked devices do not explain,
+   `cowshed doctor --clear-attach-budget` when the recorded ceiling alone is below the need, and otherwise a reboot,
+   preceded by the `diskarbitrationd` restart when volumes or media leaked. `doctor` reports `disk-image-attach-budget`:
+   the four classes' instances against their registered entries, the ceiling and its source, the headroom, and the
+   disk-image commands killed at their hard deadline this boot, each a probable leaked device. It is an error while the
+   boot is spent ("attach pool exhausted", with "reboot required" only when the leaked devices account for it), a
+   warning when the headroom falls to a quarter of the ceiling, 64 volumes or media have leaked, or a command was
+   killed, and its hint names what frees each: `sudo killall diskarbitrationd` for volumes and media, a reboot for image
+   devices, and the orphaned helpers first for a 150 the leaked devices do not explain. Orphaned helpers are named only
+   when two reads in a row agree and no `diskutil` or `hdiutil` ran during either, since a helper whose attach is under
+   way has no device yet and killing it mid-attach is what leaks one; killing orphans frees their mappings, never a
+   leaked device.
+
+   **A disk-image command is detached from its caller.** It runs in its own session, ignores the hangup, interrupt and
+   terminate signals addressed to it, and writes its output to per-run files the runner reads back after its wait, never
+   to the caller's pipes. A caller killed mid-attach — an agent tool deadline, a process-group kill of `cowshed exec`, a
+   supervisor reaped with its tree — therefore cannot interrupt it or wedge it on a dead pipe: the command finishes, and
+   the next invocation reconciles the result from the kernel's attachment inventory (an attach that completed is
+   registered, one that never started left nothing). The runner's 15-minute hard deadline is the only killer. The
+   bounded-exec RAM volume's detach follows the same rule on its side: it is never killed at its deadline, its wait is
+   bounded and reported by name, and a stray's detach gets a short bound before the creator reports it and gives the
+   create claim back, so one wedged stray cannot hold a chain of creators.
 
    **No disk-image command is killed at its deadline.** For a `diskutil image …` or `hdiutil` child the 120 s disk-child
    deadline is a warning point, not a kill: it is waited for, synchronously and still holding its leases, and names its
