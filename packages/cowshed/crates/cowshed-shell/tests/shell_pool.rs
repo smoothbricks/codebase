@@ -1197,16 +1197,23 @@ async fn host_controller_a_job_s_sample_names_its_whole_group_and_none_after_a_k
         .collect();
     let leader = group[0];
     group.sort_unstable();
-    let mut running = handle
-        .resources(job)
-        .await
-        .expect("a running job is sampled");
-    running.members.sort_unstable();
-    assert_eq!(
-        (running.leader_pid, running.members),
-        (leader, group),
-        "the leader and both children, nothing more"
-    );
+    // The pid file proves the command started. The sample that names its
+    // leader and held members is the supervisor's own boundary, not that write.
+    let running = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let mut sample = handle
+                .resources(job)
+                .await
+                .expect("a running job is sampled");
+            sample.members.sort_unstable();
+            if sample.leader_pid == leader && sample.members == group {
+                break sample;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the command's own sample names its leader and both held children");
 
     handle.kill(job).await.expect("kill");
     let ended = tokio::time::timeout(Duration::from_secs(60), handle.wait(job))
