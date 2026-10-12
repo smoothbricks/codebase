@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use super::{MacOsApfsExecutionHost, io_error};
+use crate::build_volume::nx::Holder;
 use crate::build_volume::{
     BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord, BuildVolumeRole, LinkResolution,
     ReleaseClaim, link,
@@ -19,6 +20,7 @@ use crate::storage::apfs::{ApfsExecutionHost, ApfsStorageError};
 use crate::storage::lifecycle::ResizeOutcome;
 use cowshed_apfs::image::ImageCapacity;
 use cowshed_apfs::{ApfsBackend, CommandRunner, DetachIntent, MountAccess};
+use cowshed_apfs::{ApfsBackend, CommandRunner, DetachIntent, MountAccess, mount_is_in_progress};
 use cowshed_os::process::Holder;
 
 /// What releasing a build volume did.
@@ -283,21 +285,53 @@ where
                 return Ok(mount);
             }
         };
-        for mounted in self.mount_source.mounts()? {
-            if mounted.source_device != attachment.volume_device() {
-                continue;
+        let lease = self.backend.prepare_mount(&attachment)?;
+        let observed = || -> Result<bool, ApfsStorageError> {
+            let expected = MountPoint::new(&mount);
+            let mut found = false;
+            for mounted in self.mount_source.mounts()? {
+                match (
+                    mounted.source_device == attachment.volume_device(),
+                    expected.names(&mounted.mount_point),
+                ) {
+                    (true, true) => found = true,
+                    (false, false) => {}
+                    _ => {
+                        return Err(ApfsStorageError::Host(format!(
+                            "build volume {id} image {} expects {} at {}, but the kernel mounts {} at {}",
+                            image.display(),
+                            attachment.volume_device(),
+                            mount.display(),
+                            mounted.source_device,
+                            mounted.mount_point.display(),
+                        )));
+                    }
+                }
             }
-            if MountPoint::new(&mount).names(&mounted.mount_point) {
-                return Ok(mount);
+            Ok(found)
+        };
+        // Attachment recovery released its image lease, though its raw pin survived. A second
+        // mounter may have won that gap: decide only after reacquiring the lease, and retain it
+        // through both the command and any re-observation of the kernel's refusal.
+        if observed()? {
+            return Ok(mount);
+        }
+        if let Err(error) = lease.mount(&mount, MountAccess::ReadWrite, false) {
+            if !mount_is_in_progress(&error) {
+                return Err(error.into());
             }
+            let finding = match observed() {
+                Ok(true) => return Ok(mount),
+                Ok(false) => "the expected mount is absent".to_owned(),
+                Err(observation) => observation.to_string(),
+            };
             return Err(ApfsStorageError::Host(format!(
-                "build volume {id} is mounted at {}, not at {}",
-                mounted.mount_point.display(),
-                mount.display()
+                "cannot adopt build volume {id} image {} device {} at {}: {error}; {finding}",
+                image.display(),
+                attachment.volume_device(),
+                mount.display(),
             )));
         }
-        self.backend
-            .mount(&attachment, &mount, MountAccess::ReadWrite, false)?;
         Ok(mount)
     }
 

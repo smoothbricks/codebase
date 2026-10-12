@@ -565,6 +565,14 @@ an integration workspace; "the target" is whichever one it is.
    let a land's `close-target` pin open a device a concurrent `cowshed new` has already detached, after Git delivery but
    before the build-link swap. No retry or wider target-lock interval substitutes for this identity handoff.
 
+   The mount-table decision is made under the image lease reacquired for mounting, not in the gap after attachment
+   recovery releases its lease. A second mounter can win that gap without changing the pinned device. The image lease
+   and raw pin remain held through the decision and command. If `mount_apfs` reports `Operation already in progress`,
+   cowshed observes the mount table once more under that same authority: only the expected volume at its canonical
+   mountpoint is adopted. An absent mount, a different device or mountpoint, or an unreadable table refuses with the
+   image, expected device and mountpoint and the original command failure. There is no blind mount retry; unrelated
+   command failures are never converted into success by a subsequent mount observation.
+
    The land holds the target's image lock from 5.6 until 6.4 has renamed the target's link and a kept workspace has its
    fresh clone of the target's latest seed (the new one, or the previous one retained by a skipped capture). Every fork
    of the target holds the same lock from before it reads the target's seed and link until it links its own (Fork steps

@@ -1994,6 +1994,63 @@ pub struct MacOsApfsBackend<R, S = ThreadSleeper> {
     settle: DetachSettleGrace,
 }
 
+/// A verified volume pinned under its image lease. Keep this value alive through the
+/// mount-table decision and any observation of a refused mount, not merely the child command.
+pub(crate) struct MountLease<'a, R, S> {
+    backend: &'a MacOsApfsBackend<R, S>,
+    attachment: &'a AttachedImage,
+    inherited_pin: std::sync::MutexGuard<'a, Option<Fenced<File>>>,
+    _fresh_pin: Option<Fenced<File>>,
+    _lease: Option<Fenced<File>>,
+}
+
+impl<R, S> Drop for MountLease<'_, R, S> {
+    fn drop(&mut self) {
+        self.inherited_pin.take();
+    }
+}
+
+impl<R: CommandRunner, S: Sleeper> MountLease<'_, R, S> {
+    pub(crate) fn mount(
+        &self,
+        mount_point: &Path,
+        access: MountAccess,
+        browse: bool,
+    ) -> Result<(), ApfsError> {
+        let attachment = self.attachment;
+        let backend = self.backend;
+        fs::create_dir_all(mount_point).map_err(|source| ApfsError::FileOperation {
+            operation: "create mount point",
+            path: mount_point.to_owned(),
+            source,
+        })?;
+        // `noatime`: builds are read-heavy, and access-time updates on read are metadata writes no
+        // workflow here consults.
+        let options = match (access, browse) {
+            (MountAccess::ReadWrite, false) => "nobrowse,owners,noatime",
+            (MountAccess::ReadWrite, true) => "owners,noatime",
+            (MountAccess::ReadOnly, false) => "rdonly,nobrowse,owners,noatime",
+            (MountAccess::ReadOnly, true) => "rdonly,owners,noatime",
+        };
+        let mounted = timed_apfs_step(apfs_step_leg(&attachment.image), "mount", || {
+            backend.run_checked(
+                "mount verified APFS volume",
+                mount_request(attachment, options, mount_point),
+            )
+        });
+        let opted_out = match (&mounted, access) {
+            (Ok(_), MountAccess::ReadWrite) => {
+                timed_apfs_step(apfs_step_leg(&attachment.image), "event-log", || {
+                    backend.opt_out_of_event_log(attachment, mount_point, options)
+                })
+                .inspect(|()| report_spotlight_opt_out(mount_point))
+            }
+            _ => Ok(()),
+        };
+        mounted.and(opted_out)
+    }
+}
+
 impl<R> MacOsApfsBackend<R> {
     pub fn new(runner: R) -> Self {
         Self {
@@ -2027,6 +2084,32 @@ impl<R, S> MacOsApfsBackend<R, S> {
 }
 
 impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
+    /// Acquire mount authority before consulting the mount table. A recovered attachment's
+    /// pin fences its device across this reacquisition, but another mounter may have won.
+    pub(crate) fn prepare_mount<'a>(
+        &'a self,
+        attachment: &'a AttachedImage,
+    ) -> Result<MountLease<'a, R, S>, ApfsError> {
+        let lease = self.image_lease(&attachment.image)?;
+        let inherited_pin = attachment
+            .pin
+            .lock()
+            .expect("attachment pin mutex poisoned");
+        let fresh_pin = if inherited_pin.is_some() {
+            // The verified IOMedia handle survived fsck and still prevents eject.
+            None
+        } else {
+            self.pin_attached_volume(attachment)?
+        };
+        Ok(MountLease {
+            backend: self,
+            attachment,
+            inherited_pin,
+            _fresh_pin: fresh_pin,
+            _lease: lease,
+        })
+    }
+
     /// Hold `image`'s lease ([`CommandRunner::image_lease`]), keyed by the identity the
     /// attachment inventory records for it. Source holder censuses use the same exclusion as
     /// recovery mutations, so a cosmetic rename's mount descriptor is released before they run.
@@ -3382,43 +3465,8 @@ impl<R: CommandRunner, S: Sleeper> ApfsBackend for MacOsApfsBackend<R, S> {
         access: MountAccess,
         browse: bool,
     ) -> Result<(), ApfsError> {
-        let _lease = self.image_lease(&attachment.image)?;
-        let mut inherited_pin = attachment
-            .pin
-            .lock()
-            .expect("attachment pin mutex poisoned");
-        let _fresh_pin = if inherited_pin.is_some() {
-            // The same verified IOMedia handle survived fsck and still prevents eject.
-            // A second registry read cannot add identity evidence that the held kernel pin
-            // lacks.
-            None
-        } else {
-            self.pin_attached_volume(attachment)?
-        };
-        fs::create_dir_all(mount_point).map_err(|source| ApfsError::FileOperation {
-            operation: "create mount point",
-            path: mount_point.to_owned(),
-            source,
-        })?;
-        // `noatime`: builds are read-heavy, and access-time updates on read are metadata writes no
-        // workflow here consults.
-        let options = mount_options(access, browse);
-        let mounted = timed_apfs_step(apfs_step_leg(&attachment.image), "mount", || {
-            self.run_checked(
-                "mount verified APFS volume",
-                mount_request(attachment, options, mount_point),
-            )
-        });
-        let opted_out = match (&mounted, access) {
-            (Ok(_), MountAccess::ReadWrite) => {
-                timed_apfs_step(apfs_step_leg(&attachment.image), "event-log", || {
-                    self.opt_out_of_event_log(attachment, mount_point, options)
-                })
-            }
-            _ => Ok(()),
-        };
-        inherited_pin.take();
-        mounted.and(opted_out)
+        self.prepare_mount(attachment)?
+            .mount(mount_point, access, browse)
     }
 
     fn detach(&self, attachment: &AttachedImage, intent: DetachIntent) -> Result<(), ApfsError> {
@@ -3656,6 +3704,14 @@ fn attachment_capacity(
             "matching image has no registered whole-device size".into(),
         )
     })
+}
+
+/// The mount helper's already-in-progress refusal is an invitation to observe, not to retry.
+/// Unrelated failures remain failures even if a matching mount appears afterwards.
+pub(crate) fn mount_is_in_progress(error: &ApfsError) -> bool {
+    matches!(error, ApfsError::CommandFailed { request, output, .. }
+        if request.program == Path::new(MOUNT_APFS)
+            && contains_bytes(&output.stderr, b"Operation already in progress"))
 }
 
 /// Whether a failed detach failed because something still holds the volume.
