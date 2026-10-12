@@ -488,8 +488,8 @@ reviewer, who decide whether the variants share one walk:
 - **same-scenario:** one case's skeleton is the other's head (at least one statement) and tail around exactly one
   statement of its own. The tail is the action and its outcome: at least three statements equal in flow, with at least
   one action among them. The injected step differs, for example which crash window or precondition. Extra trailing pure
-  assertions on either side are more checks on the same outcome. Measured on two corpora at about 80% precision, which
-  is too low to refuse. Walk the variants over one fixture, or make one table over the injected step.
+  assertions on either side are more checks on the same outcome. Its precision is too low to refuse. Walk the variants
+  over one fixture, or make one table over the injected step.
 
 A separate case stays only for a distinct boundary or edge: its setup or path diverges, or it needs a state the walk's
 earlier steps destroy. Each diagnostic names the file, both cases, the shared statement count and that remedy.
