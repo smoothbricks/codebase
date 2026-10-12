@@ -222,7 +222,9 @@ file event and another graph computation.
 
 ### Runtime inputs
 
-Every runtime input, inferred or declared, runs through `runtime-input.sh`:
+Every runtime input, inferred or declared, starts with `sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh`.
+Command-specific environment assignments follow the wrapper as `env NAME=value command ...`, so setup failures and
+command failures use the same fail-closed path. For example:
 
 ```json
 { "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh bun --version" }
