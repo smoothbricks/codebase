@@ -2805,6 +2805,7 @@ mod tests {
             forked_from: None,
             created_trace: "re-adoption-lifecycle".to_owned(),
             lineage: Some(Vec::new()),
+            owned_links_revision: 0,
         };
         let marker_path = checkout.join(crate::storage::WORKSPACE_MARKER_PATH);
         fs::create_dir_all(marker_path.parent().expect("marker parent")).expect("marker dir");
