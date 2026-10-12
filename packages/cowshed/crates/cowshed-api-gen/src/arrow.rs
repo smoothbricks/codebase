@@ -23,6 +23,7 @@ pub enum ArrowKind {
     Dict8,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ArrowRecord {
     pub prefix: String,
     pub fields: String,
