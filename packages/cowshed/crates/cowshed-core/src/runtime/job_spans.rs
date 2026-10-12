@@ -16,8 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use arrow_array::{ArrayRef, RecordBatch, StringArray, UInt64Array};
-use arrow_schema::{DataType, Field};
+use arrow_array::RecordBatch;
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
@@ -34,6 +33,7 @@ use crate::runtime::job_boundary::{BoundaryColumns, JobSpanBoundary, boundary_co
 use crate::runtime::job_unattributed::{UnattributedSpanRow, seal_unattributed_row};
 use crate::runtime::process_spans::{ProcessSpanError, ProcessSpanRow, seal_process_row};
 use crate::storage::job_artifact::state_name;
+use crate::storage::trace_columns::{Optional, Required, U64, Utf8, trace_columns};
 use crate::storage::trace_segment::{
     EntryType, SpanAddress, SystemColumns, SystemRow, TelemetryDate, TraceSegmentError,
     seal_segment, trace_batch,
@@ -458,6 +458,19 @@ fn seal_row(root: &Path, writer: Uuid, order: u64, row: &JobSpanRow) -> Result<(
     Ok(())
 }
 
+trace_columns! {
+    /// One row of a job span's custom columns (13_telemetry.md, "Job span segments"): the job's
+    /// durable key and W3C span id, the grant revision it ran under and, on its end row, its
+    /// state.
+    pub struct JobColumns, fields: job_fields, arrays: job_column_arrays;
+    repo_id: Required<Utf8>,
+    workspace_incarnation: Required<Utf8>,
+    job_id: Required<U64>,
+    grant_revision: Required<U64>,
+    w3c_span_id: Required<U64>,
+    job_state: Optional<Utf8>,
+}
+
 fn job_span_batch(row: &JobSpanRow, timestamp_ns: i64) -> Result<RecordBatch, TraceSegmentError> {
     let mut system = SystemColumns::with_capacity(1);
     system.push(SystemRow {
@@ -471,37 +484,18 @@ fn job_span_batch(row: &JobSpanRow, timestamp_ns: i64) -> Result<RecordBatch, Tr
         entry_type: row.edge.entry_type(),
         message: Some(JOB_SPAN_MESSAGE),
     })?;
-    let w3c_span_id = u64::from_str_radix(row.trace.span_id.as_str(), 16)
-        .expect("a SpanId is exactly 16 lowercase hex digits");
-    let custom: [(Field, ArrayRef); 6] = [
-        (
-            Field::new("repo_id", DataType::Utf8, false),
-            Arc::new(StringArray::from(vec![row.repo_id.as_str()])),
-        ),
-        (
-            Field::new("workspace_incarnation", DataType::Utf8, false),
-            Arc::new(StringArray::from(vec![row.workspace_incarnation.as_str()])),
-        ),
-        (
-            Field::new("job_id", DataType::UInt64, false),
-            Arc::new(UInt64Array::from(vec![row.job_id.get()])),
-        ),
-        (
-            Field::new("grant_revision", DataType::UInt64, false),
-            Arc::new(UInt64Array::from(vec![row.grant_revision])),
-        ),
-        (
-            Field::new("w3c_span_id", DataType::UInt64, false),
-            Arc::new(UInt64Array::from(vec![w3c_span_id])),
-        ),
-        (
-            Field::new("job_state", DataType::Utf8, true),
-            Arc::new(StringArray::from(vec![row.edge.state().map(state_name)])),
-        ),
-    ];
+    let columns = JobColumns {
+        repo_id: row.repo_id.as_str().to_owned(),
+        workspace_incarnation: row.workspace_incarnation.as_str().to_owned(),
+        job_id: row.job_id.get(),
+        grant_revision: row.grant_revision,
+        w3c_span_id: u64::from_str_radix(row.trace.span_id.as_str(), 16)
+            .expect("a SpanId is exactly 16 lowercase hex digits"),
+        job_state: row.edge.state().map(|state| state_name(state).to_owned()),
+    };
     trace_batch(
         system,
-        custom
+        job_column_arrays([&columns])?
             .into_iter()
             .chain(boundary_columns(row.boundary.unwrap_or_default())?)
             .collect(),
