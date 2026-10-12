@@ -355,7 +355,11 @@ Absence there is a contradiction, not lag: it fails at once, as does an observed
 inventory is a typed refusal; each leaves both the attachment and backing file intact for diagnosis. No mutation is
 retried and no unproved device is formatted. Shared owned-image cleanup distinguishes this unformatted whole-device
 state from an APFS volume: it rechecks the exact mapping under the image's lease and releases only that owned device
-without deleting the backing file first.
+without deleting the backing file first. Every detach attempt, including a dissent retry and the final force, rechecks
+that mapping after the host storage lease is granted, immediately before spawning `hdiutil`. A check before the lease
+wait is not authority afterward: the image may have departed and another attachment, including a RAM volume, may have
+reused its `diskN`. Confirmed image absence needs no child; a positive conflicting mapping or unreadable inventory
+refuses the mutation. A release deduplicates whole-device views, so the same attachment is never detached twice.
 
 The disk-images framework behind `diskutil image` and `hdiutil` answers through helper daemons over XPC, and under host
 contention it can lose them: a test gate at load average ~350 saw ten concurrent attaches fail at once with exit 1 and

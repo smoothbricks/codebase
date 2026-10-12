@@ -14879,6 +14879,20 @@ mod retired_recovery_tests {
     struct NoDiskCommands;
 
     impl crate::apfs::CommandRunner for NoDiskCommands {
+        fn run_guarded<E>(
+            &self,
+            request: &crate::apfs::CommandRequest,
+            check: impl FnOnce() -> std::result::Result<bool, E>,
+        ) -> std::result::Result<Option<crate::apfs::CommandOutput>, E>
+        where
+            E: From<crate::apfs::CommandRunError> + std::fmt::Display,
+        {
+            if check()? {
+                self.run(request).map(Some).map_err(E::from)
+            } else {
+                Ok(None)
+            }
+        }
         fn run(
             &self,
             request: &crate::apfs::CommandRequest,
@@ -19397,6 +19411,20 @@ mod volume_labeller_tests {
     }
 
     impl crate::apfs::CommandRunner for RecordedDiskCommands {
+        fn run_guarded<E>(
+            &self,
+            request: &crate::apfs::CommandRequest,
+            check: impl FnOnce() -> std::result::Result<bool, E>,
+        ) -> std::result::Result<Option<crate::apfs::CommandOutput>, E>
+        where
+            E: From<crate::apfs::CommandRunError> + std::fmt::Display,
+        {
+            if check()? {
+                self.run(request).map(Some).map_err(E::from)
+            } else {
+                Ok(None)
+            }
+        }
         fn run(
             &self,
             request: &CommandRequest,

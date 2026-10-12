@@ -24,6 +24,20 @@ use cowshed_core::storage::recovery::{
 struct StubRunner;
 
 impl CommandRunner for StubRunner {
+    fn run_guarded<E>(
+        &self,
+        request: &cowshed_core::apfs::CommandRequest,
+        check: impl FnOnce() -> Result<bool, E>,
+    ) -> Result<Option<cowshed_core::apfs::CommandOutput>, E>
+    where
+        E: From<cowshed_core::apfs::CommandRunError> + std::fmt::Display,
+    {
+        if check()? {
+            self.run(request).map(Some).map_err(E::from)
+        } else {
+            Ok(None)
+        }
+    }
     fn run(
         &self,
         _request: &CommandRequest,

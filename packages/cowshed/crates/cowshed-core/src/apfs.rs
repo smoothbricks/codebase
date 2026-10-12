@@ -9,7 +9,7 @@ use crate::metadata::{IMAGE_EXTENSION, ImageCapacity, is_image_path};
 pub use crate::process::{CommandOutput, ProcessStatus};
 use crate::process::{fmt_command, fmt_command_failure, fmt_command_spawn};
 use std::collections::BTreeSet;
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io;
@@ -134,6 +134,16 @@ impl std::error::Error for CommandRunError {
 
 pub trait CommandRunner {
     fn run(&self, request: &CommandRequest) -> Result<CommandOutput, CommandRunError>;
+    /// Acquire the command's host disk lease, then check its authority immediately before
+    /// spawning. `false` means no child is needed. Every runner opts in explicitly: recording
+    /// runners check before recording; production checks inside the granted lifecycle phase.
+    fn run_guarded<E>(
+        &self,
+        request: &CommandRequest,
+        check: impl FnOnce() -> Result<bool, E>,
+    ) -> Result<Option<CommandOutput>, E>
+    where
+        E: From<CommandRunError> + fmt::Display;
     /// Hold `identity`'s image lease while that image's device mapping is read and used.
     ///
     /// `identity` is the absolute path produced by `attachment_inventory_path`, the same value
@@ -435,6 +445,34 @@ fn record_pool_outcome(request: &CommandRequest, output: &CommandOutput) {
 }
 
 impl CommandRunner for SystemCommandRunner {
+    fn run_guarded<E>(
+        &self,
+        request: &CommandRequest,
+        check: impl FnOnce() -> Result<bool, E>,
+    ) -> Result<Option<CommandOutput>, E>
+    where
+        E: From<CommandRunError> + fmt::Display,
+    {
+        let policy = DeadlinePolicy::for_request(request, DISK_CHILD_DEADLINE);
+        let output = crate::disk_lease::leased(&request.program, &request.args, || {
+            if !check()? {
+                return Ok(None);
+            }
+            Self::run_unleased(
+                request,
+                policy,
+                &mut |elapsed| warn_outlived(request, policy, elapsed),
+                &mut || record_killed(request),
+            )
+            .map(Some)
+            .map_err(E::from)
+        })?;
+        if let Some(output) = &output {
+            record_pool_outcome(request, output);
+        }
+        Ok(output)
+    }
+
     fn run(&self, request: &CommandRequest) -> Result<CommandOutput, CommandRunError> {
         self.run_with_deadline(request, DISK_CHILD_DEADLINE)
     }
@@ -2278,8 +2316,13 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
         intent: DetachIntent,
     ) -> Result<(), ApfsError> {
         let _lease = self.image_lease(image)?;
-        for view in self.release_views(image)? {
-            self.detach_image_device_unlocked(image, view.whole_device(), intent)?;
+        let devices = self
+            .release_views(image)?
+            .into_iter()
+            .map(|view| view.whole_device)
+            .collect::<BTreeSet<_>>();
+        for device in devices {
+            self.detach_image_device_unlocked(image, &device, intent)?;
         }
         Ok(())
     }
@@ -2489,23 +2532,27 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
     /// is finished with; a `WhenIdle` hands the dissent straight back so its verb can refuse.
     /// Only a dissent is retried — an invalid device or a missing tool fails immediately either
     /// way.
-    fn detach_device_checked(&self, target: &str, intent: DetachIntent) -> Result<(), ApfsError> {
+    fn detach_device_checked(
+        &self,
+        image: &Path,
+        target: &str,
+        intent: DetachIntent,
+    ) -> Result<bool, ApfsError> {
         if !is_kernel_device_path(target) {
             return Err(ApfsError::InvalidDetachTarget(PathBuf::from(target)));
         }
-        let target = OsStr::new(target);
         let mut waited = Duration::ZERO;
         let mut started = None;
         loop {
-            match self.detach_once(target, false) {
-                Ok(()) => return Ok(()),
+            match self.detach_once(image, target, false) {
+                Ok(detached) => return Ok(detached),
                 Err(error) if detach_was_dissented(&error) => {
                     if intent == DetachIntent::WhenIdle {
                         return Err(error);
                     }
                     let started = started.get_or_insert_with(std::time::Instant::now);
                     if self.grace.expired(waited, self.sleeper.elapsed(*started)) {
-                        return self.detach_once(target, true);
+                        return self.detach_once(image, target, true);
                     }
                     self.sleeper.sleep(self.grace.poll);
                     waited = waited.saturating_add(self.grace.poll);
@@ -2519,24 +2566,52 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
     /// eject went through, so it is kept as an attribute of the detach step whenever the eject
     /// was refused (`dissent=`, DiskArbitration's reason) or slower than the normal floor
     /// (`waited=`, at least [`SLOW_DETACH`]); a fast, accepted eject adds nothing to the trace.
-    fn detach_once(&self, target: &OsStr, force: bool) -> Result<(), ApfsError> {
+    fn detach_once(&self, image: &Path, target: &str, force: bool) -> Result<bool, ApfsError> {
         let mut args = Vec::with_capacity(3 + usize::from(force));
         args.push(OsString::from("detach"));
         if force {
             args.push(OsString::from("-force"));
         }
         args.push(OsString::from("-verbose"));
-        args.push(target.to_owned());
+        args.push(OsString::from(target));
         let started = std::time::Instant::now();
-        let result = self.run_checked("detach image", CommandRequest::new(HDIUTIL, args));
+        let request = CommandRequest::new(HDIUTIL, args);
+        crate::timing::attribute(
+            "apfs-command",
+            format_args!("detach image"),
+            "image",
+            image.display(),
+        );
+        let result = crate::timing::timed("apfs-command", format_args!("detach image"), || {
+            let output = self.runner.run_guarded(&request, || {
+                let held = self.attached_whole_devices(image)?;
+                if held.is_empty() {
+                    return Ok(false);
+                }
+                if !held.contains(target) {
+                    return Err(ApfsError::InvalidAttachmentInventory(format!(
+                        "{} still holds {held:?}, not {target}; retaining the attached \
+                         image rather than claiming it was released",
+                        image.display()
+                    )));
+                }
+                Ok(true)
+            })?;
+            match output {
+                Some(output) if !output.succeeded() => {
+                    Err(command_failed("detach image", request, output))
+                }
+                output => Ok(output),
+            }
+        });
         let account = match &result {
-            Ok(output) => {
+            Ok(Some(output)) => {
                 (started.elapsed() >= SLOW_DETACH).then_some(("waited", output.stderr.as_slice()))
             }
             Err(ApfsError::CommandFailed { output, .. }) => {
                 Some(("dissent", output.stderr.as_slice()))
             }
-            Err(_) => None,
+            Ok(None) | Err(_) => None,
         };
         if let Some((key, stderr)) = account {
             crate::timing::attribute(
@@ -2546,7 +2621,7 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
                 one_line(stderr),
             );
         }
-        result.map(|_| ())
+        result.map(|output| output.is_some())
     }
 
     /// Detach `whole_device` only while the kernel still shows `image` holding it.
@@ -2565,19 +2640,9 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
         whole_device: &str,
         intent: DetachIntent,
     ) -> Result<(), ApfsError> {
-        let held = self.attached_whole_devices(image)?;
-        if held.is_empty() {
-            return Ok(());
+        if self.detach_device_checked(image, whole_device, intent)? {
+            self.settle_detached_device(image, whole_device);
         }
-        if !held.contains(whole_device) {
-            return Err(ApfsError::InvalidAttachmentInventory(format!(
-                "{} still holds {held:?}, not {whole_device}; retaining the attached \
-                 image rather than claiming it was released",
-                image.display()
-            )));
-        }
-        self.detach_device_checked(whole_device, intent)?;
-        self.settle_detached_device(image, whole_device);
         Ok(())
     }
 
@@ -4978,6 +5043,7 @@ mod tests {
     use crate::scratch_apfs::ScratchRoot;
     use std::cell::{Ref, RefCell};
     use std::collections::{BTreeMap, VecDeque};
+    use std::ffi::OsStr;
 
     const BLANK_IMAGE_PLIST: &str = r#"<?xml version="1.0"?><plist><dict><key>system-entities</key><array>
       <dict><key>dev-entry</key><string>disk8</string><key>content-hint</key><string>GUID_partition_scheme</string></dict>
@@ -5063,6 +5129,20 @@ mod tests {
     }
 
     impl CommandRunner for RecordingRunner {
+        fn run_guarded<E>(
+            &self,
+            request: &crate::apfs::CommandRequest,
+            check: impl FnOnce() -> Result<bool, E>,
+        ) -> Result<Option<crate::apfs::CommandOutput>, E>
+        where
+            E: From<crate::apfs::CommandRunError> + std::fmt::Display,
+        {
+            if check()? {
+                self.run(request).map(Some).map_err(E::from)
+            } else {
+                Ok(None)
+            }
+        }
         fn run(&self, request: &CommandRequest) -> Result<CommandOutput, CommandRunError> {
             match self.next_reply(Seen::Command(request.clone())) {
                 Reply::Command(output) => Ok(output),
@@ -5372,6 +5452,20 @@ mod tests {
     }
 
     impl CommandRunner for StatefulMalformedAttachRunner {
+        fn run_guarded<E>(
+            &self,
+            request: &crate::apfs::CommandRequest,
+            check: impl FnOnce() -> Result<bool, E>,
+        ) -> Result<Option<crate::apfs::CommandOutput>, E>
+        where
+            E: From<crate::apfs::CommandRunError> + std::fmt::Display,
+        {
+            if check()? {
+                self.run(request).map(Some).map_err(E::from)
+            } else {
+                Ok(None)
+            }
+        }
         fn run(&self, request: &CommandRequest) -> Result<CommandOutput, CommandRunError> {
             self.steps.borrow_mut().push(Seen::Command(request.clone()));
             let args = argv(request);
@@ -6877,6 +6971,121 @@ mod tests {
         assert_eq!(backend.runner().steps(), [Seen::Inventory]);
     }
 
+    #[test]
+    fn detach_rechecks_the_image_after_the_storage_lease_wait() {
+        struct RecycledDuringWait {
+            image: PathBuf,
+            granted: std::cell::Cell<bool>,
+            commands: RefCell<Vec<CommandRequest>>,
+        }
+        impl CommandRunner for RecycledDuringWait {
+            fn run(&self, request: &CommandRequest) -> Result<CommandOutput, CommandRunError> {
+                self.commands.borrow_mut().push(request.clone());
+                Ok(CommandOutput::success([]))
+            }
+            fn run_guarded<E>(
+                &self,
+                request: &CommandRequest,
+                check: impl FnOnce() -> Result<bool, E>,
+            ) -> Result<Option<CommandOutput>, E>
+            where
+                E: From<CommandRunError> + fmt::Display,
+            {
+                // Waiting for the storage phase let our image depart and RAM reuse disk12.
+                self.granted.set(true);
+                if check()? {
+                    self.run(request).map(Some).map_err(E::from)
+                } else {
+                    Ok(None)
+                }
+            }
+            fn image_lease(&self, _: &Path) -> io::Result<Option<Fenced<File>>> {
+                Ok(None)
+            }
+            fn pin_raw_device(&self, _: &Path) -> io::Result<Option<Fenced<File>>> {
+                Ok(None)
+            }
+            fn attached_disk_images(&self) -> io::Result<Vec<AttachedDiskImage>> {
+                let mut attached =
+                    AttachedDiskImage::file(&self.image, None, [("/dev/disk12", "")]);
+                if self.granted.get() {
+                    attached.source = DiskImageSource::Url("ram://16777218".into());
+                }
+                Ok(vec![attached])
+            }
+            fn grow_image(&self, _: &Path, _: ImageCapacity) -> io::Result<()> {
+                panic!("detach never grows an image");
+            }
+        }
+        let attachment = identity_attachment("wait-recycled");
+        let backend = MacOsApfsBackend::new(RecycledDuringWait {
+            image: attachment.image.clone(),
+            granted: std::cell::Cell::new(false),
+            commands: RefCell::new(Vec::new()),
+        });
+
+        backend.detach(&attachment, DetachIntent::Release).unwrap();
+        assert!(backend.runner().granted.get());
+        assert!(backend.runner().commands.borrow().is_empty());
+    }
+
+    #[test]
+    fn detach_rechecks_the_image_before_forcing_a_recycled_device() {
+        let attachment = identity_attachment("force-recycled");
+        let backend = graced_backend([
+            holding(&attachment.image, &attachment.whole_device),
+            dissent(),
+            holding(&attachment.image, &attachment.whole_device),
+            dissent(),
+            holding(&attachment.image, &attachment.whole_device),
+            dissent(),
+            images(&[("/tmp/foreign.dmg", &["/dev/disk12"][..])]),
+        ]);
+
+        backend.detach(&attachment, DetachIntent::Release).unwrap();
+        let requests = backend.runner().requests();
+        assert_eq!(requests.len(), 3);
+        assert!(
+            requests
+                .iter()
+                .all(|request| !argv(request).contains(&"-force".into()))
+        );
+    }
+
+    #[test]
+    fn detach_rechecks_the_image_before_retrying_a_recycled_device() {
+        let attachment = identity_attachment("retry-recycled");
+        let backend = graced_backend([
+            holding(&attachment.image, &attachment.whole_device),
+            dissent(),
+            images(&[("/tmp/foreign.dmg", &["/dev/disk12"][..])]),
+        ]);
+
+        backend.detach(&attachment, DetachIntent::Release).unwrap();
+        assert_eq!(backend.runner().requests().len(), 1);
+        assert_eq!(
+            argv(&backend.runner().requests()[0]),
+            ["detach", "-verbose", "/dev/disk12"]
+        );
+    }
+
+    #[test]
+    fn release_detaches_a_duplicate_image_device_only_once() {
+        let image = temp_path("duplicate-release-view", IMAGE_EXTENSION);
+        let duplicate = AttachedDiskImage::file(&image, None, [("/dev/disk12", "")]);
+        let backend = graced_backend([
+            Reply::Inventory(Ok(vec![duplicate.clone(), duplicate])),
+            holding(&image, "/dev/disk12"),
+            ok([]),
+            no_images(),
+        ]);
+
+        backend
+            .release_every_attachment(&image, DetachIntent::Release)
+            .unwrap();
+        assert_eq!(backend.runner().requests().len(), 1);
+    }
+
     /// Detach-settle: a device already gone from the inventory costs one read and no waiting.
     #[test]
     fn detach_settle_returns_without_sleep_when_device_already_gone() {
@@ -6960,10 +7169,20 @@ mod tests {
     /// exactly once at the end of it.
     #[test]
     fn a_released_detach_spends_its_grace_before_forcing_once() {
-        let backend = graced_backend([dissent(), dissent(), dissent(), ok([])]);
+        let image = temp_path("detach-grace", IMAGE_EXTENSION);
+        let backend = graced_backend([
+            holding(&image, "/dev/disk4"),
+            dissent(),
+            holding(&image, "/dev/disk4"),
+            dissent(),
+            holding(&image, "/dev/disk4"),
+            dissent(),
+            holding(&image, "/dev/disk4"),
+            ok([]),
+        ]);
 
         backend
-            .detach_device_checked("/dev/disk4", DetachIntent::Release)
+            .detach_device_checked(&image, "/dev/disk4", DetachIntent::Release)
             .unwrap();
 
         let requests = backend.runner().requests();
@@ -6998,10 +7217,11 @@ mod tests {
     /// rollback must hand a live workspace's dissent back to their caller instead of forcing it.
     #[test]
     fn a_when_idle_detach_reports_the_dissent_without_waiting_or_forcing() {
-        let backend = graced_backend([dissent()]);
+        let image = temp_path("detach-idle", IMAGE_EXTENSION);
+        let backend = graced_backend([holding(&image, "/dev/disk4"), dissent()]);
 
         let error = backend
-            .detach_device_checked("/dev/disk4", DetachIntent::WhenIdle)
+            .detach_device_checked(&image, "/dev/disk4", DetachIntent::WhenIdle)
             .unwrap_err();
 
         assert!(matches!(
@@ -7028,9 +7248,10 @@ mod tests {
             (libc::EBUSY, "permission denied"),
             (1, "Resource busy"),
         ] {
-            let backend = graced_backend([failed(status, message)]);
+            let image = temp_path("detach-failed", IMAGE_EXTENSION);
+            let backend = graced_backend([holding(&image, "/dev/disk4"), failed(status, message)]);
             let error = backend
-                .detach_device_checked("/dev/disk4", DetachIntent::Release)
+                .detach_device_checked(&image, "/dev/disk4", DetachIntent::Release)
                 .unwrap_err();
             assert!(matches!(
                 error,
@@ -7229,6 +7450,20 @@ mod tests {
     }
 
     impl CommandRunner for PinWitness {
+        fn run_guarded<E>(
+            &self,
+            request: &crate::apfs::CommandRequest,
+            check: impl FnOnce() -> Result<bool, E>,
+        ) -> Result<Option<crate::apfs::CommandOutput>, E>
+        where
+            E: From<crate::apfs::CommandRunError> + std::fmt::Display,
+        {
+            if check()? {
+                self.run(request).map(Some).map_err(E::from)
+            } else {
+                Ok(None)
+            }
+        }
         fn run(&self, request: &CommandRequest) -> Result<CommandOutput, CommandRunError> {
             if request
                 .args
@@ -7309,6 +7544,20 @@ mod tests {
     }
 
     impl CommandRunner for ReseedBeforeMount {
+        fn run_guarded<E>(
+            &self,
+            request: &crate::apfs::CommandRequest,
+            check: impl FnOnce() -> Result<bool, E>,
+        ) -> Result<Option<crate::apfs::CommandOutput>, E>
+        where
+            E: From<crate::apfs::CommandRunError> + std::fmt::Display,
+        {
+            if check()? {
+                self.run(request).map(Some).map_err(E::from)
+            } else {
+                Ok(None)
+            }
+        }
         fn run(&self, request: &CommandRequest) -> Result<CommandOutput, CommandRunError> {
             assert_eq!(request.program, Path::new(MOUNT_APFS));
             assert!(request.args.iter().any(|arg| arg == "/dev/disk25s1"));
@@ -8464,6 +8713,20 @@ mod tests {
             held_while_growing: std::cell::Cell<bool>,
         }
         impl CommandRunner for LeaseProbe {
+            fn run_guarded<E>(
+                &self,
+                request: &crate::apfs::CommandRequest,
+                check: impl FnOnce() -> Result<bool, E>,
+            ) -> Result<Option<crate::apfs::CommandOutput>, E>
+            where
+                E: From<crate::apfs::CommandRunError> + std::fmt::Display,
+            {
+                if check()? {
+                    self.run(request).map(Some).map_err(E::from)
+                } else {
+                    Ok(None)
+                }
+            }
             fn run(&self, request: &CommandRequest) -> Result<CommandOutput, CommandRunError> {
                 panic!("growing spawned {request:?}");
             }

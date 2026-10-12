@@ -7780,6 +7780,20 @@ mod tests {
     }
 
     impl CommandRunner for TwoVolumeImage {
+        fn run_guarded<E>(
+            &self,
+            request: &crate::apfs::CommandRequest,
+            check: impl FnOnce() -> Result<bool, E>,
+        ) -> Result<Option<crate::apfs::CommandOutput>, E>
+        where
+            E: From<crate::apfs::CommandRunError> + std::fmt::Display,
+        {
+            if check()? {
+                self.run(request).map(Some).map_err(E::from)
+            } else {
+                Ok(None)
+            }
+        }
         fn run(
             &self,
             request: &crate::apfs::CommandRequest,

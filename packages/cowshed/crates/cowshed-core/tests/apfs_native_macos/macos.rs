@@ -142,6 +142,20 @@ impl RecordingRunner {
 }
 
 impl CommandRunner for RecordingRunner {
+    fn run_guarded<E>(
+        &self,
+        request: &cowshed_core::apfs::CommandRequest,
+        check: impl FnOnce() -> Result<bool, E>,
+    ) -> Result<Option<cowshed_core::apfs::CommandOutput>, E>
+    where
+        E: From<cowshed_core::apfs::CommandRunError> + std::fmt::Display,
+    {
+        if check()? {
+            self.run(request).map(Some).map_err(E::from)
+        } else {
+            Ok(None)
+        }
+    }
     fn run(&self, request: &CommandRequest) -> Result<CommandOutput, CommandRunError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.requests
@@ -195,6 +209,20 @@ impl CommandRunner for RecordingRunner {
 struct UnreadableFirstInventoryRunner(AtomicUsize);
 
 impl CommandRunner for UnreadableFirstInventoryRunner {
+    fn run_guarded<E>(
+        &self,
+        request: &cowshed_core::apfs::CommandRequest,
+        check: impl FnOnce() -> Result<bool, E>,
+    ) -> Result<Option<cowshed_core::apfs::CommandOutput>, E>
+    where
+        E: From<cowshed_core::apfs::CommandRunError> + std::fmt::Display,
+    {
+        if check()? {
+            self.run(request).map(Some).map_err(E::from)
+        } else {
+            Ok(None)
+        }
+    }
     fn run(&self, _: &CommandRequest) -> Result<CommandOutput, CommandRunError> {
         Ok(CommandOutput::success([]))
     }
@@ -2866,6 +2894,20 @@ struct UnformattedAttachment {
 }
 
 impl CommandRunner for UnformattedAttachment {
+    fn run_guarded<E>(
+        &self,
+        request: &cowshed_core::apfs::CommandRequest,
+        check: impl FnOnce() -> Result<bool, E>,
+    ) -> Result<Option<cowshed_core::apfs::CommandOutput>, E>
+    where
+        E: From<cowshed_core::apfs::CommandRunError> + std::fmt::Display,
+    {
+        if check()? {
+            self.run(request).map(Some).map_err(E::from)
+        } else {
+            Ok(None)
+        }
+    }
     fn run(&self, request: &CommandRequest) -> Result<CommandOutput, CommandRunError> {
         self.requests
             .lock()
@@ -3029,6 +3071,16 @@ struct EjectAtFsck {
 }
 
 impl CommandRunner for EjectAtFsck {
+    fn run_guarded<E>(
+        &self,
+        request: &CommandRequest,
+        check: impl FnOnce() -> Result<bool, E>,
+    ) -> Result<Option<CommandOutput>, E>
+    where
+        E: From<CommandRunError> + std::fmt::Display,
+    {
+        SystemCommandRunner.run_guarded(request, check)
+    }
     fn run(&self, request: &CommandRequest) -> Result<CommandOutput, CommandRunError> {
         let system = SystemCommandRunner;
         let device = if request.program == Path::new("/sbin/fsck_apfs") {
@@ -3306,6 +3358,16 @@ struct EjectAfterAttach {
 }
 
 impl CommandRunner for EjectAfterAttach {
+    fn run_guarded<E>(
+        &self,
+        request: &CommandRequest,
+        check: impl FnOnce() -> Result<bool, E>,
+    ) -> Result<Option<CommandOutput>, E>
+    where
+        E: From<CommandRunError> + std::fmt::Display,
+    {
+        SystemCommandRunner.run_guarded(request, check)
+    }
     fn run(&self, request: &CommandRequest) -> Result<CommandOutput, CommandRunError> {
         let system = SystemCommandRunner;
         let output = system.run(request)?;
@@ -6048,6 +6110,16 @@ fn set_file_flags(path: &Path, flags: u32) {
 }
 
 impl CommandRunner for ImmutableDuringResize {
+    fn run_guarded<E>(
+        &self,
+        request: &CommandRequest,
+        check: impl FnOnce() -> Result<bool, E>,
+    ) -> Result<Option<CommandOutput>, E>
+    where
+        E: From<CommandRunError> + std::fmt::Display,
+    {
+        SystemCommandRunner.run_guarded(request, check)
+    }
     fn run(&self, request: &CommandRequest) -> Result<CommandOutput, CommandRunError> {
         SystemCommandRunner.run(request)
     }

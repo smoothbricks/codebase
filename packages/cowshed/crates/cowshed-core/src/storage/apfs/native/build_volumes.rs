@@ -688,6 +688,16 @@ mod tests {
     }
 
     impl CommandRunner for RestoreAdmissionRunner {
+        fn run_guarded<E>(
+            &self,
+            request: &CommandRequest,
+            check: impl FnOnce() -> Result<bool, E>,
+        ) -> Result<Option<CommandOutput>, E>
+        where
+            E: From<CommandRunError> + std::fmt::Display,
+        {
+            SystemCommandRunner.run_guarded(request, check)
+        }
         fn run(&self, request: &CommandRequest) -> Result<CommandOutput, CommandRunError> {
             let output = SystemCommandRunner.run(request)?;
             if request.program == Path::new("/sbin/mount_apfs")

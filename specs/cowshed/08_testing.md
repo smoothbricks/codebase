@@ -313,6 +313,10 @@ A test is charged only what is left of the sweep once its body is done: nothing 
 no sweep selects a live pid's root. Inside the first scratch root of every test process, the sweep cost 2 s on a quiet
 run and 13 s after a run whose tests timed out, and every other test process of the run waited on its lock for as long.
 
+Pure regressions recycle a device to a RAM image during the storage-lease wait, recycle it between dissent attempts and
+before force, and repeat an image's whole-device view. They prove the guard runs after the grant, no child detaches a
+recycled number, and a release acts on each whole device once without spending an attach cycle.
+
 Coverage pays for an attachment only when the kernel behavior is the oracle. The image-growth witness also checks
 normalized whole/volume device names; unheld RW/RO live captures preserve source facts on success and destination
 refusal; a held RW capture also succeeds unchanged. Restart-derived facts check an idle-detach dissent before release.
