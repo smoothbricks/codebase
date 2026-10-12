@@ -88,6 +88,9 @@ pub struct LockHolder {
     /// The cowshed job that owns the holder, when one does.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub job: Option<JobId>,
+    /// The holder's image, only after an identity-fenced read; never a program-name guess.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub program: Option<String>,
 }
 
 /// How long a live process goes without a record restating its usage before a heartbeat

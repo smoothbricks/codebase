@@ -523,6 +523,7 @@ mod tests {
             holder: Some(LockHolder {
                 pid: holder,
                 job: None,
+                program: None,
             }),
         }
     }
