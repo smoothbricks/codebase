@@ -297,10 +297,6 @@ pub fn emit_columns(record: &ArrowRecord) -> String {
     out
 }
 
-pub fn emit_process_columns(record: &ArrowRecord) -> String {
-    emit_columns(record)
-}
-
 fn data_type(kind: ArrowKind) -> &'static str {
     match kind {
         ArrowKind::UInt32 => "DataType::UInt32",
@@ -377,7 +373,7 @@ mod tests {
         "#;
         let record = parse_arrow_record(source).expect("the record");
         assert_eq!(record.columns.len(), 2);
-        let emitted = emit_process_columns(&record);
+        let emitted = emit_columns(&record);
         assert!(emitted.contains("const PROCESS_COLUMN_COUNT: usize = 2;"));
         assert!(emitted.contains(r#"Field::new("proc_pid", DataType::UInt32, true)"#));
         assert!(emitted.contains(r#"Field::new("blocked_on", dict_type(DataType::UInt8), true)"#));

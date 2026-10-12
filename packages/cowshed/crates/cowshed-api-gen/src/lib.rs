@@ -309,27 +309,28 @@ pub fn generate(project: &Path) -> Result<Vec<GeneratedFile>, String> {
 }
 
 pub fn column_files(core: &Path) -> Result<Vec<GeneratedFile>, String> {
-    let mut files = Vec::new();
-    let process = core.join("runtime/process_spans.rs");
-    let record = arrow::parse_arrow_record(&read_source(&process)?)
-        .map_err(|error| format!("{}: {error}", process.display()))?;
-    files.push(GeneratedFile {
-        path: core.join("runtime/process_span_columns.generated.rs"),
-        contents: arrow::emit_columns(&record),
-    });
-    let unattributed = core.join("runtime/job_unattributed.rs");
-    if unattributed.is_file() {
-        let source = read_source(&unattributed)?;
-        if source.contains("arrow_columns") {
-            let record = arrow::parse_arrow_record(&source)
-                .map_err(|error| format!("{}: {error}", unattributed.display()))?;
-            files.push(GeneratedFile {
-                path: core.join("runtime/job_unattributed_columns.generated.rs"),
+    let owners = [
+        (
+            "runtime/process_spans.rs",
+            "runtime/process_span_columns.generated.rs",
+        ),
+        (
+            "runtime/job_unattributed.rs",
+            "runtime/job_unattributed_columns.generated.rs",
+        ),
+    ];
+    owners
+        .into_iter()
+        .map(|(source, generated)| {
+            let source = core.join(source);
+            let record = arrow::parse_arrow_record(&read_source(&source)?)
+                .map_err(|error| format!("{}: {error}", source.display()))?;
+            Ok(GeneratedFile {
+                path: core.join(generated),
                 contents: arrow::emit_columns(&record),
-            });
-        }
-    }
-    Ok(files)
+            })
+        })
+        .collect()
 }
 
 fn read_source(path: &Path) -> Result<String, String> {
