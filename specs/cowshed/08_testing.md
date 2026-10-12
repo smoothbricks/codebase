@@ -481,7 +481,10 @@ The land gate uses `--outputStyle=static-failures-only` and must exit zero befor
 workspace retirement. Any failed task, timeout or infrastructure failure stops the land: there is no bound-only retry,
 acceptance judge, tolerated-failure ledger or baseline-acceptance route. A separate reporter lists unique failing tasks
 and deduplicated exact diagnostics, retaining the complete output for context; reporting cannot turn a failed gate
-green. The pre-rewrite ancestry cutoff remains a separate guard before rebase.
+green. Both Nx output descriptors write directly to one regular file; successful gate output and the fallback when the
+reporter is unavailable replay only its final 64 KiB under a 10-second bound (then a one-second kill grace), and replay
+failure stops the land. The reporter reads the complete file, not the replayed suffix. The pre-rewrite ancestry cutoff
+remains a separate guard before rebase.
 
 Every test target, the groups included, is bounded by progress alone: the run ends when no test has finished for 180s,
 the hang backstop, and names the tests still running; it has no wall-clock ceiling, and no per-test bound kills a test
