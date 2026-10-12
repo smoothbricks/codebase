@@ -249,7 +249,7 @@ pub enum ProcessIoUnavailable {
 
 /// Whether the tree holds every process the job owned. A gap is absorbing: once an observation
 /// was missed, no later one makes the tree complete again.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
 pub enum ProcessCoverage {
     Complete,
@@ -282,7 +282,9 @@ pub enum ProcessCoverageGap {
     UnreadFinalUsage { pid: u32 },
 }
 
-/// The process a job's CPU went to most: its pid and the image it last ran.
+/// The observed process with the most own CPU, named only when that CPU covers the configured
+/// fraction of the independent total. Ties break by the lower pid; an unseen process is never
+/// invented to win one.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct JobProcessLeaf {
@@ -295,12 +297,70 @@ pub struct JobProcessLeaf {
     pub truncated: bool,
 }
 
-/// Thousandths of a whole: the largest share a coverage can be.
-pub const PERMILLE_WHOLE: u16 = 1_000;
+/// Observed own CPU as thousandths of the independent total. A value above 1000 is the tree
+/// exceeding that total; it is not clamped to 1000.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct CpuCoveragePermille(u16);
 
-/// Which observed process, live or exited, a job's CPU went to most, named only when the
-/// observed processes' own CPU covers at least the supervisor's configured share of the job's
-/// accounted CPU. Never a guessed winner among processes the observation missed.
+impl CpuCoveragePermille {
+    pub const fn new(value: u16) -> Self {
+        Self(value)
+    }
+
+    pub const fn get(self) -> u16 {
+        self.0
+    }
+}
+
+/// Initially 90% of the independent CPU total. The supervisor's configuration may set another
+/// fraction; the comparison keeps the fraction it was given.
+pub const LEAF_CPU_PERMILLE: CpuCoveragePermille = CpuCoveragePermille(900);
+
+/// Observed counters minus the independent total, in microseconds. Negative means the tree
+/// accounts for less than the total. Never clamped to zero.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct CpuMicrosDelta(i64);
+
+impl CpuMicrosDelta {
+    pub const fn new(value: i64) -> Self {
+        Self(value)
+    }
+
+    pub const fn get(self) -> i64 {
+        self.0
+    }
+}
+
+/// Observed storage-I/O bytes minus the independent total. Absent when either side has no byte
+/// total; never zero in that absence's place.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct StorageIoBytesDelta(i64);
+
+impl StorageIoBytesDelta {
+    pub const fn new(value: i64) -> Self {
+        Self(value)
+    }
+
+    pub const fn get(self) -> i64 {
+        self.0
+    }
+}
+
+/// The signed difference between retained process rows and the independent job total, plus the
+/// tree's coverage. A gap does not erase the difference.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UsageReconciliation {
+    pub cpu_us: CpuMicrosDelta,
+    pub io_read_bytes: Option<StorageIoBytesDelta>,
+    pub io_write_bytes: Option<StorageIoBytesDelta>,
+    pub coverage: ProcessCoverage,
+}
+
+/// Why a leaf-keyed baseline must not update, or the observed process that may.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(
     tag = "kind",
@@ -309,35 +369,13 @@ pub const PERMILLE_WHOLE: u16 = 1_000;
     deny_unknown_fields
 )]
 pub enum JobLeafAttribution {
-    /// The observed process with the most own CPU (ties to the earlier birth identity, then the
-    /// lower pid), and the thousandths of the job's accounted CPU the observed processes cover.
     Attributed {
         leaf: JobProcessLeaf,
-        observed_cpu_permille: u16,
+        observed_cpu_permille: CpuCoveragePermille,
     },
-    /// The observed processes cover less than the required share: no leaf is named.
     Unattributed {
-        observed_cpu_permille: u16,
-        required_permille: u16,
+        observed_cpu_permille: CpuCoveragePermille,
+        required_permille: CpuCoveragePermille,
     },
-    /// The job's source has accounted no CPU yet, so nothing has a share of it.
     NoAccountedCpu,
-}
-
-impl JobLeafAttribution {
-    /// Whether its thousandths are shares of a whole, and an unattributed coverage lies below
-    /// the share it was required to reach.
-    pub fn consistent(&self) -> bool {
-        match self {
-            Self::Attributed {
-                observed_cpu_permille,
-                ..
-            } => *observed_cpu_permille <= PERMILLE_WHOLE,
-            Self::Unattributed {
-                observed_cpu_permille,
-                required_permille,
-            } => observed_cpu_permille < required_permille && *required_permille <= PERMILLE_WHOLE,
-            Self::NoAccountedCpu => true,
-        }
-    }
 }

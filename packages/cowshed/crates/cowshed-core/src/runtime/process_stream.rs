@@ -157,6 +157,14 @@ impl JobProcessFold {
         &self.tree
     }
 
+    /// The start proven by the life's first usage read, fencing every later native read.
+    pub fn usage_start(
+        &self,
+        process: ProcessIdentity,
+    ) -> Option<super::process_usage::StartStamp> {
+        self.readings.usage.start(process)
+    }
+
     /// Every record, as last observed and read.
     pub fn tree(&self, sampled_at: UtcTimestamp) -> JobProcessTree {
         self.tree.tree(self.job_id, sampled_at, &self.readings)
@@ -394,10 +402,14 @@ mod tests {
         /// Apply an observation other than a tick and return its process event, if any.
         fn apply(&mut self, observation: JobProcessObservation) -> Option<JobProcessEvent> {
             let emitted = self.emit(observation);
-            let mut process_events = emitted.into_iter()
+            let mut process_events = emitted
+                .into_iter()
                 .filter(|event| !matches!(event, JobProcessEvent::Gap { .. }));
             let event = process_events.next();
-            assert!(process_events.next().is_none(), "one observation, one process event");
+            assert!(
+                process_events.next().is_none(),
+                "one observation, one process event"
+            );
             event
         }
 
@@ -883,19 +895,27 @@ mod tests {
     fn the_first_coverage_gap_is_an_event_even_without_a_process_record() {
         let mut run = Run::new();
         let reason = ProcessCoverageGap::UncountedFork { pid: 800 };
-        let events = run.emit(JobProcessObservation::Tree(ProcessObservation::Lost(reason)));
+        let events = run.emit(JobProcessObservation::Tree(ProcessObservation::Lost(
+            reason,
+        )));
         assert_eq!(
             serde_json::to_value(&events).expect("events encode"),
             serde_json::json!([{ "kind": "gap", "reason": { "kind": "uncountedFork", "pid": 800 } }])
         );
-        assert_eq!(run.fold.tree(utc(0)).coverage, ProcessCoverage::Gap { reason });
+        assert_eq!(
+            run.fold.tree(utc(0)).coverage,
+            ProcessCoverage::Gap { reason }
+        );
         for later in [reason, ProcessCoverageGap::EventsLost] {
             assert_eq!(
                 run.emit(JobProcessObservation::Tree(ProcessObservation::Lost(later))),
                 []
             );
         }
-        assert_eq!(run.fold.tree(utc(1)).coverage, ProcessCoverage::Gap { reason });
+        assert_eq!(
+            run.fold.tree(utc(1)).coverage,
+            ProcessCoverage::Gap { reason }
+        );
     }
 
     #[test]
@@ -909,10 +929,15 @@ mod tests {
             at: utc(1),
             image: image("/bin/sh"),
         }));
-        assert!(matches!(&events[..], [
-            JobProcessEvent::Born { index: 1, .. },
-            JobProcessEvent::Gap { reason: ProcessCoverageGap::UnobservedExit { pid: 800 } }
-        ]));
+        assert!(matches!(
+            &events[..],
+            [
+                JobProcessEvent::Born { index: 1, .. },
+                JobProcessEvent::Gap {
+                    reason: ProcessCoverageGap::UnobservedExit { pid: 800 }
+                }
+            ]
+        ));
         reused.assert_replay_matches();
 
         let mut unread = Run::new();
@@ -922,10 +947,15 @@ mod tests {
             status: ExitStatus::Exited { code: 0 },
             at: utc(1),
         }));
-        assert!(matches!(&events[..], [
-            JobProcessEvent::Exited { index: 0, .. },
-            JobProcessEvent::Gap { reason: ProcessCoverageGap::UnreadFinalUsage { pid: 800 } }
-        ]));
+        assert!(matches!(
+            &events[..],
+            [
+                JobProcessEvent::Exited { index: 0, .. },
+                JobProcessEvent::Gap {
+                    reason: ProcessCoverageGap::UnreadFinalUsage { pid: 800 }
+                }
+            ]
+        ));
         unread.assert_replay_matches();
 
         let mut unknown = Run::new();
@@ -937,7 +967,10 @@ mod tests {
             })),
             [JobProcessEvent::Gap { reason }]
         );
-        assert_eq!(unknown.fold.tree(utc(1)).coverage, ProcessCoverage::Gap { reason });
+        assert_eq!(
+            unknown.fold.tree(utc(1)).coverage,
+            ProcessCoverage::Gap { reason }
+        );
     }
 
     #[test]
