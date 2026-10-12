@@ -5329,6 +5329,9 @@ impl SupervisorActor {
         // Read and queue the terminal boundary while the admitted build volume is still held.
         // A successful final resource read already owns these facts; do not sample them twice.
         if let Some(job_spans) = &self.job_spans {
+            if let Some(sample) = &job.info.resources {
+                job_spans.record_terminal_accounting(&job.info, sample.accounting);
+            }
             let edge = JobSpanEdge::end(state, job.exit.as_ref());
             match &job.info.resources {
                 Some(sample) => job_spans.record_sample_boundary(&job.info, edge, sample),

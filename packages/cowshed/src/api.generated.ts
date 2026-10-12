@@ -1253,6 +1253,10 @@ export type LockHolder = {
    * The cowshed job that owns the holder, when one does.
    */
   readonly job?: JobId;
+  /**
+   * The holder's image, only after an identity-fenced read; never a program-name guess.
+   */
+  readonly program?: string;
 };
 
 /**

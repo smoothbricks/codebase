@@ -150,6 +150,13 @@ export interface JobHandle {
    * subscription, never the job.
    */
   progress(everyMs: number): AsyncIterable<Api.JobResourceSample>;
+  /** Identity-fenced retained process lives, including exited ones and explicit coverage gaps. */
+  processes(): Promise<Api.JobProcessTree>;
+  /**
+   * The canonical ordered observation stream: birth, exec, sparse changes, fixed-minute
+   * heartbeats and final usage on exit. Leaving the loop closes only this reader, never the job.
+   */
+  processEvents(everyMs: number): AsyncIterable<Api.JobProcessEvent>;
   /**
    * One stream's bytes from `offset`, at most one chunk. Reading again from `nextOffset` continues
    * where this chunk ended. Without `follow`, stop at an empty chunk or `eof`: an empty chunk is

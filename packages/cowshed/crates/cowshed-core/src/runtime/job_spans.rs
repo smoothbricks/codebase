@@ -35,6 +35,7 @@ use crate::repository::RepoId;
 use crate::runtime::job_boundary::{
     JobSpanBoundary, boundary_host, charged_memory_values, volume_deltas,
 };
+use crate::runtime::job_unattributed::{UnattributedSpanRow, seal_unattributed_row};
 use crate::runtime::process_spans::{ProcessSpanError, ProcessSpanRow, seal_process_row};
 use crate::storage::job_artifact::state_name;
 use crate::storage::trace_segment::{
@@ -46,9 +47,8 @@ use crate::storage::trace_segment::{
 pub const JOB_SPAN_MESSAGE: &str = "cowshed.job";
 /// A job span is the first span of its job's lmao thread ([`job_span_thread`]).
 pub const JOB_SPAN_ID: u32 = 1;
-/// Rows waiting for the writer: two per job, so this covers a burst of concurrent admissions and
-/// terminals far beyond what a workspace's actor queue admits at once. A full queue refuses rows
-/// rather than delaying the actor.
+/// Job boundaries, process transitions and terminal reconciliation share one bounded queue.
+/// A full queue refuses rows visibly through TraceHealth rather than delaying the actor.
 const QUEUE_CAPACITY: usize = 256;
 
 /// The lmao thread a job's spans are written on: the first eight bytes of a domain-separated
@@ -146,6 +146,7 @@ struct JobSpanRow {
 enum Request {
     Row(Box<JobSpanRow>),
     Process(Box<ProcessSpanRow>),
+    Unattributed(Box<UnattributedSpanRow>),
     Health { reply: oneshot::Sender<TraceHealth> },
 }
 
@@ -261,6 +262,29 @@ impl JobSpanPublisher {
             }
         };
         permit.send(Request::Process(Box::new(row)));
+    }
+
+    /// Queue the job's one terminal reconciliation row, when its final accounting differs or
+    /// observation coverage is a gap. Unavailable I/O remains absent.
+    pub fn record_terminal_accounting(&self, info: &JobInfo, accounting: JobAccounting) {
+        let Some(row) = UnattributedSpanRow::project(info, accounting) else {
+            return;
+        };
+        let permit = match self.sender.try_reserve() {
+            Ok(permit) => permit,
+            Err(error) => {
+                refuse(
+                    &self.health,
+                    match error {
+                        mpsc::error::TrySendError::Full(()) => "the job span queue is full",
+                        mpsc::error::TrySendError::Closed(()) => "the job span writer stopped",
+                    }
+                    .to_owned(),
+                );
+                return;
+            }
+        };
+        permit.send(Request::Unattributed(Box::new(row)));
     }
 
     /// Queue a boundary read. A failed source or conversion is counted and not sealed; absent
@@ -421,6 +445,25 @@ async fn write_rows(
                     Err(error) => {
                         refuse(&health, format!("the job span seal task failed: {error}"))
                     }
+                }
+            }
+            Request::Unattributed(row) => {
+                let root = root.clone();
+                let sealed = tokio::task::spawn_blocking(move || {
+                    seal_unattributed_row(&root, writer, order, &row)
+                })
+                .await;
+                order = order.saturating_add(1);
+                match sealed {
+                    Ok(Ok(_)) => {
+                        let mut health = lock(&health);
+                        health.recorded = health.recorded.saturating_add(1);
+                    }
+                    Ok(Err(error)) => refuse(&health, error.to_string()),
+                    Err(error) => refuse(
+                        &health,
+                        format!("the job reconciliation seal task failed: {error}"),
+                    ),
                 }
             }
             Request::Health { reply } => {
