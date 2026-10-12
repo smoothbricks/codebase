@@ -15,6 +15,7 @@ use std::collections::HashMap;
 
 use crate::api::process::{
     JobLeafAttribution, JobProcessLeaf, PERMILLE_WHOLE, ProcessCoverage, ProcessCoverageGap,
+    ProcessUsage,
 };
 use crate::api::resources::{CpuMicros, CpuMicrosDelta, CpuTotals, ResourceUnitError};
 use crate::runtime::job_groups::Process;
@@ -60,6 +61,103 @@ pub struct Attribution {
     /// The job's CPU total less the observed processes' own CPU.
     pub cpu_us: CpuMicrosDelta,
     pub coverage: ProcessCoverage,
+}
+
+/// One observed life borrowed from the fold that retains it. An unread image or
+/// unread usage covers no CPU and is never the leaf.
+#[derive(Clone, Copy, Debug)]
+pub struct ObservedLife<'a> {
+    pub identity: ProcessIdentity,
+    pub image: Option<&'a ProcessImage>,
+    pub usage: Option<ProcessUsage>,
+}
+
+/// Observed lives a leaf is chosen from. Owned so a writer can publish it beside
+/// the retained tree. It does not sample and does not invent coverage.
+#[derive(Clone, Debug)]
+pub struct AttributionSummary {
+    lives: Vec<RetainedLife>,
+}
+
+#[derive(Clone, Debug)]
+struct RetainedLife {
+    identity: ProcessIdentity,
+    image: Option<ProcessImage>,
+    usage: Option<ProcessUsage>,
+}
+
+impl AttributionSummary {
+    /// Copies the borrowed lives. The image clone is the publish cost; attribute
+    /// does not read the kernel again.
+    pub fn from_observed<'a>(lives: impl IntoIterator<Item = ObservedLife<'a>>) -> Self {
+        Self {
+            lives: lives
+                .into_iter()
+                .map(|life| RetainedLife {
+                    identity: life.identity,
+                    image: life.image.cloned(),
+                    usage: life.usage,
+                })
+                .collect(),
+        }
+    }
+
+    /// The leaf with the most own CPU. Ties go to the earlier birth, then the
+    /// lower pid. Named only when observed CPU covers `required` of `total`.
+    /// `coverage` is returned as given.
+    pub fn attribute(
+        &self,
+        total: CpuTotals,
+        required: LeafCoverage,
+        coverage: ProcessCoverage,
+    ) -> Result<Attribution, ResourceUnitError> {
+        let total = total.user_us.checked_add(total.sys_us)?;
+        let mut observed = CpuMicros::new(0)?;
+        let mut winner: Option<(CpuMicros, ProcessIdentity, &ProcessImage)> = None;
+        for life in &self.lives {
+            let (Some(image), Some(usage)) = (life.image.as_ref(), life.usage) else {
+                continue;
+            };
+            let own = usage.cpu_user_us.checked_add(usage.cpu_sys_us)?;
+            observed = observed.checked_add(own)?;
+            let rank = |own: CpuMicros, identity: ProcessIdentity| {
+                (
+                    own,
+                    std::cmp::Reverse(identity.birth.0),
+                    std::cmp::Reverse(identity.pid),
+                )
+            };
+            if winner.is_none_or(|(most, best, _)| rank(own, life.identity) > rank(most, best)) {
+                winner = Some((own, life.identity, image));
+            }
+        }
+        let cpu_us = CpuMicrosDelta::between(observed, total)?;
+        let leaf = match covered_permille(observed, total) {
+            None => JobLeafAttribution::NoAccountedCpu,
+            Some(permille) => match winner {
+                Some((_, identity, image)) if permille >= required.permille() => {
+                    JobLeafAttribution::Attributed {
+                        leaf: JobProcessLeaf {
+                            pid: identity.pid,
+                            program: image.program.clone(),
+                            argv: image.argv.clone(),
+                            truncated: image.truncated,
+                        },
+                        observed_cpu_permille: permille,
+                    }
+                }
+                Some(_) | None => JobLeafAttribution::Unattributed {
+                    observed_cpu_permille: permille,
+                    required_permille: required.permille(),
+                },
+            },
+        };
+        Ok(Attribution {
+            leaf,
+            cpu_us,
+            coverage,
+        })
+    }
 }
 
 impl Census {
@@ -159,58 +257,17 @@ impl Census {
         total: CpuTotals,
         required: LeafCoverage,
     ) -> Result<Attribution, ResourceUnitError> {
-        let total = total.user_us.checked_add(total.sys_us)?;
-        let mut observed = CpuMicros::new(0)?;
-        let mut winner: Option<(CpuMicros, &Life, &ProcessImage)> = None;
-        for life in &self.lives {
-            let (Some(image), Some(usage)) = (&life.image, self.usage.usage(life.identity)) else {
-                continue;
-            };
-            let own = usage.cpu_user_us.checked_add(usage.cpu_sys_us)?;
-            observed = observed.checked_add(own)?;
-            // Most CPU first; among equals the earlier birth, then the lower pid.
-            let rank = |own: CpuMicros, life: &Life| {
-                (
-                    own,
-                    std::cmp::Reverse(life.identity.birth.0),
-                    std::cmp::Reverse(life.identity.pid),
-                )
-            };
-            if winner.is_none_or(|(most, best, _)| rank(own, life) > rank(most, best)) {
-                winner = Some((own, life, image));
-            }
-        }
-        let cpu_us = CpuMicrosDelta::between(observed, total)?;
         let coverage = ProcessCoverage::Gap {
             reason: self
                 .gap
                 .unwrap_or(ProcessCoverageGap::UncountedFork { pid: self.leader }),
         };
-        let leaf = match covered_permille(observed, total) {
-            None => JobLeafAttribution::NoAccountedCpu,
-            Some(permille) => match winner {
-                Some((_, life, image)) if permille >= required.permille() => {
-                    JobLeafAttribution::Attributed {
-                        leaf: JobProcessLeaf {
-                            pid: life.identity.pid,
-                            program: image.program.clone(),
-                            argv: image.argv.clone(),
-                            truncated: image.truncated,
-                        },
-                        observed_cpu_permille: permille,
-                    }
-                }
-                Some(_) | None => JobLeafAttribution::Unattributed {
-                    observed_cpu_permille: permille,
-                    required_permille: required.permille(),
-                },
-            },
-        };
-        Ok(Attribution {
-            leaf,
-            cpu_us,
-            coverage,
-        })
+        let lives = self.lives.iter().map(|life| ObservedLife {
+            identity: life.identity,
+            image: life.image.as_ref(),
+            usage: self.usage.usage(life.identity),
+        });
+        AttributionSummary::from_observed(lives).attribute(total, required, coverage)
     }
 }
 
@@ -450,6 +507,7 @@ mod tests {
                     pid: 101,
                     program: "yes".into(),
                     argv: vec![CommandArg::new("yes")],
+                    truncated: false,
                 },
                 observed_cpu_permille: 1_000,
             }
@@ -639,6 +697,109 @@ mod tests {
             ProcessCoverage::Gap {
                 reason: ProcessCoverageGap::UnreadImage { pid: 100 }
             }
+        );
+    }
+
+    fn own(user: u64, sys: u64) -> ProcessUsage {
+        ProcessUsage {
+            cpu_user_us: CpuMicros::new(user).expect("exact"),
+            cpu_sys_us: CpuMicros::new(sys).expect("exact"),
+            busy: false,
+            rss_bytes: ResidentBytes::ZERO,
+            rss_peak_bytes: ResidentBytes::ZERO,
+            io: ProcessStorageIo::Unavailable {
+                reason: ProcessIoUnavailable::NotAccounted,
+            },
+        }
+    }
+
+    /// The published summary uses the same threshold as the census and returns the
+    /// coverage it was given. It does not invent a gap or a winner it was not shown.
+    #[test]
+    fn a_published_summary_keeps_the_threshold_and_the_given_coverage() {
+        let sh = image("/bin/sh");
+        let cc = image("cc");
+        let gap = ProcessCoverage::Gap {
+            reason: ProcessCoverageGap::UnobservedBirth { pid: 7 },
+        };
+        let total = cpu(800, 200);
+        for (extra, permille, attributed) in
+            [(0u64, 899u16, false), (1, 900, true), (51, 950, true)]
+        {
+            let lives = [
+                ObservedLife {
+                    identity: life(100),
+                    image: Some(&sh),
+                    usage: Some(own(50, 50)),
+                },
+                ObservedLife {
+                    identity: life(101),
+                    image: Some(&cc),
+                    usage: Some(own(799 + extra, 0)),
+                },
+            ];
+            let answer = AttributionSummary::from_observed(lives)
+                .attribute(total, coverage(900), gap)
+                .expect("exact");
+            assert_eq!(answer.coverage, gap, "the given gap is not replaced");
+            assert_eq!(
+                answer.cpu_us.get(),
+                1_000 - 899 - i64::try_from(extra).expect("extra")
+            );
+            match answer.leaf {
+                JobLeafAttribution::Attributed {
+                    leaf,
+                    observed_cpu_permille,
+                } => {
+                    assert!(attributed, "{permille}‰ is below 900‰ yet a leaf was named");
+                    assert_eq!(
+                        (leaf.pid, leaf.program.as_str(), observed_cpu_permille),
+                        (101, "cc", permille)
+                    );
+                }
+                JobLeafAttribution::Unattributed {
+                    observed_cpu_permille,
+                    required_permille,
+                } => {
+                    assert!(
+                        !attributed,
+                        "{permille}‰ reaches 900‰ yet no leaf was named"
+                    );
+                    assert_eq!((observed_cpu_permille, required_permille), (permille, 900));
+                }
+                JobLeafAttribution::NoAccountedCpu => panic!("CPU was accounted"),
+            }
+        }
+        let unread = [ObservedLife {
+            identity: life(100),
+            image: None,
+            usage: Some(own(1_000, 0)),
+        }];
+        let hidden = AttributionSummary::from_observed(unread)
+            .attribute(total, coverage(900), gap)
+            .expect("exact");
+        assert_eq!(
+            hidden.leaf,
+            JobLeafAttribution::Unattributed {
+                observed_cpu_permille: 0,
+                required_permille: 900,
+            }
+        );
+        assert_eq!(
+            hidden.cpu_us.get(),
+            1_000,
+            "unread usage is not observed CPU"
+        );
+        let none = AttributionSummary::from_observed([ObservedLife {
+            identity: life(100),
+            image: Some(&sh),
+            usage: Some(own(0, 0)),
+        }]);
+        assert_eq!(
+            none.attribute(cpu(0, 0), coverage(900), gap)
+                .expect("exact")
+                .leaf,
+            JobLeafAttribution::NoAccountedCpu
         );
     }
 }

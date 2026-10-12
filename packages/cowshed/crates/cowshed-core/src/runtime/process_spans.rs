@@ -245,8 +245,12 @@ impl ProcessSpanProjection {
         at: SystemTime,
     ) -> Result<ProcessSpanRow, ProcessSpanError> {
         let identity = identity.ok_or(ProcessSpanError::MissingIdentity { index })?;
-        if self.open.len() != usize::try_from(index).unwrap_or(usize::MAX) {
-            return Err(if index < self.open.len() as u32 {
+        let opened = match usize::try_from(index) {
+            Ok(opened) => opened,
+            Err(_) => return Err(ProcessSpanError::NotOpened { index }),
+        };
+        if self.open.len() != opened {
+            return Err(if opened < self.open.len() {
                 ProcessSpanError::OpenedTwice { index }
             } else {
                 ProcessSpanError::NotOpened { index }
@@ -319,9 +323,10 @@ impl ProcessSpanProjection {
         identity: Option<ProcessIdentity>,
     ) -> Result<&mut OpenSpan, ProcessSpanError> {
         let identity = identity.ok_or(ProcessSpanError::MissingIdentity { index })?;
+        let at = usize::try_from(index).map_err(|_| ProcessSpanError::NotOpened { index })?;
         let span = self
             .open
-            .get_mut(index as usize)
+            .get_mut(at)
             .ok_or(ProcessSpanError::NotOpened { index })?;
         if span.identity != identity {
             return Err(ProcessSpanError::IdentityMismatch {
@@ -592,12 +597,12 @@ fn push_argument(out: &mut String, bytes: &[u8]) {
             b'\n' => out.push_str("\\n"),
             b'\r' => out.push_str("\\r"),
             b'\t' => out.push_str("\\t"),
-            0x20..=0x7e => out.push(*byte as char),
+            0x20..=0x7e => out.push(char::from(*byte)),
             other => {
                 out.push_str("\\x");
                 const HEX: &[u8; 16] = b"0123456789abcdef";
-                out.push(HEX[(other >> 4) as usize] as char);
-                out.push(HEX[(other & 0x0f) as usize] as char);
+                out.push(char::from(HEX[usize::from(other >> 4)]));
+                out.push(char::from(HEX[usize::from(other & 0x0f)]));
             }
         }
     }
@@ -705,7 +710,7 @@ fn category(value: Option<&str>) -> Result<(Field, ArrayRef), TraceSegmentError>
 }
 
 fn enumeration(key: Option<u8>, names: &[&str]) -> Result<(Field, ArrayRef), TraceSegmentError> {
-    let values = Arc::new(StringArray::from_iter_values(names.iter().copied())) as ArrayRef;
+    let values: ArrayRef = Arc::new(StringArray::from_iter_values(names.iter().copied()));
     let array = DictionaryArray::<UInt8Type>::try_new(UInt8Array::from(vec![key]), values)?;
     Ok((
         Field::new("ignored", dict_type(DataType::UInt8), true),
@@ -828,11 +833,13 @@ fn dict_value(column: &ArrayRef, row: usize) -> Option<String> {
     }
     if let Some(dict) = column.as_dictionary_opt::<UInt32Type>() {
         let values = dict.values().as_string::<i32>();
-        return Some(values.value(dict.keys().value(row) as usize).to_owned());
+        let key = usize::try_from(dict.keys().value(row)).ok()?;
+        return Some(values.value(key).to_owned());
     }
     if let Some(dict) = column.as_dictionary_opt::<UInt8Type>() {
         let values = dict.values().as_string::<i32>();
-        return Some(values.value(dict.keys().value(row) as usize).to_owned());
+        let key = usize::from(dict.keys().value(row));
+        return Some(values.value(key).to_owned());
     }
     None
 }
@@ -1450,8 +1457,9 @@ mod tests {
             .nodes()
             .enumerate()
             .map(|(index, node)| {
+                let index = u32::try_from(index).expect("a process index");
                 (
-                    index as u32,
+                    index,
                     node.identity,
                     node.parent,
                     JobProcessSample {
@@ -1508,7 +1516,8 @@ mod tests {
         }
         let _ = child.wait();
         for (index, identity, parent, _) in &births {
-            let process = observer.fold().sample(*index as usize, &Unread);
+            let at = usize::try_from(*index).expect("a process index");
+            let process = observer.fold().sample(at, &Unread);
             if process.exit.is_none() {
                 continue;
             }
