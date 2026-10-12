@@ -94,9 +94,9 @@ pub struct LockHolder {
 /// restates it: one minute per process, whatever the sampling or subscriber interval.
 pub const PROCESS_HEARTBEAT: Duration = Duration::from_secs(60);
 
-/// One change to a job's process tree, in the order the supervisor folded it. `index` is the
-/// process's position in [`JobProcessTree::processes`]: the order births were observed, which
-/// never changes, so it names one life where a pid could name two.
+/// One change to a job's process tree, in the order the supervisor folded it. A process-bearing
+/// event's `index` is its position in [`JobProcessTree::processes`]: birth-observation order, which
+/// never changes. A coverage gap has no index for a life that may never have been observed.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(
     tag = "kind",
@@ -129,6 +129,8 @@ pub enum JobProcessEvent {
         index: u32,
         process: JobProcessSample,
     },
+    /// The first missed observation: emitted once as coverage changes from complete to a gap.
+    Gap { reason: ProcessCoverageGap },
 }
 
 /// The one field of one process that changed; every other field is unchanged. A usage read and

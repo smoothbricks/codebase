@@ -899,9 +899,9 @@ export type JobProcessDelta =
     };
 
 /**
- * One change to a job's process tree, in the order the supervisor folded it. `index` is the
- * process's position in [`JobProcessTree::processes`]: the order births were observed, which
- * never changes, so it names one life where a pid could name two.
+ * One change to a job's process tree, in the order the supervisor folded it. A process-bearing
+ * event's `index` is its position in [`JobProcessTree::processes`]: birth-observation order, which
+ * never changes. A coverage gap has no index for a life that may never have been observed.
  */
 export type JobProcessEvent =
   | ({ readonly kind: 'born' } & {
@@ -920,6 +920,9 @@ export type JobProcessEvent =
   | ({ readonly kind: 'exited' } & {
       readonly index: number & tags.Type<'uint32'>;
       readonly process: JobProcessSample;
+    })
+  | ({ readonly kind: 'gap' } & {
+      readonly reason: ProcessCoverageGap;
     });
 
 /**

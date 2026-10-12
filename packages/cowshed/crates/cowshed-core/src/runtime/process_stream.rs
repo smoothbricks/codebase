@@ -27,7 +27,7 @@ use std::time::Instant;
 use crate::api::dto::{JobId, UtcTimestamp};
 use crate::api::process::{
     BlockerChange, JobProcessDelta, JobProcessEvent, JobProcessTree, PROCESS_HEARTBEAT,
-    ProcessBlockedOn, ProcessUsage,
+    ProcessBlockedOn, ProcessCoverage, ProcessUsage,
 };
 use crate::api::resources::ResidentBytes;
 use crate::runtime::process_tree::{
@@ -126,14 +126,14 @@ impl JobProcessFold {
         }
     }
 
-    /// Fold `observation` and append the events it causes to `events`: at most one, except a
-    /// tick, which appends a heartbeat for each live process due one. A refused observation
-    /// appends nothing.
+    /// Fold `observation` and append its process event and first coverage gap, if any. A tick
+    /// appends a heartbeat for each live process due one. A refused observation appends nothing.
     pub fn apply(
         &mut self,
         observation: JobProcessObservation,
         events: &mut Vec<JobProcessEvent>,
     ) -> Result<(), JobProcessFoldError> {
+        let was_complete = matches!(self.tree.coverage(), ProcessCoverage::Complete);
         let event = match observation {
             JobProcessObservation::Tree(observation) => self.observed(observation)?,
             JobProcessObservation::Usage { process, reading } => {
@@ -146,6 +146,9 @@ impl JobProcessFold {
             JobProcessObservation::Tick { at } => return self.tick(at, events),
         };
         events.extend(event);
+        if was_complete && let ProcessCoverage::Gap { reason } = self.tree.coverage() {
+            events.push(JobProcessEvent::Gap { reason: *reason });
+        }
         Ok(())
     }
 
@@ -388,14 +391,14 @@ mod tests {
             emitted
         }
 
-        /// Apply an observation other than a tick: it causes at most one event.
+        /// Apply an observation other than a tick and return its process event, if any.
         fn apply(&mut self, observation: JobProcessObservation) -> Option<JobProcessEvent> {
-            let mut emitted = self.emit(observation);
-            assert!(
-                emitted.len() <= 1,
-                "one observation, one event: {emitted:?}"
-            );
-            emitted.pop()
+            let emitted = self.emit(observation);
+            let mut process_events = emitted.into_iter()
+                .filter(|event| !matches!(event, JobProcessEvent::Gap { .. }));
+            let event = process_events.next();
+            assert!(process_events.next().is_none(), "one observation, one process event");
+            event
         }
 
         /// Apply an observation the fold must refuse, and return why.
@@ -476,6 +479,7 @@ mod tests {
                     JobProcessEvent::Changed(delta) => {
                         delta.apply(&mut processes[delta.index() as usize]);
                     }
+                    JobProcessEvent::Gap { .. } => {}
                 }
             }
             processes
@@ -873,6 +877,67 @@ mod tests {
         }
         assert_eq!(run.fold.tree(utc(122)).coverage, ProcessCoverage::Complete);
         run.assert_replay_matches();
+    }
+
+    #[test]
+    fn the_first_coverage_gap_is_an_event_even_without_a_process_record() {
+        let mut run = Run::new();
+        let reason = ProcessCoverageGap::UncountedFork { pid: 800 };
+        let events = run.emit(JobProcessObservation::Tree(ProcessObservation::Lost(reason)));
+        assert_eq!(
+            serde_json::to_value(&events).expect("events encode"),
+            serde_json::json!([{ "kind": "gap", "reason": { "kind": "uncountedFork", "pid": 800 } }])
+        );
+        assert_eq!(run.fold.tree(utc(0)).coverage, ProcessCoverage::Gap { reason });
+        for later in [reason, ProcessCoverageGap::EventsLost] {
+            assert_eq!(
+                run.emit(JobProcessObservation::Tree(ProcessObservation::Lost(later))),
+                []
+            );
+        }
+        assert_eq!(run.fold.tree(utc(1)).coverage, ProcessCoverage::Gap { reason });
+    }
+
+    #[test]
+    fn implicit_gaps_are_emitted_once_beside_their_process_transition() {
+        let root = id(800, 11);
+        let mut reused = Run::new();
+        reused.root(root);
+        let events = reused.emit(JobProcessObservation::Tree(ProcessObservation::Root {
+            process: id(800, 12),
+            ppid: 1,
+            at: utc(1),
+            image: image("/bin/sh"),
+        }));
+        assert!(matches!(&events[..], [
+            JobProcessEvent::Born { index: 1, .. },
+            JobProcessEvent::Gap { reason: ProcessCoverageGap::UnobservedExit { pid: 800 } }
+        ]));
+        reused.assert_replay_matches();
+
+        let mut unread = Run::new();
+        unread.root(root);
+        let events = unread.emit(JobProcessObservation::Tree(ProcessObservation::Exited {
+            process: root,
+            status: ExitStatus::Exited { code: 0 },
+            at: utc(1),
+        }));
+        assert!(matches!(&events[..], [
+            JobProcessEvent::Exited { index: 0, .. },
+            JobProcessEvent::Gap { reason: ProcessCoverageGap::UnreadFinalUsage { pid: 800 } }
+        ]));
+        unread.assert_replay_matches();
+
+        let mut unknown = Run::new();
+        let reason = ProcessCoverageGap::UnobservedBirth { pid: 800 };
+        assert_eq!(
+            unknown.emit(JobProcessObservation::Tree(ProcessObservation::Exec {
+                process: root,
+                image: image("/bin/sh"),
+            })),
+            [JobProcessEvent::Gap { reason }]
+        );
+        assert_eq!(unknown.fold.tree(utc(1)).coverage, ProcessCoverage::Gap { reason });
     }
 
     #[test]
