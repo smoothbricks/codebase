@@ -25,6 +25,7 @@ pub mod host_config;
 pub mod job_artifact;
 pub mod lifecycle;
 pub mod recovery;
+pub mod trace_columns;
 pub mod trace_segment;
 
 pub const WORKSPACE_MARKER_PATH: &str = ".cowshed/workspace.json";
