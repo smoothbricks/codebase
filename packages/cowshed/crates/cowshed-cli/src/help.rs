@@ -412,7 +412,8 @@ mod tests {
     fn typos_suggest_the_command_that_was_meant() {
         assert_eq!(nearest_commands("sscache"), ["sccache"]);
         assert_eq!(nearest_commands("statuss"), Vec::<&str>::new());
-        assert_eq!(nearest_commands("remove"), Vec::<&str>::new());
+        assert_eq!(nearest_commands("remove"), ["revoke"]);
+        assert_eq!(nearest_commands("revok"), ["revoke"]);
         assert_eq!(nearest_commands("lands"), ["land"]);
         assert_eq!(nearest_commands("adopr"), ["adopt"]);
         // Nothing within two edits of a word that is not a near miss of any verb.

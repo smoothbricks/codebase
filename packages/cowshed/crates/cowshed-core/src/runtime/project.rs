@@ -10956,7 +10956,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                             "refresh grants and retry",
                         ));
                     }
-                    normalize_grant_delta(&mut delta)?;
+                    normalize_grant_delta(&mut delta, revoke)?;
                     let previous = current.metadata.grants.clone();
                     if let Some(block) = replacement_block {
                         if previous.port_block != Some(previous_block)
@@ -11073,6 +11073,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         normalize_grant_paths(&mut delta.read)?;
         normalize_relative_denies(&mut delta.deny_write)?;
         normalize_relative_denies(&mut delta.deny)?;
+        normalize_egress_delta(&mut delta.egress, revoke)?;
         // Every workspace runs under the project's grants, so the candidate is validated as the
         // one workspace every project has runs: main, with its own grants plus the candidate. The
         // denies that differ between workspaces are their own mounts, which the mount-root deny
@@ -11103,15 +11104,17 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
             if policy.grants == previous {
                 return Ok(previous);
             }
-            // A host the gateway cannot turn into a grant would take every session of the
-            // project down at its next reconcile; refuse it here instead.
-            crate::gateway_sessions::policy_from_grants(&GrantSet {
-                egress: policy.grants.egress.clone(),
-                ..GrantSet::default()
-            })
-            .map_err(|error| {
-                CowshedError::usage(error.message, "name a DNS host or IP address to egress to")
-            })?;
+            // New grants must be gateway-admissible. Revocation only removes authority and
+            // must remain available while other malformed recorded keys await repair.
+            if !revoke {
+                crate::gateway_sessions::policy_from_grants(&GrantSet {
+                    egress: policy.grants.egress.clone(),
+                    ..GrantSet::default()
+                })
+                .map_err(|error| {
+                    CowshedError::usage(error.message, "name a DNS host or IP address to egress to")
+                })?;
+            }
             let effective =
                 crate::project_policy::effective_grants(&main.metadata.grants, &policy.grants)
                     .map_err(|error| CowshedError::internal(error.to_string()))?;
@@ -15396,11 +15399,29 @@ fn requested_port_block_size(delta: &GrantDelta, revoke: bool) -> Result<Option<
 }
 
 #[cfg(target_os = "macos")]
-fn normalize_grant_delta(delta: &mut GrantDelta) -> Result<()> {
+fn normalize_grant_delta(delta: &mut GrantDelta, revoke: bool) -> Result<()> {
     normalize_grant_paths(&mut delta.read)?;
     normalize_grant_paths(&mut delta.write)?;
     normalize_relative_denies(&mut delta.deny_write)?;
-    normalize_relative_denies(&mut delta.deny)
+    normalize_relative_denies(&mut delta.deny)?;
+    normalize_egress_delta(&mut delta.egress, revoke)
+}
+
+#[cfg(target_os = "macos")]
+fn normalize_egress_delta(rules: &mut [crate::metadata::EgressRule], revoke: bool) -> Result<()> {
+    for rule in rules {
+        match cowshed_gateway_types::HostPattern::parse(&rule.host) {
+            Ok(host) => rule.host = host.to_string(),
+            Err(_) if revoke => {}
+            Err(error) => {
+                return Err(CowshedError::usage(
+                    format!("invalid egress host `{}`: {error}", rule.host),
+                    "use a bare DNS name, IP address or single-label *. wildcard without a port or URL scheme",
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -15587,16 +15608,12 @@ fn update_egress(
     revoke: bool,
 ) {
     for rule in delta {
-        match (
-            current.iter().position(|held| held.host == rule.host),
-            revoke,
-        ) {
-            (Some(index), true) => {
-                current.remove(index);
-            }
-            (Some(index), false) => current[index] = rule,
-            (None, false) => current.push(rule),
-            (None, true) => {}
+        if revoke {
+            current.retain(|held| held.host != rule.host);
+        } else if let Some(index) = current.iter().position(|held| held.host == rule.host) {
+            current[index] = rule;
+        } else {
+            current.push(rule);
         }
     }
 }
@@ -15653,7 +15670,7 @@ mod grant_unit_tests {
             read: vec![path],
             ..GrantDelta::default()
         };
-        normalize_grant_delta(&mut delta).expect("grant path should resolve");
+        normalize_grant_delta(&mut delta, false).expect("grant path should resolve");
         delta.read.pop().expect("one resolved path")
     }
 
@@ -15674,7 +15691,7 @@ mod grant_unit_tests {
             ..GrantDelta::default()
         };
 
-        normalize_grant_delta(&mut delta).expect("valid filesystem grant paths");
+        normalize_grant_delta(&mut delta, false).expect("valid filesystem grant paths");
         apply_grant_delta(&mut grants, delta, false);
 
         assert_eq!(grants.read, [a, z]);
@@ -15802,6 +15819,113 @@ mod grant_unit_tests {
         );
     }
 
+    fn egress_delta(host: &str) -> GrantDelta {
+        GrantDelta {
+            egress: vec![crate::metadata::EgressRule {
+                host: host.to_owned(),
+                ports: Vec::new(),
+                mode: crate::metadata::EgressMode::Intercept,
+            }],
+            ..GrantDelta::default()
+        }
+    }
+
+    #[test]
+    fn egress_grant_rejects_host_port_before_mutating_the_snapshot() {
+        for host in [
+            "api.example.test:443",
+            "*.example.test:443",
+            "https://api.example.test",
+        ] {
+            let mut delta = egress_delta(host);
+            let error = normalize_grant_delta(&mut delta, false).expect_err("invalid egress host");
+            assert_eq!(error.code, ErrorCode::Usage);
+            assert!(error.message.contains(host), "{}", error.message);
+        }
+    }
+
+    #[test]
+    fn egress_grant_and_exec_share_canonical_hosts_and_ports() {
+        let mut grants = GrantSet::default();
+        for (input, canonical) in [
+            ("API.Example.Test", "api.example.test"),
+            ("*.EXAMPLE.TEST", "*.example.test"),
+            ("bücher.example", "xn--bcher-kva.example"),
+            ("[2001:db8::1]", "2001:db8::1"),
+        ] {
+            let mut delta = egress_delta(input);
+            normalize_grant_delta(&mut delta, false).expect("gateway host grammar");
+            assert_eq!(delta.egress[0].host, canonical);
+            apply_grant_delta(&mut grants, delta, false);
+        }
+        let policy = crate::gateway_sessions::policy_from_grants(&grants)
+            .expect("exec can install every accepted grant");
+        assert_eq!(policy.grants.len(), 9);
+        let mut restated = egress_delta("API.EXAMPLE.TEST");
+        normalize_grant_delta(&mut restated, false).expect("canonical restatement");
+        let before = grants.clone();
+        apply_grant_delta(&mut grants, restated, false);
+        assert_eq!(grants, before, "canonical restatement is a no-op");
+    }
+
+    #[test]
+    fn egress_revoke_repairs_recorded_invalid_keys_and_is_idempotent() {
+        let mut grants = GrantSet {
+            egress: vec![
+                egress_delta("api.example.test:443").egress.remove(0),
+                egress_delta("api.example.test:443").egress.remove(0),
+                egress_delta("other.example.test:443").egress.remove(0),
+            ],
+            ..GrantSet::default()
+        };
+        assert!(crate::gateway_sessions::policy_from_grants(&grants).is_err());
+        let mut revoked = egress_delta("api.example.test:443");
+        normalize_grant_delta(&mut revoked, true).expect("invalid recorded selector is repairable");
+        assert_eq!(revoked.egress[0].host, "api.example.test:443");
+        apply_grant_delta(&mut grants, revoked, true);
+        assert_eq!(
+            grants.egress.len(),
+            1,
+            "one revoke removes every recorded key"
+        );
+        let before = grants.clone();
+        apply_grant_delta(&mut grants, egress_delta("api.example.test:443"), true);
+        assert_eq!(grants, before, "absent-key revoke is a no-op");
+        apply_grant_delta(&mut grants, egress_delta("other.example.test:443"), true);
+        let mut delta = egress_delta("api.example.test");
+        normalize_grant_delta(&mut delta, false).expect("bare host");
+        apply_grant_delta(&mut grants, delta, false);
+        crate::gateway_sessions::policy_from_grants(&grants).expect("exec recovers");
+    }
+
+    #[test]
+    fn egress_forks_start_closed_and_inherit_only_recoverable_standing_grants() {
+        let source = GrantSet {
+            egress: egress_delta("source.example.test:443").egress,
+            ..GrantSet::default()
+        };
+        let fork = GrantSet::closed_baseline(Some(
+            crate::metadata::PortBlock::new(40_960, 64).expect("fresh fork block"),
+        ))
+        .expect("closed fork");
+        let mut project = crate::project_policy::ProjectGrants {
+            egress: egress_delta("standing.example.test:443").egress,
+            ..Default::default()
+        };
+        let effective = crate::project_policy::effective_grants(&fork, &project).unwrap();
+        assert_eq!(effective.egress, project.egress);
+        assert!(crate::gateway_sessions::policy_from_grants(&effective).is_err());
+        update_egress(
+            &mut project.egress,
+            egress_delta("standing.example.test:443").egress,
+            true,
+        );
+        let effective = crate::project_policy::effective_grants(&fork, &project).unwrap();
+        assert!(effective.egress.is_empty());
+        crate::gateway_sessions::policy_from_grants(&effective).expect("fork exec recovers");
+        assert_eq!(source.egress[0].host, "source.example.test:443");
+    }
+
     #[test]
     fn filesystem_grants_reject_relative_paths_and_root_escape() {
         for path in ["relative/path", "/../../private"] {
@@ -15809,7 +15933,7 @@ mod grant_unit_tests {
                 read: vec![PathBuf::from(path)],
                 ..GrantDelta::default()
             };
-            let error = normalize_grant_delta(&mut delta).expect_err("invalid grant path");
+            let error = normalize_grant_delta(&mut delta, false).expect_err("invalid grant path");
             assert_eq!(error.code, ErrorCode::Usage);
             assert!(error.message.contains(path));
         }
@@ -15843,7 +15967,7 @@ mod grant_unit_tests {
             read: vec![sneaky.clone()],
             ..GrantDelta::default()
         };
-        let error = normalize_grant_delta(&mut delta).expect_err("ambiguous ..");
+        let error = normalize_grant_delta(&mut delta, false).expect_err("ambiguous ..");
         assert_eq!(error.code, ErrorCode::Usage);
         assert!(
             error.message.contains("missing component"),
@@ -15863,7 +15987,7 @@ mod grant_unit_tests {
             read: vec![child],
             ..GrantDelta::default()
         };
-        let error = normalize_grant_delta(&mut delta);
+        let error = normalize_grant_delta(&mut delta, false);
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
         let error = error.expect_err("permission denied is not a lexical fallback");
         assert_eq!(error.code, ErrorCode::Usage);

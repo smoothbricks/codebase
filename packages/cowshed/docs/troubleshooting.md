@@ -99,6 +99,11 @@ and the gateway audit events for egress (Arrow segments under `/private/cowshed/
   workspace denies it exactly as it denies a sibling workspace; jobs in main itself still read it. Land or fetch what
   you need instead of reading main's files.
 - **Egress to an unmirrored host**: `cowshed grant <ws> --egress <host>` — applies immediately, no re-exec.
+- **Exec rejects an invalid recorded egress host**: list `cowshed grant <ws>`, then remove each exact invalid key with
+  `cowshed revoke <ws> --egress api.example.com:443`. If access is still needed, grant the bare `api.example.com`.
+  Standing keys use `--project-wide` instead of `<ws>`. Recovery does not require a working gateway policy first;
+  invalid rows elsewhere in the reconciled snapshot can also block a clean workspace or fork. Do not edit controller
+  files or delete the workspace to repair a grant.
 - **Linux package/proxy client gets connection refused at `127.0.0.1:7644`**: do not point it at the Unix socket or a
   macOS block base. Run `cowshed attach`; `doctor` distinguishes a detached workspace, absent/dead connector, missing or
   wrong per-incarnation socket mount, and a dead host gateway. A healthy workspace uses

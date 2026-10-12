@@ -42,8 +42,10 @@ No mounts, no root, no network — pure functions with table-driven cases:
   reset their disposable project tree per row; every refusal still compares the whole project tree, and every converged
   row retains its unchanged-replay oracle.
 - **Grant files**: schema round-trip, revision monotonicity, delta application, wildcard egress matching
-  (`*.github.com`), port defaults.
-- **Marker files**: round-trip, unknown-version rejection, role transitions (fork/restore).
+  (`*.github.com`), port defaults, canonical host admission shared with exec, host:port refusal before write, verbatim
+  invalid-key revoke and no-op recovery, and closed own/standing-only fork inheritance. Gateway denial hints must name
+  hosts the grant parser admits.
+- **Marker files**: round-trip, unknown-version rejection, role transitions (new/fork/restore).
 - **CLI/error contract**: stdout shape per command, all `CowshedError` mappings including `Integrity` → own exit 7,
   exec-wrapper 106, MCP -32006, and `next:` hints. A child 7 still passes through unchanged. Golden tests make any
   taxonomy/shape change explicitly breaking. Wire-corpus acceptance also widens each object document, including each

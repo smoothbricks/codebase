@@ -700,6 +700,7 @@ mod parity_tests {
             // The verb runs as the worker's exec, or as the coordinator's when it asks for the gate class.
             Command::Exec(_) => Some(&["worker.exec", "coordinator.exec"]),
             Command::Grant(_) => Some(&["coordinator.grant", "workspace.grants"]),
+            Command::Revoke(_) => Some(&["coordinator.revoke", "coordinator.revokeProject"]),
             Command::Remove(_) => Some(&["coordinator.destroy"]),
             Command::Attach(_) => Some(&["workspace.attach"]),
             Command::Detach(_) => Some(&["coordinator.detach"]),
@@ -774,6 +775,10 @@ mod parity_tests {
         (
             &["grant", "parity"],
             Some(&["coordinator.grant", "workspace.grants"]),
+        ),
+        (
+            &["revoke", "parity", "--egress", "api.example.test:443"],
+            Some(&["coordinator.revoke", "coordinator.revokeProject"]),
         ),
         (&["rm", "parity"], Some(&["coordinator.destroy"])),
         (&["attach", "parity"], Some(&["workspace.attach"])),
