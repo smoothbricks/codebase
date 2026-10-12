@@ -165,16 +165,18 @@ impl ProcessSpanProjection {
                 let span = self.live(*index, observed.identity)?;
                 let changed = span.program != process.program;
                 span.program = process.program.clone();
+                let span_id = span.span_id;
                 if !changed {
                     return Ok(None);
                 }
+                let program = process.program.clone();
                 Ok(Some(self.row(
-                    span.span_id,
+                    span_id,
                     EntryType::Trace,
                     PROCESS_CHANGE,
                     at,
                     Sparse {
-                        proc_program: Some(process.program.clone()),
+                        proc_program: Some(program),
                         ..Sparse::default()
                     },
                 )))
@@ -185,6 +187,7 @@ impl ProcessSpanProjection {
                 let flipped = span.busy != usage.busy;
                 span.busy = usage.busy;
                 span.usage = Some(*usage);
+                let span_id = span.span_id;
                 let sparse = usage_columns(previous, *usage, false);
                 if !flipped && sparse.is_empty() {
                     return Ok(None);
@@ -197,7 +200,7 @@ impl ProcessSpanProjection {
                     PROCESS_IDLE
                 };
                 Ok(Some(self.row(
-                    span.span_id,
+                    span_id,
                     EntryType::Trace,
                     message,
                     at,
@@ -205,9 +208,9 @@ impl ProcessSpanProjection {
                 )))
             }
             JobProcessEvent::Changed(JobProcessDelta::Blocker { index, blocked_on }) => {
-                let span = self.live(*index, observed.identity)?;
+                let span_id = self.live(*index, observed.identity)?.span_id;
                 Ok(Some(self.row(
-                    span.span_id,
+                    span_id,
                     EntryType::Trace,
                     match blocked_on {
                         BlockerChange::Set(_) => PROCESS_SET,
@@ -218,9 +221,9 @@ impl ProcessSpanProjection {
                 )))
             }
             JobProcessEvent::Heartbeat { index, .. } => {
-                let span = self.live(*index, observed.identity)?;
+                let span_id = self.live(*index, observed.identity)?.span_id;
                 Ok(Some(self.row(
-                    span.span_id,
+                    span_id,
                     EntryType::PeriodStart,
                     PROCESS_HEARTBEAT,
                     at,
@@ -414,7 +417,48 @@ impl Sparse {
     }
 
     fn merge(&mut self, other: Self) {
-        *self = other;
+        if other.proc_pid.is_some() {
+            self.proc_pid = other.proc_pid;
+        }
+        if other.proc_program.is_some() {
+            self.proc_program = other.proc_program;
+        }
+        if other.proc_argv.is_some() {
+            self.proc_argv = other.proc_argv;
+        }
+        if other.cpu_user_us.is_some() {
+            self.cpu_user_us = other.cpu_user_us;
+        }
+        if other.cpu_sys_us.is_some() {
+            self.cpu_sys_us = other.cpu_sys_us;
+        }
+        if other.rss_bytes.is_some() {
+            self.rss_bytes = other.rss_bytes;
+        }
+        if other.rss_peak_bytes.is_some() {
+            self.rss_peak_bytes = other.rss_peak_bytes;
+        }
+        if other.io_read_bytes.is_some() {
+            self.io_read_bytes = other.io_read_bytes;
+        }
+        if other.io_write_bytes.is_some() {
+            self.io_write_bytes = other.io_write_bytes;
+        }
+        if other.exit_code.is_some() {
+            self.exit_code = other.exit_code;
+        }
+        if other.exit_signal.is_some() {
+            self.exit_signal = other.exit_signal;
+        }
+        if other.blocked_on.is_some() {
+            self.blocked_on = other.blocked_on;
+        }
+        if other.blocked_path.is_some() {
+            self.blocked_path = other.blocked_path;
+        }
+        if other.blocked_holder_pid.is_some() {
+            self.blocked_holder_pid = other.blocked_holder_pid;
+        }
     }
 }
 
@@ -597,26 +641,26 @@ fn process_batch(
         message: Some(row.message),
     })?;
     let columns = &row.columns;
-    let custom = vec![
-        uint32(columns.proc_pid),
-        category(columns.proc_program.as_deref())?,
-        text(columns.proc_argv.as_deref()),
-        uint64(columns.cpu_user_us),
-        uint64(columns.cpu_sys_us),
-        uint64(columns.rss_bytes),
-        uint64(columns.rss_peak_bytes),
-        uint64(columns.io_read_bytes),
-        uint64(columns.io_write_bytes),
-        int32(columns.exit_code),
-        enumeration(columns.exit_signal, &EXIT_SIGNAL_NAMES)?,
-        enumeration(columns.blocked_on, &BLOCKED_ON_NAMES)?,
-        category(columns.blocked_path.as_deref())?,
-        uint32(columns.blocked_holder_pid),
+    let arrays = vec![
+        uint32(columns.proc_pid).1,
+        category(columns.proc_program.as_deref())?.1,
+        text(columns.proc_argv.as_deref()).1,
+        uint64(columns.cpu_user_us).1,
+        uint64(columns.cpu_sys_us).1,
+        uint64(columns.rss_bytes).1,
+        uint64(columns.rss_peak_bytes).1,
+        uint64(columns.io_read_bytes).1,
+        uint64(columns.io_write_bytes).1,
+        int32(columns.exit_code).1,
+        enumeration(columns.exit_signal, &EXIT_SIGNAL_NAMES)?.1,
+        enumeration(columns.blocked_on, &BLOCKED_ON_NAMES)?.1,
+        category(columns.blocked_path.as_deref())?.1,
+        uint32(columns.blocked_holder_pid).1,
     ];
     let fields = process_custom_fields();
     debug_assert_eq!(fields.len(), PROCESS_COLUMN_COUNT);
-    debug_assert_eq!(custom.len(), fields.len());
-    trace_batch(system, fields.into_iter().zip(custom).collect())
+    debug_assert_eq!(arrays.len(), fields.len());
+    trace_batch(system, fields.into_iter().zip(arrays).collect())
 }
 
 fn uint32(value: Option<u32>) -> (Field, ArrayRef) {
@@ -649,9 +693,10 @@ fn text(value: Option<&str>) -> (Field, ArrayRef) {
 
 fn category(value: Option<&str>) -> Result<(Field, ArrayRef), TraceSegmentError> {
     let mut builder = StringDictionaryBuilder::<UInt32Type>::new();
-    match value {
-        Some(value) => builder.append(value)?,
-        None => builder.append_null(),
+    if let Some(value) = value {
+        builder.append(value)?;
+    } else {
+        builder.append_null();
     }
     Ok((
         Field::new("ignored", dict_type(DataType::UInt32), true),
@@ -701,13 +746,18 @@ pub fn read_process_segment(path: &Path) -> Result<DecodedProcessRow, ProcessSpa
             source,
         })
     })?;
-    let mut reader = StreamReader::try_new(file, None)?;
-    let batch = reader.next().ok_or(ProcessSpanError::Schema)??;
+    let mut reader = StreamReader::try_new(file, None)
+        .map_err(|error| ProcessSpanError::Segment(TraceSegmentError::from(error)))?;
+    let batch = reader
+        .next()
+        .ok_or(ProcessSpanError::Schema)?
+        .map_err(|error| ProcessSpanError::Segment(TraceSegmentError::from(error)))?;
     if reader.next().is_some() || batch.num_rows() != 1 {
         return Err(ProcessSpanError::Schema);
     }
     let expected = process_custom_fields();
-    let actual = batch.schema().fields();
+    let schema = batch.schema();
+    let actual = schema.fields();
     let custom = actual
         .get(actual.len().saturating_sub(expected.len())..)
         .unwrap_or_default();
@@ -1382,7 +1432,8 @@ mod tests {
             let mut pid = [0_u8; 4];
             std::io::Read::read_exact(&mut &ready_read, &mut pid).expect("child pid");
             let pid = u32::try_from(i32::from_ne_bytes(pid)).unwrap();
-            let observer = KqueueObserver::watch(pid).expect("watch");
+            let observer =
+                KqueueObserver::watch(crate::api::dto::JobId::new(1).unwrap(), pid).expect("watch");
             gate_write.write_all(b"x").unwrap();
             (observer, spawned.join().unwrap())
         });
