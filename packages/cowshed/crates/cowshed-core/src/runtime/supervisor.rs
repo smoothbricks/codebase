@@ -3297,7 +3297,7 @@ fn process_observation_unavailable(job_id: JobId) -> CowshedError {
     {
         CowshedError::environment_missing(
             format!(
-                "job {} has no placed Linux native observer: this supervisor has no Linux SpawnSink",
+                "job {} has no placed Linux native observer: the selected ptrace source is not wired to this supervisor",
                 job_id.get()
             ),
             "use a Linux execution substrate with the selected ptrace source and its source-owned reaper",

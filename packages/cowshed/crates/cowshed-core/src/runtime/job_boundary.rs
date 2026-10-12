@@ -380,6 +380,7 @@ mod tests {
         assert_eq!(process.len(), 14);
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn a_boundary_samples_the_admitted_baseline_not_a_fresh_one() {
         use std::path::PathBuf;

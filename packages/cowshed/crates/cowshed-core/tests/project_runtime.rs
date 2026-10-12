@@ -3405,6 +3405,9 @@ async fn host_controller_a_reaped_grandchild_burst_retains_its_observation_gap()
         .resources
         .as_ref()
         .expect("source accounting is retained");
+    let napi_sample: cowshed_core::api::resources::JobResourceSample =
+        napi_job_read(&jobs, &root, job.id(), "await job.resources()").await;
+    assert_eq!(&napi_sample, sample);
     let JobAccounting::MacOsRusageChildren { reconciliation, .. } = &sample.accounting else {
         panic!("a macOS burst must retain its named rusage source");
     };
