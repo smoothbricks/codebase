@@ -2846,14 +2846,15 @@ async fn release(gate: PathBuf) {
     .expect("release task");
 }
 
-/// `job.listeningPorts()` as an embedder's Node process answers it through the built N-API
-/// addon, over its own coordinator connection to the same router.
+/// One public SDK expression on a trusted embedder's inherited coordinator connection.
+/// Its result decodes into the same canonical Rust type the controller returns.
 #[cfg(target_os = "macos")]
-async fn napi_listening_ports(
+async fn napi_job_read<T: serde::de::DeserializeOwned>(
     jobs: &SupervisedJobs,
     root: &TempRoot,
     job: JobId,
-) -> cowshed_core::api::dto::JobListeningPorts {
+    expression: &str,
+) -> T {
     use cowshed_os::fork_lock::Spawn as _;
     let manifest = std::env::var_os("CARGO_MANIFEST_DIR")
         .expect("cargo and nextest export CARGO_MANIFEST_DIR to the test process");
@@ -2867,11 +2868,13 @@ async fn napi_listening_ports(
          const coordinator = await connectCoordinator(coordinatorEndpoint(3), {checkout});\n\
          const worker = await coordinator.worker('main');\n\
          const job = await worker.job({job});\n\
-         console.log(JSON.stringify(await job.listeningPorts()));\n\
+         const document = JSON.stringify({expression});\n\
+         await new Promise((resolve, reject) => process.stdout.write(document + '\\n', error => error ? reject(error) : resolve()));\n\
          process.exit(0);\n",
         module = json!(module.as_str()),
         checkout = json!(root.join("checkout")),
         job = job.get(),
+        expression = expression,
     );
     let node = std::env::var_os("PATH")
         .and_then(|path| {
@@ -2909,7 +2912,198 @@ async fn napi_listening_ports(
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    serde_json::from_slice(&output.stdout).expect("node answers the job's listening ports")
+    serde_json::from_slice(&output.stdout).expect("the SDK answers the canonical job value")
+}
+
+/// The complete native path: held workload, served supervisor, worker stream, trusted N-API
+/// embedder and the supervisor's sole trace sink. Closing a reader never releases the workload.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+async fn host_controller_process_observations_survive_a_subscriber_drop() {
+    use cowshed_core::api::process::{JobProcessEvent, JobProcessTree, ProcessCoverage};
+    use cowshed_core::api::resources::SampleInterval;
+    use cowshed_core::fork_lock::Run as _;
+    use cowshed_core::runtime::{process_spans, supervisor_socket};
+
+    let root = test_root();
+    let mut config = supervisor_config(&root);
+    let telemetry = root.join("telemetry");
+    config.telemetry_root = Some(telemetry.clone());
+    let supervisor = system_supervisor_of(config);
+    let path = root.join("observer.sock");
+    let socket = supervisor_socket::bind(&path)
+        .await
+        .expect("bind supervisor");
+    let serving = tokio::spawn(supervisor_socket::serve(
+        socket,
+        supervisor.clone(),
+        None,
+        None,
+    ));
+    let remote = supervisor_socket::connect(path, supervisor.snapshot().clone());
+    let jobs = SupervisedJobs::connect(&root, remote.clone()).await;
+    let gate = root.join("workspace").join("observation-gate");
+    assert!(
+        std::process::Command::new("/usr/bin/mkfifo")
+            .arg(&gate)
+            .status_locked()
+            .expect("create the fixture's FIFO")
+            .success()
+    );
+    let job = jobs
+        .exec(ExecCommand::Argv(
+            [
+                "/bin/sh",
+                "-c",
+                "printf 'oracle:%s\\n' \"$$\"; exec /bin/cat observation-gate",
+            ]
+            .into_iter()
+            .map(CommandArg::from)
+            .collect(),
+        ))
+        .await;
+    let mut stdout = job
+        .logs(JobStream::Stdout, 0, true)
+        .await
+        .expect("oracle stdout");
+    let mut oracle = Vec::new();
+    while !oracle.contains(&b'\n') {
+        let chunk = tokio::time::timeout(Duration::from_secs(5), stdout.next())
+            .await
+            .expect("the held fixture reports its own PID")
+            .expect("oracle did not end")
+            .expect("oracle bytes");
+        oracle.extend_from_slice(&chunk);
+    }
+    let pid: u32 = std::str::from_utf8(&oracle)
+        .unwrap()
+        .trim()
+        .strip_prefix("oracle:")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let tree = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let tree = job.processes().await.expect("native process tree");
+            if tree.processes.len() == 1 && tree.processes[0].program == "/bin/cat" {
+                break tree;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("exec reaches the retained native tree");
+    assert_eq!(tree.processes[0].pid, pid);
+    assert!(tree.processes[0].exit.is_none());
+    assert_eq!(tree.coverage, ProcessCoverage::Complete);
+
+    let napi_tree: JobProcessTree =
+        napi_job_read(&jobs, &root, job.id(), "await job.processes()").await;
+    assert_eq!(napi_tree.processes[0].pid, pid);
+    assert_eq!(napi_tree.processes[0].program, "/bin/cat");
+    assert_eq!(napi_tree.processes[0].born_at, tree.processes[0].born_at);
+    let dropped: Vec<JobProcessEvent> = napi_job_read(
+        &jobs,
+        &root,
+        job.id(),
+        "await (async () => { const rows = []; for await (const row of job.processEvents(20)) { rows.push(row); break; } return rows; })()",
+    )
+    .await;
+    assert!(
+        matches!(&dropped[..], [JobProcessEvent::Born { index: 0, process }] if process.pid == pid)
+    );
+    assert_eq!(
+        job.status()
+            .await
+            .expect("the reader did not kill the job")
+            .state,
+        JobState::Running
+    );
+
+    let mut events = job
+        .process_events(SampleInterval::new(20).unwrap())
+        .await
+        .expect("canonical worker stream");
+    release(gate).await;
+    let ended = job
+        .wait()
+        .await
+        .expect("held command ends after its gate opens");
+    assert_eq!(ended.state, JobState::Exited);
+    let mut history = Vec::new();
+    while let Some(event) = tokio::time::timeout(Duration::from_secs(5), events.next())
+        .await
+        .expect("retained stream reaches its end")
+    {
+        history.push(event.expect("native process event"));
+    }
+    assert!(
+        matches!(history.first(), Some(JobProcessEvent::Born { index: 0, process }) if process.pid == pid)
+    );
+    assert!(history.iter().any(|event| matches!(event, JobProcessEvent::Exec { index: 0, process } if process.program == "/bin/cat")));
+    assert!(
+        matches!(history.last(), Some(JobProcessEvent::Exited { index: 0, process }) if process.pid == pid && process.usage.is_some() && process.exit.as_ref().is_some_and(|exit| exit.status == cowshed_core::api::dto::ExitStatus::Exited { code: 0 }))
+    );
+    let final_tree = job
+        .processes()
+        .await
+        .expect("retired records remain readable");
+    assert_eq!(final_tree.processes.len(), 1);
+    assert!(final_tree.processes[0].exit.is_some());
+    let napi_history: Vec<JobProcessEvent> = napi_job_read(
+        &jobs,
+        &root,
+        job.id(),
+        "await (async () => { const rows = []; for await (const row of job.processEvents(20)) rows.push(row); return rows; })()",
+    )
+    .await;
+    assert_eq!(napi_history, history);
+
+    let health = remote
+        .trace_health()
+        .await
+        .expect("all earlier rows are sealed");
+    assert_eq!(health.failed, 0, "{health:?}");
+    let mut rows = Vec::new();
+    for day in std::fs::read_dir(&telemetry).expect("trace days") {
+        for entry in std::fs::read_dir(day.unwrap().path()).expect("trace segments") {
+            let path = entry.unwrap().path();
+            if path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("process-")
+            {
+                rows.push(
+                    process_spans::read_process_segment(&path)
+                        .expect("exact fourteen-column process schema"),
+                );
+            }
+        }
+    }
+    let starts: Vec<_> = rows
+        .iter()
+        .filter(|row| row.entry_type == "span-start")
+        .collect();
+    assert_eq!(starts.len(), 1, "{rows:?}");
+    assert_eq!(starts[0].proc_pid, Some(pid));
+    assert_eq!(starts[0].parent_span_id, 1);
+    assert_eq!(rows.iter().filter(|row| row.proc_argv.is_some()).count(), 1);
+    let terminal: Vec<_> = rows.iter().filter(|row| row.exit_code.is_some()).collect();
+    assert_eq!(terminal.len(), 1);
+    assert_eq!(terminal[0].exit_code, Some(0));
+    assert!(terminal[0].cpu_user_us.is_some());
+    assert!(terminal[0].cpu_sys_us.is_some());
+    assert_eq!(terminal[0].rss_bytes, Some(0));
+    drop(stdout);
+    serving.abort();
+    assert!(
+        serving
+            .await
+            .expect_err("the owned server is stopped")
+            .is_cancelled()
+    );
 }
 
 /// `listeningPorts()` over real sandboxed jobs, through the controller and through N-API: a job
@@ -2985,7 +3179,13 @@ async fn host_controller_a_job_s_listening_ports_are_its_own_group_s() {
         vec![other.port]
     );
 
-    let answered = napi_listening_ports(&jobs, &root, listening.job.id()).await;
+    let answered: cowshed_core::api::dto::JobListeningPorts = napi_job_read(
+        &jobs,
+        &root,
+        listening.job.id(),
+        "await job.listeningPorts()",
+    )
+    .await;
     assert_eq!(answered.job_id, listening.job.id());
     assert_eq!(answered.ports, vec![listening.port]);
 

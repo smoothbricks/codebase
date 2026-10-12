@@ -322,6 +322,13 @@ impl<P: ProcessReads> KqueueObserver<P> {
         self.fold.lives()
     }
 
+    pub(crate) fn attribution_summary(
+        &self,
+    ) -> Result<super::job_attribution::AttributionSummary, crate::api::resources::ResourceUnitError>
+    {
+        self.fold.attribution_summary()
+    }
+
     pub fn tree(&self, at: UtcTimestamp) -> JobProcessTree {
         self.fold.tree(at)
     }
@@ -554,7 +561,7 @@ impl<P: ProcessReads> KqueueObserver<P> {
     /// started with. An image that could not be read is the `UnreadImage` gap, and a read
     /// that failed is returned beside it with its call and errno.
     fn fold_image(&mut self, process: ProcessIdentity, seen: Seen) -> Result<(), ObserveError> {
-        let unread = ProcessObservation::Lost(ProcessCoverageGap::UnreadImage { pid: process.pid });
+        let unread = ProcessObservation::ImageUnread { process };
         let mut failures = Failures::default();
         let observation = match self.image(process) {
             Ok(Some(image))

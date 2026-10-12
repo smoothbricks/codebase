@@ -104,6 +104,8 @@ pub enum ProcessObservation {
         process: ProcessIdentity,
         image: ProcessImage,
     },
+    /// This retained life exec'd, but its current image could not be read.
+    ImageUnread { process: ProcessIdentity },
     Exited {
         process: ProcessIdentity,
         status: ExitStatus,
@@ -130,6 +132,8 @@ pub struct ProcessNode<'a> {
     pub parent: Option<ProcessIdentity>,
     pub ppid: u32,
     pub image: &'a ProcessImage,
+    /// False after a refused/failed current-image read, until an exec names it again.
+    pub image_known: bool,
     pub born_at: &'a UtcTimestamp,
     pub exit: Option<&'a ProcessExit>,
 }
@@ -141,6 +145,7 @@ struct Life {
     ppid: u32,
     /// Shared with the parent until this life execs: a fork copies no argv.
     image: Arc<ProcessImage>,
+    image_known: bool,
     born_at: UtcTimestamp,
     exit: Option<ProcessExit>,
 }
@@ -152,6 +157,7 @@ impl Life {
             parent,
             ppid: self.ppid,
             image: &self.image,
+            image_known: self.image_known,
             born_at: &self.born_at,
             exit: self.exit.as_ref(),
         }
@@ -212,7 +218,7 @@ impl ProcessTreeFold {
                 ppid,
                 at,
                 image,
-            } => self.born(process, None, ppid, at, Arc::new(image)),
+            } => self.born(process, None, ppid, at, Arc::new(image), true),
             ProcessObservation::Forked {
                 process,
                 parent,
@@ -227,13 +233,22 @@ impl ProcessTreeFold {
                     return Err(ProcessFoldError::AfterExit { pid: parent.pid });
                 }
                 let image = Arc::clone(&parent_life.image);
-                self.born(process, Some(index), parent.pid, at, image)
+                let image_known = parent_life.image_known;
+                self.born(process, Some(index), parent.pid, at, image, image_known)
             }
             ProcessObservation::Exec { process, image } => {
                 let Some(life) = self.running_life(process)? else {
                     return Ok(());
                 };
                 life.image = Arc::new(image);
+                life.image_known = true;
+                Ok(())
+            }
+            ProcessObservation::ImageUnread { process } => {
+                if let Some(life) = self.running_life(process)? {
+                    life.image_known = false;
+                }
+                self.gap(ProcessCoverageGap::UnreadImage { pid: process.pid });
                 Ok(())
             }
             ProcessObservation::Exited {
@@ -276,11 +291,13 @@ impl ProcessTreeFold {
             .map(|life| life.node(life.parent.map(|parent| self.lives[parent].identity)))
     }
 
-    /// The image `process` runs now, as last observed.
+    /// The current observed image; absent after an unread image, even if an earlier image was known.
     pub fn image(&self, process: ProcessIdentity) -> Option<&ProcessImage> {
-        self.by_identity
-            .get(&process)
-            .map(|&index| &*self.lives[index].image)
+        self.by_identity.get(&process).and_then(|&index| {
+            self.lives[index]
+                .image_known
+                .then_some(&*self.lives[index].image)
+        })
     }
 
     /// `process`'s position in birth-observation order: the index of its record in
@@ -346,6 +363,7 @@ impl ProcessTreeFold {
         ppid: u32,
         at: UtcTimestamp,
         image: Arc<ProcessImage>,
+        image_known: bool,
     ) -> Result<(), ProcessFoldError> {
         if self.by_identity.contains_key(&identity) {
             return Err(ProcessFoldError::BornTwice { pid: identity.pid });
@@ -360,6 +378,7 @@ impl ProcessTreeFold {
             parent,
             ppid,
             image,
+            image_known,
             born_at: at,
             exit: None,
         });

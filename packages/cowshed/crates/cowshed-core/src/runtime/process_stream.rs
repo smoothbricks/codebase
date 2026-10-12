@@ -184,6 +184,21 @@ impl JobProcessFold {
         self.readings.usage.start(process)
     }
 
+    /// Summarize the same identity-fenced readings that the tree and events expose.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn attribution_summary(
+        &self,
+    ) -> Result<super::job_attribution::AttributionSummary, crate::api::resources::ResourceUnitError>
+    {
+        super::job_attribution::AttributionSummary::from_observed(self.tree.nodes().map(|node| {
+            super::job_attribution::ObservedLife {
+                identity: node.identity,
+                image: node.image_known.then_some(node.image),
+                usage: self.readings.usage(node.identity),
+            }
+        }))
+    }
+
     /// Every record, as last observed and read.
     pub fn tree(&self, sampled_at: UtcTimestamp) -> JobProcessTree {
         self.tree.tree(self.job_id, sampled_at, &self.readings)
@@ -198,7 +213,7 @@ impl JobProcessFold {
             | ProcessObservation::Forked { process, .. } => Some((*process, Observed::Born)),
             ProcessObservation::Exec { process, .. } => Some((*process, Observed::Exec)),
             ProcessObservation::Exited { process, .. } => Some((*process, Observed::Exited)),
-            ProcessObservation::Lost(_) => None,
+            ProcessObservation::ImageUnread { .. } | ProcessObservation::Lost(_) => None,
         };
         self.tree.apply(observation)?;
         let Some((process, observed)) = named else {
