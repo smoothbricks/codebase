@@ -9504,7 +9504,12 @@ mod tests {
         let first = store.append_record(valid_job_record(1)).unwrap().0;
         let path = records_path(&root);
         let retained_len = fs::metadata(&path).unwrap().len();
-        let second = store.append_record(valid_job_record(2)).unwrap().0;
+        // Another writer serialized behind the records lock dies mid-append. Its frame is cut
+        // before this store validated it, so only the handed-out sequence outlives the tail.
+        let second = store_at(&root, ArtifactConfig::default())
+            .append_record(valid_job_record(2))
+            .unwrap()
+            .0;
         assert_eq!((first.sequence, second.sequence), (1, 2));
 
         let file = OpenOptions::new().write(true).open(&path).unwrap();
@@ -9519,6 +9524,31 @@ mod tests {
             second.sequence,
             after_tail_loss.sequence,
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A terminal record survives the death of the process that wrote it (11_shell.md "Durability
+    /// of a job's own records"), so one this store already validated is never a torn tail: losing
+    /// it from under the live store is integrity, not a silently forgotten job.
+    #[test]
+    fn a_lost_tail_cannot_take_a_terminal_record_this_store_validated() {
+        let root = temp_root("validated-terminal-tail-loss");
+        let mut store = store_at(&root, ArtifactConfig::default());
+        store.append_record(valid_job_record(1)).unwrap();
+        let path = records_path(&root);
+        let retained_len = fs::metadata(&path).unwrap().len();
+        store.append_record(valid_job_record(2)).unwrap();
+
+        let file = OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_len(retained_len + FRAME_HEADER_BYTES as u64)
+            .unwrap();
+        file.sync_data().unwrap();
+
+        assert!(matches!(
+            store.append_record(valid_job_record(3)),
+            Err(ArtifactError::Integrity { message, .. })
+                if message == "a validated terminal job disappeared from protected records"
+        ));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -9552,7 +9582,11 @@ mod tests {
         store.append_record(valid_job_record(1)).unwrap();
         let path = records_path(&root);
         let retained_len = fs::metadata(&path).unwrap().len();
-        let before_repair = store.append_record(valid_job_record(2)).unwrap().0;
+        // Another writer's frame: the tail that repair cuts is one this store never validated.
+        let before_repair = store_at(&root, ArtifactConfig::default())
+            .append_record(valid_job_record(2))
+            .unwrap()
+            .0;
 
         let file = OpenOptions::new().write(true).open(&path).unwrap();
         file.set_len(retained_len + FRAME_HEADER_BYTES as u64)
@@ -9919,9 +9953,9 @@ mod tests {
         #![proptest_config(ProptestConfig::with_cases(32))]
 
         /// Barrier ids belong to the store, not to whatever a later recovery can still see: for
-        /// any interleaving of appends, checkpoints and lost tails, every barrier the store hands
-        /// out is strictly above every barrier it handed out before, and no durable manifest of
-        /// this incarnation carries a barrier twice.
+        /// any interleaving of its checkpoints, other writers' appends and lost tails, every
+        /// barrier the store hands out is strictly above every barrier it handed out before, and
+        /// no durable manifest of this incarnation carries a barrier twice.
         #[test]
         fn checkpoint_barriers_never_repeat_across_appends_and_lost_tails(
             steps in records_steps(),
@@ -9934,7 +9968,11 @@ mod tests {
             for step in &steps {
                 match step {
                     RecordsStep::AppendRecord => {
-                        store.append_record(valid_job_record(next_job_id)).unwrap();
+                        // Each append is another writer's, so a lost tail only ever cuts a job
+                        // frame no live reader has validated.
+                        store_at(&root, ArtifactConfig::default())
+                            .append_record(valid_job_record(next_job_id))
+                            .unwrap();
                         next_job_id += 1;
                     }
                     RecordsStep::Checkpoint => {
