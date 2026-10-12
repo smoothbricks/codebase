@@ -135,21 +135,21 @@ slower backing store. **Therefore, assign the HOTTEST properties FIRST** in the 
 // ❌ BAD: Hot properties assigned last (likely overflow to backing store)
 class BadBuffer {
   constructor(capacity: number) {
-    this._system = new ArrayBuffer(capacity * 9); // Cold - never accessed after construction
+    this._system = new ArrayBuffer(capacity * 9);  // Cold - never accessed after construction
     this.message_values[0] = 'span'; // Cold write - span name lives in message row 0
-    this._parent = undefined; // Warm - occasionally accessed
-    this._nodeIndex = NO_NODE; // Warm - trace topology handle
+    this._parent = undefined;      // Warm - occasionally accessed
+    this._children = [];           // Warm - occasionally accessed
     this._scopeValues = undefined; // Cold - Arrow conversion only
     this._callsiteMetadata = undefined; // Cold - Arrow conversion only
     this._identity = new Uint8Array(12); // Warm - span operations
-    this._opMetadata = opMetadata; // Warm - span operations
+    this._logBinding = module;     // Warm - span operations
 
     // HOT properties last - likely overflow to out-of-object backing store!
-    this._writeIndex = 0; // HOTTEST - read + increment every write!
-    this._capacity = capacity; // HOTTEST - compared every write (overflow check)!
-    this._next = undefined; // HOT - checked on overflow!
-    this.timestamp = new BigInt64Array(capacity); // HOT - written EVERY entry
-    this.entry_type = new Uint8Array(capacity); // HOT - written EVERY entry
+    this._writeIndex = 0;          // HOTTEST - read + increment every write!
+    this._capacity = capacity;     // HOTTEST - compared every write (overflow check)!
+    this._next = undefined;        // HOT - checked on overflow!
+    this.timestamp = new BigInt64Array(capacity);  // HOT - written EVERY entry
+    this.entry_type = new Uint8Array(capacity);    // HOT - written EVERY entry
   }
 }
 
@@ -157,21 +157,21 @@ class BadBuffer {
 class GoodBuffer {
   constructor(capacity: number) {
     // SLOT 1-3: HOTTEST properties FIRST - guaranteed in-object slots
-    this._writeIndex = 0; // Read + increment on EVERY write
-    this._capacity = capacity; // Compared on EVERY write (overflow check)
-    this._next = undefined; // Checked when overflow occurs
+    this._writeIndex = 0;          // Read + increment on EVERY write
+    this._capacity = capacity;     // Compared on EVERY write (overflow check)
+    this._next = undefined;        // Checked when overflow occurs
 
     // SLOT 4-5: HOT - TypedArray refs accessed every entry
-    this.timestamp = new BigInt64Array(capacity); // Array indexing EVERY entry
-    this.entry_type = new Uint8Array(capacity); // Array indexing EVERY entry
+    this.timestamp = new BigInt64Array(capacity);  // Array indexing EVERY entry
+    this.entry_type = new Uint8Array(capacity);    // Array indexing EVERY entry
 
     // SLOT 6-7: WARM - Tree structure (span creation/navigation)
-    this._nodeIndex = NO_NODE; // Set when the factory registers the span in the trace topology
-    this._parent = undefined; // Accessed for trace_id walk
+    this._children = [];           // Modified during child span creation
+    this._parent = undefined;      // Accessed for trace_id walk
 
     // SLOT 8-9: WARM - Identity and binding (accessed during span ops)
     this._identity = new Uint8Array(12); // Accessed for span_id/thread_id
-    this._opMetadata = opMetadata; // Accessed for attribution and the physical layout plan
+    this._logBinding = module;     // Accessed for schema/capacity stats
 
     // SLOT 10+: COLD properties last (only accessed during Arrow conversion)
     this._system = new ArrayBuffer(capacity * 9); // NEVER accessed after construction
@@ -180,13 +180,38 @@ class GoodBuffer {
     this._callsiteMetadata = undefined; // Arrow conversion only
   }
 }
+}
+
+// ✅ GOOD: Hot properties first (guaranteed in-object slots)
+class GoodBuffer {
+  constructor(capacity: number) {
+    // HOTTEST properties FIRST - guaranteed in-object slots
+    this._writeIndex = 0; // Accessed on EVERY write
+    this._capacity = capacity; // Checked on EVERY write
+    this.timestamp = new BigInt64Array(capacity); // Written EVERY entry
+    this.entry_type = new Uint8Array(capacity); // Written EVERY entry
+    this._next = undefined; // Checked on overflow (hot)
+
+    // Warm properties (tree structure, accessed during span creation)
+    this._parent = undefined;
+    this._children = [];
+    this._identity = new Uint8Array(12);
+    this._system = new ArrayBuffer(capacity * 9);
+    this._logBinding = module;
+
+    // Cold properties last (metadata, rarely accessed)
+    this.message_values[0] = 'span';
+    this._scopeValues = undefined;
+    this._callsiteMetadata = undefined;
+  }
+}
 ```
 
 **Rule of Thumb for Property Ordering:**
 
 1. **Positions 1-4**: Properties accessed on EVERY write (`_writeIndex`, `_capacity`, `timestamp`, `entry_type`)
-2. **Positions 5-10**: Properties accessed frequently during span lifecycle (`_next`, `_parent`, `_nodeIndex`,
-   `_identity`, `_system`, `_opMetadata`)
+2. **Positions 5-10**: Properties accessed frequently during span lifecycle (`_next`, `_parent`, `_children`,
+   `_identity`, `_system`, `_logBinding`)
 3. **Positions 11+**: Cold properties (metadata, rarely-accessed fields)
 
 **Also important:**
@@ -781,7 +806,7 @@ class FastBuffer {
     }
   }
 
-  // Cold path: overflow handling
+  // Cold path: Growth, compaction, etc
   private _grow() {
     // Expensive entry_type isolated here
   }
@@ -932,13 +957,11 @@ Memory is managed in request-attributable flush cycles:
 
 1. **Warmed write path**: accumulate into buffer-owned storage.
 2. **Flush trigger**: freeze the request trace.
-3. **Cold conversion**: borrow contiguous/chunked JS-heap regions under `ArrowLease`, and copy WASM-backed columns into
-   Arrow-owned conversion buffers.
+3. **Cold conversion**: borrow contiguous/chunked regions under `ArrowLease` or create Arrow-owned conversion buffers.
 4. **Cleanup**: reset, recycle, or GC source memory only after every borrowing lease is released.
 
 Transport batching MAY group completed request outputs but MUST preserve per-request latency, checksum, memory, and
-ownership accounting. The WASM memory epoch is pinned only during the synchronous conversion; a view refresh that finds
-the memory grown under that pin throws rather than read a detached view.
+ownership accounting. WASM growth that invalidates views is forbidden while a lease pins the current memory epoch.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
@@ -1155,8 +1178,7 @@ export function getInterned(str: string): Uint8Array | undefined {
 **When `intern()` is called** (all at startup/definition time, NOT hot path):
 
 - **Enum schema creation**: `S.enum(['A', 'B', 'C'])` calls `intern()` for all values
-- **Op metadata creation**: `createOpMetadata(...)` (at `defineOp`) interns `package_name`, `package_file`, and
-  `git_sha`
+- **Module context creation**: `new ModuleContext(...)` interns `packageName`, `packagePath`, and `gitSha`
 - **Span buffer creation**: `createSpanBuffer(...)` interns `spanName`
 
 **Why unbounded**: All interned values are source code constants (enum values, file paths, span names) that already
@@ -1169,28 +1191,24 @@ exist in memory. The interner just caches their UTF-8 representations.
 const schema = S.enum(['CREATE', 'READ', 'UPDATE', 'DELETE']);
 // → intern() called 4 times, UTF-8 bytes cached forever
 
-// At op definition (startup)
-const opMetadata = createOpMetadata(
-  'processOrder', // op name
-  packageName, // intern(package_name) → UTF-8 bytes cached (e.g., '@mycompany/user-service')
-  packageFile, // intern(package_file) → UTF-8 bytes cached (e.g., 'src/services/user.ts')
-  gitSha, // intern(git_sha) → UTF-8 bytes cached
-  line // line of the defineOp call
+// At module creation (startup)
+const moduleCtx = new ModuleContext(
+  gitSha, // intern(gitSha) → UTF-8 bytes cached
+  packageName, // intern(packageName) → UTF-8 bytes cached (e.g., '@mycompany/user-service')
+  packagePath, // intern(packagePath) → UTF-8 bytes cached (e.g., 'src/services/user.ts')
+  logSchema
 );
 
 // At span creation (per-span, but span names are finite)
-// span(lineNumber, 'name', op, ...args) runs SpanContext._spanPre(), which creates the child buffer,
-// writes row 0 with the span name, and writes lineNumber directly to row 0's line column
-const buffer = createChildSpanBuffer(
-  parentBuffer,
-  callsiteMetadata, // Caller's OpMetadata for row 0
-  opMetadata, // Op's OpMetadata for rows 1+
-  capacityTier,
-  schema,
-  SpanBufferClass
+// SpanName is passed to op via span(lineNumber, 'name', op, args)
+// lineNumber is written directly to lineNumber_values[0] inside _invoke()
+// spanName is interned for UTF-8 encoding
+const buffer = createSpanBuffer(
+  callsiteModule, // Caller's module for row 0 metadata
+  opModule, // Op's module for rows 1+ metadata
+  'processOrder' // intern(spanName) → UTF-8 bytes cached
 );
-buffer._appenders.writeSpanStart(buffer, 'processOrder'); // intern(spanName) → UTF-8 bytes cached
-buffer.line(0, lineNumber); // Direct TypedArray write, NOT stored as property
+buffer.lineNumber_values[0] = lineNumber; // Direct TypedArray write, NOT stored as property
 ```
 
 ### Utf8Cache (lmao owns) <a id="smoo/lmao!n/buffer-perf-utf8-cache"></a>
@@ -1285,34 +1303,32 @@ export class DictionaryBuilder {
 **Why 2nd-occurrence caching**: Most one-time strings (unique error messages, UUIDs) don't benefit from caching. By
 waiting until the 2nd occurrence, we avoid wasting memory on truly unique strings while still caching repeated values.
 
-### Pre-encoded UTF-8 in OpMetadata (lmao owns)
+### Pre-encoded UTF-8 in ModuleContext (lmao owns)
 
-`OpMetadata` stores pre-encoded UTF-8 for its attribution strings:
+ModuleContext stores pre-encoded UTF-8 for frequently-used strings:
 
 ```typescript
-// createOpMetadata (once per defineOp at startup, packages/lmao/src/lib/opContext/defineOp.ts)
-function createOpMetadata(name, package_name, package_file, git_sha, line): OpMetadata {
-  return {
-    name,
-    package_name,
-    package_file,
-    git_sha,
-    line,
-    // Global interner deduplicates: Ops with the same package_name share UTF-8 bytes
-    package_name_entry: new PreEncodedEntry(package_name, intern(package_name)),
-    package_file_entry: new PreEncodedEntry(package_file, intern(package_file)),
-    git_sha_entry: new PreEncodedEntry(git_sha, intern(git_sha)),
-  };
+// ModuleContext (created once per module at startup)
+class ModuleContext {
+  readonly utf8PackageName: Uint8Array; // intern(packageName)
+  readonly utf8PackagePath: Uint8Array; // intern(packagePath)
+  readonly utf8GitSha: Uint8Array; // intern(gitSha)
+
+  constructor(gitSha, packageName, packagePath, logSchema) {
+    this.utf8PackageName = intern(packageName);
+    this.utf8PackagePath = intern(packagePath);
+    this.utf8GitSha = intern(gitSha);
+  }
 }
 
-// SpanBuffer stores dual metadata references for source attribution:
-// - _callsiteMetadata: Caller's OpMetadata (for row 0's git_sha/package_name/package_file)
-// - _opMetadata: Op's OpMetadata (for rows 1+ git_sha/package_name/package_file)
+// SpanBuffer stores dual module references for source attribution:
+// - callsiteModule: Caller's module (for row 0's gitSha/packageName/packagePath)
+// - module: Op's module (for rows 1+ gitSha/packageName/packagePath)
 // spanName is interned during buffer creation
 // lineNumber is written directly to lineNumber_values TypedArray (NOT stored as property)
 ```
 
-**Why pre-encode**: These strings are written to Arrow columns frequently. Pre-encoding at op definition moves UTF-8
+**Why pre-encode**: These strings are written to Arrow columns frequently. Pre-encoding at module creation moves UTF-8
 encoding to startup; per-request lookup/copy/wrapper costs remain measured.
 
 ### Design Decisions
@@ -1367,16 +1383,16 @@ encoding model.
 
 ### Package Ownership Summary
 
-| Component                   | Package       | Purpose                                          |
-| --------------------------- | ------------- | ------------------------------------------------ |
-| `intern()`, `getInterned()` | arrow-builder | UTF-8 pre-encoding for known strings             |
-| `Utf8Encoder` interface     | arrow-builder | Contract for UTF-8 encoding                      |
-| `defaultUtf8Encoder`        | arrow-builder | Simple TextEncoder wrapper, no caching           |
-| `utf8ByteLength()`          | arrow-builder | Calculate UTF-8 length without encoding          |
-| `DictionaryBuilder`         | arrow-builder | Build Arrow dictionaries with 2nd-occ cache      |
-| `Utf8Cache`                 | lmao          | SIEVE-cached Utf8Encoder for runtime strings     |
-| `globalUtf8Cache`           | lmao          | Singleton Utf8Cache instance                     |
-| Pre-encoded metadata        | lmao          | OpMetadata with `*_entry` PreEncodedEntry fields |
+| Component                   | Package       | Purpose                                      |
+| --------------------------- | ------------- | -------------------------------------------- |
+| `intern()`, `getInterned()` | arrow-builder | UTF-8 pre-encoding for known strings         |
+| `Utf8Encoder` interface     | arrow-builder | Contract for UTF-8 encoding                  |
+| `defaultUtf8Encoder`        | arrow-builder | Simple TextEncoder wrapper, no caching       |
+| `utf8ByteLength()`          | arrow-builder | Calculate UTF-8 length without encoding      |
+| `DictionaryBuilder`         | arrow-builder | Build Arrow dictionaries with 2nd-occ cache  |
+| `Utf8Cache`                 | lmao          | SIEVE-cached Utf8Encoder for runtime strings |
+| `globalUtf8Cache`           | lmao          | Singleton Utf8Cache instance                 |
+| Pre-encoded contexts        | lmao          | ModuleContext with utf8\* fields             |
 
 ### Data Flow During Arrow Conversion
 

@@ -13,45 +13,35 @@ The Arrow Table Structure defines the final queryable format produced by the tra
 
 ## Arrow Ownership and Copy Contract <a id="smoo/lmao!n/arrow-table-zero-copy"></a>
 
-**CRITICAL**: Arrow conversion of JS-heap SpanBuffers MUST wrap direct TypedArray references as bounded `subarray()`
-views and pass them to `arrow.makeData()` (flechette's direct `Batch`). A copy needs a measured reason: a benchmark
-against the borrow.
+**CRITICAL**: All Arrow conversions MUST wrap direct TypedArray references as bounded `subarray()` views and pass them
+to `arrow.makeData()` (flechette's direct `Batch`). A copy needs a measured reason: a benchmark against the borrow. Each
+physical column uses the cheapest correct mode:
 
-**WASM exception**: WASM-backed columns are always copied into Arrow-owned storage. `memory.grow()` detaches every view
-of the old linear memory, so a borrowed view could not outlive the next growth; this is a correctness rule, not a
-measured choice. Conversion pins the WASM memory epoch only for its synchronous build and releases the pin before it
-returns, so a lease never holds a WASM epoch. When any buffer of a trace tree is WASM-backed, the whole tree's table is
-built from copies.
-
-Each physical column uses the cheapest correct mode:
-
-| Input / boundary                                      | Required mode                                               | Owner and lifetime                                                          |
-| ----------------------------------------------------- | ----------------------------------------------------------- | --------------------------------------------------------------------------- |
-| Contiguous JS-heap primitive or null region           | Borrow bounded `subarray()` payload                         | SpanBuffer owns bytes; `ArrowLease` holds the buffers and trace topology    |
-| Any column of a tree with WASM-backed buffers         | Copy to Arrow-owned storage during synchronous conversion   | Memory epoch pinned only during the build, never by a lease                 |
-| JS-heap overflow chain accepted as Arrow chunks       | Wrap each physical chunk                                    | One lease holds every source chunk; wrapper/view allocations still count    |
-| Consumer requires one contiguous region               | Allocate once and bulk-copy chunks, measured against borrow | Arrow owns output; charge allocation and copied bytes to flush              |
-| Dictionary/category/text                              | Build required indices, UTF-8, offsets, and dictionary      | Arrow owns constructed buffers; immutable shared dictionaries may be leased |
-| Mutable/incompatible input or unpinned async lifetime | Copy to Arrow-owned storage                                 | Lifetime correctness overrides copy avoidance                               |
+| Input / boundary                                      | Required mode                                               | Owner and lifetime                                                           |
+| ----------------------------------------------------- | ----------------------------------------------------------- | ---------------------------------------------------------------------------- |
+| Contiguous primitive or compatible null region        | Borrow bounded `subarray()` payload                         | SpanBuffer/WASM owns bytes; `ArrowLease` pins backing store and memory epoch |
+| Overflow chain accepted as Arrow chunks               | Wrap each physical chunk                                    | One lease pins every source chunk; wrapper/view allocations still count      |
+| Consumer requires one contiguous region               | Allocate once and bulk-copy chunks, measured against borrow | Arrow owns output; charge allocation and copied bytes to flush               |
+| Dictionary/category/text                              | Build required indices, UTF-8, offsets, and dictionary      | Arrow owns constructed buffers; immutable shared dictionaries may be leased  |
+| Mutable/incompatible input or unpinned async lifetime | Copy to Arrow-owned storage                                 | Lifetime correctness overrides copy avoidance                                |
 
 Per-value builder `append()` is PROHIBITED for bulk columns. Direct wrapping can still allocate JS view/wrapper objects;
 those count toward flush allocations.
 
-Conversion preserves Arrow-native chunks of JS-heap buffers wherever consumers accept them and carries explicit
-`ArrowLease` ownership through asynchronous consumption, so a borrowed view lives exactly as long as its lease; the
-lease keeps the borrowed buffers, their vocabulary generations and the trace topology alive until the consumer releases
-it. Overflow and null data are bulk-concatenated only for a consumer that requires one contiguous region.
+Conversion preserves Arrow-native chunks wherever consumers accept them and carries explicit `ArrowLease` ownership
+through asynchronous consumption, so a borrowed view lives exactly as long as its lease; overflow and null data are
+bulk-concatenated only for a consumer that requires one contiguous region.
 
 `PhysicalLayoutPlan` determines direct compatibility/chunk/copy policy. Versioned `VocabularyBinding` occurs at startup
 and may supply immutable dictionaries/layout fragments; request flush does not mutate the plan.
 
 ### Contiguous Borrowing Reference <a id="smoo/lmao!n/arrow-table-zero-copy.reference"></a>
 
-For a contiguous JS-heap primitive, use flechette's direct `Batch` constructor with a bounded `subarray()` and retain
-the lease that keeps the source buffer alive. Do not use the illustrative per-value builder.
+For a contiguous primitive, use flechette's direct `Batch` constructor with a bounded `subarray()` and retain the lease
+that pins the source. Do not use the illustrative per-value builder.
 
 ```typescript
-// Borrowed JS-heap payload: the lease keeps the source buffer alive; view and Batch wrappers still allocate.
+// Borrowed payload: lease pins source bytes; view and Batch wrappers still allocate.
 return arrow.makeData({
   type: dataType,
   offset: 0,
@@ -254,7 +244,6 @@ system becomes a row in the final table, enabling rich analytical queries while 
 | `entry_type`       | `dictionary<string>` | Log entry type (see [Entry Types](#entry-type-system))                                                        | `'span-start'`, `'span-ok'`, `'op-invocations'`, `'buffer-writes'`, etc.                                     |
 | `package_name`     | `dictionary<string>` | npm package name (see [Module Identification](#module-identification) section)                                | `'@smoothbricks/lmao'`, `'@mycompany/user-service'`                                                          |
 | `package_file`     | `dictionary<string>` | Path within package, relative to package.json (see [Module Identification](#module-identification) section)   | `'src/services/user.ts'`, `'lib/handlers/auth.ts'`                                                           |
-| `git_sha`          | `dictionary<string>` | Git commit SHA of the op's source at build time (`'runtime'` when the transformer did not inject it)          | `'abc123def456...'`, `'runtime'`                                                                             |
 | `message`          | `dictionary<string>` | Span name, log message template, exception message, result message, OR flag name (see Message Column section) | `'create-user'`, `'User {userId} created'`, `'Processing {count} items'`, `'TypeError: x is not a function'` |
 
 ### Lazy System Columns (Sparse/Nullable) <a id="smoo/lmao!n/arrow-table-schema.lazy"></a>
@@ -291,7 +280,7 @@ rather than every row.
 The `package_name` and `package_file` columns work together to identify the source location of each trace entry. This
 two-column design provides significant benefits over a single combined path:
 
-### Why `package_name` + `package_file` (Not a Combined Path) <a id="smoo/lmao!n/arrow-table-module-id.two-column"></a>
+### Why `packageName` + `packagePath` (Not a Combined Path) <a id="smoo/lmao!n/arrow-table-module-id.two-column"></a>
 
 1. **Cross-repo log aggregation**: When logs from multiple repositories or services are combined (e.g., in a data
    warehouse), the package name provides a globally unique namespace. npm enforces package name uniqueness, so
@@ -317,29 +306,24 @@ two-column design provides significant benefits over a single combined path:
    - Git repo → find package location within monorepo (search for package.json with matching name)
    - `package_file` → actual source file relative to that package.json
 
-5. **TypeScript transformer compatibility**: The transformer resolves the nearest `package.json` once per source file
-   (`nearestPackage` in `packages/lmao-ttsc/plugin/driver/lmao.go`), which yields the package name and the file path
-   relative to it. Storing them separately avoids redundant string concatenation.
+5. **TypeScript transformer compatibility**: The TypeScript transformer computes both pieces via `findNearestPackage()`,
+   which returns both `packageName` and `packageDir`. Storing them separately avoids redundant string concatenation.
 
 ### Relation to Operations (Ops) <a id="smoo/lmao!n/arrow-table-module-id.ops"></a>
 
-Source attribution is per op. Each `defineOp` produces one `OpMetadata`, and every row a span writes takes its
-`package_name`, `package_file` and `git_sha` from it:
+Module metadata comes from the op's bound module at runtime:
 
 ```typescript
-const { defineOp } = defineOpContext({ logSchema: httpSchema });
+const { op } = httpModule;
 
-const GET = defineOp('GET', async (ctx, url: string) => {
-  ctx.tag.method('GET');
-  return ctx.span('fetch', fetchOp, url); // Span name comes from call site
+const GET = op(async ({ span, log, tag }, url: string) => {
+  tag.method('GET');
+  await span('fetch', fetchOp, url); // Span name comes from call site
 });
 ```
 
-- **`package_name`**: The package that defines the op (`GET`)
-- **`package_file`**: The file containing the `defineOp` call, relative to its package root
-- **`git_sha`**: The commit the op's source was built from
-- **Row 0 vs rows 1+**: Row 0 (`span-start`) is attributed to the caller's `OpMetadata` (`_callsiteMetadata`), rows 1+
-  to the called op's (`_opMetadata`)
+- **`package_name`**: From the module the op is bound to (`httpModule`)
+- **`package_file`**: From where the module was defined (TypeScript transformer)
 - **Span names**: Come from `span('name', op, ...args)` call sites, stored in `message` column
 
 ### Why NOT Git-Based Identity <a id="smoo/lmao!n/arrow-table-module-id.not-git"></a>
@@ -350,44 +334,39 @@ We considered using git repository info (git root path, git SHA for identity) bu
 - **Monorepos have one git root but many packages**: The git path doesn't uniquely identify a package
 - **Package name from `package.json` is the canonical npm identity**: Already defined, already unique
 - **Git SHA is for version tracking**: Answers "which version of the code?" not "which module?"
-  - `git_sha` is a separate column for version tracking, not part of module identity
+  - We keep `gitSha` as a separate field for version tracking, not as part of module identity
 
-### OpMetadata <a id="smoo/lmao!n/arrow-table-module-id.metadata"></a>
+### ModuleMetadata Interface <a id="smoo/lmao!n/arrow-table-module-id.metadata"></a>
 
-`defineOp(name, fn, metadata?)` takes the attribution as its third argument, and the transformer fills it at every
-`defineOp` call site. Without it, `defineOp` derives `package_file`, `line` and a package name from its caller's stack
-frame and sets `git_sha` to `'runtime'`. The result is one `OpMetadata` per op (`packages/lmao/src/lib/op.ts`):
+The `moduleMetadata` object passed to `createModuleContext()` contains:
 
 ```typescript
-interface OpMetadata {
-  readonly name: string; // Op name for metrics (span names come from call sites)
-  readonly package_name: string; // npm package name from nearest package.json
-  readonly package_file: string; // Path within package, relative to package.json
-  readonly git_sha: string; // Git commit SHA for version tracking (NOT identity)
-  readonly line: number; // Line of the defineOp call
-
-  readonly package_name_entry: PreEncodedEntry; // Pre-encoded for Arrow dictionary building
-  readonly package_file_entry: PreEncodedEntry;
-  readonly git_sha_entry: PreEncodedEntry;
+interface ModuleMetadata {
+  gitSha: string; // Git commit SHA for version tracking (NOT identity)
+  packageName: string; // npm package name from nearest package.json
+  packagePath: string; // Path within package, relative to package.json
 }
 ```
 
-Example transformer output:
+Example:
 
 ```typescript
-defineOp('createUser', createUserFn, {
-  package_name: '@smoothbricks/lmao',
-  package_file: 'src/services/user.ts',
-  git_sha: 'abc123def456...',
-  line: 42,
-});
+moduleMetadata: {
+  gitSha: 'abc123def456...',
+  packageName: '@smoothbricks/lmao',
+  packagePath: 'src/services/user.ts',
+}
 ```
 
-### Pre-encoded Entries <a id="smoo/lmao!n/arrow-table-module-id.context-props"></a>
+### ModuleContext Properties <a id="smoo/lmao!n/arrow-table-module-id.context-props"></a>
 
-`createOpMetadata` (`packages/lmao/src/lib/opContext/defineOp.ts`) builds `package_name_entry`, `package_file_entry` and
-`git_sha_entry` once per op through the global string interner, so ops sharing a package share its UTF-8 bytes, and
-Arrow conversion builds these dictionaries without re-encoding a string per span.
+The `ModuleContext` (created at module initialization) stores:
+
+- `packageName: string` — npm package name from nearest package.json (e.g., `'@smoothbricks/lmao'`)
+- `packagePath: string` — Path within package, including file extension (e.g., `'src/services/user.ts'`)
+- `gitSha: string` — Git commit SHA for version tracking
+
+Both `packageName` and `packagePath` values are interned at module creation time for efficient dictionary encoding.
 
 ## Span Definition <a id="smoo/lmao!n/arrow-table-span-id"></a>
 
@@ -742,7 +721,7 @@ The `message` column serves different purposes based on entry type:
 | `ff-access`, `ff-usage`             | Flag name (e.g., `'advancedValidation'`, `'darkMode'`)       | -                           |
 | `period-start`                      | -                                                            | Period start timestamp (ns) |
 | `op-*` (all 8 op metric types)      | Op name (e.g., `'GET'`, `'createUser'`)                      | Metric value (count or ns)  |
-| `buffer-*` (all 3 buffer types)     | -                                                            | Writes, spans, or capacity  |
+| `buffer-*` (all 4 buffer types)     | -                                                            | Metric value (count)        |
 
 ### Format String Pattern (CRITICAL) <a id="smoo/lmao!n/arrow-table-message.format-string"></a>
 
@@ -752,9 +731,8 @@ When you write:
 
 ```typescript
 // Inside an op function:
-const myOp = defineOp('myOp', async ({ log, ok }) => {
+const myOp = op(async ({ log }) => {
   log.info('User {userId} created with {itemCount} items', { userId: 123, itemCount: 5 });
-  return ok(null);
 });
 ```
 
@@ -864,16 +842,15 @@ log.info('User {userId} created with {itemCount} items', { userId: 123, itemCoun
 The `entry_type` column uses a dictionary-encoded enum that covers all possible trace events. For complete definitions
 and low-level API details, see **[Entry Types and Logging Primitives](./01h_entry_types_and_logging_primitives.md)**.
 
-**Entry Types** (26 total, `ENTRY_TYPE_NAMES` in `packages/lmao/src/lib/schema/systemSchema.ts`):
+**Entry Types** (23 total):
 
-- **Span lifecycle** (5): `span-start`, `span-ok`, `span-err`, `span-exception`, `span-retry`
-- **Log levels** (5): `trace`, `debug`, `info`, `warn`, `error`
+- **Span lifecycle** (4): `span-start`, `span-ok`, `span-err`, `span-exception`
+- **Log levels** (4): `info`, `debug`, `warn`, `error`
 - **Feature flags** (2): `ff-access`, `ff-usage`
 - **Metrics - Period** (1): `period-start`
 - **Metrics - Op** (8): `op-invocations`, `op-errors`, `op-exceptions`, `op-duration-total`, `op-duration-ok`,
   `op-duration-err`, `op-duration-min`, `op-duration-max`
-- **Metrics - Buffer** (3): `buffer-writes`, `buffer-spans`, `buffer-capacity`
-- **Signals** (2): `signal-admitted`, `signal-routed`
+- **Metrics - Buffer** (4): `buffer-writes`, `buffer-overflow-writes`, `buffer-created`, `buffer-overflows`
 
 **Key Benefits**:
 
@@ -899,16 +876,8 @@ same Arrow table, same query tools, same export path.
 | 1000      | 1         | @myco/http   | op-duration-err   | GET     | 3535000000   |
 | 1000      | 1         | @myco/http   | op-duration-min   | GET     | 2100000      |
 | 1000      | 1         | @myco/http   | op-duration-max   | GET     | 1203500000   |
-| 1000      | 0         | @myco/http   | period-start      |         | 1000         |
-| 1000      | 0         | @myco/http   | buffer-writes     |         | 2800         |
-| 1000      | 0         | @myco/http   | buffer-spans      |         | 47           |
-| 1000      | 0         | @myco/http   | buffer-capacity   |         | 64           |
-
-Buffer rows come from each SpanBuffer class's `stats` (`createCapacityStatsTable`,
-`packages/lmao/src/lib/arrow/capacityStats.ts`): four rows per class, `period-start` (value: the period start in ns),
-`buffer-writes`, `buffer-spans` and `buffer-capacity`, attributed to the class's `OpMetadata`. They belong to no span,
-so `thread_id` and `span_id` are 0 and the parent columns are null. Utilization is the capacity tuner's signal,
-`buffer-writes / (buffer-spans × (buffer-capacity − 2))`: here 2800 / (47 × 62) ≈ 0.96.
+| 1000      | 1         | @myco/http   | buffer-writes     |         | 50000        |
+| 1000      | 1         | @myco/http   | buffer-created    |         | 47           |
 
 **Why This Design**:
 
@@ -1162,20 +1131,18 @@ WHERE entry_type LIKE 'op-%'
 GROUP BY message
 ORDER BY avg_err_ms DESC;
 
--- Buffer health: utilization per buffer class and period, as the capacity tuner computes it
--- (above 1 means spans overflow; below 0.5 means capacity is wasted)
+-- Buffer health metrics
 SELECT
-  timestamp as period_start,
   package_name,
-  package_file,
   sum(CASE WHEN entry_type = 'buffer-writes' THEN uint64_value END) as total_writes,
-  sum(CASE WHEN entry_type = 'buffer-spans' THEN uint64_value END) as spans_created,
-  max(CASE WHEN entry_type = 'buffer-capacity' THEN uint64_value END) as capacity,
-  total_writes / nullif(spans_created * (capacity - 2), 0) as utilization
+  sum(CASE WHEN entry_type = 'buffer-overflow-writes' THEN uint64_value END) as overflow_writes,
+  sum(CASE WHEN entry_type = 'buffer-created' THEN uint64_value END) as buffers_created,
+  sum(CASE WHEN entry_type = 'buffer-overflows' THEN uint64_value END) as overflow_events,
+  overflow_writes * 100.0 / total_writes as overflow_pct
 FROM traces
-WHERE entry_type IN ('buffer-writes', 'buffer-spans', 'buffer-capacity')
-GROUP BY timestamp, package_name, package_file
-ORDER BY utilization DESC;
+WHERE entry_type LIKE 'buffer-%'
+GROUP BY package_name
+ORDER BY overflow_pct DESC;
 ```
 
 ## Performance Characteristics <a id="smoo/lmao!n/arrow-table.perf"></a>
@@ -1344,8 +1311,7 @@ vectors.push(new Column([batch]));
 
 - **No per-value builder append** for bulk primitive columns
 - **Bounded copies**: preserve chunks when possible; otherwise report one concatenation rather than repeated growth
-- **Direct borrowing of JS-heap buffers**: borrowed source buffers stay alive under a lease; WASM-backed columns are
-  copied
+- **Direct borrowing where ownership permits**: source bytes remain pinned under a lease
 - **Dictionary efficiency**: compatible indices can be wrapped with the shared dictionary
 
 ## Integration Points <a id="smoo/lmao!n/arrow-table.integration"></a>

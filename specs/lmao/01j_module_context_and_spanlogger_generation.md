@@ -21,12 +21,9 @@ All schema- and backend-dependent decisions move to startup.
 
 Startup canonicalizes the schema and creates one immutable `PhysicalLayoutPlan` containing concrete columns, offsets,
 widths, null bitmaps, eager/lazy decisions, static message-index lanes, dynamic reference lanes, and backend factories.
-One plan serves both backends: it carries the JS SpanBuffer class and the WASM layout template, so JS and WASM spans of
-one callsite share it. Plans are cached by **schema identity**, then by **SpanContext class**, then by a key of the
-**physical layout version**, runtime hint, message layout family, message physical layout, context layout, vocabulary
-generation, eager columns, and local message dictionary. The cache shares the plan and its buffer/writer/flush classes.
-Library prefix/remap state is an immutable binding over that physical plan, never a name lookup performed by a warmed
-callsite.
+A three-dimensional cache keyed by **schema identity + physical layout version + backend kind** shares the plan and its
+buffer/writer/flush classes. Library prefix/remap state is an immutable binding over that physical plan (or part of the
+cache key when it changes stores), never a name lookup performed by a warmed callsite.
 
 Generated APIs are specialized into **static**, **structured**, or **dynamic** callsite classes. After warmup a callsite
 sees one stable receiver shape, one fixed entry kind, one fixed representation, and a fixed sequence of direct stores.
@@ -43,18 +40,16 @@ Allocation claims are phase-specific:
 | **Span setup**         | Minimize and amortize allocations; do not describe it as the warmed entry path.                                   |
 | **Warmed entry write** | Zero allocation and fixed monomorphic stores while capacity remains.                                              |
 | **Overflow/slow path** | May allocate or grow explicitly; behavior and counters are predictable.                                           |
-| **Flush**              | Few or no allocations by reusing layout/backend classes, scratch arenas, dictionary generations, and Arrow views. |
+| **Per-request flush**  | Few or no allocations by reusing layout/backend classes, scratch arenas, dictionary generations, and Arrow views. |
 
 Flush returns an `ArrowLease` over runtime-owned Arrow-compatible buffers rather than transferring untracked reusable
-storage. The lease holds the trace topology, the JS-heap chunks a table borrows, and the exact immutable vocabulary
-dictionary generation until the exporter releases it; it never pins a module's caller-owned fragment arrays. This
-permits near-zero-allocation trace→Arrow conversion without recycling memory still observed by a consumer.
+storage. The lease pins the buffer arena and exact immutable vocabulary dictionary generation until the exporter
+releases it; it never pins a module's caller-owned fragment arrays. This permits near-zero-allocation
+request→trace→Arrow conversion without recycling memory still observed by a consumer.
 
-The flush unit is every root span tree registered with the flush scheduler since the previous flush. Each tree is
-converted to its own leased Arrow table, and the tables are merged and handed to the flush handler. A flush runs on a
-time interval, a capacity threshold, idle detection, memory pressure, or an explicit `flush()`. WASM-backed columns are
-copied into Arrow-owned storage, so a table never views WASM memory; the memory epoch is pinned only during the
-synchronous conversion, and WASM views are re-derived after linear-memory growth
+The flush unit is one request. After linear-memory growth, WASM views are re-derived. While a lease pins the current
+WASM memory epoch, growth is delayed, or the leased output is copied to Arrow-owned buffers and the lease released
+first; growth never invalidates pinned views
 ([WASM Memory Architecture](./01q_wasm_memory_architecture.md#smoo/lmao!n/wasm-mem.lifecycle)).
 
 ## Compiler-Emitted Vocabulary Registration
@@ -146,44 +141,42 @@ evaluation is idempotent for the same schema version, algorithm, content hash, a
 incompatible input fails during startup rather than falling back to hot-path string lookup. Detailed transformer
 emission is specified elsewhere.
 
-Template placeholders use `{fieldName}`; `{{` and `}}` encode literal braces. `{{fieldName}}` is not accepted as an
-alias. A `LOG_TEMPLATE` record's `textUtf8` is the template exactly as written, escapes included; readers decode `{{`
-and `}}` only when rendering. `info`/`warn`/`error` callsites bind literal templates and object-literal fields;
-`debug`/`trace` may bind a literal template or use an existing raw dynamic string reference, but avoidable interpolation
-remains invalid. Callsite classes are static, structured, or dynamic. A physical layout may be mixed when it carries
-both static-index and dynamic-reference lanes.
+Template placeholders use `{field}`; `{{` and `}}` encode literal braces. `{{field}}` is not accepted as an alias.
+`info`/`warn`/`error` callsites bind literal templates and object-literal fields; `debug`/`trace` may bind a literal
+template or use an existing raw dynamic string reference, but avoidable interpolation remains invalid. Callsite classes
+are static, structured, or dynamic. A physical layout may be mixed when it carries both static-index and
+dynamic-reference lanes.
 
 ## Context Hierarchy <a id="smoo/lmao!n/opcontext-hierarchy"></a>
 
 ```
-OpMetadata (interface) - ONE per defineOp
-├── name: string (op name for metrics)
-├── package_name / package_file / git_sha: string
-├── line: number (line of the defineOp call)
-├── package_name_entry / package_file_entry / git_sha_entry: PreEncodedEntry (UTF-8 cached)
-└── _physicalLayoutPlan → SpanBuffer class, eager columns, vocabulary generation, WASM layout
-
-LogBinding - ONE per defineOpContext
+OpMetadata (class) - ONE per defineOp
+├── package_name: string
+├── package_file: string
+├── git_sha: string
+├── package_name_entry: PreEncodedEntry (UTF-8 cached)
+├── package_file_entry: PreEncodedEntry (UTF-8 cached)
+├── git_sha_entry: PreEncodedEntry (UTF-8 cached)
 ├── logSchema (tag attribute definitions)
-└── remapDescriptor? (prefixed or remapped libraries)
-
-SpanBuffer class - ONE per schema and physical layout
-└── stats: SpanBufferStats { capacity, totalWrites, spansCreated } (self-tuning; flushed as buffer-* rows)
+├── sb_capacity: number (buffer capacity)
+├── sb_totalWrites: number (total writes across all buffers)
+├── sb_overflows: number (overflow write count)
+└── sb_totalCreated: number (total buffers created)
 
 SpanBuffer - ONE per span (internal interface)
-├── _callsiteMetadata?: OpMetadata ← caller's metadata (where span() was invoked) - for row 0 metadata
+├── _callsiteModule?: OpMetadata ← caller's metadata (where span() was invoked) - for row 0 metadata
 ├── _opMetadata: OpMetadata         ← op's metadata (what code is executing) - for rows 1+ metadata
 ├── message_values[0]: string       ← span name written by writeSpanStart()
 ├── line_values: Float64Array       ← line numbers per row (written directly, NOT stored as property)
 ├── _parent?: SpanBuffer            ← reference to parent (child spans walk this for trace_id)
-├── _nodeIndex: number             ← node in _traceRoot._topology (child links live there)
+├── _children: SpanBuffer[]         ← child spans
 ├── trace_id (getter)               ← root stores it, children walk parent chain
 └── columns, writeIndex, etc.
 
 SpanContext (interface) - user-facing, what ops receive
 ├── tag: TagWriter<T>
 ├── log: SpanLogger<T>
-├── setScope() / scope
+├── setScope()
 ├── ok() / err()
 ├── span()
 ├── buffer (getter)
@@ -191,14 +184,14 @@ SpanContext (interface) - user-facing, what ops receive
 └── deps: Deps
 ```
 
-**Key Design: Dual Metadata References for Source Attribution**
+**Key Design: Dual Module References for Source Attribution**
 
-Each SpanBuffer has TWO metadata references for different purposes:
+Each SpanBuffer has TWO module references for different purposes:
 
-- **`_callsiteMetadata`**: The caller's op metadata - where `span()` was invoked. Used for **row 0 (span-start)**
-  metadata (`git_sha`, `package_name`, `package_file`).
-- **`_opMetadata`**: The executing op's metadata - what code is executing. Used for **rows 1+ (span-ok/err/exception,
-  logs)** metadata (`git_sha`, `package_name`, `package_file`).
+- **`callsiteModule`**: The caller's module - where `span()` was invoked. Used for **row 0 (span-start)** metadata
+  (`git_sha`, `package_name`, `package_file`).
+- **`module`**: The Op's module - what code is executing. Used for **rows 1+ (span-ok/err/exception, logs)** metadata
+  (`git_sha`, `package_name`, `package_file`).
 
 This enables accurate source attribution: the span-start entry records WHERE the span was invoked from (callsite), while
 subsequent entries record WHERE the code is actually executing (the Op's module).
@@ -233,8 +226,7 @@ An alternative approach would pass a monolithic `ctx` object:
 const createUser = defineOp('createUser', async (ctx, userData) => {
   ctx.tag.userId(userData.id);
   ctx.log.info('Creating user');
-  const validated = await ctx.span('validate', validateUser, userData); // Pass ctx to everything
-  return validated.isOk() ? ctx.ok(validated.value) : ctx.err(validated.error);
+  await ctx.span('validate', validateUser, userData); // Pass ctx to everything
 });
 ```
 
@@ -244,11 +236,10 @@ The chosen design uses ops with destructuring:
 
 ```typescript
 // Destructure what you need
-const createUser = defineOp('createUser', async ({ span, log, tag, ok, err }, userData: UserData) => {
+const createUser = defineOp('createUser', async ({ span, log, tag }, userData: UserData) => {
   tag.userId(userData.id);
   log.info('Creating user');
-  const validated = await span('validate', validateUser, userData); // span() handles context
-  return validated.isOk() ? ok(validated.value) : err(validated.error);
+  await span('validate', validateUser, userData); // span() handles context
 });
 ```
 
@@ -293,159 +284,219 @@ SpanContext and can be destructured by ops.
 ### Internal Implementation
 
 ```typescript
-interface OpMetadata {
-  // Source attribution, one per defineOp
-  readonly name: string; // Op name for metrics
-  readonly package_name: string;
-  readonly package_file: string;
-  readonly git_sha: string;
-  readonly line: number; // Line of the defineOp call
+class OpMetadata {
+  // Source attribution (strings), one per defineOp
+  package_name: string;
+  package_file: string;
+  git_sha: string;
 
-  // Pre-encoded UTF-8 for Arrow dictionary building
-  readonly package_name_entry: PreEncodedEntry;
-  readonly package_file_entry: PreEncodedEntry;
-  readonly git_sha_entry: PreEncodedEntry;
+  // Pre-encoded UTF-8 for zero-copy writes
+  package_name_entry: PreEncodedEntry;
+  package_file_entry: PreEncodedEntry;
+  git_sha_entry: PreEncodedEntry;
 
-  // Startup-resolved physical layout: SpanBuffer class, eager columns, vocabulary generation, WASM layout
-  readonly _physicalLayoutPlan?: OpPhysicalLayout;
+  // Log schema definition
+  logSchema: LogSchema;
+
+  // Generated classes
+  TagWriter: TagWriterClass;
+  SpanLogger: SpanLoggerClass;
+
+  // Self-tuning buffer stats (flat properties, not nested object)
+  sb_capacity: number = 64;
+  sb_totalWrites: number = 0;
+  sb_overflows: number = 0;
+  sb_totalCreated: number = 0;
 }
 
-// Self-tuning buffer stats: one object on each SpanBuffer class, shared by every buffer of that class
-interface SpanBufferStats {
-  capacity: number; // Rows per new SpanBuffer
-  totalWrites: number; // Completed entry rows; lifecycle rows 0 and 1 are excluded
-  spansCreated: number; // Non-overflow buffers created
-}
+function defineOpContext<Schema, Deps, FF, Ctx>(config: { logSchema: Schema; deps?: Deps; flags?: FF; ctx?: Ctx }) {
+  // Compile logSchema to generate TagWriter and SpanLogger classes
+  const compiledTagOps = compileTagOperations(config.logSchema);
 
-function defineOpContext<T, FF, Deps, UserCtx>(
-  config: OpContextConfig<T, FF, Deps, UserCtx>
-): OpContextFactory<LogSchema<EffectiveSchema<T, Deps>>, FF, Deps, UserCtx> {
-  // One LogBinding (schema + optional remap descriptor) shared by every op of this context.
-  // defineOp(name, fn, metadata?) builds one OpMetadata and one frozen callsite plan per op.
-  return { logBinding, logSchema, flags, ctxDefaults, deps, defineOp, defineOps };
+  return {
+    deps: config.deps || {},
+    flags: config.flags || {},
+    ctx: config.ctx || {},
+
+    // Op factory - creates Op instances with full context type
+    defineOp: <Args extends unknown[], Result>(
+      name: string,
+      fn: (ctx: SpanContext<Schema, Deps, FF, Ctx>, ...args: Args) => Promise<Result>
+    ): Op<SpanContext<Schema, Deps, FF, Ctx>, Args, Result> => new Op(name, compiledTagOps, fn),
+  };
 }
 ```
 
 ## Op Class Generation <a id="smoo/lmao!n/op-class"></a>
 
 The `defineOp()` factory creates Op instances that wrap user functions. Type parameters are ordered to match the
-function signature `(ctx, ...args) => Result`:
+function signature `(ctx, ...args) => Promise<Result>`:
 
 ```typescript
-class Op<Ctx extends OpContext, Args extends unknown[], S, E, R extends AnyResult | Promise<AnyResult>> {
-  readonly metadata: OpMetadata; // This op's source attribution and physical layout plan
-  readonly callsitePlan: CallsitePlan<Ctx['logSchema'], Ctx>; // Frozen startup-resolved classes and operands
-  readonly fn: (ctx: SpanContext<Ctx>, ...args: Args) => R;
+class Op<Ctx, Args extends unknown[], Result> {
+  constructor(
+    readonly name: string, // For Op metrics (invocations, errors, duration)
+    private module: OpMetadata, // For git_sha/package_name/package_file attribution
+    private fn: (ctx: Ctx, ...args: Args) => Promise<Result>
+  ) {}
+
+  /**
+   * Internal invocation - called by span() or Tracer.trace()
+   *
+   * Root spans: Tracer._createRootContext() and _executeResultWithContext() (tracer.ts)
+   * Child spans: SpanContext._spanPre() and span0-span8 methods (spanContext.ts)
+   *
+   * @param parentBuffer - Parent span's buffer (null for root - Tracer handles root)
+   * @param callsiteModule - The CALLER's module (where span() was invoked)
+   * @param spanName - Name decided by caller
+   * @param lineNumber - Line number where span() was called (injected by transformer, passed directly)
+   * @param args - User arguments to the op
+   */
+  async _invoke(
+    parentBuffer: SpanBuffer | null,
+    callsiteModule: OpMetadata,
+    spanName: string,
+    lineNumber: number,
+    args: Args
+  ): Promise<Result> {
+    // 1. Create SpanBuffer with callsiteModule reference
+    //    - callsiteModule: where span() was called (for row 0's git_sha/package_name/package_file)
+    //    - this.module: the Op's module (for rows 1+ git_sha/package_name/package_file)
+    //    - For root spans, Tracer creates TraceRoot FIRST with trace_id, anchors, tracer reference
+    const buffer = parentBuffer
+      ? createChildSpanBuffer(parentBuffer, callsiteModule, this.module, spanName)
+      : createSpanBuffer(callsiteModule, this.module, spanName, traceRoot); // traceRoot created by Tracer
+
+    // 2. Register with parent's _children (RemappedBufferView if prefixed)
+    if (parentBuffer) {
+      if (this.module.remappedViewClass) {
+        // Module has prefix - wrap buffer in RemappedBufferView for parent's tree traversal
+        const view = new this.module.remappedViewClass(buffer);
+        parentBuffer._children.push(view);
+      } else {
+        // No prefix - push raw buffer directly
+        parentBuffer._children.push(buffer);
+      }
+      buffer.parent = parentBuffer;
+    }
+
+    // 3. Write span-start (row 0)
+    //    - Uses callsiteModule for git_sha/package_name/package_file
+    //    - lineNumber written DIRECTLY to line_values[0] (NO intermediate object storage)
+    buffer.line_values[0] = lineNumber; // Direct TypedArray write
+    buffer.writeSpanStart(); // Writes timestamp, operation, uses callsiteModule for metadata
+
+    // 4. Create SpanContext (satisfies Ctx constraint)
+    //    span() captures the CURRENT module (this.module) as callsiteModule for child spans
+    //    User context properties (env, requestId, etc.) come from Tracer's ctxDefaults + overrides
+    const opCtx = {
+      span: (childLineNumber, name, childOp, ...childArgs) =>
+        childOp._invoke(buffer, this.module, name, childLineNumber, childArgs),
+      log: new this.module.SpanLogger(buffer),
+      tag: new this.module.TagWriter(buffer),
+      deps: this.module.boundDeps,
+      ff: flagEvaluator?.forContext(opCtx) ?? {},
+      ok: (value) => ({ success: true, value }),
+      err: (error) => ({ success: false, error }),
+      scope: (attrs) => buffer.setScope(attrs),
+      get buffer() {
+        return buffer;
+      },
+      // User context properties spread in (e.g., env, requestId, userId)
+      // These come from Tracer.ctxDefaults merged with trace() overrides
+      ...userCtxProperties,
+    } as Ctx;
+
+    // 5. Execute with try/catch
+    //    Rows 1+ use this.module for git_sha/package_name/package_file
+    try {
+      const result = await this.fn(opCtx, ...args);
+      buffer.writeSpanOk(); // Row 1 - uses module metadata
+      return result;
+    } catch (error) {
+      buffer.writeSpanException(error); // Row 1 - uses module metadata
+      throw error;
+    }
+  }
 }
 ```
-
-An `Op` holds no span logic. The tracer runs root spans and the SpanContext class runs child spans; both read the op's
-`callsitePlan`.
-
-**Root span** (one per `trace()` call):
-
-1. The tracer creates the `TraceRoot` (trace id, time anchors, tracer reference).
-2. `bufferStrategy.createSpanBuffer(schema, traceRoot, plan.metadata, plan.capacityTier, plan.SpanBufferClass)` creates
-   the root buffer.
-3. `buffer._appenders.writeSpanStart(buffer, name)` writes row 0, including the span name.
-4. `new plan.SpanContextClass(buffer, schema, plan, ctxDefaults, overrides, deps, flagEvaluator)` creates the context.
-
-**Child span** (one per `span()` call, in `_spanPre`):
-
-1. `bufferStrategy.createChildSpanBuffer(parent, parent._opMetadata, plan.metadata, plan.capacityTier, schema, plan.SpanBufferClass)`
-   creates the child. The caller's op metadata becomes the child's `_callsiteMetadata` (row 0); the callee's becomes its
-   `_opMetadata` (rows 1+).
-2. The child buffer takes `plan.remapDescriptor`, which Arrow conversion reads for prefixed libraries.
-3. `childBuffer._appenders.writeSpanStart(childBuffer, name)` writes row 0, and `childBuffer.line(0, line)` writes the
-   call line directly to row 0.
-4. The child SpanContext receives the parent's `deps` and a flag evaluator bound to the child.
-
-**Completion** (root and child):
-
-```typescript
-try {
-  const result = await op.fn(ctx, ...args);
-  if (!(result instanceof Ok) && !(result instanceof Err)) throw new TypeError(SPAN_COMPLETION_OWNER_ERROR);
-  result._assertOwner(ctx); // The result must come from this context's ok()/err()
-  writeSpanEnd(buffer, result); // Row 1: span-ok or span-err, timestamp, error_code
-  return result;
-} catch (error) {
-  ctx._spanException(buffer, error); // Row 1: span-exception, message, exception_stack
-  throw error;
-}
-```
-
-The completion row's attributes, message, and line were already written by the result's chained methods
-([Entry Types](./01h_entry_types_and_logging_primitives.md#smoo/lmao!n/lmao-entry-row1-result-writes)).
 
 ## TagWriter Class Generation <a id="smoo/lmao!n/codegen-architecture"></a>
 
-The TagWriter class provides typed attribute methods for `tag`.
+The TagWriter class provides typed attribute methods for `tag`:
 
 ### Standard Compilation
 
-Startup builds the writer classes for a schema as part of its `PhysicalLayoutPlan`. One generator emits both fixed-row
-writers: the TagWriter writes row 0 and the ResultWriter writes row 1. The row is a literal embedded in every method.
-
 ```typescript
-function generateFixedPositionWriterClass(
-  schema: LogSchema,
-  position: number, // 0 for TagWriter, 1 for ResultWriter
-  className: string,
-  extension?: FixedPositionWriterExtension, // Extra methods, e.g. the ResultWriter's message()/line()
-  eagerColumns?: readonly string[],
-  enumLookup?: SchemaEnumLookupDescriptor
-): string;
+function compileTagOperations(logSchema: LogSchema) {
+  const attributeNames = Object.keys(logSchema);
+  const TagWriter = generateFixedPositionWriterClass(attributeNames, attributeNames, logSchema);
+  const SpanLogger = createSpanLoggerClass(attributeNames, logSchema);
 
-// Cached per schema and eager-column set
-function getTagWriterClass<T extends LogSchema>(
-  schema: T,
-  eagerColumns?: readonly string[],
-  enumLookup?: SchemaEnumLookupDescriptor
-): TagWriterConstructor<T>;
+  return { logSchema, TagWriter, SpanLogger };
+}
 ```
 
 ### Library Compilation (Prefixed) <a id="smoo/lmao!n/codegen-prefixed-remap"></a>
 
-A prefixed library reuses the writer classes of its own schema unchanged. `prefix('http')` builds an immutable
-`RemapDescriptor` that maps each output column name to its canonical source name. Each prefixed op's callsite plan
-carries the descriptor, the child buffer takes it at span setup, and Arrow conversion reads it to emit `http_status` for
-the buffer's `status` column. Writers never see prefixed names, so a library's warmed writes are the same with or
-without a prefix.
+```typescript
+function compilePrefixedTagOperations(cleanSchema: LogSchema, prefix: string) {
+  const cleanNames = Object.keys(cleanSchema);
+  const prefixedNames = cleanNames.map((name) => `${prefix}_${name}`);
+  const prefixedSchema = prefixSchema(cleanSchema, prefix);
+
+  const LibraryTagWriter = generateFixedPositionWriterClass(cleanNames, prefixedNames, prefixedSchema);
+  const LibrarySpanLogger = createSpanLoggerClass(cleanNames, prefixedSchema);
+
+  return {
+    logSchema: prefixedSchema,
+    TagWriter: LibraryTagWriter,
+    SpanLogger: LibrarySpanLogger,
+  };
+}
+```
 
 ### TagWriter Generation Logic
 
-A generated writer stores only the SpanContext's writer state. Each setter writes one column of its fixed row through
-the buffer's column setter; enum fields encode through an encoder bound when the class is created:
-
 ```typescript
-// Simplified output of generateFixedPositionWriterClass(schema, 0, 'GeneratedTagWriter')
-class GeneratedTagWriter {
-  constructor(state) {
-    this._state = state; // The only instance field
-  }
-
-  // Object API: tag.with({ userId: '123', operation: 'INSERT' })
-  with(attributes) {
-    if ('userId' in attributes && attributes.userId !== null && attributes.userId !== undefined) {
-      this._state._spanBuffer.userId(0, attributes.userId);
+function generateFixedPositionWriterClass(methodNames: string[], columnNames: string[], schema: LogSchema) {
+  // Generate individual attribute methods
+  const attributeMethods = methodNames
+    .map(
+      (methodName, i) => `
+    ${methodName}(value) {
+      this.buffer.write${capitalize(columnNames[i])}(value);
+      return this;
     }
-    if ('operation' in attributes && attributes.operation !== null && attributes.operation !== undefined) {
-      this._state._spanBuffer.operation(0, encodeEnum0(attributes.operation));
+  `
+    )
+    .join('\n');
+
+  // Generate callable body for object API: tag({ status: 200 })
+  const callableBody = methodNames
+    .map(
+      (methodName, i) => `
+    if (attributes.${methodName} !== undefined) {
+      this.buffer.write${capitalize(columnNames[i])}(attributes.${methodName});
     }
-    return this;
-  }
+  `
+    )
+    .join('\n');
 
-  // Chainable API: tag.userId('123')
-  userId(value) {
-    this._state._spanBuffer.userId(0, value);
-    return this;
-  }
+  return new Function(
+    'BaseTagWriter',
+    `
+    return class extends BaseTagWriter {
+      // Object-based API: tag({ status: 200, method: 'GET' })
+      call(attributes) {
+        ${callableBody}
+        return this;
+      }
 
-  operation(value) {
-    this._state._spanBuffer.operation(0, encodeEnum0(value));
-    return this;
-  }
+      ${attributeMethods}
+    }
+  `
+  )(BaseTagWriter);
 }
 ```
 
@@ -453,28 +504,57 @@ class GeneratedTagWriter {
 
 ### Standard Module TagWriter
 
-For `{ userId: S.category(), operation: S.enum(['INSERT', 'UPDATE', 'DELETE']) }` the generated TagWriter is the class
-shown above.
+```typescript
+// Input: { userId: S.category(), operation: S.enum(['INSERT', 'UPDATE', 'DELETE']) }
+// Generated TagWriter:
+class StandardTagWriter extends BaseTagWriter {
+  // Object API: tag({ userId: "123", operation: "INSERT" })
+  call(attributes) {
+    if (attributes.userId !== undefined) {
+      this.buffer.writeUserId(attributes.userId);
+    }
+    if (attributes.operation !== undefined) {
+      this.buffer.writeOperation(attributes.operation);
+    }
+    return this;
+  }
+
+  // Chainable API: tag.userId("123")
+  userId(value) {
+    this.buffer.writeUserId(value);
+    return this;
+  }
+
+  operation(value) {
+    this.buffer.writeOperation(value);
+    return this;
+  }
+}
+```
 
 ### Library Module TagWriter (with prefix 'http')
 
-For `{ status: S.number(), method: S.category() }` used as `httpOps.prefix('http')`, the TagWriter is the library's own
-class. `tag.status(200)` writes the buffer's `status` column; Arrow conversion names it `http_status` from the buffer's
-`RemapDescriptor`:
-
 ```typescript
-class GeneratedTagWriter {
-  constructor(state) {
-    this._state = state;
+// Input: { status: S.number(), method: S.category() }, prefix: 'http'
+// Generated TagWriter:
+class LibraryTagWriter extends BaseTagWriter {
+  call(attributes) {
+    if (attributes.status !== undefined) {
+      this.buffer.writeHttpStatus(attributes.status); // Clean → prefixed
+    }
+    if (attributes.method !== undefined) {
+      this.buffer.writeHttpMethod(attributes.method);
+    }
+    return this;
   }
 
   status(value) {
-    this._state._spanBuffer.status(0, value); // Canonical column; prefixed only at Arrow conversion
+    this.buffer.writeHttpStatus(value); // Clean method → prefixed column
     return this;
   }
 
   method(value) {
-    this._state._spanBuffer.method(0, value);
+    this.buffer.writeHttpMethod(value);
     return this;
   }
 }
@@ -482,150 +562,160 @@ class GeneratedTagWriter {
 
 ## SpanLogger Class Generation <a id="smoo/lmao!n/codegen-spanlogger"></a>
 
-The SpanLogger handles log methods (`info`/`debug`/`warn`/`error`/`trace`):
+The SpanLogger handles log methods (info/debug/warn/error):
 
 ```typescript
-// Cached per schema, materializer mode, message layout family, physical layout, and eager columns
-function createSpanLoggerClass<T extends LogSchema>(
-  schema: T,
-  messageLayoutFamily: MessageLayoutFamily = 'mixed',
-  messagePhysicalLayout: MessagePhysicalLayout = 'current',
-  eagerColumns: readonly string[] = [],
-  enumLookup: SchemaEnumLookupDescriptor = resolveEnumLookupDescriptor(schema)
-): SpanLoggerConstructor<T>;
+function createSpanLoggerClass(attributeNames: string[], schema: LogSchema) {
+  // Generate with() method body for attributes
+  const withBody = attributeNames
+    .map(
+      (name) => `
+    if (attributes.${name} !== undefined) {
+      this.buffer.write${capitalize(name)}(attributes.${name});
+    }
+  `
+    )
+    .join('\n');
+
+  return new Function(
+    'BaseSpanLogger',
+    `
+    return class extends BaseSpanLogger {
+      info(message) {
+        this._writeLogEntry('info', message);
+        return this;
+      }
+
+      debug(message) {
+        this._writeLogEntry('debug', message);
+        return this;
+      }
+
+      warn(message) {
+        this._writeLogEntry('warn', message);
+        return this;
+      }
+
+      error(message) {
+        this._writeLogEntry('error', message);
+        return this;
+      }
+
+      with(attributes) {
+        ${withBody}
+        return this;
+      }
+
+      scope(attributes) {
+        this._prefillRemainingCapacity(attributes);
+        return this;
+      }
+    }
+  `
+  )(BaseSpanLogger);
+}
 ```
-
-Where `new Function` is allowed the class is compiled from generated source; where it is forbidden (for example workerd)
-a closure materializer builds the same prototype. An instance stores only the SpanContext's writer state. Its members
-are:
-
-- `info`/`debug`/`warn`/`error`/`trace`: append one row and return the fluent entry; attribute setters on that entry
-  write the row just appended
-- `line(n)`: write the line number of the row just appended
-- `scope` (getter): the buffer's current frozen `_scopeValues`
-- `_setScope(attributes)`: replace `_scopeValues` with a new frozen merge; `null` removes a key and `undefined` is
-  ignored. `ctx.setScope()` calls it.
-- `_prefillScopedAttributesOn(buffer)`: the overflow slow-path helper. When a log write moves to a new overflow buffer,
-  it fills the current scope into that buffer's rows from its `_writeIndex` to its capacity.
-
-Scope values fill the other rows at Arrow conversion ([Span Scope Attributes](./01i_span_scope_attributes.md)).
 
 ## SpanContext Type Definition <a id="smoo/lmao!n/spancontext-type"></a>
 
-The context destructured by op functions. One type parameter, `Ctx extends OpContext`, bundles the log schema, flags,
-deps, and user context; user-defined fields (like `env` with CF Worker bindings) come from `Ctx['userCtx']`:
+The context destructured by op functions. The `Extra` type parameter allows user-defined fields (like `env` with CF
+Worker bindings):
 
 ```typescript
-type SpanContext<Ctx extends OpContext> = {
-  // Access to underlying buffer (advanced use)
-  buffer: SpanBuffer<Ctx['logSchema']>;
-
-  // Span attributes (chainable)
-  tag: TagWriter<Ctx['logSchema']>;
+// Full SpanContext type - Extra is spread in for user extensibility
+type SpanContext<Schema, Deps, FF, Extra = {}> = {
+  // Invoke another op as child span (6 overloads, see span() docs)
+  span: SpanFn<SpanContext<Schema, Deps, FF, Extra>>;
 
   // Log messages
-  log: SpanLogger<Ctx['logSchema']>;
+  log: SpanLogger;
 
-  // Feature flags (logs access to current span)
-  ff: FeatureFlagEvaluator<Ctx> & InferFeatureFlagsWithContext<Ctx>;
+  // Span attributes (chainable)
+  tag: TagWriter<Schema>;
 
   // Dependencies - can be destructured!
-  deps: ResolvedDeps<Ctx['deps']>;
+  deps: Deps;
+
+  // Feature flags (logs access to current span)
+  ff: FeatureFlagEvaluator<FF>;
 
   // Result helpers
-  ok<S>(value: S): OkResult<S, Ctx['logSchema']>;
-  err<E>(error: E): ErrResult<E, Ctx['logSchema']>;
+  ok<T>(value: T): OkResult<T>;
+  err<E>(error: E): ErrResult<E>;
 
-  // Child spans (see SpanFn below)
-  span: SpanFn<Ctx>;
-  spanSync: SpanSyncFn<Ctx>;
+  // Scoped attributes
+  scope(attributes: Partial<Schema>): void;
 
-  // Scoped attributes (merge semantics, null clears) and their current values
-  setScope(values: Partial<InferSchema<Ctx['logSchema']>> | null): void;
-  scope: Readonly<Partial<InferSchema<Ctx['logSchema']>>>;
-} & Ctx['userCtx']; // User-defined fields spread in (e.g., env, services)
+  // Access to underlying buffer (advanced use)
+  buffer: SpanBuffer;
+} & Extra; // User-defined fields spread in (e.g., env, services)
 
-// SpanFn: 4 overloads (2 with a transformer-injected line number, 2 without)
-type SpanFn<Ctx extends OpContext> = {
-  // Op with line: span(line, name, op, ...args)
-  <S, E, Args extends unknown[]>(
-    line: number,
+// SpanFn type with 6 overloads (3 with line number from transformer, 3 without)
+type SpanFn<CurrentCtx> = {
+  // Op-only: span(name, op, ...args)
+  <Ctx, Args extends unknown[], Result>(name: string, op: Op<Ctx, Args, Result>, ...args: Args): Promise<Result>;
+
+  // Context override + Op: span(name, ctx, op, ...args)
+  <Ctx, Args extends unknown[], Result>(
     name: string,
-    op: Op<Ctx, Args, S, E>,
+    ctx: Partial<Ctx>,
+    op: Op<Ctx, Args, Result>,
     ...args: Args
-  ): Promise<Result<S, E>>;
-
-  // Inline closure with line: span(line, name, fn)
-  <S, E>(
-    line: number,
-    name: string,
-    fn: (ctx: SpanContext<Ctx>) => Result<S, E> | Promise<Result<S, E>>
-  ): Promise<Result<S, E>>;
-
-  // Op: span(name, op, ...args)
-  <S, E, Args extends unknown[]>(name: string, op: Op<Ctx, Args, S, E>, ...args: Args): Promise<Result<S, E>>;
+  ): Promise<Result>;
 
   // Inline closure: span(name, fn)
-  <S, E>(name: string, fn: (ctx: SpanContext<Ctx>) => Result<S, E> | Promise<Result<S, E>>): Promise<Result<S, E>>;
+  <Result>(name: string, fn: (ctx: CurrentCtx) => Promise<Result>): Promise<Result>;
 };
 
 // Functions can pick what they need
-type LoggingContext<Ctx extends OpContext> = Pick<SpanContext<Ctx>, 'log'>;
-type TaggingContext<Ctx extends OpContext> = Pick<SpanContext<Ctx>, 'tag'>;
-type MinimalContext<Ctx extends OpContext> = Pick<SpanContext<Ctx>, 'span' | 'log' | 'tag'>;
+type LoggingContext = Pick<SpanContext<{}, {}, {}>, 'log'>;
+type TaggingContext<S> = Pick<SpanContext<S, {}, {}>, 'tag'>;
+type MinimalContext<S> = Pick<SpanContext<S, {}, {}>, 'span' | 'log' | 'tag'>;
 ```
-
-The runtime `span` dispatcher forwards each call to a fixed-arity member (`span0` through `span8`, one per argument
-count) so every call site stays monomorphic. These members, and the transformer-only `spanAuto0` through `spanAuto8`,
-are internal; ops call `span`.
 
 ## Op Definition Pattern
 
 ### Basic Op
 
 ```typescript
-const { defineOp } = defineOpContext({ logSchema: userSchema });
+const { defineOp } = userModule;
 
-const createUser = defineOp('createUser', async ({ span, log, tag, ok, err }, userData: UserData) => {
+const createUser = defineOp('createUser', async ({ span, log, tag }, userData: UserData) => {
   tag.userId(userData.id).operation('INSERT');
   log.info('Creating new user');
 
   const validated = await span('validate', validateUser, userData);
-  if (validated.isErr()) {
-    return err(validated.error); // Rebuild the child's outcome on this context
+  if (!validated.success) {
+    return { success: false, error: validated.error };
   }
 
-  const saved = await span('save', saveUser, userData);
-  return saved.isOk() ? ok(saved.value) : err(saved.error);
+  const user = await span('save', saveUser, userData);
+  return { success: true, user };
 });
 ```
 
 ### Op with Dependencies
 
 ```typescript
-const { defineOp } = defineOpContext({
-  logSchema: httpSchema,
-  deps: { retry: retryOps, auth: authOps }, // Each dep is an OpGroup
-});
+const { defineOp } = httpModule;
 
-const GET = defineOp('GET', async ({ span, log, tag, deps, ok, err }, url: string) => {
+const GET = defineOp('GET', async ({ span, log, tag, deps }, url: string) => {
   const { retry, auth } = deps; // Destructure deps!
 
   tag.method('GET').url(url);
   log.info('Making GET request');
 
   const token = await span('auth', auth.getToken);
-  if (token.isErr()) return err(token.error);
 
   try {
     const res = await fetch(url, {
-      headers: { Authorization: `Bearer ${token.value}` },
+      headers: { Authorization: `Bearer ${token}` },
     });
     tag.status(res.status);
-    return ok(res);
+    return res;
   } catch (e) {
     log.warn('Request failed, retrying');
-    await span('retry', retry.attempt, 1);
+    await span('retry', retry, 1);
     throw e;
   }
 });
@@ -634,24 +724,24 @@ const GET = defineOp('GET', async ({ span, log, tag, deps, ok, err }, url: strin
 ### Op with Feature Flags
 
 ```typescript
-const processOrder = defineOp('processOrder', async ({ span, log, tag, deps, ff, ok }, order: Order) => {
+const processOrder = defineOp('processOrder', async ({ span, log, tag, deps, ff }, order: Order) => {
   const { premiumProcessing, newPaymentFlow } = ff;
 
   tag.orderId(order.id);
 
   if (premiumProcessing) {
-    await span('premium-validate', deps.premiumValidation.validate, order);
+    await span('premium-validate', deps.premiumValidation, order);
     premiumProcessing.track();
   }
 
   if (newPaymentFlow) {
-    await span('new-payment', deps.newPayment.charge, order);
+    await span('new-payment', deps.newPayment, order);
     newPaymentFlow.track();
   } else {
-    await span('legacy-payment', deps.legacyPayment.charge, order);
+    await span('legacy-payment', deps.legacyPayment, order);
   }
 
-  return ok({ processed: true });
+  return { success: true };
 });
 ```
 
@@ -675,15 +765,15 @@ export const httpLib = defineOpContext({
     duration: S.number(),
   },
   deps: {
-    retry: retryOps,
+    retry: retryLib,
   },
 });
 
-// Get op factories
-const { defineOp, defineOps } = httpLib;
+// Get op factory
+const { defineOp } = httpLib;
 
 // Define ops
-export const request = defineOp('request', async ({ span, log, tag, deps, ok }, url: string, opts: RequestInit) => {
+export const request = defineOp('request', async ({ span, log, tag, deps }, url: string, opts: RequestInit) => {
   const startTime = performance.now();
 
   tag.method(opts.method || 'GET').url(url);
@@ -695,10 +785,10 @@ export const request = defineOp('request', async ({ span, log, tag, deps, ok }, 
 
     if (!response.ok) {
       const { retry } = deps;
-      await span('retry', retry.attempt, 1);
+      await span('retry', retry, 1);
     }
 
-    return ok(response);
+    return response;
   } catch (error) {
     tag.duration(performance.now() - startTime);
     log.error('Request failed');
@@ -706,41 +796,29 @@ export const request = defineOp('request', async ({ span, log, tag, deps, ok }, 
   }
 });
 
-export const GET = defineOp('GET', async ({ span, ok, err }, url: string) => {
-  const res = await span('request', request, url, { method: 'GET' });
-  return res.isOk() ? ok(res.value) : err(res.error);
+export const GET = defineOp('GET', async ({ span }, url: string) => {
+  return await span('request', request, url, { method: 'GET' });
 });
 
-export const POST = defineOp('POST', async ({ span, ok, err }, url: string, body: unknown) => {
-  const res = await span('request', request, url, {
+export const POST = defineOp('POST', async ({ span }, url: string, body: unknown) => {
+  return await span('request', request, url, {
     method: 'POST',
     body: JSON.stringify(body),
   });
-  return res.isOk() ? ok(res.value) : err(res.error);
 });
-
-// Export the ops as an OpGroup so applications can wire them with a prefix
-export const httpOps = defineOps({ request, GET, POST });
 ```
 
 ### Application Wiring
 
 ```typescript
 // Application wires deps with prefixes: each dep carries its own prefix
-const appContext = defineOpContext({
-  logSchema: appSchema,
-  deps: {
-    http: httpOps.prefix('http'),
-    retry: retryOps.prefix('http_retry'),
-  },
-});
+const appDeps = {
+  http: httpLib.prefix('http'),
+  retry: retryLib.prefix('http_retry'),
+};
 
-// Invoke a dependency op through span()
-const { trace } = new TestTracer(appContext);
-const result = await trace('fetch-users', async (ctx) => {
-  const users = await ctx.span('get-users', ctx.deps.http.GET, 'https://api.example.com/users');
-  return users.isOk() ? ctx.ok(users.value) : ctx.err(users.error);
-});
+// Invoke via span()
+const result = await httpRoot.span('fetch-users', GET, 'https://api.example.com/users');
 ```
 
 ## ESLint Rule: No Capturing Fluent Interface <a id="smoo/lmao!n/eslint-no-capture-fluent"></a>
@@ -786,8 +864,7 @@ setAttribute(name, value) {
 
 ### SpanBuffer Efficiency
 
-- **Dual metadata references**: `_callsiteMetadata` for row 0's git_sha/package_name/package_file, `_opMetadata` for
-  rows 1+
+- **Dual module references**: `callsiteModule` for row 0's git_sha/package_name/package_file, `module` for rows 1+
 - **Direct lineNumber writes**: lineNumber passed as argument to span(), written directly to `line_values[0]` (NO
   intermediate object storage, NO lineNumber property on any context)
 - **Span names**: `spanName` is interned during Arrow conversion; the stored value is a bound dense index
@@ -801,5 +878,5 @@ This module context and op generation system integrates with:
 - **[Context Flow and Op Wrappers](./01c_context_flow_and_op_wrappers.md)**: Provides SpanContext and span() mechanics
 - **[Op Context Pattern](./01l_op_context_pattern.md)**: High-level API for defineOpContext, defineOp, and Tracer
 - **[Trace Schema System](./01a_trace_schema_system.md)**: Consumes LogSchema definitions
-- **[Library Integration Pattern](./01e_library_integration_pattern.md)**: RemapDescriptor for prefixed columns
+- **[Library Integration Pattern](./01e_library_integration_pattern.md)**: RemappedBufferView for prefixed columns
 - **[Columnar Buffer Architecture](./01b_columnar_buffer_architecture.md)**: Generated classes write to SpanBuffer

@@ -33,14 +33,16 @@ zero. A candidate fails on semantic mismatch, warmed fixed-capacity allocation, 
 post-warmup hidden-class transitions, an unstable common overflow branch, a lease-lifetime violation, or a regression
 beyond the Mitata scenario's predeclared noise threshold.
 
-## Design Rationale: Why defineOp() + span()? <a id="smoo/lmao!n/lmao-trace-design-rationale-why-op-span"></a>
+## Design Rationale: Why op() + span()? <a id="smoo/lmao!n/lmao-trace-design-rationale-why-op-span"></a>
 
-Understanding the design rationale helps explain WHY the `defineOp()` + `span()` pattern is chosen over alternatives.
+Understanding the design rationale helps explain WHY the current `op()` + `span()` pattern was chosen over alternatives.
 
 ### Alternative Considered: task('name', fn) <a id="smoo/lmao!n/lmao-trace-alternative-considered-taskname-fn"></a>
 
 ```typescript
 // ALTERNATIVE (rejected): Name at definition time, ctx passed everywhere
+const { task } = httpModule;
+
 const GET = task('http-get', async (ctx, url: string) => {
   ctx.tag.method('GET');
   await ctx.deps.retry.attempt(1); // deps would be bound closures
@@ -48,7 +50,7 @@ const GET = task('http-get', async (ctx, url: string) => {
 });
 
 // Invocation
-await GET(ctx, 'https://example.com');
+await GET(httpRoot, 'https://example.com');
 ```
 
 **Why this approach was rejected**:
@@ -59,24 +61,22 @@ await GET(ctx, 'https://example.com');
 3. **Fixed span names**: Caller couldn't provide contextual names like `'fetch-user-123'`
 4. **Unclear responsibility**: `task()` would do definition AND implied invocation semantics
 
-### Chosen Approach: defineOp() + span() <a id="smoo/lmao!n/lmao-trace-chosen-approach-op-span"></a>
+### Chosen Approach: op() + span() <a id="smoo/lmao!n/lmao-trace-chosen-approach-op-span"></a>
 
 ```typescript
-// defineOp() names the Op for metrics and records its OpMetadata; span() names each span at the call site
-const appContext = defineOpContext({ logSchema: appSchema });
-const { defineOp } = appContext;
+// op() captures module binding, span() provides name at call site
+const { op } = httpModule;
 
-const GET = defineOp('GET', async ({ span, tag, ok, err }, url: string) => {
+const GET = op(async ({ span, log, tag, deps }, url: string) => {
   // Destructure for ergonomics - no ctx. prefix
   tag.method('GET');
   // span() is the unified invocation - NAME at call site
   const response = await span('fetch', fetchOp, url);
-  return response.success ? ok(response.value) : err(response.error);
+  return response;
 });
 
-// Root invocation through the application's Tracer - NAME provided here
-const { trace } = new StdioTracer(appContext, { bufferStrategy: new JsBufferStrategy(), createTraceRoot });
-await trace('GET', GET, 'https://example.com');
+// Root invocation - NAME provided here
+await httpRoot.span('GET', GET, 'https://example.com');
 ```
 
 **Why this approach was chosen**:
@@ -86,7 +86,7 @@ await trace('GET', GET, 'https://example.com');
 | Deps binding    | Per-span closures      | Op refs; no dependency-closure allocation |
 | Ergonomics      | `ctx.tag.userId()`     | `tag.userId()`                            |
 | Span naming     | Definition time        | Call site (flexible)                      |
-| Attribution     | Implicit               | Per-op `OpMetadata` on the Op class       |
+| Module binding  | Implicit               | Explicit via Op class                     |
 | V8 optimization | Closure-heavy          | Plain class, stable hidden class          |
 
 ### Line Number Injection <a id="smoo/lmao!n/lmao-trace-line-number-injection"></a>
@@ -95,10 +95,10 @@ The TypeScript transformer injects line numbers as the first argument to `span()
 
 ```typescript
 // User writes:
-await span('retry', deps.retry.attempt, 1);
+await span('retry', deps.retry, 1);
 
 // Transformer outputs:
-await span(42, 'retry', deps.retry.attempt, 1);
+await span(42, 'retry', deps.retry, 1);
 ```
 
 This enables source code linking without runtime stack trace parsing.
@@ -137,20 +137,18 @@ integration. It consists of these main components:
 
 **Purpose**: Queryable data format for analysis and storage.
 
-- Borrow contiguous primitive JS-heap buffers where ownership permits, preserve Arrow-native chunks where possible, and
-  make explicit Arrow-owned copies for concatenation, UTF-8, dictionaries, or lifetime isolation.
-- `ArrowLease` keeps borrowed JS-heap SpanBuffer storage and the trace topology alive until the consumer releases it;
-  WASM-backed columns are copied.
+- Borrow contiguous primitive buffers where ownership permits, preserve Arrow-native chunks where possible, and make
+  explicit Arrow-owned copies for concatenation, UTF-8, dictionaries, or lifetime isolation.
+- `ArrowLease` keeps borrowed SpanBuffer/WASM storage alive until the consumer releases it.
 - **WHY**: Enables efficient querying, compression, and integration with data analysis tools.
 
 ### 4. [Context Flow and Op/Span Pattern](./01c_context_flow_and_op_wrappers.md) <a id="smoo/lmao!n/lmao-trace-4-context-flow-and-opspan-pattern01ccontextflowandopwrappersmd"></a>
 
 **Purpose**: Hierarchical context management with span correlation.
 
-- **defineOp()**: Wraps a function as an Op with its own `OpMetadata` (`package_name`, `package_file`, `git_sha`,
-  `line`)
+- **op()**: Wraps functions with module binding, captures gitSha/packageName/packagePath
 - **span()**: Unified invocation API - name provided at call site
-- **Dual Attribution**: `_callsiteMetadata` for row 0 (where span was invoked), `_opMetadata` for rows 1+ (where code
+- **Dual Module Attribution**: `callsiteModule` for row 0 (where span was invoked), `module` for rows 1+ (where code
   executes)
 - **Context destructuring**: `{ span, log, tag, deps }` for ergonomic access
 - **WHY**: No per-span dependency-closure allocation; span setup still has the costs in the phase contract.
@@ -231,36 +229,33 @@ file-link-denying cowshed profile; the fileless and existing-reader cases retain
 
 ## The Op + Span Pattern <a id="smoo/lmao!n/lmao-trace-the-op-span-pattern"></a>
 
-### defineOp() - Definition Time <a id="smoo/lmao!n/lmao-trace-op---definition-time"></a>
+### op() - Definition Time <a id="smoo/lmao!n/lmao-trace-op---definition-time"></a>
 
-`defineOp()` wraps a function and records its per-op source attribution:
+`op()` wraps a function and captures module binding:
 
 ```typescript
-const { defineOp } = defineOpContext({ logSchema: httpSchema });
+const { op } = httpModule;
 
-// The Op carries its own OpMetadata: package_name, package_file, git_sha, line
-const GET = defineOp('GET', async ({ span, log, tag, ok, err }, url: string) => {
+// op() captures: gitSha, packageName, packagePath, schema
+const GET = op(async ({ span, log, tag, deps }, url: string) => {
   tag.method('GET');
   tag.url(url);
 
-  // fetchOp is an Op reference; this step creates no dependency closure
+  // deps are Op references; this step creates no dependency closure
   const result = await span('fetch', fetchOp, url);
 
   log.info('Request completed');
-  return result.success ? ok(result.value) : err(result.error);
+  return result;
 });
 ```
 
-**What defineOp() does**:
+**What op() does**:
 
-1. Creates an Op instance with its `OpMetadata` and its sealed callsite plan (buffer class, span context class)
+1. Creates an Op instance with module metadata
 2. Stores the function reference
 3. Returns the Op (NOT a wrapper function)
 
-`defineOps({ name: fn, ... })` does the same for a record of functions and returns an OpGroup, which `.prefix()` and
-`.mapColumns()` can map for library composition.
-
-**What defineOp() does NOT do**:
+**What op() does NOT do**:
 
 - Create closures for deps
 - Allocate per-span
@@ -271,19 +266,19 @@ const GET = defineOp('GET', async ({ span, log, tag, ok, err }, url: string) => 
 `span()` is the unified API for invoking ops:
 
 ```typescript
-// Root invocation (from request handler), through the Tracer built on GET's context
-await trace('GET', GET, 'https://example.com');
+// Root invocation (from request handler)
+await httpRoot.span('GET', GET, 'https://example.com');
 
 // Nested invocation (inside an op)
-await span('retry', deps.retry.attempt, 1);
+await span('retry', deps.retry, 1);
 await span('validate', validateOp, data);
 ```
 
 **What span() does**:
 
-1. Creates the child SpanBuffer from the op's callsite plan (its schema and buffer class)
-2. Registers the child in the trace topology (for tree structure)
-3. Builds destructurable context: `{ span, log, tag, deps, ff, ok, err }` plus the user context keys (e.g. `env`)
+1. Creates SpanBuffer with op's module schema
+2. Registers buffer with parent (for tree structure)
+3. Builds destructurable context: `{ span, log, tag, deps, ff, env }`
 4. Executes op.fn with context + args
 5. Handles try/catch for span-exception entries
 6. Records completion (span-ok or span-err)
@@ -293,7 +288,7 @@ await span('validate', validateOp, data);
 Inside an op, context is destructured for ergonomics:
 
 ```typescript
-const processUser = defineOp('processUser', async ({ span, log, tag, deps, ff, env, ok }, user: User) => {
+const processUser = op(async ({ span, log, tag, deps, ff, env }, user: User) => {
   // Direct access - no ctx. prefix
   tag.userId(user.id);
   log.info('Processing user');
@@ -310,49 +305,41 @@ const processUser = defineOp('processUser', async ({ span, log, tag, deps, ff, e
   // Environment
   const region = env.AWS_REGION;
 
-  return ok({ success: true });
+  return { success: true };
 });
 ```
 
 ### Dependencies <a id="smoo/lmao!n/lmao-trace-dependencies"></a>
 
-`deps` are the OpGroups wired in `defineOpContext({ deps })`; each of their Ops is a plain reference - no per-span
-allocation:
+`deps` are just references to Op instances - no per-span allocation:
 
 ```typescript
-const { defineOp } = defineOpContext({
-  logSchema: httpSchema,
-  deps: { retry: retryOps, auth: authOps }, // wired once, at context definition
-});
+const { op } = httpModule;
 
-const GET = defineOp('GET', async ({ span, deps, ok }, url: string, token: string) => {
-  // deps.retry.attempt is an Op instance, NOT a bound closure
+// deps defined at module level
+const GET = op(async ({ span, deps }, url: string) => {
+  // deps.retry is an Op instance, NOT a bound closure
   // Calling it via span() is explicit
-  await span('retry-1', deps.retry.attempt, 1);
-  await span('retry-2', deps.retry.attempt, 2);
+  await span('retry-1', deps.retry, 1);
+  await span('retry-2', deps.retry, 2);
 
   // Can destructure for convenience
-  const { auth } = deps;
-  await span('auth', auth.verify, token);
-  return ok(null);
+  const { retry, auth } = deps;
+  await span('auth', auth, token);
 });
 ```
 
-Every span of a trace sees the deps of the Tracer's context: the root span's context takes them, and each child span
-shares its parent's (see [Context Flow](./01c_context_flow_and_op_wrappers.md)).
-
 **Why this matters**:
 
-- A bound `ctx.deps.retry.attempt(1)` would create a closure for EVERY span
-- `deps.retry.attempt` is just an Op reference, shared across all spans
+- Old design: `ctx.deps.retry.attempt(1)` created a closure for EVERY span
+- New design: `deps.retry` is just an Op reference, shared across all spans
 
 ## Key Innovations <a id="smoo/lmao!n/lmao-trace-key-innovations"></a>
 
 1. **Dependency References**: Op references avoid per-span dependency closures; benchmark total span setup separately
 2. **Call-Site Naming**: `span('name', op, args)` for contextual flexibility
 3. **Context Destructuring**: `{ span, log, tag, deps }` for clean code
-4. **Self-Tuning Buffers**: Each SpanBuffer class tunes its capacity from its measured utilization
-   (`SpanBufferClass.stats`)
+4. **Self-Tuning Buffers**: Each module learns optimal capacity from usage patterns
 5. **Span-Aware Configuration**: Feature flags correlated to specific operations
 6. **System Self-Tracing**: The trace system traces its own optimization decisions
 7. **AI Agent Integration**: Structured access to trace data for automated analysis
@@ -449,7 +436,7 @@ logger.userId('123').requestId('req-456');
 - Enum mapping functions use generated switch-case
 - Scope `_setScope()` has unrolled per-field code
 
-### 4. Fixed-Shape Context Construction <a id="smoo/lmao!n/lmao-trace-4-prototype-based-context-inheritance"></a>
+### 4. Prototype-Based Context Inheritance <a id="smoo/lmao!n/lmao-trace-4-prototype-based-context-inheritance"></a>
 
 `Object.create(proto)` avoids copying enumerable context fields. It still allocates the child context object during span
 setup. The prototype link preserves the expected generated property-access shape without implying a universal
@@ -500,13 +487,10 @@ const childScope = { ...parentScope }; // New hidden class!
 
 **Application in LMAO**:
 
-- The Tracer creates a root span's context as an instance of the Op's generated `SpanContext` class
-  (`Tracer._createRootContext`)
-- A child span's context is a new instance of the called Op's generated `SpanContext` class; user context keys (the
-  `ctx` config of `defineOpContext`) and `span()` overrides are copied in one canonical sorted key order, with no object
-  spread, so every context of one layout shares a hidden class
-- Scope is an immutable snapshot object shared by reference with child spans
-  ([Span Scope Attributes](./01i_span_scope_attributes.md)); `_setScope()` builds the next snapshot
+- Root context is created via `module.traceContext()` (the exported `TraceContextProto` is its base shape)
+- Child spans use `Object.create(parentCtx)`
+- User `Extra` properties inherit through prototype chain
+- Scope classes are generated with fixed property order for stable hidden classes
 
 ### 5. TypedArray Performance <a id="smoo/lmao!n/lmao-trace-5-typedarray-performance"></a>
 
@@ -590,7 +574,7 @@ The trace logging system integrates with these platform components:
 
 ## Related Documents <a id="smoo/lmao!n/lmao-trace-related-documents"></a>
 
-1. **[Package Architecture](./00_package_architecture.md)** - arrow-builder vs lmao separation
+1. **[Package Architecture](./00_package_architecture.md)** - arrow-builder vs lmao separation, op() + span() evolution
 2. **[Schema System](./01a_trace_schema_system.md)** - Attribute definitions and type safety
 3. **[Columnar Buffer Architecture](./01b_columnar_buffer_architecture.md)** - Memory layout and performance
 4. **[Context Flow and Op/Span Pattern](./01c_context_flow_and_op_wrappers.md)** - Execution model and span hierarchy
@@ -600,15 +584,15 @@ The trace logging system integrates with these platform components:
 8. **[Trace Context API Codegen](./01g_trace_context_api_codegen.md)** - Runtime API generation
 9. **[TypeScript Transformer](./01o_typescript_transformer.md)** - Compile-time optimizations for V8
 
-## Quick Reference: defineOp() + span() Design <a id="smoo/lmao!n/lmao-trace-quick-reference-op-span-design"></a>
+## Quick Reference: op() + span() Design <a id="smoo/lmao!n/lmao-trace-quick-reference-op-span-design"></a>
 
-| Aspect           | Alternative (rejected)      | Chosen Approach                        |
-| ---------------- | --------------------------- | -------------------------------------- |
-| **Definition**   | `task('name', fn)`          | `defineOp('name', fn)`                 |
-| **Invocation**   | `await GET(ctx, url)`       | `await span('GET', GET, url)`          |
-| **Span name**    | Definition time             | Call site                              |
-| **Deps**         | Per-span closures           | Op references (no dependency closure)  |
-| **Context**      | `ctx.tag.userId()`          | `tag.userId()` (destructured)          |
-| **Nested calls** | `ctx.deps.retry.attempt(1)` | `span('retry', deps.retry.attempt, 1)` |
-| **Attribution**  | Implicit in closure         | Per-op `OpMetadata` on the Op          |
-| **Line numbers** | `.line(N)` fluent method    | First arg to span()                    |
+| Aspect             | Alternative (rejected)      | Chosen Approach                       |
+| ------------------ | --------------------------- | ------------------------------------- |
+| **Definition**     | `task('name', fn)`          | `op(fn)`                              |
+| **Invocation**     | `await GET(ctx, url)`       | `await span('GET', GET, url)`         |
+| **Name timing**    | Definition time             | Call site                             |
+| **Deps**           | Per-span closures           | Op references (no dependency closure) |
+| **Context**        | `ctx.tag.userId()`          | `tag.userId()` (destructured)         |
+| **Nested calls**   | `ctx.deps.retry.attempt(1)` | `span('retry', deps.retry, 1)`        |
+| **Module binding** | Implicit in closure         | Explicit in Op class                  |
+| **Line numbers**   | `.line(N)` fluent method    | First arg to span()                   |

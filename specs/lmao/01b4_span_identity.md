@@ -372,21 +372,20 @@ function generateTraceId(): TraceId {
 ### Usage Pattern
 
 ```typescript
-// At request boundary - accept an incoming trace ID; without one, the Tracer generates one (generateTraceId)
-const incoming = request.headers['x-trace-id'];
-const overrides = incoming ? { trace_id: createTraceId(incoming) } : {};
+// At request boundary - generate or accept trace ID
+const trace_id = request.headers['x-trace-id'] ? createTraceId(request.headers['x-trace-id']) : generateTraceId();
 
-const handleRequest = defineOp('handle-request', async (ctx, request: Request) => {
-  await ctx.span('load-user', loadUserOp, request);
-  // All spans in trace share the SAME string reference
-  console.log(ctx.buffer.trace_id === ctx.buffer._traceRoot.trace_id); // true (same reference)
-  return ctx.ok(null);
-});
+// Pass to root span, _children walk parent chain
+// Op's internal wrapper creates the buffer
+// lineNumber is written directly to lineNumber_values[0] inside _invoke(), NOT passed to createSpanBuffer
+const rootSpan = createSpanBuffer(schema, module, spanName, trace_id);
+rootSpan.lineNumber_values[0] = lineNumber; // Direct TypedArray write
 
-// The Tracer builds the TraceRoot (holding trace_id) and the root SpanBuffer, writes row 0, and runs the Op.
-// Each child span's buffer reaches the same TraceRoot through its parent; the transformer passes each span()'s line,
-// which span setup writes with buffer.line(0, line).
-await trace('handle-request', overrides, handleRequest, request);
+const childSpan = createChildSpanBuffer(rootSpan, childModule, childSpanName);
+childSpan.lineNumber_values[0] = childLineNumber; // Direct TypedArray write
+
+// All spans in trace share the SAME string reference
+console.log(rootSpan.trace_id === childSpan.trace_id); // true (same reference)
 ```
 
 ### SpanBuffer Integration

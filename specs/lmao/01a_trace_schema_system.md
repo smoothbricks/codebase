@@ -47,11 +47,6 @@ The schema type continues to describe semantics, not whether a particular value 
 | **CATEGORY** | Dynamic reference lane for runtime strings                  | Deduplicate/encode through reusable category state |
 | **TEXT**     | Dynamic reference lane preserving raw/high-cardinality data | Encode without CATEGORY identity semantics         |
 
-A dynamic reference lane is a plain JS array of string references (`string[]`, the column's `_values`). The warmed write
-stores the reference the producer already holds; it does not intern, look up vocabulary, or encode UTF-8. Dictionary
-building and UTF-8 encoding happen on the per-request flush
-([01b1](./01b1_buffer_performance_optimizations.md#string-interning-and-utf-8-caching-architecture)).
-
 Compiler-known message vocabulary is separate from user `CATEGORY`/`TEXT` columns. Checker-proven literal operational
 templates use `kindTag = 1` (`LOG_TEMPLATE`), and checker-proven literal span names use `kindTag = 2` (`SPAN_NAME`);
 both store process-dense `Uint32` indices that are Arrow-ready. Non-literal span names and dynamic diagnostic messages
@@ -67,9 +62,9 @@ This division is normative:
   remain inputs, never borrowed Arrow storage. Its returned `VocabularyBinding` maps `binding[ordinal]` directly to a
   process-dense Arrow index.
 - Dense indices are process-local and append-only by fragment registration order. A new immutable generation preserves
-  the prior generation as an unchanged prefix and appends unseen decoded values, keeping old bindings prefix-valid. Ids
-  and decoded values are deterministic, but dense indices and dictionary order are not cross-process guarantees. Index
-  `0` is valid; null is represented by the Arrow validity bitmap.
+  the prior generation as an unchanged prefix and appends unseen decoded values, keeping old bindings prefix-valid.
+  Stable IDs and decoded values are deterministic, but dense indices and dictionary order are not cross-process
+  guarantees. Index `0` is valid; null is represented by the Arrow validity bitmap.
 - The warmed entry write performs fixed monomorphic stores and allocates nothing while capacity remains. Startup, span
   setup, overflow/slow path, and per-request flush have separate allocation budgets.
 - Per-request flush reuses the `PhysicalLayoutPlan`, backend class, vocabulary binding, dictionary generation, scratch
@@ -141,11 +136,6 @@ The schema DSL (`S.enum/category/text/number/boolean`, plus `S.binary/unknown/ob
 inference + reserved-name guard) is `packages/lmao/src/lib/schema/defineLogSchema.ts`. The authoring surface is
 **`defineLogSchema(...)` + `defineOpContext({ logSchema, deps, flags, ctx })` → `{ defineOp, defineOps }`**
 (`packages/lmao/src/lib/defineOpContext.ts`). User context is the `ctx` config field (runtime defaults).
-
-`OpContextConfig` has no metadata key. Source attribution (`package_name`, `package_file`, `git_sha`, `line`) is per op:
-the build-time transformer fills the optional `metadata` argument of `defineOp(name, fn, metadata)`, and `defineOp`
-builds the op's `OpMetadata` from it (`packages/lmao/src/lib/opContext/defineOp.ts`). Without that argument, `defineOp`
-derives `package_file`, `line`, and a package name from the call-site stack frame and records `git_sha` as `'runtime'`.
 
 ## Feature Flag Schema Definition <a id="smoo/lmao!n/schema-feature-flags"></a>
 

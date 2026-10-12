@@ -182,10 +182,10 @@ for the full interface definition including:
 
 - Core columns (`timestamp`, `entry_type`)
 - Attribute columns with lazy getters (`X_nulls`, `X_values`)
-- Tree structure (`_parent`, and the `_nodeIndex` handle into the trace's `TraceTopology`)
-- Dual metadata references (`_callsiteMetadata`, `_opMetadata`)
+- Tree structure (children, parent)
+- Dual module references (`callsiteModule`, `module`)
 - Span identification (`thread_id`, `span_id`, `trace_id`)
-- `OpMetadata` interface (per-op source attribution) and the class-level `SpanBufferStats`
+- `ModuleContext` interface with self-tuning stats
 
 **Key Architectural Point**: Column properties are **direct properties** on SpanBuffer via lazy getters (no nested
 `columns: Record<...>`). This provides zero indirection for hot path access.

@@ -14,11 +14,8 @@ compiler-emitted vocabulary at startup; it MUST NOT mutate an instantiated plan 
 
 - **Buffer-owned:** writable `_system`, identity, lazy-column blocks, string-reference arrays, and overflow links from
   span setup until freeze.
-- **Lease-owned borrowing:** conversion may expose frozen contiguous JS-heap TypedArray regions through an `ArrowLease`.
-  The lease holds the trace topology, the source buffers, and their vocabulary generations, so `releaseBuffer()` defers
-  recycling the tree until the last lease is released. WASM-backed columns are always copied into Arrow-owned storage,
-  because linear-memory growth cannot keep borrowed views valid; the WASM memory epoch is pinned only during the
-  synchronous build.
+- **Lease-owned borrowing:** conversion may expose frozen contiguous TypedArray/WASM regions through an `ArrowLease`.
+  The lease pins the backing store, memory epoch, and overflow chunks; reset, recycle, or invalidating growth waits.
 - **Arrow-owned:** dictionary/UTF-8/offset buffers, synthesized null bitmaps, serialized output, and any contiguous
   concatenation required by a consumer.
 - **Chunked boundary:** overflow buffers remain separate physical chunks. Prefer Arrow-native chunks; concatenate only
@@ -72,7 +69,7 @@ column offsets. This reduces allocations; it does not make span setup or the com
 │                                                                                  │
 │ Properties:                                                                      │
 │   _parent: undefined (root has no parent)                                        │
-│   _nodeIndex: number (this span's node in _traceRoot._topology)                  │
+│   _children: SpanBuffer[]                                                        │
 │   _callsiteMetadata: OpMetadata (caller's module for row 0 metadata)             │
 │   _opMetadata: OpMetadata (Op's module for rows 1+ metadata)                     │
 │   spanName: string (per-span data)                                               │
@@ -101,7 +98,7 @@ column offsets. This reduces allocations; it does not make span setup or the com
 │                                                                                 │
 │ Properties:                                                                     │
 │   _parent ─────────────► (parent SpanBuffer - for trace_id + parentSpanId)      │
-│   _nodeIndex: number (this span's node in _traceRoot._topology)                 │
+│   _children: SpanBuffer[]                                                       │
 │   _callsiteMetadata: OpMetadata (caller's module for row 0 metadata)            │
 │   _opMetadata: OpMetadata (Op's module for rows 1+ metadata)                    │
 │   spanName: string (per-span data)                                              │
@@ -126,7 +123,7 @@ column offsets. This reduces allocations; it does not make span setup or the com
 │                                                                                 │
 │ Properties:                                                                     │
 │   _parent ─────────────► (same as first buffer's parent)                        │
-│   _nodeIndex: number (same logical node as the first buffer)                    │
+│   _children: [] (only root buffer tracks _children)                             │
 │   _callsiteMetadata: OpMetadata (shared from first buffer)                      │
 │   _opMetadata: OpMetadata (Op's module, shared reference)                       │
 │   spanName: string (per-span data)                                              │
@@ -255,8 +252,7 @@ class SpanBuffer {
   readonly entry_type: Uint8Array;
 
   _parent?: SpanBuffer;
-  _nodeIndex: number; // Node in _traceRoot._topology; child links live in the topology arena
-  _topologyGeneration: number;
+  _children: SpanBuffer[];
   _overflow?: SpanBuffer;
 
   // Per-span invocation data
@@ -284,8 +280,7 @@ class SpanBuffer {
     this._opMetadata = opMetadata;
     this._traceRoot = traceRoot;
     this._vocabularyGeneration = vocabularyGeneration;
-    this._nodeIndex = NO_NODE; // Set by _traceRoot._topology.registerRoot/registerChild/adoptOverflow
-    this._topologyGeneration = 0;
+    this._children = [];
     this._overflow = undefined;
 
     // Calculate system buffer size
@@ -366,7 +361,7 @@ this.timestamp = timestampView;      // Written every entry
 this.entry_type = entryTypeView;     // Written every entry
 
 // SLOT 6-7: WARM - Tree structure (span creation/navigation)
-this._nodeIndex = NO_NODE;     // Topology handle, set when the factory registers the span
+this._children = [];           // Pushed to when creating child spans
 this._parent = parent;         // Walked for trace_id lookup
 
 // SLOT 8-9: WARM - Identity and binding (accessed during span ops)
@@ -388,7 +383,7 @@ this._callsiteMetadata = ...;  // Row 0 metadata
 | `_capacity`                                                | Read (overflow check)    | Every log entry          |
 | `_overflow`                                                | Read (buffer chain)      | On overflow              |
 | `timestamp` / `entry_type`                                 | Array indexing           | Every log entry          |
-| `_nodeIndex` / `_parent`                                   | Tree navigation          | Span creation/completion |
+| `_children` / `_parent`                                    | Tree navigation          | Span creation/completion |
 | `_identity` / `_opMetadata`                                | Metadata access          | Span operations          |
 | `_system`                                                  | Never after construction | Constructor only         |
 | `message_values[0]` / `_scopeValues` / `_callsiteMetadata` | Arrow conversion         | Cold path only           |
@@ -536,7 +531,7 @@ interface SpanBuffer {
   // ... same pattern for all schema attributes
 
   // Tree structure
-  _nodeIndex: number; // Node in _traceRoot._topology (child links live there)
+  _children: SpanBuffer[];
   _parent?: SpanBuffer; // Reference to parent SpanBuffer
 
   // Dual metadata references for accurate source attribution
@@ -559,32 +554,20 @@ interface SpanBuffer {
   getNullsIfAllocated(columnName: string): Uint8Array | undefined;
 }
 
-// OpMetadata - per-op source attribution, one per defineOp
+// OpMetadata - op-level metadata with flattened stats
 interface OpMetadata {
-  name: string; // Op name for metrics
   package_name: string; // npm package name from package.json
   package_file: string; // Path within package, relative to package.json
   git_sha: string; // Git SHA at build time
-  line: number; // Line of the defineOp call
+  prefix?: string; // Optional prefix for library integration
+  logSchema: LogSchema; // Schema definition for this module
 
-  // Pre-encoded UTF-8 for Arrow dictionary building (interned once at defineOp time)
-  package_name_entry: PreEncodedEntry;
-  package_file_entry: PreEncodedEntry;
-  git_sha_entry: PreEncodedEntry;
-
-  // Startup-resolved physical layout used by span setup; absent only on raw fallback metadata
-  _physicalLayoutPlan?: {
-    SpanBufferClass: SpanBufferConstructor;
-    eagerColumns: EagerColumnDescriptor;
-    vocabularyGeneration: VocabularyGeneration;
-    localMessageDictionary: readonly number[];
-    encodeLocalMessage: (globalDenseIndex: number) => number;
-    wasmLayout: WasmLayoutTemplate;
-  };
+  // Self-tuning buffer capacity stats (flattened, not nested)
+  sb_capacity: number; // Current buffer capacity
+  sb_totalWrites: number; // Total writes for tuning decisions
+  sb_overflows: number; // Overflow count for tuning decisions
+  sb_totalCreated: number; // Total buffers created
 }
-
-// The log schema lives on the op context's LogBinding; capacity stats live on the generated class
-// (SpanBufferClass.stats, see Capacity Statistics below).
 ```
 
 ### Access Patterns
@@ -595,9 +578,9 @@ buffer._callsiteMetadata?.package_name; // Caller's '@mycompany/http' (for row 0
 buffer._opMetadata.package_name; // Op's metadata (for rows 1+)
 buffer.spanName; // Span name (direct property)
 
-// Self-tuning stats (static on the generated class, shared by its buffers)
-buffer._stats.capacity; // 8 (default, self-tuning adapts)
-buffer._stats.totalWrites; // 1234
+// Self-tuning stats (flattened on OpMetadata)
+buffer._opMetadata.sb_capacity; // 8 (default, self-tuning adapts)
+buffer._opMetadata.sb_totalWrites; // 1234
 
 // Direct property access - zero indirection:
 buffer.userId_values[idx] = value; // ✅ Direct TypedArray access
@@ -756,8 +739,10 @@ Each `SpanBufferClass` (generated per schema) has a static `stats` property for 
 ```typescript
 interface SpanBufferStats {
   capacity: number; // Current capacity for new buffers
-  totalWrites: number; // Completed user/event rows sealed across segments (rows 0/1 excluded once per span)
-  spansCreated: number; // Non-chained spans created (root + child, not overflow buffers)
+  totalWrites: number; // Total entries written across all buffers
+  overflowWrites: number; // Number of overflow events (incremented once per overflow)
+  totalCreated: number; // Total buffers created (root + children + chains)
+  overflows: number; // Number of overflow events
 }
 
 // Access via class
@@ -773,17 +758,17 @@ buffer._stats; // Getter returns this.constructor.stats
 Stats are per-schema, not per-buffer:
 
 - All buffers from same schema share capacity learning
-- Utilization computed across all buffers of the same class
+- Overflow ratio computed across all buffers of same type
 - Enables cross-request capacity optimization
 
 ### Stats Updates
 
-| Event                                | Stats Updated                                          |
-| ------------------------------------ | ------------------------------------------------------ |
-| Root or child span created (factory) | `spansCreated++`                                       |
-| Buffer sealed (overflow or span end) | `totalWrites += completed rows`                        |
-| Overflow triggered                   | buffer sealed, tracer hook, then the tuning check      |
-| Capacity adjusted                    | `capacity` updated, `totalWrites`/`spansCreated` reset |
+| Event              | Stats Updated                     |
+| ------------------ | --------------------------------- |
+| Buffer created     | `totalCreated++`                  |
+| Entry written      | `totalWrites++`                   |
+| Overflow triggered | `overflows++`, `overflowWrites++` |
+| Capacity adjusted  | `capacity` updated, stats reset   |
 
 ### Benchmark Acceptance
 

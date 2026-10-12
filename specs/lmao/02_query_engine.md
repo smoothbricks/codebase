@@ -2,11 +2,8 @@
 
 ## Overview <a id="smoo/lmao!n/query-engine.overview"></a>
 
-DuckDB is the query engine for on-demand lmao trace queries: on AWS Lambda reading S3, and in the browser as DuckDB-WASM
-([03](./03_inspector.md)). It natively reads Arrow IPC and has an extension system that carries a custom
-`msgpack_extract()` function. Scheduled heavy jobs over the same bucket are a separate job, and run in a container on
-chDB or clickhouse-local
-([01u §Analysis Surfaces](./01u_cloudflare_trace_segments.md#smoo/lmao!n/cf-trace-segments-analysis)).
+DuckDB is the query engine for lmao traces. It natively reads Arrow IPC, runs on AWS Lambda reading S3, and has an
+extension system that carries a custom `msgpack_extract()` function.
 
 This document covers:
 

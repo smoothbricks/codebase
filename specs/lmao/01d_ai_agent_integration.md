@@ -440,8 +440,8 @@ const distributedQuery = `
     span,
     duration,
     timestamp
-  FROM read_parquet('s3://traces/*/trace-*.parquet')
-  WHERE trace_id = $trace_id
+  FROM s3('s3://traces/*/trace-*.parquet')
+  WHERE trace_id = '${trace_id}'
   ORDER BY timestamp
 `;
 
@@ -457,21 +457,21 @@ traceServer.addTool({
     },
   },
   handler: async ({ trace_id, services }) => {
-    // DuckDB on Lambda runs cross-service queries (02_query_engine.md)
+    // Use ClickHouse chDB or AWS Athena for cross-service queries
     return await queryDistributedTrace({ trace_id, services });
   },
 });
 
-// Deploy DuckDB on AWS Lambda for serverless trace queries
+// Deploy chDB on AWS Lambda for serverless trace queries
 const lambdaTraceQuery = async (trace_id: string) => {
-  return await duckdb.query(distributedQuery, { trace_id });
+  return await chdb.query(distributedQuery, { trace_id });
 };
 ```
 
 **Benefits**:
 
 - **Complete trace visibility**: See operations across all services
-- **Serverless querying**: DuckDB on Lambda provides cost-effective trace analysis
+- **Serverless querying**: chDB on Lambda provides cost-effective trace analysis
 - **Standard tooling**: Leverage existing analytics infrastructure
 
 ## MCP Configuration <a id="smoo/lmao!n/ai-agent-mcp-config"></a>
@@ -620,7 +620,7 @@ const AI_AGENT_PROMPTS = {
     
     - Op metrics: op-invocations, op-errors, op-exceptions, op-duration-total, 
       op-duration-ok, op-duration-err, op-duration-min, op-duration-max
-    - Buffer metrics: buffer-writes, buffer-spans, buffer-capacity
+    - Buffer metrics: buffer-writes, buffer-overflow-writes, buffer-created, buffer-overflows
     - Period marker: period-start (marks metrics period boundaries)
     
     Metrics are automatically emitted during flush cycles. The entry_type column identifies
@@ -674,7 +674,7 @@ logging).
 
 ## Arrow Table Column Reference <a id="smoo/lmao!n/ai-agent-arrow-columns"></a>
 
-This column set (`message`, `package_name`/`package_file`, `entry_type`, `trace_id`, `thread_id`/`span_id`,
+This column set (`message`, `package_name`/`package_path`, `entry_type`, `trace_id`, `thread_id`/`span_id`,
 `parent_thread_id`/`parent_span_id`, `ff_value`) is the Arrow schema (`lib/schema/systemSchema.ts`,
 `lib/convertToArrow.ts`); span identity lives in `lib/threadId.ts` and `lib/traceId.ts`. Canonical spec is
 [`01f_arrow_table_structure.md`](./01f_arrow_table_structure.md); this section is a consumer-facing restatement.
@@ -684,8 +684,8 @@ When querying trace data via MCP tools, the following columns are available:
 | Column             | Description                                                                                                                                                    |
 | ------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `message`          | Span name, log message template, exception message, OR flag name (see [Message Column](#message-column))                                                       |
-| `package_name`     | npm package name of the op's package (see [Module Identification](#module-identification))                                                                     |
-| `package_file`     | Path within the package of the file that defined the op (see [Module Identification](#module-identification))                                                  |
+| `package_name`     | npm package name of the module the op is bound to (see [Module Identification](#module-identification))                                                        |
+| `package_path`     | Path within package where module was defined (see [Module Identification](#module-identification))                                                             |
 | `entry_type`       | `span-start`, `span-ok`, `span-err`, `info`, `debug`, `op-invocations`, `buffer-writes`, etc. (see [Entry Types](./01h_entry_types_and_logging_primitives.md)) |
 | `trace_id`         | Request correlation ID (W3C format: 32 lowercase hex characters). For test runs, `testRunId` IS the `trace_id`                                                 |
 | `thread_id`        | Thread/worker identifier (uint64, crypto-secure random)                                                                                                        |
@@ -708,19 +708,17 @@ See [Arrow Table Structure](./01f_arrow_table_structure.md#the-message-system-co
 
 ### Module Identification <a id="smoo/lmao!n/ai-agent-arrow-columns.module-id"></a>
 
-The `package_name` and `package_file` columns work together to identify the source location:
+The `package_name` and `package_path` columns work together to identify the source location:
 
 - **`package_name`**: npm package name (e.g., `'@smoothbricks/lmao'`) - globally unique namespace
-- **`package_file`**: Path within package relative to package.json (e.g., `'src/services/user.ts'`)
-- **Dual attribution**:
-  - **Row 0 (span-start)**: Uses `_callsiteMetadata`, the calling op's `OpMetadata` - identifies where the span was
-    invoked (call site)
-  - **Rows 1+ (span-end, log entries)**: Uses `_opMetadata`, the executing op's `OpMetadata` - identifies where the code
-    executes (op definition)
+- **`package_path`**: Path within package relative to package.json (e.g., `'src/services/user.ts'`)
+- **Dual module attribution**:
+  - **Row 0 (span-start)**: Uses `callsiteModule` - identifies where the span was invoked (call site)
+  - **Rows 1+ (span-end, log entries)**: Uses `module` - identifies where the code executes (op definition)
   - This enables distinguishing "who called this span" vs "where is the code that runs"
 
-Example: If the HTTP library's `GET` op is called from `userService`'s `createUser` op, row 0 shows `userService`'s file
-(caller) and rows 1+ show the HTTP library's file (execution).
+Example: If `httpModule.GET` is called from `userService.createUser`, row 0 shows `userService` (caller) and rows 1+
+show `httpModule` (execution).
 
 See [Arrow Table Structure](./01f_arrow_table_structure.md#module-identification) for complete details.
 

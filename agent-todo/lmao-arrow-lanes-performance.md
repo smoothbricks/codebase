@@ -12,12 +12,10 @@ needs for the contract to be enforced rather than asserted. They are independent
 - Code: `packages/lmao/src/lib/convertToArrow.ts:596-636` borrows chunks only when a caller passes `borrowChunks`, which
   defaults to `false`; otherwise overflow chains are concatenated (`concatenateFloat64Arrays`, `concatenateNullBitmaps`,
   `concatenateUint8Arrays`, `convertToArrow.ts:57-59`).
-- Work: make chunk wrapping the default for JS-heap buffers and the concatenation the opt-in of a consumer that declares
-  it needs one contiguous region; charge the copied bytes to the flush. WASM-backed columns stay copied: linear-memory
-  growth detaches borrowed views (`specs/lmao/01q_wasm_memory_architecture.md` "Lifecycle and Asynchronous Ownership").
-- Acceptance: a Mitata flush benchmark per column type shows borrow at least as fast as copy on the JS-heap lane; the
-  allocation census of a JS-heap flush over an overflow chain counts zero payload copies unless the consumer requested
-  contiguity.
+- Work: make chunk wrapping the default and the concatenation the opt-in of a consumer that declares it needs one
+  contiguous region; charge the copied bytes to the flush.
+- Acceptance: a Mitata flush benchmark per column type shows borrow at least as fast as copy; the allocation census of a
+  flush over an overflow chain counts zero payload copies unless the consumer requested contiguity.
 
 ## Span-writer shape rules and per-lane census
 

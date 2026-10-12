@@ -200,18 +200,18 @@ class SpanLogger {
 The trace context assembles all entry type APIs for destructuring:
 
 ```typescript
-// Generated trace context (destructurable); full shape in 01c "SpanContext Interface"
-// Ctx['userCtx'] is spread in for user-defined fields (e.g., env with CF Worker bindings)
-type SpanContext<Ctx extends OpContext> = {
-  readonly tag: TagWriter<Ctx['logSchema']>;
-  readonly log: SpanLogger<Ctx['logSchema']>;
-  readonly scope: Readonly<Partial<InferSchema<Ctx['logSchema']>>>;
-  readonly span: SpanFn<Ctx>;
-  readonly deps: ResolvedDeps<Ctx['deps']>;
-  readonly ff: FeatureFlagEvaluator<Ctx> & InferFeatureFlagsWithContext<Ctx>;
-  readonly ok: <S>(value: S) => OkResult<S, Ctx['logSchema']>;
-  readonly err: <E>(error: E) => ErrResult<E, Ctx['logSchema']>;
-} & Ctx['userCtx'];
+// Generated trace context (destructurable)
+// Extra is spread in for user-defined fields (e.g., env with CF Worker bindings)
+type SpanContext<Schema, Deps, FF, Extra = {}> = {
+  readonly tag: TagWriter<Schema>;
+  readonly log: SpanLogger<Schema>;
+  readonly scope: ScopeAPI<Schema>;
+  readonly span: SpanFn<SpanContext<Schema, Deps, FF, Extra>>;
+  readonly deps: Deps;
+  readonly ff: FeatureFlagEvaluator<FF>;
+  readonly ok: <V>(value: V) => FluentSuccessResult<V>;
+  readonly err: <E>(code: string, details?: E) => FluentErrorResult<E>;
+} & Extra;
 
 // Usage in op signature - destructure what you need
 const processUser = defineOp('processUser', async ({ log, tag, scope, span, ok, err }, userData) => {
@@ -223,34 +223,26 @@ const processUser = defineOp('processUser', async ({ log, tag, scope, span, ok, 
 
 ### _setScope() as Function (NOT stored in buffer columns)
 
-The generated `_setScope()` method (`generateSetScopeMethod` in `packages/lmao/src/lib/codegen/spanLoggerGenerator.ts`)
-is **SEPARATE from buffer columns**. Scope values live in the span buffer's `_scopeValues`, an immutable frozen object,
-not in TypedArrays.
+The `_setScope()` function is a `new Function()` compiled callable that is **SEPARATE from buffer columns**. Scope
+values are stored as plain JavaScript properties in the Scope instance, not in TypedArrays.
 
-Each call publishes a new snapshot:
+This separation enables:
 
-1. **One frozen object per scope set** - `_setScope` copies the current `_scopeValues`, applies the update (`null`
-   deletes a key, `undefined` is ignored), freezes the result, and stores it. Scope sets are rare next to log entries,
-   so this allocation stays off the warmed write path.
-2. **Inheritance by reference** - a child buffer takes its parent's `_scopeValues` reference at construction. Snapshots
-   are immutable, so the child copies nothing, and a later `setScope` on the parent never changes what the child holds.
-3. **Fill at the edges** - Arrow conversion fills scope columns from `_scopeValues` for rows without a direct write, and
-   a new overflow buffer is pre-filled through `_prefillScopedAttributesOn(buffer)`.
+1. **Zero allocation on scope set** - just sets a property
+2. **SIMD pre-filling** - child spans can use TypedArray.fill() with parent scope values
+3. **Clean inheritance** - \_getScopeValues() extracts all values for copying to child spans
 
 ```typescript
-// Generated with the SpanLogger class (cold path)
-_setScope(attributes) {
-  const current = this._buffer._scopeValues || {};
-  const next = { ...current };
-  for (const key of Object.keys(attributes)) {
-    const value = attributes[key];
-    if (value === null) {
-      delete next[key];
-    } else if (value !== undefined) {
-      next[key] = value;
+// Generated at module creation time (cold path)
+function generateScopeFunction(schema: Schema): ScopeFunction {
+  // The scope function accepts an object of attributes
+  // and stores them for propagation to all entries
+
+  return function _setScope(attributes: Partial<Schema>) {
+    for (const [key, value] of Object.entries(attributes)) {
+      this._scopeValues[key] = value;
     }
-  }
-  this._buffer._scopeValues = Object.freeze(next);
+  };
 }
 
 // Example usage in op:
@@ -262,14 +254,15 @@ const handleRequest = defineOp('handleRequest', async ({ setScope, log }, req) =
 });
 ```
 
-**Key Design Point**: `setScope` never writes buffer columns. Scope values reach buffer columns at Arrow conversion and
-when a new overflow buffer is pre-filled. See 01i_span_scope_attributes.md for the full scope lifecycle.
+**Key Design Point**: The Scope function does NOT reference the buffer at all. Scope values are applied to buffer
+columns during write operations or pre-fill operations, NOT stored in the buffer. See 01i_span_scope_attributes.md for
+the full scope lifecycle.
 
 ### Usage Pattern
 
 ```typescript
 const handleRequest = defineOp('handleRequest', async ({ setScope, log, span }, req) => {
-  // Setting scope values (publishes one frozen snapshot)
+  // Setting scope values (no allocation)
   setScope({ userId: 'user-123', requestId: 'req-456' });
 
   // All log entries include scoped attributes
@@ -293,8 +286,8 @@ const processOrder = defineOp('processOrder', async ({ setScope, log }, order) =
 | Aspect     | tag                                                                | scope                                        |
 | ---------- | ------------------------------------------------------------------ | -------------------------------------------- |
 | API Style  | Method calls: `tag.userId('123')` or `tag.with({ userId: '123' })` | Function call: `setScope({ userId: '123' })` |
-| Can Read   | No                                                                 | Yes (`ctx.scope`, read-only snapshot)        |
-| Allocates  | Yes (on first write)                                               | One frozen object per `setScope` call        |
+| Can Read   | No                                                                 | No (write-only)                              |
+| Allocates  | Yes (on first write)                                               | No (first assignment)                        |
 | Appears on | Row 0 only                                                         | ALL rows                                     |
 | Inherited  | No                                                                 | Yes                                          |
 
@@ -372,25 +365,30 @@ interface FluentLogEntry<T> {
 
 ### Library Integration Pattern
 
-Libraries define their op context with `defineOpContext` and get fully typed APIs. Source attribution is per op: the
-transformer fills each `defineOp` call's metadata argument, so the context config has no metadata key.
+Libraries define their schema using `defineModule` and get fully typed APIs:
 
 > **See**: [Op Context Pattern](./01l_op_context_pattern.md) for the complete API design.
 
 ```typescript
-// Library defines its op context with an unprefixed logSchema
-const { defineOp, defineOps } = defineOpContext({
-  logSchema: defineLogSchema({
+// Library defines module with logSchema (unprefixed)
+const httpLib = defineModule({
+  metadata: { packageName: '@my-company/http', packagePath: 'src/index.ts', gitSha: 'abc123' },
+  logSchema: {
     status: S.number(),
     method: S.enum(['GET', 'POST', 'PUT', 'DELETE']),
     url: S.text(),
     duration: S.number(),
-  }),
-  ctx: { env: null as WorkerEnv },
-});
+  },
+  deps: {},
+  ff: {},
+})
+  .ctx<{ env: WorkerEnv }>({ env: null! })
+  .make();
+
+const { defineOp } = httpLib;
 
 // Usage is fully typed - library uses clean names
-const apiCall = defineOp('apiCall', async ({ tag, log, ok }) => {
+export const apiCall = defineOp('apiCall', async ({ tag, log, ok }) => {
   // TypeScript knows these properties exist and their types
   tag.method('GET').url('https://api.example.com');
   log.info('Making API call');
@@ -398,11 +396,10 @@ const apiCall = defineOp('apiCall', async ({ tag, log, ok }) => {
   return ok({ success: true });
 });
 
-export const httpOps = defineOps({ apiCall });
-
-// Consumer applies the prefix in its own deps:
-// const { defineOp } = defineOpContext({ logSchema: appSchema, deps: { http: httpOps.prefix('http') } });
-// Result: the library's ops write to http_status, http_method, http_url, http_duration columns
+// Consumer applies prefix at use time:
+// const httpRoot = httpLib.prefix('http').use();
+// await apiCall(httpRoot);
+// Result: writes to http_status, http_method, http_url, http_duration columns
 ```
 
 ## Implementation Details
@@ -550,7 +547,8 @@ ffAccess(flagName, value) {
     const strValue = value === null || value === undefined ? 'null' : String(value);
     this._buffer.ffValue_values[idx] = strValue;
   }
-  // No per-write stats update: completed rows reach stats.totalWrites when the buffer is sealed
+  // Track write for capacity tuning
+  this._buffer.module.sb_totalWrites++;
 }
 
 ffUsage(flagName, context) {
@@ -561,6 +559,7 @@ ffUsage(flagName, context) {
   if (this._buffer.message_values) {
     this._buffer.message_values[idx] = flagName;
   }
+  this._buffer.module.sb_totalWrites++;
   if (context) {
     this.with(context); // Apply to this ff-usage row
   }

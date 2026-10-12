@@ -39,15 +39,12 @@ Request Middleware: setScope({ requestId, userId, endpoint, method })
 ```
 
 **Performance Optimization**: Scope values are stored in a plain object on the buffer. Column allocation and filling
-happens at Arrow conversion time (cold path) using `TypedArray.fill()` for SIMD optimization. Overflow is the one
-slow-path write: when a log write moves to a new overflow buffer, the span logger's `_prefillScopedAttributesOn(buffer)`
-fills the current scope values into that buffer's rows from its `_writeIndex` to its capacity, for each scope column
-already allocated on it.
+happens at Arrow conversion time (cold path) using `TypedArray.fill()` for SIMD optimization.
 
 ## Implementation: Plain Object Storage
 
-**No generated class for scope storage.** Scope is stored as a plain object on the buffer and filled into columns at
-Arrow conversion time; the overflow prefill above is a per-schema method of the generated span logger.
+**No runtime code generation needed for scope.** Scope is stored as a plain object on the buffer and filled into columns
+at Arrow conversion time.
 
 ### Why No Codegen for Scope?
 
@@ -59,10 +56,9 @@ Scope is **never in the hot path**:
 | `ctx.scope.userId`            | User code (rare) | No        |
 | Child inherits parent scope   | Span creation    | No        |
 | Scope values → Arrow columns  | Arrow conversion | No        |
-| Scope values → overflow rows  | Buffer overflow  | No        |
 
-Since scope is only accessed during span setup, overflow and Arrow conversion (all off the warmed write path), V8 hidden
-class optimization doesn't apply. A plain object is simpler and works just as well.
+Since scope is only accessed during span setup and Arrow conversion (both cold paths), V8 hidden class optimization
+doesn't apply. A plain object is simpler and works just as well.
 
 ### Scope Storage
 
@@ -120,23 +116,23 @@ ctx.setScope({ userId: null }); // scope = { orderId: 'x' } (new object, userId 
 ### Context API
 
 ```typescript
-type SpanContext<Ctx extends OpContext> = {
+interface SpanContext<Schema> {
   // Set scope values (merge semantics, null to clear)
-  setScope(values: Partial<InferSchema<Ctx['logSchema']>> | null): void;
+  setScope(attributes: ScopeUpdate<Schema> | null): void;
 
   // Read-only view of current scope
-  readonly scope: Readonly<Partial<InferSchema<Ctx['logSchema']>>>;
+  readonly scope: Readonly<SchemaValues<Schema>>;
 
   // Tag writes to row 0 only
-  tag: TagWriter<Ctx['logSchema']>;
+  tag: TagMethods<Schema>;
 
   // Logging
-  log: SpanLogger<Ctx['logSchema']>;
+  log: LogMethods;
 
-  // Results (row 1)
-  ok<S>(value: S): OkResult<S, Ctx['logSchema']>;
-  err<E>(error: E): ErrResult<E, Ctx['logSchema']>;
-} & Ctx['userCtx'];
+  // Results
+  ok<T>(value: T): Result<T>;
+  err(code: string, details?: unknown): Result<never>;
+}
 ```
 
 ### Usage Example
@@ -363,14 +359,13 @@ if (!hasDirectWrite && scopeValue !== undefined) {
 1. **Direct writes always win**: Any row with a direct write (non-null in column) keeps its value
 2. **Scope fills nulls**: Scope value fills any row that has no direct write
 3. **Row-level granularity**: Each row is checked independently
-4. **Cold path only**: This happens during Arrow conversion, not hot path. The overflow prefill marks its rows written,
-   so an overflow buffer's prefilled rows keep the scope value that was current when the overflow happened
+4. **Cold path only**: This happens during Arrow conversion, not hot path
 5. **SIMD where possible**: When large ranges have no direct writes, `TypedArray.fill()` can be used
 
 ## Scope Value Changes
 
-Each `setScope` call creates a new immutable object. Since columns are filled at Arrow conversion, ALL rows that no
-overflow prefill wrote get the **latest** scope value (the final object at span completion):
+Each `setScope` call creates a new immutable object. Since columns are filled at Arrow conversion, ALL rows get the
+**latest** scope value (the final object at span completion):
 
 ```typescript
 const processOp = defineOp('processOp', async (ctx) => {
@@ -408,9 +403,6 @@ change retain their snapshot of the parent's scope at creation time (see
 ### E-commerce Order Processing
 
 ```typescript
-// Its code fills error_code on the span-err row
-const INSUFFICIENT_STOCK = defineCodeError('INSUFFICIENT_STOCK')<{ warehouseId: string }>();
-
 const fulfillOrder = defineOp('fulfillOrder', async (ctx, orderId: string) => {
   const order = await loadOrder(orderId);
 
@@ -437,7 +429,7 @@ const fulfillOrder = defineOp('fulfillOrder', async (ctx, orderId: string) => {
     // Row: orderId, customerId, fulfillmentCenter, warehouseId
 
     if (insufficientStock) {
-      return childCtx.err(INSUFFICIENT_STOCK({ warehouseId: 'WH-42' }));
+      return childCtx.err('INSUFFICIENT_STOCK');
       // span-err row: orderId, customerId, fulfillmentCenter, warehouseId
     }
     return childCtx.ok({ reserved: true });
