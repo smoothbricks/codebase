@@ -69,6 +69,8 @@ pub enum ProcessSpanError {
     OpenedTwice { index: u32 },
     #[error("process {index} was not born")]
     NotOpened { index: u32 },
+    #[error("process {index} names retained parent {pid} that was not born")]
+    MissingParent { index: u32, pid: u32 },
     #[error("process {index} was already closed")]
     AfterExit { index: u32 },
     #[error("process {index} has no span id below the job span")]
@@ -188,6 +190,9 @@ impl ProcessSpanProjection {
                     blocker_columns(blocked_on),
                 )))
             }
+            // 07's heartbeat event carries the whole sample. 13's row sets only
+            // columns that changed. Nothing changed, so the custom columns stay
+            // null and `process.heartbeat` is the liveness fact.
             JobProcessEvent::Heartbeat { index, .. } => {
                 let span_id = self.live(*index, observed.identity)?.span_id;
                 Ok(Some(self.row(
@@ -227,9 +232,16 @@ impl ProcessSpanProjection {
         let span_id = index
             .checked_add(JOB_SPAN_ID + 1)
             .ok_or(ProcessSpanError::IndexOverflow { index })?;
-        let parent_span = parent
-            .and_then(|parent| self.by_identity.get(&parent).copied())
-            .unwrap_or(JOB_SPAN_ID);
+        let parent_span =
+            match parent {
+                None => JOB_SPAN_ID,
+                Some(parent) => self.by_identity.get(&parent).copied().ok_or(
+                    ProcessSpanError::MissingParent {
+                        index,
+                        pid: parent.pid,
+                    },
+                )?,
+            };
         self.by_identity.insert(identity, span_id);
         self.open.push(OpenSpan {
             span_id,
@@ -731,8 +743,8 @@ pub fn read_process_segment(path: &Path) -> Result<DecodedProcessRow, ProcessSpa
         io_read_bytes: columns.io_read_bytes,
         io_write_bytes: columns.io_write_bytes,
         exit_code: columns.exit_code,
-        exit_signal: columns.exit_signal,
-        blocked_on: columns.blocked_on,
+        exit_signal: enum_name(&EXIT_SIGNAL_NAMES, columns.exit_signal)?,
+        blocked_on: enum_name(&BLOCKED_ON_NAMES, columns.blocked_on)?,
         blocked_path: columns.blocked_path,
         blocked_holder_pid: columns.blocked_holder_pid,
     })
@@ -757,6 +769,33 @@ fn optional_dict(
 ) -> Result<Option<String>, ProcessSpanError> {
     let column = column(batch, start, name)?;
     Ok(dict_value(column, 0))
+}
+
+fn optional_key(
+    batch: &RecordBatch,
+    start: usize,
+    name: &str,
+) -> Result<Option<u8>, ProcessSpanError> {
+    let column = column(batch, start, name)?;
+    if column.is_null(0) {
+        return Ok(None);
+    }
+    let Some(dict) = column.as_dictionary_opt::<UInt8Type>() else {
+        return Err(ProcessSpanError::Schema);
+    };
+    Ok(Some(dict.keys().value(0)))
+}
+
+fn enum_name(names: &[&str], key: Option<u8>) -> Result<Option<String>, ProcessSpanError> {
+    match key {
+        None => Ok(None),
+        Some(key) => {
+            let name = names
+                .get(usize::from(key))
+                .ok_or(ProcessSpanError::Schema)?;
+            Ok(Some((*name).to_owned()))
+        }
+    }
 }
 
 fn dict_value(column: &ArrayRef, row: usize) -> Option<String> {
@@ -969,25 +1008,31 @@ mod tests {
             &sample(10, 1, "/bin/bash", &["/bin/bash", "-c", "cat"]),
         );
         assert_eq!(root_row.parent_span_id(), JOB_SPAN_ID);
-        // The sample's ppid is the root's pid, but the retained parent is a different identity
-        // that was never opened. That must not invent a parent span from the pid.
-        let child_row = project_born(
-            &mut projection,
-            1,
-            child,
-            Some(identity(10, 9)),
-            &sample(11, 10, "/bin/cat", &["/bin/cat"]),
+        // A sample ppid is not a parent edge. A retained parent that was never
+        // born is an error, not a silent hang from the job span.
+        let missing = projection.project(
+            RetainedProcessEvent {
+                event: &JobProcessEvent::Born {
+                    index: 1,
+                    process: sample(11, 10, "/bin/cat", &["/bin/cat"]),
+                },
+                identity: Some(child),
+                parent: Some(identity(10, 9)),
+            },
+            at(1),
         );
-        assert_eq!(child_row.parent_span_id(), JOB_SPAN_ID);
+        assert!(matches!(
+            missing,
+            Err(ProcessSpanError::MissingParent { index: 1, pid: 10 })
+        ));
         let real = project_born(
             &mut projection,
-            2,
+            1,
             identity(12, 3),
             Some(root),
             &sample(12, 99, "/bin/cat", &["/bin/cat", "fifo"]),
         );
         assert_eq!(real.parent_span_id(), root_row.span_id());
-        assert_ne!(real.parent_span_id(), child_row.span_id());
     }
 
     #[test]
