@@ -3267,11 +3267,14 @@ async fn host_controller_process_observations_survive_a_subscriber_drop() {
 #[tokio::test]
 #[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
 async fn host_controller_a_reaped_grandchild_burst_retains_its_observation_gap() {
+    use arrow_array::Array as _;
+    use arrow_array::cast::AsArray as _;
+    use arrow_array::types::{Int64Type, UInt16Type, UInt32Type};
     use cowshed_core::api::process::{
         JobProcessEvent, JobProcessTree, ProcessCoverage, ProcessCoverageGap,
     };
     use cowshed_core::api::resources::JobAccounting;
-    use cowshed_core::runtime::{job_unattributed, supervisor_socket};
+    use cowshed_core::runtime::supervisor_socket;
     use cowshed_os::fork_lock::Run as _;
 
     let root = test_root();
@@ -3432,37 +3435,73 @@ async fn host_controller_a_reaped_grandchild_burst_retains_its_observation_gap()
                 .file_name()
                 .unwrap()
                 .to_string_lossy()
-                .starts_with("unattributed-")
+                .starts_with("job-")
             {
-                gaps.push(
-                    job_unattributed::read_unattributed_segment(&path)
-                        .expect("the exact fixed reconciliation schema"),
-                );
+                let mut reader = arrow_ipc::reader::StreamReader::try_new(
+                    std::fs::File::open(&path).expect("sealed job segment"),
+                    None,
+                )
+                .expect("job segment Arrow stream");
+                let batch = reader.next().expect("one job batch").expect("valid batch");
+                assert!(reader.next().is_none());
+                let mut fields = cowshed_core::storage::trace_segment::system_fields();
+                fields.extend(cowshed_core::runtime::job_spans::job_fields());
+                assert_eq!(batch.schema().fields(), &fields.into());
+                assert_eq!(batch.num_rows(), 1);
+                let message = batch
+                    .column_by_name("message")
+                    .expect("message")
+                    .as_dictionary::<UInt32Type>();
+                if message.is_valid(0)
+                    && message
+                        .values()
+                        .as_string::<i32>()
+                        .value(usize::try_from(message.keys().value(0)).expect("message key"))
+                        == "job.unattributed"
+                {
+                    gaps.push(batch);
+                }
             }
         }
     }
     assert_eq!(gaps.len(), 1);
-    let columns = &gaps[0].columns;
+    let columns = &gaps[0];
+    let signed = |name| {
+        let values = columns
+            .column_by_name(name)
+            .expect("signed reconciliation column")
+            .as_primitive::<Int64Type>();
+        values.is_valid(0).then(|| values.value(0))
+    };
+    let enum_text = |name| {
+        let values = columns
+            .column_by_name(name)
+            .expect("reconciliation enum")
+            .as_dictionary::<UInt16Type>();
+        values.is_valid(0).then(|| {
+            values
+                .values()
+                .as_string::<i32>()
+                .value(usize::from(values.keys().value(0)))
+        })
+    };
     assert_eq!(
-        columns.unattributed_cpu_us,
+        signed("unattributed_cpu_us"),
         Some(reconciliation.cpu_us.get())
     );
     assert_eq!(
-        columns.unattributed_io_read_bytes,
+        signed("unattributed_io_read_bytes"),
         reconciliation.io_read_bytes.map(|bytes| bytes.get())
     );
     assert_eq!(
-        columns.unattributed_io_write_bytes,
+        signed("unattributed_io_write_bytes"),
         reconciliation.io_write_bytes.map(|bytes| bytes.get())
     );
     assert_eq!(
-        job_unattributed::SOURCE_NAMES[usize::from(columns.source.unwrap())],
-        "macosRusageChildren"
+        enum_text("unattributed_source"),
+        Some("macOsRusageChildren")
     );
-    assert_eq!(
-        job_unattributed::COVERAGE_NAMES[usize::from(columns.coverage.unwrap())],
-        "uncountedFork"
-    );
+    assert_eq!(enum_text("unattributed_coverage"), Some("uncountedFork"));
     serving.abort();
     assert!(
         serving

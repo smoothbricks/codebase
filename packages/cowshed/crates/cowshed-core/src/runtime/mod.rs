@@ -5,7 +5,6 @@ pub mod commitment_feed;
 pub mod job_accounting;
 #[cfg(target_os = "macos")]
 mod job_attribution;
-pub mod job_boundary;
 #[cfg(target_os = "linux")]
 pub mod job_cgroup;
 pub mod job_groups;

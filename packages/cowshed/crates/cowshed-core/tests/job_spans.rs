@@ -9,13 +9,14 @@ use arrow_array::RecordBatch;
 use arrow_array::types::{Int64Type, UInt16Type, UInt32Type, UInt64Type};
 use arrow_schema::{DataType, Field, Schema};
 use cowshed_core::api::{
-    CpuMicros, CpuMicrosDelta, CpuTotals, ExecCommand, ExitStatus, HostLoadSample, JobAccounting,
-    JobId, JobInfo, JobLeafAttribution, JobResourceSample, JobState, JobStreamWatermark,
-    JobVolumeUsage, MAX_EXACT_INTEGER, OneCoreCpuPercent, OutputStorage, OutputSummary, ProcessCoverage,
-    ProtectedOutput, ResidentBytes, Sha256Digest, SpanId, StdinInfo, StdinKind, StreamBytes,
-    StreamInfo, StreamLines, TraceContext, TraceId, UsageReconciliation, UtcTimestamp,
-    VolumeUnavailable, VolumeUsage, VolumeUsedBytesDelta, WallMicros, WorkspaceIncarnation,
-    WorkspacePath,
+    ChargedMemoryBytes, ChargedMemoryUsage, CpuMicros, CpuMicrosDelta, CpuTotals, ExecCommand,
+    ExitStatus, HostLoadSample, JobAccounting, JobId, JobInfo, JobLeafAttribution,
+    JobResourceSample, JobState, JobStreamWatermark, JobVolumeUsage, MAX_EXACT_INTEGER, OneCoreCpuPercent,
+    OutputStorage, OutputSummary, ProcessCoverage, ProcessCoverageGap, ProtectedOutput,
+    ResidentBytes, Sha256Digest, SpanId, StdinInfo, StdinKind, StorageIoBytes, StorageIoBytesDelta,
+    StorageIoTotals, StreamBytes, StreamInfo, StreamLines, TraceContext, TraceId,
+    UsageReconciliation, UtcTimestamp, VolumeUnavailable, VolumeUsage, VolumeUsedBytesDelta,
+    WallMicros, WorkspaceIncarnation, WorkspacePath,
 };
 use cowshed_core::repository::RepoId;
 use cowshed_core::runtime::job_spans::{
@@ -51,6 +52,12 @@ fn spec_job_columns() -> Vec<Column> {
         ("cores", "u16", true),
         ("charged_memory_current_bytes", "u64", true),
         ("charged_memory_peak_bytes", "u64", true),
+        ("unattributed_cpu_us", "i64", true),
+        ("unattributed_io_read_bytes", "i64", true),
+        ("unattributed_io_write_bytes", "i64", true),
+        ("unattributed_source", "S.enum", true),
+        ("unattributed_coverage", "S.enum", true),
+        ("unattributed_gap_pid", "u32", true),
     ]
 }
 
@@ -447,81 +454,671 @@ async fn a_load_no_milliload_column_holds_is_refused_and_counted() {
     );
 }
 
-const MIB: u64 = 1 << 20;
-
-/// `running_job()` as it ends with a clean exit, carrying the terminal sample `resources`.
-fn ended_job(resources: Option<JobResourceSample>) -> JobInfo {
-    JobInfo {
-        state: JobState::Exited,
-        duration_ms: Some(1_000),
-        resources,
-        exit: Some(ExitStatus::Exited { code: 0 }),
-        ..running_job()
+/// A source's totals: the CPU both the macOS and the Linux source count.
+fn totals() -> CpuTotals {
+    CpuTotals {
+        user_us: CpuMicros::new(1_250_000).unwrap(),
+        sys_us: CpuMicros::new(80_000).unwrap(),
     }
 }
 
-/// The charged-memory cells of `info`'s start row and end row, sealed through a production writer
-/// under a root of its own, each segment holding exactly the declared job columns.
-async fn charged_cells(label: &str, info: &JobInfo) -> [(Option<u64>, Option<u64>); 2] {
-    let telemetry = TempRoot::new(label);
-    let segments = sealed_start_and_end(&telemetry, info).await;
-    assert_eq!(segments.len(), 2);
+/// A reconciliation of `cpu_us`, and of `io` as `(read, write)` where the source counts bytes.
+fn reconciliation(
+    cpu_us: i64,
+    io: Option<(i64, i64)>,
+    coverage: ProcessCoverage,
+) -> UsageReconciliation {
+    UsageReconciliation {
+        cpu_us: CpuMicrosDelta::new(cpu_us).unwrap(),
+        io_read_bytes: io.map(|(read, _)| StorageIoBytesDelta::new(read).unwrap()),
+        io_write_bytes: io.map(|(_, write)| StorageIoBytesDelta::new(write).unwrap()),
+        coverage,
+    }
+}
+
+fn gap(reason: ProcessCoverageGap) -> ProcessCoverage {
+    ProcessCoverage::Gap { reason }
+}
+
+/// The macOS source: leader-own plus reaped-children CPU, and no storage bytes to compare.
+fn rusage(reconciliation: UsageReconciliation) -> JobAccounting {
+    JobAccounting::MacOsRusageChildren {
+        cpu: totals(),
+        io: None,
+        reconciliation,
+    }
+}
+
+/// The Linux source: the job's own cgroup, whose storage bytes can be compared with the observed
+/// processes' own.
+fn cgroup(reconciliation: UsageReconciliation) -> JobAccounting {
+    JobAccounting::LinuxCgroupV2 {
+        cpu: totals(),
+        io: StorageIoTotals {
+            read_bytes: StorageIoBytes::new(8192).unwrap(),
+            write_bytes: StorageIoBytes::new(4096).unwrap(),
+        },
+        charged_memory: ChargedMemoryUsage {
+            current_bytes: ChargedMemoryBytes::new(1 << 20).unwrap(),
+            peak_bytes: ChargedMemoryBytes::new(2 << 20).unwrap(),
+        },
+        reconciliation,
+    }
+}
+
+/// Job `job_id`'s terminal sample over `accounting`, its hosts and volumes quiet but present.
+fn sampled(job_id: u64, accounting: JobAccounting) -> JobResourceSample {
+    let cpu = accounting.cpu();
+    JobResourceSample {
+        cpu_user_ms: cpu.user_us.millis(),
+        cpu_sys_ms: cpu.sys_us.millis(),
+        accounting,
+        ..sample(
+            JobId::new(job_id).expect("a job id"),
+            HostLoadSample::new(1.25, 8).expect("a host"),
+            HostLoadSample::new(4.5, 16).expect("a host"),
+            JobVolumeUsage {
+                workspace: read(0),
+                build: None,
+            },
+        )
+    }
+}
+
+/// Job `job_id`, exited cleanly with the terminal `resources` it was frozen with, if it owned a
+/// process.
+fn ended_job(job_id: u64, resources: Option<JobResourceSample>) -> JobInfo {
+    JobInfo {
+        state: JobState::Exited,
+        duration_ms: Some(1250),
+        resources,
+        exit: Some(ExitStatus::Exited { code: 0 }),
+        ..job(job_id)
+    }
+}
+
+/// Seal the end of each of `jobs` through one production writer under `telemetry`, and return the
+/// segments it sealed, in the order it sealed them.
+async fn sealed_ends(telemetry: &Path, jobs: &[JobInfo]) -> Vec<(String, RecordBatch)> {
+    let publisher = JobSpanPublisher::start(telemetry.to_path_buf());
+    for job in jobs {
+        publisher.record(job, JobSpanEdge::end(job.state, job.exit.as_ref()));
+    }
+    let health = publisher.health().await.expect("the writer answers");
+    assert_eq!(health.failed, 0, "{health:?}");
+    let sealed = sealed_segments(telemetry, "job-");
+    assert_eq!(
+        usize::try_from(health.recorded).unwrap(),
+        sealed.len(),
+        "{health:?}"
+    );
+    sealed
+}
+
+/// The kind of each sealed row: its lmao entry type and its message, as `<entry type> <message>`.
+fn kinds(segments: &[(String, RecordBatch)]) -> Vec<String> {
+    segments
+        .iter()
+        .map(|(_, batch)| {
+            format!(
+                "{} {}",
+                text_cell(batch, "entry_type", 0).expect("an entry type"),
+                text_cell(batch, "message", 0).expect("a message"),
+            )
+        })
+        .collect()
+}
+
+/// The unattributed-usage cells of a sealed row, as a reader sees them: a null cell is `None`.
+#[derive(Debug, Eq, PartialEq)]
+struct Unattributed {
+    cpu_us: Option<i64>,
+    io_read_bytes: Option<i64>,
+    io_write_bytes: Option<i64>,
+    source: Option<String>,
+    coverage: Option<String>,
+    gap_pid: Option<u32>,
+}
+
+fn unattributed_cells(batch: &RecordBatch) -> Unattributed {
+    Unattributed {
+        cpu_us: number_cell::<Int64Type>(batch, "unattributed_cpu_us", 0),
+        io_read_bytes: number_cell::<Int64Type>(batch, "unattributed_io_read_bytes", 0),
+        io_write_bytes: number_cell::<Int64Type>(batch, "unattributed_io_write_bytes", 0),
+        source: text_cell(batch, "unattributed_source", 0),
+        coverage: text_cell(batch, "unattributed_coverage", 0),
+        gap_pid: number_cell::<UInt32Type>(batch, "unattributed_gap_pid", 0),
+    }
+}
+
+/// The cells of a row that states no unattributed usage.
+fn nothing_stated() -> Unattributed {
+    Unattributed {
+        cpu_us: None,
+        io_read_bytes: None,
+        io_write_bytes: None,
+        source: None,
+        coverage: None,
+        gap_pid: None,
+    }
+}
+
+/// The wire kind of the source that counted `accounting`'s totals.
+fn wire_source(accounting: &JobAccounting) -> String {
+    serde_json::to_value(accounting).expect("accounting serializes")["kind"]
+        .as_str()
+        .expect("a tagged source")
+        .to_owned()
+}
+
+/// What a job's terminal sample states: its totals' source by wire kind, and its reconciliation.
+fn stated_by(job: &JobInfo) -> (String, UsageReconciliation) {
+    let accounting = &job.resources.as_ref().expect("a sampled job").accounting;
+    (wire_source(accounting), *accounting.reconciliation())
+}
+
+/// The reconciliation a row's cells state, rebuilt through the wire's own record: the source that
+/// counted the totals by its wire kind, and the reconciliation with its coverage. `None` for a
+/// row that states nothing. A reader holding only the sealed segment recovers the very record the
+/// supervisor reconciled, or the cells lost a distinction.
+fn restated(cells: &Unattributed) -> Option<(String, UsageReconciliation)> {
+    let source = cells.source.clone()?;
+    let coverage = match cells.coverage.as_deref()? {
+        "complete" => serde_json::json!({"kind": "complete"}),
+        kind => {
+            let mut reason = serde_json::json!({"kind": kind});
+            if let Some(pid) = cells.gap_pid {
+                reason["pid"] = serde_json::json!(pid);
+            }
+            serde_json::json!({"kind": "gap", "reason": reason})
+        }
+    };
+    let mut record = serde_json::json!({"cpuUs": cells.cpu_us?, "coverage": coverage});
+    if let Some(bytes) = cells.io_read_bytes {
+        record["ioReadBytes"] = serde_json::json!(bytes);
+    }
+    if let Some(bytes) = cells.io_write_bytes {
+        record["ioWriteBytes"] = serde_json::json!(bytes);
+    }
+    let reconciliation =
+        serde_json::from_value(record).expect("cells the wire's reconciliation accepts");
+    Some((source, reconciliation))
+}
+
+const UNATTRIBUTED_ROW: &str = "info job.unattributed";
+const END_ROW: &str = "span-ok cowshed.job";
+
+/// A positive missing attribution, a signed precision and window difference, and a comparison no
+/// source could make reach the span as three different rows, and each decodes to what it stated.
+#[tokio::test]
+async fn a_terminal_reconciliation_reaches_its_span_as_one_row_that_keeps_every_distinction() {
+    // The cgroup counted CPU and bytes no observed process did, and events were lost.
+    let missing = ended_job(
+        1,
+        Some(sampled(
+            1,
+            cgroup(reconciliation(
+                1_500_000,
+                Some((4096, 2048)),
+                gap(ProcessCoverageGap::EventsLost),
+            )),
+        )),
+    );
+    // The processes counted more than the totals over a complete tree: the sources' counters and
+    // sampling windows disagree, and no process was missed. A zero difference is a count.
+    let window = ended_job(
+        2,
+        Some(sampled(
+            2,
+            cgroup(reconciliation(
+                -1_250,
+                Some((0, -512)),
+                ProcessCoverage::Complete,
+            )),
+        )),
+    );
+    // The macOS source has no storage bytes to compare, and a member exited unread.
+    let unavailable = ended_job(
+        3,
+        Some(sampled(
+            3,
+            rusage(reconciliation(
+                0,
+                None,
+                gap(ProcessCoverageGap::UnreadFinalUsage { pid: 31 }),
+            )),
+        )),
+    );
+    let jobs = [missing, window, unavailable];
+    let telemetry = TempRoot::new("cowshed-job-unattributed");
+    let segments = sealed_ends(&telemetry, &jobs).await;
+
+    assert_eq!(
+        kinds(&segments),
+        [UNATTRIBUTED_ROW, END_ROW].repeat(3),
+        "each job states its unattributed usage once, before its end"
+    );
+    let cells = segments
+        .iter()
+        .map(|(_, batch)| unattributed_cells(batch))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        cells,
+        [
+            Unattributed {
+                cpu_us: Some(1_500_000),
+                io_read_bytes: Some(4096),
+                io_write_bytes: Some(2048),
+                source: Some("linuxCgroupV2".to_owned()),
+                coverage: Some("eventsLost".to_owned()),
+                gap_pid: None,
+            },
+            nothing_stated(),
+            Unattributed {
+                cpu_us: Some(-1_250),
+                io_read_bytes: Some(0),
+                io_write_bytes: Some(-512),
+                source: Some("linuxCgroupV2".to_owned()),
+                coverage: Some("complete".to_owned()),
+                gap_pid: None,
+            },
+            nothing_stated(),
+            Unattributed {
+                cpu_us: Some(0),
+                io_read_bytes: None,
+                io_write_bytes: None,
+                source: Some("macOsRusageChildren".to_owned()),
+                coverage: Some("unreadFinalUsage".to_owned()),
+                gap_pid: Some(31),
+            },
+            nothing_stated(),
+        ]
+    );
+    for (job, row) in jobs.iter().zip(cells.chunks(2)) {
+        assert_eq!(
+            restated(&row[0]),
+            Some(stated_by(job)),
+            "the row states the very reconciliation the job's terminal sample held"
+        );
+        assert_eq!(restated(&row[1]), None, "its end row states nothing");
+    }
+
+    // The unattributed-usage row states no host or volume fact; the end row states the sample's.
+    for row in segments.chunks(2) {
+        assert_eq!(Facts::of(&row[0].1), Facts::NONE);
+        assert_eq!(
+            Facts::of(&row[1].1),
+            Facts {
+                load1_milli: Some(4500),
+                cores: Some(16),
+                disk_ws_delta_bytes: Some(0),
+                disk_build_delta_bytes: None,
+            }
+        );
+    }
+
+    // The row is one row of the job's span: its address and identity, and no state of its own.
+    let thread = job_span_thread(
+        &running_job().repo_id,
+        &running_job().workspace_incarnation,
+        JobId::new(1).unwrap(),
+    );
+    let (_, row) = &segments[0];
+    assert_eq!(number_cell::<UInt64Type>(row, "thread_id", 0), Some(thread));
+    assert_eq!(number_cell::<UInt32Type>(row, "span_id", 0), Some(1));
+    assert_eq!(number_cell::<UInt32Type>(row, "parent_span_id", 0), None);
+    assert_eq!(text_cell(row, "repo_id", 0).as_deref(), Some("acme/widget"));
+    assert_eq!(number_cell::<UInt64Type>(row, "job_id", 0), Some(1));
+    assert_eq!(number_cell::<UInt64Type>(row, "grant_revision", 0), Some(3));
+    assert_eq!(text_cell(row, "job_state", 0), None);
+}
+
+/// Each way a tree can be found incomplete is its own value in the span, with the pid its
+/// evidence names where it names one.
+#[tokio::test]
+async fn every_coverage_gap_reaches_the_span_as_its_own_kind_with_its_evidence() {
+    let gaps = [
+        (ProcessCoverageGap::EventsLost, "eventsLost", None),
+        (
+            ProcessCoverageGap::UnobservedBirth { pid: 11 },
+            "unobservedBirth",
+            Some(11),
+        ),
+        (
+            ProcessCoverageGap::UnobservedExit { pid: 12 },
+            "unobservedExit",
+            Some(12),
+        ),
+        (
+            ProcessCoverageGap::UncountedFork { pid: 13 },
+            "uncountedFork",
+            Some(13),
+        ),
+        (
+            ProcessCoverageGap::UnreadImage { pid: 14 },
+            "unreadImage",
+            Some(14),
+        ),
+        (
+            ProcessCoverageGap::UnreadFinalUsage { pid: 15 },
+            "unreadFinalUsage",
+            Some(15),
+        ),
+    ];
+    let jobs = gaps
+        .iter()
+        .zip(1..)
+        .map(|((reason, _, _), job_id)| {
+            let accounting = rusage(reconciliation(0, None, gap(*reason)));
+            ended_job(job_id, Some(sampled(job_id, accounting)))
+        })
+        .collect::<Vec<_>>();
+    let telemetry = TempRoot::new("cowshed-job-unattributed-gaps");
+    let segments = sealed_ends(&telemetry, &jobs).await;
+
+    assert_eq!(
+        kinds(&segments),
+        [UNATTRIBUTED_ROW, END_ROW].repeat(gaps.len())
+    );
+    let stated = segments
+        .iter()
+        .step_by(2)
+        .map(|(_, batch)| unattributed_cells(batch))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        stated
+            .iter()
+            .map(|cells| (cells.coverage.clone(), cells.gap_pid))
+            .collect::<Vec<_>>(),
+        gaps.iter()
+            .map(|(_, kind, pid)| (Some((*kind).to_owned()), *pid))
+            .collect::<Vec<_>>()
+    );
+    for (job, cells) in jobs.iter().zip(&stated) {
+        assert_eq!(restated(cells), Some(stated_by(job)));
+    }
+}
+
+/// A difference keeps its sign and its whole magnitude, to the largest value every consumer holds
+/// exactly: nothing is clamped to zero, saturated or wrapped on the way into the span.
+#[tokio::test]
+async fn signed_differences_keep_their_sign_and_their_largest_exact_magnitude() {
+    let largest = i64::try_from(cowshed_core::api::MAX_EXACT_INTEGER).unwrap();
+    let observed = [
+        (1, Some((1, -1))),
+        (-1, Some((-1, 1))),
+        (largest, Some((largest, -largest))),
+        (-largest, Some((-largest, largest))),
+    ];
+    let jobs = observed
+        .iter()
+        .zip(1..)
+        .map(|(&(cpu_us, io), job_id)| {
+            let accounting = cgroup(reconciliation(cpu_us, io, ProcessCoverage::Complete));
+            ended_job(job_id, Some(sampled(job_id, accounting)))
+        })
+        .collect::<Vec<_>>();
+    let telemetry = TempRoot::new("cowshed-job-unattributed-signed");
+    let segments = sealed_ends(&telemetry, &jobs).await;
+
+    let stated = segments
+        .iter()
+        .step_by(2)
+        .map(|(_, batch)| unattributed_cells(batch))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        stated
+            .iter()
+            .map(|cells| (cells.cpu_us, cells.io_read_bytes, cells.io_write_bytes))
+            .collect::<Vec<_>>(),
+        observed
+            .iter()
+            .map(|&(cpu_us, io)| {
+                let (read, write) = io.unwrap();
+                (Some(cpu_us), Some(read), Some(write))
+            })
+            .collect::<Vec<_>>()
+    );
+    for (job, cells) in jobs.iter().zip(&stated) {
+        assert_eq!(restated(cells), Some(stated_by(job)));
+    }
+}
+
+/// A job with no terminal sample has nothing to compare, and a complete tree that agrees in every
+/// comparison its source could make has nothing to state: neither writes a row it did not mean.
+#[tokio::test]
+async fn a_job_with_nothing_unattributed_writes_only_its_end_row() {
+    let unsampled = ended_job(1, None);
+    let agreed = ended_job(
+        2,
+        Some(sampled(
+            2,
+            cgroup(reconciliation(0, Some((0, 0)), ProcessCoverage::Complete)),
+        )),
+    );
+    let telemetry = TempRoot::new("cowshed-job-unattributed-none");
+    let segments = sealed_ends(&telemetry, &[unsampled, agreed]).await;
+    assert_eq!(kinds(&segments), [END_ROW, END_ROW]);
+    for (name, batch) in &segments {
+        assert_eq!(unattributed_cells(batch), nothing_stated(), "{name}");
+    }
+}
+
+/// The row is the reconciliation and nothing more: whichever leaf the sample names, or why it
+/// names none, the span states the same differences, source and coverage, and carries no leaf of
+/// its own for a baseline to read.
+#[tokio::test]
+async fn the_row_states_the_reconciliation_whatever_leaf_the_sample_names() {
+    let accounting = rusage(reconciliation(
+        -40_000,
+        None,
+        gap(ProcessCoverageGap::UncountedFork { pid: 100 }),
+    ));
+    let leaves = [
+        JobLeafAttribution::Attributed {
+            leaf: cowshed_core::api::JobProcessLeaf {
+                pid: 100,
+                program: "/bin/sh".into(),
+                argv: vec!["/bin/sh".into()],
+            },
+            observed_cpu_permille: 950,
+        },
+        JobLeafAttribution::Unattributed {
+            observed_cpu_permille: 300,
+            required_permille: 900,
+        },
+        JobLeafAttribution::NoAccountedCpu,
+    ];
+    let jobs = leaves
+        .into_iter()
+        .zip(1..)
+        .map(|(leaf, job_id)| {
+            let sample = JobResourceSample {
+                leaf,
+                ..sampled(job_id, accounting)
+            };
+            ended_job(job_id, Some(sample))
+        })
+        .collect::<Vec<_>>();
+    let telemetry = TempRoot::new("cowshed-job-unattributed-leaf");
+    let segments = sealed_ends(&telemetry, &jobs).await;
+
+    assert_eq!(kinds(&segments), [UNATTRIBUTED_ROW, END_ROW].repeat(3));
+    let stated = segments
+        .iter()
+        .step_by(2)
+        .map(|(_, batch)| unattributed_cells(batch))
+        .collect::<Vec<_>>();
+    assert_eq!(stated[0], stated[1]);
+    assert_eq!(stated[1], stated[2]);
+    assert_eq!(restated(&stated[0]), Some(stated_by(&jobs[0])));
+}
+
+/// A row the writer cannot seal is counted, the unattributed-usage row among them: a refused gap
+/// is never silently dropped.
+#[tokio::test]
+async fn a_refused_unattributed_row_is_counted_beside_its_end_row() {
+    let root = TempRoot::new("cowshed-job-unattributed-refused");
+    let publisher = JobSpanPublisher::start(root.join("absent-telemetry"));
+    let job = ended_job(
+        1,
+        Some(sampled(
+            1,
+            rusage(reconciliation(
+                5,
+                None,
+                gap(ProcessCoverageGap::UncountedFork { pid: 100 }),
+            )),
+        )),
+    );
+    publisher.record(&job, JobSpanEdge::end(job.state, job.exit.as_ref()));
+    let health = publisher.health().await.expect("the writer answers");
+    assert_eq!((health.recorded, health.failed), (0, 2), "{health:?}");
+}
+
+/// The unattributed-usage row adds six fixed columns to the job span and nothing else: a gap
+/// column named for a process, a JSON string, a column named for a metric or a sample, a leaf
+/// nothing observed, a signed difference stored unsigned and a gap without the column its
+/// evidence needs all fail the exact-schema control.
+#[tokio::test]
+async fn a_gap_carried_outside_the_six_fixed_columns_fails_the_exact_schema_control() {
+    let job = ended_job(
+        1,
+        Some(sampled(
+            1,
+            rusage(reconciliation(
+                5,
+                None,
+                gap(ProcessCoverageGap::UncountedFork { pid: 100 }),
+            )),
+        )),
+    );
+    let telemetry = TempRoot::new("cowshed-job-unattributed-schema");
+    let segments = sealed_ends(&telemetry, &[job]).await;
+    assert_eq!(kinds(&segments), [UNATTRIBUTED_ROW, END_ROW]);
     for (name, batch) in &segments {
         exact_schema(&batch.schema(), &spec_job_columns())
             .unwrap_or_else(|error| panic!("{name}: {error}"));
     }
-    [0, 1].map(|edge| {
-        let batch = &segments[edge].1;
+
+    // Positive controls: the oracle rejects what it exists to reject.
+    let schema = segments[0].1.schema();
+    let with = |field: Field| {
+        let mut columns = schema.fields().iter().cloned().collect::<Vec<_>>();
+        columns.push(field.into());
+        Schema::new(columns)
+    };
+    for (extra, what) in [
+        (
+            Field::new("proc_unattributed_cpu_us", DataType::Int64, true),
+            "a process-specific gap column",
+        ),
+        (
+            Field::new("unattributed_json", DataType::Utf8, true),
+            "a JSON string column",
+        ),
+        (
+            Field::new("unattributed_cpu_us_pid_100", DataType::Int64, true),
+            "a column named for a process",
+        ),
+        (
+            Field::new("unattributed_leaf_pid", DataType::UInt32, true),
+            "a leaf the observed processes did not earn",
+        ),
+    ] {
+        assert!(
+            exact_schema(&with(extra), &spec_job_columns()).is_err(),
+            "{what}"
+        );
+    }
+    let mut unsigned = spec_job_columns();
+    unsigned
+        .iter_mut()
+        .find(|column| column.0 == "unattributed_cpu_us")
+        .expect("the signed difference's column")
+        .1 = "u64";
+    assert!(
+        exact_schema(&schema, &unsigned).is_err(),
+        "a signed difference stored unsigned"
+    );
+    let mut dropped = spec_job_columns();
+    dropped.retain(|column| column.0 != "unattributed_gap_pid");
+    assert!(
+        exact_schema(&schema, &dropped).is_err(),
+        "a gap whose evidence has no column"
+    );
+}
+
+const MIB: u64 = 1 << 20;
+
+/// Charged memory belongs only to the end row, including when an unattributed row precedes it.
+async fn charged_cells(label: &str, info: &JobInfo) -> [(Option<u64>, Option<u64>); 2] {
+    let telemetry = TempRoot::new(label);
+    let publisher = JobSpanPublisher::start(telemetry.to_path_buf());
+    publisher.record(info, JobSpanEdge::Start { host: None });
+    publisher.record(info, JobSpanEdge::end(info.state, info.exit.as_ref()));
+    let expected_rows = if info.resources.as_ref().is_some_and(|sample| {
+        matches!(sample.accounting.reconciliation().coverage, ProcessCoverage::Gap { .. })
+    }) {
+        3
+    } else {
+        2
+    };
+    let health = publisher.health().await.expect("the writer answers");
+    assert_eq!((health.recorded, health.failed), (expected_rows, 0), "{health:?}");
+    let segments = sealed_segments(&telemetry, "job-");
+    assert_eq!(segments.len(), usize::try_from(expected_rows).unwrap());
+    let cells = |batch: &RecordBatch| {
         (
             number_cell::<UInt64Type>(batch, "charged_memory_current_bytes", 0),
             number_cell::<UInt64Type>(batch, "charged_memory_peak_bytes", 0),
         )
-    })
+    };
+    for (index, (name, batch)) in segments.iter().enumerate() {
+        exact_schema(&batch.schema(), &spec_job_columns())
+            .unwrap_or_else(|error| panic!("{name}: {error}"));
+        if index + 1 < segments.len() {
+            assert_eq!(cells(batch), (None, None), "only the end row carries charged memory");
+        }
+    }
+    [cells(&segments[0].1), cells(&segments[segments.len() - 1].1)]
 }
 
-/// A page-cache-heavy job under a cgroup source states its charged memory on its end row and
-/// nowhere else. Its cgroup is charged 96 MiB now and 160 MiB at its peak while its processes
-/// hold 8 MiB resident now and 12 MiB at most: the two readings differ, so a cell that took a
-/// resident number would show. Both edges are sealed from the same sample, and the start row
-/// states none even so.
+/// Cgroup charges and process RSS are distinct, and checked bytes survive without conversion.
 #[tokio::test]
 async fn a_cgroup_source_s_charged_memory_is_the_end_row_s_alone() {
     let job = JobId::new(JOB).unwrap();
     let sample = terminal_sample(job, Some((96 * MIB, 160 * MIB)), 8 * MIB, 12 * MIB);
     assert_eq!(
-        charged_cells("cowshed-job-span-cgroup", &ended_job(Some(sample))).await,
+        charged_cells("cowshed-job-span-cgroup", &ended_job(JOB, Some(sample))).await,
         [(None, None), (Some(96 * MIB), Some(160 * MIB))]
     );
-    // Bytes, exactly: the largest value the checked unit holds survives whole.
     let sample = terminal_sample(job, Some((MAX_EXACT_INTEGER - 1, MAX_EXACT_INTEGER)), 0, 0);
     assert_eq!(
-        charged_cells("cowshed-job-span-largest", &ended_job(Some(sample))).await[1],
+        charged_cells("cowshed-job-span-largest", &ended_job(JOB, Some(sample))).await[1],
         (Some(MAX_EXACT_INTEGER - 1), Some(MAX_EXACT_INTEGER))
     );
 }
 
-/// A source with no charged-memory counter leaves both cells absent, never zero and never a
-/// resident number: a macOS rusage record, whose sample also counts 64 MiB resident, and a job
-/// that ended without a sample. The control is that same resident memory under a cgroup source,
-/// which states its pair.
+/// A macOS source or absent terminal sample leaves charged cells null, not zero or RSS.
 #[tokio::test]
 async fn a_source_without_a_charged_memory_counter_leaves_both_cells_absent() {
     let job = JobId::new(JOB).unwrap();
     let absent = [(None, None), (None, None)];
     let macos = terminal_sample(job, None, 64 * MIB, 96 * MIB);
     assert_eq!(
-        charged_cells("cowshed-job-span-macos", &ended_job(Some(macos))).await,
+        charged_cells("cowshed-job-span-macos", &ended_job(JOB, Some(macos))).await,
         absent,
         "a macOS rusage record"
     );
     assert_eq!(
-        charged_cells("cowshed-job-span-unsampled", &ended_job(None)).await,
+        charged_cells("cowshed-job-span-unsampled", &ended_job(JOB, None)).await,
         absent,
         "a job that ended without a sample"
     );
     let cgroup = terminal_sample(job, Some((96 * MIB, 160 * MIB)), 64 * MIB, 96 * MIB);
     assert_eq!(
-        charged_cells("cowshed-job-span-control", &ended_job(Some(cgroup))).await,
+        charged_cells("cowshed-job-span-control", &ended_job(JOB, Some(cgroup))).await,
         [(None, None), (Some(96 * MIB), Some(160 * MIB))],
         "the same resident memory under a cgroup source"
     );
