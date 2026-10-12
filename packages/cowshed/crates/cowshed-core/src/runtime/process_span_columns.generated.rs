@@ -33,7 +33,7 @@ fn encode_process_columns(columns: &Sparse) -> Result<Vec<ArrayRef>, TraceSegmen
     Ok(vec![
         uint32(columns.proc_pid).1,
         category(columns.proc_program.as_deref())?.1,
-        text(columns.proc_argv.as_deref())?.1,
+        text(columns.proc_argv.as_deref()).1,
         uint64(columns.cpu_user_us).1,
         uint64(columns.cpu_sys_us).1,
         uint64(columns.rss_bytes).1,
@@ -60,8 +60,8 @@ fn decode_process_columns(batch: &RecordBatch, start: usize) -> Result<Sparse, P
         io_read_bytes: optional_u64(batch, start, "io_read_bytes")?,
         io_write_bytes: optional_u64(batch, start, "io_write_bytes")?,
         exit_code: optional_i32(batch, start, "exit_code")?,
-        exit_signal: optional_dict(batch, start, "exit_signal")?,
-        blocked_on: optional_dict(batch, start, "blocked_on")?,
+        exit_signal: optional_key(batch, start, "exit_signal")?,
+        blocked_on: optional_key(batch, start, "blocked_on")?,
         blocked_path: optional_dict(batch, start, "blocked_path")?,
         blocked_holder_pid: optional_u32(batch, start, "blocked_holder_pid")?,
     })
