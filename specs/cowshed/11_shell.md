@@ -406,13 +406,8 @@ row. Its admission keys are not inferred absent either: while the set-aside stor
 incarnation, a key the new store lacks is typed `Unprovable` and a keyed exec under it is refused, never run a second
 time.
 
-Numeric sealed lookup uses one records-lock snapshot shared with appends and checkpoints. Unchanged validated
-inode/length skips record and sealed-stream hashes; changed records validate authority and only newly learned terminal
-spill files. Known current-incarnation admissions and supervisor-held unsealed jobs prove no terminal row without an
-unread-history refusal. A readable sealed row still answers. A missing id above a valid `records.job-floor` is proven
-absent from the unread store; at or below it, or with unread history but no trustworthy floor, lookup returns the typed
-`Unprovable` of 07_api.md "Captured-content authority". The opening-incarnation marker never attests to every retained
-lineage row. Read/recovery failures remain errors, and sealed monitoring, logs and tails preserve their full cause.
+Numeric sealed lookup follows [07_api.md, “Captured-content authority”](07_api.md#captured-content-authority).
+
 Checkpoint manifests derive from the same authoritative snapshot, not from which rows earlier readers happened to ask
 about. A controller-minted immutable `workspaceIncarnation` disambiguates histories copied by fork/checkpoint/restore.
 Each create, fork destination, and restore result receives a fresh incarnation; inherited records retain the incarnation

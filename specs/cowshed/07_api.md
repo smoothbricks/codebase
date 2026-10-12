@@ -635,9 +635,10 @@ remain a separate bounded diagnostic projection.
 
 Authorization, grant, and gateway audit authority remain controller-owned.
 
-The invariant is the same one that keeps grant files outside the volume (01_storage.md, 04): a capability reachable from
-inside a sandbox must not authorize escalation. `WorkspaceHandle` is that principle expressed in the type system — a
-subagent holding one cannot grant itself anything.
+The invariant is the same one that keeps grant files outside the volume
+([01_storage.md, “Grant files live outside the volume”](01_storage.md#grant-files-live-outside-the-volume)): a
+capability reachable from inside a sandbox must not authorize escalation. `WorkspaceHandle` is that principle expressed
+in the type system — a subagent holding one cannot grant itself anything.
 
 ### Captured-content authority
 
