@@ -13949,6 +13949,18 @@ mod pre_cowshed_tests {
 mod removal_refusal_tests {
     use super::*;
 
+    #[test]
+    fn land_retirement_reports_linked_nx_holders_without_claiming_their_unmount() {
+        assert_eq!(
+            CheckoutNxCheck::Held.busy_action(),
+            "this holder inspection stops no process"
+        );
+        assert_eq!(
+            CheckoutNxCheck::CloseRecorded.busy_action(),
+            "its unmount waits, then forces"
+        );
+    }
+
     fn workspace() -> WorkspaceName {
         WorkspaceName::new("raven").expect("fixed workspace name")
     }
