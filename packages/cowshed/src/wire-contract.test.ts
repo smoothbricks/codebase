@@ -331,6 +331,23 @@ describe('job accounting', () => {
 });
 
 describe('process events', () => {
+  it('preserves a coverage gap without inventing a process index', () => {
+    for (const reason of [
+      { kind: 'eventsLost' },
+      { kind: 'unobservedBirth', pid: 7 },
+      { kind: 'unobservedExit', pid: 7 },
+      { kind: 'uncountedFork', pid: 7 },
+      { kind: 'unreadImage', pid: 7 },
+      { kind: 'unreadFinalUsage', pid: 7 },
+    ]) {
+      const event = { kind: 'gap', reason };
+      expect<unknown>(validators.assertJobProcessEvent(event)).toEqual(event);
+      expect<unknown>(validators.parseJobProcessEvent(JSON.stringify(event))).toEqual(event);
+      expect(() => validators.assertJobProcessEvent({ ...event, index: 0 })).toThrow();
+    }
+    expect(() => validators.assertJobProcessEvent({ kind: 'gap' })).toThrow();
+  });
+
   it('refuses a process change that changes nothing', () => {
     // Rust cannot build a change of nothing; the generated validator must not admit one either,
     // or a TypeScript consumer accepts an event no supervisor can emit.
