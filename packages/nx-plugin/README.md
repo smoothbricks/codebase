@@ -208,9 +208,17 @@ joins an existing flight. With no subscribers, inference neither allocates nor p
 use this readiness signal and Cargo control-channel events to prove concurrency and child teardown without sleep-based
 timing assumptions; their outer hang guards report still-open test spans and process/gate state.
 
-Keep workspace-owned runtime state outside Nx's source index. In a cowshed workspace, the root `.nxignore` must include
-`.cowshed/`: Nx's watcher reads the root ignore files, not Git's `.git/info/exclude`. Watching the daemon's own log,
-plugin sockets or job records turns each graph computation into another file event and another graph computation.
+Keep workspace-owned runtime state outside Nx's source index. The root `.nxignore` ignores every dot path with `.*` and
+re-includes each tracked dot input by its dot-named prefix, such as `!/.github` or `!/packages/lmao/.cargo`: a dot-named
+directory must be re-included to reach its tracked children. Nx's watcher reads only the root `.gitignore` and
+`.nxignore`, not nested ignore files or Git's `.git/info/exclude`. `tooling:lint-dot-inputs` is an additive lint
+dependency, keyed on the tracked file inventory as well as ignore-file contents. It fails when a tracked dot path lacks
+its `!/` line or Nx's ignore checker excludes it, so a newly tracked dot input cannot silently disappear into `.*`.
+`nx-dot-input-policy.test.ts` guards native index and file-hash parity for existing tracked inputs, unchanged project
+graphs across the policy cutover, and actual daemon graph-pass silence for `.icm*` stores and hidden Bun staging. The
+`.nxignore` file itself intentionally has new bytes. A tracked dot edit still reaches the daemon's watcher and graph
+recomputation. Watching daemon logs, plugin sockets or job records instead turns each graph computation into another
+file event and another graph computation.
 
 ### Runtime inputs
 

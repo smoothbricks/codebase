@@ -55,6 +55,34 @@
           "timeoutMs": 600000,
           "killAfterMs": 10000
         }
+      },
+      "lint-dot-inputs": {
+        "executor": "nx:run-commands",
+        "cache": true,
+        "inputs": [
+          "default",
+          "{workspaceRoot}/.nxignore",
+          "{workspaceRoot}/**/.gitignore",
+          {
+            "externalDependencies": [
+              "nx"
+            ]
+          },
+          {
+            "runtime": "GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh git -c core.excludesFile=/dev/null ls-files -z"
+          }
+        ],
+        "outputs": [],
+        "options": {
+          "command": "bun tooling/lint-dot-inputs.ts",
+          "cwd": "{workspaceRoot}"
+        }
+      },
+      "lint": {
+        "dependsOn": [
+          "...",
+          "lint-dot-inputs"
+        ]
       }
     }
   },
