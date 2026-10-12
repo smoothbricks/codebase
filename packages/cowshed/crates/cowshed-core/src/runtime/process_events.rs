@@ -330,6 +330,38 @@ impl<P: ProcessReads> KqueueObserver<P> {
         self.events.drain(..)
     }
 
+    /// Drain the same events with the identities retained at their stable tree indices.
+    /// Trace parentage never rejoins these events to a currently running PID.
+    pub(crate) fn drain_retained_events(
+        &mut self,
+    ) -> impl Iterator<
+        Item = (
+            JobProcessEvent,
+            Option<ProcessIdentity>,
+            Option<ProcessIdentity>,
+        ),
+    > {
+        let lives = self.fold.lives();
+        self.events.drain(..).map(move |event| {
+            let index = match &event {
+                JobProcessEvent::Born { index, .. }
+                | JobProcessEvent::Exec { index, .. }
+                | JobProcessEvent::Heartbeat { index, .. }
+                | JobProcessEvent::Exited { index, .. } => Some(*index),
+                JobProcessEvent::Changed(delta) => Some(delta.index()),
+                JobProcessEvent::Gap { .. } => None,
+            };
+            let node = index
+                .and_then(|index| usize::try_from(index).ok())
+                .and_then(|index| lives.node_at(index));
+            (
+                event,
+                node.map(|node| node.identity),
+                node.and_then(|node| node.parent),
+            )
+        })
+    }
+
     pub fn has_events(&self) -> bool {
         !self.events.is_empty()
     }

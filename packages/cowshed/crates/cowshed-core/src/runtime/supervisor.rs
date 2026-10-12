@@ -1673,9 +1673,12 @@ impl SpawnSink for SystemSpawnSink {
         // Through `std`: this process alone reaps the child, inside its fence ([`ChildFence`]).
         #[cfg(target_os = "macos")]
         let mut child = {
-            let (gate, held) = super::process_fence::leader_gate()
-                .map_err(ExecError::from)
-                .map_err(map_exec_error)?;
+            let (gate, held) = super::process_fence::leader_gate().map_err(|error| {
+                CowshedError::environment_missing(
+                    format!("cannot prepare the process observation fence: {error}"),
+                    "inspect descriptor availability before retrying the command",
+                )
+            })?;
             let (ready, go) = (
                 std::os::fd::AsRawFd::as_raw_fd(&held.ready),
                 std::os::fd::AsRawFd::as_raw_fd(&held.go),
@@ -4345,6 +4348,14 @@ impl SupervisorActor {
                 #[cfg(target_os = "macos")]
                 {
                     job.monitor = process.observations().cloned();
+                    if let (Some(monitor), Some(publisher)) = (&job.monitor, &self.job_spans)
+                        && let Err(error) = monitor.trace(publisher.clone(), &job.info)
+                    {
+                        eprintln!(
+                            "cowshed: attaching job {}'s process spans: {error}",
+                            job_id.get()
+                        );
+                    }
                 }
                 if let Some(owned) = process.process() {
                     // A one-shot command is the job's first process.

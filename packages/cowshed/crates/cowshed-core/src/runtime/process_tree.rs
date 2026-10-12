@@ -146,6 +146,17 @@ struct Life {
 }
 
 impl Life {
+    fn node(&self, parent: Option<ProcessIdentity>) -> ProcessNode<'_> {
+        ProcessNode {
+            identity: self.identity,
+            parent,
+            ppid: self.ppid,
+            image: &self.image,
+            born_at: &self.born_at,
+            exit: self.exit.as_ref(),
+        }
+    }
+
     fn sample(
         &self,
         usage: Option<ProcessUsage>,
@@ -253,14 +264,16 @@ impl ProcessTreeFold {
 
     /// The retained lives, in birth-observation order.
     pub fn nodes(&self) -> impl Iterator<Item = ProcessNode<'_>> {
-        self.lives.iter().map(|life| ProcessNode {
-            identity: life.identity,
-            parent: life.parent.map(|index| self.lives[index].identity),
-            ppid: life.ppid,
-            image: &life.image,
-            born_at: &life.born_at,
-            exit: life.exit.as_ref(),
-        })
+        self.lives
+            .iter()
+            .map(|life| life.node(life.parent.map(|index| self.lives[index].identity)))
+    }
+
+    /// One retained life by the index carried by its event, without a PID lookup or scan.
+    pub fn node_at(&self, index: usize) -> Option<ProcessNode<'_>> {
+        self.lives
+            .get(index)
+            .map(|life| life.node(life.parent.map(|parent| self.lives[parent].identity)))
     }
 
     /// The image `process` runs now, as last observed.

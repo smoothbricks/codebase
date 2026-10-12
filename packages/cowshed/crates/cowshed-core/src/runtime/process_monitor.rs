@@ -9,14 +9,17 @@ use std::io;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::{Arc, mpsc};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use arc_swap::ArcSwap;
 use tokio::sync::oneshot;
 
+use super::job_spans::{JobSpanPublisher, job_span_thread};
 use super::process_events::{KqueueObserver, ObserveError};
+use super::process_spans::{ProcessSpanProjection, RetainedProcessEvent};
+use super::process_tree::ProcessIdentity;
 use super::supervisor::utc_now;
-use crate::api::dto::JobId;
+use crate::api::dto::{JobId, JobInfo};
 use crate::api::process::{JobProcessEvent, JobProcessTree, ProcessCoverageGap};
 use crate::error::{CowshedError, Result};
 
@@ -37,6 +40,7 @@ enum Request {
     Finish {
         reply: mpsc::SyncSender<Result<()>>,
     },
+    Trace(Box<TraceWriter>),
     Open {
         every: Duration,
         reply: oneshot::Sender<Result<u64>>,
@@ -55,6 +59,33 @@ enum Request {
 struct Subscriber {
     every: Duration,
     pending: Option<(usize, EventReply)>,
+}
+
+struct RetainedEntry {
+    event: Result<JobProcessEvent>,
+    identity: Option<ProcessIdentity>,
+    parent: Option<ProcessIdentity>,
+    at: SystemTime,
+}
+
+struct TraceWriter {
+    publisher: JobSpanPublisher,
+    projection: ProcessSpanProjection,
+}
+
+impl TraceWriter {
+    fn record(&mut self, entry: &RetainedEntry) {
+        if let Ok(event) = &entry.event {
+            self.publisher.record_process(self.projection.project(
+                RetainedProcessEvent {
+                    event,
+                    identity: entry.identity,
+                    parent: entry.parent,
+                },
+                entry.at,
+            ));
+        }
+    }
 }
 
 struct Driver {
@@ -174,6 +205,18 @@ impl ProcessMonitor {
         self.driver.acknowledged(|reply| Request::Finish { reply })
     }
 
+    /// Attach the existing supervisor writer. The source replays its retained events,
+    /// with their original identities and times, before projecting any future event.
+    pub(crate) fn trace(&self, publisher: JobSpanPublisher, info: &JobInfo) -> Result<()> {
+        self.driver.send(Request::Trace(Box::new(TraceWriter {
+            publisher,
+            projection: ProcessSpanProjection::new(
+                info.trace.trace_id.as_str(),
+                job_span_thread(&info.repo_id, &info.workspace_incarnation, info.job_id),
+            ),
+        })))
+    }
+
     /// One publication load. A read neither touches the writer's fold nor samples the kernel.
     pub fn tree(&self) -> Result<JobProcessTree> {
         self.driver.snapshot.load().as_ref().clone()
@@ -278,11 +321,12 @@ impl Drop for NativeSubscription {
 struct Writer {
     observer: KqueueObserver,
     snapshot: Arc<ArcSwap<Result<JobProcessTree>>>,
-    journal: Vec<Result<JobProcessEvent>>,
+    journal: Vec<RetainedEntry>,
     subscribers: HashMap<u64, Subscriber>,
     next_id: u64,
     next_sample: Instant,
     ended: bool,
+    trace: Option<Box<TraceWriter>>,
 }
 
 impl Writer {
@@ -295,17 +339,37 @@ impl Writer {
             next_id: 1,
             next_sample: Instant::now() + DEFAULT_SAMPLE,
             ended: false,
+            trace: None,
         }
     }
 
     fn publish(&mut self, outcome: Result<()>) {
-        self.journal.extend(self.observer.drain_events().map(Ok));
+        let at = SystemTime::now();
+        let first = self.journal.len();
+        for (event, identity, parent) in self.observer.drain_retained_events() {
+            self.journal.push(RetainedEntry {
+                event: Ok(event),
+                identity,
+                parent,
+                at,
+            });
+        }
+        if let Some(trace) = &mut self.trace {
+            for entry in &self.journal[first..] {
+                trace.record(entry);
+            }
+        }
         let tree = match outcome {
             Ok(()) => utc_now().map(|at| self.observer.tree(at)),
             Err(error) => Err(error),
         };
         if let Err(error) = &tree {
-            self.journal.push(Err(error.clone()));
+            self.journal.push(RetainedEntry {
+                event: Err(error.clone()),
+                identity: None,
+                parent: None,
+                at,
+            });
         }
         self.snapshot.store(Arc::new(tree));
         for subscriber in self.subscribers.values_mut() {
@@ -316,7 +380,7 @@ impl Writer {
                     .pending
                     .take()
                     .expect("a pending demand was checked");
-                let _ = reply.send(self.journal.get(cursor).cloned());
+                let _ = reply.send(self.journal.get(cursor).map(|entry| entry.event.clone()));
             }
         }
     }
@@ -351,6 +415,12 @@ impl Writer {
                         self.publish(result.clone());
                         let _ = reply.send(result);
                     }
+                    Request::Trace(mut trace) => {
+                        for entry in &self.journal {
+                            trace.record(entry);
+                        }
+                        self.trace = Some(trace);
+                    }
                     Request::Open { every, reply } => match self.next_id.checked_add(1) {
                         Some(next) => {
                             let id = self.next_id;
@@ -372,7 +442,8 @@ impl Writer {
                     },
                     Request::Next { id, cursor, reply } => {
                         if cursor < self.journal.len() || self.ended {
-                            let _ = reply.send(self.journal.get(cursor).cloned());
+                            let _ = reply
+                                .send(self.journal.get(cursor).map(|entry| entry.event.clone()));
                         } else if let Some(subscriber) = self.subscribers.get_mut(&id) {
                             subscriber.pending = Some((cursor, reply));
                         } else {

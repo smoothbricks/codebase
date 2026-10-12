@@ -50,13 +50,13 @@ pub const REQUEST_APPROVE: u8 = 1;
 /// Evaluate `.envrc` once: `[directory]`, descriptors `[stderr]`.
 pub const REQUEST_ACTIVATE: u8 = 2;
 /// Fork an argv into a new process group: `[argv, cwd, overlay]`, descriptors
-/// `[stdin, stdout, stderr]`.
+/// `[stdin, stdout, stderr]`, followed on macOS by `[observation_ready, observation_go]`.
 pub const REQUEST_RUN: u8 = 3;
 /// Run a rendered script: `[text, bindings, cwd, overlay]`, descriptors `[stdin, stdout,
-/// stderr]`. The host parses the text before anything runs, then forks: the child leads a new
-/// process group, builds a brush shell from the already-activated environment and runs the
-/// program there, so every process the script starts is in the job's group and the child's own
-/// wait status is the job's.
+/// stderr]`, followed on macOS by `[observation_ready, observation_go]`. The host parses before
+/// it forks. The new group leader waits at the macOS fence until the supervisor registers its
+/// native observer, then builds a brush shell from the activated environment and runs the
+/// program. Every script process is in the job's group; the child's own wait status is the job's.
 pub const REQUEST_SCRIPT: u8 = 4;
 /// Signal the held command's group: `[signal]`. Sent between `REPLY_STARTED` and
 /// `REQUEST_RELEASE`. The host is the command's parent and holds the leader unreaped until the
