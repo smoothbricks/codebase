@@ -150,12 +150,14 @@ current/peak; charged memory includes cache/kernel charges and is never written 
 leader's own/children rusage reconciliation source. The declared source and named checked unit types are part of the
 typed accounting record (07_api.md), not a JSON string.
 
-A nonzero final difference between attributed process rows and the independent job total, or final `Gap` coverage, emits
-one terminal `job.unattributed` row per job before its job span ends. Its fixed columns are `unattributed_cpu_us`,
-optional `unattributed_io_read_bytes` and `unattributed_io_write_bytes`, in signed checked units; `source` and
-`coverage` are fixed enums, never dynamically named columns. Unavailable I/O is null, not zero. Event loss, unavailable
-evidence and counter-window/precision disagreement are explicit. Charged-memory fields
-`charged_memory_current_bytes`/`charged_memory_peak_bytes` stay on the job span. None of these fields grows the
+A discrepancy between attributed process rows and the independent job total emits one `job.unattributed` row with
+`unattributed_cpu_us`, optional `unattributed_io_read_bytes` and `unattributed_io_write_bytes`, in signed checked units;
+source/coverage is a fixed row kind or enum, not a dynamically named column. Event loss, unavailable evidence and
+counter-window/precision disagreement are explicit. Charged-memory fields
+`charged_memory_current_bytes`/`charged_memory_peak_bytes` stay on the job span, never on a process span: its end row
+states them as nullable `u64` byte columns from the terminal sample's accounting, the cgroup source's checked
+`memory.current`/`memory.peak` pair unconverted. A source with no charged-memory counter (macOS) and a job with no
+terminal sample leave both null, never zero and never an RSS column's value. None of these fields grows the
 fourteen-column process schema or duplicates process-tree JSON.
 
 The process event-source RED compares expected birth/exec/exit records for bursts of short-lived grandchildren entirely

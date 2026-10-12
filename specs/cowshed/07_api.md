@@ -1086,15 +1086,15 @@ This is accounting separation, not an adversarial sandbox boundary. A workload r
 open a writable sibling `cgroup.procs` and migrate itself.
 
 Charged-memory current/peak is separate from `rssBytes`/`rssPeakBytes`: cgroup memory includes anonymous memory,
-file/page cache and kernel charges. It is never relabeled as RSS. Named resource types above have private fields,
-checked constructors and checked unit conversions, while their generated wire projection preserves the numeric
-representation. Non-finite load/share, invalid core counts and numeric overflow are typed errors, never casts or
-truncation. The accounting union identifies each total's source; a source that cannot report storage bytes leaves that
-optional observation unavailable, never converts block-operation counts or inserts zero. Lifetime CPU share uses the
-accounting source's cumulative user+system microseconds divided by `wallUs`; `cpuPct` remains the latest sampler-window
-share and is not that lifetime statistic. A zero-duration observation does not manufacture a ratio or enter a usage
-baseline. The cgroup's peak counter is read without resetting it, and missing controllers/counters are typed operational
-errors, not zero totals.
+file/page cache and kernel charges. It is never relabeled as RSS, and the job span's end row states it in columns of its
+own (13_telemetry.md). Named resource types above have private fields, checked constructors and checked unit
+conversions, while their generated wire projection preserves the numeric representation. Non-finite load/share, invalid
+core counts and numeric overflow are typed errors, never casts or truncation. The accounting union identifies each
+total's source; a source that cannot report storage bytes leaves that optional observation unavailable, never converts
+block-operation counts or inserts zero. Lifetime CPU share uses the accounting source's cumulative user+system
+microseconds divided by `wallUs`; `cpuPct` remains the latest sampler-window share and is not that lifetime statistic. A
+zero-duration observation does not manufacture a ratio or enter a usage baseline. The cgroup's peak counter is read
+without resetting it, and missing controllers/counters are typed operational errors, not zero totals.
 
 The delegated Linux accounting fixture keeps a root setup/cleanup parent in its non-job controller leaf and runs all
 accounting workloads as the ordinary runner. Cgroup delegation grants cgroupfs authority, not mount authority; role

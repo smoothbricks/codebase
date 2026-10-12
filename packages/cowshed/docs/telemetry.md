@@ -31,9 +31,10 @@ workspace/build-volume deltas stay on the job span. There are no JSON string col
 or sample. Missing blocker evidence is not a claim that a process is unblocked.
 
 Job totals have an independent source: Linux uses each job's cgroup v2 CPU, charged-memory and storage-I/O counters;
-macOS uses the leader's own/children rusage reconciliation. Charged memory is not RSS. Missed process events do not
-erase those totals: an explicit unattributed CPU/I/O row and typed coverage gap say what remains unattributed. An
-unknown leaf is never guessed for a command baseline.
+macOS uses the leader's own/children rusage reconciliation. Charged memory is not RSS: the job span's end row carries it
+in its own `charged_memory_current_bytes` and `charged_memory_peak_bytes` columns, null for macOS, and no process span
+has either. Missed process events do not erase those totals: an explicit unattributed CPU/I/O row and typed coverage gap
+say what remains unattributed. An unknown leaf is never guessed for a command baseline.
 
 Linux pidfd/proc polling does not capture every short-lived fork/exec. A measured implementation compares proc connector
 through the privileged helper and ptrace event tracing on the same fork-heavy workload before selecting the event
