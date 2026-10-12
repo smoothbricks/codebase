@@ -1252,6 +1252,83 @@ describe('what shell entry keeps linked', () => {
         },
       );
     });
+
+    it('removes an undeclared managed link at the next install and preserves a manual retarget', async () => {
+      await withManagedRepository(
+        { ...WORKSPACE, developerLinks: { '@fixture/lib': '../local-lib', util: '../declared-util' } },
+        async ({ root, enterShell: enter }) => {
+          await checkout(join(dirname(root), 'local-lib'), '@fixture/lib');
+          await checkout(join(dirname(root), 'declared-util'), 'util');
+          expect((await enter()).exitCode).toBe(0);
+          const mine = await checkout(join(dirname(root), 'my-util'), 'util');
+          await rm(join(root, UNLINKED));
+          symlinkSync(mine, join(root, UNLINKED));
+          const manifestPath = join(root, 'package.json');
+          const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
+          delete manifest.smoo.developerLinks;
+          await writeFile(manifestPath, JSON.stringify(manifest));
+
+          const entered = await enter();
+          expect(entered.exitCode).toBe(0);
+          expect(entered.stderr).toContain(
+            `! removed developer link ${LINKED}: smoo.developerLinks no longer declares its package`,
+          );
+          expect(readlinkSync(join(root, LINKED))).toBe('../../../lib');
+          expect(readlinkSync(join(root, UNLINKED))).toBe(mine);
+          expect(JSON.parse(readFileSync(join(root, 'node_modules', '.smoo-declared-links'), 'utf8'))).toEqual([]);
+        },
+      );
+    });
+
+    it('keeps an undeclared unrecorded manual link even when it matched the old declaration', async () => {
+      await withManagedRepository(
+        { ...WORKSPACE, developerLinks: { '@fixture/lib': '../local-lib' } },
+        async ({ root, enterShell: enter }) => {
+          expect((await enter()).exitCode).toBe(0);
+          const local = await checkout(join(dirname(root), 'local-lib'), '@fixture/lib');
+          await rm(join(root, LINKED));
+          symlinkSync(local, join(root, LINKED));
+          expect((await enter({ links: true })).exitCode).toBe(0);
+          const manifestPath = join(root, 'package.json');
+          const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
+          delete manifest.smoo.developerLinks;
+          await writeFile(manifestPath, JSON.stringify(manifest));
+
+          expect((await enter()).exitCode).toBe(0);
+          expect(readlinkSync(join(root, LINKED))).toBe(local);
+        },
+      );
+    });
+
+    it('restores an undeclared managed link and its receipt when the install fails', async () => {
+      await withManagedRepository(
+        { ...WORKSPACE, developerLinks: { '@fixture/lib': '../local-lib' } },
+        async ({ root, enterShell: enter }) => {
+          const local = await checkout(join(dirname(root), 'local-lib'), '@fixture/lib');
+          expect((await enter()).exitCode).toBe(0);
+          const receiptPath = join(root, 'node_modules', '.smoo-declared-links');
+          const receipt = readFileSync(receiptPath, 'utf8');
+          const manifestPath = join(root, 'package.json');
+          const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
+          delete manifest.smoo.developerLinks;
+          await writeFile(manifestPath, JSON.stringify(manifest));
+          await expect(
+            keepDeveloperLinks(root, async () => {
+              await Bun.$`bun install --no-summary`.cwd(root).quiet();
+              throw new Error('fixture undeclared install failed');
+            }),
+          ).rejects.toThrow('fixture undeclared install failed');
+          expect(readlinkSync(join(root, LINKED))).toBe(local);
+          expect(readFileSync(receiptPath, 'utf8')).toBe(receipt);
+
+          const next = await checkout(join(dirname(root), 'next-lib'), '@fixture/lib');
+          manifest.smoo.developerLinks = { '@fixture/lib': '../next-lib' };
+          await writeFile(manifestPath, JSON.stringify(manifest));
+          expect((await enter({ links: true })).exitCode).toBe(0);
+          expect(readlinkSync(join(root, LINKED))).toBe(next);
+        },
+      );
+    });
   });
 
   describe('across an install meant to replace some of them', () => {
