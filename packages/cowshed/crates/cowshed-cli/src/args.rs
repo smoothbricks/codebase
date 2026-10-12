@@ -1,8 +1,8 @@
 use clap::error::{ContextKind, ContextValue, ErrorKind};
 use clap::{Arg, ArgAction, ArgMatches, Command as ClapCommand, value_parser};
 use cowshed_apfs::DiskTool;
-use cowshed_core::api::{ExecScope, JobserverClass};
-use cowshed_core::metadata::{EgressMode, MetadataError, WorkspaceName};
+use cowshed_core::api::{ExecScope, GrantDelta, JobserverClass};
+use cowshed_core::metadata::{EgressMode, EgressRule, MetadataError, WorkspaceName};
 use cowshed_core::repository::RepoId;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
@@ -28,6 +28,7 @@ pub static COMMANDS: &[&CommandSpec] = &[
     &BUILD_STATE,
     &EXEC,
     &GRANT,
+    &REVOKE,
     &REMOVE,
     &ATTACH,
     &DETACH,
@@ -79,6 +80,7 @@ pub enum Command {
     BuildState,
     Exec(ExecArgs),
     Grant(GrantArgs),
+    Revoke(RevokeArgs),
     Remove(RemoveArgs),
     Attach(AttachArgs),
     Detach(DetachArgs),
@@ -130,6 +132,7 @@ impl Command {
             | Self::BuildState
             | Self::Exec(_)
             | Self::Grant(_)
+            | Self::Revoke(_)
             | Self::Remove(_)
             | Self::Attach(_)
             | Self::Resize(_)
@@ -397,6 +400,18 @@ pub struct GrantArgs {
     /// `--ports N`: the minimum number of service ports this workspace's port block must hold,
     /// excluding the gateway listener. Zero is not a request, so it is unrepresentable here.
     pub service_ports: Option<NonZeroU16>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RevokeArgs {
+    pub target: GrantTarget,
+    pub selection: RevokeSelection,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RevokeSelection {
+    Items(GrantDelta),
+    All,
 }
 
 /// `rm <ws>` — retire one workspace.
@@ -806,6 +821,19 @@ fn cli_command() -> ClapCommand {
                 .arg(flag("opaque"))
                 .arg(value("ports")),
         )
+        .subcommand(
+            leaf("revoke")
+                .arg(positional("workspace", 0..=1))
+                .arg(flag("project-wide"))
+                .args([
+                    path_values("read"),
+                    path_values("write"),
+                    path_values("deny-write"),
+                    path_values("deny"),
+                ])
+                .arg(append_value("egress"))
+                .arg(flag("all")),
+        )
         .subcommand(leaf("rm").arg(positional("workspace", 0..=1)).args([
             flag("force"),
             flag("restore"),
@@ -1006,6 +1034,7 @@ fn cli_from_matches(matches: ArgMatches) -> Result<Cli, UsageError> {
         "build-state" => Command::BuildState,
         "exec" => parse_exec(leaf)?,
         "grant" => parse_grant(leaf)?,
+        "revoke" => parse_revoke(leaf)?,
         "rm" => parse_remove(leaf)?,
         "attach" => parse_attach(leaf)?,
         "detach" => parse_detach(leaf)?,
@@ -2394,7 +2423,7 @@ const GRANT: CommandSpec = CommandSpec {
         },
         Opt {
             spelling: "--egress <host>",
-            meaning: "allow this workspace to reach one host through the gateway; repeat the flag to add more",
+            meaning: "allow a bare DNS name, IP address or single-label *. wildcard; no :port or URL; repeat to add more",
         },
         Opt {
             spelling: "--opaque",
@@ -2438,7 +2467,18 @@ fn parse_grant(matches: &ArgMatches) -> Result<Command, UsageError> {
             USAGE.missing,
         )?)
     };
-    let egress = appended_values(matches, "egress", USAGE)?;
+    let mut egress = appended_values(matches, "egress", USAGE)?;
+    for host in &mut egress {
+        let canonical = cowshed_gateway::HostPattern::parse(host).map_err(|error| {
+            UsageError::new(
+                format!(
+                    "invalid egress host `{host}`: {error}; use a bare host without a port or URL scheme"
+                ),
+                USAGE,
+            )
+        })?;
+        *host = canonical.to_string();
+    }
     let egress_mode = if flagged(matches, "opaque") {
         if egress.is_empty() {
             return Err(UsageError::new(
@@ -2505,9 +2545,106 @@ fn parse_service_ports(
     })
 }
 
-/// Usage text is where the destructive flags are documented: a human reads options here
-/// deliberately, whereas a refusal message is what an agent pattern-matches into a retry — which
-/// is why no refusal names the flag that would override it.
+const REVOKE: CommandSpec = CommandSpec {
+    name: "revoke",
+    missing: "revoke requires a workspace",
+    args: "<ws>",
+    trailing: "",
+    summary: "remove paths and network access",
+    about: &[
+        "Removes the selected workspace's own grants; --project-wide selects standing project grants instead. Requires selectors or --all, never both. Absent selectors are no-ops. Port ownership never shrinks, and project checkpoint quotas are unchanged.",
+        "--egress removes every rule for the host regardless of mode or ports. Invalid recorded keys are accepted verbatim for repair: cowshed revoke raven --egress api.example.com:443, then grant the bare api.example.com if reach is still wanted. No gateway reconciliation precedes recovery. Workspace revoke cannot remove project policy.",
+    ],
+    options: &[
+        Opt {
+            spelling: "--project-wide",
+            meaning: "remove standing project grants instead; no workspace or --write",
+        },
+        Opt {
+            spelling: "--read <path...>",
+            meaning: "remove read grants; repeat for more",
+        },
+        Opt {
+            spelling: "--write <path...>",
+            meaning: "remove workspace write grants; repeat for more",
+        },
+        Opt {
+            spelling: "--deny-write <relative-path...>",
+            meaning: "remove own workspace-relative write denies",
+        },
+        Opt {
+            spelling: "--deny <relative-path...>",
+            meaning: "remove own workspace-relative read and write denies",
+        },
+        Opt {
+            spelling: "--egress <host>",
+            meaning: "remove a host or exact invalid recorded key; repeat for more",
+        },
+        Opt {
+            spelling: "--all",
+            meaning: "remove all own grant vectors under the observed revision's CAS; no selectors",
+        },
+    ],
+};
+
+fn parse_revoke(matches: &ArgMatches) -> Result<Command, UsageError> {
+    const USAGE: &CommandSpec = &REVOKE;
+    let target = if flagged(matches, "project-wide") {
+        if os(matches, "workspace").is_some() || matches.get_many::<PathBuf>("write").is_some() {
+            return Err(UsageError::new(
+                "project-wide revoke takes no workspace or write allow",
+                USAGE,
+            ));
+        }
+        GrantTarget::Project
+    } else {
+        GrantTarget::Workspace(require_workspace(
+            matches,
+            "workspace",
+            false,
+            USAGE,
+            USAGE.missing,
+        )?)
+    };
+    let paths = |name| {
+        matches
+            .get_many::<PathBuf>(name)
+            .map(|paths| paths.cloned().collect())
+            .unwrap_or_default()
+    };
+    let delta = GrantDelta {
+        read: paths("read"),
+        write: paths("write"),
+        deny_write: paths("deny-write"),
+        deny: paths("deny"),
+        egress: appended_values(matches, "egress", USAGE)?
+            .into_iter()
+            .map(|host| EgressRule {
+                host,
+                ports: Vec::new(),
+                mode: EgressMode::Intercept,
+            })
+            .collect(),
+        ..GrantDelta::default()
+    };
+    let has_items = !delta.read.is_empty()
+        || !delta.write.is_empty()
+        || !delta.deny_write.is_empty()
+        || !delta.deny.is_empty()
+        || !delta.egress.is_empty();
+    let selection = match (flagged(matches, "all"), has_items) {
+        (true, false) => RevokeSelection::All,
+        (false, true) => RevokeSelection::Items(delta),
+        _ => {
+            return Err(UsageError::new(
+                "revoke requires selectors or --all, never both",
+                USAGE,
+            ));
+        }
+    };
+    Ok(Command::Revoke(RevokeArgs { target, selection }))
+}
+
 const REMOVE: CommandSpec = CommandSpec {
     name: "rm",
     missing: "rm requires a workspace",
@@ -3168,6 +3305,74 @@ mod tests {
         assert_eq!(short, long);
         assert!(short.global.quiet);
         assert!(short.global.json);
+    }
+
+    #[test]
+    fn egress_grant_rejects_authorities_before_project_open() {
+        for host in [
+            "api.example.test:443",
+            "*.example.test:443",
+            "https://api.example.test",
+        ] {
+            for target in ["raven", "--project-wide"] {
+                let error = parse_args(["grant", target, "--egress", host])
+                    .expect_err("a grant takes a host, not an authority");
+                assert_eq!(error.kind, UsageErrorKind::InvalidArguments);
+                assert_eq!(error.exit_code(), 2);
+                assert!(error.message.contains(host), "{}", error.message);
+            }
+        }
+    }
+
+    #[test]
+    fn egress_grant_canonicalizes_the_gateway_host_grammar() {
+        for (input, canonical) in [
+            ("API.Example.Test", "api.example.test"),
+            ("*.EXAMPLE.TEST", "*.example.test"),
+            ("bücher.example", "xn--bcher-kva.example"),
+            ("[2001:db8::1]", "2001:db8::1"),
+        ] {
+            let Command::Grant(grant) = parse_args(["grant", "raven", "--egress", input])
+                .expect("host grant parses")
+                .command
+            else {
+                panic!("expected grant")
+            };
+            assert_eq!(grant.egress, [canonical]);
+        }
+    }
+
+    #[test]
+    fn revoke_accepts_recorded_invalid_egress_keys_without_gateway_preflight() {
+        for argv in [
+            vec!["revoke", "raven", "--egress", "api.example.test:443"],
+            vec![
+                "revoke",
+                "--project-wide",
+                "--egress",
+                "api.example.test:443",
+            ],
+            vec!["revoke", "raven", "--all"],
+            vec!["revoke", "--project-wide", "--all"],
+        ] {
+            let cli = parse_args(argv.clone()).expect("supported grant recovery parses");
+            assert_eq!(cli.command.project_discovery(), ProjectDiscovery::Required);
+        }
+        for argv in [
+            vec!["revoke", "raven"],
+            vec!["revoke", "raven", "--ports", "80"],
+            vec![
+                "revoke",
+                "raven",
+                "--opaque",
+                "--egress",
+                "api.example.test",
+            ],
+            vec!["revoke", "raven", "--all", "--egress", "api.example.test"],
+            vec!["revoke", "--project-wide", "--write", "/opt/output"],
+        ] {
+            assert!(parse_args(argv.clone()).is_err(), "{argv:?}");
+        }
     }
 
     #[test]

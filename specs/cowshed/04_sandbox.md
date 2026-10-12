@@ -432,7 +432,11 @@ Controller-owned, host-readable while the image is detached, outside the workspa
 - Egress hosts are exact names or single-level `*.` wildcards, optional port list (default 443/80), and optional
   `mode: "intercept" | "opaque"` (default `intercept` — the gateway terminates TLS under the workspace CA and injects
   credentials + trace; `opaque` is a pass-through CONNECT tunnel for pinned clients that injects nothing —
-  05_gateway.md). There are no SSH or Docker grant axes.
+  05_gateway.md). There are no SSH or Docker grant axes. The host field uses the gateway's shared `HostPattern` grammar:
+  an exact DNS name (IDNA A-label, lowercase), an exact IP address, or one leading `*.` matching exactly one DNS label.
+  An authority (`host:port`) or URL is not a host and is refused as `Usage` before a workspace or project grant is
+  written. Ports remain a separate rule attribute; `--egress <host>` uses 443/80 and never interprets a suffix as a
+  port.
 - `sim` is the **personal-session simulator** axis (posture B — 14_nix.md), and its closed enum contains only `openurl`
   and `install`. `openurl` drives an already-installed app and is restricted to project-registered URL schemes;
   `install` accepts only a drop-directory artifact and is additionally human-gated. Personal-device `list` and `boot`
@@ -579,10 +583,23 @@ Grant files are small, but they are the authority record — mutations are speci
 ```
 cowshed grant  <ws> [--read <path>]… [--write <path>]… [--deny-write <relative-path>]… [--deny <relative-path>]… [--egress <host>]… [--ports <N>]
 cowshed grant  --project-wide [--read <path>]… [--deny-write <relative-path>]… [--deny <relative-path>]… [--egress <host>]…
+cowshed revoke <ws> [--read <path>]… [--write <path>]… [--deny-write <relative-path>]… [--deny <relative-path>]… [--egress <host>]…
+cowshed revoke --project-wide [--read <path>]… [--deny-write <relative-path>]… [--deny <relative-path>]… [--egress <host>]…
+cowshed revoke <ws> --all
+cowshed revoke --project-wide --all
 ```
 
-Rust API: `Workspace::grant(delta)` / `Workspace::revoke(delta)`. The coordinator starts workers closed and opens paths
-and egress only as the task proves the need.
+Rust API: `Coordinator::grant(ws, delta)` / `Coordinator::revoke(ws, delta)` and the project-standing equivalents
+`grant_project(delta)` / `revoke_project(delta)` (07_api.md). The coordinator starts workers closed and opens paths and
+egress only as the task proves the need.
+
+Revoke requires selectors or `--all`, never both. `--all` removes the selected authority's own grant vectors under the
+observed revision's CAS; it preserves workspace port ownership and project checkpoint quotas. Revoking a workspace's own
+rule cannot remove standing project policy. Egress revoke matches by host regardless of mode or ports. A valid host
+selector uses the shared canonical grammar; an invalid recorded key is also accepted **verbatim** for repair, without
+interpreting an authority as a host or widening any grant. Removing one invalid key must succeed even when other invalid
+keys remain, so the operator can repair them individually. Grant/revoke do not require a gateway policy reconcile before
+mutation. Exec continues to fail closed until all invalid keys in the reconciled snapshot have been removed.
 
 Propagation:
 

@@ -86,9 +86,10 @@ and atomically rewrites the in-image token before new execution is admitted. Det
 kill, and socket unlink without rotating persistent authority; attach creates the socket and connector before admitting
 execs. The old token and every pre-restore keep-alive or tunnel are therefore invalid immediately; a preserved macOS
 port does not preserve authority. A policy miss after successful endpoint and token authentication is 403 with a
-machine-parsable grant hint naming both remedies, the standing one first:
-`cowshed grant --project-wide --egress <host:port>` (every workspace of the project) or
-`cowshed grant <ws> --egress <host:port>` (that workspace).
+machine-parsable grant hint naming both remedies, the standing one first: `cowshed grant --project-wide --egress <host>`
+(every workspace of the project) or `cowshed grant <ws> --egress <host>` (that workspace). The hint names the bare
+canonical DNS name or IP address, never a CONNECT authority: the grant host grammar is shared with grant admission and
+exec (04_sandbox.md).
 
 Main is a first-class data-plane client with identical platform wiring and policy. Gateway startup and absence are
 covered under "Availability and offline behavior".

@@ -64,6 +64,16 @@ impl HostPattern {
     }
 }
 
+impl fmt::Display for HostPattern {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Exact(name) => formatter.write_str(name),
+            Self::Wildcard(suffix) => write!(formatter, "*.{suffix}"),
+            Self::Ip(ip) => ip.fmt(formatter),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum CanonicalHost {
     Dns(String),
@@ -411,11 +421,11 @@ impl WorkspacePolicy {
         // Both remedies, the standing one first: a host a project's builds need (a registry, a
         // forge) belongs in every workspace, and granting it one workspace at a time is how the
         // grant sets of a project's workspaces drift apart.
-        let authority = target.authority();
         Err(PolicyDenial::NotGranted {
             hint: format!(
-                "cowshed grant --project-wide --egress {authority} (every workspace of this project) \
-                 or cowshed grant <ws> --egress {authority} (this workspace)"
+                "cowshed grant --project-wide --egress {host} (every workspace of this project) \
+                 or cowshed grant <ws> --egress {host} (this workspace)",
+                host = target.host,
             ),
         })
     }
@@ -868,8 +878,8 @@ mod tests {
         // holds, and the one-workspace grant.
         assert_eq!(
             hint,
-            "cowshed grant --project-wide --egress elsewhere.test:443 (every workspace of this project) \
-             or cowshed grant <ws> --egress elsewhere.test:443 (this workspace)"
+            "cowshed grant --project-wide --egress elsewhere.test (every workspace of this project) \
+             or cowshed grant <ws> --egress elsewhere.test (this workspace)"
         );
     }
 

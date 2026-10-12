@@ -1,6 +1,6 @@
 use crate::args::{
-    AdoptArgs, Cli, Command, ExecArgs, GrantTarget, MoveDestination, ProjectDiscovery,
-    StdinSource as CliStdinSource,
+    AdoptArgs, Cli, Command, ExecArgs, GrantTarget, MoveDestination, ProjectDiscovery, RevokeArgs,
+    RevokeSelection, StdinSource as CliStdinSource,
 };
 use crate::gateway_service;
 use crate::mount_main;
@@ -149,8 +149,10 @@ pub trait CliService: Send {
     async fn gc(&mut self, options: GcOptions) -> Result<GcReport>;
     async fn grants(&mut self, workspace: &str) -> Result<GrantSet>;
     async fn grant(&mut self, workspace: &str, delta: GrantDelta) -> Result<GrantSet>;
+    async fn revoke(&mut self, workspace: &str, delta: GrantDelta) -> Result<GrantSet>;
     async fn project_grants(&mut self) -> Result<ProjectGrants>;
     async fn grant_project(&mut self, delta: ProjectGrantDelta) -> Result<ProjectGrants>;
+    async fn revoke_project(&mut self, delta: ProjectGrantDelta) -> Result<ProjectGrants>;
     async fn push(&mut self, workspace: &str, options: PushOptions) -> Result<PushReport>;
     /// `into` names what the unit lands into (main when `None`); the service resolves it to a
     /// workspace reference once, before the call.
@@ -207,6 +209,7 @@ fn needs_daemon_of_this_build(command: &Command) -> bool {
         | Command::Path(_)
         | Command::Exec(_)
         | Command::Grant(_)
+        | Command::Revoke(_)
         | Command::Remove(_)
         | Command::Attach(_)
         | Command::Detach(_)
@@ -270,6 +273,7 @@ fn runtime_open_mode(command: &Command) -> RuntimeOpenMode {
         | Command::BuildState
         | Command::Exec(_)
         | Command::Grant(_)
+        | Command::Revoke(_)
         | Command::Remove(_)
         | Command::Attach(_)
         | Command::Detach(_)
@@ -361,6 +365,10 @@ fn runtime_recovery_scope(command: &Command) -> Result<RecoveryScope> {
         Command::Restore(args) => named([Some(args.workspace.as_str())]),
         Command::Exec(args) => named([Some(args.workspace.as_str())]),
         Command::Grant(args) => match &args.target {
+            GrantTarget::Workspace(workspace) => named([Some(workspace.as_str())]),
+            GrantTarget::Project => named([]),
+        },
+        Command::Revoke(args) => match &args.target {
             GrantTarget::Workspace(workspace) => named([Some(workspace.as_str())]),
             GrantTarget::Project => named([]),
         },
@@ -840,12 +848,20 @@ impl CliService for ActorBridge {
         self.coordinator()?.grant(workspace, delta).await
     }
 
+    async fn revoke(&mut self, workspace: &str, delta: GrantDelta) -> Result<GrantSet> {
+        self.coordinator()?.revoke(workspace, delta).await
+    }
+
     async fn project_grants(&mut self) -> Result<ProjectGrants> {
         self.coordinator()?.project_grants().await
     }
 
     async fn grant_project(&mut self, delta: ProjectGrantDelta) -> Result<ProjectGrants> {
         self.coordinator()?.grant_project(delta).await
+    }
+
+    async fn revoke_project(&mut self, delta: ProjectGrantDelta) -> Result<ProjectGrants> {
+        self.coordinator()?.revoke_project(delta).await
     }
 
     async fn push(&mut self, workspace: &str, options: PushOptions) -> Result<PushReport> {
@@ -1422,14 +1438,14 @@ where
                         args.read,
                         args.deny_write,
                         args.deny,
-                        egress_rules(&args.egress, args.egress_mode),
+                        egress_rules(args.egress, args.egress_mode),
                     )
                     .await;
                 }
             };
             let requested: Vec<PathBuf> =
                 args.read.iter().chain(args.write.iter()).cloned().collect();
-            let egress = egress_rules(&args.egress, args.egress_mode);
+            let egress = egress_rules(args.egress, args.egress_mode);
             let grants = if changed {
                 service
                     .grant(
@@ -1507,6 +1523,7 @@ where
             }
             Ok(success())
         }
+        Command::Revoke(args) => revoke(service, output, json, args).await,
         Command::Remove(args) if args.purge => {
             let report = service
                 .remove_project(RemoveProjectOptions {
@@ -2336,15 +2353,90 @@ pub(crate) fn report_exec<W: Write, E: Write>(
 /// Egress rules for hosts named on the command line: the ports a grant defaults to, in the mode
 /// the invocation names (`--opaque`, or intercepted). A host holds one rule, so the controller
 /// replaces any rule the host already has with this one.
-fn egress_rules(hosts: &[String], mode: EgressMode) -> Vec<EgressRule> {
+fn egress_rules(hosts: Vec<String>, mode: EgressMode) -> Vec<EgressRule> {
     hosts
-        .iter()
+        .into_iter()
         .map(|host| EgressRule {
-            host: host.clone(),
+            host,
             ports: Vec::new(),
             mode,
         })
         .collect()
+}
+
+async fn revoke<S: CliService, W: Write, E: Write>(
+    service: &mut S,
+    output: &mut Output<W, E>,
+    json: bool,
+    args: RevokeArgs,
+) -> Result<DispatchExit> {
+    let revision = match args.target {
+        GrantTarget::Workspace(workspace) => {
+            let delta = match args.selection {
+                RevokeSelection::Items(delta) => delta,
+                RevokeSelection::All => {
+                    let grants = service.grants(&workspace).await?;
+                    GrantDelta {
+                        read: grants.read,
+                        write: grants.write,
+                        deny_write: grants.deny_write,
+                        deny: grants.deny,
+                        egress: grants.egress,
+                        repos: grants.repos,
+                        sim: grants.sim,
+                        expected_revision: Some(grants.revision),
+                        ..GrantDelta::default()
+                    }
+                }
+            };
+            let grants = service.revoke(&workspace, delta).await?;
+            let revision = grants.revision;
+            if json {
+                output.success(grants).map_err(output_error)?;
+            }
+            output
+                .hint(&format!("cowshed exec {workspace} -- <retry your command>"))
+                .map_err(output_error)?;
+            revision
+        }
+        GrantTarget::Project => {
+            let delta = match args.selection {
+                RevokeSelection::Items(delta) => ProjectGrantDelta {
+                    read: delta.read,
+                    deny_write: delta.deny_write,
+                    deny: delta.deny,
+                    egress: delta.egress,
+                    expected_revision: None,
+                },
+                RevokeSelection::All => {
+                    let grants = service.project_grants().await?;
+                    ProjectGrantDelta {
+                        read: grants.read,
+                        deny_write: grants.deny_write,
+                        deny: grants.deny,
+                        egress: grants.egress,
+                        expected_revision: Some(grants.revision),
+                    }
+                }
+            };
+            let grants = service.revoke_project(delta).await?;
+            let revision = grants.revision;
+            if json {
+                output.success(grants).map_err(output_error)?;
+            }
+            output
+                .hint("cowshed grant --project-wide")
+                .map_err(output_error)?;
+            revision
+        }
+    };
+    if !json {
+        output
+            .bare_line(revision.to_string().as_bytes())
+            .map_err(output_error)?;
+    }
+    output.guidance("egress policy applies immediately; effective filesystem changes apply at the next supervisor revision").map_err(output_error)?;
+    Ok(success())
 }
 
 /// `cowshed grant --project-wide`: print or extend the project's standing grants.
@@ -4910,6 +5002,25 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn egress_revoke_recovery_skips_gateway_reconciliation() {
+        for argv in [
+            vec!["revoke", "raven", "--egress", "api.example.test:443"],
+            vec![
+                "revoke",
+                "--project-wide",
+                "--egress",
+                "api.example.test:443",
+            ],
+            vec!["revoke", "raven", "--all"],
+            vec!["revoke", "--project-wide", "--all"],
+        ] {
+            let cli = crate::args::parse_args(argv).expect("supported recovery");
+            assert!(!requires_gateway_before_dispatch(&cli.command));
+            assert!(needs_daemon_of_this_build(&cli.command));
         }
     }
 
