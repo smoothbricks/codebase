@@ -1,8 +1,8 @@
 # lmao Optimization Investigation
 
-Date: 2026-07-11. Hardware: Apple M5 Max (~4.43 GHz), bun 1.3.14 (JSC), rustc 1.96.0 (aarch64, `lto=true` release).
-Question: does lmao unlock optimizations beyond the current TS+WASM design, given the design history that JS TypedArray
-writes beat NAPI and JIT-compiled WASM beat NAPI?
+Hardware: Apple M5 Max (~4.43 GHz), bun 1.3.14 (JSC), rustc 1.96.0 (aarch64, `lto=true` release). Question: does lmao
+unlock optimizations beyond the current TS+WASM design, given the design history that JS TypedArray writes beat NAPI and
+JIT-compiled WASM beat NAPI?
 
 ## 1. Existing benchmark survey
 

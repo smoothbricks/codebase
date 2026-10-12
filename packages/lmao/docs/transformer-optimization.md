@@ -342,7 +342,7 @@ extension could emit each Op's proven numeric field subset so the superblock omi
 cannot write. That is a memory/layout specialization, not another export-call batching requirement, and remains
 unimplemented pending semantic coverage for dynamic access, `.with(...)`, composed libraries, and untransformed callers.
 
-**Measured result (2026-07-14, Apple M5 Max, Bun 1.3.14, three Mitata runs).** The retained
+**Measured result (Apple M5 Max, Bun 1.3.14, three Mitata runs).** The retained
 `packages/lmao/benchmarks/wasm-boundary.bench.ts` compares balanced allocate/start/free cycles using identical logical
 identity, system, u8, u32, and f64 storage:
 
@@ -363,10 +363,9 @@ allocator-visible bytes (span 1496B, overflow 1368B); property tests prove packe
 capacities 1–512. Keep the superblock for the bounded footprint, simpler ownership, one-call FFI surface, and measured
 overflow win—not for the superseded 10× span-setup projection.
 
-**Chrome confirmation (2026-07-14, Apple M5 Max, Headless Chrome 150, three fresh-page runs).** The Expo web benchmark
-uses the production `WasmAllocator` wrapper, fetches the shipped `allocator.wasm` over HTTP, performs 4,096 warmups,
-then records 30 alternating samples of 8,192 cycles. It compares the same capacity-64 identity, system, u8, u32, and f64
-storage:
+**Chrome confirmation (Apple M5 Max, Headless Chrome 150, three fresh-page runs).** The Expo web benchmark uses the
+production `WasmAllocator` wrapper, fetches the shipped `allocator.wasm` over HTTP, performs 4,096 warmups, then records
+30 alternating samples of 8,192 cycles. It compares the same capacity-64 identity, system, u8, u32, and f64 storage:
 
 | Cycle             | Separate allocations | Superblock |                 Result |
 | ----------------- | -------------------: | ---------: | ---------------------: |

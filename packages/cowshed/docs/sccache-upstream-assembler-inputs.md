@@ -1,6 +1,6 @@
 # Draft upstream report: files no preprocessor line marker names
 
-Status of mozilla/sccache, read at `v0.17.0` and at `main` `c0a78c4` (2026-09-26):
+Status of mozilla/sccache, read at `v0.17.0` and at `main` `c0a78c4`:
 
 - **`.incbin` / `.include` in assembler source: affected in both modes.** The only handling is in
   `process_preprocessed_file` (`src/compiler/c.rs`), which turns preprocessor cache mode off when the preprocessed text

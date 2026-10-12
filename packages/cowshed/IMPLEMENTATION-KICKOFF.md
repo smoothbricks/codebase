@@ -214,11 +214,11 @@ directly, Bun/Node applications use `cowshed-napi`, and shell-based agents use t
 
 ## State of the tree
 
-- Current tree (2026-07-13): `cowshed-core` now contains the frozen DTO/error contracts, repository and path validation,
-  APFS lifecycle primitives, sandbox profile/child spawning, protected job-artifact storage/recovery/publication, and
-  the capability/controller actor boundary including the bounded raw-byte lane. These are tested foundations, not a
-  usable product: controller operation implementations remain incomplete, the CLI parses and renders typed failures but
-  does not dispatch successful commands, and gateway/N-API/escape-suite adapters remain scaffolds. Treat every remaining
+- Current tree: `cowshed-core` now contains the frozen DTO/error contracts, repository and path validation, APFS
+  lifecycle primitives, sandbox profile/child spawning, protected job-artifact storage/recovery/publication, and the
+  capability/controller actor boundary including the bounded raw-byte lane. These are tested foundations, not a usable
+  product: controller operation implementations remain incomplete, the CLI parses and renders typed failures but does
+  not dispatch successful commands, and gateway/N-API/escape-suite adapters remain scaffolds. Treat every remaining
   behavior in the specs and docs as an implementation obligation, not as shipped functionality.
 - Toolchain configuration lives in `tooling/direnv/devenv.{yaml,nix}`. Invoke repository commands from `<repo-root>`;
   never embed a workstation-specific absolute path.
@@ -232,12 +232,12 @@ tests cover pure contracts; integration tests use isolated temporary paths. Phas
 N-API bindings, MCP server, and escape suite. Phase 3 — adversarial conformance and sandbox review, confirmed fixes,
 then targeted verification plus the repository's full Rust checks and a CLI transcript against the docs.
 
-**Resolved experiments** (2026-07-11, harnesses + results in `specs/cowshed/prototypes/apfs-workspace-bench/`; verdicts
-folded into the specs):
+**Resolved experiments** (harnesses + results in `specs/cowshed/prototypes/apfs-workspace-bench/`; verdicts folded into
+the specs):
 
-- ASIF vs SPARSE (2026-07-11, historical) → ASIF only, case-sensitive (2.1× create, 2.5× write, 5.6× read, 2.3×
-  metadata; case-sensitive ASIF equals case-insensitive within noise). **Superseded:** RAW (UDRW) `.dmg`,
-  case-sensitive, is the single format (01_storage.md §Images).
+- ASIF vs SPARSE (historical) → ASIF only, case-sensitive (2.1× create, 2.5× write, 5.6× read, 2.3× metadata;
+  case-sensitive ASIF equals case-insensitive within noise). **Superseded:** RAW (UDRW) `.dmg`, case-sensitive, is the
+  single format (01_storage.md §Images).
 - Attach latency floor (pre-cutover measurement) → **not flag-reducible** (`-noverify` ~15 ms noise); only a
   DiskImages2/diskarbitrationd-level path could improve it — research item, budgets don't assume it.
 - Fork-mid-write clone validity (historical, pre-cutover) → **10/10 clean** under continuous writer + streaming dd, both
