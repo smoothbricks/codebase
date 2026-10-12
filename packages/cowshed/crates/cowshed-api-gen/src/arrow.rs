@@ -17,6 +17,7 @@ pub enum ArrowKind {
     UInt32,
     UInt64,
     Int32,
+    Int64,
     Utf8,
     Dict32,
     Dict8,
@@ -129,12 +130,13 @@ fn arrow_of(attrs: &[syn::Attribute]) -> Result<(ArrowKind, Option<Vec<String>>)
                         "uint32" => ArrowKind::UInt32,
                         "uint64" => ArrowKind::UInt64,
                         "int32" => ArrowKind::Int32,
+                        "int64" => ArrowKind::Int64,
                         "utf8" => ArrowKind::Utf8,
                         "dict32" => ArrowKind::Dict32,
                         "dict8" => ArrowKind::Dict8,
                         _ => {
                             return Err(meta.error(
-                                "arrow must be uint32, uint64, int32, utf8, dict32 or dict8",
+                                "arrow must be uint32, uint64, int32, int64, utf8, dict32 or dict8",
                             ));
                         }
                     });
@@ -229,6 +231,7 @@ fn data_type(kind: ArrowKind) -> &'static str {
         ArrowKind::UInt32 => "DataType::UInt32",
         ArrowKind::UInt64 => "DataType::UInt64",
         ArrowKind::Int32 => "DataType::Int32",
+        ArrowKind::Int64 => "DataType::Int64",
         ArrowKind::Utf8 => "DataType::Utf8",
         ArrowKind::Dict32 => "dict_type(DataType::UInt32)",
         ArrowKind::Dict8 => "dict_type(DataType::UInt8)",
@@ -237,18 +240,15 @@ fn data_type(kind: ArrowKind) -> &'static str {
 
 fn encode_expr(column: &ArrowColumn) -> String {
     match column.kind {
-        ArrowKind::UInt32 | ArrowKind::UInt64 | ArrowKind::Int32 => {
+        ArrowKind::UInt32 | ArrowKind::UInt64 | ArrowKind::Int32 | ArrowKind::Int64 => {
             format!(
                 "{kind}(columns.{name}).1",
                 kind = encode_fn(column.kind),
                 name = column.name
             )
         }
-        ArrowKind::Utf8 | ArrowKind::Dict32 => format!(
-            "{kind}(columns.{name}.as_deref())?.1",
-            kind = encode_fn(column.kind),
-            name = column.name
-        ),
+        ArrowKind::Utf8 => format!("text(columns.{name}.as_deref()).1", name = column.name),
+        ArrowKind::Dict32 => format!("category(columns.{name}.as_deref())?.1", name = column.name),
         ArrowKind::Dict8 => format!(
             "enumeration(columns.{name}, &{const_name})?.1",
             name = column.name,
@@ -262,6 +262,7 @@ fn encode_fn(kind: ArrowKind) -> &'static str {
         ArrowKind::UInt32 => "uint32",
         ArrowKind::UInt64 => "uint64",
         ArrowKind::Int32 => "int32",
+        ArrowKind::Int64 => "int64",
         ArrowKind::Utf8 => "text",
         ArrowKind::Dict32 => "category",
         ArrowKind::Dict8 => "enumeration",
@@ -273,8 +274,10 @@ fn decode_expr(column: &ArrowColumn) -> String {
         ArrowKind::UInt32 => "optional_u32",
         ArrowKind::UInt64 => "optional_u64",
         ArrowKind::Int32 => "optional_i32",
+        ArrowKind::Int64 => "optional_i64",
         ArrowKind::Utf8 => "optional_text",
-        ArrowKind::Dict32 | ArrowKind::Dict8 => "optional_dict",
+        ArrowKind::Dict32 => "optional_dict",
+        ArrowKind::Dict8 => "optional_key",
     };
     format!("{reader}(batch, start, {:?})", column.name)
 }
