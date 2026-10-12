@@ -192,7 +192,10 @@ mod tests {
                 reconcile(&tree(observed, gap.clone()), totals(1000), None, required).unwrap();
             assert_eq!((&leaf, &reconciliation), (&again.0, &again.1));
             assert_eq!(reconciliation.coverage, gap);
-            assert_eq!(reconciliation.cpu_us.get(), i64::from(observed) - 1000);
+            assert_eq!(
+                reconciliation.cpu_us.get(),
+                i64::try_from(observed).unwrap() - 1000
+            );
             assert!(
                 reconciliation.cpu_us.get() < 0,
                 "the shortfall is not clamped away"
