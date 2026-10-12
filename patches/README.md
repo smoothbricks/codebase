@@ -190,7 +190,7 @@ run-information hunk creates that entry only when absent, retaining the failed r
 execution start stays absent unless `startTasks` or the task's own `startTime` supplied one; no start is fabricated.
 
 The composed lifecycle must also complete `endCommand`: native task history requires a hash and an execution start;
-legacy history stringifies the start. Both now exclude results lacking either, rather than inventing a history row or
+legacy history stringifies the start. Both exclude results lacking either, rather than inventing a history row or
 crashing after the run information was saved. Genuine database failures for valid execution rows still propagate.
 Optional timing diagnostics retain an unstarted result with a `null` duration; profiling emits no executed interval
 without a real start. Supplied timestamps, including zero, and normal started tasks retain their timing.
