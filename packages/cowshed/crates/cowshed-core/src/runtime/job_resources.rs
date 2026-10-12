@@ -228,9 +228,9 @@ pub(super) struct JobSampler {
     /// The job's CPU source: each leader's own and reaped-children rusage, the activation's once.
     #[cfg(target_os = "macos")]
     rusage: super::job_accounting::RusageChildren,
-    /// What the sampler saw of the group's processes at its boundaries.
+    /// A census exists only for an explicitly supplied spawn sink without native observations.
     #[cfg(target_os = "macos")]
-    census: super::job_attribution::Census,
+    census: Option<super::job_attribution::Census>,
 }
 
 impl JobSampler {
@@ -241,7 +241,7 @@ impl JobSampler {
             #[cfg(target_os = "macos")]
             rusage: super::job_accounting::RusageChildren::charging(first.birth.clone()),
             #[cfg(target_os = "macos")]
-            census: super::job_attribution::Census::led_by(first.birth.pid()),
+            census: None,
             leader: first.birth,
             host_start: first.host,
             rss_peak: ResidentBytes::ZERO,
@@ -254,7 +254,9 @@ impl JobSampler {
         #[cfg(target_os = "macos")]
         {
             self.rusage.lead(leader.clone());
-            self.census.lead(leader.pid());
+            if let Some(census) = &mut self.census {
+                census.lead(leader.pid());
+            }
         }
         self.leader = leader;
     }
@@ -266,11 +268,11 @@ impl JobSampler {
         &mut self.rusage
     }
 
-    /// What the sampler saw of the group's processes, which the supervisor adds each boundary's
-    /// members to.
+    /// The legacy spawn sink's census, allocated only when that path is actually sampled.
     #[cfg(target_os = "macos")]
     pub(super) fn census(&mut self) -> &mut super::job_attribution::Census {
-        &mut self.census
+        self.census
+            .get_or_insert_with(|| super::job_attribution::Census::led_by(self.leader.pid()))
     }
 
     /// The share of the job's accounted CPU its observed processes must cover for a leaf.

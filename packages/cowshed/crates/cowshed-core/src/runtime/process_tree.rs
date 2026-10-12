@@ -563,6 +563,42 @@ mod tests {
         assert_eq!(tree.processes[2].argv, tree.processes[0].argv);
     }
 
+    #[test]
+    fn an_unread_current_image_is_not_replaced_by_its_previous_image_or_gap() {
+        let mut fold = ProcessTreeFold::default();
+        let parent = id(100, 1);
+        let child = id(101, 2);
+        root(&mut fold, parent);
+        fold.apply(ProcessObservation::Lost(ProcessCoverageGap::EventsLost))
+            .unwrap();
+        fold.apply(ProcessObservation::ImageUnread { process: parent })
+            .unwrap();
+        assert!(fold.image(parent).is_none());
+        assert!(!fold.node_at(0).unwrap().image_known);
+        fork(&mut fold, child, parent, 1);
+        assert!(fold.image(child).is_none());
+        assert_eq!(
+            tree(&fold, 2).coverage,
+            ProcessCoverage::Gap {
+                reason: ProcessCoverageGap::EventsLost
+            }
+        );
+        fold.apply(ProcessObservation::Exec {
+            process: child,
+            image: image("/usr/bin/cc", &[b"cc"]),
+        })
+        .unwrap();
+        assert_eq!(fold.image(child).unwrap().program, "/usr/bin/cc");
+        assert!(fold.node_at(1).unwrap().image_known);
+        assert!(fold.image(parent).is_none());
+        assert_eq!(
+            tree(&fold, 3).coverage,
+            ProcessCoverage::Gap {
+                reason: ProcessCoverageGap::EventsLost
+            }
+        );
+    }
+
     /// Joining by numeric pid fails this: it folds both lives of pid 200 into one record and
     /// applies the stale event to the second life.
     #[test]

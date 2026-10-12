@@ -25,7 +25,11 @@ use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
 use crate::api::dto::{ExitStatus, JobId, JobInfo, JobState, TraceContext};
+use crate::api::resources::{
+    ChargedMemoryUsage, HostLoadSample, JobAccounting, JobResourceSample, JobVolumeUsage,
+};
 use crate::error::CowshedError;
+use crate::host_load::HostLoadError;
 use crate::metadata::WorkspaceIncarnation;
 use crate::repository::RepoId;
 use crate::runtime::job_boundary::{
@@ -165,12 +169,14 @@ struct PreparedBoundary {
 }
 
 impl PreparedBoundary {
-    fn from_boundary(
-        boundary: &JobSpanBoundary,
+    fn from_observation(
+        host: HostLoadSample,
+        volumes: &JobVolumeUsage,
+        charged: Option<ChargedMemoryUsage>,
     ) -> Result<Self, crate::api::resources::ResourceUnitError> {
-        let (load1_milli, cores) = boundary_host(boundary.host)?;
-        let (disk_ws, disk_build) = volume_deltas(&boundary.volumes);
-        let (charged_current, charged_peak) = charged_memory_values(boundary.charged);
+        let (load1_milli, cores) = boundary_host(host)?;
+        let (disk_ws, disk_build) = volume_deltas(volumes);
+        let (charged_current, charged_peak) = charged_memory_values(charged);
         Ok(Self {
             load1_milli,
             cores,
@@ -257,11 +263,54 @@ impl JobSpanPublisher {
         permit.send(Request::Process(Box::new(row)));
     }
 
-    /// Queue the job edge with host, volume, and charged-memory columns. Absent build volume
-    /// and absent charged memory stay null. A conversion failure is counted and not sealed.
-    /// This does not name a leaf.
-    pub fn record_boundary(&self, info: &JobInfo, edge: JobSpanEdge, boundary: &JobSpanBoundary) {
-        let prepared = match PreparedBoundary::from_boundary(boundary) {
+    /// Queue a boundary read. A failed source or conversion is counted and not sealed; absent
+    /// build volume and absent charged memory stay null.
+    pub fn record_boundary(
+        &self,
+        info: &JobInfo,
+        edge: JobSpanEdge,
+        boundary: &Result<JobSpanBoundary, HostLoadError>,
+    ) {
+        let boundary = match boundary {
+            Ok(boundary) => boundary,
+            Err(error) => {
+                refuse(&self.health, error.to_string());
+                return;
+            }
+        };
+        self.record_observation(
+            info,
+            edge,
+            boundary.host,
+            &boundary.volumes,
+            boundary.charged,
+        );
+    }
+
+    /// Reuse the terminal resource read, including its admitted-volume deltas, without reading
+    /// the host again or copying the volume's operational error strings.
+    pub fn record_sample_boundary(
+        &self,
+        info: &JobInfo,
+        edge: JobSpanEdge,
+        sample: &JobResourceSample,
+    ) {
+        let charged = match sample.accounting {
+            JobAccounting::LinuxCgroupV2 { charged_memory, .. } => Some(charged_memory),
+            JobAccounting::MacOsRusageChildren { .. } => None,
+        };
+        self.record_observation(info, edge, sample.host, &sample.volumes, charged);
+    }
+
+    fn record_observation(
+        &self,
+        info: &JobInfo,
+        edge: JobSpanEdge,
+        host: HostLoadSample,
+        volumes: &JobVolumeUsage,
+        charged: Option<ChargedMemoryUsage>,
+    ) {
+        let prepared = match PreparedBoundary::from_observation(host, volumes, charged) {
             Ok(prepared) => prepared,
             Err(error) => {
                 refuse(&self.health, error.to_string());
