@@ -923,14 +923,9 @@ next: cowshed exec raven -- <retry your command>
   with the same link and rename protection as `--deny-write`. `--project-wide --deny .runtime` applies it to main and
   every workspace. Main's `.cowshed.toml` can declare it durably as `[sandbox] deny = [".runtime"]`; cowshed reads that
   section only from main's checkout, never from a workspace's copy.
-- `--egress <host>` is repeatable and admits one host through the gateway, intercepted, on the default ports (443 and
-  80). Network reach is a separate decision from filesystem reach and a separately auditable one: the gateway records
-  every admission in its Arrow audit telemetry ([telemetry.md](telemetry.md)). Holding a credential for a registry does
-  not grant reach to it, and granting reach does not hand the workspace a credential — see
-  [`cowshed credential`](#cowshed-credential-addlsstatusrm). A host is a DNS name, exact IP address, or single-label
-  `*.` wildcard; DNS names are stored as lowercase IDNA A-labels. Do not append `:443` or a URL scheme:
-  `--egress api.example.com:443` is a usage error before anything is recorded. Port lists are separate attributes in the
-  coordinator API.
+- `--egress <host>` is repeatable: `cowshed grant raven --egress api.example.com --egress registry.example.com`. The
+  [grant-file contract](../../../specs/cowshed/04_sandbox.md#grant-file-imagegrantsjson) owns the egress host grammar
+  and port attributes. For credentials, see [`cowshed credential`](#cowshed-credential-addlsstatusrm).
 - `--opaque` grants the invocation's `--egress` hosts as opaque tunnels instead: the gateway forwards encrypted bytes
   with host-only audit and no injection, and the client verifies the real certificate. It is for clients that cannot
   trust the workspace CA — certificate-pinning clients, and Go on macOS
@@ -984,13 +979,13 @@ egress	registry.internal.example	443,80	intercept
 
 ### `cowshed revoke <name> …` / `cowshed revoke --project-wide …`
 
-Remove the selected authority's own grants with `--read`, `--write` (workspace only), `--deny-write`, `--deny`, or
-repeatable `--egress <host>`. Egress revoke removes a host regardless of its mode and ports. `--all` alone removes all
-own grant vectors, not workspace port ownership or project checkpoint quotas. A workspace revoke never removes standing
-project policy. Revoking an absent item changes neither the grant revision nor the file.
+```sh
+cowshed revoke raven --egress api.example.com
+cowshed revoke raven --all
+cowshed revoke --project-wide --egress api.example.com
+```
 
-An older binary could record an invalid host such as `api.example.com:443`, which then prevents gateway reconciliation
-and exec, including in otherwise clean forks. Repair it from the host controller with its exact recorded spelling:
+To repair an invalid recorded key, use the host controller:
 
 ```sh
 cowshed grant raven
@@ -999,10 +994,9 @@ cowshed grant raven --egress api.example.com
 cowshed exec raven -- <retry your command>
 ```
 
-Use `--project-wide` in place of `raven` for an invalid standing grant. Revoke accepts invalid recorded keys verbatim
-and does not reconcile the gateway first, so keys can be removed individually even when several are invalid. It never
-turns `host:port` into a grant. Repair every invalid key in the reconciled snapshot; none is silently ignored. Forks
-receive standing project policy but do not copy the source workspace's own grants.
+For a project-standing key, use `--project-wide` in place of `raven`. The
+[widening and narrowing contract](../../../specs/cowshed/04_sandbox.md#widening-and-narrowing) owns revoke selectors,
+revision handling, recovery, and propagation.
 
 ## Authority boundaries
 
