@@ -355,6 +355,9 @@ struct Writer {
     subscribers: HashMap<u64, Subscriber>,
     next_id: u64,
     next_sample: Instant,
+    /// The job-accounting boundary is complete. Live registrations still sample.
+    finished: bool,
+    /// `finished` and no retained registration remains. Readers then see the end.
     ended: bool,
     trace: Option<Box<TraceWriter>>,
 }
@@ -368,6 +371,7 @@ impl Writer {
             subscribers: HashMap::new(),
             next_id: 1,
             next_sample: Instant::now() + DEFAULT_SAMPLE,
+            finished: false,
             ended: false,
             trace: None,
         }
@@ -405,6 +409,9 @@ impl Writer {
             tree,
             attribution: self.observer.attribution_summary(),
         }));
+        if self.finished {
+            self.ended = !self.observer.watching();
+        }
         for subscriber in self.subscribers.values_mut() {
             if let Some((cursor, _)) = &subscriber.pending
                 && (*cursor < self.journal.len() || self.ended)
@@ -438,13 +445,8 @@ impl Writer {
                         let _ = reply.send(result);
                     }
                     Request::Finish { reply } => {
-                        let mut result = self.observer.drain().map_err(observation_error);
-                        if self.observer.watching() {
-                            if let Err(error) = self.observer.gap(ProcessCoverageGap::EventsLost) {
-                                result = Err(observation_error(error));
-                            }
-                        }
-                        self.ended = true;
+                        self.finished = true;
+                        let result = self.observer.drain().map_err(observation_error);
                         self.publish(result.clone());
                         let _ = reply.send(result);
                     }
