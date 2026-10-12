@@ -26,6 +26,7 @@
     "src/typecheck-test-policy.test.ts": 1530,
     "src/cross-check-policy.test.ts": 1521,
     "src/nx-skipped-task-exit.test.ts": 1409,
+    "src/nx-plugin-load-errors.test.ts": 1392,
     "src/executors/bounded-exec/verdict.test.ts": 1154,
     "src/nx-daemon-root-normalization.test.ts": 1069,
     "src/managed-files/managed-format-json.test.ts": 990,
