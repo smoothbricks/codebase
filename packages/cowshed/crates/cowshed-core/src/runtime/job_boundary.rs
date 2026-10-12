@@ -17,10 +17,21 @@ pub fn milliload(load: HostLoad1) -> Result<u32, ResourceUnitError> {
     if !scaled.is_finite() || scaled < 0.0 || scaled > f64::from(u32::MAX) {
         return Err(ResourceUnitError::InvalidHostLoad { value: load.get() });
     }
-    // The range check makes this an integer in `u32`. Parsing that decimal is the
-    // checked conversion; a float-to-int cast is not.
-    format!("{:.0}", scaled.round())
-        .parse()
+    let rounded = scaled.round();
+    if rounded < 1.0 {
+        return Ok(0);
+    }
+    let bits = rounded.to_bits();
+    let exponent = (bits >> 52) & 0x7ff;
+    // A rounded integer in 1..=u32::MAX has biased exponent 1023..=1054,
+    // so the shift below is 21..=52 and cannot wrap.
+    if !(1023..=1054).contains(&exponent) {
+        return Err(ResourceUnitError::InvalidHostLoad { value: load.get() });
+    }
+    let significand = (bits & ((1u64 << 52) - 1)) | (1u64 << 52);
+    let shift = u32::try_from(1075 - exponent)
+        .map_err(|_| ResourceUnitError::InvalidHostLoad { value: load.get() })?;
+    u32::try_from(significand >> shift)
         .map_err(|_| ResourceUnitError::InvalidHostLoad { value: load.get() })
 }
 
@@ -112,6 +123,7 @@ mod tests {
     #[test]
     fn milliload_rounds_to_nearest_and_refuses_overflow() {
         let load = |value| HostLoad1::new(value).unwrap();
+        assert_eq!(milliload(load(0.0)).unwrap(), 0);
         assert_eq!(milliload(load(1.2344)).unwrap(), 1234);
         assert_eq!(milliload(load(1.2345)).unwrap(), 1235);
         assert!(milliload(load(f64::from(u32::MAX) + 1.0)).is_err());
