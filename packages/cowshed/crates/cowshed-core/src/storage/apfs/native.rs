@@ -2581,12 +2581,29 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
             // The workspace's TMPDIR, named like its checkpoints, so the name's owner reclaims it.
             // A sandboxed process may have replaced it with a link: that is unlinked, never
             // followed. What its tools sealed read-only inside is made writable to remove it.
+            // A volume mounted beneath it is not part of it: removing the tree would empty that
+            // volume through its mountpoint and then stop at the busy directory. The mount is a
+            // path a sandboxed child chose, so it is named and never detached, and the retirement
+            // stays to authorise the pass that runs once it is gone.
             let exec_temp = project
                 .join(EXEC_TEMP_DIRECTORY)
                 .join(authority.workspace().name().as_str());
             match fs::symlink_metadata(&exec_temp) {
                 Ok(metadata) => {
                     let removed = if metadata.is_dir() {
+                        if let Some(mounted) = self
+                            .mount_source
+                            .mounts()?
+                            .into_iter()
+                            .find(|mount| mount.mount_point.starts_with(&exec_temp))
+                        {
+                            return Err(ApfsStorageError::Host(format!(
+                                "retired exec temp dir {} carries a mounted filesystem: {} at {}; detach it, then `cowshed gc` finishes the retirement",
+                                exec_temp.display(),
+                                mounted.source_device,
+                                mounted.mount_point.display()
+                            )));
+                        }
                         crate::fsio::remove_owned_tree(&exec_temp)
                     } else {
                         fs::remove_file(&exec_temp)

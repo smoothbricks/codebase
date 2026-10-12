@@ -5384,6 +5384,72 @@ fn real_apfs_gc_retains_root_held_event_debris_without_blocking_retirement() {
     );
 }
 
+/// A retired workspace's TMPDIR is its sandbox's scratch, and a test run inside it may mount a
+/// volume there and die holding it. Reclamation never reaches through that mount: removing the
+/// tree would empty the volume — its in-image marker included — and then stop at the busy
+/// mountpoint anyway. The mount is a path a sandboxed child chose, so it is named and never
+/// detached, and the retirement stays until a pass finds nothing mounted beneath it.
+#[test]
+fn real_apfs_retired_temp_dir_is_never_reclaimed_through_a_mounted_volume() {
+    const INCARNATION: &str = "00000000000000000000000000000005";
+    let fixture = RealFixture::new("retired-temp-mount");
+    let layout = fixture.layout();
+    let name = WorkspaceName::session("retired").expect("workspace");
+    let canonical = layout.session_image(&name).expect("retired image");
+    fixture.published_image(canonical.image());
+    write_session_metadata(canonical.image(), "retired", INCARNATION);
+    let trash = layout
+        .project()
+        .sessions
+        .join(format!(".trash/retired-{INCARNATION}.dmg"));
+    let host = fixture.host();
+    host.retire_image(canonical.image(), &trash)
+        .expect("retire image");
+
+    let exec_temp = layout.exec_temp_dir(&name).expect("temp dir");
+    std::fs::create_dir_all(&exec_temp).expect("temp dir");
+    std::fs::write(exec_temp.join("scratch"), b"own scratch").expect("own scratch");
+    let held = exec_temp.join("smoke/project");
+    let foreign_image = fixture.root().join("foreign.dmg");
+    fixture.blank_image(&foreign_image);
+    fixture.mount_left_behind(&foreign_image, &held, "nobrowse,owners");
+    std::fs::write(held.join("data"), b"another volume's data").expect("foreign data");
+
+    let report = execute_gc(&host, &fixture.config()).expect("gc defers what it cannot reclaim");
+    assert_eq!(report.reclaimed, 0);
+    let [deferred] = report.deferred.as_slice() else {
+        panic!("the retirement is deferred, naming the mount: {report:?}");
+    };
+    assert_eq!(deferred.path, trash);
+    assert!(
+        deferred.diagnostic.contains("carries a mounted filesystem")
+            && deferred
+                .diagnostic
+                .contains(held.to_str().expect("UTF-8 mount path")),
+        "{}",
+        deferred.diagnostic
+    );
+    assert_eq!(
+        std::fs::read(held.join("data")).expect("the mounted volume keeps its files"),
+        b"another volume's data"
+    );
+    assert!(
+        kernel_mount_at(&held).is_some(),
+        "the mount is never detached"
+    );
+    assert!(
+        trash.exists(),
+        "the retirement still authorises the next pass"
+    );
+
+    unmount(&held);
+    let report = execute_gc(&host, &fixture.config())
+        .expect("reclaim once nothing is mounted beneath the temp dir");
+    assert_eq!(report.reclaimed, 1);
+    assert!(!trash.exists(), "the retired image is reclaimed");
+    assert!(!exec_temp.exists(), "the temp dir is reclaimed with it");
+}
+
 #[test]
 fn flock_child_helper() {
     let Ok(root) = std::env::var("COWSHED_FLOCK_HELPER_ROOT") else {
