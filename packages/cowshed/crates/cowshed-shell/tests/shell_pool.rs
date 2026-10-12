@@ -1104,17 +1104,24 @@ async fn host_controller_a_cold_activation_is_sampled_before_its_command_starts(
     );
 
     release(&tmp.join("activation-hold")).await;
-    let command_pid = read_pid(&tmp.join("command-pid")).await;
+    let command_pid = u32::try_from(read_pid(&tmp.join("command-pid")).await).expect("pid");
     let before = std::time::Instant::now();
-    let running = handle
-        .resources(job)
-        .await
-        .expect("a running job is sampled");
-    assert_eq!(
-        running.leader_pid,
-        u32::try_from(command_pid).expect("pid"),
-        "the command leads its own group"
-    );
+    // A new leader is the supervisor's own sample boundary, not JobState::Running
+    // and not this read. The read leaves the open window open.
+    let running = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let sample = handle
+                .resources(job)
+                .await
+                .expect("a running job is sampled");
+            if sample.leader_pid == command_pid {
+                break sample;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the new-leader sample names the command");
     assert_eq!(
         running.host_start, activating.host_start,
         "the command keeps the activation's spawn host baseline"
