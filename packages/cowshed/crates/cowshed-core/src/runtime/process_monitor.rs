@@ -210,7 +210,8 @@ impl ProcessMonitor {
             .acknowledged(|reply| Request::Gap { reason, reply })
     }
 
-    /// Drain queued native exits before marking the retained stream terminal.
+    /// Drain the job's accounting boundary. Still-live descendants remain watched, and their
+    /// stream ends only when the last retained registration ends.
     pub(crate) fn finish(&self) -> Result<()> {
         self.driver.acknowledged(|reply| Request::Finish { reply })
     }
@@ -429,7 +430,9 @@ impl Writer {
         loop {
             if let Err(error) = self.observer.drain() {
                 self.publish(Err(observation_error(error)));
-            } else if self.observer.has_events() {
+            } else if self.observer.has_events()
+                || (self.finished && !self.observer.watching() && !self.ended)
+            {
                 self.publish(Ok(()));
             }
             while let Ok(request) = receiver.try_recv() {
@@ -568,5 +571,34 @@ fn control(queue: i32, flags: u16, fflags: u32) -> io::Result<()> {
         Err(io::Error::last_os_error())
     } else {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::process::ProcessCoverage;
+
+    #[tokio::test]
+    async fn finishing_a_live_observation_neither_invents_loss_nor_ends_its_reader() {
+        let monitor = ProcessMonitor::prepare(JobId::new(1).unwrap()).unwrap();
+        monitor.watch(std::process::id()).unwrap();
+        assert_eq!(monitor.tree().unwrap().coverage, ProcessCoverage::Complete);
+        monitor.finish().unwrap();
+        assert_eq!(monitor.tree().unwrap().coverage, ProcessCoverage::Complete);
+        let mut events = monitor.subscribe(Duration::from_millis(20)).await.unwrap();
+        assert!(
+            matches!(events.next().await, Some(Ok(JobProcessEvent::Born { process, .. })) if process.pid == std::process::id())
+        );
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(50);
+        loop {
+            match tokio::time::timeout_at(deadline, events.next()).await {
+                Ok(Some(Ok(_))) => {}
+                Ok(other) => panic!("the live owner's reader ended or failed: {other:?}"),
+                Err(_) => break,
+            }
+        }
+        drop(events);
+        assert!(monitor.tree().unwrap().processes[0].exit.is_none());
     }
 }

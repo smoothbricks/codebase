@@ -370,7 +370,9 @@ mod tests {
     }
 
     #[test]
-    fn the_shared_sealer_keeps_signed_precision_source_and_unavailable_io() {
+    #[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+    fn host_controller_job_reconciliation_sealer_keeps_signed_precision_source_and_unavailable_io()
+    {
         let root = crate::temp_root::TempRoot::new("cowshed-unattributed");
         let cases = [
             accounting(

@@ -2904,7 +2904,7 @@ async fn napi_job_read<T: serde::de::DeserializeOwned>(
             ])
             .arg(node)
             .arg(client)
-            .env("NAPI_DEBUG_ADDON", "1")
+            .env_remove("NAPI_DEBUG_ADDON")
             .env_remove("FORCE_COLOR")
             .current_dir(&package)
             .stdin(std::process::Stdio::from(endpoint))
