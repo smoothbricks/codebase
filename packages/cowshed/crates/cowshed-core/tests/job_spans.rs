@@ -1,16 +1,21 @@
 //! A job's span through the supervisor's production span writer (13_telemetry.md, "Job span
-//! segments"): the writer seals each edge of the span as the segment a reader of lmao's trace
-//! schema decodes, carrying exactly the columns the declaration names.
+//! segments", "Process-tree spans"): the writer seals each edge of the span as the segment a
+//! reader of lmao's trace schema decodes, carrying exactly the columns the declaration names and
+//! the host and volume facts of the job's two boundaries.
 
 use std::path::Path;
 
 use arrow_array::RecordBatch;
-use arrow_array::types::UInt64Type;
+use arrow_array::types::{Int64Type, UInt16Type, UInt32Type, UInt64Type};
 use arrow_schema::{DataType, Field, Schema};
 use cowshed_core::api::{
-    ExecCommand, ExitStatus, JobId, JobInfo, JobState, OutputStorage, OutputSummary,
-    ProtectedOutput, Sha256Digest, SpanId, StdinInfo, StdinKind, StreamInfo, TraceContext, TraceId,
-    UtcTimestamp, WorkspaceIncarnation, WorkspacePath,
+    CpuMicros, CpuMicrosDelta, CpuTotals, ExecCommand, ExitStatus, HostLoadSample, JobAccounting,
+    JobId, JobInfo, JobLeafAttribution, JobResourceSample, JobState, JobStreamWatermark,
+    JobVolumeUsage, OneCoreCpuPercent, OutputStorage, OutputSummary, ProcessCoverage,
+    ProtectedOutput, ResidentBytes, Sha256Digest, SpanId, StdinInfo, StdinKind, StreamBytes,
+    StreamInfo, StreamLines, TraceContext, TraceId, UsageReconciliation, UtcTimestamp,
+    VolumeUnavailable, VolumeUsage, VolumeUsedBytesDelta, WallMicros, WorkspaceIncarnation,
+    WorkspacePath,
 };
 use cowshed_core::repository::RepoId;
 use cowshed_core::runtime::job_spans::{
@@ -37,6 +42,10 @@ fn spec_job_columns() -> Vec<Column> {
         ("grant_revision", "u64", false),
         ("w3c_span_id", "u64", false),
         ("job_state", "utf8", true),
+        ("disk_ws_delta_bytes", "i64", true),
+        ("disk_build_delta_bytes", "i64", true),
+        ("load1_milli", "u32", true),
+        ("cores", "u16", true),
     ]
 }
 
@@ -103,7 +112,7 @@ fn running_job() -> JobInfo {
 /// return the two segments it sealed.
 async fn sealed_start_and_end(telemetry: &Path, info: &JobInfo) -> Vec<(String, RecordBatch)> {
     let publisher = JobSpanPublisher::start(telemetry.to_path_buf());
-    publisher.record(info, JobSpanEdge::Start);
+    publisher.record(info, JobSpanEdge::Start { host: None });
     publisher.record(
         info,
         JobSpanEdge::end(JobState::Exited, Some(&ExitStatus::Exited { code: 0 })),
@@ -184,5 +193,251 @@ async fn a_sealed_job_span_carries_exactly_the_declared_columns() {
     assert!(
         exact_schema(&schema, &nullable).is_err(),
         "a required column read as nullable"
+    );
+}
+
+/// `info`'s job, running as job `job_id`.
+fn job(job_id: u64) -> JobInfo {
+    JobInfo {
+        job_id: JobId::new(job_id).expect("a job id"),
+        ..running_job()
+    }
+}
+
+/// A terminal resource sample of `job_id` whose hosts and volumes are the ones given; every
+/// other reading is quiet.
+fn sample(
+    job_id: JobId,
+    host_start: HostLoadSample,
+    host: HostLoadSample,
+    volumes: JobVolumeUsage,
+) -> JobResourceSample {
+    let wall = WallMicros::new(1_000_000).expect("a wall time");
+    let zero = CpuMicros::new(0).expect("a CPU time");
+    let quiet = JobStreamWatermark {
+        bytes: StreamBytes::new(0).expect("bytes"),
+        lines: StreamLines::new(0).expect("lines"),
+    };
+    JobResourceSample {
+        job_id,
+        sampled_at: utc(1),
+        wall_ms: wall.millis(),
+        wall_us: wall,
+        leader_pid: 100,
+        members: Vec::new(),
+        leaf: JobLeafAttribution::NoAccountedCpu,
+        cpu_user_ms: zero.millis(),
+        cpu_sys_ms: zero.millis(),
+        cpu_pct: OneCoreCpuPercent::ZERO,
+        host_start,
+        host,
+        rss_bytes: ResidentBytes::ZERO,
+        rss_peak_bytes: ResidentBytes::ZERO,
+        accounting: JobAccounting::MacOsRusageChildren {
+            cpu: CpuTotals {
+                user_us: zero,
+                sys_us: zero,
+            },
+            io: None,
+            reconciliation: UsageReconciliation {
+                cpu_us: CpuMicrosDelta::new(0).expect("a CPU delta"),
+                io_read_bytes: None,
+                io_write_bytes: None,
+                coverage: ProcessCoverage::Complete,
+            },
+        },
+        volumes,
+        stdout: quiet,
+        stderr: quiet,
+    }
+}
+
+fn read(bytes: i64) -> VolumeUsage {
+    VolumeUsage::Read {
+        delta_bytes: VolumeUsedBytesDelta::new(bytes).expect("a volume delta"),
+    }
+}
+
+fn unavailable(reason: VolumeUnavailable) -> VolumeUsage {
+    VolumeUsage::Unavailable { reason }
+}
+
+/// What one sealed edge states of the host and the volumes.
+#[derive(Debug, Eq, PartialEq)]
+struct Facts {
+    load1_milli: Option<u32>,
+    cores: Option<u16>,
+    disk_ws_delta_bytes: Option<i64>,
+    disk_build_delta_bytes: Option<i64>,
+}
+
+impl Facts {
+    const NONE: Self = Self {
+        load1_milli: None,
+        cores: None,
+        disk_ws_delta_bytes: None,
+        disk_build_delta_bytes: None,
+    };
+
+    fn of(batch: &RecordBatch) -> Self {
+        Self {
+            load1_milli: number_cell::<UInt32Type>(batch, "load1_milli", 0),
+            cores: number_cell::<UInt16Type>(batch, "cores", 0),
+            disk_ws_delta_bytes: number_cell::<Int64Type>(batch, "disk_ws_delta_bytes", 0),
+            disk_build_delta_bytes: number_cell::<Int64Type>(batch, "disk_build_delta_bytes", 0),
+        }
+    }
+}
+
+/// Two sampled hosts and signed volume deltas reach one job span's start and end rows through the
+/// production writer: the start row states the start host, the end row the terminal sample's host
+/// and each volume's actual delta. A job with no build volume leaves that column null; adding a
+/// volume then states its delta, negative when deletion shrank it; a delta of zero is a value; a
+/// volume whose usage was unavailable, and a job with no sample at all, state nothing.
+#[tokio::test]
+async fn host_and_volume_facts_reach_the_start_and_end_rows_of_each_job_span() {
+    let telemetry = TempRoot::new("cowshed-job-span-facts");
+    let publisher = JobSpanPublisher::start(telemetry.to_path_buf());
+    let start_host = HostLoadSample::new(1.2346, 8).expect("a host");
+    let end_host = HostLoadSample::new(2.5, 12).expect("a host");
+    let failed = VolumeUnavailable::Failed {
+        message: "the stat failed".to_owned(),
+    };
+    // Each job's volumes, and the disk cells its end row states.
+    let cases = [
+        (
+            JobVolumeUsage {
+                workspace: read(4096),
+                build: None,
+            },
+            (Some(4096), None),
+        ),
+        (
+            JobVolumeUsage {
+                workspace: read(-8192),
+                build: Some(read(-1_048_576)),
+            },
+            (Some(-8192), Some(-1_048_576)),
+        ),
+        (
+            JobVolumeUsage {
+                workspace: read(0),
+                build: Some(read(0)),
+            },
+            (Some(0), Some(0)),
+        ),
+        (
+            JobVolumeUsage {
+                workspace: unavailable(VolumeUnavailable::Unconfigured),
+                build: Some(unavailable(failed)),
+            },
+            (None, None),
+        ),
+    ];
+    let end = JobSpanEdge::end(JobState::Exited, Some(&ExitStatus::Exited { code: 0 }));
+    for (index, (volumes, _)) in cases.iter().enumerate() {
+        let info = JobInfo {
+            resources: Some(sample(
+                JobId::new(u64::try_from(index).unwrap() + 1).unwrap(),
+                start_host,
+                end_host,
+                volumes.clone(),
+            )),
+            ..job(u64::try_from(index).unwrap() + 1)
+        };
+        publisher.record(
+            &info,
+            JobSpanEdge::Start {
+                host: Some(start_host),
+            },
+        );
+        publisher.record(&info, end);
+    }
+    // No sample and no admission host: nothing is stated, and nothing is zero.
+    let unsampled = job(5);
+    publisher.record(&unsampled, JobSpanEdge::Start { host: None });
+    publisher.record(&unsampled, end);
+    let health = publisher.health().await.expect("the writer answers");
+    assert_eq!((health.recorded, health.failed), (10, 0), "{health:?}");
+
+    let segments = sealed_segments(&telemetry, "job-");
+    assert_eq!(segments.len(), 10);
+    for (name, batch) in &segments {
+        exact_schema(&batch.schema(), &spec_job_columns())
+            .unwrap_or_else(|error| panic!("{name}: {error}"));
+    }
+    for (index, (_, (workspace, build))) in cases.iter().enumerate() {
+        let (start, end) = (&segments[index * 2].1, &segments[index * 2 + 1].1);
+        let job_id = u64::try_from(index).unwrap() + 1;
+        assert_eq!(number_cell::<UInt64Type>(start, "job_id", 0), Some(job_id));
+        assert_eq!(number_cell::<UInt64Type>(end, "job_id", 0), Some(job_id));
+        assert_eq!(
+            Facts::of(start),
+            Facts {
+                load1_milli: Some(1235),
+                cores: Some(8),
+                ..Facts::NONE
+            },
+            "job {job_id}'s start row states its host, rounded to the nearest milliload, and no volume"
+        );
+        assert_eq!(
+            Facts::of(end),
+            Facts {
+                load1_milli: Some(2500),
+                cores: Some(12),
+                disk_ws_delta_bytes: *workspace,
+                disk_build_delta_bytes: *build,
+            },
+            "job {job_id}'s end row"
+        );
+    }
+    assert_eq!(Facts::of(&segments[8].1), Facts::NONE);
+    assert_eq!(Facts::of(&segments[9].1), Facts::NONE);
+}
+
+/// A load that no `u32` milliload holds is refused by the checked conversion, never truncated:
+/// the row it would have described is not sealed, and the refusal is counted with its reason.
+#[tokio::test]
+async fn a_load_no_milliload_column_holds_is_refused_and_counted() {
+    let telemetry = TempRoot::new("cowshed-job-span-overflow");
+    let publisher = JobSpanPublisher::start(telemetry.to_path_buf());
+    let sound = HostLoadSample::new(1.0, 8).expect("a host");
+    // Finite and non-negative, so the API's own unit admits it; 5e9 milliloads exceed `u32`.
+    let beyond = HostLoadSample::new(5_000_000.0, 8).expect("a finite load");
+    let info = JobInfo {
+        resources: Some(sample(
+            JobId::new(JOB).unwrap(),
+            sound,
+            beyond,
+            JobVolumeUsage {
+                workspace: read(1),
+                build: None,
+            },
+        )),
+        ..running_job()
+    };
+    publisher.record(&info, JobSpanEdge::Start { host: Some(sound) });
+    publisher.record(
+        &info,
+        JobSpanEdge::end(JobState::Exited, Some(&ExitStatus::Exited { code: 0 })),
+    );
+    let health = publisher.health().await.expect("the writer answers");
+    assert_eq!((health.recorded, health.failed), (1, 1), "{health:?}");
+    assert!(
+        health
+            .last_failure
+            .as_deref()
+            .is_some_and(|failure| failure.contains("exceeds the u32 milliload range")),
+        "{health:?}"
+    );
+    let segments = sealed_segments(&telemetry, "job-");
+    assert_eq!(segments.len(), 1, "only the start row was sealed");
+    assert_eq!(
+        Facts::of(&segments[0].1),
+        Facts {
+            load1_milli: Some(1000),
+            cores: Some(8),
+            ..Facts::NONE
+        }
     );
 }

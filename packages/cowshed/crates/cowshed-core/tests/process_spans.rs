@@ -64,6 +64,15 @@ fn spec_process_columns() -> Vec<Column> {
     ]
 }
 
+/// The job span's host and volume columns, as 13_telemetry.md declares them. They belong to the job
+/// span alone: no process span carries any of them.
+const JOB_ONLY_COLUMNS: [Column; 4] = [
+    ("disk_ws_delta_bytes", "i64", true),
+    ("disk_build_delta_bytes", "i64", true),
+    ("load1_milli", "u32", true),
+    ("cores", "u16", true),
+];
+
 /// One decoded row of a sealed process segment.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct Row {
@@ -862,6 +871,16 @@ async fn a_job_s_process_tree_is_three_parented_process_run_spans_over_fourteen_
         .is_err(),
         "a JSON payload column"
     );
+    // The job span's host and volume columns are its alone: added to any process segment they fail
+    // the exact-schema oracle, which every real process segment passed above without them.
+    for (name, batch) in &segments {
+        let mut columns = batch.schema().fields().iter().cloned().collect::<Vec<_>>();
+        columns.extend(fields(&JOB_ONLY_COLUMNS).into_iter().map(Into::into));
+        assert!(
+            exact_schema(&Schema::new(columns), &spec_process_columns()).is_err(),
+            "{name} with the job span's columns"
+        );
+    }
     let mut logged_unchanged = rows.clone();
     let mut unchanged = idle[0].clone();
     unchanged.message = "process.usage".to_owned();
