@@ -135,11 +135,15 @@ display writes an argument of only `[A-Za-z0-9_@%+=:,./-]` bare and any other in
 `S.text` are `u32`-keyed dictionaries.
 
 The job span, not each process span, carries signed `disk_ws_delta_bytes` and optional `disk_build_delta_bytes`,
-`load1_milli: u32` at start and end, and `cores: u16` at those same boundaries. Host load converts once to nearest
+`load1_milli: u32` at start and end, and `cores: u16` at those same boundaries. The start row states the host as the
+supervisor read it at admission, when no process exists yet to sample; the end row states the job's terminal resource
+sample: its host, and each volume's used-bytes change since admission's baseline. Host load converts once to nearest
 milliload with the declared checked conversion; non-finite, negative, or overflowing load and an overflowing core count
-are typed errors, never truncation. A missing build volume leaves its delta null. A volume whose usage is `Unavailable`
-(07_api.md: unconfigured, an unsupported platform, or a failed stat) also leaves its delta null, never zero; the job's
-resource sample carries the reason. Process I/O and volume allocation remain different facts.
+are typed errors, never truncation, and the row they would have described is refused and counted in the trace health. A
+missing build volume leaves its delta null. A volume whose usage is `Unavailable` (07_api.md: unconfigured, an
+unsupported platform, or a failed stat) also leaves its delta null, never zero; the job's resource sample carries the
+reason. A job that owned no process, or whose terminal sample could not be taken, leaves every end-row host and volume
+cell null. All four columns are nullable. Process I/O and volume allocation remain different facts.
 
 Linux job accounting retains the complete cgroup-v2 CPU and storage-I/O counters and separate charged-memory
 current/peak; charged memory includes cache/kernel charges and is never written into an RSS column. macOS retains the

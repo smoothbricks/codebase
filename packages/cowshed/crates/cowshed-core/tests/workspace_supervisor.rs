@@ -5986,13 +5986,9 @@ struct JobSpanRow {
     job_state: Option<String>,
 }
 
-/// Every job-span segment under `telemetry`, in the order its writer sealed them, as one row
-/// each.
-fn job_spans(telemetry: &Path) -> Vec<(String, JobSpanRow)> {
-    use arrow_array::Array as _;
-    use arrow_array::cast::AsArray as _;
-    use arrow_array::types::{UInt8Type, UInt32Type, UInt64Type};
-
+/// Every job-span segment under `telemetry`, in the order its writer sealed them: its name and its
+/// one batch of one row.
+fn job_span_batches(telemetry: &Path) -> Vec<(String, arrow_array::RecordBatch)> {
     let mut segments = Vec::new();
     for partition in std::fs::read_dir(telemetry).expect("list telemetry root") {
         for entry in std::fs::read_dir(partition.expect("partition").path()).expect("list date") {
@@ -6015,6 +6011,21 @@ fn job_spans(telemetry: &Path) -> Vec<(String, JobSpanRow)> {
             let batch = reader.next().expect("one batch").expect("valid batch");
             assert!(reader.next().is_none(), "{name} holds one batch");
             assert_eq!(batch.num_rows(), 1, "{name} holds one row");
+            (name, batch)
+        })
+        .collect()
+}
+
+/// Every job-span segment under `telemetry`, in the order its writer sealed them, as one row
+/// each.
+fn job_spans(telemetry: &Path) -> Vec<(String, JobSpanRow)> {
+    use arrow_array::Array as _;
+    use arrow_array::cast::AsArray as _;
+    use arrow_array::types::{UInt8Type, UInt32Type, UInt64Type};
+
+    job_span_batches(telemetry)
+        .into_iter()
+        .map(|(name, batch)| {
             let column = |name: &str| batch.column_by_name(name).expect(name).clone();
             let text = |name: &str| {
                 let column = column(name);
@@ -6420,4 +6431,101 @@ async fn host_controller_a_real_exec_seals_one_job_span_through_the_production_s
         ],
     );
     handle.retire().await.unwrap();
+}
+
+/// A job's span states the host at its two boundaries as the supervisor found it: the start row as
+/// admission read it, the end row as the job's terminal resource sample holds it. A supervisor
+/// configured with no volume to stat states no volume change: those cells are null, never zero.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn a_job_span_states_the_admission_host_and_the_terminal_sample_s_host() {
+    use arrow_array::cast::AsArray as _;
+    use arrow_array::types::{Int64Type, UInt16Type, UInt32Type};
+    use cowshed_core::api::{VolumeUnavailable, VolumeUsage};
+    use cowshed_core::runtime::job_span_facts::HostColumns;
+
+    let (mut supervisor_config, root) = isolated_config("job-span-facts");
+    let telemetry = root.join("telemetry");
+    std::fs::create_dir(&telemetry).unwrap();
+    supervisor_config.telemetry_root = Some(telemetry.clone());
+    let mut harness = warm_harness(supervisor_config);
+    let (handle, spawned) = (harness.handle.clone(), &mut harness.spawned);
+
+    let before = cowshed_core::host_load::read_host_load().expect("a host before admission");
+    let job_id = handle
+        .exec(None, None, request(StdinSource::Empty))
+        .await
+        .unwrap();
+    let after = cowshed_core::host_load::read_host_load().expect("a host after admission");
+    let job = spawned.recv().await.unwrap();
+
+    let command = lone_group();
+    deliver(
+        &handle,
+        &job,
+        ProcessEvent::Started {
+            job_id,
+            process: owned(&command, Instant::now()),
+        },
+        0,
+    )
+    .await;
+    end_group(&command);
+    complete(&job, b"", b"", ExitStatus::Exited { code: 0 }).await;
+    let ended = handle.wait(job_id).await.unwrap();
+    reap(command);
+    let terminal = ended.resources.expect("a terminal sample");
+    assert!(
+        matches!(
+            terminal.volumes.workspace,
+            VolumeUsage::Unavailable {
+                reason: VolumeUnavailable::Unconfigured
+            }
+        ) && terminal.volumes.build.is_none(),
+        "the supervisor was configured with no volume: {:?}",
+        terminal.volumes
+    );
+    let health = handle.trace_health().await.unwrap();
+    assert_eq!((health.recorded, health.failed), (2, 0), "{health:?}");
+
+    let facts = |batch: &arrow_array::RecordBatch| {
+        let cell = |name: &str| batch.column_by_name(name).expect(name).clone();
+        let milli = cell("load1_milli");
+        let cores = cell("cores");
+        let workspace = cell("disk_ws_delta_bytes");
+        let build = cell("disk_build_delta_bytes");
+        (
+            milli.as_primitive::<UInt32Type>().iter().next().flatten(),
+            cores.as_primitive::<UInt16Type>().iter().next().flatten(),
+            workspace
+                .as_primitive::<Int64Type>()
+                .iter()
+                .next()
+                .flatten(),
+            build.as_primitive::<Int64Type>().iter().next().flatten(),
+        )
+    };
+    let batches = job_span_batches(&telemetry);
+    assert_eq!(batches.len(), 2, "a start and an end row");
+
+    // The start row's host lies between independent reads taken around admission.
+    let milli = |host| HostColumns::of(host).expect("a host in range");
+    let (low, high) = (
+        milli(before).load1_milli.min(milli(after).load1_milli),
+        milli(before).load1_milli.max(milli(after).load1_milli),
+    );
+    let (start_load, start_cores, start_workspace, start_build) = facts(&batches[0].1);
+    assert!(
+        start_load.is_some_and(|load| (low..=high).contains(&load)),
+        "start load {start_load:?} outside {low}..={high}"
+    );
+    assert_eq!(start_cores, Some(before.cores.get()));
+    assert_eq!((start_workspace, start_build), (None, None));
+
+    // The end row is the terminal sample's host, and no volume change it did not state.
+    let host = milli(terminal.host);
+    assert_eq!(
+        facts(&batches[1].1),
+        (Some(host.load1_milli), Some(host.cores), None, None)
+    );
 }

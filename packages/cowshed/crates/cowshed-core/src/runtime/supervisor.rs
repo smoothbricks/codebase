@@ -4387,6 +4387,7 @@ impl SupervisorActor {
             stdin: stdin_info,
             failure: None,
         };
+
         // Read before the job's first process is dispatched, so nothing it writes precedes its
         // baseline: a warm host may start the command before its start is reported here.
         let volumes = {
@@ -5719,6 +5720,22 @@ async fn next_sample_tick(clock: &mut Option<tokio::time::Interval>) {
             clock.tick().await;
         }
         None => std::future::pending().await,
+    }
+}
+
+/// The host as admission finds it, for the job span's start row: no resource sample exists yet,
+/// and the sample's own `host_start` is read by the spawn that follows. A failed read leaves the
+/// row's host columns null, said on stderr as a failed sample is.
+fn admission_host(job_id: JobId) -> Option<HostLoadSample> {
+    match crate::host_load::read_host_load() {
+        Ok(host) => Some(host),
+        Err(error) => {
+            eprintln!(
+                "cowshed: job {} start host observation failed: {error}",
+                job_id.get()
+            );
+            None
+        }
     }
 }
 

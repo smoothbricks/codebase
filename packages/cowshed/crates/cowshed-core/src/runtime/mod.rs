@@ -11,6 +11,7 @@ pub mod job_cgroup;
 pub mod job_groups;
 pub mod job_progress;
 mod job_resources;
+pub mod job_span_facts;
 pub mod job_spans;
 pub mod job_unattributed;
 pub(crate) mod nx_daemon;
