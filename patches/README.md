@@ -66,6 +66,75 @@ stack trace to explain a configuration failure.
 same-named projects and a local plugin, then native, serialized and circular plugin-load failures. Drop this hunk only
 when the installed upstream version preserves these diagnostics, retaining the regressions.
 
+## Event-driven daemon validity
+
+The daemon-validity hunks adapt [nrwl/nx PR #37113](https://github.com/nrwl/nx/pull/37113)
+(`5812d81d9b00818c00b4a2022f04c998bd1fa381`, addressing [#37112](https://github.com/nrwl/nx/issues/37112)) to the pinned
+Nx 23.2.1 distribution. Root lockfile changes restart the daemon only after the native workspace context has hashed the
+watcher batch and dropped same-byte rewrites. The startup lockfile baseline is captured before watch/scan. Nested
+lockfiles are not workspace lockfiles. The owner-record watcher retires a displaced daemon without waiting for a poll.
+
+Nx 23.2.1 has neither the upstream `ChangeBatch` API nor its `rescan` event. This adaptation checks validity once per
+request, including requests on an existing connection, and retains a 5000ms unref'd safety interval for missed events
+and socket loss. There is no 20ms validity loop. Each check preserves fresh installed-version resolution and the
+daemon's captured socket inode/path: a package-link swap, replaced ownership record or replaced socket cannot leave the
+old daemon serving requests or deleting its successor's socket. Root lockfile names as well as bytes enter the fallback
+hash, so a missed rename between lockfile formats is visible. A termination latch prevents duplicate replacement spawns
+and serving queued requests during asynchronous restart.
+
+The package-link regression also exposed a stale realpath in Node's resolver: clearing `Module._pathCache` did not make
+an existing daemon notice that `node_modules/nx` now pointed at a different version. The installed-version owner
+therefore reads the literal `node_modules/<package>/package.json` through each `getNxRequirePaths()` directory, in
+order, so the filesystem follows the current link on every read. Only non-node_modules/PnP layouts fall back to the
+existing detached, cache-shielded resolver. Invalid metadata does not fall through to a different installed copy.
+
+The existing ignore-file content snapshot, watch-before-scan ordering, exclusive daemon claim and five-minute inactivity
+policy remain unchanged. This follows `specs/cowshed/04_sandbox.md`'s fixture ownership and one-state-per- checkout
+contract and `packages/nx-plugin/README.md`'s runtime-state exclusions and daemon policy. `nx-daemon-validity.test.ts`
+exercises the installed product's lockfiles, metadata, ownership and socket lifecycle; the existing claim, ignore-file
+and idle-policy regressions remain required. The opt-in `nx-daemon-idle-cpu.test.ts` measures an owned idle daemon using
+the kernel's cumulative CPU time, without a profiler or writes during the 30-second window. Run it through the host-only
+process-census lane:
+
+```sh
+direnv exec <shed> nx run nx-plugin:test-shard1 \
+  --command="NX_DAEMON_CPU_PROOF=true bun test --timeout=120000 src/nx-daemon-idle-cpu.test.ts" \
+  --forwardAllArgs=false
+```
+
+Drop these hunks only when the installed upstream version has the event-driven checks, retaining behavioral and idle CPU
+evidence. This is a carry of the existing upstream PR, not a new upstream issue.
+
+### Upstream PR comment draft
+
+Draft for [nrwl/nx#37113](https://github.com/nrwl/nx/pull/37113); not posted. This is evidence for the existing PR, not
+a new issue:
+
+> We carried this change into our pinned Nx 23.2.1 distribution and measured an owned idle daemon on macOS arm64 with
+> Node and a real 680,830-byte `bun.lock`. The same persisted fixture/proof samples the kernel's cumulative daemon CPU
+> time over 30 seconds, with no profiler, requests or source writes during the window:
+>
+> - Before: 0.79 CPU seconds / 30.032888166 wall seconds = 2.63045% of one core.
+> - Event-driven adaptation: 0.03 CPU seconds / 30.017752375 wall seconds = 0.09994% of one core.
+> - Reduction: 96.2%. These are sequential windows under changing host load, not randomized repeated samples; the
+>   kernel's CPU-time display has 0.01-second precision.
+>
+> A separate earlier diagnostic that changed only the interval from 20ms to 1000ms measured 1.14 / 30.018672083 seconds
+> (3.79764% core) versus 0.05 / 30.027052958 seconds (0.16652% core), a 95.6% reduction. That is a different experiment,
+> not the event-driven arm above.
+>
+> The pinned version predates `ChangeBatch`/`rescan`, so we hook lockfile restart after native context hashing has
+> dropped unchanged-byte writes. We retain a slow 5-second safety check for missed events and removed/replaced sockets,
+> and check freshness at each request boundary (including requests on a long-lived connection). Real-daemon regressions
+> cover all five root lockfiles' create/change/atomic replacement/delete, same-byte writes, nested lockfiles, ignored
+> lockfiles, installed-version changes, ownership takeover and socket removal/replacement.
+>
+> One additional correctness finding: clearing `Module._pathCache` did not make the old daemon see a `node_modules/nx`
+> symlink swap. Its next PING still succeeded after the link selected a different installed version. Reading the literal
+> `node_modules/<package>/package.json` along `getNxRequirePaths()` makes the filesystem follow the current link on
+> every read; the detached resolver remains the fallback for non-node_modules/PnP layouts. This repair makes our
+> package-link regression pass. A per-connection/request validity check should not rely on stale resolver realpaths.
+
 ## Canonical daemon workspace roots
 
 The daemon and plugin-worker message guard compares canonical path strings. A redundant trailing separator does not make
