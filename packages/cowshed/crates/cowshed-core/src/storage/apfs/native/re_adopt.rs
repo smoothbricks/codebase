@@ -367,17 +367,14 @@ where
                     build,
                     SeedSource::Unclaimed(&build.id),
                 ),
-                // Main's own volume outlived main's image: it is mounted where main's build link
-                // points and seeded as it is, under its own claim.
-                Some(MissingMainBuild::Kept(build)) => {
-                    self.mount_build_volume(layout, &build.kept)?;
-                    self.seed_replacement(
-                        layout,
-                        source,
-                        SeedSource::Unclaimed(&build.kept),
-                        &build.record,
-                    )
-                }
+                // Main's own volume outlived main's image: seed it before mounting it where
+                // main's build link points, under its own claim.
+                Some(MissingMainBuild::Kept(build)) => self.seed_replacement(
+                    layout,
+                    source,
+                    SeedSource::Unclaimed(&build.kept),
+                    &build.record,
+                ),
                 None => Ok(()),
             },
             (ReAdoptMain::Retained(_), None, None) => Ok(()),
@@ -459,9 +456,10 @@ where
         self.seed_replacement(layout, source, seed, &build.record)
     }
 
-    /// Freeze one seed of main's published build volume for the replacement incarnation, under
-    /// the claim `seed` says it is captured with; the old incarnation's seeds stay retained. A
-    /// seed an earlier attempt froze is kept.
+    /// Freeze one seed of main's published build volume, then mount the live volume where main's
+    /// link points. An already-detached source is captured before its first mount, not mounted
+    /// merely to detach and restore it for capture. Admission stays closed through the new seed's
+    /// post-mount freshness mark. A seed an earlier attempt froze keeps its original mark.
     fn seed_replacement(
         &self,
         layout: &BuildVolumeLayout,
@@ -469,35 +467,49 @@ where
         seed: SeedSource<'_>,
         owner: &BuildVolumeRecord,
     ) -> Result<(), ApfsStorageError> {
+        let acquired;
+        let claim = match seed {
+            SeedSource::Claimed(claim) => claim,
+            SeedSource::Unclaimed(id) => {
+                acquired = match self.claim_build_volume(layout, id)? {
+                    super::build_volumes::Claim::Claimed(claim) => claim,
+                    super::build_volumes::Claim::Held { open } => {
+                        return Err(ApfsStorageError::BuildVolumeHeld {
+                            image: layout.image(id),
+                            hold: layout.hold_path(id),
+                            open,
+                        });
+                    }
+                };
+                &acquired
+            }
+        };
         let seeded = layout
             .seed_of(&crate::metadata::WorkspaceName::main(), &source.replacement)
             .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
-        if seeded.is_none() {
-            let destination = BuildVolumeId::mint();
-            let record = BuildVolumeRecord::new(
-                owner.tree.clone(),
-                BuildVolumeRole::Seed {
-                    target: crate::metadata::WorkspaceName::main(),
-                    incarnation: source.replacement.clone(),
-                },
-            );
-            match seed {
-                SeedSource::Claimed(claim) => {
-                    self.clone_claimed_build_volume(layout, claim, &destination, &record)?;
-                }
-                SeedSource::Unclaimed(id) => {
-                    self.clone_build_volume(layout, id, &destination, &record)?;
-                }
-            }
+        if seeded.is_some() {
+            self.mount_build_volume(layout, claim.id())?;
+            return Ok(());
         }
-        Ok(())
+        let destination = BuildVolumeId::mint();
+        let record = BuildVolumeRecord::new(
+            owner.tree.clone(),
+            BuildVolumeRole::Seed {
+                target: crate::metadata::WorkspaceName::main(),
+                incarnation: source.replacement.clone(),
+            },
+        );
+        self.clone_claimed_build_volume(layout, claim, &destination, &record)?;
+        self.mount_build_volume(layout, claim.id())?;
+        let written = self.build_volume_written(layout, claim.id())?;
+        self.mark_seed_written(layout, &destination, written)
     }
 
     /// Publish a verified build replacement under its build volume identity: detach it without
     /// force (an attached image is never renamed), rename it to the build image path the retained
-    /// volume left, write the recorded owner record verbatim, and mount it where the build link
-    /// points (16_build_volumes.md, "Targets and seeds"). Converges from whichever step a crash
-    /// interrupted.
+    /// volume left, and write the recorded owner record verbatim. Leave it detached so
+    /// `seed_replacement` can capture it before mounting (16_build_volumes.md, "Targets and seeds").
+    /// Converges from whichever step a crash interrupted.
     fn publish_build_replacement(
         &self,
         layout: &BuildVolumeLayout,
@@ -546,10 +558,7 @@ where
         }
         layout
             .write_record(&build.id, &build.owner_record)
-            .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
-        self.mount_build_volume(layout, &build.id)?;
-
-        Ok(())
+            .map_err(|error| ApfsStorageError::Host(error.to_string()))
     }
 
     fn retain_image<const N: usize>(
@@ -879,4 +888,161 @@ fn replacement_published(
         .read_record_present(&build.id)
         .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
     Ok(recorded.as_ref() == Some(&build.owner_record))
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+    use crate::apfs::{
+        AttachedDiskImage, CommandOutput, CommandRequest, CommandRunError, CommandRunFailure,
+    };
+    use crate::fork_lock::Fenced;
+    use crate::metadata::{WorkspaceIncarnation, WorkspaceName};
+    use crate::storage::StorageLayout;
+    use crate::storage::apfs::ApfsSubstrateConfig;
+    use crate::storage::recovery::{
+        ReAdoptKeptBuild, ReAdoptMissingMain, preserved_checkout, re_adopt_tests::Fixture,
+    };
+
+    struct RefuseFirstMount {
+        layout: BuildVolumeLayout,
+        id: BuildVolumeId,
+        incarnation: WorkspaceIncarnation,
+    }
+
+    impl CommandRunner for RefuseFirstMount {
+        fn run(&self, request: &CommandRequest) -> Result<CommandOutput, CommandRunError> {
+            assert_eq!(request.program, Path::new("/usr/sbin/diskutil"));
+            assert_eq!(request.args[0], "image");
+            assert_eq!(request.args[1], "attach");
+            assert!(
+                self.layout
+                    .seed_of(&WorkspaceName::main(), &self.incarnation)
+                    .unwrap()
+                    .is_some(),
+                "seed the detached build before its first attach, not after a mount/detach cycle"
+            );
+            assert_eq!(
+                self.layout.hold(&self.id).unwrap_err().kind(),
+                io::ErrorKind::ResourceBusy,
+                "job admission stays closed through the mount and freshness mark"
+            );
+            Err(CommandRunError {
+                request: request.clone(),
+                failure: CommandRunFailure::Spawn(io::Error::other("injected attach refusal")),
+            })
+        }
+
+        fn run_guarded<E>(
+            &self,
+            request: &CommandRequest,
+            check: impl FnOnce() -> Result<bool, E>,
+        ) -> Result<Option<CommandOutput>, E>
+        where
+            E: From<CommandRunError> + std::fmt::Display,
+        {
+            if check()? {
+                self.run(request).map(Some).map_err(E::from)
+            } else {
+                Ok(None)
+            }
+        }
+
+        fn image_lease(&self, _: &Path) -> io::Result<Option<Fenced<fs::File>>> {
+            Ok(None)
+        }
+
+        fn pin_raw_device(&self, _: &Path) -> io::Result<Option<Fenced<fs::File>>> {
+            panic!("the refused attach never yields a device")
+        }
+
+        fn attached_disk_images(&self) -> io::Result<Vec<AttachedDiskImage>> {
+            Ok(Vec::new())
+        }
+
+        fn grow_image(&self, _: &Path, _: ImageCapacity) -> io::Result<()> {
+            panic!("seed publication never grows its source")
+        }
+    }
+
+    fn seed_before_mount(kept: bool) {
+        let fixture = Fixture::new();
+        let build = fixture.build();
+        let mut source = fixture.source(Some(build.clone()));
+        let storage = StorageLayout::new(fixture.store(), &source.metadata.repo_id).unwrap();
+        let layout = BuildVolumeLayout::new(storage.project()).unwrap();
+        fs::create_dir_all(layout.images()).unwrap();
+        let bytes = [0x5a; 4096];
+        fs::write(layout.image(&build.id), bytes).unwrap();
+        layout.write_record(&build.id, &build.owner_record).unwrap();
+        let owner = fs::read(layout.record(&build.id)).unwrap();
+        let claim = if kept {
+            source.main = ReAdoptMain::Missing(ReAdoptMissingMain {
+                canonical: fixture.main_image().original,
+                preserved: preserved_checkout(&source.checkout, &source.replacement).unwrap(),
+                capacity_bytes: fixture.main_image().capacity_bytes,
+                build: Some(MissingMainBuild::Kept(ReAdoptKeptBuild {
+                    kept: build.id.clone(),
+                    record: build.owner_record.clone(),
+                })),
+            });
+            source.build = None;
+            None
+        } else {
+            Some(layout.claim_release(&build.id).unwrap().unwrap())
+        };
+        let host = MacOsApfsExecutionHost::new(
+            RefuseFirstMount {
+                layout: layout.clone(),
+                id: build.id.clone(),
+                incarnation: source.replacement.clone(),
+            },
+            ApfsSubstrateConfig::new(fixture.store(), &fixture.checkout),
+        )
+        .unwrap();
+
+        let publish = || {
+            let error = host
+                .publish_re_adopt_build(&layout, &source, claim.as_ref())
+                .expect_err("the injected mount failure remains an error");
+            assert!(
+                error.to_string().contains("injected attach refusal"),
+                "{error}"
+            );
+            layout
+                .seed_of(&WorkspaceName::main(), &source.replacement)
+                .unwrap()
+                .expect("capture happened before the refused mount")
+        };
+        let (seed, record) = publish();
+        let seed_time = fs::metadata(layout.image(&seed))
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert_eq!(fs::read(layout.image(&seed)).unwrap(), bytes);
+        assert_eq!(record.tree, build.owner_record.tree);
+        assert_eq!(publish(), (seed.clone(), record));
+        assert_eq!(
+            fs::metadata(layout.image(&seed))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            seed_time,
+            "a replay never relabels an existing seed as freshly captured"
+        );
+        assert_eq!(fs::read(layout.image(&build.id)).unwrap(), bytes);
+        assert_eq!(fs::read(layout.record(&build.id)).unwrap(), owner);
+        drop(claim);
+        layout.hold(&build.id).expect("refusal releases admission");
+    }
+
+    #[test]
+    fn a_kept_detached_build_is_seeded_before_mount_under_one_claim() {
+        seed_before_mount(true);
+    }
+
+    #[test]
+    fn a_published_detached_build_is_seeded_before_mount_under_the_borrowed_claim() {
+        seed_before_mount(false);
+    }
 }
