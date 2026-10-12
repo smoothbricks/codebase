@@ -15,6 +15,10 @@ pub mod job_unattributed;
 pub(crate) mod nx_daemon;
 #[cfg(target_os = "macos")]
 pub mod process_events;
+#[cfg(target_os = "macos")]
+pub mod process_fence;
+#[cfg(target_os = "macos")]
+pub mod process_monitor;
 pub mod process_spans;
 pub mod process_stream;
 pub mod process_tree;

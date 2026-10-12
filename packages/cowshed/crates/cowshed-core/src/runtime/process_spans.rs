@@ -1131,7 +1131,11 @@ mod tests {
         );
         let set = ProcessBlockedOn::Lock {
             path: "/tmp/held".to_owned(),
-            holder: Some(LockHolder { pid: 9, job: None }),
+            holder: Some(LockHolder {
+                pid: 9,
+                job: None,
+                program: None,
+            }),
         };
         let set_row = projection
             .project(
