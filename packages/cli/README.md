@@ -559,6 +559,17 @@ package, the root's and each workspace member's, the entry becomes a link to tha
 on the package gains nothing, and an entry a developer pointed at a checkout of their own stays theirs. When the
 directory is missing on this machine, or a sandbox cannot read it, the installed version stays and stderr says so.
 
+Links created by a declaration record their alias, declaration and exact symlink text in
+`node_modules/.smoo-declared-links`. Changing the declaration automatically updates a recorded link on shell entry;
+`--links --check` reports the old binding as stale even when installation inputs have not changed. A copied workspace
+keeps this provenance with its `node_modules`. Manual retargets no longer match the receipt and remain untouched.
+Existing unrecorded links are not retroactively claimed, even if they happen to match a declaration; an old checkout
+without receipts needs an explicit owner-directed relink once. No pin-directory naming convention grants ownership.
+
+A successful managed install reconciles recorded links to the current declaration instead of restoring the old pin over
+its postinstall result. A failed install restores the captured link and its provenance together. Restored manual
+overrides are not claimed by a receipt the install's postinstall temporarily created.
+
 Declarations are applied at the end of every install. smoo's root script policy sets the root `postinstall` to
 `bun tooling/direnv/developer-links.ts`, and Bun runs root lifecycle scripts after it re-points the dependencies,
 including on an install that has nothing to do. A plain `bun install` therefore ends with the declared links in place.

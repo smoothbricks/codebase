@@ -906,6 +906,141 @@ describe('what shell entry keeps linked', () => {
       );
     });
 
+    it('reconciles a changed managed declaration without reinstalling and preserves a manual retarget', async () => {
+      await withManagedRepository(
+        { ...WORKSPACE, developerLinks: { '@fixture/lib': '../first-lib', util: '../first-util' } },
+        async ({ root, enterShell: enter, count }) => {
+          const first = await checkout(join(dirname(root), 'first-lib'), '@fixture/lib');
+          await checkout(join(dirname(root), 'first-util'), 'util');
+          expect((await enter()).exitCode).toBe(0);
+          expect(readlinkSync(join(root, LINKED))).toBe(first);
+          const mine = await checkout(join(dirname(root), 'my-util'), 'util');
+          await rm(join(root, UNLINKED));
+          symlinkSync(mine, join(root, UNLINKED));
+          const next = await checkout(join(dirname(root), 'next-lib'), '@fixture/lib');
+          await checkout(join(dirname(root), 'next-util'), 'util');
+          const manifestPath = join(root, 'package.json');
+          const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
+          manifest.smoo.developerLinks = { '@fixture/lib': '../next-lib', util: '../next-util' };
+          await writeFile(manifestPath, JSON.stringify(manifest));
+          const installs = count('install');
+
+          expect((await enter({ links: true, check: true })).exitCode).toBe(1);
+          expect((await enter({ links: true })).exitCode).toBe(0);
+          expect(readlinkSync(join(root, LINKED))).toBe(next);
+          expect(readlinkSync(join(root, UNLINKED))).toBe(mine);
+          expect((await enter({ links: true, check: true })).exitCode).toBe(0);
+          expect((await enter({ links: true })).exitCode).toBe(0);
+          expect(count('install')).toBe(installs);
+          expect(readlinkSync(join(root, UNLINKED))).toBe(mine);
+        },
+      );
+    });
+
+    it('keeps changed managed declarations after an install instead of restoring the previous target', async () => {
+      await withManagedRepository(
+        { ...WORKSPACE, developerLinks: { '@fixture/lib': '../first-lib', util: '../declared-util' } },
+        async ({ root, enterShell: enter }) => {
+          await checkout(join(dirname(root), 'first-lib'), '@fixture/lib');
+          await checkout(join(dirname(root), 'declared-util'), 'util');
+          expect((await enter()).exitCode).toBe(0);
+          const mine = await checkout(join(dirname(root), 'my-util'), 'util');
+          await rm(join(root, UNLINKED));
+          symlinkSync(mine, join(root, UNLINKED));
+          const next = await checkout(join(dirname(root), 'next-lib'), '@fixture/lib');
+          const manifestPath = join(root, 'package.json');
+          const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
+          manifest.smoo.developerLinks['@fixture/lib'] = '../next-lib';
+          await writeFile(manifestPath, JSON.stringify(manifest));
+
+          expect((await enter()).exitCode).toBe(0);
+          expect(readlinkSync(join(root, LINKED))).toBe(next);
+          expect(readlinkSync(join(root, UNLINKED))).toBe(mine);
+          expect((await enter({ links: true })).exitCode).toBe(0);
+          expect(readlinkSync(join(root, UNLINKED))).toBe(mine);
+        },
+      );
+    });
+
+    it('does not claim a pre-existing manual link just because it matches a declaration', async () => {
+      await withManagedRepository(
+        { ...WORKSPACE, developerLinks: { '@fixture/lib': '../first-lib' } },
+        async ({ root, enterShell: enter }) => {
+          expect((await enter()).exitCode).toBe(0);
+          const first = await checkout(join(dirname(root), 'first-lib'), '@fixture/lib');
+          await rm(join(root, LINKED));
+          symlinkSync(first, join(root, LINKED));
+          expect((await enter({ links: true })).exitCode).toBe(0);
+          await checkout(join(dirname(root), 'next-lib'), '@fixture/lib');
+          const manifestPath = join(root, 'package.json');
+          const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
+          manifest.smoo.developerLinks['@fixture/lib'] = '../next-lib';
+          await writeFile(manifestPath, JSON.stringify(manifest));
+          expect((await enter({ links: true, check: true })).exitCode).toBe(0);
+          expect((await enter({ links: true })).exitCode).toBe(0);
+          expect(readlinkSync(join(root, LINKED))).toBe(first);
+        },
+      );
+    });
+
+    it('restores managed provenance with the link when an install fails after its postinstall', async () => {
+      await withManagedRepository(
+        { ...WORKSPACE, developerLinks: { '@fixture/lib': '../first-lib' } },
+        async ({ root, enterShell: enter }) => {
+          const first = await checkout(join(dirname(root), 'first-lib'), '@fixture/lib');
+          expect((await enter()).exitCode).toBe(0);
+          const next = await checkout(join(dirname(root), 'next-lib'), '@fixture/lib');
+          const manifestPath = join(root, 'package.json');
+          const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
+          manifest.smoo.developerLinks['@fixture/lib'] = '../next-lib';
+          await writeFile(manifestPath, JSON.stringify(manifest));
+          await expect(
+            keepDeveloperLinks(root, async () => {
+              await Bun.$`bun install --no-summary`.cwd(root).quiet();
+              throw new Error('fixture install rejected after postinstall');
+            }),
+          ).rejects.toThrow('fixture install rejected after postinstall');
+          expect(readlinkSync(join(root, LINKED))).toBe(first);
+          expect((await enter({ links: true, check: true })).exitCode).toBe(1);
+          expect((await enter({ links: true })).exitCode).toBe(0);
+          expect(readlinkSync(join(root, LINKED))).toBe(next);
+        },
+      );
+    });
+
+    it('carries managed provenance into a copied checkout for sibling and contained declarations', async () => {
+      await withManagedRepository(
+        { ...WORKSPACE, developerLinks: { '@fixture/lib': '../first-lib', util: '.cache/first-util' } },
+        async (original) => {
+          const first = await checkout(join(dirname(original.root), 'first-lib'), '@fixture/lib');
+          const firstUtil = await checkout(join(original.root, '.cache', 'first-util'), 'util');
+          expect((await original.enterShell()).exitCode).toBe(0);
+          const clone = join(dirname(original.root), 'clone');
+          await cp(original.root, clone, { recursive: true, verbatimSymlinks: true });
+          await mkdir(join(clone, '.cowshed'), { recursive: true });
+          await writeFile(join(clone, '.cowshed', 'workspace.json'), JSON.stringify({ projectRoot: original.root }));
+          const next = await checkout(join(dirname(original.root), 'next-lib'), '@fixture/lib');
+          const nextUtil = await checkout(join(clone, '.cache', 'next-util'), 'util');
+          const manifestPath = join(clone, 'package.json');
+          const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
+          manifest.smoo.developerLinks = { '@fixture/lib': '../next-lib', util: '.cache/next-util' };
+          await writeFile(manifestPath, JSON.stringify(manifest));
+          const copied = repository(
+            clone,
+            join(dirname(original.root), 'ledgers'),
+            join(dirname(original.root), 'bin'),
+          );
+          expect((await copied.enterShell({ links: true, check: true })).exitCode).toBe(1);
+          expect((await copied.enterShell({ links: true })).exitCode).toBe(0);
+          expect(realpathSync(join(clone, LINKED))).toBe(next);
+          expect(realpathSync(join(clone, UNLINKED))).toBe(nextUtil);
+          expect((await copied.enterShell({ links: true, check: true })).exitCode).toBe(0);
+          expect(realpathSync(join(original.root, LINKED))).toBe(first);
+          expect(realpathSync(join(original.root, UNLINKED))).toBe(firstUtil);
+        },
+      );
+    });
+
     it('keeps the declared link across a plain bun install, through the root postinstall', async () => {
       await withManagedRepository(
         { ...WORKSPACE, developerLinks: { '@fixture/lib': '../local-lib' } },
