@@ -152,151 +152,10 @@ registry rejects incompatible algorithms and distinct records that share an ID.
 The compiler's checker-proved Op-local literal log templates still use private `u16` message IDs and decode their
 strings at cold conversion. Span names remain strings.
 
-The compiler recognizes a call by checker semantics, not by the spelling `ctx.log` or by containment in `defineOp`. The
-resolved receiver must be LMAO `SpanLogger`/`GeneratedSpanLogger`, and the invoked `info`/`debug`/`warn`/`error`/`trace`
-declaration must have LMAO provenance. Typed aliases, parameters, imported logger-bearing helpers, and property paths
-therefore participate; unrelated same-named methods, `any`/`unknown`, unproved unions, and dynamic computed members do
-not. All proved LMAO logger callsites in source are subject to the same policy:
-
-- operational `info`/`warn`/`error` text is literal; dynamic text, interpolation, and concatenation are compile errors;
-- a `structured` call uses a second plain object literal and matching `{field}` placeholders. `{{` and `}}` escape
-  literal braces. This clean-cutover grammar replaces the shipped `{{field}}` placeholder spelling;
-- a `static` call has literal text and no fields. Literal `debug`/`trace` may be `static` or `structured`; an existing
-  runtime string reference is `dynamic`, unregistered, and stored on the raw lane, while avoidable interpolation is
-  rejected; and
-- `mixed` is reserved for a physical buffer family carrying both numeric vocabulary and dynamic lanes. It is not a
-  callsite class or kind tag. `kindTags` are entry semantic kinds.
-
-Checker-proven literal trace/span names are registered as `SPAN_NAME`; dynamic names remain on the dynamic string lane.
-Shipped code stores all span names as strings, so span-name registration is target-only and must preserve the public
-Promise/microtask contract.
-
-```typescript
-// Source in an application or independently compiled library.
-export function report(log: SpanLogger, ctx: OpContext, job: Job, elapsedMs: number) {
-  log.info('completed {jobId} in {elapsedMs}ms', { jobId: job.id, elapsedMs });
-  log.info('literal braces: {{ok}}');
-  log.trace(traceText); // supported dynamic lane
-  return ctx.span('complete-job', completeJobOp, job.id); // registered SPAN_NAME
-}
-```
-
-The compiler removes the fields object. The following registration is emitted **JavaScript**, and the installer import
-is a compiler-emitted/imported side-effect dependency so ESM installs the callback first:
-
-```javascript
-import '@smoothbricks/lmao/vocabulary/register/v1';
-const REGISTER_VOCABULARY = Symbol.for('@smoothbricks/lmao/vocabulary/register/v1');
-const $$binding = globalThis[REGISTER_VOCABULARY]($$typedArrayFragment);
-
-const $$v0 = job.id;
-const $$v1 = elapsedMs;
-log._infoStructured2($$binding[0], LINE, $$v0, $$v1);
-log._infoStatic0($$binding[1], LINE);
-log.trace(traceText);
-return ctx.spanVocabulary1(LINE, $$binding[2], completeJobOp, job.id);
-```
-
-Private seam names may change, but warmed registered writes use direct `binding[ordinal]` loads and fixed monomorphic
-stores with zero object, array, rest-argument, or interpolated-string allocation. The target span-name seam remains
-Promise-based like `span1`; a dynamic name lowers to the same `spanN` call with its string operand. Dense index zero is
-valid, and nullable rows use a validity bitmap rather than an index sentinel. A predictable overflow/slow path remains
-correct.
-
-### Versioned fragment registration
-
-The runtime type contract, separate from emitted JavaScript, is:
-
-```typescript
-type VocabularyFragmentV1 = {
-  schemaVersion: 1;
-  idAlgorithm: 'sha256-32-v1';
-  contentHash: string;
-  ids: Uint32Array;
-  kindTags: Uint8Array;
-  utf8: Uint8Array;
-  offsets: Int32Array;
-};
-type VocabularyBinding = Uint32Array;
-type RegisterVocabularyV1 = (fragment: VocabularyFragmentV1) => VocabularyBinding;
-```
-
-For `N = ids.length`, `kindTags.length` and binding length are `N`; `offsets.length` is `N + 1`, `offsets[0]` is zero,
-`offsets[N]` is `utf8.length`, and offsets are monotonic and in range. Record `i` is
-`utf8.subarray(offsets[i], offsets[i + 1])` with exact bytes:
-
-```text
-u32le textLen | text UTF8 | u16le fieldCount |
-repeated(u16le nameLen | name UTF8 | u16le columnLen | column UTF8)
-```
-
-`kindTags[i]` is `1` (`LOG_TEMPLATE`) or `2` (`SPAN_NAME`). `ids[i]` is the first 32 bits, interpreted big-endian, of
-`SHA-256(kindTag || recordBytes)`. `contentHash` is lowercase SHA-256 hex of:
-
-```text
-u8 schemaVersion |
-u16le algorithmLen | idAlgorithm UTF8 |
-u32le ids.length | repeated(u32le id) |
-u32le kindTags.length | kindTags bytes |
-u32le utf8.length | utf8 bytes |
-u32le offsets.length | repeated(i32le offset)
-```
-
-This makes numeric array serialization explicitly little-endian, independent of host typed-array byte order. The
-callback validates lengths, integer ranges, tags, UTF-8, grammar, IDs, and hash.
-
-Every precompiled library/chunk imports the LMAO installer side effect, obtains the shared Symbol, registers during
-module evaluation, and closes over the binding. The consuming build needs neither source/checker graph nor a second
-transform. Bundling retains installation/registration side effects and each callsite-to-binding pairing.
-
-The runtime validates then copies or merges inputs into a runtime-owned immutable dictionary generation. New fragments
-append unseen values in registration order; dense indices are not sorted or canonical. Existing bindings remain
-prefix-valid forever, and each generation is exactly its predecessor plus appended values. An `ArrowLease` pins the span
-topology, JS-heap chunks, and dictionary generation used by its batch until explicit release; WASM-backed columns are
-copied, so a lease never pins a WASM epoch. Ids and content bytes—not dense indices—provide deterministic cross-order
-identity and checksums; only decoded values and schema semantics are deterministic across registration orders.
-
-Registration is idempotent for byte-identical fragments and deduplicates equal `(kindTag,recordBytes)` records. An id is
-a hash, not a unique key: registration probes the records filed under an id deterministically, reuses an equal record's
-dense index and appends any other, so an id collision is never fatal (01o). Reusing `contentHash` for another fragment
-is fatal before the fragment is writable. An unavailable/incompatible callback is a strict-build diagnostic or startup
-failure, never a guessed index. Startup contributes bindings to the immutable `PhysicalLayoutPlan`; live shapes never
-mutate and warmed writes have no registration/version branch.
-
-### Diagnostics, fallbacks, and order
-
-`LMAO_DYNAMIC_OPERATIONAL_TEXT`, `LMAO_AVOIDABLE_INTERPOLATION`, `LMAO_FIELDS_NOT_OBJECT_LITERAL`, and
-`LMAO_PLACEHOLDER_MISMATCH` reject the source-policy violations above. In strict optimized mode,
-`LMAO_LOGGER_PROOF_REQUIRED` rejects an apparent typed LMAO call that cannot be proven. A genuinely unrelated/unproved
-call is left byte-shape unchanged; a proved LMAO policy violation never silently takes the raw fallback. This prevents
-optimizer success from changing vocabulary coverage.
-
-The emitted call evaluates its receiver first, arguments left-to-right, and each field initializer exactly once in
-source property order. Compiler temporaries may precede stores only to preserve this order. Throws, getters reached by
-field value expressions, and other side effects remain at their source-relative point; runtime field expressions never
-move into module registration. Vocabulary lowering also preserves the public span contract: automatic `span()` to
-`spanAutoN` selection remains forbidden, so Promise assimilation and microtask turns do not change.
-
-### Acceptance gates
-
-Repo-standard Mitata scenarios must compare `plugin-off` and the global-vocabulary variants with a position-balanced
-schedule in order-reversed independent processes. They record machine-readable raw samples, semantic checksums,
-p50/p95/p99/p99.9, and allocation/GC metadata where available, and produce a commit-message-ready summary. Any checksum,
-decode, or evaluation-order difference fails the gate.
-
-Semantic acceptance covers `static` templates, `structured` fields and brace escapes, dynamic debug/trace text, literal
-`SPAN_NAME` entries, and dynamic span-name fallback. It checks binding length, append-only prefix stability, dense zero
-with validity-based nulls, exact record bytes/hashes, decoded Arrow values, and unchanged Promise/microtask observations
-under at least two reversed registration orders.
-
-Measurements are separate for `startup`, `span setup`, `warmed entry write`, `overflow/slow path`, and
-`per-request flush`; one phase cannot hide another. The warmed target must allocate zero, use fixed monomorphic stores,
-improve p50 by at least 10% over `plugin-off`, and regress no reported tail percentile by more than 3%. The overflow
-path must remain correct and bounded with no greater than 3% p99.9 regression. Per-request flush must reuse the
-`PhysicalLayoutPlan`, process-dense Arrow vocabulary, and `ArrowLease`, allocate few or no objects, and regress no
-percentile by more than 3%. Startup and span setup costs are explicit and must not regress more than 3% unless the
-commit summary names and justifies the trade. A change that fails a gate does not land, and no zero-overhead claim is
-permitted without a passing run.
+The global 32-bit registration ABI, expanded checker coverage and removal of the Op-local lane are defined in
+[01o §6.1–6.2](../../../specs/lmao/01o_typescript_transformer.md#vocabulary-fragment-and-library-without-source-contract).
+The [implementation gap list](../../../agent-todo/lmao-wasm-transformer-errors.md) records that cutover; this package
+doc does not claim it is shipped.
 
 ## The bigger design space: typed macros over the schema, not just call sites
 
@@ -396,12 +255,11 @@ the hot store. This subset deduplicates and avoids the per-row literal string wr
 string at cold conversion. It does **not** create a program-wide dictionary, a stable trace vocabulary, or a new Arrow
 column. The local-store benchmark did not meet the promotion gate, so no performance win is claimed.
 
-**Global vocabulary ABI.** The clean-cutover ABI above expands checker-semantic coverage to `static`/`structured` logger
-callsites and literal `SPAN_NAME` records, emits content-derived 32-bit ids, and registers fragments into append-only
-runtime-dense Arrow bindings: `plugin/driver/vocabulary_registration.go` emits the registration and
-`packages/lmao/src/lib/vocabularyRegistry.ts` returns each fragment's `VocabularyBinding`. Independently compiled
-libraries self-register without source at the consuming build. It replaces the Op-local store in one change that removes
-the store and its lane, and that change must pass the acceptance gates above.
+**Global vocabulary design.**
+[01o §6.1–6.2](../../../specs/lmao/01o_typescript_transformer.md#vocabulary-fragment-and-library-without-source-contract)
+owns the 32-bit ABI, checker coverage and Op-local-lane cutover. The
+[implementation gap list](../../../agent-todo/lmao-wasm-transformer-errors.md) distinguishes that design from the
+shipped registry and local store.
 
 ### G. Smaller, cheap wins
 

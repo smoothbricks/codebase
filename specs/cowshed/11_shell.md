@@ -418,9 +418,9 @@ spawn-before-reply crash window as specified in 07_api.md.
   `job-backgrounded` fires. The client already has the job id and can poll or reattach through the API. A later
   checkpoint uses the barrier/manifest protocol below.
 - **`--background`** detaches and promotes immediately, and the caller gets the job id.
-- **Hard timeout** (`[shell] hard_timeout`, unset by default, set by CI — 10_ci.md) sends SIGTERM, then SIGKILL after a
-  grace, drains both pipes to EOF, and marks the job `killed:timeout`. It is distinct from the CLI's `--timeout`, which
-  bounds how long the caller waits before the job is backgrounded and never kills.
+- **Hard timeout** (`[shell] hard_timeout`, unset by default) sends SIGTERM, then SIGKILL after a grace, drains both
+  pipes to EOF, and marks the job `killed:timeout`. It is distinct from the CLI's `--timeout`, which bounds how long the
+  caller waits before the job is backgrounded and never kills.
 - **Combined output quota.** Each job has one configurable quota across stdout and stderr, default **1 GiB**. Accounting
   includes protected bytes plus bytes read from either child pipe but still buffered/in flight. The first read whose
   inclusion would cross the quota atomically trips the limit: the supervisor admits no payload beyond the exact
