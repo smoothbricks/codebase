@@ -16,6 +16,8 @@ use cowshed_core::api::{
 #[cfg(target_os = "macos")]
 use cowshed_core::api::{JobLeafAttribution, ProcessCoverage, ProcessCoverageGap};
 use cowshed_core::error::{AdmissionField, AdmissionRefusal, CowshedError, ErrorCode, Result};
+#[cfg(target_os = "macos")]
+use cowshed_core::fork_lock::Run as _;
 use cowshed_core::fork_lock::Spawn as _;
 use cowshed_core::metadata::{PortBlock, WorkspaceIncarnation, WorkspaceName};
 use cowshed_core::repository::{OwnedRepoIds, RepoId};
@@ -747,6 +749,112 @@ async fn host_controller_exec_mode_enforces_each_request_without_widening_the_ce
             assert_eq!(mount.join(target).exists(), writable);
         }
     }
+}
+
+/// 04_sandbox.md, "Read policy" and "Store reads": an admitted Nix program can load
+/// other store entries without a Nix project or a separate grant for each dependency.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+async fn host_controller_an_admitted_nix_bun_loads_icu_without_a_nix_project() {
+    let directories = std::env::split_paths(&std::env::var_os("PATH").expect("host tool PATH"))
+        .collect::<Vec<_>>();
+    let bun = cowshed_core::capabilities::bootstrap_program("bun", &directories)
+        .unwrap()
+        .expect("run the host-controller lane in the repository's Nix/devenv shell");
+    let package = bun.parent().unwrap().parent().unwrap();
+    assert_eq!(
+        package.parent(),
+        Some(Path::new("/nix/store")),
+        "the regression requires the repository's Nix Bun, not a standalone Bun: {}",
+        bun.display()
+    );
+    let libraries = std::process::Command::new("/usr/bin/otool")
+        .arg("-L")
+        .arg(&bun)
+        .output_locked()
+        .unwrap();
+    assert!(libraries.status.success(), "{libraries:?}");
+    assert!(
+        String::from_utf8_lossy(&libraries.stdout)
+            .lines()
+            .any(|line| line.trim().starts_with("/nix/store/") && line.contains("/lib/libicu")),
+        "the admitted Bun must actually load a separate Nix ICU library: {libraries:?}"
+    );
+
+    let (mut supervisor_config, root) = isolated_config("nix-bun-icu");
+    supervisor_config.default_cwd = None;
+    supervisor_config.artifacts.combined_output_quota_bytes = 64 * 1024;
+    // Admit only Bun's package. No capability marker or tool link can contribute
+    // a store-wide grant and mask a missing baseline metadata rule.
+    supervisor_config
+        .sandbox
+        .grants
+        .read
+        .push(package.to_path_buf());
+    let mount = &supervisor_config.workspace_root;
+    std::fs::create_dir_all(&supervisor_config.sandbox.home).unwrap();
+    std::fs::create_dir_all(mount.join(".cowshed/bin")).unwrap();
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(mount.join(cowshed_core::workspace_credentials::WORKSPACE_TOKEN_PATH))
+            .unwrap()
+            .write_all(
+                cowshed_gateway_types::WorkspaceToken::from_bytes([7; 32])
+                    .encode()
+                    .as_bytes(),
+            )
+            .unwrap();
+    }
+    let commitments = cowshed_core::runtime::supervisor::CommitmentPublisher::start(
+        Box::new(cowshed_core::storage::audit::NullAuditSink),
+        8,
+    )
+    .unwrap();
+    let handle = WorkspaceSupervisor::start(supervisor_config, commitments).unwrap();
+    let job = handle
+        .exec(
+            None,
+            None,
+            ExecRequest {
+                command: ExecCommand::Argv(vec![
+                    CommandArg::from(bun.into_os_string()),
+                    "--config=/dev/null".into(),
+                    "--no-env-file".into(),
+                    "--no-install".into(),
+                    "--eval".into(),
+                    "console.log(new Intl.DateTimeFormat('en-GB', {year:'numeric', month:'2-digit', day:'2-digit', timeZone:'UTC'}).format(new Date('2026-10-12T00:00:00Z')))".into(),
+                ]),
+                cwd: None,
+                ..request(StdinSource::Empty)
+            },
+        )
+        .await
+        .unwrap();
+    let info = handle.wait(job).await.unwrap();
+    let stderr = handle
+        .log_read(job, StreamKind::Stderr, 0, false)
+        .await
+        .unwrap();
+    let stdout = handle
+        .log_read(job, StreamKind::Stdout, 0, false)
+        .await
+        .unwrap();
+    handle.retire().await.unwrap();
+    assert_eq!(
+        info.exit,
+        Some(ExitStatus::Exited { code: 0 }),
+        "admitted Bun must load ICU under the production child sandbox: {}",
+        String::from_utf8_lossy(&stderr.bytes)
+    );
+    assert_eq!(stdout.bytes.as_ref(), b"12/10/2026\n");
+    assert!(stderr.bytes.is_empty(), "{stderr:?}");
+    drop(root);
 }
 
 #[tokio::test]

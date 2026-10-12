@@ -685,11 +685,14 @@ pub fn seatbelt_profile(
     // Directory metadata is distinct from file-read-data in Seatbelt. Toolchain
     // launchers (notably /usr/bin/git -> xcrun) must traverse their immutable
     // system roots without gaining metadata access to the user's home.
+    // Nix tools load libraries from other immutable store entries even without a Nix
+    // capability: dyld needs their metadata as well as the baseline data reads.
     for root in [
         "/Applications",
         "/Library",
         "/System",
         "/bin",
+        "/nix/store",
         "/opt",
         "/private/var/select",
         "/sbin",
@@ -2366,6 +2369,38 @@ mod tests {
         let secret_deny = profile.rfind("/Users/tester/.ssh").unwrap();
         assert!(store_deny < mount_parent);
         assert!(mount_parent < secret_deny);
+    }
+
+    #[test]
+    fn nix_store_reads_are_baseline_authority_without_nix_state_or_writes() {
+        for mode in [RunSandboxMode::ReadOnly, RunSandboxMode::ReadWrite] {
+            for role in [
+                SandboxProfileRole::TrustedSupervisor,
+                SandboxProfileRole::ExecutedChild,
+                SandboxProfileRole::GitDiscovery,
+            ] {
+                let profile = seatbelt_profile(&config(mode), role).unwrap();
+                for operation in ["file-read*", "file-read-data"] {
+                    assert!(profile.contains(&format!(
+                        "(allow {operation} (literal \"/nix/store\") (subpath \"/nix/store\"))"
+                    )));
+                }
+                assert!(profile.contains("(allow file-read* (literal \"/nix\"))"));
+                for root in ["/nix", "/nix/var"] {
+                    assert!(
+                        !profile.contains(&format!("(subpath \"{root}\")")),
+                        "{mode:?} {role:?} must not admit Nix state as a baseline subtree"
+                    );
+                }
+                assert!(
+                    profile
+                        .lines()
+                        .filter(|line| line.contains("file-write"))
+                        .all(|line| !line.contains("\"/nix")),
+                    "{mode:?} {role:?} must not grant Nix writes"
+                );
+            }
+        }
     }
 
     #[test]

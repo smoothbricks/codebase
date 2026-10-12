@@ -168,6 +168,12 @@ has nothing to declare for these caches. A cache your repository's own tooling p
 shared by naming its HOME-relative path in main's `.cowshed.toml` — `[caches] home = [".cache/ttsc"]` — trusted only
 from main, like `[sandbox] deny`.
 
+The immutable `/nix/store` stays read-only and readable without a grant, even in a project with no Nix capability. On
+macOS this includes metadata as well as file contents: dyld must resolve the separate store entries containing a tool's
+shared libraries before it can load them. Nix daemon access and writable client caches still come from the Nix
+capability, not from store reads
+([sandbox read policy](../../../specs/cowshed/04_sandbox.md#devenv--nix-inside-the-sandbox)).
+
 ## Reusing compiled output across workspaces
 
 Two different mechanisms save build time, and it helps to keep them apart.
