@@ -190,8 +190,8 @@ including `--ref` at the target's current tree: a quiet live workspace at exactl
 automatically. Between lands, the fork captures newer live state only when it is at least as near the requested tree and
 has no writer. A nearer landed seed beats an older live volume. There is no manual reseed or warm step. `doctor` reports
 target-only `seed-age`, `seed-tree-behind` and `target-moved-outside-land`; land records its actual
-seeded/adopted/skipped outcome durably, including holders. Existing owned index links migrate back to source from a
-verified sealed snapshot; a holder refuses that migration without losing bytes or being forced off.
+seeded/adopted/skipped outcome durably, including holders. An owned index link points back to source only through a
+verified sealed snapshot; a holder refuses that change without losing bytes or being forced off.
 
 **Existing checkouts migrate by rebuilding, never copying.** Setup and the first admitted job create an empty build
 volume, publish `.cowshed/build`, discard only contributed real build-state directories, and install their fixed links.

@@ -201,8 +201,9 @@ unit that rebuilt:
 - **No fingerprint at all** — the selected seed never held that unit (for example, another Cargo profile or toolchain),
   so the fork builds that delta once. If the target built it after freezing its seed, the next fork refreshes
   automatically unless a named holder refuses writer exclusion. Close that holder and fork again; no manual reseed or
-  warm step exists. `doctor` reports target-only `seed-age` and tree drift; after an external Git fast-forward, keep the
-  warm landing workspace alive until the next fork can capture its exactly matching tree.
+  warm step exists. `doctor` reports target-only `seed-age`, `seed-tree-behind` and `target-moved-outside-land`; after
+  an external Git fast-forward, keep the warm landing workspace alive until the next fork can capture its exactly
+  matching tree.
 - **`PathToSourceChanged`** — a dependency was built under another `$CARGO_HOME`; see the shared cargo caches above.
 - **`the rerun-if-changed instructions changed`** — a build script watches a path outside its package by absolute path;
   print it relative to the package instead, which is how cargo resolves it.
@@ -390,22 +391,17 @@ every workspace it recovers. When a command is still slow on a wait in a host pr
 `cowshed fork` prints a `cowshed: apfs canonical/<step>` or `cowshed: fork <step>` span with its elapsed time for every
 step, so the slow step is named on stderr. On a large repository two steps carry nearly all of the time:
 
-- **The first write into the fresh clone**, `apfs canonical/first-write`. The clone call shares main's image extent map
-  and returns in milliseconds; the first write to either file makes APFS copy that map, at about 12 µs per extent.
-  cowshed makes that write itself, rewriting the clone's first block right after the clone and before anything attaches
-  it, so the cost is a step of its own; left to the mount, the kernel's recovery write into a clone of a mounted image
-  paid it inside `mount_apfs`. Main's image fragments with every write it takes while clones share its blocks, so the
-  cost grows with how long main has been in use: an image with 2.1 million extents costs 25 s on a quiet host and 45–70
-  s on a busy one, one with 470 thousand costs 4 s, and a freshly written 4 GiB file with 256 extents costs 5 ms. A
-  one-byte write into a plain `cp -c` clone of the image file reproduces the cost with no disk image attached, so it is
-  not the mount itself and does not depend on how many images are attached. Deleting a written clone (`cowshed rm`,
-  `cowshed gc`) pays about half as much per extent. `fork <ws> <name>` pays the same cost for the source workspace's
-  image. `cowshed doctor` reports main's extent count and the cost it predicts as `main-extents`, and warns once that
-  cost reaches a second. Only rewriting main's image file contiguously lowers it: `cowshed defrag main`, run while the
-  checkout is idle, since main has to leave the kernel for the copy and a busy volume refuses. It needs as much free
-  space as main's image has allocated and keeps it while older clones still share the old blocks.
-- **`fork links`**, the walk over the whole tree for symlinks that point outside it, which costs about 5 s over a
-  million entries.
+- **The first write into the fresh clone**, `apfs canonical/first-write`. The clone call shares main's image extent map;
+  the first write to either file makes APFS copy that map. Cowshed rewrites the clone's first block before attach so the
+  cost is a step of its own rather than part of the mount's recovery write. Main's image fragments when writes move
+  blocks shared by clones into new runs, so first-write cost scales with extent count. A one-byte write into a plain
+  `cp -c` clone reproduces that map copy without an attached disk image. Deleting a written clone also incurs extent-map
+  work; `fork <ws> <name>` incurs it for the source workspace's image. `cowshed doctor` reports the extent count and
+  predicted cost as `main-extents` and warns when it reaches the cold-fork budget (08_testing.md). `cowshed defrag main`
+  rewrites main's image file contiguously while the checkout is idle; a busy volume refuses. It needs as much free space
+  as main's image has allocated and keeps it while older clones still share the old blocks.
+- **`fork links`**, the walk over the whole tree for symlinks that point outside it; its cost scales with the entries
+  visited.
 
 ## A disk child `did not finish within 120s`
 

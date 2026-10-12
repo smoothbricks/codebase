@@ -345,6 +345,8 @@ background process can report missing setup but can never cause a macOS authoriz
 Storage guidance points at `cowshed setup`, never at adopting a directory: a host with no volumes has no checkout to
 adopt, and `adopt` would ask for one.
 
+Illustrative adoption output (paths, counts, and progress messages are examples, not literal CLI output):
+
 ```
 $ cd <project-root> && cowshed adopt
 cowshed: created dedicated volume cowshed.store (space-sharing, excluded from backup)
