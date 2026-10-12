@@ -1,9 +1,34 @@
 modules/
-# Workspace-owned runtime state is not source: watching the daemon's own log
-# and plugin sockets feeds each write back into project graph construction.
-.cowshed/
-# Nx's native watcher honors only this file and the root .gitignore, never a nested
-# .gitignore, so tooling/direnv/.gitignore does not keep devenv's state out of the
-# daemon's outputs watcher: every direnv entry rewrites it, in every shed.
-tooling/direnv/.devenv*/
-tooling/direnv/.direnv/
+# Dot paths are runtime or tool state (daemon logs, sockets, job records, devenv and
+# direnv caches, editor and Bun staging) unless tracked. Ignore all of them, then
+# re-include each tracked dot input by its dot-named prefix. A directory must be
+# re-included to reach its children, so `!/.github` covers `.github/**`.
+# Nx's watcher reads only the root .gitignore and this file, never nested ignore files.
+# `tooling:lint-dot-inputs` fails when a tracked dot path lacks its `!/` line below.
+.*
+!/.cowshed.toml
+!/.editorconfig
+!/.envrc
+!/.git-format-staged.yml
+!/.gitattributes
+!/.gitignore
+!/.npmrc
+!/.nxignore
+!/.prettierrc
+!/.cargo
+!/.config
+!/.github
+!/.verdaccio
+!/.vscode
+!/packages/.gitkeep
+!/packages/columine/.cargo
+!/packages/cowshed/.cargo
+!/packages/cowshed/.gitignore
+!/packages/lmao-expo-benchmark/.gitignore
+!/packages/lmao-ttsc/examples/.gitignore
+!/packages/lmao-ttsc/plugin/.gitignore
+!/packages/lmao/.cargo
+!/packages/lmao/.planning
+!/targets/lmao-docs/.gitignore
+!/targets/lmao-docs/.vscode
+!/tooling/direnv/.gitignore
