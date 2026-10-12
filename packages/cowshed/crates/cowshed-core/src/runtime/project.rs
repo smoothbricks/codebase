@@ -11137,7 +11137,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                 landing_incarnation: landing_incarnation.clone(),
                 target_incarnation: target_incarnation.clone(),
                 landed_head: source_head.clone(),
-                seeded: build_volume.seeded,
+                seeded: matches!(build_volume.seed, crate::api::dto::LandSeed::Frozen),
                 skip: match &build_volume.adoption {
                     crate::api::dto::Adoption::Adopted { .. } => None,
                     crate::api::dto::Adoption::Skipped { reason } => Some(reason.clone()),
