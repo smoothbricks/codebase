@@ -910,10 +910,11 @@ with its whole process group, so `hdiutil attach` cannot leave a helper behind t
 
 Every `hdiutil` and `diskutil` the volume runs takes cowshed's host disk-lifecycle lease first, when the cowshed gateway
 answers at `/private/cowshed/store/gateway.sock` (`specs/cowshed/05_gateway.md`): storage calls and mount-table changes
-never overlap on the host, because an attach does not finish while the mount table keeps changing. The lease wait comes
-before the command's deadline. Without a grant the command runs unleased and stderr says why; a gateway that is not
-running is said once per process. A gateway from before disk leases answers only after 2 s of silence, so once one is
-found the process stops asking it for a minute, as cowshed's own commands do.
+never overlap on the host, because an attach does not finish while the mount table keeps changing.
+`diskutil renameVolume` is the spec's exception and takes no lease. The lease wait comes before the command's deadline.
+Without a grant the command runs unleased and stderr says why; a gateway that is not running is said once per process. A
+gateway from before disk leases answers only after 2 s of silence, so once one is found the process stops asking it for
+a minute, as cowshed's own commands do.
 
 Without an inherited parent pool, a `bounded-exec` command takes CPU tokens from cowshed's host budget before it starts,
 when the gateway answers on the same socket (`specs/cowshed/05_gateway.md`, "Host CPU budget"), so concurrent gates on

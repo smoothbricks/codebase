@@ -15,9 +15,11 @@ import { holdLease, type LeaseBounds, type UnleasedCause } from './gateway-lease
 export type DiskClass = 'storage' | 'namespace';
 
 /**
- * The class each disk tool draws on, by absolute path: every `diskutil` verb, `hdiutil` and
- * `newfs_apfs` change the set of disks through `storagekitd`; `mount_apfs` and `umount` change the
- * mount table. Every other program takes no lease.
+ * The class each disk tool draws on, by absolute path and, for `diskutil`, its verb.
+ * `hdiutil`, `newfs_apfs`, and every `diskutil` verb except `renameVolume` change the set of
+ * disks through `storagekitd`. `mount_apfs` and `umount` change the mount table. `diskutil
+ * renameVolume` changes neither, so it takes no lease (specs/cowshed/05_gateway.md,
+ * "Disk-lifecycle lease"). Every other program takes no lease.
  */
 const CLASS_BY_PROGRAM: Record<string, DiskClass> = {
   '/usr/sbin/diskutil': 'storage',
@@ -27,7 +29,10 @@ const CLASS_BY_PROGRAM: Record<string, DiskClass> = {
   '/sbin/umount': 'namespace',
 };
 
-export function diskClassOf(file: string): DiskClass | null {
+export function diskClassOf(file: string, args: readonly string[] = []): DiskClass | null {
+  if (file === '/usr/sbin/diskutil' && args[0] === 'renameVolume') {
+    return null;
+  }
   return Object.hasOwn(CLASS_BY_PROGRAM, file) ? CLASS_BY_PROGRAM[file] : null;
 }
 

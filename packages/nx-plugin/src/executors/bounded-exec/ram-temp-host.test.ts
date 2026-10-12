@@ -63,9 +63,13 @@ function attachedDisks(paths: RamTempPaths, capacity: number): RamDisk[] {
   return ramDisksIn(info).filter((disk) => disk.user === paths.user && disk.sectors === capacity / 512);
 }
 
-function detachAll(paths: RamTempPaths, capacity: number): void {
+async function detachAll(paths: RamTempPaths, capacity: number): Promise<void> {
+  const host = createHostCommands();
   for (const disk of attachedDisks(paths, capacity)) {
-    execFileSync('/usr/bin/hdiutil', ['detach', '-force', disk.physical]);
+    const output = await host.run('/usr/bin/hdiutil', ['detach', '-force', disk.physical]);
+    if (output.status !== 0) {
+      throw new Error(`hdiutil detach ${disk.physical}: exit ${output.status}: ${output.stderr}`);
+    }
   }
 }
 
@@ -260,7 +264,7 @@ describe('RAM temp volume on this host', () => {
     } finally {
       // Restore the owner write the outside directory was given, so the parent can be removed.
       chmodSync(outside, 0o755);
-      detachAll(paths, capacity);
+      await detachAll(paths, capacity);
       rmSync(parent, { recursive: true, force: true });
     }
   }, 60_000);

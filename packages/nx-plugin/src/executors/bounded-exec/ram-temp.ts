@@ -1689,7 +1689,7 @@ export function createHostCommands(
 ): HostCommands {
   return {
     async run(file, args) {
-      const diskClass = diskClassOf(file);
+      const diskClass = diskClassOf(file, args);
       const predatesSince = predatesSeenAt.get(gatewaySocket);
       if (diskClass === null || (predatesSince !== undefined && Date.now() - predatesSince < PREDATES_RECHECK_MS)) {
         return runBounded(file, args, deadlineMs);
