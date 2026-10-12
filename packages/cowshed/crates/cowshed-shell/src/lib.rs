@@ -152,6 +152,28 @@ fn one_descriptor(descriptors: &mut Vec<OwnedFd>, what: &str) -> io::Result<Owne
     Ok(descriptors.remove(0))
 }
 
+/// The command's observation fence, passed with its streams and closed once the held child
+/// has been released. A script child closes these explicitly because it does not exec.
+#[cfg(target_os = "macos")]
+pub(crate) struct ObservationHold {
+    ready: OwnedFd,
+    go: OwnedFd,
+}
+
+#[cfg(target_os = "macos")]
+impl ObservationHold {
+    fn take(descriptors: &mut Vec<OwnedFd>) -> io::Result<Self> {
+        Ok(Self {
+            ready: one_descriptor(descriptors, "observation ready")?,
+            go: one_descriptor(descriptors, "observation release")?,
+        })
+    }
+
+    pub(crate) fn raw(&self) -> [i32; 2] {
+        [self.ready.as_raw_fd(), self.go.as_raw_fd()]
+    }
+}
+
 fn reply(socket: &UnixStream, frame: FrameWriter) -> io::Result<()> {
     let mut socket = socket;
     socket.write_all(&frame.finish()?)
@@ -212,6 +234,8 @@ impl Host {
                 let stdin = one_descriptor(&mut descriptors, "stdin")?;
                 let stdout = one_descriptor(&mut descriptors, "stdout")?;
                 let stderr = one_descriptor(&mut descriptors, "stderr")?;
+                #[cfg(target_os = "macos")]
+                let hold = ObservationHold::take(&mut descriptors)?;
                 let environment = self.command_environment(&cwd, &overlay)?;
                 script::run(
                     socket,
@@ -220,6 +244,8 @@ impl Host {
                     &cwd,
                     &environment,
                     [stdin, stdout, stderr],
+                    #[cfg(target_os = "macos")]
+                    hold,
                 )
             }
             REQUEST_RUN => {
@@ -230,7 +256,17 @@ impl Host {
                 let stdin = one_descriptor(&mut descriptors, "stdin")?;
                 let stdout = one_descriptor(&mut descriptors, "stdout")?;
                 let stderr = one_descriptor(&mut descriptors, "stderr")?;
-                self.run(socket, &argv, &cwd, &overlay, [stdin, stdout, stderr])
+                #[cfg(target_os = "macos")]
+                let hold = ObservationHold::take(&mut descriptors)?;
+                self.run(
+                    socket,
+                    &argv,
+                    &cwd,
+                    &overlay,
+                    [stdin, stdout, stderr],
+                    #[cfg(target_os = "macos")]
+                    hold,
+                )
             }
             // Only a held command is signalled or released, inside its own exchange.
             REQUEST_SIGNAL | REQUEST_RELEASE => Err(io::Error::new(
@@ -403,13 +439,15 @@ impl Host {
         cwd: &Path,
         overlay: &[&[u8]],
         [stdin, stdout, stderr]: [OwnedFd; 3],
+        #[cfg(target_os = "macos")] hold: ObservationHold,
     ) -> io::Result<()> {
         let Some((program, arguments)) = argv.split_first() else {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "empty argv"));
         };
         let environment = self.command_environment(cwd, overlay)?;
         let diagnostics = stderr.try_clone()?;
-        let spawned = Command::new(OsStr::from_bytes(program))
+        let mut command = Command::new(OsStr::from_bytes(program));
+        command
             .args(arguments.iter().map(|argument| OsStr::from_bytes(argument)))
             .env_clear()
             .envs(&environment)
@@ -417,8 +455,20 @@ impl Host {
             .process_group(0)
             .stdin(Stdio::from(stdin))
             .stdout(Stdio::from(stdout))
-            .stderr(Stdio::from(stderr))
-            .spawn();
+            .stderr(Stdio::from(stderr));
+        #[cfg(target_os = "macos")]
+        {
+            let [ready, go] = hold.raw();
+            // SAFETY: only async-signal-safe getpid/write/read run between fork and exec.
+            unsafe {
+                command.pre_exec(move || {
+                    cowshed_core::runtime::process_fence::hold_before_exec(ready, go)
+                });
+            }
+        }
+        let spawned = command.spawn();
+        #[cfg(target_os = "macos")]
+        drop(hold);
         let exit = match spawned {
             Ok(child) => {
                 // The command holds the job's streams now; a copy kept here would keep its

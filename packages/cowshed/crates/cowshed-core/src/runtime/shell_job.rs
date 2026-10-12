@@ -115,6 +115,8 @@ pub(super) struct PooledSpawn<'a> {
     pub environment: SandboxEnvironment,
     pub caller: &'a BTreeMap<String, String>,
     pub grant_revision: u64,
+    #[cfg(target_os = "macos")]
+    pub monitor: super::process_monitor::ProcessMonitor,
 }
 
 impl WorkspaceShells {
@@ -201,6 +203,8 @@ impl WorkspaceShells {
                 command: spawn.command,
                 cwd: spawn.cwd,
                 overlay,
+                #[cfg(target_os = "macos")]
+                monitor: spawn.monitor.clone(),
             },
             Arc::clone(&control),
             released,
@@ -211,6 +215,8 @@ impl WorkspaceShells {
             stdin: StdinLane::new(stdin_sender),
             control,
             _release: release,
+            #[cfg(target_os = "macos")]
+            monitor: spawn.monitor,
         }))
     }
 }
@@ -356,6 +362,8 @@ impl JobControl {
 struct PooledProcess {
     stdin: StdinLane,
     control: Arc<JobControl>,
+    #[cfg(target_os = "macos")]
+    monitor: super::process_monitor::ProcessMonitor,
     /// Dropped with the handle, once the job concluded or its supervisor went away: the run then
     /// has the host reap the command.
     _release: oneshot::Sender<()>,
@@ -365,6 +373,11 @@ impl RunningProcess for PooledProcess {
     fn process(&self) -> Option<&OwnedProcess> {
         // The job's processes arrive with `ProcessEvent::Activating` and `ProcessEvent::Started`.
         None
+    }
+
+    #[cfg(target_os = "macos")]
+    fn observations(&self) -> Option<&super::process_monitor::ProcessMonitor> {
+        Some(&self.monitor)
     }
 
     fn try_write_stdin(&mut self, bytes: Bytes) -> Result<bool> {
@@ -400,6 +413,8 @@ struct RunCommand {
     command: HostCommand,
     cwd: PathBuf,
     overlay: Vec<(OsString, OsString)>,
+    #[cfg(target_os = "macos")]
+    monitor: super::process_monitor::ProcessMonitor,
 }
 
 enum Outcome {
@@ -517,6 +532,28 @@ async fn run_pooled(
                 Ok(host) => host,
                 Err(error) => return Outcome::NotLaunched(error),
             };
+            // The cold activation is owned work, but the reusable host is not this command's
+            // retained root. Keep that unobserved birth explicit rather than inventing an exit
+            // when the host becomes reusable.
+            #[cfg(target_os = "macos")]
+            {
+                let monitor = command.monitor.clone();
+                let pid = host.fence.process().birth.pid();
+                let pid = match u32::try_from(pid) {
+                    Ok(pid) => pid,
+                    Err(error) => {
+                        return Outcome::NotLaunched(CowshedError::internal(error.to_string()));
+                    }
+                };
+                if let Err(error) = tokio::task::spawn_blocking(move || {
+                    monitor.gap(crate::api::process::ProcessCoverageGap::UnobservedBirth { pid })
+                })
+                .await
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic.into_panic()))
+                {
+                    return Outcome::NotLaunched(error);
+                }
+            }
             // The host is the job's first process: it activates for this job alone.
             let _ = events
                 .send(ProcessEvent::Activating {
@@ -758,11 +795,31 @@ impl ExecHost {
             })
             .and_then(FrameWriter::finish)
             .map_err(|error| protocol_error("request", error))?;
-        let raw = descriptors
-            .each_ref()
-            .map(|descriptor| descriptor.as_raw_fd());
+        #[cfg(target_os = "macos")]
+        let (gate, held) = super::process_fence::leader_gate().map_err(pipe_error)?;
+        #[cfg(target_os = "macos")]
+        let raw = [
+            descriptors[0].as_raw_fd(),
+            descriptors[1].as_raw_fd(),
+            descriptors[2].as_raw_fd(),
+            held.ready.as_raw_fd(),
+            held.go.as_raw_fd(),
+        ];
+        #[cfg(not(target_os = "macos"))]
+        let raw = descriptors.each_ref().map(AsRawFd::as_raw_fd);
         self.send(frame, &raw).await?;
         drop(descriptors);
+        #[cfg(target_os = "macos")]
+        {
+            drop(held);
+            let monitor = command.monitor.clone();
+            tokio::task::spawn_blocking(move || {
+                gate.observe(|pid| monitor.watch(pid).map_err(io::Error::other))
+            })
+            .await
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic.into_panic()))
+            .map_err(pipe_error)?;
+        }
         let payload = self.receive().await?;
         let (tag, mut fields) =
             FrameReader::new(&payload).map_err(|error| protocol_error("reply", error))?;

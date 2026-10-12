@@ -37,6 +37,25 @@ use crate::runtime::process_usage::{
     ProcessUsageFold, UsageFoldError, UsageObservation, UsageReading,
 };
 
+/// The bounded events of one worker-stream subscription. Its producer retains the native
+/// journal; backpressure never coalesces a lifecycle or coverage transition.
+#[derive(Debug)]
+pub struct JobProcessStream {
+    events: tokio::sync::mpsc::Receiver<crate::error::Result<JobProcessEvent>>,
+}
+
+impl JobProcessStream {
+    pub(crate) fn new(
+        events: tokio::sync::mpsc::Receiver<crate::error::Result<JobProcessEvent>>,
+    ) -> Self {
+        Self { events }
+    }
+
+    pub async fn next(&mut self) -> Option<crate::error::Result<JobProcessEvent>> {
+        self.events.recv().await
+    }
+}
+
 /// One thing the observer or the sampler tells the fold.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum JobProcessObservation {

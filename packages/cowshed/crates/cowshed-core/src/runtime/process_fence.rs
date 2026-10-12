@@ -1,4 +1,4 @@
-//! The pre-exec observation fence (86-hts-shell-subtasks.md B23b/B23d).
+//! The macOS pre-exec observation fence (07_api.md, "Process-tree observations").
 //! Only async-signal-safe calls run in the child. The supervisor attaches the selected native
 //! source while the child is held, then releases it; a refused attachment fails the exec.
 
@@ -32,18 +32,6 @@ pub(crate) fn leader_gate() -> io::Result<(LeaderGate, HeldEnds)> {
     ))
 }
 
-#[cfg(target_os = "linux")]
-fn close_on_exec_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
-    let mut ends = [0; 2];
-    // SAFETY: space for both descriptors; pipe2 creates them atomically close-on-exec.
-    if unsafe { libc::pipe2(ends.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: these fresh descriptors have no other owners.
-    Ok(unsafe { (OwnedFd::from_raw_fd(ends[0]), OwnedFd::from_raw_fd(ends[1])) })
-}
-
-#[cfg(not(target_os = "linux"))]
 fn close_on_exec_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
     crate::fork_lock::create(|| {
         let mut ends = [0; 2];

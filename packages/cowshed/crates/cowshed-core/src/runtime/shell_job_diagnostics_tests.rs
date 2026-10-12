@@ -109,6 +109,9 @@ fn descriptor_exhaustion_reports_the_diagnostics_clone_failure() {
         let (_release, released) = oneshot::channel();
         let (events, mut observed) = mpsc::channel(4);
         let job_id = JobId::new(17).expect("job id");
+        #[cfg(target_os = "macos")]
+        let monitor = super::super::process_monitor::ProcessMonitor::prepare(job_id)
+            .expect("prepare observation before exhausting descriptors");
 
         let limit = DescriptorLimit::exhausted(stderr.as_raw_fd());
         let clone_error = stderr.try_clone().expect_err("the real dup must fail");
@@ -124,6 +127,8 @@ fn descriptor_exhaustion_reports_the_diagnostics_clone_failure() {
                 command: HostCommand::Argv(vec![OsString::from("true")]),
                 cwd: PathBuf::from("/"),
                 overlay: Vec::new(),
+                #[cfg(target_os = "macos")]
+                monitor,
             },
             Arc::clone(&control),
             released,

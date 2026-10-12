@@ -179,7 +179,10 @@ impl ProcessMonitor {
         self.driver.snapshot.load().as_ref().clone()
     }
 
-    pub async fn subscribe(&self, every: Duration) -> Result<JobProcessStream> {
+    pub async fn subscribe(
+        &self,
+        every: Duration,
+    ) -> Result<super::process_stream::JobProcessStream> {
         if every.is_zero() || Instant::now().checked_add(every).is_none() {
             return Err(CowshedError::usage(
                 "process sampling interval is outside the clock's range",
@@ -191,25 +194,40 @@ impl ProcessMonitor {
         let id = answer
             .await
             .map_err(|_| unavailable(self.driver.job_id))??;
-        Ok(JobProcessStream {
+        let mut subscription = NativeSubscription {
             driver: Arc::clone(&self.driver),
             id,
             cursor: 0,
             ended: false,
-        })
+        };
+        let (events, received) = tokio::sync::mpsc::channel(1);
+        tokio::spawn(async move {
+            loop {
+                let next = tokio::select! {
+                    biased;
+                    () = events.closed() => return,
+                    next = subscription.next() => next,
+                };
+                let Some(event) = next else { return };
+                if events.send(event).await.is_err() {
+                    return;
+                }
+            }
+        });
+        Ok(super::process_stream::JobProcessStream::new(received))
     }
 }
 
 /// One private journal position, transported by the canonical worker-stream demand row.
 /// There is no public cursor operation and a dropped reader never ends the command.
-pub struct JobProcessStream {
+struct NativeSubscription {
     driver: Arc<Driver>,
     id: u64,
     cursor: usize,
     ended: bool,
 }
 
-impl std::fmt::Debug for JobProcessStream {
+impl std::fmt::Debug for NativeSubscription {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("JobProcessStream")
@@ -218,7 +236,7 @@ impl std::fmt::Debug for JobProcessStream {
     }
 }
 
-impl JobProcessStream {
+impl NativeSubscription {
     pub async fn next(&mut self) -> Option<Result<JobProcessEvent>> {
         if self.ended {
             return None;
@@ -249,7 +267,7 @@ impl JobProcessStream {
     }
 }
 
-impl Drop for JobProcessStream {
+impl Drop for NativeSubscription {
     fn drop(&mut self) {
         if let Err(error) = self.driver.send(Request::Close { id: self.id }) {
             eprintln!("cowshed: closing process subscription: {error}");

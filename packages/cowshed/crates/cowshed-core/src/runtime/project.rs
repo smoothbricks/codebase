@@ -35,6 +35,7 @@ use crate::api::operations::{
     ProjectOpened, RepoRequest, Scope, StdinWriteRequest, TailRequest, WorkerScope,
     WorkspaceAtRequest, WorkspaceGrantsRequest, WorkspaceRequest, WorkspaceView, encode_result,
 };
+use crate::api::process::JobProcessTree;
 use crate::api::resources::{JobResourceSample, SampleInterval};
 use crate::api::server::{
     ConnectionAuthority, EventSource, RouterCommand, RouterHandle, RouterRequest, RouterResponse,
@@ -45,6 +46,7 @@ use crate::metadata::WorkspaceName;
 use crate::repository::OwnedRepoIds;
 use crate::repository::{RepoId, RepositoryBinding};
 use crate::runtime::job_progress::JobProgressStream;
+use crate::runtime::process_stream::JobProcessStream;
 #[cfg(target_os = "macos")]
 use cowshed_os::fork_lock::RunAsync as _;
 #[cfg(target_os = "macos")]
@@ -359,6 +361,19 @@ pub trait ProjectRuntimeHost: Send + 'static {
         incarnation: WorkspaceIncarnation,
         job: JobId,
     ) -> Result<JobAnswer<JobResourceSample>>;
+    async fn read_processes(
+        &mut self,
+        workspace: WorkspaceName,
+        incarnation: WorkspaceIncarnation,
+        job: JobId,
+    ) -> Result<JobAnswer<JobProcessTree>>;
+    async fn process_events_job(
+        &mut self,
+        workspace: WorkspaceName,
+        incarnation: WorkspaceIncarnation,
+        job: JobId,
+        every: SampleInterval,
+    ) -> Result<JobAnswer<JobProcessStream>>;
     /// The job's progress, sampled every `every`: its first read is the only wait.
     async fn progress_job(
         &mut self,
@@ -955,6 +970,18 @@ impl ProjectActor {
             Op::JobResourcesRead(params) => {
                 return self
                     .job_resources(&authority, params)
+                    .await
+                    .map(Routed::Later);
+            }
+            Op::JobProcesses(params) => {
+                return self
+                    .job_processes(&authority, params)
+                    .await
+                    .map(Routed::Later);
+            }
+            Op::JobProcessEvents(params) => {
+                return self
+                    .job_process_events(&authority, params)
                     .await
                     .map(Routed::Later);
             }
@@ -1652,6 +1679,49 @@ impl ProjectActor {
         }))
     }
 
+    async fn job_processes(
+        &mut self,
+        authority: &ConnectionAuthority,
+        params: JobRequest,
+    ) -> Result<JobAnswer<RouterResponse>> {
+        self.require_scoped_workspace(authority, &params.repo_id, &params.workspace)
+            .await?;
+        let tree = self
+            .host
+            .read_processes(
+                params.workspace,
+                params.workspace_incarnation,
+                params.job_id,
+            )
+            .await?;
+        Ok(Box::pin(async move {
+            respond::<operations::JobProcesses>(&tree.await?)
+        }))
+    }
+
+    async fn job_process_events(
+        &mut self,
+        authority: &ConnectionAuthority,
+        params: ProgressRequest,
+    ) -> Result<JobAnswer<RouterResponse>> {
+        self.require_scoped_workspace(authority, &params.repo_id, &params.workspace)
+            .await?;
+        let events = self
+            .host
+            .process_events_job(
+                params.workspace,
+                params.workspace_incarnation,
+                params.job_id,
+                params.every_ms,
+            )
+            .await?;
+        Ok(Box::pin(async move {
+            Ok(RouterResponse::events(Box::new(ProcessEvents(
+                events.await?,
+            ))))
+        }))
+    }
+
     async fn job_progress(
         &mut self,
         authority: &ConnectionAuthority,
@@ -1880,6 +1950,16 @@ impl EventSource for ProgressEvents {
     async fn next(&mut self) -> Option<Result<serde_json::Value>> {
         let sample = self.0.next().await?;
         Some(sample.and_then(|sample| encode_result::<operations::JobProgress>(&sample)))
+    }
+}
+
+struct ProcessEvents(JobProcessStream);
+
+#[async_trait]
+impl EventSource for ProcessEvents {
+    async fn next(&mut self) -> Option<Result<serde_json::Value>> {
+        let event = self.0.next().await?;
+        Some(event.and_then(|event| encode_result::<operations::JobProcessEvents>(&event)))
     }
 }
 
@@ -11490,6 +11570,33 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         Ok(Box::pin(async move { supervisor.resources(job).await }))
     }
 
+    async fn read_processes(
+        &mut self,
+        workspace: WorkspaceName,
+        incarnation: WorkspaceIncarnation,
+        job: JobId,
+    ) -> Result<JobAnswer<JobProcessTree>> {
+        let current = self.current(&workspace).await?;
+        Self::require_exact_incarnation(&current, &incarnation)?;
+        let supervisor = self.ensure_supervisor(&workspace).await?;
+        Ok(Box::pin(async move { supervisor.processes(job).await }))
+    }
+
+    async fn process_events_job(
+        &mut self,
+        workspace: WorkspaceName,
+        incarnation: WorkspaceIncarnation,
+        job: JobId,
+        every: SampleInterval,
+    ) -> Result<JobAnswer<JobProcessStream>> {
+        let current = self.current(&workspace).await?;
+        Self::require_exact_incarnation(&current, &incarnation)?;
+        let supervisor = self.ensure_supervisor(&workspace).await?;
+        Ok(Box::pin(async move {
+            supervisor.process_events(job, every).await
+        }))
+    }
+
     async fn progress_job(
         &mut self,
         workspace: WorkspaceName,
@@ -13041,6 +13148,11 @@ mod removal_supervisor_tests {
     impl RunningProcess for TestProcess {
         fn process(&self) -> Option<&super::super::supervisor::OwnedProcess> {
             Some(&self.process)
+        }
+
+        #[cfg(target_os = "macos")]
+        fn observations(&self) -> Option<&super::super::process_monitor::ProcessMonitor> {
+            None
         }
 
         fn try_write_stdin(&mut self, _bytes: bytes::Bytes) -> Result<bool> {

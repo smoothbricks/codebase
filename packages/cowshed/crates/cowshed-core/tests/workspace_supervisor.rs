@@ -124,6 +124,11 @@ impl RunningProcess for FakeProcess {
         Some(&self.process)
     }
 
+    #[cfg(target_os = "macos")]
+    fn observations(&self) -> Option<&cowshed_core::runtime::process_monitor::ProcessMonitor> {
+        None
+    }
+
     fn try_write_stdin(&mut self, bytes: Bytes) -> Result<bool> {
         self.writes += 1;
         if self.backpressure && self.writes == 2 {
@@ -4211,6 +4216,11 @@ struct WarmProcess;
 
 impl RunningProcess for WarmProcess {
     fn process(&self) -> Option<&OwnedProcess> {
+        None
+    }
+
+    #[cfg(target_os = "macos")]
+    fn observations(&self) -> Option<&cowshed_core::runtime::process_monitor::ProcessMonitor> {
         None
     }
 
