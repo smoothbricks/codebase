@@ -260,6 +260,11 @@ impl<P> AsRawFd for KqueueObserver<P> {
 }
 
 impl KqueueObserver {
+    /// Allocate the event source before any workload can be forked.
+    pub fn prepare(job_id: JobId) -> Result<Self, ObserveError> {
+        Self::prepare_with(Darwin, job_id)
+    }
+
     /// Watch the held root of `job_id` before it can fork or exec.
     pub fn watch(job_id: JobId, root: u32) -> Result<Self, ObserveError> {
         Self::watch_with(Darwin, job_id, root)
@@ -268,20 +273,30 @@ impl KqueueObserver {
 
 impl<P: ProcessReads> KqueueObserver<P> {
     pub fn watch_with(reads: P, job_id: JobId, root: u32) -> Result<Self, ObserveError> {
+        let mut observer = Self::prepare_with(reads, job_id)?;
+        observer.watch_root(root)?;
+        Ok(observer)
+    }
+
+    fn prepare_with(reads: P, job_id: JobId) -> Result<Self, ObserveError> {
         // SAFETY: kqueue takes nothing and returns a new descriptor.
         let queue = unsafe { libc::kqueue() };
         if queue < 0 {
-            return Err(kernel("kqueue", root, io::Error::last_os_error()));
+            return Err(kernel("kqueue", 0, io::Error::last_os_error()));
         }
         // SAFETY: a fresh descriptor this function alone owns.
         let queue = unsafe { OwnedFd::from_raw_fd(queue) };
-        let mut observer = Self {
+        Ok(Self {
             queue,
             reads,
             fold: JobProcessFold::new(job_id, Instant::now()),
             events: Vec::new(),
             registered: HashSet::new(),
-        };
+        })
+    }
+
+    /// Register the held root before acknowledging its pre-exec fence.
+    pub fn watch_root(&mut self, root: u32) -> Result<(), ObserveError> {
         let not_running = || {
             kernel(
                 "proc_pidinfo",
@@ -289,18 +304,18 @@ impl<P: ProcessReads> KqueueObserver<P> {
                 io::Error::new(io::ErrorKind::NotFound, "the held root is not running"),
             )
         };
-        let before = observer.record(root)?.ok_or_else(not_running)?;
-        let record = observer.attach(before)?.ok_or_else(not_running)?;
+        let before = self.record(root)?.ok_or_else(not_running)?;
+        let record = self.attach(before)?.ok_or_else(not_running)?;
         let process = identity(&record);
-        let image = observer.image(process)?.ok_or_else(not_running)?;
-        observer.observe(ProcessObservation::Root {
+        let image = self.image(process)?.ok_or_else(not_running)?;
+        self.observe(ProcessObservation::Root {
             process,
             ppid: record.ppid,
             at: utc_at_second(record.started_seconds)?,
             image,
         })?;
-        observer.sample(Instant::now())?;
-        Ok(observer)
+        self.sample(Instant::now())?;
+        Ok(())
     }
 
     pub fn fold(&self) -> &ProcessTreeFold {
@@ -313,6 +328,19 @@ impl<P: ProcessReads> KqueueObserver<P> {
 
     pub fn drain_events(&mut self) -> std::vec::Drain<'_, JobProcessEvent> {
         self.events.drain(..)
+    }
+
+    pub fn has_events(&self) -> bool {
+        !self.events.is_empty()
+    }
+
+    /// A duplicate queue descriptor wakes the sole writer; it is not an observation reader.
+    pub fn wake_handle(&self) -> io::Result<OwnedFd> {
+        self.queue.try_clone()
+    }
+
+    pub fn gap(&mut self, reason: ProcessCoverageGap) -> Result<(), ObserveError> {
+        self.observe(ProcessObservation::Lost(reason))
     }
 
     pub fn watching(&self) -> bool {
@@ -432,6 +460,9 @@ impl<P: ProcessReads> KqueueObserver<P> {
     }
 
     fn handle(&mut self, event: &libc::kevent) -> Result<(), ObserveError> {
+        if event.filter != libc::EVFILT_PROC {
+            return Ok(());
+        }
         // `struct kevent` is packed on Darwin: copy each field out before using it.
         let (ident, flags, fflags, data, udata) = (
             event.ident,
@@ -495,7 +526,7 @@ impl<P: ProcessReads> KqueueObserver<P> {
         let mut failures = Failures::default();
         let observation = match self.image(process) {
             Ok(Some(image))
-                if seen == Seen::Adopted && Some(&image) == self.fold.image(process) =>
+                if seen == Seen::Adopted && Some(&image) == self.fold.lives().image(process) =>
             {
                 None
             }
@@ -578,14 +609,14 @@ impl<P: ProcessReads> KqueueObserver<P> {
             return Ok(());
         };
         let process = identity(&before);
-        if self.fold.holds(process) || before.parent_unique_id != parent.birth.0 {
+        if self.fold.lives().holds(process) || before.parent_unique_id != parent.birth.0 {
             // Already watched, or a stranger given the pid of a child reaped meanwhile.
             return Ok(());
         }
         let Some(record) = self.attach(before)? else {
             return Ok(());
         };
-        self.fold.apply(ProcessObservation::Forked {
+        self.observe(ProcessObservation::Forked {
             process,
             parent,
             at: utc_at_second(record.started_seconds)?,
@@ -1157,14 +1188,9 @@ mod tests {
 
     /// A root, a first life of pid 900, and a second life of pid 900 forked before the first
     /// life's exit was folded.
-    fn reused_pid_fold() -> (
-        ProcessTreeFold,
-        ProcessIdentity,
-        ProcessIdentity,
-        ProcessIdentity,
-    ) {
+    fn reused_pid_fold() -> (TestFold, ProcessIdentity, ProcessIdentity, ProcessIdentity) {
         let (root, old, new) = (life(800, 1), life(900, 2), life(900, 3));
-        let mut fold = ProcessTreeFold::default();
+        let mut fold = TestFold::default();
         let at = utc_at_second(1_700_000_000).unwrap();
         fold.apply(ProcessObservation::Root {
             process: root,
@@ -1252,7 +1278,7 @@ mod tests {
         let before = record(pid, 40, 1);
         for after in [Some(record(pid, 41, 1)), None] {
             let reads = Scripted::default().record(pid, &[after]);
-            let mut observer = scripted(reads, ProcessTreeFold::default(), &[]);
+            let mut observer = scripted(reads, TestFold::default(), &[]);
             assert_eq!(observer.attach(before).unwrap(), None);
             assert!(observer.registered.is_empty());
             // Deleting it again finds no registration: the observer already withdrew it.
@@ -1266,7 +1292,7 @@ mod tests {
         }
         // The same life before and after: adopted, and its registration stays.
         let reads = Scripted::default().record(pid, &[Some(before)]);
-        let mut observer = scripted(reads, ProcessTreeFold::default(), &[]);
+        let mut observer = scripted(reads, TestFold::default(), &[]);
         assert_eq!(observer.attach(before).unwrap(), Some(before));
         assert!(observer.registered.contains(&life(pid, 40)));
         assert!(observer.change(life(pid, 40), libc::EV_DELETE).unwrap());
@@ -1289,7 +1315,7 @@ mod tests {
             .image(910, Ok(shell_image("/stranger")))
             .image(910, Ok(shell_image("/bin/cat")))
             .children(910, Ok(vec![911, 912]));
-        let observer = scripted(reads, ProcessTreeFold::default(), &[]);
+        let observer = scripted(reads, TestFold::default(), &[]);
         assert_eq!(observer.image(process).unwrap(), None, "changed life");
         assert_eq!(observer.image(process).unwrap(), None, "exited");
         assert_eq!(
@@ -1319,7 +1345,7 @@ mod tests {
                     .record(920, &[ours, after, ours])
                     .image(920, Err(io::Error::from_raw_os_error(errno)))
                     .children(920, Err(io::Error::from_raw_os_error(libc::EFAULT)));
-                let observer = scripted(reads, ProcessTreeFold::default(), &[]);
+                let observer = scripted(reads, TestFold::default(), &[]);
                 assert_eq!(
                     failed(&observer.image(process).unwrap_err()),
                     ("KERN_PROCARGS2", 920, Some(errno))
@@ -1341,7 +1367,7 @@ mod tests {
             .record(940, &[ours])
             .record_failure(940, libc::EPERM)
             .image(940, Err(io::Error::from_raw_os_error(libc::EIO)));
-        let error = scripted(reads, ProcessTreeFold::default(), &[])
+        let error = scripted(reads, TestFold::default(), &[])
             .image(process)
             .unwrap_err();
         let ObserveError::Several { first, rest } = error else {
@@ -1360,7 +1386,7 @@ mod tests {
             .record(940, &[ours])
             .record_failure(940, libc::EPERM)
             .image(940, Ok(shell_image("/bin/cat")));
-        let error = scripted(reads, ProcessTreeFold::default(), &[])
+        let error = scripted(reads, TestFold::default(), &[])
             .image(process)
             .unwrap_err();
         assert_eq!(failed(&error), ("proc_pidinfo", 940, Some(libc::EPERM)));
@@ -1373,17 +1399,16 @@ mod tests {
         let process = life(930, 11);
         let ours = Some(record(930, 11, 1));
         let einval = || Err(io::Error::from_raw_os_error(libc::EINVAL));
-        let refused = |reads: Scripted| match scripted(reads, ProcessTreeFold::default(), &[])
-            .image(process)
-        {
-            Err(ObserveError::ImageNotPermitted {
-                pid,
-                uid,
-                reader,
-                source,
-            }) => (pid, uid, reader, source.raw_os_error()),
-            other => panic!("{other:?}"),
-        };
+        let refused =
+            |reads: Scripted| match scripted(reads, TestFold::default(), &[]).image(process) {
+                Err(ObserveError::ImageNotPermitted {
+                    pid,
+                    uid,
+                    reader,
+                    source,
+                }) => (pid, uid, reader, source.raw_os_error()),
+                other => panic!("{other:?}"),
+            };
         let another_user = Scripted::default()
             .reading_as(OWNER + 1)
             .record(930, &[ours, ours])
@@ -1407,7 +1432,7 @@ mod tests {
             .reading_as(OWNER + 1)
             .record(930, &[ours, ours])
             .image(930, Err(io::Error::from_raw_os_error(libc::EIO)));
-        let error = scripted(unmapped, ProcessTreeFold::default(), &[])
+        let error = scripted(unmapped, TestFold::default(), &[])
             .image(process)
             .unwrap_err();
         assert_eq!(failed(&error), ("KERN_PROCARGS2", 930, Some(libc::EIO)));
@@ -1418,7 +1443,7 @@ mod tests {
     #[test]
     fn a_failed_read_never_drops_the_rest_of_its_batch() {
         let (root, first, second) = (life(800, 1), life(900, 2), life(901, 3));
-        let mut fold = ProcessTreeFold::default();
+        let mut fold = TestFold::default();
         let at = utc_at_second(1_700_000_000).unwrap();
         fold.apply(ProcessObservation::Root {
             process: root,

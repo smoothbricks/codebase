@@ -21,6 +21,7 @@ test = false
 bench = false
 
 [dependencies]
+arc-swap = "1"
 arrow-array = "56"
 arrow-buffer = "56"
 arrow-ipc = "56"
