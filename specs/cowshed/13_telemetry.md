@@ -21,16 +21,17 @@ the supervisor's job spans both use that module; neither keeps a copy. Nothing i
 `lmao-query`.
 
 **Job span segments.** The workspace supervisor writes each job's span with the trace context the controller minted or
-adopted for it (`JobInfo.trace`): a `span-start` row at admission and a `span-ok`/`span-err` row at its terminal state,
-each as its own sealed segment `job-<order:020>-<writer>.arrow` under `<host-telemetry-root>/<yyyy-mm-dd>/`, sealed like
-the gateway's (create-new `0600` temporary, fsync, rename, directory fsync). The rows carry `repo_id`,
-`workspace_incarnation`, `job_id`, `grant_revision`, the job's W3C span id and, on the terminal row, its state. The
-span's lmao address is span 1 of the thread derived from the durable key `(repo_id, workspace_incarnation, job_id)` (the
-first eight bytes of a domain-separated BLAKE3), never the workspace-local `job_id` alone: jobs of two workspaces under
-one adopted trace context stay distinct spans. The writes run off the supervisor's actor; a refused write is counted in
-the supervisor's trace health, which every supervisor handle reads, in process or over its socket, and never fails or
-delays the job. This job span is the anchor `process.run` spans parent from. The terminal row carries the job's
-`env_hash` (the same environment identity as the job record's `envHash`, 11_shell.md).
+adopted for it (`JobInfo.trace`): a `span-start` row at admission, the `job.unattributed` row below when its terminal
+sample states unattributed usage, and a `span-ok`/`span-err` row at its terminal state, each as its own sealed segment
+`job-<order:020>-<writer>.arrow` under `<host-telemetry-root>/<yyyy-mm-dd>/`, sealed like the gateway's (create-new
+`0600` temporary, fsync, rename, directory fsync). The rows carry `repo_id`, `workspace_incarnation`, `job_id`,
+`grant_revision`, the job's W3C span id and, on the terminal row, its state. The span's lmao address is span 1 of the
+thread derived from the durable key `(repo_id, workspace_incarnation, job_id)` (the first eight bytes of a
+domain-separated BLAKE3), never the workspace-local `job_id` alone: jobs of two workspaces under one adopted trace
+context stay distinct spans. The writes run off the supervisor's actor; a refused write is counted in the supervisor's
+trace health, which every supervisor handle reads, in process or over its socket, and never fails or delays the job.
+This job span is the anchor `process.run` spans parent from. The terminal row carries the job's `env_hash` (the same
+environment identity as the job record's `envHash`, 11_shell.md).
 
 ## Trace context propagation
 
@@ -150,10 +151,29 @@ current/peak; charged memory includes cache/kernel charges and is never written 
 leader's own/children rusage reconciliation source. The declared source and named checked unit types are part of the
 typed accounting record (07_api.md), not a JSON string.
 
-A discrepancy between attributed process rows and the independent job total emits one `job.unattributed` row with
-`unattributed_cpu_us`, optional `unattributed_io_read_bytes` and `unattributed_io_write_bytes`, in signed checked units;
-source/coverage is a fixed row kind or enum, not a dynamically named column. Event loss, unavailable evidence and
-counter-window/precision disagreement are explicit. Charged-memory fields
+A discrepancy between attributed process rows and the independent job total emits one `job.unattributed` row on the job
+span: an `info` row of that message, sealed just before the job's `span-ok`/`span-err` row, that states the job's
+terminal reconciliation (07_api.md, `UsageReconciliation`) whole in six fixed columns, which every other row of the span
+leaves null.
+
+| Column                        | Type     | Meaning                                                                                                                                                                   |
+| ----------------------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `unattributed_cpu_us`         | `i64`    | The independent CPU total less the CPU the observed processes counted as their own, in microseconds; negative where the processes counted more.                           |
+| `unattributed_io_read_bytes`  | `i64`    | The same difference in storage bytes read; null where the source or the observed processes have no bytes to compare.                                                      |
+| `unattributed_io_write_bytes` | `i64`    | The same difference in storage bytes written; null where nothing could be compared.                                                                                       |
+| `unattributed_source`         | `S.enum` | The independent source that counted the totals, by its wire kind: `linuxCgroupV2` or `macOsRusageChildren`.                                                               |
+| `unattributed_coverage`       | `S.enum` | How completely the observed processes covered the job: `complete`, `eventsLost`, `unobservedBirth`, `unobservedExit`, `uncountedFork`, `unreadImage`, `unreadFinalUsage`. |
+| `unattributed_gap_pid`        | `u32`    | The observed process a gap's evidence names; null for a complete tree and for lost events.                                                                                |
+
+Differences are signed checked units and are never clamped: observation can see work its source has not counted yet, and
+the two are read at different instants, so a negative difference is a fact. A comparison no source could make -- macOS
+counts no storage bytes for a job -- stays null, never zero. The row is written whenever the coverage names a gap, even
+with every difference zero, and whenever a difference is non-zero over a complete tree (counter precision or
+sampling-window disagreement); a complete tree that agrees in every comparison its source could make writes none. A job
+whose terminal sample could not be taken writes none, and no row is invented for it: the span states a comparison's
+absence, not a whole sample's unavailability. The row names no leaf: the leaf stays the sample's own
+`JobLeafAttribution` (07_api.md), and nothing infers one from what was missed. Its enum columns are `u16`-keyed
+dictionaries of every declared name, the names being the wire kinds. Charged-memory fields
 `charged_memory_current_bytes`/`charged_memory_peak_bytes` stay on the job span, never on a process span: its end row
 states them as nullable `u64` byte columns from the terminal sample's accounting, the cgroup source's checked
 `memory.current`/`memory.peak` pair unconverted. A source with no charged-memory counter (macOS) and a job with no

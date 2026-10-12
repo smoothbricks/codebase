@@ -5,6 +5,7 @@ is a thin third client of the same core — anything the CLI can do is assembled
 with identical semantics and error taxonomy.
 
 
+
 ## Authority model (frozen)
 
 Four handle types, one rule: **a handle reachable from inside a sandbox must not authorize escalation or select another
@@ -709,6 +710,10 @@ without waiting for exit and reports a typed not-ready conflict before spawn; `p
 sample once available, periodic samples even when neither stream advances, then the terminal sample exactly once before
 closing. The interval is positive and uses the declaration's bounded duration contract. A slow reader may coalesce
 intermediate samples; terminal evidence and journal bytes are never lost.
+
+A job without a terminal resource sample leaves its span's end-row host, volume and charged-memory cells null and
+states no `job.unattributed` row (13_telemetry.md, "Process-tree spans"). The supervisor does not resample a boundary
+for the span or fabricate a zero sample.
 
 `JobHandle::resources()` and the generated N-API `resources()` call use the declared `job.resources` operation directly,
 not a `status()` projection. The supervisor's existing reader takes one canonical sample for a live job and returns its
