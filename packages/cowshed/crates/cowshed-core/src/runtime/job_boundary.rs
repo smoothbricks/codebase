@@ -3,11 +3,15 @@
 //! These columns belong only on the job span. A process span that carries one fails
 //! [`crate::runtime::process_spans::read_process_segment`].
 
+use std::path::Path;
+
 use arrow_schema::{DataType, Field};
 
 use crate::api::resources::{
-    HostLoad1, HostLoadSample, JobVolumeUsage, ResourceUnitError, VolumeUsage,
+    ChargedMemoryUsage, HostLoad1, HostLoadSample, JobVolumeUsage, ResourceUnitError, VolumeUsage,
 };
+use crate::host_load::HostLoadError;
+use crate::runtime::volume_usage::{HostVolumeStat, VolumeBaseline, VolumeMountpoint};
 
 /// Nearest milliload. Non-finite, negative, and overflowing loads are refused, never truncated.
 pub fn milliload(load: HostLoad1) -> Result<u32, ResourceUnitError> {
@@ -42,6 +46,34 @@ pub fn job_boundary_fields() -> Vec<Field> {
         Field::new("load1_milli", DataType::UInt32, true),
         Field::new("cores", DataType::UInt16, true),
     ]
+}
+
+/// Host, volume, and charged-memory facts for one job-span start or end.
+/// Absent build volume and absent charged memory stay null. This does not
+/// name a leaf or compute unattributed usage.
+pub struct JobSpanBoundary {
+    pub host: HostLoadSample,
+    pub volumes: JobVolumeUsage,
+    pub charged: Option<ChargedMemoryUsage>,
+}
+
+/// The host's current load and the admitted volume probe.
+///
+/// `workspace` is required. `build` is probed only when the admission named
+/// one; an absent build mount is `None`, never a zero and never an invented
+/// path. A stat that fails stays [`VolumeUsage::Unavailable`]. Charged memory
+/// is not read here.
+pub fn sample_job_boundary(
+    workspace: &VolumeMountpoint,
+    build: Option<&Path>,
+) -> Result<JobSpanBoundary, HostLoadError> {
+    let host = crate::host_load::read_host_load()?;
+    let volumes = VolumeBaseline::admitted(Some(workspace), build).sample(&HostVolumeStat);
+    Ok(JobSpanBoundary {
+        host,
+        volumes,
+        charged: None,
+    })
 }
 
 /// Charged-memory columns for the job span only. Absent when the accounting source has no
@@ -122,5 +154,40 @@ mod tests {
             );
         }
         assert_eq!(process.len(), 14);
+    }
+
+    #[test]
+    fn a_native_boundary_reads_the_host_and_leaves_an_absent_build_null() {
+        use std::path::Path;
+
+        use crate::runtime::volume_usage::VolumeMountpoint;
+
+        let workspace = VolumeMountpoint::new("/".into()).expect("root is a mount");
+        let absent = sample_job_boundary(&workspace, None).expect("the host answers");
+        assert!(absent.volumes.build.is_none(), "{:?}", absent.volumes.build);
+        assert!(absent.charged.is_none());
+        let host = crate::host_load::read_host_load().expect("a second host read");
+        assert_eq!(absent.host.cores, host.cores);
+        let (workspace_delta, build_delta) = volume_deltas(&absent.volumes);
+        assert!(build_delta.is_none());
+        match &absent.volumes.workspace {
+            VolumeUsage::Read { delta_bytes } => {
+                assert_eq!(workspace_delta, Some(delta_bytes.get()));
+            }
+            VolumeUsage::Unavailable { .. } => assert!(workspace_delta.is_none()),
+        }
+
+        let present =
+            sample_job_boundary(&workspace, Some(Path::new("/"))).expect("the host answers");
+        let build = present
+            .volumes
+            .build
+            .as_ref()
+            .expect("the asked volume was probed");
+        let (_, build_delta) = volume_deltas(&present.volumes);
+        match build {
+            VolumeUsage::Read { delta_bytes } => assert_eq!(build_delta, Some(delta_bytes.get())),
+            VolumeUsage::Unavailable { .. } => assert!(build_delta.is_none()),
+        }
     }
 }
