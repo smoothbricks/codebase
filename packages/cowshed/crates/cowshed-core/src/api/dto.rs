@@ -1776,9 +1776,6 @@ impl ControllerCommitment {
                     "land outcome landing and target incarnations must differ",
                 ))
             }
-            Self::LandOutcome(value) if !value.seeded && value.skip.is_none() => Err(
-                DtoError::InvalidJobProjection("an adopted land outcome must be seeded"),
-            ),
             _ => Ok(()),
         }
     }

@@ -860,7 +860,20 @@ fn land_outcome_commitments_preserve_every_skip_and_earlier_layout() {
     let adopted = outcome(true, None);
     let batch = controller_commitments_to_batch(std::slice::from_ref(&adopted)).unwrap();
     assert_eq!(decode_controller_commitments(&batch).unwrap(), [adopted]);
-    assert!(controller_commitments_to_batch(&[outcome(false, None)]).is_err());
+    let seal_busy = outcome(false, None);
+    let encoded = encode_controller_commitment(&seal_busy).unwrap();
+    assert_eq!(decode_controller_commitment(&encoded).unwrap(), seal_busy);
+    let json = serde_json::to_value(&seal_busy).unwrap();
+    assert_eq!(
+        serde_json::from_value::<ControllerCommitment>(json).unwrap(),
+        seal_busy
+    );
+    let seal_busy_batch =
+        controller_commitments_to_batch(std::slice::from_ref(&seal_busy)).unwrap();
+    assert_eq!(
+        decode_controller_commitments(&seal_busy_batch).unwrap(),
+        [seal_busy]
+    );
     for columns in [23, 27] {
         let hidden = batch.project(&(0..columns).collect::<Vec<_>>()).unwrap();
         assert!(
