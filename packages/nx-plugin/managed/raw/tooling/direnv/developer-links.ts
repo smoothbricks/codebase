@@ -129,7 +129,8 @@ interface DeclaredLinkReceipt extends DeveloperLink {
 /**
  * Runs `install` while preserving the developer links captured under `root`.
  * On rejection every captured live link is restored, less links that already
- * dangled; a resolved install keeps its selected `relink` replacements.
+ * dangled; a resolved install keeps its selected `relink` replacements and
+ * the lockfile versions replacing undeclared links whose receipts still match.
  * This is not a transaction over new entries created by the install. Relink
  * intent reports the actual final link state on either outcome.
  */
@@ -140,6 +141,15 @@ export async function keepDeveloperLinks<T>(
 ): Promise<T> {
   const { live, dangling } = findDeveloperLinks(root);
   const recorded = readDeclaredRecord(root);
+  const undeclared = new Set<string>();
+  if (recorded.size > 0) {
+    const declared = new Map(readDeclaredLinks(root));
+    for (const link of live) {
+      if (recorded.get(link.path)?.target === link.target && !declared.has(packageName(link))) {
+        undeclared.add(link.path);
+      }
+    }
+  }
   for (const link of dangling) {
     rmSync(path.join(root, link.path), { force: true });
     console.error(`! removed developer link ${link.path}: its target ${resolvedTarget(root, link)} no longer exists`);
@@ -149,6 +159,10 @@ export async function keepDeveloperLinks<T>(
   let replaced: readonly string[] | undefined;
   let succeeded = false;
   try {
+    for (const entry of undeclared) {
+      rmSync(path.join(root, entry));
+      console.error(`! removed developer link ${entry}: smoo.developerLinks no longer declares its package`);
+    }
     const result = await install();
     replaced = options?.relink;
     succeeded = true;
@@ -156,14 +170,11 @@ export async function keepDeveloperLinks<T>(
   } finally {
     const restored = readDeclaredRecord(root);
     for (const link of live) {
-      if (!replaced?.length || !replaced.includes(packageName(link))) {
-        restoreLink(root, link);
-        const receipt = recorded.get(link.path);
-        // The install's postinstall may have claimed this alias after Bun replaced
-        // it. Restoring a manual override must restore its lack of ownership too.
-        if (receipt?.target === link.target) restored.set(link.path, receipt);
-        else restored.delete(link.path);
-      } else {
+      if (succeeded && undeclared.has(link.path)) {
+        restored.delete(link.path);
+        continue;
+      }
+      if (replaced?.includes(packageName(link))) {
         const at = path.join(root, link.path);
         const receipt = restored.get(link.path);
         // Keep the receipt postinstall wrote for the selected replacement,
@@ -171,13 +182,20 @@ export async function keepDeveloperLinks<T>(
         if (!lstatSync(at, { throwIfNoEntry: false })?.isSymbolicLink() || readlinkSync(at) !== receipt?.target) {
           restored.delete(link.path);
         }
+        continue;
       }
+      restoreLink(root, link);
+      const receipt = recorded.get(link.path);
+      // The install's postinstall may have claimed this alias after Bun replaced
+      // it. Restoring a manual override must restore its lack of ownership too.
+      if (receipt?.target === link.target) restored.set(link.path, receipt);
+      else restored.delete(link.path);
     }
     writeDeclaredRecord(root, restored);
     if (succeeded && recorded.size > 0 && process.env.GITHUB_ACTIONS !== 'true') {
       applyDeclaredLinks(root, await planDeclaredLinks(root));
     }
-    if (options !== undefined) {
+    if (options !== undefined || (succeeded && undeclared.size > 0)) {
       reportDeveloperLinks(root);
     } else {
       describeDeveloperLinks(root, live);

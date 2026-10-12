@@ -670,6 +670,10 @@ keeps this provenance with its `node_modules`. Manual retargets do not match the
 unrecorded links are not retroactively claimed, even if they happen to match a declaration; an old checkout without
 receipts needs an explicit owner-directed relink once. No pin-directory naming convention grants ownership.
 
+Dropping a declaration removes its recorded external links before the next managed install, only while the live symlink
+text still matches its receipt. A successful install keeps the lockfile's version and drops the receipt; a failed
+install restores both the link and its receipt. Unrecorded links and manual retargets stay the developer's own links.
+
 A successful managed install reconciles recorded links to the current declaration instead of restoring the old pin over
 its postinstall result. A failed install restores the captured link and its provenance together. Restored manual
 overrides are not claimed by a receipt the install's postinstall temporarily created.

@@ -25,8 +25,9 @@ function isKeepDeveloperLinks(value: unknown): value is ManagedKeepDeveloperLink
 }
 
 /**
- * Runs `install` in `root` with every link a developer pointed outside the checkout put back afterwards, except
- * those of the packages `options.relink` names when `install` resolves.
+ * Runs `install` while keeping captured manual developer links. A successful
+ * install keeps replacements selected by `options.relink` and lockfile bindings
+ * for dropped declarations whose links still match their ownership receipts.
  */
 export async function keepDeveloperLinks<T>(
   root: string,
