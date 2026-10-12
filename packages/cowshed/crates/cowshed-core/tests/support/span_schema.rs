@@ -6,7 +6,7 @@
 //! names, never derived from the declaration under test: an oracle that passes shows the
 //! declaration says what the spec says, and a segment that gains or loses a column is named.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use arrow_array::cast::AsArray as _;
 use arrow_array::{Array as _, ArrowPrimitiveType, RecordBatch};
@@ -109,22 +109,26 @@ pub(crate) fn exact_schema(schema: &Schema, custom: &[Column]) -> Result<(), Str
 /// writer sealed them: its name and its one batch. A segment under another prefix is a failure,
 /// so a test reads exactly the kind of segment it names.
 pub(crate) fn sealed_segments(telemetry: &Path, prefix: &str) -> Vec<(String, RecordBatch)> {
-    let mut segments = Vec::new();
-    for partition in std::fs::read_dir(telemetry).expect("list telemetry root") {
-        for entry in std::fs::read_dir(partition.expect("partition").path()).expect("list date") {
-            let path = entry.expect("segment").path();
-            let name = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .expect("a UTF-8 segment name")
-                .to_owned();
-            assert!(
-                name.starts_with(prefix) && name.ends_with(".arrow"),
-                "only sealed `{prefix}` segments: {name}"
-            );
-            segments.push((name, path));
-        }
-    }
+    let strangers = segment_paths(telemetry)
+        .into_iter()
+        .map(|(name, _)| name)
+        .filter(|name| !is_sealed(name, prefix))
+        .collect::<Vec<_>>();
+    assert!(
+        strangers.is_empty(),
+        "only sealed `{prefix}` segments: {strangers:?}"
+    );
+    sealed_segments_among_kinds(telemetry, prefix)
+}
+
+/// [`sealed_segments`] for a root that holds other kinds of segment too: a job's span and its
+/// process spans seal into one root, in one writer's order, and a test reads one kind of them.
+pub(crate) fn sealed_segments_among_kinds(
+    telemetry: &Path,
+    prefix: &str,
+) -> Vec<(String, RecordBatch)> {
+    let mut segments = segment_paths(telemetry);
+    segments.retain(|(name, _)| is_sealed(name, prefix));
     segments.sort();
     segments
         .into_iter()
@@ -139,6 +143,27 @@ pub(crate) fn sealed_segments(telemetry: &Path, prefix: &str) -> Vec<(String, Re
             (name, batch)
         })
         .collect()
+}
+
+fn is_sealed(name: &str, prefix: &str) -> bool {
+    name.starts_with(prefix) && name.ends_with(".arrow")
+}
+
+/// Every file in `telemetry`'s date partitions: its name and its path.
+fn segment_paths(telemetry: &Path) -> Vec<(String, PathBuf)> {
+    let mut segments = Vec::new();
+    for partition in std::fs::read_dir(telemetry).expect("list telemetry root") {
+        for entry in std::fs::read_dir(partition.expect("partition").path()).expect("list date") {
+            let path = entry.expect("segment").path();
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .expect("a UTF-8 segment name")
+                .to_owned();
+            segments.push((name, path));
+        }
+    }
+    segments
 }
 
 /// The string `column` holds at `row` as a reader of lmao's schema reads it, whether the column is
