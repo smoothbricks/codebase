@@ -22,6 +22,50 @@ and ordinary `bun install` in a consumer to adopt it. Tests import the actual in
 covers the currently maintained patch without publishing anything. Drop a carried hunk only when the installed upstream
 version contains its repair, retaining its regression test.
 
+### Known Bun 1.4.2 deletion-patch bug
+
+Bun 1.4.2 (`744846f84`) generates a malformed deletion section: only a `diff --git` header naming an absolute cache
+path, `deleted file mode` and `index`, without `---`, `+++ /dev/null`, the deletion hunk or the removed lines. Full
+regeneration therefore corrupts the existing task-history deletions. A fresh registry cache reproduces the same defect;
+it is not repaired by clearing the cache.
+
+Minimal reproduction, in a disposable directory:
+
+```sh
+mkdir nx-delete-repro
+cd nx-delete-repro
+printf '{"private":true,"dependencies":{"nx":"23.2.1"}}\n' > package.json
+bun install --cache-dir ../nx-registry-cache
+bun patch nx@23.2.1 --cache-dir ../nx-registry-cache
+rm node_modules/nx/dist/src/daemon/message-types/task-history.js
+bun patch --commit nx@23.2.1 --cache-dir ../nx-registry-cache
+cat patches/nx@23.2.1.patch
+```
+
+The resulting patch has only three lines and cannot carry the deletion's contents. Until this Bun bug is fixed, generate
+new changed-file sections with Bun against the pinned registry package, then carry those sections verbatim into the
+maintained patch while retaining every existing section byte-identically. Do not rewrite hunk coordinates or adopt the
+malformed deletion headers. Exclude the prepared package's `.bun-tag-*` metadata from patch generation. Keep the managed
+consumer copy identical and install normally as above. If patch preparation left `node_modules/nx` as an editable
+directory, remove that prepared copy before ordinary installation so Nx resolves from Bun's isolated installed store
+again, with its dependency links intact.
+
+## Plugin-load error causes
+
+Both configured and default plugin-load aggregation include each error's message, its complete `cause` chain and every
+nested `errors` entry. Local-plugin resolution first reads project configurations, so a duplicate project name can fail
+before any plugin runs. The non-verbose diagnostic must retain the duplicate name and both project roots through
+`LoadPluginError` and `ProjectConfigurationsError`, not stop at their wrapper messages.
+
+Serialized worker errors retain their `cause` and `errors` when normalized to an `Error`. Formatting follows those same
+fields on native and serialized errors; it reports a circular reference without dropping sibling errors, and shared
+errors in separate branches remain visible in each branch. It does not dump project configuration objects or require a
+stack trace to explain a configuration failure.
+
+`packages/nx-plugin/src/nx-plugin-load-errors.test.ts` drives the actual installed Nx in a fixture containing two
+same-named projects and a local plugin, then native, serialized and circular plugin-load failures. Drop this hunk only
+when the installed upstream version preserves these diagnostics, retaining the regressions.
+
 ## Canonical daemon workspace roots
 
 The daemon and plugin-worker message guard compares canonical path strings. A redundant trailing separator does not make
