@@ -492,16 +492,7 @@ where
         let claim = match seed {
             SeedSource::Claimed(claim) => claim,
             SeedSource::Unclaimed(id) => {
-                acquired = match self.claim_build_volume(layout, id)? {
-                    super::build_volumes::Claim::Claimed(claim) => claim,
-                    super::build_volumes::Claim::Held { open } => {
-                        return Err(ApfsStorageError::BuildVolumeHeld {
-                            image: layout.image(id),
-                            hold: layout.hold_path(id),
-                            open,
-                        });
-                    }
-                };
+                acquired = self.claim_capture_source(layout, id)?;
                 &acquired
             }
         };
