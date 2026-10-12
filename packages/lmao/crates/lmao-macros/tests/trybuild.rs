@@ -19,7 +19,7 @@
 
 use std::fs;
 use std::panic::{self, AssertUnwindSafe};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{Duration, SystemTime};
 
 const SPAN_HELP: &str =
