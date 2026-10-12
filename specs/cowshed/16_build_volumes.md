@@ -1156,6 +1156,7 @@ close-out writes main. With build volumes, each level adopts its units' build vo
 queues" above), and main's source image is written once per stack close-out. Stacks remain a coordinator choice; build
 volumes do not require them.
 
+
 ## Open questions
 
 - **rust-analyzer and editors with `target` as a symlink.** Not yet verified.
