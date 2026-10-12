@@ -724,7 +724,9 @@ carries those changes.
 The root formatting scripts and the commit hook run [`git-format-staged`][git-format-staged] with the generated
 `.git-format-staged.yml` (`lint:fix` adds `--unstaged`). This is the same canonical managed configuration, not a second
 repository formatter model. Prettier receives only explicitly supported file types: unknown stdin would otherwise emit
-empty output and truncate shell scripts, lockfiles, or binary artifacts. Unsupported files remain byte-identical.
+empty output and truncate shell scripts, lockfiles, or binary artifacts. Unsupported files remain byte-identical. There
+is no separate formatter configuration under `tooling/git-hooks`; the root scripts, generated script policy and commit
+hook all select this one managed file.
 
 The generated pre-commit hook runs the same formatter path from the repository root with `tooling`, `node_modules/.bin`,
 and the [devenv] profile on `PATH`.
