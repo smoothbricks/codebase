@@ -179,11 +179,10 @@ upstream version contains its respective repair, retaining the regressions.
 
 ## Upstream PR draft: Nx `findCycles`
 
-Status: drafted, not opened. Written against nrwl/nx `master` at `a37b5ca4c6630bb9ea5df9ac0546edc3a186bc2f`
-(2026-10-06), whose `findCycles`, `filterDummyTasks` and `getNonDummyDeps` have the logic of Nx 23.2.1's. This
-repository carries the fix as the `task-graph-utils` hunk of `nx@23.2.1.patch`;
-`packages/nx-plugin/src/nx-task-graph-cycles.test.ts` guards it here. Drop that patch hunk once the installed Nx
-contains the fix, retaining the regression.
+Status: drafted, not opened. Written against nrwl/nx `master` at `a37b5ca4c6630bb9ea5df9ac0546edc3a186bc2f`, whose
+`findCycles`, `filterDummyTasks` and `getNonDummyDeps` have the logic of Nx 23.2.1's. This repository carries the fix as
+the `task-graph-utils` hunk of `nx@23.2.1.patch`; `packages/nx-plugin/src/nx-task-graph-cycles.test.ts` guards it here.
+Drop that patch hunk once the installed Nx contains the fix, retaining the regression.
 
 ### Title
 
