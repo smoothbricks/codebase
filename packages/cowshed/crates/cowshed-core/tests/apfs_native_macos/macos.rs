@@ -7101,6 +7101,7 @@ mod build_mount_races {
     use super::*;
     use cowshed_core::apfs::ProcessStatus;
     use cowshed_core::build_volume::{BuildVolumeId, BuildVolumeLayout};
+    use parking_lot::Mutex;
     use std::sync::atomic::AtomicBool;
     use std::sync::mpsc;
 
@@ -7117,7 +7118,7 @@ mod build_mount_races {
                     "injected unreadable mount table".into(),
                 ));
             }
-            Ok(self.rows.lock().unwrap().clone())
+            Ok(self.rows.lock().clone())
         }
     }
 
@@ -7180,7 +7181,7 @@ mod build_mount_races {
                 return Ok(output);
             }
             let point = PathBuf::from(request.args.last().unwrap());
-            let mut rows = self.mounts.rows.lock().unwrap();
+            let mut rows = self.mounts.rows.lock();
             let observation = match self.completion {
                 Completion::Mount if !rows.is_empty() => return Ok(already_in_progress()),
                 Completion::Mount | Completion::OtherFailure => Observation::Expected,
@@ -7214,11 +7215,11 @@ mod build_mount_races {
         }
 
         fn image_lease(&self, identity: &Path) -> std::io::Result<Option<Fenced<std::fs::File>>> {
-            if self.lease_calls.fetch_add(1, Ordering::SeqCst) == 1 {
-                if let Some(gate) = &self.gate {
-                    gate.waiting.send(()).unwrap();
-                    gate.resume.lock().unwrap().recv().unwrap();
-                }
+            if self.lease_calls.fetch_add(1, Ordering::SeqCst) == 1
+                && let Some(gate) = &self.gate
+            {
+                gate.waiting.send(()).unwrap();
+                gate.resume.lock().recv().unwrap();
             }
             SystemCommandRunner.image_lease(identity)
         }
