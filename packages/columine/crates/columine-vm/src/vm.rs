@@ -45,9 +45,9 @@ use crate::element_body::{
 };
 use columine_types::types::{
     AggType, ChangeFlag, EMPTY_KEY, ErrorCode, MAX_GUARD_COMPONENTS, MAX_SCATTER_ROUTES,
-    NO_PARENT_TS_COL, Opcode, ProgramHeader, SLOT_META_SIZE, STATE_FORMAT_VERSION, STATE_MAGIC,
-    SlotMetaOffset, SlotType, StateFlags, StateHeaderOffset, StructFieldType, TOMBSTONE, align8,
-    arena_elem_size, is_arena_field_type, state_num_slots, struct_field_size,
+    NO_PARENT_TS_COL, Opcode, ProgramHeader, SCATTER_SKIP, SLOT_META_SIZE, STATE_FORMAT_VERSION,
+    STATE_MAGIC, SlotMetaOffset, SlotType, StateFlags, StateHeaderOffset, StructFieldType,
+    TOMBSTONE, align8, arena_elem_size, is_arena_field_type, state_num_slots, struct_field_size,
 };
 use core::sync::atomic::Ordering;
 
@@ -5114,7 +5114,7 @@ impl Vm {
 
                     let route_off = probe_row + probe.field_offset(state, route_field_idx);
                     let route_ord = bytes::read_u32(state, route_off);
-                    if route_ord == 0xFFFF_FFFF || route_ord as usize >= num_routes {
+                    if route_ord == SCATTER_SKIP || route_ord as usize >= num_routes {
                         continue; // SKIP / out-of-range → SKIP
                     }
 
@@ -5123,6 +5123,9 @@ impl Vm {
                     let ri = route_ord as usize;
                     let route_kind = route_kinds[ri];
                     let dest_slot = route_dest_slots[ri];
+                    if dest_slot == SCATTER_SKIP && matches!(route_kind, 0 | 1) {
+                        continue;
+                    }
                     let dest_field_idx = route_dest_fields[ri];
                     let v_src_field_idx = route_v_src_fields[ri];
                     let out_key_field = route_out_key_fields[ri];
@@ -5253,13 +5256,16 @@ impl Vm {
                         continue;
                     }
                     let route_ord = cell_u32(cols, route_col, child_idx);
-                    if route_ord == 0xFFFF_FFFF || route_ord as usize >= num_routes {
+                    if route_ord == SCATTER_SKIP || route_ord as usize >= num_routes {
                         continue; // SKIP / out-of-range → SKIP
                     }
                     let is_retract = cell_u32(cols, op_col, child_idx) != 0;
                     let ri = route_ord as usize;
                     let route_kind = route_kinds[ri];
                     let dest_slot = route_dest_slots[ri];
+                    if dest_slot == SCATTER_SKIP && matches!(route_kind, 0 | 1) {
+                        continue;
+                    }
                     let dest_field_idx = route_dest_fields[ri];
                     let v_col = route_v_cols[ri];
 
@@ -5376,7 +5382,10 @@ impl Vm {
                         // pointing elsewhere would be a card-one write gated by a
                         // guard no row of its own slot keeps — refused by name
                         // rather than left silently unguarded.
-                        if route_kinds[ri] == 0 && route_dest_slots[ri] != guard_slot {
+                        if route_kinds[ri] == 0
+                            && route_dest_slots[ri] != SCATTER_SKIP
+                            && route_dest_slots[ri] != guard_slot
+                        {
                             return INVALID_PROGRAM;
                         }
                     }
@@ -5387,13 +5396,16 @@ impl Vm {
                         continue;
                     }
                     let route_ord = cell_u32(cols, route_col, child_idx);
-                    if route_ord == 0xFFFF_FFFF || route_ord as usize >= num_routes {
+                    if route_ord == SCATTER_SKIP || route_ord as usize >= num_routes {
                         continue; // SKIP / out-of-range → SKIP
                     }
                     let is_retract = cell_u32(cols, op_col, child_idx) != 0;
                     let ri = route_ord as usize;
                     let route_kind = route_kinds[ri];
                     let dest_slot = route_dest_slots[ri];
+                    if dest_slot == SCATTER_SKIP && matches!(route_kind, 0 | 1) {
+                        continue;
+                    }
                     let dest_field_idx = route_dest_fields[ri];
                     let v_col = route_v_cols[ri];
 

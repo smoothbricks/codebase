@@ -184,6 +184,218 @@ fn build_probe_scatter_program(type_id: u32) -> Vec<u8> {
     program(4, 3, &init, &reduce)
 }
 
+/// Three shared ordinals: consumed scalar, no consumer, consumed scalar.
+/// The omitted destination has no slot definition, and its ignored value
+/// operand deliberately names no source.
+fn sparse_scatter_program(opcode: Opcode, skipped_kind: u8, ignored_value_col: u32) -> Vec<u8> {
+    let mut init = slot_struct_map(0, 6, 8, &[0, 0, 0, 4, 2, 4]);
+    init.extend(slot_struct_map(1, 6, 8, &[4, 4, 0]));
+    let probe = opcode == Opcode::BatchStructMapProbeScatter;
+    let mut body = if probe {
+        vec![opcode as u8, 0, 2, 0, 0, 1, 3]
+    } else if opcode == Opcode::BatchStructMapScatterGuarded {
+        vec![opcode as u8, 3, 4, 2, 1, 1, 6, 2, 3]
+    } else {
+        vec![opcode as u8, 3, 4, 2, 3]
+    };
+    for (kind, dest, field) in [(0, 1, 0), (skipped_kind, u32::MAX, 255), (0, 1, 1)] {
+        body.push(kind);
+        body.extend(encode_index(dest).as_bytes());
+        body.push(field);
+        if probe {
+            body.extend(if dest == u32::MAX { [255, 255] } else { [2, 3] });
+        } else {
+            body.extend(
+                encode_index(if dest == u32::MAX {
+                    ignored_value_col
+                } else {
+                    5
+                })
+                .as_bytes(),
+            );
+        }
+    }
+    let mut flat = vec![Opcode::FlatMap as u8, 1];
+    flat.extend(encode_index(NO_PARENT_TS_COL).as_bytes());
+    flat.extend(u16::try_from(body.len()).expect("small body").to_le_bytes());
+    flat.extend(body);
+    let mut reduce = vec![Opcode::ForEach as u8, 0, 1];
+    reduce.extend(2009u32.to_le_bytes());
+    reduce.extend(u16::try_from(flat.len()).expect("small body").to_le_bytes());
+    reduce.extend(flat);
+    program(2, 7, &init, &reduce)
+}
+
+fn run_sparse_scatter(
+    vm: &mut Vm,
+    state: &mut [u8],
+    prog: &[u8],
+    opcode: Opcode,
+    ordinal: u32,
+    retract: u32,
+    delta: bool,
+) -> u32 {
+    let types = [2009u32];
+    let offsets = [0u32, 1];
+    let keys = [if opcode == Opcode::BatchStructMapProbeScatter {
+        10 + ordinal
+    } else {
+        600
+    }];
+    let routes = [ordinal];
+    let ops = [retract];
+    let values = [700 + ordinal];
+    let guards = [1u32];
+    let cols = [
+        u32s_as_bytes(&types),
+        u32s_as_bytes(&offsets),
+        u32s_as_bytes(&keys),
+        u32s_as_bytes(&routes),
+        u32s_as_bytes(&ops),
+        u32s_as_bytes(&values),
+        u32s_as_bytes(&guards),
+    ];
+    if delta {
+        vm.execute_batch_delta(state, prog, &cols, 1)
+    } else {
+        vm.execute_batch(state, prog, &cols, 1)
+    }
+}
+
+#[test]
+fn scatter_no_consumer_preserves_middle_ordinals_and_undo() {
+    for opcode in [
+        Opcode::BatchStructMapProbeScatter,
+        Opcode::BatchStructMapScatter,
+        Opcode::BatchStructMapScatterGuarded,
+    ] {
+        for skipped_kind in [0, 1] {
+            for delta in [false, true] {
+                let prog = sparse_scatter_program(opcode, skipped_kind, u32::MAX);
+                let mut state = init(&prog);
+                if opcode == Opcode::BatchStructMapProbeScatter {
+                    for ordinal in 0..3 {
+                        seed_probe_row(
+                            &mut state,
+                            10 + ordinal,
+                            ordinal,
+                            0,
+                            600,
+                            700 + ordinal,
+                            0.0,
+                            0,
+                        );
+                    }
+                }
+                assert_eq!(2, columine_types::types::state_num_slots(&state));
+                let mut columns = Vec::new();
+                columine_vm::column_uses::reduce_column_uses(&prog, &state, &mut |col, _| {
+                    columns.push(col)
+                })
+                .expect("sparse routes admit their real columns");
+                assert!(
+                    !columns.contains(&u32::MAX),
+                    "ignored value is not a column read"
+                );
+                if opcode != Opcode::BatchStructMapProbeScatter {
+                    assert!(columns.contains(&5), "consumed value remains a column read");
+                }
+                let mut vm = Vm::default();
+                let before = state.clone();
+                for retract in [0, 1] {
+                    assert_eq!(
+                        OK,
+                        run_sparse_scatter(&mut vm, &mut state, &prog, opcode, 1, retract, delta),
+                        "fresh {opcode:?}, kind {skipped_kind}"
+                    );
+                    assert_eq!(before, state);
+                    assert_eq!(0, vm.undo_checkpoint());
+                }
+                vm.undo_enable(&state).expect("undo window opens");
+                let checkpoint = vm.undo_checkpoint();
+                for retract in [0, 1] {
+                    assert_eq!(
+                        OK,
+                        run_sparse_scatter(&mut vm, &mut state, &prog, opcode, 1, retract, delta),
+                        "{opcode:?}, kind {skipped_kind}"
+                    );
+                    assert_eq!(
+                        before, state,
+                        "ignored route neither writes nor stamps its guard"
+                    );
+                    assert_eq!(checkpoint, vm.undo_checkpoint());
+                }
+                for ordinal in [2, 0] {
+                    assert_eq!(
+                        OK,
+                        run_sparse_scatter(&mut vm, &mut state, &prog, opcode, ordinal, 0, delta)
+                    );
+                }
+                let row = present_row(&state, 1, 600);
+                assert_eq!(700, bytes::read_u32(&state, row + 1));
+                assert_eq!(
+                    702,
+                    bytes::read_u32(&state, row + 5),
+                    "later route retains ordinal 2"
+                );
+                if opcode == Opcode::BatchStructMapScatterGuarded {
+                    assert_eq!(
+                        1,
+                        bytes::read_u32(&state, row + 9),
+                        "consumed routes still stamp the guard"
+                    );
+                }
+                vm.undo_rollback(&mut state, checkpoint)
+                    .expect("sparse scatter rolls back");
+                assert_eq!(before, state);
+            }
+        }
+    }
+}
+
+#[test]
+fn scatter_no_consumer_keeps_consumed_shared_value_column() {
+    for opcode in [
+        Opcode::BatchStructMapScatter,
+        Opcode::BatchStructMapScatterGuarded,
+    ] {
+        let prog = sparse_scatter_program(opcode, 1, 5);
+        let state = init(&prog);
+        let mut columns = Vec::new();
+        columine_vm::column_uses::reduce_column_uses(&prog, &state, &mut |col, _| {
+            columns.push(col)
+        })
+        .expect("shared value column remains admitted");
+        assert_eq!(
+            2,
+            columns.iter().filter(|&&col| col == 5).count(),
+            "both consumed entries contribute their shared value read, the skipped entry does not"
+        );
+    }
+}
+
+#[test]
+fn scatter_no_consumer_is_not_a_third_route_kind() {
+    for opcode in [
+        Opcode::BatchStructMapProbeScatter,
+        Opcode::BatchStructMapScatter,
+        Opcode::BatchStructMapScatterGuarded,
+    ] {
+        let prog = sparse_scatter_program(opcode, 2, u32::MAX);
+        let mut state = init(&prog);
+        if opcode == Opcode::BatchStructMapProbeScatter {
+            seed_probe_row(&mut state, 11, 1, 0, 600, 701, 0.0, 0);
+        }
+        let before = state.clone();
+        let mut vm = Vm::default();
+        assert_eq!(
+            ErrorCode::InvalidProgram as u32,
+            run_sparse_scatter(&mut vm, &mut state, &prog, opcode, 1, 0, false)
+        );
+        assert_eq!(before, state);
+    }
+}
+
 // =============================================================================
 // State / metadata helpers
 // =============================================================================

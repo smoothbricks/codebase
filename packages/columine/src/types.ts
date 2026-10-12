@@ -391,9 +391,11 @@ export enum Opcode {
   // is an input column. v_src_field_idx is PER ROUTE so heterogeneously-typed values
   // (interned STRING beside FLOAT64 boost/order) each read their own typed probe field.
   // Variable-length operands:
-  //   probe_slot:u8, key_col:u8, miss_mode:u8(0=skip,1=null), route_col:u8, op_col:u8,
+  //   probe_slot:index, key_col:index, miss_mode:u8(0=skip,1=null), route_field_idx:u8, op_field_idx:u8,
   //   num_routes:u8,
-  //   [kind:u8, dest_slot:u8, dest_field_idx:u8, out_key_col:u8, v_src_field_idx:u8] × num_routes
+  //   [kind:u8, dest_slot:index, dest_field_idx:u8, out_key_field_idx:u8, v_src_field_idx:u8] × num_routes
+  // A kind-0/kind-1 dest_slot = 0xffffffff has no consumer. Its ordinal and
+  // encoded operands remain; it reads no output key/value and binds no destination.
   BATCH_STRUCT_MAP_PROBE_SCATTER = 0x2f,
 
   // Route-column dispatch, probe-free. The FLAT_MAP element already
@@ -408,8 +410,9 @@ export enum Opcode {
   // is therefore last-write-wins in STREAM order. A destination that must keep
   // the winner by a value the element CARRIES takes 0x3f, which puts a guard in
   // front of these same two arms. Variable-length operands:
-  //   route_col:u8, op_col:u8, key_col:u8, num_routes:u8,
-  //   [kind:u8, dest_slot:u8, dest_field_idx:u8, v_col:u8] × num_routes
+  //   route_col:index, op_col:index, key_col:index, num_routes:u8,
+  //   [kind:u8, dest_slot:index, dest_field_idx:u8, v_col:index] × num_routes
+  // The no-consumer destination sentinel is the same as 0x2f's.
   BATCH_STRUCT_MAP_SCATTER = 0x3e,
 
   // Guarded route-column dispatch, probe-free. Routing, kinds and the
@@ -426,11 +429,12 @@ export enum Opcode {
   // identical-assert check rather than through exclusion. The emitter's
   // precondition is that two DISTINCT transactions never produce equal tuples;
   // where they can tie, it declares an extra component that is unique per
-  // transaction. Every kind-0 route's dest_slot MUST equal guard_slot.
+  // transaction. Every consumed kind-0 route's dest_slot MUST equal guard_slot.
+  // A no-consumer dest_slot = 0xffffffff neither compares nor stamps the guard.
   // Variable-length operands:
-  //   route_col:u8, op_col:u8, key_col:u8, guard_slot:u8, num_guards:u8,
-  //   [guard_col:u8, guard_field_idx:u8] × num_guards, num_routes:u8,
-  //   [kind:u8, dest_slot:u8, dest_field_idx:u8, v_col:u8] × num_routes
+  //   route_col:index, op_col:index, key_col:index, guard_slot:index, num_guards:u8,
+  //   [guard_col:index, guard_field_idx:u8] × num_guards, num_routes:u8,
+  //   [kind:u8, dest_slot:index, dest_field_idx:u8, v_col:index] × num_routes
   BATCH_STRUCT_MAP_SCATTER_GUARDED = 0x3f,
   //#endregion reduce-typed-state.scatter-element-op
 

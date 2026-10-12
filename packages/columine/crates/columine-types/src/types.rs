@@ -140,6 +140,9 @@ impl ProgramHeader {
 
 pub const EMPTY_KEY: u32 = u32::MAX;
 pub const TOMBSTONE: u32 = u32::MAX - 1;
+/// A scatter row's no-consumer ordinal, or a route entry's no-consumer
+/// destination. The table retains that entry so shared ordinals never shift.
+pub const SCATTER_SKIP: u32 = u32::MAX;
 /// Route-table capacity of the struct-map scatters (`0x2f`, `0x3e`, `0x3f`).
 /// The VM decodes each route table into fixed 32-entry arrays, so a program
 /// declaring more routes than this refuses `INVALID_PROGRAM` at decode instead
@@ -583,6 +586,9 @@ pub enum Opcode {
     /// op_field_idx:u8, num_routes:u8, \[kind:u8, dest_slot:index, dest_field_idx:u8,
     /// out_key_field_idx:u8, v_src_field_idx:u8\] × num_routes — the route, op, key and value
     /// are fields of the probed row, not columns.
+    /// A kind-0/kind-1 entry with `dest_slot = SCATTER_SKIP` has no consumer:
+    /// retain its ordinal and decode its operands, but read no output key or
+    /// value, bind no destination, and reserve no capacity or undo for it.
     BatchStructMapProbeScatter = 0x2f,
     /// Route-column dispatch, probe-free (body opcode, per FLAT_MAP
     /// element). The element already carries the resolved route, op, key and
@@ -667,11 +673,12 @@ pub enum Opcode {
     /// and creating a row to remember it would grow the map from keys
     /// nothing ever asserted.
     ///
-    /// Every kind-0 route's `dest_slot` MUST equal `guard_slot`: the guarded
-    /// row IS the destination row, and a kind-0 route naming another slot is
-    /// `INVALID_PROGRAM` rather than a silently unguarded write. kind-1
-    /// routes name their own set slot; those writes are gated by the guard
-    /// but the set carries no guard of its own.
+    /// Every consumed kind-0 route's `dest_slot` MUST equal `guard_slot`: the
+    /// guarded row IS the destination row, and a kind-0 route naming another
+    /// slot is `INVALID_PROGRAM` rather than a silently unguarded write.
+    /// `dest_slot = SCATTER_SKIP` consumes nothing and neither compares nor
+    /// stamps the guard. kind-1 routes name their own set slot; those writes
+    /// are gated by the guard but the set carries no guard of its own.
     /// route_col:index, op_col:index, key_col:index, guard_slot:index, num_guards:u8,
     /// \[guard_col:index, guard_field_idx:u8\] × num_guards, num_routes:u8,
     /// \[kind:u8, dest_slot:index, dest_field_idx:u8, v_col:index\] × num_routes

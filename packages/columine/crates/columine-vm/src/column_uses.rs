@@ -28,7 +28,9 @@
 //! [`LiveColumns`]: crate::row_exprs::LiveColumns
 
 use columine_types::operand::Operands;
-use columine_types::types::{ErrorCode, NO_PARENT_TS_COL, Opcode, ProgramHeader, SlotTypeFlags};
+use columine_types::types::{
+    ErrorCode, NO_PARENT_TS_COL, Opcode, ProgramHeader, SCATTER_SKIP, SlotTypeFlags,
+};
 
 use crate::meta::SlotMetaView;
 use crate::vm::{
@@ -394,15 +396,18 @@ fn cell(visit: &mut dyn FnMut(ColumnOperand), column: u32, usage: ColumnUse) {
     visit(ColumnOperand::Cell { column, usage });
 }
 
-/// `num_routes:u8, (kind, dest_slot, dest_field, v_col) × num_routes`: the
-/// value column of every route is a read.
+/// `num_routes:u8, (kind, dest_slot, dest_field, v_col) × num_routes`:
+/// every consumed route contributes its value-column read.
 fn route_value_reads(ops: &mut Operands<'_>, visit: &mut dyn FnMut(ColumnOperand)) -> Option<()> {
     let num_routes = ops.byte()?;
     for _ in 0..num_routes {
         ops.byte()?;
-        ops.index()?;
+        let dest = ops.index()?;
         ops.byte()?;
-        cell(visit, ops.index()?, ColumnUse::Read);
+        let col = ops.index()?;
+        if dest != SCATTER_SKIP {
+            cell(visit, col, ColumnUse::Read);
+        }
     }
     Some(())
 }

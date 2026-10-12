@@ -36,7 +36,8 @@ use crate::struct_map::{ArenaRegion, StructMap2Slot, StructMapSlot};
 use bitmosaic::{BitmosaicView, patched_len_bound};
 use columine_types::operand::Operands;
 use columine_types::types::{
-    EMPTY_KEY, Opcode, SlotType, StructFieldType, TOMBSTONE, arena_elem_size, state_num_slots,
+    EMPTY_KEY, Opcode, SCATTER_SKIP, SlotType, StructFieldType, TOMBSTONE, arena_elem_size,
+    state_num_slots,
 };
 
 /// Container nesting a reduce section may reach; the input planner and the
@@ -306,9 +307,10 @@ fn effects(op: Opcode, o: &[u32], out: &mut impl FnMut(Effect)) -> Option<()> {
         Opcode::BatchStructMapProbeScatter => {
             let routes = usize::try_from(at(2)?).ok()?;
             for route in 0..routes {
-                out(Effect::Opaque {
-                    slot: at(4 + 2 * route)?,
-                });
+                let slot = at(4 + 2 * route)?;
+                if slot != SCATTER_SKIP {
+                    out(Effect::Opaque { slot });
+                }
             }
         }
         // route_col, op_col, key_col, num_routes, (kind, dest, field, v_col) ×.
@@ -356,6 +358,9 @@ fn routed(
         let base = at + 1 + 4 * route;
         let kind = *o.get(base)?;
         let slot = *o.get(base + 1)?;
+        if slot == SCATTER_SKIP {
+            continue;
+        }
         let v_col = *o.get(base + 3)?;
         out(Effect::Routed {
             slot,
