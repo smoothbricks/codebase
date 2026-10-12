@@ -1793,7 +1793,7 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
     }
 
     /// Read the attachment inventory for this exact path without constraining its image format.
-    /// Mutation entry points still validate the format before changing an image.
+    /// Creation and ordinary runtime attachment still validate the format.
     pub(crate) fn attached_whole_devices(
         &self,
         image: &Path,
@@ -2244,9 +2244,9 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
     }
 
     /// Every driver the kernel holds for `image`, however many, each as its whole device and
-    /// every volume its container holds: what a release has to undo.
+    /// every volume its container holds: what a release has to undo. Releasing an existing
+    /// owned attachment is format-independent, including a retained re-adoption input.
     pub(crate) fn release_views(&self, image: &Path) -> Result<Vec<ReleaseView>, ApfsError> {
-        validate_image_path(image)?;
         let image = attachment_inventory_path(image)?;
         release_views_of(&image, &self.attached_disk_images()?)
     }
@@ -7804,8 +7804,8 @@ mod tests {
     /// `$TMPDIR` stayed attached until reboot after every timed-out run, and the stock Nx daemon a
     /// timed-out test started kept running in its deleted root. The run's worker stands in for
     /// that daemon: a process the run started that outlives it, selected, as the daemon is, by its
-    /// working directory alone. The run attaches two images, as a CLI fixture leaves at least a
-    /// main and a build volume, so both teardown and sweep release several at once.
+    /// working directory alone. The run attaches one RAW image and one retained ASIF input, as
+    /// a failed re-adoption leaves both formats, so teardown and sweep must release both.
     #[cfg(target_os = "macos")]
     #[test]
     fn real_apfs_fixture_runs_leave_nothing_attached_or_running_however_they_end() {
@@ -7892,9 +7892,9 @@ mod tests {
             for image in &images {
                 assert!(
                     backend
-                        .recovered_image_attachment(image)
+                        .attached_whole_devices(image)
                         .expect("attachment inventory")
-                        .is_none(),
+                        .is_empty(),
                     "{ending}: {} is still attached",
                     image.display()
                 );
@@ -7923,16 +7923,48 @@ mod tests {
             return;
         }
         let backend = MacOsApfsBackend::new(SystemCommandRunner);
-        for name in ["first", "second"] {
-            let image = root.path().join(name).with_extension(IMAGE_EXTENSION);
-            crate::blank_image::blank_image(&image);
+        for (name, extension, access) in [
+            ("first", IMAGE_EXTENSION, MountAccess::ReadWrite),
+            ("retained/second", "asif", MountAccess::ReadOnly),
+        ] {
+            let image = root.path().join(name).with_extension(extension);
+            let raw = image.with_extension(IMAGE_EXTENSION);
+            crate::blank_image::blank_image(&raw);
+            if extension != IMAGE_EXTENSION {
+                backend
+                    .run_checked(
+                        "convert retained fixture input to ASIF",
+                        CommandRequest::new(
+                            DISKUTIL,
+                            [
+                                OsString::from("image"),
+                                OsString::from("create"),
+                                OsString::from("from"),
+                                OsString::from("--format"),
+                                OsString::from("ASIF"),
+                                raw.as_os_str().to_owned(),
+                                image.as_os_str().to_owned(),
+                            ],
+                        ),
+                    )
+                    .expect("convert the detached fixture input");
+                assert!(
+                    matches!(
+                        backend.attach_verified(&image),
+                        Err(ApfsError::InvalidImagePath(_))
+                    ),
+                    "ordinary runtime attachment still refuses a retained ASIF input"
+                );
+            }
+            // Construct the historical input through the same verifier as retained attachment,
+            // without admitting its format to ordinary workspace attachment.
             let attachment = backend
-                .attach_verified(&image)
+                .verify_attachment(&image, access, DetachIntent::Release)
                 .expect("attach a fixture image");
             let mount = root.path().join(format!("{name}-volume"));
             fs::create_dir(&mount).expect("a fixture mountpoint");
             backend
-                .mount(&attachment, &mount, MountAccess::ReadWrite, false)
+                .mount(&attachment, &mount, access, false)
                 .expect("mount a fixture image");
             println!("{FIXTURE_IMAGE}{}", image.display());
         }
@@ -9097,31 +9129,34 @@ mod tests {
     }
 
     /// A release unmounts exactly the container's mounted volumes, each under its own
-    /// revalidation, and leaves the unmounted one to the container's single detach.
+    /// revalidation, and leaves the unmounted one to the container's single detach. Cleanup
+    /// releases retained inputs too; it does not admit their format to ordinary runtime use.
     #[test]
     fn a_release_unmounts_only_the_mounted_volumes_then_detaches_the_container_once() {
-        let image = temp_path("two-volume-mixed", IMAGE_EXTENSION);
-        let backend = graced_backend([
-            Reply::Inventory(Ok(two_volume_image(&image))),
-            Reply::Inventory(Ok(two_volume_image(&image))),
-            ok([]),
-            Reply::Inventory(Ok(two_volume_image(&image))),
-            Reply::Inventory(Ok(two_volume_image(&image))),
-            ok([]),
-            no_images(),
-        ]);
-        let mounted = BTreeSet::from(["/dev/disk5s2".to_owned(), "/dev/disk9s1".to_owned()]);
-        backend
-            .release_image(&image, &mounted, DetachIntent::Release)
-            .unwrap();
-        let commands: Vec<Vec<String>> = backend.runner().requests().iter().map(argv).collect();
-        assert_eq!(
-            commands,
-            [
-                vec!["/dev/disk5s2".to_owned()],
-                vec!["detach".into(), "-verbose".into(), "/dev/disk5".into()],
-            ]
-        );
+        for extension in [IMAGE_EXTENSION, "asif"] {
+            let image = temp_path("two-volume-mixed", extension);
+            let backend = graced_backend([
+                Reply::Inventory(Ok(two_volume_image(&image))),
+                Reply::Inventory(Ok(two_volume_image(&image))),
+                ok([]),
+                Reply::Inventory(Ok(two_volume_image(&image))),
+                Reply::Inventory(Ok(two_volume_image(&image))),
+                ok([]),
+                no_images(),
+            ]);
+            let mounted = BTreeSet::from(["/dev/disk5s2".to_owned(), "/dev/disk9s1".to_owned()]);
+            backend
+                .release_image(&image, &mounted, DetachIntent::Release)
+                .unwrap();
+            let commands: Vec<Vec<String>> = backend.runner().requests().iter().map(argv).collect();
+            assert_eq!(
+                commands,
+                [
+                    vec!["/dev/disk5s2".to_owned()],
+                    vec!["detach".into(), "-verbose".into(), "/dev/disk5".into()],
+                ]
+            );
+        }
     }
 
     /// A release under `WhenIdle` hands a held volume's dissent straight back: no wait, no forced

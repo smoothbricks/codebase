@@ -295,9 +295,12 @@ disk-image command still leaks on a clean run; it must be 0.
 **The suite spends a finite host budget.** Every attach→detach cycle a test makes can leak an AppleDiskImages2 device
 that the host's live sheds lose until reboot (01_storage.md, "How the APFS host degrades" §2), so a test pays the fewest
 attach cycles that prove its behavior. A run that killed a test leaves that test's images attached until the next run's
-sweep, which `real_apfs_fixture_runs_leave_nothing_attached_or_running_however_they_end` proves for both panic and kill.
-A scratch root's teardown and the sweep release a root's images concurrently, one holder per image: each release is an
-unmount under the host's namespace lease and then a detach under its storage lease, and those classes exclude each other
+sweep, which `real_apfs_fixture_runs_leave_nothing_attached_or_running_however_they_end` proves for both panic and kill
+with one RAW image and one retained ASIF input. Owned-attachment release selects the exact backing path the kernel
+holds, not the runtime image extension: a retained input must be released too. Ordinary runtime enumeration and
+attachment remain RAW-only (02_workspaces.md, "Re-adoption"); cleanup neither attaches nor converts an image. A scratch
+root's teardown and the sweep release a root's images concurrently, one holder per image: each release is an unmount
+under the host's namespace lease and then a detach under its storage lease, and those classes exclude each other
 (05_gateway.md, "Disk-lifecycle lease"), so releasing a CLI fixture's main, build and workspace images one after another
 waited for a phase change at every step on a loaded host. A run sweeps its dead predecessors once, on a thread beside
 each test process's first test: one process sweeps while the others wait on the lock and then find the run's sweep
