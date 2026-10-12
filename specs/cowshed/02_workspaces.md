@@ -515,11 +515,10 @@ image remains live and mounted throughout capture.
    the source's developer package links to its read grants (16_build_volumes.md, "Hash inputs"); it never adds an
    ancestor dependency store or the source's main root, and the source's owned-link marker is migrated first. Finding
    them reads every directory of the fresh volume, concurrently, and is the largest setup cost after the clone's first
-   write (about 5 s over a million entries). Then, inside the mount, under the workspace's closed sandbox: configure the
-   `main` remote (see "The `main` remote") and `git switch -c cowshed/<name>` from the checked-out state. The `.git`
-   directory arrived complete via CoW — the workspace is a standalone repository with **no linked-worktree registration
-   and no back-references** into the host checkout, unless it was created with `--git-worktree` (see "Git-worktree
-   workspaces").
+   write. Then, inside the mount, under the workspace's closed sandbox: configure the `main` remote (see "The `main`
+   remote") and `git switch -c cowshed/<name>` from the checked-out state. The `.git` directory arrived complete via CoW
+   — the workspace is a standalone repository with **no linked-worktree registration and no back-references** into the
+   host checkout, unless it was created with `--git-worktree` (see "Git-worktree workspaces").
 7. Record the audit
    `ControllerCommitment::Fork(ForkCommitment { version, order, repo_id, source_incarnation, destination_incarnation })`;
    the new marker carries `lineage` = source incarnation followed by the source's own lineage, which authorizes the job
