@@ -2,13 +2,13 @@
 //! and the span is the test file, so the snapshot does not depend on how a
 //! dependency was compiled.
 //!
-//! `provenance_required` is rustc's E0599, not a macro diagnostic. `span!` is
-//! the only supported way to open a span: it expands to doc-hidden `__span`
-//! with compile-time attribution (`lmao-macros/src/lib.rs`, the Rust equivalent
-//! of `specs/lmao/01o_typescript_transformer.md` §1 Line Number Injection).
-//! Calling `TraceContext::span` without that argument must keep failing E0599
-//! at the call site, with the similar-method help naming `__span` in
-//! `context.rs`.
+//! `provenance_required` is rustc's E0599, not a macro diagnostic. `span!`
+//! (`lmao-macros/src/lib.rs` 499–550) is the only supported opener: it expands
+//! to doc-hidden `__span` with compile-time attribution, the Rust equivalent of
+//! `specs/lmao/01o_typescript_transformer.md` §1 Line Number Injection. Calling
+//! `TraceContext::span` without that argument must keep failing E0599 at
+//! `tests/compile_fail/provenance_required.rs:4:19`, with the similar-method
+//! help naming `__span` in `context.rs`.
 //!
 //! trybuild rewrites an absolute workspace path to
 //! `$WORKSPACE/.../context.rs` and keeps the expanded signature. cowshed's
@@ -20,6 +20,7 @@
 use std::fs;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 const SPAN_HELP: &str =
     "help: there is a method `__span` with a similar name, but with different arguments";
@@ -39,9 +40,11 @@ fn compile_fail_cases() {
 
 #[test]
 fn compile_fail_provenance_required() {
-    let preferred = preferred_compile_fail(PROVENANCE_CASE);
-    let normalized = normalize_provenance_stderr(&preferred)
+    let (preferred, probe_name) = preferred_compile_fail(PROVENANCE_CASE);
+    let bound = bind_probe_callsite(&preferred, &probe_name)
         .unwrap_or_else(|err| panic!("{err}\n--- compiler output ---\n{preferred}"));
+    let normalized = normalize_provenance_stderr(&bound)
+        .unwrap_or_else(|err| panic!("{err}\n--- compiler output ---\n{bound}"));
     let expected = include_str!("compile_fail/provenance_required.stderr");
     assert_eq!(
         normalized, expected,
@@ -74,6 +77,22 @@ error[E0599]: no method named `span` found for reference `&TraceContext` in the 
     let wrong = sandbox.replace("src/context.rs:76:4", "src/other.rs:1:1");
     let err = normalize_provenance_stderr(&wrong).unwrap_err();
     assert!(err.contains("other.rs"), "{err}");
+}
+
+#[test]
+fn provenance_probe_callsite_stays_the_tracked_file() {
+    let probe = "provenance_required_9_9.rs";
+    let preferred = format!(
+        "error[E0599]: no method named `span` found for reference `&TraceContext` in the current scope\n --> /tmp/lmao-provenance/{probe}:4:19\n  |\n{CALLSITE_SOURCE}\n  |                   ^^^^\n  |\n{SPAN_HELP}\n --> src/context.rs:76:4\n"
+    );
+    let bound = bind_probe_callsite(&preferred, probe).unwrap();
+    assert_eq!(
+        normalize_provenance_stderr(&bound).unwrap(),
+        include_str!("compile_fail/provenance_required.stderr")
+    );
+    assert!(bind_probe_callsite(&preferred.replace(":4:19", ":5:1"), probe).is_err());
+    assert!(bind_probe_callsite(&preferred.replace(probe, "other.rs"), probe).is_err());
+    assert!(bind_probe_callsite(&preferred.replace("trace.span", "trace.other"), probe).is_err());
 }
 
 /// Collapse host (`$WORKSPACE/.../context.rs` plus the expanded signature) and
@@ -162,102 +181,176 @@ fn strip_rustc_position(path: &str) -> &str {
     &path[..end]
 }
 
-/// trybuild has no normalization hook. Hiding the sibling `.stderr` makes it
-/// write its preferred variation to `wip/` (then panic, so a missing snapshot
-/// is not a pass). That preferred text is what a blind `TRYBUILD=overwrite`
-/// would commit, which is the environment-specific rendering we normalize.
-fn preferred_compile_fail(case: &str) -> String {
-    let case_path = PathBuf::from(case);
-    let stderr_path = case_path.with_extension("stderr");
-    // Same directory as the snapshot: cowshed's TMPDIR is another volume, and
-    // rename across that boundary is EXDEV.
-    let mut hold = stderr_path.clone().into_os_string();
-    hold.push(".hold");
-    let hold = PathBuf::from(hold);
-    fs::rename(&stderr_path, &hold).unwrap_or_else(|err| {
-        panic!(
-            "hide {} so trybuild records a preferred variation: {err}",
-            stderr_path.display()
-        )
-    });
-    let _restore = RestoreFile {
-        from: hold,
-        to: stderr_path.clone(),
-    };
-    remove_wip_artifact(&case_path);
-    let overwrite = std::env::var_os("TRYBUILD").is_some_and(|value| value == "overwrite");
-    let panicked = panic::catch_unwind(AssertUnwindSafe(|| {
+const CALLSITE_SOURCE: &str =
+    "4 |     let _ = trace.span(TextInput::Static(\"missing\"), None, 8, |_| Ok::<_, ()>(()));";
+
+/// The probe is a temp copy, so rustc names that file. Require the same
+/// callsite (line 4, column 19, the direct `span` invocation) and rewrite the
+/// path to the tracked fixture before comparing.
+fn bind_probe_callsite(stderr: &str, probe_name: &str) -> Result<String, String> {
+    let mut lines: Vec<String> = stderr.lines().map(str::to_owned).collect();
+    let arrow = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("--> "))
+        .ok_or_else(|| "missing callsite arrow".to_owned())?;
+    let loc = lines[arrow].trim_start().to_owned();
+    let path = loc
+        .strip_prefix("--> ")
+        .ok_or_else(|| format!("callsite is not an arrow: {}", lines[arrow]))?
+        .trim();
+    if !path.ends_with(":4:19") {
+        return Err(format!("callsite position is not 4:19: {path}"));
+    }
+    let file_name = Path::new(strip_rustc_position(path))
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    if file_name != probe_name {
+        return Err(format!(
+            "callsite file is {file_name}, not the probe {probe_name}"
+        ));
+    }
+    if !lines.iter().any(|line| line == CALLSITE_SOURCE) {
+        return Err("callsite source line is not the direct span invocation".to_owned());
+    }
+    let indent = lines[arrow].len() - loc.len();
+    let mut rewritten = " ".repeat(indent);
+    rewritten.push_str("--> tests/compile_fail/provenance_required.rs:4:19");
+    lines[arrow] = rewritten;
+    let mut out = lines.join("\n");
+    out.push('\n');
+    Ok(out)
+}
+
+/// Compile a unique temp copy that has no sibling `.stderr`. trybuild writes
+/// its preferred variation to `wip/<that name>.stderr` and panics so a missing
+/// snapshot is not a pass. The tracked snapshot is never opened for write.
+fn preferred_compile_fail(case: &str) -> (String, String) {
+    match capture_preferred(case) {
+        Ok(captured) => captured,
+        Err(err) => panic!("{err}"),
+    }
+}
+
+fn capture_preferred(case: &str) -> Result<(String, String), String> {
+    let cwd = std::env::current_dir().map_err(|err| format!("cwd: {err}"))?;
+    let nanos = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_err(|err| format!("clock: {err}"))?
+        .as_nanos();
+    let probe_name = format!("provenance_required_{}_{nanos}.rs", std::process::id());
+    let dir = std::env::temp_dir().join(format!("lmao-provenance-{}-{nanos}", std::process::id()));
+    fs::create_dir(&dir).map_err(|err| format!("create {}: {err}", dir.display()))?;
+    let rs = dir.join(&probe_name);
+    if let Err(err) = fs::copy(case, &rs) {
+        let cleanup = remove_owned_dir(&dir);
+        let mut msg = format!("copy {case} -> {}: {err}", rs.display());
+        if let Err(cleanup) = cleanup {
+            msg.push_str(&format!("; {cleanup}"));
+        }
+        return Err(msg);
+    }
+    if rs.with_extension("stderr").exists() {
+        let cleanup = remove_owned_dir(&dir);
+        let mut msg = format!("probe {} has an expected stderr", rs.display());
+        if let Err(cleanup) = cleanup {
+            msg.push_str(&format!("; {cleanup}"));
+        }
+        return Err(msg);
+    }
+
+    let wip_name = Path::new(&probe_name).with_extension("stderr");
+    let wip = cwd.join("wip").join(&wip_name);
+    if wip.exists() {
+        let cleanup = remove_owned_dir(&dir);
+        let mut msg = format!("refusing pre-existing wip {}", wip.display());
+        if let Err(cleanup) = cleanup {
+            msg.push_str(&format!("; {cleanup}"));
+        }
+        return Err(msg);
+    }
+    let started = SystemTime::now();
+    let _panicked = panic::catch_unwind(AssertUnwindSafe(|| {
         let t = trybuild::TestCases::new();
-        t.compile_fail(case);
+        t.compile_fail(&rs);
     }));
 
-    // `panic!` with format args on this nightly does not downcast as String
-    // or &str. The wip file is the signal trybuild actually wrote a preferred
-    // variation; a panic without that file is a real failure.
-    if let Some(preferred) = read_wip_stderr(&case_path) {
-        remove_wip_artifact(&case_path);
-        return preferred;
-    }
-    match panicked {
-        Ok(()) if overwrite => fs::read_to_string(&stderr_path).unwrap_or_else(|err| {
-            panic!(
-                "TRYBUILD=overwrite passed without writing {}: {err}",
-                stderr_path.display()
-            )
-        }),
-        Ok(()) => panic!("trybuild accepted {case} with no stderr snapshot"),
-        Err(payload) => panic::resume_unwind(payload),
-    }
-}
-
-fn read_wip_stderr(case: &Path) -> Option<String> {
-    let name = case.with_extension("stderr");
-    let file_name = name.file_name()?;
-    let mut candidates = Vec::new();
-    if let Ok(cwd) = std::env::current_dir() {
-        candidates.push(cwd.join("wip").join(file_name));
-    }
-    candidates.push(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("wip")
-            .join(file_name),
-    );
-    candidates
-        .into_iter()
-        .find_map(|path| fs::read_to_string(path).ok())
-}
-
-fn remove_wip_artifact(case: &Path) {
-    let Some(file_name) = case.with_extension("stderr").file_name().map(PathBuf::from) else {
-        return;
+    let read = read_fresh_wip(&wip, started);
+    let cleanup_dir = remove_owned_dir(&dir);
+    let cleanup_wip = remove_fresh_wip(&wip);
+    let cleanup = match (cleanup_dir, cleanup_wip) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(dir_err), Ok(())) => Err(dir_err),
+        (Ok(()), Err(wip_err)) => Err(wip_err),
+        (Err(dir_err), Err(wip_err)) => Err(format!("{dir_err}; {wip_err}")),
     };
-    let mut dirs = Vec::new();
-    if let Ok(cwd) = std::env::current_dir() {
-        dirs.push(cwd.join("wip"));
-    }
-    dirs.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("wip"));
-    for dir in dirs {
-        let _ = fs::remove_file(dir.join(&file_name));
-        let Ok(entries) = fs::read_dir(&dir) else {
-            continue;
-        };
-        let left: Vec<_> = entries.filter_map(Result::ok).collect();
-        if left.len() == 1 && left[0].file_name() == ".gitignore" {
-            let _ = fs::remove_file(left[0].path());
-            let _ = fs::remove_dir(dir);
-        }
+    match (read, cleanup) {
+        (Ok(text), Ok(())) => Ok((text, probe_name)),
+        (Ok(_), Err(err)) => Err(format!("diagnostic captured but cleanup failed: {err}")),
+        (Err(err), Ok(())) => Err(err),
+        (Err(err), Err(cleanup)) => Err(format!("{err}; cleanup also failed: {cleanup}")),
     }
 }
 
-struct RestoreFile {
-    from: PathBuf,
-    to: PathBuf,
+fn read_fresh_wip(path: &Path, started: SystemTime) -> Result<String, String> {
+    let meta = fs::metadata(path)
+        .map_err(|err| format!("wip {} was not written by this run: {err}", path.display()))?;
+    let modified = meta
+        .modified()
+        .map_err(|err| format!("mtime {}: {err}", path.display()))?;
+    if modified + Duration::from_secs(2) < started {
+        return Err(format!(
+            "wip {} predates this run; refusing a stale file",
+            path.display()
+        ));
+    }
+    fs::read_to_string(path).map_err(|err| format!("read {}: {err}", path.display()))
 }
 
-impl Drop for RestoreFile {
-    fn drop(&mut self) {
-        if self.from.exists() {
-            let _ = fs::rename(&self.from, &self.to);
+fn remove_fresh_wip(path: &Path) -> Result<(), String> {
+    remove_file_if_present(path)?;
+    let Some(dir) = path.parent() else {
+        return Ok(());
+    };
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(format!("read {}: {err}", dir.display())),
+    };
+    let mut left = Vec::new();
+    for entry in entries {
+        left.push(entry.map_err(|err| format!("read {}: {err}", dir.display()))?);
+    }
+    if left.len() == 1 && left[0].file_name() == ".gitignore" {
+        remove_file_if_present(&left[0].path())?;
+        fs::remove_dir(dir).map_err(|err| format!("remove {}: {err}", dir.display()))?;
+    }
+    Ok(())
+}
+
+fn remove_owned_dir(dir: &Path) -> Result<(), String> {
+    if !dir.exists() {
+        return Ok(());
+    }
+    let entries = fs::read_dir(dir).map_err(|err| format!("read {}: {err}", dir.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|err| format!("read {}: {err}", dir.display()))?;
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .map_err(|err| format!("stat {}: {err}", path.display()))?;
+        if !file_type.is_file() {
+            return Err(format!("refusing to remove non-file {}", path.display()));
         }
+        fs::remove_file(&path).map_err(|err| format!("remove {}: {err}", path.display()))?;
+    }
+    fs::remove_dir(dir).map_err(|err| format!("remove {}: {err}", dir.display()))
+}
+
+fn remove_file_if_present(path: &Path) -> Result<(), String> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(format!("remove {}: {err}", path.display())),
     }
 }
