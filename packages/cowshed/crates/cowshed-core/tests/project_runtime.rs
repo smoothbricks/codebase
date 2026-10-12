@@ -2932,6 +2932,7 @@ async fn napi_job_read<T: serde::de::DeserializeOwned>(
 #[tokio::test]
 #[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
 async fn host_controller_process_observations_survive_a_subscriber_drop() {
+    use cowshed_core::api::dto::ExitStatus;
     use cowshed_core::api::process::{JobProcessEvent, JobProcessTree, ProcessCoverage};
     use cowshed_core::api::resources::SampleInterval;
     use cowshed_core::fork_lock::Run as _;
@@ -2940,9 +2941,9 @@ async fn host_controller_process_observations_survive_a_subscriber_drop() {
     let root = test_root();
     let mut config = supervisor_config(&root);
     let telemetry = root.join("telemetry");
+    std::fs::create_dir(&telemetry).expect("telemetry root");
     config.telemetry_root = Some(telemetry.clone());
     let supervisor = system_supervisor_of(config);
-    // Reuse the short owned host fixture root, including cleanup on an assertion failure.
     let sockets = scratch_apfs::ScratchRoot::new("obs").expect("short observation socket root");
     let path = sockets.path().join("s");
     let socket = supervisor_socket::bind(&path)
@@ -2956,70 +2957,125 @@ async fn host_controller_process_observations_survive_a_subscriber_drop() {
     ));
     let remote = supervisor_socket::connect(path, supervisor.snapshot().clone());
     let jobs = SupervisedJobs::connect(&root, remote.clone()).await;
-    let gate = root.join("workspace").join("observation-gate");
-    assert!(
-        std::process::Command::new("/usr/bin/mkfifo")
-            .arg(&gate)
-            .status_locked()
-            .expect("create the fixture's FIFO")
-            .success()
-    );
-    let job = jobs
-        .exec(ExecCommand::Argv(
-            [
-                "/bin/sh",
-                "-c",
-                "printf 'oracle:%s\\n' \"$$\"; exec /bin/cat observation-gate",
-            ]
-            .into_iter()
-            .map(CommandArg::from)
-            .collect(),
-        ))
-        .await;
+    let workspace = root.join("workspace");
+    let birth_gate = workspace.join("observation-birth");
+    let child_gate = workspace.join("observation-child-gate");
+    let grandchild_gate = workspace.join("observation-grandchild-gate");
+    for gate in [&birth_gate, &child_gate, &grandchild_gate] {
+        assert!(
+            std::process::Command::new("/usr/bin/mkfifo")
+                .arg(gate)
+                .status_locked()
+                .expect("create the fixture FIFO")
+                .success()
+        );
+    }
+    std::fs::write(
+        workspace.join("observation-child.sh"),
+        "printf 'oracle:child:%s:%s\n' \"$$\" \"$PPID\"\n\
+         read _ < observation-birth\n\
+         /bin/sh observation-grandchild.sh &\n\
+         read _ < observation-child-gate\n\
+         wait\n\
+         exit 23\n",
+    )
+    .expect("child fixture");
+    std::fs::write(
+        workspace.join("observation-grandchild.sh"),
+        "printf 'oracle:grandchild:%s:%s\n' \"$$\" \"$PPID\"\n\
+         exec /bin/cat observation-grandchild-gate\n",
+    )
+    .expect("grandchild fixture");
+    let job = jobs.exec(ExecCommand::Argv([
+        "/bin/sh", "-c",
+        "printf 'oracle:root:%s:%s\n' \"$$\" \"$PPID\"; /bin/sh observation-child.sh & wait; exit 29",
+    ].into_iter().map(CommandArg::from).collect())).await;
     let mut stdout = job
         .logs(JobStream::Stdout, 0, true)
         .await
         .expect("oracle stdout");
     let mut oracle = Vec::new();
-    while !oracle.contains(&b'\n') {
+    while oracle.iter().filter(|&&byte| byte == b'\n').count() < 2 {
         let chunk = tokio::time::timeout(Duration::from_secs(5), stdout.next())
             .await
-            .expect("the held fixture reports its own PID")
+            .expect("the held fixture reports its own identities")
             .expect("oracle did not end")
             .expect("oracle bytes");
         oracle.extend_from_slice(&chunk);
     }
-    let pid: u32 = std::str::from_utf8(&oracle)
-        .unwrap()
-        .trim()
-        .strip_prefix("oracle:")
-        .unwrap()
-        .parse()
-        .unwrap();
-    let tree = tokio::time::timeout(Duration::from_secs(5), async {
+    let identities = |bytes: &[u8]| {
+        std::str::from_utf8(bytes)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                let mut fields = line.split(':');
+                assert_eq!(fields.next(), Some("oracle"));
+                let role = fields.next().unwrap().to_owned();
+                let pid = fields.next().unwrap().parse::<u32>().unwrap();
+                let ppid = fields.next().unwrap().parse::<u32>().unwrap();
+                assert!(fields.next().is_none());
+                (role, pid, ppid)
+            })
+            .collect::<Vec<_>>()
+    };
+    let first = identities(&oracle);
+    assert_eq!(first[0].0, "root");
+    assert_eq!(first[1].0, "child");
+    let pid = first[0].1;
+    assert_eq!(first[1].2, pid);
+    // The child is watched before it is allowed to fork its grandchild. A periodic
+    // census cannot account for the exec events this retained history must contain.
+    let initial = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let tree = job.processes().await.expect("native process tree");
-            if tree.processes.len() == 1 && tree.processes[0].program == "/bin/cat" {
+            if tree.processes.len() == 2 && tree.processes[1].pid == first[1].1 {
                 break tree;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
-    .expect("exec reaches the retained native tree");
-    assert_eq!(tree.processes[0].pid, pid);
-    assert!(tree.processes[0].exit.is_none());
-    assert_eq!(tree.coverage, ProcessCoverage::Complete);
+    .expect("the FIFO-held child reaches the retained tree");
+    assert!(matches!(initial.coverage, ProcessCoverage::Gap { .. }));
+    release(birth_gate).await;
+    while oracle.iter().filter(|&&byte| byte == b'\n').count() < 3 {
+        let chunk = tokio::time::timeout(Duration::from_secs(5), stdout.next())
+            .await
+            .expect("the grandchild reports its own identity")
+            .expect("oracle did not end")
+            .expect("oracle bytes");
+        oracle.extend_from_slice(&chunk);
+    }
+    let expected = identities(&oracle);
+    assert_eq!(expected.len(), 3);
+    assert_eq!(expected[2].0, "grandchild");
+    assert_eq!(expected[2].2, expected[1].1);
+    let tree = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let tree = job.processes().await.expect("native process tree");
+            if tree.processes.len() == 3
+                && tree.processes[2].program == "/bin/cat"
+                && tree.processes.iter().all(|process| process.usage.is_some())
+            {
+                break tree;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("grandchild exec and first usage reach the retained native tree");
+    for (process, (_, pid, ppid)) in tree.processes.iter().zip(&expected) {
+        assert_eq!((process.pid, process.ppid), (*pid, *ppid));
+        assert!(process.exit.is_none());
+        assert!(process.usage.is_some());
+    }
+    assert!(matches!(tree.coverage, ProcessCoverage::Gap { .. }));
 
-    // Exercise both rows independently, so an absent tree method cannot hide an absent stream
-    // method in the prebuilt SDK RED. Rejections are proof output, never successful fallback reads.
-    let reads: Vec<Value> = napi_job_read(
-        &jobs,
-        &root,
-        job.id(),
+    // Exercise both rows independently: an absent tree method cannot hide an absent
+    // stream method. Rejections are RED output, never successful fallback reads.
+    let reads: Vec<Value> = napi_job_read(&jobs, &root, job.id(),
         "await Promise.allSettled([Promise.resolve().then(() => job.processes()), Promise.resolve().then(async () => { const rows = []; for await (const row of job.processEvents(20)) { rows.push(row); break; } return rows; })]).then(rows => rows.map(row => row.status === 'fulfilled' ? row : { status: row.status, reason: String(row.reason) }))",
-    )
-    .await;
+    ).await;
     assert_eq!(reads.len(), 2, "{reads:?}");
     assert!(
         reads.iter().all(|read| read["status"] == "fulfilled"),
@@ -3027,9 +3083,13 @@ async fn host_controller_process_observations_survive_a_subscriber_drop() {
     );
     let napi_tree: JobProcessTree = serde_json::from_value(reads[0]["value"].clone()).unwrap();
     let dropped: Vec<JobProcessEvent> = serde_json::from_value(reads[1]["value"].clone()).unwrap();
-    assert_eq!(napi_tree.processes[0].pid, pid);
-    assert_eq!(napi_tree.processes[0].program, "/bin/cat");
-    assert_eq!(napi_tree.processes[0].born_at, tree.processes[0].born_at);
+    assert_eq!(napi_tree.processes.len(), 3);
+    for (native, served) in napi_tree.processes.iter().zip(&tree.processes) {
+        assert_eq!(
+            (native.pid, native.ppid, &native.born_at, &native.program),
+            (served.pid, served.ppid, &served.born_at, &served.program)
+        );
+    }
     assert!(
         matches!(&dropped[..], [JobProcessEvent::Born { index: 0, process }] if process.pid == pid)
     );
@@ -3040,17 +3100,17 @@ async fn host_controller_process_observations_survive_a_subscriber_drop() {
             .state,
         JobState::Running
     );
-
     let mut events = job
         .process_events(SampleInterval::new(20).unwrap())
         .await
         .expect("canonical worker stream");
-    release(gate).await;
+    release(child_gate).await;
+    release(grandchild_gate).await;
     let ended = job
         .wait()
         .await
-        .expect("held command ends after its gate opens");
-    assert_eq!(ended.state, JobState::Exited);
+        .expect("held command ends after its gates open");
+    assert_eq!(ended.exit, Some(ExitStatus::Exited { code: 29 }));
     let mut history = Vec::new();
     while let Some(event) = tokio::time::timeout(Duration::from_secs(5), events.next())
         .await
@@ -3058,28 +3118,69 @@ async fn host_controller_process_observations_survive_a_subscriber_drop() {
     {
         history.push(event.expect("native process event"));
     }
-    assert!(
-        matches!(history.first(), Some(JobProcessEvent::Born { index: 0, process }) if process.pid == pid)
+    assert_eq!(
+        history
+            .iter()
+            .filter(|event| matches!(event, JobProcessEvent::Gap { .. }))
+            .count(),
+        1
     );
-    assert!(history.iter().any(|event| matches!(event, JobProcessEvent::Exec { index: 0, process } if process.program == "/bin/cat")));
-    assert!(
-        matches!(history.last(), Some(JobProcessEvent::Exited { index: 0, process }) if process.pid == pid && process.usage.is_some() && process.exit.as_ref().is_some_and(|exit| exit.status == cowshed_core::api::dto::ExitStatus::Exited { code: 0 }))
-    );
+    for (index, (_, pid, _)) in expected.iter().enumerate() {
+        let index = u32::try_from(index).unwrap();
+        let births: Vec<_> = history.iter().filter(|event| matches!(event,
+            JobProcessEvent::Born { index: found, process } if *found == index && process.pid == *pid)).collect();
+        assert_eq!(births.len(), 1, "{history:?}");
+        assert!(history.iter().any(|event| matches!(event,
+            JobProcessEvent::Exec { index: found, process } if *found == index && process.pid == *pid)));
+        let exits: Vec<_> = history
+            .iter()
+            .filter_map(|event| match event {
+                JobProcessEvent::Exited {
+                    index: found,
+                    process,
+                } if *found == index => Some(process),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(exits.len(), 1, "{history:?}");
+        assert_eq!(
+            exits[0].exit.as_ref().unwrap().status,
+            ExitStatus::Exited {
+                code: [29, 23, 0][usize::try_from(index).unwrap()]
+            }
+        );
+        assert!(exits[0].usage.is_some());
+        let ended_at = history
+            .iter()
+            .position(|event| {
+                matches!(event,
+            JobProcessEvent::Exited { index: found, .. } if *found == index)
+            })
+            .unwrap();
+        assert!(!history[ended_at + 1..].iter().any(|event| match event {
+            JobProcessEvent::Born { index: found, .. }
+            | JobProcessEvent::Exec { index: found, .. }
+            | JobProcessEvent::Heartbeat { index: found, .. }
+            | JobProcessEvent::Exited { index: found, .. } => *found == index,
+            JobProcessEvent::Changed(change) => change.index() == index,
+            JobProcessEvent::Gap { .. } => false,
+        }));
+    }
     let final_tree = job
         .processes()
         .await
         .expect("retired records remain readable");
-    assert_eq!(final_tree.processes.len(), 1);
-    assert!(final_tree.processes[0].exit.is_some());
-    let napi_history: Vec<JobProcessEvent> = napi_job_read(
-        &jobs,
-        &root,
-        job.id(),
+    assert_eq!(final_tree.processes.len(), 3);
+    assert!(
+        final_tree
+            .processes
+            .iter()
+            .all(|process| process.exit.is_some())
+    );
+    let napi_history: Vec<JobProcessEvent> = napi_job_read(&jobs, &root, job.id(),
         "await (async () => { const rows = []; for await (const row of job.processEvents(20)) rows.push(row); return rows; })()",
-    )
-    .await;
+    ).await;
     assert_eq!(napi_history, history);
-
     let health = remote
         .trace_health()
         .await
@@ -3106,17 +3207,252 @@ async fn host_controller_process_observations_survive_a_subscriber_drop() {
         .iter()
         .filter(|row| row.entry_type == "span-start")
         .collect();
-    assert_eq!(starts.len(), 1, "{rows:?}");
-    assert_eq!(starts[0].proc_pid, Some(pid));
-    assert_eq!(starts[0].parent_span_id, 1);
-    assert_eq!(rows.iter().filter(|row| row.proc_argv.is_some()).count(), 1);
-    let terminal: Vec<_> = rows.iter().filter(|row| row.exit_code.is_some()).collect();
-    assert_eq!(terminal.len(), 1);
-    assert_eq!(terminal[0].exit_code, Some(0));
-    assert!(terminal[0].cpu_user_us.is_some());
-    assert!(terminal[0].cpu_sys_us.is_some());
-    assert_eq!(terminal[0].rss_bytes, Some(0));
+    assert_eq!(starts.len(), 3, "{rows:?}");
+    for (index, (_, pid, _)) in expected.iter().enumerate() {
+        let start = starts
+            .iter()
+            .find(|row| row.proc_pid == Some(*pid))
+            .unwrap();
+        let parent = if index == 0 {
+            1
+        } else {
+            starts
+                .iter()
+                .find(|row| row.proc_pid == Some(expected[index - 1].1))
+                .unwrap()
+                .span_id
+        };
+        assert_eq!(start.parent_span_id, parent);
+        assert!(start.proc_argv.is_some());
+        let same_span: Vec<_> = rows
+            .iter()
+            .filter(|row| row.span_id == start.span_id)
+            .collect();
+        assert_eq!(
+            same_span
+                .iter()
+                .filter(|row| row.proc_argv.is_some())
+                .count(),
+            1
+        );
+        let terminal: Vec<_> = same_span
+            .iter()
+            .filter(|row| row.exit_code.is_some())
+            .collect();
+        assert_eq!(terminal.len(), 1);
+        assert_eq!(terminal[0].exit_code, Some([29, 23, 0][index]));
+        assert!(terminal[0].cpu_user_us.is_some());
+        assert!(terminal[0].cpu_sys_us.is_some());
+    }
     drop(stdout);
+    serving.abort();
+    assert!(
+        serving
+            .await
+            .expect_err("the owned server is stopped")
+            .is_cancelled()
+    );
+}
+
+/// A short-lived-grandchild oracle measures the event source's missing births, never infers
+/// them from CPU. The same explicit gap reaches the controller, SDK and terminal job row.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+async fn host_controller_a_reaped_grandchild_burst_retains_its_observation_gap() {
+    use cowshed_core::api::process::{
+        JobProcessEvent, JobProcessTree, ProcessCoverage, ProcessCoverageGap,
+    };
+    use cowshed_core::api::resources::JobAccounting;
+    use cowshed_core::fork_lock::Run as _;
+    use cowshed_core::runtime::{job_unattributed, supervisor_socket};
+
+    let root = test_root();
+    let mut config = supervisor_config(&root);
+    let telemetry = root.join("telemetry");
+    std::fs::create_dir(&telemetry).expect("telemetry root");
+    config.telemetry_root = Some(telemetry.clone());
+    let supervisor = system_supervisor_of(config);
+    let sockets = scratch_apfs::ScratchRoot::new("burst").expect("short observation socket root");
+    let path = sockets.path().join("s");
+    let socket = supervisor_socket::bind(&path)
+        .await
+        .expect("bind supervisor");
+    let serving = tokio::spawn(supervisor_socket::serve(
+        socket,
+        supervisor.clone(),
+        None,
+        None,
+    ));
+    let remote = supervisor_socket::connect(path, supervisor.snapshot().clone());
+    let jobs = SupervisedJobs::connect(&root, remote.clone()).await;
+    let workspace = root.join("workspace");
+    let gate = workspace.join("burst-birth");
+    assert!(
+        std::process::Command::new("/usr/bin/mkfifo")
+            .arg(&gate)
+            .status_locked()
+            .expect("create the birth FIFO")
+            .success()
+    );
+    std::fs::write(
+        workspace.join("burst-child.sh"),
+        "printf 'child:%s\\n' \"$$\"\n\
+         read _ < burst-birth\n\
+         i=0\n\
+         while [ \"$i\" -lt 64 ]; do\n\
+           /usr/bin/true &\n\
+           child=$!\n\
+           printf 'grandchild:%s\\n' \"$child\"\n\
+           wait \"$child\"\n\
+           i=$((i+1))\n\
+         done\n",
+    )
+    .expect("the independent burst oracle");
+    let job = jobs
+        .exec(ExecCommand::Argv(
+            [
+                "/bin/sh",
+                "-c",
+                "printf 'root:%s\\n' \"$$\"; /bin/sh burst-child.sh & wait",
+            ]
+            .into_iter()
+            .map(CommandArg::from)
+            .collect(),
+        ))
+        .await;
+    let mut stdout = job
+        .logs(JobStream::Stdout, 0, true)
+        .await
+        .expect("oracle stdout");
+    let mut oracle = Vec::new();
+    while oracle.iter().filter(|&&byte| byte == b'\n').count() < 2 {
+        let chunk = tokio::time::timeout(Duration::from_secs(5), stdout.next())
+            .await
+            .expect("the held parent reports its identity")
+            .expect("oracle did not end")
+            .expect("oracle bytes");
+        oracle.extend_from_slice(&chunk);
+    }
+    let first: Vec<_> = std::str::from_utf8(&oracle).unwrap().lines().collect();
+    let root_pid: u32 = first[0].strip_prefix("root:").unwrap().parse().unwrap();
+    let child_pid: u32 = first[1].strip_prefix("child:").unwrap().parse().unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let tree = job.processes().await.expect("retained parent");
+            if tree
+                .processes
+                .iter()
+                .any(|process| process.pid == child_pid)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the parent is watched before its burst");
+    release(gate).await;
+    while let Some(chunk) = tokio::time::timeout(Duration::from_secs(5), stdout.next())
+        .await
+        .expect("the short burst finishes")
+    {
+        oracle.extend_from_slice(&chunk.expect("oracle bytes"));
+    }
+    let ended = job.wait().await.expect("the burst parent is reaped");
+    let grandchildren: Vec<u32> = std::str::from_utf8(&oracle)
+        .unwrap()
+        .lines()
+        .filter_map(|line| line.strip_prefix("grandchild:"))
+        .map(|pid| pid.parse().unwrap())
+        .collect();
+    assert_eq!(grandchildren.len(), 64);
+    let tree = job.processes().await.expect("retained burst records");
+    let retained: Vec<_> = tree
+        .processes
+        .iter()
+        .filter(|process| process.ppid == child_pid)
+        .collect();
+    assert!(retained.len() <= grandchildren.len());
+    assert!(
+        retained
+            .iter()
+            .all(|process| grandchildren.contains(&process.pid))
+    );
+    let missing = grandchildren.len() - retained.len();
+    println!(
+        "controller/N-API kqueue oracle: {} grandchild births, {} retained, {missing} missing",
+        grandchildren.len(),
+        retained.len(),
+    );
+    let reason = ProcessCoverageGap::UncountedFork { pid: root_pid };
+    assert_eq!(tree.coverage, ProcessCoverage::Gap { reason });
+    let napi_tree: JobProcessTree =
+        napi_job_read(&jobs, &root, job.id(), "await job.processes()").await;
+    assert_eq!(napi_tree.processes, tree.processes);
+    assert_eq!(napi_tree.coverage, tree.coverage);
+    let events: Vec<JobProcessEvent> = napi_job_read(
+        &jobs,
+        &root,
+        job.id(),
+        "await (async () => { const rows = []; for await (const row of job.processEvents(20)) { rows.push(row); if (row.kind === 'gap') break; } return rows; })()",
+    )
+    .await;
+    assert!(
+        matches!(events.last(), Some(JobProcessEvent::Gap { reason: observed }) if *observed == reason)
+    );
+    let sample = ended
+        .resources
+        .as_ref()
+        .expect("source accounting is retained");
+    let JobAccounting::MacOsRusageChildren { reconciliation, .. } = &sample.accounting else {
+        panic!("a macOS burst must retain its named rusage source");
+    };
+    assert_eq!(reconciliation.coverage, tree.coverage);
+    let health = remote
+        .trace_health()
+        .await
+        .expect("terminal rows are sealed");
+    assert_eq!(health.failed, 0, "{health:?}");
+    let mut gaps = Vec::new();
+    for day in std::fs::read_dir(&telemetry).expect("trace days") {
+        for entry in std::fs::read_dir(day.unwrap().path()).expect("trace segments") {
+            let path = entry.unwrap().path();
+            if path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("unattributed-")
+            {
+                gaps.push(
+                    job_unattributed::read_unattributed_segment(&path)
+                        .expect("the exact fixed reconciliation schema"),
+                );
+            }
+        }
+    }
+    assert_eq!(gaps.len(), 1);
+    let columns = &gaps[0].columns;
+    assert_eq!(
+        columns.unattributed_cpu_us,
+        Some(reconciliation.cpu_us.get())
+    );
+    assert_eq!(
+        columns.unattributed_io_read_bytes,
+        reconciliation.io_read_bytes.map(|bytes| bytes.get())
+    );
+    assert_eq!(
+        columns.unattributed_io_write_bytes,
+        reconciliation.io_write_bytes.map(|bytes| bytes.get())
+    );
+    assert_eq!(
+        job_unattributed::SOURCE_NAMES[usize::from(columns.source.unwrap())],
+        "macosRusageChildren"
+    );
+    assert_eq!(
+        job_unattributed::COVERAGE_NAMES[usize::from(columns.coverage.unwrap())],
+        "uncountedFork"
+    );
     serving.abort();
     assert!(
         serving
