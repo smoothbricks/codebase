@@ -1376,7 +1376,7 @@ mod tests {
         /// SQLite's `CURRENT_TIMESTAMP` stamps it), in the target's root Nx state.
         fn task_entry(&self, hash: &str, task: &TaskIdentity, accessed_at: &str, output: &[u8]) {
             let connection =
-                Connection::open(&self.from.join("nx/workspace-data/task.db")).unwrap();
+                Connection::open(&self.from.join("nx/workspace-data/task-v3.db")).unwrap();
             match &task.configuration {
                 Some(configuration) => connection.execute(
                     "INSERT INTO task_details VALUES (?1, ?2, ?3, ?4)",
@@ -1927,7 +1927,7 @@ mod tests {
         fixture.task_entry("12", &test, "2026-10-11 10:00:02", b"old test");
         fixture.task_entry("13", &test, "2026-10-11 10:00:03", b"head test");
         database(
-            &fixture.into.join("nx/workspace-data/task.db"),
+            &fixture.into.join("nx/workspace-data/task-v3.db"),
             &format!(
                 "{SCHEMA}; INSERT INTO task_details VALUES ('13', 'a', 'test', NULL); \
                  INSERT INTO cache_outputs (hash, code, size) VALUES ('13', 0, 9)"
