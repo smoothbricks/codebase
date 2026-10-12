@@ -37,8 +37,8 @@ pub const FIRST_LOG_ROW: usize = 2;
 
 /// Source identity has four deliberately distinct forms:
 ///
-/// - a versioned module names its package and file and carries the source file's
-///   40-hex last-touch commit;
+/// - a versioned module names its package and file and carries the explicitly
+///   supplied build revision;
 /// - `js-hash:<64 hex>` names unversioned authored JavaScript by content and has
 ///   no commit;
 /// - `<unversioned>` marks authored source with neither commit nor content hash;

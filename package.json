@@ -91,13 +91,49 @@
       "cargo-lint": {
         "inputs": [
           "rustWorkspace",
-          "lmaoGitRevision"
+          {
+            "env": "LMAO_GIT_REVISION"
+          }
         ]
       },
       "cargo-lint-cross": {
-        "//": "No lmaoGitRevision, deliberately: it is `git rev-parse HEAD`, so including it made EVERY commit invalidate this gate. The pre-push probe then missed on every push no matter what changed, which is unusable — you would have to rerun `bun run check:linux` after your last commit, every time. Clippy emits no artifact and its verdict does not depend on the revision string; the crates that bake a revision do so in targets that still hash it.",
         "inputs": [
-          "rustWorkspace"
+          "rustWorkspace",
+          {
+            "env": "LMAO_GIT_REVISION"
+          }
+        ]
+      },
+      "cargo-test-archive": {
+        "inputs": [
+          "rustWorkspace",
+          "{workspaceRoot}/packages/*/crates/**/*",
+          "{workspaceRoot}/.cargo/config",
+          "{workspaceRoot}/rust-toolchain",
+          "{workspaceRoot}/rust-toolchain.toml",
+          "{workspaceRoot}/rustfmt.toml",
+          "{workspaceRoot}/.rustfmt.toml",
+          "{workspaceRoot}/clippy.toml",
+          "{workspaceRoot}/.clippy.toml",
+          "!{workspaceRoot}/**/.git/**",
+          "!{workspaceRoot}/**/node_modules/**",
+          "!{workspaceRoot}/**/.nx/**",
+          "!{workspaceRoot}/**/target/**",
+          {
+            "dependentTasksOutputFiles": "**/*",
+            "transitive": false
+          },
+          "{projectRoot}/.config/nextest.toml",
+          "cargoToolchain",
+          {
+            "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh sh -c 'cd \"$0\" && rustc -vV && cargo -V && cargo nextest --version' ."
+          },
+          {
+            "externalDependencies": []
+          },
+          {
+            "env": "LMAO_GIT_REVISION"
+          }
         ]
       },
       "cargo-test-compile": {
@@ -112,7 +148,9 @@
         ],
         "inputs": [
           "rustWorkspace",
-          "lmaoGitRevision"
+          {
+            "env": "LMAO_GIT_REVISION"
+          }
         ]
       }
     },

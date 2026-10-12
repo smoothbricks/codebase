@@ -31,7 +31,7 @@ pub mod thread_ffi;
 pub mod thread_store;
 pub mod tuning;
 
-include!(concat!(env!("OUT_DIR"), "/source_git.rs"));
+include!(concat!(env!("OUT_DIR"), "/build_revision.rs"));
 
 pub use arena::{ArenaFull, ArenaStr, ScopeText, StringArena, TextInput};
 pub use attribute_cells::AttributeCells;

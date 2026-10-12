@@ -98,6 +98,20 @@ describe('publish workflow definition', () => {
     await expect(formattedPublishWorkflow(platform)).resolves.toBe(platform);
   });
 
+  it('pins Rust span provenance in every publishing job', async () => {
+    const provenanceEnv = { LMAO_GIT_REVISION: '${{ github.sha }}' };
+    const platform = await formattedPublishWorkflow(renderPublishWorkflowYaml(codebaseWorkflowOptions));
+    const single = await formattedPublishWorkflow(renderPublishWorkflowYaml({ repoName: '@smoothbricks/codebase' }));
+    expect(Bun.YAML.parse(platform)).toMatchObject({
+      jobs: {
+        'linux-release-candidate': { env: provenanceEnv },
+        'macos-platform': { env: provenanceEnv },
+        'publish-on-linux': { env: provenanceEnv },
+      },
+    });
+    expect(Bun.YAML.parse(single)).toMatchObject({ jobs: { publish: { env: provenanceEnv } } });
+  });
+
   it('passes the projects selector to the version and platform-output steps', async () => {
     const rendered = renderPublishWorkflowYaml(codebaseWorkflowOptions);
 
