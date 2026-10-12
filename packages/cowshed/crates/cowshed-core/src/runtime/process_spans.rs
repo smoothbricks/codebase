@@ -1516,8 +1516,8 @@ mod tests {
         }
         let _ = child.wait();
         for (index, identity, parent, _) in &births {
-            let at = usize::try_from(*index).expect("a process index");
-            let process = observer.fold().sample(at, &Unread);
+            let row_index = usize::try_from(*index).expect("a process index");
+            let process = observer.fold().sample(row_index, &Unread);
             if process.exit.is_none() {
                 continue;
             }
