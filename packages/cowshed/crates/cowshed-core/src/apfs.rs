@@ -8047,10 +8047,10 @@ mod tests {
 
     /// A real-image fixture leaves nothing attached and nothing running however its run ends. A
     /// panic unwinds through the scratch root's own teardown. A kill — nextest's
-    /// `terminate-after`, a host-wide stop — runs no teardown at all, so only the next run's sweep
-    /// can end the run's processes and release its images, and the sweep finds only those working
-    /// in or staged under a scratch root that names the dead run's pid. Fixtures staged under
-    /// `$TMPDIR` stayed attached until reboot after every timed-out run, and the stock Nx daemon a
+    /// `terminate-after`, a host-wide stop — runs no teardown at all, so its parent reclaims the
+    /// exact root after reaping the child. The same cleanup ends the dead owner's processes and
+    /// releases its images without sweeping other host runs.
+    /// Fixtures staged under `$TMPDIR` stayed attached after timed-out runs, and the stock Nx daemon a
     /// timed-out test started kept running in its deleted root. The run's worker stands in for
     /// that daemon: a process the run started that outlives it, selected, as the daemon is, by its
     /// working directory alone. The run attaches one RAW image and one retained ASIF input, as
@@ -8063,11 +8063,10 @@ mod tests {
         use std::os::unix::process::ExitStatusExt;
         use std::process::{Child, Command, Stdio};
 
-        // Each fixture run is a run of its own, as the next `cargo nextest run` is: without the
-        // parent's `NEXTEST_RUN_ID`, its scratch root's sweep is never one the parent's run
-        // already recorded. Its stderr is forwarded line by line, so a hung run still shows its
-        // open step, and answers whether the run printed a panic: the run's output is this test's
-        // own, and a panic in it reads as this test's assertion failure behind any timeout.
+        // Helpers retain the suite's run identity and own only the roots their parent recovers.
+        // Forward stderr line by line so a hung helper still shows its open step, and report
+        // whether it printed a panic: its output is this test's, so a panic would read as this
+        // test's assertion failure behind any timeout.
         let run = |ending: &str| -> (Child, std::thread::JoinHandle<bool>) {
             let mut child = Command::new(std::env::current_exe().expect("test binary"))
                 .args([
@@ -8077,7 +8076,6 @@ mod tests {
                     "--nocapture",
                 ])
                 .env(FIXTURE_ENDING, ending)
-                .env_remove("NEXTEST_RUN_ID")
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
@@ -8129,13 +8127,8 @@ mod tests {
                 "panic" => assert_eq!(status.code(), Some(101), "the run failed"),
                 _ => {
                     assert_eq!(status.signal(), Some(libc::SIGKILL), "the run was killed");
-                    let (mut next, forwarded) = run("sweep");
-                    let next = next.wait().expect("the next run");
-                    assert!(
-                        !forwarded.join().expect("forward the next run's stderr"),
-                        "the sweep run printed a panic"
-                    );
-                    assert!(next.success(), "the next run swept: {next}");
+                    crate::scratch_apfs::reclaim_dead_root(&root)
+                        .expect("reclaim exactly the killed fixture's root");
                 }
             }
             for image in &images {
@@ -8157,9 +8150,8 @@ mod tests {
     }
 
     /// One real-image fixture run, ended as [`FIXTURE_ENDING`] says: it fails or waits to be
-    /// killed once its images are attached and its worker started, or (`sweep`) only opens and
-    /// drops a scratch root, whose teardown waits for its run's sweep of dead runs. Its images
-    /// are the root's to release, as a CLI fixture's are.
+    /// killed once its images are attached and its worker started. The parent owns recovery of
+    /// this exact root after a kill; no child starts a host-wide sweep of unrelated runs.
     #[cfg(target_os = "macos")]
     #[test]
     #[ignore = "spawned by real_apfs_fixture_runs_leave_nothing_attached_or_running_however_they_end"]
@@ -8167,10 +8159,7 @@ mod tests {
         let Some(ending) = std::env::var_os(FIXTURE_ENDING) else {
             return;
         };
-        let root = ScratchRoot::new("fixture-run").expect("scratch root");
-        if ending == "sweep" {
-            return;
-        }
+        let root = ScratchRoot::new_owned("fixture-run").expect("owned scratch root");
         let backend = MacOsApfsBackend::new(SystemCommandRunner);
         for (name, extension, access) in [
             ("first", IMAGE_EXTENSION, MountAccess::ReadWrite),

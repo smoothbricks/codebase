@@ -296,24 +296,29 @@ This is a live pool-headroom precondition, not a command or test deadline.
 
 **The suite spends a finite host budget.** Every attach→detach cycle a test makes can leak an AppleDiskImages2 device
 that the host's live sheds lose until reboot (01_storage.md, "How the APFS host degrades" §2), so a test pays the fewest
-attach cycles that prove its behavior. A run that killed a test leaves that test's images attached until the next run's
-sweep, which `real_apfs_fixture_runs_leave_nothing_attached_or_running_however_they_end` proves for both panic and kill
-with one RAW image and one retained ASIF input. Owned-attachment release selects the exact backing path the kernel
-holds, not the runtime image extension: a retained input must be released too. Ordinary runtime enumeration and
-attachment remain RAW-only (02_workspaces.md, "Re-adoption"); cleanup neither attaches nor converts an image. A scratch
-root's teardown and the sweep release a root's images concurrently, one holder per image: each release is an unmount
-under the host's namespace lease and then a detach under its storage lease, and those classes exclude each other
-(05_gateway.md, "Disk-lifecycle lease"), so releasing a CLI fixture's main, build and workspace images one after another
-waited for a phase change at every step on a loaded host. A run sweeps its dead predecessors once, on a thread beside
-each test process's first test: one process sweeps while the others wait on the lock and then find the run's sweep
-recorded, and every scratch root's teardown waits for its process's sweep, so no test process ends with it unfinished.
-An individual image-release refusal retains only the dead root containing that image; the sweep reports every refusal
-and still removes other dead roots after releasing their images. An inventory failure retains every root, since no
-root's image-release safety can then be proved. Root-local refusal and continued reclamation have a pure,
-platform-independent regression; one unrelated legacy image must not leave another run's already-detached files behind.
-A test is charged only what is left of the sweep once its body is done: nothing a test does depends on the sweep, since
-no sweep selects a live pid's root. Inside the first scratch root of every test process, the sweep cost 2 s on a quiet
-run and 13 s after a run whose tests timed out, and every other test process of the run waited on its lock for as long.
+attach cycles that prove its behavior. A run that killed a test leaves that test's images attached until recovery
+reclaims its dead root. `real_apfs_fixture_runs_leave_nothing_attached_or_running_however_they_end` proves panic and
+SIGKILL cleanup with one RAW image and one retained ASIF input. Its parent owns the helper roots: panic drops the
+child's root, while a killed child's exact reported root is reclaimed after the parent reaps it. This uses the same
+process/image/tree cleanup as root drop, without starting a host-wide sweep or waiting on unrelated dead runs.
+Owned-attachment release selects the exact backing path the kernel holds, not the runtime image extension: a retained
+input must be released too. Ordinary runtime enumeration and attachment remain RAW-only (02_workspaces.md,
+"Re-adoption"); cleanup neither attaches nor converts an image. A scratch root's teardown and the sweep release a root's
+images concurrently, one holder per image: each release is an unmount under the host's namespace lease and then a detach
+under its storage lease, and those classes exclude each other (05_gateway.md, "Disk-lifecycle lease"), so releasing a
+CLI fixture's main, build and workspace images one after another waited for a phase change at every step on a loaded
+host. A run sweeps its dead predecessors once, on a thread beside each test process's first test: one process sweeps
+while the others wait on the lock and then find the run's sweep recorded. Only the root that started its process's sweep
+owns and joins that thread; dropping another root never takes its handle or waits for it. A barrier regression keeps the
+starter's sweep blocked while another root finishes cleanup. An individual image-release refusal retains only the dead
+root containing that image; the sweep reports every refusal and still removes other dead roots after releasing their
+images. An inventory failure retains every root, since no root's image-release safety can then be proved. Root-local
+refusal and continued reclamation have a pure, platform-independent regression; one unrelated legacy image must not
+leave another run's already-detached files behind. Nothing a test does depends on the predecessor sweep, since no sweep
+selects a live pid's root. The starter keeps its sweep alive through completion, including on unwind. Child fixtures
+whose parent owns their recovery create only their own roots; they never reset the suite run identity to force another
+host-wide scan. That old coupling made the panic witness spend 44.7 seconds joining a 52-second scan of unrelated dead
+runs after its own 1.6-second teardown.
 
 Pure regressions recycle a device to a RAM image during the storage-lease wait, recycle it between dissent attempts and
 before force, and repeat an image's whole-device view. They prove the guard runs after the grant, no child detaches a

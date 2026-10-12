@@ -9,8 +9,8 @@ use std::fs::{self, File, OpenOptions};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::sync::Once;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, Once, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -46,109 +46,111 @@ const EXIT_GRACE: Duration = Duration::from_secs(10);
 /// One test's disposable root: `/private/tmp/cowshed-itest-<pid>-<n>-<label>`.
 ///
 /// Dropping it ends every process working in its tree, detaches every image attached from below
-/// it, then removes the tree, then waits for its process's sweep of dead runs if that is still
-/// going, and says on stderr how long each took: both run inside the test's own time bound. A
-/// run that could not drop it (a SIGKILL, a harness timeout) leaves it to the next run's sweep.
+/// it, then removes the tree. Only the root that started a predecessor sweep joins that sweep;
+/// another root's teardown never inherits that unrelated work.
 pub struct ScratchRoot {
     path: PathBuf,
+    sweep: Option<JoinHandle<()>>,
 }
-
-/// The process's sweep of dead runs, until a scratch root's teardown has waited for it.
-static SWEEPING: Mutex<Option<JoinHandle<()>>> = Mutex::new(None);
 
 impl ScratchRoot {
     pub fn new(label: &str) -> std::io::Result<Self> {
         static SWEEP: Once = Once::new();
+        Self::new_with_sweep(label, &SWEEP, sweep_dead_runs)
+    }
+
+    /// A child fixture whose parent owns recovery if the child is killed. It cleans its own
+    /// root on drop, but never starts or waits for a sweep of unrelated host runs.
+    pub(crate) fn new_owned(label: &str) -> std::io::Result<Self> {
         static NEXT: AtomicUsize = AtomicUsize::new(0);
-        // The sweep reclaims what dead runs left, and nothing of this test needs it first: its
-        // roots spell a live pid, which no sweep selects. Run before the test, it was charged to
-        // the test's time bound in full, 2 s on a quiet run and 13 s after a run whose tests timed
-        // out, and every other test process of the run queued behind it on the lock. Beside the
-        // test, only what is left of it when the test's first root is dropped is charged.
-        SWEEP.call_once(|| {
-            match std::thread::Builder::new()
-                .name("scratch-sweep".to_owned())
-                .spawn(sweep_dead_runs)
-            {
-                Ok(sweep) => {
-                    *SWEEPING.lock().unwrap_or_else(PoisonError::into_inner) = Some(sweep);
-                }
-                Err(error) => {
-                    eprintln!("scratch root: no sweep thread ({error}); sweeping dead runs now");
-                    sweep_dead_runs();
-                }
-            }
-        });
         let path = PathBuf::from(format!(
             "{ROOT_PREFIX}{}-{}-{label}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
         fs::create_dir_all(&path)?;
-        Ok(Self { path })
+        Ok(Self { path, sweep: None })
+    }
+
+    fn new_with_sweep(label: &str, once: &Once, sweep: fn()) -> std::io::Result<Self> {
+        let mut root = Self::new_owned(label)?;
+        // The starter owns this work through completion. Other roots can come and go without
+        // waiting on its handle, while the live starter keeps its process's sweep from being
+        // silently cut off on the normal path.
+        once.call_once(|| {
+            match std::thread::Builder::new()
+                .name("scratch-sweep".to_owned())
+                .spawn(sweep)
+            {
+                Ok(sweep) => root.sweep = Some(sweep),
+                Err(error) => {
+                    eprintln!("scratch root: no sweep thread ({error}); sweeping dead runs now");
+                    sweep();
+                }
+            }
+        });
+        Ok(root)
     }
 
     pub fn path(&self) -> &Path {
         &self.path
     }
+}
 
-    fn tear_down(&self) {
-        // A failed test unwinds with the processes it started still working in the tree. An Nx
-        // daemon detaches from whatever started it, so nothing else ever ends it: it outlived
-        // every failed test in a deleted directory, watching files for good. Ended first, no
-        // such process holds a volume the detach below releases.
-        if let Err(error) = end_processes_in(|cwd| cwd.starts_with(&self.path)) {
-            eprintln!("scratch root {}: {error}", self.path.display());
-        }
-        // A failed test unwinds with its volumes still attached; removing the tree without
-        // detaching first strands kernel attachments pointing into a half-deleted root, and
-        // leaves their volumes showing up in Finder and `mount` until the machine reboots.
-        if let Err(error) =
-            detach_images(|image| image.starts_with(&self.path)).and_then(|unreleased| {
-                if unreleased.is_empty() {
-                    Ok(())
-                } else {
-                    Err(std::io::Error::other(
-                        "one or more images could not be released",
-                    ))
-                }
-            })
-        {
-            eprintln!(
-                "scratch root {} remains intact because its images could not be released: {error}",
-                self.path.display()
-            );
-            return;
-        }
-        if let Err(error) = fs::remove_dir_all(&self.path) {
-            eprintln!(
-                "scratch root {} was not removed ({error}); the next run's sweep reclaims it",
-                self.path.display()
-            );
-        }
+/// Recover exactly the scratch root an owned child reported, after that child has been reaped.
+/// This does not take the host-wide sweep lock, enumerate unrelated dead roots, or rewrite the
+/// suite's sweep record. The parent's panic/kill witness uses the same cleanup as root drop.
+pub(crate) fn reclaim_dead_root(path: &Path) -> std::io::Result<()> {
+    if path.parent() != Some(Path::new("/private/tmp"))
+        || !owner_pid(&path.to_string_lossy()).is_some_and(process_is_gone)
+    {
+        return Err(std::io::Error::other(format!(
+            "refusing to reclaim a scratch root without a dead owner: {}",
+            path.display()
+        )));
+    }
+    tear_down_root(path)
+}
+
+fn tear_down_root(path: &Path) -> std::io::Result<()> {
+    // End the root's workers before releasing any image they may hold.
+    if let Err(error) = end_processes_in(|cwd| cwd.starts_with(path)) {
+        eprintln!("scratch root {}: {error}", path.display());
+    }
+    let unreleased = detach_images(|image| image.starts_with(path))?;
+    if !unreleased.is_empty() {
+        return Err(std::io::Error::other(format!(
+            "scratch root {} remains intact because its images could not be released: {unreleased:?}",
+            path.display()
+        )));
+    }
+    match fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
     }
 }
 
 impl Drop for ScratchRoot {
     fn drop(&mut self) {
         let started = Instant::now();
-        self.tear_down();
+        if let Err(error) = tear_down_root(&self.path) {
+            eprintln!(
+                "scratch root {}: {error}; a later sweep reclaims it",
+                self.path.display()
+            );
+        }
         let torn_down = started.elapsed();
-        // A test process never ends with its sweep unfinished: a sweep cut off by the process's
-        // exit records nothing, and a run of short processes would never finish one. The lock is
-        // held through the join, so a root dropped beside this one waits for the sweep too.
         let swept = Instant::now();
-        let mut sweeping = SWEEPING.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(sweep) = sweeping.take()
+        if let Some(sweep) = self.sweep.take()
             && sweep.join().is_err()
         {
             eprintln!(
-                "scratch root: the sweep of dead runs panicked before recording it; the next run sweeps"
+                "scratch root: its sweep of dead runs panicked before recording it; the next run sweeps"
             );
         }
-        drop(sweeping);
         eprintln!(
-            "scratch root {}: torn down in {torn_down:?}, then waited {:?} for the sweep of dead runs",
+            "scratch root {}: torn down in {torn_down:?}, then waited {:?} for its own sweep",
             self.path.display(),
             swept.elapsed()
         );
@@ -532,5 +534,64 @@ fn all_pids() -> std::io::Result<Vec<libc::pid_t>> {
             return Ok(pids);
         }
         capacity = count;
+    }
+}
+
+#[cfg(test)]
+mod sweep_ownership_tests {
+    use super::*;
+    use std::sync::Mutex;
+    use std::sync::mpsc::{self, Receiver, Sender};
+
+    static RENDEZVOUS: Mutex<Option<(Sender<()>, Receiver<()>)>> = Mutex::new(None);
+
+    fn blocked_sweep() {
+        let (started, release) = RENDEZVOUS.lock().unwrap().take().unwrap();
+        started.send(()).unwrap();
+        release.recv().unwrap();
+    }
+
+    #[test]
+    fn scoped_recovery_refuses_a_live_owner_and_non_root_paths() {
+        let root = ScratchRoot::new_owned("live-recovery-refusal").unwrap();
+        let sentinel = root.path().join("keep");
+        fs::write(&sentinel, b"live owner's bytes").unwrap();
+        for path in [root.path(), sentinel.as_path(), Path::new("/private/tmp")] {
+            assert!(
+                reclaim_dead_root(path).is_err(),
+                "refuse {}",
+                path.display()
+            );
+        }
+        assert_eq!(fs::read(sentinel).unwrap(), b"live owner's bytes");
+    }
+
+    #[test]
+    fn dropping_another_root_does_not_join_the_starters_sweep() {
+        let (started, running) = mpsc::channel();
+        let (release, blocked) = mpsc::channel();
+        *RENDEZVOUS.lock().unwrap() = Some((started, blocked));
+        let once = Once::new();
+        let starter = ScratchRoot::new_with_sweep("sweep-owner", &once, blocked_sweep).unwrap();
+        running.recv().unwrap();
+        let other =
+            ScratchRoot::new_with_sweep("not-sweep-owner", &once, || panic!("one sweep per run"))
+                .unwrap();
+        let other_path = other.path().to_owned();
+        let (done, finished) = mpsc::channel();
+        let dropping = std::thread::spawn(move || {
+            drop(other);
+            done.send(()).unwrap();
+        });
+        let independent = finished.recv_timeout(Duration::from_secs(2));
+        // Always release and join the threads, including on RED: the assertion is not a hang.
+        release.send(()).unwrap();
+        dropping.join().unwrap();
+        drop(starter);
+        assert!(
+            independent.is_ok(),
+            "another root's teardown waited for the blocked sweep it did not start"
+        );
+        assert!(!other_path.exists(), "the root still cleans its own tree");
     }
 }
