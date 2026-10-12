@@ -840,7 +840,7 @@ fn cli_command() -> ClapCommand {
             value("expected-source-head"),
             value("expected-target-head"),
         ]))
-        .subcommand(leaf("doctor").arg(flag("repair")))
+        .subcommand(leaf("doctor").args([flag("repair"), flag("clear-attach-budget")]))
         .subcommand(
             leaf("gateway")
                 .subcommand_required(true)
@@ -2821,15 +2821,22 @@ const DOCTOR: CommandSpec = CommandSpec {
         "Checks the invariants a healthy host holds: every image has a marker, every mount matches an image, grants files parse, the caches volume and the gateway answer, autosave is fresh, and nothing reclaimable is stranded — retired trash, and staging entries (images, sidecars, mountpoints, attached volumes) that no running operation owns are each a finding with their byte count. Exit 0 when healthy, otherwise 5.",
         "With `--repair`, first validates every mounted workspace artifact frame. Duplicate or regressed sequences are refused because resequencing would change store identity and make the rewritten log attest to itself; create a fresh store instead. Repair then runs the same sweep `gc` runs, so stranded trash and orphaned staging are retired under gc's rules and reported.",
     ],
-    options: &[Opt {
-        spelling: "--repair",
-        meaning: "validate artifact ordering, refuse identity-changing sequence rewrites, then reclaim what gc would",
-    }],
+    options: &[
+        Opt {
+            spelling: "--repair",
+            meaning: "validate artifact ordering, refuse identity-changing sequence rewrites, then reclaim what gc would",
+        },
+        Opt {
+            spelling: "--clear-attach-budget",
+            meaning: "end this boot's recorded disk-image attach-pool exhaustion and forget its recorded ceiling, once what spent it is freed",
+        },
+    ],
 };
 
 fn parse_doctor(matches: &ArgMatches) -> Result<Command, UsageError> {
     Ok(Command::Doctor(DoctorArgs {
         repair: flagged(matches, "repair"),
+        clear_attach_budget: flagged(matches, "clear-attach-budget"),
     }))
 }
 
@@ -3221,6 +3228,45 @@ mod tests {
             Command::Doctor(repair).project_discovery(),
             ProjectDiscovery::Optional
         );
+    }
+
+    #[test]
+    fn doctor_clear_attach_budget_is_an_explicit_flag() {
+        let Command::Doctor(clear) = parse_args(["doctor", "--clear-attach-budget"])
+            .unwrap()
+            .command
+        else {
+            panic!("expected doctor")
+        };
+        assert!(clear.clear_attach_budget);
+        assert!(!clear.repair);
+    }
+
+    /// Every `cowshed …` command an attach-budget hint or next step prints parses as a
+    /// valid invocation: a hint that names a command the CLI refuses is a dead end at the
+    /// exact moment the operator is out of attach headroom.
+    #[test]
+    fn attach_budget_hint_commands_parse_as_cowshed_invocations() {
+        use cowshed_core::attach_budget::{CLEAR_COMMAND, ORPHANS_FIRST_HINT};
+        for hint in [CLEAR_COMMAND, ORPHANS_FIRST_HINT] {
+            let mut spans = 0;
+            let mut candidates: Vec<&str> = hint.split('`').skip(1).step_by(2).collect();
+            if candidates.is_empty() {
+                candidates.push(hint);
+            }
+            for span in candidates {
+                let Some(argv) = span.strip_prefix("cowshed ") else {
+                    continue;
+                };
+                spans += 1;
+                let argv: Vec<&str> = argv.split_whitespace().collect();
+                parse_args(argv.clone()).unwrap_or_else(|error| {
+                    panic!("hint command `cowshed {argv:?}` does not parse: {error}")
+                });
+            }
+            assert!(spans >= 1, "no cowshed command in hint: {hint}");
+        }
+        assert_eq!(CLEAR_COMMAND, "cowshed doctor --clear-attach-budget");
     }
 
     #[test]

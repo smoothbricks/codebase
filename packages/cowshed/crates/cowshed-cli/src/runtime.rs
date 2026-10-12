@@ -1844,6 +1844,20 @@ where
             }
             // Repair retires what doctor named as reclaimable the same way `gc` does — one
             // sweep, one set of reasons — rather than a second deleter with its own rules.
+            if args.clear_attach_budget {
+                cowshed_core::attach_budget::clear().map_err(|error| {
+                    CowshedError::environment_missing(
+                        format!("cannot clear the recorded attach-pool exhaustion: {error}"),
+                        "check the cowshed attach-pool record's permissions and retry",
+                    )
+                })?;
+                output
+                    .guidance(
+                        "cleared this boot's recorded attach-pool exhaustion and its recorded \\
+                         ceiling; the next disk-image attach records this boot's new answer",
+                    )
+                    .map_err(output_error)?;
+            }
             if args.repair {
                 let swept = service.gc(GcOptions { dry_run: false }).await?;
                 output
