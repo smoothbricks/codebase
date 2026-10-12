@@ -3487,11 +3487,26 @@ async fn host_controller_process_observations_survive_a_subscriber_drop() {
     );
     for (index, (_, pid, _)) in expected.iter().enumerate() {
         let index = u32::try_from(index).unwrap();
-        let births: Vec<_> = history.iter().filter(|event| matches!(event,
-            JobProcessEvent::Born { index: found, process } if *found == index && process.pid == *pid)).collect();
-        assert_eq!(births.len(), 1, "{history:?}");
-        assert!(history.iter().any(|event| matches!(event,
-            JobProcessEvent::Exec { index: found, process } if *found == index && process.pid == *pid)));
+        // Order, not presence: one life is born, execs, then exits on the stream. A relay that
+        // reordered a life's transitions would still show each of them.
+        let life: Vec<_> = history
+            .iter()
+            .filter(|event| {
+                matches!(event,
+                JobProcessEvent::Born { index: found, .. }
+                | JobProcessEvent::Exec { index: found, .. }
+                | JobProcessEvent::Exited { index: found, .. } if *found == index)
+            })
+            .collect();
+        assert!(
+            matches!(&life[..],
+                [JobProcessEvent::Born { process: born, .. }, execs @ .., JobProcessEvent::Exited { .. }]
+                if born.pid == *pid
+                    && !execs.is_empty()
+                    && execs.iter().all(|event| matches!(event,
+                        JobProcessEvent::Exec { process, .. } if process.pid == *pid))),
+            "life {index}: {history:?}"
+        );
         let exits: Vec<_> = history
             .iter()
             .filter_map(|event| match event {
@@ -3526,6 +3541,26 @@ async fn host_controller_process_observations_survive_a_subscriber_drop() {
             JobProcessEvent::Gap { .. } => false,
         }));
     }
+    // A parent's birth precedes its child's, and the first coverage gap follows the root's
+    // birth: no member could fork before the root was born.
+    let born_at = |index: u32| {
+        history
+            .iter()
+            .position(|event| {
+                matches!(event,
+                JobProcessEvent::Born { index: found, .. } if *found == index)
+            })
+            .unwrap()
+    };
+    assert!(
+        born_at(0) < born_at(1) && born_at(1) < born_at(2),
+        "{history:?}"
+    );
+    let gap_at = history
+        .iter()
+        .position(|event| matches!(event, JobProcessEvent::Gap { .. }))
+        .unwrap();
+    assert!(born_at(0) < gap_at, "{history:?}");
     let final_tree = job
         .processes()
         .await
