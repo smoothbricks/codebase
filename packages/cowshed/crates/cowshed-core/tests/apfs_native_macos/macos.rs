@@ -7096,3 +7096,300 @@ fn recovering_an_unmounted_attachment_mounts_its_pinned_volume_without_reattachi
     assert!(held.is_root());
     assert_eq!(held.source_device(), attachment.volume_device());
 }
+
+mod build_mount_races {
+    use super::*;
+    use cowshed_core::apfs::ProcessStatus;
+    use cowshed_core::build_volume::{BuildVolumeId, BuildVolumeLayout};
+    use std::sync::atomic::AtomicBool;
+    use std::sync::mpsc;
+
+    #[derive(Clone, Default)]
+    struct Mounts {
+        rows: Arc<Mutex<Vec<KernelMountSnapshot>>>,
+        unreadable: Arc<AtomicBool>,
+    }
+
+    impl KernelMountSource for Mounts {
+        fn mounts(&self) -> Result<Vec<KernelMountSnapshot>, ApfsStorageError> {
+            if self.unreadable.load(Ordering::SeqCst) {
+                return Err(ApfsStorageError::Host(
+                    "injected unreadable mount table".into(),
+                ));
+            }
+            Ok(self.rows.lock().unwrap().clone())
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum Observation {
+        Expected,
+        Elsewhere,
+        Foreign,
+        Absent,
+        Unreadable,
+    }
+
+    #[derive(Clone, Copy)]
+    enum Completion {
+        Mount,
+        InProgress(Observation),
+        OtherFailure,
+    }
+
+    struct LeaseGate {
+        waiting: mpsc::SyncSender<()>,
+        resume: Mutex<mpsc::Receiver<()>>,
+    }
+
+    struct Runner {
+        recorded: RecordingRunner,
+        mounts: Mounts,
+        completion: Completion,
+        lease_calls: AtomicUsize,
+        gate: Option<LeaseGate>,
+    }
+
+    fn already_in_progress() -> CommandOutput {
+        CommandOutput {
+            status: ProcessStatus::Exit(75),
+            stdout: Vec::new(),
+            stderr: b"mount_apfs: Operation already in progress\n".to_vec(),
+        }
+    }
+
+    impl CommandRunner for Runner {
+        fn run_guarded<E>(
+            &self,
+            request: &CommandRequest,
+            check: impl FnOnce() -> Result<bool, E>,
+        ) -> Result<Option<CommandOutput>, E>
+        where
+            E: From<CommandRunError> + std::fmt::Display,
+        {
+            if check()? {
+                self.run(request).map(Some).map_err(E::from)
+            } else {
+                Ok(None)
+            }
+        }
+
+        fn run(&self, request: &CommandRequest) -> Result<CommandOutput, CommandRunError> {
+            let output = self.recorded.run(request)?;
+            if request.program != Path::new("/sbin/mount_apfs") {
+                return Ok(output);
+            }
+            let point = PathBuf::from(request.args.last().unwrap());
+            let mut rows = self.mounts.rows.lock().unwrap();
+            let observation = match self.completion {
+                Completion::Mount if !rows.is_empty() => return Ok(already_in_progress()),
+                Completion::Mount | Completion::OtherFailure => Observation::Expected,
+                Completion::InProgress(observation) => observation,
+            };
+            let row = match observation {
+                Observation::Expected => Some((point, "/dev/disk10s1")),
+                Observation::Elsewhere => {
+                    Some((point.with_extension("elsewhere"), "/dev/disk10s1"))
+                }
+                Observation::Foreign => Some((point, "/dev/disk99s1")),
+                Observation::Absent => None,
+                Observation::Unreadable => {
+                    self.mounts.unreadable.store(true, Ordering::SeqCst);
+                    None
+                }
+            };
+            *rows = row
+                .into_iter()
+                .map(|(point, device)| KernelMountSnapshot::new(1, point, device, true, true))
+                .collect();
+            Ok(match self.completion {
+                Completion::Mount => output,
+                Completion::InProgress(_) => already_in_progress(),
+                Completion::OtherFailure => CommandOutput {
+                    status: ProcessStatus::Exit(1),
+                    stdout: Vec::new(),
+                    stderr: b"injected unrelated mount failure\n".to_vec(),
+                },
+            })
+        }
+
+        fn image_lease(&self, identity: &Path) -> std::io::Result<Option<Fenced<std::fs::File>>> {
+            if self.lease_calls.fetch_add(1, Ordering::SeqCst) == 1 {
+                if let Some(gate) = &self.gate {
+                    gate.waiting.send(()).unwrap();
+                    gate.resume.lock().unwrap().recv().unwrap();
+                }
+            }
+            SystemCommandRunner.image_lease(identity)
+        }
+        fn pin_raw_device(&self, _: &Path) -> std::io::Result<Option<Fenced<std::fs::File>>> {
+            Ok(None)
+        }
+        fn attached_disk_images(&self) -> std::io::Result<Vec<AttachedDiskImage>> {
+            self.recorded.attached_disk_images()
+        }
+        fn grow_image(&self, image: &Path, capacity: ImageCapacity) -> std::io::Result<()> {
+            self.recorded.grow_image(image, capacity)
+        }
+    }
+
+    fn runner(recorded: &RecordingRunner, mounts: &Mounts, completion: Completion) -> Runner {
+        Runner {
+            recorded: recorded.clone(),
+            mounts: mounts.clone(),
+            completion,
+            lease_calls: AtomicUsize::new(0),
+            gate: None,
+        }
+    }
+
+    fn build(fixture: &Fixture, recorded: &RecordingRunner) -> (BuildVolumeLayout, BuildVolumeId) {
+        let storage = StorageLayout::new(&fixture.root, &repo()).unwrap();
+        let layout = BuildVolumeLayout::new(storage.project()).unwrap();
+        let id = BuildVolumeId::mint();
+        let image = layout.image(&id);
+        std::fs::create_dir_all(image.parent().unwrap()).unwrap();
+        std::fs::write(&image, b"ordinary file, never a real attached image").unwrap();
+        attach(recorded, &image);
+        (layout, id)
+    }
+
+    fn mount_commands(recorded: &RecordingRunner) -> usize {
+        recorded
+            .requests()
+            .iter()
+            .filter(|request| request.program == Path::new("/sbin/mount_apfs"))
+            .count()
+    }
+
+    #[test]
+    fn two_mounters_reobserve_after_the_second_image_lease() {
+        let fixture = Fixture::new("two-build-mounters");
+        let recorded = RecordingRunner::default();
+        let mounts = Mounts::default();
+        let (layout, id) = build(&fixture, &recorded);
+        let (waiting, waited) = mpsc::sync_channel(1);
+        let (resume, resumed) = mpsc::sync_channel(1);
+        let mut loser = runner(&recorded, &mounts, Completion::Mount);
+        loser.gate = Some(LeaseGate {
+            waiting,
+            resume: Mutex::new(resumed),
+        });
+        std::thread::scope(|scope| {
+            let config = fixture.config();
+            let loser_mounts = mounts.clone();
+            let layout = &layout;
+            let id = &id;
+            let loser = scope.spawn(move || {
+                MacOsApfsExecutionHost::with_mount_source(loser, config, loser_mounts)
+                    .unwrap()
+                    .mount_build_volume(layout, id)
+            });
+            waited
+                .recv_timeout(Duration::from_secs(5))
+                .expect("loser reached its second image lease");
+            let winner = MacOsApfsExecutionHost::with_mount_source(
+                runner(&recorded, &mounts, Completion::Mount),
+                fixture.config(),
+                mounts.clone(),
+            )
+            .unwrap()
+            .mount_build_volume(layout, id);
+            resume.send(()).unwrap();
+            let loser = loser.join().unwrap();
+            assert_eq!(winner.expect("winner mounts"), layout.mount(id));
+            assert_eq!(
+                loser.expect("loser adopts the winner under the reacquired lease"),
+                layout.mount(id)
+            );
+        });
+        assert_eq!(
+            mount_commands(&recorded),
+            1,
+            "no second mount and no blind retry"
+        );
+    }
+
+    #[test]
+    fn an_in_progress_mount_is_adopted_only_after_its_expected_mount_is_observed() {
+        let fixture = Fixture::new("in-progress-build-mount");
+        let recorded = RecordingRunner::default();
+        let mounts = Mounts::default();
+        let (layout, id) = build(&fixture, &recorded);
+        let host = MacOsApfsExecutionHost::with_mount_source(
+            runner(
+                &recorded,
+                &mounts,
+                Completion::InProgress(Observation::Expected),
+            ),
+            fixture.config(),
+            mounts,
+        )
+        .unwrap();
+        assert_eq!(
+            host.mount_build_volume(&layout, &id)
+                .expect("adopt observed mount"),
+            layout.mount(&id)
+        );
+        assert_eq!(mount_commands(&recorded), 1);
+    }
+
+    #[test]
+    fn an_in_progress_mount_without_the_expected_identity_is_refused_without_retry() {
+        for observation in [
+            Observation::Elsewhere,
+            Observation::Foreign,
+            Observation::Absent,
+            Observation::Unreadable,
+        ] {
+            let fixture = Fixture::new("refused-build-mount");
+            let recorded = RecordingRunner::default();
+            let mounts = Mounts::default();
+            let (layout, id) = build(&fixture, &recorded);
+            let host = MacOsApfsExecutionHost::with_mount_source(
+                runner(&recorded, &mounts, Completion::InProgress(observation)),
+                fixture.config(),
+                mounts,
+            )
+            .unwrap();
+            let error = host
+                .mount_build_volume(&layout, &id)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains(layout.image(&id).to_str().unwrap()),
+                "{error}"
+            );
+            assert!(error.contains("/dev/disk10s1"), "{error}");
+            assert!(
+                error.contains(layout.mount(&id).to_str().unwrap()),
+                "{error}"
+            );
+            assert!(error.contains("Operation already in progress"), "{error}");
+            assert_eq!(mount_commands(&recorded), 1);
+        }
+    }
+
+    #[test]
+    fn an_unrelated_mount_failure_is_not_adopted_even_if_the_mount_appears() {
+        let fixture = Fixture::new("other-build-mount-failure");
+        let recorded = RecordingRunner::default();
+        let mounts = Mounts::default();
+        let (layout, id) = build(&fixture, &recorded);
+        let host = MacOsApfsExecutionHost::with_mount_source(
+            runner(&recorded, &mounts, Completion::OtherFailure),
+            fixture.config(),
+            mounts,
+        )
+        .unwrap();
+        let error = host
+            .mount_build_volume(&layout, &id)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("injected unrelated mount failure"),
+            "{error}"
+        );
+        assert_eq!(mount_commands(&recorded), 1);
+    }
+}
