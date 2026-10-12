@@ -1125,6 +1125,51 @@ impl Serves<JobListeningPortsRead> for JobHandle {
     }
 }
 
+impl Serves<JobProcesses> for JobHandle {
+    const BOUND: &'static [&'static str] =
+        &["repoId", "workspace", "workspaceIncarnation", "jobId"];
+
+    fn request(
+        authority: &<Self as Binder>::Fields<'_>,
+        arguments: Arguments,
+    ) -> Result<JobRequest> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Caller {}
+        let Caller {} = decode::<JobProcesses, Caller>(arguments)?;
+        Ok(JobRequest {
+            repo_id: owned(authority.repo_id),
+            workspace: owned(authority.workspace),
+            workspace_incarnation: owned(authority.workspace_incarnation),
+            job_id: owned(authority.job_id),
+        })
+    }
+}
+
+impl Serves<JobProcessEvents> for JobHandle {
+    const BOUND: &'static [&'static str] =
+        &["repoId", "workspace", "workspaceIncarnation", "jobId"];
+
+    fn request(
+        authority: &<Self as Binder>::Fields<'_>,
+        arguments: Arguments,
+    ) -> Result<ProgressRequest> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Caller {
+            every_ms: SampleInterval,
+        }
+        let Caller { every_ms } = decode::<JobProcessEvents, Caller>(arguments)?;
+        Ok(ProgressRequest {
+            repo_id: owned(authority.repo_id),
+            workspace: owned(authority.workspace),
+            workspace_incarnation: owned(authority.workspace_incarnation),
+            job_id: owned(authority.job_id),
+            every_ms,
+        })
+    }
+}
+
 impl Serves<JobProgress> for JobHandle {
     const BOUND: &'static [&'static str] =
         &["repoId", "workspace", "workspaceIncarnation", "jobId"];
@@ -1326,6 +1371,8 @@ pub(crate) fn each_served(
     check.served::<JobLogs, _>(job_handle, &[]);
     check.served::<JobTailRead, _>(job_handle, &[]);
     check.served::<JobListeningPortsRead, _>(job_handle, &[]);
+    check.served::<JobProcesses, _>(job_handle, &[]);
+    check.served::<JobProcessEvents, _>(job_handle, &[]);
     check.served::<JobProgress, _>(job_handle, &[]);
     check.served::<JobAttachWrite, _>(job_handle, &[]);
     check.served::<JobAttachClose, _>(job_handle, &[]);

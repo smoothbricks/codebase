@@ -3011,18 +3011,25 @@ async fn host_controller_process_observations_survive_a_subscriber_drop() {
     assert!(tree.processes[0].exit.is_none());
     assert_eq!(tree.coverage, ProcessCoverage::Complete);
 
-    let napi_tree: JobProcessTree =
-        napi_job_read(&jobs, &root, job.id(), "await job.processes()").await;
-    assert_eq!(napi_tree.processes[0].pid, pid);
-    assert_eq!(napi_tree.processes[0].program, "/bin/cat");
-    assert_eq!(napi_tree.processes[0].born_at, tree.processes[0].born_at);
-    let dropped: Vec<JobProcessEvent> = napi_job_read(
+    // Exercise both rows independently, so an absent tree method cannot hide an absent stream
+    // method in the prebuilt SDK RED. Rejections are proof output, never successful fallback reads.
+    let reads: Vec<Value> = napi_job_read(
         &jobs,
         &root,
         job.id(),
-        "await (async () => { const rows = []; for await (const row of job.processEvents(20)) { rows.push(row); break; } return rows; })()",
+        "await Promise.allSettled([Promise.resolve().then(() => job.processes()), Promise.resolve().then(async () => { const rows = []; for await (const row of job.processEvents(20)) { rows.push(row); break; } return rows; })]).then(rows => rows.map(row => row.status === 'fulfilled' ? row : { status: row.status, reason: String(row.reason) }))",
     )
     .await;
+    assert_eq!(reads.len(), 2, "{reads:?}");
+    assert!(
+        reads.iter().all(|read| read["status"] == "fulfilled"),
+        "both native SDK observations must succeed: {reads:?}"
+    );
+    let napi_tree: JobProcessTree = serde_json::from_value(reads[0]["value"].clone()).unwrap();
+    let dropped: Vec<JobProcessEvent> = serde_json::from_value(reads[1]["value"].clone()).unwrap();
+    assert_eq!(napi_tree.processes[0].pid, pid);
+    assert_eq!(napi_tree.processes[0].program, "/bin/cat");
+    assert_eq!(napi_tree.processes[0].born_at, tree.processes[0].born_at);
     assert!(
         matches!(&dropped[..], [JobProcessEvent::Born { index: 0, process }] if process.pid == pid)
     );

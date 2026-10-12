@@ -89,6 +89,8 @@ export interface NativeJobHandleOperations
     NativeJobLogs,
     NativeJobTail,
     NativeJobListeningPorts,
+    NativeJobProcesses,
+    NativeJobProcessEvents,
     NativeJobProgress,
     NativeJobAttachWrite,
     NativeJobAttachClose,
@@ -670,6 +672,42 @@ export async function jobLogs(
 ): Promise<Api.LogsChunk & { readonly bytes: Uint8Array }> {
   const answer = await handle.logs(JSON.stringify(args));
   return { ...V.parseLogsChunk(answer.json), bytes: answer.bytes };
+}
+
+/** A handle that serves `job.processEvents`. */
+export interface NativeJobProcessEvents {
+  processEvents(argumentsJson: string): Promise<NativeEvents>;
+}
+
+/** The request fields a `job.processEvents` caller names; its handle binds the rest. */
+export type JobProcessEventsArguments = Pick<Api.ProgressRequest, 'everyMs'>;
+
+/**
+ * Streams ordered retained process transitions and the first coverage gap, without coalescing.
+ */
+export function jobProcessEvents(
+  handle: NativeJobProcessEvents,
+  args: JobProcessEventsArguments,
+): EventIterator<Api.JobProcessEvent> {
+  return eventIterator(() => handle.processEvents(JSON.stringify(args)), V.parseJobProcessEvent);
+}
+
+/** A handle that serves `job.processes`. */
+export interface NativeJobProcesses {
+  processes(argumentsJson: string): Promise<string>;
+}
+
+/** The request fields a `job.processes` caller names; its handle binds the rest. */
+export type JobProcessesArguments = Readonly<Record<string, never>>;
+
+/**
+ * Reads the retained native process tree with its absorbing coverage evidence.
+ */
+export async function jobProcesses(
+  handle: NativeJobProcesses,
+  args: JobProcessesArguments,
+): Promise<Api.JobProcessTree> {
+  return V.parseJobProcessTree(await handle.processes(JSON.stringify(args)));
 }
 
 /** A handle that serves `job.progress`. */

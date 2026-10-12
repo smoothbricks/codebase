@@ -455,6 +455,22 @@ impl JobHandle {
         )
     }
 
+    /// Reads the retained native process tree with its absorbing coverage evidence.
+    #[napi(js_name = "processes")]
+    pub fn processes(&self, env: Env, arguments: String) -> napi::Result<JsObject> {
+        super::json_call::<operations::JobProcesses, _>(env, Arc::clone(&self.inner), arguments)
+    }
+
+    /// Streams ordered retained process transitions and the first coverage gap, without coalescing.
+    #[napi(js_name = "processEvents")]
+    pub fn process_events(&self, env: Env, arguments: String) -> napi::Result<JsObject> {
+        super::stream_call::<operations::JobProcessEvents, _>(
+            env,
+            Arc::clone(&self.inner),
+            arguments,
+        )
+    }
+
     /// Streams one job's resource samples: the latest at once, one every interval while it runs,
     /// then its terminal sample once.
     #[napi(js_name = "progress")]
