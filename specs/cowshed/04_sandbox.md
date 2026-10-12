@@ -338,18 +338,15 @@ Notes:
   must match the deny's specificity. It is not expressible as a read/write grant for exactly that reason: a grant
   intersecting an effective deny is refused. It is controller-owned, carried by the workspaces that asked for the mode,
   and never implied by the baseline — main's working tree is no more reachable than any other workspace's.
-- **Controller Git is separately confined.** Controller Git never runs with its cwd or config inside a workspace
-  unsandboxed, on any platform. Host-side checkout Git disables hooks, fsmonitor and commit signing regardless of
-  repository config, and forces off `core.sshCommand`, `credential.helper` and `core.askPass`, so a workspace-writable
-  `.git/config` names no program the controller runs. Rebase, land and fetch run under the controller Git sandbox: on
-  macOS the GitDiscovery profile, on Linux the Landlock controller Git sandbox with the same write boundary. The target
-  checkout is writable, and any source checkout it must read is supplied by the controller, not a URL found in
-  `.git/config`. Linked-worktree Git can write the shared `.git` only when its reverse registration points back to this
-  workspace. Repository filters and merge drivers run within this narrower write boundary. A platform without the
-  controller Git sandbox refuses those verbs with a typed error; it never runs them unsandboxed. The object-only bundle
-  create/verify/fetch verbs access controller-owned bundle files in the denied store; they run host-side with hooks and
-  fsmonitor disabled, without checkout, configured remotes or merge/filter execution. The store is not made readable to
-  a workspace Git sandbox.
+- **Controller Git is separately confined on macOS.** Host-side checkout Git disables hooks, fsmonitor and commit
+  signing regardless of repository config on every platform. On macOS, rebase, land and fetch use the GitDiscovery
+  profile: the target checkout is writable, and any source checkout it must read is supplied by the controller, not a
+  URL found in `.git/config`. Linked-worktree Git can write the shared `.git` only when its reverse registration points
+  back to this workspace. Repository filters and merge drivers run within this narrower write boundary on macOS; Linux
+  currently has the hardened Git flags but no controller Git sandbox. The object-only bundle create/verify/fetch verbs
+  access controller-owned bundle files in the denied store; they run host-side with hooks and fsmonitor disabled,
+  without checkout, configured remotes or merge/filter execution. The store is not made readable to a workspace Git
+  sandbox.
 - **Effective denies are monotonic.** `repo_id` is the machine-independent lowercase `owner/repo` normalized from a
   chosen remote URL. The binding records that remote and validates the identifier against it; multiple bound identities
   may exist but exactly one is primary. A local-only repository requires an explicit `repo_id`, and discovery may
@@ -587,21 +584,20 @@ the certificate itself as an additive anchor; clients that read exactly one CA f
 Linux) followed by the workspace CA — so an opaque tunnel, which presents the real upstream certificate, still verifies.
 A caller that sets one of these variables itself keeps it, and the exec says so on stderr.
 
-| Tool family  | Anchor                                                                                                                                                                                                                                                                                                                                             |
-| ------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Node / Bun   | `NODE_EXTRA_CA_CERTS` = the workspace CA certificate                                                                                                                                                                                                                                                                                               |
-| git          | `GIT_SSL_CAINFO` = the trust bundle                                                                                                                                                                                                                                                                                                                |
-| cargo        | `CARGO_HTTP_CAINFO` = the trust bundle (cargo's environment spelling of `http.cainfo`; there is no per-workspace cargo config — 03_caches.md)                                                                                                                                                                                                      |
-| nix          | `NIX_SSL_CERT_FILE` = the trust bundle, and `ssl-cert-file = <bundle>` appended to `NIX_CONFIG`: a host `nix.conf` naming its own `ssl-cert-file` outranks `NIX_SSL_CERT_FILE` (measured on Determinate Nix 2.35), and `NIX_CONFIG` outranks it                                                                                                    |
-| OpenSSL, uv  | `SSL_CERT_FILE` = the trust bundle, and `UV_SYSTEM_CERTS=true`: uv verifies against its own bundled roots unless told to use the platform's, and then takes `SSL_CERT_FILE` as that bundle (measured on uv 0.12.5: `uv sync` against intercepted `files.pythonhosted.org` fails `UnknownIssuer` with `SSL_CERT_FILE` alone and verifies with both) |
-| JVM (gradle) | a per-workspace PKCS12 truststore cowshed generates in-image                                                                                                                                                                                                                                                                                       |
+| Tool family | Anchor                                                                                                                                                                                                                                                                                                                                             |
+| ----------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Node / Bun  | `NODE_EXTRA_CA_CERTS` = the workspace CA certificate                                                                                                                                                                                                                                                                                               |
+| git         | `GIT_SSL_CAINFO` = the trust bundle                                                                                                                                                                                                                                                                                                                |
+| cargo       | `CARGO_HTTP_CAINFO` = the trust bundle (cargo's environment spelling of `http.cainfo`; there is no per-workspace cargo config — 03_caches.md)                                                                                                                                                                                                      |
+| nix         | `NIX_SSL_CERT_FILE` = the trust bundle, and `ssl-cert-file = <bundle>` appended to `NIX_CONFIG`: a host `nix.conf` naming its own `ssl-cert-file` outranks `NIX_SSL_CERT_FILE` (measured on Determinate Nix 2.35), and `NIX_CONFIG` outranks it                                                                                                    |
+| OpenSSL, uv | `SSL_CERT_FILE` = the trust bundle, and `UV_SYSTEM_CERTS=true`: uv verifies against its own bundled roots unless told to use the platform's, and then takes `SSL_CERT_FILE` as that bundle (measured on uv 0.12.5: `uv sync` against intercepted `files.pythonhosted.org` fails `UnknownIssuer` with `SSL_CERT_FILE` alone and verifies with both) |
 
 `SSL_CERT_FILE` names the trust bundle because the bundle is a superset of what the toolchain would otherwise point it
 at: the same platform roots, followed by the workspace CA. Every client that reads it therefore trusts everything it did
 before, and intercepted hosts as well. Shell activation runs after this environment is set, so a devenv shell whose
-activation exports its own `SSL_CERT_FILE` replaces it for that shell. Python requests (`REQUESTS_CA_BUNDLE`) and Deno
-(`DENO_CERT`) read anchors cowshed does not wire, so they verify an intercepted host only when their own configuration
-trusts the bundle.
+activation exports its own `SSL_CERT_FILE` replaces it for that shell. Python requests (`REQUESTS_CA_BUNDLE`), Deno
+(`DENO_CERT`) and the JVM read anchors cowshed does not wire, so they verify an intercepted host only when their own
+configuration trusts the bundle.
 
 **Known gaps** (documented, not silently broken):
 
@@ -788,9 +784,7 @@ build volume and the same socket directory, so it shares the record, daemon, tas
 Reaching the read-write daemon grants a read-only job nothing: the daemon computes the project graph, hashes and records
 task history from the checked-in plugins, which any read-write job would run anyway, and tasks themselves execute in the
 client under the client's own boundary. The supervisor binds `NX_WORKSPACE_ROOT_PATH` to the Nx project root: the
-workspace, or the capability's override directory. The managed shell publishes the same owner beside its socket
-override, so a wrapper entering another root discards that owner's state locations rather than sharing its daemon
-(`packages/nx-plugin/README.md`).
+workspace, or the capability's override directory.
 
 Build-volume write authority is a controller-only `build_volume_mount` selected for each job, not a filesystem grant in
 a repository's configuration or a path accepted from a job request. It names exactly one physical mount beneath the

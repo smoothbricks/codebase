@@ -28,7 +28,19 @@ requirements. The system optimizes each type appropriately rather than forcing t
 
 LMAO provides three distinct string types with different storage strategies optimized for different access patterns.
 
-#### Schema physicalization
+#### Shipped representation
+
+The shipped implementation does **not** intern strings on the warmed entry path. `CATEGORY` and `TEXT` columns store raw
+JS strings in `string[]`; dictionary construction and UTF-8 encoding occur during Arrow conversion. This describes the
+current Op-local implementation, not the clean-cutover target below.
+
+| Type         | Shipped entry storage  | Shipped Arrow conversion            | Semantic intent                 |
+| ------------ | ---------------------- | ----------------------------------- | ------------------------------- |
+| **ENUM**     | Numeric typed index    | Predefined dictionary               | Closed compile-time value set   |
+| **CATEGORY** | `string[]` raw strings | Sort/dedupe and encode              | Repeating runtime values        |
+| **TEXT**     | `string[]` raw strings | Conditional/raw string construction | High-cardinality runtime values |
+
+#### Target representation: schema physicalization
 
 At startup, a canonical log schema is lowered to an immutable `PhysicalLayoutPlan`. The plan fixes column order,
 physical widths and offsets, eager/lazy placement, null bitmaps, static message-index lanes, dynamic reference lanes,
@@ -41,16 +53,11 @@ both static-index and dynamic-reference lanes; `mixed` is not a callsite class.
 
 The schema type continues to describe semantics, not whether a particular value happened to be observed before:
 
-| Type         | Warmed entry storage                                        | Flush behavior                                     |
+| Type         | Target warmed entry storage                                 | Target flush behavior                              |
 | ------------ | ----------------------------------------------------------- | -------------------------------------------------- |
 | **ENUM**     | Fixed-width numeric index                                   | Reuse the plan's closed dictionary                 |
 | **CATEGORY** | Dynamic reference lane for runtime strings                  | Deduplicate/encode through reusable category state |
 | **TEXT**     | Dynamic reference lane preserving raw/high-cardinality data | Encode without CATEGORY identity semantics         |
-
-A dynamic reference lane is a plain JS array of string references (`string[]`, the column's `_values`). The warmed write
-stores the reference the producer already holds; it does not intern, look up vocabulary, or encode UTF-8. Dictionary
-building and UTF-8 encoding happen on the per-request flush
-([01b1](./01b1_buffer_performance_optimizations.md#string-interning-and-utf-8-caching-architecture)).
 
 Compiler-known message vocabulary is separate from user `CATEGORY`/`TEXT` columns. Checker-proven literal operational
 templates use `kindTag = 1` (`LOG_TEMPLATE`), and checker-proven literal span names use `kindTag = 2` (`SPAN_NAME`);
@@ -67,18 +74,18 @@ This division is normative:
   remain inputs, never borrowed Arrow storage. Its returned `VocabularyBinding` maps `binding[ordinal]` directly to a
   process-dense Arrow index.
 - Dense indices are process-local and append-only by fragment registration order. A new immutable generation preserves
-  the prior generation as an unchanged prefix and appends unseen decoded values, keeping old bindings prefix-valid. Ids
-  and decoded values are deterministic, but dense indices and dictionary order are not cross-process guarantees. Index
-  `0` is valid; null is represented by the Arrow validity bitmap.
-- The warmed entry write performs fixed monomorphic stores and allocates nothing while capacity remains. Startup, span
-  setup, overflow/slow path, and per-request flush have separate allocation budgets.
+  the prior generation as an unchanged prefix and appends unseen decoded values, keeping old bindings prefix-valid.
+  Stable IDs and decoded values are deterministic, but dense indices and dictionary order are not cross-process
+  guarantees. Index `0` is valid; null is represented by the Arrow validity bitmap.
+- The target warmed entry write performs fixed monomorphic stores and allocates nothing while capacity remains. Startup,
+  span setup, overflow/slow path, and per-request flush have separate allocation budgets.
 - Per-request flush reuses the `PhysicalLayoutPlan`, backend class, vocabulary binding, dictionary generation, scratch
-  arenas, and Arrow-compatible views, and makes few or no allocations; an `ArrowLease` pins runtime-owned storage and
-  the exact immutable dictionary generation until release, never a caller's mutable fragment arrays.
+  arenas, and Arrow-compatible views. The target is few or no allocations; an `ArrowLease` pins runtime-owned storage
+  and the exact immutable dictionary generation until release, never a caller's mutable fragment arrays.
 
 See
 **[Buffer Performance Optimizations](./01b1_buffer_performance_optimizations.md#string-interning-and-utf-8-caching-architecture)**
-for the conversion path and its optimizations.
+for the shipped conversion path and optimization roadmap.
 
 ### String Type Decision Matrix <a id="smoo/lmao!n/schema-string-types.matrix"></a>
 
@@ -109,24 +116,28 @@ uuid: S.text(); // UUIDs are unique by definition
 
 ```typescript
 // Define a log schema, then wire it into an op context.
-const httpSchema = defineLogSchema({
-  requestId: S.category(),
-  userId: S.category().mask('hash'),
-  timestamp: S.number(),
-  status: S.number(),
-  method: S.enum(['GET', 'POST', 'PUT', 'DELETE']),
-  endpoint: S.category(),
-  errorMessage: S.text(),
-});
-
-const httpContext = defineOpContext({
-  logSchema: httpSchema,
+// (Implemented API — see "Implementation status" below. The illustrative
+// `defineModule(...).ctx<Extra>().make()` form below predates the shipped
+// `defineLogSchema` + `defineOpContext` surface.)
+const httpModule = defineModule({
+  metadata: { packageName: '@mycompany/http', packagePath: 'src/index.ts', gitSha: 'abc123' },
+  logSchema: {
+    requestId: S.category(),
+    userId: S.category().mask('hash'),
+    timestamp: S.number(),
+    status: S.number(),
+    method: S.enum(['GET', 'POST', 'PUT', 'DELETE']),
+    endpoint: S.category(),
+    errorMessage: S.text(),
+  },
   deps: { db: dbModule },
-  flags: defineFeatureFlags({ premium: S.boolean().default(false).sync() }).schema,
-  ctx: { env: null as WorkerEnv, requestId: null as string },
-});
-
-const { defineOp, defineOps } = httpContext;
+  ff: { premium: ff.boolean() },
+})
+  .ctx<{ env: WorkerEnv; requestId: string }>({
+    env: null!,
+    requestId: null!,
+  })
+  .make();
 ```
 
 **Why This Design**:
@@ -136,24 +147,22 @@ const { defineOp, defineOps } = httpContext;
 - **Masking rules**: Sensitive data automatically masked during serialization
 - **Columnar storage**: Schema drives efficient TypedArray column generation
 
-The schema DSL (`S.enum/category/text/number/boolean`, plus `S.binary/unknown/object` for msgpack columns and
-`.mask(preset)` on category/text) is `packages/lmao/src/lib/schema/builder.ts`; `defineLogSchema()` (validation +
-inference + reserved-name guard) is `packages/lmao/src/lib/schema/defineLogSchema.ts`. The authoring surface is
-**`defineLogSchema(...)` + `defineOpContext({ logSchema, deps, flags, ctx })` → `{ defineOp, defineOps }`**
-(`packages/lmao/src/lib/defineOpContext.ts`). User context is the `ctx` config field (runtime defaults).
-
-`OpContextConfig` has no metadata key. Source attribution (`package_name`, `package_file`, `git_sha`, `line`) is per op:
-the build-time transformer fills the optional `metadata` argument of `defineOp(name, fn, metadata)`, and `defineOp`
-builds the op's `OpMetadata` from it (`packages/lmao/src/lib/opContext/defineOp.ts`). Without that argument, `defineOp`
-derives `package_file`, `line`, and a package name from the call-site stack frame and records `git_sha` as `'runtime'`.
+**Implementation status**: The schema DSL (`S.enum/category/text/number/boolean`, plus `S.binary/unknown/object` for
+msgpack columns and `.mask(preset)` on category/text) is `packages/lmao/src/lib/schema/builder.ts`; `defineLogSchema()`
+(validation + inference + reserved-name guard) is `packages/lmao/src/lib/schema/defineLogSchema.ts`. The shipped
+authoring surface is **`defineLogSchema(...)` + `defineOpContext({ logSchema, deps, flags, ctx })` →
+`{ defineOp, defineOps }`** (`packages/lmao/src/lib/defineOpContext.ts`), NOT `defineModule(...).ctx<Extra>().make()` as
+drawn above — user context is the `ctx` config field (runtime defaults), not a type-only `.ctx<Extra>()` method. The
+wholesale `defineModule` → `defineOpContext` rename across 01a/01g/01j is staged as the reconciliation node below.
 
 ## Feature Flag Schema Definition <a id="smoo/lmao!n/schema-feature-flags"></a>
 
 **Purpose**: Define feature flags with type-safe access and explicit analytics tracking.
 
-`defineFeatureFlags()` is `packages/lmao/src/lib/schema/defineFeatureFlags.ts`; the sync/async flag builder
-(`.default(v).sync()/.async()`) is on the schema DSL in `schema/builder.ts`. The evaluator is generated by
-`codegen/evaluatorGenerator.ts` and implemented in `schema/evaluator.ts`.
+> **Implementation status**: `defineFeatureFlags()` is `packages/lmao/src/lib/schema/defineFeatureFlags.ts`; the
+> sync/async flag builder (`.default(v).sync()/.async()`) is on the schema DSL in `schema/builder.ts`. The full
+> evaluator + `ff-access`/`ff-usage` analytics are specified in [01p](./01p_feature_flags.md) and realized in
+> `codegen/evaluatorGenerator.ts` / `schema/evaluator.ts`.
 
 See **[Feature Flags](./01p_feature_flags.md)** for the complete feature flag system specification, including:
 
@@ -186,10 +195,11 @@ const featureFlags = defineFeatureFlags({
 
 **Purpose**: Provide simple, fast access to deployment configuration without overhead.
 
-There is no dedicated env-config module, by design: a plain object is "just property access, no evaluator or tracking".
-The user-supplied object reaches ops through the `ctx` config field of `defineOpContext`
-(`packages/lmao/src/lib/defineOpContext.ts`), spread into `SpanContext` as user-extensible properties. Masking on logged
-values is the schema's `.mask(preset)` (`schema/builder.ts`), applied at Arrow-conversion time, not by an env layer.
+> **Implementation status**: There is no dedicated env-config module — by design (a plain object is "just property
+> access, no evaluator or tracking"). In the shipped API the user-supplied object reaches ops through the `ctx` config
+> field of `defineOpContext` (`packages/lmao/src/lib/defineOpContext.ts`), spread into `SpanContext` as user-extensible
+> properties. Masking on logged values is the schema's `.mask(preset)` (`schema/builder.ts`), applied at
+> Arrow-conversion time, not by an env layer.
 
 ```typescript
 // Simple configuration object loaded at startup

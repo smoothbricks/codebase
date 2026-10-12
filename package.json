@@ -114,6 +114,20 @@
           "rustWorkspace",
           "lmaoGitRevision"
         ]
+      },
+      "attach-budget-check": {
+        "executor": "nx:run-commands",
+        "cache": false,
+        "inputs": [],
+        "outputs": [],
+        "dependsOn": [
+          "cargo-fetch"
+        ],
+        "//": "348 is the measured 158-case real-APFS lane's 307 image-without-mounting and 9 blank-RAW attaches, plus the fixed margin of 32. Measure it again whenever the lane's test set changes. Uncached: the gate reads the host's live attach pool, so a cached pass would be stale. inputs is explicitly empty: the gate outcome is runtime state; the serial group's own inputs keep the Rust closure hashed.",
+        "options": {
+          "command": "cargo --frozen run -q -p cowshed-core --bin attach-budget -- --need 348",
+          "cwd": "{workspaceRoot}"
+        }
       }
     },
     "name": "@smoothbricks/codebase"

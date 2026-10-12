@@ -456,29 +456,19 @@ fn missing_revision() -> CreateOptions {
 
 #[tokio::test]
 async fn a_create_interrupted_after_its_pending_clone_exists_still_resumes() {
-    // One adopted project proves both journal spellings (08_testing.md, "Host limit"): the
-    // current binary's `Mutating` create, and an older binary's `Prepared` one — binaries
-    // before the `Mutating` mark journaled every create `Prepared`, and its pending clone,
-    // not its phase, is what recovery decides on.
     let fixture = Fixture::new("mutating-create");
     let runtime = fixture.adopt().await;
-    for workspace in ["resumed", "legacy"] {
-        fixture.plant_workspace_branch(workspace);
-        fixture
-            .create(&runtime, workspace, CreateOptions::default())
-            .await
-            .expect_err("the clone's initializer refuses the inherited workspace branch");
-    }
+    fixture.plant_workspace_branch("resumed");
+
+    fixture
+        .create(&runtime, "resumed", CreateOptions::default())
+        .await
+        .expect_err("the clone's initializer refuses the inherited workspace branch");
     let record = fixture
         .intent("resumed")
         .expect("the intent stays journaled");
     assert_eq!(record.phase, LifecycleIntentPhase::Mutating);
     assert_eq!(record.completion, None);
-    fixture.strip_phase("legacy");
-    assert_eq!(
-        fixture.intent("legacy").expect("legacy intent").phase,
-        LifecycleIntentPhase::Prepared
-    );
     assert_eq!(fixture.listed(&runtime).await, ["main"]);
     runtime
         .shutdown()
@@ -486,9 +476,36 @@ async fn a_create_interrupted_after_its_pending_clone_exists_still_resumes() {
         .expect("stop the interrupted runtime");
 
     let gc = fixture.gc().await;
-    assert_eq!(fixture.listed(&gc).await, ["legacy", "main", "resumed"]);
+    assert_eq!(fixture.listed(&gc).await, ["main", "resumed"]);
     assert!(completed(fixture.intent("resumed")));
-    assert!(completed(fixture.intent("legacy")));
+    gc.shutdown().await.expect("stop gc");
+}
+
+/// Binaries before the `Mutating` mark journaled every create `Prepared`. Its pending clone,
+/// not its phase, is what recovery decides on.
+#[tokio::test]
+async fn an_older_binarys_prepared_create_with_a_pending_clone_still_resumes() {
+    let fixture = Fixture::new("legacy-create");
+    let runtime = fixture.adopt().await;
+    fixture.plant_workspace_branch("resumed");
+
+    fixture
+        .create(&runtime, "resumed", CreateOptions::default())
+        .await
+        .expect_err("the clone's initializer refuses the inherited workspace branch");
+    runtime
+        .shutdown()
+        .await
+        .expect("stop the interrupted runtime");
+    fixture.strip_phase("resumed");
+    assert_eq!(
+        fixture.intent("resumed").expect("legacy intent").phase,
+        LifecycleIntentPhase::Prepared
+    );
+
+    let gc = fixture.gc().await;
+    assert_eq!(fixture.listed(&gc).await, ["main", "resumed"]);
+    assert!(completed(fixture.intent("resumed")));
     gc.shutdown().await.expect("stop gc");
 }
 
@@ -540,10 +557,7 @@ async fn a_slot_bound_create_that_fails_after_binding_is_kept_and_resumed() {
 /// The residue an unchecked `--ref` left: a create past its mutation fence whose pending
 /// clone exists, and whose every replay fails. Here the clone stopped on a link it cannot
 /// restore, and its record carries the missing revision as the incident's did. `rm` retires
-/// the clone instead of replaying it, and the name is free again. The same unreplayable
-/// create with no clone behind it — stopped after its mutation mark, before the clone's
-/// first write — is the second workspace here: `rm` has only the intent to retire, and
-/// retires it. One adopted project proves both (08_testing.md, "Host limit").
+/// the clone instead of replaying it, and the name is free again.
 #[tokio::test]
 async fn rm_retires_a_pending_clone_whose_create_can_never_be_replayed() {
     let fixture = Fixture::new("unreplayable-clone");
@@ -558,7 +572,6 @@ async fn rm_retires_a_pending_clone_whose_create_can_never_be_replayed() {
         .await
         .expect("stop the interrupted runtime");
     fixture.journal_unreplayable_create("wedged");
-    fixture.journal_unreplayable_create("stranded");
 
     let rm = fixture
         .open_removing("wedged")
@@ -572,39 +585,53 @@ async fn rm_retires_a_pending_clone_whose_create_can_never_be_replayed() {
     rm.shutdown().await.expect("stop the removing runtime");
     fixture.remove_escaping_link();
 
-    let rm = fixture
-        .open_removing("stranded")
+    let next = fixture
+        .open_naming("wedged")
         .await
-        .expect("`rm stranded` opens without replaying the create");
+        .expect("`new wedged` opens: the retired create is not replayed");
     fixture
-        .remove(&rm, "stranded")
+        .create(&next, "wedged", CreateOptions::default())
+        .await
+        .expect("the name is free again");
+    assert_eq!(fixture.listed(&next).await, ["main", "wedged"]);
+    next.shutdown().await.expect("stop the creating runtime");
+}
+
+/// The same unreplayable create with no clone behind it — stopped after its mutation mark,
+/// before the clone's first write. `rm` has only the intent to retire, and retires it.
+#[tokio::test]
+async fn rm_retires_a_clone_intent_that_left_no_clone_and_can_never_be_replayed() {
+    let fixture = Fixture::new("unreplayable-intent");
+    let runtime = fixture.adopt().await;
+    runtime.shutdown().await.expect("stop the adopting runtime");
+    fixture.journal_unreplayable_create("wedged");
+
+    let rm = fixture
+        .open_removing("wedged")
+        .await
+        .expect("`rm wedged` opens without replaying the create");
+    fixture
+        .remove(&rm, "wedged")
         .await
         .expect("rm retires the bare intent");
     assert!(matches!(
         fixture
-            .intent("stranded")
+            .intent("wedged")
             .and_then(|record| record.completion),
         Some(LifecycleIntentCompletion::Retire(_))
     ));
     rm.shutdown().await.expect("stop the removing runtime");
 
-    for workspace in ["wedged", "stranded"] {
-        let next = fixture
-            .open_naming(workspace)
-            .await
-            .expect("`new` opens: the retired create is not replayed");
-        fixture
-            .create(&next, workspace, CreateOptions::default())
-            .await
-            .expect("the name is free again");
-        next.shutdown().await.expect("stop the creating runtime");
-    }
-    let listed = fixture.gc().await;
-    assert_eq!(
-        fixture.listed(&listed).await,
-        ["main", "stranded", "wedged"]
-    );
-    listed.shutdown().await.expect("stop gc");
+    let next = fixture
+        .open_naming("wedged")
+        .await
+        .expect("`new wedged` opens: the retired create is not replayed");
+    fixture
+        .create(&next, "wedged", CreateOptions::default())
+        .await
+        .expect("the name is free again");
+    assert_eq!(fixture.listed(&next).await, ["main", "wedged"]);
+    next.shutdown().await.expect("stop the creating runtime");
 }
 
 /// The kernel claim on a new workspace's port block lasts until its image publication is

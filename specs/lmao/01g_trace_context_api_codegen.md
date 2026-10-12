@@ -15,7 +15,7 @@ property-based APIs.
 **Core Principles**:
 
 - **Unified backend**: All entry types use the same generated column writers
-- **Dual API patterns**: Support both `tag.with({ key: value })` and `tag.key(value)`
+- **Dual API patterns**: Support both `tag({ key: value })` and `tag.key(value)`
 - **Zero runtime overhead**: All expensive work happens at op definition time
 - **Type safety**: Full TypeScript support with schema-driven types
 - **Destructured context**: Context properties available via destructuring in op signatures
@@ -25,7 +25,7 @@ property-based APIs.
 The context is destructured directly in op signatures, eliminating `ctx.<field>` drilling:
 
 ```typescript
-const GET = defineOp('GET', async ({ span, log, tag, deps, ff, env, scope, setScope }, url: string) => {
+const GET = op(async ({ span, log, tag, deps, ff, env, scope }, url: string) => {
   // All context properties available via destructuring
 
   // Logging
@@ -35,7 +35,7 @@ const GET = defineOp('GET', async ({ span, log, tag, deps, ff, env, scope, setSc
   tag.method('GET').url(url);
 
   // Scope (propagates to all entries)
-  setScope({ requestId: req.id });
+  scope({ requestId: req.id });
 
   // Feature flags
   const { premiumFeatures } = ff;
@@ -65,10 +65,15 @@ const GET = defineOp('GET', async ({ span, log, tag, deps, ff, env, scope, setSc
 
 ## API Patterns <a id="smoo/lmao!n/codegen-architecture.api-patterns"></a>
 
+> **Implementation status**: Both the object `tag({...})` / `log.info().with({...})` form and the per-field
+> `tag.userId()` form are emitted by the same TagWriter/SpanLogger generators
+> (`codegen/fixedPositionWriterGenerator.ts`, `codegen/spanLoggerGenerator.ts`) — the dual API is the generated `with()`
+> method plus the per-field setters, not two separate backends.
+
 ### Object-Based API (Primary)
 
 ```typescript
-const processUser = defineOp('processUser', async ({ log, tag }, userData) => {
+const processUser = op(async ({ log, tag }, userData) => {
   // Console.log operations with optional structured data
   log.info('Starting user registration');
   log.info('User validation complete').with({ userId: '123', duration: 45.2 });
@@ -76,15 +81,15 @@ const processUser = defineOp('processUser', async ({ log, tag }, userData) => {
   log.error('Connection failed').with({ host: 'db.example.com', retries: 3 });
 
   // Tag operations with structured data
-  tag.with({ userId: '123', requestId: 'req_456' });
-  tag.with({ httpStatus: 200, duration: 45.2, cacheHit: true });
+  tag({ userId: '123', requestId: 'req_456' });
+  tag({ httpStatus: 200, duration: 45.2, cacheHit: true });
 });
 ```
 
 ### Property-Based API (Alternative)
 
 ```typescript
-const processUser = defineOp('processUser', async ({ tag }, userData) => {
+const processUser = op(async ({ tag }, userData) => {
   // Individual property setters (generated from schema)
   tag.userId('123');
   tag.httpStatus(200);
@@ -97,16 +102,17 @@ const processUser = defineOp('processUser', async ({ tag }, userData) => {
 
 ## Codegen Architecture <a id="smoo/lmao!n/codegen-architecture"></a>
 
-The runtime codegen lives in `packages/lmao/src/lib/codegen/`. `fixedPositionWriterGenerator.ts` generates the
-**TagWriter** (row 0) and **ResultWriter** (row 1) fluent setters — both the object-based `with({...})` and the
-per-field `tag.userId()` setters, with compile-time enum→index mapping, cached per schema (`WeakMap`). The TagWriter
-class is a source-authored constructor with schema-driven prototype methods and runs no `new Function()` under either
-materializer; the ResultWriter class is built via `new Function()` or the closure-composed materializer chosen by
-[01b6 Materializer Selection](./01b6_buffer_codegen_extension.md#smoo/lmao!n/buffer-codegen.materializer-selection).
-`spanLoggerGenerator.ts` generates the **SpanLogger** (rows 2+: info/debug/warn/error/trace + `with`) by extending
-arrow-builder's `ColumnWriter`, under the same selection. The entry-type-bound split in the prose below maps to:
-TagWriter (fixed row 0) vs SpanLogger (advancing rows) — not a per-entry-type class. The illustrative class names below
-(`TagAPI`/`LogAPI`) are `TagWriter`/`SpanLogger`.
+> **Implementation status**: The runtime codegen lives in `packages/lmao/src/lib/codegen/`.
+> `fixedPositionWriterGenerator.ts` generates the **TagWriter** (row 0) and **ResultWriter** (row 1) fluent setters —
+> both the object-based `with({...})` and the per-field `tag.userId()` setters, with compile-time enum→index mapping,
+> cached per schema (`WeakMap`). The TagWriter class is a source-authored constructor with schema-driven prototype
+> methods and runs no `new Function()` under either materializer; the ResultWriter class is built via `new Function()`
+> or the closure-composed materializer chosen by
+> [01b6 Materializer Selection](./01b6_buffer_codegen_extension.md#smoo/lmao!n/buffer-codegen.materializer-selection).
+> `spanLoggerGenerator.ts` generates the **SpanLogger** (rows 2+: info/debug/warn/error/trace + `with`) by extending
+> arrow-builder's `ColumnWriter`, under the same selection. The "entry-type-bound" split in the prose below maps to:
+> TagWriter (fixed row 0) vs SpanLogger (advancing rows) — not a per-entry-type class. The illustrative class names
+> below (`TagAPI`/`LogAPI`) are the shipped `TagWriter`/`SpanLogger`.
 
 ### 1. Schema-Driven Column Writers
 
@@ -137,51 +143,51 @@ Each entry type gets bound versions of the column writers:
 ```typescript
 // Generated for tag API - writes directly to row 0 (span-start row)
 // Note: tag does NOT create a separate entry type - it updates span-start attributes
-class TagWriter {
+class TagAPI {
   constructor(private buffer: SpanBuffer) {}
 
   // Object-based API - writes to row 0
-  with(attributes: Partial<HttpLibrarySchema>): this {
+  (attributes: Partial<HttpLibrarySchema>): this {
     for (const [key, value] of Object.entries(attributes)) {
-      this.buffer[`${key}_values`][0] = value; // Always row 0
+      this.buffer[`${key}_values`][0] = value;  // Always row 0
     }
     return this;
   }
 
   // Property-based API (generated for each schema property)
   httpStatus(value: number): this {
-    this.buffer.httpStatus_values[0] = value; // Always row 0
+    this.buffer.httpStatus_values[0] = value;  // Always row 0
     return this;
   }
 
   httpMethod(value: string): this {
-    this.buffer.httpMethod_values[0] = value; // Always row 0
+    this.buffer.httpMethod_values[0] = value;  // Always row 0
     return this;
   }
 
   // ... etc for all schema properties
 }
 
-class SpanLogger {
+class LogAPI {
   constructor(private buffer: SpanBuffer) {}
 
   // Console.log compatible with fluent .with() for attributes
-  info(message: string): FluentLogEntry {
+  info(message: string): FluentLog {
     this._writeLogEntry('info', message);
     return this;
   }
 
-  debug(message: string): FluentLogEntry {
+  debug(message: string): FluentLog {
     this._writeLogEntry('debug', message);
     return this;
   }
 
-  warn(message: string): FluentLogEntry {
+  warn(message: string): FluentLog {
     this._writeLogEntry('warn', message);
     return this;
   }
 
-  error(message: string): FluentLogEntry {
+  error(message: string): FluentLog {
     this._writeLogEntry('error', message);
     return this;
   }
@@ -200,77 +206,78 @@ class SpanLogger {
 The trace context assembles all entry type APIs for destructuring:
 
 ```typescript
-// Generated trace context (destructurable); full shape in 01c "SpanContext Interface"
-// Ctx['userCtx'] is spread in for user-defined fields (e.g., env with CF Worker bindings)
-type SpanContext<Ctx extends OpContext> = {
-  readonly tag: TagWriter<Ctx['logSchema']>;
-  readonly log: SpanLogger<Ctx['logSchema']>;
-  readonly scope: Readonly<Partial<InferSchema<Ctx['logSchema']>>>;
-  readonly span: SpanFn<Ctx>;
-  readonly deps: ResolvedDeps<Ctx['deps']>;
-  readonly ff: FeatureFlagEvaluator<Ctx> & InferFeatureFlagsWithContext<Ctx>;
-  readonly ok: <S>(value: S) => OkResult<S, Ctx['logSchema']>;
-  readonly err: <E>(error: E) => ErrResult<E, Ctx['logSchema']>;
-} & Ctx['userCtx'];
+// Generated trace context (destructurable)
+// Extra is spread in for user-defined fields (e.g., env with CF Worker bindings)
+type SpanContext<Schema, Deps, FF, Extra = {}> = {
+  readonly tag: TagAPI<Schema>;
+  readonly log: LogAPI<Schema>;
+  readonly scope: ScopeAPI<Schema>;
+  readonly span: SpanFn<SpanContext<Schema, Deps, FF, Extra>>;
+  readonly deps: Deps;
+  readonly ff: FeatureFlagEvaluator<FF>;
+  readonly ok: <V>(value: V) => FluentSuccessResult<V>;
+  readonly err: <E>(code: string, details?: E) => FluentErrorResult<E>;
+} & Extra;
 
 // Usage in op signature - destructure what you need
-const processUser = defineOp('processUser', async ({ log, tag, scope, span, ok, err }, userData) => {
+const processUser = op(async ({ log, tag, scope, span, ok, err }, userData) => {
   // Direct access to all context properties
 });
 ```
 
 ## Scope API Code Generation <a id="smoo/lmao!n/codegen-spanlogger.scope"></a>
 
-### _setScope() as Function (NOT stored in buffer columns)
+> **Implementation status**: Scope generation is in `spanLoggerGenerator.ts` (`generateSetScopeMethod` +
+> `generatePrefillScopedAttributesMethod`). Scope values live in `buffer._scopeValues` (a plain frozen object), separate
+> from TypedArray columns, matching the "NOT stored in buffer columns" pin. Two refinements over the prose below, per
+> [01i](./01i_span_scope_attributes.md): scope is **immutable** (`_setScope` builds a NEW frozen object; `null` clears a
+> key, `undefined` is ignored) and scope values are **filled at Arrow conversion / overflow-prefill time**
+> (`_prefillScopedAttributesOn`), not eagerly on set. The generated method is named `_setScope`, not a bare `scope()`
+> closure.
 
-The generated `_setScope()` method (`generateSetScopeMethod` in `packages/lmao/src/lib/codegen/spanLoggerGenerator.ts`)
-is **SEPARATE from buffer columns**. Scope values live in the span buffer's `_scopeValues`, an immutable frozen object,
-not in TypedArrays.
+### scope() as Function (NOT stored in buffer columns)
 
-Each call publishes a new snapshot:
+The `scope()` function is a `new Function()` compiled callable that is **SEPARATE from buffer columns**. Scope values
+are stored as plain JavaScript properties in the Scope instance, not in TypedArrays.
 
-1. **One frozen object per scope set** - `_setScope` copies the current `_scopeValues`, applies the update (`null`
-   deletes a key, `undefined` is ignored), freezes the result, and stores it. Scope sets are rare next to log entries,
-   so this allocation stays off the warmed write path.
-2. **Inheritance by reference** - a child buffer takes its parent's `_scopeValues` reference at construction. Snapshots
-   are immutable, so the child copies nothing, and a later `setScope` on the parent never changes what the child holds.
-3. **Fill at the edges** - Arrow conversion fills scope columns from `_scopeValues` for rows without a direct write, and
-   a new overflow buffer is pre-filled through `_prefillScopedAttributesOn(buffer)`.
+This separation enables:
+
+1. **Zero allocation on scope set** - just sets a property
+2. **SIMD pre-filling** - child spans can use TypedArray.fill() with parent scope values
+3. **Clean inheritance** - \_getScopeValues() extracts all values for copying to child spans
 
 ```typescript
-// Generated with the SpanLogger class (cold path)
-_setScope(attributes) {
-  const current = this._buffer._scopeValues || {};
-  const next = { ...current };
-  for (const key of Object.keys(attributes)) {
-    const value = attributes[key];
-    if (value === null) {
-      delete next[key];
-    } else if (value !== undefined) {
-      next[key] = value;
+// Generated at module creation time (cold path)
+function generateScopeFunction(schema: Schema): ScopeFunction {
+  // The scope function accepts an object of attributes
+  // and stores them for propagation to all entries
+
+  return function scope(attributes: Partial<Schema>) {
+    for (const [key, value] of Object.entries(attributes)) {
+      this._scopeValues[key] = value;
     }
-  }
-  this._buffer._scopeValues = Object.freeze(next);
+  };
 }
 
 // Example usage in op:
-const handleRequest = defineOp('handleRequest', async ({ setScope, log }, req) => {
+const handleRequest = op(async ({ scope, log }, req) => {
   // Set scoped attributes via function call
-  setScope({ requestId: req.id, userId: req.userId });
+  scope({ requestId: req.id, userId: req.userId });
 
   log.info('Processing'); // Includes requestId, userId
 });
 ```
 
-**Key Design Point**: `setScope` never writes buffer columns. Scope values reach buffer columns at Arrow conversion and
-when a new overflow buffer is pre-filled. See 01i_span_scope_attributes.md for the full scope lifecycle.
+**Key Design Point**: The Scope function does NOT reference the buffer at all. Scope values are applied to buffer
+columns during write operations or pre-fill operations, NOT stored in the buffer. See 01i_span_scope_attributes.md for
+the full scope lifecycle.
 
 ### Usage Pattern
 
 ```typescript
-const handleRequest = defineOp('handleRequest', async ({ setScope, log, span }, req) => {
-  // Setting scope values (publishes one frozen snapshot)
-  setScope({ userId: 'user-123', requestId: 'req-456' });
+const handleRequest = op(async ({ scope, log, span }, req) => {
+  // Setting scope values (no allocation)
+  scope({ userId: 'user-123', requestId: 'req-456' });
 
   // All log entries include scoped attributes
   log.info('Processing request'); // Includes userId, requestId
@@ -280,9 +287,9 @@ const handleRequest = defineOp('handleRequest', async ({ setScope, log, span }, 
 });
 
 // Child op - inherits scope from parent
-const processOrder = defineOp('processOrder', async ({ setScope, log }, order) => {
+const processOrder = op(async ({ scope, log }, order) => {
   // Inherited: userId, requestId from parent scope
-  setScope({ orderId: order.id }); // Add to scope
+  scope({ orderId: order.id }); // Add to scope
 
   log.info('Processing order'); // Includes userId, requestId, orderId
 });
@@ -290,13 +297,13 @@ const processOrder = defineOp('processOrder', async ({ setScope, log }, order) =
 
 ### Key Differences from tag
 
-| Aspect     | tag                                                                | scope                                        |
-| ---------- | ------------------------------------------------------------------ | -------------------------------------------- |
-| API Style  | Method calls: `tag.userId('123')` or `tag.with({ userId: '123' })` | Function call: `setScope({ userId: '123' })` |
-| Can Read   | No                                                                 | Yes (`ctx.scope`, read-only snapshot)        |
-| Allocates  | Yes (on first write)                                               | One frozen object per `setScope` call        |
-| Appears on | Row 0 only                                                         | ALL rows                                     |
-| Inherited  | No                                                                 | Yes                                          |
+| Aspect     | tag                                                           | scope                                     |
+| ---------- | ------------------------------------------------------------- | ----------------------------------------- |
+| API Style  | Method calls: `tag.userId('123')` or `tag({ userId: '123' })` | Function call: `scope({ userId: '123' })` |
+| Can Read   | No                                                            | No (write-only)                           |
+| Allocates  | Yes (on first write)                                          | No (first assignment)                     |
+| Appears on | Row 0 only                                                    | ALL rows                                  |
+| Inherited  | No                                                            | Yes                                       |
 
 ## Cold Path vs Hot Path Optimization
 
@@ -330,8 +337,8 @@ Zero overhead during op execution:
 
 ```typescript
 // Hot path: Direct property access and function calls
-const processUser = defineOp('processUser', async ({ tag, log }, userData) => {
-  tag.with({ userId: '123' }); // → Direct column write
+const processUser = op(async ({ tag, log }, userData) => {
+  tag({ userId: '123' }); // → Direct column write
   log.info('Processing user').with({ userId: '123' }); // → Direct column writes
 });
 ```
@@ -350,47 +357,52 @@ interface LibrarySchema {
 }
 
 // Generated TypeScript interfaces
-interface TagWriter<T> {
-  with(attributes: Partial<T>): TagWriter<T>;
+interface TagAPI<T> {
+  (attributes: Partial<T>): TagAPI<T>;
   userId(value: string): this;
   httpStatus(value: number): this;
   duration(value: number): this;
   cacheHit(value: boolean): this;
 }
 
-interface SpanLogger<T> {
-  info(message: string): FluentLogEntry<T>;
-  debug(message: string): FluentLogEntry<T>;
-  warn(message: string): FluentLogEntry<T>;
-  error(message: string): FluentLogEntry<T>;
+interface LogAPI<T> {
+  info(message: string): FluentLog<T>;
+  debug(message: string): FluentLog<T>;
+  warn(message: string): FluentLog<T>;
+  error(message: string): FluentLog<T>;
 }
 
-interface FluentLogEntry<T> {
-  with(attributes: Partial<T>): FluentLogEntry<T>;
+interface FluentLog<T> {
+  with(attributes: Partial<T>): FluentLog<T>;
 }
 ```
 
 ### Library Integration Pattern
 
-Libraries define their op context with `defineOpContext` and get fully typed APIs. Source attribution is per op: the
-transformer fills each `defineOp` call's metadata argument, so the context config has no metadata key.
+Libraries define their schema using `defineModule` and get fully typed APIs:
 
 > **See**: [Op Context Pattern](./01l_op_context_pattern.md) for the complete API design.
 
 ```typescript
-// Library defines its op context with an unprefixed logSchema
-const { defineOp, defineOps } = defineOpContext({
-  logSchema: defineLogSchema({
+// Library defines module with logSchema (unprefixed)
+const httpLib = defineModule({
+  metadata: { packageName: '@my-company/http', packagePath: 'src/index.ts', gitSha: 'abc123' },
+  logSchema: {
     status: S.number(),
     method: S.enum(['GET', 'POST', 'PUT', 'DELETE']),
     url: S.text(),
     duration: S.number(),
-  }),
-  ctx: { env: null as WorkerEnv },
-});
+  },
+  deps: {},
+  ff: {},
+})
+  .ctx<{ env: WorkerEnv }>({ env: null! })
+  .make();
+
+const { op } = httpLib;
 
 // Usage is fully typed - library uses clean names
-const apiCall = defineOp('apiCall', async ({ tag, log, ok }) => {
+export const apiCall = op(async ({ tag, log, ok }) => {
   // TypeScript knows these properties exist and their types
   tag.method('GET').url('https://api.example.com');
   log.info('Making API call');
@@ -398,11 +410,10 @@ const apiCall = defineOp('apiCall', async ({ tag, log, ok }) => {
   return ok({ success: true });
 });
 
-export const httpOps = defineOps({ apiCall });
-
-// Consumer applies the prefix in its own deps:
-// const { defineOp } = defineOpContext({ logSchema: appSchema, deps: { http: httpOps.prefix('http') } });
-// Result: the library's ops write to http_status, http_method, http_url, http_duration columns
+// Consumer applies prefix at use time:
+// const httpRoot = httpLib.prefix('http').use();
+// await apiCall(httpRoot);
+// Result: writes to http_status, http_method, http_url, http_duration columns
 ```
 
 ## Implementation Details
@@ -430,8 +441,8 @@ function generateColumnWriter(columnName: string, columnType: string): Function 
 
 ### Object API Implementation
 
-The object-based API (`tag.with({ … })`) is generated the same way — one `new Function()` body that fans the attribute
-keys out to the per-column writers:
+The object-based API (`tag({ … })`) is generated the same way — one `new Function()` body that fans the attribute keys
+out to the per-column writers:
 
 ```typescript
 function generateObjectAPI(schema: Schema): Function {
@@ -476,7 +487,7 @@ Feature flag entry types (`ff-access` and `ff-usage`) are handled automatically 
 internal methods on `SpanLogger`:
 
 ```typescript
-const processUser = defineOp('processUser', async ({ ff }, userData) => {
+const processUser = op(async ({ ff }, userData) => {
   // Clean user API - no logging methods exposed
   if (ff.advancedValidation) {
     // Internally creates ff-access entry via log.ffAccess()
@@ -550,7 +561,8 @@ ffAccess(flagName, value) {
     const strValue = value === null || value === undefined ? 'null' : String(value);
     this._buffer.ffValue_values[idx] = strValue;
   }
-  // No per-write stats update: completed rows reach stats.totalWrites when the buffer is sealed
+  // Track write for capacity tuning
+  this._buffer.module.sb_totalWrites++;
 }
 
 ffUsage(flagName, context) {
@@ -561,6 +573,7 @@ ffUsage(flagName, context) {
   if (this._buffer.message_values) {
     this._buffer.message_values[idx] = flagName;
   }
+  this._buffer.module.sb_totalWrites++;
   if (context) {
     this.with(context); // Apply to this ff-usage row
   }
@@ -609,19 +622,25 @@ This codegen system integrates with:
 
 ## uint64 Method Generation <a id="smoo/lmao!n/codegen-spanlogger.uint64"></a>
 
+> **Implementation status**: The `uint64_value(value: bigint)` fluent method is generated on SpanLogger in
+> `spanLoggerGenerator.ts` (lazy `BigUint64Array` column, null-bitmap tracked, writes at the current `_writeIndex`). The
+> shipped method name is **`uint64_value`** (matching the column), not bare `.uint64`. It is present on the log fluent
+> entry and the result writers; the spec's "TagAPI" row-0 case is the `uint64_value` column reachable via the same
+> generated setter surface.
+
 ### Overview
 
-The `uint64_value(value: bigint)` method is generated on:
+The `.uint64(value: bigint)` method is generated on:
 
-- **TagWriter** - for `tag.userId('123').uint64_value(n)`
-- **SpanLogger** - for `log.info('msg').uint64_value(n)`
-- **Result helpers** - for `ok().uint64_value(n)`, `err().uint64_value(n)`
+- **TagAPI** - for `tag.userId('123').uint64(n)`
+- **SpanLogger** - for `log.info('msg').uint64(n)`
+- **Result helpers** - for `ok().uint64(n)`, `err().uint64(n)`
 
 ### Generated Code Example
 
 ```typescript
-// Generated on TagWriter, SpanLogger, and result helpers
-uint64_value(value) {
+// Generated on TagAPI, SpanLogger, and result helpers
+uint64(value) {
   const idx = this._buffer._writeIndex - 1;  // Current entry
   this._buffer.uint64_value_nulls[Math.floor(idx / 8)] |= (1 << (idx % 8));
   this._buffer.uint64_value_values[idx] = value;
@@ -632,15 +651,15 @@ uint64_value(value) {
 ### Usage Examples
 
 ```typescript
-const processRecords = defineOp('processRecords', async ({ log, tag, ok }, records) => {
+const processRecords = op(async ({ log, tag, ok }, records) => {
   // Attach large integer to tag entry
-  tag.batchId(batchId).uint64_value(recordCount);
+  tag.batchId(batchId).uint64(recordCount);
 
   // Attach to log entry
-  log.info('Processing complete').uint64_value(bytesProcessed);
+  log.info('Processing complete').uint64(bytesProcessed);
 
   // Attach to result
-  return ok({ success: true }).uint64_value(totalRecords);
+  return ok({ success: true }).uint64(totalRecords);
 });
 ```
 
@@ -693,9 +712,9 @@ const createArrowVectors = (spanBuffer: SpanBuffer) => {
 };
 ```
 
-## Out of Scope
+## Deferred
 
-Out of scope for this codegen.
+Out of scope for this codegen; each is a flagged follow-up, not a silent stub.
 
 ### Dynamic Schema Updates
 

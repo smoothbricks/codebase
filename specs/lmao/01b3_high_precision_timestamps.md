@@ -9,18 +9,20 @@ The trace logging system uses a high-precision timestamp design that provides su
 overhead. The design captures a single time anchor at trace root creation, then uses high-resolution timers for all
 subsequent timestamps.
 
-The anchored-timestamp design is the `TraceRoot` **class** (`ITraceRoot` interface in
-`packages/lmao/src/lib/traceRoot.ts`), with two platform classes: `packages/lmao/src/lib/traceRoot.node.ts`
-(`process.hrtime.bigint()`, pure-JS writes) and `packages/lmao/src/lib/traceRoot.es.ts` (`performance.now()`). Each
-exposes `getTimestampNanos(): Nanoseconds`, the per-trace anchor (`anchorEpochNanos`, `anchorPerfNow`), and the
-span-start/span-end/log write methods. Anchors and `trace_id` live in a single `_system` `ArrayBuffer` (offsets
-`TRACE_ROOT_*_OFFSET` in `traceRoot.ts`) so the WASM path can read them without BigInt extraction. The
-`getTimestampNanos()` method is the API; the function-style sketches below show its arithmetic. Behaviour is pinned by
-`packages/lmao/src/lib/__tests__/timestamp.test.ts`.
-
-**Native acceleration is WASM, not NAPI.** The N-API span-write backend lost to WASM in benchmarks (span timestamp
-writes, M1 Max: WASM ~48 ns, NAPI ~70–86 ns, JS ~85–98 ns), so `TraceRoot` writes stay in plain JS and the WASM
-allocator is the native fast path. There is no NAPI addon in the package.
+> **Implementation status** (system state, not aspiration). The anchored-timestamp design is implemented as the
+> `TraceRoot` **class** (`ITraceRoot` interface in `packages/lmao/src/lib/traceRoot.ts`), with two platform classes:
+> `packages/lmao/src/lib/traceRoot.node.ts` (`process.hrtime.bigint()`, pure-JS writes) and
+> `packages/lmao/src/lib/traceRoot.es.ts` (`performance.now()`). Each exposes `getTimestampNanos(): Nanoseconds`, the
+> per-trace anchor (`anchorEpochNanos`, `anchorPerfNow`), and the span-start/span-end/log write methods. Anchors and
+> `trace_id` live in a single `_system` `ArrayBuffer` (see the layout below `TRACE_ROOT_*_OFFSET`) so the WASM path can
+> read them without BigInt extraction. The function-style `getTimestamp(buffer)` sketches below are illustrative; the
+> realized API is the class method `getTimestampNanos()`. Behaviour is pinned by
+> `packages/lmao/src/lib/__tests__/timestamp.test.ts`.
+>
+> **Native acceleration is WASM, not NAPI.** Earlier benchmarks compared a N-API span-write backend with JS and WASM
+> (span timestamp writes, M1 Max: WASM ~48 ns, NAPI ~70–86 ns, JS ~85–98 ns); NAPI beat JS but lost to WASM. The current
+> package keeps `TraceRoot` writes in plain JS and uses the WASM allocator as the native fast path. There is no NAPI
+> addon in the package.
 
 ### Core Design Principles
 
@@ -171,10 +173,12 @@ function createTraceRoot(tracer: Tracer, traceId?: TraceId): TraceRoot {
 // All subsequent timestamps derived from anchor (accessed via buffer._traceRoot)
 function getTimestamp(buffer: SpanBuffer): bigint {
   // Returns nanoseconds since epoch; hrtime.bigint() gives nanoseconds directly.
-  // The class keeps the exact anchor as the BigInt offset `_epochHrtimeOffset` (anchorEpochNanos - anchorHrtime),
-  // not BigInt(Math.round(anchorPerfNow)): the f64 anchorPerfNow loses integer precision after ~104 days of uptime,
-  // which would corrupt the delta (traceRoot.node.ts).
-  return process.hrtime.bigint() + buffer._traceRoot._epochHrtimeOffset;
+  // The realized class keeps the EXACT hrtime anchor as a BigInt (_anchorHrtimeBigInt),
+  // not BigInt(Math.round(anchorPerfNow)) — the f64 anchorPerfNow loses integer
+  // precision after ~104 days of uptime, which would corrupt the delta (traceRoot.node.ts).
+  const { anchorEpochNanos } = buffer._traceRoot;
+  const elapsedNanos = process.hrtime.bigint() - buffer._traceRoot._anchorHrtimeBigInt;
+  return anchorEpochNanos + elapsedNanos;
 }
 ```
 
@@ -266,7 +270,7 @@ import { TestTracer, defineOpContext } from '@smoothbricks/lmao/react-native';
 Re-exports the same `traceRoot.es.ts` factory as the browser entry: React Native installs `global.performance.now` in
 `InitializeCore`, and Hermes has no `WebAssembly` global, so the pure-TypedArray lane is the only lane that runs there.
 Hermes supplies neither `crypto.getRandomValues` (declined as out of engine scope in facebook/hermes#915) nor
-`TextDecoder`, and gained `TextEncoder` only in the Hermes build that ships with React Native 0.74; the app provides the
+`TextDecoder`, and gained `TextEncoder` only in the Hermes build shipped with React Native 0.74; the app provides the
 two missing globals before importing the entry point.
 
 ### Why Separate Entry Points?
@@ -275,22 +279,23 @@ two missing globals before importing the entry point.
 2. **Precision**: Node.js gets true nanosecond precision via hrtime, browsers get microsecond precision via
    performance.now()
 3. **Compatibility**: Browser entry works in any ES environment (Deno, Cloudflare Workers, etc.)
-4. **Zero overhead**: the platform is chosen at import time by which factory the entry point re-exports, no runtime
-   branching
+4. **Zero overhead**: Implementation is set once at module load via `setTimestampNanosImpl()`, no runtime branching
 
 ### Implementation
 
 Both entry points provide the same `ITraceRoot` API (`getTimestampNanos()`, anchors, span/log writes) with different
-underlying implementations. The form is a **class per platform** plus a `createTraceRoot` factory; the factory is what
-each entry point re-exports, so the unused platform class is tree-shaken; the `Tracer` receives the factory:
+underlying implementations. The realized form is a **class per platform** plus a `createTraceRoot` factory; the factory
+is what each entry point re-exports, so the unused platform class is tree-shaken (there is **no**
+`setTimestampNanosImpl` module-load mutation — the factory is passed to the `Tracer` instead):
 
 ```typescript
 // traceRoot.node.ts (Node.js - TRUE nanosecond precision)
 class TraceRoot implements ITraceRoot {
-  // anchors + trace_id live in _system ArrayBuffer; _epochHrtimeOffset (anchorEpochNanos - anchorHrtime) kept as exact BigInt
+  // anchors + trace_id live in _system ArrayBuffer; _anchorHrtimeBigInt kept as exact BigInt
   getTimestampNanos(): Nanoseconds {
-    const epochNanos = process.hrtime.bigint() + this._epochHrtimeOffset; // exact BigInt, no f64 round-trip
-    return Nanoseconds.unsafe(epochNanos);
+    const currentHrtime = process.hrtime.bigint();
+    const elapsedNanos = currentHrtime - this._anchorHrtimeBigInt; // exact BigInt delta
+    return Nanoseconds.unsafe(this.anchorEpochNanos + elapsedNanos);
   }
 }
 export function createTraceRoot(trace_id: string, tracer: TracerLifecycleHooks): TraceRoot {
@@ -325,10 +330,9 @@ export function createTraceRoot(trace_id: string, tracer: TracerLifecycleHooks):
 - **Anchor captured once** at trace creation inside `createTraceRoot()` (the factory)
 - All subsequent timestamps use delta from anchor for consistency
 - Both implementations expose the same anchors (`anchorEpochNanos`, `anchorPerfNow`)
-- The Node class additionally retains the **exact** `process.hrtime.bigint()` anchor as a BigInt offset
-  (`_epochHrtimeOffset`, the epoch anchor minus the hrtime anchor), so deltas stay correct even after the f64
-  `anchorPerfNow` loses integer precision (~104 days of uptime); a regression test pins this. A
-  `BigInt(Math.round(anchorPerfNow))` anchor would drift.
+- The Node class additionally retains the **exact** `process.hrtime.bigint()` anchor as a BigInt (`_anchorHrtimeBigInt`)
+  so deltas stay correct even after the f64 `anchorPerfNow` loses integer precision (~104 days of uptime); a regression
+  test pins this. This supersedes a `BigInt(Math.round(anchorPerfNow))` approach, which would drift.
 - Entry points (`node.ts`, `es.ts`) re-export the matching `createTraceRoot` factory; `Tracer` calls it
 - No runtime platform detection — the platform is chosen at import time (which factory) for zero overhead
 
@@ -341,5 +345,5 @@ sub-millisecond digits but is the process-start wall clock advanced by the monot
 host slewed or stepped since the process started. The anchor is that estimate held inside the millisecond `Date.now()`
 names, read after it: exact to the performance clock (measured within ~2 µs of `CLOCK_REALTIME` under Bun) while the
 drift stays under a millisecond, never more than that millisecond wrong when it does not, and a wall-clock step
-re-anchors the next trace. A runtime without `performance.timeOrigin` anchors on the millisecond. Within a trace nothing
-changes: every stamp is the anchor plus the monotonic delta.
+re-anchors the next trace as before. A runtime without `performance.timeOrigin` anchors on the millisecond. Within a
+trace nothing changes: every stamp is the anchor plus the monotonic delta.

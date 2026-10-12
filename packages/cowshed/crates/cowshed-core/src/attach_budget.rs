@@ -49,13 +49,13 @@ pub const RESTART_DISK_ARBITRATION_HINT: &str = "sudo killall diskarbitrationd: 
 
 /// What clears a 150 the leaked devices do not explain.
 pub const ORPHANS_FIRST_HINT: &str = "kill the orphaned diskimagesiod helpers `cowshed doctor` \
-     names (orphaned-disk-image-helpers), then `attach-budget --clear`; reboot if attaches still \
+     names (orphaned-disk-image-helpers), then `cowshed doctor --clear-attach-budget`; reboot if attaches still `;
+core.line
      fail with error code 150";
 
 /// How the lane's checkout runs the operator's reset ([`clear`]): the bin is built from the
-/// checkout, not installed.
-pub const CLEAR_COMMAND: &str =
-    "cargo --frozen run -q -p cowshed-core --bin attach-budget -- --clear";
+/// command a hint prints is one that parses and runs as printed.
+pub const CLEAR_COMMAND: &str = "cowshed doctor --clear-attach-budget";
 
 /// The next step for a command the spent pool refused.
 pub const EXHAUSTED_HINT: &str = "cowshed doctor: its disk-image-attach-budget finding says \
@@ -212,7 +212,7 @@ impl PoolRecord {
         }
     }
 
-    /// The record after the operator cleared it (`attach-budget --clear`): this boot's
+    /// The record after the operator cleared it (`cowshed doctor --clear-attach-budget`): this boot's
     /// exhaustion ends, as after a successful attach, and the observed ceiling is forgotten,
     /// back to [`OBSERVED_LEAK_CEILING`]. A ceiling only ever moves down and survives reboots,
     /// so one 150 at a low leaked count would otherwise refuse the lane on every later boot,

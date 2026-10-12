@@ -1,8 +1,18 @@
-# Lambda Routing Example: Library Composition with `defineOp()` + `span()` <a id="smoo/lmao!n/lambda-routing-example"></a>
+# Lambda Routing Example: Library Composition with `op()` + `span()` <a id="smoo/lmao!n/lambda-routing-example"></a>
 
-> **Example.** This worked example shows op-wrapped operations, `span(name, op, …args)` invocation, `tag`/`log`,
-> dependency injection via `deps`, prefix-namespaced columns, shared dependency instances, and the resulting prefixed
-> Arrow table. The authored surface is specified in [`01l_op_context_pattern.md`](./01l_op_context_pattern.md).
+> **Implementation status — illustrative example; construction surface renamed in source.** This is a worked
+> **example**, not a new contract: every behaviour it shows (op-wrapped operations, `span(name, op, …args)` invocation,
+> `tag`/`log`, dependency injection via `deps`, prefix-namespaced columns, shared dependency instances, the resulting
+> prefixed Arrow table) is realized today in `packages/lmao/src` — `defineOpContext`/`defineOp`/`defineOps`
+> (`lib/defineOpContext.ts`, fenced `smoo/lmao!n/opcontext-definition`), the op/span/tag/log context (`lib/op.ts`
+> `smoo/lmao!n/op-class`, `lib/spanContext.ts`), prefix remap (`lib/library.ts` `smoo/lmao!n/codegen-prefixed-remap`,
+> `lib/opContext/createOpGroup.ts` `smoo/lmao!n/column-mapping-api`), and the tracer (`lib/tracer.ts`
+> `smoo/lmao!n/tracer-architecture`). **But the module-construction surface in the code samples below is stale:** the
+> shipped API is `defineOpContext({ logSchema, deps, flags, ctx })` returning `{ defineOp, defineOps }` with
+> `deps: { auth: authOps.prefix('auth') }`, **not** `defineModule({ schema, deps })` + `op()` +
+> `.prefix('x').use({…})` + `.forContext({…})`. The current authored surface is
+> [`01l_op_context_pattern.md`](./01l_op_context_pattern.md). Truing the samples up to the shipped names is tracked as
+> `smoo/lmao!n/lambda-routing-example-api-trueup`.
 
 ## Overview <a id="smoo/lmao!n/lambda-routing-example-overview"></a>
 
@@ -15,7 +25,7 @@ routing example. It showcases:
 4. **The `span()` pattern** as the universal invocation mechanism
 5. **Op-based routing** for Lambda handlers
 
-## The Pattern: `defineOp()` + `span()` <a id="smoo/lmao!n/lambda-routing-example-pattern"></a>
+## The Pattern: `op()` + `span()` <a id="smoo/lmao!n/lambda-routing-example-pattern"></a>
 
 The key insight is that **every cross-cutting operation should be wrapped in a span**. This gives you:
 
@@ -37,16 +47,23 @@ A simple authentication library that validates tokens and extracts user informat
 
 ```typescript
 // @mycompany/auth-tracing/src/index.ts
-import { defineOpContext, S } from '@smoothbricks/lmao';
+import { defineModule, S } from '@smoothbricks/lmao';
 
-// Define the op context with an unprefixed log schema
-const { defineOp, defineOps } = defineOpContext({
-  logSchema: {
+// Define module with unprefixed schema
+export const authModule = defineModule({
+  metadata: {
+    packageName: '@mycompany/auth-tracing',
+    packagePath: 'src/index.ts',
+  },
+  schema: {
     tokenType: S.enum(['bearer', 'api-key', 'session']),
     userId: S.category(),
     valid: S.boolean(),
   },
 });
+
+// Destructure op factory from module
+const { op } = authModule;
 
 // Token decoding helper (implementation details)
 function decodeToken(token: string): DecodedToken {
@@ -54,8 +71,8 @@ function decodeToken(token: string): DecodedToken {
   return { type: 'bearer', userId: 'user-123', permissions: ['read', 'write'] };
 }
 
-// Define operation - receives { tag, log, span, deps, ok, err } context
-export const validateToken = defineOp('validateToken', async ({ tag, log, ok }, token: string) => {
+// Define operation - receives { tag, log, span, deps } context
+export const validateToken = op(async ({ tag, log }, token: string) => {
   log.info('Validating token');
 
   const decoded = decodeToken(token);
@@ -68,29 +85,26 @@ export const validateToken = defineOp('validateToken', async ({ tag, log, ok }, 
 
   log.info('Token validated successfully');
 
-  return ok({ userId: decoded.userId, permissions: decoded.permissions });
+  return { userId: decoded.userId, permissions: decoded.permissions };
 });
 
 // Another auth operation
-export const refreshToken = defineOp('refreshToken', async ({ tag, log, ok }, refreshToken: string) => {
+export const refreshToken = op(async ({ tag, log }, refreshToken: string) => {
   log.info('Refreshing token');
   tag.tokenType('bearer');
 
   // ... refresh logic ...
 
   tag.valid(true);
-  return ok({ accessToken: 'new-token', expiresIn: 3600 });
+  return { accessToken: 'new-token', expiresIn: 3600 };
 });
-
-// Batch the ops into the exported OpGroup
-export const authModule = defineOps({ validateToken, refreshToken });
 ```
 
 **Key Points**:
 
 - Schema uses unprefixed names (`userId`, not `auth_userId`)
-- `defineOp()` creates traced operations with automatic span management
-- Context provides `{ tag, log, span, deps, ok, err }` - destructure what you need; every op returns `ok()` or `err()`
+- `op()` creates traced operations with automatic span management
+- Context provides `{ tag, log, span, deps }` - destructure what you need
 - No prefix concerns in library code - clean, domain-focused
 
 ### HTTP Library (`@mycompany/http-tracing`) <a id="smoo/lmao!n/lambda-routing-example-router.http-library"></a>
@@ -99,12 +113,16 @@ An HTTP client library that can optionally authenticate requests using the auth 
 
 ```typescript
 // @mycompany/http-tracing/src/index.ts
-import { defineOpContext, S } from '@smoothbricks/lmao';
+import { defineModule, S } from '@smoothbricks/lmao';
 import { authModule } from '@mycompany/auth-tracing';
 
 // HTTP module declares auth as a dependency
-const { defineOp, defineOps } = defineOpContext({
-  logSchema: {
+export const httpModule = defineModule({
+  metadata: {
+    packageName: '@mycompany/http-tracing',
+    packagePath: 'src/index.ts',
+  },
+  schema: {
     method: S.enum(['GET', 'POST', 'PUT', 'DELETE', 'PATCH']),
     url: S.text().masked('url'), // URL masking for PII
     status: S.number(),
@@ -115,6 +133,8 @@ const { defineOp, defineOps } = defineOpContext({
   },
 });
 
+const { op } = httpModule;
+
 interface RequestOpts {
   method: 'GET' | 'POST' | 'PUT' | 'DELETE' | 'PATCH';
   body?: unknown;
@@ -123,75 +143,61 @@ interface RequestOpts {
 }
 
 // Core request operation - uses auth dependency via span()
-export const request = defineOp(
-  'request',
-  async ({ span, tag, log, deps, ok, err }, url: string, opts: RequestOpts) => {
-    const startTime = performance.now();
+export const request = op(async ({ span, tag, log, deps }, url: string, opts: RequestOpts) => {
+  const startTime = performance.now();
 
-    // Destructure deps for ergonomic access
-    const { auth } = deps;
+  // Destructure deps for ergonomic access
+  const { auth } = deps;
 
-    // Tag request attributes
-    tag.method(opts.method);
-    tag.url(url);
+  // Tag request attributes
+  tag.method(opts.method);
+  tag.url(url);
 
-    log.info('Starting HTTP request');
+  log.info('Starting HTTP request');
 
-    // If token provided, authenticate via auth dependency
-    // span() creates a child span for the auth operation
-    if (opts.token) {
-      const authResult = await span('auth', auth.validateToken, opts.token);
-      if (authResult.isErr()) return err(authResult.error); // Rebuild the child's outcome on this context
-      // authResult.value contains { userId, permissions }
-      log.info('Request authenticated');
-    }
-
-    // Perform the actual HTTP request
-    const response = await fetch(url, {
-      method: opts.method,
-      body: opts.body ? JSON.stringify(opts.body) : undefined,
-      headers: {
-        'Content-Type': 'application/json',
-        ...opts.headers,
-      },
-    });
-
-    // Tag response attributes
-    tag.status(response.status);
-    tag.duration(performance.now() - startTime);
-
-    log.info('HTTP request completed');
-
-    return ok(response);
+  // If token provided, authenticate via auth dependency
+  // span() creates a child span for the auth operation
+  if (opts.token) {
+    const authResult = await span('auth', auth.validateToken, opts.token);
+    // authResult contains { userId, permissions }
+    log.info('Request authenticated');
   }
-);
 
-// Convenience methods that delegate to request via span(); each rebuilds the child's outcome on its own context
-export const GET = defineOp('GET', async ({ span, ok, err }, url: string, opts?: { token?: string }) => {
-  const res = await span('request', request, url, { method: 'GET' as const, ...opts });
-  return res.isOk() ? ok(res.value) : err(res.error);
+  // Perform the actual HTTP request
+  const response = await fetch(url, {
+    method: opts.method,
+    body: opts.body ? JSON.stringify(opts.body) : undefined,
+    headers: {
+      'Content-Type': 'application/json',
+      ...opts.headers,
+    },
+  });
+
+  // Tag response attributes
+  tag.status(response.status);
+  tag.duration(performance.now() - startTime);
+
+  log.info('HTTP request completed');
+
+  return response;
 });
 
-export const POST = defineOp(
-  'POST',
-  async ({ span, ok, err }, url: string, body: unknown, opts?: { token?: string }) => {
-    const res = await span('request', request, url, { method: 'POST' as const, body, ...opts });
-    return res.isOk() ? ok(res.value) : err(res.error);
-  }
-);
-
-export const PUT = defineOp('PUT', async ({ span, ok, err }, url: string, body: unknown, opts?: { token?: string }) => {
-  const res = await span('request', request, url, { method: 'PUT' as const, body, ...opts });
-  return res.isOk() ? ok(res.value) : err(res.error);
+// Convenience methods that delegate to request via span()
+export const GET = op(async ({ span }, url: string, opts?: { token?: string }) => {
+  return span('request', request, url, { method: 'GET' as const, ...opts });
 });
 
-export const DELETE = defineOp('DELETE', async ({ span, ok, err }, url: string, opts?: { token?: string }) => {
-  const res = await span('request', request, url, { method: 'DELETE' as const, ...opts });
-  return res.isOk() ? ok(res.value) : err(res.error);
+export const POST = op(async ({ span }, url: string, body: unknown, opts?: { token?: string }) => {
+  return span('request', request, url, { method: 'POST' as const, body, ...opts });
 });
 
-// Batch the ops into the exported OpGroup
-export const httpModule = defineOps({ request, GET, POST, PUT, DELETE });
+export const PUT = op(async ({ span }, url: string, body: unknown, opts?: { token?: string }) => {
+  return span('request', request, url, { method: 'PUT' as const, body, ...opts });
+});
+
+export const DELETE = op(async ({ span }, url: string, opts?: { token?: string }) => {
+  return span('request', request, url, { method: 'DELETE' as const, ...opts });
+});
 ```
 
 **Key Points**:
@@ -208,13 +214,17 @@ A Lambda handler that routes operations by name, composing HTTP and auth librari
 
 ```typescript
 // @mycompany/lambda-router/src/index.ts
-import { defineCodeError, defineOpContext, S, type Result } from '@smoothbricks/lmao';
-import { httpModule } from '@mycompany/http-tracing';
-import { authModule } from '@mycompany/auth-tracing';
+import { defineModule, S } from '@smoothbricks/lmao';
+import { httpModule, GET, POST, PUT, DELETE } from '@mycompany/http-tracing';
+import { authModule, validateToken, refreshToken } from '@mycompany/auth-tracing';
 
 // Lambda module composes both HTTP and auth
-const { defineOp, defineOps } = defineOpContext({
-  logSchema: {
+export const lambdaModule = defineModule({
+  metadata: {
+    packageName: '@mycompany/lambda-router',
+    packagePath: 'src/index.ts',
+  },
+  schema: {
     op: S.category(), // Operation name from request (repeated values → category)
     duration: S.number(), // Total operation duration
     success: S.boolean(), // Operation success/failure
@@ -226,20 +236,25 @@ const { defineOp, defineOps } = defineOpContext({
   },
 });
 
+const { op } = lambdaModule;
+
 // Lambda event structure
 interface LambdaEvent {
   op: string; // Operation to invoke
   url?: string; // URL for HTTP operations
   body?: unknown; // Request body for POST/PUT
   token?: string; // Auth token
-  requestId?: string; // Numeric request id, tagged as uint64_value
 }
 
-// Failure of a routed operation, as a code error (its code fills error_code on row 1)
-const ROUTE_FAILED = defineCodeError('ROUTE_FAILED')<{ message: string; errorCode: string }>();
+interface LambdaResult {
+  success: boolean;
+  data?: unknown;
+  error?: string;
+  errorCode?: string;
+}
 
 // The main router operation
-export const routeOp = defineOp('routeOp', async ({ span, tag, log, deps, ok, err }, event: LambdaEvent) => {
+export const routeOp = op(async ({ span, tag, log, deps }, event: LambdaEvent): Promise<LambdaResult> => {
   const startTime = performance.now();
 
   // Destructure deps for ergonomic access
@@ -248,15 +263,15 @@ export const routeOp = defineOp('routeOp', async ({ span, tag, log, deps, ok, er
   // Tag the operation name immediately
   tag.op(event.op);
 
-  // Use .uint64_value() for large integers (e.g., request IDs, byte counts)
+  // Use .uint64() for large integers (e.g., request IDs, byte counts)
   if (event.requestId) {
-    tag.uint64_value(BigInt(event.requestId));
+    tag.uint64(BigInt(event.requestId));
   }
 
   log.info('Routing operation');
 
   try {
-    let result: Result<unknown, unknown>;
+    let result: unknown;
 
     // Route based on operation name
     // Each route uses span() to invoke the appropriate op
@@ -297,21 +312,13 @@ export const routeOp = defineOp('routeOp', async ({ span, tag, log, deps, ok, er
         throw new Error(`Unknown operation: ${event.op}`);
     }
 
-    if (result.isErr()) {
-      // A routed op failed: rebuild its outcome on this context
-      tag.success(false);
-      tag.duration(performance.now() - startTime);
-      log.error('Operation failed');
-      return err(result.error);
-    }
-
     // Tag success
     tag.success(true);
     tag.duration(performance.now() - startTime);
 
     log.info('Operation completed successfully');
 
-    return ok(result.value);
+    return { success: true, data: result };
   } catch (error) {
     // Tag failure
     tag.success(false);
@@ -322,12 +329,13 @@ export const routeOp = defineOp('routeOp', async ({ span, tag, log, deps, ok, er
 
     log.error('Operation failed');
 
-    return err(ROUTE_FAILED({ message: error instanceof Error ? error.message : String(error), errorCode }));
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : String(error),
+      errorCode,
+    };
   }
 });
-
-// Batch the ops into the exported OpGroup
-export const lambdaModule = defineOps({ routeOp });
 ```
 
 ### Direct Invoke Argument Shape <a id="smoo/lmao!n/lambda-routing-example-invoke-shape"></a>
@@ -351,12 +359,11 @@ remaining payload fields should map to a single object arg.
 
 ### Application Entry Point <a id="smoo/lmao!n/lambda-routing-example-router.entry-point"></a>
 
-Wire everything together with prefixes in the application's own op context, then trace the Lambda handler.
+Wire everything together with prefixes and create the Lambda handler.
 
 ```typescript
 // src/lambda.ts
-import { defineOpContext, defineLogSchema, ArrayQueueTracer } from '@smoothbricks/lmao';
-import { lambdaModule } from '@mycompany/lambda-router';
+import { lambdaModule, routeOp } from '@mycompany/lambda-router';
 import { httpModule } from '@mycompany/http-tracing';
 import { authModule } from '@mycompany/auth-tracing';
 
@@ -364,58 +371,58 @@ import { authModule } from '@mycompany/auth-tracing';
 // Wire dependencies with prefixes
 // ============================================
 
-// Each dep carries its own prefix:
-// auth columns: tokenType → auth_tokenType
+// Create auth instance with prefix
+// All auth columns will be prefixed: tokenType → auth_tokenType
+const authRoot = authModule.prefix('auth').use();
+
+// Create HTTP instance with prefix and inject auth dependency
 // HTTP columns: method → http_method, url → http_url, etc.
+// HTTP's auth dependency uses the SAME auth instance
+const httpRoot = httpModule.prefix('http').use({
+  auth: authRoot, // HTTP uses our auth instance
+});
+
+// Create Lambda router instance with prefix
 // Lambda columns: op → lambda_op, duration → lambda_duration, etc.
-const appContext = defineOpContext({
-  logSchema: defineLogSchema({}),
-  deps: {
-    lambda: lambdaModule.prefix('lambda'),
-    http: httpModule.prefix('http'),
-    auth: authModule.prefix('auth'),
-  },
-  ctx: {
-    requestId: undefined as string | undefined, // OPTIONAL - set per invocation
-  },
+// Lambda has access to both HTTP and auth
+const lambdaRoot = lambdaModule.prefix('lambda').use({
+  http: httpRoot, // Lambda uses our HTTP instance
+  auth: authRoot, // Lambda also uses SAME auth instance for direct auth ops
 });
-
-// Root op: routes the event through the prefixed Lambda router
-const handle = appContext.defineOp('handle', async (ctx, event: LambdaEvent) => {
-  const routed = await ctx.span('route', ctx.deps.lambda.routeOp, event);
-  return routed.isOk() ? ctx.ok(routed.value) : ctx.err(routed.error);
-});
-
-const { trace } = new ArrayQueueTracer(appContext);
 
 // ============================================
 // Lambda Handler
 // ============================================
 
 export const handler = async (event: LambdaEvent) => {
-  // trace() creates the root span for this Lambda invocation
-  return trace('lambda-invoke', handle, event);
+  // Single entry point - routeOp handles all operations
+  // span() creates the root span for this Lambda invocation
+  return lambdaRoot.span('route', routeOp, event);
 };
 
 // ============================================
 // Alternative: Request-scoped context
 // ============================================
 
-// trace() overrides set user context properties for this invocation
+// For request-scoped attributes (requestId, userId from JWT, etc.)
 export const handlerWithContext = async (event: LambdaEvent, context: LambdaContext) => {
-  return trace('lambda-invoke', { requestId: context.awsRequestId }, handle, event);
+  // Create request context with scope attributes
+  const requestCtx = lambdaRoot.forContext({
+    requestId: context.awsRequestId,
+    // userId could come from JWT in event.token
+  });
+
+  return requestCtx.span('route', routeOp, event);
 };
 ```
 
 **Key Points**:
 
-- `deps: { lambda: lambdaModule.prefix('lambda'), http: ..., auth: ... }` wires every dependency with its prefix
-- **Shared deps**: child spans receive the same `deps` references as their parent
-  ([Context Flow](./01c_context_flow_and_op_wrappers.md)), so `routeOp`'s `http` and `auth`, and the HTTP library's
-  `auth`, all resolve to the application's prefixed groups
-- `trace('lambda-invoke', handle, event)` creates the root span and invokes the router through `span()`
-- `trace(name, overrides, op, ...args)` sets request-scoped context properties (requestId, etc.); use `setScope()` for
-  column values that every row should carry
+- `authModule.prefix('auth').use()` creates instance with `auth_` prefix
+- `httpModule.prefix('http').use({ auth: authRoot })` injects auth dependency
+- **Shared instance**: `authRoot` is used by BOTH `httpRoot` and `lambdaRoot`
+- `lambdaRoot.span('route', routeOp, event)` creates root span and invokes
+- `forContext()` adds request-scoped attributes (requestId, etc.)
 
 ## Why This Pattern is Elegant <a id="smoo/lmao!n/lambda-routing-example-why"></a>
 
@@ -434,14 +441,16 @@ Destructuring makes library code readable and IDE-friendly with full autocomplet
 ### 2. Shared Dependency Instances <a id="smoo/lmao!n/lambda-routing-example-why.shared-instances"></a>
 
 ```typescript
-// One prefixed auth group, shared by the whole trace through deps
-const appContext = defineOpContext({
-  logSchema: defineLogSchema({}),
-  deps: {
-    lambda: lambdaModule.prefix('lambda'),
-    http: httpModule.prefix('http'),
-    auth: authModule.prefix('auth'), // Reached by HTTP and Lambda alike
-  },
+// Single auth instance shared across the entire trace
+const authRoot = authModule.prefix('auth').use();
+
+const httpRoot = httpModule.prefix('http').use({
+  auth: authRoot, // HTTP uses auth
+});
+
+const lambdaRoot = lambdaModule.prefix('lambda').use({
+  http: httpRoot,
+  auth: authRoot, // Lambda also uses SAME auth
 });
 ```
 
@@ -646,7 +655,7 @@ await invoke({ op: 'refreshToken', token: 'refresh-token-xxx' });
 
 ## Summary <a id="smoo/lmao!n/lambda-routing-example-summary"></a>
 
-The `defineOp()` + `span()` pattern enables:
+The `op()` + `span()` pattern enables:
 
 1. **Clean library authoring** - Focus on domain logic, not tracing plumbing
 2. **Type-safe composition** - Dependencies declared and injected with full TypeScript support
@@ -661,7 +670,7 @@ resolvers, or microservice gateways.
 ## Integration with Other Specs <a id="smoo/lmao!n/lambda-routing-example-integration"></a>
 
 - **[Op Context Pattern](./01l_op_context_pattern.md)**: Defines `defineOpContext()`, `defineOp()`, and Tracer API
-- **[Library Integration Pattern](./01e_library_integration_pattern.md)**: RemapDescriptor for Arrow conversion
+- **[Library Integration Pattern](./01e_library_integration_pattern.md)**: RemappedBufferView for Arrow conversion
 - **[Context Flow](./01c_context_flow_and_op_wrappers.md)**: How context propagates through span() calls
 - **[Trace Schema System](./01a_trace_schema_system.md)**: `S.enum()`, `S.category()`, `S.text()` definitions
 - **[Arrow Table Structure](./01f_arrow_table_structure.md)**: Final queryable format

@@ -131,10 +131,8 @@ or ordinary on-disk text log.
 | ----------------------- | ---------------------------- | ------------------------------------------------------------------------------------------------------------------- |
 | `cowshed-core`          | lib (+ bin `apfs-benchmark`) | Image/volume lifecycle, clonefile, marker & grant files, Seatbelt profile generation, env wiring, supervisors, exec |
 | `cowshed-cli`           | bin `cowshed`                | Self-driving CLI over cowshed-core, and the host daemon it runs; stdout machine-readable, stderr guidance           |
-| `cowshed-escape-tests`  | test crate                   | The adversarial escape corpus, run through the real exec pipeline on both OSes; a release gate (08_testing.md)      |
 | `cowshed-gateway`       | lib                          | Actor-owned, host-only egress gateway: registry and repository mirrors, TLS interception, CONNECT tunnel, audit     |
 | `cowshed-gateway-types` | lib                          | The gateway's control-plane data model (sessions, endpoints, tokens, CA material, egress policy), with no daemon    |
-| `cowshed-helper`        | bin `cowshed-helper`         | Linux: the minimal root binary with a fixed verb set through which ZFS substrate mutations go (09_substrates.md)    |
 | `cowshed-napi`          | cdylib                       | napi-rs bindings exposing cowshed-core to Bun/Node                                                                  |
 | `cowshed-shell`         | bin `cowshed-shell-host`     | The warm exec host: holds an activated workspace shell and runs each command from it (11_shell.md)                  |
 

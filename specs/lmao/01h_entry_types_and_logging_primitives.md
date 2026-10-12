@@ -172,12 +172,13 @@ return ctx.ok(user).message('User created successfully');
 
 #### Row 1 Entry Types
 
-| Return Type                                 | Entry Type Written   | Written By     |
-| ------------------------------------------- | -------------------- | -------------- |
-| `Ok` (from the span's own `ctx.ok()`)       | `span-ok` (2)        | span()/trace() |
-| `Err` (from the span's own `ctx.err()`)     | `span-err` (3)       | span()/trace() |
-| Any other value, including a foreign result | `span-exception` (4) | span()/trace() |
-| Exception thrown                            | `span-exception` (4) | span()/trace() |
+| Return Type                  | Entry Type Written   | Written By     |
+| ---------------------------- | -------------------- | -------------- |
+| `FluentOk` (from ctx.ok())   | `span-ok` (2)        | span()/trace() |
+| `FluentErr` (from ctx.err()) | `span-err` (3)       | span()/trace() |
+| Plain `Ok<T>`                | `span-ok` (2)        | span()/trace() |
+| Plain `Err<E>`               | `span-err` (3)       | span()/trace() |
+| Exception thrown             | `span-exception` (4) | span()/trace() |
 
 **Note**: Entry types are always written by `span()`/`trace()` at span-end, never by the result constructor.
 
@@ -274,7 +275,7 @@ span-ok:     op:transcodeVideo/attach (result delivered)
 
 ### Log Level Entry Types <a id="smoo/lmao!n/lmao-entry-log-level-entry-types"></a>
 
-Structured logging appends rows starting at row 2. The entry-type enum includes all five levels:
+Structured logging appends rows starting at row 2. The shipped entry-type enum includes all five levels:
 
 - **`trace`** - Most verbose diagnostic events
 - **`debug`** - Diagnostic events
@@ -284,13 +285,13 @@ Structured logging appends rows starting at row 2. The entry-type enum includes 
 
 #### Static operational templates and diagnostic raw messages
 
-Logging has two deliberate policies; they MUST NOT be blended:
+The clean-cutover target has two deliberate policies; they MUST NOT be blended:
 
 1. **Operational `info`/`warn`/`error`** require a compiler-visible literal template. Runtime values belong in an
    object-literal field set whose keys are schema-known. Template interpolation, string concatenation, a dynamic message
-   expression, and a dynamically shaped attributes object are rejected. Placeholders use `{fieldName}`; `{{` and `}}`
-   encode literal braces. `{{fieldName}}` is not accepted as an alias. The stored template keeps its escapes exactly as
-   written; `{{` and `}}` are decoded only when a reader renders the message, never on the entry path.
+   expression, and a dynamically shaped attributes object are rejected. Target placeholders use `{fieldName}`; `{{` and
+   `}}` encode literal braces. This clean-cutover grammar explicitly replaces the shipped `{{fieldName}}` placeholder
+   form. The stored template is never rendered on the entry path.
 2. **Diagnostic `debug`/`trace`** may retain the existing raw dynamic string-reference form when the whole argument is
    an existing string value. Avoidable interpolation and concatenation are rejected: use a literal template plus
    object-literal fields when structure is available. A raw diagnostic string uses the dynamic message lane; it does not
@@ -299,7 +300,7 @@ Logging has two deliberate policies; they MUST NOT be blended:
 ```typescript
 log.info('User {userId} processed {count} items', { userId, count }); // valid structured operational form
 log.warn('Queue depth {depth} exceeded {limit}', { depth, limit }); // valid structured operational form
-log.info('Parser emitted {{token}}', {}); // valid: escaped braces, no field; renders as "Parser emitted {token}"
+log.info('Parser emitted {{token}}', {}); // valid: escaped braces, no field; stored text is "Parser emitted {token}"
 log.error(`Request ${requestId} failed`); // invalid: interpolation
 log.info(messageFromConfig); // invalid: dynamic operational message
 
@@ -308,11 +309,11 @@ log.trace('packet {packetId}', { packetId }); // valid structured diagnostic tem
 log.debug(`packet ${packetId}`); // invalid: avoidable interpolation
 ```
 
-The callsite classes are **static** (literal with no fields), **structured** (literal plus object-literal fields), and
-**dynamic** (an allowed existing diagnostic string reference). `mixed` is not a callsite class; it names only a physical
-buffer/layout that contains both a static-index lane and a dynamic-reference lane.
+The target callsite classes are **static** (literal with no fields), **structured** (literal plus object-literal
+fields), and **dynamic** (an allowed existing diagnostic string reference). `mixed` is not a callsite class; it names
+only a physical buffer/layout that contains both a static-index lane and a dynamic-reference lane.
 
-#### Message physical representation
+#### Message physical representation (Target, Not Yet Shipped)
 
 Every compiler-known log template or literal span name has a fragment-local ordinal. `kindTag = 1` means `LOG_TEMPLATE`;
 `kindTag = 2` means `SPAN_NAME`. Checker-proven literal span names use the static lane, while non-literal span names
@@ -323,14 +324,14 @@ warmed method dispatch or `messageIndex()` lookup.
 The registry validates the typed fragment and copies/merges it into a runtime-owned immutable dictionary generation.
 Module arrays are inputs, not borrowed mutable Arrow storage. Dense indices are process-local and append-only in
 fragment registration order: each new generation preserves the previous generation as an unchanged prefix and appends
-only unseen decoded values, so prior bindings remain prefix-valid. Ids and decoded values are deterministic; dense
-indices and dictionary ordering are not deterministic across processes. Dense index `0` is valid and null is represented
-only by the Arrow validity bitmap.
+only unseen decoded values, so prior bindings remain prefix-valid. Stable IDs and decoded values are deterministic;
+dense indices and dictionary ordering are not deterministic across processes. Dense index `0` is valid and null is
+represented only by the Arrow validity bitmap.
 
 The warmed path performs no hash lookup, interning, string rendering, object enumeration, backend dispatch, or
-allocation. Dynamic references are resolved during overflow/flush processing. Each flush reuses the active vocabulary
-dictionary and `PhysicalLayoutPlan`; an `ArrowLease` pins the exact runtime-owned storage and immutable dictionary
-generation until export finishes, never the module's fragment arrays.
+allocation. Dynamic references are resolved during overflow/flush processing. Per-request flush reuses the active
+vocabulary dictionary and `PhysicalLayoutPlan`; an `ArrowLease` pins the exact runtime-owned storage and immutable
+dictionary generation until export finishes, never the module's fragment arrays.
 
 Precompiled libraries register and own their vocabulary fragment inputs when evaluated. The application neither
 recompiles nor assumes ownership of library templates. Registration IDs are stable content-derived identifiers, while
@@ -338,16 +339,14 @@ dense message indices are process-local hot/Arrow indices; they are not intercha
 
 #### The `message` Column: Operational Templates and Diagnostic Raw References
 
-Operational messages use format templates stored logically in the `message` column; the column stores their dense
-vocabulary indices. Diagnostic `debug`/`trace` may instead use the raw dynamic-reference policy above. Placeholders use
-`{fieldName}`, with `{{` and `}}` for literal braces. `{{fieldName}}` is not accepted as an alias. The stored template
-keeps the escapes as written, so in stored text a single-brace `{name}` is always a placeholder and a literal brace is
-always doubled.
+Operational messages use format templates stored logically in the `message` column; the target stores their dense
+vocabulary indices. Diagnostic `debug`/`trace` may instead use the raw dynamic-reference policy above. Target template
+placeholders use `{fieldName}`, with `{{` and `}}` for literal braces. The shipped `{{fieldName}}` grammar is replaced,
+not accepted as an alias in the clean cutover.
 
 ```typescript
-const processUser = defineOp('processUser', async ({ log, ok }) => {
+const processUser = op(async ({ log }) => {
   log.info('User {userId} processed {count} items', { userId: 'user-123', count: 42 });
-  return ok(null);
 });
 ```
 
@@ -366,18 +365,17 @@ Traditional interpolation remains invalid because it destroys template identity:
 
 ```typescript
 console.log(`User ${userId} processed ${count} items`); // unstructured, allocates a rendered string
-log.info('User {userId} processed {count} items', { userId, count }); // structured form
+log.info('User {userId} processed {count} items', { userId, count }); // structured target form
 ```
 
 **Row Behavior**: Unlike `tag.*` which overwrites row 0, `log.*` methods APPEND new rows:
 
 ```typescript
-const processUser = defineOp('processUser', async ({ log, ok }) => {
+const processUser = op(async ({ log }) => {
   // writeIndex starts at 2 after span initialization
   log.info('Starting process'); // Writes to row 2, writeIndex → 3
   log.debug('Details...'); // Writes to row 3, writeIndex → 4
   log.warn('Slow operation'); // Writes to row 4, writeIndex → 5
-  return ok(null);
 });
 ```
 
@@ -392,7 +390,7 @@ const processUser = defineOp('processUser', async ({ log, ok }) => {
 - Contrast with `log.*` which APPENDS new rows (events)
 
 ```typescript
-const processUser = defineOp('processUser', async ({ tag, log, ok }) => {
+const processUser = op(async ({ tag, log }) => {
   // tag writes to row 0 (span-start) - OVERWRITES, not appends
   tag.userId('user-123'); // Writes to userId_values[0]
   tag.requestId('req-456'); // Writes to requestId_values[0]
@@ -401,7 +399,6 @@ const processUser = defineOp('processUser', async ({ tag, log, ok }) => {
   // log creates new rows - APPENDS
   log.info('Processing...'); // Appends at row 2
   log.debug('Details...'); // Appends at row 3
-  return ok(null);
 });
 ```
 
@@ -469,18 +466,29 @@ flush share identical `timestamp` (the period end time).
   - `message`: Op name
   - `uint64_value`: Longest duration in nanoseconds
 
-**Buffer Metrics** (3 entry types for buffer statistics, read from the SpanBuffer class's `stats`):
+**Buffer Metrics** (4 entry types for buffer statistics):
 
-- **`buffer-writes`** - Total entries written to this module's buffers
-  - `uint64_value`: Count of completed entries written during the period (`stats.totalWrites`)
+> **Implementation status.** The shipped enum (`ENTRY_TYPE_NAMES` in `packages/lmao/src/lib/schema/systemSchema.ts`)
+> defines **three** buffer metrics, not four, and names them differently: `buffer-writes` (22), `buffer-spans` (23),
+> `buffer-capacity` (24). The four names below (`buffer-overflow-writes`, `buffer-created`, `buffer-overflows`) are NOT
+> in the source. The source is authoritative; aligning this list and the
+> [Entry Type Validation](#smoo/lmao!n/lmao-entry-entry-type-validation) table is tracked by
+> `smoo/lmao!n/lmao-entry-spec-source-reconcile`.
+
+- **`buffer-writes`** - Total entries written to buffers
+  - `uint64_value`: Count of all entries written during the period
   - `message`: unused (null)
 
-- **`buffer-spans`** - Spans created
-  - `uint64_value`: Number of non-overflow SpanBuffers created during the period (`stats.spansCreated`)
+- **`buffer-overflow-writes`** - Entries written to overflow buffers
+  - `uint64_value`: Count of entries that went to chained overflow buffers
   - `message`: unused (null)
 
-- **`buffer-capacity`** - Current buffer capacity
-  - `uint64_value`: Rows per new SpanBuffer for this module (`stats.capacity`)
+- **`buffer-created`** - SpanBuffers allocated
+  - `uint64_value`: Number of new SpanBuffer instances created
+  - `message`: unused (null)
+
+- **`buffer-overflows`** - Times a buffer overflowed and chained
+  - `uint64_value`: Number of overflow events
   - `message`: unused (null)
 
 ## Fluent API Design <a id="smoo/lmao!n/lmao-entry-fluent-api-design"></a>
@@ -489,11 +497,11 @@ With unified tag attributes across all entry types, we use a fluent/chainable AP
 different operations:
 
 ```typescript
-const processOrder = defineOp('processOrder', async ({ ok, err, span, log }, order) => {
+const processOrder = op(async ({ ok, err, span, log }, order) => {
   // Fluent span completion API
   return ok(result).with({ userId: user.id, operation: 'CREATE' }).message('User created successfully');
 
-  return err(VALIDATION_FAILED({ field: 'email' }))
+  return err('VALIDATION_FAILED')
     .with({
       field: 'email',
       attemptedValue: userData.email,
@@ -506,18 +514,17 @@ const processOrder = defineOp('processOrder', async ({ ok, err, span, log }, ord
 
   // Simple usage when no additional context needed
   return ok(result);
-  return err(VALIDATION_FAILED({ field: 'email' }));
+  return err('VALIDATION_FAILED');
   log.info('Simple message');
 });
 ```
 
 This fluent pattern provides a consistent, composable API across all trace operations.
 
-### The `.uint64_value()` Fluent Method <a id="smoo/lmao!n/lmao-entry-the-uint64-fluent-method"></a>
+### The `.uint64()` Fluent Method <a id="smoo/lmao!n/lmao-entry-the-uint64-fluent-method"></a>
 
-The `.uint64_value()` method attaches a large integer value to any entry type. It writes to the `uint64_value` lazy
-system column (see [Arrow Table Structure](./01f_arrow_table_structure.md)). The method name matches the column; there
-is no `.uint64()` alias ([Op and Buffer Metrics](./01n_op_and_buffer_metrics.md#smoo/lmao!n/op-metrics-uint64-api)).
+The `.uint64()` method attaches a large integer value to any entry type. It writes to the `uint64_value` lazy system
+column (see [Arrow Table Structure](./01f_arrow_table_structure.md)).
 
 **Use Cases**:
 
@@ -529,15 +536,15 @@ is no `.uint64()` alias ([Op and Buffer Metrics](./01n_op_and_buffer_metrics.md#
 **API Examples**:
 
 ```typescript
-const processRecords = defineOp('processRecords', async ({ log, tag, ok }, records) => {
+const processRecords = op(async ({ log, tag, ok }, records) => {
   // Attach to tag entry (row 0)
-  tag.batchId(batchId).uint64_value(recordCount);
+  tag.batchId(batchId).uint64(recordCount);
 
   // Attach to log entry (appended row)
-  log.info('Processing complete').uint64_value(bytesProcessed);
+  log.info('Processing complete').uint64(bytesProcessed);
 
   // Attach to result (row 1)
-  return ok(result).uint64_value(totalRecords);
+  return ok(result).uint64(totalRecords);
 });
 ```
 
@@ -552,8 +559,8 @@ const processRecords = defineOp('processRecords', async ({ log, tag, ok }, recor
 
 ### SpanLogger Allocation Design <a id="smoo/lmao!n/lmao-entry-spanlogger-zero-allocation-design"></a>
 
-The design avoids a per-call builder allocation by reusing each span's `SpanLogger`; span setup still creates the
-instance. A warmed entry write allocates nothing while capacity remains:
+The shipped design avoids a per-call builder allocation by reusing each span's `SpanLogger`; span setup still creates
+the instance. The target warmed entry write allocates nothing while capacity remains:
 
 #### Design Evolution and Trade-offs
 
@@ -600,44 +607,41 @@ The API is simplified by destructuring `tag` and `log` directly from the context
 
 ```typescript
 // Op context provides separate API surfaces via destructuring
-const processUser = defineOp('processUser', async ({ tag, log, setScope, ok, err }, userData) => {
+const processUser = op(async ({ tag, log, scope, ok, err }, userData) => {
   // tag: For span attributes (chainable setters)
   // log: For log messages (info/debug/warn/error)
-  // setScope: For scoped attributes
-  // ok/err: For span completion; every op returns one of them
-  return ok(userData);
+  // scope: For scoped attributes
+  // ok/err: For span completion
 });
 
-// TagWriter handles span attributes (chainable); its only instance field is the context's writer state
-class TagWriter {
-  constructor(state) {
-    this._state = state;
+// TagAPI handles span attributes (chainable)
+class TagAPI {
+  constructor(buffer) {
+    this.buffer = buffer;
     // Runtime class generation adds attribute methods to prototype
   }
 
-  // Object-based API: tag.with({ userId: "123" })
-  with(attributes) {
-    if (attributes.userId !== undefined && attributes.userId !== null) {
-      this._state._spanBuffer.userId(0, attributes.userId);
-    }
+  // Callable for object-based API: tag({ userId: "123" })
+  (attributes: Record<string, any>) {
+    this._writeAttributes(attributes);
     return this;
   }
 
   // Attribute methods compiled onto prototype at module context creation time
-  // Each writes one column of row 0 through the buffer's column setter
+  // These directly write to TypedArrays for minimal overhead
   userId(value) {
-    this._state._spanBuffer.userId(0, value); // Always row 0
+    this.buffer.userId_values[0] = value;  // Always row 0
     return this; // Chainable!
   }
 
   httpStatus(value) {
-    this._state._spanBuffer.httpStatus(0, value);
+    this.buffer.httpStatus_values[0] = value;
     return this;
   }
 }
 
-// BaseSpanLogger handles log messages
-class BaseSpanLogger {
+// LogAPI handles log messages
+class LogAPI {
   constructor(buffer) {
     this.buffer = buffer;
   }
@@ -659,8 +663,7 @@ class BaseSpanLogger {
 
 1. **Destructured APIs**: `tag` and `log` destructured directly from context - cleaner than nested access
 2. **No per-call chaining allocation**: All fluent methods return the same instance for continued chaining
-3. **Runtime class generation**: TagWriter and BaseSpanLogger classes built at runtime with `new Function` for typed
-   methods
+3. **Runtime class generation**: TagAPI and LogAPI classes built at runtime with `new Function` for typed methods
 4. **Per-span instances**: Each span creates new tag/log instances with direct buffer references
 5. **Span-local grouping**: Each span's entries stay together in final Arrow output; this does not order dictionaries
 6. **Prototype compilation**: Attribute methods compiled onto prototypes at module context creation time
@@ -671,16 +674,16 @@ class BaseSpanLogger {
 #### Usage Examples
 
 ```typescript
-const processUser = defineOp('processUser', async ({ tag, log, setScope, span, ok, err }, userData) => {
+const processUser = op(async ({ tag, log, scope, span, ok, err }, userData) => {
   // ===== SPAN ATTRIBUTES (tag) =====
   // Set span attributes - chainable methods
   tag.userId('user-123').requestId('req-456').operation('CREATE');
 
   // Object-based API for multiple attributes at once
-  tag.with({ userId: 'user-123', requestId: 'req-456', operation: 'CREATE' });
+  tag({ userId: 'user-123', requestId: 'req-456', operation: 'CREATE' });
 
   // ===== LOG MESSAGES (log) =====
-  // Format: {fieldName} placeholder; {{ and }} encode literal braces.
+  // TARGET FORMAT: {field} placeholder; {{ and }} encode literal braces.
 
   log.info('Processing user {userId}', { userId: 123 });
   // Logical message='Processing user {userId}', userId=123
@@ -694,31 +697,30 @@ const processUser = defineOp('processUser', async ({ tag, log, setScope, span, o
   log.error('Connection to {host} failed', { host: 'db.example.com' });
   // Logical message='Connection to {host} failed', host='db.example.com'
 
-  // ===== SCOPED ATTRIBUTES (setScope) =====
+  // ===== SCOPED ATTRIBUTES (scope) =====
   // Set once, propagates to all entries and child spans
-  setScope({ requestId: 'req-456', userId: 'user-123' });
+  scope({ requestId: 'req-456', userId: 'user-123' });
   // All subsequent entries in this span include these attributes
-
-  // ===== CHILD SPANS (span) =====
-  const payment = await span('process-payment', processPaymentOp, order);
-  if (payment.isErr()) return err(payment.error); // Rebuild a child's outcome on this context
 
   // ===== SPAN COMPLETION (ok/err) =====
   // Success with result data
   return ok(result).with({ rowsAffected: 5, duration: 12.5 });
 
-  // Error with context (VALIDATION_FAILED and NOT_FOUND come from defineCodeError)
-  return err(VALIDATION_FAILED({ field: 'email' })).with({ rule: 'unique' });
+  // Error with context
+  return err('VALIDATION_FAILED').with({ field: 'email', rule: 'unique' });
 
   // Simple usage when no additional context needed
   return ok(result);
-  return err(NOT_FOUND({ userId: 'user-123' }));
+  return err('NOT_FOUND');
+
+  // ===== CHILD SPANS (span) =====
+  const payment = await span('process-payment', processPaymentOp, order);
 });
 ```
 
 #### Performance Characteristics
 
-- **Allocation profile**: Span setup allocates the SpanLogger; individual fluent calls allocate no builder
+- **Shipped allocation profile**: Span setup allocates the SpanLogger; individual fluent calls allocate no builder
 - **Prototype methods**: All tag operations pre-compiled at module context creation time
 - **V8 optimization**: Single object with stable hidden class for optimal JIT compilation
 - **Memory efficiency**: No intermediate objects or proxies
@@ -739,7 +741,7 @@ This unrolling eliminates the object allocation and `Object.keys()` iteration at
 the transformer is enabled. Without the transformer, `with()` still works but has minor overhead from iterating the
 object keys.
 
-This design preserves fluent ergonomics while each warmed, in-capacity entry write stays allocation-free.
+This design preserves fluent ergonomics while the target keeps each warmed, in-capacity entry write allocation-free.
 
 ### Type Safety with Generics <a id="smoo/lmao!n/lmao-entry-type-safety-with-generics"></a>
 
@@ -747,28 +749,28 @@ The API uses TypeScript generics to provide full type safety for attribute opera
 
 ```typescript
 // Reserved method names that cannot be used as attributes
-type ReservedTagNames = 'with'; // Fewer reserved names since tag is separate
+type ReservedTagNames = 'with';  // Fewer reserved names since tag is separate
 type ReservedLogNames = 'with' | 'info' | 'debug' | 'warn' | 'error';
 
-// TagWriter - for span attributes (tag)
-type TagWriter<TAttributes extends ValidAttributes<TAttributes>> = {
-  // Dynamically generated attribute methods
-  [K in keyof TAttributes]: (value: TAttributes[K]) => TagWriter<TAttributes>;
-} & {
-  // Object-based API
-  with(attributes: Partial<TAttributes>): TagWriter<TAttributes>;
-};
+// TagAPI - for span attributes (tag)
+interface TagAPI<TAttributes extends ValidAttributes<TAttributes>> {
+  // Callable for object-based API
+  (attributes: Partial<TAttributes>): TagAPI<TAttributes>;
 
-// BaseSpanLogger - for log messages (log)
-interface BaseSpanLogger<TAttributes extends ValidAttributes<TAttributes>> {
-  info(message: string): FluentLogEntry<TAttributes>;
-  debug(message: string): FluentLogEntry<TAttributes>;
-  warn(message: string): FluentLogEntry<TAttributes>;
-  error(message: string): FluentLogEntry<TAttributes>;
+  // Dynamically generated attribute methods
+  [K in keyof TAttributes]: (value: TAttributes[K]) => TagAPI<TAttributes>;
 }
 
-interface FluentLogEntry<TAttributes> {
-  with(attributes: Partial<TAttributes>): FluentLogEntry<TAttributes>;
+// LogAPI - for log messages (log)
+interface LogAPI<TAttributes extends ValidAttributes<TAttributes>> {
+  info(message: string): FluentLog<TAttributes>;
+  debug(message: string): FluentLog<TAttributes>;
+  warn(message: string): FluentLog<TAttributes>;
+  error(message: string): FluentLog<TAttributes>;
+}
+
+interface FluentLog<TAttributes> {
+  with(attributes: Partial<TAttributes>): FluentLog<TAttributes>;
 }
 ```
 
@@ -784,10 +786,9 @@ interface UserServiceAttributes {
   // with: string;  // ❌ Compile error: reserved name
 }
 
-// The op context is typed by the defineOpContext() that created defineOp: SpanContext<Ctx>
-const createUser = defineOp(
-  'createUser',
-  async ({ tag, log, setScope, ok }: SpanContext<OpContextOf<typeof userContext>>, userData: UserData) => {
+// Op context is typed with attribute schema (Schema, Deps, FF, Extra)
+const createUser = op(
+  async ({ tag, log, scope, ok }: SpanContext<UserServiceAttributes, {}, {}, {}>, userData: UserData) => {
     // ===== tag - Span Attributes =====
     // Chainable attribute setters (destructured from context)
     tag
@@ -796,7 +797,7 @@ const createUser = defineOp(
       .operation('CREATE'); // ✅ Generated: (value: 'CREATE' | 'UPDATE' | 'DELETE') => this
 
     // Object-based API
-    tag.with({
+    tag({
       user_id: userData.id,
       operation: 'CREATE',
       email: userData.email, // ✅ optional property
@@ -809,13 +810,12 @@ const createUser = defineOp(
     });
 
     // Scoped attributes for the span
-    setScope({ user_id: userData.id });
+    scope({ user_id: userData.id });
 
     // TypeScript knows exactly what's available:
     // tag.user_id        ✅ Available
     // tag.http_status    ✅ Available
     // tag.invalidProp    ❌ TypeScript error: doesn't exist
-    return ok(userData);
   }
 );
 ```
@@ -826,11 +826,11 @@ This provides complete compile-time safety while maintaining zero runtime overhe
 
 The APIs reserve certain method names that cannot be used as attribute column names:
 
-**On `tag` (TagWriter)**:
+**On `tag` (TagAPI)**:
 
-- **`with`**: Reserved on `tag` for bulk attribute setting: `tag.with({ ... })` is the bulk setter.
+- **`with`**: Reserved on `tag` for bulk attribute setting; the object-callable form `tag({ ... })` is the bulk setter.
 
-**On `log` (BaseSpanLogger)**:
+**On `log` (LogAPI)**:
 
 - **`with`**: Used for fluent attribute chaining
 - **`info`, `debug`, `warn`, `error`**: Used for log level methods
@@ -842,7 +842,7 @@ When defining attribute schemas, these names must be avoided to prevent conflict
 **Span Attributes** (`tag`):
 
 - `tag.attribute(value)` - chainable attribute setters
-- `tag.with({ ... })` - object-based attribute setting
+- `tag({ ... })` - object-based attribute setting
 - Follows OpenTelemetry's `Span.setAttribute()` pattern
 
 **Log Messages** (`log`):
@@ -851,14 +851,14 @@ When defining attribute schemas, these names must be avoided to prevent conflict
 - `with({ ... })` - fluent attribute chaining
 - Every span creates a new `log` instance with reference to its buffer
 
-**Scoped Attributes** (`setScope`, `scope`):
+**Scoped Attributes** (`scope`):
 
-- `setScope({ ... })` - scoped attributes that propagate to all entries; `scope` reads the current values
+- `scope({ ... })` - scoped attributes that propagate to all entries
 
 **Span Completion** (`ok`, `err`):
 
 - `ok(result)` - success with optional result data (creates `span-ok` entry)
-- `err(error)` - error with optional context (creates `span-err` entry; a code error also fills `error_code`)
+- `err(code)` - error with optional context (creates `span-err` entry)
 - Follows OpenTelemetry's `Span.setStatus()` pattern
 
 **Child Spans** (`span`):
@@ -879,82 +879,78 @@ underlying entry type system and the span's own buffer.
 
 ## Fluent Result API <a id="smoo/lmao!n/lmao-entry-fluent-result-api"></a>
 
-The `ok()` and `err()` functions return fluent result objects bound to the span context that created them. Chained
-methods write to that span's reserved row 1 when they are called, and the objects keep ordinary TypeScript type
-narrowing for Result pattern consumption.
+The `ok()` and `err()` functions return **buffer-agnostic** fluent result objects that support method chaining while
+maintaining TypeScript type narrowing for Result pattern consumption.
 
-### Row-1 Result Writes <a id="smoo/lmao!n/lmao-entry-row1-result-writes"></a>
+### Deferred Tag Application Design <a id="smoo/lmao!n/lmao-entry-deferred-tag-application-design"></a>
 
-A result captures its creating context's writer state (`_state`) once, when `ctx.ok()` or `ctx.err()` runs. That state
-is both the write target and the completion owner. This ensures:
+**Key Insight**: FluentOk and FluentErr do NOT hold buffer references. This ensures:
 
-1. **Correct buffer targeting**: `.with()`, `.message()`, and `.line()` write to the creating span's row 1, never to a
-   span that later receives the result
-2. **No deferred work**: each chained call writes at once through the lazily materialized result writer; nothing is
-   queued for span end
-3. **Ownership**: the execution envelope completes a span only with a result whose `_state` is the executing context
-   (see Span-End Write Sequence above)
+1. **Type safety**: Can't accidentally write to wrong buffer if result is captured
+2. **Clean semantics**: `return ctx.ok(value)` is clearly a terminal expression
+3. **Correct buffer targeting**: `span()`/`trace()` applies tags to the correct buffer
+
+Each chained method captures the write operation as a closure in `applyTags`:
 
 ```typescript
 // What happens when you write:
 return ctx.ok(user).with({ cached: true }).message('Created');
 
-// 1. ctx.ok(user) creates an Ok holding the value and the context's writer state
-// 2. .with({ cached: true }) writes the cached column of row 1
-// 3. .message('Created') writes the message column of row 1
-// 4. span() checks that the result belongs to the executing context, then calls writeSpanEnd(buffer, result)
-// 5. writeSpanEnd writes entry_type and timestamp, plus error_code for an Err
+// 1. ctx.ok(user) creates FluentOk with value, no buffer reference
+// 2. .with({ cached: true }) captures attribute writes in closure
+// 3. .message('Created') chains another closure
+// 4. span() receives result, calls writeSpanEnd(buffer, result)
+// 5. writeSpanEnd writes entry_type, timestamp, then calls result.applyTags(buffer)
 ```
 
-### Ok <a id="smoo/lmao!n/lmao-entry-fluentok"></a>
+### FluentOk <a id="smoo/lmao!n/lmao-entry-fluentok"></a>
 
-Returned by `ctx.ok(value)`. It is the `Ok<V>` class with row-1 chaining methods:
+Returned by `ctx.ok(value)`. Implements the `Ok<V>` interface with deferred chaining methods:
 
 ```typescript
-class Ok<V, T extends LogSchema = LogSchema> {
+class FluentOk<V, T extends LogSchema> implements Ok<V> {
   readonly value: V;
-  protected readonly _state: WriterState | undefined; // Creating context: write target and completion owner
+  applyTags?: (buffer: SpanBuffer<T>) => void; // Closure chain
 
-  constructor(value: V, state?: WriterState) {
+  constructor(value: V) {
     this.value = value;
-    this._state = state;
+    // No buffer reference!
   }
 
   get success(): true {
     return true;
   } // Derived from class identity
 
-  // Write attributes to row 1
+  // Capture attribute writes as closure
   with(attributes: Partial<InferSchema<T>>): this;
 
-  // Write the row 1 message (overwrites the span name in row 1)
+  // Capture message write as closure (overwrites span name in row 1)
   message(text: string): this;
 
-  // Write the row 1 line number
+  // Capture line number write as closure
   line(lineNumber: number): this;
 }
 ```
 
-### Err <a id="smoo/lmao!n/lmao-entry-fluenterr"></a>
+### FluentErr <a id="smoo/lmao!n/lmao-entry-fluenterr"></a>
 
-Returned by `ctx.err(error)`. It is the `Err<E>` class with the same row-1 chaining methods. A code error built with
-`defineCodeError` (for example `NOT_FOUND({ userId })`) carries the `code` that becomes `error_code`:
+Returned by `ctx.err(code, details)`. Implements the `Err<E>` interface with deferred chaining methods:
 
 ```typescript
-class Err<E, T extends LogSchema = LogSchema> {
-  readonly error: E;
-  protected readonly _state: WriterState | undefined; // Creating context: write target and completion owner
+class FluentErr<E, T extends LogSchema> implements Err<E> {
+  readonly error: { code: string; details: E };
+  applyTags?: (buffer: SpanBuffer<T>) => void; // Closure chain
 
-  constructor(error: E, state?: WriterState) {
-    this.error = error;
-    this._state = state;
+  constructor(code: string, details: E) {
+    this.error = { code, details };
+    // No buffer reference! error_code written by span()/trace()
   }
 
   get success(): false {
     return false;
   } // Derived from class identity
 
-  // Same chaining methods as Ok
+  // Same chaining methods as FluentOk
   with(attributes: Partial<InferSchema<T>>): this;
   message(text: string): this;
   line(lineNumber: number): this;
@@ -963,20 +959,19 @@ class Err<E, T extends LogSchema = LogSchema> {
 
 ### Buffer Write Timing <a id="smoo/lmao!n/lmao-entry-buffer-write-timing"></a>
 
-Row 1 is written in two phases:
+All writes to row 1 happen when `span()`/`trace()` completes:
 
-1. **Attributes, message, line**: written by the chained methods while the op body runs, before the result is returned
-2. **Entry type**: written by `writeSpanEnd` at span completion, from `instanceof Ok` vs `Err`
-3. **Timestamp**: written by `writeSpanEnd` at span-end time
-4. **Error code**: written by `writeSpanEnd` from `result.error.code` when the error carries a string `code`
+1. **Entry type**: Written based on `instanceof FluentOk` vs `FluentErr`
+2. **Timestamp**: Written at span-end time
+3. **Error code**: Written from `result.error.code` for FluentErr
+4. **Deferred tags**: Applied via `result.applyTags(buffer)` if present
 
-Row 1 reads as `span-exception` until `writeSpanEnd` runs, so a span whose body throws after a chained write still
-records its exception outcome.
+This ensures row 1 is never partially written - it's atomic at span completion.
 
 ### Usage Examples <a id="smoo/lmao!n/lmao-entry-usage-examples"></a>
 
 ```typescript
-const createUser = defineOp('createUser', async ({ ok, err }, userData) => {
+const createUser = op(async ({ ok, err }, userData) => {
   // Simple success - just the value
   return ok(user);
 
@@ -989,20 +984,20 @@ const createUser = defineOp('createUser', async ({ ok, err }, userData) => {
   // Success with both attributes and message
   return ok(user).with({ rowsAffected: 1, duration: 42.5 }).message('User created successfully');
 
-  // Simple error - a code error (NOT_FOUND and VALIDATION_FAILED come from defineCodeError)
-  return err(NOT_FOUND({ userId: 'user-123' }));
+  // Simple error - code and details
+  return err('NOT_FOUND', { userId: 'user-123' });
 
   // Error with additional attributes
-  return err(VALIDATION_FAILED({ field: 'email' })).with({
+  return err('VALIDATION_FAILED', { field: 'email' }).with({
     attemptedValue: userData.email,
     validationRule: 'unique_constraint',
   });
 
   // Error with message
-  return err(NOT_FOUND({ userId })).message('User not found in database');
+  return err('NOT_FOUND', { userId }).message('User not found in database');
 
   // Error with both attributes and message
-  return err(VALIDATION_FAILED({ field: 'email' }))
+  return err('VALIDATION_FAILED', { field: 'email' })
     .with({ validationRule: 'format' })
     .message('Invalid email format provided');
 });
@@ -1020,7 +1015,7 @@ if (result.success) {
   // result.value is available
   console.log('Created user:', result.value.id);
 } else {
-  // TypeScript knows: result is Err
+  // TypeScript knows: result is FluentErrorResult
   // result.error.code and result.error.details are available
   console.log('Failed:', result.error.code, result.error.details);
 }
@@ -1056,11 +1051,11 @@ The entry type system is implemented through low-level column writers that direc
 
 The concrete column-writing API is the **schema-driven, codegen'd** writer set defined in
 [Trace Context API Codegen](./01g_trace_context_api_codegen.md#1-schema-driven-column-writers); that spec is the source
-of truth for the generated writers. The `writeColumnName()` interface below is an **example** — it names the columns
+of truth for the generated writers. The `writeColumnName()` interface below is **illustrative** — it names the columns
 each entry type populates, not the generated method surface:
 
 ```typescript
-// Example shape — the generated writers are specified in 01g §Schema-Driven Column Writers
+// ILLUSTRATIVE shape — the generated writers are specified in 01g §Schema-Driven Column Writers
 interface ColumnWriters {
   // Core system columns
   writeTimestamp(value: bigint): void;
@@ -1082,7 +1077,8 @@ interface ColumnWriters {
 ### Entry Type Creation Patterns <a id="smoo/lmao!n/lmao-entry-entry-type-creation-patterns"></a>
 
 Each entry type populates a fixed set of columns; the per-type column contract below is normative (it matches
-[Entry Type Validation](#entry-type-validation)). The `writeColumnName()` calls stand in for the codegen'd writers
+[Entry Type Validation](#entry-type-validation)). The `writeColumnName()` calls are illustrative stand-ins for the
+codegen'd writers
 ([01g §Schema-Driven Column Writers](./01g_trace_context_api_codegen.md#1-schema-driven-column-writers)):
 
 #### Span Start Pattern
@@ -1141,7 +1137,7 @@ function createSpanCompletion(entryType: 'span-ok' | 'span-err', result?: any, a
 #### Log Entry Pattern
 
 ```typescript
-// Grammar: {fieldName} is a placeholder; {{ and }} encode literal braces.
+// TARGET GRAMMAR: {field} is a placeholder; {{ and }} encode literal braces.
 // Example: 'User {userId} created' is stored as template identity, never rendered on the entry path.
 // Values such as userId are written to their own typed columns.
 function createLogEntry(
@@ -1263,7 +1259,8 @@ The system enforces entry type constraints at the API level:
   value
 - **Op metrics** (`op-invocations`, `op-errors`, `op-exceptions`, `op-duration-*`): `message` contains op name,
   `uint64_value` contains the metric value
-- **Buffer metrics** (`buffer-writes`, `buffer-spans`, `buffer-capacity`): `uint64_value` contains the metric value
+- **Buffer metrics** (`buffer-writes`, `buffer-overflow-writes`, `buffer-created`, `buffer-overflows`): `uint64_value`
+  contains the metric value
 - **Period marker** (`period-start`): `uint64_value` contains the period start timestamp (nanoseconds)
 
 ### The `message` Column by Entry Type <a id="smoo/lmao!n/lmao-entry-the-message-column-by-entry-type"></a>
@@ -1275,7 +1272,7 @@ The system enforces entry type constraints at the API level:
 | `debug`, `trace`                                      | Literal template or allowed raw dynamic diagnostic string      |
 | `ff-access`, `ff-usage`                               | Flag name (e.g., `'advancedValidation'`, `'darkMode'`)         |
 | `op-*` (all 8 op metric types)                        | Op name (e.g., `'GET'`, `'createUser'`)                        |
-| `period-start`, `buffer-*` (4 types)                  | unused (null)                                                  |
+| `period-start`, `buffer-*` (5 types)                  | unused (null)                                                  |
 
 ### Fixed Row Constraints <a id="smoo/lmao!n/lmao-entry-fixed-row-constraints"></a>
 
@@ -1306,10 +1303,10 @@ Entry types use Arrow's dictionary encoding:
 
 The entry type system is designed for minimal hot path overhead:
 
-- **Pre-generated writers**: Column writers are generated and bound during startup
+- **Pre-generated writers**: Target column writers are generated and bound during startup
 - **Specialized callsites**: Static, structured, and dynamic callsite classes each have a fixed path
 - **Physical mixed layout**: Only a buffer with both static-index and dynamic-reference lanes is called mixed
-- **Direct memory writes**: Warmed in-capacity calls perform fixed stores without intermediate objects
+- **Direct memory writes**: Warmed in-capacity target calls perform fixed stores without intermediate objects
 
 ## Integration Points <a id="smoo/lmao!n/lmao-entry-integration-points"></a>
 

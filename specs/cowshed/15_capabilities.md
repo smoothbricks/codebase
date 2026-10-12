@@ -28,7 +28,7 @@ path and failure.
 | direnv    | `.envrc`                                                                       | Contained shell activation, private approval state, read-only host `source_url` store, bootstrap executable         |
 | Nx        | `nx.json`                                                                      | The checkout's one `.nx` and daemon for every job; short shared socket namespace; discard inherited daemon records  |
 | cargo     | Tracked `Cargo.toml` files                                                     | Distinct workspaces' configured target dirs; shared registry/git caches and exact cache-state files; Git and trust  |
-| Go        | `go.mod` or `go.work` at the selected root, or any tracked `go.mod` below it   | Shared module/build caches; `GOPROXY` without `direct`, `GOSUMDB`, `GOTOOLCHAIN=local`; no generated GOENV          |
+| Go        | `go.mod` or `go.work` at the selected root, or any tracked `go.mod` below it   | Shared module/build caches; no generated GOENV or toolchain/proxy policy                                            |
 | Bun       | `package.json` and `bun.lock` or `bun.lockb`                                   | Bun install cache and JavaScript trust/proxy settings; each installed package's `node_modules/.cache`               |
 | npm       | `package.json` and `package-lock.json` or `npm-shrinkwrap.json`                | npm content cache and JavaScript trust/proxy settings; each installed package's `node_modules/.cache`               |
 | pnpm      | `package.json` and `pnpm-lock.yaml`                                            | pnpm store and JavaScript trust/proxy settings; each installed package's `node_modules/.cache`                      |

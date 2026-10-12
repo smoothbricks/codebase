@@ -5068,38 +5068,35 @@ fn system_mount_source_observes_the_live_root_mount() {
 /// on this same volume and marker, once the verification attachment has released its raw pin.
 #[test]
 fn real_apfs_kernel_mount_flag_truth_table_allows_browse_but_requires_owners() {
-    // The pool's one scenario image, attached once for the whole lane run: this test only
-    // mounts its already-attached volume under each flag combination and reads the kernel.
-    let pool = blank_image::pool_root();
-    let layout = StorageLayout::new(&pool, &repo()).expect("pool layout");
-    let canonical = layout.main_image().expect("canonical");
-    let shared = blank_image::shared_image_at("scenario-main", canonical.image());
-    metadata()
-        .write_for_image(canonical.image())
-        .expect("sidecar");
-    let signing_key =
-        KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("fixture P-256 private key");
-    write_ca_key(canonical.image(), signing_key.serialize_pem().as_bytes());
-    let mount = pool.join("mount");
-    let host =
-        MacOsApfsExecutionHost::new(SystemCommandRunner, ApfsSubstrateConfig::new(&pool, &mount))
-            .expect("native APFS host");
-    let mounted = shared.mount_at(&mount, "nobrowse,owners");
-    host.write_marker(&mount, &workspace(), None, &identity_at(&pool))
-        .expect("mount marker");
-    drop(mounted);
+    let fixture = RealFixture::new("flag-table");
+    let canonical = fixture.layout().main_image().expect("canonical");
+    fixture.published_image(canonical.image());
+    let mount = fixture.main_mount();
+    let attachment = fixture.mount_left_behind(canonical.image(), &mount, "nobrowse,owners");
+    fixture.plant_marker(&mount, &workspace());
+    let host = fixture.host();
     for (options, expected_valid) in [
         ("nobrowse,owners", true),
         ("nobrowse,noowners", false),
         ("owners", true),
     ] {
-        let mounted = shared.mount_at(&mount, options);
+        if kernel_mount_at(&mount).is_none() {
+            fixture.remount(&attachment, &mount, options);
+        }
         let result = host.mounts(&repo());
         assert_eq!(result.is_ok(), expected_valid, "{options}: {result:?}");
-        drop(mounted);
+        let unmounted = SystemCommandRunner
+            .run(&CommandRequest::new("/sbin/umount", [&mount]))
+            .expect("umount");
+        assert!(
+            unmounted.succeeded(),
+            "umount {}: {}",
+            mount.display(),
+            String::from_utf8_lossy(&unmounted.stderr)
+        );
     }
 
-    let _mounted = shared.mount_at(&mount, "noowners");
+    fixture.remount(&attachment, &mount, "noowners");
     let result = host.mounts(&repo());
     assert!(result.is_err(), "noowners: {result:?}");
     assert!(
@@ -5108,6 +5105,10 @@ fn real_apfs_kernel_mount_flag_truth_table_allows_browse_but_requires_owners() {
             .to_string()
             .contains("non-canonical flags")
     );
+    // The verification attachment still holds the raw device pin. Hdiutil's detach is refused
+    // while it is held, so release it before healing by mountpoint.
+    drop(attachment);
+
     host.heal_mount(&workspace(), &mount)
         .expect("heal by mountpoint");
     assert!(
@@ -5904,12 +5905,8 @@ fn resize_refuses_a_capacity_that_does_not_grow_before_touching_the_image() {
 
 /// A holder first refuses both resize and defragment without changing the image or its
 /// attachment. Once released, the same mounted workspace grows and returns with its payload.
-/// The refused-grow, defragment and failed-rewrite phases run on this same mounted workspace
-/// in turn: one fixture lifecycle proves the whole resize/defrag scenario (08_testing.md,
-/// "Host limit"), instead of an attach per phase.
 #[test]
-fn real_apfs_resize_and_defrag_scenario_puts_a_mounted_workspace_back_on_its_mount_substrate_lifecycle()
- {
+fn real_apfs_resizing_a_mounted_workspace_puts_it_back_on_its_mount() {
     let fixture = RealFixture::new("resize-mounted");
     let (image, mount) = mounted_main(&fixture);
     let host = fixture.host();
@@ -5979,59 +5976,6 @@ fn real_apfs_resize_and_defrag_scenario_puts_a_mounted_workspace_back_on_its_mou
         "the workspace stays mounted"
     );
     drop(holder);
-    // A grow the image file refuses (user-immutable during the grow) leaves the image ungrown
-    // and the workspace back on its mount, on this same fixture.
-    let refused_host = MacOsApfsExecutionHost::with_mount_source(
-        ImmutableDuringResize {
-            image: image.clone(),
-            resized: AtomicUsize::new(0),
-        },
-        fixture.config(),
-        SystemKernelMountSource,
-    )
-    .expect("native APFS host");
-    let error = refused_host
-        .resize(
-            &workspace(),
-            &image,
-            &mount,
-            ImageCapacity::from_gibibytes(2),
-        )
-        .expect_err("an image nothing may write refuses to grow");
-    assert!(
-        matches!(
-            &error,
-            ApfsStorageError::Apfs(ApfsError::FileOperation { operation, source, .. })
-                if *operation == "grow RAW image"
-                    && source.kind() == std::io::ErrorKind::PermissionDenied
-        ),
-        "unexpected failure: {error}"
-    );
-    assert_eq!(
-        refused_host
-            .backend()
-            .runner()
-            .resized
-            .load(Ordering::SeqCst),
-        1,
-        "the refused grow really ran against the immutable file"
-    );
-    let after = kernel_attachments(&image);
-    assert!(
-        matches!(
-            after.as_slice(),
-            [only] if only.capacity == Some(ImageCapacity::from_gibibytes(1))
-        ),
-        "a refused resize grows nothing and leaves one fresh attachment: {after:?}"
-    );
-    assert!(
-        kernel_mount_at(&mount).is_some(),
-        "the workspace is back on its mount"
-    );
-    assert_eq!(
-        std::fs::read(mount.join("payload")).expect("payload"),
-        b"carried across"
-    );
 
     let outcome = host
         .resize(
@@ -6041,58 +5985,12 @@ fn real_apfs_resize_and_defrag_scenario_puts_a_mounted_workspace_back_on_its_mou
             ImageCapacity::from_gibibytes(2),
         )
         .expect("resize a mounted workspace");
+
     assert_eq!(outcome.capacity, ImageCapacity::from_gibibytes(2));
     assert!(
         filesystem_bytes(&mount) > ImageCapacity::from_gibibytes(1).bytes(),
         "the remounted volume spans the grown container"
     );
-    assert!(
-        kernel_mount_at(&mount).is_some(),
-        "the workspace is back on its mount"
-    );
-    assert_eq!(
-        std::fs::read(mount.join("payload")).expect("payload"),
-        b"carried across"
-    );
-
-    // Defragmenting the same mounted workspace replaces its image and puts it back.
-    let before = std::fs::metadata(&image).expect("image");
-    let outcome = host
-        .defragment(&workspace(), &image, &mount)
-        .expect("defragment a mounted workspace");
-    let after = std::fs::metadata(&image).expect("image");
-    assert_ne!(after.ino(), before.ino(), "the image is a new file");
-    assert_eq!(after.len(), before.len());
-    assert_eq!(after.permissions().mode(), before.permissions().mode());
-    assert!(
-        outcome.bytes > 0 && outcome.bytes <= before.len(),
-        "only the image's data is copied: {} of {} bytes",
-        outcome.bytes,
-        before.len()
-    );
-    assert!(
-        kernel_mount_at(&mount).is_some(),
-        "the workspace is back on its mount"
-    );
-
-    // A rewrite that cannot clear its copy fails before a byte is copied, image untouched.
-    let before = std::fs::metadata(&image).expect("image").ino();
-    let sibling = cowshed_core::storage::apfs::extents::rewrite_sibling(&image);
-    std::fs::create_dir(&sibling).expect("obstruct the rewrite");
-    std::fs::write(sibling.join("occupant"), b"x").expect("occupy the obstruction");
-    let error = host
-        .defragment(&workspace(), &image, &mount)
-        .expect_err("an obstructed rewrite fails");
-    assert!(
-        matches!(
-            &error,
-            ApfsStorageError::Io { operation, path, .. }
-                if *operation == "remove an interrupted rewrite's copy" && *path == sibling
-        ),
-        "unexpected failure: {error}"
-    );
-    assert_eq!(std::fs::metadata(&image).expect("image").ino(), before);
-    std::fs::remove_dir_all(&sibling).expect("clear the obstruction");
     assert_back_on_its_mount(&host, &image, &mount);
 }
 
@@ -6207,6 +6105,107 @@ impl CommandRunner for ImmutableDuringResize {
     fn attached_disk_images(&self) -> std::io::Result<Vec<AttachedDiskImage>> {
         SystemCommandRunner.attached_disk_images()
     }
+}
+
+#[test]
+fn real_apfs_a_refused_resize_leaves_the_image_ungrown_and_puts_the_workspace_back_on_its_mount() {
+    let fixture = RealFixture::new("resize-refused");
+    let (image, mount) = mounted_main(&fixture);
+    let host = MacOsApfsExecutionHost::with_mount_source(
+        ImmutableDuringResize {
+            image: image.clone(),
+            resized: AtomicUsize::new(0),
+        },
+        fixture.config(),
+        SystemKernelMountSource,
+    )
+    .expect("native APFS host");
+
+    let error = host
+        .resize(
+            &workspace(),
+            &image,
+            &mount,
+            ImageCapacity::from_gibibytes(2),
+        )
+        .expect_err("an image nothing may write refuses to grow");
+
+    assert!(
+        matches!(
+            &error,
+            ApfsStorageError::Apfs(ApfsError::FileOperation { operation, source, .. })
+                if *operation == "grow RAW image"
+                    && source.kind() == std::io::ErrorKind::PermissionDenied
+        ),
+        "unexpected failure: {error}"
+    );
+    assert_eq!(
+        host.backend().runner().resized.load(Ordering::SeqCst),
+        1,
+        "the refused grow really ran against the immutable file"
+    );
+    let after = kernel_attachments(&image);
+    assert!(
+        matches!(
+            after.as_slice(),
+            [only] if only.capacity == Some(ImageCapacity::from_gibibytes(1))
+        ),
+        "a refused resize grows nothing and leaves one fresh attachment: {after:?}"
+    );
+    assert_back_on_its_mount(&host, &image, &mount);
+}
+
+#[test]
+fn real_apfs_defragmenting_a_mounted_workspace_replaces_the_image_then_puts_it_back_on_its_mount() {
+    let fixture = RealFixture::new("defragment-mounted");
+    let (image, mount) = mounted_main(&fixture);
+    let host = fixture.host();
+    let before = std::fs::metadata(&image).expect("image");
+
+    let outcome = host
+        .defragment(&workspace(), &image, &mount)
+        .expect("defragment a mounted workspace");
+
+    let after = std::fs::metadata(&image).expect("image");
+    assert_ne!(after.ino(), before.ino(), "the image is a new file");
+    assert_eq!(after.len(), before.len());
+    assert_eq!(after.permissions().mode(), before.permissions().mode());
+    assert!(
+        outcome.bytes > 0 && outcome.bytes <= before.len(),
+        "only the image's data is copied: {} of {} bytes",
+        outcome.bytes,
+        before.len()
+    );
+    assert_back_on_its_mount(&host, &image, &mount);
+}
+
+#[test]
+fn real_apfs_a_failed_rewrite_leaves_the_image_untouched_and_puts_the_workspace_back_on_its_mount()
+{
+    let fixture = RealFixture::new("defragment-failed");
+    let (image, mount) = mounted_main(&fixture);
+    let host = fixture.host();
+    let before = std::fs::metadata(&image).expect("image").ino();
+    // A directory where the copy has to go: the rewrite cannot clear it, so it fails before a
+    // byte is copied.
+    let sibling = cowshed_core::storage::apfs::extents::rewrite_sibling(&image);
+    std::fs::create_dir(&sibling).expect("obstruct the rewrite");
+    std::fs::write(sibling.join("occupant"), b"x").expect("occupy the obstruction");
+
+    let error = host
+        .defragment(&workspace(), &image, &mount)
+        .expect_err("an obstructed rewrite fails");
+
+    assert!(
+        matches!(
+            &error,
+            ApfsStorageError::Io { operation, path, .. }
+                if *operation == "remove an interrupted rewrite's copy" && *path == sibling
+        ),
+        "unexpected failure: {error}"
+    );
+    assert_eq!(std::fs::metadata(&image).expect("image").ino(), before);
+    assert_back_on_its_mount(&host, &image, &mount);
 }
 
 /// SliceA quarantine: a published canonical image whose grants sidecar exists but whose CA

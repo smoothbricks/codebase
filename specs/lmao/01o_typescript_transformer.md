@@ -4,20 +4,19 @@ The LMAO TypeScript transformer performs compile-time rewrites that remove runti
 is available. The optimizations below describe emitted code and runtime contracts; they do not imply an unmeasured
 speedup.
 
-The sole compiler implementation is the native ttsc/tsgo plugin in `packages/lmao-ttsc/plugin/driver/`. Bun build and
-runtime hosts load that plugin through the package's `@ttsc/unplugin` adapters; there is no parallel TypeScript
-compiler-API transformer. The plugin performs Promise-preserving fixed-arity span lowering, packed runtime hints,
-global-vocabulary registration of literal log templates and span names, and the line, metadata, tag, log, and result
-transformations. Its Go suite and Bun integration tests assert the transformed output, which is the contract for emitted
-code.
-
-Destructured-context rewriting (§3) rewrites a first parameter that destructures `span` into `__ctx`
-(`packages/lmao-ttsc/plugin/driver/destructured.go`). `spanAutoN` is an internal, explicit runtime seam. Automatic
-`ctx.span(...)` → `spanAutoN(...)` lowering is disabled because `span()`'s retry-aware envelope must not silently
-degrade to a synchronous return (01c). Root `trace()` callsites keep the op's own result kind for the same reason.
-
-The global vocabulary ABI in §6.2 is the only representation of a literal log message: there is no Op-local template
-table and no per-Op `u16` ID lane (§6.1). No performance improvement is claimed without the §6.2 benchmark gates.
+> **Implementation status (system state).** The sole compiler implementation is the native ttsc/tsgo plugin in
+> `packages/lmao-ttsc/plugin/driver/`. Bun build and runtime hosts load that plugin through the package's
+> `@ttsc/unplugin` adapters; there is no parallel TypeScript compiler-API transformer. Promise-preserving fixed-arity
+> span lowering, packed runtime hints, private `u16` log-template storage, and the line, metadata, tag, log, and result
+> transformations are implemented in the native plugin and covered by its Go suite plus Bun integration.
+> Destructured-context rewriting (§3) is implemented: a first parameter that destructures `span` becomes `__ctx`
+> (`packages/lmao-ttsc/plugin/driver/destructured.go`). `spanAutoN` exists as an internal, explicit runtime seam, but
+> automatic `ctx.span(...)` → `spanAutoN(...)` lowering is intentionally disabled because `span()`'s retry-aware
+> envelope must not silently degrade to a synchronous return (01c). Root `trace()` callsites keep the op's own result
+> kind for the same reason. The running invariant is **the transformed output the tests assert**, not earlier design
+> sketches. The global vocabulary ABI in §6.2 is the clean-cutover target, not shipped behavior. The shipped Op-local
+> IDs remain lexical `u16` values, not stable IDs or `VocabularyBinding` indices. No performance improvement is claimed
+> for either representation without its phase-specific benchmark gate.
 
 ## Bun integration
 
@@ -111,7 +110,7 @@ should always use the transformer for optimal performance.
 
 Injects the 1-based source line as the first runtime argument when a span call can be lowered without changing
 evaluation or Promise semantics. The line comes from `getLineNumber()` (`getLineAndCharacterOfPosition` + 1) and is also
-reused by the log, result, and metadata rewrites.
+reused by log, result, and task rewrites.
 
 ```typescript
 // User writes:
@@ -120,7 +119,7 @@ await ctx.span('fetch-user', fetchUserOp, userId);
 // Stable, checker-proved Op:
 await ctx.span1(
   42,
-  $$lmaoVocabulary[0],
+  'fetch-user',
   fetchUserOp.callsitePlan.newCtx0(ctx),
   fetchUserOp.callsitePlan,
   fetchUserOp.fn,
@@ -155,7 +154,7 @@ await ctx.span('fetch-user', fetchUserOp, userId);
 // Transformer outputs:
 await ctx.span1(
   42,
-  $$lmaoVocabulary[0],
+  'fetch-user',
   fetchUserOp.callsitePlan.newCtx0(ctx),
   fetchUserOp.callsitePlan,
   fetchUserOp.fn,
@@ -170,7 +169,7 @@ await ctx.span('validate', async (child) => child.ok(1), userId);
 // Transformer outputs:
 await ctx.span1(
   42,
-  $$lmaoVocabulary[1],
+  'validate',
   ctx._physicalLayoutPlan.newCtx0(ctx),
   ctx._physicalLayoutPlan,
   async (child) => child.ok(1),
@@ -178,12 +177,9 @@ await ctx.span1(
 );
 ```
 
-A checker-proven literal span name lowers its name operand to the registered vocabulary index `$$lmaoVocabulary[N]`
-(§6.2). The member form registers the name at `plugin/driver/optimization.go:900-903` and lowers it at
-`plugin/driver/lmao.go:418-421`; the re-rooted form (§3) follows the same rule. A dynamic span name is not registered
-and keeps its string operand. The child context's source is exactly `callsitePlan.newCtx0(receiver)`: with no overrides
-the plan's factory returns the receiver itself (`packages/lmao/src/lib/physicalLayoutPlan.ts:139`), and `_spanPre`
-builds the child `SpanContextClass` over it (`packages/lmao/src/lib/spanContext.ts:1179-1216`). It is not a copied or
+A proven call with a literal span name may lower its name operand to the registered vocabulary index instead of the
+string literal (`plugin/driver/lmao.go:405-407`). The child context is exactly `callsitePlan.newCtx0(receiver)` — the
+plan's prototype-inheriting child constructor (`packages/lmao/src/lib/spanContext.ts:1123-1126`) — not a copied or
 merged object. Because `spanN` remains Promise-based, the lowered call preserves the public `span()` scheduling
 contract.
 
@@ -203,7 +199,7 @@ Promise allocation.
 
 #### Internal `spanAutoN` seam
 
-The runtime exposes `spanAuto0`–`spanAuto8` as an internal/explicit ABI returning `Result | Promise<Result>`.
+The runtime still exposes `spanAuto0`–`spanAuto8` as an internal/explicit ABI returning `Result | Promise<Result>`.
 `_spanAutoPre` performs `Object.create(this)`, passes that exact inherited child to `_spanPre`, and invokes the Op once
 on the initial path. A genuine `Ok`/`Err` terminal result with no retry requirement is finalized and returned
 synchronously. All other values—including custom thenables—transfer to the async helper and are assimilated once; a
@@ -238,19 +234,14 @@ first parameter is destructured is therefore conservatively hinted as `0`, and s
 hint analysis reads the callback as written, so the hint does not depend on the rewrite. Its span calls do lower.
 
 `defineOp` is annotated only when no fourth argument already exists. Its fourth argument is
-`{ runtimeHint, eagerColumns }`; the third argument carries the injected source metadata (§5), or `undefined` when no
-metadata is injected. `defineOps` is annotated only when called with a single object literal; its second argument is a
-property-keyed map of the same structured metadata. The map includes inline arrow functions, function expressions, and
-method declarations, keyed by literal property name. Shorthand properties and property assignments containing an
-existing Op identifier/expression are omitted rather than assigned empty metadata; an analyzable inline callback that
-fails closed-world hint analysis keeps its own key with `runtimeHint: 0`. The runtime normalizes the fields and installs
-`runtimeHint` on the Op.
-
-`eagerColumns` lists, sorted, the schema columns the callback writes on every path: the columns written by
-checker-proved `tag`, `log`, and result chains on its context parameter, intersected across every path that returns or
-falls through. The field is omitted when the set is empty or any write cannot be proved. At `defineOp`, the runtime
-resolves the names against the Op's log schema (`resolveEagerColumns`, which throws on an unknown name) and selects a
-span buffer class that preallocates those columns, so their first write binds no storage lazily.
+`{ runtimeHint, logTemplateIds }`; missing user metadata is represented by an inserted third argument `undefined`.
+`defineOps` is annotated only when called with a single object literal; its second argument is a property-keyed map of
+the same structured metadata. The map includes inline arrow functions, function expressions, and method declarations,
+keyed by literal property name. Shorthand properties and property assignments containing an existing Op
+identifier/expression are omitted rather than assigned empty metadata; an analyzable inline callback that fails
+closed-world hint analysis keeps its own key with `runtimeHint: 0`. This object ABI replaces the earlier bare
+packed-hint argument/map: the runtime normalizes both fields, installs `runtimeHint` on the Op, and copies the frozen
+template table to `OpMetadata.logTemplateIds`.
 
 Hint analysis reads the original callback as written; it does not depend on any body rewrite.
 
@@ -268,9 +259,9 @@ destructures `span` with `__ctx`, rebinds the remaining properties as the first 
 the call, so there is exactly one span lowering in the transform and the two forms cannot drift.
 
 A parameter qualifies when its CHECKER TYPE is a proven LMAO context — not when the literal is passed to a particular
-callee. That is stronger than an `op`/`defineOp`/`defineOps` whitelist: it cannot admit a same-named foreign function,
-and it admits a proven context a whitelist would miss. Other destructured properties keep their aliases, defaults, and
-nested bindings verbatim, because the binding pattern node is reused minus `span` rather than rebuilt.
+callee. That is stronger than an `op`/`defineOp`/`defineOps`/`task` whitelist: it cannot admit a same-named foreign
+function, and it admits a proven context a whitelist would miss. Other destructured properties keep their aliases,
+defaults, and nested bindings verbatim, because the binding pattern node is reused minus `span` rather than rebuilt.
 
 ```typescript
 // User writes:
@@ -283,7 +274,7 @@ op(async (__ctx, userId) => {
   const { log } = __ctx;
   await __ctx.span1(
     42,
-    $$lmaoVocabulary[0],
+    'fetch',
     fetchUserOp.callsitePlan.newCtx0(__ctx),
     fetchUserOp.callsitePlan,
     fetchUserOp.fn,
@@ -312,8 +303,10 @@ A concise arrow body is converted to a block with an explicit `return` only when
 prepended; with no residual properties the body stays concise. Only a destructured PARAMETER is rewritten — a body-level
 `const { span } = ctx` is left alone.
 
-A re-rooted call follows the §2 span-name rule: a checker-proven literal name lowers its name operand to the registered
-vocabulary index. The `spanN` name operand is typed `string | number`, so the runtime accepts either operand form.
+A re-rooted call emits its span name as the string literal, not as a vocabulary index: the whole-program vocabulary
+registers span names only for the member form, so a bare `span(...)` name is never interned. The `spanN` name operand is
+typed `string | number` and accepts either, so this costs the interning, not the lowering. Interning them is a target;
+it moves catalog ordinals, so it is not a free change.
 
 ### 4. `with()` Bulk Setter Unrolling <a id="smoo/lmao!n/transformer-tag-chain-inline"></a>
 
@@ -348,38 +341,43 @@ their sorted-order index via a switch IIFE; non-literal arguments are wrapped in
 
 ### 5. Metadata Injection <a id="smoo/lmao!n/transformer-metadata-inject"></a>
 
-Injects per-Op source metadata from build context as the third argument of each `defineOp` call. The runtime takes this
-argument as `metadata?: Partial<OpMetadata>` and builds the Op's `OpMetadata` from it; a call that already has a third
-argument keeps it:
+Injects module metadata from build context. `tryDefineModuleMetadata`
+(`packages/lmao-ttsc/plugin/driver/lmao.go:304-343`) rewrites `defineModule({...})` by prepending a `metadata` property
+to its first object-literal argument, and is a no-op when a `metadata` property already exists:
 
 ```typescript
 // User writes:
-const fetchUser = defineOp('fetchUser', async (ctx, id: string) => ctx.ok(await load(id)));
+const myModule = defineModule({
+  logSchema: { userId: S.category() },
+  deps: {},
+  ff: {},
+});
 
-// Transformer outputs (snake_case keys, the defineOp call's own line):
-const fetchUser = defineOp(
-  'fetchUser',
-  async (ctx, id: string) => ctx.ok(await load(id)),
-  {
-    package_name: '@mycompany/my-package',
-    package_file: 'src/modules/users.ts',
+// Transformer outputs (metadata prepended, snake_case keys, git_sha first):
+const myModule = defineModule({
+  metadata: {
     git_sha: 'abc123def',
-    line: 12,
+    package_name: '@mycompany/my-package',
+    package_file: 'src/modules/my-module.ts',
   },
-  { runtimeHint: /* packed value */ }
-);
+  logSchema: { userId: S.category() },
+  deps: {},
+  ff: {},
+});
 ```
 
-**Metadata sources** (`nearestPackage` + `gitLastCommit`, `plugin/driver/lmao.go`):
+**Metadata sources** (`nearestPackage` + `gitLastCommit`, `plugin/driver/lmao.go:345-381`):
 
 - `package_name`: `name` from the nearest `package.json` (walking up); `'unknown'` if none.
 - `package_file`: path of the source file relative to that package dir (basename fallback).
 - `git_sha`: `git rev-list -1 HEAD -- <file>`; `'unknown'` if git is unavailable.
-- `line`: the 1-based line of the `defineOp` call.
 
-The metadata is per Op; there is no module-level or `defineOpContext`-level metadata key. Without the transformer,
-`defineOp` derives the same fields from the call stack (`extractMetadataFromStack`). The snake_case key names match the
-runtime/Arrow contract (`smoo/lmao!n/arrow-table-module-id`) and the `01l §metadata-injection` consumer contract.
+> **Cross-reference / known divergence.** Spec `01l §metadata-injection` (node `smoo/lmao!n/metadata-injection`)
+> describes injection at the **`defineOpContext`** call site with a `__metadata` key — that is the _consumer_ contract
+> (`createOpMetadata` in `packages/lmao/src/lib/opContext/defineOp.ts` builds the per-Op `OpMetadata`). The transformer
+> as shipped injects into **`defineModule`** with a plain `metadata` key and the three snake_case fields above. The
+> snake_case key names match the runtime/Arrow contract (`smoo/lmao!n/arrow-table-module-id`); the `defineOpContext`
+> injection path is not implemented by this transformer.
 
 ### 6. Log Line Number Injection <a id="smoo/lmao!n/transformer-log-line"></a>
 
@@ -395,13 +393,13 @@ log.info('Processing user').line(42);
 log.warn('Rate limit approaching').line(43);
 ```
 
-The transform finds the log method call inside a chain (`findLogInline`, `plugin/driver/loginline.go:171`), marks the
-chain processed, and inserts `.line(N)` immediately after the log method — preserving any trailing fluent calls
-(`ctx.log.info('msg').userId('123')` → `ctx.log.info('msg').line(N).userId('123')`). It is a no-op if `.line(...)` is
-already present. The recognised methods are `info`/`debug`/`warn`/`error`/`trace`.
+The transform finds the log method call inside a chain (`findLogCallInChain`), marks the chain processed, and inserts
+`.line(N)` immediately after the log method — preserving any trailing fluent calls (`ctx.log.info('msg').userId('123')`
+→ `ctx.log.info('msg').line(N).userId('123')`). It is a no-op if `.line(...)` is already present (`hasLineInChain`). The
+recognised methods are `info`/`debug`/`warn`/`error`/`trace`.
 
-The same `.line(N)` insertion applies to the **result chain** `ctx.ok(...)` / `ctx.err(...)` through `tryChainLine`
-(`plugin/driver/lmao.go:479`), preserving trailing `.with(...)` / `.message(...)` calls:
+The same `.line(N)` insertion applies to the **result chain** `ctx.ok(...)` / `ctx.err(...)` via
+`tryTransformResultChain` (`findResultCallInChain`), preserving trailing `.with(...)` / `.message(...)` calls:
 
 ```typescript
 // User writes:
@@ -411,13 +409,75 @@ return ctx.ok(user).with({ userId: user.id }).message('Created');
 return ctx.ok(user).line(42).with({ userId: user.id }).message('Created');
 ```
 
-#### 6.1 One static-message representation
+#### Op-local `u16` log-template IDs
 
-Literal log text and literal span names are registered in the global vocabulary of §6.2, and a row stores the dense
-vocabulary index. There is no Op-local template table, no per-Op `u16` ID lane, and no alias or dual-write shim: every
-compiler and runtime caller uses the versioned global registration ABI. The examples in §6.2 are normative.
+The same checker-backed prepass can replace an eligible literal log write with a private numeric write. Eligibility is
+intentionally narrow: the enclosing Op must be an inline arrow, function expression, or method with a simple identifier
+as its first parameter; the call must be direct `ctx.log.info/debug/warn/error/trace(message)` with exactly one
+argument; `ctx` must be that first parameter; the `ctx.log` value must be checker-proved as LMAO `SpanLogger` or
+`GeneratedSpanLogger`; and `message` must be a string literal or no-substitution template literal. Analysis never
+crosses a nested function. Trailing fluent links, including an existing `.line(...)`, are preserved around the rewritten
+inner call.
 
-#### 6.2 Checker-semantic structured vocabulary ABI
+The compiler uses the literal's **cooked string value** (`node.text`/the tsgo AST equivalent), not source-token
+spelling. It deduplicates equal cooked strings within each Op and assigns IDs in first lexical encounter order. ID `0`
+is reserved for the dynamic/raw-message path; unique templates receive IDs `1..65535`, and
+`OpMetadata.logTemplateIds[id - 1]` is the only lookup table. Once 65,535 unique strings have been assigned, later
+unseen strings remain ordinary dynamic writes; previous duplicates continue to reuse their assigned ID. These IDs are
+private to one Op and are neither stable across builds nor comparable between Ops.
+
+```typescript
+// User writes:
+const load = defineOp('load', async (ctx) => {
+  ctx.log.info('cache\nhit').userId('42');
+  ctx.log.warn(`cache\nhit`);
+  ctx.log.info(getMessage());
+});
+
+// Contractual shape (irrelevant printer details omitted):
+defineOp('load', async (ctx) => {
+  ctx.log._infoTemplate(1).line(42).userId('42');
+  ctx.log._warnTemplate(1).line(43);
+  ctx.log.info(getMessage()).line(44);
+}, undefined, {
+  runtimeHint: /* packed value */,
+  logTemplateIds: ['cache\nhit'],
+});
+```
+
+A dynamic expression, substitution template, multiple/zero arguments, alias or computed access, unrelated/shadowed
+logger type, nested-function call, non-inline Op definition, missing checker proof, or saturated new template bails out
+of ID encoding without changing logging behavior. It still uses the existing raw string column and ordinary line
+transform where eligible.
+
+At runtime, a template-bearing Op conditionally adds a zero-initialized `Uint16Array` lane to each JS `SpanBuffer`
+system allocation; the wasm-backed buffer uses the same conditional `Uint16Array` contract. Ops with an empty table
+allocate no lane. Static compiler output writes only the nonzero ID (both fluent and direct-inlined log paths); dynamic
+logs leave the zero sentinel and write `message_values` exactly as before. Overflow buffers inherit the same Op metadata
+and lane shape.
+
+`resolveMessage(buffer, row)` is the cold/public boundary: `0` returns the raw row value, while nonzero `n` returns
+`buffer._opMetadata.logTemplateIds[n - 1]` and throws on an invalid nonzero ID. Arrow conversion, SQLite insertion,
+testing/fact extraction, Cloudflare rows, feature-flag evaluation, and stdio tracing all use this resolver. Therefore
+public Arrow `message` values and other exported messages remain the exact cooked literal or dynamic runtime string; the
+private ID lane is not an Arrow schema change. Span names and all non-eligible messages remain ordinary strings.
+
+The native plugin implements these checker-proof, lexical-order, deduplication, saturation, structured metadata, and
+bailout rules; its Go suite establishes emitted behavior and runtime/Arrow invariants. They are not performance
+evidence. The hot-store change has no claimed speedup until a dedicated benchmark reports results.
+
+#### 6.1 Shipped versus clean-cutover status
+
+The preceding Op-local `u16` path is the **shipped compatibility state**. It recognizes only direct calls inside
+eligible inline `defineOp`/`defineOps` callbacks, assigns IDs by lexical encounter, and reconstructs strings at the cold
+boundary. It is not a global vocabulary, a stable trace identity, or an Arrow dictionary optimization.
+
+The **clean-cutover target** below replaces that representation rather than adding a second permanent ID namespace. At
+cutover, every compiler and runtime caller uses the versioned global registration ABI, the old Op-local table/lane is
+removed, and no alias or dual-write shim remains. Until that cutover ships, target examples in §6.2 are normative design
+requirements but not claims about current emitted JavaScript.
+
+#### 6.2 Target: checker-semantic structured vocabulary ABI
 
 ##### Recognition and level policy
 
@@ -436,19 +496,19 @@ The source contract classifies callsites independently of the physical buffer fa
 
 Operational `info`/`warn`/`error` text must be a string literal or no-substitution template literal. Interpolation,
 concatenation, dynamic text, spread properties, computed keys, getters, methods, and non-object field bags are compile
-errors. A structured template uses `{fieldName}`; `{{` and `}}` escape literal braces. The `LOG_TEMPLATE` record text is
-the literal exactly as written, escapes included; the transformer validates the escapes and collects placeholders but
-does not decode them, and readers decode `{{`/`}}` only when rendering. Placeholder names and object-literal keys form
-the same duplicate-free set, and each key resolves to a schema column represented canonically as `{name,column}`.
-Literal `debug`/`trace` calls follow the same `static`/`structured` rules; a referenced runtime string stays `dynamic`,
-while avoidable interpolation/concatenation is rejected.
+errors. A clean-cutover structured template uses `{fieldName}`; `{{` and `}}` escape literal braces. This **replaces**
+the shipped `{{fieldName}}` placeholder spelling. Placeholder names and object-literal keys form the same duplicate-free
+set, and each key resolves to a schema column represented canonically as `{name,column}`. Literal `debug`/`trace` calls
+follow the same `static`/`structured` rules; a referenced runtime string stays `dynamic`, while avoidable
+interpolation/concatenation is rejected.
 
 The physical term `mixed` is reserved for a buffer family carrying both numeric vocabulary and dynamic raw-string lanes;
 it is not a callsite class, record mode, or `kindTags` value. `kindTags` describes entry semantics only.
 
 Checker-proven literal trace/span names are also registered records of kind `SPAN_NAME`. This applies wherever the
 transformer already proves the LMAO span/trace API and literal name without changing evaluation or Promise semantics. A
-dynamic span name remains on the ordinary dynamic string lane.
+dynamic span name remains on the ordinary dynamic string lane. Shipped code stores every span name as a string; span
+name registration is target-only.
 
 ```typescript
 // Source: the checker proves `log` and `ctx` are LMAO values.
@@ -476,9 +536,9 @@ module calls the Symbol callback:
 import '@smoothbricks/lmao/vocabulary/register/v1';
 
 const REGISTER_VOCABULARY = Symbol.for('@smoothbricks/lmao/vocabulary/register/v1');
-const $$lmaoVocabulary = globalThis[REGISTER_VOCABULARY]({
+const $$vocabulary = globalThis[REGISTER_VOCABULARY]({
   schemaVersion: 1,
-  idAlgorithm: 'sha256-32-v1',
+  idAlgorithm: 'sha256-24-v1',
   contentHash: $$contentHash,
   ids: new Uint32Array($$ids),
   kindTags: new Uint8Array([1, 1, 2]),
@@ -489,22 +549,15 @@ const $$lmaoVocabulary = globalThis[REGISTER_VOCABULARY]({
 // Warmed callsites: direct dense-index loads, fixed arity, no object or lookup dispatch.
 const $$field0 = user.id;
 const $$field1 = elapsedMs;
-log._infoStructured2($$lmaoVocabulary[0], 42, $$field0, $$field1);
-log._infoTemplate($$lmaoVocabulary[1]).line(43);
+log._infoStructured2($$vocabulary[0], 42, $$field0, $$field1);
+log._infoStatic0($$vocabulary[1], 43);
 log.debug(debugMessage);
-return ctx.span1(
-  44,
-  $$lmaoVocabulary[2],
-  loadUserOp.callsitePlan.newCtx0(ctx),
-  loadUserOp.callsitePlan,
-  loadUserOp.fn,
-  user.id
-);
+return ctx.spanVocabulary1(44, $$vocabulary[2], loadUserOp, user.id);
 ```
 
-The span call shown above is Promise-based exactly like `span1`; its numeric name argument is the dense `SPAN_NAME`
-index. A dynamic name lowers to the same `spanN` call and keeps its string operand. Literal and dynamic names must
-decode identically and retain the public Promise/microtask schedule.
+The target span-name seam shown above remains Promise-based exactly like `span1`; its numeric name argument is the dense
+`SPAN_NAME` index. A dynamic name continues through public `span(name, ...)`. Private seam spelling may change, but
+literal and dynamic names must decode identically and retain the public Promise/microtask schedule.
 
 The private write seams may instead be compiler-emitted direct stores, but they preserve observable order and allocation
 behavior: fixed monomorphic stores for registered warmed writes and no object, array, rest-argument, or interpolated-
@@ -517,7 +570,7 @@ The runtime type contract is separate from the emitted JavaScript above:
 ```typescript
 type VocabularyFragmentV1 = {
   readonly schemaVersion: 1;
-  readonly idAlgorithm: 'sha256-32-v1';
+  readonly idAlgorithm: 'sha256-24-v1';
   readonly contentHash: string;
   readonly ids: Uint32Array;
   readonly kindTags: Uint8Array;
@@ -538,7 +591,7 @@ repeated(u16le nameLen | name UTF8 | u16le columnLen | column UTF8)
 ```
 
 `kindTags[i]` is `1` (`LOG_TEMPLATE`) or `2` (`SPAN_NAME`); these are semantic entry kinds, not
-`static`/`structured`/`dynamic` or physical `mixed`. `ids[i]` is the first 32 bits, interpreted big-endian, of
+`static`/`structured`/`dynamic` or physical `mixed`. `ids[i]` is the first 24 bits, interpreted big-endian, of
 `SHA-256(kindTag || recordBytes)`. `contentHash` is lowercase SHA-256 hex of this canonical byte stream:
 
 ```text
@@ -567,24 +620,19 @@ mutation of compiler-emitted arrays or later registration cannot mutate a live g
 
 A strict optimized build diagnoses an unavailable/incompatible ABI, and direct loading of incompatible emitted code
 fails at startup rather than guessing an index. There is no warmed registration check or method dispatch: a callsite
-reads `$$lmaoVocabulary[fragmentLocalOrdinal]` directly. Every dense index, including zero, is valid; nullability uses
-the row validity bitmap.
+reads `$$vocabulary[fragmentLocalOrdinal]` directly. Every dense index, including zero, is valid; nullability uses the
+row validity bitmap.
 
 Registration contributes the vocabulary portion of the startup-versioned `PhysicalLayoutPlan`, whose offsets, widths,
 alignment, and chunk policy are immutable once live. `VocabularyBinding` maps fragment-local ordinals to dense indices.
-An `ArrowLease` pins the span topology, JS-heap chunks, and dictionary generation used by a batch until explicit release
-after flush consumption; WASM-backed columns are copied, so a lease never pins a WASM epoch.
+An `ArrowLease` pins the exact backing store, WASM epoch, chunks, and dictionary generation used by a batch until
+explicit release after flush consumption.
 
-An id is a 32-bit hash of its record, not a unique key: two distinct records can share one, and a collision is never
-fatal. Registration keeps every registered record in a table keyed by id and probes it deterministically: it walks the
-records already filed under the id and compares `(kindTag, recordBytes)` with each. An equal record reuses that record's
-dense index, which makes registration idempotent for byte-identical fragments and deduplicates equal records; a record
-no entry equals is appended, even when its id is taken. The transformer's whole-program catalog follows the same rule,
-so a collision between two records of one compilation is not an error either. Which record a dense index decodes to
-depends only on its bytes, never on which colliding record registered first. Reusing `contentHash` for another canonical
-fragment is fatal before the fragment is writable. Ids and content bytes—not dense indices—provide deterministic
-identity and semantic checksums across registration orders. Cross-process dense-index stability is not promised; decoded
-values and schema semantics remain deterministic.
+Registration is idempotent for byte-identical fragments and deduplicates equal `(kindTag,id,recordBytes)` records.
+Reusing an ID for different kind/record bytes, or `contentHash` for another canonical fragment, is fatal before the
+fragment is writable. Stable IDs and content bytes—not dense indices—provide deterministic identity and semantic
+checksums across registration orders. Cross-process dense-index stability is not promised; decoded values and schema
+semantics remain deterministic.
 
 ##### Diagnostics, fallback, and evaluation order
 
@@ -597,6 +645,7 @@ Policy violations are diagnostics, not silent raw-message bailouts:
 | `LMAO_FIELDS_NOT_OBJECT_LITERAL`  | fields are not a plain literal or use spread/computed/accessor/method syntax |
 | `LMAO_PLACEHOLDER_MISMATCH`       | missing, extra, duplicate, malformed, or unresolved placeholder/field        |
 | `LMAO_LOGGER_PROOF_REQUIRED`      | strict optimized build cannot prove an apparent LMAO logger call             |
+| `LMAO_VOCABULARY_ID_COLLISION`    | one stable `u24` identity has different canonical bytes                      |
 | `LMAO_VOCABULARY_ABI_UNAVAILABLE` | emitted chunk cannot use callback ABI version 1                              |
 
 An unrelated or genuinely unproved logger call is left byte-shape unchanged; the transformer must not guess. A typed
@@ -613,10 +662,11 @@ optimization may select `spanAutoN` or change Promise-assimilation/microtask tur
 
 ##### Authoritative benchmark gates
 
-The global vocabulary path is accepted by repo-standard Mitata scenarios that compare `plugin-off` and the
-global-vocabulary variants with a position-balanced schedule in independent order-reversed processes. Every run emits
-machine-readable raw samples, semantic checksums, p50/p95/p99/p99.9, and allocation/GC metadata when the host exposes
-it. A checksum mismatch, decode difference, or evaluation-order difference is an unconditional fail.
+Promotion from the shipped Op-local representation to this clean cutover requires repo-standard Mitata scenarios to
+compare `plugin-off`, `plugin-on/current`, and target variants with a position-balanced schedule in independent
+order-reversed processes. Every run emits machine-readable raw samples, semantic checksums, p50/p95/p99/p99.9, and
+allocation/GC metadata when the host exposes it. A checksum mismatch, collision, decode difference, or evaluation-order
+difference is an unconditional fail.
 
 Semantic acceptance covers `static` log templates, `structured` fields and brace escaping, dynamic debug/trace text,
 literal `SPAN_NAME` registration, and dynamic span-name fallback. It verifies binding length/append-only prefix
@@ -625,30 +675,46 @@ span Promise/microtask observations under at least two reversed registration ord
 
 Results are reported separately for `startup`, `span setup`, `warmed entry write`, `overflow/slow path`, and
 `per-request flush`; one phase may not amortize or hide another. The warmed registered entry path must demonstrate zero
-allocations, fixed monomorphic stores, and at least a 10% p50 improvement over `plugin-off` without a greater than 3%
-regression at any reported tail percentile. Overflow must remain bounded and correct without a greater than 3% p99.9
-regression. Per-request flush must show few or no allocations and reuse the startup `PhysicalLayoutPlan`, dense Arrow
-vocabulary, and `ArrowLease`; it must not regress a reported percentile by more than 3%. Startup and span setup are
-explicit costs and must not regress by more than 3% unless the commit message names and justifies the trade. A change
-that fails a gate does not land, and no zero-overhead claim is made without a passing run.
+allocations, fixed monomorphic stores, and at least a 10% p50 improvement over `plugin-on/current` without a greater
+than 3% regression at any reported tail percentile. Overflow must remain bounded and correct without a greater than 3%
+p99.9 regression. Per-request flush must show few or no allocations and reuse the startup `PhysicalLayoutPlan`, dense
+Arrow vocabulary, and `ArrowLease`; it must not regress a reported percentile by more than 3%. Startup and span setup
+are explicit costs and must not regress by more than 3% unless the commit message names and justifies the trade. Failing
+a gate leaves the target unpromoted and forbids a zero-overhead claim.
+
+### 7. `task()` Line Number Injection <a id="smoo/lmao!n/transformer-task-line"></a>
+
+`tryTransformTaskCall` appends the call-site line number as a trailing argument to `task('name', fn)` calls — both the
+property-access form (`module.task('name', fn)`) and the destructured-direct form (`task('name', fn)` from
+`const { task } = createModuleContext(...)`). It fires only when there are exactly two arguments and the first is a
+string literal (so an already-lined `task('name', fn, 99)` and a dynamic name like `task(getName(), fn)` are left
+alone):
+
+```typescript
+// User writes:
+module.task('processOrder', async (ctx) => {});
+
+// Transformer outputs (line number appended as the 3rd argument):
+module.task('processOrder', async (ctx) => {}, 42);
+```
 
 ## V8 Optimization Impact <a id="smoo/lmao!n/transformer-v8-impact"></a>
 
-| Transformation                     | Without Transformer                   | With Transformer                                                                              |
-| ---------------------------------- | ------------------------------------- | --------------------------------------------------------------------------------------------- |
-| Stable proven Op span              | Public variadic Promise dispatcher    | Promise-based fixed `span0`–`span8` ABI                                                       |
-| Dynamic/unstable Op span           | Public variadic Promise dispatcher    | Unchanged public dispatcher; single evaluation preserved                                      |
-| Inline-closure span                | Public variadic Promise dispatcher    | Promise-based fixed `span0`–`span8` ABI on the receiver's `_physicalLayoutPlan`               |
-| Explicit internal `spanAutoN`      | Not applicable                        | Sync `Ok`/`Err` terminal or Promise retry/thenable fallback; never automatic                  |
-| `with()` bulk setter               | Object allocation + iteration         | Direct columnar buffer writes                                                                 |
-| Destructured `span`                | Closure-bound public dispatcher       | `__ctx` parameter plus the same fixed-arity lowering; residual properties rebound in the body |
-| Op setup                           | Full context setup, adaptive capacity | Structured compile metadata with packed hint and eager columns when analysis is valid         |
-| Literal Op log message             | String stored per row                 | Stable message `u32` id in a stable fragment bound to a process-dense Arrow index             |
-| Structured operational log         | Runtime object/string work or raw API | Checker-proved literal template and fixed-arity field stores                                  |
-| Dynamic debug/trace message        | Raw string row                        | Preserved dynamic lane; avoidable interpolation is diagnostic `LMAO_AVOIDABLE_INTERPOLATION`  |
-| Dynamic/ineligible operational log | Raw string row                        | Raw fallback for unproved calls; proved-LMAO policy violations are diagnostics                |
-| Line numbers                       | Runtime fallback/absent               | Compile-time injection on lowered calls                                                       |
-| Metadata                           | Manual or missing                     | Auto-injected                                                                                 |
+| Transformation                     | Without Transformer                   | With Transformer                                                                                                         |
+| ---------------------------------- | ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| Stable proven Op span              | Public variadic Promise dispatcher    | Promise-based fixed `span0`–`span8` ABI                                                                                  |
+| Dynamic/unstable Op span           | Public variadic Promise dispatcher    | Unchanged public dispatcher; single evaluation preserved                                                                 |
+| Inline-closure span                | Public variadic Promise dispatcher    | Promise-based fixed `span0`–`span8` ABI on the receiver's `_physicalLayoutPlan`                                          |
+| Explicit internal `spanAutoN`      | Not applicable                        | Sync `Ok`/`Err` terminal or Promise retry/thenable fallback; never automatic                                             |
+| `with()` bulk setter               | Object allocation + iteration         | Direct columnar buffer writes                                                                                            |
+| Destructured `span`                | Closure-bound public dispatcher       | `__ctx` parameter plus the same fixed-arity lowering; residual properties rebound in the body                            |
+| Op setup                           | Full context setup, adaptive capacity | Structured compile metadata with packed hint and Op-local templates when analysis is valid                               |
+| Literal Op log message             | String stored per row                 | Shipped: private Op-local `u16`; target: stable message `u24` in a stable fragment, bound to a process-dense Arrow index |
+| Structured operational log         | Runtime object/string work or raw API | Target: checker-proved literal template and fixed-arity field stores; not shipped                                        |
+| Dynamic debug/trace message        | Raw string row                        | Preserved dynamic lane; avoidable interpolation is a target diagnostic                                                   |
+| Dynamic/ineligible operational log | Raw string row                        | Shipped: raw fallback; target proved-LMAO policy violations are diagnostics                                              |
+| Line numbers                       | Runtime fallback/absent               | Compile-time injection on lowered calls                                                                                  |
+| Metadata                           | Manual or missing                     | Auto-injected                                                                                                            |
 
 These are structural properties of emitted code. Performance claims require a benchmark for the target runtime and
 workload.
@@ -675,7 +741,9 @@ The native plugin constructs replacement AST nodes through tsgo's shim factory i
 all rewriting in the compiler's normal emit pipeline instead of text-splicing JavaScript. Synthesized direct-write
 blocks do not inherit unrelated source comments.
 
-Source-map preservation is verified by a dedicated pass (node `smoo/lmao!n/transformer-source-maps`).
+> **Implementation status.** A dedicated source-map preservation/verification pass is not separately implemented or
+> tested; correctness currently relies on ttsc's factory-based emit. Tracked by node
+> `smoo/lmao!n/transformer-source-maps`.
 
 ## Fallback Behavior <a id="smoo/lmao!n/transformer-fallback"></a>
 
@@ -689,14 +757,11 @@ Without proof—or without the transformer—everything stays correct through th
   replacement, even in direct await or async-return positions.
 - `with()` and tag setters iterate through generated fluent builders rather than direct inlined writes.
 - Runtime line/metadata fallbacks continue to apply when compile-time injection is absent.
-- Vocabulary registration applies only to proved calls: dynamic and unproved calls write the raw message, and every
-  public and Arrow read of a registered row decodes to the exact source literal.
-- Proved structured calls use the registered writer. Unsupported unrelated calls retain the public raw API, while typed
-  LMAO policy violations are compile diagnostics rather than runtime fallbacks. A precompiled library or chunk without
-  source is correct through its own version-1 fragment registration.
-
-Both the transformer-lowered path and the polymorphic fallback end up calling the same monomorphic `spanN` methods; the
-transformer only skips runtime argument parsing.
+- Literal log-template encoding is optional in the shipped Op-local implementation: ineligible/dynamic calls write the
+  raw message, every public/Arrow read resolves to the same string, and malformed nonzero IDs fail loudly.
+- In the clean-cutover target, proved structured calls use the registered writer. Unsupported unrelated calls retain the
+  public raw API, while typed LMAO policy violations are compile diagnostics rather than runtime fallbacks. A
+  precompiled library/chunk without source is correct through its own version-1 fragment registration.
 
 ## Related Specs <a id="smoo/lmao!n/transformer-related"></a>
 

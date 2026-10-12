@@ -303,34 +303,61 @@ impl SystemCommandRunner {
         killed: &mut dyn FnMut(),
     ) -> Result<CommandOutput, CommandRunError> {
         use std::io::Read;
-        let mut child = spawn_disk_child(request).map_err(|source| CommandRunError {
-            request: request.clone(),
-            failure: CommandRunFailure::Spawn(source),
-        })?;
+        let (mut child, output_files) =
+            spawn_disk_child(request).map_err(|source| CommandRunError {
+                request: request.clone(),
+                failure: CommandRunFailure::Spawn(source),
+            })?;
         // Drain both pipes on dedicated threads while the deadline poll runs, exactly as
         // `Command::output` drains while it waits: a verbose child (fsck) must never wedge
         // on a full pipe just because the parent is polling instead of reading. A child
-        // killed at the deadline drops its pipes, which ends both pumps.
-        let stdout = std::thread::spawn({
-            let mut pipe = child.stdout.take();
-            move || {
-                let mut bytes = Vec::new();
-                if let Some(pipe) = pipe.as_mut() {
-                    let _ = pipe.read_to_end(&mut bytes);
+        // killed at the deadline drops its pipes, which ends both pumps. A disk-image
+        // command has no pipes to drain: its output lands in files (spawn_disk_child), so
+        // nothing it writes can wedge on a caller that is no longer there.
+        let stdout = (!output_files.is_some()).then(|| {
+            std::thread::spawn({
+                let mut pipe = child.stdout.take();
+                move || {
+                    let mut bytes = Vec::new();
+                    if let Some(pipe) = pipe.as_mut() {
+                        let _ = pipe.read_to_end(&mut bytes);
+                    }
+                    bytes
                 }
-                bytes
-            }
+            })
         });
-        let stderr = std::thread::spawn({
-            let mut pipe = child.stderr.take();
-            move || {
-                let mut bytes = Vec::new();
-                if let Some(pipe) = pipe.as_mut() {
-                    let _ = pipe.read_to_end(&mut bytes);
+        let stderr = (!output_files.is_some()).then(|| {
+            std::thread::spawn({
+                let mut pipe = child.stderr.take();
+                move || {
+                    let mut bytes = Vec::new();
+                    if let Some(pipe) = pipe.as_mut() {
+                        let _ = pipe.read_to_end(&mut bytes);
+                    }
+                    bytes
                 }
-                bytes
-            }
+            })
         });
+        let collect = |stdout: Option<std::thread::JoinHandle<Vec<u8>>>,
+                       stderr: Option<std::thread::JoinHandle<Vec<u8>>>|
+         -> (Vec<u8>, Vec<u8>) {
+            match &output_files {
+                Some(directory) => {
+                    let read = |name: &str| fs::read(directory.join(name)).unwrap_or_default();
+                    let output = (read("stdout"), read("stderr"));
+                    let _ = fs::remove_dir_all(directory);
+                    output
+                }
+                None => (
+                    stdout
+                        .map(|pump| pump.join().unwrap_or_default())
+                        .unwrap_or_default(),
+                    stderr
+                        .map(|pump| pump.join().unwrap_or_default())
+                        .unwrap_or_default(),
+                ),
+            }
+        };
         let started = std::time::Instant::now();
         let mut warned = 0;
         loop {
@@ -339,10 +366,11 @@ impl SystemCommandRunner {
                 failure: CommandRunFailure::Wait(source),
             })? {
                 Some(status) => {
+                    let (stdout, stderr) = collect(stdout, stderr);
                     let output = std::process::Output {
                         status,
-                        stdout: stdout.join().unwrap_or_default(),
-                        stderr: stderr.join().unwrap_or_default(),
+                        stdout,
+                        stderr,
                     };
                     return Ok(CommandOutput::from(output));
                 }
@@ -355,8 +383,7 @@ impl SystemCommandRunner {
                     DeadlineStep::Kill => {
                         kill_disk_child_group(&mut child);
                         let _ = child.wait();
-                        let _ = stdout.join();
-                        let _ = stderr.join();
+                        let _ = collect(stdout, stderr);
                         if let Some(image) = deferred_image_target(request) {
                             record_deferred_image(image);
                         }
@@ -739,34 +766,75 @@ fn lease_holder(lease: &Path) -> String {
     }
 }
 
-/// Spawn a disk child detached into its own process group on Unix, so the deadline kill
+/// Spawn a disk child detached into its own session on Unix, so the deadline kill
 /// reaps the whole helper tree: a disk-image tool can fork helpers (`hdiutil` forks
 /// `diskimages-helper`), and killing only the direct child would leave a helper holding the wedge.
-fn spawn_disk_child(request: &CommandRequest) -> io::Result<std::process::Child> {
+///
+/// A disk-image command (`is_disk_image_command`) is detached further, because it is the
+/// one child a caller must never interrupt: it also ignores the hangup, interrupt and
+/// terminate signals a caller's tree-killer addresses to it, and writes its output to
+/// per-run files under the system temp directory instead of the caller's pipes. A caller
+/// killed mid-attach (an agent tool deadline, a process-group kill of `cowshed exec`)
+/// then leaves the command running to completion — no full pipe wedges it, no signal
+/// reaches it — and the next invocation reconciles the result from the kernel's
+/// attachment inventory. The runner's hard deadline (a SIGKILL of its group) is the only
+/// killer. The answered output directory travels with the child; reading it back removes it.
+fn spawn_disk_child(
+    request: &CommandRequest,
+) -> io::Result<(std::process::Child, Option<PathBuf>)> {
+    spawn_disk_child_as(request, is_disk_image_command(request))
+}
+
+/// `spawn_disk_child` with the detachment decided by the caller, so tests can detach a
+/// stand-in child without naming a real disk tool.
+fn spawn_disk_child_as(
+    request: &CommandRequest,
+    detached: bool,
+) -> io::Result<(std::process::Child, Option<PathBuf>)> {
     let mut command = Command::new(&request.program);
     command
         .args(&request.args)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
+        .stdin(std::process::Stdio::null());
+    let output_files = if detached {
+        let directory = std::env::temp_dir().join(format!(
+            "cowshed-disk-image-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&directory)?;
+        let stdout = File::create(directory.join("stdout"))?;
+        let stderr = File::create(directory.join("stderr"))?;
+        command.stdout(stdout).stderr(stderr);
+        Some(directory)
+    } else {
+        command
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        None
+    };
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        // SAFETY: `setsid` is async-signal-safe and runs in the forked child before
-        // exec; the child becomes its own group leader. Fail closed: a child that
-        // cannot leave the parent group must never be addressed by group id, so a
-        // setsid failure aborts the spawn instead of risking the parent group.
+        // SAFETY: `setsid` and `signal` are async-signal-safe and run in the forked
+        // child before exec; the child becomes its own session leader, and a disk-image
+        // command starts with the caller's hangup, interrupt and terminate ignored (an
+        // ignored disposition survives exec). Fail closed: a child that cannot leave the
+        // parent group must never be addressed by group id, so a setsid failure aborts
+        // the spawn instead of risking the parent group.
         unsafe {
-            command.pre_exec(|| {
+            command.pre_exec(move || {
                 if libc::setsid() == -1 {
-                    Err(io::Error::last_os_error())
-                } else {
-                    Ok(())
+                    return Err(io::Error::last_os_error());
                 }
+                if detached {
+                    for signal in [libc::SIGHUP, libc::SIGINT, libc::SIGTERM] {
+                        libc::signal(signal, libc::SIG_IGN);
+                    }
+                }
+                Ok(())
             });
         }
     }
-    command.spawn_locked()
+    command.spawn_locked().map(|child| (child, output_files))
 }
 
 /// Kill a disk child and, on Unix, its whole process group.
@@ -5690,6 +5758,40 @@ mod tests {
     }
 
     /// The outlived-deadline warning names the verb, not just its noun: `diskutil image attach`.
+    /// A detached child leads its own session, ignores the terminate and hangup a
+    /// caller's tree-killer sends it, and its output waits in files, not the caller's
+    /// pipes: a caller killed mid-attach leaves it running to completion.
+    #[cfg(unix)]
+    #[test]
+    fn a_detached_disk_child_ignores_caller_signals_and_writes_files() {
+        let request = CommandRequest::new(
+            "/bin/sh",
+            [
+                "-c",
+                "kill -TERM $$; kill -HUP $$; printf done; printf err >&2",
+            ],
+        );
+        let (mut child, files) = spawn_disk_child_as(&request, true).expect("spawn detached");
+        let directory = files.expect("a detached child writes files");
+        let status = child.wait().expect("reap the detached child");
+        assert!(status.success(), "{status:?}");
+        assert_eq!(fs::read(directory.join("stdout")).unwrap(), b"done");
+        assert_eq!(fs::read(directory.join("stderr")).unwrap(), b"err");
+        fs::remove_dir_all(directory).unwrap();
+
+        let request = CommandRequest::new("/bin/sh", ["-c", "sleep 5"]);
+        let (mut child, _) = spawn_disk_child_as(&request, true).expect("spawn sleeper");
+        let pid = child.id() as libc::pid_t;
+        // SAFETY: getpgid only reads the child's group; the child is ours, unreaped.
+        assert_eq!(
+            unsafe { libc::getpgid(pid) },
+            pid,
+            "the child leads its session"
+        );
+        kill_disk_child_group(&mut child);
+        let _ = child.wait();
+    }
+
     #[test]
     fn a_disk_image_command_is_named_by_its_program_and_verb() {
         assert_eq!(

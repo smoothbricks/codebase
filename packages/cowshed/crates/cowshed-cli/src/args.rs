@@ -495,6 +495,7 @@ pub struct LandArgs {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct DoctorArgs {
     pub repair: bool,
+    pub clear_attach_budget: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

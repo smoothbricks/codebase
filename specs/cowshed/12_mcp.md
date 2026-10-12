@@ -8,6 +8,11 @@ Built on the core crates directly, the server keeps typed grants, streamed exec 
 and the `Coordinator`/`WorkspaceHandle` split (07_api.md); shelling out to the CLI would reserialize everything through
 argv/JSON and lose exactly those properties.
 
+> **Implementation status:** the MCP server binary, tools, and capability handshake are unbuilt. The contracts below
+> reuse the existing Rust core rather than claiming a deployed MCP surface. Resource-bearing job results, bounded cursor
+> tails, and progress events inherit the canonical generated API declaration in 07_api.md; the same unbuilt monitoring
+> and generation gaps apply here.
+
 ## v1 scope: tools only
 
 cowshed-mcp v1 is a **tools-only** server. `resources/list` returns an empty array, no resource templates, **no
@@ -100,8 +105,8 @@ even if compromised — escalation is strictly a decision made one level up.
 | `repo_mirror`       | `name`, `url`                                                                                                 | controller-owned read-only mirror path                   |
 
 A coordinator-scoped telemetry query tool (selector/SQL over controller commitments and telemetry, 13_telemetry.md) is
-roadmap, not v1. Workers get only one-workspace job status/log tools: lifecycle and captured bytes both resolve from
-protected in-volume records and artifacts within their origin boundary.
+roadmap, not v1. Workers get only one-workspace job status/log tools: lifecycle is reconciled against controller
+continuity commitments, while captured bytes resolve from protected in-volume artifacts within their origin boundary.
 
 `restore` requires a label — there is no "restore the latest" default. Worker `checkpoint` accepts an optional label.
 `grant`/`revoke` carry `expectedRevision` for compare-and-swap (07_api.md/04_sandbox.md) and a `repo[]` selector for
@@ -116,9 +121,9 @@ axes.
 `land.targetBranch` defaults to `main`. It names a real local branch in the main workspace repository. If that branch is
 checked out in the main workspace, a successful call advances the visible checkout — branch ref, `HEAD`, index, and
 working tree — to the exact validated head. If it is not checked out, only `refs/heads/<targetBranch>` advances and the
-current checkout is untouched. Dirty checked-out state, a linked-worktree checkout of the target, a changed expected
-value, or a non-fast-forward returns `Conflict`; the tool never substitutes a hidden ref or silently retries against a
-new base. `push` remains the separate worker-scoped preservation primitive and intentionally never advances a branch.
+current checkout is untouched. Dirty checked-out state, an unmanaged linked-worktree checkout, a changed expected value,
+or a non-fast-forward returns `Conflict`; the tool never substitutes a hidden ref or silently retries against a new
+base. `push` remains the separate worker-scoped preservation primitive and intentionally never advances a branch.
 
 ### Worker tools (one-use descriptor; scoped to that workspace)
 
@@ -150,9 +155,9 @@ plus normal job/trace identity; inline bytes never enter JSON results or telemet
 
 `checkpoint` atomically enforces the coordinator-configured per-workspace checkpoint count and byte quotas. It reaches
 the supervisor barrier before cloning: running memory-only stream prefixes promote, protected files and a complete
-checkpoint-manifest Arrow batch fsync, and the controller records the audit checkpoint commitment. Quota exhaustion is a
-conflict carrying current usage and limits; it never silently prunes another checkpoint. Restore is coordinator-only and
-rejects a checkpoint whose own manifest does not match its records and artifacts as `Integrity`.
+checkpoint-manifest Arrow batch fsync, and the controller publishes the manifest digest/lineage commitment. Quota
+exhaustion is a conflict carrying current usage and limits; it never silently prunes another checkpoint. Restore is
+coordinator-only and rejects any manifest/commitment mismatch as `Integrity`.
 
 `push` has the same preservation and compare-and-swap semantics as `WorkspaceHandle::push` (07_api.md): it installs the
 exact fetched source head under `refs/cowshed/<ws>/heads/<branch>` in the main workspace repository/object store without
@@ -169,11 +174,11 @@ still applies. `stdoutCopy`/`stderrCopy` are the exact per-stream `{path,policy}
 never becomes authority.
 
 Every job result/event includes `(repoId, workspaceIncarnation, jobId)` and standard trace identity. Protected in-volume
-complete Arrow batches and sealed artifacts are the authoritative evidence within the origin incarnation/checkpoint
-boundary. Controller commitments are audit telemetry: they carry no output payload or artifact path, and the server
-reads none of them for a result. Missing/altered content, invalid complete batches, a count/hash/batch digest mismatch
-or a checkpoint-barrier counter behind a durable barrier return `Integrity` (`-32006`), preserving the evidence rather
-than trusting whichever copy appears newer. Discarding only an incomplete trailing batch is successful recovery.
+complete Arrow batches and sealed artifacts own captured content within the origin incarnation/checkpoint boundary.
+Compact controller commitments own existence/status/order/lineage and expected counts/hashes, but never output payload
+or artifact paths. The server reconciles both: missing/altered committed content, invalid complete batches, and
+count/hash/batch/lineage mismatch return `Integrity` (`-32006`), preserving both sides rather than trusting whichever
+appears newer. Discarding only an incomplete trailing batch is successful recovery.
 
 The resource sample is exactly `JobResourceSample` from 07_api.md: wall time, cumulative process-group CPU user/sys time
 and one-core CPU share, current/peak group RSS, immutable start and current/end host load1/cores, separate signed
@@ -188,8 +193,8 @@ may classify only a proven simple literal `>`/`2>` as `Redirect`, and only when 
 writable descriptor and applies identical exact quota accounting. After terminal state it snapshots that source into an
 independent protected inline or clone/reflink/copied file artifact. Polling/tailing or reopening the source path is
 forbidden. If eligibility/interposition fails, ordinary shell semantics run and the result claims only bytes that
-reached captured pipes. This is evidence classification, not the removed hardlink optimization. Parsing is optimization
-only, never authority or correctness. Structured stdin remains separate from shell text.
+reached captured pipes. This is evidence classification, not the removed hardlink optimization. Structured stdin remains
+separate from shell text.
 
 ## Error mapping (CowshedError → JSON-RPC)
 

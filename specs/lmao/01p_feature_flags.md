@@ -100,8 +100,7 @@ Feature flag evaluation reads context from two sources:
 The evaluator receives the full SpanContext (minus `ff`) and can access both:
 
 ```typescript
-// Inside a class implementing FlagEvaluator<AppCtx>
-async getAsync(ctx: SpanContextWithoutFf<AppCtx>, flag: string) {
+flagEvaluator: async (ctx, flag, defaultValue) => {
   // Access scope values (column data)
   const region = ctx.scope.region;
 
@@ -109,8 +108,8 @@ async getAsync(ctx: SpanContextWithoutFf<AppCtx>, flag: string) {
   const userId = ctx.userId;
   const userPlan = ctx.userPlan;
 
-  return launchDarkly.variation(flag, null, { userId, userPlan, region });
-}
+  return launchDarkly.variation(flag, defaultValue, { userId, userPlan, region });
+};
 ```
 
 ### Context Flow Diagram <a id="smoo/lmao!n/schema-feature-flags.context-flow-diagram"></a>
@@ -144,12 +143,12 @@ trace('request', {                  ctx.setScope({ region })          ctx.ff.pre
 
 **Purpose**: Handle feature flag evaluation with full span context for logging, tracing, and analytics.
 
-The evaluator is defined in `schema/evaluator.ts`: the `FlagEvaluator` interface, the `FeatureFlagEvaluator` per-span
-wrapper, `createFeatureFlagEvaluator`, the `FlagValue` / `SpanContextWithoutFf` / `BooleanFlagContext` /
-`VariantFlagContext` / `ConfigFlagContext` types, and the built-in `InMemoryFlagEvaluator`.
-`tracer.ts:_createFlagEvaluator` wires the evaluator from `TracerOptions`, and `codegen/evaluatorGenerator.ts` generates
-the per-span getter class. Source regions are marked under `smoo/lmao!n/flag-evaluator*`; the spec relationship is
-`n/op-context-flag-evaluator` (evaluator) and `n/schema-feature-flags` (schema entry point).
+**Implementation status:** Realized in `schema/evaluator.ts` (the `FlagEvaluator` interface, the abstract
+`FeatureFlagEvaluator` per-span wrapper, `createFeatureFlagEvaluator`, the `FlagValue` / `SpanContextWithoutFf` /
+`BooleanFlagContext` / `VariantFlagContext` / `ConfigFlagContext` types, and the built-in `InMemoryFlagEvaluator`),
+`tracer.ts:_createFlagEvaluator` (wires the evaluator from `TracerOptions`), and the generated per-span getter class in
+`codegen/evaluatorGenerator.ts`. These source spans are fenced under `smoo/lmao!n/flag-evaluator*`; the spec
+relationship is `n/op-context-flag-evaluator` (evaluator) and `n/schema-feature-flags` (schema entry point).
 
 ### Ctx-First Evaluator Pattern <a id="smoo/lmao!n/op-context-flag-evaluator.ctx-first-evaluator-pattern"></a>
 
@@ -165,10 +164,9 @@ The evaluator receives `Omit<SpanContext, 'ff'>` - full context access except `f
 
 ```typescript
 /**
- * SpanContext without 'ff' field - prevents infinite recursion in evaluators.
- * Ctx is the OpContext bundle: the log schema, flags, deps, and user context (env, etc.) all derive from it.
+ * SpanContext without 'ff' field - prevents infinite recursion in evaluators
  */
-type SpanContextWithoutFf<Ctx extends OpContext> = Omit<SpanContext<Ctx>, 'ff'>;
+type SpanContextWithoutFf<T, FF, Env> = Omit<SpanContext<T, FF, Env>, 'ff'>;
 
 /**
  * Feature flag evaluator interface.
@@ -176,31 +174,31 @@ type SpanContextWithoutFf<Ctx extends OpContext> = Omit<SpanContext<Ctx>, 'ff'>;
  * Receives SpanContext (minus 'ff') as FIRST parameter for consistency with ctx-first pattern.
  * This enables evaluators to log, create child spans, and access scope/env during evaluation.
  */
-interface FlagEvaluator<Ctx extends OpContext = OpContext> {
+interface FlagEvaluator<T extends LogSchema, FF extends FeatureFlagSchema, Env> {
   /**
    * Get a flag value synchronously (for cached/static flags)
    * @param ctx - SpanContext without 'ff' (can log, create spans, access scope)
    * @param flag - Flag name to evaluate
    */
-  getSync<K extends string>(ctx: SpanContextWithoutFf<Ctx>, flag: K): FlagValue;
+  getSync<K extends string>(ctx: SpanContextWithoutFf<T, FF, Env>, flag: K): FlagValue;
 
   /**
    * Get a flag value asynchronously (for dynamic flags)
    * @param ctx - SpanContext without 'ff' (can log, create spans, access scope)
    * @param flag - Flag name to evaluate
    */
-  getAsync<K extends string>(ctx: SpanContextWithoutFf<Ctx>, flag: K): Promise<FlagValue>;
+  getAsync<K extends string>(ctx: SpanContextWithoutFf<T, FF, Env>, flag: K): Promise<FlagValue>;
 
   /**
    * Create span-bound accessor from span context.
-   * Returns a FeatureFlagEvaluator with typed getters for each flag in Ctx['flags'].
+   * Returns a FeatureFlagEvaluator with typed getters for each flag.
    *
    * MUST create a new instance per span because JS getters (`get darkMode()`)
    * cannot receive parameters - the span context must be stored at construction.
    *
    * Receives `Omit<SpanContext, 'ff'>` to prevent infinite recursion.
    */
-  forContext(ctx: SpanContextWithoutFf<Ctx>): FeatureFlagEvaluator<Ctx> & InferFeatureFlagsWithContext<Ctx>;
+  forContext(ctx: SpanContextWithoutFf<T, FF, Env>): FeatureFlagEvaluator<FF, T, Env>;
 }
 ```
 
@@ -218,9 +216,7 @@ ctx-first pattern used throughout the codebase and enables:
 ### Example: LaunchDarkly Integration <a id="smoo/lmao!n/op-context-flag-evaluator.example-launchdarkly-integration"></a>
 
 ```typescript
-import { FlagEvaluator, OpContextOf, SpanContextWithoutFf, createFeatureFlagEvaluator } from '@smoothbricks/lmao';
-
-type AppCtx = OpContextOf<typeof opContext>;
+import { FlagEvaluator, FeatureFlagEvaluator, SpanContextWithoutFf } from '@smoothbricks/lmao';
 
 /**
  * LaunchDarkly evaluator implementing FlagEvaluator interface.
@@ -228,16 +224,16 @@ type AppCtx = OpContextOf<typeof opContext>;
  * Simple evaluators can often just return `this` from forContext since
  * getSync/getAsync receive the correct span's context on each call.
  */
-class LaunchDarklyEvaluator implements FlagEvaluator<AppCtx> {
+class LaunchDarklyEvaluator implements FlagEvaluator<AppSchema, AppFlags, Env> {
   constructor(
     private ldClient: LaunchDarkly.LDClient,
-    private schema: AppCtx['flags']
+    private schema: AppFlags
   ) {}
 
   /**
    * Sync evaluation - returns cached value or default
    */
-  getSync(ctx: SpanContextWithoutFf<AppCtx>, flag: string) {
+  getSync(ctx: SpanContextWithoutFf<AppSchema, AppFlags, Env>, flag: string) {
     // Can log during evaluation!
     ctx.log.debug(`Sync eval: ${flag}`);
 
@@ -255,9 +251,9 @@ class LaunchDarklyEvaluator implements FlagEvaluator<AppCtx> {
   /**
    * Async evaluation - can make network calls with full observability
    */
-  async getAsync(ctx: SpanContextWithoutFf<AppCtx>, flag: string) {
+  async getAsync(ctx: SpanContextWithoutFf<AppSchema, AppFlags, Env>, flag: string) {
     // Can create child spans for external calls!
-    const evaluated = await ctx.span('launchDarkly', async (child) => {
+    return ctx.span('launchDarkly', async (child) => {
       child.tag.flag(flag);
 
       try {
@@ -271,22 +267,21 @@ class LaunchDarklyEvaluator implements FlagEvaluator<AppCtx> {
         );
 
         child.tag.value(String(value));
-        return child.ok(value);
+        return child.ok(value).value;
       } catch (error) {
         child.log.error('LaunchDarkly evaluation failed');
-        return child.err(LD_ERROR({ flag })); // LD_ERROR from defineCodeError
+        return child.err('LD_ERROR').value ?? this.schema[flag]?.defaultValue;
       }
     });
-    // The span returns a Result; the evaluator returns the flag value
-    return evaluated.isOk() ? evaluated.value : (this.schema[flag]?.defaultValue ?? null);
   }
 
   /**
-   * Create span-bound accessor: the generated per-span wrapper with typed getters,
-   * reusing this evaluator for every getSync/getAsync call.
+   * Create span-bound accessor. Simple evaluators can return `this` since
+   * getSync/getAsync receive the correct ctx on each call.
    */
-  forContext(ctx: SpanContextWithoutFf<AppCtx>) {
-    return createFeatureFlagEvaluator(this.schema, ctx, this);
+  forContext(ctx: SpanContextWithoutFf<AppSchema, AppFlags, Env>) {
+    // Create wrapper that provides typed flag getters
+    return new FeatureFlagEvaluator(this.schema, ctx as SpanContext, this);
   }
 }
 
@@ -362,20 +357,19 @@ the stored `#spanContext`.
 The evaluator receives `Omit<SpanContext, 'ff'>` to **prevent infinite recursion**:
 
 ```typescript
-// ❌ BAD: If the evaluator had access to ctx.ff, this would infinite loop
-async getAsync(ctx, flag) {
-  if (ctx.ff.someOtherFlag) {  // This calls the evaluator again!
+// ❌ BAD: If evaluator had access to ctx.ff, this would infinite loop
+flagEvaluator: async (ctx, flag, defaultValue) => {
+  if (ctx.ff.someOtherFlag) {  // This calls flagEvaluator again!
     // ...infinite recursion
   }
-}
+};
 
-// ✅ GOOD: ctx is SpanContextWithoutFf<Ctx>, so TypeScript prevents this mistake
-async getAsync(ctx: SpanContextWithoutFf<AppCtx>, flag: string) {
+// ✅ GOOD: ctx.ff is omitted, TypeScript prevents this mistake
+flagEvaluator: async (ctx, flag, defaultValue) => {
   // ctx.ff doesn't exist here - TypeScript error if you try to access it
   ctx.log.debug('Safe to log');
-  const external = await ctx.span('external', async (child) => child.ok(await fetchFlag(flag))); // Safe to create spans
-  return external.isOk() ? external.value : null;
-}
+  return ctx.span('external', async () => { ... }); // Safe to create spans
+};
 ```
 
 ### Evaluator Capabilities Summary <a id="smoo/lmao!n/op-context-flag-evaluator.evaluator-capabilities-summary"></a>
@@ -459,29 +453,29 @@ evaluator.setFlag('darkMode', false);
 **InMemoryFlagEvaluator implementation pattern:**
 
 ```typescript
-class InMemoryFlagEvaluator<Ctx extends OpContext = OpContext> implements FlagEvaluator<Ctx> {
+class InMemoryFlagEvaluator<T, FF, Env> implements FlagEvaluator<T, FF, Env> {
   private flags: Record<string, FlagValue>;
 
   constructor(
-    private ffSchema: Ctx['flags'],
+    private schema: FF,
     initialFlags: Record<string, FlagValue> = {}
   ) {
     this.flags = initialFlags;
   }
 
   // Simple: ignores ctx, just returns stored value
-  getSync(_ctx: SpanContextWithoutFf<Ctx>, flag: string) {
+  getSync(_ctx: SpanContextWithoutFf<T, FF, Env>, flag: string) {
     return this.flags[flag] ?? null;
   }
 
   // Simple: ignores ctx, just returns stored value
-  async getAsync(_ctx: SpanContextWithoutFf<Ctx>, flag: string) {
+  async getAsync(_ctx: SpanContextWithoutFf<T, FF, Env>, flag: string) {
     return this.flags[flag] ?? null;
   }
 
   // Returns FeatureFlagEvaluator wrapper with typed getters
-  forContext(ctx: SpanContextWithoutFf<Ctx>) {
-    return createFeatureFlagEvaluator(this.ffSchema, ctx, this);
+  forContext(ctx: SpanContextWithoutFf<T, FF, Env>) {
+    return new FeatureFlagEvaluator(this.schema, ctx as SpanContext, this);
   }
 
   // Test helper to update flags at runtime
@@ -503,11 +497,10 @@ const fetchUser = defineOp('fetchUser', async (ctx, id: string) => {
     // Track that this flag influenced behavior
     useNewApi.track({ action: 'select_api', outcome: 'new' });
 
-    const user = await ctx.span('newApi', async (child) => {
+    return ctx.span('newApi', async (child) => {
       const user = await newUserService.fetch(id);
       return child.ok(user);
     });
-    return user.isOk() ? ctx.ok(user.value) : ctx.err(user.error); // Rebuild the child's outcome on this context
   }
 
   // Original path
@@ -524,7 +517,7 @@ const { trace } = new TestTracer(opContext);
 
 export default {
   async fetch(req: Request, env: Env) {
-    const result = await trace(
+    return trace(
       'request',
       {
         env,
@@ -538,14 +531,12 @@ export default {
         const maintenanceMode = await ctx.ff.get('maintenanceMode');
         if (maintenanceMode) {
           maintenanceMode.track({ action: 'request_gate', outcome: 'maintenance' });
-          return ctx.ok(new Response('Service under maintenance', { status: 503 }));
+          return new Response('Service under maintenance', { status: 503 });
         }
 
-        const handled = await ctx.span('handle-request', handleRequest, req); // handleRequest returns ok(Response)
-        return handled.isOk() ? ctx.ok(handled.value) : ctx.err(handled.error);
+        return handleRequest(ctx, req);
       }
     );
-    return result.isOk() ? result.value : new Response('Internal error', { status: 500 });
   },
 };
 ```
@@ -567,9 +558,8 @@ import {
   S,
   defineFeatureFlags,
   FlagEvaluator,
-  OpContextOf,
+  FeatureFlagEvaluator,
   SpanContextWithoutFf,
-  createFeatureFlagEvaluator,
 } from '@smoothbricks/lmao';
 import LaunchDarkly from 'launchdarkly-node-server-sdk';
 
@@ -590,13 +580,14 @@ const flags = defineFeatureFlags({
   experimentGroup: S.category().default('control').async(),
 });
 
-type AppCtx = OpContextOf<typeof opContext>;
+type AppSchema = typeof appSchema;
+type AppFlags = typeof flags.schema;
 
 // Implement FlagEvaluator interface
-class AppFlagEvaluator implements FlagEvaluator<AppCtx> {
+class AppFlagEvaluator implements FlagEvaluator<AppSchema, AppFlags, Env> {
   constructor(private ldClient: LaunchDarkly.LDClient) {}
 
-  getSync(ctx: SpanContextWithoutFf<AppCtx>, flag: string) {
+  getSync(ctx: SpanContextWithoutFf<AppSchema, AppFlags, Env>, flag: string) {
     // Sync: return cached value (LaunchDarkly caches after first async fetch)
     ctx.log.debug(`Sync eval: ${flag}`);
     return this.ldClient.variationSync(
@@ -608,9 +599,9 @@ class AppFlagEvaluator implements FlagEvaluator<AppCtx> {
     );
   }
 
-  async getAsync(ctx: SpanContextWithoutFf<AppCtx>, flag: string) {
+  async getAsync(ctx: SpanContextWithoutFf<AppSchema, AppFlags, Env>, flag: string) {
     // Async: full tracing of external call
-    const evaluated = await ctx.span('launchDarkly', async (child) => {
+    return ctx.span('launchDarkly', async (child) => {
       child.tag.flag(flag);
 
       const value = await this.ldClient.variation(
@@ -626,13 +617,12 @@ class AppFlagEvaluator implements FlagEvaluator<AppCtx> {
       );
 
       child.tag.value(String(value));
-      return child.ok(value);
+      return child.ok(value).value;
     });
-    return evaluated.isOk() ? evaluated.value : (flags.schema[flag]?.defaultValue ?? null);
   }
 
-  forContext(ctx: SpanContextWithoutFf<AppCtx>) {
-    return createFeatureFlagEvaluator(flags.schema, ctx, this);
+  forContext(ctx: SpanContextWithoutFf<AppSchema, AppFlags, Env>) {
+    return new FeatureFlagEvaluator(flags.schema, ctx as SpanContext, this);
   }
 }
 
@@ -656,18 +646,16 @@ const processUpload = defineOp('processUpload', async (ctx, file: File) => {
   const maxSize = maxSizeFlag?.value ?? 10;
 
   if (file.size > maxSize * 1024 * 1024) {
-    return ctx.err(FILE_TOO_LARGE({ maxSize })); // FILE_TOO_LARGE from defineCodeError
+    return ctx.err('FILE_TOO_LARGE', { maxSize });
   }
 
   // Async flag access
   const premiumFlag = await ctx.ff.get('premiumFeatures');
   if (premiumFlag) {
     premiumFlag.track(); // Record that flag influenced behavior
-    const premium = await ctx.span('premium-upload', processPremiumUpload, file);
-    if (premium.isErr()) return ctx.err(premium.error);
+    await processPremiumUpload(ctx, file);
   } else {
-    const standard = await ctx.span('standard-upload', processStandardUpload, file);
-    if (standard.isErr()) return ctx.err(standard.error);
+    await processStandardUpload(ctx, file);
   }
 
   return ctx.ok({ uploaded: true });
@@ -680,13 +668,12 @@ const tracer = new TestTracer(opContext, {
 
 export default {
   async fetch(req: Request, env: Env) {
-    const result = await tracer.trace(
+    return tracer.trace(
       'upload',
       { env, userId: req.headers.get('x-user-id') ?? undefined, userPlan: await getUserPlan(req) },
       processUpload,
       await req.blob()
     );
-    return result.isOk() ? Response.json(result.value) : new Response('Upload rejected', { status: 413 });
   },
 };
 ```

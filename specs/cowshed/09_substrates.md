@@ -258,9 +258,8 @@ Unlike APFS clonefile, a ZFS clone depends on its origin snapshot: `main@cowshed
 `ws/raven` exists. cowshed contains this with one rule — **one origin snapshot per workspace, destroyed together with
 it**:
 
-- `cowshed new raven` creates `main@cowshed:raven`; `cowshed rm raven` destroys `ws/raven` then its origin snapshot, the
-  one its `origin` property names (`main@cowshed:raven` unless a CI refresh promotion moved it, below), in that order —
-  an idempotent logical transaction (physically two commands; `cowshed gc` completes interrupted halves).
+- `cowshed new raven` creates `main@cowshed:raven`; `cowshed rm raven` destroys `ws/raven` then `main@cowshed:raven`, in
+  that order — an idempotent logical transaction (physically two commands; `cowshed gc` completes interrupted halves).
 - `cowshed gc` prunes `cowshed:*` snapshots with no surviving clone (crash between the two destroys).
 - Main is never blocked: writes to main proceed freely; a workspace's origin snapshot pins only the main blocks that
   main has since overwritten. `cowshed doctor` reports that pinned space per workspace (`zfs list -H -o written,origin`)
@@ -270,21 +269,17 @@ it**:
   rather than breaks: a workspace's origin snapshot dies with it, and **a workspace with live dependents cannot be
   reclaimed** — `cowshed rm src` exits 4 naming the dependent forks; `cowshed doctor` reports fork dependencies and
   their pinned bytes so a coordinator lands or removes forks first.
-- `zfs promote` is used in exactly one case: the CI host's refresh promotion (10_ci.md, "Keeping the host main warm"),
-  where a green refresh clone becomes main. There it removes the old main from the center of the graph instead of
-  chaining every later main onto it; the old main becomes one spoke off the new main and is destroyed by `gc` once no
-  live clone hangs off it. Everywhere else promotion re-parents the dependency graph and makes teardown order
-  data-dependent, so cowshed keeps the graph shallow — main at the center, one snapshot spoke per workspace, fork spokes
-  off sessions — and refuses reclaim while dependents exist rather than re-parenting.
+- `zfs promote` is not used: promotion re-parents the dependency graph and makes teardown order data-dependent. cowshed
+  keeps the graph shallow — main at the center, one snapshot spoke per workspace, fork spokes off sessions — and refuses
+  reclaim while dependents exist rather than re-parenting.
 
 ### Privileged helper (Linux)
 
 `zfs allow` delegation covers create/snapshot/clone/destroy but **not `mount(2)`**, which Linux gates on `CAP_SYS_ADMIN`
 regardless of delegation. Substrate mutations therefore go through `cowshed-helper`: a minimal root binary (installed by
 the package, auditable in one sitting) that accepts a fixed verb set
-(`create|clone|snapshot|destroy|rename|swap|promote|mount|unmount|set-mountpoint`) — `rename` serves retire's trash
-namespace, `swap` is the narrowly-constrained clone-swap that `cowshed restore` and the CI refresh promotion need, and
-`promote` serves only the CI refresh promotion (a refresh clone of main) — and refuses, on every verb, any dataset
+(`create|clone|snapshot|destroy|rename|swap|mount|unmount|set-mountpoint`) — `rename` serves retire's trash namespace,
+`swap` is the narrowly-constrained clone-swap that `cowshed restore` needs — and refuses, on every verb, any dataset
 argument outside `<pool>/cowshed/`. Constrained sudoers entries are the supported alternative for hosts that forbid
 setuid helpers. Everything else — Landlock sandboxing (04_sandbox.md), gateway, secrets scanner, CLI — runs
 unprivileged.
@@ -325,13 +320,12 @@ Restore is one fenced transaction on both substrates:
    checkpoint identity, format/dataset, and absence of a concurrent retire. Stop admitting jobs, drain the
    revision-bound supervisor, and detach/unmount the current workspace.
 2. Prepare the replacement at a non-enumerated staging name. Clone the checkpoint, validate it (including fsck on APFS),
-   and validate the clone's own complete protected `CheckpointManifestRecord`: its frame matches its `batch_sha256`,
-   `records_sha256` hashes the record prefix before it, its `repo_id` and `origin_incarnation` match the marker, and
-   every visible stream matches its count, hash and path. The controller's `CheckpointCommitment` is audit telemetry and
-   is not read. Missing/altered content, invalid complete frames, or digest mismatch is typed `Integrity` before
-   publication; only an incomplete trailing frame may be discarded as reported recovery with its `batch_sha256`
-   retained. Preserve the logical workspace name, grant binding, CA, primary `repo_id`, and macOS `portBlock` only when
-   present. Linux preserves no port block.
+   and validate the complete protected `CheckpointManifestRecord` against the controller `CheckpointCommitment`:
+   `repo_id`, `origin_incarnation`, `barrier_id`, visible stream counts/hashes/paths, `records_sha256`, and
+   `manifest_batch_sha256` must agree. Missing/altered content, invalid complete frames, or digest mismatch is typed
+   `Integrity` before publication; only an incomplete trailing frame may be discarded as reported recovery with its
+   `batch_sha256` retained. Preserve the logical workspace name, grant binding, CA, primary `repo_id`, and macOS
+   `portBlock` only when present. Linux preserves no port block.
 3. Mint the fresh `workspaceIncarnation` first. Then mint a fresh gateway token bound to that incarnation and write both
    into staged marker/token files, flush, and verify while undiscoverable. Copied job records retain their producer
    incarnation; allocation in the new incarnation starts above every inherited numeric job ID.

@@ -316,9 +316,7 @@ against the filesystem.
 
 The checkout path is written down in two places, and neither can be derived from the other: the in-image marker at
 main's mount root and the `infoSnapshot.projectRoot` in the sidecar beside main's canonical image. Every move carries
-both. Opening a project verifies that the marker's `projectRoot` matches the canonical git root and returns a conflict
-(exit 4) on mismatch, before any mount: a checkout moved or copied outside `cowshed mv` is refused, never mounted as the
-project its marker names.
+both.
 
 Moving an adopted checkout is always cowshed-mediated (`mv <ws> <new-path>`): the image is detached, published at the
 new path, and reattached — no unmount-and-remount gap at the user's path, no relink to maintain.
@@ -624,10 +622,9 @@ is detached and its mount can say nothing. A standalone workspace's sidecar omit
 `cowshed mv` repairs registrations. Moving main under direct mount moves the gitdir every git-worktree workspace points
 at, and moving a workspace moves the path main's registration records; both directions are repaired inside the same
 transaction that moves the mount, so there is no window in which a registration names a path nothing is mounted on.
-`cowshed land` needs no special case: it fast-forwards a checked-out target only through main's own checkout,
-compares-and-swaps a target nothing has checked out, and refuses a target held by any linked worktree, a git-worktree
-workspace or a foreign one: git never checks one branch out in two worktrees, so that worktree would be left with a
-stale index and files.
+`cowshed land` needs no special case: it fast-forwards only through main's own checkout and refuses a target that
+checkout does not have checked out. Git never checks one branch out in two worktrees, so a target held by any linked
+worktree, a git-worktree workspace or a foreign one, is refused rather than left with a stale index and files.
 
 ### Why clone is the default
 
@@ -852,9 +849,9 @@ and are refused together (exit 2).
 
 The full born-from-host-return-to-host close-out, as one primitive. It lands into main, or with `--into <lane>` into
 that lane base (see "Lanes" below); "the target" below is whichever one it is. The target branch defaults to the branch
-the target's checkout has checked out (`main` for main); a detached checkout with no `--target` is refused with exit 4
-before anything runs. How the branch moves depends only on checkout state, read again under the repository lock just
-before the update, because the check can run for minutes while the checkout is switched (step 3).
+the target's checkout has checked out (`main` for main), and it must be that branch: land moves the target branch
+through that checkout, so any other branch (or a detached checkout) is refused with exit 4 before anything runs, and
+again just before the fast-forward, because the check can run for minutes while the checkout is switched.
 
 Land does not rebase. It lands the head the caller validated and named (`--expected-source-head`), and an implicit
 rebase would land a head nobody named whenever main had moved. A workspace whose base main has moved past fails the
@@ -894,20 +891,13 @@ step.
    minted name. Only the resolved head is load-bearing. A workspace with no checked-out branch is a conflict naming the
    fix.
 
-   How the update is materialized depends only on checkout state:
-   - If the target branch is checked out in the target's checkout, the fast-forward runs **through that checkout**: its
-     branch ref, `HEAD`, index, and working tree all advance to the validated source tree. Cowshed never updates only a
-     hidden or non-checked-out ref while leaving the visible target stale. The target must be clean enough for the
-     update or `land` refuses with exit 4 and a `next:` hint to commit or stash.
-   - If the target branch is not checked out, land atomically compares-and-swaps `refs/heads/<target>` from the expected
-     target head to the validated source head, leaving the checkout's checked-out branch, `HEAD`, index and working tree
-     untouched. A failed compare-and-swap is a `Conflict` and changes nothing.
-   - If the target branch is checked out by any linked worktree, a git-worktree workspace or a foreign one, land refuses
-     rather than leave that worktree's index and files stale.
-
-   If the target advanced during validation, any expected head changed, or the update is not a fast-forward, return
-   `Conflict`, leave both source and target intact, and report the moved value. Cowshed never retries against a new base
-   internally; the coordinator decides whether to rebase and re-run checks.
+   The fast-forward runs **through the target's checkout**, which has the target branch checked out: its branch ref,
+   `HEAD`, index, and working tree all advance to the validated source tree. Cowshed never updates only a hidden or
+   non-checked-out ref while leaving the visible target stale. The target must be clean enough for the update or `land`
+   refuses with exit 4 and a `next:` hint to commit or stash. If the target advanced during validation, any expected
+   head changed, or the update is not a fast-forward, return `Conflict`, leave both source and target intact, and report
+   the moved value. Cowshed never retries against a new base internally; the coordinator decides whether to rebase and
+   re-run checks.
 
    Every rebase and land fence reports its refusal as data as well as prose: the `Conflict` carries a `FenceRefusal`
    (07_api.md "Errors") naming the fence and what it observed — the moved incarnation, source, destination or target
@@ -918,17 +908,15 @@ step.
 4. **Adopt the build volume and check it**: the target takes the workspace's build volume by renaming its one
    `.cowshed/build` link, re-runs the check on the adopted volume and requires 100% Nx cache hits, reporting every miss
    as a configuration finding, then freezes a new seed for later forks. The target builds nothing the workspace built.
-   16_build_volumes.md owns this step: when the swap is skipped, what a miss means, and garbage collection. A land that
-   compared-and-swapped a branch that is not checked out leaves the target's checkout, and so its build volume,
-   untouched, and skips this step.
+   16_build_volumes.md owns this step: when the swap is skipped, what a miss means, and garbage collection.
 
-5. **Retire**: only after the target branch and, when checked out, its visible working state resolve to the validated
-   source head, destroy the workspace (supervisor tree first — 11_shell.md) and prune its `refs/cowshed/<ws>/*`
-   preservation refs on the host. The retire gate is `rm`'s, measured against the branch the workspace just landed on,
-   in the target's repository: a lane unit whose commits its lane base holds retires, though main does not hold them
-   yet. A retire refused at this point (the check left work behind, say) keeps the workspace and exits with the refusal,
-   but its message starts with the landed head and target: the target has moved, so the next step is `cowshed rm`, not
-   another land.
+5. **Retire**: only after the target branch and its visible working state resolve to the validated source head, destroy
+   the workspace (supervisor tree first — 11_shell.md) and prune its `refs/cowshed/<ws>/*` preservation refs on the
+   host. The retire gate is `rm`'s, measured against the branch the workspace just landed on, in the target's
+   repository: a lane unit whose commits its lane base holds retires, though main does not hold them yet. A retire
+   refused at this point (the check left work behind, say) keeps the workspace and exits with the refusal, but its
+   message starts with the landed head and target: the target has moved, so the next step is `cowshed rm`, not another
+   land.
 
 `--no-retire` keeps the workspace after a successful land (for a coordinator that wants to reuse it via
 `rebase --fresh`). `--push-only` performs steps 1–2 and installs the validated head in the workspace's durable
