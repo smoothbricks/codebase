@@ -14,6 +14,7 @@ pub struct ArrowColumn {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ArrowKind {
+    UInt16,
     UInt32,
     UInt64,
     Int32,
@@ -97,6 +98,9 @@ fn owner_names(attrs: &[syn::Attribute]) -> Result<OwnerNames, String> {
     let mut error = None;
     let mut merge = None;
     for attr in attrs {
+        if !matches!(&attr.meta, syn::Meta::List(_)) {
+            continue;
+        }
         attr.parse_nested_meta(|meta| {
             if !meta.path.is_ident("cowshed_api") {
                 consume_value(&meta)?;
@@ -176,6 +180,9 @@ fn arrow_of(attrs: &[syn::Attribute]) -> Result<(ArrowKind, Option<Vec<String>>)
     let mut kind = None;
     let mut values = None;
     for attr in attrs {
+        if !matches!(&attr.meta, syn::Meta::List(_)) {
+            continue;
+        }
         attr.parse_nested_meta(|meta| {
             if !meta.path.is_ident("cowshed_api") {
                 consume_value(&meta)?;
@@ -189,6 +196,7 @@ fn arrow_of(attrs: &[syn::Attribute]) -> Result<(ArrowKind, Option<Vec<String>>)
                     .value();
                 if meta.path.is_ident("arrow") {
                     kind = Some(match value.as_str() {
+                        "uint16" => ArrowKind::UInt16,
                         "uint32" => ArrowKind::UInt32,
                         "uint64" => ArrowKind::UInt64,
                         "int32" => ArrowKind::Int32,
@@ -198,7 +206,7 @@ fn arrow_of(attrs: &[syn::Attribute]) -> Result<(ArrowKind, Option<Vec<String>>)
                         "dict8" => ArrowKind::Dict8,
                         _ => {
                             return Err(meta.error(
-                                "arrow must be uint32, uint64, int32, int64, utf8, dict32 or dict8",
+                                "arrow must be uint16, uint32, uint64, int32, int64, utf8, dict32 or dict8",
                             ));
                         }
                     });
@@ -299,6 +307,7 @@ pub fn emit_columns(record: &ArrowRecord) -> String {
 
 fn data_type(kind: ArrowKind) -> &'static str {
     match kind {
+        ArrowKind::UInt16 => "DataType::UInt16",
         ArrowKind::UInt32 => "DataType::UInt32",
         ArrowKind::UInt64 => "DataType::UInt64",
         ArrowKind::Int32 => "DataType::Int32",
@@ -311,7 +320,11 @@ fn data_type(kind: ArrowKind) -> &'static str {
 
 fn encode_expr(column: &ArrowColumn) -> String {
     match column.kind {
-        ArrowKind::UInt32 | ArrowKind::UInt64 | ArrowKind::Int32 | ArrowKind::Int64 => {
+        ArrowKind::UInt16
+        | ArrowKind::UInt32
+        | ArrowKind::UInt64
+        | ArrowKind::Int32
+        | ArrowKind::Int64 => {
             format!(
                 "{kind}(columns.{name})",
                 kind = encode_fn(column.kind),
@@ -330,6 +343,7 @@ fn encode_expr(column: &ArrowColumn) -> String {
 
 fn encode_fn(kind: ArrowKind) -> &'static str {
     match kind {
+        ArrowKind::UInt16 => "uint16",
         ArrowKind::UInt32 => "uint32",
         ArrowKind::UInt64 => "uint64",
         ArrowKind::Int32 => "int32",
@@ -342,6 +356,7 @@ fn encode_fn(kind: ArrowKind) -> &'static str {
 
 fn decode_expr(column: &ArrowColumn) -> String {
     let reader = match column.kind {
+        ArrowKind::UInt16 => "optional_u16",
         ArrowKind::UInt32 => "optional_u32",
         ArrowKind::UInt64 => "optional_u64",
         ArrowKind::Int32 => "optional_i32",
@@ -427,5 +442,25 @@ mod tests {
         assert!(!emitted.contains("ProcessSpanError"));
         assert!(!emitted.contains(".1"));
         assert!(!emitted.contains("merge_unattributed_columns"));
+    }
+
+    #[test]
+    fn a_job_boundary_preserves_unsigned_sixteen_bit_cores() {
+        let record = parse_arrow_record(
+            r#"
+                /// A real column owner may be documented.
+                #[cfg_attr(any(), cowshed_api(arrow_columns = "job_boundary"))]
+                struct BoundaryColumns {
+                    /// The checked number of online host cores.
+                    #[cfg_attr(any(), cowshed_api(arrow = "uint16"))]
+                    cores: Option<u16>,
+                }
+            "#,
+        )
+        .expect("a checked core count has an exact Arrow column");
+        let emitted = emit_columns(&record);
+        assert!(emitted.contains("DataType::UInt16"));
+        assert!(emitted.contains("uint16(columns.cores)"));
+        assert!(emitted.contains(r#"optional_u16(batch, start, "cores")?"#));
     }
 }

@@ -318,6 +318,10 @@ pub fn column_files(core: &Path) -> Result<Vec<GeneratedFile>, String> {
             "runtime/job_unattributed.rs",
             "runtime/job_unattributed_columns.generated.rs",
         ),
+        (
+            "runtime/job_boundary.rs",
+            "runtime/job_boundary_columns.generated.rs",
+        ),
     ];
     owners
         .into_iter()
