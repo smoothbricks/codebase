@@ -112,10 +112,10 @@ describe('root smoo monorepo policy', () => {
         clean: 'nx run-many -t clean',
         'clean:node_modules':
           'rm -rf node_modules && find e* t* p* -type d -name node_modules -print0 | xargs -0 rm -rvf',
-        'format:changed': 'git-format-staged --config tooling/git-hooks/git-format-staged.yml --also-unstaged',
-        'format:staged': 'git-format-staged --config tooling/git-hooks/git-format-staged.yml',
+        'format:changed': 'git-format-staged --config .git-format-staged.yml --also-unstaged',
+        'format:staged': 'git-format-staged --config .git-format-staged.yml',
         lint: 'nx run-many -t lint',
-        'lint:fix': 'git-format-staged --config tooling/git-hooks/git-format-staged.yml --unstaged',
+        'lint:fix': 'git-format-staged --config .git-format-staged.yml --unstaged',
         postinstall: 'bun tooling/direnv/developer-links.ts',
       });
       expect(rootPackage).toMatchObject({ nx: { includedScripts: [] } });
