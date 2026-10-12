@@ -3,8 +3,8 @@
 
 use arrow_schema::{DataType, Field};
 
-use crate::api::process::{ProcessCoverage, UsageReconciliation};
-use crate::runtime::process_spans::process_custom_fields;
+use crate::api::process::ProcessCoverage;
+use crate::api::resources::UsageReconciliation;
 
 /// The row template. Not a process span and not a JSON payload.
 pub const JOB_UNATTRIBUTED: &str = "job.unattributed";
@@ -45,18 +45,19 @@ pub fn unattributed_values(
         },
     )
 }
+#[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::process::{
-        CpuMicrosDelta, ProcessCoverage, ProcessCoverageGap, StorageIoBytesDelta,
-    };
+    use crate::api::process::{ProcessCoverage, ProcessCoverageGap};
+    use crate::api::resources::{CpuMicrosDelta, StorageIoBytesDelta};
+    use crate::runtime::process_spans::process_custom_fields;
 
     #[test]
     fn a_missing_io_comparison_stays_absent_and_the_process_schema_does_not_grow() {
         let values = unattributed_values(&UsageReconciliation {
-            cpu_us: CpuMicrosDelta::new(-150),
+            cpu_us: CpuMicrosDelta::new(-150).unwrap(),
             io_read_bytes: None,
-            io_write_bytes: Some(StorageIoBytesDelta::new(8)),
+            io_write_bytes: Some(StorageIoBytesDelta::new(8).unwrap()),
             coverage: ProcessCoverage::Gap {
                 reason: ProcessCoverageGap::EventsLost,
             },

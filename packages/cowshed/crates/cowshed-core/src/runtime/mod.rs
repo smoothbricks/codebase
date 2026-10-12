@@ -3,7 +3,8 @@ pub(crate) mod build_volumes;
 pub mod commitment_feed;
 #[cfg(target_os = "macos")]
 pub mod job_accounting;
-pub mod job_attribution;
+#[cfg(target_os = "macos")]
+mod job_attribution;
 pub mod job_boundary;
 #[cfg(target_os = "linux")]
 pub mod job_cgroup;
