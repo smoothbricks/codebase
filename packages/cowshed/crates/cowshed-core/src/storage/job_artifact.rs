@@ -9326,14 +9326,7 @@ mod tests {
         );
         let other_id = store.next_job_id().unwrap();
         let other = store
-            .begin_job(
-                other_id,
-                1,
-                &argv_true(),
-                None,
-                OutputTargets::default(),
-                OriginalJobCwd::WorkspaceRoot,
-            )
+            .begin_job(other_id, 1, &argv_true(), None, OutputTargets::default())
             .unwrap();
         store.finish(other, JobState::Failed).unwrap();
         assert!(
