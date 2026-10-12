@@ -5317,6 +5317,20 @@ async fn a_busy_job_reads_its_measured_cpu_share_and_its_busy_leader_as_leaf() {
     let burned = leader.burned();
     let busy = handle.resources(job_id).await.unwrap();
     assert!(busy.consistent(), "{busy:?}");
+    let measured_share = |sample: &cowshed_core::api::JobResourceSample| {
+        let spent = u32::try_from(accounted_us(sample) - accounted_us(&opened))
+            .expect("fixture CPU fits u32 microseconds");
+        let elapsed = u32::try_from(sample.wall_us.get() - opened.wall_us.get())
+            .expect("fixture interval fits u32 microseconds");
+        assert!(spent > 0 && elapsed > 0, "a real observed CPU interval");
+        let expected = 100.0 * f64::from(spent) / f64::from(elapsed);
+        assert!(
+            (sample.cpu_pct.get() - expected).abs() < 0.001,
+            "reported {} %, measured {spent} us CPU / {elapsed} us wall = {expected} %",
+            sample.cpu_pct.get()
+        );
+    };
+    measured_share(&busy);
     assert!(
         window_shares(&opened, &busy).contains(&busy.cpu_pct.get()),
         "the share is the window's CPU over its wall time: {:?} of {opened:?} and {busy:?}",
@@ -5327,6 +5341,8 @@ async fn a_busy_job_reads_its_measured_cpu_share_and_its_busy_leader_as_leaf() {
         (burned..burned + SLACK_US).contains(&accounted),
         "the job's {accounted} us hold the {burned} us its leader burned"
     );
+    let read_again = handle.resources(job_id).await.unwrap();
+    measured_share(&read_again);
     let JobLeafAttribution::Attributed {
         leaf,
         observed_cpu_permille,

@@ -1208,8 +1208,38 @@ mod tests {
         original
     }
 
-    #[test]
-    fn configured_filters_never_run_and_copies_verify_their_raw_state() {
+    struct FilteredCopy {
+        repository: Repository,
+        staging: PathBuf,
+        before: GitPreservationSnapshot,
+        advanced: String,
+    }
+
+    impl FilteredCopy {
+        fn verify(&self) -> Result<()> {
+            verify_copy(
+                &self.staging,
+                &self.repository.root,
+                &self.before,
+                &self.repository.root,
+            )
+        }
+
+        fn reject_changed_bytes(&self, relative: &str, bytes: &[u8]) {
+            let path = self.staging.join(relative);
+            let original = plant(&path, bytes);
+            let error = self
+                .verify()
+                .expect_err(&format!("planted bytes in {}", path.display()));
+            assert_eq!(error.code, crate::ErrorCode::Integrity, "{}", error.message);
+            plant(&path, &original);
+            self.verify().expect("restored bytes verify again");
+        }
+    }
+
+    // Each independent witness gets the same real filtered checkout and source-byte controls.
+    // Keep repeated full Git captures out of one aggregate test's 30-second window.
+    fn with_filtered_copy(check: impl FnOnce(&FilteredCopy)) {
         let repository = Repository::new();
         // A clean filter stores the index blob, so raw worktree bytes differ from it: the shape
         // git-crypt and LFS checkouts take. The copy must verify without running that filter.
@@ -1348,61 +1378,16 @@ mod tests {
         fs::create_dir(&staging).expect("create copy destination");
         crate::copy::copy_until_quiescent_blocking(&repository.root, &staging)
             .expect("copy checkout");
-        let verify = || verify_copy(&staging, &repository.root, &before, &repository.root);
-        verify().expect("filter-free copy verifies against its retained source");
-
-        // Each planted difference must refuse, and the exact original bytes must verify again.
-        let mut flipped_index = index_before.clone();
-        *flipped_index.last_mut().expect("index checksum byte") ^= 0xff;
-        let mut planted_config = config_before.clone();
-        planted_config.extend_from_slice(b"\n# planted\n");
-        let planted = [
-            (staging.join(".git/index"), flipped_index),
-            (staging.join(".git/config"), planted_config),
-            (staging.join("README"), b"DIRTY\n".to_vec()),
-            (staging.join("scratch.txt"), b"UNTRACKED\n".to_vec()),
-            (staging.join("secret.txt"), b"RAW SECRET\n".to_vec()),
-            (staging.join("subdir/README"), b"SECONX\n".to_vec()),
-            (staging.join("subdir/ignored.log"), b"IGNORED\n".to_vec()),
-        ];
-        for (path, bytes) in planted {
-            let original = plant(&path, &bytes);
-            let error = verify().expect_err(&format!("planted bytes in {}", path.display()));
-            assert_eq!(error.code, crate::ErrorCode::Integrity, "{}", error.message);
-            plant(&path, &original);
-            verify().expect("restored bytes verify again");
-        }
-        // A file only the copy holds is a path the source never had, never a silent omission.
-        fs::write(staging.join("extra.txt"), b"only in the copy\n").expect("plant extra file");
-        let error = verify().expect_err("a copy-only untracked file must refuse");
-        assert_eq!(error.code, crate::ErrorCode::Integrity, "{}", error.message);
-        fs::remove_file(staging.join("extra.txt")).expect("remove extra file");
-        verify().expect("removed extra file verifies again");
-        // A file only the copy holds inside the submodule is refused by the subtree compare.
-        let subdir = staging.join("subdir");
-        let subdir_modified = fs::metadata(&subdir)
-            .expect("stat copied submodule directory")
-            .modified()
-            .expect("copied submodule modification time");
-        fs::write(staging.join("subdir/extra.txt"), b"only in the copy\n")
-            .expect("plant submodule extra file");
-        let error = verify().expect_err("a copy-only file inside the submodule must refuse");
-        assert_eq!(error.code, crate::ErrorCode::Integrity, "{}", error.message);
-        fs::remove_file(staging.join("subdir/extra.txt")).expect("remove submodule extra file");
-        fs::File::open(&subdir)
-            .expect("open copied submodule directory")
-            .set_modified(subdir_modified)
-            .expect("restore the directory metadata changed by the planted extra file");
-        verify().expect("removed submodule extra file verifies again");
-        // Commit-level pointer drift: the copy's submodule HEAD moves onto the unrecorded commit.
-        // Status names it, so the refusal must name porcelain.
-        let submodule_head = staging.join(".git/modules/subdir/HEAD");
-        let recorded_head = plant(&submodule_head, format!("{advanced}\n").as_bytes());
-        let error = verify().expect_err("a drifted submodule pointer must refuse");
-        assert_eq!(error.code, crate::ErrorCode::Integrity, "{}", error.message);
-        assert!(error.message.contains("porcelain"), "{}", error.message);
-        plant(&submodule_head, &recorded_head);
-        verify().expect("restored submodule pointer verifies again");
+        let fixture = FilteredCopy {
+            repository,
+            staging,
+            before,
+            advanced,
+        };
+        fixture
+            .verify()
+            .expect("filter-free copy verifies against its retained source");
+        check(&fixture);
 
         assert!(
             !marker.exists(),
@@ -1428,6 +1413,85 @@ mod tests {
             submodule_index_before,
             "submodule index unchanged"
         );
+    }
+
+    #[test]
+    fn configured_filters_never_run_and_copies_verify_their_raw_state() {
+        with_filtered_copy(|fixture| {
+            let mut flipped_index =
+                fs::read(fixture.staging.join(".git/index")).expect("copied index");
+            *flipped_index.last_mut().expect("index checksum byte") ^= 0xff;
+            let mut planted_config =
+                fs::read(fixture.staging.join(".git/config")).expect("copied config");
+            planted_config.extend_from_slice(b"\n# planted\n");
+            for (relative, bytes) in [
+                (".git/index", flipped_index),
+                (".git/config", planted_config),
+                ("README", b"DIRTY\n".to_vec()),
+                ("scratch.txt", b"UNTRACKED\n".to_vec()),
+                ("secret.txt", b"RAW SECRET\n".to_vec()),
+            ] {
+                fixture.reject_changed_bytes(relative, &bytes);
+            }
+        });
+    }
+
+    #[test]
+    fn filtered_copy_verification_refuses_submodule_byte_and_head_drift() {
+        with_filtered_copy(|fixture| {
+            fixture.reject_changed_bytes("subdir/README", b"SECONX\n");
+            fixture.reject_changed_bytes("subdir/ignored.log", b"IGNORED\n");
+            // Commit-level pointer drift stays visible even though child status is disabled.
+            let submodule_head = fixture.staging.join(".git/modules/subdir/HEAD");
+            let recorded_head = plant(
+                &submodule_head,
+                format!("{}\n", fixture.advanced).as_bytes(),
+            );
+            let error = fixture
+                .verify()
+                .expect_err("a drifted submodule pointer must refuse");
+            assert_eq!(error.code, crate::ErrorCode::Integrity, "{}", error.message);
+            assert!(error.message.contains("porcelain"), "{}", error.message);
+            plant(&submodule_head, &recorded_head);
+            fixture
+                .verify()
+                .expect("restored submodule pointer verifies again");
+        });
+    }
+
+    #[test]
+    fn filtered_copy_verification_refuses_copy_only_paths() {
+        with_filtered_copy(|fixture| {
+            // A file only the copy holds is a path the source never had, never a silent omission.
+            let extra = fixture.staging.join("extra.txt");
+            fs::write(&extra, b"only in the copy\n").expect("plant extra file");
+            let error = fixture
+                .verify()
+                .expect_err("a copy-only untracked file must refuse");
+            assert_eq!(error.code, crate::ErrorCode::Integrity, "{}", error.message);
+            fs::remove_file(&extra).expect("remove extra file");
+            fixture.verify().expect("removed extra file verifies again");
+            // An extra submodule path is refused by the subtree compare, including ignored paths.
+            let subdir = fixture.staging.join("subdir");
+            let modified = fs::metadata(&subdir)
+                .expect("stat copied submodule directory")
+                .modified()
+                .expect("copied submodule modification time");
+            let extra = subdir.join("extra.txt");
+            fs::write(&extra, b"only in the copy\n").expect("plant submodule extra file");
+            let error = fixture
+                .verify()
+                .expect_err("a copy-only file inside the submodule must refuse");
+            assert_eq!(error.code, crate::ErrorCode::Integrity, "{}", error.message);
+            fs::remove_file(&extra).expect("remove submodule extra file");
+            fs::File::open(&subdir)
+                .expect("open copied submodule directory")
+                .set_modified(modified)
+                .expect("restore the directory metadata changed by the planted extra file");
+            fixture
+                .verify()
+                .expect("removed submodule extra file verifies again");
+        });
     }
 
     #[test]

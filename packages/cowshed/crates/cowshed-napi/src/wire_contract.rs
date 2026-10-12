@@ -1010,8 +1010,246 @@ fn reports() -> BTreeMap<&'static str, BTreeMap<&'static str, Value>> {
     ])
 }
 
+fn process_observations() -> BTreeMap<&'static str, BTreeMap<&'static str, Value>> {
+    use cowshed_core::api::{
+        StorageIoBytes,
+        process::{
+            BlockerChange, JobProcessDelta, JobProcessEvent, JobProcessSample, JobProcessTree,
+            LockHolder, ProcessBlockedOn, ProcessExit, ProcessIoUnavailable, ProcessStorageIo,
+            ProcessUsage,
+        },
+    };
+
+    let unread = JobProcessSample {
+        pid: 4242,
+        ppid: 4200,
+        program: "cargo".into(),
+        argv: vec![CommandArg::from("cargo")],
+        born_at: timestamp(),
+        usage: None,
+        blocked_on: None,
+        exit: None,
+    };
+    let usage = ProcessUsage {
+        cpu_user_us: CpuMicros::new(12_345).expect("fixture CPU"),
+        cpu_sys_us: CpuMicros::new(678).expect("fixture CPU"),
+        busy: true,
+        rss_bytes: ResidentBytes::new(4096).expect("fixture resident bytes"),
+        rss_peak_bytes: ResidentBytes::new(8192).expect("fixture resident bytes"),
+        io: ProcessStorageIo::Read {
+            read_bytes: StorageIoBytes::new(123).expect("fixture read bytes"),
+            write_bytes: StorageIoBytes::new(456).expect("fixture write bytes"),
+        },
+    };
+    let running = JobProcessSample {
+        usage: Some(usage),
+        blocked_on: Some(ProcessBlockedOn::None),
+        ..unread.clone()
+    };
+    let ended = JobProcessSample {
+        usage: Some(ProcessUsage {
+            busy: false,
+            rss_bytes: ResidentBytes::new(0).expect("exited resident bytes"),
+            ..usage
+        }),
+        exit: Some(ProcessExit {
+            status: ExitStatus::Exited { code: 0 },
+            exited_at: timestamp(),
+        }),
+        ..unread.clone()
+    };
+    let tree = JobProcessTree {
+        job_id: JobId::new(7).expect("fixture job ID"),
+        sampled_at: timestamp(),
+        processes: vec![unread.clone()],
+        coverage: ProcessCoverage::Complete,
+    };
+    let mut trees = BTreeMap::from([
+        ("unread", document("job processes", &tree)),
+        (
+            "running",
+            document(
+                "job processes",
+                &JobProcessTree {
+                    processes: vec![running.clone()],
+                    ..tree.clone()
+                },
+            ),
+        ),
+        (
+            "exited",
+            document(
+                "job processes",
+                &JobProcessTree {
+                    processes: vec![ended.clone()],
+                    ..tree.clone()
+                },
+            ),
+        ),
+    ]);
+    for (name, reason) in [
+        ("ioNotPermitted", ProcessIoUnavailable::NotPermitted),
+        ("ioNotAccounted", ProcessIoUnavailable::NotAccounted),
+    ] {
+        let process = JobProcessSample {
+            argv: vec![CommandArg::from(OsString::from_vec(vec![0xff]))],
+            usage: Some(ProcessUsage {
+                io: ProcessStorageIo::Unavailable { reason },
+                ..ended.usage.expect("exited fixture usage")
+            }),
+            exit: Some(ProcessExit {
+                status: ExitStatus::Signaled {
+                    signal: 9,
+                    core_dumped: false,
+                },
+                exited_at: timestamp(),
+            }),
+            ..ended.clone()
+        };
+        trees.insert(
+            name,
+            document(
+                "job processes",
+                &JobProcessTree {
+                    processes: vec![process],
+                    ..tree.clone()
+                },
+            ),
+        );
+    }
+    let mut events = BTreeMap::new();
+    for (name, event) in [
+        (
+            "born",
+            JobProcessEvent::Born {
+                index: 0,
+                process: unread,
+            },
+        ),
+        (
+            "exec",
+            JobProcessEvent::Exec {
+                index: 0,
+                process: running.clone(),
+            },
+        ),
+        (
+            "heartbeat",
+            JobProcessEvent::Heartbeat {
+                index: 0,
+                process: running,
+            },
+        ),
+        (
+            "exited",
+            JobProcessEvent::Exited {
+                index: 0,
+                process: ended,
+            },
+        ),
+        (
+            "usage",
+            JobProcessEvent::Changed(JobProcessDelta::Usage { index: 0, usage }),
+        ),
+        (
+            "blockerClear",
+            JobProcessEvent::Changed(JobProcessDelta::Blocker {
+                index: 0,
+                blocked_on: BlockerChange::Clear,
+            }),
+        ),
+    ] {
+        events.insert(name, document("job process event", &event));
+    }
+    for (name, blocker) in [
+        ("blockerNone", ProcessBlockedOn::None),
+        ("blockerSocket", ProcessBlockedOn::Socket),
+        ("blockerPipe", ProcessBlockedOn::Pipe),
+        ("blockerChild", ProcessBlockedOn::Child),
+        ("blockerStdin", ProcessBlockedOn::Stdin),
+        ("blockerDisk", ProcessBlockedOn::Disk),
+        (
+            "lockUnknownHolder",
+            ProcessBlockedOn::Lock {
+                path: "target/.lock".into(),
+                holder: None,
+            },
+        ),
+        (
+            "lockHolderPid",
+            ProcessBlockedOn::Lock {
+                path: "target/.lock".into(),
+                holder: Some(LockHolder {
+                    pid: 4300,
+                    job: None,
+                    program: None,
+                }),
+            },
+        ),
+        (
+            "lockHolder",
+            ProcessBlockedOn::Lock {
+                path: "target/.lock".into(),
+                holder: Some(LockHolder {
+                    pid: 4300,
+                    job: Some(tree.job_id),
+                    program: Some("rustc".into()),
+                }),
+            },
+        ),
+    ] {
+        events.insert(
+            name,
+            document(
+                "job process event",
+                &JobProcessEvent::Changed(JobProcessDelta::Blocker {
+                    index: 0,
+                    blocked_on: BlockerChange::Set(blocker),
+                }),
+            ),
+        );
+    }
+    for (name, reason) in [
+        ("eventsLost", ProcessCoverageGap::EventsLost),
+        (
+            "unobservedBirth",
+            ProcessCoverageGap::UnobservedBirth { pid: 4243 },
+        ),
+        (
+            "unobservedExit",
+            ProcessCoverageGap::UnobservedExit { pid: 4243 },
+        ),
+        (
+            "uncountedFork",
+            ProcessCoverageGap::UncountedFork { pid: 4242 },
+        ),
+        ("unreadImage", ProcessCoverageGap::UnreadImage { pid: 4242 }),
+        (
+            "unreadFinalUsage",
+            ProcessCoverageGap::UnreadFinalUsage { pid: 4242 },
+        ),
+    ] {
+        trees.insert(
+            name,
+            document(
+                "job processes",
+                &JobProcessTree {
+                    coverage: ProcessCoverage::Gap { reason },
+                    ..tree.clone()
+                },
+            ),
+        );
+        events.insert(
+            name,
+            document("job process event", &JobProcessEvent::Gap { reason }),
+        );
+    }
+    BTreeMap::from([("JobProcessTree", trees), ("JobProcessEvent", events)])
+}
+
 fn corpus() -> BTreeMap<&'static str, BTreeMap<&'static str, Value>> {
     let mut corpus = reports();
+    corpus.extend(process_observations());
     corpus.insert("JobInfo", job_infos());
     corpus.insert("WorkspaceInfo", workspace_infos());
     corpus.insert("GrantSet", grant_sets());
