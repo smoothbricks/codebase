@@ -10,9 +10,10 @@
  * script runs (measured on Bun 1.4.2), so no lifecycle script ever sees the
  * link. So each install smoo runs (shell entry's, a CI runner's
  * frozen-lockfile one, `smoo monorepo update`'s) records these links before
- * it installs and puts exactly those back afterwards, except Nx (below). A plain `bun install`
- * still relinks an undeclared link: only a wrapper around bun itself could
- * intercept that. A declared one (below) comes back on its own.
+ * it installs and restores manual choices afterwards, except Nx (below).
+ * Recorded declarations follow their current target after a successful install.
+ * A plain `bun install` still relinks an undeclared link: only a wrapper around
+ * bun itself could intercept that. A declared one (below) comes back on its own.
  *
  * A developer link is a symlink directly inside a node_modules tree bun
  * installs (the root's or a workspace member's, scoped names included) whose
@@ -23,11 +24,12 @@
  * `globalStore`, each .bun entry is itself a link into the shared install
  * cache, outside every checkout.
  *
- * Nothing is recorded across installs, so the state is the filesystem itself:
- * unlinking a package means removing its link, and the next install puts the
- * lockfile's version there. A link whose target no longer exists is removed
- * before the install, with a warning, so that install puts the lockfile's
- * version in its place.
+ * Unlinking a package means removing its link, and the next install puts the
+ * lockfile's version there. A dangling link is removed before the install,
+ * with a warning. Links this owner creates for declarations also have a receipt
+ * in node_modules/.smoo-declared-links: their alias, declaration and exact link
+ * text. A changed declaration can replace that link only while its text still
+ * matches the receipt. Unrecorded links and manual retargets stay the developer's.
  *
  * An install that exists to replace links says which: `{ relink }` names the
  * packages (`name` or `@scope/name`) it is meant to relink, in the root's
@@ -43,7 +45,7 @@
  * a developer link to a local Nx checkout is not kept: the managed installs
  * (shell entry's, a CI runner's frozen-lockfile one, `smoo monorepo update`'s)
  * pass `{ relink: ['nx'] }`, and a successful one leaves Nx as Bun installed it.
- * Every other developer link is still kept. A live Nx link makes the install
+ * Other manual developer links are still kept. A live Nx link makes the install
  * stamp stale (`hasStaleDeveloperLinks`), so the next managed install replaces
  * it; an ordinary local setup invocation with current bindings then runs no
  * `bun install`.
@@ -92,6 +94,7 @@ import {
   rmSync,
   statSync,
   symlinkSync,
+  writeFileSync,
 } from 'node:fs';
 import path from 'node:path';
 import type { KeepDeveloperLinksOptions } from '@smoothbricks/nx-plugin/managed-assets';
@@ -109,6 +112,10 @@ interface DeveloperLinks {
   readonly dangling: readonly DeveloperLink[];
 }
 
+interface DeclaredLinkReceipt extends DeveloperLink {
+  readonly declaration: string;
+}
+
 /**
  * Runs `install` while preserving the developer links captured under `root`.
  * On rejection every captured live link is restored, less links that already
@@ -122,6 +129,7 @@ export async function keepDeveloperLinks<T>(
   options?: KeepDeveloperLinksOptions,
 ): Promise<T> {
   const { live, dangling } = findDeveloperLinks(root);
+  const recorded = readDeclaredRecord(root);
   for (const link of dangling) {
     rmSync(path.join(root, link.path), { force: true });
     console.error(`! removed developer link ${link.path}: its target ${resolvedTarget(root, link)} no longer exists`);
@@ -129,15 +137,29 @@ export async function keepDeveloperLinks<T>(
   // Only an install that resolved leaves the links it was meant to replace as
   // it made them; a rejected one puts every captured live link back.
   let replaced: readonly string[] | undefined;
+  let succeeded = false;
   try {
     const result = await install();
     replaced = options?.relink;
+    succeeded = true;
     return result;
   } finally {
+    const restored = readDeclaredRecord(root);
     for (const link of live) {
       if (!replaced?.length || !replaced.includes(packageName(link))) {
         restoreLink(root, link);
+        const receipt = recorded.get(link.path);
+        // The install's postinstall may have claimed this alias after Bun replaced
+        // it. Restoring a manual override must restore its lack of ownership too.
+        if (receipt?.target === link.target) restored.set(link.path, receipt);
+        else restored.delete(link.path);
+      } else {
+        restored.delete(link.path);
       }
+    }
+    writeDeclaredRecord(root, restored);
+    if (succeeded && recorded.size > 0 && process.env.GITHUB_ACTIONS !== 'true') {
+      applyDeclaredLinks(root, planDeclaredLinks(root));
     }
     if (options !== undefined) {
       reportDeveloperLinks(root);
@@ -318,6 +340,7 @@ export function planDeclaredLinks(root: string): DeclaredLinksPlan {
   const anchor = linkAnchor(root);
   const canonicalRoot = realpathSync(root);
   const trees = nodeModulesTrees(root);
+  const recorded = readDeclaredRecord(root);
   const changes: DeclaredLinkChange[] = [];
   const unavailable: UnavailableDeclaredLink[] = [];
   for (const [name, relative] of declared) {
@@ -340,14 +363,17 @@ export function planDeclaredLinks(root: string): DeclaredLinksPlan {
         continue;
       }
       if (stats.isSymbolicLink()) {
-        const current = resolvedTarget(root, { path: entry, target: readlinkSync(at) });
+        const text = readlinkSync(at);
+        const current = resolvedTarget(root, { path: entry, target: text });
         const foreign = !containsPath(path.resolve(root), current);
         // Any contained main-project binding inherited by this clone belongs to
         // the declaration, even if the old producer used a different directory.
-        // Genuine sibling declarations and unrelated developer choices stay theirs.
+        // A receipt proves an earlier managed sibling binding; an unrecorded
+        // sibling or a manual retarget remains the developer's own choice.
         const inherited = inheritedContainedBinding(anchor, relative, current);
-        if (current === target && readlinkSync(at) === packageAliasTarget(root, at, target)) continue;
-        if (foreign && !inherited && current !== target) continue;
+        const managed = recorded.get(entry)?.target === text;
+        if (current === target && text === packageAliasTarget(root, at, target)) continue;
+        if (foreign && !inherited && !managed && current !== target) continue;
       }
       changes.push({ path: entry, target });
     }
@@ -381,11 +407,19 @@ export function applyDeclaredLinks(root: string, plan: DeclaredLinksPlan): void 
   for (const { name, target, reason } of plan.unavailable) {
     console.error(`! smoo.developerLinks ${name}: ${target} ${reason}; the installed version stays`);
   }
+  if (plan.changes.length === 0) return;
+  const declared = new Map(readDeclaredLinks(root));
+  const recorded = readDeclaredRecord(root);
   const counts = new Map<string, number>();
   for (const change of plan.changes) {
+    const name = packageName(change);
+    const declaration = declared.get(name);
+    if (declaration === undefined) throw new Error(`cannot apply an undeclared developer link: ${name}`);
     const at = path.join(root, change.path);
     replacePackageAlias(root, at, change.target);
-    const named = `${packageName(change)} -> ${change.target}`;
+    recorded.set(change.path, { path: change.path, declaration, target: readlinkSync(at) });
+    writeDeclaredRecord(root, recorded);
+    const named = `${name} -> ${change.target}`;
     counts.set(named, (counts.get(named) ?? 0) + 1);
   }
   if (counts.size > 0) {
@@ -551,6 +585,59 @@ function linkAnchor(root: string): string {
   }
   const projectRoot = typeof marker === 'object' && marker !== null ? Reflect.get(marker, 'projectRoot') : undefined;
   return typeof projectRoot === 'string' && path.isAbsolute(projectRoot) ? projectRoot : root;
+}
+
+/** Ownership is the link text we wrote, not merely an alias path we once used. */
+const DECLARED_RECORD = path.join('node_modules', '.smoo-declared-links');
+
+function readDeclaredRecord(root: string): Map<string, DeclaredLinkReceipt> {
+  const file = path.join(root, DECLARED_RECORD);
+  let input: unknown;
+  try {
+    input = JSON.parse(readFileSync(file, 'utf8'));
+  } catch (error) {
+    if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return new Map();
+    throw error;
+  }
+  // This raw bootstrap script runs before packages or Typia transforms exist,
+  // like readDeclaredLinks. Malformed ownership is never treated as none.
+  if (!Array.isArray(input)) throw new Error(`${file}: expected declared-link receipts`);
+  const recorded = new Map<string, DeclaredLinkReceipt>();
+  for (const row of input) {
+    if (typeof row !== 'object' || row === null) throw new Error(`${file}: invalid declared-link receipt`);
+    const entry: unknown = Reflect.get(row, 'path');
+    const declaration: unknown = Reflect.get(row, 'declaration');
+    const target: unknown = Reflect.get(row, 'target');
+    if (typeof entry !== 'string' || typeof declaration !== 'string' || typeof target !== 'string') {
+      throw new Error(`${file}: a receipt needs string path, declaration and target fields`);
+    }
+    if (recorded.has(entry)) throw new Error(`${file}: duplicate declared-link receipt for ${entry}`);
+    recorded.set(entry, { path: entry, declaration, target });
+  }
+  return recorded;
+}
+
+/** Stable, atomic receipts relocate with node_modules and leave unchanged trees read-only. */
+function writeDeclaredRecord(root: string, recorded: ReadonlyMap<string, DeclaredLinkReceipt>): void {
+  const file = path.join(root, DECLARED_RECORD);
+  const content = `${JSON.stringify([...recorded.values()].sort((a, b) => a.path.localeCompare(b.path)))}\n`;
+  try {
+    if (readFileSync(file, 'utf8') === content) return;
+  } catch (error) {
+    if (!(error instanceof Error && 'code' in error && error.code === 'ENOENT')) throw error;
+    if (recorded.size === 0) return;
+  }
+  const canonicalRoot = realpathSync(root);
+  const owned = path.join(canonicalRoot, DECLARED_RECORD);
+  assertOwnedPath(canonicalRoot, path.dirname(owned));
+  const scratch = mkdtempSync(path.join(path.dirname(owned), '.declared-links-'));
+  try {
+    const temporary = path.join(scratch, 'record');
+    writeFileSync(temporary, content);
+    renameSync(temporary, owned);
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
 }
 
 /**
