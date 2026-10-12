@@ -1098,7 +1098,7 @@ fn start(
 }
 
 /// Calls other than streams one connection may have open at once.
-const MAX_IN_FLIGHT_REQUESTS: usize = 64;
+pub(super) const MAX_IN_FLIGHT_REQUESTS: usize = 64;
 
 /// Calls other than streams one connection may have waiting for an open one to complete.
 const MAX_WAITING_REQUESTS: usize = 64;

@@ -25,7 +25,8 @@ use super::resources::{JobResourceSample, SampleInterval};
 use super::server::MAX_BINARY_FRAME_BYTES;
 #[cfg(unix)]
 use super::server::{
-    HANDSHAKE_VERSION, MAX_HANDSHAKE_BYTES, MAX_JSON_FRAME_BYTES as MAX_RPC_BYTES, codec,
+    HANDSHAKE_VERSION, MAX_HANDSHAKE_BYTES, MAX_IN_FLIGHT_REQUESTS,
+    MAX_JSON_FRAME_BYTES as MAX_RPC_BYTES, codec,
 };
 use crate::error::{CowshedError, ErrorCode, OtherBuild, Result};
 use crate::metadata::WorkspaceName;
@@ -171,26 +172,18 @@ pub(crate) trait ControllerRuntime: Send + Sync {
 }
 
 #[cfg(unix)]
+struct ActorCall {
+    method: &'static str,
+    params: Params,
+    lane: ActorLane,
+    /// Where the call's step frames go; `None` asks for none.
+    steps: Option<mpsc::UnboundedSender<StepReport>>,
+    reply: oneshot::Sender<Result<ActorResponse>>,
+}
+
+#[cfg(unix)]
 enum ActorMessage {
-    Json {
-        method: &'static str,
-        params: Params,
-        /// Where the call's step frames go; `None` asks for none.
-        steps: Option<mpsc::UnboundedSender<StepReport>>,
-        reply: oneshot::Sender<Result<ActorResponse>>,
-    },
-    Upload {
-        method: &'static str,
-        params: Params,
-        bytes: Bytes,
-        reply: oneshot::Sender<Result<ActorResponse>>,
-    },
-    Download {
-        method: &'static str,
-        params: Params,
-        expected_offset: u64,
-        reply: oneshot::Sender<Result<ActorResponse>>,
-    },
+    Call(ActorCall),
     /// Opens a stream-lane call; `opened` hears its id once its request is sent, `first` its
     /// first event or its end.
     Stream {
@@ -246,12 +239,13 @@ impl ActorRuntime {
     ) -> Result<Value> {
         let (reply, response) = oneshot::channel();
         self.sender
-            .send(ActorMessage::Json {
+            .send(ActorMessage::Call(ActorCall {
                 method,
                 params,
+                lane: ActorLane::Json,
                 steps,
                 reply,
-            })
+            }))
             .await
             .map_err(|_| actor_send_error())?;
         match response.await.map_err(|_| actor_reply_error())?? {
@@ -287,12 +281,13 @@ impl ControllerRuntime for ActorRuntime {
         }
         let (reply, response) = oneshot::channel();
         self.sender
-            .send(ActorMessage::Upload {
+            .send(ActorMessage::Call(ActorCall {
                 method,
                 params,
-                bytes,
+                lane: ActorLane::Upload(bytes),
+                steps: None,
                 reply,
-            })
+            }))
             .await
             .map_err(|_| actor_send_error())?;
         match response.await.map_err(|_| actor_reply_error())?? {
@@ -311,12 +306,13 @@ impl ControllerRuntime for ActorRuntime {
     ) -> Result<BinaryDownload> {
         let (reply, response) = oneshot::channel();
         self.sender
-            .send(ActorMessage::Download {
+            .send(ActorMessage::Call(ActorCall {
                 method,
                 params,
-                expected_offset,
+                lane: ActorLane::Download(expected_offset),
+                steps: None,
                 reply,
-            })
+            }))
             .await
             .map_err(|_| actor_send_error())?;
         match response.await.map_err(|_| actor_reply_error())?? {
@@ -1532,25 +1528,28 @@ async fn run_controller_actor(
 ) {
     let mut pending =
         std::collections::HashMap::<u64, oneshot::Sender<Result<ActorResponse>>>::new();
+    let mut waiting = std::collections::VecDeque::<ActorCall>::new();
     // The step listeners of the pending calls that asked for steps; a listener is dropped with
     // its call's answer, so the caller's step stream ends exactly when the call does.
     let mut listeners = std::collections::HashMap::<u64, mpsc::UnboundedSender<StepReport>>::new();
     let mut streams = std::collections::HashMap::<u64, OpenStream>::new();
     let mut next_id = 1_u64;
     let failure = loop {
-        tokio::select! {
+        let call = tokio::select! {
+            () = std::future::ready(()),
+                if pending.len() < MAX_IN_FLIGHT_REQUESTS && !waiting.is_empty() => {
+                waiting.pop_front().expect("the enabled admission branch has a queued call")
+            }
             message = messages.recv() => {
                 // Every handle is gone, and with it every caller that could wait on an answer.
                 let Some(message) = message else { return };
-                let (method, params, lane, steps, reply) = match message {
-                    ActorMessage::Json { method, params, steps, reply } => {
-                        (method, params, ActorLane::Json, steps, reply)
-                    }
-                    ActorMessage::Upload { method, params, bytes, reply } => {
-                        (method, params, ActorLane::Upload(bytes), None, reply)
-                    }
-                    ActorMessage::Download { method, params, expected_offset, reply } => {
-                        (method, params, ActorLane::Download(expected_offset), None, reply)
+                match message {
+                    ActorMessage::Call(call) => {
+                        if pending.len() >= MAX_IN_FLIGHT_REQUESTS || !waiting.is_empty() {
+                            waiting.push_back(call);
+                            continue;
+                        }
+                        call
                     }
                     ActorMessage::Stream { method, params, opened, first } => {
                         let id = next_id;
@@ -1582,23 +1581,6 @@ async fn run_controller_actor(
                         stream.waiting = Some(reply);
                         continue;
                     }
-                };
-                let id = next_id;
-                next_id = next_id.saturating_add(1);
-                if let ActorLane::Download(offset) = lane {
-                    downloads
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .insert(id, offset);
-                }
-                let call = send_call(&mut writer, id, method, &params, &lane, steps.is_some());
-                if let Err(error) = call.await {
-                    let _ = reply.send(Err(error.clone()));
-                    break error;
-                }
-                pending.insert(id, reply);
-                if let Some(steps) = steps {
-                    listeners.insert(id, steps);
                 }
             }
             Some(id) = closes.recv() => {
@@ -1610,6 +1592,7 @@ async fn run_controller_actor(
                         break error;
                     }
                 }
+                continue;
             }
             inbound = answers.recv() => {
                 let answer = match inbound {
@@ -1678,15 +1661,58 @@ async fn run_controller_actor(
                     );
                 };
                 let _ = reply.send(answer.outcome);
+                continue;
             }
+        };
+        let ActorCall {
+            method,
+            params,
+            lane,
+            steps,
+            reply,
+        } = call;
+        let id = next_id;
+        next_id = next_id.saturating_add(1);
+        if let ActorLane::Download(offset) = lane {
+            downloads
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(id, offset);
+        }
+        let call = send_call(&mut writer, id, method, &params, &lane, steps.is_some());
+        if let Err(error) = call.await {
+            let _ = reply.send(Err(error.clone()));
+            break error;
+        }
+        pending.insert(id, reply);
+        if let Some(steps) = steps {
+            listeners.insert(id, steps);
         }
     };
+    messages.close();
     for (_, reply) in pending.drain() {
         let _ = reply.send(Err(failure.clone()));
+    }
+    for call in waiting {
+        let _ = call.reply.send(Err(failure.clone()));
     }
     for (_, stream) in streams.drain() {
         if let Some(waiting) = stream.waiting {
             let _ = waiting.send(Err(failure.clone()));
+        }
+    }
+    while let Some(message) = messages.recv().await {
+        match message {
+            ActorMessage::Call(call) => {
+                let _ = call.reply.send(Err(failure.clone()));
+            }
+            ActorMessage::Stream { opened, first, .. } => {
+                let _ = opened.send(Err(failure.clone()));
+                let _ = first.send(Err(failure.clone()));
+            }
+            ActorMessage::Next { reply, .. } => {
+                let _ = reply.send(Err(failure.clone()));
+            }
         }
     }
 }
