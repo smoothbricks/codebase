@@ -11,7 +11,7 @@ use arrow_schema::{DataType, Field, Schema};
 use cowshed_core::api::{
     CpuMicros, CpuMicrosDelta, CpuTotals, ExecCommand, ExitStatus, HostLoadSample, JobAccounting,
     JobId, JobInfo, JobLeafAttribution, JobResourceSample, JobState, JobStreamWatermark,
-    JobVolumeUsage, OneCoreCpuPercent, OutputStorage, OutputSummary, ProcessCoverage,
+    JobVolumeUsage, MAX_EXACT_INTEGER, OneCoreCpuPercent, OutputStorage, OutputSummary, ProcessCoverage,
     ProtectedOutput, ResidentBytes, Sha256Digest, SpanId, StdinInfo, StdinKind, StreamBytes,
     StreamInfo, StreamLines, TraceContext, TraceId, UsageReconciliation, UtcTimestamp,
     VolumeUnavailable, VolumeUsage, VolumeUsedBytesDelta, WallMicros, WorkspaceIncarnation,
@@ -22,6 +22,9 @@ use cowshed_core::runtime::job_spans::{
     JobSpanEdge, JobSpanPublisher, job_fields, job_span_thread,
 };
 
+#[path = "support/accounting_fixture.rs"]
+mod accounting_fixture;
+use accounting_fixture::terminal_sample;
 #[path = "support/span_schema.rs"]
 mod span_schema;
 use span_schema::{Column, exact_schema, fields, number_cell, sealed_segments, text_cell};
@@ -46,6 +49,8 @@ fn spec_job_columns() -> Vec<Column> {
         ("disk_build_delta_bytes", "i64", true),
         ("load1_milli", "u32", true),
         ("cores", "u16", true),
+        ("charged_memory_current_bytes", "u64", true),
+        ("charged_memory_peak_bytes", "u64", true),
     ]
 }
 
@@ -439,5 +444,85 @@ async fn a_load_no_milliload_column_holds_is_refused_and_counted() {
             cores: Some(8),
             ..Facts::NONE
         }
+    );
+}
+
+const MIB: u64 = 1 << 20;
+
+/// `running_job()` as it ends with a clean exit, carrying the terminal sample `resources`.
+fn ended_job(resources: Option<JobResourceSample>) -> JobInfo {
+    JobInfo {
+        state: JobState::Exited,
+        duration_ms: Some(1_000),
+        resources,
+        exit: Some(ExitStatus::Exited { code: 0 }),
+        ..running_job()
+    }
+}
+
+/// The charged-memory cells of `info`'s start row and end row, sealed through a production writer
+/// under a root of its own, each segment holding exactly the declared job columns.
+async fn charged_cells(label: &str, info: &JobInfo) -> [(Option<u64>, Option<u64>); 2] {
+    let telemetry = TempRoot::new(label);
+    let segments = sealed_start_and_end(&telemetry, info).await;
+    assert_eq!(segments.len(), 2);
+    for (name, batch) in &segments {
+        exact_schema(&batch.schema(), &spec_job_columns())
+            .unwrap_or_else(|error| panic!("{name}: {error}"));
+    }
+    [0, 1].map(|edge| {
+        let batch = &segments[edge].1;
+        (
+            number_cell::<UInt64Type>(batch, "charged_memory_current_bytes", 0),
+            number_cell::<UInt64Type>(batch, "charged_memory_peak_bytes", 0),
+        )
+    })
+}
+
+/// A page-cache-heavy job under a cgroup source states its charged memory on its end row and
+/// nowhere else. Its cgroup is charged 96 MiB now and 160 MiB at its peak while its processes
+/// hold 8 MiB resident now and 12 MiB at most: the two readings differ, so a cell that took a
+/// resident number would show. Both edges are sealed from the same sample, and the start row
+/// states none even so.
+#[tokio::test]
+async fn a_cgroup_source_s_charged_memory_is_the_end_row_s_alone() {
+    let job = JobId::new(JOB).unwrap();
+    let sample = terminal_sample(job, Some((96 * MIB, 160 * MIB)), 8 * MIB, 12 * MIB);
+    assert_eq!(
+        charged_cells("cowshed-job-span-cgroup", &ended_job(Some(sample))).await,
+        [(None, None), (Some(96 * MIB), Some(160 * MIB))]
+    );
+    // Bytes, exactly: the largest value the checked unit holds survives whole.
+    let sample = terminal_sample(job, Some((MAX_EXACT_INTEGER - 1, MAX_EXACT_INTEGER)), 0, 0);
+    assert_eq!(
+        charged_cells("cowshed-job-span-largest", &ended_job(Some(sample))).await[1],
+        (Some(MAX_EXACT_INTEGER - 1), Some(MAX_EXACT_INTEGER))
+    );
+}
+
+/// A source with no charged-memory counter leaves both cells absent, never zero and never a
+/// resident number: a macOS rusage record, whose sample also counts 64 MiB resident, and a job
+/// that ended without a sample. The control is that same resident memory under a cgroup source,
+/// which states its pair.
+#[tokio::test]
+async fn a_source_without_a_charged_memory_counter_leaves_both_cells_absent() {
+    let job = JobId::new(JOB).unwrap();
+    let absent = [(None, None), (None, None)];
+    let macos = terminal_sample(job, None, 64 * MIB, 96 * MIB);
+    assert_eq!(
+        charged_cells("cowshed-job-span-macos", &ended_job(Some(macos))).await,
+        absent,
+        "a macOS rusage record"
+    );
+    assert_eq!(
+        charged_cells("cowshed-job-span-unsampled", &ended_job(None)).await,
+        absent,
+        "a job that ended without a sample"
+    );
+    let cgroup = terminal_sample(job, Some((96 * MIB, 160 * MIB)), 64 * MIB, 96 * MIB);
+    assert_eq!(
+        charged_cells("cowshed-job-span-control", &ended_job(Some(cgroup))).await,
+        [(None, None), (Some(96 * MIB), Some(160 * MIB))],
+        "the same resident memory under a cgroup source"
     );
 }

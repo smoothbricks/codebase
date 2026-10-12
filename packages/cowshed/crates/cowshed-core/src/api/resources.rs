@@ -464,6 +464,16 @@ impl JobAccounting {
             | Self::MacOsRusageChildren { reconciliation, .. } => reconciliation,
         }
     }
+
+    /// What the job's cgroup is charged for memory, from the source that has such a counter. The
+    /// macOS rusage source has none, so it states nothing: never zero, and never the resident
+    /// memory its sample counts, which is a different quantity.
+    pub const fn charged_memory(&self) -> Option<&ChargedMemoryUsage> {
+        match self {
+            Self::LinuxCgroupV2 { charged_memory, .. } => Some(charged_memory),
+            Self::MacOsRusageChildren { .. } => None,
+        }
+    }
 }
 
 /// Bytes of memory a cgroup is charged for: anonymous memory, file and page cache, and kernel

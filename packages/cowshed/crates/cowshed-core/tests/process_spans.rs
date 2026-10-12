@@ -22,7 +22,7 @@ use cowshed_core::api::{
     UtcTimestamp, WorkspaceIncarnation, WorkspacePath,
 };
 use cowshed_core::repository::RepoId;
-use cowshed_core::runtime::job_spans::{JobSpanPublisher, job_span_thread};
+use cowshed_core::runtime::job_spans::{JobSpanEdge, JobSpanPublisher, job_span_thread};
 use cowshed_core::runtime::process_spans::{
     ProcessSpanProjection, RetainedProcessEvent, process_custom_fields,
 };
@@ -32,9 +32,15 @@ use cowshed_core::runtime::process_tree::{
 };
 use cowshed_core::runtime::process_usage::{StartStamp, UsageReading};
 
+#[path = "support/accounting_fixture.rs"]
+mod accounting_fixture;
+use accounting_fixture::terminal_sample;
 #[path = "support/span_schema.rs"]
 mod span_schema;
-use span_schema::{Column, exact_schema, fields, number_cell, sealed_segments, text_cell};
+use span_schema::{
+    Column, exact_schema, fields, number_cell, sealed_segments, sealed_segments_among_kinds,
+    text_cell,
+};
 #[path = "support/temp_root.rs"]
 mod temp_root;
 use temp_root::TempRoot;
@@ -922,4 +928,132 @@ async fn an_event_the_projection_refuses_is_counted_and_seals_nothing() {
         Some("process event 7 names no retained identity")
     );
     assert!(sealed_segments(&telemetry, "process-").is_empty());
+}
+
+/// `schema` with one more column.
+fn with_column(schema: &Schema, field: Field) -> Schema {
+    let mut columns = schema.fields().iter().cloned().collect::<Vec<_>>();
+    columns.push(field.into());
+    Schema::new(columns)
+}
+
+/// A page-cache-heavy job records its memory in two places that share no column: its cgroup
+/// source's charged memory on the job span's end row, and its process's resident memory on the
+/// process's own span. The job's one process holds at most 8 MiB resident while its cgroup is
+/// charged 96 MiB now and 160 MiB at its peak for the cache it filled; the same job under a source
+/// with no charged-memory counter records the same process rows and no charged cell. Every
+/// process segment holds exactly the fourteen process columns, and either charged-memory column
+/// added to any of them fails the exact-schema oracle.
+#[tokio::test]
+async fn a_job_s_charged_memory_and_its_process_s_resident_memory_are_recorded_apart() {
+    let mut recorded = Vec::new();
+    for (label, charged) in [("cgroup", Some((96 * MIB, 160 * MIB))), ("macos", None)] {
+        let telemetry = TempRoot::new(&format!("cowshed-process-spans-{label}"));
+        let mut job = TracedJob::new(&telemetry);
+        let shell = id(100, 1);
+        job.publisher.record(&job.info, JobSpanEdge::Start);
+        job.tree(
+            0,
+            ProcessObservation::Root {
+                process: shell,
+                ppid: 1,
+                at: utc(0),
+                image: image("/bin/sh", &[b"sh", b"-c", b"fill-the-page-cache"]),
+            },
+        );
+        let at = job.at(0);
+        assert_eq!(job.read(0, shell, reading(at, 0, 8 * MIB)), 1);
+        let mut last = reading(job.at(1_000), 10_000, 0);
+        last.exited = true;
+        job.read(1_000, shell, last);
+        job.tree(
+            1_000,
+            ProcessObservation::Exited {
+                process: shell,
+                status: ExitStatus::Exited { code: 0 },
+                at: utc(1),
+            },
+        );
+        let exit = ExitStatus::Exited { code: 0 };
+        let ended = JobInfo {
+            state: JobState::Exited,
+            duration_ms: Some(1_000),
+            resources: Some(terminal_sample(job.info.job_id, charged, 0, 8 * MIB)),
+            exit: Some(exit.clone()),
+            ..job.info.clone()
+        };
+        job.publisher
+            .record(&ended, JobSpanEdge::end(JobState::Exited, Some(&exit)));
+        let health = job.publisher.health().await.unwrap();
+        assert_eq!(
+            (health.recorded, health.failed),
+            (u64::try_from(job.batches).unwrap() + 2, 0),
+            "{label}: the process segments and the job's two rows: {health:?}"
+        );
+
+        // The job span: its end row states the source's pair, or nothing.
+        let jobs = sealed_segments_among_kinds(&telemetry, "job-");
+        assert_eq!(jobs.len(), 2);
+        let cells = |batch: &RecordBatch| {
+            (
+                number_cell::<UInt64Type>(batch, "charged_memory_current_bytes", 0),
+                number_cell::<UInt64Type>(batch, "charged_memory_peak_bytes", 0),
+            )
+        };
+        assert_eq!(cells(&jobs[0].1), (None, None), "{label}: the start row");
+        assert_eq!(
+            cells(&jobs[1].1),
+            charged.map_or((None, None), |(current, peak)| (Some(current), Some(peak))),
+            "{label}: the end row"
+        );
+
+        // The process spans: exactly the fourteen columns, in the job span's trace and thread.
+        let segments = sealed_segments_among_kinds(&telemetry, "process-");
+        assert_eq!(segments.len(), job.batches);
+        let mut rows = Vec::new();
+        for (name, batch) in &segments {
+            exact_schema(&batch.schema(), &spec_process_columns())
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+            for charged_column in ["charged_memory_current_bytes", "charged_memory_peak_bytes"] {
+                let added = with_column(
+                    &batch.schema(),
+                    Field::new(charged_column, DataType::UInt64, true),
+                );
+                assert!(
+                    exact_schema(&added, &spec_process_columns()).is_err(),
+                    "{name} with {charged_column}"
+                );
+            }
+            rows.extend(decode(batch));
+        }
+        let thread = job.thread();
+        assert_eq!(
+            number_cell::<UInt64Type>(&jobs[1].1, "thread_id", 0),
+            Some(thread)
+        );
+        assert!(
+            rows.iter()
+                .all(|row| row.thread_id == thread && row.parent_thread_id == Some(thread)),
+            "{label}: {rows:#?}"
+        );
+
+        // The process's resident memory is its own: at most 8 MiB, where the cgroup is charged 96.
+        assert_eq!(
+            rows.iter().filter_map(|row| row.rss_peak_bytes).max(),
+            Some(8 * MIB)
+        );
+        let end = rows
+            .iter()
+            .find(|row| row.kind() == "span-ok")
+            .expect("the process's end");
+        assert_eq!(
+            (end.rss_bytes, end.rss_peak_bytes),
+            (Some(0), Some(8 * MIB))
+        );
+        recorded.push(rows);
+    }
+    assert_eq!(
+        recorded[0], recorded[1],
+        "the source of the job's accounting changes no process row"
+    );
 }
