@@ -278,7 +278,7 @@ pub fn generate(project: &Path) -> Result<Vec<GeneratedFile>, String> {
     )?;
     let projection = napi::emit(&operations, &api, &capabilities)?;
     let declaration_ir = ir_types("./declaration-ir.generated.js")?;
-    Ok(vec![
+    let mut files = vec![
         GeneratedFile {
             path: project.join("src/api.generated.ts"),
             contents: output.types,
@@ -303,7 +303,33 @@ pub fn generate(project: &Path) -> Result<Vec<GeneratedFile>, String> {
             path: project.join("src/declaration-ir.generated.ts"),
             contents: declaration_ir.types,
         },
-    ])
+    ];
+    files.extend(column_files(&core)?);
+    Ok(files)
+}
+
+pub fn column_files(core: &Path) -> Result<Vec<GeneratedFile>, String> {
+    let mut files = Vec::new();
+    let process = core.join("runtime/process_spans.rs");
+    let record = arrow::parse_arrow_record(&read_source(&process)?)
+        .map_err(|error| format!("{}: {error}", process.display()))?;
+    files.push(GeneratedFile {
+        path: core.join("runtime/process_span_columns.generated.rs"),
+        contents: arrow::emit_columns(&record),
+    });
+    let unattributed = core.join("runtime/job_unattributed.rs");
+    if unattributed.is_file() {
+        let source = read_source(&unattributed)?;
+        if source.contains("arrow_columns") {
+            let record = arrow::parse_arrow_record(&source)
+                .map_err(|error| format!("{}: {error}", unattributed.display()))?;
+            files.push(GeneratedFile {
+                path: core.join("runtime/job_unattributed_columns.generated.rs"),
+                contents: arrow::emit_columns(&record),
+            });
+        }
+    }
+    Ok(files)
 }
 
 fn read_source(path: &Path) -> Result<String, String> {
