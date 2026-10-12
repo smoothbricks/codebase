@@ -2816,6 +2816,142 @@ mod tests {
         stream.write_all(bytes).await.unwrap();
     }
 
+    #[cfg(unix)]
+    async fn poll_pending<F: Future>(mut future: std::pin::Pin<&mut F>) {
+        std::future::poll_fn(|context| {
+            assert!(future.as_mut().poll(context).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+    }
+
+    #[cfg(unix)]
+    async fn queued_actor_call(
+        runtime: Arc<dyn ControllerRuntime>,
+        method: &'static str,
+    ) -> impl Future<Output = Result<Value>> {
+        let mut call = Box::pin(async move { runtime.call(method, empty_params()).await });
+        poll_pending(call.as_mut()).await;
+        call
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn actor_admission_bounds_non_stream_calls_and_drains_fifo() {
+        let (runtime, mut server) = actor_pair();
+        let mut held = Vec::new();
+        for id in 1..=64 {
+            held.push(queued_actor_call(Arc::clone(&runtime), "job.status").await);
+            let (_, request) = read_rpc_request(&mut server).await;
+            assert_eq!(request["id"], id);
+        }
+        let first = queued_actor_call(Arc::clone(&runtime), "project.list").await;
+        let second = queued_actor_call(Arc::clone(&runtime), "project.doctor").await;
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                read_rpc_request(&mut server),
+            )
+            .await
+            .is_err(),
+            "a full connection sends no excess non-stream call"
+        );
+
+        // Any answer frees a slot, not merely the oldest one's answer.
+        write_rpc_success(&mut server, 32, json!({}), None).await;
+        let (_, request) = read_rpc_request(&mut server).await;
+        assert_eq!(request["id"], 65);
+        assert_eq!(request["method"], "project.list");
+        write_rpc_success(&mut server, 1, json!({}), None).await;
+        let (_, request) = read_rpc_request(&mut server).await;
+        assert_eq!(request["id"], 66);
+        assert_eq!(request["method"], "project.doctor");
+
+        for id in 2..=66 {
+            if id != 32 {
+                write_rpc_success(&mut server, id, json!({}), None).await;
+            }
+        }
+        for call in held {
+            assert_eq!(call.await.unwrap(), json!({}));
+        }
+        assert_eq!(first.await.unwrap(), json!({}));
+        assert_eq!(second.await.unwrap(), json!({}));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn actor_admission_serves_stream_demands_and_closes_while_full() {
+        let (runtime, mut server) = actor_pair();
+        let mut held = Vec::new();
+        for _ in 0..64 {
+            held.push(queued_actor_call(Arc::clone(&runtime), "job.status").await);
+            read_rpc_request(&mut server).await;
+        }
+        let queued = queued_actor_call(Arc::clone(&runtime), "project.list").await;
+        let mut opening = Box::pin(runtime.stream("job.processEvents", empty_params()));
+        poll_pending(opening.as_mut()).await;
+        let (_, request) = read_rpc_request(&mut server).await;
+        assert_eq!(request["method"], "job.processEvents");
+        assert_eq!(request["id"], 65);
+        let mut stream = opening.await.unwrap();
+        let event = codec::encode_rpc_event(65, &json!({"sample": 1})).unwrap();
+        write_rpc_frame(&mut server, &event).await.unwrap();
+        assert_eq!(stream.next().await.unwrap().unwrap(), json!({"sample": 1}));
+
+        let mut next = Box::pin(stream.next());
+        poll_pending(next.as_mut()).await;
+        let (_, demand) = read_rpc_request(&mut server).await;
+        assert_eq!(demand, json!({"id": 65, "demand": "next"}));
+        let event = codec::encode_rpc_event(65, &json!({"sample": 2})).unwrap();
+        write_rpc_frame(&mut server, &event).await.unwrap();
+        assert_eq!(next.await.unwrap().unwrap(), json!({"sample": 2}));
+        drop(stream);
+        let (_, demand) = read_rpc_request(&mut server).await;
+        assert_eq!(demand, json!({"id": 65, "demand": "close"}));
+        write_rpc_success(&mut server, 65, json!({}), None).await;
+
+        write_rpc_success(&mut server, 1, json!({}), None).await;
+        let (_, request) = read_rpc_request(&mut server).await;
+        assert_eq!(request["id"], 66);
+        assert_eq!(request["method"], "project.list");
+        for id in (2..=64).chain([66]) {
+            write_rpc_success(&mut server, id, json!({}), None).await;
+        }
+        for call in held {
+            call.await.unwrap();
+        }
+        queued.await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn actor_admission_fails_queued_and_sent_calls_on_protocol_loss() {
+        let (runtime, mut server) = actor_pair();
+        let mut calls = Vec::new();
+        for _ in 0..64 {
+            calls.push(queued_actor_call(Arc::clone(&runtime), "job.status").await);
+            read_rpc_request(&mut server).await;
+        }
+        calls.push(queued_actor_call(Arc::clone(&runtime), "project.list").await);
+        calls.push(queued_actor_call(Arc::clone(&runtime), "project.doctor").await);
+        let invalid = serde_json::to_vec(&json!({
+            "id": 1, "ok": true, "result": {}, "extra": true,
+        }))
+        .unwrap();
+        write_rpc_frame(&mut server, &invalid).await.unwrap();
+        let mut cause = None;
+        for call in calls {
+            let error = call.await.unwrap_err();
+            assert_eq!(error.code, ErrorCode::Internal);
+            if let Some(cause) = &cause {
+                assert_eq!(&error.message, cause);
+            } else {
+                cause = Some(error.message);
+            }
+        }
+    }
+
     fn exec_request(stdin: StdinSource) -> ExecRequest {
         ExecRequest {
             command: crate::api::dto::ExecCommand::Argv(vec!["cat".into()]),
