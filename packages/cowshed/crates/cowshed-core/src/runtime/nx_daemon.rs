@@ -677,7 +677,6 @@ where
 
 #[cfg(test)]
 mod tests {
-    use crate::fork_lock::Run as _;
     use std::os::unix::net::UnixListener;
 
     use super::*;
