@@ -272,27 +272,26 @@ commitment. An empty findings list alone is not evidence that a declared output 
 unattributed run summary or a failed check leaves it empty too.
 
 **Host limit.** The host's disk-image attach pool runs out (01_storage.md, "How the APFS host degrades" §2), and the
-suite stops spending into a spent one. Fixtures attach an image once and share it across the assertions that need it
-rather than each re-attaching. Every real-APFS fixture image (`tests/support/blank_image.rs`) first passes
-`attach_budget::harness_gate`, which reads only the boot and the pool record: once any test process meets error code
-150, the system runner that met it records it, and every later fixture of the run, in whichever process, fails with
-`AttachPoolExhausted` and its `next:` step without attaching. A record the gate cannot read proves nothing about the
-pool, so it warns and the fixture proceeds. The lane stays `--no-fail-fast`, so its ordinary failures still run to the
-end; the refusal is the harness's own error, not a scheduler flag. Before the real-APFS lane starts, its root
-`attach-budget-check` dependency runs uncached through `nx:run-commands`, before the group's RAM leases and test run.
-`cargo --frozen run -q -p cowshed-core --bin attach-budget -- --need <N>` prints the pool as one JSON line (the four
-classes' instances, registered and leaked counts, the ceiling and its source, the headroom, whether this boot is spent)
-and refuses, exit 3 with `AttachPoolExhausted` and a `next:` hint, when the boot is spent or the headroom is below `N`;
-a pool it cannot read is exit 0 with an `unread` line and a warning, never a claim of headroom; `--clear` ends a
-recorded 150 after the operator freed what spent it and forgets a recorded ceiling, which the refusal names when that
-ceiling alone is below `N`. `N` is the lane's measured attach count, one per
-`apfs-command attach image without mounting start` or `apfs-command attach blank RAW image start` line of a lane run
-under `COWSHED_TIMING=1` with `NEXTEST_SUCCESS_OUTPUT=immediate` to show passing tests' captured output, plus a fixed
-margin of 32 attach slots. It is measured again whenever the lane's test set changes. The leaked-device delta across a
-lane run (`ioclasscount AppleDiskImageDevice` against the registered devices, before and after) is the check that no
-disk-image command still leaks on a clean run; it must be 0. The 2026-10-12 full 158-test lane measured 307
-image-without-mounting starts and 9 blank-RAW starts: the admission need is 348, including the unchanged 32-slot margin.
-This is a live pool-headroom precondition, not a command or test deadline.
+suite stops spending into a spent one. The harness owns a lane-wide fixture pool (`tests/support/blank_image.rs`): it
+attaches each scenario image in its registry once per lane run and hands tests handles to mounts of an already-attached
+volume, so a test cannot attach an image of its own through the fixture API — the API hands out shared-fixture handles
+only, and no per-test attach helper is in tests' reach. Seeding a store clones the blank template and attaches nothing.
+Tests that inherently prove attach or detach behaviour keep their own attach through the production host; they are few
+and name that in their docs. Fixtures attach once per scenario and share; tests pay the fewest attach cycles that prove
+their behaviour. The pool refuses to attach past its registry, whose size — computed in code from the registry itself —
+is the lane's attach bound, so a new per-test attach fails the lane instead of silently spending the pool. A test whose
+setup and subject match a neighbour's becomes assertions in that neighbour rather than a separate test, and anything
+that does not need a real device is a pure or unit test with no image at all: the real-device lane holds a few scenario
+tests per fixture, not a test per behaviour. Every fixture first passes `attach_budget::harness_gate`, which reads only
+the boot and the pool record: once any test process meets error code 150, the system runner that met it records it, and
+every later fixture of the run, in whichever process, fails with `AttachPoolExhausted` and its `next:` step without
+attaching. A record the gate cannot read proves nothing about the pool, so it warns and the fixture proceeds. The lane
+stays `--no-fail-fast`, so its ordinary failures still run to the end; the refusal is the harness's own error, not a
+scheduler flag. There is no measured attach-count constant and no pre-lane admission gate: the `harness_gate` refusal at
+the first fixture that would spend into a spent pool is the fail-fast behaviour, and it needs no number from the lane.
+`attach-budget --clear` still ends a recorded 150 after the operator freed what spent it. The leaked-device delta across
+a lane run (`ioclasscount AppleDiskImageDevice` against the registered devices, before and after) is the check that no
+disk-image command still leaks on a clean run; it must be 0.
 
 **The suite spends a finite host budget.** Every attach→detach cycle a test makes can leak an AppleDiskImages2 device
 that the host's live sheds lose until reboot (01_storage.md, "How the APFS host degrades" §2), so a test pays the fewest
