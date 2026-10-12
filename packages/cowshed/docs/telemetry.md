@@ -5,10 +5,6 @@ operation, every job, and every gateway request is a span; spans carry a W3C tra
 they flush as Arrow segments under `/private/cowshed/store/telemetry/`. There is one storage format (lmao's Arrow trace
 schema), no NDJSON files on disk, and no telemetry daemon. (Spec: `specs/cowshed/13_telemetry.md`.)
 
-> **Implementation status — process monitoring:** per-process tree observation, resource/blocker events, and the compact
-> process/job spans described below are unbuilt. Existing gateway and continuity segments are not that tree. Complete
-> cgroup job accounting, charged-memory counters, event-source measurement and reconciliation rows are also unbuilt.
-
 ## Why not a logfile
 
 Text logs record _that_ things happened. Columns make cowshed's behavior a **dataset** — the same artifact answers

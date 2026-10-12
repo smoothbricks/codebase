@@ -88,15 +88,14 @@ directly, Bun/Node applications use `cowshed-napi`, and shell-based agents use t
 - **Cache taxonomy (3 layers, discriminated by USE not concurrency safety)**: (1) gateway mirror artifacts in cowshed's
   own cache directory (`~/Library/Caches/dev.cowshed/mirror`) — download dedupe; (2) clone-materializing caches — the
   cache is the reflink source (bun materializes node_modules by cloning from it; APFS clonefile is same-volume-only) —
-  kept reflink-reachable INSIDE the workspace image, inherited from main via CoW; today that means "bun, on APFS",
-  possibly nothing on ZFS (BRT crosses datasets — verify); (3) read-at-build caches (cargo registry, sccache, zig
-  global, gradle) — read at build time, outputs written elsewhere, so sharing costs nothing — at each tool's own default
-  path in the host HOME, shared into the sandboxes of projects that use the tool; no relocation, no symlinks. **Share
-  only the cache subdirs** (`~/.cargo/registry`, `~/.cargo/git`, `~/.cache/zig`, `~/.gradle/caches`) — NOT `~/.cargo`
-  wholesale, which also holds `config.toml`, `credentials.toml`, and `bin/` (on PATH); granting those writable to a
-  sandbox would be a persistence-escape surface. Workspace-keyed state (target/, node_modules, DerivedData, .nx)
-  in-image. Env wiring is 0–2 vars total, each only until its verification passes; everything else is in-image config
-  files + host paths. Main uses identical wiring. Spec: 03_caches.md.
+  kept reflink-reachable INSIDE the workspace image, inherited from main via CoW; (3) read-at-build caches (cargo
+  registry, sccache, zig global, gradle) — read at build time, outputs written elsewhere, so sharing costs nothing — at
+  each tool's own default path in the host HOME, shared into the sandboxes of projects that use the tool; no relocation,
+  no symlinks. **Share only the cache subdirs** (`~/.cargo/registry`, `~/.cargo/git`, `~/.cache/zig`,
+  `~/.gradle/caches`) — NOT `~/.cargo` wholesale, which also holds `config.toml`, `credentials.toml`, and `bin/` (on
+  PATH); granting those writable to a sandbox would be a persistence-escape surface. Workspace-keyed state (target/,
+  node_modules, DerivedData, .nx) in-image. Env wiring is 0–2 vars total; everything else is in-image config files +
+  host paths. Main uses identical wiring. Spec: 03_caches.md.
 - **Go: shared caches at Go's own defaults.** `GOMODCACHE`/`GOCACHE` name the host's `~/go/pkg/mod` and the user cache
   directory's `go-build` (`~/Library/Caches/go-build`) — read-at-build, layer 3; go's sum/ziphash verification + 0444
   entries make it the strongest-postured shared cache — and the host's own `go` uses the same two directories without
@@ -212,14 +211,8 @@ directly, Bun/Node applications use `cowshed-napi`, and shell-based agents use t
   claims only bytes reaching captured pipes. The old shell-AST hardlink optimization is deleted: no protected inode may
   have a writable hardlink alias.
 
-## State of the tree
+## Working rules
 
-- Current tree: `cowshed-core` now contains the frozen DTO/error contracts, repository and path validation, APFS
-  lifecycle primitives, sandbox profile/child spawning, protected job-artifact storage/recovery/publication, and the
-  capability/controller actor boundary including the bounded raw-byte lane. These are tested foundations, not a usable
-  product: controller operation implementations remain incomplete, the CLI parses and renders typed failures but does
-  not dispatch successful commands, and gateway/N-API/escape-suite adapters remain scaffolds. Treat every remaining
-  behavior in the specs and docs as an implementation obligation, not as shipped functionality.
 - Toolchain configuration lives in `tooling/direnv/devenv.{yaml,nix}`. Invoke repository commands from `<repo-root>`;
   never embed a workstation-specific absolute path.
 - Keep the implementation greenfield: migrate all callers cleanly and leave no compatibility paths.
@@ -231,87 +224,6 @@ env wiring, sandbox profile generation, multi-client supervision, jobs, output q
 tests cover pure contracts; integration tests use isolated temporary paths. Phase 2 — parallel work on the CLI, gateway,
 N-API bindings, MCP server, and escape suite. Phase 3 — adversarial conformance and sandbox review, confirmed fixes,
 then targeted verification plus the repository's full Rust checks and a CLI transcript against the docs.
-
-**Resolved experiments** (harnesses + results in `specs/cowshed/prototypes/apfs-workspace-bench/`; verdicts folded into
-the specs):
-
-- ASIF vs SPARSE (historical) → ASIF only, case-sensitive (2.1× create, 2.5× write, 5.6× read, 2.3× metadata;
-  case-sensitive ASIF equals case-insensitive within noise). **Superseded:** RAW (UDRW) `.dmg`, case-sensitive, is the
-  single format (01_storage.md §Images).
-- Attach latency floor (pre-cutover measurement) → **not flag-reducible** (`-noverify` ~15 ms noise); only a
-  DiskImages2/diskarbitrationd-level path could improve it — research item, budgets don't assume it.
-- Fork-mid-write clone validity (historical, pre-cutover) → **10/10 clean** under continuous writer + streaming dd, both
-  candidate formats, `fsck_apfs -q` and full `-n`; that finding judged sync-before-clone filesystem freshness, not
-  crash-consistency. 01_storage.md §Images now calls the flushed RAW descriptor clone filesystem crash-consistent.
-  Checkpoint still requires the separate supervisor artifact barrier so process-resident captured bytes and its manifest
-  are durable; regression-pinned in 08_testing.md.
-- (a) bunfig relative `install.cache.dir` → **works, resolves to project root** (bun 1.3.14); `[install] cacheDir` is
-  silently ignored. Unused: under the isolated linker every checkout shares bun's global cache through one literal path
-  (03_caches.md).
-- Cross-volume bun install cost (clonefile backend) → **measured 6× slower + full-copy** (0.03 s/480 KiB in-volume vs
-  0.18 s/59 MB cross-volume, 1,579-file tree) — the basis of 03_caches.md's reflink-reachability rule.
-- (d) cargo `[env]` → **reaches all rustc-wrapper invocations** (cargo 1.97); `SCCACHE_SERVER_UDS` rides there, no env
-  fallback.
-- (e) SBPL semantics → **ranges don't parse; last-match-wins (denies must be emitted last); implicit bind-on-connect
-  exempt; `bind(0)` breaks under bind restriction** → the outbound-only 16-single-port-rule model in 04_sandbox.md,
-  validated end-to-end.
-
-Open experiments (fold into Phase 1 as tests, don't block on them):
-
-- **Unified-log denial visibility** — confirm Seatbelt violations reach the unified log with pid+operation _from an
-  unsandboxed controller context_ (the log store is permission-gated from sandboxed sessions, so this could not be
-  tested). Gates the log-correlation enhancement only; the errno signal (EPERM vs ECONNREFUSED, measured) stands alone.
-- **In-block-only self-connects in practice** — under the outbound-only model an in-sandbox client can reach only its
-  own block ports; survey which real tools break by spawning a helper server on a random port and connecting back (test
-  runners, HMR side-channels), and whether the PORT convention covers them (04_sandbox.md).
-- **devenv eval cost across clone paths** — needs the first real `cowshed fork`: does a fresh clone's `.envrc`
-  evaluation reuse the in-image `.devenv`/Nix state (cheap) or re-evaluate?
-- (b) bun registry token via the per-workspace port URL / registry auth (the workspace's identity is primarily its
-  data-plane _port_ now, so this decides only whether `COWSHED_GATEWAY_TOKEN` survives as a load-bearing export); (c)
-  bun's Linux copyfile backend × OpenZFS BRT (`copy_file_range` — empties layer 2 on ZFS); cargo `trim-paths`
-  warm-target survival across mount paths.
-- **Declarative host setup (14_nix.md)** — (i) home-manager launchd coverage on darwin: confirm HM-managed LaunchAgents
-  (gateway, login-attach/autosave) load and KeepAlive correctly across HM generation switches; (ii) ownership detection:
-  HM-created symlinks resolve into `/nix/store` — verify this holds across HM's symlink strategies (home.file vs
-  mkOutOfStoreSymlink) as the validate-vs-mutate signal; (iii) posture B2: nix-darwin LaunchDaemons with
-  `UserName = dev` for gateway/autosave (a uid that never logs in graphically gets no user LaunchAgents), and the
-  Keychain wrinkle — dev's login keychain is not auto-unlocked without a login session; first dev shell (or
-  `cowshed unlock`) unlocks it and the gateway defers Keychain reads until then.
-- **Go wiring verification** (03/04/05, empirical baseline: devenv-provided go 1.26.3, defaults `GOPATH=~/go` with a 1.1
-  GB modcache already grown, `GOENV=~/Library/Application Support/go/env`): (i) `GOENV` coverage across all go
-  invocations — including editor-spawned gopls (direnv integration) and unwrapped spawns — and whether any file-based
-  mechanism could kill the export (none known: go has no directory-scoped config); (ii) Go-on-macOS platform verifier:
-  confirm `crypto/x509` ignores `SSL_CERT_FILE` on darwin so Go-built clients of intercepted hosts need `--opaque`
-  (04_sandbox.md gap table; why module traffic is an opaque tunnel); (iii) cite/verify the GOMODCACHE concurrent-sharing
-  guarantee across many workspaces + main (0444 entries, internal locking) and confirm GOFLAGS `-modcacherw` projects
-  don't break the model.
-- **iOS/simulator verification** (14_nix.md, 05_gateway.md `/sim/`): (i) simulator reliability without an Aqua session —
-  CI folklore says XCUITest/`simctl` workloads want a live GUI session for the executing uid; confirm what actually
-  degrades over pure SSH and whether a persistent background dev session fixes it; (ii) Expo CLI resolves `xcrun` via
-  PATH (not an absolute `/usr/bin/xcrun` spawn), so the in-image wrapper intercepts `i`/`shift+i`; (iii) cross-uid
-  `simctl install` end-to-end: a dev-built, ad-hoc-signed `.app` from the drop dir installs and launches in the
-  personal-session simulator; (iv) the gateway↔session-broker auth mechanism (mutual secret provisioning at posture-B
-  setup); (v) the headless-signing recipe (`security set-key-partition-list`, once-per-boot unlock) under the dev uid;
-  (vi) idb as the dev-side streaming/HID path for agents observing headless simulators; (vii) the "simulator" Seatbelt
-  preset's exact mach-lookup/XPC-socket inventory for CoreSimulator (04_sandbox.md).
-- **macOS desktop verification** (14_nix.md): (i) Developer-ID vs ad-hoc Gatekeeper behavior when `cowshed app promote`
-  installs into `~/Applications` (confirm ad-hoc needs the override, Developer-ID does not); (ii) quarantine-xattr
-  absence on `cp`/`cp -R` into the drop dir — **verified this session** (`cp` adds no `com.apple.quarantine`),
-  re-confirm on a real signed `.app` bundle; (iii) an Electron/RN-desktop promoted app pointing at dev's dev-server over
-  loopback across uids (live iteration); (iv) driving a dev-session desktop app from a dev-side agent via accessibility
-  APIs/AppleScript (the lane-1 mechanism; reuse cowshed's agent-browser Electron path); (v) `app promote` refuses to run
-  as anything but the personal user and is unreachable from the sandbox/gateway (structural, but assert it).
-
-Interception + telemetry verification (05_gateway.md, 13_telemetry.md — fold into Phase 2 gateway work):
-
-- **Bun `NODE_EXTRA_CA_CERTS`** — does Bun honor it so the workspace CA trust anchor works for `fetch`/`bun install`
-  over an intercepted host? If not, Bun is a documented interception gap (04_sandbox.md trust-anchor table).
-- **macOS-native-TLS tool inventory** — enumerate the Security.framework-backed tools (Swift/Xcode, some system
-  utilities) that ignore env anchors and therefore need `--opaque` for an intercepted host (04_sandbox.md gaps).
-- **Audit flush-durability window** — measure the one-batch crash window under the decision-boundary/short-timer flush
-  policy; confirm no audit-relevant event class needs a per-event flush (13_telemetry.md).
-- **lmao TRACEPARENT adoption** — verify that the TS/Rust tracer adopts `TRACEPARENT` at init and stamps outbound
-  `fetch`/HTTP, which promotes first-party traffic to tier-1 attribution (13_telemetry.md).
 
 ## Acceptance
 
