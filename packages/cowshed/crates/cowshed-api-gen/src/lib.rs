@@ -311,10 +311,6 @@ pub fn generate(project: &Path) -> Result<Vec<GeneratedFile>, String> {
 pub fn column_files(core: &Path) -> Result<Vec<GeneratedFile>, String> {
     let owners = [
         (
-            "runtime/process_spans.rs",
-            "runtime/process_span_columns.generated.rs",
-        ),
-        (
             "runtime/job_unattributed.rs",
             "runtime/job_unattributed_columns.generated.rs",
         ),

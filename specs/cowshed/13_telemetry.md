@@ -117,6 +117,23 @@ arbitrary Unix argv bytes into lossy UTF-8 or a JSON string column. A CPU busy/i
 kind/template, not a fifteenth custom column. Sparse API deltas distinguish unchanged, SET, and CLEAR; the row's
 transition kind preserves clearing semantics without carrying a JSON payload or adding columns.
 
+**Process segments.** The life the job's fold retained at birth-order index `i` is span `i + 2` of the job's lmao
+thread, beside the job span (span 1), and every row of it carries its parent's address. Each batch of events the fold
+emits is projected and sealed as one segment `process-<order:020>-<writer>.arrow` beside the job's segments, by the same
+writer, order and sealing; an event the projection cannot place is counted in the trace health and adds no row. A row's
+kind is its lmao entry type and a fixed message: `span-start` and `span-ok`/`span-err` named `process.run` at the
+observed birth and exit (`span-ok` only for a clean exit with status 0), and `info` rows `process.exec`, `process.busy`,
+`process.idle`, `process.usage` (a first read or an RSS step), `process.heartbeat`, `process.blocked` and
+`process.blocker-cleared`. A `process.blocked` row is a SET that states `blocked_on`, `blocked_path` and
+`blocked_holder_pid` whole, so a null path or holder there is absent, never unchanged; `process.blocker-cleared` is a
+CLEAR. A span starts idle and only busy/idle rows change that; a flip with no counter moved is a row with every column
+null. The end row states every counter of the final usage. `exit_signal` names the signal from one dictionary on every
+host: the macOS and Linux signal names, then Linux's real-time signals by kernel number as `SIG32`…`SIG64`. The argv
+display writes an argument of only `[A-Za-z0-9_@%+=:,./-]` bare and any other in `$'…'` quotes, with `\\`, `\'`, and
+`\xHH` for each byte of a control character or of an invalid UTF-8 sequence. The enum columns (`exit_signal`,
+`blocked_on`) are dictionaries of every declared name keyed by `u16`, as lmao encodes `S.enum`; `S.category` and
+`S.text` are `u32`-keyed dictionaries.
+
 The job span, not each process span, carries signed `disk_ws_delta_bytes` and optional `disk_build_delta_bytes`,
 `load1_milli: u32` at start and end, and `cores: u16` at those same boundaries. Host load converts once to nearest
 milliload with the declared checked conversion; non-finite, negative, or overflowing load and an overflowing core count

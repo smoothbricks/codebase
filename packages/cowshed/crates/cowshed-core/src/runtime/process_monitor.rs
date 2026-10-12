@@ -68,6 +68,8 @@ struct RetainedEntry {
     identity: Option<ProcessIdentity>,
     parent: Option<ProcessIdentity>,
     at: SystemTime,
+    /// The last entry of one emitted fold batch, retained for exact trace replay.
+    batch_end: bool,
 }
 
 struct TraceWriter {
@@ -76,17 +78,20 @@ struct TraceWriter {
 }
 
 impl TraceWriter {
-    fn record(&mut self, entry: &RetainedEntry) {
-        if let Ok(event) = &entry.event {
-            self.publisher.record_process(self.projection.project(
-                RetainedProcessEvent {
-                    event,
-                    identity: entry.identity,
-                    parent: entry.parent,
-                },
-                entry.at,
-            ));
-        }
+    fn record(&mut self, entries: &[RetainedEntry]) {
+        let Self { publisher, projection } = self;
+        publisher.record_process(entries.iter().filter_map(|entry| {
+            entry.event.as_ref().ok().map(|event| {
+                projection.project(
+                    RetainedProcessEvent {
+                        event,
+                        identity: entry.identity,
+                        parent: entry.parent,
+                    },
+                    entry.at,
+                )
+            })
+        }));
     }
 }
 
@@ -387,12 +392,14 @@ impl Writer {
                 identity,
                 parent,
                 at,
+                batch_end: false,
             });
         }
+        if self.journal.len() > first {
+            self.journal.last_mut().expect("the batch emitted an entry").batch_end = true;
+        }
         if let Some(trace) = &mut self.trace {
-            for entry in &self.journal[first..] {
-                trace.record(entry);
-            }
+            trace.record(&self.journal[first..]);
         }
         let tree = match outcome {
             Ok(()) => utc_now().map(|at| self.observer.tree(at)),
@@ -404,6 +411,7 @@ impl Writer {
                 identity: None,
                 parent: None,
                 at,
+                batch_end: true,
             });
         }
         self.snapshot.store(Arc::new(Snapshot {
@@ -454,8 +462,8 @@ impl Writer {
                         let _ = reply.send(result);
                     }
                     Request::Trace(mut trace) => {
-                        for entry in &self.journal {
-                            trace.record(entry);
+                        for batch in self.journal.split_inclusive(|entry| entry.batch_end) {
+                            trace.record(batch);
                         }
                         self.trace = Some(trace);
                     }
