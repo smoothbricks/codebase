@@ -359,6 +359,8 @@ builds leave the variable unset; publish jobs supply their dispatch commit. Nx h
 for targets whose outputs contain it; changing only the checkout's commit does not change those inputs when it is unset.
 The build script rejects CR or LF in `LMAO_GIT_REVISION` with an explicit panic before emitting the revision.
 
+### ModuleMetadata Interface <a id="smoo/lmao!n/arrow-table-module-id.metadata"></a>
+
 ### OpMetadata <a id="smoo/lmao!n/arrow-table-module-id.metadata"></a>
 
 `defineOp(name, fn, metadata?)` takes the attribution as its third argument, and the transformer fills it at every
