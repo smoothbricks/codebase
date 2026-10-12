@@ -104,7 +104,11 @@ import {
  * instead of probing the host; any change sends the lease back to a probe.
  * Every disk child runs under a deadline, in its own process group so the
  * deadline also reaches the helper it spawned, so a wedged DiskArbitration
- * fails the task instead of every task waiting on the volume.
+ * fails the task instead of every task waiting on the volume. A detach is the
+ * exception: never killed at its deadline, because an interrupted detach can
+ * wedge DiskArbitration itself; its wait is bounded and reported by name, and
+ * a stray's detach gets the short stray bound, so one wedged stray cannot
+ * hold the create claim while a chain of tasks queues behind it.
  *
  * A cowshed sandbox denies writes to /private/tmp (EPERM on the lock), and
  * cannot attach disk images at all; there the task keeps the workspace's own
@@ -155,7 +159,7 @@ export interface CommandOutput {
 
 /** The host programs the volume lifecycle runs. A seam so the state machine is testable without DiskArbitration. */
 export interface HostCommands {
-  run(file: string, args: readonly string[]): Promise<CommandOutput>;
+  run(file: string, args: readonly string[], deadlineMs?: number): Promise<CommandOutput>;
 }
 
 /**
@@ -1262,7 +1266,11 @@ export class RamTempVolume {
           return failed('reclaim', holdingText(point, held.value));
         }
       }
-      const detached = await this.commands.run('/usr/bin/hdiutil', ['detach', '-force', disk.physical]);
+      const detached = await this.commands.run(
+        '/usr/bin/hdiutil',
+        ['detach', '-force', disk.physical],
+        STRAY_DETACH_DEADLINE_MS,
+      );
       if (detached.status !== 0) {
         return failed(`hdiutil detach (stray ${disk.physical})`, commandText(detached));
       }
@@ -1664,6 +1672,20 @@ export function ramDisksIn(info: string): RamDisk[] {
  */
 const HOST_COMMAND_DEADLINE_MS = 120_000;
 
+/**
+ * How long one creator waits on a stray's detach before it reports the stray by name and
+ * gives the create claim back. A stray detach that makes no progress is DiskArbitration's
+ * wedge, not this volume's: at 120 s a chain of creators each waited the full bound on the
+ * same stray and the claim never moved. The detach itself is never killed (below); the
+ * bound is on the wait, and the next creator finds the stray gone or names it again.
+ */
+const STRAY_DETACH_DEADLINE_MS = 30_000;
+
+/** A detach command: the one disk-image verb that is never killed at its deadline. */
+function isDetach(file: string, args: readonly string[]): boolean {
+  return (file === '/usr/bin/hdiutil' || file.endsWith('/hdiutil')) && args[0] === 'detach';
+}
+
 /** Whether this process already said the cowshed gateway is not there to lease disk commands. */
 let gatewayAbsenceSaid = false;
 
@@ -1684,11 +1706,12 @@ const predatesSeenAt = new Map<string, number>();
  * said once per process, and one that predates leases is said and not asked again for a minute.
  */
 export function createHostCommands(
-  deadlineMs: number = HOST_COMMAND_DEADLINE_MS,
+  defaultDeadlineMs: number = HOST_COMMAND_DEADLINE_MS,
   gatewaySocket: string = GATEWAY_SOCKET,
 ): HostCommands {
   return {
-    async run(file, args) {
+    async run(file, args, callDeadlineMs) {
+      const deadlineMs = callDeadlineMs ?? defaultDeadlineMs;
       const diskClass = diskClassOf(file, args);
       const predatesSince = predatesSeenAt.get(gatewaySocket);
       if (diskClass === null || (predatesSince !== undefined && Date.now() - predatesSince < PREDATES_RECHECK_MS)) {
@@ -1730,13 +1753,30 @@ function runBounded(file: string, args: readonly string[], deadlineMs: number): 
   // `hdiutil attach` hands the attach to a diskimages-helper, and one that outlived its
   // killed `hdiutil` finished the attach later, an image nobody detached (2026-10-06).
   const child = spawn(file, [...args], { detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
+  const detach = isDetach(file, args);
   const stdout: Buffer[] = [];
   const stderr: Buffer[] = [];
   child.stdout.on('data', (chunk: Buffer) => stdout.push(chunk));
   child.stderr.on('data', (chunk: Buffer) => stderr.push(chunk));
   const text = (chunks: Buffer[]) => Buffer.concat(chunks).toString('utf8');
   // Answered without waiting for the pipes: a helper that escaped the group may hold them.
+  // A detach is never killed at its deadline: interrupted mid-operation it can wedge
+  // DiskArbitration for every later task (the cowshed runner's hard deadline is the only
+  // killer of a disk-image command). The wait is bounded instead: the caller gets a named
+  // failure and its claim back, and the detached child finishes or stays wedged on its own,
+  // never holding this task's lifecycle claim.
   const timer = setTimeout(() => {
+    if (detach) {
+      child.unref();
+      child.stdout.unref();
+      child.stderr.unref();
+      resolve({
+        status: 1,
+        stdout: text(stdout),
+        stderr: `no answer within ${deadlineMs} ms; left running detached (process group ${child.pid ?? 'unknown'}), not killed: a detach interrupted mid-operation can wedge DiskArbitration`,
+      });
+      return;
+    }
     resolve({
       status: 1,
       stdout: text(stdout),

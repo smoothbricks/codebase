@@ -119,6 +119,24 @@ describe('RAM temp volume on this host', () => {
     expect(state.status === 1 || state.stdout.trim().startsWith('Z')).toBe(true);
   });
 
+  it('never kills a wedged detach: the wait is bounded, named, and the child runs on', async () => {
+    // A stray volume's detach that DiskArbitration never answers held a chain of creators
+    // for 120 s each: the deadline killed hdiutil's group mid-detach, the creator died, and
+    // the next waiter retried the same stray. A detach now outlives its wait instead.
+    const directory = await ownedSocketDirectory('rt-', 'fake-hdiutil');
+    const fake = join(directory, 'hdiutil');
+    await writeFile(fake, '#!/bin/sh\necho $$\nsleep 60\n', { mode: 0o755 });
+    const started = Date.now();
+    const result = await createHostCommands(300).run(fake, ['detach', '/dev/disk504']);
+    expect(Date.now() - started).toBeLessThan(10_000);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toMatch(/^no answer within 300 ms; left running detached \(process group \d+\), not killed/);
+    const pid = Number(result.stdout.trim());
+    expect(() => process.kill(pid, 0)).not.toThrow();
+    process.kill(pid, 'SIGKILL');
+    await createHostCommands().run('/bin/rm', ['-rf', directory]);
+  });
+
   it('asks a gateway that predates disk leases once, not before every disk command', async () => {
     // Such a gateway answers only after 2 s of silence; asking it before each of a volume's
     // dozen hdiutil and diskutil calls once pushed a test shard past its 120 s bound.
