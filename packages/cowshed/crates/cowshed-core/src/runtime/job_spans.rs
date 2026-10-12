@@ -16,16 +16,21 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use arrow_array::{ArrayRef, RecordBatch, StringArray, UInt64Array};
+use arrow_array::{
+    ArrayRef, Int64Array, RecordBatch, StringArray, UInt16Array, UInt32Array, UInt64Array,
+};
 use arrow_schema::{DataType, Field};
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
 use crate::api::dto::{ExitStatus, JobId, JobInfo, JobState, TraceContext};
+use crate::api::resources::{ChargedMemoryUsage, HostLoadSample, JobVolumeUsage};
 use crate::error::CowshedError;
 use crate::metadata::WorkspaceIncarnation;
 use crate::repository::RepoId;
+use crate::runtime::job_boundary::{boundary_host, charged_memory_values, volume_deltas};
+use crate::runtime::process_spans::{ProcessSpanRow, seal_process_row};
 use crate::storage::job_artifact::state_name;
 use crate::storage::trace_segment::{
     EntryType, SpanAddress, SystemColumns, SystemRow, TelemetryDate, TraceSegmentError,
@@ -130,10 +135,12 @@ struct JobSpanRow {
     job_id: JobId,
     grant_revision: u64,
     edge: JobSpanEdge,
+    boundary: Option<PreparedBoundary>,
 }
 
 enum Request {
     Row(Box<JobSpanRow>),
+    Process(Box<ProcessSpanRow>),
     Health { reply: oneshot::Sender<TraceHealth> },
 }
 
@@ -145,6 +152,42 @@ enum JobSpanError {
     BeyondNanoseconds,
     #[error(transparent)]
     Segment(#[from] TraceSegmentError),
+}
+
+/// Host, volume, and charged-memory facts for one job-span start or end. The actor
+/// reads these at the boundary. Absent build volume and absent charged memory stay
+/// null. This does not name a leaf or compute unattributed usage.
+pub struct JobSpanBoundary {
+    pub host: HostLoadSample,
+    pub volumes: JobVolumeUsage,
+    pub charged: Option<ChargedMemoryUsage>,
+}
+
+struct PreparedBoundary {
+    load1_milli: u32,
+    cores: u16,
+    disk_ws: Option<i64>,
+    disk_build: Option<i64>,
+    charged_current: Option<u64>,
+    charged_peak: Option<u64>,
+}
+
+impl PreparedBoundary {
+    fn from_boundary(
+        boundary: &JobSpanBoundary,
+    ) -> Result<Self, crate::api::resources::ResourceUnitError> {
+        let (load1_milli, cores) = boundary_host(boundary.host)?;
+        let (disk_ws, disk_build) = volume_deltas(&boundary.volumes);
+        let (charged_current, charged_peak) = charged_memory_values(boundary.charged);
+        Ok(Self {
+            load1_milli,
+            cores,
+            disk_ws,
+            disk_build,
+            charged_current,
+            charged_peak,
+        })
+    }
 }
 
 /// The queue into one supervisor's job-span writer. Clones share the writer and its health.
@@ -190,7 +233,64 @@ impl JobSpanPublisher {
                 return;
             }
         };
-        permit.send(Request::Row(Box::new(JobSpanRow {
+        permit.send(Request::Row(Box::new(self.row(info, edge, None))));
+    }
+
+    /// Queue one projected process row. Stem `process-`, same order counter and health as job
+    /// rows. A full or stopped queue is counted; the row is not sealed.
+    pub fn record_process(&self, row: ProcessSpanRow) {
+        let permit = match self.sender.try_reserve() {
+            Ok(permit) => permit,
+            Err(error) => {
+                refuse(
+                    &self.health,
+                    match error {
+                        mpsc::error::TrySendError::Full(()) => "the job span queue is full",
+                        mpsc::error::TrySendError::Closed(()) => "the job span writer stopped",
+                    }
+                    .to_owned(),
+                );
+                return;
+            }
+        };
+        permit.send(Request::Process(Box::new(row)));
+    }
+
+    /// Queue the job edge with host, volume, and charged-memory columns. Absent build volume
+    /// and absent charged memory stay null. A conversion failure is counted and not sealed.
+    /// This does not name a leaf.
+    pub fn record_boundary(&self, info: &JobInfo, edge: JobSpanEdge, boundary: &JobSpanBoundary) {
+        let prepared = match PreparedBoundary::from_boundary(boundary) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                refuse(&self.health, error.to_string());
+                return;
+            }
+        };
+        let permit = match self.sender.try_reserve() {
+            Ok(permit) => permit,
+            Err(error) => {
+                refuse(
+                    &self.health,
+                    match error {
+                        mpsc::error::TrySendError::Full(()) => "the job span queue is full",
+                        mpsc::error::TrySendError::Closed(()) => "the job span writer stopped",
+                    }
+                    .to_owned(),
+                );
+                return;
+            }
+        };
+        permit.send(Request::Row(Box::new(self.row(info, edge, Some(prepared)))));
+    }
+
+    fn row(
+        &self,
+        info: &JobInfo,
+        edge: JobSpanEdge,
+        boundary: Option<PreparedBoundary>,
+    ) -> JobSpanRow {
+        JobSpanRow {
             at: SystemTime::now(),
             trace: info.trace.clone(),
             repo_id: info.repo_id.clone(),
@@ -198,7 +298,8 @@ impl JobSpanPublisher {
             job_id: info.job_id,
             grant_revision: info.grant_revision,
             edge,
-        })));
+            boundary,
+        }
     }
 
     /// The writer's health once every row queued before this call is sealed or refused.
@@ -245,6 +346,24 @@ async fn write_rows(
                 order = order.saturating_add(1);
                 match sealed {
                     Ok(Ok(())) => {
+                        let mut health = lock(&health);
+                        health.recorded = health.recorded.saturating_add(1);
+                    }
+                    Ok(Err(error)) => refuse(&health, error.to_string()),
+                    Err(error) => {
+                        refuse(&health, format!("the job span seal task failed: {error}"))
+                    }
+                }
+            }
+            Request::Process(row) => {
+                let root = root.clone();
+                let sealed = tokio::task::spawn_blocking(move || {
+                    seal_process_row(&root, writer, order, &row)
+                })
+                .await;
+                order = order.saturating_add(1);
+                match sealed {
+                    Ok(Ok(_)) => {
                         let mut health = lock(&health);
                         health.recorded = health.recorded.saturating_add(1);
                     }
@@ -319,6 +438,42 @@ fn job_span_batch(row: &JobSpanRow, timestamp_ns: i64) -> Result<RecordBatch, Tr
             Field::new("job_state", DataType::Utf8, true),
             Arc::new(StringArray::from(vec![row.edge.state().map(state_name)])),
         ),
+        (
+            Field::new("disk_ws_delta_bytes", DataType::Int64, true),
+            Arc::new(Int64Array::from(vec![
+                row.boundary.as_ref().and_then(|b| b.disk_ws),
+            ])),
+        ),
+        (
+            Field::new("disk_build_delta_bytes", DataType::Int64, true),
+            Arc::new(Int64Array::from(vec![
+                row.boundary.as_ref().and_then(|b| b.disk_build),
+            ])),
+        ),
+        (
+            Field::new("load1_milli", DataType::UInt32, true),
+            Arc::new(UInt32Array::from(vec![
+                row.boundary.as_ref().map(|b| b.load1_milli),
+            ])),
+        ),
+        (
+            Field::new("cores", DataType::UInt16, true),
+            Arc::new(UInt16Array::from(vec![
+                row.boundary.as_ref().map(|b| b.cores),
+            ])),
+        ),
+        (
+            Field::new("charged_memory_current_bytes", DataType::UInt64, true),
+            Arc::new(UInt64Array::from(vec![
+                row.boundary.as_ref().and_then(|b| b.charged_current),
+            ])),
+        ),
+        (
+            Field::new("charged_memory_peak_bytes", DataType::UInt64, true),
+            Arc::new(UInt64Array::from(vec![
+                row.boundary.as_ref().and_then(|b| b.charged_peak),
+            ])),
+        ),
     ];
     trace_batch(system, custom)
 }
@@ -381,5 +536,65 @@ mod tests {
             );
         }
         assert_ne!(thread, one.get(), "not the workspace-local job id");
+    }
+
+    #[tokio::test]
+    async fn a_projected_process_row_seals_on_the_same_writer() {
+        use crate::api::dto::{CommandArg, UtcTimestamp};
+        use crate::api::process::{JobProcessEvent, JobProcessSample};
+        use crate::runtime::process_spans::{
+            ProcessSpanProjection, RetainedProcessEvent, read_process_segment,
+        };
+        use crate::runtime::process_tree::{BirthToken, ProcessIdentity};
+
+        let root = std::env::temp_dir().join(format!("cowshed-span-pub-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir(&root).unwrap();
+        let publisher = JobSpanPublisher::start(root.clone());
+        let mut projection = ProcessSpanProjection::new("trace", 9);
+        let identity = ProcessIdentity {
+            pid: 4,
+            birth: BirthToken(1),
+        };
+        let process = JobProcessSample {
+            pid: 4,
+            ppid: 1,
+            program: "/bin/cat".to_owned(),
+            argv: vec![CommandArg::from("/bin/cat")],
+            born_at: UtcTimestamp::new("2026-10-12T00:00:00Z").unwrap(),
+            usage: None,
+            blocked_on: None,
+            exit: None,
+        };
+        let row = projection
+            .project(
+                RetainedProcessEvent {
+                    event: &JobProcessEvent::Born { index: 0, process },
+                    identity: Some(identity),
+                    parent: None,
+                },
+                UNIX_EPOCH + std::time::Duration::from_secs(3),
+            )
+            .unwrap()
+            .unwrap();
+        publisher.record_process(row);
+        let health = publisher.health().await.unwrap();
+        assert_eq!((health.recorded, health.failed), (1, 0), "{health:?}");
+        let sealed = std::fs::read_dir(root.join("1970-01-01"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .starts_with("process-")
+            })
+            .unwrap();
+        let decoded = read_process_segment(&sealed).unwrap();
+        assert_eq!(decoded.message, "process.run");
+        assert_eq!(decoded.proc_argv.as_deref(), Some("'/bin/cat'"));
+        assert_eq!(decoded.parent_span_id, JOB_SPAN_ID);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
