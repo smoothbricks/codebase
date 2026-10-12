@@ -266,27 +266,15 @@ is not reported delivered. `worker.jobByKey(key)` can recover the handle used fo
 
 The acceptance boundaries are explicit: the actual addon and core client over a scripted controller prove 4 MiB binary
 framing, per-frame backpressure, EOF and typed causes; an independent real supervisor with a real child and pipe proves
-byte-identical delivery, known cursors, pending-write drain and EOF without cancellation. The full real-host N-API
-monitoring fixture is separate work.
+byte-identical delivery, known cursors, pending-write drain and EOF without cancellation.
 
-### Implementation status — monitoring gaps
-
-Core job resource samples and terminal persistence, controller cursor-addressed bounded tails, and keyed admission and
-lookup are implemented. Periodic progress samples stream over the controller and through the generated N-API adapter.
-Open stdin and generated N-API attachment input `write` / `end` / `detach` are implemented. Resumable N-API raw-byte
-output iterables, full attachment output stdio and `AbortSignal` plumbing remain unbuilt; existing raw log chunks and
-cursor tails are unchanged. One-use worker descriptor connection is also unbuilt. Fork/exec tree observations,
-per-process CPU/RSS/I/O and blocker facts, typed process event streams, CPU-winning leaf identity, and their
-`process.run`/job spans are also unbuilt. Complete cgroup job totals, separate charged-memory counters, measured
-fork/exec/exit observation and explicit unattributed-usage reconciliation are unbuilt as well.
+### Monitoring surface
 
 The controller and N-API monitoring surface is generated from the same canonical API declarations, including resource
 and process-group samples, workspace/build-volume usage, journal cursors and tails, attach, kill, and progress events.
 TypeScript public types and validators are generated projections, never a second hand-maintained field list. Every
 declared controller operation reaches the addon as a generated adapter on the handle that binds its authority, with a
-generated TypeScript declaration whose argument type picks exactly the request fields the caller names. Of the
-monitoring surface above, `progress`, `kill`, `tail` and `listeningPorts` are declared; the rest is generated once it is
-declared.
+generated TypeScript declaration whose argument type picks exactly the request fields the caller names.
 
 Each `JobResourceSample` carries its own `jobId`. Its start baseline is the first job-owned process, including a cold
 shell's activation; progress and terminal accounting include that activation, but never charge the idle time of a

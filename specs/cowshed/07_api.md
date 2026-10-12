@@ -621,9 +621,10 @@ remain a separate bounded diagnostic projection.
 The shell connection is a reconnectable view over the persistent, permission-checked, multi-client per-workspace
 supervisor socket (11_shell.md). Dropping a `Session`, `JobHandle`, or transport never unlinks that socket or stops the
 job. Protected complete in-volume Arrow batches and sealed artifacts are the authoritative evidence of a job; controller
-commitments are audit telemetry that no API reads for a decision. Faults follow the
-[protected-record Integrity rule](11_shell.md#exec-records-stream-storage-and-tiered-authority). Authorization, grant,
-and gateway audit authority remain controller-owned.
+commitments are audit telemetry that no API reads for a decision (11_shell.md). APIs return `Integrity` for a missing or
+altered artifact, an invalid complete batch, a checkpoint-barrier counter behind a durable barrier, or an incarnation
+outside the marker lineage; nothing silently wins. Authorization, grant, and gateway audit authority remain
+controller-owned.
 
 The invariant is the same one that keeps grant files outside the volume (01_storage.md, 04): a capability reachable from
 inside a sandbox must not authorize escalation. `WorkspaceHandle` is that principle expressed in the type system — a
