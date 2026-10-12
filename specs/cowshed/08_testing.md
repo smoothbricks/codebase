@@ -290,7 +290,9 @@ ceiling alone is below `N`. `N` is the lane's measured attach count, one per
 under `COWSHED_TIMING=1` with `NEXTEST_SUCCESS_OUTPUT=immediate` to show passing tests' captured output, plus a fixed
 margin of 32 attach slots. It is measured again whenever the lane's test set changes. The leaked-device delta across a
 lane run (`ioclasscount AppleDiskImageDevice` against the registered devices, before and after) is the check that no
-disk-image command still leaks on a clean run; it must be 0.
+disk-image command still leaks on a clean run; it must be 0. The 2026-10-12 full 158-test lane measured 307
+image-without-mounting starts and 9 blank-RAW starts: the admission need is 348, including the unchanged 32-slot margin.
+This is a live pool-headroom precondition, not a command or test deadline.
 
 **The suite spends a finite host budget.** Every attach→detach cycle a test makes can leak an AppleDiskImages2 device
 that the host's live sheds lose until reboot (01_storage.md, "How the APFS host degrades" §2), so a test pays the fewest
