@@ -467,17 +467,17 @@ impl Host {
             }
         }
         let spawned = command.spawn();
+        // spawn borrows the builder's stdio and dup2s the raw numbers. The
+        // owned ends stay in `command` until it drops. Release waits for those
+        // ends, so the builder closes them before that wait. The child handle
+        // does not own them and stays unreaped.
+        drop(command);
         #[cfg(target_os = "macos")]
         drop(hold);
         let exit = match spawned {
             Ok(child) => {
-                // The command holds the job's streams now; a copy kept here would keep its
-                // stderr from ending until the release, which waits for that end.
                 drop(diagnostics);
-                // Held from here: any failure below ends the command before it is reported.
                 let held = Held::new(child.id().cast_signed());
-                // Before any wait: this host is the command's parent, so until it reaps the child
-                // its pid names nothing else.
                 let birth = Birth::of(child.id());
                 reply(socket, FrameWriter::new(REPLY_STARTED).birth(&birth)?)?;
                 return serve_command(socket, held);
