@@ -3,120 +3,113 @@ name: cowshed
 description:
   Give each agent, fork, or subtask an instant warm copy-on-write clone of a repository instead of a cold git worktree.
   Use when spawning parallel agents that each need their own checkout, when a worktree would force a multi-minute cold
-  rebuild, when isolating risky or destructive work, or when running any cowshed command (adopt, setup, new, path, exec,
-  grant, land, push, rm, gc, rebase, doctor).
+  rebuild, when isolating risky or destructive work, or when running any cowshed command (adopt, setup, new, fork, path,
+  exec, grant, land, push, rm, gc, rebase, checkpoint, restore, attach, detach, defrag, reseed, doctor, sccache).
 ---
 
 # cowshed — warm workspaces for parallel agents
 
 A cowshed workspace is a full standalone checkout — source, `.git`, `node_modules`, `target/`, every build cache —
-cloned copy-on-write from the repository's warm `main` image. A `git worktree` gives an agent a cold tree whose build
-cache starts empty and a first build that costs minutes; a cowshed workspace starts warm. `cowshed new` on a large,
-long-used repository still takes tens of seconds, and nearly all of it is two steps. The clone call returns in
-milliseconds, but the clone's first write, during its attach or mount, makes APFS copy the extent map of main's image
-file. That copy costs about 12 µs per extent, and main's image fragments with every write it takes while clones share
-its blocks: 2.1 million extents cost 25 s on a quiet host and over a minute on a busy one. Then setup walks the whole
-tree for symlinks that point outside it, about 5 s over a million entries. The number of attached images does not
-matter.
+cloned copy-on-write from the repository's warm `main` image. A `git worktree` starts cold; a shed starts warm. On a
+large, long-used repo `cowshed new` still takes tens of seconds: APFS copies main's extent map at ~12 µs/extent on first
+write, then setup walks the tree for escaping symlinks. `cowshed defrag main` is the remedy when `doctor` warns
+`main-extents`.
 
 ## Use it
 
-Reach for cowshed when several agents work in one repository, when a build cache is expensive, or when risky work needs
-a blast radius that ends at `cowshed rm`.
-
-1. Adopt once with the warm build cache included and capacity sized for growth:
-   `cowshed adopt <path> --capacity <size>`.
-2. If host storage is missing, run `cowshed doctor` (it mutates nothing), then follow its `next:` command, usually
-   `cowshed setup`. `cowshed setup` also installs the build it runs from as the installed cowshed — the gateway daemon
-   and the `cowshed` on `PATH` alike, one binary. `cowshed setup` typed at a shell runs that installed copy and installs
-   nothing new; to install a checkout's release build, run its own `packages/cowshed/bin/cowshed setup`. Never link
-   `cowshed` on `PATH` into a checkout. Setup refuses a build of an older commit than the installed one (a `conflict`
-   naming both builds); `--downgrade` installs it anyway, only when going back is intended.
-3. Create one workspace per agent. Work in that workspace, never in shared `main`.
-4. Retire finished workspaces and run `cowshed gc` on a cadence. Storage grows with divergence, not clone count.
-
-direnv users need nothing extra.
+1. Adopt once: `cowshed adopt <path> --capacity <size>`. Adoption runs a secret gate first; `--quarantine` moves
+   findings aside, a waiver in the named `waivers.json` is only for committed synthetic fixtures.
+2. Host storage missing → `cowshed doctor` (bare doctor mutates nothing; `--repair` also runs the gc sweep), then its
+   `next:` command, usually `cowshed setup`. Setup installs the invoking build as the one installed cowshed (CLI and
+   daemon, one artifact): typing `cowshed setup` runs the installed copy and installs nothing new, so install a checkout
+   build via its own `packages/cowshed/bin/cowshed setup`, never symlink `cowshed` on PATH into a checkout, and expect
+   setup to refuse a build older than the installed one (`--downgrade` only when intended).
+3. One workspace per agent; work there, never in shared `main`. Pass `--project <git-root>` explicitly rather than
+   trusting cwd. Retire finished sheds; storage grows with divergence, not clone count.
+4. Workspaces publish `.cowshed/env`; direnv users need nothing extra (`source_env_if_exists .cowshed/env` is the
+   optional hook). After a reboot or eject, `cowshed attach` re-mounts; it is idempotent.
 
 ## Commands
 
-| Task                    | Command                                                              | Use                                                                                        |
-| ----------------------- | -------------------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
-| Create from main        | `cowshed new <name>`                                                 | Clone the warm main image.                                                                 |
-| Create from a sibling   | `cowshed new <name> --from <ws>`                                     | Start from another workspace's current image.                                              |
-| Create at a stable slot | `cowshed new <name> --slot <n>`                                      | Recycle a stable mount path for path-keyed compiler caches.                                |
-| Locate                  | `cowshed path <ws>`                                                  | Print the live mount path.                                                                 |
-| Run a command           | `cowshed exec <ws> -- <cmd>`                                         | Execute argv inside the workspace sandbox.                                                 |
-| Grant host paths        | `cowshed grant <ws> --read <path...> [--write <path...>]`            | Widen filesystem access from the next exec; omit flags to list.                            |
-| Grant network reach     | `cowshed grant <ws> --egress <host>`                                 | Admit one host through the gateway; separately audited.                                    |
-| Grant a pinned client   | `cowshed grant <ws> --egress <host> --opaque`                        | Tunnel without interception for a client that verifies the real certificate (Go on macOS). |
-| Grant service ports     | `cowshed grant <ws> --ports <N>`                                     | macOS: grow the port block to at least N service ports before launching services.          |
-| List this project       | `cowshed ls`                                                         | Show its workspaces.                                                                       |
-| List every project      | `cowshed ls --all`                                                   | Show workspaces store-wide.                                                                |
-| Inspect host            | `cowshed doctor`                                                     | Check host and workspace invariants without mutation.                                      |
-| Inspect compile cache   | `cowshed sccache status`                                             | Check daemon health and cache hits before debugging misses.                                |
-| Attach or detach        | `cowshed attach <ws>` / `cowshed detach <ws>`                        | Mount or park one session workspace.                                                       |
-| Attach or detach all    | `cowshed attach --all` / `cowshed detach --all`                      | Mount or park all session workspaces.                                                      |
-| Checkpoint or restore   | `cowshed checkpoint <ws> <label>` / `cowshed restore <ws> <label>`   | Save or roll back an image.                                                                |
-| Rebase                  | `cowshed rebase <ws>`                                                | Rebase the workspace branch onto main.                                                     |
-| Land with a check       | `cowshed land <ws> --target main --check '<bare command>'`           | Check, fast-forward main, and retire on success.                                           |
-| Rebase within a lane    | `cowshed rebase <ws> --into <lane>`                                  | Rebase onto the lane base's branch, where the lane's other units land.                     |
-| Land into a lane base   | `cowshed land <ws> --into <lane> --check '<bare command>'`           | Check, fast-forward the lane base instead of main, and retire.                             |
-| Deliver a branch        | `cowshed push <ws> --branch <name>`                                  | Put the workspace branch in main's repository for review.                                  |
-| Retire                  | `cowshed rm <ws>`                                                    | Remove a landed workspace.                                                                 |
-| Reclaim                 | `cowshed gc --dry-run` / `cowshed gc`                                | Review, then reclaim orphaned storage.                                                     |
-| Grow an image           | `cowshed resize <ws> <size>`                                         | Grow an image; resize never shrinks it.                                                    |
-| Make clones cheap again | `cowshed defrag main`                                                | Rewrite main contiguously when doctor warns `main-extents`.                                |
-| Rename or move          | `cowshed mv <ws> <new-name>` / `cowshed mv main <new-checkout-path>` | Rename a workspace or move the adopted checkout.                                           |
+| Task                     | Command                                                                            | Use                                                                                                                                                          |
+| ------------------------ | ---------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Create from main         | `cowshed new <name>` (`--ref <rev>`)                                               | Clone the warm main image at main's tip (or a rev).                                                                                                          |
+| Create from a sibling    | `cowshed new <name> --from <ws>`                                                   | Clone another workspace's image. Same repo only.                                                                                                             |
+| Fork live state          | `cowshed fork <src> <dst>`                                                         | Divergent future from a running workspace; grants are NOT inherited.                                                                                         |
+| Create at a stable slot  | `cowshed new <name> --slot <n>`                                                    | Stable mount path — only for crates/tooling that bake absolute paths; cargo ≥1.97 + bundled sccache already hit across paths.                                |
+| Linked worktree (escape) | `cowshed new <name> --git-worktree`                                                | One object store with main; costs checkpoint/restore, needs main mounted. Prefer a real shed.                                                                |
+| Locate                   | `cowshed path <ws>` (`--no-attach`)                                                | Print the mount path; attaches a detached shed first unless `--no-attach`.                                                                                   |
+| Run a command            | `cowshed exec <ws> -- <cmd>`                                                       | One argv, never a shell string, inside the sandbox. `--session`, `--background`, `--timeout`, `--stdin*` exist.                                              |
+| Grant host paths         | `cowshed grant <ws> --read <p…> [--write <p…>]`                                    | Applies from next exec; omit flags to list. Grant the symlink's target, not the link.                                                                        |
+| Grant network / ports    | `cowshed grant <ws> --egress <host> [--opaque]`; `--ports <N>`                     | Egress via gateway (`--opaque` for cert-pinning clients, e.g. Go on macOS). macOS: grow the port block _before_ launching services — refused while jobs run. |
+| List                     | `cowshed ls` / `ls --all` / `ls --landed`                                          | `--landed` = patch-equivalence-aware safe-rm list (`ls --landed \| xargs -n1 cowshed rm`).                                                                   |
+| Inspect host / cache     | `cowshed doctor` / `cowshed sccache status`                                        | Doctor names attach-pool, extent and orphan findings (below).                                                                                                |
+| Attach / detach          | `cowshed attach [<ws>]` / `cowshed detach [<ws>]` (`--all`)                        | Mount or park. Detach is NOT cleanup: image, commits, grants, ports persist. Only `rm`/`land` retire.                                                        |
+| Checkpoint / restore     | `cowshed checkpoint [<ws>] [label]` / `cowshed restore <ws> <label>`               | Explicit labels pin; restore keeps the displaced image as `pre-restore-*` and refuses over unsaved work.                                                     |
+| Rebase                   | `cowshed rebase [<ws>]` (`--into <lane>`, `--onto <rev>`)                          | Onto main by default; `--into` onto a lane base's branch. Dirty tree refused; conflict aborts clean.                                                         |
+| Land                     | `cowshed land <ws> [--check '<cmd>' …]`                                            | Check (repeatable), fast-forward, retire by default. Does NOT rebase — rebase first. `--into <lane>`, `--no-retire`, `--push-only` exist.                    |
+| Deliver a branch         | `cowshed push [<ws>] [--branch <name>]`                                            | Preserves `refs/cowshed/<ws>/heads/<branch>` in main's repo for review; touches no checkout.                                                                 |
+| Retire / reclaim         | `cowshed rm <ws>` / `cowshed gc [--dry-run]`                                       | `rm` refuses until main contains HEAD (ancestry or patch equivalence).                                                                                       |
+| Grow / repair images     | `cowshed resize <ws\|main> <size>` (`--build <size>`), `defrag`, `reseed`, `rekey` | Resize never shrinks; `--build` grows the build volume. Reseed refreshes a stale fork seed.                                                                  |
+| Rename / move            | `cowshed mv <ws> <new>` / `cowshed mv main <path>`                                 | Moving/re-identifying main needs a quiesced mount, run from outside.                                                                                         |
+
+Also present: `mount main`, `build-state` (Nx lint), `gateway`, `credential`, `identity add`, `skill install` — run
+`cowshed <verb> --help`; every verb is self-describing.
 
 ## Merge flow
 
-1. Work and commit in the agent's workspace.
-2. Rebase before hand-off: `cowshed rebase <ws>`. Resolve conflicts in that workspace.
-3. Run the same check there: `cowshed exec <ws> -- <bare command>`.
-4. Land with `cowshed land <ws> --target main --check '<bare command>'`. The check is one bare command, not a shell
-   pipeline.
-5. A successful `land` retires by default. If it was run with `--no-retire`, if you used `push`, or if land's error says
-   it landed but kept the workspace, run `cowshed rm <ws>` after main contains the workspace `HEAD` (never land again:
-   main already moved). Do not use `--abandon` unless destroying unlanded commits is intentional.
-6. A unit forked from a lane base (`cowshed fork <lane> <ws>`) does steps 2 and 4 with `--into <lane>` (in place of
-   `--target main`): it rebases onto and lands into the lane base, not main. The lane base itself then rebases and lands
-   as an ordinary workspace.
+1. Work and commit in the shed. Never reuse sheds across tasks.
+2. `cowshed rebase <ws>` onto current main; resolve conflicts in the shed. Land will not do this for you.
+3. Gate, then land — **but check for a repo land path first.** Repositories with their own land command require that
+   route to rebase, gate on the _host_ (sandbox hashes differ and host-boundary tests cannot run sandboxed), and only
+   then fast-forward. A bare `cowshed land` is refused when the repository requires its own route. Elsewhere:
+   `cowshed land <ws> --check '<cmd>'` (repeatable; runs inside the sandbox after grant sync).
+4. A successful land retires by default. If retire was refused after the fast-forward, main already moved: run
+   `cowshed rm <ws>`, never land again. With `--no-retire` or after `push`, `rm` once main contains HEAD.
+5. `--force` on `rm` waives only transient state (dirty tree, busy mount) and destroys the uncommitted tree; it can
+   never waive containment. `--abandon` is the sole way to destroy unlanded commits (they are bundled to
+   `sessions/.trash/` first). Never answer an `rm` refusal by adding a flag.
+6. Lane work: fork units from the lane base (`cowshed fork <lane> <unit>`), then `rebase --into <lane>` /
+   `land --into <lane>`; the lane base itself lands to main as an ordinary workspace.
+
+## Host route vs sandbox route
+
+- `cowshed exec` is the sandboxed route (argv only, cwd = shed root, child's exit passes through).
+- Heavy host tooling often belongs on the host route: `cd "$(cowshed path <ws>)" && direnv exec . nx run …`. In
+  particular `taskpolicy -b` inside `cowshed exec` fails with EPERM — run it outside:
+  `cd "$(cowshed path <ws>)" && taskpolicy -b direnv exec . nx run …`.
+- macOS loopback inside exec: only the shed's own port block (`$COWSHED_PORT_BASE`, 64 ports) is connectable; 127.0.0.1
+  outside it is EPERM. Bind services at `$COWSHED_PORT_BASE + 1…`, and `grant --ports <N>` before starting them. Linux
+  sheds get private loopback with all ports.
 
 ## Keep builds shareable
 
-- Never point agents at a shared external build directory. `target/` is inside each workspace image and already warm; an
-  external shared target restores contention and serializes builds on Cargo's per-target-directory lock.
-- Never set `CARGO_INCREMENTAL`, not even for a land check. Setting it to `1` hard-fails the sccache wrapper at Cargo's
-  version probe; setting it to `0` discards incremental compilation and makes every workspace crate a second unit. Leave
-  it unset: workspace crates stay incremental while their dependencies use the shared host cache.
-- Let `test` inherit `dev`: no `[profile.test]` overrides. `cargo test` then reuses the dependencies `cargo build`
-  compiled, and the `target/` a new workspace clones from main is warm for both.
-- Never compile `env!("CARGO_MANIFEST_DIR")` in, tests included. Cargo does not fingerprint the checkout path, so a
-  workspace runs the test binaries it cloned from main and a baked path reads main's files. Read it at run time with
-  `std::env::var_os("CARGO_MANIFEST_DIR")`, which cargo and nextest set for every test.
-- After a lockfile or toolchain bump, re-warm main's image with `cowshed exec main -- <canonical build>` so new clones
-  inherit the dependency graph.
-- Nx inside a workspace sandbox keeps its normal daemon and the checkout's own `.nx`: host shells and read-write jobs of
-  one checkout share one task database, cache and daemon, and clones inherit main's through the image. In a workspace
-  the supervisor keeps that daemon running inside the sandbox, and a host shell's Nx connects to it. A read-only job's
-  Nx state is its exec temp dir's. A repository shell that sets `NX_WORKSPACE_DATA_DIRECTORY` or `NX_CACHE_DIRECTORY`
-  keeps a value already present (`${NX_CACHE_DIRECTORY:-.nx/cache}`) and leaves `NX_DAEMON` to Nx's default.
-- The compile cache is a host daemon. Start it deliberately with `cowshed sccache start --capacity <size>`; a client
-  that spawns its own daemon silently gets sccache's 10 GiB default cap. If hits are absent, run
-  `cowshed sccache status` first.
+- Never point agents at a shared external build directory; `target/` is inside each image and warm. Never set
+  `CARGO_INCREMENTAL` (1 hard-fails the sccache wrapper; 0 makes every workspace crate a second unit) — not even for a
+  land check. Leave it unset: workspace crates stay incremental, dependencies use the shared host cache.
+- Two profiles only: `dev` (tests included) and `release`; let `test` inherit `dev`, no `[profile.test]` overrides.
+- Never compile in `env!("CARGO_MANIFEST_DIR")`, tests included: cargo does not fingerprint the path, so a cloned binary
+  baked with main's path silently reads main's files. Read `std::env::var_os("CARGO_MANIFEST_DIR")` at runtime.
+- One Nx state per checkout: host shells, sandboxed jobs and land checks of one checkout share its `.nx` cache, task
+  database and daemon (clones inherit it warm through the build volume). Never delete or redirect `.nx/workspace-data` /
+  `.nx/cache` to "clean" a shed — that splits the state and cold-starts everything.
+- Build volumes: a land's target adopts the landing shed's build volume including `.nx/cache`; `new`/`fork` reseed from
+  the source's live volume first, so a fork is warm only as of its source's last writes. Re-warm main after
+  lockfile/toolchain bumps via the land path, not by hand-copying caches.
+- sccache is a host daemon: jobs get `SCCACHE_DIR`/`SCCACHE_SERVER_UDS`/`RUSTC_WRAPPER` injected, and `setup` writes
+  sccache's config so env-less host clients use the shared store. Start it deliberately
+  (`cowshed sccache start --capacity <size>`); a self-spawned daemon silently gets the 10 GiB default. Check
+  `cowshed sccache status` (per-language hits) before debugging misses.
 
 ## Output and failures
 
-- stdout is the result; stderr is progress and guidance. Use `--json` for machine output and follow each `next:` command
-  literally instead of scraping stderr.
-- Failures: `--json` names `code` (the taxonomy) and `hint` (the next command). Do not scrape stderr or memorize process
-  exits; `cowshed --help` documents the mapping. Under `exec`, the child's status passes through.
-- A missing host volume is `environment-missing`: run `cowshed doctor`, then its `next:` command. `doctor` mutates
-  nothing.
-- `sandbox-denied` from a lifecycle verb such as `new` or `rm` whose message says "the process running cowshed is
-  sandboxed away from cowshed's store" means the shell running cowshed is itself sandboxed (the kernel answered EPERM on
-  a store path). The store is intact and no grant helps; rerun the verb from a shell whose sandbox allows writing the
-  store. Any other `sandbox-denied` names its own refusal (a grant that would intersect a protected root, a shell input
-  that escapes the workspace): follow its hint.
-- "the cowshed daemon is build X; this cowshed is build Y" means the daemon and this `cowshed` are different builds. The
-  command stopped before changing anything. Run `cowshed setup` from the cowshed you mean to use, then retry.
+- stdout is the result; stderr is progress/guidance. Use `--json` for machine output; follow each `next:` command
+  literally instead of scraping stderr. Exit codes (docs/cli.md): 2 usage, 3 not-found, 4 conflict, 5
+  environment-missing, 6 sandbox-denied, 7 integrity; exec passes the child's status through (wrapper failures 100–106).
+- Exit 6 is a negotiation, not a retry: surface the named `next:` grant to the operator/coordinator; filesystem grants
+  apply from the next exec. A `sandbox-denied` on a lifecycle verb saying this process is "sandboxed away from cowshed's
+  store" means your shell is sandboxed — no grant helps; rerun from an unsandboxed shell.
+- Attach failures with `AttachPoolExhausted` / error 150: run `cowshed doctor`. Leaked `AppleDiskImageDevice`s free only
+  on reboot; orphaned `diskimagesiod` helpers are freed by the `sudo kill -9` doctor names, then
+  `attach-budget --clear`. Detaching sheds does not free leaked devices — do not retry-spawn into a spent pool.
+- "the cowshed daemon is build X; this cowshed is build Y": run `cowshed setup` from the build you mean, then retry.
