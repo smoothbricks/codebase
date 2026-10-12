@@ -99,7 +99,8 @@
           "{projectRoot}/crates/cowshed-napi/src/operations.generated.rs",
           "{projectRoot}/crates/cowshed-core/src/api/served.generated.rs",
           "{projectRoot}/crates/cowshed-core/src/runtime/process_span_columns.generated.rs",
-          "{projectRoot}/crates/cowshed-core/src/runtime/job_unattributed_columns.generated.rs"
+          "{projectRoot}/crates/cowshed-core/src/runtime/job_unattributed_columns.generated.rs",
+          "{projectRoot}/crates/cowshed-core/src/runtime/job_boundary_columns.generated.rs"
         ],
         "options": {
           "command": "packages/cowshed/.cache/api-generator/cowshed-api-gen write packages/cowshed",
@@ -129,6 +130,7 @@
           "{projectRoot}/crates/cowshed-core/src/api/served.generated.rs",
           "{projectRoot}/crates/cowshed-core/src/runtime/process_span_columns.generated.rs",
           "{projectRoot}/crates/cowshed-core/src/runtime/job_unattributed_columns.generated.rs",
+          "{projectRoot}/crates/cowshed-core/src/runtime/job_boundary_columns.generated.rs",
           "cargoToolchain",
           {
             "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh rustc -vV"

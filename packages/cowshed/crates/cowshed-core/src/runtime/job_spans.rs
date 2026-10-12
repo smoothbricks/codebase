@@ -16,9 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use arrow_array::{
-    ArrayRef, Int64Array, RecordBatch, StringArray, UInt16Array, UInt32Array, UInt64Array,
-};
+use arrow_array::{ArrayRef, RecordBatch, StringArray, UInt64Array};
 use arrow_schema::{DataType, Field};
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
@@ -32,9 +30,7 @@ use crate::error::CowshedError;
 use crate::host_load::HostLoadError;
 use crate::metadata::WorkspaceIncarnation;
 use crate::repository::RepoId;
-use crate::runtime::job_boundary::{
-    JobSpanBoundary, boundary_host, charged_memory_values, volume_deltas,
-};
+use crate::runtime::job_boundary::{BoundaryColumns, JobSpanBoundary, boundary_columns};
 use crate::runtime::job_unattributed::{UnattributedSpanRow, seal_unattributed_row};
 use crate::runtime::process_spans::{ProcessSpanError, ProcessSpanRow, seal_process_row};
 use crate::storage::job_artifact::state_name;
@@ -140,7 +136,7 @@ struct JobSpanRow {
     job_id: JobId,
     grant_revision: u64,
     edge: JobSpanEdge,
-    boundary: Option<PreparedBoundary>,
+    boundary: Option<BoundaryColumns>,
 }
 
 enum Request {
@@ -158,35 +154,6 @@ enum JobSpanError {
     BeyondNanoseconds,
     #[error(transparent)]
     Segment(#[from] TraceSegmentError),
-}
-
-struct PreparedBoundary {
-    load1_milli: u32,
-    cores: u16,
-    disk_ws: Option<i64>,
-    disk_build: Option<i64>,
-    charged_current: Option<u64>,
-    charged_peak: Option<u64>,
-}
-
-impl PreparedBoundary {
-    fn from_observation(
-        host: HostLoadSample,
-        volumes: &JobVolumeUsage,
-        charged: Option<ChargedMemoryUsage>,
-    ) -> Result<Self, crate::api::resources::ResourceUnitError> {
-        let (load1_milli, cores) = boundary_host(host)?;
-        let (disk_ws, disk_build) = volume_deltas(volumes);
-        let (charged_current, charged_peak) = charged_memory_values(charged);
-        Ok(Self {
-            load1_milli,
-            cores,
-            disk_ws,
-            disk_build,
-            charged_current,
-            charged_peak,
-        })
-    }
 }
 
 /// The queue into one supervisor's job-span writer. Clones share the writer and its health.
@@ -334,7 +301,7 @@ impl JobSpanPublisher {
         volumes: &JobVolumeUsage,
         charged: Option<ChargedMemoryUsage>,
     ) {
-        let prepared = match PreparedBoundary::from_observation(host, volumes, charged) {
+        let prepared = match BoundaryColumns::from_observation(host, volumes, charged) {
             Ok(prepared) => prepared,
             Err(error) => {
                 refuse(&self.health, error.to_string());
@@ -362,7 +329,7 @@ impl JobSpanPublisher {
         &self,
         info: &JobInfo,
         edge: JobSpanEdge,
-        boundary: Option<PreparedBoundary>,
+        boundary: Option<BoundaryColumns>,
     ) -> JobSpanRow {
         JobSpanRow {
             at: SystemTime::now(),
@@ -506,7 +473,7 @@ fn job_span_batch(row: &JobSpanRow, timestamp_ns: i64) -> Result<RecordBatch, Tr
     })?;
     let w3c_span_id = u64::from_str_radix(row.trace.span_id.as_str(), 16)
         .expect("a SpanId is exactly 16 lowercase hex digits");
-    let custom: Vec<(Field, ArrayRef)> = vec![
+    let custom: [(Field, ArrayRef); 6] = [
         (
             Field::new("repo_id", DataType::Utf8, false),
             Arc::new(StringArray::from(vec![row.repo_id.as_str()])),
@@ -531,44 +498,14 @@ fn job_span_batch(row: &JobSpanRow, timestamp_ns: i64) -> Result<RecordBatch, Tr
             Field::new("job_state", DataType::Utf8, true),
             Arc::new(StringArray::from(vec![row.edge.state().map(state_name)])),
         ),
-        (
-            Field::new("disk_ws_delta_bytes", DataType::Int64, true),
-            Arc::new(Int64Array::from(vec![
-                row.boundary.as_ref().and_then(|b| b.disk_ws),
-            ])),
-        ),
-        (
-            Field::new("disk_build_delta_bytes", DataType::Int64, true),
-            Arc::new(Int64Array::from(vec![
-                row.boundary.as_ref().and_then(|b| b.disk_build),
-            ])),
-        ),
-        (
-            Field::new("load1_milli", DataType::UInt32, true),
-            Arc::new(UInt32Array::from(vec![
-                row.boundary.as_ref().map(|b| b.load1_milli),
-            ])),
-        ),
-        (
-            Field::new("cores", DataType::UInt16, true),
-            Arc::new(UInt16Array::from(vec![
-                row.boundary.as_ref().map(|b| b.cores),
-            ])),
-        ),
-        (
-            Field::new("charged_memory_current_bytes", DataType::UInt64, true),
-            Arc::new(UInt64Array::from(vec![
-                row.boundary.as_ref().and_then(|b| b.charged_current),
-            ])),
-        ),
-        (
-            Field::new("charged_memory_peak_bytes", DataType::UInt64, true),
-            Arc::new(UInt64Array::from(vec![
-                row.boundary.as_ref().and_then(|b| b.charged_peak),
-            ])),
-        ),
     ];
-    trace_batch(system, custom)
+    trace_batch(
+        system,
+        custom
+            .into_iter()
+            .chain(boundary_columns(row.boundary.unwrap_or_default())?)
+            .collect(),
+    )
 }
 
 #[cfg(test)]

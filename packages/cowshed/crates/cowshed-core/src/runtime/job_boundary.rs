@@ -3,13 +3,22 @@
 //! These columns belong only on the job span. A process span that carries one fails
 //! [`crate::runtime::process_spans::read_process_segment`].
 
+use std::sync::Arc;
+
+use arrow_array::cast::AsArray;
+use arrow_array::types::{ArrowPrimitiveType, Int64Type, UInt16Type, UInt32Type, UInt64Type};
+use arrow_array::{
+    Array, ArrayRef, Int64Array, RecordBatch, UInt16Array, UInt32Array, UInt64Array,
+};
 use arrow_schema::{DataType, Field};
+use thiserror::Error;
 
 use crate::api::resources::{
     ChargedMemoryUsage, HostLoad1, HostLoadSample, JobVolumeUsage, ResourceUnitError, VolumeUsage,
 };
 use crate::host_load::HostLoadError;
 use crate::runtime::volume_usage::{HostVolume, HostVolumeStat, VolumeBaseline};
+use crate::storage::trace_segment::TraceSegmentError;
 
 /// Nearest milliload. Non-finite, negative, and overflowing loads are refused, never truncated.
 pub fn milliload(load: HostLoad1) -> Result<u32, ResourceUnitError> {
@@ -51,14 +60,154 @@ fn delta(usage: &VolumeUsage) -> Option<i64> {
     }
 }
 
-/// The job-only columns. Process spans do not declare these names.
-pub fn job_boundary_fields() -> Vec<Field> {
-    vec![
-        Field::new("disk_ws_delta_bytes", DataType::Int64, true),
-        Field::new("disk_build_delta_bytes", DataType::Int64, true),
-        Field::new("load1_milli", DataType::UInt32, true),
-        Field::new("cores", DataType::UInt16, true),
-    ]
+/// The one declaration of the six job-only observation columns.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(
+    any(),
+    cowshed_api(
+        arrow_columns = "job_boundary",
+        fields = "job_boundary_fields",
+        error = "BoundaryColumnError"
+    )
+)]
+pub struct BoundaryColumns {
+    #[cfg_attr(any(), cowshed_api(arrow = "int64"))]
+    pub disk_ws_delta_bytes: Option<i64>,
+    #[cfg_attr(any(), cowshed_api(arrow = "int64"))]
+    pub disk_build_delta_bytes: Option<i64>,
+    #[cfg_attr(any(), cowshed_api(arrow = "uint32"))]
+    pub load1_milli: Option<u32>,
+    #[cfg_attr(any(), cowshed_api(arrow = "uint16"))]
+    pub cores: Option<u16>,
+    #[cfg_attr(any(), cowshed_api(arrow = "uint64"))]
+    pub charged_memory_current_bytes: Option<u64>,
+    #[cfg_attr(any(), cowshed_api(arrow = "uint64"))]
+    pub charged_memory_peak_bytes: Option<u64>,
+}
+
+impl BoundaryColumns {
+    pub(crate) fn from_observation(
+        host: HostLoadSample,
+        volumes: &JobVolumeUsage,
+        charged: Option<ChargedMemoryUsage>,
+    ) -> Result<Self, ResourceUnitError> {
+        let (load1_milli, cores) = boundary_host(host)?;
+        let (disk_ws_delta_bytes, disk_build_delta_bytes) = volume_deltas(volumes);
+        let (charged_memory_current_bytes, charged_memory_peak_bytes) =
+            charged_memory_values(charged);
+        Ok(Self {
+            disk_ws_delta_bytes,
+            disk_build_delta_bytes,
+            load1_milli: Some(load1_milli),
+            cores: Some(cores),
+            charged_memory_current_bytes,
+            charged_memory_peak_bytes,
+        })
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum BoundaryColumnError {
+    #[error("job boundary does not have the declared fixed schema")]
+    Schema,
+}
+
+include!("job_boundary_columns.generated.rs");
+
+pub(crate) fn boundary_columns(
+    columns: BoundaryColumns,
+) -> Result<impl Iterator<Item = (Field, ArrayRef)>, TraceSegmentError> {
+    Ok(job_boundary_fields()
+        .into_iter()
+        .zip(encode_job_boundary_columns(&columns)?))
+}
+
+/// Read the exact boundary suffix of one row; the caller owns the preceding columns.
+pub fn read_boundary_columns(
+    batch: &RecordBatch,
+    start: usize,
+) -> Result<BoundaryColumns, BoundaryColumnError> {
+    let expected = job_boundary_fields();
+    let schema = batch.schema();
+    if batch.num_rows() != 1
+        || start.checked_add(JOB_BOUNDARY_COLUMN_COUNT) != Some(schema.fields().len())
+        || !schema
+            .fields()
+            .iter()
+            .skip(start)
+            .map(AsRef::as_ref)
+            .eq(expected.iter())
+    {
+        return Err(BoundaryColumnError::Schema);
+    }
+    decode_job_boundary_columns(batch, start)
+}
+
+fn int64(value: Option<i64>) -> ArrayRef {
+    Arc::new(Int64Array::from(vec![value]))
+}
+
+fn uint16(value: Option<u16>) -> ArrayRef {
+    Arc::new(UInt16Array::from(vec![value]))
+}
+
+fn uint32(value: Option<u32>) -> ArrayRef {
+    Arc::new(UInt32Array::from(vec![value]))
+}
+
+fn uint64(value: Option<u64>) -> ArrayRef {
+    Arc::new(UInt64Array::from(vec![value]))
+}
+
+fn scalar<T: ArrowPrimitiveType>(
+    batch: &RecordBatch,
+    start: usize,
+    name: &str,
+) -> Result<Option<T::Native>, BoundaryColumnError> {
+    let index = batch
+        .schema()
+        .index_of(name)
+        .map_err(|_| BoundaryColumnError::Schema)?;
+    if index < start {
+        return Err(BoundaryColumnError::Schema);
+    }
+    let values = batch
+        .column(index)
+        .as_primitive_opt::<T>()
+        .ok_or(BoundaryColumnError::Schema)?;
+    Ok(values.is_valid(0).then(|| values.value(0)))
+}
+
+fn optional_i64(
+    batch: &RecordBatch,
+    start: usize,
+    name: &str,
+) -> Result<Option<i64>, BoundaryColumnError> {
+    scalar::<Int64Type>(batch, start, name)
+}
+
+fn optional_u16(
+    batch: &RecordBatch,
+    start: usize,
+    name: &str,
+) -> Result<Option<u16>, BoundaryColumnError> {
+    scalar::<UInt16Type>(batch, start, name)
+}
+
+fn optional_u32(
+    batch: &RecordBatch,
+    start: usize,
+    name: &str,
+) -> Result<Option<u32>, BoundaryColumnError> {
+    scalar::<UInt32Type>(batch, start, name)
+}
+
+fn optional_u64(
+    batch: &RecordBatch,
+    start: usize,
+    name: &str,
+) -> Result<Option<u64>, BoundaryColumnError> {
+    scalar::<UInt64Type>(batch, start, name)
 }
 
 /// Host, volume, and charged-memory facts for one job-span start or end.
@@ -87,15 +236,6 @@ pub fn sample_job_boundary(
     })
 }
 
-/// Charged-memory columns for the job span only. Absent when the accounting source has no
-/// charged-memory counter, never written into an RSS column.
-pub fn charged_memory_fields() -> Vec<Field> {
-    vec![
-        Field::new("charged_memory_current_bytes", DataType::UInt64, true),
-        Field::new("charged_memory_peak_bytes", DataType::UInt64, true),
-    ]
-}
-
 pub fn charged_memory_values(
     charged: Option<crate::api::resources::ChargedMemoryUsage>,
 ) -> (Option<u64>, Option<u64>) {
@@ -119,6 +259,78 @@ mod tests {
     use super::*;
     use crate::api::resources::{HostCores, VolumeUnavailable, VolumeUsedBytesDelta};
     use crate::runtime::process_spans::process_custom_fields;
+
+    #[test]
+    fn generated_boundary_columns_round_trip_signed_bytes_and_absence() {
+        let volumes = JobVolumeUsage {
+            workspace: VolumeUsage::Read {
+                delta_bytes: VolumeUsedBytesDelta::new(-4096).unwrap(),
+            },
+            build: None,
+        };
+        let columns = BoundaryColumns::from_observation(
+            HostLoadSample::new(1.2345, u16::MAX).unwrap(),
+            &volumes,
+            None,
+        )
+        .unwrap();
+        assert_eq!(columns.disk_ws_delta_bytes, Some(-4096));
+        assert_eq!(columns.disk_build_delta_bytes, None);
+        assert_eq!(columns.load1_milli, Some(1235));
+        assert_eq!(columns.cores, Some(u16::MAX));
+        assert_eq!(columns.charged_memory_current_bytes, None);
+        assert_eq!(columns.charged_memory_peak_bytes, None);
+        for columns in [columns, BoundaryColumns::default()] {
+            let batch = RecordBatch::try_new(
+                Arc::new(arrow_schema::Schema::new(job_boundary_fields())),
+                encode_job_boundary_columns(&columns).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(batch.num_columns(), 6);
+            assert_eq!(read_boundary_columns(&batch, 0).unwrap(), columns);
+        }
+    }
+
+    #[test]
+    fn generated_boundary_schema_rejects_a_widened_core_or_extra_column() {
+        let columns = BoundaryColumns {
+            cores: Some(8),
+            charged_memory_current_bytes: Some(4096),
+            charged_memory_peak_bytes: Some(8192),
+            ..BoundaryColumns::default()
+        };
+        let mut fields = job_boundary_fields();
+        let mut arrays = encode_job_boundary_columns(&columns).unwrap();
+        let batch = RecordBatch::try_new(
+            Arc::new(arrow_schema::Schema::new(fields.clone())),
+            arrays.clone(),
+        )
+        .unwrap();
+        assert_eq!(read_boundary_columns(&batch, 0).unwrap(), columns);
+        let cores = fields
+            .iter()
+            .position(|field| field.name() == "cores")
+            .unwrap();
+        fields[cores] = Field::new("cores", DataType::UInt32, true);
+        arrays[cores] = uint32(Some(8));
+        let widened =
+            RecordBatch::try_new(Arc::new(arrow_schema::Schema::new(fields)), arrays).unwrap();
+        assert!(matches!(
+            read_boundary_columns(&widened, 0),
+            Err(BoundaryColumnError::Schema)
+        ));
+
+        let mut fields = job_boundary_fields();
+        let mut arrays = encode_job_boundary_columns(&columns).unwrap();
+        fields.push(Field::new("process_specific_usage", DataType::UInt64, true));
+        arrays.push(uint64(Some(4096)));
+        let extra =
+            RecordBatch::try_new(Arc::new(arrow_schema::Schema::new(fields)), arrays).unwrap();
+        assert!(matches!(
+            read_boundary_columns(&extra, 0),
+            Err(BoundaryColumnError::Schema)
+        ));
+    }
 
     #[test]
     fn milliload_rounds_to_nearest_and_refuses_overflow() {
