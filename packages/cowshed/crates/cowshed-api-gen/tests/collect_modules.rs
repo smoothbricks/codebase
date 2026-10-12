@@ -209,7 +209,7 @@ struct Scratch(PathBuf);
 
 impl Scratch {
     fn copy_of(project: &Path) -> Self {
-        let root = Path::new("/tmp").join(format!(
+        let root = std::env::temp_dir().join(format!(
             "cowshed-api-gen-collect-{}-{}",
             std::process::id(),
             SCRATCHES.fetch_add(1, Ordering::Relaxed)

@@ -98,6 +98,9 @@ No mounts, no root, no network — pure functions with table-driven cases:
   project live in the package's ignored `.cache/`, preserving the owning Typia/dependency lookup while remaining outside
   strict source scanners. A live-clone inventory control retains the real bootstrap source and excludes the temporary
   copy. The focused target runs Biome and ESLint before the admission oracle.
+  - **API generator source mutations:** module-collection and N-API projection fixtures copy declarations under
+    std::env::temp_dir(), honoring the workspace TMPDIR contract in 04_sandbox.md. They run inside the worker sandbox
+    without write authority to a world-shared temporary directory.
 - **Authoritative cwd resolution and env wiring**: fake-host/router tables cover deeply nested cwd success, detached and
   cross-project refusal, malicious marker-only refusal, and overlapping active-mount ambiguity, plus macOS/Linux
   `PortBlock` presence. Capability-wire tests freeze `project.workspaceAt` and reject local CLI inference.
