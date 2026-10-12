@@ -2817,7 +2817,7 @@ async fn directory_a_foreign_database_opener_skips_adoption_with_its_pid_and_arg
 /// A host process outside every cowshed and Nx protocol holding a file of the landing volume open
 /// (as an indexer's MCP server holds its SQLite index) refuses the seal, so main keeps its
 /// previous seed; the swap still runs, the re-run check hits on the adopted volume, and once the
-/// holder lets go `cowshed reseed main` refreezes the seed from it (16_build_volumes.md, Land
+/// holder lets go, the next fork refreezes the seed from it (16_build_volumes.md, Land
 /// step 5.6).
 #[tokio::test]
 async fn directory_a_landing_volume_holder_keeps_the_previous_seed_and_the_land_still_adopts_substrate_lifecycle()
@@ -2889,20 +2889,14 @@ async fn directory_a_landing_volume_holder_keeps_the_previous_seed_and_the_land_
     );
 
     drop(holder);
-    let (stdout, stderr) = succeed(&mut service, ["--json", "reseed", "main"]).await;
-    let envelope: JsonEnvelope<ReseedResult> = serde_json::from_slice(&stdout)
-        .unwrap_or_else(|error| panic!("reseed --json ({error}): {stderr}"));
-    let reseeded = envelope.result().cloned().expect("a reseed result");
-    assert!(
-        matches!(reseeded.outcome, Reseed::Reseeded { .. }),
-        "{reseeded:?}"
-    );
+    // The next fork reseeds main (Fork step 2) now that the holder has let go.
+    new_workspace(&mut service, "after").await;
     let [(seed, record)] = seeds_of_main(&layout).try_into().expect("one seed of main");
-    assert_ne!(seed, previous_seed, "the reseed replaced the kept seed");
+    assert_ne!(seed, previous_seed, "the next fork refreezes the kept seed");
     assert_eq!(
         record.tree.as_ref().map(|tree| tree.as_str()),
         Some(landed_tree.as_str()),
-        "the reseed records the tree main adopted"
+        "the refrozen seed records the tree main adopted"
     );
     service.shutdown().await.expect("stop the runtime");
     fixture.stop_gateway().await;
@@ -2949,7 +2943,7 @@ async fn directory_a_job_running_across_an_adoption_keeps_its_volume_and_later_j
     assert_eq!(linked_volume(&layout, &fixture.checkout), landing);
     let new_mount = layout.mount(&landing);
 
-    // `new w` reseeded main from the volume the job writes, so the adopted volume may hold a
+    // `fork w` reseeded main from the volume the job writes, so the adopted volume may hold a
     // copy of the ticks as they were then; the job itself never writes it.
     let copied = new_mount.join("target/ticking/ticks");
     let copied_at_swap = file_len(&copied);
