@@ -1,6 +1,7 @@
 {
   "version": 1,
   "files": {
+    "src/nx-daemon-validity.test.ts": 58181,
     "src/nextest-partitions.test.ts": 22440,
     "src/nx-daemon-idle-policy.test.ts": 21440,
     "src/cargo-resolve-cache.test.ts": 15694,
@@ -57,6 +58,7 @@
     "src/managed-files/tree-permissions.test.ts": 21,
     "src/test-program.test.ts": 21,
     "src/host-controller-wiring.test.ts": 19,
+    "src/nx-daemon-idle-cpu.test.ts": 17,
     "src/managed-files/tree.test.ts": 15,
     "src/executors/bounded-exec/ram-temp-held.test.ts": 14,
     "src/executors/clean-outputs/executor.test.ts": 14,

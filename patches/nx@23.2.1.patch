@@ -572,11 +572,196 @@ index 0051f7f97f0d9c05341f8cbaa7f51eb851051077..00000000000000000000000000000000
 -        description: 'handleGetEstimatedTaskTimings',
 -    };
 -}
+diff --git a/dist/src/daemon/server/project-graph-incremental-recomputation.js b/dist/src/daemon/server/project-graph-incremental-recomputation.js
+index c2a2f8f70fe71940e47c97931c5925bac1fbd480..39582a8fc342ae59decd3d4ca25179f2bc478691 100644
+--- a/dist/src/daemon/server/project-graph-incremental-recomputation.js
++++ b/dist/src/daemon/server/project-graph-incremental-recomputation.js
+@@ -27,6 +27,7 @@ const file_watcher_sockets_1 = require("./file-watching/file-watcher-sockets");
+ const project_graph_listener_sockets_1 = require("./project-graph-listener-sockets");
+ const watcher_1 = require("./watcher");
+ const logger_1 = require("../logger");
++const restart_checks_1 = require("./restart-checks");
+ let cachedSerializedProjectGraphPromise;
+ // Maps file path to a version counter that increments on each modification.
+ // This lets us detect mid-flight re-modifications when clearing processed files.
+@@ -241,6 +242,11 @@ function scheduleProjectGraphRecomputation(createdFiles, updatedFiles, deletedFi
+         : {};
+     perf_hooks_1.performance.mark('hash-watched-changes-end');
+     perf_hooks_1.performance.measure('hash changed files from watcher', 'hash-watched-changes-start', 'hash-watched-changes-end');
++    const changedPaths = Object.keys(changedFileHashes);
++    if ((0, restart_checks_1.restartDaemonIfLockFilesChanged)(changedPaths) ||
++        (0, restart_checks_1.restartDaemonIfLockFilesChanged)(deletedFiles)) {
++        return;
++    }
+     for (const [f, hash] of Object.entries(changedFileHashes)) {
+         collectedDeletedFiles.delete(f);
+         collectedUpdatedFiles.set(f, { version: fileChangeCounter, hash });
+@@ -251,7 +257,7 @@ function scheduleProjectGraphRecomputation(createdFiles, updatedFiles, deletedFi
+     }
+     // The native watcher already coalesces a burst of events into one batch,
+     // so socket + listener notifications dispatch immediately.
+-    if (Object.keys(changedFileHashes).length > 0 || deletedFiles.length > 0) {
++    if (changedPaths.length > 0 || deletedFiles.length > 0) {
+         (0, file_change_events_1.notifyFileChangeListeners)({ createdFiles, updatedFiles, deletedFiles });
+         (0, file_watcher_sockets_1.notifyFileWatcherSockets)(createdFiles, updatedFiles, deletedFiles);
+         // Bump generation synchronously so any in-flight compute fails its
+diff --git a/node_modules/nx/dist/src/daemon/server/restart-checks.d.ts b/dist/src/daemon/server/restart-checks.d.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..65660f0d5f7789d64ad26b0a9644f23949e79831
+--- /dev/null
++++ b/dist/src/daemon/server/restart-checks.d.ts
+@@ -0,0 +1,9 @@
++import type { Server, Socket } from 'net';
++import type { WatchEvent } from '../../native';
++export declare const DAEMON_VALIDITY_SAFETY_INTERVAL_MS = 5000;
++export declare const relativeServerProcess: string;
++export declare function registerDaemonForRestartChecks(server: Server, sockets: Iterable<Socket>, socketPath: string): void;
++export declare function recordLockFileHash(): void;
++export declare function restartDaemonIfLockFilesChanged(paths: string[]): boolean;
++export declare function stopDaemonIfReplaced(events: WatchEvent[]): boolean;
++export declare function stopDaemonIfOutdated(): boolean;
+diff --git a/node_modules/nx/dist/src/daemon/server/restart-checks.js b/dist/src/daemon/server/restart-checks.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..e45f9d2c918a1d33b6ebb29be76dfb2eecd37b45
+--- /dev/null
++++ b/dist/src/daemon/server/restart-checks.js
+@@ -0,0 +1,113 @@
++"use strict";
++Object.defineProperty(exports, "__esModule", { value: true });
++exports.relativeServerProcess = exports.DAEMON_VALIDITY_SAFETY_INTERVAL_MS = void 0;
++exports.registerDaemonForRestartChecks = registerDaemonForRestartChecks;
++exports.recordLockFileHash = recordLockFileHash;
++exports.restartDaemonIfLockFilesChanged = restartDaemonIfLockFilesChanged;
++exports.stopDaemonIfReplaced = stopDaemonIfReplaced;
++exports.stopDaemonIfOutdated = stopDaemonIfOutdated;
++const fs_1 = require("fs");
++const path_1 = require("path");
++const file_hasher_1 = require("../../hasher/file-hasher");
++const native_1 = require("../../native");
++const path_2 = require("../../utils/path");
++const workspace_root_1 = require("../../utils/workspace-root");
++const cache_1 = require("../cache");
++const is_nx_version_mismatch_1 = require("../is-nx-version-mismatch");
++const logger_1 = require("../logger");
++const socket_utils_1 = require("../socket-utils");
++const shutdown_utils_1 = require("./shutdown-utils");
++// Adapted from nrwl/nx#37113. Kept apart from server.js: importing it starts a server.
++let daemon;
++let terminating = false;
++function registerDaemonForRestartChecks(server, sockets, socketPath) {
++    daemon = { server, sockets, socketPath };
++    terminating = false;
++}
++exports.DAEMON_VALIDITY_SAFETY_INTERVAL_MS = 5000;
++exports.relativeServerProcess = (0, path_2.normalizePath)((0, path_1.relative)(workspace_root_1.workspaceRoot, cache_1.serverProcessJsonPath));
++const LOCK_FILE_NAMES = ['package-lock.json', 'yarn.lock', 'pnpm-lock.yaml', 'bun.lockb', 'bun.lock'];
++const lockFiles = LOCK_FILE_NAMES.map((name) => (0, path_1.join)(workspace_root_1.workspaceRoot, name));
++let lockFileHash;
++function hashLockFiles() {
++    // Include the names so a missed rename between two lockfile formats is visible.
++    const hashes = [];
++    for (let i = 0; i < lockFiles.length; i++) {
++        if ((0, fs_1.existsSync)(lockFiles[i])) {
++            hashes.push(LOCK_FILE_NAMES[i], (0, native_1.hashFile)(lockFiles[i]));
++        }
++    }
++    return (0, file_hasher_1.hashArray)(hashes);
++}
++function recordLockFileHash() {
++    lockFileHash = hashLockFiles();
++}
++function lockFileHashChanged() {
++    const newHash = hashLockFiles();
++    if (lockFileHash !== undefined && newHash !== lockFileHash) {
++        logger_1.serverLogger.log(`[Server] lock file hash changed! old=${lockFileHash}, new=${newHash}`);
++        lockFileHash = newHash;
++        return true;
++    }
++    lockFileHash = newHash;
++    return false;
++}
++// Applied paths have been hashed by the native workspace context; same-byte
++// rewrites were dropped already. No lockfile is read on this watcher path.
++function restartDaemonIfLockFilesChanged(paths) {
++    if (!paths.some((path) => LOCK_FILE_NAMES.includes(path))) {
++        return false;
++    }
++    restartDaemon('LOCK_FILES_CHANGED');
++    return true;
++}
++function stopDaemonIfReplaced(events) {
++    if (terminating) return true;
++    // Pinned Nx 23.2.1 reports create/update/delete, not upstream's rescan event.
++    // The safety interval covers missed ownership events on this version.
++    const replaced = events.some((event) => event.path === exports.relativeServerProcess && isReplaced());
++    if (replaced) {
++        stopDaemon('this process is no longer the current daemon (native)');
++    }
++    return replaced;
++}
++// Once per request, including long-lived sockets, and on the slow safety poll.
++// The socket guard uses the inode captured at bind, never a client's environment.
++function stopDaemonIfOutdated() {
++    if (terminating) return true;
++    if (isReplaced()) {
++        stopDaemon('this process is no longer the current daemon (native)');
++        return true;
++    }
++    if ((0, socket_utils_1.ownSocketState)() === 'lost') {
++        stopDaemon(`its socket ${daemon.socketPath} was removed or replaced, so no client can reach it`);
++        return true;
++    }
++    if ((0, is_nx_version_mismatch_1.isNxVersionMismatch)()) {
++        logger_1.serverLogger.log('[Server] Daemon outdated: NX_VERSION_CHANGED');
++        stopDaemon('NX_VERSION_CHANGED');
++        return true;
++    }
++    if (lockFileHashChanged()) {
++        restartDaemon('LOCK_FILES_CHANGED');
++        return true;
++    }
++    return false;
++}
++function isReplaced() {
++    return (0, cache_1.getDaemonProcessIdSync)() !== process.pid;
++}
++function stopDaemon(reason) {
++    if (!daemon || terminating) return;
++    terminating = true;
++    (0, shutdown_utils_1.handleServerProcessTermination)({ server: daemon.server, reason, sockets: daemon.sockets });
++}
++function restartDaemon(reason) {
++    if (!daemon || terminating) return;
++    // Do not spawn multiple replacements or answer queued requests while the
++    // asynchronous restart releases ownership and starts the successor.
++    terminating = true;
++    logger_1.serverLogger.log(`[Server] Daemon outdated: ${reason}`);
++    logger_1.serverLogger.log('[Server] Restarting daemon...');
++    (0, shutdown_utils_1.handleServerProcessTerminationWithRestart)({ server: daemon.server, reason, sockets: daemon.sockets });
++}
 diff --git a/dist/src/daemon/server/server.js b/dist/src/daemon/server/server.js
-index b1c143e244efd435b28642ed86e999d6c86f7d94..57925ac7a79a16756e6af51d6ead4b5f019ec821 100644
+index b1c143e244efd435b28642ed86e999d6c86f7d94..9939d13d2845b63af8dfdfbba08a01d3832fe34d 100644
 --- a/dist/src/daemon/server/server.js
 +++ b/dist/src/daemon/server/server.js
-@@ -34,7 +34,6 @@ const hash_glob_1 = require("../message-types/hash-glob");
+@@ -7,17 +7,13 @@ const fs_1 = require("fs");
+ const permission_errors_1 = require("../../utils/permission-errors");
+ const socket_refused_exit_code_1 = require("../../utils/socket-refused-exit-code");
+ const net_1 = require("net");
+-const path_1 = require("path");
+ const analytics_1 = require("../../analytics");
+-const file_hasher_1 = require("../../hasher/file-hasher");
+-const native_1 = require("../../native");
+ const consume_messages_from_socket_1 = require("../../utils/consume-messages-from-socket");
+ require("../../utils/perf-logging");
+ const versions_1 = require("../../utils/versions");
+ const workspace_context_1 = require("../../utils/workspace-context");
+ const workspace_root_1 = require("../../utils/workspace-root");
+ const cache_1 = require("../cache");
+-const is_nx_version_mismatch_1 = require("../is-nx-version-mismatch");
+ const installed_nx_version_1 = require("../../utils/installed-nx-version");
+ const logger_1 = require("../logger");
+ const configure_ai_agents_1 = require("../message-types/configure-ai-agents");
+@@ -34,7 +30,6 @@ const hash_glob_1 = require("../message-types/hash-glob");
  const nx_console_1 = require("../message-types/nx-console");
  const register_project_graph_listener_1 = require("../message-types/register-project-graph-listener");
  const run_tasks_execution_hooks_1 = require("../message-types/run-tasks-execution-hooks");
@@ -584,7 +769,7 @@ index b1c143e244efd435b28642ed86e999d6c86f7d94..57925ac7a79a16756e6af51d6ead4b5f
  const update_workspace_context_1 = require("../message-types/update-workspace-context");
  const socket_utils_1 = require("../socket-utils");
  const file_change_events_1 = require("./file-watching/file-change-events");
-@@ -57,7 +56,6 @@ const handle_outputs_tracking_1 = require("./handle-outputs-tracking");
+@@ -57,7 +52,6 @@ const handle_outputs_tracking_1 = require("./handle-outputs-tracking");
  const handle_process_in_background_1 = require("./handle-process-in-background");
  const handle_request_project_graph_1 = require("./handle-request-project-graph");
  const handle_request_shutdown_1 = require("./handle-request-shutdown");
@@ -592,7 +777,15 @@ index b1c143e244efd435b28642ed86e999d6c86f7d94..57925ac7a79a16756e6af51d6ead4b5f
  const handle_tasks_execution_hooks_1 = require("./handle-tasks-execution-hooks");
  const handle_update_workspace_context_1 = require("./handle-update-workspace-context");
  const handle_outputs_changes_1 = require("./handle-outputs-changes");
-@@ -97,6 +95,9 @@ const server = (0, net_1.createServer)(async (socket) => {
+@@ -66,6 +60,7 @@ const project_graph_listener_sockets_1 = require("./project-graph-listener-socke
+ const shutdown_utils_1 = require("./shutdown-utils");
+ const sync_generators_1 = require("./sync-generators");
+ const watcher_1 = require("./watcher");
++const restart_checks_1 = require("./restart-checks");
+ let workspaceWatcherError;
+ global.NX_DAEMON = true;
+ process.env.NX_DAEMON_PROCESS = 'true';
+@@ -97,6 +92,9 @@ const server = (0, net_1.createServer)(async (socket) => {
          numberOfOpenConnections -= 1;
          exports.openSockets.delete(socket);
          logger_1.serverLogger.log(`Closed a connection. Number of open connections: ${numberOfOpenConnections}`);
@@ -602,7 +795,19 @@ index b1c143e244efd435b28642ed86e999d6c86f7d94..57925ac7a79a16756e6af51d6ead4b5f
          (0, file_watcher_sockets_1.removeRegisteredFileWatcherSocket)(socket);
          (0, project_graph_listener_sockets_1.removeRegisteredProjectGraphListenerSocket)(socket);
      });
-@@ -185,15 +186,6 @@ async function handleMessage(socket, data) {
+@@ -134,6 +132,11 @@ async function handleMessage(socket, data) {
+             return;
+         }
+     }
++    // Check every request, including requests on a long-lived connection.
++    // Shutdown closes this socket; the client reconnects to the next daemon.
++    if ((0, restart_checks_1.stopDaemonIfOutdated)()) {
++        return;
++    }
+     if ((0, daemon_message_1.isDaemonMessage)(payload) && payload.env) {
+         await (0, handle_client_env_1.handleClientEnv)(payload.env);
+     }
+@@ -185,15 +188,6 @@ async function handleMessage(socket, data) {
      else if ((0, hash_glob_1.isHandleHashMultiGlobMessage)(payload)) {
          await handleResult(socket, hash_glob_1.HASH_GLOB, () => (0, handle_hash_glob_1.handleHashMultiGlob)(payload.globGroups), mode);
      }
@@ -618,7 +823,7 @@ index b1c143e244efd435b28642ed86e999d6c86f7d94..57925ac7a79a16756e6af51d6ead4b5f
      else if ((0, force_shutdown_1.isHandleForceShutdownMessage)(payload)) {
          await handleResult(socket, 'FORCE_SHUTDOWN', () => (0, handle_force_shutdown_1.handleForceShutdown)(server), mode);
      }
-@@ -256,9 +248,10 @@ async function handleResult(socket, type, hrFn, mode) {
+@@ -256,9 +250,10 @@ async function handleResult(socket, type, hrFn, mode) {
      logger_1.serverLogger.log(`Handled ${mode} message ${type}. Handling time: ${doneHandlingMark.getTime() - startMark.getTime()}. Response time: ${endMark.getTime() - doneHandlingMark.getTime()}.`);
  }
  function handleInactivityTimeout() {
@@ -631,7 +836,45 @@ index b1c143e244efd435b28642ed86e999d6c86f7d94..57925ac7a79a16756e6af51d6ead4b5f
          (0, shutdown_utils_1.resetInactivityTimeout)(handleInactivityTimeout);
      }
      else {
-@@ -348,7 +341,40 @@ const handleWorkspaceChanges = async (err, changeEvents) => {
+@@ -287,37 +282,6 @@ function registerProcessTerminationListeners() {
+         sockets: exports.openSockets,
+     }));
+ }
+-let existingLockHash;
+-function daemonIsOutdated() {
+-    if ((0, is_nx_version_mismatch_1.isNxVersionMismatch)()) {
+-        return 'NX_VERSION_CHANGED';
+-    }
+-    else if (lockFileHashChanged()) {
+-        return 'LOCK_FILES_CHANGED';
+-    }
+-    return null;
+-}
+-function lockFileHashChanged() {
+-    const lockFiles = [
+-        (0, path_1.join)(workspace_root_1.workspaceRoot, 'package-lock.json'),
+-        (0, path_1.join)(workspace_root_1.workspaceRoot, 'yarn.lock'),
+-        (0, path_1.join)(workspace_root_1.workspaceRoot, 'pnpm-lock.yaml'),
+-        (0, path_1.join)(workspace_root_1.workspaceRoot, 'bun.lockb'),
+-        (0, path_1.join)(workspace_root_1.workspaceRoot, 'bun.lock'),
+-    ];
+-    const existingFiles = lockFiles.filter((file) => (0, fs_1.existsSync)(file));
+-    const lockHashes = existingFiles.map((file) => (0, native_1.hashFile)(file));
+-    const newHash = (0, file_hasher_1.hashArray)(lockHashes);
+-    if (existingLockHash && newHash != existingLockHash) {
+-        logger_1.serverLogger.log(`[Server] lock file hash changed! old=${existingLockHash}, new=${newHash}`);
+-        existingLockHash = newHash;
+-        return true;
+-    }
+-    else {
+-        existingLockHash = newHash;
+-        return false;
+-    }
+-}
+ /**
+  * When applicable files in the workspaces are changed (created, updated, deleted),
+  * we need to recompute the cached serialized project graph so that it is readily
+@@ -348,7 +312,43 @@ const handleWorkspaceChanges = async (err, changeEvents) => {
          (0, file_watcher_sockets_1.notifyFileWatcherSocketsOfError)(err);
      }
  };
@@ -669,10 +912,13 @@ index b1c143e244efd435b28642ed86e999d6c86f7d94..57925ac7a79a16756e6af51d6ead4b5f
 +        logger_1.serverLogger.log(`[Server] Daemon ${owner.processId} already serves this workspace on ${owner.socketPath}, so daemon ${process.pid} exits`);
 +        process.exit(0);
 +    }
++    (0, restart_checks_1.registerDaemonForRestartChecks)(server, exports.openSockets, socketPath);
++    // Record before watch/scan so a lockfile changed during boot is not lost.
++    (0, restart_checks_1.recordLockFileHash)();
      // Watch before scan: a file written during boot must be visible to the
      // watcher or the scan below. Scan-first left a blind window where such
      // files stayed invisible to both until an unrelated change arrived.
-@@ -359,18 +385,11 @@ async function startServer() {
+@@ -359,54 +359,21 @@ async function startServer() {
      (0, workspace_context_1.setupWorkspaceContext)(workspace_root_1.workspaceRoot);
      // Initialize analytics for daemon process
      await (0, analytics_1.startAnalytics)();
@@ -691,28 +937,57 @@ index b1c143e244efd435b28642ed86e999d6c86f7d94..57925ac7a79a16756e6af51d6ead4b5f
      // See notes in socket-command-line-utils.ts on OS differences regarding clean up of existings connections.
      if (!socket_utils_1.isWindows) {
          (0, socket_utils_1.killSocketOrPath)();
-@@ -384,6 +403,13 @@ async function startServer() {
-                 sockets: exports.openSockets,
-             });
-         }
-+        if ((0, socket_utils_1.ownSocketState)() === 'lost') {
-+            return (0, shutdown_utils_1.handleServerProcessTermination)({
-+                server,
-+                reason: `its socket ${socketPath} was removed or replaced, so no client can reach it`,
-+                sockets: exports.openSockets,
-+            });
-+        }
-         const outdated = daemonIsOutdated();
-         if (outdated) {
-             logger_1.serverLogger.log(`[Server] Daemon outdated: ${outdated}`);
-@@ -432,6 +458,7 @@ async function startServer() {
+     }
+-    logger_1.serverLogger.log(`[Server] Starting outdated check interval (20ms)`);
++    // Watch events and request boundaries do the normal validity checks.
++    // Retain a slow safety check for dropped events and unreachable sockets.
++    logger_1.serverLogger.log(`[Server] Starting validity safety interval (${restart_checks_1.DAEMON_VALIDITY_SAFETY_INTERVAL_MS}ms)`);
+     setInterval(() => {
+-        if ((0, cache_1.getDaemonProcessIdSync)() !== process.pid) {
+-            return (0, shutdown_utils_1.handleServerProcessTermination)({
+-                server,
+-                reason: 'this process is no longer the current daemon (native)',
+-                sockets: exports.openSockets,
+-            });
+-        }
+-        const outdated = daemonIsOutdated();
+-        if (outdated) {
+-            logger_1.serverLogger.log(`[Server] Daemon outdated: ${outdated}`);
+-            if (outdated === 'LOCK_FILES_CHANGED') {
+-                // Lock file changes - restart daemon, clients will reconnect
+-                logger_1.serverLogger.log('[Server] Restarting daemon...');
+-                (0, shutdown_utils_1.handleServerProcessTerminationWithRestart)({
+-                    server,
+-                    reason: outdated,
+-                    sockets: exports.openSockets,
+-                });
+-            }
+-            else {
+-                // Version changes or other reasons - just shut down, don't restart
+-                logger_1.serverLogger.log('[Server] Shutting down daemon (no restart)...');
+-                (0, shutdown_utils_1.handleServerProcessTermination)({
+-                    server,
+-                    reason: outdated,
+-                    sockets: exports.openSockets,
+-                });
+-            }
+-        }
+-    }, 20).unref();
++        (0, restart_checks_1.stopDaemonIfOutdated)();
++    }, restart_checks_1.DAEMON_VALIDITY_SAFETY_INTERVAL_MS).unref();
+     return new Promise(async (resolve, reject) => {
+         // `listen` reports a failed bind asynchronously on the server, which the
+         // try below cannot catch — without this an EACCES became an uncaught
+@@ -432,8 +399,7 @@ async function startServer() {
                              // Best effort; the 0700 socket directory is the primary control.
                          }
                      }
+-                    // this triggers the storage of the lock file hash
+-                    daemonIsOutdated();
 +                    (0, socket_utils_1.recordOwnSocket)(socketPath);
-                     // this triggers the storage of the lock file hash
-                     daemonIsOutdated();
                      if (!(0, shutdown_utils_1.getOutputWatcherInstance)()) {
+                         (0, shutdown_utils_1.storeOutputWatcherInstance)(await (0, watcher_1.watchOutputFiles)(server, handle_outputs_changes_1.handleOutputsChanges));
+                     }
 diff --git a/dist/src/daemon/server/shutdown-utils.d.ts b/dist/src/daemon/server/shutdown-utils.d.ts
 index 698fcf9e061b8e0b37057a6318614dbe6d290b9e..422d244931ceb3a7143fc06e23d113bc0c566092 100644
 --- a/dist/src/daemon/server/shutdown-utils.d.ts
@@ -775,21 +1050,22 @@ index a449f2fb3c864bc9d3d710078418c8a05879aa84..7123ce257437d940409bc683b00ed500
          if (watcherInstance) {
              await watcherInstance.stop();
 diff --git a/dist/src/daemon/server/watcher.js b/dist/src/daemon/server/watcher.js
-index cbc34a1a9c7650ddd50ee7309a0b487f1837e88a..7ff8c387c06f6f50ea8f8e334a64b5b5db57d87a 100644
+index cbc34a1a9c7650ddd50ee7309a0b487f1837e88a..11d56729bcd092605dd9ed64728232022e942384 100644
 --- a/dist/src/daemon/server/watcher.js
 +++ b/dist/src/daemon/server/watcher.js
-@@ -6,20 +6,103 @@ exports.watchOutputFiles = watchOutputFiles;
+@@ -6,20 +6,102 @@ exports.watchOutputFiles = watchOutputFiles;
  exports.convertChangeEventsToLogMessage = convertChangeEventsToLogMessage;
  const workspace_root_1 = require("../../utils/workspace-root");
  const path_1 = require("path");
 +const fs_1 = require("fs");
  const shutdown_utils_1 = require("./shutdown-utils");
- const path_2 = require("../../utils/path");
- const cache_1 = require("../cache");
+-const path_2 = require("../../utils/path");
+-const cache_1 = require("../cache");
  const server_1 = require("./server");
  const handle_import_1 = require("../../utils/handle-import");
 +const workspace_context_1 = require("../../utils/workspace-context");
 +const cache_directory_1 = require("../../utils/cache-directory");
++const restart_checks_1 = require("./restart-checks");
  // Captured by watchWorkspace so flushPendingWorkspaceChanges can route
  // force-flushed events through the same handling as the async callback.
  // Definite-assignment: dispatchWorkspaceChanges only runs after
@@ -885,7 +1161,7 @@ index cbc34a1a9c7650ddd50ee7309a0b487f1837e88a..7ff8c387c06f6f50ea8f8e334a64b5b5
              // If the ignore files themselves have changed we need to dynamically
              // update our cached ignoreGlobs
              (0, shutdown_utils_1.handleServerProcessTermination)({
-@@ -32,16 +115,20 @@ function dispatchWorkspaceChanges(events) {
+@@ -32,16 +114,20 @@ function dispatchWorkspaceChanges(events) {
      return workspaceChangesCallback(null, events);
  }
  async function watchWorkspace(server, cb) {
@@ -908,6 +1184,31 @@ index cbc34a1a9c7650ddd50ee7309a0b487f1837e88a..7ff8c387c06f6f50ea8f8e334a64b5b5
      return watcher;
  }
  /**
+@@ -61,21 +147,13 @@ async function flushPendingWorkspaceChanges() {
+ }
+ async function watchOutputFiles(server, cb) {
+     const { Watcher } = await (0, handle_import_1.handleImport)('../../native/index.js', __dirname);
+-    const relativeServerProcess = (0, path_2.normalizePath)((0, path_1.relative)(workspace_root_1.workspaceRoot, cache_1.serverProcessJsonPath));
+-    const watcher = new Watcher(workspace_root_1.workspaceRoot, [`!${relativeServerProcess}`], false);
++    const watcher = new Watcher(workspace_root_1.workspaceRoot, [`!${restart_checks_1.relativeServerProcess}`], false);
+     watcher.watch((err, events) => {
+         if (err) {
+             return cb(err, null);
+         }
+-        for (const event of events) {
+-            if (event.path == relativeServerProcess &&
+-                (0, cache_1.getDaemonProcessIdSync)() !== process.pid) {
+-                return (0, shutdown_utils_1.handleServerProcessTermination)({
+-                    server,
+-                    reason: 'this process is no longer the current daemon (native)',
+-                    sockets: server_1.openSockets,
+-                });
+-            }
++        if ((0, restart_checks_1.stopDaemonIfReplaced)(events)) {
++            return;
+         }
+         if (events.length !== 0) {
+             cb(null, events);
 diff --git a/dist/src/daemon/socket-utils.d.ts b/dist/src/daemon/socket-utils.d.ts
 index 52b621b433beccb8e6590316cfd5baa7c7ec3b80..1c13e49fb4e8e37520ecd6e7a1c00ce251d201e4 100644
 --- a/dist/src/daemon/socket-utils.d.ts
@@ -1952,6 +2253,49 @@ index a6e742172f09e800da486af4716e9747d5ff2304..29f3376dfc5a00f83e90a7a2a7ce1a4e
 +        paths: [...getNxRequirePaths(root), __dirname],
 +    });
 +}
+diff --git a/dist/src/utils/installed-nx-version.js b/dist/src/utils/installed-nx-version.js
+index 7adf7fe48dbde78fa770ad37c5714985d78a7b8c..13e1858e5487a7d308a84cba1f379cde4e1429fa 100644
+--- a/dist/src/utils/installed-nx-version.js
++++ b/dist/src/utils/installed-nx-version.js
+@@ -6,19 +6,32 @@ exports.getInstalledLegacyNrwlWorkspaceVersion = getInstalledLegacyNrwlWorkspace
+ exports.getInstalledPackageGroup = getInstalledPackageGroup;
+ const tslib_1 = require("tslib");
+ const node_module_1 = tslib_1.__importStar(require("node:module"));
++const node_fs_1 = require("node:fs");
++const node_path_1 = require("node:path");
+ const fileutils_1 = require("./fileutils");
+ const package_json_1 = require("./package-json");
+ const workspace_root_1 = require("./workspace-root");
+ const installation_directory_1 = require("./installation-directory");
+ /**
+- * Read the installed `packageName` package.json via the cache-shielded
+- * resolver. The resolver always reflects the workspace's `node_modules`/PnP
+- * store rather than whichever copy happens to be loaded in the current process
+- * (e.g. the temp `nx@latest` install used by the migrate bootstrap). See
+- * nrwl/nx#35444 and `resolvePackageJsonWithoutCachePollution` below.
++ * Read installed metadata through its literal node_modules path first, so a
++ * package-link swap is followed by the filesystem rather than Node's cached
++ * realpath. Non-node_modules/PnP layouts use the detached resolver below,
++ * preserving its protection against self-reference and path-cache pollution.
+  */
+ function readInstalledPackageJson(packageName) {
+-    const path = resolvePackageJsonWithoutCachePollution(packageName, (0, installation_directory_1.getNxRequirePaths)(workspace_root_1.workspaceRoot));
++    const requirePaths = (0, installation_directory_1.getNxRequirePaths)(workspace_root_1.workspaceRoot);
++    for (const root of requirePaths) {
++        const path = (0, node_path_1.join)(root, 'node_modules', packageName, 'package.json');
++        if ((0, node_fs_1.existsSync)(path)) {
++            try {
++                return (0, fileutils_1.readJsonFile)(path);
++            }
++            catch {
++                return null;
++            }
++        }
++    }
++    const path = resolvePackageJsonWithoutCachePollution(packageName, requirePaths);
+     if (!path) {
+         return null;
+     }
 diff --git a/dist/src/utils/task-history.js b/dist/src/utils/task-history.js
 index 34dbaa2a5a44e6b7d1f69a516756b30939877bd7..09f95b73572a0d411f26d42aac2cfbf0098311f4 100644
 --- a/dist/src/utils/task-history.js
