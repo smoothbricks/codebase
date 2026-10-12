@@ -1627,6 +1627,10 @@ One boundary answer, no ambiguity:
   output therefore reaches a client while the client waits for the job's end, and a status read is answered while a wait
   is open on the same connection. A frame that breaks the protocol ends the connection and fails every call still open
   on it with that error.
+  The SDK client admits at most that same published limit of non-stream calls onto its connection at once. Excess
+  calls wait in FIFO order until an answer frees a slot, and receive their wire id only when sent. Stream-lane requests,
+  demands and closes continue while the non-stream queue is full; the client neither opens extra connections nor retries
+  or suppresses a controller conflict. A fatal connection error fails queued calls as well as calls already sent.
 - **A call may ask to hear its lifecycle steps.** A request that sets top-level `steps: true` gets, ahead of its answer,
   one `{id, step}` frame per step start and end its router call reports — the same steps a lifecycle verb prints on
   stderr (13_telemetry.md): `{event: "started", step, parent?, scope, name}` and `{event: "ended", step, error?}`. Step
