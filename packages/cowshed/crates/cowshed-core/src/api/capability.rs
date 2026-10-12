@@ -20,6 +20,7 @@ use super::operations::{
     WorkspaceGrantsRequest, WorkspaceRequest, WorkspaceView, decode_result, encode_request,
 };
 use super::peer_credentials::PeerCredentialsError;
+use super::process::JobProcessTree;
 use super::resources::{JobResourceSample, SampleInterval};
 use super::server::MAX_BINARY_FRAME_BYTES;
 #[cfg(unix)]
@@ -2421,6 +2422,27 @@ impl JobHandle {
     pub async fn listening_ports(&self) -> Result<JobListeningPorts> {
         invoke::<operations::JobListeningPortsRead>(&*self.runtime, &self.authority.job(self.id))
             .await
+    }
+
+    /// Every observed life, live or exited, with its retained image, usage and first coverage gap.
+    pub async fn processes(&self) -> Result<JobProcessTree> {
+        invoke::<operations::JobProcesses>(&*self.runtime, &self.authority.job(self.id)).await
+    }
+
+    /// Birth/exec/exit transitions, sparse changes and fixed-cadence heartbeats. The retained
+    /// journal preserves every transition under backpressure; dropping a reader never kills the job.
+    pub async fn process_events(
+        &self,
+        every: SampleInterval,
+    ) -> Result<EventStream<operations::JobProcessEvents>> {
+        let request = ProgressRequest {
+            repo_id: self.authority.repo_id.clone(),
+            workspace: self.authority.workspace.clone(),
+            workspace_incarnation: self.authority.workspace_incarnation.clone(),
+            job_id: self.id,
+            every_ms: every,
+        };
+        invoke_stream::<operations::JobProcessEvents>(&*self.runtime, &request).await
     }
 
     /// The job's resource samples: the latest at once when the job owns a process, another

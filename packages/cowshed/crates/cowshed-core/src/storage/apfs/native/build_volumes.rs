@@ -1560,6 +1560,10 @@ mod tests {
                 None
             }
 
+            fn observations(&self) -> Option<&crate::runtime::process_monitor::ProcessMonitor> {
+                None
+            }
+
             fn try_write_stdin(&mut self, _bytes: bytes::Bytes) -> crate::error::Result<bool> {
                 Ok(true)
             }

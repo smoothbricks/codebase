@@ -213,16 +213,26 @@ fn submit(
         .unwrap()
         .finish()
         .unwrap();
-    let sent = send_with_descriptors(
-        control.as_raw_fd(),
-        &frame,
-        &[
-            stdin.as_raw_fd(),
-            stdout_write.as_raw_fd(),
-            stderr_write.as_raw_fd(),
-        ],
-    )
-    .expect("send the request");
+    #[cfg(target_os = "macos")]
+    let (ready_read, ready_write) = pipe();
+    #[cfg(target_os = "macos")]
+    let (go_read, go_write) = pipe();
+    #[cfg(target_os = "macos")]
+    let descriptors = [
+        stdin.as_raw_fd(),
+        stdout_write.as_raw_fd(),
+        stderr_write.as_raw_fd(),
+        ready_write.as_raw_fd(),
+        go_read.as_raw_fd(),
+    ];
+    #[cfg(not(target_os = "macos"))]
+    let descriptors = [
+        stdin.as_raw_fd(),
+        stdout_write.as_raw_fd(),
+        stderr_write.as_raw_fd(),
+    ];
+    let sent =
+        send_with_descriptors(control.as_raw_fd(), &frame, &descriptors).expect("send the request");
     std::io::Write::write_all(&mut &*control, &frame[sent..]).expect("send the rest");
     drop((stdin, stdout_write, stderr_write));
     let readers = [stdout_read, stderr_read].map(|reader| {
@@ -234,6 +244,35 @@ fn submit(
             String::from_utf8_lossy(&bytes).into_owned()
         })
     });
+    #[cfg(target_os = "macos")]
+    let _observation = {
+        drop((ready_write, go_read));
+        let mut ready = std::fs::File::from(ready_read);
+        let mut pid = [0_u8; 4];
+        let first = loop {
+            match ready.read(&mut pid[..1]) {
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                read => break read.expect("read the held leader's report"),
+            }
+        };
+        if first == 0 {
+            None // Syntax or spawn failed before a leader existed.
+        } else {
+            ready
+                .read_exact(&mut pid[1..])
+                .expect("the complete leader report");
+            let pid = u32::try_from(i32::from_ne_bytes(pid)).expect("leader pid");
+            let observer = cowshed_core::runtime::process_events::KqueueObserver::watch(
+                cowshed_core::api::JobId::new(1).expect("job id"),
+                pid,
+            )
+            .expect("attach before the script can run");
+            assert_eq!(observer.fold().live(pid).map(|life| life.pid), Some(pid));
+            std::io::Write::write_all(&mut std::fs::File::from(go_write), b"x")
+                .expect("release the observed leader");
+            Some(observer)
+        }
+    };
     let (reply, _) = read_frame(control).unwrap().expect("a reply");
     Submitted { reply, readers }
 }

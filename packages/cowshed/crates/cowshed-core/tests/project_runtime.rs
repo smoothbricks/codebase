@@ -1494,6 +1494,39 @@ impl ProjectRuntimeHost for FakeHost {
         Ok(Box::pin(async move { supervisor.resources(job).await }))
     }
 
+    async fn read_processes(
+        &mut self,
+        workspace: WorkspaceName,
+        incarnation: WorkspaceIncarnation,
+        job: JobId,
+    ) -> Result<JobAnswer<cowshed_core::api::process::JobProcessTree>> {
+        self.require_incarnation(&workspace, &incarnation)?;
+        let supervisor = self
+            .supervisors
+            .get(&workspace)
+            .cloned()
+            .ok_or_else(Self::worker_unavailable)?;
+        Ok(Box::pin(async move { supervisor.processes(job).await }))
+    }
+
+    async fn process_events_job(
+        &mut self,
+        workspace: WorkspaceName,
+        incarnation: WorkspaceIncarnation,
+        job: JobId,
+        every: cowshed_core::api::SampleInterval,
+    ) -> Result<JobAnswer<cowshed_core::runtime::process_stream::JobProcessStream>> {
+        self.require_incarnation(&workspace, &incarnation)?;
+        let supervisor = self
+            .supervisors
+            .get(&workspace)
+            .cloned()
+            .ok_or_else(Self::worker_unavailable)?;
+        Ok(Box::pin(async move {
+            supervisor.process_events(job, every).await
+        }))
+    }
+
     async fn progress_job(
         &mut self,
         workspace: WorkspaceName,
@@ -1986,6 +2019,11 @@ struct ScriptedProcess {
 impl RunningProcess for ScriptedProcess {
     fn process(&self) -> Option<&OwnedProcess> {
         self.process.as_ref()
+    }
+
+    #[cfg(target_os = "macos")]
+    fn observations(&self) -> Option<&cowshed_core::runtime::process_monitor::ProcessMonitor> {
+        None
     }
 
     fn try_write_stdin(&mut self, _bytes: Bytes) -> Result<bool> {

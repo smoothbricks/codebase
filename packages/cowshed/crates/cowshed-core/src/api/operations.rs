@@ -19,6 +19,7 @@ use super::dto::{
     ResizeVolume, RunSandboxMode, ScriptCommand, SealedJob, TraceContext, WorkspaceIncarnation,
     WorkspaceInfo, WorkspacePath, WorkspaceTarget,
 };
+use super::process::{JobProcessEvent, JobProcessTree};
 use super::resources::{JobResourceSample, SampleInterval};
 use crate::build_volume::BuildStateRefresh;
 use crate::error::{CowshedError, ErrorCode, Result};
@@ -349,6 +350,10 @@ operations! {
     worker json "job.tail" JobTailRead(TailRequest) -> JobTail;
     /// Reads the TCP ports the job's process group listens on, from the kernel.
     worker json "job.listeningPorts" JobListeningPortsRead(JobRequest) -> JobListeningPorts;
+    /// Reads the retained native process tree with its absorbing coverage evidence.
+    worker json "job.processes" JobProcesses(JobRequest) -> JobProcessTree;
+    /// Streams ordered retained process transitions and the first coverage gap, without coalescing.
+    worker stream "job.processEvents" JobProcessEvents(ProgressRequest) -> JobProcessEvent;
     /// Streams one job's resource samples: the latest at once, one every interval while it runs,
     /// then its terminal sample once.
     worker stream "job.progress" JobProgress(ProgressRequest) -> JobResourceSample;

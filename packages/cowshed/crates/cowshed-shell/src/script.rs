@@ -43,6 +43,7 @@ pub(crate) fn run(
     cwd: &Path,
     environment: &BTreeMap<OsString, OsString>,
     [stdin, stdout, stderr]: [OwnedFd; 3],
+    #[cfg(target_os = "macos")] hold: crate::ObservationHold,
 ) -> io::Result<()> {
     let program = match brush_parser::Parser::new(
         io::Cursor::new(text.as_bytes()),
@@ -88,6 +89,8 @@ pub(crate) fn run(
     let job_descriptors = [stdin.as_raw_fd(), stdout.as_raw_fd(), stderr.as_raw_fd()];
     let (ready_read, ready_write) = close_on_exec_pipe()?;
     let ready = [ready_read.as_raw_fd(), ready_write.as_raw_fd()];
+    #[cfg(target_os = "macos")]
+    let held = hold.raw();
 
     // SAFETY: the host is single-threaded here (no activation guard thread exists outside an
     // activation), so the child starts with a consistent heap and no lock held by another
@@ -97,9 +100,19 @@ pub(crate) fn run(
         return Err(io::Error::last_os_error());
     }
     if pid == 0 {
-        child(job_descriptors, ready, cwd, variables, program);
+        child(
+            job_descriptors,
+            ready,
+            cwd,
+            variables,
+            program,
+            #[cfg(target_os = "macos")]
+            held,
+        );
     }
     drop((stdin, stdout, stderr, ready_write));
+    #[cfg(target_os = "macos")]
+    drop(hold);
     // A signal for the job reaches its group the moment the start is reported, so the group must
     // exist first. Only the child creates it: two creations of one group race, and macOS
     // refuses the loser with EPERM. The child reports once its group exists; an end of file
@@ -168,6 +181,7 @@ fn child(
     cwd: &Path,
     variables: Vec<(String, brush_core::ShellVariable)>,
     program: brush_parser::ast::Program,
+    #[cfg(target_os = "macos")] [hold_ready, hold_go]: [i32; 2],
 ) -> ! {
     // SAFETY: plain descriptor, process-group and signal-disposition calls on this process's
     // own tables. The control socket belongs to the host; the job's descriptors become 0, 1
@@ -182,6 +196,16 @@ fn child(
                 "cannot lead a process group of its own",
                 io::Error::last_os_error(),
             );
+        }
+        #[cfg(target_os = "macos")]
+        {
+            if let Err(error) =
+                cowshed_core::runtime::process_fence::hold_before_exec(hold_ready, hold_go)
+            {
+                refuse(stderr, "was not released by its process observer", error);
+            }
+            libc::close(hold_ready);
+            libc::close(hold_go);
         }
         // The group exists: the host may give the supervisor this pid. A host that stopped
         // reading has nothing to learn, so a failed write changes nothing here.
