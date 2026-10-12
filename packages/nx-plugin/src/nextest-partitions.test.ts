@@ -462,10 +462,11 @@ async function run(root: string, args: string[], overlay: Record<string, string>
   expect(code, `${args.join(' ')}\n${output}`).toBe(0);
 }
 
-/** The real default executor, run in a driver process so its runner group can be ended by the lease owner. */
-const EXECUTOR_MODULE = fileURLToPath(new URL('./executors/bounded-exec/executor.ts', import.meta.url));
-// The driver runs outside this package's bunfig; use the same native transform preload as its test runner.
-const VALIDATION_PRELOAD = fileURLToPath(import.meta.resolve('@smoothbricks/validation/bun/preload'));
+/**
+ * The built production executor, in a driver process whose runner group the lease owner can end.
+ * The test target already depends on build: do not compile the TypeScript project again in every driver.
+ */
+const EXECUTOR_MODULE = fileURLToPath(new URL('../dist/executors/bounded-exec/executor.js', import.meta.url));
 
 /**
  * Exit 0 when the executor reports success, 2 when its run fails. A crash in the driver
@@ -485,7 +486,7 @@ console.log('driver ready: calling the default executor');
 const result = await boundedExecExecutor(${JSON.stringify(options)}, ${JSON.stringify(context)});
 console.log('driver done: default executor success=' + result.success);
 process.exitCode = result.success ? 0 : 2;`;
-  const result = await runTracked(root, [process.execPath, '--preload', VALIDATION_PRELOAD, '-e', script], {
+  const result = await runTracked(root, ['node', '--input-type=module', '-e', script], {
     graceful: true,
     tee: true,
     overlay: { ...environment, NX_WORKSPACE_DATA_DIRECTORY: join(root, '.nx/workspace-data') },
