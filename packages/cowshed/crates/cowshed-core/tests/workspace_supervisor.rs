@@ -6067,8 +6067,8 @@ fn expected_span(
     [row("span-start", None), row(entry_type, Some(state))]
 }
 
-/// Asserts the segments under `telemetry` are exactly `spans`, two per job in sealing order,
-/// each named `job-<order>-<writer>.arrow` by one writer counting from 1.
+/// The job rows are exactly `spans` in sealing order. Process/reconciliation rows share this
+/// writer's monotonically increasing sequence; they do not occupy additional job-span rows.
 fn assert_job_spans(telemetry: &Path, spans: &[[JobSpanRow; 2]]) {
     let sealed = job_spans(telemetry);
     let names = sealed
@@ -6081,12 +6081,37 @@ fn assert_job_spans(telemetry: &Path, spans: &[[JobSpanRow; 2]]) {
         "two sealed segments per job: {names:?}"
     );
     let writer = &names[0]["job-00000000000000000001-".len()..];
-    for (index, name) in names.iter().enumerate() {
-        assert_eq!(*name, format!("job-{:020}-{writer}", index + 1));
+    let mut previous = 0;
+    for name in &names {
+        let order: u64 = name["job-".len().."job-".len() + 20].parse().unwrap();
+        assert!(
+            order > previous,
+            "one shared writer's ordered job rows: {names:?}"
+        );
+        assert_eq!(&name["job-00000000000000000001-".len()..], writer);
+        previous = order;
     }
     let rows = sealed.into_iter().map(|(_, row)| row).collect::<Vec<_>>();
     let expected = spans.iter().flatten().collect::<Vec<_>>();
     assert_eq!(rows.iter().collect::<Vec<_>>(), expected);
+}
+
+#[cfg(target_os = "macos")]
+fn sealed_trace_count(telemetry: &Path) -> u64 {
+    std::fs::read_dir(telemetry)
+        .expect("telemetry partitions")
+        .flat_map(|day| std::fs::read_dir(day.expect("partition").path()).expect("trace segments"))
+        .filter(|entry| {
+            entry
+                .as_ref()
+                .expect("trace segment")
+                .path()
+                .extension()
+                .is_some_and(|extension| extension == "arrow")
+        })
+        .count()
+        .try_into()
+        .expect("the fixture's segment count fits u64")
 }
 
 fn adopted_trace() -> cowshed_core::api::TraceContext {
@@ -6357,7 +6382,8 @@ async fn host_controller_a_real_exec_seals_one_job_span_through_the_production_s
     assert_eq!(clean.exit, Some(ExitStatus::Exited { code: 0 }));
     assert_eq!(clean.trace, adopted_trace());
     let health = handle.trace_health().await.unwrap();
-    assert_eq!((health.recorded, health.failed), (2, 0), "{health:?}");
+    assert_eq!(health.failed, 0, "{health:?}");
+    assert_eq!(health.recorded, sealed_trace_count(&telemetry));
     assert_job_spans(&telemetry, &[expected_span(&clean, "span-ok", "exited")]);
 
     let job = handle
@@ -6367,7 +6393,8 @@ async fn host_controller_a_real_exec_seals_one_job_span_through_the_production_s
     let failed = handle.wait(job).await.unwrap();
     assert_eq!(failed.exit, Some(ExitStatus::Exited { code: 1 }));
     let health = handle.trace_health().await.unwrap();
-    assert_eq!((health.recorded, health.failed), (4, 0), "{health:?}");
+    assert_eq!(health.failed, 0, "{health:?}");
+    assert_eq!(health.recorded, sealed_trace_count(&telemetry));
     assert_job_spans(
         &telemetry,
         &[

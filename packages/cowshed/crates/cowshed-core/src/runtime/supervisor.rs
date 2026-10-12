@@ -3483,6 +3483,8 @@ impl SupervisorActor {
                 job.stdout_tally,
                 job.stderr_tally,
                 Boundary::Supervisor,
+                #[cfg(target_os = "macos")]
+                job.monitor.as_ref(),
             ) {
                 job.info.resources = Some(sample);
             }
@@ -4380,9 +4382,6 @@ impl SupervisorActor {
             stdin: stdin_info,
             failure: None,
         };
-        if let Some(job_spans) = &self.job_spans {
-            job_spans.record(&info, JobSpanEdge::Start);
-        }
         // Read before the job's first process is dispatched, so nothing it writes precedes its
         // baseline: a warm host may start the command before its start is reported here.
         let volumes = {
@@ -4392,6 +4391,13 @@ impl SupervisorActor {
                 self.policy.ceiling().build_volume_mount.as_deref(),
             )
         };
+        if let Some(job_spans) = &self.job_spans {
+            job_spans.record_boundary(
+                &info,
+                JobSpanEdge::Start,
+                &super::job_boundary::sample_job_boundary(&volumes),
+            );
+        }
         let spawn_span = cowshed_os::timing::span("admit", "spawn");
         let spawn = self
             .spawner
@@ -5316,8 +5322,23 @@ impl SupervisorActor {
                 job.stdout_tally,
                 job.stderr_tally,
                 Boundary::Supervisor,
+                #[cfg(target_os = "macos")]
+                job.monitor.as_ref(),
             )
         });
+        // Read and queue the terminal boundary while the admitted build volume is still held.
+        // A successful final resource read already owns these facts; do not sample them twice.
+        if let Some(job_spans) = &self.job_spans {
+            let edge = JobSpanEdge::end(state, job.exit.as_ref());
+            match &job.info.resources {
+                Some(sample) => job_spans.record_sample_boundary(&job.info, edge, sample),
+                None => job_spans.record_boundary(
+                    &job.info,
+                    edge,
+                    &super::job_boundary::sample_job_boundary(&job.volumes),
+                ),
+            }
+        }
         let ending = JobEnding {
             state,
             exit: job.exit.clone(),
@@ -5381,10 +5402,6 @@ impl SupervisorActor {
         job.info.state = state;
         job.info.duration_ms = Some(duration_ms);
         job.info.exit = job.exit.clone();
-        // The span ends before any waiter learns of the end, so a span read after a wait has it.
-        if let Some(job_spans) = &self.job_spans {
-            job_spans.record(&job.info, JobSpanEdge::end(state, job.exit.as_ref()));
-        }
         job.info.failure =
             (job.kill_reason == Some(KillReason::ScriptSyntax)).then_some(JobFailure::ScriptSyntax);
         job.info.stdin.complete = true;
@@ -5713,6 +5730,8 @@ fn own_process(job: &mut JobStateRecord, process: OwnedProcess, coverage: LeafCo
             job.stdout_tally,
             job.stderr_tally,
             Boundary::Supervisor,
+            #[cfg(target_os = "macos")]
+            job.monitor.as_ref(),
         ) {
             Ok(sample) => job.info.resources = Some(sample),
             // The latest sample stands, dated by its own `sampledAt`; a read reports the failure.
@@ -5736,6 +5755,7 @@ fn observe(
     stdout: StreamTally,
     stderr: StreamTally,
     boundary: Boundary,
+    #[cfg(target_os = "macos")] monitor: Option<&super::process_monitor::ProcessMonitor>,
 ) -> Result<JobResourceSample> {
     let sampled_at = utc_now()?;
     let leader = sampler.leader().pid();
@@ -5772,7 +5792,12 @@ fn observe(
         })?;
         members.push(Member { pid, resident });
     }
-    let (accounting, leaf) = account(sampler, &processes)?;
+    let (accounting, leaf) = account(
+        sampler,
+        &processes,
+        #[cfg(target_os = "macos")]
+        monitor,
+    )?;
     let volumes = volumes.sample(&HostVolumeStat);
     sampler.sample(
         Observation {
@@ -5790,35 +5815,39 @@ fn observe(
     )
 }
 
-/// The job's totals from its independent source, reconciled against the census of `members`
-/// taken now through the identities the membership read found, and the leaf that census names.
-/// The census reads each member's identity, image and own counters after the membership; the
-/// leader's own and reaped-children CPU is read after that, so a member that exited and was
-/// reaped since is already in its parent's children total.
+/// Read the independent job total after the process observation. Native jobs attribute from one
+/// immutable publication of their retained event fold, without resampling or moving its window.
+/// An explicitly supplied spawn sink without that source uses the transitional census in 07_api.md.
 #[cfg(target_os = "macos")]
 fn account(
     sampler: &mut JobSampler,
     members: &[super::job_groups::Process],
+    monitor: Option<&super::process_monitor::ProcessMonitor>,
 ) -> Result<(JobAccounting, JobLeafAttribution)> {
     let leader = sampler.leader().pid();
-    super::job_attribution::observe(sampler.census(), members, Instant::now()).map_err(
-        |error| {
-            CowshedError::environment_missing(
-                format!("the processes of job group {leader} could not be read: {error}"),
-                "the job runs on; read its resources again",
-            )
-        },
-    )?;
+    if monitor.is_none() {
+        super::job_attribution::observe(sampler.census(), members, Instant::now()).map_err(
+            |error| {
+                CowshedError::environment_missing(
+                    format!("the processes of job group {leader} could not be read: {error}"),
+                    "the job runs on; read its resources again",
+                )
+            },
+        )?;
+    }
     let cpu = sampler
         .rusage()
         .account(super::job_accounting::read_leader)
         .map_err(|error| unaccounted(leader, error))?;
     let coverage = sampler.coverage();
-    let attribution = sampler.census().attribute(cpu, coverage).map_err(|error| {
-        CowshedError::internal(format!(
-            "the CPU of job group {leader} cannot be attributed: {error}"
-        ))
-    })?;
+    let attribution = match monitor {
+        Some(monitor) => monitor.attribution(cpu, coverage)?,
+        None => sampler.census().attribute(cpu, coverage).map_err(|error| {
+            CowshedError::internal(format!(
+                "the CPU of job group {leader} cannot be attributed: {error}"
+            ))
+        })?,
+    };
     Ok((
         JobAccounting::MacOsRusageChildren {
             cpu,
@@ -5882,6 +5911,8 @@ fn sample_job(job: &mut JobStateRecord) -> Result<JobResourceSample> {
             job.stdout_tally,
             job.stderr_tally,
             Boundary::Read,
+            #[cfg(target_os = "macos")]
+            job.monitor.as_ref(),
         )
     })?;
     if !job.terminal() {

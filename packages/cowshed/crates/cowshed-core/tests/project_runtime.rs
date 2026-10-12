@@ -7,6 +7,8 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bytes::Bytes;
+#[cfg(target_os = "macos")]
+use cowshed_core::apfs::{CommandRunner, DetachIntent, DiskImageSource, SystemCommandRunner};
 use cowshed_core::api::dto::{
     AbandonedWork, AdoptOptions, AttachOptions, CheckpointInfo, CheckpointOptions, CheckpointQuota,
     CheckpointResult, CommandArg, CreateOptions, DefragmentResult, DoctorReport, ExecCommand,
@@ -34,6 +36,10 @@ use cowshed_core::runtime::{
     WorkspaceSnapshot,
 };
 use cowshed_core::sandbox::{SandboxConfig, SandboxGrants};
+#[cfg(target_os = "macos")]
+use cowshed_core::storage::apfs::ApfsSubstrateConfig;
+#[cfg(target_os = "macos")]
+use cowshed_core::storage::apfs::native::MacOsApfsExecutionHost;
 use cowshed_core::storage::job_artifact::{ArtifactConfig, StreamKind};
 use cowshed_core::storage::lifecycle::{Conflict, LifecycleFact, Revision};
 use cowshed_core::{Cowshed, CowshedError, ErrorCode, JobStream, Result, Retry};
@@ -46,6 +52,10 @@ use url::Url;
 #[path = "support/temp_root.rs"]
 mod temp_root;
 use temp_root::TempRoot;
+
+#[cfg(target_os = "macos")]
+#[path = "support/scratch_apfs.rs"]
+mod scratch_apfs;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum Event {
@@ -2895,6 +2905,7 @@ async fn napi_job_read<T: serde::de::DeserializeOwned>(
             .arg(node)
             .arg(client)
             .env("NAPI_DEBUG_ADDON", "1")
+            .env_remove("FORCE_COLOR")
             .current_dir(&package)
             .stdin(std::process::Stdio::from(endpoint))
             .stdout(std::process::Stdio::piped())
@@ -2931,7 +2942,9 @@ async fn host_controller_process_observations_survive_a_subscriber_drop() {
     let telemetry = root.join("telemetry");
     config.telemetry_root = Some(telemetry.clone());
     let supervisor = system_supervisor_of(config);
-    let path = root.join("observer.sock");
+    // Reuse the short owned host fixture root, including cleanup on an assertion failure.
+    let sockets = scratch_apfs::ScratchRoot::new("obs").expect("short observation socket root");
+    let path = sockets.path().join("s");
     let socket = supervisor_socket::bind(&path)
         .await
         .expect("bind supervisor");
