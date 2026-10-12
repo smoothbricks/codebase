@@ -114,9 +114,9 @@ paths; `--ref <rev>` implies clean. Ignored dependencies and build state stay wa
   checksum/content freshness consistently; switching modes invalidates units once.
 - Nx inside a workspace sandbox keeps its normal daemon and the checkout's own `.nx`: host shells, read-write and
   read-only jobs share one task database, cache and daemon through the build volume. Read-only jobs keep source
-  read-only, not a second Nx state. The supervisor keeps the daemon in the sandbox and host shells connect to it.
-  `NX_MAX_CACHE_SIZE` defaults to configured build-volume capacity divided by ten; explicit overrides win. Repository
-  shells leave `NX_DAEMON` to Nx.
+  read-only, not a second Nx state. The supervisor keeps the daemon in the sandbox and host shells connect to it. The
+  `NX_MAX_CACHE_SIZE` default and override policy are defined in
+  [03_caches.md §Wiring](../../../../specs/cowshed/03_caches.md#wiring). Repository shells leave `NX_DAEMON` to Nx.
 - The compile cache is a host daemon. Start it deliberately with `cowshed sccache start --capacity <size>`; a client
   that spawns its own daemon silently gets sccache's 10 GiB default cap. If hits are absent, run
   `cowshed sccache status` first.
