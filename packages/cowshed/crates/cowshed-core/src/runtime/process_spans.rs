@@ -6,7 +6,7 @@
 //! [`JobProcessEvent::Gap`] seals no row.
 
 use std::collections::HashMap;
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -914,6 +914,7 @@ mod tests {
     use crate::api::process::{LockHolder, ProcessExit, ProcessIoUnavailable, ProcessStorageIo};
     use crate::api::resources::{CpuMicros, ResidentBytes, StorageIoBytes};
     use crate::runtime::process_tree::BirthToken;
+    use std::os::unix::ffi::OsStringExt;
     use std::time::Duration;
 
     fn at(second: u64) -> SystemTime {
