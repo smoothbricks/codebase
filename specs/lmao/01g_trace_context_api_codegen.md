@@ -104,8 +104,8 @@ class is a source-authored constructor with schema-driven prototype methods and 
 materializer; the ResultWriter class is built via `new Function()` or the closure-composed materializer chosen by
 [01b6 Materializer Selection](./01b6_buffer_codegen_extension.md#smoo/lmao!n/buffer-codegen.materializer-selection).
 `spanLoggerGenerator.ts` generates the **SpanLogger** (rows 2+: info/debug/warn/error/trace + `with`) by extending
-arrow-builders ColumnWriter, under the same selection. The entry-type-bound split in the prose below maps to: TagWriter
-(fixed row 0) vs SpanLogger (advancing rows) — not a per-entry-type class. The illustrative class names below
+arrow-builder's `ColumnWriter`, under the same selection. The entry-type-bound split in the prose below maps to:
+TagWriter (fixed row 0) vs SpanLogger (advancing rows) — not a per-entry-type class. The illustrative class names below
 (`TagAPI`/`LogAPI`) are `TagWriter`/`SpanLogger`.
 
 ### 1. Schema-Driven Column Writers
