@@ -110,6 +110,8 @@ struct Demand {
     rows: bool,
     /// Neither bound applies; only a dry run decides.
     opaque: bool,
+    /// A stored-row sweep needs a sparse plan but adds no slot units.
+    swept: bool,
 }
 
 /// Collects one instruction's operands in wire order; raw spans are skipped.
@@ -188,6 +190,8 @@ enum Effect {
     },
     /// Only a dry run decides this slot.
     Opaque { slot: u32 },
+    /// Remove predicate-selected stored rows without admitting new keys.
+    Sweep { slot: u32 },
 }
 
 impl Effect {
@@ -200,6 +204,7 @@ impl Effect {
             | Effect::Arena { slot, .. }
             | Effect::Routed { slot, .. }
             | Effect::Nested { slot, .. }
+            | Effect::Sweep { slot }
             | Effect::Opaque { slot } => slot,
             Effect::Algebra { target, .. } => target,
         }
@@ -289,6 +294,7 @@ fn effects(op: Opcode, o: &[u32], out: &mut impl FnMut(Effect)) -> Option<()> {
         }
         // Init frames charged for absent rows and clear fields alike.
         Opcode::BatchStructMapCountsFold => out(Effect::Opaque { slot: at(0)? }),
+        Opcode::StructMapSweep => out(Effect::Sweep { slot: at(0)? }),
         Opcode::BatchStructMap2UpsertLast
         | Opcode::BatchStructMap2UpsertMaxI64x2
         | Opcode::BatchStructMap2UpsertMinI64x2 => {
@@ -547,6 +553,13 @@ impl CapacityScratch {
                 return Some(Admission::DryRun);
             }
             let meta = slot_meta(state, slot)?;
+            if d.swept && batch_len != 0 {
+                let rows = u64::from(meta.size(state))
+                    .saturating_add(d.units)
+                    .min(u64::from(meta.capacity));
+                let ranges = usize::try_from(rows).ok()?.checked_add(1)?;
+                self.scratch.sweep_ranges = self.scratch.sweep_ranges.max(ranges);
+            }
             if meta.slot_type() == SlotType::Bitmap {
                 if d.rows {
                     return Some(Admission::DryRun);
@@ -1039,6 +1052,7 @@ impl Tier1<'_> {
         let d = &mut demand[usize::try_from(slot).ok()?];
         mark(touched, d, slot);
         match (effect, bound) {
+            (Effect::Sweep { .. }, _) => d.swept = true,
             (Effect::Opaque { .. }, _) => d.opaque = true,
             // Rehash allocations depend on each container's capacity.
             (Effect::Nested { .. }, _) => d.rows = true,

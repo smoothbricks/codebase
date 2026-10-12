@@ -363,6 +363,7 @@ pub(crate) fn walk_operands<S: OperandSink>(
             &[I, B, I, B]
         }
         Opcode::ListAppend => &[I, I],
+        Opcode::StructMapSweep => &[I, I],
         Opcode::BatchStructMap2Remove => &[I, I, I],
         Opcode::ListAppendStruct => {
             // slot, then the value pairs.
@@ -493,6 +494,9 @@ fn scan_body(
     let mut pc = 0;
     while pc < body.len() {
         let op = Opcode::from_u8(body[pc])?;
+        if op == Opcode::StructMapSweep {
+            return None;
+        }
         if is_aggregate_op(op) {
             if op == Opcode::BatchScalarLatest {
                 scalar_latest_slots.push(Operands::at(body, pc.checked_add(1)?).index()?);
@@ -594,6 +598,9 @@ fn visit_source_body<'a, E: From<InvalidSource>>(
     let mut pc = 0;
     while pc < code.len() {
         let op = Opcode::from_u8(code[pc]).ok_or(InvalidSource)?;
+        if nesting != 0 && op == Opcode::StructMapSweep {
+            return Err(InvalidSource.into());
+        }
         let len = body_op_len(code, pc).ok_or(InvalidSource)?;
         visit(SourceOp {
             op,

@@ -760,6 +760,8 @@ pub enum Opcode {
     /// Same operands as 0x87; keeps the strictly least signed-i64
     /// lexicographic tuple instead of the greatest.
     BatchStructMap2UpsertMinI64x2 = 0x89,
+    /// slot:index, predicate_col:index; top-level stored unary-map row sweep.
+    StructMapSweep = 0x8a,
     /// slot:index, val_col:index (body opcode inside FOR_EACH/FLAT_MAP blocks)
     ListAppend = 0x84,
     /// slot:index, num_vals:u8, \[(val_col:index, field_idx:u8) × N\]
@@ -852,6 +854,7 @@ impl Opcode {
             0x87 => Self::BatchStructMap2UpsertMaxI64x2,
             0x88 => Self::BatchStructMapCountsFold,
             0x89 => Self::BatchStructMap2UpsertMinI64x2,
+            0x8a => Self::StructMapSweep,
             0x90 => Self::NestedSetInsert,
             0x92 => Self::NestedMapUpsertLast,
             0x95 => Self::NestedAggUpdate,

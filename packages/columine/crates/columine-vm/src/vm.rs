@@ -27,7 +27,7 @@ use crate::hashset_ops;
 use crate::hooks::{ByteCapture, CaptureFrame, EraseScratch, VmHooks};
 use crate::meta::{SlotMetaView, slot_meta_base};
 use crate::nested;
-use crate::row_exprs::LiveColumns;
+use crate::row_exprs::{LiveColumns, StoredRow};
 use crate::scratch::ScratchDemand;
 use crate::state_init::{self, EVICTION_ENTRY_SIZE};
 use crate::struct_map::{
@@ -1036,6 +1036,8 @@ pub struct Vm {
     element_struct_map2_tuple: StructMap2TupleOperands,
     element_list_vals: ScalarOperands,
     nested_scratch: nested::NestedScratch,
+    /// Sparse key ranges selected by a stored-row sweep, retained across batches.
+    sweep_ranges: Vec<(u32, u32)>,
     /// Batch capacity admission (`capacity`), retained across batches.
     capacity: CapacityScratch,
     /// Whether the batch now running reserved and sealed its scratch: a
@@ -1064,6 +1066,7 @@ impl Vm {
             element_struct_map2_tuple: StructMap2TupleOperands::EMPTY,
             element_list_vals: ScalarOperands::EMPTY,
             nested_scratch: nested::NestedScratch::default(),
+            sweep_ranges: Vec::new(),
             capacity: CapacityScratch::default(),
             scratch_sealed: false,
             needs_growth_slot: None,
@@ -1182,6 +1185,10 @@ impl Vm {
 
     /// Reserve the working memory `demand` names before any write.
     fn reserve_scratch(&mut self, demand: &ScratchDemand) -> Result<(), ErrorCode> {
+        self.sweep_ranges.clear();
+        self.sweep_ranges
+            .try_reserve(demand.sweep_ranges)
+            .map_err(|_| ErrorCode::OutOfMemory)?;
         self.undo.ttl_batch_scratch.reserve_for(demand.ttl)?;
         if let Some(nested) = demand.nested {
             self.nested_scratch.reserve_for(nested)?;
@@ -1214,6 +1221,7 @@ impl Vm {
         ScratchDemand {
             ttl: crate::ttl_plan::plan_demand(state, meta, u64::try_from(rows).unwrap_or(u64::MAX)),
             nested: None,
+            sweep_ranges: 0,
             // A slot whose image cannot be read refuses in the call itself.
             bitmap: (meta.slot_type() == SlotType::Bitmap)
                 .then(|| {
@@ -3252,6 +3260,100 @@ const NEEDS_GROWTH: u32 = ErrorCode::NeedsGrowth as u32;
 const OUT_OF_MEMORY: u32 = ErrorCode::OutOfMemory as u32;
 
 impl Vm {
+    fn sweep_stored_rows(
+        &mut self,
+        delta_mode: bool,
+        state: &mut [u8],
+        (slot, predicate_col): (u32, u32),
+        cols: &[&[u8]],
+        batch_len: u32,
+        mut live: Option<&mut LiveColumns<'_, '_>>,
+    ) -> Result<(), ErrorCode> {
+        let map = CheckedStructMap::bind(state, slot)?.view;
+        if batch_len == 0 {
+            return Ok(());
+        }
+        let predicate_col_index =
+            usize::try_from(predicate_col).map_err(|_| ErrorCode::InvalidProgram)?;
+        let bound = col_u32_exact(col_at(cols, predicate_col_index), batch_len)
+            .ok_or(ErrorCode::ColumnUnderrun)?;
+        let logical_row = batch_len - 1;
+        let logical_index = usize::try_from(logical_row).map_err(|_| ErrorCode::InvalidProgram)?;
+        self.sweep_ranges.clear();
+        let size = map.size(state);
+        let ranges = usize::try_from(size)
+            .map_err(|_| ErrorCode::OutOfMemory)?
+            .checked_add(1)
+            .ok_or(ErrorCode::OutOfMemory)?;
+        if self.scratch_sealed {
+            debug_assert!(
+                self.sweep_ranges.capacity() >= ranges,
+                "batch admission must back the stored-row sweep plan"
+            );
+        } else {
+            self.sweep_ranges
+                .try_reserve(ranges)
+                .map_err(|_| ErrorCode::OutOfMemory)?;
+        }
+        let mut removed = 0u32;
+        for position in 0..map.capacity {
+            let key = map.key_at(state, position);
+            if key == EMPTY_KEY || key == TOMBSTONE {
+                continue;
+            }
+            let predicate = match live.as_deref_mut().and_then(|live| {
+                live.stored_cell(
+                    predicate_col,
+                    logical_row,
+                    state,
+                    cols,
+                    StoredRow::new(state, &map, position),
+                )
+            }) {
+                Some(result) => result?,
+                None => bound[logical_index],
+            };
+            if predicate == 0 {
+                continue;
+            }
+            if removed == size {
+                return Err(ErrorCode::InvalidState);
+            }
+            if removed == 0 {
+                self.sweep_ranges.push((map.size_off, 4));
+            }
+            let offset = map.keys_off + position * 4;
+            if let Some((_, len)) = self
+                .sweep_ranges
+                .last_mut()
+                .filter(|(start, len)| removed != 0 && *start + *len == offset)
+            {
+                *len += 4;
+            } else {
+                self.sweep_ranges.push((offset, 4));
+            }
+            removed += 1;
+        }
+        if removed == 0 {
+            return Ok(());
+        }
+        let size = size.checked_sub(removed).ok_or(ErrorCode::InvalidState)?;
+        let flags = usize::try_from(slot_meta_base(slot) + SlotMetaOffset::CHANGE_FLAGS)
+            .map_err(|_| ErrorCode::InvalidState)?;
+        let capture = self
+            .undo
+            .begin_capture(state, || self.sweep_ranges.as_slice())?;
+        for &(offset, len) in &self.sweep_ranges[1..] {
+            for at in (offset..offset + len).step_by(4) {
+                bytes::write_u32(state, at, TOMBSTONE);
+            }
+        }
+        map.set_size(state, size);
+        state[flags] |= ChangeFlag::REMOVED;
+        self.undo.finish_capture(delta_mode, state, capture);
+        Ok(())
+    }
+
     /// Execute one batch using the VM's normal mutation lane, over a batch
     /// with no live derived columns (`row_exprs`).
     pub fn execute_batch(
@@ -3503,6 +3605,21 @@ impl Vm {
 
             match op {
                 Opcode::Halt => break,
+
+                Opcode::StructMapSweep => {
+                    let operands = (operand!(r.index()), operand!(r.index()));
+                    pc = r.pos();
+                    if let Err(error) = self.sweep_stored_rows(
+                        delta_mode,
+                        state,
+                        operands,
+                        cols,
+                        batch_len,
+                        live.as_deref_mut(),
+                    ) {
+                        return error as u32;
+                    }
+                }
 
                 Opcode::BatchMapUpsertLatest | Opcode::BatchMapUpsertLatestTtl => {
                     let (slot, key_col, val_col, ts_col) = (

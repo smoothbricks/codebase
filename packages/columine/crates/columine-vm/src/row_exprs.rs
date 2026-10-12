@@ -51,9 +51,10 @@
 //! already applied — otherwise the answer depends on where the host cut its
 //! batches, and one batch of `n` rows and `n` batches of one row store
 //! different values. A live column is read by the per-element conditional
-//! opcodes (the `*_IF` family); the batch aggregates read the bound cells,
-//! so an embedder lowers a state-reading expression only to a per-element
-//! predicate. A live column read by anything else — an aggregate, an
+//! opcodes (the `*_IF` family) or by a top-level stored-row sweep. The sweep
+//! supplies [`StoredRow`] for each live stored key and the last input row
+//! for the logical clock. Batch aggregates still read bound cells.
+//! A live column read by anything else — an aggregate, an
 //! aggregate's `*_IF` predicate, a key, value, timestamp or element operand,
 //! the `FOR_EACH` type column, the table's own type column — would see the
 //! zero placeholder; the bind refuses such a program with `InvalidProgram`
@@ -63,10 +64,13 @@
 //! [`column_uses`]: crate::column_uses
 
 use columine_types::operand::Operands;
-use columine_types::types::{ErrorCode, ProgramHeader};
+use columine_types::types::{
+    ErrorCode, ProgramHeader, StructFieldType, is_arena_field_type, struct_field_size,
+};
 
 use crate::bytes;
 use crate::column_uses::{ColumnUse, reduce_column_uses};
+use crate::struct_map::StructMapSlot;
 use crate::vm::{col_at, col_u32, col_u32_exact, u32s_as_bytes};
 
 /// ASCII `R X P 1` in little-endian wire order.
@@ -74,6 +78,60 @@ pub const ROW_EXPRESSIONS_MAGIC: u32 = 0x3150_5852;
 
 /// Magic and entry count: the fixed part of the table header.
 const TABLE_FIXED_BYTES: usize = 4 + 2;
+
+/// One live stored row, borrowing the map geometry and state image.
+/// Only the sweep constructs this view, after validating the slot.
+pub struct StoredRow<'a> {
+    state: &'a [u8],
+    map: &'a StructMapSlot,
+    position: u32,
+}
+
+impl<'a> StoredRow<'a> {
+    pub(crate) const fn new(state: &'a [u8], map: &'a StructMapSlot, position: u32) -> Self {
+        Self {
+            state,
+            map,
+            position,
+        }
+    }
+
+    pub fn key(&self) -> u32 {
+        self.map.key_at(self.state, self.position)
+    }
+
+    pub const fn num_fields(&self) -> u8 {
+        self.map.num_fields
+    }
+
+    pub fn field_type(&self, field: u8) -> Result<StructFieldType, ErrorCode> {
+        if field >= self.map.num_fields {
+            return Err(ErrorCode::InvalidProgram);
+        }
+        Ok(self.map.field_type(self.state, field))
+    }
+
+    /// Present scalar cell bytes or an arena field's borrowed payload.
+    /// An absent field is `None`; an invalid field ordinal is a typed error.
+    pub fn field(&self, field: u8) -> Result<Option<&'a [u8]>, ErrorCode> {
+        let kind = self.field_type(field)?;
+        if is_arena_field_type(kind) {
+            return self.map.arena_field(self.state, self.position, field);
+        }
+        let row = self.map.row_off(self.position);
+        if !StructMapSlot::is_field_set(self.state, row, field) {
+            return Ok(None);
+        }
+        let offset = row + self.map.field_offset(self.state, field);
+        let end = offset + struct_field_size(kind);
+        let offset = usize::try_from(offset).map_err(|_| ErrorCode::InvalidState)?;
+        let end = usize::try_from(end).map_err(|_| ErrorCode::InvalidState)?;
+        self.state
+            .get(offset..end)
+            .map(Some)
+            .ok_or(ErrorCode::InvalidState)
+    }
+}
 
 /// The batch as one entry sees it: the live state, the host's columns, and
 /// the derived columns the entries before it already bound.
@@ -84,6 +142,7 @@ pub struct BatchView<'a> {
     /// Target column of each earlier entry, parallel to `derived`.
     derived_targets: &'a [u32],
     derived: &'a [Vec<u32>],
+    stored_row: Option<StoredRow<'a>>,
 }
 
 impl<'a> BatchView<'a> {
@@ -96,6 +155,7 @@ impl<'a> BatchView<'a> {
             cols,
             derived_targets: &[],
             derived: &[],
+            stored_row: None,
         }
     }
 
@@ -107,6 +167,12 @@ impl<'a> BatchView<'a> {
             Some(i) => u32s_as_bytes(&self.derived[i]),
             None => col_at(self.cols, col as usize),
         }
+    }
+
+    /// The sweep's live stored row, absent during ordinary row evaluation
+    /// and admission. The view cannot outlive this batch borrow.
+    pub fn stored_row(&self) -> Option<&StoredRow<'a>> {
+        self.stored_row.as_ref()
     }
 
     /// Number of columns the host passed.
@@ -321,6 +387,28 @@ impl LiveColumns<'_, '_> {
         state: &[u8],
         cols: &[&[u8]],
     ) -> Option<Result<u32, ErrorCode>> {
+        self.cell_at(col, row, state, cols, None)
+    }
+
+    pub(crate) fn stored_cell<'a>(
+        &mut self,
+        col: u32,
+        row: u32,
+        state: &'a [u8],
+        cols: &'a [&'a [u8]],
+        stored: StoredRow<'a>,
+    ) -> Option<Result<u32, ErrorCode>> {
+        self.cell_at(col, row, state, cols, Some(stored))
+    }
+
+    fn cell_at<'a>(
+        &mut self,
+        col: u32,
+        row: u32,
+        state: &'a [u8],
+        cols: &'a [&'a [u8]],
+        stored: Option<StoredRow<'a>>,
+    ) -> Option<Result<u32, ErrorCode>> {
         let rows = self.rows;
         let entry = rows.live[rows.live_entry(col)?];
         let type_cell = col_u32(col_at(cols, rows.type_col as usize), rows.batch_len)
@@ -333,7 +421,8 @@ impl LiveColumns<'_, '_> {
             return Some(Ok(0));
         }
         let expr = &self.program[entry.expr.start..entry.expr.end];
-        let batch = BatchView::host(state, cols, rows.batch_len);
+        let mut batch = BatchView::host(state, cols, rows.batch_len);
+        batch.stored_row = stored;
         Some(self.eval.eval(expr, &batch, row))
     }
 }
@@ -431,9 +520,10 @@ impl Range {
     }
 }
 
-/// A live column holds zero placeholder cells; only a per-element `*_IF`
-/// predicate resolves it through the handle. The table's type column and
-/// every plain read of the reduce section ([`ColumnUse::Read`]) would take
+/// A live column holds zero placeholder cells; a per-element `*_IF`
+/// predicate or stored-row sweep resolves it through the handle.
+/// The table's type column and every plain read of the reduce section
+/// ([`ColumnUse::Read`]) would take
 /// the zeros as cells, so a program that reads a live column that way is
 /// refused before any column is spliced.
 fn refuse_plain_reads_of_live_columns(
@@ -546,6 +636,7 @@ pub fn bind_row_columns<'a, 'e, E: RowExpression>(
             cols: view,
             derived_targets: &out.targets[..i],
             derived: done,
+            stored_row: None,
         };
         let binding = eval.admit(entry.expr, &batch)?;
         let cells = &mut rest[0];

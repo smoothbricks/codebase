@@ -520,3 +520,89 @@ fn plain_batch_struct_map_upsert_stamps_change_flags() {
     assert_ne!(change_flags(&state) & ChangeFlag::UPDATED, 0);
     assert_eq!(change_flags(&state) & ChangeFlag::INSERTED, 0);
 }
+
+#[test]
+fn stored_row_sweep_removes_keys_absent_from_the_input_batch() {
+    let seed = program(2, &[0], &upsert(0x80, 0, &[(1, 0)], &[], None));
+    let mut state = init(&seed);
+    let mut vm = Vm::default();
+    let keys = [10, 20];
+    let values = [100, 200];
+    assert_eq!(
+        vm.execute_batch_delta(
+            &mut state,
+            &seed,
+            &[u32s_as_bytes(&keys), u32s_as_bytes(&values)],
+            2,
+        ),
+        OK,
+    );
+    let sweep = program(2, &[0], &[0x8a, 0, 1]);
+    let incoming_keys = [999];
+    let predicates = [1];
+    assert_eq!(
+        vm.execute_batch_delta(
+            &mut state,
+            &sweep,
+            &[u32s_as_bytes(&incoming_keys), u32s_as_bytes(&predicates)],
+            1,
+        ),
+        OK,
+    );
+    let stored = CheckedStructMap::bind(&state, 0).expect("valid stored map");
+    assert_eq!(stored.row(10), None);
+    assert_eq!(stored.row(20), None);
+    assert_eq!(stored.row(999), None);
+}
+
+#[test]
+fn stored_row_sweep_reserves_for_rows_inserted_by_preceding_instructions() {
+    let mut reduce = upsert(0x80, 0, &[(1, 0)], &[], None);
+    reduce.extend([0x8a, 0, 1]);
+    let program = program(2, &[0], &reduce);
+    let mut state = init(&program);
+    let mut vm = Vm::default();
+    let keys = [10, 20];
+    let values = [100, 200];
+    assert_eq!(
+        vm.execute_batch(
+            &mut state,
+            &program,
+            &[u32s_as_bytes(&keys), u32s_as_bytes(&values)],
+            2,
+        ),
+        OK,
+    );
+    assert_eq!(StructMapSlot::bind(&state, 0).size(&state), 0);
+    assert_eq!(
+        CheckedStructMap::bind(&state, 0)
+            .expect("valid map")
+            .row(10),
+        None
+    );
+    assert_eq!(
+        CheckedStructMap::bind(&state, 0)
+            .expect("valid map")
+            .row(20),
+        None
+    );
+    assert_ne!(change_flags(&state) & ChangeFlag::REMOVED, 0);
+}
+
+#[test]
+fn stored_row_sweep_refuses_malformed_geometry_before_writing() {
+    let program = program(1, &[0], &[0x8a, 0, 0]);
+    let mut state = init(&program);
+    bytes::write_u32(
+        &mut state,
+        STATE_HEADER_SIZE + SlotMetaOffset::CAPACITY,
+        u32::MAX,
+    );
+    let malformed = state.clone();
+    let mut vm = Vm::default();
+    assert_eq!(
+        vm.execute_batch(&mut state, &program, &[u32s_as_bytes(&[1])], 1),
+        ErrorCode::InvalidState as u32,
+    );
+    assert_eq!(state, malformed);
+}

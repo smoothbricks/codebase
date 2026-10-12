@@ -3,14 +3,15 @@
 //! spliced into the batch so dispatch reads the derived column like input.
 
 use columine_types::PROGRAM_MAGIC;
-use columine_types::types::ErrorCode;
+use columine_types::types::{ChangeFlag, ErrorCode, StructFieldType};
 use columine_vm::meta::SlotMetaView;
 use columine_vm::row_exprs::{
     BatchView, Binding, ROW_EXPRESSIONS_MAGIC, RowColumns, RowExpression, bind_row_columns,
 };
 use columine_vm::state_init::{DEFAULT_ACCEPTED_PROGRAM_MAGICS, calculate_state_size, init_state};
 use columine_vm::struct_map::StructMapSlot;
-use columine_vm::vm::{CheckedMap, Vm, col_u32_exact, u32s_as_bytes};
+use columine_vm::undo_log::FLAT_UNDO_ENTRY_SIZE;
+use columine_vm::vm::{CheckedMap, CheckedStructMap, Vm, col_u32_exact, u32s_as_bytes};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
@@ -94,15 +95,27 @@ fn program(trailer: &[u8]) -> Vec<u8> {
     reduce.extend((body.len() as u16).to_le_bytes());
     reduce.extend(body);
     reduce.push(0); // HALT
+    program_sections(&init, &reduce, trailer)
+}
+
+fn program_sections(init: &[u8], reduce: &[u8], trailer: &[u8]) -> Vec<u8> {
     let mut prog = vec![0u8; 32];
     prog.extend(PROGRAM_MAGIC.to_le_bytes());
     prog.extend([2, 0, 0, 0]); // version 2, no callbacks, no flags
     prog.extend(1u32.to_le_bytes());
     prog.extend(4u32.to_le_bytes());
-    prog.extend((init.len() as u32).to_le_bytes());
-    prog.extend((reduce.len() as u32).to_le_bytes());
-    prog.extend(init);
-    prog.extend(&reduce);
+    prog.extend(
+        u32::try_from(init.len())
+            .expect("init length fits u32")
+            .to_le_bytes(),
+    );
+    prog.extend(
+        u32::try_from(reduce.len())
+            .expect("reduce length fits u32")
+            .to_le_bytes(),
+    );
+    prog.extend_from_slice(init);
+    prog.extend_from_slice(reduce);
     prog.extend_from_slice(trailer);
     prog
 }
@@ -1220,4 +1233,422 @@ fn a_live_element_predicate_binds_beside_a_guarded_scatter() {
     );
     let meta = SlotMetaView::read(&state, 1);
     assert_eq!(meta.size(&state), 2, "both live predicates were non-zero");
+}
+
+fn stored_program(slot: u8, predicate: u8, reduce_prefix: &[u8]) -> Vec<u8> {
+    let init = [0x18, 0, 6, 8, 0, 2, 0, 0, 0];
+    let mut reduce = reduce_prefix.to_vec();
+    reduce.extend([0x8a, slot, predicate, 0]);
+    program_sections(
+        &init,
+        &reduce,
+        &table(TYPE_COL, &[entry(PRED_COL, &[ORDER_TYPE], &[0])]),
+    )
+}
+
+fn stored_fixture(program: &[u8]) -> Vec<u8> {
+    let mut state = init(program);
+    let map = StructMapSlot::bind(&state, 0);
+    for (key, settled, at) in [
+        (10, 1, Some(100)),
+        (20, 1, Some(150)),
+        (30, 0, Some(1)),
+        (40, 1, None),
+    ] {
+        let row = map.upsert(&mut state, key).expect("fixture fits");
+        map.write_scalar_field(&mut state, row.pos, 0, &[u32s_as_bytes(&[settled])], 0, 0);
+        if let Some(at) = at {
+            map.write_scalar_field(&mut state, row.pos, 1, &[u32s_as_bytes(&[at])], 0, 0);
+        }
+    }
+    state
+}
+
+#[derive(Default)]
+struct StoredRetention {
+    evaluated: usize,
+    fail_after: Option<usize>,
+    invalid_field: bool,
+}
+
+impl RowExpression for StoredRetention {
+    fn admit(&mut self, expr: &[u8], batch: &BatchView<'_>) -> Result<Binding, ErrorCode> {
+        assert!(batch.stored_row().is_none());
+        if expr != [0] {
+            return Err(ErrorCode::InvalidProgram);
+        }
+        col_u32_exact(batch.column(u32::from(VAL_COL)), batch.batch_len)
+            .ok_or(ErrorCode::ColumnUnderrun)?;
+        Ok(Binding::Live)
+    }
+
+    fn eval(
+        &mut self,
+        _: &[u8],
+        batch: &BatchView<'_>,
+        logical_row: u32,
+    ) -> Result<u32, ErrorCode> {
+        self.evaluated += 1;
+        if self.fail_after == Some(self.evaluated) {
+            return Err(ErrorCode::InvalidCellValue);
+        }
+        let stored = batch.stored_row().ok_or(ErrorCode::InvalidProgram)?;
+        assert!([10, 20, 30, 40].contains(&stored.key()));
+        assert_eq!(stored.num_fields(), 2);
+        assert_eq!(stored.field_type(0)?, StructFieldType::UInt32);
+        if self.invalid_field {
+            stored.field(stored.num_fields())?;
+        }
+        let field = |ordinal| -> Result<Option<u32>, ErrorCode> {
+            stored
+                .field(ordinal)?
+                .map(|bytes| {
+                    bytes
+                        .try_into()
+                        .map(u32::from_le_bytes)
+                        .map_err(|_| ErrorCode::InvalidCellValue)
+                })
+                .transpose()
+        };
+        if field(0)? != Some(1) {
+            return Ok(0);
+        }
+        let Some(at) = field(1)? else {
+            return Ok(0);
+        };
+        let clock = col_u32_exact(batch.column(u32::from(VAL_COL)), batch.batch_len)
+            .ok_or(ErrorCode::ColumnUnderrun)?;
+        let logical_row = usize::try_from(logical_row).map_err(|_| ErrorCode::InvalidProgram)?;
+        Ok(u32::from(
+            clock[logical_row]
+                .checked_sub(at)
+                .is_some_and(|elapsed| elapsed >= 50),
+        ))
+    }
+}
+
+fn run_stored(
+    vm: &mut Vm,
+    state: &mut [u8],
+    program: &[u8],
+    types: &[u32],
+    clocks: &[u32],
+    eval: &mut StoredRetention,
+) -> u32 {
+    let batch_len = u32::try_from(types.len()).expect("batch length fits");
+    let mut cols = [u32s_as_bytes(types), &[], u32s_as_bytes(clocks), &[]];
+    let mut rows = RowColumns::new();
+    let mut live = bind_row_columns(program, state, &mut cols, batch_len, eval, &mut rows)
+        .expect("admitted stored predicate");
+    vm.execute_batch_delta_live(state, program, &cols, batch_len, &mut live)
+}
+
+fn stored_keys(state: &[u8]) -> Vec<u32> {
+    let map = CheckedStructMap::bind(state, 0).expect("valid stored map");
+    let mut keys = Vec::new();
+    let mut position = map.iter_start();
+    while position < map.capacity() {
+        keys.push(map.iter_key(position).expect("live cell"));
+        position = map.iter_next(position).expect("valid cursor");
+    }
+    keys.sort_unstable();
+    keys
+}
+
+#[test]
+fn stored_sweep_reads_the_last_logical_input_row_and_keeps_zero_predicates() {
+    let program = stored_program(0, PRED_COL, &[]);
+    let mut state = stored_fixture(&program);
+    let mut vm = Vm::default();
+    let mut eval = StoredRetention::default();
+    assert_eq!(
+        run_stored(
+            &mut vm,
+            &mut state,
+            &program,
+            &[ORDER_TYPE; 2],
+            &[1, 151],
+            &mut eval
+        ),
+        OK
+    );
+    assert_eq!(stored_keys(&state), [20, 30, 40]);
+    assert_eq!(eval.evaluated, 4);
+    assert_ne!(
+        SlotMetaView::read(&state, 0).change_flags(&state) & ChangeFlag::REMOVED,
+        0
+    );
+}
+
+#[test]
+fn stored_sweep_uses_inclusive_deterministic_retention_boundaries() {
+    let program = stored_program(0, PRED_COL, &[]);
+    let mut state = stored_fixture(&program);
+    let before = state.clone();
+    let mut vm = Vm::default();
+    let mut eval = StoredRetention::default();
+    assert_eq!(
+        run_stored(
+            &mut vm,
+            &mut state,
+            &program,
+            &[ORDER_TYPE],
+            &[149],
+            &mut eval
+        ),
+        OK
+    );
+    assert_eq!(state, before);
+    assert_eq!(
+        run_stored(
+            &mut vm,
+            &mut state,
+            &program,
+            &[ORDER_TYPE],
+            &[150],
+            &mut eval
+        ),
+        OK
+    );
+    assert_eq!(stored_keys(&state), [20, 30, 40]);
+    assert_eq!(
+        run_stored(
+            &mut vm,
+            &mut state,
+            &program,
+            &[ORDER_TYPE],
+            &[200],
+            &mut eval
+        ),
+        OK
+    );
+    assert_eq!(stored_keys(&state), [30, 40]);
+}
+
+#[test]
+fn stored_sweep_empty_batch_and_unmatched_type_leave_state_unchanged() {
+    let program = stored_program(0, PRED_COL, &[]);
+    let mut state = stored_fixture(&program);
+    let before = state.clone();
+    let mut vm = Vm::default();
+    let mut eval = StoredRetention::default();
+    assert_eq!(
+        run_stored(&mut vm, &mut state, &program, &[], &[], &mut eval),
+        OK
+    );
+    assert_eq!(state, before);
+    assert_eq!(
+        run_stored(
+            &mut vm,
+            &mut state,
+            &program,
+            &[ORDER_TYPE + 1],
+            &[300],
+            &mut eval
+        ),
+        OK
+    );
+    assert_eq!(state, before);
+    assert_eq!(eval.evaluated, 0);
+}
+
+#[test]
+fn stored_sweep_predicate_failure_precedes_all_row_mutations() {
+    let program = stored_program(0, PRED_COL, &[]);
+    let mut state = stored_fixture(&program);
+    let map = StructMapSlot::bind(&state, 0);
+    for key in [10, 20, 30, 40] {
+        let position = map.find(&state, key).expect("fixture key");
+        map.write_scalar_field(&mut state, position, 0, &[u32s_as_bytes(&[1])], 0, 0);
+        map.write_scalar_field(&mut state, position, 1, &[u32s_as_bytes(&[100])], 0, 0);
+    }
+    let before = state.clone();
+    let mut vm = Vm::default();
+    vm.undo_enable(&state).expect("journal admits image");
+    let checkpoint = vm.undo_checkpoint();
+    let mut eval = StoredRetention {
+        fail_after: Some(2),
+        ..StoredRetention::default()
+    };
+    assert_eq!(
+        run_stored(
+            &mut vm,
+            &mut state,
+            &program,
+            &[ORDER_TYPE],
+            &[300],
+            &mut eval
+        ),
+        ErrorCode::InvalidCellValue as u32
+    );
+    assert_eq!(state, before);
+    assert_eq!(vm.undo_checkpoint(), checkpoint);
+}
+
+#[test]
+fn stored_sweep_invalid_slot_column_and_field_are_typed_refusals() {
+    let program = stored_program(0, PRED_COL, &[]);
+    let mut state = stored_fixture(&program);
+    let before = state.clone();
+    let mut vm = Vm::default();
+    let mut eval = StoredRetention::default();
+    let invalid_slot = stored_program(1, PRED_COL, &[]);
+    assert_eq!(
+        run_stored(
+            &mut vm,
+            &mut state,
+            &invalid_slot,
+            &[ORDER_TYPE],
+            &[300],
+            &mut eval
+        ),
+        ErrorCode::InvalidSlot as u32
+    );
+    assert_eq!(state, before);
+    let invalid_column = stored_program(0, 4, &[]);
+    assert_eq!(
+        run_stored(
+            &mut vm,
+            &mut state,
+            &invalid_column,
+            &[ORDER_TYPE],
+            &[300],
+            &mut eval
+        ),
+        ErrorCode::ColumnUnderrun as u32
+    );
+    assert_eq!(state, before);
+    eval.invalid_field = true;
+    assert_eq!(
+        run_stored(
+            &mut vm,
+            &mut state,
+            &program,
+            &[ORDER_TYPE],
+            &[300],
+            &mut eval
+        ),
+        ErrorCode::InvalidProgram as u32
+    );
+    assert_eq!(state, before);
+}
+
+#[test]
+fn stored_sweep_undo_and_delta_restore_exact_images_and_idle_records_nothing() {
+    let program = stored_program(0, PRED_COL, &[]);
+    let mut state = stored_fixture(&program);
+    let before = state.clone();
+    let mut vm = Vm::default();
+    vm.undo_enable(&state).expect("journal admits image");
+    let checkpoint = vm.undo_checkpoint();
+    let mut eval = StoredRetention::default();
+    assert_eq!(
+        run_stored(
+            &mut vm,
+            &mut state,
+            &program,
+            &[ORDER_TYPE],
+            &[300],
+            &mut eval
+        ),
+        OK
+    );
+    assert_eq!(stored_keys(&state), [30, 40]);
+    let after = state.clone();
+    let end = vm.undo_checkpoint();
+    assert!(end > checkpoint);
+    vm.delta_export_segment(checkpoint, end)
+        .expect("paired physical delta");
+    let undo = vm.delta_export_undo().to_vec();
+    let redo = vm.delta_export_redo().to_vec();
+    let mut receiver = before.clone();
+    let mut receiver_vm = Vm::default();
+    receiver_vm
+        .delta_apply_rollforward_segment(&mut receiver, &redo, FLAT_UNDO_ENTRY_SIZE)
+        .expect("apply physical redo");
+    assert_eq!(receiver, after);
+    receiver_vm
+        .delta_apply_rollback_segment(&mut receiver, &undo, FLAT_UNDO_ENTRY_SIZE)
+        .expect("apply physical undo");
+    assert_eq!(receiver, before);
+    assert_eq!(
+        run_stored(
+            &mut vm,
+            &mut state,
+            &program,
+            &[ORDER_TYPE],
+            &[300],
+            &mut eval
+        ),
+        OK
+    );
+    assert_eq!(state, after);
+    assert_eq!(vm.undo_checkpoint(), end);
+    vm.undo_rollback(&mut state, checkpoint)
+        .expect("rollback sweep");
+    assert_eq!(state, before);
+}
+
+#[test]
+fn warmed_stored_sweep_evaluates_and_mutates_with_allocation_refused() {
+    let program = stored_program(0, PRED_COL, &[]);
+    let mut state = stored_fixture(&program);
+    let mut vm = Vm::default();
+    let mut eval = StoredRetention::default();
+    vm.undo_enable(&state).expect("journal admits image");
+    let checkpoint = vm.undo_checkpoint();
+    assert_eq!(
+        run_stored(
+            &mut vm,
+            &mut state,
+            &program,
+            &[ORDER_TYPE],
+            &[300],
+            &mut eval
+        ),
+        OK
+    );
+    vm.undo_rollback(&mut state, checkpoint)
+        .expect("restore warmed image");
+    let types = [ORDER_TYPE];
+    let clocks = [300];
+    let mut cols = [u32s_as_bytes(&types), &[], u32s_as_bytes(&clocks), &[]];
+    let mut rows = RowColumns::new();
+    let mut live = bind_row_columns(&program, &state, &mut cols, 1, &mut eval, &mut rows)
+        .expect("bind before allocator refusal");
+    assert_eq!(
+        without_memory(|| vm.execute_batch_delta_live(&mut state, &program, &cols, 1, &mut live)),
+        OK
+    );
+    assert_eq!(stored_keys(&state), [30, 40]);
+}
+
+#[test]
+fn stored_sweep_is_not_an_element_body_instruction() {
+    let mut body = vec![0xE0, TYPE_COL, 1];
+    body.extend(ORDER_TYPE.to_le_bytes());
+    body.extend(3u16.to_le_bytes());
+    body.extend([0x8a, 0, PRED_COL]);
+    let program = stored_program(0, PRED_COL, &body);
+    assert!(calculate_state_size(&program, DEFAULT_ACCEPTED_PROGRAM_MAGICS).is_err());
+}
+
+#[test]
+fn cold_stored_sweep_allocation_refusal_precedes_writes() {
+    let program = stored_program(0, PRED_COL, &[]);
+    let mut state = stored_fixture(&program);
+    let before = state.clone();
+    let types = [ORDER_TYPE];
+    let clocks = [300];
+    let mut cols = [u32s_as_bytes(&types), &[], u32s_as_bytes(&clocks), &[]];
+    let mut rows = RowColumns::new();
+    let mut eval = StoredRetention::default();
+    let mut live = bind_row_columns(&program, &state, &mut cols, 1, &mut eval, &mut rows)
+        .expect("bind before allocator refusal");
+    let mut vm = Vm::default();
+    assert_eq!(
+        without_memory(|| vm.execute_batch_live(&mut state, &program, &cols, 1, &mut live)),
+        ErrorCode::OutOfMemory as u32,
+    );
+    assert_eq!(state, before);
 }

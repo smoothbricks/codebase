@@ -5,9 +5,10 @@
 //! every operand that names a batch column together with its
 //! [`ColumnUse`]. The one distinction that matters to a caller is whether a
 //! read resolves through the live-column handle: the per-element
-//! conditional opcodes (`*_IF` in a `FOR_EACH` body) ask [`LiveColumns`]
-//! for their predicate cell; every other read — aggregates, their `*_IF`
-//! predicates, keys, values, timestamps, elements, offsets, the `FOR_EACH`
+//! conditional opcodes (`*_IF` in a `FOR_EACH` body) and the top-level
+//! stored-row sweep ask [`LiveColumns`] for their predicate cell; every other
+//! read — aggregates, their `*_IF` predicates, keys, values, timestamps,
+//! elements, offsets, the `FOR_EACH`
 //! type column — takes the bytes the batch carries. A live column carries
 //! zero placeholder cells, so such a read would silently see zeros;
 //! `row_exprs` refuses the bind instead.
@@ -46,6 +47,8 @@ pub enum ColumnUse {
     /// The predicate of a per-element conditional opcode: resolved through
     /// the live-column handle when the column is live.
     ElementPredicate,
+    /// A top-level predicate evaluated against a borrowed stored map row.
+    StoredRowPredicate,
 }
 
 /// One column operand of a reduce section, by the role it plays.
@@ -179,6 +182,13 @@ fn walk_op(
     };
     match op {
         Opcode::Halt => {}
+        Opcode::StructMapSweep => {
+            if predicate != ColumnUse::Read {
+                return None;
+            }
+            ops.index()?;
+            cell(visit, ops.index()?, ColumnUse::StoredRowPredicate);
+        }
         Opcode::BatchMapUpsertLatest | Opcode::BatchMapUpsertLatestTtl => {
             ops.index()?;
             reads(ops, 3, visit)?;
