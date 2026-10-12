@@ -3,15 +3,13 @@
 //! These columns belong only on the job span. A process span that carries one fails
 //! [`crate::runtime::process_spans::read_process_segment`].
 
-use std::path::Path;
-
 use arrow_schema::{DataType, Field};
 
 use crate::api::resources::{
     ChargedMemoryUsage, HostLoad1, HostLoadSample, JobVolumeUsage, ResourceUnitError, VolumeUsage,
 };
 use crate::host_load::HostLoadError;
-use crate::runtime::volume_usage::{HostVolumeStat, VolumeBaseline, VolumeMountpoint};
+use crate::runtime::volume_usage::{HostVolume, HostVolumeStat, VolumeBaseline};
 
 /// Nearest milliload. Non-finite, negative, and overflowing loads are refused, never truncated.
 pub fn milliload(load: HostLoad1) -> Result<u32, ResourceUnitError> {
@@ -19,7 +17,11 @@ pub fn milliload(load: HostLoad1) -> Result<u32, ResourceUnitError> {
     if !scaled.is_finite() || scaled < 0.0 || scaled > f64::from(u32::MAX) {
         return Err(ResourceUnitError::InvalidHostLoad { value: load.get() });
     }
-    Ok(scaled.round() as u32)
+    // The range check makes this an integer in `u32`. Parsing that decimal is the
+    // checked conversion; a float-to-int cast is not.
+    format!("{:.0}", scaled.round())
+        .parse()
+        .map_err(|_| ResourceUnitError::InvalidHostLoad { value: load.get() })
 }
 
 /// Signed workspace and build deltas for one job-span boundary. An absent or unreadable build
@@ -51,27 +53,25 @@ pub fn job_boundary_fields() -> Vec<Field> {
 /// Host, volume, and charged-memory facts for one job-span start or end.
 /// Absent build volume and absent charged memory stay null. This does not
 /// name a leaf or compute unattributed usage.
+#[derive(Debug)]
 pub struct JobSpanBoundary {
     pub host: HostLoadSample,
     pub volumes: JobVolumeUsage,
     pub charged: Option<ChargedMemoryUsage>,
 }
 
-/// The host's current load and the admitted volume probe.
+/// The host's current load and a sample of the baseline admission already took.
 ///
-/// `workspace` is required. `build` is probed only when the admission named
-/// one; an absent build mount is `None`, never a zero and never an invented
-/// path. A stat that fails stays [`VolumeUsage::Unavailable`]. Charged memory
-/// is not read here.
+/// The actor passes `job.volumes`. This does not admit again, so an end row's
+/// delta is against that baseline, not against the terminal instant. An absent
+/// build on the baseline stays absent. Charged memory is not read here.
 pub fn sample_job_boundary(
-    workspace: &VolumeMountpoint,
-    build: Option<&Path>,
+    volumes: &VolumeBaseline<HostVolume>,
 ) -> Result<JobSpanBoundary, HostLoadError> {
     let host = crate::host_load::read_host_load()?;
-    let volumes = VolumeBaseline::admitted(Some(workspace), build).sample(&HostVolumeStat);
     Ok(JobSpanBoundary {
         host,
-        volumes,
+        volumes: volumes.sample(&HostVolumeStat),
         charged: None,
     })
 }
@@ -157,37 +157,56 @@ mod tests {
     }
 
     #[test]
-    fn a_native_boundary_reads_the_host_and_leaves_an_absent_build_null() {
-        use std::path::Path;
+    fn a_boundary_samples_the_admitted_baseline_not_a_fresh_one() {
+        use std::path::PathBuf;
 
-        use crate::runtime::volume_usage::VolumeMountpoint;
+        use crate::runtime::volume_usage::{VolumeAtSpawn, VolumeMountpoint};
 
-        let workspace = VolumeMountpoint::new("/".into()).expect("root is a mount");
-        let absent = sample_job_boundary(&workspace, None).expect("the host answers");
-        assert!(absent.volumes.build.is_none(), "{:?}", absent.volumes.build);
-        assert!(absent.charged.is_none());
-        let host = crate::host_load::read_host_load().expect("a second host read");
-        assert_eq!(absent.host.cores, host.cores);
-        let (workspace_delta, build_delta) = volume_deltas(&absent.volumes);
-        assert!(build_delta.is_none());
-        match &absent.volumes.workspace {
-            VolumeUsage::Read { delta_bytes } => {
-                assert_eq!(workspace_delta, Some(delta_bytes.get()));
-            }
-            VolumeUsage::Unavailable { .. } => assert!(workspace_delta.is_none()),
+        let mut candidates = vec![
+            PathBuf::from("/System/Volumes/Data"),
+            PathBuf::from("/System/Volumes/Preboot"),
+            PathBuf::from("/dev"),
+        ];
+        if let Ok(entries) = std::fs::read_dir("/Volumes") {
+            candidates.extend(entries.flatten().map(|entry| entry.path()));
         }
-
-        let present =
-            sample_job_boundary(&workspace, Some(Path::new("/"))).expect("the host answers");
-        let build = present
-            .volumes
-            .build
-            .as_ref()
-            .expect("the asked volume was probed");
-        let (_, build_delta) = volume_deltas(&present.volumes);
-        match build {
-            VolumeUsage::Read { delta_bytes } => assert_eq!(build_delta, Some(delta_bytes.get())),
-            VolumeUsage::Unavailable { .. } => assert!(build_delta.is_none()),
-        }
+        let (workspace, admitted) = candidates
+            .into_iter()
+            .find_map(|path| {
+                let mount = VolumeMountpoint::new(path).ok()?;
+                let admitted = VolumeBaseline::admitted(Some(&mount), None);
+                matches!(admitted.workspace, VolumeAtSpawn::Read { .. })
+                    .then_some((mount, admitted))
+            })
+            .expect("this host has no volume the production capture can read");
+        let VolumeAtSpawn::Read { volume, used } = &admitted.workspace else {
+            unreachable!("the finder kept only a read baseline");
+        };
+        let stale = VolumeBaseline {
+            workspace: VolumeAtSpawn::Read {
+                volume: volume.clone(),
+                used: used.saturating_add(1 << 40),
+            },
+            build: None,
+        };
+        let boundary = sample_job_boundary(&stale).expect("the host answers");
+        assert!(boundary.charged.is_none());
+        assert!(boundary.volumes.build.is_none());
+        assert_eq!(boundary.volumes, stale.sample(&HostVolumeStat));
+        let fresh = VolumeBaseline::admitted(Some(&workspace), None).sample(&HostVolumeStat);
+        let (
+            VolumeUsage::Read { delta_bytes },
+            VolumeUsage::Read {
+                delta_bytes: fresh_delta,
+            },
+        ) = (&boundary.volumes.workspace, &fresh.workspace)
+        else {
+            panic!("both probes of a readable volume must be deltas: {boundary:?} {fresh:?}");
+        };
+        assert_ne!(
+            delta_bytes.get(),
+            fresh_delta.get(),
+            "a new admission would not keep the passed reading {used}"
+        );
     }
 }
