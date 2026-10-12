@@ -296,10 +296,14 @@ fn command_arg_serializer_reuses_the_public_projection() {
     .expect("base64 projection");
 
     let nul = CommandArg::from(OsString::from_vec(vec![b'x', 0]));
+    let mut called = false;
     assert_eq!(
-        nul.with_wire(|_| ()),
+        nul.with_wire(|_| {
+            called = true;
+        }),
         Err(DtoError::CommandArgumentContainsNul)
     );
+    assert!(!called, "a refused argument must not lend a projection");
 }
 
 #[test]

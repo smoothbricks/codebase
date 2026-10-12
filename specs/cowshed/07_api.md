@@ -1577,8 +1577,11 @@ One boundary answer, no ambiguity:
   request and `JobInfo` reuse its one exact tagged serde shape, and protected Arrow stores a Binary list. Valid UTF-8
   takes the readable `utf8` branch without base64 allocation. Non-UTF-8 Unix bytes take canonical base64 across JSON,
   are restored before supervisor planning, and are consumed into `OsString` for spawn without `String`,
-  `to_string_lossy`, replacement characters, or a second wire union. The 128 KiB argument and 1 MiB argv bounds are
-  checked before RPC, spawn, and artifact mutation.
+  `to_string_lossy`, replacement characters, or a second wire union. `CommandArg::with_wire` validates the argument,
+  then lends one public `TaggedBytesRef { encoding, data }`: valid UTF-8 borrows those bytes as `utf8`, and every other
+  sequence borrows canonical standard base64. A validation failure is `DtoError` and does not call the closure. Serde
+  writes that same projection; it does not encode the bytes a second time. The 128 KiB argument and 1 MiB argv bounds
+  are checked before RPC, spawn, and artifact mutation.
 - **JSON is bounded control plus tagged inline data.** Ordinary `JobInfo` may carry `BinaryData` as the exact bounded
   `utf8|base64` tagged union for an inline protected artifact. It never embeds an unbounded stream or invents a path.
   Controller commitments never contain either encoding, protected paths, redirect sources, or other output payload.
