@@ -334,9 +334,9 @@ fn encode_expr(column: &ArrowColumn) -> String {
         ArrowKind::Utf8 => format!("text(columns.{name}.as_deref())", name = column.name),
         ArrowKind::Dict32 => format!("category(columns.{name}.as_deref())?", name = column.name),
         ArrowKind::Dict8 => format!(
-            "enumeration(columns.{name}, &{const_name})?",
+            "enumeration(columns.{name}, &{const_name}_NAMES)?",
             name = column.name,
-            const_name = format!("{}_NAMES", column.name.to_uppercase())
+            const_name = column.name.to_uppercase()
         ),
     }
 }
