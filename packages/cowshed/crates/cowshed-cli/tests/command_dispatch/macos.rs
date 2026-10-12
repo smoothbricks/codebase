@@ -1430,7 +1430,10 @@ fn assert_land_outcome(telemetry: &Path, build: &cowshed_core::api::dto::LandBui
     let [outcome] = outcomes.as_slice() else {
         panic!("one durable outcome per land: {outcomes:?}");
     };
-    assert_eq!(outcome.seeded, build.seeded);
+    assert_eq!(
+        outcome.seeded,
+        matches!(build.seed, cowshed_core::api::dto::LandSeed::Frozen)
+    );
     assert_eq!(
         outcome.skip.as_ref(),
         match &build.adoption {
