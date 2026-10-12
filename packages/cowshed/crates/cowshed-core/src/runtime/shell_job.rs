@@ -539,12 +539,6 @@ async fn run_pooled(
             {
                 let monitor = command.monitor.clone();
                 let pid = host.fence.process().birth.pid();
-                let pid = match u32::try_from(pid) {
-                    Ok(pid) => pid,
-                    Err(error) => {
-                        return Outcome::NotLaunched(CowshedError::internal(error.to_string()));
-                    }
-                };
                 if let Err(error) = tokio::task::spawn_blocking(move || {
                     monitor.gap(crate::api::process::ProcessCoverageGap::UnobservedBirth { pid })
                 })

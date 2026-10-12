@@ -1,13 +1,11 @@
 //! A workspace supervisor served over its Unix socket, and the handle that reaches one
 //! (11_shell.md "Protocol").
 //!
-//! Every call is one connection. The client writes one JSON request frame, then the raw bytes
-//! the call carries (stdin) as one more frame; the server answers with one JSON response frame,
-//! then the raw bytes the answer carries (a log chunk), and both sides close. A long call — a
-//! `wait`, a following log read — therefore holds only its own connection: nothing queues
-//! behind it and nothing needs multiplexing. The server fences every call by the authority the
-//! client names, exactly as the in-process actor does, so a client that still holds an older
-//! grant revision or incarnation is refused rather than served under the wrong profile.
+//! Each non-streaming call is one connection: one request and optional bytes, one answer and
+//! optional bytes. A long wait holds only its own connection. Process events hold a separate
+//! connection and use the worker stream's next/close demands; close remains readable while a
+//! next is pending. The server fences every call by the authority the client names, so a client
+//! with an older grant revision or incarnation is refused rather than served under another profile.
 //!
 //! The server accepts only peers with its own uid; the socket is created mode `0600` inside a
 //! `0700` directory by the process that serves it.
@@ -21,10 +19,11 @@ use std::task::{Context, Poll};
 
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncRead, AsyncReadExt as _, ReadBuf};
+use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, ReadBuf};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot};
 
+use super::process_stream::JobProcessStream;
 use super::supervisor::{
     CheckpointBarrier, Command, LogChunk, SessionSnapshot, SessionToken,
     WorkspaceAuthoritySnapshot, WorkspaceSupervisorHandle,
@@ -34,6 +33,9 @@ use crate::api::dto::{
     OutputPublication, RunSandboxMode, ScriptCommand, Sha256Digest, StdinSource, TraceContext,
     WorkspacePath,
 };
+use crate::api::process::JobProcessEvent;
+use crate::api::resources::SampleInterval;
+use crate::api::server::codec::Demand;
 use crate::error::{CowshedError, Result};
 use crate::storage::job_artifact::StreamKind;
 use cowshed_os::fork_lock::Fenced;
@@ -290,6 +292,15 @@ enum Call {
     Resources {
         job_id: JobId,
     },
+    #[serde(rename_all = "camelCase")]
+    Processes {
+        job_id: JobId,
+    },
+    #[serde(rename_all = "camelCase")]
+    ProcessEvents {
+        job_id: JobId,
+        every: SampleInterval,
+    },
     TraceHealth,
     #[serde(rename_all = "camelCase")]
     ListeningPorts {
@@ -467,7 +478,11 @@ fn unavailable(path: &Path, error: &io::Error) -> CowshedError {
     )
 }
 
-async fn write_frame(stream: &mut UnixStream, bytes: &[u8], maximum: usize) -> Result<()> {
+async fn write_frame(
+    stream: &mut (impl AsyncWrite + Unpin),
+    bytes: &[u8],
+    maximum: usize,
+) -> Result<()> {
     crate::api::frame::write_frame(
         stream,
         bytes,
@@ -478,7 +493,7 @@ async fn write_frame(stream: &mut UnixStream, bytes: &[u8], maximum: usize) -> R
     .await
 }
 
-async fn read_frame(stream: &mut UnixStream, maximum: usize) -> Result<Vec<u8>> {
+async fn read_frame(stream: &mut (impl AsyncRead + Unpin), maximum: usize) -> Result<Vec<u8>> {
     crate::api::frame::read_frame(
         stream,
         maximum,
@@ -488,13 +503,18 @@ async fn read_frame(stream: &mut UnixStream, maximum: usize) -> Result<Vec<u8>> 
     .await
 }
 
-pub(super) async fn write_json<T: Serialize>(stream: &mut UnixStream, value: &T) -> Result<()> {
+pub(super) async fn write_json<T: Serialize>(
+    stream: &mut (impl AsyncWrite + Unpin),
+    value: &T,
+) -> Result<()> {
     let bytes = serde_json::to_vec(value)
         .map_err(|error| protocol_error(format!("encoding failed: {error}")))?;
     write_frame(stream, &bytes, MAX_JSON_FRAME).await
 }
 
-pub(super) async fn read_json<T: for<'de> Deserialize<'de>>(stream: &mut UnixStream) -> Result<T> {
+pub(super) async fn read_json<T: for<'de> Deserialize<'de>>(
+    stream: &mut (impl AsyncRead + Unpin),
+) -> Result<T> {
     let bytes = read_frame(stream, MAX_JSON_FRAME).await?;
     serde_json::from_slice(&bytes)
         .map_err(|error| protocol_error(format!("malformed frame: {error}")))
@@ -967,6 +987,10 @@ async fn serve_call(
     };
     let payload = read_bytes(&mut stream, length).await?;
     let caller = supervisor.with_authority(authority.into());
+    if let Call::ProcessEvents { job_id, every } = *call {
+        serve_process_events(stream, &caller, job_id, every).await?;
+        return Ok(Retirement::Serving);
+    }
     let retiring = matches!(*call, Call::Retire);
     let (value, bytes) = match answer(&caller, streams, *call, payload).await {
         Ok(answer) => answer,
@@ -999,6 +1023,97 @@ async fn serve_call(
     }
     .await;
     answered.map(|()| Retirement::Serving)
+}
+
+async fn serve_process_events(
+    mut stream: UnixStream,
+    supervisor: &WorkspaceSupervisorHandle,
+    job_id: JobId,
+    every: SampleInterval,
+) -> Result<()> {
+    let events = match supervisor.process_events(job_id, every).await {
+        Ok(events) => events,
+        Err(error) => return write_json(&mut stream, &Response::Err(error)).await,
+    };
+    write_json(
+        &mut stream,
+        &Response::Ok {
+            value: serde_json::Value::Null,
+            bytes: 0,
+        },
+    )
+    .await?;
+    relay_process_events(stream, events).await
+}
+
+async fn relay_process_events(stream: UnixStream, mut events: JobProcessStream) -> Result<()> {
+    let (mut reader, mut writer) = stream.into_split();
+    let (send, mut demands) = mpsc::channel(1);
+    // Read close even while the source has no event. A complete frame is read by
+    // one task; cancelling a partial frame never changes the next frame's boundary.
+    let reader = tokio::spawn(async move {
+        loop {
+            let demand = read_json::<Demand>(&mut reader).await;
+            let failed = demand.is_err();
+            if send.send(demand).await.is_err() || failed {
+                break;
+            }
+        }
+    });
+    let result = async {
+        loop {
+            match demands.recv().await {
+                Some(Ok(Demand::Next)) => {}
+                Some(Ok(Demand::Close)) => {
+                    return write_process_event(&mut writer, None).await;
+                }
+                Some(Err(error)) => return Err(error),
+                None => return Ok(()),
+            }
+            let event = tokio::select! {
+                biased;
+                demand = demands.recv() => match demand {
+                    Some(Ok(Demand::Close)) => {
+                        return write_process_event(&mut writer, None).await;
+                    }
+                    Some(Ok(Demand::Next)) => {
+                        return Err(protocol_error("process event demanded while one is unanswered"));
+                    }
+                    Some(Err(error)) => return Err(error),
+                    None => return Ok(()),
+                },
+                event = events.next() => event,
+            };
+            match event {
+                Some(Ok(event)) => write_process_event(&mut writer, Some(event)).await?,
+                Some(Err(error)) => return write_json(&mut writer, &Response::Err(error)).await,
+                None => return write_process_event(&mut writer, None).await,
+            }
+        }
+    }
+    .await;
+    reader.abort();
+    match reader.await {
+        Ok(()) => result,
+        Err(error) if error.is_cancelled() => result,
+        Err(error) => Err(CowshedError::internal(format!(
+            "process demand reader failed: {error}; stream result: {result:?}"
+        ))),
+    }
+}
+
+async fn write_process_event(
+    writer: &mut (impl AsyncWrite + Unpin),
+    event: Option<JobProcessEvent>,
+) -> Result<()> {
+    write_json(
+        writer,
+        &Response::Ok {
+            value: to_value(&event)?,
+            bytes: 0,
+        },
+    )
+    .await
 }
 
 pub(super) fn verify_peer(stream: &UnixStream) -> Result<()> {
@@ -1140,6 +1255,13 @@ async fn answer(
             to_value(&supervisor.resources(job_id).await?)?,
             Bytes::new(),
         ),
+        Call::Processes { job_id } => (
+            to_value(&supervisor.processes(job_id).await?)?,
+            Bytes::new(),
+        ),
+        Call::ProcessEvents { .. } => {
+            return Err(protocol_error("process events require their demand stream"));
+        }
         Call::TraceHealth => (to_value(&supervisor.trace_health().await?)?, Bytes::new()),
         Call::ListeningPorts { job_id } => (
             to_value(&supervisor.listening_ports(job_id).await?)?,
@@ -1500,6 +1622,75 @@ async fn call<T: for<'de> Deserialize<'de>>(
     decode(value)
 }
 
+async fn open_process_events(
+    path: &Path,
+    authority: &WorkspaceAuthoritySnapshot,
+    job_id: JobId,
+    every: SampleInterval,
+) -> Result<JobProcessStream> {
+    let mut stream = UnixStream::connect(path)
+        .await
+        .map_err(|error| unavailable(path, &error))?;
+    write_json(
+        &mut stream,
+        &Request::Call {
+            authority: authority.into(),
+            call: Box::new(Call::ProcessEvents { job_id, every }),
+            bytes: 0,
+        },
+    )
+    .await?;
+    match read_json::<Response>(&mut stream).await? {
+        Response::Err(error) => return Err(error),
+        Response::Ok { value, bytes: 0 } if value.is_null() => {}
+        Response::Ok { .. } => return Err(protocol_error("malformed process subscription answer")),
+    }
+    let (mut reader, mut writer) = stream.into_split();
+    let (send, receive) = mpsc::channel(1);
+    tokio::spawn(async move {
+        loop {
+            if let Err(error) = write_json(&mut writer, &Demand::Next).await {
+                let _ = send.send(Err(error)).await;
+                break;
+            }
+            let response = tokio::select! {
+                biased;
+                () = send.closed() => {
+                    if let Err(error) = write_json(&mut writer, &Demand::Close).await {
+                        eprintln!("cowshed: closing process observation: {error}");
+                    }
+                    break;
+                }
+                response = read_json::<Response>(&mut reader) => response,
+            };
+            let event = match response {
+                Ok(Response::Ok { value, bytes: 0 }) => decode::<Option<JobProcessEvent>>(value),
+                Ok(Response::Ok { .. }) => Err(protocol_error("process event carried raw bytes")),
+                Ok(Response::Err(error)) | Err(error) => Err(error),
+            };
+            let ended = !matches!(event, Ok(Some(_)));
+            match event {
+                Ok(Some(event)) => {
+                    if send.send(Ok(event)).await.is_err() {
+                        if let Err(error) = write_json(&mut writer, &Demand::Close).await {
+                            eprintln!("cowshed: closing process observation: {error}");
+                        }
+                        break;
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    let _ = send.send(Err(error)).await;
+                }
+            }
+            if ended {
+                break;
+            }
+        }
+    });
+    Ok(JobProcessStream::new(receive))
+}
+
 async fn forward(path: Arc<PathBuf>, command: Command) {
     let path = path.as_path();
     match command {
@@ -1619,6 +1810,22 @@ async fn forward(path: Arc<PathBuf>, command: Command) {
         } => {
             let _ =
                 reply.send(call(path, &authority, Call::Resources { job_id }, Bytes::new()).await);
+        }
+        Command::Processes {
+            authority,
+            job_id,
+            reply,
+        } => {
+            let _ =
+                reply.send(call(path, &authority, Call::Processes { job_id }, Bytes::new()).await);
+        }
+        Command::ProcessEvents {
+            authority,
+            job_id,
+            every,
+            reply,
+        } => {
+            let _ = reply.send(open_process_events(path, &authority, job_id, every).await);
         }
         Command::TraceHealth { authority, reply } => {
             let _ = reply.send(call(path, &authority, Call::TraceHealth, Bytes::new()).await);
@@ -1856,6 +2063,77 @@ async fn forward_exec(
             Bytes::new(),
         )
         .await;
+    }
+}
+
+#[cfg(test)]
+mod process_demand_tests {
+    use super::*;
+    use crate::api::process::ProcessCoverageGap;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn a_process_demand_delivers_a_canonical_gap_and_then_ends() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let (events, receive) = mpsc::channel(1);
+        events
+            .send(Ok(JobProcessEvent::Gap {
+                reason: ProcessCoverageGap::EventsLost,
+            }))
+            .await
+            .unwrap();
+        drop(events);
+        let relay = tokio::spawn(relay_process_events(server, JobProcessStream::new(receive)));
+        write_json(&mut client, &Demand::Next).await.unwrap();
+        let Response::Ok { value, bytes: 0 } = read_json(&mut client).await.unwrap() else {
+            panic!("one demand must answer with the event");
+        };
+        assert_eq!(
+            decode::<Option<JobProcessEvent>>(value).unwrap(),
+            Some(JobProcessEvent::Gap {
+                reason: ProcessCoverageGap::EventsLost,
+            })
+        );
+        write_json(&mut client, &Demand::Next).await.unwrap();
+        let Response::Ok { value, bytes: 0 } = read_json(&mut client).await.unwrap() else {
+            panic!("the next demand must answer with the stream end");
+        };
+        assert!(value.is_null());
+        relay.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn closing_an_unanswered_process_demand_drops_the_subscription() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let (events, receive) = mpsc::channel(1);
+        let relay = tokio::spawn(relay_process_events(server, JobProcessStream::new(receive)));
+        write_json(&mut client, &Demand::Next).await.unwrap();
+        write_json(&mut client, &Demand::Close).await.unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(1), read_json(&mut client))
+            .await
+            .expect("close must not wait for a native event")
+            .unwrap();
+        let Response::Ok { value, bytes: 0 } = response else {
+            panic!("close must answer with the stream end");
+        };
+        assert!(value.is_null());
+        relay.await.unwrap().unwrap();
+        assert!(events.is_closed());
+    }
+
+    #[tokio::test]
+    async fn a_second_unanswered_process_demand_is_refused() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let (_events, receive) = mpsc::channel(1);
+        let relay = tokio::spawn(relay_process_events(server, JobProcessStream::new(receive)));
+        write_json(&mut client, &Demand::Next).await.unwrap();
+        write_json(&mut client, &Demand::Next).await.unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(1), relay)
+            .await
+            .expect("a duplicate demand is not queued")
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.code, crate::ErrorCode::Integrity);
     }
 }
 
