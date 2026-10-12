@@ -520,9 +520,11 @@ stale, so the next managed install replaces it; a later ordinary local setup inv
 `bun install`. `smoo.developerLinks.nx` is obsolete and refused: `smoo monorepo update` removes that declaration while
 keeping sibling package declarations. Nx must not be reselected by the developer-links postinstall task.
 
-Gap: `smoo:install` runs setup only when one of its listed inputs changed, and the `smoo:developer-links` status covers
-only the packages `smoo.developerLinks` declares. So a new external Nx alias in the root's or a workspace member's
-`node_modules`, with no changed input, is not detected until setup runs.
+`smoo:install` runs setup when one of its listed inputs changed. The `smoo:developer-links` status also checks for stale
+install links, including external Nx aliases in the root's or a workspace member's `node_modules`. An ordinary shell
+entry therefore repairs inherited Nx aliases even when no install input changed: under the same install lock, it runs
+the managed Bun installer before applying declared links. Genuine sibling links survive, a failed install reports its
+cause without claiming the aliases are repaired, and the next unchanged entry installs nothing.
 
 #### Declared Links
 

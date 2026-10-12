@@ -371,7 +371,9 @@ in {
   # `smoo.developerLinks` declares at their local checkouts, after an install
   # and in every tree that installed them (tooling/direnv/developer-links.ts).
   # Gated by `status` too: a clone or an install can lose a link without any
-  # file devenv watches changing. A runner links nothing.
+  # file devenv watches changing. Stale install links, including external Nx
+  # aliases, run the managed Bun installer before declarations are applied.
+  # A runner links nothing.
   #
   # A failed task does not fail shell entry (devenv reports it and the shell
   # still loads, so the tools to repair it stay available). CI runs both with
@@ -409,7 +411,7 @@ in {
       showOutput = true;
     };
     "smoo:developer-links" = {
-      description = "link the packages smoo.developerLinks declares to their local checkouts";
+      description = "repair stale install links and link declared local checkouts";
       exec = "${setup} --links";
       status = "${setup} --links --check";
       after = ["smoo:install"];

@@ -1088,6 +1088,65 @@ describe('what shell entry keeps linked', () => {
       }
     }
 
+    it.each(Object.keys(NX_BINDINGS))(
+      'the shell link task repairs an external %s without changed install inputs',
+      async (entry) => {
+        await withManagedRepository(WITH_NX, async ({ root, enterShell: enter, count }) => {
+          expect((await enter()).exitCode).toBe(0);
+          expect(count('install')).toBe(1);
+          const stamp = readFileSync(join(root, 'node_modules', '.smoo-install'), 'utf8');
+          const retired = await providerCheckout(join(dirname(root), 'retired-nx'), 'nx');
+          const local = await providerCheckout(join(dirname(root), 'local-lib'), '@fixture/lib');
+          await linkEntry(root, entry, retired);
+          await linkEntry(root, LINKED, local);
+
+          // devenv's install inputs did not change; only the link task's status runs.
+          expect((await enter({ links: true, check: true })).exitCode).toBe(1);
+          expect(count('install')).toBe(1);
+          expect(readlinkSync(join(root, entry))).toBe(retired);
+          expect(readFileSync(join(root, 'node_modules', '.smoo-install'), 'utf8')).toBe(stamp);
+
+          const repaired = await Promise.all([enter({ links: true }), enter({ links: true })]);
+          expect(repaired.map(({ exitCode }) => exitCode)).toEqual([0, 0]);
+          expect(count('install')).toBe(2);
+          expectNxBindings(root);
+          expect(readlinkSync(join(root, LINKED))).toBe(local);
+
+          expect((await enter({ links: true, check: true })).exitCode).toBe(0);
+          expect((await enter({ links: true })).exitCode).toBe(0);
+          expect(count('install')).toBe(2);
+          expectNxBindings(root);
+          expect(readlinkSync(join(root, LINKED))).toBe(local);
+        });
+      },
+    );
+
+    it('reports a failed shell link repair and keeps its status stale', async () => {
+      await withManagedRepository(
+        {
+          ...WITH_NX,
+          prepare: 'test ! -f refuse-install || { echo "fixture-install-refused" >&2; exit 19; }',
+        },
+        async ({ root, enterShell: enter }) => {
+          expect((await enter()).exitCode).toBe(0);
+          const stamp = readFileSync(join(root, 'node_modules', '.smoo-install'), 'utf8');
+          const retired = await providerCheckout(join(dirname(root), 'retired-nx'), 'nx');
+          const local = await providerCheckout(join(dirname(root), 'local-lib'), '@fixture/lib');
+          for (const entry of Object.keys(NX_BINDINGS)) await linkEntry(root, entry, retired);
+          await linkEntry(root, LINKED, local);
+          await writeFile(join(root, 'refuse-install'), '');
+
+          const failed = await enter({ links: true });
+          expect(failed.exitCode).toBe(1);
+          expect(failed.stderr).toContain('fixture-install-refused');
+          for (const entry of Object.keys(NX_BINDINGS)) expect(readlinkSync(join(root, entry))).toBe(retired);
+          expect(readlinkSync(join(root, LINKED))).toBe(local);
+          expect(readFileSync(join(root, 'node_modules', '.smoo-install'), 'utf8')).toBe(stamp);
+          expect((await enter({ links: true, check: true })).exitCode).toBe(1);
+        },
+      );
+    });
+
     it('replaces external Nx entries that a matching install stamp would keep', async () => {
       await withManagedRepository(WITH_NX, async ({ root, enterShell: enter, count }) => {
         expect((await enter()).exitCode).toBe(0);

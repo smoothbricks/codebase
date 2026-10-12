@@ -137,11 +137,10 @@ const POST_COMMIT_BLOCK = [
 // (cargoFetcher) live in smoo's user cache and count only while CARGO_HOME
 // names the directory they were fetched into, which no checkout-relative
 // change detection can see.
-// `--links` points the packages `smoo.developerLinks` declares at their local
-// checkouts (developer-links.ts): devenv's smoo:developer-links task, whose
-// `status` is `--links --check`. A status, not a file list, because what it
-// keeps is the trees' own state: a checkout whose links an install or a clone
-// lost has changed no file devenv could name.
+// `--links` repairs stale install links (including external Nx aliases), then
+// points the packages `smoo.developerLinks` declares at their local checkouts.
+// devenv's smoo:developer-links task uses `--links --check` as its status:
+// links can change without any smoo:install input changing.
 // Declared above the bootstrap block for the same hoisting reason as above.
 const { values: flags } = parseArgs({
   options: {
@@ -167,9 +166,18 @@ try {
       process.exit(0);
     }
     if (flags.check === true) {
-      process.exit(planDeclaredLinks(projectRoot).changes.length === 0 ? 0 : 1);
+      process.exit(
+        planDeclaredLinks(projectRoot).changes.length === 0 && !hasStaleDeveloperLinks(projectRoot, ['nx']) ? 0 : 1,
+      );
     }
     await withInstallLock(async () => {
+      // Recheck under the install lock: another shell may already have repaired
+      // the aliases. Use the same installer as smoo:install, never a second linker.
+      if (hasStaleDeveloperLinks(projectRoot, ['nx'])) {
+        const error = await installLocalDependencies([bunInstaller(bunInstallInputs())]);
+        if (error !== undefined) reportSetupFailure(error);
+        ensureTypeScriptApiPackage(projectRoot);
+      }
       applyDeclaredLinks(projectRoot, planDeclaredLinks(projectRoot));
     });
     process.exit(0);
