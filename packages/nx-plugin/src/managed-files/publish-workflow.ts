@@ -500,6 +500,7 @@ jobs:
   publish:
 ${options.release === false ? renderRunsOnLine(options.runsOn) : publishJobRunsOnLine(options)}
     env:
+      LMAO_GIT_REVISION: ${githubExpression('github.sha')}
       GH_TOKEN: ${githubExpression('github.token')}${remoteCacheJobEnv(options)}${cargoCredentialsJobEnv(options)}${privateNpmInstallJobEnv(options)}${platformProducerJobEnv(options)}
     steps:
 `;
@@ -885,6 +886,7 @@ ${renderRunsOnLine(options.runsOn)}
       mode: ${githubExpression('steps.version.outputs.mode')}
       release-sha: ${githubExpression('steps.release-state.outputs.sha')}
     env:
+      LMAO_GIT_REVISION: ${githubExpression('github.sha')}
       GH_TOKEN: ${githubExpression('github.token')}${remoteCacheJobEnv(options)}${cargoCredentialsJobEnv(options)}${privateNpmInstallJobEnv(options)}
     steps:
 ${renderLinuxReleaseCandidateSteps(steps, options)}
@@ -895,6 +897,7 @@ ${renderMacosJobHeaderLines(options)}
       contents: read
       id-token: none
     env:
+      LMAO_GIT_REVISION: ${githubExpression('github.sha')}
       GH_TOKEN: ${githubExpression('github.token')}${remoteCacheJobEnv(options)}${cargoCredentialsJobEnv(options)}${privateNpmInstallJobEnv(options)}
 ${Object.entries(options.platformProducer?.env ?? {})
   .map(([name, value]) => `      ${name}: ${JSON.stringify(value)}`)
@@ -909,6 +912,7 @@ ${publishJobRunsOnLine(options)}
       contents: write
       id-token: write
     env:
+      LMAO_GIT_REVISION: ${githubExpression('github.sha')}
       TTSC_TSGO_BINARY: ${githubExpression('github.workspace')}/node_modules/@typescript/native/bin/tsc
       GH_TOKEN: ${githubExpression('github.token')}${remoteCacheJobEnv(options)}${cargoCredentialsJobEnv(options)}${privateNpmInstallJobEnv(options)}
     steps:

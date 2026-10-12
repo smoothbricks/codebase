@@ -145,6 +145,13 @@ test binaries. A package-local target that builds a shipped artifact follows the
 for an artifact family no other build compiles, such as a size-optimised wasm32 lane; a profile that compiles the same
 crates for the same target as `dev` or `release` compiles every dependency a second time.
 
+Rust LMAO's opt-in source-revision contract is defined in
+[01f](../../specs/lmao/01f_arrow_table_structure.md#smoo/lmao!n/arrow-table-module-id.not-git). Its native and Wasm
+targets declare `{ "env": "LMAO_GIT_REVISION" }` as an input. Default dev/test runs leave it unset; publishing jobs set
+it to the dispatch commit, so those builds include the explicit revision in their key without making dev runs
+commit-keyed. The `production` configuration selects the shipping profile; it does not discover a Git revision. The root
+workspace's cached nextest archive hashes that variable too, because it contains the compiled LMAO test binaries.
+
 ### Cargo cache boundaries
 
 `cargo-fetch` is uncached because the registry lives outside Nx outputs. `cargo-test-compile` is also uncached: it warms

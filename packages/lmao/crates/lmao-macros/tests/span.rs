@@ -33,11 +33,7 @@ fn span_macro_injects_callsite_and_supports_parent_form() {
     assert_eq!(source.package_name, "lmao-macros");
     assert!(source.package_file.ends_with("tests/span.rs"));
     assert!(source.line > 0);
-    let git_sha = source
-        .git_sha
-        .expect("git checkout records a last-touch commit");
-    assert_eq!(git_sha.len(), 40);
-    assert!(git_sha.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    assert_eq!(source.git_sha, lmao_core::build_revision());
 
     let parent = root.identity.clone();
     let (result, child) = span!(trace, parent.clone(), "child", child_body);

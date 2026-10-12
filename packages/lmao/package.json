@@ -220,7 +220,9 @@
           "{projectRoot}/**/.cargo/config.toml",
           "{projectRoot}/scripts/*.sh",
           "!{projectRoot}/**/target/**",
-          "lmaoGitRevision",
+          {
+            "env": "LMAO_GIT_REVISION"
+          },
           "cargoToolchain"
         ]
       },
@@ -236,7 +238,9 @@
           "{projectRoot}/**/.cargo/config.toml",
           "{projectRoot}/scripts/*.sh",
           "!{projectRoot}/**/target/**",
-          "lmaoGitRevision",
+          {
+            "env": "LMAO_GIT_REVISION"
+          },
           "cargoToolchain"
         ]
       },
@@ -254,7 +258,9 @@
           "{projectRoot}/**/.cargo/config.toml",
           "{projectRoot}/scripts/*.sh",
           "!{projectRoot}/**/target/**",
-          "lmaoGitRevision",
+          {
+            "env": "LMAO_GIT_REVISION"
+          },
           "cargoToolchain"
         ]
       },
@@ -272,7 +278,9 @@
           "{projectRoot}/**/.cargo/config.toml",
           "{projectRoot}/scripts/*.sh",
           "!{projectRoot}/**/target/**",
-          "lmaoGitRevision",
+          {
+            "env": "LMAO_GIT_REVISION"
+          },
           "cargoToolchain"
         ]
       },
@@ -288,7 +296,9 @@
           "{projectRoot}/**/.cargo/config.toml",
           "{projectRoot}/scripts/*.sh",
           "!{projectRoot}/**/target/**",
-          "lmaoGitRevision",
+          {
+            "env": "LMAO_GIT_REVISION"
+          },
           "cargoToolchain"
         ]
       },
@@ -304,7 +314,9 @@
           "{projectRoot}/**/.cargo/config.toml",
           "{projectRoot}/scripts/*.sh",
           "!{projectRoot}/**/target/**",
-          "lmaoGitRevision",
+          {
+            "env": "LMAO_GIT_REVISION"
+          },
           "cargoToolchain"
         ]
       },
@@ -344,7 +356,9 @@
           "{projectRoot}/justfile",
           "{projectRoot}/src/lib/schema/systemSchema.ts",
           "{projectRoot}/src/lib/capacityTuning.ts",
-          "lmaoGitRevision"
+          {
+            "env": "LMAO_GIT_REVISION"
+          }
         ],
         "outputs": [
           "{projectRoot}/dist/allocator.wasm"
@@ -373,7 +387,9 @@
           "{workspaceRoot}/Cargo.lock",
           "{workspaceRoot}/.cargo/config.toml",
           "{projectRoot}/.cargo/config.toml",
-          "lmaoGitRevision",
+          {
+            "env": "LMAO_GIT_REVISION"
+          },
           "cargoToolchain"
         ],
         "outputs": [

@@ -1,6 +1,4 @@
-mod git_state;
-
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::env;
 use std::fmt::Write as _;
 use std::fs;
@@ -47,7 +45,7 @@ fn main() {
     generate_thread_schema(&schema_path);
     generate_thread_kinds(&schema_path);
     generate_tuning_constants(&tuning_path);
-    generate_source_git(package_root, &manifest_dir);
+    generate_build_revision();
 }
 
 fn generate_entry_types(path: &Path) {
@@ -277,40 +275,25 @@ fn write_generated(name: &str, contents: String) {
     fs::write(out.join(name), contents).expect("write generated Rust binding");
 }
 
-fn generate_source_git(package_root: &Path, manifest_dir: &Path) {
+fn generate_build_revision() {
     println!("cargo:rerun-if-env-changed={REVISION_ENV}");
-    let requested = env::var(REVISION_ENV)
+    let revision = env::var(REVISION_ENV)
         .ok()
         .filter(|value| !value.is_empty());
-    let source_git = git_state::source_git(package_root, manifest_dir, requested.as_deref())
-        .unwrap_or_else(|error| panic!("{REVISION_ENV} {error}"));
-    for input in &source_git.inputs {
-        println!("cargo:rerun-if-changed={}", input.display());
+    if let Some(revision) = &revision {
+        assert!(
+            !revision.bytes().any(|byte| matches!(byte, b'\r' | b'\n')),
+            "{REVISION_ENV} must not contain CR or LF"
+        );
     }
-    write_source_git(&source_git.commits, source_git.revision.as_deref());
-}
-
-fn write_source_git(entries: &BTreeMap<String, String>, revision: Option<&str>) {
     println!(
         "cargo:rustc-env=LMAO_GIT_REVISION={}",
-        revision.unwrap_or_default()
+        revision.as_deref().unwrap_or_default()
     );
-    let mut generated = String::from("#[doc(hidden)]\n#[inline(always)]\n");
-    if entries.is_empty() {
-        // No map when git had no answer: a lone `_ => None` arm fails clippy's
-        // `match_single_binding` under `-D warnings`.
-        generated.push_str(
-            "pub fn source_git_sha(_file: &str) -> Option<&'static str> {\n    None\n}\n",
-        );
-    } else {
-        generated.push_str(
-            "pub fn source_git_sha(file: &str) -> Option<&'static str> {\n    match file {\n",
-        );
-        for (file, sha) in entries {
-            writeln!(generated, "        {file:?} => Some({sha:?}),")
-                .expect("writing to String cannot fail");
-        }
-        generated.push_str("        _ => None,\n    }\n}\n");
-    }
-    write_generated("source_git.rs", generated);
+    write_generated(
+        "build_revision.rs",
+        format!(
+            "#[doc(hidden)]\n#[inline(always)]\npub fn build_revision() -> Option<&'static str> {{\n    {revision:?}\n}}\n"
+        ),
+    );
 }

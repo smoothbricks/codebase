@@ -480,7 +480,7 @@ fn source_metadata() -> proc_macro2::TokenStream {
         ::lmao_core::SourceMetadata {
             package_name: env!("CARGO_PKG_NAME"),
             package_file: file!(),
-            git_sha: ::lmao_core::source_git_sha(file!()),
+            git_sha: ::lmao_core::build_revision(),
             line: line!(),
         }
     }
