@@ -4437,13 +4437,16 @@ async fn a_served_supervisor_s_progress_starts_at_ownership_and_ends_at_the_seal
 }
 
 /// What each [`Holder`] keeps resident.
+#[cfg(target_os = "macos")]
 const HELD: u64 = 128 << 20;
 
 /// A process this test started in the job's group: it holds [`HELD`] bytes of its own, every
 /// page written, from the line it writes on stdout until its stdin -- a pipe this test holds --
 /// closes.
+#[cfg(target_os = "macos")]
 struct Holder(std::process::Child);
 
+#[cfg(target_os = "macos")]
 impl Holder {
     /// Start a holder in the group `leader` leads and return once its memory is resident.
     fn hold(leader: &std::process::Child) -> Self {

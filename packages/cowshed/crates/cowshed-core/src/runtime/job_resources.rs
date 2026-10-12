@@ -24,13 +24,18 @@ pub(super) enum Sampling {
     /// No process of the job's exists yet -- or, once the job ended, none ever did.
     Unowned,
     /// The job owns processes: a read observes them now.
-    Live(JobSampler),
+    Live(Box<JobSampler>),
     /// The job ended: the process that last led its group, and its terminal sample or why that
     /// last observation failed. A failure is kept as it is: an earlier sample would claim the
     /// job's end looked like its middle.
+    ///
+    /// Both payloads are boxed, each allocated once per job (at its first owned process and at
+    /// its end, never per sample): which one is larger differs by platform -- the macOS sampler
+    /// carries its rusage source and census, a terminal sample its leaf and accounting -- so no
+    /// job's state is the size of the larger of the two.
     Frozen {
         leader: Birth,
-        outcome: Result<JobResourceSample>,
+        outcome: Box<Result<JobResourceSample>>,
     },
 }
 
@@ -52,15 +57,15 @@ impl Sampling {
     ) -> Option<&mut JobSampler> {
         match self {
             Self::Unowned => {
-                *self = Self::Live(JobSampler::spawned(job_id, process, coverage));
+                *self = Self::Live(Box::new(JobSampler::spawned(job_id, process, coverage)));
                 match self {
-                    Self::Live(sampler) => Some(sampler),
+                    Self::Live(sampler) => Some(sampler.as_mut()),
                     Self::Unowned | Self::Frozen { .. } => None,
                 }
             }
             Self::Live(sampler) => {
                 sampler.lead(process.birth);
-                Some(sampler)
+                Some(sampler.as_mut())
             }
             Self::Frozen { .. } => None,
         }
@@ -75,22 +80,15 @@ impl Sampling {
         if let Self::Live(_) = self
             && let Self::Live(mut sampler) = std::mem::replace(self, Self::Unowned)
         {
-            let outcome = observe(&mut sampler);
+            let outcome = Box::new(observe(sampler.as_mut()));
             *self = Self::Frozen {
                 leader: sampler.leader,
                 outcome,
             };
         }
         match self {
-            Self::Frozen {
-                outcome: Ok(sample),
-                ..
-            } => Some(sample.clone()),
-            Self::Unowned
-            | Self::Live(_)
-            | Self::Frozen {
-                outcome: Err(_), ..
-            } => None,
+            Self::Frozen { outcome, .. } => outcome.as_ref().as_ref().ok().cloned(),
+            Self::Unowned | Self::Live(_) => None,
         }
     }
 
@@ -102,8 +100,8 @@ impl Sampling {
         observe: impl FnOnce(&mut JobSampler) -> Result<JobResourceSample>,
     ) -> Result<JobResourceSample> {
         match self {
-            Self::Live(sampler) => observe(sampler),
-            Self::Frozen { outcome, .. } => outcome.clone(),
+            Self::Live(sampler) => observe(sampler.as_mut()),
+            Self::Frozen { outcome, .. } => outcome.as_ref().clone(),
             Self::Unowned => Err(CowshedError::conflict(
                 format!(
                     "job {} owns no process: it has not started one, or ended before it did",
@@ -117,7 +115,7 @@ impl Sampling {
     /// The sampler of a job that owns processes and has not ended.
     pub(super) fn live(&mut self) -> Option<&mut JobSampler> {
         match self {
-            Self::Live(sampler) => Some(sampler),
+            Self::Live(sampler) => Some(sampler.as_mut()),
             Self::Unowned | Self::Frozen { .. } => None,
         }
     }
