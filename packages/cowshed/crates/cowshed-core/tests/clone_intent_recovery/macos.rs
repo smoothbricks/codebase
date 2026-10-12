@@ -455,63 +455,6 @@ fn missing_revision() -> CreateOptions {
 }
 
 #[tokio::test]
-async fn a_create_refused_for_want_of_a_port_block_leaves_nothing_for_gc_to_create() {
-    let fixture = Fixture::new("refused-create");
-    let runtime = fixture.adopt().await;
-    let claims = fixture.claim_every_port_block();
-
-    refused(
-        fixture
-            .create(&runtime, "refused", CreateOptions::default())
-            .await
-            .expect_err("every port block is claimed"),
-    );
-    assert_eq!(
-        fixture.intent("refused"),
-        None,
-        "a refusal before the first mutation leaves no intent"
-    );
-    refused(
-        fixture
-            .fork(&runtime, "main", "refused-fork")
-            .await
-            .expect_err("every port block is claimed"),
-    );
-    assert_eq!(fixture.intent("refused-fork"), None);
-    runtime.shutdown().await.expect("stop the refusing runtime");
-
-    // With blocks free again, a replayed intent would now succeed: gc must find none.
-    claims.release();
-    let gc = fixture.gc().await;
-    assert_eq!(fixture.listed(&gc).await, ["main"]);
-    assert_eq!(fixture.intent("refused"), None);
-    assert_eq!(fixture.intent("refused-fork"), None);
-    gc.shutdown().await.expect("stop gc");
-}
-
-/// The residue the incident left: an older binary's create refused before anything existed,
-/// journaled `Prepared` with no artifact. Store-scope recovery discards it instead of creating.
-#[tokio::test]
-async fn gc_discards_an_older_binarys_refused_create_instead_of_creating_it() {
-    let fixture = Fixture::new("legacy-refusal");
-    let runtime = fixture.adopt().await;
-    runtime.shutdown().await.expect("stop the adopting runtime");
-    LifecycleIntentJournal::update(&fixture.journal_path(), |journal| {
-        journal.begin(LifecycleIntent::Create {
-            workspace: name("refused"),
-            options: CreateOptions::default(),
-        });
-        Ok(())
-    })
-    .expect("journal the refused create as an older binary did");
-
-    let gc = fixture.gc().await;
-    assert_eq!(fixture.listed(&gc).await, ["main"]);
-    assert_eq!(fixture.intent("refused"), None);
-    gc.shutdown().await.expect("stop gc");
-}
-
-#[tokio::test]
 async fn a_create_interrupted_after_its_pending_clone_exists_still_resumes() {
     let fixture = Fixture::new("mutating-create");
     let runtime = fixture.adopt().await;
@@ -611,44 +554,6 @@ async fn a_slot_bound_create_that_fails_after_binding_is_kept_and_resumed() {
     gc.shutdown().await.expect("stop gc");
 }
 
-/// `cowshed new wedged --ref <commit main lacks>` is refused before it journals anything, so
-/// the very next `new wedged` opens without replaying it and creates the workspace.
-#[tokio::test]
-async fn a_create_from_a_revision_the_source_lacks_leaves_the_name_free() {
-    let fixture = Fixture::new("missing-revision");
-    let runtime = fixture.adopt().await;
-
-    let error = fixture
-        .create(&runtime, "wedged", missing_revision())
-        .await
-        .expect_err("main holds no such commit");
-    assert!(
-        error.message.contains(MISSING_REVISION),
-        "the refusal names the revision, got {}: {}",
-        error.code.as_str(),
-        error.message
-    );
-    assert_eq!(
-        fixture.intent("wedged"),
-        None,
-        "a revision refused before the clone journals nothing"
-    );
-    assert_eq!(fixture.listed(&runtime).await, ["main"]);
-    runtime.shutdown().await.expect("stop the refusing runtime");
-
-    let next = fixture
-        .open_naming("wedged")
-        .await
-        .expect("`new wedged` opens: nothing of the refused create is replayed");
-    fixture
-        .create(&next, "wedged", CreateOptions::default())
-        .await
-        .expect("the name is free for a create that can succeed");
-    assert_eq!(fixture.listed(&next).await, ["main", "wedged"]);
-    assert!(completed(fixture.intent("wedged")));
-    next.shutdown().await.expect("stop the creating runtime");
-}
-
 /// The residue an unchecked `--ref` left: a create past its mutation fence whose pending
 /// clone exists, and whose every replay fails. Here the clone stopped on a link it cannot
 /// restore, and its record carries the missing revision as the incident's did. `rm` retires
@@ -733,25 +638,91 @@ async fn rm_retires_a_clone_intent_that_left_no_clone_and_can_never_be_replayed(
 /// complete and no longer (05_gateway.md): from then on the image owns the block, and another
 /// process's gateway reconcile installing the workspace's session must find no claim of the
 /// verb's on it, or it moves the workspace to another block at a new grant revision.
+/// Before publication, current port refusals and an older binary's artifact-free Prepared
+/// intent each pass through their own store-scope recovery. A missing revision then leaves no
+/// intent for a named reopening, whose successful retry also proves the create's port handoff.
 #[tokio::test]
 async fn a_created_workspaces_port_block_is_free_for_its_gateway_session_once_published() {
     let fixture = Fixture::new("published-create");
     let main_gateway = fixture.gateway_at_hello("main");
     let runtime = fixture.adopt().await;
     assert_eq!(main_gateway.claimed().await, [0_u16; 0]);
-    let gateway = fixture.gateway_at_hello("published");
 
-    fixture
-        .create(&runtime, "published", CreateOptions::default())
+    let claims = fixture.claim_every_port_block();
+    refused(
+        fixture
+            .create(&runtime, "refused", CreateOptions::default())
+            .await
+            .expect_err("every port block is claimed"),
+    );
+    assert_eq!(
+        fixture.intent("refused"),
+        None,
+        "a refusal before the first mutation leaves no intent"
+    );
+    refused(
+        fixture
+            .fork(&runtime, "main", "refused-fork")
+            .await
+            .expect_err("every port block is claimed"),
+    );
+    assert_eq!(fixture.intent("refused-fork"), None);
+    runtime.shutdown().await.expect("stop the refusing runtime");
+
+    // With blocks free again, a replayed intent would now succeed: gc must find none.
+    claims.release();
+    let gc = fixture.gc().await;
+    assert_eq!(fixture.listed(&gc).await, ["main"]);
+    assert_eq!(fixture.intent("refused"), None);
+    assert_eq!(fixture.intent("refused-fork"), None);
+    gc.shutdown().await.expect("stop gc");
+
+    // An older binary left Prepared without an artifact; a separate opening discards it.
+    LifecycleIntentJournal::update(&fixture.journal_path(), |journal| {
+        journal.begin(LifecycleIntent::Create {
+            workspace: name("refused"),
+            options: CreateOptions::default(),
+        });
+        Ok(())
+    })
+    .expect("journal the refused create as an older binary did");
+    let runtime = fixture.gc().await;
+    assert_eq!(fixture.listed(&runtime).await, ["main"]);
+    assert_eq!(fixture.intent("refused"), None);
+
+    let error = fixture
+        .create(&runtime, "wedged", missing_revision())
         .await
-        .expect("create");
+        .expect_err("main holds no such commit");
+    assert!(
+        error.message.contains(MISSING_REVISION),
+        "the refusal names the revision, got {}: {}",
+        error.code.as_str(),
+        error.message
+    );
+    assert_eq!(
+        fixture.intent("wedged"),
+        None,
+        "a revision refused before the clone journals nothing"
+    );
+    assert_eq!(fixture.listed(&runtime).await, ["main"]);
+    runtime.shutdown().await.expect("stop the refusing runtime");
+
+    let next = fixture
+        .open_naming("wedged")
+        .await
+        .expect("`new wedged` opens: nothing of the refused create is replayed");
+    let gateway = fixture.gateway_at_hello("wedged");
+    fixture
+        .create(&next, "wedged", CreateOptions::default())
+        .await
+        .expect("the name is free for a create that can succeed");
+    assert_eq!(fixture.listed(&next).await, ["main", "wedged"]);
+    assert!(completed(fixture.intent("wedged")));
     assert_eq!(gateway.claimed().await, [0_u16; 0]);
 
     let gateway = fixture.gateway_at_hello("forked");
-    fixture
-        .fork(&runtime, "main", "forked")
-        .await
-        .expect("fork");
+    fixture.fork(&next, "main", "forked").await.expect("fork");
     assert_eq!(gateway.claimed().await, [0_u16; 0]);
-    runtime.shutdown().await.expect("stop the runtime");
+    next.shutdown().await.expect("stop the creating runtime");
 }

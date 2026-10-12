@@ -3458,6 +3458,7 @@ fn main() {
     /// deletes it before the adoption completes, so it never outlives the intent that protects it
     /// from collection. A checkout in which nothing can name build state gets none minted at all:
     /// no tracked manifest, or only tracked build inputs whose state is the host's.
+    /// Once linked, that volume wins over another mint, which settling releases unused.
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn real_apfs_main_links_the_volume_minted_beside_its_image_or_releases_it() {
@@ -3538,13 +3539,38 @@ fn main() {
                 .is_some(),
             "main is seeded from its first volume"
         );
+
+        // A later first-touch attempt must use the link, not its newly minted candidate.
+        let first = scratch
+            .volumes
+            .mint_first(checkout.clone(), checkout.clone())
+            .await;
+        let unused = minted(&first);
+        let refresh = scratch
+            .volumes
+            .refresh(
+                main.clone(),
+                checkout.clone(),
+                discovered(vec![BuildStatePath::new("target", "target").unwrap()]),
+                first.lend(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            refresh.volume,
+            Some(linked_now.id.clone()),
+            "the linked volume wins"
+        );
+        first.settle().await;
+        assert!(!scratch.layout.image(&unused.id).exists());
+        assert!(scratch.layout.image(&linked_now.id).exists());
         scratch.release_all();
     }
 
-    /// Every first touch that does not take the volume minted beside main's image leaves it to
-    /// settling, which releases it: a tracked-source refusal and a volume the checkout already
-    /// links. A volume the checkout links stays, record or not: an interrupted first touch's link
-    /// protects it and its retry finds it.
+    /// A tracked-source refusal leaves the volume minted beside main's image to settling,
+    /// which releases it. An interrupted first touch's link protects its volume even before
+    /// the record is published.
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn real_apfs_main_releases_the_volume_minted_beside_its_image_its_first_touch_left() {
@@ -3576,28 +3602,6 @@ fn main() {
         assert!(refusal.is_err(), "target holds tracked source: {refusal:?}");
         first.settle().await;
         assert!(!scratch.layout.image(&refused.id).exists());
-
-        let (holding, held, _) = scratch.linked_checkout("holding", 1);
-        let first = scratch
-            .volumes
-            .mint_first(source.clone(), holding.clone())
-            .await;
-        let unused = minted(&first);
-        let refresh = scratch
-            .volumes
-            .refresh(
-                main.clone(),
-                holding.clone(),
-                discovered(vec![BuildStatePath::new("target", "target").unwrap()]),
-                first.lend(),
-            )
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(refresh.volume, Some(held.clone()), "the linked volume wins");
-        first.settle().await;
-        assert!(!scratch.layout.image(&unused.id).exists());
-        assert!(scratch.layout.image(&held).exists());
 
         let interrupted = tracked_checkout(scratch.root.path(), "interrupted", AT_THE_CAP, &[]);
         let first = scratch

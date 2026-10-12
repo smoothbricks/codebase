@@ -620,35 +620,6 @@ fn real_apfs_live_capture_leaves_its_source_unchanged_on_success_and_refusal() {
     }
 }
 
-/// A detached capture (the blank template and build seeds, 16_build_volumes.md) holds its source's
-/// backing file against attachment while it clones. The raw clone primitive therefore refuses an
-/// attached image before any byte is copied, and publishes no destination.
-#[test]
-fn real_apfs_detached_capture_refuses_an_attached_image_before_copying_any_bytes() {
-    let fixture = RealFixture::new("detached-capture-attached");
-    let source = fixture.root().join("source.dmg");
-    let destination = fixture.root().join("destination.dmg");
-    fixture.blank_image(&source);
-    let host = fixture.host();
-    let backend = host.backend();
-    let attachment = backend.attach_verified(&source).expect("attach source");
-    assert!(
-        attached(&source),
-        "the kernel has the source image attached"
-    );
-    let cloned = backend.clone_image(&source, &destination, ImageCapture::Detached);
-    assert!(
-        cloned.is_err(),
-        "an attached image must never be captured detached: {cloned:?}"
-    );
-    assert!(!destination.exists(), "no unsealed image may be published");
-    assert!(
-        attached(&source),
-        "refusal leaves the source attachment alone"
-    );
-    drop(attachment);
-}
-
 fn repo() -> RepoId {
     RepoId::parse("acme/widget").expect("repo")
 }
@@ -2525,40 +2496,6 @@ fn sidecar_removal_does_not_hide_non_file_errors() {
     assert!(host.reclaim_image(image.image()).is_err());
 }
 
-/// A `WhenIdle` detach that a holder dissents leaves the workspace exactly as it found it: still
-/// mounted, and still the actor's to detach once the holder lets go. The holder is real — a file
-/// open on the volume — so the refusal is the native unmount's resource-busy result. The separate
-/// real held-file release test proves escalation after the unchanged grace; this test proves that
-/// `WhenIdle` leaves the volume and its contents to their owner.
-#[test]
-fn real_apfs_dissented_when_idle_detach_leaves_the_mount_to_the_actor() {
-    let fixture = RealFixture::new("detach-dissent");
-    let image = fixture.layout().main_image().expect("image");
-    fixture.published_image(image.image());
-    let host = fixture.host();
-    let workspace = workspace();
-    let mount = fixture.main_mount();
-    std::fs::create_dir_all(&mount).expect("mount point");
-    let attachment = host.attach_verified(image.image()).expect("attachment");
-    host.mount(&attachment, &mount, MountAccess::ReadWrite, false)
-        .expect("mount");
-    host.retain_mounted(&workspace, attachment).expect("retain");
-    let holder = std::fs::File::create(mount.join("held")).expect("hold the volume");
-
-    host.detach_mounted(&workspace, DetachIntent::WhenIdle)
-        .expect_err("a dissented WhenIdle detach must fail");
-    assert!(
-        kernel_mount_at(&mount).is_some(),
-        "WhenIdle never forces: the volume stays mounted"
-    );
-
-    drop(holder);
-    host.detach_mounted(&workspace, DetachIntent::Release)
-        .expect("the workspace is still the actor's to detach");
-    assert!(kernel_mount_at(&mount).is_none());
-    assert!(!attached(image.image()));
-}
-
 #[test]
 fn real_apfs_release_detaches_a_volume_held_open_after_its_grace() {
     let fixture = RealFixture::new("native-release-held-file");
@@ -2589,6 +2526,9 @@ fn real_apfs_release_detaches_a_volume_held_open_after_its_grace() {
 /// nowhere are typed skips, the empty mountpoint is refused as no store image, and nothing the
 /// host owns changes name. The mounted workspace is renamed through its device, under the raw pin
 /// the rename takes, and the kernel then reports the label.
+/// Before mounting, detached capture refuses the attached image without publishing a copy.
+/// Once mounted, a holder can dissent to WhenIdle without surrendering the actor's attachment;
+/// after the holder drops, Release removes the mount and attachment.
 #[test]
 fn real_apfs_rename_names_the_pinned_device_and_skips_what_is_not_mounted() {
     let fixture = RealFixture::new("native-rename-pinned");
@@ -2625,6 +2565,23 @@ fn real_apfs_rename_names_the_pinned_device_and_skips_what_is_not_mounted() {
     let mount = fixture.main_mount();
     std::fs::create_dir_all(&mount).expect("mount point");
     let attachment = host.attach_verified(image.image()).expect("attachment");
+    let destination = fixture.root().join("destination.dmg");
+    assert!(
+        attached(image.image()),
+        "the kernel has the source image attached"
+    );
+    let cloned = host
+        .backend()
+        .clone_image(image.image(), &destination, ImageCapture::Detached);
+    assert!(
+        cloned.is_err(),
+        "an attached image must never be captured detached: {cloned:?}"
+    );
+    assert!(!destination.exists(), "no unsealed image may be published");
+    assert!(
+        attached(image.image()),
+        "refusal leaves the source attachment alone"
+    );
     assert_eq!(
         host.label_image_volume(image.image(), label)
             .expect("an attached, unmounted volume is a typed skip"),
@@ -2656,8 +2613,16 @@ fn real_apfs_rename_names_the_pinned_device_and_skips_what_is_not_mounted() {
         "the host's Data volume keeps its name"
     );
 
+    let holder = std::fs::File::create(mount.join("held")).expect("hold the volume");
+    host.detach_mounted(&workspace(), DetachIntent::WhenIdle)
+        .expect_err("a dissented WhenIdle detach must fail");
+    assert!(
+        kernel_mount_at(&mount).is_some(),
+        "WhenIdle never forces: the volume stays mounted"
+    );
+    drop(holder);
     host.detach_mounted(&workspace(), DetachIntent::Release)
-        .expect("release");
+        .expect("the workspace is still the actor's to detach");
     assert!(kernel_mount_at(&mount).is_none());
     assert!(!attached(image.image()));
 }
@@ -5938,10 +5903,11 @@ fn resize_refuses_a_capacity_that_does_not_grow_before_touching_the_image() {
     );
 }
 
-/// The same holder also refuses a defragment, leaving the image as it was.
+/// A holder first refuses both resize and defragment without changing the image or its
+/// attachment. Once released, the same mounted workspace grows and returns with its payload.
 #[test]
-fn real_apfs_resize_refuses_a_busy_workspace_before_growing_the_image() {
-    let fixture = RealFixture::new("resize-busy");
+fn real_apfs_resizing_a_mounted_workspace_puts_it_back_on_its_mount() {
+    let fixture = RealFixture::new("resize-mounted");
     let (image, mount) = mounted_main(&fixture);
     let host = fixture.host();
     let holder = std::fs::File::open(mount.join("payload")).expect("hold the volume");
@@ -6010,13 +5976,6 @@ fn real_apfs_resize_refuses_a_busy_workspace_before_growing_the_image() {
         "the workspace stays mounted"
     );
     drop(holder);
-}
-
-#[test]
-fn real_apfs_resizing_a_mounted_workspace_puts_it_back_on_its_mount() {
-    let fixture = RealFixture::new("resize-mounted");
-    let (image, mount) = mounted_main(&fixture);
-    let host = fixture.host();
 
     let outcome = host
         .resize(

@@ -328,16 +328,27 @@ Coverage pays for an attachment only when the kernel behavior is the oracle. The
 normalized whole/volume device names; unheld RW/RO live captures preserve source facts on success and destination
 refusal; a held RW capture also succeeds unchanged. Restart-derived facts check an idle-detach dissent before release.
 Workspace grant refusal, workspace grant persistence and project-policy persistence share one adopted CLI fixture,
-retaining both refused and successful restart checks. Create/fork refusal and adopt/create/fork port-publication checks
-likewise share an adopted project without omitting any entry point. Busy resize and defrag each run their original
-refusal oracles on one held volume. The raw-pin witness also checks independent forced release between verification and
-mount; the mount-flag truth table heals its final ownership-free mount by mountpoint. Declared first-touch and warm-fork
+retaining both refused and successful restart checks before a real port race and gateway-grant reconciliation. Current
+create/fork refusal, legacy no-artifact recovery, missing-revision refusal/retry and adopt/create/fork port-publication
+checks share one adopted project, retaining every runtime shutdown and scoped recovery opening. An attached source's
+detached-capture refusal precedes its mount and rename checks; registered-host idle-detach dissent precedes its final
+release. Busy resize and defrag run their original refusal oracles on the mounted-growth fixture before its holder is
+released and growth succeeds. The raw-pin witness also checks independent forced release between verification and mount;
+the mount-flag truth table heals its final ownership-free mount by mountpoint. Declared first-touch and warm-fork
 assertions share the build-volume naming/reclamation walk. Push preservation and checked-land refusal/success share the
 plain-Git lifecycle walk, keeping the original Git-reference and no-write refusal oracles. Capacity-only refusal uses
 the existing recording host over a sparse RAW file, and an invalid first-mint capacity uses the pure filesystem store:
 neither needs an attached volume. Distinct adoption crash windows, registered-versus-restarted detach paths,
 writer-admission boundaries and durable deletion records remain separate oracles. The non-growing build-volume resize is
 refused as Usage on the held-conflict fixture before the holder is taken.
+
+Ordered scenarios reuse a step's resulting state instead of adopting another identical store. The Nx land walk checks
+ownership, seed identity, previous-volume reclamation, labels and linked mounts before main writes again, reseeds and
+forks. Link displacement, doctor findings and exec relinking precede a workspace's fork/reseed walk. Database-opening
+refusal precedes release of the opener, a new topic commit and database-holder refusal on the same warm main and topic;
+both distinct refusal variants, process identities and unchanged target volume are asserted. The successful first-touch
+volume also supplies the existing-link-wins case, whose unused competing mint is still released. These sequences remove
+duplicate setup, not real transitions: crash-injection states and source/target isolation witnesses remain separate.
 
 Staging GC derives backing-image and mountpoint paths in one preallocated buffer each. Both orphan branches borrow the
 parsed workspace for the deletion record rather than allocating a second name; mount GC also retains its parsed stem.

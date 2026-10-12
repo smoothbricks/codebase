@@ -358,9 +358,18 @@ async fn adopt(fixture: &Fixture, service: &mut ActorBridge) {
     );
 }
 
+/// Persist grants across restarts before installing the gateway, then race the published port
+/// and reconcile a changed grant revision on the same adopted main.
 #[tokio::test]
 async fn real_apfs_dispatch_grant_persists_across_runtime_restart() {
-    let fixture = Fixture::new();
+    let mut fixture = Fixture::new();
+    // Main's block must be one no parallel test's store is also handed. Every store allocates
+    // from its lowest free block up and checks the host only when it allocates, so two tests can
+    // hold the same low block, and the other's gateway took this test's port before this test
+    // could ("claim published port: AddrInUse"). Adoption here is steered to the highest free
+    // block, which no other store reaches, by claiming every other block in this store.
+    let steered = highest_free_port_block();
+    let claims = PortClaims::all_but(&fixture, steered);
     let mut service = fixture.open().await;
     adopt(&fixture, &mut service).await;
     let before = service.grants("main").await.expect("baseline grants");
@@ -436,68 +445,6 @@ async fn real_apfs_dispatch_grant_persists_across_runtime_restart() {
         .await
         .expect("durable project policy");
     assert!(project.deny_write.contains(&PathBuf::from("generated")));
-    service.shutdown().await.expect("shutdown runtime");
-}
-
-/// Every macOS port block of `fixture`'s store claimed for this process except `kept`, exactly
-/// as a concurrent creator's reservation claims one; dropping it releases the claims.
-struct PortClaims(Vec<PathBuf>);
-
-impl PortClaims {
-    fn all_but(fixture: &Fixture, kept: PortBlock) -> Self {
-        let staging = fixture.storage.store().join(".staging");
-        fs::create_dir_all(&staging).expect("reservation directory");
-        let owner = std::process::id().to_string();
-        Self(
-            PortBlock::macos_candidates()
-                .filter(|block| *block != kept)
-                .map(|block| {
-                    let marker = staging.join(format!("port-{}.reservation", block.base()));
-                    std::os::unix::fs::symlink(&owner, &marker).expect("port reservation marker");
-                    marker
-                })
-                .collect(),
-        )
-    }
-}
-
-impl Drop for PortClaims {
-    fn drop(&mut self) {
-        for marker in &self.0 {
-            if let Err(error) = fs::remove_file(marker) {
-                eprintln!("port reservation {}: {error}", marker.display());
-            }
-        }
-    }
-}
-
-/// The highest macOS port block whose every port the host has free right now.
-fn highest_free_port_block() -> PortBlock {
-    let candidates: Vec<PortBlock> = PortBlock::macos_candidates().collect();
-    candidates
-        .into_iter()
-        .rev()
-        .find(|block| {
-            (block.base()..block.base() + block.size())
-                .map(|port| TcpListener::bind((Ipv4Addr::LOCALHOST, port)))
-                .collect::<std::io::Result<Vec<_>>>()
-                .is_ok()
-        })
-        .expect("a macOS port block is free on the host")
-}
-
-#[tokio::test]
-async fn real_apfs_dispatch_reallocates_a_raced_port_and_reconciles_gateway_grants() {
-    let mut fixture = Fixture::new();
-    // Main's block must be one no parallel test's store is also handed. Every store allocates
-    // from its lowest free block up and checks the host only when it allocates, so two tests can
-    // hold the same low block, and the other's gateway took this test's port before this test
-    // could ("claim published port: AddrInUse"). Adoption here is steered to the highest free
-    // block, which no other store reaches, by claiming every other block in this store.
-    let steered = highest_free_port_block();
-    let claims = PortClaims::all_but(&fixture, steered);
-    let mut service = fixture.open().await;
-    adopt(&fixture, &mut service).await;
     let original = service
         .grants("main")
         .await
@@ -559,6 +506,53 @@ async fn real_apfs_dispatch_reallocates_a_raced_port_and_reconciles_gateway_gran
     service.shutdown().await.expect("shutdown runtime");
     fixture.stop_gateway().await;
     drop(competing_listener);
+}
+
+/// Every macOS port block of `fixture`'s store claimed for this process except `kept`, exactly
+/// as a concurrent creator's reservation claims one; dropping it releases the claims.
+struct PortClaims(Vec<PathBuf>);
+
+impl PortClaims {
+    fn all_but(fixture: &Fixture, kept: PortBlock) -> Self {
+        let staging = fixture.storage.store().join(".staging");
+        fs::create_dir_all(&staging).expect("reservation directory");
+        let owner = std::process::id().to_string();
+        Self(
+            PortBlock::macos_candidates()
+                .filter(|block| *block != kept)
+                .map(|block| {
+                    let marker = staging.join(format!("port-{}.reservation", block.base()));
+                    std::os::unix::fs::symlink(&owner, &marker).expect("port reservation marker");
+                    marker
+                })
+                .collect(),
+        )
+    }
+}
+
+impl Drop for PortClaims {
+    fn drop(&mut self) {
+        for marker in &self.0 {
+            if let Err(error) = fs::remove_file(marker) {
+                eprintln!("port reservation {}: {error}", marker.display());
+            }
+        }
+    }
+}
+
+/// The highest macOS port block whose every port the host has free right now.
+fn highest_free_port_block() -> PortBlock {
+    let candidates: Vec<PortBlock> = PortBlock::macos_candidates().collect();
+    candidates
+        .into_iter()
+        .rev()
+        .find(|block| {
+            (block.base()..block.base() + block.size())
+                .map(|port| TcpListener::bind((Ipv4Addr::LOCALHOST, port)))
+                .collect::<std::io::Result<Vec<_>>>()
+                .is_ok()
+        })
+        .expect("a macOS port block is free on the host")
 }
 
 /// A plain Git repository, adopted and served through a real gateway, with one workspace,
@@ -1912,11 +1906,39 @@ fn write_declared_project(checkout: &Path) {
     fs::write(upstream.join("build/build.ninja"), b"before cowshed\n").unwrap();
 }
 
-/// A land freezes main's new seed from the landing volume at the landed tree, moves main's link
-/// onto that volume, releases main's previous volume, and re-runs the check in main: every task
-/// hits (16_build_volumes.md, Land steps 5–7).
+/// Run `nx_check` in `workspace` and answer the cache status of each task of that run.
+async fn nx_statuses(
+    service: &mut ActorBridge,
+    workspace: &str,
+    checkout: &Path,
+    nx_check: &str,
+) -> Vec<(String, nx::CacheStatus)> {
+    let spawned = SystemTime::now();
+    sh(service, workspace, nx_check).await;
+    let exited = SystemTime::now();
+    match nx::attribute(&checkout.join(".nx/cache"), nx_check, spawned, exited) {
+        nx::Attribution::Ours(run) => run
+            .tasks
+            .into_iter()
+            .map(|task| (task.task_id, task.cache))
+            .collect(),
+        nx::Attribution::Unattributed(reason) => {
+            panic!("{workspace}'s Nx run left no summary of its own: {reason:?}")
+        }
+    }
+}
+
+/// The retiring land first proves ownership, frozen-seed identity and tree, immediate reclamation
+/// of the old volume, its new label and the exact linked mounts (16_build_volumes.md, steps 5–7).
+/// What main runs after a land reaches main's seed (16_build_volumes.md, "Targets and seeds"):
+/// main changes `a` and runs it on the adopted volume, so its seed, frozen from the landing
+/// volume, is behind; doctor says so, `cowshed reseed main` refreezes it, and a fork hits
+/// main's run. A fork that reseeds its source on its own is
+/// [`real_apfs_a_fork_of_a_workspace_reseeds_it_and_hits_its_latest_run_substrate_lifecycle`]: `new` and `fork`
+/// reseed through the one fork path, so a second fork of main here would only pay two more
+/// attaches for it.
 #[tokio::test]
-async fn real_apfs_a_land_adopts_freezes_the_seed_releases_the_old_volume_and_reports_2b_substrate_lifecycle()
+async fn real_apfs_what_main_runs_after_a_land_reaches_its_seed_and_a_fork_hits_it_substrate_lifecycle()
  {
     let (nx, node) = repository_nx();
     let mut fixture = Fixture::with(Project::Build {
@@ -1927,21 +1949,17 @@ async fn real_apfs_a_land_adopts_freezes_the_seed_releases_the_old_volume_and_re
     let mut service = serve_project(&mut fixture, &nx_reads).await;
     let layout = build_volumes(&fixture);
     let previous = linked_volume(&layout, &fixture.checkout);
+    let nx_check = nx_run_many(&node, "build test");
+    let main = fixture.checkout.clone();
 
     let topic = new_workspace(&mut service, "topic").await;
-    fs::write(topic.join("a/src.txt"), b"src, changed\n").unwrap();
-    git(&topic, &["commit", "-q", "-am", "change a"]);
+    fs::write(topic.join("a/src.txt"), b"src, landed\n").unwrap();
+    git(&topic, &["commit", "-q", "-am", "land a"]);
     let landing = linked_volume(&layout, &topic);
     assert_ne!(landing, previous);
     let landed_tree = git_stdout(&topic, &["rev-parse", "HEAD^{tree}"]);
-    let report = land(
-        &mut service,
-        "topic",
-        true,
-        &[&nx_run_many(&node, "build test")],
-    )
-    .await;
-
+    let report = land(&mut service, "topic", true, &[&nx_check]).await;
+    assert!(report.build_volume.adoption.is_adopted(), "{report:?}");
     assert!(report.retired, "{report:?}");
     assert_eq!(report.build_volume.seed, LandSeed::Frozen, "{report:?}");
     match &report.build_volume.adoption {
@@ -1983,59 +2001,6 @@ async fn real_apfs_a_land_adopts_freezes_the_seed_releases_the_old_volume_and_re
     );
     assert_build_label(&layout, &fixture.checkout, "main").await;
     assert_linked_build_mounts(&layout, &[&fixture.checkout]);
-    service.shutdown().await.expect("stop the runtime");
-    fixture.stop_gateway().await;
-}
-
-/// Run `nx_check` in `workspace` and answer the cache status of each task of that run.
-async fn nx_statuses(
-    service: &mut ActorBridge,
-    workspace: &str,
-    checkout: &Path,
-    nx_check: &str,
-) -> Vec<(String, nx::CacheStatus)> {
-    let spawned = SystemTime::now();
-    sh(service, workspace, nx_check).await;
-    let exited = SystemTime::now();
-    match nx::attribute(&checkout.join(".nx/cache"), nx_check, spawned, exited) {
-        nx::Attribution::Ours(run) => run
-            .tasks
-            .into_iter()
-            .map(|task| (task.task_id, task.cache))
-            .collect(),
-        nx::Attribution::Unattributed(reason) => {
-            panic!("{workspace}'s Nx run left no summary of its own: {reason:?}")
-        }
-    }
-}
-
-/// What main runs after a land reaches main's seed (16_build_volumes.md, "Targets and seeds"):
-/// main changes `a` and runs it on the adopted volume, so its seed, frozen from the landing
-/// volume, is behind; doctor says so, `cowshed reseed main` refreezes it, and a fork hits
-/// main's run. A fork that reseeds its source on its own is
-/// [`real_apfs_a_fork_of_a_workspace_reseeds_it_and_hits_its_latest_run_substrate_lifecycle`]: `new` and `fork`
-/// reseed through the one fork path, so a second fork of main here would only pay two more
-/// attaches for it.
-#[tokio::test]
-async fn real_apfs_what_main_runs_after_a_land_reaches_its_seed_and_a_fork_hits_it_substrate_lifecycle()
- {
-    let (nx, node) = repository_nx();
-    let mut fixture = Fixture::with(Project::Build {
-        nx: Some((&nx, &node)),
-        rust: None,
-    });
-    let nx_reads = nx_read_paths(&fixture_nx(&fixture.checkout));
-    let mut service = serve_project(&mut fixture, &nx_reads).await;
-    let layout = build_volumes(&fixture);
-    let nx_check = nx_run_many(&node, "build test");
-    let main = fixture.checkout.clone();
-
-    let topic = new_workspace(&mut service, "topic").await;
-    fs::write(topic.join("a/src.txt"), b"src, landed\n").unwrap();
-    git(&topic, &["commit", "-q", "-am", "land a"]);
-    let landed_tree = git_stdout(&topic, &["rev-parse", "HEAD^{tree}"]);
-    let report = land(&mut service, "topic", true, &[&nx_check]).await;
-    assert!(report.build_volume.adoption.is_adopted(), "{report:?}");
     let [(landed_seed, _)] = seeds_of_main(&layout).try_into().expect("one seed of main");
 
     // Main's own work on the adopted volume, after the seed was frozen: a miss in main.
@@ -2104,6 +2069,8 @@ async fn real_apfs_what_main_runs_after_a_land_reaches_its_seed_and_a_fork_hits_
 /// `cowshed fork` reseeds its source as `new` does (16_build_volumes.md, "Fork"): `w1` runs on
 /// its own volume after its seed was frozen at its creation, and a fork of `w1` hits that run
 /// instead of cloning the older seed and running everything again.
+/// Before either fork, doctor diagnoses main's displaced workspace-data link and an exec restores
+/// it, so the forks never inherit a real directory in place of the build-volume link.
 #[tokio::test]
 async fn real_apfs_a_fork_of_a_workspace_reseeds_it_and_hits_its_latest_run_substrate_lifecycle() {
     let (nx, node) = repository_nx();
@@ -2113,6 +2080,30 @@ async fn real_apfs_a_fork_of_a_workspace_reseeds_it_and_hits_its_latest_run_subs
     });
     let nx_reads = nx_read_paths(&fixture_nx(&fixture.checkout));
     let mut service = serve_project(&mut fixture, &nx_reads).await;
+    assert_eq!(build_link_findings(&mut service).await, [""; 0]);
+
+    let data = fixture.checkout.join(".nx/workspace-data");
+    let link = fs::read_link(&data).expect("main's workspace-data link");
+    fs::remove_file(&data).unwrap();
+    fs::create_dir(&data).unwrap();
+    fs::write(data.join("project-graph.json"), b"{}").unwrap();
+    let displaced = build_link_findings(&mut service).await;
+
+    sh(&mut service, "main", "true").await;
+    let relinked = fs::read_link(&data);
+    let after = build_link_findings(&mut service).await;
+    assert!(
+        matches!(
+            displaced.as_slice(),
+            [message] if message.starts_with(
+                "main's .nx/workspace-data is a real directory where its link onto the build volume belongs"
+            )
+        ),
+        "{displaced:?}"
+    );
+    assert_eq!(relinked.expect("the exec's refresh relinked it"), link);
+    assert_eq!(after, [""; 0]);
+
     let nx_check = nx_run_many(&node, "build test");
 
     let w1 = new_workspace(&mut service, "w1").await;
@@ -2155,47 +2146,6 @@ async fn build_link_findings(service: &mut ActorBridge) -> Vec<String> {
         .filter(|finding| finding["code"] == "build-link")
         .map(|finding| finding["message"].as_str().unwrap_or_default().to_owned())
         .collect()
-}
-
-/// A tool that removes main's `.nx/workspace-data` link -- the repository's own shell entry did,
-/// on every Nx plugin rebuild -- leaves its next Nx run to make a real directory there, off the
-/// build volume, and every new workspace clones that directory. Doctor names it, and the refresh
-/// before the next exec puts the link back.
-#[tokio::test]
-async fn real_apfs_doctor_names_a_displaced_build_link_and_an_exec_relinks_it_substrate_lifecycle()
-{
-    let (nx, node) = repository_nx();
-    let mut fixture = Fixture::with(Project::Build {
-        nx: Some((&nx, &node)),
-        rust: None,
-    });
-    let nx_reads = nx_read_paths(&fixture_nx(&fixture.checkout));
-    let mut service = serve_project(&mut fixture, &nx_reads).await;
-    assert_eq!(build_link_findings(&mut service).await, [""; 0]);
-
-    let data = fixture.checkout.join(".nx/workspace-data");
-    let link = fs::read_link(&data).expect("main's workspace-data link");
-    fs::remove_file(&data).unwrap();
-    fs::create_dir(&data).unwrap();
-    fs::write(data.join("project-graph.json"), b"{}").unwrap();
-    let displaced = build_link_findings(&mut service).await;
-
-    sh(&mut service, "main", "true").await;
-    let relinked = fs::read_link(&data);
-    let after = build_link_findings(&mut service).await;
-    service.shutdown().await.expect("stop the runtime");
-    fixture.stop_gateway().await;
-    assert!(
-        matches!(
-            displaced.as_slice(),
-            [message] if message.starts_with(
-                "main's .nx/workspace-data is a real directory where its link onto the build volume belongs"
-            )
-        ),
-        "{displaced:?}"
-    );
-    assert_eq!(relinked.expect("the exec's refresh relinked it"), link);
-    assert_eq!(after, [""; 0]);
 }
 
 /// A land carries main's Nx cache entries into the volume main adopts (16_build_volumes.md,
@@ -2546,16 +2496,14 @@ async fn rebase(service: &mut ActorBridge, workspace: &str) -> RebaseReport {
         .expect("a successful rebase report")
 }
 
-/// The common warm project for the two independent ways a foreign process blocks adoption.
-struct DatabaseHolderFixture {
-    fixture: Fixture,
-    service: ActorBridge,
-    layout: BuildVolumeLayout,
-    database: PathBuf,
-    nx_check: String,
-}
-
-async fn database_holder_fixture() -> DatabaseHolderFixture {
+/// Stock Nx's open lock fences the look-to-rename window: an opener skips the swap and is
+/// named, while the target keeps its volume and the landing tree still freezes its seed.
+/// Once the opener exits, a new commit on the same topic exercises a foreign database holder:
+/// the retiring land names that holder and freezes a new seed without swapping main's volume
+/// (16_build_volumes.md, "The adoption needs the target's Nx database closed").
+#[tokio::test]
+async fn real_apfs_a_foreign_database_opener_skips_adoption_with_its_pid_and_argv_substrate_lifecycle()
+ {
     let (nx, node) = repository_nx();
     let mut fixture = Fixture::with(Project::Build {
         nx: Some((&nx, &node)),
@@ -2578,27 +2526,6 @@ async fn database_holder_fixture() -> DatabaseHolderFixture {
     let [database] = databases.as_slice() else {
         panic!("one task database in {}: {databases:?}", data.display());
     };
-    DatabaseHolderFixture {
-        fixture,
-        service,
-        layout,
-        database: database.clone(),
-        nx_check,
-    }
-}
-
-/// Stock Nx's open lock fences the look-to-rename window: an opener skips the swap and is
-/// named, while the target keeps its volume and the landing tree still freezes its seed.
-#[tokio::test]
-async fn real_apfs_a_foreign_database_opener_skips_adoption_with_its_pid_and_argv_substrate_lifecycle()
- {
-    let DatabaseHolderFixture {
-        mut fixture,
-        mut service,
-        layout,
-        database,
-        nx_check,
-    } = database_holder_fixture().await;
     let before = linked_volume(&layout, &fixture.checkout);
     let mut opening = Holder(
         Command::new("/usr/bin/lockf")
@@ -2652,34 +2579,29 @@ async fn real_apfs_a_foreign_database_opener_skips_adoption_with_its_pid_and_arg
     drop(opening.0.stdin.take());
     opening.0.wait().expect("lockf exits with its command");
     drop(opening);
-    service.shutdown().await.expect("stop the runtime");
-    fixture.stop_gateway().await;
-}
 
-/// A process other than main's daemon holding its task database open skips the swap and is
-/// named (16_build_volumes.md, "The adoption needs the target's Nx database closed").
-#[tokio::test]
-async fn real_apfs_a_foreign_database_holder_skips_adoption_with_its_pid_and_argv_substrate_lifecycle()
- {
-    let DatabaseHolderFixture {
-        mut fixture,
-        mut service,
-        layout,
-        database,
-        nx_check,
-    } = database_holder_fixture().await;
-    let before = linked_volume(&layout, &fixture.checkout);
+    // The first land retained topic and left main's database in place. Change the landing tree
+    // again before holding that database, so this is another checked land, not a no-op replay.
+    fs::write(
+        topic.join("a/src.txt"),
+        b"src, changed with a database holder\n",
+    )
+    .unwrap();
+    git(
+        &topic,
+        &["commit", "-q", "-am", "change a after the opener exits"],
+    );
     let holder = Holder(
         Command::new("/usr/bin/tail")
             .arg("-f")
-            .arg(&database)
+            .arg(database)
             .stdout(Stdio::null())
             .spawn()
             .expect("spawn a database holder"),
     );
     let pid = i32::try_from(holder.0.id()).expect("a pid fits i32");
     eventually("tail holds the task database open", || {
-        nx::holders(&database)
+        nx::holders(database)
             .expect("query the database's holders")
             .iter()
             .any(|holder| holder.pid == pid)
