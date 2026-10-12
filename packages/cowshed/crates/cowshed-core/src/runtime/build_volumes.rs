@@ -2333,28 +2333,6 @@ fn say_release(id: &BuildVolumeId, whose: &str, release: &BuildVolumeRelease) {
     }
 }
 
-/// Processes, each as `pid <n> (<argv>)`, joined by `; `.
-struct Holders<'a>(&'a [nx::Holder]);
-
-impl std::fmt::Display for Holders<'_> {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write_holders(formatter, self.0)
-    }
-}
-
-fn write_holders(
-    formatter: &mut std::fmt::Formatter<'_>,
-    holders: &[nx::Holder],
-) -> std::fmt::Result {
-    for (index, holder) in holders.iter().enumerate() {
-        if index > 0 {
-            formatter.write_str("; ")?;
-        }
-        write!(formatter, "{holder}")?;
-    }
-    Ok(())
-}
-
 /// Spec 16's owned index-link cutover. Only a recorded fixed `.codegraph` link is exchanged;
 /// the index is copied from a sealed snapshot, never from the live database.
 fn migrate_owned_indexes(
