@@ -6,7 +6,7 @@
 // FIX_STATE names a directory holding `plan.json`, an array of calls. A call whose arguments are not the next
 // scripted one, or one past the end of the plan, exits 97 or 98 and says so: the script under test did something the
 // scenario did not expect. An expected argument ending in `*` matches any argument that starts the same way.
-import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, fstatSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { Call } from './land-host.plan.ts';
 
@@ -35,6 +35,15 @@ if (!matches) {
   process.exit(97);
 }
 writeFileSync(counter, String(index + 1));
+
+if (call.requireFileOutput) {
+  const stdout = fstatSync(1);
+  const stderr = fstatSync(2);
+  if (!stdout.isFile() || !stderr.isFile() || stdout.dev !== stderr.dev || stdout.ino !== stderr.ino) {
+    process.stderr.write('fake nx: output must go directly to one regular capture file\n');
+    process.exit(96);
+  }
+}
 
 if (call.output !== undefined) {
   process.stdout.write(`${call.output}\n`);

@@ -73,6 +73,14 @@ workspace_nx() {
   (cd "$checkout" && direnv exec "$checkout" bun nx "$@" </dev/null)
 }
 
+# Replay only the final 64 KiB under a 10-second bound; a blocked reader never authorizes a land.
+replay_gate_output() {
+  timeout --kill-after=1s 10s tail -c 65536 "$1" >&2 || {
+    say "could not replay the gate output from $1; the land stops; complete output: $1"
+    exit 1
+  }
+}
+
 # Gates exactly the rebased tree. Reporting never changes Nx's status or grants permission to land.
 gate_workspace() {
   say "gating $head (rebased onto $base) on the host"
@@ -90,12 +98,12 @@ gate_workspace() {
   if [ "$gate_status" -ne 0 ]; then
     (cd "$checkout" && direnv exec "$checkout" bun "$here/land-summary.ts" "$output") >&2 || {
       say "failure summary unavailable; complete gate output: $output"
-      cat "$output" >&2
+      replay_gate_output "$output"
     }
     say "gate exited $gate_status; the land stops; complete output: $output"
     exit "$gate_status"
   fi
-  cat "$output" >&2
+  replay_gate_output "$output"
   rm "$output"
 }
 

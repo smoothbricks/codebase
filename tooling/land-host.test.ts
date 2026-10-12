@@ -154,6 +154,8 @@ interface LandRun {
   readonly log: string;
   /** The nx calls it made, in order. */
   readonly nx: readonly string[];
+  /** Arguments received by the planted unavailable replay tool, when this fixture uses it. */
+  readonly replayArgs?: readonly string[];
 }
 
 interface Land {
@@ -171,7 +173,7 @@ afterEach(() => {
 });
 
 /** A main repository carrying the land tooling, and a workspace one commit ahead of it. */
-function fixture(): Land {
+function fixture(replayFails = false): Land {
   const root = mkdtempSync(join(tmpdir(), 'land-host-'));
   roots.push(root);
   const main = join(root, 'main');
@@ -199,6 +201,11 @@ function fixture(): Land {
   for (const [name, text] of Object.entries(stubs)) {
     writeFileSync(join(bin, name), text);
     chmodSync(join(bin, name), 0o755);
+  }
+  if (replayFails) {
+    const timeout = join(bin, 'timeout');
+    writeFileSync(timeout, '#!/bin/sh\nprintf \'%s\\n\' "$@" >"$FIX_STATE/replay.args"\nexit 73\n');
+    chmodSync(timeout, 0o755);
   }
   const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('NX_')));
   return {
@@ -228,10 +235,12 @@ function fixture(): Land {
         if (match[1] !== undefined) roots.push(match[1]);
       }
       const nxLog = join(state, 'nx.log');
+      const replayLog = join(state, 'replay.args');
       return {
         status: run.status ?? -1,
         log: run.stderr,
         nx: existsSync(nxLog) ? readFileSync(nxLog, 'utf8').trimEnd().split('\n') : [],
+        replayArgs: existsSync(replayLog) ? readFileSync(replayLog, 'utf8').trimEnd().split('\n') : undefined,
       };
     },
   };
@@ -269,6 +278,51 @@ describe('land-host.sh', () => {
     expect(run.nx).toEqual(['daemon --stop', GATE.join(' ')]);
     expect(git(land.main, 'rev-parse', 'HEAD')).toBe(gated);
     expect(existsSync(join(land.ws, 'agent-todo/land-ledger.md'))).toBe(false);
+  });
+
+  it('captures directly to one file and replays exactly the final 64 KiB without changing the gate verdict', () => {
+    const land = fixture();
+    const gated = git(land.ws, 'rev-parse', 'HEAD');
+    const suffix = '\ncapture-suffix\n';
+    const run = land.land([
+      DAEMON_STOP,
+      {
+        ...passingRun(GATE),
+        requireFileOutput: true,
+        output: `capture-prefix\n${'x'.repeat(70_000)}${suffix.slice(0, -1)}`,
+      },
+    ]);
+    expect(run.status, run.log).toBe(0);
+    expect(run.log).not.toContain('capture-prefix');
+    expect(run.log).toContain('capture-suffix');
+    expect(run.log.match(/x{1000,}/)?.[0]?.length).toBe(65_536 - suffix.length);
+    expect(git(land.main, 'rev-parse', 'HEAD')).toBe(gated);
+  });
+
+  it('reports the complete captured failure even when its summary precedes the replay suffix', () => {
+    const land = fixture();
+    const before = git(land.main, 'rev-parse', 'HEAD');
+    const message = 'error: failure before the replay suffix';
+    const failed = failedRun(message, 7);
+    const run = land.land([
+      DAEMON_STOP,
+      { ...failed, requireFileOutput: true, output: `${failed.output}\n${'x'.repeat(70_000)}\ncapture-suffix` },
+    ]);
+    expect(run.status, run.log).toBe(7);
+    expect(run.log).toContain('failed ' + TASK + '\n' + message);
+    expect(run.nx).toEqual(['daemon --stop', GATE.join(' ')]);
+    expect(git(land.main, 'rev-parse', 'HEAD')).toBe(before);
+  });
+
+  it('refuses to land when bounded replay fails after a successful gate', () => {
+    const land = fixture(true);
+    const before = git(land.main, 'rev-parse', 'HEAD');
+    const run = land.land([DAEMON_STOP, { ...passingRun(GATE), requireFileOutput: true }]);
+    expect(run.status, run.log).toBe(1);
+    expect(run.log).toContain('could not replay the gate output');
+    expect(run.replayArgs?.slice(0, -1)).toEqual(['--kill-after=1s', '10s', 'tail', '-c', '65536']);
+    expect(run.nx).toEqual(['daemon --stop', GATE.join(' ')]);
+    expect(git(land.main, 'rev-parse', 'HEAD')).toBe(before);
   });
 
   for (const message of [
@@ -320,10 +374,19 @@ describe('land-host.sh', () => {
     const land = fixture();
     const before = git(land.main, 'rev-parse', 'HEAD');
     rmSync(join(land.main, 'tooling/land-summary.ts'));
-    const run = land.land([DAEMON_STOP, failedRun('error: original failure', 9)]);
+    const failed = failedRun('error: original failure', 9);
+    const run = land.land([
+      DAEMON_STOP,
+      { ...failed, requireFileOutput: true, output: `${failed.output}\n${'x'.repeat(70_000)}\ncapture-suffix` },
+    ]);
     expect(run.status, run.log).toBe(9);
     expect(run.log).toContain('failure summary unavailable');
-    expect(run.log).toContain('error: original failure');
+    expect(run.log).not.toContain('error: original failure');
+    expect(run.log).toContain('capture-suffix');
+    expect(run.log.match(/x{1000,}/)?.[0]?.length).toBe(65_536 - '\ncapture-suffix\n'.length);
+    const output = /complete gate output: (.+)/.exec(run.log)?.[1];
+    expect(output).toBeDefined();
+    if (output !== undefined) expect(readFileSync(output, 'utf8')).toContain('error: original failure');
     expect(git(land.main, 'rev-parse', 'HEAD')).toBe(before);
   });
 

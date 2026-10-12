@@ -5,4 +5,6 @@ export interface Call {
   readonly exit: number;
   /** What the run prints: the output of its tasks and Nx's closing summary. */
   readonly output?: string;
+  /** Refuse unless both output descriptors name the same regular capture file. */
+  readonly requireFileOutput?: boolean;
 }
