@@ -263,6 +263,45 @@ fn command_args_are_canonical_lossless_and_strictly_bounded() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn command_arg_serializer_reuses_the_public_projection() {
+    let utf8 = CommandArg::from("bun");
+    let raw = CommandArg::from(OsString::from_vec(vec![0xff, 0xfe]));
+    for argument in [utf8, raw] {
+        let through_serialize = serde_json::to_vec(&argument).expect("serialize argument");
+        let through_projection = argument
+            .with_wire(|proxy| serde_json::to_vec(proxy))
+            .expect("projection")
+            .expect("serialize projection");
+        assert_eq!(through_serialize, through_projection);
+    }
+
+    let utf8 = CommandArg::from("bun");
+    utf8.with_wire(|proxy| {
+        assert_eq!(proxy.encoding, TaggedBytesEncoding::Utf8);
+        assert_eq!(proxy.data, "bun");
+    })
+    .expect("utf8 projection");
+    assert_eq!(
+        serde_json::to_vec(&CommandArg::from("bun")).expect("serialize"),
+        br#"{"encoding":"utf8","data":"bun"}"#
+    );
+
+    let raw = CommandArg::from(OsString::from_vec(vec![0xff, 0xfe]));
+    raw.with_wire(|proxy| {
+        assert_eq!(proxy.encoding, TaggedBytesEncoding::Base64);
+        assert_eq!(proxy.data, "//4=");
+    })
+    .expect("base64 projection");
+
+    let nul = CommandArg::from(OsString::from_vec(vec![b'x', 0]));
+    assert_eq!(
+        nul.with_wire(|_| ()),
+        Err(DtoError::CommandArgumentContainsNul)
+    );
+}
+
 #[test]
 fn workspace_info_attached_and_detached_shapes_are_frozen() {
     let attached = WorkspaceInfo {

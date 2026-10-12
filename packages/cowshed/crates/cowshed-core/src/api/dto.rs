@@ -895,6 +895,19 @@ impl CommandArg {
         }
         Ok(())
     }
+
+    /// Borrows the tagged projection [`Serialize`] writes for this argument.
+    ///
+    /// Valid UTF-8 is `utf8` and borrows those bytes. Every other sequence is canonical
+    /// standard base64. Validation failure is [`DtoError`] and does not call `use_wire`.
+    pub fn with_wire<R>(
+        &self,
+        use_wire: impl FnOnce(&TaggedBytesRef<'_>) -> R,
+    ) -> Result<R, DtoError> {
+        self.validate()?;
+        let bytes = command_arg_bytes(self.as_os_str())?;
+        Ok(project_tagged_bytes(bytes, use_wire))
+    }
 }
 
 impl From<OsString> for CommandArg {
@@ -967,15 +980,15 @@ fn command_arg_bytes(value: &OsStr) -> Result<&[u8], DtoError> {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-enum TaggedBytesEncoding {
+pub enum TaggedBytesEncoding {
     Utf8,
     Base64,
 }
 
 #[derive(Serialize)]
-struct TaggedBytesRef<'a> {
-    encoding: TaggedBytesEncoding,
-    data: &'a str,
+pub struct TaggedBytesRef<'a> {
+    pub encoding: TaggedBytesEncoding,
+    pub data: &'a str,
 }
 
 #[derive(Deserialize)]
@@ -990,25 +1003,27 @@ enum TaggedBytesError {
     InvalidEncoding,
 }
 
+fn project_tagged_bytes<R>(bytes: &[u8], use_wire: impl FnOnce(&TaggedBytesRef<'_>) -> R) -> R {
+    match std::str::from_utf8(bytes) {
+        Ok(data) => use_wire(&TaggedBytesRef {
+            encoding: TaggedBytesEncoding::Utf8,
+            data,
+        }),
+        Err(_) => {
+            let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+            use_wire(&TaggedBytesRef {
+                encoding: TaggedBytesEncoding::Base64,
+                data: &encoded,
+            })
+        }
+    }
+}
+
 fn serialize_tagged_bytes<S>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
 {
-    match std::str::from_utf8(bytes) {
-        Ok(data) => TaggedBytesRef {
-            encoding: TaggedBytesEncoding::Utf8,
-            data,
-        }
-        .serialize(serializer),
-        Err(_) => {
-            let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
-            TaggedBytesRef {
-                encoding: TaggedBytesEncoding::Base64,
-                data: &encoded,
-            }
-            .serialize(serializer)
-        }
-    }
+    project_tagged_bytes(bytes, |proxy| proxy.serialize(serializer))
 }
 
 fn decode_tagged_bytes(wire: TaggedBytesWire, maximum: usize) -> Result<Vec<u8>, TaggedBytesError> {
@@ -1056,9 +1071,10 @@ impl Serialize for CommandArg {
     where
         S: Serializer,
     {
-        self.validate().map_err(serde::ser::Error::custom)?;
-        let bytes = command_arg_bytes(self.as_os_str()).map_err(serde::ser::Error::custom)?;
-        serialize_tagged_bytes(bytes, serializer)
+        match self.with_wire(|proxy| proxy.serialize(serializer)) {
+            Ok(serialized) => serialized,
+            Err(error) => Err(serde::ser::Error::custom(error)),
+        }
     }
 }
 
