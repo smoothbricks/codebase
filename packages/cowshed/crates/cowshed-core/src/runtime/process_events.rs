@@ -40,14 +40,17 @@ use std::fmt;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::process::ExitStatusExt;
+use std::time::Instant;
 
-use crate::api::process::ProcessCoverageGap;
+use crate::api::dto::{CommandArg, JobId, UtcTimestamp};
+use crate::api::process::{JobProcessEvent, JobProcessTree, ProcessCoverageGap};
 use crate::error::CowshedError;
 use crate::runtime::job_groups::{ProcessRecord, process_record};
+use crate::runtime::process_stream::{JobProcessFold, JobProcessFoldError, JobProcessObservation};
 use crate::runtime::process_tree::{
-    BirthToken, ProcessFoldError, ProcessIdentity, ProcessImage, ProcessObservation,
-    ProcessTreeFold,
+    BirthToken, ProcessIdentity, ProcessImage, ProcessObservation, ProcessTreeFold,
 };
+use crate::runtime::process_usage::{SampleError, Sampled, StartStamp};
 use crate::runtime::supervisor::{process_termination_from_wait, utc_at_second, utc_now};
 use cowshed_os::process::process_arguments;
 
@@ -74,7 +77,9 @@ pub enum ObserveError {
         source: io::Error,
     },
     #[error("the kernel's process events contradict each other: {0}")]
-    Contradiction(#[from] ProcessFoldError),
+    Contradiction(#[from] JobProcessFoldError),
+    #[error(transparent)]
+    Usage(#[from] SampleError),
     #[error(transparent)]
     Cowshed(#[from] CowshedError),
     /// More than one event of one batch failed; every event of it was folded all the same.
@@ -148,6 +153,13 @@ pub trait ProcessReads {
     fn children(&self, pid: u32) -> io::Result<Vec<u32>>;
     /// The effective uid the reads are made as.
     fn reader_uid(&self) -> u32;
+    /// A reading fenced to this retained life; missing proof never becomes invented counters.
+    fn usage(
+        &self,
+        process: ProcessIdentity,
+        start: Option<StartStamp>,
+        at: Instant,
+    ) -> Result<Sampled, SampleError>;
 }
 
 /// The running kernel.
@@ -191,6 +203,15 @@ impl ProcessReads for Darwin {
         // SAFETY: geteuid takes nothing and cannot fail.
         unsafe { libc::geteuid() }
     }
+
+    fn usage(
+        &self,
+        process: ProcessIdentity,
+        start: Option<StartStamp>,
+        at: Instant,
+    ) -> Result<Sampled, SampleError> {
+        crate::runtime::process_usage::sample(start, process, at)
+    }
 }
 
 /// `proc_listchildpids`, its failure told apart from an empty list. libproc's `proc_listpids`
@@ -225,7 +246,8 @@ unsafe fn list_child_pids(
 pub struct KqueueObserver<P = Darwin> {
     queue: OwnedFd,
     reads: P,
-    fold: ProcessTreeFold,
+    fold: JobProcessFold,
+    events: Vec<JobProcessEvent>,
     /// Every life with a registration: its events are the only ones the observer folds.
     registered: HashSet<ProcessIdentity>,
 }
@@ -238,15 +260,14 @@ impl<P> AsRawFd for KqueueObserver<P> {
 }
 
 impl KqueueObserver {
-    /// Watch `root` and everything it forks. The caller holds `root` before its exec, so the
-    /// root has neither forked nor exec'd yet.
-    pub fn watch(root: u32) -> Result<Self, ObserveError> {
-        Self::watch_with(Darwin, root)
+    /// Watch the held root of `job_id` before it can fork or exec.
+    pub fn watch(job_id: JobId, root: u32) -> Result<Self, ObserveError> {
+        Self::watch_with(Darwin, job_id, root)
     }
 }
 
 impl<P: ProcessReads> KqueueObserver<P> {
-    pub fn watch_with(reads: P, root: u32) -> Result<Self, ObserveError> {
+    pub fn watch_with(reads: P, job_id: JobId, root: u32) -> Result<Self, ObserveError> {
         // SAFETY: kqueue takes nothing and returns a new descriptor.
         let queue = unsafe { libc::kqueue() };
         if queue < 0 {
@@ -257,7 +278,8 @@ impl<P: ProcessReads> KqueueObserver<P> {
         let mut observer = Self {
             queue,
             reads,
-            fold: ProcessTreeFold::default(),
+            fold: JobProcessFold::new(job_id, Instant::now()),
+            events: Vec::new(),
             registered: HashSet::new(),
         };
         let not_running = || {
@@ -271,17 +293,67 @@ impl<P: ProcessReads> KqueueObserver<P> {
         let record = observer.attach(before)?.ok_or_else(not_running)?;
         let process = identity(&record);
         let image = observer.image(process)?.ok_or_else(not_running)?;
-        observer.fold.apply(ProcessObservation::Root {
+        observer.observe(ProcessObservation::Root {
             process,
             ppid: record.ppid,
             at: utc_at_second(record.started_seconds)?,
             image,
         })?;
+        observer.sample(Instant::now())?;
         Ok(observer)
     }
 
     pub fn fold(&self) -> &ProcessTreeFold {
-        &self.fold
+        self.fold.lives()
+    }
+
+    pub fn tree(&self, at: UtcTimestamp) -> JobProcessTree {
+        self.fold.tree(at)
+    }
+
+    pub fn drain_events(&mut self) -> std::vec::Drain<'_, JobProcessEvent> {
+        self.events.drain(..)
+    }
+
+    pub fn watching(&self) -> bool {
+        !self.registered.is_empty()
+    }
+
+    fn observe(&mut self, observation: ProcessObservation) -> Result<(), ObserveError> {
+        self.fold
+            .apply(JobProcessObservation::Tree(observation), &mut self.events)?;
+        Ok(())
+    }
+
+    /// One supervisor-owned sampling boundary, independent of subscribers and tree readers.
+    pub fn sample(&mut self, at: Instant) -> Result<(), ObserveError> {
+        let mut failures = Failures::default();
+        for &process in &self.registered {
+            if self.fold.lives().live(process.pid) != Some(process) {
+                continue;
+            }
+            match self
+                .reads
+                .usage(process, self.fold.usage_start(process), at)
+            {
+                Ok(Sampled::Read(reading)) => failures.note(
+                    self.fold
+                        .apply(
+                            JobProcessObservation::Usage { process, reading },
+                            &mut self.events,
+                        )
+                        .map_err(ObserveError::from),
+                ),
+                Ok(Sampled::Gone | Sampled::Unproven) => {}
+                Err(error) => failures.note(Err(error.into())),
+            }
+        }
+        failures.note(
+            self.fold
+                .apply(JobProcessObservation::Tick { at }, &mut self.events)
+                .map_err(ObserveError::from),
+        );
+        failures.into_result()
     }
 
     /// Fold every event already queued, without waiting. An `Err` names what could not be
@@ -435,12 +507,28 @@ impl<P: ProcessReads> KqueueObserver<P> {
             }
         };
         if let Some(observation) = observation {
-            failures.note(self.fold.apply(observation).map_err(ObserveError::from));
+            failures.note(self.observe(observation));
         }
         failures.into_result()
     }
 
     fn exited(&mut self, process: ProcessIdentity, data: isize) -> Result<(), ObserveError> {
+        let mut failures = Failures::default();
+        match self
+            .reads
+            .usage(process, self.fold.usage_start(process), Instant::now())
+        {
+            Ok(Sampled::Read(reading)) => failures.note(
+                self.fold
+                    .apply(
+                        JobProcessObservation::Usage { process, reading },
+                        &mut self.events,
+                    )
+                    .map_err(ObserveError::from),
+            ),
+            Ok(Sampled::Gone | Sampled::Unproven) => {}
+            Err(error) => failures.note(Err(error.into())),
+        }
         // An exit ends the kernel's registration with it.
         self.registered.remove(&process);
         let status = i32::try_from(data).map_err(|_| {
@@ -454,17 +542,17 @@ impl<P: ProcessReads> KqueueObserver<P> {
             )
         })?;
         let status = process_termination_from_wait(Ok(std::process::ExitStatus::from_raw(status)))?;
-        self.fold.apply(ProcessObservation::Exited {
+        failures.note(self.observe(ProcessObservation::Exited {
             process,
             status,
             at: utc_now()?,
-        })?;
-        Ok(())
+        }));
+        failures.into_result()
     }
 
     /// `parent` forked an uncounted number of children: adopt every one it has now.
     fn forked(&mut self, parent: ProcessIdentity) -> Result<(), ObserveError> {
-        self.fold.apply(ProcessObservation::Lost(
+        self.observe(ProcessObservation::Lost(
             ProcessCoverageGap::UncountedFork { pid: parent.pid },
         ))?;
         self.adopt_children(parent)
@@ -711,7 +799,8 @@ mod tests {
             let mut pid = [0_u8; 4];
             std::io::Read::read_exact(&mut &ready_read, &mut pid).expect("child pid");
             let pid = u32::try_from(i32::from_ne_bytes(pid)).expect("pid");
-            let observer = KqueueObserver::watch(pid).expect("watch the held root");
+            let observer =
+                KqueueObserver::watch(JobId::new(1).unwrap(), pid).expect("watch the held root");
             gate_write.write_all(b"x").expect("release");
             let child = spawned.join().expect("spawner");
             assert_eq!(child.id(), pid);
@@ -752,7 +841,7 @@ mod tests {
     fn argv(bytes: &[&str]) -> Vec<CommandArg> {
         bytes
             .iter()
-            .map(|&argument| CommandArg::from(argument))
+            .map(|&argument| CommandArg::new(argument))
             .collect()
     }
 
@@ -994,6 +1083,16 @@ mod tests {
         fn reader_uid(&self) -> u32 {
             self.reader
         }
+
+        fn usage(
+            &self,
+            _process: ProcessIdentity,
+            _start: Option<StartStamp>,
+            _at: Instant,
+        ) -> Result<Sampled, SampleError> {
+            // These metadata/error controls provide no native counter proof.
+            Ok(Sampled::Unproven)
+        }
     }
 
     /// Every scripted process runs as this uid.
@@ -1029,7 +1128,7 @@ mod tests {
     /// registrations named.
     fn scripted(
         reads: Scripted,
-        fold: ProcessTreeFold,
+        fold: TestFold,
         registered: &[ProcessIdentity],
     ) -> KqueueObserver<Scripted> {
         // SAFETY: kqueue takes nothing and returns a new descriptor.
@@ -1039,7 +1138,8 @@ mod tests {
             // SAFETY: a fresh descriptor this observer owns.
             queue: unsafe { OwnedFd::from_raw_fd(queue) },
             reads,
-            fold,
+            fold: fold.fold,
+            events: fold.events,
             registered: registered.iter().copied().collect(),
         }
     }
@@ -1404,5 +1504,26 @@ mod tests {
         };
         assert_eq!(childless.unwrap(), 0, "cat has no children");
         release(child);
+    }
+
+    struct TestFold {
+        fold: JobProcessFold,
+        events: Vec<JobProcessEvent>,
+    }
+
+    impl Default for TestFold {
+        fn default() -> Self {
+            Self {
+                fold: JobProcessFold::new(JobId::new(1).unwrap(), Instant::now()),
+                events: Vec::new(),
+            }
+        }
+    }
+
+    impl TestFold {
+        fn apply(&mut self, observation: ProcessObservation) -> Result<(), JobProcessFoldError> {
+            self.fold
+                .apply(JobProcessObservation::Tree(observation), &mut self.events)
+        }
     }
 }

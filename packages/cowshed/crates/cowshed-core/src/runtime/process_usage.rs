@@ -272,14 +272,12 @@ fn busy(cpu_us: u64, span: Duration) -> bool {
 pub enum SampleError {
     #[error("reading the own counters of process {pid} failed: {source}")]
     Read { pid: u32, source: io::Error },
-    #[error(transparent)]
-    Fold(#[from] UsageFoldError),
 }
 
 /// What sampling one life found.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Sampled {
-    Read,
+    Read(UsageReading),
     /// Its pid no longer names it: it was reaped, and perhaps the pid given to another.
     Gone,
     /// A first read that nothing proves is of this life (macOS: it exited before its counters
@@ -287,11 +285,10 @@ pub enum Sampled {
     Unproven,
 }
 
-/// Read `process`'s own counters at the supervisor's sample tick `at` and fold them. `held` is
-/// the pidfd the observer opened for this very life.
+/// Read `process`'s own counters at the supervisor's sample tick `at`. `held` is
+/// the pidfd the observer opened for this very life. The caller folds a proven reading once.
 #[cfg(target_os = "linux")]
 pub fn sample(
-    fold: &mut ProcessUsageFold,
     process: ProcessIdentity,
     held: std::os::fd::BorrowedFd<'_>,
     at: Instant,
@@ -305,15 +302,13 @@ pub fn sample(
     let Some(counters) = own_counters(pid).map_err(failed)? else {
         return Ok(Sampled::Gone);
     };
-    // The pidfd names the life it was opened for alone. Unreaped after the read, that life
-    // held the pid throughout, so the counters read were its own -- exited or not.
     if !unreaped(held).map_err(failed)? {
         return Ok(Sampled::Gone);
     }
-    fold_counters(fold, process, counters, at)
+    Ok(Sampled::Read(counters.reading(at)))
 }
 
-/// Read `process`'s own counters at the supervisor's sample tick `at` and fold them.
+/// Read `process`'s own counters at the supervisor's sample tick `at`; the caller folds them.
 ///
 /// A first read names the pid alone. It is of `process` if the pid names `process`'s unique id
 /// after the read: the observer saw that life before, and a life holds its pid until it is
@@ -321,7 +316,7 @@ pub fn sample(
 /// read carries its own start, so it is fenced by the read itself, an exited life included.
 #[cfg(target_os = "macos")]
 pub fn sample(
-    fold: &mut ProcessUsageFold,
+    start: Option<StartStamp>,
     process: ProcessIdentity,
     at: Instant,
 ) -> Result<Sampled, SampleError> {
@@ -334,7 +329,7 @@ pub fn sample(
     let Some(counters) = own_counters(pid).map_err(failed)? else {
         return Ok(Sampled::Gone);
     };
-    match fold.start(process) {
+    match start {
         Some(start) if counters.started != start => return Ok(Sampled::Gone),
         Some(_) => {}
         None => match crate::runtime::job_groups::process_record(pid).map_err(failed)? {
@@ -344,28 +339,7 @@ pub fn sample(
             None => return Ok(Sampled::Unproven),
         },
     }
-    fold_counters(fold, process, counters, at)
-}
-
-fn fold_counters(
-    fold: &mut ProcessUsageFold,
-    process: ProcessIdentity,
-    counters: OwnCounters,
-    at: Instant,
-) -> Result<Sampled, SampleError> {
-    fold.apply(UsageObservation::Read {
-        process,
-        reading: UsageReading {
-            started: counters.started,
-            at,
-            cpu_user: counters.cpu_user,
-            cpu_sys: counters.cpu_sys,
-            resident: counters.resident,
-            io: counters.io,
-            exited: counters.exited,
-        },
-    })?;
-    Ok(Sampled::Read)
+    Ok(Sampled::Read(counters.reading(at)))
 }
 
 /// Whether the process a pidfd names has not been reaped: signal 0 reaches an exited, unreaped
@@ -405,6 +379,20 @@ struct OwnCounters {
     resident: ResidentBytes,
     io: ProcessStorageIo,
     exited: bool,
+}
+
+impl OwnCounters {
+    fn reading(self, at: Instant) -> UsageReading {
+        UsageReading {
+            started: self.started,
+            at,
+            cpu_user: self.cpu_user,
+            cpu_sys: self.cpu_sys,
+            resident: self.resident,
+            io: self.io,
+            exited: self.exited,
+        }
+    }
 }
 
 fn unit(error: ResourceUnitError) -> io::Error {
@@ -1234,16 +1222,24 @@ mod tests {
         }
     }
 
-    /// One supervisor tick's read of `life`.
+    /// One supervisor tick's read of `life`, applied once to this test's fold.
     fn tick(fold: &mut ProcessUsageFold, life: &Observed) -> Sampled {
         #[cfg(target_os = "linux")]
         let sampled = {
             use std::os::fd::AsFd as _;
-            sample(fold, life.identity, life.pidfd.as_fd(), Instant::now())
+            sample(life.identity, life.pidfd.as_fd(), Instant::now())
         };
         #[cfg(target_os = "macos")]
-        let sampled = sample(fold, life.identity, Instant::now());
-        sampled.expect("a sample")
+        let sampled = sample(fold.start(life.identity), life.identity, Instant::now());
+        let sampled = sampled.expect("a sample");
+        if let Sampled::Read(reading) = sampled {
+            fold.apply(UsageObservation::Read {
+                process: life.identity,
+                reading,
+            })
+            .expect("a consistent read");
+        }
+        sampled
     }
 
     fn total(usage: ProcessUsage) -> u64 {
@@ -1280,15 +1276,15 @@ mod tests {
         let mut lines = BufReader::new(parent.stdout.take().expect("parent stdout")).lines();
         let parent_life = observed(parent.id());
         let mut fold = ProcessUsageFold::default();
-        assert_eq!(tick(&mut fold, &parent_life), Sampled::Read);
+        assert!(matches!(tick(&mut fold, &parent_life), Sampled::Read(_)));
 
         let burner_pid: u32 = next_report(&mut lines, "burning")[0].parse().expect("pid");
         let burner = observed(burner_pid);
-        assert_eq!(tick(&mut fold, &burner), Sampled::Read);
+        assert!(matches!(tick(&mut fold, &burner), Sampled::Read(_)));
         let burned: u64 = next_report(&mut lines, "burned")[0]
             .parse()
             .expect("burned");
-        assert_eq!(tick(&mut fold, &burner), Sampled::Read);
+        assert!(matches!(tick(&mut fold, &burner), Sampled::Read(_)));
         let usage = fold.usage(burner.identity).expect("the burner's usage");
         assert!(usage.busy, "it burned throughout the window: {usage:?}");
         // Linux counts whole 10 ms ticks; the burner did almost nothing after measuring itself.
@@ -1318,7 +1314,7 @@ mod tests {
             "reaped before a read after its exit, its usage is not known final"
         );
 
-        assert_eq!(tick(&mut fold, &parent_life), Sampled::Read);
+        assert!(matches!(tick(&mut fold, &parent_life), Sampled::Read(_)));
         let parent_own = total(
             fold.usage(parent_life.identity)
                 .expect("the parent's usage"),
@@ -1371,7 +1367,7 @@ mod tests {
 
         let waiting = read_leader(&leader).expect("the held, waiting leader");
         let mut fold = ProcessUsageFold::default();
-        assert_eq!(tick(&mut fold, &parent_life), Sampled::Read);
+        assert!(matches!(tick(&mut fold, &parent_life), Sampled::Read(_)));
         let row = total(fold.usage(parent_life.identity).expect("the parent's row"));
         let cpu =
             |totals: crate::api::resources::CpuTotals| totals.user_us.get() + totals.sys_us.get();
@@ -1467,11 +1463,10 @@ mod tests {
         let (mut child, stdin) = held_shell();
         let life = observed(child.id());
         let mut fold = ProcessUsageFold::default();
-        assert_eq!(tick(&mut fold, &life), Sampled::Read);
+        assert!(matches!(tick(&mut fold, &life), Sampled::Read(_)));
         exit_unreaped(&child, stdin);
-        assert_eq!(
-            tick(&mut fold, &life),
-            Sampled::Read,
+        assert!(
+            matches!(tick(&mut fold, &life), Sampled::Read(_)),
             "a zombie's last counters"
         );
         fold.apply(UsageObservation::Exited {
@@ -1492,7 +1487,7 @@ mod tests {
         exit_unreaped(&child, stdin);
         let mut fold = ProcessUsageFold::default();
         #[cfg(target_os = "linux")]
-        assert_eq!(tick(&mut fold, &life), Sampled::Read);
+        assert!(matches!(tick(&mut fold, &life), Sampled::Read(_)));
         #[cfg(target_os = "macos")]
         {
             assert_eq!(tick(&mut fold, &life), Sampled::Unproven);
@@ -1623,7 +1618,7 @@ mod tests {
         let small = Fixture::start("allocate 24", "allocated");
         let mut fold = ProcessUsageFold::default();
         let read = |fold: &mut ProcessUsageFold, allocator: &Fixture| {
-            assert_eq!(tick(fold, &allocator.life), Sampled::Read);
+            assert!(matches!(tick(fold, &allocator.life), Sampled::Read(_)));
             let usage = fold.usage(allocator.life.identity).expect("usage");
             let independent = allocator.independent_resident();
             assert!(
@@ -1687,13 +1682,13 @@ mod tests {
         let mut writer = Fixture::start(&format!("io 2 0 {second}"), "ready");
         let mut fold = ProcessUsageFold::default();
         for fixture in [&writer_reader, &writer] {
-            assert_eq!(tick(&mut fold, &fixture.life), Sampled::Read);
+            assert!(matches!(tick(&mut fold, &fixture.life), Sampled::Read(_)));
         }
         let before = (storage(&fold, &writer_reader), storage(&fold, &writer));
         writer_reader.step("done");
         writer.step("done");
         for fixture in [&writer_reader, &writer] {
-            assert_eq!(tick(&mut fold, &fixture.life), Sampled::Read);
+            assert!(matches!(tick(&mut fold, &fixture.life), Sampled::Read(_)));
         }
         let after = (storage(&fold, &writer_reader), storage(&fold, &writer));
         let delta =

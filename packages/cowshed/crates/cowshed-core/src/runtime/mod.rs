@@ -3,17 +3,19 @@ pub(crate) mod build_volumes;
 pub mod commitment_feed;
 #[cfg(target_os = "macos")]
 pub mod job_accounting;
-#[cfg(target_os = "macos")]
-mod job_attribution;
+pub mod job_attribution;
+pub mod job_boundary;
 #[cfg(target_os = "linux")]
 pub mod job_cgroup;
 pub mod job_groups;
 pub mod job_progress;
 mod job_resources;
 pub mod job_spans;
+pub mod job_unattributed;
 pub(crate) mod nx_daemon;
 #[cfg(target_os = "macos")]
 pub mod process_events;
+pub mod process_spans;
 pub mod process_stream;
 pub mod process_tree;
 pub mod process_usage;
