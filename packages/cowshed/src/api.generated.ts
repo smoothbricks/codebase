@@ -330,7 +330,8 @@ export type CowshedError = {
   readonly recovering?: SupervisorRecovery;
   /**
    * Present only on the daemon's refusal of a request that depends on the mounts and sessions
-   * its startup pass has not finished restoring; absent from the wire otherwise.
+   * its startup pass has not finished restoring; absent from the wire otherwise. Boxed like
+   * `otherBuild`: the cause is rare, and unboxed its `Option` takes 16 bytes of every `Result`.
    */
   readonly healing?: StartupHeal;
   /**
