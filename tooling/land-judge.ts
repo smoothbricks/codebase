@@ -6,8 +6,8 @@
 //
 //   - the output of the Nx run, which names the tasks that failed, the tasks it did not run behind them, and the
 //     tasks it stopped. Not Nx's `run.json`: this repository's patched Nx writes it to a per-user directory that
-//     every checkout of the workspace shares, so a concurrent run anywhere overwrites it, and
-//     `smoo-nx-bound-failures` reads the checkout's own directory, which holds nothing current.
+//     every checkout of the workspace shares, so a concurrent run anywhere overwrites it. `smoo-nx-bound-failures`
+//     reads that same shared file; a land still does not, because the file is not this checkout's run.
 //   - bounded-exec's record of each task it ran, in the checkout's Nx workspace-data directory: its verdict and its
 //     JUnit report (@smoothbricks/nx-plugin README, "Bounded Test Targets"). A task clears its own record when it
 //     starts, and `forget` clears them before a run, so every record read was written by the run being judged.

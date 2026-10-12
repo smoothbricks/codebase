@@ -960,14 +960,14 @@ binary the target named. A script that spawns the runner itself passes
 `--reporter=junit --reporter-outfile="$BOUNDED_EXEC_JUNIT"` on; the variable is set for every task. A command with no
 runner, or with two (they would write one report), is judged by its exit alone.
 
-`smoo-nx-bound-failures` reads the workspace's last Nx run (`run.json` in the Nx cache directory) against those records
-and prints one line per failed task. It exits 0 only when the run failed and every failed task's record, for that task's
-hash, is a `bound`; a failed task without one is not. A merge queue uses it to re-run a gate that a loaded host failed,
-and to stop on anything else. It reads the checkout's own Nx cache directory, so it sees nothing current where Nx shares
-one cache directory across checkouts (this repository's patched Nx writes `run.json` to `~/.nx/<id>/cache`, which every
-checkout of the workspace shares and every run overwrites). This repository's merge queue, `tooling/land-host.sh`,
-judges the failed tasks its own gate run names in its output against the same records, refuses a timeout behind a panic
-or failed assertion, and lands a bound only once every test of the task ran (`tooling/land-judge.ts`).
+`smoo-nx-bound-failures` reads the workspace's last Nx run (`run.json` in Nx's `cacheDir`, the directory
+`StoreRunInformationLifeCycle` writes, including the shared `~/.nx/<id>/cache` when checkouts share one cache) against
+those records and prints one line per failed task. It exits 0 only when the run failed and every failed task's record,
+for that task's hash, is a `bound`; a failed task without one is not. A merge queue uses it to re-run a gate that a
+loaded host failed, and to stop on anything else. The shared file is overwritten by every run of every checkout, so this
+repository's merge queue, `tooling/land-host.sh`, judges the failed tasks its own gate run names in its output against
+the same records, refuses a timeout behind a panic or failed assertion, and lands a bound only once every test of the
+task ran (`tooling/land-judge.ts`).
 
 The shared policy API is exported from `@smoothbricks/nx-plugin/bounded-test-policy` for generators or other workspace
 tools that need to normalize package JSON consistently.
