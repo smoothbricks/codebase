@@ -1,276 +1,644 @@
-//! One pure comparison of retained process-own usage with an independent job total.
-//! A coverage gap never erases that total, clamps a signed difference, or invents an unseen
-//! CPU winner (07_api.md, "Process-tree observations").
+//! Which observed process a job's CPU went to, and how the job's independent totals compare
+//! with what its observed processes counted as their own (07_api.md, "Process-tree observations"
+//! and "Complete job accounting and observation reconciliation").
+//!
+//! The census is what the sampler saw of the job's group at its sample boundaries: each member
+//! it found, the image that member ran and its own counters. Polling a group at boundaries never
+//! sees a process born and gone between two of them, so the census never claims a complete tree:
+//! its coverage names the first observation it is known to lack, and with none known, that the
+//! leader may have forked unseen.
+//!
+//! The fold is pure: the sampler is its only writer, and [`observe`] is the thin kernel shell
+//! that feeds it on macOS.
+
+use std::collections::HashMap;
 
 use crate::api::process::{
-    CpuCoveragePermille, CpuMicrosDelta, JobLeafAttribution, JobProcessLeaf, JobProcessTree,
-    ProcessStorageIo, StorageIoBytesDelta, UsageReconciliation,
+    JobLeafAttribution, JobProcessLeaf, PERMILLE_WHOLE, ProcessCoverage, ProcessCoverageGap,
 };
-use crate::api::resources::{
-    CpuMicros, CpuTotals, ResourceUnitError, StorageIoBytes, StorageIoTotals,
-};
+use crate::api::resources::{CpuMicros, CpuMicrosDelta, CpuTotals, ResourceUnitError};
+use crate::runtime::job_groups::Process;
+use crate::runtime::process_tree::{ProcessIdentity, ProcessImage};
+use crate::runtime::process_usage::{ProcessUsageFold, UsageFoldError, UsageObservation};
+use crate::runtime::supervisor::LeafCoverage;
 
-/// Reconcile `tree` with `independent` CPU and optional storage-I/O totals. `required` is the
-/// fraction, in thousandths, that observed own CPU must cover before a leaf is named. The same
-/// inputs, including that fraction, replay to the same result.
-pub fn reconcile(
-    tree: &JobProcessTree,
-    independent: CpuTotals,
-    io: Option<StorageIoTotals>,
-    required: CpuCoveragePermille,
-) -> Result<(JobLeafAttribution, UsageReconciliation), ResourceUnitError> {
-    let mut observed_cpu = CpuMicros::new(0)?;
-    let mut observed_read = StorageIoBytes::new(0)?;
-    let mut observed_written = StorageIoBytes::new(0)?;
-    let mut io_complete = io.is_some();
-    let mut winner: Option<(&crate::api::process::JobProcessSample, CpuMicros)> = None;
-    for process in &tree.processes {
-        let Some(usage) = process.usage else {
-            io_complete = false;
-            continue;
-        };
-        let cpu = usage.cpu_user_us.checked_add(usage.cpu_sys_us)?;
-        observed_cpu = observed_cpu.checked_add(cpu)?;
-        match usage.io {
-            ProcessStorageIo::Read {
-                read_bytes,
-                write_bytes,
-            } => {
-                observed_read =
-                    StorageIoBytes::new(observed_read.get().checked_add(read_bytes.get()).ok_or(
-                        ResourceUnitError::Inexact {
-                            unit: "observedIoRead",
-                            value: u128::from(observed_read.get()) + u128::from(read_bytes.get()),
-                        },
-                    )?)?;
-                observed_written = StorageIoBytes::new(
-                    observed_written
-                        .get()
-                        .checked_add(write_bytes.get())
-                        .ok_or(ResourceUnitError::Inexact {
-                            unit: "observedIoWritten",
-                            value: u128::from(observed_written.get())
-                                + u128::from(write_bytes.get()),
-                        })?,
-                )?;
-            }
-            ProcessStorageIo::Unavailable { .. } => io_complete = false,
-        }
-        let wins = match &winner {
-            None => true,
-            Some((prior, prior_cpu)) => {
-                cpu > *prior_cpu || (cpu == *prior_cpu && process.pid < prior.pid)
-            }
-        };
-        if wins {
-            winner = Some((process, cpu));
-        }
-    }
-    let accounted = independent.user_us.checked_add(independent.sys_us)?;
-    let cpu_us = signed_delta(observed_cpu.get(), accounted.get(), "cpuUs")?;
-    let (io_read_bytes, io_write_bytes) = match io.filter(|_| io_complete) {
-        Some(totals) => (
-            Some(StorageIoBytesDelta::new(signed_delta(
-                observed_read.get(),
-                totals.read_bytes.get(),
-                "ioReadBytes",
-            )?)),
-            Some(StorageIoBytesDelta::new(signed_delta(
-                observed_written.get(),
-                totals.write_bytes.get(),
-                "ioWriteBytes",
-            )?)),
-        ),
-        None => (None, None),
-    };
-    let reconciliation = UsageReconciliation {
-        cpu_us: CpuMicrosDelta::new(cpu_us),
-        io_read_bytes,
-        io_write_bytes,
-        coverage: tree.coverage.clone(),
-    };
-    let leaf = if accounted.get() == 0 {
-        JobLeafAttribution::NoAccountedCpu
-    } else {
-        let fraction = u128::from(observed_cpu.get()) * 1000 / u128::from(accounted.get());
-        let fraction = u16::try_from(fraction).map_err(|_| ResourceUnitError::Inexact {
-            unit: "observedCpuPermille",
-            value: fraction,
-        })?;
-        let fraction = CpuCoveragePermille::new(fraction);
-        match winner {
-            Some((process, _)) if fraction >= required && observed_cpu.get() > 0 => {
-                JobLeafAttribution::Attributed {
-                    leaf: JobProcessLeaf {
-                        pid: process.pid,
-                        program: process.program.clone(),
-                        argv: process.argv.clone(),
-                        truncated: process.truncated,
-                    },
-                    observed_cpu_permille: fraction,
-                }
-            }
-            _ => JobLeafAttribution::Unattributed {
-                observed_cpu_permille: fraction,
-                required_permille: required,
-            },
-        }
-    };
-    Ok((leaf, reconciliation))
+/// One process life the census saw.
+#[derive(Debug)]
+struct Life {
+    identity: ProcessIdentity,
+    /// The image it ran when last read; `None` while no read of it succeeded.
+    image: Option<ProcessImage>,
+    /// The boundary it was last found a member at.
+    seen_at: u64,
+    exited: bool,
 }
 
-fn signed_delta(
-    observed: u64,
-    accounted: u64,
-    unit: &'static str,
-) -> Result<i64, ResourceUnitError> {
-    let delta = i128::from(observed) - i128::from(accounted);
-    i64::try_from(delta).map_err(|_| ResourceUnitError::InexactSigned { unit, value: delta })
+/// What the sampler saw of a job's processes, folded over its boundaries.
+#[derive(Debug)]
+pub struct Census {
+    /// In the order the census first saw them.
+    lives: Vec<Life>,
+    by_identity: HashMap<ProcessIdentity, usize>,
+    /// Each life's own counters, as last read.
+    usage: ProcessUsageFold,
+    /// The process that leads the job now.
+    leader: u32,
+    /// The pids of every process that led the job: their births are the supervisor's own
+    /// spawns, so the census knows where they came from.
+    leaders: Vec<u32>,
+    /// The boundary being taken; lives found at it carry it.
+    boundary: u64,
+    /// The first observation the census is known to lack.
+    gap: Option<ProcessCoverageGap>,
+}
+
+/// The census's answer for one boundary: the leaf, and how much of the job's CPU the observed
+/// processes counted.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Attribution {
+    pub leaf: JobLeafAttribution,
+    /// The job's CPU total less the observed processes' own CPU.
+    pub cpu_us: CpuMicrosDelta,
+    pub coverage: ProcessCoverage,
+}
+
+impl Census {
+    /// A census of a job led by `leader`, the job's first owned process.
+    pub fn led_by(leader: u32) -> Self {
+        Self {
+            lives: Vec::new(),
+            by_identity: HashMap::new(),
+            usage: ProcessUsageFold::default(),
+            leader,
+            leaders: vec![leader],
+            boundary: 0,
+            gap: None,
+        }
+    }
+
+    /// `leader` takes the lead: its birth is the supervisor's spawn too.
+    pub fn lead(&mut self, leader: u32) {
+        self.leader = leader;
+        self.leaders.push(leader);
+    }
+
+    /// `process` is a member at this boundary, running `image` if that read succeeded. A member
+    /// the census never saw born, one no leader spawn accounts for, is a birth it missed.
+    pub fn found(&mut self, process: ProcessIdentity, image: Option<ProcessImage>) {
+        let index = match self.by_identity.get(&process) {
+            Some(&index) => index,
+            None => {
+                if !self.leaders.contains(&process.pid) {
+                    self.missed(ProcessCoverageGap::UnobservedBirth { pid: process.pid });
+                }
+                self.lives.push(Life {
+                    identity: process,
+                    image: None,
+                    seen_at: self.boundary,
+                    exited: false,
+                });
+                self.by_identity.insert(process, self.lives.len() - 1);
+                self.lives.len() - 1
+            }
+        };
+        let life = &mut self.lives[index];
+        life.seen_at = self.boundary;
+        match image {
+            Some(image) => life.image = Some(image),
+            None if life.image.is_none() => {
+                self.missed(ProcessCoverageGap::UnreadImage { pid: process.pid });
+            }
+            None => {}
+        }
+    }
+
+    /// `process` is a member at this boundary whose image the kernel would not give while it
+    /// ran: the census lacks that image, and an image an earlier read named may no longer be the
+    /// one it runs, so the life is unidentified until a later read names one again.
+    pub fn unread_image(&mut self, process: ProcessIdentity) {
+        self.found(process, None);
+        if let Some(&index) = self.by_identity.get(&process) {
+            self.lives[index].image = None;
+        }
+        self.missed(ProcessCoverageGap::UnreadImage { pid: process.pid });
+    }
+
+    /// Each life's own counters, for the sampler to read into.
+    pub fn usage(&mut self) -> &mut ProcessUsageFold {
+        &mut self.usage
+    }
+
+    /// The boundary is taken: a life found at the previous one and not at this one has left the
+    /// group, and the census never read its counters after it did.
+    pub fn close(&mut self) -> Result<(), UsageFoldError> {
+        for life in &mut self.lives {
+            if !life.exited && life.seen_at != self.boundary {
+                life.exited = true;
+                self.usage.apply(UsageObservation::Exited {
+                    process: life.identity,
+                })?;
+            }
+        }
+        if let Some(gap) = self.usage.gap() {
+            self.missed(gap);
+        }
+        self.boundary += 1;
+        Ok(())
+    }
+
+    fn missed(&mut self, gap: ProcessCoverageGap) {
+        self.gap.get_or_insert(gap);
+    }
+
+    /// The leaf among the lives the census identified, against the job's accounted `total`.
+    /// The leaf has the most own CPU, ties going to the earlier birth identity, then the lower
+    /// pid, whatever order the census found them in; it is named only when those lives' own CPU
+    /// covers `required` of the total.
+    pub fn attribute(
+        &self,
+        total: CpuTotals,
+        required: LeafCoverage,
+    ) -> Result<Attribution, ResourceUnitError> {
+        let total = total.user_us.checked_add(total.sys_us)?;
+        let mut observed = CpuMicros::new(0)?;
+        let mut winner: Option<(CpuMicros, &Life, &ProcessImage)> = None;
+        for life in &self.lives {
+            let (Some(image), Some(usage)) = (&life.image, self.usage.usage(life.identity)) else {
+                continue;
+            };
+            let own = usage.cpu_user_us.checked_add(usage.cpu_sys_us)?;
+            observed = observed.checked_add(own)?;
+            // Most CPU first; among equals the earlier birth, then the lower pid.
+            let rank = |own: CpuMicros, life: &Life| {
+                (
+                    own,
+                    std::cmp::Reverse(life.identity.birth.0),
+                    std::cmp::Reverse(life.identity.pid),
+                )
+            };
+            if winner.is_none_or(|(most, best, _)| rank(own, life) > rank(most, best)) {
+                winner = Some((own, life, image));
+            }
+        }
+        let cpu_us = CpuMicrosDelta::between(observed, total)?;
+        let coverage = ProcessCoverage::Gap {
+            reason: self
+                .gap
+                .unwrap_or(ProcessCoverageGap::UncountedFork { pid: self.leader }),
+        };
+        let leaf = match covered_permille(observed, total) {
+            None => JobLeafAttribution::NoAccountedCpu,
+            Some(permille) => match winner {
+                Some((_, life, image)) if permille >= required.permille() => {
+                    JobLeafAttribution::Attributed {
+                        leaf: JobProcessLeaf {
+                            pid: life.identity.pid,
+                            program: image.program.clone(),
+                            argv: image.argv.clone(),
+                            truncated: image.truncated,
+                        },
+                        observed_cpu_permille: permille,
+                    }
+                }
+                Some(_) | None => JobLeafAttribution::Unattributed {
+                    observed_cpu_permille: permille,
+                    required_permille: required.permille(),
+                },
+            },
+        };
+        Ok(Attribution {
+            leaf,
+            cpu_us,
+            coverage,
+        })
+    }
+}
+
+/// The thousandths of `total` that `observed` covers, rounded down: never more than the whole,
+/// since CPU observed beyond the total covers nothing more of it. `None` for a zero total.
+fn covered_permille(observed: CpuMicros, total: CpuMicros) -> Option<u16> {
+    let total = u128::from(total.get());
+    if total == 0 {
+        return None;
+    }
+    let covered = u128::from(observed.get()).min(total);
+    // `covered` is at most `total`, so the share is at most the whole and always fits.
+    Some(u16::try_from(covered * u128::from(PERMILLE_WHOLE) / total).unwrap_or(PERMILLE_WHOLE))
+}
+
+/// Read each member of the job's group into `census` at `at`: its identity, the image it runs
+/// and its own counters, each fenced to the life the membership read found. A member whose pid
+/// no longer names that life -- it exited, or the pid was given to another process -- is no
+/// member; a read failure of a member still running is an error.
+pub fn observe(
+    census: &mut Census,
+    members: &[Process],
+    at: std::time::Instant,
+) -> std::result::Result<(), ObserveError> {
+    use crate::runtime::process_events::{Darwin, ProcessReads as _};
+    use crate::runtime::process_tree::BirthToken;
+    use crate::runtime::process_usage::sample;
+
+    let reader = Darwin.reader_uid();
+    for member in members {
+        let pid = member.pid().cast_unsigned();
+        let read = |source| ObserveError::Read { pid, source };
+        // Read through the identity the membership read found, never the pid alone.
+        let Some(before) = member.record().map_err(read)? else {
+            continue;
+        };
+        let process = ProcessIdentity {
+            pid,
+            birth: BirthToken(before.unique_id),
+        };
+        // The image names the pid alone: it is this life's only if the member still holds the
+        // pid after the read.
+        let image = Darwin.image(pid);
+        let after = member.record().map_err(read)?;
+        match (image, after) {
+            (Ok(image), Some(_)) => census.found(process, Some(image)),
+            // The life ended around the read: the image may be a stranger's, or none.
+            (Ok(_) | Err(_), None) => census.found(process, None),
+            // `EINVAL` is also the kernel's refusal of another user's arguments, which its own
+            // credential rule says: an image the census lacks, not a failure.
+            (Err(source), Some(record))
+                if source.raw_os_error() == Some(libc::EINVAL)
+                    && reader != 0
+                    && reader != record.uid =>
+            {
+                census.unread_image(process);
+            }
+            // The census lacks this image whatever later reads find: the gap stays, beside the
+            // failure this read returns.
+            (Err(source), Some(_)) => {
+                census.unread_image(process);
+                return Err(ObserveError::Image { pid, source });
+            }
+        }
+        let start = census.usage().start(process);
+        if let crate::runtime::process_usage::Sampled::Read(reading) = sample(start, process, at)? {
+            census
+                .usage()
+                .apply(UsageObservation::Read { process, reading })?;
+        }
+    }
+    census.close()?;
+    Ok(())
+}
+
+/// Why the census could not read the job's members.
+#[derive(Debug, thiserror::Error)]
+pub enum ObserveError {
+    #[error("reading process {pid} failed: {source}")]
+    Read { pid: u32, source: std::io::Error },
+    #[error("KERN_PROCARGS2 for running process {pid} failed: {source}")]
+    Image { pid: u32, source: std::io::Error },
+    #[error(transparent)]
+    Sample(#[from] crate::runtime::process_usage::SampleError),
+    #[error(transparent)]
+    Fold(#[from] UsageFoldError),
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::api::dto::{CommandArg, JobId, UtcTimestamp};
-    use crate::api::process::{
-        JobProcessSample, LEAF_CPU_PERMILLE, ProcessCoverage, ProcessCoverageGap, ProcessStorageIo,
-        ProcessUsage,
-    };
-    use crate::api::resources::{ResidentBytes, StorageIoBytes};
+    use std::time::{Duration, Instant};
 
-    fn tree(cpu: u64, coverage: ProcessCoverage) -> JobProcessTree {
-        JobProcessTree {
-            job_id: JobId::new(1).unwrap(),
-            sampled_at: UtcTimestamp::new("2026-10-12T00:00:00Z").unwrap(),
-            processes: vec![process(40, "/bin/winner", cpu)],
-            coverage,
+    use super::*;
+    use crate::api::dto::CommandArg;
+    use crate::api::process::{ProcessIoUnavailable, ProcessStorageIo};
+    use crate::api::resources::ResidentBytes;
+    use crate::runtime::process_tree::BirthToken;
+    use crate::runtime::process_usage::{StartStamp, UsageReading};
+
+    fn life(pid: u32) -> ProcessIdentity {
+        ProcessIdentity {
+            pid,
+            birth: BirthToken(u64::from(pid) * 7),
         }
     }
 
-    fn process(pid: u32, program: &str, cpu: u64) -> JobProcessSample {
-        JobProcessSample {
-            pid,
-            ppid: 1,
+    fn image(program: &str) -> ProcessImage {
+        ProcessImage {
             program: program.to_owned(),
             argv: vec![CommandArg::new(program)],
             truncated: false,
-            born_at: UtcTimestamp::new("2026-10-12T00:00:00Z").unwrap(),
-            usage: Some(ProcessUsage {
-                cpu_user_us: CpuMicros::new(cpu).unwrap(),
-                cpu_sys_us: CpuMicros::new(0).unwrap(),
-                busy: false,
-                rss_bytes: ResidentBytes::new(1).unwrap(),
-                rss_peak_bytes: ResidentBytes::new(1).unwrap(),
-                io: ProcessStorageIo::Read {
-                    read_bytes: StorageIoBytes::new(0).unwrap(),
-                    write_bytes: StorageIoBytes::new(0).unwrap(),
-                },
-            }),
-            blocked_on: None,
-            exit: None,
         }
     }
 
-    fn totals(cpu: u64) -> CpuTotals {
+    fn cpu(user: u64, sys: u64) -> CpuTotals {
         CpuTotals {
-            user_us: CpuMicros::new(cpu).unwrap(),
-            sys_us: CpuMicros::new(0).unwrap(),
+            user_us: CpuMicros::new(user).expect("exact"),
+            sys_us: CpuMicros::new(sys).expect("exact"),
         }
     }
 
-    #[test]
-    fn coverage_crossing_the_configured_fraction_names_the_observed_winner() {
-        let required = LEAF_CPU_PERMILLE;
-        assert_eq!(required.get(), 900);
-        for (observed, expect_named) in [(899, false), (900, true), (950, true)] {
-            let gap = ProcessCoverage::Gap {
-                reason: ProcessCoverageGap::EventsLost,
-            };
-            let (leaf, reconciliation) =
-                reconcile(&tree(observed, gap.clone()), totals(1000), None, required).unwrap();
-            let again =
-                reconcile(&tree(observed, gap.clone()), totals(1000), None, required).unwrap();
-            assert_eq!((&leaf, &reconciliation), (&again.0, &again.1));
-            assert_eq!(reconciliation.coverage, gap);
-            assert_eq!(
-                reconciliation.cpu_us.get(),
-                i64::try_from(observed).unwrap() - 1000
-            );
-            assert!(
-                reconciliation.cpu_us.get() < 0,
-                "the shortfall is not clamped away"
-            );
-            assert!(reconciliation.io_read_bytes.is_none());
-            match (expect_named, leaf) {
-                (
-                    false,
-                    JobLeafAttribution::Unattributed {
-                        observed_cpu_permille,
-                        required_permille,
+    fn coverage(permille: u16) -> LeafCoverage {
+        LeafCoverage::new(permille).expect("a share")
+    }
+
+    /// `process`'s own counters read at `at`: `user` and `sys` microseconds.
+    fn read(census: &mut Census, process: ProcessIdentity, at: Instant, user: u64, sys: u64) {
+        census
+            .usage()
+            .apply(UsageObservation::Read {
+                process,
+                reading: UsageReading {
+                    at,
+                    started: StartStamp(u64::from(process.pid)),
+                    cpu_user: CpuMicros::new(user).expect("exact"),
+                    cpu_sys: CpuMicros::new(sys).expect("exact"),
+                    resident: ResidentBytes::ZERO,
+                    io: ProcessStorageIo::Unavailable {
+                        reason: ProcessIoUnavailable::NotAccounted,
                     },
-                ) => {
-                    assert_eq!(observed_cpu_permille.get(), observed as u16);
-                    assert_eq!(required_permille, required);
-                }
-                (
-                    true,
-                    JobLeafAttribution::Attributed {
-                        leaf,
-                        observed_cpu_permille,
-                    },
-                ) => {
-                    assert_eq!(leaf.pid, 40);
-                    assert_eq!(observed_cpu_permille.get(), observed as u16);
-                }
-                (_, other) => panic!("observed {observed}: {other:?}"),
-            }
+                    exited: false,
+                },
+            })
+            .expect("a reading");
+    }
+
+    /// One boundary at which `members` were found with `(user, sys)` own CPU each.
+    fn boundary(census: &mut Census, at: Instant, members: &[(u32, &str, u64, u64)]) {
+        for &(pid, program, user, sys) in members {
+            census.found(life(pid), Some(image(program)));
+            read(census, life(pid), at, user, sys);
         }
+        census.close().expect("the boundary");
     }
 
+    /// The leaf is named exactly from the configured share on: below it the observation is
+    /// said to fall short, at and above it the winner is named, whatever the tree's gap.
     #[test]
-    fn zero_accounted_cpu_names_no_leaf_and_keeps_a_signed_excess() {
-        let (leaf, reconciliation) = reconcile(
-            &tree(100, ProcessCoverage::Complete),
-            totals(0),
-            None,
-            LEAF_CPU_PERMILLE,
-        )
-        .unwrap();
-        assert_eq!(leaf, JobLeafAttribution::NoAccountedCpu);
-        assert_eq!(reconciliation.cpu_us.get(), 100);
-        let (none, _) = reconcile(
-            &tree(0, ProcessCoverage::Complete),
-            totals(0),
-            None,
-            LEAF_CPU_PERMILLE,
-        )
-        .unwrap();
-        assert_eq!(none, JobLeafAttribution::NoAccountedCpu);
-    }
-
-    #[test]
-    fn a_lower_pid_wins_a_tie_and_an_unseen_process_is_not_invented() {
-        let mut observed = tree(
-            500,
-            ProcessCoverage::Gap {
-                reason: ProcessCoverageGap::UncountedFork { pid: 1 },
-            },
+    fn the_leaf_is_named_only_from_the_required_share_of_the_accounted_cpu() {
+        let at = Instant::now();
+        let mut census = Census::led_by(100);
+        boundary(
+            &mut census,
+            at,
+            &[(100, "/bin/sh", 50, 50), (101, "cc", 799, 0)],
         );
-        observed.processes.push(process(30, "/bin/other", 500));
-        let (leaf, _) = reconcile(&observed, totals(2000), None, LEAF_CPU_PERMILLE).unwrap();
-        match leaf {
-            JobLeafAttribution::Unattributed {
-                observed_cpu_permille,
-                ..
-            } => {
-                assert_eq!(observed_cpu_permille.get(), 500);
+        let total = cpu(800, 200);
+        for (observed_extra, permille, attributed) in
+            [(0, 899, false), (1, 900, true), (51, 950, true)]
+        {
+            let mut census = Census::led_by(100);
+            boundary(
+                &mut census,
+                at,
+                &[
+                    (100, "/bin/sh", 50, 50),
+                    (101, "cc", 799 + observed_extra, 0),
+                ],
+            );
+            let answer = census.attribute(total, coverage(900)).expect("exact");
+            match answer.leaf {
+                JobLeafAttribution::Attributed {
+                    leaf,
+                    observed_cpu_permille,
+                } => {
+                    assert!(attributed, "{permille}‰ is below 900‰ yet a leaf was named");
+                    assert_eq!(observed_cpu_permille, permille);
+                    assert_eq!(leaf.pid, 101);
+                    assert_eq!(leaf.program, "cc");
+                }
+                JobLeafAttribution::Unattributed {
+                    observed_cpu_permille,
+                    required_permille,
+                } => {
+                    assert!(
+                        !attributed,
+                        "{permille}‰ reaches 900‰ yet no leaf was named"
+                    );
+                    assert_eq!((observed_cpu_permille, required_permille), (permille, 900));
+                }
+                JobLeafAttribution::NoAccountedCpu => panic!("CPU was accounted"),
             }
-            other => panic!("below threshold must not name a seen stand-in: {other:?}"),
+            assert!(
+                matches!(answer.coverage, ProcessCoverage::Gap { .. }),
+                "a polled census is never complete"
+            );
         }
-        let (leaf, _) = reconcile(&observed, totals(1000), None, LEAF_CPU_PERMILLE).unwrap();
-        match leaf {
-            JobLeafAttribution::Attributed { leaf, .. } => assert_eq!(leaf.pid, 30),
-            other => panic!("{other:?}"),
+        let answer = census.attribute(total, coverage(900)).expect("exact");
+        assert_eq!(answer.cpu_us.get(), 1_000 - 899, "the unobserved remainder");
+    }
+
+    /// No accounted CPU names no leaf and says why, rather than a share of nothing.
+    #[test]
+    fn a_job_with_no_accounted_cpu_says_so() {
+        let mut census = Census::led_by(100);
+        boundary(&mut census, Instant::now(), &[(100, "/bin/sh", 0, 0)]);
+        let answer = census.attribute(cpu(0, 0), coverage(900)).expect("exact");
+        assert_eq!(answer.leaf, JobLeafAttribution::NoAccountedCpu);
+        assert_eq!(answer.cpu_us.get(), 0);
+    }
+
+    /// CPU observed beyond the source's total covers the whole and no more; the excess stays
+    /// in the signed reconciliation, never clamped away.
+    #[test]
+    fn observation_beyond_the_total_covers_the_whole_and_keeps_its_signed_excess() {
+        let mut census = Census::led_by(100);
+        boundary(
+            &mut census,
+            Instant::now(),
+            &[(100, "/bin/sh", 10, 0), (101, "yes", 5_000, 0)],
+        );
+        let answer = census.attribute(cpu(100, 0), coverage(900)).expect("exact");
+        assert_eq!(
+            answer.leaf,
+            JobLeafAttribution::Attributed {
+                leaf: JobProcessLeaf {
+                    pid: 101,
+                    program: "yes".into(),
+                    argv: vec![CommandArg::new("yes")],
+                },
+                observed_cpu_permille: 1_000,
+            }
+        );
+        assert_eq!(answer.cpu_us.get(), 100 - 5_010);
+    }
+
+    /// Equal CPU goes to the earlier birth identity, then the lower pid, whatever order the
+    /// census found the lives in; an exited life keeps its last counters and can still win.
+    #[test]
+    fn ties_go_to_the_earlier_birth_then_the_lower_pid_whatever_the_discovery_order() {
+        let at = Instant::now();
+        let mut census = Census::led_by(100);
+        // Found first, born last: pid 300's birth token is 2100.
+        boundary(
+            &mut census,
+            at,
+            &[(100, "/bin/sh", 0, 0), (300, "late", 400, 0)],
+        );
+        // Found later, born earlier (1400), and it has exited by the next boundary.
+        boundary(
+            &mut census,
+            at + Duration::from_secs(1),
+            &[(100, "/bin/sh", 0, 0), (200, "early", 400, 0)],
+        );
+        boundary(
+            &mut census,
+            at + Duration::from_secs(2),
+            &[(100, "/bin/sh", 0, 0)],
+        );
+        let answer = census.attribute(cpu(800, 0), coverage(900)).expect("exact");
+        let JobLeafAttribution::Attributed { leaf, .. } = answer.leaf else {
+            panic!("covered: {:?}", answer.leaf);
+        };
+        assert_eq!((leaf.pid, leaf.program.as_str()), (200, "early"));
+
+        // Equal CPU and equal birth: the lower pid.
+        let mut census = Census::led_by(100);
+        for (pid, program) in [(201, "higher"), (150, "lower")] {
+            let process = ProcessIdentity {
+                pid,
+                birth: BirthToken(1_400),
+            };
+            census.found(process, Some(image(program)));
+            read(&mut census, process, at, 500, 0);
         }
+        census.close().expect("the boundary");
+        let answer = census
+            .attribute(cpu(1_000, 0), coverage(900))
+            .expect("exact");
+        let JobLeafAttribution::Attributed { leaf, .. } = answer.leaf else {
+            panic!("covered: {:?}", answer.leaf);
+        };
+        assert_eq!((leaf.pid, leaf.program.as_str()), (150, "lower"));
+    }
+
+    /// The coverage names the first observation the census lacks: a member born unseen, then
+    /// a member gone before a read after its exit; with none, that the leader may have forked
+    /// between boundaries. Never complete.
+    #[test]
+    fn the_coverage_names_the_first_missed_observation_and_is_never_complete() {
+        let at = Instant::now();
+        let mut lone = Census::led_by(100);
+        boundary(&mut lone, at, &[(100, "/bin/sh", 5, 5)]);
+        lone.lead(200);
+        boundary(
+            &mut lone,
+            at + Duration::from_secs(1),
+            &[(200, "/bin/cc", 5, 5)],
+        );
+        let answer = lone.attribute(cpu(20, 0), coverage(900)).expect("exact");
+        assert_eq!(
+            answer.coverage,
+            ProcessCoverage::Gap {
+                reason: ProcessCoverageGap::UnreadFinalUsage { pid: 100 }
+            },
+            "the activation left without a read after its exit"
+        );
+
+        let mut alone = Census::led_by(100);
+        boundary(&mut alone, at, &[(100, "/bin/sh", 5, 5)]);
+        assert_eq!(
+            alone
+                .attribute(cpu(10, 0), coverage(900))
+                .expect("exact")
+                .coverage,
+            ProcessCoverage::Gap {
+                reason: ProcessCoverageGap::UncountedFork { pid: 100 }
+            }
+        );
+
+        let mut forked = Census::led_by(100);
+        boundary(
+            &mut forked,
+            at,
+            &[(100, "/bin/sh", 5, 5), (150, "cc", 5, 5)],
+        );
+        boundary(
+            &mut forked,
+            at + Duration::from_secs(1),
+            &[(100, "/bin/sh", 5, 5)],
+        );
+        assert_eq!(
+            forked
+                .attribute(cpu(20, 0), coverage(900))
+                .expect("exact")
+                .coverage,
+            ProcessCoverage::Gap {
+                reason: ProcessCoverageGap::UnobservedBirth { pid: 150 }
+            },
+            "the first gap stands"
+        );
+    }
+
+    /// A member whose image was never read is not an identified process: its CPU covers
+    /// nothing and it is never named, and the census says what it lacks.
+    #[test]
+    fn a_member_without_an_image_is_never_named() {
+        let at = Instant::now();
+        let mut census = Census::led_by(100);
+        census.found(life(100), Some(image("/bin/sh")));
+        read(&mut census, life(100), at, 10, 0);
+        census.found(life(100), None);
+        census.found(life(101), None);
+        read(&mut census, life(101), at, 990, 0);
+        census.close().expect("the boundary");
+        let answer = census
+            .attribute(cpu(1_000, 0), coverage(900))
+            .expect("exact");
+        assert_eq!(
+            answer.leaf,
+            JobLeafAttribution::Unattributed {
+                observed_cpu_permille: 10,
+                required_permille: 900,
+            }
+        );
+        assert_eq!(
+            answer.coverage,
+            ProcessCoverage::Gap {
+                reason: ProcessCoverageGap::UnobservedBirth { pid: 101 }
+            }
+        );
+    }
+
+    #[test]
+    fn a_coverage_threshold_is_a_share_of_the_whole() {
+        assert_eq!(LeafCoverage::new(0), None);
+        assert_eq!(LeafCoverage::new(1_001), None);
+        assert_eq!(
+            LeafCoverage::new(1_000).map(LeafCoverage::permille),
+            Some(1_000)
+        );
+    }
+
+    /// A running member whose image the kernel refused -- after an earlier read named one, as
+    /// when it execs a set-id image -- is unidentified until a read names its image again: never
+    /// named the leaf under its old image. The gap stays once a later read succeeds.
+    #[test]
+    fn an_image_the_kernel_refused_unnames_the_life_and_stays_a_gap() {
+        let at = Instant::now();
+        let mut census = Census::led_by(100);
+        boundary(&mut census, at, &[(100, "/bin/sh", 10, 0)]);
+        census.unread_image(life(100));
+        read(&mut census, life(100), at + Duration::from_secs(1), 15, 0);
+        census.close().expect("the boundary");
+        let refused = census.attribute(cpu(15, 0), coverage(900)).expect("exact");
+        assert_eq!(
+            refused.leaf,
+            JobLeafAttribution::Unattributed {
+                observed_cpu_permille: 0,
+                required_permille: 900,
+            },
+            "its old image no longer names it"
+        );
+        boundary(
+            &mut census,
+            at + Duration::from_secs(2),
+            &[(100, "/usr/bin/su", 20, 0)],
+        );
+        let answer = census.attribute(cpu(20, 0), coverage(900)).expect("exact");
+        let JobLeafAttribution::Attributed { leaf, .. } = &answer.leaf else {
+            panic!("named again: {:?}", answer.leaf);
+        };
+        assert_eq!(leaf.program, "/usr/bin/su");
+        assert_eq!(
+            answer.coverage,
+            ProcessCoverage::Gap {
+                reason: ProcessCoverageGap::UnreadImage { pid: 100 }
+            }
+        );
     }
 }
