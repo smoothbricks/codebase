@@ -490,21 +490,24 @@ Concrete targets come from concrete files:
 - Tests that a `nextest.toml` override singles out run separately in `cargo-test-<package>-exceptions-shard1..N`, using
   the same declared partition count. Ordinary shards run the complement of that class and of every declared serial group
   (below), so the union still covers every test exactly once. The plugin's own override raises the `slow-timeout`
-  warning period for compile-fail tests; lifting them out keeps their long bodies from delaying an ordinary shard. The
-  remaining non-group exceptional tests stay normally schedulable. Every piece runs `--no-fail-fast`, so a failing test
-  does not stop the rest of its piece. The exceptional filter is the union of the overrides in the plugin's own
-  `nextest.toml`, so adding one there is the whole change to that class. Serial groups are classified separately, by
-  `test-group` overrides in the workspace's `.config/nextest.toml`; the plugin's file declares none. Only sharded crates
-  need these targets; an unsharded crate already runs all its non-group tests in one process. Empty partitions pass,
-  including platforms where the tests are `cfg`-ed out. `nextest-partitions.test.ts` executes the inferred archive and
-  shard commands over 29 tests and asserts that the ordinary shards ran exactly the 13 ordinary tests once and the
-  exceptional shards exactly the 12 exceptional ones. The suite builds one shared fixture and archive, then runs
-  separate cases through the real default executor on the serial group's inferred options: a successful run with the
-  group's probes exactly once each, an emptied filter that fails rather than passing a run of no test and replaces the
-  task's previous verdict, and a failing run whose ordinary failures still run the group's remaining probes. The shared
-  fixture first produces one real passing verdict, before any case runs; the empty case copies that seed and removes its
-  own marker log. Each case settles its owned processes before the next case starts; the fixture is removed only after
-  the final settlement.
+  warning period for compile-fail tests; lifting them out keeps their long bodies from delaying an ordinary shard, and
+  partitioning the class keeps every target inside its progress bound without relaxing it. The remaining non-group
+  exceptional tests stay normally schedulable. Every piece runs `--no-fail-fast`, so a failing test does not stop the
+  rest of its piece. The exceptional filter is the union of the overrides in the plugin's own `nextest.toml`, so adding
+  one there is the whole change to that class. Serial groups are classified separately, by `test-group` overrides in
+  the workspace's `.config/nextest.toml`; the plugin's file declares none. Only sharded crates need these targets; an
+  unsharded crate already runs all its non-group tests in one process. Empty partitions pass, including platforms where
+  the tests are `cfg`-ed out. `nextest-partitions.test.ts` executes the inferred archive and shard commands over 29
+  tests and asserts that the ordinary shards ran exactly the 13 ordinary tests once and the exceptional shards exactly
+  the 12 exceptional ones. The suite builds one shared fixture and archive, then runs separate bounded cases through the
+  real default serial-group executor: a successful count and run with the group's probes exactly once each, three
+  refusals that run nothing and clear the task's previous verdict, and a failing run whose ordinary failures still run
+  the group's remaining probes. The shared fixture first produces one real passing verdict, before any case runs. Each
+  refusal copies that seed and removes its own marker log, so neither a timed-out success case nor a prior refusal that
+  wrongly ran can become another case's precondition. The success case still runs and verifies the real executor
+  independently. Drivers run the built production Node executor, supplied by the test target's build dependency, rather
+  than starting a native TypeScript compiler for every case inside the shard's progress bound. Each case settles its
+  owned processes before the next case starts; the fixture is removed only after the final settlement.
 - A repository's serial test groups each run in one runner, `cargo-test-group-<group>`, owned by the cargo workspace
   root beside `cargo-test-archive`. A group is declared once, in `<cargo-workspace>/.config/nextest.toml`: a
   `[test-groups.<group>]` table with `max-threads = 1`, and default-profile overrides that name it with `test-group` and
