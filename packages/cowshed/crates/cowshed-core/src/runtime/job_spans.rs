@@ -25,12 +25,13 @@ use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
 use crate::api::dto::{ExitStatus, JobId, JobInfo, JobState, TraceContext};
-use crate::api::resources::{ChargedMemoryUsage, HostLoadSample, JobVolumeUsage};
 use crate::error::CowshedError;
 use crate::metadata::WorkspaceIncarnation;
 use crate::repository::RepoId;
-use crate::runtime::job_boundary::{boundary_host, charged_memory_values, volume_deltas};
-use crate::runtime::process_spans::{ProcessSpanRow, seal_process_row};
+use crate::runtime::job_boundary::{
+    JobSpanBoundary, boundary_host, charged_memory_values, volume_deltas,
+};
+use crate::runtime::process_spans::{ProcessSpanError, ProcessSpanRow, seal_process_row};
 use crate::storage::job_artifact::state_name;
 use crate::storage::trace_segment::{
     EntryType, SpanAddress, SystemColumns, SystemRow, TelemetryDate, TraceSegmentError,
@@ -154,15 +155,6 @@ enum JobSpanError {
     Segment(#[from] TraceSegmentError),
 }
 
-/// Host, volume, and charged-memory facts for one job-span start or end. The actor
-/// reads these at the boundary. Absent build volume and absent charged memory stay
-/// null. This does not name a leaf or compute unattributed usage.
-pub struct JobSpanBoundary {
-    pub host: HostLoadSample,
-    pub volumes: JobVolumeUsage,
-    pub charged: Option<ChargedMemoryUsage>,
-}
-
 struct PreparedBoundary {
     load1_milli: u32,
     cores: u16,
@@ -236,9 +228,18 @@ impl JobSpanPublisher {
         permit.send(Request::Row(Box::new(self.row(info, edge, None))));
     }
 
-    /// Queue one projected process row. Stem `process-`, same order counter and health as job
-    /// rows. A full or stopped queue is counted; the row is not sealed.
-    pub fn record_process(&self, row: ProcessSpanRow) {
+    /// Queue one projected process row. `Ok(Some)` seals on this writer.
+    /// `Ok(None)` is no row. `Err` is counted on this writer's health and
+    /// is not sealed. A full or stopped queue is counted the same way.
+    pub fn record_process(&self, projected: Result<Option<ProcessSpanRow>, ProcessSpanError>) {
+        let row = match projected {
+            Ok(Some(row)) => row,
+            Ok(None) => return,
+            Err(error) => {
+                refuse(&self.health, error.to_string());
+                return;
+            }
+        };
         let permit = match self.sender.try_reserve() {
             Ok(permit) => permit,
             Err(error) => {
@@ -566,20 +567,19 @@ mod tests {
             blocked_on: None,
             exit: None,
         };
-        let row = projection
-            .project(
-                RetainedProcessEvent {
-                    event: &JobProcessEvent::Born { index: 0, process },
-                    identity: Some(identity),
-                    parent: None,
-                },
-                UNIX_EPOCH + std::time::Duration::from_secs(3),
-            )
-            .unwrap()
-            .unwrap();
-        publisher.record_process(row);
+        let projected = projection.project(
+            RetainedProcessEvent {
+                event: &JobProcessEvent::Born { index: 0, process },
+                identity: Some(identity),
+                parent: None,
+            },
+            UNIX_EPOCH + std::time::Duration::from_secs(3),
+        );
+        publisher.record_process(projected);
+        publisher.record_process(Ok(None));
+        publisher.record_process(Err(ProcessSpanError::MissingIdentity { index: 7 }));
         let health = publisher.health().await.unwrap();
-        assert_eq!((health.recorded, health.failed), (1, 0), "{health:?}");
+        assert_eq!((health.recorded, health.failed), (1, 1), "{health:?}");
         let sealed = std::fs::read_dir(root.join("1970-01-01"))
             .unwrap()
             .map(|entry| entry.unwrap().path())
