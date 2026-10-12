@@ -1,9 +1,9 @@
 //! Process-tree spans (13_telemetry.md, "Process-tree spans").
 //!
-//! One declaration, [`process_custom_fields`], owns the fourteen custom columns. The writer
-//! and the reader both use it; neither keeps a second list. Parentage is the observer's
-//! retained parent identity, never a numeric pid join. A coverage gap is not a process column:
-//! [`JobProcessEvent::Gap`] seals no row.
+//! [`Sparse`] is the one column declaration. cowshed-api-gen writes the field
+//! list, the encode, the decode, and the merge from it. Parentage is the
+//! observer's retained parent identity, never a numeric pid join. A coverage
+//! gap is not a process column: [`JobProcessEvent::Gap`] seals no row.
 
 use std::collections::HashMap;
 use std::os::unix::ffi::OsStrExt;
@@ -49,39 +49,7 @@ pub const PROCESS_CLEAR: &str = "process.clear";
 /// A usage change that is not a busy/idle flip.
 pub const PROCESS_CHANGE: &str = "process.change";
 
-/// `blocked_on` vocabulary. Key 0 is unused, so a present key is never the empty name.
-pub const BLOCKED_ON_NAMES: [&str; 8] = [
-    "", "none", "lock", "socket", "pipe", "child", "stdin", "disk",
-];
-
-/// `exit_signal` vocabulary. Key 0 is unused.
-pub const EXIT_SIGNAL_NAMES: [&str; 16] = [
-    "", "SIGHUP", "SIGINT", "SIGQUIT", "SIGILL", "SIGTRAP", "SIGABRT", "SIGBUS", "SIGFPE",
-    "SIGKILL", "SIGUSR1", "SIGSEGV", "SIGUSR2", "SIGPIPE", "SIGALRM", "SIGTERM",
-];
-
-const PROCESS_COLUMN_COUNT: usize = 14;
-
-/// The fourteen custom columns every process span and row share. Adding a name here is the
-/// only way the writer grows the schema, and [`read_process_segment`] refuses any other suffix.
-pub fn process_custom_fields() -> Vec<Field> {
-    vec![
-        Field::new("proc_pid", DataType::UInt32, true),
-        Field::new("proc_program", dict_type(DataType::UInt32), true),
-        Field::new("proc_argv", DataType::Utf8, true),
-        Field::new("cpu_user_us", DataType::UInt64, true),
-        Field::new("cpu_sys_us", DataType::UInt64, true),
-        Field::new("rss_bytes", DataType::UInt64, true),
-        Field::new("rss_peak_bytes", DataType::UInt64, true),
-        Field::new("io_read_bytes", DataType::UInt64, true),
-        Field::new("io_write_bytes", DataType::UInt64, true),
-        Field::new("exit_code", DataType::Int32, true),
-        Field::new("exit_signal", dict_type(DataType::UInt8), true),
-        Field::new("blocked_on", dict_type(DataType::UInt8), true),
-        Field::new("blocked_path", dict_type(DataType::UInt32), true),
-        Field::new("blocked_holder_pid", DataType::UInt32, true),
-    ]
-}
+include!("process_span_columns.generated.rs");
 
 /// One observed event plus the identity the observer retained for it. A gap has neither
 /// identity: it names no life. `parent` is the retained parent, consulted only when the life
@@ -398,21 +366,45 @@ impl ProcessSpanRow {
     }
 }
 
+#[cfg_attr(any(), cowshed_api(arrow_columns = "process"))]
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct Sparse {
+    #[cfg_attr(any(), cowshed_api(arrow = "uint32"))]
     proc_pid: Option<u32>,
+    #[cfg_attr(any(), cowshed_api(arrow = "dict32"))]
     proc_program: Option<String>,
+    #[cfg_attr(any(), cowshed_api(arrow = "utf8"))]
     proc_argv: Option<String>,
+    #[cfg_attr(any(), cowshed_api(arrow = "uint64"))]
     cpu_user_us: Option<u64>,
+    #[cfg_attr(any(), cowshed_api(arrow = "uint64"))]
     cpu_sys_us: Option<u64>,
+    #[cfg_attr(any(), cowshed_api(arrow = "uint64"))]
     rss_bytes: Option<u64>,
+    #[cfg_attr(any(), cowshed_api(arrow = "uint64"))]
     rss_peak_bytes: Option<u64>,
+    #[cfg_attr(any(), cowshed_api(arrow = "uint64"))]
     io_read_bytes: Option<u64>,
+    #[cfg_attr(any(), cowshed_api(arrow = "uint64"))]
     io_write_bytes: Option<u64>,
+    #[cfg_attr(any(), cowshed_api(arrow = "int32"))]
     exit_code: Option<i32>,
+    #[cfg_attr(
+        any(),
+        cowshed_api(
+            arrow = "dict8",
+            values = "|SIGHUP|SIGINT|SIGQUIT|SIGILL|SIGTRAP|SIGABRT|SIGBUS|SIGFPE|SIGKILL|SIGUSR1|SIGSEGV|SIGUSR2|SIGPIPE|SIGALRM|SIGTERM"
+        )
+    )]
     exit_signal: Option<u8>,
+    #[cfg_attr(
+        any(),
+        cowshed_api(arrow = "dict8", values = "|none|lock|socket|pipe|child|stdin|disk")
+    )]
     blocked_on: Option<u8>,
+    #[cfg_attr(any(), cowshed_api(arrow = "dict32"))]
     blocked_path: Option<String>,
+    #[cfg_attr(any(), cowshed_api(arrow = "uint32"))]
     blocked_holder_pid: Option<u32>,
 }
 
@@ -422,48 +414,7 @@ impl Sparse {
     }
 
     fn merge(&mut self, other: Self) {
-        if other.proc_pid.is_some() {
-            self.proc_pid = other.proc_pid;
-        }
-        if other.proc_program.is_some() {
-            self.proc_program = other.proc_program;
-        }
-        if other.proc_argv.is_some() {
-            self.proc_argv = other.proc_argv;
-        }
-        if other.cpu_user_us.is_some() {
-            self.cpu_user_us = other.cpu_user_us;
-        }
-        if other.cpu_sys_us.is_some() {
-            self.cpu_sys_us = other.cpu_sys_us;
-        }
-        if other.rss_bytes.is_some() {
-            self.rss_bytes = other.rss_bytes;
-        }
-        if other.rss_peak_bytes.is_some() {
-            self.rss_peak_bytes = other.rss_peak_bytes;
-        }
-        if other.io_read_bytes.is_some() {
-            self.io_read_bytes = other.io_read_bytes;
-        }
-        if other.io_write_bytes.is_some() {
-            self.io_write_bytes = other.io_write_bytes;
-        }
-        if other.exit_code.is_some() {
-            self.exit_code = other.exit_code;
-        }
-        if other.exit_signal.is_some() {
-            self.exit_signal = other.exit_signal;
-        }
-        if other.blocked_on.is_some() {
-            self.blocked_on = other.blocked_on;
-        }
-        if other.blocked_path.is_some() {
-            self.blocked_path = other.blocked_path;
-        }
-        if other.blocked_holder_pid.is_some() {
-            self.blocked_holder_pid = other.blocked_holder_pid;
-        }
+        merge_process_columns(self, other);
     }
 }
 
@@ -645,23 +596,7 @@ fn process_batch(
         entry_type: row.entry_type,
         message: Some(row.message),
     })?;
-    let columns = &row.columns;
-    let arrays = vec![
-        uint32(columns.proc_pid).1,
-        category(columns.proc_program.as_deref())?.1,
-        text(columns.proc_argv.as_deref()).1,
-        uint64(columns.cpu_user_us).1,
-        uint64(columns.cpu_sys_us).1,
-        uint64(columns.rss_bytes).1,
-        uint64(columns.rss_peak_bytes).1,
-        uint64(columns.io_read_bytes).1,
-        uint64(columns.io_write_bytes).1,
-        int32(columns.exit_code).1,
-        enumeration(columns.exit_signal, &EXIT_SIGNAL_NAMES)?.1,
-        enumeration(columns.blocked_on, &BLOCKED_ON_NAMES)?.1,
-        category(columns.blocked_path.as_deref())?.1,
-        uint32(columns.blocked_holder_pid).1,
-    ];
+    let arrays = encode_process_columns(&row.columns)?;
     let fields = process_custom_fields();
     debug_assert_eq!(fields.len(), PROCESS_COLUMN_COUNT);
     debug_assert_eq!(arrays.len(), fields.len());
@@ -774,10 +709,7 @@ pub fn read_process_segment(path: &Path) -> Result<DecodedProcessRow, ProcessSpa
         return Err(ProcessSpanError::Schema);
     }
     let start = actual.len() - expected.len();
-    let text = |name: &str| optional_text(&batch, start, name);
-    let dict = |name: &str| optional_dict(&batch, start, name);
-    let u32_col = |name: &str| optional_u32(&batch, start, name);
-    let u64_col = |name: &str| optional_u64(&batch, start, name);
+    let columns = decode_process_columns(&batch, start)?;
     Ok(DecodedProcessRow {
         span_id: batch
             .column(3)
@@ -789,20 +721,20 @@ pub fn read_process_segment(path: &Path) -> Result<DecodedProcessRow, ProcessSpa
             .value(0),
         entry_type: dict_value(batch.column(6), 0).ok_or(ProcessSpanError::Schema)?,
         message: dict_value(batch.column(7), 0).ok_or(ProcessSpanError::Schema)?,
-        proc_pid: u32_col("proc_pid")?,
-        proc_program: dict("proc_program")?,
-        proc_argv: text("proc_argv")?,
-        cpu_user_us: u64_col("cpu_user_us")?,
-        cpu_sys_us: u64_col("cpu_sys_us")?,
-        rss_bytes: u64_col("rss_bytes")?,
-        rss_peak_bytes: u64_col("rss_peak_bytes")?,
-        io_read_bytes: u64_col("io_read_bytes")?,
-        io_write_bytes: u64_col("io_write_bytes")?,
-        exit_code: optional_i32(&batch, start, "exit_code")?,
-        exit_signal: dict("exit_signal")?,
-        blocked_on: dict("blocked_on")?,
-        blocked_path: dict("blocked_path")?,
-        blocked_holder_pid: u32_col("blocked_holder_pid")?,
+        proc_pid: columns.proc_pid,
+        proc_program: columns.proc_program,
+        proc_argv: columns.proc_argv,
+        cpu_user_us: columns.cpu_user_us,
+        cpu_sys_us: columns.cpu_sys_us,
+        rss_bytes: columns.rss_bytes,
+        rss_peak_bytes: columns.rss_peak_bytes,
+        io_read_bytes: columns.io_read_bytes,
+        io_write_bytes: columns.io_write_bytes,
+        exit_code: columns.exit_code,
+        exit_signal: columns.exit_signal,
+        blocked_on: columns.blocked_on,
+        blocked_path: columns.blocked_path,
+        blocked_holder_pid: columns.blocked_holder_pid,
     })
 }
 

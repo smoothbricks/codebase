@@ -1,3 +1,4 @@
+pub mod arrow;
 pub mod capabilities;
 pub mod errors;
 pub mod ir;
