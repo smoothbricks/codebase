@@ -1075,6 +1075,74 @@ index f756066cc6009478b6e16136d8ba4b5a5614c63c..7b0f3b4b5b270650f2ac0a1c28259e84
      }
      // We only care about options, so we don't need to scan source files, and thus
      // `readDirectory` is stubbed for performance.
+diff --git a/dist/src/project-graph/plugins/get-plugins.js b/dist/src/project-graph/plugins/get-plugins.js
+index df153050063fa81b915d3004d3a87cd397f73b19..7d751ed7b895ea88735361b481c9437339ef7ffa 100644
+--- a/dist/src/project-graph/plugins/get-plugins.js
++++ b/dist/src/project-graph/plugins/get-plugins.js
+@@ -296,7 +296,7 @@ async function loadDefaultNxPlugins(root = workspace_root_1.workspaceRoot) {
+             fn();
+         }
+         const errorMessage = errors
+-            .map((e) => `  - ${e.pluginName}: ${e.error.message}`)
++            .map((e) => `  - ${e.pluginName}: ${formatPluginLoadError(e.error).replace(/\n/g, '\n    ')}`)
+             .join('\n');
+         throw new AggregateError(errors.map((e) => e.error), `Failed to load ${errors.length} default Nx plugin(s):\n${errorMessage}`);
+     }
+@@ -361,7 +361,7 @@ async function loadSpecifiedNxPlugins(pluginsConfigurations, root = workspace_ro
+             fn();
+         }
+         const errorMessage = errors
+-            .map((e) => `  - ${e.pluginName}: ${e.error.message}`)
++            .map((e) => `  - ${e.pluginName}: ${formatPluginLoadError(e.error).replace(/\n/g, '\n    ')}`)
+             .join('\n');
+         throw new AggregateError(errors.map((e) => e.error), `Failed to load ${errors.length} Nx plugin(s):\n${errorMessage}`);
+     }
+@@ -376,6 +376,32 @@ async function loadSpecifiedNxPlugins(pluginsConfigurations, root = workspace_ro
+     };
+     return plugins;
+ }
++// Plugin resolution can wrap configuration errors before a plugin ever runs.
++// Keep their causes and aggregate entries in the non-verbose diagnostic too.
++function formatPluginLoadError(error, ancestors = new Set()) {
++    const isObject = error !== null && typeof error === 'object';
++    if (isObject) {
++        if (ancestors.has(error)) {
++            return '[Circular error]';
++        }
++        ancestors.add(error);
++    }
++    let message = Array.isArray(error) ? '' : String(error?.message ?? error);
++    if (error?.cause !== undefined) {
++        message += `\nCaused by: ${formatPluginLoadError(error.cause, ancestors)}`;
++    }
++    // AggregateCreateNodesError entries can be [file, error] pairs.
++    const nestedErrors = Array.isArray(error) ? error : error?.errors;
++    if (Array.isArray(nestedErrors)) {
++        for (const nested of nestedErrors) {
++            message += `${message ? '\n' : ''}${formatPluginLoadError(nested, ancestors)}`;
++        }
++    }
++    if (isObject) {
++        ancestors.delete(error);
++    }
++    return message;
++}
+ function reasonToError(reason) {
+     if (reason instanceof Error) {
+         return reason;
+@@ -385,6 +411,12 @@ function reasonToError(reason) {
+         if ('stack' in reason) {
+             error.stack = String(reason.stack);
+         }
++        if ('cause' in reason) {
++            error.cause = reason.cause;
++        }
++        if ('errors' in reason) {
++            error.errors = reason.errors;
++        }
+         return error;
+     }
+     return new Error(String(reason));
 diff --git a/dist/src/project-graph/plugins/isolation/isolated-plugin.js b/dist/src/project-graph/plugins/isolation/isolated-plugin.js
 index 07648586a78fad6c986f537e042e94e65b0dcc61..d7079a756fda379a7c6898de2b08ff917bf214bb 100644
 --- a/dist/src/project-graph/plugins/isolation/isolated-plugin.js

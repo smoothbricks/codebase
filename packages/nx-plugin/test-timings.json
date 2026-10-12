@@ -1,10 +1,10 @@
 {
   "version": 1,
   "files": {
+    "src/nx-daemon-idle-policy.test.ts": 22703,
     "src/nextest-partitions.test.ts": 22440,
     "src/cargo-resolve-cache.test.ts": 15694,
     "src/executors/bounded-exec/executor.test.ts": 12174,
-    "src/nx-daemon-idle-policy.test.ts": 11110,
     "src/executors/bounded-exec/ram-temp.test.ts": 9506,
     "src/testing.test.ts": 9246,
     "src/cargo-source-hash.test.ts": 9180,
@@ -24,6 +24,7 @@
     "src/typecheck-test-policy.test.ts": 1530,
     "src/cross-check-policy.test.ts": 1521,
     "src/nx-skipped-task-exit.test.ts": 1409,
+    "src/nx-plugin-load-errors.test.ts": 1392,
     "src/executors/bounded-exec/verdict.test.ts": 1154,
     "src/nx-daemon-root-normalization.test.ts": 1069,
     "src/managed-files/managed-format-json.test.ts": 990,
