@@ -47,6 +47,8 @@ cowshed has no reader verb for it: each segment is an Arrow IPC stream, readable
 ```
 /private/cowshed/store/telemetry/
   <yyyy-mm-dd>/commitment-*.arrow   # controller commitments: lifecycle and job continuity records
+  <yyyy-mm-dd>/job-*.arrow          # each job's span, one segment per edge: its start and its end
+  <yyyy-mm-dd>/process-*.arrow      # a job's process.run spans, one segment per batch of process events
   gateway/<yyyy-mm-dd>/gateway-*.arrow   # gateway egress decisions, one event per decision
   daemon-stderr.log, sccache-stderr.log  # launchd stderr of the two agents, for crashes before tracing starts
 ```

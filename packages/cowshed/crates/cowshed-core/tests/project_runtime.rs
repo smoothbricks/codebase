@@ -3203,7 +3203,7 @@ async fn host_controller_process_observations_survive_a_subscriber_drop() {
                 .to_string_lossy()
                 .starts_with("process-")
             {
-                rows.push(
+                rows.extend(
                     process_spans::read_process_segment(&path)
                         .expect("exact fourteen-column process schema"),
                 );
@@ -3218,19 +3218,19 @@ async fn host_controller_process_observations_survive_a_subscriber_drop() {
     for (index, (_, pid, _)) in expected.iter().enumerate() {
         let start = starts
             .iter()
-            .find(|row| row.proc_pid == Some(*pid))
+            .find(|row| row.columns.proc_pid == Some(*pid))
             .unwrap();
         let parent = if index == 0 {
             1
         } else {
             starts
                 .iter()
-                .find(|row| row.proc_pid == Some(expected[index - 1].1))
+                .find(|row| row.columns.proc_pid == Some(expected[index - 1].1))
                 .unwrap()
                 .span_id
         };
         assert_eq!(start.parent_span_id, parent);
-        assert!(start.proc_argv.is_some());
+        assert!(start.columns.proc_argv.is_some());
         let same_span: Vec<_> = rows
             .iter()
             .filter(|row| row.span_id == start.span_id)
@@ -3238,18 +3238,18 @@ async fn host_controller_process_observations_survive_a_subscriber_drop() {
         assert_eq!(
             same_span
                 .iter()
-                .filter(|row| row.proc_argv.is_some())
+                .filter(|row| row.columns.proc_argv.is_some())
                 .count(),
             1
         );
         let terminal: Vec<_> = same_span
             .iter()
-            .filter(|row| row.exit_code.is_some())
+            .filter(|row| row.columns.exit_code.is_some())
             .collect();
         assert_eq!(terminal.len(), 1);
-        assert_eq!(terminal[0].exit_code, Some([29, 23, 0][index]));
-        assert!(terminal[0].cpu_user_us.is_some());
-        assert!(terminal[0].cpu_sys_us.is_some());
+        assert_eq!(terminal[0].columns.exit_code, Some([29, 23, 0][index]));
+        assert!(terminal[0].columns.cpu_user_us.is_some());
+        assert!(terminal[0].columns.cpu_sys_us.is_some());
     }
     drop(stdout);
     serving.abort();

@@ -31,7 +31,7 @@ use crate::metadata::WorkspaceIncarnation;
 use crate::repository::RepoId;
 use crate::runtime::job_boundary::{BoundaryColumns, JobSpanBoundary, boundary_columns};
 use crate::runtime::job_unattributed::{UnattributedSpanRow, seal_unattributed_row};
-use crate::runtime::process_spans::{ProcessSpanError, ProcessSpanRow, seal_process_row};
+use crate::runtime::process_spans::{ProcessSpanError, ProcessSpanRow, seal_process_batch};
 use crate::storage::job_artifact::state_name;
 use crate::storage::trace_columns::{Optional, Required, U64, Utf8, trace_columns};
 use crate::storage::trace_segment::{
@@ -141,7 +141,7 @@ struct JobSpanRow {
 
 enum Request {
     Row(Box<JobSpanRow>),
-    Process(Box<ProcessSpanRow>),
+    Process(Vec<ProcessSpanRow>),
     Unattributed(Box<UnattributedSpanRow>),
     Health { reply: oneshot::Sender<TraceHealth> },
 }
@@ -202,18 +202,23 @@ impl JobSpanPublisher {
         permit.send(Request::Row(Box::new(self.row(info, edge, None))));
     }
 
-    /// Queue one projected process row. `Ok(Some)` seals on this writer.
-    /// `Ok(None)` is no row. `Err` is counted on this writer's health and
-    /// is not sealed. A full or stopped queue is counted the same way.
-    pub fn record_process(&self, projected: Result<Option<ProcessSpanRow>, ProcessSpanError>) {
-        let row = match projected {
-            Ok(Some(row)) => row,
-            Ok(None) => return,
-            Err(error) => {
-                refuse(&self.health, error.to_string());
-                return;
+    /// Queue all projected rows of one emitted fold batch as one segment. Each refused event
+    /// is counted and contributes no row; successful rows remain in the same batch.
+    pub fn record_process(
+        &self,
+        projected: impl IntoIterator<Item = Result<Option<ProcessSpanRow>, ProcessSpanError>>,
+    ) {
+        let mut rows = Vec::new();
+        for result in projected {
+            match result {
+                Ok(Some(row)) => rows.push(row),
+                Ok(None) => {}
+                Err(error) => refuse(&self.health, error.to_string()),
             }
-        };
+        }
+        if rows.is_empty() {
+            return;
+        }
         let permit = match self.sender.try_reserve() {
             Ok(permit) => permit,
             Err(error) => {
@@ -228,7 +233,7 @@ impl JobSpanPublisher {
                 return;
             }
         };
-        permit.send(Request::Process(Box::new(row)));
+        permit.send(Request::Process(rows));
     }
 
     /// Queue the job's one terminal reconciliation row, when its final accounting differs or
@@ -396,10 +401,10 @@ async fn write_rows(
                     }
                 }
             }
-            Request::Process(row) => {
+            Request::Process(rows) => {
                 let root = root.clone();
                 let sealed = tokio::task::spawn_blocking(move || {
-                    seal_process_row(&root, writer, order, &row)
+                    seal_process_batch(&root, writer, order, &rows)
                 })
                 .await;
                 order = order.saturating_add(1);
@@ -599,9 +604,9 @@ mod tests {
             },
             UNIX_EPOCH + std::time::Duration::from_secs(3),
         );
-        publisher.record_process(projected);
-        publisher.record_process(Ok(None));
-        publisher.record_process(Err(ProcessSpanError::MissingIdentity { index: 7 }));
+        publisher.record_process([projected]);
+        publisher.record_process([Ok(None)]);
+        publisher.record_process([Err(ProcessSpanError::MissingIdentity { index: 7 })]);
         let health = publisher.health().await.unwrap();
         assert_eq!((health.recorded, health.failed), (1, 1), "{health:?}");
         let sealed = std::fs::read_dir(root.join("1970-01-01"))
@@ -616,9 +621,10 @@ mod tests {
             })
             .unwrap();
         let decoded = read_process_segment(&sealed).unwrap();
-        assert_eq!(decoded.message, "process.run");
-        assert_eq!(decoded.proc_argv.as_deref(), Some("'/bin/cat'"));
-        assert_eq!(decoded.parent_span_id, JOB_SPAN_ID);
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].message, "process.run");
+        assert_eq!(decoded[0].columns.proc_argv.as_deref(), Some("/bin/cat"));
+        assert_eq!(decoded[0].parent_span_id, JOB_SPAN_ID);
         let _ = std::fs::remove_dir_all(&root);
     }
 }

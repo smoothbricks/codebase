@@ -98,7 +98,6 @@
           "{projectRoot}/src/declaration-ir.generated.ts",
           "{projectRoot}/crates/cowshed-napi/src/operations.generated.rs",
           "{projectRoot}/crates/cowshed-core/src/api/served.generated.rs",
-          "{projectRoot}/crates/cowshed-core/src/runtime/process_span_columns.generated.rs",
           "{projectRoot}/crates/cowshed-core/src/runtime/job_unattributed_columns.generated.rs",
           "{projectRoot}/crates/cowshed-core/src/runtime/job_boundary_columns.generated.rs"
         ],
@@ -128,7 +127,6 @@
           "{projectRoot}/src/declaration-ir.generated.ts",
           "{projectRoot}/crates/cowshed-napi/src/operations.generated.rs",
           "{projectRoot}/crates/cowshed-core/src/api/served.generated.rs",
-          "{projectRoot}/crates/cowshed-core/src/runtime/process_span_columns.generated.rs",
           "{projectRoot}/crates/cowshed-core/src/runtime/job_unattributed_columns.generated.rs",
           "{projectRoot}/crates/cowshed-core/src/runtime/job_boundary_columns.generated.rs",
           "cargoToolchain",

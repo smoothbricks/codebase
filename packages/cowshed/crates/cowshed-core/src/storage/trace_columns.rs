@@ -11,6 +11,9 @@
 //! [`I32`], [`I64`]), and [`Utf8`] is the plain string column. Its nullability is part of the
 //! declaration: an [`Optional`] column is nullable and a row leaves a cell null by holding `None`;
 //! a [`Required`] column is non-null and no row can leave it out.
+//!
+//! A fixed set of names is declared once with `trace_enum!`: the Rust enum, its dictionary and its
+//! keys are one list in one order.
 
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -232,6 +235,7 @@ dictionary_value!(
 );
 
 /// A fixed set of names, encoded as lmao's `S.enum`: `u16` keys into a dictionary of every name.
+/// Declare one with `trace_enum!`.
 pub trait TraceEnum: Copy {
     /// Every name, indexed by its key.
     const NAMES: &'static [&'static str];
@@ -268,6 +272,52 @@ impl<E: TraceEnum> TraceValue for Enum<E> {
             Arc::new(StringArray::from_iter_values(E::NAMES.iter().copied())),
         )?))
     }
+}
+
+/// Declares a fixed set of names once: the enum, its dictionary and its keys are generated from
+/// this one list, in this order.
+///
+/// ```text
+/// trace_enum! {
+///     /// What a process waits on.
+///     pub enum BlockedOn { None = "none", Lock = "lock" }
+/// }
+/// ```
+macro_rules! trace_enum {
+    (
+        $(#[$meta:meta])*
+        $vis:vis enum $name:ident {
+            $($(#[doc = $doc:literal])* $variant:ident = $text:literal,)+
+        }
+    ) => {
+        $(#[$meta])*
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        $vis enum $name {
+            $($(#[doc = $doc])* $variant,)+
+        }
+
+        impl $name {
+            /// Every value, in declaration order: the order of its dictionary's names.
+            pub const ALL: &'static [Self] = &[$(Self::$variant,)+];
+        }
+
+        impl $crate::storage::trace_columns::TraceEnum for $name {
+            const NAMES: &'static [&'static str] = &[$($text,)+];
+
+            fn key(self) -> u16 {
+                let position = Self::ALL
+                    .iter()
+                    .position(|value| *value == self)
+                    .expect("every value is listed in ALL");
+                u16::try_from(position).expect("a declared enum has fewer than 2^16 names")
+            }
+        }
+
+        const _: () = assert!(
+            <$name as $crate::storage::trace_columns::TraceEnum>::NAMES.len() <= 1 << 16,
+            "an S.enum's keys are u16"
+        );
+    };
 }
 
 /// Declares a span kind's custom columns once: the row struct, the Arrow fields and the encoder
@@ -334,6 +384,7 @@ macro_rules! trace_columns {
 }
 
 pub(crate) use trace_columns;
+pub(crate) use trace_enum;
 
 #[cfg(test)]
 mod tests {
@@ -344,23 +395,12 @@ mod tests {
 
     use super::*;
 
-    /// A test enum whose key is its position in its names.
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    enum Phase {
-        Warm,
-        Cold,
-        Hot,
-    }
-
-    impl TraceEnum for Phase {
-        const NAMES: &'static [&'static str] = &["warm", "cold", "hot"];
-
-        fn key(self) -> u16 {
-            match self {
-                Self::Warm => 0,
-                Self::Cold => 1,
-                Self::Hot => 2,
-            }
+    trace_enum! {
+        /// A test enum whose declaration order is its key order.
+        enum Phase {
+            Warm = "warm",
+            Cold = "cold",
+            Hot = "hot",
         }
     }
 
@@ -507,11 +547,12 @@ mod tests {
     }
 
     #[test]
-    fn an_enum_names_itself_by_its_key() {
-        for value in [Phase::Warm, Phase::Cold, Phase::Hot] {
-            assert_eq!(Phase::NAMES[usize::from(value.key())], value.name());
+    fn an_enum_s_keys_follow_its_declaration() {
+        assert_eq!(Phase::NAMES, ["warm", "cold", "hot"]);
+        for (position, value) in Phase::ALL.iter().enumerate() {
+            assert_eq!(usize::from(value.key()), position);
+            assert_eq!(value.name(), Phase::NAMES[position]);
         }
-        assert_eq!(Phase::Hot.name(), "hot");
     }
 
     #[test]

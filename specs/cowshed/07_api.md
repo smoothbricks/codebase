@@ -4,6 +4,7 @@ Two surfaces over one core: the `cowshed-core` Rust crate and `@smoothbricks/cow
 is a thin third client of the same core — anything the CLI can do is assembled from the same capability-scoped APIs,
 with identical semantics and error taxonomy.
 
+
 ## Authority model (frozen)
 
 Four handle types, one rule: **a handle reachable from inside a sandbox must not authorize escalation or select another
