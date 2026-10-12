@@ -39,6 +39,13 @@ fn run() -> Result<(), String> {
         return serde_json::to_writer(std::io::stdout().lock(), &model)
             .map_err(|error| format!("writing public declaration IR: {error}"));
     }
+    if mode == "columns" {
+        let mut files = cowshed_api_gen::column_files(&project.join("crates/cowshed-core/src"))?;
+        for file in &mut files {
+            format_generated(file)?;
+        }
+        return cowshed_api_gen::write(&files);
+    }
     let mut files = cowshed_api_gen::generate(&project)?;
     for file in &mut files {
         format_generated(file)?;

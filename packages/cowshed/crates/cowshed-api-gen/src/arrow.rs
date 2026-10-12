@@ -346,7 +346,10 @@ fn decode_expr(column: &ArrowColumn) -> String {
         ArrowKind::Int64 => "optional_i64",
         ArrowKind::Utf8 => "optional_text",
         ArrowKind::Dict32 => "optional_dict",
-        ArrowKind::Dict8 => "optional_key",
+        ArrowKind::Dict8 => {
+            let names = format!("{}_NAMES", column.name.to_uppercase());
+            return format!("optional_key(batch, start, {:?}, &{names})", column.name);
+        }
     };
     format!("{reader}(batch, start, {:?})", column.name)
 }
@@ -378,7 +381,9 @@ mod tests {
         assert!(emitted.contains("uint32(columns.proc_pid)"));
         assert!(!emitted.contains(".1"));
         assert!(emitted.contains("enumeration(columns.blocked_on, &BLOCKED_ON_NAMES)?"));
-        assert!(emitted.contains(r#"optional_key(batch, start, "blocked_on")?"#));
+        assert!(
+            emitted.contains(r#"optional_key(batch, start, "blocked_on", &BLOCKED_ON_NAMES)?"#)
+        );
         assert!(emitted.contains("ProcessSpanError"));
         assert!(emitted.contains("fn process_custom_fields()"));
         assert!(emitted.contains("if other.proc_pid.is_some()"));

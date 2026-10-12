@@ -615,54 +615,36 @@ fn process_batch(
     trace_batch(system, fields.into_iter().zip(arrays).collect())
 }
 
-fn uint32(value: Option<u32>) -> (Field, ArrayRef) {
-    (
-        Field::new("ignored", DataType::UInt32, true),
-        Arc::new(UInt32Array::from(vec![value])),
-    )
+fn uint32(value: Option<u32>) -> ArrayRef {
+    Arc::new(UInt32Array::from(vec![value]))
 }
 
-fn uint64(value: Option<u64>) -> (Field, ArrayRef) {
-    (
-        Field::new("ignored", DataType::UInt64, true),
-        Arc::new(UInt64Array::from(vec![value])),
-    )
+fn uint64(value: Option<u64>) -> ArrayRef {
+    Arc::new(UInt64Array::from(vec![value]))
 }
 
-fn int32(value: Option<i32>) -> (Field, ArrayRef) {
-    (
-        Field::new("ignored", DataType::Int32, true),
-        Arc::new(Int32Array::from(vec![value])),
-    )
+fn int32(value: Option<i32>) -> ArrayRef {
+    Arc::new(Int32Array::from(vec![value]))
 }
 
-fn text(value: Option<&str>) -> (Field, ArrayRef) {
-    (
-        Field::new("ignored", DataType::Utf8, true),
-        Arc::new(StringArray::from(vec![value])),
-    )
+fn text(value: Option<&str>) -> ArrayRef {
+    Arc::new(StringArray::from(vec![value]))
 }
 
-fn category(value: Option<&str>) -> Result<(Field, ArrayRef), TraceSegmentError> {
+fn category(value: Option<&str>) -> Result<ArrayRef, TraceSegmentError> {
     let mut builder = StringDictionaryBuilder::<UInt32Type>::new();
     if let Some(value) = value {
         builder.append(value)?;
     } else {
         builder.append_null();
     }
-    Ok((
-        Field::new("ignored", dict_type(DataType::UInt32), true),
-        Arc::new(builder.finish()),
-    ))
+    Ok(Arc::new(builder.finish()))
 }
 
-fn enumeration(key: Option<u8>, names: &[&str]) -> Result<(Field, ArrayRef), TraceSegmentError> {
+pub(crate) fn enumeration(key: Option<u8>, names: &[&str]) -> Result<ArrayRef, TraceSegmentError> {
     let values: ArrayRef = Arc::new(StringArray::from_iter_values(names.iter().copied()));
     let array = DictionaryArray::<UInt8Type>::try_new(UInt8Array::from(vec![key]), values)?;
-    Ok((
-        Field::new("ignored", dict_type(DataType::UInt8), true),
-        Arc::new(array),
-    ))
+    Ok(Arc::new(array))
 }
 
 /// One row read back from a sealed process segment, using the same column declaration the
@@ -771,19 +753,33 @@ fn optional_dict(
     Ok(dict_value(column, 0))
 }
 
-fn optional_key(
+pub(crate) fn optional_key(
     batch: &RecordBatch,
     start: usize,
     name: &str,
+    declared: &[&str],
 ) -> Result<Option<u8>, ProcessSpanError> {
     let column = column(batch, start, name)?;
-    if column.is_null(0) {
-        return Ok(None);
-    }
     let Some(dict) = column.as_dictionary_opt::<UInt8Type>() else {
         return Err(ProcessSpanError::Schema);
     };
-    Ok(Some(dict.keys().value(0)))
+    let values = dict.values().as_string::<i32>();
+    if values.len() != declared.len() {
+        return Err(ProcessSpanError::Schema);
+    }
+    for (index, name) in declared.iter().enumerate() {
+        if values.value(index) != *name {
+            return Err(ProcessSpanError::Schema);
+        }
+    }
+    if column.is_null(0) {
+        return Ok(None);
+    }
+    let key = dict.keys().value(0);
+    if usize::from(key) >= declared.len() {
+        return Err(ProcessSpanError::Schema);
+    }
+    Ok(Some(key))
 }
 
 fn enum_name(names: &[&str], key: Option<u8>) -> Result<Option<String>, ProcessSpanError> {
@@ -1033,6 +1029,26 @@ mod tests {
             &sample(12, 99, "/bin/cat", &["/bin/cat", "fifo"]),
         );
         assert_eq!(real.parent_span_id(), root_row.span_id());
+    }
+
+    #[test]
+    fn a_forged_enum_dictionary_is_not_the_declared_vocabulary() {
+        let values = Arc::new(StringArray::from(vec!["", "NOT_A_SIGNAL"]));
+        let keys = UInt8Array::from(vec![Some(1u8)]);
+        let dict = DictionaryArray::<UInt8Type>::try_new(keys, values).unwrap();
+        let batch = RecordBatch::try_new(
+            Arc::new(arrow_schema::Schema::new(vec![Field::new(
+                "exit_signal",
+                dict_type(DataType::UInt8),
+                true,
+            )])),
+            vec![Arc::new(dict)],
+        )
+        .unwrap();
+        assert!(matches!(
+            optional_key(&batch, 0, "exit_signal", &EXIT_SIGNAL_NAMES),
+            Err(ProcessSpanError::Schema)
+        ));
     }
 
     #[test]
