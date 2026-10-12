@@ -951,7 +951,8 @@ async fn a_job_s_charged_memory_and_its_process_s_resident_memory_are_recorded_a
         let telemetry = TempRoot::new(&format!("cowshed-process-spans-{label}"));
         let mut job = TracedJob::new(&telemetry);
         let shell = id(100, 1);
-        job.publisher.record(&job.info, JobSpanEdge::Start);
+        job.publisher
+            .record(&job.info, JobSpanEdge::Start { host: None });
         job.tree(
             0,
             ProcessObservation::Root {

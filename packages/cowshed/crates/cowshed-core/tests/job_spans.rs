@@ -11,12 +11,12 @@ use arrow_schema::{DataType, Field, Schema};
 use cowshed_core::api::{
     ChargedMemoryBytes, ChargedMemoryUsage, CpuMicros, CpuMicrosDelta, CpuTotals, ExecCommand,
     ExitStatus, HostLoadSample, JobAccounting, JobId, JobInfo, JobLeafAttribution,
-    JobResourceSample, JobState, JobStreamWatermark, JobVolumeUsage, MAX_EXACT_INTEGER, OneCoreCpuPercent,
-    OutputStorage, OutputSummary, ProcessCoverage, ProcessCoverageGap, ProtectedOutput,
-    ResidentBytes, Sha256Digest, SpanId, StdinInfo, StdinKind, StorageIoBytes, StorageIoBytesDelta,
-    StorageIoTotals, StreamBytes, StreamInfo, StreamLines, TraceContext, TraceId,
-    UsageReconciliation, UtcTimestamp, VolumeUnavailable, VolumeUsage, VolumeUsedBytesDelta,
-    WallMicros, WorkspaceIncarnation, WorkspacePath,
+    JobResourceSample, JobState, JobStreamWatermark, JobVolumeUsage, MAX_EXACT_INTEGER,
+    OneCoreCpuPercent, OutputStorage, OutputSummary, ProcessCoverage, ProcessCoverageGap,
+    ProtectedOutput, ResidentBytes, Sha256Digest, SpanId, StdinInfo, StdinKind, StorageIoBytes,
+    StorageIoBytesDelta, StorageIoTotals, StreamBytes, StreamInfo, StreamLines, TraceContext,
+    TraceId, UsageReconciliation, UtcTimestamp, VolumeUnavailable, VolumeUsage,
+    VolumeUsedBytesDelta, WallMicros, WorkspaceIncarnation, WorkspacePath,
 };
 use cowshed_core::repository::RepoId;
 use cowshed_core::runtime::job_spans::{
@@ -1058,14 +1058,21 @@ async fn charged_cells(label: &str, info: &JobInfo) -> [(Option<u64>, Option<u64
     publisher.record(info, JobSpanEdge::Start { host: None });
     publisher.record(info, JobSpanEdge::end(info.state, info.exit.as_ref()));
     let expected_rows = if info.resources.as_ref().is_some_and(|sample| {
-        matches!(sample.accounting.reconciliation().coverage, ProcessCoverage::Gap { .. })
+        matches!(
+            sample.accounting.reconciliation().coverage,
+            ProcessCoverage::Gap { .. }
+        )
     }) {
         3
     } else {
         2
     };
     let health = publisher.health().await.expect("the writer answers");
-    assert_eq!((health.recorded, health.failed), (expected_rows, 0), "{health:?}");
+    assert_eq!(
+        (health.recorded, health.failed),
+        (expected_rows, 0),
+        "{health:?}"
+    );
     let segments = sealed_segments(&telemetry, "job-");
     assert_eq!(segments.len(), usize::try_from(expected_rows).unwrap());
     let cells = |batch: &RecordBatch| {
@@ -1078,10 +1085,17 @@ async fn charged_cells(label: &str, info: &JobInfo) -> [(Option<u64>, Option<u64
         exact_schema(&batch.schema(), &spec_job_columns())
             .unwrap_or_else(|error| panic!("{name}: {error}"));
         if index + 1 < segments.len() {
-            assert_eq!(cells(batch), (None, None), "only the end row carries charged memory");
+            assert_eq!(
+                cells(batch),
+                (None, None),
+                "only the end row carries charged memory"
+            );
         }
     }
-    [cells(&segments[0].1), cells(&segments[segments.len() - 1].1)]
+    [
+        cells(&segments[0].1),
+        cells(&segments[segments.len() - 1].1),
+    ]
 }
 
 /// Cgroup charges and process RSS are distinct, and checked bytes survive without conversion.
