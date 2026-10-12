@@ -378,7 +378,14 @@ impl ProcessSpanRow {
     }
 }
 
-#[cfg_attr(any(), cowshed_api(arrow_columns = "process"))]
+#[cfg_attr(
+    any(),
+    cowshed_api(
+        arrow_columns = "process",
+        fields = "process_custom_fields",
+        merge = "true"
+    )
+)]
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct Sparse {
     #[cfg_attr(any(), cowshed_api(arrow = "uint32"))]
