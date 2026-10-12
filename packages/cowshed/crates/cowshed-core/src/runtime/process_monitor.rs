@@ -14,13 +14,15 @@ use std::time::{Duration, Instant, SystemTime};
 use arc_swap::ArcSwap;
 use tokio::sync::oneshot;
 
+use super::job_attribution::{Attribution, AttributionSummary};
 use super::job_spans::{JobSpanPublisher, job_span_thread};
 use super::process_events::{KqueueObserver, ObserveError};
 use super::process_spans::{ProcessSpanProjection, RetainedProcessEvent};
 use super::process_tree::ProcessIdentity;
-use super::supervisor::utc_now;
+use super::supervisor::{LeafCoverage, utc_now};
 use crate::api::dto::{JobId, JobInfo};
 use crate::api::process::{JobProcessEvent, JobProcessTree, ProcessCoverageGap};
+use crate::api::resources::{CpuTotals, ResourceUnitError};
 use crate::error::{CowshedError, Result};
 
 const DEFAULT_SAMPLE: Duration = Duration::from_secs(1);
@@ -88,11 +90,16 @@ impl TraceWriter {
     }
 }
 
+struct Snapshot {
+    tree: Result<JobProcessTree>,
+    attribution: std::result::Result<AttributionSummary, ResourceUnitError>,
+}
+
 struct Driver {
     job_id: JobId,
     wake: OwnedFd,
     requests: mpsc::Sender<Request>,
-    snapshot: Arc<ArcSwap<Result<JobProcessTree>>>,
+    snapshot: Arc<ArcSwap<Snapshot>>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -164,10 +171,13 @@ impl ProcessMonitor {
                 "cannot retain the process observer's wake descriptor: {error}"
             ))
         })?;
-        let snapshot = Arc::new(ArcSwap::from_pointee(Err(CowshedError::conflict(
-            format!("job {} has no observed process yet", job_id.get()),
-            "read its processes once the command has started",
-        ))));
+        let snapshot = Arc::new(ArcSwap::from_pointee(Snapshot {
+            tree: Err(CowshedError::conflict(
+                format!("job {} has no observed process yet", job_id.get()),
+                "read its processes once the command has started",
+            )),
+            attribution: AttributionSummary::from_observed(std::iter::empty()),
+        }));
         let (requests, receiver) = mpsc::channel();
         let published = Arc::clone(&snapshot);
         let thread = thread::Builder::new()
@@ -219,7 +229,27 @@ impl ProcessMonitor {
 
     /// One publication load. A read neither touches the writer's fold nor samples the kernel.
     pub fn tree(&self) -> Result<JobProcessTree> {
-        self.driver.snapshot.load().as_ref().clone()
+        self.driver.snapshot.load().tree.clone()
+    }
+
+    /// One publication load and the canonical B13 comparison; no resample or CPU-window move.
+    pub(crate) fn attribution(
+        &self,
+        total: CpuTotals,
+        required: LeafCoverage,
+    ) -> Result<Attribution> {
+        let snapshot = self.driver.snapshot.load();
+        let tree = snapshot.tree.as_ref().map_err(Clone::clone)?;
+        snapshot
+            .attribution
+            .as_ref()
+            .map_err(|error| {
+                CowshedError::internal(format!("cannot summarize observed process CPU: {error}"))
+            })?
+            .attribute(total, required, tree.coverage)
+            .map_err(|error| {
+                CowshedError::internal(format!("cannot attribute observed process CPU: {error}"))
+            })
     }
 
     pub async fn subscribe(
@@ -320,7 +350,7 @@ impl Drop for NativeSubscription {
 
 struct Writer {
     observer: KqueueObserver,
-    snapshot: Arc<ArcSwap<Result<JobProcessTree>>>,
+    snapshot: Arc<ArcSwap<Snapshot>>,
     journal: Vec<RetainedEntry>,
     subscribers: HashMap<u64, Subscriber>,
     next_id: u64,
@@ -330,7 +360,7 @@ struct Writer {
 }
 
 impl Writer {
-    fn new(observer: KqueueObserver, snapshot: Arc<ArcSwap<Result<JobProcessTree>>>) -> Self {
+    fn new(observer: KqueueObserver, snapshot: Arc<ArcSwap<Snapshot>>) -> Self {
         Self {
             observer,
             snapshot,
@@ -371,7 +401,10 @@ impl Writer {
                 at,
             });
         }
-        self.snapshot.store(Arc::new(tree));
+        self.snapshot.store(Arc::new(Snapshot {
+            tree,
+            attribution: self.observer.attribution_summary(),
+        }));
         for subscriber in self.subscribers.values_mut() {
             if let Some((cursor, _)) = &subscriber.pending
                 && (*cursor < self.journal.len() || self.ended)
