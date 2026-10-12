@@ -1352,12 +1352,12 @@ each instead — `unfinished-intent`, `interrupted-publication`, `pending-public
 `identity-change-unfinished` and `binding-moved` — and the next command that opens the project finishes them.
 `cowshed doctor --repair` opens the project the way every other command does.
 
-`cowshed doctor --repair` handles one narrow, mechanically provable failure: valid artifact frames whose job sequence
-numbers are not strictly increasing because concurrent writers raced. It first validates every frame header, length
-complement, SHA-256 digest, trailer, Arrow payload, record invariant, and checkpoint prefix. If anything except sequence
-ordering is invalid, it refuses without replacing the log. Otherwise it writes a byte-for-byte
-`records.arrow.pre-repair-<digest>` backup beside the log, resequences the records in physical append order, recomputes
-checkpoint prefix digests, atomically replaces the log, verifies it again, and then runs the ordinary checks.
+`cowshed doctor --repair` validates the protected artifact journal under its append lock. It refuses out-of-order
+sequences rather than resequencing them: changing complete records would change the identity authenticated by checkpoint
+manifests. Complete batches and checkpoint prefix digests are not rewritten; normal recovery discards only an incomplete
+trailing batch. Other integrity failures propagate. The
+[job-control contract](../../../specs/cowshed/11_shell.md#job-control) defines the journal's allocation and recovery
+rules.
 
 ```
 $ cowshed doctor
