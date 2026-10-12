@@ -689,20 +689,21 @@ pub fn read_process_segment(path: &Path) -> Result<DecodedProcessRow, ProcessSpa
     if reader.next().is_some() || batch.num_rows() != 1 {
         return Err(ProcessSpanError::Schema);
     }
-    let expected = process_custom_fields();
+    let custom = process_custom_fields();
+    let mut expected = crate::storage::trace_segment::system_fields();
+    let start = expected.len();
+    expected.extend(custom);
     let schema = batch.schema();
     let actual = schema.fields();
-    let custom = actual
-        .get(actual.len().saturating_sub(expected.len())..)
-        .unwrap_or_default();
-    if custom.len() != expected.len()
-        || custom.iter().zip(&expected).any(|(found, declared)| {
-            found.name() != declared.name() || found.data_type() != declared.data_type()
+    if actual.len() != expected.len()
+        || actual.iter().zip(&expected).any(|(found, declared)| {
+            found.name() != declared.name()
+                || found.data_type() != declared.data_type()
+                || found.is_nullable() != declared.is_nullable()
         })
     {
         return Err(ProcessSpanError::Schema);
     }
-    let start = actual.len() - expected.len();
     let columns = decode_process_columns(&batch, start)?;
     Ok(DecodedProcessRow {
         span_id: batch
@@ -1289,6 +1290,35 @@ mod tests {
         .unwrap();
         assert!(matches!(
             read_process_segment(&refused),
+            Err(ProcessSpanError::Schema)
+        ));
+        let mut early_columns = good.columns().to_vec();
+        let mut early_fields: Vec<Field> = good
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| field.as_ref().clone())
+            .collect();
+        let at = crate::storage::trace_segment::system_fields().len();
+        early_fields.insert(at, Field::new("sneaked", DataType::Boolean, true));
+        early_columns.insert(
+            at,
+            Arc::new(arrow_array::BooleanArray::from(vec![Some(true)])),
+        );
+        let early = RecordBatch::try_new(
+            Arc::new(arrow_schema::Schema::new(early_fields)),
+            early_columns,
+        )
+        .unwrap();
+        let early_path = seal_segment(
+            &root,
+            TelemetryDate::from_unix_seconds(1),
+            "process-early-column",
+            &early,
+        )
+        .unwrap();
+        assert!(matches!(
+            read_process_segment(&early_path),
             Err(ProcessSpanError::Schema)
         ));
         let _ = std::fs::remove_dir_all(&root);

@@ -200,6 +200,28 @@ pub fn dict_type(key: DataType) -> DataType {
     DataType::Dictionary(Box::new(key), Box::new(DataType::Utf8))
 }
 
+/// lmao's system columns, in the order [`trace_batch`] writes them. Custom columns follow.
+pub fn system_fields() -> Vec<Field> {
+    vec![
+        Field::new(
+            "timestamp",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            false,
+        ),
+        Field::new("trace_id", dict_type(DataType::UInt32), false),
+        Field::new("thread_id", DataType::UInt64, false),
+        Field::new("span_id", DataType::UInt32, false),
+        Field::new("parent_thread_id", DataType::UInt64, true),
+        Field::new("parent_span_id", DataType::UInt32, true),
+        Field::new("entry_type", dict_type(DataType::UInt8), false),
+        Field::new("message", dict_type(DataType::UInt32), true),
+        Field::new("package_name", dict_type(DataType::UInt32), true),
+        Field::new("package_file", dict_type(DataType::UInt32), true),
+        Field::new("git_sha", dict_type(DataType::UInt32), true),
+        Field::new("line", DataType::UInt32, false),
+    ]
+}
+
 /// One record batch: lmao's system columns, then the writer's own `custom` columns, each as long
 /// as `system`.
 pub fn trace_batch(
@@ -221,24 +243,7 @@ pub fn trace_batch(
         UInt8Array::from(entry_type),
         Arc::new(StringArray::from_iter_values(EntryType::NAMES)) as ArrayRef,
     )?;
-    let mut fields = vec![
-        Field::new(
-            "timestamp",
-            DataType::Timestamp(TimeUnit::Nanosecond, None),
-            false,
-        ),
-        Field::new("trace_id", dict_type(DataType::UInt32), false),
-        Field::new("thread_id", DataType::UInt64, false),
-        Field::new("span_id", DataType::UInt32, false),
-        Field::new("parent_thread_id", DataType::UInt64, true),
-        Field::new("parent_span_id", DataType::UInt32, true),
-        Field::new("entry_type", dict_type(DataType::UInt8), false),
-        Field::new("message", dict_type(DataType::UInt32), true),
-        Field::new("package_name", dict_type(DataType::UInt32), true),
-        Field::new("package_file", dict_type(DataType::UInt32), true),
-        Field::new("git_sha", dict_type(DataType::UInt32), true),
-        Field::new("line", DataType::UInt32, false),
-    ];
+    let mut fields = system_fields();
     let mut columns: Vec<ArrayRef> = vec![
         Arc::new(TimestampNanosecondArray::from(timestamp)),
         Arc::new(trace_id.finish()),
