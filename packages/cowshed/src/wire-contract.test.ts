@@ -38,6 +38,8 @@ const seamTypes = {
     assertMany: validators.assertJobInfoList,
     parseMany: validators.parseJobInfoList,
   },
+  JobProcessTree: { assertOne: validators.assertJobProcessTree, parseOne: validators.parseJobProcessTree },
+  JobProcessEvent: { assertOne: validators.assertJobProcessEvent, parseOne: validators.parseJobProcessEvent },
   WorkspaceInfo: {
     assertOne: validators.assertWorkspaceInfo,
     parseOne: validators.parseWorkspaceInfo,
@@ -111,6 +113,24 @@ describe('napi wire contract', () => {
       }
     });
   }
+
+  it('pins process observation identity, omitted evidence, and non-empty changes', () => {
+    const tree = seamTypes.JobProcessTree.assertOne(corpus.JobProcessTree?.unread);
+    expect(tree.processes).toHaveLength(1);
+    expect(tree.processes[0]).not.toHaveProperty('usage');
+    expect(tree.processes[0]).not.toHaveProperty('blockedOn');
+    expect(tree.processes[0]).not.toHaveProperty('exit');
+    const { jobId: _jobId, ...withoutJob } = tree;
+    expect(() => seamTypes.JobProcessTree.assertOne(withoutJob)).toThrow();
+
+    const event = seamTypes.JobProcessEvent.assertOne(corpus.JobProcessEvent?.born);
+    expect(event.kind).toBe('born');
+    expect(() => seamTypes.JobProcessEvent.assertOne({ ...event, index: -1 })).toThrow();
+    expect(() => seamTypes.JobProcessEvent.assertOne({ kind: 'changed', index: 0 })).toThrow();
+    expect(() =>
+      seamTypes.JobProcessEvent.assertOne({ kind: 'gap', reason: { kind: 'eventsLost' }, index: 0 }),
+    ).toThrow();
+  });
 
   it('rejects the flattened argv this file was written to catch', () => {
     // The substitution test for the whole corpus. `JobInfo.argv` was typed `string[]` while the

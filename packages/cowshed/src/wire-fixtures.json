@@ -1191,6 +1191,603 @@
       "workspaceIncarnation": "0123456789abcdef0123456789abcdef"
     }
   },
+  "JobProcessEvent": {
+    "blockerChild": {
+      "blockedOn": {
+        "set": {
+          "kind": "child"
+        }
+      },
+      "index": 0,
+      "kind": "changed"
+    },
+    "blockerClear": {
+      "blockedOn": "clear",
+      "index": 0,
+      "kind": "changed"
+    },
+    "blockerDisk": {
+      "blockedOn": {
+        "set": {
+          "kind": "disk"
+        }
+      },
+      "index": 0,
+      "kind": "changed"
+    },
+    "blockerNone": {
+      "blockedOn": {
+        "set": {
+          "kind": "none"
+        }
+      },
+      "index": 0,
+      "kind": "changed"
+    },
+    "blockerPipe": {
+      "blockedOn": {
+        "set": {
+          "kind": "pipe"
+        }
+      },
+      "index": 0,
+      "kind": "changed"
+    },
+    "blockerSocket": {
+      "blockedOn": {
+        "set": {
+          "kind": "socket"
+        }
+      },
+      "index": 0,
+      "kind": "changed"
+    },
+    "blockerStdin": {
+      "blockedOn": {
+        "set": {
+          "kind": "stdin"
+        }
+      },
+      "index": 0,
+      "kind": "changed"
+    },
+    "born": {
+      "index": 0,
+      "kind": "born",
+      "process": {
+        "argv": [
+          {
+            "data": "cargo",
+            "encoding": "utf8"
+          }
+        ],
+        "bornAt": "2026-01-02T03:04:05Z",
+        "pid": 4242,
+        "ppid": 4200,
+        "program": "cargo"
+      }
+    },
+    "eventsLost": {
+      "kind": "gap",
+      "reason": {
+        "kind": "eventsLost"
+      }
+    },
+    "exec": {
+      "index": 0,
+      "kind": "exec",
+      "process": {
+        "argv": [
+          {
+            "data": "cargo",
+            "encoding": "utf8"
+          }
+        ],
+        "blockedOn": {
+          "kind": "none"
+        },
+        "bornAt": "2026-01-02T03:04:05Z",
+        "pid": 4242,
+        "ppid": 4200,
+        "program": "cargo",
+        "usage": {
+          "busy": true,
+          "cpuSysUs": 678,
+          "cpuUserUs": 12345,
+          "io": {
+            "kind": "read",
+            "readBytes": 123,
+            "writeBytes": 456
+          },
+          "rssBytes": 4096,
+          "rssPeakBytes": 8192
+        }
+      }
+    },
+    "exited": {
+      "index": 0,
+      "kind": "exited",
+      "process": {
+        "argv": [
+          {
+            "data": "cargo",
+            "encoding": "utf8"
+          }
+        ],
+        "bornAt": "2026-01-02T03:04:05Z",
+        "exit": {
+          "exitedAt": "2026-01-02T03:04:05Z",
+          "status": {
+            "code": 0,
+            "kind": "exited"
+          }
+        },
+        "pid": 4242,
+        "ppid": 4200,
+        "program": "cargo",
+        "usage": {
+          "busy": false,
+          "cpuSysUs": 678,
+          "cpuUserUs": 12345,
+          "io": {
+            "kind": "read",
+            "readBytes": 123,
+            "writeBytes": 456
+          },
+          "rssBytes": 0,
+          "rssPeakBytes": 8192
+        }
+      }
+    },
+    "heartbeat": {
+      "index": 0,
+      "kind": "heartbeat",
+      "process": {
+        "argv": [
+          {
+            "data": "cargo",
+            "encoding": "utf8"
+          }
+        ],
+        "blockedOn": {
+          "kind": "none"
+        },
+        "bornAt": "2026-01-02T03:04:05Z",
+        "pid": 4242,
+        "ppid": 4200,
+        "program": "cargo",
+        "usage": {
+          "busy": true,
+          "cpuSysUs": 678,
+          "cpuUserUs": 12345,
+          "io": {
+            "kind": "read",
+            "readBytes": 123,
+            "writeBytes": 456
+          },
+          "rssBytes": 4096,
+          "rssPeakBytes": 8192
+        }
+      }
+    },
+    "lockHolder": {
+      "blockedOn": {
+        "set": {
+          "holder": {
+            "job": 7,
+            "pid": 4300,
+            "program": "rustc"
+          },
+          "kind": "lock",
+          "path": "target/.lock"
+        }
+      },
+      "index": 0,
+      "kind": "changed"
+    },
+    "lockHolderPid": {
+      "blockedOn": {
+        "set": {
+          "holder": {
+            "pid": 4300
+          },
+          "kind": "lock",
+          "path": "target/.lock"
+        }
+      },
+      "index": 0,
+      "kind": "changed"
+    },
+    "lockUnknownHolder": {
+      "blockedOn": {
+        "set": {
+          "kind": "lock",
+          "path": "target/.lock"
+        }
+      },
+      "index": 0,
+      "kind": "changed"
+    },
+    "uncountedFork": {
+      "kind": "gap",
+      "reason": {
+        "kind": "uncountedFork",
+        "pid": 4242
+      }
+    },
+    "unobservedBirth": {
+      "kind": "gap",
+      "reason": {
+        "kind": "unobservedBirth",
+        "pid": 4243
+      }
+    },
+    "unobservedExit": {
+      "kind": "gap",
+      "reason": {
+        "kind": "unobservedExit",
+        "pid": 4243
+      }
+    },
+    "unreadFinalUsage": {
+      "kind": "gap",
+      "reason": {
+        "kind": "unreadFinalUsage",
+        "pid": 4242
+      }
+    },
+    "unreadImage": {
+      "kind": "gap",
+      "reason": {
+        "kind": "unreadImage",
+        "pid": 4242
+      }
+    },
+    "usage": {
+      "index": 0,
+      "kind": "changed",
+      "usage": {
+        "busy": true,
+        "cpuSysUs": 678,
+        "cpuUserUs": 12345,
+        "io": {
+          "kind": "read",
+          "readBytes": 123,
+          "writeBytes": 456
+        },
+        "rssBytes": 4096,
+        "rssPeakBytes": 8192
+      }
+    }
+  },
+  "JobProcessTree": {
+    "eventsLost": {
+      "coverage": {
+        "kind": "gap",
+        "reason": {
+          "kind": "eventsLost"
+        }
+      },
+      "jobId": 7,
+      "processes": [
+        {
+          "argv": [
+            {
+              "data": "cargo",
+              "encoding": "utf8"
+            }
+          ],
+          "bornAt": "2026-01-02T03:04:05Z",
+          "pid": 4242,
+          "ppid": 4200,
+          "program": "cargo"
+        }
+      ],
+      "sampledAt": "2026-01-02T03:04:05Z"
+    },
+    "exited": {
+      "coverage": {
+        "kind": "complete"
+      },
+      "jobId": 7,
+      "processes": [
+        {
+          "argv": [
+            {
+              "data": "cargo",
+              "encoding": "utf8"
+            }
+          ],
+          "bornAt": "2026-01-02T03:04:05Z",
+          "exit": {
+            "exitedAt": "2026-01-02T03:04:05Z",
+            "status": {
+              "code": 0,
+              "kind": "exited"
+            }
+          },
+          "pid": 4242,
+          "ppid": 4200,
+          "program": "cargo",
+          "usage": {
+            "busy": false,
+            "cpuSysUs": 678,
+            "cpuUserUs": 12345,
+            "io": {
+              "kind": "read",
+              "readBytes": 123,
+              "writeBytes": 456
+            },
+            "rssBytes": 0,
+            "rssPeakBytes": 8192
+          }
+        }
+      ],
+      "sampledAt": "2026-01-02T03:04:05Z"
+    },
+    "ioNotAccounted": {
+      "coverage": {
+        "kind": "complete"
+      },
+      "jobId": 7,
+      "processes": [
+        {
+          "argv": [
+            {
+              "data": "/w==",
+              "encoding": "base64"
+            }
+          ],
+          "bornAt": "2026-01-02T03:04:05Z",
+          "exit": {
+            "exitedAt": "2026-01-02T03:04:05Z",
+            "status": {
+              "coreDumped": false,
+              "kind": "signaled",
+              "signal": 9
+            }
+          },
+          "pid": 4242,
+          "ppid": 4200,
+          "program": "cargo",
+          "usage": {
+            "busy": false,
+            "cpuSysUs": 678,
+            "cpuUserUs": 12345,
+            "io": {
+              "kind": "unavailable",
+              "reason": "notAccounted"
+            },
+            "rssBytes": 0,
+            "rssPeakBytes": 8192
+          }
+        }
+      ],
+      "sampledAt": "2026-01-02T03:04:05Z"
+    },
+    "ioNotPermitted": {
+      "coverage": {
+        "kind": "complete"
+      },
+      "jobId": 7,
+      "processes": [
+        {
+          "argv": [
+            {
+              "data": "/w==",
+              "encoding": "base64"
+            }
+          ],
+          "bornAt": "2026-01-02T03:04:05Z",
+          "exit": {
+            "exitedAt": "2026-01-02T03:04:05Z",
+            "status": {
+              "coreDumped": false,
+              "kind": "signaled",
+              "signal": 9
+            }
+          },
+          "pid": 4242,
+          "ppid": 4200,
+          "program": "cargo",
+          "usage": {
+            "busy": false,
+            "cpuSysUs": 678,
+            "cpuUserUs": 12345,
+            "io": {
+              "kind": "unavailable",
+              "reason": "notPermitted"
+            },
+            "rssBytes": 0,
+            "rssPeakBytes": 8192
+          }
+        }
+      ],
+      "sampledAt": "2026-01-02T03:04:05Z"
+    },
+    "running": {
+      "coverage": {
+        "kind": "complete"
+      },
+      "jobId": 7,
+      "processes": [
+        {
+          "argv": [
+            {
+              "data": "cargo",
+              "encoding": "utf8"
+            }
+          ],
+          "blockedOn": {
+            "kind": "none"
+          },
+          "bornAt": "2026-01-02T03:04:05Z",
+          "pid": 4242,
+          "ppid": 4200,
+          "program": "cargo",
+          "usage": {
+            "busy": true,
+            "cpuSysUs": 678,
+            "cpuUserUs": 12345,
+            "io": {
+              "kind": "read",
+              "readBytes": 123,
+              "writeBytes": 456
+            },
+            "rssBytes": 4096,
+            "rssPeakBytes": 8192
+          }
+        }
+      ],
+      "sampledAt": "2026-01-02T03:04:05Z"
+    },
+    "uncountedFork": {
+      "coverage": {
+        "kind": "gap",
+        "reason": {
+          "kind": "uncountedFork",
+          "pid": 4242
+        }
+      },
+      "jobId": 7,
+      "processes": [
+        {
+          "argv": [
+            {
+              "data": "cargo",
+              "encoding": "utf8"
+            }
+          ],
+          "bornAt": "2026-01-02T03:04:05Z",
+          "pid": 4242,
+          "ppid": 4200,
+          "program": "cargo"
+        }
+      ],
+      "sampledAt": "2026-01-02T03:04:05Z"
+    },
+    "unobservedBirth": {
+      "coverage": {
+        "kind": "gap",
+        "reason": {
+          "kind": "unobservedBirth",
+          "pid": 4243
+        }
+      },
+      "jobId": 7,
+      "processes": [
+        {
+          "argv": [
+            {
+              "data": "cargo",
+              "encoding": "utf8"
+            }
+          ],
+          "bornAt": "2026-01-02T03:04:05Z",
+          "pid": 4242,
+          "ppid": 4200,
+          "program": "cargo"
+        }
+      ],
+      "sampledAt": "2026-01-02T03:04:05Z"
+    },
+    "unobservedExit": {
+      "coverage": {
+        "kind": "gap",
+        "reason": {
+          "kind": "unobservedExit",
+          "pid": 4243
+        }
+      },
+      "jobId": 7,
+      "processes": [
+        {
+          "argv": [
+            {
+              "data": "cargo",
+              "encoding": "utf8"
+            }
+          ],
+          "bornAt": "2026-01-02T03:04:05Z",
+          "pid": 4242,
+          "ppid": 4200,
+          "program": "cargo"
+        }
+      ],
+      "sampledAt": "2026-01-02T03:04:05Z"
+    },
+    "unread": {
+      "coverage": {
+        "kind": "complete"
+      },
+      "jobId": 7,
+      "processes": [
+        {
+          "argv": [
+            {
+              "data": "cargo",
+              "encoding": "utf8"
+            }
+          ],
+          "bornAt": "2026-01-02T03:04:05Z",
+          "pid": 4242,
+          "ppid": 4200,
+          "program": "cargo"
+        }
+      ],
+      "sampledAt": "2026-01-02T03:04:05Z"
+    },
+    "unreadFinalUsage": {
+      "coverage": {
+        "kind": "gap",
+        "reason": {
+          "kind": "unreadFinalUsage",
+          "pid": 4242
+        }
+      },
+      "jobId": 7,
+      "processes": [
+        {
+          "argv": [
+            {
+              "data": "cargo",
+              "encoding": "utf8"
+            }
+          ],
+          "bornAt": "2026-01-02T03:04:05Z",
+          "pid": 4242,
+          "ppid": 4200,
+          "program": "cargo"
+        }
+      ],
+      "sampledAt": "2026-01-02T03:04:05Z"
+    },
+    "unreadImage": {
+      "coverage": {
+        "kind": "gap",
+        "reason": {
+          "kind": "unreadImage",
+          "pid": 4242
+        }
+      },
+      "jobId": 7,
+      "processes": [
+        {
+          "argv": [
+            {
+              "data": "cargo",
+              "encoding": "utf8"
+            }
+          ],
+          "bornAt": "2026-01-02T03:04:05Z",
+          "pid": 4242,
+          "ppid": 4200,
+          "program": "cargo"
+        }
+      ],
+      "sampledAt": "2026-01-02T03:04:05Z"
+    }
+  },
   "LandReport": {
     "adoptionSkipped": {
       "buildVolume": {
