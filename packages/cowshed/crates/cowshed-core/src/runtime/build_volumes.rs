@@ -2660,6 +2660,33 @@ mod tests {
             .write_record(&live, &BuildVolumeRecord::new(None, linked("main")))
             .unwrap();
         link::point(&main_checkout, &mount).unwrap();
+        // Both refusals use the same live volume before the successful resize.
+        let refused = volumes
+            .resize(
+                main.clone(),
+                main_checkout.clone(),
+                ImageCapacity::from_gibibytes(1),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code, crate::ErrorCode::Usage, "{refused}");
+        let held = fs::File::create(mount.join("held")).unwrap();
+        let refused = volumes
+            .resize(
+                main.clone(),
+                main_checkout.clone(),
+                ImageCapacity::from_gibibytes(2),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code, crate::ErrorCode::Conflict, "{refused}");
+        assert_eq!(
+            host.build_volume_capacity(&layout, &live).unwrap(),
+            ImageCapacity::from_gibibytes(1),
+            "refusals leave the original capacity"
+        );
+        drop(held);
+
         host.clone_build_volume(
             &layout,
             &live,
@@ -3367,52 +3394,6 @@ fn main() {
         }
     }
 
-    /// A non-growing resize is Usage before detach; a file held open then refuses growth as a
-    /// Conflict. Both refusals leave the image at its original capacity.
-    #[cfg(target_os = "macos")]
-    #[tokio::test]
-    async fn real_apfs_build_resize_of_a_held_volume_is_a_conflict() {
-        let scratch = Scratch::new("build-resize-held");
-        let (checkout, id, mount) = scratch.linked_checkout("main", 1);
-        let refused = scratch
-            .volumes
-            .resize(
-                owner("main", '0'),
-                checkout.clone(),
-                ImageCapacity::from_gibibytes(1),
-            )
-            .await
-            .unwrap_err();
-        assert_eq!(refused.code, crate::ErrorCode::Usage, "{refused}");
-        assert_eq!(
-            scratch
-                .host
-                .build_volume_capacity(&scratch.layout, &id)
-                .unwrap(),
-            ImageCapacity::from_gibibytes(1)
-        );
-        let held = fs::File::create(mount.join("held")).unwrap();
-        let refused = scratch
-            .volumes
-            .resize(
-                owner("main", '0'),
-                checkout,
-                ImageCapacity::from_gibibytes(2),
-            )
-            .await
-            .unwrap_err();
-        assert_eq!(refused.code, crate::ErrorCode::Conflict, "{refused}");
-        assert_eq!(
-            scratch
-                .host
-                .build_volume_capacity(&scratch.layout, &id)
-                .unwrap(),
-            ImageCapacity::from_gibibytes(1)
-        );
-        drop(held);
-        scratch.release_all();
-    }
-
     /// Adoption never shrinks a target (16_build_volumes.md, "Substrate"): a landing volume
     /// smaller than the target's grows to the target's capacity while it is quiet, before the
     /// seed is frozen from it, so the target and every later fork end at the larger capacity. A
@@ -3712,22 +3693,15 @@ fn main() {
         scratch.release_all();
     }
 
-    /// A volume minted beside main's image at a capacity other than the one asked once main is
-    /// copied (the source's `.cowshed.toml` edited meanwhile) is not linked: the first touch
-    /// mints its own at the asked capacity, and settling releases the minted one. Its own test,
-    /// since a mint at a capacity off the test cap makes a template of its own.
+    /// A first touch rejects a volume minted for an earlier capacity request, mints its own,
+    /// and settling releases the unused first mint. This checks request selection, not physical
+    /// growth, which the resize and adoption scenarios prove on APFS.
     #[cfg(target_os = "macos")]
     #[tokio::test]
-    async fn real_apfs_main_mints_its_own_when_the_volume_minted_beside_it_is_another_capacity() {
-        let scratch = Scratch::new("build-minted-resized");
+    async fn directory_main_mints_its_own_when_the_volume_minted_beside_it_is_another_capacity() {
+        let scratch = Scratch::directory("build-minted-resized");
         let source = tracked_checkout(scratch.root.path(), "source", AT_THE_CAP, &["package.json"]);
         // The source asked 1 GiB when main's volume was minted and asks 2 GiB once copied.
-        let capacity = |id: &BuildVolumeId| {
-            scratch
-                .host
-                .build_volume_capacity(&scratch.layout, id)
-                .unwrap()
-        };
         let resized = tracked_checkout(scratch.root.path(), "resized", AT_THE_CAP, &[]);
         let first = scratch
             .volumes
@@ -3735,7 +3709,6 @@ fn main() {
             .await;
         let stale = minted(&first);
         assert_eq!(stale.capacity, ImageCapacity::from_gibibytes(1));
-        assert_eq!(capacity(&stale.id), ImageCapacity::from_gibibytes(1));
         let refresh = scratch
             .volumes
             .refresh(
@@ -3753,7 +3726,6 @@ fn main() {
             .unwrap();
         let own = refresh.volume.expect("the first touch mints its own");
         assert_ne!(own, stale.id);
-        assert_eq!(capacity(&own), ImageCapacity::from_gibibytes(2));
         first.settle().await;
         assert!(!scratch.layout.image(&stale.id).exists());
         assert_eq!(scratch.layout.linked(&resized).unwrap(), Some(own));
@@ -3882,26 +3854,18 @@ fn main() {
         assert_eq!(scratch.layout.list().unwrap(), []);
     }
 
-    /// The `cowshed land <ws>` then `cowshed rm <ws>` that left main's build link naming a
-    /// volume that no longer existed, on real APFS. The `rm` retired the landing workspace while
-    /// its land was still running, so its collection saw the landing volume linked by nothing:
-    /// main still linked its own previous volume, and the landing workspace was gone. That
-    /// collection ran once while the land held the quiet volume and once after the land had moved
-    /// main's link onto it, both times from the snapshot it took before the adoption. Neither
-    /// may take the volume: main ends owning the adopted volume, mounted, at main's larger
-    /// capacity from before the land. Main's link left naming a volume that is gone anyway is
-    /// what `cowshed doctor --repair` and every other opening's mount then settle: main reforks
-    /// from the seed its land froze. Main starts at that capacity, as in
-    /// `real_apfs_adoption_ends_at_the_larger_of_the_two_capacities`: how it got there is
-    /// `real_apfs_build_resize_grows_the_volume_and_seed_so_a_later_fork_inherits_it`'s proof,
-    /// and a resize here would only add a detach, grow, attach and remount of main's volume.
+    /// A collection snapshots main's old link before a land, then runs both while the land
+    /// holds its volume quiet and after main adopts it. Neither may take the adopted volume.
+    /// If main's link later names a lost volume, opening settles it by reforking its seed.
+    /// This is a publication/GC race; physical growth is covered by the adoption scenario.
     #[cfg(target_os = "macos")]
     #[tokio::test]
-    async fn real_apfs_a_collection_planned_before_a_land_adopted_never_takes_the_adopted_volume() {
-        let scratch = Scratch::new("build-adopt-rm");
+    async fn directory_a_collection_planned_before_a_land_adopted_never_takes_the_adopted_volume() {
+        let scratch = Scratch::directory("build-adopt-rm");
         let main = owner("main", '0');
-        let (main_checkout, main_live, _) = scratch.linked_checkout("main", 2);
+        let (main_checkout, main_live, _) = scratch.linked_checkout("main", 1);
         let (topic_checkout, topic, topic_mount) = scratch.linked_checkout("topic", 1);
+        fs::write(topic_mount.join("warm-cache"), b"landed build state\n").unwrap();
         // What the `rm` of the landing workspace read: every image, then main, mounted, linking
         // its own volume; the landing workspace already retired.
         let rm_listed = scratch.layout.list().unwrap();
@@ -3994,18 +3958,14 @@ fn main() {
             "main owns the volume it adopted"
         );
         assert!(scratch.layout.image(&topic).exists());
-        assert_ne!(
-            fs::metadata(&topic_mount).unwrap().dev(),
-            fs::metadata(topic_mount.parent().unwrap()).unwrap().dev(),
-            "main's adopted volume is still mounted"
+        assert_eq!(
+            fs::read_link(scratch.layout.image(&topic)).unwrap(),
+            topic_mount,
+            "main's adopted payload is still bound"
         );
-        assert!(
-            scratch
-                .host
-                .build_volume_capacity(&scratch.layout, &topic)
-                .unwrap()
-                >= ImageCapacity::from_gibibytes(2),
-            "the adopted volume keeps the capacity main was resized to"
+        assert_eq!(
+            fs::read(topic_mount.join("warm-cache")).unwrap(),
+            b"landed build state\n"
         );
 
         // The incident's end state: main's link names a volume that is gone.
@@ -4039,10 +3999,15 @@ fn main() {
             "main owns the volume it reforked"
         );
         let remount = scratch.layout.mount(&relinked);
-        assert_ne!(
-            fs::metadata(&remount).unwrap().dev(),
-            fs::metadata(remount.parent().unwrap()).unwrap().dev(),
-            "main's reforked volume is mounted"
+        assert_eq!(
+            fs::read_link(scratch.layout.image(&relinked)).unwrap(),
+            remount,
+            "main's reforked payload is bound"
+        );
+        assert_eq!(
+            fs::read(remount.join("warm-cache")).unwrap(),
+            b"landed build state\n",
+            "the refork recovers the landed seed's contents"
         );
         scratch.release_all();
     }
