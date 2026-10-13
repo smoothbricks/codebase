@@ -1931,6 +1931,11 @@ fn seed_age(
 /// Refreeze an out-of-date seed after Nx and existing Cargo profiles admit capture. The
 /// non-forced detach, not profile enumeration or a later holder probe, excludes filesystem
 /// writers while the image is validated and cloned.
+///
+/// The source's build hold is claimed first and kept through the capture: a job admitted on the
+/// source skips the reseed, and while the claim lives no job is admitted on it. Stopping a
+/// shed's daemon makes its supervisor's keeper submit a start job on its next probe; claimed
+/// after the stop, that job refused the seal (16_build_volumes.md, "Targets and seeds").
 fn reseed(
     host: &impl RuntimeStorageHost,
     layout: &BuildVolumeLayout,
@@ -1947,6 +1952,20 @@ fn reseed(
         .map_err(storage)?;
     let state = BuildVolumeState::read(&mount)?;
     let skipped = |reason| Ok(Reseed::Skipped { behind_ms, reason });
+    let claim = match host
+        .claim_build_volume(layout, &age.live)
+        .map_err(storage)?
+    {
+        BuildVolumeClaim::Claimed(claim) => claim,
+        BuildVolumeClaim::Held { open } => {
+            let hold = layout.hold_path(&age.live);
+            let claimants = nx::holders(&hold)
+                .map_err(|error| io("list the build hold's holders", &hold, &error))?;
+            return skipped(ReseedSkip::VolumeBusy {
+                reason: build_hold_busy_reason(&layout.image(&age.live), &hold, &claimants, &open),
+            });
+        }
+    };
     if let Err(busy) = nx::close(&mount, &state)
         .map_err(|error| io("close the target's Nx state", &mount, &error))?
     {
@@ -1972,9 +1991,9 @@ fn reseed(
     // unmount busy. Release them before sealing: a Cargo that gets in first makes unmount
     // refuse, and no filesystem writer can modify the image after its driver is detached.
     drop(builds);
-    match host.clone_build_volume(
+    match host.clone_claimed_build_volume(
         layout,
-        &age.live,
+        &claim,
         &seed,
         &BuildVolumeRecord::new(
             age.tree,
@@ -1997,6 +2016,7 @@ fn reseed(
         }
         Err(error) => return Err(storage(error)),
     }
+    drop(claim);
     retire_seeds(host, layout, target, previous)?;
     let elapsed_ms = millis(started.elapsed());
     cowshed_os::timing::event("build-volume", || {
@@ -2009,6 +2029,38 @@ fn reseed(
         behind_ms,
         elapsed_ms,
     })
+}
+
+/// Why a reseed could not claim its source's build hold, naming every holder of that hold: a
+/// job admitted on the volume (its supervisor's process holds the hold for it) or another
+/// cowshed operation claiming the volume, and anything with a file open inside it.
+fn build_hold_busy_reason(
+    image: &Path,
+    hold: &Path,
+    claimants: &[cowshed_os::process::Holder],
+    open: &[cowshed_os::process::Holder],
+) -> String {
+    let named = |holders: &[cowshed_os::process::Holder]| {
+        holders
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let mut reason = format!(
+        "build volume {} has a job admitted on it or another cowshed operation claiming it: its build hold {} is held by {}",
+        image.display(),
+        hold.display(),
+        match claimants {
+            [] => "a process this user cannot see".to_owned(),
+            claimants => named(claimants),
+        }
+    );
+    if !open.is_empty() {
+        reason.push_str(&format!(", and {} has it open", named(open)));
+    }
+    reason.push_str("; nothing was stopped: the next fork retries once that job ends");
+    reason
 }
 
 fn millis(duration: Duration) -> u64 {
@@ -3364,6 +3416,196 @@ fn main() {
             "{reason}"
         );
         assert!(reason.contains("nothing was forced"), "{reason}");
+    }
+
+    /// A shed's daemon keeper answers the reseed's stop of its daemon by admitting a start job
+    /// (16_build_volumes.md, "Targets and seeds", step 1). The recorded daemon here is that
+    /// restart: on SIGTERM it asks for the source's build hold exactly as job admission does (a
+    /// shared, non-waiting flock), hands any hold it gets to a child that keeps it, and only then
+    /// exits, so the attempt happens before the stop returns. The reseed's claim, taken before the
+    /// stop, refuses that admission, and the reseed captures.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn directory_reseed_claims_its_source_before_the_keeper_can_restart_the_daemon() {
+        use cowshed_os::fork_lock::Spawn as _;
+
+        let scratch = Scratch::directory("reseed-keeper");
+        let (_, live, mount) = scratch.linked_checkout("w1", 1);
+        let target = owner("w1", '1');
+        let state = BuildVolumeState {
+            paths: vec![BuildStatePath::new(".nx/workspace-data", "nx/workspace-data").unwrap()],
+            fingerprint: None,
+        };
+        state.write(&mount).unwrap();
+        let data = mount.join("nx/workspace-data");
+        fs::create_dir_all(data.join(nx::DAEMON_DIRECTORY)).unwrap();
+        let previous = BuildVolumeId::mint();
+        scratch
+            .host
+            .clone_build_volume(
+                &scratch.layout,
+                &live,
+                &previous,
+                &BuildVolumeRecord::new(
+                    None,
+                    BuildVolumeRole::Seed {
+                        target: target.name.clone(),
+                        incarnation: target.incarnation.clone(),
+                    },
+                ),
+            )
+            .unwrap();
+        // Short, under /tmp: a Unix socket path is bounded at 104 bytes on macOS.
+        let sockets = Path::new("/tmp").join(format!(
+            "cs-keep-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..12]
+        ));
+        fs::create_dir_all(&sockets).unwrap();
+        let socket = sockets.join("d.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let admission = sockets.join("admission");
+        let mut daemon = std::process::Command::new("/usr/bin/perl")
+            .args([
+                "-e",
+                r#"use Fcntl qw(:flock);
+                   my ($hold, $out) = @ARGV;
+                   $SIG{TERM} = sub {
+                       open(my $h, '+<', $hold) or die "open $hold: $!";
+                       open(my $o, '>', $out) or die "open $out: $!";
+                       if (flock($h, LOCK_SH | LOCK_NB)) {
+                           my $child = fork();
+                           if ($child == 0) { sleep 600; exit 0 }
+                           print $o "admitted $child";
+                       } else {
+                           print $o "refused";
+                       }
+                       close $o;
+                       exit 0;
+                   };
+                   $| = 1;
+                   print "ready\n";
+                   select(undef, undef, undef, 600) while 1;"#,
+            ])
+            .arg(scratch.layout.hold_path(&live))
+            .arg(&admission)
+            .current_dir(&data)
+            .stdout(std::process::Stdio::piped())
+            .spawn_locked()
+            .unwrap();
+        // The daemon is recorded once its SIGTERM handler is installed: before that, the stop
+        // would end it with the default action and no restart would be attempted.
+        let mut ready = String::new();
+        std::io::BufRead::read_line(
+            &mut std::io::BufReader::new(daemon.stdout.take().expect("piped stdout")),
+            &mut ready,
+        )
+        .unwrap();
+        assert_eq!(ready, "ready\n", "the stand-in daemon installs its handler");
+        fs::write(
+            data.join(nx::DAEMON_DIRECTORY).join("server-process.json"),
+            serde_json::json!({ "processId": daemon.id(), "socketPath": socket }).to_string(),
+        )
+        .unwrap();
+        let reseeded = reseed(
+            &*scratch.host,
+            &scratch.layout,
+            &target,
+            SeedAge {
+                live,
+                tree: None,
+                written: SystemTime::UNIX_EPOCH + Duration::from_secs(2),
+                seed: Some((
+                    previous.clone(),
+                    SystemTime::UNIX_EPOCH + Duration::from_secs(1),
+                )),
+            },
+        );
+        let stopped = daemon.try_wait().unwrap();
+        if stopped.is_none() {
+            daemon.kill().unwrap();
+            daemon.wait().unwrap();
+        }
+        let attempt = fs::read_to_string(&admission).unwrap_or_default();
+        if let Some(child) = attempt.strip_prefix("admitted ") {
+            let child: libc::pid_t = child.parse().unwrap();
+            // SAFETY: kill takes a pid and a signal number and touches no memory.
+            unsafe { libc::kill(child, libc::SIGKILL) };
+        }
+        drop(listener);
+        fs::remove_dir_all(&sockets).unwrap();
+        let seeds = seeds_of(&scratch.layout, &target).unwrap();
+        scratch.release_all();
+        assert!(stopped.is_some(), "the reseed stops the recorded daemon");
+        assert_eq!(
+            attempt, "refused",
+            "the restart's admission meets the reseed's claim"
+        );
+        assert!(
+            matches!(reseeded.unwrap(), Reseed::Reseeded { .. }),
+            "the reseed captures"
+        );
+        assert!(
+            !seeds.contains(&previous) && seeds.len() == 1,
+            "the new seed replaces the previous one: {seeds:?}"
+        );
+    }
+
+    /// A job admitted on the source before the reseed skips it, and the skip names the process
+    /// holding the build hold rather than an empty list of open files.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn directory_reseed_skipped_by_an_admitted_job_names_the_holds_holder() {
+        let scratch = Scratch::directory("reseed-admitted");
+        let (_, live, _) = scratch.linked_checkout("w1", 1);
+        let target = owner("w1", '1');
+        let previous = BuildVolumeId::mint();
+        scratch
+            .host
+            .clone_build_volume(
+                &scratch.layout,
+                &live,
+                &previous,
+                &BuildVolumeRecord::new(
+                    None,
+                    BuildVolumeRole::Seed {
+                        target: target.name.clone(),
+                        incarnation: target.incarnation.clone(),
+                    },
+                ),
+            )
+            .unwrap();
+        let job = scratch.layout.hold(&live).expect("a job's hold");
+        let reseeded = reseed(
+            &*scratch.host,
+            &scratch.layout,
+            &target,
+            SeedAge {
+                live: live.clone(),
+                tree: None,
+                written: SystemTime::UNIX_EPOCH + Duration::from_secs(2),
+                seed: Some((
+                    previous.clone(),
+                    SystemTime::UNIX_EPOCH + Duration::from_secs(1),
+                )),
+            },
+        );
+        drop(job);
+        let seeds = seeds_of(&scratch.layout, &target).unwrap();
+        scratch.release_all();
+        assert_eq!(seeds, [previous], "the skip keeps the previous seed");
+        let Reseed::Skipped {
+            reason: ReseedSkip::VolumeBusy { reason },
+            ..
+        } = reseeded.unwrap()
+        else {
+            panic!("an admitted job is a reseed skip");
+        };
+        assert!(
+            reason.contains(&scratch.layout.hold_path(&live).display().to_string())
+                && reason.contains(&format!("pid {}", std::process::id()))
+                && reason.contains("a job admitted on it"),
+            "{reason}"
+        );
     }
 
     /// Build volume `id`, mounted, its image recording `gib` GiB: a clone of the run's blank

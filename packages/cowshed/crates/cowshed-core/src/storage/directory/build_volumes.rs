@@ -186,8 +186,10 @@ impl DirectoryExecutionHost {
         self.clone_build_volume_under_hold(layout, source, destination, record)
     }
 
-    /// Clone the quiet landing volume, under the hold its stopped socket lease already keeps
-    /// (16_build_volumes.md, Land step 4): a second exclusive claim would conflict with it.
+    /// Clone a source whose caller already keeps job admission off it: the quiet landing volume,
+    /// under the hold its stopped socket lease keeps (16_build_volumes.md, Land step 4), where a
+    /// second exclusive claim would conflict, or a reseed's source under the claim the reseed
+    /// took before it stopped the source's Nx daemon ("Targets and seeds").
     pub fn clone_held_build_volume(
         &self,
         layout: &BuildVolumeLayout,

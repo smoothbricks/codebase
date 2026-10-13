@@ -41,6 +41,16 @@ where
         MacOsApfsExecutionHost::clone_quiet_build_volume(self, layout, quiet, destination, record)
     }
 
+    fn clone_claimed_build_volume(
+        &self,
+        layout: &BuildVolumeLayout,
+        claim: &ReleaseClaim,
+        destination: &BuildVolumeId,
+        record: &BuildVolumeRecord,
+    ) -> Result<(), ApfsStorageError> {
+        MacOsApfsExecutionHost::clone_claimed_build_volume(self, layout, claim, destination, record)
+    }
+
     fn build_volume_written(
         &self,
         layout: &BuildVolumeLayout,

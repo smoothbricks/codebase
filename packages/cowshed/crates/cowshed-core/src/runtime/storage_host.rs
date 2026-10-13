@@ -44,6 +44,17 @@ pub(crate) trait RuntimeStorageHost: ApfsExecutionHost<LockGuard: Sync> {
         destination: &BuildVolumeId,
         record: &BuildVolumeRecord,
     ) -> Result<(), ApfsStorageError>;
+    /// Capture the source `claim` claimed into seed `destination`, under that claim: a reseed
+    /// takes it before it stops the source's Nx daemon, so no job (the daemon keeper's start job
+    /// included) is admitted on the source until the capture is done (16_build_volumes.md,
+    /// "Targets and seeds").
+    fn clone_claimed_build_volume(
+        &self,
+        layout: &BuildVolumeLayout,
+        claim: &ReleaseClaim,
+        destination: &BuildVolumeId,
+        record: &BuildVolumeRecord,
+    ) -> Result<(), ApfsStorageError>;
     fn build_volume_written(
         &self,
         layout: &BuildVolumeLayout,
