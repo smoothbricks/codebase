@@ -116,16 +116,20 @@ fence and checkout handoff as adopt. Default adopt remains idempotent; replaceme
 ASIF-to-RAW transition and the RAW guest-space reclaim operation, not an image converter or a second runtime format.
 
 1. Require the caller to be outside the checkout and require its source and build volumes to have no holders. Refuse
-   with each holder's PID and command; never kill a user process or force an unmount. Record the exact source backing
-   path, incarnation, original checkout path, build-volume identity, current kernel IOMedia capacities and retained
-   paths in the durable adoption intent before changing any of them. Preserve an existing `<checkout>.pre-cowshed` tree
-   without overwriting or deleting it. Source and build copy mounts use the project's recorded adoption staging
-   namespace, with source and destination names that cannot be parsed as BuildVolumeIds. Without `--repo-id`, the
-   replacement binds the checkout's existing primary `repo_id` from the store rather than deriving one from the remotes.
-   It does so only when the in-image marker at the checkout records this checkout as main's, the controller's Active RAW
-   `main.dmg` sidecar for that repository records the same checkout and incarnation, a binding owns that repository, and
-   no other project's RAW main claims the checkout. Any disagreement refuses. With no main marker at the checkout, or no
-   RAW `main.dmg` for the repository it names, the identity rules of adopt step 1 apply.
+   with each holder's PID and command; never kill a user process or force an unmount. Each mounted image's holder census
+   runs under its existing image lease (01_storage.md, "Mounts" and "Ownership, identity, and the volume label"), after
+   an in-flight cosmetic rename releases its mount descriptor. Supervisor retirement remains nonwaiting; genuine
+   holders, including the controller's own PID, still refuse. An unmounted input is not censused. Record the exact
+   source backing path, incarnation, original checkout path, build-volume identity, current kernel IOMedia capacities
+   and retained paths in the durable adoption intent before changing any of them. Preserve an existing
+   `<checkout>.pre-cowshed` tree without overwriting or deleting it. Source and build copy mounts use the project's
+   recorded adoption staging namespace, with source and destination names that cannot be parsed as BuildVolumeIds.
+   Without `--repo-id`, the replacement binds the checkout's existing primary `repo_id` from the store rather than
+   deriving one from the remotes. It does so only when the in-image marker at the checkout records this checkout as
+   main's, the controller's Active RAW `main.dmg` sidecar for that repository records the same checkout and incarnation,
+   a binding owns that repository, and no other project's RAW main claims the checkout. Any disagreement refuses. With
+   no main marker at the checkout, or no RAW `main.dmg` for the repository it names, the identity rules of adopt step 1
+   apply.
 2. Record the source's complete content and Git state while it is quiescent: HEAD, porcelain, count-objects, local
    config including includes, every ref, packed refs or reftables, reflogs and stash, hooks, `info/`, index and worktree
    registrations. Preserve the sheds' links to the same main checkout path. Detach the exact old source without force,

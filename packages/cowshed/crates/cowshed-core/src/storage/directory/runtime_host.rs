@@ -141,6 +141,14 @@ impl RuntimeStorageHost for DirectoryExecutionHost {
         DirectoryExecutionHost::resize_build_volume(self, layout, id, capacity)
     }
 
+    fn re_adopt_volume_holders(
+        &self,
+        _image: &Path,
+        _mount: &Path,
+    ) -> Result<Vec<cowshed_os::process::Holder>, ApfsStorageError> {
+        Err(unsupported("re-adoption volume holders"))
+    }
+
     fn retain_re_adopt_source(&self, _source: &ReAdoptSource) -> Result<(), ApfsStorageError> {
         Err(unsupported("re-adoption"))
     }

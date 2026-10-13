@@ -3904,6 +3904,35 @@ fn assert_host_sparse(path: &Path) {
     );
 }
 
+/// The image lease excludes only cowshed's in-flight disk operation, never an unrelated open
+/// descriptor of the very same process. Prove that guard for healthy and missing-main inputs.
+async fn assert_re_adopt_refuses_own_build_file(
+    fixture: &Fixture,
+    service: &mut ActorBridge,
+    mount: &Path,
+) {
+    let held = fs::File::open(mount).expect("hold the fixture's own build mount");
+    let (result, _, _) = run(
+        service,
+        [
+            OsString::from("adopt"),
+            fixture.checkout.as_os_str().to_os_string(),
+            OsString::from("--re-adopt"),
+        ],
+    )
+    .await;
+    let error = result.expect_err("an actual same-PID holder refuses re-adoption");
+    assert_eq!(error.code, ErrorCode::Conflict, "{error}");
+    assert!(
+        error.message.contains(&mount.display().to_string())
+            && error
+                .message
+                .contains(&format!("pid {} (", std::process::id())),
+        "the refusal names the held build mount and this process: {error}"
+    );
+    drop(held);
+}
+
 /// One adopted fixture exercises the three missing-main transitions (02_workspaces.md,
 /// "Missing main image"): publish an empty build after loss, keep a surviving build under a
 /// new id after the next loss, then replay a refused copy after the user commits new work.
@@ -3926,6 +3955,9 @@ async fn real_apfs_missing_main_recovers_empty_and_surviving_builds_and_replays_
     let main_volume = linked_volume(&layout, &fixture.checkout);
     let cache_marker = layout.mount(&main_volume).join("discarded-cache");
     fs::write(&cache_marker, b"old cached payload\n").expect("warm the original build cache");
+
+    assert_re_adopt_refuses_own_build_file(&fixture, &mut service, &layout.mount(&main_volume))
+        .await;
 
     // The completed healthy re-adoption is the journal authority for main's build volume.
     succeed(
@@ -4324,6 +4356,8 @@ async fn prove_missing_main_replays_live_work(fixture: &mut Fixture) {
         .shutdown()
         .await
         .expect("stop the runtime before main is lost");
+    let layout = build_volumes(fixture);
+    let build_mount = layout.mount(&linked_volume(&layout, &fixture.checkout));
     lose_main_to_a_plain_checkout(fixture, &main_image, "replay-source");
 
     // An ignored file the copy cannot read: the attempt is journaled, then refuses at the copy.
@@ -4336,6 +4370,7 @@ async fn prove_missing_main_replays_live_work(fixture: &mut Fixture) {
     fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000))
         .expect("make the file unreadable");
     let mut refused = fixture.open().await;
+    assert_re_adopt_refuses_own_build_file(fixture, &mut refused, &build_mount).await;
     let (result, _, _) = run(
         &mut refused,
         [

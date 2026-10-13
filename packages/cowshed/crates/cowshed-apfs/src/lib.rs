@@ -1819,8 +1819,9 @@ impl<R, S> MacOsApfsBackend<R, S> {
 
 impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
     /// Hold `image`'s lease ([`CommandRunner::image_lease`]), keyed by the identity the
-    /// attachment inventory records for it.
-    fn image_lease(&self, image: &Path) -> Result<Option<Fenced<File>>, ApfsError> {
+    /// attachment inventory records for it. Source holder censuses use the same exclusion as
+    /// recovery mutations, so a cosmetic rename's mount descriptor is released before they run.
+    pub fn image_lease(&self, image: &Path) -> Result<Option<Fenced<File>>, ApfsError> {
         let identity = attachment_inventory_path(image)?;
         timed_apfs_step(apfs_step_leg(image), "image-lease", || {
             self.runner
