@@ -3888,25 +3888,19 @@ fn main() {
     /// main still linked its own previous volume, and the landing workspace was gone. That
     /// collection ran once while the land held the quiet volume and once after the land had moved
     /// main's link onto it, both times from the snapshot it took before the adoption. Neither
-    /// may take the volume: main ends owning the adopted volume, mounted, at the capacity a
-    /// resize gave main before the land. Main's link left naming a volume that is gone anyway is
+    /// may take the volume: main ends owning the adopted volume, mounted, at main's larger
+    /// capacity from before the land. Main's link left naming a volume that is gone anyway is
     /// what `cowshed doctor --repair` and every other opening's mount then settle: main reforks
-    /// from the seed its land froze.
+    /// from the seed its land froze. Main starts at that capacity, as in
+    /// `real_apfs_adoption_ends_at_the_larger_of_the_two_capacities`: how it got there is
+    /// `real_apfs_build_resize_grows_the_volume_and_seed_so_a_later_fork_inherits_it`'s proof,
+    /// and a resize here would only add a detach, grow, attach and remount of main's volume.
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn real_apfs_a_collection_planned_before_a_land_adopted_never_takes_the_adopted_volume() {
         let scratch = Scratch::new("build-adopt-rm");
         let main = owner("main", '0');
-        let (main_checkout, main_live, _) = scratch.linked_checkout("main", 1);
-        scratch
-            .volumes
-            .resize(
-                main.clone(),
-                main_checkout.clone(),
-                ImageCapacity::from_gibibytes(2),
-            )
-            .await
-            .expect("grow main's build volume");
+        let (main_checkout, main_live, _) = scratch.linked_checkout("main", 2);
         let (topic_checkout, topic, topic_mount) = scratch.linked_checkout("topic", 1);
         // What the `rm` of the landing workspace read: every image, then main, mounted, linking
         // its own volume; the landing workspace already retired.
