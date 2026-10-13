@@ -404,7 +404,11 @@ same for main and for an integration workspace; "the target" is whichever one it
 1. **Refuse a dirty tree** (as today).
 2. **Validate in the workspace**: the caller's check (`--check`, for an Nx project `nx run-many -t lint test build` over
    what the workspace changed) runs in the sandbox against the workspace's own build volume. Only the delta builds.
-3. **Fast-forward the target** under its repository lock (as today).
+3. **Update the target** under its repository lock (02_workspaces.md "`cowshed land`" step 3). When the target's
+   checkout has the target branch checked out, the branch fast-forwards through that checkout (as today) and the land
+   continues at step 4. When nothing has the target branch checked out, the land compares-and-swaps the branch ref and
+   **skips steps 4 to 7**: the target's checkout holds another branch, so its build volume and seed are not the landed
+   branch's. The target keeps its build volume and its seed; nothing is quiesced, carried, frozen or adopted.
 4. **Quiesce the landing workspace.** The land holds the landing build volume (the shared `<id>.dmg.hold` a job holds,
    GC below) from before the workspace's jobs stop until its build-volume steps end (after step 7), so no collection in
    any process releases it while step 6 renames the target's link and records the target as its owner. Its supervisor
@@ -502,7 +506,8 @@ same for main and for an integration workspace; "the target" is whichever one it
    one: a run of the same command that began after the check and ended between the check's Nx writing its summary and
    the check exiting. That run hashes the same tree with the same tasks, so the hashes it reports are the check's.
 
-8. **Retire the workspace** (as today). Its build volume is now the target's and does not retire with it.
+8. **Retire the workspace** (as today). An adopted build volume is now the target's and does not retire with it. After a
+   compare-and-swap at step 3 nothing adopted it, so it is still the workspace's.
 
 ### Carry
 
@@ -668,6 +673,9 @@ again at any level above it.
   intent journal, not the kernel's refusal to unmount. Every admitted cowshed job holds a shared flock on the build
   volume's `<id>.dmg.hold` for its lifetime; release must claim it exclusively. A running job therefore keeps main's
   previous volume across a swap.
+- A held lifecycle or image lock likewise defers release. A superseded seed is retired only under its target's image
+  lock, which the land and reseed paths hold while they replace it, and seed retirement takes that lock as a typed
+  witness, so collection never releases a seed that a land or reseed is replacing.
 - Collection decides from a snapshot, and a land can move a target's link onto a volume after it: an `rm` that retired
   the landing workspace while that workspace's land still ran saw the landing volume linked by nothing, and once it
   released it, main's link named a volume that no longer existed. So each release claims the volume first and reads

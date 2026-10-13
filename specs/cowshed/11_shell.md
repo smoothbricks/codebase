@@ -5,19 +5,6 @@ mounts, sandbox profiles, grants) and every client that runs commands (CLI, MCP,
 supervisor per workspace holding warm exec hosts with the workspace shell already activated, a framed stdio protocol
 over a Unix socket, job control, and the single exec-record capture that all clients consume.
 
-> **Implementation status — job monitoring:** the supervisor owns durable numeric jobs, protected stdout/stderr
-> journals, offset-addressed reads, bounded cursor tails, attach resumed at a journal cursor, detach, and complete-group
-> termination. Core job resource samples, terminal persistence and keyed admission/lookup are implemented, and periodic
-> progress subscriptions stream over the controller and through N-API. Controller and N-API operation bindings derive
-> from one API declaration, group-owned TCP-listener queries among them. Explicit Open stdin, bounded delivered-byte
-> writes and exactly-once EOF are implemented in Rust and through the generated N-API attachment input view. The
-> process-group ownership ledger identifies groups for sampling and termination. On macOS each sample carries the job's
-> CPU share over the supervisor's sampling clock window, its leader/children rusage totals reconciled against a polled
-> census of the group, and the census's CPU-winning leaf. Complete fork/exec tree observation, per-process usage and
-> blocker streams, process event streams, and process/job resource spans are unbuilt as well. Complete cgroup job totals
-> (so Linux samples, which have no accounting source yet), charged-memory measurements, and event-source
-> coverage/overhead measurement are unbuilt too.
-
 ## Shell activation and process reuse
 
 A fresh workspace is a CoW clone of main, including its `.direnv`/`.devenv` caches. These are inputs to canonical
@@ -345,15 +332,14 @@ attached workspace. Admission appends a complete `ProtectedRecord::Job(JobArtifa
 `ControllerCommitment::Admission(AdmissionCommitment)` before process creation, so spawn failure retains durable
 identity. A record's sequence comes from the `records.sequence` counter, published by atomic rename before the record is
 appended under the same lock, so a crash may leave a gap but never hands a sequence out twice. At startup the supervisor
-reconciles the maximum canonical `job_id` across valid complete in-volume allocation batches, controller commitments for
-the active lineage, and canonical spill directories, then chooses `max + 1` (or `1` when none exist). Any disagreement
-or duplicate durable key is `Integrity`, not a reason to reuse a number. Open/recovery requires every record's `repo_id`
-to equal the workspace's bound repository. A record incarnation may differ from the current marker only when controller
-fork/restore/checkpoint lineage and commitments admit it as inherited history; an unknown historical incarnation, or any
-new allocation under a non-current incarnation, is `Integrity`. Thus copied histories are intentional but cannot smuggle
-a foreign repository/timeline. Supervisor replacement and attach otherwise discard only an incomplete trailing Arrow
-batch and never rewrite a complete batch or sealed artifact. Fork/checkpoint/restore copies start above every inherited
-allocation; no separate high-water file exists.
+takes the maximum canonical `job_id` across valid complete in-volume allocation batches, canonical spill directories and
+the checked `records.job-floor` counter, then chooses `max + 1` (or `1` when none exist). Any duplicate durable key is
+`Integrity`, not a reason to reuse a number. Open/recovery requires every record's `repo_id` to equal the workspace's
+bound repository. A record incarnation may differ from the current marker only when the marker's fork/restore lineage
+names it as an ancestor; an unknown historical incarnation, or any new allocation under a non-current incarnation, is
+`Integrity`. Thus copied histories are intentional but cannot smuggle a foreign repository/timeline. Supervisor
+replacement and attach otherwise discard only an incomplete trailing Arrow batch and never rewrite a complete batch or
+sealed artifact. Fork/checkpoint/restore copies start above every inherited allocation.
 
 **Durability of a job's own records.** A job's records — its admission and terminal batches, its spill files (made
 durable when it backgrounds, sealed when it ends), the output copies it publishes, and its admission and terminal
@@ -425,8 +411,8 @@ spawn-before-reply crash window as specified in 07_api.md.
   checkpoint uses the barrier/manifest protocol below.
 - **`--background`** detaches and promotes immediately, and the caller gets the job id.
 - **Hard timeout** (`[shell] hard_timeout`, unset by default, set by CI — 10_ci.md) sends SIGTERM, then SIGKILL after a
-  grace, drains both pipes to EOF, and marks the job `killed:timeout`. **Implementation status:** this configured
-  job-killing timeout is unbuilt; the implemented CLI `--timeout` detaches and never kills.
+  grace, drains both pipes to EOF, and marks the job `killed:timeout`. It is distinct from the CLI's `--timeout`, which
+  bounds how long the caller waits before the job is backgrounded and never kills.
 - **Combined output quota.** Each job has one configurable quota across stdout and stderr, default **1 GiB**. Accounting
   includes protected bytes plus bytes read from either child pipe but still buffered/in flight. The first read whose
   inclusion would cross the quota atomically trips the limit: the supervisor admits no payload beyond the exact
@@ -524,6 +510,9 @@ unlink, link, or replace protected records or artifacts. Terminal completion is 
 unclean supervisor exit, recovery may discard only an incomplete trailing batch or uncommitted bytes beyond a checkpoint
 manifest; malformed or mismatched complete data is `Integrity`, never child-authored input to reinterpret.
 
+Every job's record carries `envHash`, the hash of the environment the job was spawned with, beside its `grantRevision`:
+a consumer sees the same `grantRevision` and `envHash` needed to reproduce a run.
+
 The shared DTO is exact:
 
 ```rust
@@ -572,7 +561,7 @@ supervisor clonefiles/reflinks or extent-copies into a temporary destination, fs
 Publication never changes `StreamInfo.storage`; reads and authority never resolve through it. Redirect snapshots and
 publication forbid hardlinks.
 
-Cross-incarnation completeness uses this exact tagged/versioned union:
+Controller commitments, the audit telemetry of job and lineage events, use this exact tagged/versioned union:
 
 ```rust
 enum ControllerCommitment {
@@ -597,14 +586,21 @@ validated on its own row and written to the configured sink (sealed Arrow segmen
 sink), and nothing replays them for a decision. No variant contains inline bytes, protected paths, redirect sources,
 summaries, or raw payload.
 
-Protected in-volume records and artifacts are authoritative captured-content evidence for their origin
-incarnation/checkpoint boundary. Controller commitments are authoritative for existence, lifecycle/status, ordering,
-fork/restore/checkpoint lineage, and the expected hashes/counts that detect omission, mutation, or rollback. Neither
-tier substitutes for the other. A missing committed artifact, unknown commitment, count/hash/terminal-batch/manifest
-digest mismatch, or lineage contradiction returns typed `Integrity`, stops status/restore/export from presenting the
-record as valid, and preserves both sides for diagnosis; cowshed never overwrites one side or chooses whichever appears
-newer. Grant authority remains in controller-owned grant files and gateway decisions remain in controller-owned audit
-segments.
+Protected in-volume records and artifacts are the authoritative evidence of what a workspace ran; the controller
+commitments above are telemetry about it and decide nothing. The protected tier carries its own checks. Every complete
+frame keeps its `batch_sha256`, so a mutated frame is caught. Each terminal job record holds its artifacts' byte counts
+and SHA-256 digests, and opening the store verifies them, as it does the files a checkpoint manifest's visible jobs
+name, so a missing or altered artifact is caught. A checkpoint manifest binds the record prefix it covers through
+`records_sha256`. The checked counters beside the records only move forward: `records.sequence` and each incarnation's
+`records.barrier.*` are published before the records they number, and `records.job-floor` holds the highest job id a
+set-aside store handed out. At open, a sequence counter behind the log is advanced to it ("Durability of a job's own
+records", above), and a barrier counter that trails a durable checkpoint barrier is detected as a rollback of the
+counter. Nothing in the volume detects a rollback of the whole image, records and counters together: the commitments
+record what happened for whoever reads the audit trail, and cowshed does not read them for a decision. Any detected
+fault, a duplicate durable key, or an incarnation outside the marker lineage returns typed `Integrity`, stops
+status/restore/export from presenting the record as valid, and preserves the evidence for diagnosis; cowshed never
+overwrites it or chooses whichever copy appears newer. Grant authority remains in controller-owned grant files and
+gateway decisions remain in controller-owned audit segments.
 
 Each `StreamInfo.summary` is a deterministic, bounded, versioned **diagnostic summary**, inspired by RTK/ContextCrawler:
 retain a small ordered context window around compiler/test/error signatures plus deterministic head/tail context,

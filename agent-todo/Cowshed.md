@@ -1,5 +1,10 @@
 # Cowshed
 
+- Post-reboot proof owed for fixture-attach-pool (landed): run `COWSHED_TIMING=1` nextest `apfs_native` + `clone_intent`
+  real-APFS subset and count `apfs-command attach.*start` lines (one shared attach in the flag table). New
+  `diskutil image attach` calls hang host-wide until the attach pool recovers, so this proof could not run before the
+  reboot; compile and merge evidence are recorded in the landing.
+
 - Qualify the initial `jobCpuSamplePeriod` (1 s) and observed-CPU leaf coverage threshold (900‰) on real Cargo/Nx/Bun
   gate jobs; report sampler cost, `cpuPct` stability and coverage evidence (specs/cowshed/07_api.md, "Job monitoring"
   and "Process-tree observations").

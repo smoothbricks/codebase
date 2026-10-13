@@ -1,11 +1,7 @@
 # Cloudflare Trace Segments and Log Sink <a id="smoo/lmao!n/cf-trace-segments"></a>
 
-> Status: partially implemented. The LMAO sink-fit adapters ship as the `@smoothbricks/lmao/cloudflare` subpath
-> (`packages/lmao/src/lib/cloudflare/`): the billing-grade `CollectorClient` interface + in-memory fake, the diagnostic
-> `DiagnosticDrainTracer` with Pipelines-shaped and Queues-fallback transports, and the `ClassSplitTracer` routing rows
-> per delivery class. The collector service, the 01s fetch wrapper, tail-worker crash net, and all platform wiring
-> remain design. Investigated 2026-07-04 against current Cloudflare docs/pricing (cited inline; Pipelines and R2 Data
-> Catalog are open beta — re-verify pricing before GA commitments).
+Checked 2026-07-04 against current Cloudflare docs and pricing (cited inline). Pipelines and R2 Data Catalog are open
+beta: re-verify pricing before GA commitments.
 
 ## Governing Principle <a id="smoo/lmao!n/cf-trace-segments-principle"></a>
 
@@ -33,7 +29,7 @@ format.
 
 The sampling knob is **structurally inapplicable to billing-grade** — not "configured off" but absent from the class:
 these rows are domain events (facts a downstream contract consumes), not derived plumbing, and domain events always
-append. Any future sampling implementation operates on the diagnostic class only.
+append. Sampling, where applied, operates on the diagnostic class only.
 
 ## Zero-Loss Sources <a id="smoo/lmao!n/cf-trace-segments-zero-loss"></a>
 
@@ -102,18 +98,18 @@ transactional-storage commit is the durability point; the collector reduces, sta
 uploads to R2. **Rows on the wire is normative for this lane**, not a convenience: the segment layout's sort and
 row-group requirements mean the collector must encode at seal time — it alone sees the merged multi-client stream — so
 Arrow-on-wire would be pure decode-then-re-encode overhead; rows also keep browser clients Arrow-free (crash-path
-emitters must stay dumb). Arrow remains the storage format and the Queues-fallback envelope format. If row-parse CPU
-ever becomes measurable, msgpack encoding of the same row shape is the mitigation — the architecture is unchanged by it.
-The obvious caution — "a self-built collector lane is self-building Pipelines" — is answered, not ignored: the collector
-is justified precisely because it is NOT transport. It does compute on the stream (incremental aggregate reduction,
-threshold alerting, the hot-window freshness surface) that Pipelines cannot do; if it were only moving bytes, it would
-still be disqualified.
+emitters must stay dumb). Arrow remains the storage format; the Queues fallback carries rows as well, batched under a
+01t chunk envelope. If row-parse CPU ever becomes measurable, msgpack encoding of the same row shape is the mitigation —
+the architecture is unchanged by it. The obvious caution — "a self-built collector lane is self-building Pipelines" — is
+answered, not ignored: the collector is justified precisely because it is NOT transport. It does compute on the stream
+(incremental aggregate reduction, threshold alerting, the hot-window freshness surface) that Pipelines cannot do; if it
+were only moving bytes, it would still be disqualified.
 
 **Diagnostic primary: Cloudflare Pipelines** (open beta; Workers Paid). Ingestion via Worker **stream binding**
 (`env.TRACE_STREAM.send(rows)` — array of JSON-serializable records, promise resolves on confirmed ingest) or HTTP
 endpoint; SQL transforms at ingest; **exactly-once delivery to R2**; Parquet/JSON/Iceberg output. Limits (beta): 5
-MB/ingestion request, 5 MB/s per stream, 20 streams/pipelines/sinks per account. Currently unbilled beyond standard R2
-storage/operations.
+MB/ingestion request, 5 MB/s per stream, 20 streams/pipelines/sinks per account. Unbilled during open beta beyond
+standard R2 storage/operations.
 
 - Spans are sent as **rows**, not pre-built Arrow chunks: Pipelines owns batching and Parquet encoding for the raw tier.
   The 01s wrapper's `enqueue` seam stays; its payload becomes `rows` instead of an Arrow envelope. 01t's Arrow
@@ -125,14 +121,14 @@ storage/operations.
 **Considered and dropped — awaited Pipelines send as the billing-grade primary:** the `send()` confirmation is a real
 durability point, but the lane does no compute on the stream (no reduction, no alerting), offers no hot-window
 freshness, its ack semantics are opaque (beta), and post-beta pricing is unknown. It **remains the valid simpler
-fallback** for billing-grade wherever the collector is not yet deployed — bootstrap environments bill correctly through
-it, they just get no live aggregates.
+fallback** for billing-grade wherever no collector is deployed — bootstrap environments bill correctly through it, they
+just get no live aggregates.
 
 **Fallback: Queues** if Pipelines' limits or post-beta pricing disqualify it — a drop-in behind the same sink seam.
 Messages are 128 KB max and operations are billed per 64 KB (write+read+delete ≈ 3 ops), so the fallback MUST ship
-batched chunk envelopes (01s/01t), never per-span messages: 100 M spans/month as ~250 k chunked messages ≈ 0.75 M ops ≈
-within the 1 M included; per-span would be ~300 M ops ≈ $120/month. ($0.40/M ops after 1 M included.) At-least-once +
-`chunk_id` dedup.
+batched chunk messages (01s `TraceChunkQueueMessage`: one 01t envelope plus its rows), never per-span messages: 100 M
+spans/month as ~250 k chunked messages ≈ 0.75 M ops ≈ within the 1 M included; per-span would be ~300 M ops ≈
+$120/month. ($0.40/M ops after 1 M included.) At-least-once + `chunk_id` dedup.
 
 **Bootstrap only: direct R2 per request.** A worker PUTting its own rows/chunks straight to R2. Works on day one with
 zero dependencies, but Class A ops are $4.50/M (per-request PUTs at 10 M requests/month ≈ $45 — dwarfing every other
@@ -304,9 +300,9 @@ pricing (2026-07, spans ≈ 200 B compressed columnar):
 (R2: $0.015/GB-mo standard, Class A $4.50/M, Class B $0.36/M, zero egress; compaction reads/writes add Class A/B ops in
 the thousands/month — noise. Post-beta Pipelines pricing is the open risk; the Queues fallback bounds it.)
 
-At these numbers the sampling hook shrinks to a **future knob**: LMAO's tracer keeps a head-sampling extension point in
-the API, unimplemented, and "always-keep errors/security" rules are moot while nothing is dropped. Retention/tiering
-(Infrequent Access at $0.01/GB-mo, or delete-after-N-months as Iceberg snapshot expiry) is the cost lever, not sampling.
+At these numbers the sampling hook is never engaged: LMAO's tracer keeps a head-sampling extension point in the API, and
+"always-keep errors/security" rules are moot while nothing is dropped. Retention/tiering (Infrequent Access at
+$0.01/GB-mo, or delete-after-N-months as Iceberg snapshot expiry) is the cost lever, not sampling.
 
 ## WAE: Justify or Drop <a id="smoo/lmao!n/cf-trace-segments-wae"></a>
 
@@ -377,14 +373,13 @@ The OLAP job owns heavy historical rollups. Both write aggregate segments back u
 
 No new abstraction: the base `Tracer` sink lifecycle (`onTraceEnd`/`flush`) already models this. The Cloudflare sink is
 a `Tracer` subclass whose `flush()` drains completed buffers and sends **rows** through the pipeline binding; the 01s
-wrapper schedules `flush()` via `ctx.waitUntil`. The Queues-fallback sink instead builds 01t chunk envelopes. Both are
-constructor-injected transports — the tracer API is unchanged.
+wrapper schedules `flush()` via `ctx.waitUntil`. The Queues-fallback sink instead batches the rows into messages, each
+one 01t chunk envelope plus its rows. Both are constructor-injected transports — the tracer API is unchanged.
 
-Implemented at `packages/lmao/src/lib/cloudflare/` (exported as `@smoothbricks/lmao/cloudflare`):
-`DiagnosticDrainTracer` + `PipelinesStreamTransport`/`QueuesFallbackTransport` (this section),
-`CollectorClient`/`FakeCollectorClient` (§Delivery Classes, §Zero-Loss Sources), and `ClassSplitTracer` with an injected
-`DeliveryClassifier` — the spec fixes the classes, not the classification mechanism, so the row→class mapping stays a
-constructor-injected seam.
+Exported as `@smoothbricks/lmao/cloudflare` from `packages/lmao/src/lib/cloudflare/`: `DiagnosticDrainTracer` +
+`PipelinesStreamTransport`/`QueuesFallbackTransport` (this section), `CollectorClient`/`FakeCollectorClient` (§Delivery
+Classes, §Zero-Loss Sources), and `ClassSplitTracer` with an injected `DeliveryClassifier` — the spec fixes the classes,
+not the classification mechanism, so the row→class mapping stays a constructor-injected seam.
 
 ## Open Questions <a id="smoo/lmao!n/cf-trace-segments-open"></a>
 
@@ -404,8 +399,8 @@ constructor-injected seam.
   parameter-drift rejection) is what makes at-least-once sufficient, and an outcome-based billability contract is what
   the crash-net rows feed.
 - [01s](./01s_cloudflare_fetch_trace_wrapper.md) carries the matching lane note (§Trace Chunk Envelope): the `enqueue`
-  seam sends **rows** on the primary Pipelines rung; the Arrow chunk envelope remains the Queues-fallback and compactor
-  format.
+  seam sends **rows** on every lane; the Queues fallback batches them under a 01t chunk envelope, and the compactor
+  works on 01t envelopes.
 
 ## Related <a id="smoo/lmao!n/cf-trace-segments-related"></a>
 

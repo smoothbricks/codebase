@@ -37,20 +37,20 @@ lmao's concept). When converting to Arrow:
 │                           PASS 1: Build Dictionaries                         │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                              │
-│   Walk tree with simple recursive function (no buffer array)                │
+│   Walk tree with the allocation-free walk (no buffer array)                 │
 │                     │                                                        │
 │                     ▼                                                        │
 │   For each buffer:                                                           │
 │   ├── Count rows (accumulate total)                                         │
 │   └── For each string column (category/text):                               │
-│       └── Add to ColumnDictionary                                           │
+│       └── Add to DictionaryBuilder                                          │
 │                     │                                                        │
 │                     ▼                                                        │
-│   ColumnDictionary per column:                                              │
-│   ├── Map<string, { utf8?: Uint8Array, count: number }>                     │
-│   ├── Track totalUtf8Bytes (sum of unique string byte lengths)             │
+│   DictionaryBuilder per column:                                             │
+│   ├── Map<string, { utf8?: Uint8Array, byteLength: number, count: number }> │
+│   ├── Track totalBytes (sum of unique string byte lengths)                  │
 │   ├── On first occurrence: compute utf8ByteLength() (no allocation)        │
-│   └── On second occurrence: cache UTF-8 encoding (encoder.encode())        │
+│   └── On second occurrence: cache UTF-8 bytes (utf8Encoder.encode())        │
 │                                                                              │
 └─────────────────────────────────────────────────────────────────────────────┘
                                     │
@@ -59,10 +59,10 @@ lmao's concept). When converting to Arrow:
 │                         FINALIZE DICTIONARIES                                │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                              │
-│   For each ColumnDictionary:                                                │
+│   For each DictionaryBuilder (finalize):                                    │
 │   ├── Pre-allocate sorted array: new Array(map.size)                        │
 │   ├── Copy keys into array, sort in place (V8 Timsort: O(n log n))         │
-│   ├── Pre-allocate data: new Uint8Array(totalUtf8Bytes + alignment)        │
+│   ├── Pre-allocate data: new Uint8Array(totalBytes)                         │
 │   ├── Pre-allocate offsets: new Int32Array(uniqueCount + 1)                │
 │   │                                                                          │
 │   │   For each string in sorted order:                                       │
@@ -78,7 +78,7 @@ lmao's concept). When converting to Arrow:
 │                      PASS 2: Convert to RecordBatches                        │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                              │
-│   Walk tree again with same recursive function                               │
+│   Walk tree again with the same walk                                        │
 │                     │                                                        │
 │                     ▼                                                        │
 │   For each buffer, convert to RecordBatch:                                  │
@@ -101,211 +101,182 @@ lmao's concept). When converting to Arrow:
 
 ### Pass 1: Build Dictionaries <a id="smoo/lmao!n/arrow-tree-walker-two-pass.pass1"></a>
 
-Walk the tree with a simple recursive function. For each buffer encountered:
+Walk the tree. For each buffer encountered:
 
 1. **Count rows** - Accumulate `writeIndex` for total row count
-2. **Process string columns** - For each category/text column, add strings to `ColumnDictionary`
+2. **Process string columns** - For each category/text column, add strings to that column's `DictionaryBuilder`
 
-**Key Design**: The `Utf8Cache` is shared across the entire conversion process (passed as argument, not global). This
-allows UTF-8 encodings to be reused across columns and across multiple conversion calls if the cache persists.
+**Key Design**: every `DictionaryBuilder` in a conversion takes the process-wide `globalUtf8Cache` as its `Utf8Encoder`.
+The cache is bounded (SIEVE eviction), so UTF-8 encodings are reused across columns and across conversions without
+unbounded growth. `DictionaryBuilder`, `Utf8Encoder`, and `utf8ByteLength` live in `arrow-builder`; `Utf8Cache` lives in
+lmao and implements `Utf8Encoder`.
 
 ```typescript
-/**
- * Shared UTF-8 encoding cache.
- * Passed to ColumnDictionary and finalization functions.
- * Can be reused across multiple conversions to amortize encoding costs.
- */
-class Utf8Cache {
-  private cache = new Map<string, Uint8Array>();
-  private encoder = new TextEncoder();
-
-  /**
-   * Get or compute UTF-8 encoding for a string.
-   * Caches the result for future lookups.
-   */
-  getOrEncode(str: string): Uint8Array {
-    let utf8 = this.cache.get(str);
-    if (utf8 === undefined) {
-      utf8 = this.encoder.encode(str);
-      this.cache.set(str, utf8);
-    }
-    return utf8;
-  }
-
-  /**
-   * Check if string is already cached (without encoding).
-   */
-  has(str: string): boolean {
-    return this.cache.has(str);
-  }
-
-  /**
-   * Get cached encoding if available.
-   */
-  get(str: string): Uint8Array | undefined {
-    return this.cache.get(str);
-  }
-
-  /**
-   * Get the encoder for encodeInto() calls.
-   */
-  get textEncoder(): TextEncoder {
-    return this.encoder;
-  }
+/** arrow-builder: the encoder a DictionaryBuilder uses for strings the interner does not hold. */
+interface Utf8Encoder {
+  byteLength(str: string): number;
+  encode(str: string): Uint8Array;
+  /** Encode into buffer at offset; returns bytes written. */
+  encodeInto(str: string, buffer: Uint8Array, offset: number): number;
 }
 
 /**
- * ColumnDictionary tracks unique strings for a single column.
- *
- * Key optimizations:
- * - First occurrence: compute byte length only (no UTF-8 encoding allocation)
- * - Second occurrence: cache UTF-8 encoding via shared Utf8Cache
- * - Track totalUtf8Bytes for exact-size allocation later
+ * lmao: bounded UTF-8 encoding cache with SIEVE eviction (default 4096 entries).
+ * encode, byteLength, and encodeInto read the cache and fill it on a miss.
  */
-class ColumnDictionary {
-  private map = new Map<string, { count: number }>();
-  private totalUtf8Bytes = 0;
+class Utf8Cache implements Utf8Encoder {
+  constructor(maxSize?: number);
+  encode(str: string): Uint8Array;
+  byteLength(str: string): number;
+  encodeInto(str: string, buffer: Uint8Array, offset: number): number;
+  /** Encode a batch into concatenated bytes plus Arrow offsets (length strings.length + 1). */
+  encodeMany(strings: readonly string[]): { data: Uint8Array; offsets: Int32Array };
+  get stats(): { hits: number; misses: number; hitRate: number; size: number };
+  resetStats(): void;
+  clear(): void;
+}
 
-  constructor(private utf8Cache: Utf8Cache) {}
+declare const globalUtf8Cache: Utf8Cache;
+declare function createUtf8Cache(maxSize?: number): Utf8Cache;
 
-  /**
-   * Add a string value to the dictionary.
-   */
-  add(value: string): void {
-    const entry = this.map.get(value);
-
-    if (entry === undefined) {
-      // First occurrence: compute byte length only (no allocation)
-      const byteLength = this.utf8ByteLength(value);
-      this.totalUtf8Bytes += byteLength;
-      this.map.set(value, { count: 1 });
-    } else {
-      entry.count++;
-
-      // Second occurrence: cache the UTF-8 encoding in shared cache
-      // Rationale: if it appeared twice, likely to appear more times
-      // and we'll need the encoding during finalization anyway
-      if (entry.count === 2 && !this.utf8Cache.has(value)) {
-        this.utf8Cache.getOrEncode(value); // Cache it
-      }
-    }
-  }
-
-  /**
-   * Compute UTF-8 byte length without allocating.
-   */
-  private utf8ByteLength(str: string): number {
-    // Check cache first - if already encoded, use that length
-    const cached = this.utf8Cache.get(str);
-    if (cached) return cached.length;
-
-    // Fast path for ASCII-only strings
-    let bytes = 0;
-    for (let i = 0; i < str.length; i++) {
-      const code = str.charCodeAt(i);
-      if (code < 0x80) bytes += 1;
-      else if (code < 0x800) bytes += 2;
-      else if (code < 0xd800 || code >= 0xe000) bytes += 3;
-      else {
-        // Surrogate pair
+/**
+ * arrow-builder: UTF-8 byte length without allocating. It counts exactly what TextEncoder writes: a lone surrogate
+ * encodes as U+FFFD (3 bytes).
+ */
+function utf8ByteLength(str: string): number {
+  let bytes = 0;
+  for (let i = 0; i < str.length; i++) {
+    const code = str.charCodeAt(i);
+    if (code < 0x80) bytes += 1;
+    else if (code < 0x800) bytes += 2;
+    else if (code >= 0xd800 && code < 0xdc00 && i + 1 < str.length) {
+      const next = str.charCodeAt(i + 1);
+      if (next >= 0xdc00 && next < 0xe000) {
+        // High surrogate followed by low surrogate: one 4-byte code point
         i++;
         bytes += 4;
+      } else {
+        // Lone high surrogate: U+FFFD
+        bytes += 3;
       }
+    } else {
+      // BMP code point, or a lone surrogate (U+FFFD)
+      bytes += 3;
     }
-    return bytes;
+  }
+  return bytes;
+}
+
+/**
+ * arrow-builder: DictionaryBuilder tracks the unique strings of one column.
+ *
+ * - Interned string (enum values, module names): reuse its pre-encoded UTF-8
+ * - Other first occurrence: compute the byte length only (no encoding allocation)
+ * - Second occurrence: encode once through the Utf8Encoder and keep the bytes on the entry
+ * - Track totalBytes for exact-size allocation in finalize
+ */
+class DictionaryBuilder {
+  private entries = new Map<string, { utf8?: Uint8Array; byteLength: number; count: number }>();
+  private totalBytes = 0;
+
+  constructor(private utf8Encoder: Utf8Encoder = defaultUtf8Encoder) {}
+
+  add(str: string): void {
+    const existing = this.entries.get(str);
+    if (existing) {
+      existing.count++;
+      // Second occurrence: likely to repeat, and finalize needs the bytes anyway
+      if (existing.count === 2 && !existing.utf8) existing.utf8 = this.utf8Encoder.encode(str);
+      return;
+    }
+
+    const interned = getInterned(str);
+    if (interned) {
+      this.entries.set(str, { utf8: interned, byteLength: interned.length, count: 1 });
+      this.totalBytes += interned.length;
+      return;
+    }
+
+    // First occurrence: count bytes only
+    const byteLength = utf8ByteLength(str);
+    this.entries.set(str, { byteLength, count: 1 });
+    this.totalBytes += byteLength;
   }
 
   get size(): number {
-    return this.map.size;
+    return this.entries.size;
   }
 
-  get utf8TotalBytes(): number {
-    return this.totalUtf8Bytes;
-  }
-
-  keys(): IterableIterator<string> {
-    return this.map.keys();
-  }
+  finalize(sorted: boolean): FinalizedDictionary; // see Finalize Dictionaries
+  clear(): void;
 }
 ```
 
+A first occurrence counts its bytes with `utf8ByteLength` directly and does not ask the encoder: `Utf8Cache.byteLength`
+encodes and caches on a miss, which would allocate for strings that appear once.
+
 ### Finalize Dictionaries <a id="smoo/lmao!n/arrow-tree-walker-two-pass.finalize"></a>
 
-After Pass 1, finalize each dictionary with exact-size allocations:
+After Pass 1, `DictionaryBuilder.finalize(sorted)` turns each builder into a `FinalizedDictionary` with exact-size
+allocations. Category columns finalize sorted, so their values support binary search; text columns and the trace id
+column finalize in insertion order.
 
 ```typescript
-interface FinalizedDictionary {
-  /** Arrow dictionary vector (shared by all RecordBatches) */
-  vector: arrow.Vector<arrow.Utf8>;
-  /** Lookup: string → dictionary index */
-  indexMap: Map<string, number>;
-  /** Index data type (Uint8, Uint16, or Uint32 based on dictionary size) */
-  indexType: arrow.Uint8 | arrow.Uint16 | arrow.Uint32;
+class FinalizedDictionary {
+  constructor(
+    readonly data: Uint8Array, // concatenated UTF-8 bytes
+    readonly offsets: Int32Array, // Arrow offsets, length uniqueCount + 1
+    readonly indexMap: Map<string, number>, // string → dictionary index
+    readonly indexArrayCtor: Uint8ArrayConstructor | Uint16ArrayConstructor | Uint32ArrayConstructor,
+    readonly arrowIndexType: IntType // uint8, uint16, or uint32 by dictionary size
+  ) {}
 }
 
-function finalizeDictionary(dict: ColumnDictionary, utf8Cache: Utf8Cache): FinalizedDictionary {
-  const uniqueCount = dict.size;
+// DictionaryBuilder.finalize; `encoder` is arrow-builder's module-level TextEncoder
+finalize(sorted: boolean): FinalizedDictionary {
+  const uniqueCount = this.entries.size;
+  const strings = [...this.entries.keys()];
+  if (sorted) strings.sort(); // V8's Timsort is O(n log n), hard to beat with manual insertion
 
-  // 1. Pre-allocate sorted array with exact size
-  const sorted: string[] = new Array(uniqueCount);
-  let i = 0;
-  for (const key of dict.keys()) {
-    sorted[i++] = key;
-  }
+  const indexArrayCtor = uniqueCount <= 255 ? Uint8Array : uniqueCount <= 65535 ? Uint16Array : Uint32Array;
+  const arrowIndexType = uniqueCount <= 255 ? uint8() : uniqueCount <= 65535 ? uint16() : uint32();
 
-  // 2. Sort in place - V8's Timsort is O(n log n), hard to beat with manual insertion
-  sorted.sort();
-
-  // 3. Determine index type based on dictionary size
-  const indexType =
-    uniqueCount <= 255 ? new arrow.Uint8() : uniqueCount <= 65535 ? new arrow.Uint16() : new arrow.Uint32();
-
-  // 4. Pre-allocate UTF-8 data buffer with exact size (+ 64-byte alignment padding)
-  const alignedSize = Math.ceil(dict.utf8TotalBytes / 64) * 64;
-  const data = new Uint8Array(alignedSize);
-
-  // 5. Pre-allocate offsets array with exact size
+  // Exact-size buffers: totalBytes is the sum of the unique strings' byte lengths
+  const data = new Uint8Array(this.totalBytes);
   const offsets = new Int32Array(uniqueCount + 1);
-
-  // 6. Build index map and encode strings
   const indexMap = new Map<string, number>();
+
   let offset = 0;
-  const encoder = utf8Cache.textEncoder;
+  for (let i = 0; i < strings.length; i++) {
+    const str = strings[i];
+    const entry = this.entries.get(str);
+    if (!entry) continue;
+    offsets[i] = offset;
+    indexMap.set(str, i);
 
-  for (let idx = 0; idx < sorted.length; idx++) {
-    const str = sorted[idx];
-    indexMap.set(str, idx);
-    offsets[idx] = offset;
-
-    // Check shared UTF-8 cache first
-    const cached = utf8Cache.get(str);
-
-    if (cached) {
-      // Cached UTF-8: copy directly
-      data.set(cached, offset);
-      offset += cached.length;
+    if (entry.utf8) {
+      // Interned or second-occurrence bytes: copy directly
+      data.set(entry.utf8, offset);
+      offset += entry.utf8.length;
     } else {
-      // Not cached: encode directly into buffer (zero intermediate allocation)
+      // Encode directly into the output buffer (zero intermediate allocation)
       const result = encoder.encodeInto(str, data.subarray(offset));
-      offset += result.written!;
+      if (result.read !== str.length) {
+        // The byte count sized `data` exactly, so a short write is a broken invariant (a byte-count bug),
+        // never an input condition: fail loudly instead of truncating this entry and shifting every later one.
+        throw new DictionaryEncodeInvariantError(str, result.read, result.written);
+      }
+      offset += result.written;
     }
   }
   offsets[uniqueCount] = offset;
 
-  // 7. Create Arrow dictionary vector
-  const dictData = arrow.makeData({
-    type: new arrow.Utf8(),
-    offset: 0,
-    length: uniqueCount,
-    nullCount: 0,
-    data: data.subarray(0, offset),
-    valueOffsets: offsets,
-  });
-  const vector = arrow.makeVector(dictData);
-
-  return { vector, indexMap, indexType };
+  return new FinalizedDictionary(data, offsets, indexMap, indexArrayCtor, arrowIndexType);
 }
 ```
+
+Conversion builds each Arrow dictionary vector once from `data` and `offsets`, and every batch of the table references
+that one vector.
 
 ### Pass 2: Convert Buffers to RecordBatches <a id="smoo/lmao!n/arrow-tree-walker-single-batch"></a>
 
@@ -319,7 +290,8 @@ Walk the tree again, converting each buffer to a RecordBatch using the shared di
 function convertBufferToRecordBatch(
   buffer: SpanBuffer,
   schema: arrow.Schema,
-  dictionaries: Map<string, FinalizedDictionary>
+  dictionaries: Map<string, FinalizedDictionary>,
+  dictionaryVectors: Map<string, arrow.Vector<arrow.Utf8>> // built once per column from data + offsets
 ): arrow.RecordBatch {
   const length = buffer._writeIndex;
   const vectors: arrow.Vector[] = [];
@@ -342,7 +314,7 @@ function convertBufferToRecordBatch(
     } else if (isStringColumn(buffer, columnName)) {
       // String column: lookup indices in dictionary
       const dict = dictionaries.get(columnName)!;
-      const indices = new (getIndexArrayType(dict.indexType))(length);
+      const indices = new dict.indexArrayCtor(length);
 
       for (let i = 0; i < length; i++) {
         const value = getStringValue(buffer, columnName, i);
@@ -352,13 +324,13 @@ function convertBufferToRecordBatch(
       }
 
       const data = arrow.makeData({
-        type: new arrow.Dictionary(new arrow.Utf8(), dict.indexType),
+        type: new arrow.Dictionary(new arrow.Utf8(), dict.arrowIndexType),
         offset: 0,
         length,
         nullCount: getNullCount(buffer, columnName),
         data: indices,
         nullBitmap: getNullBitmap(buffer, columnName),
-        dictionary: dict.vector, // SAME vector for all batches!
+        dictionary: dictionaryVectors.get(columnName), // SAME vector for all batches!
       });
       vectors.push(arrow.makeVector(data));
     }
@@ -369,134 +341,85 @@ function convertBufferToRecordBatch(
     type: new arrow.Struct(schema.fields),
     length,
     nullCount: 0,
-    _children: vectors.map((v) => v.data[0]),
+    children: vectors.map((v) => v.data[0]),
   });
 
   return new arrow.RecordBatch(schema, structData);
 }
 ```
 
-### Tree Walking: Simple Recursive Function <a id="smoo/lmao!n/arrow-tree-walker-walk"></a>
+### Tree Walking: Allocation-Free Preorder <a id="smoo/lmao!n/arrow-tree-walker-walk"></a>
 
-The tree walking is a simple recursive function - no intermediate buffer collection:
+The walk iterates the trace's topology (`firstChild`/`nextSibling` node arrays) without recursion and without collecting
+buffers. Each visit passes the logical span's `RemapDescriptor`, which is `undefined` for a span that is not remapped:
 
 ```typescript
-/**
- * Walk span tree depth-first, calling visitor for each buffer.
- * Handles overflow chains (buffer._next) automatically.
- *
- * Note: Children may be RemappedBufferViews (for library integration).
- * RemappedBufferView implements the same interface as SpanBuffer for
- * read-only traversal - see 01e_library_integration_pattern.md.
- */
-function walkSpanTree(root: SpanBuffer, visitor: (buffer: SpanBuffer) => void): void {
-  // Visit this buffer (or RemappedBufferView)
-  visitor(root);
+type SpanTreeVisitor = (buffer: AnySpanBuffer, remapDescriptor: RemapDescriptor | undefined) => void;
 
-  // Visit overflow chain (same span_id, linked via ._next)
-  let overflow = root._next as SpanBuffer | undefined;
-  while (overflow) {
-    visitor(overflow);
-    overflow = overflow._next as SpanBuffer | undefined;
-  }
+/** Allocation-free iterative preorder: logical node overflow chain, then children in insertion order. */
+function walkSpanTree(root: AnySpanBuffer, visitor: SpanTreeVisitor): void {
+  const topology = root._traceRoot._topology;
+  topology.assertLive(root);
+  const subtreeRoot = root._nodeIndex;
+  let nodeIndex = subtreeRoot;
 
-  // Recursively visit _children (depth-first)
-  // Children may be SpanBuffer or RemappedBufferView
-  for (const child of root._children) {
-    walkSpanTree(child, visitor);
-  }
-}
+  for (;;) {
+    // Visit the logical span, then its overflow chain (same span_id, linked via _overflow)
+    const logical = topology.buffers[nodeIndex];
+    if (!logical) throw new Error('Trace topology references a released span buffer');
+    let segment: AnySpanBuffer | undefined = logical;
+    while (segment) {
+      visitor(segment, logical._remapDescriptor);
+      segment = segment._overflow;
+    }
 
-/**
- * Convert multiple span trees to a single Arrow RecordBatch using two-pass approach.
- *
- * **Schema Requirement**: All root buffers must share the same schema. The application composes
- * all library schemas into a single ModuleContext at startup, so all buffers created from that
- * module share the same logSchema schema. This requirement is enforced at runtime.
- *
- * **Why Single RecordBatch**: Converting multiple root buffers (e.g., multiple HTTP requests)
- * into a single RecordBatch maximizes dictionary reuse - all buffers share the same dictionary
- * vectors, reducing memory and improving query performance.
- *
- * @param rootBuffers - Array of root SpanBuffers (one per request/trace tree)
- * @param schema - Arrow schema for the output table (from first root buffer's module)
- * @param utf8Cache - Shared UTF-8 cache (can be reused across conversions)
- */
-function convertSpanTreeToArrowTable(
-  rootBuffers: SpanBuffer[],
-  schema: arrow.Schema,
-  utf8Cache: Utf8Cache
-): arrow.Table {
-  if (rootBuffers.length === 0) {
-    return new arrow.Table();
-  }
-
-  // Schema requirement: All buffers must share the same schema
-  // This is enforced because the application composes all library schemas into one ModuleContext
-  const expectedSchema = rootBuffers[0].op.module.logSchema;
-  for (let i = 1; i < rootBuffers.length; i++) {
-    if (rootBuffers[i].op.module.logSchema !== expectedSchema) {
-      throw new Error(
-        `Schema mismatch: All buffers in a flush must share the same schema. ` +
-          `Buffer 0 has schema from module ${rootBuffers[0].op.module.packageName}, ` +
-          `but buffer ${i} has schema from module ${rootBuffers[i].op.module.packageName}`
-      );
+    // Descend to the first child, else climb to the next sibling of the nearest ancestor
+    const child = topology.firstChild[nodeIndex];
+    if (child !== NO_NODE) {
+      nodeIndex = child;
+      continue;
+    }
+    for (;;) {
+      if (nodeIndex === subtreeRoot) return;
+      const sibling = topology.nextSibling[nodeIndex];
+      if (sibling !== NO_NODE) {
+        nodeIndex = sibling;
+        break;
+      }
+      const current = topology.buffers[nodeIndex];
+      if (!current?._parent) throw new Error('Trace topology parent link is missing');
+      nodeIndex = current._parent._nodeIndex;
     }
   }
-
-  // Collect dictionaries per string column
-  const columnDicts = new Map<string, ColumnDictionary>();
-  let totalRows = 0;
-
-  // Pass 1: Build dictionaries from ALL root buffers (uses shared utf8Cache)
-  for (const rootBuffer of rootBuffers) {
-    walkSpanTree(rootBuffer, (buffer) => {
-      totalRows += buffer._writeIndex;
-
-      for (const field of schema.fields) {
-        if (isStringColumn(buffer, field.name)) {
-          let dict = columnDicts.get(field.name);
-          if (!dict) {
-            dict = new ColumnDictionary(utf8Cache); // Shared cache!
-            columnDicts.set(field.name, dict);
-          }
-
-          // Add all string values from this buffer
-          for (let i = 0; i < buffer._writeIndex; i++) {
-            const value = getStringValue(buffer, field.name, i);
-            if (value !== null) {
-              dict.add(value);
-            }
-          }
-        }
-      }
-    });
-  }
-
-  // Finalize dictionaries (uses same shared utf8Cache)
-  const finalDicts = new Map<string, FinalizedDictionary>();
-  for (const [name, dict] of columnDicts) {
-    finalDicts.set(name, finalizeDictionary(dict, utf8Cache));
-  }
-
-  // Pass 2: Collect all buffers from ALL root trees, convert to single RecordBatch
-  const allBuffers: SpanBuffer[] = [];
-  for (const rootBuffer of rootBuffers) {
-    walkSpanTree(rootBuffer, (buffer) => {
-      if (buffer._writeIndex > 0) {
-        allBuffers.push(buffer);
-      }
-    });
-  }
-
-  // Convert all buffers to a single RecordBatch with shared dictionaries
-  // This maximizes dictionary reuse across all requests/traces in the flush
-  const recordBatch = convertBuffersToRecordBatch(allBuffers, schema, finalDicts);
-
-  // Create Table from single RecordBatch
-  return new arrow.Table([recordBatch]);
 }
 ```
+
+### Tree Conversion Entry Point <a id="smoo/lmao!n/arrow-tree-walker-two-pass.entry"></a>
+
+One call converts one trace tree into one table:
+
+```typescript
+function convertSpanTreeToArrowTable(
+  rootBuffer: AnySpanBuffer,
+  modulesToLogStats?: CapacityStatsEntry[],
+  periodStartNs?: bigint,
+  borrowChunks = false
+): Table;
+```
+
+1. **Pass 0: merge schema fields.** Child spans may carry library schemas, so the walk collects every schema field in
+   the tree, first occurrence wins. A remapped span contributes its descriptor's output columns.
+2. **Pass 1: build dictionaries.** One `DictionaryBuilder(globalUtf8Cache)` per category column, per text column, and
+   one for the trace id.
+3. **Finalize.** Category dictionaries finalize sorted; text and trace id dictionaries finalize unsorted.
+4. **Pass 2: convert.** Every buffer with rows becomes part of one table that shares the finalized dictionaries.
+5. **Capacity stats.** When `modulesToLogStats` is non-empty, the capacity-stats rows for the period starting at
+   `periodStartNs` (supplied by the flush scheduler) are appended to the same table.
+
+`borrowChunks` lets JS-heap buffers lend their physical chunks to the table instead of copying them. Only
+`convertSpanTreeToLeasedArrowTable(rootBuffer, modulesToLogStats?, periodStartNs?)` sets it, because only an
+`ArrowLease` keeps the lent chunks alive; it returns the lease rather than a bare table. A thread-lane view converts
+through its native row-store provider instead of the JS walk.
 
 ## Why This Approach? <a id="smoo/lmao!n/arrow-tree-walker.rationale"></a>
 
@@ -504,8 +427,8 @@ function convertSpanTreeToArrowTable(
 
 **Problem**: Collecting all buffers into an array before processing wastes memory and adds allocation overhead.
 
-**Solution**: Walk the tree twice with a simple recursive function. The function is the same for both passes - just the
-visitor callback changes.
+**Solution**: Walk the tree once per pass with the same allocation-free walk. Only the visitor callback changes between
+passes.
 
 **Benefit**: Zero intermediate array allocation. Only the data structures we actually need (dictionaries,
 RecordBatches).
@@ -528,17 +451,18 @@ RecordBatches).
 
 **Solution**:
 
-- **Shared `Utf8Cache`**: Passed as argument, can persist across multiple conversions
+- **Shared `Utf8Cache`**: `globalUtf8Cache`, bounded by SIEVE eviction, persists across conversions
+- Interned strings (enum values, module names): reuse their pre-encoded bytes
 - First occurrence: compute byte length only (no allocation)
-- Second occurrence: cache the UTF-8 encoding in shared cache
-- Finalization: use cached encoding if available, else `encodeInto()` directly into final buffer
+- Second occurrence: encode once through the shared cache and keep the bytes on the dictionary entry
+- Finalization: copy kept bytes if present, else `encodeInto()` directly into the final buffer
 
 **Benefit**:
 
 - Strings that appear once: zero intermediate allocation (encodeInto directly)
 - Strings that appear multiple times: one encode, reused for copy
 - Most strings in logging are repeated (module names, span names, etc.)
-- Cache persists across conversions: module/span names encoded once across entire application lifetime
+- Cache persists across conversions: frequent strings stay encoded for as long as the SIEVE cache keeps them
 
 ### 4. V8's Native Sort Beats Manual Insertion <a id="smoo/lmao!n/arrow-tree-walker-sort"></a>
 
@@ -625,152 +549,89 @@ Traversal with overflow:
 
 This ensures all entries for a span are contiguous in the Arrow table.
 
-### Library Integration: RemappedBufferView <a id="smoo/lmao!n/arrow-tree-walker.remapped-view"></a>
+### Library Integration: RemapDescriptor <a id="smoo/lmao!n/arrow-tree-walker.remapped-view"></a>
 
-When libraries use prefixed schemas (see [Library Integration Pattern](./01e_library_integration_pattern.md)), the tree
-may contain **RemappedBufferView** objects instead of raw SpanBuffers:
+When libraries use prefixed schemas (see [Library Integration Pattern](./01e_library_integration_pattern.md)), every
+span buffer in the tree is still a canonical SpanBuffer with its own library schema and storage layout. A prefixed or
+mapped span carries an immutable `RemapDescriptor` (`packages/lmao/src/lib/logBinding.ts`) that only cold Arrow
+conversion reads:
+
+```typescript
+/** Dense cold-path remap entry with schema and canonical storage property metadata. */
+type RemappedColumn = readonly [
+  outputName: string, // 'http_status'
+  sourceName: string, // 'status'
+  schema: unknown,
+  valuesProperty: `${string}_values`, // 'status_values'
+  nullsProperty: `${string}_nulls`, // 'status_nulls'
+];
+
+interface RemapDescriptor {
+  /** Fully composed output-name to canonical source-name lookup. */
+  readonly sourceNames: Readonly<Record<string, string>>;
+  /** Dense output/source/schema entries in deterministic composition order. */
+  readonly columns: readonly RemappedColumn[];
+}
+```
 
 ```
 Application Root Buffer (schema: { userId, http_status, http_method })
 │
-└── _children[0]: RemappedBufferView  ← NOT a raw SpanBuffer
-        │
-        │   Maps prefixed → unprefixed:
-        │   - http_status → status
-        │   - http_method → method
-        │
-        └── wraps: HTTP Library Buffer (schema: { status, method })
+└── child: HTTP Library Buffer (schema: { status, method })
+        _remapDescriptor.sourceNames:
+          http_status → status
+          http_method → method
 ```
 
-**Why RemappedBufferView exists**:
+**Why a descriptor and no wrapper**:
 
-1. **Library code** is compiled with unprefixed column names (`status_values`)
+1. **Library code** is compiled with unprefixed column names (`status_values`) and writes its own buffer directly
 2. **Application schema** has prefixed columns (`http_status`)
-3. **Arrow conversion** iterates using application schema field names
-4. **RemappedBufferView** bridges the gap by mapping prefixed → unprefixed in `getColumnIfAllocated()`
+3. **Arrow conversion** emits application field names, so it must find each output column's source storage
+4. **RemapDescriptor** supplies that mapping as data. No buffer is wrapped, so the hot path never sees a second object
+   shape, and the tree holds only canonical buffers.
 
-**Tree walker doesn't need to distinguish** - RemappedBufferView implements the same read-only interface:
+The walker passes each span's descriptor to the visitor (see Tree Walking). Pass 0 takes a remapped span's output
+columns from `columns`; column reads resolve an output name through `sourceNames` and read the canonical
+`valuesProperty`/`nullsProperty` of the child buffer. An output name the descriptor does not map is null on a remapped
+span's rows; it never falls back to a same-named source column. A span without a descriptor is read by its own field
+names. `createRemapDescriptor(sourceSchema, outputToSourceMapping)` (`packages/lmao/src/lib/library.ts`) builds the
+descriptor once from the fully composed `.prefix()`/`.mapColumns()` mapping, so nested library composition yields one
+descriptor per span, not a chain of views.
 
-```typescript
-// Both SpanBuffer and RemappedBufferView support:
-interface TreeTraversable {
-  _children: TreeTraversable[];
-  _next: TreeTraversable | undefined;
-  _writeIndex: number;
-  timestamps: BigInt64Array;
-  operations: Uint8Array;
-  trace_id: TraceId;
-  thread_id: bigint;
-  span_id: number;
-  parentSpanId: number;
-  op: SpanContext;
-  getColumnIfAllocated(name: string): ColumnValueType | undefined;
-  getNullsIfAllocated(name: string): Uint8Array | undefined;
-}
-```
+### Buffer Registration <a id="smoo/lmao!n/arrow-tree-walker.op-registration"></a>
 
-**Column access through RemappedBufferView**:
+SpanBuffer constructors do **not** register themselves. The buffer strategy's `createChildSpanBuffer` registers each
+child in the trace topology (`topology.registerChild(parent, child)`), and the span setup then attaches the callsite
+plan's descriptor to the raw child:
 
 ```typescript
-// Arrow conversion iterates with prefixed names from root schema
-for (const [fieldName, _] of schemaFields) {
-  // fieldName = 'http_status'
-  const col = buffer.getColumnIfAllocated(fieldName);
-
-  // If buffer is RemappedBufferView:
-  // 1. Maps 'http_status' → 'status'
-  // 2. Calls ownBuffer.getColumnIfAllocated('status')
-  // 3. Returns the actual TypedArray
-
-  // If buffer is regular SpanBuffer (no http library columns):
-  // Returns undefined (column not allocated)
-}
+// Child span setup (spanContext.ts, simplified)
+const childBuffer = bufferStrategy.createChildSpanBuffer(parentBuffer, ...); // registers in the topology
+childBuffer._remapDescriptor = callsitePlan.remapDescriptor ?? undefined;
 ```
 
-**Nested library calls** work naturally - each library registers its own RemappedBufferView:
+The callsite plan owns the descriptor because it already knows the Op's schema and its composed prefix mapping, and the
+descriptor is resolved once per plan, never per span.
 
-```
-App Root → RemappedBufferView(HTTP) → RemappedBufferView(Auth) → Auth Buffer
-           http_status → status       auth_token → token
-```
+## One Trace Tree → One Table <a id="smoo/lmao!n/arrow-tree-walker-single-batch.multi-root"></a>
 
-### Op's Responsibility: Buffer Registration <a id="smoo/lmao!n/arrow-tree-walker.op-registration"></a>
+`convertSpanTreeToArrowTable` converts one root buffer's tree into one table whose dictionaries all buffers of that tree
+share. The flush scheduler converts each finished trace with its own `convertSpanTreeToLeasedArrowTable` call,
+concatenates the resulting tables, and releases the leases once the flush has consumed them. A trace whose conversion
+fails is reported and left out; the other traces of the flush still convert.
 
-SpanBuffer constructors do **not** auto-register with parent's `_children[]` array. The **Op's wrapper** handles
-registration explicitly:
+### Schema Merge <a id="smoo/lmao!n/arrow-tree-walker-single-batch.schema-req"></a>
 
-```typescript
-// Inside op's wrapper (conceptual):
-async invoke(parentCtx, spanName, line, ...args) {
-  // Op creates its own SpanBuffer with unprefixed schema
-  const ownBuffer = createSpanBuffer(unprefixedSchema, callsite, trace_id);
+Buffers in one tree need not share a schema. Library spans keep their canonical library schema, so Pass 0 merges the
+schema fields of every buffer in the tree, taking a remapped span's output columns from its `RemapDescriptor`. A field
+name seen twice keeps its first schema.
 
-  // Op registers with parent - wrap with RemappedBufferView if prefixed
-  if (prefix && parentCtx?.buffer) {
-    const remappedView = new RemappedViewClass(ownBuffer);
-    parentCtx.buffer._children.push(remappedView); // Register the view, not raw buffer
-  } else if (parentCtx?.buffer) {
-    parentCtx.buffer._children.push(ownBuffer);
-  }
+### Benefits of One Table per Tree <a id="smoo/lmao!n/arrow-tree-walker-single-batch.benefits"></a>
 
-  // ... execute user function
-}
-```
-
-**Why op owns registration (not span())?**
-
-1. **Schema knowledge**: Op knows its module's schema and prefix mapping
-2. **RemappedBufferView creation**: Op creates the view if prefixed
-3. **Testing flexibility**: Ops can be tested without polluting parent's children
-4. **Clear control flow**: No hidden side effects - registration happens in op wrapper
-
-**Where registration happens**:
-
-| Location              | Description                        |
-| --------------------- | ---------------------------------- |
-| Op's internal wrapper | Primary registration point         |
-| `span()` inline child | Delegates to op wrapper            |
-| Library `.use()` impl | Op wrapper with RemappedBufferView |
-
-## Multiple Root Buffers → Single RecordBatch <a id="smoo/lmao!n/arrow-tree-walker-single-batch.multi-root"></a>
-
-**Key Design Decision**: Multiple root buffers (e.g., multiple HTTP requests) are converted into a **single
-RecordBatch** rather than multiple RecordBatches. This maximizes dictionary reuse - all buffers share the same
-dictionary vectors.
-
-### Schema Requirement <a id="smoo/lmao!n/arrow-tree-walker-single-batch.schema-req"></a>
-
-**All buffers in a flush must share the same schema.** This is enforced because:
-
-1. **Application Composition**: The application declares dependencies on libraries and wires them with prefixes:
-
-   ```typescript
-   // Define module with dependencies (see 01l_op_context_pattern.md)
-   const appModule = defineModule({
-     metadata: { ... },
-     schema: appSchema,
-     deps: { http: httpModule, db: dbModule },
-   });
-
-   // Wire dependencies with prefixes at use time
-   const appRoot = appModule.use({
-     http: httpModule.prefix('http').use(),
-     db: dbModule.prefix('db').use(),
-   });
-   ```
-
-2. **Per-Module Schema**: Each module has one unified schema. All buffers created from that module share the same
-   schema. Library buffers use RemappedBufferView to map prefixed names to unprefixed columns.
-
-3. **Runtime Enforcement**: The conversion function validates that all root buffers share the same schema, throwing an
-   error if they differ.
-
-### Benefits of Single RecordBatch <a id="smoo/lmao!n/arrow-tree-walker-single-batch.benefits"></a>
-
-- **Maximum Dictionary Reuse**: All buffers share the same dictionary vectors, reducing memory
-- **Better Query Performance**: Query engines can optimize dictionary lookups across all data
-- **Simpler Implementation**: No need to union schemas or handle missing columns
-- **Efficient Flushing**: One RecordBatch per flush cycle, matching the flush scheduler's design
+- **Dictionary reuse within the trace**: All buffers of the tree share the same dictionary vectors
+- **Per-trace failure isolation**: One trace's conversion error never discards another trace's rows
+- **No cross-trace schema check**: A flush never needs every trace to come from one schema
 
 ### Single Buffer Conversion <a id="smoo/lmao!n/arrow-tree-walker-single-batch.single-buffer"></a>
 
@@ -819,9 +680,10 @@ already emits an open span's start row without its completion.
 
 | Responsibility              | Package       | Why                                                    |
 | --------------------------- | ------------- | ------------------------------------------------------ |
-| Tree walking                | lmao          | Knows about SpanBuffer.\_children, SpanBuffer.\_next   |
-| ColumnDictionary            | lmao          | Knows about category/text types from schema            |
-| Dictionary finalization     | lmao          | Builds Arrow Dictionary vectors with lmao's schema     |
+| Tree walking                | lmao          | Knows about the trace topology and overflow chains     |
+| DictionaryBuilder           | arrow-builder | Generic: unique strings, interner reuse, UTF-8 sizing  |
+| Dictionary finalization     | arrow-builder | `DictionaryBuilder.finalize`: exact-size data, offsets |
+| Utf8Cache                   | lmao          | Bounded encoding cache passed as the `Utf8Encoder`     |
 | Single buffer → RecordBatch | lmao          | Uses lmao's interners, schema, system columns          |
 | TypedArray utilities        | arrow-builder | Generic: concatenation, alignment, null bitmaps        |
 | ColumnBuffer interface      | arrow-builder | Generic buffer type with writeIndex                    |
@@ -834,11 +696,12 @@ already emits an open span's start row without its completion.
 - Generic TypedArray utilities
 - ColumnBuffer interface
 - Null bitmap helpers
+- `DictionaryBuilder`, `FinalizedDictionary`, `Utf8Encoder`, and `utf8ByteLength`
 
-**lmao owns tree walking and dictionary building**:
+**lmao owns tree walking and conversion orchestration**:
 
 - `walkSpanTree()` function
-- `ColumnDictionary` class
+- `Utf8Cache` and `globalUtf8Cache`
 - `convertSpanTreeToArrowTable()` orchestration
 
 ## Performance Characteristics <a id="smoo/lmao!n/arrow-tree-walker.perf"></a>
@@ -847,7 +710,7 @@ already emits an open span's start row without its completion.
 
 | Phase               | Allocations                                  | Size                            |
 | ------------------- | -------------------------------------------- | ------------------------------- |
-| Pass 1 tree walk    | ColumnDictionary maps only                   | O(unique strings)               |
+| Pass 1 tree walk    | DictionaryBuilder maps only                  | O(unique strings)               |
 | Dictionary finalize | sorted array, data buffer, offsets, indexMap | Exact size (no over-allocation) |
 | Pass 2 tree walk    | RecordBatch per buffer                       | O(buffers)                      |
 | Final Table         | One Table wrapping batches                   | Minimal overhead                |

@@ -61,12 +61,10 @@ Span completion entry types (all written to row 1):
 6. **Events append from row 2**: `ctx.log.*` creates new rows starting at index 2
 7. **writeIndex starts at 2**: After span initialization, ready for event appends
 
-**Implementation status**: The row-0/row-1/writeIndex=2 contract is realized by `ITraceRoot.writeSpanStart` /
-`writeSpanEnd` (declared in `packages/lmao/src/lib/traceRoot.ts`; implemented in `traceRoot.node.ts` and
-`traceRoot.es.ts`). Those spans are fenced under the high-precision-timestamp node `smoo/lmao!n/trace-root-timestamps`
-([01b3](./01b3_high_precision_timestamps.md)); this heading shares that realization rather than re-fencing it. The
-pre-init of row 1 to `span-exception` and its overwrite to `span-ok`/`span-err` live in `spanContext.ts` (fenced
-`smoo/lmao!n/lmao-entry-span-lifecycle-entry-types`).
+The row-0/row-1/writeIndex=2 contract is written by the `ITraceRoot` primitives `_writeSpanStart` and `_writeSpanEnd`
+(declared in `packages/lmao/src/lib/traceRoot.ts`; implemented in `traceRoot.node.ts` and `traceRoot.es.ts`; see
+[01b3](./01b3_high_precision_timestamps.md)). Row 1 is pre-initialized to `span-exception` in `traceRoot.node.ts:98-101`
+and overwritten on completion by `_writeSpanEnd`; `spanContext.ts` holds the `writeSpanEnd` entry point.
 
 ### ctx.tag Semantics (Datadog/Jaeger Pattern) <a id="smoo/lmao!n/buffer-arch-ctx-tag-semantics"></a>
 
@@ -184,10 +182,10 @@ for the full interface definition including:
 
 - Core columns (`timestamp`, `entry_type`)
 - Attribute columns with lazy getters (`X_nulls`, `X_values`)
-- Tree structure (children, parent)
-- Dual module references (`callsiteModule`, `module`)
+- Tree structure (`_parent`, and the `_nodeIndex` handle into the trace's `TraceTopology`)
+- Dual metadata references (`_callsiteMetadata`, `_opMetadata`)
 - Span identification (`thread_id`, `span_id`, `trace_id`)
-- `ModuleContext` interface with self-tuning stats
+- `OpMetadata` interface (per-op source attribution) and the class-level `SpanBufferStats`
 
 **Key Architectural Point**: Column properties are **direct properties** on SpanBuffer via lazy getters (no nested
 `columns: Record<...>`). This provides zero indirection for hot path access.

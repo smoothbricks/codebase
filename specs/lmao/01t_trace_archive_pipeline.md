@@ -12,11 +12,11 @@ routing-destination derivation, and control-plane policy.
 
 ### LMAO Owns (This Spec) <a id="smoo/lmao!n/trace-archive-ownership.lmao-owns"></a>
 
-- Trace chunk envelope construction from Arrow tables
+- Trace chunk envelope construction for persisted chunks
 - Deterministic chunk identity helpers (`chunk_id`, schema hash, lineage hash)
 - Generic partition-cardinality inspection and split helpers for tabular batches
 - Compaction primitives for time-windowed Arrow/Parquet outputs
-- Chunk statistics extraction helpers for downstream predicate pre-filtering
+- Chunk-level statistics rollups for downstream predicate pre-filtering
 
 ### The Consuming System Owns (Out of Scope Here) <a id="smoo/lmao!n/trace-archive-ownership.consumer-owns"></a>
 
@@ -30,96 +30,88 @@ LMAO primitives in this spec do not parse, compile, or evaluate consumer predica
 ## Primitive 1: Chunk Envelope Construction <a id="smoo/lmao!n/trace-archive-envelope"></a>
 
 ```typescript
-type TraceChunkEnvelope = {
-  chunk_id: string; // deterministic idempotency identity
-  emitted_at: string; // ISO timestamp
-  format: 'arrow';
-  codec: 'none' | 'gzip' | 'zstd';
-  payload_bytes: Uint8Array; // Arrow IPC bytes
-  metadata: {
-    row_count: number;
-    first_ts?: string;
-    last_ts?: string;
-    schema_hash: string;
-    group_hints?: string[];
-  };
+type TraceChunkEnvelopeInput = {
+  file_ref: string; // the object that holds the chunk's bytes
+  chunk_ref: string; // the chunk within that object
+  row_count: number;
+  started_at_ms: number;
+  ended_at_ms: number;
+  partition_keys?: readonly string[];
+  metadata?: Record<string, unknown>;
 };
 
-interface TraceChunkBuilder {
-  fromArrowTable(input: {
-    table: unknown;
-    emittedAt: Date;
-    codec?: 'none' | 'gzip' | 'zstd';
-    idSeed?: string;
-  }): TraceChunkEnvelope;
-}
+type TraceChunkEnvelope = {
+  chunk_id: string; // deterministic idempotency identity
+  file_ref: string;
+  chunk_ref: string;
+  row_count: number;
+  started_at_ms: number;
+  ended_at_ms: number;
+  partition_keys: readonly string[]; // sorted
+  metadata?: Record<string, unknown>;
+};
+
+function buildTraceChunkEnvelope(input: TraceChunkEnvelopeInput): TraceChunkEnvelope;
 ```
 
-`chunk_id` must be deterministic from envelope content identity (not random per retry).
+The envelope describes a chunk by reference: the chunk's bytes live in the object that `file_ref` names, at `chunk_ref`
+within it, and the envelope carries no payload.
 
-> **Implementation status (shipped, leaner contract).** `packages/lmao/src/lib/archive/chunkEnvelope.ts` ships
-> `buildTraceChunkEnvelope(input)` — the deterministic `chunk_id` (FNV-1a over a stable-serialized canonical body) is
-> implemented as specified. The shipped envelope addresses an already-flushed chunk **by reference** (`file_ref` +
-> `chunk_ref`) rather than carrying inline `payload_bytes` / `codec` / `format`, and its time bounds are numeric
-> `started_at_ms` / `ended_at_ms` (not ISO `emitted_at` / `first_ts`). The inline-Arrow-payload envelope
-> (`payload_bytes` Arrow IPC, `codec`, `schema_hash`, `group_hints`) below is the future shape — staged as a `smoo/lmao`
-> node, not yet built.
+`chunk_id` must be deterministic from envelope content identity (not random per retry), computed as FNV-1a over a
+stable-serialized canonical body of the input fields, with `partition_keys` sorted. The caller derives `file_ref` or
+`chunk_ref` from the chunk's content, so a retry of the same content yields the same `chunk_id`.
 
 ## Primitive 2: Partition Shape Inspection <a id="smoo/lmao!n/trace-archive-partition-inspect"></a>
 
 ```typescript
-type PartitionCardinality =
-  | { kind: 'single'; partition: Record<string, string | number | bigint | null> }
-  | { kind: 'mixed'; partition_count: number }
-  | { kind: 'unknown'; reason: string };
+type PartitionCardinality = 'single' | 'mixed' | 'unknown';
 
-interface ChunkPartitionInspector {
-  inspectPartitionCardinality(input: {
-    chunk: TraceChunkEnvelope;
-    partitionColumns: readonly string[];
-  }): PartitionCardinality;
-}
+function inspectPartitionCardinality<T>(
+  rows: readonly T[],
+  partitionOf: (row: T) => string | null | undefined
+): PartitionCardinality;
 ```
 
 This primitive does not derive routing groups or delivery destinations for the consuming system. It only reports whether
-rows are single-partition, mixed-partition, or unresolvable from provided columns.
+rows are single-partition, mixed-partition, or unresolvable through `partitionOf`. The caller decodes the rows from the
+object that the chunk's `file_ref` names.
 
-> **Implementation status (shipped).** `packages/lmao/src/lib/archive/chunkRouting.ts:inspectPartitionCardinality`
-> reports `'single' | 'mixed' | 'unknown'` over rows + a `partitionOf` accessor, exactly as specified (an empty/missing
-> partition value yields `'unknown'`). It derives no routing destinations.
+No rows, or an empty or missing partition value, yields `unknown`. The scan stops at the second distinct partition.
 
 ## Primitive 3: Partition Split Helper <a id="smoo/lmao!n/trace-archive-partition-split"></a>
 
 ```typescript
-type PartitionSlice = {
-  partition: Record<string, string | number | bigint | null>;
-  selector: {
-    row_count: number;
-    row_bitmap?: Uint8Array; // optional compact row selector
-  };
-  chunk_ref: {
-    chunk_id: string;
-    uri?: string;
-  };
+type PartitionSplit<T> = {
+  partition: string;
+  selector: string; // `${partitionField} == ${JSON.stringify(partition)}`
+  row_indexes: readonly number[]; // ascending indexes into the input rows
+  rows: readonly T[];
 };
 
-interface ChunkPartitioner {
-  splitByPartition(input: { chunk: TraceChunkEnvelope; partitionColumns: readonly string[] }): PartitionSlice[];
-}
+function splitChunkByPartition<T>(
+  rows: readonly T[],
+  partitionOf: (row: T) => string | null | undefined,
+  partitionField?: string // default 'group'
+): readonly PartitionSplit<T>[];
 ```
 
-Split output must be deterministic for the same input chunk and partition-column configuration.
+Split output must be deterministic for the same input rows and partition function.
 
-> **Implementation status (shipped, leaner contract).**
-> `packages/lmao/src/lib/archive/chunkRouting.ts:splitChunkByPartition` splits rows deterministically (sorted partition
-> keys) and emits, per partition, the row indexes, the materialized rows, and a stable string `selector`
-> (`group == "value"`). It returns the rows directly rather than a `row_bitmap` + `chunk_ref` indirection; the
-> compact-bitmap selector below is a future optimization, not yet built.
+Partitions are emitted in sorted partition-key order. A row with an empty or missing partition value is in no split.
+
+The split takes rows, not an envelope, so a split carries no parent identity: the caller records the parent envelope's
+`chunk_id` in each split chunk's lineage, and a split chunk's identity derives from `(parent chunk_id, partition)`
+([01u §Metering Boundary](./01u_cloudflare_trace_segments.md#smoo/lmao!n/cf-trace-segments-billing-boundary)).
 
 ## Primitive 4: Compaction <a id="smoo/lmao!n/trace-archive-compaction"></a>
 
 ```typescript
 type CompactionTargetFormat = 'arrow' | 'parquet';
+
+type CompactionWindow = {
+  started_at_ms: number;
+  ended_at_ms: number;
+};
 
 type CompactionOutput = {
   output_chunk_id: string;
@@ -128,7 +120,7 @@ type CompactionOutput = {
   lineage: {
     source_chunk_ids: string[];
     source_set_hash: string;
-    window: string; // e.g. '5m', '1h'
+    window: CompactionWindow;
   };
   metadata: {
     row_count: number;
@@ -140,58 +132,51 @@ type CompactionOutput = {
 
 interface TraceChunkCompactor {
   compact(input: {
-    chunks: TraceChunkEnvelope[];
-    window: string;
+    sources: readonly { envelope: TraceChunkEnvelope; payload_bytes: Uint8Array }[];
+    window: CompactionWindow;
     targetFormat: CompactionTargetFormat;
   }): CompactionOutput;
 }
 ```
 
-Compaction must be append-only: source chunks remain immutable, output emits new chunk identity + lineage.
+Each source pairs an envelope with the Arrow IPC bytes the caller read from the object that its `file_ref` names.
 
-> **Implementation status (shipped, identity-only).**
-> `packages/lmao/src/lib/archive/chunkCompaction.ts:compactTraceChunks` ships the append-only **identity + lineage**
-> half: a deterministic `compaction_id` and `source_set_hash` stable by `(window, sorted source_chunk_ids)`, plus
-> `total_rows`. It does **not** yet read source payloads, re-encode to Arrow/Parquet, or emit `payload_bytes` — i.e. it
-> computes the compaction manifest, not the compacted bytes. The payload-producing compaction (`targetFormat` →
-> `payload_bytes`) below is staged as a `smoo/lmao` node, not yet built.
+Compaction must be append-only: source chunks remain immutable, output emits new chunk identity + lineage.
 
 ## Primitive 5: Chunk Stats Extraction <a id="smoo/lmao!n/trace-archive-stats"></a>
 
 ```typescript
-type ChunkColumnStat = {
-  column: string;
-  null_count: number;
-  min?: string | number | bigint;
-  max?: string | number | bigint;
+type TraceChunkStats = {
+  chunk_id: string;
+  row_count: number;
+  partition_count: number;
+  started_at_ms: number;
+  ended_at_ms: number;
+  duration_ms: number; // max(0, ended_at_ms - started_at_ms)
 };
 
-interface TraceChunkStats {
-  summarize(input: { chunk: TraceChunkEnvelope; columns: readonly string[] }): ChunkColumnStat[];
-}
+function extractChunkStats<T>(envelope: TraceChunkEnvelope, partitions?: readonly PartitionSplit<T>[]): TraceChunkStats;
 ```
 
-These stats are optional optimization primitives for downstream predicate pre-filtering.
-
-> **Implementation status (shipped, chunk-level).** `packages/lmao/src/lib/archive/chunkStats.ts:extractChunkStats`
-> ships **chunk-level** rollups — `chunk_id`, `row_count`, `partition_count`, time bounds, and `duration_ms`. The
-> **per-column** min/max/null_count stats below (for predicate pre-filtering) are not yet built; they are staged as a
-> `smoo/lmao` node. Both are optional optimization primitives.
+These chunk-level rollups are optional optimization primitives for downstream predicate pre-filtering. `partition_count`
+is the number of splits passed in, and zero for an unsplit chunk. Per-column statistics are not a chunk primitive: the
+compacted segments carry them as column statistics and zone maps
+([01u §Segment Layout](./01u_cloudflare_trace_segments.md#smoo/lmao!n/cf-trace-segments-layout)).
 
 ## Determinism and Retry Invariants <a id="smoo/lmao!n/trace-archive-determinism"></a>
 
 - Same logical input produces same `chunk_id` and partition split output.
 - Retrying ingest/compaction must not require random IDs.
 - Compaction identity is stable by `(window, source_set_hash, targetFormat)`.
-- Split helper never mutates input payload bytes.
+- Split helper never mutates its input rows.
 
 ## Op Integration Pattern <a id="smoo/lmao!n/trace-archive-op-integration"></a>
 
 These primitives are designed to be called from the consuming system's archival jobs. Example call chain:
 
-1. Job receives queue envelope
-2. Job builds chunk via `TraceChunkBuilder`
-3. Job inspects/splits via `ChunkPartitionInspector` + `ChunkPartitioner`
+1. Job receives a queue message (01s `TraceChunkQueueMessage`: one envelope plus its rows)
+2. Job persists the rows as an immutable chunk and builds its envelope via `buildTraceChunkEnvelope`
+3. Job inspects/splits the rows via `inspectPartitionCardinality` + `splitChunkByPartition`
 4. Job compacts via `TraceChunkCompactor` on schedule
 5. The consuming system's archive processor maps partition values to routing destinations using its route configuration
    or predicate expressions, then decides fan-out and cursor behavior

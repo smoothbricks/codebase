@@ -7,21 +7,6 @@ stored as structured log entries in the same Arrow table as trace data.
 
 **Key insight:** Metrics reuse span timestamps, achieving zero extra timing overhead in the hot path.
 
-**Implementation status (audit 2026-06):** Partially implemented.
-
-- **Done** — the metric **entry-type enum** (`period-start`, the eight `op-*`, and the buffer metrics) is defined in
-  `schema/systemSchema.ts` (`n/lmao-entry-metrics-entry-types` / `n/lmao-entry-entry-type-definitions`), and the
-  `uint64_value` lazy column exists in the system schema. The **buffer-side flush** ships as utilization-based capacity
-  logging in `arrow/capacityStats.ts` (`n/buffer-tuning-stats-logging`), writing four rows per module — `period-start`,
-  `buffer-writes`, `buffer-spans`, `buffer-capacity`.
-- **Not built** — the **per-op metric accumulation + flush** (the `Op`-class counters and the `op-invocations` /
-  `op-errors` / `op-exceptions` / `op-duration-*` rows) and the **user-facing fluent `.uint64()`** method. The
-  `ENTRY_TYPE_OP_*` constants exist but nothing writes those rows yet. These are tracked as implementation work
-  (`n/op-metrics-collection`, `n/op-metrics-uint64-api`).
-- **Reconciled** — the buffer-metric set in this spec was superseded by the shipped enum: source uses `buffer-writes` /
-  `buffer-spans` / `buffer-capacity` (utilization tuning), not the original `buffer-overflow-writes` / `buffer-created`
-  / `buffer-overflows`. The tables below are trued up to source.
-
 ## Design Evolution: Why This Design <a id="smoo/lmao!n/op-metrics.design-evolution-why-this-design"></a>
 
 ### Problem: No Runtime Visibility <a id="smoo/lmao!n/op-metrics.problem-no-runtime-visibility"></a>
@@ -169,9 +154,9 @@ GROUP BY timestamp, package_name
 ## Entry Types for Metrics <a id="smoo/lmao!n/lmao-entry-metrics-entry-types.entry-types-for-metrics"></a>
 
 **Total: 12 metric entry types** (codes 13–24 in `schema/systemSchema.ts`): one period marker, eight op metrics, and
-three buffer metrics. The op codes (14–21) and the `period-start` marker (13) are defined but only the buffer side
-(22–24) is written today (see the per-section status notes). The `uint64_value` column is `LazyBigUint64` — allocated
-only when first written, so sparse usage is free.
+three buffer metrics. The period marker (13) and the buffer codes (22–24) are written at each flush by
+`capacityStats.ts`; the op codes (14–21) are written by the per-op flush. The `uint64_value` column is `LazyBigUint64` —
+allocated only when first written, so sparse usage is free.
 
 ### Period Marker (1) <a id="smoo/lmao!n/lmao-entry-metrics-entry-types.period-marker-1"></a>
 
@@ -182,9 +167,6 @@ only when first written, so sparse usage is free.
 The period ends at `timestamp` (the flush time). Duration = `timestamp - uint64_value`.
 
 ### Op Metrics (8) <a id="smoo/lmao!n/lmao-entry-metrics-entry-types.op-metrics-8"></a>
-
-**Status:** entry-type constants defined (`ENTRY_TYPE_OP_INVOCATIONS`..`ENTRY_TYPE_OP_DURATION_MAX`, codes 14–21); the
-rows are **not written yet** — pending `n/op-metrics-collection`.
 
 | Entry Type        | package_file | message | uint64_value                       |
 | ----------------- | ------------ | ------- | ---------------------------------- |
@@ -207,9 +189,8 @@ rows are **not written yet** — pending `n/op-metrics-collection`.
 
 ### Buffer Metrics (3) <a id="smoo/lmao!n/lmao-entry-metrics-entry-types.buffer-metrics-3"></a>
 
-**Status:** implemented and written each flush by `arrow/capacityStats.ts` (`n/buffer-tuning-stats-logging`). The
-shipped set is utilization-based capacity tuning, which superseded the original overflow-oriented set
-(`buffer-overflow-writes` / `buffer-created` / `buffer-overflows`):
+Written at each flush by `arrow/capacityStats.ts` (`n/buffer-tuning-stats-logging`). The set is utilization-based
+capacity tuning:
 
 | Entry Type      | code | message | uint64_value                                       |
 | --------------- | ---- | ------- | -------------------------------------------------- |
@@ -226,34 +207,29 @@ shipped set is utilization-based capacity tuning, which superseded the original 
 
 ## Op Class Metrics Tracking <a id="smoo/lmao!n/op-metrics-collection"></a>
 
-**Status: NOT YET IMPLEMENTED** — `n/op-metrics-collection`. The `Op` class (`lib/op.ts`) currently carries only its
-`fn` / `module` / `name` metadata; the counters below, the in-`invoke` accumulation, and the per-op flush that writes
-`op-invocations` / `op-errors` / `op-exceptions` / `op-duration-*` rows do not exist yet. The block below is the target
-design.
-
 The `Op` class maintains metrics counters that reset on each flush. Type parameters are ordered to match the function
-signature `(ctx, ...args) => Promise<Result>`:
+signature `(ctx, ...args) => Result`:
 
 ```typescript
-class Op<Ctx, Args extends unknown[], Result> {
-  readonly fn: (ctx: Ctx, ...args: Args) => Promise<Result>;
-  readonly module: Module;
-  readonly definitionLine?: number;
+class Op<Ctx extends OpContext, Args extends unknown[], S, E> {
+  readonly metadata: OpMetadata; // name, package_name, package_file, git_sha, line
+  readonly callsitePlan: CallsitePlan<Ctx['logSchema'], Ctx>;
+  readonly fn: (ctx: SpanContext<Ctx>, ...args: Args) => Result<S, E> | Promise<Result<S, E>>;
 
-  // Metrics (reset on flush)
-  private invocationCount: number = 0;
-  private errorCount: number = 0; // span-err outcomes
-  private exceptionCount: number = 0; // span-exception outcomes
+  // Metrics (reset on flush; written by the span envelope)
+  invocationCount: number = 0;
+  errorCount: number = 0; // span-err outcomes
+  exceptionCount: number = 0; // span-exception outcomes
 
   // Duration tracking (BigInt for nanosecond precision)
-  private totalDurationNs: bigint = 0n;
-  private okDurationNs: bigint = 0n;
-  private errDurationNs: bigint = 0n; // span-err + span-exception
-  private minDurationNs: bigint = BigInt(Number.MAX_SAFE_INTEGER);
-  private maxDurationNs: bigint = 0n;
+  totalDurationNs: bigint = 0n;
+  okDurationNs: bigint = 0n;
+  errDurationNs: bigint = 0n; // span-err + span-exception
+  minDurationNs: bigint = BigInt(Number.MAX_SAFE_INTEGER);
+  maxDurationNs: bigint = 0n;
 
   // Period tracking
-  private periodStartNs: bigint = hrtime.bigint();
+  periodStartNs: bigint = hrtime.bigint();
 }
 ```
 
@@ -263,44 +239,46 @@ class Op<Ctx, Args extends unknown[], Result> {
 - 9,007,199,254,740,991 ns = ~104 days
 - Summing many durations compounds quickly
 
-## Collecting Metrics (Inside Op's Invoke) <a id="smoo/lmao!n/op-metrics-collection.collecting-metrics-inside-ops-invoke"></a>
+## Collecting Metrics (In the Span Envelope) <a id="smoo/lmao!n/op-metrics-collection.collecting-metrics-inside-ops-invoke"></a>
 
-**Status:** target design for `n/op-metrics-collection` — there is no `Op.invoke` accumulation today.
+An `Op` holds no span logic: the tracer runs root spans and the SpanContext class runs child spans
+([Module Context](./01j_module_context_and_spanlogger_generation.md#smoo/lmao!n/op-class)). That span envelope updates
+the invoked op's counters around its existing span-start and span-end writes:
 
 ```typescript
-async invoke(parentCtx, spanName, line, ...args) {
-  this.invocationCount++;
+// Span envelope for `op` (root: Tracer; child: SpanContext span methods)
+op.invocationCount++;
 
-  // Buffer creation writes span-start timestamp to row 0
-  const buffer = createSpanBuffer(...);
-  const startTs = buffer.timestamp[0];  // Already captured!
+// Span setup writes the span-start timestamp to row 0
+const buffer = createSpanBuffer(...);
+const startTs = buffer.timestamp[0];  // Already captured!
 
-  try {
-    const result = await this.fn(ctx, ...args);
+try {
+  const result = await op.fn(ctx, ...args);
+  // writeSpanEnd writes the end timestamp to row 1 (span-ok, or span-err with op.errorCount++)
+  writeSpanEnd(buffer, result);
+  const endTs = buffer.timestamp[1];  // Already captured!
+  const durationNs = BigInt(endTs - startTs);
 
-    // span-ok writes end timestamp to row 1
-    const endTs = buffer.timestamp[1];  // Already captured!
-    const durationNs = BigInt(endTs - startTs);
+  op.totalDurationNs += durationNs;
+  op.okDurationNs += durationNs; // errDurationNs for span-err
+  if (durationNs < op.minDurationNs) op.minDurationNs = durationNs;
+  if (durationNs > op.maxDurationNs) op.maxDurationNs = durationNs;
 
-    this.totalDurationNs += durationNs;
-    this.okDurationNs += durationNs;
-    if (durationNs < this.minDurationNs) this.minDurationNs = durationNs;
-    if (durationNs > this.maxDurationNs) this.maxDurationNs = durationNs;
+  return result;
+} catch (e) {
+  op.exceptionCount++;
+  ctx._spanException(buffer, e); // Writes span-exception and the end timestamp to row 1
 
-    return result;
-  } catch (e) {
-    this.exceptionCount++;  // or errorCount for expected errors
+  const endTs = buffer.timestamp[1];
+  const durationNs = BigInt(endTs - startTs);
 
-    const endTs = buffer.timestamp[1];
-    const durationNs = BigInt(endTs - startTs);
+  op.totalDurationNs += durationNs;
+  op.errDurationNs += durationNs;
+  if (durationNs < op.minDurationNs) op.minDurationNs = durationNs;
+  if (durationNs > op.maxDurationNs) op.maxDurationNs = durationNs;
 
-    this.totalDurationNs += durationNs;
-    this.errDurationNs += durationNs;
-    if (durationNs < this.minDurationNs) this.minDurationNs = durationNs;
-    if (durationNs > this.maxDurationNs) this.maxDurationNs = durationNs;
-
-    throw e;
-  }
+  throw e;
 }
 ```
 
@@ -309,9 +287,8 @@ async invoke(parentCtx, spanName, line, ...args) {
 
 ## Metrics Flush <a id="smoo/lmao!n/op-metrics-collection.metrics-flush"></a>
 
-**Status:** the **buffer-side** flush (the `period-start` + `buffer-*` rows, step 2c–2f below) ships in
-`arrow/capacityStats.ts` (`n/buffer-tuning-stats-logging`). The **per-op** flush (step 2b — the `op-*` rows) is part of
-the unbuilt `n/op-metrics-collection`. The block below is the full target flush.
+The `period-start` and `buffer-*` rows are written at each flush by `arrow/capacityStats.ts`
+(`n/buffer-tuning-stats-logging`). The per-op rows (step 2.2 below) are written by the same flush.
 
 ### When <a id="smoo/lmao!n/op-metrics-collection.when"></a>
 
@@ -325,16 +302,20 @@ Metrics flush alongside trace data using the same `FlushScheduler` triggers:
 ### Process <a id="smoo/lmao!n/op-metrics-collection.process"></a>
 
 1. Capture current timestamp as `period_end` (this becomes `timestamp` for all metric rows)
-2. For each module: a. Write `period-start` row with `periodStartNs` as `uint64_value` b. For each Op in module:
-   - Write `op-invocations` row
-   - Write `op-errors` row (if > 0)
-   - Write `op-exceptions` row (if > 0)
-   - Write `op-duration-total` row
-   - Write `op-duration-ok` row (if > 0)
-   - Write `op-duration-err` row (if > 0)
-   - Write `op-duration-min` row
-   - Write `op-duration-max` row c. Write `buffer-writes` row d. Write `buffer-overflow-writes` row (if > 0) e. Write
-     `buffer-created` row f. Write `buffer-overflows` row (if > 0)
+2. For each module:
+   1. Write `period-start` row with `periodStartNs` as `uint64_value`
+   2. For each Op in module:
+      - Write `op-invocations` row
+      - Write `op-errors` row (if > 0)
+      - Write `op-exceptions` row (if > 0)
+      - Write `op-duration-total` row
+      - Write `op-duration-ok` row (if > 0)
+      - Write `op-duration-err` row (if > 0)
+      - Write `op-duration-min` row
+      - Write `op-duration-max` row
+   3. Write `buffer-writes` row
+   4. Write `buffer-spans` row
+   5. Write `buffer-capacity` row
 3. Reset all counters to zero
 4. Update `periodStartNs` to current timestamp (start of next period)
 
@@ -365,9 +346,8 @@ timestamp | thread_id | package_name | package_file       | entry_type          
 1000      | 1         | @myco/http   | src/auth.ts        | op-duration-min        | verify  | 5000000
 1000      | 1         | @myco/http   | src/auth.ts        | op-duration-max        | verify  | 15000000
 1000      | 1         | @myco/http   |                    | buffer-writes          |         | 50000
-1000      | 1         | @myco/http   |                    | buffer-overflow-writes |         | 1200
-1000      | 1         | @myco/http   |                    | buffer-created         |         | 47
-1000      | 1         | @myco/http   |                    | buffer-overflows       |         | 3
+1000      | 1         | @myco/http   |                    | buffer-spans           |         | 47
+1000      | 1         | @myco/http   |                    | buffer-capacity        |         | 64
 ```
 
 **Note:** Buffer metrics don't have `package_file` since they're aggregated at the package level. Op metrics include
@@ -375,16 +355,16 @@ timestamp | thread_id | package_name | package_file       | entry_type          
 
 ## User-Facing API <a id="smoo/lmao!n/op-metrics-uint64-api"></a>
 
-**Status: SHIPPED** — `n/op-metrics-uint64-api`. The `uint64_value` column exists in the system schema, and the fluent
-`uint64_value(value: bigint)` writer is generated on all three surfaces: `log` (`FluentLogEntry`, by
-`codegen/spanLoggerGenerator.ts`) and `tag` (`TagWriter`) / result (`ok`/`err`, `ResultWriter`, by
-`codegen/fixedPositionWriterGenerator.ts`). The method matches the Arrow column name 1:1 per the system-field naming
-convention; there is no short-form `.uint64()` alias (a second name for one column would violate that convention).
+The `uint64_value` column exists in the system schema, and the fluent `uint64_value(value: bigint)` writer is generated
+on all three surfaces: `log` (`FluentLogEntry`, by `codegen/spanLoggerGenerator.ts`) and `tag` (`TagWriter`) / result
+(`ok`/`err`, `ResultWriter`, by `codegen/fixedPositionWriterGenerator.ts`). The method matches the Arrow column name 1:1
+per the system-field naming convention; there is no short-form `.uint64()` alias (a second name for one column would
+violate that convention).
 
 Users can write `uint64_value` for their own purposes using the `uint64_value()` method:
 
 ```typescript
-const processRecords = op(async ({ log, tag, ok }, records) => {
+const processRecords = defineOp('processRecords', async ({ log, tag, ok }, records) => {
   // Tag the span with a large count
   tag.batchId(batchId).uint64_value(BigInt(recordCount));
 
@@ -392,7 +372,7 @@ const processRecords = op(async ({ log, tag, ok }, records) => {
   log.info('Processing complete').uint64_value(BigInt(bytesProcessed));
 
   // Return with a large total
-  return ok({ success: true }).uint64_value(BigInt(totalRecords));
+  return ok({ processed: records.length }).uint64_value(BigInt(totalRecords));
 });
 ```
 
@@ -520,16 +500,15 @@ Monitor buffer efficiency and detect capacity issues:
 SELECT
   package_name,
   anyIf(uint64_value, entry_type = 'buffer-writes') as total_writes,
-  anyIf(uint64_value, entry_type = 'buffer-overflow-writes') as overflow_writes,
-  -- Overflow rate: high = needs larger initial capacity
-  anyIf(uint64_value, entry_type = 'buffer-overflow-writes') /
-    NULLIF(anyIf(uint64_value, entry_type = 'buffer-writes'), 0) as overflow_rate,
-  anyIf(uint64_value, entry_type = 'buffer-created') as buffers_created,
-  anyIf(uint64_value, entry_type = 'buffer-overflows') as overflow_count
+  anyIf(uint64_value, entry_type = 'buffer-spans') as spans_created,
+  anyIf(uint64_value, entry_type = 'buffer-capacity') as buffer_capacity,
+  -- Writes per capacity slot: high = needs larger initial capacity
+  anyIf(uint64_value, entry_type = 'buffer-writes') /
+    NULLIF(anyIf(uint64_value, entry_type = 'buffer-capacity'), 0) as writes_per_capacity
 FROM traces
 WHERE entry_type LIKE 'buffer-%'
 GROUP BY timestamp, package_name
-ORDER BY overflow_rate DESC
+ORDER BY writes_per_capacity DESC
 ```
 
 ### Invocation Rate (Throughput) <a id="smoo/lmao!n/op-metrics.invocation-rate-throughput"></a>
@@ -596,14 +575,14 @@ ORDER BY minute, package_name
 
 ## Integration with Other Specs <a id="smoo/lmao!n/op-metrics.integration-with-other-specs"></a>
 
-| Spec                                                                                   | Integration                                                                    | Status  |
-| -------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------ | ------- |
-| [01h_entry_types_and_logging_primitives.md](01h_entry_types_and_logging_primitives.md) | Defines the 12 metric entry types (period + 8 op + 3 buffer) in the enum       | shipped |
-| [01f_arrow_table_structure.md](01f_arrow_table_structure.md)                           | Documents `uint64_value` as a lazy system column                               | shipped |
-| [01b2_buffer_self_tuning.md](01b2_buffer_self_tuning.md)                               | Buffer stats feed `buffer-*` rows via `capacityStats.ts`                       | shipped |
-| [01l_op_context_pattern.md](01l_op_context_pattern.md)                                 | `Op` class to gain metrics counters + per-op flush (`n/op-metrics-collection`) | pending |
-| [01g_trace_context_api_codegen.md](01g_trace_context_api_codegen.md)                   | To generate `.uint64()` method (`n/op-metrics-uint64-api`)                     | pending |
-| [01a_trace_schema_system.md](01a_trace_schema_system.md)                               | Entry type enum extended with metric types                                     | shipped |
+| Spec                                                                                   | Integration                                                              |
+| -------------------------------------------------------------------------------------- | ------------------------------------------------------------------------ |
+| [01h_entry_types_and_logging_primitives.md](01h_entry_types_and_logging_primitives.md) | Defines the 12 metric entry types (period + 8 op + 3 buffer) in the enum |
+| [01f_arrow_table_structure.md](01f_arrow_table_structure.md)                           | Documents `uint64_value` as a lazy system column                         |
+| [01b2_buffer_self_tuning.md](01b2_buffer_self_tuning.md)                               | Buffer stats feed `buffer-*` rows via `capacityStats.ts`                 |
+| [01l_op_context_pattern.md](01l_op_context_pattern.md)                                 | Op metrics counters and per-op flush (`n/op-metrics-collection`)         |
+| [01g_trace_context_api_codegen.md](01g_trace_context_api_codegen.md)                   | Generates the fluent `uint64_value()` method (`n/op-metrics-uint64-api`) |
+| [01a_trace_schema_system.md](01a_trace_schema_system.md)                               | Entry type enum extended with metric types                               |
 
 ## Summary <a id="smoo/lmao!n/op-metrics.summary"></a>
 
@@ -616,5 +595,5 @@ leverages specific entry types for efficient querying.
 - Zero extra timing syscalls (reuse span timestamps)
 - Same flush path as trace data
 - Rich insights (duration by outcome reveals timeout vs validation failures)
-- User-extensible (`.uint64()` method for custom large numbers)
+- User-extensible (`uint64_value()` method for custom large numbers)
 - Efficient storage (ENUM entry types, lazy uint64 column)

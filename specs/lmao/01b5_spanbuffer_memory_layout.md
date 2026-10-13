@@ -14,8 +14,11 @@ compiler-emitted vocabulary at startup; it MUST NOT mutate an instantiated plan 
 
 - **Buffer-owned:** writable `_system`, identity, lazy-column blocks, string-reference arrays, and overflow links from
   span setup until freeze.
-- **Lease-owned borrowing:** conversion may expose frozen contiguous TypedArray/WASM regions through an `ArrowLease`.
-  The lease pins the backing store, memory epoch, and overflow chunks; reset, recycle, or invalidating growth waits.
+- **Lease-owned borrowing:** conversion may expose frozen contiguous JS-heap TypedArray regions through an `ArrowLease`.
+  The lease holds the trace topology, the source buffers, and their vocabulary generations, so `releaseBuffer()` defers
+  recycling the tree until the last lease is released. WASM-backed columns are always copied into Arrow-owned storage,
+  because linear-memory growth cannot keep borrowed views valid; the WASM memory epoch is pinned only during the
+  synchronous build.
 - **Arrow-owned:** dictionary/UTF-8/offset buffers, synthesized null bitmaps, serialized output, and any contiguous
   concatenation required by a consumer.
 - **Chunked boundary:** overflow buffers remain separate physical chunks. Prefer Arrow-native chunks; concatenate only
@@ -26,8 +29,8 @@ and fragmentation, Arrow output, active-lease pinned bytes, temporary conversion
 Report logical payload and peak/retained effective bytes per request.
 
 Startup creates the plan/generated class; span setup allocates the object and base storage; warmed fixed-capacity writes
-target zero new heap allocations with fixed monomorphic stores and one predictable not-overflow branch; first lazy
-column and overflow are slow paths; per-request Arrow flush is separately measured.
+allocate zero new heap memory with fixed monomorphic stores and one predictable not-overflow branch; first lazy column
+and overflow are slow paths; per-request Arrow flush is separately measured.
 
 ## Unified SpanBuffer Memory Layout <a id="smoo/lmao!n/spanbuffer-layout-unified"></a>
 
@@ -68,10 +71,10 @@ column offsets. This reduces allocations; it does not make span setup or the com
 │   [13+]   trace_id     (1-128 bytes, ASCII string)                               │
 │                                                                                  │
 │ Properties:                                                                      │
-│   parent: undefined (root has no parent)                                         │
-│   _children: SpanBuffer[]                                                        │
-│   callsiteModule: ModuleContext (caller's module for row 0 metadata)             │
-│   module: ModuleContext (Op's module for rows 1+ metadata)                       │
+│   _parent: undefined (root has no parent)                                        │
+│   _nodeIndex: number (this span's node in _traceRoot._topology)                  │
+│   _callsiteMetadata: OpMetadata (caller's module for row 0 metadata)             │
+│   _opMetadata: OpMetadata (Op's module for rows 1+ metadata)                     │
 │   spanName: string (per-span data)                                               │
 │   NOTE: lineNumber is in lineNumber_values TypedArray, NOT a property            │
 └──────────────────────────────────────────────────────────────────────────────────┘
@@ -97,10 +100,10 @@ column offsets. This reduces allocations; it does not make span setup or the com
 │   [8-11]  span_id      (4 bytes, Uint32, incrementing counter)                  │
 │                                                                                 │
 │ Properties:                                                                     │
-│   parent ──────────────► (parent SpanBuffer - for trace_id + parentSpanId)      │
-│   _children: SpanBuffer[]                                                       │
-│   callsiteModule: ModuleContext (caller's module for row 0 metadata)            │
-│   module: ModuleContext (Op's module for rows 1+ metadata)                      │
+│   _parent ─────────────► (parent SpanBuffer - for trace_id + parentSpanId)      │
+│   _nodeIndex: number (this span's node in _traceRoot._topology)                 │
+│   _callsiteMetadata: OpMetadata (caller's module for row 0 metadata)            │
+│   _opMetadata: OpMetadata (Op's module for rows 1+ metadata)                    │
 │   spanName: string (per-span data)                                              │
 │   NOTE: lineNumber is in lineNumber_values TypedArray, NOT a property           │
 └─────────────────────────────────────────────────────────────────────────────────┘
@@ -122,10 +125,10 @@ column offsets. This reduces allocations; it does not make span setup or the com
 │   _identity  ──────────────► (first buffer's _identity - shared reference!)     │
 │                                                                                 │
 │ Properties:                                                                     │
-│   parent ──────────────► (same as first buffer's parent)                        │
-│   _children: [] (only root buffer tracks _children)                             │
-│   callsiteModule: ModuleContext (shared from first buffer)                      │
-│   module: ModuleContext (Op's module, shared reference)                         │
+│   _parent ─────────────► (same as first buffer's parent)                        │
+│   _nodeIndex: number (same logical node as the first buffer)                    │
+│   _callsiteMetadata: OpMetadata (shared from first buffer)                      │
+│   _opMetadata: OpMetadata (Op's module, shared reference)                       │
 │   spanName: string (per-span data)                                              │
 │   NOTE: lineNumber is in lineNumber_values TypedArray, NOT a property           │
 └─────────────────────────────────────────────────────────────────────────────────┘
@@ -171,16 +174,16 @@ Instead of copying 12 bytes of parent identity into each child, we use the exist
 
 ```typescript
 get hasParent(): boolean {
-  return this.parent !== undefined;
+  return this._parent !== undefined;
 }
 
 get parentSpanId(): number {
-  return this.parent?.span_id ?? 0;
+  return this._parent?.span_id ?? 0;
 }
 
 get trace_id(): string {
-  if (this.parent) {
-    return this.parent.trace_id;  // Walk up to root
+  if (this._parent) {
+    return this._parent.trace_id;  // Walk up to root
   }
   // Root: decode from _identity
   const len = this._identity[12];
@@ -189,11 +192,11 @@ get trace_id(): string {
 
 // MASSIVE WIN: isParentOf becomes pointer comparison!
 isParentOf(other: SpanBuffer): boolean {
-  return this === other.parent;
+  return this === other._parent;
 }
 
 isChildOf(other: SpanBuffer): boolean {
-  return this.parent === other;
+  return this._parent === other;
 }
 ```
 
@@ -237,14 +240,12 @@ function copyThreadIdTo(dest: Uint8Array, offset: number): void {
 
 ### Constructor Implementation <a id="smoo/lmao!n/spanbuffer-layout.constructor"></a>
 
-**Implementation status**: Realized as a **generated** constructor — `getSpanBufferClass`
-(`packages/lmao/src/lib/spanBuffer.ts`) builds the `constructorPreamble` string passed to arrow-builder's
-`getColumnBufferClass`. The authoritative parameter list is `SpanBufferConstructor` (same file):
-`(capacity, stats, parent, isChained, callsiteMetadata, opMetadata, traceRoot)`. The illustrative class below predates
-that signature: the real constructor takes `stats`/`traceRoot`/`callsiteMetadata`/`opMetadata` (NOT `module`,
-`spanName`, or a `trace_id` string — `spanName` is written to `message_values[0]` by `writeSpanStart`, and `trace_id`
-comes from `traceRoot`). The unified `_system` layout, identity layout
-(`[threadId 8][spanId 4][traceIdLen 1][traceId N]`), and V8 hot-property ordering shown here are accurate.
+The constructor is generated. `getSpanBufferClass` (`packages/lmao/src/lib/spanBuffer.ts`) builds the
+`constructorPreamble` string passed to arrow-builder's `getColumnBufferClass`, and `SpanBufferConstructor` (same file)
+is the parameter list:
+`(capacity, stats, parent, isChained, callsiteMetadata, opMetadata, traceRoot, vocabularyGeneration)`. `spanName` is
+written to `message_values[0]` by `writeSpanStart`, and `trace_id` comes from `traceRoot._traceIdBytes`. The class below
+shows the unified `_system` layout and the identity layout (`[threadId 8][spanId 4][traceIdLen 1][traceId N]`).
 
 ```typescript
 class SpanBuffer {
@@ -253,46 +254,53 @@ class SpanBuffer {
   readonly timestamp: BigInt64Array;
   readonly entry_type: Uint8Array;
 
-  parent?: SpanBuffer;
-  _children: SpanBuffer[];
-  _next?: SpanBuffer;
+  _parent?: SpanBuffer;
+  _nodeIndex: number; // Node in _traceRoot._topology; child links live in the topology arena
+  _topologyGeneration: number;
+  _overflow?: SpanBuffer;
 
   // Per-span invocation data
   // NOTE: lineNumber is in lineNumber_values TypedArray, NOT a property on SpanBuffer
-  callsiteModule?: ModuleContext; // Caller's module (for row 0's gitSha/packageName/packagePath)
-  module: ModuleContext; // Op's module (for rows 1+ gitSha/packageName/packagePath)
-  spanName: string;
+  _callsiteMetadata?: OpMetadata; // Caller's metadata (for row 0's git_sha/package_name/package_file)
+  _opMetadata: OpMetadata; // Op's metadata (for rows 1+ git_sha/package_name/package_file)
+  _traceRoot: ITraceRoot;
+  _vocabularyGeneration: VocabularyGeneration;
 
   _writeIndex: number;
   _capacity: number;
 
   constructor(
     requestedCapacity: number,
-    module: ModuleContext, // Op's module context
-    spanName: string, // Span name
-    parent?: SpanBuffer,
-    isChained = false,
-    trace_id?: string, // Only for root spans
-    callsiteModule?: ModuleContext // Caller's module for row 0 metadata
+    stats: SpanBufferStats,
+    parent: SpanBuffer | undefined,
+    isChained: boolean,
+    callsiteMetadata: OpMetadata | undefined, // Caller's metadata for row 0
+    opMetadata: OpMetadata | undefined, // Op's metadata
+    traceRoot: ITraceRoot,
+    vocabularyGeneration: VocabularyGeneration
   ) {
-    // Store module and spanName (flattened from TaskContext)
-    this.module = module;
-    this.spanName = spanName;
-    this._children = [];
-    this._next = undefined;
-    this.callsiteModule = callsiteModule;
+    // Store metadata and trace root
+    this._callsiteMetadata = callsiteMetadata;
+    this._opMetadata = opMetadata;
+    this._traceRoot = traceRoot;
+    this._vocabularyGeneration = vocabularyGeneration;
+    this._nodeIndex = NO_NODE; // Set by _traceRoot._topology.registerRoot/registerChild/adoptOverflow
+    this._topologyGeneration = 0;
+    this._overflow = undefined;
 
     // Calculate system buffer size
     const systemSize = requestedCapacity * 9; // timestamp (8*cap) + entry_type (1*cap)
+    // Thread-local span counter (per-process/worker, see threadId.ts docs)
+    const spanId = ++globalThis.globalSpanCounter;
 
     if (isChained && parent) {
       // CHAINED: share identity, only allocate system columns
-      this.parent = parent.parent;
+      this._parent = parent._parent;
       this._system = new ArrayBuffer(systemSize);
       this._identity = parent._identity; // Shared reference!
     } else if (parent) {
       // CHILD: own 12-byte identity (thread_id + span_id)
-      this.parent = parent;
+      this._parent = parent;
       const identitySize = 12;
       this._system = new ArrayBuffer(systemSize + identitySize);
       this._identity = new Uint8Array(this._system, systemSize, identitySize);
@@ -300,12 +308,15 @@ class SpanBuffer {
       // Set thread_id via thread_id.ts module-level singleton (cached bytes)
       copyThreadIdTo(this._identity, 0);
 
-      // Set span_id (bytes 8-11, little-endian) - accesses module-level nextSpanId via closure
-      sbHelpers.writeSpanId(this._identity, 8, nextSpanId++);
+      // Set span_id (bytes 8-11, little-endian) from the thread-local counter
+      this._identity[8] = spanId;
+      this._identity[9] = spanId >>> 8;
+      this._identity[10] = spanId >>> 16;
+      this._identity[11] = spanId >>> 24;
     } else {
       // ROOT: identity with trace_id
-      const traceBytes = trace_id ? sbHelpers.textEncoder.encode(trace_id) : new Uint8Array(0);
-      const identitySize = 13 + traceBytes.length;
+      const traceIdBytes = traceRoot._traceIdBytes;
+      const identitySize = 13 + traceIdBytes.length;
       this._system = new ArrayBuffer(systemSize + identitySize);
       this._identity = new Uint8Array(this._system, systemSize, identitySize);
 
@@ -313,25 +324,21 @@ class SpanBuffer {
       copyThreadIdTo(this._identity, 0);
 
       // Set span_id
-      sbHelpers.writeSpanId(this._identity, 8, nextSpanId++);
+      this._identity[8] = spanId;
+      this._identity[9] = spanId >>> 8;
+      this._identity[10] = spanId >>> 16;
+      this._identity[11] = spanId >>> 24;
 
       // Set trace_id length and bytes
-      this._identity[12] = traceBytes.length;
-      this._identity.set(traceBytes, 13);
+      this._identity[12] = traceIdBytes.length;
+      this._identity.set(traceIdBytes, 13);
     }
 
     // System columns at FIXED offsets (same for ALL buffer types)
-    this._timestamp = new BigInt64Array(this._system, 0, requestedCapacity);
-    this._entry_type = new Uint8Array(this._system, requestedCapacity * 8, requestedCapacity);
-
-    // Direct property aliases for system columns (V8 hidden class friendly)
-    this.timestamp = this._timestamp;
-    this.entry_type = this._operations;
+    this.timestamp = new BigInt64Array(this._system, 0, requestedCapacity);
+    this.entry_type = new Uint8Array(this._system, requestedCapacity * 8, requestedCapacity);
 
     this._writeIndex = 0;
-
-    // Track buffer creation
-    module.sb_totalCreated++;
   }
 }
 ```
@@ -352,19 +359,19 @@ allocation and overflow branch into explicit slow helpers.
 // SLOT 1-3: HOTTEST - Read/written on EVERY log entry
 this._writeIndex = 0;          // Incremented every write
 this._capacity = requestedCapacity;  // Compared every write (overflow check)
-this._next = undefined;        // Checked on overflow
+this._overflow = undefined;    // Checked on overflow
 
 // SLOT 4-5: HOT - TypedArray refs accessed every entry
 this.timestamp = timestampView;      // Written every entry
 this.entry_type = entryTypeView;     // Written every entry
 
 // SLOT 6-7: WARM - Tree structure (span creation/navigation)
-this._children = [];           // Pushed to when creating child spans
+this._nodeIndex = NO_NODE;     // Topology handle, set when the factory registers the span
 this._parent = parent;         // Walked for trace_id lookup
 
 // SLOT 8-9: WARM - Identity and binding (accessed during span ops)
 this._identity = identityView; // Accessed for span_id/thread_id
-this._logBinding = module;     // Accessed for schema/capacity stats
+this._opMetadata = opMetadata; // Accessed for schema/capacity stats
 
 // SLOT 10+: COLD - Only accessed during Arrow conversion or rarely
 this._system = systemBuffer;   // Underlying ArrayBuffer (accessed via views)
@@ -379,10 +386,10 @@ this._callsiteMetadata = ...;  // Row 0 metadata
 | ---------------------------------------------------------- | ------------------------ | ------------------------ |
 | `_writeIndex`                                              | Read + increment         | Every log entry          |
 | `_capacity`                                                | Read (overflow check)    | Every log entry          |
-| `_next`                                                    | Read (buffer chain)      | On overflow              |
+| `_overflow`                                                | Read (buffer chain)      | On overflow              |
 | `timestamp` / `entry_type`                                 | Array indexing           | Every log entry          |
-| `_children` / `_parent`                                    | Tree navigation          | Span creation/completion |
-| `_identity` / `_logBinding`                                | Metadata access          | Span operations          |
+| `_nodeIndex` / `_parent`                                   | Tree navigation          | Span creation/completion |
+| `_identity` / `_opMetadata`                                | Metadata access          | Span operations          |
 | `_system`                                                  | Never after construction | Constructor only         |
 | `message_values[0]` / `_scopeValues` / `_callsiteMetadata` | Arrow conversion         | Cold path only           |
 
@@ -405,16 +412,16 @@ get span_id(): number {
 }
 
 get hasParent(): boolean {
-  return this.parent !== undefined;
+  return this._parent !== undefined;
 }
 
 get parentSpanId(): number {
-  return this.parent?.span_id ?? 0;
+  return this._parent?.span_id ?? 0;
 }
 
 get trace_id(): string {
-  if (this.parent) {
-    return this.parent.trace_id;  // Walk up
+  if (this._parent) {
+    return this._parent.trace_id;  // Walk up
   }
   // Root: decode from identity
   const len = this._identity[12];
@@ -435,11 +442,11 @@ Methods are defined externally and assigned to prototype for smaller generated c
 // Defined once, shared by all SpanBuffer instances
 const spanBufferMethods = {
   isParentOf(this: SpanBuffer, other: SpanBuffer): boolean {
-    return this === other.parent; // Pointer comparison!
+    return this === other._parent; // Pointer comparison!
   },
 
   isChildOf(this: SpanBuffer, other: SpanBuffer): boolean {
-    return this.parent === other; // Pointer comparison!
+    return this._parent === other; // Pointer comparison!
   },
 
   copyThreadIdTo(this: SpanBuffer, dest: Uint8Array, offset: number): void {
@@ -529,18 +536,18 @@ interface SpanBuffer {
   // ... same pattern for all schema attributes
 
   // Tree structure
-  _children: SpanBuffer[];
-  parent?: SpanBuffer; // Reference to parent SpanBuffer
+  _nodeIndex: number; // Node in _traceRoot._topology (child links live there)
+  _parent?: SpanBuffer; // Reference to parent SpanBuffer
 
-  // Dual module references for accurate source attribution
-  callsiteModule?: ModuleContext; // Caller's module (for row 0 metadata)
-  module: ModuleContext; // Op's module (for rows 1+ metadata)
+  // Dual metadata references for accurate source attribution
+  _callsiteMetadata?: OpMetadata; // Caller's metadata (for row 0)
+  _opMetadata: OpMetadata; // Op's metadata (for rows 1+)
   spanName: string; // Span name for this invocation
 
   // Buffer management
   _writeIndex: number; // Current write position (0 to capacity-1)
   _capacity: number; // Logical capacity for bounds checking
-  _next?: SpanBuffer; // Chain to next buffer when overflow
+  _overflow?: SpanBuffer; // Chain to next buffer when overflow
 
   // Span Identification (see Span Identity section above)
   thread_id: bigint; // 64-bit random ID per worker
@@ -552,33 +559,45 @@ interface SpanBuffer {
   getNullsIfAllocated(columnName: string): Uint8Array | undefined;
 }
 
-// ModuleContext - module-level metadata with flattened stats
-interface ModuleContext {
-  packageName: string; // npm package name from package.json
-  packagePath: string; // Path within package, relative to package.json
-  gitSha: string; // Git SHA at build time
-  prefix?: string; // Optional prefix for library integration
-  logSchema: LogSchema; // Schema definition for this module
+// OpMetadata - per-op source attribution, one per defineOp
+interface OpMetadata {
+  name: string; // Op name for metrics
+  package_name: string; // npm package name from package.json
+  package_file: string; // Path within package, relative to package.json
+  git_sha: string; // Git SHA at build time
+  line: number; // Line of the defineOp call
 
-  // Self-tuning buffer capacity stats (flattened, not nested)
-  sb_capacity: number; // Current buffer capacity
-  sb_totalWrites: number; // Total writes for tuning decisions
-  sb_overflows: number; // Overflow count for tuning decisions
-  sb_totalCreated: number; // Total buffers created
+  // Pre-encoded UTF-8 for Arrow dictionary building (interned once at defineOp time)
+  package_name_entry: PreEncodedEntry;
+  package_file_entry: PreEncodedEntry;
+  git_sha_entry: PreEncodedEntry;
+
+  // Startup-resolved physical layout used by span setup; absent only on raw fallback metadata
+  _physicalLayoutPlan?: {
+    SpanBufferClass: SpanBufferConstructor;
+    eagerColumns: EagerColumnDescriptor;
+    vocabularyGeneration: VocabularyGeneration;
+    localMessageDictionary: readonly number[];
+    encodeLocalMessage: (globalDenseIndex: number) => number;
+    wasmLayout: WasmLayoutTemplate;
+  };
 }
+
+// The log schema lives on the op context's LogBinding; capacity stats live on the generated class
+// (SpanBufferClass.stats, see Capacity Statistics below).
 ```
 
 ### Access Patterns
 
 ```typescript
-// Module metadata (row 0 uses callsiteModule, rows 1+ use module)
-buffer.callsiteModule?.packageName; // Caller's '@mycompany/http' (for row 0)
-buffer.module.packageName; // Op's module (for rows 1+)
+// Op metadata (row 0 uses _callsiteMetadata, rows 1+ use _opMetadata)
+buffer._callsiteMetadata?.package_name; // Caller's '@mycompany/http' (for row 0)
+buffer._opMetadata.package_name; // Op's metadata (for rows 1+)
 buffer.spanName; // Span name (direct property)
 
-// Self-tuning stats (flattened on module)
-buffer.module.sb_capacity; // 8 (default, self-tuning adapts)
-buffer.module.sb_totalWrites; // 1234
+// Self-tuning stats (static on the generated class, shared by its buffers)
+buffer._stats.capacity; // 8 (default, self-tuning adapts)
+buffer._stats.totalWrites; // 1234
 
 // Direct property access - zero indirection:
 buffer.userId_values[idx] = value; // ✅ Direct TypedArray access
@@ -682,12 +701,11 @@ explicitly accounted contiguous copy.
 TraceRoot is created once per trace and shared by reference across all spans. It provides timestamp anchoring and tracer
 lifecycle hooks.
 
-**Implementation status**: Realized as `ITraceRoot` (`packages/lmao/src/lib/traceRoot.ts`), fenced under the
-high-precision-timestamp node `smoo/lmao!n/trace-root-timestamps` ([01b3](./01b3_high_precision_timestamps.md)), so this
-heading shares that realization rather than re-fencing it. The shipped interface adds `_system` (backing anchor buffer)
-and the `writeSpanStart`/`writeSpanEnd`/`writeLogEntry`/`getTimestampNanos` write API beyond the four read-only fields
-sketched below; `tracer` is `TracerLifecycleHooks` (carrying `onStatsWillResetFor`, the
-[Buffer Self-Tuning](./01b2_buffer_self_tuning.md) observability hook).
+`ITraceRoot` (`packages/lmao/src/lib/traceRoot.ts`) is fenced under the high-precision-timestamp node
+`smoo/lmao!n/trace-root-timestamps` ([01b3](./01b3_high_precision_timestamps.md)), so this heading shares that fence.
+The interface also carries `_system` (backing anchor buffer) and the `writeSpanStart`/`writeSpanEnd`/`writeLogEntry`/
+`getTimestampNanos` write API beyond the four read-only fields sketched below; `tracer` is `TracerLifecycleHooks`, which
+carries `onStatsWillResetFor` (the [Buffer Self-Tuning](./01b2_buffer_self_tuning.md) observability hook).
 
 ```typescript
 interface TraceRoot {
@@ -735,20 +753,11 @@ See [High-Precision Timestamps](./01b3_high_precision_timestamps.md) for timesta
 
 Each `SpanBufferClass` (generated per schema) has a static `stats` property for capacity tuning.
 
-**Implementation status**: The shipped `SpanBufferStats` (`packages/lmao/src/lib/spanBufferStats.ts`) carries the three
-fields the utilization tuner actually reads — `capacity`, `totalWrites`, `spansCreated` (non-chained spans only). The
-`overflowWrites` / `totalCreated` / `overflows` fields below are NOT on the runtime interface; overflow accounting is
-derived during flush (see [Buffer Self-Tuning §Buffer Statistics Logging](./01b2_buffer_self_tuning.md)), and the
-`buffer.constructor.stats` accessor (`_stats` getter) replaces the per-instance variants. The example below is the
-original design sketch.
-
 ```typescript
 interface SpanBufferStats {
   capacity: number; // Current capacity for new buffers
-  totalWrites: number; // Total entries written across all buffers
-  overflowWrites: number; // Number of overflow events (incremented once per overflow)
-  totalCreated: number; // Total buffers created (root + children + chains)
-  overflows: number; // Number of overflow events
+  totalWrites: number; // Completed user/event rows sealed across segments (rows 0/1 excluded once per span)
+  spansCreated: number; // Non-chained spans created (root + child, not overflow buffers)
 }
 
 // Access via class
@@ -764,17 +773,17 @@ buffer._stats; // Getter returns this.constructor.stats
 Stats are per-schema, not per-buffer:
 
 - All buffers from same schema share capacity learning
-- Overflow ratio computed across all buffers of same type
+- Utilization computed across all buffers of the same class
 - Enables cross-request capacity optimization
 
 ### Stats Updates
 
-| Event              | Stats Updated                     |
-| ------------------ | --------------------------------- |
-| Buffer created     | `totalCreated++`                  |
-| Entry written      | `totalWrites++`                   |
-| Overflow triggered | `overflows++`, `overflowWrites++` |
-| Capacity adjusted  | `capacity` updated, stats reset   |
+| Event                                | Stats Updated                                          |
+| ------------------------------------ | ------------------------------------------------------ |
+| Root or child span created (factory) | `spansCreated++`                                       |
+| Buffer sealed (overflow or span end) | `totalWrites += completed rows`                        |
+| Overflow triggered                   | buffer sealed, tracer hook, then the tuning check      |
+| Capacity adjusted                    | `capacity` updated, `totalWrites`/`spansCreated` reset |
 
 ### Benchmark Acceptance
 

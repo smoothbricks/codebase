@@ -13,35 +13,45 @@ The Arrow Table Structure defines the final queryable format produced by the tra
 
 ## Arrow Ownership and Copy Contract <a id="smoo/lmao!n/arrow-table-zero-copy"></a>
 
-Conversion does not guarantee payload borrowing across all columns. It uses the cheapest correct mode per physical
-column:
+**CRITICAL**: Arrow conversion of JS-heap SpanBuffers MUST wrap direct TypedArray references as bounded `subarray()`
+views and pass them to `arrow.makeData()` (flechette's direct `Batch`). A copy needs a measured reason: a benchmark
+against the borrow.
 
-| Input / boundary                                      | Required mode                                          | Owner and lifetime                                                           |
-| ----------------------------------------------------- | ------------------------------------------------------ | ---------------------------------------------------------------------------- |
-| Contiguous primitive or compatible null region        | Borrow bounded `subarray()` payload when supported     | SpanBuffer/WASM owns bytes; `ArrowLease` pins backing store and memory epoch |
-| Overflow chain accepted as Arrow chunks               | Wrap each physical chunk                               | One lease pins every source chunk; wrapper/view allocations still count      |
-| Consumer requires one contiguous region               | Allocate once and bulk-copy chunks                     | Arrow owns output; charge allocation and copied bytes to flush               |
-| Dictionary/category/text                              | Build required indices, UTF-8, offsets, and dictionary | Arrow owns constructed buffers; immutable shared dictionaries may be leased  |
-| Mutable/incompatible input or unpinned async lifetime | Copy to Arrow-owned storage                            | Lifetime correctness overrides copy avoidance                                |
+**WASM exception**: WASM-backed columns are always copied into Arrow-owned storage. `memory.grow()` detaches every view
+of the old linear memory, so a borrowed view could not outlive the next growth; this is a correctness rule, not a
+measured choice. Conversion pins the WASM memory epoch only for its synchronous build and releases the pin before it
+returns, so a lease never holds a WASM epoch. When any buffer of a trace tree is WASM-backed, the whole tree's table is
+built from copies.
+
+Each physical column uses the cheapest correct mode:
+
+| Input / boundary                                      | Required mode                                               | Owner and lifetime                                                          |
+| ----------------------------------------------------- | ----------------------------------------------------------- | --------------------------------------------------------------------------- |
+| Contiguous JS-heap primitive or null region           | Borrow bounded `subarray()` payload                         | SpanBuffer owns bytes; `ArrowLease` holds the buffers and trace topology    |
+| Any column of a tree with WASM-backed buffers         | Copy to Arrow-owned storage during synchronous conversion   | Memory epoch pinned only during the build, never by a lease                 |
+| JS-heap overflow chain accepted as Arrow chunks       | Wrap each physical chunk                                    | One lease holds every source chunk; wrapper/view allocations still count    |
+| Consumer requires one contiguous region               | Allocate once and bulk-copy chunks, measured against borrow | Arrow owns output; charge allocation and copied bytes to flush              |
+| Dictionary/category/text                              | Build required indices, UTF-8, offsets, and dictionary      | Arrow owns constructed buffers; immutable shared dictionaries may be leased |
+| Mutable/incompatible input or unpinned async lifetime | Copy to Arrow-owned storage                                 | Lifetime correctness overrides copy avoidance                               |
 
 Per-value builder `append()` is PROHIBITED for bulk columns. Direct wrapping can still allocate JS view/wrapper objects;
 those count toward flush allocations.
 
-**Shipped versus target.** Shipped flechette wraps final TypedArrays and bulk-concatenates overflow/null data when
-contiguity is required; dictionary/UTF-8 construction allocates. The target preserves Arrow-native chunks wherever
-consumers accept them and carries explicit `ArrowLease` ownership through asynchronous consumption. Until that lifetime
-contract is end to end, borrowed views cannot outlive synchronous consumption.
+Conversion preserves Arrow-native chunks of JS-heap buffers wherever consumers accept them and carries explicit
+`ArrowLease` ownership through asynchronous consumption, so a borrowed view lives exactly as long as its lease; the
+lease keeps the borrowed buffers, their vocabulary generations and the trace topology alive until the consumer releases
+it. Overflow and null data are bulk-concatenated only for a consumer that requires one contiguous region.
 
 `PhysicalLayoutPlan` determines direct compatibility/chunk/copy policy. Versioned `VocabularyBinding` occurs at startup
 and may supply immutable dictionaries/layout fragments; request flush does not mutate the plan.
 
 ### Contiguous Borrowing Reference <a id="smoo/lmao!n/arrow-table-zero-copy.reference"></a>
 
-For a contiguous primitive, use flechette's direct `Batch` constructor with a bounded `subarray()` and retain the lease
-that pins the source. Do not use the illustrative per-value builder.
+For a contiguous JS-heap primitive, use flechette's direct `Batch` constructor with a bounded `subarray()` and retain
+the lease that keeps the source buffer alive. Do not use the illustrative per-value builder.
 
 ```typescript
-// Borrowed payload: lease pins source bytes; view and Batch wrappers still allocate.
+// Borrowed JS-heap payload: the lease keeps the source buffer alive; view and Batch wrappers still allocate.
 return arrow.makeData({
   type: dataType,
   offset: 0,
@@ -244,6 +254,7 @@ system becomes a row in the final table, enabling rich analytical queries while 
 | `entry_type`       | `dictionary<string>` | Log entry type (see [Entry Types](#entry-type-system))                                                        | `'span-start'`, `'span-ok'`, `'op-invocations'`, `'buffer-writes'`, etc.                                     |
 | `package_name`     | `dictionary<string>` | npm package name (see [Module Identification](#module-identification) section)                                | `'@smoothbricks/lmao'`, `'@mycompany/user-service'`                                                          |
 | `package_file`     | `dictionary<string>` | Path within package, relative to package.json (see [Module Identification](#module-identification) section)   | `'src/services/user.ts'`, `'lib/handlers/auth.ts'`                                                           |
+| `git_sha`          | `dictionary<string>` | Git commit SHA of the op's source at build time (`'runtime'` when the transformer did not inject it)          | `'abc123def456...'`, `'runtime'`                                                                             |
 | `message`          | `dictionary<string>` | Span name, log message template, exception message, result message, OR flag name (see Message Column section) | `'create-user'`, `'User {userId} created'`, `'Processing {count} items'`, `'TypeError: x is not a function'` |
 
 ### Lazy System Columns (Sparse/Nullable) <a id="smoo/lmao!n/arrow-table-schema.lazy"></a>
@@ -270,15 +281,17 @@ rather than every row.
 
 - `trace_id`: Branded `TraceId` string, validated (non-empty, max 128 chars, ASCII). Shared by reference across all
   spans in a trace (no per-span string payload copy).
-- `thread_id` + `span_id`: Extracted from `SpanIdentity` 25-byte ArrayBuffer during Arrow conversion.
-- `parent_thread_id` + `parent_span_id`: Also from `SpanIdentity`, null for root spans (hasParent flag = 0).
+- `thread_id` + `span_id`: Read from the buffer's packed identity section during Arrow conversion
+  ([Span Identity](./01b4_span_identity.md#spanbuffer-integration)).
+- `parent_thread_id` + `parent_span_id`: Read through the parent pointer (or the trace root's remote parent), null for
+  rows of a span with no parent.
 
 ## Module Identification <a id="smoo/lmao!n/arrow-table-module-id"></a>
 
 The `package_name` and `package_file` columns work together to identify the source location of each trace entry. This
 two-column design provides significant benefits over a single combined path:
 
-### Why `packageName` + `packagePath` (Not a Combined Path) <a id="smoo/lmao!n/arrow-table-module-id.two-column"></a>
+### Why `package_name` + `package_file` (Not a Combined Path) <a id="smoo/lmao!n/arrow-table-module-id.two-column"></a>
 
 1. **Cross-repo log aggregation**: When logs from multiple repositories or services are combined (e.g., in a data
    warehouse), the package name provides a globally unique namespace. npm enforces package name uniqueness, so
@@ -304,24 +317,29 @@ two-column design provides significant benefits over a single combined path:
    - Git repo → find package location within monorepo (search for package.json with matching name)
    - `package_file` → actual source file relative to that package.json
 
-5. **TypeScript transformer compatibility**: The TypeScript transformer computes both pieces via `findNearestPackage()`,
-   which returns both `packageName` and `packageDir`. Storing them separately avoids redundant string concatenation.
+5. **TypeScript transformer compatibility**: The transformer resolves the nearest `package.json` once per source file
+   (`nearestPackage` in `packages/lmao-ttsc/plugin/driver/lmao.go`), which yields the package name and the file path
+   relative to it. Storing them separately avoids redundant string concatenation.
 
 ### Relation to Operations (Ops) <a id="smoo/lmao!n/arrow-table-module-id.ops"></a>
 
-Module metadata comes from the op's bound module at runtime:
+Source attribution is per op. Each `defineOp` produces one `OpMetadata`, and every row a span writes takes its
+`package_name`, `package_file` and `git_sha` from it:
 
 ```typescript
-const { op } = httpModule;
+const { defineOp } = defineOpContext({ logSchema: httpSchema });
 
-const GET = op(async ({ span, log, tag }, url: string) => {
-  tag.method('GET');
-  await span('fetch', fetchOp, url); // Span name comes from call site
+const GET = defineOp('GET', async (ctx, url: string) => {
+  ctx.tag.method('GET');
+  return ctx.span('fetch', fetchOp, url); // Span name comes from call site
 });
 ```
 
-- **`package_name`**: From the module the op is bound to (`httpModule`)
-- **`package_file`**: From where the module was defined (TypeScript transformer)
+- **`package_name`**: The package that defines the op (`GET`)
+- **`package_file`**: The file containing the `defineOp` call, relative to its package root
+- **`git_sha`**: The commit the op's source was built from
+- **Row 0 vs rows 1+**: Row 0 (`span-start`) is attributed to the caller's `OpMetadata` (`_callsiteMetadata`), rows 1+
+  to the called op's (`_opMetadata`)
 - **Span names**: Come from `span('name', op, ...args)` call sites, stored in `message` column
 
 ### Why NOT Git-Based Identity <a id="smoo/lmao!n/arrow-table-module-id.not-git"></a>
@@ -332,39 +350,44 @@ We considered using git repository info (git root path, git SHA for identity) bu
 - **Monorepos have one git root but many packages**: The git path doesn't uniquely identify a package
 - **Package name from `package.json` is the canonical npm identity**: Already defined, already unique
 - **Git SHA is for version tracking**: Answers "which version of the code?" not "which module?"
-  - We keep `gitSha` as a separate field for version tracking, not as part of module identity
+  - `git_sha` is a separate column for version tracking, not part of module identity
 
-### ModuleMetadata Interface <a id="smoo/lmao!n/arrow-table-module-id.metadata"></a>
+### OpMetadata <a id="smoo/lmao!n/arrow-table-module-id.metadata"></a>
 
-The `moduleMetadata` object passed to `createModuleContext()` contains:
+`defineOp(name, fn, metadata?)` takes the attribution as its third argument, and the transformer fills it at every
+`defineOp` call site. Without it, `defineOp` derives `package_file`, `line` and a package name from its caller's stack
+frame and sets `git_sha` to `'runtime'`. The result is one `OpMetadata` per op (`packages/lmao/src/lib/op.ts`):
 
 ```typescript
-interface ModuleMetadata {
-  gitSha: string; // Git commit SHA for version tracking (NOT identity)
-  packageName: string; // npm package name from nearest package.json
-  packagePath: string; // Path within package, relative to package.json
+interface OpMetadata {
+  readonly name: string; // Op name for metrics (span names come from call sites)
+  readonly package_name: string; // npm package name from nearest package.json
+  readonly package_file: string; // Path within package, relative to package.json
+  readonly git_sha: string; // Git commit SHA for version tracking (NOT identity)
+  readonly line: number; // Line of the defineOp call
+
+  readonly package_name_entry: PreEncodedEntry; // Pre-encoded for Arrow dictionary building
+  readonly package_file_entry: PreEncodedEntry;
+  readonly git_sha_entry: PreEncodedEntry;
 }
 ```
 
-Example:
+Example transformer output:
 
 ```typescript
-moduleMetadata: {
-  gitSha: 'abc123def456...',
-  packageName: '@smoothbricks/lmao',
-  packagePath: 'src/services/user.ts',
-}
+defineOp('createUser', createUserFn, {
+  package_name: '@smoothbricks/lmao',
+  package_file: 'src/services/user.ts',
+  git_sha: 'abc123def456...',
+  line: 42,
+});
 ```
 
-### ModuleContext Properties <a id="smoo/lmao!n/arrow-table-module-id.context-props"></a>
+### Pre-encoded Entries <a id="smoo/lmao!n/arrow-table-module-id.context-props"></a>
 
-The `ModuleContext` (created at module initialization) stores:
-
-- `packageName: string` — npm package name from nearest package.json (e.g., `'@smoothbricks/lmao'`)
-- `packagePath: string` — Path within package, including file extension (e.g., `'src/services/user.ts'`)
-- `gitSha: string` — Git commit SHA for version tracking
-
-Both `packageName` and `packagePath` values are interned at module creation time for efficient dictionary encoding.
+`createOpMetadata` (`packages/lmao/src/lib/opContext/defineOp.ts`) builds `package_name_entry`, `package_file_entry` and
+`git_sha_entry` once per op through the global string interner, so ops sharing a package share its UTF-8 bytes, and
+Arrow conversion builds these dictionaries without re-encoding a string per span.
 
 ## Span Definition <a id="smoo/lmao!n/arrow-table-span-id"></a>
 
@@ -406,10 +429,10 @@ This happens in several scenarios:
 - **Distributed services**: Same trace spanning multiple machines
 - **Serverless**: Multiple Lambda invocations for the same request
 
-### Chosen Approach: SpanIdentity + TraceId <a id="smoo/lmao!n/arrow-table-span-id.chosen"></a>
+### Chosen Approach: Packed Identity + TraceId <a id="smoo/lmao!n/arrow-table-span-id.chosen"></a>
 
-LMAO uses a combination of `SpanIdentity` (25-byte ArrayBuffer) and `TraceId` (branded string) for span identification.
-In the Arrow output, these are expanded to separate columns for query flexibility:
+LMAO uses a packed identity section in each buffer's `_system` ArrayBuffer and a `TraceId` (branded string) for span
+identification. In the Arrow output, these are expanded to separate columns for query flexibility:
 
 | Column             | Type                 | Description                                           |
 | ------------------ | -------------------- | ----------------------------------------------------- |
@@ -419,20 +442,32 @@ In the Arrow output, these are expanded to separate columns for query flexibilit
 | `parent_thread_id` | `uint64` (nullable)  | Parent span's thread                                  |
 | `parent_span_id`   | `uint32` (nullable)  | Parent span's ID                                      |
 
-### SpanIdentity Memory Layout <a id="smoo/lmao!n/arrow-table-span-id.layout"></a>
+### Identity Memory Layout <a id="smoo/lmao!n/arrow-table-span-id.layout"></a>
 
-In memory, span identification is packed into a 25-byte `SpanIdentity` ArrayBuffer:
+In memory, span identification is a packed byte section at the end of the buffer's `_system` ArrayBuffer, after the
+timestamp and entry-type storage, 8-byte aligned. [Span Identity](./01b4_span_identity.md#spanbuffer-integration) owns
+the layout:
 
 ```
-SpanIdentity (25 bytes):
+CHILD identity (12 bytes):
 ┌──────────────────────────────────────────────────────────────────────────┐
-│ Byte 0:      flags           (bit 0 = hasParent)                         │
-│ Bytes 1-8:   thread_id        (8 bytes, crypto-secure random)             │
-│ Bytes 9-12:  span_id          (4 bytes, thread-local counter)             │
-│ Bytes 13-20: parentThreadId  (8 bytes, zeroed if root)                   │
-│ Bytes 21-24: parentSpanId    (4 bytes, zeroed if root)                   │
+│ Bytes 0-7:   thread_id       (8 bytes, crypto-secure random, per thread) │
+│ Bytes 8-11:  span_id         (4 bytes, thread-local counter)             │
+└──────────────────────────────────────────────────────────────────────────┘
+
+ROOT identity (13 + N bytes):
+┌──────────────────────────────────────────────────────────────────────────┐
+│ Bytes 0-7:   thread_id       (8 bytes)                                   │
+│ Bytes 8-11:  span_id         (4 bytes)                                   │
+│ Byte 12:     traceIdLen      (1 byte, N)                                 │
+│ Bytes 13-:   trace_id        (N bytes)                                   │
 └──────────────────────────────────────────────────────────────────────────┘
 ```
+
+A CHAINED overflow buffer shares its first buffer's identity reference and adds no bytes. The identity stores no parent
+ids and no hasParent flag: the parent ids are read through the `_parent` pointer, or through the trace root's remote
+parent for a root that continues a remote trace
+([Remote Parent of a Root Span](./01b4_span_identity.md#smoo/lmao!n/span-identity.remote-parent)).
 
 ### TraceId: Branded String <a id="smoo/lmao!n/arrow-table-span-id.traceid"></a>
 
@@ -464,12 +499,11 @@ To find a parent span, you need:
 - Same `trace_id` (parent is always in same trace)
 - Match `thread_id = parent_thread_id` AND `span_id = parent_span_id`
 
-SpanBuffer provides convenience methods:
+SpanBuffer provides convenience methods. They compare the parent pointer in O(1); they read no identity bytes:
 
 ```typescript
-// These check BOTH trace_id equality AND SpanIdentity relationship
-spanA.isParentOf(spanB); // true if spanA is spanB's parent
-spanB.isChildOf(spanA); // true if spanB is spanA's child
+spanA.isParentOf(spanB); // spanA === spanB._parent
+spanB.isChildOf(spanA); // spanB._parent === spanA
 ```
 
 ### Why This Design <a id="smoo/lmao!n/arrow-table-span-id.why"></a>
@@ -479,7 +513,7 @@ spanB.isChildOf(spanA); // true if spanB is spanA's child
 - `span_id` is just `i++` - no random generation, no BigInt operations per span
 - Thread ID generated once at worker startup using crypto-secure random (cold path)
 - TraceId shared by reference - no string copies per span
-- SpanIdentity comparison uses simple byte loop (6x faster than DataView)
+- Parent relationships are pointer comparisons; no identity bytes are compared
 
 **Collision Resistance**:
 
@@ -501,7 +535,8 @@ spanB.isChildOf(spanA); // true if spanB is spanA's child
 
 **JavaScript Compatibility**:
 
-- `thread_id` (64-bit): Stored as raw bytes in SpanIdentity, converted to BigUint64 for Arrow
+- `thread_id` (64-bit): Stored as raw bytes in the packed identity, held as a `bigint` on the buffer, written to Arrow
+  as `uint64`
 - `span_id` (32-bit): Fits in `number`, used per span (no BigInt in hot path)
 - `trace_id`: Plain string reference (branded for type safety)
 
@@ -604,47 +639,28 @@ ORDER BY span_id;
 -- trace_id: req-2, span_id: 5    (req-2 continues)
 ```
 
-### SpanIdentity to Arrow Conversion <a id="smoo/lmao!n/arrow-table-span-id.to-arrow"></a>
+### Identity to Arrow Conversion <a id="smoo/lmao!n/arrow-table-span-id.to-arrow"></a>
 
-During Arrow conversion, the `SpanIdentity` 25-byte ArrayBuffer is expanded to separate columns:
+During Arrow conversion, each identity column is one TypedArray over every row of the batch. Each buffer fills its own
+`_writeIndex` rows from its identity getters, so the identity is read once per buffer, never per row
+(`buildNonDictIdentityColumns` in `packages/lmao/src/lib/convertToArrow.ts`):
 
 ```typescript
-function convertSpanIdentityToArrowColumns(spanIdentity: SpanIdentity, rowCount: number): ArrowColumns {
-  // Thread ID: extract 8 bytes, convert to BigUint64
-  const threadIdBytes = spanIdentity.threadId; // Uint8Array view of bytes 1-8
-  const threadIdView = new DataView(threadIdBytes.buffer, threadIdBytes.byteOffset, 8);
-  const threadIdValue = threadIdView.getBigUint64(0, true); // little-endian
-  const threadIdData = new BigUint64Array(rowCount).fill(threadIdValue);
+// thread_id and span_id: constant per buffer, never null
+threadIds.fill(buf.thread_id, offset, offset + buf._writeIndex);
+spanIds.fill(buf.span_id, offset, offset + buf._writeIndex);
 
-  // Span ID: direct 32-bit value
-  const spanIdData = new Uint32Array(rowCount).fill(spanIdentity.spanId);
-
-  // Parent columns (nullable based on hasParent flag)
-  if (spanIdentity.hasParent) {
-    const parentThreadIdBytes = spanIdentity.parentThreadId;
-    const parentThreadIdView = new DataView(parentThreadIdBytes.buffer, parentThreadIdBytes.byteOffset, 8);
-    const parentThreadIdValue = parentThreadIdView.getBigUint64(0, true);
-    const parentThreadIdData = new BigUint64Array(rowCount).fill(parentThreadIdValue);
-    const parentSpanIdData = new Uint32Array(rowCount).fill(spanIdentity.parentSpanId);
-
-    return {
-      thread_id: { data: threadIdData, nullBitmap: null },
-      span_id: { data: spanIdData, nullBitmap: null },
-      parent_thread_id: { data: parentThreadIdData, nullBitmap: null },
-      parent_span_id: { data: parentSpanIdData, nullBitmap: null },
-    };
-  } else {
-    // Root span: parent columns are all null
-    const nullBitmap = new Uint8Array(Math.ceil(rowCount / 8)); // All zeros = all null
-    return {
-      thread_id: { data: threadIdData, nullBitmap: null },
-      span_id: { data: spanIdData, nullBitmap: null },
-      parent_thread_id: { data: new BigUint64Array(rowCount), nullBitmap, nullCount: rowCount },
-      parent_span_id: { data: new Uint32Array(rowCount), nullBitmap, nullCount: rowCount },
-    };
-  }
+// parent columns: filled when the span has a parent (pointer or remote parent), else null for its rows
+if (buf._hasParent) {
+  parentThreadIds.fill(buf.parent_thread_id, offset, offset + buf._writeIndex);
+  parentSpanIds.fill(buf.parent_span_id, offset, offset + buf._writeIndex);
+} else {
+  clearBitRange(parentThreadIdNulls, offset, buf._writeIndex);
+  clearBitRange(parentSpanIdNulls, offset, buf._writeIndex);
 }
 ```
+
+A parent column carries a null bitmap only when some row is null.
 
 ### Library-Specific Attribute Columns (Sparse/Nullable) <a id="smoo/lmao!n/arrow-table-schema.library-attrs"></a>
 
@@ -726,7 +742,7 @@ The `message` column serves different purposes based on entry type:
 | `ff-access`, `ff-usage`             | Flag name (e.g., `'advancedValidation'`, `'darkMode'`)       | -                           |
 | `period-start`                      | -                                                            | Period start timestamp (ns) |
 | `op-*` (all 8 op metric types)      | Op name (e.g., `'GET'`, `'createUser'`)                      | Metric value (count or ns)  |
-| `buffer-*` (all 4 buffer types)     | -                                                            | Metric value (count)        |
+| `buffer-*` (all 3 buffer types)     | -                                                            | Writes, spans, or capacity  |
 
 ### Format String Pattern (CRITICAL) <a id="smoo/lmao!n/arrow-table-message.format-string"></a>
 
@@ -736,8 +752,9 @@ When you write:
 
 ```typescript
 // Inside an op function:
-const myOp = op(async ({ log }) => {
+const myOp = defineOp('myOp', async ({ log, ok }) => {
   log.info('User {userId} created with {itemCount} items', { userId: 123, itemCount: 5 });
+  return ok(null);
 });
 ```
 
@@ -847,15 +864,16 @@ log.info('User {userId} created with {itemCount} items', { userId: 123, itemCoun
 The `entry_type` column uses a dictionary-encoded enum that covers all possible trace events. For complete definitions
 and low-level API details, see **[Entry Types and Logging Primitives](./01h_entry_types_and_logging_primitives.md)**.
 
-**Entry Types** (23 total):
+**Entry Types** (26 total, `ENTRY_TYPE_NAMES` in `packages/lmao/src/lib/schema/systemSchema.ts`):
 
-- **Span lifecycle** (4): `span-start`, `span-ok`, `span-err`, `span-exception`
-- **Log levels** (4): `info`, `debug`, `warn`, `error`
+- **Span lifecycle** (5): `span-start`, `span-ok`, `span-err`, `span-exception`, `span-retry`
+- **Log levels** (5): `trace`, `debug`, `info`, `warn`, `error`
 - **Feature flags** (2): `ff-access`, `ff-usage`
 - **Metrics - Period** (1): `period-start`
 - **Metrics - Op** (8): `op-invocations`, `op-errors`, `op-exceptions`, `op-duration-total`, `op-duration-ok`,
   `op-duration-err`, `op-duration-min`, `op-duration-max`
-- **Metrics - Buffer** (4): `buffer-writes`, `buffer-overflow-writes`, `buffer-created`, `buffer-overflows`
+- **Metrics - Buffer** (3): `buffer-writes`, `buffer-spans`, `buffer-capacity`
+- **Signals** (2): `signal-admitted`, `signal-routed`
 
 **Key Benefits**:
 
@@ -881,8 +899,16 @@ same Arrow table, same query tools, same export path.
 | 1000      | 1         | @myco/http   | op-duration-err   | GET     | 3535000000   |
 | 1000      | 1         | @myco/http   | op-duration-min   | GET     | 2100000      |
 | 1000      | 1         | @myco/http   | op-duration-max   | GET     | 1203500000   |
-| 1000      | 1         | @myco/http   | buffer-writes     |         | 50000        |
-| 1000      | 1         | @myco/http   | buffer-created    |         | 47           |
+| 1000      | 0         | @myco/http   | period-start      |         | 1000         |
+| 1000      | 0         | @myco/http   | buffer-writes     |         | 2800         |
+| 1000      | 0         | @myco/http   | buffer-spans      |         | 47           |
+| 1000      | 0         | @myco/http   | buffer-capacity   |         | 64           |
+
+Buffer rows come from each SpanBuffer class's `stats` (`createCapacityStatsTable`,
+`packages/lmao/src/lib/arrow/capacityStats.ts`): four rows per class, `period-start` (value: the period start in ns),
+`buffer-writes`, `buffer-spans` and `buffer-capacity`, attributed to the class's `OpMetadata`. They belong to no span,
+so `thread_id` and `span_id` are 0 and the parent columns are null. Utilization is the capacity tuner's signal,
+`buffer-writes / (buffer-spans × (buffer-capacity − 2))`: here 2800 / (47 × 62) ≈ 0.96.
 
 **Why This Design**:
 
@@ -1136,18 +1162,20 @@ WHERE entry_type LIKE 'op-%'
 GROUP BY message
 ORDER BY avg_err_ms DESC;
 
--- Buffer health metrics
+-- Buffer health: utilization per buffer class and period, as the capacity tuner computes it
+-- (above 1 means spans overflow; below 0.5 means capacity is wasted)
 SELECT
+  timestamp as period_start,
   package_name,
+  package_file,
   sum(CASE WHEN entry_type = 'buffer-writes' THEN uint64_value END) as total_writes,
-  sum(CASE WHEN entry_type = 'buffer-overflow-writes' THEN uint64_value END) as overflow_writes,
-  sum(CASE WHEN entry_type = 'buffer-created' THEN uint64_value END) as buffers_created,
-  sum(CASE WHEN entry_type = 'buffer-overflows' THEN uint64_value END) as overflow_events,
-  overflow_writes * 100.0 / total_writes as overflow_pct
+  sum(CASE WHEN entry_type = 'buffer-spans' THEN uint64_value END) as spans_created,
+  max(CASE WHEN entry_type = 'buffer-capacity' THEN uint64_value END) as capacity,
+  total_writes / nullif(spans_created * (capacity - 2), 0) as utilization
 FROM traces
-WHERE entry_type LIKE 'buffer-%'
-GROUP BY package_name
-ORDER BY overflow_pct DESC;
+WHERE entry_type IN ('buffer-writes', 'buffer-spans', 'buffer-capacity')
+GROUP BY timestamp, package_name, package_file
+ORDER BY utilization DESC;
 ```
 
 ## Performance Characteristics <a id="smoo/lmao!n/arrow-table.perf"></a>
@@ -1270,9 +1298,9 @@ efficiency and shared dictionaries.
 
 The conversion lives in `packages/lmao/src/lib/convertToArrow.ts` (`convertSpanTreeToArrowTable`, the two-pass tree walk
 of [01k](./01k_tree_walker_and_arrow_conversion.md)). The back-end is `@uwdata/flechette`. Final contiguous TypedArrays
-are wrapped by bounded views; overflow/null concatenation performs one explicit bulk copy, and UTF-8/dictionary
-construction owns its output. This is the shipped ownership behavior; every copied boundary remains explicit. Helpers
-live in `packages/arrow-builder/src/lib/arrow/data.ts`:
+are wrapped by bounded views; overflow chains are wrapped chunk by chunk, and the one explicit bulk copy is for a
+consumer that requires one contiguous region (the copy contract above). UTF-8/dictionary construction owns its output,
+and every copied boundary is explicit. Helpers live in `packages/arrow-builder/src/lib/arrow/data.ts`:
 
 - `createUint8Data` / `createUint16Data` / `createUint32Data` / `createInt32Data` / `createFloat64Data` /
   `createBoolData` — primitive columns borrow bounded `values.subarray(0, length)` payloads under the applicable
@@ -1296,7 +1324,7 @@ system columns. Dictionary building (`DictionaryBuilder`, `createSortedDictionar
 ```typescript
 // Borrow bounded views from each physical chunk.
 const valueArrays = buffers.map((buf) => buf.column.subarray(0, buf._writeIndex));
-// Shipped contiguous fallback: one Arrow-owned bulk concatenation copy.
+// Contiguous-consumer path: one Arrow-owned bulk concatenation copy, measured against the borrow.
 const allValues = concatenateFloat64Arrays(valueArrays);
 const { nullBitmap, nullCount } = concatenateNullBitmaps(buffers, columnName);
 // Wrap as a flechette Batch; the bounded payload is borrowed, while view/Batch wrappers are counted
@@ -1316,7 +1344,8 @@ vectors.push(new Column([batch]));
 
 - **No per-value builder append** for bulk primitive columns
 - **Bounded copies**: preserve chunks when possible; otherwise report one concatenation rather than repeated growth
-- **Direct borrowing where ownership permits**: source bytes remain pinned under a lease
+- **Direct borrowing of JS-heap buffers**: borrowed source buffers stay alive under a lease; WASM-backed columns are
+  copied
 - **Dictionary efficiency**: compatible indices can be wrapped with the shared dictionary
 
 ## Integration Points <a id="smoo/lmao!n/arrow-table.integration"></a>
@@ -1327,7 +1356,8 @@ This Arrow table structure integrates with:
   and low-level logging API
 - **[Columnar Buffer Architecture](./01b_columnar_buffer_architecture.md)**: Direct conversion from SpanBuffer columns.
   Also documents:
-  - **SpanIdentity**: 25-byte ArrayBuffer with comparison methods (`equals()`, `isParentOf()`, `isChildOf()`)
+  - **Span identity**: packed `[threadId][spanId]` section in `_system` (plus the trace id for a root), with O(1)
+    pointer-based `isParentOf()` / `isChildOf()`
   - **TraceId**: Branded string type with validation and W3C format generation
   - **ColumnBuffer Extension**: Mechanism for lmao to inject span-specific code into arrow-builder generated classes
 - **[Library Integration Pattern](./01e_library_integration_pattern.md)**: Prefixed columns from different libraries

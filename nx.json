@@ -61,7 +61,7 @@
       "cache": false
     },
     "cargo-test-group-real-apfs": {
-      "dependsOn": ["...", "attach-budget-check"]
+      "dependsOn": ["..."]
     }
   },
   "plugins": ["@smoothbricks/nx-plugin"],

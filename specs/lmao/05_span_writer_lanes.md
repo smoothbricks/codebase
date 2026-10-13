@@ -200,14 +200,24 @@ Unpatched `bun:ffi` (1.15–2.10 ns no-op, measured here) and a host's typed JSC
 
 ## 9. Enforcement
 
-**The writer is held by the existing machinery, plus one twin rule.**
+**The writer is held by the existing machinery, four shape rules, a per-lane census, and one twin rule.**
 
 - **Tier-0:** the workspace deny set applies to `lmao-core` and `lmao-wasm` via `[lints] workspace = true`; the
   disallowed-types list (no `std::sync::Mutex`, no default-hasher maps on row paths) binds the row store.
-- **Allocation census:** `lmao-core/tests/thread_buffer_alloc.rs` runs a counting global allocator: open, end, log and
-  tag allocate nothing after warmup, and neither does a whole write–flush–retain cycle of a long-lived store, overflow
-  block included.
-- **Tier-1b row:**
+- **Tier-1 shapes:** the writer trips none of these shapes on a row path. `SHAPE-FMTROW`: messages cross as ordinals or
+  vocabulary ids, never as formatted strings (`format!`). `SHAPE-CAP0`/`SHAPE-SEED`: blocks are pushed whole at fixed
+  capacity (`thread_buffer.rs` `ensure_rows`), never grown from zero or seeded row by row. `SHAPE-RMWROW`: span-id
+  allocation is thread-local, with no shared atomic read-modify-write per row. `SHAPE-SPILL`: the arena is sized at
+  startup, `clear()`ed, and never grown mid-lane.
+- **Boundary signatures:** every binding entry takes borrows (`&str`, `*const u8` + length) and returns `u64`/`u8`
+  scalars; no `String`, `Vec` or `Box<dyn>` crosses, and the Rust side's out-state is the row store sized at startup.
+- **Tier-2 census, per lane:** `lmao-core/tests/thread_buffer_alloc.rs` runs a counting global allocator: open, end, log
+  and tag allocate nothing after warmup, and neither does a whole write–flush–retain cycle of a long-lived store,
+  overflow block included. Each per-element symbol makes `calls ≤ 2` with `grow = 0`, and the itemized residue after
+  warmup is first-seen interns, owned by the arena. Every native-row-store lane (wasm, plain-Bun `thread_ffi`, an
+  embedding host) shows the same symbols with the same counts. JS-heap lanes are outside the Rust census; their gate is
+  the ABBA harness floors (`packages/lmao/benchmarks/abba-lanes.ts`, floors, not means).
+- **Tier-1 twin row:**
 
 | Rule       | Input                                      | Pass condition                                                                                                                                               | Start tier  |
 | ---------- | ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----------- |

@@ -54,8 +54,8 @@ ns) bounds the win at a few ns per write; only worth it bundled with the checker
 ### 4. Column-name discipline under library composition (spec 01e)
 
 Any inliner emission — TS or Go — must write **library-local (unprefixed)** column names. `.prefix()`/`.mapColumns()`
-remapping is cold-path-only via `RemappedBufferView` at Arrow conversion. The transformer must never resolve prefixes
-into hot-path writes; offsets/constants it folds are per-library-schema, not per-application-schema.
+remapping is cold-path-only via the span's `RemapDescriptor` at Arrow conversion. The transformer must never resolve
+prefixes into hot-path writes; offsets/constants it folds are per-library-schema, not per-application-schema.
 
 ### 5. Native lmao hosts don't need the transformer
 
@@ -72,8 +72,8 @@ The ttsc Go plugin implements bounded, Promise-preserving span setup plus packed
 
 A checker-proved `ctx.span(name, op, ...args)` with zero through eight trailing arguments may become the Promise-based
 `ctx.spanN(...)` ABI when both receiver and Op are stable and every expanded value can be evaluated once. The emitted
-child is `Object.create(ctx)`, and the Op's buffer class, remapped view, metadata, function, and runtime hint are passed
-directly. Inline arrow/function spans use the same fixed-arity Promise ABI with the receiver's buffer data.
+child is `Object.create(ctx)`, and the Op's buffer class, remap descriptor, metadata, function, and runtime hint are
+passed directly. Inline arrow/function spans use the same fixed-arity Promise ABI with the receiver's buffer data.
 
 Dynamic or unstable expressions such as `getCtx().span(name, getOp(), ...args)` remain byte-shape calls to public
 `span()`: receiver and Op are evaluated once in source order, and Promise scheduling is unchanged. The transformer also
@@ -198,8 +198,9 @@ return ctx.spanVocabulary1(LINE, $$binding[2], completeJobOp, job.id);
 
 Private seam names may change, but warmed registered writes use direct `binding[ordinal]` loads and fixed monomorphic
 stores with zero object, array, rest-argument, or interpolated-string allocation. The target span-name seam remains
-Promise-based like `span1`; dynamic names continue through public `span(name, ...)`. Dense index zero is valid, and
-nullable rows use a validity bitmap rather than an index sentinel. A predictable overflow/slow path remains correct.
+Promise-based like `span1`; a dynamic name lowers to the same `spanN` call with its string operand. Dense index zero is
+valid, and nullable rows use a validity bitmap rather than an index sentinel. A predictable overflow/slow path remains
+correct.
 
 ### Versioned fragment registration
 
@@ -208,7 +209,7 @@ The runtime type contract, separate from emitted JavaScript, is:
 ```typescript
 type VocabularyFragmentV1 = {
   schemaVersion: 1;
-  idAlgorithm: 'sha256-24-v1';
+  idAlgorithm: 'sha256-32-v1';
   contentHash: string;
   ids: Uint32Array;
   kindTags: Uint8Array;
@@ -228,7 +229,7 @@ u32le textLen | text UTF8 | u16le fieldCount |
 repeated(u16le nameLen | name UTF8 | u16le columnLen | column UTF8)
 ```
 
-`kindTags[i]` is `1` (`LOG_TEMPLATE`) or `2` (`SPAN_NAME`). `ids[i]` is the first 24 bits, interpreted big-endian, of
+`kindTags[i]` is `1` (`LOG_TEMPLATE`) or `2` (`SPAN_NAME`). `ids[i]` is the first 32 bits, interpreted big-endian, of
 `SHA-256(kindTag || recordBytes)`. `contentHash` is lowercase SHA-256 hex of:
 
 ```text
@@ -249,16 +250,17 @@ transform. Bundling retains installation/registration side effects and each call
 
 The runtime validates then copies or merges inputs into a runtime-owned immutable dictionary generation. New fragments
 append unseen values in registration order; dense indices are not sorted or canonical. Existing bindings remain
-prefix-valid forever, and each generation is exactly its predecessor plus appended values. An `ArrowLease` pins the
-exact backing store, WASM epoch, chunks, and dictionary generation used by its batch until explicit release. Stable IDs
-and content bytes—not dense indices—provide deterministic cross-order identity and checksums; only decoded values and
-schema semantics are deterministic across registration orders.
+prefix-valid forever, and each generation is exactly its predecessor plus appended values. An `ArrowLease` pins the span
+topology, JS-heap chunks, and dictionary generation used by its batch until explicit release; WASM-backed columns are
+copied, so a lease never pins a WASM epoch. Ids and content bytes—not dense indices—provide deterministic cross-order
+identity and checksums; only decoded values and schema semantics are deterministic across registration orders.
 
-Registration is idempotent for byte-identical fragments and deduplicates equal `(kindTag,id,recordBytes)` records.
-Reusing an ID for different kind/bytes, or `contentHash` for another fragment, is fatal before the fragment is writable.
-An unavailable/incompatible callback is a strict-build diagnostic or startup failure, never a guessed index. Startup
-contributes bindings to the immutable `PhysicalLayoutPlan`; live shapes never mutate and warmed writes have no
-registration/version branch.
+Registration is idempotent for byte-identical fragments and deduplicates equal `(kindTag,recordBytes)` records. An id is
+a hash, not a unique key: registration probes the records filed under an id deterministically, reuses an equal record's
+dense index and appends any other, so an id collision is never fatal (01o). Reusing `contentHash` for another fragment
+is fatal before the fragment is writable. An unavailable/incompatible callback is a strict-build diagnostic or startup
+failure, never a guessed index. Startup contributes bindings to the immutable `PhysicalLayoutPlan`; live shapes never
+mutate and warmed writes have no registration/version branch.
 
 ### Diagnostics, fallbacks, and order
 
@@ -274,12 +276,12 @@ field value expressions, and other side effects remain at their source-relative 
 move into module registration. Vocabulary lowering also preserves the public span contract: automatic `span()` to
 `spanAutoN` selection remains forbidden, so Promise assimilation and microtask turns do not change.
 
-### Promotion gates
+### Acceptance gates
 
-Repo-standard Mitata scenarios must compare `plugin-off`, `plugin-on/current`, and target variants with a
-position-balanced schedule in order-reversed independent processes. They record machine-readable raw samples, semantic
-checksums, p50/p95/p99/p99.9, and allocation/GC metadata where available, and produce a commit-message-ready summary.
-Any checksum, decode, collision, or evaluation-order difference fails promotion.
+Repo-standard Mitata scenarios must compare `plugin-off` and the global-vocabulary variants with a position-balanced
+schedule in order-reversed independent processes. They record machine-readable raw samples, semantic checksums,
+p50/p95/p99/p99.9, and allocation/GC metadata where available, and produce a commit-message-ready summary. Any checksum,
+decode, or evaluation-order difference fails the gate.
 
 Semantic acceptance covers `static` templates, `structured` fields and brace escapes, dynamic debug/trace text, literal
 `SPAN_NAME` entries, and dynamic span-name fallback. It checks binding length, append-only prefix stability, dense zero
@@ -288,20 +290,20 @@ under at least two reversed registration orders.
 
 Measurements are separate for `startup`, `span setup`, `warmed entry write`, `overflow/slow path`, and
 `per-request flush`; one phase cannot hide another. The warmed target must allocate zero, use fixed monomorphic stores,
-improve p50 by at least 10% over `plugin-on/current`, and regress no reported tail percentile by more than 3%. The
-overflow path must remain correct and bounded with no greater than 3% p99.9 regression. Per-request flush must reuse the
+improve p50 by at least 10% over `plugin-off`, and regress no reported tail percentile by more than 3%. The overflow
+path must remain correct and bounded with no greater than 3% p99.9 regression. Per-request flush must reuse the
 `PhysicalLayoutPlan`, process-dense Arrow vocabulary, and `ArrowLease`, allocate few or no objects, and regress no
 percentile by more than 3%. Startup and span setup costs are explicit and must not regress more than 3% unless the
-commit summary names and justifies the trade. Until every gate passes, the target remains unpromoted and no
-zero-overhead claim is permitted.
+commit summary names and justifies the trade. A change that fails a gate does not land, and no zero-overhead claim is
+permitted without a passing run.
 
 ## The bigger design space: typed macros over the schema, not just call sites
 
 The verdicts above treat the transformer as a call-site rewriter. Its real power is that it sees **the schema
-definitions themselves** (`defineLogSchema`/`defineModule` object literals: field kinds, enum values, eagerness) _and_
-**every call site in the program**. That enables a class of whole-program, compile-time decisions that runtime codegen
-structurally cannot make — lmao's runtime `new Function()` sees one schema value at startup; it never sees usage.
-Ordered by expected value:
+definitions themselves** (`defineLogSchema`/`defineOpContext` object literals: field kinds, enum values, eagerness)
+_and_ **every call site in the program**. That enables a class of whole-program, compile-time decisions that runtime
+codegen structurally cannot make — lmao's runtime `new Function()` sees one schema value at startup; it never sees
+usage. Ordered by expected value:
 
 ### A. Compile-time buffer-class emission (kill runtime codegen entirely)
 
@@ -387,18 +389,19 @@ The refuted micro-batching staged values and paid `.set()` overhead. A possible 
 constants** such as entry type, the already-implemented Op-local template ID, and line number into one u32/u64 literal
 and emit one element write instead of separate lane writes. No packed row header is implemented or measured.
 
-### F. Template/name dictionaries: shipped Op-local store versus specified global target
+### F. Template/name dictionaries: Op-local store and the global vocabulary ABI
 
 **Implemented subset.** Literal log messages eligible under the shipped checker rules use private per-Op `u16` IDs in
 the hot store. This subset deduplicates and avoids the per-row literal string write, then restores the exact public
 string at cold conversion. It does **not** create a program-wide dictionary, a stable trace vocabulary, or a new Arrow
 column. The local-store benchmark did not meet the promotion gate, so no performance win is claimed.
 
-**Specified, not shipped.** The clean-cutover ABI above expands checker-semantic coverage to `static`/`structured`
-logger callsites and literal `SPAN_NAME` records, emits stable content-derived `u24` identities, and registers fragments
-into append-only runtime-dense Arrow bindings. Independently compiled libraries self-register without source at the
-consuming build. None of stable IDs, fragment registration, `VocabularyBinding`, registered span names, or runtime-owned
-immutable dictionary generations is shipped. The target cannot be promoted until its phase-specific gates pass.
+**Global vocabulary ABI.** The clean-cutover ABI above expands checker-semantic coverage to `static`/`structured` logger
+callsites and literal `SPAN_NAME` records, emits content-derived 32-bit ids, and registers fragments into append-only
+runtime-dense Arrow bindings: `plugin/driver/vocabulary_registration.go` emits the registration and
+`packages/lmao/src/lib/vocabularyRegistry.ts` returns each fragment's `VocabularyBinding`. Independently compiled
+libraries self-register without source at the consuming build. It replaces the Op-local store in one change that removes
+the store and its lane, and that change must pass the acceptance gates above.
 
 ### G. Smaller, cheap wins
 
@@ -421,8 +424,8 @@ analyses (usage-driven pre-allocation, dead columns, vocabulary contracts) that 
 - **Lint-stage contract enforcement.** ttsc plugins can also run at the check stage and emit real diagnostics. A future
   program-wide trace-vocabulary contract could make renaming a span/template without updating a checked-in manifest, or
   a dynamic message where stable vocabulary is required, a compile error. Today dynamic messages are a supported
-  fallback, and no checked-in vocabulary manifest is generated. Masking gaps on fields typed as PII and the
-  one-`defineModule`-per-file invariant could likewise become diagnostics rather than runtime/build failures.
+  fallback, and no checked-in vocabulary manifest is generated. Masking gaps on fields typed as PII could likewise
+  become a diagnostic rather than a runtime failure.
 - **Compile-time log-level stripping.** Production config → `log.debug`/ `log.trace` statements deleted at emit (not
   branched over). Zero-cost disabled levels; composes with feature flags (01p) for flag-gated spans. The "stripped, not
   stubbed" law from the deterministic simulation toolchain, applied to TS.
@@ -463,8 +466,8 @@ analyses (usage-driven pre-allocation, dead columns, vocabulary contracts) that 
 4. **Next, measure first**: benchmark the shipped fixed-arity/hint path and the separate Op-local template-ID path on
    target runtimes. Keep structural correctness and ABI claims separate from performance claims.
 5. **Implement behind measurement**: compile-time buffer-class emission (A), static eager sets (B), and the specified
-   registered vocabulary target (F). Keep their benchmark variants separate from the shipped private Op-local lane;
-   clean cutover removes that lane only after all semantic and performance gates pass.
+   registered vocabulary target (F). The clean cutover removes the private Op-local lane in the same change, which must
+   pass every semantic and performance gate.
 6. **With lmao-wasm, only after measurement**: evaluate an `alloc_span_with_columns` descriptor export for allocation
    batching (D).
 7. **Don't**: value-level write batching or export-call amortization for tag/log writes; the measurements above refute

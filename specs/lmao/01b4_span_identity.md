@@ -372,46 +372,49 @@ function generateTraceId(): TraceId {
 ### Usage Pattern
 
 ```typescript
-// At request boundary - generate or accept trace ID
-const trace_id = request.headers['x-trace-id'] ? createTraceId(request.headers['x-trace-id']) : generateTraceId();
+// At request boundary - accept an incoming trace ID; without one, the Tracer generates one (generateTraceId)
+const incoming = request.headers['x-trace-id'];
+const overrides = incoming ? { trace_id: createTraceId(incoming) } : {};
 
-// Pass to root span, _children walk parent chain
-// Op's internal wrapper creates the buffer
-// lineNumber is written directly to lineNumber_values[0] inside _invoke(), NOT passed to createSpanBuffer
-const rootSpan = createSpanBuffer(schema, module, spanName, trace_id);
-rootSpan.lineNumber_values[0] = lineNumber; // Direct TypedArray write
+const handleRequest = defineOp('handle-request', async (ctx, request: Request) => {
+  await ctx.span('load-user', loadUserOp, request);
+  // All spans in trace share the SAME string reference
+  console.log(ctx.buffer.trace_id === ctx.buffer._traceRoot.trace_id); // true (same reference)
+  return ctx.ok(null);
+});
 
-const childSpan = createChildSpanBuffer(rootSpan, childModule, childSpanName);
-childSpan.lineNumber_values[0] = childLineNumber; // Direct TypedArray write
-
-// All spans in trace share the SAME string reference
-console.log(rootSpan.trace_id === childSpan.trace_id); // true (same reference)
+// The Tracer builds the TraceRoot (holding trace_id) and the root SpanBuffer, writes row 0, and runs the Op.
+// Each child span's buffer reaches the same TraceRoot through its parent; the transformer passes each span()'s line,
+// which span setup writes with buffer.line(0, line).
+await trace('handle-request', overrides, handleRequest, request);
 ```
 
 ### SpanBuffer Integration
 
-> **Implementation status** (system state). The realized layout differs from an earlier "`span_id: SpanIdentity` 25-byte
-> ArrayBuffer" sketch. In `packages/lmao/src/lib/spanBuffer.ts` (the generated buffer class) the identity is a **packed
-> byte section** inside the buffer's `_system` ArrayBuffer: `[threadId(8)][spanId(4)]` for a CHILD (12 bytes),
-> `[threadId(8)][spanId(4)][traceIdLen(1)][traceId(N)]` for a ROOT (13 + N bytes); a CHAINED overflow buffer **shares**
-> the parent's `_identity` reference. `span_id` is a `uint32` getter reading bytes `[8:12]`; `thread_id` a `uint64`
-> getter over `[0:8]`; `trace_id` walks the parent chain to the root and decodes. `parent_span_id` / `parent_thread_id`
-> delegate to the parent **pointer** (no copied bytes). `isParentOf` / `isChildOf` are O(1) **pointer** comparisons
-> (`this === other._parent`), exactly the "parent ancestry via pointer" decision below — not a `SpanIdentity` method.
+The identity is a **packed byte section** inside the buffer's `_system` ArrayBuffer. The generated buffer class in
+`packages/lmao/src/lib/spanBuffer.ts` lays it out as `[threadId(8)][spanId(4)]` for a CHILD (12 bytes) and
+`[threadId(8)][spanId(4)][traceIdLen(1)][traceId(N)]` for a ROOT (13 + N bytes). A CHAINED overflow buffer **shares**
+the parent's `_identity` reference. `span_id` is a `uint32` getter reading bytes `[8:12]`. `thread_id` returns the
+buffer's `_threadId` field, the same `uint64` the identity holds at bytes `[0:8]` (`copyThreadIdTo` copies those bytes
+into a destination the caller supplies). `trace_id` returns `_traceRoot.trace_id`, the one string every buffer of the
+trace shares through its trace root. `parent_span_id` / `parent_thread_id` delegate to the parent **pointer** (no copied
+bytes), and to the trace root's remote parent for a root that continues a remote trace. `isParentOf` / `isChildOf` are
+O(1) **pointer** comparisons (`this === other._parent`), the "parent ancestry via pointer" decision below, not a
+`SpanIdentity` method.
 
 ```typescript
-// Realized shape (packages/lmao/src/lib/spanBuffer.ts, generated getters):
+// Generated getters (packages/lmao/src/lib/spanBuffer.ts):
 interface SpanBuffer {
-  // TraceId is a shared string reference (zero-copy across spans), walked up to the root
-  get trace_id(): TraceId;
+  // TraceId is a shared string reference (zero-copy across spans), held by the trace root
+  get trace_id(): TraceId; // this._traceRoot.trace_id
 
-  // span_id / thread_id read from the packed identity bytes (uint32 / uint64)
+  // span_id reads the packed identity bytes; thread_id is the cached copy of bytes [0:8]
   get span_id(): number; // bytes [8:12] of _identity
-  get thread_id(): bigint; // bytes [0:8] of _identity
+  get thread_id(): bigint; // this._threadId
 
-  // parent ids delegate to the parent pointer (no separate storage)
-  get parent_span_id(): number; // this._parent?.span_id ?? 0
-  get parent_thread_id(): bigint; // this._parent?.thread_id ?? 0n
+  // parent ids delegate to the parent pointer, then to a remote parent (no separate storage)
+  get parent_span_id(): number; // this._parent?.span_id ?? this._traceRoot.remoteParent?.span_id ?? 0
+  get parent_thread_id(): bigint; // this._parent?.thread_id ?? this._traceRoot.remoteParent?.thread_id ?? 0n
 
   // O(1) pointer comparison (NOT a trace_id + SpanIdentity check)
   isParentOf(other: SpanBuffer): boolean; // this === other._parent
