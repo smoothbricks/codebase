@@ -630,7 +630,8 @@
                 }
               ],
               "pid": 4242,
-              "program": "cargo"
+              "program": "cargo",
+              "truncated": false
             },
             "observedCpuPermille": 950
           },
@@ -898,7 +899,8 @@
               }
             ],
             "pid": 4242,
-            "program": "cargo"
+            "program": "cargo",
+            "truncated": false
           },
           "observedCpuPermille": 950
         },

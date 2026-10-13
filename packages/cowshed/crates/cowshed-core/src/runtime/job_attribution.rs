@@ -195,6 +195,7 @@ impl Census {
                             pid: life.identity.pid,
                             program: image.program.clone(),
                             argv: image.argv.clone(),
+                            truncated: image.truncated,
                         },
                         observed_cpu_permille: permille,
                     }
@@ -315,6 +316,7 @@ mod tests {
         ProcessImage {
             program: program.to_owned(),
             argv: vec![CommandArg::new(program)],
+            truncated: false,
         }
     }
 
@@ -443,6 +445,7 @@ mod tests {
                     pid: 101,
                     program: "yes".into(),
                     argv: vec![CommandArg::new("yes")],
+                    truncated: false,
                 },
                 observed_cpu_permille: 1_000,
             }

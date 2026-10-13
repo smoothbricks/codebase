@@ -14,7 +14,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::api::dto::{CommandArg, ExitStatus, JobId, UtcTimestamp};
+use crate::api::dto::{
+    CommandArg, ExitStatus, JobId, MAX_ARGV_BYTES, MAX_COMMAND_ARG_BYTES, UtcTimestamp,
+};
 use crate::api::process::{
     JobProcessSample, JobProcessTree, ProcessBlockedOn, ProcessCoverage, ProcessCoverageGap,
     ProcessExit, ProcessUsage,
@@ -38,7 +40,47 @@ pub struct ProcessIdentity {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProcessImage {
     pub program: String,
+    /// Within the record bounds every observation keeps (07_api.md, "Process-tree
+    /// observations"): [`Self::observed`] cuts what exceeds them and says so in `truncated`.
     pub argv: Vec<CommandArg>,
+    pub truncated: bool,
+}
+
+impl ProcessImage {
+    /// The image the kernel reported, its argv cut to at most [`MAX_COMMAND_ARG_BYTES`] per
+    /// argument and [`MAX_ARGV_BYTES`] in all. A process may legally hold more (macOS bounds
+    /// only the total, at `KERN_ARGMAX`), and an argument past the bounds can be in no record:
+    /// one leader seen before `sandbox-exec -p` exec'd carried its whole profile as one argument
+    /// and failed its job's record. Arguments past the total bound are dropped, the one that
+    /// crosses it is cut to what fits, and `truncated` says that anything was lost.
+    #[cfg(unix)]
+    pub fn observed(program: String, argv: Vec<Vec<u8>>) -> Self {
+        use std::os::unix::ffi::OsStringExt as _;
+        let mut truncated = false;
+        let mut room = MAX_ARGV_BYTES;
+        let mut kept = Vec::with_capacity(argv.len());
+        for mut argument in argv {
+            if argument.len() > MAX_COMMAND_ARG_BYTES {
+                argument.truncate(MAX_COMMAND_ARG_BYTES);
+                truncated = true;
+            }
+            if argument.len() > room {
+                argument.truncate(room);
+                truncated = true;
+                if !argument.is_empty() {
+                    kept.push(CommandArg::new(std::ffi::OsString::from_vec(argument)));
+                }
+                break;
+            }
+            room -= argument.len();
+            kept.push(CommandArg::new(std::ffi::OsString::from_vec(argument)));
+        }
+        Self {
+            program,
+            argv: kept,
+            truncated,
+        }
+    }
 }
 
 /// One thing the observer saw, in the order the kernel reported it for that process.
@@ -114,6 +156,7 @@ impl Life {
             ppid: self.ppid,
             program: self.image.program.clone(),
             argv: self.image.argv.clone(),
+            truncated: self.image.truncated,
             born_at: self.born_at.clone(),
             usage,
             blocked_on,
@@ -337,7 +380,7 @@ impl ProcessTreeFold {
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
-    use std::os::unix::ffi::OsStringExt;
+    use std::os::unix::ffi::{OsStrExt as _, OsStringExt};
 
     use super::*;
 
@@ -359,6 +402,7 @@ mod tests {
                 .iter()
                 .map(|arg| CommandArg::new(OsString::from_vec(arg.to_vec())))
                 .collect(),
+            truncated: false,
         }
     }
 
@@ -678,6 +722,7 @@ mod tests {
                         "ppid": 1,
                         "program": "/bin/sh",
                         "argv": serde_json::to_value(&tree.processes[0].argv).unwrap(),
+                        "truncated": false,
                         "bornAt": "2026-10-07T00:00:00Z",
                     },
                     {
@@ -685,6 +730,7 @@ mod tests {
                         "ppid": 100,
                         "program": "/bin/sh",
                         "argv": serde_json::to_value(&tree.processes[1].argv).unwrap(),
+                        "truncated": false,
                         "bornAt": "2026-10-07T00:00:01Z",
                         "exit": {
                             "status": { "kind": "signaled", "signal": 9, "coreDumped": false },
@@ -706,5 +752,62 @@ mod tests {
             .unwrap()
             .remove("exitedAt");
         assert!(serde_json::from_value::<JobProcessTree>(exit_without_time).is_err());
+    }
+
+    /// An observed argument past the 128 KiB a record holds -- the whole profile a leader
+    /// observed before `sandbox-exec -p` exec'd carried -- is cut to it, and the image says so;
+    /// an argv within the bounds is kept byte for byte.
+    #[test]
+    fn an_observed_argument_past_the_record_bound_is_cut_and_marked() {
+        let profile = vec![b'('; MAX_COMMAND_ARG_BYTES + 1];
+        let image = ProcessImage::observed(
+            "/usr/bin/sandbox-exec".into(),
+            vec![
+                b"/usr/bin/sandbox-exec".to_vec(),
+                b"-p".to_vec(),
+                profile.clone(),
+                b"--".to_vec(),
+            ],
+        );
+        assert!(image.truncated);
+        assert_eq!(image.argv.len(), 4, "only the long argument is cut");
+        assert_eq!(
+            image.argv[2].as_os_str().as_bytes(),
+            &profile[..MAX_COMMAND_ARG_BYTES]
+        );
+        assert_eq!(image.argv[3], CommandArg::new("--"));
+
+        let within = ProcessImage::observed(
+            "/bin/sh".into(),
+            vec![
+                b"sh".to_vec(),
+                vec![b'x'; MAX_COMMAND_ARG_BYTES],
+                b"\xff".to_vec(),
+            ],
+        );
+        assert!(!within.truncated);
+        assert_eq!(within.argv[1].as_os_str().len(), MAX_COMMAND_ARG_BYTES);
+        assert_eq!(within.argv[2].as_os_str().as_bytes(), b"\xff");
+    }
+
+    /// Past [`MAX_ARGV_BYTES`] in all, the argument that crosses the bound is cut to what fits
+    /// and every later one is dropped.
+    #[test]
+    fn an_observed_argv_past_the_total_bound_keeps_only_what_fits() {
+        let whole = MAX_ARGV_BYTES / MAX_COMMAND_ARG_BYTES;
+        let mut argv = vec![vec![b'a'; MAX_COMMAND_ARG_BYTES - 1]; whole];
+        argv.push(vec![b'b'; 100]);
+        argv.push(b"dropped".to_vec());
+        let image = ProcessImage::observed("/bin/echo".into(), argv);
+        assert!(image.truncated);
+        assert_eq!(image.argv.len(), whole + 1);
+        let room = MAX_ARGV_BYTES - whole * (MAX_COMMAND_ARG_BYTES - 1);
+        assert_eq!(
+            image.argv[whole].as_os_str().as_bytes(),
+            vec![b'b'; room].as_slice(),
+            "the crossing argument keeps the bytes the total has room for"
+        );
+        let total: usize = image.argv.iter().map(|arg| arg.as_os_str().len()).sum();
+        assert_eq!(total, MAX_ARGV_BYTES);
     }
 }

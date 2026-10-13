@@ -6224,6 +6224,7 @@ mod tests {
                     pid: leader_pid,
                     program: "/usr/bin/cc".into(),
                     argv: vec![CommandArg::new("/usr/bin/cc")],
+                    truncated: false,
                 },
                 observed_cpu_permille: 955,
             },
@@ -6259,6 +6260,80 @@ mod tests {
             stdout: watermark(5, 3),
             stderr: watermark(2_097_152, 2_097_152),
         }
+    }
+
+    /// The record a loaded `exec` failed: its leaf was the leader seen before `sandbox-exec -p`
+    /// exec'd, whose profile was one argument past the 128 KiB a record holds, and the write
+    /// answered "artifact Arrow IPC failure: command argument exceeds the 131072-byte limit". The
+    /// observation now keeps that argument's first 128 KiB, marked truncated, and the record
+    /// writes and reads back as it was.
+    #[test]
+    fn a_leaf_whose_argument_exceeded_the_record_bound_is_recorded_cut_and_marked() {
+        let profile = vec![b'('; MAX_COMMAND_ARG_BYTES + 1];
+        let argv = || {
+            vec![
+                b"/usr/bin/sandbox-exec".to_vec(),
+                b"-p".to_vec(),
+                profile.clone(),
+                b"--".to_vec(),
+                b"/bin/sh".to_vec(),
+            ]
+        };
+        let record = |leaf: JobProcessLeaf| {
+            let mut resources = sample(10, 1, 1);
+            resources.leaf = JobLeafAttribution::Attributed {
+                leaf,
+                observed_cpu_permille: 990,
+            };
+            JobArtifactRecord {
+                exit: Some(ExitStatus::Exited { code: 0 }),
+                duration_ms: Some(1),
+                resources: Some(resources),
+                ..valid_job_record(10)
+            }
+        };
+
+        use std::os::unix::ffi::OsStringExt as _;
+        let uncut = record(JobProcessLeaf {
+            pid: 1,
+            program: "/usr/bin/sandbox-exec".into(),
+            argv: argv()
+                .into_iter()
+                .map(|argument| CommandArg::new(OsString::from_vec(argument)))
+                .collect(),
+            truncated: false,
+        });
+        assert_eq!(
+            job_record_to_batch(&uncut).unwrap_err().to_string(),
+            "artifact Arrow IPC failure: command argument exceeds the 131072-byte limit",
+            "the failure an uncut observation still meets"
+        );
+
+        let image = crate::runtime::process_tree::ProcessImage::observed(
+            "/usr/bin/sandbox-exec".into(),
+            argv(),
+        );
+        let cut = record(JobProcessLeaf {
+            pid: 1,
+            program: image.program,
+            argv: image.argv,
+            truncated: image.truncated,
+        });
+        let ProtectedRecord::Job(read) =
+            batch_to_protected_record(&job_record_to_batch(&cut).unwrap()).unwrap()
+        else {
+            panic!("a job record");
+        };
+        assert_eq!(read, cut);
+        let Some(JobResourceSample {
+            leaf: JobLeafAttribution::Attributed { leaf, .. },
+            ..
+        }) = read.resources
+        else {
+            panic!("an attributed leaf");
+        };
+        assert!(leaf.truncated);
+        assert_eq!(leaf.argv[2].as_os_str().len(), MAX_COMMAND_ARG_BYTES);
     }
 
     /// Each volume's usage is kept as it was sampled, read or not; a job that ran with no build

@@ -901,7 +901,7 @@ pub struct JobProcessTree {
     pub processes: Vec<JobProcessSample>,
     pub coverage: ProcessCoverage,
 }
-pub struct JobProcessLeaf { pub pid: u32, pub program: String, pub argv: Vec<CommandArg> }
+pub struct JobProcessLeaf { pub pid: u32, pub program: String, pub argv: Vec<CommandArg>, pub truncated: bool }
 pub enum ProcessBlockedOn {               // lock detail exists only on a lock: no stale path or holder
     None, Lock { path: String, holder: Option<LockHolder> }, Socket, Pipe, Child, Stdin, Disk,
 }
@@ -910,7 +910,8 @@ pub struct JobProcessSample {
     pub pid: u32,
     pub ppid: u32,
     pub program: String,
-    pub argv: Vec<CommandArg>,
+    pub argv: Vec<CommandArg>,                // at most 128 KiB per argument and 1 MiB in all
+    pub truncated: bool,                      // the exec's argv exceeded those bounds and was cut to them
     pub born_at: UtcTimestamp,
     pub usage: Option<ProcessUsage>,          // absent until its counters are first read, never zeroes
     pub blocked_on: Option<ProcessBlockedOn>, // absent when not observed, not fabricated `none`
@@ -973,6 +974,11 @@ pub enum JobAccounting {
     MacOsRusageChildren { cpu: CpuTotals, io: Option<StorageIoTotals>, reconciliation: UsageReconciliation },
 }
 ```
+
+An observation keeps every argv within the bounds a record holds (`MAX_COMMAND_ARG_BYTES`, `MAX_ARGV_BYTES`): an
+argument past 128 KiB keeps its first 128 KiB, the argument that crosses 1 MiB in all keeps what fits, later ones are
+dropped, and `truncated` says so. macOS bounds only a process's whole argv (`KERN_ARGMAX`), so a legal process can hold
+an argument no record could; a record written before this field reads it as `false`.
 
 Birth and parent identity are kernel observations retained internally, not fresh trust in numeric PID values.
 Per-process CPU counters are that process's own usage. Complete job counters have an independent, declared source and
