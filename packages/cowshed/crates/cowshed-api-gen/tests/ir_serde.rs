@@ -79,6 +79,66 @@ fn public_declaration_types_and_validators_are_the_owner_emitter_goldens() {
 }
 
 #[test]
+fn native_copy_and_static_size_follow_the_source_graph() {
+    let mut api = Api::default();
+    records::parse(
+        r#"
+        #[derive(Serialize, Clone, core::marker::Copy)]
+        pub struct Small { pub left: u32, pub right: u32 }
+        #[derive(Serialize, Clone, Copy)]
+        pub struct Large { pub words: [u64; 32] }
+        #[derive(Serialize)]
+        pub struct Nested { pub inner: Small, pub byte: u8 }
+        #[derive(Serialize, Clone, Copy)]
+        pub struct Forward { pub next: Later }
+        #[derive(Serialize, Clone, Copy)]
+        pub struct Symbolic { pub bytes: [u8; LIMIT] }
+        #[repr(align(64))]
+        #[derive(Serialize, Clone, Copy)]
+        pub struct Aligned { pub byte: u8 }
+        "#,
+        &mut api,
+        FIXTURE_MODULE,
+    )
+    .expect("source records");
+    assert!(api.records["Small"].copy);
+    assert_eq!(api.records["Small"].static_size, Some(8));
+    assert_eq!(api.records["Large"].static_size, Some(256));
+    assert!(!api.records["Nested"].copy);
+    assert_eq!(api.records["Nested"].static_size, Some(12));
+    assert_eq!(api.records["Forward"].static_size, None);
+    assert_eq!(api.records["Symbolic"].static_size, None);
+    assert_eq!(api.records["Aligned"].static_size, None);
+    records::parse(
+        "#[derive(Serialize, Clone, Copy)] pub struct Later { pub count: u32 }",
+        &mut api,
+        FIXTURE_MODULE,
+    )
+    .expect("later source file");
+    assert_eq!(api.records["Forward"].static_size, Some(4));
+}
+
+#[test]
+fn canonical_process_coverage_layouts_reuse_the_gap_discriminant_niche() {
+    let manifest = std::env::var_os("CARGO_MANIFEST_DIR")
+        .expect("cargo and nextest export the executing checkout's manifest path");
+    let project = std::path::Path::new(&manifest).join("../..");
+    let model = cowshed_api_gen::collect(&project).expect("canonical producer declarations");
+    for name in ["ProcessCoverage", "ProcessCoverageGap"] {
+        let record = &model.api.records[name];
+        assert!(
+            record.copy,
+            "{name} derives Copy in the actual producer source"
+        );
+        assert_eq!(
+            record.static_size,
+            Some(8),
+            "{name}: tag and payload layout"
+        );
+    }
+}
+
+#[test]
 fn numeric_refinements_import_tags_from_the_owner_emitter() {
     let mut api = Api::default();
     records::parse(
@@ -207,6 +267,9 @@ fn wire() -> Record {
         module: FIXTURE_MODULE.to_owned(),
         visibility: DeclarationVisibility::Public,
         docs: strings(&["A source-owned declaration.", "Second docs line."]),
+        copy: false,
+        static_size: None,
+        layout_known: true,
         serde: every_serde_fact(),
         projection: every_projection_fact(),
         shape: Shape::Struct(Fields::Named(vec![
@@ -261,6 +324,9 @@ fn choice() -> Record {
             path: "crate::api::fixture".to_owned(),
         },
         docs: strings(&["An externally tagged enum."]),
+        copy: true,
+        static_size: None,
+        layout_known: true,
         serde: Serde {
             tag: Some("kind".to_owned()),
             content: Some("data".to_owned()),
@@ -311,6 +377,9 @@ fn coordinates() -> Record {
         module: format!("{FIXTURE_MODULE}::inner"),
         visibility: DeclarationVisibility::Crate,
         docs: Vec::new(),
+        copy: false,
+        static_size: None,
+        layout_known: true,
         serde: Serde::default(),
         projection: Projection::default(),
         shape: Shape::Struct(Fields::Tuple(vec![
@@ -349,6 +418,9 @@ fn marker() -> Record {
         module: FIXTURE_MODULE.to_owned(),
         visibility: DeclarationVisibility::Private,
         docs: Vec::new(),
+        copy: false,
+        static_size: Some(0),
+        layout_known: true,
         serde: Serde::default(),
         projection: Projection::default(),
         shape: Shape::Struct(Fields::Unit),
@@ -362,6 +434,9 @@ fn borrowed() -> Record {
         module: FIXTURE_MODULE.to_owned(),
         visibility: DeclarationVisibility::Super,
         docs: Vec::new(),
+        copy: false,
+        static_size: None,
+        layout_known: true,
         serde: Serde::default(),
         projection: Projection::default(),
         shape: Shape::Alias(RustType::Reference {

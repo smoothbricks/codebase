@@ -650,6 +650,14 @@ omitted, changed and extra facts. Normal owner generation publishes that model a
 exposed through `@smoothbricks/cowshed/declaration-ir`. Consumers import these public types through their declared
 package dependency; no consumer generator produces an input to its own generic schema library's build.
 
+The declaration IR also retains whether the Rust AST derives `Copy` and its static native byte size. The owner computes
+sizes from primitives, literal fixed arrays, tuples, nested records and aliases, including native alignment padding.
+Sequential-discriminant enums carry a tag plus their largest payload; a single-data-arm enum reuses spare discriminant
+values in that payload when available. Explicit representations or discriminants, symbolic lengths, unresolved types and
+recursive layouts have unknown size. These are native calling-convention facts, not VO wire widths. A consumer that
+classifies a native helper by value emits a compile-time `size_of` assertion against the computed size, so a different
+compiler layout fails loudly instead of silently changing the calling convention.
+
 The public CLI health summary `GatewayStatus` and the daemon snapshot `DaemonStatus` are distinct declarations with
 distinct names. API and support collection share the same duplicate-name refusal; neither source shadows the other. This
 naming cutover changes no serialized field or status wire envelope. The control socket and gateway reconciliation

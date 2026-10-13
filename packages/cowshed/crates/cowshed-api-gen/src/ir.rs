@@ -23,6 +23,160 @@ pub struct DeclarationModel {
     pub modules: BTreeMap<String, String>,
 }
 
+impl Api {
+    /// Publish static native sizes after collection, including forward and cross-file references.
+    pub fn refresh_layouts(&mut self) {
+        let sizes: Vec<_> = self
+            .records
+            .values()
+            .map(|record| record_layout(record, self, 0).map(|layout| layout.size))
+            .collect();
+        for (record, size) in self.records.values_mut().zip(sizes) {
+            record.static_size = size;
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Layout {
+    size: u32,
+    align: u32,
+    spare_tags: u64,
+}
+
+fn aggregate_layout<'a>(
+    types: impl Iterator<Item = &'a RustType>,
+    api: &Api,
+    depth: usize,
+) -> Option<Layout> {
+    let mut size = 0_u32;
+    let mut align = 1_u32;
+    let mut single = None;
+    let mut count = 0_u32;
+    for ty in types {
+        let layout = type_layout(ty, api, depth)?;
+        size = size.checked_add(layout.size)?;
+        align = align.max(layout.align);
+        count += 1;
+        single = Some(layout);
+    }
+    // Natural Rust records group fields by alignment. Sizes are multiples of each field's
+    // power-of-two alignment, so only trailing padding remains after that grouping.
+    let size = size.checked_add(align - 1)? & !(align - 1);
+    Some(Layout {
+        size,
+        align,
+        spare_tags: if count == 1 { single?.spare_tags } else { 0 },
+    })
+}
+
+fn fields_layout(fields: &Fields, api: &Api, depth: usize) -> Option<Layout> {
+    match fields {
+        Fields::Unit => Some(Layout {
+            size: 0,
+            align: 1,
+            spare_tags: 0,
+        }),
+        Fields::Named(fields) | Fields::Tuple(fields) => {
+            aggregate_layout(fields.iter().map(|field| &field.ty), api, depth)
+        }
+    }
+}
+
+fn enum_layout(variants: &[Variant], api: &Api, depth: usize) -> Option<Layout> {
+    let count = u64::try_from(variants.len()).ok()?;
+    let tag: u32 = match count {
+        0 => return None,
+        1..=256 => 1,
+        257..=65_536 => 2,
+        65_537..=4_294_967_296 => 4,
+        _ => return None,
+    };
+    let mut size = 0;
+    let mut align = tag;
+    let mut data_arms = 0;
+    let mut empty_arms = 0;
+    let mut payload = None;
+    for variant in variants {
+        let layout = fields_layout(&variant.fields, api, depth)?;
+        if layout.size == 0 {
+            empty_arms += 1;
+        } else {
+            data_arms += 1;
+            payload = Some(layout);
+        }
+        size = size.max(layout.size);
+        align = align.max(layout.align);
+    }
+    if data_arms == 1 {
+        let payload = payload?;
+        if payload.spare_tags >= empty_arms {
+            return Some(Layout {
+                spare_tags: payload.spare_tags - empty_arms,
+                ..payload
+            });
+        }
+    }
+    // A sequential tag precedes the largest payload, padded to its alignment. The unused tag
+    // values are niches a containing one-data-arm enum can use without adding another tag.
+    let payload_at = tag.checked_add(align - 1)? & !(align - 1);
+    let size = payload_at.checked_add(size)?.checked_add(align - 1)? & !(align - 1);
+    Some(Layout {
+        size,
+        align,
+        spare_tags: (1_u64 << (tag * 8)) - count,
+    })
+}
+
+fn record_layout(record: &Record, api: &Api, depth: usize) -> Option<Layout> {
+    if !record.layout_known || depth > api.records.len() {
+        return None;
+    }
+    match &record.shape {
+        Shape::Struct(fields) => fields_layout(fields, api, depth),
+        Shape::Alias(ty) => type_layout(ty, api, depth),
+        Shape::Enum(variants) => enum_layout(variants, api, depth),
+    }
+}
+
+fn type_layout(ty: &RustType, api: &Api, depth: usize) -> Option<Layout> {
+    match ty {
+        RustType::Named { name, arguments } if arguments.is_empty() => {
+            let width = match name.as_str() {
+                "bool" | "u8" | "i8" => Some(1),
+                "u16" | "i16" => Some(2),
+                "u32" | "i32" | "f32" | "char" => Some(4),
+                "u64" | "i64" | "f64" => Some(8),
+                "u128" | "i128" => Some(16),
+                _ => None,
+            };
+            if let Some(size) = width {
+                return Some(Layout {
+                    size,
+                    align: size,
+                    spare_tags: 0,
+                });
+            }
+            let record = api.records.get(last_segment(name))?;
+            record_layout(record, api, depth + 1)
+        }
+        RustType::Array { element, length } => {
+            let count = syn::parse_str::<syn::LitInt>(length)
+                .ok()?
+                .base10_parse::<u32>()
+                .ok()?;
+            let element = type_layout(element, api, depth)?;
+            Some(Layout {
+                size: element.size.checked_mul(count)?,
+                align: element.align,
+                spare_tags: if count == 0 { 0 } else { element.spare_tags },
+            })
+        }
+        RustType::Tuple { elements } => aggregate_layout(elements.iter(), api, depth),
+        RustType::Named { .. } | RustType::Reference { .. } | RustType::Slice { .. } => None,
+    }
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Record {
@@ -31,6 +185,12 @@ pub struct Record {
     pub module: String,
     pub visibility: DeclarationVisibility,
     pub docs: Vec<String>,
+    /// Whether the declaration's Rust AST derives Copy.
+    pub copy: bool,
+    /// Static native byte size; unknown layouts are never classified as small.
+    pub static_size: Option<u32>,
+    #[serde(skip)]
+    pub layout_known: bool,
     pub serde: Serde,
     pub projection: Projection,
     pub shape: Shape,

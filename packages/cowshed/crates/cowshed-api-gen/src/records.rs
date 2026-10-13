@@ -89,6 +89,9 @@ fn parse_items(items: Vec<Item>, api: &mut Api, module: &str, exported: bool) ->
                         module: module.to_owned(),
                         visibility: declaration_visibility(&item.vis),
                         docs: docs(&item.attrs),
+                        copy: has_derive(&item.attrs, "Copy"),
+                        static_size: None,
+                        layout_known: !item.attrs.iter().any(|attr| attr.path().is_ident("repr")),
                         serde: serde(&item.attrs)?,
                         projection,
                         shape,
@@ -114,6 +117,13 @@ fn parse_items(items: Vec<Item>, api: &mut Api, module: &str, exported: bool) ->
                         module: module.to_owned(),
                         visibility: declaration_visibility(&item.vis),
                         docs: docs(&item.attrs),
+                        copy: has_derive(&item.attrs, "Copy"),
+                        static_size: None,
+                        layout_known: !item.attrs.iter().any(|attr| attr.path().is_ident("repr"))
+                            && item
+                                .variants
+                                .iter()
+                                .all(|variant| variant.discriminant.is_none()),
                         serde: serde(&item.attrs)?,
                         projection,
                         shape: Shape::Enum(
@@ -140,6 +150,9 @@ fn parse_items(items: Vec<Item>, api: &mut Api, module: &str, exported: bool) ->
                 module: module.to_owned(),
                 visibility: declaration_visibility(&item.vis),
                 docs: docs(&item.attrs),
+                copy: false,
+                static_size: None,
+                layout_known: true,
                 serde: serde(&item.attrs)?,
                 projection: projection(&item.attrs)?,
                 shape: Shape::Alias(normalized_type(*item.ty)?),
@@ -158,6 +171,9 @@ fn parse_items(items: Vec<Item>, api: &mut Api, module: &str, exported: bool) ->
                     // `hex_identifier!` expands to a `pub struct` (api/dto.rs), so it is public.
                     visibility: DeclarationVisibility::Public,
                     docs: docs(&item.attrs),
+                    copy: false,
+                    static_size: None,
+                    layout_known: false,
                     serde: Serde::default(),
                     projection: Projection {
                         scalar: Some(format!(
@@ -199,6 +215,7 @@ fn parse_items(items: Vec<Item>, api: &mut Api, module: &str, exported: bool) ->
             }
         }
     }
+    api.refresh_layouts();
     Ok(())
 }
 
@@ -359,7 +376,7 @@ fn is_public_projection(projection: &Projection) -> bool {
     projection.wire.is_some() || projection.scalar.is_some() || projection.name.is_some()
 }
 
-fn is_serialized(attrs: &[Attribute]) -> bool {
+fn has_derive(attrs: &[Attribute], name: &str) -> bool {
     attrs.iter().any(|attr| {
         if !attr.path().is_ident("derive") {
             return false;
@@ -369,12 +386,16 @@ fn is_serialized(attrs: &[Attribute]) -> bool {
         );
         paths.is_ok_and(|paths| {
             paths.iter().any(|path| {
-                path.segments.last().is_some_and(|segment| {
-                    segment.ident == "Serialize" || segment.ident == "Deserialize"
-                })
+                path.segments
+                    .last()
+                    .is_some_and(|segment| segment.ident == name)
             })
         })
     })
+}
+
+fn is_serialized(attrs: &[Attribute]) -> bool {
+    has_derive(attrs, "Serialize") || has_derive(attrs, "Deserialize")
 }
 
 fn fields(fields: syn::Fields, output_only: bool) -> syn::Result<Fields> {
