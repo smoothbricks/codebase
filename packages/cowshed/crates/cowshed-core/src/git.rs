@@ -582,6 +582,22 @@ impl GitRepository {
         linked: bool,
         restored_links: &[PathBuf],
     ) -> Result<RenameWorkState> {
+        // The preserved index is digested before any Git read below: a read that refreshes
+        // stat data in a cloned worktree's index would otherwise digest the refresh, not the
+        // preservation. The same refresh would rewrite the preserved file itself, so its
+        // bytes are held here and put back if a read below changed them.
+        let preserved_index = if linked {
+            let path = self.linked_index_path().await?;
+            let bytes = fs::read(&path)
+                .map_err(|error| io_failure("read linked worktree index", &path, error))?;
+            Some((path, bytes))
+        } else {
+            None
+        };
+        let index = match &preserved_index {
+            Some((_, bytes)) => Some(Self::digest_index_bytes(bytes.clone()).await?),
+            None => None,
+        };
         let restored = self.git_visible_restored_links(restored_links).await?;
         let mut pathspecs = vec![OsString::from("--"), OsString::from(".")];
         pathspecs.extend(restored.iter().map(|path| {
@@ -642,44 +658,37 @@ impl GitRepository {
             hasher.update(section);
         }
         let work_digest = Sha256Digest::from_bytes(hasher.finalize().into());
-        let index = if linked {
-            let output = self
-                .run(["rev-parse", "--path-format=absolute", "--git-path", "index"])
-                .await?;
-            if !output.status.success() {
-                return Err(git_internal("resolve linked worktree index", &output));
-            }
-            let index_path = parse_one_path(&output.stdout, "linked worktree index")?;
-            let digest = tokio::task::spawn_blocking(move || -> Result<Sha256Digest> {
-                use std::io::Read as _;
-                let mut file = fs::File::open(&index_path).map_err(|error| {
-                    io_failure("open linked worktree index", &index_path, error)
-                })?;
-                let mut hasher = Sha256::new();
-                let mut buffer = [0_u8; 64 * 1024];
-                loop {
-                    let read = file.read(&mut buffer).map_err(|error| {
-                        io_failure("read linked worktree index", &index_path, error)
-                    })?;
-                    if read == 0 {
-                        break;
-                    }
-                    hasher.update(&buffer[..read]);
-                }
-                Ok(Sha256Digest::from_bytes(hasher.finalize().into()))
-            })
-            .await
-            .map_err(|error| {
-                CowshedError::internal(format!("hash linked worktree index: {error}"))
-            })??;
-            Some(digest)
-        } else {
-            None
-        };
+        if let Some((path, bytes)) = &preserved_index
+            && fs::read(path).is_ok_and(|current| current != *bytes)
+        {
+            fs::write(path, bytes)
+                .map_err(|error| io_failure("restore linked worktree index", path, error))?;
+        }
         Ok(RenameWorkState {
             work: *work_digest.as_bytes(),
             index: index.map(|digest| *digest.as_bytes()),
         })
+    }
+
+    /// The index file of a linked worktree, resolved without reading it.
+    async fn linked_index_path(&self) -> Result<PathBuf> {
+        let output = self
+            .run(["rev-parse", "--path-format=absolute", "--git-path", "index"])
+            .await?;
+        if !output.status.success() {
+            return Err(git_internal("resolve linked worktree index", &output));
+        }
+        parse_one_path(&output.stdout, "linked worktree index")
+    }
+
+    /// SHA-256 of index bytes already read, hashed off the runtime's threads.
+    async fn digest_index_bytes(bytes: Vec<u8>) -> Result<Sha256Digest> {
+        tokio::task::spawn_blocking(move || {
+            use sha2::{Digest as _, Sha256};
+            Sha256Digest::from_bytes(Sha256::digest(&bytes).into())
+        })
+        .await
+        .map_err(|error| CowshedError::internal(format!("hash linked worktree index: {error}")))
     }
 
     /// The restored links Git itself reports as tracked or untracked non-ignored, sorted. Ignored
@@ -2281,7 +2290,6 @@ impl GitRepository {
             CowshedError::internal(format!("preserve renamed worktree Git state: {error}"))
         })?
     }
-
     /// Establish clone-owned Git, without resetting its index or selecting a branch.
     async fn register_linked_worktree(
         &self,
