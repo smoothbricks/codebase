@@ -1016,6 +1016,8 @@ absent is unchanged. A blocker observed afresh, `none` included, is SET, and a b
 Because lock detail lives inside `Lock`, setting any other blocker leaves no stale path or holder. No delta shape
 changes nothing, so neither Rust nor the generated validators admit an empty one.
 
+Events preserve each observed life's transition order. A parent's birth precedes the birth of its observed child.
+
 The `leaf` in `JobResourceSample` is the observed process, live or exited, with the most own CPU (user+system
 microseconds), ties broken by birth identity then PID. It does not need a complete tree: it needs the observed processes
 to account for most of the job's exact CPU. It is named only when the observed processes' own CPU covers at least a
