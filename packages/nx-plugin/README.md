@@ -200,6 +200,13 @@ invalidate those tasks conservatively. Nx 23.2.1 hashes a cached target that dec
 its project root and ignores the `default` named input, so `smoo monorepo check` refuses such a target: declare its
 inputs, or give its target name a `targetDefaults` entry with `"inputs": ["default", "^default"]`.
 
+TypeScript toolchain inputs exclude Markdown beneath workspace-root `patches/`, but retain every other patch byte and
+pin, including extensionless `PIN` and `VERSION` files. Native content-hash regressions distinguish those inputs from
+README and unrelated-source edits. A task that consumes Markdown declares it through an input set without a matching
+negative: Nx exclusions win over positive paths in the same fileset, so a later explicit path cannot re-include it.
+Inferred Cargo package filesets remain broad for arbitrary compiled data, headers, schemas and build-script reads;
+incidental Markdown beneath a crate can therefore still invalidate those tasks conservatively.
+
 Cargo keeps the caller's `CARGO_HOME`. Moving configuration into an isolated home can change relative paths or lose
 source replacement, credentials, and toolchain settings; forwarding it with `--config` changes precedence. Registry
 access may consequently wait on Cargo's package-cache lock, which Cargo arbitrates itself; Nx adds no ordering for it.

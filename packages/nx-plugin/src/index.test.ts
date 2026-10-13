@@ -11,6 +11,7 @@ import type {
   ProjectGraphProjectNode,
   TargetConfiguration,
 } from 'nx/src/devkit-exports.js';
+import { WorkspaceContext } from 'nx/src/native/index.js';
 import { AggregateCreateNodesError } from 'nx/src/project-graph/error-types.js';
 import { createTargetDefaultsResults } from 'nx/src/project-graph/utils/project-configuration/target-defaults.js';
 import { mergeTargetConfigurations } from 'nx/src/project-graph/utils/project-configuration-utils.js';
@@ -151,6 +152,63 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
     }
   });
 
+  it('keys installed patch data and pins without keying patch documentation', async () => {
+    const workspace = await createWorkspace();
+    try {
+      await workspace.write('packages/example/package.json', '{"name":"example","scripts":{"test":"bun test"}}\n');
+      await workspace.write('packages/example/tsconfig.lib.json', '{}\n');
+      await workspace.write('packages/example/tsconfig.test.json', '{}\n');
+      await workspace.write('patches/nx.patch', 'patch-one\n');
+      await workspace.write('patches/compiler/PIN', 'revision-one\n');
+      await workspace.write('patches/compiler/VERSION', 'version-one\n');
+      await workspace.write('patches/README.md', 'documentation-one\n');
+      await workspace.write('patches/compiler/notes.md', 'nested documentation-one\n');
+      await workspace.write('packages/unrelated/source.ts', 'export const value = 1;\n');
+      const targets = await inferProjectTargets(workspace, 'packages/example/package.json');
+      const context = new WorkspaceContext(
+        workspace.context.workspaceRoot,
+        join(workspace.context.workspaceRoot, '.nx/patch-input-context'),
+      );
+      for (const name of ['tsc-js', 'typecheck', 'typecheck-tests', 'lint']) {
+        const inputs = targets[name]?.inputs ?? [];
+        const patchInputs = inputs.filter(
+          (input): input is string => typeof input === 'string' && input.includes('{workspaceRoot}/patches/'),
+        );
+        expect(patchInputs.length).toBeGreaterThan(0);
+        const positive = patchInputs
+          .filter((input) => !input.startsWith('!'))
+          .map((input) => input.slice('{workspaceRoot}/'.length));
+        const negative = patchInputs
+          .filter((input) => input.startsWith('!'))
+          .map((input) => input.slice('!{workspaceRoot}/'.length));
+        expect(context.glob(positive, negative).sort()).toEqual([
+          'patches/compiler/PIN',
+          'patches/compiler/VERSION',
+          'patches/nx.patch',
+        ]);
+        const before = context.hashFilesMatchingGlob(positive, negative);
+        await workspace.write('patches/README.md', name + ' docs\n');
+        await workspace.write('patches/compiler/notes.md', name + ' nested docs\n');
+        await workspace.write('packages/unrelated/source.ts', 'export const value = ' + name.length + ';\n');
+        context.incrementalUpdate(
+          ['patches/README.md', 'patches/compiler/notes.md', 'packages/unrelated/source.ts'],
+          [],
+        );
+        expect(context.hashFilesMatchingGlob(positive, negative)).toBe(before);
+        let previous = before;
+        for (const file of ['patches/nx.patch', 'patches/compiler/PIN', 'patches/compiler/VERSION']) {
+          await workspace.write(file, name + ' changed ' + file + '\n');
+          context.incrementalUpdate([file], []);
+          const changed = context.hashFilesMatchingGlob(positive, negative);
+          expect(changed).not.toBe(previous);
+          previous = changed;
+        }
+      }
+    } finally {
+      await workspace.cleanup();
+    }
+  });
+
   it('uses the transformer-aware compiler for emit and validation', async () => {
     const workspace = await createWorkspace();
     try {
@@ -173,6 +231,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         '{workspaceRoot}/package.json',
         '{workspaceRoot}/bun.lock',
         '{workspaceRoot}/patches/**/*',
+        '!{workspaceRoot}/patches/**/*.md',
         '{workspaceRoot}/tsconfig.base.json',
       ];
       // An emit is a shipped artifact: it hashes the raw manifests, so a
@@ -195,6 +254,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       });
       const checkToolchainInputs = [
         '{workspaceRoot}/patches/**/*',
+        '!{workspaceRoot}/patches/**/*.md',
         '{workspaceRoot}/tsconfig.base.json',
         { json: '{workspaceRoot}/package.json', excludeFields: ['version', 'scripts', 'smoo', 'nx'] },
         { json: '{workspaceRoot}/bun.lock', excludeFields: ['workspaces'] },
@@ -264,6 +324,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       const targets = project?.targets ?? {};
       const checkToolchain = [
         '{workspaceRoot}/patches/**/*',
+        '!{workspaceRoot}/patches/**/*.md',
         '{workspaceRoot}/tsconfig.base.json',
         // Hashed by Nx itself: a `json` input costs no process, and neither
         // does the crate digest that replaces the manifests below.
@@ -329,6 +390,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         '{workspaceRoot}/package.json',
         '{workspaceRoot}/bun.lock',
         '{workspaceRoot}/patches/**/*',
+        '!{workspaceRoot}/patches/**/*.md',
         '{workspaceRoot}/tsconfig.base.json',
         '{projectRoot}/tsconfig.lib.json',
       ]);
@@ -391,6 +453,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         'versionlessProduction',
         '^production',
         '{workspaceRoot}/patches/**/*',
+        '!{workspaceRoot}/patches/**/*.md',
         '{workspaceRoot}/tsconfig.base.json',
         { json: '{workspaceRoot}/package.json', excludeFields: ['version', 'scripts', 'smoo', 'nx'] },
         { json: '{workspaceRoot}/bun.lock', excludeFields: ['workspaces'] },
@@ -429,6 +492,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       ];
       const checkToolchain = [
         '{workspaceRoot}/patches/**/*',
+        '!{workspaceRoot}/patches/**/*.md',
         ...configChain,
         { json: '{workspaceRoot}/package.json', excludeFields: ['version', 'scripts', 'smoo', 'nx'] },
         { json: '{workspaceRoot}/bun.lock', excludeFields: ['workspaces'] },
@@ -455,6 +519,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         '{workspaceRoot}/package.json',
         '{workspaceRoot}/bun.lock',
         '{workspaceRoot}/patches/**/*',
+        '!{workspaceRoot}/patches/**/*.md',
         ...configChain,
         '{projectRoot}/tsconfig.lib.json',
       ]);
@@ -518,6 +583,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         'versionlessProduction',
         '^production',
         '{workspaceRoot}/patches/**/*',
+        '!{workspaceRoot}/patches/**/*.md',
         '{workspaceRoot}/tsconfig.base.json',
         '{workspaceRoot}/packages/example/tsconfig.cycle.json',
         '{workspaceRoot}/packages/example/tsconfig.lib.json',
@@ -562,6 +628,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         'versionlessProduction',
         '^production',
         '{workspaceRoot}/patches/**/*',
+        '!{workspaceRoot}/patches/**/*.md',
         '{workspaceRoot}/tsconfig.base.json',
         '{workspaceRoot}/packages/tsconfig/base.json',
         { json: '{workspaceRoot}/package.json', excludeFields: ['version', 'scripts', 'smoo', 'nx'] },
@@ -599,6 +666,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         'versionlessProduction',
         '^production',
         '{workspaceRoot}/patches/**/*',
+        '!{workspaceRoot}/patches/**/*.md',
         '{workspaceRoot}/tsconfig.base.json',
         { json: '{workspaceRoot}/package.json', excludeFields: ['version', 'scripts', 'smoo', 'nx'] },
         { json: '{workspaceRoot}/bun.lock', excludeFields: ['workspaces'] },
