@@ -561,9 +561,9 @@ impl ProcessSpanProjection {
                     columns,
                 )))
             }
-            JobProcessEvent::Exited { index, process } => self
-                .exited(*index, identity, process, at)
-                .map(Some),
+            JobProcessEvent::Exited { index, process } => {
+                self.exited(*index, identity, process, at).map(Some)
+            }
         }
     }
 
@@ -587,17 +587,16 @@ impl ProcessSpanProjection {
         let span_id = index
             .checked_add(JOB_SPAN_ID + 1)
             .ok_or(ProcessSpanError::IndexOverflow { index })?;
-        let parent_span_id = match parent {
-            None => JOB_SPAN_ID,
-            Some(parent) => self
-                .by_identity
-                .get(&parent)
-                .copied()
-                .ok_or(ProcessSpanError::MissingParent {
-                    index,
-                    pid: parent.pid,
-                })?,
-        };
+        let parent_span_id =
+            match parent {
+                None => JOB_SPAN_ID,
+                Some(parent) => self.by_identity.get(&parent).copied().ok_or(
+                    ProcessSpanError::MissingParent {
+                        index,
+                        pid: parent.pid,
+                    },
+                )?,
+            };
         let ids = SpanIds {
             span_id,
             parent_span_id,
@@ -650,7 +649,8 @@ impl ProcessSpanProjection {
             }
             ExitStatus::Signaled { signal, .. } => {
                 columns.exit_signal = Some(
-                    ExitSignal::from_raw(signal).ok_or(ProcessSpanError::UnknownSignal { signal })?,
+                    ExitSignal::from_raw(signal)
+                        .ok_or(ProcessSpanError::UnknownSignal { signal })?,
                 );
                 SpanOutcome::Err
             }
@@ -868,7 +868,8 @@ pub fn read_process_segment(path: &Path) -> Result<Vec<DecodedProcessRow>, Proce
     declared.extend(process_custom_fields());
     let mut rows = Vec::new();
     for batch in reader {
-        let batch = batch.map_err(|error| ProcessSpanError::Segment(TraceSegmentError::from(error)))?;
+        let batch =
+            batch.map_err(|error| ProcessSpanError::Segment(TraceSegmentError::from(error)))?;
         let schema = batch.schema();
         let found = schema.fields();
         if found.len() != declared.len()
@@ -904,8 +905,7 @@ fn decode_row(
             .ok_or(ProcessSpanError::Schema)?,
         entry_type: dict_value(column(batch, 0, "entry_type")?, row)?
             .ok_or(ProcessSpanError::Schema)?,
-        message: dict_value(column(batch, 0, "message")?, row)?
-            .ok_or(ProcessSpanError::Schema)?,
+        message: dict_value(column(batch, 0, "message")?, row)?.ok_or(ProcessSpanError::Schema)?,
         columns: decode_columns(batch, start, row)?,
     })
 }
@@ -1002,7 +1002,10 @@ fn optional_enum<E: TraceEnum>(
         return Ok(None);
     }
     let key = usize::from(dict.keys().value(row));
-    all.get(key).copied().map(Some).ok_or(ProcessSpanError::Schema)
+    all.get(key)
+        .copied()
+        .map(Some)
+        .ok_or(ProcessSpanError::Schema)
 }
 
 /// The name a dictionary cell holds: `None` for a null cell, an error for a key the dictionary
@@ -1041,9 +1044,7 @@ mod tests {
 
     use super::*;
     use crate::api::dto::UtcTimestamp;
-    use crate::api::process::{
-        LockHolder, ProcessCoverageGap, ProcessExit, ProcessIoUnavailable,
-    };
+    use crate::api::process::{LockHolder, ProcessCoverageGap, ProcessExit, ProcessIoUnavailable};
     use crate::api::resources::{CpuMicros, ResidentBytes, StorageIoBytes};
     use crate::runtime::process_tree::BirthToken;
     use crate::storage::trace_segment::dict_type;
@@ -1550,13 +1551,8 @@ mod tests {
         assert_eq!(terminal.columns().proc_argv, None);
 
         let root = temp_root("heartbeat");
-        let path = seal_process_batch(
-            &root,
-            Uuid::nil(),
-            1,
-            &[start, heartbeat, terminal],
-        )
-        .unwrap();
+        let path =
+            seal_process_batch(&root, Uuid::nil(), 1, &[start, heartbeat, terminal]).unwrap();
         let rows = read_process_segment(&path).unwrap();
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0].entry_type, "span-start");

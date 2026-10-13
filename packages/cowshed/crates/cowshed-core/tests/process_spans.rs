@@ -13,7 +13,8 @@ use arrow_array::RecordBatch;
 use arrow_array::types::{Int32Type, TimestampNanosecondType, UInt32Type, UInt64Type};
 use arrow_schema::{DataType, Field, Schema};
 use cowshed_core::api::process::{
-    BlockerChange, JobProcessDelta, JobProcessEvent, LockHolder, ProcessBlockedOn, ProcessStorageIo,
+    BlockerChange, JobProcessDelta, JobProcessEvent, LockHolder, ProcessBlockedOn, ProcessCoverage,
+    ProcessCoverageGap, ProcessStorageIo,
 };
 use cowshed_core::api::resources::{CpuMicros, ResidentBytes, StorageIoBytes};
 use cowshed_core::api::{
@@ -350,7 +351,14 @@ impl TracedJob {
 
     fn tree(&mut self, millis: u64, observation: ProcessObservation) {
         let events = self.observe(millis, JobProcessObservation::Tree(observation));
-        assert_eq!(events.len(), 1, "one tree event: {events:?}");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| !matches!(event, JobProcessEvent::Gap { .. }))
+                .count(),
+            1,
+            "one life transition, with any separately stated coverage gap: {events:?}"
+        );
     }
 
     fn read(&mut self, millis: u64, process: ProcessIdentity, reading: UsageReading) -> usize {
@@ -402,7 +410,10 @@ fn retained(
     event: &JobProcessEvent,
 ) -> (Option<ProcessIdentity>, Option<ProcessIdentity>) {
     let life = life_of(event).and_then(|index| lives.node_at(index));
-    (life.map(|life| life.identity), life.and_then(|life| life.parent))
+    (
+        life.map(|life| life.identity),
+        life.and_then(|life| life.parent),
+    )
 }
 
 /// The kinds of each span's rows, by span id, in the order they were sealed.
@@ -557,6 +568,7 @@ async fn a_job_s_process_tree_is_three_parented_process_run_spans_over_fourteen_
         holder: Some(LockHolder {
             pid: 4242,
             job: None,
+            program: None,
         }),
     };
     job.blocked(6_000, second, Some(lock));
@@ -818,6 +830,13 @@ async fn a_job_s_process_tree_is_three_parented_process_run_spans_over_fourteen_
 
     // Rebuilt from its rows, each span ends at the fold's own final record.
     let tree = job.fold.tree(utc(124));
+    assert_eq!(
+        tree.coverage,
+        ProcessCoverage::Gap {
+            reason: ProcessCoverageGap::UnreadFinalUsage { pid: second.pid },
+        },
+        "the killed child had no identity-fenced read after its exit"
+    );
     for (index, record) in tree.processes.iter().enumerate() {
         let span = u32::try_from(index).unwrap() + 2;
         let rebuilt = snapshot(rows.iter().filter(|row| row.span_id == span));

@@ -306,7 +306,6 @@ pub fn generate(project: &Path) -> Result<Vec<GeneratedFile>, String> {
     Ok(files)
 }
 
-
 fn read_source(path: &Path) -> Result<String, String> {
     std::fs::read_to_string(path).map_err(|error| format!("{}: {error}", path.display()))
 }
