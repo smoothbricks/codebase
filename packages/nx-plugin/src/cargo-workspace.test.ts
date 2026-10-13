@@ -336,7 +336,11 @@ describe('nextest serial test groups', () => {
         ].join('\n'),
       );
       expect(serialTestGroups(config)).toEqual([
-        { group: 'real-apfs', filter: '(test(/real_apfs_/)) or (binary(apfs_native_macos))' },
+        {
+          group: 'real-apfs',
+          filter: '(test(/real_apfs_/)) or (binary(apfs_native_macos))',
+          scope: { kind: 'workspace' },
+        },
       ]);
     } finally {
       await rm(root, { recursive: true, force: true });
