@@ -1533,6 +1533,14 @@ impl GitRepository {
         if !self.root.join(".git").is_dir() {
             return Ok(());
         }
+        // A directory clone preserves bytes and mtimes, not inode identity. Refresh HEAD's
+        // index against those bytes before the hard reset: otherwise Git rewrites unchanged
+        // files whose copied stat cache names the source's inodes, invalidating warm builds.
+        let refresh = self.run(["reset", "-q", "--mixed", "HEAD"]).await?;
+        ensure_git_success(
+            "refresh the clone's index without rewriting its worktree",
+            refresh,
+        )?;
         let reset = self.run(["reset", "-q", "--hard", "HEAD"]).await?;
         ensure_git_success("reset main's uncommitted edits in the clone", reset)?;
         self.ensure_cowshed_excludes().await?;
@@ -3362,6 +3370,8 @@ mod tests {
         let root = repository();
         fs::write(root.join(".gitignore"), "/ignored/\n").expect("ignore rules");
         fs::write(root.join("kept.txt"), "committed\n").expect("tracked file");
+        fs::write(root.join("warm.rs"), "pub const WARM: bool = true;\n")
+            .expect("unchanged source");
         git(&root, &["add", "."]);
         git(&root, &["commit", "-qm", "ignore build output"]);
         fs::write(root.join("README"), "edited in main\n").expect("tracked edit");
@@ -3374,6 +3384,14 @@ mod tests {
         let main_status = git_stdout(&root, &["status", "--porcelain"]);
         let workspace = root.with_extension("clean-workspace");
         copy_tree(&root, &workspace);
+        let warm_time = fs::metadata(root.join("warm.rs"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        fs::File::open(workspace.join("warm.rs"))
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(warm_time))
+            .unwrap();
         let repository = GitRepository::from_root(&workspace);
         repository
             .ensure_cowshed_excludes()
@@ -3400,6 +3418,14 @@ mod tests {
         assert_eq!(
             fs::read_to_string(workspace.join("kept.txt")).unwrap(),
             "committed\n"
+        );
+        assert_eq!(
+            fs::metadata(workspace.join("warm.rs"))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            warm_time,
+            "discarding main's edits must not rewrite an unchanged file with copied index stat data"
         );
         assert!(!workspace.join("stray.ts").exists());
         assert!(!workspace.join("notes").exists());
