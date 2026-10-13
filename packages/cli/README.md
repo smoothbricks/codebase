@@ -676,12 +676,15 @@ must stay synchronized with those comments. Composite action internals do not ch
 
 Managed CI setup is split across local composite actions:
 
-- `setup-devenv` detects the runner kind first. An ephemeral runner installs a single-user [Nix], restores `/nix` itself
-  from the Actions cache — store paths and the Nix database, as files, so nothing is imported — hands `~/.cache` back to
-  the runner (the cache action unpacks through sudo and leaves that directory root's, where the first `~/.cache/smoo`
-  stamp would die with EACCES), enables [Cachix], installs [devenv] at `devenv.lock`'s rev, restores `node_modules` and
-  the ttsc plugins, and builds the shell. A host-nix runner (`NIX_REMOTE=daemon` with `/var/cache/ci`) skips the install
-  and every store cache: it already has the store and keeps its caches on the shared bind.
+- `setup-devenv` detects the runner kind first. On a GitHub-hosted Linux runner it then frees disk: it prints `df -h /`,
+  deletes preinstalled trees the shell never uses (Swift, PowerShell modules, GHCup, .NET, the hosted tool cache, then
+  the Android SDK) until `/` has 32 GiB free, and prints `df -h /` again. An ephemeral runner installs a single-user
+  [Nix], restores `/nix` itself from the Actions cache — store paths and the Nix database, as files, so nothing is
+  imported — hands `~/.cache` back to the runner (the cache action unpacks through sudo and leaves that directory
+  root's, where the first `~/.cache/smoo` stamp would die with EACCES), enables [Cachix], installs [devenv] at
+  `devenv.lock`'s rev, restores `node_modules` and the ttsc plugins, and builds the shell. A host-nix runner
+  (`NIX_REMOTE=daemon` with `/var/cache/ci`) skips the install and every store cache: it already has the store and keeps
+  its caches on the shared bind.
 - `save-nix-devenv` runs under `always()` and saves the `.devenv`/`.direnv` eval-cache segment when setup missed it and
   the shell produced `nix-eval-cache.db`. The store cache saves itself in `setup-devenv`'s post phase, which collects
   garbage down to the live closure before uploading.
