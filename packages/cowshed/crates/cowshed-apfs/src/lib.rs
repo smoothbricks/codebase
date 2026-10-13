@@ -780,14 +780,18 @@ fn lease_holder(lease: &Path) -> String {
 /// `diskimages-helper`), and killing only the direct child would leave a helper holding the wedge.
 ///
 /// A disk-image command (`is_disk_image_command`) is detached further, because it is the
-/// one child a caller must never interrupt: it also ignores the hangup, interrupt and
-/// terminate signals a caller's tree-killer addresses to it, and writes its output to
-/// per-run files under the system temp directory instead of the caller's pipes. A caller
-/// killed mid-attach (an agent tool deadline, a process-group kill of `cowshed exec`)
-/// then leaves the command running to completion — no full pipe wedges it, no signal
-/// reaches it — and the next invocation reconciles the result from the kernel's
-/// attachment inventory. The runner's hard deadline (a SIGKILL of its group) is the only
-/// killer. The answered output directory travels with the child; reading it back removes it.
+/// one child a caller must never interrupt: it starts with the hangup, interrupt and
+/// terminate signals a caller's tree-killer addresses to it both ignored and blocked, and
+/// writes its output to per-run files under the system temp directory instead of the
+/// caller's pipes. Ignoring alone is not enough: `diskutil` installs its own handlers over
+/// the inherited SIG_IGN and abandons an attach mid-way on SIGTERM ("diskutil: interrupted",
+/// exit 1). It installs them with `signal` and never touches its mask, so a blocked signal
+/// stays pending, never delivered, through any handler it installs. A caller killed
+/// mid-attach (an agent tool deadline, a process-group kill of `cowshed exec`) then leaves
+/// the command running to completion — no full pipe wedges it, no signal reaches it — and
+/// the next invocation reconciles the result from the kernel's attachment inventory. The
+/// runner's hard deadline (a SIGKILL of its group) is the only killer. The answered output
+/// directory travels with the child; reading it back removes it.
 fn spawn_disk_child(
     request: &CommandRequest,
 ) -> io::Result<(std::process::Child, Option<PathBuf>)> {
@@ -823,20 +827,27 @@ fn spawn_disk_child_as(
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        // SAFETY: `setsid` and `signal` are async-signal-safe and run in the forked
-        // child before exec; the child becomes its own session leader, and a disk-image
-        // command starts with the caller's hangup, interrupt and terminate ignored (an
-        // ignored disposition survives exec). Fail closed: a child that cannot leave the
-        // parent group must never be addressed by group id, so a setsid failure aborts
-        // the spawn instead of risking the parent group.
+        // SAFETY: `setsid`, `signal`, `sigemptyset`, `sigaddset` and `sigprocmask` are
+        // async-signal-safe and run in the forked child before exec; the child becomes its
+        // own session leader, and a disk-image command starts with the caller's hangup,
+        // interrupt and terminate ignored and blocked (both survive exec). Fail closed: a
+        // child that cannot leave the parent group must never be addressed by group id, so a
+        // setsid failure aborts the spawn instead of risking the parent group, and a disk-image
+        // command that cannot block the tree-killer's signals is not started.
         unsafe {
             command.pre_exec(move || {
                 if libc::setsid() == -1 {
                     return Err(io::Error::last_os_error());
                 }
                 if detached {
+                    let mut held: libc::sigset_t = std::mem::zeroed();
+                    libc::sigemptyset(&mut held);
                     for signal in [libc::SIGHUP, libc::SIGINT, libc::SIGTERM] {
                         libc::signal(signal, libc::SIG_IGN);
+                        libc::sigaddset(&mut held, signal);
+                    }
+                    if libc::sigprocmask(libc::SIG_BLOCK, &held, std::ptr::null_mut()) == -1 {
+                        return Err(io::Error::last_os_error());
                     }
                 }
                 Ok(())
@@ -5690,6 +5701,58 @@ mod tests {
         );
         kill_disk_child_group(&mut child);
         let _ = child.wait();
+    }
+
+    /// A disk tool's own handlers do not reopen it to the caller's tree-killer: `diskutil`
+    /// installs a terminate handler over the inherited SIG_IGN and abandons an attach on it, so
+    /// the stand-in below does the same, then is sent the terminate. Detached, it survives.
+    #[cfg(unix)]
+    #[test]
+    fn a_detached_disk_child_holds_caller_signals_through_its_own_handlers() {
+        let request = CommandRequest::new(
+            std::env::current_exe().expect("test binary"),
+            [
+                "--exact",
+                "tests::a_disk_tool_installing_its_own_terminate_handler",
+                "--ignored",
+                "--nocapture",
+            ],
+        );
+        let (mut child, files) = spawn_disk_child_as(&request, true).expect("spawn detached");
+        let directory = files.expect("a detached child writes files");
+        let status = child.wait().expect("reap the detached child");
+        let stdout = fs::read_to_string(directory.join("stdout")).unwrap();
+        fs::remove_dir_all(directory).unwrap();
+        assert!(
+            status.success() && stdout.contains("survived its terminate"),
+            "{status:?}: {stdout}"
+        );
+    }
+
+    /// The disk tool [`a_detached_disk_child_holds_caller_signals_through_its_own_handlers`]
+    /// runs detached: like `diskutil`, it installs its own terminate handler, which exits 3.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "spawned by a_detached_disk_child_holds_caller_signals_through_its_own_handlers"]
+    fn a_disk_tool_installing_its_own_terminate_handler() {
+        extern "C" fn interrupted(_: libc::c_int) {
+            // SAFETY: `_exit` is async-signal-safe and ends the process at once.
+            unsafe { libc::_exit(3) };
+        }
+        // SAFETY: getsid and getpid only read this process's own ids.
+        if unsafe { libc::getsid(0) != libc::getpid() } {
+            return; // Only a detached disk child leads its own session.
+        }
+        // SAFETY: the handler only calls `_exit`; `raise` directs the signal at this thread,
+        // so an unblocked terminate runs the handler before `raise` returns.
+        unsafe {
+            libc::signal(
+                libc::SIGTERM,
+                interrupted as *const () as libc::sighandler_t,
+            );
+            libc::raise(libc::SIGTERM);
+        }
+        println!("survived its terminate");
     }
 
     #[test]
