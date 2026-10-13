@@ -1,10 +1,13 @@
 # DEP-BLOAT decisions
 
+Naming cutover: daemon-snapshot `GatewayStatus` references in this historical audit now name `DaemonStatus`. The public
+CLI `cowshed_core::api::GatewayStatus` is unchanged; original audit evidence below is retained.
+
 Verdict on all 25 DEP-BLOAT findings, judged against `main` at `17a95a816`.
 
-Two agents produced this: judgment and manifest archaeology here, build evidence from a second workspace (`dependency-audit`).
-No dependency change is landed by either. Every CUT-SAFE row below names a build that was run and reverted; every KEEP
-row names the mechanism that makes the dependency load-bearing.
+Two agents produced this: judgment and manifest archaeology here, build evidence from a second workspace. No dependency
+change is landed by either. Every CUT-SAFE row below names a build that was run and reverted; every KEEP row names the
+mechanism that makes the dependency load-bearing.
 
 ## The rule this category needs
 
@@ -62,7 +65,7 @@ no wall-clock number here is quoted without that regime, and none is used as evi
 
 ## CUT-SAFE — 3
 
-Each was applied, built, and reverted in `dependency-audit`. Nothing is landed.
+Each was applied, built, and reverted in the second workspace. Nothing is landed.
 
 ### `cowshed-gateway-policy-config-platform-tls` F7 — MEDIUM — `rustls-pki-types` is unused
 
@@ -435,8 +438,8 @@ Closed by tonight's landed work. Each was confirmed against the current manifest
 
 ## Build ledger
 
-Every command run in `dependency-audit` (`<checkouts>/.cowshed/<owner>/<repo>/<ws>`), all reverted. Regime
-throughout: warm target directory, sibling `cargo` contention.
+Every command run in the second workspace (`<mount-root>/<owner>/<repo>/<workspace>`), all reverted. Regime throughout:
+warm target directory, sibling `cargo` contention.
 
 | #   | finding                                                               | command                                                                                                  | result                                                                                                                             |
 | --- | --------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |

@@ -484,7 +484,7 @@ pub struct LandReport {
 
 ```rust
 /// The sole mutation, diagnostics, and cross-workspace authority over a project. It is the only capability that can
-/// adopt, create, destroy, fork, grant, revoke, restore, rebase, land, collect garbage, diagnose controller state,
+/// adopt, destroy, fork, grant, revoke, restore, rebase, land, collect garbage, diagnose controller state,
 /// mirror repositories, set checkpoint quotas, or assign slots.
 pub struct Coordinator { /* Project + authenticated controller identity */ }
 impl Coordinator {
@@ -492,8 +492,7 @@ impl Coordinator {
     // connection met it; the remedy is a controller of the daemon's build (11_shell.md "hello").
     pub fn other_build(&self) -> watch::Receiver<Option<OtherBuild>>;
     pub async fn adopt(&self, opts: AdoptOptions) -> Result<WorkspaceRef, CowshedError>;
-    pub async fn create(&self, name: &str, opts: CreateOptions) -> Result<WorkspaceRef, CowshedError>;
-    pub async fn fork(&self, src: &str, dst: &str) -> Result<WorkspaceRef, CowshedError>;
+    pub async fn fork(&self, workspace: &str, source: Option<&str>, opts: ForkOptions) -> Result<WorkspaceRef, CowshedError>;
     pub async fn grant(&self, ws: &str, delta: GrantDelta) -> Result<GrantSet, CowshedError>;
     pub async fn revoke(&self, ws: &str, delta: GrantDelta) -> Result<GrantSet, CowshedError>;
     // The project's standing grants (04: reads and egress every workspace runs under).
@@ -653,7 +652,8 @@ package dependency; no consumer generator produces an input to its own generic s
 
 The public CLI health summary `GatewayStatus` and the daemon snapshot `DaemonStatus` are distinct declarations with
 distinct names. API and support collection share the same duplicate-name refusal; neither source shadows the other. This
-naming cutover changes no serialized field or status wire envelope.
+naming cutover changes no serialized field or status wire envelope. The control socket and gateway reconciliation
+fixtures use the daemon snapshot, not the public CLI health summary.
 
 Scalar projection accessor metadata is the closed get/as-str/display contract owned by the declaration. Opaque numeric
 and byte-backed string units use their actual Display, never a guessed as_str or consumer formatter.
@@ -663,7 +663,7 @@ NAPI, and MCP — no adapter redefines a field, and contract goldens (08_testing
 `CheckpointInfo`, `GcReport`, `Finding`, `JobId`, `JobState`, `JobInfo`, `StreamInfo`, `OutputStorage`,
 `ProtectedOutput`, `BinaryData`, `OutputSummary`, `OutputPublication`, `PublicationPolicy`, `ControllerCommitment` and
 its five event structs, `PushReport`, `LandReport`, `RevisionTarget`, `GrantSet`/`GrantDelta`/`PortBlock`/`EgressRule`/
-`RepoRule`/`SimVerb`, `GatewayStatus`, `AuditEvent`, and every `*Options` type (`AdoptOptions`, `CreateOptions`,
+`RepoRule`/`SimVerb`, `GatewayStatus`, `AuditEvent`, and every `*Options` type (`AdoptOptions`, `ForkOptions`,
 `AttachOptions`, `CheckpointOptions`, `RemoveOptions`, `GcOptions`, `RebaseOptions`, `LandOptions`, `PushOptions`).
 
 `JobArtifactRecord`, `ProtectedRecord`, `CheckpointManifestRecord`, and `VisibleJobCommitment` are canonical internal
@@ -785,16 +785,15 @@ descendants without double-counting them. `cpuPct` is the user+system delta divi
 preceding supervisor sample, multiplied by 100; it is one-core normalized and may exceed 100. Supervisor samples are its
 own boundaries: the job's first owned process, a new leader, the terminal sample, and each tick of its sampling clock,
 which runs every `jobCpuSamplePeriod` while any job owns a process. `jobCpuSamplePeriod` is a supervisor policy value,
-initially one second (to be measured for its cost and `cpuPct`'s stability). Reading resources or starting a second
-subscriber does not reset that window: a read measures from the open window to its own instant and leaves it open. The
-first zero-length window reports zero share, not a division by zero; a later window with no whole elapsed microsecond
-stays open, so its CPU is measured by the next. RSS is the simultaneously sampled group sum; peak is its maximum
-observed sum. `members` retains the complete current group, never a truncated membership claim; CPU/RSS accounting
-covers every member. A sample exceeding the generated frame bound is a typed error, not a silently shortened list.
-`leaderPid` retains the job's observed leader after exit; terminal membership may be empty. An incomplete kernel
-membership read is an operational error, never evidence of an empty group. On Linux a retained pidfd judges each procfs
-read after it completes: a process proven departed is no current member, even when its stat read reports `ESRCH`; a read
-failure for a process still alive remains an operational error.
+initially one second. Reading resources or starting a second subscriber does not reset that window: a read measures from
+the open window to its own instant and leaves it open. The first zero-length window reports zero share, not a division
+by zero; a later window with no whole elapsed microsecond stays open, so its CPU is measured by the next. RSS is the
+simultaneously sampled group sum; peak is its maximum observed sum. `members` retains the complete current group, never
+a truncated membership claim; CPU/RSS accounting covers every member. A sample exceeding the generated frame bound is a
+typed error, not a silently shortened list. `leaderPid` retains the job's observed leader after exit; terminal
+membership may be empty. An incomplete kernel membership read is an operational error, never evidence of an empty group.
+On Linux a retained pidfd judges each procfs read after it completes: a process proven departed is no current member,
+even when its stat read reports `ESRCH`; a read failure for a process still alive remains an operational error.
 
 `volumes` compares the used bytes of the workspace volume and the job's build volume at spawn with those at the sample
 boundary. Deltas are signed and never clamped: deletion can shrink a volume. They describe volume-wide usage, not
@@ -861,9 +860,8 @@ prefix, with no safe-retry metadata. No later write or close disguises that unce
 The public N-API `job.attach({ cursor? })` returns an input view whose `write(Uint8Array)`, `end()` and `detach()`
 project the core's stateful capability methods through the generator, without a second cursor implementation. Each
 JavaScript write preserves its view's byte offset and length and snapshots that supplied view once before the
-runtime-thread handoff; its bounded frames then await delivery. Full attachment output iterables remain separate work:
-the existing `job.logs` raw chunks and cursor tails continue to read output. EOF, detachment and process-group
-cancellation are distinct; neither EOF nor a dropped attachment kills the job.
+runtime-thread handoff; its bounded frames then await delivery. EOF, detachment and process-group cancellation are
+distinct; neither EOF nor a dropped attachment kills the job.
 
 ### Process-tree observations
 
@@ -873,20 +871,18 @@ event source beside pidfd identity and proc metrics. Periodic proc children poll
 missed observation records a typed coverage gap and an unattributed-usage row; it never silently claims completeness or
 trusts a reused PID.
 
-macOS per-process coverage is best-effort with a measured gap, and its job totals carry their own named source limits
+macOS per-process coverage is best-effort with a coverage gap, and its job totals carry their own named source limits
 (below). kqueue `NOTE_FORK` on each member coalesces and carries no child PID, and `NOTE_TRACK`/`NOTE_CHILD` are refused
 with `ENOTSUP` (xnu
 [`filt_procattach`](https://github.com/apple-oss-distributions/xnu/blob/ac9718fb1af618d5ce8678d0dc6e8a58f252216f/bsd/kern/kern_event.c#L1094-L1131),
 [`filt_procevent`](https://github.com/apple-oss-distributions/xnu/blob/ac9718fb1af618d5ce8678d0dc6e8a58f252216f/bsd/kern/kern_event.c#L1210-L1212),
-and the `NOTE_FORK` comment in `bsd/sys/event.h`; measured on Darwin 25.6: 64 children forked and reaped under a watched
-root delivered one `NOTE_FORK` and an empty child list). The supervisor therefore answers each `NOTE_FORK` by reading
-the member's children with `proc_listchildpids` and watches each new one for `NOTE_FORK`/`NOTE_EXEC`/`NOTE_EXIT`
+and the `NOTE_FORK` comment in `bsd/sys/event.h`). The supervisor therefore answers each `NOTE_FORK` by reading the
+member's children with `proc_listchildpids` and watches each new one for `NOTE_FORK`/`NOTE_EXEC`/`NOTE_EXIT`
 (`NOTE_EXITSTATUS` is accepted for any process the supervisor may signal, grandchildren included). A child that forks,
 execs and is reaped before that read is missed, and a coalesced `NOTE_FORK` cannot prove how many children it stood for,
 so a macOS tree in which a member forked never claims `Complete`. The leader/children rusage source (below) still counts
 the missed children's CPU once each parent up to the leader has reaped them, and reconciliation states it as
-unattributed usage. An Endpoint Security observer is not used: it needs an Apple entitlement. It is revisited only if
-the measured gap on real gates proves large.
+unattributed usage. An Endpoint Security observer is not used: it needs an Apple entitlement.
 
 The canonical records are:
 
@@ -901,7 +897,7 @@ pub struct JobProcessLeaf { pub pid: u32, pub program: String, pub argv: Vec<Com
 pub enum ProcessBlockedOn {               // lock detail exists only on a lock: no stale path or holder
     None, Lock { path: String, holder: Option<LockHolder> }, Socket, Pipe, Child, Stdin, Disk,
 }
-pub struct LockHolder { pub pid: u32, pub job: Option<JobId> }
+pub struct LockHolder { pub pid: u32, pub job: Option<JobId>, pub program: Option<String> }
 pub struct JobProcessSample {
     pub pid: u32,
     pub ppid: u32,
@@ -937,6 +933,7 @@ pub enum JobProcessEvent {             // `index`: the record's position in `Job
     Changed(JobProcessDelta),          // non-empty sparse change of one process
     Heartbeat { index: u32, process: JobProcessSample }, // one unchanged live process, once a minute
     Exited { index: u32, process: JobProcessSample }, // final own-process usage, exit and exitedAt
+    Gap { reason: ProcessCoverageGap }, // emitted once on the first transition from Complete
 }
 pub enum JobProcessDelta {            // one changed field; no shape changes nothing
     Usage { index: u32, usage: ProcessUsage },          // usage is never cleared
@@ -982,7 +979,8 @@ an observation error with its call and errno; the gap keeps the tree from claimi
 error. Both gaps retain their evidence through the generated controller and N-API records. Blocker detail fields are
 valid only for their observed blocker kind; an unobserved blocker is absence or an observation error, never an assertion
 that the process is unblocked. A lock observation identifies its path and, when kernel evidence resolves it, the holder
-PID and that holder's job; no program-name guess supplies it.
+PID and that holder's job. Its optional `program` is present only after an identity-fenced image read; no program-name
+guess supplies it.
 
 `usage` is a process's own counters as last read. It is absent, never zero, for a process whose counters were never
 read: one reaped before the sampler reached it, or on macOS one that exited before its first read could be proven its
@@ -1001,33 +999,41 @@ dirtied rather than at writeback. Reads served from the cache count on neither. 
 counters.
 
 `processEvents(everyMs)` emits birth/exec transitions, non-empty changed-state records, one heartbeat per minute for
-each unchanged live process, and each process's final usage on exit. The sampling/subscriber interval `everyMs` does not
-set the heartbeat cadence; changed-state and terminal events are immediate. A blocker transition, resident memory
-crossing a power of two (`[2ⁿ⁻¹, 2ⁿ)` is one step), a busy/idle CPU flip, and a process's first usage read produce
-change records; a sample that only moves counters does not. A live process whose usage no record restated for
-`PROCESS_HEARTBEAT` gets its own heartbeat restating its whole record; a blocker change restates no usage, so it does
-not postpone one. A read taken after a process exited is withheld from every record until its `Exited` event carries it,
-once, as final usage: from that read the process is no longer live, so no heartbeat restates it, no blocker read of it
-is accepted, and a late exec event still shows the usage read before the exit. Nothing about that process follows its
-exit. Closing a reader never kills the process. Consumers use these observed facts without declaring or deriving an
-expectation from a command's argv. Events name a process by `index`, its record's position in birth-observation order,
-never by a pid that another life may reuse. The generated sparse delta changes exactly one field, usage or blocker;
-absent is unchanged. A blocker observed afresh, `none` included, is SET, and a blocker no longer observed is CLEAR.
-Because lock detail lives inside `Lock`, setting any other blocker leaves no stale path or holder. No delta shape
-changes nothing, so neither Rust nor the generated validators admit an empty one.
+each unchanged live process, and each process's final usage on exit. The first transition from `Complete` to `Gap` emits
+one `Gap { reason }`, without an index for a life the observer may never have seen; later gaps emit nothing and retain
+that first reason. The sampling/subscriber interval `everyMs` does not set the heartbeat cadence; changed-state,
+coverage-gap and terminal events are immediate. A blocker transition, resident memory crossing a power of two
+(`[2ⁿ⁻¹, 2ⁿ)` is one step), a busy/idle CPU flip, and a process's first usage read produce change records; a sample that
+only moves counters does not. A live process whose usage no record restated for `PROCESS_HEARTBEAT` gets its own
+heartbeat restating its whole record; a blocker change restates no usage, so it does not postpone one. A read taken
+after a process exited is withheld from every record until its `Exited` event carries it, once, as final usage: from
+that read the process is no longer live, so no heartbeat restates it, no blocker read of it is accepted, and a late exec
+event still shows the usage read before the exit. Nothing about that process follows its exit. The job's terminal
+accounting boundary does not close observation of a still-live descendant; its stream ends after the last retained
+registration ends. Closing a reader never kills the process. Consumers use these observed facts without declaring or
+deriving an expectation from a command's argv. Events name a process by `index`, its record's position in
+birth-observation order, never by a pid that another life may reuse. The generated sparse delta changes exactly one
+field, usage or blocker; absent is unchanged. A blocker observed afresh, `none` included, is SET, and a blocker no
+longer observed is CLEAR. Because lock detail lives inside `Lock`, setting any other blocker leaves no stale path or
+holder. No delta shape changes nothing, so neither Rust nor the generated validators admit an empty one.
 
 Events preserve each observed life's transition order. A parent's birth precedes the birth of its observed child.
 
 The `leaf` in `JobResourceSample` is the observed process, live or exited, with the most own CPU (user+system
 microseconds), ties broken by birth identity then PID. It does not need a complete tree: it needs the observed processes
 to account for most of the job's exact CPU. It is named only when the observed processes' own CPU covers at least a
-declared fraction of the accounting source's CPU total; the fraction is supervisor configuration, initially 90%,
-measured on real cargo/Nx/Bun gate jobs and reported. Below it, or with no accounted CPU yet, the leaf is not named and
-the sample says why. The rule is the same on Linux and macOS; the unattributed remainder is still stated by
-reconciliation.
+declared fraction of the accounting source's CPU total; the fraction is supervisor configuration, initially 90%. Below
+it, or with no accounted CPU yet, the leaf is not named and the sample says why. The rule is the same on Linux and
+macOS; the unattributed remainder is still stated by reconciliation.
 
-Until the event observer feeds the sampler, the observed processes are the sampler's census: at each sample boundary it
-reads every member of the group, its identity, the image it runs (fenced by the identity read after it) and its own
+Native macOS jobs attribute from the observer's retained, identity-fenced process lives, including final usage of exited
+processes. The observer publishes the checked CPU sum and leaf candidate with its immutable tree; a resource read loads
+that publication once, compares it with the independent job total, and neither resamples those lives nor moves the
+observer's sampling window. A refused or failed current-image read excludes that life from both the sum and leaf until
+an identity-fenced image read names it again, even when an earlier gap already describes the tree's coverage.
+
+Without an event observer feeding the sampler, the observed processes are the sampler's census: at each sample boundary
+it reads every member of the group, its identity, the image it runs (fenced by the identity read after it) and its own
 counters, and keeps each life it found, exited ones with their last counters. A census polls, so its coverage is never
 `Complete`: it names the first observation it lacks -- a member it found whose birth no leader spawn accounts for
 (`UnobservedBirth`), a member that left before a read after its exit (`UnreadFinalUsage`), a member whose image read the
@@ -1037,8 +1043,8 @@ an observed process until a read names its image again: its CPU covers nothing a
 observed CPU's share of the accounted total, never more than the whole; observed CPU beyond the total stays in the
 signed reconciliation.
 
-A Linux job's accounting source is its own cgroup v2, and until the production spawn path places jobs in one, a Linux
-sample is the typed operational error naming the missing source, not a sample without accounting.
+A Linux job's accounting source is its own cgroup v2; without one, a Linux sample is the typed operational error naming
+the missing source, not a sample without accounting.
 
 ```rust
 pub enum JobLeafAttribution {
@@ -1059,12 +1065,10 @@ storage I/O. Descendants born and reaped between polls still contribute. Cgroup 
 migrating a process after it ran is not complete accounting. These totals reach the controller and N-API through the
 same declaration as process events.
 
-The implemented Linux authority and CPU reader are proven by native fixtures in a sudo-delegated CI scope. Placement is
-a controller-owned API: no request field, environment variable or workload action selects the cgroup through that API.
+The Linux authority and CPU reader are proven by native fixtures in a sudo-delegated CI scope. Placement is a
+controller-owned API: no request field, environment variable or workload action selects the cgroup through that API.
 This is accounting separation, not an adversarial sandbox boundary. A workload running as the controller's UID can still
-open a writable sibling `cgroup.procs` and migrate itself; denying that access remains a stated Linux sandbox gap. The
-real-workspace admission, restart lookup and retirement proof remains blocked on a Linux execution substrate. No
-production spawn-path hook is installed before a Linux `SpawnSink` exists.
+open a writable sibling `cgroup.procs` and migrate itself.
 
 Charged-memory current/peak is separate from `rssBytes`/`rssPeakBytes`: cgroup memory includes anonymous memory,
 file/page cache and kernel charges. It is never relabeled as RSS. Named resource types above have private fields,
@@ -1094,13 +1098,13 @@ backing file, whose final put emits the close notification
 close, the fixture performs one blocking read of that watch: exactly one complete 16-byte nameless `inotify_event` must
 match this watch descriptor, an `IN_CLOSE_WRITE` mask and a zero cookie, then one independent device/backing
 verification runs. Overflow, watch loss, rename/unlink, a short or misframed record, or failed delivery is an error,
-never completion and never retried. The existing fixture guard is unchanged: no timed sleep, status retry or new
-deadline substitutes for the kernel event. Cleanup observes the target's kernel mount ID and device/backing identity,
-including when mount reports failure after acquiring it; an unmount command's status is reconciled with that kernel
-state before the image can be removed. Explicit cleanup returns every release and diagnostic-write failure. Destructor
-fallback attempts the same safe steps without panicking, then attempts fallible stderr/stdout reporting; delivery is
-unavailable if both existing channels fail. Failure controls exercise refused commands before and after mounting,
-including a setup refusal after actual mount acquisition.
+never completion and never retried. No timed sleep, status retry or new deadline substitutes for the kernel event.
+Cleanup observes the target's kernel mount ID and device/backing identity, including when mount reports failure after
+acquiring it; an unmount command's status is reconciled with that kernel state before the image can be removed. Explicit
+cleanup returns every release and diagnostic-write failure. Destructor fallback attempts the same safe steps without
+panicking, then attempts fallible stderr/stdout reporting; delivery is unavailable if both existing channels fail.
+Failure controls exercise refused commands before and after mounting, including a setup refusal after actual mount
+acquisition.
 
 The fixture compares `memory.current`/`memory.peak` with direct reads and verifies regular-file cache separately from
 shmem using `memory.stat`'s `file - shmem`. Direct-I/O workloads require exact independent `io.stat` parity, excluding
@@ -1116,15 +1120,15 @@ every stated counter. Unavailable membership, unreadable proc records or absent 
 rather than becoming a zero-valued proxy; both proc I/O byte keys are required. Terminal census zero is accepted only
 after kernel terminal evidence and an independently read empty membership.
 
-The Linux per-process event source is chosen by a measured implementation unit comparing proc connector `CN_PROC`
-through the owning privileged Linux helper with a ptrace `TRACEFORK`/`TRACEEXEC`/`TRACEEXIT` seam. Both run the same
-fork-heavy workload, measuring complete birth/exec/exit coverage and overhead against an unobserved control. Neither
-backend is selected by familiarity or assumed overhead. pidfd identity and proc sampling complement the chosen event
-source, not replace it. macOS observes the three kqueue event kinds best-effort, as above, and reconciles CPU against
-cumulative leader-own plus reaped-children rusage. That covers the activation interval and the command once each, but it
-is not a complete job total. Descendants still running, those exited and not yet reaped, and orphans reparented to
-another reaper are missing. An exited leader's held zombie keeps the rusage fixed at its exit, so orphans that run on
-after it add nothing. These limits are stated, never presented as exact.
+The Linux per-process event source is chosen by a measurement comparing proc connector `CN_PROC` through the owning
+privileged Linux helper with a ptrace `TRACEFORK`/`TRACEEXEC`/`TRACEEXIT` seam. Both run the same fork-heavy workload,
+measuring complete birth/exec/exit coverage and overhead against an unobserved control. Neither backend is selected by
+familiarity or assumed overhead. pidfd identity and proc sampling complement the chosen event source, not replace it.
+macOS observes the three kqueue event kinds best-effort, as above, and reconciles CPU against cumulative leader-own plus
+reaped-children rusage. That covers the activation interval and the command once each, but it is not a complete job
+total. Descendants still running, those exited and not yet reaped, and orphans reparented to another reaper are missing.
+An exited leader's held zombie keeps the rusage fixed at its exit, so orphans that run on after it add nothing. These
+limits are stated, never presented as exact.
 
 Reconciliation retains the difference between independent job totals and attributed process rows in named units.
 Unattributed CPU/storage-I/O emits an explicit typed row on the job span; event loss, unavailable comparison evidence,
@@ -1249,9 +1253,14 @@ supervisor that ran the job retires.
 - `AdoptOptions = { path?, repoId?, capacity?, quarantine, reAdopt }`; `reAdopt: false` keeps default adoption
   idempotent, while `true` selects the verified retained-source replacement in 02_workspaces.md §Re-adoption, or, when
   main's image is missing, the plain-checkout recovery in §Missing main image.
-  `CreateOptions = { revision?, fromWorkspace?, browse, slot? }`; `AttachOptions = { browse }`;
+  `ForkOptions = { ref?, clean, browse, slot?, register, gitWorktree }`; `AttachOptions = { browse }`;
   `RemoveOptions = { force }`; `GcOptions = { dryRun }`; `RebaseOptions`, `LandOptions`, and `PushOptions` use the
   expectation fields shown above. All booleans are explicit in JSON; absence never silently means authority was granted.
+  `coordinator.fork { repoId, workspace, source?, options: ForkOptions }` defaults an absent source to main. A ref with
+  `clean: false` is a usage refusal; the CLI sets clean for `--ref`. Every fork uses the same mint, carries source edits
+  and untracked files by default, and gets its own `cowshed/<ws>` branch. `coordinator.create`, `CreateOptions`, and
+  `cowshed.create` are not API names; calling `coordinator.create` returns a Usage error. The TypeScript entry point is
+  `cowshed.fork(workspace, { source, ... })`.
 - `GrantSet`, `GrantDelta`, `PortBlock`, `EgressRule`, `RepoRule`, and `SimVerb` reuse the metadata definitions.
   `GrantSet.portBlock` is present on macOS and omitted on Linux; `GrantSet.retainedPortBlocks` is present only after a
   macOS relocation; `GrantDelta.servicePorts` and `GrantDelta.expectedRevision` are optional. `PortBlock` fields are
@@ -1329,17 +1338,26 @@ pub struct CowshedError {
     pub code: ErrorCode,
     pub message: String,
     pub hint: String,
-    /* otherBuild, fence, admission, stdin: optional structured sources, read through accessors */
+    /* otherBuild, fence, admission, stdin, indexMigration: optional structured sources, read through accessors */
 }
 impl CowshedError {
     pub fn other_build_source(&self) -> Option<&OtherBuild>;
     pub fn fence_source(&self) -> Option<&FenceRefusal>;
     pub fn admission_source(&self) -> Option<&AdmissionRefusal>;
     pub fn stdin_source(&self) -> Option<StdinRefusal>;
+    pub fn index_migration_source(&self) -> Option<&IndexMigrationRefusal>;
 }
 
 pub enum ErrorCode {
     Internal, EnvironmentMissing, Usage, NotFound, Conflict, SandboxDenied, Integrity,
+}
+
+/// A non-forced owned index-link cutover refused before publication (16_build_volumes.md).
+/// Wire `indexMigration`: exact checkout path, kernel refusal and observed holders. No holder is killed.
+pub struct IndexMigrationRefusal {
+    pub path: PathBuf,
+    pub reason: String,
+    pub holders: Vec<DatabaseHolder>,
 }
 
 /// Why a rebase or land refused at one of its fences, with what the fence observed. `IncarnationMoved` also types

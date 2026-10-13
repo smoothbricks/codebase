@@ -331,7 +331,8 @@ A high-level structured logging library providing excellent developer experience
 ### Optimization Architecture Contract
 
 A performance claim MUST name its phase: **startup**, **span setup**, **warmed entry write**, **overflow/slow path**, or
-**per-request flush**. “Zero allocation” without a phase is not a valid architecture claim.
+**flush**. “Zero allocation” without a phase is not a valid architecture claim. The flush unit is defined in
+[01j, Physicalization and Cache Lifecycle](./01j_module_context_and_spanlogger_generation.md#physicalization-and-cache-lifecycle).
 
 Startup owns expensive work. `@smoothbricks/lmao` compiles each canonical schema into an immutable `PhysicalLayoutPlan`:
 concrete column offsets and widths, eager/lazy policy, null-bitmap placement, message lanes, and backend-specific
@@ -362,12 +363,12 @@ generation retains the previous generation as an unchanged prefix and appends on
 bindings remain prefix-valid. Ids and decoded values are deterministic; dense indices and dictionary order are not
 deterministic across processes. Dense index `0` is valid; nullability is represented only by the Arrow bitmap.
 
-Per-request flush walks the already physicalized buffers and reuses schema/layout/backend classes, vocabulary bindings,
-dictionary generations, scratch storage, and Arrow-compatible views. It makes few or no allocations and maximal
-Arrow-native reuse. Borrowed storage is held by an `ArrowLease`; the exporter MUST release the lease before the exact
-runtime-owned storage or dictionary generation can be recycled. A lease never pins or borrows a module's mutable
-fragment arrays: those arrays are registration inputs already copied by the registry. Overflow remains an explicit,
-predictable slow path and may allocate; it MUST NOT make the warmed in-capacity path polymorphic.
+Flush walks the already physicalized buffers and reuses schema/layout/backend classes, vocabulary bindings, dictionary
+generations, scratch storage, and Arrow-compatible views. It makes few or no allocations and maximal Arrow-native reuse.
+Borrowed storage is held by an `ArrowLease`; the exporter MUST release the lease before the exact runtime-owned storage
+or dictionary generation can be recycled. A lease never pins or borrows a module's mutable fragment arrays: those arrays
+are registration inputs already copied by the registry. Overflow remains an explicit, predictable slow path and may
+allocate; it MUST NOT make the warmed in-capacity path polymorphic.
 
 Each trace's flush produces one measured lease. The lease holds the trace topology and the JS-heap chunks a table
 borrows, so a borrowed view never outlives the storage it reads; WASM-backed columns are copied into Arrow-owned

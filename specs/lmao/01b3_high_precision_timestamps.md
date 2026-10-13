@@ -18,9 +18,8 @@ span-start/span-end/log write methods. Anchors and `trace_id` live in a single `
 `getTimestampNanos()` method is the API; the function-style sketches below show its arithmetic. Behaviour is pinned by
 `packages/lmao/src/lib/__tests__/timestamp.test.ts`.
 
-**Native acceleration is WASM, not NAPI.** The N-API span-write backend lost to WASM in benchmarks (span timestamp
-writes, M1 Max: WASM ~48 ns, NAPI ~70–86 ns, JS ~85–98 ns), so `TraceRoot` writes stay in plain JS and the WASM
-allocator is the native fast path. There is no NAPI addon in the package.
+**Native acceleration is WASM, not NAPI.** TraceRoot writes stay in plain JS; the WASM allocator is the native fast
+path.
 
 ### Core Design Principles
 
@@ -339,7 +338,7 @@ writer reads `CLOCK_REALTIME` at every boundary), and the early anchor made a ch
 cross-process parent read as starting before it. `performance.timeOrigin + performance.now()` carries the
 sub-millisecond digits but is the process-start wall clock advanced by the monotonic clock, so it drifts by whatever the
 host slewed or stepped since the process started. The anchor is that estimate held inside the millisecond `Date.now()`
-names, read after it: exact to the performance clock (measured within ~2 µs of `CLOCK_REALTIME` under Bun) while the
-drift stays under a millisecond, never more than that millisecond wrong when it does not, and a wall-clock step
-re-anchors the next trace. A runtime without `performance.timeOrigin` anchors on the millisecond. Within a trace nothing
-changes: every stamp is the anchor plus the monotonic delta.
+names, read after it: exact to the performance clock while the drift stays under a millisecond, never more than that
+millisecond wrong when it does not, and a wall-clock step re-anchors the next trace. A runtime without
+`performance.timeOrigin` anchors on the millisecond. Within a trace nothing changes: every stamp is the anchor plus the
+monotonic delta.

@@ -1,9 +1,10 @@
 # 01q: WASM Memory Architecture for SpanBuffer Storage <a id="smoo/lmao!n/wasm-mem"></a>
 
-This spec defines the WASM memory architecture for SpanBuffer storage. The allocator, TypeScript wrapper,
-`PhysicalLayoutPlan`, generated WASM buffer strategy, packed span-superblock setup, trace-root writer, and synchronous
-conversion/release flow live under `packages/lmao/src/lib/wasm/`. `VocabularyBinding`, `ArrowLease`, and the
-memory-epoch pin govern Arrow output lifetime below. The Implementation Map names the source regions.
+This spec defines the WASM memory architecture for SpanBuffer storage. The allocator, TypeScript wrapper, generated WASM
+buffer strategy, packed span-superblock setup, trace-root writer, and synchronous conversion/release flow live under
+`packages/lmao/src/lib/wasm/`. `PhysicalLayoutPlan` lives in `packages/lmao/src/lib/physicalLayoutPlan.ts`.
+`VocabularyBinding`, `ArrowLease`, and the memory-epoch pin govern Arrow output lifetime below. The Implementation Map
+names the source regions.
 
 ## Phase Contract <a id="smoo/lmao!n/wasm-mem.status-contract"></a>
 
@@ -21,8 +22,8 @@ span tree superblock after conversion, or when the last `ArrowLease` on the tree
 are recreated after growth.
 
 **Write and flush contract:** startup performs `VocabularyBinding`; warmed fixed-capacity writes introduce zero new JS
-heap allocations with monomorphic stores and one predictable branch; and per-request flush copies WASM-backed columns
-into Arrow-owned storage, so Arrow output never views WASM memory.
+heap allocations with monomorphic stores and one predictable branch; and flush copies WASM-backed columns into
+Arrow-owned storage, so Arrow output never views WASM memory.
 
 For measurement and acceptance gates, effective memory includes JS heap/view objects, every committed WASM page (live,
 free, fragmented, or orphaned), Arrow output, temporary conversion buffers, caches, and allocator/GC metadata.
@@ -896,9 +897,9 @@ beside Mitata and may be unavailable. Reject semantic differences, warmed-write 
 shapes/branches, growth under a conversion's epoch pin, output retaining WASM views, or regressions beyond the declared
 noise threshold.
 
-## Resolved Decisions <a id="smoo/lmao!n/wasm-mem.resolved-decisions"></a>
+## Design Decisions <a id="smoo/lmao!n/wasm-mem.resolved-decisions"></a>
 
-Three earlier questions are settled, and their resolutions are commitments:
+These decisions are commitments:
 
 - **Capacity tuning** — on a capacity change, orphaned freelist blocks are discarded rather than tracked per capacity;
   capacity stabilizes quickly, so the waste is transient (see

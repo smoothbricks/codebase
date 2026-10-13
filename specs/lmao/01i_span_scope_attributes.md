@@ -122,7 +122,7 @@ ctx.setScope({ userId: null }); // scope = { orderId: 'x' } (new object, userId 
 ```typescript
 type SpanContext<Ctx extends OpContext> = {
   // Set scope values (merge semantics, null to clear)
-  setScope(values: Partial<InferSchema<Ctx['logSchema']>> | null): void;
+  setScope(values: ScopeUpdate<Ctx['logSchema']> | null): void;
 
   // Read-only view of current scope
   readonly scope: Readonly<Partial<InferSchema<Ctx['logSchema']>>>;

@@ -22,14 +22,23 @@ No mounts, no root, no network — pure functions with table-driven cases:
   grants. Real Seatbelt probes must confirm data reads are denied, not merely that deny text occurs later in the
   generated profile.
 - **Path policy**: cwd validation, `..`/symlink-shape normalization, workspace-name validation.
+- **Raw Git preservation**: independent real-repository witnesses cover top-level byte drift, submodule bytes and HEAD
+  drift, and copy-only paths. Each witness proves configured filters would run under ordinary Git but never during
+  capture or copy verification, verifies restored bytes again, and checks both repositories' config/index bytes remain
+  unchanged. These cases keep their ordinary 30s per-test bound; they are not one aggregate of hundreds of serial Git
+  probes.
 - **Grant files**: schema round-trip, revision monotonicity, delta application, wildcard egress matching
   (`*.github.com`), port defaults.
-- **Marker files**: round-trip, unknown-version rejection, role transitions (new/fork/restore).
+- **Marker files**: round-trip, unknown-version rejection, role transitions (fork/restore).
 - **CLI/error contract**: stdout shape per command, all `CowshedError` mappings including `Integrity` → own exit 7,
   exec-wrapper 106, MCP -32006, and `next:` hints. A child 7 still passes through unchanged. Golden tests make any
   taxonomy/shape change explicitly breaking.
 - **Env wiring**: exec env allowlist filtering (no `*_TOKEN`/`*_SECRET`/`AWS_*` pass-through), cache exports match
   03_caches.md exactly.
+- **Repository Cargo warmth**: warm the real repository's own config in a managed shell, fork its source/build images to
+  a different mount path and repeat the identical Cargo build. Require every `compiler-artifact` to be `fresh: true`; a
+  fixture alone cannot catch a checkout-relative linker. The Darwin linker probe requires zero `xcrun`/`xcode-select`
+  with exported `SDKROOT`, exactly one fallback `xcrun` without it, and runnable binaries from both paths.
 - **Port-block rule generation**: the generated SBPL emits the block as **one literal single-port `network-outbound`
   allow per port of its recorded size** — 16 for a live pre-64 block, 64 for a new one (measured: SBPL rejects port
   ranges — `invalid port in network address` — and hosts other than `localhost`/`*`), leaves
@@ -45,10 +54,18 @@ No mounts, no root, no network — pure functions with table-driven cases:
   tagged inline JSON, flattened Arrow validity, and deterministic bounded redacted summaries. Protected Arrow may carry
   bounded inline Binary; controller audit Arrow must contain counts/hashes/batch digests but no payload/path fields.
   `job_id` joins standard trace identity and never substitutes for `span_id`.
+- **Job CPU sampling**: the real-process witness compares CPU share with the job's own observed CPU delta and wall-time
+  interval, not a presumed share of a loaded host. A paused Tokio sampling clock keeps the interval's boundaries known
+  while kernel rusage and monotonic wall time remain real. Repeated reads must keep the window; advancing one clock
+  boundary opens the idle window. The child's independent CPU report pins the accounted total.
 - **API capability goldens**: `Project` exposes discovery only; `WorkspaceRef` exposes inspection plus safe `attach`;
   `WorkspaceHandle` exposes exactly one workspace's exec/shell/jobs/quota-bound checkpoint/push/grant reads; only
   `Coordinator` exposes grant/revoke/restore/destroy/rebase/land/gc/repo-mirror and quota policy. Compile-fail fixtures
-  prove forbidden methods and cross-workspace construction are unavailable.
+  prove forbidden methods and cross-workspace construction are unavailable. Every declared operation, including
+  `job.processes` and `job.processEvents`, has one request in `operations.corpus.json`; the codec, controller authority
+  routing, and served-handle decoding tests consume that same corpus. Process-tree and process-event reply goldens cover
+  omitted observations, observed exits, sparse changes, and coverage gaps through core serialization and the generated
+  public validators. `cowshed:wire-fixtures` regenerates those goldens; generated JSON is never edited by hand.
 - **Public declaration IR:** `cowshed:declaration-model-test` admits the actual owner model through its generated Typia
   Equals guards in one setup, pins `get`/`as-str`/`display` projection metadata, and refuses missing, unknown and extra
   metadata through both assertion and JSON parsing. It consumes the prebuilt owner generator, without an N-API wire
@@ -116,6 +133,19 @@ Darwin's socket-path bound is independent of that private `TMPDIR`. Fixtures use
 change installed host services or checkout source. The descriptor-inheritance proof launches only its unique one-shot
 agent from the generated gateway plist, holds 10000 descriptors with finite `OPEN_MAX`, and unloads that agent on every
 exit path.
+
+Process-observation fixtures hold a child and grandchild under their root with FIFO gates and independent PID/parent
+oracles. The real served supervisor and trusted N-API embedder read the same retained birth-order records and exec/exit
+events. Dropping a stream leaves the workload running; a later subscriber replays the same history. Their sole
+supervisor trace sink seals three spans with the observed parent edges, one argv display per start, one terminal usage
+row per life and the exact generated fourteen-column schema (07_api.md, "Process-tree observations"; 13_telemetry.md,
+"Process-tree spans"). A separately counted burst of reaped grandchildren reports retained and missing births from its
+fixture oracle, never from CPU, and preserves the explicit coverage gap through both public API rows and the terminal
+fixed `job.unattributed` row. Its named signed differences and unavailable I/O survive decoding without clamping or zero
+fill. The job-only host, volume and charged-memory boundary columns come from their one annotated record through the
+same generator. Boundary round trips preserve signed deltas, absent build/charged memory and the exact `u16` core count;
+positive schema controls reject a widened core column or an added process-specific column. The admitted APFS-baseline
+reader control is macOS-only; the fixed-column encoding and schema controls remain in all-targets Linux cross-checks.
 
 Sandboxed TypeScript fixtures cannot allocate the host-controller's Rust-only `ScratchRoot` under world-shared
 `/private/tmp`. They use the same short-parent-link pattern in the job's already-admitted socket namespace: a short
@@ -225,43 +255,41 @@ per-crate shards. `.config/nextest.toml` declares the group's filter once for th
 qualified job-volume accounting witness. Both ordinary and exceptions shards exclude that same declared filter, so no
 test is duplicated or dropped. Non-macOS planning creates no APFS group.
 
-Before the group runs, nextest lists runnable, nonignored matches from the same compiled archive and filter. For `N`
-matches, the target logs `N` and its `N * 30000` millisecond outer budget. Empty or malformed listings, listing failure,
-and a budget exceeding Node's timer range fail closed; the budget is never silently clamped. The ordinary targets keep
-their 120s bound and the ordinary per-test 30s bound stays unchanged. The group's 60s lifecycle class can exceed a
-single test's 30s share of the outer budget. The RAM host walk and real-process CPU-pool production-wiring proofs run
-after this group in `test-host`, outside the four pure Bun shards, with the existing target and case bounds. The shards
-exclude `*-host.test.ts`; the host target names both owned host files.
+Every test target, the group included, is bounded by progress alone: the run ends when no test has finished for 180s,
+the hang backstop, and names the tests still running; it has no wall-clock ceiling, and no per-test bound kills a test
+(`packages/nx-plugin/README.md`, "Bounded Test Targets"). The group's runner carries `--no-tests=fail`, so a filter that
+selects nothing fails rather than passing a run of no test. The RAM host walk and real-process CPU-pool
+production-wiring proofs run after this group in `test-host`, outside the four pure Bun shards, with the existing case
+bounds. The shards exclude `*-host.test.ts`; the host target names both owned host files.
 
-**A real-APFS test's bound is on its code time.** Every disk command a test's process tree runs first queues for the
+**A real-APFS test's class is on its code time.** Every disk command a test's process tree runs first queues for the
 host-wide disk-lifecycle lease (05_gateway.md, "Disk-lifecycle lease") behind every other cowshed process on the host:
 the same warm-fork walk took 37-70s on a loaded host with 0.2-28s of it spent waiting for grants, against a 25s run when
-nothing waited, and one 7.7s wait admitted a 73ms unmount. A wall-clock bound measured that queue, not the test. So each
+nothing waited, and one 7.7s wait admitted a 73ms unmount. A wall-clock class measured that queue, not the test. So each
 group test runs under the `nextest-code-bound.ts` run-wrapper the `@smoothbricks/nx-plugin` ships, named in
 `.config/nextest.toml`. The wrapper creates a fresh lease-wait record, names it in `COWSHED_LEASE_WAIT_RECORD`, which
 every process of the test inherits, and runs the test binary. Every disk-lease client — cowshed-core's `leased` and the
 plugin's `takeDiskLease` — appends `start <pid> <seq> <unix-µs> <class>` before it asks and `end <pid> <seq> <unix-µs>`
 when the wait ends, granted or not, unwinding included; each line is one append, so concurrent writers never interleave.
 After the test exits, the wrapper prints its wall time, the union of its waits clipped to the run (waits of concurrent
-threads and processes, as a sweep beside a teardown, count once) and their difference, its code time, and fails a
-passing test whose code time exceeds its class. A failing test keeps its own exit status. The record cannot undercount a
-wait whose process died: the start is written before the wait, so a start with no end — its process killed while
-waiting, or still waiting — counts to the test's end and is named. A record that cannot be written is said once per
-process and its waits then count as code time; an end with no start counts as code time and is named; a record the
-wrapper cannot parse fails the test. The classes are declared once, as the wrapper rules of `.config/nextest.toml`: 60s
-for `test(/real_apfs_.*_substrate_lifecycle/)`, and 30s for every other group test; the 30s rule names exactly the
-group's filter. The 60s class is defined by what a test runs: the raw substrate lifecycle and every genuine-Nx CLI walk,
-a test whose fixture installs the repository's pinned Nx and runs it or its daemon (`Project::Nx`, or `Project::Build`
-with Nx), each named with the `_substrate_lifecycle` suffix. For the raw lifecycle, 3× its worst idle measurement,
-14.8s, is 44.4s, rounded up. The genuine-Nx walks have no idle median; the warm-fork walk took about 25s when nothing
-waited. With their lease waits excluded, one full serial lane at load 15-84 (median 37) measured them at 2.3-45.4s of
-code time: land-carries 45.4s, the foreign database opener 38.1s, rebase-carries 36.0s, warm fork 30.9s, the foreign
-database holder 30.2s, against at most 5.8s of lease wait each. Five were over 30s, so that class cannot hold them under
-ordinary host load; 60s holds every measurement. It is below 3× their ~25s idle floor (75s): a walk past it on a loaded
-host is a regression to find, not a bound to raise. The group's nextest `slow-timeout` is 180s with
-`terminate-after = 1`: the hang backstop that ends a test which never returns, not its performance bound. It is the only
-killer: a test over its class runs to its own teardown and fails after it, since a killed test leaves its images
-attached until the next run's sweep (01_storage.md, "How the APFS host degrades" §2).
+threads and processes, as a sweep beside a teardown, count once) and their difference, its code time, and warns when
+that code time exceeds its class; the test keeps its own exit status. The record cannot undercount a wait whose process
+died: the start is written before the wait, so a start with no end — its process killed while waiting, or still waiting
+— counts to the test's end and is named. A record that cannot be written is said once per process and its waits then
+count as code time; an end with no start counts as code time and is named; a record the wrapper cannot parse fails the
+test. The classes are declared once, as the wrapper rules of `.config/nextest.toml`: 60s for
+`test(/real_apfs_.*_substrate_lifecycle/)`, and 30s for every other group test; the 30s rule names exactly the group's
+filter. The 60s class is defined by what a test runs: the raw substrate lifecycle and every genuine-Nx CLI walk, a test
+whose fixture installs the repository's pinned Nx and runs it or its daemon (`Project::Nx`, or `Project::Build` with
+Nx), each named with the `_substrate_lifecycle` suffix. For the raw lifecycle, 3× its worst idle measurement, 14.8s, is
+44.4s, rounded up. The genuine-Nx walks have no idle median; the warm-fork walk took about 25s when nothing waited. With
+their lease waits excluded, one full serial lane at load 15-84 (median 37) measured them at 2.3-45.4s of code time:
+land-carries 45.4s, the foreign database opener 38.1s, rebase-carries 36.0s, warm fork 30.9s, the foreign database
+holder 30.2s, against at most 5.8s of lease wait each. Five were over 30s, so that class cannot hold them under ordinary
+host load; 60s holds every measurement. It is below 3× their ~25s idle floor (75s): a walk past it on a loaded host is a
+regression to find, not a class to raise. A class is a warning, never a kill or a failure: a test that never returns is
+ended by its runner's 180s no-progress bound, which names it, and a killed test leaves its images attached until the
+next run's sweep (01_storage.md, "How the APFS host degrades" §2).
 
 The genuine-Nx CLI fixtures use the normal enabled daemon (16_build_volumes.md, "The Nx daemon stays on"). Both halves
 of the declared-versus-undeclared output witness require a seeded, actually adopted build volume through the typed land
@@ -454,16 +482,15 @@ Covered flows:
   rebinding. Repeat for both grant and revoke.
 - **attach `-nomount` → fsck device → mount** ordering on APFS (the clone is verified as a block device _before_ it is
   mounted, per 02) — asserts the sequence and that a structurally-bad clone is caught before mount, not after;
-- **live source capture stays mounted; build seeds are sealed**: a live capture (`new`, `fork`, `checkpoint`) flushes
-  the source volume and backing file, descriptor-clones the live RAW image, and asserts that the source's attachment and
-  mount flags are unchanged (01_storage.md, "Images"). `new` and `fork` verify the clone with `fsck_apfs` before its
-  first mount; a failed verification deletes the clone and retries once from a fresh live capture, and a second failure
-  refuses publication (02_workspaces.md, `new` step 4). `restore` verifies a checkpoint clone before its first mount. A
+- **Live source capture stays mounted; build seeds are sealed**: a live capture (`fork`, `checkpoint`) flushes the
+  source volume and backing file, descriptor-clones the live RAW image, and asserts that the source's attachment and
+  mount flags are unchanged (01_storage.md, "Images"). `fork` verifies the clone with `fsck_apfs` before its first
+  mount; a failed verification deletes the clone and retries once from a fresh live capture, and a second failure
+  refuses publication (02_workspaces.md, fork step 4). `restore` verifies a checkpoint clone before its first mount. A
   build seed is the exception (16_build_volumes.md): the sealed capture detaches its source without force, clones
   through its held inode, and restores identical access/visibility and an updated registry after both success and
-  failure; busy-source refusal names visible holders and leaves source bytes and mounts intact. The earlier ten-sample
-  ASIF live-clone smoke (pre-cutover, historical) passed fsck and reads but did not prove image-driver consistency; RAW
-  has no outer allocation map (02_workspaces.md, `new` step 2).
+  failure; busy-source refusal names visible holders and leaves source bytes and mounts intact. RAW has no outer
+  allocation map for a live capture to split (02_workspaces.md, fork step 2).
 - checkpoint/restore round-trip (restore undo image `pre-restore-…` present);
 - defrag: main fragmented by rewriting pages while a clone shares them refuses the rewrite while a file is open on its
   volume (image untouched), then, idle, comes back in at most a tenth of its extents with its data, marker, and mount
@@ -554,10 +581,10 @@ Covered flows:
 ## Escape tests
 
 One adversarial corpus (04_sandbox.md "Escape tests"), each case a payload run under the generated profile plus an
-assertion that the operation was denied and the artifact untouched. The corpus runs in the `cowshed-escape-tests` crate,
-one corpus on both OSes, through the real exec pipeline: Seatbelt on macOS, Landlock plus loopback netns on Linux.
-Escape suite green on both OSes is a release gate; a red escape test cannot be waived. The categories below are the
-corpus; each category has cases.
+assertion that the operation was denied and the artifact untouched. Test cases live beside the code they pin, as defined
+in [04 Sandbox, Escape tests](04_sandbox.md#escape-tests). The same corpus runs on both OSes through the real exec
+pipeline: Seatbelt on macOS, Landlock plus loopback netns on Linux. Escape suite green on both OSes is a release gate; a
+red escape test cannot be waived. The categories below are the corpus; each category has cases.
 
 Shared categories: path escapes (traversal, symlink, hardlink), secret reads, cowshed-state tampering, cross-workspace
 access, egress bypass (direct, helper-process, DNS), revocation binding, ReadOnly enforcement, **workspace-CA
@@ -586,38 +613,31 @@ production-discovered escape becomes a permanent case.
 Measured by the integration suite with tinybench-style medians (≥ 10 samples); CI asserts with a 3× multiplier to absorb
 runner noise, local `cowshed doctor --bench` reports raw numbers.
 
+The fork tests run from main and from a session with a tracked edit and a nonignored untracked file. Default `fork`
+preserves both on `cowshed/<ws>` without changing the source branch or status. `--clean` removes both; `--ref <commit>`
+implies clean and selects that exact commit. Ignored dependencies and build state remain warm in every case.
+Linked-worktree carry preserves working-tree edits and untracked files, not staged-only state. `new` is rejected as a
+fork argument, and the API rejects a ref with `clean: false`.
+
 ### APFS / Seatbelt (macOS)
 
-| Operation                     | Budget (median, local)  | Basis                                                                     |
-| ----------------------------- | ----------------------- | ------------------------------------------------------------------------- |
-| `cowshed new` cold            | ≤ 1 s                   | pre-cutover measurement: clonefile ~2 ms + attach ~235 ms; RAW unmeasured |
-| `cowshed rm` (perceived)      | ≤ 100 ms to return      | rename + grant-file unlink; detach is background                          |
-| `cowshed fork` / `checkpoint` | ≤ 1 s                   | same path as new; RAW unmeasured                                          |
-| `cowshed path` / `ls`         | ≤ 50 ms                 | readdir + getmntinfo only — proves the no-state-store design              |
-| exec sandbox overhead         | ≤ 50 ms over bare spawn | profile generation + sandbox-exec                                         |
+| Operation                | Budget (median, local)  | Basis                                                        |
+| ------------------------ | ----------------------- | ------------------------------------------------------------ |
+| `cowshed fork` cold      | ≤ 1 s                   | clonefile + first write + attach + `fsck_apfs -q` + mount    |
+| `cowshed rm` (perceived) | ≤ 100 ms to return      | rename + grant-file unlink; detach is background             |
+| `cowshed checkpoint`     | ≤ 1 s                   | descriptor-clone path                                        |
+| `cowshed path` / `ls`    | ≤ 50 ms                 | readdir + getmntinfo only — proves the no-state-store design |
+| exec sandbox overhead    | ≤ 50 ms over bare spawn | profile generation + sandbox-exec                            |
 
-**Basis, and what the numbers are (and are not).** Figures come from the apfs-workspace-bench study
-(`specs/cowshed/prototypes/apfs-workspace-bench/`, harness, REPORT.md, and results committed alongside): clonefile of a
-populated 100k-file image ~2 ms; `hdiutil attach` **median ~235 ms**; clone-backed images beat shadow mounts 2.34× on
-synchronous write throughput, which is why clones are the substrate. These are **primitive-operation evidence from a
-single 20-sample run**, not end-to-end cowshed SLOs — budgets are stated as **medians** precisely because 20 samples
-cannot fix a stable tail. Note the p99 correction: the ~590 ms figure sometimes quoted is the p99 of **shadow
-create+attach**, not clone attach — clone _attach-only_ p99 in that run was ~273 ms and clonefile+attach ~271 ms. Do not
-cite ~590 ms as a clone-attach percentile. These figures are pre-cutover measurements and are not RAW timings; no RAW
-measurement backs the budgets above.
+**What the budgets are.** They are regression thresholds on medians of primitive-operation costs, not end-to-end cowshed
+SLOs: a median is stated because a small sample cannot fix a stable tail. Clone-backed images rather than shadow mounts
+are the substrate because shadows degrade synchronous writes (09_substrates.md, "Tradeoffs").
 
-The pre-cutover image-format prototype (`specs/cowshed/prototypes/image-format-bench/`, harness and results; 100 GB
-images holding a 6.3 GB tree; 01_storage.md, "Format measurements") was the basis for the then-chosen case-sensitive
-ASIF format (historical; superseded by the single RAW format in 01_storage.md §Images): create 441 vs 1,046 ms for
-SPARSE, attach + fsck + mount 228 vs 308 ms, clonefile equal (under 0.1 ms at these sizes), small files created,
-symlinked, and unlinked 10×, 16×, and 7× faster and 1 GiB written and read 4.3× and 7.5× faster (interleaved medians), a
-6.3 GB tree filled 1.6–3.5× faster; case-insensitive ASIF measures the same as case-sensitive within noise. The earlier
-4 GiB experiment (`apfs-workspace-bench/results/2026-07-11-substrate-experiments.json`) points the same way. **Attach
-floor verdict (pre-cutover measurement): not flag-reducible** — `-noverify` saves ~15 ms (noise), `-noautofsck` nothing,
-`diskutil image attach` exposes no equivalent knobs; the ~200–400 ms is inherent to DiskImages attach plus the APFS
-mount. Halving it would need a different attach path (DiskImages2 private API) — a research note, and budgets must not
-assume it. The two harnesses are the reference methodology for any future substrate change (they validated the
-pre-cutover ASIF choice; apfs-workspace-bench establishes the ZFS baseline below).
+**Attach floor verdict: not flag-reducible** — `-noverify` and `-noautofsck` do not lower it, and
+`diskutil image attach` exposes no equivalent knobs; the floor is inherent to DiskImages attach plus the APFS mount.
+Only a different attach path (the private DiskImages2 API) could lower it, and budgets must not assume one. The
+apfs-workspace-bench and image-format-bench harnesses (`specs/cowshed/prototypes/`) are the reference methodology for
+any substrate change; apfs-workspace-bench also establishes the ZFS baseline below.
 
 ### ZFS / Landlock (Linux) — separate baseline
 
@@ -625,15 +645,12 @@ ZFS has no `attach` and no `fsck` step, so the APFS numbers do not transfer; the
 their own measured baseline and regression limits on a ZFS-capable Linux host (the cowshed CI runner, 10_ci.md),
 established before the Linux leg gates.
 
-| Operation                | Budget (median, local)  | Basis                                                                |
-| ------------------------ | ----------------------- | -------------------------------------------------------------------- |
-| `cowshed new` cold       | ≤ 250 ms (to establish) | `zfs snapshot` + `zfs clone` + mount, tens of ms; no attach, no fsck |
-| `cowshed rm` (perceived) | ≤ 100 ms to return      | logical retire; `zfs destroy` clone+origin is background             |
-| `cowshed path` / `ls`    | ≤ 50 ms                 | `zfs list` + mount table                                             |
-| exec sandbox overhead    | ≤ 50 ms over bare spawn | Landlock ruleset apply + netns join                                  |
-
-The "to establish" figures are placeholders until first measured on the runner; they are recorded here so the Linux
-baseline is an explicit deliverable, not an inherited APFS number.
+| Operation                | Budget (median, local)  | Basis                                                    |
+| ------------------------ | ----------------------- | -------------------------------------------------------- |
+| `cowshed fork` cold      | ≤ 250 ms                | `zfs snapshot` + `zfs clone` + mount; no attach, no fsck |
+| `cowshed rm` (perceived) | ≤ 100 ms to return      | logical retire; `zfs destroy` clone+origin is background |
+| `cowshed path` / `ls`    | ≤ 50 ms                 | `zfs list` + mount table                                 |
+| exec sandbox overhead    | ≤ 50 ms over bare spawn | Landlock ruleset apply + netns join                      |
 
 ## CI
 

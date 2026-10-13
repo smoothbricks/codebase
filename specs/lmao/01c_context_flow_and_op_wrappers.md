@@ -266,10 +266,8 @@ trace('create-user', { env, requestId }, createUserOp, userData) creates:
 - `span(name, op, ...args)`: Invoke an op as a child span
 - `log`: SpanLogger for info/debug/warn/error
 - `tag`: TagWriter for span attributes
-- `deps`: Bound dependency ops (can be destructured: `const { retry } = deps`). Every span of a trace shares the root's
-  deps, so the root `defineOpContext` must wire, under the same key, a compatible group for every dep that any included
-  group declares, transitively. A missing or incompatible dep is a type error at the root wiring, never an `undefined`
-  read at runtime ([Library Integration](./01e_library_integration_pattern.md)).
+- `deps`: Bound dependency ops (can be destructured: `const { retry } = deps`), wired under the
+  [Library Integration root-dependency contract](./01e_library_integration_pattern.md#how-nested-libraries-compose).
 - `ff`: Feature flag evaluator bound to current span's buffer
 - User context properties (e.g., `env`, `requestId`, `userId` - defined via `ctx` in `defineOpContext()`)
 
@@ -431,14 +429,15 @@ _spanPre(childCtx, line: number, name: string, callsitePlan: CallsitePlan): Span
 ```
 
 **2. Run and 3. complete.** The `span0`-`span8` methods (child) and `_executeResultWithContext()` (root) call the
-function and write the span-end entry to row 1 for every completion (01l "Entry Type Detection"):
+matching arity-fixed `executeWithRetry0`–`executeWithRetry8` helper and write the span-end entry to row 1 for every
+completion (01l "Entry Type Detection"). The following illustration is the one-argument `span1` case:
 
 ```typescript
 const ctx = this._spanPre(childCtx, line, name, op.callsitePlan);
 const buffer = ctx._spanBuffer;
 tracer.onSpanStart(buffer);
 try {
-  const result = await executeWithRetryN(buffer, op.fn, ctx, ...args); // Retries a TransientError per its policy
+  const result = await executeWithRetry1(buffer, op.fn, ctx, a1); // Retries a TransientError per its policy
   writeSpanEnd(buffer, result); // span-ok or span-err, timestamp, and error_code to row 1
   return result;
 } catch (error) {
@@ -495,7 +494,7 @@ type SpanContext<Ctx extends OpContext> = {
   scope: Readonly<Partial<InferSchema<Ctx['logSchema']>>>;
 
   // Set scoped attributes (merge semantics, null to clear)
-  setScope(values: Partial<InferSchema<Ctx['logSchema']>> | null): void;
+  setScope(values: ScopeUpdate<Ctx['logSchema']> | null): void;
 
   // Access to underlying buffer (advanced use)
   buffer: SpanBuffer<Ctx['logSchema']>;

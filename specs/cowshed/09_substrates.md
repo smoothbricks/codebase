@@ -2,8 +2,8 @@
 
 cowshed's workspace physics — cheap CoW clone, instant delete, own inode namespace — is provided by a substrate.
 Everything above the substrate (grants, sandbox model, gateway, CLI contract, marker files, cache taxonomy) is
-substrate-independent. Two substrates ship: **APFS images** (macOS, 01_storage.md/02_workspaces.md are written against
-it) and **ZFS datasets** (Linux; macOS only where OpenZFS is already installed).
+substrate-independent. There are two substrates: **APFS images** (macOS, 01_storage.md/02_workspaces.md are written
+against it) and **ZFS datasets** (Linux; macOS only where OpenZFS is already installed).
 
 ## Public lifecycle and substrate API
 
@@ -78,9 +78,9 @@ every retired workspace's checkpoint images, and `execute_gc` repeats the previe
 would read the whole store twice for a fence the inode already gives: a replacement differs by inode, a write by
 modification time, a resize by length.
 
-Adopt, create, fork, checkpoint, and restore are intentionally absent from `Substrate`'s execution methods. The
-implemented APFS controller boundary is staged so that controller-owned state can be initialized or fenced while the
-lifecycle lock remains held. `ApfsSubstrate` exposes these methods:
+Adopt, create, fork, checkpoint, and restore are intentionally absent from `Substrate`'s execution methods. The APFS
+controller boundary is staged so that controller-owned state can be initialized or fenced while the lifecycle lock
+remains held. `ApfsSubstrate` exposes these methods:
 
 ```rust
 impl<H, L> ApfsSubstrate<H, L>
@@ -212,8 +212,7 @@ case-sensitive APFS volume. Attach is `diskutil image attach --noMount` followed
 (`fsck_apfs -q`, then mount). Deletion unlinks one file. Clones are logically independent of their source (no GC
 coupling), but inherit its extent map, so a fragmented main makes every clone's first write slow until
 `cowshed defrag main` (01_storage.md, "Clone cost follows extents, not size"), and they share its blocks until every
-sharer is released (01_storage.md, "Space reclamation"). The clonefile ≈ 2 ms and attach ≈ 235–400 ms figures are
-pre-cutover APFS measurements (08_testing.md, historical), not RAW timings; no RAW timing budget is stated here.
+sharer is released (01_storage.md, "Space reclamation"). Timing budgets are in 08_testing.md ("Performance budgets").
 
 ## ZFS substrate
 
@@ -226,10 +225,9 @@ pre-cutover APFS measurements (08_testing.md, historical), not RAW timings; no R
 | session workspace                 | `<pool>/cowshed/projects/<owner>/<repo>/ws/<name>`                                                                                                                                                           |
 | workspace mounts                  | `mountpoint` inheritance on `…/ws` → `<mount-root>/<owner>/<repo>/<name>`                                                                                                                                    |
 | crash-consistent snapshot of main | `zfs snapshot main@cowshed:<name>` (transactionally atomic)                                                                                                                                                  |
-| `cowshed new`                     | snapshot + `zfs clone` — tens of ms, mounts itself, **no attach step, no fsck step**                                                                                                                         |
 | `cowshed checkpoint <ws> <label>` | `zfs snapshot ws@<label>` — instant, zero-copy                                                                                                                                                               |
 | `cowshed restore`                 | clone-swap (default; later checkpoints survive) or `--discard-newer` → `zfs rollback`                                                                                                                        |
-| `cowshed fork <src> <dst>`        | `zfs snapshot src@cowshed:fork-<dst>` + clone                                                                                                                                                                |
+| `cowshed fork [<src>] <ws>`       | `zfs snapshot src@cowshed:fork-<ws>` + clone; source defaults to main                                                                                                                                        |
 | `cowshed rm`                      | retire: `zfs rename` into `…/.trash`; reclaim: `zfs destroy` the clone **then** its origin snapshot — an idempotent logical transaction (physically two commands; `cowshed gc` completes interrupted halves) |
 | capacity cap                      | `refquota` per workspace dataset (replaces sparse-image capacity)                                                                                                                                            |
 | shared caches (layers 1 and 3)    | none — layer 1 is cowshed's user cache directory and layer 3 each tool's own default in the host HOME (03_caches.md)                                                                                         |
@@ -254,13 +252,14 @@ load-bearing (it is version- and tunable-dependent).
 
 ### The clone-origin dependency
 
-Unlike APFS clonefile, a ZFS clone depends on its origin snapshot: `main@cowshed:raven` cannot be destroyed while
+Unlike APFS clonefile, a ZFS clone depends on its origin snapshot: `main@cowshed:fork-raven` cannot be destroyed while
 `ws/raven` exists. cowshed contains this with one rule — **one origin snapshot per workspace, destroyed together with
 it**:
 
-- `cowshed new raven` creates `main@cowshed:raven`; `cowshed rm raven` destroys `ws/raven` then its origin snapshot, the
-  one its `origin` property names (`main@cowshed:raven` unless a CI refresh promotion moved it, below), in that order —
-  an idempotent logical transaction (physically two commands; `cowshed gc` completes interrupted halves).
+- `cowshed fork raven` creates `main@cowshed:fork-raven`; `cowshed rm raven` destroys `ws/raven` then its origin
+  snapshot, the one its `origin` property names (`main@cowshed:fork-raven` unless a CI refresh promotion moved it,
+  below), in that order — an idempotent logical transaction (physically two commands; `cowshed gc` completes interrupted
+  halves).
 - `cowshed gc` prunes `cowshed:*` snapshots with no surviving clone (crash between the two destroys).
 - Main is never blocked: writes to main proceed freely; a workspace's origin snapshot pins only the main blocks that
   main has since overwritten. `cowshed doctor` reports that pinned space per workspace (`zfs list -H -o written,origin`)
@@ -354,8 +353,8 @@ same fencing, token/incarnation, publication, and supervisor ordering.
 OpenZFS on macOS (o3x) is a kext requiring reduced-security boot on Apple silicon; cowshed supports the ZFS substrate
 there when the pool already exists but never selects it by default — APFS images remain the macOS path. btrfs occupies
 the third implementation slot when needed: subvolume snapshot + clone maps one-to-one onto the trait, its clones are
-independent (no origin rule), and reflink crosses subvolumes natively; it is unimplemented in v1 and listed only to show
-the trait is not ZFS-shaped.
+independent (no origin rule), and reflink crosses subvolumes natively; it is listed only to show the trait is not
+ZFS-shaped.
 
 ## Tradeoffs
 

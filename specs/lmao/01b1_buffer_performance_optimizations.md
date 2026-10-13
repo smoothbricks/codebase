@@ -2,8 +2,8 @@
 
 > **📚 PART OF COLUMNAR BUFFER ARCHITECTURE**
 >
-> This document details the V8 and memory optimization tricks that make columnar buffers 10-100x faster than
-> object-based logging. Read the [main overview](./01b_columnar_buffer_architecture.md) first.
+> This document details the V8 and memory optimization tricks that make columnar buffers faster than object-based
+> logging. Read the [main overview](./01b_columnar_buffer_architecture.md) first.
 
 ## WHY: V8 Optimizations Matter
 
@@ -937,8 +937,8 @@ Memory is managed in request-attributable flush cycles:
 4. **Cleanup**: reset, recycle, or GC source memory only after every borrowing lease is released.
 
 Transport batching MAY group completed request outputs but MUST preserve per-request latency, checksum, memory, and
-ownership accounting. The WASM memory epoch is pinned only during the synchronous conversion; a view refresh that finds
-the memory grown under that pin throws rather than read a detached view.
+ownership accounting. A caller holding a detached WASM view re-asks for the view when its `byteLength` is zero; a
+refresh does not read a detached view.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐

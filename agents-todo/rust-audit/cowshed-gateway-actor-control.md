@@ -1,5 +1,8 @@
 # cowshed-gateway/actor+control
 
+Naming cutover: daemon-snapshot `GatewayStatus` references in this historical audit now name `DaemonStatus`. The public
+CLI `cowshed_core::api::GatewayStatus` is unchanged; original audit evidence below is retained.
+
 Scope: `packages/cowshed/crates/cowshed-gateway/src/actor.rs` (2206),
 `packages/cowshed/crates/cowshed-gateway/src/control.rs` (1168). Supporting reads (not audited): `config.rs`
 (`WorkspaceSession`, `ControlTcpConfig`), `policy.rs` (`mirror_scope_matches`, `CanonicalTarget::{origin,authority}`),

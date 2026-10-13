@@ -575,14 +575,14 @@ ORDER BY minute, package_name
 
 ## Integration with Other Specs <a id="smoo/lmao!n/op-metrics.integration-with-other-specs"></a>
 
-| Spec                                                                                   | Integration                                                              |
-| -------------------------------------------------------------------------------------- | ------------------------------------------------------------------------ |
-| [01h_entry_types_and_logging_primitives.md](01h_entry_types_and_logging_primitives.md) | Defines the 12 metric entry types (period + 8 op + 3 buffer) in the enum |
-| [01f_arrow_table_structure.md](01f_arrow_table_structure.md)                           | Documents `uint64_value` as a lazy system column                         |
-| [01b2_buffer_self_tuning.md](01b2_buffer_self_tuning.md)                               | Buffer stats feed `buffer-*` rows via `capacityStats.ts`                 |
-| [01l_op_context_pattern.md](01l_op_context_pattern.md)                                 | Op metrics counters and per-op flush (`n/op-metrics-collection`)         |
-| [01g_trace_context_api_codegen.md](01g_trace_context_api_codegen.md)                   | Generates the fluent `uint64_value()` method (`n/op-metrics-uint64-api`) |
-| [01a_trace_schema_system.md](01a_trace_schema_system.md)                               | Entry type enum extended with metric types                               |
+| Spec                                                                                           | Integration                                                              |
+| ---------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------ |
+| [01h_entry_types_and_logging_primitives.md](01h_entry_types_and_logging_primitives.md)         | Defines the 12 metric entry types (period + 8 op + 3 buffer) in the enum |
+| [01f_arrow_table_structure.md](01f_arrow_table_structure.md)                                   | Documents `uint64_value` as a lazy system column                         |
+| [01b2_buffer_self_tuning.md](01b2_buffer_self_tuning.md)                                       | Buffer stats feed `buffer-*` rows via `capacityStats.ts`                 |
+| [01n_op_and_buffer_metrics.md](01n_op_and_buffer_metrics.md#smoo/lmao!n/op-metrics-collection) | Op metrics counters and per-op flush (`n/op-metrics-collection`)         |
+| [01g_trace_context_api_codegen.md](01g_trace_context_api_codegen.md)                           | Generates the fluent `uint64_value()` method (`n/op-metrics-uint64-api`) |
+| [01h_entry_types_and_logging_primitives.md](01h_entry_types_and_logging_primitives.md)         | Entry type enum extended with metric types                               |
 
 ## Summary <a id="smoo/lmao!n/op-metrics.summary"></a>
 

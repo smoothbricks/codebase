@@ -1,5 +1,8 @@
 # cowshed-cli/services
 
+Naming cutover: daemon-snapshot `GatewayStatus` references in this historical audit now name `DaemonStatus`. The public
+CLI `cowshed_core::api::GatewayStatus` is unchanged; original audit evidence below is retained.
+
 Scope: `packages/cowshed/crates/cowshed-cli/src/launchd.rs` (1650),
 `packages/cowshed/crates/cowshed-cli/src/setup_service.rs` (1185),
 `packages/cowshed/crates/cowshed-cli/src/gateway_service.rs` (1051). Also

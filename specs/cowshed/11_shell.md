@@ -9,7 +9,7 @@ over a Unix socket, job control, and the single exec-record capture that all cli
 
 A fresh workspace is a CoW clone of main, including its `.direnv`/`.devenv` caches. These are inputs to canonical
 activation, not proof that an exported environment is current. Activation dominates command latency: **a warm
-`direnv exec` on a devenv repo costs ~1.3–5 s per invocation**, dwarfing `sandbox-exec` startup and process creation.
+`direnv exec` on a devenv repo costs seconds per invocation**, dwarfing `sandbox-exec` startup and process creation.
 Cowshed therefore activates a workspace shell once, reuses the activated process for every command until one of the
 inputs direnv recorded for that activation changes, and never replays exported variables in place of activation.
 
@@ -232,11 +232,17 @@ descriptor exhaustion); no command starts. The reason is written through the ori
 diagnostics are written through a borrowed file, never another descriptor clone, and their writer closes as soon as the
 command starts so it cannot hold output EOF open.
 
-Every call is one connection: the client writes one JSON request frame, then the raw bytes the call carries (inline
-stdin, a stdin chunk) as one more frame; the supervisor answers with one JSON response frame, then the raw bytes the
-answer carries (a log chunk), and both sides close. A frame is a big-endian `u32` length and that many bytes. A long
+Each non-streaming call is one connection: the client writes one JSON request frame, then the raw bytes the call carries
+(inline stdin, a stdin chunk) as one more frame; the supervisor answers with one JSON response frame, then the raw bytes
+the answer carries (a log chunk), and both sides close. A frame is a big-endian `u32` length and that many bytes. A long
 call — `wait`, a following log read — therefore holds only its own connection: no call queues behind another, nothing is
 multiplexed, and a client that disconnects abandons only its own call, never a job.
+
+`processEvents` holds its own connection. The supervisor validates the caller's authority and opens the retained native
+subscription before acknowledging it. The client then sends the stream-lane demands defined in
+[07_api.md, “A stream-lane call answers each demand”](07_api.md#napi-streaming-frozen). Each `next` receives one
+canonical process event, an end, or an error; `close` remains readable while a demand awaits an event. Disconnecting or
+closing drops only that subscription, never the job. No public cursor or long-poll operation is exposed.
 
 - **hello** — the supervisor answers with its build, the authority it serves (repository, workspace, incarnation, grant
   and lifecycle revisions) and its pid. A client reads the build first and refuses any other by name (`Conflict`), so
@@ -433,6 +439,9 @@ build can exceed 100%. Current RSS is the group's resident-byte sum, and peak RS
 a sum of unrelated per-process peaks. A leader that exits before descendants does not end accounting: the same ownership
 fence that retains the group for cancellation retains it for sampling through terminal drain.
 
+On macOS each sample carries the job's CPU share over the supervisor's sampling clock window, its leader/children rusage
+totals reconciled against a polled census of the group, and the census's CPU-winning leaf.
+
 Each sample names its native `jobId`, including a standalone progress event or a completed-output projection. The start
 boundary is the first job-owned process: the activation group on a cold host, otherwise the command. Activation receives
 real progress while it runs, and a failure preserves its cost. When the command starts, current leader/membership move
@@ -443,11 +452,12 @@ command, never idle time inherited from a reused warm host.
 
 The supervisor observes fork, exec and exit, not just membership at a poll. macOS uses kqueue
 `NOTE_FORK`/`NOTE_EXEC`/`NOTE_EXIT` on each member and reads a forking member's children with `proc_listchildpids`,
-since kqueue gives no child PID: its per-process coverage is best-effort with a measured gap, and its job totals stay
-exact through leader/children rusage (07_api.md, "Process-tree observations"). Linux combines pidfd identity and proc
-metrics with an event-capable source, chosen by measuring proc connector `CN_PROC` through the privileged helper against
-ptrace fork/exec/exit tracing on the same fork-heavy workload. Polling alone cannot claim complete short-lived
-descendants. Missing events are explicit coverage gaps, never a shortened tree presented as complete.
+since kqueue gives no child PID: its per-process coverage is best-effort with a coverage gap. Its job accounting retains
+the declared leader-own plus reaped-children rusage source and its limits (07_api.md, "Complete job accounting and
+observation reconciliation"). Linux combines pidfd identity and proc metrics with an event-capable source, chosen by
+measuring proc connector `CN_PROC` through the privileged helper against ptrace fork/exec/exit tracing on the same
+fork-heavy workload. Polling alone cannot claim complete short-lived descendants. Missing events are explicit coverage
+gaps, never a shortened tree presented as complete.
 
 `JobHandle.processes` and `process_events` expose the canonical records in 07_api.md through both controller and N-API,
 generated from the same declaration. The records carry per-process CPU user/sys microseconds, current/peak RSS,
@@ -488,7 +498,9 @@ volume evidence never becomes invented zeroes. Job output and the actual exit st
 `JobHandle.listening_ports` reports the current TCP LISTEN ports whose sockets belong to identity-proven members of this
 job's process group. It includes listening children, supports IPv4 and IPv6, and never mistakes a port owned by an
 unrelated host process for readiness. The supervisor reads kernel socket ownership through the same birth-identity fence
-as group sampling; a failed ownership read is a typed error, not an empty census.
+as group sampling; a failed ownership read is a typed error, not an empty census. The controller and N-API reach this
+query through the operation bindings generated from the one API declaration (07_api.md, "DTO freeze (single source of
+truth)").
 
 Explicit Open admission keeps stdin available without starting a reader. `JobStdin::write` / `close` in Rust and the
 generated N-API `JobAttachment.write` / `end` preserve arbitrary binary views, at most 64 KiB per wire frame, with

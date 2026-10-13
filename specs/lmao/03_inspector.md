@@ -80,8 +80,8 @@ considered:
 | Polars (polars-js) | Rust     | Node-native; no browser build | Yes          | SQL + API   | Growing    |
 | GlareDB            | Rust     | None                          | Yes          | Full SQL    | Early      |
 
-DuckDB-WASM is the chosen engine (proven, ~4MB, full SQL, Arrow-native). The Rust alternatives are recorded (snapshot
-2026-07) only as the fallback set should DuckDB-WASM's bundle size or Arrow integration prove inadequate.
+DuckDB-WASM is the chosen engine (proven, ~4MB, full SQL, Arrow-native). The Rust alternatives are recorded only as the
+fallback set should DuckDB-WASM's bundle size or Arrow integration prove inadequate.
 
 The engine must handle the LMAO column schema including `S.unknown()` Binary columns (msgpack-encoded). For DuckDB-WASM,
 the `msgpack_extract()` extension from `02_query_engine.md` applies here too — either as a WASM extension or with

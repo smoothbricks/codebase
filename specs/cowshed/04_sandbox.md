@@ -50,7 +50,7 @@ Shape:
 ;; answered, it names the host user's /var/folders, which macOS mktemp prefers over TMPDIR
 ;; and no job may write.
 ;; Runtime seeding (Python dies in _Py_HashRandomization_Init without it). Every role,
-;; the controller's Git profile included: it runs merge drivers and hooks.
+;; the controller's Git profile included: it may run a standalone repository's merge drivers.
 (allow file-read* (literal "/dev/random") (literal "/dev/urandom"))
 
 ;; Local IPC: scoped, never blanket — a blanket unix-connect allow would let a
@@ -249,8 +249,8 @@ Notes:
   including one it only probes while the sandboxed supervisor repeats detection, contributes it as a grant or shared
   cache, main's `[caches] home` entries join the same merge, and nothing else adds one. A workspace's sandbox `HOME`,
   `XDG_*` directories and runtime dir are inside its own mount, so the deny takes nothing a child's private home holds.
-  Reported leak this closes: a job `cat`ting `~/.omp/agent/agent.db` or `~/Library/Application Support/*` — the broad
-  data allow admitted any file whose metadata was denied.
+  A job therefore cannot read another tool's private state under HOME, such as an agent harness's session database or
+  `~/Library/Application Support/*`: the broad data allow would otherwise admit any file whose metadata was denied.
 - **Main's checkout is a sibling.** Main mounts at the operator's own checkout path, outside the configured mount root,
   so the mount-root deny never covered it: a job read main's untracked files, `.cowshed/token` included. Every workspace
   but main now carries main's canonical mount among its policy denies (`file-read* file-write*`, exact and subpath, the
@@ -345,8 +345,21 @@ Notes:
   macOS the GitDiscovery profile, on Linux the Landlock controller Git sandbox with the same write boundary. The target
   checkout is writable, and any source checkout it must read is supplied by the controller, not a URL found in
   `.git/config`. Linked-worktree Git can write the shared `.git` only when its reverse registration points back to this
-  workspace. Repository filters and merge drivers run within this narrower write boundary. A platform without the
-  controller Git sandbox refuses those verbs with a typed error; it never runs them unsandboxed. The object-only bundle
+  workspace. A platform without the controller Git sandbox refuses those verbs with a typed error; it never runs them
+  unsandboxed. A standalone workspace's repository filters and merge drivers run within this narrower write boundary. A
+  git-worktree workspace's controller Git runs no repository driver: every filter is emptied and every merge,
+  external-diff and textconv driver switched off, so a merge that needs one conflicts. On macOS it also reads the
+  regular config files inside main's checkout that main's job-writable config includes, and nothing else outside the
+  workspace and main's `.git` (02_workspaces.md, "Git-worktree workspaces"); an include outside main's checkout, or one
+  that is not a bounded regular file, refuses the command by name rather than being granted. While it holds such a grant
+  its profile allows `process-exec` of Git's own executables only — the developer directory's `usr/bin/git` and
+  `usr/libexec/git-core` — so `gpg.program`, a shell, or a driver added after the command was built fails closed. A
+  controller-supplied fetch source is not such a grant, and the two never meet: a local fetch runs `upload-pack` through
+  a shell, so a fetch into or from a git-worktree workspace that holds such a grant — `rebase --into` a lane,
+  `land --into` a git-worktree lane base — refuses before Git runs, naming the include and this rule ("a linked worktree
+  whose main config includes main-tree files cannot fetch"), with the hint to move the include or go through a
+  standalone lane. Only a fetch is refused: a read of another repository's object store in place (`rm`'s unlanded-work
+  proof, `ls --landing`) runs no program and works under the Git-only profile. The object-only bundle
   create/verify/fetch verbs access controller-owned bundle files in the denied store; they run host-side with hooks and
   fsmonitor disabled, without checkout, configured remotes or merge/filter execution. The store is not made readable to
   a workspace Git sandbox.
@@ -423,19 +436,38 @@ Controller-owned, host-readable while the image is detached, outside the workspa
   `size` is a power of two of at least 2, `base` is aligned to its own `size`, and every reader — sidecar parsing, grant
   validation, the gateway's session check, the Seatbelt profile — validates a block against its own recorded
   `{base, size}`. A new workspace gets `NEW_PORT_BLOCK_SIZE` (64) ports — the gateway plus 63 service ports — at the
-  lowest aligned base whose block shares no port with any live block of any size. A live block keeps its size until a
+  lowest aligned base whose block shares no port with any claimed block of any size. A block is claimed while any record
+  names it: a published grant, the `PendingFence` grant of an unpublished clone, the grant every unfinished lifecycle
+  intent carries (a re-adoption's main: its image sits in `retained/` or `.staging/` outside the canonical inventory
+  until the intent completes), and the grants sidecar of any image outside that inventory (`retained/`, `.staging/`, a
+  fence whose payload is still staged, a legacy session image). The journal is read before the images, so a block an
+  intent moves between the two is seen in one of them. A sidecar outside the canonical inventory that cannot be read, or
+  that names another repository than the project it sits in, names a block nobody can know: allocation goes on without
+  it, says so on stderr, and doctor reports it as `port-claim-unreadable`. A live block keeps its size until a
   `service_ports` grant (below) grows it, so 16-port blocks from before the size was raised stay valid beside 64-port
-  ones and grown ones. Alignment makes blocks nest or stay disjoint, never straddle, and the store-wide readers refuse
-  any two live blocks that share a port. It is allocated at new/fork (adopt, for main), preserved across restore, never
-  inherited by a fork, and omitted on Linux. Linux records no synthetic port alias; its per-workspace Unix gateway
-  socket and private loopback namespace are runtime topology, not grant authority. Unpublished allocations claim every
-  initial-size 64-port grid cell they touch, even when a legacy 16-port block grows into an upper-half 32-port block.
-  Cell claims and newly owned kernel listeners stay held through the authoritative inventory re-read and durable grant
-  publication. A block is held for the workspace's whole life, attached or detached: detach closes the gateway listener
-  on `base` but releases no port, and only retirement frees the block and its retained blocks. The range therefore
-  bounds how many workspaces a host holds at once — 256 at the initial size. It ends just below the macOS ephemeral
-  range (`net.inet.ip.portrange.first`, 49152), so no outbound connection's local port falls inside a block. It started
-  at 40960, a ceiling of 128 workspaces that a busy host reached; blocks allocated there are still valid.
+  ones and grown ones. Alignment makes blocks nest or stay disjoint, never straddle. Two workspaces whose claimed blocks
+  share a port are a **collision**: the older workspace (by its recorded `createdAt`, then repository and name) keeps
+  the ports. Every inventory reader sees both members; only the gateway's session path — its startup install and every
+  per-project reconcile — serves the older one and not the newer, saying so on stderr with
+  `next: cowshed doctor --repair`, so the gateway never exits and no project's reconcile fails over a collision.
+  `cowshed doctor` reports each collision a project's workspace is part of as `port-block-collision`, naming both
+  workspaces and the record each claim is read from. When the newer claim is that workspace's published grant,
+  `doctor --repair` in its project moves it: a colliding current block is replaced by the lowest free block of the same
+  size, through the allocator's own claim, a colliding retained block is dropped, the grants publish at the next
+  revision, and a mounted workspace is stopped idle and its supervisor started again from the new grants, which rewrites
+  `.cowshed/env` (a detached one gets it at its next attach). A newer claim another record carries — an intent, a
+  pending fence, a sidecar outside the inventory — is not doctor's to rewrite: the finding names that record, which
+  changes when its operation finishes or is retired. A pending clone whose fenced grant collides is refused before it is
+  activated. It is allocated at fork (adopt, for main), preserved across restore, never inherited by a fork, and omitted
+  on Linux. Linux records no synthetic port alias; its per-workspace Unix gateway socket and private loopback namespace
+  are runtime topology, not grant authority. Unpublished allocations claim every initial-size 64-port grid cell they
+  touch, even when a legacy 16-port block grows into an upper-half 32-port block. Cell claims and newly owned kernel
+  listeners stay held through the authoritative inventory re-read and durable grant publication. A block is held for the
+  workspace's whole life, attached or detached: detach closes the gateway listener on `base` but releases no port, and
+  only retirement frees the block and its retained blocks. The range therefore bounds how many workspaces a host holds
+  at once — 256 at the initial size. It ends just below the macOS ephemeral range (`net.inet.ip.portrange.first`,
+  49152), so no outbound connection's local port falls inside a block. Port blocks already allocated in the earlier
+  range starting at 40960 remain valid.
 - **Port capacity grows only by grant.** `GrantDelta.service_ports = N` (`cowshed grant <ws> --ports <N>`) requires the
   block to hold at least N service ports, the gateway port excluded: the target size is the smallest power of two of at
   least N+1. Growth is monotone — a count the current block already holds leaves the block, the revision, and the
@@ -470,7 +502,7 @@ a workspace grant delta cannot remove a project deny.
   "checkpointQuotas": { "raven": { "maxCount": 4, "maxBytes": 10737418240 } },
   "grants": {
     "revision": 3,
-    "read": ["/Users/alice/Dev/acme/shared-fixtures"],
+    "read": ["<home>/Dev/acme/shared-fixtures"],
     "egress": [{ "host": "index.crates.io" }, { "host": "github.com" }],
     "denyWrite": [".git/hooks", ".git/config"],
     "deny": [".runtime"]
@@ -493,8 +525,8 @@ a workspace grant delta cannot remove a project deny.
   `[sandbox] deny`); egress is workspace rules plus every standing rule for a host the workspace does not name. Project
   denies cannot be removed by a workspace `grant` or `revoke` delta. A fork receives the standing policy, never another
   workspace's own grants.
-- **Linux.** Neither workspace-relative deny has a Linux enforcement yet: `denyWrite` is Seatbelt-only today and `deny`
-  follows it exactly; both land together with the Linux workspace filesystem ruleset.
+- **Linux.** The Linux workspace filesystem ruleset enforces both workspace-relative denies; `deny` follows `denyWrite`
+  exactly.
 - **Effective revision.** The standing grants carry their own `revision`, advanced by every effective change and never
   reset. The revision a workspace's supervisor launches under, its jobs record, and its gateway session is installed at
   is the workspace's own revision plus the project's: each only grows, so the sum grows whenever either does, and a
@@ -603,14 +635,13 @@ activation exports its own `SSL_CERT_FILE` replaces it for that shell. Python re
 (`DENO_CERT`) read anchors cowshed does not wire, so they verify an intercepted host only when their own configuration
 trusts the bundle.
 
-**Known gaps** (documented, not silently broken):
+**Limits** (documented, not silently broken):
 
 - **macOS-native TLS** (Security.framework — Swift/Xcode tooling, some system utilities, **and Go-built binaries**: Go's
-  `crypto/x509` honors `SSL_CERT_FILE` only on Unix roots, while its darwin path defers to the platform verifier —
-  verification item) ignores the env anchors above. Such a client either fails against an intercepted host or must be
-  granted `--opaque` for it (05_gateway.md). Go module traffic is such a client: it reaches `proxy.golang.org` and
-  `sum.golang.org` through opaque tunnels (03_caches.md). The exact inventory of affected tools is a kickoff
-  verification item.
+  `crypto/x509` honors `SSL_CERT_FILE` only on Unix roots, while its darwin path defers to the platform verifier)
+  ignores the env anchors above. Such a client either fails against an intercepted host or must be granted `--opaque`
+  for it (05_gateway.md). Go module traffic is such a client: it reaches `proxy.golang.org` and `sum.golang.org` through
+  opaque tunnels (03_caches.md).
 - **Cert-pinning clients** reject the leaf regardless of trust store; `--opaque` is their path.
 
 These anchors are trust configuration, not secrets, so they are exported/written like any other cache wiring
@@ -852,10 +883,10 @@ using its real kernel process and daemon log. It stays outside the ordinary boun
 A known, accepted property: a host client that connects to a workspace's daemon sends it the client's environment, as
 every Nx client does with its first message (`getDaemonEnv`, pinned Nx 23.2.1 `daemon/client/daemon-environment.js`).
 The daemon applies that environment to its own process environment, which the workspace's project-graph plugins run
-under, so a host shell's variables reach code inside the workspace's sandbox. This is accepted for now for three
-reasons. A workspace is a clone of main for changing main in parallel. Main's environment holds no long-lived secrets,
-and the credentials it carries today are temporary. Host-side Nx in coder workspaces runs from the pure environment, not
-a login shell's. Revisit this property once real secrets can reach a host shell that runs Nx in a workspace.
+under, so a host shell's variables reach code inside the workspace's sandbox. This is accepted for three reasons. A
+workspace is a clone of main for changing main in parallel. Main's environment holds no long-lived secrets: the
+credentials it carries are temporary. Host-side Nx in coder workspaces runs from the pure environment, not a login
+shell's. The acceptance holds only while no real secrets can reach a host shell that runs Nx in a workspace.
 
 The same adoption decides what a runtime hash input sees. Nx runs a task's `runtime` inputs in the process that hashes
 the task, which for a workspace's clients is the daemon inside the sandbox, and lays the requesting client's environment
@@ -876,10 +907,8 @@ sandboxed daemon, in a sandboxed client and in a daemonless host client. One tha
 client uses it, and Nx must report that failure as an error. Nx 23.2.1 ignores a runtime input's exit status and hashes
 its stdout and stderr, so a failed input would otherwise become a valid key: its error text, constant across every tree.
 Every runtime input therefore runs through `@smoothbricks/nx-plugin`'s `runtime-input.sh`, which keys on stdout alone
-and turns a nonzero exit into an Nx error. Measured on one consumer test target before the contract: a sandboxed client
-(through the sandboxed daemon) and a daemonless host client both hashed it `6594635368833226346`. A host client through
-the sandboxed daemon hashed it `10802304702072678079`, because its git-history input hashed git's
-`unable to access '/Users/<user>/.config/git/config': Operation not permitted` in place of the history.
+and turns a nonzero exit into an Nx error. A Git input that reads an inaccessible global config fails: Git reports the
+config as unreadable rather than producing repository history.
 
 Beyond the runtime dir, a child may bind and connect Unix sockets anywhere in its workspace's own tree — the exec temp
 dir, and for a read-write job the whole mount — so a test's socket in `TMPDIR` works as it does on the host. A write
@@ -963,13 +992,12 @@ intersects the deny set.
 
 ## Escape tests
 
-Escape tests run the generated profile under the kernel and assert denial; there is no separate escape crate. Today they
-live beside the code they pin, and run on macOS only: `cowshed-core`'s Seatbelt tests execute supervisor and child
-profiles under `/usr/bin/sandbox-exec` (protected job artifacts refuse writes, hardlinks and parent replacement), and
-the host-controller probes in `cowshed-core/tests/devenv_runtime_dir.rs` exercise Unix sockets outside the workspace
-tree, a proxy bypass to unallocated loopback ports, and private-environment symlinks that try to redirect host
-preparation. The list below is the corpus they are to cover, on Seatbelt and, once the Linux leg exists, on Landlock; a
-case with no test yet is an open gap, not a guarantee:
+Escape tests run the generated profile under the kernel and assert denial; there is no separate escape crate. They live
+beside the code they pin: `cowshed-core`'s Seatbelt tests execute supervisor and child profiles under
+`/usr/bin/sandbox-exec` (protected job artifacts refuse writes, hardlinks and parent replacement), and the
+host-controller probes in `cowshed-core/tests/devenv_runtime_dir.rs` exercise Unix sockets outside the workspace tree, a
+proxy bypass to unallocated loopback ports, and private-environment symlinks that try to redirect host preparation. The
+list below is the corpus on Seatbelt and Landlock; each category requires denial and untouched-artifact assertions:
 
 - write outside granted roots (absolute, relative, `..`-traversal, symlink pivot, hardlink);
 - read `~/.ssh`, `~/.aws`, Keychains, any `/private/cowshed/store` path outside the carve-backs (grant files, CA keys,

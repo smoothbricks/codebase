@@ -414,8 +414,9 @@ return ctx.ok(user).line(42).with({ userId: user.id }).message('Created');
 #### 6.1 One static-message representation
 
 Literal log text and literal span names are registered in the global vocabulary of §6.2, and a row stores the dense
-vocabulary index. There is no Op-local template table, no per-Op `u16` ID lane, and no alias or dual-write shim: every
-compiler and runtime caller uses the versioned global registration ABI. The examples in §6.2 are normative.
+vocabulary index. The global-vocabulary cutover removes the Op-local template table and per-Op `u16` ID lane: every
+compiler and runtime caller migrates to the versioned global registration ABI, with no alias or dual-write shim. The
+examples in §6.2 are normative.
 
 #### 6.2 Checker-semantic structured vocabulary ABI
 
@@ -623,32 +624,32 @@ literal `SPAN_NAME` registration, and dynamic span-name fallback. It verifies bi
 stability, dense index zero with validity-based nulls, exact record bytes/hashes, decoded Arrow values, and unchanged
 span Promise/microtask observations under at least two reversed registration orders.
 
-Results are reported separately for `startup`, `span setup`, `warmed entry write`, `overflow/slow path`, and
-`per-request flush`; one phase may not amortize or hide another. The warmed registered entry path must demonstrate zero
-allocations, fixed monomorphic stores, and at least a 10% p50 improvement over `plugin-off` without a greater than 3%
-regression at any reported tail percentile. Overflow must remain bounded and correct without a greater than 3% p99.9
-regression. Per-request flush must show few or no allocations and reuse the startup `PhysicalLayoutPlan`, dense Arrow
-vocabulary, and `ArrowLease`; it must not regress a reported percentile by more than 3%. Startup and span setup are
-explicit costs and must not regress by more than 3% unless the commit message names and justifies the trade. A change
-that fails a gate does not land, and no zero-overhead claim is made without a passing run.
+Results are reported separately for `startup`, `span setup`, `warmed entry write`, `overflow/slow path`, and `flush`;
+one phase may not amortize or hide another. The warmed registered entry path must demonstrate zero allocations, fixed
+monomorphic stores, and at least a 10% p50 improvement over `plugin-off` without a greater than 3% regression at any
+reported tail percentile. Overflow must remain bounded and correct without a greater than 3% p99.9 regression. Flush
+must show few or no allocations and reuse the startup `PhysicalLayoutPlan`, dense Arrow vocabulary, and `ArrowLease`; it
+must not regress a reported percentile by more than 3%. Startup and span setup are explicit costs and must not regress
+by more than 3% unless the commit message names and justifies the trade. A change that fails a gate does not land, and
+no zero-overhead claim is made without a passing run.
 
 ## V8 Optimization Impact <a id="smoo/lmao!n/transformer-v8-impact"></a>
 
-| Transformation                     | Without Transformer                   | With Transformer                                                                              |
-| ---------------------------------- | ------------------------------------- | --------------------------------------------------------------------------------------------- |
-| Stable proven Op span              | Public variadic Promise dispatcher    | Promise-based fixed `span0`–`span8` ABI                                                       |
-| Dynamic/unstable Op span           | Public variadic Promise dispatcher    | Unchanged public dispatcher; single evaluation preserved                                      |
-| Inline-closure span                | Public variadic Promise dispatcher    | Promise-based fixed `span0`–`span8` ABI on the receiver's `_physicalLayoutPlan`               |
-| Explicit internal `spanAutoN`      | Not applicable                        | Sync `Ok`/`Err` terminal or Promise retry/thenable fallback; never automatic                  |
-| `with()` bulk setter               | Object allocation + iteration         | Direct columnar buffer writes                                                                 |
-| Destructured `span`                | Closure-bound public dispatcher       | `__ctx` parameter plus the same fixed-arity lowering; residual properties rebound in the body |
-| Op setup                           | Full context setup, adaptive capacity | Structured compile metadata with packed hint and eager columns when analysis is valid         |
-| Literal Op log message             | String stored per row                 | Stable message `u32` id in a stable fragment bound to a process-dense Arrow index             |
-| Structured operational log         | Runtime object/string work or raw API | Checker-proved literal template and fixed-arity field stores                                  |
-| Dynamic debug/trace message        | Raw string row                        | Preserved dynamic lane; avoidable interpolation is diagnostic `LMAO_AVOIDABLE_INTERPOLATION`  |
-| Dynamic/ineligible operational log | Raw string row                        | Raw fallback for unproved calls; proved-LMAO policy violations are diagnostics                |
-| Line numbers                       | Runtime fallback/absent               | Compile-time injection on lowered calls                                                       |
-| Metadata                           | Manual or missing                     | Auto-injected                                                                                 |
+| Transformation                     | Without Transformer                                                | With Transformer                                                                              |
+| ---------------------------------- | ------------------------------------------------------------------ | --------------------------------------------------------------------------------------------- |
+| Stable proven Op span              | Public variadic Promise dispatcher                                 | Promise-based fixed `span0`–`span8` ABI                                                       |
+| Dynamic/unstable Op span           | Public variadic Promise dispatcher                                 | Unchanged public dispatcher; single evaluation preserved                                      |
+| Inline-closure span                | Public variadic Promise dispatcher                                 | Promise-based fixed `span0`–`span8` ABI on the receiver's `_physicalLayoutPlan`               |
+| Explicit internal `spanAutoN`      | Not applicable                                                     | Sync `Ok`/`Err` terminal or Promise retry/thenable fallback; never automatic                  |
+| `with()` bulk setter               | Object allocation + iteration                                      | Direct columnar buffer writes                                                                 |
+| Destructured `span`                | Closure-bound public dispatcher                                    | `__ctx` parameter plus the same fixed-arity lowering; residual properties rebound in the body |
+| Op setup                           | Full context setup, adaptive capacity                              | Structured compile metadata with packed hint and eager columns when analysis is valid         |
+| Literal Op log message             | Per-Op `u16` message ID per row; strings decode at cold conversion | Stable message `u32` id in a stable fragment bound to a process-dense Arrow index             |
+| Structured operational log         | Runtime object/string work or raw API                              | Checker-proved literal template and fixed-arity field stores                                  |
+| Dynamic debug/trace message        | Raw string row                                                     | Preserved dynamic lane; avoidable interpolation is diagnostic `LMAO_AVOIDABLE_INTERPOLATION`  |
+| Dynamic/ineligible operational log | Raw string row                                                     | Raw fallback for unproved calls; proved-LMAO policy violations are diagnostics                |
+| Line numbers                       | Runtime fallback/absent                                            | Compile-time injection on lowered calls                                                       |
+| Metadata                           | Manual or missing                                                  | Auto-injected                                                                                 |
 
 These are structural properties of emitted code. Performance claims require a benchmark for the target runtime and
 workload.

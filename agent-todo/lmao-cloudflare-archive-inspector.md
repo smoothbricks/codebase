@@ -78,7 +78,8 @@ under the work items.
   `grep DurableObject packages/lmao/src/lib/cloudflare → no class`.
 - Work: implement the collector shard as a Durable Object. It acks only after the transactional-storage commit, reduces
   rows, stages content-addressed segments, and uploads them to R2 (see the platform wiring item). Wire `CollectorClient`
-  (`collectorClient.ts:41`) to it.
+  (`collectorClient.ts:41`) to it. Verify at prototype that a Pipelines stream binding is available inside a Durable
+  Object (mechanically expected, because bindings are env-scoped).
 - Acceptance: a POST returns only after the storage commit. Killing the shard after the ack loses no rows. Staged
   segments survive a restart.
 
@@ -89,7 +90,9 @@ under the work items.
   no delivery guarantee (55-56).
 - Code: `grep exceededCpu packages/lmao/src → no hits`. No tail handler exists under
   `packages/lmao/src/lib/cloudflare/`.
-- Work: implement a tail handler that emits the `span-err` row through the pipeline binding.
+- Work: implement a tail handler that emits the `span-err` row through the pipeline binding. Measure tail-event delivery
+  under load first, because there is no documented guarantee, and set the loss-detector threshold from that measurement
+  before relying on the crash net's coverage bound.
 - Acceptance: a forced CPU-exceeded invocation yields one tail row. The row carries the request identity and the billing
   key.
 
@@ -102,7 +105,8 @@ under the work items.
   `TRACE_STREAM.send` appears only in a comment at `packages/lmao/src/lib/cloudflare/diagnosticDrain.ts:10`. The real
   call is `this.transport.send(rows)` at `:146`.
 - Work: add the R2 upload, the catalog commit, and the D1 manifest fallback. The Pipelines SQL transform lives in the
-  consuming system.
+  consuming system. Decide first whether R2 Data Catalog maintenance and compaction (Iceberg snapshot expiry plus the
+  compactor) suffice for v1, or whether the D1 manifest fallback is needed.
 - Acceptance: a diagnostic segment appears in R2 under the catalog after commit. Its staging copy is deleted only after
   the upload succeeds.
 
@@ -120,10 +124,12 @@ under the work items.
 
 - Spec: `specs/lmao/01u_cloudflare_trace_segments.md:310` (`writeDataPoint`). Lines 326-329: WAE is an independent
   failure domain. Lines 333-335: the recursion cut-off, so collector traces never route through the watchdog channel
-  itself. Open question Q5 (393-395) asks about the WAE binding inside a Durable Object.
+  itself.
 - Code: `grep writeDataPoint packages/ → no hits`.
-- Work: the collector shard writes its self-diagnostics through `writeDataPoint`. Verify the WAE binding inside a
-  Durable Object first (Q5, 393-395).
+- Work: the collector shard writes its self-diagnostics through `writeDataPoint`. Verify first that the WAE binding is
+  available inside a Durable Object, and the per-invocation write ceiling in the DO context (documented as 250 data
+  points per Worker invocation; confirm how that maps to DO alarm and fetch invocations), and size the collector's
+  self-diagnostics accordingly.
 - Acceptance: with R2 down, a backlog data point written by the collector is readable through the WAE SQL API.
 
 ## 01u: consumer topology
@@ -323,7 +329,7 @@ under the work items.
 - Applied: 01s now gives the shipped `TraceChunkEnvelope` and `TraceChunkQueueMessage`
   (`specs/lmao/01s_cloudflare_fetch_trace_wrapper.md:89-103`). The `enqueue` seam takes rows (39), the request flow
   flattens buffers with `spanBufferToTraceRows` (73-75), and the reference flush routine is the shipped
-  `DiagnosticDrainTracer.flush()` (168-190). 01u's lane wording follows (101-103, 130-132, 377-378, 402-404). The flush
+  `DiagnosticDrainTracer.flush()` (168-190). 01u's lane wording follows (101-103, 130-132, 377-378, 390-392). The flush
   example builder item is gone: the example no longer calls `encodeArrowTableAsChunkEnvelope`.
 - Decision: adopt the shipped shape. The shipped Queues lane already pairs the by-reference envelope with its rows in
   one message and the primary lane sends rows, so one envelope type serves both lanes and the wrapper needs no Arrow
@@ -577,3 +583,9 @@ under the work items.
 - Decision: keep the spec. 01d's serverless lookup is the same on-demand job that 02 assigns to DuckDB, the only shipped
   SQL engine is DuckDB-WASM, and 02 specifies `msgpack_extract()` as a DuckDB extension. chDB keeps the scheduled job,
   which is a different job.
+
+## Cloudflare price and limit assumptions
+
+Governing contract: `specs/lmao/01u_cloudflare_trace_segments.md`, “Diagnostic primary”, “Fallback” and “Sampling
+Model”. Before release commitments, recheck the cited Cloudflare pricing and limits. Price SQL input and uncompressed
+sink output independently of compressed R2 bytes; account for catalog charges and each billed 64 KB Queues unit.

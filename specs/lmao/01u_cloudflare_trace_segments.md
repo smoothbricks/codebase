@@ -1,13 +1,10 @@
 # Cloudflare Trace Segments and Log Sink <a id="smoo/lmao!n/cf-trace-segments"></a>
 
-Checked 2026-07-04 against current Cloudflare docs and pricing (cited inline). Pipelines and R2 Data Catalog are open
-beta: re-verify pricing before GA commitments.
-
 ## Governing Principle <a id="smoo/lmao!n/cf-trace-segments-principle"></a>
 
 **Open formats at every boundary; the substrate is a pricing decision.** Trace data lives as Parquet segments under an
-Iceberg catalog on an S3-compatible store. R2 today; any S3-compatible store or a dedicated ClickHouse box tomorrow —
-same bytes, only the reader changes.
+Iceberg catalog on an S3-compatible store. R2 by default; any S3-compatible store or a dedicated ClickHouse box instead
+— same bytes, only the reader changes.
 
 **Exit test (normative):** migrating the archive = sync the bucket + repoint the catalog. Any component that would break
 this sentence is disqualified from the architecture.
@@ -105,11 +102,15 @@ answered, not ignored: the collector is justified precisely because it is NOT tr
 (incremental aggregate reduction, threshold alerting, the hot-window freshness surface) that Pipelines cannot do; if it
 were only moving bytes, it would still be disqualified.
 
-**Diagnostic primary: Cloudflare Pipelines** (open beta; Workers Paid). Ingestion via Worker **stream binding**
+**Diagnostic primary: Cloudflare Pipelines** (Workers Paid). Ingestion via Worker **stream binding**
 (`env.TRACE_STREAM.send(rows)` — array of JSON-serializable records, promise resolves on confirmed ingest) or HTTP
-endpoint; SQL transforms at ingest; **exactly-once delivery to R2**; Parquet/JSON/Iceberg output. Limits (beta): 5
-MB/ingestion request, 5 MB/s per stream, 20 streams/pipelines/sinks per account. Unbilled during open beta beyond
-standard R2 storage/operations.
+endpoint; SQL transforms at ingest; **exactly-once delivery to R2**; Parquet/JSON/Iceberg output. Limits: 5 MB/ingestion
+request, 5 MB/s per stream, 20 streams/pipelines/sinks per account.
+[Pipelines pricing](https://developers.cloudflare.com/basin-pipelines/platform/pricing/) includes 50 GB/month of SQL
+transforms and 50 GB/month of sink output on Workers Paid. Additional SQL transforms cost $0.04/GB; sinks cost
+$0.03/GB
+for JSON or $0.06/GB for Parquet/Iceberg, measured on uncompressed output. Ingress is free; standard R2
+storage/operations and applicable catalog charges are additional.
 
 - Spans are sent as **rows**, not pre-built Arrow chunks: Pipelines owns batching and Parquet encoding for the raw tier.
   The 01s wrapper's `enqueue` seam stays; its payload becomes `rows` instead of an Arrow envelope. 01t's Arrow
@@ -120,15 +121,17 @@ standard R2 storage/operations.
 
 **Considered and dropped — awaited Pipelines send as the billing-grade primary:** the `send()` confirmation is a real
 durability point, but the lane does no compute on the stream (no reduction, no alerting), offers no hot-window
-freshness, its ack semantics are opaque (beta), and post-beta pricing is unknown. It **remains the valid simpler
-fallback** for billing-grade wherever no collector is deployed — bootstrap environments bill correctly through it, they
-just get no live aggregates.
+freshness, and its acknowledgement semantics are opaque to the collector. It **remains the valid simpler fallback** for
+billing-grade wherever no collector is deployed — bootstrap environments bill correctly through it, they just get no
+live aggregates.
 
-**Fallback: Queues** if Pipelines' limits or post-beta pricing disqualify it — a drop-in behind the same sink seam.
+**Fallback: Queues** if Pipelines' limits or published pricing disqualify it — a drop-in behind the same sink seam.
 Messages are 128 KB max and operations are billed per 64 KB (write+read+delete ≈ 3 ops), so the fallback MUST ship
 batched chunk messages (01s `TraceChunkQueueMessage`: one 01t envelope plus its rows), never per-span messages: 100 M
-spans/month as ~250 k chunked messages ≈ 0.75 M ops ≈ within the 1 M included; per-span would be ~300 M ops ≈
-$120/month. ($0.40/M ops after 1 M included.) At-least-once + `chunk_id` dedup.
+spans/month as ~250 k chunked messages is approximately 0.75 M operations only when each message is at most 64 KB and
+has one write, read and delete. Otherwise the estimate is `sum(ceil(message_bytes / 64 KB)) × 3` operations. Per-span
+delivery would be approximately 300 M operations, costing $120/month. ($0.40/M ops after 1 M included.) At-least-once +
+`chunk_id` dedup.
 
 **Bootstrap only: direct R2 per request.** A worker PUTting its own rows/chunks straight to R2. Works on day one with
 zero dependencies, but Class A ops are $4.50/M (per-request PUTs at 10 M requests/month ≈ $45 — dwarfing every other
@@ -157,10 +160,10 @@ A stateful collector shard hosted by the consuming system — on Cloudflare, a D
 - **Cost**: DO storage write units ≈ $0.25/GB. Staging 100 M spans/month (~25 GB flowing through) is single-digit
   dollars/month including write-read-upload-delete amplification — and it avoids the direct-R2 Class A storm by batching
   many requests' rows into each staged segment.
-- **Hosting is an adapter, not the architecture**: the collector contract is platform-portable — a Durable Object today;
-  the same service can run as a Lambda fed by direct HTTPS invoke from workers, or any host with transactional storage.
-  If a shard cannot keep up, the options are re-shard or re-host — same service contract, same segments, same catalog,
-  per the exit test.
+- **Hosting is an adapter, not the architecture**: the collector contract is platform-portable — a Durable Object on
+  Cloudflare; the same service can run as a Lambda fed by direct HTTPS invoke from workers, or any host with
+  transactional storage. If a shard cannot keep up, the options are re-shard or re-host — same service contract, same
+  segments, same catalog, per the exit test.
 
 Two normative cautions:
 
@@ -274,8 +277,8 @@ Range-request pruning effectiveness is decided at write time; these are the comp
 ## Catalog <a id="smoo/lmao!n/cf-trace-segments-catalog"></a>
 
 **Primary: Apache Iceberg via R2 Data Catalog** (open beta): standard table format, schema evolution, snapshot/partition
-metadata; Iceberg REST is readable by DuckDB/ClickHouse/Trino generally; unbilled during beta beyond R2 ops. A standard
-catalog keeps the exit test intact: repointing = changing the catalog URI.
+metadata; Iceberg REST is readable by DuckDB/ClickHouse/Trino generally. A standard catalog keeps the exit test intact:
+repointing = changing the catalog URI.
 
 **Fallback: D1 manifest** if Data Catalog beta limits bite (unknown compaction/maintenance features are the main risk).
 Manifest rows:
@@ -288,29 +291,30 @@ hand-rolled metadata over open files re-creates the lock-in the files avoid.
 
 **Diagnostic class only, app-level or none — and the numbers say none.** Billing-grade rows are outside sampling's
 domain by construction (see Delivery Classes — domain events always append). The storage path never samples for either
-class (Pipelines is exactly-once; Queues fallback is at-least-once + `chunk_id` dedup). Keep-everything cost at current
-pricing (2026-07, spans ≈ 200 B compressed columnar):
+class (Pipelines is exactly-once; Queues fallback is at-least-once + `chunk_id` dedup). The table estimates only R2
+storage at the R2 storage rate (spans ≈ 200 B compressed columnar):
 
-| Volume         | New data/mo | R2 storage (steady state ≈ 3 mo hot) | Hop cost                                              | Total order |
-| -------------- | ----------- | ------------------------------------ | ----------------------------------------------------- | ----------- |
-| 1 M spans/mo   | ~0.2 GB     | ~$0.01/mo                            | Pipelines: $0 (beta) · Queues fallback: $0 (included) | ~**$0**     |
-| 10 M spans/mo  | ~2 GB       | ~$0.09/mo                            | $0 (beta) · fallback ~$0                              | **cents**   |
-| 100 M spans/mo | ~20 GB      | ~$0.90/mo                            | $0 (beta) · fallback ~$0–0.4                          | **~$1/mo**  |
+| Volume         | New data/mo | R2 storage (steady state ≈ 3 mo hot) |
+| -------------- | ----------- | ------------------------------------ |
+| 1 M spans/mo   | ~0.2 GB     | ~$0.01/mo                            |
+| 10 M spans/mo  | ~2 GB       | ~$0.09/mo                            |
+| 100 M spans/mo | ~20 GB      | ~$0.90/mo                            |
 
 (R2: $0.015/GB-mo standard, Class A $4.50/M, Class B $0.36/M, zero egress; compaction reads/writes add Class A/B ops in
-the thousands/month — noise. Post-beta Pipelines pricing is the open risk; the Queues fallback bounds it.)
+the thousands/month — noise.) Transport costs use the published Pipelines rates or Queues 64 KB units above; compressed
+R2 bytes alone do not establish that either transport is free. Iceberg catalog charges are additional.
 
-At these numbers the sampling hook is never engaged: LMAO's tracer keeps a head-sampling extension point in the API, and
-"always-keep errors/security" rules are moot while nothing is dropped. Retention/tiering (Infrequent Access at
-$0.01/GB-mo, or delete-after-N-months as Iceberg snapshot expiry) is the cost lever, not sampling.
+The diagnostic lane keeps all traces: LMAO's tracer keeps a head-sampling extension point in the API, and "always-keep
+errors/security" rules are moot while nothing is dropped. Retention/tiering (Infrequent Access at $0.01/GB-mo, or
+delete-after-N-months as Iceberg snapshot expiry) is the cost lever, not sampling.
 
 ## WAE: Justify or Drop <a id="smoo/lmao!n/cf-trace-segments-wae"></a>
 
-What Workers Analytics Engine would buy: `writeDataPoint` is fire-and-forget cheap (10 M points/mo included, +$0.25/M;
-currently unbilled), and its SQL API gives **seconds-fresh** dashboards with zero pipeline work. What it costs: a second
-store with a second schema (20 blobs/20 doubles/1 index of 96 B; 250 points/invocation), **externally-imposed sampling**
-(write-time equitable per-index sampling + read-time ABR; per-row `_sample_interval` must be threaded through every
-aggregate), fixed 3-month retention, and no export path.
+What Workers Analytics Engine would buy: `writeDataPoint` is fire-and-forget cheap (10 M points/mo included, +$0.25/M),
+and its SQL API gives **seconds-fresh** dashboards with zero pipeline work. What it costs: a second store with a second
+schema (20 blobs/20 doubles/1 index of 96 B; 250 points/invocation), **externally-imposed sampling** (write-time
+equitable per-index sampling + read-time ABR; per-row `_sample_interval` must be threaded through every aggregate),
+fixed 3-month retention, and no export path.
 
 Verdict: **drop as archive; retained as watchdog channel** (next section). As a system of record it fails the exit test
 three ways — proprietary, sampled, unexportable — and that reasoning stands verbatim. The freshness gap it would have
@@ -361,9 +365,9 @@ The OLAP job owns heavy historical rollups. Both write aggregate segments back u
   infrastructure.
 - **Heavy/scheduled: chDB / clickhouse-local** over the same bucket via S3 API, in a Cloudflare Container or any
   on-demand runtime; plain DuckDB CLI locally for dev. (Terminology note: AWS S3 Select is deprecated — "S3-native
-  querying" today means table formats + engines over range requests, or Athena on AWS.)
+  querying" means table formats + engines over range requests, or Athena on AWS.)
 - **Worker-side duckdb-wasm: not assumed.** The WASM bundle is tens of MB against a 128 MB isolate and cold-start
-  budget; treat as unproven, and unnecessary — browser + container cover the needs. Revisit only with a measured
+  budget; treat as unproven, and unnecessary — browser + container cover the needs. It is adopted only with a measured
   prototype.
 - **Dedicated-machine exit**: at scale, ClickHouse (or chDB) on owned hardware reads the same bucket via S3 API — no
   format or pipeline change, per the exit test. That lane is a pricing decision, exercised when query volume outgrows
@@ -380,18 +384,6 @@ Exported as `@smoothbricks/lmao/cloudflare` from `packages/lmao/src/lib/cloudfla
 `PipelinesStreamTransport`/`QueuesFallbackTransport` (this section), `CollectorClient`/`FakeCollectorClient` (§Delivery
 Classes, §Zero-Loss Sources), and `ClassSplitTracer` with an injected `DeliveryClassifier` — the spec fixes the classes,
 not the classification mechanism, so the row→class mapping stays a constructor-injected seam.
-
-## Open Questions <a id="smoo/lmao!n/cf-trace-segments-open"></a>
-
-1. Post-beta Pipelines pricing (the cost table's main unknown; Queues fallback bounds the downside).
-2. R2 Data Catalog maintenance/compaction maturity — whether Iceberg snapshot expiry + the compactor suffice, or the D1
-   fallback is needed for v1.
-3. Pipeline-binding availability inside DOs: mechanically expected (env-scoped bindings), verify at prototype.
-4. Tail-event delivery behavior under load: no documented guarantee — measure empirically before relying on the crash
-   net's coverage bound, and set the loss-detector threshold from that measurement.
-5. WAE watchdog channel from DOs: verify `writeDataPoint` binding availability inside Durable Objects at implementation,
-   and the per-invocation write ceiling in the DO context (docs state 250 data points per Worker invocation; confirm how
-   that maps to DO alarm/fetch invocations and size collector self-diagnostics accordingly).
 
 ## Spec Cross-Impacts <a id="smoo/lmao!n/cf-trace-segments-cross"></a>
 

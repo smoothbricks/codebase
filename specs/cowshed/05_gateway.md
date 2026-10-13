@@ -14,11 +14,9 @@ On macOS the gateway runs as the `dev.cowshed.gateway` LaunchAgent at launchd `P
 type that runs at parity with the host's own processes (PRI 31). The type is the QoS band of the agent and every
 descendant, and a descendant cannot leave it; the daemon's supervisor manager starts every workspace supervisor, which
 starts every shell host and job. Background runs them at priority 4 and Standard at priority 20 (the utility band), and
-both throttle their I/O behind the host's. Under Background on a host at load 80 a fresh workspace's supervisor took 115
-s to answer and its first `cowshed exec` spent 537 s inside `direnv export json`; under the utility clamp at load 10–47
-the first `codegraph status` over a fresh workspace's cold 1 GB SQLite index took 34.5 s and 54.5 s where the same cold
-run unclamped took 2.4 s and 2.7 s. The sccache LaunchAgent is Interactive for the same reason (launchd.rs
-`PROCESS_TYPE`).
+both throttle their I/O behind the host's. Under either clamp a loaded host delays a fresh workspace's supervisor, its
+first `direnv export json` and cold index reads many times over their unclamped cost. The sccache LaunchAgent is
+Interactive for the same reason (launchd.rs `PROCESS_TYPE`).
 
 The gateway's generated plist sets `SoftResourceLimits.NumberOfFiles` to the finite kernel-sized value `245760` and
 `HardResourceLimits.NumberOfFiles` to Darwin's `RLIM_INFINITY`. A finite soft limit keeps `sysconf(_SC_OPEN_MAX)` useful
@@ -36,11 +34,14 @@ topology is platform-specific:
 - **macOS — port block.** Every workspace, main included, gets a contiguous block of ports from 32768–49151, recorded as
   `portBlock {base, size}` (04_sandbox.md: a power-of-two size, a base aligned to it; new workspaces get 64 ports, and a
   live block grows only through a `service_ports` grant; one that moves keeps its old block reserved as
-  `retainedPortBlocks`, which carries no gateway listener). `portBlock` is allocated at new/fork (adopt for main),
-  preserved across restore, and present only in macOS grant files. The gateway binds `base`; `base+1 … base+size-1` are
-  workspace service ports. A session carries its block's recorded size, and the gateway validates the endpoint against
-  it. Seatbelt permits a workspace to connect only to its current and retained blocks. The destination `base` listener
-  is the primary, kernel-enforced workspace identity.
+  `retainedPortBlocks`, which carries no gateway listener). `portBlock` is allocated at fork (adopt for main), preserved
+  across restore, and present only in macOS grant files. The gateway binds `base`; `base+1 … base+size-1` are workspace
+  service ports. A session carries its block's recorded size, and the gateway validates the endpoint against it.
+  Seatbelt permits a workspace to connect only to its current and retained blocks. The destination `base` listener is
+  the primary, kernel-enforced workspace identity. Of two sessions whose blocks share a port, the gateway serves the
+  older workspace's and not the newer one's, at startup and in every per-project reconcile, with
+  `next: cowshed doctor --repair`, serving every other session (04_sandbox.md, `portBlock` collisions); neither startup
+  nor a reconcile fails over a collision.
 - **Linux — Unix socket, private netns, and trusted connector.** No `portBlock` is allocated. The controller creates
   `/private/cowshed/store/run/gateway/<workspaceIncarnation>.sock` under a 0700 directory with mode 0600 and bind-mounts
   that one socket as `/run/cowshed/gateway.sock` inside the workspace's private network namespace. The namespace has
@@ -344,19 +345,15 @@ Disk-changing tools cowshed runs on the host — the CLI's, a supervisor's, the 
 test's — run under a host-wide lease the gateway schedules. One code path takes it: `SystemCommandRunner` reads the
 command's class from its program and arguments and holds that lease around the child; setup uses the same client. An
 attach spends most of its time in StorageKit's `syncAllDisks`, after its device already exists, and that sync does not
-finish while the mount table keeps changing (01_storage.md, "How the APFS host degrades"): eight attach loops beside two
-mount loops made 8 attaches in 42 s, each taking 41.7 s, while keeping the two apart made 106 attaches at 0.94 s p50 and
-1.78 s p95 under load 167–212. Attaches among themselves only queue on `storagekitd`; so the lease is two classes that
-exclude each other rather than N interchangeable tokens.
+finish while the mount table keeps changing (01_storage.md, "How the APFS host degrades"), so attaches stall beside
+mount churn and stay fast once the two are kept apart. Attaches among themselves only queue on `storagekitd`; so the
+lease is two classes that exclude each other rather than N interchangeable tokens.
 
 - **Storage**: `diskutil` except `renameVolume`, `hdiutil`, and `newfs_apfs`. **Namespace**: `mount_apfs` and `umount`.
   Read-only operations (`fsck_apfs`, IORegistry reads) and cosmetic `diskutil renameVolume` take no lease.
-- **A label does not change the disk lifecycle.** On a mounted scratch APFS volume, a rename kept the same mount-table
-  position (58/58) and st_dev (16777292). Five attach probes without renames took 0.648, 0.683, 0.953, 0.896 and 0.572
-  s; with 19 renames on another volume they took 1.056, 0.596, 0.461, 0.590 and 0.477 s. Five mount/unmount probes took
-  1.123, 0.862, 0.991, 0.928 and 0.889 s; with 13 concurrent renames, 0.841, 0.556, 0.450, 0.750 and 0.567 s. Renames
-  neither starved attaches nor delayed namespace work. A background cosmetic rename therefore must not hold either phase
-  and make an attach wait behind it.
+- **A label does not change the disk lifecycle.** A rename keeps a mounted volume's mount-table position and st_dev, and
+  renames neither starve attaches nor delay namespace work. A background cosmetic rename therefore must not hold either
+  phase and make an attach wait behind it.
 - Members of one class share the running phase, up to 8 at once. A request of the running class with room in the phase
   and nobody waiting enters at once; an idle gateway starts a phase for it.
 - Once a member of the other class waits, the running phase admits nobody new, so a steady stream of one class cannot
@@ -391,17 +388,16 @@ exclude each other rather than N interchangeable tokens.
 
 The regression is `cowshed-gateway`'s `contention_attaches_stay_fast_beside_mount_churn_only_under_the_lease`, run by
 name with `--ignored`: eight real attach/detach loops beside two real mount loops for 40 s, first through a real
-gateway's lease and then unleased. Measured at load 14–50: leased, 125 attaches at 1.24 s p50 and 1.93 s p95 (2.09 s and
-3.39 s with the lease wait); unleased, 8 attaches, each taking 53.5 s.
+gateway's lease and then unleased: leased attaches stay fast, unleased ones stall behind the mount churn.
 
 ## Host CPU budget
 
 Every gate on the host sizes its runners to the whole machine. Nx runs one task per core, and each nextest run under it
-runs one test thread per core again; five to ten concurrent gates on an 18-core host kept the load average at 80–170,
-and tests that do no disk work timed out waiting for a CPU (37 of 65 timeouts in one acceptance run). Running anything
-serially would trade those timeouts for idle cores. The gateway instead holds one budget of CPU tokens for the host: a
-runner takes tokens before it starts and sizes its own parallelism to its grant, every gate keeps running its tasks in
-parallel, and the total runnable work stays near the core count.
+runs one test thread per core again; several concurrent gates oversubscribe the host many times over, and tests that do
+no disk work time out waiting for a CPU. Running anything serially would trade those timeouts for idle cores. The
+gateway instead holds one budget of CPU tokens for the host: a runner takes tokens before it starts and sizes its own
+parallelism to its grant, every gate keeps running its tasks in parallel, and the total runnable work stays near the
+core count.
 
 - **The budget.** N tokens, one per core the host reports (`std::thread::available_parallelism`); one token is one
   runnable thread or process. The ledger keeps `free + Σ held = N`; it never infers a holder from a process scan.

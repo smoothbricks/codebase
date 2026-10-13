@@ -239,7 +239,7 @@ their overflow chains; live buffers are never compacted or resized in place.
 
 **All buffer capacities MUST be multiples of 8.**
 
-The `(requestedCapacity + 7) & ~7` alignment is performed by `getAlignedCapacity`
+`getAlignedCapacity` rounds up to a multiple of 8 with `Math.ceil(elementCount / 8) * 8`
 (`packages/arrow-builder/src/lib/buffer/bufferHelpers.ts`, fenced
 [`smoo/lmao!n/buffer-perf-cache-alignment`](./01b1_buffer_performance_optimizations.md#smoo/lmao!n/buffer-perf-cache-alignment))
 inside the generated constructor. `createOverflowBuffer` re-applies it
@@ -294,8 +294,7 @@ Promotion has a static half and a runtime half. The static half is arrow-builder
 [`smoo/lmao!n/buffer-arch-eager-vs-lazy`](./01b_columnar_buffer_architecture.md#smoo/lmao!n/buffer-arch-eager-vs-lazy)),
 with the schema builder marking `number`/`boolean`/`bigUint64` columns eager by type. The runtime half is the
 usage-driven ratchet below: `LazyColumnStats` tracks per-column `instantiationCount`, and `promoteColumnsToEager`
-performs the 100-sample / 80%-ratio recompilation. The in-flight-buffer convergence and the promotion tests below verify
-the runtime half.
+performs the 100-sample / 80%-ratio recompilation.
 
 **Key Insight**: Promotion happens during background flush (cold path), ensuring zero hot-path impact while optimizing
 for actual usage patterns.
@@ -485,12 +484,12 @@ No migration or data copying is needed. The system simply creates new SpanBuffer
 
 ### Performance Trade-offs
 
-| Aspect             | Before (Lazy)             | After (Eager)          | Impact                 |
-| ------------------ | ------------------------- | ---------------------- | ---------------------- |
-| Memory per buffer  | Optimal (no allocation)   | +256-512 bytes         | Minimal for 80%+ usage |
-| Hot path access    | Getter overhead (~5-10ns) | Direct property (~1ns) | 5-10x faster           |
-| Best for           | <80% column usage         | ≥80% column usage      | Auto-optimizes         |
-| Recompilation cost | N/A                       | One-time, cold path    | Zero hot-path impact   |
+| Aspect             | Before (Lazy)           | After (Eager)          | Impact                 |
+| ------------------ | ----------------------- | ---------------------- | ---------------------- |
+| Memory per buffer  | Optimal (no allocation) | +256-512 bytes         | Minimal for 80%+ usage |
+| Hot path access    | Getter overhead         | Direct property access | Faster: no getter call |
+| Best for           | <80% column usage       | ≥80% column usage      | Auto-optimizes         |
+| Recompilation cost | N/A                     | One-time, cold path    | Zero hot-path impact   |
 
 ### Example: Promotion in Action
 
@@ -688,8 +687,8 @@ ORDER BY utilization DESC
 Before each capacity-tuning check, which may reset the stats, the Tracer's `onStatsWillResetFor` hook is called.
 
 The hook is declared on `TracerLifecycleHooks` (`packages/lmao/src/lib/traceRoot.ts`) and implemented by every tracer
-(`TestTracer`, `StdioTracer`, `ArrayQueueTracer`, `SQLiteTracer`, `NoOpTracer`, `CompositeTracer`). It is invoked from
-the generated `getOrCreateOverflow` method
+(`TestTracer`, `StdioTracer`, `ArrayQueueTracer`, `SQLiteTracer`, `SQLiteAsyncTracer`, `NoOpTracer`, `CompositeTracer`).
+It is invoked from the generated `getOrCreateOverflow` method
 ([01b5 §Constructor](./01b5_spanbuffer_memory_layout.md#smoo/lmao!n/spanbuffer-layout.constructor)), which calls
 `tracer.onStatsWillResetFor(this)` then `checkCapacityTuning(stats)`.
 

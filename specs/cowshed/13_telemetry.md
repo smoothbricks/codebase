@@ -59,13 +59,12 @@ Propagation across cowshed's own boundaries:
   the originating traceparent in the trash entry / grants sidecar and continues as a **deferred span**; a causal (not
   parental) relation to the originating trace is a span **link**, not a parent.
 
-**lmao TRACEPARENT convention** (a verification item until the TS/Rust tracer ships it, kickoff): a tracer adopts
-`TRACEPARENT` at init and stamps outbound `fetch`/HTTP requests with it. This is what upgrades a first-party tool's
-traffic from tier-2 to tier-1 attribution (below).
+**lmao TRACEPARENT convention**: a tracer adopts `TRACEPARENT` at init and stamps outbound `fetch`/HTTP requests with
+it. This is what upgrades a first-party tool's traffic from tier-2 to tier-1 attribution (below).
 
 ## Span taxonomy
 
-- **Lifecycle spans.** `cowshed new`'s steps (02_workspaces.md) are the canonical waterfall — clone, attach, fsck,
+- **Lifecycle spans.** `cowshed fork`'s steps (02_workspaces.md) are the canonical waterfall — clone, attach, fsck,
   marker, port-block, CA, grants, direnv-trust, branch — and they map 1:1 onto the 08_testing.md performance budgets, so
   a budget regression is a span that got slower, findable directly.
 - **Job spans.** Every `bash`/exec is a span (11_shell.md); its children (an lmao-instrumented build, a dev server)
@@ -130,10 +129,11 @@ current/peak; charged memory includes cache/kernel charges and is never written 
 leader's own/children rusage reconciliation source. The declared source and named checked unit types are part of the
 typed accounting record (07_api.md), not a JSON string.
 
-A discrepancy between attributed process rows and the independent job total emits one `job.unattributed` row with
-`unattributed_cpu_us`, optional `unattributed_io_read_bytes` and `unattributed_io_write_bytes`, in signed checked units;
-source/coverage is a fixed row kind or enum, not a dynamically named column. Event loss, unavailable evidence and
-counter-window/precision disagreement are explicit. Charged-memory fields
+A nonzero final difference between attributed process rows and the independent job total, or final `Gap` coverage, emits
+one terminal `job.unattributed` row per job before its job span ends. Its fixed columns are `unattributed_cpu_us`,
+optional `unattributed_io_read_bytes` and `unattributed_io_write_bytes`, in signed checked units; `source` and
+`coverage` are fixed enums, never dynamically named columns. Unavailable I/O is null, not zero. Event loss, unavailable
+evidence and counter-window/precision disagreement are explicit. Charged-memory fields
 `charged_memory_current_bytes`/`charged_memory_peak_bytes` stay on the job span. None of these fields grows the
 fourteen-column process schema or duplicates process-tree JSON.
 
@@ -163,15 +163,16 @@ Under interception (05_gateway.md), most granted traffic is request-visible, so 
    endpoint and the token select and authenticate the workspace, and a process that rewrites its own proxy URL can
    misattribute traffic only among its own workspace's jobs. A child inherits its job's environment, so its traffic is
    the job's.
-3. **Everything else** — an intercepted host whose client sent no `traceparent` and no job userinfo (a shell outside any
-   job, whose wiring names `cowshed` as the username, or a client that drops proxy userinfo) — is **workspace-exact**
-   (port identity) and **job-attributed at query time** by an interval join (request timestamp within a job's start/end,
-   same workspace incarnation) over two controller-owned tables. The resulting gateway span links the matching `job_id`
-   to its standard lmao trace/thread/span identity; exact when a workspace's jobs don't overlap, heuristic when they do.
+3. **Everything else** — an opaque tunnel, or an intercepted host whose client sent no `traceparent` and no job userinfo
+   (a shell outside any job, whose wiring names `cowshed` as the username, or a client that drops proxy userinfo) — is
+   **workspace-exact** (port identity) and **job-attributed at query time** by an interval join (request timestamp
+   within a job's start/end, same workspace incarnation) over two controller-owned tables. The resulting gateway span
+   links the matching `job_id` to its standard lmao trace/thread/span identity; exact when a workspace's jobs don't
+   overlap, heuristic when they do.
 
-Interception makes tiers 2 and 3 richer than a tunnel would: an intercepted request is workspace-exact **with
-request-level detail** (verb, path, bytes) and an outbound-injected `traceparent`, even when the inbound client is
-silent.
+Interception enriches tiers 2 and 3 with request detail; an opaque tunnel remains host-only. An intercepted request is
+workspace-exact **with request-level detail** (verb, path, bytes) and an outbound-injected `traceparent`, even when the
+inbound client is silent.
 
 ## Storage: one authority tier, one audit trail, one Arrow substrate
 
@@ -191,9 +192,10 @@ Cowshed uses Arrow IPC for both, but placement and authority differ:
   under `/private/cowshed/store/`, the per-workspace grants files, and the controller lock. No log is replayed for any
   of these decisions; a controller that opens a project reads the inventory once and starts.
 - **Controller audit records** — every controller act (workspace introduced/retired, job admission and terminal state,
-  checkpoint, fork, restore, and each cache miss a land's adoption check found) is emitted as one typed
-  `ControllerCommitment` record to an audit sink. The records carry existence, lifecycle/status, a writer-local order,
-  lineage, byte counts, and expected hashes; they never contain inline output, a protected artifact path, a redirect
+  checkpoint, fork, restore, each land whose build-volume step completes and returns its actual result, and each cache
+  miss a land's adoption check found) is emitted as one typed `ControllerCommitment` record to an audit sink. A land
+  outcome records whether the landing volume seeded the target and whether adoption succeeded or skipped, including the
+  exact skip reason and its holders. The records never contain inline output, a protected artifact path, a redirect
   source, or any other raw stdout/stderr payload duplication. **Nothing reads them for a decision.** The sink is
   selected when the project opens (`COWSHED_CONTINUITY_AUDIT`): `arrow` (default for the standalone CLI) writes sealed
   per-writer segments under `/private/cowshed/store/telemetry/`, `off` discards, and a supervising runtime injects its
@@ -335,6 +337,7 @@ enum ControllerCommitment {
     Fork(ForkCommitment),
     Restore(RestoreCommitment),
     LandAdoption(LandAdoptionCommitment),
+    LandOutcome(LandOutcomeCommitment),
 }
 struct WorkspaceIntroducedCommitment {
     version: u16, order: u64, repo_id: RepoId,
@@ -372,6 +375,11 @@ struct LandAdoptionCommitment {
     landing_incarnation: WorkspaceIncarnation, target_incarnation: WorkspaceIncarnation,
     landed_head: GitOid, task: String, task_hash: String, inputs_digest: Sha256Digest,
 }
+struct LandOutcomeCommitment {
+    version: u16, order: u64, repo_id: RepoId,
+    landing_incarnation: WorkspaceIncarnation, target_incarnation: WorkspaceIncarnation,
+    landed_head: GitOid, seeded: bool, skip: Option<AdoptionSkip>,
+}
 ```
 
 A `LandAdoption` record is one Nx task that missed the cache when a land re-ran its check in the target on the build
@@ -383,17 +391,23 @@ and the land succeeds regardless, so the land report alone is read once and forg
 every miss across lands and hosts, groups recurrences by `task` and `inputs_digest`, and turns them into fix work. The
 landing and target incarnations must differ, and `task` and `task_hash` must be non-empty.
 
+A `LandOutcome` record is the actual build-volume result of one `cowshed land` whose build-volume step completes and
+returns that result, written whether or not its seed or adoption happened, before retirement. If the build-volume step
+returns an error, the error is returned and no outcome record is written. `seeded` is true exactly when the report's
+`seed` is `frozen`; an adopted `sealBusy` outcome keeps the previous seed and records false. `skip` is the report's
+complete `AdoptionSkip` when adoption skipped, including lock paths and each holder's pid and command, and is absent
+only when adoption succeeded. Landing and target incarnations must differ. It does not replace the per-miss
+`LandAdoption` records. A failed audit sink is reported through audit health, never used to undo a land.
+
 The flat controller Arrow columns are exactly `commitment_kind, commitment_version, commitment_order, repo_id` plus
 variant-selected
-`workspace_incarnation, job_id, grant_revision, state, stdout_bytes, stdout_sha256, stderr_bytes, stderr_sha256, batch_sha256, origin_incarnation, checkpoint_id, barrier_id, manifest_batch_sha256, source_incarnation, destination_incarnation, source_checkpoint, output_limit_bytes, output_crossing_bytes, replaced_incarnation, landed_head, task, task_hash, inputs_digest`.
-A `landAdoption` row carries its landing and target incarnations in `source_incarnation` and `destination_incarnation`;
-the last four columns (`landed_head`, `task`, `task_hash` as Utf8, `inputs_digest` as Binary) are its alone.
-Non-selected fields are null and the tag controls required fields. Segments sealed before `LandAdoption` existed carry
-only the first twenty-three columns; they are read as they are, every earlier kind decoding the same, because the four
-columns they lack are null for every kind but `landAdoption`. A `landAdoption` row in such a segment is malformed and
-refused. Why: sealed segments are never rewritten, and a refresh enumerates every one of them (below), so refusing the
-shorter layout would fail every host's history closed. Version 1 segments are intentionally incompatible with this clean
-schema cutover; no optional-field or legacy parser path exists for them.
+`workspace_incarnation, job_id, grant_revision, state, stdout_bytes, stdout_sha256, stderr_bytes, stderr_sha256, batch_sha256, origin_incarnation, checkpoint_id, barrier_id, manifest_batch_sha256, source_incarnation, destination_incarnation, source_checkpoint, output_limit_bytes, output_crossing_bytes, replaced_incarnation, landed_head, task, task_hash, inputs_digest, seeded, adoption_skip`.
+A `landAdoption` or `landOutcome` row carries its landing and target incarnations in `source_incarnation` and
+`destination_incarnation`. Both carry `landed_head` (Utf8); `landAdoption` alone carries `task`, `task_hash` (Utf8) and
+`inputs_digest` (Binary); `landOutcome` alone carries `seeded` (Boolean) and `adoption_skip` (nullable Utf8, the exact
+JSON `AdoptionSkip` value). Non-selected fields are null and the tag controls required fields. Missing columns are null
+for every kind that does not require them. A row requiring a column its segment lacks is malformed and refused. Sealed
+segments are never rewritten.
 
 `order` is the writing controller's own positive, strictly increasing sequence from 1; across writers a segment is
 identified by `(order, writer_uuid)`, and nothing requires a host-global order because nothing replays the segments.

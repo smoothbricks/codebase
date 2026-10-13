@@ -8,24 +8,9 @@ native row store (`lmao-core`'s `ThreadSpanBuffer`), and per-lane providers sele
 scalar calls and attribute _values_ do not cross at all: JavaScript stores them into the store's own memory through
 TypedArray views.
 
-Measured floors (ABBA, 96 blocks × 10,000 calls, positions 1↔4/2↔3, three-repetition floors, Apple M5 Max arm64-darwin;
-the release target is x64 Linux — `tooling/direnv/devenv.smoo.nix` declares `x86_64-unknown-linux-gnu` as the only
-non-host Rust target, and floors do not transfer between the two):
-
-| Arm                                        | Floor          |
-| ------------------------------------------ | -------------- |
-| `bun:ffi` no-op                            | 1.21–1.62 ns   |
-| 4×u32 native store                         | 3.82–4.99 ns   |
-| pre-encoded `ptr,len` row                  | 5.33–5.66 ns   |
-| generic JSC host scalar refusal            | 6.60–7.16 ns   |
-| log-shaped string refusal                  | 21.12–22.01 ns |
-| JS-heap coarse row / exact row             | 58.8 / ≈84 ns  |
-| Rust exact row (16.75 ns clock + 2.65 buf) | ≈19.4 ns       |
-| Rust row, `LOG_STAMP_REFRESH = 16` cache   | 2.91 ns        |
-
-Per attribute store, M5 Max / Bun 1.4.0, 128-row spans, best-of-five: a Proxy trap forwarding `lane[i] = v` costs 10.8
-ns, a plain method call 2.7 ns, a TypedArray store 0.4 ns (`src/lib/wasm/threadSpanView.ts`, `laneProxy`). That gap is
-why an attribute value is a store into the row store's cells and not a call into the store.
+Per attribute store, a Proxy trap forwarding `lane[i] = v` and a plain method call each cost far more than a TypedArray
+store (`src/lib/wasm/threadSpanView.ts`, `laneProxy`). That gap is why an attribute value is a store into the row
+store's cells and not a call into the store.
 
 ## 1. The seam
 
@@ -37,9 +22,8 @@ why an attribute value is a store into the row store's cells and not a call into
 - **Lifecycle, as calls:** `openSpan`, `openSpanStatic`, `end`, `appendLog`, `appendLogStatic`, `setScope`,
   `setCompletionMessage`, `intern`, `reset`, `free`. Each is one call into the store. What crosses: integers (span id,
   entry type, ordinal, vocabulary id, line), a `bigint` timestamp on lanes where JavaScript owns the clock, and strings
-  only on cold paths — `intern` caches, so a warm string crosses nothing and encodes nothing (hit rate measured
-  4,507,371/129 on the benchmark workload). Row-producing calls return the packed receipt `(span_id << 32) | row`, and
-  bare `0` on refusal (`lmao-core/tests/thread_ffi_oracles.rs`).
+  only on cold paths — `intern` caches, so a warm string crosses nothing and encodes nothing. Row-producing calls return
+  the packed receipt `(span_id << 32) | row`, and bare `0` on refusal (`lmao-core/tests/thread_ffi_oracles.rs`).
 - **Values, as memory:** `attributeCells(block)` hands out the bytes of one block's attribute cells. The lane keeps one
   set of TypedArray views per block (`ThreadSpanCells`, created once per store, not per span) and writes a value as a
   store plus one validity bit.
@@ -68,8 +52,8 @@ happens only when the arena is large).
 
 **Rejected:** a per-lane bespoke writer interface (every provider shares the store's semantics; a second interface would
 fork `ThreadBufferStrategy` per provider); a batched JS-side row queue (a JS-owned row index plus double-buffering, for
-nothing the per-call floor does not already buy); and attribute values as per-call ABI writes (the 10.8 ns proxy trap or
-a 2.7 ns call per value, against a 0.4 ns store, to move a value into memory JavaScript can already address).
+nothing the per-call floor does not already buy); and attribute values as per-call ABI writes (a proxy trap or a call
+per value, each far costlier than a store, to move a value into memory JavaScript can already address).
 
 ## 2. The registration inversion
 
@@ -142,8 +126,8 @@ and pays a call or a trap per value for it.
   `traceRoot.node.ts`); log rows ride the `LOG_STAMP_REFRESH = 16` cache (`src/lib/coarseClock.ts`, bounded to a quarter
   of the 64-row capacity; durations never coarsen because span start/end always read fresh).
 - **Plain Bun and Wasm thread lanes:** JS owns the clock and passes `timestamp: bigint` on each lifecycle call — the
-  same coarse cache applies on the view (`src/lib/wasm/threadSpanView.ts` `_stampCache`/`_stampReads`). The measured JS
-  clock + bigint cost (31.31 ns/row decomposition) is exactly what the cache amortizes.
+  same coarse cache applies on the view (`src/lib/wasm/threadSpanView.ts` `_stampCache`/`_stampReads`). The JS clock
+  read plus `bigint` cost per row is exactly what the cache amortizes.
 - **Embedding host:** the host stamps every row inside the lifecycle call from its own clock. Its binding ignores the
   timestamp argument, which is how the seam inverts ownership without a branch: _who stamps_ is a property of the
   provider selected at registration, and no call site tests which world it is in. A native coarse clock does not satisfy
@@ -195,8 +179,8 @@ built over another provider must not reach it through the strategy.
   itself (§5), and converts natively; its provider refuses JavaScript conversion because its rows are never read back
   into JS.
 
-Unpatched `bun:ffi` (1.15–2.10 ns no-op, measured here) and a host's typed JSC functions (1.21–1.62 ns) reach the same
-`JSFFIFunction` fast path; what differs between providers is authority, not speed.
+Unpatched `bun:ffi` and a host's typed JSC functions reach the same `JSFFIFunction` fast path; what differs between
+providers is authority, not speed.
 
 ## 9. Enforcement
 
@@ -209,8 +193,9 @@ Unpatched `bun:ffi` (1.15–2.10 ns no-op, measured here) and a host's typed JSC
   capacity (`thread_buffer.rs` `ensure_rows`), never grown from zero or seeded row by row. `SHAPE-RMWROW`: span-id
   allocation is thread-local, with no shared atomic read-modify-write per row. `SHAPE-SPILL`: the arena is sized at
   startup, `clear()`ed, and never grown mid-lane.
-- **Boundary signatures:** every binding entry takes borrows (`&str`, `*const u8` + length) and returns `u64`/`u8`
-  scalars; no `String`, `Vec` or `Box<dyn>` crosses, and the Rust side's out-state is the row store sized at startup.
+- **Boundary signatures:** every binding entry takes borrows (`&str`, `*const u8` + length) and returns a scalar (`u8`,
+  `u32`, `u64`), an opaque `*mut` handle, or a cell pointer; no `String`, `Vec` or `Box<dyn>` crosses, and the Rust
+  side's out-state is the row store sized at startup.
 - **Tier-2 census, per lane:** `lmao-core/tests/thread_buffer_alloc.rs` runs a counting global allocator: open, end, log
   and tag allocate nothing after warmup, and neither does a whole write–flush–retain cycle of a long-lived store,
   overflow block included. Each per-element symbol makes `calls ≤ 2` with `grow = 0`, and the itemized residue after

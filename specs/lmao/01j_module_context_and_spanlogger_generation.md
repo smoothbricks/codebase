@@ -108,10 +108,11 @@ repeat fieldCount times:
   u8[columnLength] columnUtf8
 ```
 
-For record `i`, `ids[i]` is the first 32 SHA-256 bits, interpreted big-endian, over `kindTags[i] || recordBytes`. An id
-is a hash, not a unique key: two distinct records may share one, and registration resolves that by deterministic probing
-([01o](./01o_typescript_transformer.md#vocabulary-fragment-and-library-without-source-contract)); a collision is never
-fatal. `contentHash` is lowercase SHA-256 hex over this exact canonical byte stream:
+For record `i`, `ids[i]` is the first 32 SHA-256 bits, interpreted big-endian, over `kindTags[i] || recordBytes`.
+Registration follows the
+[01o fragment contract](./01o_typescript_transformer.md#vocabulary-fragment-and-library-without-source-contract),
+including idempotence and collision resolution. `contentHash` is lowercase SHA-256 hex over this exact canonical byte
+stream:
 
 ```text
 u8 schemaVersion
@@ -541,7 +542,7 @@ type SpanContext<Ctx extends OpContext> = {
   spanSync: SpanSyncFn<Ctx>;
 
   // Scoped attributes (merge semantics, null clears) and their current values
-  setScope(values: Partial<InferSchema<Ctx['logSchema']>> | null): void;
+  setScope(values: ScopeUpdate<Ctx['logSchema']> | null): void;
   scope: Readonly<Partial<InferSchema<Ctx['logSchema']>>>;
 } & Ctx['userCtx']; // User-defined fields spread in (e.g., env, services)
 
@@ -772,7 +773,7 @@ An ESLint rule prevents capturing `tag` or `log` in variables.
 ```typescript
 // Warmed method (fixed stores, zero allocation):
 userId(value) {
-  this.buffer.writeUserId(value);  // Direct method call
+  this._state._spanBuffer.userId(0, value); // Row 0 column setter
   return this;
 }
 

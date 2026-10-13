@@ -27,16 +27,26 @@ identifies groups for sampling and termination; it does not observe the process 
 ## Work
 
 1. Process-tree observation: the event source chosen per platform by measurement (07_api.md:844-1013), with typed
-   coverage gaps instead of silent incompleteness.
+   coverage gaps instead of silent incompleteness. On macOS, measure the per-process coverage gap on real gates, and
+   revisit an Endpoint Security observer only if that gap proves large.
 2. Per-process usage and blocker samples, and the sparse delta stream with its heartbeat rule.
 3. `process.run` spans parented to the job span, with the compact on-change/heartbeat rows of 13_telemetry.md.
-4. Linux per-job cgroup v2 accounting and charged-memory counters; macOS exit observation and rusage reconciliation.
+4. Linux per-job cgroup v2 accounting and charged-memory counters: a Linux `SpawnSink` and its spawn-path hook place
+   jobs in the cgroup on the production spawn path, and workload writes to a sibling `cgroup.procs` are denied so that a
+   job running as the controller's UID cannot migrate itself out of its accounting cgroup. Prove real-workspace
+   admission, restart lookup and retirement on a Linux execution substrate. macOS exit observation and rusage
+   reconciliation.
 5. `job.unattributed` rows whenever attributed process usage and the independent job total disagree.
 6. Backpressured byte-stream iterables for logs and attachment output, with abort plumbing.
+7. Declare the rest of the monitoring surface (resource and process-group samples, workspace/build-volume usage, journal
+   cursors and tails, attach) in the canonical API declarations, so that its controller and N-API adapters are
+   generated; only `progress`, `kill`, `tail` and `listeningPorts` are declared. Add the full real-host N-API monitoring
+   fixture (`packages/cowshed/docs/integrations.md:271` "Monitoring surface").
 
 ## Acceptance
 
 - A fork-heavy job (a shell loop spawning short-lived children) yields one `process.run` span per child with exact exit
   state, or a typed coverage-gap row; never a silently partial tree.
-- On Linux the job's cgroup total equals the attributed rows plus the `job.unattributed` row.
+- On Linux the job's cgroup total equals the attributed rows plus the `job.unattributed` row, and a workload cannot
+  write a sibling `cgroup.procs`.
 - A slow consumer of a log iterable pauses the producer instead of growing memory; aborting it ends the read.

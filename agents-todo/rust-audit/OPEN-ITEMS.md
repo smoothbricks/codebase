@@ -15,7 +15,7 @@ git fetch main
 git rebase --onto main/main <fork-base> cowshed/<name>
 cargo test -p <crate> && cargo clippy -p <crate> --all-targets --config 'build.warnings="deny"'
 # in the host checkout
-git fetch <checkouts>/.cowshed/<owner>/<repo>/<ws> cowshed/<name>
+git fetch <mount-root>/<owner>/<repo>/<name> cowshed/<name>
 git merge --ff-only FETCH_HEAD
 ```
 
@@ -130,10 +130,10 @@ multi-platform directory instead of `optionalDependencies`. The last one is expl
 records that separate platform packages "were rejected because smoo scopes release candidates to each package root and
 cannot keep sidecar packages in lockstep without release-group support".
 
-**The napi CLI predates the native binary.** `c67631547` (2026-07-14) added the Bun/Node bindings and
-`COWSHED_NODE_PATH`; `cab66c110` (2026-08-14, 441 commits later) shipped the real binaries behind the exec trampoline
-and explicitly "keeps runCli as the final fallback". That fallback is what forces `cowshed-napi` to link `cowshed-cli`
-and therefore hyper, rustls/ring and Arrow — `cowshed-napi-workspace-manifests.md` F3.
+**The napi CLI predates the native binary.** `c67631547` added the Bun/Node bindings and `COWSHED_NODE_PATH`;
+`cab66c110` (441 commits later) shipped the real binaries behind the exec trampoline and explicitly "keeps runCli as the
+final fallback". That fallback is what forces `cowshed-napi` to link `cowshed-cli` and therefore hyper, rustls/ring and
+Arrow — `cowshed-napi-workspace-manifests.md` F3.
 
 ## Latent hazards, labelled honestly
 

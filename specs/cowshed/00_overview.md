@@ -131,7 +131,6 @@ or ordinary on-disk text log.
 | ----------------------- | ---------------------------- | ------------------------------------------------------------------------------------------------------------------- |
 | `cowshed-core`          | lib (+ bin `apfs-benchmark`) | Image/volume lifecycle, clonefile, marker & grant files, Seatbelt profile generation, env wiring, supervisors, exec |
 | `cowshed-cli`           | bin `cowshed`                | Self-driving CLI over cowshed-core, and the host daemon it runs; stdout machine-readable, stderr guidance           |
-| `cowshed-escape-tests`  | test crate                   | The adversarial escape corpus, run through the real exec pipeline on both OSes; a release gate (08_testing.md)      |
 | `cowshed-gateway`       | lib                          | Actor-owned, host-only egress gateway: registry and repository mirrors, TLS interception, CONNECT tunnel, audit     |
 | `cowshed-gateway-types` | lib                          | The gateway's control-plane data model (sessions, endpoints, tokens, CA material, egress policy), with no daemon    |
 | `cowshed-helper`        | bin `cowshed-helper`         | Linux: the minimal root binary with a fixed verb set through which ZFS substrate mutations go (09_substrates.md)    |
@@ -143,8 +142,8 @@ or ordinary on-disk text log.
 - **Rust consumers** link `cowshed-core` directly. A coordinator holds a `Coordinator` (07_api.md), creates workspaces
   for workers, hands each worker a non-escalating `WorkspaceHandle`, and widens grants mid-session through
   `Coordinator::grant`.
-- **Agent harnesses** use the CLI: `cowshed new <name>` prints a mount path on stdout and next-step guidance on stderr —
-  a "warm worktree" with no further setup.
+- **Agent harnesses** use the CLI: `cowshed fork [<src>] <ws>` prints a mount path on stdout and next-step guidance on
+  stderr — a "warm worktree" with no further setup.
 - **Bun/Node tooling** uses `@smoothbricks/cowshed` (cowshed-napi) for programmatic control.
 - **CI runners.** A Linux+ZFS host runs each GitHub Actions job in an ephemeral, sandbox-confined clone of a warm
   headless main — warm caches, no on-runner Nix install, and registry/git secrets held host-side in the gateway rather
@@ -160,6 +159,5 @@ kernel uid boundary by running the whole stack as a dedicated `dev` account (dep
 the recommended hardening, not a substrate change.
 
 **Warm pools rejected.** Pre-attached image pools would hide attach latency but add a claim/refill state machine and
-staleness handling. The ~235 ms attach figure is a pre-cutover APFS measurement (08_testing.md), not a RAW figure, and
-the ≤ 1 s cold budget has no RAW measurement yet. The acceptable-latency envelope (10 s for humans, minutes for agents)
-makes pooling pure complexity.
+staleness handling. Cold `new` has a ≤ 1 s budget (08_testing.md, "Performance budgets"). The acceptable-latency
+envelope (10 s for humans, minutes for agents) makes pooling pure complexity.

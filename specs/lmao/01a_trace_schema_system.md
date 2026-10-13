@@ -49,7 +49,8 @@ The schema type continues to describe semantics, not whether a particular value 
 
 A dynamic reference lane is a plain JS array of string references (`string[]`, the column's `_values`). The warmed write
 stores the reference the producer already holds; it does not intern, look up vocabulary, or encode UTF-8. Dictionary
-building and UTF-8 encoding happen on the per-request flush
+building and UTF-8 encoding happen during flush, whose registered-root-tree unit is defined in
+[01j](./01j_module_context_and_spanlogger_generation.md#physicalization-and-cache-lifecycle)
 ([01b1](./01b1_buffer_performance_optimizations.md#string-interning-and-utf-8-caching-architecture)).
 
 Compiler-known message vocabulary is separate from user `CATEGORY`/`TEXT` columns. Checker-proven literal operational
@@ -71,10 +72,10 @@ This division is normative:
   and decoded values are deterministic, but dense indices and dictionary order are not cross-process guarantees. Index
   `0` is valid; null is represented by the Arrow validity bitmap.
 - The warmed entry write performs fixed monomorphic stores and allocates nothing while capacity remains. Startup, span
-  setup, overflow/slow path, and per-request flush have separate allocation budgets.
-- Per-request flush reuses the `PhysicalLayoutPlan`, backend class, vocabulary binding, dictionary generation, scratch
-  arenas, and Arrow-compatible views, and makes few or no allocations; an `ArrowLease` pins runtime-owned storage and
-  the exact immutable dictionary generation until release, never a caller's mutable fragment arrays.
+  setup, overflow/slow path, and flush have separate allocation budgets.
+- Flush reuses the `PhysicalLayoutPlan`, backend class, vocabulary binding, dictionary generation, scratch arenas, and
+  Arrow-compatible views, and makes few or no allocations; an `ArrowLease` pins runtime-owned storage and the exact
+  immutable dictionary generation until release, never a caller's mutable fragment arrays.
 
 See
 **[Buffer Performance Optimizations](./01b1_buffer_performance_optimizations.md#string-interning-and-utf-8-caching-architecture)**

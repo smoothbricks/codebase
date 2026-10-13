@@ -87,7 +87,7 @@ gateway sockets, volume ownership, and Keychain access. Same-uid-or-nothing.
 
 Everything — cowshed, gateway, workspaces, editors, agents — runs as the interactive user. Seatbelt is the only
 boundary. Stated plainly: **main is unsandboxed** (02_workspaces.md), so a main-workspace compromise has the full
-authority of the personal account — Photos, Documents, browser sessions, Keychain. This is today's model and the
+authority of the personal account — Photos, Documents, browser sessions, Keychain. This is the default model and the
 confinement ceiling 00_overview.md documents.
 
 ### Posture B — dedicated `dev` uid (recommended hardening)
@@ -239,10 +239,9 @@ run-as-dev; using wants run-as-you, and `promote` is the bridge between them.
 **Cross-uid FILE access**: personal-account processes reading or writing the dedicated development account's home
 directly — for example, a personal-session editor opening dev-owned files in place or a shared group-ACL tree. B2 does
 not need it (the personal side hosts only GUI frontends speaking to dev-side backends over SSH/sockets), and
-half-supporting it would mean permissions, launchd, and socket semantics that limp. Group-ACL sharing is a roadmap note,
-nothing more. `cowshed doctor` refuses cowshed volumes owned by a different uid with a clear error (per-user volume
-naming is noted as a future extension for multi-posture machines) — and recognizes posture B2 as healthy: running via a
-remote-backend shell or explicit uid switch is fine and expected.
+half-supporting it would mean permissions, launchd, and socket semantics that limp. `cowshed doctor` refuses cowshed
+volumes owned by a different uid with a clear error — and recognizes posture B2 as healthy: running via a remote-backend
+shell or explicit uid switch is fine and expected.
 
 ## Tradeoffs
 

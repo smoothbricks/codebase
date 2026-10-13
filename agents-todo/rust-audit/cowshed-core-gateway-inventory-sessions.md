@@ -1,5 +1,8 @@
 # cowshed-core/gateway-inventory+sessions
 
+Naming cutover: daemon-snapshot `GatewayStatus` references in this historical audit now name `DaemonStatus`. The public
+CLI `cowshed_core::api::GatewayStatus` is unchanged; original audit evidence below is retained.
+
 Scope: `packages/cowshed/crates/cowshed-core/src/gateway_inventory.rs` (2591),
 `packages/cowshed/crates/cowshed-core/src/gateway_sessions.rs` (511). Rubric: `BYPRODUCT-ENGINEERING.md`;
 `docs/handbook/04-mechanisms.md`; `docs/handbook/05-memory-toolkit.md`; `docs/handbook/02-measurement.md` §4.1. Targeted

@@ -352,6 +352,13 @@ We considered using git repository info (git root path, git SHA for identity) bu
 - **Git SHA is for version tracking**: Answers "which version of the code?" not "which module?"
   - `git_sha` is a separate column for version tracking, not part of module identity
 
+Rust span provenance is opt-in build attribution, not per-file last-touch history. A nonempty `LMAO_GIT_REVISION`
+supplies the exact `git_sha` for every Rust source; without it the field is null. Cargo tracks that variable and no Git
+files, and the build script makes no Git calls. Package, file and line still identify the callsite. Default dev and test
+builds leave the variable unset; publish jobs supply their dispatch commit. Nx hashes the explicit environment variable
+for targets whose outputs contain it; changing only the checkout's commit does not change those inputs when it is unset.
+The build script rejects CR or LF in `LMAO_GIT_REVISION` with an explicit panic before emitting the revision.
+
 ### OpMetadata <a id="smoo/lmao!n/arrow-table-module-id.metadata"></a>
 
 `defineOp(name, fn, metadata?)` takes the attribution as its third argument, and the transformer fills it at every
@@ -1226,7 +1233,7 @@ then uses high-resolution timers for all subsequent timestamps. See
   - Arrow type: `timestamp[ns]` (nanosecond)
 
 **Hot Path Storage**: Timestamps use `BigInt64Array`. For an existing buffer, the fixed store is part of the warmed
-zero-new-heap-allocation target; trace-anchor setup and fallback timestamp APIs are measured separately.
+zero-new-heap-allocation target; trace-anchor setup and fallback timestamp APIs are outside that target.
 
 **Cold Path Conversion**: Converted to Arrow `TimestampNanosecond` type, compatible with ClickHouse `DateTime64(9)`.
 

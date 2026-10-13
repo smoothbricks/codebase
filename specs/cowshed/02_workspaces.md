@@ -11,8 +11,8 @@ working tree.
 
 Every use of `main` in this specification is project-scoped. A host may adopt any number of repositories, each with its
 own warm `main`, sessions, checkpoints, grants, gateway identity, and standalone Git object store under its primary
-`repo_id`. Commands select the project explicitly with global `--project <git-root>` or derive it from cwd; `new`,
-`fork`, `checkpoint`, `restore`, `push`, and `land` never select a machine-global `main` or cross repository boundaries.
+`repo_id`. Commands select the project explicitly with global `--project <git-root>` or derive it from cwd; `fork`,
+`checkpoint`, `restore`, `push`, and `land` never select a machine-global main or cross repository boundaries.
 
 ## The safe-to-clone-main invariant
 
@@ -22,21 +22,18 @@ worktree:
 - No `.env` files. Credentials exist only inside cowshed-gateway (Keychain-backed, 05_gateway.md).
 - Environment wiring (`.cowshed/env`, sourced by `.envrc`) exports build-configuration variables only, never secrets.
 
-Everything else in main — installed dependencies, build outputs, warm build state — is exactly what makes a clone
-useful. Main's uncommitted source changes are not: they belong to main's user. A clone of main starts at main's
-committed `HEAD`. Before any other mint step, cowshed resets tracked changes in the clone from `HEAD` and deletes the
-untracked files and directories Git does not ignore. Ignored paths stay, every build-state link with them. The reset
-rewrites only files that differ, so every other mtime survives and the clone stays warm. **Why:** a clone that inherited
-a Markdown edit or a stray export from main gated a tree that was not its commit, so Nx missed, and its land then
-refused it as dirty. The clone is its volume's root, where macOS keeps its own bookkeeping (`.Trashes`, `.fseventsd`,
-`.Spotlight-V100`, `.TemporaryItems`, `.DocumentRevisions-V100`), which a mount may grow root-owned. Cowshed excludes
-each in the clone's `info/exclude` before the clean, and again whenever a checkout's supervisor starts: in its own for a
-standalone checkout, and in main's for a git-worktree workspace, whose `.git` is a pointer file and whose Git reads the
-common directory's. So the clean leaves them alone and dirty checks ignore them: a fresh mount's root-owned `.Trashes`
-made the clean fail ('Permission denied') and left the create unfinished, and a supervisor that wrote a git-worktree
-workspace's own `.git/info/exclude` refused its pointer file, so `new --git-worktree` and every verb after it failed. A
-fork of another workspace (`--from`, `cowshed fork`) still carries that workspace's live state, which is the point of a
-handoff fork (below).
+Everything else in main — installed dependencies, build outputs, warm build state and uncommitted work — makes a clone
+useful. A fork carries its source's tracked edits and untracked files unless asked not to (`--clean`, or `--ref`); main
+is no exception. Uncommitted work is warm state like any other.
+
+With `--clean`, a standalone clone resets tracked changes from `HEAD` before other mint steps and deletes nonignored
+untracked paths. An inherited git-worktree clone first establishes its own registration and index, then cleans through
+that clone-owned Git before publication; it never resets through the source's inherited pointer or changes its index.
+Ignored paths and build-state links stay warm. The reset rewrites only changed files, preserving other mtimes. The clone
+is its volume's root, where macOS keeps bookkeeping (`.Trashes`, `.fseventsd`, `.Spotlight-V100`, `.TemporaryItems`,
+`.DocumentRevisions-V100`), which a mount may grow root-owned. Cowshed excludes each in the clone's `info/exclude`
+before cleaning and whenever its supervisor starts: in the standalone checkout's own Git directory, or main's common
+directory for a linked worktree.
 
 ### Secrets enforcement
 
@@ -233,16 +230,16 @@ look for it; direct mount is the only faithful option.
 
 Git identity inheritance follows each `includeIf gitdir:` rule's anchor. Rules anchored at an ancestor shared by both
 the checkout and the mount root (for example `gitdir:<checkouts>/` when checkouts live in `<checkouts>` and the root is
-`<checkouts>/.cowshed`) match workspaces with zero additional configuration — the expected setup. Rules anchored exactly at a
-project root do not reach into the mount root; cowshed surfaces that divergence instead of letting identities silently
-drift: `cowshed setup` (every adopted checkout, after a repair and after `--mount-root`) and `cowshed doctor` (the
-current project) run `git config --list --show-origin` in the checkout and in a throwaway probe repository under the
-mount root, and any config file included only in the checkout is reported by name with the pattern that would restore
-it. The repository's own config travels with every clone, so a file it includes by a relative path inside the repository
-(`include.path = ../tooling/workspace.gitconfig`, which Git lists as `.git/../tooling/workspace.gitconfig`) resolves in
-each clone and is never reported; a relative include that climbs out of the repository lands elsewhere for a mount and
-is. The answer depends only on the host's git configuration and the mount root, never on a workspace, so `new` does not
-repeat it.
+`<checkouts>/.cowshed`) match workspaces with zero additional configuration — the expected setup. Rules anchored exactly
+at a project root do not reach into the mount root; cowshed surfaces that divergence instead of letting identities
+silently drift: `cowshed setup` (every adopted checkout, after a repair and after `--mount-root`) and `cowshed doctor`
+(the current project) run `git config --list --show-origin` in the checkout and in a throwaway probe repository under
+the mount root, and any config file included only in the checkout is reported by name with the pattern that would
+restore it. The repository's own config travels with every clone, so a file it includes by a relative path inside the
+repository (`include.path = ../tooling/workspace.gitconfig`, which Git lists as `.git/../tooling/workspace.gitconfig`)
+resolves in each clone and is never reported; a relative include that climbs out of the repository lands elsewhere for a
+mount and is. The answer depends only on the host's git configuration and the mount root, never on a workspace, so
+`fork` does not repeat it.
 
 Linked Git worktrees share their primary checkout's config. Managed shell setup retains that primary checkout's
 repo-relative `tooling/workspace.gitconfig` include; it never retargets the shared config to the linked caller's foreign
@@ -320,6 +317,31 @@ both. Opening a project verifies that the marker's `projectRoot` matches the can
 (exit 4) on mismatch, before any mount: a checkout moved or copied outside `cowshed mv` is refused, never mounted as the
 project its marker names.
 
+`mv` is a rename, not a fresh fork or mint. It preserves the source branch, remotes, uncommitted work and git-worktree
+registration through its clone-then-retire composition.
+
+The existing on-disk `fork` intent has an optional `rename` discriminator. Absent or false retains historical raw-fork
+recovery; true owns the complete rename transaction: raw clone, linked-registration/index handoff when applicable, and
+source retirement. It is never a public fork alias or a fresh mint. The intent is durable before any mutation. The
+source's supervisor admission and ownership fences remain enforced without force; dirty state alone does not refuse a
+rename because the destination preserves it. In-progress Git operations still refuse.
+
+A rename preserves the source branch, staged-only index state, working-tree edits, untracked files and ignored warm
+state. Linked registration handoff is resumable before and after its durable publication, never an index reset. Neither
+source nor destination may start new work while the rename is unfinished, and the destination is not served before
+ownership transfer and source retirement complete. Recovery resumes the exact journaled source/destination pair rather
+than creating another incarnation or discarding staged state. A rename intent still `Prepared` with no `PendingFence`
+destination is discarded and named, like a refused fork; only a mutating rename or one with durable destination facts
+resumes. Before source retirement, including a retry with an existing destination, the destination's HEAD and a
+read-only work digest must equal the source fence. Without optional locks, the digest covers the porcelain status with
+its branch header, the binary diff of the index against HEAD, the binary diff of the working tree against the index, and
+the path, mode and bytes of every untracked non-ignored file. Links rewritten by inherited-link restoration compare by
+path only. Linked worktrees must also have equal index-byte digests. A mismatch keeps both workspaces and the unfinished
+intent, with a rename-specific preservation refusal. An untracked nested repository is Git's `??dir/` entry: its
+contents are not a path the rename can carry by bytes, so the workspace rename refuses it with `conflict` before any
+capture, naming the directory and the way out — commit it, move it out of the workspace, or exclude it, then retry.
+Untracked files are preserved by path, mode and bytes; a nested repository is never recursed into.
+
 Moving an adopted checkout is always cowshed-mediated (`mv <ws> <new-path>`): the image is detached, published at the
 new path, and reattached — no unmount-and-remount gap at the user's path, no relink to maintain.
 
@@ -340,10 +362,11 @@ outstanding clone observe a mount point derived from the new checkout path again
 old one. Config, host, and substrate are rebuilt together and swapped at once, under the project actor's exclusive
 ownership, at the one moment nothing is mounted.
 
-Refusals are self-guiding as everywhere else and fire before any mutation: for the workspace rename, a dirty tree or an
-in-flight job; for the checkout move, a relative destination, one that is occupied, one whose parent does not exist, and
-one that overlaps cowshed storage or the current checkout. A dirty tree is _not_ a refusal for the checkout move — the
-working tree is carried across untouched rather than republished, so there is nothing for a fence to protect.
+Refusals are self-guiding as everywhere else and fire before any mutation: for the workspace rename, an in-progress Git
+operation, an untracked nested repository, or an in-flight job (a dirty tree is carried, see above); for the checkout
+move, a relative destination, one that is occupied, one whose parent does not exist, and one that overlaps cowshed
+storage or the current checkout. A dirty tree is _not_ a refusal for the checkout move — the working tree is carried
+across untouched rather than republished, so there is nothing for a fence to protect.
 
 A user who moves an adopted checkout by hand has not broken anything: `cowshed doctor` accepts a checkout path that
 resolves to the workspace's volume root wherever it now sits, and `cowshed attach` converges the recorded path onto the
@@ -357,26 +380,78 @@ so the mount path is never mistaken for the user's checkout — and it differs f
 recorded from the same observation: a checkout that is a mount is direct mount by construction. An `attach` with no
 observation converges nothing rather than guessing.
 
-## `cowshed new <name>` — create a session workspace
+## The `main` remote
 
-No pool or pre-warming. The source image remains live and mounted throughout capture.
+Every session workspace is minted with one remote, named `main`, whose URL is **main's canonical mount path**. The name
+says what the remote is — the main workspace — so `git fetch main`, `git log main/main`, and `git diff main/main` read
+as what they do, and an agent that knows nothing about cowshed guesses it correctly on the first try.
 
-1. `flock` main's image lock. Flush its source volume and backing file for freshness without unmounting, detaching,
-   sealing, or changing its mount flags. Main's shells, editors and source watchers continue to use it.
-2. Open the source inode without following symlinks and descriptor-clone it to `sessions/<name>.dmg`. RAW has no outer
+The URL is the canonical mount, never the recorded checkout path, and the two differ by checkout layout (see "Checkout
+layout"): they are the same directory. Recording a separate checkout path would put a path outside the workspace's read
+grants into its git config and would dangle the moment the checkout moves; the canonical mount is the path the substrate
+owns, the path the grants already cover, and the path `cowshed mv` maintains. `mv` rewrites the remote in every mounted
+workspace as part of the same transaction that moves the mount, for the same reason it rewrites the volume label. A
+workspace that was detached while main moved has no volume to write into; `attach` re-runs the same idempotent
+configuration when the workspace is next used, so the repair rides the front door a workspace already passes through
+rather than needing a verb of its own. Both paths are the idempotent no-op the remote configuration is built to be.
+
+A fresh mint starts from a clean slate: the workspace's `.git` arrives by CoW carrying every remote main had, network
+URLs included, so mint **strips them all** before configuring its own. That is the "no remote URL ever exists inside a
+sandbox" invariant, not a judgement about user intent — nothing in a just-cloned image is the user's yet.
+
+Afterwards it is, and configuration **never clobbers a remote cowshed did not create**. Remote configuration is
+idempotent and re-runs on reconciliation, against a repository an agent has been working in — where `cowshed repo`
+mirrors and hand-added remotes are real, and `main` is a plausible name for one of them. Cowshed inspects before it
+writes:
+
+- No remote named `main`: create it.
+- A remote named `main` whose URL is already the canonical mount: leave it. This is the idempotent re-run.
+- A remote named `main` pointing anywhere else: it is not cowshed's. Leave it untouched, register cowshed's under
+  `cowshed-main` instead, and print one `cowshed:` stderr line naming both. The workspace is fully functional; only the
+  spelling in `next:` hints changes, and the hints print the name actually in force.
+
+Cowshed never renames, retargets, or deletes a remote it did not create. The rule is the same one the secrets gate and
+`.pre-cowshed` retention follow: cowshed adds, and lets the user remove.
+
+**Reverse registration is optional and off by default.** `cowshed fork --register` (or `.cowshed.toml`
+`[remotes] register-workspaces = true`) additionally adds a remote named `cowshed/<ws>` in the **main** workspace's
+repository, pointing at the new workspace's canonical mount, so a human working in main can `git fetch cowshed/<ws>` and
+review a workspace's branch without leaving their checkout. It is off by default because it is host-side state that
+accumulates: a coordinator that mints and retires workspaces all day would grow a remote per workspace and leave the
+stale ones behind on any crash between retire and cleanup.
+
+The direction is the safe one. The reverse remote lets main **fetch from** a workspace; it never lets a workspace push
+into main, which is the same pull-based hand-back `cowshed push`, autosave, and `land` all use, and for the same trust
+reason — the sandboxed side is never the side that initiates a write.
+
+`cowshed rm` drops the reverse registration as part of retirement, before the image is trashed, and `land` drops it at
+the same point it prunes `refs/cowshed/<ws>/*`. A registration left behind by an interrupted retire is removed
+idempotently by `cowshed gc` from the same revalidated retirement metadata that authorizes the rest of the cleanup — a
+remote naming a mount path that no longer exists is never by itself authority to delete anything.
+
+## `cowshed fork [<src>] <ws>` — create a workspace
+
+The source defaults to `main`, or names any session. The clone carries the source exactly as captured, including
+installed dependencies, build state, tracked edits and untracked files. Every fork runs this one mint path and switches
+to its own `cowshed/<ws>` branch from the source's `HEAD`, never the source's branch. Grants start closed with a fresh
+CA and platform endpoint identity; neither source grants nor endpoints carry over. No pool or pre-warming. The source
+image remains live and mounted throughout capture.
+
+1. `flock` the source's image lock. Flush its source volume and backing file for freshness without unmounting,
+   detaching, sealing, or changing its mount flags. Source shells, editors and watchers continue to use it.
+2. Open the source inode without following symlinks and descriptor-clone it to `sessions/<ws>.dmg`. RAW has no outer
    allocation map; the filesystem snapshot is crash-consistent, not an application-state transaction. Create the
    complete closed-baseline sibling sidecar before attach; allocate `portBlock` only on macOS and omit it on Linux.
 3. Attach without mounting (`diskutil image attach --noMount`, flags per 01_storage.md), run `fsck_apfs -q` against the
-   clone's APFS volume device, then mount at `<mount-root>/<owner>/<repo>/<name>`. The earlier ~235–400 ms attach
-   measurements are pre-RAW figures, not a RAW timing guarantee. Before attach, the `first-write` step rewrites the
-   clone's first block with the bytes it holds, which copies the source image's extent map (01_storage.md, "Clone cost
-   follows extents, not size"). On a long-used main that costs tens of seconds, and under host load a container-wide
-   metadata stall follows it, until `cowshed defrag main` rewrites main contiguously. Verification precedes the first
-   mount; a clone never mounts unchecked.
+   clone's APFS volume device, then mount at `<mount-root>/<owner>/<repo>/<ws>`. RAW makes no fixed attach-latency
+   guarantee. Before attach, the `first-write` step rewrites the clone's first block with the bytes it holds, which
+   copies the source image's extent map (01_storage.md, "Clone cost follows extents, not size"). On a long-used main
+   that costs tens of seconds, and under host load a container-wide metadata stall follows it, until
+   `cowshed defrag main` rewrites main contiguously. Verification precedes the first mount; a clone never mounts
+   unchecked.
 4. On fsck failure, delete the clone and retry once from a fresh live RAW capture. If verification fails again, refuse
-   publication with the actual fsck result; never detach the live source as a fallback. The earlier ASIF live-clone
-   smoke and inconsistent allocation maps are historical evidence, not a proof of what caused their corruption.
-5. Rewrite `.cowshed/workspace.json` (`role: "workspace"`, `baseCommit` = main's HEAD), mint a fresh `.cowshed/token`,
+   publication with the actual fsck result; never detach the live source as a fallback.
+5. Rewrite `.cowshed/workspace.json` (`role: "workspace"`, `baseCommit` = source HEAD), mint a fresh `.cowshed/token`,
    mint a fresh per-workspace CA (private key controller-side next to the grant file; CA cert placed in-image as a trust
    anchor with the tool anchors wired — 04_sandbox.md/05_gateway.md), and complete platform wiring. On macOS, use the
    sidecar's allocated contiguous `portBlock` from the reserved range (default `32768–49151`; its size is recorded with
@@ -395,25 +470,29 @@ No pool or pre-warming. The source image remains live and mounted throughout cap
    live, and is not walked. Then re-resolve inherited escaping symlinks. A relative symlink whose target climbs above
    the tree root (the entry `bun install` writes for a `link:` dependency, say) was computed against main's depth and
    lands somewhere else at the workspace's mount depth, so it is rewritten to the absolute path it named in main; one
-   whose target does not exist in main either is refused by name rather than repointed at a guess. In-tree and absolute
-   links are left alone. Finding them reads every directory of the fresh volume, concurrently, and is the largest setup
+   whose target does not exist in main either is refused by name rather than repointed at a guess. An absolute symlink
+   whose target lies under the source checkout's root (a hook installer's `.git/hooks` entry, a package linker's link to
+   a directory the checkout owns) names the source checkout's own files, which the workspace's sandbox cannot read and
+   whose edits belong to another checkout; it is rewritten to the same path under the clone's root, spelled relative to
+   the link, so it names the clone's own copy at every later depth. In-tree links and absolute links outside the source
+   root are left alone. Finding them reads every directory of the fresh volume, concurrently, and is the largest setup
    cost after the clone's first write (about 5 s over a million entries). Then, inside the mount, under the workspace's
-   closed sandbox: configure the `main` remote (see "The `main` remote") and `git switch -c cowshed/<name>` from the
+   closed sandbox: configure the `main` remote (see "The `main` remote") and `git switch -c cowshed/<ws>` from the
    checked-out state. The `.git` directory arrived complete via CoW — the workspace is a standalone repository with **no
    linked-worktree registration and no back-references** into the host checkout, unless it was created with
    `--git-worktree` (see "Git-worktree workspaces").
 7. Record the audit
    `ControllerCommitment::Fork(ForkCommitment { version, order, repo_id, source_incarnation, destination_incarnation })`;
-   the new marker carries `lineage` = main's incarnation followed by main's own lineage, which is what authorizes the
-   job records the clone inherited.
+   the new marker carries `lineage` = source incarnation followed by the source's own lineage, which authorizes the job
+   records the clone inherited.
 8. Print the mount path on stdout; guidance and `next:` hints on stderr.
 
-Before the first slot, image, grant-reservation, or Git mutation, `new` and `fork` fsync their complete operation into
-the project lifecycle-intent journal. The intent stays `Prepared` until the verb has something durable to recover: it is
-marked `Mutating` once `--slot` is bound, or otherwise immediately before the staged clone writes its `PendingFence`
-sidecar. A port-block claim is not durable: it belongs to the claiming process and lapses with it. A verb that fails
-while its intent is still `Prepared` was refused (no free port block, an occupied slot) and puts back the journal record
-its intent superseded before returning its error, so no later recovery can create a workspace whose caller was told it
+Before the first slot, image, grant-reservation, or Git mutation, `fork` fsyncs its complete operation into the project
+lifecycle-intent journal. The intent stays `Prepared` until the verb has something durable to recover: it is marked
+`Mutating` once `--slot` is bound, or otherwise immediately before the staged clone writes its `PendingFence` sidecar. A
+port-block claim is not durable: it belongs to the claiming process and lapses with it. A verb that fails while its
+intent is still `Prepared` was refused (no free port block, an occupied slot) and puts back the journal record its
+intent superseded before returning its error, so no later recovery can create a workspace whose caller was told it
 failed. Startup first reconciles a pending destination against canonical inventory: an already-published incarnation
 becomes the recorded result; an absent destination reruns the operation if its intent is `Mutating`, or if a
 `PendingFence` image or a slot binding carries its name. Binaries before the `Mutating` mark journaled every create and
@@ -421,24 +500,29 @@ fork `Prepared`, so those durable facts, not the phase, decide a `Prepared` inte
 startup discards it and names it on stderr instead of rerunning it. Reissuing the same call returns the recorded
 incarnation instead of creating a second workspace or reporting a false conflict.
 
-Flags: `--ref <rev>` (after branching, `git switch -c cowshed/<name> <commit>` instead of main's state, where `<commit>`
-is what `<rev>` names in the source's repository — resolved before the intent is journaled, so a revision the source
-does not hold is refused with nothing to replay), `--from <workspace>` (clone a session instead of main — sugar over
-`cowshed fork`), `--register` (see "The `main` remote"), `--git-worktree` (see "Git-worktree workspaces"), `--browse`.
+Flags: `--clean` resets tracked changes from `HEAD` and removes nonignored untracked files in the clone, with the
+clone-owned registration ordering above for linked sources. Ignored paths stay warm. `--ref <rev>` implies `--clean` and
+branches at the commit the revision names in the source repository, resolved before the intent is journaled. The public
+API refuses a ref with `clean: false`; the CLI sets clean for a ref. Also `--browse`, `--slot <n>`, `--register` (see
+"The `main` remote"), and `--git-worktree` (see "Git-worktree workspaces"). `<src>` replaces `--from`; `new` is not a
+command or alias. The marker records `forkedFrom = <src>` and `lineage` as the source incarnation followed by its
+ancestors, and the audit record is `ControllerCommitment::Fork`.
 
 ### Publication and crash recovery
 
-`new` and `fork` publish the destination before they mount it, and a crash resumes rather than rolls back. The lifecycle
-intent is durable before storage mutation. Clone metadata is written at the canonical sidecar before the payload
-appears, in publication state `PendingFence`, which keeps the destination out of ordinary enumeration until
-initialization and post-callback validation finish. Activation is one atomic sidecar rewrite from `PendingFence` to
-`Active`; the mounted attachment is then retained. The normal path has no staging mount, detach, image rename, canonical
-reattach, or remount.
+The public fork journals the existing create intent, called the fork intent here. `mv`'s raw clone keeps its own intent
+kind. Historical on-disk create/fork tags remain readable for recovery; they are storage formats, not CLI aliases.
+
+`fork` publishes the destination before mounting it, and a crash resumes rather than rolls back. The lifecycle intent is
+durable before storage mutation. Clone metadata is written at the canonical sidecar before the payload appears, in
+publication state `PendingFence`, which keeps the destination out of ordinary enumeration until initialization and
+post-callback validation finish. Activation is one atomic sidecar rewrite from `PendingFence` to `Active`; the mounted
+attachment is then retained. The normal path has no staging mount, detach, image rename, canonical reattach, or remount.
 
 On macOS, a complete canonical `PendingFence` image reserves its persisted `portBlock` even after its creator exits.
 Allocation scans include those reservations without making the workspace visible or runnable. A dead creator's PID claim
-may be reclaimed, but that never releases a block still owned by an image. Resuming `new` or `fork` reuses the stored
-grant rather than allocating a temporary second block. Duplicate ownership remains an integrity refusal.
+may be reclaimed, but that never releases a block still owned by an image. Resuming `fork` reuses the stored grant
+rather than allocating a temporary second block. Duplicate ownership remains an integrity refusal.
 
 Every cowshed process that opens a project shares its intent journal. Each change re-reads and rewrites the journal
 under an exclusive lock on `lifecycle-intents.json.lock`, so no process writes back a copy that predates another
@@ -482,7 +566,7 @@ Every initializer step can run again:
 | slot                                                              | Binding the same workspace to the same slot is idempotent, and the binding stays owned by the pending intent.                          |
 | optional registration, commitments, intent completion, supervisor | Set or check first, append-safe telemetry, overwrite-safe completion, start-or-reuse.                                                  |
 
-**Rollback was rejected.** Initialization changes state outside the image: the `cowshed/<name>` branch and, for a
+**Rollback was rejected.** Initialization changes state outside the image: the `cowshed/<ws>` branch and, for a
 git-worktree workspace, its registration live in main's repository. Deleting the image of a crashed create orphans them,
 compensating is itself crashable, and deleting a branch that acquired commits between the crash and the reclaim loses
 work. Rolling back would also need a fence for the corpse and a reclaim rule anyway, and it has a window in which a
@@ -493,56 +577,7 @@ file, after which the attachment inventory, keyed by the path the image was open
 detached. A crash during initialization would also leave a staging image mounted at the canonical mountpoint, which the
 staging-mount collector does not retire, so the retry would find its own mountpoint busy.
 
-## The `main` remote
-
-Every session workspace is minted with one remote, named `main`, whose URL is **main's canonical mount path**. The name
-says what the remote is — the main workspace — so `git fetch main`, `git log main/main`, and `git diff main/main` read
-as what they do, and an agent that knows nothing about cowshed guesses it correctly on the first try.
-
-The URL is the canonical mount, never the recorded checkout path, and the two differ by checkout layout (see "Checkout
-layout"): they are the same directory. Recording a separate checkout path would put a path outside the workspace's read
-grants into its git config and would dangle the moment the checkout moves; the canonical mount is the path the substrate
-owns, the path the grants already cover, and the path `cowshed mv` maintains. `mv` rewrites the remote in every mounted
-workspace as part of the same transaction that moves the mount, for the same reason it rewrites the volume label. A
-workspace that was detached while main moved has no volume to write into; `attach` re-runs the same idempotent
-configuration when the workspace is next used, so the repair rides the front door a workspace already passes through
-rather than needing a verb of its own. Both paths are the idempotent no-op the remote configuration is built to be.
-
-A fresh mint starts from a clean slate: the workspace's `.git` arrives by CoW carrying every remote main had, network
-URLs included, so mint **strips them all** before configuring its own. That is the "no remote URL ever exists inside a
-sandbox" invariant, not a judgement about user intent — nothing in a just-cloned image is the user's yet.
-
-Afterwards it is, and configuration **never clobbers a remote cowshed did not create**. Remote configuration is
-idempotent and re-runs on reconciliation, against a repository an agent has been working in — where `cowshed repo`
-mirrors and hand-added remotes are real, and `main` is a plausible name for one of them. Cowshed inspects before it
-writes:
-
-- No remote named `main`: create it.
-- A remote named `main` whose URL is already the canonical mount: leave it. This is the idempotent re-run.
-- A remote named `main` pointing anywhere else: it is not cowshed's. Leave it untouched, register cowshed's under
-  `cowshed-main` instead, and print one `cowshed:` stderr line naming both. The workspace is fully functional; only the
-  spelling in `next:` hints changes, and the hints print the name actually in force.
-
-Cowshed never renames, retargets, or deletes a remote it did not create. The rule is the same one the secrets gate and
-`.pre-cowshed` retention follow: cowshed adds, and lets the user remove.
-
-**Reverse registration is optional and off by default.** `cowshed new --register` (or `.cowshed.toml`
-`[remotes] register-workspaces = true`) additionally adds a remote named `cowshed/<ws>` in the **main** workspace's
-repository, pointing at the new workspace's canonical mount, so a human working in main can `git fetch cowshed/<ws>` and
-review a workspace's branch without leaving their checkout. It is off by default because it is host-side state that
-accumulates: a coordinator that mints and retires workspaces all day would grow a remote per workspace and leave the
-stale ones behind on any crash between retire and cleanup.
-
-The direction is the safe one. The reverse remote lets main **fetch from** a workspace; it never lets a workspace push
-into main, which is the same pull-based hand-back `cowshed push`, autosave, and `land` all use, and for the same trust
-reason — the sandboxed side is never the side that initiates a write.
-
-`cowshed rm` drops the reverse registration as part of retirement, before the image is trashed, and `land` drops it at
-the same point it prunes `refs/cowshed/<ws>/*`. A registration left behind by an interrupted retire is removed
-idempotently by `cowshed gc` from the same revalidated retirement metadata that authorizes the rest of the cleanup — a
-remote naming a mount path that no longer exists is never by itself authority to delete anything.
-
-## Git-worktree workspaces: `cowshed new --git-worktree`
+## Git-worktree workspaces: `cowshed fork --git-worktree`
 
 A workspace is a standalone repository by default. `--git-worktree` makes it a **git-worktree workspace** instead: a
 registered linked worktree of the main workspace's repository, sharing main's object store and ref namespace rather than
@@ -566,19 +601,21 @@ gains three steps between attach and publication:
    moved up to the mount root afterwards; the staging directory's name is the worktree id git derives from it, which is
    why it is the workspace name and not anything mount-derived — a `--slot` mount does not carry the name, and
    retirement has to find the registration from the name alone.
-3. Refill the index from `HEAD` with a mixed reset, then `git switch -c cowshed/<name>` as usual. `--no-checkout` leaves
-   the index empty, and an empty index against a full tree reads as the wholesale deletion of every file; the reset
-   restores the reading a standalone clone gives: the tree at `HEAD`, since main's uncommitted edits were already
-   discarded at the start of the mint. The branch is created in main's ref namespace, so it is visible from main
-   immediately — with no fetch, and no `main` remote, which a git-worktree workspace does not get: there is nothing to
-   fetch from when the object store is already shared. For the same reason `cowshed rebase` defaults to replaying onto
-   `main` itself rather than onto a remote-tracking ref, and fetches nothing first.
+3. Refill the index from `HEAD` with a mixed reset, then `git switch -c cowshed/<ws>` as usual. `--no-checkout` leaves
+   the index empty. Refilling it preserves working-tree edits and untracked files in a carrying fork, but not
+   staged-only state. `--clean` discards edits before registration when the clone has its own `.git` directory, and
+   after registration through the clone-owned index when it inherited a source pointer (see the safe-to-clone-main
+   invariant). The branch is created in main's ref namespace and is immediately visible there, with no fetch and no
+   `main` remote: the object store is already shared. `cowshed rebase` therefore defaults to `main` itself and fetches
+   nothing first. A lane does fetch: `rebase --into` a lane and `land --into` a lane base move work by a local fetch.
+   While main's config includes a file of main's checkout, a git-worktree workspace's controller Git executes only Git
+   (below), and a local fetch runs `upload-pack` through a shell, so such a fetch is refused before Git runs, naming the
+   include and the rule: move the include into main's `.git` or out of main's config, or route the work through a
+   standalone lane.
 
-A workspace's mode is not only requested, it is **inherited**. `cowshed fork`, `cowshed new --from`, and the fork half
-of `cowshed mv` all clone an image whose only git state is a pointer file naming the _source's_ registration, so a clone
-of a git-worktree workspace is re-registered under its own id and is a git-worktree workspace too. There is no image to
-be standalone from. `--register` is refused alongside `--git-worktree` rather than quietly ignored: a reverse remote
-exists so main can fetch a workspace's branch, and main already holds that branch.
+A workspace's mode is inherited. A fork or `mv` of a git-worktree source is re-registered under its own id because its
+clone contains only the source's pointer file. `--register` is refused for any git-worktree fork: main already holds its
+branch.
 
 Main's config is shared along with its objects, so the network remotes in it are visible from inside a git-worktree
 workspace — cowshed cannot strip them without editing the user's own repository, and does not. The invariant that holds
@@ -599,12 +636,34 @@ It cannot be an ordinary read/write grant: grants are refused outright when they
 mount is one — the denied project root under direct mount. Main's working tree stays as unreachable as any other
 workspace's, and a workspace that did not ask for `--git-worktree` never has any of it.
 
+The controller's own Git for such a workspace (mint, attach, `rm`, `gc`, `rebase`, `land`) reads main's shared config
+through that carve-back, and Git refuses to run when a file the config includes cannot be read: a relative include such
+as `../tooling/workspace.gitconfig` lands in main's working tree. Every job of the workspace can write that config, so
+the controller resolves its `include.path` and `includeIf.*.path` targets itself, transitively, and holds each to the
+narrowest reading. `~/` is the HOME the controller's Git runs with, inside the workspace. A target in the workspace or
+in main's `.git` is readable already. A regular config file inside main's checkout is granted to that Git, by itself,
+read without following a final symlink, without blocking on a FIFO, and only up to 1 MiB. Any other target — outside
+main's checkout, a device, a FIFO, past 64 included files — refuses the command by name; an include outside main stays
+denied, as it always was.
+
+A git-worktree workspace's controller Git runs no repository driver. Every `filter.<name>` clean, smudge and process
+command is emptied, as hooks already are; every `merge.<name>.driver` and `diff.<name>.command` is `false`; every
+`diff.<name>.textconv` is the identity. A merge or rebase that needs a driver — a pin-merging `merge=<driver>`
+attribute, say — therefore conflicts there instead of running it. Those overrides name the drivers the config holds when
+the command is built, which is not a boundary: a job can add one under a new name before the command runs, and
+`gpg.program`, `core.sshCommand` and the like are not drivers at all. So while that Git holds a grant of main's
+checkout, its sandbox executes nothing but Git's own executables — the developer directory's `usr/bin/git` and
+`usr/libexec/git-core` — and any program a config key names fails closed, a shell included. A standalone workspace's
+controller Git holds no such grant and keeps running the repository's drivers (04_sandbox.md, "Controller Git"). A job's
+own Git inside a git-worktree workspace keeps only the `.git` carve-back, so an include into main's checkout still fails
+there; widening the job profile is not part of this.
+
 **Checkpoint and restore refuse** on a git-worktree workspace, exit 4, with `next:` hints. The image is not
 self-contained: a checkpoint clone would capture a tree whose history lives in a repository it does not include, so the
 clone is not a restorable state — it is half a repository. Restoring one is worse than useless, because the fresh
 incarnation would resurrect a registration for a worktree id that main has since pruned and quietly claim a branch
 another workspace may now hold. The hints name the two honest substitutes: commit and `cowshed land` to keep the work,
-or `cowshed new` a standalone workspace when checkpointing is what is actually wanted. Cowshed refuses rather than
+or `cowshed fork` a standalone workspace when checkpointing is what is actually wanted. Cowshed refuses rather than
 checkpointing something that cannot be restored.
 
 `cowshed rm` drops the registration as part of retirement, in the same host-side-state-first step that drops a reverse
@@ -639,7 +698,7 @@ The reasons are both about blast radius:
 
 **Crash isolation of the object store.** A shared object store is one repository that every worktree writes into, main
 included. A hard crash mid-write, a killed `git gc`, a corrupted pack, an over-eager `--prune` — in clone mode each
-lands inside one disposable image, and the cure is `cowshed rm` and a fresh `cowshed new`. In worktree mode it lands in
+lands inside one disposable image, and the cure is `cowshed rm` and a fresh `cowshed fork`. In worktree mode it lands in
 the user's own repository, and the blast radius is every workspace plus main. Cowshed's entire posture is that a
 workspace is cheap and destroyable; that only holds while destroying one cannot take anything else with it.
 
@@ -652,16 +711,6 @@ should not be rewriting it where the user lives.
 `--git-worktree` exists for the cases where the shared namespace is the point: tooling that assumes one repository,
 `git worktree list` as the inventory, and reviewing a workspace's commits from main with no fetch step at all. It is a
 deliberate trade of isolation for immediacy, taken per workspace, and never by default.
-
-## `cowshed fork <src> <dst>`
-
-Clones a _session_ mid-flight with the same barrier/fencing as `cowshed new` (`sessions/<src>.dmg` →
-`sessions/<dst>.dmg`). The marker records `forkedFrom` and `lineage` (the source incarnation, then the source's own
-ancestors), and the controller records the audit
-`ControllerCommitment::Fork(ForkCommitment { version, order, repo_id, source_incarnation, destination_incarnation })`.
-Grants do **not** carry over: the fork starts closed, with a fresh CA and platform endpoint identity. macOS allocates a
-new `portBlock`; Linux leaves it absent and creates a new per-incarnation socket/netns/ connector. Neither inherits the
-source endpoint or CA.
 
 ## `cowshed checkpoint <ws> [label]` / `cowshed restore <ws> <label>`
 
@@ -816,11 +865,11 @@ workspace or sandbox operation and not agent-invokable.
 
 ## Return to an integration branch: `cowshed rebase` and `cowshed land`
 
-Workspaces are born from the main workspace's Git state and return to a controller-selected integration branch.
-`new`/`fork` are the first half of the lifecycle; `rebase` and `land` are the second. Between them, autosave refs
-(fetched host-side to `refs/cowshed/<ws>/wip` — see "Autosave") remain the crash-safety net. Cowshed provides the
-primitives; retry, scheduling, review, remote publication, and branch-selection policy are coordinator work (12_mcp.md),
-deliberately not baked in.
+Workspaces are born from the main workspace's Git state and return to a controller-selected integration branch. `fork`
+is the first half of the lifecycle; `rebase` and `land` are the second. Between them, autosave refs (fetched host-side
+to `refs/cowshed/<ws>/wip` — see "Autosave") remain the crash-safety net. Cowshed provides the primitives; retry,
+scheduling, review, remote publication, and branch-selection policy are coordinator work (12_mcp.md), deliberately not
+baked in.
 
 ### `cowshed rebase <ws> [--onto <branch-or-ref> | --into <lane>]`
 
@@ -890,7 +939,7 @@ step.
    `refs/cowshed/<ws>/heads/<branch>`, which retirement prunes.
 
    **Land has no branch-name contract.** It fetches whatever branch the workspace has checked out — `cowshed/<ws>` is
-   what `new` creates, but an agent may have made `wt/<ws>` or anything else, and land neither assumes nor requires the
+   what `fork` creates, but an agent may have made `wt/<ws>` or anything else, and land neither assumes nor requires the
    minted name. Only the resolved head is load-bearing. A workspace with no checked-out branch is a conflict naming the
    fix.
 
@@ -915,12 +964,11 @@ step.
    head a conflicted replay was rolled back to — so a coordinator types the outcome without reading either repository
    again.
 
-4. **Adopt the build volume and check it**: the target takes the workspace's build volume by renaming its one
-   `.cowshed/build` link, re-runs the check on the adopted volume and requires 100% Nx cache hits, reporting every miss
-   as a configuration finding, then freezes a new seed for later forks. The target builds nothing the workspace built.
-   16_build_volumes.md owns this step: when the swap is skipped, what a miss means, and garbage collection. A land that
-   compared-and-swapped a branch that is not checked out leaves the target's checkout, and so its build volume,
-   untouched, and skips this step.
+4. **Freeze the seed, adopt the build volume and check it**: every land refreshes the target's seed by sealing and
+   cloning the landing workspace's warm build volume before the target adopts it by renaming its `.cowshed/build` link.
+   It then re-runs the check on the adopted volume and reports every Nx miss as a configuration finding. The target
+   builds nothing the workspace built. 16_build_volumes.md owns this step, writer-quiescence skips and collection; every
+   seeded/unseeded and adopted/skipped outcome is durable (13_telemetry.md).
 
 5. **Retire**: only after the target branch and, when checked out, its visible working state resolve to the validated
    source head, destroy the workspace (supervisor tree first — 11_shell.md) and prune its `refs/cowshed/<ws>/*`
@@ -934,10 +982,15 @@ step.
 `rebase --fresh`). `--push-only` performs steps 1–2 and installs the validated head in the workspace's durable
 `refs/cowshed/<ws>/heads/<branch>` preservation ref without advancing the target branch, for review-gated flows.
 
-### Lanes: `new`, `fork`, and `--into`
+A target fast-forwarded through plain Git instead is an **external land**: it forfeits carry, output restoration and
+adoption. The next fork (including `--ref` naming the target's current tree) automatically captures a live workspace at
+exactly that tree as the target's seed, under writer exclusion; no manual reseed or warm command exists. `doctor`
+reports `seed-tree-behind` and `target-moved-outside-land` when the recorded volumes do not match the tree.
+
+### Lanes: `fork` and `--into`
 
 A lane is a line of work that reaches main as one change but is built by several workspaces. Its base is an ordinary
-workspace, `cowshed new <lane>` (a clone of main). Its units are `cowshed fork <lane> <unit>`. A unit rebases onto
+workspace, `cowshed fork <lane>` (a clone of main). Its units are `cowshed fork <lane> <unit>`. A unit rebases onto
 (`cowshed rebase <unit> --into <lane>`) and lands into (`cowshed land <unit> --into <lane>`) the lane base, then is
 removed. The lane completes with the ordinary close-out of its base: `cowshed rebase <lane>` and `cowshed land <lane>`
 fast-forward main and remove the lane base.
@@ -996,10 +1049,10 @@ retirement but before acknowledging the call, startup observes the workspace abs
 retiring it twice. A prepared request that never crossed the safety fence is discarded, not a deferred deletion; an
 authorized mutating request reruns the safety fences and retirement.
 
-A named `rm` can retire an unfinished `new` or `fork` without activating it. The exact pending image is mounted and
-validated under its image lock, then receives the same dirty-state, HEAD-stability and landed-work checks as an active
-workspace. A refusal preserves the image and original clone intent. Once retirement is authorized, its journal record
-retains the original clone source so an interrupted removal can recover.
+A named `rm` can retire an unfinished fork without activating it. The exact pending image is mounted and validated under
+its image lock, then receives the same dirty-state, HEAD-stability and landed-work checks as an active workspace. A
+refusal preserves the image and original clone intent. Once retirement is authorized, its journal record retains the
+original clone source so an interrupted removal can recover.
 
 Removal-scoped startup never finishes the named target's own unpublished clone: it leaves the clone intent for the `rm`
 to retire, so whatever stopped the clone — a duplicate port block, a start revision the source no longer holds — cannot
@@ -1040,8 +1093,8 @@ workspace's short runtime link (04_sandbox.md): a mint may run at a staging moun
 the workspace is served at. Nothing is derived from cwd, guessed from a slot, or trusted from a marker alone.
 
 Shell hooks are optional repository input. Cowshed never creates or rewrites `.envrc` or `.envrc-local`, and adoption,
-new, fork and restore do not require either file or any ignore rule for it. A repository with no shell configuration
-uses the ordinary sandbox environment; a project-owned `.envrc` needs no cowshed-specific loader.
+fork and restore do not require either file or any ignore rule for it. A repository with no shell configuration uses the
+ordinary sandbox environment; a project-owned `.envrc` needs no cowshed-specific loader.
 
 Projects that want interactive direnv shells to receive the published workspace values may add this optional line to
 their own hook:
@@ -1068,7 +1121,7 @@ because it is used. The secrets invariant is what makes this safe; it is enforce
 `.git/worktrees/<id>`: a sandbox hole into the user's object store, a registration that outlives an interrupted
 teardown, a gitdir that is invalid the moment the image is cloned, and a workspace that is unusable whenever main is
 detached. A standalone `.git` arrives via CoW at zero marginal cost and the pull-based `cowshed push` replaces
-shared-state semantics with an explicit, auditable hand-back — so clone is what `cowshed new` does. `--git-worktree`
+shared-state semantics with an explicit, auditable hand-back — so clone is what `cowshed fork` does. `--git-worktree`
 takes the trade deliberately, per workspace, and gives up checkpoint and restore for it (see "Git-worktree workspaces").
 
 **A git credential broker rejected — sandboxed git fetches, never pushes.** A smart-HTTP credential broker on the

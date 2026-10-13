@@ -43,7 +43,7 @@ no reflink, so the cache's volume never enters an install's cost.
 | Layer                                   | Contents                                                                                                                                                                | Location                                                                                                                     | Sharing                                   |
 | --------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------- |
 | 1. Gateway mirrors                      | npm metadata and tarballs, bare repository mirrors                                                                                                                      | cowshed's own user cache directory: `~/Library/Caches/dev.cowshed/{mirror,repo-mirrors}` (Linux `$XDG_CACHE_HOME/cowshed/…`) | Global, written only by cowshed-gateway   |
-| 2. Clone-materializing caches           | caches a tool reflinks out of into the workspace — **none today**: bun's isolated linker links into its cache instead                                                   | Inside each workspace image                                                                                                  | Inherited from main via CoW at clone time |
+| 2. Clone-materializing caches           | caches a tool reflinks out of into the workspace — **none in scope**: bun's isolated linker links into its cache instead                                                | Inside each workspace image                                                                                                  | Inherited from main via CoW at clone time |
 | 3. Read-at-build and link-target caches | Cargo registry/git extraction caches, bun/npm/pnpm install caches, uv cache, Go module + build caches, sccache, zig global cache, gradle, Nix fetcher and profile state | Each tool's own default location in the host user's HOME, shared into the sandboxes of projects that use the tool            | Shared writable by detecting workspaces   |
 
 Layer 1 removes duplicate _downloads_ (and stores compressed bytes once, ever). Bare repository mirrors live only at
@@ -52,20 +52,26 @@ and, like the rest of cowshed's cache directory, are controller state no sandbox
 is **not** that mirror tree: it is cargo's own shared writable extraction/index cache. The two have distinct ownership,
 permissions, and paths, so a Cargo process can never mutate gateway repository mirrors. Layer 2 is one special case, not
 a category: it exists exactly where a tool reflinks out of its cache and the substrate cannot reflink across volume
-boundaries, and no cache in scope does that today. Layer 3 caches are read at build time or linked to, and write nowhere
-near the workspace, so sharing them is free.
+boundaries, and no cache in scope does that. Layer 3 caches are read at build time or linked to, and write nowhere near
+the workspace, so sharing them is free.
 
-**ZFS may widen layer 2** (verify item, not a promise): OpenZFS 2.2 block cloning (BRT) works across datasets within a
-pool — something APFS clonefile cannot do across volumes. A clone-materializing cache whose copy path goes through
-`copy_file_range` (which BRT intercepts) would get reflink speed from a pool-shared location, so on ZFS layer 2 could
-share with zero duplication and no speed penalty. Bun's Linux _default_ backend is hardlink, which cannot cross
-datasets; its isolated linker needs neither.
+**ZFS may widen layer 2**: OpenZFS 2.2 block cloning (BRT) works across datasets within a pool — something APFS
+clonefile cannot do across volumes. A clone-materializing cache whose copy path goes through `copy_file_range` (which
+BRT intercepts) would get reflink speed from a pool-shared location, so on ZFS layer 2 could share with zero duplication
+and no speed penalty. Bun's Linux _default_ backend is hardlink, which cannot cross datasets; its isolated linker needs
+neither.
 
 **Workspace-keyed state** — `target/`, materialized `node_modules`, `DerivedData`, `.nx`, `.zig-cache`, Metro/Expo
 caches — is not shareable concurrently under any mechanism. A build tool's per-tree incremental state that capability
 detection names (Cargo target directories, Nx's cache and task database) lives on the workspace's build volume, cloned
 from main's seed at fork and adopted by main at land (16_build_volumes.md). The rest stays in the workspace image, warm
 because the image was cloned from main.
+
+For a managed Bun checkout, the successful installer records each present `bun.lock`/`bun.lockb` SHA-256 in its existing
+`node_modules/.smoo-install` receipt, beside the installer-input digest. The receipt is written only after success and
+travels with `node_modules`; a receipt without lock digests is not current. `cowshed doctor` reads the checkout's locks
+and receipt and reports `node-modules-install-missing` or `node-modules-lock-drift`, without installing or changing
+files.
 
 ## The reflink-reachability rule
 
@@ -81,11 +87,11 @@ cover processes cowshed never spawned (IDE terminals, launchd jobs, CI runner st
 HTTP proxy variables, which are emitted by the workspace environment wiring because ordinary proxy-aware tools consume
 them there; they contain the endpoint URL, whose userinfo is the workspace token (below).
 
-- **Private-environment config files**, written when the workspace is minted (adopt/new/fork, and rekey/restore's fresh
-  CA) and republished before every exec, so a moved environment is never served stale. They live in the workspace's
-  private environment — `.cowshed/{home,config,cache}`, which a cowshed-spawned child gets as `HOME`, `XDG_CONFIG_HOME`
-  and `XDG_CACHE_HOME` — never in a tracked file, so a rewrite never dirties `git status`. A read-only exec gets the
-  same files under its exec-temp environment. Define `GATEWAY_HTTP` as `http://127.0.0.1:<portBlock.base>` on macOS and
+- **Private-environment config files**, written when the workspace is minted (adopt/fork, and rekey/restore's fresh CA)
+  and republished before every exec, so a moved environment is never served stale. They live in the workspace's private
+  environment — `.cowshed/{home,config,cache}`, which a cowshed-spawned child gets as `HOME`, `XDG_CONFIG_HOME` and
+  `XDG_CACHE_HOME` — never in a tracked file, so a rewrite never dirties `git status`. A read-only exec gets the same
+  files under its exec-temp environment. Define `GATEWAY_HTTP` as `http://127.0.0.1:<portBlock.base>` on macOS and
   exactly `http://127.0.0.1:7644` on Linux. The Linux address is served by the trusted connector inside that workspace's
   private netns; package clients do not speak Unix sockets. No Linux `portBlock` or synthetic base exists.
   - **bun: no registry configuration at all.** Bun reads its registry from the repository's own configuration
@@ -137,7 +143,7 @@ them there; they contain the endpoint URL, whose userinfo is the workspace token
   workspace CA. The core points `GIT_SSL_CAINFO` and `SSL_CERT_FILE` at it; each detected capability adds its tool's own
   variable, such as cargo's `CARGO_HTTP_CAINFO` (04_sandbox.md).
 - **In-image tool shims** at `.cowshed/bin/`, PATH-prepended by the same `.envrc` wiring (so they travel with every
-  clone and cover every process spawned in the workspace, IDE terminals included). Today that is one shim: the **`xcrun`
+  clone and cover every process spawned in the workspace, IDE terminals included). There is one shim: the **`xcrun`
   wrapper** — pure `exec /usr/bin/xcrun "$@"` passthrough for everything except the simulator-control verbs (`simctl`,
   `devicectl`), so toolchain calls (`xcrun clang`, `--show-sdk-path`) stay native-speed and unbreakable. Simulator verbs
   resolve their device target: **dev-local CoreSimulator is the default** (agents and automation never accidentally
@@ -150,10 +156,10 @@ them there; they contain the endpoint URL, whose userinfo is the workspace token
   an inherited jobserver (`CARGO_MAKEFLAGS` names a live one, as for a `cargo` a build script starts) it runs that
   `cargo` as asked. Under a `bounded-exec` grant (`BOUNDED_EXEC_CPU_TOKENS` set) it takes no second grant and sets
   `CARGO_BUILD_JOBS`, `RUST_TEST_THREADS` and `NEXTEST_TEST_THREADS` to that count where they are unset. A subcommand
-  that compiles nothing (`metadata`, `fmt`, `locate-project`, `--version`, …) runs directly. Any other takes a jobserver
-  grant of `g` tokens and runs with the grant's fifo, and with `RUST_TEST_THREADS`, `NEXTEST_TEST_THREADS` and
-  `BOUNDED_EXEC_CPU_TOKENS` set to `g` where they are unset. With no gateway listening it runs `cargo` unbudgeted, as
-  `bounded-exec` does.
+  classified as non-compiling by [05 Gateway, Host CPU budget](05_gateway.md#host-cpu-budget) runs directly. Any other
+  takes a jobserver grant of `g` tokens and runs with the grant's fifo, and with `RUST_TEST_THREADS`,
+  `NEXTEST_TEST_THREADS` and `BOUNDED_EXEC_CPU_TOKENS` set to `g` where they are unset. With no gateway listening it
+  runs `cargo` unbudgeted, as `bounded-exec` does.
 - **Tool homes stay where the tool keeps them.** Every layer-3 cache lives at its tool's own default location in the
   host user's HOME, the one place the host's own tools already use without configuration, and cowshed shares that exact
   path into the sandbox of every project whose detector names the tool (15_capabilities.md). There is no cache volume,
@@ -252,43 +258,44 @@ them there; they contain the endpoint URL, whose userinfo is the workspace token
   `~/.cargo/credentials` and `~/.gradle/gradle.properties` sit beside the shared caches and are on the secret deny list
   (04_sandbox.md); a sandbox building against the host `$CARGO_HOME` cannot read or write any of them. `~/.cargo/bin`
   holds rustup's proxies and no credentials: a cargo project reads it, never writes it (above). A Gradle project's
-  `GRADLE_USER_HOME` is private (below), never the host's `~/.gradle`; `SCCACHE_DIR` reaches a job only as the
-  supervisor sets it, naming the daemon's own cache directory, which the sandbox can neither read nor write (below).
-  Profile generation canonicalizes symlinked paths when emitting write grants (the `/var` → `/private/var` handling
-  generalizes).
+  `GRADLE_USER_HOME` is private (below), never the host's `~/.gradle`; `SCCACHE_DIR` reaches host shells and jobs
+  through the same capability contribution, naming the daemon's own cache directory, which the sandbox can neither read
+  nor write (below). Profile generation canonicalizes symlinked paths when emitting write grants (the `/var` →
+  `/private/var` handling generalizes).
 
 - **Environment variables.** Two sets, and neither is wiring a file could carry instead:
   - The in-image `.cowshed/env`, sourced by the workspace's `.envrc`, exports what processes cowshed never spawned need
     and no file can give them: `COWSHED_WORKSPACE_TOKEN`, and on macOS the dev-server port conventions
-    `COWSHED_PORT_BASE` and `COWSHED_PORT_BLOCK_SIZE` (04_sandbox.md, cooperative-sandboxing caveat). Linux exports no
-    port values: services use private loopback and package/proxy wiring uses the fixed `http://127.0.0.1:7644`. No
-    workspace-identity variable is exported; anything that needs identity derives it from cwd via
-    `.cowshed/workspace.json` or asks the CLI.
+    `COWSHED_PORT_BASE` and `COWSHED_PORT_BLOCK_SIZE` (04_sandbox.md, cooperative-sandboxing caveat). A served mount
+    also publishes the sccache capability's client environment below, and Nx's `NX_MAX_CACHE_SIZE` default; explicit
+    caller cache-size overrides are preserved. Linux exports no port values: services use private loopback and
+    package/proxy wiring uses `http://127.0.0.1:7644`. No workspace-identity variable is exported; anything that needs
+    identity derives it from cwd via `.cowshed/workspace.json` or asks the CLI.
   - The supervisor sets, for every job it spawns (`runtime/supervisor.rs` `sandbox_environment`):
     - the private environment: `HOME`, `XDG_{CONFIG,CACHE,DATA,STATE}_HOME`, `DIRENV_CONFIG`, `TMPDIR` (the workspace's
       temp dir in the project store, 04_sandbox.md) and `XDG_RUNTIME_DIR`;
     - git isolation: `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_NOSYSTEM`, `GIT_ATTR_NOSYSTEM`, and the fetch-route include as
       `GIT_CONFIG_COUNT`/`KEY`/`VALUE` (02_workspaces.md);
     - each detected capability's contribution (15_capabilities.md): for an Nx project `NX_SOCKET_DIR`,
-      `NX_WORKSPACE_DATA_DIRECTORY` and `NX_CACHE_DIRECTORY` (for a read-write job the checkout's own `.nx`, shared with
-      the checkout's host shells; for a read-only job its exec temp dir; a caller's `NX_DAEMON` withheld so Nx's own
-      default decides, 04_sandbox.md) and `NX_WORKSPACE_ROOT_PATH`; for a cargo project `CARGO_HOME` (above, naming the
-      host's own default path only to undo the private `HOME`), `CARGO_NET_GIT_FETCH_WITH_CLI=true` and on a rustup host
-      `RUSTUP_HOME`; for a Go project `GOMODCACHE`, `GOCACHE`, `GOPROXY`, `GOSUMDB` and `GOTOOLCHAIN` (above); the other
-      shared tool homes of detected package managers and toolchains (`BUN_INSTALL_CACHE_DIR`, `NPM_CONFIG_CACHE`,
-      `PNPM_CONFIG_STORE_DIR`, `UV_CACHE_DIR`, `ZIG_GLOBAL_CACHE_DIR`), each naming the host's own path; and for a
-      Gradle project a private `GRADLE_USER_HOME` under the private cache whose `caches` links to the host's
-      `~/.gradle/caches`, so the daemon, wrapper distributions, native libraries and JDKs stay private and no other part
-      of the host `~/.gradle` is granted;
+      `NX_WORKSPACE_DATA_DIRECTORY` and `NX_CACHE_DIRECTORY` (the checkout's own `.nx` for both read-write and read-only
+      jobs; source remains read-only while the build volume stays writable); `NX_MAX_CACHE_SIZE` defaults to one tenth
+      of configured `[build] capacity` (100 GiB by default), preserving explicit caller overrides; a caller's
+      `NX_DAEMON` is withheld so Nx's own default decides (04_sandbox.md), and `NX_WORKSPACE_ROOT_PATH`; for a cargo
+      project `CARGO_HOME` (above, naming the host's own default path only to undo the private `HOME`),
+      `CARGO_NET_GIT_FETCH_WITH_CLI=true` and on a rustup host `RUSTUP_HOME`; for a Go project `GOMODCACHE` and
+      `GOCACHE`; the other shared tool homes of detected package managers and toolchains (`BUN_INSTALL_CACHE_DIR`,
+      `NPM_CONFIG_CACHE`, `PNPM_CONFIG_STORE_DIR`, `UV_CACHE_DIR`, `ZIG_GLOBAL_CACHE_DIR`), each naming the host's own
+      path; and for a Gradle project a private `GRADLE_USER_HOME` under the private cache whose `caches` links to the
+      host's `~/.gradle/caches`, so the daemon, wrapper distributions, native libraries and JDKs stay private and no
+      other part of the host `~/.gradle` is granted;
     - the `.cowshed/env` set again (the token, the port pair), `SCCACHE_SERVER_UDS` and `SCCACHE_DIR` (the host sccache
-      daemon, below), and `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` in both cases, carrying `job-<job_id>` and the token as
-      proxy userinfo;
-    - the build wiring: `SCCACHE_BASEDIR_CWD=1`, `SCCACHE_BASEDIR=<workspace root>`, and `RUSTC_WRAPPER` naming
-      `bin/sccache` inside the store path the host's sccache GC root pins, the program the daemon itself runs (below).
-      It is read through the root before every spawn and names the program rather than a `PATH` entry: shell activation
-      owns `PATH`, and a repository shell that ships no sccache left a bare `sccache` unresolvable, failing every cargo
-      at its version probe. A host that pinned none — sccache is opt-in — or whose pinned store path was collected gets
-      no wrapper at all; no value is the caller's;
+      daemon, below), and `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` in both cases, carrying the token as proxy userinfo;
+    - the build wiring, also emitted into `.cowshed/env` from the same sccache capability: `SCCACHE_BASEDIR_CWD=1`,
+      `SCCACHE_BASEDIR=<workspace root>`, and `RUSTC_WRAPPER` naming `bin/sccache` inside the store path the host's
+      sccache GC root pins, the program the daemon itself runs (below). It is read through the root before every spawn
+      and names the program rather than a `PATH` entry: shell activation owns `PATH`, and a repository shell that ships
+      no sccache left a bare `sccache` unresolvable, failing every cargo at its version probe. A host that pinned none —
+      sccache is opt-in — or whose pinned store path was collected gets no wrapper at all; no value is the caller's;
     - trust anchors as defaults a caller may override: the core's `GIT_SSL_CAINFO` and `SSL_CERT_FILE`, and each
       detected capability's own — `CARGO_HTTP_CAINFO`, `NODE_EXTRA_CA_CERTS`, `NIX_SSL_CERT_FILE` with an
       `ssl-cert-file` line appended to `NIX_CONFIG`, `UV_SYSTEM_CERTS=true` (04_sandbox.md);
@@ -350,15 +357,16 @@ because it adds immediacy, not new reach, while the store's write surface strict
 
 Cache classification is a built-in table keyed by well-known names — never configuration:
 
-| Name (at any depth, gitignored)                              | Class                     |
-| ------------------------------------------------------------ | ------------------------- |
-| `node_modules`                                               | workspace-keyed, in-image |
-| `target` (with `Cargo.toml` sibling)                         | workspace-keyed, in-image |
-| `.nx`, `.turbo`, `.next`, `.expo`, `.gradle` (project-local) | workspace-keyed, in-image |
-| `.zig-cache`, `zig-cache`, `zig-out`                         | workspace-keyed, in-image |
-| `DerivedData` (project-local)                                | workspace-keyed, in-image |
-| `Pods`                                                       | workspace-keyed, in-image |
-| `vendor` (with `go.mod` sibling)                             | workspace-keyed, in-image |
+| Name (at any depth, gitignored)                       | Class                         |
+| ----------------------------------------------------- | ----------------------------- |
+| `node_modules`                                        | workspace-keyed, in-image     |
+| `target` (with `Cargo.toml` sibling)                  | workspace-keyed, build volume |
+| `.nx`                                                 | workspace-keyed, build volume |
+| `.turbo`, `.next`, `.expo`, `.gradle` (project-local) | workspace-keyed, in-image     |
+| `.zig-cache`, `zig-cache`, `zig-out`                  | workspace-keyed, in-image     |
+| `DerivedData` (project-local)                         | workspace-keyed, in-image     |
+| `Pods`                                                | workspace-keyed, in-image     |
+| `vendor` (with `go.mod` sibling)                      | workspace-keyed, in-image     |
 
 The table exists so `cowshed doctor` can report cache health and so the Seatbelt baseline can include project-local
 build dirs as writable without per-project config. Unknown build dirs are simply in-image files — nothing breaks; the
@@ -385,7 +393,7 @@ table is advisory metadata, not a gate.
 - **Path-keyed warm state.** Cargo keys a workspace crate on its package-relative path, so a session at a per-name mount
   finds main's units fresh; what stays path-keyed is whatever a build records absolutely — a dependency's `$CARGO_HOME`
   path (one literal path, above) and a build script's watched path outside its package — and Xcode DerivedData. Slot
-  mounts (`new --slot`) recycle stable paths for those. A compiled-in `env!("CARGO_MANIFEST_DIR")` is worse than
+  mounts (`fork --slot`) recycle stable paths for those. A compiled-in `env!("CARGO_MANIFEST_DIR")` is worse than
   path-keyed: cargo does not fingerprint the checkout path, so the inherited unit stays fresh and reads its origin's
   files; the path is read at run time instead, where cargo and nextest set it. cowshed does not force compiler flags.
 - **Poisoning model.** Lockfile integrity hashes protect _downloads_ (layer 1 is verified by the package managers

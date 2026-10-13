@@ -615,7 +615,7 @@ class TagWriter {
     // Runtime class generation adds attribute methods to prototype
   }
 
-  // Object-based API: tag.with({ userId: "123" })
+  // One-column illustration of tag.with({ userId: "123" }); the full setter writes every supplied attribute.
   with(attributes) {
     if (attributes.userId !== undefined && attributes.userId !== null) {
       this._state._spanBuffer.userId(0, attributes.userId);

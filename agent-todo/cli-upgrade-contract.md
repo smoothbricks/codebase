@@ -1,33 +1,39 @@
-# smoo: `monorepo sync` and a coherent `monorepo update`
+# smoo workspace reconciliation: implementation gaps
 
-`packages/cli/docs/workspace-reconciliation.md` states the upgrade contract: `smoo monorepo sync` reconciles the
-installed, pinned toolset offline; `smoo monorepo update` resolves one release manifest, installs the compatible CLI and
-plugin pair, re-invokes the newly installed CLI through its resolved path, and only then renders, validates, checks the
-fixed point and applies.
+Governing contract: `specs/cli/01_workspace_reconciliation.md`, “Operations”, “Update resolves one release manifest”,
+“Dirty workspaces and resumable installs”, and “Acceptance”. The package's shipped path is described in
+`packages/cli/docs/workspace-reconciliation.md`.
 
-## What the code does
+## Installed-toolset synchronization
 
-- `packages/cli/src/cli.ts:129-132`: `monorepo update` calls `updateManagedFiles`. There is no `monorepo sync` command
-  (the only `sync` commands are `monorepo sync-bun-lockfile-versions` at `:167` and `secrets sync` at `:626`).
-- `packages/cli/src/monorepo/index.ts:115-136`: `updateManagedFiles` renders the managed files first (`:116`), applies
-  the package and tool policies (`:117-133`), and installs last (`:134-135`). The running process stays the old
-  generator, and no release manifest is resolved or recorded.
+- Spec: `specs/cli/01_workspace_reconciliation.md:8-11` separates offline, deterministic `monorepo sync` from upgrade
+  resolution and installation.
+- Code: `packages/cli/src/cli.ts:129-132` registers `monorepo update`, which calls `updateManagedFiles`; no separate
+  `monorepo sync` is registered.
+- Work: expose installed-toolset render-and-apply as `monorepo sync`, with no release resolution, installation of new
+  versions or network requests. Name both commands in `packages/cli/README.md`, “Managed Files”.
 
-## Work
+## One compatible release and new-CLI generation
 
-1. Add `smoo monorepo sync`: today's render-and-apply with the installed toolset, with no resolution and no install of
-   new versions. It must make no network request.
-2. Define the release manifest (CLI and plugin versions, tested Nx ranges, configuration schema version, template
-   version, ordered migrations) and where a release publishes it.
-3. Rework `monorepo update`: resolve the manifest once, record the selected versions before any network operation, stage
-   and install them, then run the installed CLI's `monorepo sync` through its explicit resolved path, never through
-   `PATH`. A failed install resumes from the recorded versions.
-4. Keep `workspace:` links in Smoothbricks itself; an update never replaces a linked package with a registry package.
-5. Define the dirty-workspace snapshot and conflict policy; an update never discards user edits.
-6. Update `packages/cli/README.md` "Managed Files" to name both commands.
+- Spec: `specs/cli/01_workspace_reconciliation.md:13-25` records one compatible release manifest, installs the selected
+  toolset, re-executes its CLI through the resolved path and checks the rendered fixed point. Linked workspace source
+  remains linked.
+- Code: `packages/cli/src/monorepo/index.ts:115-137` renders first, applies policies and runs `bun install` last. It
+  resolves no upgrade manifest and continues in the installed generator.
+- Work: define the manifest's publication and implement the specified resolve, stage, install and explicit-path
+  re-execution sequence; retain `workspace:` links rather than implicitly replacing source with registry packages.
 
-## Acceptance
+## Dirty workspaces and resumable installs
 
-The fixtures in `workspace-reconciliation.md` "Acceptance", run from published tarballs: an old published CLI upgrading
-a downstream repository; distinct compatible CLI and plugin versions; multi-version migrations; a linked CLI; dirty
-local extensions; a failed installation that resumes with the same versions; and a second `sync` that changes nothing.
+- Spec: `specs/cli/01_workspace_reconciliation.md:27-32` defines snapshot/conflict handling, preserves user edits and
+  records selected versions before network operations so a failed installation resumes the same release.
+- Code: `updateManagedFiles` has no upgrade snapshot/conflict policy or selected-release resume record.
+- Work: implement those safeguards around the upgrade, without discarding user edits or re-resolving a failed install.
+
+## Published-package fixtures
+
+- Spec: `specs/cli/01_workspace_reconciliation.md:34-38`, “Acceptance”, requires published-tarball fixtures for old-CLI
+  upgrades, distinct compatible CLI/plugin versions, migrations, linked CLI source, dirty extensions, install resume and
+  an unchanged second synchronization.
+- Code: the CLI has no fixture suite for that upgrade contract.
+- Work: add the specified published-package fixtures; source-import tests alone do not satisfy the contract.
