@@ -62,6 +62,13 @@ cowshed setup                          # install that build; `cowshed` on PATH n
 and only another install changes them ([gateway.md](gateway.md#start-at-login-launchd)). A later `cowshed setup` typed
 at the shell runs that installed copy, so it repairs the host but installs nothing new.
 
+The same directory also holds `cargo`, a relative link to the stable `cowshed` name. In the managed environment it comes
+first on `PATH` and launches the next real Cargo under the gateway's jobserver budget. Inherited jobservers,
+`bounded-exec` grants and non-compiling commands avoid a second grant; an absent gateway runs Cargo unbudgeted and says
+why. Install and failed-activation rollback switch the launcher and daemon to the same content-addressed bytes through
+the one stable name ([03 Caches](../../../specs/cowshed/03_caches.md), "The `cargo` jobserver launcher";
+[05 Gateway](../../../specs/cowshed/05_gateway.md#host-cpu-budget)).
+
 From a checkout of this repository, build the host's release CLI with `nx run cowshed:cli-<platform>:production`
 (`cli-arm64-macos` on Apple silicon; `nx build cowshed -c production` builds it too, with the TypeScript library and
 host Node-API addon), which writes `dist/bin/<platform>/cowshed`, then run that build's own setup:

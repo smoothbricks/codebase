@@ -813,24 +813,12 @@ pub fn plan_executable_install(
     InstallPlan { operations }
 }
 
-/// Plan the removal of `present`: files of the host-stable directory, in the order given.
-///
-/// Serves the uninstall, which removes the stable name before the copies it names so nothing
-/// launchd could start dangles, and the pruning of copies an install has replaced. Only those
-/// files: the enclosing directories are removed by nothing, because
-/// `~/Library/Application Support/dev.cowshed` is shared by every service and an empty directory
-/// costs nothing. No file to remove plans nothing, which is what makes a second uninstall a
-/// no-op rather than a failure.
-/// Plan the `cargo` link beside a cowshed stable name: the stored copy of the
-/// same build under the launcher's name, so the managed environment's first
-/// `cargo` on `PATH` is this build's jobserver launcher and moves with it in
-/// one rename. A link that already names that copy plans nothing.
-pub fn plan_launcher_link(
-    executable: &HostStableExecutable,
-    digest: &ExecutableDigest,
-    current: &StableLink,
-) -> InstallPlan {
-    let target = executable.stored_link(digest);
+/// Plan the `cargo` link to the relative stable cowshed name: one rename of
+/// that stable name publishes the same stored build for the launcher and
+/// daemon, including when a failed activation restores the previous build.
+/// A link that already names the stable name plans nothing.
+pub fn plan_launcher_link(executable: &HostStableExecutable, current: &StableLink) -> InstallPlan {
+    let target = PathBuf::from(executable.name());
     if *current == StableLink::To(target.clone()) {
         return InstallPlan {
             operations: Vec::new(),
@@ -853,6 +841,14 @@ pub fn plan_launcher_link(
     }
 }
 
+/// Plan the removal of `present`: files of the host-stable directory, in the order given.
+///
+/// Serves the uninstall, which removes the stable name before the copies it names so nothing
+/// launchd could start dangles, and the pruning of copies an install has replaced. Only those
+/// files: the enclosing directories are removed by nothing, because
+/// `~/Library/Application Support/dev.cowshed` is shared by every service and an empty directory
+/// costs nothing. No file to remove plans nothing, which is what makes a second uninstall a
+/// no-op rather than a failure.
 pub fn plan_executable_remove(
     executable: &HostStableExecutable,
     present: &[PathBuf],

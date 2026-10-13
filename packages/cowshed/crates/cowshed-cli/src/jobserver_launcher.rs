@@ -16,6 +16,8 @@
 //!   under its fifo, with the test-thread sizing set to the grant where
 //!   unset. With no gateway listening, `cargo` runs unbudgeted.
 
+use cowshed_os::fork_lock::Run as _;
+
 #[cfg(test)]
 use std::collections::BTreeMap;
 use std::env;
@@ -269,8 +271,8 @@ fn exec_with(arguments: &[OsString], environment: &[(String, String)]) -> i32 {
     };
     match Command::new(&cargo)
         .args(arguments)
-        .envs(environment.iter().cloned())
-        .status()
+        .envs(environment.iter().map(|(name, value)| (name, value)))
+        .status_locked()
     {
         Ok(status) => exit_code(status),
         Err(error) => {

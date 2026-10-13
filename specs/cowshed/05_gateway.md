@@ -95,6 +95,7 @@ reaches it after a reboot whatever volume the build came from (a workspace image
 | Name in `bin`            | What it is                                                                                     |
 | ------------------------ | ---------------------------------------------------------------------------------------------- |
 | `cowshed`                | The stable name: a symbolic link saying `cowshed-<sha256>`, relative to `bin`.                 |
+| `cargo`                  | The jobserver launcher: a relative link saying `cowshed`, so install and rollback switch both. |
 | `cowshed-<sha256>`       | A stored copy, named for the SHA-256 of its bytes (64 lowercase hex digits), mode 0755.        |
 | `cowshed-<sha256>.build` | That copy's build record, JSON `{"commit","commitTime"}`, written by a build that records one. |
 

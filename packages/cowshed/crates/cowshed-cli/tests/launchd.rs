@@ -1092,31 +1092,32 @@ fn current_install() -> ExecutableInstallState {
     }
 }
 
-/// The `cargo` link beside the stable name names the same stored copy, so the
-/// managed environment's jobserver launcher is the build `cowshed setup`
-/// installed and moves with it; a link that already names it plans nothing.
+/// The cargo link follows the stable name, so one publication or rollback
+/// switches the launcher and daemon to the same stored build.
 #[test]
-fn launcher_link_plan_names_the_stored_copy_beside_the_stable_name() {
+fn launcher_link_plan_follows_the_stable_name_beside_it() {
     let executable = cowshed_binary();
     let binary_directory = PathBuf::from(BINARY_DIRECTORY);
+    let stable_name = PathBuf::from(COWSHED_BINARY_NAME);
 
     assert_eq!(
-        plan_launcher_link(&executable, &digest(), &StableLink::Absent).operations(),
+        plan_launcher_link(&executable, &StableLink::Absent).operations(),
         [
             Mutation::CreateTemporarySymlink {
                 directory: binary_directory.clone(),
                 name_prefix: format!(".{JOBSERVER_LAUNCHER_NAME}.link."),
-                target: stored_name(),
+                target: stable_name.clone(),
             },
             Mutation::RenameTemporaryFile {
                 destination: binary_directory.join(JOBSERVER_LAUNCHER_NAME),
             },
             Mutation::SyncDirectory {
-                path: binary_directory,
+                path: binary_directory
             },
         ]
     );
-    assert!(plan_launcher_link(&executable, &digest(), &StableLink::To(stored_name())).is_noop());
+    assert!(plan_launcher_link(&executable, &StableLink::To(stable_name)).is_noop());
+    assert!(!plan_launcher_link(&executable, &StableLink::To(stored_name())).is_noop());
 }
 
 /// A copy of the build is stored once under the name its bytes give it, and the stable name moves
