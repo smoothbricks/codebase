@@ -390,9 +390,11 @@ the mount-flag truth table heals its final ownership-free mount by mountpoint. D
 assertions share the build-volume naming/reclamation walk. Push preservation and checked-land refusal/success share the
 plain-Git lifecycle walk, keeping the original Git-reference and no-write refusal oracles. Capacity-only refusal uses
 the existing recording host over a sparse RAW file, and an invalid first-mint capacity uses the pure filesystem store:
-neither needs an attached volume. Distinct adoption crash windows, registered-versus-restarted detach paths,
-writer-admission boundaries and durable deletion records remain separate oracles. The non-growing build-volume resize is
-refused as Usage on the held-conflict fixture before the holder is taken.
+neither needs an attached volume. Tests that share an attach are one scenario with phased assertions: adoption crash
+windows one world reaches in order are phases of that world, each window's state asserted before the next step.
+Registered-versus-restarted detach paths, writer-admission boundaries and durable deletion records keep their own
+oracles. The non-growing build-volume resize is refused as Usage on the held-conflict fixture before the holder is
+taken.
 
 Ordered scenarios reuse a step's resulting state instead of adopting another identical store. The Nx land walk checks
 ownership, seed identity, previous-volume reclamation, labels and linked mounts before main writes again, reseeds and
@@ -400,22 +402,24 @@ forks. Link displacement, doctor findings and exec relinking precede a workspace
 refusal precedes release of the opener, a new topic commit and database-holder refusal on the same warm main and topic;
 both distinct refusal variants, process identities and unchanged target volume are asserted. The successful first-touch
 volume also supplies the existing-link-wins case, whose unused competing mint is still released. These sequences remove
-duplicate setup, not real transitions: crash-injection states and source/target isolation witnesses remain separate.
+duplicate setup, not real transitions: each crash-injection state and source/target isolation witness keeps its own
+assertions.
 
 Staging GC derives backing-image and mountpoint paths in one preallocated buffer each. Both orphan branches borrow the
 parsed workspace for the deletion record rather than allocating a second name; mount GC also retains its parsed stem.
 
-The native inventory teardown regression runs the production read-only host-storage planner against the real home device
-while detaching a disposable RAW image. Attachment and teardown use the production APFS backend, including its per-image
-lease and image ownership checks, so independent Nextest runners cannot recycle another fixture's device. A barrier
-starts one real teardown beside the planner; measured operation intervals must overlap, and the selected home device and
-container must remain unchanged. The regression does not require machine-global `cowshed.store` installation on an
-ephemeral runner. Installation validation remains a separate contract and still refuses missing storage.
+The native inventory teardown regression runs the production read-only host-storage planner over a deterministic
+disk-state source that steps an unrelated image through its teardown: mounted, its mount gone while the registry still
+lists it, its container left with no volume, then gone. Each stage is one fixed kernel snapshot, so the ordering is
+proven by the stages rather than by overlapping wall-clock intervals, and no image is attached. At every stage the
+selected home device and container remain unchanged. The regression does not require machine-global `cowshed.store`
+installation on an ephemeral runner. Installation validation remains a separate contract and still refuses missing
+storage.
 
-Read-only planning reads the kernel snapshot once, with no retry (01_storage.md "Dedicated store volume"), while a real
-teardown departs beside it. A regression proves that the snapshot taken during that teardown still finds a reserved
-volume in another container. An incomplete snapshot, an invalid device name or a partially populated record is an error,
-never evidence that a reserved volume is absent, and mutation planning refuses it.
+Read-only planning reads the kernel snapshot once, with no retry (01_storage.md "Dedicated store volume"), while an
+unrelated image may be departing. The same regression proves that a snapshot taken at any teardown stage still finds a
+reserved volume in another container. An incomplete snapshot, an invalid device name or a partially populated record is
+an error, never evidence that a reserved volume is absent, and mutation planning refuses it.
 
 APFS diagnostics distinguish image-lease acquisition, a mint (`<leg>/mint`, its `clonefile` and attach inside it),
 template minting (`template/mint`, with blank-image creation and formatting inside it), raw-device pinning, image/device
