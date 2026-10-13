@@ -62,6 +62,9 @@
     },
     "cargo-test-group-real-apfs": {
       "dependsOn": ["..."]
+    },
+    "cargo-test-group-real-apfs-host": {
+      "dependsOn": ["...", "cargo-test-group-real-apfs"]
     }
   },
   "plugins": ["@smoothbricks/nx-plugin"],

@@ -1,16 +1,29 @@
-# The one declaration of the real-APFS serial group. The nx plugin derives its
-# runner `cargo-test-group-real-apfs` and every per-crate exclusion from these
-# two tables, so the filter is stated here and nowhere else but the group's
-# 30s wrapper rule below, which must name exactly the same tests.
+# The two real-APFS serial groups. The nx plugin derives each group's runner
+# `cargo-test-group-<group>` and every per-crate exclusion from these tables, so a
+# group's filter is stated here and nowhere else but the wrapper rules below, which
+# must name exactly the same tests as the two groups together.
 #
-# `max-threads = 1` serializes the group within its one runner process; ordinary
-# per-crate runners exclude these tests with `not (…)` so each runs in exactly one
-# target. The platform is the one the plugin honours: the group applies on macOS
-# hosts, where the host disk lease exists, and the planner infers no runner elsewhere.
+# There are two groups so that each runner hashes only the crates its tests can come
+# from: every clause of a group's filter starts with `package(<crate>)`, and the plugin
+# reads that scope off the filter (`filterScope`). A clause without one widens its
+# group's inputs to the whole workspace again.
+#
+#   real-apfs       the `cowshed-apfs` crate's own real-image tests: the device layer.
+#   real-apfs-host  the real-image tests that remain in `cowshed-core` and `cowshed-cli`,
+#                   which run on top of that layer.
+#
+# `max-threads = 1` serializes a group within its one runner process. It cannot order one
+# group against the other, which are two runners: Nx does, through the explicit
+# `cargo-test-group-real-apfs-host` -> `cargo-test-group-real-apfs` edge in the targetDefaults
+# of nx.json, so two real-image runners never contend for the host's disk lease at once.
+# Ordinary per-crate runners exclude both groups with `not (…)`, so each test runs in exactly
+# one target. The platform is the one the plugin honours: the groups apply on macOS hosts,
+# where the host disk lease exists, and the planner infers no runner elsewhere.
 #
 # The exact-name clause is nextest's fully qualified name (module path included),
 # because `test(=…)` matches the whole name. Two inventory rows are deliberately
-# `#[ignore]`d host-controller and contention lanes and stay out of this group.
+# `#[ignore]`d host-controller and contention lanes and stay out of these groups.
+# `clone_intent_recovery` runs on the directory substrate and belongs to neither group.
 #
 # A test's performance bound is on its code time, not its wall time
 # (specs/cowshed/08_testing.md, "Integration tests (real substrate)"): part of
@@ -24,14 +37,29 @@ experimental = ["wrapper-scripts"]
 [test-groups.real-apfs]
 max-threads = 1
 
+[test-groups.real-apfs-host]
+max-threads = 1
+
 [[profile.default.overrides]]
-filter = 'test(/real_apfs_/) or binary(apfs_native_macos) or binary(clone_intent_recovery) or test(=storage::apfs::native::build_volumes::tests::a_jobs_volumes_count_from_admission_through_its_command_to_its_sealed_record)'
+filter = 'package(cowshed-apfs) and test(/real_apfs_/)'
 platform = 'cfg(target_os="macos")'
 test-group = 'real-apfs'
 slow-timeout = { period = "180s", terminate-after = 1 }
 
+[[profile.default.overrides]]
+filter = 'package(cowshed-core) and (test(/real_apfs_/) or binary(apfs_native_macos) or test(=storage::apfs::native::build_volumes::tests::a_jobs_volumes_count_from_admission_through_its_command_to_its_sealed_record))'
+platform = 'cfg(target_os="macos")'
+test-group = 'real-apfs-host'
+slow-timeout = { period = "180s", terminate-after = 1 }
+
+[[profile.default.overrides]]
+filter = 'package(cowshed-cli) and test(/real_apfs_/)'
+platform = 'cfg(target_os="macos")'
+test-group = 'real-apfs-host'
+slow-timeout = { period = "180s", terminate-after = 1 }
+
 # The two performance classes. The wrapper is run from the plugin's shipped
-# source, which the group's runner hashes as an input.
+# source, which each group's runner hashes as an input.
 [scripts.wrapper.real-apfs-code-30s]
 command = { command-line = "node_modules/@smoothbricks/nx-plugin/src/nextest-code-bound.ts 30", relative-to = "workspace-root" }
 
@@ -47,13 +75,27 @@ command = { command-line = "node_modules/@smoothbricks/nx-plugin/src/nextest-cod
 # it would pay that attach again per piece. The genuine-Nx walks measured up to
 # 45.4s of code time on a loaded host, lease waits excluded; 08_testing.md has the
 # numbers. The fast `real_apfs_*` unit tests keep 30s. The first matching rule
-# wins, so this one precedes the group's default class.
+# wins, so this one precedes the groups' default class.
 [[profile.default.scripts]]
 filter = 'test(/real_apfs_.*_substrate_lifecycle/)'
 platform = 'cfg(target_os="macos")'
 run-wrapper = 'real-apfs-code-60s'
 
+# The groups' default class. A config file has no `group()` predicate, so these three
+# rules repeat the three overrides' filters verbatim, one for one: together they name
+# exactly the tests the two groups hold, and a wrapper rule any wider would bind ordinary
+# tests to a real-image class. serial-group-wiring.test.ts compares them.
 [[profile.default.scripts]]
-filter = 'test(/real_apfs_/) or binary(apfs_native_macos) or binary(clone_intent_recovery) or test(=storage::apfs::native::build_volumes::tests::a_jobs_volumes_count_from_admission_through_its_command_to_its_sealed_record)'
+filter = 'package(cowshed-apfs) and test(/real_apfs_/)'
+platform = 'cfg(target_os="macos")'
+run-wrapper = 'real-apfs-code-30s'
+
+[[profile.default.scripts]]
+filter = 'package(cowshed-core) and (test(/real_apfs_/) or binary(apfs_native_macos) or test(=storage::apfs::native::build_volumes::tests::a_jobs_volumes_count_from_admission_through_its_command_to_its_sealed_record))'
+platform = 'cfg(target_os="macos")'
+run-wrapper = 'real-apfs-code-30s'
+
+[[profile.default.scripts]]
+filter = 'package(cowshed-cli) and test(/real_apfs_/)'
 platform = 'cfg(target_os="macos")'
 run-wrapper = 'real-apfs-code-30s'
