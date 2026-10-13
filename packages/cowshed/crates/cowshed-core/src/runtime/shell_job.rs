@@ -44,27 +44,29 @@ use super::supervisor::{
 use crate::api::dto::{ExitStatus, JobId, Sha256Digest};
 use crate::error::{CowshedError, Result};
 use crate::exec::{
-    ExecError, ProfileFile, SANDBOX_EXEC, classify_spawn_error, prepare_child_descriptors,
-    sandbox_exec_args,
+    ExecError, ProfileLaunch, SANDBOX_EXEC, classify_spawn_error, prepare_child_descriptors,
 };
 use crate::storage::job_artifact::StreamKind;
 use cowshed_os::fork_lock::Spawn as _;
 
 /// Everything that makes one warm shell interchangeable with another: the same profile (mode
-/// and grants), the same sandbox environment, the same `.envrc` or none, the same host program.
+/// and grants) bound to the same build volume, the same sandbox environment, the same `.envrc`
+/// or none, the same host program.
 fn pool_key(
-    profile: &str,
+    profile: &ProfileLaunch,
     environment: &BTreeMap<OsString, OsString>,
     envrc_directory: Option<&Path>,
     grant_revision: u64,
     program: &ShellHostProgram,
 ) -> Sha256Digest {
-    let mut bytes = Vec::with_capacity(profile.len() + 4096);
+    let mut bytes = Vec::with_capacity(4096);
     let mut field = |value: &[u8]| {
         bytes.extend_from_slice(&u64::try_from(value.len()).unwrap_or(u64::MAX).to_le_bytes());
         bytes.extend_from_slice(value);
     };
-    field(profile.as_bytes());
+    for part in profile.identity() {
+        field(part.as_bytes());
+    }
     match envrc_directory {
         Some(directory) => {
             field(b"envrc");
@@ -130,8 +132,9 @@ impl WorkspaceShells {
         events: mpsc::Sender<ProcessEvent>,
     ) -> Result<Box<dyn RunningProcess>> {
         let base = spawn.environment.base();
+        let launch = spawn.profile.launch()?;
         let key = pool_key(
-            spawn.profile.text(),
+            &launch,
             &base,
             spawn.envrc_directory.as_deref(),
             spawn.grant_revision,
@@ -145,7 +148,7 @@ impl WorkspaceShells {
                     Arc::new(HostActivator {
                         program: self.program.clone(),
                         workspace_mount: spawn.workspace_mount.clone(),
-                        profile: spawn.profile.file()?,
+                        profile: launch,
                         environment: base,
                         envrc_directory: spawn.envrc_directory.clone(),
                     }),
@@ -999,8 +1002,7 @@ enum HostActivation {
 pub(super) struct HostActivator {
     program: ShellHostProgram,
     workspace_mount: PathBuf,
-    /// Held for as long as the activator may start hosts under it.
-    profile: Arc<ProfileFile>,
+    profile: ProfileLaunch,
     environment: BTreeMap<OsString, OsString>,
     /// `None` for a workspace with no shell configuration: its hosts hold the sandbox
     /// environment itself, which no workspace file can make stale.
@@ -1025,7 +1027,7 @@ impl HostActivator {
         let theirs_raw = theirs.as_raw_fd();
         let mut command = tokio::process::Command::new(SANDBOX_EXEC);
         command
-            .args(sandbox_exec_args(&self.profile))
+            .args(self.profile.args())
             .arg(&staged)
             .args(self.program.arguments())
             .env_clear()

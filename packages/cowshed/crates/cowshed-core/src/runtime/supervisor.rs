@@ -31,8 +31,8 @@ use crate::api::resources::{
 };
 use crate::error::{AdmissionField, AdmissionRefusal, CowshedError, Result, StdinRefusal};
 use crate::exec::{
-    ExecError, ProfileFile, SandboxExecRequest, SpawnPlan, classify_spawn_error, plan_exec_under,
-    prepare_child_descriptors,
+    ExecError, ProfileFile, ProfileLaunch, SandboxExecRequest, SpawnPlan, classify_spawn_error,
+    plan_exec_under, prepare_child_descriptors,
 };
 use crate::metadata::{WorkspaceIncarnation, WorkspaceName, WorkspaceRole};
 use crate::repository::{OwnedRepoIds, RepoId};
@@ -390,45 +390,49 @@ struct RenderedPolicy {
     read_only_child: ChildProfile,
 }
 
-/// An executed-child profile, rendered, and the file `sandbox-exec -f` reads it from, written
-/// by the first spawn that runs under it. Every spawn under the render shares that file, and
-/// holds it until its child exits.
+/// An executed-child profile, rendered, the build volume its launches bind, and the file
+/// `sandbox-exec -f` reads it from, made sure of by the first spawn under the render. The text
+/// depends only on the workspace's authority, so renders before and after a build-volume pivot
+/// share one file and differ only in the binding.
 #[derive(Debug)]
 pub struct ChildProfile {
     text: String,
-    file: std::sync::OnceLock<Arc<ProfileFile>>,
+    build_volume: Option<PathBuf>,
+    file: std::sync::OnceLock<ProfileFile>,
 }
 
 impl ChildProfile {
-    fn new(text: String) -> Self {
+    fn new(text: String, sandbox: &SandboxConfig) -> Self {
         Self {
             text,
+            build_volume: sandbox.build_volume_mount.clone(),
             file: std::sync::OnceLock::new(),
         }
     }
 
-    /// The rendered profile: what tells one warm shell's sandbox from another's.
+    /// The rendered profile.
     pub fn text(&self) -> &str {
         &self.text
     }
 
-    /// The profile's file, written now when no spawn has written it yet.
-    pub fn file(&self) -> Result<Arc<ProfileFile>> {
-        if let Some(file) = self.file.get() {
-            return Ok(Arc::clone(file));
-        }
-        let written = ProfileFile::write(&self.text).map_err(|error| {
-            CowshedError::environment_missing(
-                format!(
-                    "cannot write the sandbox profile into {}: {error}",
-                    crate::exec::profile_directory().display()
-                ),
-                "run `cowshed setup` so the store's run directory exists and is yours",
-            )
-        })?;
-        // A concurrent first spawn may have set it meanwhile: its file is the render's, and this
-        // one is removed as it drops.
-        Ok(Arc::clone(self.file.get_or_init(|| written)))
+    /// How a launch is told this profile: its file, written now when absent, and its binding.
+    pub fn launch(&self) -> Result<ProfileLaunch> {
+        let file = match self.file.get() {
+            Some(file) => file.clone(),
+            None => {
+                let written = ProfileFile::write(&self.text).map_err(|error| {
+                    CowshedError::environment_missing(
+                        format!(
+                            "cannot write the sandbox profile into {}: {error}",
+                            crate::exec::profile_directory().display()
+                        ),
+                        "run `cowshed setup` so the store's run directory exists and is yours",
+                    )
+                })?;
+                self.file.get_or_init(|| written).clone()
+            }
+        };
+        Ok(ProfileLaunch::bound(file, self.build_volume.clone()))
     }
 }
 
@@ -452,11 +456,14 @@ impl SandboxPolicy {
         // not one this supervisor may hold.
         render(&ceiling, SandboxProfileRole::TrustedSupervisor)?;
         Ok(Self(std::sync::Arc::new(RenderedPolicy {
-            ceiling_child: ChildProfile::new(render(&ceiling, SandboxProfileRole::ExecutedChild)?),
-            read_only_child: ChildProfile::new(render(
+            ceiling_child: ChildProfile::new(
+                render(&ceiling, SandboxProfileRole::ExecutedChild)?,
+                &ceiling,
+            ),
+            read_only_child: ChildProfile::new(
+                render(&read_only, SandboxProfileRole::ExecutedChild)?,
                 &read_only,
-                SandboxProfileRole::ExecutedChild,
-            )?),
+            ),
             ceiling,
             read_only,
         })))
@@ -978,7 +985,8 @@ fn wrap_one_shot(plan: &mut SpawnPlan, shell: &crate::capabilities::ShellActivat
         OsString::from(shell.label),
         shell.directory.as_os_str().to_owned(),
     ];
-    activation.extend(plan.args.drain(3..));
+    let command = plan.command_start();
+    activation.extend(plan.args.drain(command..));
     plan.args.extend(activation);
 }
 
@@ -990,8 +998,12 @@ fn one_shot_plan(
     cwd: PathBuf,
     argv: Vec<OsString>,
 ) -> Result<SpawnPlan> {
-    let mut plan = plan_exec_under(SandboxExecRequest { argv, cwd }, sandbox, &profile.file()?)
-        .map_err(map_exec_error)?;
+    let mut plan = plan_exec_under(
+        SandboxExecRequest { argv, cwd },
+        sandbox,
+        &profile.launch()?,
+    )
+    .map_err(map_exec_error)?;
     if let Some(shell) = &sandbox.capabilities.contribution.shell {
         wrap_one_shot(&mut plan, shell);
     }
@@ -1749,9 +1761,6 @@ impl SpawnSink for SystemSpawnSink {
             events.clone(),
         ));
         let watcher = std::sync::Arc::clone(&fence);
-        // `sandbox-exec` reads its profile file after this spawn returns, and a re-render may
-        // drop the policy that wrote it meanwhile: the leader's exit releases it.
-        let profile = plan.profile;
         tokio::spawn(async move {
             let event = match watcher.exited().await {
                 Ok(exit) => ProcessEvent::Exited { job_id, exit },
@@ -1763,7 +1772,6 @@ impl SpawnSink for SystemSpawnSink {
                     ProcessEvent::WaitFailed { job_id, error }
                 }
             };
-            drop(profile);
             let _ = events.send(event).await;
         });
         Ok(Box::new(SystemRunningProcess {

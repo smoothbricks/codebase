@@ -211,7 +211,6 @@ async fn probe_git(root: &Path, args: &[&str], sandbox: &SandboxConfig) -> Resul
     let profile =
         crate::sandbox::seatbelt_profile(sandbox, crate::sandbox::SandboxProfileRole::GitDiscovery)
             .map_err(|error| failure(error.to_string()))?;
-    // Held until the probe has been collected below, long after `sandbox-exec` read it.
     let profile = crate::exec::ProfileFile::write(&profile).map_err(|error| {
         failure(format!(
             "cannot write the Git probe's sandbox profile into {}: {error}",
@@ -222,7 +221,7 @@ async fn probe_git(root: &Path, args: &[&str], sandbox: &SandboxConfig) -> Resul
     // The system selector names the active developer tools without consulting PATH.
     // /usr/bin/git is an xcrun shim that writes host caches even for read-only probes.
     command
-        .args(crate::exec::sandbox_exec_args(&profile))
+        .args(crate::exec::ProfileLaunch::new(profile, sandbox).args())
         .args(["/var/select/developer_dir/usr/bin/git", "-C"])
         .arg(root)
         .args([

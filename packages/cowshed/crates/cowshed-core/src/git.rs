@@ -2446,7 +2446,7 @@ fn registered_worktree_git_dir(root: &Path) -> Result<Option<PathBuf>> {
 /// transports. Run it with the GitDiscovery policy: writable only in this
 /// checkout; other trees require controller-supplied, explicit roots.
 #[cfg(target_os = "macos")]
-pub fn sandboxed_git_command_at(root: &Path) -> Result<SandboxedGit> {
+pub fn sandboxed_git_command_at(root: &Path) -> Result<std::process::Command> {
     sandboxed_git_command_with_paths(root, None, None)
 }
 
@@ -2456,7 +2456,7 @@ pub fn sandboxed_git_command_at(root: &Path) -> Result<SandboxedGit> {
 pub(crate) fn sandboxed_git_command_with_read(
     root: &Path,
     readable: &Path,
-) -> Result<SandboxedGit> {
+) -> Result<std::process::Command> {
     sandboxed_git_command_with_paths(root, Some(readable), None)
 }
 
@@ -2465,7 +2465,7 @@ fn sandboxed_git_command_with_paths(
     root: &Path,
     readable: Option<&Path>,
     writable: Option<&Path>,
-) -> Result<SandboxedGit> {
+) -> Result<std::process::Command> {
     use crate::sandbox::{
         RunSandboxMode, SandboxConfig, SandboxGrants, SandboxProfileRole, seatbelt_profile,
     };
@@ -2572,7 +2572,7 @@ fn sandboxed_git_command_with_paths(
     let git = git_command_at(&canonical);
     let mut command = std::process::Command::new(crate::exec::SANDBOX_EXEC);
     command
-        .args(crate::exec::sandbox_exec_args(&profile))
+        .args(crate::exec::ProfileLaunch::new(profile, &config).args())
         .arg("/var/select/developer_dir/usr/bin/git");
     command.args(git.get_args());
     for (name, value) in git.get_envs() {
@@ -2595,15 +2595,7 @@ fn sandboxed_git_command_with_paths(
     if let Some(identity) = workspace_git_identity_config(&canonical)? {
         command.env("GIT_CONFIG_GLOBAL", identity);
     }
-    Ok(SandboxedGit { command, profile })
-}
-
-/// A sandboxed controller Git command and the profile file it runs under, which it holds until
-/// the command has run.
-#[cfg(target_os = "macos")]
-pub struct SandboxedGit {
-    pub command: std::process::Command,
-    pub profile: std::sync::Arc<crate::exec::ProfileFile>,
+    Ok(command)
 }
 
 /// The one spelling of "git itself could not run", so the same failure never carries two
@@ -2636,10 +2628,7 @@ where
     S: AsRef<OsStr>,
 {
     #[cfg(target_os = "macos")]
-    let SandboxedGit {
-        command: git,
-        profile: _profile,
-    } = sandboxed_git_command_with_paths(root, alternate_objects, writable)?;
+    let git = sandboxed_git_command_with_paths(root, alternate_objects, writable)?;
     #[cfg(not(target_os = "macos"))]
     let git = git_command_at(root);
     let mut command = Command::from(git);
@@ -3099,9 +3088,8 @@ mod tests {
         let main = main.canonicalize().expect("canonical main");
         let workspace = workspace.canonicalize().expect("canonical workspace");
         let source = main.to_str().expect("UTF-8 fixture");
-        let mut denied = super::sandboxed_git_command_at(&workspace).expect("narrow Git");
-        let denied = denied
-            .command
+        let denied = super::sandboxed_git_command_at(&workspace)
+            .expect("narrow Git")
             .args(["fetch", "--no-tags", source])
             .output_locked()
             .expect("sandboxed fetch");
@@ -3109,10 +3097,8 @@ mod tests {
             !denied.status.success(),
             "a repository URL cannot grant its own read"
         );
-        let mut admitted =
-            super::sandboxed_git_command_with_read(&workspace, &main).expect("trusted read grant");
-        let admitted = admitted
-            .command
+        let admitted = super::sandboxed_git_command_with_read(&workspace, &main)
+            .expect("trusted read grant")
             .args(["fetch", "--no-tags", source])
             .output_locked()
             .expect("sandboxed fetch");

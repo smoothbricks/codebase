@@ -3,7 +3,6 @@ use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
-use std::sync::Arc;
 
 use crate::repository::is_lexically_canonical;
 use crate::sandbox::{SandboxConfig, SandboxError, SandboxProfileRole, seatbelt_profile};
@@ -16,7 +15,7 @@ mod macos;
 mod other;
 mod profile_file;
 
-pub use profile_file::{ProfileFile, profile_directory};
+pub use profile_file::{ProfileFile, ProfileLaunch, profile_directory};
 
 pub const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 
@@ -27,25 +26,22 @@ pub struct SandboxExecRequest {
     pub cwd: PathBuf,
 }
 
-/// A `sandbox-exec -f <profile> -- argv` launch. The plan holds its profile file, so the file
-/// lives for as long as anything that may still launch or wait on the plan does.
+/// A `sandbox-exec [-D NAME=value…] -f <profile> -- argv` launch.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SpawnPlan {
     pub program: PathBuf,
     pub args: Vec<OsString>,
     pub cwd: PathBuf,
-    pub profile: Arc<ProfileFile>,
 }
 
-/// The arguments that run what follows them under the profile in `profile`, before the
-/// command's own argv: the profile travels in a file, never as an argument (07_api.md,
-/// `SandboxSpec::wrap`).
-pub fn sandbox_exec_args(profile: &ProfileFile) -> [&OsStr; 3] {
-    [
-        OsStr::new("-f"),
-        profile.path().as_os_str(),
-        OsStr::new("--"),
-    ]
+impl SpawnPlan {
+    /// Where the command's own argv starts: after `sandbox-exec`'s `--`.
+    pub fn command_start(&self) -> usize {
+        self.args
+            .iter()
+            .position(|argument| argument == "--")
+            .map_or(0, |end| end + 1)
+    }
 }
 
 #[derive(Debug)]
@@ -115,7 +111,7 @@ pub fn plan_exec(
         ),
         source: Some(source),
     })?;
-    plan_exec_under(request, sandbox, &profile)
+    plan_exec_under(request, sandbox, &ProfileLaunch::new(profile, sandbox))
 }
 
 /// [`plan_exec`] under an executed-child `profile` already rendered from `sandbox`: a workspace
@@ -123,20 +119,18 @@ pub fn plan_exec(
 pub fn plan_exec_under(
     request: SandboxExecRequest,
     sandbox: &SandboxConfig,
-    profile: &Arc<ProfileFile>,
+    profile: &ProfileLaunch,
 ) -> Result<SpawnPlan, ExecError> {
     validate_argv(&request.argv)?;
     let cwd = contained_cwd(&sandbox.workspace_mount, &request.cwd)?;
 
-    let mut args = Vec::with_capacity(request.argv.len() + 3);
-    args.extend(sandbox_exec_args(profile).map(OsString::from));
+    let mut args = profile.args();
     args.extend(request.argv);
 
     Ok(SpawnPlan {
         program: PathBuf::from(SANDBOX_EXEC),
         args,
         cwd,
-        profile: Arc::clone(profile),
     })
 }
 
@@ -532,11 +526,6 @@ mod tests {
                 capabilities: Default::default(),
             }
         }
-
-        /// A profile file for a plan these tests run without `sandbox-exec`.
-        fn profile(&self) -> Arc<ProfileFile> {
-            ProfileFile::write_in(&self.root.join("profiles"), "(version 1)").unwrap()
-        }
     }
 
     impl Drop for TestTree {
@@ -616,7 +605,6 @@ mod tests {
                 program: PathBuf::from("false"),
                 args: vec![],
                 cwd: tree.cwd.clone(),
-                profile: tree.profile(),
             })
             .unwrap();
         assert_eq!(status.code(), Some(1));
@@ -630,7 +618,6 @@ mod tests {
                 program: tree.root.join("missing-executable"),
                 args: vec![],
                 cwd: tree.cwd.clone(),
-                profile: tree.profile(),
             })
             .unwrap_err();
         assert_eq!(failure.stage, WrapperStage::Spawn);
@@ -660,7 +647,6 @@ mod tests {
                     OsString::from(format!("test ! -e /dev/fd/{descriptor}")),
                 ],
                 cwd: tree.cwd.clone(),
-                profile: tree.profile(),
             })
             .unwrap();
 
@@ -1110,7 +1096,6 @@ mod tests {
                 program: PathBuf::from("sh"),
                 args: vec![OsString::from("-c"), OsString::from(&script)],
                 cwd: tree.cwd.clone(),
-                profile: tree.profile(),
             }) {
                 Ok(status) if status.success() => {}
                 Ok(status) => {
@@ -1143,7 +1128,11 @@ mod tests {
         let plan = plan_exec(request, &tree.sandbox()).unwrap();
         assert_eq!(plan.program, Path::new(SANDBOX_EXEC));
         assert_eq!(plan.args[0], "-f");
-        assert_eq!(plan.args[1], plan.profile.path().as_os_str());
+        assert!(
+            Path::new(&plan.args[1]).starts_with(profile_directory()),
+            "{:?}",
+            plan.args[1]
+        );
         assert_eq!(plan.args[2], "--");
         assert_eq!(
             &plan.args[3..],
@@ -1164,7 +1153,7 @@ mod tests {
             &sandbox,
         )
         .unwrap();
-        let planned_profile = std::fs::read_to_string(plan.profile.path()).unwrap();
+        let planned_profile = std::fs::read_to_string(&plan.args[1]).unwrap();
         let child = seatbelt_profile(&sandbox, SandboxProfileRole::ExecutedChild).unwrap();
         let supervisor = seatbelt_profile(&sandbox, SandboxProfileRole::TrustedSupervisor).unwrap();
 
