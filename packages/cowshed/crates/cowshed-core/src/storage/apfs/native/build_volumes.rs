@@ -1086,23 +1086,6 @@ mod tests {
                 build_mount,
             }
         }
-
-        fn release(
-            self,
-            host: &MacOsApfsExecutionHost<SystemCommandRunner>,
-            layout: &BuildVolumeLayout,
-        ) {
-            host.backend
-                .unmount_verified(&self.attachment, DetachIntent::WhenIdle)
-                .expect("unmount the workspace");
-            host.backend
-                .detach(&self.attachment, DetachIntent::Release)
-                .expect("detach the workspace");
-            assert_eq!(
-                host.release_build_volume(layout, &self.build_id).unwrap(),
-                Release::Deleted { refused: None }
-            );
-        }
     }
 
     /// Every regular file and directory under `root` with its bytes and modification time.
@@ -1304,17 +1287,13 @@ mod tests {
     /// workspace's own container moves neither delta, which a container-wide reading would by the
     /// sibling's whole 32 MiB. A mountpoint its volume has left is a typed failure, never the
     /// parent volume's usage.
-    #[test]
-    fn real_apfs_volume_usage_reads_the_owned_volumes_and_nothing_else() {
+    fn prove_owned_volume_usage(root: &Path, lane: &Lane) {
         use crate::api::resources::VolumeUsage;
         use crate::runtime::volume_usage::{
             VolumeAtSpawn, VolumeBaseline, VolumeStat as _, VolumeStatError,
         };
         use crate::storage::apfs::native::{ApfsVolume, ApfsVolumeStat};
 
-        let root = crate::scratch_apfs::ScratchRoot::new("volume-usage").expect("scratch root");
-        let (host, layout) = fixture(root.path());
-        let lane = Lane::mount(root.path(), &host, &layout);
         let (attachment, checkout, named) = (&lane.attachment, &lane.checkout, &lane.build_mount);
 
         // A sibling volume in the workspace's own container, nothing to do with the job.
@@ -1324,7 +1303,7 @@ mod tests {
             .map(|(container, _)| container)
             .expect("an APFS volume device is <container>s<n>");
         let added = add_volume(container, "sibling");
-        let sibling = root.path().join("sibling");
+        let sibling = root.join("sibling");
         fs::create_dir_all(&sibling).unwrap();
         diskutil(&["mount", "-mountPoint", sibling.to_str().unwrap(), &added]);
 
@@ -1407,8 +1386,6 @@ mod tests {
             matches!(ApfsVolume::capture(&sibling), Err(VolumeStatError::Read(_))),
             "a directory on its parent's volume is no volume"
         );
-
-        lane.release(&host, &layout);
     }
 
     /// A release takes an image whose container holds a volume beside the image's own, as a test
@@ -1417,8 +1394,11 @@ mod tests {
     /// attachment and no mount. (A 1 GiB test container holds at most two volumes.) What attaches,
     /// verifies or looks up one attachment still refuses the image, attached before the release
     /// and attached afresh after.
-    #[test]
-    fn real_apfs_release_takes_every_volume_of_an_image_and_its_whole_disk_once() {
+    fn prove_multi_volume_release(
+        root: &Path,
+        host: &MacOsApfsExecutionHost<SystemCommandRunner>,
+        attachment: &cowshed_apfs::AttachedImage,
+    ) {
         use cowshed_apfs::ApfsError;
         let one_volume_refusal = |error: &ApfsError| {
             matches!(error,
@@ -1428,20 +1408,7 @@ mod tests {
                         && message.matches("/dev/disk").count() == 2)
         };
 
-        let root =
-            crate::scratch_apfs::ScratchRoot::new("two-volume-release").expect("scratch root");
-        let (host, _) = fixture(root.path());
-        let image = root.path().join("store/lane.dmg");
-        crate::blank_image::blank_image(&image);
-        let attachment = host
-            .backend
-            .attach_verified(&image)
-            .expect("attach the image");
-        let checkout = root.path().join("lane");
-        fs::create_dir_all(&checkout).unwrap();
-        host.backend
-            .mount(&attachment, &checkout, MountAccess::ReadWrite, false)
-            .expect("mount the image");
+        let image = root.join("store/lane.dmg");
         let container = cowshed_apfs::device::container_of(
             attachment
                 .volume_device()
@@ -1450,7 +1417,7 @@ mod tests {
         )
         .expect("APFS volume names its synthesized container");
         let sibling = add_volume(container, "sibling");
-        let sibling_mount = root.path().join("sibling");
+        let sibling_mount = root.join("sibling");
         fs::create_dir_all(&sibling_mount).unwrap();
         diskutil(&[
             "mount",
@@ -1466,7 +1433,7 @@ mod tests {
         );
         let unmounted = host
             .backend
-            .unmount_verified(&attachment, DetachIntent::WhenIdle);
+            .unmount_verified(attachment, DetachIntent::WhenIdle);
         assert!(
             unmounted.as_ref().is_err_and(one_volume_refusal),
             "{unmounted:?}"
@@ -1476,7 +1443,7 @@ mod tests {
             .expect("release every volume of the image");
         let held = host.backend.attached_whole_devices(&image).unwrap();
         assert!(held.is_empty(), "the image is still attached as {held:?}");
-        let scratch = fs::canonicalize(root.path()).unwrap();
+        let scratch = fs::canonicalize(root).unwrap();
         let left: Vec<_> = host
             .mount_source
             .mounts()
@@ -1546,14 +1513,11 @@ mod tests {
         )
     }
 
-    /// A job's volumes through the supervisor that runs it, on real APFS volumes. The baseline is
-    /// read at admission, before the job's first process is dispatched: the activation writes 8
-    /// MiB into the workspace before its spawn even returns, and the first sample counts it. The
-    /// command that takes the lead keeps that baseline, so its 16 MiB in the workspace and 4 MiB
-    /// through the build-state link add to it. The terminal sample is sealed with each volume's
-    /// usage, and a store opened afresh reads the same sample back.
+    /// One pair of real volumes proves owned-volume stats, admission-through-terminal job
+    /// accounting, and whole-image release after an extra sibling volume is added. The phases
+    /// share their workspace/build attachments; each sample takes its own baseline.
     #[tokio::test]
-    async fn a_jobs_volumes_count_from_admission_through_its_command_to_its_sealed_record() {
+    async fn real_apfs_owned_volume_usage_and_job_accounting_through_multi_volume_release() {
         use crate::api::dto::{ExecCommand, ExecRequest, ExitStatus, JobId, StdinSource};
         use crate::runtime::job_groups::Birth;
         use crate::runtime::supervisor::{
@@ -1654,6 +1618,7 @@ mod tests {
         let root = crate::scratch_apfs::ScratchRoot::new("job-volumes").expect("scratch root");
         let (host, layout) = fixture(root.path());
         let lane = Lane::mount(root.path(), &host, &layout);
+        prove_owned_volume_usage(root.path(), &lane);
         let defaults = WorkspaceSupervisorConfig::default();
         let config = WorkspaceSupervisorConfig {
             workspace_root: lane.checkout.clone(),
@@ -1826,6 +1791,10 @@ mod tests {
         );
 
         reap(command);
-        lane.release(&host, &layout);
+        assert_eq!(
+            host.release_build_volume(&layout, &lane.build_id).unwrap(),
+            Release::Deleted { refused: None }
+        );
+        prove_multi_volume_release(root.path(), &host, &lane.attachment);
     }
 }
