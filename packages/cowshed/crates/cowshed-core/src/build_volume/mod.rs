@@ -622,6 +622,7 @@ impl BuildVolumeLayout {
         }
     }
 
+    #[cfg(target_os = "macos")]
     /// The same actual-image hold probed for preview, without creating a missing hold file.
     pub(crate) fn held_re_adopt_source(
         &self,
@@ -631,6 +632,7 @@ impl BuildVolumeLayout {
         hold_is_held(&self.source_hold_path(id, image)?)
     }
 
+    #[cfg(target_os = "macos")]
     fn source_hold_path(&self, id: &BuildVolumeId, image: &Path) -> io::Result<PathBuf> {
         if image.parent() != Some(self.images.as_path())
             || image.file_stem().and_then(|stem| stem.to_str()) != Some(id.as_str())
