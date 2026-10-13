@@ -11,6 +11,8 @@ use tokio::task::JoinHandle;
 use url::Url;
 
 #[cfg(target_os = "macos")]
+use super::storage_host::RuntimeStorageHost;
+#[cfg(target_os = "macos")]
 use crate::api::dto::AbandonedWork;
 #[cfg(target_os = "macos")]
 use crate::api::dto::GitOid;
@@ -38,15 +40,13 @@ use crate::api::server::{
     ConnectionAuthority, EventSource, RouterCommand, RouterHandle, RouterRequest, RouterResponse,
 };
 use crate::error::{CowshedError, ErrorCode, Result};
-#[cfg(target_os = "macos")]
-use cowshed_os::fork_lock::RunAsync as _;
 use crate::metadata::WorkspaceName;
 #[cfg(target_os = "macos")]
 use crate::repository::OwnedRepoIds;
 use crate::repository::{RepoId, RepositoryBinding};
 use crate::runtime::job_progress::JobProgressStream;
 #[cfg(target_os = "macos")]
-use super::storage_host::RuntimeStorageHost;
+use cowshed_os::fork_lock::RunAsync as _;
 #[cfg(target_os = "macos")]
 use cowshed_os::timing::timed_async;
 
@@ -2713,6 +2713,11 @@ fn verified_recovery_facts<'a>(
 
 #[cfg(target_os = "macos")]
 impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one project open: root, bootstrap mode, repository, continuity, validation, \
+                  recovery scope, supplied storage and the backend's host constructor"
+    )]
     async fn open(
         project_root: &Path,
         bootstrap_mode: crate::storage::bootstrap::native::NativeBootstrapMode,
@@ -6134,7 +6139,8 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         name: &WorkspaceName,
     ) -> Result<super::supervisor::WorkspaceSupervisorHandle> {
         cowshed_os::timing::spanned("supervisor", "binding", self.validate_binding()).await?;
-        let current = cowshed_os::timing::spanned("supervisor", "inventory", self.current(name)).await?;
+        let current =
+            cowshed_os::timing::spanned("supervisor", "inventory", self.current(name)).await?;
         self.ensure_supervisor_for(current).await
     }
 
@@ -8174,7 +8180,8 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         // gets: opening a project starts none, and waits on none. An inspecting host replays
         // nothing; doctor reports each unfinished intent instead.
         if self.recovery_scope.repairs() {
-            cowshed_os::timing::spanned("recover", "intents", self.recover_lifecycle_intents()).await?;
+            cowshed_os::timing::spanned("recover", "intents", self.recover_lifecycle_intents())
+                .await?;
         }
         Ok(())
     }
@@ -14635,11 +14642,9 @@ fn retired_refs<H: crate::storage::apfs::ApfsExecutionHost>(
     project_root: &Path,
     repo_id: &RepoId,
 ) -> Result<RetiredTrash> {
-    use cowshed_apfs::image::{IMAGE_EXTENSION, is_image_path};
-    use crate::metadata::{
-        DetachedWorkspaceMetadata, WorkspaceRole, sidecar_path,
-    };
+    use crate::metadata::{DetachedWorkspaceMetadata, WorkspaceRole, sidecar_path};
     use crate::storage::lifecycle::{LifecycleWorkspace, RetiredRef, Revision};
+    use cowshed_apfs::image::{IMAGE_EXTENSION, is_image_path};
 
     let trash = project_root
         .join("sessions")
@@ -14823,8 +14828,8 @@ mod retired_recovery_tests {
         let retired = retired_refs::<
             crate::storage::apfs::native::MacOsApfsExecutionHost<cowshed_apfs::SystemCommandRunner>,
         >(&project_root, &repo_id)
-            .unwrap()
-            .recorded;
+        .unwrap()
+        .recorded;
         assert_eq!(retired.len(), 1);
         assert_eq!(retired[0].workspace().incarnation(), &incarnation);
         assert_eq!(
@@ -14880,8 +14885,8 @@ mod retired_recovery_tests {
         let retired = retired_refs::<
             crate::storage::apfs::native::MacOsApfsExecutionHost<cowshed_apfs::SystemCommandRunner>,
         >(&project_root, &repo_id)
-            .expect("retired pending image is recoverable from its exact trash identity")
-            .recorded;
+        .expect("retired pending image is recoverable from its exact trash identity")
+        .recorded;
         assert_eq!(retired.len(), 1);
         assert_eq!(retired[0].workspace().incarnation(), &incarnation);
         assert_eq!(
@@ -14899,7 +14904,7 @@ mod retired_recovery_tests {
         retired_refs::<
             crate::storage::apfs::native::MacOsApfsExecutionHost<cowshed_apfs::SystemCommandRunner>,
         >(&project_root, &repo_id)
-            .expect_err("a mismatched workspace identity cannot authorize reclamation");
+        .expect_err("a mismatched workspace identity cannot authorize reclamation");
         mismatched.workspace = name.clone();
         mismatched
             .write_for_image(&image)
@@ -14916,8 +14921,8 @@ mod retired_recovery_tests {
         let retired = retired_refs::<
             crate::storage::apfs::native::MacOsApfsExecutionHost<cowshed_apfs::SystemCommandRunner>,
         >(&project_root, &repo_id)
-            .expect("new use of the name cannot invalidate old retired trash")
-            .recorded;
+        .expect("new use of the name cannot invalidate old retired trash")
+        .recorded;
         assert_eq!(retired[0].workspace().incarnation(), &incarnation);
         assert!(live.exists(), "discovery cannot touch the new workspace");
         assert!(image.exists(), "discovery cannot delete old retired bytes");
@@ -14969,8 +14974,8 @@ mod retired_recovery_tests {
         let retired = retired_refs::<
             crate::storage::apfs::native::MacOsApfsExecutionHost<cowshed_apfs::SystemCommandRunner>,
         >(&project_root, &repo_id)
-            .unwrap()
-            .recorded;
+        .unwrap()
+        .recorded;
         assert_eq!(retired.len(), 1);
         assert_eq!(retired[0].workspace().incarnation(), &incarnation);
         assert_eq!(
@@ -15005,7 +15010,8 @@ mod retired_recovery_tests {
         fn run(
             &self,
             request: &cowshed_apfs::CommandRequest,
-        ) -> std::result::Result<cowshed_apfs::CommandOutput, cowshed_apfs::CommandRunError> {
+        ) -> std::result::Result<cowshed_apfs::CommandOutput, cowshed_apfs::CommandRunError>
+        {
             panic!("reclaiming a detached retired image ran a disk command: {request:?}");
         }
         fn image_lease(
@@ -15085,7 +15091,9 @@ mod retired_recovery_tests {
             )
             .unwrap();
             let retired = retired_refs::<
-                crate::storage::apfs::native::MacOsApfsExecutionHost<cowshed_apfs::SystemCommandRunner>,
+                crate::storage::apfs::native::MacOsApfsExecutionHost<
+                    cowshed_apfs::SystemCommandRunner,
+                >,
             >(&project_root, &repo_id)
             .unwrap();
             assert_eq!(retired.recorded.len(), 1, "the retired image is found");
@@ -15148,9 +15156,11 @@ mod retired_recovery_tests {
             )
             .unwrap();
             let retired = retired_refs::<
-                crate::storage::apfs::native::MacOsApfsExecutionHost<cowshed_apfs::SystemCommandRunner>,
+                crate::storage::apfs::native::MacOsApfsExecutionHost<
+                    cowshed_apfs::SystemCommandRunner,
+                >,
             >(&project_root, &repo_id)
-                .expect("a sidecarless trash image does not fail the open");
+            .expect("a sidecarless trash image does not fail the open");
             assert!(retired.recorded.is_empty());
             assert_eq!(retired.unrecorded, std::slice::from_ref(&image));
             finish_store_residue(
@@ -15292,12 +15302,10 @@ fn native_storage_error(error: crate::storage::apfs::ApfsStorageError) -> Cowshe
         crate::storage::apfs::ApfsStorageError::Conflict(error) => {
             CowshedError::lifecycle_conflict(error)
         }
-        error @ crate::storage::apfs::ApfsStorageError::Unsupported { .. } => {
-            CowshedError::usage(
-                error.to_string(),
-                "use the native APFS backend for physical-volume operations",
-            )
-        }
+        error @ crate::storage::apfs::ApfsStorageError::Unsupported { .. } => CowshedError::usage(
+            error.to_string(),
+            "use the native APFS backend for physical-volume operations",
+        ),
         crate::storage::apfs::ApfsStorageError::GcPlanStale => CowshedError::retryable(
             crate::error::Retry::GcPlanStale,
             "garbage-collection plan became stale: an image was reclaimed or retired between the \
@@ -19511,11 +19519,11 @@ mod session_reopen_tests {
 #[cfg(all(test, target_os = "macos"))]
 mod volume_labeller_tests {
     use super::*;
-    use cowshed_apfs::{AttachedDiskImage, CommandOutput, CommandRequest, CommandRunError};
-    use cowshed_os::fork_lock::Fenced;
     use crate::runtime::supervisor::VolumeLabeller as _;
     use crate::storage::apfs::ApfsSubstrateConfig;
     use crate::storage::apfs::native::{MacOsApfsExecutionHost, SystemKernelMountSource};
+    use cowshed_apfs::{AttachedDiskImage, CommandOutput, CommandRequest, CommandRunError};
+    use cowshed_os::fork_lock::Fenced;
 
     /// Records every disk command instead of running it, and reports no image attached.
     #[derive(Clone, Default)]

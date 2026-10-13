@@ -43,6 +43,11 @@ use std::time::{Duration, Instant, SystemTime};
 mod blank_image;
 #[path = "../../../cowshed-apfs/tests/support/scratch_apfs.rs"]
 mod scratch_apfs;
+#[expect(
+    clippy::duplicate_mod,
+    reason = "scratch_directory and scratch_apfs each include the stateless scratch_processes \
+              helpers, so either support file also stands alone in a test binary"
+)]
 #[path = "../../../cowshed-core/tests/support/scratch_directory.rs"]
 mod scratch_directory;
 

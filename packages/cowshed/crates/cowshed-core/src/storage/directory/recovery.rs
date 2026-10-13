@@ -18,23 +18,20 @@ use super::{
     DirectoryExecutionHost, MountPointState, allocated_tree_bytes, host_error, mount_point_state,
     observed_mount, read_metadata,
 };
-use cowshed_apfs::image::{IMAGE_EXTENSION, is_image_path};
-use cowshed_apfs::store_lock::{ImageLockGuard, LockMode, acquire_image_locks};
 use crate::metadata::{
-    DetachedWorkspaceMetadata, GRANTS_SIDECAR_SUFFIX, PublicationState,
-    WorkspaceIncarnation, WorkspaceMarker, WorkspaceName, sidecar_path,
+    DetachedWorkspaceMetadata, GRANTS_SIDECAR_SUFFIX, PublicationState, WorkspaceIncarnation,
+    WorkspaceMarker, WorkspaceName, sidecar_path,
 };
 use crate::repository::{
     CHECKPOINTS_DIRECTORY, EXEC_TEMP_DIRECTORY, QUARANTINE_DIRECTORY, RepoId, SESSIONS_DIRECTORY,
 };
 use crate::storage::apfs::native::{
-    CHECKPOINT_FACT_VERSION, CheckpointFactWire, CheckpointPinWire,
-    QuarantineTombstone, RESTORE_RECOVERY_FACT_VERSION, RestoreRecoveryFactWire,
-    checkpoint_fact_path, collect_project_directories,
-    collect_restore_sidecars, directory_children, gc_candidate_failure_is_fatal,
-    grants_sidecar_missing, image_from_sidecar, io_error, metadata_workspace_ref, path_exists,
-    regular_file_children, restore_recovery_fact_path, swap_paths, sync_parent_path,
-    validate_restore_recovery_lineage, warn_session_image_issue,
+    CHECKPOINT_FACT_VERSION, CheckpointFactWire, CheckpointPinWire, QuarantineTombstone,
+    RESTORE_RECOVERY_FACT_VERSION, RestoreRecoveryFactWire, checkpoint_fact_path,
+    collect_project_directories, collect_restore_sidecars, directory_children,
+    gc_candidate_failure_is_fatal, grants_sidecar_missing, image_from_sidecar, io_error,
+    metadata_workspace_ref, path_exists, regular_file_children, restore_recovery_fact_path,
+    swap_paths, sync_parent_path, validate_restore_recovery_lineage, warn_session_image_issue,
 };
 use crate::storage::apfs::{
     ApfsExecutionHost, ApfsStorageError, ApfsSubstrateConfig, companion_path, layout,
@@ -47,6 +44,8 @@ use crate::storage::lifecycle::{
 };
 use crate::storage::recovery::{STAGING_NAMESPACE, TRASH_NAMESPACE};
 use crate::storage::{CheckpointLabel, PRE_RESTORE_PREFIX, WORKSPACE_MARKER_PATH};
+use cowshed_apfs::image::{IMAGE_EXTENSION, is_image_path};
+use cowshed_apfs::store_lock::{ImageLockGuard, LockMode, acquire_image_locks};
 
 /// Whether a retirement may collect the artifacts keyed on its workspace name - its checkpoint
 /// directory, exec temp directory and mountpoint - which re-minting the name hands the next
@@ -172,9 +171,11 @@ fn gc_candidate(
             )));
         };
         hasher.update(allocated.to_le_bytes());
-        bytes = bytes.checked_add(allocated).ok_or(ApfsStorageError::InvalidPlan(
-            "GC candidate byte accounting overflow",
-        ))?;
+        bytes = bytes
+            .checked_add(allocated)
+            .ok_or(ApfsStorageError::InvalidPlan(
+                "GC candidate byte accounting overflow",
+            ))?;
     }
     Ok(StorageGcCandidate::new(
         hasher.finalize().into(),
@@ -459,7 +460,11 @@ impl DirectoryExecutionHost {
                 self.recovery_companion(&canonical, "canonical payload awaiting metadata")?;
                 let destination = sidecar_path(&canonical);
                 fs::rename(&path, &destination).map_err(|error| {
-                    io_error("complete canonical sidecar publication", &destination, error)
+                    io_error(
+                        "complete canonical sidecar publication",
+                        &destination,
+                        error,
+                    )
                 })?;
                 sync_parent_path(&canonical)?;
             }
@@ -512,10 +517,14 @@ impl DirectoryExecutionHost {
             if read_metadata(&undo)? != old_metadata {
                 continue;
             }
-            let staged = storage.project().project_root.join(STAGING_NAMESPACE).join(format!(
-                "{}-{replacement_incarnation}.{IMAGE_EXTENSION}",
-                old_metadata.workspace.as_str(),
-            ));
+            let staged = storage
+                .project()
+                .project_root
+                .join(STAGING_NAMESPACE)
+                .join(format!(
+                    "{}-{replacement_incarnation}.{IMAGE_EXTENSION}",
+                    old_metadata.workspace.as_str(),
+                ));
             self.recover_restore(
                 config,
                 &old_metadata,
@@ -575,11 +584,11 @@ impl DirectoryExecutionHost {
                 ));
             }
             validate_restore_recovery_lineage(config, &fact)?;
-        } else if !path_exists(staged)? && path_exists(&canonical_sidecar)? {
-            if read_metadata(canonical)?.workspace_incarnation != old_metadata.workspace_incarnation
-            {
-                return Ok(());
-            }
+        } else if !path_exists(staged)?
+            && path_exists(&canonical_sidecar)?
+            && read_metadata(canonical)?.workspace_incarnation != old_metadata.workspace_incarnation
+        {
+            return Ok(());
         }
         // Recovery renames and exchanges these payloads, and a rename moves a mount record, not
         // the payload it names: every one present comes home first, as the executor unmounts
@@ -599,9 +608,9 @@ impl DirectoryExecutionHost {
         } else {
             None
         };
-        let published = canonical_metadata
-            .as_ref()
-            .is_some_and(|metadata| metadata.workspace_incarnation.as_str() == replacement_incarnation);
+        let published = canonical_metadata.as_ref().is_some_and(|metadata| {
+            metadata.workspace_incarnation.as_str() == replacement_incarnation
+        });
         if published {
             if Self::companions_match(&canonical_companion, &undo_companion)? {
                 return mismatch(format!(
@@ -616,7 +625,8 @@ impl DirectoryExecutionHost {
                     self.delete_payload(staged)?;
                 }
             } else if path_exists(staged)? {
-                let displaced = self.recovery_companion(staged, "restore displaced staged payload")?;
+                let displaced =
+                    self.recovery_companion(staged, "restore displaced staged payload")?;
                 if !Self::companions_match(&displaced, &undo_companion)? {
                     return mismatch(format!(
                         "displaced restore payload has the wrong CA key: staged={}, staged_companion={}, undo_companion={}",
@@ -759,9 +769,8 @@ impl DirectoryExecutionHost {
                 )
             })?;
         }
-        fs::remove_file(&undo_companion).map_err(|error| {
-            io_error("remove redundant restore CA key", &undo_companion, error)
-        })?;
+        fs::remove_file(&undo_companion)
+            .map_err(|error| io_error("remove redundant restore CA key", &undo_companion, error))?;
         sync_parent_path(canonical)
     }
 
@@ -979,7 +988,10 @@ impl DirectoryExecutionHost {
 
     /// The mountpoint a retirement may remove: an empty directory. Anything a late writer left
     /// there is named, never deleted.
-    fn retired_mount_point(&self, retired: &RetiredRef) -> Result<Option<PathBuf>, ApfsStorageError> {
+    fn retired_mount_point(
+        &self,
+        retired: &RetiredRef,
+    ) -> Result<Option<PathBuf>, ApfsStorageError> {
         let mount_point = layout(&self.config, retired.workspace().repo())?
             .project()
             .mount_root
@@ -1029,7 +1041,10 @@ impl DirectoryExecutionHost {
         trash_image: &Path,
         expected: Option<&RetiredRef>,
     ) -> Result<(), ApfsStorageError> {
-        let authority = match (self.retired_authority(project, repo, trash_image)?, expected) {
+        let authority = match (
+            self.retired_authority(project, repo, trash_image)?,
+            expected,
+        ) {
             (Some(authority), Some(expected)) if expected.workspace() != authority.workspace() => {
                 return Err(ApfsStorageError::MarkerMismatch(format!(
                     "retired cleanup authority changed for {}",
@@ -1048,7 +1063,8 @@ impl DirectoryExecutionHost {
         };
         let trash = project.join(SESSIONS_DIRECTORY).join(TRASH_NAMESPACE);
         let owners = retired_name_owners(&Self::retired_trash_images(&trash)?);
-        let scope = self.retired_name_scope(&authority, owners.get(authority.workspace().name()))?;
+        let scope =
+            self.retired_name_scope(&authority, owners.get(authority.workspace().name()))?;
         let cleanup = self.retired_cleanup(project, &authority, trash_image, scope)?;
         for image in &cleanup.checkpoint_images {
             self.reclaim_image(image)?;
@@ -1273,7 +1289,9 @@ impl DirectoryExecutionHost {
                     .project()
                     .checkpoints
                     .join(workspace.as_str())
-                    .join(format!("{PRE_RESTORE_PREFIX}{incarnation}.{IMAGE_EXTENSION}"));
+                    .join(format!(
+                        "{PRE_RESTORE_PREFIX}{incarnation}.{IMAGE_EXTENSION}"
+                    ));
                 if path_exists(&sidecar_path(&undo))? {
                     continue;
                 }
@@ -1411,8 +1429,9 @@ impl DirectoryExecutionHost {
         project: &Path,
         plan: StorageGcPlan,
     ) -> Result<StorageGcReport, ApfsStorageError> {
-        let _guard = acquire_image_locks(&self.config.store_root, plan.lock_paths(), LockMode::Try)?
-            .ok_or(ApfsStorageError::GcPlanStale)?;
+        let _guard =
+            acquire_image_locks(&self.config.store_root, plan.lock_paths(), LockMode::Try)?
+                .ok_or(ApfsStorageError::GcPlanStale)?;
         let current =
             self.preview_gc_project(project, plan.repo(), plan.observed_at(), plan.lock_paths())?;
         if current != plan {
@@ -1451,9 +1470,9 @@ impl DirectoryExecutionHost {
                     let removed = match mount_point_state(path)? {
                         MountPointState::Vacant => fs::remove_dir(path),
                         MountPointState::Absent => Ok(()),
-                        MountPointState::Link | MountPointState::Occupied => Err(
-                            io::Error::other("staging mountpoint is no longer vacant"),
-                        ),
+                        MountPointState::Link | MountPointState::Occupied => {
+                            Err(io::Error::other("staging mountpoint is no longer vacant"))
+                        }
                     };
                     removed
                         .map_err(|error| io_error("remove orphan staging mount", path, error))
@@ -1479,12 +1498,9 @@ impl DirectoryExecutionHost {
                         .reclaimed
                         .checked_add(1)
                         .ok_or(ApfsStorageError::InvalidPlan("GC count overflow"))?;
-                    report.freed_bytes = report
-                        .freed_bytes
-                        .checked_add(candidate.bytes())
-                        .ok_or(ApfsStorageError::InvalidPlan(
-                            "GC freed byte accounting overflow",
-                        ))?;
+                    report.freed_bytes = report.freed_bytes.checked_add(candidate.bytes()).ok_or(
+                        ApfsStorageError::InvalidPlan("GC freed byte accounting overflow"),
+                    )?;
                 }
                 Err(error) if gc_candidate_failure_is_fatal(&error) => return Err(error),
                 Err(error) => report.deferred.push(StorageGcDeferred {
