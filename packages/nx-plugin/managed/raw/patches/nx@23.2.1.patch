@@ -2650,3 +2650,109 @@ index 74f0682269ede01ee9ee4819e39f38c90a719894..03686ffeeff54286b99386fddeef77d0
 +        }
      }
  }
+diff --git a/dist/src/project-graph/build-project-graph.js b/dist/src/project-graph/build-project-graph.js
+index 28c9655c4612dcc85a881816f172dce98642bb0c..ea65f019024da507dd81f4ace12020914a6f97a1 100644
+--- a/dist/src/project-graph/build-project-graph.js
++++ b/dist/src/project-graph/build-project-graph.js
+@@ -93,7 +93,7 @@ async function buildProjectGraphUsingProjectFileMap(projectRootMap, externalNode
+     try {
+         const context = createContext(projects, nxJson, externalNodes, fileMap, filesToProcess);
+         projectGraph = await buildProjectGraphUsingContext(externalNodes, context, cachedFileData, projectGraphVersion, plugins, sourceMap);
+-        projectFileMapCache = (0, nx_deps_cache_1.createProjectFileMapCache)(nxJson, packageJsonDeps, fileMap, rootTsConfig, externalNodesHash);
++        projectFileMapCache = (0, nx_deps_cache_1.createProjectFileMapCache)(nxJson, packageJsonDeps, fileMap, rootTsConfig, externalNodesHash, projects);
+     }
+     catch (e) {
+         // we need to include the workspace validity errors in the final error
+diff --git a/dist/src/project-graph/nx-deps-cache.d.ts b/dist/src/project-graph/nx-deps-cache.d.ts
+index 5bc1e76b319294101cc9b038dc6eb0ad01036b13..baf7908aeb206f1c4e26ed0c8578465d8b510776 100644
+--- a/dist/src/project-graph/nx-deps-cache.d.ts
++++ b/dist/src/project-graph/nx-deps-cache.d.ts
+@@ -11,6 +11,8 @@ export interface FileMapCache {
+     pluginsConfig?: any;
+     fileMap: FileMap;
+     externalNodesHash?: string;
++    /** Missing only in caches written before package-resolution invalidation. */
++    projectResolution?: string;
+ }
+ export declare const nxProjectGraph: string;
+ export declare const nxFileMap: string;
+@@ -25,7 +27,7 @@ export declare function createProjectFileMapCache(nxJson: NxJsonConfiguration<'*
+             [p: string]: any;
+         };
+     };
+-}, externalNodesHash: string): FileMapCache;
++}, externalNodesHash: string, projects: Record<string, ProjectConfiguration>): FileMapCache;
+ export declare function writeCache(cache: FileMapCache, projectGraph: ProjectGraph, sourceMaps: ConfigurationSourceMaps, errors: ProjectGraphErrorTypes[]): void;
+ /**
+  * Writes the cache only if the on-disk cache file has been modified since
+diff --git a/dist/src/project-graph/nx-deps-cache.js b/dist/src/project-graph/nx-deps-cache.js
+index a880a6620cd7ac46e4bd189bc2034ce58825769a..ef3c99a115e7114ea78da379316a0478e45fbeea 100644
+--- a/dist/src/project-graph/nx-deps-cache.js
++++ b/dist/src/project-graph/nx-deps-cache.js
+@@ -120,7 +120,7 @@ function readSourceMapsCache() {
+     perf_hooks_1.performance.measure('read cache', 'read source-maps:start', 'read source-maps:end');
+     return data ?? null;
+ }
+-function createProjectFileMapCache(nxJson, packageJsonDeps, fileMap, tsConfig, externalNodesHash) {
++function createProjectFileMapCache(nxJson, packageJsonDeps, fileMap, tsConfig, externalNodesHash, projects) {
+     const nxJsonPlugins = getNxJsonPluginsData(nxJson, packageJsonDeps);
+     const newValue = {
+         version: '6.0',
+@@ -131,9 +131,29 @@ function createProjectFileMapCache(nxJson, packageJsonDeps, fileMap, tsConfig, e
+         pluginsConfig: nxJson?.pluginsConfig,
+         fileMap,
+         externalNodesHash,
++        projectResolution: projectResolutionIdentity(projects),
+     };
+     return newValue;
+ }
++// Dependency resolution reads project roots and package metadata, even when
++// the importing files have not changed. Do not key unrelated targets or tags.
++// Preserve enumeration order: package-name collisions are last-writer-wins
++// and wildcard export lookup uses the first matching entry.
++function projectResolutionIdentity(projects) {
++    return JSON.stringify(Object.keys(projects).map((name) => {
++        const project = projects[name];
++        const js = project.metadata?.js;
++        return [
++            name,
++            project.root,
++            js?.packageName,
++            js?.packageVersion,
++            js?.packageExports,
++            js?.packageMain,
++            js?.isInPackageManagerWorkspaces,
++        ];
++    }));
++}
+ /**
+  * Tracks the mtime of the project graph cache file after the last successful
+  * writeCache() call. Used by writeCacheIfStale() to skip redundant writes
+@@ -230,19 +250,19 @@ function shouldRecomputeWholeGraph(cache, packageJsonDeps, projects, nxJson, tsC
+     if (cache.nxVersion !== versions_1.nxVersion) {
+         return true;
+     }
+-    // we have a cached project that is no longer present
+-    const cachedNodes = Object.keys(cache.fileMap.projectFileMap);
+-    if (cachedNodes.some((p) => projects[p] === undefined)) {
++    // Legacy caches have no resolution identity and must be rebuilt once.
++    // A new package can resolve an unchanged import just as a renamed one can.
++    if (cache.projectResolution !== projectResolutionIdentity(projects)) {
+         return true;
+     }
+-    // a path mapping for an existing project has changed
+-    if (Object.keys(cache.pathMappings).some((t) => {
++    // Added aliases can resolve unchanged imports; compare the whole key set.
++    const cachedPaths = Object.keys(cache.pathMappings);
++    const paths = tsConfig?.compilerOptions?.paths || {};
++    if (cachedPaths.length !== Object.keys(paths).length || cachedPaths.some((t) => {
+         const cached = cache.pathMappings && cache.pathMappings[t]
+             ? JSON.stringify(cache.pathMappings[t])
+             : undefined;
+-        const notCached = tsConfig?.compilerOptions?.paths && tsConfig?.compilerOptions?.paths[t]
+-            ? JSON.stringify(tsConfig.compilerOptions.paths[t])
+-            : undefined;
++        const notCached = paths[t] ? JSON.stringify(paths[t]) : undefined;
+         return cached !== notCached;
+     })) {
+         return true;
