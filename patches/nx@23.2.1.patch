@@ -1,8 +1,16 @@
 diff --git a/dist/bin/nx.js b/dist/bin/nx.js
-index 5a59f762f2002f61f84d0966c8fb48d48b3bdce2..7a3a0cafad1b1f8e356206505e5a526b97e0e404 100755
+index 5a59f762f2002f61f84d0966c8fb48d48b3bdce2..f190d2b93cc7c1d0f59dcb1e76ef7d3efb01c3f9 100755
 --- a/dist/bin/nx.js
 +++ b/dist/bin/nx.js
-@@ -12,6 +12,7 @@ if (process.env.FORCE_COLOR === '0') {
+@@ -9,9 +9,15 @@ if (process.env.FORCE_COLOR === '0') {
+     process.env.NO_COLOR = '1';
+     delete process.env.FORCE_COLOR;
+ }
++// Every command, and the daemon this process starts, answers from this
++// installed Nx: `nx configure-ai-agents`, `nx init` and `nx migrate` would
++// otherwise run `nx@latest` from the registry. `NX_USE_LOCAL=false` restores
++// the latest CLI for one command.
++process.env.NX_USE_LOCAL ??= 'true';
  // Must be the first import — see enable-compile-cache.ts.
  require("../src/utils/enable-compile-cache");
  const find_workspace_root_1 = require("../src/utils/find-workspace-root");
@@ -10,7 +18,7 @@ index 5a59f762f2002f61f84d0966c8fb48d48b3bdce2..7a3a0cafad1b1f8e356206505e5a526b
  const pc = tslib_1.__importStar(require("picocolors"));
  const output_1 = require("../src/utils/output");
  const installation_directory_1 = require("../src/utils/installation-directory");
-@@ -35,6 +36,10 @@ async function main() {
+@@ -35,6 +41,10 @@ async function main() {
      // user's command line.
      if (process.env.NX_COMPLETE) {
          try {
@@ -21,7 +29,7 @@ index 5a59f762f2002f61f84d0966c8fb48d48b3bdce2..7a3a0cafad1b1f8e356206505e5a526b
              perf_hooks_1.performance.mark('init-local');
              const { tryValueCompletion } = await import('nx/src/command-line/completion/value-completions');
              if (tryValueCompletion())
-@@ -51,6 +56,13 @@ async function main() {
+@@ -51,6 +61,13 @@ async function main() {
          }
          return;
      }
@@ -35,7 +43,7 @@ index 5a59f762f2002f61f84d0966c8fb48d48b3bdce2..7a3a0cafad1b1f8e356206505e5a526b
      if (process.argv[2] !== 'report' &&
          process.argv[2] !== '--version' &&
          process.argv[2] !== '--help' &&
-@@ -154,6 +166,23 @@ async function main() {
+@@ -154,6 +171,23 @@ async function main() {
          }
      }
  }
@@ -572,6 +580,22 @@ index 0051f7f97f0d9c05341f8cbaa7f51eb851051077..00000000000000000000000000000000
 -        description: 'handleGetEstimatedTaskTimings',
 -    };
 -}
+diff --git a/dist/src/daemon/server/latest-nx.js b/dist/src/daemon/server/latest-nx.js
+index ef00ae3212498e75d6bb6371aec4b113970c0c68..06eb2bf7436cc20dad1d646be44ba99064395f3d 100644
+--- a/dist/src/daemon/server/latest-nx.js
++++ b/dist/src/daemon/server/latest-nx.js
+@@ -20,6 +20,11 @@ let installPromise = null;
+  * Guards against concurrent callers by reusing the in-flight promise.
+  */
+ async function getLatestNxTmpPath() {
++    // The daemon never installs `nx@latest` from the registry, whatever the
++    // environment a client sent it says: it answers Nx Console and AI-agent
++    // status from the Nx that runs it. Callers resolve `nx/...` from the
++    // returned directory, which finds this installed package.
++    return __dirname;
+     if (latestNxTmpPath !== null) {
+         logger_1.serverLogger.log('[LATEST-NX]: Reusing cached Nx installation from', latestNxTmpPath);
+         return latestNxTmpPath;
 diff --git a/dist/src/daemon/server/project-graph-incremental-recomputation.js b/dist/src/daemon/server/project-graph-incremental-recomputation.js
 index c2a2f8f70fe71940e47c97931c5925bac1fbd480..39582a8fc342ae59decd3d4ca25179f2bc478691 100644
 --- a/dist/src/daemon/server/project-graph-incremental-recomputation.js
