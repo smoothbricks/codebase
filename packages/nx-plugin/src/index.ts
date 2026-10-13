@@ -15,7 +15,7 @@ import {
 import { AggregateCreateNodesError } from 'nx/src/project-graph/error-types.js';
 import { parse as parseToml } from 'smol-toml';
 
-import { BOUNDED_TEST_KILL_AFTER_MS, BOUNDED_TEST_TIMEOUT_MS } from './bounded-test-policy.js';
+import { BOUNDED_TEST_IDLE_TIMEOUT_MS, BOUNDED_TEST_KILL_AFTER_MS } from './bounded-test-policy.js';
 import {
   CARGO_CLOSURE_INPUT,
   type CargoClosureSource,
@@ -41,7 +41,6 @@ import {
   exceptionalTestFilter,
   listCargoCrossTestTargets,
   listCargoWorkspacePackages,
-  NEXTEST_GROUP_EXECUTOR,
   NEXTEST_REPO_CONFIG_PATH,
   nextestToolConfigArg,
   type SerialTestGroup,
@@ -843,7 +842,7 @@ function createCargoCrossTestTargets(
           `cargo-nextest nextest run --archive-file ${archiveFile} --workspace-remap . ` +
           `--no-tests=pass --user-config-file none ${toolConfig}`,
         cwd: projectRoot,
-        timeoutMs: BOUNDED_TEST_TIMEOUT_MS,
+        idleTimeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
         killAfterMs: BOUNDED_TEST_KILL_AFTER_MS,
       },
     },
@@ -859,7 +858,7 @@ function createCargoTestTarget(projectRoot: string): TargetConfiguration {
     options: {
       command: cargoFrozen('test --workspace'),
       cwd: projectRoot,
-      timeoutMs: BOUNDED_TEST_TIMEOUT_MS,
+      idleTimeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
       killAfterMs: BOUNDED_TEST_KILL_AFTER_MS,
     },
   };
@@ -2302,8 +2301,8 @@ function createNapiTestTarget(projectRoot: string, hasDedicatedBunfig: boolean):
       // Routes the package's native loader to the napi-debug artifact under
       // .cache/native-debug instead of the packaged dist/native tree.
       env: { NAPI_DEBUG_ADDON: '1' },
-      timeoutMs: 120000,
-      killAfterMs: 10000,
+      idleTimeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
+      killAfterMs: BOUNDED_TEST_KILL_AFTER_MS,
     },
   };
 }
@@ -2681,16 +2680,11 @@ async function cargoTestRunnerInputs(
 }
 
 /**
- * One `nextest` invocation over a filterset against the workspace's archive. Every runner of the
+ * One `nextest run` over a filterset against the workspace's archive. Every runner of the
  * workspace builds its command here, so the extraction, reuse-build, tool config and cwd cannot
- * drift between the per-crate pieces and the serial group's count and run stages.
+ * drift between the per-crate pieces and the serial groups.
  */
-function nextestRunnerCommand(
-  workspace: CargoWorkspace,
-  verb: 'run' | 'list',
-  selector: string,
-  flags: string,
-): string {
+function nextestRunnerCommand(workspace: CargoWorkspace, selector: string, flags: string): string {
   const toolConfig = nextestToolConfigArg(workspace.projectRoot);
   // Relative to the runner's cwd, so the hashed command is the same in every checkout.
   const extractBin = posix.join(posix.relative(workspace.projectRoot, '.'), NEXTEST_EXTRACT_BIN);
@@ -2701,7 +2695,7 @@ function nextestRunnerCommand(
   return (
     `extracted="$(node ${extractBin} ${CARGO_TEST_ARCHIVE_FILE})" && ` +
     cargoFrozen(
-      `nextest ${verb} ${reuseExtraction} --workspace-remap . -E ${shellWord(selector)}${flags} --user-config-file none ${toolConfig}`,
+      `nextest run ${reuseExtraction} --workspace-remap . -E ${shellWord(selector)}${flags} --user-config-file none ${toolConfig}`,
     )
   );
 }
@@ -2719,19 +2713,21 @@ function cargoTestRunnerTarget(
     inputs,
     dependsOn: [archive],
     options: {
-      command: nextestRunnerCommand(workspace, 'run', piece.selector, `${piece.extra} --no-fail-fast --no-tests=pass`),
+      command: nextestRunnerCommand(workspace, piece.selector, `${piece.extra} --no-fail-fast --no-tests=pass`),
       cwd: workspace.projectRoot,
-      timeoutMs: BOUNDED_TEST_TIMEOUT_MS,
+      idleTimeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
       killAfterMs: BOUNDED_TEST_KILL_AFTER_MS,
     },
   };
 }
 
 /**
- * A serial group's runner. Its count stage lists the group's selection and sizes the bound from
- * it; its run stage is a nextest run of that selection with no partition and no thread flag: the
- * group is serial because its test-group declares `max-threads = 1`. It runs `--no-fail-fast`, so an
- * ordinary failure runs the group's remaining tests, and a failed verdict lists the failed ones.
+ * A serial group's runner: a nextest run of the group's selection with no partition and no thread
+ * flag, the group being serial because its test-group declares `max-threads = 1`, so it asks for one
+ * CPU token. It is bounded by progress like every test target: a group of slow tests runs as long as
+ * it keeps finishing them. It runs `--no-fail-fast`, so an ordinary failure runs the group's remaining
+ * tests and a failed verdict lists the failed ones, and `--no-tests=fail`, so a filter that selects
+ * nothing fails rather than passing a group that ran no test.
  */
 function cargoTestGroupTarget(
   workspace: CargoWorkspace,
@@ -2739,15 +2735,16 @@ function cargoTestGroupTarget(
   group: SerialTestGroup,
 ): TargetConfiguration {
   return {
-    executor: NEXTEST_GROUP_EXECUTOR,
+    executor: '@smoothbricks/nx-plugin:bounded-exec',
     cache: true,
     inputs: [...inputs, fileHashInput(PLUGIN_NEXTEST_CODE_BOUND)],
     dependsOn: [CARGO_TEST_ARCHIVE_TARGET],
     options: {
-      command: nextestRunnerCommand(workspace, 'run', group.filter, ' --no-fail-fast --no-tests=pass'),
-      listCommand: nextestRunnerCommand(workspace, 'list', group.filter, ' --message-format=json'),
+      command: nextestRunnerCommand(workspace, group.filter, ' --no-fail-fast --no-tests=fail'),
       cwd: workspace.projectRoot,
+      idleTimeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
       killAfterMs: BOUNDED_TEST_KILL_AFTER_MS,
+      parallelism: 1,
     },
   };
 }

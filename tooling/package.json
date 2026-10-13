@@ -52,7 +52,7 @@
         "options": {
           "command": "bun test --timeout=30000 direnv land-host.test land-judge.test",
           "cwd": "{projectRoot}",
-          "timeoutMs": 600000,
+          "idleTimeoutMs": 180000,
           "killAfterMs": 10000
         }
       },

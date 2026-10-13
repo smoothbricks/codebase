@@ -8,8 +8,10 @@ import { join } from 'node:path';
  * - `bound`: the run hit a wall-clock bound and nothing else failed. Either the command
  *   outlived `timeoutMs` (`total`), or every failing test in the runner's report failed on
  *   its runner's per-test timeout (`test`). A loaded host produces exactly these.
- * - `wedged`: `idleTimeoutMs` fired. Silence means a hang, not a slow host, and the fix is the
- *   opposite one, so it is never a `bound`.
+ * - `wedged`: `idleTimeoutMs` fired: no test finished for that long. A machine that is only slow still finishes
+ *   tests, so this is a hang, not a slow host, and the fix is the opposite one, so it is never a `bound`. It names
+ *   the tests still running: those the runner said were running and never said finished, and those its report says
+ *   it aborted when the bound stopped it.
  * - `failed`: anything else that did not pass. That includes an assertion named in the report,
  *   or a non-zero exit with no report to say why.
  */
@@ -17,7 +19,12 @@ export type BoundedExecVerdict =
   | { readonly outcome: 'passed' }
   | { readonly outcome: 'bound'; readonly bound: 'total'; readonly limitMs: number; readonly elapsedMs: number }
   | { readonly outcome: 'bound'; readonly bound: 'test'; readonly tests: readonly string[] }
-  | { readonly outcome: 'wedged'; readonly idleMs: number; readonly elapsedMs: number }
+  | {
+      readonly outcome: 'wedged';
+      readonly idleMs: number;
+      readonly elapsedMs: number;
+      readonly tests: readonly string[];
+    }
   | { readonly outcome: 'failed'; readonly exitCode: number; readonly tests: readonly string[] };
 
 /** One task's verdict, keyed by the Nx task and the hash it ran at. */
@@ -158,23 +165,36 @@ function decodeEntities(value: string): string {
   });
 }
 
+/**
+ * The bound that ended a run. `total` is a wall-clock ceiling: it answers "is this run unbounded?". `idle` is the
+ * no-progress bound: it answers "is this run hung?", and carries the tests the runner reported still running.
+ *
+ * These are different questions and one number cannot answer both. A ceiling tight enough to catch a hang promptly
+ * is also tight enough to fail a correct run on a busy machine; a ceiling loose enough never to do that cannot catch
+ * a hang promptly. Keeping the two bounds separate is what makes each honest.
+ */
+export type ExpiredBound =
+  | { readonly kind: 'total'; readonly limitMs: number }
+  | { readonly kind: 'idle'; readonly limitMs: number; readonly tests: readonly string[] };
+
 /** How a run ended, as the executor saw it. */
 export interface RunEnd {
   readonly exitCode: number;
   readonly elapsedMs: number;
-  readonly expiry: { readonly kind: 'total' | 'idle'; readonly limitMs: number } | null;
+  readonly expiry: ExpiredBound | null;
   /** The run's report, or `null` when the command was asked for none or wrote none. */
   readonly report: JunitFailures | null;
 }
 
 /**
- * Judge a run. A test that failed on its own is a failure even when a bound fired too, and an
- * idle bound is never load: the report's assertions and the idle bound are read first. A test
- * the runner aborted because the total bound told its command to stop is not one that failed.
+ * Judge a run. A test that failed on its own is a failure even when a bound fired too, and the no-progress bound is
+ * never load: the report's assertions and the idle bound are read first. A test the runner aborted because the total
+ * bound told its command to stop is not one that failed; one it aborted at the idle bound is a test still running.
  */
 export function judgeRun(run: RunEnd): BoundedExecVerdict {
   if (run.expiry?.kind === 'idle') {
-    return { outcome: 'wedged', idleMs: run.expiry.limitMs, elapsedMs: run.elapsedMs };
+    const tests = [...new Set([...run.expiry.tests, ...(run.report?.cancelled ?? [])])];
+    return { outcome: 'wedged', idleMs: run.expiry.limitMs, elapsedMs: run.elapsedMs, tests };
   }
   if (run.report !== null && run.report.failed.length > 0) {
     return { outcome: 'failed', exitCode: run.exitCode, tests: run.report.failed };
@@ -328,8 +348,8 @@ function parseVerdict(value: unknown): BoundedExecVerdict {
         }
         break;
       case 'wedged':
-        if (typeof value.idleMs === 'number' && typeof value.elapsedMs === 'number') {
-          return { outcome: 'wedged', idleMs: value.idleMs, elapsedMs: value.elapsedMs };
+        if (typeof value.idleMs === 'number' && typeof value.elapsedMs === 'number' && isStrings(value.tests)) {
+          return { outcome: 'wedged', idleMs: value.idleMs, elapsedMs: value.elapsedMs, tests: value.tests };
         }
         break;
       case 'failed':
@@ -400,7 +420,11 @@ export function describeVerdict(verdict: BoundedExecVerdict): string {
         ? `outlived its ${verdict.limitMs}ms bound (${verdict.elapsedMs}ms)`
         : `per-test timeout only: ${verdict.tests.join(', ')}`;
     case 'wedged':
-      return `wedged: no output for ${verdict.idleMs}ms after ${verdict.elapsedMs}ms`;
+      return `wedged: no test finished for ${verdict.idleMs}ms after ${verdict.elapsedMs}ms; ${
+        verdict.tests.length > 0
+          ? `still running: ${verdict.tests.join(', ')}`
+          : 'the runner named no test still running'
+      }`;
     case 'failed':
       return verdict.tests.length > 0
         ? `failed: ${verdict.tests.join(', ')}`

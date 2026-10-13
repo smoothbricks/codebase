@@ -19,6 +19,7 @@ import {
   sizeRunner,
   type TokenGrant,
 } from './cpu-tokens.js';
+import { createRunProgress, withProgressReport } from './progress.js';
 import {
   createHostCommands,
   describeRamTempError,
@@ -32,6 +33,7 @@ import {
   type BoundedExecRecord,
   type BoundedExecTask,
   clearTaskDirectory,
+  type ExpiredBound,
   JUNIT_FILE,
   JUNIT_REPORT_ENV,
   judgeOperationalFailure,
@@ -74,19 +76,6 @@ export interface BoundedExecResult {
   success: boolean;
   terminalOutput: string;
 }
-
-/**
- * Which bound ended the run.
- *
- * `total` is a wall-clock ceiling: it answers "is this run unbounded?".
- * `idle` is a no-progress bound: it answers "is this run wedged?".
- *
- * These are different questions and one number cannot answer both. A ceiling
- * tight enough to catch a wedge promptly is also tight enough to fail a correct
- * run on a busy machine; a ceiling loose enough never to do that cannot catch a
- * wedge promptly. Keeping the two bounds separate is what makes each honest.
- */
-type ExpiredBound = { kind: 'total' | 'idle'; limitMs: number };
 
 interface RunState {
   settled: boolean;
@@ -354,7 +343,10 @@ export async function runBoundedExec(
     }
     pool = created.pool;
   }
-  const command = directory === null ? sized.command : await withJunitReport(sized.command, directory);
+  const command =
+    directory === null
+      ? withProgressReport(sized.command)
+      : await withJunitReport(withProgressReport(sized.command), directory);
   // A runner bounded-exec cannot see in the command (a script that spawns `bun test`) writes its JUnit report to this
   // path when it is set. The grant's sizing outranks the target's own environment: the runner may use what it was
   // granted, not what it was configured with. The sub-pool's environment comes last: a descendant reads only the pool
@@ -380,25 +372,32 @@ export async function runBoundedExec(
     return refuse(`cowshed: could not start the command: ${error instanceof Error ? error.message : String(error)}\n`);
   }
 
+  // Progress is a finished test, not output: a runner's SLOW warnings and a hung test's heartbeat keep printing.
+  const progress = createRunProgress();
   let idleTimer: NodeJS.Timeout | undefined;
   const armIdleTimer = (): void => {
     if (idleTimeoutMs === undefined || state.settled || state.expiry !== null) {
       return;
     }
     clearTimeout(idleTimer);
-    idleTimer = setTimeout(() => expire({ kind: 'idle', limitMs: idleTimeoutMs }), idleTimeoutMs);
+    idleTimer = setTimeout(
+      () => expire({ kind: 'idle', limitMs: idleTimeoutMs, tests: progress.inFlight() }),
+      idleTimeoutMs,
+    );
   };
 
-  // Only the CHILD's own output counts as progress. The diagnostics below go
+  // Only the CHILD's own output is read for progress. The diagnostics below go
   // through appendStderr as well, and re-arming on those would let a teardown
   // message extend the very bound that just fired.
   child.stdout?.on('data', (chunk: Buffer | string) => {
-    armIdleTimer();
-    appendStdout(chunk);
+    const text = chunk.toString();
+    if (progress.scan('stdout', text)) armIdleTimer();
+    appendStdout(text);
   });
   child.stderr?.on('data', (chunk: Buffer | string) => {
-    armIdleTimer();
-    appendStderr(chunk);
+    const text = chunk.toString();
+    if (progress.scan('stderr', text)) armIdleTimer();
+    appendStderr(text);
   });
 
   const killChildTree = async (force: boolean): Promise<void> => {
@@ -465,7 +464,11 @@ export async function runBoundedExec(
     const elapsedMs = Date.now() - startedAt;
     appendStderr(
       bound.kind === 'idle'
-        ? `\nCommand made no progress: no output for ${bound.limitMs}ms (idleTimeoutMs=${bound.limitMs}) after ${elapsedMs}ms of runtime (cwd=${cwd}): ${command}\n`
+        ? `\nCommand made no progress: no test finished for ${bound.limitMs}ms (idleTimeoutMs=${bound.limitMs}) after ${elapsedMs}ms of runtime; ${
+            bound.tests.length > 0
+              ? `still running: ${bound.tests.join(', ')}`
+              : 'the runner named no test still running'
+          } (cwd=${cwd}): ${command}\n`
         : `\nCommand timed out after ${elapsedMs}ms (timeoutMs=${bound.limitMs}, cwd=${cwd}): ${command}\n`,
     );
     termination = terminate();
@@ -503,7 +506,8 @@ export async function runBoundedExec(
     }
   };
 
-  const totalTimer = setTimeout(() => expire({ kind: 'total', limitMs: timeoutMs }), timeoutMs);
+  const totalTimer =
+    timeoutMs === undefined ? undefined : setTimeout(() => expire({ kind: 'total', limitMs: timeoutMs }), timeoutMs);
   armIdleTimer();
 
   // A borrowed grant ends with the ancestor that lent it, and the command runs on tokens that ancestor takes back

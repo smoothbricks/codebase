@@ -6,7 +6,6 @@ import {
   CARGO_TEST_COMPILE_TARGET,
   CARGO_TEST_TARGET,
   listCargoWorkspacePackages,
-  NEXTEST_GROUP_EXECUTOR,
   packageNameFromCargoTestTarget,
 } from './cargo-workspace.js';
 import { writeJsonFile } from './managed-files/managed-format.js';
@@ -14,7 +13,13 @@ import type { PackageTargetPolicyOptions, ResolvedProjectTargets } from './packa
 import { isTestRunnerTargetName } from './workspace-config-policy.js';
 
 export const BOUNDED_TEST_EXECUTOR = '@smoothbricks/nx-plugin:bounded-exec';
-export const BOUNDED_TEST_TIMEOUT_MS = 120_000;
+/**
+ * A test target's one bound: the `idleTimeoutMs` with which no test may go unfinished, the hang backstop of
+ * specs/cowshed/08_testing.md. It is no wall-clock ceiling: a suite that keeps finishing tests runs as long as it
+ * needs. It is the longest any single test may run, so it stays above every slow-timeout class in the plugin's
+ * nextest.toml and every bun `--timeout`.
+ */
+export const BOUNDED_TEST_IDLE_TIMEOUT_MS = 180_000;
 export const BOUNDED_TEST_KILL_AFTER_MS = 10_000;
 // Per-test timeout passed to `bun test --timeout=<ms>`. Bun's default is
 // 5000ms which is too tight for git-fixture tests on slower CI runners
@@ -68,7 +73,7 @@ export function applyBoundedTestTargetPolicy(
   nextTestTarget.options = {
     command,
     cwd: '{projectRoot}',
-    timeoutMs: BOUNDED_TEST_TIMEOUT_MS,
+    idleTimeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
     killAfterMs: BOUNDED_TEST_KILL_AFTER_MS,
   };
 
@@ -412,9 +417,6 @@ function isPositiveSafeInteger(value: unknown): value is number {
 }
 
 function isBoundedExecutionTarget(executor: unknown, rawOptions: unknown, allowedCwds: ReadonlySet<string>): boolean {
-  if (executor === NEXTEST_GROUP_EXECUTOR) {
-    return isBoundedNextestGroupTarget(rawOptions);
-  }
   if (executor !== BOUNDED_TEST_EXECUTOR || !isRecord(rawOptions)) {
     return false;
   }
@@ -423,35 +425,22 @@ function isBoundedExecutionTarget(executor: unknown, rawOptions: unknown, allowe
     typeof command === 'string' &&
     command.length > 0 &&
     isPackageTestScriptRunnerCommand(command) === false &&
-    isPositiveSafeInteger(rawOptions.timeoutMs) &&
-    bunTestTimeoutIsBounded(command, rawOptions.timeoutMs) &&
+    // A test leg is bounded by progress alone: a wall-clock ceiling fails a suite that is only slow.
+    rawOptions.timeoutMs === undefined &&
+    isPositiveSafeInteger(rawOptions.idleTimeoutMs) &&
+    bunTestTimeoutIsBounded(command, rawOptions.idleTimeoutMs) &&
     typeof rawOptions.cwd === 'string' &&
     // `bun test` walks its working directory looking for test files, so it must start where that walk is cheap: the
     // project root or its `src/`. Any other command names what it runs and has no walk to bound. A cargo workspace's
     // per-crate nextest legs run from the workspace root, which no member project owns, and a gate may run a script
-    // that lives in another project; both are bounded by their timeouts alone.
+    // that lives in another project; both are bounded by their progress bound alone.
     (!BUN_TEST_PREFIX.test(command) || allowedCwds.has(rawOptions.cwd)) &&
     isPositiveSafeInteger(rawOptions.killAfterMs)
   );
 }
 
-/**
- * A serial group's runner names no timeout: `nextest-group` sizes its bound from the tests its list
- * selects, and its schema refuses any other option. What the policy checks is what that executor
- * requires: both commands and a kill grace.
- */
-function isBoundedNextestGroupTarget(rawOptions: unknown): boolean {
-  return (
-    isRecord(rawOptions) &&
-    typeof rawOptions.command === 'string' &&
-    rawOptions.command.length > 0 &&
-    typeof rawOptions.listCommand === 'string' &&
-    rawOptions.listCommand.length > 0 &&
-    isPositiveSafeInteger(rawOptions.killAfterMs)
-  );
-}
-
-function bunTestTimeoutIsBounded(command: string, timeoutMs: number): boolean {
+/** A bun leg's per-test `--timeout` must fire before the leg's progress bound would. */
+function bunTestTimeoutIsBounded(command: string, idleTimeoutMs: number): boolean {
   if (!BUN_TEST_PREFIX.test(command)) {
     return true;
   }
@@ -463,7 +452,7 @@ function bunTestTimeoutIsBounded(command: string, timeoutMs: number): boolean {
       value === undefined ||
       !/^\d+$/.test(value) ||
       !isPositiveSafeInteger(perTestTimeoutMs) ||
-      perTestTimeoutMs > timeoutMs
+      perTestTimeoutMs > idleTimeoutMs
     ) {
       return false;
     }

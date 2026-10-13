@@ -53,7 +53,6 @@
     "src/generators/bun-test-tracing/generator.test.ts": 31,
     "src/generators/bounded-test-targets/generator.test.ts": 28,
     "src/managed-files/managed-content.test.ts": 27,
-    "src/executors/nextest-group/executor.test.ts": 25,
     "src/build-state-output-policy.test.ts": 22,
     "src/managed-files/tree-permissions.test.ts": 21,
     "src/test-program.test.ts": 21,

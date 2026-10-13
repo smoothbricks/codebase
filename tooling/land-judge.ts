@@ -170,8 +170,14 @@ function boundOf(task: string, record: unknown): Bound {
       return verdict.bound === 'total'
         ? { kind: 'total', limitMs: Number(verdict.limitMs) }
         : { kind: 'test', tests: Array.isArray(verdict.tests) ? verdict.tests.map(String) : [] };
-    case 'wedged':
-      return { why: `wedged: no output for ${String(verdict.idleMs)}ms after ${String(verdict.elapsedMs)}ms` };
+    case 'wedged': {
+      const running = Array.isArray(verdict.tests) && verdict.tests.length > 0 ? verdict.tests.join(', ') : null;
+      return {
+        why:
+          `wedged: no test finished for ${String(verdict.idleMs)}ms after ${String(verdict.elapsedMs)}ms; ` +
+          (running === null ? 'the runner named no test still running' : `still running: ${running}`),
+      };
+    }
     case 'failed':
       return {
         why:

@@ -159,8 +159,12 @@ describe('judgeTask', () => {
       bound: false,
       why: 'failed: pkg asserts',
     });
-    const wedged = recordOf({ outcome: 'wedged', idleMs: 60000, elapsedMs: 61000 });
-    expect(judgeTask(TASK, wedged, null).bound).toBe(false);
+    const wedged = recordOf({ outcome: 'wedged', idleMs: 180000, elapsedMs: 600000, tests: ['core tests::hangs'] });
+    expect(judgeTask(TASK, wedged, null)).toEqual({
+      task: TASK,
+      bound: false,
+      why: 'wedged: no test finished for 180000ms after 600000ms; still running: core tests::hangs',
+    });
     expect(judgeTask('other:test', perTestBound(shard), null)).toEqual({
       task: 'other:test',
       bound: false,

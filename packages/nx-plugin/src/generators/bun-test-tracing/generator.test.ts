@@ -3,9 +3,9 @@ import { addProjectConfiguration, readJson, type Tree } from 'nx/src/devkit-expo
 import { createTreeWithEmptyWorkspace } from 'nx/src/devkit-testing-exports.js';
 
 import {
+  BOUNDED_TEST_IDLE_TIMEOUT_MS,
   BOUNDED_TEST_KILL_AFTER_MS,
   BOUNDED_TEST_PER_TEST_TIMEOUT_MS,
-  BOUNDED_TEST_TIMEOUT_MS,
 } from '../../bounded-test-policy.js';
 import generator from './generator.js';
 
@@ -79,7 +79,7 @@ describe('bun-test-tracing generator', () => {
       options: {
         command: `bun test --timeout=${BOUNDED_TEST_PER_TEST_TIMEOUT_MS}`,
         cwd: '{projectRoot}',
-        timeoutMs: BOUNDED_TEST_TIMEOUT_MS,
+        idleTimeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
         killAfterMs: BOUNDED_TEST_KILL_AFTER_MS,
       },
     });

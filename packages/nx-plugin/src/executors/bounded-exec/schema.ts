@@ -1,19 +1,28 @@
-export interface BoundedExecOptions {
+/**
+ * A command and the bounds that end it. At least one bound is required: a run with neither would block Nx forever.
+ * A test target names only `idleTimeoutMs` (`bounded-test-policy.ts`); `timeoutMs` is for commands that report no
+ * tests, whose only progress is exiting.
+ */
+export type BoundedExecOptions = BoundedExecCommand & BoundedExecBounds;
+
+export type BoundedExecBounds =
+  | { timeoutMs: number; idleTimeoutMs?: number }
+  | { timeoutMs?: undefined; idleTimeoutMs: number };
+
+export interface BoundedExecCommand {
   command: string;
   cwd?: string;
   env?: Record<string, string>;
-  timeoutMs: number;
+  /** Absolute wall-clock ceiling: a backstop against an unbounded run, not a performance budget. */
+  timeoutMs?: number;
   /**
-   * Kill the process tree when it has produced no stdout or stderr for this
-   * long. Absent means no progress bound.
+   * Kill the process tree when no test has finished for this long (`progress.ts`). Absent means no progress bound.
    *
-   * This is the bound that catches a hang. A wedged process — a flock deadlock
-   * between two cargo writers, a transformer waiting on a lock nobody will
-   * release, a runner that ignores its own per-test timeout — emits nothing at
-   * all, so silence is the signal. Unlike `timeoutMs` it does not scale with
-   * machine speed or load: a machine ten times slower still prints progress,
-   * just further apart, and each gap is bounded by the slowest single unit of
-   * work rather than by the total.
+   * This is the bound that catches a hang. A hung test never finishes, whatever its runner keeps printing about it,
+   * and the tests still running when it fires are named in the verdict. Unlike `timeoutMs` it does not scale with
+   * the size of the suite or the load on the machine: a machine ten times slower still finishes tests, just further
+   * apart, and each gap is bounded by the slowest single test rather than by the total. A command that reports no
+   * tests makes progress only by exiting.
    */
   idleTimeoutMs?: number;
   killAfterMs?: number;

@@ -4,9 +4,9 @@ import { createTreeWithEmptyWorkspace } from 'nx/src/devkit-testing-exports.js';
 
 import {
   BOUNDED_TEST_EXECUTOR,
+  BOUNDED_TEST_IDLE_TIMEOUT_MS,
   BOUNDED_TEST_KILL_AFTER_MS,
   BOUNDED_TEST_PER_TEST_TIMEOUT_MS,
-  BOUNDED_TEST_TIMEOUT_MS,
 } from '../../bounded-test-policy.js';
 
 const TIMEOUT_FLAG = `--timeout=${BOUNDED_TEST_PER_TEST_TIMEOUT_MS}`;
@@ -47,7 +47,7 @@ describe('bounded-test-targets generator', () => {
       options: {
         command: `bun test ${TIMEOUT_FLAG} --target`,
         cwd: '{projectRoot}',
-        timeoutMs: BOUNDED_TEST_TIMEOUT_MS,
+        idleTimeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
         killAfterMs: BOUNDED_TEST_KILL_AFTER_MS,
       },
     });
@@ -70,7 +70,7 @@ describe('bounded-test-targets generator', () => {
       options: {
         command: `bun test ${TIMEOUT_FLAG} --script`,
         cwd: '{projectRoot}',
-        timeoutMs: BOUNDED_TEST_TIMEOUT_MS,
+        idleTimeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
         killAfterMs: BOUNDED_TEST_KILL_AFTER_MS,
       },
     });
@@ -116,7 +116,7 @@ describe('bounded-test-targets generator', () => {
       options: {
         command: `bun test ${TIMEOUT_FLAG} --project-target`,
         cwd: '{projectRoot}',
-        timeoutMs: BOUNDED_TEST_TIMEOUT_MS,
+        idleTimeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
         killAfterMs: BOUNDED_TEST_KILL_AFTER_MS,
       },
     });

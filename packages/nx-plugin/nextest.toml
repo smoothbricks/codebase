@@ -1,16 +1,18 @@
 # Injected by @smoothbricks/nx-plugin as `--config-file` on inferred cargo-test
-# package targets. `period` matches bun's `--timeout=30000`; `terminate-after = 1`
-# kills at that bound instead of warning then waiting another period.
+# package targets. `period` matches bun's `--timeout=30000`. A slow-timeout here
+# only warns: nextest prints a `SLOW` line naming the test every period, and
+# never kills it. The run's no-progress bound (`idleTimeoutMs`, README "Bounded
+# Test Targets") ends a test that never returns, and names it from those lines.
 [profile.default]
-slow-timeout = { period = "30s", terminate-after = 1 }
+slow-timeout = { period = "30s" }
 
 # Compile-fail tests compile fixture crates (or rustc a negative contract) as
 # their body. `cargo test --no-run` cannot pre-build those; they are generated
 # at test time. Filterset matches the class by test name rather than listing
 # today's two tests (`compile_fail_cases`, `lesser_capabilities_fail_to_compile_*`).
 #
-# 180s is provisional: measure the test alone on an idle machine.
-# An unbounded run phase is how a hung test becomes a hung lane.
+# Their raised period is what marks them exceptional: the plugin lifts them out
+# of the ordinary hash into partitions of their own.
 [[profile.default.overrides]]
 filter = 'test(/compile_fail|fail_to_compile/)'
-slow-timeout = { period = "180s", terminate-after = 1 }
+slow-timeout = { period = "180s" }

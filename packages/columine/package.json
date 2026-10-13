@@ -43,7 +43,7 @@
         "options": {
           "command": "bun test --timeout=30000 src/__tests__",
           "cwd": "{projectRoot}",
-          "timeoutMs": 120000,
+          "idleTimeoutMs": 180000,
           "killAfterMs": 10000
         }
       },
