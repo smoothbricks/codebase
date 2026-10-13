@@ -22,6 +22,9 @@ import { scaffold } from './wrangler/scaffold.js';
 import { type DeploymentStage, parseDeploymentStage, parsePullRequestNumber } from './wrangler/stage.js';
 
 export async function runCli(argv = process.argv.slice(2)): Promise<void> {
+  // Every Nx smoo loads in-process or starts answers from the installed Nx: a daemon otherwise installs `nx@latest` to
+  // answer Nx Console's status, and a client without the variable recomputes the daemon's graph.
+  process.env.NX_USE_LOCAL = 'true';
   const program = buildProgram();
   try {
     await program.parseAsync(argv, { from: 'user' });

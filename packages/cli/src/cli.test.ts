@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from 'bun:test';
 import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { reportFatal } from './cli.js';
+import { reportFatal, runCli } from './cli.js';
 import { mergeEnv } from './lib/run.js';
 
 const originalConsoleError = console.error;
@@ -25,6 +25,25 @@ describe('CLI fatal error reporting', () => {
     reportFatal(failure);
 
     expect(output).toEqual([[failure]]);
+  });
+});
+
+// The installed Nx answers every Nx smoo loads or starts, whatever smoo was started with: a daemon an unset client
+// starts installs `nx@latest` from the registry for Nx Console's status (patches/README.md).
+describe('smoo and Nx', () => {
+  it('runs every Nx it loads or starts with NX_USE_LOCAL=true', async () => {
+    const caller = process.env.NX_USE_LOCAL;
+    const log = console.log;
+    try {
+      process.env.NX_USE_LOCAL = 'false';
+      console.log = () => {};
+      await runCli(['--version']);
+      expect(process.env.NX_USE_LOCAL).toBe('true');
+    } finally {
+      console.log = log;
+      if (caller === undefined) delete process.env.NX_USE_LOCAL;
+      else process.env.NX_USE_LOCAL = caller;
+    }
   });
 });
 
