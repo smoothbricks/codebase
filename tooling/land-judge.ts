@@ -33,13 +33,43 @@
 //       The tasks Nx did not run behind a failed task, from the run's Nx output, as `nx run-many` groups in dependency
 //       order, from the task graph `nx run-many --graph=FILE` wrote. A tolerated failure must not hide the tasks
 //       behind it.
+//   history CHECKOUT NEW_MAIN
+//       Refuses a source containing the known pre-rewrite main before any ordinary rebase.
 //   forget [TASK]
 //       Deletes bounded-exec's records, of TASK or of every task, so none is read as the next run's.
+import { spawnSync } from 'node:child_process';
 import { readFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { parseArgs } from 'node:util';
 import { workspaceDataDirectoryForWorkspace } from 'nx/src/utils/cache-directory.js';
 import { workspaceRoot } from 'nx/src/utils/workspace-root.js';
+
+/** The unpublished main whose ancestry the public rewrite replaced. */
+export const PRE_REWRITE_MAIN = 'e9e596563bfaa8b337893bb7df9937f9f65d06ea';
+
+export type HistoryVerdict =
+  | { readonly kind: 'clean' }
+  | { readonly kind: 'refused'; readonly why: string; readonly remedy: string }
+  | { readonly kind: 'unavailable'; readonly why: string };
+
+/** Judge actual source ancestry without needing the forbidden object in a clean clone. */
+export function judgeHistory(checkout: string, newMain: string, forbiddenAncestor = PRE_REWRITE_MAIN): HistoryVerdict {
+  const history = spawnSync('git', ['-C', checkout, 'rev-list', 'HEAD'], { encoding: 'utf8' });
+  if (history.status !== 0) {
+    return {
+      kind: 'unavailable',
+      why: history.error?.message ?? history.stderr.trim(),
+    };
+  }
+  if (history.stdout.split('\n').includes(forbiddenAncestor)) {
+    return {
+      kind: 'refused',
+      why: 'source ancestry contains pre-rewrite main ' + forbiddenAncestor,
+      remedy: 'git rebase --onto ' + newMain + ' ' + forbiddenAncestor.slice(0, 9),
+    };
+  }
+  return { kind: 'clean' };
+}
 
 export type Runner = 'nextest' | 'bun';
 
@@ -422,6 +452,22 @@ function main(argv: readonly string[]): number {
   const [command, first, second] = positionals;
   const data = values.data ?? workspaceDataDirectoryForWorkspace(workspaceRoot);
   switch (command) {
+    case 'history': {
+      if (first === undefined || second === undefined) {
+        throw new Error('usage: land-judge.ts history CHECKOUT NEW_MAIN');
+      }
+      const verdict = judgeHistory(first, second);
+      switch (verdict.kind) {
+        case 'clean':
+          return 0;
+        case 'refused':
+          process.stderr.write('land-judge: ' + verdict.why + '\nnext: ' + verdict.remedy + '\n');
+          return 1;
+        case 'unavailable':
+          process.stderr.write('land-judge: source ancestry unavailable: ' + verdict.why + '\n');
+          return 1;
+      }
+    }
     case 'failures': {
       if (first === undefined) {
         throw new Error('usage: land-judge.ts failures OUTPUT');
@@ -480,7 +526,7 @@ function main(argv: readonly string[]): number {
     }
     default:
       throw new Error(
-        'usage: land-judge.ts <failures OUTPUT | rerun-args TASK | coverage TASK OUTPUT | skipped OUTPUT --graph FILE | forget [TASK]>',
+        'usage: land-judge.ts <history CHECKOUT NEW_MAIN | failures OUTPUT | rerun-args TASK | coverage TASK OUTPUT | skipped OUTPUT --graph FILE | forget [TASK]>',
       );
   }
 }

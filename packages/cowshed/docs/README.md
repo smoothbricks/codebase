@@ -114,6 +114,9 @@ cowshed exec "$WS" -- bun test
 cowshed land "$WS"
 ```
 
+The SmoothBricks host land gate refuses a source containing pre-rewrite main `e9e596563` before rebasing and names the
+ordinary remedy `git rebase --onto <new-main> e9e596563`; it never replays that old range.
+
 From outside the repository, make selection explicit:
 
 ```sh

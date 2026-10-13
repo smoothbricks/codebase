@@ -915,6 +915,9 @@ rebase would land a head nobody named whenever main had moved. A workspace whose
 fast-forward with exit 4 and a hint naming `cowshed rebase <ws>`; rebasing and re-running the gates is the caller's
 step.
 
+The SmoothBricks host land gate refuses a source containing pre-rewrite main `e9e596563` before rebasing and names the
+ordinary remedy `git rebase --onto <new-main> e9e596563`; it never replays that old range.
+
 1. **Refuse a dirty tree** (exit 4), read exactly as `rm` reads one (a tracked change, or an untracked file that is not
    hidden, not ignored by main's current rules, and not held by main's checkout with the same content). The check runs
    in the working tree but only the commit lands, so uncommitted work would be validated without landing, and would then
