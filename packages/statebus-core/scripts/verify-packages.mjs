@@ -9,6 +9,20 @@ import { fileURLToPath } from 'node:url';
 import { prunePublishedExports } from '../../cli/src/monorepo/published-exports.ts';
 
 const root = fileURLToPath(new URL('../../..', import.meta.url));
+const flechettePatch = {
+  package: '@uwdata/flechette@2.7.0',
+  path: 'patches/@uwdata%2Fflechette@2.7.0.patch',
+  sha256: '5d5afe8a8df9f19b991c23809df690fa63992d093131f123a3584fd178304abc',
+};
+// Registry Flechette 2.7.0 has broken owner declarations. Model the real consumer-root
+// patch recipe, never a source alias or skipLibCheck, and retain its exact bytes in evidence.
+assert.equal(
+  createHash('sha256')
+    .update(readFileSync(join(root, flechettePatch.path)))
+    .digest('hex'),
+  flechettePatch.sha256,
+  'packed consumers require the exact reviewed Flechette declaration patch',
+);
 const statebusNames = [
   'statebus-core',
   'statebus-react',
@@ -109,11 +123,20 @@ try {
       recursive: true,
       filter: (path) => !['dist', 'node_modules', '.cache'].includes(path.split(sep).at(-1)),
     });
+    mkdirSync(join(consumer, 'patches'), { recursive: true });
+    cpSync(join(root, flechettePatch.path), join(consumer, flechettePatch.path));
     writeFileSync(
       join(consumer, 'package.json'),
       // These exact prereleases are not on npm yet. Map transitive requests to the
       // same unmodified tarballs; the packed semver edges were asserted above.
-      JSON.stringify({ name: 'statebus-packed-consumer', private: true, type: 'module', dependencies, overrides }),
+      JSON.stringify({
+        name: 'statebus-packed-consumer',
+        private: true,
+        type: 'module',
+        dependencies,
+        overrides,
+        patchedDependencies: { [flechettePatch.package]: flechettePatch.path },
+      }),
     );
     // Keep every dependency inside this disposable install, including with Bun's
     // isolated linker. No workspace source, global store, or TS paths overrides.
@@ -189,9 +212,10 @@ try {
         sourceCommit: process.env.GITHUB_SHA ?? process.env.STATEBUS_BENCH_COMMIT ?? 'working-tree',
         versions: process.versions,
         packages: summaries,
+        dependencyPatches: [flechettePatch],
         consumers,
         verified: [
-          'strict declarations',
+          'strict declarations with the reviewed Flechette 2.7.0 consumer-root patch',
           'Node consumer',
           'Bun consumer',
           'packed dependency installations',
