@@ -920,6 +920,7 @@ async fn the_row_states_the_reconciliation_whatever_leaf_the_sample_names() {
                 pid: 100,
                 program: "/bin/sh".into(),
                 argv: vec!["/bin/sh".into()],
+                truncated: false,
             },
             observed_cpu_permille: 950,
         },
