@@ -6,6 +6,8 @@
         "module": "cowshed_core::api::fixture",
         "visibility": { "kind": "super" },
         "docs": [],
+        "copy": false,
+        "staticSize": null,
         "serde": {
           "rename": null,
           "renameAll": null,
@@ -49,6 +51,8 @@
         "module": "cowshed_core::api::fixture",
         "visibility": { "kind": "restricted", "path": "crate::api::fixture" },
         "docs": ["An externally tagged enum."],
+        "copy": true,
+        "staticSize": null,
         "serde": {
           "rename": null,
           "renameAll": null,
@@ -211,6 +215,8 @@
         "module": "cowshed_core::api::fixture::inner",
         "visibility": { "kind": "crate" },
         "docs": [],
+        "copy": false,
+        "staticSize": null,
         "serde": {
           "rename": null,
           "renameAll": null,
@@ -308,6 +314,8 @@
         "module": "cowshed_core::api::fixture",
         "visibility": { "kind": "private" },
         "docs": [],
+        "copy": false,
+        "staticSize": 0,
         "serde": {
           "rename": null,
           "renameAll": null,
@@ -343,6 +351,8 @@
         "module": "cowshed_core::api::fixture",
         "visibility": { "kind": "public" },
         "docs": ["A source-owned declaration.", "Second docs line."],
+        "copy": false,
+        "staticSize": null,
         "serde": {
           "rename": "wireName",
           "renameAll": "camelCase",
