@@ -11,6 +11,8 @@ use cowshed_core::api::ControllerCommitment;
 use cowshed_core::api::dto::{AdoptOptions, ForkOptions, RemoveOptions, RevisionTarget};
 use cowshed_core::api::operations::OperationRequest;
 use cowshed_core::api::server::ConnectionAuthority;
+use cowshed_apfs::attach_budget;
+use cowshed_os::fork_lock::{self, Run as _};
 use cowshed_core::metadata::{
     DetachedWorkspaceMetadata, ImageCapacity, PortBlock, PublicationState, WorkspaceIncarnation,
     WorkspaceName,
