@@ -544,13 +544,14 @@ describe('CI workflow rendering by repo shape', () => {
     expect(ci).not.toContain('e2e-deployment');
     expect(renderManagedWorkflowForTest('publish-workflow', shape)).not.toContain('Deploy production');
     expect(managedFileTargetsForContext(shape)).not.toContain('.github/workflows/pr-preview-cleanup.yml');
+    expect(managedFileTargetsForContext(shape)).not.toContain('.github/workflows/pr-stage-sweep.yml');
   });
 
-  it('adds the preview cleanup workflow only where a cloudflare stage deploy makes preview stages', () => {
-    expect(managedFileTargetsForContext(deploying)).toContain('.github/workflows/pr-preview-cleanup.yml');
-    expect(managedFileTargetsForContext({ ...deploying, stagingDeployProvider: undefined })).not.toContain(
-      '.github/workflows/pr-preview-cleanup.yml',
-    );
+  it('adds the preview cleanup and sweep workflows only where a cloudflare stage deploy makes preview stages', () => {
+    for (const workflow of ['.github/workflows/pr-preview-cleanup.yml', '.github/workflows/pr-stage-sweep.yml']) {
+      expect(managedFileTargetsForContext(deploying)).toContain(workflow);
+      expect(managedFileTargetsForContext({ ...deploying, stagingDeployProvider: undefined })).not.toContain(workflow);
+    }
   });
 
   it('threads the declared private npm read token into the preview cleanup job', () => {

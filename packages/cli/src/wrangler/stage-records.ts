@@ -122,6 +122,27 @@ function repositoryScope(url: string): string | undefined {
   return `${host}/${segments.join('/')}`.toLowerCase();
 }
 
+/** Every stage key of `scope` starts with this: the prefix a sweep lists to find recorded stages. */
+export function scopeRecordPrefix(scope: string): string {
+  return `${KEY_VERSION}/${encodeURIComponent(scope)}/`;
+}
+
+/**
+ * The pull requests `scope` holds records for, ascending, from keys listed under `scopeRecordPrefix`.
+ * Only a segment a deploy writes (`pr` and canonical digits) names a stage; anything else under the
+ * prefix is not a stage's and is skipped rather than guessed at.
+ */
+export function recordedPullRequests(scope: string, keys: string[]): number[] {
+  const prefix = scopeRecordPrefix(scope);
+  const numbers = new Set<number>();
+  for (const key of keys) {
+    if (!key.startsWith(prefix)) continue;
+    const match = /^pr([1-9]\d*)\//.exec(key.slice(prefix.length));
+    if (match) numbers.add(Number(match[1]));
+  }
+  return [...numbers].sort((a, b) => a - b);
+}
+
 /** Every key of `stage` starts with this; the trailing slash keeps `pr7` from listing `pr70`. */
 export function stageRecordPrefix(scope: string, stage: `pr${number}`): string {
   return `${KEY_VERSION}/${encodeURIComponent(scope)}/${stage}/`;

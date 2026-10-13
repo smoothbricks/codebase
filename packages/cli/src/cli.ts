@@ -1,3 +1,4 @@
+import { appendFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { Command, CommanderError, InvalidArgumentError, Option } from 'commander';
 import { variants } from './generate/index.js';
@@ -20,6 +21,7 @@ import {
 import { deployedVersion } from './wrangler/deployed-version.js';
 import { scaffold } from './wrangler/scaffold.js';
 import { type DeploymentStage, parseDeploymentStage, parsePullRequestNumber } from './wrangler/stage.js';
+import { describeSweep, sweepNeedsAttention, sweepRepositoryStages } from './wrangler/stage-sweep.js';
 
 export async function runCli(argv = process.argv.slice(2)): Promise<void> {
   // Every Nx smoo loads in-process or starts answers from the installed Nx: a daemon otherwise installs `nx@latest` to
@@ -702,6 +704,36 @@ function buildProgram(): Command {
       }
       const result = await cleanupPullRequest(root, pr);
       console.log(json ? JSON.stringify(result, null, 2) : describeCleanup(result));
+    });
+  wrangler
+    .command('sweep-pr-stages')
+    .description(
+      'Clean up every recorded prN stage whose pull request is closed, and fail when the account nears its Durable Object namespace limit',
+    )
+    .option(
+      '--pr <number>',
+      'sweep only this pull request, still only if closed',
+      usageArgument(parsePullRequestNumber),
+    )
+    .option('--json', 'write the result as JSON instead of a report')
+    .action(async (options: { pr?: number; json?: boolean }) => {
+      const result = await sweepRepositoryStages(
+        await findRepoRoot(),
+        options.pr === undefined ? {} : { only: options.pr },
+      );
+      const report = describeSweep(result);
+      console.log(options.json === true ? JSON.stringify(result, null, 2) : report);
+      if (process.env.GITHUB_STEP_SUMMARY) await appendFile(process.env.GITHUB_STEP_SUMMARY, report);
+      if (sweepNeedsAttention(result)) {
+        const reasons = [
+          ...result.failed.map(({ pr }) => `pr${pr} could not be cleaned up`),
+          ...(result.namespaces.over
+            ? [`${result.namespaces.count} of ${result.namespaces.limit} Durable Object namespaces are in use`]
+            : []),
+        ];
+        console.error(`::error title=PR stage sweep::${reasons.join('; ')}`);
+        process.exitCode = 1;
+      }
     });
 
   return program;

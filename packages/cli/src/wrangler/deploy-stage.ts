@@ -1213,10 +1213,19 @@ async function wrangler(runner: ProcessRunner, args: string[], run: ProcessRunOp
   const result = await runner.run('wrangler', args, run);
   if (result.exitCode !== 0) {
     printCommandOutput(result.stdout, result.stderr);
-    throw new Error(`wrangler ${args.join(' ')} failed with exit code ${result.exitCode}`);
+    const failure = `wrangler ${args.join(' ')} failed with exit code ${result.exitCode}`;
+    // Cloudflare's code for the account's 500th Durable Object namespace; wrangler prints it as `[code: 10067]`.
+    if (/\[code: 10067\]/.test(`${result.stdout}\n${result.stderr}`)) {
+      throw new Error(`${failure}. ${DURABLE_OBJECT_LIMIT_HINT}`);
+    }
+    throw new Error(failure);
   }
   return result;
 }
+
+/** What to do when a deploy hits Cloudflare 10067: the managed PR Stage Sweep frees closed pull requests' namespaces. */
+export const DURABLE_OBJECT_LIMIT_HINT =
+  'The Cloudflare account is at its limit of 500 Durable Object namespaces (error 10067), usually held by the stages of closed pull requests. Run the "PR Stage Sweep" workflow by hand (Actions > PR Stage Sweep > Run workflow, PR number empty) to collect them, or `smoo wrangler sweep-pr-stages` with the stage deploy\u2019s Cloudflare credentials, then re-run this deploy.';
 
 function requiredEnvironmentValue(value: string | undefined, name: string): string {
   if (!value) throw new Error(`${name} is required.`);

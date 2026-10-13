@@ -784,9 +784,9 @@ job that deploys nothing, nor deploy a project no job announced.
 
 An untagged `deploy` target is deployable by hand — `nx run <project>:deploy --stage=pr42` — and invisible to CI. A
 repository where no project carries one of these tags gets no deploy step, no `deployments: write` permission, no
-Cloudflare credentials and no `pr-preview-cleanup.yml`, however many wrangler manifests its packages hold: a published
-library ships one to document a Durable Object binding for its consumers, and that manifest looks exactly like a
-deployable worker's.
+Cloudflare credentials and no `pr-preview-cleanup.yml` or `pr-stage-sweep.yml`, however many wrangler manifests its
+packages hold: a published library ships one to document a Durable Object binding for its consumers, and that manifest
+looks exactly like a deployable worker's.
 
 Tag a project `production-push-deploy-target` to have it deployed to production by a generated `deploy-production` job
 that runs after Validate and the e2e job succeed on a push to the staging push branch
@@ -1266,6 +1266,26 @@ Known gaps:
   [Upgrading to a smoo that records stages](#upgrading-to-a-smoo-that-records-stages).
 - Wrangler's own Workers Sites namespace (`__<worker>-workers_sites_assets`) is not in the plan, so it is not recorded
   and not deleted.
+
+### `smoo wrangler sweep-pr-stages [--pr <number>] [--json]`
+
+The safety net behind `cleanup-pr`. The generated `pr-preview-cleanup.yml` runs `cleanup-pr` when a pull request closes
+and retries it three times; a cleanup that still fails, was cancelled or never ran leaves the stage's Workers, and their
+Durable Object namespaces, against the account's limit of 500. Past it every stage deploy fails with Cloudflare error
+10067, and `deploy-stage` then names this command and the workflow that runs it.
+
+The generated `pr-stage-sweep.yml` runs this every 6 hours and by hand (Actions > PR Stage Sweep, optionally with one PR
+number). It lists every `prN` this repository holds records for, asks the forge for each pull request's state with
+`GH_TOKEN`/`GITHUB_TOKEN`, and runs `cleanup-pr` for each one that is closed and whose head and base are this
+repository. An open pull request is kept; a state the forge cannot answer is a failure, never read as closed. One
+stage's failure does not stop the others. `--pr` restricts the sweep to that one pull request, still only if closed.
+
+It then counts the account's Durable Object namespaces and writes a report to stdout and, in Actions, the job summary.
+It exits 1 when a stage could not be cleaned up or when more than 80% of the 500 namespaces are in use, so the scheduled
+run goes red and the forge notifies. Like `cleanup-pr`, it deletes only recorded items: a stage deployed before smoo
+recorded stages is not found, and what holds namespaces then has to be found by hand. The sweep runs outside the pull
+requests' CI concurrency groups: a pull request reopened and deployed between its state lookup and its cleanup loses
+that deploy, as with re-running an old cleanup job (above).
 
 ### Upgrading to a smoo that records stages
 

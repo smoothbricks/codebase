@@ -96,9 +96,74 @@ ${preflightSteps(options)}
       - name: Setup Nix/devenv
         uses: ./.github/actions/setup-devenv
 
+      # A transient Cloudflare or network failure retries here; one that outlasts
+      # the retries is collected by the scheduled PR Stage Sweep, because
+      # cleanup-pr keeps the records of a cleanup that stopped.
       - name: Cleanup PR environment
 ${cloudflareCredentialEnvLines(options.deploySecrets).join('\n')}
-        run: smoo wrangler cleanup-pr --pr \${{ github.event.pull_request.number }}
+        run: |
+          for attempt in 1 2 3; do
+            smoo wrangler cleanup-pr --pr \${{ github.event.pull_request.number }} && exit 0
+            echo "::warning::cleanup attempt $attempt failed"
+            if [ "$attempt" -lt 3 ]; then sleep $((attempt * 30)); fi
+          done
+          echo "::error::cleanup failed 3 times; the scheduled PR Stage Sweep retries it"
+          exit 1
+`;
+}
+
+/**
+ * The safety net behind the close-time cleanup: every 6 hours, and by hand, it collects the stage of
+ * every closed pull request that still holds records, and fails (red run, job summary) when the
+ * account nears Cloudflare's 500 Durable Object namespace limit. A hand run may name one pull
+ * request; it is collected only if closed, exactly as the sweep decides.
+ */
+export function renderPrStageSweepWorkflowYaml(options: PrPreviewCleanupWorkflowOptions = {}): string {
+  return `name: PR Stage Sweep
+
+on:
+  schedule:
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: One pull request number to collect if closed; empty sweeps every closed pull request
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  pull-requests: read
+
+# One sweep at a time; a hand run waits for a scheduled one instead of racing it.
+concurrency:
+  group: pr-stage-sweep
+  cancel-in-progress: false
+
+jobs:
+  sweep:
+    name: Sweep closed PR stages
+${renderRunsOnLine(options.runsOn)}
+    timeout-minutes: 60
+${environmentLine(options.environments?.staging)}    defaults:
+      run:
+        working-directory: tooling/direnv
+${setupJobEnv(options)}    steps:
+      - name: Checkout
+        uses: ${githubActionPins.checkout.ref} # ${githubActionPins.checkout.version}
+        with:
+          filter: blob:none
+          fetch-depth: 1
+          persist-credentials: false
+${preflightSteps(options)}
+      - name: Setup Nix/devenv
+        uses: ./.github/actions/setup-devenv
+
+      - name: Sweep closed PR stages
+${cloudflareCredentialEnvLines(options.deploySecrets).join('\n')}
+          GH_TOKEN: \${{ github.token }}
+          PR: \${{ inputs.pr }}
+        run: smoo wrangler sweep-pr-stages \${PR:+--pr "$PR"}
 `;
 }
 
