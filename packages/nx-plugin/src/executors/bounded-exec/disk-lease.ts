@@ -36,6 +36,12 @@ export function diskClassOf(file: string, args: readonly string[] = []): DiskCla
   return Object.hasOwn(CLASS_BY_PROGRAM, file) ? CLASS_BY_PROGRAM[file] : null;
 }
 
+/**
+ * How much of its class's running phase a lease takes: one place beside the phase's other members, or the whole
+ * phase, so its command queues in `storagekitd` behind nobody (specs/cowshed/05_gateway.md, "Disk-lifecycle lease").
+ */
+export type PhaseShare = 'shared' | 'alone';
+
 /** A granted lease, held until released, or why the command runs without one. */
 export type LeaseOutcome =
   | { granted: true; release: () => void }
@@ -105,18 +111,32 @@ function leaseWaitRecord(): WaitRecord | null {
 }
 
 /**
- * Ask the gateway at `socket` for a `diskClass` lease for `command` (`holdLease`). The wait is appended to this
- * process's lease-wait record when the environment names one, and its end is appended however the ask ends.
+ * The share this process asks for: `alone` when its waits are recorded, so its test's code time holds no other
+ * process's disk work, and `shared` otherwise (specs/cowshed/08_testing.md, "Integration tests (real substrate)").
+ */
+export function recordedShare(): PhaseShare {
+  return leaseWaitRecord() === null ? 'shared' : 'alone';
+}
+
+/**
+ * Ask the gateway at `socket` for `share` of a `diskClass` phase for `command` (`holdLease`). A shared request names no
+ * `share`, so every lease-scheduling gateway reads it. The wait is appended to this process's lease-wait record when
+ * the environment names one, and its end is appended however the ask ends.
  */
 export async function takeDiskLease(
   socket: string,
   diskClass: DiskClass,
   command: string,
   bounds: LeaseBounds,
+  share: PhaseShare,
 ): Promise<LeaseOutcome> {
   const endWait = leaseWaitRecord()?.begin(diskClass);
+  const request =
+    share === 'alone'
+      ? { op: 'disk-lease', class: diskClass, share, command }
+      : { op: 'disk-lease', class: diskClass, command };
   try {
-    const lease = await holdLease(socket, { op: 'disk-lease', class: diskClass, command }, 'disk leases', bounds);
+    const lease = await holdLease(socket, request, 'disk leases', bounds);
     return lease.granted ? { granted: true, release: lease.release } : lease;
   } finally {
     endWait?.();

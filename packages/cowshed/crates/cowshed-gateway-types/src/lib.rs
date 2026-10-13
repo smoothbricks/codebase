@@ -23,7 +23,9 @@ pub mod session;
 pub mod status;
 
 pub use cpu_budget::{CPU_TOKENS_OP, CpuBudgetStatus, CpuCheckoutStatus, CpuTokensRequest};
-pub use disk_lease::{DISK_LEASE_OP, DiskClass, DiskLeaseAnswer, DiskLeaseRequest, LeaseState};
+pub use disk_lease::{
+    DISK_LEASE_OP, DiskClass, DiskLeaseAnswer, DiskLeaseRequest, LeaseState, PhaseShare,
+};
 pub use policy::{
     CanonicalHost, CanonicalTarget, EgressGrant, EgressMode, HostPattern, MirrorProtocol,
     MirrorRoute, PolicyDenial, PolicyError, ResolvedMirrorRoute, TargetScheme, WorkspacePolicy,

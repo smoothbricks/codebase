@@ -167,6 +167,40 @@ describe('RAM temp volume on this host', () => {
       rmSync(directory, { recursive: true, force: true });
     }
   });
+
+  it('asks a gateway that refuses alone leases shared at once, and shared for a minute after', async () => {
+    // A lease-scheduling gateway from before `share` refuses the field at once; the refused command
+    // still runs leased, and later ones do not ask alone again.
+    const directory = await ownedSocketDirectory('rt-', 'gw.sock');
+    const socket = join(directory, 'gw.sock');
+    const asked: string[] = [];
+    const server = createServer({ allowHalfOpen: true }, (client) => {
+      client.once('data', (chunk) => {
+        const line = chunk.toString('utf8');
+        asked.push(line.includes('"share":"alone"') ? 'alone' : 'shared');
+        client.end(
+          line.includes('"share"')
+            ? '{"ok":false,"code":"invalid-request","error":"gateway control encoding failed: gateway control request contains an unknown field"}\n'
+            : '{"ok":true,"lease":"queued"}\n{"ok":true,"lease":"granted"}\n',
+        );
+      });
+    });
+    try {
+      const { promise: listening, resolve: listened, reject: failed } = Promise.withResolvers<void>();
+      server.once('error', failed);
+      server.listen(socket, listened);
+      await listening;
+      server.off('error', failed);
+      const host = createHostCommands(10_000, socket, 'alone');
+      // `umount` with no operand only prints its usage, and it is a disk tool that takes a lease.
+      expect((await host.run('/sbin/umount', [])).status).not.toBe(0);
+      expect((await host.run('/sbin/umount', [])).status).not.toBe(0);
+      expect(asked).toEqual(['alone', 'shared', 'shared']);
+    } finally {
+      server.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('processes a task left working in its RAM lease', () => {

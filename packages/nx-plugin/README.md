@@ -951,7 +951,8 @@ never overlap on the host, because an attach does not finish while the mount tab
 `diskutil renameVolume` is the spec's exception and takes no lease. The lease wait comes before the command's deadline.
 Without a grant the command runs unleased and stderr says why; a gateway that is not running is said once per process. A
 gateway from before disk leases answers only after 2 s of silence, so once one is found the process stops asking it for
-a minute, as cowshed's own commands do.
+a minute, as cowshed's own commands do. A process whose lease waits are recorded (`COWSHED_LEASE_WAIT_RECORD`) asks for
+its phase `alone`; a gateway from before `alone` refuses the field at once and is asked shared instead, for a minute.
 
 Without an inherited parent pool, a `bounded-exec` command takes CPU tokens from cowshed's host budget before it starts,
 when the gateway answers on the same socket (`specs/cowshed/05_gateway.md`, "Host CPU budget"), so concurrent gates on
