@@ -5,8 +5,9 @@ use std::process::Command;
 use cowshed_core::api::dto::{AdoptOptions, CreateOptions, RemoveOptions, RevisionTarget};
 use cowshed_core::api::operations::OperationRequest;
 use cowshed_core::api::server::ConnectionAuthority;
-use cowshed_os::fork_lock::Run as _;
-use cowshed_core::metadata::{DetachedWorkspaceMetadata, PortBlock, PublicationState, WorkspaceName};
+use cowshed_core::metadata::{
+    DetachedWorkspaceMetadata, PortBlock, PublicationState, WorkspaceName,
+};
 use cowshed_core::repository::RepoId;
 use cowshed_core::runtime::{ProjectRuntime, RecoveryScope, supervisor_socket};
 use cowshed_core::storage::StorageLayout;
@@ -16,6 +17,7 @@ use cowshed_core::storage::recovery::{
     LifecycleIntentPhase, LifecycleIntentRecord,
 };
 use cowshed_core::{CowshedError, Result};
+use cowshed_os::fork_lock::Run as _;
 use serde_json::{Value, json};
 
 #[path = "../support/scratch_directory.rs"]
@@ -91,9 +93,13 @@ impl Fixture {
     /// What `cowshed gc` opens: store-wide recovery, which finishes every unfinished intent as
     /// residue.
     async fn gc(&self) -> ProjectRuntime {
-        ProjectRuntime::open_directory_existing_at(&self.checkout, RecoveryScope::Store, self.storage.clone())
-            .await
-            .expect("store-scope recovery opens the project")
+        ProjectRuntime::open_directory_existing_at(
+            &self.checkout,
+            RecoveryScope::Store,
+            self.storage.clone(),
+        )
+        .await
+        .expect("store-scope recovery opens the project")
     }
 
     /// What `cowshed new <workspace>` and other verbs naming it open: their own intents and

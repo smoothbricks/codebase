@@ -10,16 +10,16 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use super::{MacOsApfsExecutionHost, io_error};
-use cowshed_apfs::{ApfsBackend, CommandRunner, DetachIntent, MountAccess};
-use cowshed_os::process::Holder;
 use crate::build_volume::{
     BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord, BuildVolumeRole, LinkResolution,
     ReleaseClaim, link,
 };
-use cowshed_apfs::image::ImageCapacity;
 use crate::metadata::{WorkspaceIncarnation, WorkspaceName};
 use crate::storage::apfs::{ApfsExecutionHost, ApfsStorageError};
 use crate::storage::lifecycle::ResizeOutcome;
+use cowshed_apfs::image::ImageCapacity;
+use cowshed_apfs::{ApfsBackend, CommandRunner, DetachIntent, MountAccess};
+use cowshed_os::process::Holder;
 
 /// What releasing a build volume did.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -639,15 +639,15 @@ impl<'a> MountPoint<'a> {
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
-    use cowshed_apfs::{
-        AttachedDiskImage, CommandOutput, CommandRequest, CommandRunError, SystemCommandRunner,
-    };
     use crate::api::resources::JobAccounting;
     use crate::build_volume::BuildVolumeRole;
-    use cowshed_os::fork_lock::Fenced;
     use crate::metadata::WorkspaceName;
     use crate::repository::{ProjectPaths, RepoId};
     use crate::storage::apfs::ApfsSubstrateConfig;
+    use cowshed_apfs::{
+        AttachedDiskImage, CommandOutput, CommandRequest, CommandRunError, SystemCommandRunner,
+    };
+    use cowshed_os::fork_lock::Fenced;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant, SystemTime};
 
