@@ -131,7 +131,7 @@ const FAKE_CARGO: &str = r#"#!/bin/sh
   echo "BOUNDED_EXEC_CPU_TOKENS=$BOUNDED_EXEC_CPU_TOKENS"
 } > "$FAKE_CARGO_OUT"
 echo $$ > "$FAKE_CARGO_PID"
-if [ "$FAKE_CARGO_SLEEP" = "1" ]; then sleep 60; fi
+if [ "$FAKE_CARGO_SLEEP" = "1" ]; then exec sleep 60; fi
 exit "${FAKE_CARGO_EXIT:-0}"
 "#;
 
