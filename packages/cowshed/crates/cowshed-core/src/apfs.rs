@@ -8389,13 +8389,31 @@ mod tests {
         let backend = MacOsApfsBackend::new(SystemCommandRunner);
         let image = root.join("attach.dmg");
         crate::blank_image::blank_image(&image);
-        // Say when the attach's disk child exists, so the parent kills mid-attach, not
-        // before it: any other process working in this root is the attach's own tree.
+        // Say when the attach's own diskutil exists, so the parent kills mid-attach, not
+        // during the inventory reads before it: a process working in this root whose
+        // executable is diskutil is the attach itself.
         let watched = root.clone();
         std::thread::spawn(move || {
             loop {
                 let found = crate::scratch_apfs::processes_in(|cwd| cwd.starts_with(&watched))
-                    .is_ok_and(|found| !found.is_empty());
+                    .is_ok_and(|found| {
+                        found.iter().any(|(pid, _)| {
+                            let mut path = [0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+                            // SAFETY: `path` is writable for its whole length, the size passed.
+                            let length = unsafe {
+                                libc::proc_pidpath(
+                                    *pid,
+                                    path.as_mut_ptr().cast(),
+                                    path.len() as u32,
+                                )
+                            };
+                            usize::try_from(length).is_ok_and(|length| {
+                                length > 0
+                                    && String::from_utf8_lossy(&path[..length])
+                                        .ends_with("/diskutil")
+                            })
+                        })
+                    });
                 if found {
                     println!("inflight");
                     return;
