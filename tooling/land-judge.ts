@@ -64,8 +64,8 @@ export function judgeHistory(checkout: string, newMain: string, forbiddenAncesto
   if (history.stdout.split('\n').includes(forbiddenAncestor)) {
     return {
       kind: 'refused',
-      why: 'source ancestry contains pre-rewrite main ' + forbiddenAncestor,
-      remedy: 'git rebase --onto ' + newMain + ' ' + forbiddenAncestor.slice(0, 9),
+      why: `source ancestry contains pre-rewrite main ${forbiddenAncestor}`,
+      remedy: `git rebase --onto ${newMain} ${forbiddenAncestor.slice(0, 9)}`,
     };
   }
   return { kind: 'clean' };
@@ -457,16 +457,15 @@ function main(argv: readonly string[]): number {
         throw new Error('usage: land-judge.ts history CHECKOUT NEW_MAIN');
       }
       const verdict = judgeHistory(first, second);
-      switch (verdict.kind) {
-        case 'clean':
-          return 0;
-        case 'refused':
-          process.stderr.write('land-judge: ' + verdict.why + '\nnext: ' + verdict.remedy + '\n');
-          return 1;
-        case 'unavailable':
-          process.stderr.write('land-judge: source ancestry unavailable: ' + verdict.why + '\n');
-          return 1;
+      if (verdict.kind === 'clean') {
+        return 0;
       }
+      const why =
+        verdict.kind === 'refused'
+          ? `${verdict.why}\nnext: ${verdict.remedy}`
+          : `source ancestry unavailable: ${verdict.why}`;
+      process.stderr.write(`land-judge: ${why}\n`);
+      return 1;
     }
     case 'failures': {
       if (first === undefined) {
