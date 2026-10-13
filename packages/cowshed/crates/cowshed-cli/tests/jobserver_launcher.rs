@@ -3,6 +3,7 @@
 //! cases, the variables it sets or leaves, and a `SIGKILL`ed `cargo`
 //! mid-build leaving the ledger whole and its fifo unlinked.
 
+use cowshed_os::fork_lock::Run as _;
 use std::io::Write as _;
 use std::num::NonZeroUsize;
 use std::os::unix::fs::PermissionsExt as _;
@@ -235,6 +236,26 @@ async fn the_launcher_sizes_each_case_and_a_killed_cargo_leaves_the_ledger_whole
     assert_eq!(code, 7);
     let shown = env_out();
     assert!(shown.contains("CARGO_MAKEFLAGS=\n"), "{shown}");
+
+    // Exercise the real CLI entrypoint through cargo -> cowshed -> this test build.
+    // A metadata command must reach the next Cargo, not the cowshed CLI parser.
+    let installed = root.join("installed");
+    std::fs::create_dir(&installed).expect("installed bin");
+    let cli = std::env::var_os("CARGO_BIN_EXE_cowshed")
+        .expect("cargo and nextest publish the runtime CLI binary");
+    std::os::unix::fs::symlink(cli, installed.join("cowshed")).expect("stable name");
+    let launcher = installed.join("cargo");
+    std::os::unix::fs::symlink("cowshed", &launcher).expect("relative launcher link");
+    let output = std::process::Command::new(&launcher)
+        .arg("metadata")
+        .env(
+            "PATH",
+            format!("{}:{}:{original_path}", installed.display(), bin.display()),
+        )
+        .output_locked()
+        .expect("launch the real cargo entrypoint");
+    assert_eq!(output.status.code(), Some(7), "{output:?}");
+    assert!(env_out().contains("CARGO_MAKEFLAGS=\n"));
 
     // A cargo killed mid-build: the launcher reports its death, the gateway
     // unlinks the fifo and credits every token.

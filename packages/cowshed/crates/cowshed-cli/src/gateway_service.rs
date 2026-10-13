@@ -1275,7 +1275,7 @@ where
     // The same build under the launcher's name, beside the stable name.
     let launcher = observe_launcher_link(executable)?;
     executor
-        .execute_install(&plan_launcher_link(executable, digest, &launcher))
+        .execute_install(&plan_launcher_link(executable, &launcher))
         .map_err(launchd_error)?;
     Ok(())
 }
@@ -2581,13 +2581,23 @@ mod tests {
     /// build it ran, and the copy of the build the failed install brought is no one's business.
     #[test]
     fn a_failed_activation_puts_the_previous_build_back() {
-        struct RefusingLaunchctl;
+        struct RefusingLaunchctl {
+            stable: PathBuf,
+            launcher: PathBuf,
+            candidate: ExecutableDigest,
+            saw_candidate: bool,
+        }
         impl LaunchctlCommand for RefusingLaunchctl {
             fn run(
                 &mut self,
                 _: &Path,
                 arguments: &[std::ffi::OsString],
             ) -> io::Result<crate::launchd::LaunchctlOutput> {
+                if arguments[0] == "bootstrap" && !self.saw_candidate {
+                    assert_eq!(executable_digest(&self.stable).unwrap(), self.candidate);
+                    assert_eq!(executable_digest(&self.launcher).unwrap(), self.candidate);
+                    self.saw_candidate = true;
+                }
                 Ok(crate::launchd::LaunchctlOutput {
                     status: match arguments[0].to_str() {
                         Some("print") => crate::launchd::CommandStatus::ExitCode(113),
@@ -2614,7 +2624,18 @@ mod tests {
             &first.source,
         )
         .unwrap();
-        let mut executor = LaunchdExecutor::new(NativeFilesystem::new(), RefusingLaunchctl);
+        let launcher = executable.directory().join(JOBSERVER_LAUNCHER_NAME);
+        assert_eq!(executable_digest(executable.path()).unwrap(), first.digest);
+        assert_eq!(executable_digest(&launcher).unwrap(), first.digest);
+        let mut executor = LaunchdExecutor::new(
+            NativeFilesystem::new(),
+            RefusingLaunchctl {
+                stable: executable.path().to_path_buf(),
+                launcher: launcher.clone(),
+                candidate: second.digest.clone(),
+                saw_candidate: false,
+            },
+        );
 
         let error = install_and_activate_gateway(
             &mut executor,
@@ -2638,6 +2659,8 @@ mod tests {
             fs::read(executable.path()).unwrap(),
             b"the supervised release build"
         );
+        assert_eq!(executable_digest(executable.path()).unwrap(), first.digest);
+        assert_eq!(executable_digest(&launcher).unwrap(), first.digest);
         fs::remove_dir_all(home).unwrap();
     }
 
