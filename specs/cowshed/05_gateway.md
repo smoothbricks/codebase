@@ -408,37 +408,37 @@ parallel, and the total runnable work stays near the core count.
   `--parallel` for one per core; a cargo build (`cargo build`/`test`/`clippy`/…, `nextest archive`, `napi build`) for
   one job per core; anything else, one `bun test` process included, for one. A target's `parallelism` option outranks
   all of these. `test.concurrent` inside one process is not another CPU.
-- **Sized to the grant.** A grant is between 1 and `want`, and `want` is capped at half the host (below). The executor
-  sets `NEXTEST_TEST_THREADS` for nextest, rewrites a `--test-threads=`/`--parallel=` count the command names (a flag
-  outranks the environment), sets `CARGO_BUILD_JOBS` and `RUST_TEST_THREADS` for cargo, and gives every command
-  `BOUNDED_EXEC_CPU_TOKENS`, so a script that starts a runner itself can size it.
+- **Sized to the grant.** A grant is between 1 and `want`. The executor sets `NEXTEST_TEST_THREADS` for nextest,
+  rewrites a `--test-threads=`/`--parallel=` count the command names (a flag outranks the environment), sets
+  `CARGO_BUILD_JOBS` and `RUST_TEST_THREADS` for cargo, and gives every command `BOUNDED_EXEC_CPU_TOKENS`, so a script
+  that starts a runner itself can size it.
 - **Nested runners use a parent-held sub-ledger.** A granted executor serves its T tokens on a private socket and
   publishes that endpoint as `BOUNDED_EXEC_CPU_POOL`, beside its `BOUNDED_EXEC_CPU_TOKENS` count. A default nested
-  executor connects to its immediate parent's live pool, requests at most `min(want, inherited, ceil(N/2))`, and holds
-  one complete local grant on that connection. The pool accounts for every holding sibling, so their sum never exceeds
-  T. It serves its own FIFO queue, granting the head `min(requested, free)` once at least one token is free; that count
-  is final, not a partial holding awaiting more tokens. Queued siblings wait only for that pool's own holders. Host
-  checkout fairness remains the upstream ledger's concern. An admitted child serves its granted count as its own pool,
-  and grandchildren draw only from that pool: no holder waits for another grant from an ancestor or the host. The parent
-  remains the owner of its upstream grant. A child returns only its local allocation by closing its connection; it never
-  releases the parent's connection. Upstream loss revokes the downstream pool and its connections, so a dead parent
-  cannot grant tokens to a descendant. Losing a borrowed grant ends its still-running command through the normal
-  TERM/grace/KILL path and reports an ordinary CPU-grant-loss failure, never a timeout. If a bound already started
-  terminating the command, the loss still makes its verdict an ordinary failure; the existing termination owns the
-  signals and grace, so losing the grant starts no second teardown. A bare or invalid count proves no allocation; an
-  absent endpoint follows normal host admission. Once connected to the parent, refusal, silence or protocol failure is
-  an ordinary admission failure, never a second host take while that parent may still hold its grant. A stale descriptor
-  whose endpoint no longer connects is treated as absent. Only the executor publishes its actual live pool;
-  `options.env` cannot inject either marker into a command. The span and `cpu.inherited: true` record identify a
-  parent-pool grant and its actual local wait. Pool setup or cleanup failure is an ordinary failure, never a successful
-  unaccounted run. Real-process default-runner proofs live in `executor-host.test.ts` under `test-host`, because the
-  default macOS runner acquires a real RAM volume. Node peers import the built executor artifact named by
-  `executors.json`; the host target's existing build dependency produces it, rather than compiling TypeScript inside a
-  test's guard. Pure pool and executor unit cases never attach images. **Known admission ambiguity:** a connect error is
-  currently classified as an absent endpoint. A full listen backlog or local file-descriptor exhaustion can also prevent
-  connection to a live pool, so this classification does not yet prove that its parent has released the upstream grant.
-  Distinguishing those cases before any host fallback remains an admission follow-up; connected refusals and protocol
-  errors already fail without a second take.
+  executor connects to its immediate parent's live pool, requests at most `min(want, inherited)`, and holds one complete
+  local grant on that connection. The pool accounts for every holding sibling, so their sum never exceeds T. It serves
+  its own FIFO queue, granting the head `min(requested, free)` once at least one token is free; that count is final, not
+  a partial holding awaiting more tokens. Queued siblings wait only for that pool's own holders. Host checkout fairness
+  remains the upstream ledger's concern. An admitted child serves its granted count as its own pool, and grandchildren
+  draw only from that pool: no holder waits for another grant from an ancestor or the host. The parent remains the owner
+  of its upstream grant. A child returns only its local allocation by closing its connection; it never releases the
+  parent's connection. Upstream loss revokes the downstream pool and its connections, so a dead parent cannot grant
+  tokens to a descendant. Losing a borrowed grant ends its still-running command through the normal TERM/grace/KILL path
+  and reports an ordinary CPU-grant-loss failure, never a timeout. If a bound already started terminating the command,
+  the loss still makes its verdict an ordinary failure; the existing termination owns the signals and grace, so losing
+  the grant starts no second teardown. A bare or invalid count proves no allocation; an absent endpoint follows normal
+  host admission. Once connected to the parent, refusal, silence or protocol failure is an ordinary admission failure,
+  never a second host take while that parent may still hold its grant. A stale descriptor whose endpoint no longer
+  connects is treated as absent. Only the executor publishes its actual live pool; `options.env` cannot inject either
+  marker into a command. The span and `cpu.inherited: true` record identify a parent-pool grant and its actual local
+  wait. Pool setup or cleanup failure is an ordinary failure, never a successful unaccounted run. Real-process
+  default-runner proofs live in `executor-host.test.ts` under `test-host`, because the default macOS runner acquires a
+  real RAM volume. Node peers import the built executor artifact named by `executors.json`; the host target's existing
+  build dependency produces it, rather than compiling TypeScript inside a test's guard. Pure pool and executor unit
+  cases never attach images. **Known admission ambiguity:** a connect error is currently classified as an absent
+  endpoint. A full listen backlog or local file-descriptor exhaustion can also prevent connection to a live pool, so
+  this classification does not yet prove that its parent has released the upstream grant. Distinguishing those cases
+  before any host fallback remains an admission follow-up; connected refusals and protocol errors already fail without a
+  second take.
 - **Fair between checkouts.** The checkout is the Nx workspace root the request names. A checkout's share is N divided
   among the checkouts holding or waiting (at least 1). The next grant goes to the waiting checkout that holds the fewest
   tokens (the older head request on a tie), to its oldest request. While another checkout waits, that grant is
@@ -447,15 +447,23 @@ parallel, and the total runnable work stays near the core count.
   ones. A gate with sixty runners queued cannot crowd out one with three.
 - **All at once.** A request is granted once, in full, and never holds part of a grant while waiting for more, so no two
   requests can deadlock on each other's tokens.
-- **No grant exceeds half the host**, `ceil(N/2)`. Fairness acts only when a grant is made, and a running nextest or
-  cargo cannot hand tokens back. Uncapped, one checkout's single runner once held 17 of 18 tokens for its whole run, and
-  a second checkout's gate held 1 and waited it out. With the cap, a checkout arriving beside one runner finds the other
-  half, or the next runner's tokens. A checkout alone still fills the host, because each gate runs several runners.
-  - The cost: one runner alone on the host runs at most N/2 threads. Measured on 18 cores at host load 83–99 from other
-    work, with `cowshed-core`'s 903 non-APFS unit tests: 26 s at 18 threads (warm) against 31 s and 44 s at 9. A
-    newcomer behind an uncapped runner instead waits out that runner's whole run.
-  - Rejected alternative: reserving slots for a newcomer. It idles cores whenever no newcomer comes, and it still lets
-    two runners of one checkout hold everything else.
+- **Work-conserving.** No grant is capped below `want` for fairness' sake: with nobody else waiting, a grant is
+  `min(want, free)`, so a lone runner may hold all N tokens, because idle tokens help nobody and a gate's wall time is
+  what the budget buys. What a newcomer needs is not a reserved half — it never waits out a whole run — but the
+  foreground band (Dynamic QoS, below): a foreground arrival demotes running normal work to utility instead of queueing
+  behind its tokens. Fairness among checkouts (the share rule above) still bounds a grant while another checkout waits.
+- **Dynamic QoS.** A job's class states what it is; its band states how the host schedules it now, and the two move
+  independently. Four bands, in scheduler order: **foreground**, **normal**, **utility**, **background**. The land turn
+  — its holder and the gate lineage that follows it — and any job a model is waiting on run **foreground**. Ordinary
+  development work (builds and suites) starts **normal**. Opportunistic work — research models, prefetch and warmers an
+  operator names as such, never inferred from unattended, detached or long-running work — runs **background** from
+  admission. While a foreground job is starved (admitted or queued and not runnable at its grant), running normal jobs
+  are demoted to **utility**: their tokens and grants do not change, only their scheduling weight drops, so the
+  foreground job's threads win the cores its grant names. When no foreground job is starved, utility jobs are promoted
+  back to normal. A band change is a live transition on the job's retained process identities (the Darwin and Linux
+  placements of "Bands"); one that cannot cover a forked tree whole reports `IncompleteCoverage` and claims no
+  transition. Bands never admit, queue or size a job — the token ledger alone does that — so a demoted job holding many
+  tokens cannot starve a foreground job of cores, and an idle host leaves every band's work at full speed.
 - **Crash safety by connection.** The grant is tied to the connection: on exit, `SIGKILL` included, the kernel closes
   the socket and the gateway returns the tokens at once. A request that closes while queued leaves the queue. A gateway
   restart forgets every grant, so runners started under the old one overshoot until they finish.
@@ -493,7 +501,7 @@ parallel, and the total runnable work stays near the core count.
   - **Any other subcommand**, aliases and third-party `cargo-*` subcommands included, is a build. The launcher asks the
     gateway on the control socket (`{"op":"jobserver","want":<n>,"checkout":"<workspace root>","command":"<command>"}`)
     with `want` one per core, as for a cargo build under `bounded-exec`. The gateway queues and grants it like a
-    `cpu-tokens` request (the half-host cap, fairness, all at once), refuses the same malformed requests, and answers
+    `cpu-tokens` request (fairness, all at once), refuses the same malformed requests, and answers
     `{"ok":true,"lease":"granted","tokens":<g>,"fifo":"<path>"}`.
 - **The jobserver fifo.** On the grant the gateway creates that fifo in its private runtime directory, mode `0600` and
   owned by the client's user (from the socket's peer credentials). It opens the fifo `O_RDWR` and keeps that descriptor
@@ -519,8 +527,10 @@ Tests: `cowshed-gateway`'s `cpu_budget` ledger unit tests (fairness, share, star
 over a real socket (`SIGKILL` of a holding client returns its tokens to the waiter at once; checkouts share the host;
 refusals); the plugin's `cpu-tokens.test.ts` (each runner's `want` and sizing, a killed holder closing its grant) and
 `executor.test.ts` (a granted run sized and released, a refused one run as asked); a jobserver test in which a
-`SIGKILL`ed `cargo` mid-build leaves the ledger whole and its fifo unlinked; and the launcher's tests (each of its four
-cases, the `want` it sends, and the variables it sets or leaves on each path).
+`SIGKILL`ed `cargo` mid-build leaves the ledger whole and its fifo unlinked; the launcher's tests (each of its four
+cases, the `want` it sends, and the variables it sets or leaves on each path); and the dynamic-band tests: a starved
+foreground grant demotes a running normal job's band and restores it when the foreground job leaves, and an
+opportunistic job admitted in the background band never holds a foreground job's cores.
 
 ## Credentials
 
