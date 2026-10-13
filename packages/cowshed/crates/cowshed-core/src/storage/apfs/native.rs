@@ -7498,7 +7498,8 @@ mod tests {
     }
 
     /// Detaching an existing image unmounts exactly the volumes the kernel mount table names, here
-    /// the added sibling and not the unmounted image volume, then detaches the container once.
+    /// the added sibling and not the unmounted image volume, then detaches the image's physical
+    /// device (`disk4`, not its synthesized container `disk5`) once.
     #[test]
     fn detaching_an_existing_image_unmounts_only_its_mounted_volumes_then_detaches_it_once() {
         let root = std::env::temp_dir().join(format!(
@@ -7531,7 +7532,7 @@ mod tests {
             host.backend().runner().argv(),
             [
                 vec!["/dev/disk5s2".to_owned()],
-                vec!["detach".into(), "-verbose".into(), "/dev/disk5".into()],
+                vec!["detach".into(), "-verbose".into(), "/dev/disk4".into()],
             ]
         );
         fs::remove_dir_all(root).unwrap();
