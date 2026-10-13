@@ -92,6 +92,7 @@
 
 import {
   type Dirent,
+  existsSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
@@ -515,6 +516,18 @@ export function reportUnavailableDeclaredLinks(unavailable: readonly Unavailable
   for (const { name, target, reason } of unavailable) {
     console.error(`! smoo.developerLinks ${name}: ${target} ${reason}; the installed version stays`);
   }
+}
+
+/**
+ * Whether `current` is a binding this clone inherited from the main checkout its marker names: the
+ * declaration is contained in that checkout and the link's target lies inside it, at whatever relative
+ * path the older producer used.
+ */
+function inheritedContainedBinding(anchor: string, relative: string, current: string): boolean {
+  const shared = path.resolve(anchor, relative);
+  const inside = path.relative(anchor, shared);
+  if (inside === '..' || inside.startsWith(`..${path.sep}`) || path.isAbsolute(inside)) return false;
+  return containsPath(path.resolve(anchor), path.resolve(current));
 }
 
 function containsPath(root: string, candidate: string): boolean {

@@ -2740,7 +2740,8 @@ mod tests {
         assert_eq!(supervisor.lines().last(), Some(protected_allow));
         assert!(!supervisor.contains(ancestor_deny));
         assert!(!supervisor.contains(protected_deny));
-        assert_eq!(child.lines().last(), Some(protected_deny));
+        let tool_deny = "(deny file-write* (literal \"/private/tmp/cowshed-raven/tools\") (subpath \"/private/tmp/cowshed-raven/tools\"))";
+        assert_eq!(child.lines().last(), Some(tool_deny));
         assert!(child.rfind("(allow ").unwrap() < child.find(ancestor_deny).unwrap());
         assert!(supervisor.contains(token_deny));
         assert!(child.contains(token_deny));
@@ -2751,7 +2752,7 @@ mod tests {
         let common_supervisor = supervisor
             .strip_suffix(&format!("{protected_allow}\n"))
             .unwrap();
-        let child_suffix = format!("{ancestor_deny}\n{protected_deny}\n");
+        let child_suffix = format!("{ancestor_deny}\n{protected_deny}\n{tool_deny}\n");
         let common_child = child.strip_suffix(&child_suffix).unwrap();
         assert_eq!(common_child, common_supervisor);
     }

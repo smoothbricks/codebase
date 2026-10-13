@@ -2443,7 +2443,7 @@ fn supervisor_config_of(
         default_cwd: None,
         sandbox: SandboxConfig {
             home: root.join("home"),
-            mount_root: root.to_path_buf(),
+            mount_root: root.join("mounts"),
             workspace_mount: workspace_root.clone(),
             exec_temp_dir: root.join("tmp"),
             profile_directory: root.join("store/run/profiles"),
