@@ -1482,13 +1482,6 @@ async function createProjectTargets(
         cwd: cargoWorkspaceRoot,
       },
     };
-    if (!targets.test && !('test' in declaredTargets) && typeof packageJson.scripts?.test !== 'string') {
-      targets.test = {
-        executor: 'nx:noop',
-        cache: true,
-        dependsOn: [CARGO_TEST_TARGET],
-      };
-    }
     // Mutation runs are minutes-to-hours: never cached, never part of build/lint.
     // CI runs these per-PR via `cargo mutants --in-diff` (see mutants.toml docs).
     targets.mutation = {
