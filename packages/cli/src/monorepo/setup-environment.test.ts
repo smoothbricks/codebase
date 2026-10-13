@@ -1,3 +1,4 @@
+/* biome-ignore-all lint/suspicious/noTemplateCurlyInString: Shell fixture scripts are literal shell text. */
 import { describe, expect, it } from 'bun:test';
 import { existsSync, lstatSync, readdirSync, readFileSync, readlinkSync, realpathSync, symlinkSync } from 'node:fs';
 import { chmod, copyFile, cp, mkdir, mkdtemp, rm, utimes, writeFile } from 'node:fs/promises';
@@ -317,10 +318,10 @@ function startShell(root: string, state: string, bin: string, options: EntryOpti
     ],
     cwd: root,
     env: {
-      PATH: `${bin}:${process.env['PATH'] ?? ''}`,
+      PATH: `${bin}:${process.env.PATH ?? ''}`,
       ...(options.home === undefined
         ? {
-            HOME: process.env['HOME'],
+            HOME: process.env.HOME,
             CARGO_HOME: options.cargoHome ?? join(dirname(bin), 'cargo-home'),
             XDG_CACHE_HOME: join(dirname(bin), 'xdg-cache'),
           }
@@ -1231,7 +1232,7 @@ describe('what shell entry keeps linked', () => {
             Bun.spawnSync({
               cmd: ['bun', 'install'],
               cwd: root,
-              env: { PATH: process.env['PATH'], HOME: process.env['HOME'], SMOO_NPM_TOKEN: 'npm' },
+              env: { PATH: process.env.PATH, HOME: process.env.HOME, SMOO_NPM_TOKEN: 'npm' },
               stdout: 'pipe',
               stderr: 'pipe',
             }).exitCode;
@@ -2109,7 +2110,7 @@ describe('a shell direnv keeps loaded', () => {
     );
     await chmod(join(devenvBin, 'devenv'), 0o755);
     const base: Record<string, string> = {
-      PATH: `${devenvBin}:${process.env['PATH'] ?? ''}`,
+      PATH: `${devenvBin}:${process.env.PATH ?? ''}`,
       HOME: home,
       XDG_CONFIG_HOME: join(home, '.config'),
       XDG_DATA_HOME: join(home, '.local', 'share'),
@@ -2677,8 +2678,8 @@ describe('the project root a shell entry owns', () => {
       cmd: ['bun', join(checkout, 'tooling', 'direnv', 'setup-environment.ts'), ...args],
       cwd,
       env: {
-        PATH: process.env['PATH'] ?? '',
-        HOME: process.env['HOME'],
+        PATH: process.env.PATH ?? '',
+        HOME: process.env.HOME,
         ...(devenvRoot === undefined ? {} : { DEVENV_ROOT: devenvRoot }),
       },
       stdout: 'pipe',
