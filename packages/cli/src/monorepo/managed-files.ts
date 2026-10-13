@@ -4,6 +4,7 @@ import type { ManagedFileContext } from '@smoothbricks/nx-plugin/managed-files/f
 import { generateManagedFiles, generateManagedFilesForContext } from '@smoothbricks/nx-plugin/managed-files/generator';
 import type { FileResult } from '@smoothbricks/nx-plugin/managed-files/tree';
 import { FsTree } from 'nx/src/generators/tree.js';
+import typia from 'typia';
 import { loadNxProjects } from '../nx/index.js';
 import { finishManagedFiles } from './managed-fs.js';
 
@@ -75,6 +76,93 @@ export function validateDevenvModuleImport(root: string): number {
   }
   console.error(
     `tooling/direnv/devenv.nix does not import ${DEVENV_MODULE_IMPORT}: add "imports = [${DEVENV_MODULE_IMPORT}];" so the managed shell contract applies`,
+  );
+  return 1;
+}
+
+/** The only part of devenv.lock this check reads: the node install-devenv installs the CLI from. */
+interface DevenvLock {
+  nodes: { devenv?: { locked?: { rev?: string }; original?: { ref?: string; rev?: string } } };
+}
+
+/** devenv.lock is repo-owned text, so it is validated rather than cast. */
+const parseDevenvLock = typia.json.createIsParse<DevenvLock>();
+
+/**
+ * What a devenv input declared at `latest` or a `v*` tag leaves in the lock's
+ * `original.ref`. A `git+https` URL can name a tag only as `refs/tags/<tag>`.
+ */
+const DEVENV_RELEASE_REF = /^(?:refs\/tags\/)?(?:latest|v(\d+(?:\.\d+)*))$/;
+
+/**
+ * devenv.cachix.org has pinned the aarch64-darwin, aarch64-linux and
+ * x86_64-linux builds of every release from this one on for good, and the
+ * x86_64-darwin builds up to v2.1.2, since from v2.2 on devenv builds nothing
+ * for x86_64-darwin. Some older tags, such as v2.0.3, have no pin, and their
+ * builds are gone.
+ */
+const OLDEST_PINNED_DEVENV_RELEASE = '2.0.4';
+
+/** Whether a lock's `original.ref` names `latest`, which is always the newest release, or a pinned release. */
+function isPinnedDevenvRelease(ref: string): boolean {
+  const release = DEVENV_RELEASE_REF.exec(ref);
+  if (release === null) {
+    return false;
+  }
+  const version = release[1];
+  // Numeric collation orders dotted versions: 2.0 < 2.0.4 < 2.1 < 2.10.
+  return version === undefined || version.localeCompare(OLDEST_PINNED_DEVENV_RELEASE, 'en', { numeric: true }) >= 0;
+}
+
+/**
+ * Report, never rewrite: re-locking is `devenv update`'s job. On a hosted
+ * runner install-devenv installs the CLI at the commit this node locks.
+ * devenv.cachix.org keeps the aarch64-darwin, aarch64-linux and x86_64-linux
+ * builds of every release from v2.0.4 on for good, but drops a build of
+ * devenv's main after about six weeks, and from then on every cold runner
+ * compiles devenv from source. An input nobody declared locks main as it was
+ * that minute. The check reads the tag offline: asking the cache would pass on
+ * the day of the re-lock and fail six weeks later.
+ */
+export function validateDevenvReleaseLock(root: string): number {
+  const target = join(root, 'tooling/direnv/devenv.lock');
+  if (!existsSync(target)) {
+    return 0;
+  }
+  let lock: DevenvLock | null;
+  try {
+    lock = parseDevenvLock(readFileSync(target, 'utf8'));
+  } catch {
+    lock = null;
+  }
+  if (lock === null) {
+    console.error('tooling/direnv/devenv.lock is not a devenv lock: it must be JSON with a nodes object');
+    return 1;
+  }
+  const node = lock.nodes.devenv;
+  const ref = node?.original?.ref;
+  // A rev declared beside the tag (a git+https URL takes both) is what Nix locks, whichever commit it names.
+  const revBesideRef = ref !== undefined && node?.original?.rev !== undefined;
+  if (node === undefined || (ref !== undefined && !revBesideRef && isPinnedDevenvRelease(ref))) {
+    return 0;
+  }
+  const commit = node.locked?.rev?.slice(0, 7) ?? 'an unknown commit';
+  let lockedAt = ref === undefined ? commit : `${ref} (${commit})`;
+  if (revBesideRef) {
+    lockedAt = `${commit} (a rev declared beside ${ref})`;
+  }
+  const oldest = `v${OLDEST_PINNED_DEVENV_RELEASE}`;
+  console.error(
+    `tooling/direnv/devenv.lock locks devenv at ${lockedAt}, not at latest or a release from ${oldest} on.\n` +
+      '  On a GitHub-hosted runner install-devenv installs the devenv CLI at that commit. devenv.cachix.org keeps\n' +
+      `  the aarch64-darwin, aarch64-linux and x86_64-linux builds of every release from ${oldest} on for good.\n` +
+      "  Some older tags, such as v2.0.3, have no pin and their builds are gone, and a build of devenv's main is\n" +
+      '  dropped after about six weeks. Once the build is gone, every cold runner compiles devenv from source.\n' +
+      '  Declare the input at a release in tooling/direnv/devenv.yaml:\n' +
+      '    inputs:\n' +
+      '      devenv:\n' +
+      '        url: github:cachix/devenv/latest?dir=src/modules   # or a tag, such as v2.3.1\n' +
+      '  and re-lock that input alone: run `devenv update devenv` in tooling/direnv.',
   );
   return 1;
 }
