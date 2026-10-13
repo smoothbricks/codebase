@@ -54,6 +54,11 @@ mod blank_image;
 #[path = "../../cowshed-apfs/tests/support/scratch_apfs.rs"]
 mod scratch_apfs;
 #[cfg(all(test, target_os = "macos"))]
+#[expect(
+    clippy::duplicate_mod,
+    reason = "scratch_directory and scratch_apfs each include the stateless scratch_processes \
+              helpers, so either support file also stands alone in a test binary"
+)]
 #[path = "../tests/support/scratch_directory.rs"]
 mod scratch_directory;
 #[cfg(test)]
