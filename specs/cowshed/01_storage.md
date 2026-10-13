@@ -225,9 +225,10 @@ every clone automatically). Main and sessions use identical wiring; only the san
   from where the backing image lives and from the in-image marker; see "Ownership, identity, and the volume label"
   below. A minted image carries its template's label, `[cowshed]`, until its workspace's supervisor relabels it off the
   provisioning path; a build volume keeps it, since nothing mounts one browsable.
-- **Spotlight**: nothing to set. `diskutil image create` has no `-nospotlight`, `mdutil -i off` needs root, and a
-  `nobrowse` mount is not indexed (measured: no `.Spotlight-V100` store appears after writes, and `mdutil -s` reports no
-  indexing state). A `--browse` mount is an ordinary visible volume to Spotlight.
+- **Spotlight**: the existing root storage service merges the configured store and mount roots into the Data volume's
+  Spotlight Search Privacy `Exclusions` at setup and boot, preserving other entries. No supported reload-only route is
+  exposed by `mdutil`; cowshed neither restarts `mds` nor toggles host indexing. These exclusions and the image marker
+  below express search/indexing policy; they do not establish absence or release of Spotlight-held media references.
 - **Time Machine**: nothing to set. Backup policy is one per-volume decision, not path exclusions, and Time Machine
   already leaves the store volume out: measured on macOS 26.6, `tmutil isexcluded /private/cowshed/store` reports
   `[Excluded]` though cowshed applies no exclusion (it runs no `tmutil`). Durability is git (`cowshed push`), never
