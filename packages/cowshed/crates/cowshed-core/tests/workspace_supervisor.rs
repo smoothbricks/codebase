@@ -1008,11 +1008,11 @@ async fn each_job_runs_with_the_build_volume_it_was_admitted_with() {
         assert_eq!(granted(&second_spawn, mode), Some(adopted.clone()));
     }
     let (_, first_profile) = first_spawn.request.policy.child(RunSandboxMode::ReadWrite);
-    assert!(first_profile.contains(before.to_str().unwrap()));
-    assert!(!first_profile.contains(adopted.to_str().unwrap()));
+    assert!(first_profile.text().contains(before.to_str().unwrap()));
+    assert!(!first_profile.text().contains(adopted.to_str().unwrap()));
     let (_, second_profile) = second_spawn.request.policy.child(RunSandboxMode::ReadWrite);
-    assert!(second_profile.contains(adopted.to_str().unwrap()));
-    assert!(!second_profile.contains(before.to_str().unwrap()));
+    assert!(second_profile.text().contains(adopted.to_str().unwrap()));
+    assert!(!second_profile.text().contains(before.to_str().unwrap()));
     // A checkout that links no volume grants none.
     let third = h
         .handle
@@ -5897,10 +5897,10 @@ async fn nx_daemon_restart_follows_a_build_volume_swap_without_an_exec() {
         let (second_config, second_profile) = second.request.policy.child(mode);
         assert_eq!(first_config.build_volume_mount.as_ref(), Some(&before));
         assert_eq!(second_config.build_volume_mount.as_ref(), Some(&adopted));
-        assert!(first_profile.contains(before.to_str().unwrap()));
-        assert!(!first_profile.contains(adopted.to_str().unwrap()));
-        assert!(second_profile.contains(adopted.to_str().unwrap()));
-        assert!(!second_profile.contains(before.to_str().unwrap()));
+        assert!(first_profile.text().contains(before.to_str().unwrap()));
+        assert!(!first_profile.text().contains(adopted.to_str().unwrap()));
+        assert!(second_profile.text().contains(adopted.to_str().unwrap()));
+        assert!(!second_profile.text().contains(before.to_str().unwrap()));
     }
     complete(&second, b"", b"", ExitStatus::Exited { code: 0 }).await;
     h.handle.wait(second.request.job_id).await.unwrap();

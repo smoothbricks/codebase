@@ -1449,6 +1449,94 @@ mod tests {
         );
     }
 
+    /// A profile past the 128 KiB a command argument may hold -- many read grants make one --
+    /// launches with no argument over that bound, from its file, and `sandbox-exec -f` enforces
+    /// it: a granted tree reads and stays unwritable, and the workspace writes. Passed as
+    /// `sandbox-exec -p`, the profile was one argument a job's process observation read back and
+    /// its record could not hold.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_profile_past_the_argument_bound_launches_from_its_file_and_is_enforced() {
+        use crate::api::dto::MAX_COMMAND_ARG_BYTES;
+        use crate::exec::{SandboxExecRequest, SpawnRunner as _, SystemSpawnRunner, plan_exec};
+
+        let fixture = crate::capabilities::test_support::Fixture::new();
+        let mut sandbox = config(RunSandboxMode::ReadWrite);
+        sandbox.home = fixture.home.clone();
+        sandbox.mount_root = fixture.root.join("mounts");
+        sandbox.workspace_mount = sandbox.mount_root.join("workspace");
+        sandbox.exec_temp_dir = fixture.root.join("exec-temp");
+        sandbox.grants = SandboxGrants::default();
+        sandbox.allowed_unix_sockets.clear();
+        fs::create_dir_all(&sandbox.workspace_mount).unwrap();
+        fs::create_dir_all(&sandbox.exec_temp_dir).unwrap();
+        // Seatbelt bounds a compiled profile's string data at 64 KiB, not its text: deep grants
+        // that share their ancestors repeat those ancestors' rules in the text and their strings
+        // once in the data, so the text passes 128 KiB and still compiles.
+        let mut grants = fixture.root.join("grants");
+        for level in 0..24 {
+            grants.push(format!("shared-ancestor-{level:02}"));
+        }
+        let count = 120;
+        for index in 0..count {
+            let tree = grants.join(format!("{index:03}"));
+            fs::create_dir_all(&tree).unwrap();
+            sandbox.grants.read.push(tree);
+        }
+        let readable = sandbox.grants.read[count - 1].join("file");
+        fs::write(&readable, b"granted\n").unwrap();
+        let profile = seatbelt_profile(&sandbox, SandboxProfileRole::ExecutedChild).unwrap();
+        assert!(
+            profile.len() > MAX_COMMAND_ARG_BYTES,
+            "the fixture needs a profile past one argument's bound, not {} bytes",
+            profile.len()
+        );
+
+        let written = sandbox.workspace_mount.join("written");
+        let script = format!(
+            "/bin/cat '{}' && ! /usr/bin/touch '{}' 2>/dev/null && /usr/bin/touch '{}'",
+            readable.display(),
+            sandbox.grants.read[0].join("forbidden").display(),
+            written.display()
+        );
+        let plan = plan_exec(
+            SandboxExecRequest {
+                argv: vec!["/bin/sh".into(), "-c".into(), script.into()],
+                cwd: sandbox.workspace_mount.clone(),
+            },
+            &sandbox,
+        )
+        .unwrap();
+        assert_eq!(
+            &plan.args[..3],
+            [
+                std::ffi::OsStr::new("-f"),
+                plan.profile.path().as_os_str(),
+                std::ffi::OsStr::new("--")
+            ]
+        );
+        assert!(
+            plan.args
+                .iter()
+                .all(|argument| argument.len() <= MAX_COMMAND_ARG_BYTES),
+            "no launch argument may exceed one argument's bound"
+        );
+        assert_eq!(fs::read_to_string(plan.profile.path()).unwrap(), profile);
+        let status = SystemSpawnRunner.run(&plan).unwrap();
+        assert!(status.success(), "the sandboxed script failed: {status:?}");
+        assert!(written.is_file(), "the workspace is writable");
+        assert!(
+            !sandbox.grants.read[0].join("forbidden").exists(),
+            "a read grant stays unwritable"
+        );
+        let file = plan.profile.path().to_owned();
+        drop(plan);
+        assert!(
+            !file.exists(),
+            "the plan was the profile file's last holder"
+        );
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn a_source_read_only_job_writes_only_its_shared_nx_leaf_not_other_checkout_runtime() {

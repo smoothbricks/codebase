@@ -13532,8 +13532,8 @@ async fn run_git_with_read<const N: usize>(
     read: &Path,
     args: [&str; N],
 ) -> Result<()> {
-    let mut command =
-        tokio::process::Command::from(crate::git::sandboxed_git_command_with_read(root, read)?);
+    let git = crate::git::sandboxed_git_command_with_read(root, read)?;
+    let mut command = tokio::process::Command::from(git.command);
     let output = command.args(args).output_locked().await.map_err(|error| {
         CowshedError::environment_missing(
             error.to_string(),
@@ -13547,13 +13547,16 @@ async fn run_git_with_read<const N: usize>(
 /// with a write boundary around the checkout, not with controller host reach.
 #[cfg(target_os = "macos")]
 async fn invoke_git(root: &Path, args: &[&str]) -> Result<std::process::Output> {
-    let mut command = tokio::process::Command::from(crate::git::sandboxed_git_command_at(root)?);
-    command.args(args).output_locked().await.map_err(|error| {
+    let git = crate::git::sandboxed_git_command_at(root)?;
+    let mut command = tokio::process::Command::from(git.command);
+    let output = command.args(args).output_locked().await.map_err(|error| {
         CowshedError::environment_missing(
             error.to_string(),
             "restore /usr/bin/git and sandbox-exec",
         )
-    })
+    });
+    drop(git.profile);
+    output
 }
 
 #[cfg(target_os = "macos")]

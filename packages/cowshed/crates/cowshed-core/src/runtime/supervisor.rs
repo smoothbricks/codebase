@@ -31,7 +31,7 @@ use crate::api::resources::{
 };
 use crate::error::{AdmissionField, AdmissionRefusal, CowshedError, Result, StdinRefusal};
 use crate::exec::{
-    ExecError, SandboxExecRequest, SpawnPlan, classify_spawn_error, plan_exec_under,
+    ExecError, ProfileFile, SandboxExecRequest, SpawnPlan, classify_spawn_error, plan_exec_under,
     prepare_child_descriptors,
 };
 use crate::metadata::{WorkspaceIncarnation, WorkspaceName, WorkspaceRole};
@@ -386,8 +386,50 @@ struct RenderedPolicy {
     /// The current authority grants plus convention-gated project capabilities.
     ceiling: SandboxConfig,
     read_only: SandboxConfig,
-    ceiling_child: String,
-    read_only_child: String,
+    ceiling_child: ChildProfile,
+    read_only_child: ChildProfile,
+}
+
+/// An executed-child profile, rendered, and the file `sandbox-exec -f` reads it from, written
+/// by the first spawn that runs under it. Every spawn under the render shares that file, and
+/// holds it until its child exits.
+#[derive(Debug)]
+pub struct ChildProfile {
+    text: String,
+    file: std::sync::OnceLock<Arc<ProfileFile>>,
+}
+
+impl ChildProfile {
+    fn new(text: String) -> Self {
+        Self {
+            text,
+            file: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// The rendered profile: what tells one warm shell's sandbox from another's.
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// The profile's file, written now when no spawn has written it yet.
+    pub fn file(&self) -> Result<Arc<ProfileFile>> {
+        if let Some(file) = self.file.get() {
+            return Ok(Arc::clone(file));
+        }
+        let written = ProfileFile::write(&self.text).map_err(|error| {
+            CowshedError::environment_missing(
+                format!(
+                    "cannot write the sandbox profile into {}: {error}",
+                    crate::exec::profile_directory().display()
+                ),
+                "run `cowshed setup` so the store's run directory exists and is yours",
+            )
+        })?;
+        // A concurrent first spawn may have set it meanwhile: its file is the render's, and this
+        // one is removed as it drops.
+        Ok(Arc::clone(self.file.get_or_init(|| written)))
+    }
 }
 
 impl SandboxPolicy {
@@ -410,8 +452,11 @@ impl SandboxPolicy {
         // not one this supervisor may hold.
         render(&ceiling, SandboxProfileRole::TrustedSupervisor)?;
         Ok(Self(std::sync::Arc::new(RenderedPolicy {
-            ceiling_child: render(&ceiling, SandboxProfileRole::ExecutedChild)?,
-            read_only_child: render(&read_only, SandboxProfileRole::ExecutedChild)?,
+            ceiling_child: ChildProfile::new(render(&ceiling, SandboxProfileRole::ExecutedChild)?),
+            read_only_child: ChildProfile::new(render(
+                &read_only,
+                SandboxProfileRole::ExecutedChild,
+            )?),
             ceiling,
             read_only,
         })))
@@ -435,7 +480,7 @@ impl SandboxPolicy {
     }
 
     /// The sandbox and executed-child profile of a job that asked for `mode`.
-    pub fn child(&self, mode: crate::api::dto::RunSandboxMode) -> (&SandboxConfig, &str) {
+    pub fn child(&self, mode: crate::api::dto::RunSandboxMode) -> (&SandboxConfig, &ChildProfile) {
         match mode {
             crate::api::dto::RunSandboxMode::ReadOnly => {
                 (&self.0.read_only, &self.0.read_only_child)
@@ -941,11 +986,11 @@ fn wrap_one_shot(plan: &mut SpawnPlan, shell: &crate::capabilities::ShellActivat
 /// workspace shell selected for that cwd when there is one.
 fn one_shot_plan(
     sandbox: &SandboxConfig,
-    profile: &str,
+    profile: &ChildProfile,
     cwd: PathBuf,
     argv: Vec<OsString>,
 ) -> Result<SpawnPlan> {
-    let mut plan = plan_exec_under(SandboxExecRequest { argv, cwd }, sandbox, profile)
+    let mut plan = plan_exec_under(SandboxExecRequest { argv, cwd }, sandbox, &profile.file()?)
         .map_err(map_exec_error)?;
     if let Some(shell) = &sandbox.capabilities.contribution.shell {
         wrap_one_shot(&mut plan, shell);
@@ -1704,6 +1749,9 @@ impl SpawnSink for SystemSpawnSink {
             events.clone(),
         ));
         let watcher = std::sync::Arc::clone(&fence);
+        // `sandbox-exec` reads its profile file after this spawn returns, and a re-render may
+        // drop the policy that wrote it meanwhile: the leader's exit releases it.
+        let profile = plan.profile;
         tokio::spawn(async move {
             let event = match watcher.exited().await {
                 Ok(exit) => ProcessEvent::Exited { job_id, exit },
@@ -1715,6 +1763,7 @@ impl SpawnSink for SystemSpawnSink {
                     ProcessEvent::WaitFailed { job_id, error }
                 }
             };
+            drop(profile);
             let _ = events.send(event).await;
         });
         Ok(Box::new(SystemRunningProcess {

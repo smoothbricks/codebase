@@ -659,7 +659,11 @@ These anchors are trust configuration, not secrets, so they are exported/written
    `ProtectedRecord::Job(JobArtifactRecord)` admission batch, and record the audit
    `ControllerCommitment::Admission(AdmissionCommitment)` before process creation. Only the trusted supervisor opens the
    protected record stream; the audit record is telemetry and gates nothing.
-4. Compile the child profile before starting shell activation. The trusted parent contributes identity, cache wiring
+4. Compile the child profile before starting shell activation. Every `sandbox-exec` launch reads its profile from a
+   file, `sandbox-exec -f <store>/run/profiles/<sha256>.<pid>.<n>.sb` (mode 0400, inside the cowshed root every profile
+   denies to every role), never from an argument: a profile passes the 128 KiB a command argument may hold, and a job's
+   process observation reads the launch argv back; the launcher holds the file until its child exits, and a write
+   removes the files of launchers that no longer run. The trusted parent contributes identity, cache wiring
    (03_caches.md), `TRACEPARENT`, and caller env filtered to build-configuration variables, then sets the private
    HOME/XDG directories, proxy credentials, runtime directory, and bootstrap PATH. Inside that restriction, canonical
    shell activation owns the environment the command sees. A command under the nearest workspace-contained `.envrc` runs
