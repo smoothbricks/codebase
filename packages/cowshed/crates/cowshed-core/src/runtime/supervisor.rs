@@ -6457,7 +6457,9 @@ impl SupervisorActor {
             .as_ref()
             .is_some_and(|keeper| keeper.starting == Some(job_id))
         {
-            let (read_write, _) = self.policy.child(crate::api::dto::RunSandboxMode::ReadWrite);
+            let (read_write, _) = self
+                .policy
+                .child(crate::api::dto::RunSandboxMode::ReadWrite);
             if let Some(project_root) = super::nx_daemon::kept_project(read_write) {
                 let record = crate::capabilities::nx::daemon_record(project_root);
                 if let Some(pid) = super::nx_daemon::live_pid(&record)
