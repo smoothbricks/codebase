@@ -300,6 +300,11 @@ impl Gateway {
                         startup: config.startup.clone(),
                         disk_leases: crate::disk_lease::DiskLeases::start(config.disk_lease),
                         cpu_budget: crate::cpu_budget::CpuBudget::start(config.cpu_budget),
+                        jobserver: crate::jobserver::JobserverFifos::start(
+                            path.parent()
+                                .map(|parent| parent.join("jobserver"))
+                                .unwrap_or_else(|| std::path::PathBuf::from("jobserver")),
+                        ),
                     },
                     config.control_tcp.as_ref(),
                 )

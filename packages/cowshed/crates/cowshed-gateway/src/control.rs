@@ -20,8 +20,8 @@ use zeroize::{Zeroize, Zeroizing};
 
 use cowshed_gateway_types::{
     CPU_TOKENS_OP, CpuBudgetStatus, DISK_LEASE_OP, DaemonStatus, DiskClass, EgressGrant,
-    EgressMode, HostPattern, LeaseState, MirrorRoute, PhaseShare, WorkspaceCa, WorkspaceEndpoint,
-    WorkspacePolicy, WorkspaceSession, WorkspaceToken,
+    EgressMode, HostPattern, JOBSERVER_OP, LeaseState, MirrorRoute, PhaseShare, WorkspaceCa,
+    WorkspaceEndpoint, WorkspacePolicy, WorkspaceSession, WorkspaceToken,
 };
 
 use crate::{
@@ -351,6 +351,11 @@ enum Incoming {
         checkout: String,
         command: String,
     },
+    Jobserver {
+        want: NonZeroUsize,
+        checkout: String,
+        command: String,
+    },
 }
 
 /// A `disk-lease` request's fields. Its keys are checked against the operation's allowed set
@@ -402,6 +407,9 @@ struct ControlResponse {
     /// How many CPU tokens a `cpu-tokens` grant holds.
     #[serde(skip_serializing_if = "Option::is_none")]
     tokens: Option<usize>,
+    /// The jobserver fifo a `jobserver` grant names for `CARGO_MAKEFLAGS`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fifo: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     cpu_budget: Option<CpuBudgetStatus>,
 }
@@ -647,6 +655,7 @@ pub(crate) struct ControlServices {
     pub startup: Option<Arc<dyn StartupProbe>>,
     pub disk_leases: DiskLeases,
     pub cpu_budget: CpuBudget,
+    pub jobserver: crate::jobserver::JobserverFifos,
 }
 
 impl ControlServices {
@@ -809,6 +818,17 @@ async fn serve<R, W>(
             )
             .await;
         }
+        Ok(Incoming::Jobserver {
+            want,
+            checkout,
+            command,
+        }) => {
+            let (stake, granted) =
+                services
+                    .cpu_budget
+                    .ask(Arc::from(checkout), want, Claim::new(&command, pid));
+            hold_jobserver(reader, writer, stake, granted, services.jobserver.clone()).await;
+        }
         Ok(Incoming::Request(request)) => {
             let request = expect_eof(&mut reader).await.map(|()| request);
             serve_request(writer, request, services).await;
@@ -867,6 +887,74 @@ async fn hold<R, W, S, G>(
     drop(stake);
 }
 
+/// Hold one jobserver grant: answer `queued` at once; on grant, create the
+/// fifo, name it in the granted answer, and hold until the client closes. The
+/// fifo is then drained and unlinked, and dropping the stake returns all of
+/// its tokens, including any a killed client read and never wrote back.
+async fn hold_jobserver<R, W, S>(
+    mut reader: R,
+    mut writer: W,
+    stake: S,
+    granted: tokio::sync::oneshot::Receiver<usize>,
+    fifos: crate::jobserver::JobserverFifos,
+) where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    if write_response(&mut writer, &lease(LeaseState::Queued))
+        .await
+        .is_err()
+    {
+        return;
+    }
+    let mut discard = [0_u8; 64];
+    let tokens = tokio::select! {
+        answer = granted => match answer {
+            Ok(tokens) => tokens,
+            Err(_) => {
+                let _ = write_response(
+                    &mut writer,
+                    &failure(
+                        ControlFailureCode::Rejected,
+                        "the gateway's CPU budget has stopped".to_owned(),
+                    ),
+                )
+                .await;
+                return;
+            }
+        },
+        _ = reader.read(&mut discard) => return,
+    };
+    let fifo = match fifos.create(tokens) {
+        Ok(fifo) => fifo,
+        Err(error) => {
+            let _ = write_response(
+                &mut writer,
+                &failure(
+                    ControlFailureCode::Rejected,
+                    format!("cannot create the jobserver fifo: {error}"),
+                ),
+            )
+            .await;
+            return;
+        }
+    };
+    let answer = ControlResponse {
+        tokens: Some(tokens),
+        fifo: Some(fifo.path().to_string_lossy().into_owned()),
+        ..lease(LeaseState::Granted)
+    };
+    if write_response(&mut writer, &answer).await.is_err() {
+        fifo.drain_and_unlink();
+        return;
+    }
+    while let Ok(read) = reader.read(&mut discard).await
+        && read > 0
+    {}
+    fifo.drain_and_unlink();
+    drop(stake);
+}
+
 fn parse_control_request(bytes: &[u8]) -> Result<Incoming, ControlError> {
     let value =
         serde_json::from_slice(bytes).map_err(|error| ControlError::Encoding(error.to_string()))?;
@@ -894,6 +982,7 @@ fn parse_control_request_value(value: serde_json::Value) -> Result<Incoming, Con
         "cpu-budget" => &["op"],
         DISK_LEASE_OP => &["op", "class", "share", "command"],
         CPU_TOKENS_OP => &["op", "want", "checkout", "command"],
+        JOBSERVER_OP => &["op", "want", "checkout", "command"],
         _ => {
             return Err(ControlError::Encoding(
                 "unknown gateway control operation".to_owned(),
@@ -918,7 +1007,8 @@ fn parse_control_request_value(value: serde_json::Value) -> Result<Incoming, Con
             command,
         });
     }
-    if op == CPU_TOKENS_OP {
+    let jobserver = op == JOBSERVER_OP;
+    if op == CPU_TOKENS_OP || jobserver {
         let CpuTokensIn {
             want,
             checkout,
@@ -929,10 +1019,18 @@ fn parse_control_request_value(value: serde_json::Value) -> Result<Incoming, Con
                 "a cpu-tokens checkout must name a path of 1 to {MAX_CHECKOUT} bytes"
             )));
         }
-        return Ok(Incoming::CpuTokens {
-            want,
-            checkout,
-            command,
+        return Ok(if jobserver {
+            Incoming::Jobserver {
+                want,
+                checkout,
+                command,
+            }
+        } else {
+            Incoming::CpuTokens {
+                want,
+                checkout,
+                command,
+            }
         });
     }
     serde_json::from_value(value)
@@ -1234,6 +1332,7 @@ fn success() -> ControlResponse {
         error: None,
         lease: None,
         tokens: None,
+        fifo: None,
         cpu_budget: None,
     }
 }

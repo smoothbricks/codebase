@@ -22,7 +22,9 @@ pub mod repo_id;
 pub mod session;
 pub mod status;
 
-pub use cpu_budget::{CPU_TOKENS_OP, CpuBudgetStatus, CpuCheckoutStatus, CpuTokensRequest};
+pub use cpu_budget::{
+    CPU_TOKENS_OP, CpuBudgetStatus, CpuCheckoutStatus, CpuTokensRequest, JOBSERVER_OP,
+};
 pub use disk_lease::{
     DISK_LEASE_OP, DiskClass, DiskLeaseAnswer, DiskLeaseRequest, LeaseState, PhaseShare,
 };

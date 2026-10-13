@@ -159,10 +159,7 @@ async fn ledger(socket: &Path) -> CpuBudgetStatus {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_holder_killed_with_sigkill_returns_its_tokens_at_once() {
     let (gateway, root, socket) = gateway(4).await;
-    // One grant holds at most half the host, so another checkout holds the other half.
-    let mut other = Asker::ask(&socket, 4, "/w/other").await;
-    assert_eq!(other.granted(Duration::from_secs(10)).await, Some(2));
-
+    // No cap: the holder takes the whole host, so a second checkout queues whole.
     // The holder is another process, so SIGKILL is a real death: the kernel closes its socket.
     let mut holder = Command::new("/usr/bin/nc")
         .arg("-U")
@@ -184,7 +181,7 @@ async fn a_holder_killed_with_sigkill_returns_its_tokens_at_once() {
     .await
     .expect("read answers");
     assert!(answers.0.contains("\"queued\""), "{}", answers.0);
-    assert!(answers.1.contains("\"tokens\":2"), "{}", answers.1);
+    assert!(answers.1.contains("\"tokens\":4"), "{}", answers.1);
 
     let mut waiter = Asker::ask(&socket, 2, "/w/waiting").await;
     assert_eq!(waiter.granted(Duration::from_millis(300)).await, None);
@@ -199,34 +196,35 @@ async fn a_holder_killed_with_sigkill_returns_its_tokens_at_once() {
         "the killed holder's tokens go to the waiter"
     );
     let held = ledger(&socket).await;
-    assert_eq!(held.held, 4);
+    assert_eq!(held.held, 2);
     assert_eq!(
         held.checkouts
             .iter()
             .map(|checkout| (checkout.checkout.as_str(), checkout.held))
             .collect::<Vec<_>>(),
-        [("/w/other", 2), ("/w/waiting", 2)]
+        [("/w/waiting", 2)]
     );
-    drop((input, other));
+    drop(input);
 
     gateway.drain().await.expect("drain");
     let _ = std::fs::remove_dir_all(root);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn checkouts_share_the_host_and_one_grant_holds_at_most_half() {
+async fn checkouts_share_the_host_and_a_lone_grant_fills_it() {
     let (gateway, root, socket) = gateway(8).await;
 
-    // Alone, a checkout fills the host with two runners, each capped at half of it.
+    // Alone, one grant fills the host; no half is reserved.
     let mut whole = Asker::ask(&socket, 64, "/w/a").await;
-    assert_eq!(whole.granted(Duration::from_secs(10)).await, Some(4));
+    assert_eq!(whole.granted(Duration::from_secs(10)).await, Some(8));
     let mut a_next = Asker::ask(&socket, 8, "/w/a").await;
-    assert_eq!(a_next.granted(Duration::from_secs(10)).await, Some(4));
+    assert_eq!(a_next.granted(Duration::from_millis(300)).await, None);
     let mut b = Asker::ask(&socket, 8, "/w/b").await;
     assert_eq!(b.granted(Duration::from_millis(300)).await, None);
 
-    // a's first runner returns 4: b holds least, and its share of 4 is what came free.
+    // The runner returns 8: each waiting checkout takes its share of 4.
     drop(whole);
+    assert_eq!(a_next.granted(Duration::from_secs(10)).await, Some(4));
     assert_eq!(b.granted(Duration::from_secs(10)).await, Some(4));
     let held = ledger(&socket).await;
     assert_eq!(held.held, 8);
@@ -248,6 +246,56 @@ async fn checkouts_share_the_host_and_one_grant_holds_at_most_half() {
     assert_eq!(refused["code"], "invalid-request", "{refused}");
 
     drop((a_next, b));
+    gateway.drain().await.expect("drain");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_jobserver_grant_names_a_fifo_and_close_returns_every_token() {
+    let (gateway, root, socket) = gateway(4).await;
+    let stream = UnixStream::connect(&socket).await.expect("connect");
+    let (reader, mut writer) = stream.into_split();
+    writer
+        .write_all(b"{\"op\":\"jobserver\",\"want\":4,\"checkout\":\"/w/js\",\"command\":\"cargo build\"}\n")
+        .await
+        .expect("ask");
+    let mut lines = BufReader::new(reader);
+    let mut line = String::new();
+    lines.read_line(&mut line).await.expect("queued");
+    let queued: Value = serde_json::from_str(&line).expect("queued is JSON");
+    assert_eq!(queued["lease"], "queued", "{queued}");
+    line.clear();
+    lines.read_line(&mut line).await.expect("granted");
+    let granted: Value = serde_json::from_str(&line).expect("granted is JSON");
+    assert_eq!(granted["lease"], "granted", "{granted}");
+    assert_eq!(granted["tokens"], 4, "{granted}");
+    let fifo = PathBuf::from(granted["fifo"].as_str().expect("a grant names its fifo"));
+    assert_eq!(ledger(&socket).await.held, 4);
+
+    // The fifo holds g-1 token bytes: read them, put them back, then take one
+    // and close without returning it — every token must still be credited.
+    let mut client = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&fifo)
+        .expect("open fifo");
+    let mut bytes = [0_u8; 3];
+    std::io::Read::read_exact(&mut client, &mut bytes).expect("read token bytes");
+    assert_eq!(bytes, [b'+'; 3], "the fifo holds g-1 token bytes");
+    std::io::Write::write_all(&mut client, &bytes).expect("return the bytes");
+    let mut taken = [0_u8; 1];
+    std::io::Read::read_exact(&mut client, &mut taken).expect("take a token");
+    drop(client);
+    drop((writer, lines));
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while fifo.exists() || ledger(&socket).await.held != 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the fifo and its tokens outlive the close"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
     gateway.drain().await.expect("drain");
     let _ = std::fs::remove_dir_all(root);
 }
