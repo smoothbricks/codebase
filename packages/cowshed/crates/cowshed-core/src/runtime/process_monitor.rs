@@ -593,18 +593,14 @@ fn control(queue: i32, flags: u16, fflags: u32) -> io::Result<()> {
 }
 
 #[cfg(test)]
-#[path = "../../tests/support/temp_root.rs"]
-mod temp_root;
-
-#[cfg(test)]
 mod tests {
-    use super::temp_root::TempRoot;
     use super::*;
     use crate::api::dto::{CommandArg, UtcTimestamp};
     use crate::api::process::JobProcessSample;
     use crate::api::process::ProcessCoverage;
     use crate::runtime::process_spans::read_process_segment;
     use crate::runtime::process_tree::BirthToken;
+    use crate::temp_root::TempRoot;
 
     #[tokio::test]
     async fn trace_replay_preserves_emitted_batches_and_gap_only_batches_seal_nothing() {
