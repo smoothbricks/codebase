@@ -41,6 +41,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 #[path = "../../../cowshed-apfs/tests/support/blank_image.rs"]
 mod blank_image;
+#[path = "../../../cowshed-core/tests/support/nx_reads.rs"]
+mod nx_dependencies;
 #[path = "../../../cowshed-apfs/tests/support/scratch_apfs.rs"]
 mod scratch_apfs;
 #[expect(
@@ -50,6 +52,7 @@ mod scratch_apfs;
 )]
 #[path = "../../../cowshed-core/tests/support/scratch_directory.rs"]
 mod scratch_directory;
+use nx_dependencies::nx_read_paths;
 
 use scratch_apfs::ScratchRoot;
 
@@ -1191,12 +1194,6 @@ fn repository_nx() -> (PathBuf, PathBuf) {
     (nx, node)
 }
 
-#[derive(serde::Deserialize)]
-struct InstalledPackageIdentity {
-    name: String,
-    version: String,
-}
-
 /// The fixture checkout's own Bun-installed Nx, canonical: the program each fixture runs.
 fn fixture_nx(checkout: &Path) -> PathBuf {
     checkout
@@ -1205,105 +1202,172 @@ fn fixture_nx(checkout: &Path) -> PathBuf {
         .expect("the fixture's Bun-installed Nx")
 }
 
-/// Read only the installed package-private namespaces reachable from Nx, not a hoist or home.
-/// Bun keeps patched packages in this checkout's `.bun` tree and shares eligible dependencies
-/// through its global store; neither layout requires a generated release closure.
-fn nx_read_paths(nx: &Path) -> Vec<PathBuf> {
-    // The namespace is the `.bun` directory above the checkout's own canonical Nx.
-    let local = nx
-        .ancestors()
-        .find(|ancestor| ancestor.file_name() == Some(std::ffi::OsStr::new(".bun")))
-        .expect("Nx must sit in its checkout's Bun install namespace")
-        .to_path_buf();
-    let store = std::env::var_os("BUN_INSTALL_CACHE_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(std::env::var_os("HOME").expect("host HOME")).join(".bun/install/cache")
-        })
-        .canonicalize()
-        .expect("the host's Bun install cache");
-    let installed = |path: &Path| {
-        (path.starts_with(&local) && path != local) || (path.starts_with(&store) && path != store)
-    };
-    assert!(
-        installed(nx),
-        "Nx must be the checkout's pinned Bun install"
+/// A genuine sibling checkout of the suite's ordinary Bun-installed patched Nx product.
+/// Its private dependency namespace stays beside that product; no repository package is borrowed.
+fn developer_nx(fixture: &Fixture) -> (PathBuf, PathBuf) {
+    let checkout = fixture._scratch.path().join("developer-checkout");
+    fs::create_dir_all(checkout.join("packages")).unwrap();
+    let nx = checkout.join("packages/nx");
+    clone_tree(&fixture_nx(&fixture.checkout), &nx);
+    let product = ["package.json", "dist/bin/nx.js"];
+    let before = product.map(|file| fs::read(nx.join(file)).expect("maintained developer product"));
+    fs::copy(
+        repository_root().join("bunfig.toml"),
+        nx.join("bunfig.toml"),
+    )
+    .expect("the existing Bun install configuration");
+    let configuration =
+        fs::read(nx.join("bunfig.toml")).expect("actual developer Bun configuration");
+    eprintln!(
+        "developer Nx bunfig.toml sha256={}",
+        cowshed_core::api::dto::Sha256Digest::compute(&configuration)
     );
-    let mut reads = std::collections::BTreeSet::from([nx.to_path_buf()]);
-    let mut namespaces = std::collections::BTreeSet::new();
-    let mut binaries = Vec::new();
-    let mut pending = vec![nx.parent().expect("Nx package namespace").to_path_buf()];
-    while let Some(namespace) = pending.pop() {
-        assert!(
-            installed(&namespace),
-            "dependency namespace leaves the Bun install"
+    let bun = host_bun();
+    let context = Command::new(&bun)
+        .args(["--print", "process.cwd()"])
+        .env("PWD", &nx)
+        .current_dir(&nx)
+        .output()
+        .expect("observe the installer package root");
+    assert!(
+        context.status.success(),
+        "{}",
+        String::from_utf8_lossy(&context.stderr)
+    );
+    assert_eq!(
+        PathBuf::from(String::from_utf8(context.stdout).unwrap().trim()),
+        nx,
+        "the observed Bun root is the standalone developer package"
+    );
+    eprintln!("developer Nx installer root: {}", nx.display());
+    // Production mode is frozen and never writes a missing lock. The ordinary producer must
+    // generate this package's exact lock first, just as the covered-install fixture does.
+    let lock_started = Instant::now();
+    let locked = Command::new(&bun)
+        .args([
+            "install",
+            "--lockfile-only",
+            "--ignore-scripts",
+            "--offline",
+        ])
+        .env("PWD", &nx)
+        .current_dir(&nx)
+        .output()
+        .expect("produce the actual developer package lock");
+    eprintln!(
+        "developer Nx lock producer: {:?}; stdout: {}; stderr: {}",
+        lock_started.elapsed(),
+        String::from_utf8_lossy(&locked.stdout),
+        String::from_utf8_lossy(&locked.stderr)
+    );
+    assert!(
+        locked.status.success(),
+        "the ordinary developer package lock producer failed"
+    );
+    assert!(
+        nx.join("bun.lock").is_file(),
+        "the normal producer wrote this package's own lock"
+    );
+    let began = Instant::now();
+    let install = Command::new(&bun)
+        .args(["install", "--production", "--ignore-scripts", "--offline"])
+        .env("PWD", &nx)
+        .current_dir(&nx)
+        .output()
+        .expect("install the developer package's exact production closure");
+    eprintln!(
+        "developer Nx production install: {:?}; stdout: {}; stderr: {}",
+        began.elapsed(),
+        String::from_utf8_lossy(&install.stdout),
+        String::from_utf8_lossy(&install.stderr)
+    );
+    assert!(
+        install.status.success(),
+        "the real developer package install failed"
+    );
+    // Nx's unchanged CLI resolves its global namespace four levels above dist/bin.
+    // Produce that genuine workspace binding with Bun, never a hand-made self alias.
+    let package_lock = fs::read(nx.join("bun.lock")).expect("the package's own production lock");
+    fs::write(
+        checkout.join("package.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "name": "fixture-developer-nx", "private": true,
+            "workspaces": ["packages/nx"], "dependencies": { "nx": "workspace:*" }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(checkout.join("bunfig.toml"), &configuration).unwrap();
+    for args in [
+        [
+            "install",
+            "--lockfile-only",
+            "--ignore-scripts",
+            "--offline",
+        ],
+        ["install", "--production", "--ignore-scripts", "--offline"],
+    ] {
+        let began = Instant::now();
+        let result = Command::new(&bun)
+            .args(args)
+            .env("PWD", &checkout)
+            .current_dir(&checkout)
+            .output()
+            .expect("produce the developer checkout's ordinary workspace namespace");
+        eprintln!(
+            "developer Nx workspace producer {args:?}: {:?}; stdout: {}; stderr: {}",
+            began.elapsed(),
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
         );
-        if !namespaces.insert(namespace.clone()) {
-            continue;
-        }
-        let mut groups = vec![namespace];
-        while let Some(group) = groups.pop() {
-            for entry in fs::read_dir(&group).expect("installed dependency namespace") {
-                let entry = entry.expect("dependency namespace entry");
-                let target = entry
-                    .path()
-                    .canonicalize()
-                    .expect("installed namespace entry resolves");
-                if group.file_name() == Some(std::ffi::OsStr::new(".bin")) {
-                    binaries.push(target);
-                    continue;
-                }
-                if reads.iter().any(|package| target.starts_with(package)) {
-                    continue;
-                }
-                let name = entry.file_name();
-                if (name.to_string_lossy().starts_with('@') || name == ".bin")
-                    && entry.file_type().expect("namespace entry kind").is_dir()
-                {
-                    groups.push(entry.path());
-                    continue;
-                }
-                assert!(
-                    installed(&target),
-                    "dependency {} leaves the Bun install: {}",
-                    entry.path().display(),
-                    target.display()
-                );
-                let identity: InstalledPackageIdentity = serde_json::from_slice(
-                    &fs::read(target.join("package.json")).expect("installed package manifest"),
-                )
-                .expect("installed logical package identity");
-                assert!(
-                    entry.path().ends_with(Path::new(&identity.name))
-                        && !identity.version.is_empty(),
-                    "dependency binding does not match its installed package identity"
-                );
-                reads.insert(target.clone());
-                let mut dependency_namespace = target;
-                for _ in Path::new(&identity.name).components() {
-                    assert!(dependency_namespace.pop());
-                }
-                assert_eq!(
-                    dependency_namespace.file_name(),
-                    Some(std::ffi::OsStr::new("node_modules"))
-                );
-                pending.push(dependency_namespace);
-            }
-        }
+        assert!(
+            result.status.success(),
+            "the actual workspace namespace producer failed"
+        );
+        assert!(
+            checkout.join("bun.lock").is_file(),
+            "the root producer wrote its own lock"
+        );
     }
-    assert!(
-        binaries
-            .iter()
-            .all(|binary| reads.iter().any(|package| binary.starts_with(package))),
-        "an installed binary binding leaves the package closure"
+    assert_eq!(
+        fs::read(nx.join("bun.lock")).unwrap(),
+        package_lock,
+        "the root producer preserves the package's own production lock"
     );
-    reads.extend(namespaces);
-    // Local packages already belong to the workspace's read authority. External grants must
-    // never intersect that protected workspace; only shared cache payloads need added reads.
-    reads
-        .into_iter()
-        .filter(|path| !path.starts_with(&local))
-        .collect()
+    assert_eq!(checkout.join("node_modules/nx").canonicalize().unwrap(), nx);
+    eprintln!(
+        "developer Nx workspace bun.lock sha256={}",
+        cowshed_core::api::dto::Sha256Digest::compute(
+            &fs::read(checkout.join("bun.lock")).unwrap()
+        )
+    );
+    for (file, bytes) in product.into_iter().zip(before) {
+        let after = fs::read(nx.join(file)).expect("the installed developer product");
+        assert_eq!(
+            after, bytes,
+            "ordinary dependency installation must not change the maintained Nx {file}"
+        );
+        eprintln!(
+            "developer Nx {file} sha256={}",
+            cowshed_core::api::dto::Sha256Digest::compute(&after)
+        );
+    }
+    let lock =
+        fs::read(nx.join("bun.lock")).expect("ordinary Bun wrote the developer closure lock");
+    eprintln!(
+        "developer Nx bun.lock sha256={}",
+        cowshed_core::api::dto::Sha256Digest::compute(&lock)
+    );
+    assert!(
+        fs::metadata(nx.join("dist/bin/nx.js"))
+            .expect("the real developer Nx program")
+            .permissions()
+            .mode()
+            & 0o111
+            != 0,
+        "the maintained developer program remains executable"
+    );
+    (checkout, nx)
 }
 
 /// Adopt the fixture's checkout as main, let every workspace read `reads` (the toolchains its
@@ -1355,15 +1419,25 @@ fn repository_root() -> PathBuf {
         .expect("the repository root")
 }
 
-/// The host's Bun, the package manager the repository pins in `packageManager`.
 fn host_bun() -> PathBuf {
-    std::env::var_os("PATH")
-        .and_then(|path| {
-            std::env::split_paths(&path)
-                .map(|directory| directory.join("bun"))
-                .find(|candidate| candidate.is_file())
-        })
-        .expect("bun on the test's PATH")
+    let observed = Command::new("bun")
+        .args(["--print", "process.execPath"])
+        .output()
+        .expect("observe the actual pinned Bun executable");
+    assert!(
+        observed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&observed.stderr)
+    );
+    let executable = PathBuf::from(
+        String::from_utf8(observed.stdout)
+            .expect("Bun executable path is UTF-8")
+            .trim(),
+    )
+    .canonicalize()
+    .expect("the observed pinned Bun executable resolves");
+    eprintln!("fixture Bun executable: {}", executable.display());
+    executable
 }
 
 /// The pins `bun install` applies to Nx, read from the repository's own manifest.
@@ -1416,7 +1490,11 @@ fn write_nx_project(checkout: &Path, nx: &Path, node: &Path, declared: bool) {
     .unwrap();
     // The genuine fixture uses the normal daemon: checks must share the keeper's warm graph,
     // not race its detached startup while bypassing it (16_build_volumes.md, daemon stays on).
-    fs::write(checkout.join("nx.json"), "{}").unwrap();
+    fs::write(
+        checkout.join("nx.json"),
+        r#"{"cacheDirectory":".nx/cache"}"#,
+    )
+    .unwrap();
     fs::write(checkout.join(".gitignore"), "node_modules\n.nx\n.cowshed\n").unwrap();
     fs::create_dir_all(checkout.join("a")).unwrap();
     fs::write(checkout.join("a/src.txt"), b"src\n").unwrap();
@@ -5309,31 +5387,64 @@ async fn real_apfs_land_leaves_a_stock_detached_landing_daemon_running_and_skips
         nx: Some((&nx, &node)),
         rust: None,
     });
-    write_emit_project(&fixture.checkout, &node, false);
-    git(&fixture.checkout, &["add", "b"]);
-    git(
-        &fixture.checkout,
-        &["commit", "-q", "-m", "add emit producer"],
-    );
-    let mut service = serve_project(&mut fixture, &nx_read_paths(&nx)).await;
+    let nx_reads = nx_read_paths(&fixture_nx(&fixture.checkout));
+    let mut service = serve_project(&mut fixture, &nx_reads).await;
     let topic = new_workspace(&mut service, "outputs").await;
     fs::write(topic.join("a/src.txt"), "changed\n").unwrap();
     git(&topic, &["commit", "-q", "-am", "change output input"]);
-    sh(&mut service, "outputs", &nx_run_many(&node)).await;
-    sh(
-        &mut service,
-        "outputs",
-        "node_modules/.bin/nx daemon --start",
-    )
-    .await;
-    let record = topic.join(".nx/workspace-data/d/server-process.json");
-    eventually("the topic's Nx daemon publishes its record", || {
-        record.is_file()
-    })
-    .await;
-    let daemon_pid = serde_json::from_slice::<LandDaemonRecord>(&fs::read(&record).unwrap())
-        .expect("the daemon's own record")
+    sh(&mut service, "outputs", &nx_run_many(&node, "build")).await;
+
+    // A real foreign stock daemon owns a standalone root that retirement must not remove.
+    // Its produced record nominates it in the landing checkout; it grants no ledger ownership.
+    let foreign = fixture._scratch.path().join("foreign-daemon-checkout");
+    clone_tree(
+        &checkout_template(Project::Build {
+            nx: Some((&nx, &node)),
+            rust: None,
+        }),
+        &foreign,
+    );
+    let state = fixture._scratch.path().join("foreign-daemon-state");
+    let data = state.join("workspace-data");
+    let socket = cowshed_core::sandbox::workspace_runtime_link(&foreign).join("nx");
+    fs::create_dir_all(&socket).unwrap();
+    let mut command = Command::new(&node);
+    command
+        .args(["node_modules/nx/dist/bin/nx.js", "daemon", "--start"])
+        .current_dir(&foreign);
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("NX_") || key == "CI" {
+            command.env_remove(key);
+        }
+    }
+    command
+        .env("NX_USE_LOCAL", "true")
+        .env("NX_WORKSPACE_ROOT_PATH", &foreign)
+        .env("NX_CACHE_DIRECTORY", state.join("cache"))
+        .env("NX_WORKSPACE_DATA_DIRECTORY", &data)
+        .env("NX_SOCKET_DIR", &socket);
+    let started = command.output().expect("start the standalone stock daemon");
+    assert!(
+        started.status.success(),
+        "{}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    let record = data.join("d/server-process.json");
+    let bytes = fs::read(&record).expect("the standalone daemon's produced record");
+    let daemon_pid = serde_json::from_slice::<LandDaemonRecord>(&bytes)
+        .unwrap()
         .process_id;
+    let process = cowshed_core::runtime::job_groups::Process::observe(daemon_pid)
+        .unwrap()
+        .expect("the actual foreign identity");
+    let exit = process
+        .watch_exit()
+        .expect("watch the foreign identity before land");
+    fs::write(
+        topic.join(".nx/workspace-data/d/server-process.json"),
+        &bytes,
+    )
+    .unwrap();
 
     let report = land(&mut service, "outputs", true, &[]).await;
     match &report.build_volume.adoption {
@@ -5342,21 +5453,46 @@ async fn real_apfs_land_leaves_a_stock_detached_landing_daemon_running_and_skips
         } => assert_eq!(daemon.pid, daemon_pid, "{report:?}"),
         other => panic!("an unproven landing daemon skips adoption: {other:?}"),
     }
-    assert!(!report.build_volume.seeded, "{report:?}");
-    let daemon = cowshed_core::runtime::job_groups::Process::observe(daemon_pid)
-        .expect("observe the daemon after land");
-    assert!(daemon.is_some(), "the unproven daemon was never signalled");
-
-    // Cleanup of the daemon this test started: a labelled host-context stop, after the assertions.
-    let daemon = daemon.expect("the daemon still runs");
-    let exit = daemon.watch_exit().expect("watch the daemon's exit");
-    // SAFETY: `daemon_pid` is the process this test started and observed through its own record.
-    assert_eq!(unsafe { libc::kill(daemon_pid, libc::SIGTERM) }, 0);
+    assert_ne!(report.build_volume.seed, LandSeed::Frozen, "{report:?}");
     assert!(
-        exit.within(std::time::Duration::from_secs(10))
-            .expect("exit watch")
+        !exit.within(Duration::ZERO).unwrap(),
+        "the actual foreign identity survived retirement"
     );
-    drop(service);
+    assert_eq!(
+        fs::read(&record).unwrap(),
+        bytes,
+        "retirement leaves the foreign owner record unchanged"
+    );
+    let socket_path: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    std::os::unix::net::UnixStream::connect(socket_path["socketPath"].as_str().unwrap())
+        .expect("the real foreign daemon socket survives");
+
+    // Cleanup belongs to the daemon's standalone owner, only after the survival proof.
+    let mut stop = Command::new(&node);
+    stop.args(["node_modules/nx/dist/bin/nx.js", "daemon", "--stop"])
+        .current_dir(&foreign);
+    for (key, value) in command.get_envs() {
+        if let Some(value) = value {
+            stop.env(key, value);
+        } else {
+            stop.env_remove(key);
+        }
+    }
+    let stopped = stop
+        .output()
+        .expect("stop the standalone stock daemon through its own Nx owner");
+    assert!(
+        stopped.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+    assert!(
+        exit.within(Duration::from_secs(10)).unwrap(),
+        "owned foreign cleanup completes"
+    );
+    fs::remove_dir_all(socket.parent().expect("owned short socket root"))
+        .expect("remove the standalone daemon socket namespace");
+    service.shutdown().await.expect("stop the runtime");
     fixture.stop_gateway().await;
 }
 
@@ -5375,11 +5511,12 @@ async fn real_apfs_default_land_never_signals_a_foreign_nominee_during_retiremen
         &fixture.checkout,
         &["commit", "-q", "-m", "add emit producer"],
     );
-    let mut service = serve_project(&mut fixture, &nx_read_paths(&nx)).await;
+    let nx_reads = nx_read_paths(&fixture_nx(&fixture.checkout));
+    let mut service = serve_project(&mut fixture, &nx_reads).await;
     let topic = new_workspace(&mut service, "outputs").await;
     fs::write(topic.join("a/src.txt"), "changed\n").unwrap();
     git(&topic, &["commit", "-q", "-am", "change output input"]);
-    sh(&mut service, "outputs", &nx_run_many(&node)).await;
+    sh(&mut service, "outputs", &nx_run_many(&node, "build")).await;
     // A process no job started, under sandbox-exec with signals to other pids denied. The ledger
     // names no group for it, so the forged record is an unproven nominee.
     let mut foreign = Command::new("/usr/bin/sandbox-exec")
@@ -5456,11 +5593,12 @@ async fn real_apfs_land_skips_an_unverifiable_daemon_record_before_quiesce() {
             &fixture.checkout,
             &["commit", "-q", "-m", "add emit producer"],
         );
-        let mut service = serve_project(&mut fixture, &nx_read_paths(&nx)).await;
+        let nx_reads = nx_read_paths(&fixture_nx(&fixture.checkout));
+        let mut service = serve_project(&mut fixture, &nx_reads).await;
         let topic = new_workspace(&mut service, "outputs").await;
         fs::write(topic.join("a/src.txt"), "changed\n").unwrap();
         git(&topic, &["commit", "-q", "-am", "change output input"]);
-        sh(&mut service, "outputs", &nx_run_many(&node)).await;
+        sh(&mut service, "outputs", &nx_run_many(&node, "build")).await;
         let record = topic.join(".nx/workspace-data/d/server-process.json");
         fs::create_dir_all(record.parent().unwrap()).unwrap();
         if record.exists() {
@@ -5485,7 +5623,7 @@ async fn real_apfs_land_skips_an_unverifiable_daemon_record_before_quiesce() {
             }
             other => panic!("an unverifiable daemon record skips adoption: {other:?}"),
         }
-        assert!(!report.build_volume.seeded, "{report:?}");
+        assert_ne!(report.build_volume.seed, LandSeed::Frozen, "{report:?}");
         drop(service);
         fixture.stop_gateway().await;
     }
@@ -5499,12 +5637,13 @@ async fn real_apfs_managed_install_restores_developer_links_before_nx_and_cleans
             vec![cowshed_core::runtime::shell_host::SHELL_HOST_ARGUMENT.into()],
         ),
     );
-    let (nx, node) = repository_nx();
+    let (repository, node) = repository_nx();
     let mut fixture = Fixture::with(Project::Build {
-        nx: Some((&nx, &node)),
+        nx: Some((&repository, &node)),
         rust: None,
     });
-    let registry = fixture.storage.home().join("registry-nx");
+    let (developer, nx) = developer_nx(&fixture);
+    let registry = fixture.checkout.join("fixture-registry-nx");
     fs::create_dir_all(registry.join("dist/bin")).unwrap();
     fs::write(
         registry.join("package.json"),
@@ -5522,20 +5661,9 @@ async fn real_apfs_managed_install_restores_developer_links_before_nx_and_cleans
     )
     .unwrap();
     fs::write(fixture.checkout.join("package.json"), serde_json::to_vec(&serde_json::json!({
-        "name": "fixture", "private": true, "dependencies": { "nx": format!("file:{}", registry.display()) }
+        "name": "fixture", "private": true, "dependencies": { "nx": "file:./fixture-registry-nx" }
     })).unwrap()).unwrap();
-    let bun = Command::new("bun")
-        .args(["--print", "process.execPath"])
-        .output()
-        .expect("actual Bun");
-    assert!(
-        bun.status.success(),
-        "{}",
-        String::from_utf8_lossy(&bun.stderr)
-    );
-    let bun = PathBuf::from(String::from_utf8(bun.stdout).unwrap().trim())
-        .canonicalize()
-        .unwrap();
+    let bun = host_bun();
     let installed = Command::new(&bun)
         .args(["install", "--ignore-scripts"])
         .current_dir(&fixture.checkout)
@@ -5566,24 +5694,56 @@ async fn real_apfs_managed_install_restores_developer_links_before_nx_and_cleans
         fixture.checkout.join("node_modules/.bin/nx"),
     )
     .unwrap();
-    git(&fixture.checkout, &["add", "package.json", "bun.lock"]);
+    git(
+        &fixture.checkout,
+        &["add", "package.json", "bun.lock", "fixture-registry-nx"],
+    );
     git(
         &fixture.checkout,
         &["commit", "-q", "-m", "record local installer fixture"],
     );
-    let mut reads = nx_read_paths(&nx);
-    reads.push(registry);
+    let reads = nx_dependencies::installed_nx_read_paths(&nx, Some(&developer));
+    // The file provider travels inside each checkout and needs no sibling read grant.
     let mut service = serve_project(&mut fixture, &reads).await;
-    let topic = new_workspace(&mut service, "links").await;
+    succeed(&mut service, ["fork", "links"]).await;
+    let topic = service
+        .path("links", false)
+        .await
+        .expect("mounted links workspace")
+        .mount;
+    assert_eq!(
+        fixture_nx(&topic),
+        nx,
+        "the fork preserves the genuine sibling product"
+    );
+    let tslib_manifest = nx.join("node_modules/tslib/package.json");
+    assert!(
+        tslib_manifest.is_file(),
+        "the ordinary installed sibling tslib payload exists"
+    );
+    let native_manifest = nx.join("node_modules/@nx/nx-darwin-arm64/package.json");
+    let native_identity: serde_json::Value = serde_json::from_slice(
+        &fs::read(&native_manifest)
+            .expect("ordinary Bun installed the pinned native platform package"),
+    )
+    .unwrap();
+    assert_eq!(native_identity["name"], "@nx/nx-darwin-arm64");
+    assert_eq!(native_identity["version"], "23.2.1");
+    let closure_probe = format!(
+        "node -e 'const assert=require(\"node:assert/strict\"); const root=require(\"node:path\").resolve({},\"../../../../\"); assert.equal(root,{}); assert.equal(require(\"node:module\").createRequire(root+\"/package.json\").resolve(\"nx/bin/nx.js\"),{}); require(\"fs\").readFileSync({}); require(\"fs\").readFileSync({}); require({})'",
+        serde_json::to_string(&nx.join("dist/bin").to_string_lossy()).unwrap(),
+        serde_json::to_string(&developer.to_string_lossy()).unwrap(),
+        serde_json::to_string(&nx.join("dist/bin/nx.js").to_string_lossy()).unwrap(),
+        serde_json::to_string(&tslib_manifest.to_string_lossy()).unwrap(),
+        serde_json::to_string(&native_manifest.to_string_lossy()).unwrap(),
+        serde_json::to_string(&nx.join("dist/src/native").to_string_lossy()).unwrap()
+    );
+    sh(&mut service, "links", &closure_probe).await;
     let (stdout, stderr) = succeed(
         &mut service,
         [
-            "exec",
-            "links",
-            "--",
-            "/bin/sh",
-            "-c",
-            "bun install --ignore-scripts && node_modules/.bin/nx show projects --json",
+            "exec", "links", "--", "/bin/sh", "-c",
+            &format!("bun install --ignore-scripts && {closure_probe} && node_modules/.bin/nx show projects --json"),
         ],
     )
     .await;
@@ -5717,11 +5877,12 @@ async fn real_apfs_killed_covered_install_restores_links_its_postinstall_removed
             vec![cowshed_core::runtime::shell_host::SHELL_HOST_ARGUMENT.into()],
         ),
     );
-    let (nx, node) = repository_nx();
+    let (repository, node) = repository_nx();
     let mut fixture = Fixture::with(Project::Build {
-        nx: Some((&nx, &node)),
+        nx: Some((&repository, &node)),
         rust: None,
     });
+    let (developer, nx) = developer_nx(&fixture);
     // Real Bun runs the root's postinstall for `bun install` without --ignore-scripts. The script
     // removes the developer links, records its TMPDIR in `ready`, then stays alive.
     fs::create_dir_all(fixture.checkout.join("scripts")).unwrap();
@@ -5749,18 +5910,7 @@ async fn real_apfs_killed_covered_install_restores_links_its_postinstall_removed
     .unwrap();
     // Bun's own lockfile, written without running any lifecycle script, so `bun.lock` is real and
     // Bun detection (capabilities/bun.rs) activates on it. Resolved as the managed-install test does.
-    let bun = Command::new("bun")
-        .args(["--print", "process.execPath"])
-        .output()
-        .expect("actual Bun");
-    assert!(
-        bun.status.success(),
-        "{}",
-        String::from_utf8_lossy(&bun.stderr)
-    );
-    let bun = PathBuf::from(String::from_utf8(bun.stdout).unwrap().trim())
-        .canonicalize()
-        .unwrap();
+    let bun = host_bun();
     let lockfile = Command::new(&bun)
         .args(["install", "--ignore-scripts", "--lockfile-only"])
         .current_dir(&fixture.checkout)
@@ -5775,6 +5925,15 @@ async fn real_apfs_killed_covered_install_restores_links_its_postinstall_removed
         fixture.checkout.join("bun.lock").is_file(),
         "Bun wrote bun.lock"
     );
+    // This witness displaces a developer choice, not a normal package-manager store alias.
+    fs::remove_file(fixture.checkout.join("node_modules/nx")).unwrap();
+    fs::remove_file(fixture.checkout.join("node_modules/.bin/nx")).unwrap();
+    std::os::unix::fs::symlink(&nx, fixture.checkout.join("node_modules/nx")).unwrap();
+    std::os::unix::fs::symlink(
+        "../nx/dist/bin/nx.js",
+        fixture.checkout.join("node_modules/.bin/nx"),
+    )
+    .unwrap();
     git(
         &fixture.checkout,
         &[
@@ -5789,8 +5948,19 @@ async fn real_apfs_killed_covered_install_restores_links_its_postinstall_removed
         &fixture.checkout,
         &["commit", "-q", "-m", "fixture postinstall"],
     );
-    let mut service = serve_project(&mut fixture, &nx_read_paths(&nx)).await;
-    let topic = new_workspace(&mut service, "links").await;
+    let reads = nx_dependencies::installed_nx_read_paths(&nx, Some(&developer));
+    let mut service = serve_project(&mut fixture, &reads).await;
+    succeed(&mut service, ["fork", "links"]).await;
+    let topic = service
+        .path("links", false)
+        .await
+        .expect("mounted links workspace")
+        .mount;
+    assert_eq!(
+        fixture_nx(&topic),
+        nx,
+        "the fork preserves the genuine sibling product"
+    );
     let nx_link = fs::read_link(topic.join("node_modules/nx")).unwrap();
     let bin_link = fs::read_link(topic.join("node_modules/.bin/nx")).unwrap();
     service

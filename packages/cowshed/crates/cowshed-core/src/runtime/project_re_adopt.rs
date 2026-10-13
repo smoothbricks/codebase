@@ -10,7 +10,10 @@
 
 use std::path::{Path, PathBuf};
 
-use super::{StorageProjectRuntimeHost, close_checkout_nx, main_name, native_integrity_error};
+use super::{
+    CheckoutNxCheck, StorageProjectRuntimeHost, check_checkout_nx, main_name,
+    native_integrity_error,
+};
 use super::{WorkspaceSnapshot, native_staged_error, native_storage_error};
 use crate::api::dto::AdoptOptions;
 use crate::build_volume::BuildVolumeId;

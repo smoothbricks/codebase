@@ -911,6 +911,10 @@ Cowshed never sets `NX_DAEMON=false` for any process, and never withholds the da
   (Land 6.3), so the swap does not end it: the daemon exits as soon as it finds no record that names it, and a client
   writing to it then fails with `write EPIPE`. A sandboxed daemon's grant names the previous volume alone, so its record
   is left behind; it exits and its keeper starts the next one on the adopted volume.
+- The keeper runs the checkout's installed Nx foreground server as one admitted background job. Its original job
+  birth/group is the only ledger ownership proof; a daemon record never enrolls a new process. That maintenance job is
+  excluded from user-activity and idle checks, while quiescence and retirement stop and wait for it through the ordinary
+  job lifecycle.
 - An idle shed's daemon is stopped, never disabled. Five minutes after a shed was last in use, its keeper stops its
   daemon and starts none until the shed is in use again (04_sandbox.md), and the next Nx command starts one. What the
   rule protects is the warm state of a shed in use; a daemon nothing uses is a resident process, its plugin workers and
@@ -1031,9 +1035,9 @@ An Nx task hash must not change between checkouts of the same tree.
 - **Enforced by**: step 2b of every land (100% hits on main) and the fork test (100% hits in a fresh fork).
 
 A project-contained developer-link declaration selects its directory in the current checkout and refuses physical
-symlink escapes, including an escaping existing ancestor of a not-yet-existing declared directory. Genuine sibling
-declarations retain their main-checkout anchor. Neither the containment nor the sibling rule grants the main checkout or
-an ancestor dependency store to a cowshed sandbox.
+symlink escapes, including an escaping existing ancestor of a not-yet-existing declared directory. Sibling declarations
+resolve beside the current checkout; inherited absolute sibling bindings retain their existing targets. Neither the
+containment nor the sibling rule grants the main checkout or an ancestor dependency store to a cowshed sandbox.
 
 A project-contained developer alias is a relative link within its checkout. A source-image fork therefore selects its
 own copy without borrowing its donor's tree. Genuine sibling links retain their distinct host-local authority.

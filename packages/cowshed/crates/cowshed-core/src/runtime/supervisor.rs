@@ -4046,7 +4046,12 @@ impl SupervisorActor {
                 command = self.commands.recv(), if !self.command_lane_closed => {
                     match command {
                         Some(command) => self.handle_command(command).await,
-                        None => self.command_lane_closed = true,
+                        None => {
+                            self.command_lane_closed = true;
+                            if let Some(id) = self.nx_daemon.as_ref().and_then(|keeper| keeper.starting) {
+                                let _ = self.begin_kill(id, KillReason::Retire);
+                            }
+                        },
                     }
                 }
                 event = self.event_receiver.recv() => {
@@ -4404,7 +4409,7 @@ impl SupervisorActor {
                     let _ = reply.send(Err(error));
                 } else if self.lifecycle == ActorLifecycle::Retired {
                     let _ = reply.send(Ok(()));
-                } else if fail_if_busy && self.has_running_jobs() {
+                } else if fail_if_busy && self.has_user_jobs() {
                     let _ = reply.send(Err(CowshedError::conflict(
                         "workspace port capacity cannot change while jobs are active",
                         "request port capacity before starting the workload",
@@ -4412,6 +4417,9 @@ impl SupervisorActor {
                 } else {
                     if self.lifecycle == ActorLifecycle::Running {
                         self.lifecycle = ActorLifecycle::Quiescing;
+                    }
+                    if let Some(id) = self.nx_daemon.as_ref().and_then(|keeper| keeper.starting) {
+                        let _ = self.begin_kill(id, KillReason::Retire);
                     }
                     self.quiesce_waiters.push(reply);
                 }
@@ -4450,16 +4458,12 @@ impl SupervisorActor {
                 } else {
                     self.lifecycle = ActorLifecycle::Retiring;
                     self.retire_waiters.push(reply);
-                    // The keeper's own start job is let finish: killed, it could leave the
-                    // detached daemon it was starting to write its record after the keeper's
-                    // stop read none. Finished, its daemon is recorded and the stop ends it.
-                    let starting = self.nx_daemon.as_ref().and_then(|keeper| keeper.starting);
+                    // The keeper is the foreground daemon itself, so it stops and concludes
+                    // through the same lifecycle as every other admitted job.
                     let running = self
                         .jobs
                         .iter()
-                        .filter_map(|(id, job)| {
-                            (!job.terminal() && Some(*id) != starting).then_some(*id)
-                        })
+                        .filter_map(|(id, job)| (!job.terminal()).then_some(*id))
                         .collect::<Vec<_>>();
                     for job_id in running {
                         let _ = self.begin_kill(job_id, KillReason::Retire);
@@ -4472,7 +4476,7 @@ impl SupervisorActor {
             #[cfg(target_os = "macos")]
             Command::Idle { reply } => {
                 let idle = self.named_sessions.is_empty()
-                    && self.jobs.values().all(JobStateRecord::terminal)
+                    && !self.has_user_jobs()
                     && self.nx_daemon.as_ref().is_none_or(|keeper| keeper.settled);
                 let _ = reply.send(Ok(idle));
             }
@@ -4487,7 +4491,7 @@ impl SupervisorActor {
         let Some(path) = &self.group_ledger else {
             return;
         };
-        let mut groups: Vec<(u64, super::job_groups::GroupLeader)> = self
+        let groups: Vec<(u64, super::job_groups::GroupLeader)> = self
             .jobs
             .iter()
             // A job sealed after a wait failure may have left its group running: nothing saw it
@@ -4495,11 +4499,6 @@ impl SupervisorActor {
             .filter(|(_, job)| !job.sealed() || job.wait_failure.is_some())
             .filter_map(|(job_id, job)| Some((job_id.get(), job.birth.as_ref()?.leader()?)))
             .collect();
-        if let Some(keeper) = &self.nx_daemon
-            && let Some((job_id, leader)) = keeper.daemon_group
-        {
-            groups.push((job_id.get(), leader));
-        }
         match super::job_groups::record(path, &groups, &self.inherited_groups) {
             Ok(recorded) => {
                 for error in &recorded.uninspected {
@@ -5474,8 +5473,8 @@ impl SupervisorActor {
         }
     }
 
-    /// One probe of a shed's Nx daemon: nothing while the keeper's start job runs; once it has
-    /// ended, say how it went unless it left the daemon live; then judge whether the shed still
+    /// One probe of a shed's Nx daemon: observe the foreground keeper job independently of
+    /// developer activity, report its terminal failure, then judge whether the shed still
     /// wants a daemon ([`NxDaemonKeeper::judge`]), stopping one it no longer wants; start the
     /// daemon, inside the sandbox, when the shed wants one and the probe finds none live. Nobody
     /// waits for the start, so a start that is refused is said where the supervisor's own
@@ -5484,52 +5483,34 @@ impl SupervisorActor {
         let Some(keeper) = &mut self.nx_daemon else {
             return;
         };
-        if let Some(job_id) = keeper.starting
-            && self.jobs.get(&job_id).is_some_and(|job| !job.terminal())
-        {
-            return;
-        }
-        let ended = keeper.starting.take();
         let (read_write, _) = self
             .policy
             .child(crate::api::dto::RunSandboxMode::ReadWrite);
         let Some(project_root) = super::nx_daemon::kept_project(read_write).map(Path::to_path_buf)
         else {
-            // No Nx to keep: nothing for the supervisor to wait for.
             keeper.settled = true;
             return;
         };
-        let record = crate::capabilities::nx::daemon_record(&project_root);
-        let daemon = super::nx_daemon::probe(&record);
-        let mut daemon_group_changed = false;
-        if let Some(job_id) = ended {
+        let daemon =
+            super::nx_daemon::probe(&crate::capabilities::nx::daemon_record(&project_root));
+        let running = keeper
+            .starting
+            .is_some_and(|id| self.jobs.get(&id).is_some_and(|job| !job.terminal()));
+        if !running && let Some(job_id) = keeper.starting.take() {
             let job = self.jobs.get(&job_id).map(|job| &job.info);
             super::nx_daemon::report_start(job_id, job, &project_root, daemon);
         }
-        if daemon == Probe::Live
-            && keeper.daemon_group.is_none()
-            && let Some(job_id) = ended.or(keeper.daemon_job)
-            && let Some(pid) = super::nx_daemon::live_pid(&record)
-            && let Ok(leader) = super::job_groups::GroupLeader::observe(pid as u32)
-        {
-            keeper.daemon_group = Some((job_id, leader));
-            daemon_group_changed = true;
-        }
-        if daemon != Probe::Live && keeper.daemon_group.take().is_some() {
-            daemon_group_changed = true;
-        }
-        let working =
-            !self.named_sessions.is_empty() || self.jobs.values().any(|job| !job.terminal());
+        // The keeper's foreground job is maintenance, not use by the developer. It still belongs
+        // to the ordinary job ledger and every lifecycle drain waits for its real conclusion.
+        let working = !self.named_sessions.is_empty()
+            || self
+                .jobs
+                .iter()
+                .any(|(id, job)| Some(*id) != keeper.starting && !job.terminal());
         if keeper.judge(&project_root, working, daemon).await == Verdict::Release {
-            if daemon_group_changed {
-                self.record_groups();
-            }
             return;
         }
-        if daemon == Probe::Live {
-            if daemon_group_changed {
-                self.record_groups();
-            }
+        if daemon == Probe::Live || running {
             return;
         }
         let authority = self.authority.clone();
@@ -5555,19 +5536,14 @@ impl SupervisorActor {
             Ok(ExecAdmission::Queued(job_id) | ExecAdmission::Repeat(job_id)) => {
                 if let Some(keeper) = &mut self.nx_daemon {
                     keeper.starting = Some(job_id);
-                    keeper.daemon_job = Some(job_id);
                 }
             }
             Err(error) => eprintln!(
-                "cowshed: the Nx daemon of {} did not start in the sandbox: {}; the next probe in \
-                 {}s tries again",
+                "cowshed: the Nx daemon of {} did not start in the sandbox: {}; the next probe in {}s tries again",
                 project_root.display(),
                 error.message,
                 PROBE_INTERVAL.as_secs()
             ),
-        }
-        if daemon_group_changed {
-            self.record_groups();
         }
     }
 
@@ -6449,27 +6425,6 @@ impl SupervisorActor {
         // waiters so a follower that is mid-stream is served from the live deque first.
         job.stdout = VecDeque::new();
         job.stderr = VecDeque::new();
-        // The keeper's daemon start job ending is when its daemon first answers: record the
-        // daemon's group in the ledger now, because this supervisor may retire before the
-        // keeper's next probe, and a land proves the daemon from the ledger alone.
-        if self
-            .nx_daemon
-            .as_ref()
-            .is_some_and(|keeper| keeper.starting == Some(job_id))
-        {
-            let (read_write, _) = self
-                .policy
-                .child(crate::api::dto::RunSandboxMode::ReadWrite);
-            if let Some(project_root) = super::nx_daemon::kept_project(read_write) {
-                let record = crate::capabilities::nx::daemon_record(project_root);
-                if let Some(pid) = super::nx_daemon::live_pid(&record)
-                    && let Ok(leader) = super::job_groups::GroupLeader::observe(pid as u32)
-                    && let Some(keeper) = &mut self.nx_daemon
-                {
-                    keeper.daemon_group = Some((job_id, leader));
-                }
-            }
-        }
         if job.birth.is_some() {
             self.record_groups();
         }
@@ -6491,6 +6446,13 @@ impl SupervisorActor {
                 let _ = waiter.send(Ok(()));
             }
         }
+    }
+
+    fn has_user_jobs(&self) -> bool {
+        let keeper_job = self.nx_daemon.as_ref().and_then(|keeper| keeper.starting);
+        self.jobs
+            .iter()
+            .any(|(id, job)| Some(*id) != keeper_job && !job.terminal())
     }
 
     fn has_running_jobs(&self) -> bool {
@@ -9388,7 +9350,10 @@ mod install_observation_tests {
 
     #[test]
     fn an_absent_marker_is_not_observed_and_removing_it_is_idempotent() {
-        let scratch = crate::temp_root::TempRoot::new("install-observation-absent");
+        let scratch = crate::temp_root::TempRoot::new_in(
+            &crate::temp_parent::canonical_parent(),
+            "install-observation-absent",
+        );
         let exec = scratch.join("exec");
         fs::create_dir_all(&exec).unwrap();
         let marker = InstallObservation::new(&exec).unwrap();
@@ -9400,7 +9365,10 @@ mod install_observation_tests {
 
     #[test]
     fn a_regular_marker_is_observed_until_it_is_removed() {
-        let scratch = crate::temp_root::TempRoot::new("install-observation-regular");
+        let scratch = crate::temp_root::TempRoot::new_in(
+            &crate::temp_parent::canonical_parent(),
+            "install-observation-regular",
+        );
         let exec = scratch.join("exec");
         fs::create_dir_all(&exec).unwrap();
         let marker = InstallObservation::new(&exec).unwrap();
@@ -9413,7 +9381,10 @@ mod install_observation_tests {
 
     #[test]
     fn a_symlink_marker_is_refused_and_unlinked_without_touching_its_target() {
-        let scratch = crate::temp_root::TempRoot::new("install-observation-symlink");
+        let scratch = crate::temp_root::TempRoot::new_in(
+            &crate::temp_parent::canonical_parent(),
+            "install-observation-symlink",
+        );
         let exec = scratch.join("exec");
         fs::create_dir_all(&exec).unwrap();
         let foreign = scratch.join("foreign");
@@ -9428,7 +9399,10 @@ mod install_observation_tests {
 
     #[test]
     fn a_swapped_parent_cannot_redirect_the_marker_to_a_foreign_directory() {
-        let scratch = crate::temp_root::TempRoot::new("install-observation-swap");
+        let scratch = crate::temp_root::TempRoot::new_in(
+            &crate::temp_parent::canonical_parent(),
+            "install-observation-swap",
+        );
         let exec = scratch.join("exec");
         fs::create_dir_all(&exec).unwrap();
         let marker = InstallObservation::new(&exec).unwrap();
@@ -9454,7 +9428,7 @@ mod install_observation_tests {
     fn captured_checkout(
         scratch: &Path,
     ) -> (PathBuf, PathBuf, crate::developer_links::DeveloperLinks) {
-        use crate::fork_lock::Run as _;
+        use cowshed_os::fork_lock::Run as _;
         let root = scratch.join("checkout");
         fs::create_dir_all(root.join("node_modules/@scope")).unwrap();
         fs::write(root.join("package.json"), "{}\n").unwrap();
@@ -9485,7 +9459,10 @@ mod install_observation_tests {
 
     #[test]
     fn an_unreadable_marker_counts_unobserved_and_still_restores_a_registry_replacement() {
-        let scratch = crate::temp_root::TempRoot::new("install-observation-directory-marker");
+        let scratch = crate::temp_root::TempRoot::new_in(
+            &crate::temp_parent::canonical_parent(),
+            "install-observation-directory-marker",
+        );
         let (root, sibling, links) = captured_checkout(&scratch);
         fs::remove_file(root.join("node_modules/@scope/dev")).unwrap();
         fs::create_dir_all(root.join("node_modules/@scope/dev")).unwrap();
@@ -9520,7 +9497,10 @@ mod install_observation_tests {
     #[test]
     fn a_read_only_marker_parent_cannot_disable_the_restore_and_its_removal_is_reported() {
         use std::os::unix::fs::PermissionsExt as _;
-        let scratch = crate::temp_root::TempRoot::new("install-observation-read-only");
+        let scratch = crate::temp_root::TempRoot::new_in(
+            &crate::temp_parent::canonical_parent(),
+            "install-observation-read-only",
+        );
         let (root, sibling, links) = captured_checkout(&scratch);
         fs::remove_file(root.join("node_modules/@scope/dev")).unwrap();
         let exec = scratch.join("exec");
@@ -9546,7 +9526,10 @@ mod install_observation_tests {
     /// developer-link restoration, with the marker removed and no observation cleanup failure.
     #[test]
     fn a_refused_link_parent_is_a_links_failure_and_nothing_else() {
-        let scratch = crate::temp_root::TempRoot::new("terminal-cleanup-links-only");
+        let scratch = crate::temp_root::TempRoot::new_in(
+            &crate::temp_parent::canonical_parent(),
+            "terminal-cleanup-links-only",
+        );
         let (root, _sibling, links) = captured_checkout(&scratch);
         fs::remove_file(root.join("node_modules/@scope/dev")).unwrap();
         fs::remove_dir_all(root.join("node_modules/@scope")).unwrap();
@@ -9574,7 +9557,10 @@ mod install_observation_tests {
     #[test]
     fn a_marker_removal_failure_is_an_observation_failure_after_a_real_restore() {
         use std::os::unix::fs::PermissionsExt as _;
-        let scratch = crate::temp_root::TempRoot::new("terminal-cleanup-marker-only");
+        let scratch = crate::temp_root::TempRoot::new_in(
+            &crate::temp_parent::canonical_parent(),
+            "terminal-cleanup-marker-only",
+        );
         let (root, sibling, links) = captured_checkout(&scratch);
         fs::remove_file(root.join("node_modules/@scope/dev")).unwrap();
         fs::create_dir_all(root.join("node_modules/@scope/dev")).unwrap();
@@ -9633,7 +9619,10 @@ mod install_observation_tests {
     #[test]
     fn both_cleanup_causes_are_kept_and_named() {
         use std::os::unix::fs::PermissionsExt as _;
-        let scratch = crate::temp_root::TempRoot::new("terminal-cleanup-both");
+        let scratch = crate::temp_root::TempRoot::new_in(
+            &crate::temp_parent::canonical_parent(),
+            "terminal-cleanup-both",
+        );
         let (root, _sibling, links) = captured_checkout(&scratch);
         fs::remove_file(root.join("node_modules/@scope/dev")).unwrap();
         fs::remove_dir_all(root.join("node_modules/@scope")).unwrap();
