@@ -1728,9 +1728,9 @@ impl GitRepository {
     /// Only call through clone-owned Git: a linked source's inherited pointer must first be
     /// replaced by the clone's registration/index, never reset through the source registration.
     async fn discard_uncommitted(&self) -> Result<()> {
-        if !self.root.join(".git").is_dir() {
-            return Ok(());
-        }
+        // No `.git`-shape guard: the mint call site checks for a real directory itself, and
+        // the linked-adopt call site runs after registration replaced the inherited pointer
+        // with the clone's own, where `.git` is a file and the discard must still run.
         // A directory clone preserves bytes and mtimes, not inode identity. Refresh HEAD's
         // index against those bytes before the hard reset: otherwise Git rewrites unchanged
         // files whose copied stat cache names the source's inodes, invalidating warm builds.
