@@ -9,6 +9,7 @@ import {
   cargoPackageTestInputs,
   cargoTestGroupTargetName,
   cargoTestPackageTargetName,
+  filterScope,
   listCargoWorkspacePackages,
   packageNameFromCargoTestTarget,
   SERIAL_TEST_GROUP_PLATFORM,
@@ -347,6 +348,60 @@ describe('nextest serial test groups', () => {
     }
   });
 
+  it('scopes each group to the packages its overrides name, and to the workspace once any override names none', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'nx-serial-scope-'));
+    const override = (filter: string, group: string): string[] => [
+      '[[profile.default.overrides]]',
+      `filter = '${filter}'`,
+      `platform = '${SERIAL_TEST_GROUP_PLATFORM}'`,
+      `test-group = '${group}'`,
+      '',
+    ];
+    try {
+      await write(
+        root,
+        'nextest.toml',
+        [
+          '[test-groups.device]',
+          'max-threads = 1',
+          '',
+          '[test-groups.host]',
+          'max-threads = 1',
+          '',
+          '[test-groups.loose]',
+          'max-threads = 1',
+          '',
+          ...override('package(apfs) and test(/real_/)', 'device'),
+          ...override('package(core) and (test(/real_/) or binary(native))', 'host'),
+          ...override('package(cli) and test(/real_/)', 'host'),
+          ...override('package(apfs) and test(/loose_/)', 'loose'),
+          ...override('test(/loose_/)', 'loose'),
+        ].join('\n'),
+      );
+      expect(serialTestGroups(join(root, 'nextest.toml'))).toEqual([
+        {
+          group: 'device',
+          filter: '(package(apfs) and test(/real_/))',
+          scope: { kind: 'packages', packages: ['apfs'] },
+        },
+        {
+          // Several overrides of one group are one union, scoped to the packages of every clause.
+          group: 'host',
+          filter: '(package(core) and (test(/real_/) or binary(native))) or (package(cli) and test(/real_/))',
+          scope: { kind: 'packages', packages: ['cli', 'core'] },
+        },
+        {
+          // One override scoped to no package leaves the group's runner hashing every member.
+          group: 'loose',
+          filter: '(package(apfs) and test(/loose_/)) or (test(/loose_/))',
+          scope: { kind: 'workspace' },
+        },
+      ]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it('declares no serial group when the config is absent or names no group capped at one thread', async () => {
     const root = await mkdtemp(join(tmpdir(), 'nx-serial-none-'));
     try {
@@ -376,5 +431,142 @@ describe('nextest serial test groups', () => {
     expect(packageNameFromCargoTestTarget(cargoTestGroupTargetName('real-apfs'))).toBeNull();
     expect(packageNameFromCargoTestTarget(cargoTestPackageTargetName('big', 'shard1'))).toBe('big');
     expect(() => cargoTestPackageTargetName('group-real-apfs')).toThrow(/reserved/);
+  });
+});
+
+describe('nextest filter scopes', () => {
+  it('bounds a filter by the packages it is scoped to, however its operators and blanks are spelled', () => {
+    const scoped: ReadonlyArray<readonly [string, readonly string[]]> = [
+      // A plain name, with or without nextest's equality prefix, bare or parenthesised.
+      ['package(cowshed-apfs)', ['cowshed-apfs']],
+      ['package(=cowshed_apfs)', ['cowshed_apfs']],
+      ['(package(a))', ['a']],
+      ['((package(a)))', ['a']],
+      // `and`, `&` and `-` keep the package of the side that names one, with or without blanks around them.
+      ['package(a) and test(/x/)', ['a']],
+      ['package(a) & test(/x/)', ['a']],
+      ['package(a)&test(/x/)', ['a']],
+      ['package(a) - test(/x/)', ['a']],
+      ['package(a)-test(/x/)', ['a']],
+      ['package(a) and not test(/x/)', ['a']],
+      ['package(a) and !test(/x/)', ['a']],
+      ['package(a) and not(test(/x/))', ['a']],
+      ['test(/x/) and package(a)', ['a']],
+      ['binary(b) & (package(a) or package(c))', ['a', 'c']],
+      // An intersection takes the narrower side.
+      ['(package(a) or package(b)) and package(a)', ['a']],
+      ['package(a) and (package(a) or package(b))', ['a']],
+      // A union is bounded by every clause, once each, in any spelling and order.
+      ['package(b) or package(a)', ['a', 'b']],
+      ['package(b) | package(a)', ['a', 'b']],
+      ['package(b)+package(a)', ['a', 'b']],
+      ['package(a) or package(a)', ['a']],
+      // `and` binds tighter than `or`, so each clause keeps its own package.
+      ['package(a) and test(/x/) or package(b) and test(/y/)', ['a', 'b']],
+      ['package(a) or package(b) and test(/y/)', ['a', 'b']],
+      ['(package(a) and test(/x/)) or (package(b) and (test(/y/) or binary(z)))', ['a', 'b']],
+      // A difference is bounded by what it subtracts from, not by what it subtracts.
+      ['(package(a) or package(b)) - package(a)', ['a', 'b']],
+      ['package(a) - package(b)', ['a']],
+      // Operators and parentheses inside a matcher are its text, not the filter's syntax.
+      ['package(a) and test(/x or y | z + w - v & u (/)', ['a']],
+      ['package(a) and test(/(x|y)z/)', ['a']],
+      ['package(a) and test(/[)] | package(b) | [x]/)', ['a']],
+      ['package(a) and test(~one and two or three)', ['a']],
+      ['package(a) and test(=m::t::f_or_g)', ['a']],
+      // nextest reads the line endings of a multi-line TOML string as blanks.
+      ['package(a)\n  and test(/x/)\n  or package(b)', ['a', 'b']],
+      ['package(a)\r\n  and test(/x/)', ['a']],
+    ];
+    for (const [filter, packages] of scoped) {
+      expect(filterScope(filter), JSON.stringify(filter)).toEqual({ kind: 'packages', packages });
+    }
+  });
+
+  it('is the whole workspace for whatever can select from every package, or cannot be read with certainty', () => {
+    const workspace: readonly string[] = [
+      // Scoped to no package at all.
+      'test(/real_apfs_/)',
+      'binary(apfs_native_macos)',
+      'all()',
+      'default()',
+      'none()',
+      // One unscoped clause leaves a union unscoped, whatever spells the union.
+      'package(a) or test(/x/)',
+      'package(a) | test(/x/)',
+      'package(a)+test(/x/)',
+      'test(/x/) or package(a)',
+      '(package(a) and test(/x/)) or binary(b)',
+      // `and`, `&` and `-` bind tighter than `or`, `|` and `+`, with or without blanks: the union is not under the package.
+      'package(a) and test(/x/) | test(/y/)',
+      'package(a) and test(/x/)|test(/y/)',
+      'package(a) & test(/x/) + test(/y/)',
+      'package(a)&test(/x/)+test(/y/)',
+      'package(a) and test(/x/) or test(/y/)',
+      '(package(a) and test(/x/))|test(/y/)',
+      // Negation selects from every other package.
+      'not package(a)',
+      '!package(a)',
+      'not (package(a))',
+      '!(package(a) or package(b))',
+      'package(a) or not package(b)',
+      'not not package(a)',
+      // A name that a glob, a substring or a regex can widen.
+      'package(cowshed-*)',
+      'package(cowshed-ap?s)',
+      'package(~apfs)',
+      'package(/apfs/)',
+      'package(#cowshed-apfs)',
+      'package(=a*)',
+      'package(a|b)',
+      'package(a b)',
+      'package( a)',
+      'package(a )',
+      'package()',
+      'package(=)',
+      // Predicates that reach past the package they name.
+      'deps(a)',
+      'rdeps(a)',
+      'binary_id(a)',
+      'kind(lib)',
+      'platform(host)',
+      'group(g)',
+      // An argument whose end depends on nextest's escapes, or a comma, which nextest refuses.
+      'package(a) and test(=x\\)) | test(y)',
+      'package(a) and test(/x\\/y/) | test(z)',
+      'package(a) and test(=x,y)',
+      'package(a,b)',
+      // A union that only an exact reading of the regexes finds.
+      'package(a) and test(/(/) | test(/)/)',
+      // Not a filterset nextest accepts.
+      '',
+      '   ',
+      'package(a',
+      'package(a))',
+      '(package(a)',
+      'package(a) and',
+      'and package(a)',
+      'package(a) or',
+      '| package(a)',
+      'package(a) && test(/x/)',
+      'package(a) || test(/x/)',
+      'package(a) AND test(/x/)',
+      'package(a) OR package(b)',
+      'NOT package(a)',
+      'package(a) test(/x/)',
+      'package(a) and and test(/x/)',
+      'Package(a)',
+      'packages(a)',
+      'package a',
+      'package(a)\tand test(/x/)',
+      'test(/x/',
+      'test(/x/ y)',
+      'test(/a/b/)',
+      // Packages that exclude each other leave nothing to name.
+      'package(a) and package(b)',
+    ];
+    for (const filter of workspace) {
+      expect(filterScope(filter), JSON.stringify(filter)).toEqual({ kind: 'workspace' });
+    }
   });
 });
