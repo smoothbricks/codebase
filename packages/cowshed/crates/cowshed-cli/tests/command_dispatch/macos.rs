@@ -411,13 +411,17 @@ async fn adopt(fixture: &Fixture, service: &mut ActorBridge) {
 #[tokio::test]
 async fn directory_dispatch_grant_persists_across_runtime_restart() {
     let mut fixture = Fixture::directory();
-    // Main's block must be one no parallel test's store is also handed. Every store allocates
+    // Main's blocks must be ones no parallel test's store is also handed. Every store allocates
     // from its lowest free block up and checks the host only when it allocates, so two tests can
     // hold the same low block, and the other's gateway took this test's port before this test
-    // could ("claim published port: AddrInUse"). Adoption here is steered to the highest free
-    // block, which no other store reaches, by claiming every other block in this store.
-    let steered = highest_free_port_block(&fixture);
-    let claims = PortClaims::all_but(&fixture, steered);
+    // could ("claim published port: AddrInUse"). The same holds for the block main moves to: a
+    // low one is free on the host while this test's fixture gateway restarts, another store's
+    // adopt takes it then, and the restore correctly refuses the occupied base and moves main
+    // again (05_gateway.md, `AddrInUse`). Adoption is steered to the highest free block and the
+    // move to the next one below it, which no other store reaches, by claiming every other block
+    // in this store for the whole test.
+    let [steered, moved_to] = highest_free_port_blocks(&fixture);
+    let mut claims = PortClaims::all_but(&fixture, steered);
     let mut service = fixture.open().await;
     adopt(&fixture, &mut service).await;
     let before = service.grants("main").await.expect("baseline grants");
@@ -511,8 +515,8 @@ async fn directory_dispatch_grant_persists_across_runtime_restart() {
     // cannot be solved by probing in the allocator: the listener must trigger a real bind refusal.
     let competing_listener =
         TcpListener::bind((Ipv4Addr::LOCALHOST, original_port)).expect("claim published port");
-    // The reallocation needs a block to move to.
-    drop(claims);
+    // The reallocation's one block to move to; every other block stays claimed until the end.
+    claims.release(moved_to);
     fixture.start_gateway().await;
     service
         .reconcile_gateway()
@@ -530,8 +534,11 @@ async fn directory_dispatch_grant_persists_across_runtime_restart() {
             .port_allocation()
             .contains(reallocated)
     );
+    assert_eq!(
+        reallocated, moved_to,
+        "main moves to the one unclaimed block"
+    );
     let reallocated_port = reallocated.base();
-    assert_ne!(reallocated_port, original_port);
     let gateway = fixture
         .gateway
         .as_ref()
@@ -585,11 +592,12 @@ async fn directory_dispatch_grant_persists_across_runtime_restart() {
     service.shutdown().await.expect("shutdown runtime");
     fixture.stop_gateway().await;
     drop(competing_listener);
+    drop(claims);
 }
 
 /// Every macOS port block of `fixture`'s store claimed for this process except `kept`, exactly
 /// as a concurrent creator's reservation claims one; dropping it releases the claims.
-struct PortClaims(Vec<PathBuf>);
+struct PortClaims(Vec<(PortBlock, PathBuf)>);
 
 impl PortClaims {
     fn all_but(fixture: &Fixture, kept: PortBlock) -> Self {
@@ -602,16 +610,27 @@ impl PortClaims {
                 .map(|block| {
                     let marker = staging.join(format!("port-{}.reservation", block.base()));
                     std::os::unix::fs::symlink(&owner, &marker).expect("port reservation marker");
-                    marker
+                    (block, marker)
                 })
                 .collect(),
         )
+    }
+
+    /// Release the claim on `block`, leaving every other one held.
+    fn release(&mut self, block: PortBlock) {
+        let index = self
+            .0
+            .iter()
+            .position(|(claimed, _)| *claimed == block)
+            .expect("the released block is claimed");
+        let (_, marker) = self.0.swap_remove(index);
+        fs::remove_file(&marker).expect("release a port reservation");
     }
 }
 
 impl Drop for PortClaims {
     fn drop(&mut self) {
-        for marker in &self.0 {
+        for (_, marker) in &self.0 {
             if let Err(error) = fs::remove_file(marker) {
                 eprintln!("port reservation {}: {error}", marker.display());
             }
@@ -619,20 +638,23 @@ impl Drop for PortClaims {
     }
 }
 
-/// The highest block in the fixture partition whose every port is free right now.
-fn highest_free_port_block(fixture: &Fixture) -> PortBlock {
-    let candidates: Vec<PortBlock> =
-        PortBlock::macos_candidates(fixture.storage.port_allocation()).collect();
-    candidates
+/// The `N` highest blocks in the fixture partition whose every port is free right now, highest
+/// first.
+fn highest_free_port_blocks<const N: usize>(fixture: &Fixture) -> [PortBlock; N] {
+    let free: Vec<PortBlock> = PortBlock::macos_candidates(fixture.storage.port_allocation())
+        .collect::<Vec<_>>()
         .into_iter()
         .rev()
-        .find(|block| {
+        .filter(|block| {
             (block.base()..block.base() + block.size())
                 .map(|port| TcpListener::bind((Ipv4Addr::LOCALHOST, port)))
                 .collect::<std::io::Result<Vec<_>>>()
                 .is_ok()
         })
-        .expect("a macOS port block is free on the host")
+        .take(N)
+        .collect();
+    free.try_into()
+        .unwrap_or_else(|free: Vec<PortBlock>| panic!("{N} free macOS port blocks, not {free:?}"))
 }
 
 #[tokio::test]
