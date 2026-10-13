@@ -5,7 +5,6 @@
 use std::num::NonZeroUsize;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
@@ -15,8 +14,8 @@ use async_trait::async_trait;
 use cowshed_apfs::disk_lease::leased_at;
 use cowshed_apfs::image::{IMAGE_EXTENSION, ImageCapacity};
 use cowshed_apfs::{
-    ApfsBackend, AttachedImage, CreateImageRequest, DetachIntent, MacOsApfsBackend,
-    SystemCommandRunner,
+    ApfsBackend, AttachedImage, CommandOutput, CommandRequest, CreateImageRequest,
+    DISK_CHILD_DEADLINE, DetachIntent, MacOsApfsBackend, SystemCommandRunner,
 };
 use cowshed_gateway::{
     AuditError, AuditEvent, AuditSink, AuthorizedTarget, ConnectError, CredentialError,
@@ -24,7 +23,6 @@ use cowshed_gateway::{
     MirrorCacheConfig, UpstreamConnection, UpstreamConnector, UpstreamHealth,
 };
 use cowshed_gateway_types::DiskClass;
-use cowshed_os::fork_lock::Run as _;
 use uuid::Uuid;
 
 struct NoCredentials;
@@ -202,27 +200,32 @@ enum Arm {
     Leased,
 }
 
-/// One disk command, timed, through the lease in the leased arm: how long the command itself
-/// took, how long its lease wait added, and what it printed.
+/// One disk command, timed, through the shared disk runner and, in the leased arm, the test
+/// gateway's lease: how long the command itself took, how long its lease wait added, and what
+/// it printed. The unleased arm is the deliberately free-for-all baseline.
 fn timed(
     arm: Arm,
     socket: &Path,
     class: DiskClass,
     argv: &[&str],
-) -> (Duration, Duration, std::process::Output) {
+) -> (Duration, Duration, CommandOutput) {
+    let request = CommandRequest::new(argv[0], &argv[1..]);
     let asked = Instant::now();
     let mut ran = Duration::ZERO;
-    let mut run = || {
-        let started = Instant::now();
-        let output = Command::new(argv[0]).args(&argv[1..]).output_locked();
-        ran = started.elapsed();
-        output.map_err(|error| format!("{}: {error}", argv[0]))
-    };
-    let output = match arm {
-        Arm::Unleased => run(),
-        Arm::Leased => leased_at(socket, class, &argv.join(" "), run),
-    }
-    .expect("run a disk command");
+    let output = SystemCommandRunner
+        .run_within(&request, DISK_CHILD_DEADLINE, |run| {
+            let mut timed_run = || {
+                let started = Instant::now();
+                let output = run();
+                ran = started.elapsed();
+                output
+            };
+            match arm {
+                Arm::Unleased => timed_run(),
+                Arm::Leased => leased_at(socket, class, &argv.join(" "), timed_run),
+            }
+        })
+        .expect("run a disk command");
     (ran, asked.elapsed() - ran, output)
 }
 
@@ -279,7 +282,7 @@ fn attach_loop(
                 image,
             ],
         );
-        if !output.status.success() {
+        if !output.succeeded() {
             return Err(format!("attach {image}: {output:?}"));
         }
         attaches.push((ran, ran + waited));
@@ -291,7 +294,7 @@ fn attach_loop(
             DiskClass::Storage,
             &["/usr/bin/hdiutil", "detach", "-force", &device],
         );
-        if !detached.status.success() {
+        if !detached.succeeded() {
             return Err(format!("detach {device}: {detached:?}"));
         }
     }
@@ -314,7 +317,7 @@ fn mount_loop(
             DiskClass::Namespace,
             &["/sbin/mount_apfs", "-o", "nobrowse", volume, mount_point],
         );
-        if !mounted.status.success() {
+        if !mounted.succeeded() {
             return Err(format!("mount {volume}: {mounted:?}"));
         }
         let (_, _, unmounted) = timed(
@@ -323,7 +326,7 @@ fn mount_loop(
             DiskClass::Namespace,
             &["/sbin/umount", mount_point],
         );
-        if !unmounted.status.success() {
+        if !unmounted.succeeded() {
             return Err(format!("unmount {volume}: {unmounted:?}"));
         }
         cycles += 1;

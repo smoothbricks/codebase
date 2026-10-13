@@ -505,12 +505,12 @@ are host facts, not cowshed bugs, and every rule that budgets disk-tool calls ex
    `diskarbitrationd` freed none of them, and the reboot freed all (178 instances, 178 registered, after it). The likely
    cause is a device stuck in termination with an unfinished request pool because its attach or helper was killed
    mid-operation; the check that confirms it is the leaked-device delta across one real-APFS lane run, which must be 0
-   now that no disk-image command is killed before its hard deadline (below). 1024 is an observation of one host and
-   boot, not a documented limit. Departed volumes leak the same way above the device, held by `diskarbitrationd`: on
-   that host it held 1064 `AppleAPFSVolume` and 1067 `IOMedia` rights, and restarting it dropped `AppleAPFSVolume` from
-   1065 to 81 instances and `IOMedia` from 1075 to 80, with the image devices unchanged. After the reboot one
-   attach→mount→detach cycle of a plain `hdiutil` APFS image still left one `AppleAPFSVolume` instance behind, with or
-   without a Spotlight opt-out.
+   now that cowshed kills no disk-image command at all (below). 1024 is an observation of one host and boot, not a
+   documented limit. Departed volumes leak the same way above the device, held by `diskarbitrationd`: on that host it
+   held 1064 `AppleAPFSVolume` and 1067 `IOMedia` rights, and restarting it dropped `AppleAPFSVolume` from 1065 to 81
+   instances and `IOMedia` from 1075 to 80, with the image devices unchanged. After the reboot one attach→mount→detach
+   cycle of a plain `hdiutil` APFS image still left one `AppleAPFSVolume` instance behind, with or without a Spotlight
+   opt-out.
 
    The pool is bookkept per host user in `/private/var/tmp/cowshed-attach-pool-<euid>/pool.json`, a 0700 directory that
    survives the reboot, written under a lock beside it; the pool itself is host-wide, and each user's record holds what
@@ -524,38 +524,42 @@ are host facts, not cowshed bugs, and every rule that budgets disk-tool calls ex
    minus the devices leaked now. A ceiling only moves down and survives reboots, so
    `cowshed doctor --clear-attach-budget` also forgets it, back to the observed 1024, and keeps the last exhaustion as
    evidence. A record that does not parse proves nothing: it reads as empty with a warning naming the file, the kernel
-   is still reported, and the next write (a 150, a kill, a clear) replaces it. A refusal of the lane gate always names
-   what frees enough: the orphaned helpers for a spent boot the leaked devices do not explain,
+   is still reported, and the next write (a 150, a clear) replaces it. A refusal of the lane gate always names what
+   frees enough: the orphaned helpers for a spent boot the leaked devices do not explain,
    `cowshed doctor --clear-attach-budget` when the recorded ceiling alone is below the need, and otherwise a reboot,
    preceded by the `diskarbitrationd` restart when volumes or media leaked. `doctor` reports `disk-image-attach-budget`:
    the four classes' instances against their registered entries, the ceiling and its source, the headroom, and the
-   disk-image commands killed at their hard deadline this boot, each a probable leaked device. It is an error while the
-   boot is spent ("attach pool exhausted", with "reboot required" only when the leaked devices account for it), a
-   warning when the headroom falls to a quarter of the ceiling, 64 volumes or media have leaked, or a command was
-   killed, and its hint names what frees each: `sudo killall diskarbitrationd` for volumes and media, a reboot for image
-   devices, and the orphaned helpers first for a 150 the leaked devices do not explain. Orphaned helpers are named only
-   when two reads in a row agree and no `diskutil` or `hdiutil` ran during either, since a helper whose attach is under
-   way has no device yet and killing it mid-attach is what leaks one; killing orphans frees their mappings, never a
-   leaked device.
+   disk-image commands an earlier build killed at its former 15-minute hard deadline this boot, each a probable leaked
+   device (the record keeps them until the boot ends; no current build writes one). It is an error while the boot is
+   spent ("attach pool exhausted", with "reboot required" only when the leaked devices account for it), a warning when
+   the headroom falls to a quarter of the ceiling, 64 volumes or media have leaked, or a command was killed, and its
+   hint names what frees each: `sudo killall diskarbitrationd` for volumes and media, a reboot for image devices, and
+   the orphaned helpers first for a 150 the leaked devices do not explain. Orphaned helpers are named only when two
+   reads in a row agree and no `diskutil` or `hdiutil` ran during either, since a helper whose attach is under way has
+   no device yet and killing it mid-attach is what leaks one; killing orphans frees their mappings, never a leaked
+   device.
 
-   **A disk-image command is detached from its caller.** It runs in its own session, ignores the hangup, interrupt and
-   terminate signals addressed to it, and writes its output to per-run files the runner reads back after its wait, never
-   to the caller's pipes. A caller killed mid-attach — an agent tool deadline, a process-group kill of `cowshed exec`, a
-   supervisor reaped with its tree — therefore cannot interrupt it or wedge it on a dead pipe: the command finishes, and
-   the next invocation reconciles the result from the kernel's attachment inventory (an attach that completed is
-   registered, one that never started left nothing). The runner's 15-minute hard deadline is the only killer. The
-   bounded-exec RAM volume's detach follows the same rule on its side: it is never killed at its deadline, its wait is
-   bounded and reported by name, and a stray's detach gets a short bound before the creator reports it and gives the
+   **A disk-image command is detached from its caller.** A disk-image command is one that creates or releases an image
+   device: any `diskutil image …`, any `hdiutil`, and `diskutil eject` (Disk Arbitration's release of an image device,
+   classed so whatever it targets). It runs in its own session, ignores the hangup, interrupt and terminate signals
+   addressed to it, and writes its output to per-run files the runner reads back after its wait, never to the caller's
+   pipes. A caller killed mid-attach — an agent tool deadline, a process-group kill of `cowshed exec`, a supervisor
+   reaped with its tree, an adapter that gave up on `cowshed disk-command` — therefore cannot interrupt it or wedge it
+   on a dead pipe: the command finishes, and the next invocation reconciles the result from the kernel's attachment
+   inventory (an attach that completed is registered, one that never started left nothing). Nothing in cowshed kills it.
+   The bounded-exec RAM volume's detach follows the same rule on its side: it is never killed at its deadline, its wait
+   is bounded and reported by name, and a stray's detach gets a short bound before the creator reports it and gives the
    create claim back, so one wedged stray cannot hold a chain of creators.
 
-   **No disk-image command is killed at its deadline.** For a `diskutil image …` or `hdiutil` child the 120 s disk-child
-   deadline is a warning point, not a kill: it is waited for, synchronously and still holding its leases, and names its
-   verb, its target and the time elapsed on stderr every 30 s, until a hard deadline of 15 minutes kills it and records
-   a probable leaked device. A late child that succeeds is a success; one that fails is the caller's failure as always,
-   and an attach's own failure path detaches whatever device it produced. Every other disk child is still killed at 120
-   s. The trade-off is explicit: a hung DiskImages2 verb now wedges its own operation, and the image lease it holds, for
-   up to 15 minutes instead of leaking a device until reboot (the gateway evicts it from its disk phase after 10 s, so
-   the host's other disk work goes on; 05_gateway.md, "Disk-lifecycle lease"); past that the device is the smaller cost.
+   **No disk-image command is killed.** For a disk-image command the 120 s disk-child deadline is a warning point, not a
+   kill: it is waited for, synchronously and still holding its leases, and names its verb, its target and the time
+   elapsed on stderr every 30 s, until it ends on its own. A late child that succeeds is a success; one that fails is
+   the caller's failure as always, and an attach's own failure path detaches whatever device it produced. Every other
+   disk child (`diskutil info`, `diskutil apfs …`, `mount_apfs`, …) is still killed at 120 s. The trade-off is explicit:
+   a hung DiskImages2 verb wedges its own operation, and the image lease it holds, for as long as it hangs instead of
+   leaking a device until reboot (the gateway evicts it from its disk phase after 10 s, so the host's other disk work
+   goes on; 05_gateway.md, "Disk-lifecycle lease"). Its caller stays cancellable: a caller that stops waiting leaves the
+   detached command to finish. Callers outside cowshed get the same runner through `cowshed disk-command` (06_cli.md).
    The orphaned-helper `kill -9` does not contradict this: an orphan serves no device, so killing it strands nothing.
 
 3. **Detach waits on the kernel and holders.** A non-forced unmount of a volume something holds is refused with `EBUSY`
@@ -753,6 +757,14 @@ DeterminateSystems/nix-installer#212). `noauto` prevents Disk Arbitration from r
 Arbitration cannot supply System.keychain secrets. The script lives outside every user home and cowshed volume, so it
 unlocks and mounts the store before login without depending on the cowshed binary or its version. `nobrowse` keeps the
 store out of Finder, the Desktop, and the sidebar; nothing lands under `/Volumes`.
+
+The root boot script is cowshed's central **physical-volume** command layer, not an image executor. Its disk commands
+are limited to `info -plist`, `apfs unlockVolume -nomount -stdinpassphrase`, and `mount` for the configured UUID. It
+never attaches, detaches, creates, or resizes an image, and never executes a user-writable cowshed installation as root.
+The repository disk-command guard pins those exact commands in this one script and rejects image verbs there. Every
+image operation, including tests and benchmark scripts, uses `SystemCommandRunner` or
+`cowshed disk-command <hdiutil|diskutil> -- <args>`; callers do not implement their own signal, deadline, or output
+handling for disk tools.
 
 **`noowners` is deliberate.** The herd is machine-global and shared by every local account: with ownership honoring off,
 every user sees the same bytes as their own, which is exactly right for git checkouts (git tracks mode bits, never

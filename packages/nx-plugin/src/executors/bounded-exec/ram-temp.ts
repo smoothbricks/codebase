@@ -1681,9 +1681,10 @@ const HOST_COMMAND_DEADLINE_MS = 120_000;
  */
 const STRAY_DETACH_DEADLINE_MS = 30_000;
 
-/** A detach command: the one disk-image verb that is never killed at its deadline. */
-function isDetach(file: string, args: readonly string[]): boolean {
-  return (file === '/usr/bin/hdiutil' || file.endsWith('/hdiutil')) && args[0] === 'detach';
+/** Disk tools have one process owner: cowshed's detached, file-backed command layer. */
+export function diskCommand(file: string, args: readonly string[]): string[] | null {
+  const program = basename(file);
+  return program === 'hdiutil' || program === 'diskutil' ? ['disk-command', program, '--', ...args] : null;
 }
 
 /** Whether this process already said the cowshed gateway is not there to lease disk commands. */
@@ -1700,22 +1701,26 @@ const PREDATES_RECHECK_MS = 60_000;
 const predatesSeen = new Map<string, { at: number; what: 'leases' | 'alone' }>();
 
 /**
- * Every disk tool runs under cowshed's host disk-lifecycle lease when the gateway answers
- * (`disk-lease.ts`): its attaches and mounts then never starve cowshed's, nor cowshed's them. The
- * lease wait comes before the deadline starts, and the lease is released once the command is
- * answered. A process whose lease waits are recorded asks for its phase `alone`. Without a grant
- * the command runs unleased and stderr says why; an absent gateway is said once per process, and
- * one that predates leases is said and not asked again for a minute. One that refuses `alone` is
- * asked shared at once, and for a minute after.
+ * Disk-image tools delegate both process lifetime and disk leasing to cowshed. In particular,
+ * a caller timeout never kills an attach or detach, which can leak its kernel device until
+ * reboot. Other disk tools take the host lease here; acquiring it again around cowshed would
+ * deadlock a queued storage phase against its own caller. A process whose lease waits are
+ * recorded asks for its phase `alone`; a gateway that refuses `alone` is asked shared at once,
+ * and for a minute after.
  */
 export function createHostCommands(
   defaultDeadlineMs: number = HOST_COMMAND_DEADLINE_MS,
   gatewaySocket: string = GATEWAY_SOCKET,
   wantedShare: PhaseShare = recordedShare(),
+  cowshed = 'cowshed',
 ): HostCommands {
   return {
     async run(file, args, callDeadlineMs) {
       const deadlineMs = callDeadlineMs ?? defaultDeadlineMs;
+      const disk = diskCommand(file, args);
+      if (disk !== null) {
+        return runBounded(cowshed, disk, deadlineMs, false);
+      }
       const diskClass = diskClassOf(file, args);
       const seen = predatesSeen.get(gatewaySocket);
       const predates = seen !== undefined && Date.now() - seen.at < PREDATES_RECHECK_MS ? seen.what : null;
@@ -1750,36 +1755,37 @@ export function createHostCommands(
   };
 }
 
-function runBounded(file: string, args: readonly string[], deadlineMs: number): Promise<CommandOutput> {
+function runBounded(
+  file: string,
+  args: readonly string[],
+  deadlineMs: number,
+  killOnDeadline = true,
+): Promise<CommandOutput> {
   // `Promise.withResolvers` would read better but needs lib es2024; this package inherits lib
   // es2022 from tsconfig.base.json.
   let resolve!: (output: CommandOutput) => void;
   const promise = new Promise<CommandOutput>((settled) => {
     resolve = settled;
   });
-  // `detached` leads a process group, so the deadline kills what the child spawned too:
-  // `hdiutil attach` hands the attach to a diskimages-helper, and one that outlived its
-  // killed `hdiutil` finished the attach later, an image nobody detached (2026-10-06).
+  // Ordinary children own their process group so their deadline also reaps helpers. Disk
+  // commands instead run through cowshed, which owns their detached lifetime and output.
   const child = spawn(file, [...args], { detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
-  const detach = isDetach(file, args);
   const stdout: Buffer[] = [];
   const stderr: Buffer[] = [];
   child.stdout.on('data', (chunk: Buffer) => stdout.push(chunk));
   child.stderr.on('data', (chunk: Buffer) => stderr.push(chunk));
   const text = (chunks: Buffer[]) => Buffer.concat(chunks).toString('utf8');
-  // Answered without waiting for the pipes: a helper that escaped the group may hold them.
-  // A detach is never killed at its deadline: interrupted mid-operation it can wedge
-  // DiskArbitration for every later task (the cowshed runner's hard deadline is the only
-  // killer of a disk-image command). The wait is bounded instead: the caller gets a named
-  // failure and its claim back, and the detached child finishes or stays wedged on its own,
-  // never holding this task's lifecycle claim.
+  // The facade owns its disk child's output files. Stop waiting, not the disk operation:
+  // closing these pipes cannot wedge the disk tool, and cowshed still holds its disk lease.
   const timer = setTimeout(() => {
-    if (detach) {
+    if (!killOnDeadline) {
+      child.stdout.destroy();
+      child.stderr.destroy();
       child.unref();
       resolve({
         status: 1,
         stdout: text(stdout),
-        stderr: `no answer within ${deadlineMs} ms; left running detached (process group ${child.pid ?? 'unknown'}), not killed: a detach interrupted mid-operation can wedge DiskArbitration`,
+        stderr: `no answer within ${deadlineMs} ms; cowshed command ${child.pid ?? 'unknown'} left running, not killed: disk-image operations must finish to release their kernel devices`,
       });
       return;
     }

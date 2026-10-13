@@ -1,5 +1,4 @@
 import { describe, expect, it } from 'bun:test';
-import { execFileSync } from 'node:child_process';
 import {
   chmodSync,
   existsSync,
@@ -49,23 +48,17 @@ function scratchVolume(index: number): { parent: string; paths: RamTempPaths; ca
   };
 }
 
-function attachedDisks(paths: RamTempPaths, capacity: number): RamDisk[] {
-  let info: string;
-  try {
-    info = execFileSync('/usr/bin/hdiutil', ['info'], { encoding: 'utf8' });
-  } catch (error) {
-    // A host without hdiutil has no RAM disk attached.
-    if (error instanceof Error && 'code' in error && error.code === 'ENOENT') {
-      return [];
-    }
-    throw error;
+async function attachedDisks(paths: RamTempPaths, capacity: number): Promise<RamDisk[]> {
+  const info = await createHostCommands().run('/usr/bin/hdiutil', ['info']);
+  if (info.status !== 0) {
+    throw new Error(`inventory RAM disks: exit ${info.status}: ${info.stderr}`);
   }
-  return ramDisksIn(info).filter((disk) => disk.user === paths.user && disk.sectors === capacity / 512);
+  return ramDisksIn(info.stdout).filter((disk) => disk.user === paths.user && disk.sectors === capacity / 512);
 }
 
 async function detachAll(paths: RamTempPaths, capacity: number): Promise<void> {
   const host = createHostCommands();
-  for (const disk of attachedDisks(paths, capacity)) {
+  for (const disk of await attachedDisks(paths, capacity)) {
     const output = await host.run('/usr/bin/hdiutil', ['detach', '-force', disk.physical]);
     if (output.status !== 0) {
       throw new Error(`hdiutil detach ${disk.physical}: exit ${output.status}: ${output.stderr}`);
@@ -158,7 +151,7 @@ describe('RAM temp volume on this host', () => {
         ) ?? '';
       await run('/usr/sbin/diskutil', ['mount', '-mountOptions', 'nobrowse', orphanVolume]);
       await run('/usr/bin/hdiutil', ['attach', '-nomount', sectors]);
-      expect(attachedDisks(paths, capacity).map((disk) => disk.mountpoints)).toEqual([[paths.mountpoint], []]);
+      expect((await attachedDisks(paths, capacity)).map((disk) => disk.mountpoints)).toEqual([[paths.mountpoint], []]);
 
       // An unmarked volume that carries a lease is someone's TMPDIR: it is named, not detached.
       const lease = join(paths.mountpoint, `${process.pid}-abcdef`);
@@ -183,7 +176,7 @@ describe('RAM temp volume on this host', () => {
       expect(a.value.lease.mountpoint).toBe(paths.mountpoint);
       expect(readFileSync(join(paths.mountpoint, '.smoo-ram'), 'utf8')).toBe(`${paths.volumeName}\n`);
       expect(existsSync(`${paths.mountpoint} 1`)).toBe(false);
-      expect(attachedDisks(paths, capacity).map((disk) => disk.mountpoints)).toEqual([[paths.mountpoint]]);
+      expect((await attachedDisks(paths, capacity)).map((disk) => disk.mountpoints)).toEqual([[paths.mountpoint]]);
 
       const leaseA = a.value.lease;
       const b = await second.acquire();
@@ -260,7 +253,7 @@ describe('RAM temp volume on this host', () => {
       expectUntouched(outside);
       expect(await fourth.release(d.value.lease)).toEqual({ ok: true, value: undefined });
       expect(existsSync(paths.mountpoint)).toBe(false);
-      expect(attachedDisks(paths, capacity)).toEqual([]);
+      expect(await attachedDisks(paths, capacity)).toEqual([]);
     } finally {
       // Restore the owner write the outside directory was given, so the parent can be removed.
       chmodSync(outside, 0o755);

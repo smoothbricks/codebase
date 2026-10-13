@@ -1,5 +1,6 @@
 use clap::error::{ContextKind, ContextValue, ErrorKind};
 use clap::{Arg, ArgAction, ArgMatches, Command as ClapCommand, value_parser};
+use cowshed_apfs::DiskTool;
 use cowshed_core::metadata::{EgressMode, MetadataError, WorkspaceName};
 use cowshed_core::repository::RepoId;
 use std::ffi::{OsStr, OsString};
@@ -40,6 +41,7 @@ pub static COMMANDS: &[&CommandSpec] = &[
     &REBASE,
     &LAND,
     &DOCTOR,
+    &DISK_COMMAND,
     &GATEWAY,
     &CONTROLLER,
     &CREDENTIAL,
@@ -91,6 +93,9 @@ pub enum Command {
     Rebase(RebaseArgs),
     Land(LandArgs),
     Doctor(DoctorArgs),
+    /// One `diskutil` or `hdiutil` invocation through cowshed's disk runner, for a caller that is
+    /// not cowshed: no project, no daemon, the tool's own bytes and exit status.
+    DiskCommand(DiskCommandArgs),
     Gateway(GatewayCommand),
     /// One coordinator controller connection, served on standard input for an embedding process.
     Controller,
@@ -145,12 +150,20 @@ impl Command {
             Self::List(_)
             | Self::Setup(_)
             | Self::Gateway(_)
+            | Self::DiskCommand(_)
             | Self::Sccache(_)
             | Self::Skill(_)
             | Self::Version
             | Self::Help(_) => ProjectDiscovery::NotUsed,
         }
     }
+}
+
+/// `disk-command <diskutil|hdiutil> -- <args…>`: the tool and its argv, bytes untouched.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DiskCommandArgs {
+    pub tool: DiskTool,
+    pub args: Vec<OsString>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -842,6 +855,15 @@ fn cli_command() -> ClapCommand {
         ]))
         .subcommand(leaf("doctor").args([flag("repair"), flag("clear-attach-budget")]))
         .subcommand(
+            leaf("disk-command").arg(positional("tool", 0..=1)).arg(
+                Arg::new("argv")
+                    .value_parser(value_parser!(OsString))
+                    .num_args(0..)
+                    .last(true)
+                    .allow_hyphen_values(true),
+            ),
+        )
+        .subcommand(
             leaf("gateway")
                 .subcommand_required(true)
                 .subcommand(leaf("start"))
@@ -986,6 +1008,7 @@ fn cli_from_matches(matches: ArgMatches) -> Result<Cli, UsageError> {
         "rebase" => parse_rebase(leaf)?,
         "land" => parse_land(leaf)?,
         "doctor" => parse_doctor(leaf)?,
+        "disk-command" => parse_disk_command(leaf, &global)?,
         "controller" => Command::Controller,
         "gateway" => parse_gateway(leaf, &global)?,
         "credential" => parse_credential(leaf)?,
@@ -1064,6 +1087,12 @@ fn translate_clap(error: clap::Error, args: &[OsString]) -> UsageError {
                 ),
                 Some(spec) if spec.name == "exec" && !token.starts_with('-') => {
                     UsageError::new("exec requires `--` before the child argv", spec)
+                }
+                Some(spec) if spec.name == "disk-command" && !token.starts_with('-') => {
+                    UsageError::new(
+                        "disk-command requires `--` before the tool's arguments",
+                        spec,
+                    )
                 }
                 Some(spec) if token.starts_with('-') => unknown_flag(&token, spec),
                 Some(spec) => UsageError::new(
@@ -1297,6 +1326,60 @@ fn reject_project(
         return Err(UsageError::new(message, usage));
     }
     Ok(())
+}
+
+const DISK_COMMAND: CommandSpec = CommandSpec {
+    name: "disk-command",
+    missing: "disk-command requires a tool: diskutil or hdiutil",
+    args: "<diskutil|hdiutil>",
+    trailing: "-- <args...>",
+    summary: "run diskutil or hdiutil through cowshed's disk runner",
+    about: &[
+        "Runs one `diskutil` or `hdiutil` argv — never a shell string — exactly as cowshed runs its own disk tools: under the host's disk-lifecycle lease, in its own session, with the tool's stdout and stderr passed through as its own bytes and its exit status as this command's (a signal ends it with 128 + the signal). The command's standard input is forwarded to the tool, so a passphrase can be piped to `diskutil apfs unlockVolume … -stdinpassphrase`. It needs no project and asks no daemon: scripts and other programs call it from any directory.",
+        "A command that creates or releases a disk-image device — `diskutil image …`, `diskutil eject` and every `hdiutil` verb — is never killed: past 120 s it is waited for, with a `cowshed:` warning on stderr every 30 s, because one killed mid-operation can leak its kernel device until reboot. It also ignores hangup, interrupt and terminate and writes its output to files the runner reads back, so a caller that gives up and kills this command leaves the operation to finish. Every other verb is killed at 120 s.",
+        "Failures of the runner itself — the tool could not be started or waited for, or an ordinary verb hit its deadline — exit 100–106 with a `cowshed:` line on stderr and nothing on stdout, as `exec` reports its wrapper failures. `--json` is refused: the answer is the tool's own output, so ask the tool for structure (`-plist`).",
+    ],
+    options: &[],
+};
+
+fn parse_disk_command(matches: &ArgMatches, global: &GlobalOptions) -> Result<Command, UsageError> {
+    const USAGE: &CommandSpec = &DISK_COMMAND;
+    reject_project(
+        global,
+        USAGE,
+        "--project is not valid for disk-command: it names no project",
+    )?;
+    if global.json {
+        return Err(UsageError::new(
+            "disk-command answers with the tool's own bytes, never a JSON envelope; drop --json and ask the tool for structure (`-plist`)",
+            USAGE,
+        ));
+    }
+    let name = os(matches, "tool").ok_or_else(|| UsageError::new(USAGE.missing, USAGE))?;
+    let tool = name.to_str().and_then(DiskTool::named).ok_or_else(|| {
+        UsageError::new(
+            format!(
+                "disk-command runs diskutil or hdiutil, named without a path; got `{}`",
+                name.to_string_lossy()
+            ),
+            USAGE,
+        )
+    })?;
+    let args: Vec<OsString> = matches
+        .get_many::<OsString>("argv")
+        .map(|values| values.cloned().collect())
+        .unwrap_or_default();
+    if args.is_empty() {
+        return Err(UsageError::new(
+            if matches.contains_id("argv") {
+                "disk-command requires the tool's arguments after `--`"
+            } else {
+                "disk-command requires `--` before the tool's arguments"
+            },
+            USAGE,
+        ));
+    }
+    Ok(Command::DiskCommand(DiskCommandArgs { tool, args }))
 }
 
 const CONTROLLER: CommandSpec = CommandSpec {
@@ -4394,6 +4477,71 @@ mod tests {
                 .unwrap()
                 .summary
                 .contains("create or repair")
+        );
+    }
+
+    #[test]
+    fn disk_command_takes_a_named_tool_and_its_argv_after_the_separator() {
+        let cli = parse_args(["disk-command", "hdiutil", "--", "info"]).unwrap();
+        assert_eq!(
+            cli.command,
+            Command::DiskCommand(DiskCommandArgs {
+                tool: DiskTool::Hdiutil,
+                args: vec![OsString::from("info")],
+            })
+        );
+        assert_eq!(cli.command.project_discovery(), ProjectDiscovery::NotUsed);
+
+        // Past `--` every word is the tool's, cowshed's own flags included.
+        let Command::DiskCommand(disk) = parse_args([
+            "disk-command",
+            "diskutil",
+            "--",
+            "image",
+            "attach",
+            "--json",
+            "-q",
+            "--help",
+        ])
+        .unwrap()
+        .command
+        else {
+            panic!("disk-command parses");
+        };
+        assert_eq!(disk.tool, DiskTool::Diskutil);
+        assert_eq!(
+            disk.args,
+            ["image", "attach", "--json", "-q", "--help"].map(OsString::from)
+        );
+
+        for (argv, said) in [
+            (&["disk-command", "hdiutil", "info"][..], "requires `--`"),
+            (&["disk-command", "hdiutil", "--"][..], "`--`"),
+            (
+                &["disk-command", "fsck_apfs", "--", "-n"][..],
+                "diskutil or hdiutil",
+            ),
+            (
+                &["disk-command", "/usr/sbin/diskutil", "--", "list"][..],
+                "diskutil or hdiutil",
+            ),
+            (&["disk-command"][..], "requires a tool"),
+            (
+                &["--json", "disk-command", "hdiutil", "--", "info"][..],
+                "--json",
+            ),
+            (
+                &["disk-command", "--project", "/w", "hdiutil", "--", "info"][..],
+                "--project",
+            ),
+        ] {
+            let error = parse_args(argv.iter().copied()).expect_err("refused");
+            assert!(error.message.contains(said), "{argv:?}: {}", error.message);
+            assert_eq!(error.exit_code(), 2, "{argv:?}");
+        }
+        assert_eq!(
+            parse_args(["disk-command", "--help"]).unwrap().command,
+            Command::Help(help::command_named("disk-command"))
         );
     }
 }

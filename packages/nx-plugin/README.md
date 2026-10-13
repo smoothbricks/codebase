@@ -950,17 +950,20 @@ The volume is formatted, mounted and marked as `smoo-ram2-<uid>-new`, then renam
 part way never leaves an unmarked volume at `/Volumes/smoo-ram2-<uid>` for the next one to dodge as `smoo-ram2-<uid> 1`.
 Before creating, a task detaches every RAM disk of the same user and size that is mounted nowhere but those two names:
 the debris of a creator that was killed or ran into its deadline. One that still carries a lease directory, or has
-something attached below it, is named in the task's error instead. A disk command that runs past its deadline is killed
-with its whole process group, so `hdiutil attach` cannot leave a helper behind that finishes the attach later.
+something attached below it, is named in the task's error instead.
 
-Every `hdiutil` and `diskutil` the volume runs takes cowshed's host disk-lifecycle lease first, when the cowshed gateway
-answers at `/private/cowshed/store/gateway.sock` (`specs/cowshed/05_gateway.md`): storage calls and mount-table changes
-never overlap on the host, because an attach does not finish while the mount table keeps changing.
-`diskutil renameVolume` is the spec's exception and takes no lease. The lease wait comes before the command's deadline.
-Without a grant the command runs unleased and stderr says why; a gateway that is not running is said once per process. A
-gateway from before disk leases answers only after 2 s of silence, so once one is found the process stops asking it for
-a minute, as cowshed's own commands do. A process whose lease waits are recorded (`COWSHED_LEASE_WAIT_RECORD`) asks for
-its phase `alone`; a gateway from before `alone` refuses the field at once and is asked shared instead, for a minute.
+Every `hdiutil` and `diskutil` execution goes through `cowshed disk-command <tool> -- <args>`, including host-test
+inventory and cleanup. The installed cowshed must provide this command. Cowshed owns disk-lifecycle leasing and starts
+image commands detached from the caller's signals, with file-backed output. A caller deadline stops waiting; it never
+kills the disk command, because killing an attach or detach can leak its kernel device until reboot. A still-running
+command retains its lease and is named in the timeout error. Other helpers retain their process-group deadline. A
+process whose lease waits are recorded (`COWSHED_LEASE_WAIT_RECORD`) asks for its phase `alone`; a gateway from before
+`alone` refuses the field at once and is asked shared instead, for a minute.
+
+`bun node_modules/@smoothbricks/nx-plugin/src/disk-command-policy.ts <repository...>` checks tracked and nonignored
+source, tests and scripts for direct disk-tool process calls. SmoothBricks runs it from `tooling:lint-disk-commands`;
+consumers wire the same guard into their root lint. Rust callers use `SystemCommandRunner` and `CommandRequest`; script
+callers use the CLI facade rather than introducing another disk-command runner.
 
 Without an inherited parent pool, a `bounded-exec` command takes CPU tokens from cowshed's host budget before it starts,
 when the gateway answers on the same socket (`specs/cowshed/05_gateway.md`, "Host CPU budget"), so concurrent gates on

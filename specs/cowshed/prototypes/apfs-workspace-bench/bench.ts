@@ -45,6 +45,7 @@ interface BenchmarkTask {
 }
 
 const projectDir = import.meta.dir;
+// hdiutil and diskutil run only through `cowshed disk-command` (cowshed must be on PATH); timings include that layer.
 const mounted = new Set<string>();
 
 function parsePositiveInteger(value: string): number {
@@ -124,9 +125,9 @@ async function attachImage(image: string, mountpoint: string): Promise<void> {
   // root-owned and unwritable to the user, so the bench mounts ASIF without owners; a real
   // cowshed workspace would chown the volume root after create — see the fork's report.)
   if (image.endsWith('.asif')) {
-    await $`diskutil image attach --nobrowse --mountPoint ${mountpoint} ${image}`.quiet();
+    await $`cowshed disk-command diskutil -- image attach --nobrowse --mountPoint ${mountpoint} ${image}`.quiet();
   } else {
-    await $`hdiutil attach -quiet -nobrowse -owners on -mountpoint ${mountpoint} ${image}`.quiet();
+    await $`cowshed disk-command hdiutil -- attach -quiet -nobrowse -owners on -mountpoint ${mountpoint} ${image}`.quiet();
   }
   mounted.add(mountpoint);
 }
@@ -134,19 +135,19 @@ async function attachImage(image: string, mountpoint: string): Promise<void> {
 async function createBaseImage(format: ImageFormat, image: string, size: string): Promise<void> {
   if (format === 'ASIF') {
     // diskutil's --fs does not expose case-sensitivity; ASIF base uses plain APFS.
-    await $`diskutil image create blank --format ASIF --size ${size} --volumeName APFSBench --fs APFS ${image}`.quiet();
+    await $`cowshed disk-command diskutil -- image create blank --format ASIF --size ${size} --volumeName APFSBench --fs APFS ${image}`.quiet();
   } else {
-    await $`hdiutil create -quiet -size ${size} -type SPARSE -fs ${'Case-sensitive APFS'} -volname APFSBench -nospotlight ${image}`.quiet();
+    await $`cowshed disk-command hdiutil -- create -quiet -size ${size} -type SPARSE -fs ${'Case-sensitive APFS'} -volname APFSBench -nospotlight ${image}`.quiet();
   }
 }
 
 async function attachShadow(base: string, shadow: string, mountpoint: string): Promise<void> {
-  await $`hdiutil attach -quiet -nobrowse -owners on -shadow ${shadow} -mountpoint ${mountpoint} ${base}`.quiet();
+  await $`cowshed disk-command hdiutil -- attach -quiet -nobrowse -owners on -shadow ${shadow} -mountpoint ${mountpoint} ${base}`.quiet();
   mounted.add(mountpoint);
 }
 
 async function detach(mountpoint: string): Promise<void> {
-  await $`hdiutil detach -quiet ${mountpoint}`.quiet();
+  await $`cowshed disk-command hdiutil -- detach -quiet ${mountpoint}`.quiet();
   mounted.delete(mountpoint);
 }
 
@@ -622,7 +623,7 @@ try {
   console.log(`\nSaved ${resultPath}`);
 } finally {
   for (const mountpoint of [...mounted].reverse()) {
-    await $`hdiutil detach -quiet ${mountpoint}`.nothrow().quiet();
+    await $`cowshed disk-command hdiutil -- detach -quiet ${mountpoint}`.nothrow().quiet();
   }
   mounted.clear();
   if (!options.keep) {

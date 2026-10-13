@@ -9,6 +9,7 @@ import { join } from 'node:path';
 import { ownedSocketDirectory, pidsWorkingIn, processTable, terminate } from '../../testing.js';
 import {
   createHostCommands,
+  diskCommand,
   hostLeaseProcesses,
   imagesBackedUnder,
   leaseProcessesOn,
@@ -107,8 +108,7 @@ describe('RAM temp volume output parsing', () => {
 
 describe('RAM temp volume on this host', () => {
   it('kills a deadlined command together with everything it spawned', async () => {
-    // `hdiutil attach` leaves the attach to a diskimages-helper it spawns; the deadline must take
-    // that child down too, or it finishes the attach after the task gave up on it.
+    // Ordinary helpers remain deadline-bound; disk-image tools are owned by cowshed instead.
     const result = await createHostCommands(500).run('/bin/sh', ['-c', 'sleep 60 & echo $!; wait']);
     expect(result.status).not.toBe(0);
     expect(result.stderr).toMatch(/^no answer within 500 ms; killed process group \d+$/);
@@ -119,22 +119,43 @@ describe('RAM temp volume on this host', () => {
     expect(state.status === 1 || state.stdout.trim().startsWith('Z')).toBe(true);
   });
 
-  it('never kills a wedged detach: the wait is bounded, named, and the child runs on', async () => {
-    // A stray volume's detach that DiskArbitration never answers held a chain of creators
-    // for 120 s each: the deadline killed hdiutil's group mid-detach, the creator died, and
-    // the next waiter retried the same stray. A detach now outlives its wait instead.
-    const directory = await ownedSocketDirectory('rt-', 'fake-hdiutil');
-    const fake = join(directory, 'hdiutil');
-    await writeFile(fake, '#!/bin/sh\necho $$\nsleep 60\n', { mode: 0o755 });
-    const started = Date.now();
-    const result = await createHostCommands(300).run(fake, ['detach', '/dev/disk504']);
-    expect(Date.now() - started).toBeLessThan(10_000);
-    expect(result.status).not.toBe(0);
-    expect(result.stderr).toMatch(/^no answer within 300 ms; left running detached \(process group \d+\), not killed/);
-    const pid = Number(result.stdout.trim());
-    expect(() => process.kill(pid, 0)).not.toThrow();
-    process.kill(pid, 'SIGKILL');
-    await createHostCommands().run('/bin/rm', ['-rf', directory]);
+  it('routes both disk tools through cowshed without shell interpolation', () => {
+    for (const tool of ['hdiutil', 'diskutil']) {
+      for (const file of [tool, `/usr/sbin/${tool}`]) {
+        expect(diskCommand(file, ['attach', '/image with spaces; echo unsafe'])).toEqual([
+          'disk-command',
+          tool,
+          '--',
+          'attach',
+          '/image with spaces; echo unsafe',
+        ]);
+      }
+    }
+    expect(diskCommand('/sbin/umount', ['/volume'])).toBeNull();
+  });
+
+  it('bounds its wait without killing the cowshed disk-command owner', async () => {
+    const directory = await ownedSocketDirectory('rt-', 'fake-cowshed');
+    const fake = join(directory, 'cowshed');
+    await writeFile(fake, '#!/bin/sh\necho $$\nprintf "%s\\n" "$@"\nsleep 60\n', { mode: 0o755 });
+    let pid = 0;
+    try {
+      const started = Date.now();
+      const result = await createHostCommands(300, undefined, undefined, fake).run('/usr/bin/hdiutil', [
+        'attach',
+        '/image with spaces',
+      ]);
+      expect(Date.now() - started).toBeLessThan(10_000);
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toMatch(/^no answer within 300 ms; cowshed command \d+ left running, not killed/);
+      const [processId, ...args] = result.stdout.trim().split('\n');
+      pid = Number(processId);
+      expect(args).toEqual(['disk-command', 'hdiutil', '--', 'attach', '/image with spaces']);
+      expect(() => process.kill(pid, 0)).not.toThrow();
+    } finally {
+      if (pid > 0) process.kill(-pid, 'SIGKILL');
+      rmSync(directory, { recursive: true, force: true });
+    }
   });
 
   it('asks a gateway that predates disk leases once, not before every disk command', async () => {

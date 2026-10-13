@@ -4,6 +4,7 @@ pub mod build_state;
 pub mod capabilities;
 pub mod controller_service;
 pub mod credential_service;
+pub mod disk_command;
 pub mod gateway_service;
 pub mod help;
 pub mod identity_service;

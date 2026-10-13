@@ -1273,13 +1273,11 @@ mod tests {
     }
 
     fn diskutil(args: &[&str]) -> String {
-        use cowshed_os::fork_lock::Run as _;
-        let output = std::process::Command::new("/usr/sbin/diskutil")
-            .args(args)
-            .output_locked()
+        let output = SystemCommandRunner
+            .run(&CommandRequest::new(cowshed_apfs::device::DISKUTIL, args))
             .expect("run diskutil");
         assert!(
-            output.status.success(),
+            output.succeeded(),
             "diskutil {args:?}: {}{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)

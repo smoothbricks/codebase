@@ -121,8 +121,8 @@ next: run `cowshed setup` from the cowshed you mean to use: it installs that bui
 ```
 
 `ls`, `doctor`, `build-state`, `mount`, `setup`, `gateway`, `controller`, `credential`, `identity`, `sccache`, `skill`,
-`--version` and `--help` do not ask: `doctor` diagnoses the disagreement, and `setup` ends it. No daemon answering is
-not a disagreement.
+`disk-command`, `--version` and `--help` do not ask: `doctor` diagnoses the disagreement, and `setup` ends it. No daemon
+answering is not a disagreement.
 
 `--mount-root <dir>` sets the host workspace mount root (default `~/.cowshed/mnt`). Session workspaces mount at
 `<mount-root>/<owner>/<repo>/<ws>`. The path must be absolute. The root can change only while every workspace is
@@ -1309,6 +1309,32 @@ this command of the host's `cowshed` and speaks the controller protocol on its e
 ([integrations](integrations.md#embedding-the-controller)). Nothing is written to stdout; the command exits 0 when the
 embedding process closes its end. A terminal or a pipe on standard input is refused with exit 2 before the project is
 resolved. The project's gateway sessions are reconciled before each exec, shell and checked land.
+
+### `cowshed disk-command <diskutil|hdiutil> -- <args...>`
+
+Runs one `diskutil` or `hdiutil` argv for a program that is not cowshed — a test script, a benchmark, a build adapter —
+through the same runner cowshed's own disk work uses, so it never needs to spawn a disk tool itself:
+
+```
+$ cowshed disk-command hdiutil -- info -plist | plutil -p -
+$ security find-generic-password -a cowshed.store -s cowshed.store -w \
+    | cowshed disk-command diskutil -- apfs unlockVolume "$uuid" -nomount -stdinpassphrase
+```
+
+Stdout and stderr are the tool's own bytes and the exit status is the tool's (128 + n when a signal ended it); nothing
+of cowshed's is mixed in except `cowshed:` warnings on stderr. Standard input is forwarded to the tool. The command runs
+under the host's disk-lifecycle lease, in its own session, from any directory, with no project and no daemon check.
+
+A command that creates or releases a disk-image device — `diskutil image …`, `diskutil eject` and every `hdiutil` verb —
+is never killed: past 120 s it keeps running with a warning on stderr every 30 s, because one killed mid-operation can
+leak its kernel device until reboot. It ignores hangup, interrupt and terminate and writes its output to files the
+runner reads back, so killing `disk-command` or closing its pipes leaves the operation to finish; the next caller reads
+the result from the host. Every other verb is killed at 120 s.
+
+Failures of the runner itself use the `exec` wrapper codes with a `cowshed:` line on stderr and nothing on stdout: 104
+when the tool does not exist on this host, 103 when an ordinary verb hit its deadline, 100 when the tool could not be
+waited for or its output could not be delivered to a reader that already left. `--json` and `--project` are usage errors
+(exit 2): ask the tool for structure (`-plist`) instead.
 
 ### `cowshed gc`
 

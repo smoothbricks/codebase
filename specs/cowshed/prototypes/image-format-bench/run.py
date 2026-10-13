@@ -6,6 +6,7 @@ usage: PROTO_ROOT=<dir> run.py <A|B|C> <clones|noclones|inclone>
   noclones  churn the source with no clone held
   inclone   churn a clone of the source (a shed) and leave the source untouched
   (build <dir>/xtool from xtool.c and <dir>/ds with mkds.sh first)
+  (`cowshed` must be on PATH: every hdiutil/diskutil call runs through `cowshed disk-command`; timings include it)
   A  ASIF, case-sensitive  (diskutil image create blank --fs None + newfs_apfs -e)
   B  ASIF, case-insensitive (same, newfs_apfs -i)
   C  SPARSE, case-sensitive (hdiutil create -type SPARSE -fs "Case-sensitive APFS")
@@ -53,24 +54,29 @@ def kv(stdout):
 
 def create():
     if fmt == 'C':
-        ms, _ = run(['hdiutil', 'create', '-quiet', '-size', '100g', '-type', 'SPARSE', '-fs',
+        ms, _ = run(['cowshed', 'disk-command', 'hdiutil', '--',
+                     'create', '-quiet', '-size', '100g', '-type', 'SPARSE', '-fs',
                      'Case-sensitive APFS', '-volname', 'proto' + fmt, '-nospotlight', IMG])
         return {'create_ms': ms}
-    a, _ = run(['diskutil', 'image', 'create', 'blank', '--format', 'ASIF', '--size', '100g',
+    a, _ = run(['cowshed', 'disk-command', 'diskutil', '--',
+                'image', 'create', 'blank', '--format', 'ASIF', '--size', '100g',
                 '--volumeName', 'proto' + fmt, '--fs', 'None', IMG])
-    b, out = run(['diskutil', 'image', 'attach', '--nobrowse', '--noMount', '--plist', IMG])
+    b, out = run(['cowshed', 'disk-command', 'diskutil', '--',
+                  'image', 'attach', '--nobrowse', '--noMount', '--plist', IMG])
     dev = plistlib.loads(out)['system-entities'][0]['dev-entry']
     c, _ = run([NEWFS, '-U', str(os.getuid()), '-G', str(os.getgid()),
                 '-e' if fmt == 'A' else '-i', '-v', 'proto' + fmt, '/dev/' + dev])
-    d, _ = run(['diskutil', 'eject', dev])
+    d, _ = run(['cowshed', 'disk-command', 'diskutil', '--', 'eject', dev])
     return {'create_ms': round(a + b + c + d, 1), 'blank_ms': a, 'attach_ms': b, 'newfs_ms': c,
             'eject_ms': d}
 
 
 def attach(image=IMG, mnt=MNT):
-    cmd = (['hdiutil', 'attach', '-nobrowse', '-owners', 'on', '-nomount', '-plist', image]
+    cmd = (['cowshed', 'disk-command', 'hdiutil', '--',
+            'attach', '-nobrowse', '-owners', 'on', '-nomount', '-plist', image]
            if fmt == 'C' else
-           ['diskutil', 'image', 'attach', '--nobrowse', '--noMount', '--plist', image])
+           ['cowshed', 'disk-command', 'diskutil', '--',
+            'image', 'attach', '--nobrowse', '--noMount', '--plist', image])
     a, out = run(cmd)
     ents = plistlib.loads(out)['system-entities']
     vol = next(e['dev-entry'] for e in ents
@@ -86,7 +92,8 @@ def attach(image=IMG, mnt=MNT):
 
 
 def detach(whole):
-    ms, _ = run(['hdiutil', 'detach', whole] if fmt == 'C' else ['diskutil', 'eject', whole])
+    ms, _ = run(['cowshed', 'disk-command', 'hdiutil', '--', 'detach', whole] if fmt == 'C' else
+                ['cowshed', 'disk-command', 'diskutil', '--', 'eject', whole])
     return ms
 
 

@@ -38,8 +38,11 @@ use crate::error::CowshedError;
 use crate::storage::apfs::native::{KernelMountSource, SystemKernelMountSource};
 use crate::storage::fstab::{COWSHED_FSTAB_TAG, FstabPin, build_fstab};
 use cowshed_apfs::mounts::KernelMountSnapshot;
-use cowshed_apfs::{RegisteredApfsContainer, registered_apfs_containers};
-use cowshed_os::fork_lock::{Run as _, Spawn as _};
+use cowshed_apfs::{
+    CommandRequest, CommandRunFailure, DISK_CHILD_DEADLINE, RegisteredApfsContainer,
+    SystemCommandRunner, registered_apfs_containers,
+};
+use cowshed_os::fork_lock::Run as _;
 
 const DISKUTIL_PROBE_DEADLINE: Duration = Duration::from_secs(5);
 const DISKUTIL_MOUNT_DEADLINE: Duration = Duration::from_secs(30);
@@ -81,8 +84,34 @@ fn is_diskutil_mount(command: &HostCommand) -> bool {
 }
 
 fn arbitration_probe(device: &str) -> Result<(), HostError> {
-    let probe = HostCommand::new(DISKUTIL, ["info", device]);
-    spawn_with_deadline(Path::new(DISKUTIL), probe.args(), DISKUTIL_PROBE_DEADLINE).map(|_| ())
+    run_disk_tool(
+        &HostCommand::new(DISKUTIL, ["info", device]),
+        DISKUTIL_PROBE_DEADLINE,
+    )
+    .map(|_| ())
+}
+
+/// Run an unprivileged `diskutil` through the one disk-child runner
+/// ([`SystemCommandRunner`]): the host disk lease, its own session, and `deadline` (an ordinary
+/// verb is killed there; a disk-image verb is never killed, only warned about).
+fn run_disk_tool(
+    command: &HostCommand,
+    deadline: Duration,
+) -> Result<HostCommandOutput, HostError> {
+    let request = CommandRequest::new(command.program(), command.args());
+    SystemCommandRunner
+        .run_with_deadline(&request, deadline)
+        .map_err(|error| match error.failure {
+            CommandRunFailure::Deadline(deadline) => HostError::new(format!(
+                "{:?} produced no result within {deadline:?}; the disk arbitration daemon is unresponsive",
+                command.program()
+            )),
+            CommandRunFailure::Spawn(_) | CommandRunFailure::Wait(_) => HostError::new(format!(
+                "cannot execute {:?} with argv {:?}: {error}",
+                command.program(),
+                command.args()
+            )),
+        })
 }
 
 impl BootstrapHost for SystemBootstrapHost {
@@ -103,12 +132,10 @@ impl BootstrapHost for SystemBootstrapHost {
                     "disk arbitration daemon did not answer within 5s; it is wedged and needs a restart (cowshed setup performs this)",
                 )
             })?;
-            return spawn_with_deadline(
-                Path::new(command.program()),
-                command.args(),
-                DISKUTIL_MOUNT_DEADLINE,
-            )
-            .map(HostCommandOutput::from);
+            return run_disk_tool(command, DISKUTIL_MOUNT_DEADLINE);
+        }
+        if command.program() == DISKUTIL {
+            return run_disk_tool(command, DISK_CHILD_DEADLINE);
         }
         run_command_with(command, |program, args| {
             Command::new(program).args(args).output_locked()
@@ -3513,6 +3540,7 @@ mod tests {
     use crate::storage::bootstrap::{BlockingJob, RETIRED_CACHES_MOUNTPOINT};
     use cowshed_apfs::RegisteredApfsVolume;
     use cowshed_gateway_types::STORE_ROOT;
+    use cowshed_os::fork_lock::Spawn as _;
     use uuid::Uuid;
 
     #[test]
@@ -7192,26 +7220,29 @@ UUID=CACHES /private/cowshed/caches apfs rw # cowshed created volume labelled co
         );
     }
 
-    fn deadline_spawn(
-        args: &[&str],
-        deadline: Duration,
-    ) -> Result<std::process::Output, HostError> {
-        let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
-        spawn_with_deadline(Path::new("/bin/sleep"), &args, deadline)
+    /// The bootstrap's own disk-tool calls go through the shared runner: an answering child
+    /// completes, and an ordinary one past its deadline is killed and reported as an
+    /// unresponsive disk arbitration daemon.
+    #[test]
+    fn run_disk_tool_completes_when_the_child_answers() {
+        let output = run_disk_tool(
+            &HostCommand::new("/bin/sleep", ["0.05"]),
+            Duration::from_secs(10),
+        )
+        .expect("fast child");
+        assert!(output.succeeded());
     }
 
     #[test]
-    fn deadline_spawn_completes_when_the_child_answers() {
-        let output = deadline_spawn(&["0.05"], Duration::from_secs(10)).expect("fast child");
-        assert!(output.status.success());
-    }
-
-    #[test]
-    fn deadline_spawn_reports_unresponsiveness_and_kills_the_child() {
+    fn run_disk_tool_reports_unresponsiveness_and_kills_the_child() {
         let started = std::time::Instant::now();
-        let error = deadline_spawn(&["30"], Duration::from_millis(250)).expect_err("deadline");
+        let error = run_disk_tool(
+            &HostCommand::new("/bin/sleep", ["30"]),
+            Duration::from_millis(250),
+        )
+        .expect_err("deadline");
         assert!(started.elapsed() < Duration::from_secs(5));
-        assert!(error.to_string().contains("unresponsive"));
+        assert!(error.to_string().contains("unresponsive"), "{error}");
     }
 }
 
@@ -7236,57 +7267,9 @@ mod unix {
     use std::io::Write;
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::io::{AsRawFd, FromRawFd};
-    use std::process::{Command, Output, Stdio};
-    use std::time::{Duration, Instant};
     use uuid::Uuid;
 
     const MARKER_MODE: libc::mode_t = 0o600;
-
-    /// Run `program args` to completion or `deadline`, under the disk-lifecycle lease when it is
-    /// a disk tool ([`cowshed_apfs::disk_lease`]); the deadline starts once the lease is granted.
-    pub(super) fn spawn_with_deadline(
-        program: &Path,
-        args: &[String],
-        deadline: Duration,
-    ) -> Result<Output, HostError> {
-        cowshed_apfs::disk_lease::leased(program, args, || {
-            spawn_unleased_with_deadline(program, args, deadline)
-        })
-    }
-
-    fn spawn_unleased_with_deadline(
-        program: &Path,
-        args: &[String],
-        deadline: Duration,
-    ) -> Result<Output, HostError> {
-        let mut child = Command::new(program)
-            .args(args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn_locked()
-            .map_err(|source| host_io_error("execute", program, source))?;
-        let started = Instant::now();
-        loop {
-            match child.try_wait() {
-                Ok(Some(_)) => {
-                    return child
-                        .wait_with_output()
-                        .map_err(|source| host_io_error("collect output from", program, source));
-                }
-                Ok(None) => {
-                    if started.elapsed() >= deadline {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        return Err(HostError::new(format!(
-                            "{program:?} produced no result within {deadline:?}; the disk arbitration daemon is unresponsive"
-                        )));
-                    }
-                    std::thread::sleep(Duration::from_millis(25));
-                }
-                Err(source) => return Err(host_io_error("wait for", program, source)),
-            }
-        }
-    }
 
     pub(super) fn write_marker_atomic(path: &Path, contents: &[u8]) -> Result<(), HostError> {
         require_host_canonical(path)?;
@@ -7415,4 +7398,4 @@ mod unix {
     }
 }
 
-use unix::{spawn_with_deadline, write_marker_atomic};
+use unix::write_marker_atomic;
