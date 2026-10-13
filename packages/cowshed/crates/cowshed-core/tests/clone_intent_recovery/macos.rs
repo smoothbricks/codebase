@@ -503,10 +503,6 @@ async fn an_older_binarys_prepared_create_with_a_pending_clone_still_resumes() {
         .mint(&runtime, "resumed", ForkOptions::default())
         .await
         .expect_err("the clone's initializer refuses the inherited workspace branch");
-    runtime
-        .shutdown()
-        .await
-        .expect("stop the interrupted runtime");
     fixture.strip_phase("resumed");
     assert_eq!(
         fixture.intent("legacy").expect("legacy intent").phase,
