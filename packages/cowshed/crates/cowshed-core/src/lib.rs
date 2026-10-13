@@ -65,9 +65,9 @@ pub use error::{
     Retry, StdinRefusal,
 };
 pub use gateway_inventory::{
-    AdoptedProject, GatewayInventoryError, GatewaySessionFact, NativeGatewayInventory,
-    ProjectHealOutcome, SessionHealOutcome, StartupHealState, UnreachableMain,
-    forming_re_adoption_checkout,
+    AdoptedProject, GatewayInventoryError, GatewaySessionFact, GatewayStoreBackend,
+    NativeGatewayInventory, ProjectHealOutcome, SessionHealOutcome, StartupHealState,
+    UnreachableMain, forming_re_adoption_checkout,
 };
 pub use storage::bootstrap::ValidatedHostStorage;
 pub use storage::bootstrap::native::validate_existing_host_storage;

@@ -117,6 +117,14 @@ impl NativeSessionInventory {
             inventory: NativeGatewayInventory::new(storage),
         }
     }
+    pub fn with_backend(
+        storage: ValidatedHostStorage,
+        backend: crate::gateway_inventory::GatewayStoreBackend,
+    ) -> Self {
+        Self {
+            inventory: NativeGatewayInventory::with_backend(storage, backend),
+        }
+    }
 }
 
 #[async_trait]
