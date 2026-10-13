@@ -3566,11 +3566,18 @@ where
         }
         let access = mounted.access();
         let browse = mounted.browse();
+        // An unmount the kernel accepted unforced leaves no file open on the volume, so a
+        // dissent at the detach after it is a transient device holder: it is waited out within
+        // the detach grace, never forced (16_build_volumes.md, "Targets and seeds", step 4).
         let captured = self
             .backend
             .unmount_verified(&attachment, DetachIntent::WhenIdle)
-            .and_then(|()| self.backend.detach(&attachment, DetachIntent::WhenIdle))
             .map_err(|refusal| self.capture_refusal(source, mount_point, refusal))
+            .and_then(|()| {
+                self.backend
+                    .detach(&attachment, DetachIntent::WithinGrace)
+                    .map_err(|refusal| Self::capture_device_refusal(source, mount_point, refusal))
+            })
             .and_then(|()| {
                 self.backend
                     .clone_image(source, destination, cowshed_apfs::ImageCapture::Detached)
@@ -3615,6 +3622,8 @@ where
         }
     }
 
+    /// The seal's unforced unmount was refused: name each process of this user that holds the
+    /// volume.
     fn capture_refusal(
         &self,
         source: &Path,
@@ -3651,7 +3660,26 @@ where
         ApfsError::CaptureSourceBusy {
             image: source.to_owned(),
             mount_point: mount_point.to_owned(),
-            holders,
+            held: cowshed_apfs::CaptureHold::Volume(holders),
+            refusal: Box::new(refusal),
+        }
+        .into()
+    }
+
+    /// The seal's unmount was accepted, and its detach was still dissented when the detach grace
+    /// ended: no file was open, so the device itself held it, and no process can be named.
+    fn capture_device_refusal(
+        source: &Path,
+        mount_point: &Path,
+        refusal: ApfsError,
+    ) -> ApfsStorageError {
+        if !cowshed_apfs::detach_was_dissented(&refusal) {
+            return refusal.into();
+        }
+        ApfsError::CaptureSourceBusy {
+            image: source.to_owned(),
+            mount_point: mount_point.to_owned(),
+            held: cowshed_apfs::CaptureHold::Device,
             refusal: Box::new(refusal),
         }
         .into()

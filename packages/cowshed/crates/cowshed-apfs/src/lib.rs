@@ -1045,11 +1045,15 @@ pub struct CreateImageRequest {
 /// whatever a stray `mds` scan thinks, so `Release` waits the holder out and then forces. A
 /// volume the user may still be working in is theirs, so `WhenIdle` reports the dissent and lets
 /// the verb refuse; `resize` and the explicit `detach`/un-adopt verbs would otherwise tear a
-/// live workspace out from under whoever is in it.
+/// live workspace out from under whoever is in it. `WithinGrace` waits the holder out as
+/// `Release` does but never forces: it answers the dissent still standing when the grace ends.
+/// A build seed's seal detaches with it once the kernel has accepted its unforced unmount, so
+/// no file on the volume is open and only a transient device holder can still dissent.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DetachIntent {
     Release,
     WhenIdle,
+    WithinGrace,
 }
 
 /// How a `Release` unmount went: through at once or within the grace, or forced once the grace
@@ -1398,17 +1402,27 @@ pub enum ApfsError {
     ImageNotAttached(PathBuf),
     /// The kernel's disk-image inventory could not be read.
     KernelInventory(io::Error),
-    /// A clone needed its mounted source detached, and the kernel refused the unforced release:
-    /// something still has the volume at `mount_point` open. Nothing is forced; `holders` names
-    /// each process of this user that had it open when it was refused (empty when none of them
-    /// is visible: the kernel or another user's process holds it), and `refusal` is the refused
-    /// unmount or detach itself.
+    /// A clone needed its mounted source detached, and the kernel refused the unforced release.
+    /// Nothing is forced; `held` says which step was refused and by what, and `refusal` is the
+    /// refused unmount or detach itself.
     CaptureSourceBusy {
         image: PathBuf,
         mount_point: PathBuf,
-        holders: Vec<cowshed_os::process::Holder>,
+        held: CaptureHold,
         refusal: Box<ApfsError>,
     },
+}
+
+/// Which unforced step of a capture's seal the kernel refused, and what it named.
+#[derive(Debug)]
+pub enum CaptureHold {
+    /// The unmount was refused: each process of this user that had the volume open when it was
+    /// refused (empty when none of them is visible: the kernel or another user's process holds
+    /// it).
+    Volume(Vec<cowshed_os::process::Holder>),
+    /// The unmount was accepted, so no file on the volume was open, but the image's device
+    /// still refused its unforced detach when the detach grace ended.
+    Device,
 }
 
 /// The framework's failure, not the request's: it was seen striking a burst of concurrent
@@ -1562,7 +1576,7 @@ impl fmt::Display for ApfsError {
             Self::CaptureSourceBusy {
                 image,
                 mount_point,
-                holders,
+                held: CaptureHold::Volume(holders),
                 refusal,
             } => {
                 write!(
@@ -1585,6 +1599,17 @@ impl fmt::Display for ApfsError {
                     "; nothing was forced: close what holds it and run the command again (release refused: {refusal})"
                 )
             }
+            Self::CaptureSourceBusy {
+                image,
+                mount_point,
+                held: CaptureHold::Device,
+                refusal,
+            } => write!(
+                f,
+                "{} must be detached to be cloned; its volume at {} unmounted with no file open, but the image's device still refused the unforced detach when the detach grace ended, held by something this user cannot see; nothing was forced: run the command again (detach refused: {refusal})",
+                image.display(),
+                mount_point.display()
+            ),
         }
     }
 }
@@ -1862,7 +1887,8 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
 
     /// `umount` the attachment's volume, the caller holding its image lease and pin. A volume
     /// something still holds is waited on for the detach grace and then, under
-    /// [`DetachIntent::Release`], forced; [`DetachIntent::WhenIdle`] answers the first dissent.
+    /// [`DetachIntent::Release`], forced; [`DetachIntent::WithinGrace`] answers the dissent
+    /// still standing then, and [`DetachIntent::WhenIdle`] the first one.
     fn unmount_volume_unlocked(
         &self,
         attachment: &AttachedImage,
@@ -1885,15 +1911,17 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
                 Ok(_) if force => return Ok(Unmounted::Forced),
                 Ok(_) => return Ok(Unmounted::Unforced),
                 Err(error) if !force && detach_was_dissented(&error) => {
-                    if intent == DetachIntent::WhenIdle {
-                        return Err(error);
-                    }
                     let started = started.get_or_insert_with(std::time::Instant::now);
-                    if self.grace.expired(waited, self.sleeper.elapsed(*started)) {
-                        force = true;
-                    } else {
-                        self.sleeper.sleep(self.grace.poll);
-                        waited = waited.saturating_add(self.grace.poll);
+                    let expired = self.grace.expired(waited, self.sleeper.elapsed(*started));
+                    match (intent, expired) {
+                        (DetachIntent::WhenIdle, _) | (DetachIntent::WithinGrace, true) => {
+                            return Err(error);
+                        }
+                        (DetachIntent::Release, true) => force = true,
+                        (DetachIntent::Release | DetachIntent::WithinGrace, false) => {
+                            self.sleeper.sleep(self.grace.poll);
+                            waited = waited.saturating_add(self.grace.poll);
+                        }
                     }
                 }
                 Err(error) => return Err(error),
@@ -2594,9 +2622,10 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
     /// Detach an owned whole device under `intent`.
     ///
     /// A `Release` waits out a dissent and then forces, because the volume is cowshed's own and
-    /// is finished with; a `WhenIdle` hands the dissent straight back so its verb can refuse.
-    /// Only a dissent is retried — an invalid device or a missing tool fails immediately either
-    /// way.
+    /// is finished with; a `WithinGrace` waits it out the same way and hands back the dissent
+    /// still standing when the grace ends; a `WhenIdle` hands the dissent straight back so its
+    /// verb can refuse. Only a dissent is retried — an invalid device or a missing tool fails
+    /// immediately either way.
     fn detach_device_checked(
         &self,
         image: &Path,
@@ -2612,15 +2641,20 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
             match self.detach_once(image, target, false) {
                 Ok(detached) => return Ok(detached),
                 Err(error) if detach_was_dissented(&error) => {
-                    if intent == DetachIntent::WhenIdle {
-                        return Err(error);
-                    }
                     let started = started.get_or_insert_with(std::time::Instant::now);
-                    if self.grace.expired(waited, self.sleeper.elapsed(*started)) {
-                        return self.detach_once(image, target, true);
+                    let expired = self.grace.expired(waited, self.sleeper.elapsed(*started));
+                    match (intent, expired) {
+                        (DetachIntent::WhenIdle, _) | (DetachIntent::WithinGrace, true) => {
+                            return Err(error);
+                        }
+                        (DetachIntent::Release, true) => {
+                            return self.detach_once(image, target, true);
+                        }
+                        (DetachIntent::Release | DetachIntent::WithinGrace, false) => {
+                            self.sleeper.sleep(self.grace.poll);
+                            waited = waited.saturating_add(self.grace.poll);
+                        }
                     }
-                    self.sleeper.sleep(self.grace.poll);
-                    waited = waited.saturating_add(self.grace.poll);
                 }
                 Err(error) => return Err(error),
             }
@@ -7302,6 +7336,81 @@ mod tests {
         ));
         assert_eq!(backend.runner().requests().len(), 1);
         assert!(backend.sleeper.waits().is_empty());
+    }
+
+    /// A seal's detach after an accepted unforced unmount: the transient device holder's
+    /// dissent is waited out within the grace, and the detach that then goes through was never
+    /// forced.
+    #[test]
+    fn a_within_grace_detach_waits_out_a_transient_dissent_without_forcing() {
+        let image = temp_path("detach-within-grace", IMAGE_EXTENSION);
+        let backend = graced_backend([
+            holding(&image, "/dev/disk4"),
+            dissent(),
+            holding(&image, "/dev/disk4"),
+            ok([]),
+        ]);
+
+        assert!(
+            backend
+                .detach_device_checked(&image, "/dev/disk4", DetachIntent::WithinGrace)
+                .unwrap()
+        );
+
+        let requests = backend.runner().requests();
+        assert_eq!(requests.len(), 2, "one dissent, then the accepted retry");
+        for request in requests.iter() {
+            assert_eq!(argv(request), ["detach", "-verbose", "/dev/disk4"]);
+        }
+        assert_eq!(*backend.sleeper.waits(), [Duration::from_millis(10)]);
+    }
+
+    /// A dissent that outlasts the grace is handed back as the dissent itself, never forced: the
+    /// seal refuses rather than tearing the device away from whatever holds it.
+    #[test]
+    fn a_within_grace_detach_answers_the_dissent_standing_when_the_grace_ends() {
+        let image = temp_path("detach-within-grace-busy", IMAGE_EXTENSION);
+        let backend = graced_backend([
+            holding(&image, "/dev/disk4"),
+            dissent(),
+            holding(&image, "/dev/disk4"),
+            dissent(),
+            holding(&image, "/dev/disk4"),
+            dissent(),
+        ]);
+
+        let error = backend
+            .detach_device_checked(&image, "/dev/disk4", DetachIntent::WithinGrace)
+            .unwrap_err();
+
+        assert!(detach_was_dissented(&error), "{error}");
+        let requests = backend.runner().requests();
+        assert_eq!(requests.len(), 3, "three unforced attempts and no force");
+        for request in requests.iter() {
+            assert_eq!(argv(request), ["detach", "-verbose", "/dev/disk4"]);
+        }
+        assert_eq!(
+            *backend.sleeper.waits(),
+            [Duration::from_millis(10), Duration::from_millis(10)]
+        );
+
+        // The seal reports it as the device's refusal: the unmount already proved no file open,
+        // so it names no holders and does not claim the volume is in use.
+        let busy = ApfsError::CaptureSourceBusy {
+            image: image.clone(),
+            mount_point: PathBuf::from("/tmp/cowshed-build-mount"),
+            held: CaptureHold::Device,
+            refusal: Box::new(error),
+        };
+        assert!(detach_was_dissented(&busy));
+        let said = busy.to_string();
+        assert!(
+            said.contains("unmounted with no file open")
+                && said.contains("refused the unforced detach when the detach grace ended")
+                && said.contains("nothing was forced")
+                && !said.contains("is in use"),
+            "{said}"
+        );
     }
 
     /// Only a dissent is transient. A tool that failed for any other reason is failing now and

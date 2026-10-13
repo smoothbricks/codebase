@@ -339,8 +339,11 @@ while it clones the seed, so a reseed never deletes a seed a fork is cloning:
 4. those admission-check descriptors are closed before sealing, because their open files would themselves prevent
    unmount. Enumeration cannot fence a previously absent profile or a build starting afterwards. The APFS source is then
    unmounted and detached without force. A late host Cargo build, a new profile, an editor or any other filesystem
-   holder refuses that seal; it is reported as a busy-volume skip and the old seed remains. The detached image is
-   flushed and its source inode held against reattachment while it is cloned;
+   holder refuses that seal; it is reported as a busy-volume skip and the old seed remains. An unmount the kernel
+   accepted leaves no file open, so a detach refused after it names no filesystem holder: it is retried without force
+   within the detach grace (01_storage.md, "Mounts"), and only a detach still refused when the grace ends is a busy
+   seal, reported as the device's refusal. The detached image is flushed and its source inode held against reattachment
+   while it is cloned;
 5. the live volume is restored at canonical with the same mount flags and current attachment identity, still under the
    exclusive build hold. Its volume and image are flushed and the post-restore image clock is marked on the seed. The
    clone's extent-map write and owner-record publication complete before the hold is released. Reopening admission is

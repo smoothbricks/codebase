@@ -246,12 +246,14 @@ image in a hosted arm64 release. A local real-ASIF comparison measured 127–173
 257–298 ms for general eject; this does not establish a hosted latency bound. `WhenIdle` returns the observed
 EBUSY/resource-busy refusal without forcing. `Release` gives the first refusal its 10 s monotonic wall-clock grace,
 including command execution and disk-lease waits between retries, then uses `hdiutil detach -force`; requested poll
-sleeps alone never define that deadline. Every other error remains authoritative. There is no general-eject fallback.
-Every detach runs `-verbose`, and hdiutil's account becomes an attribute of the `detach image` span: a refused eject
-prints `dissent=<reason>`, and an accepted one slower than 1 s prints `waited=<account>`. A forced eject of an unmounted
-volume measured 2.57 s on a loaded host with no dissent in its account: the wait is DiskArbitration's own queue (the
-unmount and eject callbacks), which `-force` does not bypass. The kernel's I/O Registry is the one host view that maps
-an image's path to its devices (`diskutil image info` reports none): one `IOServiceGetMatchingServices("IOMedia")`
+sleeps alone never define that deadline. `WithinGrace` retries through the same grace without forcing and then returns
+the refusal still standing; a build seed's seal detaches with it after an accepted unmount (16_build_volumes.md,
+"Targets and seeds"). Every other error remains authoritative. There is no general-eject fallback. Every detach runs
+`-verbose`, and hdiutil's account becomes an attribute of the `detach image` span: a refused eject prints
+`dissent=<reason>`, and an accepted one slower than 1 s prints `waited=<account>`. A forced eject of an unmounted volume
+measured 2.57 s on a loaded host with no dissent in its account: the wait is DiskArbitration's own queue (the unmount
+and eject callbacks), which `-force` does not bypass. The kernel's I/O Registry is the one host view that maps an
+image's path to its devices (`diskutil image info` reports none): one `IOServiceGetMatchingServices("IOMedia")`
 snapshot, each node walked up to its `AppleDiskImageDevice` and that device's `DiskImageURL`. `hdiutil info -plist` is
 not an inventory: while any other image attaches or detaches it answers a truncated image list with nothing marking it
 (a reviewer probe that kept one image attached while churning another saw it missing from 11–89 of every 648–1551 polls,
