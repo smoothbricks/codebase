@@ -86,8 +86,8 @@ export const DEPLOY_BUILD_TARGET = 'deploy-build';
 
 /** The workspace-wide manifests a release rewrites: the version of every member, and the lockfile mirror of it. */
 const RELEASE_REWRITTEN_WORKSPACE_INPUTS = ['{workspaceRoot}/package.json', '{workspaceRoot}/bun.lock'];
-/** Installed-toolchain files a TypeScript task reads that no config can name. */
-const TYPESCRIPT_PATCH_INPUTS = ['{workspaceRoot}/patches/**/*'];
+/** Installed patch bytes and pins affect the compiler; Markdown explains them but is not loaded. */
+const TYPESCRIPT_PATCH_INPUTS = ['{workspaceRoot}/patches/**/*', '!{workspaceRoot}/patches/**/*.md'];
 /**
  * The workspace's own base config, hashed for every TypeScript task whether or
  * not this project's chain reaches it: it is where a workspace puts the options
