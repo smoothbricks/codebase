@@ -355,10 +355,12 @@ lease is two classes that exclude each other rather than N interchangeable token
   renames neither starve attaches nor delay namespace work. A background cosmetic rename therefore must not hold either
   phase and make an attach wait behind it.
 - Members of one class share the running phase, up to 8 at once. A request of the running class with room in the phase
-  and nobody waiting enters at once; an idle gateway starts a phase for it.
+  and nobody waiting enters at once; an idle gateway starts a phase for it. A request asked `alone` takes all 8 places:
+  it enters only a phase that has no other member and runs with none beside it.
 - Once a member of the other class waits, the running phase admits nobody new, so a steady stream of one class cannot
   starve the other. When the phase drains, the next goes to the other class, whose oldest waiters enter it in arrival
-  order up to the cap; with both classes waiting, phases alternate.
+  order up to the cap, none overtaking an older one the phase has no room for; with both classes waiting, phases
+  alternate.
 - **A stuck holder is bounded.** A holder that keeps its phase 10 s after its grant while the other class waits is
   evicted from the phase: it no longer counts, the phase hands over once its other holders leave, and the gateway's
   stderr names it — `disk-lease evicted a <class> holder after <held> while <class> waited`, with its pid and the
@@ -366,15 +368,17 @@ lease is two classes that exclude each other rather than N interchangeable token
   overlap, not every attach on the host. A client's own deadline still kills its child at 120 s, except a disk-image
   command (`diskutil image …`, `hdiutil`), which it warns about from 120 s every 30 s and kills only at 15 minutes,
   because a killed one can leak its device until reboot (01_storage.md, "How the APFS host degrades" §2).
-- **Wire.** The client writes `{"op":"disk-lease","class":"storage"|"namespace","command":"<argv>"}` and does not
-  half-close. The gateway answers `{"ok":true,"lease":"queued"}` at once and `{"ok":true,"lease":"granted"}` when the
-  command may run; the lease lasts until the client closes the connection, so a client that dies holding one releases it
-  with its socket, and one that closes while queued leaves the queue.
+- **Wire.** The client writes `{"op":"disk-lease","class":"storage"|"namespace","command":"<argv>"}`, with
+  `"share":"alone"` when it asks for the whole phase, and does not half-close. The gateway answers
+  `{"ok":true,"lease":"queued"}` at once and `{"ok":true,"lease":"granted"}` when the command may run; the lease lasts
+  until the client closes the connection, so a client that dies holding one releases it with its socket, and one that
+  closes while queued leaves the queue.
 - **The lease spaces commands out; it never decides whether one runs.** The command runs unleased when the control
   socket does not answer (said once per process: the gateway is down or being set up), when the gateway refuses, when no
   grant comes within 120 s, and when the gateway predates leases. An older gateway says nothing until it reads EOF, so a
   client that hears no `queued` within 2 s half-closes, reads that gateway's `invalid-request` refusal, and stops asking
-  it for a minute.
+  it for a minute. A gateway that predates `alone` refuses the field as `invalid-request` at once; the client asks it
+  shared instead, from that command on, for a minute.
 - **Spans.** The client's lifecycle spans are `disk-lease <class> wait`, from the request to the grant (`status=err`,
   with an `unleased=<reason>` line, when the command runs unleased), and `disk-lease <class> phase`, around the command
   the grant admitted. With `COWSHED_TIMING` set, the gateway prints each phase as it drains: its class, how long it ran,

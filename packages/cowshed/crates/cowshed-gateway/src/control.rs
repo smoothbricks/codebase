@@ -20,7 +20,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 use cowshed_gateway_types::{
     CPU_TOKENS_OP, CpuBudgetStatus, DISK_LEASE_OP, DaemonStatus, DiskClass, EgressGrant,
-    EgressMode, HostPattern, LeaseState, MirrorRoute, WorkspaceCa, WorkspaceEndpoint,
+    EgressMode, HostPattern, LeaseState, MirrorRoute, PhaseShare, WorkspaceCa, WorkspaceEndpoint,
     WorkspacePolicy, WorkspaceSession, WorkspaceToken,
 };
 
@@ -343,6 +343,7 @@ enum Incoming {
     Request(ControlRequest),
     DiskLease {
         class: DiskClass,
+        share: PhaseShare,
         command: String,
     },
     CpuTokens {
@@ -353,10 +354,13 @@ enum Incoming {
 }
 
 /// A `disk-lease` request's fields. Its keys are checked against the operation's allowed set
-/// before this is read, so the `op` tag is the one key it ignores.
+/// before this is read, so the `op` tag is the one key it ignores. A request without `share`
+/// shares its phase.
 #[derive(Deserialize)]
 struct DiskLeaseIn {
     class: DiskClass,
+    #[serde(default)]
+    share: PhaseShare,
     command: String,
 }
 
@@ -764,8 +768,15 @@ async fn serve<R, W>(
         .await
         .and_then(|line| parse(&line))
     {
-        Ok(Incoming::DiskLease { class, command }) => {
-            let (tenure, granted) = services.disk_leases.ask(class, Claim::new(&command, pid));
+        Ok(Incoming::DiskLease {
+            class,
+            share,
+            command,
+        }) => {
+            let (tenure, granted) =
+                services
+                    .disk_leases
+                    .ask(class, share, Claim::new(&command, pid));
             hold(
                 reader,
                 writer,
@@ -881,7 +892,7 @@ fn parse_control_request_value(value: serde_json::Value) -> Result<Incoming, Con
         "sim-list" => &["op", "repoId"],
         "sim-boot" => &["op", "repoId", "device"],
         "cpu-budget" => &["op"],
-        DISK_LEASE_OP => &["op", "class", "command"],
+        DISK_LEASE_OP => &["op", "class", "share", "command"],
         CPU_TOKENS_OP => &["op", "want", "checkout", "command"],
         _ => {
             return Err(ControlError::Encoding(
@@ -896,8 +907,16 @@ fn parse_control_request_value(value: serde_json::Value) -> Result<Incoming, Con
     }
     let encoding = |error: serde_json::Error| ControlError::Encoding(error.to_string());
     if op == DISK_LEASE_OP {
-        let DiskLeaseIn { class, command } = serde_json::from_value(value).map_err(encoding)?;
-        return Ok(Incoming::DiskLease { class, command });
+        let DiskLeaseIn {
+            class,
+            share,
+            command,
+        } = serde_json::from_value(value).map_err(encoding)?;
+        return Ok(Incoming::DiskLease {
+            class,
+            share,
+            command,
+        });
     }
     if op == CPU_TOKENS_OP {
         let CpuTokensIn {
@@ -1366,6 +1385,7 @@ mod tests {
             r#"{"op":"unknown"}"#,
             r#"{"op":"disk-lease","class":"storage","command":"diskutil","pid":1}"#,
             r#"{"op":"disk-lease","class":"compute","command":"diskutil"}"#,
+            r#"{"op":"disk-lease","class":"storage","share":"half","command":"diskutil"}"#,
             r#"{"op":"disk-lease","class":"storage"}"#,
             r#"{"op":"cpu-tokens","want":0,"checkout":"/w","command":"nextest"}"#,
             r#"{"op":"cpu-tokens","want":-1,"checkout":"/w","command":"nextest"}"#,
@@ -1382,8 +1402,19 @@ mod tests {
             ),
             Ok(Incoming::DiskLease {
                 class: DiskClass::Namespace,
+                share: PhaseShare::Shared,
                 command,
             }) if command == "/sbin/umount /x"
+        ));
+        assert!(matches!(
+            parse_control_request(
+                br#"{"op":"disk-lease","class":"storage","share":"alone","command":"/usr/bin/hdiutil detach"}"#
+            ),
+            Ok(Incoming::DiskLease {
+                class: DiskClass::Storage,
+                share: PhaseShare::Alone,
+                command,
+            }) if command == "/usr/bin/hdiutil detach"
         ));
         assert!(matches!(
             parse_control_request(

@@ -26,9 +26,10 @@ export interface LeaseBounds {
 
 /**
  * Why a command runs without a lease: no gateway listens, the gateway predates this kind of lease,
- * or any other refusal, silence or breakage.
+ * the gateway knows the lease but predates a field the request names (it refuses the field at
+ * once), or any other refusal, silence or breakage.
  */
-export type UnleasedCause = 'absent' | 'predates' | 'other';
+export type UnleasedCause = 'absent' | 'predates' | 'predates-field' | 'other';
 
 /**
  * A granted lease with its `granted` answer, held until released, or why there is none. `closed`
@@ -102,6 +103,11 @@ export function holdLease(
       const why = `${String(fields.code ?? 'refused')}: ${error}`;
       if (state === 'half-closed' || error.endsWith('unknown gateway control operation')) {
         unleased(`the gateway predates ${what} (${why}); restart it with \`cowshed setup\``, 'predates');
+      } else if (error.endsWith('contains an unknown field')) {
+        unleased(
+          `the gateway predates a field of ${what} (${why}); restart it with \`cowshed setup\``,
+          'predates-field',
+        );
       } else {
         unleased(`the gateway refused the lease (${why})`);
       }

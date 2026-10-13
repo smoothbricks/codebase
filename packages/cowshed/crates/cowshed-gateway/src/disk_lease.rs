@@ -2,11 +2,12 @@
 //!
 //! Disk commands come in two classes ([`DiskClass`]) that exclude each other: a `storagekitd`
 //! attach does not finish while the mount table keeps changing. Members of one class share the
-//! running phase, up to a cap. Once a member of the other class waits, the running phase admits
-//! nobody new; when it drains, the next phase goes to the waiting class, and its oldest waiters
-//! enter it in arrival order. A holder that keeps a phase past the bound while the other class
-//! waits is evicted from the phase and reported with the command it named, so one hung `umount`
-//! cannot hold every attach on the host.
+//! running phase, up to a cap; a lease asked [`PhaseShare::Alone`] takes all of the cap, so it runs
+//! with no other member. Once a member of the other class waits, the running phase admits nobody
+//! new; when it drains, the next phase goes to the waiting class, and its oldest waiters enter it
+//! in arrival order, none overtaking an older one the phase has no room for. A holder that keeps
+//! a phase past the bound while the other class waits is evicted from the phase and reported with
+//! the command it named, so one hung `umount` cannot hold every attach on the host.
 //!
 //! [`Ledger`] is the whole policy as a pure state machine over explicit instants; [`DiskLeases`]
 //! is the thin actor that feeds it requests, departures and deadlines.
@@ -17,7 +18,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use cowshed_gateway_types::{ConfigError, DiskClass};
+use cowshed_gateway_types::{ConfigError, DiskClass, PhaseShare};
 use tokio::sync::{mpsc, oneshot};
 
 /// How many holders one class's phase admits, and how long a holder may keep a phase the other
@@ -104,6 +105,7 @@ pub(crate) enum Effect {
 #[derive(Debug)]
 struct Holder {
     ticket: Ticket,
+    share: PhaseShare,
     granted: Instant,
     claim: Claim,
 }
@@ -112,6 +114,7 @@ struct Holder {
 struct Waiter {
     ticket: Ticket,
     class: DiskClass,
+    share: PhaseShare,
     claim: Claim,
 }
 
@@ -122,6 +125,14 @@ struct Phase {
     holders: Vec<Holder>,
     members: usize,
     evicted: usize,
+}
+
+/// The places of a phase of `cap` that a `share` lease takes.
+const fn places(share: PhaseShare, cap: usize) -> usize {
+    match share {
+        PhaseShare::Shared => 1,
+        PhaseShare::Alone => cap,
+    }
 }
 
 /// The lease's state: the running phase, if any, and everyone waiting, oldest first.
@@ -143,14 +154,15 @@ impl Ledger {
         }
     }
 
-    /// `ticket` asks for `class`. It enters the running phase at once when that phase is its own
-    /// class, has room, and nobody waits; an idle ledger starts a phase for it. Everyone else
-    /// waits in arrival order.
+    /// `ticket` asks for `class`, taking `share` of its phase. It enters the running phase at once
+    /// when that phase is its own class, has room for its share, and nobody waits; an idle ledger
+    /// starts a phase for it. Everyone else waits in arrival order.
     pub(crate) fn ask(
         &mut self,
         now: Instant,
         ticket: Ticket,
         class: DiskClass,
+        share: PhaseShare,
         claim: Claim,
         effects: &mut Vec<Effect>,
     ) {
@@ -158,17 +170,20 @@ impl Ledger {
         match &mut self.phase {
             None => {
                 let mut phase = Phase::new(class, now);
-                phase.admit(ticket, now, claim, effects);
+                phase.admit(ticket, share, now, claim, effects);
                 self.phase = Some(phase);
             }
             Some(phase)
-                if phase.class == class && phase.holders.len() < cap && self.waiting.is_empty() =>
+                if phase.class == class
+                    && phase.has_room(share, cap)
+                    && self.waiting.is_empty() =>
             {
-                phase.admit(ticket, now, claim, effects);
+                phase.admit(ticket, share, now, claim, effects);
             }
             Some(_) => self.waiting.push_back(Waiter {
                 ticket,
                 class,
+                share,
                 claim,
             }),
         }
@@ -286,9 +301,27 @@ impl Phase {
         }
     }
 
-    fn admit(&mut self, ticket: Ticket, now: Instant, claim: Claim, effects: &mut Vec<Effect>) {
+    /// Whether a `share` lease still fits beside this phase's holders.
+    fn has_room(&self, share: PhaseShare, cap: usize) -> bool {
+        let taken: usize = self
+            .holders
+            .iter()
+            .map(|holder| places(holder.share, cap))
+            .sum();
+        taken + places(share, cap) <= cap
+    }
+
+    fn admit(
+        &mut self,
+        ticket: Ticket,
+        share: PhaseShare,
+        now: Instant,
+        claim: Claim,
+        effects: &mut Vec<Effect>,
+    ) {
         self.holders.push(Holder {
             ticket,
+            share,
             granted: now,
             claim,
         });
@@ -296,7 +329,7 @@ impl Phase {
         effects.push(Effect::Grant(ticket));
     }
 
-    /// Move this phase's class's waiters into it, oldest first, until it is full.
+    /// Move this phase's class's waiters into it, oldest first, until the oldest left has no room.
     fn admit_waiting(
         &mut self,
         waiting: &mut VecDeque<Waiter>,
@@ -305,12 +338,14 @@ impl Phase {
         effects: &mut Vec<Effect>,
     ) {
         let mut index = 0;
-        while index < waiting.len() && self.holders.len() < cap {
-            if waiting[index].class == self.class {
-                let waiter = waiting.remove(index).expect("index is in bounds");
-                self.admit(waiter.ticket, now, waiter.claim, effects);
-            } else {
+        while index < waiting.len() {
+            if waiting[index].class != self.class {
                 index += 1;
+            } else if self.has_room(waiting[index].share, cap) {
+                let waiter = waiting.remove(index).expect("index is in bounds");
+                self.admit(waiter.ticket, waiter.share, now, waiter.claim, effects);
+            } else {
+                break;
             }
         }
     }
@@ -320,6 +355,7 @@ enum Message {
     Ask {
         ticket: Ticket,
         class: DiskClass,
+        share: PhaseShare,
         claim: Claim,
         granted: oneshot::Sender<()>,
     },
@@ -362,15 +398,21 @@ impl DiskLeases {
         }
     }
 
-    /// Ask for `class`. The receiver resolves once the lease is granted; the tenure holds the
-    /// place in the queue or the phase until it is dropped. A receiver that errors means the
-    /// scheduler is gone.
-    pub(crate) fn ask(&self, class: DiskClass, claim: Claim) -> (Tenure, oneshot::Receiver<()>) {
+    /// Ask for `share` of a `class` phase. The receiver resolves once the lease is granted; the
+    /// tenure holds the place in the queue or the phase until it is dropped. A receiver that
+    /// errors means the scheduler is gone.
+    pub(crate) fn ask(
+        &self,
+        class: DiskClass,
+        share: PhaseShare,
+        claim: Claim,
+    ) -> (Tenure, oneshot::Receiver<()>) {
         let ticket = self.tickets.fetch_add(1, Ordering::Relaxed);
         let (granted, receiver) = oneshot::channel();
         let _ = self.messages.send(Message::Ask {
             ticket,
             class,
+            share,
             claim,
             granted,
         });
@@ -399,9 +441,9 @@ async fn run(mut ledger: Ledger, mut messages: mpsc::UnboundedReceiver<Message>)
         };
         tokio::select! {
             message = messages.recv() => match message {
-                Some(Message::Ask { ticket, class, claim, granted }) => {
+                Some(Message::Ask { ticket, class, share, claim, granted }) => {
                     grants.insert(ticket, granted);
-                    ledger.ask(Instant::now(), ticket, class, claim, &mut effects);
+                    ledger.ask(Instant::now(), ticket, class, share, claim, &mut effects);
                 }
                 Some(Message::Leave { ticket }) => {
                     grants.remove(&ticket);
@@ -483,11 +525,26 @@ mod tests {
         }
 
         fn ask(&mut self, ms: u64, ticket: Ticket, class: DiskClass) -> Vec<Ticket> {
+            self.ask_for(ms, ticket, class, PhaseShare::Shared)
+        }
+
+        fn ask_alone(&mut self, ms: u64, ticket: Ticket, class: DiskClass) -> Vec<Ticket> {
+            self.ask_for(ms, ticket, class, PhaseShare::Alone)
+        }
+
+        fn ask_for(
+            &mut self,
+            ms: u64,
+            ticket: Ticket,
+            class: DiskClass,
+            share: PhaseShare,
+        ) -> Vec<Ticket> {
             let now = self.at(ms);
             self.ledger.ask(
                 now,
                 ticket,
                 class,
+                share,
                 claim(&format!("t{ticket}")),
                 &mut self.effects,
             );
@@ -515,6 +572,66 @@ mod tests {
                 })
                 .collect()
         }
+    }
+
+    #[test]
+    fn an_alone_lease_waits_for_its_phase_to_drain_and_nobody_overtakes_it() {
+        let mut clock = Clock::new(limits(8, 1_000));
+        assert_eq!(clock.ask(0, 1, Storage), [1]);
+        assert_eq!(
+            clock.ask_alone(1, 2, Storage),
+            [] as [Ticket; 0],
+            "seven places are free, but alone takes all eight"
+        );
+        assert_eq!(
+            clock.ask(2, 3, Storage),
+            [] as [Ticket; 0],
+            "room for a shared lease, but an older alone one waits"
+        );
+        assert_eq!(
+            clock.leave(3, 1),
+            [2],
+            "the drained phase is the alone lease's and only its"
+        );
+        assert_eq!(clock.leave(4, 2), [3]);
+    }
+
+    #[test]
+    fn an_alone_lease_on_an_idle_ledger_runs_at_once_with_no_member_of_either_class() {
+        let mut clock = Clock::new(limits(8, 1_000));
+        assert_eq!(clock.ask_alone(0, 1, Storage), [1]);
+        assert_eq!(clock.ask(1, 2, Storage), [] as [Ticket; 0], "storage waits");
+        assert_eq!(
+            clock.ask(2, 3, Namespace),
+            [] as [Ticket; 0],
+            "namespace waits"
+        );
+        assert_eq!(
+            clock.ask_alone(3, 4, Storage),
+            [] as [Ticket; 0],
+            "a second alone lease waits its turn"
+        );
+        assert_eq!(
+            clock.leave(4, 1),
+            [3],
+            "namespace waited, so the next phase is namespace's"
+        );
+        assert_eq!(
+            clock.leave(5, 3),
+            [2],
+            "storage's oldest enters; the alone lease behind it has no room"
+        );
+        assert_eq!(clock.leave(6, 2), [4]);
+    }
+
+    #[test]
+    fn with_a_cap_of_one_alone_and_shared_take_the_same_place() {
+        let mut clock = Clock::new(limits(1, 1_000));
+        assert_eq!(clock.ask(0, 1, Storage), [1]);
+        assert_eq!(clock.ask_alone(1, 2, Storage), [] as [Ticket; 0]);
+        assert_eq!(clock.leave(2, 1), [2]);
+        assert_eq!(clock.ask(3, 3, Storage), [] as [Ticket; 0]);
+        assert_eq!(clock.leave(4, 2), [3]);
     }
 
     #[test]

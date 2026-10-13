@@ -26,7 +26,7 @@ import {
   withDescendants,
 } from '../../testing.js';
 import { isRecord } from '../../type-guards.js';
-import { diskClassOf, takeDiskLease } from './disk-lease.js';
+import { diskClassOf, type PhaseShare, recordedShare, takeDiskLease } from './disk-lease.js';
 import { GATEWAY_SOCKET } from './gateway-lease.js';
 import {
   captureHeldVerdict,
@@ -1691,40 +1691,48 @@ let gatewayAbsenceSaid = false;
 
 /**
  * How long this process stops asking a gateway that predates leases before it asks again: each
- * ask costs that gateway's 2 s of silence, and `cowshed setup` may replace it meanwhile.
+ * ask costs that gateway's 2 s of silence, and `cowshed setup` may replace it meanwhile. A gateway
+ * that predates only `alone` leases is asked shared for as long.
  */
 const PREDATES_RECHECK_MS = 60_000;
 
-/** When this process last found the gateway at each control socket predating leases. */
-const predatesSeenAt = new Map<string, number>();
+/** When this process last found the gateway at each control socket predating leases, or `alone` ones. */
+const predatesSeen = new Map<string, { at: number; what: 'leases' | 'alone' }>();
 
 /**
  * Every disk tool runs under cowshed's host disk-lifecycle lease when the gateway answers
  * (`disk-lease.ts`): its attaches and mounts then never starve cowshed's, nor cowshed's them. The
  * lease wait comes before the deadline starts, and the lease is released once the command is
- * answered. Without a grant the command runs unleased and stderr says why; an absent gateway is
- * said once per process, and one that predates leases is said and not asked again for a minute.
+ * answered. A process whose lease waits are recorded asks for its phase `alone`. Without a grant
+ * the command runs unleased and stderr says why; an absent gateway is said once per process, and
+ * one that predates leases is said and not asked again for a minute. One that refuses `alone` is
+ * asked shared at once, and for a minute after.
  */
 export function createHostCommands(
   defaultDeadlineMs: number = HOST_COMMAND_DEADLINE_MS,
   gatewaySocket: string = GATEWAY_SOCKET,
+  wantedShare: PhaseShare = recordedShare(),
 ): HostCommands {
   return {
     async run(file, args, callDeadlineMs) {
       const deadlineMs = callDeadlineMs ?? defaultDeadlineMs;
       const diskClass = diskClassOf(file, args);
-      const predatesSince = predatesSeenAt.get(gatewaySocket);
-      if (diskClass === null || (predatesSince !== undefined && Date.now() - predatesSince < PREDATES_RECHECK_MS)) {
+      const seen = predatesSeen.get(gatewaySocket);
+      const predates = seen !== undefined && Date.now() - seen.at < PREDATES_RECHECK_MS ? seen.what : null;
+      if (diskClass === null || predates === 'leases') {
         return runBounded(file, args, deadlineMs);
       }
-      const lease = await takeDiskLease(gatewaySocket, diskClass, [file, ...args].join(' '), {
-        ackMs: 2_000,
-        afterCloseMs: 5_000,
-        grantMs: deadlineMs,
-      });
+      const command = [file, ...args].join(' ');
+      const bounds = { ackMs: 2_000, afterCloseMs: 5_000, grantMs: deadlineMs };
+      const share = predates === 'alone' ? 'shared' : wantedShare;
+      let lease = await takeDiskLease(gatewaySocket, diskClass, command, bounds, share);
+      if (!lease.granted && lease.cause === 'predates-field' && share === 'alone') {
+        predatesSeen.set(gatewaySocket, { at: Date.now(), what: 'alone' });
+        lease = await takeDiskLease(gatewaySocket, diskClass, command, bounds, 'shared');
+      }
       if (!lease.granted) {
         if (lease.cause === 'predates') {
-          predatesSeenAt.set(gatewaySocket, Date.now());
+          predatesSeen.set(gatewaySocket, { at: Date.now(), what: 'leases' });
         }
         if (!(lease.cause === 'absent' && gatewayAbsenceSaid)) {
           gatewayAbsenceSaid ||= lease.cause === 'absent';

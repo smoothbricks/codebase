@@ -13,7 +13,9 @@
 //!
 //! A test's lease waits are the host's queue, not its code. When [`LEASE_WAIT_RECORD_ENV`] names
 //! a file, every wait is also appended to it (08_testing.md, "Integration tests (real
-//! substrate)"), so the real-APFS lane's wrapper can judge the test's code time without them.
+//! substrate)"), so the real-APFS lane's wrapper can judge the test's code time without them,
+//! and every lease is asked [`PhaseShare::Alone`]: a shared phase's command queues on
+//! `storagekitd` behind the other members', which would be the host's queue counted as code.
 
 use std::ffi::OsStr;
 use std::fmt;
@@ -26,7 +28,7 @@ use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use cowshed_gateway_types::{DiskClass, DiskLeaseAnswer, DiskLeaseRequest, LeaseState};
+use cowshed_gateway_types::{DiskClass, DiskLeaseAnswer, DiskLeaseRequest, LeaseState, PhaseShare};
 
 use crate::device::DISKUTIL;
 use crate::{DISK_CHILD_DEADLINE, HDIUTIL, MOUNT_APFS, NEWFS_APFS, UMOUNT};
@@ -55,7 +57,8 @@ pub fn class_of(program: &Path, args: &[impl AsRef<OsStr>]) -> Option<DiskClass>
 
 /// Run `run`, the disk tool `program args`, under a lease of its class from the host gateway. A
 /// program that is no disk tool runs at once, and so does every disk tool for a minute after the
-/// host gateway was found to predate leases.
+/// host gateway was found to predate leases; for a minute after it was found to predate `alone`
+/// leases, it is asked shared.
 pub fn leased<T, E: fmt::Display>(
     program: &Path,
     args: &[impl AsRef<OsStr>],
@@ -64,12 +67,14 @@ pub fn leased<T, E: fmt::Display>(
     let Some(class) = class_of(program, args) else {
         return run();
     };
-    if predates_recently() {
-        return run();
-    }
+    let share = match predates_recently() {
+        Some(Predates::Leases) => return run(),
+        Some(Predates::Alone) => PhaseShare::Shared,
+        None => wanted_share(),
+    };
     let command = describe(program, args);
     let socket = cowshed_gateway_types::control_socket_path();
-    lease_then(&socket, class, &command, remember_predates, run)
+    lease_then(&socket, class, share, &command, remember_predates, run)
 }
 
 /// [`leased`] against the control socket at `socket`, for a command already classed and named.
@@ -80,14 +85,26 @@ pub fn leased_at<T, E: fmt::Display>(
     command: &str,
     run: impl FnOnce() -> Result<T, E>,
 ) -> Result<T, E> {
-    lease_then(socket, class, command, |_| {}, run)
+    lease_then(socket, class, wanted_share(), command, |_| {}, run)
 }
 
+/// The share this process asks for: the whole phase when its lease waits are recorded.
+fn wanted_share() -> PhaseShare {
+    match *RECORD {
+        Some(_) => PhaseShare::Alone,
+        None => PhaseShare::Shared,
+    }
+}
+
+/// Ask for `share` of a `class` phase and run `run` under the grant, or unleased with the reason
+/// said. A gateway that predates `alone` leases is asked again at once, shared, so the command
+/// it refused still runs leased.
 fn lease_then<T, E: fmt::Display>(
     socket: &Path,
     class: DiskClass,
+    share: PhaseShare,
     command: &str,
-    unleased_by: impl FnOnce(&Unleased),
+    unleased_by: impl Fn(&Unleased),
     run: impl FnOnce() -> Result<T, E>,
 ) -> Result<T, E> {
     let waiting = RECORD.as_ref().map(|record| record.begin(class));
@@ -106,7 +123,7 @@ fn lease_then<T, E: fmt::Display>(
         }
     };
     let lease = cowshed_os::timing::timed("disk-lease", format_args!("{class} wait"), || {
-        acquire(stream, class, command, Bounds::PRODUCTION)
+        acquire(stream, class, share, command, Bounds::PRODUCTION)
     });
     drop(waiting);
     match lease {
@@ -119,7 +136,13 @@ fn lease_then<T, E: fmt::Display>(
                 &unleased,
             );
             unleased_by(&unleased);
-            run()
+            match unleased {
+                Unleased::Predates {
+                    what: Predates::Alone,
+                    ..
+                } => lease_then(socket, class, PhaseShare::Shared, command, unleased_by, run),
+                _ => run(),
+            }
         }
     }
 }
@@ -135,9 +158,8 @@ pub struct DiskLease {
 pub enum Unleased {
     /// The gateway answered with a refusal.
     Refused { code: String, error: String },
-    /// The gateway predates disk leases: it said nothing until the request was half-closed,
-    /// then refused the operation. Leases are not asked of it again for [`PREDATES_RECHECK`].
-    Predates(String),
+    /// The gateway predates `what`. It is not asked for `what` again for [`PREDATES_RECHECK`].
+    Predates { what: Predates, error: String },
     /// The gateway queued nothing within [`Bounds::ack`], yet acknowledged once asked to finish:
     /// it is alive but too slow to schedule this command in time.
     Slow,
@@ -147,16 +169,40 @@ pub enum Unleased {
     NotGranted(Duration),
 }
 
+/// What a gateway from an older build predates (05_gateway.md, "Disk-lifecycle lease").
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Predates {
+    /// Disk leases: it said nothing until the request was half-closed, then refused the
+    /// operation. Its commands run unleased.
+    Leases,
+    /// Asking for the whole phase: it refused the request's `share` at once. It is asked shared.
+    Alone,
+}
+
+/// The end of the refusal a lease-scheduling gateway answers a request field it does not know.
+const UNKNOWN_FIELD: &str = "contains an unknown field";
+
 impl fmt::Display for Unleased {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Refused { code, error } => {
                 write!(formatter, "the gateway refused the lease ({code}): {error}")
             }
-            Self::Predates(error) => write!(
+            Self::Predates {
+                what: Predates::Leases,
+                error,
+            } => write!(
                 formatter,
                 "the gateway predates disk leases ({error}); restart it from this build with \
                  `cowshed setup`"
+            ),
+            Self::Predates {
+                what: Predates::Alone,
+                error,
+            } => write!(
+                formatter,
+                "the gateway predates alone disk leases ({error}), so it is asked shared; restart \
+                 it from this build with `cowshed setup`"
             ),
             Self::Slow => formatter.write_str(
                 "the gateway did not queue the request in time; it is alive but overloaded",
@@ -189,12 +235,13 @@ impl Bounds {
     };
 }
 
-/// How long a process stops asking a gateway that predates leases before it asks again: the
-/// gateway may be replaced by `cowshed setup` while a long-lived process runs.
+/// How long a process stops asking a gateway that predates leases, or `alone` leases, before it
+/// asks again: the gateway may be replaced by `cowshed setup` while a long-lived process runs.
 const PREDATES_RECHECK: Duration = Duration::from_secs(60);
 
-/// When this process last found the host gateway predating leases, as milliseconds after
-/// [`EPOCH`] plus one; zero for never.
+/// When this process last found the host gateway predating leases or `alone` leases: the
+/// milliseconds after [`EPOCH`] plus one, shifted left once, with the low bit set for `alone`;
+/// zero for never.
 static PREDATES_SEEN: AtomicU64 = AtomicU64::new(0);
 static EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
 static ABSENT_SAID: AtomicBool = AtomicBool::new(false);
@@ -203,19 +250,24 @@ fn since_epoch() -> u64 {
     u64::try_from(EPOCH.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
-fn predates_recently() -> bool {
-    match PREDATES_SEEN.load(Ordering::Relaxed) {
-        0 => false,
-        seen => {
-            let recheck = u64::try_from(PREDATES_RECHECK.as_millis()).unwrap_or(u64::MAX);
-            since_epoch().saturating_sub(seen - 1) < recheck
-        }
-    }
+fn predates_recently() -> Option<Predates> {
+    let seen = PREDATES_SEEN.load(Ordering::Relaxed);
+    let at = (seen >> 1).checked_sub(1)?;
+    let recheck = u64::try_from(PREDATES_RECHECK.as_millis()).unwrap_or(u64::MAX);
+    (since_epoch().saturating_sub(at) < recheck).then_some(if seen & 1 == 1 {
+        Predates::Alone
+    } else {
+        Predates::Leases
+    })
 }
 
 fn remember_predates(unleased: &Unleased) {
-    if matches!(unleased, Unleased::Predates(_)) {
-        PREDATES_SEEN.store(since_epoch() + 1, Ordering::Relaxed);
+    if let Unleased::Predates { what, .. } = unleased {
+        let at = since_epoch().saturating_add(1).min(u64::MAX >> 1);
+        PREDATES_SEEN.store(
+            (at << 1) | u64::from(*what == Predates::Alone),
+            Ordering::Relaxed,
+        );
     }
 }
 
@@ -302,14 +354,15 @@ fn unix_micros() -> u128 {
         .map_or(0, |since| since.as_micros())
 }
 
-/// Ask for a `class` lease on `stream` for `command` and wait for the grant.
+/// Ask for `share` of a `class` phase on `stream` for `command` and wait for the grant.
 pub(crate) fn acquire(
     stream: UnixStream,
     class: DiskClass,
+    share: PhaseShare,
     command: &str,
     bounds: Bounds,
 ) -> Result<DiskLease, Unleased> {
-    let mut line = serde_json::to_vec(&DiskLeaseRequest::new(class, command))
+    let mut line = serde_json::to_vec(&DiskLeaseRequest::new(class, share, command))
         .map_err(|error| Unleased::Broken(io::Error::other(error)))?;
     line.push(b'\n');
     (&stream).write_all(&line).map_err(Unleased::Broken)?;
@@ -318,7 +371,19 @@ pub(crate) fn acquire(
         .set_read_timeout(Some(bounds.ack))
         .map_err(Unleased::Broken)?;
     match read_answer(&mut answers) {
-        Ok(answer) => expect(answer, LeaseState::Queued)?,
+        Ok(answer) => expect(answer, LeaseState::Queued).map_err(|unleased| match unleased {
+            Unleased::Refused { code, error }
+                if share == PhaseShare::Alone
+                    && code == "invalid-request"
+                    && error.ends_with(UNKNOWN_FIELD) =>
+            {
+                Unleased::Predates {
+                    what: Predates::Alone,
+                    error,
+                }
+            }
+            other => other,
+        })?,
         Err(error) if timed_out(&error) => {
             stream
                 .shutdown(std::net::Shutdown::Write)
@@ -330,7 +395,10 @@ pub(crate) fn acquire(
             return Err(match answer {
                 DiskLeaseAnswer {
                     ok: false, error, ..
-                } => Unleased::Predates(error.unwrap_or_default()),
+                } => Unleased::Predates {
+                    what: Predates::Leases,
+                    error: error.unwrap_or_default(),
+                },
                 DiskLeaseAnswer { .. } => Unleased::Slow,
             });
         }
@@ -502,8 +570,14 @@ mod tests {
             &listener,
             b"{\"ok\":true,\"lease\":\"queued\"}\n{\"ok\":true,\"lease\":\"granted\"}\n",
         );
-        let lease =
-            acquire(client, DiskClass::Namespace, "/sbin/umount /x", ANSWERED).expect("granted");
+        let lease = acquire(
+            client,
+            DiskClass::Namespace,
+            PhaseShare::Shared,
+            "/sbin/umount /x",
+            ANSWERED,
+        )
+        .expect("granted");
         let mut sent = BufReader::new(&server);
         let mut line = String::new();
         sent.read_line(&mut line).expect("request");
@@ -543,6 +617,7 @@ mod tests {
         let unleased = acquire(
             client,
             DiskClass::Storage,
+            PhaseShare::Shared,
             "/usr/sbin/diskutil list",
             Bounds {
                 ack: NO_ANSWER,
@@ -553,7 +628,7 @@ mod tests {
         let waited = started.elapsed();
         server.join().expect("server");
         assert!(
-            matches!(&unleased, Unleased::Predates(error) if error.contains("unknown")),
+            matches!(&unleased, Unleased::Predates { what: Predates::Leases, error } if error.contains("unknown")),
             "{unleased}"
         );
         assert!(
@@ -569,7 +644,13 @@ mod tests {
             &listener,
             b"{\"ok\":false,\"code\":\"rejected\",\"error\":\"stopped\"}\n",
         );
-        let refused = acquire(client, DiskClass::Storage, "x", ANSWERED);
+        let refused = acquire(
+            client,
+            DiskClass::Storage,
+            PhaseShare::Shared,
+            "x",
+            ANSWERED,
+        );
         assert!(
             matches!(&refused, Err(Unleased::Refused { code, .. }) if code == "rejected"),
             "{refused:?}"
@@ -580,6 +661,7 @@ mod tests {
         let ungranted = acquire(
             client,
             DiskClass::Storage,
+            PhaseShare::Shared,
             "x",
             Bounds {
                 grant: NO_ANSWER,
@@ -592,6 +674,94 @@ mod tests {
         );
         let mut rest = Vec::new();
         io::Read::read_to_end(&mut server, &mut rest).expect("client closes");
+    }
+
+    /// What a lease-scheduling gateway from before `share` answers a request that names it.
+    const UNKNOWN_SHARE: &[u8] = b"{\"ok\":false,\"code\":\"invalid-request\",\"error\":\"gateway control encoding failed: gateway control request contains an unknown field\"}\n";
+
+    #[test]
+    fn a_gateway_that_refuses_the_share_field_predates_alone_leases_only_when_asked_alone() {
+        let (_socket, listener, client) = pair();
+        let server = answering(&listener, UNKNOWN_SHARE);
+        let unleased = acquire(client, DiskClass::Storage, PhaseShare::Alone, "x", ANSWERED)
+            .expect_err("an older gateway refuses the field");
+        assert!(
+            matches!(&unleased, Unleased::Predates { what: Predates::Alone, error } if error.ends_with(UNKNOWN_FIELD)),
+            "{unleased}"
+        );
+        let mut line = String::new();
+        BufReader::new(&server)
+            .read_line(&mut line)
+            .expect("request");
+        assert_eq!(
+            line,
+            "{\"op\":\"disk-lease\",\"class\":\"storage\",\"share\":\"alone\",\"command\":\"x\"}\n"
+        );
+
+        let (_socket, listener, client) = pair();
+        let _server = answering(&listener, UNKNOWN_SHARE);
+        let refused = acquire(
+            client,
+            DiskClass::Storage,
+            PhaseShare::Shared,
+            "x",
+            ANSWERED,
+        );
+        assert!(
+            matches!(&refused, Err(Unleased::Refused { code, .. }) if code == "invalid-request"),
+            "a shared request names no share, so its refusal is only a refusal: {refused:?}"
+        );
+    }
+
+    #[test]
+    fn a_command_a_gateway_refuses_alone_is_asked_again_shared_and_runs_leased() {
+        let socket = Socket(std::path::PathBuf::from(format!(
+            "/tmp/cowshed-dl-{}.sock",
+            uuid::Uuid::new_v4().simple()
+        )));
+        let listener = UnixListener::bind(&socket.0).expect("bind");
+        let gateway = std::thread::spawn(move || {
+            let granted: &[u8] =
+                b"{\"ok\":true,\"lease\":\"queued\"}\n{\"ok\":true,\"lease\":\"granted\"}\n";
+            let mut asked = Vec::new();
+            for answer in [UNKNOWN_SHARE, granted] {
+                let (mut server, _) = listener.accept().expect("accept");
+                let mut line = String::new();
+                BufReader::new(&server)
+                    .read_line(&mut line)
+                    .expect("request");
+                asked.push(line);
+                server.write_all(answer).expect("answer");
+                // Until the client closes: at once after a refusal, after its command once granted.
+                let mut rest = Vec::new();
+                io::Read::read_to_end(&mut server, &mut rest).expect("client closes");
+            }
+            asked
+        });
+        let said = std::cell::RefCell::new(Vec::new());
+        let ran = lease_then(
+            &socket.0,
+            DiskClass::Storage,
+            PhaseShare::Alone,
+            "x",
+            |unleased| said.borrow_mut().push(unleased.to_string()),
+            || Ok::<_, String>("ran"),
+        );
+        assert_eq!(ran, Ok("ran"));
+        assert_eq!(
+            gateway.join().expect("gateway"),
+            [
+                "{\"op\":\"disk-lease\",\"class\":\"storage\",\"share\":\"alone\",\"command\":\"x\"}\n",
+                "{\"op\":\"disk-lease\",\"class\":\"storage\",\"command\":\"x\"}\n",
+            ]
+        );
+        let said = said.into_inner();
+        assert_eq!(
+            said.len(),
+            1,
+            "only the alone ask went unleased; the shared one was granted: {said:?}"
+        );
+        assert!(said[0].contains("predates alone disk leases"), "{said:?}");
     }
 
     #[test]

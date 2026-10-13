@@ -56,21 +56,45 @@ impl fmt::Display for DiskClass {
     }
 }
 
-/// The one line a client writes: `{"op":"disk-lease","class":"storage","command":"…"}`.
-/// `command` names what the lease is for, so the gateway can say which command held a phase too
-/// long.
+/// How much of its class's running phase one lease takes.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PhaseShare {
+    /// One of the phase's places: the command runs beside the class's other members.
+    #[default]
+    Shared,
+    /// The whole phase: the command runs with no other disk command of either class, so time
+    /// it would spend queued behind them in `storagekitd` is spent waiting for the grant instead.
+    /// A client whose lease waits are recorded (08_testing.md, "Integration tests (real
+    /// substrate)") asks for this, so its test's code time holds no other process's disk work.
+    Alone,
+}
+
+impl PhaseShare {
+    pub const fn is_shared(&self) -> bool {
+        matches!(self, Self::Shared)
+    }
+}
+
+/// The one line a client writes: `{"op":"disk-lease","class":"storage","command":"…"}`, with
+/// `"share":"alone"` when it asks for the whole phase. `command` names what the lease is for, so
+/// the gateway can say which command held a phase too long. A shared request carries no `share`,
+/// so it is the line every lease-scheduling gateway reads.
 #[derive(Clone, Copy, Debug, Serialize)]
 pub struct DiskLeaseRequest<'a> {
     op: &'static str,
     pub class: DiskClass,
+    #[serde(skip_serializing_if = "PhaseShare::is_shared")]
+    pub share: PhaseShare,
     pub command: &'a str,
 }
 
 impl<'a> DiskLeaseRequest<'a> {
-    pub const fn new(class: DiskClass, command: &'a str) -> Self {
+    pub const fn new(class: DiskClass, share: PhaseShare, command: &'a str) -> Self {
         Self {
             op: DISK_LEASE_OP,
             class,
+            share,
             command,
         }
     }

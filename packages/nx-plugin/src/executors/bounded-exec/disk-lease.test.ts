@@ -80,7 +80,7 @@ describe('cowshed disk-lifecycle lease client', () => {
       // after the peer closes until the server ends it, so 'close' is not that signal on Linux.
       client.on('end', () => close());
     });
-    const lease = await takeDiskLease(socket, 'storage', '/usr/bin/hdiutil detach /dev/disk9', QUICK);
+    const lease = await takeDiskLease(socket, 'storage', '/usr/bin/hdiutil detach /dev/disk9', QUICK, 'shared');
     expect(await request).toBe(
       '{"op":"disk-lease","class":"storage","command":"/usr/bin/hdiutil detach /dev/disk9"}\n',
     );
@@ -98,7 +98,7 @@ describe('cowshed disk-lifecycle lease client', () => {
         client.end('{"ok":false,"code":"invalid-request","error":"unknown gateway control operation"}\n'),
       );
     });
-    const lease = await takeDiskLease(socket, 'namespace', '/sbin/umount /x', QUICK);
+    const lease = await takeDiskLease(socket, 'namespace', '/sbin/umount /x', QUICK, 'shared');
     expect(lease).toEqual({
       granted: false,
       cause: 'predates',
@@ -107,8 +107,38 @@ describe('cowshed disk-lifecycle lease client', () => {
     });
   });
 
+  it('asks for the whole phase by naming its share, and only then', async () => {
+    const { promise: request, resolve: requested } = Promise.withResolvers<string>();
+    const socket = await gateway((client) => {
+      client.once('data', (chunk) => {
+        requested(chunk.toString('utf8'));
+        client.write('{"ok":true,"lease":"queued"}\n{"ok":true,"lease":"granted"}\n');
+      });
+    });
+    const lease = await takeDiskLease(socket, 'storage', '/usr/bin/hdiutil detach /dev/disk9', QUICK, 'alone');
+    expect(await request).toBe(
+      '{"op":"disk-lease","class":"storage","share":"alone","command":"/usr/bin/hdiutil detach /dev/disk9"}\n',
+    );
+    expect(lease.granted).toBe(true);
+    if (lease.granted) {
+      lease.release();
+    }
+  });
+
+  it('recognizes a gateway that predates the share field by its refusal at once', async () => {
+    const socket = await gateway((client) => {
+      client.once('data', () =>
+        client.end(
+          '{"ok":false,"code":"invalid-request","error":"gateway control encoding failed: gateway control request contains an unknown field"}\n',
+        ),
+      );
+    });
+    const lease = await takeDiskLease(socket, 'storage', 'x', QUICK, 'alone');
+    expect(lease.granted === false && lease.cause).toBe('predates-field');
+  });
+
   it('runs unleased, said as absent, when no gateway listens', async () => {
-    const lease = await takeDiskLease(await socketPath('none.sock'), 'storage', 'x', QUICK);
+    const lease = await takeDiskLease(await socketPath('none.sock'), 'storage', 'x', QUICK, 'shared');
     expect(lease.granted === false && lease.cause).toBe('absent');
   });
 
@@ -116,7 +146,7 @@ describe('cowshed disk-lifecycle lease client', () => {
     const socket = await gateway((client) => {
       client.once('data', () => client.write('{"ok":true,"lease":"queued"}\n'));
     });
-    const lease = await takeDiskLease(socket, 'storage', 'x', QUICK);
+    const lease = await takeDiskLease(socket, 'storage', 'x', QUICK, 'shared');
     expect(lease).toEqual({ granted: false, cause: 'other', reason: 'the gateway granted nothing within 500 ms' });
   });
 
