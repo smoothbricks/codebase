@@ -16,6 +16,7 @@ import {
   statfs,
   writeFile,
 } from 'node:fs/promises';
+import { Socket } from 'node:net';
 import { basename, join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import {
@@ -1820,6 +1821,9 @@ function runBounded(
       child.stdout.destroy();
       child.stderr.destroy();
       child.unref();
+      // A piped child's streams are sockets; only a socket can be unref'd.
+      if (child.stdout instanceof Socket) child.stdout.unref();
+      if (child.stderr instanceof Socket) child.stderr.unref();
       resolve({
         status: 1,
         stdout: text(stdout),
