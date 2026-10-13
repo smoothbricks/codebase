@@ -252,6 +252,12 @@
               "@smoothbricks/codebase"
             ],
             "target": "cargo-test-group-real-apfs"
+          },
+          {
+            "projects": [
+              "@smoothbricks/codebase"
+            ],
+            "target": "cargo-test-group-real-apfs-host"
           }
         ],
         "options": {
