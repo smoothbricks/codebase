@@ -720,10 +720,10 @@ function declaredTarget(root: string, anchor: string, relative: string): string 
 }
 
 /**
- * The stable anchor for genuine sibling directories is the project's main checkout.
- * A cowshed marker names it without reading main's tree. Contained declared
- * directories are projected into the current checkout by `declaredTarget`, with
- * physical containment checked against symlink escapes.
+ * The marker names the donor only to recognize a contained binding inherited from it.
+ * It grants no read of the donor tree and never selects a declaration target: both
+ * contained and sibling declarations resolve at this checkout through `declaredTarget`,
+ * with physical containment checked against symlink escapes.
  */
 function linkAnchor(root: string): string {
   let marker: unknown;
