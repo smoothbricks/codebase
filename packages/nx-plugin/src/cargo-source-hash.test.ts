@@ -1,6 +1,6 @@
 import { expect, it } from 'bun:test';
 import { execFileSync } from 'node:child_process';
-import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, realpath, rename, rm, symlink, writeFile } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { useFixtureCargoHome } from './__tests__/fixture-cargo-home.js';
@@ -49,6 +49,66 @@ it.each(['app', '.'])('invalidates transitive and inherited Cargo inputs with Nx
     expect(inheritedChanged).not.toBe(sourceChanged);
     await put('external/leaf/target/noise.rs', 'uncompiled build output');
     expect(await hashCargoPathInputs(manifest, nxRoot)).toBe(inheritedChanged);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+it('identical external inputs hash equally at different checkout depths, with bytes and file names still significant', async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'cargo-hash-portable-')));
+  const shared = join(root, 'shared');
+  const roots: readonly [string, string] = [join(root, 'main'), join(root, 'sheds/deep/unit')];
+  try {
+    await mkdir(join(shared, 'src'), { recursive: true });
+    await writeFile(
+      join(shared, 'Cargo.toml'),
+      '[package]\nname="shared"\nversion="0.1.0"\nedition="2021"\n[workspace]\n',
+    );
+    const include = 'const DATA: &str = include_str!(' + JSON.stringify(join(root, 'data.txt')) + ');\n';
+    await writeFile(join(shared, 'src/lib.rs'), 'pub fn value() -> u8 { 7 }\n' + include);
+    await writeFile(join(shared, 'src/extra.rs'), 'pub const EXTRA: u8 = 9;\n');
+    await writeFile(join(root, 'data.txt'), 'shared-data-one');
+    const manifest =
+      '[package]\nname="consumer"\nversion="0.1.0"\nedition="2021"\n[dependencies]\nshared={path=' +
+      JSON.stringify(shared) +
+      '}\n[workspace]\n';
+    for (const workspace of roots) {
+      await mkdir(join(workspace, 'src'), { recursive: true });
+      await writeFile(join(workspace, 'Cargo.toml'), manifest);
+      await writeFile(join(workspace, 'src/lib.rs'), 'pub fn value() -> u8 { shared::value() }\n' + include);
+      await symlink(join(shared, 'src'), join(workspace, 'linked-src'), 'dir');
+      execFileSync('cargo', ['generate-lockfile', '--offline', '--manifest-path', join(workspace, 'Cargo.toml')], {
+        stdio: 'pipe',
+      });
+    }
+    expect(await readFile(join(roots[0], 'Cargo.lock'), 'utf8')).toBe(
+      await readFile(join(roots[1], 'Cargo.lock'), 'utf8'),
+    );
+    const before: string[] = [];
+    const after: string[] = [];
+    for (const includeWorkspace of [false, true]) {
+      const hashes = await Promise.all(
+        roots.map((workspace) => hashCargoPathInputs(join(workspace, 'Cargo.toml'), workspace, { includeWorkspace })),
+      );
+      expect(hashes[0]).toBeDefined();
+      expect(hashes[1]).toBe(hashes[0]);
+      before.push(hashes.join(','));
+    }
+    await writeFile(join(root, 'data.txt'), 'shared-data-two');
+    for (const [index, includeWorkspace] of [false, true].entries()) {
+      const hashes = await Promise.all(
+        roots.map((workspace) => hashCargoPathInputs(join(workspace, 'Cargo.toml'), workspace, { includeWorkspace })),
+      );
+      expect(hashes[1]).toBe(hashes[0]);
+      expect(hashes.join(',')).not.toBe(before[index]);
+      after.push(hashes.join(','));
+    }
+    await rename(join(shared, 'src/extra.rs'), join(shared, 'src/renamed.rs'));
+    const renamed = await Promise.all(
+      roots.map((workspace) => hashCargoPathInputs(join(workspace, 'Cargo.toml'), workspace)),
+    );
+    expect(renamed[1]).toBe(renamed[0]);
+    expect(renamed.join(',')).not.toBe(after[0]);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

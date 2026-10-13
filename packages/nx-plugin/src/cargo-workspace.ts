@@ -4,7 +4,7 @@ import { dirname, isAbsolute, join, normalize, posix, relative, resolve, sep } f
 import { readNxJson } from 'nx/src/config/nx-json.js';
 import { parse as parseToml, type TomlTable } from 'smol-toml';
 
-import { compiledInFiles } from './cargo-source-hash.js';
+import { type CompiledCargoInput, compiledInFiles } from './cargo-source-hash.js';
 
 export interface CargoWorkspacePackage {
   name: string;
@@ -239,7 +239,7 @@ export interface CargoPackageTestInputsOptions {
 export interface CargoInputsCache {
   readonly manifests: Map<string, Promise<TomlTable>>;
   readonly nestedCrateDirs: Map<string, string[]>;
-  readonly compiledInFiles: Map<string, string[]>;
+  readonly compiledInFiles: Map<string, CompiledCargoInput[]>;
   readonly results: Map<string, Promise<string[]>>;
 }
 
@@ -396,7 +396,7 @@ async function deriveCargoPackageTestInputs(
     // `include_str!("../../../skills/SKILL.md")` compiles a file the package's own
     // fileset does not reach; a target that does not hash it serves a binary
     // built from the file's old bytes.
-    for (const file of compiledInFiles(absoluteDir, cache.compiledInFiles)) {
+    for (const { file } of compiledInFiles(absoluteDir, cache.compiledInFiles)) {
       if (isOutsideRoot(relative(absoluteDir, file))) declaredSources.add(file);
     }
   }
