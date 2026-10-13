@@ -188,9 +188,20 @@ export async function keepDeveloperLinks<T>(
       restoreLink(root, link);
       const receipt = recorded.get(link.path);
       // The install's postinstall may have claimed this alias after Bun replaced
-      // it. Restoring a manual override must restore its lack of ownership too.
-      if (receipt?.target === link.target) restored.set(link.path, receipt);
-      else restored.delete(link.path);
+      // it. Restoring a manual override restores it as the developer's binding
+      // under the current declaration, so a later plan does not claim it.
+      if (receipt?.target === link.target) {
+        restored.set(link.path, receipt);
+      } else if (receipt !== undefined) {
+        const declaration = new Map(readDeclaredLinks(root)).get(packageName(link));
+        if (declaration !== undefined) {
+          restored.set(link.path, { path: link.path, declaration, target: link.target });
+        } else {
+          restored.delete(link.path);
+        }
+      } else {
+        restored.delete(link.path);
+      }
     }
     writeDeclaredRecord(root, restored);
     if (succeeded && recorded.size > 0 && process.env.GITHUB_ACTIONS !== 'true') {
@@ -385,6 +396,7 @@ export async function planDeclaredLinks(root: string): Promise<DeclaredLinksPlan
     return { changes: [], unavailable: [] };
   }
   const anchor = linkAnchor(root);
+  const manifestMtime = statSync(path.join(root, 'package.json')).mtimeMs;
   const canonicalRoot = realpathSync(root);
   const trees = nodeModulesTrees(root);
   const recorded = readDeclaredRecord(root);
@@ -430,7 +442,16 @@ export async function planDeclaredLinks(root: string): Promise<DeclaredLinksPlan
         // A receipt proves an earlier managed sibling binding; an unrecorded
         // sibling or a manual retarget remains the developer's own choice.
         const inherited = inheritedContainedBinding(anchor, relative, current);
-        const managed = recorded.get(entry)?.target === text;
+        const receipt = recorded.get(entry);
+        // A contained declaration owns its entry at whatever target it was retargeted to. A
+        // managed sibling entry follows the declaration while the link is exactly what this
+        // owner last wrote; a retarget after that stays the developer's. An unrecorded foreign
+        // link answers to the declaration it was made under: one made while this declaration
+        // stood is claimed, one a later declaration change overtook is not.
+        const managed =
+          contained ||
+          (receipt !== undefined && receipt.target === text && receipt.declaration !== relative) ||
+          (receipt === undefined && stats.mtimeMs >= manifestMtime);
         if (current === target && text === packageAliasTarget(root, at, target)) continue;
         const physical = sourcePhysical === undefined ? undefined : realpathOrNull(current);
         if (binding.kind === 'snapshot' && foreign && !inherited && !managed && physical === sourcePhysical) {
@@ -648,7 +669,7 @@ function readDeclaredLinks(root: string): DeclaredLink[] {
     const directory: unknown = object ? Reflect.get(declaration, 'directory') : declaration;
     if (typeof directory !== 'string' || directory.length === 0 || path.isAbsolute(directory)) {
       throw new Error(
-        `${manifestPath}: smoo.developerLinks ${name} must be a directory relative to this checkout, not ${JSON.stringify(directory)}`,
+        `${manifestPath}: smoo.developerLinks ${name} must be a directory relative to ${import.meta.main ? 'the main' : 'this'} checkout, not ${JSON.stringify(directory)}`,
       );
     }
     if (!object) return { name, directory, snapshot: undefined };
@@ -672,11 +693,13 @@ function readDeclaredLinks(root: string): DeclaredLink[] {
   });
 }
 
-/** Project-contained declared directories follow their checkout; siblings retain the shared main anchor. */
+/** Project-contained declared directories follow their checkout; siblings resolve beside this
+ * checkout, never the main checkout its marker names. */
 function declaredTarget(root: string, anchor: string, relative: string): string {
   const shared = path.resolve(anchor, relative);
   const inside = path.relative(anchor, shared);
-  if (inside === '..' || inside.startsWith(`..${path.sep}`) || path.isAbsolute(inside)) return shared;
+  if (inside === '..' || inside.startsWith(`..${path.sep}`) || path.isAbsolute(inside))
+    return path.resolve(root, relative);
   const candidate = path.resolve(root, inside);
   const canonicalRoot = realpathSync(root);
   let existing = candidate;
