@@ -13,6 +13,7 @@ mod control;
 mod cpu_budget;
 mod disk_lease;
 mod interfaces;
+mod jobserver;
 mod mirror;
 mod npm_index;
 mod platform;

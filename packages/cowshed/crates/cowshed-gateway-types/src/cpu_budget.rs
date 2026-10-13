@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 
 /// The control operation that asks for CPU tokens.
 pub const CPU_TOKENS_OP: &str = "cpu-tokens";
+pub const JOBSERVER_OP: &str = "jobserver";
 
 /// The one line a client writes:
 /// `{"op":"cpu-tokens","want":8,"checkout":"/path/to/checkout","command":"…"}`.
