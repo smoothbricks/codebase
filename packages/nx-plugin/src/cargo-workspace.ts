@@ -857,6 +857,12 @@ export interface SerialTestGroup {
  * derived from those overrides rather than restated, so the runner and the
  * per-crate exclusions cannot drift from what nextest actually serializes.
  *
+ * Each group also carries the `scope` of its filter (`filterScope`): the members its runner hashes.
+ * A group whose every clause is scoped to a `package(<name>)` reruns only when those crates or their
+ * local dependencies change; any other group is scoped to the whole workspace. Nothing here orders one
+ * group against another: they are separate runners, and a repository that needs two never concurrent
+ * declares the edge between their targets itself.
+ *
  * Every override naming a serial group must declare `SERIAL_TEST_GROUP_PLATFORM`.
  * This plugin has no cfg evaluator, so it honours exactly that platform and
  * refuses any other rather than guessing where the group applies.
@@ -906,79 +912,193 @@ export function serialTestGroups(nextestConfigPath: string): SerialTestGroup[] {
 }
 
 /**
- * The packages `filter` can select tests from, read off its `package(<name>)` predicates.
+ * The packages `filter` can select tests from, read off its `package(<name>)` predicates. The scope is
+ * never narrower than the selection: whatever this does not read with certainty is the whole workspace.
  *
- * A filterset is a union of clauses; a clause is scoped when its first operand — the one `and`,
- * `&` and `-` all keep positive — is `package(<name>)` or `package(=<name>)`, or a parenthesised
- * filter that is itself scoped. Whatever the operators' precedence, a scoped clause selects only
- * from its package, so the union of the clauses' packages bounds the whole selection. Anything
- * else — an unscoped clause, a glob name, unbalanced parentheses — can select from every member,
- * and the scope is the workspace: never narrower than what the filter can select.
+ * The filter is read as nextest reads it, with nextest's precedence — parentheses, then `not` and `!`,
+ * then `and`, `&` and `-`, then `or`, `|` and `+`, each level left to right — and with nextest's blanks,
+ * which are spaces and line endings. Each expression is bounded by the packages it can select from:
+ *
+ * - `package(<name>)` and `package(=<name>)`, for a plain Cargo name, bound it to that package. A glob,
+ *   `~contains`, `/regex/` or `#glob` name can match any package, so it bounds nothing.
+ * - Every other predicate bounds nothing, and nor does `not`: `not package(a)` selects from every other
+ *   package, and `deps` and `rdeps` reach beyond the package they name.
+ * - `a and b` selects only what both select, so it is bounded by the narrower of the two bounds, and
+ *   `a - b`, which is `a and not b`, by `a`. `a or b` is bounded by both together, so one unbounded
+ *   clause leaves the union unbounded however the union is spelled.
+ *
+ * A predicate's argument ends where nextest ends it: a regex at its closing `/`, any other matcher at its
+ * first `)`. Only arguments that need none of nextest's escape sequences are read: a backslash, or a comma
+ * outside a regex, makes where the predicate ends depend on escapes this does not implement. Those, a
+ * filter that does not parse, and one whose packages exclude each other have no bound.
  */
 export function filterScope(filter: string): SerialTestGroupScope {
-  const packages = scopedPackages(filter);
-  return packages === null
-    ? { kind: 'workspace' }
-    : { kind: 'packages', packages: [...packages].sort((left, right) => left.localeCompare(right)) };
+  const read = readUnion(filter, 0);
+  if (read === null || skipBlank(filter, read.end) !== filter.length || read.bound === 'any' || read.bound.size === 0) {
+    return { kind: 'workspace' };
+  }
+  return { kind: 'packages', packages: [...read.bound].sort((left, right) => left.localeCompare(right)) };
 }
 
-function scopedPackages(filter: string): Set<string> | null {
-  const clauses = splitTopLevel(filter, [' or ', ' | ']);
-  if (clauses === null) return null;
-  const packages = new Set<string>();
-  for (const clause of clauses) {
-    const operands = splitTopLevel(clause.trim(), [' and ', ' & ', ' - ']);
-    const first = operands?.[0]?.trim();
-    if (first === undefined) return null;
-    const inner = unwrapParentheses(first);
-    if (inner !== null) {
-      const nested = scopedPackages(inner);
-      if (nested === null) return null;
-      for (const name of nested) packages.add(name);
-      continue;
-    }
-    const named = /^package\(=?([A-Za-z0-9_-]+)\)$/.exec(first)?.[1];
-    if (named === undefined) return null;
-    packages.add(named);
-  }
-  return packages;
+/** What a filterset can select from: only the named packages, or `'any'` when no package bounds it. */
+type PackageBound = ReadonlySet<string> | 'any';
+
+/** A filterset prefix that has been read: the packages it can select from, and the offset just past it. */
+interface ReadFilter {
+  readonly bound: PackageBound;
+  readonly end: number;
 }
 
-/** `text` split at each of `operators` outside parentheses, or null when its parentheses do not balance. */
-function splitTopLevel(text: string, operators: readonly string[]): string[] | null {
-  const parts: string[] = [];
-  let depth = 0;
-  let start = 0;
-  let index = 0;
-  while (index < text.length) {
-    const character = text[index];
-    if (character === '(') depth += 1;
-    if (character === ')') depth -= 1;
-    if (depth < 0) return null;
-    const operator = depth === 0 ? operators.find((candidate) => text.startsWith(candidate, index)) : undefined;
-    if (operator === undefined) {
-      index += 1;
-      continue;
-    }
-    parts.push(text.slice(start, index));
-    index += operator.length;
-    start = index;
+/** nextest's loosest-binding level: `or`, `|` and `+` between chains of `and`. */
+function readUnion(text: string, from: number): ReadFilter | null {
+  let left = readIntersection(text, from);
+  while (left !== null) {
+    const operatorEnd = skipUnionOperator(text, left.end);
+    if (operatorEnd === null) return left;
+    const right = readIntersection(text, operatorEnd);
+    if (right === null) return null;
+    const bound = left.bound === 'any' || right.bound === 'any' ? 'any' : new Set([...left.bound, ...right.bound]);
+    left = { bound, end: right.end };
   }
-  if (depth !== 0) return null;
-  parts.push(text.slice(start));
-  return parts;
+  return null;
 }
 
-/** The filter inside `text` when one pair of parentheses encloses all of it, else null. */
-function unwrapParentheses(text: string): string | null {
-  if (!text.startsWith('(') || !text.endsWith(')')) return null;
-  let depth = 0;
-  for (let index = 0; index < text.length; index += 1) {
-    if (text[index] === '(') depth += 1;
-    if (text[index] === ')') depth -= 1;
-    if (depth === 0 && index < text.length - 1) return null;
+/** A chain of `and`, `&` and `-`, which bind tighter than a union, left to right. */
+function readIntersection(text: string, from: number): ReadFilter | null {
+  let left = readOperand(text, from);
+  while (left !== null) {
+    const operator = readIntersectionOperator(text, left.end);
+    if (operator === null) return left;
+    const right = readOperand(text, operator.end);
+    left =
+      right === null
+        ? null
+        : { bound: operator.difference ? left.bound : boundIntersection(left.bound, right.bound), end: right.end };
   }
-  return text.slice(1, -1);
+  return null;
+}
+
+/** A negation, a parenthesised filterset, or one predicate. */
+function readOperand(text: string, from: number): ReadFilter | null {
+  const at = skipBlank(text, from);
+  const word = readWord(text, at, 'not');
+  const negated = word ?? (text.charAt(at) === '!' ? at + 1 : null);
+  if (negated !== null) {
+    const operand = readOperand(text, negated);
+    return operand === null ? null : { bound: 'any', end: operand.end };
+  }
+  if (text.charAt(at) !== '(') return readPredicate(text, at);
+  const inner = readUnion(text, at + 1);
+  if (inner === null) return null;
+  const close = skipBlank(text, inner.end);
+  return text.charAt(close) === ')' ? { bound: inner.bound, end: close + 1 } : null;
+}
+
+/** What follows a predicate's `(`: nothing, or a name matcher. */
+const PREDICATE_ARGUMENTS: Record<string, 'none' | 'matcher'> = {
+  all: 'none',
+  none: 'none',
+  default: 'none',
+  test: 'matcher',
+  group: 'matcher',
+  package: 'matcher',
+  deps: 'matcher',
+  rdeps: 'matcher',
+  binary_id: 'matcher',
+  kind: 'matcher',
+  binary: 'matcher',
+  platform: 'matcher',
+};
+
+/** One predicate: `all()` and its kin, or a name followed by its parenthesised matcher. */
+function readPredicate(text: string, at: number): ReadFilter | null {
+  const identifier = /[a-z_]+/y;
+  identifier.lastIndex = at;
+  const predicate = identifier.exec(text)?.[0];
+  if (predicate === undefined) return null;
+  const open = skipBlank(text, at + predicate.length);
+  if (text.charAt(open) !== '(') return null;
+  const argument = Object.hasOwn(PREDICATE_ARGUMENTS, predicate) ? PREDICATE_ARGUMENTS[predicate] : undefined;
+  if (argument === undefined) return null;
+  if (argument === 'none') {
+    const close = skipBlank(text, open + 1);
+    return text.charAt(close) === ')' ? { bound: 'any', end: close + 1 } : null;
+  }
+  const matcher = readMatcher(text, open + 1);
+  return matcher === null
+    ? null
+    : { bound: predicate === 'package' ? packageBound(matcher.text) : 'any', end: matcher.end };
+}
+
+/**
+ * The argument of a predicate whose `(` ends just before `from`, as written between its parentheses, and
+ * the offset past its `)`; null when it cannot be delimited exactly as nextest delimits it.
+ */
+function readMatcher(text: string, from: number): { readonly text: string; readonly end: number } | null {
+  const start = skipBlank(text, from);
+  const close = text.charAt(start) === '/' ? regexMatcherClose(text, start) : plainMatcherClose(text, start);
+  return close === null ? null : { text: text.slice(from, close), end: close + 1 };
+}
+
+/** The `)` that follows the `/regex/` starting at `start`, when the regex holds no backslash. */
+function regexMatcherClose(text: string, start: number): number | null {
+  const slash = text.indexOf('/', start + 1);
+  if (slash < 0 || text.slice(start, slash).includes('\\')) return null;
+  const close = skipBlank(text, slash + 1);
+  return text.charAt(close) === ')' ? close : null;
+}
+
+/** The first `)` at or after `start`, when nothing before it is a backslash or a comma. */
+function plainMatcherClose(text: string, start: number): number | null {
+  const close = text.indexOf(')', start);
+  return close < 0 || /[,\\]/.test(text.slice(start, close)) ? null : close;
+}
+
+/** A plain Cargo package name, with or without nextest's `=` prefix: nothing a glob can widen. */
+const PLAIN_PACKAGE_NAME = /^=?([A-Za-z0-9_-]+)$/;
+
+function packageBound(matcher: string): PackageBound {
+  const name = PLAIN_PACKAGE_NAME.exec(matcher)?.[1];
+  return name === undefined ? 'any' : new Set([name]);
+}
+
+function boundIntersection(left: PackageBound, right: PackageBound): PackageBound {
+  if (left === 'any') return right;
+  if (right === 'any') return left;
+  return new Set([...left].filter((name) => right.has(name)));
+}
+
+/** The offset of the first character at or after `from` that nextest does not read as blank. */
+function skipBlank(text: string, from: number): number {
+  const blank = /(?: |\r?\n)*/y;
+  blank.lastIndex = from;
+  return from + (blank.exec(text)?.[0].length ?? 0);
+}
+
+/** `word` at `at`, read as nextest reads an operator word: not the start of a longer identifier. */
+function readWord(text: string, at: number, word: string): number | null {
+  const end = at + word.length;
+  return text.startsWith(word, at) && !/[A-Za-z0-9_]/.test(text.charAt(end)) ? end : null;
+}
+
+/** The offset past the `or`, `|` or `+` that follows `from` after any blanks, or null. */
+function skipUnionOperator(text: string, from: number): number | null {
+  const at = skipBlank(text, from);
+  const character = text.charAt(at);
+  return readWord(text, at, 'or') ?? (character === '|' || character === '+' ? at + 1 : null);
+}
+
+/** The `and`, `&` or `-` that follows `from` after any blanks: where it ends, and whether it subtracts. */
+function readIntersectionOperator(
+  text: string,
+  from: number,
+): { readonly end: number; readonly difference: boolean } | null {
+  const at = skipBlank(text, from);
+  const word = readWord(text, at, 'and');
+  if (word !== null) return { end: word, difference: false };
+  const character = text.charAt(at);
+  if (character === '&') return { end: at + 1, difference: false };
+  return character === '-' ? { end: at + 1, difference: true } : null;
 }
 
 /** The plugin's nextest.toml as the workspace root's `node_modules` links it. */
