@@ -520,9 +520,9 @@ Concrete targets come from concrete files:
   substrate)").
 - `cargo-test` is the ordinary suite alone: it depends on the crate pieces and never on a serial group, so a run of it
   never reaches a group's real-image tests. The inferred `test`, the gate of the cargo workspace root and of every
-  project that owns crates, depends on `cargo-test` and on every group's runner, by plain name at the root that owns
-  them and across projects from a member. A project that declares its own `test` replaces that list, so its declaration
-  names the runners it wants: `{ "projects": ["<root project>"], "target": "cargo-test-group-<group>" }`.
+  project that owns crates, depends on `cargo-test` alone. No target depends on a serial group's runner: a group runs
+  only as its own target, which a gate names (`nx run-many -t … cargo-test-group-<group>`), and replays from the cache
+  unless its own inputs changed.
 - A group's runner hashes only the crates its filter can select tests from, with everything they link, every member
   manifest and the repository's nextest config, so a change to an unrelated crate leaves it cached. The filter is read
   as nextest reads it (its precedence, blanks and predicate arguments; `filterScope`): a plain `package(<name>)` or

@@ -1,8 +1,13 @@
 import { describe, expect, it } from 'bun:test';
-import { readdir, readFile } from 'node:fs/promises';
+import { spawnSync } from 'node:child_process';
+import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { join, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import type { ProjectGraph } from 'nx/src/config/project-graph';
+import { createTaskGraph } from 'nx/src/tasks-runner/create-task-graph.js';
 import { parse as parseToml } from 'smol-toml';
+import typia from 'typia';
 import {
   type CargoWorkspacePackage,
   cargoPackageTestInputs,
@@ -82,17 +87,38 @@ describe('the real-APFS serial groups of this repository', () => {
     expect(host.dependsOn).toEqual(['...', DEVICE_GROUP]);
   });
 
-  it('are named by every explicit target that must run after real images: the gate of cowshed, and test-host', async () => {
-    const cowshed = await readRecord('packages/cowshed/package.json', JSON.parse);
-    const plugin = await readRecord('packages/nx-plugin/package.json', JSON.parse);
-    for (const target of [DEVICE_GROUP, HOST_GROUP]) {
-      const edge = { projects: [ROOT_PROJECT], target };
-      // cowshed declares its own `test`, which replaces the inferred one that reaches the groups.
-      expect(child(manifestTargets(cowshed), 'test').dependsOn).toContainEqual(edge);
-      // test-host drives the host's disk, so it waits for the host group as well as the device group.
-      expect(child(manifestTargets(plugin), 'test-host').dependsOn).toContainEqual(edge);
+  it("are reached by no target of this repository's real task graph but the host group's edge to the device group", async () => {
+    const graph = await repositoryProjectGraph();
+    const projects = Object.keys(graph.nodes);
+    const targets = [...new Set(projects.flatMap((name) => Object.keys(graph.nodes[name]?.data.targets ?? {})))];
+    // Every task of every project, as one run-many of every target would plan it.
+    const tasks = createTaskGraph(graph, {}, projects, targets, undefined, {});
+    const device = `${ROOT_PROJECT}:${DEVICE_GROUP}`;
+    const host = `${ROOT_PROJECT}:${HOST_GROUP}`;
+    if (process.platform === 'darwin') {
+      // The groups exist where they run; elsewhere the plugin infers neither and there is nothing to reach.
+      expect(Object.keys(tasks.tasks)).toEqual(expect.arrayContaining([device, host]));
     }
-  });
+    const edges = (id: string): string[] => [
+      ...(tasks.dependencies[id] ?? []),
+      ...(tasks.continuousDependencies?.[id] ?? []),
+    ];
+    const groupsReached: Record<string, string[]> = {};
+    for (const id of Object.keys(tasks.tasks)) {
+      const seen = new Set<string>();
+      const pending = edges(id);
+      for (let next = pending.pop(); next !== undefined; next = pending.pop()) {
+        if (seen.has(next)) continue;
+        seen.add(next);
+        pending.push(...edges(next));
+      }
+      const groups = [...seen].filter((reached) => reached === device || reached === host);
+      if (groups.length > 0) groupsReached[id] = groups;
+    }
+    // A real-image group runs only as its own target, named by the gate, and only when its own inputs changed: an
+    // aggregate that reached one pulled 21 minutes of real-image tests into a plain `-t test`.
+    expect(groupsReached).toEqual(process.platform === 'darwin' ? { [host]: [device] } : {});
+  }, 120_000);
 
   it('wrap exactly their tests in the 30s code-bound class, behind the 60s class that wins first', async () => {
     const config = await readRecord(NEXTEST_REPO_CONFIG_PATH, parseToml);
@@ -173,9 +199,39 @@ function records(value: unknown): Record<string, unknown>[] {
   });
 }
 
-/** A package manifest's explicit Nx targets. */
-function manifestTargets(manifest: Record<string, unknown>): Record<string, unknown> {
-  return child(child(manifest, 'nx'), 'targets');
+const parseProjectGraph = typia.json.createAssertParse<ProjectGraph>();
+// The child computes the graph outside this package's bunfig; it takes the same transform preload as the test runner.
+const VALIDATION_PRELOAD = fileURLToPath(import.meta.resolve('@smoothbricks/validation/bun/preload'));
+const GRAPH_SCRIPT = `const { createProjectGraphAsync } = await import('nx/src/project-graph/project-graph.js');
+const graph = await createProjectGraphAsync({ exitOnError: false });
+process.stdout.write(JSON.stringify({ nodes: graph.nodes, dependencies: graph.dependencies }));`;
+
+/**
+ * The repository's own project graph, as Nx builds it with this plugin: computed daemonless, in a child that exits when
+ * it is done, with plugins in its own process and workspace data of its own, so it neither starts a daemon nor writes
+ * the checkout's graph cache.
+ */
+async function repositoryProjectGraph(): Promise<ProjectGraph> {
+  const data = await mkdtemp(join(tmpdir(), 'serial-group-graph-'));
+  try {
+    const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('NX_')));
+    const run = spawnSync(process.execPath, ['--preload', VALIDATION_PRELOAD, '-e', GRAPH_SCRIPT], {
+      cwd: REPOSITORY,
+      encoding: 'utf8',
+      maxBuffer: 256 * 1024 * 1024,
+      env: {
+        ...env,
+        NX_DAEMON: 'false',
+        NX_ISOLATE_PLUGINS: 'false',
+        NX_CACHE_PROJECT_GRAPH: 'false',
+        NX_WORKSPACE_DATA_DIRECTORY: data,
+      },
+    });
+    if (run.status !== 0) throw new Error(`the project graph child exited ${run.status}: ${run.stderr}`);
+    return parseProjectGraph(run.stdout);
+  } finally {
+    await rm(data, { recursive: true, force: true });
+  }
 }
 
 interface RustSource {

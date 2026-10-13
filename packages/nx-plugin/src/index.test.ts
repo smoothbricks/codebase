@@ -2150,9 +2150,9 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
           `-E 'package(big) and (${exceptional}) and not ((test(/real_apfs_/)))' --partition hash:${index}/3 --no-fail-fast --no-tests=pass`,
         );
       }
-      // `cargo-test` is the ordinary suite alone; the gate (`test`) reaches the group beside it.
+      // `cargo-test` and the gate (`test`) are the ordinary suite alone: no target depends on the group.
       expect(macos['cargo-test']?.dependsOn).not.toContain('cargo-test-group-real-apfs');
-      expect(macos.test?.dependsOn).toEqual(['cargo-test', 'cargo-test-group-real-apfs']);
+      expect(macos.test?.dependsOn).toEqual(['cargo-test']);
 
       // Off macOS nextest applies the group nowhere, so it is not inferred and no piece excludes its tests.
       const linux = await inferProjectTargets(
@@ -2276,7 +2276,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
     }
   });
 
-  it('keeps cargo-test to the ordinary suite and reaches every serial group from the gate of the root and of each member', async () => {
+  it('keeps cargo-test and test to the ordinary suite, so no gate of the root or a member reaches a serial group', async () => {
     const workspace = await createWorkspace();
     try {
       await writeApfsSplitFixture(workspace, APFS_SPLIT_GROUPS);
@@ -2284,11 +2284,6 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       const root = macos.get('.') ?? {};
       const cowshed = macos.get('packages/cowshed') ?? {};
       const lmao = macos.get('packages/lmao') ?? {};
-      const rootProject = '@fixture/codebase';
-      const groups = [
-        { projects: [rootProject], target: 'cargo-test-group-real-apfs' },
-        { projects: [rootProject], target: 'cargo-test-group-real-apfs-host' },
-      ];
 
       // `cargo-test` is the ordinary suite alone, whichever project owns the aggregate.
       expect(root['cargo-test']?.dependsOn).toEqual([
@@ -2308,15 +2303,11 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       ]);
       expect(lmao['cargo-test']?.dependsOn).toEqual(['cargo-test-lmao-core']);
 
-      // The gate reaches the ordinary suite and both groups: by plain name at the root that owns the
-      // groups, across projects from a member, whether or not the member owns a crate the groups hold.
-      expect(root.test?.dependsOn).toEqual([
-        'cargo-test',
-        'cargo-test-group-real-apfs',
-        'cargo-test-group-real-apfs-host',
-      ]);
-      expect(cowshed.test?.dependsOn).toEqual(['cargo-test', ...groups]);
-      expect(lmao.test?.dependsOn).toEqual(['cargo-test', ...groups]);
+      // The gate is the ordinary suite alone, at the root that owns the groups and at every member: a serial group is
+      // its own target, which a gate names, and nothing depends on it.
+      for (const targets of [root, cowshed, lmao]) {
+        expect(targets.test?.dependsOn).toEqual(['cargo-test']);
+      }
 
       // Inference orders nothing between the groups: that edge is the repository's explicit config.
       for (const name of ['cargo-test-group-real-apfs', 'cargo-test-group-real-apfs-host']) {
@@ -2339,7 +2330,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         );
       }
 
-      // Off macOS the groups are not inferred, so the gate is the ordinary suite alone.
+      // Off macOS the groups are not inferred at all, and the gate is the same ordinary suite.
       const linux = await inferApfsSplit(workspace, createNodesV2ForPlatform('linux', 'x64'));
       expect(linux.get('.')?.test?.dependsOn).toEqual(['cargo-test']);
       expect(linux.get('packages/cowshed')?.test?.dependsOn).toEqual(['cargo-test']);
@@ -2349,7 +2340,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
     }
   });
 
-  it('runs the host group after the device group through the explicit targetDefaults edge, and the gate runs both', async () => {
+  it('runs the host group after the device group through the explicit targetDefaults edge, and no test gate runs either', async () => {
     const workspace = await createWorkspace();
     try {
       await writeApfsSplitFixture(workspace, APFS_SPLIT_GROUPS);
@@ -2409,24 +2400,25 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       const device = task(rootProject, 'cargo-test-group-real-apfs');
       const hosted = task(rootProject, 'cargo-test-group-real-apfs-host');
 
-      // The task graph `nx run-many -t test` runs: the host group starts only once the device group is done,
-      // so two real-image runners never overlap, and the ordinary suite reaches neither.
-      const gate = createTaskGraph(graph, {}, [rootProject], ['test'], undefined, {});
-      expect(gate.dependencies[task(rootProject, 'test')]).toEqual(
-        expect.arrayContaining([task(rootProject, 'cargo-test'), device, hosted]),
-      );
-      expect(gate.dependencies[hosted]).toContain(device);
-      expect(gate.dependencies[device]).not.toContain(hosted);
-      expect(reached(gate.dependencies, device)).not.toContain(hosted);
-      expect(groupsReached(gate.dependencies, task(rootProject, 'cargo-test'))).toEqual([]);
+      // The task graph `nx run-many -t test` runs reaches neither group, from the root or from a member.
+      for (const project of [rootProject, 'cowshed']) {
+        const gate = createTaskGraph(graph, {}, [project], ['test'], undefined, {});
+        expect(groupsReached(gate.dependencies, task(project, 'test'))).toEqual([]);
+      }
 
-      // A member's gate reaches both groups too, and the order between them holds for it.
-      const member = createTaskGraph(graph, {}, ['cowshed'], ['test'], undefined, {});
-      expect(member.dependencies[task('cowshed', 'test')]).toEqual(
-        expect.arrayContaining([task('cowshed', 'cargo-test'), device, hosted]),
+      // A gate names the groups: the host group starts only once the device group is done, so two real-image
+      // runners never overlap, and the device group waits on no other group.
+      const named = createTaskGraph(
+        graph,
+        {},
+        [rootProject],
+        ['test', 'cargo-test-group-real-apfs', 'cargo-test-group-real-apfs-host'],
+        undefined,
+        {},
       );
-      expect(groupsReached(member.dependencies, task('cowshed', 'cargo-test'))).toEqual([]);
-      expect(member.dependencies[hosted]).toContain(device);
+      expect(named.dependencies[hosted]).toContain(device);
+      expect(groupsReached(named.dependencies, device)).toEqual([device]);
+      expect(groupsReached(named.dependencies, task(rootProject, 'test'))).toEqual([]);
     } finally {
       await workspace.cleanup();
     }

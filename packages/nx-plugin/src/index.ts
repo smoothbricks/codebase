@@ -1513,20 +1513,13 @@ async function createProjectTargets(
       workspaceRoot,
       cargoWorkspace,
     );
-    // A serial group's runner belongs to the workspace root, whichever project is asked to test. The
-    // ordinary `cargo-test` leaves the groups out; this project's `test`, the gate, reaches each one.
-    const serialGroupDependencies = cargoWorkspace.serialGroups.map((group) =>
-      cargoTargetDependency(projectName, {
-        projectName: cargoWorkspace.rootProjectName,
-        targetName: cargoTestGroupTargetName(group.group),
-      }),
-    );
+    // A serial group's runner belongs to the workspace root and is reached by nothing: it runs only as its own
+    // target, so a gate names it (tooling/land-host.sh), and only when its own inputs change does it run at all.
     if (!isCargoWorkspaceRoot) {
       targets[CARGO_TEST_TARGET] = {
         executor: 'nx:noop',
         cache: true,
         outputs: [],
-        // The crates this project owns, as ordinary pieces; the serial groups are reached from `test`.
         dependsOn: packageTargetNames,
       };
     }
@@ -1550,8 +1543,8 @@ async function createProjectTargets(
       targets.test = {
         executor: 'nx:noop',
         cache: true,
-        // The gate: the ordinary suite, then every serial group, which `cargo-test` leaves out.
-        dependsOn: [CARGO_TEST_TARGET, ...serialGroupDependencies],
+        // The gate: the ordinary suite. The serial groups are their own targets, which no target depends on.
+        dependsOn: [CARGO_TEST_TARGET],
       };
     }
     for (const name of [CARGO_TEST_TARGET, 'test']) {

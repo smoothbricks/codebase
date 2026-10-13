@@ -28,7 +28,17 @@ const repo = dirname(tooling);
 const bun = process.execPath;
 
 const TASK = 'cowshed:cargo-test-cowshed-core-shard1';
-const GATE = ['run-many', '-t', 'lint', 'test', 'build', '--nx-bail=false'];
+// The real-APFS groups are reached by no target, so the gate names them beside the aggregates.
+const GATE = [
+  'run-many',
+  '-t',
+  'lint',
+  'test',
+  'build',
+  'cargo-test-group-real-apfs',
+  'cargo-test-group-real-apfs-host',
+  '--nx-bail=false',
+];
 const TIMEOUT = 'cowshed-core apfs::tests::real_apfs_attach';
 /** The tasks Nx does not run behind the failed shard: the aggregate over the shards, and the `test` over it. */
 const BEHIND_TASKS = ['cowshed:cargo-test', 'cowshed:test'];
