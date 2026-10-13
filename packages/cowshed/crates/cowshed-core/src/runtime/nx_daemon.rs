@@ -249,11 +249,6 @@ fn read_daemon_stop_plan(record: &Path, ledger: &Path) -> io::Result<DaemonStopP
             reason: format!("process {pid} is not sandboxed, so it is not a job's daemon"),
         });
     }
-    eprintln!(
-        "cowshed: plan debug: ledger {} groups {:?}",
-        ledger.display(),
-        std::fs::read_to_string(ledger).unwrap_or_default()
-    );
     let Some(process) = super::job_groups::owned_process(ledger, pid).map_err(|error| {
         io::Error::new(
             error.kind(),

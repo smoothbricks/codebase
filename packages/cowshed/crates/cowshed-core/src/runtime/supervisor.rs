@@ -5495,10 +5495,6 @@ impl SupervisorActor {
             .child(crate::api::dto::RunSandboxMode::ReadWrite);
         let Some(project_root) = super::nx_daemon::kept_project(read_write).map(Path::to_path_buf)
         else {
-            eprintln!(
-                "cowshed: keeper debug: no kept project for {}",
-                self.workspace_root.display()
-            );
             // No Nx to keep: nothing for the supervisor to wait for.
             keeper.settled = true;
             return;
@@ -5516,10 +5512,6 @@ impl SupervisorActor {
             && let Some(pid) = super::nx_daemon::live_pid(&record)
             && let Ok(leader) = super::job_groups::GroupLeader::observe(pid as u32)
         {
-            eprintln!(
-                "cowshed: keeper debug: recorded daemon group for job {} pid {pid}",
-                job_id.get()
-            );
             keeper.daemon_group = Some((job_id, leader));
             daemon_group_changed = true;
         }
