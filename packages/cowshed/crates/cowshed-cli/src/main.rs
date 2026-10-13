@@ -7,7 +7,13 @@ use cowshed_cli::run::{Ending, run_interruptible};
 const INTERRUPTED_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
 fn main() {
-    // First, before the runtime starts any thread: this binary is also every workspace's warm
+    // First of all: invoked as `cargo`, this binary is the managed
+    // environment's jobserver launcher and nothing else.
+    if cowshed_cli::jobserver_launcher::invoked_as_cargo() {
+        let arguments: Vec<OsString> = std::env::args_os().skip(1).collect();
+        std::process::exit(cowshed_cli::jobserver_launcher::run(&arguments));
+    }
+    // Before the runtime starts any thread: this binary is also every workspace's warm
     // exec host, and in that role it never returns from here.
     if let Err(error) = cowshed_shell::dispatch() {
         eprintln!("cowshed: cannot locate this executable for warm workspace shells: {error}");

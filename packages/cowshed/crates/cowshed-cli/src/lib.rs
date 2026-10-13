@@ -8,6 +8,7 @@ pub mod disk_command;
 pub mod gateway_service;
 pub mod help;
 pub mod identity_service;
+pub mod jobserver_launcher;
 pub mod launchd;
 pub mod mount_main;
 pub mod output;
