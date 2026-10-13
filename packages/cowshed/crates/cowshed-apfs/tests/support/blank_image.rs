@@ -142,11 +142,15 @@ impl SharedImage {
     pub fn mount_at(&self, mount_point: &Path, options: &str) -> SharedMount {
         fs::create_dir_all(mount_point)
             .unwrap_or_else(|error| panic!("mount point {}: {error}", mount_point.display()));
-        let mounted = Command::new("/sbin/mount_apfs")
-            .args(["-o", options, &self.volume_device])
-            .arg(mount_point)
-            .output_locked()
-            .expect("run mount_apfs");
+        let mounted = disk_tool(
+            "/sbin/mount_apfs",
+            &[
+                "-o".as_ref(),
+                options.as_ref(),
+                self.volume_device.as_ref(),
+                mount_point.as_os_str(),
+            ],
+        );
         assert!(
             mounted.status.success(),
             "mount_apfs -o {options} {} {}: {}",
@@ -173,10 +177,7 @@ impl SharedMount {
 
 impl Drop for SharedMount {
     fn drop(&mut self) {
-        let unmounted = Command::new("/sbin/umount")
-            .arg(&self.mount_point)
-            .output_locked()
-            .expect("run umount");
+        let unmounted = disk_tool("/sbin/umount", &[self.mount_point.as_os_str()]);
         if !unmounted.status.success() {
             eprintln!(
                 "unmount shared fixture volume at {}: {}",
@@ -185,6 +186,16 @@ impl Drop for SharedMount {
             );
         }
     }
+}
+
+/// Run the disk tool `program args` as production runs one: under the host's disk-lifecycle
+/// lease, which also appends it to the run's disk command record, through the fork-safe launch.
+fn disk_tool(program: &str, args: &[&std::ffi::OsStr]) -> std::process::Output {
+    let program = Path::new(program);
+    cowshed_apfs::disk_lease::leased(program, args, || {
+        Command::new(program).args(args).output_locked()
+    })
+    .unwrap_or_else(|error| panic!("run {}: {error}", program.display()))
 }
 
 /// This lane run's pool directory: the root under which shared scenario images live, laid out
