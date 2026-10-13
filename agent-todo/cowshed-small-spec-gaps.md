@@ -47,12 +47,14 @@ done. They are independent of each other.
 
 ## envHash on job records and job spans
 
-- Spec: `specs/cowshed/11_shell.md:514-515` (`envHash` beside `grantRevision` on every job record) and
+- Spec: `specs/cowshed/11_shell.md:513-514` (`envHash` beside `grantRevision` on every job record) and
   `13_telemetry.md:32-33`, `:53` (`env_hash` on job spans).
-- Code: `ExecRecord.env_hash` exists in `crates/cowshed-core/src/api/dto.rs:2051`, but no record or span carries a
+- Code: `ExecRecord.env_hash` exists in `crates/cowshed-core/src/api/dto.rs:2085`, but no record or span carries a
   computed value; `crates/cowshed-core/src/runtime/job_spans.rs:8` says the supervisor does not compute it.
-- Work: hash the spawned job's environment once at spawn (`runtime/supervisor.rs:1268` `sandbox_environment` plus the
+- Work: hash the spawned job's environment once at spawn (`runtime/supervisor.rs:1323` `sandbox_environment` plus the
   request's env), store it in the protected record's admission batch and the terminal span row.
+- Algorithm gap: `specs/cowshed/11_shell.md:513-514` names the environment hash but defines neither its algorithm nor
+  its canonical byte encoding. Define that contract before adding the missing producer; do not invent a hash or zero.
 - Acceptance: two jobs with the same environment carry the same `envHash`; changing one variable changes it; the
   terminal span row and the record agree.
 
