@@ -87,7 +87,8 @@ fn enum_layout(variants: &[Variant], api: &Api, depth: usize) -> Option<Layout> 
     let count = u64::try_from(variants.len()).ok()?;
     let tag: u32 = match count {
         0 => return None,
-        1..=256 => 1,
+        1 => return fields_layout(&variants.first()?.fields, api, depth),
+        2..=256 => 1,
         257..=65_536 => 2,
         65_537..=4_294_967_296 => 4,
         _ => return None,

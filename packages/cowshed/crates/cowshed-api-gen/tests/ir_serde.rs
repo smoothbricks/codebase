@@ -119,7 +119,7 @@ fn native_copy_and_static_size_follow_the_source_graph() {
 }
 
 #[test]
-fn canonical_process_coverage_layouts_reuse_the_gap_discriminant_niche() {
+fn canonical_copy_enums_follow_tag_and_niche_layouts() {
     let manifest = std::env::var_os("CARGO_MANIFEST_DIR")
         .expect("cargo and nextest export the executing checkout's manifest path");
     let project = std::path::Path::new(&manifest).join("../..");
@@ -136,6 +136,7 @@ fn canonical_process_coverage_layouts_reuse_the_gap_discriminant_niche() {
             "{name}: tag and payload layout"
         );
     }
+    assert_eq!(model.api.records["Retry"].static_size, Some(0));
 }
 
 #[test]
