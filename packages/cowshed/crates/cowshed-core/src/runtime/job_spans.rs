@@ -591,6 +591,7 @@ mod tests {
             ppid: 1,
             program: "/bin/cat".to_owned(),
             argv: vec![CommandArg::from("/bin/cat")],
+            truncated: false,
             born_at: UtcTimestamp::new("2026-10-12T00:00:00Z").unwrap(),
             usage: None,
             blocked_on: None,

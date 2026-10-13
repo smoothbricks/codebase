@@ -42,7 +42,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::process::ExitStatusExt;
 use std::time::Instant;
 
-use crate::api::dto::{CommandArg, JobId, UtcTimestamp};
+use crate::api::dto::{JobId, UtcTimestamp};
 use crate::api::process::{JobProcessEvent, JobProcessTree, ProcessCoverageGap};
 use crate::error::CowshedError;
 use crate::runtime::job_groups::{ProcessRecord, process_record};

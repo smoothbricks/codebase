@@ -23,8 +23,10 @@ exact declaration is [Process-tree spans](../../../specs/cowshed/13_telemetry.md
 The source-owned Arrow column generator emits each fixed enum dictionary as `<FIELD>_NAMES` and uses that same constant
 for encoding and decoding. Enum names and their order remain those declared on the owning record.
 
-Rows record state/blocker changes, RSS 2× steps, and busy/idle transitions, plus a coarse heartbeat per progress tick.
-Only changed columns are set; the terminal row carries final usage. Host start/end load and cores and the signed
+Rows record state/blocker changes, RSS 2× steps, and busy/idle transitions, plus one heartbeat a minute per unchanged
+live process, independently of the subscriber interval. Only changed columns are set; the terminal row carries final
+usage exactly once. Observed argv is bounded to 128 KiB per argument and 1 MiB in total; the typed process record keeps
+its observed `truncated` flag through span projection. Host start/end load and cores and the signed
 workspace/build-volume deltas stay on the job span. There are no JSON string columns or new columns per process, metric,
 or sample. Missing blocker evidence is not a claim that a process is unblocked.
 

@@ -1011,6 +1011,7 @@ fn process_observations() -> BTreeMap<&'static str, BTreeMap<&'static str, Value
         ppid: 4200,
         program: "cargo".into(),
         argv: vec![CommandArg::from("cargo")],
+        truncated: false,
         born_at: timestamp(),
         usage: None,
         blocked_on: None,
