@@ -5018,6 +5018,36 @@ fn accounted_us(sample: &cowshed_core::api::JobResourceSample) -> u64 {
     }
 }
 
+/// The CPU share `read` may state over the window the supervisor boundary `opened` opened: the
+/// CPU the job spent between the two samples over the wall time between them, as 07_api.md
+/// defines `cpuPct`. Each sample truncates its own wall time to a whole microsecond, so the
+/// window the supervisor measured is their difference or one microsecond shorter.
+#[cfg(target_os = "macos")]
+fn window_shares(
+    opened: &cowshed_core::api::JobResourceSample,
+    read: &cowshed_core::api::JobResourceSample,
+) -> [f64; 2] {
+    let micros = |value: u64| f64::from(u32::try_from(value).expect("a test's microseconds"));
+    let spent = micros(accounted_us(read) - accounted_us(opened));
+    let wall = read.wall_us.get() - opened.wall_us.get();
+    [wall, wall - 1].map(|wall| spent * 100.0 / micros(wall))
+}
+
+/// The job's latest sample, without taking one: a supervisor boundary's, unless a read since
+/// replaced it.
+#[cfg(target_os = "macos")]
+async fn latest(
+    handle: &WorkspaceSupervisorHandle,
+    job_id: JobId,
+) -> cowshed_core::api::JobResourceSample {
+    handle
+        .info(job_id)
+        .await
+        .unwrap()
+        .resources
+        .expect("a job that owns a process has a sample")
+}
+
 /// Two children burn CPU at once and are reaped before any sample: the group the sample reads is
 /// the leader alone, whose own CPU holds none of theirs. The job's totals hold both, once, live
 /// and in the sealed sample.
@@ -5176,14 +5206,16 @@ async fn an_activation_and_its_command_each_count_once() {
     reap(command);
 }
 
-/// A command line that spins for `seconds` of its own CPU in the very process it runs in,
-/// reporting `spinning <pid>` as it starts and `burned <us>` once done, then waits for a line.
+/// A command line that reports `spinning <pid>` as it starts and holds until a line arrives on
+/// its stdin, then spins for `seconds` of its own CPU in the very process it runs in, reports
+/// `burned <us>` once done, and waits for another line.
 #[cfg(target_os = "macos")]
 fn spinner(seconds: f64) -> String {
     format!(
         "python3 -c 'import os, resource, sys\n\
          def used():\n    u = resource.getrusage(resource.RUSAGE_SELF)\n    return u.ru_utime + u.ru_stime\n\
          print(\"spinning\", os.getpid(), flush=True)\n\
+         sys.stdin.readline()\n\
          x = 0\n\
          while used() < {seconds}:\n    for _ in range(10000):\n        x += 1\n\
          print(\"burned\", int(used() * 1e6), flush=True)\n\
@@ -5220,15 +5252,22 @@ fn spinning(leader: &mut Scripted) -> u32 {
         .unwrap()
 }
 
-/// A job whose leader keeps one core busy reads about one core's share over the supervisor's
-/// window -- opened by its sampling clock, not by the read -- and names that leader its leaf
-/// from the processes it observed. Once the leader idles, its share falls to nothing while its
-/// accounted CPU keeps what it burned.
+/// A job whose leader burns CPU reads that CPU's share over the supervisor's window -- opened by
+/// its own boundary, not by a read -- and names that leader its leaf from the processes it
+/// observed. Once the leader idles, one tick of the sampling clock opens a window after the burn,
+/// while the accounted CPU keeps what it burned.
+///
+/// The share is compared with the job's own CPU delta and wall time between the boundary and the
+/// read, never with a presumed share of a loaded host (08_testing.md, "Job CPU sampling"): the
+/// paused Tokio clock moves the supervisor's boundaries only when the test advances it, while
+/// rusage and monotonic wall time stay real. The test reads the spinner's lines blocking the
+/// runtime the supervisor's actor runs on, so no boundary falls between its own steps.
 #[cfg(target_os = "macos")]
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_busy_job_reads_its_measured_cpu_share_and_its_busy_leader_as_leaf() {
+    let period = Duration::from_millis(400);
     let (mut supervisor_config, _root) = isolated_config("cpu-busy");
-    supervisor_config.job_sampling.cpu_sample_period = Duration::from_millis(400);
+    supervisor_config.job_sampling.cpu_sample_period = period;
     let mut harness = warm_harness(supervisor_config);
     let (handle, spawned) = (harness.handle.clone(), &mut harness.spawned);
     let job_id = handle
@@ -5236,7 +5275,7 @@ async fn a_busy_job_reads_its_measured_cpu_share_and_its_busy_leader_as_leaf() {
         .await
         .unwrap();
     let job = spawned.recv().await.unwrap();
-    let mut leader = Scripted::start(&format!("exec {}", spinner(3.0)));
+    let mut leader = Scripted::start(&format!("exec {}", spinner(BURN_SECONDS)));
     let pid = spinning(&mut leader);
     assert_eq!(pid, leader.child.id(), "the spinner is the leader itself");
     deliver(
@@ -5249,18 +5288,25 @@ async fn a_busy_job_reads_its_measured_cpu_share_and_its_busy_leader_as_leaf() {
         0,
     )
     .await;
-    // The clock ticks every 400 ms from ownership: a read at one second lies mid-window.
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    // No read has been taken: the latest sample is the boundary that opened the window.
+    let opened = latest(&handle, job_id).await;
+    assert!(
+        accounted_us(&opened) < SLACK_US,
+        "the window opened at the leader's start, before its burn: {opened:?}"
+    );
+    leader.send("burn");
+    let burned = leader.burned();
     let busy = handle.resources(job_id).await.unwrap();
     assert!(busy.consistent(), "{busy:?}");
     assert!(
-        (50.0..=150.0).contains(&busy.cpu_pct.get()),
-        "one busy core reads about 100 %: {}",
-        busy.cpu_pct.get()
+        window_shares(&opened, &busy).contains(&busy.cpu_pct.get()),
+        "the share is the window's CPU over its wall time: {:?} of {opened:?} and {busy:?}",
+        window_shares(&opened, &busy)
     );
+    let accounted = accounted_us(&busy);
     assert!(
-        busy.cpu_user_ms.get() + busy.cpu_sys_ms.get() >= 500,
-        "about a second of the leader's CPU is accounted: {busy:?}"
+        (burned..burned + SLACK_US).contains(&accounted),
+        "the job's {accounted} us hold the {burned} us its leader burned"
     );
     let JobLeafAttribution::Attributed {
         leaf,
@@ -5283,14 +5329,31 @@ async fn a_busy_job_reads_its_measured_cpu_share_and_its_busy_leader_as_leaf() {
         "a polled census never claims the whole tree"
     );
 
-    let burned = leader.burned();
-    // Idle now, waiting for its line: the windows after the burn hold almost no CPU.
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    let again = handle.resources(job_id).await.unwrap();
+    assert!(
+        window_shares(&opened, &again).contains(&again.cpu_pct.get()),
+        "a second read measures from the same window: {:?} of {opened:?} and {again:?}",
+        window_shares(&opened, &again)
+    );
+
+    // Idle now, waiting for its line: one tick of the clock closes the burn into its window. The
+    // paused clock moves only once both tasks wait on it, to each deadline in turn: the actor
+    // takes the tick alone, a millisecond (the timer's resolution) before the test wakes.
+    tokio::time::sleep(period + Duration::from_millis(1)).await;
+    let ticked = latest(&handle, job_id).await;
+    assert!(
+        ticked.wall_us > again.wall_us,
+        "the clock's tick took a boundary after the reads: {ticked:?}"
+    );
+    assert!(
+        accounted_us(&ticked) >= burned,
+        "the burn lies before the window the tick opened: {ticked:?}"
+    );
     let idle = handle.resources(job_id).await.unwrap();
     assert!(
-        idle.cpu_pct.get() < 10.0,
-        "an idle leader reads no share: {}",
-        idle.cpu_pct.get()
+        window_shares(&ticked, &idle).contains(&idle.cpu_pct.get()),
+        "the idle share is the new window's: {:?} of {ticked:?} and {idle:?}",
+        window_shares(&ticked, &idle)
     );
     let accounted = accounted_us(&idle);
     assert!(
