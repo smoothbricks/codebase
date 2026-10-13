@@ -25,8 +25,8 @@ No mounts, no root, no network — pure functions with table-driven cases:
 - **Raw Git preservation**: independent real-repository witnesses cover top-level byte drift, submodule bytes and HEAD
   drift, and copy-only paths. Each witness proves configured filters would run under ordinary Git but never during
   capture or copy verification, verifies restored bytes again, and checks both repositories' config/index bytes remain
-  unchanged. These cases keep their ordinary 30s per-test bound; they are not one aggregate of hundreds of serial Git
-  probes.
+  unchanged. Each is an ordinary test that finishes well inside the ordinary 30s slow warning, so the run's progress
+  bound sees it finish; they are not one aggregate of hundreds of serial Git probes.
 - **Grant files**: schema round-trip, revision monotonicity, delta application, wildcard egress matching
   (`*.github.com`), port defaults.
 - **Marker files**: round-trip, unknown-version rejection, role transitions (fork/restore).
