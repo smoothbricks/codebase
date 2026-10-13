@@ -101,7 +101,11 @@ const rootScriptPolicy: Record<string, string> = {
   // every repo alongside the managed devenv profile it activates, so the fleet
   // rule that devenv equals CI holds for the cross arm too.
   [CROSS_CHECK_SCRIPT_NAME]: CROSS_CHECK_SCRIPT_COMMAND,
-  clean: 'nx run-many -t clean; nx reset',
+  // Each project's `clean` target removes only that project's declared outputs (clean-outputs executor). It never
+  // runs `nx reset`: that deletes the cache and the task database that indexes it, which in a cowshed checkout is
+  // the build volume every fork inherits and every land carries (specs/cowshed/16_build_volumes.md). Nx's own
+  // eviction (`NX_MAX_CACHE_SIZE`) bounds the cache.
+  clean: 'nx run-many -t clean',
   'clean:node_modules': 'rm -rf node_modules && find e* t* p* -type d -name node_modules -print0 | xargs -0 rm -rvf',
   'format:changed': 'git-format-staged --config tooling/git-hooks/git-format-staged.yml --also-unstaged',
   'format:staged': 'git-format-staged --config tooling/git-hooks/git-format-staged.yml',
