@@ -3036,14 +3036,6 @@ fn verified_recovery_facts<'a>(
         .collect()
 }
 
-/// The two heads a land's build-volume steps are keyed on: the target's head before the land, and
-/// the head it landed. `previous_head` is absent for a first land.
-#[cfg(target_os = "macos")]
-struct LandOutputRange<'a> {
-    previous_head: Option<&'a GitOid>,
-    landed_head: &'a GitOid,
-}
-
 #[cfg(target_os = "macos")]
 impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
     #[allow(
@@ -4460,10 +4452,6 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         retire: bool,
         carry_stopped: Option<String>,
     ) -> Result<crate::api::dto::LandBuildVolume> {
-        let LandOutputRange {
-            previous_head,
-            landed_head,
-        } = heads;
         use crate::api::dto::{Adoption, AdoptionSkip, LandBuildVolume, LandSeed};
         let volumes = self.build_volumes()?;
         let skipped = |reason| LandBuildVolume {

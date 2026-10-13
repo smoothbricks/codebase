@@ -564,10 +564,10 @@ its images attached until the next run's sweep (01a_apfs.md, "How the APFS host 
 The genuine-Nx CLI fixtures use the normal enabled daemon (16_build_volumes.md, "The Nx daemon stays on"). Both halves
 of the declared-versus-undeclared output witness require a seeded, actually adopted build volume through the typed land
 report and assert its step-7 check exactly (16_build_volumes.md, Land step 7): the declared half hits all three Nx tasks
-with no miss, unattributed or failed check; the undeclared half hits two, misses only `a:test`, whose test check fails
-in the target because `a:build`'s hit restored no undeclared output, and seals that miss as its one `landAdoption`
-commitment. An empty findings list alone is not evidence that a declared output restored and hit: a busy-volume skip, an
-unattributed run summary or a failed check leaves it empty too.
+with no miss, unattributed or failed check; the undeclared half hits two and misses only `a:test` because restoring
+`a:build` supplies no undeclared output, so `a:test`'s recomputed hash differs. No test runs in the target, and that miss
+is sealed as its one `landAdoption` commitment. An empty findings list alone is not evidence that a declared output
+restored and hit: a busy-volume skip, an unattributed run summary or a failed check leaves it empty too.
 
 **Host limit.** The host's disk-image attach pool runs out (01a_apfs.md, "How the APFS host degrades" §2), and the suite
 stops spending into a spent one. The harness owns a lane-wide fixture pool

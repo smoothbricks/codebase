@@ -19,9 +19,9 @@
 //! used while its supervisor runs a job or holds a session, while a process other than the daemon
 //! holds one of its Nx task databases open (a host shell's run), and for [`IDLE`] after a daemon
 //! comes up. Once none of that has happened for [`IDLE`] the keeper stops the daemon, as
-//! `nx daemon --stop` does, and starts none until the shed is used again. The keeper is no job
-//! between its probes, and the supervisor does not retire until its keeper holds no daemon, so a
-//! daemon never outlives the supervisor that watches it.
+//! `nx daemon --stop` does, and starts none until the shed is used again. Its foreground daemon
+//! is one admitted maintenance job, excluded from developer activity. Quiescence and retirement
+//! stop and wait for that job; the supervisor also releases any daemon its keeper watched.
 
 use std::collections::HashMap;
 use std::io;
@@ -238,7 +238,7 @@ fn read_daemon_stop_plan(record: &Path, ledger: &Path) -> io::Result<DaemonStopP
     }
     // A job's daemon runs inside its sandbox. Unsandboxed is refused here, but a sandboxed pid
     // still needs the ledger's proof: this guard only refuses, it never grants.
-    if !crate::process::sandboxed(pid).map_err(|error| {
+    if !cowshed_os::process::sandboxed(pid).map_err(|error| {
         io::Error::new(
             error.kind(),
             format!("cannot inspect sandbox of process {pid}: {error}"),
@@ -344,9 +344,8 @@ pub(crate) fn start_request(workspace_root: &Path, project_root: &Path) -> Resul
     };
     Ok(ExecRequest {
         command: ExecCommand::Argv(vec![
-            CommandArg::new(project_root.join("node_modules/.bin/nx")),
-            CommandArg::from("daemon"),
-            CommandArg::from("--start"),
+            CommandArg::from("node"),
+            CommandArg::new(project_root.join("node_modules/nx/dist/src/daemon/server/start.js")),
         ]),
         cwd,
         mode: RunSandboxMode::ReadWrite,
@@ -398,7 +397,7 @@ pub(crate) fn report_start(
 #[derive(Debug)]
 pub(crate) struct NxDaemonKeeper {
     probes: Interval,
-    /// The start job submitted last, until a probe sees it ended.
+    /// The foreground daemon job admitted last, retained until a probe sees its terminal result.
     pub(super) starting: Option<JobId>,
     /// The last probe that found the shed in use, or a daemon newly up.
     last_use: Instant,
@@ -410,13 +409,7 @@ pub(crate) struct NxDaemonKeeper {
     /// Whether the last probe found the shed unused for [`IDLE`] and no daemon live: nothing is
     /// left for the supervisor to wait for.
     pub(super) settled: bool,
-    /// The daemon this keeper's start job left live, as the group it leads: recorded in the job
-    /// group ledger under the start job's id, so a land can prove the daemon is the supervisor's
-    /// own and stop it. A daemon the keeper did not start is never recorded.
-    pub(super) daemon_group: Option<(JobId, super::job_groups::GroupLeader)>,
-    /// The last start job this keeper admitted, until its daemon's group is recorded above: a
-    /// probe can see the job ended before the daemon answers, so the recording retries.
-    pub(super) daemon_job: Option<JobId>,
+    // Process ownership belongs only to the admitted job's birth and ledger, never an Nx record.
 }
 
 /// What a probe decides about the daemon of a shed.
@@ -446,8 +439,6 @@ impl NxDaemonKeeper {
                     daemon_was_live: false,
                     last_look: None,
                     settled: false,
-                    daemon_group: None,
-                    daemon_job: None,
                 })
             }
         }
@@ -689,6 +680,7 @@ mod tests {
     use std::os::unix::net::UnixListener;
 
     use super::*;
+    use cowshed_os::fork_lock::Run as _;
 
     fn write_record(record: &Path, pid: u32, socket: &Path) {
         std::fs::write(
@@ -834,7 +826,7 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     fn sleeper() -> std::process::Child {
-        use crate::fork_lock::Spawn as _;
+        use cowshed_os::fork_lock::Spawn as _;
         std::process::Command::new("/bin/sleep")
             .arg("300")
             .spawn_locked()
@@ -870,7 +862,7 @@ mod tests {
     /// A sleeping process that leads its own group, as a job's leader does.
     #[cfg(target_os = "macos")]
     fn group_sleeper() -> std::process::Child {
-        use crate::fork_lock::Spawn as _;
+        use cowshed_os::fork_lock::Spawn as _;
         use std::os::unix::process::CommandExt as _;
         std::process::Command::new("/bin/sleep")
             .arg("300")
@@ -893,7 +885,7 @@ mod tests {
     /// ledger observes is the one the process keeps, and `sandboxed` reads the profile it runs under.
     #[cfg(target_os = "macos")]
     fn sandboxed_group_leader() -> std::process::Child {
-        use crate::fork_lock::Spawn as _;
+        use cowshed_os::fork_lock::Spawn as _;
         use std::io::BufRead as _;
         use std::os::unix::process::CommandExt as _;
         let mut child = std::process::Command::new("/usr/bin/sandbox-exec")
@@ -922,7 +914,10 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn a_daemon_the_ledger_proves_is_owned_and_stopped_through_its_watch() {
-        let scratch = crate::temp_root::TempRoot::new("nx-daemon-owned-stop");
+        let scratch = crate::temp_root::TempRoot::new_in(
+            &crate::temp_parent::canonical_parent(),
+            "nx-daemon-owned-stop",
+        );
         let mut child = sandboxed_group_leader();
         let pid = i32::try_from(child.id()).unwrap();
         let ledger = ledger_naming(&scratch, &child);
@@ -951,7 +946,10 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn a_fresh_forged_record_naming_a_process_the_ledger_does_not_prove_is_unproven() {
-        let scratch = crate::temp_root::TempRoot::new("nx-daemon-forged");
+        let scratch = crate::temp_root::TempRoot::new_in(
+            &crate::temp_parent::canonical_parent(),
+            "nx-daemon-forged",
+        );
         let mut foreign = sandboxed_group_leader();
         let ledger = scratch.join("supervisor.groups");
         super::super::job_groups::record(&ledger, &[], &[]).unwrap();
@@ -982,7 +980,10 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn a_record_rewritten_to_a_foreign_pid_after_the_plan_cannot_redirect_the_stop() {
-        let scratch = crate::temp_root::TempRoot::new("nx-daemon-race");
+        let scratch = crate::temp_root::TempRoot::new_in(
+            &crate::temp_parent::canonical_parent(),
+            "nx-daemon-race",
+        );
         let mut owned = sandboxed_group_leader();
         let owned_pid = i32::try_from(owned.id()).unwrap();
         let ledger = ledger_naming(&scratch, &owned);
@@ -1030,7 +1031,10 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn a_record_older_than_its_process_is_unproven_even_when_the_ledger_proves_it() {
-        let scratch = crate::temp_root::TempRoot::new("nx-daemon-stale");
+        let scratch = crate::temp_root::TempRoot::new_in(
+            &crate::temp_parent::canonical_parent(),
+            "nx-daemon-stale",
+        );
         let mut child = group_sleeper();
         let ledger = ledger_naming(&scratch, &child);
         let record = scratch.join("server-process.json");
@@ -1058,7 +1062,10 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn a_reaped_leader_proves_nothing_and_its_record_names_nothing() {
-        let scratch = crate::temp_root::TempRoot::new("nx-daemon-reaped");
+        let scratch = crate::temp_root::TempRoot::new_in(
+            &crate::temp_parent::canonical_parent(),
+            "nx-daemon-reaped",
+        );
         let mut child = group_sleeper();
         let pid = i32::try_from(child.id()).unwrap();
         let ledger = ledger_naming(&scratch, &child);
@@ -1083,10 +1090,13 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn a_reaped_leader_with_a_live_member_leaves_the_group_unproven() {
-        use crate::fork_lock::Spawn as _;
+        use cowshed_os::fork_lock::Spawn as _;
         use std::io::BufRead as _;
         use std::os::unix::process::CommandExt as _;
-        let scratch = crate::temp_root::TempRoot::new("nx-daemon-survivor");
+        let scratch = crate::temp_root::TempRoot::new_in(
+            &crate::temp_parent::canonical_parent(),
+            "nx-daemon-survivor",
+        );
         let mut leader = std::process::Command::new("/bin/sh")
             .args(["-c", "sleep 300 & echo READY; exit 0"])
             .stdout(std::process::Stdio::piped())
@@ -1124,7 +1134,10 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn absent_and_malformed_records_are_scoped_and_never_guessed() {
-        let scratch = crate::temp_root::TempRoot::new("nx-daemon-scoped");
+        let scratch = crate::temp_root::TempRoot::new_in(
+            &crate::temp_parent::canonical_parent(),
+            "nx-daemon-scoped",
+        );
         let ledger = scratch.join("absent.groups");
         assert!(matches!(
             prepare_daemon_stop(&scratch.join("absent.json"), &ledger).unwrap(),
@@ -1151,7 +1164,10 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn unreadable_and_malformed_records_and_ledgers_are_typed_adoption_skips() {
-        let scratch = crate::temp_root::TempRoot::new("nx-daemon-unverifiable");
+        let scratch = crate::temp_root::TempRoot::new_in(
+            &crate::temp_parent::canonical_parent(),
+            "nx-daemon-unverifiable",
+        );
         let record = scratch.join("server-process.json");
         let ledger = scratch.join("supervisor.groups");
         let mut child = sandboxed_group_leader();
@@ -1210,10 +1226,13 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn an_exec_after_the_plan_refuses_the_stale_identity_and_reports_no_delivered_signal() {
-        use crate::fork_lock::Spawn as _;
+        use cowshed_os::fork_lock::Spawn as _;
         use std::io::{BufRead as _, Write as _};
         use std::os::unix::process::CommandExt as _;
-        let scratch = crate::temp_root::TempRoot::new("nx-daemon-exec-identity");
+        let scratch = crate::temp_root::TempRoot::new_in(
+            &crate::temp_parent::canonical_parent(),
+            "nx-daemon-exec-identity",
+        );
         let mut child = std::process::Command::new("/usr/bin/sandbox-exec")
             .args([
                 "-p",
@@ -1272,8 +1291,8 @@ mod lifecycle_authority_tests {
     use std::os::unix::process::CommandExt as _;
 
     use super::*;
-    use crate::fork_lock::{Run as _, RunAsync, Spawn as _};
     use crate::runtime::job_groups::{GroupLeader, record};
+    use cowshed_os::fork_lock::{Run as _, RunAsync, Spawn as _};
 
     const SELF_ONLY: &str = "(version 1)(allow default)(deny signal (target others))";
 
@@ -1324,7 +1343,10 @@ mod lifecycle_authority_tests {
 
     #[tokio::test]
     async fn an_owned_daemon_refuses_a_sandboxed_signal_and_a_failed_cleanup_never_aborts() {
-        let scratch = crate::temp_root::TempRoot::new("nx-daemon-owned-stop");
+        let scratch = crate::temp_root::TempRoot::new_in(
+            &crate::temp_parent::canonical_parent(),
+            "nx-daemon-owned-stop",
+        );
         let mut child = sandboxed_sleeper();
         let pid = child.id();
         let ledger = ledger_for(&scratch, &child);
@@ -1372,7 +1394,10 @@ mod lifecycle_authority_tests {
 
     #[test]
     fn a_record_naming_a_process_the_ledger_does_not_own_signals_nothing() {
-        let scratch = crate::temp_root::TempRoot::new("nx-daemon-forged-nominee");
+        let scratch = crate::temp_root::TempRoot::new_in(
+            &crate::temp_parent::canonical_parent(),
+            "nx-daemon-forged-nominee",
+        );
         let mut foreign = sandboxed_sleeper();
         let ledger = scratch.join("supervisor.groups");
         record(&ledger, &[], &[]).expect("an empty ledger");
@@ -1478,7 +1503,10 @@ mod lifecycle_authority_tests {
     #[tokio::test]
     async fn the_real_nx_daemon_is_stopped_only_through_the_ledger_proven_identity() {
         let (nx, node) = declared_nx();
-        let scratch = crate::temp_root::TempRoot::new("nx-daemon-real-authority");
+        let scratch = crate::temp_root::TempRoot::new_in(
+            &crate::temp_parent::canonical_parent(),
+            "nx-daemon-real-authority",
+        );
         let root = scratch.join("workspace");
         std::fs::create_dir_all(&root).expect("workspace");
         std::fs::write(

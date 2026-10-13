@@ -6257,9 +6257,10 @@ fn nx_project(name: &str) -> (WorkspaceSupervisorConfig, TempRoot) {
 /// The argv that starts the daemon of the Nx project at `project`: the project's own `nx`.
 fn nx_daemon_start(project: &Path) -> Vec<OsString> {
     vec![
-        project.join("node_modules/.bin/nx").into_os_string(),
-        OsString::from("daemon"),
-        OsString::from("--start"),
+        OsString::from("node"),
+        project
+            .join("node_modules/nx/dist/src/daemon/server/start.js")
+            .into_os_string(),
     ]
 }
 
@@ -6337,6 +6338,41 @@ async fn a_shed_keeps_its_nx_daemon_inside_the_sandbox() {
     complete(&second, b"", b"", ExitStatus::Exited { code: 0 }).await;
     h.handle.wait(second.request.job_id).await.unwrap();
     std::fs::remove_dir_all(sockets).unwrap();
+}
+
+/// A foreground keeper is an ordinary owned job for draining, not developer activity. Even before
+/// its socket is ready, quiescing an otherwise idle workspace stops that exact job and waits for it.
+#[tokio::test(start_paused = true)]
+async fn a_foreground_nx_keeper_does_not_count_as_user_work_and_quiescence_drains_it() {
+    let (config, _root) = nx_project("foreground");
+    let mut h = harness_with_config(config, 1, 1024, false, false);
+    let keeper = h.spawned.recv().await.expect("the foreground keeper job");
+    assert_eq!(
+        h.process.recv().await.unwrap(),
+        ProcessObservation::StdinClosed(keeper.request.job_id),
+        "empty stdin closes before lifecycle signalling"
+    );
+    assert!(
+        !h.handle.active().await.unwrap(),
+        "maintenance is not user activity"
+    );
+    let handle = h.handle.clone();
+    let quiesce = tokio::spawn(async move { handle.quiesce_if_idle().await });
+    assert_eq!(
+        h.process.recv().await.unwrap(),
+        ProcessObservation::Signal(keeper.request.job_id, ProcessSignal::Term)
+    );
+    assert!(
+        !quiesce.is_finished(),
+        "quiescence waits for the real keeper conclusion"
+    );
+    complete(&keeper, b"", b"", ExitStatus::Exited { code: 0 }).await;
+    quiesce.await.unwrap().unwrap();
+    assert!(
+        h.spawned.try_recv().is_err(),
+        "quiescence admits no replacement keeper"
+    );
+    h.handle.retire().await.unwrap();
 }
 
 /// How long a shed must go unused before its keeper stops the daemon it keeps.

@@ -901,7 +901,27 @@ Native APFS fixtures install this same pinned package and patch offline into the
 cache, and report each installation's elapsed time. They do not borrow another checkout's `node_modules`: a patched
 package's dependency links can traverse lexical `.bun` symlinks outside an explicit sandbox read grant even when the
 resolved payload is granted. The workspace's own read authority covers those local links; only shared dependency
-payloads receive additional bounded store grants. Installation runs once per suite template, which fixtures clone.
+payloads receive additional bounded store grants. Grants are derived from the fixture's installed package namespace, not
+the repository's different private patched namespace. Installation runs once per suite template, which fixtures clone.
+Installer-restoration witnesses clone that real installed product into `packages/nx` of a distinct private developer
+checkout, outside every consumer `node_modules`. Its root declares `workspaces: ["packages/nx"]` and the dependency
+`nx: "workspace:*"`, following the ordinary in-repo workspace binding pattern. Pinned offline Bun produces that root's
+lock and production namespace; no hand-made self alias substitutes for the install. The unchanged Nx CLI's global
+resolution must resolve `nx/bin/nx.js` from that producer-owned checkout, not from `/private/tmp`. Ordinary pinned Bun
+first generates this package's own lock offline with the existing `--lockfile-only` producer, then installs its
+manifest-owned production dependencies offline into its own `node_modules`, without changing its manifest or maintained
+program bytes. The fixture records the actual install, lock and product digests. The process launcher keeps `PWD` equal
+to its actual `current_dir`, as the supervisor launcher does; the fixture observes Bun's real root before installation
+and requires the lock at that root. Production mode implies a frozen lock and does not write a missing one, so a
+production-only run is not lock-production evidence. Private lexical dependency aliases therefore stay inside the owned
+developer checkout; reached namespaces and canonical shared targets use the same single closure traversal, bounded by
+the exact caller-owned developer checkout and the actual shared store. Only reached package and namespace paths become
+grants, never the whole checkout or `.bun` root. Traversal deduplicates exact package identities, not read-grant
+prefixes: a covered local `@nx` scope can still contain a binding to the pinned native platform package in the shared
+store. A normal Bun store entry is never presented as a developer binding. Local file providers are checkout-relative
+directories that travel with the clone.
+Foreign-daemon retirement witnesses retain the daemon's own standalone root, state and short socket throughout the
+landing; its actual produced record is only a nomination, and its owner performs cleanup after the identity proof.
 
 The Nx patch repairs upstream Nx runtime behavior, separately from this plugin's workspace-owner checks:
 

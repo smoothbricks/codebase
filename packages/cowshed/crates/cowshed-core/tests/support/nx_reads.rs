@@ -13,12 +13,19 @@ struct InstalledPackageIdentity {
 /// Bun keeps patched packages in this checkout's `.bun` tree and shares eligible dependencies
 /// through its global store; neither layout requires a generated release closure.
 pub(crate) fn nx_read_paths(nx: &Path) -> Vec<PathBuf> {
-    // The namespace is the `.bun` directory above the checkout's own canonical Nx.
-    let local = nx
-        .ancestors()
-        .find(|ancestor| ancestor.file_name() == Some(std::ffi::OsStr::new(".bun")))
-        .expect("Nx must sit in its checkout's Bun install namespace")
-        .to_path_buf();
+    installed_nx_read_paths(nx, None)
+}
+
+/// One installed-package closure traversal; a genuine sibling also needs its private namespaces.
+pub(crate) fn installed_nx_read_paths(nx: &Path, owned_checkout: Option<&Path>) -> Vec<PathBuf> {
+    // The caller names the exact owned developer checkout, never a shared ancestor. A consumer's
+    // registry Nx sits in its enclosing .bun namespace. Both use this one bounded traversal.
+    let local = owned_checkout.map(Path::to_path_buf).unwrap_or_else(|| {
+        nx.ancestors()
+            .find(|ancestor| ancestor.file_name() == Some(std::ffi::OsStr::new(".bun")))
+            .expect("consumer Nx must sit in its checkout's Bun install namespace")
+            .to_path_buf()
+    });
     let store = std::env::var_os("BUN_INSTALL_CACHE_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
@@ -35,8 +42,13 @@ pub(crate) fn nx_read_paths(nx: &Path) -> Vec<PathBuf> {
     );
     let mut reads = std::collections::BTreeSet::from([nx.to_path_buf()]);
     let mut namespaces = std::collections::BTreeSet::new();
+    let mut bindings = std::collections::BTreeSet::new();
     let mut binaries = Vec::new();
-    let mut pending = vec![nx.parent().expect("Nx package namespace").to_path_buf()];
+    let mut pending = if owned_checkout.is_some() {
+        vec![nx.join("node_modules"), local.join("node_modules")]
+    } else {
+        vec![nx.parent().expect("Nx package namespace").to_path_buf()]
+    };
     while let Some(namespace) = pending.pop() {
         assert!(
             installed(&namespace),
@@ -49,6 +61,10 @@ pub(crate) fn nx_read_paths(nx: &Path) -> Vec<PathBuf> {
         while let Some(group) = groups.pop() {
             for entry in fs::read_dir(&group).expect("installed dependency namespace") {
                 let entry = entry.expect("dependency namespace entry");
+                let name = entry.file_name();
+                if name.as_encoded_bytes().starts_with(b".") && name != ".bin" {
+                    continue; // Bun installer bookkeeping is not a logical package binding.
+                }
                 let target = entry
                     .path()
                     .canonicalize()
@@ -57,14 +73,15 @@ pub(crate) fn nx_read_paths(nx: &Path) -> Vec<PathBuf> {
                     binaries.push(target);
                     continue;
                 }
-                if reads.iter().any(|package| target.starts_with(package)) {
-                    continue;
-                }
-                let name = entry.file_name();
                 if (name.to_string_lossy().starts_with('@') || name == ".bin")
                     && entry.file_type().expect("namespace entry kind").is_dir()
                 {
                     groups.push(entry.path());
+                    continue;
+                }
+                // Authority coverage is not traversal coverage: a local scoped namespace can
+                // still bind a native package in the shared store. Deduplicate exact products.
+                if reads.contains(&target) {
                     continue;
                 }
                 assert!(
@@ -82,6 +99,23 @@ pub(crate) fn nx_read_paths(nx: &Path) -> Vec<PathBuf> {
                         && !identity.version.is_empty(),
                     "dependency binding does not match its installed package identity"
                 );
+                // Keep the reachable lexical binding too: a private .bun alias is part of
+                // resolving the shared package, even though its physical bytes lie in the store.
+                if entry
+                    .file_type()
+                    .expect("namespace entry kind")
+                    .is_symlink()
+                {
+                    let text = fs::read_link(entry.path()).expect("dependency link text");
+                    let binding = cowshed_core::inherited_links::resolve_in_source(
+                        &group,
+                        Path::new(""),
+                        &text,
+                    );
+                    if binding.starts_with(&local) {
+                        bindings.insert(binding.parent().expect("dependency namespace").to_owned());
+                    }
+                }
                 reads.insert(target.clone());
                 let mut dependency_namespace = target;
                 for _ in Path::new(&identity.name).components() {
@@ -102,10 +136,11 @@ pub(crate) fn nx_read_paths(nx: &Path) -> Vec<PathBuf> {
         "an installed binary binding leaves the package closure"
     );
     reads.extend(namespaces);
+    reads.extend(bindings);
     // Local packages already belong to the workspace's read authority. External grants must
     // never intersect that protected workspace; only shared cache payloads need added reads.
     reads
         .into_iter()
-        .filter(|path| !path.starts_with(&local))
+        .filter(|path| owned_checkout.is_some() || !path.starts_with(&local))
         .collect()
 }
