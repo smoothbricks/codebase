@@ -634,9 +634,10 @@ impl KillWindow {
         Ok(self.host().create_attached(CAPACITY, &self.image)?)
     }
 
-    /// Everything adoption does before the checkout changes hands, killed at `swapped`: after
-    /// activation, either before the checkout swap or after it.
-    fn published(&self, swapped: bool) -> Result<(), Box<dyn Error>> {
+    /// Everything adoption does before the checkout changes hands, killed after activation and
+    /// before the checkout swap. The image stays attached and unmounted, as the killed process
+    /// left it.
+    fn published(&self) -> Result<(), Box<dyn Error>> {
         let host = self.host();
         let attachment = self.fenced_image()?;
         host.mount(&attachment, &self.staging, MountAccess::ReadWrite, false)?;
@@ -650,11 +651,28 @@ impl KillWindow {
         host.write_marker(&self.staging, &self.main, None, &self.identity)?;
         host.unmount_attachment(&attachment)?;
         host.activate_pending(&self.image, &self.main)?;
-        if swapped {
-            host.vacate_adopted_checkout(&self.checkout, &self.pre_cowshed)
-                .map_err(ApfsStorageError::from)?;
-        }
         drop(attachment);
+        Ok(())
+    }
+
+    /// Adoption's next step after activation: the production checkout swap, which retains the
+    /// user's tree beside the checkout and plants the stub main mounts over.
+    fn swap_checkout(&self) -> Result<(), Box<dyn Error>> {
+        self.host()
+            .vacate_adopted_checkout(&self.checkout, &self.pre_cowshed)
+            .map_err(ApfsStorageError::from)?;
+        Ok(())
+    }
+
+    /// What a restarted controller does with a published main: `finish_adoption` over the
+    /// checkout handoff.
+    fn finish(&self) -> Result<(), Box<dyn Error>> {
+        self.block_on(self.substrate.finish_adoption(
+            &self.main,
+            &AdoptHandoff::Checkout {
+                pre_cowshed_checkout: self.pre_cowshed.clone(),
+            },
+        ))??;
         Ok(())
     }
 
@@ -820,47 +838,28 @@ fn real_apfs_adopt_resumes_a_fenced_image_killed_mid_copy_on_its_surviving_attac
     assert!(!world.checkout.join("half-copied").exists());
 }
 
-/// Killed after activation and before the checkout swap: main is published, the checkout is still
-/// the user's tree, and finishing swaps it and mounts main there — twice is the same as once.
+/// Killed after activation, first before the checkout swap and then after it and before main's
+/// mount, walked in one world because the second window is the first plus the swap the killed
+/// process would have made next. Before the swap main is published and the checkout is still the
+/// user's tree; after the production swap the stub stands at the checkout with nothing mounted
+/// there. Finishing from that window mounts main over the stub — its own swap is the same
+/// `vacate_adopted_checkout` call converging on an already-swapped checkout — and finishing again
+/// is the same as once. That `finish_adoption` swaps before it mounts when it finds the checkout
+/// unswapped is pinned by `finishing_a_published_adoption_swaps_and_mounts_once`.
 #[test]
-fn real_apfs_finishing_an_adoption_killed_before_its_checkout_swap() {
+fn real_apfs_finishing_an_adoption_killed_before_and_after_its_checkout_swap() {
     let world = KillWindow::new("adopt-kill-activated").expect("kill window");
-    world.published(false).expect("published, swap pending");
+    world.published().expect("published, swap pending");
     assert!(
         !world.pre_cowshed.exists(),
         "the checkout was never touched"
     );
 
-    for _ in 0..2 {
-        world
-            .block_on(world.substrate.finish_adoption(
-                &world.main,
-                &AdoptHandoff::Checkout {
-                    pre_cowshed_checkout: world.pre_cowshed.clone(),
-                },
-            ))
-            .expect("runtime")
-            .expect("finish adoption");
-    }
-    world.assert_adopted().expect("adopted");
-}
-
-/// Killed after the checkout swap and before main's mount: the stub stands at the checkout, and
-/// finishing mounts main over it.
-#[test]
-fn real_apfs_finishing_an_adoption_killed_between_checkout_swap_and_mount() {
-    let world = KillWindow::new("adopt-kill-swapped").expect("kill window");
-    world.published(true).expect("published and swapped");
+    world.swap_checkout().expect("checkout swapped");
     assert!(world.mounted_device().expect("mounts").is_none());
 
-    world
-        .block_on(world.substrate.finish_adoption(
-            &world.main,
-            &AdoptHandoff::Checkout {
-                pre_cowshed_checkout: world.pre_cowshed.clone(),
-            },
-        ))
-        .expect("runtime")
-        .expect("finish adoption");
+    world.finish().expect("finish adoption");
     world.assert_adopted().expect("adopted");
+    world.finish().expect("finishing again");
+    world.assert_adopted().expect("adopted, once more");
 }
