@@ -1522,7 +1522,7 @@ async fn json_emits_one_frozen_envelope_and_no_prose_on_stdout() {
         streams.stdout,
         "{\"ok\":true,\"result\":{\"actionOutcomes\":[],\"volumes\":[{\"name\":\"cowshed.store\",\"role\":\"store\",\
          \"stateBefore\":{\"foundElsewhere\":{\"container\":\"disk4\",\"device\":\"disk4s7\",\
-         \"mountedAt\":null}},\"action\":\"reported\"}],\"fstab\":\"pinned\",\"authorized\":true}}\n"
+         \"mountedAt\":null}},\"action\":\"reported\"}],\"fstab\":\"pinned\",\"authorized\":true,\"optOuts\":[]}}\n"
     );
     // The announcement is guidance, not an answer: it stays on stderr even in JSON mode, because a
     // dialog is about to appear either way.
