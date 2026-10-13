@@ -9,7 +9,7 @@ use std::process::{ExitStatus, Output};
 /// (POSIX requires it), and a daemon reparented to launchd stays one until launchd gets round to
 /// reaping it. A process this one may not inspect still runs, as far as anyone here can tell.
 #[cfg(target_os = "macos")]
-pub(crate) fn running(pid: libc::pid_t) -> io::Result<bool> {
+pub fn running(pid: libc::pid_t) -> io::Result<bool> {
     let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
     let size = libc::c_int::try_from(std::mem::size_of::<libc::proc_bsdinfo>())
         .map_err(io::Error::other)?;
@@ -48,7 +48,7 @@ pub(crate) fn running(pid: libc::pid_t) -> io::Result<bool> {
 /// `sandbox-exec`'s profiles are checked by), and 1 for a sandboxed process and for a pid that
 /// names none (measured), so `false` proves a live, unsandboxed process.
 #[cfg(target_os = "macos")]
-pub(crate) fn sandboxed(pid: libc::pid_t) -> io::Result<bool> {
+pub fn sandboxed(pid: libc::pid_t) -> io::Result<bool> {
     unsafe extern "C" {
         fn sandbox_check(
             pid: libc::pid_t,
@@ -71,13 +71,13 @@ pub(crate) fn sandboxed(pid: libc::pid_t) -> io::Result<bool> {
 /// them. Fails for a process that has exited, reaped or not.
 #[cfg(target_os = "macos")]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ProcessArguments {
+pub struct ProcessArguments {
     pub executable: Vec<u8>,
     pub argv: Vec<Vec<u8>>,
 }
 
 #[cfg(target_os = "macos")]
-pub(crate) fn process_arguments(pid: libc::pid_t) -> io::Result<ProcessArguments> {
+pub fn process_arguments(pid: libc::pid_t) -> io::Result<ProcessArguments> {
     let mut mib = [libc::CTL_KERN, libc::KERN_ARGMAX];
     let mut argmax: libc::c_int = 0;
     let mut argmax_size = size_of::<libc::c_int>();
@@ -202,7 +202,7 @@ fn padded_argv(strings: &[u8], path_end: usize, argc: usize) -> Option<Vec<Vec<u
 /// [`running`] from procfs: a pid without a stat has been reaped, and state `Z` (zombie) or `X`
 /// (dead) has exited.
 #[cfg(target_os = "linux")]
-pub(crate) fn running(pid: libc::pid_t) -> io::Result<bool> {
+pub fn running(pid: libc::pid_t) -> io::Result<bool> {
     let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
         Ok(stat) => stat,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -226,7 +226,7 @@ pub(crate) fn running(pid: libc::pid_t) -> io::Result<bool> {
 /// process has no task, not `ri_resident_size` of `proc_pid_rusage`, which still answers for an
 /// exited, unreaped process with the size it last held (measured: 1.1 MB for a zombie).
 #[cfg(target_os = "macos")]
-pub(crate) fn resident_bytes(pid: libc::pid_t) -> io::Result<Option<u64>> {
+pub fn resident_bytes(pid: libc::pid_t) -> io::Result<Option<u64>> {
     let mut info = std::mem::MaybeUninit::<libc::proc_taskinfo>::zeroed();
     let size = libc::c_int::try_from(std::mem::size_of::<libc::proc_taskinfo>())
         .map_err(io::Error::other)?;
@@ -266,7 +266,7 @@ pub(crate) fn resident_bytes(pid: libc::pid_t) -> io::Result<Option<u64>> {
 /// a `statm` (`ENOENT`), or one reaped while it is read (`ESRCH`), names no process; an exited,
 /// unreaped one has no memory left to count, and its `statm` reads zero pages.
 #[cfg(target_os = "linux")]
-pub(crate) fn resident_bytes(pid: libc::pid_t) -> io::Result<Option<u64>> {
+pub fn resident_bytes(pid: libc::pid_t) -> io::Result<Option<u64>> {
     let statm = match std::fs::read_to_string(format!("/proc/{pid}/statm")) {
         Ok(statm) => statm,
         Err(error)
@@ -318,7 +318,7 @@ pub(crate) fn resident_bytes(pid: libc::pid_t) -> io::Result<Option<u64>> {
 /// Darwin reads each socket descriptor's `socket_fdinfo` (`proc_pidfdinfo`), whose TCP record
 /// carries the connection's state, as `lsof` and `netstat` read it.
 #[cfg(target_os = "macos")]
-pub(crate) fn listening_ports(pid: libc::pid_t) -> io::Result<BTreeSet<u16>> {
+pub fn listening_ports(pid: libc::pid_t) -> io::Result<BTreeSet<u16>> {
     let descriptors = descriptors(pid)?;
     let size =
         libc::c_int::try_from(std::mem::size_of::<SocketFdInfo>()).map_err(io::Error::other)?;
@@ -665,7 +665,7 @@ const _: () = {
 /// neither leave nor exchange for another (`unshare`/`setns` are refused, 04_sandbox.md, Linux
 /// "Egress"). A process that held a socket made in another namespace would have it missing here.
 #[cfg(target_os = "linux")]
-pub(crate) fn listening_ports(pid: libc::pid_t) -> io::Result<BTreeSet<u16>> {
+pub fn listening_ports(pid: libc::pid_t) -> io::Result<BTreeSet<u16>> {
     use std::os::unix::ffi::OsStrExt as _;
 
     let unreadable = |what: &str, error: io::Error| {
@@ -854,7 +854,7 @@ impl From<Output> for CommandOutput {
 /// Write a subprocess failure without decoding arbitrary output bytes or allocating a joined
 /// command string. Valid UTF-8 stays readable; invalid bytes are escaped individually, so the
 /// diagnostic retains every byte instead of replacing it with U+FFFD.
-pub(crate) fn fmt_command_failure<A: AsRef<OsStr>>(
+pub fn fmt_command_failure<A: AsRef<OsStr>>(
     f: &mut fmt::Formatter<'_>,
     operation: &str,
     program: &OsStr,
@@ -872,7 +872,7 @@ pub(crate) fn fmt_command_failure<A: AsRef<OsStr>>(
     )
 }
 
-pub(crate) fn fmt_command_spawn<A: AsRef<OsStr>>(
+pub fn fmt_command_spawn<A: AsRef<OsStr>>(
     f: &mut fmt::Formatter<'_>,
     program: &OsStr,
     args: &[A],
@@ -884,7 +884,7 @@ pub(crate) fn fmt_command_spawn<A: AsRef<OsStr>>(
 }
 
 /// `executable "<program>", argv [<args>]`: the command as every diagnostic names it.
-pub(crate) fn fmt_command<A: AsRef<OsStr>>(
+pub fn fmt_command<A: AsRef<OsStr>>(
     f: &mut fmt::Formatter<'_>,
     program: &OsStr,
     args: &[A],
@@ -938,6 +938,19 @@ impl fmt::Display for DiagnosticBytes<'_> {
             }
         }
         Ok(())
+    }
+}
+
+/// A process of this user that holds a file open: a task database, a volume a release was refused.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Holder {
+    pub pid: i32,
+    pub command: String,
+}
+
+impl fmt::Display for Holder {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "pid {} ({})", self.pid, self.command)
     }
 }
 

@@ -11,10 +11,10 @@ arrow-ipc = "56"
 arrow-schema = "56"
 base64 = "0.22"
 bytes = "1"
-# For its fork lock only: the gateway's children are spawned in the daemon that also binds the
-# supervisor manager's socket and takes image leases (`cowshed_core::fork_lock`).
+# The shared trace-segment writer remains in core; process fences live in cowshed-os.
 cowshed-core.workspace = true
 cowshed-gateway-types = { path = "../cowshed-gateway-types" }
+cowshed-os = { path = "../cowshed-os" }
 http = "1"
 http-body = "=1.0.1"
 http-body-util = "=0.1.3"
@@ -45,5 +45,6 @@ security-framework = "3"
 security-framework-sys = "2"
 
 [dev-dependencies]
+cowshed-apfs = { path = "../cowshed-apfs" }
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
 tokio = { workspace = true, features = ["test-util"] }

@@ -7,7 +7,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use cowshed_core::apfs::{CommandOutput, CommandRequest, CommandRunner};
+use cowshed_apfs::{CommandOutput, CommandRequest, CommandRunner};
 use cowshed_core::metadata::WorkspaceName;
 use cowshed_core::repository::RepoId;
 use cowshed_core::storage::apfs::native::MacOsApfsExecutionHost;
@@ -26,11 +26,11 @@ struct StubRunner;
 impl CommandRunner for StubRunner {
     fn run_guarded<E>(
         &self,
-        request: &cowshed_core::apfs::CommandRequest,
+        request: &cowshed_apfs::CommandRequest,
         check: impl FnOnce() -> Result<bool, E>,
-    ) -> Result<Option<cowshed_core::apfs::CommandOutput>, E>
+    ) -> Result<Option<cowshed_apfs::CommandOutput>, E>
     where
-        E: From<cowshed_core::apfs::CommandRunError> + std::fmt::Display,
+        E: From<cowshed_apfs::CommandRunError> + std::fmt::Display,
     {
         if check()? {
             self.run(request).map(Some).map_err(E::from)
@@ -41,28 +41,28 @@ impl CommandRunner for StubRunner {
     fn run(
         &self,
         _request: &CommandRequest,
-    ) -> Result<CommandOutput, cowshed_core::apfs::CommandRunError> {
+    ) -> Result<CommandOutput, cowshed_apfs::CommandRunError> {
         Ok(CommandOutput::success(Vec::new()))
     }
     fn image_lease(
         &self,
         _: &std::path::Path,
-    ) -> std::io::Result<Option<cowshed_core::fork_lock::Fenced<std::fs::File>>> {
+    ) -> std::io::Result<Option<cowshed_os::fork_lock::Fenced<std::fs::File>>> {
         Ok(None)
     }
     fn pin_raw_device(
         &self,
         _: &std::path::Path,
-    ) -> std::io::Result<Option<cowshed_core::fork_lock::Fenced<std::fs::File>>> {
+    ) -> std::io::Result<Option<cowshed_os::fork_lock::Fenced<std::fs::File>>> {
         Ok(None)
     }
-    fn attached_disk_images(&self) -> std::io::Result<Vec<cowshed_core::apfs::AttachedDiskImage>> {
+    fn attached_disk_images(&self) -> std::io::Result<Vec<cowshed_apfs::AttachedDiskImage>> {
         Ok(Vec::new())
     }
     fn grow_image(
         &self,
         image: &std::path::Path,
-        _: cowshed_core::metadata::ImageCapacity,
+        _: cowshed_apfs::image::ImageCapacity,
     ) -> std::io::Result<()> {
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,

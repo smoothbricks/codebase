@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use cowshed_core::api::{ExitStatus, JobId};
-use cowshed_core::fork_lock::Run as _;
+use cowshed_os::fork_lock::Run as _;
 use cowshed_core::metadata::{
     GrantSet, MACOS_PORT_MIN, PortBlock, WorkspaceIncarnation, WorkspaceName,
 };

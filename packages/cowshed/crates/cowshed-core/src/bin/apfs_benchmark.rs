@@ -3,12 +3,12 @@ mod macos {
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
 
-    use cowshed_core::apfs::{
+    use cowshed_apfs::{
         ApfsBackend, AttachedImage, CreateImageRequest, DetachIntent, MacOsApfsBackend,
         SystemCommandRunner,
     };
     use cowshed_core::copy::copy_until_quiescent_blocking;
-    use cowshed_core::metadata::{IMAGE_EXTENSION, ImageCapacity};
+    use cowshed_apfs::image::{IMAGE_EXTENSION, ImageCapacity};
 
     pub fn run() {
         let mut arguments = std::env::args_os();
@@ -68,7 +68,7 @@ mod macos {
     }
 
     impl AttachmentGuard<'_> {
-        fn detach(mut self) -> Result<(), cowshed_core::apfs::ApfsError> {
+        fn detach(mut self) -> Result<(), cowshed_apfs::ApfsError> {
             let result = self.backend.detach(
                 self.attachment.as_ref().expect("attachment is present"),
                 DetachIntent::Release,
@@ -115,7 +115,7 @@ mod macos {
                 backend.clone_image(
                     &created,
                     &clone,
-                    cowshed_core::apfs::ImageCapture::Detached,
+                    cowshed_apfs::ImageCapture::Detached,
                 )?;
                 clone_samples.push(started.elapsed());
                 backend.delete_image(&clone)?;

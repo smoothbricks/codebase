@@ -494,7 +494,7 @@ pub fn record_directory() -> io::Result<PathBuf> {
     // SAFETY: `geteuid` reads this process's credentials; it takes no pointers and cannot fail.
     let uid = unsafe { libc::geteuid() };
     let directory = PathBuf::from(format!("/private/var/tmp/cowshed-attach-pool-{uid}"));
-    crate::apfs::private_user_directory(&directory, "attach-pool record directory")?;
+    crate::private_user_directory(&directory, "attach-pool record directory")?;
     Ok(directory)
 }
 
@@ -543,18 +543,18 @@ pub fn update(
     path: &Path,
     change: impl FnOnce(PoolRecord) -> PoolRecord,
 ) -> io::Result<PoolRecord> {
-    let _lock = crate::apfs::locked_private_file(&path.with_extension("lock"))?;
+    let _lock = crate::locked_private_file(&path.with_extension("lock"))?;
     let (before, broken) = load_or_empty(path)?;
     let after = change(before.clone());
     if after == before && !broken {
         return Ok(after);
     }
-    crate::fsio::publish_private_file(path, |writer| serde_json::to_writer(writer, &after))
+    cowshed_os::fsio::publish_private_file(path, |writer| serde_json::to_writer(writer, &after))
         .map_err(|error| match error {
-            crate::fsio::PublishError::Io { path, source } => {
+            cowshed_os::fsio::PublishError::Io { path, source } => {
                 io::Error::new(source.kind(), format!("{}: {source}", path.display()))
             }
-            crate::fsio::PublishError::Write(error) => io::Error::other(error),
+            cowshed_os::fsio::PublishError::Write(error) => io::Error::other(error),
         })?;
     Ok(after)
 }
@@ -633,7 +633,7 @@ pub fn boot() -> io::Result<Boot> {
 /// The four classes now.
 #[cfg(target_os = "macos")]
 pub fn read_kernel() -> io::Result<KernelReading> {
-    crate::apfs::disk_image_class_counts()
+    crate::disk_image_class_counts()
 }
 
 #[cfg(not(target_os = "macos"))]

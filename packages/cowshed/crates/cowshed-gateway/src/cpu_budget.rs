@@ -373,7 +373,7 @@ async fn run(mut ledger: Ledger, mut messages: mpsc::UnboundedReceiver<Message>)
             if let Some(granted) = grants.remove(&ticket) {
                 let _ = granted.send(tokens);
             }
-            cowshed_core::timing::event("cpu-tokens", || {
+            cowshed_os::timing::event("cpu-tokens", || {
                 format!(
                     "grant {tokens}/{want} after {waited:?} to {checkout}: pid {} `{}`",
                     claim

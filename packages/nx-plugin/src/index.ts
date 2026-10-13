@@ -1401,17 +1401,15 @@ async function createProjectTargets(
         ]),
       );
     }
-    // A serial group runs one filter across every member, so no single crate owns
-    // it. The root owns each group's runner beside the archive it executes, and
-    // gives it every member's inputs, as the archive itself has.
+    // A serial group's filter can span members, so no single crate owns it. The root
+    // owns each group's runner beside the archive it executes, and gives it the inputs
+    // of exactly the members its filter can select from (`filterScope`): a group scoped
+    // to its packages reruns only when their sources or local dependencies change,
+    // and an unscoped one hashes every member, as the archive itself does.
     for (const group of cargoWorkspace.serialGroups) {
       targets[cargoTestGroupTargetName(group.group)] = cargoTestGroupTarget(
         cargoWorkspace,
-        await cargoTestRunnerInputs(
-          workspaceRoot,
-          cargoWorkspace,
-          cargoWorkspace.packages.map((plan) => plan.package.dir),
-        ),
+        await cargoTestRunnerInputs(workspaceRoot, cargoWorkspace, serialGroupMemberDirs(cargoWorkspace, group)),
         group,
       );
     }
@@ -2626,6 +2624,27 @@ async function addCargoTestTargets(
     }
   }
   return targetNames;
+}
+
+/**
+ * The member directories a serial group's runner hashes: the packages its filter is scoped to,
+ * or every member when it is not. A scope naming a package that is not a member is a config
+ * error, refused rather than hashed as nothing.
+ */
+function serialGroupMemberDirs(workspace: CargoWorkspace, group: SerialTestGroup): string[] {
+  if (group.scope.kind === 'workspace') {
+    return workspace.packages.map((plan) => plan.package.dir);
+  }
+  return group.scope.packages.map((name) => {
+    const member = workspace.packages.find((plan) => plan.package.name === name);
+    if (member === undefined) {
+      throw new Error(
+        `test-group "${group.group}" selects package(${name}), which is not a member of the Cargo workspace at ` +
+          `${workspace.projectRoot || '.'}`,
+      );
+    }
+    return member.package.dir;
+  });
 }
 
 /**

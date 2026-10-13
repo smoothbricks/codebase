@@ -12,7 +12,7 @@ use thiserror::Error;
 use toml::Spanned;
 
 use crate::capabilities::{CapabilityId, CapabilityOverride, DeclaredState};
-use crate::process::fmt_command_failure;
+use cowshed_os::process::fmt_command_failure;
 
 use super::fstab::FstabPin;
 
@@ -27,11 +27,8 @@ pub use native::{
 pub const VOLUME_MARKER_FILE: &str = ".cowshed-volume.json";
 pub const APFS_STORE_VOLUME: &str = "cowshed.store";
 pub const APFS_CACHES_VOLUME: &str = "cowshed.caches";
-/// Machine-global evidence roots shared by every user in the herd.
-///
-/// Bootstrap volumes cannot follow `$HOME`: doing so gives each user a different view of the
-/// same machine-global herd and leaves the evidence layer outside the dedicated volumes.
-pub const STORE_ROOT: &str = "/private/cowshed/store";
+// TEMPORARY (apfs split): removed by the closing path codemod.
+pub use cowshed_gateway_types::STORE_ROOT;
 /// Where the retired `cowshed.caches` volume (or `<pool>/cowshed/caches` dataset) is mounted on a
 /// host that still has one. Nothing is provisioned there any more: setup moves what it holds into
 /// the host HOME and `setup --retire-caches-volume` deletes it (03_caches.md).
@@ -66,7 +63,7 @@ pub fn is_reserved_store_namespace(name: &str) -> bool {
     name.starts_with('.') || RESERVED_STORE_NAMESPACES.contains(&name)
 }
 
-pub(crate) use crate::device::DISKUTIL;
+pub(crate) use cowshed_apfs::device::DISKUTIL;
 const ZFS: &str = "/usr/sbin/zfs";
 const MARKER_VERSION: u32 = 1;
 
@@ -87,7 +84,7 @@ pub struct CowshedConfig {
     >,
     /// `[build] capacity`: the capacity of the build volumes this project creates from nothing
     /// (16_build_volumes.md, "Substrate"); a clone and a seed inherit their source's instead.
-    build_capacity: Option<crate::metadata::ImageCapacity>,
+    build_capacity: Option<cowshed_apfs::image::ImageCapacity>,
     /// `[build] state`: build state the repository declares for tools no capability detects
     /// (16_build_volumes.md, "Declared build state"), sorted, no spelling inside another.
     build_state: Vec<crate::capabilities::DeclaredState>,
@@ -117,7 +114,7 @@ impl CowshedConfig {
 
     /// The capacity a build volume created from nothing gets: `[build] capacity`, else
     /// [`crate::build_volume::DEFAULT_BUILD_VOLUME_CAPACITY`].
-    pub fn build_capacity(&self) -> crate::metadata::ImageCapacity {
+    pub fn build_capacity(&self) -> cowshed_apfs::image::ImageCapacity {
         self.build_capacity
             .unwrap_or(crate::build_volume::DEFAULT_BUILD_VOLUME_CAPACITY)
     }
@@ -232,7 +229,7 @@ pub fn parse_cowshed_config(input: &str) -> Result<CowshedConfig, ConfigError> {
         Some(BuildSection { capacity, state }) => (
             capacity
                 .map(|capacity| {
-                    crate::metadata::ImageCapacity::parse(capacity.get_ref()).map_err(|reason| {
+                    cowshed_apfs::image::ImageCapacity::parse(capacity.get_ref()).map_err(|reason| {
                         ConfigError::InvalidBuildCapacity {
                             line: line_of(input, &capacity),
                             reason,
@@ -429,7 +426,7 @@ pub enum ConfigError {
     #[error("[build] capacity at line {line}: {reason}")]
     InvalidBuildCapacity {
         line: usize,
-        reason: crate::metadata::ImageCapacityError,
+        reason: cowshed_apfs::image::ImageCapacityError,
     },
     #[error("[build] state entry {path:?} at line {line} {reason}")]
     InvalidBuildState {
@@ -1574,7 +1571,7 @@ pub enum MountpointState {
     },
 }
 
-pub type HostCommandOutput = crate::process::CommandOutput;
+pub type HostCommandOutput = cowshed_os::process::CommandOutput;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HostCommandFailure {
@@ -1847,7 +1844,7 @@ pub(crate) fn parse_created_apfs_identifier(
     // `device` owns the `diskN[sM…]` grammar, and the inventory parser this identifier is later
     // compared against uses it. Depth one is an APFS volume: `disk3` is a container and
     // `disk3s1s4` is a snapshot of a slice, neither of which addVolume returns.
-    if crate::device::identifier_depth(identifier) != Some(1) {
+    if cowshed_apfs::device::identifier_depth(identifier) != Some(1) {
         return Err(BootstrapExecutionError::CreatedVolumeOutput(format!(
             "malformed created DeviceIdentifier {identifier:?}"
         )));

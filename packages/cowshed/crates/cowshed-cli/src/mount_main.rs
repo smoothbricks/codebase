@@ -16,7 +16,7 @@
 //! and touches nothing else.
 
 use async_trait::async_trait;
-use cowshed_core::apfs::SystemCommandRunner;
+use cowshed_apfs::SystemCommandRunner;
 use cowshed_core::api::MountResult;
 use cowshed_core::metadata::{
     DetachedWorkspaceMetadata, MetadataError, PublicationState, WorkspaceName, read_json,

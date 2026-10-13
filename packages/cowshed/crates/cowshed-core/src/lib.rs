@@ -1,20 +1,13 @@
 //! Warm, copy-on-write workspaces with explicit controller authority.
 
-pub mod apfs;
 pub mod api;
-pub mod attach_budget;
 pub mod build_volume;
 pub mod caches_retirement;
 pub mod capabilities;
 pub mod checkout;
 pub mod copy;
-mod device;
-pub mod disk_image_helpers;
-pub mod disk_lease;
 pub mod error;
 pub mod exec;
-pub mod fork_lock;
-mod fsio;
 mod gateway_inventory;
 pub mod gateway_sessions;
 pub mod git;
@@ -27,7 +20,6 @@ mod inherited_git_locks;
 pub mod inherited_links;
 pub mod landing;
 pub mod metadata;
-mod process;
 pub mod project_policy;
 pub mod repository;
 pub mod resident;
@@ -36,33 +28,33 @@ pub mod sandbox;
 pub mod script;
 pub mod secrets;
 pub mod storage;
-pub mod timing;
 pub mod vnodes;
 pub mod workspace_clients;
 pub mod workspace_credentials;
 pub mod workspace_environment;
 pub mod workspace_git_fetch;
 
+
 // Every real-image fixture in the lib test binary shares this one scratch-root protocol: one
 // sweep, one sequence, whichever module attaches the image; and one blank image template.
 #[cfg(all(test, target_os = "macos"))]
-use crate::apfs::{
+use cowshed_apfs::{
     ApfsBackend, CommandRunner, DetachIntent, DiskImageSource, ImageCapture, MacOsApfsBackend,
     SystemCommandRunner,
 };
 #[cfg(all(test, target_os = "macos"))]
-use crate::metadata::ImageCapacity;
+use cowshed_apfs::image::ImageCapacity;
 #[cfg(all(test, target_os = "macos"))]
-use crate::storage::apfs::{
-    ApfsSubstrateConfig,
-    native::{MacOsApfsExecutionHost, blank_template},
-};
+use cowshed_apfs::{mounts::kernel_mounts, store_lock::verify_no_symlinks, template::blank_template};
 #[cfg(all(test, target_os = "macos"))]
-#[path = "../tests/support/blank_image.rs"]
+#[path = "../../cowshed-apfs/tests/support/blank_image.rs"]
 mod blank_image;
 #[cfg(all(test, target_os = "macos"))]
-#[path = "../tests/support/scratch_apfs.rs"]
+#[path = "../../cowshed-apfs/tests/support/scratch_apfs.rs"]
 mod scratch_apfs;
+#[cfg(all(test, target_os = "macos"))]
+#[path = "../tests/support/scratch_directory.rs"]
+mod scratch_directory;
 #[cfg(test)]
 #[path = "../tests/support/temp_root.rs"]
 mod temp_root;

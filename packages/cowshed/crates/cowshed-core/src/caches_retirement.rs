@@ -24,7 +24,7 @@ use std::process::Command;
 
 use crate::capabilities::cache::SharedToolHome;
 use crate::capabilities::{bun, cargo, go, gradle, nix, npm, pnpm, sccache, uv, zig};
-use crate::fork_lock::Run as _;
+use cowshed_os::fork_lock::Run as _;
 use crate::storage::bootstrap::VOLUME_MARKER_FILE;
 
 /// The suffix of a copy that is not yet published: `.<name>.cowshed-retiring` beside `<name>`.
@@ -36,7 +36,7 @@ const BOOKKEEPING: [&str; 8] = [
     VOLUME_MARKER_FILE,
     ".fseventsd",
     ".Spotlight-V100",
-    crate::apfs::SPOTLIGHT_OPT_OUT,
+    cowshed_apfs::SPOTLIGHT_OPT_OUT,
     ".Trashes",
     ".TemporaryItems",
     ".DocumentRevisions-V100",
@@ -829,7 +829,7 @@ struct Totals {
 fn merge_tree(from: &Path, to: &Path, totals: &mut Totals) -> io::Result<()> {
     // WHY: tools seal their caches (Go's module cache extracts every directory 0555), so the
     // volume-side tree must be writable by its owner before entries can leave it.
-    crate::fsio::grant_owner_directory_access(from)?;
+    cowshed_os::fsio::grant_owner_directory_access(from)?;
     let mut names = Vec::new();
     for entry in fs::read_dir(from)? {
         names.push(entry?.file_name());
@@ -916,7 +916,7 @@ fn move_directory(from: &Path, to: &Path, replace_link: bool) -> io::Result<()> 
 
 fn remove_tree(path: &Path) -> io::Result<()> {
     let result = match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.is_dir() => crate::fsio::remove_owned_tree(path),
+        Ok(metadata) if metadata.is_dir() => cowshed_os::fsio::remove_owned_tree(path),
         Ok(_) => fs::remove_file(path),
         Err(error) => Err(error),
     };

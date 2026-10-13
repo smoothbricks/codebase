@@ -30,7 +30,7 @@ use arrow_schema::{ArrowError, DataType, Field, Schema, TimeUnit};
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::fsio::{
+use cowshed_os::fsio::{
     Durability, TemporaryAt, create_private_file_at, open_directory_nofollow,
     open_or_create_child_directory, rename_noreplace, temp_name,
 };

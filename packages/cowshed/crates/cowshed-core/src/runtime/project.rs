@@ -39,14 +39,16 @@ use crate::api::server::{
 };
 use crate::error::{CowshedError, ErrorCode, Result};
 #[cfg(target_os = "macos")]
-use crate::fork_lock::RunAsync as _;
+use cowshed_os::fork_lock::RunAsync as _;
 use crate::metadata::WorkspaceName;
 #[cfg(target_os = "macos")]
 use crate::repository::OwnedRepoIds;
 use crate::repository::{RepoId, RepositoryBinding};
 use crate::runtime::job_progress::JobProgressStream;
 #[cfg(target_os = "macos")]
-use crate::timing::timed_async;
+use super::storage_host::RuntimeStorageHost;
+#[cfg(target_os = "macos")]
+use cowshed_os::timing::timed_async;
 
 const ROUTER_CAPACITY: usize = 64;
 const STARTUP_LIFECYCLE_ATTEMPTS: usize = 8;
@@ -661,6 +663,73 @@ impl ProjectRuntime {
         .await
     }
 
+    /// Adopt into a caller-owned directory store, without provisioning or attaching disk images.
+    ///
+    /// This selects real directory storage explicitly; [`Self::open_for_adopt_at`] continues to
+    /// select native APFS images. The caller owns the supplied roots and their teardown.
+    pub async fn open_directory_for_adopt_at(
+        project_root: impl AsRef<Path>,
+        requested_repo_id: Option<RepoId>,
+        storage: crate::storage::bootstrap::ValidatedHostStorage,
+    ) -> Result<Self> {
+        Self::open_directory(
+            project_root.as_ref(),
+            crate::storage::bootstrap::native::NativeBootstrapMode::Provision,
+            requested_repo_id,
+            RecoveryScope::Workspaces(std::collections::BTreeSet::new()),
+            storage,
+        )
+        .await
+    }
+
+    /// Reopen a caller-owned directory store with the same recovery rules as native storage.
+    pub async fn open_directory_existing_at(
+        project_root: impl AsRef<Path>,
+        scope: RecoveryScope,
+        storage: crate::storage::bootstrap::ValidatedHostStorage,
+    ) -> Result<Self> {
+        Self::open_directory(
+            project_root.as_ref(),
+            crate::storage::bootstrap::native::NativeBootstrapMode::ExistingOnly,
+            None,
+            scope,
+            storage,
+        )
+        .await
+    }
+
+    async fn open_directory(
+        project_root: &Path,
+        mode: crate::storage::bootstrap::native::NativeBootstrapMode,
+        requested_repo_id: Option<RepoId>,
+        scope: RecoveryScope,
+        storage: crate::storage::bootstrap::ValidatedHostStorage,
+    ) -> Result<Self> {
+        #[cfg(target_os = "macos")]
+        {
+            let host = StorageProjectRuntimeHost::open(
+                project_root,
+                mode,
+                requested_repo_id.as_ref(),
+                continuity_from_environment()?,
+                BindingRemoteValidation::Strict,
+                scope,
+                Some(storage),
+                crate::storage::directory::DirectoryExecutionHost::new,
+            )
+            .await?;
+            Self::start(host).await
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (project_root, mode, requested_repo_id, scope, storage);
+            Err(CowshedError::environment_missing(
+                "the cowshed directory project runtime currently requires macOS",
+                "run the controller on macOS",
+            ))
+        }
+    }
+
     async fn open_native(
         project_root: &Path,
         mode: crate::storage::bootstrap::native::NativeBootstrapMode,
@@ -680,6 +749,12 @@ impl ProjectRuntime {
                 validation,
                 recovery_scope,
                 storage,
+                |config| {
+                    crate::storage::apfs::native::MacOsApfsExecutionHost::new(
+                        cowshed_apfs::SystemCommandRunner,
+                        config,
+                    )
+                },
             )
             .await?;
             Self::start(host).await
@@ -827,7 +902,7 @@ impl ProjectActor {
         while let Some(command) = self.receiver.recv().await {
             let (request, reply) = command.into_parts();
             let routed = match request.steps().cloned() {
-                Some(steps) => crate::timing::reporting(steps, self.route(request)).await,
+                Some(steps) => cowshed_os::timing::reporting(steps, self.route(request)).await,
                 None => self.route(request).await,
             };
             self.host.release_intent_leases();
@@ -850,7 +925,7 @@ impl ProjectActor {
     async fn route(&mut self, request: RouterRequest) -> Result<Routed> {
         self.validate_connection_authority(request.authority())?;
         let method = request.method();
-        let _span = crate::timing::span_named("route", || method.to_owned());
+        let _span = cowshed_os::timing::span_named("route", || method.to_owned());
         let (authority, operation, upload, _) = request.into_parts();
         let scope = operations::operation(method)
             .map(|info| info.scope)
@@ -1915,17 +1990,23 @@ fn exec_request(
 mod re_adopt;
 
 #[cfg(target_os = "macos")]
-type NativeSubstrate = crate::storage::apfs::ApfsSubstrate<
-    crate::storage::apfs::native::MacOsApfsExecutionHost<crate::apfs::SystemCommandRunner>,
+type NativeProjectRuntimeHost = StorageProjectRuntimeHost<
+    crate::storage::apfs::native::MacOsApfsExecutionHost<cowshed_apfs::SystemCommandRunner>,
 >;
 
 #[cfg(target_os = "macos")]
-struct NativeProjectRuntimeHost {
+type StorageHostFactory<H> = fn(
+    crate::storage::apfs::ApfsSubstrateConfig,
+) -> std::result::Result<H, crate::storage::apfs::ApfsStorageError>;
+
+#[cfg(target_os = "macos")]
+struct StorageProjectRuntimeHost<H: RuntimeStorageHost> {
     descriptor: ProjectDescriptor,
     git: crate::git::GitRepository,
     layout: crate::storage::StorageLayout,
     substrate_config: crate::storage::apfs::ApfsSubstrateConfig,
-    substrate: NativeSubstrate,
+    substrate: crate::storage::apfs::ApfsSubstrate<H>,
+    host_factory: StorageHostFactory<H>,
     commitments: super::supervisor::CommitmentPublisherHandle,
     /// The handle each workspace's commands go through: to the supervisor serving the
     /// workspace's socket, whichever process serves it.
@@ -2043,7 +2124,7 @@ fn process_is_alive(pid: u32) -> bool {
     let Ok(pid) = i32::try_from(pid) else {
         return false;
     };
-    crate::process::running(pid).unwrap_or(true)
+    cowshed_os::process::running(pid).unwrap_or(true)
 }
 
 #[cfg(target_os = "macos")]
@@ -2631,7 +2712,7 @@ fn verified_recovery_facts<'a>(
 }
 
 #[cfg(target_os = "macos")]
-impl NativeProjectRuntimeHost {
+impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
     async fn open(
         project_root: &Path,
         bootstrap_mode: crate::storage::bootstrap::native::NativeBootstrapMode,
@@ -2640,9 +2721,9 @@ impl NativeProjectRuntimeHost {
         validation: BindingRemoteValidation,
         recovery_scope: RecoveryScope,
         supplied_storage: Option<crate::storage::bootstrap::ValidatedHostStorage>,
+        host_factory: StorageHostFactory<H>,
     ) -> Result<Self> {
-        use crate::storage::apfs::ApfsExecutionHost;
-        use crate::timing::spanned;
+        use cowshed_os::timing::spanned;
 
         // A re-adoption interrupted between retiring the replaced main and mounting its
         // replacement leaves the checkout an empty mountpoint, where no repository is discovered.
@@ -2722,7 +2803,7 @@ impl NativeProjectRuntimeHost {
             )
             .await?;
         }
-        let origin_span = crate::timing::span("open", "origin");
+        let origin_span = cowshed_os::timing::span("open", "origin");
         let origin = if existing_only {
             workspace_origin_from_marker(&git_root).await?
         } else {
@@ -2770,7 +2851,7 @@ impl NativeProjectRuntimeHost {
             .map_err(native_integrity_error)?;
         }
         let mut replay_journal = None;
-        let binding_span = crate::timing::span("open", "binding");
+        let binding_span = cowshed_os::timing::span("open", "binding");
         let (repo_id, layout, binding) = if let Some(resolved) = session_project {
             resolved
         } else {
@@ -2868,11 +2949,7 @@ impl NativeProjectRuntimeHost {
             })?;
         }
         let config = crate::storage::apfs::ApfsSubstrateConfig::new(storage.store(), &git_root);
-        let host = crate::storage::apfs::native::MacOsApfsExecutionHost::new(
-            crate::apfs::SystemCommandRunner,
-            config.clone(),
-        )
-        .map_err(native_storage_error)?;
+        let host = host_factory(config.clone()).map_err(native_storage_error)?;
         let lifecycle_intents_path = layout
             .project()
             .project_root
@@ -2880,7 +2957,7 @@ impl NativeProjectRuntimeHost {
         let recovery_intents_path = lifecycle_intents_path.clone();
         let recovery_config = config.clone();
         let recovery_repo = repo_id.clone();
-        let recovery_span = crate::timing::span("open", "inventory");
+        let recovery_span = cowshed_os::timing::span("open", "inventory");
         let repairs = recovery_scope.repairs();
         let (host, facts, pending, lifecycle_intents) =
             crate::storage::lifecycle::dispatch_blocking(move || {
@@ -2920,7 +2997,7 @@ impl NativeProjectRuntimeHost {
             "open",
             "retired",
             crate::storage::lifecycle::dispatch_blocking(move || {
-                native_retired_refs(&retired_project_root, &retired_repo)
+                retired_refs::<H>(&retired_project_root, &retired_repo)
             }),
         )
         .await
@@ -2987,7 +3064,7 @@ impl NativeProjectRuntimeHost {
             crate::storage::audit::ContinuityAudit::External(_)
         );
         let mut commitments = {
-            let _span = crate::timing::span("open", "commitments");
+            let _span = cowshed_os::timing::span("open", "commitments");
             super::supervisor::CommitmentPublisher::open(
                 &telemetry_root,
                 continuity,
@@ -3016,6 +3093,7 @@ impl NativeProjectRuntimeHost {
             layout,
             substrate_config: config,
             substrate,
+            host_factory,
             commitments,
             supervisors: std::collections::BTreeMap::new(),
             served: std::collections::BTreeMap::new(),
@@ -3759,7 +3837,7 @@ impl NativeProjectRuntimeHost {
     async fn conclude_adoption(
         &mut self,
         workspace: &crate::storage::lifecycle::LifecycleWorkspace,
-        first: super::build_volumes::FirstMint,
+        first: super::build_volumes::FirstMint<H>,
     ) -> Result<WorkspaceSnapshot> {
         use super::supervisor::CommitmentSink;
         let introduced = self
@@ -3780,7 +3858,7 @@ impl NativeProjectRuntimeHost {
         let touched = self
             .first_build_state(workspace.name(), &mount, first.lend())
             .await;
-        crate::timing::spanned("adopt", "build-volume-release", first.settle()).await;
+        cowshed_os::timing::spanned("adopt", "build-volume-release", first.settle()).await;
         self.complete_lifecycle_intent(
             workspace.name(),
             crate::storage::recovery::LifecycleIntentCompletion::Workspace(
@@ -3822,7 +3900,7 @@ impl NativeProjectRuntimeHost {
             .map_err(native_integrity_error)
     }
 
-    fn build_volumes(&self) -> Result<super::build_volumes::BuildVolumes> {
+    fn build_volumes(&self) -> Result<super::build_volumes::BuildVolumes<H>> {
         Ok(super::build_volumes::BuildVolumes::new(
             self.substrate.shared_host(),
             self.build_volume_layout()?,
@@ -4433,11 +4511,7 @@ impl NativeProjectRuntimeHost {
         &mut self,
         config: crate::storage::apfs::ApfsSubstrateConfig,
     ) -> Result<()> {
-        let host = crate::storage::apfs::native::MacOsApfsExecutionHost::new(
-            crate::apfs::SystemCommandRunner,
-            config.clone(),
-        )
-        .map_err(native_storage_error)?;
+        let host = (self.host_factory)(config.clone()).map_err(native_storage_error)?;
         self.substrate = crate::storage::apfs::ApfsSubstrate::new(config.clone(), host);
         self.substrate_config = config;
         Ok(())
@@ -6059,8 +6133,8 @@ impl NativeProjectRuntimeHost {
         &mut self,
         name: &WorkspaceName,
     ) -> Result<super::supervisor::WorkspaceSupervisorHandle> {
-        crate::timing::spanned("supervisor", "binding", self.validate_binding()).await?;
-        let current = crate::timing::spanned("supervisor", "inventory", self.current(name)).await?;
+        cowshed_os::timing::spanned("supervisor", "binding", self.validate_binding()).await?;
+        let current = cowshed_os::timing::spanned("supervisor", "inventory", self.current(name)).await?;
         self.ensure_supervisor_for(current).await
     }
 
@@ -6085,7 +6159,7 @@ impl NativeProjectRuntimeHost {
             current.derived.mount_state,
             crate::storage::lifecycle::MountState::Detached
         );
-        let mount = crate::timing::spanned(
+        let mount = cowshed_os::timing::spanned(
             "supervisor",
             "ensure-mounted",
             self.substrate
@@ -6139,7 +6213,7 @@ impl NativeProjectRuntimeHost {
         } else {
             &mount
         };
-        crate::timing::spanned(
+        cowshed_os::timing::spanned(
             "supervisor",
             "excludes",
             crate::git::GitRepository::from_root(excludes_in).ensure_cowshed_excludes(),
@@ -6153,7 +6227,7 @@ impl NativeProjectRuntimeHost {
             lifecycle_revision: current.derived.workspace.revision().get(),
         };
         if self.supervisors_run_in == SupervisorHome::Daemon {
-            let ensured = crate::timing::spanned(
+            let ensured = cowshed_os::timing::spanned(
                 "supervisor",
                 "manager-ensure",
                 super::supervisor_manager::ensure(
@@ -6188,9 +6262,13 @@ impl NativeProjectRuntimeHost {
             current.derived.workspace.incarnation(),
             crate::storage::job_artifact::ArtifactConfig::default().retained_recovery_budget_bytes,
         )?;
-        // Each job's resource samples stat the workspace volume mounted here; a checkout no volume
-        // is mounted at is a configuration error, never a sample's.
-        let workspace_volume = super::volume_usage::VolumeMountpoint::new(mount.clone())?;
+        // Directory stores own no kernel volume; their job samples explicitly remain
+        // unconfigured rather than reporting the containing filesystem's usage.
+        let workspace_volume = if H::HAS_PHYSICAL_VOLUMES {
+            Some(super::volume_usage::VolumeMountpoint::new(mount.clone())?)
+        } else {
+            None
+        };
         let mut config = super::supervisor::WorkspaceSupervisorConfig {
             authority: needed,
             owned_repo_ids: self.owned_repo_ids()?,
@@ -6227,18 +6305,22 @@ impl NativeProjectRuntimeHost {
             telemetry_root: Some(self.telemetry_root.clone()),
             // Filled from the lost predecessor's ledger once this process holds the socket.
             inherited_groups: Vec::new(),
-            volume_labels: Some(super::supervisor::VolumeLabels {
-                workspace_image: self
-                    .layout
-                    .canonical_image(name)
-                    .map_err(native_integrity_error)?
-                    .image()
-                    .to_owned(),
-                workspace: crate::storage::apfs::volume_label(&self.descriptor.repo_id, name),
-                build: crate::storage::apfs::build_volume_label(&self.descriptor.repo_id, name),
-                labeller: std::sync::Arc::new(ApfsLabeller(self.substrate.shared_host())),
-            }),
-            workspace_volume: Some(workspace_volume),
+            volume_labels: if H::HAS_PHYSICAL_VOLUMES {
+                Some(super::supervisor::VolumeLabels {
+                    workspace_image: self
+                        .layout
+                        .canonical_image(name)
+                        .map_err(native_integrity_error)?
+                        .image()
+                        .to_owned(),
+                    workspace: crate::storage::apfs::volume_label(&self.descriptor.repo_id, name),
+                    build: crate::storage::apfs::build_volume_label(&self.descriptor.repo_id, name),
+                    labeller: std::sync::Arc::new(ApfsLabeller(self.substrate.shared_host())),
+                })
+            } else {
+                None
+            },
+            workspace_volume,
             job_sampling: super::supervisor::JobSamplingPolicy::default(),
         };
         // A workspace has one supervisor, its one job allocator: when another controller
@@ -7103,7 +7185,7 @@ async fn finish_store_residue<H: crate::storage::apfs::ApfsExecutionHost>(
             .map_err(native_storage_error)?;
     }
     let substrate = crate::storage::apfs::ApfsSubstrate::new(config, host);
-    let _span = crate::timing::span("open", "reclaim");
+    let _span = cowshed_os::timing::span("open", "reclaim");
     for retirement in retired.recorded {
         // Trash reclamation is best effort: the retirement is already a fact of the inventory,
         // and an image left in the trash is reclaimed by the next open or by `gc`. A failure is
@@ -7535,7 +7617,7 @@ enum NativeAdoptRollbackState {
 mod rebase_recovery_tests {
     use super::*;
     use crate::error::FenceRefusal;
-    use crate::fork_lock::Run as _;
+    use cowshed_os::fork_lock::Run as _;
 
     fn git(root: &Path, args: &[&str]) -> std::process::Output {
         std::process::Command::new("git")
@@ -8050,7 +8132,7 @@ mod rebase_recovery_tests {
 }
 #[cfg(target_os = "macos")]
 #[async_trait]
-impl ProjectRuntimeHost for NativeProjectRuntimeHost {
+impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> {
     fn descriptor(&self) -> &ProjectDescriptor {
         &self.descriptor
     }
@@ -8064,7 +8146,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         // repository at its recorded checkout by definition; its session marker and persisted
         // binding were validated during open, so querying remotes there would prevent the move
         // operation that repairs it. Every other state retains the ordinary live-Git check.
-        let authoritative = crate::timing::spanned(
+        let authoritative = cowshed_os::timing::spanned(
             "recover",
             "inventory",
             self.authoritative_allowing_detached_main_relocation(),
@@ -8085,14 +8167,14 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             .next()
             .is_some();
         if !detached_direct_main && !re_adopting {
-            crate::timing::spanned("recover", "binding", self.validate_binding()).await?;
+            cowshed_os::timing::spanned("recover", "binding", self.validate_binding()).await?;
         }
         // Intent recovery finishes interrupted create/fork/remove work by creating and destroying
         // images. Workspace supervisors are the daemon's, started by the first command a workspace
         // gets: opening a project starts none, and waits on none. An inspecting host replays
         // nothing; doctor reports each unfinished intent instead.
         if self.recovery_scope.repairs() {
-            crate::timing::spanned("recover", "intents", self.recover_lifecycle_intents()).await?;
+            cowshed_os::timing::spanned("recover", "intents", self.recover_lifecycle_intents()).await?;
         }
         Ok(())
     }
@@ -8231,7 +8313,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         // in which nothing can name build state. The answer owns the volume until main's first
         // touch has run, and releases it when the adopt is dropped first.
         let volumes = self.build_volumes()?;
-        let mint = crate::timing::spanned(
+        let mint = cowshed_os::timing::spanned(
             "adopt",
             "build-volume",
             volumes.mint_first(
@@ -9153,15 +9235,17 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             .map_err(native_integrity_error)?
             .image()
             .to_owned();
-        let named = self
-            .substrate
-            .host()
-            .label_image_volume(
-                &main_image,
-                &crate::storage::apfs::volume_label(&self.descriptor.repo_id, &main_name()),
-            )
-            .map_err(native_storage_error)?;
-        require_named_after_mount(named, &main_image)?;
+        if H::HAS_PHYSICAL_VOLUMES {
+            let named = self
+                .substrate
+                .host()
+                .label_image_volume(
+                    &main_image,
+                    &crate::storage::apfs::volume_label(&self.descriptor.repo_id, &main_name()),
+                )
+                .map_err(native_storage_error)?;
+            require_named_after_mount(named, &main_image)?;
+        }
         self.ensure_supervisor(&main_name()).await?;
         RepositoryIdentityIntent::clear(&self.substrate_config.store_root)?;
         self.snapshot_named(&main_name()).await
@@ -9238,7 +9322,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             .await
             .map_err(|error| {
                 if let crate::storage::apfs::ApfsStorageError::Apfs(apfs) = &error
-                    && crate::apfs::detach_was_dissented(apfs)
+                    && cowshed_apfs::detach_was_dissented(apfs)
                 {
                     detach_refused(&workspace, &mount, &error)
                 } else {
@@ -11008,10 +11092,11 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         }
         // Every clone of main copies main's extent map on its first write, so the count predicts
         // what the next `new` will pay before it is paid.
-        if let Some(image) = companion_images
-            .iter()
-            .find(|(name, _)| name.is_main())
-            .map(|(_, image)| image.clone())
+        if H::HAS_PHYSICAL_VOLUMES
+            && let Some(image) = companion_images
+                .iter()
+                .find(|(name, _)| name.is_main())
+                .map(|(_, image)| image.clone())
         {
             let counted = image.clone();
             let extents = crate::storage::lifecycle::dispatch_blocking(move || {
@@ -11048,7 +11133,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                             message: format!(
                                 "{} is the copy an interrupted or still-running cowshed defrag {name} was writing; it holds {} bytes",
                                 sibling.display(),
-                                metadata.blocks().saturating_mul(crate::apfs::SECTOR_BYTES)
+                                metadata.blocks().saturating_mul(cowshed_apfs::SECTOR_BYTES)
                             ),
                             hint: format!(
                                 "cowshed defrag {name} replaces it; with no defrag running, deleting it is safe"
@@ -12324,7 +12409,7 @@ fn quarantine_secret_files(
                 "move the existing quarantine artifact aside and retry adopt",
             ));
         }
-        let temporary = destination_parent.join(crate::fsio::temp_name(
+        let temporary = destination_parent.join(cowshed_os::fsio::temp_name(
             destination
                 .file_name()
                 .unwrap_or_else(|| std::ffi::OsStr::new("cowshed-quarantine")),
@@ -13004,8 +13089,8 @@ fn revision_target(target: &crate::api::dto::RevisionTarget) -> String {
 }
 
 #[cfg(target_os = "macos")]
-fn current_snapshot_mount(
-    host: &NativeProjectRuntimeHost,
+fn current_snapshot_mount<H: RuntimeStorageHost>(
+    host: &StorageProjectRuntimeHost<H>,
     workspace: &NativeWorkspace,
 ) -> Result<PathBuf> {
     host.workspace_mount_path(workspace.derived.workspace.name())
@@ -14546,9 +14631,13 @@ struct RetiredTrash {
 }
 
 #[cfg(target_os = "macos")]
-fn native_retired_refs(project_root: &Path, repo_id: &RepoId) -> Result<RetiredTrash> {
+fn retired_refs<H: crate::storage::apfs::ApfsExecutionHost>(
+    project_root: &Path,
+    repo_id: &RepoId,
+) -> Result<RetiredTrash> {
+    use cowshed_apfs::image::{IMAGE_EXTENSION, is_image_path};
     use crate::metadata::{
-        DetachedWorkspaceMetadata, IMAGE_EXTENSION, WorkspaceRole, is_image_path, sidecar_path,
+        DetachedWorkspaceMetadata, WorkspaceRole, sidecar_path,
     };
     use crate::storage::lifecycle::{LifecycleWorkspace, RetiredRef, Revision};
 
@@ -14592,10 +14681,20 @@ fn native_retired_refs(project_root: &Path, repo_id: &RepoId) -> Result<RetiredT
                 "cowshed doctor --json",
             )
         })?;
-        if !file_type.is_file() {
+        let expected_type = if H::HAS_PHYSICAL_VOLUMES {
+            "regular file"
+        } else {
+            "directory"
+        };
+        let matches_backend = if H::HAS_PHYSICAL_VOLUMES {
+            file_type.is_file()
+        } else {
+            file_type.is_dir()
+        };
+        if !matches_backend {
             return Err(CowshedError::integrity(
                 format!(
-                    "retired workspace image is not a regular file: {}",
+                    "retired workspace image is not a {expected_type}: {}",
                     entry.path().display()
                 ),
                 "cowshed doctor --json",
@@ -14721,7 +14820,9 @@ mod retired_recovery_tests {
         .write_for_image(&image)
         .unwrap();
 
-        let retired = native_retired_refs(&project_root, &repo_id)
+        let retired = retired_refs::<
+            crate::storage::apfs::native::MacOsApfsExecutionHost<cowshed_apfs::SystemCommandRunner>,
+        >(&project_root, &repo_id)
             .unwrap()
             .recorded;
         assert_eq!(retired.len(), 1);
@@ -14776,7 +14877,9 @@ mod retired_recovery_tests {
         .write_for_image(&image)
         .expect("retired sidecar");
 
-        let retired = native_retired_refs(&project_root, &repo_id)
+        let retired = retired_refs::<
+            crate::storage::apfs::native::MacOsApfsExecutionHost<cowshed_apfs::SystemCommandRunner>,
+        >(&project_root, &repo_id)
             .expect("retired pending image is recoverable from its exact trash identity")
             .recorded;
         assert_eq!(retired.len(), 1);
@@ -14793,7 +14896,9 @@ mod retired_recovery_tests {
         mismatched
             .write_for_image(&image)
             .expect("change metadata identity");
-        native_retired_refs(&project_root, &repo_id)
+        retired_refs::<
+            crate::storage::apfs::native::MacOsApfsExecutionHost<cowshed_apfs::SystemCommandRunner>,
+        >(&project_root, &repo_id)
             .expect_err("a mismatched workspace identity cannot authorize reclamation");
         mismatched.workspace = name.clone();
         mismatched
@@ -14808,7 +14913,9 @@ mod retired_recovery_tests {
         mismatched
             .write_for_image(&live)
             .expect("new canonical metadata");
-        let retired = native_retired_refs(&project_root, &repo_id)
+        let retired = retired_refs::<
+            crate::storage::apfs::native::MacOsApfsExecutionHost<cowshed_apfs::SystemCommandRunner>,
+        >(&project_root, &repo_id)
             .expect("new use of the name cannot invalidate old retired trash")
             .recorded;
         assert_eq!(retired[0].workspace().incarnation(), &incarnation);
@@ -14859,7 +14966,9 @@ mod retired_recovery_tests {
         .write_for_image(&image)
         .unwrap();
 
-        let retired = native_retired_refs(&project_root, &repo_id)
+        let retired = retired_refs::<
+            crate::storage::apfs::native::MacOsApfsExecutionHost<cowshed_apfs::SystemCommandRunner>,
+        >(&project_root, &repo_id)
             .unwrap()
             .recorded;
         assert_eq!(retired.len(), 1);
@@ -14878,14 +14987,14 @@ mod retired_recovery_tests {
     /// Reclaiming a detached retired image runs no disk command; one that does is a test bug.
     struct NoDiskCommands;
 
-    impl crate::apfs::CommandRunner for NoDiskCommands {
+    impl cowshed_apfs::CommandRunner for NoDiskCommands {
         fn run_guarded<E>(
             &self,
-            request: &crate::apfs::CommandRequest,
+            request: &cowshed_apfs::CommandRequest,
             check: impl FnOnce() -> std::result::Result<bool, E>,
-        ) -> std::result::Result<Option<crate::apfs::CommandOutput>, E>
+        ) -> std::result::Result<Option<cowshed_apfs::CommandOutput>, E>
         where
-            E: From<crate::apfs::CommandRunError> + std::fmt::Display,
+            E: From<cowshed_apfs::CommandRunError> + std::fmt::Display,
         {
             if check()? {
                 self.run(request).map(Some).map_err(E::from)
@@ -14895,29 +15004,29 @@ mod retired_recovery_tests {
         }
         fn run(
             &self,
-            request: &crate::apfs::CommandRequest,
-        ) -> std::result::Result<crate::apfs::CommandOutput, crate::apfs::CommandRunError> {
+            request: &cowshed_apfs::CommandRequest,
+        ) -> std::result::Result<cowshed_apfs::CommandOutput, cowshed_apfs::CommandRunError> {
             panic!("reclaiming a detached retired image ran a disk command: {request:?}");
         }
         fn image_lease(
             &self,
             identity: &Path,
-        ) -> std::io::Result<Option<crate::fork_lock::Fenced<std::fs::File>>> {
+        ) -> std::io::Result<Option<cowshed_os::fork_lock::Fenced<std::fs::File>>> {
             panic!("reclaiming a detached retired image took an APFS image lease: {identity:?}");
         }
         fn pin_raw_device(
             &self,
             device: &Path,
-        ) -> std::io::Result<Option<crate::fork_lock::Fenced<std::fs::File>>> {
+        ) -> std::io::Result<Option<cowshed_os::fork_lock::Fenced<std::fs::File>>> {
             panic!("reclaiming a detached retired image pinned a raw APFS device: {device:?}");
         }
-        fn attached_disk_images(&self) -> std::io::Result<Vec<crate::apfs::AttachedDiskImage>> {
+        fn attached_disk_images(&self) -> std::io::Result<Vec<cowshed_apfs::AttachedDiskImage>> {
             panic!("reclaiming a detached retired image read the kernel disk-image inventory");
         }
         fn grow_image(
             &self,
             image: &Path,
-            _: crate::metadata::ImageCapacity,
+            _: cowshed_apfs::image::ImageCapacity,
         ) -> std::io::Result<()> {
             panic!("reclaiming a detached retired image grew an image: {image:?}");
         }
@@ -14975,7 +15084,10 @@ mod retired_recovery_tests {
                 config.clone(),
             )
             .unwrap();
-            let retired = native_retired_refs(&project_root, &repo_id).unwrap();
+            let retired = retired_refs::<
+                crate::storage::apfs::native::MacOsApfsExecutionHost<cowshed_apfs::SystemCommandRunner>,
+            >(&project_root, &repo_id)
+            .unwrap();
             assert_eq!(retired.recorded.len(), 1, "the retired image is found");
             finish_store_residue(
                 host,
@@ -15035,7 +15147,9 @@ mod retired_recovery_tests {
                 config.clone(),
             )
             .unwrap();
-            let retired = native_retired_refs(&project_root, &repo_id)
+            let retired = retired_refs::<
+                crate::storage::apfs::native::MacOsApfsExecutionHost<cowshed_apfs::SystemCommandRunner>,
+            >(&project_root, &repo_id)
                 .expect("a sidecarless trash image does not fail the open");
             assert!(retired.recorded.is_empty());
             assert_eq!(retired.unrecorded, std::slice::from_ref(&image));
@@ -15121,8 +15235,8 @@ fn native_restore_error(
 /// Read a capacity the way both image verbs spell it, refusing anything the tools would have to
 /// round or reinterpret before the caller's workspace is touched.
 #[cfg(target_os = "macos")]
-fn parse_capacity(value: &str) -> Result<crate::metadata::ImageCapacity> {
-    crate::metadata::ImageCapacity::parse(value).map_err(|error| {
+fn parse_capacity(value: &str) -> Result<cowshed_apfs::image::ImageCapacity> {
+    cowshed_apfs::image::ImageCapacity::parse(value).map_err(|error| {
         CowshedError::usage(
             error.to_string(),
             "use a capacity such as 100g, 200g, or 1t",
@@ -15177,6 +15291,12 @@ fn native_storage_error(error: crate::storage::apfs::ApfsStorageError) -> Cowshe
     match error {
         crate::storage::apfs::ApfsStorageError::Conflict(error) => {
             CowshedError::lifecycle_conflict(error)
+        }
+        error @ crate::storage::apfs::ApfsStorageError::Unsupported { .. } => {
+            CowshedError::usage(
+                error.to_string(),
+                "use the native APFS backend for physical-volume operations",
+            )
         }
         crate::storage::apfs::ApfsStorageError::GcPlanStale => CowshedError::retryable(
             crate::error::Retry::GcPlanStale,
@@ -15306,13 +15426,10 @@ fn require_named_after_mount(named: crate::storage::apfs::Labelled, image: &Path
 /// Names a workspace image's volume through the APFS host, which renames only the volume device
 /// the kernel maps that image under the store to.
 #[cfg(target_os = "macos")]
-struct ApfsLabeller<R>(std::sync::Arc<crate::storage::apfs::native::MacOsApfsExecutionHost<R>>);
+struct ApfsLabeller<H>(std::sync::Arc<H>);
 
 #[cfg(target_os = "macos")]
-impl<R> super::supervisor::VolumeLabeller for ApfsLabeller<R>
-where
-    R: crate::apfs::CommandRunner + Send + Sync + 'static,
-{
+impl<H: RuntimeStorageHost> super::supervisor::VolumeLabeller for ApfsLabeller<H> {
     fn ensure_label(
         &self,
         image: &Path,
@@ -15627,7 +15744,7 @@ fn image_lifecycle_lock_is_held(image: &Path) -> Result<bool> {
         .custom_flags(libc::O_NOFOLLOW)
         .open(&lock)
     {
-        Ok(file) => crate::fork_lock::Fenced::new(file),
+        Ok(file) => cowshed_os::fork_lock::Fenced::new(file),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(error) => {
             return Err(CowshedError::environment_missing(
@@ -16005,7 +16122,7 @@ async fn require_lost_groups_released(
 #[cfg(all(test, target_os = "macos"))]
 mod unresolved_retirement_tests {
     use super::*;
-    use crate::fork_lock::Spawn as _;
+    use cowshed_os::fork_lock::Spawn as _;
     use std::io::{BufRead as _, Read as _, Write as _};
     use std::os::unix::process::CommandExt as _;
     use std::time::Duration;
@@ -19394,8 +19511,8 @@ mod session_reopen_tests {
 #[cfg(all(test, target_os = "macos"))]
 mod volume_labeller_tests {
     use super::*;
-    use crate::apfs::{AttachedDiskImage, CommandOutput, CommandRequest, CommandRunError};
-    use crate::fork_lock::Fenced;
+    use cowshed_apfs::{AttachedDiskImage, CommandOutput, CommandRequest, CommandRunError};
+    use cowshed_os::fork_lock::Fenced;
     use crate::runtime::supervisor::VolumeLabeller as _;
     use crate::storage::apfs::ApfsSubstrateConfig;
     use crate::storage::apfs::native::{MacOsApfsExecutionHost, SystemKernelMountSource};
@@ -19410,14 +19527,14 @@ mod volume_labeller_tests {
         }
     }
 
-    impl crate::apfs::CommandRunner for RecordedDiskCommands {
+    impl cowshed_apfs::CommandRunner for RecordedDiskCommands {
         fn run_guarded<E>(
             &self,
-            request: &crate::apfs::CommandRequest,
+            request: &cowshed_apfs::CommandRequest,
             check: impl FnOnce() -> std::result::Result<bool, E>,
-        ) -> std::result::Result<Option<crate::apfs::CommandOutput>, E>
+        ) -> std::result::Result<Option<cowshed_apfs::CommandOutput>, E>
         where
-            E: From<crate::apfs::CommandRunError> + std::fmt::Display,
+            E: From<cowshed_apfs::CommandRunError> + std::fmt::Display,
         {
             if check()? {
                 self.run(request).map(Some).map_err(E::from)
@@ -19447,7 +19564,7 @@ mod volume_labeller_tests {
         fn grow_image(
             &self,
             image: &Path,
-            _: crate::metadata::ImageCapacity,
+            _: cowshed_apfs::image::ImageCapacity,
         ) -> std::io::Result<()> {
             Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,

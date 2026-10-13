@@ -1,0 +1,24 @@
+[package]
+name = "cowshed-os"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+
+# The host primitives every cowshed layer shares: child processes, durable file I/O, the fork
+# lock, lifecycle spans and the host load. Below both `cowshed-apfs` and `cowshed-core`, so the
+# disk-image layer builds without the workspace controller.
+[dependencies]
+libc = "0.2"
+thiserror = "2"
+tokio.workspace = true
+uuid = { version = "1", features = ["v4"] }
+
+[features]
+# Test-support surface for dependants' tests: the per-thread sync counter `fsio` keeps and the
+# fork-lock probes (`held_exclusive`, `in_flight`). A dependant's `tests` link this crate as an
+# external dependency, where `cfg(test)` cannot reach them; its dev-dependency turns this on for
+# its test build only, so no shipped artifact counts syncs.
+test-hooks = []
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "test-util"] }

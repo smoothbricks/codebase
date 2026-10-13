@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use super::{BuildStatePath, CapabilityId, DeclaredState, DetectionContext, merge_build_state};
-use crate::fork_lock::Run;
+use cowshed_os::fork_lock::Run;
 use crate::{CowshedError, Result};
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

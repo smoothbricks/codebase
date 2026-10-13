@@ -46,7 +46,7 @@ use std::os::unix::process::ExitStatusExt;
 use crate::api::dto::CommandArg;
 use crate::api::process::ProcessCoverageGap;
 use crate::error::CowshedError;
-use crate::process::process_arguments;
+use cowshed_os::process::process_arguments;
 use crate::runtime::job_groups::{ProcessRecord, process_record};
 use crate::runtime::process_tree::{
     BirthToken, ProcessFoldError, ProcessIdentity, ProcessImage, ProcessObservation,
@@ -676,7 +676,7 @@ mod tests {
     use super::*;
     use crate::api::dto::ExitStatus;
     use crate::api::process::{ProcessCoverage, ProcessExit};
-    use crate::fork_lock::Spawn;
+    use cowshed_os::fork_lock::Spawn;
 
     /// `/bin/bash -c script` (not `/bin/sh`, a stub that execs the selected shell), held before
     /// its exec until it is watched. The pre-exec hook reports the child's pid, then waits for

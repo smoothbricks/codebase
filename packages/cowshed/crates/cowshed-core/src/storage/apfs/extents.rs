@@ -16,7 +16,7 @@ use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use super::ApfsStorageError;
-use crate::apfs::SECTOR_BYTES;
+use cowshed_apfs::SECTOR_BYTES;
 use crate::storage::lifecycle::ExtentCount;
 
 /// The rewrite's read/write unit: large enough that the allocator lays each write out as one run,
@@ -380,7 +380,7 @@ mod tests {
     use super::{
         count_extents, next_data_region, punch_hole, rewrite_contiguously, rewrite_sibling,
     };
-    use crate::fork_lock::Run as _;
+    use cowshed_os::fork_lock::Run as _;
 
     const MIB: u64 = 1024 * 1024;
     const PAGE: u64 = 16 * 1024;

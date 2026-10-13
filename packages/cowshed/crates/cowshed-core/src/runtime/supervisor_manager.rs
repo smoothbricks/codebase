@@ -36,9 +36,9 @@ use super::supervisor_socket::{
     self, AuthorityWire, BuildId, protocol_error, read_json, verify_peer, write_json,
 };
 use crate::error::{CowshedError, ErrorCode, OtherBuild, Result};
-use crate::fork_lock::Spawn as _;
+use cowshed_os::fork_lock::Spawn as _;
 use crate::metadata::WorkspaceName;
-use crate::timing;
+use cowshed_os::timing;
 
 /// How long a started supervisor may take to open its project, mount its workspace and answer.
 const START_BOUND: Duration = Duration::from_secs(180);

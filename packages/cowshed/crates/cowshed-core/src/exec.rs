@@ -4,7 +4,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 
-use crate::fork_lock::Spawn as _;
+use cowshed_os::fork_lock::Spawn as _;
 use crate::repository::is_lexically_canonical;
 use crate::sandbox::{SandboxConfig, SandboxError, SandboxProfileRole, seatbelt_profile};
 #[cfg(target_os = "linux")]

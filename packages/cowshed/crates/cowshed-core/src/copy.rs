@@ -895,13 +895,13 @@ fn classify(metadata: &fs::Metadata) -> Option<EntryKind> {
     }
 }
 
-/// The volume's own bookkeeping ([`crate::apfs::VOLUME_METADATA`], and the Spotlight opt-out
-/// [`crate::apfs::SPOTLIGHT_OPT_OUT`] each mount plants): the image volume grows its own, so it
+/// The volume's own bookkeeping ([`cowshed_apfs::VOLUME_METADATA`], and the Spotlight opt-out
+/// [`cowshed_apfs::SPOTLIGHT_OPT_OUT`] each mount plants): the image volume grows its own, so it
 /// is neither copied from the source nor deleted from the destination.
 fn is_apfs_volume_metadata(name: &OsStr) -> bool {
-    crate::apfs::VOLUME_METADATA
+    cowshed_apfs::VOLUME_METADATA
         .iter()
-        .chain([&crate::apfs::SPOTLIGHT_OPT_OUT])
+        .chain([&cowshed_apfs::SPOTLIGHT_OPT_OUT])
         .any(|reserved| name == OsStr::new(reserved))
 }
 
@@ -1714,7 +1714,7 @@ mod tests {
     #[test]
     #[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
     fn host_controller_copy_preserves_holes_and_verifies_each_lifecycle_step() {
-        use crate::apfs::{ApfsBackend, MacOsApfsBackend, MountAccess, SystemCommandRunner};
+        use cowshed_apfs::{ApfsBackend, MacOsApfsBackend, MountAccess, SystemCommandRunner};
         use std::io::{Seek, SeekFrom, Write};
         use std::os::unix::fs::symlink;
 
@@ -1739,7 +1739,7 @@ mod tests {
         let image = root
             .path()
             .join("destination")
-            .with_extension(crate::metadata::IMAGE_EXTENSION);
+            .with_extension(cowshed_apfs::image::IMAGE_EXTENSION);
         crate::blank_image::blank_image(&image);
         let backend = MacOsApfsBackend::new(SystemCommandRunner);
         let attachment = backend.attach_verified(&image).unwrap();
@@ -1860,10 +1860,10 @@ mod tests {
         );
         assert_eq!(fs::read(source.join("dense")).unwrap(), b"updated!");
         backend
-            .unmount_verified(&attachment, crate::apfs::DetachIntent::WhenIdle)
+            .unmount_verified(&attachment, cowshed_apfs::DetachIntent::WhenIdle)
             .unwrap();
         backend
-            .detach(&attachment, crate::apfs::DetachIntent::WhenIdle)
+            .detach(&attachment, cowshed_apfs::DetachIntent::WhenIdle)
             .unwrap();
     }
 }

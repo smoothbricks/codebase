@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::api::dto::{AdoptOptions, CreateOptions, RemoveOptions, RemoveReport};
 use crate::error::{CowshedError, Result as CowshedResult};
-use crate::fork_lock::Fenced;
+use cowshed_os::fork_lock::Fenced;
 use crate::metadata::{MetadataError, WorkspaceIncarnation, WorkspaceName, read_json, write_json};
 use crate::repository::RepoId;
 /// Objects in these namespaces are controller implementation details and never canonical listings.
@@ -237,7 +237,7 @@ impl ReAdoptSource {
                     let staged_image = project
                         .join(STAGING_NAMESPACE)
                         .join(format!("readopt-{new}-build"))
-                        .with_extension(crate::metadata::IMAGE_EXTENSION);
+                        .with_extension(cowshed_apfs::image::IMAGE_EXTENSION);
                     if build.replacement_image != staged_image {
                         return refuse(format!(
                             "replacement build image {} is not {}",
@@ -265,7 +265,7 @@ impl ReAdoptSource {
             ReAdoptMain::Missing(missing) => {
                 let canonical = project
                     .join("main")
-                    .with_extension(crate::metadata::IMAGE_EXTENSION);
+                    .with_extension(cowshed_apfs::image::IMAGE_EXTENSION);
                 if missing.canonical != canonical {
                     return refuse(format!(
                         "missing main image {} is not {}",
@@ -372,6 +372,38 @@ impl ReAdoptSource {
     }
 }
 
+/// The images a re-adoption record retains: main's (a missing main retains none), its build
+/// volume's, and every old seed's, each by its original or its retained path.
+impl cowshed_apfs::RetainedInputs for ReAdoptSource {
+    fn names(&self, path: &Path) -> bool {
+        let named = |original: &Path, retained: &Path| path == original || path == retained;
+        self.main.retained().is_some_and(|image| named(&image.original, &image.retained))
+            || self.build.as_ref().is_some_and(|build| named(&build.image.original, &build.image.retained))
+            || self.old_seeds.iter().any(|seed| named(&seed.original, &seed.retained))
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl ReAdoptSource {
+    /// `path` as the retained-input token the disk-image layer's read-only attachment takes: one
+    /// of exactly the images this validated record names.
+    pub(crate) fn retained_input<'a>(
+        &self,
+        path: &'a Path,
+    ) -> CowshedResult<cowshed_apfs::RetainedInput<'a>> {
+        self.validate()?;
+        cowshed_apfs::RetainedInput::named_by(self, path).ok_or_else(|| {
+            CowshedError::integrity(
+                format!(
+                    "{} is not an input named by this re-adoption record",
+                    path.display()
+                ),
+                "keep the source images and repair the replacement record",
+            )
+        })
+    }
+}
+
 /// Where re-adoption retains the images it replaced, under the project directory.
 pub const RETAINED_NAMESPACE: &str = "retained";
 
@@ -387,7 +419,7 @@ fn retained_at(
     retained_stem: &str,
 ) -> bool {
     let Some(extension) = original.extension().filter(|extension| {
-        [crate::metadata::IMAGE_EXTENSION, "asif", "sparseimage"]
+        [cowshed_apfs::image::IMAGE_EXTENSION, "asif", "sparseimage"]
             .iter()
             .any(|known| **extension == **known)
     }) else {

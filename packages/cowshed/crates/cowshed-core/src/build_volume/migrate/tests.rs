@@ -1,10 +1,11 @@
 use super::*;
 use crate::build_volume::BuildVolumeRole;
-use crate::fork_lock::Run as _;
+use cowshed_os::fork_lock::Run as _;
 use crate::metadata::WorkspaceName;
 use crate::repository::{ProjectPaths, RepoId};
 use crate::sandbox::{RunSandboxMode, SandboxConfig, SandboxGrants};
 use crate::storage::apfs::ApfsSubstrateConfig;
+use crate::storage::directory::DirectoryExecutionHost;
 use std::path::PathBuf;
 
 struct Scratch(PathBuf);
@@ -70,12 +71,7 @@ fn linked_record() -> BuildVolumeRecord {
     )
 }
 
-fn host(
-    root: &Path,
-) -> (
-    MacOsApfsExecutionHost<SystemCommandRunner>,
-    BuildVolumeLayout,
-) {
+fn host(root: &Path) -> (DirectoryExecutionHost, BuildVolumeLayout) {
     let store = root.join("store");
     fs::create_dir_all(&store).unwrap();
     let project = ProjectPaths::with_mount_root(
@@ -84,11 +80,9 @@ fn host(
         &RepoId::parse("example-org/example-app").unwrap(),
     )
     .unwrap();
-    let host = MacOsApfsExecutionHost::new(
-        SystemCommandRunner,
-        ApfsSubstrateConfig::new(&store, root.join("checkout")),
-    )
-    .unwrap();
+    let host =
+        DirectoryExecutionHost::new(ApfsSubstrateConfig::new(&store, root.join("checkout")))
+            .unwrap();
     (host, BuildVolumeLayout::new(&project).unwrap())
 }
 
@@ -333,8 +327,8 @@ fn configured_cargo_target_containing_tracked_source_refuses_before_mint_or_dele
 }
 
 #[test]
-fn real_apfs_first_touch_resumes_the_early_pointer_and_publishes_record_last() {
-    let root = crate::scratch_apfs::ScratchRoot::new("build-migration").unwrap();
+fn directory_first_touch_resumes_the_early_pointer_and_publishes_record_last() {
+    let root = crate::scratch_directory::ScratchRoot::new("build-migration").unwrap();
     let checkout = root.path().join("checkout");
     fs::create_dir_all(&checkout).unwrap();
     git(&checkout, &["init", "--quiet"]);
@@ -348,11 +342,6 @@ fn real_apfs_first_touch_resumes_the_early_pointer_and_publishes_record_last() {
     write(&checkout, "source.rs", "source stays");
     git(&checkout, &["add", "source.rs"]);
     let (host, layout) = host(root.path());
-    // The mint clones the store's blank template: the run's, seeded here.
-    crate::blank_image::blank_image(&crate::storage::apfs::native::blank_template_path(
-        &root.path().join("store"),
-        crate::blank_image::CAPACITY,
-    ));
     let id = BuildVolumeId::mint();
     let mount = host
         .create_build_volume(&layout, &id, ImageCapacity::from_gibibytes(1))

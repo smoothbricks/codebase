@@ -7,21 +7,24 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use cowshed_core::apfs::{
+use cowshed_apfs::{
     ApfsBackend, AttachedImage, CommandRunner, CreateImageRequest, DetachIntent, DiskImageSource,
     ImageCapture, MacOsApfsBackend, MountAccess, SystemCommandRunner, volume_name,
 };
-use cowshed_core::attach_budget;
-use cowshed_core::fork_lock::Run as _;
+use cowshed_apfs::attach_budget;
+use cowshed_os::fork_lock::Run as _;
+use cowshed_apfs::image::ImageCapacity;
+use cowshed_apfs::template::{
+    BLANK_TEMPLATE_LABEL, blank_template, blank_template_path, blank_template_staged_stem,
+};
 use cowshed_core::metadata::{
-    GrantSet, ImageCapacity, MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE, PortBlock, WorkspaceIncarnation,
+    GrantSet, MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE, PortBlock, WorkspaceIncarnation,
     WorkspaceName, WorkspaceRole,
 };
 use cowshed_core::repository::RepoId;
 use cowshed_core::storage::apfs::extents::{count_extents, rewrite_sibling};
 use cowshed_core::storage::apfs::native::{
-    BLANK_TEMPLATE_LABEL, KernelMountSource, MacOsApfsExecutionHost, SystemKernelMountSource,
-    blank_template, blank_template_path, blank_template_staged_stem,
+    KernelMountSource, MacOsApfsExecutionHost, SystemKernelMountSource,
 };
 use cowshed_core::storage::apfs::{
     Alongside, ApfsExecutionHost, ApfsStorageError, ApfsSubstrate, ApfsSubstrateConfig,
@@ -33,9 +36,9 @@ use cowshed_core::storage::lifecycle::{
 };
 use cowshed_core::storage::{CheckpointLabel, StorageLayout, WORKSPACE_MARKER_PATH};
 
-#[path = "../support/blank_image.rs"]
+#[path = "../../../cowshed-apfs/tests/support/blank_image.rs"]
 mod blank_image;
-#[path = "../support/scratch_apfs.rs"]
+#[path = "../../../cowshed-apfs/tests/support/scratch_apfs.rs"]
 mod scratch_apfs;
 
 use blank_image::CAPACITY;

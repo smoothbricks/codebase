@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use cowshed_gateway_types::StartupHeal;
 use thiserror::Error;
 
-use crate::apfs::SystemCommandRunner;
+use cowshed_apfs::SystemCommandRunner;
 #[cfg(test)]
 use crate::api::dto::WorkspaceState;
 use crate::api::dto::{ProjectWorkspaces, WorkspaceInfo};
@@ -18,8 +18,9 @@ use crate::metadata::{
     WorkspaceIncarnation, WorkspaceName, sidecar_path,
 };
 use crate::repository::{OwnedRepoIds, RepoId, RepositoryBinding};
+use cowshed_apfs::mounts::KernelMountSnapshot;
 use crate::storage::apfs::native::{
-    KernelMountSnapshot, KernelMountSource, MacOsApfsExecutionHost, SystemKernelMountSource,
+    KernelMountSource, MacOsApfsExecutionHost, SystemKernelMountSource,
 };
 use crate::storage::apfs::{
     ApfsExecutionHost, ApfsStorageError, ApfsSubstrate, ApfsSubstrateConfig,
@@ -649,7 +650,7 @@ impl NativeGatewayInventory {
     /// anyone: its first status already says how many it is still mounting.
     pub async fn recorded_projects(&self) -> Result<Vec<RepoId>, GatewayInventoryError> {
         let store = self.storage.store().to_owned();
-        crate::timing::timed_async(HEAL_SCOPE, "discover", async move {
+        cowshed_os::timing::timed_async(HEAL_SCOPE, "discover", async move {
             crate::storage::lifecycle::dispatch_blocking(move || discover_repositories(&store))
                 .await
                 .map_err(|error| GatewayInventoryError::Blocking(error.to_string()))?
@@ -687,7 +688,7 @@ impl NativeGatewayInventory {
         // Deferred-first: images whose disk child hit the deadline on the last pass heal
         // before the rest, so a deferred workspace is retried first rather than in
         // inventory order. Empty most passes, in which case every order below is untouched.
-        let deferred = crate::apfs::take_deferred_images();
+        let deferred = cowshed_apfs::take_deferred_images();
         let store_root = self.storage.store().to_owned();
         let was_deferred = |repo: &RepoId, workspace: &LifecycleWorkspace| {
             let Ok(layout) = StorageLayout::new(&store_root, repo) else {
@@ -702,7 +703,7 @@ impl NativeGatewayInventory {
         };
         let mut opened = Vec::with_capacity(repositories.len());
         for repo in repositories {
-            let project = crate::timing::timed_async(
+            let project = cowshed_os::timing::timed_async(
                 HEAL_SCOPE,
                 format!("open {repo}"),
                 self.open_project(&repo),
@@ -725,7 +726,7 @@ impl NativeGatewayInventory {
                 Ok(project) => {
                     let main = match &project.main {
                         Some(main) => {
-                            crate::timing::timed_async(
+                            cowshed_os::timing::timed_async(
                                 HEAL_SCOPE,
                                 format!("mount {repo_id}/{}", main.name()),
                                 project.mounts.mount(main),
@@ -757,7 +758,7 @@ impl NativeGatewayInventory {
                 for workspace in ordered {
                     sessions.push(SessionHealOutcome {
                         workspace: workspace.name().clone(),
-                        mount: crate::timing::timed_async(
+                        mount: cowshed_os::timing::timed_async(
                             HEAL_SCOPE,
                             format!("mount {}/{}", healed.repo_id, workspace.name()),
                             project.mounts.mount(workspace),
@@ -963,7 +964,7 @@ impl NativeGatewayInventory {
                             .file_name()
                             .and_then(|name| name.to_str())
                             .is_some_and(|name| name.starts_with("main-"))
-                            && crate::metadata::is_image_path(&path)
+                            && cowshed_apfs::image::is_image_path(&path)
                             && fs::symlink_metadata(&path)
                                 .is_ok_and(|metadata| metadata.file_type().is_file())
                             // A retired image without its sidecar has no record left to name a

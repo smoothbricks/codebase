@@ -30,21 +30,8 @@ use crate::error::{CowshedError, Result};
 use crate::gateway_inventory::{GatewaySessionFact, NativeGatewayInventory};
 use crate::metadata::{EgressMode as CoreEgressMode, GrantSet, WorkspaceIncarnation};
 use crate::repository::RepoId;
-use crate::storage::bootstrap::{STORE_ROOT, ValidatedHostStorage};
-
-/// The gateway control socket, at the store root.
-///
-/// Root-level keeps `sun_path` short (01_storage.md): a Unix socket address is capped near 104
-/// bytes, and a home-relative path spent that budget on the user's name before the gateway had
-/// said anything. The store is also the only location every peer agrees on — a LaunchAgent, the
-/// CLI, and a supervising runtime each know the store, while `HOME` differs between them.
-///
-/// Derived here rather than in `cowshed-gateway` because the canonical roots live in this crate
-/// and the gateway crate sits below it: one definition, no constant copied across a crate
-/// boundary.
-pub fn control_socket_path() -> PathBuf {
-    Path::new(STORE_ROOT).join("gateway.sock")
-}
+use crate::storage::bootstrap::ValidatedHostStorage;
+use cowshed_gateway_types::{STORE_ROOT, control_socket_path};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ReconcileReport {

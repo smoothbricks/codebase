@@ -648,7 +648,7 @@ mod tests {
         ProcessCoverageGap, ProcessIoUnavailable, ProcessStorageIo, ProcessUsage,
     };
     use crate::api::resources::{CpuMicros, ResidentBytes, StorageIoBytes};
-    use crate::fork_lock::Spawn as _;
+    use cowshed_os::fork_lock::Spawn as _;
     use crate::runtime::process_tree::{BirthToken, ProcessIdentity};
 
     const ROLE: &str = "COWSHED_PROCESS_USAGE_ROLE";

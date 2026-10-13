@@ -36,7 +36,7 @@ use crate::api::resources::{
     ResourceUnitError, StorageIoBytes, StorageIoTotals, StreamBytes, StreamLines,
     UsageReconciliation, VolumeUsage, WallMicros,
 };
-use crate::fsio::Durability;
+use cowshed_os::fsio::Durability;
 use crate::metadata::WorkspaceIncarnation;
 use crate::repository::{OwnedRepoIds, RepoId};
 mod publication;
@@ -566,12 +566,12 @@ fn record_set_aside_incarnation(
     set_aside: &SetAsideStore,
     incarnation: &WorkspaceIncarnation,
 ) -> Result<(), ArtifactError> {
-    crate::fsio::publish_private_file(&set_aside.path.join(SET_ASIDE_INCARNATION_FILE), |writer| {
+    cowshed_os::fsio::publish_private_file(&set_aside.path.join(SET_ASIDE_INCARNATION_FILE), |writer| {
         writer.write_all(incarnation.as_str().as_bytes())
     })
     .map_err(|error| match error {
-        crate::fsio::PublishError::Io { path, source } => io_error(&path, source),
-        crate::fsio::PublishError::Write(source) => io_error(&set_aside.path, source),
+        cowshed_os::fsio::PublishError::Io { path, source } => io_error(&path, source),
+        cowshed_os::fsio::PublishError::Write(source) => io_error(&set_aside.path, source),
     })
 }
 
@@ -2636,7 +2636,7 @@ fn records_path(workspace_root: &Path) -> PathBuf {
 /// The records `flock`, fenced so another store instance takes it as soon as this one drops it
 /// (`fork_lock`).
 struct RecordsLock<'path> {
-    _file: crate::fork_lock::Fenced<File>,
+    _file: cowshed_os::fork_lock::Fenced<File>,
     records: &'path Path,
 }
 
@@ -2667,7 +2667,7 @@ impl<'path> RecordsLock<'path> {
         }
         let file = options
             .open(&path)
-            .map(crate::fork_lock::Fenced::new)
+            .map(cowshed_os::fork_lock::Fenced::new)
             .map_err(|error| io_error(&path, error))?;
         let metadata = file.metadata().map_err(|error| io_error(&path, error))?;
         reject_hardlink(&path, &metadata)?;
@@ -2782,12 +2782,12 @@ fn publish_counter(
     bytes[..8].copy_from_slice(counter.magic);
     bytes[8..16].copy_from_slice(&current.to_le_bytes());
     bytes[16..24].copy_from_slice(&(!current).to_le_bytes());
-    crate::fsio::publish_private_file_with::<io::Error>(path, durability, |writer| {
+    cowshed_os::fsio::publish_private_file_with::<io::Error>(path, durability, |writer| {
         writer.write_all(&bytes)
     })
     .map_err(|error| match error {
-        crate::fsio::PublishError::Io { path, source } => io_error(&path, source),
-        crate::fsio::PublishError::Write(source) => io_error(path, source),
+        cowshed_os::fsio::PublishError::Io { path, source } => io_error(&path, source),
+        cowshed_os::fsio::PublishError::Write(source) => io_error(path, source),
     })
 }
 
@@ -3091,7 +3091,7 @@ fn sync_parent_directory(path: &Path) -> Result<(), ArtifactError> {
 }
 
 fn sync_directory(path: &Path) -> Result<(), ArtifactError> {
-    crate::fsio::sync_directory(path).map_err(|error| io_error(path, error))
+    cowshed_os::fsio::sync_directory(path).map_err(|error| io_error(path, error))
 }
 
 fn scan_job_directories(workspace_root: &Path) -> Result<u64, ArtifactError> {
@@ -7830,16 +7830,16 @@ mod tests {
             )
             .unwrap();
         store.append(&token, StreamKind::Stdout, b"built").unwrap();
-        crate::fsio::take_syncs();
+        cowshed_os::fsio::take_syncs();
         store.prepare_background(&token).unwrap();
         assert_eq!(
-            crate::fsio::take_syncs(),
-            crate::fsio::Syncs { fsync: 2, full: 0 },
+            cowshed_os::fsio::take_syncs(),
+            cowshed_os::fsio::Syncs { fsync: 2, full: 0 },
             "backgrounding syncs stdout and stderr"
         );
 
         store.finish(token, JobState::Exited).unwrap();
-        crate::fsio::take_syncs();
+        cowshed_os::fsio::take_syncs();
         let publication = OutputPublication {
             path: WorkspacePath::new("published/stdout.txt").unwrap(),
             policy: crate::api::dto::PublicationPolicy::CreateNew,
@@ -7848,8 +7848,8 @@ mod tests {
             .publish_output(job_id, StreamKind::Stdout, &publication)
             .unwrap();
         assert_eq!(
-            crate::fsio::take_syncs(),
-            crate::fsio::Syncs { fsync: 1, full: 0 },
+            cowshed_os::fsio::take_syncs(),
+            cowshed_os::fsio::Syncs { fsync: 1, full: 0 },
             "publication syncs its copy and not the directory it lands in"
         );
         assert_eq!(

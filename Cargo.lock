@@ -817,6 +817,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
+name = "cowshed-apfs"
+version = "0.1.0"
+dependencies = [
+ "cowshed-gateway-types",
+ "cowshed-os",
+ "libc",
+ "plist",
+ "serde",
+ "serde_json",
+ "sha2",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "cowshed-api-gen"
 version = "0.1.0"
 dependencies = [
@@ -861,7 +876,9 @@ dependencies = [
  "base64 0.22.1",
  "blake3",
  "bytes",
+ "cowshed-apfs",
  "cowshed-gateway-types",
+ "cowshed-os",
  "getrandom 0.3.4",
  "libc",
  "miniz_oxide 0.8.9",
@@ -948,6 +965,16 @@ dependencies = [
  "napi-derive",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "cowshed-os"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "thiserror",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]

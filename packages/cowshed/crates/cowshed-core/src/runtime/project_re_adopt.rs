@@ -10,12 +10,14 @@
 
 use std::path::{Path, PathBuf};
 
-use super::{NativeProjectRuntimeHost, close_checkout_nx, main_name, native_integrity_error};
+use super::{StorageProjectRuntimeHost, close_checkout_nx, main_name, native_integrity_error};
 use super::{WorkspaceSnapshot, native_staged_error, native_storage_error};
+use crate::runtime::storage_host::RuntimeStorageHost;
 use crate::api::dto::AdoptOptions;
 use crate::build_volume::BuildVolumeId;
 use crate::error::{CowshedError, ErrorCode, Result};
-use crate::metadata::{IMAGE_EXTENSION, WorkspaceName};
+use cowshed_apfs::image::IMAGE_EXTENSION;
+use crate::metadata::WorkspaceName;
 use crate::storage::apfs::COMPANION_SUFFIX;
 use crate::storage::lifecycle::AdoptHandoff;
 use crate::storage::recovery::{
@@ -24,7 +26,7 @@ use crate::storage::recovery::{
     ReAdoptRetained, ReAdoptSource, STAGING_NAMESPACE,
 };
 
-impl NativeProjectRuntimeHost {
+impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
     /// Re-adopt main: gate, record, then run the replacement (step 1 of the spec, then 2-5).
     pub(super) async fn re_adopt(&mut self, options: AdoptOptions) -> Result<WorkspaceSnapshot> {
         let main = main_name();
@@ -681,7 +683,7 @@ impl NativeProjectRuntimeHost {
             .substrate
             .plan_adopt(crate::storage::lifecycle::AdoptRequest {
                 repo: self.descriptor.repo_id.clone(),
-                capacity: crate::metadata::ImageCapacity::from_bytes(main_capacity(&source)),
+                capacity: cowshed_apfs::image::ImageCapacity::from_bytes(main_capacity(&source)),
                 topology_revision: crate::storage::lifecycle::Revision::new(0),
                 source_checkout: source.checkout.clone(),
                 handoff: handoff(&source),
@@ -821,7 +823,7 @@ impl NativeProjectRuntimeHost {
 /// Image formats an adoption from before RAW left, read only as re-adoption inputs.
 const LEGACY_IMAGE_EXTENSIONS: [&str; 2] = ["asif", "sparseimage"];
 
-/// The main a re-adoption replaces, as [`NativeProjectRuntimeHost::replaced_main`] found it.
+/// The main a re-adoption replaces, as [`StorageProjectRuntimeHost::replaced_main`] found it.
 struct ReplacedMain {
     image: PathBuf,
     metadata: crate::metadata::DetachedWorkspaceMetadata,
@@ -895,7 +897,7 @@ fn require_outside(checkout: &Path) -> Result<()> {
 /// repository (02_workspaces.md, "Missing main image"). Both paths arrive canonical.
 /// Refuse when anything holds `path`, naming each holder by PID and command (02_workspaces.md,
 /// "Re-adoption" step 1). Nothing is stopped, killed or forced.
-fn refuse_held(path: &Path, holders: &[crate::build_volume::nx::Holder]) -> Result<()> {
+fn refuse_held(path: &Path, holders: &[cowshed_os::process::Holder]) -> Result<()> {
     if holders.is_empty() {
         return Ok(());
     }

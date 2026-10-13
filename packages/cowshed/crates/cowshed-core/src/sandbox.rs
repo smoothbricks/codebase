@@ -6,7 +6,7 @@ use crate::capabilities::{
     CapabilityGrant, DetectedCapabilities, DetectionContext, GrantAccess, GrantScope,
 };
 pub use crate::metadata::PortBlock;
-use crate::storage::bootstrap::STORE_ROOT;
+use cowshed_gateway_types::STORE_ROOT;
 
 fn cowshed_root() -> &'static Path {
     Path::new(STORE_ROOT)
@@ -1257,9 +1257,9 @@ fn push_line(profile: &mut String, line: &str) {
 mod tests {
     use super::*;
     #[cfg(target_os = "macos")]
-    use crate::fork_lock::Run as _;
+    use cowshed_os::fork_lock::Run as _;
     #[cfg(target_os = "macos")]
-    use crate::fork_lock::Spawn as _;
+    use cowshed_os::fork_lock::Spawn as _;
     use std::fs;
     #[cfg(target_os = "macos")]
     use std::process::Stdio;

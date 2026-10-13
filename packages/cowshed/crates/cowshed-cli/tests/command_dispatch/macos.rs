@@ -1,7 +1,7 @@
 use cowshed_cli::args::parse_args;
 use cowshed_cli::output::Output;
 use cowshed_cli::runtime::{ActorBridge, CliService, dispatch};
-use cowshed_core::apfs::{
+use cowshed_apfs::{
     ApfsBackend, CommandRunner, DetachIntent, DiskImageSource, ImageCapture, MacOsApfsBackend,
     SystemCommandRunner,
 };
@@ -10,16 +10,17 @@ use cowshed_core::api::dto::{
     Adoption, AdoptionSkip, CarrySide, DatabaseHolder, GcReport, LandReport, LandSeed,
     RebaseBuildVolume, RebaseCarrySkip, RebaseReport, Reseed, ReseedResult,
 };
-use cowshed_core::attach_budget;
+use cowshed_apfs::attach_budget;
 use cowshed_core::build_volume::{
     BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord, BuildVolumeRole, link, nx,
 };
-use cowshed_core::metadata::{ImageCapacity, PortBlock, WorkspaceName};
+use cowshed_apfs::image::ImageCapacity;
+use cowshed_core::metadata::{PortBlock, WorkspaceName};
+use cowshed_apfs::template::{blank_template, blank_template_path};
 use cowshed_core::repository::RepoId;
 use cowshed_core::runtime::RecoveryScope;
 use cowshed_core::storage::apfs::native::{
-    KernelMountSource, MacOsApfsExecutionHost, SystemKernelMountSource, blank_template,
-    blank_template_path,
+    KernelMountSource, MacOsApfsExecutionHost, SystemKernelMountSource,
 };
 use cowshed_core::storage::apfs::{ApfsSubstrateConfig, build_volume_label};
 use cowshed_core::storage::bootstrap::{CanonicalRoots, ValidatedHostStorage};
@@ -37,18 +38,34 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
-#[path = "../../../cowshed-core/tests/support/blank_image.rs"]
+#[path = "../../../cowshed-apfs/tests/support/blank_image.rs"]
 mod blank_image;
-#[path = "../../../cowshed-core/tests/support/scratch_apfs.rs"]
+#[path = "../../../cowshed-apfs/tests/support/scratch_apfs.rs"]
 mod scratch_apfs;
+#[path = "../../../cowshed-core/tests/support/scratch_directory.rs"]
+mod scratch_directory;
 
 use scratch_apfs::ScratchRoot;
+
+enum FixtureRoot {
+    Apfs(ScratchRoot),
+    Directory(scratch_directory::ScratchRoot),
+}
+
+impl FixtureRoot {
+    fn path(&self) -> &Path {
+        match self {
+            Self::Apfs(root) => root.path(),
+            Self::Directory(root) => root.path(),
+        }
+    }
+}
 
 /// The checkout's whole `.cowshed.toml`: the build-volume cap, nothing else.
 const FIXTURE_COWSHED_TOML: &str = "[build]\ncapacity = \"1g\"\n";
 
 struct Fixture {
-    _scratch: ScratchRoot,
+    _scratch: FixtureRoot,
     checkout: PathBuf,
     storage: ValidatedHostStorage,
     granted: PathBuf,
@@ -60,21 +77,39 @@ impl Fixture {
         Self::with(Project::Plain)
     }
 
+    fn directory() -> Self {
+        Self::with_directory(Project::Plain)
+    }
+
+    fn with_directory(project: Project<'_>) -> Self {
+        Self::with_root(
+            project,
+            FixtureRoot::Directory(
+                scratch_directory::ScratchRoot::new("cli").expect("scratch directory root"),
+            ),
+        )
+    }
+
     /// A fixture whose checkout holds `project`, committed: an APFS clone of this run's checkout
     /// template for it ([`checkout_template`]).
     fn with(project: Project<'_>) -> Self {
-        // The supervisor socket includes this root and an incarnation hash. Keep the root short
-        // enough for Darwin's Unix-socket path limit; ScratchRoot's pid/sequence keep it unique.
-        let scratch = ScratchRoot::new("cli").expect("scratch APFS root");
+        Self::with_root(
+            project,
+            FixtureRoot::Apfs(ScratchRoot::new("cli").expect("scratch APFS root")),
+        )
+    }
+
+    fn with_root(project: Project<'_>, scratch: FixtureRoot) -> Self {
         let checkout = scratch.path().join("checkout");
         let store = scratch.path().join("store");
         let granted = scratch.path().join("granted");
         for path in [&store, &granted] {
             fs::create_dir_all(path).expect("fixture directory");
         }
-        // Main and build volumes are minted from the store's blank template: the run's, seeded
-        // here, at the 1 GiB test cap both `adopt --capacity` and `.cowshed.toml` ask for.
-        blank_image::blank_image(&blank_template_path(&store, blank_image::CAPACITY));
+        if matches!(&scratch, FixtureRoot::Apfs(_)) {
+            // Only the native backend mints images from the user's blank template.
+            blank_image::blank_image(&blank_template_path(&store, blank_image::CAPACITY));
+        }
         clone_tree(&checkout_template(project), &checkout);
         let storage =
             ValidatedHostStorage::new(scratch.path().to_path_buf(), CanonicalRoots::at(store));
@@ -94,22 +129,30 @@ impl Fixture {
     }
 
     async fn open(&self) -> ActorBridge {
-        ActorBridge::open_for_adopt_at(
-            &self.checkout,
-            Some(RepoId::parse("fixture/dispatch").expect("repository identity")),
-            self.storage.clone(),
-        )
-        .await
-        .expect("open native project runtime on scratch APFS")
+        let repo = Some(RepoId::parse("fixture/dispatch").expect("repository identity"));
+        match &self._scratch {
+            FixtureRoot::Apfs(_) => {
+                ActorBridge::open_for_adopt_at(&self.checkout, repo, self.storage.clone()).await
+            }
+            FixtureRoot::Directory(_) => {
+                ActorBridge::open_directory_for_adopt_at(&self.checkout, repo, self.storage.clone())
+                    .await
+            }
+        }
+        .expect("open project runtime on the fixture's storage")
     }
 
     async fn reopen(&self) -> ActorBridge {
-        ActorBridge::open_existing_at(
-            &self.checkout,
-            RecoveryScope::Workspaces([WorkspaceName::main()].into()),
-            self.storage.clone(),
-        )
-        .await
+        let scope = RecoveryScope::Workspaces([WorkspaceName::main()].into());
+        match &self._scratch {
+            FixtureRoot::Apfs(_) => {
+                ActorBridge::open_existing_at(&self.checkout, scope, self.storage.clone()).await
+            }
+            FixtureRoot::Directory(_) => {
+                ActorBridge::open_directory_existing_at(&self.checkout, scope, self.storage.clone())
+                    .await
+            }
+        }
         .expect("reopen persisted project runtime")
     }
     async fn start_gateway(&mut self) {
@@ -361,8 +404,8 @@ async fn adopt(fixture: &Fixture, service: &mut ActorBridge) {
 /// Persist grants across restarts before installing the gateway, then race the published port
 /// and reconcile a changed grant revision on the same adopted main.
 #[tokio::test]
-async fn real_apfs_dispatch_grant_persists_across_runtime_restart() {
-    let mut fixture = Fixture::new();
+async fn directory_dispatch_grant_persists_across_runtime_restart() {
+    let mut fixture = Fixture::directory();
     // Main's block must be one no parallel test's store is also handed. Every store allocates
     // from its lowest free block up and checks the host only when it allocates, so two tests can
     // hold the same low block, and the other's gateway took this test's port before this test
@@ -563,13 +606,13 @@ fn highest_free_port_block() -> PortBlock {
 /// "`cowshed land`"). Adopt, new, exec and land never create a shell hook (02_workspaces.md,
 /// "Workspace environment"; 15_capabilities.md, "Required evidence").
 #[tokio::test]
-async fn real_apfs_plain_git_repository_adopts_clones_executes_and_lands_without_shell_hooks() {
+async fn directory_plain_git_repository_adopts_clones_executes_and_lands_without_shell_hooks() {
     let started = std::time::Instant::now();
     let phase = |name| {
         eprintln!("plain-git fixture: {name} elapsed={:?}", started.elapsed());
     };
     phase("fixture");
-    let mut fixture = Fixture::new();
+    let mut fixture = Fixture::directory();
     for convention in [".envrc", ".envrc-local", "flake.nix", "devenv.nix"] {
         assert!(!fixture.checkout.join(convention).exists());
     }
@@ -790,8 +833,8 @@ async fn real_apfs_plain_git_repository_adopts_clones_executes_and_lands_without
 /// workspace failed. The supervisor starts, writes the excludes into main's, and the
 /// workspace's runtime state and the volume's own bookkeeping stay out of its status.
 #[tokio::test]
-async fn real_apfs_a_git_worktree_workspace_starts_its_supervisor_and_executes() {
-    let mut fixture = Fixture::new();
+async fn directory_a_git_worktree_workspace_starts_its_supervisor_and_executes() {
+    let mut fixture = Fixture::directory();
     let mut service = fixture.open().await;
     adopt(&fixture, &mut service).await;
     fixture.start_gateway().await;
@@ -874,10 +917,10 @@ async fn real_apfs_a_git_worktree_workspace_starts_its_supervisor_and_executes()
 /// started it, so stopping the supervisor leaves it running with its cwd on the checkout: the
 /// unmount was refused for its whole grace, then forced, and the daemon outlived the removal.
 #[tokio::test]
-async fn real_apfs_rm_stops_the_checkouts_nx_daemon_before_its_unmount() {
+async fn directory_rm_stops_the_checkouts_nx_daemon_before_removal() {
     use std::os::unix::process::ExitStatusExt;
 
-    let mut fixture = Fixture::new();
+    let mut fixture = Fixture::directory();
     let mut service = fixture.open().await;
     adopt(&fixture, &mut service).await;
     fixture.start_gateway().await;
@@ -1311,7 +1354,7 @@ async fn land_nx_project(
     String,
 ) {
     let (nx, node) = repository_nx();
-    let mut fixture = Fixture::with(Project::Nx {
+    let mut fixture = Fixture::with_directory(Project::Nx {
         nx: &nx,
         node: &node,
         declared,
@@ -1369,7 +1412,7 @@ async fn land_nx_project(
 // Admitted to the 60 s lifecycle class below its 3× rule and kept paired, because split halves
 // cost more; its samples are load-dependent (08_testing.md, Integration tests).
 #[tokio::test(flavor = "multi_thread")]
-async fn real_apfs_an_undeclared_nx_output_lands_as_a_land_adoption_commitment_substrate_lifecycle()
+async fn directory_an_undeclared_nx_output_lands_as_a_land_adoption_commitment_substrate_lifecycle()
 {
     let undeclared = tokio::spawn(land_nx_project(false));
     let declared = tokio::spawn(land_nx_project(true));
@@ -1422,14 +1465,14 @@ async fn real_apfs_an_undeclared_nx_output_lands_as_a_land_adoption_commitment_s
 /// A real-Nx test that fails mid-way leaves no Nx daemon under its root. A daemon started in a
 /// fixture's checkout -- by a shed's keeper, by a check, by hand -- detaches from whatever started
 /// it, so the failed test's unwinding never reached it, and it kept running in the deleted tree.
-/// The fixture's scratch root ends every process working in its tree as the test unwinds, before
-/// it releases the fixture's images and removes the tree.
+/// The fixture's directory root ends every process working in its tree before removal, without
+/// acquiring any disk-image capability.
 #[test]
-fn real_apfs_a_failed_nx_test_leaves_no_daemon_under_its_root_substrate_lifecycle() {
+fn directory_a_failed_nx_test_leaves_no_daemon_under_its_root_substrate_lifecycle() {
     let (nx, node) = repository_nx();
     let started = std::cell::RefCell::new(None);
     let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let fixture = Fixture::with(Project::Nx {
+        let fixture = Fixture::with_directory(Project::Nx {
             nx: &nx,
             node: &node,
             declared: true,
@@ -1465,7 +1508,7 @@ fn real_apfs_a_failed_nx_test_leaves_no_daemon_under_its_root_substrate_lifecycl
     let (root, daemon) = started
         .into_inner()
         .expect("the daemon started before the test failed");
-    let left = scratch_apfs::processes_in(|cwd| cwd.starts_with(&root))
+    let left = scratch_directory::processes::processes_in(|cwd| cwd.starts_with(&root))
         .expect("list the processes working under the root");
     assert_eq!(
         left,
@@ -1789,10 +1832,10 @@ impl Drop for Holder {
 /// sources the checkout's environment; the sandbox build must reuse those same units. Main's
 /// first seed was frozen empty at first touch; a land is what warms it.
 #[tokio::test]
-async fn real_apfs_a_fork_of_a_warm_target_is_all_fresh_and_all_hits_substrate_lifecycle() {
+async fn directory_a_fork_of_a_warm_target_is_all_fresh_and_all_hits_substrate_lifecycle() {
     let (nx, node) = repository_nx();
     let rust = rust_toolchain();
-    let mut fixture = Fixture::with(Project::Build {
+    let mut fixture = Fixture::with_directory(Project::Build {
         nx: Some((&nx, &node)),
         rust: Some(&rust),
     });
@@ -1934,14 +1977,13 @@ async fn nx_statuses(
 /// main changes `a` and runs it on the adopted volume, so its seed, frozen from the landing
 /// volume, is behind; doctor says so, `cowshed reseed main` refreezes it, and a fork hits
 /// main's run. A fork that reseeds its source on its own is
-/// [`real_apfs_a_fork_of_a_workspace_reseeds_it_and_hits_its_latest_run_substrate_lifecycle`]: `new` and `fork`
-/// reseed through the one fork path, so a second fork of main here would only pay two more
-/// attaches for it.
+/// [`directory_a_fork_of_a_workspace_reseeds_it_and_hits_its_latest_run_substrate_lifecycle`]:
+/// `new` and `fork` reseed through the same fork path.
 #[tokio::test]
-async fn real_apfs_what_main_runs_after_a_land_reaches_its_seed_and_a_fork_hits_it_substrate_lifecycle()
+async fn directory_what_main_runs_after_a_land_reaches_its_seed_and_a_fork_hits_it_substrate_lifecycle()
  {
     let (nx, node) = repository_nx();
-    let mut fixture = Fixture::with(Project::Build {
+    let mut fixture = Fixture::with_directory(Project::Build {
         nx: Some((&nx, &node)),
         rust: None,
     });
@@ -1999,8 +2041,11 @@ async fn real_apfs_what_main_runs_after_a_land_reaches_its_seed_and_a_fork_hits_
         !layout.record(&previous).exists(),
         "land immediately reclaims its record"
     );
-    assert_build_label(&layout, &fixture.checkout, "main").await;
-    assert_linked_build_mounts(&layout, &[&fixture.checkout]);
+    assert_eq!(
+        fs::canonicalize(layout.mount(&linked_volume(&layout, &fixture.checkout))).unwrap(),
+        fs::canonicalize(layout.image(&linked_volume(&layout, &fixture.checkout))).unwrap(),
+        "main resolves to the directory payload of the volume it adopted"
+    );
     let [(landed_seed, _)] = seeds_of_main(&layout).try_into().expect("one seed of main");
 
     // Main's own work on the adopted volume, after the seed was frozen: a miss in main.
@@ -2072,9 +2117,9 @@ async fn real_apfs_what_main_runs_after_a_land_reaches_its_seed_and_a_fork_hits_
 /// Before either fork, doctor diagnoses main's displaced workspace-data link and an exec restores
 /// it, so the forks never inherit a real directory in place of the build-volume link.
 #[tokio::test]
-async fn real_apfs_a_fork_of_a_workspace_reseeds_it_and_hits_its_latest_run_substrate_lifecycle() {
+async fn directory_a_fork_of_a_workspace_reseeds_it_and_hits_its_latest_run_substrate_lifecycle() {
     let (nx, node) = repository_nx();
-    let mut fixture = Fixture::with(Project::Build {
+    let mut fixture = Fixture::with_directory(Project::Build {
         nx: Some((&nx, &node)),
         rust: None,
     });
@@ -2154,10 +2199,10 @@ async fn build_link_findings(service: &mut ActorBridge) -> Vec<String> {
 /// git, since `cowshed rebase` would carry `a`'s entries into its volume first. Main then adopts
 /// `b`'s volume, which never held `a`'s entries, and a fork of main still hits both.
 #[tokio::test]
-async fn real_apfs_a_land_carries_mains_nx_entries_into_the_volume_main_adopts_substrate_lifecycle()
+async fn directory_a_land_carries_mains_nx_entries_into_the_volume_main_adopts_substrate_lifecycle()
 {
     let (nx, node) = repository_nx();
-    let mut fixture = Fixture::with(Project::Build {
+    let mut fixture = Fixture::with_directory(Project::Build {
         nx: Some((&nx, &node)),
         rust: None,
     });
@@ -2228,8 +2273,8 @@ fn sqlite3(database: &Path, sql: &str) -> String {
 /// the adopted volume, opens with main's rows. Adopting `w`'s volume as it was left main's
 /// `.codegraph/` empty after every such land.
 #[tokio::test]
-async fn real_apfs_a_land_carries_mains_code_graph_index_into_the_volume_main_adopts() {
-    let mut fixture = Fixture::new();
+async fn directory_a_land_carries_mains_code_graph_index_into_the_volume_main_adopts() {
+    let mut fixture = Fixture::directory();
     fs::create_dir(fixture.checkout.join(".codegraph")).unwrap();
     let mut service = serve_project(&mut fixture, &[]).await;
     let layout = build_volumes(&fixture);
@@ -2279,10 +2324,10 @@ async fn real_apfs_a_land_carries_mains_code_graph_index_into_the_volume_main_ad
 // with the daemon off, and its daemon-on samples are load-dependent (08_testing.md, Integration
 // tests).
 #[tokio::test]
-async fn real_apfs_a_rebase_carries_mains_nx_entries_into_the_rebased_workspace_substrate_lifecycle()
+async fn directory_a_rebase_carries_mains_nx_entries_into_the_rebased_workspace_substrate_lifecycle()
  {
     let (nx, node) = repository_nx();
-    let mut fixture = Fixture::with(Project::Build {
+    let mut fixture = Fixture::with_directory(Project::Build {
         nx: Some((&nx, &node)),
         rust: None,
     });
@@ -2388,10 +2433,10 @@ async fn real_apfs_a_rebase_carries_mains_nx_entries_into_the_rebased_workspace_
 /// file on disk would be a key no run looks up, so the carry takes main's latest `a:test` entry by
 /// task instead, and `b`'s run of the landed check hits both tasks.
 #[tokio::test]
-async fn real_apfs_a_rebase_carries_a_task_that_hashes_its_dependencys_stale_outputs_substrate_lifecycle()
+async fn directory_a_rebase_carries_a_task_that_hashes_its_dependencys_stale_outputs_substrate_lifecycle()
  {
     let (nx, node) = repository_nx();
-    let mut fixture = Fixture::with(Project::Build {
+    let mut fixture = Fixture::with_directory(Project::Build {
         nx: Some((&nx, &node)),
         rust: None,
     });
@@ -2502,10 +2547,10 @@ async fn rebase(service: &mut ActorBridge, workspace: &str) -> RebaseReport {
 /// the retiring land names that holder and freezes a new seed without swapping main's volume
 /// (16_build_volumes.md, "The adoption needs the target's Nx database closed").
 #[tokio::test]
-async fn real_apfs_a_foreign_database_opener_skips_adoption_with_its_pid_and_argv_substrate_lifecycle()
+async fn directory_a_foreign_database_opener_skips_adoption_with_its_pid_and_argv_substrate_lifecycle()
  {
     let (nx, node) = repository_nx();
-    let mut fixture = Fixture::with(Project::Build {
+    let mut fixture = Fixture::with_directory(Project::Build {
         nx: Some((&nx, &node)),
         rust: None,
     });
@@ -2647,10 +2692,10 @@ async fn real_apfs_a_foreign_database_opener_skips_adoption_with_its_pid_and_arg
 /// holder lets go `cowshed reseed main` refreezes the seed from it (16_build_volumes.md, Land
 /// step 5.6).
 #[tokio::test]
-async fn real_apfs_a_landing_volume_holder_keeps_the_previous_seed_and_the_land_still_adopts_substrate_lifecycle()
+async fn directory_a_landing_volume_holder_keeps_the_previous_seed_and_the_land_still_adopts_substrate_lifecycle()
  {
     let (nx, node) = repository_nx();
-    let mut fixture = Fixture::with(Project::Build {
+    let mut fixture = Fixture::with_directory(Project::Build {
         nx: Some((&nx, &node)),
         rust: None,
     });
@@ -2740,10 +2785,10 @@ async fn real_apfs_a_landing_volume_holder_keeps_the_previous_seed_and_the_land_
 /// admitted afterwards resolves main's link to the adopted volume (16_build_volumes.md, "Process
 /// lifetime across a swap", "Garbage collection").
 #[tokio::test]
-async fn real_apfs_a_job_running_across_an_adoption_keeps_its_volume_and_later_jobs_get_the_new_one()
+async fn directory_a_job_running_across_an_adoption_keeps_its_volume_and_later_jobs_get_the_new_one()
  {
     let rust = rust_toolchain();
-    let mut fixture = Fixture::with(Project::Build {
+    let mut fixture = Fixture::with_directory(Project::Build {
         nx: None,
         rust: Some(&rust),
     });
@@ -2868,7 +2913,7 @@ async fn assert_build_label(layout: &BuildVolumeLayout, checkout: &Path, name: &
     eventually(
         "the build volume has its checkout's descriptive label",
         || {
-            cowshed_core::apfs::volume_name(&mount).expect("read build volume name")
+            cowshed_apfs::volume_name(&mount).expect("read build volume name")
                 == expected.as_str()
         },
     )
@@ -3312,7 +3357,7 @@ async fn prove_re_adoption(proof: ReAdoptionProof) {
             .expect("hold the fixture's publication boundary");
         }
         let legacy_image = image.with_extension("asif");
-        let convert = cowshed_core::apfs::CommandRequest::new(
+        let convert = cowshed_apfs::CommandRequest::new(
             "/usr/sbin/diskutil",
             [
                 OsString::from("image"),
@@ -3350,7 +3395,7 @@ async fn prove_re_adoption(proof: ReAdoptionProof) {
         } else {
             layout.mount(&main_volume)
         };
-        let attach = cowshed_core::apfs::CommandRequest::new(
+        let attach = cowshed_apfs::CommandRequest::new(
             "/usr/sbin/diskutil",
             [
                 OsString::from("image"),
@@ -3513,7 +3558,7 @@ async fn prove_re_adoption(proof: ReAdoptionProof) {
             .find(|mount| mount.mount_point == *from)
             .expect("the recorded retained fixture input is mounted")
             .source_device;
-        let unmount = cowshed_core::apfs::CommandRequest::new(
+        let unmount = cowshed_apfs::CommandRequest::new(
             "/sbin/umount",
             [from.as_os_str().to_os_string()],
         );
@@ -3522,7 +3567,7 @@ async fn prove_re_adoption(proof: ReAdoptionProof) {
             result.succeeded(),
             "normal own retained-input unmount: {result:?}"
         );
-        let remount = cowshed_core::apfs::CommandRequest::new(
+        let remount = cowshed_apfs::CommandRequest::new(
             "/sbin/mount_apfs",
             [
                 OsString::from("-o"),
@@ -4213,7 +4258,7 @@ async fn real_apfs_a_resumed_re_adopt_whose_retained_build_is_gone_publishes_it_
         b"operator data\n",
     )
     .expect("hold the publication boundary");
-    let attach = cowshed_core::apfs::CommandRequest::new(
+    let attach = cowshed_apfs::CommandRequest::new(
         "/usr/sbin/diskutil",
         [
             OsString::from("image"),

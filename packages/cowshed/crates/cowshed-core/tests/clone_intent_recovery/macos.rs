@@ -2,25 +2,14 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use cowshed_core::apfs::{
-    ApfsBackend, CommandRunner, DetachIntent, DiskImageSource, ImageCapture, MacOsApfsBackend,
-    SystemCommandRunner,
-};
 use cowshed_core::api::dto::{AdoptOptions, CreateOptions, RemoveOptions, RevisionTarget};
 use cowshed_core::api::operations::OperationRequest;
 use cowshed_core::api::server::ConnectionAuthority;
-use cowshed_core::attach_budget;
-use cowshed_core::fork_lock::Run as _;
-use cowshed_core::metadata::{
-    DetachedWorkspaceMetadata, ImageCapacity, PortBlock, PublicationState, WorkspaceName,
-};
+use cowshed_os::fork_lock::Run as _;
+use cowshed_core::metadata::{DetachedWorkspaceMetadata, PortBlock, PublicationState, WorkspaceName};
 use cowshed_core::repository::RepoId;
 use cowshed_core::runtime::{ProjectRuntime, RecoveryScope, supervisor_socket};
 use cowshed_core::storage::StorageLayout;
-use cowshed_core::storage::apfs::ApfsSubstrateConfig;
-use cowshed_core::storage::apfs::native::{
-    MacOsApfsExecutionHost, blank_template, blank_template_path,
-};
 use cowshed_core::storage::bootstrap::{CanonicalRoots, ValidatedHostStorage};
 use cowshed_core::storage::recovery::{
     LIFECYCLE_INTENTS_FILE, LifecycleIntent, LifecycleIntentCompletion, LifecycleIntentJournal,
@@ -29,18 +18,16 @@ use cowshed_core::storage::recovery::{
 use cowshed_core::{CowshedError, Result};
 use serde_json::{Value, json};
 
-#[path = "../support/blank_image.rs"]
-mod blank_image;
-#[path = "../support/scratch_apfs.rs"]
-mod scratch_apfs;
+#[path = "../support/scratch_directory.rs"]
+mod scratch_directory;
 
-use scratch_apfs::ScratchRoot;
+use scratch_directory::ScratchRoot;
 
 const REFUSAL: &str = "no macOS workspace port block remains";
 
-/// One adopted project on its own scratch APFS store.
+/// One adopted project on its own real directory store.
 struct Fixture {
-    /// Owned so its drop detaches this test's images and removes its tree.
+    /// Owned so its drop ends this test's workers and removes its tree.
     _scratch: ScratchRoot,
     checkout: PathBuf,
     storage: ValidatedHostStorage,
@@ -49,14 +36,12 @@ struct Fixture {
 
 impl Fixture {
     fn new(label: &str) -> Self {
-        let scratch = ScratchRoot::new(label).expect("scratch APFS root");
+        let scratch = ScratchRoot::new(label).expect("scratch directory root");
         let checkout = scratch.path().join("checkout");
         let store = scratch.path().join("store");
         for path in [&checkout, &store] {
             fs::create_dir_all(path).expect("fixture directory");
         }
-        // Adoption mints main from the store's blank template: the run's, seeded here.
-        blank_image::blank_image(&blank_template_path(&store, blank_image::CAPACITY));
         git(&checkout, &["init", "-q", "-b", "main"]);
         fs::write(checkout.join("tracked"), b"tracked\n").expect("tracked file");
         fs::write(
@@ -77,13 +62,13 @@ impl Fixture {
     }
 
     async fn adopt(&self) -> ProjectRuntime {
-        let runtime = ProjectRuntime::open_for_adopt_at(
+        let runtime = ProjectRuntime::open_directory_for_adopt_at(
             &self.checkout,
             Some(self.repo.clone()),
             self.storage.clone(),
         )
         .await
-        .expect("open native project runtime on scratch APFS");
+        .expect("open project runtime on the directory store");
         self.call(
             &runtime,
             "coordinator.adopt",
@@ -99,14 +84,14 @@ impl Fixture {
             }),
         )
         .await
-        .expect("real APFS adoption");
+        .expect("directory-backed adoption");
         runtime
     }
 
     /// What `cowshed gc` opens: store-wide recovery, which finishes every unfinished intent as
     /// residue.
     async fn gc(&self) -> ProjectRuntime {
-        ProjectRuntime::open_existing_at(&self.checkout, RecoveryScope::Store, self.storage.clone())
+        ProjectRuntime::open_directory_existing_at(&self.checkout, RecoveryScope::Store, self.storage.clone())
             .await
             .expect("store-scope recovery opens the project")
     }
@@ -114,7 +99,7 @@ impl Fixture {
     /// What `cowshed new <workspace>` and other verbs naming it open: their own intents and
     /// main's are replayed, and a failed replay fails the opening.
     async fn open_naming(&self, workspace: &str) -> Result<ProjectRuntime> {
-        ProjectRuntime::open_existing_at(
+        ProjectRuntime::open_directory_existing_at(
             &self.checkout,
             RecoveryScope::Workspaces([name(workspace)].into()),
             self.storage.clone(),
@@ -124,7 +109,7 @@ impl Fixture {
 
     /// What `cowshed rm <workspace>` opens.
     async fn open_removing(&self, workspace: &str) -> Result<ProjectRuntime> {
-        ProjectRuntime::open_existing_at(
+        ProjectRuntime::open_directory_existing_at(
             &self.checkout,
             RecoveryScope::Removal(name(workspace)),
             self.storage.clone(),

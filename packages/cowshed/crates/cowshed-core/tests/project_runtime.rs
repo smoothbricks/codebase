@@ -36,7 +36,7 @@ use cowshed_core::runtime::{
 use cowshed_core::sandbox::{SandboxConfig, SandboxGrants};
 use cowshed_core::storage::job_artifact::{ArtifactConfig, StreamKind};
 use cowshed_core::storage::lifecycle::{Conflict, LifecycleFact, Revision};
-use cowshed_core::timing::{timed, timed_async};
+use cowshed_os::timing::{timed, timed_async};
 use cowshed_core::{Cowshed, CowshedError, ErrorCode, JobStream, Result, Retry};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -2570,7 +2570,7 @@ async fn host_controller_a_real_child_s_tail_ends_at_its_journal_end_and_resumes
     let root = test_root();
     let jobs = SupervisedJobs::connect(&root, system_supervisor(&root)).await;
     let gate = root.join("workspace").join("gate");
-    use cowshed_core::fork_lock::Run as _;
+    use cowshed_os::fork_lock::Run as _;
     let made = std::process::Command::new("/usr/bin/mkfifo")
         .arg(&gate)
         .status_locked()
@@ -2751,7 +2751,7 @@ async fn listening_job(
     workspace: &Path,
     worker: &cowshed_core::api::WorkspaceHandle,
 ) -> ListeningJob {
-    use cowshed_core::fork_lock::Run as _;
+    use cowshed_os::fork_lock::Run as _;
     std::fs::write(workspace.join("listen.pl"), LISTENER).expect("the listener program");
     let gate = workspace.join("gate");
     let made = std::process::Command::new("/usr/bin/mkfifo")
@@ -2815,7 +2815,7 @@ async fn napi_listening_ports(
     root: &TempRoot,
     job: JobId,
 ) -> cowshed_core::api::dto::JobListeningPorts {
-    use cowshed_core::fork_lock::Spawn as _;
+    use cowshed_os::fork_lock::Spawn as _;
     let manifest = std::env::var_os("CARGO_MANIFEST_DIR")
         .expect("cargo and nextest export CARGO_MANIFEST_DIR to the test process");
     let package = Path::new(&manifest).join("../..");
@@ -3066,7 +3066,7 @@ impl SpawnSink for GatedSpawner {
         _request: ProcessSpawnRequest,
         events: mpsc::Sender<ProcessEvent>,
     ) -> Result<Box<dyn RunningProcess>> {
-        use cowshed_core::fork_lock::Spawn as _;
+        use cowshed_os::fork_lock::Spawn as _;
         use std::os::unix::process::CommandExt as _;
         // `cat` through PATH: a Nix-built Linux host has no /bin/cat.
         let child = std::process::Command::new("cat")
@@ -3336,7 +3336,7 @@ async fn progress_samples_a_silent_job_periodically_then_its_sealed_terminal_onc
 #[tokio::test]
 #[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
 async fn host_controller_open_stdin_delivers_binary_and_counts_only_written_pipe_bytes() {
-    use cowshed_core::fork_lock::Run as _;
+    use cowshed_os::fork_lock::Run as _;
     use std::io::Write as _;
     use std::task::Poll;
 
@@ -3500,7 +3500,7 @@ async fn host_controller_open_stdin_delivers_binary_and_counts_only_written_pipe
 #[tokio::test]
 #[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
 async fn host_controller_close_waits_for_an_in_progress_pipe_write() {
-    use cowshed_core::fork_lock::Run as _;
+    use cowshed_os::fork_lock::Run as _;
     use std::io::Write as _;
     use std::task::Poll;
 

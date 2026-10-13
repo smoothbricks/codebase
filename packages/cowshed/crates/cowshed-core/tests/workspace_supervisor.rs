@@ -17,8 +17,8 @@ use cowshed_core::api::{
 use cowshed_core::api::{JobLeafAttribution, ProcessCoverage, ProcessCoverageGap};
 use cowshed_core::error::{AdmissionField, AdmissionRefusal, CowshedError, ErrorCode, Result};
 #[cfg(target_os = "macos")]
-use cowshed_core::fork_lock::Run as _;
-use cowshed_core::fork_lock::Spawn as _;
+use cowshed_os::fork_lock::Run as _;
+use cowshed_os::fork_lock::Spawn as _;
 use cowshed_core::metadata::{PortBlock, WorkspaceIncarnation, WorkspaceName};
 use cowshed_core::repository::{OwnedRepoIds, RepoId};
 use cowshed_core::runtime::job_groups::Birth;

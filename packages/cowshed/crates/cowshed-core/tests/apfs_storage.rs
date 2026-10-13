@@ -4,16 +4,18 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use cowshed_core::apfs::{DetachIntent, MountAccess};
+use cowshed_apfs::{DetachIntent, MountAccess};
+use cowshed_apfs::image::{ImageCapacity, is_image_path};
+use cowshed_apfs::store_lock::LockMode;
 use cowshed_core::metadata::{
-    GrantSet, ImageCapacity, MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE, PortBlock, WorkspaceIncarnation,
-    WorkspaceInfoSnapshot, WorkspaceName, WorkspaceRole, is_image_path,
+    GrantSet, MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE, PortBlock, WorkspaceIncarnation,
+    WorkspaceInfoSnapshot, WorkspaceName, WorkspaceRole,
 };
 use cowshed_core::repository::RepoId;
 use cowshed_core::storage::CheckpointLabel;
 use cowshed_core::storage::apfs::{
     AdoptExecutionError, Alongside, ApfsBlockingLane, ApfsExecutionHost, ApfsStorageError,
-    ApfsSubstrate, ApfsSubstrateConfig, DEFAULT_IMAGE_CAPACITY, IncarnationSource, LockMode,
+    ApfsSubstrate, ApfsSubstrateConfig, DEFAULT_IMAGE_CAPACITY, IncarnationSource,
     MarkerExpectation, MetadataPolicy, PendingAdoption, PublicationError, ResumableClone,
     RetireExecutionError, volume_key,
 };

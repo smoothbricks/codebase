@@ -222,7 +222,7 @@ const EXCLUDE_END: &str = "# end cowshed build-state links";
 /// naming a path nothing occupies matches nothing. A checkout outside Git has no status to keep
 /// clean.
 pub(crate) fn exclude_links(checkout: &Path, paths: &[BuildStatePath]) -> Result<()> {
-    use crate::fork_lock::Run as _;
+    use cowshed_os::fork_lock::Run as _;
     use std::os::unix::fs::OpenOptionsExt as _;
     match fs::symlink_metadata(checkout.join(".git")) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -581,7 +581,7 @@ mod tests {
     /// as untracked. Cowshed excludes its own links, and leaves the repository's lines alone.
     #[test]
     fn linked_checkouts_show_no_build_links_in_git_status() {
-        use crate::fork_lock::Run as _;
+        use cowshed_os::fork_lock::Run as _;
         let scratch = Scratch::new("status");
         let checkout = scratch.checkout();
         let volume = scratch.volume("volume-a");

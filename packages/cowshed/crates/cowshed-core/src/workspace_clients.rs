@@ -15,7 +15,7 @@
 use std::ffi::CStr;
 use std::io;
 
-use crate::fsio::AnchoredDirectory;
+use cowshed_os::fsio::AnchoredDirectory;
 
 /// The combined trust bundle, at the root of the private environment.
 pub const TRUST_BUNDLE_NAME: &CStr = c"ca-bundle.pem";

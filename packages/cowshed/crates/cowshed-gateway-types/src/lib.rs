@@ -36,3 +36,24 @@ pub use session::{
     validate_identifier,
 };
 pub use status::{DaemonStatus, SessionStatus, StartupHeal, SupervisorRecovery};
+
+use std::path::{Path, PathBuf};
+
+/// Machine-global evidence roots shared by every user in the herd.
+///
+/// Bootstrap volumes cannot follow `$HOME`: doing so gives each user a different view of the
+/// same machine-global herd and leaves the evidence layer outside the dedicated volumes.
+pub const STORE_ROOT: &str = "/private/cowshed/store";
+
+/// The gateway control socket, at the store root.
+///
+/// Root-level keeps `sun_path` short (01_storage.md): a Unix socket address is capped near 104
+/// bytes, and a home-relative path spent that budget on the user's name before the gateway had
+/// said anything. The store is also the only location every peer agrees on — a LaunchAgent, the
+/// CLI, and a supervising runtime each know the store, while `HOME` differs between them.
+///
+/// Defined here, below the controller, the disk-image layer and the daemon, so each of them
+/// names the one definition and no constant is copied across a crate boundary.
+pub fn control_socket_path() -> PathBuf {
+    Path::new(STORE_ROOT).join("gateway.sock")
+}

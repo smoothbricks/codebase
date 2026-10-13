@@ -34,8 +34,8 @@ use crate::exec::{
     ExecError, SandboxExecRequest, SpawnPlan, classify_spawn_error, plan_exec_under,
     prepare_child_descriptors,
 };
-use crate::fork_lock::Spawn as _;
-use crate::fsio::AnchoredDirectory;
+use cowshed_os::fork_lock::Spawn as _;
+use cowshed_os::fsio::AnchoredDirectory;
 use crate::metadata::{WorkspaceIncarnation, WorkspaceName, WorkspaceRole};
 use crate::repository::{OwnedRepoIds, RepoId};
 use crate::sandbox::{
@@ -419,13 +419,13 @@ impl SandboxPolicy {
 
     fn for_cwd(&self, cwd: &Path) -> Result<Self> {
         let capabilities = {
-            let _span = crate::timing::span("spawn", "capability-detection");
+            let _span = cowshed_os::timing::span("spawn", "capability-detection");
             self.ceiling().detect_capabilities_for(cwd)?
         };
         if capabilities == self.ceiling().capabilities {
             Ok(self.clone())
         } else {
-            let _span = crate::timing::span("spawn", "capability-profile");
+            let _span = cowshed_os::timing::span("spawn", "capability-profile");
             Self::render(self.ceiling().with_capabilities(capabilities))
         }
     }
@@ -631,7 +631,7 @@ pub trait ArtifactSink: Send {
     fn sealed(&self, job_id: JobId) -> Option<SealedJob>;
 }
 
-pub use crate::process::ProcessStatus;
+pub use cowshed_os::process::ProcessStatus;
 pub use crate::storage::audit::CommitmentDraft;
 
 /// Where a supervisor sends its audit records. Recording is best effort by contract: the act a
@@ -1305,7 +1305,7 @@ pub async fn run_as_job(
     prepare_child_descriptors(command.as_std_mut())
         .map_err(ExecError::from)
         .map_err(map_exec_error)?;
-    crate::fork_lock::RunAsync::output_locked(&mut command)
+    cowshed_os::fork_lock::RunAsync::output_locked(&mut command)
         .await
         .map_err(classify_spawn_error)
         .map_err(ExecError::from)
@@ -1590,7 +1590,7 @@ impl SpawnSink for SystemSpawnSink {
         let policy = request.policy.for_cwd(&cwd)?;
         let (sandbox, profile) = policy.child(request.mode);
         let envrc_directory = shell_directory(sandbox);
-        let environment = crate::timing::spanned(
+        let environment = cowshed_os::timing::spanned(
             "spawn",
             "environment",
             sandbox_environment(sandbox, &request.env),
@@ -3961,7 +3961,7 @@ impl SupervisorActor {
         // volume the controller resolved. A running job keeps the profile it was spawned with,
         // so it stays on its old volume until it exits; nothing is relaunched.
         if build_volume != self.policy.ceiling().build_volume_mount {
-            let _span = crate::timing::span("admit", "build-volume-profile");
+            let _span = cowshed_os::timing::span("admit", "build-volume-profile");
             self.policy = SandboxPolicy::render(SandboxConfig {
                 build_volume_mount: build_volume,
                 ..self.policy.ceiling().clone()
@@ -4036,12 +4036,12 @@ impl SupervisorActor {
                 JobId::new(value).map_err(|error| CowshedError::internal(error.to_string()))
             })?;
         {
-            let _span = crate::timing::span("admit", "record");
+            let _span = cowshed_os::timing::span("admit", "record");
             self.artifacts
                 .admit(job_id, self.authority.grant_revision, &command, admission)?;
         }
         self.next_job_id = expected_next;
-        let admission = crate::timing::spanned(
+        let admission = cowshed_os::timing::spanned(
             "admit",
             "commitment",
             self.commitments.record(CommitmentDraft::Admission {
@@ -4105,13 +4105,13 @@ impl SupervisorActor {
         // Read before the job's first process is dispatched, so nothing it writes precedes its
         // baseline: a warm host may start the command before its start is reported here.
         let volumes = {
-            let _span = crate::timing::span("admit", "volume-baseline");
+            let _span = cowshed_os::timing::span("admit", "volume-baseline");
             VolumeBaseline::admitted(
                 self.workspace_volume.as_ref(),
                 self.policy.ceiling().build_volume_mount.as_deref(),
             )
         };
-        let spawn_span = crate::timing::span("admit", "spawn");
+        let spawn_span = cowshed_os::timing::span("admit", "spawn");
         let spawn = self
             .spawner
             .spawn(
@@ -5016,7 +5016,7 @@ impl SupervisorActor {
             duration_ms: Some(duration_ms),
             resources: job.info.resources.clone(),
         };
-        let seal_span = crate::timing::span("seal", "record");
+        let seal_span = cowshed_os::timing::span("seal", "record");
         let sealed = self.artifacts.seal(
             job_id,
             ending,
@@ -5030,7 +5030,7 @@ impl SupervisorActor {
         // retirement never sees the workspace idle.
         let conclusion = match sealed {
             Ok(seal) => {
-                let commitment = crate::timing::spanned(
+                let commitment = cowshed_os::timing::spanned(
                     "seal",
                     "commitment",
                     self.commitments.record(CommitmentDraft::Terminal {
@@ -5967,7 +5967,7 @@ fn label_report(
 mod workspace_toolchain_tests {
     use super::*;
     #[cfg(target_os = "macos")]
-    use crate::fork_lock::Run as _;
+    use cowshed_os::fork_lock::Run as _;
     #[cfg(target_os = "macos")]
     use crate::sandbox::{RunSandboxMode, SandboxConfig, SandboxGrants};
 
@@ -7093,7 +7093,7 @@ mod lifecycle_commitment_tests {
 #[cfg(test)]
 mod sandbox_environment_tests {
     use super::*;
-    use crate::fork_lock::Run as _;
+    use cowshed_os::fork_lock::Run as _;
 
     fn scratch(label: &str) -> PathBuf {
         let root =

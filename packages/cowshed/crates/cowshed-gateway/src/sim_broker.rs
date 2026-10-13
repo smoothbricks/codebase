@@ -7,7 +7,7 @@ use std::{
 
 use async_trait::async_trait;
 #[cfg(target_os = "macos")]
-use cowshed_core::fork_lock::RunAsync as _;
+use cowshed_os::fork_lock::RunAsync as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;

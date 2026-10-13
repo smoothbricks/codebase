@@ -29,10 +29,12 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::LazyLock;
 
-use super::scratch_apfs::ROOT_PREFIX;
+use cowshed_os::fork_lock::Run as _;
+
+use super::scratch_apfs::{ROOT_PREFIX, release_image};
 use super::{
-    ApfsBackend, ApfsSubstrateConfig, CommandRunner, DetachIntent, DiskImageSource, ImageCapacity,
-    ImageCapture, MacOsApfsBackend, MacOsApfsExecutionHost, SystemCommandRunner, blank_template,
+    ApfsBackend, CommandRunner, DiskImageSource, ImageCapacity, ImageCapture, MacOsApfsBackend,
+    SystemCommandRunner, blank_template,
 };
 
 /// The 1 GiB test cap (08_testing.md): the template's capacity, and so every clone's.
@@ -141,7 +143,7 @@ impl SharedImage {
         let mounted = Command::new("/sbin/mount_apfs")
             .args(["-o", options, &self.volume_device])
             .arg(mount_point)
-            .output()
+            .output_locked()
             .expect("run mount_apfs");
         assert!(
             mounted.status.success(),
@@ -171,7 +173,7 @@ impl Drop for SharedMount {
     fn drop(&mut self) {
         let unmounted = Command::new("/sbin/umount")
             .arg(&self.mount_point)
-            .output()
+            .output_locked()
             .expect("run umount");
         if !unmounted.status.success() {
             eprintln!(
@@ -245,9 +247,7 @@ pub fn shared_image_at(scenario: &str, image: &Path) -> SharedImage {
     if !image.exists() {
         blank_image(image);
     }
-    let host = pool_host(&pool);
-    let attachment = host
-        .backend()
+    let attachment = MacOsApfsBackend::new(SystemCommandRunner)
         .attach_verified(image)
         .unwrap_or_else(|error| panic!("attach the pool's {scenario} image: {error}"));
     let device = attachment.volume_device().to_owned();
@@ -279,15 +279,6 @@ fn kernel_holds(image: &Path) -> bool {
         .any(|attached| matches!(&attached.source, DiskImageSource::File(path) if path == image))
 }
 
-/// A production host rooted at `pool`, for the pool's own attach and release work.
-fn pool_host(pool: &Path) -> MacOsApfsExecutionHost<SystemCommandRunner> {
-    MacOsApfsExecutionHost::new(
-        SystemCommandRunner,
-        ApfsSubstrateConfig::new(pool.to_path_buf(), pool.join("mount")),
-    )
-    .expect("fixture pool host")
-}
-
 /// Detach every image an earlier lane run's pool left attached and remove its directory: a
 /// pool's images live exactly one run, and a later run is what ends an earlier one. Only a
 /// pool untouched for an hour is ended, so a lane running concurrently is never touched.
@@ -296,7 +287,6 @@ fn detach_previous_runs(current: &Path) {
     let Ok(entries) = fs::read_dir(tmp) else {
         return;
     };
-    let host = pool_host(current);
     for entry in entries.flatten() {
         let path = entry.path();
         if path == *current
@@ -320,13 +310,13 @@ fn detach_previous_runs(current: &Path) {
         };
         for line in recorded.lines() {
             let image = PathBuf::from(line.split('\t').nth(1).unwrap_or_default());
-            if kernel_holds(&image) {
-                if let Err(error) = host.detach_existing_image(&image, DetachIntent::Release) {
-                    eprintln!(
-                        "release the previous run's pool image {}: {error}",
-                        image.display()
-                    );
-                }
+            if kernel_holds(&image)
+                && let Err(error) = release_image(&image)
+            {
+                eprintln!(
+                    "release the previous run's pool image {}: {error}",
+                    image.display()
+                );
             }
         }
         let _ = fs::remove_dir_all(&path);

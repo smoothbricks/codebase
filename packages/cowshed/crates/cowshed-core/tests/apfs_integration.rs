@@ -5,7 +5,7 @@ mod macos;
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn native_apfs_clone_refuses_a_host_without_clonefile() {
-    use cowshed_core::apfs::{ApfsBackend, CloneFileError, MacOsApfsBackend, SystemCommandRunner};
+    use cowshed_apfs::{ApfsBackend, CloneFileError, MacOsApfsBackend, SystemCommandRunner};
     use std::path::Path;
 
     let backend = MacOsApfsBackend::new(SystemCommandRunner);
@@ -13,7 +13,7 @@ fn native_apfs_clone_refuses_a_host_without_clonefile() {
         backend.clone_image(
             Path::new("/tmp/source.dmg"),
             Path::new("/tmp/clone.dmg"),
-            cowshed_core::apfs::ImageCapture::Detached,
+            cowshed_apfs::ImageCapture::Detached,
         ),
         Err(CloneFileError::UnsupportedPlatform)
     ));

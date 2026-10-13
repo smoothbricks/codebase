@@ -44,7 +44,7 @@ use super::supervisor::{
 use crate::api::dto::{ExitStatus, JobId, Sha256Digest};
 use crate::error::{CowshedError, Result};
 use crate::exec::{ExecError, SANDBOX_EXEC, classify_spawn_error, prepare_child_descriptors};
-use crate::fork_lock::Spawn as _;
+use cowshed_os::fork_lock::Spawn as _;
 use crate::storage::job_artifact::StreamKind;
 
 /// Everything that makes one warm shell interchangeable with another: the same profile (mode
@@ -240,10 +240,10 @@ fn pipe_with(between: impl FnOnce()) -> io::Result<(OwnedFd, OwnedFd)> {
 
 /// [`pipe`], running `between` after creating the pair and before marking it close-on-exec.
 /// Darwin has no `pipe2`: the two steps run under the exclusive fork lock, so no spawn forks
-/// between them ([`crate::fork_lock::create`]).
+/// between them ([`cowshed_os::fork_lock::create`]).
 #[cfg(not(target_os = "linux"))]
 fn pipe_with(between: impl FnOnce()) -> io::Result<(OwnedFd, OwnedFd)> {
-    crate::fork_lock::create(|| {
+    cowshed_os::fork_lock::create(|| {
         let mut ends = [0; 2];
         // SAFETY: `ends` has room for the two descriptors pipe(2) writes.
         if unsafe { libc::pipe(ends.as_mut_ptr()) } != 0 {
@@ -1325,7 +1325,7 @@ mod tests {
     use std::sync::mpsc;
 
     use super::pipe_with;
-    use crate::fork_lock::{Spawn as _, held_exclusive};
+    use cowshed_os::fork_lock::{Spawn as _, held_exclusive};
 
     /// The kernel's identity of pipe end `descriptor` in process `pid`: the pipe's inode, which
     /// both ends share.

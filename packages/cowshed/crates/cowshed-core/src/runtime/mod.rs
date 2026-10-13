@@ -22,6 +22,8 @@ pub mod shell_host;
 mod shell_job;
 pub mod shell_pool;
 pub mod shell_watch;
+#[cfg(target_os = "macos")]
+pub(crate) mod storage_host;
 pub mod supervisor;
 pub mod supervisor_manager;
 pub mod supervisor_socket;

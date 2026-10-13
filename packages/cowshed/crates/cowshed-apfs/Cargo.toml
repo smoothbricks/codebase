@@ -1,0 +1,30 @@
+[package]
+name = "cowshed-apfs"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+
+# The macOS disk-image and APFS layer: image commands and their kernel inventory, the attach
+# budget, the host disk-lifecycle lease client. Below `cowshed-core`, which consumes it through
+# `ApfsBackend`/`CommandRunner`; nothing here knows a workspace, a project or a store record, so
+# its real-image tests rerun only when this layer (or what it links) changes.
+
+[[bin]]
+name = "attach-budget"
+path = "src/bin/attach_budget.rs"
+test = false
+bench = false
+
+[dependencies]
+cowshed-gateway-types = { path = "../cowshed-gateway-types" }
+cowshed-os = { path = "../cowshed-os" }
+libc = "0.2"
+plist = "1"
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.10"
+url = "2"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+cowshed-os = { path = "../cowshed-os", features = ["test-hooks"] }

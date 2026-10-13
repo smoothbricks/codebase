@@ -4,8 +4,8 @@
 //! command adapters so callers can keep one mutable, actor-owned executor while
 //! tests remain entirely host-independent.
 
-use cowshed_core::fork_lock::Run as _;
-use cowshed_core::metadata::ImageCapacity;
+use cowshed_os::fork_lock::Run as _;
+use cowshed_apfs::image::ImageCapacity;
 use std::error::Error;
 use std::ffi::OsString;
 use std::fmt;

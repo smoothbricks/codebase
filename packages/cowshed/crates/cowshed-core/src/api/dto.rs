@@ -537,7 +537,7 @@ pub struct TraceContext {
 }
 
 /// One lifecycle step of a controller call that asked for its steps, reported when the step starts
-/// and again when it ends (`crate::timing`). Step ids are unique within the call. A step's
+/// and again when it ends (`cowshed_os::timing`). Step ids are unique within the call. A step's
 /// `parent` is the step it runs inside, absent at the call's top level, and is always reported
 /// started before any step inside it; a step ends before its parent does.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -563,6 +563,25 @@ pub enum StepReport {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
+}
+
+impl From<cowshed_os::timing::Step> for StepReport {
+    fn from(step: cowshed_os::timing::Step) -> Self {
+        match step {
+            cowshed_os::timing::Step::Started {
+                step,
+                parent,
+                scope,
+                name,
+            } => Self::Started {
+                step,
+                parent,
+                scope,
+                name,
+            },
+            cowshed_os::timing::Step::Ended { step, error } => Self::Ended { step, error },
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

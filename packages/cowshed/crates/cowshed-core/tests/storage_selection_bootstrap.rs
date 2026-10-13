@@ -342,7 +342,7 @@ fn sandbox_deny_is_an_array_of_workspace_relative_paths() {
 /// project gets 100 GiB. The value is an image capacity, so it refuses what an image refuses.
 #[test]
 fn build_capacity_defaults_to_100_gibibytes_and_is_an_image_capacity() {
-    use cowshed_core::metadata::ImageCapacity;
+    use cowshed_apfs::image::ImageCapacity;
     assert_eq!(
         parse_cowshed_config("").unwrap().build_capacity(),
         ImageCapacity::from_gibibytes(100)

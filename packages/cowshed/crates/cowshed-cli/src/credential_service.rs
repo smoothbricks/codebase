@@ -14,7 +14,7 @@
 use std::path::Path;
 
 use cowshed_core::api::{CredentialReport, CredentialRoute as CredentialRouteReport};
-use cowshed_core::fork_lock::RunAsync as _;
+use cowshed_os::fork_lock::RunAsync as _;
 use cowshed_core::repository::RepoId;
 use cowshed_core::runtime::project::{ProjectRuntime, RecoveryScope};
 use cowshed_core::storage::host_config::{CredentialRoute, HostConfig};

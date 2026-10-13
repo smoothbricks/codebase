@@ -28,7 +28,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cowshed_gateway_types::{DiskClass, DiskLeaseAnswer, DiskLeaseRequest, LeaseState};
 
-use crate::apfs::{DISK_CHILD_DEADLINE, HDIUTIL, MOUNT_APFS, NEWFS_APFS, UMOUNT};
+use crate::{DISK_CHILD_DEADLINE, HDIUTIL, MOUNT_APFS, NEWFS_APFS, UMOUNT};
 use crate::device::DISKUTIL;
 
 /// Classify disk-changing commands, not cosmetic labels. `diskutil renameVolume` changes
@@ -68,7 +68,7 @@ pub fn leased<T, E: fmt::Display>(
         return run();
     }
     let command = describe(program, args);
-    let socket = crate::gateway_sessions::control_socket_path();
+    let socket = cowshed_gateway_types::control_socket_path();
     lease_then(&socket, class, &command, remember_predates, run)
 }
 
@@ -105,14 +105,14 @@ fn lease_then<T, E: fmt::Display>(
             return run();
         }
     };
-    let lease = crate::timing::timed("disk-lease", format_args!("{class} wait"), || {
+    let lease = cowshed_os::timing::timed("disk-lease", format_args!("{class} wait"), || {
         acquire(stream, class, command, Bounds::PRODUCTION)
     });
     drop(waiting);
     match lease {
-        Ok(_lease) => crate::timing::timed("disk-lease", format_args!("{class} phase"), run),
+        Ok(_lease) => cowshed_os::timing::timed("disk-lease", format_args!("{class} phase"), run),
         Err(unleased) => {
-            crate::timing::attribute(
+            cowshed_os::timing::attribute(
                 "disk-lease",
                 format_args!("{class} wait"),
                 "unleased",

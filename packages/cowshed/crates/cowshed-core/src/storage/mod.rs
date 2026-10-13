@@ -8,8 +8,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 
+use cowshed_apfs::image::IMAGE_EXTENSION;
 use crate::metadata::{
-    CheckoutRootRecord, IMAGE_EXTENSION, MetadataError, SlotBindings, SlotBindingsRecord,
+    CheckoutRootRecord, MetadataError, SlotBindings, SlotBindingsRecord,
     WorkspaceName, append_suffix, sidecar_path,
 };
 use crate::repository::{PathLayoutError, ProjectPaths, RepoId};
@@ -18,6 +19,7 @@ pub mod apfs;
 pub mod audit;
 pub mod bootstrap;
 pub mod deletion_log;
+pub mod directory;
 pub mod fstab;
 pub mod host_config;
 pub mod job_artifact;

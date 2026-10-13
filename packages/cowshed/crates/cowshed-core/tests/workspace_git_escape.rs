@@ -4,7 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use cowshed_core::fork_lock::Run as _;
+use cowshed_os::fork_lock::Run as _;
 use cowshed_core::git::{git_command_at, sandboxed_git_command_at};
 use cowshed_core::metadata::PortBlock;
 use cowshed_core::sandbox::{

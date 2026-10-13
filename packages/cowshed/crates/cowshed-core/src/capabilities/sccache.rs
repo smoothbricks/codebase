@@ -2,7 +2,7 @@ use super::{
     CapabilityContribution, CapabilityGrant, CapabilityId, DetectionContext, Detector, EnvAction,
     GrantAccess, GrantScope,
 };
-use crate::storage::bootstrap::STORE_ROOT;
+use cowshed_gateway_types::STORE_ROOT;
 use crate::{CowshedError, Result};
 use std::path::{Path, PathBuf};
 

@@ -10,7 +10,7 @@
 
 use std::process::ExitCode;
 
-use cowshed_core::attach_budget::{self, Budget, Ceiling, ClassCount};
+use cowshed_apfs::attach_budget::{self, Budget, Ceiling, ClassCount};
 use serde_json::{Value, json};
 
 const USAGE: &str = "usage: attach-budget --need <attaches> | attach-budget --clear";

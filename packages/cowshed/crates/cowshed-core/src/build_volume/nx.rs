@@ -22,18 +22,7 @@ pub const RUN_SUMMARY: &str = "run.json";
 /// How long a stopped daemon gets to exit after `SIGTERM`, as `nx daemon --stop` sends it.
 const DAEMON_EXIT_GRACE: Duration = Duration::from_secs(10);
 
-/// A process that holds a task database open.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Holder {
-    pub pid: i32,
-    pub command: String,
-}
-
-impl std::fmt::Display for Holder {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "pid {} ({})", self.pid, self.command)
-    }
-}
+pub use cowshed_os::process::Holder;
 
 /// Every Nx task database in the volume rooted at `volume`: each `*.db` file directly in a
 /// `workspace-data` directory the volume holds.
@@ -79,7 +68,7 @@ pub fn hand_over_daemon_records(
         let Some(live) = crate::runtime::nx_daemon::live_record(&record) else {
             continue;
         };
-        if crate::process::sandboxed(live.pid)? {
+        if cowshed_os::process::sandboxed(live.pid)? {
             continue;
         }
         let directory = into.join(data).join(DAEMON_DIRECTORY);
@@ -211,7 +200,7 @@ pub fn held(volume: &Path, state: &BuildVolumeState) -> io::Result<Result<(), Bu
 #[cfg(target_os = "macos")]
 #[must_use]
 pub struct Opens {
-    _locks: Vec<crate::fork_lock::Fenced<fs::File>>,
+    _locks: Vec<cowshed_os::fork_lock::Fenced<fs::File>>,
 }
 
 /// A task database an Nx process is opening: the processes that have its open lock open, the
@@ -258,7 +247,7 @@ pub fn hold_opens(
                 .create(true)
                 .truncate(false)
                 .open(&lock)
-                .map(crate::fork_lock::Fenced::new)?;
+                .map(cowshed_os::fork_lock::Fenced::new)?;
             match file.try_lock() {
                 Ok(()) => locks.push(file),
                 Err(fs::TryLockError::WouldBlock) => {
@@ -848,7 +837,7 @@ fn listpidspath(path: &Path, pathflags: u32) -> io::Result<Vec<Holder>> {
 /// placeholder naming why neither could be read.
 #[cfg(target_os = "macos")]
 fn command_line(pid: libc::pid_t) -> String {
-    if let Ok(arguments) = crate::process::process_arguments(pid)
+    if let Ok(arguments) = cowshed_os::process::process_arguments(pid)
         && !arguments.argv.is_empty()
     {
         return arguments
@@ -1233,7 +1222,7 @@ mod tests {
     use super::*;
     use crate::capabilities::BuildStatePath;
     #[cfg(any(target_os = "macos", target_os = "linux"))]
-    use crate::fork_lock::Spawn as _;
+    use cowshed_os::fork_lock::Spawn as _;
 
     fn scratch(label: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!(
@@ -1613,7 +1602,7 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     impl StockNx {
-        fn new(root: &crate::scratch_apfs::ScratchRoot) -> Self {
+        fn new(root: &crate::scratch_directory::ScratchRoot) -> Self {
             // Read at run time: `env!` would compile this checkout's path into the test binary,
             // and a test binary built in one checkout must not reach another's files.
             let manifest = std::env::var_os("CARGO_MANIFEST_DIR")
@@ -1685,7 +1674,7 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     impl Linked {
-        fn new(root: &crate::scratch_apfs::ScratchRoot, stock: &StockNx) -> Self {
+        fn new(root: &crate::scratch_directory::ScratchRoot, stock: &StockNx) -> Self {
             let [from, into] = ["from", "into"].map(|name| root.path().join("volumes").join(name));
             for volume in [&from, &into] {
                 fs::create_dir_all(volume.join("nx/workspace-data")).unwrap();
@@ -1857,7 +1846,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn an_nx_opener_waits_out_held_opens_and_opens_the_database_the_moved_link_names() {
-        let root = crate::scratch_apfs::ScratchRoot::new("nx-opens").expect("scratch root");
+        let root = crate::scratch_directory::ScratchRoot::new("nx-opens").expect("scratch root");
         let stock = StockNx::new(&root);
         let linked = Linked::new(&root, &stock);
         // Each volume holds the task database a first Nx process made there.
@@ -1981,12 +1970,12 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn a_host_daemon_whose_record_is_handed_over_serves_on_across_the_move() {
-        let root = crate::scratch_apfs::ScratchRoot::new("nx-hand-over").expect("scratch root");
+        let root = crate::scratch_directory::ScratchRoot::new("nx-hand-over").expect("scratch root");
         let stock = StockNx::new(&root);
         let linked = Linked::new(&root, &stock);
         stock.daemon("--start");
         let daemon = crate::runtime::nx_daemon::live_pid(&stock.record()).expect("a live daemon");
-        assert!(!crate::process::sandboxed(daemon).unwrap());
+        assert!(!cowshed_os::process::sandboxed(daemon).unwrap());
 
         hand_over_daemon_records(&linked.from, &linked.state, &linked.into).unwrap();
         super::super::link::point(&stock.checkout, &linked.into).unwrap();
@@ -2005,7 +1994,7 @@ mod tests {
         events.exit(daemon as u32);
         super::super::link::point(&stock.checkout, &linked.from).unwrap();
         assert_eq!(events.next(), libc::EVFILT_PROC);
-        assert!(!crate::process::running(daemon).unwrap());
+        assert!(!cowshed_os::process::running(daemon).unwrap());
     }
 
     /// A process `sandbox-exec` started is sandboxed. (The host daemon of the hand-over test is
@@ -2033,7 +2022,7 @@ mod tests {
                 .unwrap();
             assert_eq!(line, "in\n");
         }
-        assert!(crate::process::sandboxed(sandboxed.id() as i32).unwrap());
+        assert!(cowshed_os::process::sandboxed(sandboxed.id() as i32).unwrap());
         drop(sandboxed.stdin.take());
         sandboxed.wait().unwrap();
     }
@@ -2044,7 +2033,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn a_stock_nx_daemon_stopped_natively_restarts_cleanly() {
-        let root = crate::scratch_apfs::ScratchRoot::new("nx-daemon").expect("scratch root");
+        let root = crate::scratch_directory::ScratchRoot::new("nx-daemon").expect("scratch root");
         let stock = StockNx::new(&root);
         let state = BuildVolumeState {
             paths: vec![BuildStatePath::new(".nx/workspace-data", ".nx/workspace-data").unwrap()],
@@ -2064,7 +2053,7 @@ mod tests {
         // Exited, though launchd may not have reaped it yet: a zombie, which `kill(pid, 0)`
         // still reaches.
         assert!(
-            !crate::process::running(first).unwrap(),
+            !cowshed_os::process::running(first).unwrap(),
             "the daemon exited"
         );
         // The daemon's own shutdown ran: it removed its record and its socket, as after
@@ -2088,7 +2077,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn a_test_that_fails_with_a_live_nx_daemon_leaves_none_under_its_root() {
-        let root = crate::scratch_apfs::ScratchRoot::new("nx-daemon-failed").expect("scratch root");
+        let root = crate::scratch_directory::ScratchRoot::new("nx-daemon-failed").expect("scratch root");
         let path = root.path().to_path_buf();
         let daemon = std::cell::Cell::new(None);
         let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -2102,7 +2091,7 @@ mod tests {
         let daemon = daemon
             .get()
             .expect("the daemon was live when the test failed");
-        let left = crate::scratch_apfs::processes_in(|cwd| cwd.starts_with(&path))
+        let left = crate::scratch_directory::processes::processes_in(|cwd| cwd.starts_with(&path))
             .expect("list the processes working under the root");
         assert_eq!(
             left,

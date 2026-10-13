@@ -12,10 +12,9 @@ use super::{
     BuildStateTool, BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord, BuildVolumeState,
     DisplacedBuildStateFinding, TrackedBuildStateRefusal, discard, link, nx, tracked_source,
 };
-use crate::apfs::SystemCommandRunner;
 use crate::capabilities::BuildStatePath;
-use crate::metadata::ImageCapacity;
-use crate::storage::apfs::native::MacOsApfsExecutionHost;
+use cowshed_apfs::image::ImageCapacity;
+use crate::runtime::storage_host::RuntimeStorageHost;
 use crate::{CowshedError, Result};
 
 pub struct FirstTouch<'a> {
@@ -55,8 +54,8 @@ pub struct MintedVolume {
 /// The checkout's first build volume (or the one an interrupted first touch already linked),
 /// with every contributed path linked into it (a declared one once it exists), and the real
 /// directories it discarded.
-pub fn first_touch(
-    host: &MacOsApfsExecutionHost<SystemCommandRunner>,
+pub(crate) fn first_touch<H: RuntimeStorageHost>(
+    host: &H,
     layout: &BuildVolumeLayout,
     migration: FirstTouch<'_>,
 ) -> Result<

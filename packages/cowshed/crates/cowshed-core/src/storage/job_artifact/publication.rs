@@ -15,7 +15,7 @@ use super::{
 use crate::api::dto::{
     OutputPublication, ProtectedOutput, PublicationPolicy, Sha256Digest, StreamInfo,
 };
-use crate::fsio::rename_noreplace;
+use cowshed_os::fsio::rename_noreplace;
 
 #[cfg(target_os = "linux")]
 mod linux;

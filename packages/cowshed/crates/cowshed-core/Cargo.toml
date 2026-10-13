@@ -20,12 +20,6 @@ path = "src/bin/apfs_benchmark.rs"
 test = false
 bench = false
 
-[[bin]]
-name = "attach-budget"
-path = "src/bin/attach_budget.rs"
-test = false
-bench = false
-
 [dependencies]
 arrow-array = "56"
 arrow-buffer = "56"
@@ -35,10 +29,12 @@ base64 = "0.22"
 blake3 = "1"
 async-trait = "0.1"
 bytes = "1"
+cowshed-apfs = { path = "../cowshed-apfs" }
 # The control-plane data model only. Reconciling the gateway's session table against host
 # inventory is a pure function of these values, so the controller has no reason to link the
 # daemon's hyper/rustls closure; `cowshed-cli` owns the wiring to the running daemon.
 cowshed-gateway-types = { path = "../cowshed-gateway-types" }
+cowshed-os = { path = "../cowshed-os" }
 getrandom = "0.3"
 libc = "0.2"
 # DIRENV_WATCHES is zlib-deflated; a pure-Rust inflate, bounded at the call site.
@@ -59,6 +55,7 @@ x509-parser = { version = "0.18", features = ["verify"] }
 zeroize = "1"
 
 [dev-dependencies]
+cowshed-os = { path = "../cowshed-os", features = ["test-hooks"] }
 proptest = "1"
 # Paused time: a supervisor test lets a minute of Nx daemon probes pass without waiting it out.
 tokio = { workspace = true, features = ["test-util"] }

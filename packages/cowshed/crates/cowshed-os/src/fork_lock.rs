@@ -194,8 +194,8 @@ pub fn create<T>(make: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
 
 /// Whether a release or a [`create`] holds the fork lock exclusive right now: a spawn asked for
 /// meanwhile waits for it.
-#[cfg(test)]
-pub(crate) fn held_exclusive() -> bool {
+#[cfg(any(test, feature = "test-hooks"))]
+pub fn held_exclusive() -> bool {
     matches!(
         FORK_LOCK.try_read(),
         Err(std::sync::TryLockError::WouldBlock)
@@ -231,8 +231,8 @@ impl<T> Drop for Fenced<T> {
 }
 
 /// A spawn this crate's tests hold in flight, for any lease's release to be tried against.
-#[cfg(test)]
-pub(crate) mod in_flight {
+#[cfg(any(test, feature = "test-hooks"))]
+pub mod in_flight {
     use std::io::{self, Read as _, Write as _};
     use std::os::fd::AsRawFd as _;
     use std::os::unix::process::CommandExt as _;
@@ -242,13 +242,13 @@ pub(crate) mod in_flight {
 
     /// A spawn held in flight: its child is parked in `pre_exec`, after the fork and before the
     /// `exec`, holding a copy of every descriptor of this process, until [`InFlight::finish`].
-    pub(crate) struct InFlight {
+    pub struct InFlight {
         go: std::io::PipeWriter,
         spawn: std::thread::JoinHandle<io::Result<std::process::Child>>,
     }
 
     impl InFlight {
-        pub(crate) fn start() -> Self {
+        pub fn start() -> Self {
             let (mut started, started_writer) = std::io::pipe().unwrap();
             let (go_reader, go) = std::io::pipe().unwrap();
             let (started_fd, go_fd) = (started_writer.as_raw_fd(), go_reader.as_raw_fd());
@@ -283,7 +283,7 @@ pub(crate) mod in_flight {
         }
 
         /// Let the parked child run `exec`, and the spawn return.
-        pub(crate) fn finish(mut self) {
+        pub fn finish(mut self) {
             self.go.write_all(&[0]).unwrap();
             let mut child = self.spawn.join().unwrap().unwrap();
             assert!(child.wait().unwrap().success());

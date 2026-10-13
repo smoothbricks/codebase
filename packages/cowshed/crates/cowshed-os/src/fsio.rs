@@ -16,18 +16,18 @@ use std::path::{Path, PathBuf};
 /// A held directory capability. Child preparation never re-resolves a mutable
 /// parent path after it has been opened.
 #[derive(Debug)]
-pub(crate) struct AnchoredDirectory(File);
+pub struct AnchoredDirectory(File);
 
 impl AnchoredDirectory {
     /// Open/create a canonical absolute chain without following any symlink.
     /// One path buffer supplies all NUL-terminated components to openat.
-    pub(crate) fn create(path: &Path) -> io::Result<Self> {
+    pub fn create(path: &Path) -> io::Result<Self> {
         Self::open_chain(path, true)
     }
 
     /// Hold an existing canonical chain without creating a component or following a link.
     #[cfg(target_os = "macos")]
-    pub(crate) fn open(path: &Path) -> io::Result<Self> {
+    pub fn open(path: &Path) -> io::Result<Self> {
         Self::open_chain(path, false)
     }
 
@@ -63,12 +63,12 @@ impl AnchoredDirectory {
         Ok(directory)
     }
 
-    pub(crate) fn child(&self, name: &CStr) -> io::Result<Self> {
+    pub fn child(&self, name: &CStr) -> io::Result<Self> {
         self.child_with(name, true)
     }
 
     #[cfg(target_os = "macos")]
-    pub(crate) fn existing_child(&self, name: &CStr) -> io::Result<Self> {
+    pub fn existing_child(&self, name: &CStr) -> io::Result<Self> {
         self.child_with(name, false)
     }
 
@@ -108,13 +108,13 @@ impl AnchoredDirectory {
     }
 
     #[cfg(target_os = "macos")]
-    pub(crate) fn metadata(&self) -> io::Result<fs::Metadata> {
+    pub fn metadata(&self) -> io::Result<fs::Metadata> {
         self.0.metadata()
     }
 
     /// The entry itself, never a symlink's target. No permission on the child is needed.
     #[cfg(target_os = "macos")]
-    pub(crate) fn stat_child(&self, name: &CStr) -> io::Result<Option<libc::stat>> {
+    pub fn stat_child(&self, name: &CStr) -> io::Result<Option<libc::stat>> {
         validate_directory_leaf(name)?;
         let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
         // SAFETY: the directory/name are held, and fstatat initializes the output on success.
@@ -141,7 +141,7 @@ impl AnchoredDirectory {
     /// Enumerate the held directory, not its path. A new open has its own directory offset;
     /// dup would share an offset and make a second check see the first check's EOF.
     #[cfg(target_os = "macos")]
-    pub(crate) fn contains_only(&self, expected: &CStr) -> io::Result<bool> {
+    pub fn contains_only(&self, expected: &CStr) -> io::Result<bool> {
         validate_directory_leaf(expected)?;
         // SAFETY: "." is a constant leaf below the live held directory.
         let fd = unsafe {
@@ -203,7 +203,7 @@ impl AnchoredDirectory {
 
     /// Both names resolve against this held parent; an existing destination is never replaced.
     #[cfg(target_os = "macos")]
-    pub(crate) fn rename_child_noreplace(
+    pub fn rename_child_noreplace(
         &self,
         source: &CStr,
         destination: &CStr,
@@ -217,7 +217,7 @@ impl AnchoredDirectory {
     /// Keep real private cache entries, preserve matching links, and replace stale links and empty
     /// directories without following any mutable parent or destination. An empty directory holds
     /// nothing a link could lose: it is what a tool leaves after a miss it could not fill.
-    pub(crate) fn ensure_symlink(&self, name: &CStr, target: &Path) -> io::Result<()> {
+    pub fn ensure_symlink(&self, name: &CStr, target: &Path) -> io::Result<()> {
         validate_directory_leaf(name)?;
         let target = CString::new(target.as_os_str().as_bytes())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "link target contains NUL"))?;
@@ -278,7 +278,7 @@ impl AnchoredDirectory {
     /// wiring before every spawn costs one read. Otherwise the bytes go to an exclusively created
     /// 0600 temp sibling, are synced, and are renamed over `name`. Nothing is followed: a link a
     /// child planted at `name` is replaced by the rename, never written through.
-    pub(crate) fn publish_file(&self, name: &CStr, contents: &[u8]) -> io::Result<()> {
+    pub fn publish_file(&self, name: &CStr, contents: &[u8]) -> io::Result<()> {
         validate_directory_leaf(name)?;
         if self.read_regular_file(name)?.as_deref() == Some(contents) {
             return Ok(());
@@ -336,7 +336,7 @@ impl AnchoredDirectory {
     /// Remove the entry `name` beneath this directory, whatever it is but a directory: a file a
     /// previous wiring published, or a link a child planted there — never the link's target. An
     /// absent entry is already the state this asks for.
-    pub(crate) fn remove_file(&self, name: &CStr) -> io::Result<()> {
+    pub fn remove_file(&self, name: &CStr) -> io::Result<()> {
         validate_directory_leaf(name)?;
         // SAFETY: unlinkat removes this directory's own entry, not a link target.
         if unsafe { libc::unlinkat(self.0.as_raw_fd(), name.as_ptr(), 0) } == 0 {
@@ -361,7 +361,7 @@ impl AnchoredDirectory {
     /// so a crash at any point leaves a manifest the next call can reconcile from. A manifest
     /// naming anything but a plain leaf, or an entry that is a directory, is an error; nothing
     /// is guessed.
-    pub(crate) fn reconcile_links<N: AsRef<CStr>>(
+    pub fn reconcile_links<N: AsRef<CStr>>(
         &self,
         manifest: &CStr,
         links: &[(N, &Path)],
@@ -525,7 +525,7 @@ fn validate_directory_leaf(name: &CStr) -> io::Result<()> {
 /// exactly one recognizer ([`is_temp_artifact`]) instead of per-writer spellings. Applied only in
 /// cowshed-owned directories (project roots, `sessions/`, config and trace directories) — never
 /// to workspace content, which is what keeps the loose recognizer safe.
-pub(crate) fn temp_name(final_name: &OsStr, discriminator: impl fmt::Display) -> OsString {
+pub fn temp_name(final_name: &OsStr, discriminator: impl fmt::Display) -> OsString {
     let mut name = OsString::from(".");
     name.push(final_name);
     name.push(format!(".tmp.{discriminator}"));
@@ -537,7 +537,7 @@ pub(crate) fn temp_name(final_name: &OsStr, discriminator: impl fmt::Display) ->
 /// exists yet — residue is currently reclaimed only by whole-tree removal — so until one lands
 /// this predicate is pinned by tests alone.
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn is_temp_artifact(file_name: &OsStr) -> bool {
+pub fn is_temp_artifact(file_name: &OsStr) -> bool {
     let Some(name) = file_name.to_str() else {
         return false;
     };
@@ -552,7 +552,7 @@ pub(crate) fn is_temp_artifact(file_name: &OsStr) -> bool {
 /// owner's `rwx` bits on every directory in the tree this user owns, then removes it once more.
 /// Only this user's own directories are touched: one another user owns keeps its mode, so the
 /// second removal reports exactly what still refuses it. Symlinks are never followed.
-pub(crate) fn remove_owned_tree(path: &Path) -> io::Result<()> {
+pub fn remove_owned_tree(path: &Path) -> io::Result<()> {
     match fs::remove_dir_all(path) {
         Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
             grant_owner_directory_access(path)?;
@@ -565,7 +565,7 @@ pub(crate) fn remove_owned_tree(path: &Path) -> io::Result<()> {
 /// Add `u+rwx` to each directory beneath (and including) `root` that this user owns, top-down so
 /// each one is searchable before its children are visited. A directory another user owns is not
 /// descended into. An entry gone mid-walk was removed by someone else and is skipped.
-pub(crate) fn grant_owner_directory_access(root: &Path) -> io::Result<()> {
+pub fn grant_owner_directory_access(root: &Path) -> io::Result<()> {
     use std::os::unix::fs::MetadataExt;
 
     // SAFETY: geteuid has no preconditions and reads no caller-owned memory.
@@ -624,7 +624,7 @@ pub(crate) fn grant_owner_directory_access(root: &Path) -> io::Result<()> {
 /// `O_DIRECTORY` so a path swapped for a file between derivation and sync fails instead of
 /// silently syncing the wrong object, and `O_CLOEXEC` so the descriptor never leaks into an
 /// exec'd child.
-pub(crate) fn sync_directory(path: &Path) -> io::Result<()> {
+pub fn sync_directory(path: &Path) -> io::Result<()> {
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -637,7 +637,7 @@ pub(crate) fn sync_directory(path: &Path) -> io::Result<()> {
 
 /// Atomically rename one directory-relative entry without replacing an existing destination.
 #[cfg(target_os = "macos")]
-pub(crate) fn rename_noreplace(
+pub fn rename_noreplace(
     directory: std::os::fd::RawFd,
     source: &std::ffi::CStr,
     destination: &std::ffi::CStr,
@@ -662,7 +662,7 @@ pub(crate) fn rename_noreplace(
 
 /// Atomically rename one directory-relative entry without replacing an existing destination.
 #[cfg(target_os = "linux")]
-pub(crate) fn rename_noreplace(
+pub fn rename_noreplace(
     directory: std::os::fd::RawFd,
     source: &std::ffi::CStr,
     destination: &std::ffi::CStr,
@@ -687,7 +687,7 @@ pub(crate) fn rename_noreplace(
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-pub(crate) fn rename_noreplace(
+pub fn rename_noreplace(
     _directory: std::os::fd::RawFd,
     _source: &std::ffi::CStr,
     _destination: &std::ffi::CStr,
@@ -701,7 +701,7 @@ pub(crate) fn rename_noreplace(
 /// Open the directory at `path` for directory-relative work, refusing a symlink or a
 /// non-directory at its last component. Earlier components resolve normally, so a root below a
 /// linked system prefix (macOS `/var` → `/private/var`) opens.
-pub(crate) fn open_directory_nofollow(path: &Path) -> io::Result<File> {
+pub fn open_directory_nofollow(path: &Path) -> io::Result<File> {
     OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
@@ -711,7 +711,7 @@ pub(crate) fn open_directory_nofollow(path: &Path) -> io::Result<File> {
 /// Create the child directory `name` of `parent` with mode 0700, or open the one already there,
 /// refusing a symlink or a non-directory at `name`. `true` when this call created it: the parent
 /// then gained an entry its writer may have to make durable.
-pub(crate) fn open_or_create_child_directory(
+pub fn open_or_create_child_directory(
     parent: &File,
     name: &CStr,
 ) -> io::Result<(File, bool)> {
@@ -745,7 +745,7 @@ pub(crate) fn open_or_create_child_directory(
 /// Create the private file `name` beneath `directory`. `O_EXCL` and `O_NOFOLLOW` refuse any entry
 /// already there, a link included; the mode is set to 0600 after the open because the open's mode
 /// is masked by the umask. A file whose mode cannot be set is unlinked before the error returns.
-pub(crate) fn create_private_file_at(directory: &File, name: &CStr) -> io::Result<File> {
+pub fn create_private_file_at(directory: &File, name: &CStr) -> io::Result<File> {
     validate_directory_leaf(name)?;
     // SAFETY: the held directory fd and NUL-terminated leaf outlive the call.
     let fd = unsafe {
@@ -770,14 +770,14 @@ pub(crate) fn create_private_file_at(directory: &File, name: &CStr) -> io::Resul
 /// Unlinks a directory-relative temporary when dropped armed: publication either renames the
 /// temporary to its sealed name and disarms this, or leaves nothing behind. The unlink is the
 /// last act of a path that already failed, so its own failure has nowhere to go.
-pub(crate) struct TemporaryAt<'a> {
+pub struct TemporaryAt<'a> {
     directory: &'a File,
     name: &'a CStr,
     armed: bool,
 }
 
 impl<'a> TemporaryAt<'a> {
-    pub(crate) fn new(directory: &'a File, name: &'a CStr) -> Self {
+    pub fn new(directory: &'a File, name: &'a CStr) -> Self {
         Self {
             directory,
             name,
@@ -785,7 +785,7 @@ impl<'a> TemporaryAt<'a> {
         }
     }
 
-    pub(crate) fn disarm(mut self) {
+    pub fn disarm(mut self) {
         self.armed = false;
     }
 }
@@ -802,7 +802,7 @@ impl Drop for TemporaryAt<'_> {
 /// How [`publish_private_file`] failed: an I/O step (with the path it was about), or the caller's
 /// own write closure. Typed so callers keep their structured errors instead of flattening
 /// serialization failures into `io::Error`.
-pub(crate) enum PublishError<E> {
+pub enum PublishError<E> {
     Io { path: PathBuf, source: io::Error },
     Write(E),
 }
@@ -815,7 +815,7 @@ pub(crate) enum PublishError<E> {
 /// anyway, and recovery treats a job whose record went missing or torn with it as a lost job
 /// (11_shell.md "Job control").
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum Durability {
+pub enum Durability {
     /// No sync: the kernel holds the bytes, so they survive the writer's death. For state that a
     /// later open re-derives from whatever did survive.
     Process,
@@ -828,11 +828,11 @@ pub(crate) enum Durability {
 }
 
 impl Durability {
-    pub(crate) fn sync_file(self, file: &File) -> io::Result<()> {
+    pub fn sync_file(self, file: &File) -> io::Result<()> {
         match self {
             Self::Process => Ok(()),
             Self::Device => {
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-hooks"))]
                 count_sync(|syncs| syncs.fsync += 1);
                 // SAFETY: fsync on a descriptor the borrowed `File` keeps open.
                 if unsafe { libc::fsync(file.as_raw_fd()) } == 0 {
@@ -846,7 +846,7 @@ impl Durability {
     }
 
     /// Make a directory entry this write created as durable as the write itself.
-    pub(crate) fn sync_new_entry(self, directory: &Path) -> io::Result<()> {
+    pub fn sync_new_entry(self, directory: &Path) -> io::Result<()> {
         match self {
             Self::Process | Self::Device => Ok(()),
             Self::PowerLoss => sync_directory(directory),
@@ -854,7 +854,7 @@ impl Durability {
     }
 
     /// [`Self::sync_new_entry`] through a directory descriptor the writer already holds.
-    pub(crate) fn sync_new_entry_at(self, directory: &File) -> io::Result<()> {
+    pub fn sync_new_entry_at(self, directory: &File) -> io::Result<()> {
         match self {
             Self::Process | Self::Device => Ok(()),
             Self::PowerLoss => full_sync(directory),
@@ -865,28 +865,28 @@ impl Durability {
 /// `F_FULLFSYNC` on macOS (`fsync(2)` elsewhere), the only full-device flush a [`Durability`]
 /// issues.
 fn full_sync(file: &File) -> io::Result<()> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     count_sync(|syncs| syncs.full += 1);
     file.sync_all()
 }
 
 /// The syncs this thread issued through [`Durability`] since the last [`take_syncs`], so a test
 /// can hold a path to the flush its state's tier allows.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-hooks"))]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct Syncs {
+pub struct Syncs {
     /// `fsync(2)`: [`Durability::Device`].
-    pub(crate) fsync: usize,
+    pub fsync: usize,
     /// Full-device flushes: [`Durability::PowerLoss`] files and directories.
-    pub(crate) full: usize,
+    pub full: usize,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-hooks"))]
 thread_local! {
     static SYNCS: std::cell::Cell<Syncs> = const { std::cell::Cell::new(Syncs { fsync: 0, full: 0 }) };
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-hooks"))]
 fn count_sync(count: impl FnOnce(&mut Syncs)) {
     SYNCS.with(|cell| {
         let mut syncs = cell.get();
@@ -895,8 +895,8 @@ fn count_sync(count: impl FnOnce(&mut Syncs)) {
     });
 }
 
-#[cfg(test)]
-pub(crate) fn take_syncs() -> Syncs {
+#[cfg(any(test, feature = "test-hooks"))]
+pub fn take_syncs() -> Syncs {
     SYNCS.with(std::cell::Cell::take)
 }
 
@@ -907,7 +907,7 @@ pub(crate) fn take_syncs() -> Syncs {
 /// included, so no separate `O_NOFOLLOW` is needed — plus `O_CLOEXEC`. Permissions are `0600`
 /// twice on purpose: the open mode is masked by the umask, so the explicit `set_permissions`
 /// afterwards is what guarantees the private mode.
-pub(crate) fn publish_private_file<E>(
+pub fn publish_private_file<E>(
     path: &Path,
     write: impl FnOnce(&mut BufWriter<File>) -> Result<(), E>,
 ) -> Result<(), PublishError<E>> {
@@ -917,7 +917,7 @@ pub(crate) fn publish_private_file<E>(
 /// [`publish_private_file`] at `durability`: the rename is atomic at every level, so a reader
 /// sees the old file or the new one, never a torn one; the level decides only which crash the
 /// new one survives.
-pub(crate) fn publish_private_file_with<E>(
+pub fn publish_private_file_with<E>(
     path: &Path,
     durability: Durability,
     write: impl FnOnce(&mut BufWriter<File>) -> Result<(), E>,

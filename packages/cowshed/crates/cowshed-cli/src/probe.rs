@@ -19,7 +19,7 @@ use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use cowshed_core::api::{Finding, FindingSeverity};
-use cowshed_core::fork_lock::Run as _;
+use cowshed_os::fork_lock::Run as _;
 use cowshed_core::metadata::WorkspaceName;
 use cowshed_core::storage::StorageLayout;
 use cowshed_core::{CowshedError, Result};

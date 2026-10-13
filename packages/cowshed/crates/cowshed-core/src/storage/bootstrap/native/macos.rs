@@ -34,11 +34,12 @@ use super::shared::{
     existing_host_storage_error, platform_host_error, provision_volumes_action,
     setup_execution_error, write_marker_action,
 };
-use crate::apfs::{RegisteredApfsContainer, registered_apfs_containers};
+use cowshed_apfs::{RegisteredApfsContainer, registered_apfs_containers};
 use crate::error::CowshedError;
-use crate::fork_lock::{Run as _, Spawn as _};
+use cowshed_os::fork_lock::{Run as _, Spawn as _};
+use cowshed_apfs::mounts::KernelMountSnapshot;
 use crate::storage::apfs::native::{
-    KernelMountSnapshot, KernelMountSource, SystemKernelMountSource,
+    KernelMountSource, SystemKernelMountSource,
 };
 use crate::storage::fstab::{COWSHED_FSTAB_TAG, FstabPin, build_fstab};
 
@@ -2111,7 +2112,7 @@ fn exact_device_identifier(path: &Path) -> Result<String, NativeBootstrapError> 
 fn valid_container_identifier(value: &[u8]) -> bool {
     str::from_utf8(value)
         .ok()
-        .and_then(crate::device::identifier_depth)
+        .and_then(cowshed_apfs::device::identifier_depth)
         == Some(0)
 }
 
@@ -2120,7 +2121,7 @@ fn valid_container_identifier(value: &[u8]) -> bool {
 fn valid_volume_identifier(value: &[u8]) -> bool {
     str::from_utf8(value)
         .ok()
-        .and_then(crate::device::identifier_depth)
+        .and_then(cowshed_apfs::device::identifier_depth)
         == Some(1)
 }
 
@@ -2210,7 +2211,7 @@ impl ApfsInventory {
             let mut volumes = Vec::with_capacity(container.volumes.len());
             for volume in container.volumes {
                 if !valid_volume_identifier(volume.identifier.as_bytes())
-                    || crate::device::container_of(&volume.identifier)
+                    || cowshed_apfs::device::container_of(&volume.identifier)
                         != Some(container.reference.as_str())
                 {
                     return Err(malformed(format!(
@@ -2434,7 +2435,7 @@ fn run_command_with(
         )));
     }
     let output =
-        crate::disk_lease::leased(program, command.args(), || spawn(program, command.args()))
+        cowshed_apfs::disk_lease::leased(program, command.args(), || spawn(program, command.args()))
             .map_err(|source| {
                 HostError::new(format!(
                     "cannot execute {:?} with argv {:?}: {source}",
@@ -2976,7 +2977,7 @@ impl MacAuthorizationSession {
         Ok(session)
     }
     /// Run `command` as root, under the disk-lifecycle lease when it is a disk tool
-    /// ([`crate::disk_lease`]).
+    /// ([`cowshed_apfs::disk_lease`]).
     fn execute_authorized(
         &mut self,
         command: &HostCommand,
@@ -2988,7 +2989,7 @@ impl MacAuthorizationSession {
                 command.program()
             )));
         }
-        crate::disk_lease::leased(Path::new(command.program()), command.args(), || {
+        cowshed_apfs::disk_lease::leased(Path::new(command.program()), command.args(), || {
             self.execute_authorized_unleased(command, input)
         })
     }
@@ -3125,7 +3126,7 @@ fn authorized_command_output(mut output: Vec<u8>) -> Result<HostCommandOutput, H
         Ok(HostCommandOutput::success(output))
     } else {
         Ok(HostCommandOutput::failure_with_streams(
-            crate::process::ProcessStatus::Exit(code),
+            cowshed_os::process::ProcessStatus::Exit(code),
             output,
             Vec::new(),
         ))
@@ -3510,13 +3511,13 @@ mod tests {
 
     use super::super::shared::mutating_setup_actions;
     use super::*;
-    use crate::apfs::RegisteredApfsVolume;
-    use crate::storage::bootstrap::{BlockingJob, RETIRED_CACHES_MOUNTPOINT, STORE_ROOT};
+    use cowshed_apfs::RegisteredApfsVolume;
+    use crate::storage::bootstrap::{BlockingJob, RETIRED_CACHES_MOUNTPOINT};
     use uuid::Uuid;
 
     #[test]
     fn real_apfs_inventory_survives_concurrent_image_teardown() {
-        use crate::apfs::{ApfsBackend, DetachIntent, MacOsApfsBackend, SystemCommandRunner};
+        use cowshed_apfs::{ApfsBackend, DetachIntent, MacOsApfsBackend, SystemCommandRunner};
 
         let root =
             crate::scratch_apfs::ScratchRoot::new("inventory-teardown").expect("scratch root");
@@ -3535,7 +3536,7 @@ mod tests {
             StatFsEvidence::Apfs {
                 mount_source: snapshot.mount_source,
                 container: Some(
-                    crate::device::container_of(&device)
+                    cowshed_apfs::device::container_of(&device)
                         .expect("home container")
                         .to_owned(),
                 ),
@@ -3658,7 +3659,7 @@ mod tests {
             .expect("home device is registered in exactly one container");
         assert_eq!(
             Some(container.reference.as_str()),
-            crate::device::container_of(&device)
+            cowshed_apfs::device::container_of(&device)
         );
         let home_volume = container
             .volumes
@@ -5981,7 +5982,7 @@ mod tests {
 
     #[test]
     fn volume_container_is_the_synthesized_disk_of_the_volume_identifier() {
-        use crate::device::container_of;
+        use cowshed_apfs::device::container_of;
         assert_eq!(container_of("disk3s5"), Some("disk3"));
         assert_eq!(container_of("disk13s1"), Some("disk13"));
         // A sealed system snapshot mounts as `<volume>s<snapshot>`; the container is unchanged,
@@ -7142,7 +7143,7 @@ UUID=CACHES /private/cowshed/caches apfs rw # cowshed created volume labelled co
         let output =
             authorized_command_output(b"secret\n--cowshed-aewp-exit:44--\n".to_vec()).unwrap();
         assert!(!output.succeeded());
-        assert_eq!(output.status, crate::process::ProcessStatus::Exit(44));
+        assert_eq!(output.status, cowshed_os::process::ProcessStatus::Exit(44));
         assert_eq!(output.stdout, b"secret");
     }
 
@@ -7242,13 +7243,13 @@ mod unix {
     const MARKER_MODE: libc::mode_t = 0o600;
 
     /// Run `program args` to completion or `deadline`, under the disk-lifecycle lease when it is
-    /// a disk tool ([`crate::disk_lease`]); the deadline starts once the lease is granted.
+    /// a disk tool ([`cowshed_apfs::disk_lease`]); the deadline starts once the lease is granted.
     pub(super) fn spawn_with_deadline(
         program: &Path,
         args: &[String],
         deadline: Duration,
     ) -> Result<Output, HostError> {
-        crate::disk_lease::leased(program, args, || {
+        cowshed_apfs::disk_lease::leased(program, args, || {
             spawn_unleased_with_deadline(program, args, deadline)
         })
     }

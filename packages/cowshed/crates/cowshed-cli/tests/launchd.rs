@@ -15,17 +15,16 @@ use cowshed_cli::launchd::{
     StableLink, StoreBackedProgram, plan_executable_install, plan_executable_remove, plan_install,
     plan_remove, replace_symlink,
 };
-use cowshed_core::metadata::ImageCapacity;
+use cowshed_apfs::image::ImageCapacity;
 
 #[cfg(target_os = "macos")]
-use cowshed_core::apfs::{CommandRunner, DetachIntent, DiskImageSource, SystemCommandRunner};
-#[cfg(target_os = "macos")]
-use cowshed_core::storage::apfs::ApfsSubstrateConfig;
-#[cfg(target_os = "macos")]
-use cowshed_core::storage::apfs::native::MacOsApfsExecutionHost;
+use cowshed_apfs::{
+    CommandRunner, DetachIntent, DiskImageSource, MacOsApfsBackend, SystemCommandRunner,
+    mounts::kernel_mounts, store_lock::verify_no_symlinks,
+};
 
 #[cfg(target_os = "macos")]
-#[path = "../../cowshed-core/tests/support/scratch_apfs.rs"]
+#[path = "../../cowshed-apfs/tests/support/scratch_apfs.rs"]
 mod scratch_apfs;
 
 const HOME: &str = "/Users/cowshed-test";

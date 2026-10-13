@@ -1,6 +1,4 @@
 use std::collections::{BTreeMap, BTreeSet};
-#[cfg(target_os = "macos")]
-use std::ffi::CStr;
 use std::ffi::{CString, OsStr, OsString};
 use std::fs::{self, File};
 use std::io;
@@ -14,20 +12,19 @@ use std::thread;
 use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
-#[cfg(unix)]
-use std::os::unix::io::{AsRawFd, FromRawFd};
 
-use crate::apfs::{
+use cowshed_apfs::{
     ApfsBackend, ApfsError, AttachedImage, CommandRunner, DetachIntent, MacOsApfsBackend,
     MountAccess, RecoveredImageAttachment,
 };
 use crate::copy::copy_until_quiescent_blocking;
 #[cfg(target_os = "macos")]
-use crate::fsio::AnchoredDirectory;
+use cowshed_os::fsio::AnchoredDirectory;
+use cowshed_apfs::image::{IMAGE_EXTENSION, ImageCapacity, is_image_path};
 use crate::metadata::{
-    DetachedWorkspaceMetadata, GRANTS_SIDECAR_SUFFIX, IMAGE_EXTENSION, ImageCapacity,
+    DetachedWorkspaceMetadata, GRANTS_SIDECAR_SUFFIX,
     MARKER_VERSION, Platform, PublicationState, SIDECAR_VERSION, WorkspaceIncarnation,
-    WorkspaceInfoSnapshot, WorkspaceMarker, WorkspaceName, WorkspaceRole, is_image_path,
+    WorkspaceInfoSnapshot, WorkspaceMarker, WorkspaceName, WorkspaceRole,
     sidecar_path,
 };
 use crate::repository::{
@@ -56,244 +53,25 @@ use super::{
     ResumableClone, companion_path, extents, layout, main_aware_mount_point,
     recovery_staging_mount, retired_image_below, split_retired_stem, volume_key,
 };
-use crate::timing::timed;
+use cowshed_os::timing::timed;
 
 mod blank_template;
 mod build_volumes;
 #[cfg(target_os = "macos")]
 mod re_adopt;
-pub use blank_template::{
-    BLANK_TEMPLATE_LABEL, blank_template, blank_template_path, blank_template_staged_stem,
-};
+use cowshed_apfs::mounts::{KernelMountSnapshot, kernel_mounts};
+use cowshed_apfs::store_lock::{ImageLockGuard, acquire_image_locks};
 pub use build_volumes::{
     Claim as BuildVolumeClaim, Refusal as BuildVolumeRefusal, Release as BuildVolumeRelease,
 };
 
-const CHECKPOINT_FACT_VERSION: u32 = 1;
+pub(in crate::storage) const CHECKPOINT_FACT_VERSION: u32 = 1;
 const CHECKPOINT_FACT_SUFFIX: &str = ".checkpoint.json";
 
-const ROOT_OPEN_FLAGS: libc::c_int =
-    libc::O_RDONLY + libc::O_DIRECTORY + libc::O_NOFOLLOW + libc::O_CLOEXEC;
-const DIRECTORY_OPEN_FLAGS: libc::c_int =
-    libc::O_RDONLY + libc::O_DIRECTORY + libc::O_NOFOLLOW + libc::O_CLOEXEC;
-/// An existing lock file: opened, never created.
-const LOCK_FILE_OPEN_FLAGS: libc::c_int = libc::O_RDWR + libc::O_NOFOLLOW + libc::O_CLOEXEC;
-/// A lock file no one has created yet: created, or `EEXIST` when someone just did.
-const LOCK_FILE_CREATE_FLAGS: libc::c_int = LOCK_FILE_OPEN_FLAGS + libc::O_CREAT + libc::O_EXCL;
-const WAIT_LOCK_OPERATION: libc::c_int = libc::LOCK_EX;
-const TRY_LOCK_OPERATION: libc::c_int = libc::LOCK_EX + libc::LOCK_NB;
-const LOCK_FILE_MODE: libc::c_uint = 0o600;
-const CONTROLLER_DIRECTORY_MODE: libc::mode_t = 0o700;
-
-fn fd_failed(fd: libc::c_int) -> bool {
-    fd == -1
-}
-
-/// The mount count Darwin `getfsstat` answered, which is `-1` on error with `errno` set.
-/// Treating a negative count as a slice length would be memory-unsafe; `0` is
-/// not a legitimate Darwin mount table either (at least `/` is mounted).
-///
-/// Only `system_kernel_mounts`' Darwin arm calls this, so the non-macOS lib must
-/// not compile it; `test` keeps the predicate's own unit test on every platform.
-#[cfg(any(target_os = "macos", test))]
-fn mount_count(count: libc::c_int) -> Option<usize> {
-    usize::try_from(count).ok().filter(|&count| count > 0)
-}
-
-fn flock_succeeded(result: libc::c_int) -> bool {
-    result == 0
-}
-
-fn lock_is_busy(mode: LockMode, kind: io::ErrorKind) -> bool {
-    matches!((mode, kind), (LockMode::Try, io::ErrorKind::WouldBlock))
-}
-
-fn should_create_directory(fd: libc::c_int, kind: io::ErrorKind) -> bool {
-    matches!((fd_failed(fd), kind), (true, io::ErrorKind::NotFound))
-}
-
-fn mkdir_failed(result: libc::c_int, kind: io::ErrorKind) -> bool {
-    !matches!(
-        (fd_failed(result), kind),
-        (false, _) | (true, io::ErrorKind::AlreadyExists)
-    )
-}
-
-fn should_retry_lock(kind: io::ErrorKind) -> bool {
-    matches!(kind, io::ErrorKind::Interrupted)
-}
-
-/// The image lifecycle locks one operation holds. Fenced: a peer's try-lock succeeds as soon as
-/// the guard is dropped, whatever this process is spawning (`fork_lock`).
-pub struct ImageLockGuard {
-    _files: Vec<crate::fork_lock::Fenced<File>>,
-}
-
-fn path_component(value: &std::ffi::OsStr, path: &Path) -> Result<CString, ApfsStorageError> {
-    CString::new(value.as_bytes()).map_err(|_| {
-        ApfsStorageError::Host(format!("controller path contains NUL: {}", path.display()))
-    })
-}
-
-/// The lock file `name` in `directory`, created if it does not exist yet.
-///
-/// Never one `O_CREAT` open: when several processes `openat` the same new name with `O_CREAT` at
-/// once, macOS answers some of them `ENOENT` (measured on APFS: thousands of failures in 4,800
-/// racing `openat`s, none with path-based `open`). An open of the existing file, then an
-/// exclusive create, then an open of the file the `EEXIST` names, measured none in 12,000.
-fn open_or_create_lock_at(
-    directory: &File,
-    name: &CString,
-    path: &Path,
-) -> Result<File, ApfsStorageError> {
-    let open = |flags: libc::c_int| {
-        // SAFETY: `directory` owns a live directory fd; `name` is a `CString` that outlives the
-        // call. Both flag sets include `O_NOFOLLOW | O_CLOEXEC`, so the lock file cannot be a
-        // symlink and the fd cannot leak; the mode applies only to `O_CREAT`.
-        let fd =
-            unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags, LOCK_FILE_MODE) };
-        if fd_failed(fd) {
-            Err(io::Error::last_os_error())
-        } else {
-            // SAFETY: `fd` is a live descriptor we exclusively own from a successful `openat`;
-            // `File` takes ownership and will close it.
-            Ok(unsafe { File::from_raw_fd(fd) })
-        }
-    };
-    open(LOCK_FILE_OPEN_FLAGS)
-        .or_else(|error| match error.kind() {
-            io::ErrorKind::NotFound => open(LOCK_FILE_CREATE_FLAGS),
-            _ => Err(error),
-        })
-        .or_else(|error| match error.kind() {
-            io::ErrorKind::AlreadyExists => open(LOCK_FILE_OPEN_FLAGS),
-            _ => Err(error),
-        })
-        .map_err(|error| {
-            io_error(
-                "open lifecycle lock without following symlinks",
-                path,
-                error,
-            )
-        })
-}
-
-fn open_lock_file(root: &Path, path: &Path) -> Result<File, ApfsStorageError> {
-    let relative = path.strip_prefix(root).map_err(|_| {
-        ApfsStorageError::Layout(super::super::StorageLayoutError::EscapesStoreRoot)
-    })?;
-    let mut components = relative.components().peekable();
-    if components.peek().is_none() {
-        return Err(ApfsStorageError::InvalidPlan("lock path is the store root"));
-    }
-    let root_name = CString::new(root.as_os_str().as_bytes())
-        .map_err(|_| ApfsStorageError::Host("store root contains NUL".to_owned()))?;
-    // SAFETY: `root_name` is a `CString`, so the pointer is NUL-terminated and
-    // lives for the call. `ROOT_OPEN_FLAGS` includes `O_CLOEXEC | O_NOFOLLOW |
-    // O_DIRECTORY`, so this never follows a symlink at the store root.
-    let root_fd = unsafe { libc::open(root_name.as_ptr(), ROOT_OPEN_FLAGS) };
-    if fd_failed(root_fd) {
-        return Err(io_error(
-            "open controller store without following symlinks",
-            root,
-            io::Error::last_os_error(),
-        ));
-    }
-    // SAFETY: `root_fd` is a live descriptor we exclusively own from a successful
-    // `open`; `File` takes ownership and will close it.
-    let mut directory = unsafe { File::from_raw_fd(root_fd) };
-    while let Some(component) = components.next() {
-        let Component::Normal(name) = component else {
-            return Err(ApfsStorageError::Layout(
-                super::super::StorageLayoutError::EscapesStoreRoot,
-            ));
-        };
-        let name = path_component(name, path)?;
-        if components.peek().is_none() {
-            return open_or_create_lock_at(&directory, &name, path);
-        }
-        // SAFETY: `directory` owns a live directory fd; `name` is a `CString` that
-        // outlives the call. `DIRECTORY_OPEN_FLAGS` includes `O_NOFOLLOW | O_DIRECTORY`.
-        let mut fd =
-            unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), DIRECTORY_OPEN_FLAGS) };
-        if should_create_directory(fd, io::Error::last_os_error().kind()) {
-            // SAFETY: `directory` owns a live directory fd; `name` is a `CString`
-            // that outlives the call. Mode `0o700` is the controller-directory policy.
-            let created = unsafe {
-                libc::mkdirat(
-                    directory.as_raw_fd(),
-                    name.as_ptr(),
-                    CONTROLLER_DIRECTORY_MODE,
-                )
-            };
-            if mkdir_failed(created, io::Error::last_os_error().kind()) {
-                return Err(io_error(
-                    "create controller directory without following symlinks",
-                    path,
-                    io::Error::last_os_error(),
-                ));
-            }
-            // SAFETY: same as the `openat` above; retry after `mkdirat` raced with another
-            // creator. `name` still lives.
-            fd =
-                unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), DIRECTORY_OPEN_FLAGS) };
-        }
-        if fd_failed(fd) {
-            return Err(io_error(
-                "open controller directory without following symlinks",
-                path,
-                io::Error::last_os_error(),
-            ));
-        }
-        // SAFETY: `fd` is a live directory descriptor we exclusively own from a
-        // successful `openat`; `File` takes ownership and will close it. Dropping
-        // `directory` closes the previous component fd.
-        directory = unsafe { File::from_raw_fd(fd) };
-    }
-    Err(ApfsStorageError::InvalidPlan(
-        "lock path has no final component",
-    ))
-}
-
-fn acquire_image_locks(
-    root: &Path,
-    paths: &[PathBuf],
-    mode: LockMode,
-) -> Result<Option<ImageLockGuard>, ApfsStorageError> {
-    let mut paths = paths.to_vec();
-    paths.sort();
-    paths.dedup();
-    let mut files = Vec::with_capacity(paths.len());
-    for path in paths {
-        let file = crate::fork_lock::Fenced::new(open_lock_file(root, &path)?);
-        let operation = match mode {
-            LockMode::Wait => WAIT_LOCK_OPERATION,
-            LockMode::Try => TRY_LOCK_OPERATION,
-        };
-        loop {
-            // SAFETY: `file` owns the fd for the duration of the call; `flock` does
-            // not consume it. `operation` is `LOCK_EX` or `LOCK_EX|LOCK_NB`.
-            let result = unsafe { libc::flock(file.as_raw_fd(), operation) };
-            if flock_succeeded(result) {
-                files.push(file);
-                break;
-            }
-            let error = io::Error::last_os_error();
-            if should_retry_lock(error.kind()) {
-                continue;
-            }
-            if lock_is_busy(mode, error.kind()) {
-                return Ok(None);
-            }
-            return Err(io_error("acquire lifecycle lock", &path, error));
-        }
-    }
-    Ok(Some(ImageLockGuard { _files: files }))
-}
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
-enum CheckpointPinWire {
+pub(in crate::storage) enum CheckpointPinWire {
     Pinned,
     Automatic,
 }
@@ -318,43 +96,43 @@ impl From<CheckpointPinWire> for Pin {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct CheckpointFactWire {
-    version: u32,
-    repo_id: RepoId,
-    workspace: WorkspaceName,
-    label: CheckpointLabel,
-    revision: u64,
-    pin: CheckpointPinWire,
+pub(in crate::storage) struct CheckpointFactWire {
+    pub(in crate::storage) version: u32,
+    pub(in crate::storage) repo_id: RepoId,
+    pub(in crate::storage) workspace: WorkspaceName,
+    pub(in crate::storage) label: CheckpointLabel,
+    pub(in crate::storage) revision: u64,
+    pub(in crate::storage) pin: CheckpointPinWire,
 }
 
-const RESTORE_RECOVERY_FACT_VERSION: u32 = 2;
+pub(in crate::storage) const RESTORE_RECOVERY_FACT_VERSION: u32 = 2;
 const RESTORE_RECOVERY_FACT_SUFFIX: &str = ".restore.json";
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct RestoreRecoveryFactWire {
-    version: u32,
-    repo_id: RepoId,
-    workspace: WorkspaceName,
-    source_checkpoint: CheckpointLabel,
-    source_incarnation: WorkspaceIncarnation,
-    replaced_incarnation: WorkspaceIncarnation,
-    destination_incarnation: WorkspaceIncarnation,
+pub(in crate::storage) struct RestoreRecoveryFactWire {
+    pub(in crate::storage) version: u32,
+    pub(in crate::storage) repo_id: RepoId,
+    pub(in crate::storage) workspace: WorkspaceName,
+    pub(in crate::storage) source_checkpoint: CheckpointLabel,
+    pub(in crate::storage) source_incarnation: WorkspaceIncarnation,
+    pub(in crate::storage) replaced_incarnation: WorkspaceIncarnation,
+    pub(in crate::storage) destination_incarnation: WorkspaceIncarnation,
 }
 
-fn checkpoint_fact_path(image: &Path) -> PathBuf {
+pub(in crate::storage) fn checkpoint_fact_path(image: &Path) -> PathBuf {
     let mut path = image.as_os_str().to_owned();
     path.push(CHECKPOINT_FACT_SUFFIX);
     PathBuf::from(path)
 }
 
-fn restore_recovery_fact_path(image: &Path) -> PathBuf {
+pub(in crate::storage) fn restore_recovery_fact_path(image: &Path) -> PathBuf {
     let mut path = image.as_os_str().to_owned();
     path.push(RESTORE_RECOVERY_FACT_SUFFIX);
     PathBuf::from(path)
 }
 
-fn restore_recovery_fact(
+pub(in crate::storage) fn restore_recovery_fact(
     config: &ApfsSubstrateConfig,
     image: &Path,
     metadata: &DetachedWorkspaceMetadata,
@@ -378,7 +156,7 @@ fn restore_recovery_fact(
     Ok(fact)
 }
 
-fn validate_restore_recovery_lineage(
+pub(in crate::storage) fn validate_restore_recovery_lineage(
     config: &ApfsSubstrateConfig,
     fact: &RestoreRecoveryFactWire,
 ) -> Result<(), ApfsStorageError> {
@@ -424,7 +202,7 @@ fn validate_restore_recovery_lineage(
 fn allocated_file_bytes(metadata: &fs::Metadata) -> u64 {
     #[cfg(unix)]
     {
-        metadata.blocks().saturating_mul(crate::apfs::SECTOR_BYTES)
+        metadata.blocks().saturating_mul(cowshed_apfs::SECTOR_BYTES)
     }
     #[cfg(not(unix))]
     {
@@ -498,7 +276,7 @@ fn orphan_session_image_identity(image: &Path) -> Result<[u8; 56], ApfsStorageEr
     Ok(identity)
 }
 
-fn grants_sidecar_missing(image: &Path) -> Result<bool, ApfsStorageError> {
+pub(in crate::storage) fn grants_sidecar_missing(image: &Path) -> Result<bool, ApfsStorageError> {
     let sidecar = sidecar_path(image);
     match fs::symlink_metadata(&sidecar) {
         Ok(_) => Ok(false),
@@ -507,7 +285,7 @@ fn grants_sidecar_missing(image: &Path) -> Result<bool, ApfsStorageError> {
     }
 }
 
-fn warn_session_image_issue(image: &Path, issue: impl std::fmt::Display) {
+pub(in crate::storage) fn warn_session_image_issue(image: &Path, issue: impl std::fmt::Display) {
     let name = image
         .file_name()
         .map(|name| name.to_string_lossy())
@@ -515,7 +293,7 @@ fn warn_session_image_issue(image: &Path, issue: impl std::fmt::Display) {
     eprintln!("cowshed: warning: skipping session image {name}: {issue}");
 }
 
-fn warn_missing_session_sidecar(image: &Path) {
+pub(in crate::storage) fn warn_missing_session_sidecar(image: &Path) {
     warn_session_image_issue(image, "grants sidecar is missing");
 }
 
@@ -556,7 +334,7 @@ fn gc_reason_tag(reason: StorageGcReason) -> &'static [u8] {
         StorageGcReason::ExpiredCheckpoint => b"expired-checkpoint",
     }
 }
-fn gc_candidate_failure_is_fatal(error: &ApfsStorageError) -> bool {
+pub(in crate::storage) fn gc_candidate_failure_is_fatal(error: &ApfsStorageError) -> bool {
     match error {
         ApfsStorageError::Cleanup {
             primary, cleanup, ..
@@ -578,7 +356,8 @@ fn gc_candidate_failure_is_fatal(error: &ApfsStorageError) -> bool {
         | ApfsStorageError::MissingCaCompanion { .. }
         | ApfsStorageError::PendingPublication(_)
         | ApfsStorageError::ResizeNotObserved { .. }
-        | ApfsStorageError::UnexpectedResult => true,
+        | ApfsStorageError::UnexpectedResult
+        | ApfsStorageError::Unsupported { .. } => true,
     }
 }
 
@@ -680,7 +459,7 @@ fn image_gc_paths(image: &Path) -> Vec<PathBuf> {
     ]
 }
 
-fn pre_cowshed_path(project_root: &Path) -> PathBuf {
+pub(in crate::storage) fn pre_cowshed_path(project_root: &Path) -> PathBuf {
     let mut path = project_root.as_os_str().to_owned();
     path.push(".pre-cowshed");
     PathBuf::from(path)
@@ -688,21 +467,23 @@ fn pre_cowshed_path(project_root: &Path) -> PathBuf {
 
 /// Sibling name the direct-mount handoff stages its mountpoint under. It must be a sibling: the
 /// handoff is a `RENAME_SWAP`, which requires both paths on the same filesystem.
-fn checkout_mountpoint_staging_path(source_checkout: &Path) -> PathBuf {
+pub(in crate::storage) fn checkout_mountpoint_staging_path(source_checkout: &Path) -> PathBuf {
     let mut path = source_checkout.as_os_str().to_owned();
     path.push(".cowshed-mountpoint");
     PathBuf::from(path)
 }
 
 /// Remove only an empty staging mountpoint; never remove a tree containing user files.
-fn remove_checkout_staging_mountpoint(staging: &Path) -> Result<(), ApfsStorageError> {
+pub(in crate::storage) fn remove_checkout_staging_mountpoint(
+    staging: &Path,
+) -> Result<(), ApfsStorageError> {
     if !path_exists(staging)? {
         return Ok(());
     }
     remove_empty_mountpoint(staging)
 }
 
-fn path_exists(path: &Path) -> Result<bool, ApfsStorageError> {
+pub(in crate::storage) fn path_exists(path: &Path) -> Result<bool, ApfsStorageError> {
     match fs::symlink_metadata(path) {
         Ok(_) => Ok(true),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
@@ -710,7 +491,7 @@ fn path_exists(path: &Path) -> Result<bool, ApfsStorageError> {
     }
 }
 
-fn sync_parent_path(path: &Path) -> Result<(), ApfsStorageError> {
+pub(in crate::storage) fn sync_parent_path(path: &Path) -> Result<(), ApfsStorageError> {
     let parent = path
         .parent()
         .ok_or(ApfsStorageError::InvalidPlan("image path has no parent"))?;
@@ -719,7 +500,7 @@ fn sync_parent_path(path: &Path) -> Result<(), ApfsStorageError> {
         .map_err(|error| io_error("sync image directory", parent, error))
 }
 
-fn empty_mountpoint(path: &Path) -> Result<bool, ApfsStorageError> {
+pub(in crate::storage) fn empty_mountpoint(path: &Path) -> Result<bool, ApfsStorageError> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
@@ -736,7 +517,7 @@ fn empty_mountpoint(path: &Path) -> Result<bool, ApfsStorageError> {
         .map_err(|error| io_error("read adoption rollback path", path, error))
 }
 
-fn remove_empty_mountpoint(path: &Path) -> Result<(), ApfsStorageError> {
+pub(in crate::storage) fn remove_empty_mountpoint(path: &Path) -> Result<(), ApfsStorageError> {
     if !empty_mountpoint(path)? {
         return Err(ApfsStorageError::InvalidPlan(
             "refusing to remove a nonempty adoption mountpoint",
@@ -751,7 +532,7 @@ fn remove_empty_mountpoint(path: &Path) -> Result<(), ApfsStorageError> {
 /// After detach the checkout path is an empty mountpoint. Restore exchanges it for the retained
 /// tree with `RENAME_SWAP`, so the checkout path is never absent. A crash before cleanup leaves
 /// the restored tree in place and an empty mountpoint beside it at `.pre-cowshed`.
-fn restore_adopted_checkout_paths(
+pub(in crate::storage) fn restore_adopted_checkout_paths(
     source_checkout: &Path,
     pre_cowshed_checkout: &Path,
 ) -> Result<(), ApfsStorageError> {
@@ -786,50 +567,6 @@ fn restore_adopted_checkout_paths(
     remove_empty_mountpoint(pre_cowshed_checkout)
 }
 
-const MNT_DONTBROWSE: u64 = 0x0010_0000;
-const MNT_IGNORE_OWNERS: u64 = 0x0020_0000;
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct KernelMountSnapshot {
-    pub mount_id: u64,
-    pub mount_point: PathBuf,
-    pub source_device: String,
-    flags: u64,
-}
-
-impl KernelMountSnapshot {
-    pub fn new(
-        mount_id: u64,
-        mount_point: impl Into<PathBuf>,
-        source_device: impl Into<String>,
-        nobrowse: bool,
-        owners: bool,
-    ) -> Self {
-        let mut flags = 0;
-        if nobrowse {
-            flags |= MNT_DONTBROWSE;
-        }
-        if !owners {
-            flags |= MNT_IGNORE_OWNERS;
-        }
-        Self {
-            mount_id,
-            mount_point: mount_point.into(),
-            source_device: source_device.into(),
-            flags,
-        }
-    }
-
-    /// The access this mount was made with: what mounting the volume again must ask for.
-    fn access(&self) -> MountAccess {
-        MountAccess::from_kernel_flags(self.flags)
-    }
-
-    /// Whether this mount shows in the Finder: what mounting the volume again must ask for.
-    fn browse(&self) -> bool {
-        self.flags & MNT_DONTBROWSE == 0
-    }
-}
 
 pub trait KernelMountSource: Send + Sync + 'static {
     fn mounts(&self) -> Result<Vec<KernelMountSnapshot>, ApfsStorageError>;
@@ -843,80 +580,10 @@ pub struct SystemKernelMountSource;
 
 impl KernelMountSource for SystemKernelMountSource {
     fn mounts(&self) -> Result<Vec<KernelMountSnapshot>, ApfsStorageError> {
-        system_kernel_mounts()
+        kernel_mounts().map_err(|error| ApfsStorageError::Host(error.to_string()))
     }
 }
 
-fn canonical_mount_flags(flags: u64) -> bool {
-    flags & MNT_IGNORE_OWNERS == 0
-}
-
-fn system_kernel_mounts() -> Result<Vec<KernelMountSnapshot>, ApfsStorageError> {
-    #[cfg(target_os = "macos")]
-    {
-        use std::hash::{Hash, Hasher};
-
-        let failed =
-            || ApfsStorageError::Host(format!("getfsstat failed: {}", io::Error::last_os_error()));
-        // Into a buffer this call owns. `getmntinfo` answers a process-static array that the
-        // next `getmntinfo` on any thread overwrites, and mount reads run on several threads at
-        // once: a `new` mounts its checkout and its build volume together, and a scratch root
-        // releases its images together.
-        // SAFETY: a null buffer asks `getfsstat` only for the number of mounts.
-        let listed = unsafe { libc::getfsstat(std::ptr::null_mut(), 0, libc::MNT_NOWAIT) };
-        // Room for mounts that appear between the two calls.
-        let mut room = mount_count(listed).ok_or_else(failed)? + 8;
-        let mut entries: Vec<libc::statfs> = Vec::new();
-        loop {
-            let bytes = room
-                .checked_mul(std::mem::size_of::<libc::statfs>())
-                .and_then(|bytes| libc::c_int::try_from(bytes).ok())
-                .ok_or_else(|| {
-                    ApfsStorageError::Host(format!("room for {room} mounts overflows getfsstat"))
-                })?;
-            // `entries` is empty, so this leaves room for `room` records.
-            entries.reserve_exact(room);
-            // SAFETY: `entries` has room for `room` records, `bytes` long, of which `getfsstat`
-            // writes at most `bytes`, and it answers how many records it wrote, or `-1`.
-            let count = unsafe { libc::getfsstat(entries.as_mut_ptr(), bytes, libc::MNT_NOWAIT) };
-            let count = mount_count(count).ok_or_else(failed)?;
-            if count < room {
-                // SAFETY: `getfsstat` initialized the first `count` records.
-                unsafe { entries.set_len(count) };
-                break;
-            }
-            // A full buffer may have cut mounts off: read the table again into twice the room.
-            room = room.checked_mul(2).ok_or_else(|| {
-                ApfsStorageError::Host(format!("room for {room} mounts overflows getfsstat"))
-            })?;
-        }
-        entries
-            .iter()
-            .map(|entry| {
-                // SAFETY: Darwin NUL-terminates `f_mntonname`/`f_mntfromname`
-                // (`char[MAXPATHLEN]`), in a record `entries` owns.
-                let bytes = unsafe { CStr::from_ptr(entry.f_mntonname.as_ptr()) }.to_bytes();
-                // SAFETY: same NUL-termination and ownership as `f_mntonname`.
-                let source_device = unsafe { CStr::from_ptr(entry.f_mntfromname.as_ptr()) }
-                    .to_string_lossy()
-                    .into_owned();
-                let mount_point = PathBuf::from(std::ffi::OsStr::from_bytes(bytes));
-                let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                mount_point.hash(&mut hasher);
-                Ok(KernelMountSnapshot {
-                    mount_id: hasher.finish(),
-                    mount_point,
-                    source_device,
-                    flags: entry.f_flags as u64,
-                })
-            })
-            .collect()
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        Ok(Vec::new())
-    }
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RestoreFailpoint {
@@ -945,7 +612,7 @@ fn collect_dir_entry_paths(
         .collect()
 }
 
-fn read_dir_paths(
+pub(in crate::storage) fn read_dir_paths(
     directory: &Path,
     operation: &'static str,
 ) -> Result<Vec<PathBuf>, ApfsStorageError> {
@@ -1010,11 +677,15 @@ fn kept_child(
     }
 }
 
-fn directory_children(directory: &Path) -> Result<Vec<PathBuf>, ApfsStorageError> {
+pub(in crate::storage) fn directory_children(
+    directory: &Path,
+) -> Result<Vec<PathBuf>, ApfsStorageError> {
     typed_children(directory, |file_type| file_type.is_dir())
 }
 
-fn regular_file_children(directory: &Path) -> Result<Vec<PathBuf>, ApfsStorageError> {
+pub(in crate::storage) fn regular_file_children(
+    directory: &Path,
+) -> Result<Vec<PathBuf>, ApfsStorageError> {
     typed_children(directory, |file_type| file_type.is_file())
 }
 
@@ -1072,7 +743,9 @@ fn is_project_owner_directory(path: &Path) -> bool {
         .is_some_and(|name| !is_reserved_store_namespace(name))
 }
 
-fn collect_project_directories(store_root: &Path) -> Result<Vec<PathBuf>, ApfsStorageError> {
+pub(in crate::storage) fn collect_project_directories(
+    store_root: &Path,
+) -> Result<Vec<PathBuf>, ApfsStorageError> {
     let mut projects = Vec::new();
     for owner in directory_children(store_root)? {
         if !is_project_owner_directory(&owner) {
@@ -1083,7 +756,7 @@ fn collect_project_directories(store_root: &Path) -> Result<Vec<PathBuf>, ApfsSt
     Ok(projects)
 }
 
-fn collect_restore_sidecars(
+pub(in crate::storage) fn collect_restore_sidecars(
     project: &Path,
     sidecars: &mut Vec<PathBuf>,
 ) -> Result<(), ApfsStorageError> {
@@ -1135,7 +808,7 @@ pub fn interrupted_publications(project: &Path) -> Result<Vec<PathBuf>, ApfsStor
     Ok(interrupted)
 }
 
-fn image_from_sidecar(sidecar: &Path) -> Result<PathBuf, ApfsStorageError> {
+pub(in crate::storage) fn image_from_sidecar(sidecar: &Path) -> Result<PathBuf, ApfsStorageError> {
     crate::metadata::image_from_sidecar_path(sidecar).ok_or_else(|| {
         ApfsStorageError::Host(format!(
             "invalid detached restore sidecar path: {}",
@@ -1955,11 +1628,10 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                 mount.source_device
             )));
         }
-        if !canonical_mount_flags(mount.flags) {
+        if !mount.owners_honoured() {
             return Err(ApfsStorageError::Host(format!(
-                "workspace mount has non-canonical flags at {}: expected nobrowse with owners, flags={:#x}",
-                expected_path.display(),
-                mount.flags
+                "workspace mount ignores owners at {}",
+                expected_path.display()
             )));
         }
         Ok(())
@@ -2051,7 +1723,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
             Ok(Some(None))
         } else {
             acquire_image_locks(&self.config.store_root, &[lock], LockMode::Try)
-                .map(|guard| guard.map(Some))
+                .map(|guard| guard.map(Some)).map_err(Into::into)
         }
     }
 
@@ -2604,7 +2276,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                                 mounted.mount_point.display()
                             )));
                         }
-                        crate::fsio::remove_owned_tree(&exec_temp)
+                        cowshed_os::fsio::remove_owned_tree(&exec_temp)
                     } else {
                         fs::remove_file(&exec_temp)
                     };
@@ -3858,14 +3530,14 @@ where
         let Some(mount_point) = source_mount else {
             return self
                 .backend
-                .clone_image(source, destination, crate::apfs::ImageCapture::Detached)
+                .clone_image(source, destination, cowshed_apfs::ImageCapture::Detached)
                 .map_err(ApfsError::from)
                 .map_err(ApfsStorageError::from);
         };
         let Some(attachment) = self.backend.existing_attachment(source)? else {
             return self
                 .backend
-                .clone_image(source, destination, crate::apfs::ImageCapture::Detached)
+                .clone_image(source, destination, cowshed_apfs::ImageCapture::Detached)
                 .map_err(ApfsError::from)
                 .map_err(ApfsStorageError::from);
         };
@@ -3880,7 +3552,7 @@ where
             // An attached-but-unmounted source remains the driver's; the raw clone refuses it.
             return self
                 .backend
-                .clone_image(source, destination, crate::apfs::ImageCapture::Detached)
+                .clone_image(source, destination, cowshed_apfs::ImageCapture::Detached)
                 .map_err(ApfsError::from)
                 .map_err(ApfsStorageError::from);
         };
@@ -3901,7 +3573,7 @@ where
             .map_err(|refusal| self.capture_refusal(source, mount_point, refusal))
             .and_then(|()| {
                 self.backend
-                    .clone_image(source, destination, crate::apfs::ImageCapture::Detached)
+                    .clone_image(source, destination, cowshed_apfs::ImageCapture::Detached)
                     .map_err(ApfsError::from)
                     .map_err(ApfsStorageError::from)
             });
@@ -3949,7 +3621,7 @@ where
         mount_point: &Path,
         refusal: ApfsError,
     ) -> ApfsStorageError {
-        if !crate::apfs::detach_was_dissented(&refusal) {
+        if !cowshed_apfs::detach_was_dissented(&refusal) {
             return refusal.into();
         }
         let holders = match self.mounted_at(mount_point) {
@@ -4125,7 +3797,7 @@ where
         paths: &[PathBuf],
         mode: LockMode,
     ) -> Result<Option<Self::LockGuard>, ApfsStorageError> {
-        acquire_image_locks(&self.config.store_root, paths, mode)
+        acquire_image_locks(&self.config.store_root, paths, mode).map_err(Into::into)
     }
 
     type Attachment = AttachedImage;
@@ -4235,7 +3907,7 @@ where
         Self::ensure_parent(destination)?;
         self.backend.sync_for_freshness(source, source_mount)?;
         self.backend
-            .clone_image(source, destination, crate::apfs::ImageCapture::Live)
+            .clone_image(source, destination, cowshed_apfs::ImageCapture::Live)
             .map_err(ApfsError::from)
             .map_err(ApfsStorageError::from)
     }
@@ -4479,7 +4151,7 @@ where
                 ))
             })?;
             if mount.source_device != attachment.volume_device()
-                || !canonical_mount_flags(mount.flags)
+                || !mount.owners_honoured()
             {
                 return Err(ApfsStorageError::Host(format!(
                     "cannot resume pending clone at {}: mounted source {} does not match {} or canonical flags",
@@ -4676,7 +4348,7 @@ where
                 workspace.incarnation()
             )));
         }
-        if canonical_mount_flags(mount.flags) {
+        if mount.owners_honoured() {
             return Ok(());
         }
 
@@ -6431,7 +6103,7 @@ pub(crate) struct QuarantineTombstone {
     pub(crate) sidecar: String,
 }
 
-fn metadata_workspace_ref(
+pub(in crate::storage) fn metadata_workspace_ref(
     metadata: &DetachedWorkspaceMetadata,
 ) -> Result<LifecycleWorkspace, ApfsStorageError> {
     let role = if metadata.workspace.is_main() {
@@ -6751,7 +6423,11 @@ fn decode_volume_space(bytes: &[u8; VOLUME_SPACE_LENGTH]) -> io::Result<VolumeSp
     })
 }
 
-fn io_error(operation: &'static str, path: &Path, source: io::Error) -> ApfsStorageError {
+pub(in crate::storage) fn io_error(
+    operation: &'static str,
+    path: &Path,
+    source: io::Error,
+) -> ApfsStorageError {
     ApfsStorageError::Io {
         operation,
         path: path.to_owned(),
@@ -6759,7 +6435,7 @@ fn io_error(operation: &'static str, path: &Path, source: io::Error) -> ApfsStor
     }
 }
 
-fn swap_paths(left: &Path, right: &Path) -> Result<(), ApfsStorageError> {
+pub(in crate::storage) fn swap_paths(left: &Path, right: &Path) -> Result<(), ApfsStorageError> {
     #[cfg(target_os = "macos")]
     {
         let left_name = CString::new(left.as_os_str().as_bytes())
@@ -6805,7 +6481,7 @@ fn swap_paths(left: &Path, right: &Path) -> Result<(), ApfsStorageError> {
 fn carries_label(mount_point: &Path, label: &str) -> Result<bool, ApfsStorageError> {
     #[cfg(target_os = "macos")]
     {
-        crate::apfs::volume_name(mount_point)
+        cowshed_apfs::volume_name(mount_point)
             .map(|name| name == label)
             .map_err(|error| io_error("read volume name", mount_point, error))
     }
@@ -6824,7 +6500,10 @@ fn carries_label(mount_point: &Path, label: &str) -> Result<bool, ApfsStorageErr
 /// A marker from another repository is not an ancestor: `adopt` copies a checkout tree that may
 /// carry a stale `.cowshed/` from somewhere else, and a foreign marker must not smuggle its
 /// incarnations into this repository's lineage.
-fn clone_lineage_from(marker_path: &Path, repo: &RepoId) -> Vec<WorkspaceIncarnation> {
+pub(in crate::storage) fn clone_lineage_from(
+    marker_path: &Path,
+    repo: &RepoId,
+) -> Vec<WorkspaceIncarnation> {
     match WorkspaceMarker::read_from(marker_path) {
         Ok(existing) if &existing.repo_id == repo => existing.clone_lineage(),
         _ => Vec::new(),
@@ -6834,14 +6513,14 @@ fn clone_lineage_from(marker_path: &Path, repo: &RepoId) -> Vec<WorkspaceIncarna
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fork_lock::Run as _;
+    use cowshed_os::fork_lock::Run as _;
 
     /// One journal/GC walk pins exact staging ownership, a stale pre-intent plan, completion,
     /// and retained-source bytes. It needs real Git evidence, not a disk-image setup or a mock.
     #[cfg(target_os = "macos")]
     #[test]
     fn forming_re_adoption_fences_staging_gc_without_a_prefix_waiver() {
-        use crate::apfs::SystemCommandRunner;
+        use cowshed_apfs::SystemCommandRunner;
         use crate::storage::StorageLayout;
         use crate::storage::apfs::ApfsExecutionHost;
         use crate::storage::host_config::HostConfig;
@@ -6947,7 +6626,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn retained_companions_converge_on_replay_and_move_nothing_on_refusal() {
-        use crate::apfs::SystemCommandRunner;
+        use cowshed_apfs::SystemCommandRunner;
         use crate::build_volume::RECORD_SUFFIX;
         use crate::metadata::{GRANTS_SIDECAR_SUFFIX, append_suffix};
         use crate::storage::apfs::COMPANION_SUFFIX;
@@ -7119,7 +6798,7 @@ mod tests {
                 threads.spawn(|| {
                     start.wait();
                     for _ in 0..32 {
-                        let mounts = system_kernel_mounts().expect("owned kernel mount snapshot");
+                        let mounts = kernel_mounts().expect("owned kernel mount snapshot");
                         assert!(
                             mounts
                                 .iter()
@@ -7467,65 +7146,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn native_flag_and_result_tables_are_exact() {
-        assert_eq!(
-            ROOT_OPEN_FLAGS,
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC
-        );
-        assert_eq!(DIRECTORY_OPEN_FLAGS, ROOT_OPEN_FLAGS);
-        assert_eq!(
-            LOCK_FILE_OPEN_FLAGS,
-            libc::O_RDWR | libc::O_NOFOLLOW | libc::O_CLOEXEC
-        );
-        assert_eq!(
-            LOCK_FILE_CREATE_FLAGS,
-            libc::O_RDWR | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_CREAT | libc::O_EXCL
-        );
-        assert_eq!(WAIT_LOCK_OPERATION, libc::LOCK_EX);
-        assert_eq!(TRY_LOCK_OPERATION, libc::LOCK_EX | libc::LOCK_NB);
-        assert_eq!(LOCK_FILE_MODE, 0o600);
-        assert_eq!(CONTROLLER_DIRECTORY_MODE, 0o700);
-
-        for (fd, failed) in [(-1, true), (0, false), (1, false)] {
-            assert_eq!(fd_failed(fd), failed, "fd={fd}");
-            assert_eq!(flock_succeeded(fd), fd == 0, "result={fd}");
-        }
-        for (count, mounts) in [(-1, None), (0, None), (1, Some(1))] {
-            assert_eq!(mount_count(count), mounts, "getfsstat count={count}");
-        }
-        for (mode, kind, busy) in [
-            (LockMode::Try, io::ErrorKind::WouldBlock, true),
-            (LockMode::Wait, io::ErrorKind::WouldBlock, false),
-            (LockMode::Try, io::ErrorKind::Other, false),
-            (LockMode::Wait, io::ErrorKind::Other, false),
-        ] {
-            assert_eq!(lock_is_busy(mode, kind), busy, "{mode:?}/{kind:?}");
-        }
-        for (fd, kind, create) in [
-            (-1, io::ErrorKind::NotFound, true),
-            (-1, io::ErrorKind::PermissionDenied, false),
-            (0, io::ErrorKind::NotFound, false),
-            (0, io::ErrorKind::Other, false),
-        ] {
-            assert_eq!(should_create_directory(fd, kind), create);
-        }
-        for (result, kind, failed) in [
-            (-1, io::ErrorKind::PermissionDenied, true),
-            (-1, io::ErrorKind::AlreadyExists, false),
-            (0, io::ErrorKind::PermissionDenied, false),
-            (0, io::ErrorKind::Other, false),
-        ] {
-            assert_eq!(mkdir_failed(result, kind), failed);
-        }
-        for (kind, retry) in [
-            (io::ErrorKind::Interrupted, true),
-            (io::ErrorKind::WouldBlock, false),
-            (io::ErrorKind::Other, false),
-        ] {
-            assert_eq!(should_retry_lock(kind), retry);
-        }
-    }
 
     #[test]
     fn session_enumeration_propagates_a_read_dir_entry_error() {
@@ -7759,7 +7379,7 @@ mod tests {
     /// recorded, and in it no longer once one is. Every command is recorded and succeeds.
     struct TwoVolumeImage {
         image: PathBuf,
-        commands: std::sync::Mutex<Vec<crate::apfs::CommandRequest>>,
+        commands: std::sync::Mutex<Vec<cowshed_apfs::CommandRequest>>,
     }
 
     impl TwoVolumeImage {
@@ -7782,11 +7402,11 @@ mod tests {
     impl CommandRunner for TwoVolumeImage {
         fn run_guarded<E>(
             &self,
-            request: &crate::apfs::CommandRequest,
+            request: &cowshed_apfs::CommandRequest,
             check: impl FnOnce() -> Result<bool, E>,
-        ) -> Result<Option<crate::apfs::CommandOutput>, E>
+        ) -> Result<Option<cowshed_apfs::CommandOutput>, E>
         where
-            E: From<crate::apfs::CommandRunError> + std::fmt::Display,
+            E: From<cowshed_apfs::CommandRunError> + std::fmt::Display,
         {
             if check()? {
                 self.run(request).map(Some).map_err(E::from)
@@ -7796,24 +7416,24 @@ mod tests {
         }
         fn run(
             &self,
-            request: &crate::apfs::CommandRequest,
-        ) -> Result<crate::apfs::CommandOutput, crate::apfs::CommandRunError> {
+            request: &cowshed_apfs::CommandRequest,
+        ) -> Result<cowshed_apfs::CommandOutput, cowshed_apfs::CommandRunError> {
             self.commands
                 .lock()
                 .expect("recorded commands")
                 .push(request.clone());
-            Ok(crate::apfs::CommandOutput::success([]))
+            Ok(cowshed_apfs::CommandOutput::success([]))
         }
-        fn image_lease(&self, _: &Path) -> io::Result<Option<crate::fork_lock::Fenced<fs::File>>> {
+        fn image_lease(&self, _: &Path) -> io::Result<Option<cowshed_os::fork_lock::Fenced<fs::File>>> {
             Ok(None)
         }
         fn pin_raw_device(
             &self,
             _: &Path,
-        ) -> io::Result<Option<crate::fork_lock::Fenced<fs::File>>> {
+        ) -> io::Result<Option<cowshed_os::fork_lock::Fenced<fs::File>>> {
             Ok(None)
         }
-        fn attached_disk_images(&self) -> io::Result<Vec<crate::apfs::AttachedDiskImage>> {
+        fn attached_disk_images(&self) -> io::Result<Vec<cowshed_apfs::AttachedDiskImage>> {
             let detached = self
                 .commands
                 .lock()
@@ -7823,7 +7443,7 @@ mod tests {
             Ok(if detached {
                 Vec::new()
             } else {
-                vec![crate::apfs::AttachedDiskImage::file(
+                vec![cowshed_apfs::AttachedDiskImage::file(
                     &self.image,
                     None,
                     [

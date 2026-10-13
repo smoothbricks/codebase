@@ -598,19 +598,19 @@ impl CowshedError {
                     "rerun the command from a shell whose sandbox allows writing the cowshed store",
                 );
             }
-            if let Some(crate::apfs::ApfsError::AttachPoolExhausted(_)) =
-                error.downcast_ref::<crate::apfs::ApfsError>()
+            if let Some(cowshed_apfs::ApfsError::AttachPoolExhausted(_)) =
+                error.downcast_ref::<cowshed_apfs::ApfsError>()
             {
                 // The host's finding, not storage's: no storage repair frees the attach pool.
-                return Self::environment_missing(message, crate::attach_budget::EXHAUSTED_HINT);
+                return Self::environment_missing(message, cowshed_apfs::attach_budget::EXHAUSTED_HINT);
             }
             starved |= errno == Some(libc::ENFILE)
-                || error.is::<crate::apfs::CommandRunError>()
+                || error.is::<cowshed_apfs::CommandRunError>()
                 || matches!(
-                    error.downcast_ref::<crate::apfs::ApfsError>(),
+                    error.downcast_ref::<cowshed_apfs::ApfsError>(),
                     Some(
-                        crate::apfs::ApfsError::CommandFailed { .. }
-                            | crate::apfs::ApfsError::DiskImageHelperUnreachable(_)
+                        cowshed_apfs::ApfsError::CommandFailed { .. }
+                            | cowshed_apfs::ApfsError::DiskImageHelperUnreachable(_)
                     )
                 );
             cause = error.source();
@@ -929,7 +929,7 @@ mod tests {
 
     #[test]
     fn a_disk_child_starved_by_a_saturated_vnode_table_names_the_limit() {
-        use crate::apfs::{ApfsError, CommandRequest, CommandRunError, CommandRunFailure};
+        use cowshed_apfs::{ApfsError, CommandRequest, CommandRunError, CommandRunFailure};
         use crate::vnodes::VnodeTable;
         let saturated = || {
             Some(VnodeTable {
@@ -978,7 +978,7 @@ mod tests {
 
     #[test]
     fn a_spent_attach_pool_sends_the_caller_to_doctor_not_storage_repair() {
-        use crate::apfs::{
+        use cowshed_apfs::{
             ApfsError, AttachPoolFailure, CommandOutput, CommandRequest, ProcessStatus,
         };
         let spent = ApfsError::AttachPoolExhausted(Box::new(AttachPoolFailure {
@@ -994,7 +994,7 @@ mod tests {
             panic!("a spent pool is not blamed on the vnode table")
         });
         assert_eq!(error.code, ErrorCode::EnvironmentMissing);
-        assert_eq!(error.hint, crate::attach_budget::EXHAUSTED_HINT);
+        assert_eq!(error.hint, cowshed_apfs::attach_budget::EXHAUSTED_HINT);
         assert_eq!(error.message, "build volume");
     }
 

@@ -438,7 +438,7 @@ async fn run(mut ledger: Ledger, mut messages: mpsc::UnboundedReceiver<Message>)
                     elapsed,
                     members,
                     evicted,
-                } => cowshed_core::timing::event("disk-lease", || {
+                } => cowshed_os::timing::event("disk-lease", || {
                     format!("phase {class} {elapsed:?} members={members} evicted={evicted}")
                 }),
             }

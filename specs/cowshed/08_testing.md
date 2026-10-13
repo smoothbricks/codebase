@@ -227,6 +227,16 @@ vdev (`cowshed.itest.<pid>`) with datasets destroyed and the pool exported on te
 `cowshed-helper` and the Landlock/netns exec path. A suite-level guard reaps leaked `cowshed.itest.*` volumes/pools. The
 same flow table runs on both; substrate-specific assertions (fsck step on APFS, origin-snapshot GC on ZFS) are tagged.
 
+Lifecycle integration that does not assert a physical-volume property uses the same project controller and lifecycle
+executor with `DirectoryExecutionHost`. Its workspaces and build volumes are real directory payloads, cloned through
+the production tree-copy path; atomic filesystem bindings expose them at checkout and build paths. Git, Nx, gateway
+connections, command supervision, lock contention, publication records and recovery journals remain real. These
+`directory_*` tests and the clone-intent recovery binary run in ordinary Cargo test shards without creating or
+attaching a disk image. Directory stores report actual tree allocation, not fabricated block-device counters; volume
+labels, physical resizing, read-only mounts and legacy-image conversion remain native-host tests. Their scratch roots
+use `/private/tmp/cowshed-dtest-<pid>-<n>-<label>` and share process cleanup with the image fixtures, but neither their
+setup nor their cleanup enumerates or releases disk images.
+
 The Linux job-accounting fixture is a separate kernel-counter proof, not a production ZFS workspace-admission proof. It
 runs from the ordinary runner through a passwordless-sudo delegated scope; only its parent prepares and cleans up a
 test-owned ext4 image on a declared root-only loop device. Delegation of cgroupfs does not confer mount authority. The
@@ -248,12 +258,20 @@ whatever `TMPDIR` a runner has: every run's sweep must see every dead run, not o
 reaches its template by `clonefile`, which cannot cross volumes; and Darwin's socket bound must not depend on the
 runner's `TMPDIR`. The lease never detaches an image attached from below it; it keeps such a lease and names it.
 
-On macOS, real-APFS coverage runs once in the dedicated root `cargo-test-group-real-apfs` target. Its nextest group has
-`max-threads = 1`: the host-global storage lease is serialized by one runner rather than contested by independent
-per-crate shards. `.config/nextest.toml` declares the group's filter once for the plugin, and its 30s wrapper rule
-(below) restates it exactly: `real_apfs_*`, the `apfs_native_macos` and `clone_intent_recovery` binaries, and the exact
-qualified job-volume accounting witness. Both ordinary and exceptions shards exclude that same declared filter, so no
-test is duplicated or dropped. Non-macOS planning creates no APFS group.
+On macOS, disk-image coverage runs in the dedicated root `cargo-test-group-real-apfs` target, selected from the
+`cowshed-apfs` crate. Its source inputs are that crate's transitive local Cargo dependency closure: `cowshed-apfs`,
+`cowshed-os` and `cowshed-gateway-types`. The closure includes the image fixture pool and shared process-cleanup
+support. Cargo manifests and lockfile, effective Cargo configuration, nextest policy and the run-wrapper are inputs
+too; unrelated crate sources and the workspace archive's content hash are not inputs of this verdict. Changing an
+APFS implementation or one of its dependencies invalidates it; an unrelated source change preserves its cache key.
+
+Native-host integration whose subject combines physical images with core lifecycle state runs in
+`cargo-test-group-real-apfs-host`, with its own core/CLI Cargo dependency closure. This includes actual mount and
+label assertions, image resizing, legacy-image re-adoption and native recovery boundaries. The host target depends on
+the disk-image target: the two groups never run concurrently. Each nextest group declares `max-threads = 1`.
+`.config/nextest.toml` owns their package-scoped selection filters, and the code-time wrapper rules select the same
+tests. Ordinary and exceptions shards exclude those filters; ordinary `cargo-test` excludes both groups, while the
+full `test` aggregate reaches them. Every test has one runner, and non-macOS planning creates neither APFS group.
 
 Every test target, the group included, is bounded by progress alone: the run ends when no test has finished for 180s,
 the hang backstop, and names the tests still running; it has no wall-clock ceiling, and no per-test bound kills a test
@@ -300,7 +318,8 @@ commitment. An empty findings list alone is not evidence that a declared output 
 unattributed run summary or a failed check leaves it empty too.
 
 **Host limit.** The host's disk-image attach pool runs out (01_storage.md, "How the APFS host degrades" §2), and the
-suite stops spending into a spent one. The harness owns a lane-wide fixture pool (`tests/support/blank_image.rs`): it
+suite stops spending into a spent one. The harness owns a lane-wide fixture pool
+(`packages/cowshed/crates/cowshed-apfs/tests/support/blank_image.rs`): it
 attaches each scenario image in its registry once per lane run and hands tests handles to mounts of an already-attached
 volume, so a test cannot attach an image of its own through the fixture API — the API hands out shared-fixture handles
 only, and no per-test attach helper is in tests' reach. Seeding a store clones the blank template and attaches nothing.

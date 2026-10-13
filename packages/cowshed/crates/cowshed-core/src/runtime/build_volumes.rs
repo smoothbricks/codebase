@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
-use crate::apfs::SystemCommandRunner;
+use cowshed_apfs::SystemCommandRunner;
 use crate::api::dto::{
     AdoptionSkip, CarrySide, DatabaseHolder, GcCandidate, GcDeferred, GcReason, GitOid, LandSeed,
     NxCarry, RebaseBuildVolume, RebaseCarrySkip, Reseed, ReseedSkip, Sha256Digest,
@@ -26,14 +26,18 @@ use crate::build_volume::{
     BuildVolumeRole, BuildVolumeState, TrackedBuildStateRefusal, cargo, carry, link, nx,
 };
 use crate::capabilities::BuildStatePath;
-use crate::metadata::{ImageCapacity, WorkspaceIncarnation, WorkspaceName};
+use cowshed_apfs::image::ImageCapacity;
+use crate::metadata::{WorkspaceIncarnation, WorkspaceName};
 use crate::storage::apfs::native::{
-    BuildVolumeClaim, BuildVolumeRefusal, BuildVolumeRelease, ImageLockGuard,
-    MacOsApfsExecutionHost,
+    BuildVolumeClaim, BuildVolumeRefusal, BuildVolumeRelease, MacOsApfsExecutionHost,
 };
-use crate::storage::apfs::{ApfsExecutionHost, ApfsStorageError, LockMode};
+#[cfg(test)]
+use crate::storage::apfs::ApfsExecutionHost;
+use cowshed_apfs::store_lock::LockMode;
+use crate::storage::apfs::ApfsStorageError;
 use crate::storage::lifecycle::ResizeOutcome;
 use crate::{CowshedError, Result};
+use super::storage_host::RuntimeStorageHost;
 
 type Host = MacOsApfsExecutionHost<SystemCommandRunner>;
 
@@ -124,23 +128,23 @@ pub(crate) struct Closed {
 /// need it take it by reference; only [`BuildVolumes::try_lock_target`] and [`Contended::wait`]
 /// make one.
 #[must_use = "the target's image lock is let go when this is dropped"]
-pub(crate) struct TargetLock {
+pub(crate) struct TargetLock<H: RuntimeStorageHost = Host> {
     target: Owner,
-    _guard: ImageLockGuard,
+    _guard: H::LockGuard,
 }
 
 /// The target's image lock, held by another cowshed operation on the target when the land asked
 /// for it.
 #[must_use = "wait takes the target's image lock"]
-pub(crate) struct Contended {
-    volumes: BuildVolumes,
+pub(crate) struct Contended<H: RuntimeStorageHost = Host> {
+    volumes: BuildVolumes<H>,
     target: Owner,
     lock: PathBuf,
 }
 
-impl Contended {
+impl<H: RuntimeStorageHost> Contended<H> {
     /// Wait until whatever holds the target's image lock lets go of it, and take it.
-    pub async fn wait(self) -> Result<TargetLock> {
+    pub async fn wait(self) -> Result<TargetLock<H>> {
         let Self {
             volumes,
             target,
@@ -265,11 +269,11 @@ pub(crate) struct Collection {
 /// What [`BuildVolumes::mint_first`] did beside main's image, owned by the adopt until it
 /// settles or abandons it.
 #[must_use = "settle or abandon releases a minted volume main's first touch did not link"]
-pub(crate) enum FirstMint {
+pub(crate) enum FirstMint<H: RuntimeStorageHost = Host> {
     /// Nothing minted: nothing in the checkout can name build state, or a replayed adoption,
     /// whose first touch mints its own.
     Nothing,
-    Minted(OwnedMint),
+    Minted(OwnedMint<H>),
     Failed(CowshedError),
 }
 
@@ -280,8 +284,8 @@ pub(crate) enum FirstMint {
 /// in its staging, initializer, commit or conclusion), it is released unless the checkout links
 /// it: on the blocking lane when a runtime is there to run it, at once otherwise, and at once
 /// too when that runtime refuses or cancels the task ([`DroppedMint`]).
-pub(crate) struct OwnedMint {
-    volumes: BuildVolumes,
+pub(crate) struct OwnedMint<H: RuntimeStorageHost = Host> {
+    volumes: BuildVolumes<H>,
     checkout: PathBuf,
     slot: MintSlot,
 }
@@ -295,16 +299,16 @@ fn lock(slot: &MintSlot) -> MutexGuard<'_, Option<MintedVolume>> {
     slot.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-impl OwnedMint {
+impl<H: RuntimeStorageHost> OwnedMint<H> {
     /// Release the slot's volume unless the checkout links it, once a first touch that holds the
     /// slot has finished. Blocking.
-    fn release_now(&self, host: &Host, layout: &BuildVolumeLayout, whose: &str) {
+    fn release_now(&self, host: &H, layout: &BuildVolumeLayout, whose: &str) {
         release_slot(host, layout, &self.slot, &self.checkout, whose);
     }
 }
 
 fn release_slot(
-    host: &Host,
+    host: &impl RuntimeStorageHost,
     layout: &BuildVolumeLayout,
     slot: &MintSlot,
     checkout: &Path,
@@ -318,16 +322,16 @@ fn release_slot(
 /// The release a dropped [`OwnedMint`] owes, run when this is dropped: by the blocking task it is
 /// handed to, or by a runtime that refuses that task or shuts down before it starts, which drops
 /// it unrun. Plain values, not an `OwnedMint`, so its drop never spawns again.
-struct DroppedMint {
-    volumes: BuildVolumes,
+struct DroppedMint<H: RuntimeStorageHost> {
+    volumes: BuildVolumes<H>,
     checkout: PathBuf,
     slot: MintSlot,
 }
 
-impl Drop for DroppedMint {
+impl<H: RuntimeStorageHost> Drop for DroppedMint<H> {
     fn drop(&mut self) {
         release_slot(
-            &self.volumes.host,
+            self.volumes.host.as_ref(),
             &self.volumes.layout,
             &self.slot,
             &self.checkout,
@@ -336,7 +340,7 @@ impl Drop for DroppedMint {
     }
 }
 
-impl Drop for OwnedMint {
+impl<H: RuntimeStorageHost> Drop for OwnedMint<H> {
     fn drop(&mut self) {
         // Settled already: nothing to spawn. A first touch holding the slot leaves it to the
         // release, which waits for it on the blocking lane.
@@ -369,7 +373,7 @@ pub(crate) enum Lent {
     Failed(CowshedError),
 }
 
-impl FirstMint {
+impl<H: RuntimeStorageHost> FirstMint<H> {
     /// What main's first touch is lent; this keeps the volume until it settles.
     pub fn lend(&self) -> Lent {
         match self {
@@ -437,19 +441,25 @@ impl Lent {
 }
 
 #[derive(Clone)]
-pub(crate) struct BuildVolumes {
-    host: Arc<Host>,
+pub(crate) struct BuildVolumes<H: RuntimeStorageHost = Host> {
+    host: Arc<H>,
     pub layout: BuildVolumeLayout,
 }
 
-impl BuildVolumes {
-    pub fn new(host: Arc<Host>, layout: BuildVolumeLayout) -> Self {
+impl<H: RuntimeStorageHost> Clone for BuildVolumes<H> {
+    fn clone(&self) -> Self {
+        Self { host: Arc::clone(&self.host), layout: self.layout.clone() }
+    }
+}
+
+impl<H: RuntimeStorageHost> BuildVolumes<H> {
+    pub fn new(host: Arc<H>, layout: BuildVolumeLayout) -> Self {
         Self { host, layout }
     }
 
     async fn blocking<T: Send + 'static>(
         &self,
-        work: impl FnOnce(&Host, &BuildVolumeLayout) -> Result<T> + Send + 'static,
+        work: impl FnOnce(&H, &BuildVolumeLayout) -> Result<T> + Send + 'static,
     ) -> Result<T> {
         let (host, layout) = (Arc::clone(&self.host), self.layout.clone());
         crate::storage::lifecycle::dispatch_blocking(move || work(&host, &layout))
@@ -464,7 +474,7 @@ impl BuildVolumes {
         &self,
         target: Owner,
         lock: PathBuf,
-    ) -> Result<std::result::Result<TargetLock, Contended>> {
+    ) -> Result<std::result::Result<TargetLock<H>, Contended<H>>> {
         let path = lock.clone();
         let guard = self
             .blocking(move |host, _| host.lock_images(&[path], LockMode::Try).map_err(storage))
@@ -631,7 +641,7 @@ impl BuildVolumes {
     ///
     /// The volume is the answer's to release: dropped unsettled, it releases itself. An adopt
     /// dropped while the mint runs leaves nobody to answer, so the mint releases what it made.
-    pub async fn mint_first(&self, source: PathBuf, checkout: PathBuf) -> FirstMint {
+    pub async fn mint_first(&self, source: PathBuf, checkout: PathBuf) -> FirstMint<H> {
         let (answer, answered) = tokio::sync::oneshot::channel();
         let volumes = self.clone();
         let minting = self.blocking(move |host, layout| {
@@ -773,7 +783,7 @@ impl BuildVolumes {
             let written = host.build_volume_written(layout, &live).map_err(storage)?;
             host.mark_seed_written(layout, &own_seed, written)
                 .map_err(storage)?;
-            crate::timing::event("build-volume", || {
+            cowshed_os::timing::event("build-volume", || {
                 format!(
                     "fork {} from seed {seed} in {:?}",
                     destination.name,
@@ -853,14 +863,16 @@ impl BuildVolumes {
             {
                 return Ok(Err(skip(busy, Side::Landing)));
             }
-            if let Some(target) = target {
+            if H::HAS_PHYSICAL_VOLUMES
+                && let Some(target) = target
+            {
                 let capacity = host
                     .build_volume_capacity(layout, &target)
                     .map_err(storage)?;
                 match host.resize_build_volume(layout, &id, capacity) {
                     Ok(_) | Err(ApfsStorageError::CapacityNotGrowing { .. }) => {}
                     Err(ApfsStorageError::Apfs(error))
-                        if crate::apfs::detach_was_dissented(&error) =>
+                        if cowshed_apfs::detach_was_dissented(&error) =>
                     {
                         return Ok(Err(AdoptionSkip::LandingVolumeBusy {
                             reason: error.to_string(),
@@ -960,7 +972,7 @@ impl BuildVolumes {
     /// volume with the previous seed kept.
     pub async fn freeze_seed(
         &self,
-        locked: &TargetLock,
+        locked: &TargetLock<H>,
         quiet: &Quiet,
         tree: GitOid,
     ) -> Result<std::result::Result<Freeze, AdoptionSkip>> {
@@ -1130,7 +1142,7 @@ impl BuildVolumes {
     /// ([`nx::hand_over_daemon_records`]), so the client that waited finds it still serving.
     pub async fn adopt(
         &self,
-        locked: &TargetLock,
+        locked: &TargetLock<H>,
         quiet: &Quiet,
         previous: Closed,
         target_checkout: PathBuf,
@@ -1217,7 +1229,7 @@ impl BuildVolumes {
     /// lock, so no reseed of the target deletes the seed it clones.
     pub async fn refork(
         &self,
-        locked: &TargetLock,
+        locked: &TargetLock<H>,
         workspace: WorkspaceName,
         checkout: PathBuf,
     ) -> Result<()> {
@@ -1403,7 +1415,7 @@ fn still_doomed(
 /// work is done or has not begun. Answers the unforced unmount's refusal of a release, or why
 /// the volume stays.
 fn release_if_still_doomed(
-    host: &Host,
+    host: &impl RuntimeStorageHost,
     layout: &BuildVolumeLayout,
     links: &Links,
     doomed: &Doomed,
@@ -1426,7 +1438,7 @@ fn release_if_still_doomed(
 pub(crate) enum Deferral {
     /// A job admitted on the volume still runs and holds it; `0` names the processes that had
     /// the volume open when the release looked.
-    Held(Vec<nx::Holder>),
+    Held(Vec<cowshed_os::process::Holder>),
     /// Its release failed; the next pass tries again.
     ReleaseFailed(String),
     /// Its record exists but cannot be read, so nothing proves it unreachable.
@@ -1656,11 +1668,18 @@ pub(crate) fn plan(
     }
     for (id, reason, seen) in doomed {
         let image = layout.image(&id);
-        match std::fs::metadata(&image) {
-            Ok(metadata) => plan.doomed.push(Doomed {
+        let allocated = std::fs::metadata(&image).and_then(|metadata| {
+            if metadata.is_dir() {
+                crate::storage::directory::allocated_tree_bytes(&image)
+            } else {
+                Ok(metadata.blocks().saturating_mul(512))
+            }
+        });
+        match allocated {
+            Ok(bytes) => plan.doomed.push(Doomed {
                 id,
                 reason,
-                bytes: metadata.blocks().saturating_mul(512),
+                bytes,
                 seen,
             }),
             Err(error) => plan.deferred.push((
@@ -1699,7 +1718,7 @@ enum Sealed {
 /// descriptors are closed before the unmount and the non-forced detached capture excludes late
 /// writers.
 fn seal(
-    host: &Host,
+    host: &impl RuntimeStorageHost,
     layout: &BuildVolumeLayout,
     quiet: &Quiet,
     record: &BuildVolumeRecord,
@@ -1720,7 +1739,7 @@ fn seal(
     drop(builds);
     match host.clone_quiet_build_volume(layout, quiet, &BuildVolumeId::mint(), record) {
         Ok(()) => Ok(Ok(Sealed::Captured)),
-        Err(ApfsStorageError::Apfs(error)) if crate::apfs::detach_was_dissented(&error) => {
+        Err(ApfsStorageError::Apfs(error)) if cowshed_apfs::detach_was_dissented(&error) => {
             Ok(Ok(Sealed::Refused {
                 reason: error.to_string(),
             }))
@@ -1732,7 +1751,7 @@ fn seal(
 /// Delete `previous`, the seeds of `target` a new one replaced. A seed is never mounted and no
 /// job is admitted on one, so a hold on it is an integrity fault.
 fn retire_seeds(
-    host: &Host,
+    host: &impl RuntimeStorageHost,
     layout: &BuildVolumeLayout,
     target: &Owner,
     previous: Vec<BuildVolumeId>,
@@ -1774,7 +1793,7 @@ fn may_mint(source: &Path) -> Result<Option<ImageCapacity>> {
 /// Release a volume minted beside main's image unless `checkout` links it, and say on stderr
 /// what the release did or why the volume stays.
 fn release_minted(
-    host: &Host,
+    host: &impl RuntimeStorageHost,
     layout: &BuildVolumeLayout,
     volume: &MintedVolume,
     checkout: &Path,
@@ -1836,7 +1855,7 @@ fn say_release(id: &BuildVolumeId, whose: &str, release: &BuildVolumeRelease) {
 }
 
 /// Processes, each as `pid <n> (<argv>)`, joined by `; `.
-struct Holders<'a>(&'a [nx::Holder]);
+struct Holders<'a>(&'a [cowshed_os::process::Holder]);
 
 impl std::fmt::Display for Holders<'_> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1846,7 +1865,7 @@ impl std::fmt::Display for Holders<'_> {
 
 fn write_holders(
     formatter: &mut std::fmt::Formatter<'_>,
-    holders: &[nx::Holder],
+    holders: &[cowshed_os::process::Holder],
 ) -> std::fmt::Result {
     for (index, holder) in holders.iter().enumerate() {
         if index > 0 {
@@ -1860,7 +1879,7 @@ fn write_holders(
 /// `target`'s seed against its live volume `live`, or `None` when `live` is an interrupted
 /// first touch's, unpublished: only a fresh discovery finishes that one.
 fn seed_age(
-    host: &Host,
+    host: &impl RuntimeStorageHost,
     layout: &BuildVolumeLayout,
     target: &Owner,
     live: BuildVolumeId,
@@ -1887,7 +1906,7 @@ fn seed_age(
 /// Refreeze an out-of-date seed after Nx and existing Cargo profiles admit capture. The
 /// non-forced detach, not profile enumeration or a later holder probe, excludes filesystem
 /// writers while the image is validated and cloned.
-fn reseed(host: &Host, layout: &BuildVolumeLayout, target: &Owner, age: SeedAge) -> Result<Reseed> {
+fn reseed(host: &impl RuntimeStorageHost, layout: &BuildVolumeLayout, target: &Owner, age: SeedAge) -> Result<Reseed> {
     if !age.stale() {
         return Ok(Reseed::Fresh);
     }
@@ -1941,7 +1960,7 @@ fn reseed(host: &Host, layout: &BuildVolumeLayout, target: &Owner, age: SeedAge)
                 reason: error.to_string(),
             });
         }
-        Err(ApfsStorageError::Apfs(error)) if crate::apfs::detach_was_dissented(&error) => {
+        Err(ApfsStorageError::Apfs(error)) if cowshed_apfs::detach_was_dissented(&error) => {
             return skipped(ReseedSkip::VolumeBusy {
                 reason: error.to_string(),
             });
@@ -1950,7 +1969,7 @@ fn reseed(host: &Host, layout: &BuildVolumeLayout, target: &Owner, age: SeedAge)
     }
     retire_seeds(host, layout, target, previous)?;
     let elapsed_ms = millis(started.elapsed());
-    crate::timing::event("build-volume", || {
+    cowshed_os::timing::event("build-volume", || {
         format!(
             "reseed {} from {} in {elapsed_ms} ms",
             target.name, age.live
@@ -1966,7 +1985,7 @@ fn millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
-fn database_holder(holder: nx::Holder) -> DatabaseHolder {
+fn database_holder(holder: cowshed_os::process::Holder) -> DatabaseHolder {
     DatabaseHolder {
         pid: holder.pid,
         command: holder.command,
@@ -2026,7 +2045,7 @@ fn nx_carry(carried: carry::Carried, elapsed: Duration, into: &BuildVolumeId) ->
         elapsed_ms: millis(elapsed),
         stopped: carried.stopped,
     };
-    crate::timing::event("build-volume", || {
+    cowshed_os::timing::event("build-volume", || {
         format!(
             "carried {} Nx entries ({} bytes) into {into} in {} ms",
             carry.entries, carry.bytes, carry.elapsed_ms
@@ -2101,7 +2120,7 @@ fn resize_error(
             format!("build volume {id} of {workspace}: {error}"),
             format!("cowshed resize {workspace} --build <capacity larger than the current one>"),
         ),
-        ApfsStorageError::Apfs(error) if crate::apfs::detach_was_dissented(&error) => {
+        ApfsStorageError::Apfs(error) if cowshed_apfs::detach_was_dissented(&error) => {
             CowshedError::conflict(
                 format!("build volume {id} of {workspace} is in use: {error}"),
                 "stop what holds it, then retry the resize",
@@ -2401,8 +2420,8 @@ mod tests {
     /// fork's mount refuses its link exactly as the broken `cowshed new` did.
     #[cfg(target_os = "macos")]
     #[tokio::test]
-    async fn real_apfs_collection_keeps_a_forming_forks_volume_and_seed() {
-        let scratch = Scratch::new("build-forming-fork");
+    async fn directory_collection_keeps_a_forming_forks_volume_and_seed() {
+        let scratch = Scratch::directory("build-forming-fork");
         let main = owner("main", '0');
         let (main_checkout, main_live, _) = scratch.linked_checkout("main", 1);
         scratch
@@ -2570,7 +2589,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn real_apfs_build_resize_grows_the_volume_and_seed_so_a_later_fork_inherits_it() {
-        use crate::apfs::SystemCommandRunner;
+        use cowshed_apfs::SystemCommandRunner;
         use crate::capabilities::BuildStatePath;
         use crate::storage::apfs::ApfsSubstrateConfig;
         const GIB: u64 = ImageCapacity::GIBIBYTE;
@@ -2685,20 +2704,65 @@ mod tests {
         }
     }
 
-    /// A scratch APFS store with one project's build volumes, for the refusal and adoption tests.
     #[cfg(target_os = "macos")]
-    struct Scratch {
-        root: crate::scratch_apfs::ScratchRoot,
-        host: Arc<Host>,
+    enum FixtureRoot {
+        Apfs(crate::scratch_apfs::ScratchRoot),
+        Directory(crate::scratch_directory::ScratchRoot),
+    }
+
+    #[cfg(target_os = "macos")]
+    impl FixtureRoot {
+        fn path(&self) -> &Path {
+            match self {
+                Self::Apfs(root) => root.path(),
+                Self::Directory(root) => root.path(),
+            }
+        }
+    }
+
+    /// A real store with one project's build volumes, using the scenario's storage backend.
+    #[cfg(target_os = "macos")]
+    struct Scratch<H: RuntimeStorageHost = Host> {
+        root: FixtureRoot,
+        host: Arc<H>,
         layout: BuildVolumeLayout,
-        volumes: BuildVolumes,
+        volumes: BuildVolumes<H>,
+        mint: fn(&H, &BuildVolumeLayout, &BuildVolumeId, u64) -> PathBuf,
     }
 
     #[cfg(target_os = "macos")]
     impl Scratch {
         fn new(name: &str) -> Self {
+            Self::with_root(
+                FixtureRoot::Apfs(crate::scratch_apfs::ScratchRoot::new(name).expect("scratch APFS root")),
+                |config| MacOsApfsExecutionHost::new(SystemCommandRunner, config),
+                test_volume,
+            )
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl Scratch<crate::storage::directory::DirectoryExecutionHost> {
+        fn directory(name: &str) -> Self {
+            Self::with_root(
+                FixtureRoot::Directory(crate::scratch_directory::ScratchRoot::new(name).expect("scratch directory root")),
+                crate::storage::directory::DirectoryExecutionHost::new,
+                |host, layout, id, gib| {
+                    host.create_build_volume(layout, id, ImageCapacity::from_gibibytes(gib))
+                        .expect("create a directory-backed build volume")
+                },
+            )
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl<H: RuntimeStorageHost> Scratch<H> {
+        fn with_root(
+            root: FixtureRoot,
+            make_host: impl FnOnce(crate::storage::apfs::ApfsSubstrateConfig) -> std::result::Result<H, ApfsStorageError>,
+            mint: fn(&H, &BuildVolumeLayout, &BuildVolumeId, u64) -> PathBuf,
+        ) -> Self {
             use crate::storage::apfs::ApfsSubstrateConfig;
-            let root = crate::scratch_apfs::ScratchRoot::new(name).expect("scratch root");
             let store = root.path().join("store");
             fs::create_dir_all(&store).unwrap();
             let project = ProjectPaths::with_mount_root(
@@ -2707,29 +2771,18 @@ mod tests {
                 &RepoId::parse("acme/widget").unwrap(),
             )
             .unwrap();
-            let host = Arc::new(
-                MacOsApfsExecutionHost::new(
-                    SystemCommandRunner,
-                    ApfsSubstrateConfig::new(&store, root.path().join("checkout")),
-                )
-                .unwrap(),
-            );
+            let host = Arc::new(make_host(ApfsSubstrateConfig::new(&store, root.path().join("checkout"))).unwrap());
             let layout = BuildVolumeLayout::new(&project).unwrap();
             let volumes = BuildVolumes::new(Arc::clone(&host), layout.clone());
-            Self {
-                root,
-                host,
-                layout,
-                volumes,
-            }
+            Self { root, host, layout, volumes, mint }
         }
 
-        /// `name`'s checkout, linked to a new live volume of `gib` GiB recorded as its own.
+        /// `name`'s checkout, linked to a new live volume recorded as its own.
         fn linked_checkout(&self, name: &str, gib: u64) -> (PathBuf, BuildVolumeId, PathBuf) {
             let checkout = self.root.path().join(name);
             fs::create_dir_all(checkout.join(".cowshed")).unwrap();
             let id = BuildVolumeId::mint();
-            let mount = test_volume(&self.host, &self.layout, &id, gib);
+            let mount = (self.mint)(&self.host, &self.layout, &id, gib);
             BuildVolumeState::default().write(&mount).unwrap();
             self.layout
                 .write_record(&id, &BuildVolumeRecord::new(None, linked(name)))
@@ -2775,7 +2828,7 @@ mod tests {
         }
 
         /// `target`'s image lock, taken as its land takes it, when nothing else holds it.
-        async fn lock(&self, target: &Owner) -> TargetLock {
+        async fn lock(&self, target: &Owner) -> TargetLock<H> {
             match self
                 .volumes
                 .try_lock_target(target.clone(), self.image_lock(&target.name))
@@ -2806,7 +2859,7 @@ mod tests {
         mount: &Path,
         profile: &str,
     ) -> (tokio::process::Child, tokio::net::UnixStream) {
-        use crate::fork_lock::Spawn as _;
+        use cowshed_os::fork_lock::Spawn as _;
         use tokio::io::AsyncReadExt as _;
 
         fs::create_dir_all(source.join("src")).unwrap();
@@ -2858,7 +2911,7 @@ fn main() {
     async fn freeze_with_running_cargo(profile: &str, enumerate_before_start: bool) {
         use tokio::io::AsyncWriteExt as _;
 
-        let scratch = Scratch::new("seed-cargo-admission");
+        let scratch = Scratch::directory("seed-cargo-admission");
         let (main_checkout, _, _) = scratch.linked_checkout("main", 1);
         let (topic_checkout, _, mount) = scratch.linked_checkout("topic", 1);
         let state = BuildVolumeState {
@@ -2948,20 +3001,20 @@ fn main() {
 
     #[cfg(target_os = "macos")]
     #[tokio::test]
-    async fn real_apfs_seed_freeze_skips_a_real_cargo_build_after_quiesce() {
+    async fn directory_seed_freeze_skips_a_real_cargo_build_after_quiesce() {
         freeze_with_running_cargo("dev", false).await;
     }
 
     #[cfg(target_os = "macos")]
     #[tokio::test]
-    async fn real_apfs_seed_freeze_skips_a_new_cargo_profile_created_after_enumeration() {
+    async fn directory_seed_freeze_skips_a_new_cargo_profile_created_after_enumeration() {
         freeze_with_running_cargo("guard", true).await;
     }
 
     #[cfg(target_os = "macos")]
     #[tokio::test]
-    async fn real_apfs_seed_freeze_keeps_the_previous_seed_for_a_filesystem_holder_after_quiesce() {
-        let scratch = Scratch::new("seed-late-holder");
+    async fn directory_seed_freeze_keeps_the_previous_seed_for_a_filesystem_holder_after_quiesce() {
+        let scratch = Scratch::directory("seed-late-holder");
         let (main_checkout, _, _) = scratch.linked_checkout("main", 1);
         let (topic_checkout, _, mount) = scratch.linked_checkout("topic", 1);
         let quiet = scratch
@@ -3015,10 +3068,10 @@ fn main() {
     /// volume with the client still in it (16_build_volumes.md, Land step 5.6).
     #[cfg(target_os = "macos")]
     #[tokio::test]
-    async fn real_apfs_seed_freeze_skips_a_late_nx_database_holder_after_quiesce() {
-        use crate::fork_lock::Spawn as _;
+    async fn directory_seed_freeze_skips_a_late_nx_database_holder_after_quiesce() {
+        use cowshed_os::fork_lock::Spawn as _;
 
-        let scratch = Scratch::new("seed-late-nx-holder");
+        let scratch = Scratch::directory("seed-late-nx-holder");
         let (main_checkout, _, _) = scratch.linked_checkout("main", 1);
         let (topic_checkout, _, mount) = scratch.linked_checkout("topic", 1);
         let state = BuildVolumeState {
@@ -3099,11 +3152,11 @@ fn main() {
     /// (16_build_volumes.md, Land step 5.6).
     #[cfg(target_os = "macos")]
     #[tokio::test]
-    async fn real_apfs_seed_freeze_stops_a_late_landing_daemon_and_seals_again() {
-        use crate::fork_lock::Spawn as _;
+    async fn directory_seed_freeze_stops_a_late_landing_daemon_and_seals_again() {
+        use cowshed_os::fork_lock::Spawn as _;
         use std::os::unix::process::ExitStatusExt as _;
 
-        let scratch = Scratch::new("seed-late-daemon");
+        let scratch = Scratch::directory("seed-late-daemon");
         let (main_checkout, _, _) = scratch.linked_checkout("main", 1);
         let (topic_checkout, _, mount) = scratch.linked_checkout("topic", 1);
         let state = BuildVolumeState {
@@ -3177,8 +3230,8 @@ fn main() {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn real_apfs_reseed_skips_a_filesystem_holder_without_retiring_the_previous_seed() {
-        let scratch = Scratch::new("reseed-late-holder");
+    fn directory_reseed_skips_a_filesystem_holder_without_retiring_the_previous_seed() {
+        let scratch = Scratch::directory("reseed-late-holder");
         let (_, live, mount) = scratch.linked_checkout("main", 1);
         let target = owner("main", '0');
         let previous = BuildVolumeId::mint();
@@ -3250,7 +3303,7 @@ fn main() {
         id: &BuildVolumeId,
         gib: u64,
     ) -> PathBuf {
-        use crate::apfs::{CommandRunner, SystemCommandRunner};
+        use cowshed_apfs::{CommandRunner, SystemCommandRunner};
         let image = layout.image(id);
         crate::blank_image::blank_image(&image);
         let capacity = ImageCapacity::from_gibibytes(gib);
@@ -3409,7 +3462,7 @@ fn main() {
     /// asking `toml`, everything added to the index.
     #[cfg(target_os = "macos")]
     fn tracked_checkout(root: &Path, name: &str, toml: &str, tracked: &[&str]) -> PathBuf {
-        use crate::fork_lock::Run as _;
+        use cowshed_os::fork_lock::Run as _;
         let checkout = root.join(name);
         fs::create_dir_all(checkout.join(".cowshed")).unwrap();
         fs::write(checkout.join(".cowshed.toml"), toml).unwrap();
@@ -3461,8 +3514,8 @@ fn main() {
     /// Once linked, that volume wins over another mint, which settling releases unused.
     #[cfg(target_os = "macos")]
     #[tokio::test]
-    async fn real_apfs_main_links_the_volume_minted_beside_its_image_or_releases_it() {
-        let scratch = Scratch::new("build-minted-first");
+    async fn directory_main_links_the_volume_minted_beside_its_image_or_releases_it() {
+        let scratch = Scratch::directory("build-minted-first");
         let main = owner("main", '0');
         for (name, tracked) in [
             ("bare", &[][..]),
@@ -3573,8 +3626,8 @@ fn main() {
     /// the record is published.
     #[cfg(target_os = "macos")]
     #[tokio::test]
-    async fn real_apfs_main_releases_the_volume_minted_beside_its_image_its_first_touch_left() {
-        let scratch = Scratch::new("build-minted-left");
+    async fn directory_main_releases_the_volume_minted_beside_its_image_its_first_touch_left() {
+        let scratch = Scratch::directory("build-minted-left");
         let main = owner("main", '0');
         let source = tracked_checkout(scratch.root.path(), "source", AT_THE_CAP, &["package.json"]);
 
@@ -3724,9 +3777,9 @@ fn main() {
     /// refuses the task, it runs at once.
     #[cfg(target_os = "macos")]
     #[test]
-    fn real_apfs_a_dropped_adopt_releases_the_volume_minted_beside_main() {
+    fn directory_a_dropped_adopt_releases_the_volume_minted_beside_main() {
         use std::task::Poll;
-        let scratch = Scratch::new("build-minted-dropped");
+        let scratch = Scratch::directory("build-minted-dropped");
         let checkout = tracked_checkout(scratch.root.path(), "main", AT_THE_CAP, &["package.json"]);
 
         // The runtime's one blocking thread is held, so the mint is queued behind it: one poll
@@ -3965,8 +4018,8 @@ fn main() {
     /// goes on once the new has linked its fork.
     #[cfg(target_os = "macos")]
     #[tokio::test]
-    async fn real_apfs_a_new_of_the_target_succeeds_whatever_a_concurrent_land_does() {
-        let scratch = Scratch::new("build-land-new");
+    async fn directory_a_new_of_the_target_succeeds_whatever_a_concurrent_land_does() {
+        let scratch = Scratch::directory("build-land-new");
         let main = owner("main", '0');
         let (main_checkout, main_live, _) = scratch.linked_checkout("main", 1);
         let first_seed = BuildVolumeId::mint();
@@ -4128,11 +4181,11 @@ fn main() {
     /// volume once left no trace at all. A held volume is not released, and leaves no line.
     #[cfg(target_os = "macos")]
     #[test]
-    fn real_apfs_every_build_volume_release_is_journaled() {
+    fn directory_every_build_volume_release_is_journaled() {
         use crate::storage::deletion_log::{
             DELETION_LOG_FILE, DeletionKind, DeletionLogEntry, DeletionOp,
         };
-        let scratch = Scratch::new("build-release-journal");
+        let scratch = Scratch::directory("build-release-journal");
         let main = owner("main", '0');
         let (_, live, _) = scratch.linked_checkout("main", 1);
         let clone = |role: BuildVolumeRole| {

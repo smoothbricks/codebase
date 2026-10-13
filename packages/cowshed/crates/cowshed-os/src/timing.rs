@@ -24,7 +24,25 @@ use std::time::Instant;
 
 use tokio::sync::mpsc;
 
-use crate::api::dto::StepReport;
+/// One lifecycle step starting or ending, as a call that asked for its steps hears it. The
+/// controller's wire form is its own DTO; this is the value the spans emit.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Step {
+    Started {
+        step: u32,
+        /// The step this one runs inside; absent for a call's outermost step.
+        parent: Option<u32>,
+        /// The verb or layer the step belongs to: `new`, `apfs`.
+        scope: String,
+        /// The step within its scope: `links`, `canonical/mount`.
+        name: String,
+    },
+    Ended {
+        step: u32,
+        /// Why the step failed; absent when it succeeded.
+        error: Option<String>,
+    },
+}
 
 /// The environment variable that turns latency spans on.
 pub const TIMING_ENV: &str = "COWSHED_TIMING";
@@ -176,12 +194,12 @@ pub fn attribute(
 /// which step a slow or hung call is in while the call is still in it.
 #[derive(Clone, Debug)]
 pub struct StepSink {
-    reports: mpsc::UnboundedSender<StepReport>,
+    reports: mpsc::UnboundedSender<Step>,
     next: Arc<AtomicU32>,
 }
 
 impl StepSink {
-    pub fn new(reports: mpsc::UnboundedSender<StepReport>) -> Self {
+    pub fn new(reports: mpsc::UnboundedSender<Step>) -> Self {
         Self {
             reports,
             next: Arc::new(AtomicU32::new(0)),
@@ -189,7 +207,7 @@ impl StepSink {
     }
 
     /// A caller that stopped listening loses only the reports, never the step.
-    fn report(&self, report: StepReport) {
+    fn report(&self, report: Step) {
         let _ = self.reports.send(report);
     }
 }
@@ -234,7 +252,7 @@ impl OpenStep {
     fn start(scope: &'static str, name: impl FnOnce() -> String) -> Option<Self> {
         let outer = STEPS.try_with(StepScope::clone).ok()?;
         let step = outer.sink.next.fetch_add(1, Ordering::Relaxed);
-        outer.sink.report(StepReport::Started {
+        outer.sink.report(Step::Started {
             step,
             parent: outer.parent,
             scope: scope.to_owned(),
@@ -255,7 +273,7 @@ impl OpenStep {
     }
 
     fn end<T, E: fmt::Display>(self, result: &Result<T, E>) {
-        self.sink.report(StepReport::Ended {
+        self.sink.report(Step::Ended {
             step: self.step,
             error: result.as_ref().err().map(ToString::to_string),
         });
@@ -265,10 +283,9 @@ impl OpenStep {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::dto::StepReport;
 
-    fn started(step: u32, parent: Option<u32>, scope: &str, name: &str) -> StepReport {
-        StepReport::Started {
+    fn started(step: u32, parent: Option<u32>, scope: &str, name: &str) -> Step {
+        Step::Started {
             step,
             parent,
             scope: scope.to_owned(),
@@ -276,14 +293,14 @@ mod tests {
         }
     }
 
-    fn ended(step: u32, error: Option<&str>) -> StepReport {
-        StepReport::Ended {
+    fn ended(step: u32, error: Option<&str>) -> Step {
+        Step::Ended {
             step,
             error: error.map(str::to_owned),
         }
     }
 
-    fn reports(receiver: &mut mpsc::UnboundedReceiver<StepReport>) -> Vec<StepReport> {
+    fn reports(receiver: &mut mpsc::UnboundedReceiver<Step>) -> Vec<Step> {
         std::iter::from_fn(|| receiver.try_recv().ok()).collect()
     }
 

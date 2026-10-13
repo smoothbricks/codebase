@@ -39,7 +39,7 @@ use crate::repository::RepoId;
 use crate::storage::job_artifact::write_controller_commitment;
 use crate::storage::trace_segment::TelemetryDate;
 
-use crate::fsio::{
+use cowshed_os::fsio::{
     Durability, TemporaryAt, create_private_file_at, open_directory_nofollow,
     open_or_create_child_directory, rename_noreplace,
 };
@@ -419,7 +419,7 @@ impl ArrowAuditSink {
         // The sealed name already carries order and writer id, so the shared temp grammar keeps
         // crash residue both diagnosable and recognizable by the one sweeper predicate.
         let temporary_name =
-            crate::fsio::temp_name(std::ffi::OsStr::new(&sealed_name), Uuid::new_v4().simple());
+            cowshed_os::fsio::temp_name(std::ffi::OsStr::new(&sealed_name), Uuid::new_v4().simple());
         let temporary = CString::new(temporary_name.as_encoded_bytes())
             .map_err(|_| integrity("temporary segment name contains NUL"))?;
         let sealed = CString::new(sealed_name.as_bytes())

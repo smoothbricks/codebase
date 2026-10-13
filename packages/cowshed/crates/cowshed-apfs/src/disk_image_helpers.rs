@@ -169,7 +169,7 @@ fn read_orphans() -> io::Result<(OrphanedHelpers, bool)> {
     // Helpers first: a helper must already run to be named, and its device must be missing at
     // the later registry read, so a helper that exits with its image is not caught midway.
     let scan = scan_processes()?;
-    let creators = crate::apfs::disk_image_user_client_creators()?
+    let creators = crate::disk_image_user_client_creators()?
         .iter()
         .map(|creator| creator_pid(creator))
         .collect::<io::Result<BTreeSet<_>>>()?;
@@ -359,7 +359,7 @@ mod tests {
     #[test]
     fn the_live_helpers_and_creators_are_readable() {
         let creators = || {
-            crate::apfs::disk_image_user_client_creators()
+            crate::disk_image_user_client_creators()
                 .expect("read disk image user client creators")
                 .iter()
                 .map(|creator| creator_pid(creator).expect("creator pid"))

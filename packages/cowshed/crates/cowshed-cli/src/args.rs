@@ -3247,7 +3247,7 @@ mod tests {
     /// exact moment the operator is out of attach headroom.
     #[test]
     fn attach_budget_hint_commands_parse_as_cowshed_invocations() {
-        use cowshed_core::attach_budget::{CLEAR_COMMAND, ORPHANS_FIRST_HINT};
+        use cowshed_apfs::attach_budget::{CLEAR_COMMAND, ORPHANS_FIRST_HINT};
         for hint in [CLEAR_COMMAND, ORPHANS_FIRST_HINT] {
             let mut spans = 0;
             let mut candidates: Vec<&str> = hint.split('`').skip(1).step_by(2).collect();

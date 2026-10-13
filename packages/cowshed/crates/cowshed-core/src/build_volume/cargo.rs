@@ -9,7 +9,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use super::BuildVolumeState;
-use crate::fork_lock::Fenced;
+use cowshed_os::fork_lock::Fenced;
 
 /// The file Cargo locks in each profile directory it builds into.
 pub const BUILD_LOCK: &str = ".cargo-lock";

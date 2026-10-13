@@ -296,7 +296,7 @@ fn publish_minted_client_wiring(
     // directory, and no child runs while a workspace is minted, but the mount's own ancestry may
     // pass through a platform link (`/var` → `/private/var`), which the anchored walk refuses.
     let root = fs::canonicalize(credential_directory)
-        .and_then(|resolved| crate::fsio::AnchoredDirectory::create(&resolved))
+        .and_then(|resolved| cowshed_os::fsio::AnchoredDirectory::create(&resolved))
         .map_err(|source| {
             io_failure(
                 "opening the private environment",
@@ -514,7 +514,7 @@ fn read_bounded_utf8(
 }
 
 fn sync_directory(path: &Path, operation: &'static str) -> Result<(), WorkspaceCredentialError> {
-    crate::fsio::sync_directory(path).map_err(|source| io_failure(operation, path, source))
+    cowshed_os::fsio::sync_directory(path).map_err(|source| io_failure(operation, path, source))
 }
 
 fn io_failure(operation: &'static str, path: &Path, source: io::Error) -> WorkspaceCredentialError {

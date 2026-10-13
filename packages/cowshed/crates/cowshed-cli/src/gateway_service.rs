@@ -36,10 +36,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+pub use cowshed_gateway_types::control_socket_path;
 pub use cowshed_core::gateway_sessions::{
     ControlRefusal, GATEWAY_START_HINT, GatewayControl, GatewayInstaller, GatewayPortReallocator,
     GatewayStatusError, NativeSessionInventory, ReconcileReport, SessionInventory, canonical_home,
-    control_error, control_socket_path, effective_uid, gateway_absent, install_all_sessions,
+    control_error, effective_uid, gateway_absent, install_all_sessions,
     policy_from_grants, project_session_prefix, reconcile_against_status, reconcile_project,
     reconcile_project_with_reallocator, session_from_fact, sessions_from_facts,
     stable_workspace_id,
@@ -251,7 +252,7 @@ pub async fn reconcile_native_project(
         repo_id,
         assigner,
     };
-    cowshed_core::timing::spanned(
+    cowshed_os::timing::spanned(
         "reconcile",
         "sessions",
         reconcile_project_with_reallocator(

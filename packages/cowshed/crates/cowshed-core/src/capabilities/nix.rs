@@ -437,7 +437,7 @@ mod tests {
     #[test]
     #[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
     fn host_controller_nix_config_metadata_is_readable_and_nothing_else_in_etc() {
-        use crate::fork_lock::Run as _;
+        use cowshed_os::fork_lock::Run as _;
 
         let nix_conf = Path::new("/etc/nix/nix.conf");
         assert!(

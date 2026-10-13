@@ -9,7 +9,7 @@ use crate::probe;
 use async_trait::async_trait;
 use base64::Engine as _;
 use bytes::Bytes;
-use cowshed_core::apfs::SystemCommandRunner;
+use cowshed_apfs::SystemCommandRunner;
 pub use cowshed_core::api::ProjectWorkspaces;
 use cowshed_core::api::server::{ConnectionAuthority, serve_controller_connection};
 use cowshed_core::api::{
@@ -25,8 +25,10 @@ use cowshed_core::api::{
     WorkspaceState, validate_command_argv,
 };
 use cowshed_core::git::GitRepository;
+use cowshed_apfs::image::{IMAGE_EXTENSION, ImageCapacity};
+use cowshed_gateway_types::STORE_ROOT;
 use cowshed_core::metadata::{
-    DetachedWorkspaceMetadata, IMAGE_EXTENSION, ImageCapacity, SlotId, WorkspaceIncarnation,
+    DetachedWorkspaceMetadata, SlotId, WorkspaceIncarnation,
     WorkspaceName, WorkspaceRole,
 };
 use cowshed_core::metadata::{EgressMode, EgressRule};
@@ -37,7 +39,7 @@ use cowshed_core::storage::apfs::rekey::RekeyReport;
 use cowshed_core::storage::apfs::{ApfsSubstrate, ApfsSubstrateConfig, DEFAULT_IMAGE_CAPACITY};
 use cowshed_core::storage::bootstrap::{
     CachesVolume, CanonicalRoots, HostAction, HostSetupPlan, HostSetupReport, MOUNT_SERVICE_PLIST,
-    RETIRED_CACHES_MOUNTPOINT, STORE_ROOT, VOLUME_MARKER_FILE, ValidatedHostStorage, VolumeRole,
+    RETIRED_CACHES_MOUNTPOINT, VOLUME_MARKER_FILE, ValidatedHostStorage, VolumeRole,
     VolumeState, execute_host_setup, plan_host_setup,
 };
 use cowshed_core::storage::host_config::{RETIRED_LAYOUT_HINT, retired_layout_paths};
@@ -238,7 +240,7 @@ fn needs_daemon_of_this_build(command: &Command) -> bool {
 /// `cowshed setup`.
 pub async fn require_daemon_of_this_build(command: &Command) -> Result<()> {
     require_daemon_of_this_build_at(
-        Path::new(cowshed_core::storage::bootstrap::STORE_ROOT),
+        Path::new(cowshed_gateway_types::STORE_ROOT),
         command,
     )
     .await
@@ -409,7 +411,7 @@ impl ActorBridge {
         requested_repo_id: Option<RepoId>,
         storage: ValidatedHostStorage,
     ) -> Result<Self> {
-        let runtime = cowshed_core::timing::timed_async(
+        let runtime = cowshed_os::timing::timed_async(
             "controller-open",
             "runtime",
             ProjectRuntime::open_for_adopt_at(project_root, requested_repo_id, storage),
@@ -424,6 +426,32 @@ impl ActorBridge {
         storage: ValidatedHostStorage,
     ) -> Result<Self> {
         let runtime = ProjectRuntime::open_existing_at(project_root, scope, storage).await?;
+        Self::from_runtime(project_root, runtime).await
+    }
+
+    /// Drive the same dispatch workflow against a caller-owned directory store.
+    pub async fn open_directory_for_adopt_at(
+        project_root: &Path,
+        requested_repo_id: Option<RepoId>,
+        storage: ValidatedHostStorage,
+    ) -> Result<Self> {
+        let runtime = ProjectRuntime::open_directory_for_adopt_at(
+            project_root,
+            requested_repo_id,
+            storage,
+        )
+        .await?;
+        Self::from_runtime(project_root, runtime).await
+    }
+
+    /// Reopen a directory store without acquiring disk-image capabilities.
+    pub async fn open_directory_existing_at(
+        project_root: &Path,
+        scope: RecoveryScope,
+        storage: ValidatedHostStorage,
+    ) -> Result<Self> {
+        let runtime =
+            ProjectRuntime::open_directory_existing_at(project_root, scope, storage).await?;
         Self::from_runtime(project_root, runtime).await
     }
 
@@ -460,7 +488,7 @@ impl ActorBridge {
         ));
         let client_descriptor: OwnedFd = client.into();
 
-        let (cowshed, token) = match cowshed_core::timing::timed_async(
+        let (cowshed, token) = match cowshed_os::timing::timed_async(
             "controller-open",
             "connect",
             cowshed_core::Cowshed::connect(client_descriptor),
@@ -472,7 +500,7 @@ impl ActorBridge {
                 return Err(cleanup_open_failure(primary, connection, runtime).await);
             }
         };
-        let project = match cowshed_core::timing::timed_async(
+        let project = match cowshed_os::timing::timed_async(
             "controller-open",
             "project",
             cowshed.open(project_root),
@@ -857,13 +885,13 @@ impl CliService for ActorBridge {
         stdout: &mut (dyn Write + Send),
         stderr: &mut (dyn Write + Send),
     ) -> Result<ExecResult> {
-        let worker = cowshed_core::timing::spanned(
+        let worker = cowshed_os::timing::spanned(
             "exec",
             "worker",
             self.coordinator()?.worker(&command.workspace),
         )
         .await?;
-        let submit = cowshed_core::timing::span("exec", "submit");
+        let submit = cowshed_os::timing::span("exec", "submit");
         let job = if let Some(session_name) = command.session.as_deref() {
             worker
                 .shell(Some(session_name))
@@ -883,7 +911,7 @@ impl CliService for ActorBridge {
                 end: ExecEnd::Backgrounded,
             });
         }
-        let _relay = cowshed_core::timing::span("exec", "relay");
+        let _relay = cowshed_os::timing::span("exec", "relay");
         relay_foreground(&job, command.timeout, presentation, stdout, stderr).await
     }
 
@@ -1344,7 +1372,7 @@ where
             };
             let info = service.path(&workspace, args.no_attach).await?;
             if !args.no_attach {
-                cowshed_core::timing::spanned(
+                cowshed_os::timing::spanned(
                     "path",
                     "reconcile-gateway",
                     service.reconcile_gateway(),
@@ -1845,7 +1873,7 @@ where
             // Repair retires what doctor named as reclaimable the same way `gc` does — one
             // sweep, one set of reasons — rather than a second deleter with its own rules.
             if args.clear_attach_budget {
-                cowshed_core::attach_budget::clear().map_err(|error| {
+                cowshed_apfs::attach_budget::clear().map_err(|error| {
                     CowshedError::environment_missing(
                         format!("cannot clear the recorded attach-pool exhaustion: {error}"),
                         "check the cowshed attach-pool record's permissions and retry",
@@ -4173,9 +4201,9 @@ fn vnode_table_finding(
 /// pid is named only when two reads agree with no disk-image tool running; while one runs, a
 /// helper may be attaching, and the finding says so without naming any.
 fn orphaned_disk_image_helpers_finding(
-    reading: std::io::Result<cowshed_core::disk_image_helpers::HelperReading>,
+    reading: std::io::Result<cowshed_apfs::disk_image_helpers::HelperReading>,
 ) -> Option<Finding> {
-    use cowshed_core::disk_image_helpers::HelperReading;
+    use cowshed_apfs::disk_image_helpers::HelperReading;
     match reading {
         Ok(HelperReading::Settled(orphans)) if orphans.is_empty() => None,
         Ok(HelperReading::Settled(orphans)) => Some(Finding {
@@ -4216,7 +4244,7 @@ fn orphaned_disk_image_helpers_finding(
 /// A pool spent this boot is an error; low headroom or a volume leak warns. The hint names what
 /// frees each leak.
 fn disk_image_attach_budget_finding(
-    budget: std::io::Result<cowshed_core::attach_budget::Budget>,
+    budget: std::io::Result<cowshed_apfs::attach_budget::Budget>,
 ) -> Option<Finding> {
     match budget {
         Ok(budget) => Some(Finding {
@@ -4294,10 +4322,10 @@ async fn diagnose_host() -> Result<HostDiagnosis> {
     diagnosis
         .findings
         .extend(orphaned_disk_image_helpers_finding(
-            cowshed_core::disk_image_helpers::OrphanedHelpers::read(),
+            cowshed_apfs::disk_image_helpers::OrphanedHelpers::read(),
         ));
     diagnosis.findings.extend(disk_image_attach_budget_finding(
-        cowshed_core::attach_budget::observe(),
+        cowshed_apfs::attach_budget::observe(),
     ));
     match crate::capabilities::sccache::service::service_status().await {
         Ok(status) => diagnosis.findings.push(sccache_finding(&status)),
@@ -4571,7 +4599,7 @@ where
     W: Write + Send,
     E: Write + Send,
 {
-    let primary = cowshed_core::timing::spanned(
+    let primary = cowshed_os::timing::spanned(
         "cli",
         "dispatch",
         dispatch(&mut service, cli, stdin, output),
@@ -4584,7 +4612,7 @@ async fn finish_dispatch<S: CliService>(
     service: S,
     primary: Result<DispatchExit>,
 ) -> Result<DispatchExit> {
-    let teardown = cowshed_core::timing::spanned("cli", "shutdown", service.shutdown())
+    let teardown = cowshed_os::timing::spanned("cli", "shutdown", service.shutdown())
         .await
         .err();
     match primary {
@@ -4626,7 +4654,7 @@ where
         return dispatch_host_command(cli, output, false).await;
     }
     let resolved =
-        match cowshed_core::timing::spanned("cli", "resolve-root", resolve_project_context(&cli))
+        match cowshed_os::timing::spanned("cli", "resolve-root", resolve_project_context(&cli))
             .await
         {
             Ok(resolved) => resolved,
@@ -4648,7 +4676,7 @@ where
         } else {
             requested_repo_id
         };
-    let open_span = cowshed_core::timing::span("cli", "open");
+    let open_span = cowshed_os::timing::span("cli", "open");
     let bridge = match mode {
         RuntimeOpenMode::Provision => ActorBridge::open_for_adopt(root, requested_repo_id).await,
         RuntimeOpenMode::ExistingOnly => {
@@ -4669,7 +4697,7 @@ where
         Err(error) => return Err(error),
     };
     if resolved.resuming_re_adoption {
-        let primary = cowshed_core::timing::spanned(
+        let primary = cowshed_os::timing::spanned(
             "cli",
             "dispatch",
             report_recovered_adoption(&mut bridge, root, cli.global.json, output),
@@ -5383,7 +5411,7 @@ mod tests {
 
     #[test]
     fn doctor_reports_the_attach_budget_and_says_reboot_once_the_pool_ran_out() {
-        use cowshed_core::attach_budget::{
+        use cowshed_apfs::attach_budget::{
             Boot, ClassCount, KernelReading, PoolRecord, REBOOT_HINT, RESTART_DISK_ARBITRATION_HINT,
         };
         let count = |instances, registered| ClassCount {
@@ -5468,7 +5496,7 @@ mod tests {
 
     #[test]
     fn doctor_names_orphaned_disk_image_helpers_and_the_root_command() {
-        use cowshed_core::disk_image_helpers::{HelperReading, OrphanedHelpers};
+        use cowshed_apfs::disk_image_helpers::{HelperReading, OrphanedHelpers};
         use std::collections::BTreeSet;
         let helpers = BTreeSet::from([4353, 25101, 75251]);
         let orphans = OrphanedHelpers::among(&helpers, &BTreeSet::from([25101]));

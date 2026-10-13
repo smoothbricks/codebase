@@ -11,7 +11,7 @@ use std::{
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use cowshed_core::fork_lock::{Run as _, Spawn as _};
+use cowshed_os::fork_lock::{Run as _, Spawn as _};
 use http::{Method, Request, header};
 use http_body_util::Empty;
 use hyper::client::conn::{http1, http2};

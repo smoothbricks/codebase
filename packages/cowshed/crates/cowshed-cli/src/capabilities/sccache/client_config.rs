@@ -29,7 +29,7 @@
 //! environment rather than host state, so a file written there would be read by exactly the shell
 //! that ran `setup`.
 
-use cowshed_core::metadata::ImageCapacity;
+use cowshed_apfs::image::ImageCapacity;
 use cowshed_core::{CowshedError, Result};
 use std::fmt;
 use std::fs;

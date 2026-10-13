@@ -7,7 +7,7 @@ use super::peer_credentials::PeerCredentialsError;
 use crate::error::{CowshedError, ErrorCode, Result};
 use crate::metadata::{WorkspaceIncarnation, WorkspaceName};
 use crate::repository::RepoId;
-use crate::timing::StepSink;
+use cowshed_os::timing::StepSink;
 use async_trait::async_trait;
 use bytes::Bytes;
 use codec::Demand;
@@ -1303,12 +1303,12 @@ async fn route_reporting_steps(
         tokio::select! {
             biased;
             Some(report) = reports.recv() => {
-                write_rpc_step(&mut *writer.lock().await, request_id, &report).await?;
+                write_rpc_step(&mut *writer.lock().await, request_id, &report.into()).await?;
             }
             response = &mut routed => {
                 // Every step the call reported before it answered is already queued.
                 while let Ok(report) = reports.try_recv() {
-                    write_rpc_step(&mut *writer.lock().await, request_id, &report).await?;
+                    write_rpc_step(&mut *writer.lock().await, request_id, &report.into()).await?;
                 }
                 return Ok(response);
             }

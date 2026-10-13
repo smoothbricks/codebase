@@ -31,9 +31,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::api::dto::GitOid;
 use crate::capabilities::BuildStatePath;
-use crate::fork_lock::Fenced;
+use cowshed_os::fork_lock::Fenced;
+use cowshed_apfs::image::IMAGE_EXTENSION;
 use crate::metadata::{
-    IMAGE_EXTENSION, MetadataError, WorkspaceIncarnation, WorkspaceName, read_json, write_json,
+    MetadataError, WorkspaceIncarnation, WorkspaceName, read_json, write_json,
 };
 use crate::repository::ProjectPaths;
 use crate::storage::StorageLayoutError;
@@ -57,8 +58,8 @@ pub(crate) const RECORD_VERSION: u32 = 1;
 /// The capacity of a build volume created from nothing, unless `.cowshed.toml` `[build] capacity`
 /// says otherwise (16_build_volumes.md, "Substrate"). Sparse: a cap on build-cache growth, not an
 /// allocation.
-pub const DEFAULT_BUILD_VOLUME_CAPACITY: crate::metadata::ImageCapacity =
-    crate::metadata::ImageCapacity::from_gibibytes(100);
+pub const DEFAULT_BUILD_VOLUME_CAPACITY: cowshed_apfs::image::ImageCapacity =
+    cowshed_apfs::image::ImageCapacity::from_gibibytes(100);
 
 /// A build volume's identity: 32 lowercase hex digits, minted once and never reused.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -414,7 +415,7 @@ pub(crate) fn tracked_source(
     checkout: &Path,
     paths: &[&BuildStatePath],
 ) -> crate::Result<Option<TrackedBuildStateRefusal>> {
-    use crate::fork_lock::Run as _;
+    use cowshed_os::fork_lock::Run as _;
     use std::os::unix::ffi::OsStrExt as _;
     if paths.is_empty() {
         return Ok(None);
@@ -1243,7 +1244,7 @@ mod tests {
     /// No timer orders the race. The child is parked before the hold is dropped; the dropping
     /// thread either answers first, having closed its descriptor without waiting (unfenced), or
     /// is queued for the exclusive fork lock behind the parked spawn, which a reader then sees
-    /// refused ([`crate::fork_lock::held_exclusive`]) -- only then is the child let go.
+    /// refused ([`cowshed_os::fork_lock::held_exclusive`]) -- only then is the child let go.
     #[test]
     fn a_dropped_hold_is_free_though_a_spawn_that_copied_it_is_in_flight() {
         let root = std::env::temp_dir().join(format!(
@@ -1263,7 +1264,7 @@ mod tests {
         let hold = layout.hold(&id).unwrap();
         assert!(layout.held(&id).unwrap());
 
-        let in_flight = crate::fork_lock::in_flight::InFlight::start();
+        let in_flight = cowshed_os::fork_lock::in_flight::InFlight::start();
         let (answer, answered) = std::sync::mpsc::channel();
         let release = {
             let (layout, id) = (layout.clone(), id.clone());
@@ -1276,7 +1277,7 @@ mod tests {
             if let Ok(held) = answered.try_recv() {
                 break Some(held);
             }
-            if crate::fork_lock::held_exclusive() {
+            if cowshed_os::fork_lock::held_exclusive() {
                 break None;
             }
             std::thread::yield_now();

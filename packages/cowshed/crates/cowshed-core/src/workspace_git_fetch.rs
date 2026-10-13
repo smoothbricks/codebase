@@ -164,7 +164,7 @@ fn publish_git_fetch_config(mount: &Path, mappings: &[GitFetchMapping]) -> Resul
     let output = render_git_fetch_config(mappings)?;
     if output.is_empty() {
         match std::fs::remove_file(&path) {
-            Ok(()) => crate::fsio::sync_directory(&directory)
+            Ok(()) => cowshed_os::fsio::sync_directory(&directory)
                 .map_err(|error| failure(format!("cannot sync Git mapping revocation: {error}")))?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => {
@@ -206,7 +206,7 @@ fn publish_git_fetch_config(mount: &Path, mappings: &[GitFetchMapping]) -> Resul
 /// Parsing only directory names also means a remote in an included config is never identity.
 #[cfg(target_os = "macos")]
 async fn probe_git(root: &Path, args: &[&str], sandbox: &SandboxConfig) -> Result<Vec<u8>> {
-    use crate::fork_lock::Spawn as _;
+    use cowshed_os::fork_lock::Spawn as _;
 
     let profile =
         crate::sandbox::seatbelt_profile(sandbox, crate::sandbox::SandboxProfileRole::GitDiscovery)
@@ -405,7 +405,7 @@ async fn repository_object_store(root: &Path, sandbox: &SandboxConfig) -> Result
 /// Called host-side immediately before child spawn. The registry, binding and main image
 /// sidecar are controller authority. A checkout's mutable remotes cannot invent routes.
 pub async fn refresh_git_fetch_config(sandbox: &SandboxConfig) -> Result<Option<PathBuf>> {
-    refresh_from_store(Path::new(crate::storage::bootstrap::STORE_ROOT), sandbox).await
+    refresh_from_store(Path::new(cowshed_gateway_types::STORE_ROOT), sandbox).await
 }
 
 async fn refresh_from_store(store: &Path, sandbox: &SandboxConfig) -> Result<Option<PathBuf>> {
@@ -462,8 +462,8 @@ async fn refresh_from_store(store: &Path, sandbox: &SandboxConfig) -> Result<Opt
 mod tests {
     use super::*;
     #[cfg(target_os = "macos")]
-    use crate::fork_lock::Run as _;
-    use crate::fork_lock::Spawn as _;
+    use cowshed_os::fork_lock::Run as _;
+    use cowshed_os::fork_lock::Spawn as _;
 
     fn mapping(url: &str, path: &str) -> GitFetchMapping {
         GitFetchMapping {

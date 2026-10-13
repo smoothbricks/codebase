@@ -1,5 +1,5 @@
 use cowshed_core::api::*;
-use cowshed_core::fork_lock::Run as _;
+use cowshed_os::fork_lock::Run as _;
 use cowshed_core::{CowshedError, ErrorCode};
 use serde_json::json;
 use std::ffi::OsString;

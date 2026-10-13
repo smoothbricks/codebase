@@ -10,8 +10,8 @@ use tokio::process::Command;
 
 use crate::api::dto::GitOid;
 use crate::error::{CowshedError, Result};
-use crate::fork_lock::{Run as _, RunAsync as _, Spawn as _};
-use crate::timing::timed_async;
+use cowshed_os::fork_lock::{Run as _, RunAsync as _, Spawn as _};
+use cowshed_os::timing::timed_async;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RemoteUrl {
@@ -388,7 +388,7 @@ impl GitRepository {
                         .map_err(|error| {
                             io_error("create Git identity directory", directory, error)
                         })?;
-                    crate::fsio::sync_directory(&root)
+                    cowshed_os::fsio::sync_directory(&root)
                         .map_err(|error| io_error("sync Git identity parent", &root, error))?;
                 }
                 Err(error) => {
@@ -399,7 +399,7 @@ impl GitRepository {
             // A newly created private directory cannot contain inherited links or Git lockfiles.
             // Let Git quote values, then use the maintained private-file publisher for the final
             // rename; replacing a copied final-component symlink never writes through its target.
-            let staging = directory.join(crate::fsio::temp_name(
+            let staging = directory.join(cowshed_os::fsio::temp_name(
                 OsStr::new("git-identity.inc"),
                 uuid::Uuid::new_v4().simple(),
             ));
@@ -673,8 +673,8 @@ impl GitRepository {
     }
 
     /// Exclude cowshed's runtime metadata, the volume's own bookkeeping
-    /// ([`crate::apfs::VOLUME_METADATA`]) and the Spotlight opt-out each mount plants at the
-    /// volume root ([`crate::apfs::SPOTLIGHT_OPT_OUT`]) in `.git/info/exclude`: a checkout is its
+    /// ([`cowshed_apfs::VOLUME_METADATA`]) and the Spotlight opt-out each mount plants at the
+    /// volume root ([`cowshed_apfs::SPOTLIGHT_OPT_OUT`]) in `.git/info/exclude`: a checkout is its
     /// volume's root, so none of it is the repository's work, for a dirty check or for a clean.
     /// Directories are excluded as `name/`; the marker is a file, so it is `/name`, anchored at
     /// the root, where a trailing slash would match only a directory.
@@ -731,9 +731,9 @@ impl GitRepository {
             })?;
             let mut addition = Vec::new();
             let directories = std::iter::once(".cowshed")
-                .chain(crate::apfs::VOLUME_METADATA)
+                .chain(cowshed_apfs::VOLUME_METADATA)
                 .map(|name| format!("{name}/"));
-            for pattern in directories.chain([format!("/{}", crate::apfs::SPOTLIGHT_OPT_OUT)]) {
+            for pattern in directories.chain([format!("/{}", cowshed_apfs::SPOTLIGHT_OPT_OUT)]) {
                 let pattern = pattern.as_bytes();
                 if !existing
                     .split(|byte| *byte == b'\n')
@@ -2509,7 +2509,7 @@ fn sandboxed_git_command_with_paths(
     }
     let config = SandboxConfig {
         home,
-        mount_root: PathBuf::from(crate::storage::bootstrap::STORE_ROOT),
+        mount_root: PathBuf::from(cowshed_gateway_types::STORE_ROOT),
         workspace_mount: canonical.clone(),
         shed_links: Vec::new(),
         exec_temp_dir: canonical.clone(),
@@ -3006,7 +3006,7 @@ fn parse_one_line<'a>(bytes: &'a [u8], description: &str) -> Result<&'a [u8]> {
 
 #[cfg(test)]
 mod tests {
-    use crate::fork_lock::Run as _;
+    use cowshed_os::fork_lock::Run as _;
     use std::ffi::OsString;
     use std::fs;
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -3626,17 +3626,17 @@ mod tests {
         );
         fs::create_dir(root.join(".cowshed")).expect("runtime metadata");
         fs::write(root.join(".cowshed/state"), b"").expect("runtime state");
-        for metadata in crate::apfs::VOLUME_METADATA {
+        for metadata in cowshed_apfs::VOLUME_METADATA {
             fs::create_dir(root.join(metadata)).expect("APFS metadata");
             fs::write(root.join(metadata).join("entry"), b"").expect("APFS metadata entry");
         }
-        fs::write(root.join(crate::apfs::SPOTLIGHT_OPT_OUT), b"").expect("Spotlight opt-out");
+        fs::write(root.join(cowshed_apfs::SPOTLIGHT_OPT_OUT), b"").expect("Spotlight opt-out");
         assert!(!repo.is_dirty().await.expect("runtime state is ignored"));
         // Ignored by the exclude itself, not merely as hidden junk, so `git add -A` leaves it,
         // and anchored at the root: a same-named file deeper in the tree is the repository's.
         fs::create_dir(root.join("nested")).expect("nested directory");
         fs::write(
-            root.join("nested").join(crate::apfs::SPOTLIGHT_OPT_OUT),
+            root.join("nested").join(cowshed_apfs::SPOTLIGHT_OPT_OUT),
             b"",
         )
         .expect("nested");
@@ -3649,10 +3649,10 @@ mod tests {
                 .expect("git check-ignore")
                 .success()
         };
-        assert!(ignored(crate::apfs::SPOTLIGHT_OPT_OUT));
+        assert!(ignored(cowshed_apfs::SPOTLIGHT_OPT_OUT));
         assert!(!ignored(&format!(
             "nested/{}",
-            crate::apfs::SPOTLIGHT_OPT_OUT
+            cowshed_apfs::SPOTLIGHT_OPT_OUT
         )));
     }
 

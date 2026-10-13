@@ -19,7 +19,7 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use cowshed_core::checkout::CheckoutRecord;
-use cowshed_core::fork_lock::Run as _;
+use cowshed_os::fork_lock::Run as _;
 use cowshed_core::git::{GitRepository, MainRemote, MergeDriverState};
 use cowshed_core::metadata::{
     DetachedWorkspaceMetadata, MARKER_VERSION, Platform, PortBlock, PublicationState,

@@ -9,12 +9,13 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use thiserror::Error;
 
-use crate::apfs::{ApfsError, DetachIntent, MountAccess, timed_apfs_step};
+use cowshed_apfs::{ApfsError, DetachIntent, MountAccess, timed_apfs_step};
+use cowshed_apfs::image::{IMAGE_EXTENSION, ImageCapacity};
 use crate::metadata::{
-    IMAGE_EXTENSION, ImageCapacity, WorkspaceIncarnation, WorkspaceName, WorkspaceRole,
+    WorkspaceIncarnation, WorkspaceName, WorkspaceRole,
 };
 use crate::repository::{OwnedRepoIds, RepoId};
-use crate::timing::timed_async;
+use cowshed_os::timing::timed_async;
 
 use super::lifecycle::{
     AdoptHandoff, AdoptPlan, AdoptRequest, CheckpointFact, CheckpointPlan, CheckpointRef,
@@ -328,11 +329,7 @@ pub struct RetiredImage {
     pub retired: RetiredRef,
     pub image: PathBuf,
 }
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum LockMode {
-    Wait,
-    Try,
-}
+use cowshed_apfs::store_lock::LockMode;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PublicationDisposition {
@@ -396,8 +393,14 @@ pub enum Labelled {
 }
 
 /// Synchronous macOS/filesystem boundary. Implementations must use the primitives in
-/// `crate::apfs`; the storage executor calls this trait only through [`ApfsBlockingLane`].
+/// `cowshed_apfs`; the storage executor calls this trait only through [`ApfsBlockingLane`].
 pub trait ApfsExecutionHost: Send + Sync + 'static {
+    /// Whether this host's workspaces are kernel volumes with physical identity: a label, a
+    /// device, a capacity and block statistics. A directory store has none of them, so the
+    /// executor and the runtime skip only the cosmetic steps (volume labels, volume sampling)
+    /// that exist for physical volumes; every physical claim such a host is asked for anyway is
+    /// refused with [`ApfsStorageError::Unsupported`].
+    const HAS_PHYSICAL_VOLUMES: bool = true;
     type LockGuard: Send + 'static;
     fn lock_images(
         &self,
@@ -726,7 +729,7 @@ impl ApfsBlockingLane for TokioApfsBlockingLane {
         T: Send + 'static,
         F: FnOnce() -> Result<T, ApfsStorageError> + Send + 'static,
     {
-        tokio::task::spawn_blocking(crate::timing::carried(job))
+        tokio::task::spawn_blocking(cowshed_os::timing::carried(job))
             .await
             .map_err(|error| ApfsStorageError::BlockingTask(error.to_string()))?
     }
@@ -749,7 +752,7 @@ pub enum ApfsStorageError {
     BuildVolumeHeld {
         image: PathBuf,
         hold: PathBuf,
-        open: Vec<crate::build_volume::nx::Holder>,
+        open: Vec<cowshed_os::process::Holder>,
     },
     #[error("lifecycle conflict: {0}")]
     Conflict(#[from] super::lifecycle::Conflict),
@@ -779,6 +782,12 @@ pub enum ApfsStorageError {
     },
     #[error("unexpected lifecycle operation result")]
     UnexpectedResult,
+    /// A physical-volume operation asked of a backend whose workspaces are not kernel volumes.
+    #[error("{backend} storage does not support {operation}")]
+    Unsupported {
+        backend: &'static str,
+        operation: &'static str,
+    },
     #[error("invalid APFS lifecycle plan: {0}")]
     InvalidPlan(&'static str),
     #[error("APFS host operation failed: {0}")]
@@ -805,6 +814,36 @@ pub enum ApfsStorageError {
         primary: Box<ApfsStorageError>,
         cleanup: Box<ApfsStorageError>,
     },
+}
+
+impl From<cowshed_apfs::store_lock::StoreLockError> for ApfsStorageError {
+    fn from(error: cowshed_apfs::store_lock::StoreLockError) -> Self {
+        use cowshed_apfs::store_lock::StoreLockError;
+        match error {
+            StoreLockError::EscapesStoreRoot => Self::Layout(StorageLayoutError::EscapesStoreRoot),
+            StoreLockError::InvalidPath(reason) => Self::InvalidPlan(reason),
+            StoreLockError::Nul(path) => Self::Host(format!("controller path contains NUL: {}", path.display())),
+            StoreLockError::SymlinkComponent(path) => Self::Layout(StorageLayoutError::SymlinkComponent(path)),
+            StoreLockError::Io { operation, path, source } => Self::Io { operation, path, source },
+        }
+    }
+}
+
+impl From<cowshed_apfs::template::TemplateError> for ApfsStorageError {
+    fn from(error: cowshed_apfs::template::TemplateError) -> Self {
+        use cowshed_apfs::template::TemplateError;
+        match error {
+            TemplateError::Apfs(error) => error.into(),
+            TemplateError::Lock(error) => error.into(),
+            TemplateError::Io { operation, path, source } => Self::Io { operation, path, source },
+            TemplateError::InvalidPlan(reason) => Self::InvalidPlan(reason),
+            TemplateError::Cleanup { operation, primary, cleanup } => Self::Cleanup {
+                operation,
+                primary: Box::new((*primary).into()),
+                cleanup: Box::new((*cleanup).into()),
+            },
+        }
+    }
 }
 
 impl From<ExecuteError<ApfsStorageError>> for ApfsStorageError {
@@ -2118,7 +2157,7 @@ enum PreparedRestore<A> {
     Verify(PreparedVerifyRestore<A>),
     Replace(Box<PreparedReplaceRestore<A>>),
 }
-fn workspace_lock_path(
+pub(super) fn workspace_lock_path(
     config: &ApfsSubstrateConfig,
     repo: &RepoId,
     workspace: &WorkspaceName,
@@ -2661,10 +2700,15 @@ fn prepare_clone_stage<H: ApfsExecutionHost>(
         })?;
         let source_mount = mount_point(config, &source)?;
         // The first write happens only on a clone nothing has attached yet: rewriting a block
-        // under an attached image's driver could put back bytes it had just changed.
+        // under an attached image's driver could put back bytes it had just changed. Only an
+        // image clone shares an extent map with its source; a host without physical volumes
+        // has none to copy.
         let cloned = host
             .clone_image(&source_image, Some(&source_mount), &canonical_image)
             .and_then(|()| {
+                if !H::HAS_PHYSICAL_VOLUMES {
+                    return Ok(());
+                }
                 timed_apfs_step("canonical", "first-write", || {
                     host.write_first(&canonical_image)
                 })
@@ -2959,10 +3003,14 @@ fn prepare_restore_stage<H: ApfsExecutionHost>(
     let prepared = host
         .mount(&attachment, &staging_mount, MountAccess::ReadWrite, false)
         .and_then(|()| {
-            host.rename_volume(
-                &attachment,
-                &volume_label(replacement.repo(), replacement.name()),
-            )?;
+            // The volume label is human-facing only (`volume_label`); a host without
+            // physical volumes has no label to set, and nothing reads one.
+            if H::HAS_PHYSICAL_VOLUMES {
+                host.rename_volume(
+                    &attachment,
+                    &volume_label(replacement.repo(), replacement.name()),
+                )?;
+            }
             host.mint_workspace_credentials(
                 &replacement,
                 &staged_image,
@@ -3206,7 +3254,7 @@ fn detach_after_failure<H: ApfsExecutionHost, T>(
     }
 }
 
-fn combine_cleanup<T>(
+pub(super) fn combine_cleanup<T>(
     operation: &'static str,
     primary: ApfsStorageError,
     cleanup: Result<(), ApfsStorageError>,
@@ -3271,7 +3319,7 @@ fn active_expected(
 /// The suffix of the CA private key that rides beside a workspace image.
 pub(crate) const COMPANION_SUFFIX: &str = ".ca.key";
 
-fn companion_path(image: &Path) -> PathBuf {
+pub(super) fn companion_path(image: &Path) -> PathBuf {
     crate::metadata::append_suffix(image, COMPANION_SUFFIX)
 }
 
@@ -3305,7 +3353,10 @@ fn main_name() -> WorkspaceName {
     WorkspaceName::main()
 }
 
-fn layout(config: &ApfsSubstrateConfig, repo: &RepoId) -> Result<StorageLayout, ApfsStorageError> {
+pub(super) fn layout(
+    config: &ApfsSubstrateConfig,
+    repo: &RepoId,
+) -> Result<StorageLayout, ApfsStorageError> {
     StorageLayout::new(&config.store_root, repo).map_err(Into::into)
 }
 
@@ -3344,7 +3395,7 @@ fn staging_image(
     Ok(stem.with_extension(IMAGE_EXTENSION))
 }
 
-fn staging_mount(
+pub(super) fn staging_mount(
     config: &ApfsSubstrateConfig,
     workspace: &LifecycleWorkspace,
 ) -> Result<PathBuf, ApfsStorageError> {
@@ -3410,7 +3461,7 @@ fn undo_image(
 /// The `-` between name and incarnation is the separator [`split_retired_stem`] reverses; the two
 /// live side by side so the pair cannot drift. Incarnations are fixed-width lowercase hex, which
 /// is what keeps `rsplit_once` unambiguous even though workspace names contain hyphens.
-fn retired_image_below(
+pub(super) fn retired_image_below(
     sessions: &Path,
     workspace: &WorkspaceName,
     incarnation: &WorkspaceIncarnation,
@@ -3424,7 +3475,7 @@ fn retired_image_below(
 
 /// Splits a `<name>-<incarnation>` trash stem: the exact inverse of the stem written by
 /// [`retired_image_below`], kept adjacent so neither side can change the separator alone.
-fn split_retired_stem(stem: &str) -> Option<(WorkspaceName, WorkspaceIncarnation)> {
+pub(super) fn split_retired_stem(stem: &str) -> Option<(WorkspaceName, WorkspaceIncarnation)> {
     let (name, incarnation) = stem.rsplit_once('-')?;
     Some((
         WorkspaceName::new(name).ok()?,
@@ -3453,7 +3504,7 @@ fn mount_point(
     main_aware_mount_point(config, workspace.repo(), workspace.name())
 }
 
-fn main_aware_mount_point(
+pub(super) fn main_aware_mount_point(
     config: &ApfsSubstrateConfig,
     repo: &RepoId,
     workspace: &WorkspaceName,
@@ -3628,7 +3679,7 @@ mod tests {
         let lock = store.join("sessions/raven.dmg.lock");
         let config = ApfsSubstrateConfig::new(&store, root.join("checkout"));
         let host =
-            native::MacOsApfsExecutionHost::new(crate::apfs::SystemCommandRunner, config.clone())
+            native::MacOsApfsExecutionHost::new(cowshed_apfs::SystemCommandRunner, config.clone())
                 .expect("native host");
         let substrate = ApfsSubstrate::new(config, host);
 

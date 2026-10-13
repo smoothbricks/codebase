@@ -443,15 +443,15 @@ fn write_private_atomic(path: &Path, bytes: &[u8]) -> Result<(), HostConfigError
     })?;
     fs::create_dir_all(parent)
         .map_err(|source| io_error("create host configuration directory", parent, source))?;
-    crate::fsio::publish_private_file::<io::Error>(path, |writer| {
+    cowshed_os::fsio::publish_private_file::<io::Error>(path, |writer| {
         writer.write_all(bytes)?;
         writer.write_all(b"\n")
     })
     .map_err(|error| match error {
-        crate::fsio::PublishError::Io { path, source } => {
+        cowshed_os::fsio::PublishError::Io { path, source } => {
             io_error("publish host configuration", path, source)
         }
-        crate::fsio::PublishError::Write(source) => {
+        cowshed_os::fsio::PublishError::Write(source) => {
             io_error("write host configuration", path.to_path_buf(), source)
         }
     })

@@ -3,7 +3,7 @@ use std::process::Command;
 
 use super::*;
 use crate::error::ErrorCode;
-use crate::fork_lock::Run as _;
+use cowshed_os::fork_lock::Run as _;
 
 const CHILD: &str = "COWSHED_DIAGNOSTICS_NOFILE_CHILD";
 const TEST: &str = "runtime::shell_job::diagnostics_tests::descriptor_exhaustion_reports_the_diagnostics_clone_failure";

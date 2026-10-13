@@ -11,12 +11,13 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use super::{MacOsApfsExecutionHost, allocated_file_bytes, io_error, sync_parent_path};
-use crate::apfs::{ApfsBackend, CommandRunner, DetachIntent, MountAccess, RetainedInput};
+use cowshed_apfs::{ApfsBackend, CommandRunner, DetachIntent, MountAccess, RetainedInput};
 use crate::build_volume::{
     BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord, BuildVolumeRole, RECORD_SUFFIX,
     ReleaseClaim,
 };
-use crate::metadata::{ImageCapacity, append_suffix};
+use cowshed_apfs::image::ImageCapacity;
+use crate::metadata::append_suffix;
 use crate::storage::apfs::{ApfsExecutionHost, ApfsStorageError, COMPANION_SUFFIX};
 use crate::storage::recovery::{
     MissingMainBuild, ReAdoptBuild, ReAdoptEmptyBuild, ReAdoptMain, ReAdoptSource,
@@ -521,7 +522,7 @@ where
         if build
             .image
             .original
-            .with_extension(crate::metadata::IMAGE_EXTENSION)
+            .with_extension(cowshed_apfs::image::IMAGE_EXTENSION)
             != published
         {
             return Err(ApfsStorageError::InvalidPlan(
@@ -804,7 +805,8 @@ fn retained_input<'a>(
     source: &'a ReAdoptSource,
     path: &'a Path,
 ) -> Result<RetainedInput<'a>, ApfsStorageError> {
-    RetainedInput::from_record(source, path)
+    source
+        .retained_input(path)
         .map_err(|error| ApfsStorageError::Host(error.to_string()))
 }
 
@@ -824,7 +826,7 @@ fn rename_exclusive(from: &Path, to: &Path) -> io::Result<()> {
         std::ffi::CString::new(path.as_os_str().as_bytes())
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))
     };
-    crate::fsio::rename_noreplace(libc::AT_FDCWD, &name(from)?, &name(to)?)
+    cowshed_os::fsio::rename_noreplace(libc::AT_FDCWD, &name(from)?, &name(to)?)
 }
 
 fn exists(path: &Path) -> Result<bool, ApfsStorageError> {
@@ -893,10 +895,10 @@ fn replacement_published(
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
-    use crate::apfs::{
+    use cowshed_apfs::{
         AttachedDiskImage, CommandOutput, CommandRequest, CommandRunError, CommandRunFailure,
     };
-    use crate::fork_lock::Fenced;
+    use cowshed_os::fork_lock::Fenced;
     use crate::metadata::{WorkspaceIncarnation, WorkspaceName};
     use crate::storage::StorageLayout;
     use crate::storage::apfs::ApfsSubstrateConfig;

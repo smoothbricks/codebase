@@ -945,7 +945,7 @@ impl Process {
     /// own, not that of a later process given the pid. A read that failed for a process gone
     /// since is its exit, not an error.
     pub(super) fn resident_bytes(&self) -> io::Result<Option<u64>> {
-        let read = crate::process::resident_bytes(self.pid);
+        let read = cowshed_os::process::resident_bytes(self.pid);
         match running_info(self.pid)? {
             Some(info) if info.unique.id_version.cast_unsigned() == self.version => read,
             Some(_) | None => Ok(None),
@@ -958,7 +958,7 @@ impl Process {
     /// failed -- was its own; gone, or another process's now, it holds nothing, whatever the
     /// read met.
     pub(super) fn listening_ports(&self) -> io::Result<Option<BTreeSet<u16>>> {
-        let read = crate::process::listening_ports(self.pid);
+        let read = cowshed_os::process::listening_ports(self.pid);
         match running_info(self.pid)? {
             Some(info) if info.unique.id_version.cast_unsigned() == self.version => read.map(Some),
             Some(_) | None => Ok(None),
@@ -1244,7 +1244,7 @@ impl Process {
     /// still runs afterwards: then the size read was its own, not that of a later process given
     /// the pid. A read that failed for a process gone since is its exit, not an error.
     pub(super) fn resident_bytes(&self) -> io::Result<Option<u64>> {
-        let read = crate::process::resident_bytes(self.pid);
+        let read = cowshed_os::process::resident_bytes(self.pid);
         if pidfd_exited(&self.handle)? {
             return Ok(None);
         }
@@ -1256,7 +1256,7 @@ impl Process {
     /// network tables were read -- or failed to be -- as its own; exited, it holds nothing,
     /// whatever the read met. A missing table of a process still running is an error.
     pub(super) fn listening_ports(&self) -> io::Result<Option<BTreeSet<u16>>> {
-        let read = crate::process::listening_ports(self.pid);
+        let read = cowshed_os::process::listening_ports(self.pid);
         if pidfd_exited(&self.handle)? {
             return Ok(None);
         }
@@ -1385,8 +1385,8 @@ mod tests {
 
     use super::{GroupLeader, Writer, end_recorded, ledger_path, names_groups, record, take_lost};
     #[cfg(target_os = "macos")]
-    use crate::fork_lock::Run as _;
-    use crate::fork_lock::Spawn as _;
+    use cowshed_os::fork_lock::Run as _;
+    use cowshed_os::fork_lock::Spawn as _;
 
     fn leader(pid: u32) -> GroupLeader {
         GroupLeader::observe(pid).expect("observe a live test group leader")

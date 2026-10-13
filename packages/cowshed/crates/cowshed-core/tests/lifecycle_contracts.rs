@@ -3,8 +3,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread::ThreadId;
 
 use async_trait::async_trait;
+use cowshed_apfs::image::ImageCapacity;
 use cowshed_core::metadata::{
-    GrantSet, ImageCapacity, MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE, PortBlock, WorkspaceIncarnation,
+    GrantSet, MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE, PortBlock, WorkspaceIncarnation,
     WorkspaceName, WorkspaceRole,
 };
 use cowshed_core::repository::RepoId;

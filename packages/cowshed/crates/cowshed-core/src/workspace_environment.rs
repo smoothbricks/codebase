@@ -191,7 +191,7 @@ mod tests {
 
     #[test]
     fn published_environment_strips_harness_ci_but_preserves_real_ci_and_compiler_identity() {
-        use crate::fork_lock::Run;
+        use cowshed_os::fork_lock::Run;
 
         /// Removes the fixture root however the test ends, a failed assertion included.
         struct Root(std::path::PathBuf);

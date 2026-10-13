@@ -156,11 +156,11 @@ fn read_and_probe(record: &Path) -> (Probe, Option<(libc::pid_t, Vec<u8>)>) {
     }
 }
 
-/// Whether the process `pid` has not exited ([`crate::process::running`]): a daemon that exited
+/// Whether the process `pid` has not exited ([`cowshed_os::process::running`]): a daemon that exited
 /// and is still a zombie awaiting its reaper is gone. A process whose state cannot be read is
 /// left for the socket to judge.
 fn running(pid: libc::pid_t) -> bool {
-    crate::process::running(pid).unwrap_or(true)
+    cowshed_os::process::running(pid).unwrap_or(true)
 }
 
 /// The Nx project whose daemon a supervisor keeps: the project Nx is rooted at under the
@@ -471,7 +471,7 @@ mod tests {
         assert_eq!(probe(&record), Probe::Live);
 
         // `/bin/sh` is the one program path every supported host has: NixOS keeps no `/usr/bin/true`.
-        let mut exited = crate::fork_lock::Spawn::spawn_locked(
+        let mut exited = cowshed_os::fork_lock::Spawn::spawn_locked(
             std::process::Command::new("/bin/sh").args(["-c", ":"]),
         )
         .expect("spawn");

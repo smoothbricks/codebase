@@ -9,7 +9,7 @@
 /// The number of slice components in a bare identifier — `disk3` → 0, `disk3s1` → 1,
 /// `disk3s1s4` → 2 (an APFS snapshot of slice 1) — or `None` when the string is not a
 /// well-formed identifier. No `/dev/` prefix.
-pub(crate) fn identifier_depth(value: &str) -> Option<usize> {
+pub fn identifier_depth(value: &str) -> Option<usize> {
     let tail = value.strip_prefix("disk")?;
     let mut components = tail.split('s');
     let mut depth = 0;
@@ -34,7 +34,7 @@ fn valid_component(component: &str) -> bool {
 
 /// The `diskN` container prefix of a valid identifier of any depth, or `None` when the string is
 /// not a well-formed identifier.
-pub(crate) fn container_of(identifier: &str) -> Option<&str> {
+pub fn container_of(identifier: &str) -> Option<&str> {
     identifier_depth(identifier)?;
     let digits = identifier["disk".len()..]
         .bytes()
@@ -43,7 +43,7 @@ pub(crate) fn container_of(identifier: &str) -> Option<&str> {
     Some(&identifier[.."disk".len() + digits])
 }
 
-pub(crate) const DISKUTIL: &str = "/usr/sbin/diskutil";
+pub const DISKUTIL: &str = "/usr/sbin/diskutil";
 
 #[cfg(test)]
 mod tests {

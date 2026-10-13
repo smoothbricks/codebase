@@ -39,7 +39,7 @@ use crate::api::{GitOid, Sha256Digest};
 #[cfg(any(target_os = "macos", test))]
 use crate::error::{CowshedError, Result};
 #[cfg(any(target_os = "macos", test))]
-use crate::fork_lock::Run as _;
+use cowshed_os::fork_lock::Run as _;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

@@ -6,8 +6,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use thiserror::Error;
 
+use cowshed_apfs::image::ImageCapacity;
 use crate::metadata::{
-    GrantSet, ImageCapacity, WorkspaceIncarnation, WorkspaceName, WorkspaceRole,
+    GrantSet, WorkspaceIncarnation, WorkspaceName, WorkspaceRole,
 };
 use crate::repository::RepoId;
 
@@ -976,7 +977,7 @@ where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,
 {
-    tokio::task::spawn_blocking(crate::timing::carried(task)).await
+    tokio::task::spawn_blocking(cowshed_os::timing::carried(task)).await
 }
 
 /// Platform mutation boundary. `acquire` must return only after the lifecycle lock is held.

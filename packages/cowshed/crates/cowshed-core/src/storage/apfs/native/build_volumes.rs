@@ -10,13 +10,14 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use super::{MacOsApfsExecutionHost, io_error};
-use crate::apfs::{ApfsBackend, CommandRunner, DetachIntent, MountAccess};
-use crate::build_volume::nx::Holder;
+use cowshed_apfs::{ApfsBackend, CommandRunner, DetachIntent, MountAccess};
+use cowshed_os::process::Holder;
 use crate::build_volume::{
     BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord, BuildVolumeRole, LinkResolution,
     ReleaseClaim, link,
 };
-use crate::metadata::{ImageCapacity, WorkspaceIncarnation, WorkspaceName};
+use cowshed_apfs::image::ImageCapacity;
+use crate::metadata::{WorkspaceIncarnation, WorkspaceName};
 use crate::storage::apfs::{ApfsExecutionHost, ApfsStorageError};
 use crate::storage::lifecycle::ResizeOutcome;
 
@@ -392,12 +393,12 @@ where
                     .unmount_verified(&attachment, DetachIntent::WhenIdle)
                 {
                     Ok(()) => {}
-                    Err(error) if crate::apfs::detach_was_dissented(&error) => {
+                    Err(error) if cowshed_apfs::detach_was_dissented(&error) => {
                         let open = holders_of(&mount)?;
                         let unmounted = self.backend.unmount_within_grace(&attachment)?;
                         refused = Some(Refusal {
                             open,
-                            forced: unmounted == crate::apfs::Unmounted::Forced,
+                            forced: unmounted == cowshed_apfs::Unmounted::Forced,
                         });
                     }
                     Err(error) => return Err(error.into()),
@@ -638,12 +639,12 @@ impl<'a> MountPoint<'a> {
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
-    use crate::apfs::{
+    use cowshed_apfs::{
         AttachedDiskImage, CommandOutput, CommandRequest, CommandRunError, SystemCommandRunner,
     };
     use crate::api::resources::JobAccounting;
     use crate::build_volume::BuildVolumeRole;
-    use crate::fork_lock::Fenced;
+    use cowshed_os::fork_lock::Fenced;
     use crate::metadata::WorkspaceName;
     use crate::repository::{ProjectPaths, RepoId};
     use crate::storage::apfs::ApfsSubstrateConfig;
@@ -1031,7 +1032,7 @@ mod tests {
     /// A checkout mounted from an image of its own, with its own build volume recorded, linked and
     /// reached through a `target` build-state link: what a job of the checkout runs on.
     struct Lane {
-        attachment: crate::apfs::AttachedImage,
+        attachment: cowshed_apfs::AttachedImage,
         checkout: PathBuf,
         build_id: BuildVolumeId,
         /// The volume `WorkspaceRef::build_volume` names for the checkout.
@@ -1115,7 +1116,7 @@ mod tests {
                 let relative = path.strip_prefix(root).unwrap().to_path_buf();
                 if relative.starts_with(".fseventsd")
                     || relative.starts_with(".Spotlight-V100")
-                    || relative == Path::new(crate::apfs::SPOTLIGHT_OPT_OUT)
+                    || relative == Path::new(cowshed_apfs::SPOTLIGHT_OPT_OUT)
                 {
                     continue;
                 }
@@ -1248,7 +1249,7 @@ mod tests {
 
     /// Run `script` under `/bin/sh` in `cwd`, as a job's command runs, and require it to succeed.
     fn job(cwd: &Path, script: &str) {
-        use crate::fork_lock::Run as _;
+        use cowshed_os::fork_lock::Run as _;
         let status = std::process::Command::new("/bin/sh")
             .arg("-c")
             .arg(script)
@@ -1272,7 +1273,7 @@ mod tests {
     }
 
     fn diskutil(args: &[&str]) -> String {
-        use crate::fork_lock::Run as _;
+        use cowshed_os::fork_lock::Run as _;
         let output = std::process::Command::new("/usr/sbin/diskutil")
             .args(args)
             .output_locked()
@@ -1420,7 +1421,7 @@ mod tests {
     /// and attached afresh after.
     #[test]
     fn real_apfs_release_takes_every_volume_of_an_image_and_its_whole_disk_once() {
-        use crate::apfs::ApfsError;
+        use cowshed_apfs::ApfsError;
         let one_volume_refusal = |error: &ApfsError| {
             matches!(error,
                 ApfsError::InvalidAttachmentInventory(message)
@@ -1492,7 +1493,7 @@ mod tests {
     /// A process group of its own the test leads, standing in for a job's activation or command:
     /// the supervisor samples it like any job group.
     fn lone_group() -> std::process::Child {
-        use crate::fork_lock::Spawn as _;
+        use cowshed_os::fork_lock::Spawn as _;
         use std::os::unix::process::CommandExt as _;
         std::process::Command::new("/bin/sleep")
             .arg("300")

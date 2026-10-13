@@ -246,7 +246,7 @@ pub async fn resolve(
     {
         return Err(Decline::GitEnvironment);
     }
-    let project_span = crate::timing::span("resident", "project");
+    let project_span = cowshed_os::timing::span("resident", "project");
     let root = repository_root(start).ok_or(Decline::NoRepository)?;
     // The invocation root names the project: main's checkout under direct mount, or any mounted
     // workspace, whose marker records that checkout.
@@ -265,7 +265,7 @@ pub async fn resolve(
         return Err(Decline::UnfinishedWork);
     }
     drop(project_span);
-    let journal_span = crate::timing::span("resident", "journal");
+    let journal_span = cowshed_os::timing::span("resident", "journal");
     let journal = crate::storage::recovery::LifecycleIntentJournal::load(
         &project
             .project_root
@@ -281,7 +281,7 @@ pub async fn resolve(
     }
     drop(journal_span);
 
-    let workspace_span = crate::timing::span("resident", "workspace");
+    let workspace_span = cowshed_os::timing::span("resident", "workspace");
     let mount = layout
         .main_aware_workspace_mount(&origin.project_root, workspace)
         .map_err(|_| Decline::Records)?;
@@ -326,7 +326,7 @@ pub async fn resolve(
     let build_volume = build_volume_grant(project, workspace, &mount, probe)?;
     drop(workspace_span);
     let socket = supervisor_socket::socket_path(store_root, &repo, workspace);
-    let hello = crate::timing::spanned("resident", "hello", probe.hello(&socket))
+    let hello = cowshed_os::timing::spanned("resident", "hello", probe.hello(&socket))
         .await
         .map_err(|_| Decline::Unserved)?;
     match crate::runtime::supervisor_manager::standing(&hello.authority, &needed) {
@@ -770,7 +770,7 @@ mod tests {
             BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord, BuildVolumeRole, BuildVolumeState,
             link,
         };
-        use crate::fork_lock::Run as _;
+        use cowshed_os::fork_lock::Run as _;
         let checkout = &store.raven_mount;
         let init = crate::git::git_command_at(checkout)
             .args(["init", "--quiet"])

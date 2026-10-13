@@ -1,6 +1,6 @@
 #![cfg(target_os = "macos")]
 //! The disk-lifecycle lease over a real control socket, asked by the client every disk command
-//! runs inside (`cowshed_core::disk_lease`).
+//! runs inside (`cowshed_apfs::disk_lease`).
 
 use std::num::NonZeroUsize;
 use std::os::unix::fs::PermissionsExt as _;
@@ -12,13 +12,13 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use cowshed_core::apfs::{
+use cowshed_apfs::{
     ApfsBackend, AttachedImage, CreateImageRequest, DetachIntent, MacOsApfsBackend,
     SystemCommandRunner,
 };
-use cowshed_core::disk_lease::leased_at;
-use cowshed_core::fork_lock::Run as _;
-use cowshed_core::metadata::{IMAGE_EXTENSION, ImageCapacity};
+use cowshed_apfs::disk_lease::leased_at;
+use cowshed_os::fork_lock::Run as _;
+use cowshed_apfs::image::{IMAGE_EXTENSION, ImageCapacity};
 use cowshed_gateway::{
     AuditError, AuditEvent, AuditSink, AuthorizedTarget, ConnectError, CredentialError,
     CredentialProvider, CredentialQuery, CredentialRecord, DiskLeaseLimits, Gateway, GatewayConfig,
@@ -457,7 +457,7 @@ async fn contention_attaches_stay_fast_beside_mount_churn_only_under_the_lease()
     let clone = |name: String| {
         let image = images.join(name).with_extension(IMAGE_EXTENSION);
         backend
-            .clone_image(&source, &image, cowshed_core::apfs::ImageCapture::Detached)
+            .clone_image(&source, &image, cowshed_apfs::ImageCapture::Detached)
             .expect("clone");
         image
     };

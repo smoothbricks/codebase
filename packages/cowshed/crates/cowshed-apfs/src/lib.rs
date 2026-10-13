@@ -1,13 +1,22 @@
 //! macOS APFS disk-image substrate.
 //!
 //! Every external operation crosses [`CommandRunner`]. Commands are represented
-//! as an executable plus an argument vector; this module never invokes a shell.
+//! as an executable plus an argument vector; this crate never invokes a shell.
 
-use crate::fork_lock::{Fenced, Spawn as _};
-use crate::host_load::HostLoad;
-use crate::metadata::{IMAGE_EXTENSION, ImageCapacity, is_image_path};
-pub use crate::process::{CommandOutput, ProcessStatus};
-use crate::process::{fmt_command, fmt_command_failure, fmt_command_spawn};
+pub mod attach_budget;
+pub mod device;
+pub mod disk_image_helpers;
+pub mod disk_lease;
+pub mod image;
+pub mod mounts;
+pub mod store_lock;
+pub mod template;
+
+use crate::image::{IMAGE_EXTENSION, ImageCapacity, is_image_path};
+use cowshed_os::fork_lock::{Fenced, Spawn as _};
+use cowshed_os::host_load::HostLoad;
+pub use cowshed_os::process::{CommandOutput, ProcessStatus};
+use cowshed_os::process::{fmt_command, fmt_command_failure, fmt_command_spawn};
 use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::fmt;
@@ -18,8 +27,18 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-use crate::attach_budget;
 use crate::device::{DISKUTIL, container_of, identifier_depth};
+
+// Every real-image fixture in the lib test binary shares one scratch-root protocol: one sweep,
+// one sequence, whichever test attaches the image; and one blank image template.
+#[cfg(all(test, target_os = "macos"))]
+use crate::{mounts::kernel_mounts, store_lock::verify_no_symlinks, template::blank_template};
+#[cfg(all(test, target_os = "macos"))]
+#[path = "../tests/support/blank_image.rs"]
+mod blank_image;
+#[cfg(all(test, target_os = "macos"))]
+#[path = "../tests/support/scratch_apfs.rs"]
+mod scratch_apfs;
 
 /// The disk-image driver's detach interface. Creation and attachment of RAW images use
 /// `diskutil image`; releasing an owned image goes directly through `hdiutil detach`. Which
@@ -38,7 +57,7 @@ pub(crate) const NEWFS_APFS: &str =
     "/System/Library/Filesystems/apfs.fs/Contents/Resources/newfs_apfs";
 
 /// Unix `st_blocks` units: 512 bytes on Darwin. GC allocated-byte accounting reads them.
-pub(crate) const SECTOR_BYTES: u64 = 512;
+pub const SECTOR_BYTES: u64 = 512;
 
 /// `diskutil apfs resizeContainer <ref> 0` asks for grow-to-fit, and macOS reports "there is
 /// nothing to grow into" as a failure rather than a no-op: -69743 when the computed size equals
@@ -73,7 +92,7 @@ pub enum MountAccess {
 }
 
 impl MountAccess {
-    pub(crate) fn from_kernel_flags(flags: u64) -> Self {
+    pub fn from_kernel_flags(flags: u64) -> Self {
         if flags & 0x0000_0001 == 0 {
             Self::ReadWrite
         } else {
@@ -548,7 +567,7 @@ impl CommandRunner for SystemCommandRunner {
 /// there is no outer image header or allocation map to decode.
 #[cfg(target_os = "macos")]
 mod raw {
-    use crate::metadata::ImageCapacity;
+    use crate::image::ImageCapacity;
     use std::fs::{File, OpenOptions};
     use std::io;
     use std::os::unix::fs::OpenOptionsExt;
@@ -595,7 +614,7 @@ mod raw {
             ));
         }
         file.set_len(capacity.bytes())?;
-        crate::fsio::Durability::PowerLoss.sync_file(&file)
+        cowshed_os::fsio::Durability::PowerLoss.sync_file(&file)
     }
 }
 
@@ -613,8 +632,9 @@ fn image_lease_path(identity: &Path) -> io::Result<PathBuf> {
     let uid = unsafe { libc::geteuid() };
     let directory = PathBuf::from(format!("/private/tmp/cowshed-apfs-image-leases-{uid}"));
     private_user_directory(&directory, "APFS image lease directory")?;
-    let digest = crate::api::dto::Sha256Digest::compute(identity.as_os_str().as_encoded_bytes());
-    Ok(directory.join(format!("{}.lock", digest.to_hex())))
+    use sha2::Digest as _;
+    let digest = sha2::Sha256::digest(identity.as_os_str().as_encoded_bytes());
+    Ok(directory.join(format!("{digest:x}.lock")))
 }
 
 /// Create `directory` 0700 unless it exists, and refuse it unless it is a real directory this
@@ -880,7 +900,7 @@ pub(crate) fn record_deferred_image(path: PathBuf) {
 
 /// Drain the images deferred since the last pass, oldest first. The startup pass calls
 /// this once per pass and heals the drained images before the rest.
-pub(crate) fn take_deferred_images() -> Vec<PathBuf> {
+pub fn take_deferred_images() -> Vec<PathBuf> {
     std::mem::take(
         &mut *DEFERRED_IMAGES
             .lock()
@@ -981,21 +1001,21 @@ impl Default for DetachSettleGrace {
     }
 }
 
-/// One backend step inside a [`crate::timing`] span labelled `apfs <leg>/<step>`, so a slow
+/// One backend step inside a [`cowshed_os::timing`] span labelled `apfs <leg>/<step>`, so a slow
 /// lifecycle verb names the storage step that spent the time.
-pub(crate) fn timed_apfs_step<T, E: std::fmt::Display>(
+pub fn timed_apfs_step<T, E: std::fmt::Display>(
     leg: &str,
     step: &'static str,
     operation: impl FnOnce() -> Result<T, E>,
 ) -> Result<T, E> {
-    crate::timing::timed("apfs", format_args!("{leg}/{step}"), operation)
+    cowshed_os::timing::timed("apfs", format_args!("{leg}/{step}"), operation)
 }
 
 /// The leg a backend step serves, derived from the image path it touches: staging state lives
 /// under `.staging` (the same namespace the storage layer calls STAGING_NAMESPACE; this module
 /// cannot name it without a dependency cycle, so the literal is matched here), everything else
 /// is canonical. No signature changes — the trait seams stay intact.
-pub(crate) fn apfs_step_leg(image: &Path) -> &'static str {
+pub fn apfs_step_leg(image: &Path) -> &'static str {
     if image
         .components()
         .any(|component| component.as_os_str() == ".staging")
@@ -1069,44 +1089,30 @@ impl AttachedImage {
     }
 }
 
+/// The authority that names retained inputs: a validated explicit re-adoption record. The
+/// workspace layer implements it for its record; this layer only asks whether a path is named.
+pub trait RetainedInputs {
+    /// Whether this record names `path` as one of the images it retains.
+    fn names(&self, path: &Path) -> bool;
+}
+
 /// A path named by a validated explicit re-adoption record, not another runtime image format.
 /// Ordinary operations still accept only RAW. This token enables identity inspection and
 /// read-only retained attachment, never image creation or growth.
 #[cfg(any(target_os = "macos", test))]
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct RetainedInput<'a> {
+pub struct RetainedInput<'a> {
     path: &'a Path,
 }
 
 #[cfg(any(target_os = "macos", test))]
 impl<'a> RetainedInput<'a> {
-    pub(crate) fn from_record(
-        source: &'a crate::storage::recovery::ReAdoptSource,
-        path: &'a Path,
-    ) -> crate::Result<Self> {
-        source.validate()?;
-        // A missing main retains no main image: only its build inputs can be named.
-        let named = source.main.retained().is_some_and(|image| {
-            path == image.original.as_path() || path == image.retained.as_path()
-        }) || source.build.as_ref().is_some_and(|build| {
-            path == build.image.original.as_path() || path == build.image.retained.as_path()
-        }) || source
-            .old_seeds
-            .iter()
-            .any(|seed| path == seed.original.as_path() || path == seed.retained.as_path());
-        if !named {
-            return Err(crate::CowshedError::integrity(
-                format!(
-                    "{} is not an input named by this re-adoption record",
-                    path.display()
-                ),
-                "keep the source images and repair the replacement record",
-            ));
-        }
-        Ok(Self { path })
+    /// `path` as a retained input, or `None` when `record` does not name it.
+    pub fn named_by(record: &impl RetainedInputs, path: &'a Path) -> Option<Self> {
+        record.names(path).then_some(Self { path })
     }
 
-    pub(crate) fn path(&self) -> &'a Path {
+    pub fn path(&self) -> &'a Path {
         self.path
     }
 }
@@ -1115,11 +1121,11 @@ impl<'a> RetainedInput<'a> {
 /// attachment; callers use its read-only mount and non-forced release methods.
 #[cfg(any(target_os = "macos", test))]
 #[derive(Debug)]
-pub(crate) struct RetainedAttachment(AttachedImage);
+pub struct RetainedAttachment(AttachedImage);
 
 #[cfg(any(target_os = "macos", test))]
 impl RetainedAttachment {
-    pub(crate) fn volume_device(&self) -> &str {
+    pub fn volume_device(&self) -> &str {
         self.0.volume_device()
     }
 }
@@ -1139,7 +1145,7 @@ fn one_line(output: &[u8]) -> String {
 }
 
 /// The exact image mapping may be a just-created whole device or a formatted APFS attachment.
-pub(crate) enum RecoveredImageAttachment {
+pub enum RecoveredImageAttachment {
     Unformatted {
         image: PathBuf,
         whole_device: String,
@@ -1148,7 +1154,7 @@ pub(crate) enum RecoveredImageAttachment {
 }
 
 impl RecoveredImageAttachment {
-    pub(crate) fn whole_device(&self) -> &str {
+    pub fn whole_device(&self) -> &str {
         match self {
             Self::Unformatted { whole_device, .. } => whole_device,
             Self::Apfs(attachment) => &attachment.whole_device,
@@ -1400,7 +1406,7 @@ pub enum ApfsError {
     CaptureSourceBusy {
         image: PathBuf,
         mount_point: PathBuf,
-        holders: Vec<crate::build_volume::nx::Holder>,
+        holders: Vec<cowshed_os::process::Holder>,
         refusal: Box<ApfsError>,
     },
 }
@@ -1812,7 +1818,7 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
 
     /// Remove an owned volume from the filesystem namespace before releasing its image.
     /// The raw IOMedia pin freezes the device identity while native unmount bypasses DA.
-    pub(crate) fn unmount_verified(
+    pub fn unmount_verified(
         &self,
         attachment: &AttachedImage,
         intent: DetachIntent,
@@ -1822,7 +1828,7 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
 
     /// [`Self::unmount_verified`] with `Release`, answering whether the grace ran out and the
     /// unmount was forced past whatever still held the volume.
-    pub(crate) fn unmount_within_grace(
+    pub fn unmount_within_grace(
         &self,
         attachment: &AttachedImage,
     ) -> Result<Unmounted, ApfsError> {
@@ -1900,7 +1906,7 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
 
     /// Read the attachment inventory for this exact path without constraining its image format.
     /// Creation and ordinary runtime attachment still validate the format.
-    pub(crate) fn attached_whole_devices(
+    pub fn attached_whole_devices(
         &self,
         image: &Path,
     ) -> Result<BTreeSet<String>, ApfsError> {
@@ -1916,7 +1922,7 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
     /// attachment devices, and `hdiutil info -plist` truncates its list while other images
     /// attach or detach, so only the I/O Registry answers both presence and absence.
     fn attached_disk_images(&self) -> Result<Vec<AttachedDiskImage>, ApfsError> {
-        crate::timing::timed(
+        cowshed_os::timing::timed(
             "apfs-inventory",
             format_args!("attached disk images"),
             || {
@@ -2013,7 +2019,7 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
         operation: &'static str,
         request: CommandRequest,
     ) -> Result<CommandOutput, ApfsError> {
-        crate::timing::timed("apfs-command", format_args!("{operation}"), || {
+        cowshed_os::timing::timed("apfs-command", format_args!("{operation}"), || {
             let output = self.runner.run(&request)?;
             if output.succeeded() {
                 Ok(output)
@@ -2307,7 +2313,7 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
     /// This never attaches a second device. An absent mapping returns `None`; more than one
     /// mapping is ambiguous and fails closed. The caller decides whether an unmounted survivor
     /// must be detached and verified afresh before use.
-    pub(crate) fn existing_attachment(
+    pub fn existing_attachment(
         &self,
         image: &Path,
     ) -> Result<Option<AttachedImage>, ApfsError> {
@@ -2325,7 +2331,7 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
 
     /// Resolve a mount's existing attachment under its image lease and hand the raw pin to
     /// mount. A reseed may have replaced the device while the lease was being awaited.
-    pub(crate) fn existing_attachment_for_mount(
+    pub fn existing_attachment_for_mount(
         &self,
         image: &Path,
     ) -> Result<Option<AttachedImage>, ApfsError> {
@@ -2340,7 +2346,7 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
         Ok(Some(attachment))
     }
 
-    pub(crate) fn recovered_image_attachment(
+    pub fn recovered_image_attachment(
         &self,
         image: &Path,
     ) -> Result<Option<RecoveredImageAttachment>, ApfsError> {
@@ -2359,7 +2365,7 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
 
     /// The backing file of every attached disk image, each once, by the path its attach was
     /// handed. A file deleted since is still listed: the kernel keeps the path it registered.
-    pub(crate) fn attached_image_files(&self) -> Result<BTreeSet<PathBuf>, ApfsError> {
+    pub fn attached_image_files(&self) -> Result<BTreeSet<PathBuf>, ApfsError> {
         Ok(self
             .attached_disk_images()?
             .into_iter()
@@ -2378,7 +2384,7 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
     /// the container holds. Nothing here unmounts first: a mounted volume's caller unmounts it
     /// ([`Self::unmount_released`]), and an unmounted one, such as a template's staging image,
     /// has nothing to unmount.
-    pub(crate) fn release_every_attachment(
+    pub fn release_every_attachment(
         &self,
         image: &Path,
         intent: DetachIntent,
@@ -2399,7 +2405,7 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
     /// attachment's container whose device is in `mounted` (the kernel's mount sources) is
     /// unmounted through its own pinned identity ([`Self::unmount_released`]), then every whole
     /// device is detached once ([`Self::release_every_attachment`]), taking the unmounted rest.
-    pub(crate) fn release_image(
+    pub fn release_image(
         &self,
         image: &Path,
         mounted: &BTreeSet<String>,
@@ -2541,7 +2547,7 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
     }
 
     #[cfg(target_os = "macos")]
-    pub(crate) fn existing_retained_attachment(
+    pub fn existing_retained_attachment(
         &self,
         input: &RetainedInput<'_>,
     ) -> Result<Option<RetainedAttachment>, ApfsError> {
@@ -2561,7 +2567,7 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
     }
 
     #[cfg(any(target_os = "macos", test))]
-    pub(crate) fn attach_retained_verified(
+    pub fn attach_retained_verified(
         &self,
         input: &RetainedInput<'_>,
     ) -> Result<RetainedAttachment, ApfsError> {
@@ -2570,7 +2576,7 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
     }
 
     #[cfg(target_os = "macos")]
-    pub(crate) fn mount_retained_read_only(
+    pub fn mount_retained_read_only(
         &self,
         attachment: &RetainedAttachment,
         mount: &Path,
@@ -2579,7 +2585,7 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
     }
 
     #[cfg(target_os = "macos")]
-    pub(crate) fn unmount_retained_when_idle(
+    pub fn unmount_retained_when_idle(
         &self,
         attachment: &RetainedAttachment,
     ) -> Result<(), ApfsError> {
@@ -2587,7 +2593,7 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
     }
 
     #[cfg(target_os = "macos")]
-    pub(crate) fn detach_retained_when_idle(
+    pub fn detach_retained_when_idle(
         &self,
         attachment: &RetainedAttachment,
     ) -> Result<(), ApfsError> {
@@ -2644,13 +2650,13 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
         args.push(OsString::from(target));
         let started = std::time::Instant::now();
         let request = CommandRequest::new(HDIUTIL, args);
-        crate::timing::attribute(
+        cowshed_os::timing::attribute(
             "apfs-command",
             format_args!("detach image"),
             "image",
             image.display(),
         );
-        let result = crate::timing::timed("apfs-command", format_args!("detach image"), || {
+        let result = cowshed_os::timing::timed("apfs-command", format_args!("detach image"), || {
             let output = self.runner.run_guarded(&request, || {
                 let held = self.attached_whole_devices(image)?;
                 if held.is_empty() {
@@ -2682,7 +2688,7 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
             Ok(None) | Err(_) => None,
         };
         if let Some((key, stderr)) = account {
-            crate::timing::attribute(
+            cowshed_os::timing::attribute(
                 "apfs-command",
                 format_args!("detach image"),
                 key,
@@ -3023,7 +3029,7 @@ impl<R: CommandRunner, S: Sleeper> ApfsBackend for MacOsApfsBackend<R, S> {
             ],
         );
         // Timed like every other disk-tool call: `resizeContainer` queues on storagekitd too.
-        crate::timing::timed("apfs-command", format_args!("grow APFS container"), || {
+        cowshed_os::timing::timed("apfs-command", format_args!("grow APFS container"), || {
             let output = self.runner.run(&request)?;
             if output.succeeded() || container_already_spans_image(&output) {
                 Ok(())
@@ -3192,7 +3198,7 @@ fn attachment_capacity(
 ///
 /// The image driver reports EBUSY plus its resource-busy diagnostic. Anything else — a bad
 /// device, a missing tool, a spawn failure — is not a dissent and must not be waited on.
-pub(crate) fn detach_was_dissented(error: &ApfsError) -> bool {
+pub fn detach_was_dissented(error: &ApfsError) -> bool {
     if let ApfsError::CaptureSourceBusy { refusal, .. } = error {
         return detach_was_dissented(refusal);
     }
@@ -3532,7 +3538,7 @@ pub(crate) struct ReleaseView {
 }
 
 impl ReleaseView {
-    pub(crate) fn whole_device(&self) -> &str {
+    pub fn whole_device(&self) -> &str {
         &self.whole_device
     }
 
@@ -4031,7 +4037,7 @@ fn classify_clone_error(source: &Path, destination: &Path, error: io::Error) -> 
 /// Mount state is deliberately absent: the kernel mount table is the mount authority.
 #[cfg(any(target_os = "macos", test))]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct RegisteredApfsContainer {
+pub struct RegisteredApfsContainer {
     /// The container's synthesized whole disk as a bare BSD name, e.g. `disk3`.
     pub reference: String,
     /// The `Size` of that `AppleAPFSMedia`: the ceiling every volume in it shares.
@@ -4043,7 +4049,7 @@ pub(crate) struct RegisteredApfsContainer {
 /// One `AppleAPFSVolume` the kernel has published as a BSD device.
 #[cfg(any(target_os = "macos", test))]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct RegisteredApfsVolume {
+pub struct RegisteredApfsVolume {
     /// The volume's `FullName`.
     pub name: String,
     /// The volume's bare BSD name, e.g. `disk3s8`, always a slice of its container's reference.
@@ -4062,7 +4068,7 @@ pub(crate) struct RegisteredApfsVolume {
 }
 
 #[cfg(target_os = "macos")]
-pub(crate) use io_registry::registered_apfs_containers;
+pub use io_registry::registered_apfs_containers;
 #[cfg(target_os = "macos")]
 pub(crate) use io_registry::{disk_image_class_counts, disk_image_user_client_creators};
 
@@ -4267,7 +4273,7 @@ mod io_registry {
         ApfsMediaFacts, ApfsVolumeFacts, AttachedDiskImage, DiskImageSource, ImageMedia,
         RegisteredApfsContainer, project_registered_apfs,
     };
-    use crate::metadata::ImageCapacity;
+    use crate::image::ImageCapacity;
     use std::collections::BTreeMap;
     use std::collections::btree_map::Entry;
     use std::ffi::{CStr, c_char, c_void};
@@ -4572,7 +4578,7 @@ mod io_registry {
     /// whose provider chain has already left the plane, or whose entries the kernel finalizes
     /// mid-read, is departing and is not; any other read failure fails the whole inventory,
     /// which [`super::project_registered_apfs`] validates.
-    pub(crate) fn registered_apfs_containers() -> io::Result<Vec<RegisteredApfsContainer>> {
+    pub fn registered_apfs_containers() -> io::Result<Vec<RegisteredApfsContainer>> {
         let keys = ApfsKeys {
             bsd_name: key("BSD Name")?,
             size: key("Size")?,
@@ -5199,11 +5205,11 @@ mod tests {
     impl CommandRunner for RecordingRunner {
         fn run_guarded<E>(
             &self,
-            request: &crate::apfs::CommandRequest,
+            request: &crate::CommandRequest,
             check: impl FnOnce() -> Result<bool, E>,
-        ) -> Result<Option<crate::apfs::CommandOutput>, E>
+        ) -> Result<Option<crate::CommandOutput>, E>
         where
-            E: From<crate::apfs::CommandRunError> + std::fmt::Display,
+            E: From<crate::CommandRunError> + std::fmt::Display,
         {
             if check()? {
                 self.run(request).map(Some).map_err(E::from)
@@ -5393,25 +5399,26 @@ mod tests {
         )])
     }
 
+    /// A re-adoption record that names exactly one retained input.
+    struct NamesOne(PathBuf);
+
+    impl RetainedInputs for NamesOne {
+        fn names(&self, path: &Path) -> bool {
+            path == self.0
+        }
+    }
+
     /// One command-contract walk covers strict recorded input selection, readonly attach and
-    /// fsck, then a retained-source cleanup dissent that must never escalate to force.
+    /// fsck, then a retained-source cleanup dissent that must never escalate to force. That the
+    /// workspace layer's re-adoption record names exactly its retained images is its own test.
     #[test]
     fn retained_inputs_are_record_bound_read_only_and_never_forced() {
-        use crate::storage::recovery::re_adopt_tests::Fixture;
-
-        let fixture = Fixture::new();
-        let mut source = fixture.source(Some(fixture.build()));
-        let crate::storage::recovery::ReAdoptMain::Retained(image) = &mut source.main else {
-            panic!("the fixture retains main's image")
-        };
-        image.original.set_extension("asif");
-        image.retained.set_extension("asif");
-        let retained = image.retained.clone();
+        let retained = temp_path("retained-input", "asif");
         fs::create_dir_all(retained.parent().unwrap()).unwrap();
-        let input = RetainedInput::from_record(&source, &retained).unwrap();
+        let record = NamesOne(retained.clone());
+        let input = RetainedInput::named_by(&record, &retained).expect("the record names it");
         let unrelated = retained.with_file_name("unrecorded.asif");
-        let refused = RetainedInput::from_record(&source, &unrelated).unwrap_err();
-        assert_eq!(refused.code, crate::ErrorCode::Integrity);
+        assert!(RetainedInput::named_by(&record, &unrelated).is_none());
         assert!(
             matches!(
                 validate_image_path(input.path()),
@@ -5522,11 +5529,11 @@ mod tests {
     impl CommandRunner for StatefulMalformedAttachRunner {
         fn run_guarded<E>(
             &self,
-            request: &crate::apfs::CommandRequest,
+            request: &crate::CommandRequest,
             check: impl FnOnce() -> Result<bool, E>,
-        ) -> Result<Option<crate::apfs::CommandOutput>, E>
+        ) -> Result<Option<crate::CommandOutput>, E>
         where
-            E: From<crate::apfs::CommandRunError> + std::fmt::Display,
+            E: From<crate::CommandRunError> + std::fmt::Display,
         {
             if check()? {
                 self.run(request).map(Some).map_err(E::from)
@@ -7015,7 +7022,7 @@ mod tests {
                 .clone_image(
                     Path::new(source),
                     Path::new(destination),
-                    crate::apfs::ImageCapture::Detached,
+                    crate::ImageCapture::Detached,
                 )
                 .unwrap_err();
             assert!(matches!(
@@ -7027,7 +7034,7 @@ mod tests {
         let source = temp_path("validated-missing-source", IMAGE_EXTENSION);
         let destination = temp_path("validated-missing-destination", IMAGE_EXTENSION);
         let error = backend
-            .clone_image(&source, &destination, crate::apfs::ImageCapture::Detached)
+            .clone_image(&source, &destination, crate::ImageCapture::Detached)
             .unwrap_err();
         #[cfg(target_os = "macos")]
         assert!(matches!(error, CloneFileError::Io { .. }));
@@ -7554,11 +7561,11 @@ mod tests {
     impl CommandRunner for PinWitness {
         fn run_guarded<E>(
             &self,
-            request: &crate::apfs::CommandRequest,
+            request: &crate::CommandRequest,
             check: impl FnOnce() -> Result<bool, E>,
-        ) -> Result<Option<crate::apfs::CommandOutput>, E>
+        ) -> Result<Option<crate::CommandOutput>, E>
         where
-            E: From<crate::apfs::CommandRunError> + std::fmt::Display,
+            E: From<crate::CommandRunError> + std::fmt::Display,
         {
             if check()? {
                 self.run(request).map(Some).map_err(E::from)
@@ -7648,11 +7655,11 @@ mod tests {
     impl CommandRunner for ReseedBeforeMount {
         fn run_guarded<E>(
             &self,
-            request: &crate::apfs::CommandRequest,
+            request: &crate::CommandRequest,
             check: impl FnOnce() -> Result<bool, E>,
-        ) -> Result<Option<crate::apfs::CommandOutput>, E>
+        ) -> Result<Option<crate::CommandOutput>, E>
         where
-            E: From<crate::apfs::CommandRunError> + std::fmt::Display,
+            E: From<crate::CommandRunError> + std::fmt::Display,
         {
             if check()? {
                 self.run(request).map(Some).map_err(E::from)
@@ -8160,7 +8167,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn real_apfs_fixture_runs_leave_nothing_attached_or_running_however_they_end() {
-        use crate::fork_lock::Spawn;
+        use cowshed_os::fork_lock::Spawn;
         use std::io::{BufRead, BufReader};
         use std::os::unix::process::ExitStatusExt;
         use std::process::{Child, Command, Stdio};
@@ -8173,7 +8180,7 @@ mod tests {
             let mut child = Command::new(std::env::current_exe().expect("test binary"))
                 .args([
                     "--exact",
-                    "apfs::tests::real_apfs_fixture_run_ended_by_its_parent",
+                    "tests::real_apfs_fixture_run_ended_by_its_parent",
                     "--ignored",
                     "--nocapture",
                 ])
@@ -8244,7 +8251,7 @@ mod tests {
                 );
                 assert!(!image.exists(), "{ending}: {} remains", image.display());
             }
-            let left = crate::scratch_apfs::processes_in(|cwd| cwd.starts_with(&root))
+            let left = crate::scratch_apfs::processes::processes_in(|cwd| cwd.starts_with(&root))
                 .expect("list the processes working under the run's root");
             assert_eq!(left, [], "{ending}: worker {worker} outlived its run");
             assert!(!root.exists(), "{ending}: {} remains", root.display());
@@ -8283,7 +8290,7 @@ mod tests {
         let mut child = Command::new(std::env::current_exe().expect("test binary"))
             .args([
                 "--exact",
-                "apfs::tests::real_apfs_disk_image_attach_outliving_a_killed_caller",
+                "tests::real_apfs_disk_image_attach_outliving_a_killed_caller",
                 "--ignored",
                 "--nocapture",
             ])
@@ -8306,7 +8313,7 @@ mod tests {
         assert!(inflight, "the caller's attach never came in flight");
         // The tree-killer's two strokes: SIGTERM to every process working in the root
         // (the disk-image child among them, which ignores it), SIGKILL to the caller.
-        for (pid, _) in crate::scratch_apfs::processes_in(|cwd| cwd.starts_with(root.path()))
+        for (pid, _) in crate::scratch_apfs::processes::processes_in(|cwd| cwd.starts_with(root.path()))
             .expect("list the caller's tree")
         {
             // SAFETY: kill only names a process; a pid gone since the listing reports ESRCH.
@@ -8395,7 +8402,7 @@ mod tests {
         let watched = root.clone();
         std::thread::spawn(move || {
             loop {
-                let found = crate::scratch_apfs::processes_in(|cwd| cwd.starts_with(&watched))
+                let found = crate::scratch_apfs::processes::processes_in(|cwd| cwd.starts_with(&watched))
                     .is_ok_and(|found| {
                         found.iter().any(|(pid, _)| {
                             let mut path = [0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
@@ -8495,7 +8502,7 @@ mod tests {
             clippy::zombie_processes,
             reason = "the worker must outlive this run; the scratch root or the next sweep ends it"
         )]
-        let worker = crate::fork_lock::Spawn::spawn_locked(
+        let worker = cowshed_os::fork_lock::Spawn::spawn_locked(
             std::process::Command::new("/bin/sleep")
                 .arg("600")
                 .current_dir(root.path())
@@ -8987,11 +8994,11 @@ mod tests {
         impl CommandRunner for LeaseProbe {
             fn run_guarded<E>(
                 &self,
-                request: &crate::apfs::CommandRequest,
+                request: &crate::CommandRequest,
                 check: impl FnOnce() -> Result<bool, E>,
-            ) -> Result<Option<crate::apfs::CommandOutput>, E>
+            ) -> Result<Option<crate::CommandOutput>, E>
             where
-                E: From<crate::apfs::CommandRunError> + std::fmt::Display,
+                E: From<crate::CommandRunError> + std::fmt::Display,
             {
                 if check()? {
                     self.run(request).map(Some).map_err(E::from)
@@ -9179,7 +9186,7 @@ mod tests {
         let source = temp_path("missing-clone-source", IMAGE_EXTENSION);
         let destination = temp_path("missing-clone-destination", IMAGE_EXTENSION);
         let error = MacOsApfsBackend::new(RecordingRunner::default())
-            .clone_image(&source, &destination, crate::apfs::ImageCapture::Detached)
+            .clone_image(&source, &destination, crate::ImageCapture::Detached)
             .unwrap_err();
         #[cfg(target_os = "macos")]
         assert!(matches!(error, CloneFileError::Io { .. }));
@@ -9248,7 +9255,7 @@ mod tests {
         let attached = lock_as_attached(&source).unwrap();
 
         let error = MacOsApfsBackend::new(RecordingRunner::default())
-            .clone_image(&source, &destination, crate::apfs::ImageCapture::Detached)
+            .clone_image(&source, &destination, crate::ImageCapture::Detached)
             .unwrap_err();
         assert!(
             matches!(&error, CloneFileError::SourceAttached { source: refused } if *refused == source),
@@ -9313,7 +9320,7 @@ mod tests {
         std::os::unix::fs::symlink(&target, &source).unwrap();
 
         let error = MacOsApfsBackend::new(RecordingRunner::default())
-            .clone_image(&source, &destination, crate::apfs::ImageCapture::Detached)
+            .clone_image(&source, &destination, crate::ImageCapture::Detached)
             .unwrap_err();
         assert!(
             matches!(&error, CloneFileError::Io { source, .. } if source.raw_os_error() == Some(libc::ELOOP)),

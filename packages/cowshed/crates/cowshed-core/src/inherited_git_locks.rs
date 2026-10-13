@@ -122,7 +122,7 @@ fn inspect_error(path: &Path, source: &io::Error) -> CowshedError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fork_lock::Run as _;
+    use cowshed_os::fork_lock::Run as _;
     use std::path::PathBuf;
     use std::process::Command;
 

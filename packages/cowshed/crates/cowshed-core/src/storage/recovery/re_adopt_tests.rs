@@ -20,7 +20,7 @@ use crate::ErrorCode;
 use crate::api::GitOid;
 use crate::api::dto::{AdoptOptions, RemoveReport};
 use crate::build_volume::{BuildVolumeId, BuildVolumeRecord, BuildVolumeRole};
-use crate::fork_lock::Run as _;
+use cowshed_os::fork_lock::Run as _;
 use crate::git_preservation::{self, GitPreservationSnapshot};
 use crate::metadata::{
     DetachedWorkspaceMetadata, GrantSet, MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE, Platform, PortBlock,
@@ -301,6 +301,25 @@ fn begin_and_mark_mutating(journal: &Path, intent: LifecycleIntent) {
     .expect("record ReAdopt intent before its first mutation");
     LifecycleIntentJournal::update(journal, |state| state.mark_mutating(&WorkspaceName::main()))
         .expect("mark ReAdopt intent mutating");
+}
+
+#[test]
+fn retained_input_refuses_an_unrecorded_path() {
+    let fixture = Fixture::new();
+    let source = fixture.source(Some(fixture.build()));
+    source.validate().expect("valid retained source record");
+    let main = source.main.retained().expect("retained main");
+    let build = source.build.as_ref().expect("retained build");
+    for path in [&main.original, &main.retained, &build.image.original, &build.image.retained]
+        .into_iter()
+        .chain(source.old_seeds.iter().flat_map(|seed| [&seed.original, &seed.retained]))
+    {
+        source.retained_input(path).expect("recorded original and retained paths are inputs");
+    }
+    let unrecorded = fixture.project.join("unrecorded.dmg");
+    let error = source.retained_input(&unrecorded).expect_err("an unrecorded image is not an input");
+    assert_eq!(error.code, ErrorCode::Integrity);
+    assert!(error.message.contains("is not an input named by this re-adoption record"));
 }
 
 #[test]

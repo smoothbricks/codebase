@@ -828,6 +828,14 @@ function filterUnion(filters: readonly string[]): string | null {
 export const SERIAL_TEST_GROUP_PLATFORM = 'cfg(target_os="macos")';
 
 /**
+ * Which workspace members a serial group's filter can select tests from: exactly the named
+ * packages when every clause of the filter is scoped to one, otherwise every member.
+ */
+export type SerialTestGroupScope =
+  | { readonly kind: 'packages'; readonly packages: readonly string[] }
+  | { readonly kind: 'workspace' };
+
+/**
  * One nextest test group capped at a single thread, and the tests its overrides
  * assign it.
  */
@@ -836,6 +844,8 @@ export interface SerialTestGroup {
   group: string;
   /** Every default-profile override filter that names the group, as one filterset. */
   filter: string;
+  /** The members the filter can select from, which are the members whose sources its runner hashes. */
+  scope: SerialTestGroupScope;
 }
 
 /**
@@ -891,8 +901,84 @@ export function serialTestGroups(nextestConfigPath: string): SerialTestGroup[] {
       }
     }
     const filter = filterUnion(filters);
-    return filter === null ? [] : [{ group, filter }];
+    return filter === null ? [] : [{ group, filter, scope: filterScope(filter) }];
   });
+}
+
+/**
+ * The packages `filter` can select tests from, read off its `package(<name>)` predicates.
+ *
+ * A filterset is a union of clauses; a clause is scoped when its first operand — the one `and`,
+ * `&` and `-` all keep positive — is `package(<name>)` or `package(=<name>)`, or a parenthesised
+ * filter that is itself scoped. Whatever the operators' precedence, a scoped clause selects only
+ * from its package, so the union of the clauses' packages bounds the whole selection. Anything
+ * else — an unscoped clause, a glob name, unbalanced parentheses — can select from every member,
+ * and the scope is the workspace: never narrower than what the filter can select.
+ */
+export function filterScope(filter: string): SerialTestGroupScope {
+  const packages = scopedPackages(filter);
+  return packages === null
+    ? { kind: 'workspace' }
+    : { kind: 'packages', packages: [...packages].sort((left, right) => left.localeCompare(right)) };
+}
+
+function scopedPackages(filter: string): Set<string> | null {
+  const clauses = splitTopLevel(filter, [' or ', ' | ']);
+  if (clauses === null) return null;
+  const packages = new Set<string>();
+  for (const clause of clauses) {
+    const operands = splitTopLevel(clause.trim(), [' and ', ' & ', ' - ']);
+    const first = operands?.[0]?.trim();
+    if (first === undefined) return null;
+    const inner = unwrapParentheses(first);
+    if (inner !== null) {
+      const nested = scopedPackages(inner);
+      if (nested === null) return null;
+      for (const name of nested) packages.add(name);
+      continue;
+    }
+    const named = /^package\(=?([A-Za-z0-9_-]+)\)$/.exec(first)?.[1];
+    if (named === undefined) return null;
+    packages.add(named);
+  }
+  return packages;
+}
+
+/** `text` split at each of `operators` outside parentheses, or null when its parentheses do not balance. */
+function splitTopLevel(text: string, operators: readonly string[]): string[] | null {
+  const parts: string[] = [];
+  let depth = 0;
+  let start = 0;
+  let index = 0;
+  while (index < text.length) {
+    const character = text[index];
+    if (character === '(') depth += 1;
+    if (character === ')') depth -= 1;
+    if (depth < 0) return null;
+    const operator = depth === 0 ? operators.find((candidate) => text.startsWith(candidate, index)) : undefined;
+    if (operator === undefined) {
+      index += 1;
+      continue;
+    }
+    parts.push(text.slice(start, index));
+    index += operator.length;
+    start = index;
+  }
+  if (depth !== 0) return null;
+  parts.push(text.slice(start));
+  return parts;
+}
+
+/** The filter inside `text` when one pair of parentheses encloses all of it, else null. */
+function unwrapParentheses(text: string): string | null {
+  if (!text.startsWith('(') || !text.endsWith(')')) return null;
+  let depth = 0;
+  for (let index = 0; index < text.length; index += 1) {
+    if (text[index] === '(') depth += 1;
+    if (text[index] === ')') depth -= 1;
+    if (depth === 0 && index < text.length - 1) return null;
+  }
+  return text.slice(1, -1);
 }
 
 /** The plugin's nextest.toml as the workspace root's `node_modules` links it. */

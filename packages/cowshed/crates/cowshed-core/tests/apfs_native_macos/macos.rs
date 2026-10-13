@@ -8,26 +8,29 @@ use std::time::{Duration, Instant, SystemTime};
 
 use rcgen::{KeyPair, PKCS_ECDSA_P256_SHA256};
 
-use cowshed_core::apfs::{
+use cowshed_apfs::{
     ApfsBackend, ApfsError, AttachedDiskImage, AttachedImage, CommandOutput, CommandRequest,
     CommandRunError, CommandRunner, DetachIntent, DiskImageSource, ImageCapture, MacOsApfsBackend,
     MountAccess, SystemCommandRunner,
 };
-use cowshed_core::attach_budget;
-use cowshed_core::fork_lock::{Fenced, Spawn as _};
+use cowshed_apfs::attach_budget;
+use cowshed_os::fork_lock::{Fenced, Spawn as _};
+use cowshed_apfs::image::ImageCapacity;
+use cowshed_apfs::mounts::KernelMountSnapshot;
+use cowshed_apfs::store_lock::LockMode;
+use cowshed_apfs::template::{blank_template, blank_template_path, blank_template_staged_stem};
 use cowshed_core::metadata::{
-    DetachedWorkspaceMetadata, GrantSet, ImageCapacity, MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE,
+    DetachedWorkspaceMetadata, GrantSet, MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE,
     Platform, PortBlock, PublicationState, SIDECAR_VERSION, WorkspaceIncarnation,
     WorkspaceInfoSnapshot, WorkspaceName, WorkspaceRole, sidecar_path,
 };
 use cowshed_core::repository::{OwnedRepoIds, RepoId};
 use cowshed_core::storage::apfs::native::{
-    KernelMountSnapshot, KernelMountSource, MacOsApfsExecutionHost, RecoveryMarkerSource,
-    RestoreFailpoint, SystemKernelMountSource, blank_template, blank_template_path,
-    blank_template_staged_stem,
+    KernelMountSource, MacOsApfsExecutionHost, RecoveryMarkerSource,
+    RestoreFailpoint, SystemKernelMountSource,
 };
 use cowshed_core::storage::apfs::{
-    ApfsExecutionHost, ApfsStorageError, ApfsSubstrateConfig, Labelled, LockMode,
+    ApfsExecutionHost, ApfsStorageError, ApfsSubstrateConfig, Labelled,
     MarkerExpectation, MetadataPolicy,
 };
 use cowshed_core::storage::lifecycle::{
@@ -37,11 +40,11 @@ use cowshed_core::storage::lifecycle::{
 use cowshed_core::storage::{CheckpointLabel, StorageLayout, StorageLayoutError};
 use cowshed_core::workspace_credentials::mint_workspace_credentials;
 
-#[path = "../support/blank_image.rs"]
+#[path = "../../../cowshed-apfs/tests/support/blank_image.rs"]
 mod blank_image;
 #[path = "../support/fsevents.rs"]
 mod fsevents;
-#[path = "../support/scratch_apfs.rs"]
+#[path = "../../../cowshed-apfs/tests/support/scratch_apfs.rs"]
 mod scratch_apfs;
 
 use scratch_apfs::ScratchRoot;
@@ -144,11 +147,11 @@ impl RecordingRunner {
 impl CommandRunner for RecordingRunner {
     fn run_guarded<E>(
         &self,
-        request: &cowshed_core::apfs::CommandRequest,
+        request: &cowshed_apfs::CommandRequest,
         check: impl FnOnce() -> Result<bool, E>,
-    ) -> Result<Option<cowshed_core::apfs::CommandOutput>, E>
+    ) -> Result<Option<cowshed_apfs::CommandOutput>, E>
     where
-        E: From<cowshed_core::apfs::CommandRunError> + std::fmt::Display,
+        E: From<cowshed_apfs::CommandRunError> + std::fmt::Display,
     {
         if check()? {
             self.run(request).map(Some).map_err(E::from)
@@ -211,11 +214,11 @@ struct UnreadableFirstInventoryRunner(AtomicUsize);
 impl CommandRunner for UnreadableFirstInventoryRunner {
     fn run_guarded<E>(
         &self,
-        request: &cowshed_core::apfs::CommandRequest,
+        request: &cowshed_apfs::CommandRequest,
         check: impl FnOnce() -> Result<bool, E>,
-    ) -> Result<Option<cowshed_core::apfs::CommandOutput>, E>
+    ) -> Result<Option<cowshed_apfs::CommandOutput>, E>
     where
-        E: From<cowshed_core::apfs::CommandRunError> + std::fmt::Display,
+        E: From<cowshed_apfs::CommandRunError> + std::fmt::Display,
     {
         if check()? {
             self.run(request).map(Some).map_err(E::from)
@@ -2536,7 +2539,7 @@ fn real_apfs_rename_names_the_pinned_device_and_skips_what_is_not_mounted() {
     let image = layout.main_image().expect("image");
     fixture.published_image(image.image());
     let host = fixture.host();
-    let host_data = cowshed_core::apfs::volume_name(Path::new("/System/Volumes/Data"))
+    let host_data = cowshed_apfs::volume_name(Path::new("/System/Volumes/Data"))
         .expect("the host's Data volume name");
     let label = "[cowshed] fixture · intents — main";
 
@@ -2546,7 +2549,7 @@ fn real_apfs_rename_names_the_pinned_device_and_skips_what_is_not_mounted() {
     let refused_mount = fixture.root().join("mount").join("slotted");
     std::fs::create_dir_all(&refused_mount).expect("an empty mountpoint");
     let holding_volume =
-        cowshed_core::apfs::volume_name(&refused_mount).expect("the volume holding it");
+        cowshed_apfs::volume_name(&refused_mount).expect("the volume holding it");
     assert_eq!(
         host.label_image_volume(slotted.image(), label)
             .expect("a refused create is a typed skip"),
@@ -2557,7 +2560,7 @@ fn real_apfs_rename_names_the_pinned_device_and_skips_what_is_not_mounted() {
         "a mountpoint is no image under the store"
     );
     assert_eq!(
-        cowshed_core::apfs::volume_name(&refused_mount).expect("the volume holding it"),
+        cowshed_apfs::volume_name(&refused_mount).expect("the volume holding it"),
         holding_volume,
         "the volume holding the empty mountpoint keeps its name"
     );
@@ -2598,7 +2601,7 @@ fn real_apfs_rename_names_the_pinned_device_and_skips_what_is_not_mounted() {
         Labelled::Renamed
     );
     assert_eq!(
-        cowshed_core::apfs::volume_name(&mount).expect("the renamed volume's name"),
+        cowshed_apfs::volume_name(&mount).expect("the renamed volume's name"),
         label
     );
     assert_eq!(
@@ -2607,7 +2610,7 @@ fn real_apfs_rename_names_the_pinned_device_and_skips_what_is_not_mounted() {
         Labelled::Already
     );
     assert_eq!(
-        cowshed_core::apfs::volume_name(Path::new("/System/Volumes/Data"))
+        cowshed_apfs::volume_name(Path::new("/System/Volumes/Data"))
             .expect("the host's Data volume name"),
         host_data,
         "the host's Data volume keeps its name"
@@ -2861,11 +2864,11 @@ struct UnformattedAttachment {
 impl CommandRunner for UnformattedAttachment {
     fn run_guarded<E>(
         &self,
-        request: &cowshed_core::apfs::CommandRequest,
+        request: &cowshed_apfs::CommandRequest,
         check: impl FnOnce() -> Result<bool, E>,
-    ) -> Result<Option<cowshed_core::apfs::CommandOutput>, E>
+    ) -> Result<Option<cowshed_apfs::CommandOutput>, E>
     where
-        E: From<cowshed_core::apfs::CommandRunError> + std::fmt::Display,
+        E: From<cowshed_apfs::CommandRunError> + std::fmt::Display,
     {
         if check()? {
             self.run(request).map(Some).map_err(E::from)
@@ -3131,7 +3134,7 @@ fn real_apfs_raw_pin_prevents_foreign_eject_during_fsck() {
         foreign: foreign.clone(),
         ejected: AtomicUsize::new(0),
     };
-    let backend = cowshed_core::apfs::MacOsApfsBackend::new(runner);
+    let backend = cowshed_apfs::MacOsApfsBackend::new(runner);
     let attachment = backend
         .attach_verified(&owned)
         .expect("owned image verified");
@@ -3413,7 +3416,7 @@ fn real_apfs_lost_attachment_reattaches_without_verifying_foreign_volume() {
     let foreign = fixture.root().join("foreign.dmg");
     fixture.blank_image(&owned);
     fixture.blank_image(&foreign);
-    let backend = cowshed_core::apfs::MacOsApfsBackend::new(EjectAfterAttach {
+    let backend = cowshed_apfs::MacOsApfsBackend::new(EjectAfterAttach {
         owned: owned.clone(),
         foreign: foreign.clone(),
         ejected: AtomicUsize::new(0),

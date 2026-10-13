@@ -35,7 +35,7 @@ use crate::api::dto::{
     WorkspacePath,
 };
 use crate::error::{CowshedError, Result};
-use crate::fork_lock::Fenced;
+use cowshed_os::fork_lock::Fenced;
 use crate::storage::job_artifact::StreamKind;
 
 /// The identity of a cowshed build: the Mach-O `LC_UUID` the linker derives from the image's
@@ -632,7 +632,7 @@ fn occupant(path: &Path) -> io::Result<Occupant> {
 }
 
 /// Rename `from` to `to` in one step the kernel performs whole, refusing an existing `to`:
-/// [`crate::fsio::rename_noreplace`] against the working directory, which `from` and `to` resolve
+/// [`cowshed_os::fsio::rename_noreplace`] against the working directory, which `from` and `to` resolve
 /// from when relative. On Linux that is the `renameat2` system call itself, not glibc's wrapper,
 /// which glibc only gained in 2.28 and the published arm64 Linux CLI does not link against.
 fn rename_exclusive(from: &Path, to: &Path) -> io::Result<()> {
@@ -641,7 +641,7 @@ fn rename_exclusive(from: &Path, to: &Path) -> io::Result<()> {
         std::ffi::CString::new(path.as_os_str().as_bytes())
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))
     };
-    crate::fsio::rename_noreplace(libc::AT_FDCWD, &native(from)?, &native(to)?)
+    cowshed_os::fsio::rename_noreplace(libc::AT_FDCWD, &native(from)?, &native(to)?)
 }
 
 fn socket_error(path: &Path, what: &str, error: io::Error) -> CowshedError {
@@ -1848,7 +1848,7 @@ async fn forward_exec(
 #[cfg(test)]
 mod socket_ownership_tests {
     use super::*;
-    use crate::fork_lock::Spawn as _;
+    use cowshed_os::fork_lock::Spawn as _;
 
     fn path() -> PathBuf {
         PathBuf::from("/tmp")
