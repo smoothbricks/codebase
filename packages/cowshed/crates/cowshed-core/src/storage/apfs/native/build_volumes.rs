@@ -163,7 +163,7 @@ where
     /// and an upgrade would reopen admission (16_build_volumes.md, "Targets and seeds"). The source
     /// is the claim's own volume, so no caller can pair a claim with another volume's id.
     #[cfg(target_os = "macos")]
-    pub(super) fn clone_claimed_build_volume(
+    pub(crate) fn clone_claimed_build_volume(
         &self,
         layout: &BuildVolumeLayout,
         claim: &ReleaseClaim,
