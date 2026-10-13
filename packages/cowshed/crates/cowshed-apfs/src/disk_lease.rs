@@ -58,7 +58,8 @@ pub fn class_of(program: &Path, args: &[impl AsRef<OsStr>]) -> Option<DiskClass>
 /// Run `run`, the disk tool `program args`, under a lease of its class from the host gateway. A
 /// program that is no disk tool runs at once, and so does every disk tool for a minute after the
 /// host gateway was found to predate leases; for a minute after it was found to predate `alone`
-/// leases, it is asked shared.
+/// leases, it is asked shared. Every disk tool is first appended to the command record when
+/// [`COMMAND_RECORD_ENV`] names one, leased or not.
 pub fn leased<T, E: fmt::Display>(
     program: &Path,
     args: &[impl AsRef<OsStr>],
@@ -67,12 +68,15 @@ pub fn leased<T, E: fmt::Display>(
     let Some(class) = class_of(program, args) else {
         return run();
     };
+    let command = describe(program, args);
+    if let Some(record) = COMMAND_RECORD.as_ref() {
+        record.append(class, &command);
+    }
     let share = match predates_recently() {
         Some(Predates::Leases) => return run(),
         Some(Predates::Alone) => PhaseShare::Shared,
         None => wanted_share(),
     };
-    let command = describe(program, args);
     let socket = cowshed_gateway_types::control_socket_path();
     lease_then(&socket, class, share, &command, remember_predates, run)
 }
@@ -318,18 +322,60 @@ impl WaitRecord {
     /// Append one line. A record that cannot be written is said once per process: this process's
     /// waits then count as the test's code time, which can only fail the bound, never pass it.
     fn append(&self, line: &str) {
-        let written = OpenOptions::new()
-            .append(true)
-            .create(true)
-            .mode(0o600)
-            .open(&self.path)
-            .and_then(|mut file| file.write_all(line.as_bytes()));
-        if let Err(error) = written
+        if let Err(error) = append_line(&self.path, line)
             && !self.failed.swap(true, Ordering::Relaxed)
         {
             eprintln!(
                 "cowshed: disk-lease wait record {} is unwritable ({error}); this process's lease \
                  waits count as its test's code time",
+                self.path.display()
+            );
+        }
+    }
+}
+
+/// Append `line` to `path` in one write, so the lines of concurrent processes never interleave.
+fn append_line(path: &Path, line: &str) -> io::Result<()> {
+    OpenOptions::new()
+        .append(true)
+        .create(true)
+        .mode(0o600)
+        .open(path)
+        .and_then(|mut file| file.write_all(line.as_bytes()))
+}
+
+/// Names the file every disk command of a process tree is appended to; unset by default. A test
+/// run names one to count the images it attaches and the volumes it mounts (08_testing.md,
+/// "Integration tests (real substrate)", Host limit).
+pub const COMMAND_RECORD_ENV: &str = "COWSHED_DISK_COMMAND_RECORD";
+
+/// This process's disk-command record, when its environment names one.
+static COMMAND_RECORD: LazyLock<Option<CommandRecord>> = LazyLock::new(|| {
+    std::env::var_os(COMMAND_RECORD_ENV).map(|path| CommandRecord {
+        path: PathBuf::from(path),
+        failed: AtomicBool::new(false),
+    })
+});
+
+/// The file every disk command [`leased`] runs is appended to, one line per command, before it
+/// runs: `<class> <program> <args…>`, as the lease names it. A run's attaches are its lines of
+/// `diskutil image attach`, its mounts its lines of `mount_apfs`.
+#[derive(Debug)]
+struct CommandRecord {
+    path: PathBuf,
+    failed: AtomicBool,
+}
+
+impl CommandRecord {
+    /// Append one command. A record that cannot be written is said once per process, so a count
+    /// read from it is known to be short.
+    fn append(&self, class: DiskClass, command: &str) {
+        if let Err(error) = append_line(&self.path, &format!("{class} {command}\n"))
+            && !self.failed.swap(true, Ordering::Relaxed)
+        {
+            eprintln!(
+                "cowshed: disk command record {} is unwritable ({error}); this process's disk \
+                 commands are missing from it",
                 self.path.display()
             );
         }
