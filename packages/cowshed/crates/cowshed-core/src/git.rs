@@ -673,7 +673,7 @@ impl GitRepository {
     }
 
     /// Exclude cowshed's runtime metadata, the volume's own bookkeeping
-    /// ([`cowshed_apfs::VOLUME_METADATA`]) and the Spotlight opt-out each mount plants at the
+    /// ([`cowshed_apfs::VOLUME_METADATA`]) and adopted main's Spotlight opt-out at the
     /// volume root ([`cowshed_apfs::SPOTLIGHT_OPT_OUT`]) in `.git/info/exclude`: a checkout is its
     /// volume's root, so none of it is the repository's work, for a dirty check or for a clean.
     /// Directories are excluded as `name/`; the marker is a file, so it is `/name`, anchored at

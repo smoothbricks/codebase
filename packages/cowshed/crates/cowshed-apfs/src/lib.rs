@@ -3009,7 +3009,6 @@ impl<R: CommandRunner, S: Sleeper> ApfsBackend for MacOsApfsBackend<R, S> {
                 timed_apfs_step(apfs_step_leg(&attachment.image), "event-log", || {
                     self.opt_out_of_event_log(attachment, mount_point, options)
                 })
-                .inspect(|()| report_spotlight_opt_out(mount_point))
             }
             _ => Ok(()),
         };
@@ -3293,11 +3292,7 @@ pub const EVENT_LOG_DIRECTORY: &str = ".fseventsd";
 /// The marker fseventsd reads when a volume mounts: present, it keeps no log of the volume and
 /// still delivers the volume's live events to every stream.
 pub const EVENT_LOG_OPT_OUT: &str = "no_log";
-/// The marker at a volume's root that keeps Spotlight off it. Measured on macOS 26: a
-/// browsable mount of a marked volume reads `mdutil -s` "Indexing and searching disabled"
-/// against "Indexing disabled" unmarked; a `nobrowse` mount reads "unknown indexing state"
-/// either way. It does not stop the departed-volume leak (01_storage.md, "How the APFS host
-/// degrades" §2).
+/// The marker adopted main carries at its volume root, inherited by its image clones.
 pub const SPOTLIGHT_OPT_OUT: &str = ".metadata_never_index";
 
 /// What macOS keeps at every volume's root for itself: the event log, the Spotlight index, the
@@ -3453,30 +3448,19 @@ fn plant_empty_marker(directory: &File, marker: &std::ffi::CStr) -> io::Result<M
     }
 }
 
-/// Plant [`SPOTLIGHT_OPT_OUT`] at the root of the volume mounted at `mount_point`.
-fn opt_out_of_spotlight(mount_point: &Path) -> io::Result<Marker> {
-    plant_empty_marker(&open_volume_root(mount_point)?, SPOTLIGHT_OPT_OUT_C)
-}
-
-/// Keep Spotlight off the read-write volume just mounted at `mount_point` ([`SPOTLIGHT_OPT_OUT`]).
-/// Like the event log, indexing is host load and the mount is what the caller asked for, so a
-/// failure to opt out is reported and the volume stays mounted.
-fn report_spotlight_opt_out(mount_point: &Path) {
-    match opt_out_of_spotlight(mount_point) {
-        Ok(Marker::Planted) => {}
-        Ok(Marker::Refused) => eprintln!(
-            "cowshed: apfs {} refuses this user a {SPOTLIGHT_OPT_OUT}; Spotlight may index it",
-            mount_point.display()
-        ),
-        Ok(Marker::Squatted) => eprintln!(
-            "cowshed: apfs {} has a {SPOTLIGHT_OPT_OUT} that is not an empty regular file; left \
-             as found, not written through",
-            mount_point.display()
-        ),
-        Err(error) => eprintln!(
-            "cowshed: apfs {} keeps Spotlight indexing: {error}",
-            mount_point.display()
-        ),
+/// Initialize adopted main's volume root before its image is cloned. Existing adopted mains
+/// pass through the same helper on an adopt check; a conflicting entry is never overwritten.
+pub fn initialize_volume_root(mount_point: &Path) -> io::Result<()> {
+    match plant_empty_marker(&open_volume_root(mount_point)?, SPOTLIGHT_OPT_OUT_C)? {
+        Marker::Planted => Ok(()),
+        Marker::Refused => Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("cannot create {SPOTLIGHT_OPT_OUT}"),
+        )),
+        Marker::Squatted => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{SPOTLIGHT_OPT_OUT} is not an empty regular file"),
+        )),
     }
 }
 
@@ -6005,28 +5989,30 @@ mod tests {
     }
 
     #[test]
-    fn every_read_write_mount_plants_the_spotlight_opt_out_and_refuses_a_squatter() {
+    fn main_volume_initialization_plants_the_spotlight_opt_out_and_refuses_a_squatter() {
         let root = temp_path("spotlight-opt-out", "mnt");
         fs::create_dir_all(&root).unwrap();
-        assert_eq!(opt_out_of_spotlight(&root).unwrap(), Marker::Planted);
+        initialize_volume_root(&root).unwrap();
         let marker = root.join(SPOTLIGHT_OPT_OUT);
         assert_eq!(fs::metadata(&marker).unwrap().len(), 0);
-        assert_eq!(
-            opt_out_of_spotlight(&root).unwrap(),
-            Marker::Planted,
-            "idempotent"
-        );
+        initialize_volume_root(&root).expect("idempotent");
         fs::remove_file(&marker).unwrap();
         let elsewhere = root.with_extension("elsewhere");
         std::os::unix::fs::symlink(&elsewhere, &marker).unwrap();
-        assert_eq!(opt_out_of_spotlight(&root).unwrap(), Marker::Squatted);
+        assert_eq!(
+            initialize_volume_root(&root).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
         assert!(
             !elsewhere.exists(),
             "nothing is written through the symlink"
         );
         fs::remove_file(&marker).unwrap();
         fs::write(&marker, b"not empty").unwrap();
-        assert_eq!(opt_out_of_spotlight(&root).unwrap(), Marker::Squatted);
+        assert_eq!(
+            initialize_volume_root(&root).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
         fs::remove_dir_all(&root).unwrap();
     }
 

@@ -591,7 +591,9 @@ What the substrate does about each:
   minter, at `/private/tmp/cowshed-itest-templates-uid<uid>`, and clone every test image from it; a test store that
   mints is seeded with a clone of it. Like a store's template it outlives its minter and its name spells everything its
   bytes depend on, so concurrent lanes and later runs clone the same one instead of each test process tree paying a
-  create, a formatting attach, a format and a detach before its first test.
+  create, a formatting attach, a format and a detach before its first test. Real-APFS tests attach with `noMount` unless
+  mounting is under test, reducing the departed-volume references `mds` retains; the separate real-APFS group keeps
+  those tests out of ordinary per-crate runs.
 - **A disk-tool timeout is a concurrency measurement first.** Raising the bound or serializing the suite hides the host
   contention instead of reducing it; the fix is fewer calls, and calls that do not starve each other.
 - **`doctor`** reports main's extent count (`main-extents`) so fragmentation is visible before it costs a fork.

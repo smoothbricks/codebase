@@ -635,6 +635,18 @@ fn highest_free_port_block(fixture: &Fixture) -> PortBlock {
         .expect("a macOS port block is free on the host")
 }
 
+#[tokio::test]
+async fn real_apfs_adopt_initializes_mains_spotlight_marker() {
+    let fixture = Fixture::with(Project::Plain);
+    let mut service = fixture.open().await;
+    adopt(&fixture, &mut service).await;
+    let main = service.path("main", false).await.expect("adopted main");
+    let marker = fs::symlink_metadata(main.mount.join(cowshed_apfs::SPOTLIGHT_OPT_OUT))
+        .expect("adopt writes main's Spotlight opt-out");
+    assert!(marker.file_type().is_file());
+    assert_eq!(marker.len(), 0);
+}
+
 /// A plain Git repository, adopted and served through a real gateway, with one workspace,
 /// `topic`. Its exec runs with no shell hook. Push preserves the workspace branch as
 /// `refs/cowshed/topic/heads/cowshed/topic` in main's repository and never moves main's
