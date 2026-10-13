@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 #[path = "../../../cowshed-os/tests/support/scratch_processes.rs"]
 pub(crate) mod processes;
 
-const ROOT_PREFIX: &str = "cowshed-dtest-";
+pub(crate) const ROOT_PREFIX: &str = "cowshed-dtest-";
 
 pub struct ScratchRoot {
     path: PathBuf,
@@ -21,9 +21,9 @@ impl ScratchRoot {
     pub fn new(label: &str) -> std::io::Result<Self> {
         static SWEPT: Mutex<bool> = Mutex::new(false);
         static NEXT: AtomicUsize = AtomicUsize::new(0);
-        let mut swept = SWEPT
-            .lock()
-            .map_err(|error| std::io::Error::other(format!("directory fixture sweep lock: {error}")))?;
+        let mut swept = SWEPT.lock().map_err(|error| {
+            std::io::Error::other(format!("directory fixture sweep lock: {error}"))
+        })?;
         if !*swept {
             sweep_dead_roots()?;
             *swept = true;
@@ -103,7 +103,10 @@ mod tests {
         std::os::unix::fs::symlink(outside.path(), path.join("linked")).unwrap();
         drop(root);
         assert!(!path.exists());
-        assert_eq!(fs::read_to_string(outside.path().join("kept")).unwrap(), "outside");
+        assert_eq!(
+            fs::read_to_string(outside.path().join("kept")).unwrap(),
+            "outside"
+        );
     }
 
     #[test]
@@ -138,6 +141,10 @@ mod tests {
         assert!(!worker.wait().unwrap().success());
         assert!(outside_running, "another root's worker must survive");
         assert!(!path.exists());
-        assert!(processes::processes_in(|cwd| cwd.starts_with(&path)).unwrap().is_empty());
+        assert!(
+            processes::processes_in(|cwd| cwd.starts_with(&path))
+                .unwrap()
+                .is_empty()
+        );
     }
 }
