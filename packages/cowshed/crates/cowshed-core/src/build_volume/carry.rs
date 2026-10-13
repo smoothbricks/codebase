@@ -133,6 +133,27 @@ pub struct Staged {
     /// Why staging stopped short. The entries staged until then are committed; nothing more is
     /// copied while the target is closed.
     stopped: Option<String>,
+    /// Each Nx state (its checkout-relative `.nx`) whose selection reached the target's task
+    /// databases, and whether one of them indexes any cache entry.
+    consulted: Vec<(PathBuf, bool)>,
+}
+
+impl Staged {
+    /// The Nx states consulted, when staging did not stop and none of the target's task
+    /// databases they reached indexes a single cache entry: the target had nothing to select
+    /// from, which is not the same as the workspace missing nothing (16_build_volumes.md,
+    /// "Rebase carry").
+    pub fn unindexed(&self) -> Option<Vec<PathBuf>> {
+        let unindexed = self.stopped.is_none()
+            && !self.consulted.is_empty()
+            && self.consulted.iter().all(|(_, indexed)| !indexed);
+        unindexed.then(|| {
+            self.consulted
+                .iter()
+                .map(|(state, _)| state.clone())
+                .collect()
+        })
+    }
 }
 
 /// What a carry put into the landing volume.
@@ -268,6 +289,9 @@ fn stage_with(
                 return staged;
             }
         };
+        // A target state with no task database indexes nothing; one whose every database is of
+        // another Nx schema than the workspace's is not consulted at all.
+        let mut indexed = databases.is_empty().then_some(false);
         for name in databases {
             let from_database = from.join(source.data).join(&name);
             let into_database = into.join(destination.data).join(&name);
@@ -302,10 +326,20 @@ fn stage_with(
             };
             let result = stage_database(&mut database, selected, staged.budget.as_mut());
             staged.databases.push(database);
-            if let Err(error) = result {
-                staged.stopped = Some(error);
-                return staged;
+            match result {
+                Ok(database_indexed) => {
+                    indexed = Some(indexed.unwrap_or(false) || database_indexed);
+                }
+                Err(error) => {
+                    staged.stopped = Some(error);
+                    return staged;
+                }
             }
+        }
+        if let Some(indexed) = indexed {
+            staged
+                .consulted
+                .push((source.checkout.to_path_buf(), indexed));
         }
     }
     staged
@@ -494,12 +528,13 @@ pub fn unstage(into: &Path) -> io::Result<()> {
 }
 
 /// Read the rows `database.into_database` lacks from `database.from_database`, then copy each
-/// entry's files into the staging directory, recording each entry staged whole.
+/// entry's files into the staging directory, recording each entry staged whole. Answers whether
+/// the target's database indexes any cache entry at all.
 fn stage_database(
     database: &mut StagedDatabase,
     selected: Selection<'_>,
     mut budget: Option<&mut Budget>,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let context = |error: io::Error| {
         format!(
             "stage {} into {}: {error}",
@@ -509,8 +544,11 @@ fn stage_database(
     };
     // The connection closes before the copies: phase 1 holds the target's database only for
     // the one read.
-    let missing =
-        missing(&database.into_database, &database.from_database, selected).map_err(context)?;
+    let Some(missing) =
+        missing(&database.into_database, &database.from_database, selected).map_err(context)?
+    else {
+        return Ok(false);
+    };
     for row in missing {
         match copy_row(
             &database.from_cache,
@@ -529,7 +567,7 @@ fn stage_database(
             }
         }
     }
-    Ok(())
+    Ok(true)
 }
 
 /// Open the landing database with the target's attached as `previous`. Stock Nx creates
@@ -566,14 +604,30 @@ fn table_definition(
     Ok(statement.step()?.then(|| statement.text(0)))
 }
 
-/// The target's rows the landing database lacks ([`MISSING`]).
+/// The target's rows the landing database lacks ([`MISSING`]), or none when the target's
+/// database indexes no cache entry.
 fn missing(
     into_database: &Path,
     from_database: &Path,
     selected: Selection<'_>,
-) -> io::Result<Vec<Row>> {
+) -> io::Result<Option<Vec<Row>>> {
     let connection = attached(into_database, from_database)?;
-    rows(&connection, selected)
+    if !indexes(&connection)? {
+        return Ok(None);
+    }
+    rows(&connection, selected).map(Some)
+}
+
+/// Whether the target's database (`previous`) indexes any cache entry. Stock Nx creates
+/// `cache_outputs` only once a task runs through its cache, and an Nx whose cache is elsewhere
+/// never fills this one.
+fn indexes(connection: &Connection) -> io::Result<bool> {
+    if table_definition(connection, "previous", "cache_outputs")?.is_none() {
+        return Ok(false);
+    }
+    let mut statement =
+        connection.prepare("SELECT EXISTS (SELECT 1 FROM previous.cache_outputs)")?;
+    Ok(statement.step()? && statement.integer(0) == 1)
 }
 
 /// [`MISSING`], or [`SELECTED`] for a rebase: none when the target's database has no
@@ -1735,6 +1789,48 @@ mod tests {
                 .contains("no current-tree task hashes")
         );
         assert!(!fixture.into.join("nx/cache/1").exists());
+    }
+
+    /// A target whose task database indexes no cache entry (no `cache_outputs` table, an empty
+    /// one, or no database at all) had nothing to select from, so the carry says so instead of
+    /// carrying 0; a target that indexes entries the rebased tree does not ask for, and an empty
+    /// selection, carry 0 because nothing is missing.
+    #[test]
+    fn rebase_from_a_target_that_indexes_nothing_is_unindexed_not_carried_zero() {
+        let target = |fixture: &Fixture| fixture.from.join("nx/workspace-data/task.db");
+        let empty = Fixture::new();
+        assert_eq!(
+            empty.stage(&["1"]).unindexed(),
+            Some(vec![PathBuf::from(".nx")])
+        );
+
+        let tableless = Fixture::new();
+        database(
+            &target(&tableless),
+            "CREATE TABLE task_details (hash TEXT PRIMARY KEY NOT NULL, \
+             project TEXT NOT NULL, target TEXT NOT NULL, configuration TEXT); \
+             INSERT INTO task_details VALUES ('1', 'a', 'build', NULL)",
+        );
+        assert_eq!(
+            tableless.stage(&["1"]).unindexed(),
+            Some(vec![PathBuf::from(".nx")])
+        );
+
+        let absent = Fixture::new();
+        fs::remove_file(target(&absent)).unwrap();
+        assert_eq!(
+            absent.stage(&["1"]).unindexed(),
+            Some(vec![PathBuf::from(".nx")])
+        );
+
+        let elsewhere = Fixture::new();
+        elsewhere.entry("2", 4, b"other tree");
+        let staged = elsewhere.stage(&["1"]);
+        assert_eq!(staged.unindexed(), None);
+        let carried = commit(staged, &elsewhere.into);
+        assert_eq!((carried.entries, carried.stopped), (0, None));
+
+        assert_eq!(Fixture::new().stage(&[]).unindexed(), None);
     }
 
     #[test]

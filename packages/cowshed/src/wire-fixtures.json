@@ -1416,6 +1416,16 @@
       },
       "oid": "7777777777777777777777777777777777777777"
     },
+    "unindexed": {
+      "buildVolume": {
+        "kind": "skipped",
+        "reason": {
+          "kind": "unindexed",
+          "states": [".nx", "apps/web/.nx"]
+        }
+      },
+      "oid": "7777777777777777777777777777777777777777"
+    },
     "workspaceHeld": {
       "buildVolume": {
         "kind": "skipped",

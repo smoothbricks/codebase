@@ -898,7 +898,8 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
     /// the Nx cache entries the target's volume indexes and it lacks, among those `selections`
     /// names: for each Nx state of the workspace's volume (its `.nx`, relative to the checkout),
     /// the task hashes stock Nx computed for the rebased tree there and the tasks it defers. A
-    /// selection that could not be computed is the skip it carries, after the volume skips. The
+    /// selection that could not be computed is the skip it carries, after the volume skips; a
+    /// target whose task databases index no cache entry skips before either side closes. The
     /// copies are staged while both sides run. Then each side's Nx state is closed as a land
     /// closes the target's (its idle daemon stopped, any other holder a skip), and the commit
     /// runs under both sides' Nx open locks once neither database has a holder, so nothing but
@@ -940,6 +941,11 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
                 layout.images(),
             );
             let staged_in = started.elapsed();
+            // Nothing to select from is not nothing missing: say so before closing either side.
+            if let Some(states) = staged.unindexed() {
+                carry::unstage(&into).map_err(|error| io("unstage the carry", &into, &error))?;
+                return skipped(RebaseCarrySkip::Unindexed { states });
+            }
             let sides = [
                 (CarrySide::Workspace, into.as_path(), &into_state),
                 (CarrySide::Target, from.as_path(), &from_state),

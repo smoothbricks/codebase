@@ -1615,6 +1615,12 @@ export type RebaseCarrySkip =
        */
       readonly state: string;
       readonly reason: string;
+    })
+  | ({ readonly kind: 'unindexed' } & {
+      /**
+       * Each such root's Nx state directory (`<root>/.nx`), relative to the workspace.
+       */
+      readonly states: ReadonlyArray<string>;
     });
 
 export type RebaseOptions = {

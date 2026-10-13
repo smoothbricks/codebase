@@ -960,6 +960,15 @@ fn reports() -> BTreeMap<&'static str, BTreeMap<&'static str, Value>> {
                         }),
                     ),
                 ),
+                (
+                    "unindexed",
+                    document(
+                        "rebase report",
+                        &rebase_skipped(RebaseCarrySkip::Unindexed {
+                            states: vec![PathBuf::from(".nx"), PathBuf::from("apps/web/.nx")],
+                        }),
+                    ),
+                ),
             ]),
         ),
         (
