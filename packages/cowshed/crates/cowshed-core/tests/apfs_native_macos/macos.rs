@@ -383,12 +383,12 @@ impl RealFixture {
             .backend()
             .attach_verified(image)
             .expect("attach a real image");
-        self.remount(&attachment, mount_point, options);
+        self.remount(attachment.volume_device(), mount_point, options);
         attachment
     }
 
-    /// Mount `attachment`'s volume at `mount_point` with exactly `options`.
-    fn remount(&self, attachment: &AttachedImage, mount_point: &Path, options: &str) {
+    /// Mount the attached `volume_device` at `mount_point` with exactly `options`.
+    fn remount(&self, volume_device: &str, mount_point: &Path, options: &str) {
         std::fs::create_dir_all(mount_point).expect("mount point");
         let mounted = SystemCommandRunner
             .run(&CommandRequest::new(
@@ -396,15 +396,14 @@ impl RealFixture {
                 [
                     "-o".as_ref(),
                     options.as_ref(),
-                    attachment.volume_device().as_ref(),
+                    volume_device.as_ref(),
                     mount_point.as_os_str(),
                 ],
             ))
             .expect("run mount_apfs");
         assert!(
             mounted.succeeded(),
-            "mount_apfs -o {options} {} {}: {}",
-            attachment.volume_device(),
+            "mount_apfs -o {options} {volume_device} {}: {}",
             mount_point.display(),
             String::from_utf8_lossy(&mounted.stderr)
         );
@@ -476,14 +475,17 @@ fn filesystem_bytes(mount_point: &Path) -> u64 {
     stat.f_blocks * u64::from(stat.f_bsize)
 }
 
+/// A published source image, attached once and mounted read-write and hidden at the main
+/// mountpoint with its marker, credentials and payload, registered as [`workspace`]'s mount.
+/// Returns the host, the image, the mountpoint and the volume's device, which a later remount
+/// of the same attachment names.
 fn live_capture_source(
     fixture: &RealFixture,
-    access: MountAccess,
-    browse: bool,
 ) -> (
     MacOsApfsExecutionHost<SystemCommandRunner>,
     PathBuf,
     PathBuf,
+    String,
 ) {
     let source = fixture
         .layout()
@@ -504,19 +506,10 @@ fn live_capture_source(
     fixture.plant_marker(&mount, &workspace());
     mint_credentials(&workspace(), &mount, &ca_key_path(&source)).expect("source credentials");
     std::fs::write(mount.join("sealed-payload"), b"complete source bytes").expect("source payload");
-    if access == MountAccess::ReadOnly || browse {
-        unmount(&mount);
-        let options = match (access, browse) {
-            (MountAccess::ReadWrite, false) => "nobrowse,owners,noatime",
-            (MountAccess::ReadWrite, true) => "owners,noatime",
-            (MountAccess::ReadOnly, false) => "rdonly,nobrowse,owners,noatime",
-            (MountAccess::ReadOnly, true) => "rdonly,owners,noatime",
-        };
-        fixture.remount(&attachment, &mount, options);
-    }
+    let volume_device = attachment.volume_device().to_owned();
     host.retain_mounted(&workspace(), attachment)
         .expect("registered source");
-    (host, source, mount)
+    (host, source, mount, volume_device)
 }
 
 /// A live source's identity as the kernel holds it: its mount (id, device and flags) and its
@@ -561,32 +554,41 @@ fn assert_capture_carries_source(
 
 /// The live rule (01_storage.md, "Live source snapshots"): unheld RW/RO captures and destination
 /// refusals leave the source's mount, device, flags and attachment unchanged. A held RW capture
-/// also succeeds without changing those facts. RW volume writes are flushed; RO has none.
+/// also succeeds without changing those facts. RW volume writes are flushed; RO has none, so the
+/// RW capture's payload is the one read back through a mount of its own. One source attachment
+/// serves both sources: the read-only browsable source is a remount of the same volume.
 #[test]
 fn real_apfs_live_capture_leaves_its_source_unchanged_on_success_and_refusal() {
-    for (label, access, browse) in [
-        ("rw-hidden", MountAccess::ReadWrite, false),
-        ("ro-browse", MountAccess::ReadOnly, true),
+    let fixture = RealFixture::new("live-capture");
+    let (host, source, mount, volume_device) = live_capture_source(&fixture);
+    for (label, access) in [
+        ("rw-hidden", MountAccess::ReadWrite),
+        ("ro-browse", MountAccess::ReadOnly),
     ] {
-        let fixture = RealFixture::new(label);
-        let (host, source, mount) = live_capture_source(&fixture, access, browse);
+        if access == MountAccess::ReadOnly {
+            unmount(&mount);
+            fixture.remount(&volume_device, &mount, "rdonly,owners,noatime");
+        }
         let before = live_source_state(&source, &mount);
-        let destination = fixture.root().join("snapshot.dmg");
+        let destination = fixture.root().join(format!("{label}.dmg"));
         host.clone_image(&source, Some(&mount), &destination)
             .expect("live capture");
         assert_eq!(
             live_source_state(&source, &mount),
             before,
-            "a live capture leaves the source's mount, device, flags and attachment as they were"
+            "{label}: a live capture leaves the source's mount, device, flags and attachment as they were"
         );
-        assert!(!attached(&destination), "captured image stays detached");
+        assert!(
+            !attached(&destination),
+            "{label}: captured image stays detached"
+        );
         assert_eq!(
             std::fs::read(mount.join("sealed-payload")).unwrap(),
             b"complete source bytes"
         );
 
         // A refused capture never deletes a pre-existing target, and touches nothing else.
-        let occupied = fixture.root().join("occupied.dmg");
+        let occupied = fixture.root().join(format!("{label}-occupied.dmg"));
         std::fs::write(&occupied, b"preserve destination").unwrap();
         let error = host
             .clone_image(&source, Some(&mount), &occupied)
@@ -596,10 +598,9 @@ fn real_apfs_live_capture_leaves_its_source_unchanged_on_success_and_refusal() {
         assert_eq!(
             live_source_state(&source, &mount),
             before,
-            "a refused capture leaves the source as it was"
+            "{label}: a refused capture leaves the source as it was"
         );
 
-        assert_capture_carries_source(&host, &destination, &fixture.root().join("snapshot"));
         if access == MountAccess::ReadWrite {
             let held = std::fs::File::open(mount.join("sealed-payload"))
                 .expect("hold source during live capture");
@@ -611,17 +612,14 @@ fn real_apfs_live_capture_leaves_its_source_unchanged_on_success_and_refusal() {
                 before,
                 "a held live capture leaves the source's mount, device, flags and attachment as they were"
             );
-            assert_capture_carries_source(
-                &host,
-                &held_destination,
-                &fixture.root().join("snapshot-held"),
-            );
+            assert!(!attached(&held_destination), "held capture stays detached");
             drop(held);
+            assert_capture_carries_source(&host, &destination, &fixture.root().join(label));
         }
-        host.detach_mounted(&workspace(), DetachIntent::WhenIdle)
-            .expect("source registry mapping");
-        assert!(kernel_mount_at(&mount).is_none());
     }
+    host.detach_mounted(&workspace(), DetachIntent::WhenIdle)
+        .expect("source registry mapping");
+    assert!(kernel_mount_at(&mount).is_none());
 }
 
 fn repo() -> RepoId {
@@ -2500,39 +2498,14 @@ fn sidecar_removal_does_not_hide_non_file_errors() {
     assert!(host.reclaim_image(image.image()).is_err());
 }
 
-#[test]
-fn real_apfs_release_detaches_a_volume_held_open_after_its_grace() {
-    let fixture = RealFixture::new("native-release-held-file");
-    let image = fixture.layout().main_image().expect("image");
-    fixture.published_image(image.image());
-    let host = fixture.host();
-    let workspace = workspace();
-    let mount = fixture.main_mount();
-    std::fs::create_dir_all(&mount).expect("mount point");
-    let attachment = host.attach_verified(image.image()).expect("attachment");
-    host.mount(&attachment, &mount, MountAccess::ReadWrite, false)
-        .expect("mount");
-    host.retain_mounted(&workspace, attachment).expect("retain");
-    let mut holder = std::fs::File::create(mount.join("held")).expect("hold the volume");
-
-    host.detach_mounted(&workspace, DetachIntent::Release)
-        .expect("release waits its grace, then forces the owned volume");
-    assert!(kernel_mount_at(&mount).is_none());
-    assert!(!attached(image.image()));
-    use std::io::Write as _;
-    assert!(
-        holder.write_all(b"after forced unmount").is_err(),
-        "a held file cannot write into a released filesystem"
-    );
-}
-
 /// On real APFS: a refused create (`slotted`, never attached) and an attached volume mounted
 /// nowhere are typed skips, the empty mountpoint is refused as no store image, and nothing the
 /// host owns changes name. The mounted workspace is renamed through its device, under the raw pin
 /// the rename takes, and the kernel then reports the label.
 /// Before mounting, detached capture refuses the attached image without publishing a copy.
 /// Once mounted, a holder can dissent to WhenIdle without surrendering the actor's attachment;
-/// after the holder drops, Release removes the mount and attachment.
+/// with the holder still open, Release waits its grace, then forces the owned volume off: the
+/// mount and attachment are gone and the held file can no longer write.
 #[test]
 fn real_apfs_rename_names_the_pinned_device_and_skips_what_is_not_mounted() {
     let fixture = RealFixture::new("native-rename-pinned");
@@ -2616,18 +2589,22 @@ fn real_apfs_rename_names_the_pinned_device_and_skips_what_is_not_mounted() {
         "the host's Data volume keeps its name"
     );
 
-    let holder = std::fs::File::create(mount.join("held")).expect("hold the volume");
+    let mut holder = std::fs::File::create(mount.join("held")).expect("hold the volume");
     host.detach_mounted(&workspace(), DetachIntent::WhenIdle)
         .expect_err("a dissented WhenIdle detach must fail");
     assert!(
         kernel_mount_at(&mount).is_some(),
         "WhenIdle never forces: the volume stays mounted"
     );
-    drop(holder);
     host.detach_mounted(&workspace(), DetachIntent::Release)
-        .expect("the workspace is still the actor's to detach");
+        .expect("release waits its grace, then forces the owned volume");
     assert!(kernel_mount_at(&mount).is_none());
     assert!(!attached(image.image()));
+    use std::io::Write as _;
+    assert!(
+        holder.write_all(b"after forced unmount").is_err(),
+        "a held file cannot write into a released filesystem"
+    );
 }
 
 /// Kernel mounts a test states outright, so a rename's target is proven from the fake inventory
@@ -3239,36 +3216,13 @@ fn hold_twice(fixture: &RealFixture, image: &Path) {
     assert_eq!(kernel_attachments(image).len(), 2, "the path is held twice");
 }
 
-/// A path the kernel holds twice wedged every real-APFS run on the host: each lookup refused it
-/// as `matching image has multiple inventory entries`, the sweep included. Cowshed never adds a
-/// third attachment to such a path, and releasing the image releases both.
-#[test]
-fn real_apfs_a_path_held_twice_is_never_attached_again_and_released_whole() {
-    let fixture = RealFixture::new("held-twice");
-    let image = fixture.root().join("twice.dmg");
-    hold_twice(&fixture, &image);
-
-    let refused = MacOsApfsBackend::new(SystemCommandRunner)
-        .attach_verified(&image)
-        .expect_err("a held path is never attached again");
-    assert!(
-        matches!(&refused, ApfsError::InvalidAttachmentInventory(message)
-            if message.contains("is already attached as")),
-        "{refused}"
-    );
-    assert_eq!(kernel_attachments(&image).len(), 2);
-
-    fixture
-        .host()
-        .detach_existing_image(&image, DetachIntent::Release)
-        .expect("release both attachments");
-    assert!(!attached(&image), "{:?}", kernel_attachments(&image));
-}
-
 /// The minter's own leftovers, as the incident left them: the single staging name older minters
 /// reused, held twice, and a staging image of this minter's kind whose file is gone while its
-/// attachment stays. The next mint releases every attachment of both, removes their files, and
-/// mints the template, which it leaves detached under its name.
+/// attachment stays. A path the kernel holds twice wedged every real-APFS run on the host: each
+/// lookup refused it as `matching image has multiple inventory entries`, the sweep included.
+/// Cowshed never adds a third attachment to such a path. The next mint releases every attachment
+/// of both leftovers through `release_every_attachment`, the release every image detach ends in,
+/// removes their files, and mints the template, which it leaves detached under its name.
 #[test]
 fn real_apfs_a_template_mint_releases_every_leftover_staging_attachment() {
     let fixture = RealFixture::new("template-leftovers");
@@ -3283,6 +3237,15 @@ fn real_apfs_a_template_mint_releases_every_leftover_staging_attachment() {
             .expect("a template stem")
     ));
     hold_twice(&fixture, &reused);
+    let refused = MacOsApfsBackend::new(SystemCommandRunner)
+        .attach_verified(&reused)
+        .expect_err("a held path is never attached again");
+    assert!(
+        matches!(&refused, ApfsError::InvalidAttachmentInventory(message)
+            if message.contains("is already attached as")),
+        "{refused}"
+    );
+    assert_eq!(kernel_attachments(&reused).len(), 2);
     let orphaned = blank_template_staged_stem(&store, capacity).with_extension("dmg");
     fixture.blank_image(&orphaned);
     attach_behind_cowshed(&orphaned);
@@ -5244,7 +5207,7 @@ fn real_apfs_gc_retains_root_held_event_debris_without_blocking_retirement() {
     );
     unmount(&backing);
     mounts.wait_for(&backing, Unmounted);
-    fixture.remount(&attachment, &backing, "nobrowse,noowners");
+    fixture.remount(attachment.volume_device(), &backing, "nobrowse,noowners");
     mounts.wait_for(&backing, Mounted);
 
     let mount_root = backing.join("mnt");
@@ -5264,7 +5227,7 @@ fn real_apfs_gc_retains_root_held_event_debris_without_blocking_retirement() {
     std::fs::write(backing.join(".fseventsd/no_log"), b"").expect("opt fixture volume out");
     unmount(&backing);
     mounts.wait_for(&backing, Unmounted);
-    fixture.remount(&attachment, &backing, "nobrowse,owners");
+    fixture.remount(attachment.volume_device(), &backing, "nobrowse,owners");
     mounts.wait_for(&backing, Mounted);
     assert!(!fsevents::keeps_event_log(&backing));
     let log = std::fs::symlink_metadata(bare.join(".fseventsd")).expect("root-owned log");
@@ -5812,46 +5775,6 @@ fn assert_back_on_its_mount<R: CommandRunner + Send + Sync + 'static>(
     assert!(!attached(image));
 }
 
-#[test]
-fn real_apfs_resizing_a_detached_workspace_grows_the_image_then_the_container() {
-    let fixture = RealFixture::new("resize-detached");
-    let image = fixture.layout().main_image().expect("image");
-    fixture.published_image(image.image());
-    let host = fixture.host();
-
-    let outcome = host
-        .resize(
-            &workspace(),
-            image.image(),
-            &fixture.main_mount(),
-            ImageCapacity::from_gibibytes(2),
-        )
-        .expect("resize a detached workspace");
-
-    assert_eq!(outcome.previous, ImageCapacity::from_gibibytes(1));
-    assert_eq!(outcome.capacity, ImageCapacity::from_gibibytes(2));
-    assert!(
-        !attached(image.image()),
-        "a detached workspace is handed back detached"
-    );
-    assert_eq!(
-        host.backend()
-            .image_capacity(image.image())
-            .expect("image capacity"),
-        ImageCapacity::from_gibibytes(2)
-    );
-    // The container grew with the image: the volume's filesystem spans the new capacity.
-    let probe = fixture.root().join("probe");
-    let attachment = fixture.mount_left_behind(image.image(), &probe, "nobrowse,owners");
-    assert!(
-        filesystem_bytes(&probe) > ImageCapacity::from_gibibytes(1).bytes(),
-        "the APFS container was grown into the image: {} bytes",
-        filesystem_bytes(&probe)
-    );
-    host.detach(attachment, DetachIntent::Release)
-        .expect("detach the probe");
-}
-
 /// Pure (08_testing.md, "Unit tests": no mounts): a refused grow reads the image's length and runs no disk command.
 #[test]
 fn resize_refuses_a_capacity_that_does_not_grow_before_touching_the_image() {
@@ -5906,8 +5829,10 @@ fn resize_refuses_a_capacity_that_does_not_grow_before_touching_the_image() {
 /// A holder first refuses both resize and defragment without changing the image or its
 /// attachment. Once released, the same mounted workspace grows and returns with its payload.
 /// The refused-grow, defragment and failed-rewrite phases run on this same mounted workspace
-/// in turn: one fixture lifecycle proves the whole resize/defrag scenario (08_testing.md,
-/// "Host limit"), instead of an attach per phase.
+/// in turn, and the detached workspace they leave then grows again and is handed back detached:
+/// one fixture lifecycle proves the whole resize/defrag scenario (08_testing.md, "Host limit"),
+/// instead of an attach per phase. Both resizes grow the container through the same verified
+/// attachment; the mounted one reads the grown filesystem through its remount.
 #[test]
 fn real_apfs_resize_and_defrag_scenario_puts_a_mounted_workspace_back_on_its_mount_substrate_lifecycle()
  {
@@ -6095,6 +6020,29 @@ fn real_apfs_resize_and_defrag_scenario_puts_a_mounted_workspace_back_on_its_mou
     assert_eq!(std::fs::metadata(&image).expect("image").ino(), before);
     std::fs::remove_dir_all(&sibling).expect("clear the obstruction");
     assert_back_on_its_mount(&host, &image, &mount);
+
+    // The workspace is detached now; a detached workspace is resized detached.
+    let outcome = host
+        .resize(
+            &workspace(),
+            &image,
+            &mount,
+            ImageCapacity::from_gibibytes(3),
+        )
+        .expect("resize a detached workspace");
+    assert_eq!(outcome.previous, ImageCapacity::from_gibibytes(2));
+    assert_eq!(outcome.capacity, ImageCapacity::from_gibibytes(3));
+    assert!(
+        !attached(&image),
+        "a detached workspace is handed back detached"
+    );
+    assert!(kernel_mount_at(&mount).is_none());
+    assert_eq!(
+        host.backend()
+            .image_capacity(&image)
+            .expect("image capacity"),
+        ImageCapacity::from_gibibytes(3)
+    );
 }
 
 /// An image the kernel still holds with nothing mounted at the workspace's mount point — what an

@@ -52,7 +52,7 @@ platform = 'cfg(target_os="macos")'
 test-group = 'real-apfs'
 
 [[profile.default.overrides]]
-filter = 'package(cowshed-core) and (test(/real_apfs_/) or binary(apfs_native_macos) or test(=storage::apfs::native::build_volumes::tests::a_jobs_volumes_count_from_admission_through_its_command_to_its_sealed_record))'
+filter = 'package(cowshed-core) and (test(/real_apfs_/) or binary(apfs_native_macos))'
 platform = 'cfg(target_os="macos")'
 test-group = 'real-apfs-host'
 
@@ -94,7 +94,7 @@ platform = 'cfg(target_os="macos")'
 run-wrapper = 'real-apfs-code-30s'
 
 [[profile.default.scripts]]
-filter = 'package(cowshed-core) and (test(/real_apfs_/) or binary(apfs_native_macos) or test(=storage::apfs::native::build_volumes::tests::a_jobs_volumes_count_from_admission_through_its_command_to_its_sealed_record))'
+filter = 'package(cowshed-core) and (test(/real_apfs_/) or binary(apfs_native_macos))'
 platform = 'cfg(target_os="macos")'
 run-wrapper = 'real-apfs-code-30s'
 
