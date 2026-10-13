@@ -1535,7 +1535,7 @@ impl NativeGatewayInventory {
             ] {
                 for image in sidecar_images(&directory)? {
                     if canonical
-                        && crate::metadata::is_image_path(&image)
+                        && cowshed_apfs::image::is_image_path(&image)
                         && fs::symlink_metadata(&image).is_ok()
                     {
                         continue;

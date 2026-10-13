@@ -6637,8 +6637,8 @@ mod workspace_toolchain_tests {
             host.env_clear()
                 .args(["-c", ". \"$1\"; env", "host"])
                 .arg(mount.join(".cowshed/env"));
-            let output =
-                crate::fork_lock::Run::output_locked(&mut host).expect("source host environment");
+            let output = cowshed_os::fork_lock::Run::output_locked(&mut host)
+                .expect("source host environment");
             assert!(output.status.success());
             let text = String::from_utf8(output.stdout).unwrap();
             for name in crate::capabilities::sccache::HOST_ENVIRONMENT {

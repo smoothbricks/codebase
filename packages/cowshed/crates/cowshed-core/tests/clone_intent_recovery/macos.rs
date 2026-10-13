@@ -3,19 +3,12 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use arrow_ipc::reader::StreamReader;
-use cowshed_apfs::{
-    ApfsBackend, CommandRunner, DetachIntent, DiskImageSource, ImageCapture, MacOsApfsBackend,
-    SystemCommandRunner,
-};
 use cowshed_core::api::ControllerCommitment;
 use cowshed_core::api::dto::{AdoptOptions, ForkOptions, RemoveOptions, RevisionTarget};
 use cowshed_core::api::operations::OperationRequest;
 use cowshed_core::api::server::ConnectionAuthority;
-use cowshed_apfs::attach_budget;
-use cowshed_os::fork_lock::{self, Run as _};
 use cowshed_core::metadata::{
-    DetachedWorkspaceMetadata, ImageCapacity, PortBlock, PublicationState, WorkspaceIncarnation,
-    WorkspaceName,
+    DetachedWorkspaceMetadata, PortBlock, PublicationState, WorkspaceIncarnation, WorkspaceName,
 };
 use cowshed_core::repository::RepoId;
 use cowshed_core::runtime::{ProjectRuntime, RecoveryScope, supervisor_socket};

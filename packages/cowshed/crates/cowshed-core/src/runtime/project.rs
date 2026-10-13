@@ -2509,11 +2509,9 @@ async fn reserve_port_grants_of_size(
     used: crate::metadata::ReservedPortBlocks,
     size: u16,
 ) -> Result<PortGrantReservation> {
-    for block in crate::metadata::PortBlock::macos_candidates_with_size(
-        inventory.port_allocation(),
-        size,
-    )
-    .map_err(native_integrity_error)?
+    for block in
+        crate::metadata::PortBlock::macos_candidates_with_size(inventory.port_allocation(), size)
+            .map_err(native_integrity_error)?
     {
         if used.overlapping(block).is_some() {
             continue;
@@ -18448,7 +18446,7 @@ mod git_worktree_tests {
     /// runs, citing the include and the rule, rather than failing as an opaque exec denial.
     #[tokio::test]
     async fn a_lane_fetch_under_main_tree_include_grants_is_refused_by_name() {
-        use crate::fork_lock::Run as _;
+        use cowshed_os::fork_lock::Run as _;
         let scratch = crate::temp_root::TempRoot::new("cowshed-lane-include");
         let git = |directory: &Path, args: &[&str]| {
             let status = std::process::Command::new("git")
@@ -19809,8 +19807,9 @@ mod port_reservation_tests {
     };
     use crate::gateway_inventory::NativeGatewayInventory;
     use crate::metadata::{
-        DetachedWorkspaceMetadata, GrantSet, Platform, PortAllocation, PortBlock, PublicationState,
-        SIDECAR_VERSION, WorkspaceIncarnation, WorkspaceName,
+        DetachedWorkspaceMetadata, GrantSet, MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE, Platform,
+        PortAllocation, PortBlock, PublicationState, SIDECAR_VERSION, WorkspaceIncarnation,
+        WorkspaceName,
     };
     use crate::repository::{BoundIdentity, RepoId, RepositoryBinding};
     use crate::storage::StorageLayout;

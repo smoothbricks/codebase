@@ -8,7 +8,10 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use bytes::Bytes;
 #[cfg(target_os = "macos")]
-use cowshed_core::apfs::{CommandRunner, DetachIntent, DiskImageSource, SystemCommandRunner};
+use cowshed_apfs::{
+    CommandRunner, DetachIntent, DiskImageSource, MacOsApfsBackend, SystemCommandRunner,
+    mounts::kernel_mounts, store_lock::verify_no_symlinks,
+};
 use cowshed_core::api::dto::{
     AbandonedWork, AdoptOptions, AttachOptions, CheckpointInfo, CheckpointOptions, CheckpointQuota,
     CheckpointResult, CommandArg, DefragmentResult, DoctorReport, ExecCommand, ExecRequest,
@@ -35,10 +38,7 @@ use cowshed_core::runtime::{
     RuntimeLogChunk, WorkspaceSnapshot,
 };
 use cowshed_core::sandbox::{SandboxConfig, SandboxGrants};
-#[cfg(target_os = "macos")]
-use cowshed_core::storage::apfs::ApfsSubstrateConfig;
-#[cfg(target_os = "macos")]
-use cowshed_core::storage::apfs::native::MacOsApfsExecutionHost;
+
 use cowshed_core::storage::job_artifact::{ArtifactConfig, StreamKind};
 use cowshed_core::storage::lifecycle::{Conflict, LifecycleFact, Revision};
 use cowshed_core::{Cowshed, CowshedError, ErrorCode, JobStream, Result, Retry};
@@ -53,7 +53,7 @@ mod temp_root;
 use temp_root::TempRoot;
 
 #[cfg(target_os = "macos")]
-#[path = "support/scratch_apfs.rs"]
+#[path = "../../cowshed-apfs/tests/support/scratch_apfs.rs"]
 mod scratch_apfs;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2942,8 +2942,8 @@ async fn host_controller_process_observations_survive_a_subscriber_drop() {
     use cowshed_core::api::dto::ExitStatus;
     use cowshed_core::api::process::{JobProcessEvent, JobProcessTree, ProcessCoverage};
     use cowshed_core::api::resources::SampleInterval;
-    use cowshed_core::fork_lock::Run as _;
     use cowshed_core::runtime::{process_spans, supervisor_socket};
+    use cowshed_os::fork_lock::Run as _;
 
     let root = test_root();
     let mut config = supervisor_config(&root);
@@ -3271,8 +3271,8 @@ async fn host_controller_a_reaped_grandchild_burst_retains_its_observation_gap()
         JobProcessEvent, JobProcessTree, ProcessCoverage, ProcessCoverageGap,
     };
     use cowshed_core::api::resources::JobAccounting;
-    use cowshed_core::fork_lock::Run as _;
     use cowshed_core::runtime::{job_unattributed, supervisor_socket};
+    use cowshed_os::fork_lock::Run as _;
 
     let root = test_root();
     let mut config = supervisor_config(&root);

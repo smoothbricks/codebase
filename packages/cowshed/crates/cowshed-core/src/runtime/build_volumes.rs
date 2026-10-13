@@ -1243,14 +1243,14 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
             let mut passed = Vec::new();
             if age.unlanded()
                 && let Some(landed) =
-                    seed_from_landed(&this.host, &this.layout, &target, &aim, &mut passed)?
+                    seed_from_landed(&*this.host, &this.layout, &target, &aim, &mut passed)?
             {
                 return Ok(Refreshed {
                     passed,
                     outcome: landed,
                 });
             }
-            let outcome = reseed(&this.host, &this.layout, &target, age)?;
+            let outcome = reseed(&*this.host, &this.layout, &target, age)?;
             Ok(Refreshed { passed, outcome })
         })
         .await
@@ -1714,7 +1714,7 @@ fn collect_legacy_seed_sidecars(
                         &error,
                     )
                 })?;
-                crate::fsio::sync_directory(layout.images()).map_err(|error| {
+                cowshed_os::fsio::sync_directory(layout.images()).map_err(|error| {
                     io(
                         "sync legacy seed metadata collection",
                         layout.images(),
@@ -2336,7 +2336,7 @@ fn say_release(id: &BuildVolumeId, whose: &str, release: &BuildVolumeRelease) {
 /// Spec 16's owned index-link cutover. Only a recorded fixed `.codegraph` link is exchanged;
 /// the index is copied from a sealed snapshot, never from the live database.
 fn migrate_owned_indexes(
-    host: &Host,
+    host: &impl RuntimeStorageHost,
     layout: &BuildVolumeLayout,
     live: &BuildVolumeId,
     checkout: &Path,
@@ -2461,7 +2461,7 @@ fn migrate_owned_indexes(
                     ));
                 }
                 crate::storage::apfs::native::swap_paths(at, &staged).map_err(storage)?;
-                crate::fsio::sync_directory(at.parent().expect("index parent"))
+                cowshed_os::fsio::sync_directory(at.parent().expect("index parent"))
                     .map_err(|error| io("sync the index publication", at, &error))?;
                 std::fs::remove_file(&staged)
                     .map_err(|error| io("remove the exchanged index link", &staged, &error))?;
@@ -2601,7 +2601,7 @@ fn head_tree(checkout: &Path) -> std::result::Result<GitOid, String> {
 /// again under it. `None` when none was captured; every candidate passed over is in `passed`.
 /// The caller holds `target`'s image lock.
 fn seed_from_landed(
-    host: &Host,
+    host: &impl RuntimeStorageHost,
     layout: &BuildVolumeLayout,
     target: &Owner,
     aim: &Aim,
@@ -2666,7 +2666,7 @@ fn seed_from_landed(
 /// A reseed (16_build_volumes.md, "Which volume a seed holds", step 2): capture the target's
 /// live volume when it is nearer the fork's tree than the seed, or as near and written since.
 fn reseed(
-    host: &Host,
+    host: &impl RuntimeStorageHost,
     layout: &BuildVolumeLayout,
     target: &Owner,
     age: SeedAge,
@@ -2689,7 +2689,7 @@ fn reseed(
 /// non-forced detach, not profile enumeration or a later holder probe, excludes filesystem
 /// writers while the image is validated and cloned. A skip leaves every seed as it was.
 fn capture(
-    host: &Host,
+    host: &impl RuntimeStorageHost,
     layout: &BuildVolumeLayout,
     target: &Owner,
     source: &BuildVolumeId,
@@ -3096,7 +3096,7 @@ mod tests {
         let nonseed = candidate(&BuildVolumeRecord::new(None, linked("lane")));
         let held = candidate(&record);
         let held_path = crate::metadata::append_suffix(&held.image, ".hold");
-        let holder = crate::fork_lock::Fenced::new(
+        let holder = cowshed_os::fork_lock::Fenced::new(
             fs::OpenOptions::new()
                 .read(true)
                 .write(true)
