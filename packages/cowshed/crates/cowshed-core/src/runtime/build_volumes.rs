@@ -2748,9 +2748,9 @@ fn capture(
         ),
     ) {
         Ok(()) => {}
-        Err(error @ ApfsStorageError::BuildVolumeHeld { .. }) => {
+        Err(ApfsStorageError::BuildVolumeHeld { image, open, .. }) => {
             return Ok(Err(CaptureSkip::VolumeBusy {
-                reason: error.to_string(),
+                reason: volume_busy_reason(&image, &open),
             }));
         }
         Err(ApfsStorageError::Apfs(error)) if cowshed_apfs::detach_was_dissented(&error) => {
