@@ -110,6 +110,30 @@ const SCALARS = [
 
 const refusals: readonly Refusal[] = [
   {
+    name: 'a missing native Copy fact',
+    mutate: (model) => {
+      Reflect.deleteProperty(objectAt(model, RECORD), 'copy');
+    },
+  },
+  {
+    name: 'a non-boolean native Copy fact',
+    mutate: (model) => {
+      objectAt(model, RECORD).copy = 'true';
+    },
+  },
+  {
+    name: 'a missing static native size',
+    mutate: (model) => {
+      Reflect.deleteProperty(objectAt(model, RECORD), 'staticSize');
+    },
+  },
+  {
+    name: 'a non-numeric static native size',
+    mutate: (model) => {
+      objectAt(model, RECORD).staticSize = '8';
+    },
+  },
+  {
     name: 'an extra key in serde',
     mutate: (model) => {
       objectAt(model, [...RECORD, 'serde']).lingering = true;
