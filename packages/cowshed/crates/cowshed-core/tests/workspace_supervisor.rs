@@ -428,7 +428,7 @@ fn config(root: &TempRoot) -> WorkspaceSupervisorConfig {
         default_cwd: Some(WorkspacePath::new("packages/app").unwrap()),
         sandbox: SandboxConfig {
             home: PathBuf::from("/Users/tester"),
-            mount_root: root.to_path_buf(),
+            mount_root: root.join("mounts"),
             workspace_mount: workspace_root,
             exec_temp_dir: PathBuf::from("/tmp/cowshed-exec"),
             profile_directory: root.join("store/run/profiles"),
