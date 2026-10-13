@@ -101,7 +101,8 @@ The plugin discovers Cargo workspaces beside Nx project manifests at any depth:
 
 - **Workspace owner:** the project beside a workspace `Cargo.toml` owns one `cargo-fetch`, `cargo-test-compile`,
   `cargo-test-archive`, `cargo-lint`, cross-check, mutation, bench, and sweep target. Its `cargo-lint` and `cargo-test`
-  aggregates reach all workspace crates, including a root `[package]`.
+  aggregates reach all workspace crates, including a root `[package]`; `cargo-test` is the ordinary suite, and the
+  project's `test` also reaches the serial test groups (below).
 - **Crate owner:** the deepest Nx project directory containing a crate owns `cargo-test-<crate>` targets. Its
   `cargo-lint` delegates to the workspace owner's one verdict, and `lint` never depends on the workspace test suite.
   Projects can own multiple crates. A nested independent workspace has its own prerequisites and does not inherit those
@@ -500,15 +501,35 @@ Concrete targets come from concrete files:
   `platform = 'cfg(target_os="macos")'`. The runner's filter is the union of those overrides, so the runner and the
   per-crate exclusions cannot drift; every crate piece excludes it with `not (…)`, so each test is selected by exactly
   one target. The runner is not inferred off macOS, where nextest applies the group nowhere and no piece excludes its
-  tests. It is a `bounded-exec` run of the group's selection under the same progress bound as every test target, and
-  asks for one CPU token, matching the group's one runnable test process instead of reserving idle host capacity. The
-  run carries `--no-fail-fast`: an ordinary test failure does not stop the group's remaining tests, and a failed verdict
-  lists the failed ones. It carries `--no-tests=fail`, so a filter that selects no test fails the group. Ignored tests
-  keep their explicit lane. The root's `cargo-test` and every member's `cargo-test` depend on the group. A crate named
-  `group-*` is refused, since its runner name would collide. A repository's serial group may measure each test's code
-  time against a class with a nextest run-wrapper from the plugin's source (`src/nextest-code-bound.ts`), which warns of
-  a test over its class and never fails or kills it; the group's target hashes that file as an input, so changing it
-  reruns the group (`specs/cowshed/08_testing.md`, "Integration tests (real substrate)").
+  tests. Its executor, `@smoothbricks/nx-plugin:nextest-group`, lists the selection
+  (`nextest list --message-format=json`, same archive and reuse flags) under the existing bounded runner, counts the
+  matching non-ignored tests, and runs the group under a bound of that count × 30 s. Both stages ask the bounded
+  executor for one CPU token, matching the group's one runnable test process instead of reserving idle host capacity.
+  The bound is aggregate, not a per-test limit; the real-APFS lifecycle tests keep their 60 s code bound in the
+  repository's run-wrapper. The run carries `--no-fail-fast`: an ordinary test failure does not stop the group's
+  remaining tests, and a failed verdict lists the failed ones. A listing that fails, does not parse, or selects no test
+  refuses before anything runs, clears this task's previous verdict and report, and fails the group rather than running
+  it unbounded. Ignored tests keep their explicit lane. A crate named `group-*` is refused, since its runner name would
+  collide. A repository's serial group may bound each test's code time with a nextest run-wrapper from the plugin's
+  source (`src/nextest-code-bound.ts`); the group's target hashes that file as an input, so changing it reruns the group
+  (`specs/cowshed/08_testing.md`, "Integration tests (real substrate)").
+- `cargo-test` is the ordinary suite alone: it depends on the crate pieces and never on a serial group, so a run of it
+  never reaches a group's real-image tests. The inferred `test`, the gate of the cargo workspace root and of every
+  project that owns crates, depends on `cargo-test` and on every group's runner, by plain name at the root that owns
+  them and across projects from a member. A project that declares its own `test` replaces that list, so its declaration
+  names the runners it wants: `{ "projects": ["<root project>"], "target": "cargo-test-group-<group>" }`.
+- A group's runner hashes only the crates its filter can select tests from, with everything they link, every member
+  manifest and the repository's nextest config, so a change to an unrelated crate leaves it cached. The filter is read
+  as nextest reads it (its precedence, blanks and predicate arguments; `filterScope`): a plain `package(<name>)` or
+  `package(=<name>)` bounds a clause to that package, `and`, `&` and `-` keep the narrower side or the left side, and
+  `or`, `|` and `+` take every clause. Anything that bounds nothing scopes the group to every member, as the archive is
+  hashed: a clause with no package, a glob, substring or regex name, `not`, `deps` or `rdeps`, an argument with a
+  backslash or a comma, a filter nextest refuses, or packages that exclude each other. A scope that names a package
+  which is not a member of the Cargo workspace is refused when the graph is built.
+- Inference orders nothing between two serial groups: each is serial only within its own runner. A repository that needs
+  two never concurrent states the edge as explicit target config, `"dependsOn": ["...", "cargo-test-group-<other>"]`
+  under `nx.json` `targetDefaults` or the owning project's `nx.targets`, and Nx starts the later group once the earlier
+  one has finished.
 - Canonical `napi` package metadata provides a host `cargo-napi` target and named release targets for each configured
   triple. Linux `--use-napi-cross` targets compile C/C++ dependencies with Clang; the NAPI CLI supplies its downloaded
   GNU sysroot and toolchain flags. This avoids the bundled GCC's unsupported diagnostics-color flag without disabling
