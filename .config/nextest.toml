@@ -8,9 +8,15 @@
 # reads that scope off the filter (`filterScope`). A clause without one widens its
 # group's inputs to the whole workspace again.
 #
-#   real-apfs       the `cowshed-apfs` crate's own real-image tests: the device layer.
+#   real-apfs       the real-image scenarios of the `cowshed-apfs-tests` crate: the device layer's own
+#                   tests, written against the production `cowshed-apfs` API.
 #   real-apfs-host  the real-image tests that remain in `cowshed-core` and `cowshed-cli`,
 #                   which run on top of that layer.
+#
+# The scenarios are a crate of their own, no workspace crate depends on it, so editing one
+# invalidates the device group alone; a change to the production `cowshed-apfs`, or to what
+# it links, reaches both groups, because the host crates link it too. The production crate's
+# own unit tests are ordinary tests and belong to neither group.
 #
 # `max-threads = 1` serializes a group within its one runner process. It cannot order one
 # group against the other, which are two runners: Nx does, through the explicit
@@ -41,7 +47,7 @@ max-threads = 1
 max-threads = 1
 
 [[profile.default.overrides]]
-filter = 'package(cowshed-apfs) and test(/real_apfs_/)'
+filter = 'package(cowshed-apfs-tests) and test(/real_apfs_/)'
 platform = 'cfg(target_os="macos")'
 test-group = 'real-apfs'
 slow-timeout = { period = "180s", terminate-after = 1 }
@@ -86,7 +92,7 @@ run-wrapper = 'real-apfs-code-60s'
 # exactly the tests the two groups hold, and a wrapper rule any wider would bind ordinary
 # tests to a real-image class. serial-group-wiring.test.ts compares them.
 [[profile.default.scripts]]
-filter = 'package(cowshed-apfs) and test(/real_apfs_/)'
+filter = 'package(cowshed-apfs-tests) and test(/real_apfs_/)'
 platform = 'cfg(target_os="macos")'
 run-wrapper = 'real-apfs-code-30s'
 
