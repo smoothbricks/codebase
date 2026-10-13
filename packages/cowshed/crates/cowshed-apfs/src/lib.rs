@@ -2428,11 +2428,10 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
     /// Detach every attachment the kernel holds for `image`, under its lease, each by the whole
     /// device that attachment is detached through, re-reading the image's own mapping before
     /// each one. A path held twice is released twice; a path held by nothing is already
-    /// released. One attachment is one detach: an APFS attachment shows two whole devices (the
-    /// image's and its synthesized container), and detaching one takes both, with every volume
-    /// the container holds. Nothing here unmounts first: a mounted volume's caller unmounts it
-    /// ([`Self::unmount_released`]), and an unmounted one, such as a template's staging image,
-    /// has nothing to unmount.
+    /// released. One attachment is one detach: target the image driver's physical whole
+    /// device, not its synthesized APFS container. Nothing here unmounts first: a mounted
+    /// volume's caller unmounts it ([`Self::unmount_released`]); an unmounted template has
+    /// nothing to unmount.
     pub fn release_every_attachment(
         &self,
         image: &Path,
@@ -3651,8 +3650,8 @@ fn release_views_of(
         .collect()
 }
 
-/// A formatted attachment's container and every APFS volume it reports in it. Refused when it
-/// reports no volume, a volume without its container, or volumes in two containers.
+/// A formatted attachment's physical image device and every APFS volume in its one container.
+/// Neither a synthesized container nor a slice is authority to release the image driver.
 fn attached_apfs_volumes(entities: &[(String, String)]) -> Result<(String, Vec<String>), String> {
     let volumes: Vec<String> = entities
         .iter()
@@ -3670,7 +3669,7 @@ fn attached_apfs_volumes(entities: &[(String, String)]) -> Result<(String, Vec<S
             ));
         }
     }
-    Ok((container, volumes))
+    Ok((physical_image_device(entities)?.to_owned(), volumes))
 }
 
 fn is_valid_apfs_volume_name(name: &str) -> bool {
@@ -3894,8 +3893,8 @@ fn is_apfs_container_hint(hint: &str) -> bool {
         || hint_has_type_guid(hint, APFS_STORE_TYPE_GUID_PREFIX)
 }
 
-/// The APFS volume an attached image exposes, and the synthesized container it hangs from — the
-/// whole device whose detach releases the image — read from the image's own system entities.
+/// The physical image device and its one APFS volume. The synthesized container validates
+/// the volume's parentage, but is not the device whose image-driver connection we release.
 ///
 /// Cowshed's images hold one volume in one container, and both reports of an attachment name
 /// the two: `diskutil image attach --plist` with string hints (`Apple_APFS_Container`,
@@ -3914,7 +3913,11 @@ fn attached_apfs_volume(entities: &[(String, String)]) -> Result<(String, String
     let [volume] = volumes.as_slice() else {
         return Err(format!("expected one APFS volume, reported {volumes:?}"));
     };
-    Ok((reported_container(entities, volume)?, (*volume).to_owned()))
+    reported_container(entities, volume)?;
+    Ok((
+        physical_image_device(entities)?.to_owned(),
+        (*volume).to_owned(),
+    ))
 }
 
 /// The container `volume` is a slice of, once the report names it as an APFS container.
@@ -3931,6 +3934,25 @@ fn reported_container(entities: &[(String, String)], volume: &str) -> Result<Str
             "APFS volume {volume} was reported without its container {container}"
         ))
     }
+}
+
+/// The image driver's whole media, distinct from every synthesized container and slice.
+/// RAW exposes it with no content hint; partitioned retained images name their partition map.
+fn physical_image_device(entities: &[(String, String)]) -> Result<&str, String> {
+    let mut physical = entities.iter().filter(|(device, hint)| {
+        device_depth(device) == 0
+            && is_kernel_device_path(device)
+            && (hint.is_empty()
+                || hint == "GUID_partition_scheme"
+                || hint == "Apple_partition_scheme")
+    });
+    let Some((device, _)) = physical.next() else {
+        return Err("attachment reports no physical whole image device".into());
+    };
+    if physical.next().is_some() {
+        return Err("attachment reports multiple physical whole image devices".into());
+    }
+    Ok(device)
 }
 
 /// The refusal of a device its image no longer holds, naming the whole devices it holds now.
@@ -5184,8 +5206,8 @@ mod tests {
 
     /// `diskutil image attach --nobrowse --noMount --plist` for a formatted image, captured live on
     /// macOS 26.6: the image's whole device carries no content hint, and the synthesized container
-    /// and its one case-sensitive volume follow it. The attach answers with the volume and the
-    /// whole disk it hangs from, the synthesized container.
+    /// and its one case-sensitive volume follow it. The volume is mounted; the physical
+    /// whole device, not its synthesized container, is detached.
     const ATTACH_PLIST: &str = r#"<?xml version="1.0"?><plist><dict><key>system-entities</key><array>
       <dict><key>content-hint</key><string></string><key>dev-entry</key><string>disk4</string></dict>
       <dict><key>content-hint</key><string>Apple_APFS_Container</string><key>dev-entry</key><string>disk5</string></dict>
@@ -5495,7 +5517,7 @@ mod tests {
         let attachment = backend.attach_retained_verified(&input).unwrap();
         assert_eq!(attachment.0.image(), input.path());
         assert_eq!(attachment.volume_device(), "/dev/disk5s1");
-        assert_eq!(attachment.0.whole_device(), "/dev/disk5");
+        assert_eq!(attachment.0.whole_device(), "/dev/disk4");
         let requests = backend.runner().requests();
         assert_eq!(
             argv(&requests[0]),
@@ -6042,7 +6064,7 @@ mod tests {
             ok(ATTACH_PLIST),
             holding_verified_volume("session.dmg"),
             failed(8, "not clean"),
-            holding("session.dmg", "/dev/disk5"),
+            holding("session.dmg", "/dev/disk4"),
             ok([]),
             no_images(),
         ]));
@@ -6068,7 +6090,7 @@ mod tests {
         assert_eq!(steps[5].command().program, Path::new(HDIUTIL));
         assert_eq!(
             argv(steps[5].command()),
-            ["detach", "-verbose", "/dev/disk5"]
+            ["detach", "-verbose", "/dev/disk4"]
         );
         assert!(
             !commands(&steps)
@@ -6132,7 +6154,7 @@ mod tests {
             held.iter()
                 .map(RecoveredImageAttachment::whole_device)
                 .collect::<Vec<_>>(),
-            ["/dev/disk15", "/dev/disk25"]
+            ["/dev/disk14", "/dev/disk24"]
         );
     }
 
@@ -8070,7 +8092,7 @@ mod tests {
             .existing_attachment(Path::new("/tmp/cowshed-target.dmg"))
             .expect("inventory")
             .expect("existing attachment");
-        assert_eq!(attachment.whole_device(), "/dev/disk15");
+        assert_eq!(attachment.whole_device(), "/dev/disk14");
         assert_eq!(attachment.volume_device(), "/dev/disk15s1");
         assert_eq!(
             backend
@@ -8168,10 +8190,9 @@ mod tests {
         else {
             panic!("the live capture is a formatted APFS attachment");
         };
-        // The synthesized APFS volume, not the image's own device or the synthesized store, and
-        // the whole disk that volume hangs from.
+        // The synthesized volume is mounted; the image driver's physical disk is detached.
         assert_eq!(attachment.volume_device(), "/dev/disk15s1");
-        assert_eq!(attachment.whole_device(), "/dev/disk15");
+        assert_eq!(attachment.whole_device(), "/dev/disk14");
     }
 
     /// An attach that does not report exactly one APFS volume inside a container it also reports
@@ -8194,7 +8215,7 @@ mod tests {
         };
         assert_eq!(
             parse_attachment_plist(ATTACH_PLIST.as_bytes()).unwrap(),
-            ("/dev/disk5".into(), "/dev/disk5s1".into())
+            ("/dev/disk4".into(), "/dev/disk5s1".into())
         );
         for (entities, refusal) in [
             (
@@ -9093,7 +9114,7 @@ mod tests {
             .release_every_attachment(&image, DetachIntent::Release)
             .unwrap();
         let commands: Vec<Vec<String>> = backend.runner().requests().iter().map(argv).collect();
-        assert_eq!(commands, [["detach", "-verbose", "/dev/disk5"]]);
+        assert_eq!(commands, [["detach", "-verbose", "/dev/disk4"]]);
     }
 
     /// A release unmounts each volume of the container under its own revalidation against the
@@ -9105,7 +9126,7 @@ mod tests {
         let [view] = views.as_slice() else {
             panic!("one attachment is one release view");
         };
-        assert_eq!(view.whole_device(), "/dev/disk5");
+        assert_eq!(view.whole_device(), "/dev/disk4");
         let both = BTreeSet::from(["/dev/disk5s1".to_owned(), "/dev/disk5s2".to_owned()]);
         let volumes: Vec<ReleasedVolume> = view.mounted_volumes(&both).collect();
         let backend = graced_backend([
@@ -9122,7 +9143,7 @@ mod tests {
         }
         let stranger = ReleasedVolume(AttachedImage {
             image: image.clone(),
-            whole_device: "/dev/disk5".into(),
+            whole_device: "/dev/disk4".into(),
             volume_device: "/dev/disk5s3".into(),
             pin: std::sync::Mutex::new(None),
         });
@@ -9131,7 +9152,7 @@ mod tests {
             .unwrap_err();
         assert!(
             matches!(&refused, ApfsError::InvalidAttachmentInventory(message)
-                if message.contains("no longer owns /dev/disk5 / /dev/disk5s3")),
+                if message.contains("no longer owns /dev/disk4 / /dev/disk5s3")),
             "{refused}"
         );
         let commands: Vec<Vec<String>> = backend.runner().requests().iter().map(argv).collect();
@@ -9139,10 +9160,10 @@ mod tests {
     }
 
     /// A release unmounts exactly the container's mounted volumes, each under its own
-    /// revalidation, and leaves the unmounted one to the container's single detach. Cleanup
+    /// revalidation, and leaves the unmounted one to the physical image's single detach. Cleanup
     /// releases retained inputs too; it does not admit their format to ordinary runtime use.
     #[test]
-    fn a_release_unmounts_only_the_mounted_volumes_then_detaches_the_container_once() {
+    fn a_release_unmounts_only_the_mounted_volumes_then_detaches_the_physical_image_once() {
         for extension in [IMAGE_EXTENSION, "asif"] {
             let image = temp_path("two-volume-mixed", extension);
             let backend = graced_backend([
@@ -9163,7 +9184,7 @@ mod tests {
                 commands,
                 [
                     vec!["/dev/disk5s2".to_owned()],
-                    vec!["detach".into(), "-verbose".into(), "/dev/disk5".into()],
+                    vec!["detach".into(), "-verbose".into(), "/dev/disk4".into()],
                 ]
             );
         }
@@ -9261,5 +9282,48 @@ mod tests {
         assert_eq!(view.whole_device(), "/dev/disk4");
         let whole = BTreeSet::from(["/dev/disk4".to_owned()]);
         assert_eq!(view.mounted_volumes(&whole).count(), 0);
+    }
+
+    #[test]
+    fn physical_image_device_is_neither_its_synthesized_container_nor_a_slice() {
+        let entities = [
+            ("/dev/disk42".to_owned(), "Apple_APFS_Container".to_owned()),
+            ("/dev/disk42s1".to_owned(), "Apple_APFS_Volume".to_owned()),
+            ("/dev/disk7".to_owned(), String::new()),
+        ];
+        assert_eq!(physical_image_device(&entities).unwrap(), "/dev/disk7");
+        assert_eq!(
+            attached_apfs_volume(&entities).unwrap(),
+            ("/dev/disk7".into(), "/dev/disk42s1".into())
+        );
+        assert_eq!(attached_apfs_volumes(&entities).unwrap().0, "/dev/disk7");
+        assert!(physical_image_device(&entities[..2]).is_err());
+        let mut ambiguous = entities.to_vec();
+        ambiguous.push(("/dev/disk8".into(), "GUID_partition_scheme".into()));
+        assert!(physical_image_device(&ambiguous).is_err());
+    }
+
+    #[test]
+    fn a_never_mounted_release_detaches_the_physical_image_device() {
+        let image = temp_path("physical-release", IMAGE_EXTENSION);
+        let inventory = || {
+            Reply::Inventory(Ok(vec![AttachedDiskImage::file(
+                &image,
+                None,
+                [
+                    ("/dev/disk7", ""),
+                    ("/dev/disk42", APFS_CONTAINER_CONTENT),
+                    ("/dev/disk42s1", APFS_VOLUME_CONTENT),
+                ],
+            )]))
+        };
+        let backend = graced_backend([inventory(), inventory(), inventory(), ok([]), no_images()]);
+        backend
+            .release_image(&image, &BTreeSet::new(), DetachIntent::Release)
+            .unwrap();
+        let requests = backend.runner().requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].program, Path::new(HDIUTIL));
+        assert_eq!(argv(&requests[0]), ["detach", "-verbose", "/dev/disk7"]);
     }
 }
