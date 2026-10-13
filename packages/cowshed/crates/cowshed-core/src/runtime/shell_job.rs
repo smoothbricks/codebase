@@ -148,7 +148,7 @@ impl WorkspaceShells {
                     Arc::new(HostActivator {
                         program: self.program.clone(),
                         workspace_mount: spawn.workspace_mount.clone(),
-                        profile: launch,
+                        profile: spawn.profile.clone(),
                         environment: base,
                         envrc_directory: spawn.envrc_directory.clone(),
                     }),
@@ -1002,7 +1002,8 @@ enum HostActivation {
 pub(super) struct HostActivator {
     program: ShellHostProgram,
     workspace_mount: PathBuf,
-    profile: ProfileLaunch,
+    /// Made sure of at each host start: `cowshed gc` may have removed its file since the last.
+    profile: super::supervisor::ChildProfile,
     environment: BTreeMap<OsString, OsString>,
     /// `None` for a workspace with no shell configuration: its hosts hold the sandbox
     /// environment itself, which no workspace file can make stale.
@@ -1027,7 +1028,7 @@ impl HostActivator {
         let theirs_raw = theirs.as_raw_fd();
         let mut command = tokio::process::Command::new(SANDBOX_EXEC);
         command
-            .args(self.profile.args())
+            .args(self.profile.launch()?.args())
             .arg(&staged)
             .args(self.program.arguments())
             .env_clear()

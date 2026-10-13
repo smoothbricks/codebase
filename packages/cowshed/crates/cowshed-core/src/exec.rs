@@ -15,7 +15,7 @@ mod macos;
 mod other;
 mod profile_file;
 
-pub use profile_file::{ProfileFile, ProfileLaunch, profile_directory};
+pub use profile_file::{ProfileFile, ProfileLaunch, collect_profiles, profile_directory};
 
 pub const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 
@@ -103,15 +103,16 @@ pub fn plan_exec(
 ) -> Result<SpawnPlan, ExecError> {
     let profile =
         seatbelt_profile(sandbox, SandboxProfileRole::ExecutedChild).map_err(map_sandbox_error)?;
-    let profile = ProfileFile::write(&profile).map_err(|source| ExecError::WrapperFailure {
-        stage: WrapperStage::ValidateProfile,
-        message: format!(
-            "cannot write the sandbox profile into {}: {source}",
-            profile_directory().display()
-        ),
-        source: Some(source),
-    })?;
-    plan_exec_under(request, sandbox, &ProfileLaunch::new(profile, sandbox))
+    let profile =
+        ProfileLaunch::write(sandbox, &profile).map_err(|source| ExecError::WrapperFailure {
+            stage: WrapperStage::ValidateProfile,
+            message: format!(
+                "cannot write the sandbox profile into {}: {source}",
+                sandbox.profile_directory.display()
+            ),
+            source: Some(source),
+        })?;
+    plan_exec_under(request, sandbox, &profile)
 }
 
 /// [`plan_exec`] under an executed-child `profile` already rendered from `sandbox`: a workspace
@@ -513,6 +514,7 @@ mod tests {
                 mount_root: self.root.clone(),
                 workspace_mount: self.workspace.clone(),
                 exec_temp_dir: self.root.join("tmp"),
+                profile_directory: self.root.join("store/run/profiles"),
                 port_block: PortBlock::new(40_960, 16).unwrap(),
                 retained_port_blocks: Vec::new(),
                 mode: RunSandboxMode::ReadWrite,
@@ -1129,7 +1131,7 @@ mod tests {
         assert_eq!(plan.program, Path::new(SANDBOX_EXEC));
         assert_eq!(plan.args[0], "-f");
         assert!(
-            Path::new(&plan.args[1]).starts_with(profile_directory()),
+            Path::new(&plan.args[1]).starts_with(&tree.sandbox().profile_directory),
             "{:?}",
             plan.args[1]
         );

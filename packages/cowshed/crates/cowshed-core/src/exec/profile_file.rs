@@ -9,26 +9,31 @@
 //! A profile's text depends only on its workspace's authority: the one path that moves under a
 //! workspace, its build volume, is the `BUILD_VOLUME` parameter (`crate::sandbox`), bound per
 //! launch. So one file serves every job of a workspace profile, before and after a build volume
-//! pivot. It is named by its SHA-256 in [`profile_directory`], inside the machine-global cowshed
-//! root that every rendered profile denies, read and write, to every role, so no sandboxed process
-//! can replace a profile a later launch reads. It is written once, mode 0400, by a rename that
-//! makes it whole or absent, and kept.
+//! pivot. It is named by its SHA-256 in the [`profile_directory`] of the store the launcher
+//! serves, inside the store every rendered profile denies, read and write, to every role, so no
+//! sandboxed process can replace a profile a later launch reads. A fixture's launches use its
+//! own store, never the host's. Every launch makes sure of its file: it is written, mode 0400, by
+//! a rename that makes it whole or absent when missing, and its mtime is bumped when present.
+//! `cowshed gc` ([`collect_profiles`]) removes a file only when its last launch predates the
+//! start of every live supervisor of the store, an order of events and not a timeout: no live
+//! supervisor can still be about to launch from it, and a launch that wants it writes it again.
 
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, DirBuilder, OpenOptions};
 use std::io::{self, Write as _};
+use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::SystemTime;
 
 use crate::api::dto::Sha256Digest;
 use crate::sandbox::{BUILD_VOLUME_PARAM, SandboxConfig};
 
-/// Where profile files live: beside the supervisors' sockets in the store's `run` directory.
-pub fn profile_directory() -> PathBuf {
-    Path::new(cowshed_gateway_types::STORE_ROOT)
-        .join("run")
-        .join("profiles")
+/// Where the profile files of `store_root`'s launches live: beside its supervisors' sockets in
+/// its `run` directory.
+pub fn profile_directory(store_root: &Path) -> PathBuf {
+    store_root.join("run").join("profiles")
 }
 
 /// One rendered profile on disk, `<sha256>.sb`, whole once it exists.
@@ -41,19 +46,17 @@ pub struct ProfileFile {
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
 impl ProfileFile {
-    /// The file of `profile` in [`profile_directory`], written now when it is absent.
-    pub fn write(profile: &str) -> io::Result<Self> {
-        Self::write_in(&profile_directory(), profile)
-    }
-
-    /// The file of `profile` in `directory`, written now when it is absent. The content is
-    /// staged beside it and renamed into place, so a reader finds the whole profile or none; a
-    /// concurrent writer of the same profile renames identical bytes over it.
-    pub fn write_in(directory: &Path, profile: &str) -> io::Result<Self> {
+    /// The file of `profile` in `directory`, made sure of for a launch now: its mtime bumped
+    /// when present, written when absent. The content is staged beside it and renamed into
+    /// place, so a reader finds the whole profile or none; a concurrent writer of the same
+    /// profile renames identical bytes over it.
+    pub fn write(directory: &Path, profile: &str) -> io::Result<Self> {
         let digest = Sha256Digest::compute(profile.as_bytes()).to_hex();
         let path = directory.join(format!("{digest}.sb"));
-        if fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_file()) {
-            return Ok(Self { path });
+        match touch(&path) {
+            Ok(()) => return Ok(Self { path }),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
         }
         DirBuilder::new()
             .recursive(true)
@@ -83,6 +86,83 @@ impl ProfileFile {
     }
 }
 
+/// Set `path`'s access and modification times to now, without following a symlink.
+fn touch(path: &Path) -> io::Result<()> {
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    // SAFETY: `path` is NUL-terminated; a null `times` means now for both.
+    match unsafe {
+        libc::utimensat(
+            libc::AT_FDCWD,
+            path.as_ptr(),
+            std::ptr::null(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } {
+        0 => Ok(()),
+        _ => Err(io::Error::last_os_error()),
+    }
+}
+
+/// Remove the profile files of `store_root` whose last launch predates the start of its oldest
+/// live supervisor; with no live supervisor, nothing is removed. Answers how many went.
+pub fn collect_profiles(store_root: &Path) -> io::Result<usize> {
+    let Some(oldest) = oldest_live_supervisor(&store_root.join("run"))? else {
+        return Ok(0);
+    };
+    let directory = profile_directory(store_root);
+    let entries = match fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error),
+    };
+    let mut removed = 0;
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(digest) = name.to_str().and_then(|name| name.strip_suffix(".sb")) else {
+            continue;
+        };
+        if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            continue;
+        }
+        let launched = match entry.metadata().and_then(|metadata| metadata.modified()) {
+            Ok(launched) => launched,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        if launched >= oldest {
+            continue;
+        }
+        match fs::remove_file(entry.path()) {
+            Ok(()) => removed += 1,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(removed)
+}
+
+/// When the oldest supervisor still serving a socket in `run` started serving it.
+fn oldest_live_supervisor(run: &Path) -> io::Result<Option<SystemTime>> {
+    let entries = match fs::read_dir(run) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let mut oldest: Option<SystemTime> = None;
+    for entry in entries {
+        let path = entry?.path();
+        if path.extension() != Some(OsStr::new("sock")) {
+            continue;
+        }
+        if let Some(started) = crate::runtime::supervisor_socket::serving_since(&path)? {
+            oldest = Some(oldest.map_or(started, |oldest| oldest.min(started)));
+        }
+    }
+    Ok(oldest)
+}
+
 /// How `sandbox-exec` is told a profile: its file and the parameters its rules name.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProfileLaunch {
@@ -91,9 +171,13 @@ pub struct ProfileLaunch {
 }
 
 impl ProfileLaunch {
-    /// `file`, the profile rendered from `sandbox`, bound to `sandbox`'s build volume.
-    pub fn new(file: ProfileFile, sandbox: &SandboxConfig) -> Self {
-        Self::bound(file, sandbox.build_volume_mount.clone())
+    /// A launch of `profile`, rendered from `sandbox`: its file made sure of in `sandbox`'s
+    /// profile directory now, bound to `sandbox`'s build volume.
+    pub fn write(sandbox: &SandboxConfig, profile: &str) -> io::Result<Self> {
+        Ok(Self::bound(
+            ProfileFile::write(&sandbox.profile_directory, profile)?,
+            sandbox.build_volume_mount.clone(),
+        ))
     }
 
     /// `file`, bound to `build_volume`, the build volume of the sandbox it was rendered from.
@@ -136,31 +220,61 @@ mod tests {
     use super::*;
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
+    /// A fresh directory under `/tmp`, short enough for a socket inside it to bind (`sun_path`
+    /// holds 104 bytes).
     fn scratch() -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "cowshed-profile-file-{}",
-            uuid::Uuid::new_v4().simple()
+        PathBuf::from(format!(
+            "/tmp/cowshed-pf-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..12]
         ))
     }
 
+    /// Set `path`'s modification time to `seconds` after the epoch, without following a symlink.
+    fn set_mtime(path: &Path, seconds: i64) {
+        let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        let time = libc::timespec {
+            tv_sec: seconds,
+            tv_nsec: 0,
+        };
+        // SAFETY: `path` is NUL-terminated and `times` holds the two timespecs utimensat reads.
+        let set = unsafe {
+            libc::utimensat(
+                libc::AT_FDCWD,
+                path.as_ptr(),
+                [time, time].as_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        assert_eq!(set, 0, "{}", io::Error::last_os_error());
+    }
+
+    fn mtime(path: &Path) -> SystemTime {
+        fs::symlink_metadata(path).unwrap().modified().unwrap()
+    }
+
     #[test]
-    fn a_profile_is_written_once_read_only_and_kept() {
+    fn a_profile_is_written_once_read_only_kept_and_its_launches_bump_it() {
         let directory = scratch();
-        let first = ProfileFile::write_in(&directory, "(version 1)(allow default)").unwrap();
+        let first = ProfileFile::write(&directory, "(version 1)(allow default)").unwrap();
         assert_eq!(
             fs::read_to_string(first.path()).unwrap(),
             "(version 1)(allow default)"
         );
         let metadata = fs::metadata(first.path()).unwrap();
         assert_eq!(metadata.permissions().mode() & 0o777, 0o400);
-        let again = ProfileFile::write_in(&directory, "(version 1)(allow default)").unwrap();
+        set_mtime(first.path(), 1_000);
+        let again = ProfileFile::write(&directory, "(version 1)(allow default)").unwrap();
         assert_eq!(again, first, "one file per profile");
         assert_eq!(
             fs::metadata(again.path()).unwrap().ino(),
             metadata.ino(),
             "an existing profile is not written again"
         );
-        let other = ProfileFile::write_in(&directory, "(version 1)(deny default)").unwrap();
+        assert!(
+            mtime(again.path()) > SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000),
+            "a launch bumps its file"
+        );
+        let other = ProfileFile::write(&directory, "(version 1)(deny default)").unwrap();
         assert_ne!(other, first);
         let names: Vec<_> = fs::read_dir(&directory)
             .unwrap()
@@ -174,6 +288,60 @@ mod tests {
             "dropping a handle removes nothing"
         );
         fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// gc removes a profile file exactly when its last launch predates the start of the store's
+    /// oldest live supervisor: a supervisor older than the file may still launch from it, a
+    /// stopped one is no supervisor, and with none live nothing goes. A launch after gc writes
+    /// the file again.
+    #[test]
+    fn gc_removes_a_profile_only_when_every_live_supervisor_started_after_its_last_launch() {
+        let store = scratch();
+        let run = store.join("run");
+        let profile = "(version 1)(allow default)";
+        let file = ProfileFile::write(&profile_directory(&store), profile).unwrap();
+        set_mtime(file.path(), 2_000);
+        assert_eq!(collect_profiles(&store).unwrap(), 0, "no live supervisor");
+
+        let stopped = run.join("stopped.sock");
+        drop(std::os::unix::net::UnixListener::bind(&stopped).unwrap());
+        set_mtime(&stopped, 3_000);
+        assert_eq!(
+            collect_profiles(&store).unwrap(),
+            0,
+            "a socket nothing is attached to is no live supervisor"
+        );
+
+        let older = run.join("older.sock");
+        let older_listener = std::os::unix::net::UnixListener::bind(&older).unwrap();
+        set_mtime(&older, 1_000);
+        let younger = run.join("younger.sock");
+        let _younger_listener = std::os::unix::net::UnixListener::bind(&younger).unwrap();
+        set_mtime(&younger, 3_000);
+        assert_eq!(
+            collect_profiles(&store).unwrap(),
+            0,
+            "a supervisor started before the file's last launch may launch from it again"
+        );
+        assert!(file.path().is_file());
+
+        drop(older_listener);
+        assert_eq!(
+            collect_profiles(&store).unwrap(),
+            1,
+            "every live supervisor started after the file's last launch"
+        );
+        assert!(!file.path().exists());
+
+        let relaunched = ProfileFile::write(&profile_directory(&store), profile).unwrap();
+        assert_eq!(relaunched, file);
+        assert_eq!(fs::read_to_string(relaunched.path()).unwrap(), profile);
+        assert_eq!(
+            collect_profiles(&store).unwrap(),
+            0,
+            "a launch after the youngest supervisor started keeps its file"
+        );
+        fs::remove_dir_all(&store).unwrap();
     }
 
     #[test]

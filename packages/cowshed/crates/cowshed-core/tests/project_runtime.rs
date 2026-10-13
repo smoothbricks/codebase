@@ -2046,6 +2046,7 @@ fn supervisor_config_of(
             mount_root: root.to_path_buf(),
             workspace_mount: workspace_root.clone(),
             exec_temp_dir: root.join("tmp"),
+            profile_directory: root.join("store/run/profiles"),
             port_block: cowshed_core::metadata::PortBlock::new(49_136, 16).expect("port block"),
             retained_port_blocks: Vec::new(),
             mode: cowshed_core::sandbox::RunSandboxMode::ReadWrite,

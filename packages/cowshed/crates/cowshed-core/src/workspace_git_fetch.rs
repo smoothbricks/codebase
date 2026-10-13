@@ -211,17 +211,17 @@ async fn probe_git(root: &Path, args: &[&str], sandbox: &SandboxConfig) -> Resul
     let profile =
         crate::sandbox::seatbelt_profile(sandbox, crate::sandbox::SandboxProfileRole::GitDiscovery)
             .map_err(|error| failure(error.to_string()))?;
-    let profile = crate::exec::ProfileFile::write(&profile).map_err(|error| {
+    let profile = crate::exec::ProfileLaunch::write(sandbox, &profile).map_err(|error| {
         failure(format!(
             "cannot write the Git probe's sandbox profile into {}: {error}",
-            crate::exec::profile_directory().display()
+            sandbox.profile_directory.display()
         ))
     })?;
     let mut command = tokio::process::Command::new(crate::exec::SANDBOX_EXEC);
     // The system selector names the active developer tools without consulting PATH.
     // /usr/bin/git is an xcrun shim that writes host caches even for read-only probes.
     command
-        .args(crate::exec::ProfileLaunch::new(profile, sandbox).args())
+        .args(profile.args())
         .args(["/var/select/developer_dir/usr/bin/git", "-C"])
         .arg(root)
         .args([
@@ -658,6 +658,7 @@ mod tests {
             workspace_mount: root.join("mounts/workspace"),
             shed_links: Vec::new(),
             exec_temp_dir: root.join("temp"),
+            profile_directory: root.join("store/run/profiles"),
             port_block: crate::metadata::PortBlock::new(49_136, 16).expect("ports"),
             retained_port_blocks: Vec::new(),
             mode: crate::sandbox::RunSandboxMode::ReadWrite,

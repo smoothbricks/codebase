@@ -90,10 +90,9 @@ fn descriptor_exhaustion_reports_the_diagnostics_clone_failure() {
                     std::env::current_exe().expect("test executable"),
                 ),
                 workspace_mount: PathBuf::from("/"),
-                profile: crate::exec::ProfileLaunch::bound(
-                    crate::exec::ProfileFile::write_in(&std::env::temp_dir(), "")
-                        .expect("an empty profile file"),
-                    None,
+                profile: crate::runtime::supervisor::ChildProfile::unbound(
+                    "",
+                    &std::env::temp_dir().join("cowshed-diagnostics-profiles"),
                 ),
                 environment: BTreeMap::new(),
                 envrc_directory: None,
