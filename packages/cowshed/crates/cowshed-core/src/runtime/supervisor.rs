@@ -6449,6 +6449,25 @@ impl SupervisorActor {
         // waiters so a follower that is mid-stream is served from the live deque first.
         job.stdout = VecDeque::new();
         job.stderr = VecDeque::new();
+        // The keeper's daemon start job ending is when its daemon first answers: record the
+        // daemon's group in the ledger now, because this supervisor may retire before the
+        // keeper's next probe, and a land proves the daemon from the ledger alone.
+        if self
+            .nx_daemon
+            .as_ref()
+            .is_some_and(|keeper| keeper.starting == Some(job_id))
+        {
+            let (read_write, _) = self.policy.child(crate::api::dto::RunSandboxMode::ReadWrite);
+            if let Some(project_root) = super::nx_daemon::kept_project(read_write) {
+                let record = crate::capabilities::nx::daemon_record(project_root);
+                if let Some(pid) = super::nx_daemon::live_pid(&record)
+                    && let Ok(leader) = super::job_groups::GroupLeader::observe(pid as u32)
+                    && let Some(keeper) = &mut self.nx_daemon
+                {
+                    keeper.daemon_group = Some((job_id, leader));
+                }
+            }
+        }
         if job.birth.is_some() {
             self.record_groups();
         }
