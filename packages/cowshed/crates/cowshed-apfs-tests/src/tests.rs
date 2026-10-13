@@ -482,6 +482,46 @@ fn real_apfs_fixture_runs_leave_nothing_attached_or_running_however_they_end() {
         assert!(!root.exists(), "{ending}: {} remains", root.display());
     }
 }
+/// Block until `pid`, which is not this process's child, exits, on the kernel's exit event. A
+/// process already gone, or already exiting, has exited. The device tests reach no cowshed-core
+/// internals, so this is the test's own copy of the supervisor manager's waiter.
+#[cfg(target_os = "macos")]
+fn wait_for_exit(pid: libc::pid_t) -> io::Result<()> {
+    let ident = usize::try_from(pid).map_err(io::Error::other)?;
+    // SAFETY: kqueue returns a new descriptor this function owns and closes.
+    let queue = unsafe { libc::kqueue() };
+    if queue < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the kevent structs are plain data that outlive the call; `queue` is live until
+    // the close below.
+    let result = unsafe {
+        let change = libc::kevent {
+            ident,
+            filter: libc::EVFILT_PROC,
+            flags: libc::EV_ADD | libc::EV_ONESHOT,
+            fflags: libc::NOTE_EXIT,
+            data: 0,
+            udata: std::ptr::null_mut(),
+        };
+        let mut event = std::mem::zeroed::<libc::kevent>();
+        let returned = libc::kevent(queue, &change, 1, &mut event, 1, std::ptr::null());
+        let outcome = match returned {
+            ..0 => Err(io::Error::last_os_error()),
+            // A registration that failed comes back as an event carrying the error.
+            _ if event.flags & libc::EV_ERROR != 0 => Err(i32::try_from(event.data)
+                .map_or_else(io::Error::other, io::Error::from_raw_os_error)),
+            _ => Ok(()),
+        };
+        libc::close(queue);
+        outcome
+    };
+    match result {
+        Err(error) if error.raw_os_error() == Some(libc::ESRCH) => Ok(()),
+        other => other,
+    }
+}
+
 /// The fixture root the killed-caller attach pair shares through the environment.
 #[cfg(target_os = "macos")]
 const FIXTURE_KILL_ROOT: &str = "COWSHED_TEST_FIXTURE_KILL_ROOT";
@@ -511,7 +551,7 @@ fn real_apfs_a_disk_image_attach_survives_its_callers_kill() {
             .unwrap_or_default();
     let root = ScratchRoot::new_owned("fixture-kill").expect("owned scratch root");
     let image = root.path().join("attach.dmg");
-    let _leak = RealImageCleanup::new(&backend, image.clone());
+    let mut cleanup = RealImageCleanup::new(&backend, image.clone());
     let mut child = Command::new(std::env::current_exe().expect("test binary"))
         .args([
             "--exact",
@@ -523,23 +563,45 @@ fn real_apfs_a_disk_image_attach_survives_its_callers_kill() {
         .process_group(0)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        // Its step log reaches this test's output; an unread pipe would fill and stop it.
+        .stderr(Stdio::inherit())
         .spawn_locked()
         .expect("spawn the attaching caller");
+    let caller = libc::pid_t::try_from(child.id()).expect("caller pid");
+    let in_root = |cwd: &Path| cwd.starts_with(root.path());
     let mut lines = BufReader::new(child.stdout.take().expect("caller stdout")).lines();
-    let mut inflight = false;
-    for line in lines.by_ref() {
-        let line = line.expect("caller line");
-        if line == "inflight" {
-            inflight = true;
-            break;
+    // Each attach's diskutil is announced once it runs. Stop the caller there, so it cannot
+    // move past the attach, and strike only while that diskutil still runs: an announcement
+    // read after its attach had already finished is passed over for the next one.
+    let attach = loop {
+        let line = lines
+            .next()
+            .expect("the caller's attach never came in flight")
+            .expect("caller line");
+        let Some(announced) = line.strip_prefix("inflight ") else {
+            continue;
+        };
+        let announced: libc::pid_t = announced.parse().expect("announced diskutil pid");
+        let mut status = 0;
+        // SAFETY: kill and waitpid only name the caller, this test's unreaped child;
+        // WUNTRACED returns once the stop has taken effect.
+        unsafe {
+            assert_eq!(libc::kill(caller, libc::SIGSTOP), 0, "stop the caller");
+            assert_eq!(libc::waitpid(caller, &mut status, libc::WUNTRACED), caller);
         }
-    }
-    assert!(inflight, "the caller's attach never came in flight");
+        assert!(libc::WIFSTOPPED(status), "the caller ended before its stop");
+        let tree =
+            crate::scratch_apfs::processes::processes_in(in_root).expect("list the caller's tree");
+        if tree.iter().any(|&(pid, _)| pid == announced) {
+            break announced;
+        }
+        // SAFETY: as above.
+        assert_eq!(unsafe { libc::kill(caller, libc::SIGCONT) }, 0, "resume");
+    };
     // The tree-killer's two strokes: SIGTERM to every process working in the root
-    // (the disk-image child among them, which ignores it), SIGKILL to the caller.
-    for (pid, _) in crate::scratch_apfs::processes::processes_in(|cwd| cwd.starts_with(root.path()))
-        .expect("list the caller's tree")
+    // (the disk-image child among them, which holds it blocked), SIGKILL to the caller.
+    for (pid, _) in
+        crate::scratch_apfs::processes::processes_in(in_root).expect("list the caller's tree")
     {
         // SAFETY: kill only names a process; a pid gone since the listing reports ESRCH.
         unsafe { libc::kill(pid, libc::SIGTERM) };
@@ -547,28 +609,31 @@ fn real_apfs_a_disk_image_attach_survives_its_callers_kill() {
     child.kill().expect("kill the caller mid-attach");
     let _ = child.wait();
     lines.for_each(drop);
-    // Reconcile as the next invocation does: an attach that completed is registered.
-    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    // The detached attach, and anything else still working in the root, ends on its own:
+    // wait for each one's exit event, then reconcile as the next invocation does.
     loop {
-        let devices = backend
-            .attached_whole_devices(&image)
-            .expect("attachment inventory");
-        if !devices.is_empty() {
-            backend
-                .release_image(
-                    &image,
-                    &std::collections::BTreeSet::new(),
-                    DetachIntent::Release,
-                )
-                .expect("release the attach the dead caller finished");
+        let left = crate::scratch_apfs::processes::processes_in(in_root).expect("list the root");
+        if left.is_empty() {
             break;
         }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the killed caller's attach neither completed nor left the image attachable"
-        );
-        std::thread::sleep(Duration::from_millis(250));
+        for (pid, _) in left {
+            wait_for_exit(pid).expect("watch a detached disk child's exit");
+        }
     }
+    assert!(
+        !backend
+            .attached_whole_devices(&image)
+            .expect("attachment inventory")
+            .is_empty(),
+        "the killed caller's attach (diskutil {attach}) did not complete"
+    );
+    backend
+        .release_image(
+            &image,
+            &std::collections::BTreeSet::new(),
+            DetachIntent::Release,
+        )
+        .expect("release the attach the dead caller finished");
     assert!(
         backend
             .attached_whole_devices(&image)
@@ -576,13 +641,16 @@ fn real_apfs_a_disk_image_attach_survives_its_callers_kill() {
             .is_empty(),
         "the released image is still attached"
     );
-    // The lock is free: a fresh attach and detach of the same image both work.
-    let attachment = backend
-        .attach_verified(&image)
-        .expect("attach the released image again");
-    backend
-        .detach(&attachment, DetachIntent::Release)
-        .expect("detach the released image");
+    // The lock is free: a fresh attach and detach of the same image both work, and the
+    // detached image is deleted.
+    cleanup.track(
+        backend
+            .attach_verified(&image)
+            .expect("attach the released image again"),
+    );
+    cleanup
+        .finish()
+        .expect("detach the released image and delete it");
     let leaked_after = crate::attach_budget::observe()
         .expect("attach pool after")
         .reading
@@ -621,35 +689,27 @@ fn real_apfs_disk_image_attach_outliving_a_killed_caller() {
     let backend = MacOsApfsBackend::new(SystemCommandRunner);
     let image = root.join("attach.dmg");
     crate::blank_image::blank_image(&image);
-    // Say when the attach's own diskutil exists, so the parent kills mid-attach, not
-    // during the inventory reads before it: a process working in this root whose
-    // executable is diskutil is the attach itself.
+    // Announce each attach's own diskutil by pid once it runs, so the parent kills
+    // mid-attach, not during the inventory reads before it: a process working in this root
+    // whose executable is diskutil is an attach itself (the detach is `hdiutil`).
     let watched = root.clone();
     std::thread::spawn(move || {
+        let mut announced = std::collections::BTreeSet::new();
         loop {
             let found =
                 crate::scratch_apfs::processes::processes_in(|cwd| cwd.starts_with(&watched))
-                    .is_ok_and(|found| {
-                        found.iter().any(|(pid, _)| {
-                            let mut path = [0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
-                            // SAFETY: `path` is writable for its whole length, the size passed.
-                            let length = unsafe {
-                                libc::proc_pidpath(
-                                    *pid,
-                                    path.as_mut_ptr().cast(),
-                                    path.len() as u32,
-                                )
-                            };
-                            usize::try_from(length).is_ok_and(|length| {
-                                length > 0
-                                    && String::from_utf8_lossy(&path[..length])
-                                        .ends_with("/diskutil")
-                            })
-                        })
-                    });
-            if found {
-                println!("inflight");
-                return;
+                    .unwrap_or_default();
+            for (pid, _) in found {
+                let mut path = [0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+                // SAFETY: `path` is writable for its whole length, the size passed.
+                let length =
+                    unsafe { libc::proc_pidpath(pid, path.as_mut_ptr().cast(), path.len() as u32) };
+                let diskutil = usize::try_from(length).is_ok_and(|length| {
+                    length > 0 && String::from_utf8_lossy(&path[..length]).ends_with("/diskutil")
+                });
+                if diskutil && announced.insert(pid) {
+                    println!("inflight {pid}");
+                }
             }
             std::thread::sleep(Duration::from_millis(10));
         }
