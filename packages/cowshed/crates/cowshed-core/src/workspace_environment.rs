@@ -322,7 +322,7 @@ mod tests {
 
     #[test]
     fn host_capability_values_are_shell_quoted_and_defaults_preserve_overrides() {
-        use crate::fork_lock::Run;
+        use cowshed_os::fork_lock::Run;
         let root =
             std::env::temp_dir().join(format!("cowshed-env-values-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(root.join(".cowshed")).unwrap();

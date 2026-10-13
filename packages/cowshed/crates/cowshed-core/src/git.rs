@@ -4233,7 +4233,7 @@ mod tests {
     /// a land's `git merge` to run.
     #[cfg(target_os = "macos")]
     fn worktree_with_a_planted_program() -> (Repository, PathBuf, String, PathBuf) {
-        use crate::fork_lock::Spawn as _;
+        use cowshed_os::fork_lock::Spawn as _;
         let (main, workspace) = linked_worktree(&["../tooling/workspace.gitconfig"]);
         fs::create_dir_all(main.join("tooling")).expect("tooling");
         fs::write(

@@ -5,7 +5,6 @@ use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cowshed_core::api::{AdoptOptions, RemoveOptions, RemoveReport};
-use cowshed_os::fork_lock::{Run as _, Spawn as _};
 use cowshed_core::metadata::{WorkspaceIncarnation, WorkspaceName};
 use cowshed_core::storage::recovery::{
     IntentLease, LIFECYCLE_INTENTS_FILE, LifecycleIntent, LifecycleIntentCompletion,

@@ -17,8 +17,7 @@ use cowshed_core::api::dto::{
 use cowshed_core::build_volume::{
     BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord, BuildVolumeRole, link, nx,
 };
-use cowshed_core::metadata::{ImageCapacity, PortBlock, WorkspaceName};
-use cowshed_os::fork_lock;
+use cowshed_core::metadata::{PortBlock, WorkspaceName};
 use cowshed_core::repository::RepoId;
 use cowshed_core::runtime::RecoveryScope;
 use cowshed_core::storage::apfs::native::{
@@ -676,7 +675,7 @@ async fn real_apfs_adopt_initializes_mains_spotlight_marker() {
 /// its served `.cowshed/env` exports it.
 #[tokio::test]
 async fn real_apfs_doctor_repair_moves_the_newer_of_two_workspaces_sharing_a_port_block() {
-    let mut fixture = Fixture::new();
+    let mut fixture = Fixture::with(Project::Plain);
     let mut service = fixture.open().await;
     adopt(&fixture, &mut service).await;
     fixture.start_gateway().await;
@@ -784,7 +783,6 @@ async fn real_apfs_doctor_repair_moves_the_newer_of_two_workspaces_sharing_a_por
     assert!(findings(&stdout, "port-block-collision").is_empty());
     service.shutdown().await.expect("shutdown runtime");
     fixture.stop_gateway().await;
-
 }
 
 /// A plain Git repository, adopted and served through a real gateway, with one workspace,
@@ -2558,7 +2556,6 @@ async fn directory_a_land_carries_mains_nx_entries_into_the_volume_main_adopts_s
         "a fork of main hits what a's land ran, though b's land adopted a volume without it: {hits:?}"
     );
 }
-
 
 /// A rebase carries main's Nx cache entries into the rebased workspace's volume
 /// (16_build_volumes.md, "Rebase carry"), and only those the rebased tree looks up: `b`, forked
@@ -4799,7 +4796,7 @@ async fn prove_published_build_loss(fixture: &mut Fixture) {
 /// `rm <destination> --force` cancel, keep both images, and keep the edits it raced.
 #[tokio::test]
 async fn real_apfs_rename_keeps_edits_written_after_clone_publication() {
-    let mut fixture = Fixture::new();
+    let mut fixture = Fixture::with(Project::Plain);
     let mut service = fixture.open().await;
     adopt(&fixture, &mut service).await;
     fixture.start_gateway().await;

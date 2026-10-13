@@ -33,7 +33,7 @@ pub(crate) fn leader_gate() -> io::Result<(LeaderGate, HeldEnds)> {
 }
 
 fn close_on_exec_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
-    crate::fork_lock::create(|| {
+    cowshed_os::fork_lock::create(|| {
         let mut ends = [0; 2];
         // SAFETY: space for both descriptors, protected from a concurrent fork until CLOEXEC.
         if unsafe { libc::pipe(ends.as_mut_ptr()) } != 0 {

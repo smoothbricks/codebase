@@ -876,7 +876,6 @@ impl From<cowshed_apfs::template::TemplateError> for ApfsStorageError {
                 cleanup: Box::new((*cleanup).into()),
             },
         }
-        }
     }
 }
 

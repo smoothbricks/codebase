@@ -6,7 +6,7 @@ use std::fs;
 #[cfg(test)]
 use std::fs::File;
 use std::io;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering as AtomicOrdering};
 use std::sync::mpsc::{self, Sender, SyncSender};

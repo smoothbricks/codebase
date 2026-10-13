@@ -1416,9 +1416,9 @@ mod tests {
         use std::os::unix::process::CommandExt;
         use std::process::{Command, Stdio};
 
-        use crate::fork_lock::Spawn;
         use crate::runtime::process_events::KqueueObserver;
         use crate::runtime::process_tree::LifeReadings;
+        use cowshed_os::fork_lock::Spawn;
 
         struct Unread;
         impl LifeReadings for Unread {

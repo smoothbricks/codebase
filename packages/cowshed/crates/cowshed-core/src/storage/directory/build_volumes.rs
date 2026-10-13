@@ -175,6 +175,7 @@ impl DirectoryExecutionHost {
                     return Err(ApfsStorageError::BuildVolumeHeld {
                         image: layout.image(source),
                         hold: layout.hold_path(source),
+                        holds: Vec::new(),
                         open,
                     });
                 }
@@ -218,6 +219,7 @@ impl DirectoryExecutionHost {
             return Err(ApfsStorageError::BuildVolumeHeld {
                 image: from,
                 hold: layout.hold_path(source),
+                holds: Vec::new(),
                 open,
             });
         }
@@ -400,6 +402,7 @@ impl DirectoryExecutionHost {
                 return Err(ApfsStorageError::BuildVolumeHeld {
                     hold: layout.hold_path(id),
                     image,
+                    holds: Vec::new(),
                     open,
                 });
             }
