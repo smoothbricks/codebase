@@ -43,7 +43,10 @@ use super::supervisor::{
 };
 use crate::api::dto::{ExitStatus, JobId, Sha256Digest};
 use crate::error::{CowshedError, Result};
-use crate::exec::{ExecError, SANDBOX_EXEC, classify_spawn_error, prepare_child_descriptors};
+use crate::exec::{
+    ExecError, ProfileFile, SANDBOX_EXEC, classify_spawn_error, prepare_child_descriptors,
+    sandbox_exec_args,
+};
 use crate::storage::job_artifact::StreamKind;
 use cowshed_os::fork_lock::Spawn as _;
 
@@ -102,7 +105,7 @@ pub(super) struct PooledSpawn<'a> {
     pub command: HostCommand,
     pub cwd: PathBuf,
     /// The executed-child profile the supervisor rendered once for its authority.
-    pub profile: &'a str,
+    pub profile: &'a super::supervisor::ChildProfile,
     pub read_only: bool,
     pub workspace_mount: PathBuf,
     /// The `.envrc` a host activates, or `None` for a workspace with no shell configuration.
@@ -128,7 +131,7 @@ impl WorkspaceShells {
     ) -> Result<Box<dyn RunningProcess>> {
         let base = spawn.environment.base();
         let key = pool_key(
-            spawn.profile,
+            spawn.profile.text(),
             &base,
             spawn.envrc_directory.as_deref(),
             spawn.grant_revision,
@@ -142,7 +145,7 @@ impl WorkspaceShells {
                     Arc::new(HostActivator {
                         program: self.program.clone(),
                         workspace_mount: spawn.workspace_mount.clone(),
-                        profile: spawn.profile.to_owned(),
+                        profile: spawn.profile.file()?,
                         environment: base,
                         envrc_directory: spawn.envrc_directory.clone(),
                     }),
@@ -996,7 +999,8 @@ enum HostActivation {
 pub(super) struct HostActivator {
     program: ShellHostProgram,
     workspace_mount: PathBuf,
-    profile: String,
+    /// Held for as long as the activator may start hosts under it.
+    profile: Arc<ProfileFile>,
     environment: BTreeMap<OsString, OsString>,
     /// `None` for a workspace with no shell configuration: its hosts hold the sandbox
     /// environment itself, which no workspace file can make stale.
@@ -1021,9 +1025,7 @@ impl HostActivator {
         let theirs_raw = theirs.as_raw_fd();
         let mut command = tokio::process::Command::new(SANDBOX_EXEC);
         command
-            .arg("-p")
-            .arg(&self.profile)
-            .arg("--")
+            .args(sandbox_exec_args(&self.profile))
             .arg(&staged)
             .args(self.program.arguments())
             .env_clear()
