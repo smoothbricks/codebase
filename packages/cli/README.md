@@ -398,12 +398,14 @@ nothing when nothing changed:
   retried on the next entry. A CI runner writes it too, after its install: devenv's `smoo:install` task lists the file
   among its inputs, and a runner's devenv state outlives its checkout (a host runner keeps it on a shared bind), so
   without the record a fresh checkout of an unchanged lockfile found the task current, installed nothing, and the shell
-  hook failed on a missing `ttsc`. A CI runner always installs with `--frozen-lockfile`. A CI runner is one that sets
-  `GITHUB_ACTIONS=true` (GitHub Actions, and Forgejo Actions, which mirrors its variables as `GITHUB_*`), never `CI`
-  alone: agent harnesses export `CI=true` on every command they run. When that frozen install misses, the entry installs
-  again without the flag, prints the `git diff` of what the install changed (the `bun.lock` the pull request should have
-  committed) and fails. The diff goes to stderr, whole: devenv reports a failed shell entry as its stderr alone, so
-  anything written to stdout would be lost.
+  hook failed on a missing `ttsc`. A developer entry installs with `--frozen-lockfile` whenever `bun.lock` exists, so
+  shell entry never rewrites the lockfile: a manifest that needs a lockfile change degrades the shell with Bun's reason,
+  and `bun install` run on purpose writes the change. A CI runner always installs with `--frozen-lockfile`. A CI runner
+  is one that sets `GITHUB_ACTIONS=true` (GitHub Actions, and Forgejo Actions, which mirrors its variables as
+  `GITHUB_*`), never `CI` alone: agent harnesses export `CI=true` on every command they run. When that frozen install
+  misses, the entry installs again without the flag, prints the `git diff` of what the install changed (the `bun.lock`
+  the pull request should have committed) and fails. The diff goes to stderr, whole: devenv reports a failed shell entry
+  as its stderr alone, so anything written to stdout would be lost.
 - A repository whose `devenv.nix` enables `languages.python.uv` gets its uv workspace synced the same way
   (`uv sync --all-packages --all-groups`, `--locked` on a CI runner) into devenv's `UV_PROJECT_ENVIRONMENT`, with the
   interpreter devenv provides, and activated after the sync. Its inputs are the root `pyproject.toml`, `uv.lock` and
