@@ -52,29 +52,100 @@ fn change_time(metadata: &fs::Metadata) -> SystemTime {
     SystemTime::UNIX_EPOCH + Duration::new(seconds, nanos)
 }
 
-/// The last change anywhere in the tree at `root`: the newest inode change time of every entry
-/// below the root, and the root's own modification time. A change time cannot be set back, so a
-/// write that preserves modification times (`cp -p`, an unpacked archive) still moves it, and so
-/// does a removal, through the directory that held the removed name. The root's change time is
-/// left out because mounting and unmounting rename the root itself, which is no write to what
-/// the volume holds; an entry added to or removed from the root still moves its modification
-/// time.
 fn tree_change_clock(root: &Path) -> io::Result<SystemTime> {
-    let mut newest = fs::symlink_metadata(root)?.modified()?;
+    let mut newest = fs::symlink_metadata(root)
+        .and_then(|metadata| metadata.modified())
+        .map_err(|error| clock_error(root, error))?;
     let mut pending = vec![root.to_owned()];
     while let Some(path) = pending.pop() {
-        for entry in fs::read_dir(&path)? {
-            let child = entry?.path();
-            let metadata = fs::symlink_metadata(&child)?;
-            newest = newest.max(change_time(&metadata));
-            if metadata.is_dir() {
-                pending.push(child);
+        let entries = match fs::read_dir(&path) {
+            Ok(entries) => entries,
+            Err(error) if path != root && disappeared(&error) => {
+                newest = newest.max(removal_clock(root, &path)?);
+                continue;
             }
-        }
+            Err(error) => return Err(clock_error(&path, error)),
+        };
+        scan_clock_entries(root, &path, entries, &mut newest, &mut pending)?;
     }
+    // A removed child is a write, but a lost volume is not an empty or fresh tree.
+    fs::read_dir(root).map_err(|error| clock_error(root, error))?;
     Ok(newest)
 }
 
+fn disappeared(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+    )
+}
+
+fn clock_error(path: &Path, error: io::Error) -> io::Error {
+    io::Error::new(
+        error.kind(),
+        format!("inspect tree clock {}: {error}", path.display()),
+    )
+}
+
+/// A name just observed in a directory vanished or changed kind. Its nearest
+/// surviving ancestor records that mutation; never manufacture a wall-clock mark.
+fn removal_clock(root: &Path, removed: &Path) -> io::Result<SystemTime> {
+    let mut parent = removed
+        .parent()
+        .filter(|parent| parent.starts_with(root))
+        .ok_or_else(|| {
+            clock_error(
+                removed,
+                io::Error::new(io::ErrorKind::NotFound, "volume root is unavailable"),
+            )
+        })?;
+    loop {
+        match fs::symlink_metadata(parent) {
+            Ok(metadata) => {
+                return if parent == root {
+                    metadata
+                        .modified()
+                        .map_err(|error| clock_error(parent, error))
+                } else {
+                    Ok(change_time(&metadata))
+                };
+            }
+            Err(error) if parent != root && disappeared(&error) => {
+                parent = parent
+                    .parent()
+                    .expect("a descendant of the root has a parent");
+            }
+            Err(error) => return Err(clock_error(parent, error)),
+        }
+    }
+}
+
+/// Consume the actual listing separately from metadata reads: a live Nx daemon
+/// may unlink a temporary file or directory between those filesystem operations.
+fn scan_clock_entries(
+    root: &Path,
+    directory: &Path,
+    entries: impl Iterator<Item = io::Result<fs::DirEntry>>,
+    newest: &mut SystemTime,
+    pending: &mut Vec<PathBuf>,
+) -> io::Result<()> {
+    for entry in entries {
+        let child = entry.map_err(|error| clock_error(directory, error))?.path();
+        match fs::symlink_metadata(&child) {
+            Ok(metadata) => {
+                *newest = (*newest).max(change_time(&metadata));
+                if metadata.is_dir() {
+                    pending.push(child);
+                }
+            }
+            Err(error) if disappeared(&error) => {
+                *newest = (*newest).max(removal_clock(root, &child)?);
+            }
+            Err(error) => return Err(clock_error(&child, error)),
+        }
+    }
+    Ok(())
+}
 fn remove_if_present(path: &Path) -> Result<(), ApfsStorageError> {
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
@@ -502,5 +573,72 @@ impl DirectoryExecutionHost {
         _capacity: ImageCapacity,
     ) -> Result<ResizeOutcome, ApfsStorageError> {
         Err(unsupported("resizing a build volume"))
+    }
+}
+
+#[cfg(test)]
+mod clock_tests {
+    use super::*;
+
+    #[test]
+    fn listed_child_removal_uses_surviving_parent_clock_and_missing_root_refuses() {
+        let root =
+            std::env::temp_dir().join(format!("cowshed-clock-{}", uuid::Uuid::new_v4().simple()));
+        let parent = root.join("nx/workspace-data");
+        fs::create_dir_all(&parent).unwrap();
+        let temporary = parent.join("watch-start");
+        fs::write(&temporary, b"probe").unwrap();
+        let listed: Vec<_> = fs::read_dir(&parent).unwrap().collect();
+        fs::remove_file(&temporary).unwrap();
+        let actual = change_time(&fs::symlink_metadata(&parent).unwrap());
+        let mut newest = SystemTime::UNIX_EPOCH;
+        let mut pending = Vec::new();
+        scan_clock_entries(
+            &root,
+            &parent,
+            listed.into_iter(),
+            &mut newest,
+            &mut pending,
+        )
+        .unwrap();
+        assert_eq!(
+            newest, actual,
+            "the observed deletion clock, not wall-clock now"
+        );
+        assert!(pending.is_empty());
+
+        let nested = parent.join("transient/nested");
+        fs::create_dir_all(&nested).unwrap();
+        let child = nested.join("data");
+        fs::write(&child, b"data").unwrap();
+        let listed: Vec<_> = fs::read_dir(&nested).unwrap().collect();
+        fs::remove_dir_all(parent.join("transient")).unwrap();
+        let actual = change_time(&fs::symlink_metadata(&parent).unwrap());
+        newest = SystemTime::UNIX_EPOCH;
+        scan_clock_entries(
+            &root,
+            &nested,
+            listed.into_iter(),
+            &mut newest,
+            &mut pending,
+        )
+        .unwrap();
+        assert_eq!(
+            newest, actual,
+            "a removed parent uses its surviving ancestor"
+        );
+        assert!(tree_change_clock(&root).unwrap() >= actual);
+
+        fs::remove_dir_all(&root).unwrap();
+        let error = removal_clock(&root, &child).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(
+            error.to_string().contains(&root.display().to_string()),
+            "{error}"
+        );
+        assert_eq!(
+            tree_change_clock(&root).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
     }
 }

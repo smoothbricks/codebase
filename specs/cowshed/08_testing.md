@@ -237,6 +237,12 @@ physical resizing, read-only mounts and legacy-image conversion remain native-ho
 `/private/tmp/cowshed-dtest-<pid>-<n>-<label>` and share process cleanup with the image fixtures, but neither their
 setup nor their cleanup enumerates or releases disk images.
 
+Directory build-state freshness uses observed filesystem change times, not synthetic wall-clock marks. If a listed child
+or subtree disappears during a live scan, the nearest surviving ancestor records that removal; the root uses its
+modification time so binding renames do not count as build writes. A missing root still refuses, and other I/O errors
+name the actual path. The deterministic listing-then-removal regression checks those clocks and root refusal; the
+ordinary directory rebase lifecycle proves main can run Nx, fork, land and carry its indexed entries afterward.
+
 The Linux job-accounting fixture is a separate kernel-counter proof, not a production ZFS workspace-admission proof. It
 runs from the ordinary runner through a passwordless-sudo delegated scope; only its parent prepares and cleans up a
 test-owned ext4 image on a declared root-only loop device. Delegation of cgroupfs does not confer mount authority. The
