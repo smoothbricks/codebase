@@ -54,6 +54,7 @@ each of them.
 | ----------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------- | --------------------------------------------------------- |
 | Git tree and `.git`, installed dependencies (`node_modules`), every Nx task's declared outputs                                                              | Source volume                     | Cloned with the workspace image                           |
 | Cargo target directories; Nx `.nx/cache` and `.nx/workspace-data` (task database, project graph); each installed JavaScript package's `node_modules/.cache` | Build volume                      | Cloned at fork; adopted by main at land                   |
+| Codegraph's per-tree `.codegraph/` index                                                                                                                    | Build volume                      | Cloned at fork; adopted by main at land                   |
 | Declared build state (`.cowshed.toml` `[build] state`), under the volume's `declared/`                                                                      | Build volume                      | Cloned at fork; adopted by main at land                   |
 | Nx daemon record and sockets (`.nx/workspace-data/d`, the socket directory)                                                                                 | Per checkout, never travels       | Deleted from a build volume before main adopts it (below) |
 | Content-addressed tool caches (Cargo registry/git, Go `GOMODCACHE`/`GOCACHE`, zig, bun, uv, sccache)                                                        | Shared cache paths (03_caches.md) | Written once, read by every checkout; never in any image  |
@@ -110,6 +111,7 @@ are fixed relative symlinks through it, created by cowshed when it mints the che
 <checkout>/target            -> .cowshed/build/target               # one per Cargo target dir capability detection finds
 <checkout>/.nx/cache         -> ../.cowshed/build/nx/cache
 <checkout>/.nx/workspace-data -> ../.cowshed/build/nx/workspace-data
+<checkout>/.codegraph        -> .cowshed/build/codegraph
 ```
 
 A land changes exactly one name, `.cowshed/build`, with one `rename(2)` of a new symlink over it. That is atomic: every
@@ -156,15 +158,15 @@ before it completes whenever its first touch does not link it (nothing to hold, 
 linked, another capacity), and an adoption dropped before that (a cancelled request) releases it as it is dropped, the
 mint itself when it was still running. A build-state path that holds tracked source refuses before anything is deleted.
 
-**Owned index links.** `.codegraph/` is the one exception to fixed held paths. At refresh, cowshed migrates only an
-index link matching its recorded fixed target. It captures a sealed, verified snapshot of the owning build volume under
-the same non-forced writer exclusion as a seed, copies and verifies the index from that snapshot into a staged directory
-on the source volume, then atomically exchanges that directory for the owned link. Its bytes and metadata are preserved;
-no live SQLite database is copied. Any holder refusing the snapshot leaves the link, index and state unchanged, with a
-typed busy refusal naming the holders; no process is forced off or killed, and refresh after it closes retries. Foreign
-links and real directories remain untouched. After publication, the live volume's path state holds no index
-contribution; interrupted publication resumes from the already-real directory. Detached seeds retain their bytes;
-inherited owned index links undergo the same verified cutover on the fork's first refresh.
+**Owned index links.** `.codegraph/` is build-volume state and follows the same fixed-link contract as other contributed
+paths. At the checkout root, `.codegraph -> .cowshed/build/codegraph`; a nested project's contribution preserves its
+project-relative path on the build volume. A fork clones the index with the build state, and a land adopts it with that
+volume. Refresh keeps the owned fixed link; it does not migrate the index to a real directory on the source volume. Each
+workspace indexes its own tree, never another checkout's live index.
+
+Index readers participate in the same non-forced exclusion as other build-state holders when a seed is captured. A
+holder refusing the seal leaves the previous seed intact and is reported as a busy-volume skip; no process is forced off
+or killed, and no live SQLite database is copied onto the source volume to evade the refusal.
 
 A link displaced between refreshes detaches the checkout from its volume until the next one: what a tool writes there
 reaches no fork, land or seed. A tool that removes the path itself (`nx reset`, an `rm -rf` of the path) leaves its next
@@ -185,9 +187,9 @@ none, in which case it is the shell's activation or Cargo itself.
 Capability detection names the build-state paths (15_capabilities.md, one contribution contract): the Cargo capability
 contributes each `cargo metadata` `target_directory` inside the checkout, the Nx capability contributes `.nx/cache` and
 `.nx/workspace-data`, and a JavaScript package manager contributes the `node_modules/.cache` of every package it
-installed. `.codegraph/` stays on the source volume, not the build volume: it indexes source and its permanent readers
-must not hold build-state captures open. A project with no build-state capability and no declared build state gets no
-build volume and pays nothing.
+installed. The Codegraph capability contributes each detected project's `.codegraph/` index, held at that project's
+`codegraph` path on the build volume. A project with no build-state capability and no declared build state gets no build
+volume and pays nothing.
 
 A tool's own per-checkout state that no capability names belongs inside one that is named, never in the source tree
 beside an output. Content-keyed or per-run tool state is not an output, and written into the source tree it churns the
