@@ -17,7 +17,8 @@ use cowshed_core::api::dto::{
 use cowshed_core::build_volume::{
     BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord, BuildVolumeRole, link, nx,
 };
-use cowshed_core::metadata::{PortBlock, WorkspaceName};
+use cowshed_core::metadata::{ImageCapacity, PortBlock, WorkspaceName};
+use cowshed_os::fork_lock;
 use cowshed_core::repository::RepoId;
 use cowshed_core::runtime::RecoveryScope;
 use cowshed_core::storage::apfs::native::{
