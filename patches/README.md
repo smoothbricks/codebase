@@ -62,6 +62,25 @@ identical and install normally as above. If patch preparation left `node_modules
 that prepared copy before ordinary installation so Nx resolves from Bun's isolated installed store again, with its
 dependency links intact.
 
+## Dependency-graph resolution cache identity
+
+The cached dependency edges of an unchanged file are reusable only while its resolution context is unchanged.
+`createProjectFileMapCache` records project roots and JavaScript package-resolution metadata: package name, version,
+exports, main entry and package-manager workspace membership. `shouldRecomputeWholeGraph` compares that snapshot,
+including added or removed projects. Enumeration order is retained because Nx's package-name map is last-writer-wins and
+wildcard export lookup uses the first matching entry. Unrelated target and tag changes do not invalidate this dependency
+cache. Added TypeScript path aliases also invalidate it, not only changes to previously cached aliases.
+
+A legacy file-map cache without the snapshot is recomputed once through normal graph construction. Nothing deletes,
+resets or redirects the task database or cache entries. This fixes a missing-input class where a package's inferred
+identity changed while an importing manifest's bytes stayed identical, so live resolution found a dependency but the
+persisted graph continued to omit it.
+
+`packages/nx-plugin/src/nx-project-resolution-cache.test.ts` uses the installed Nx cache writer, invalidation decision
+and target locator. It proves the missing-edge transition with unchanged file hashes, every resolution field, membership
+and collision order, legacy recovery, alias additions, and retention across unrelated target/tag edits. Drop these
+carried hunks when the pinned upstream version includes the repair; retain the regression.
+
 ## Plugin-load error causes
 
 Both configured and default plugin-load aggregation include each error's message, its complete `cause` chain and every
