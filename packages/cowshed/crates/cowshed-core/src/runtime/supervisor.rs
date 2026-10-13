@@ -4487,7 +4487,7 @@ impl SupervisorActor {
         let Some(path) = &self.group_ledger else {
             return;
         };
-        let groups: Vec<(u64, super::job_groups::GroupLeader)> = self
+        let mut groups: Vec<(u64, super::job_groups::GroupLeader)> = self
             .jobs
             .iter()
             // A job sealed after a wait failure may have left its group running: nothing saw it
@@ -4495,6 +4495,11 @@ impl SupervisorActor {
             .filter(|(_, job)| !job.sealed() || job.wait_failure.is_some())
             .filter_map(|(job_id, job)| Some((job_id.get(), job.birth.as_ref()?.leader()?)))
             .collect();
+        if let Some(keeper) = &self.nx_daemon
+            && let Some((job_id, leader)) = keeper.daemon_group
+        {
+            groups.push((job_id.get(), leader));
+        }
         match super::job_groups::record(path, &groups, &self.inherited_groups) {
             Ok(recorded) => {
                 for error in &recorded.uninspected {
@@ -5490,22 +5495,49 @@ impl SupervisorActor {
             .child(crate::api::dto::RunSandboxMode::ReadWrite);
         let Some(project_root) = super::nx_daemon::kept_project(read_write).map(Path::to_path_buf)
         else {
+            eprintln!(
+                "cowshed: keeper debug: no kept project for {}",
+                self.workspace_root.display()
+            );
             // No Nx to keep: nothing for the supervisor to wait for.
             keeper.settled = true;
             return;
         };
         let record = crate::capabilities::nx::daemon_record(&project_root);
         let daemon = super::nx_daemon::probe(&record);
+        let mut daemon_group_changed = false;
         if let Some(job_id) = ended {
             let job = self.jobs.get(&job_id).map(|job| &job.info);
             super::nx_daemon::report_start(job_id, job, &project_root, daemon);
         }
+        if daemon == Probe::Live
+            && keeper.daemon_group.is_none()
+            && let Some(job_id) = ended.or(keeper.daemon_job)
+            && let Some(pid) = super::nx_daemon::live_pid(&record)
+            && let Ok(leader) = super::job_groups::GroupLeader::observe(pid as u32)
+        {
+            eprintln!(
+                "cowshed: keeper debug: recorded daemon group for job {} pid {pid}",
+                job_id.get()
+            );
+            keeper.daemon_group = Some((job_id, leader));
+            daemon_group_changed = true;
+        }
+        if daemon != Probe::Live && keeper.daemon_group.take().is_some() {
+            daemon_group_changed = true;
+        }
         let working =
             !self.named_sessions.is_empty() || self.jobs.values().any(|job| !job.terminal());
         if keeper.judge(&project_root, working, daemon).await == Verdict::Release {
+            if daemon_group_changed {
+                self.record_groups();
+            }
             return;
         }
         if daemon == Probe::Live {
+            if daemon_group_changed {
+                self.record_groups();
+            }
             return;
         }
         let authority = self.authority.clone();
@@ -5531,6 +5563,7 @@ impl SupervisorActor {
             Ok(ExecAdmission::Queued(job_id) | ExecAdmission::Repeat(job_id)) => {
                 if let Some(keeper) = &mut self.nx_daemon {
                     keeper.starting = Some(job_id);
+                    keeper.daemon_job = Some(job_id);
                 }
             }
             Err(error) => eprintln!(
@@ -5540,6 +5573,9 @@ impl SupervisorActor {
                 error.message,
                 PROBE_INTERVAL.as_secs()
             ),
+        }
+        if daemon_group_changed {
+            self.record_groups();
         }
     }
 

@@ -249,6 +249,11 @@ fn read_daemon_stop_plan(record: &Path, ledger: &Path) -> io::Result<DaemonStopP
             reason: format!("process {pid} is not sandboxed, so it is not a job's daemon"),
         });
     }
+    eprintln!(
+        "cowshed: plan debug: ledger {} groups {:?}",
+        ledger.display(),
+        std::fs::read_to_string(ledger).unwrap_or_default()
+    );
     let Some(process) = super::job_groups::owned_process(ledger, pid).map_err(|error| {
         io::Error::new(
             error.kind(),
@@ -410,6 +415,13 @@ pub(crate) struct NxDaemonKeeper {
     /// Whether the last probe found the shed unused for [`IDLE`] and no daemon live: nothing is
     /// left for the supervisor to wait for.
     pub(super) settled: bool,
+    /// The daemon this keeper's start job left live, as the group it leads: recorded in the job
+    /// group ledger under the start job's id, so a land can prove the daemon is the supervisor's
+    /// own and stop it. A daemon the keeper did not start is never recorded.
+    pub(super) daemon_group: Option<(JobId, super::job_groups::GroupLeader)>,
+    /// The last start job this keeper admitted, until its daemon's group is recorded above: a
+    /// probe can see the job ended before the daemon answers, so the recording retries.
+    pub(super) daemon_job: Option<JobId>,
 }
 
 /// What a probe decides about the daemon of a shed.
@@ -439,6 +451,8 @@ impl NxDaemonKeeper {
                     daemon_was_live: false,
                     last_look: None,
                     settled: false,
+                    daemon_group: None,
+                    daemon_job: None,
                 })
             }
         }
