@@ -790,7 +790,8 @@ Host shells, sandboxed jobs, land checks and the daemon of one checkout use one 
 daemon (04_sandbox.md states the socket and daemon placement). There is never a second, sandbox-private Nx cache, not
 even for a read-only job: build state is not source, so a read-only job keeps the source tree read-only but reads and
 writes its checkout's build volume like any other job. Nx is configured to use its cache, never to avoid it: cowshed
-does not unset Nx's variables to sidestep a problem.
+does not unset Nx's variables to sidestep a problem. Clearing Nx's graph state (a shell entry that rebuilt a stale Nx
+plugin) keeps the task database: it is the cache's only index, so the cache without it is unreachable and never evicted.
 
 - **Why**: Nx's task database indexes exactly one cache directory, and setting any of `NX_WORKSPACE_DATA_DIRECTORY`,
   `NX_CACHE_DIRECTORY` or `NX_PROJECT_GRAPH_CACHE_DIRECTORY` to something else moves the database with it. A second
@@ -802,7 +803,8 @@ does not unset Nx's variables to sidestep a problem.
   set, resolves its cache to `<checkout>/.nx/cache` and its task database to `<checkout>/.nx/workspace-data`: the pinned
   Nx 23.2.1 otherwise moves both to a per-user `~/.nx/<id>` unless `nx.json` names `cacheDirectory`. Smoo's workspace
   policy writes `"cacheDirectory": ".nx/cache"` into every managed `nx.json` (`smoo monorepo update`), and
-  `smoo monorepo check` and `smoo monorepo validate` fail on an `nx.json` without it.
+  `smoo monorepo check` and `smoo monorepo validate` fail on an `nx.json` without it; and a shell-entry test in which a
+  stale plugin rebuild empties `.nx/workspace-data` but for the task database, its SQLite sidecars and its lock.
 - The capability publishes `NX_MAX_CACHE_SIZE` as the caller-overridable default defined in
   [03_caches.md §Wiring](./03_caches.md#wiring), independent of whichever filesystem a client happens to discover. The
   hosted CI action's separate bound is `20GB`.

@@ -20,12 +20,16 @@ import { join } from 'node:path';
 const enterShell = join(import.meta.dir, 'enter-shell.ts');
 
 /**
- * A stale Nx plugin build clears Nx's workspace data on shell entry. In a cowshed
+ * A stale Nx plugin build clears Nx's graph state on shell entry. In a cowshed
  * checkout `.nx/workspace-data` is a link onto the checkout's build volume: the
  * entry empties the directory it names and keeps the link, so the next Nx run
- * writes the volume instead of making a real directory in the link's place.
+ * writes the volume instead of making a real directory in the link's place. The
+ * task database there indexes `.nx/cache` and stays, with its SQLite sidecars and
+ * Nx's open lock: a main whose land changed the plugin once lost the adopted
+ * volume's whole index on its first shell entry, and every rebase onto it then
+ * carried nothing.
  */
-it('a stale plugin build clears the workspace data through its link and keeps the link', () => {
+it('a stale plugin build clears the graph state through its link and keeps the link and the task database', () => {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'smoo-enter-shell-')));
   try {
     const plugin = join(root, 'packages/nx-plugin');
@@ -41,6 +45,9 @@ it('a stale plugin build clears the workspace data through its link and keeps th
     mkdirSync(join(volume, 'd'), { recursive: true });
     writeFileSync(join(volume, 'project-graph.json'), '{}');
     writeFileSync(join(volume, 'd/server-process.json'), '{}');
+    const database = ['A-v3.db', 'A-v3.db-wal', 'A-v3.db-shm', 'A-v3.lock'];
+    for (const entry of database) writeFileSync(join(volume, entry), 'indexed');
+    writeFileSync(join(volume, 'project-graph.lock'), '');
     mkdirSync(join(root, '.nx'));
     const link = join(root, '.nx/workspace-data');
     symlinkSync('../volume/nx/workspace-data', link);
@@ -66,7 +73,7 @@ it('a stale plugin build clears the workspace data through its link and keeps th
     expect(entered.status, `${entered.stdout}${entered.stderr}`).toBe(0);
     expect(lstatSync(link).isSymbolicLink()).toBe(true);
     expect(readlinkSync(link)).toBe('../volume/nx/workspace-data');
-    expect(readdirSync(volume)).toEqual([]);
+    expect(readdirSync(volume).sort()).toEqual([...database].sort());
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
