@@ -534,6 +534,38 @@ describe('managed cache actions', () => {
       await rm(temp, { recursive: true, force: true });
     }
   });
+
+  it('falls back only to a Nix store saved from the same devenv pins', async () => {
+    const template = await readFile(
+      join(
+        REPO_ROOT,
+        'packages',
+        'nx-plugin',
+        'managed',
+        'templates',
+        'github',
+        'actions',
+        'setup-devenv',
+        'action.yml',
+      ),
+      'utf8',
+    );
+    const input = (name: string) =>
+      template
+        .split('\n')
+        .map((line) => line.trim())
+        .find((line) => line.startsWith(`${name}: `))
+        ?.slice(name.length + 2);
+    const primaryKey = input('primary-key');
+    const restorePrefix = input('restore-prefixes-first-match');
+    const pinsHash = "${{ hashFiles('tooling/direnv/devenv.lock', 'tooling/direnv/devenv.yaml') }}";
+
+    // A hash has a fixed length, so a prefix that ends right after it matches only stores saved from these pins.
+    expect(restorePrefix).toEndWith(`-${pinsHash}-`);
+    expect(primaryKey).toStartWith(restorePrefix ?? 'no restore prefix');
+    // devenv.lock locks the overlay as a path without a narHash, so only hashing it directly notices an edit.
+    expect(primaryKey).toContain("'tooling/direnv/nixpkgs-overlay/**'");
+  });
 });
 
 const context = (overrides: Partial<ManagedFileContext>): ManagedFileContext => ({

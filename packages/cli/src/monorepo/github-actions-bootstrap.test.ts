@@ -234,10 +234,10 @@ describe('github-actions-bootstrap install-devenv', () => {
   });
 
   it('replaces a restored devenv that is a different commit than the lock', () => {
-    // The real drift: the store cache restores ~/.nix-profile wholesale, so a
-    // rotated key hands the job the CLI of whichever run last populated the
-    // prefix. Observed in run 34369909403 as devenv 2.3.1+2a399e9 against a
-    // lock naming 190959a.
+    // The real drift, from when the store cache restored ~/.nix-profile
+    // wholesale: a rotated key handed the job the CLI of whichever run last
+    // populated the prefix. Observed in run 34369909403 as devenv 2.3.1+2a399e9
+    // against a lock naming 190959a.
     const run = runInstallDevenv(LOCK_WITH_REV, { devenvVersion: 'devenv 2.3.1+2a399e9 (aarch64-darwin)' });
     if (run.status !== 0) {
       printCommandOutput(run.stdout, run.stderr);
