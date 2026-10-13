@@ -2041,7 +2041,7 @@ export type StdinWriteRequest = {
 
 /**
  * One lifecycle step of a controller call that asked for its steps, reported when the step starts
- * and again when it ends (`crate::timing`). Step ids are unique within the call. A step's
+ * and again when it ends (`cowshed_os::timing`). Step ids are unique within the call. A step's
  * `parent` is the step it runs inside, absent at the call's top level, and is always reported
  * started before any step inside it; a step ends before its parent does.
  */
