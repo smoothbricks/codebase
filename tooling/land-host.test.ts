@@ -333,8 +333,8 @@ describe('land-host.sh', () => {
     expect(PRE_REWRITE_MAIN).toBe('e9e596563bfaa8b337893bb7df9937f9f65d06ea');
     expect(judgeHistory(land.ws, newMain, oldMain)).toEqual({
       kind: 'refused',
-      why: 'source ancestry contains pre-rewrite main ' + oldMain,
-      remedy: 'git rebase --onto ' + newMain + ' ' + oldMain.slice(0, 9),
+      why: `source ancestry contains pre-rewrite main ${oldMain}`,
+      remedy: `git rebase --onto ${newMain} ${oldMain.slice(0, 9)}`,
     });
     expect(git(land.ws, 'rev-parse', 'HEAD')).toBe(sourceBefore);
     git(land.ws, 'fetch', '-q', land.main, newMain);
