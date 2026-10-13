@@ -21,6 +21,13 @@ const flags = defineFeatureFlags({
 });
 
 // 3. Create op context
+const ctxDefaults: {
+  env: Env | null;
+  requestId: string | null;
+  userId: string | undefined;
+  config: { retryCount: number };
+} = { env: null, requestId: null, userId: undefined, config: { retryCount: 3 } };
+
 const opContext = defineOpContext({
   logSchema: appSchema,
   deps: {
@@ -28,12 +35,7 @@ const opContext = defineOpContext({
     db: dbOps.mapColumns({ query: 'query', rows: 'db_rows' }),
   },
   flags,
-  ctx: {
-    env: null as Env, // REQUIRED at trace()
-    requestId: null as string, // REQUIRED at trace()
-    userId: undefined as string | undefined, // OPTIONAL - may not be known yet
-    config: { retryCount: 3 }, // has default, can override
-  },
+  ctx: ctxDefaults,
 });
 
 const { defineOp, defineOps } = opContext;
@@ -99,9 +101,10 @@ interface OpContextFactory<T, FF, Deps, UserCtx> extends OpContextBinding<T, FF,
 
 ```typescript
 // Store the full factory
+const ctxDefaults: { env: Env | null } = { env: null };
 const opContext = defineOpContext({
   logSchema: mySchema,
-  ctx: { env: null as Env },
+  ctx: ctxDefaults,
 });
 
 // Destructure what you need
@@ -119,29 +122,34 @@ The phantom type `[opContextType]` enables TypeScript to infer the full context 
 **IMPORTANT**: `ctx` properties are **runtime context** (environment, config, services). They are NOT stored in Arrow
 columns. For column data, use `setScope()` or `tag`.
 
-Declare ALL properties upfront for V8 hidden class optimization. Three patterns for different initialization needs:
+Declare all properties upfront for stable hidden classes. Give the defaults object its authoritative context type,
+including the sentinel union, and let `defineOpContext` infer that type. A cast such as `null as Env` hides the null
+from the required-key calculation; it does not declare a required context property.
 
 ```typescript
-ctx: {
-  // 1. REQUIRED - must provide at trace()
-  env: null as Env,                         // null sentinel → Env in SpanContext
-  requestId: null as string,                // null sentinel → string in SpanContext
-
-  // 2. OPTIONAL - may or may not be provided
-  userId: undefined as string | undefined,  // undefined → string | undefined in SpanContext
-  sessionId: undefined as string | undefined,
-
-  // 3. HAS DEFAULT - can override at trace()
+const ctxDefaults: {
+  env: Env | null;
+  requestId: string | null;
+  userId: string | undefined;
+  sessionId: string | undefined;
+  config: { retryCount: number; timeout: number };
+  debug: boolean;
+} = {
+  env: null, // required at trace(); resolved to Env inside the span
+  requestId: null, // required at trace(); resolved to string inside the span
+  userId: undefined, // optional; remains string | undefined inside the span
+  sessionId: undefined,
   config: { retryCount: 3, timeout: 30000 },
   debug: false,
-}
+};
+const opContext = defineOpContext({ logSchema, ctx: ctxDefaults });
 ```
 
-| Pattern  | Declaration                   | At trace()   | In SpanContext   |
-| -------- | ----------------------------- | ------------ | ---------------- |
-| Required | `null as T`                   | Must provide | `T`              |
-| Optional | `undefined as T \| undefined` | Can omit     | `T \| undefined` |
-| Default  | `value`                       | Can override | `typeof value`   |
+| Pattern  | Declared property type and initial value | At trace()   | In SpanContext   |
+| -------- | ---------------------------------------- | ------------ | ---------------- |
+| Required | `T \| null`, initially `null`            | Must provide | `T`              |
+| Optional | `T \| undefined`, initially `undefined`  | Can omit     | `T \| undefined` |
+| Default  | `T`, initially a real `T` value          | Can override | `T`              |
 
 **Why all three?**
 
@@ -159,16 +167,17 @@ ctx: {
 | `setScope({ col: v })` | Column values for ALL rows    | Arrow columns | `ctx.setScope({ request_id: 'abc' })` |
 
 ```typescript
-// ctx properties - runtime objects, NOT columns
-ctx: {
-  env: null as Env,        // Access via ctx.env - not stored in Arrow
-  config: { retries: 3 },  // Access via ctx.config - not stored in Arrow
-}
+// Runtime context carries objects; it does not write columns.
+const ctxDefaults: { env: Env | null; config: { retries: number } } = {
+  env: null,
+  config: { retries: 3 },
+};
+const opContext = defineOpContext({ logSchema, ctx: ctxDefaults });
 
 // setScope - sets COLUMN values for ALL rows in this span
 // The column must exist in your logSchema!
-ctx.setScope({ request_id: 'abc123' });  // request_id column = 'abc123' on ALL rows
-ctx.setScope({ user_id: 'u456' });       // user_id column = 'u456' on ALL rows
+ctx.setScope({ request_id: 'abc123' }); // request_id column = 'abc123' on ALL rows
+ctx.setScope({ user_id: 'u456' }); // user_id column = 'u456' on ALL rows
 
 // Child spans inherit scope
 await ctx.span('child', async (child) => {
@@ -605,18 +614,19 @@ type TraceOverrides<UserCtx> = Partial<UserCtx> & { trace_id?: TraceId };
 ```typescript
 import { defineOpContext, defineLogSchema, S, TestTracer } from '@smoothbricks/lmao';
 
+const ctxDefaults: { env: Env | null } = { env: null };
 const opContext = defineOpContext({
   logSchema: defineLogSchema({
     user_id: S.category(),
     operation: S.enum(['create', 'read', 'update', 'delete']),
   }),
-  ctx: { env: null as Env }, // Required at trace time
+  ctx: ctxDefaults, // Env is required at trace time
 });
 
 const tracer = new TestTracer(opContext);
 const { trace } = tracer;
 
-await trace('fetch-user', fetchUserOp, userId);
+await trace('fetch-user', { env }, fetchUserOp, userId);
 
 // Inspect results
 const table = convertSpanTreeToArrowTable(tracer.rootBuffers[0]);

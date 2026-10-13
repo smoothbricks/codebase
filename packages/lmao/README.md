@@ -79,19 +79,23 @@ console.log(result.success ? result.value : result.error);
 ### `defineOpContext`
 
 ```ts
+const ctxDefaults: { requestId: string | undefined } = { requestId: undefined };
 const opContext = defineOpContext({
   logSchema, // required
   flags, // optional: defineFeatureFlags(...).schema
   deps, // optional: other op groups, wired with .prefix()/.mapColumns()
-  ctx: {
-    // optional: user context carried on every span
-    requestId: undefined as string | undefined,
-  },
+  ctx: ctxDefaults, // optional user context carried on every span
 });
 const { defineOp, defineOps } = opContext;
 ```
 
 `defineOp(name, fn)` creates a single op; `defineOps({ ... })` batches ops into a reusable group.
+
+Declare a required trace-time value with its nullable type, not a cast: for example,
+`const ctxDefaults: { env: Env | null } = { env: null }`. Passing that object as `ctx` preserves inference and makes
+`trace('request', { env }, requestOp)` require the real environment. Optional values retain `undefined`; real defaults
+can be overridden. See
+[the context contract](../../specs/lmao/01l_op_context_pattern.md#smoo/lmao!n/op-context-ctx-props).
 
 ### `SpanContext` (`ctx`)
 

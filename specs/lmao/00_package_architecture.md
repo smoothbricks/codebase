@@ -92,8 +92,8 @@ const values = buffer.userId_values; // Allocates HERE, once, explicitly
 
 ```typescript
 // lmao - logging-aware allocation strategy
-// System columns: ALWAYS eager (hot path critical)
-// User attributes: lazy by default (sparse data)
+// Structural columns written every entry: eager
+// Sparse system and user attributes: schema-controlled lazy allocation
 const GET = defineOp('GET', async ({ log, tag, ok }) => {
   log.info('Starting'); // _timestamps/_operations already allocated (eager)
   tag.userId('u123'); // userId column allocated on first use (lazy)
@@ -128,9 +128,13 @@ check adds overhead per entry, compounding to milliseconds on high-throughput sp
 
 **HOW lmao implements this**:
 
-- **System columns**: Always EAGER - pre-allocated at buffer creation, zero conditionals
-- **User attributes**: Lazy by default - allocated only when first written or scope set
-- Clear separation enforced by codegen: system columns are direct TypedArray properties
+- **Structural columns**: `timestamp` and `entry_type` are pre-allocated and written on every entry.
+- **System attributes**: follow their schema's eager/lazy declaration; membership in the system schema alone does not
+  make a column eager. The message field is eager; sparse line, error and retry attributes can be lazy.
+- **User attributes**: lazy by default, allocated when first needed.
+- **Column writes**: use each schema kind's physical storage. Numeric lanes use TypedArrays; dynamic category/text lanes
+  store existing string references without hot-path interning. Dictionary building and UTF-8 encoding belong to Arrow
+  conversion, as specified in [the schema contract](./01a_trace_schema_system.md#schema-physicalization).
 
 Thread-store schema attribute writers likewise establish writable/current-row ownership once per write and consume that
 already-current mapping for the cell store; they do not reread the binding's generation after the proof. Standalone
@@ -540,5 +544,5 @@ Is it logging/tracing specific?
 
 - [ ] Feature is logging/tracing specific
 - [ ] Uses arrow-builder primitives, doesn't duplicate them
-- [ ] System columns remain eager (no lazy checks in hot path)
+- [ ] Structural columns remain eager; sparse system attributes follow their schema's allocation policy
 - [ ] Scope values stay separate from buffer columns

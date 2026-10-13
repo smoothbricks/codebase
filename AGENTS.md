@@ -1,1046 +1,119 @@
-# AGENTS.md - AI Coding Assistant Guidelines for LMAO
+# AGENTS.md
 
-`CLAUDE.md` is the short repo-memory sheet. This file is the detailed manual. Keep the core rules in both files aligned.
+## Rule card
+
+1. **Preserve others' work.** Coordinate shared files; never reset, checkout or stash a shared tree to clean it. Commit
+   each accepted coherent unit promptly with exact paths (`git commit --only -- <paths>`), never the shared index
+   wholesale. Commit WIP before disruptive host operations. Confirm main contains the accepted commit before claiming a
+   landing; preserve failed or partially landed work for its owner.
+2. **Use the cheapest sufficient proof: mount less; wait for the event.** Reuse valid proof until its relevant inputs
+   change. Use a directory or owned fixture instead of an image when it proves the same contract. Tests advance on
+   readiness, completion and progress, not sleeps or arbitrary total wall-clock ceilings; inject time for time behavior.
+   Keep expensive host fixtures out of ordinary gate dependencies; run their dedicated proof when that boundary or its
+   dependency, fixture, environment or toolchain inputs change. Keep caches warm and fix unexplained misses where found.
+   **`--skip-nx-cache` is forbidden, including for diagnosis.** Repair inputs, outputs or dependencies; never raise a
+   bound or bypass a cache to manufacture a pass. Clean up physically owned fixtures on every exit path.
+3. **Inspect evidence before expensive work; stop obsolete work.** Read trace sinks, task history and prior verdicts
+   before rerunning. Cancel an owned run whose result is already obsolete or doomed, preserve its evidence, fix the
+   cause and run the relevant proof. Do not kill a peer's useful independent work or conceal a real failure.
+4. **One owner and one shed per code unit.** Helpers share the unit through explicitly owned files; no git worktrees as
+   a substitute. Use absolute workspace paths in filesystem/edit tools so session cwd cannot redirect an edit into main.
+   Standalone and unrelated Markdown follow the documentation custody card, not the code-workspace rule.
+5. **Land through the repo wrapper.** It owns the rebased-tree gate, cache custody and expected-tip fast-forward.
+   Prioritize fixes that remove fleet bottlenecks; combine related fixes into coherent trains. Nx acceptance follows its
+   declared DAG: lint-first is focused inner-loop fail-fast advice, not fleet serialization. Bare Cargo or Bun tests may
+   diagnose their runners but do not replace Nx acceptance. After success, confirm main's accepted commit and the
+   workspace's retirement; remove only a residual completed workspace, never failed or unlanded work.
+6. **Choose documentation custody by relationship.** Fix standalone or unrelated Markdown immediately on main through
+   its doc lane. Keep a code unit's own docs/specs with that code and land them atomically. The repo card defines the
+   local lock and gate behavior; a Markdown-only commit does not imply its contents are irrelevant to later acceptance.
+7. **Fix concurrency defects; do not serialize them into passing.** Prove the fix under intended concurrency. Shared
+   mutable state needs explicit ownership: single writers, one producer per checkout, land/ref locks and operator
+   admission or priority for scarce resources are legitimate. They are not permission to hide a failing concurrent test.
+8. **Test at the defect's owner and the smallest real boundary.** Do not repeat dependency suites in consumers or
+   re-prove OS internals. Exercise our real OS/process/network integration where that behavior matters; use real
+   in-memory implementations for logic, never fake echoes. Choose an oracle that can fail. Missing tests, infrastructure
+   errors and timeouts are not intended red. Measure performance claims in comparable regimes and retain the witness.
+9. **Preserve inference.** Thread precise public types and generics from input through storage to returned values; fix
+   source APIs instead of adding cast bridges or test-only wrappers. No `as any`, `as unknown as`, or
+   `JSON.parse(...) as T` as validation. `as const` and `satisfies` preserve information. An `unknown` generic default
+   is valid when it preserves inference, not as a backward-compatibility exemption.
+10. **Validate external boundaries from their authoritative contracts.** Generate validation from the owning type or
+    schema, translate failures to typed `Err`, and do not revalidate proven internal data without a trust boundary.
+    Exact fixture/oracle readers reject unknown fields; additive protocol readers follow their evolution contract. Use
+    Typia `validate/createValidate` for TypeScript envelopes/JSON, or translate assert failures at the seam. Wire and
+    domain payloads use their owning generated codecs or schema validators; do not maintain a second validator.
+11. **Operational failures are observable typed values.** Return `Err`/`Result` with operation, code and cause; throw or
+    panic only for stated programmer bugs or impossible invariants. Require tracing context in normal wiring, root
+    traces at entry points and child spans below them. Test operational paths as `span-err`, not `span-exception`. Use
+    observable test tracers; no default NoOpTracer. API-comparison and benchmark exceptions remain explicit.
+12. **Keep private information out of public code and history.** No home paths, private project names or agent/session
+    identifiers in public source, comments, docs or commit messages. Use portable command placeholders there. Review
+    every surface; a partial guard does not establish complete coverage.
+13. **Reuse, simplify and keep one contract owner.** Search existing code/specs before implementing; use available
+    search tools and fall back to source when an index is unavailable. Fix touched defects; give unrelated code defects
+    evidence and an owner without replacing the goal. Fix unrelated docs immediately under rule 6. No compatibility
+    shims, dead APIs or hand-maintained copies of derivable contracts; required protocol evolution remains a contract.
+    Avoid needless allocation/copying, pay for computation once and retain what it proves. Specs state the target design
+    in present tense, not a diary: implement an agreed better design and update its spec with the same unit, never omit
+    the capability. Put implementation gaps and evidence in the owning brief, not status notes in the spec.
+
+### Conduct
+
+- **C1:** Finish authorized work; soft budgets never justify stopping, idling or handing off unfinished work.
+- **C2:** Prepare useful authorized work against a blocking dependency's newest candidate; do not invent another owner.
+- **C3:** Answer the actual question first; questions alone authorize no changes. Continue already authorized work.
+- **C4:** Read governing instructions before editing; reuse their terms and update the owner, not a parallel section.
+
+## Repo card
+
+Follow the active human task and higher-level instructions. This sheet gives entry decisions; linked owners define
+mechanics and design. A specific scoped rule wins over a generic slogan. Name and repair conflicts at the owner rather
+than inventing workarounds. `CLAUDE.md` is a symlink to this file; there is no separate short authority or generated
+sheet.
+
+- **Tools:** Bun only; no npm, npx or bunx. Use `bun nx` or the shell's `nx` and other installed tools directly.
+- **Acceptance:** `NO_COLOR=1 bun nx run-many -t lint test build -p <projects> --outputStyle=static-failures-only`.
+  Focused proof does not replace the land wrapper's acceptance of the rebased candidate. Read its exit status and
+  evidence. For platform-conditional Rust, run `bun run check:linux` before the relevant final land/push; it proves
+  Linux compilation, not Linux test execution.
+- **Land:** `<land-command> land <ws>`, where `<land-command>` is the operator-configured, repository-locking host
+  entry. It invokes `tooling/land-host.sh`; that script owns acceptance of the rebased tree and takes no fleet lock
+  itself. Do not invoke its unlocked internals directly or reconstruct its retry/waiver taxonomy in this sheet.
+- **Markdown commit:** `<land-command> git -C <main> commit --only -m 'docs: summary' -- <paths>`. Stage new files
+  through `<land-command> git -C <main> add -- <paths>`. Use conventional commits, no trailers. This configured entry
+  takes the repository gate lock, so Markdown can wait behind a land. It runs the Git command, not a separate
+  Markdown-validating, ref-lock-only lane. Follow the custody card without claiming a nonwaiting lane.
+- **Build state:** shell/cowshed owns paired absolute Nx state paths and daemon lifecycle, preserving explicit absolute
+  CI/cowshed overrides. Tasks and agents must not redirect them ad hoc. Declare all restorable deliverables as Nx
+  outputs, never mutable tool state; keep one producer per checkout. Infer targets and inspect their resolved graph,
+  rather than adding lint/clean stubs. Detailed keying belongs in the linked owners, not another command recipe.
+- **Architecture:** arrow-builder owns generic buffers and Arrow conversion; LMAO owns spans, tracing, contexts and
+  span-tree conversion. Hot paths use allocation-sensitive column writes with each schema kind's storage, including raw
+  strings for dynamic category/text fields. Physical structural columns are eager; sparse system attributes can be lazy.
+  The architecture and schema specs own these distinctions, not a handwritten API or enum inventory.
+- **Admission:** add entry guidance only for a recurring high-loss decision with an actionable scope and named owner. Do
+  not restate what a tool, template or check already enforces. Preserve useful rationale at the existing owner; delete
+  stale recipes and API inventories. Do not regenerate vendor instruction blocks into this file.
+- **Enforcement:** these rules do not claim universal tool coverage. Source checks are scoped; Markdown instructions and
+  fixed-bound runner/waiver behavior are not proved correct by a source lint. Change owner tools/specs coherently.
 
 ## Read First
 
-- `CLAUDE.md` — short high-retention rule sheet
-- "Errors, Tracing, And Testing" below — what the trace sink is for, and how to read failures out of it instead of
-  re-running a large suite
-- `specs/lmao/00_package_architecture.md` — read first when changing `packages/lmao` or `packages/arrow-builder`
-
-## Core Rules
-
-- **Use Bun only.** Never use `npm`, `npx`, or `bunx` here. Use `bun`, `nx`, `biome`, etc. directly from PATH.
-- **Fix everything you see.** Never wave off a failure as "pre-existing". If you touch casts, hacks, dead code, or
-  broken tests, clean them up.
-- **Search before implementing.** Reuse existing code and patterns before adding new helpers, APIs, or schema objects.
-- **Avoid stupid allocations, especially on hot or frequently hit paths.** Do not excuse needless allocations just
-  because a path is "cold" — startup, boundary, serverless, and browser initialization paths still matter. If a
-  success/failure wrapper can be an immutable singleton or eliminated entirely, do that instead of allocating fresh
-  `{ ok: true }` / tiny throwaway objects. Keep small result objects only when they are truly the right contract and not
-  an avoidable churn point.
-- **This is greenfield.** No backwards-compat layers, deprecated APIs, or dead code retention.
-
-## Specs Rules
-
-- **Specs are commitments, not suggestions.** Critique them when needed, but do not skip implementation by deferring
-  work or adding JS workarounds.
-
-## Errors, Tracing, And Testing
-
-- **Known operational failures return `Err`/`Result`.** `throw` is only for invariants, impossible states, or programmer
-  bugs.
-- **No default `NoOpTracer`.** `createNoOpTracer()` is banned/removed. `NoOpTracer` may still exist in
-  `@smoothbricks/lmao` for API proof, comparison, and overhead benchmarking, but it is not the normal repo pattern.
-  Require tracing context from callers, use child spans, and use observable suite/test tracers in tests.
-- **Lint before tests.** Use `nx lint <project>` before `nx test <project>`.
-- **Run tests through Nx.** Use `nx test <project>` as the default and expected path so dependencies are built, package
-  test config is honored, and the real preloads/setup files load correctly. Pass runner args/filters through Nx instead
-  of switching to `bun test`.
-- **Direct `bun test` is diagnostic-only.** Use it only when you are explicitly debugging Bun itself (preload behavior,
-  Bun-specific runner issues, etc.), not as the normal validation path.
-- **Nx cache is not flaky; config is.** If a task only passes with `--skip-nx-cache`, fix the target's inputs, outputs,
-  dependency graph, or task wiring so cached and uncached runs agree.
-- **Do not normalize cache bypasses.** `--skip-nx-cache` is for diagnosis only, not routine development or validation.
-
-## Type Inference Rules
-
-### TypeScript / Typia Non-Negotiables (MANDATORY)
-
-- **Thread generics end-to-end.** If inference breaks, fix the source generic/signature/return type. Do not patch the
-  caller with casts, hand-restated shapes, or local wrapper types.
-  - **WHY:** once a boundary is validated, the concrete type should flow through the system. That removes internal
-    casts, duplicate validation, impossible runtime checks, and keeps autocomplete/refactoring honest.
-- **Bundle related generic parameters when possible.** If multiple generic parameters always travel together, prefer one
-  bundled type parameter/object over passing them separately.
-  - **WHY:** type bundling preserves inference and prevents giant generic lists from forcing cast-heavy APIs.
-- **Typia is THE validator to use by default.**
-  - parsed/runtime value boundary -> `typia.assert/validate/assertEquals/validateEquals`
-  - JSON string boundary -> `typia.json.assertParse/validateParse/isParse`
-  - repeated boundary -> `typia.create*` / `typia.json.create*Parse`
-  - **WHY:** Typia generates optimal runtime code directly from the type definition. Changing the type changes the
-    validator automatically, so validation stays aligned with the real contract without hand-written drift or wasted
-    tokens.
-- **Use `*Equals` when extra properties must be rejected.**
-  - **WHY:** exactness belongs in the validator contract, not in hand-written property filtering logic.
-- **`@smoothbricks/validation` is LAST RESORT only.** It may contain thin shared wrappers around Typia, shared error
-  formatting, or tiny utilities Typia truly cannot express. It is NOT a license to hand-write validators instead of
-  using Typia directly.
-  - **WHY:** otherwise it becomes a dumping ground for custom validators that duplicate and drift from the real type.
-- **Do not hand-write validators Typia already provides.** New helpers like `isRecord`, `normalizeX`, `parseJsonX`,
-  `toRecord`, `coerceX`, `isHttpRequest`, or similar are wrong by default.
-  - **WHY:** they manually duplicate the contract instead of using the contract itself.
-- **No cast-based fake validation.** `JSON.parse(...) as T`, `as Record<string, unknown>` property walking, `as any`,
-  `as unknown as`, and `as never` are all banned.
-  - **WHY:** those suppress the exact compile-time signal that should force a real type/generic/API fix.
-- **Use real public contract types.** Prefer inferred/public types over manually restating `Record<string, unknown>` or
-  giant local context/state shapes.
-  - **WHY:** restated broad shapes erase domain meaning and force more downstream validation/casts.
-- **Review gate:** if a diff introduces a manual validator/helper that Typia already covers, reject or fix it before
-  commit.
-
-## 💡 DEVELOPMENT TOOLS NOTE
-
-**For efficient code search and editing in this project, use Serena's tools when available.** Serena provides semantic
-code understanding, symbol-based editing, and precise file operations that are optimized for TypeScript and complex
-codebases.
-
-### ts-morph MCP Tools (for cross-file refactoring)
-
-When using `mcp-tsmorph_rename_symbol_by_tsmorph` or other ts-morph tools:
-
-**Use `tsconfig.lib.json`** NOT `tsconfig.json` - The root tsconfig uses project references with empty `include`, so
-ts-morph won't find any files. Always use the lib-specific tsconfig that has `include: ["src/**/*.ts"]`. **Example**:
-
-```
-tsconfigPath: "/path/to/packages/lmao/tsconfig.lib.json"  ✅
-tsconfigPath: "/path/to/packages/lmao/tsconfig.json"      ❌ (files not found)
-```
-
-### Comby for Structural Search/Replace
-
-**Docs**: https://comby.dev/docs/syntax-reference
-
-Use comby for bulk structural code edits. Key syntax:
-
-| Pattern        | Description                                                            |
-| -------------- | ---------------------------------------------------------------------- |
-| `:[var]`       | Match zero or more chars (lazy), stops at newline outside delimiters   |
-| `:[[var]]`     | Match one or more alphanumeric + `_` (like `\w+`)                      |
-| `:[var:e]`     | Match expression-like (handles balanced parens, e.g., `foo.bar(x, y)`) |
-| `:[var.]`      | Match alphanumeric + punctuation (`.`, `;`, `-`)                       |
-| `:[var\n]`     | Match up to and including newline                                      |
-| `:[ var]`      | Match only whitespace (no newlines)                                    |
-| `:[var~regex]` | Match arbitrary PCRE regex                                             |
-
-**⚠️ CRITICAL: ALWAYS dry-run first with `-diff` before using `-in-place`!**
-
-```bash
-# Step 1: ALWAYS preview changes first (dry-run)
-comby 'old_pattern' 'new_pattern' -matcher .ts -d src -diff
-
-# Step 2: Only after verifying the diff, apply changes
-comby 'old_pattern' 'new_pattern' -matcher .ts -d src -in-place
-```
-
-**Examples**:
-
-```bash
-# Rename destructured variable (preview first!)
-comby 'const { :[a], createTrace } = :[rest]' 'const { :[a], logBinding } = :[rest]' -matcher .ts -d src -diff
-# Then with -in-place after review
-
-# Match function calls with args
-comby 'createTrace(:[args])' 'tracer.trace(:[args])' -matcher .ts -d src -diff
-
-# Match multiline with expression hole
-comby 'new Tracer(:[factory:e], { sink: :[sink:e] })' 'new Tracer({ logBinding: :[factory:e].logBinding, sink: :[sink:e] })' -matcher .ts -d src -diff
-```
-
-**Tips**:
-
-**ALWAYS use `-diff` first** - never go straight to `-in-place` Use `-matcher .ts` for TypeScript (better than
-`-extensions ts`) Use `:[var:e]` for expressions that may contain parens/brackets Comby handles balanced delimiters
-automatically - `{:[x]}` matches balanced braces Patterns can match more broadly than expected - review the diff
-carefully!
-
-### git-reword-commit (for rewriting commit messages)
-
-Rewrite a commit message without affecting worktree or staged changes. Uses git-filter-repo API directly.
-
-```bash
-# Replace entire message
-echo "feat: new message" | ./tooling/git-reword-commit abc123
-
-# Prepend to existing message
-cat msg.txt | ./tooling/git-reword-commit abc123 --prepend
-
-# Append to existing message
-echo "Co-authored-by: Someone" | ./tooling/git-reword-commit abc123 --append
-```
-
-**Note**: Message is read from stdin to preserve newlines and avoid shell escaping issues.
-
-### ts-morph MCP Tools (for cross-file refactoring)
-
-When using `mcp-tsmorph_rename_symbol_by_tsmorph` or other ts-morph tools:
-
-**Use `tsconfig.lib.json`** NOT `tsconfig.json` - The root tsconfig uses project references with empty `include`, so
-ts-morph won't find any files. Always use the lib-specific tsconfig that has `include: ["src/**/*.ts"]`. **Example**:
-
-```
-tsconfigPath: "/path/to/packages/lmao/tsconfig.lib.json"  ✅
-tsconfigPath: "/path/to/packages/lmao/tsconfig.json"      ❌ (files not found)
-```
-
-### Nx Target Inference And New Package Checklist
-
-**`@smoothbricks/nx-plugin` owns transformer-aware TypeScript targets.** It infers `tsc-js` from `tsconfig.lib.json`,
-`typecheck-tests` from `tsconfig.test.json`, Cargo workspace targets from `Cargo.toml`, and aggregate `build` / `lint`
-targets. Do not configure `@nx/js/typescript`: its native inference runs `tsc`/`tsgo` directly and cannot load the
-repository's Typia and LMAO transformers. Do not add package-local stubs for inferred targets unless there is a concrete
-package-specific override.
-
-Concrete target sources:
-
-- `tsc-js`: `@smoothbricks/nx-plugin`, from `tsconfig.lib.json`; runs `ttsc` so configured transformers execute.
-- `typecheck-tests`: `@smoothbricks/nx-plugin`, from `tsconfig.test.json`; required for packages that use `bun test`
-  because Bun executes tests without typechecking.
-- `cargo-test`, `test`, `cargo-lint`, `mutation`, and `bench`: `@smoothbricks/nx-plugin`, from a workspace-root
-  `Cargo.toml`.
-- `cargo-wasm`, `cargo-napi`, and other Rust output targets: never inferred from crate metadata such as `cdylib`
-  crate-types (a native N-API cdylib is not a wasm build). Declare them package-locally in `package.json` `nx.targets`;
-  their `*-wasm` / `*-napi` / `*-native` output-family names feed the aggregate `build` and `clean`.
-- `build`: aggregate inferred only when at least one concrete build target exists.
-- `lint`: aggregate validation target, never a formatter.
-
-**Keep the compiler and JavaScript TypeScript API separate.** The root `@typescript/native` dependency follows
-TypeScript's documented side-by-side pattern: it aliases `typescript@^7.0.2` and supplies the native compiler that
-`ttsc` runs for `tsc-js` and `typecheck-tests`. Because `ttsc` resolves only the unscoped package by default, devenv
-exports `TTSC_TSGO_BINARY` to `node_modules/@typescript/native/bin/tsc`; the GitHub setup action persists the same
-absolute path through `GITHUB_ENV`. JavaScript tools such as Nx and transformer hosts import the full TypeScript API
-from the workspace `typescript` dependency, which must stay on `^6.0.3`. After `bun install`, setup-environment pins
-both `node_modules/typescript` and `node_modules/.bun/node_modules/typescript` to that API package so Nx (resolved from
-the Bun store) does not load `@typescript/native`'s TS7 `version.cjs`
-([oven-sh/bun#40355](https://github.com/oven-sh/bun/issues/40355)). Keep both dependencies and the environment binding.
-Do not install TypeScript 7 under the unscoped `typescript` name.
-
-**Target names are `{tool}-{output}` names.** Use names like `tsc-js`, `tsdown-js`, and `cargo-wasm`. `build` and `lint`
-are aggregates that depend on output-family wildcards such as `*-js`, `*-web`, `*-html`, `*-css`, `*-ios`, `*-android`,
-`*-native`, `*-napi`, `*-bun`, and `*-wasm`. Do not create colon-style Nx target names such as `build:wasm` or
-`lint:fix`: Nx CLI syntax already uses `project:target:configuration`, so colon target names are ambiguous with
-configurations and make package-script aliases harder to reason about. Package scripts may still be named `build:wasm`
-if they delegate to a real target such as `nx run pkg:cargo-wasm`.
-
-**Commits must be atomic conventional commits.** Release changelogs are generated from commit history, so split
-unrelated features, fixes, docs, and chores into separate commits with accurate conventional prefixes and scopes. Do not
-bundle two independent features into one commit just because they were implemented in one session.
-
-**`typecheck-tests` is no-emit only.** Packages that use `bun test` must have `tsconfig.test.json` because Bun executes
-tests without typechecking. That config gets `typecheck-tests`; the test tsconfig must use `noEmit` and must not write
-`dist-test`. It must not be `composite`, and package root `tsconfig.json` must not reference `./tsconfig.test.json`; Nx
-runs it through the inferred `typecheck-tests` target after `build`.
-
-If the package is published to npm, add `"npm:public"` to `package.json` `"nx".tags`. If the package is private or
-internal-only, do not add that tag. `smoo` and release workflows use `npm:public` as the source of truth.
-
-Also create `tsconfig.test.json` for packages with tests (see existing packages for the pattern: `types: ["bun"]`,
-`composite: false`, `noEmit: true`, includes test globs, references `tsconfig.lib.json`).
-
-**Typia setup for new packages:** Every package that validates data at runtime needs:
-
-1. `typia` in `dependencies` and `@smoothbricks/validation` in `devDependencies`
-2. A Typia preload in `bunfig.toml`:
-   - With LMAO tracing: `preload = ["@smoothbricks/lmao/bun/preload", "@smoothbricks/lmao/bun/trace-preload"]`
-   - Without LMAO: `preload = ["@smoothbricks/validation/bun/preload"]`
-3. Use `typia.createValidate<T>()` / `typia.json.createValidateParse<T>()` for validation — never hand-write `isRecord`,
-   `typeof` guards, or manual narrowing for data crossing trust boundaries (JSON parsing, external input, file loading).
-
-**After any tsconfig or dependency changes**, run `nx sync` to update project references. Verify with `nx sync:check`.
-
-### Nx Cache Reliability Policy
-
-If agents keep reaching for `--skip-nx-cache`, assume the workspace configuration is wrong until proven otherwise.
-
-- Verify target `inputs`, `outputs`, `dependsOn`, and project graph edges rather than bypassing cache.
-- Fix nondeterministic generators, missing output declarations, stale build artifacts, or implicit dependency gaps.
-- When a cached run diverges from a fresh run, capture the exact target and repair the Nx config so both paths behave
-  the same.
-- Do not leave docs, scripts, or plans teaching `--skip-nx-cache` as a normal fix.
-
-### Platform-Agnostic tsconfig Policy
-
-Platform-agnostic packages use `"types": []` in `tsconfig.lib.json` to prevent accidentally depending on platform
-globals (`Buffer`, `process`, `Bun`). Files that intentionally use platform APIs opt in with per-file triple-slash
-directives:
-
-```typescript
-/// <reference types="node" />  // for node:* imports
-/// <reference types="bun" />   // for Bun.* APIs (use "bun-types")
-```
-
-## ⚠️ GREENFIELD PROJECT - CRITICAL ANALYSIS APPROACH
-
-**THIS IS A GREENFIELD PROJECT.** There is NO legacy code. There are NO existing users.
-
-**DO NOT** add backwards compatibility layers or deprecated API support **DO NOT** maintain old function signatures
-"just in case" **DO NOT** keep dead code around **CRITICALLY ANALYZE** specs vs implementation - specs evolve and may be
-outdated or incorrect If implementation diverges from spec → **EVALUATE WHICH IS CORRECT** and update accordingly
-**GENERATE TASKS FOR BOTH** implementation fixes AND spec updates when inconsistencies are found **QUESTION
-ASSUMPTIONS** - implementation may have discovered better approaches than spec requirements When in doubt, ask - don't
-blindly follow specs if implementation suggests better patterns
-
-## ERROR HANDLING POLICY (RESULT VS THROW)
-
-This repo uses a strict policy:
-
-**Known operational failures MUST return `Err`/`Result`** (validation failures, business-rule failures, transient
-errors, blocked state, missing optional dependencies, missing runtime data, retryable failures). **`throw` is ONLY for
-invariants / impossible states / programmer bugs** (type exhaustiveness failures, impossible internal state, broken
-build/runtime contracts). **No SQS exception to this rule**: known retry cases MUST be represented as structured
-failures and mapped to platform responses (e.g. Lambda SQS `batchItemFailures`), not thrown.
-
-### Trace semantics
-
-`span-err`: expected operational error represented via `ctx.err(...)` / `Err`. `span-exception`: unexpected thrown
-exception (bug/invariant break).
-
-The distinction is asserted over, not merely displayed: a test proves a failure path is operational by matching
-`span-err`, and a `span-exception` surfacing where `span-err` was expected is a bug the trace catches. Keep the two
-honest.
-
-### NoOpTracer policy
-
-**`NoOpTracer` is not an approved default wiring pattern in this codebase.**
-
-**Production code**: Requires real tracing. If code needs a spanContext, require it from the caller **Tests**: MUST use
-`TestTracer` or suite tracer that flushes to SQLite (per CLAUDE.md test tracing policy)
-
-- **Benchmarking / comparison**: `NoOpTracer` may still exist in `@smoothbricks/lmao` for API proof or overhead
-  measurement, but ordinary app/test wiring in this repo should not use it as the default pattern
-
-**Red flags that indicate broken design:**
-
-```typescript
-// ❌ WRONG - Creating throwaway tracer anywhere
-const tracer = new NoOpTracer();  // NEVER DO THIS
-
-// ❌ WRONG - Optional spanContext
-interface Config {
-  spanContext?: TraceContext;  // Should be REQUIRED
-}
-
-// ✅ CORRECT - Require context, use child spans
-async function dispatchQuery(ctx: TraceContext, ...): Promise<Result> {
-  return ctx.span('query', async (childCtx) => {
-    // childCtx is properly nested in trace tree
-  });
-}
-
-// ✅ CORRECT - Tests use TestTracer or suite tracer
-const tracer = new TestTracer(opContext);  // For test inspection
-// OR use the package's test suite tracer that flushes to SQLite
-```
-
-Runtime code that lacks tracing context indicates a broken call graph. Every entry point (Lambda handler, HTTP handler,
-DO fetch) starts a root trace; all subsequent operations use child spans.
-
-### Agent implementation requirements
-
-If code currently throws for a known operational failure, migrate it to a typed `Err` with explicit error code. If a
-throw is retained, add a short comment explaining invariant intent, e.g. `// invariant throw: programmer/config bug`.
-Prefer type guards and exhaustive checks so impossible states are prevented at compile-time where feasible.
-
---
-
-## 🔍 CRITICAL ANALYSIS APPROACH - SPECS EVOLVE BUT MUST BE IMPLEMENTED
-
-**SPECS EVOLVE AND MAY BE WRONG** - The agent must actively critique and improve specifications. But "critique" means
-"build the better version," not "skip building." Every spec'd capability must be implemented or explicitly replaced by a
-superior alternative that is also implemented.
-
-### Spec Consistency Review Agent Requirements
-
-The agent should:
-
-1. **REVIEW for INCONSISTENCIES** between spec and implementation
-2. **CRITIQUE the specs themselves** - specs will evolve
-3. **Evaluate if implementation approaches are better than spec requirements**
-4. **Generate tasks for BOTH** implementation fixes AND spec updates when inconsistencies are found
-5. **Question assumptions**: Are spec requirements still valid? Do they make sense?
-6. **Check for outdated patterns**: Specs written early may not reflect current best practices
-7. **Validate constraints**: Are spec limitations still necessary or were they premature optimizations?
-8. **Consider real-world usage**: Does the spec match actual developer needs and workflows?
-
-### When Implementation Diverges from Spec
-
-**Don't blindly fix implementation** - specs may be wrong or outdated **Evaluate trade-offs**: Performance, ergonomics,
-correctness, maintainability **Implementation may be right**: Greenfield projects often discover better patterns during
-coding **Update specs proactively**: If implementation proves superior, update the spec to match **Document rationale**:
-When diverging from spec, explain WHY in commit messages and spec updates
-
-### Spec Quality Assessment
-
-**Question assumptions**: Are spec requirements still valid? Do they make sense? **Check for outdated patterns**: Specs
-written early may not reflect current best practices **Validate constraints**: Are spec limitations still necessary or
-were they premature optimizations? **Consider real-world usage**: Does the spec match actual developer needs and
-workflows?
-
-### Task Generation Strategy
-
-**Implementation fixes**: When spec is clearly correct and implementation is wrong **Spec updates**: When implementation
-demonstrates better approach or spec is outdated **Hybrid tasks**: When both spec and implementation need refinement
-**Documentation updates**: Always update this file when discovering new patterns or insights
-
---
-
-## ⚠️ REPO COLLABORATION - MULTIPLE AGENTS WORKING SIMULTANEOUSLY
-
-**MULTIPLE AI AGENTS WORK IN THIS REPO** - coordinate carefully to avoid conflicts:
-
-**NEVER use `git checkout`** - This can reset other agents' work in progress **NEVER use `git reset`** - Same issue,
-destroys other agents' changes **Check git status first** - See what others are working on before making changes
-**Communicate changes** - If you modify shared interfaces/types, notify other agents **Avoid conflicting edits** - Work
-on different files when possible, coordinate on shared files
-
-**If you accidentally use git checkout/reset:**
-
-IMMEDIATELY notify other agents what you changed They may need to reapply their work Use this as a lesson to check git
-status first next time
-
-### Fleet rules (each paid for with lost work)
-
-**Relative paths in `read`/`edit`/`write` resolve against the SESSION cwd, not a `cd` you did in `bash`.** One relative
-edit silently lands in the host checkout while your workspace shows the file unchanged. Use absolute workspace paths.
-
-**Commit verified work immediately, however small.** A commit survives a failed rebase; a dirty tree does not. WIP-mark
-and reword later.
-
-**Verify a dependency FEATURE cut with a build, not by reading call sites.** The contract is in the dependency's
-`#[cfg]` attributes: `toml::Table`/`Value` are themselves `#[cfg(feature = "serde")]`, so "nothing serializes" is the
-wrong evidence.
-
-**A partial override of an inferred Nx target REPLACES it.** Declaring only `dependsOn` on `cargo-test` collapses it to
-`nx:noop` — a target that passes having run nothing. Change inference in `@smoothbricks/nx-plugin`.
-
-**A `--ff-only` merge verifies nothing; run the gate on the MERGED tree.** Every branch can be green in isolation while
-main is red, because a branch replayed onto main cannot retroactively update a caller that landed after its commits were
-authored. Cheapest sufficient gate: `cargo check -p <crate> --all-targets` after each land.
-
-**Land with `tooling/land-host.sh <ws>`, never a hand-rolled `cowshed rebase && gate && cowshed land`.** It rebases onto
-main, stops the workspace's Nx daemon (its file map can be stale across a rebase), gates the rebased tree with
-`nx run-many -t lint test build --nx-bail=false`, and fast-forwards main with `cowshed land` to exactly the gated
-commit; when main moved meanwhile it rebases and gates again. A failed gate is re-run once, and lands only if every
-failed task failed on a wall-clock bound alone (the failed tasks its own gate run names, judged by their `bounded-exec`
-verdicts). That rule is the script's, so do not restate it by hand:
-
-- A task whose report shows a panic or failed assertion behind its timeout is a real failure (a test thread can panic
-  and then hang until the bound, which nextest reports as a timeout).
-- A bound is tolerated only when every test ran: each failed task is re-run alone, nextest with `--no-fail-fast`, and a
-  task that passes then has nothing left to tolerate. One that fails again must fail on per-test timeouts alone, with a
-  JUnit report holding every test the runner started. A task that outlives its total ceiling even alone ran an unknown
-  number of tests and blocks the land.
-- The tasks Nx skipped behind a failed task run afterwards, one target at a time without their dependencies, under the
-  same rule.
-- Each tolerated task is appended to `agent-todo/land-ledger.md` and to the message of the one commit the script adds on
-  top of the gated one; that commit is what main fast-forwards to.
-
-An assertion failure, a build or lint failure, a wedged task or a task with no verdict stops the land with the task and
-the reason named. `tooling/land-judge.ts` is the classifier and `tooling/land-host.test.ts` plants the failures it must
-block.
-
-**`cowshed rm <ws>` immediately after each land, and never `git merge` a shed by hand.** Sheds are attached APFS images:
-leaving them mounted grows a host-wide inventory that every real-APFS test enumerates, so `diskutil`/`hdiutil` slow down
-until those tests miss their timeout — 62 images attached, only 27 this project's. `cowshed rm` also refuses a workspace
-holding commits main lacks by ancestry or patch equivalence, which is the only check that catches a land you _think_
-succeeded. Piping `git merge --ff-only` through `tail` makes the exit status `tail`'s, so a failed merge prints success.
-
-**Markdown-only work needs no shed, and unrelated doc fixes go straight to main.** Commit a change that only edits
-Markdown directly on main. While working on code in a shed, fix any spec or doc problem unrelated to that code at once
-on main rather than carrying it in the shed; docs that belong to the shed's code stay in the shed and land with it. A
-land re-rebases its shed over such commits, and that re-rebase must hit the Nx cache for every task that does not read
-the edited Markdown; a miss is a bug in that task's inputs, fixed in the land that hit it.
-
-**A fleet touching `cfg(target_os)` code MUST run `bun run check:linux` before the last land, not after.** macOS gates
-cannot see the `not(target_os = "macos")` branch, so a green warnings-denied clippy on every branch still lands a red
-CI. One session put four regressions in that blind spot — a gated `impl` orphaning its imports, an ungated caller
-reaching a gated helper, two macOS-only consumers leaving shared items unread. Enumerate with `--keep-going`:
-compilation stops at the first error per crate, so fixing one reveals the next, and gating an item can cascade into
-whatever only it read.
-
---
-
---
-
-## 📚 BEFORE WRITING CODE, READ THESE SPECS:
-
-### Package Architecture (Read FIRST!)
-
-**Package Architecture**: specs/lmao/00_package_architecture.md - Defines arrow-builder vs lmao responsibilities,
-dependency direction, what each package OWNS and MUST NOT know about
-
-### Core System
-
-**System Overview**: specs/lmao/01_trace_logging_system.md - Architecture overview, hot/cold path design, **V8
-Optimization Patterns** (see also [V8 Optimization References](#v8-optimization-references) below) **Schema System**:
-specs/lmao/01a_trace_schema_system.md - S.enum/S.category/S.text, logSchema [**LMAO**] **Feature Flags**:
-specs/lmao/01p_feature_flags.md - Flag schema, evaluator, analytics [**LMAO**] **Context Flow**:
-specs/lmao/01c_context_flow_and_op_wrappers.md - TraceContext→Op→Span hierarchy, op() pattern [**LMAO**] **Buffer
-Architecture**: specs/lmao/01b_columnar_buffer_architecture.md - TypedArray columnar storage (NOT Arrow builders!)
-[**ARROW-BUILDER**] **TypeScript Transformer**: specs/lmao/01o_typescript_transformer.md - Compile-time V8
-optimizations, span_op/span_fn monomorphic methods [**LMAO-TRANSFORMER**]
-
-### Buffer System Details (All in @packages/arrow-builder)
-
-**Performance Opts**: specs/lmao/01b1_buffer_performance_optimizations.md - Cache alignment, string interning, enum
-optimization **Self-Tuning**: specs/lmao/01b2_buffer_self_tuning.md - Zero-config capacity management **High-Precision
-Timestamps**: specs/lmao/01b3_high_precision_timestamps.md - Nanosecond timestamps, BigInt64Array **Span Identity**:
-specs/lmao/01b4_span_identity.md - Span ID design, TraceId, distributed tracing **SpanBuffer Memory Layout**:
-specs/lmao/01b5_spanbuffer_memory_layout.md - Memory diagrams, column organization, SpanBuffer interface **Buffer
-Codegen Extension**: specs/lmao/01b6_buffer_codegen_extension.md - ColumnBufferExtension, lazy getters, schema-generated
-buffers **Arrow Table**: specs/lmao/01f_arrow_table_structure.md - Final queryable format & zero-copy conversion
-
-### API & Code Generation (All in @packages/lmao)
-
-**Entry Types**: specs/lmao/01h_entry_types_and_logging_primitives.md - Unified entry type enum, fluent API **Context
-API Codegen**: specs/lmao/01g_trace_context_api_codegen.md - Runtime code generation for tag methods **Module Context**:
-specs/lmao/01j_module_context_and_spanlogger_generation.md - Op/SpanLogger class generation **Span Scope**:
-specs/lmao/01i_span_scope_attributes.md - Scoped attributes for zero-overhead propagation
-
-### Integration & Output
-
-**Op Context Pattern**: specs/lmao/01l_op_context_pattern.md - `defineOpContext()`, `defineOp()`, and Tracer [**LMAO**]
-**Library Integration**: specs/lmao/01e_library_integration_pattern.md - RemappedBufferView for prefixing [**LMAO**]
-**AI Agent Integration**: specs/lmao/01d_ai_agent_integration.md - MCP server for AI trace querying [**LMAO**]
-
-## 🏗️ PACKAGE ARCHITECTURE - TWO SIBLING PACKAGES:
-
-> **See specs/lmao/00_package_architecture.md for complete details including WHY each decision was made.**
-
-### @packages/arrow-builder - Low-Level Alternative to Apache Arrow
-
-**Purpose**: Explicit, visible allocations for Arrow table construction (NOT Apache Arrow's hidden resizing!)
-
-**Owns**:
-
-Cache-aligned TypedArray buffer creation (64-byte alignment) Lazy column storage pattern (nulls + values share ONE
-ArrayBuffer per column) Runtime class generation via `new Function()` for V8 optimization Schema extensibility via
-composition (NOT inheritance) Zero-copy Arrow conversion
-
-**CRITICAL - Does NOT know about**:
-
-❌ Logging/tracing concepts (spans, traces, contexts) ❌ Entry types (info, warn, error, span-start) ❌ Scope or scoped
-attributes ❌ System vs user column distinction ❌ Any `@smoothbricks/lmao` dependency
-
-**Key Files**:
-
-`src/lib/buffer/types.ts` - ColumnBuffer interface `src/lib/buffer/columnBufferGenerator.ts` - new Function() codegen
-for lazy columns `src/lib/buffer/createColumnBuffer.ts` - Buffer factory `src/lib/schema-types.ts` - Generic schema
-types
-
-### @packages/lmao - High-Level Logging/Runtime
-
-**Purpose**: Developer ergonomics with zero-allocation hot path
-
-**Owns**:
-
-Schema DSL (S.enum/category/text/number/boolean) (specs/lmao/01a) logSchema definitions with masking **System columns
-(timestamps, operations) - ALWAYS eager, never lazy** **Scope storage - plain object on buffer, NO codegen needed**
-SpanBuffer creation (extends ColumnBuffer with span metadata) SpanLogger/ctx API generation (specs/lmao/01g, 01j) Fluent
-logging (ctx.tag, ctx.log, ctx.ok, ctx.err) (specs/lmao/01h) Context propagation (traceContext→module→op→span)
-(specs/lmao/01c) Feature flag evaluation (specs/lmao/01a) Library integration & prefixing (specs/lmao/01e)
-
-**Key Architectural Decisions**:
-
-System columns NEVER lazy (written every entry, zero conditionals) User attribute columns lazy by default (sparse data)
-Scope is a plain object (`buffer.scopeValues`) - filled at Arrow conversion via SIMD Direct properties on SpanBuffer
-(`$name_nulls` + `$name_values` for each schema field)
-
-**Key Files**:
-
-`src/lib/schema/` - Schema builders, logSchema, feature flags `src/lib/codegen/spanLoggerGenerator.ts` - SpanLogger
-class generation (tag methods) `src/lib/spanBuffer.ts` - SpanBuffer factory (extends ColumnBuffer) `src/lib/lmao.ts` -
-Main integration, context creation `src/lib/types.ts` - SpanBuffer interfaces
-
-**Relationship**: lmao depends on arrow-builder. arrow-builder MUST NOT depend on lmao.
-
-## 🚫 CRITICAL RULES:
-
-**Hot Path**: TypedArray assignments ONLY in arrow-builder. No Arrow builders, no objects! **Package Imports**: lmao can
-import from `@smoothbricks/arrow-builder`. arrow-builder MUST NOT import from lmao! **DO NOT**: Use Apache Arrow
-builders in hot path - only TypedArray assignments per specs/lmao/01b_columnar_buffer_architecture.md **⚠️ SEARCH BEFORE
-IMPLEMENTING**: Before writing ANY new code, ALWAYS search for existing implementations in BOTH packages:
-
-- Use `grep` or `glob` to find similar functions/types/patterns
-- Check `packages/lmao/src/lib/` for high-level APIs
-- Check `packages/arrow-builder/src/lib/` for low-level buffer operations
-- Look for existing helper functions, types, and patterns
-- **DO NOT re-implement what already exists** - reuse existing code
-- **DO NOT create raw objects** - use `defineLogSchema()` and `S` schema builder
-- **Example**: Before creating a schema object like `{ __lmao_type: 'number' }`, search for `defineLogSchema` and use it
-  properly
-
-## ✅ TYPE-DRIVEN TEST ERGONOMICS WORKFLOW (MANDATORY)
-
-Goal: **zero casts in tests** (`as any`, broad assertion casts, and non-null assertion workarounds) by making library
-APIs naturally inferable for users.
-
-When a test needs casts, follow this exact sequence:
-
-1. **Remove casts in one test file first** and run typecheck/lint to expose real type errors.
-2. **Interpret each error as API feedback** (missing discriminated union, weak generic, unknown boundary, etc.).
-3. **Fix source/runtime/public typings first** (non-test code) so usage is inferred without helper hacks.
-4. **Only after repeated patterns emerge**, add minimal shared helpers/guards in source for boundary decoding.
-5. Re-run package lint/typecheck/tests; then remove now-unneeded test scaffolding.
-
-Rules:
-
-- Do not introduce test-only generic wrappers that hide poor API inference.
-- Prefer Typia-backed runtime validation at boundary seams (`postMessage`, network payloads, storage reads) over casts.
-  Hand-written type guards are allowed only as last-resort shared helpers in `@smoothbricks/validation` when Typia truly
-  cannot express the contract.
-- Treat integration tests as user experience tests: if test code must cast to call public APIs, API typing is not ready.
-- Make **atomic commits per fix cluster** (e.g., boundary parser + its call sites, decide context typing upgrade, etc.).
-
-### No Type Erasure Policy (MANDATORY)
-
-These rules are grounded in recent repository direction: typed API inference, generic threading across runtime chains,
-and sustained cast-removal refactors across the codebase.
-
-Policy:
-
-Keep generic type parameters threaded end-to-end (input -> storage -> accessor return type). Do not erase specific
-generic types into broad singleton storage when those values are later returned to callers. If a helper accepts a
-generic context/tracer, exposed getters/handles must preserve that exact generic. Do not patch inference gaps with
-`as unknown as ...`, `as any`, or broad cast bridges in library code. If a cast seems required, treat it as a typing bug
-in source API design and fix types first. Back-compat `unknown` defaults may exist in core public generics, but
-helper/harness APIs must still preserve concrete inferred types at the call site.
-
-Scenario paths write facts to VM state via the RETE bridge (`vm-rete-bridge.ts` runs JS `:then` callbacks, writes
-results to VM state via `vm_rete_insert_fact`). The VM facts reader (`vm-facts-reader.ts`) reads directly from WASM
-memory with zero-copy Uint32Array views.
-
-- **Domain/agent tests:** Use Scenario with `defineRuleset` — rules fire automatically after reduce, facts are stored in
-  VM state, `scenario.facts` returns a snapshot-backed reader. pattern as reducer parity: run both paths, compare with
-  fast-check. See `rete-parity.test.ts`.
-
-## 🎯 STRING TYPE SYSTEM (CRITICAL - See specs/lmao/01a_trace_schema_system.md):
-
-Three distinct string types, each with different storage strategies:
-
-### S.enum - Known Values (Uint8Array)
-
-**When**: All possible values known at compile time **Storage**: Uint8Array (1 byte) with compile-time mapping
-**Example**: S.enum(['CREATE', 'READ', 'UPDATE', 'DELETE']) → switch case mapping **Arrow**: Dictionary with pre-defined
-values **Use for**: Operations, HTTP methods, entry types, status enums
-
-### S.category - Repeated Values (Dictionary Encoded)
-
-**When**: Values often repeat (limited cardinality) **Storage**: Raw strings in hot path, dictionary built in cold path
-**Example**: buffer.userId_values[idx] = userId (raw string stored, dict built at Arrow conversion) **Arrow**:
-Dictionary built dynamically from unique values **Use for**: userIds, sessionIds, moduleNames, spanNames, table names
-
-### S.text - Unique Values (No Dictionary)
-
-**When**: Values rarely repeat **Storage**: Raw strings without interning **Example**: Error messages, stack traces, SQL
-queries after masking **Arrow**: Plain string column (no dictionary overhead) **Use for**: Unique error messages, URLs,
-request bodies, masked queries **IMPORTANT**: Never use generic "S.string" - always choose enum/category/text
-explicitly!
-
-## Build/Test Commands (Use Bun, Never npm/npx)
-
-### Build & Typecheck
-
-**Build**: `nx build <project>` **Typecheck**: `nx typecheck <project>` (typechecks source code)
-
-### Linting (ALWAYS run before tests!)
-
-**Lint**: `nx lint <project>` **Fix linting issues**: `bun run lint:fix` at the repository root. There is no Nx
-`lint:fix` target. **⚠️ CRITICAL**: Agents MUST run `nx lint <project>` before running tests to catch type errors early
-
-#### Linux cross-compile check (macOS hosts)
-
-CI validates on Linux. Rust behind a `cfg(target_os)` arm that only Linux compiles is invisible to `nx lint` on macOS,
-so a fully green local lint can still turn CI red on unused imports, unresolved names and dead code inside the
-`not(target_os = "macos")` branch. Before pushing Rust that has any platform `cfg`, run at the repository root:
-
-```bash
-bun run check:linux
-```
-
-That runs `nx run-many -t cargo-lint-cross` inside the opt-in `linux-cross` devenv profile, which is the only place the
-0.4 GiB cross C toolchain lives — the default `devenv shell` never carries it, so macOS shells and macOS CI stay lean.
-Each Rust project gets `cargo-lint-cross` inferred automatically from its workspace `Cargo.toml`; nobody adds it by
-hand, and `smoo monorepo check` fails if a Cargo workspace has lost it.
-
-**It type-checks, it does not run.** `--all-targets` compiles bins, tests, benches and examples for
-`x86_64-unknown-linux-gnu`, so test _code_ is verified for Linux — but nothing is executed, because an x86_64 Linux
-binary cannot run on Apple Silicon. There is deliberately no cross `test` or `build` target: Linux release artifacts are
-built by CI's platform matrix, and a cross test target could only produce a harness it must refuse to launch. Passing
-`check:linux` therefore means "Linux compiles this", never "Linux tests pass".
-
-### Testing
-
-- **Test**: `nx test <project>`
-- **Test with filter/args**: pass runner args through Nx, e.g. `nx test <project> -- --filter "test name pattern"`
-- **Note**: Tests only depend on build. `typecheck-tests` is inferred from `tsconfig.test.json` and is run by linting.
-  Direct `bun test` is diagnostic-only, not the standard validation path.
-
-**Repository requirement:** Every package test suite (except `packages/lmao`) MUST be LMAO-traced and MUST flush traces
-through a SQLite sink (worker packages: a D1 binding such as `TRACE_RESULTS`). Configure SQLite once in the
-package-local tracer module (`src/test-suite-tracer.ts` or vitest equivalent), not in individual tests. Preload/setup
-files must stay wiring-only (one call to setup helper + runner mock bridge when needed). If a runner-specific package
-needs extra wiring (e.g. Worker/Vitest bridge), put that logic in the runner harness module, not in setup files.
-
-**Why the sink exists — two consumers, both load-bearing:**
-
-1. **Assertions.** Traces are the observable output a test asserts over. Selectors match span name/TEMPLATE and typed
-   columns, never rendered text; negative assertions ("this event never appears") are first-class; ordering asserts use
-   span parentage, not wall-clock. `lmao-query` runs the same selector against the SQLite sink and against in-process
-   Arrow batches, so the sink is an assertion oracle — not a log file, and not optional decoration.
-2. **Post-run inspection.** `.claude/commands/test-results.md` reads failures out of the sink so a human or agent
-   diagnoses them _without re-running the suite_, pulling detail on request instead of scrolling output. CI collects the
-   databases as build artifacts for the same reason.
-
-**Consequences that are easy to get wrong:**
-
-- **The sink's integrity is a correctness dependency of the suite,** not a convenience. Parallel test workers share one
-  database (hence `busy_timeout`), so a journal mode with no on-disk rollback lets a killed worker leave rows that never
-  committed readable by the survivors. Measured: a SIGKILLed writer under `journal_mode = MEMORY` left 12 uncommitted
-  rows visible while `PRAGMA integrity_check` reported ok. That is a false test result, not a lost diagnostic — which is
-  why `SQLiteTraceWriter` reads the pragma back and refuses a file-backed sink that settled on `memory` or `off`.
-- **`DEFAULT_TRACE_DB_PATH` owns the sink's path** (`packages/lmao/src/lib/sqlite/trace-db-path.ts`, re-exported from
-  `@smoothbricks/lmao/testing{,/bun,/vitest}`; `TRACE_DB_DIRECTORY` and `TRACE_DB_FILENAME` join onto a root). Never
-  restate the literal in a package or a doc. The CI artifact glob is the one legitimate exception: the nx-plugin
-  generates it (`TRACE_DB_ARTIFACT_GLOB`) and cannot import lmao at runtime, and the glob needs a shape the constant
-  does not have — a `packages/*/` prefix and a trailing `*` so a SIGKILLed run's WAL sidecars are collected. A plugin
-  test pins it to the constant. Without the sidecars the uploaded database reads `no such table: spans`, because the
-  committed frames are still in the `-wal`.
-- **It must live under a directory name project walkers and watchers ignore.** A database in a compiled package's root
-  makes its own per-transaction journal churn look like the project tree changing mid-compile, which breaks
-  transform-generation caching in tools that verify directory membership.
-- **It is per-checkout tool state, not an output.** It lives in `.cache/lmao`, a directory nothing else writes, so a
-  cowshed project declares exactly that directory as build state (`.cowshed.toml` `[build] state`, a
-  `packages/*/.cache/lmao` pattern) and keeps it on the build volume: the sink rewrites its pages on every run, and in
-  the source image those writes fragment an image every clone shares. A package-level `.cache/` holds Nx outputs and
-  cannot be build state. `node_modules/.cache/lmao` would create a `node_modules` in a package nothing was installed
-  into, which makes the package look installed.
-- **A run that dies is exactly the run whose trace you want.** Never reason about the sink as disposable output.
-
-### Property-Based Testing with fast-check
-
-**Prefer property-based tests by default** for buffer/overflow semantics, fork graphs, and data integrity scenarios. The
-`fast-check` library is installed.
-
-```typescript
-import fc from 'fast-check';
-
-// Example: Verify buffer overflow preserves all entries
-fc.assert(
-  fc.property(
-    fc.integer({ min: 1, max: 200 }), // Generate test inputs
-    (numEntries) => {
-      // ... write numEntries to buffer ...
-      const entries = collectEntries(buffer);
-      expect(entries.length).toBe(numEntries); // Property must hold for ALL inputs
-    }
-  ),
-  { numRuns: 100 }
-);
-```
-
-**When to use property-based tests:**
-
-Buffer overflow and chaining (entry preservation, buffer count formulas) Data integrity across
-serialization/deserialization Mathematical invariants (e.g., `sb_overflows === bufferCount - 1`) Any scenario where "it
-works for N" should imply "it works for all N" Deep fork of-fork interleavings with append/switch/reset operations
-Rollback/rollforward reversibility across long randomized operation sequences
-
-**Policy:**
-
-Start with a small example test for readability, then add a property test that stress-tests the same invariant. For
-fork/undo logic, prefer randomized traces over manually enumerated branch cases.
-
-### Boundary Validation And Contract Preservation (MANDATORY)
-
-- At transport/storage/IPC boundaries, use Typia by default. `@smoothbricks/validation` is only for thin shared wrappers
-  around Typia, shared error formatting, or tiny utilities Typia cannot express.
-  - **WHY:** the type definition should be the source of truth for the validator. If the type changes, the validator
-    should change automatically with it.
-- For JSON string boundaries, use `typia.json.assertParse/validateParse/isParse` (or `create*Parse` for repeated paths)
-  instead of hand-written `JSON.parse` wrappers.
-- For parsed/runtime value boundaries, use `typia.assert/validate/assertEquals/validateEquals` (or `create*` for
-  repeated paths).
-- If extra properties must be rejected, use `*Equals` instead of hand-written exactness checks.
-- If a boundary already has a meaningful public type (for example `Record<string, unknown>`), use that type instead of
-  manually restating `Record<string, unknown>` unions across multiple files.
-- Treat new helpers named like `normalizeX`, `coerceX`, `toRecord`, `isStringKeyRecord`, or similar as suspicious by
-  default. Before adding one, search for an existing shared validator/helper and justify why the new helper is
-  necessary.
-- Treat `isRecord`, `parseJsonX`, `expectJsonX`, `toRecord`, `coerceX`, `normalizeX`, `isHttpRequest`, and similar names
-  as red flags by default. If you are about to add one, stop and justify why direct Typia is not the correct tool.
-- If you replace a hand-written boundary parser with Typia, preserve the surrounding WHY comment or add a better one
-  that explains the invariant being protected.
-- When a typed boundary change alters an error message, update the test expectation deliberately; do not preserve stale
-  message assertions just because they existed first.
-
-**Key properties to test:**
-
-**Preservation**: All N inputs produce exactly N outputs **Formulas**: Buffer count matches
-`1 + ceil((N - reservedRows) / capacity)` **Bounds**: Values stay within expected ranges **Consistency**: Related
-counters/metrics stay in sync
-
-## SPANBUFFER PROPERTY NAMING: EXACT ARROW COLUMN MATCH
-
-**CRITICAL**: SpanBuffer public properties MUST match Arrow table column names exactly (no camelCase conversions). This
-ensures obvious data flow and enables users to define custom columns with consistent naming.
-
-### Core Arrow Columns → SpanBuffer Properties (Exact Match)
-
-`trace_id` → `trace_id` getter `thread_id` → `thread_id` getter `span_id` → `span_id` getter `parent_thread_id` →
-`parent_thread_id` getter `parent_span_id` → `parent_span_id` getter `timestamp` → `timestamp` (direct TypedArray)
-`entry_type` → `entry_type` (direct TypedArray) `package_name` → `package_name` (dictionary encoded) `package_file` →
-`package_file` (dictionary encoded) `git_sha` → `git_sha` (dictionary encoded)
-
-### System Schema Fields (snake_case)
-
-`message` (eager category) `line` (lazy number) `error_code` (lazy category) `exception_stack` (lazy text) `ff_value`
-(lazy category) `uint64_value` (lazy bigUint64)
-
-### SpanContext Changes
-
-No `traceId` (access via `ctx.buffer.trace_id`) New `module` getter for direct access to module metadata
-`callee_package`, `callee_file`, `callee_line`, `callee_git_sha` getters (pull from `buffer.module` and
-`buffer.line(0)`) `SpanLogger` methods use `snake_case` (e.g., `error_code()`, `ff_value()`)
-
-### Internal Properties (underscore prefix)
-
-`_system`, `_identity`, `_writeIndex`, `_capacity`, `_next`, `_hasParent`, `_children`, `_parent`, `_module`,
-`_spanName`, `_callsiteModule`, `_scopeValues`
-
-### Implementation Details
-
-**Arrow columns**: Use exact underscore names (correspond 1:1 with Arrow table) **System fields**: `snake_case` (same as
-Arrow columns) **Internal**: `_` prefix for encapsulation (implementation details)
-
-### Example
-
-```typescript
-// ✅ CORRECT - Arrow column names match exactly
-buffer.trace_id; // Arrow column: trace_id
-buffer.parent_span_id; // Arrow column: parent_span_id
-buffer.timestamp; // Arrow column: timestamp
-
-// ✅ CORRECT - System fields (snake_case)
-buffer.message; // System field: message
-buffer.line; // System field: line
-
-// ✅ CORRECT - Internal (underscore)
-buffer._children; // Internal tree structure
-buffer._module; // Internal context
-```
-
-## Implementation Patterns (See specs/lmao/01h_entry_types_and_logging_primitives.md)
-
-**Schema Definition**: ALWAYS use `defineLogSchema()` with `S` builder:
-
-```typescript
-// ✅ CORRECT
-const schema = defineLogSchema({
-  userId: S.category(),
-  operation: S.enum(['CREATE', 'READ']),
-  errorMsg: S.text(),
-  count: S.number(),
-});
-
-// ❌ WRONG - Never create raw objects
-const schema = { userId: { __lmao_type: 'category' } };
-```
-
-**Buffer Creation**: arrow-builder provides TypedArray buffers, lmao wraps with logging API **Hot Path Writes**: Direct
-TypedArray assignment only
-
-- Enums: buffer.operation_values[idx] = OPERATION_MAP[value] (compile-time lookup)
-- Categories: buffer.userId_values[idx] = rawString (raw string, dict built in cold path)
-- Text: buffer.errorMsg_values[idx] = rawString (no interning) **Method Chaining**: Return this from tag methods for
-  fluent API: .userId(id).requestId(req) **Per-Span Buffers**: Each span owns its columnar TypedArrays (Uint8Array,
-  Float64Array, etc.)
-
-## Entry Type System (See specs/lmao/01h_entry_types_and_logging_primitives.md)
-
-Unified enum for ALL trace events:
-
-**Span lifecycle**: `span-start` 1, `span-ok` 2, `span-err` 3, `span-exception` 4, `span-retry` 5. **Logging**: `trace`
-6, `debug` 7, `info` 8, `warn` 9, `error` 10. **Feature flags**: `ff-access` 11, `ff-usage` 12. **Metrics**:
-`period-start` 13, op counters/durations 14–21, buffer counters 22–24. `ENTRY_TYPE_NAMES` in `schema/systemSchema.ts` is
-authoritative — index it rather than restating these numbers elsewhere.
-
-`tag` is **not** an entry type: tags write attributes onto a row that already exists, so a tagged span produces no extra
-row. Entry types use compile-time enum mapping to Uint8Array for 1-byte storage.
-
-## Critical Performance Rules (See specs/lmao/01b1_buffer_performance_optimizations.md)
-
-1. **Hot Path**: TypedArray writes ONLY. No Arrow builders, no objects, no console.log
-2. **Cache Alignment**: 64-byte aligned TypedArrays (specs/lmao/01b_columnar_buffer_architecture.md)
-3. **String Optimization**:
-   - Enums: Compile-time switch-case mapping to Uint8 (1 byte)
-   - Categories: Raw strings on hot path, dictionary built in cold path
-   - Text: Raw strings without dictionary overhead
-4. **Direct References**: SpanLogger holds buffer ref, no lookups
-   (specs/lmao/01j_module_context_and_spanlogger_generation.md)
-5. **Background Conversion**: Arrow Table creation in cold path ONLY (specs/lmao/01f_arrow_table_structure.md)
-
-## Code Generation (See specs/lmao/01g_trace_context_api_codegen.md & 01j)
-
-**SpanLogger generation**: Runtime class generation with typed methods per schema **Attribute methods**: Each schema
-field gets a typed method on SpanLogger **Dual API**: Object-based (ctx.tag({ userId: "123" })) and property-based
-(ctx.tag.userId("123")) **Zero allocation**: Fluent methods return this, no intermediate objects
-
-## Library Integration (See specs/lmao/01l_op_context_pattern.md & 01e)
-
-Libraries use `defineOpContext({ logSchema, deps, flags, ctx })` to define their op context Ops are defined via
-`const { defineOp, defineOps } = opContext; const myOp = defineOp('name', async (ctx, ...args) => {})` Ops receive full
-ctx and can destructure: `{ span, log, tag, deps, ff, env }` - take only what you need Span names at call site:
-`await ctx.span('contextual-name', someOp, args)` - caller names spans Deps can be destructured:
-`const { retry, auth } = ctx.deps` Prefix applied at use time: `httpOps.prefix('http')` for column prefixing
-RemappedBufferView maps prefixed names to unprefixed columns for Arrow conversion `ctx` properties require all keys
-enumerable for V8 hidden class optimization
-
-## Tracer Usage Pattern
-
-`Tracer` is an **abstract base class** with 5 lifecycle hooks. Use concrete implementations. `NoOpTracer` may exist for
-API/benchmark comparison, but this repo's normal runtime/test wiring should use real tracing in production and
-suite/test tracers in tests.
-
-```typescript
-import { TestTracer, StdioTracer, ArrayQueueTracer } from '@smoothbricks/lmao';
-
-// defineOpContext returns OpContextFactory which extends OpContextBinding
-const opContext = defineOpContext({
-  logSchema: defineLogSchema({ userId: S.category() }),
-  ctx: { env: null as Env }, // Required at trace time
-});
-
-// For tests that need buffer inspection:
-const tracer = new TestTracer(opContext);
-const { trace } = tracer;
-await trace('fetch', fetchOp);
-const table = convertSpanTreeToArrowTable(tracer.rootBuffers[0]);
-
-// For tests that don't need buffer inspection, still use the suite tracer wiring
-// that flushes to SQLite for trace-backed debugging.
-
-// For development/debugging (colored console output):
-const { trace } = new StdioTracer(opContext);
-
-// For production batching:
-const tracer = new ArrayQueueTracer(opContext);
-// ... process requests ...
-const batch = tracer.drain();
-for (const buf of batch) {
-  await sendToBackend(convertSpanTreeToArrowTable(buf));
-}
-
-// With feature flag evaluator:
-const { trace } = new TestTracer(opContext, { flagEvaluator });
-
-// trace() overloads - name is always required:
-await trace('my-op', myOp); // invoke Op
-await trace('handle', async (ctx) => ctx.ok('done')); // inline function
-
-// With context overrides (flat object, not nested { ctx: {...} }):
-await trace('my-op', { env: myEnv, requestId: 'req-123' }, myOp);
-await trace('handle', { env: myEnv }, async (ctx) => ctx.ok('done'));
-
-// With trace_id for distributed tracing:
-await trace('my-op', { trace_id: incomingTraceId, env: myEnv }, myOp);
-```
-
-**Key Points:**
-
-**Tracer is abstract** - use `TestTracer`, `StdioTracer`, or `ArrayQueueTracer` here **Do not default to `NoOpTracer` in
-repo code** - if ordinary code seems to need it, the tracing API/call graph is wrong **Pass full opContext** -
-`new TestTracer(opContext)` not just logBinding **Always destructure** `{ trace, flush }` from concrete tracer instance
-`TestTracer.rootBuffers` - accumulated root buffers for inspection `TestTracer.statsSnapshots` - captured capacity
-tuning stats `ArrayQueueTracer.drain()` - consume and clear batched buffers `StdioTracer` - prints spans with
-color-coded trace IDs and indentation
-
-**Lifecycle Hooks** (for custom Tracer implementations): | Hook | When Called | |------|-------------| |
-`onTraceStart(rootBuffer)` | Before root fn execution | | `onTraceEnd(rootBuffer)` | After root fn completes (in
-finally) | | `onSpanStart(childBuffer)` | Before child span fn execution | | `onSpanEnd(childBuffer)` | After child span
-fn completes | | `onStatsWillResetFor(buffer)` | Before capacity tuning stats reset |
-
-## Span Scope Attributes (See specs/lmao/01i_span_scope_attributes.md)
-
-Set scoped attributes: `ctx.setScope({ requestId, userId })` - merge semantics, `null` to clear Read scope:
-`ctx.scope.requestId` - readonly view Scope appears on ALL rows in Arrow output (default for all rows) **Direct writes
-win**: `tag.X()` wins on row 0, `ctx.ok().X()` wins on row 1, scope fills rows 2+ **Immutable objects**: `setScope`
-creates NEW frozen object (never mutates) Child spans inherit parent scope by reference (safe because immutable -
-zero-cost!) **Snapshot semantics**: Child's scope is frozen at creation time (async safe, no race conditions) Columns
-filled via `TypedArray.fill()` at Arrow conversion (SIMD optimized)
-
-## Self-Tuning Buffers (See specs/lmao/01b2_buffer_self_tuning.md)
-
-Per-module capacity learning Buffer chaining for overflow Zero configuration needed Adapts to workload patterns
-
-## AI Agent Integration (See specs/lmao/01d_ai_agent_integration.md)
-
-MCP server for structured trace querying Tool-based interface for AI agents Context-efficient (detailed data only loaded
-on request) Works with Claude Desktop, Cursor, VS Code Copilot
-
-## Arrow Table Output (See specs/lmao/01f_arrow_table_structure.md)
-
-Enum columns: Dictionary with compile-time values Category columns: Dictionary with runtime-built values Text columns:
-Plain strings without dictionary Zero-copy conversion from SpanBuffer to Arrow Optimized for ClickHouse/Parquet
-analytics
-
-## ✅ IMPLEMENTED FEATURES (Search These First!)
-
-### Core Schema System (@packages/lmao/src/lib/schema/)
-
-✅ `S.enum()` - Compile-time known values with Uint8Array storage ✅ `S.category()` - Runtime string interning for
-repeated values ✅ `S.text()` - Raw strings for unique values ✅ `S.number()` - Float64Array storage ✅ `S.boolean()` -
-Uint8Array (0/1) storage ✅ `defineLogSchema()` - Schema definition with validation ✅ `defineFeatureFlags()` - Feature
-flag schema with sync/async evaluation ✅ Schema extension with `.extend()` method ✅ Masking transforms (hash, url,
-sql, email)
-
-### Buffer System (@packages/arrow-builder/src/lib/buffer/)
-
-✅ `createSpanBuffer()` - Cache-aligned TypedArray buffer creation ✅ `createChildSpanBuffer()` - Child span buffer with
-tree structure ✅ `createNextBuffer()` - Buffer chaining for overflow ✅ `createAttributeColumns()` - Schema-based
-column creation ✅ Null bitmap management (Arrow format) ✅ `convertToArrowTable()` - Zero-copy Arrow conversion ✅
-`convertSpanTreeToArrowTable()` - Recursive tree conversion
-
-### Code Generation (@packages/lmao/src/lib/codegen/)
-
-✅ `generateSpanLoggerClass()` - Runtime class code generation ✅ `createSpanLoggerClass()` - Compile and cache
-SpanLogger classes ✅ Compile-time enum mapping via switch-case (V8 JIT-inlined) ✅ Prototype methods for zero-overhead
-tag writing ✅ Distinct entry types (info/debug/warn/error)
-
-### Context & Integration (@packages/lmao/src/lib/)
-
-✅ `createTraceContext()` - Root trace context with ff/env ✅ `createModuleContext()` - Module-level context with op
-wrapper ✅ `ctx.ok()` / `ctx.err()` - Fluent result API ✅ `ctx.span()` - Child span creation (polymorphic dispatcher)
-✅ `ctx.span_op()` / `ctx.span_fn()` - Monomorphic span methods (for transformer) ✅ `ctx.tag` - Chainable tag API for
-span attributes ✅ `ctx.setScope()` - Set scope values (merge semantics, null to clear) ✅ `ctx.scope` - Read-only view
-of current scope ✅ Feature flag evaluation with analytics tracking ✅ `callsiteModule` on SpanBuffer for dual module
-attribution (row 0 vs rows 1+)
-
-### Library Integration (@packages/lmao/src/lib/library.ts)
-
-✅ `prefixSchema()` - Add prefix to all schema fields ✅ `generateRemappedBufferViewClass()` - Generate view for Arrow
-conversion ✅ `generateRemappedSpanLoggerClass()` - Generate SpanLogger with prefix mapping ✅
-`defineModule().ctx<Extra>(defaults).make()` - Fluent module definition API
-
-### Background Processing (@packages/lmao/src/lib/flushScheduler.ts)
-
-✅ `FlushScheduler` - Adaptive background flushing ✅ Capacity-based flushing (80% threshold) ✅ Time-based flushing
-(10s max, 1s min intervals) ✅ Idle detection (5s timeout) ✅ Memory pressure detection (Node.js only) ✅ Manual flush
-with `flush()` method
-
-### String Storage
-
-✅ `Utf8Cache` (SIEVE-based) - Bounded UTF-8 encoding cache for Arrow conversion (cold path only)
-
-**Note**: CATEGORY and TEXT columns store raw `string[]` on hot path. Dictionary building and UTF-8 encoding happen
-during Arrow conversion (cold path). There is NO hot-path interning.
-
-Module IDs and span names are accessed directly from `buf.module.package_name`, `buf.module.package_file`, and
-`buf.spanName` during Arrow conversion.
-
-**BEFORE IMPLEMENTING**: Search these modules first! Most functionality already exists.
-
-## V8 Optimization References
-
-When implementing performance-critical code, refer to these V8 optimization resources:
-
-**Primary Spec**: [V8 Optimization Patterns](specs/lmao/01_trace_logging_system.md#v8-optimization-patterns) - Complete
-guide to V8 optimization patterns used in LMAO **External References**:
-
-- [V8 Fast Properties Blog](https://v8.dev/blog/fast-properties) - Hidden class internals and property access
-  optimization
-- [Web.dev V8 Performance Tips](https://web.dev/articles/speed-v8) - Best practices for V8 optimization
-- [V8 Hidden Classes and Inline Caching](https://richardartoul.github.io/jekyll/update/2015/04/26/hidden-classes.html) -
-  Detailed explanation of hidden classes **Key Principle**: Objects with same properties in same order share hidden
-  classes = optimized property access
+- `specs/lmao/00_package_architecture.md`: package ownership, dependency direction and allocation strategy.
+- `specs/lmao/01a_trace_schema_system.md`: storage by schema kind, raw-string lanes and cold-path encoding.
+- `specs/lmao/01l_op_context_pattern.md`: inference-preserving contexts and Op authoring.
+- `packages/lmao/README.md`: tracer wiring, trace-testing and the TraceQuery/SQLite inspection entry; inspect before
+  reruns.
+- `packages/nx-plugin/README.md`: inferred targets, Cargo closures, runtime inputs and build-state output safety.
+- `specs/cowshed/16_build_volumes.md`: workspace-owned build state, warm forks, cache carry and adoption.
+- `packages/cowshed/docs/agents.md`: workspace ownership and agent-facing CLI workflow.
+- `tooling/land-host.sh` and `tooling/land-host.test.ts`: current landing mechanics and refusal evidence.
+
+## Documentation custody card
+
+| Unit                                                  | Workspace                                    | Commit and acceptance                                                                    |
+| ----------------------------------------------------- | -------------------------------------------- | ---------------------------------------------------------------------------------------- |
+| Only Markdown, unrelated to an active code unit       | Main, no shed                                | Exact-path commit through the configured locking entry; do not start a code gate for it. |
+| Code plus docs/specs describing that code             | Unit's shed                                  | One coherent unit through the land wrapper.                                              |
+| Unrelated Markdown found while working in a code shed | Main for the doc fix; code stays in its shed | Fix immediately through the doc lane; the next rebase must reuse unaffected task caches. |
