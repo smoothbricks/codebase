@@ -79,7 +79,10 @@ struct TraceWriter {
 
 impl TraceWriter {
     fn record(&mut self, entries: &[RetainedEntry]) {
-        let Self { publisher, projection } = self;
+        let Self {
+            publisher,
+            projection,
+        } = self;
         publisher.record_process(entries.iter().filter_map(|entry| {
             entry.event.as_ref().ok().map(|event| {
                 projection.project(
@@ -92,6 +95,12 @@ impl TraceWriter {
                 )
             })
         }));
+    }
+
+    fn replay(&mut self, entries: &[RetainedEntry]) {
+        for batch in entries.split_inclusive(|entry| entry.batch_end) {
+            self.record(batch);
+        }
     }
 }
 
@@ -396,7 +405,10 @@ impl Writer {
             });
         }
         if self.journal.len() > first {
-            self.journal.last_mut().expect("the batch emitted an entry").batch_end = true;
+            self.journal
+                .last_mut()
+                .expect("the batch emitted an entry")
+                .batch_end = true;
         }
         if let Some(trace) = &mut self.trace {
             trace.record(&self.journal[first..]);
@@ -462,9 +474,7 @@ impl Writer {
                         let _ = reply.send(result);
                     }
                     Request::Trace(mut trace) => {
-                        for batch in self.journal.split_inclusive(|entry| entry.batch_end) {
-                            trace.record(batch);
-                        }
+                        trace.replay(&self.journal);
                         self.trace = Some(trace);
                     }
                     Request::Open { every, reply } => match self.next_id.checked_add(1) {
@@ -583,9 +593,85 @@ fn control(queue: i32, flags: u16, fflags: u32) -> io::Result<()> {
 }
 
 #[cfg(test)]
+#[path = "../../tests/support/temp_root.rs"]
+mod temp_root;
+
+#[cfg(test)]
 mod tests {
+    use super::temp_root::TempRoot;
     use super::*;
+    use crate::api::dto::{CommandArg, UtcTimestamp};
+    use crate::api::process::JobProcessSample;
     use crate::api::process::ProcessCoverage;
+    use crate::runtime::process_spans::read_process_segment;
+    use crate::runtime::process_tree::BirthToken;
+
+    #[tokio::test]
+    async fn trace_replay_preserves_emitted_batches_and_gap_only_batches_seal_nothing() {
+        let root = TempRoot::new("cowshed-process-batch-replay");
+        let publisher = JobSpanPublisher::start(root.to_path_buf());
+        let parent = ProcessIdentity {
+            pid: 41,
+            birth: BirthToken(1),
+        };
+        let birth = |pid, index, parent, batch_end| RetainedEntry {
+            event: Ok(JobProcessEvent::Born {
+                index,
+                process: JobProcessSample {
+                    pid,
+                    ppid: if index == 0 { 1 } else { 41 },
+                    program: "/bin/cat".to_owned(),
+                    argv: vec![CommandArg::from("/bin/cat")],
+                    born_at: UtcTimestamp::new("1970-01-01T00:00:01Z").unwrap(),
+                    usage: None,
+                    blocked_on: None,
+                    exit: None,
+                },
+            }),
+            identity: Some(ProcessIdentity {
+                pid,
+                birth: BirthToken(u64::from(index) + 1),
+            }),
+            parent,
+            at: SystemTime::UNIX_EPOCH + Duration::from_secs(1),
+            batch_end,
+        };
+        let journal = [
+            birth(41, 0, None, false),
+            birth(42, 1, Some(parent), true),
+            birth(43, 2, Some(parent), true),
+            RetainedEntry {
+                event: Ok(JobProcessEvent::Gap {
+                    reason: ProcessCoverageGap::EventsLost,
+                }),
+                identity: None,
+                parent: None,
+                at: SystemTime::UNIX_EPOCH + Duration::from_secs(2),
+                batch_end: true,
+            },
+        ];
+        let mut trace = TraceWriter {
+            publisher: publisher.clone(),
+            projection: ProcessSpanProjection::new("4bf92f3577b34da6a3ce929d0e0e4736", 9),
+        };
+        trace.replay(&journal);
+        let health = publisher.health().await.unwrap();
+        assert_eq!((health.recorded, health.failed), (2, 0), "{health:?}");
+        let mut paths = std::fs::read_dir(root.join("1970-01-01"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        paths.sort();
+        assert_eq!(paths.len(), 2);
+        let first = read_process_segment(&paths[0]).unwrap();
+        let second = read_process_segment(&paths[1]).unwrap();
+        assert_eq!((first.len(), second.len()), (2, 1));
+        assert_eq!(first[0].columns.proc_pid, Some(41));
+        assert_eq!(first[1].columns.proc_pid, Some(42));
+        assert_eq!(second[0].columns.proc_pid, Some(43));
+        assert_eq!(first[1].parent_span_id, first[0].span_id);
+        assert_eq!(second[0].parent_span_id, first[0].span_id);
+    }
 
     #[tokio::test]
     async fn finishing_a_live_observation_neither_invents_loss_nor_ends_its_reader() {
