@@ -163,7 +163,7 @@ async function runInBootstrap(
 ): Promise<{ stdout: string; stderr: string; exitCode: number }> {
   const proc = Bun.spawn({
     cmd: ['bun', '-e', script, RAW_RESOLVER, ...payload],
-    env: { PATH: process.env['PATH'], HOME: process.env['HOME'] },
+    env: { PATH: process.env.PATH, HOME: process.env.HOME },
     stdin: 'ignore',
     stdout: 'pipe',
     stderr: 'pipe',

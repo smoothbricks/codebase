@@ -1049,15 +1049,21 @@ impl OwnedGroupProcess {
 }
 
 /// The job's own process `pid`, as the ledger at `path` proves it. The pid must be a member of a
-/// recorded group whose [`ownership`] proof holds, so a group whose leader is gone or belongs to
-/// another process, and every unresolved group, name nothing. A ledger that is absent names no
-/// job; one that cannot be read is an error, never an empty answer.
+/// group whose [`ownership`] proof holds at this read -- a recorded group, or an unresolved one
+/// a lost supervisor left, whose leader still holds its id: the proof is the leader's identity
+/// and the membership read, not which list names the group. A group whose leader is gone or
+/// belongs to another process names nothing. A ledger that is absent names no job; one that
+/// cannot be read is an error, never an empty answer.
 #[cfg(target_os = "macos")]
 pub(crate) fn owned_process(path: &Path, pid: i32) -> io::Result<Option<OwnedGroupProcess>> {
     let Some(ledger) = read(path)? else {
         return Ok(None);
     };
-    for group in &ledger.groups {
+    for group in ledger
+        .groups
+        .iter()
+        .chain(ledger.unresolved.iter().map(|unresolved| &unresolved.group))
+    {
         if let Ownership::Owned(members) = ownership(group)?
             && let Some(member) = members.into_iter().find(|member| member.pid() == pid)
         {
