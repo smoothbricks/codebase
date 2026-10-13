@@ -1,12 +1,9 @@
-import { existsSync } from 'node:fs';
-import { lstat, rm } from 'node:fs/promises';
-import { join } from 'node:path';
 // Nx package exports are CLI-oriented; this is the module the CLI uses for graph + daemon IPC.
 import { createProjectGraphAsync } from 'nx/src/project-graph/project-graph.js';
 import { workspaceRoot as primaryWorkspaceRoot } from 'nx/src/utils/workspace-root.js';
 import typia from 'typia';
 import type { NxDependsOn, NxProjectJson, NxTargetConfig, NxTargetOptions } from '../lib/json.js';
-import { printCommandOutput, run, runResult } from '../lib/run.js';
+import { printCommandOutput, runResult } from '../lib/run.js';
 
 export interface ProjectTargets {
   project: string;
@@ -21,19 +18,6 @@ export interface ProjectTargets {
   targetOptions?: Map<string, NxTargetOptions>;
   targetOutputs?: Map<string, string[]>;
   targetScripts?: Map<string, string>;
-}
-
-export interface CommandInvocation {
-  command: string;
-  args: string[];
-}
-
-export function nxResetCommand(): CommandInvocation {
-  return { command: 'nx', args: ['reset'] };
-}
-
-export function nxCacheDirectories(root: string): string[] {
-  return [join(root, '.nx/cache'), join(root, '.nx/workspace-data'), join(root, 'node_modules/.cache/nx')];
 }
 
 export function targetNamesFromNxProjectJson(value: NxProjectJson | null | undefined): string[] {
@@ -203,26 +187,6 @@ export async function listProjects(root: string, options: { withTarget?: string 
   const projects = projectNamesWithTarget(await readProjectTargets(root), options.withTarget).join('\n');
   if (projects) {
     console.log(projects);
-  }
-}
-
-export async function resetCache(root: string): Promise<void> {
-  const command = nxResetCommand();
-  await run(command.command, command.args, root);
-}
-
-export async function cleanCache(root: string): Promise<void> {
-  for (const path of nxCacheDirectories(root)) {
-    if (!existsSync(path)) {
-      continue;
-    }
-    const stat = await lstat(path);
-    if (!stat.isDirectory() && !stat.isSymbolicLink()) {
-      console.warn(`Skipping non-directory Nx cache path: ${path}`);
-      continue;
-    }
-    await rm(path, { recursive: true, force: true });
-    console.log(`Removed ${path}`);
   }
 }
 

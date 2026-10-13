@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from 'bun:test';
-import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { reportFatal } from './cli.js';
@@ -70,6 +70,41 @@ describe('smoo wrangler cleanup-pr', () => {
 
       expect(child.exitCode).toBe(1);
       expect(child.stderr.toString()).toContain(`${join(root, 'package.json')} declares no repository`);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
+/**
+ * Nx's cache entries are reachable only through the task database beside them, and in a cowshed checkout both
+ * paths are links onto the checkout's build volume (specs/cowshed/16_build_volumes.md, "One link per checkout").
+ * `smoo nx reset-cache` ran `nx reset` and `smoo nx clean-cache` removed `.nx/cache` and `.nx/workspace-data`
+ * outright: either emptied the cache every fork and land carries, and the second also left the next Nx run a real
+ * directory off the volume. Neither command exists; Nx's own eviction bounds the cache.
+ */
+describe('smoo nx', () => {
+  it("offers no command that deletes the checkout's Nx cache or task database", async () => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), 'smoo-cli-nx-state-')));
+    try {
+      const init = Bun.spawnSync(['git', 'init', '--quiet'], { cwd: root, env: gitFreeEnvironment() });
+      expect(init.exitCode).toBe(0);
+      await writeFile(join(root, 'nx.json'), '{}\n');
+      await writeFile(join(root, 'package.json'), '{ "name": "@acme/app" }\n');
+      const entry = join(root, '.nx', 'cache', '1234', 'outputs');
+      const database = join(root, '.nx', 'workspace-data', 'machine-v1.db');
+      await mkdir(entry, { recursive: true });
+      await mkdir(join(root, '.nx', 'workspace-data'), { recursive: true });
+      await writeFile(join(entry, 'artifact'), 'cached\n');
+      await writeFile(database, 'rows\n');
+
+      for (const command of ['reset-cache', 'clean-cache']) {
+        const child = Bun.spawnSync(['bun', SMOO, 'nx', command], { cwd: root, env: gitFreeEnvironment() });
+        expect(child.exitCode).not.toBe(0);
+        expect(child.stderr.toString()).toContain(`unknown command '${command}'`);
+      }
+      expect(await readFile(join(entry, 'artifact'), 'utf8')).toBe('cached\n');
+      expect(await readFile(database, 'utf8')).toBe('rows\n');
     } finally {
       await rm(root, { recursive: true, force: true });
     }

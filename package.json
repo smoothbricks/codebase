@@ -43,7 +43,7 @@
     "build:all": "nx run-many -t build",
     "build:watch": "nx run-many -t build --watch",
     "check:linux": "tooling/devenv -P linux-cross shell -- nx run-many -t cargo-lint-cross",
-    "clean": "nx run-many -t clean; nx reset",
+    "clean": "nx run-many -t clean",
     "clean:node_modules": "rm -rf node_modules && find e* t* p* -type d -name node_modules -print0 | xargs -0 rm -rvf",
     "clean:trace-db": "bun -e \"import { rmSync } from 'node:fs'; import { dirname, join } from 'node:path'; import { TRACE_DB_DIRECTORY } from './packages/lmao/src/lib/sqlite/trace-db-path.ts'; for (const manifest of new Bun.Glob('{package.json,tooling/package.json,{packages,targets}/*/package.json}').scanSync()) { rmSync(join(dirname(manifest), TRACE_DB_DIRECTORY), { recursive: true, force: true }); }\"",
     "format:changed": "git-format-staged --config tooling/git-hooks/git-format-staged.yml --also-unstaged",

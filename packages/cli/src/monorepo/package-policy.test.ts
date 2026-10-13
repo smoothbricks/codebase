@@ -21,6 +21,7 @@ import {
   applyNxPatchDefaults,
   applyNxPluginDefaults,
   applyNxProjectNameDefaults,
+  applyRootScriptDefaults,
   applyWorkspaceDependencyDefaults,
   listValidCommitScopes,
   validateNoStaleTestOutput,
@@ -74,7 +75,7 @@ describe('root smoo monorepo policy', () => {
       const nxJson = await readJson(join(root, 'nx.json'));
       expect(rootPackage.scripts).toEqual({
         'check:linux': 'tooling/devenv -P linux-cross shell -- nx run-many -t cargo-lint-cross',
-        clean: 'nx run-many -t clean; nx reset',
+        clean: 'nx run-many -t clean',
         'clean:node_modules':
           'rm -rf node_modules && find e* t* p* -type d -name node_modules -print0 | xargs -0 rm -rvf',
         'format:changed': 'git-format-staged --config tooling/git-hooks/git-format-staged.yml --also-unstaged',
@@ -92,6 +93,30 @@ describe('root smoo monorepo policy', () => {
       expect(nxJson.cacheDirectory).toBe('.nx/cache');
       expect(validateRootPackagePolicy(root)).toBe(0);
       expect(validateNxReleaseConfig(root)).toBe(0);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  // `nx reset` deletes the Nx cache and the task database indexing it: in a cowshed checkout, the build volume every
+  // fork inherits and every land carries. The managed `clean` used to end with it, so `bun run clean` emptied it.
+  it("migrates a root clean script that resets Nx to one that removes only projects' declared outputs", async () => {
+    const root = await mkdtemp(join(tmpdir(), 'smoo-package-policy-'));
+    try {
+      await writeJson(
+        join(root, 'package.json'),
+        validRootPackage({ scripts: { clean: 'nx run-many -t clean; nx reset' } }),
+      );
+      const errors = captureConsoleErrors();
+
+      validateRootPackagePolicy(root);
+      expect(errors).toContain('package.json scripts.clean must be nx run-many -t clean');
+
+      applyRootScriptDefaults(root);
+
+      const { scripts } = await readJson(join(root, 'package.json'));
+      expect(scripts).toMatchObject({ clean: 'nx run-many -t clean' });
+      expect(JSON.stringify(scripts)).not.toMatch(/\bnx\s+reset\b/);
     } finally {
       await rm(root, { recursive: true, force: true });
     }

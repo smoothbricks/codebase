@@ -1,9 +1,6 @@
 import { describe, expect, it } from 'bun:test';
-import { join } from 'node:path';
 import {
   formatProjectTargetLines,
-  nxCacheDirectories,
-  nxResetCommand,
   projectNamesWithTarget,
   projectRootFromNxProjectJson,
   projectTargetsFromNxProjects,
@@ -12,20 +9,6 @@ import {
   targetNamesFromProjects,
   targetOutputsFromNxProjectJson,
 } from './index.js';
-
-describe('Nx helper command construction', () => {
-  it('builds explicit nx reset invocation', () => {
-    expect(nxResetCommand()).toEqual({ command: 'nx', args: ['reset'] });
-  });
-
-  it('selects only local Nx cache directories', () => {
-    expect(nxCacheDirectories('/repo')).toEqual([
-      join('/repo', '.nx/cache'),
-      join('/repo', '.nx/workspace-data'),
-      join('/repo', 'node_modules/.cache/nx'),
-    ]);
-  });
-});
 
 describe('Nx helper output formatting', () => {
   it('formats project target pairs like the old root helper script', () => {

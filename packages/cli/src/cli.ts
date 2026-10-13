@@ -438,18 +438,6 @@ function buildProgram(): Command {
       const { listProjects } = await import('./nx/index.js');
       await listProjects(await findRepoRoot(), options);
     });
-  nx.command('reset-cache')
-    .description('Run nx reset to clear Nx daemon and cache state')
-    .action(async () => {
-      const { resetCache } = await import('./nx/index.js');
-      await resetCache(await findRepoRoot());
-    });
-  nx.command('clean-cache')
-    .description('Remove local Nx cache directories when present')
-    .action(async () => {
-      const { cleanCache } = await import('./nx/index.js');
-      await cleanCache(await findRepoRoot());
-    });
 
   const githubCi = program.command('github-ci').description('GitHub Actions helpers');
   githubCi
