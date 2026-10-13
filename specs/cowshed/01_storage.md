@@ -651,11 +651,17 @@ kernel's attachment inventory maps that image to. An image no attachment holds n
 twice, or held unformatted, is an inventory fault and is refused. One whose volume the kernel mount table does not list
 names nothing (`NotMounted`). Both skips are typed outcomes, not errors, and the supervisor says each one in the daemon
 log. The rename runs under the image's lease and a raw IOMedia pin that re-proves the mapping, as a release proves it
-before `umount` ("Mounts"), and the pin is held across the `diskutil` call. The mount check is read before the pin and
-not re-proven under it: an unmount racing the rename can let it reach that image's own unmounted volume, which is still
-cowshed's and never another's. Cowshed renames only a volume it found mounted; what `diskutil renameVolume` does to an
-unmounted APFS volume is not measured here. No internal disk is an attachment of an image under the store, so the host's
-own volumes can never be a rename target, whatever is mounted at, or missing from, a workspace's path.
+before `umount` ("Mounts"), and the pin is held across the `diskutil` call. The mount the label found is re-proven under
+them too, immediately before the rename. A device rename is not enough on its own: Disk Arbitration names a mounted
+volume through the mount path it recorded for the disk, not the device node (Apple's DiskArbitration source; not
+measured here), and a volume unmounted between the mount table read and the rename (cowshed's own unmount bypasses Disk
+Arbitration, which then learns of it late) leaves that path a bare directory of the host's Data volume — which once
+carried a fixture's `[cowshed] fixture · dispatch — main` label. So the rename opens the mountpoint as a directory and
+reads the filesystem that descriptor lies on (`fstatfs`): anything but that image's volume device, or a directory inside
+it rather than its root, refuses the rename (`RenameTargetNotMounted`) before `diskutil` runs. The descriptor is held
+across the call, so an unforced unmount of that volume fails busy until the rename returns, and every cooperating
+unmount of the image already waits on its lease; only a forced unmount by another process can still land inside the
+call. No internal disk is an attachment of an image under the store, so the device a rename names is never the host's.
 
 Open item: the rename holds the image's lease for the whole `diskutil renameVolume` call, and Disk Arbitration's queue
 sits inside that call (9.5–27.8 s under load, bounded by the 120 s disk-child deadline). Meanwhile a mount, unmount or

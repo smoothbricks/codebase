@@ -226,6 +226,14 @@ pub trait CommandRunner {
     /// explicitly opt out; production must not fall back to an unpinned pathname. The pin is
     /// fenced like the lease: once it is dropped, an eject is no longer refused.
     fn pin_raw_device(&self, device: &Path) -> io::Result<Option<Fenced<File>>>;
+    /// Hold `mount_point` open and say what the kernel has mounted there ([`mounts::hold_mount`]).
+    /// A rename proves its volume mounted through this under the image's lease, immediately
+    /// before Disk Arbitration renames it by that mount. The default reads the kernel, so a
+    /// recording runner that does not answer from its script refuses every fake device: it
+    /// fails closed, never into a rename.
+    fn hold_mount(&self, mount_point: &Path) -> io::Result<mounts::HeldMount> {
+        mounts::hold_mount(mount_point)
+    }
     /// Every disk image the kernel has attached right now, read from the I/O Registry.
     ///
     /// This is the one attachment inventory, and its absences are authoritative. `hdiutil info
@@ -1382,6 +1390,16 @@ pub enum ApfsError {
     InvalidDetachTarget(PathBuf),
     InvalidVolumeName(String),
     InvalidVolumeDevice(String),
+    /// A rename's volume is not the one mounted at the path it was found mounted at by the time
+    /// the rename would run: the path now lies on `found` (the host's own Data volume, once
+    /// nothing is mounted there), or inside a volume rather than at its root. Disk Arbitration
+    /// renames a mounted volume through its recorded mountpoint, so the rename is refused.
+    RenameTargetNotMounted {
+        image: PathBuf,
+        volume_device: String,
+        mount_point: PathBuf,
+        found: String,
+    },
     CommandRun(CommandRunError),
     CommandFailed {
         operation: &'static str,
@@ -1494,6 +1512,18 @@ impl fmt::Display for ApfsError {
             Self::InvalidVolumeDevice(device) => {
                 write!(f, "invalid APFS volume device: {device}")
             }
+            Self::RenameTargetNotMounted {
+                image,
+                volume_device,
+                mount_point,
+                found,
+            } => write!(
+                f,
+                "refusing to rename {volume_device} of {}: {} is no longer its mount root (the \
+                 kernel holds {found} there)",
+                image.display(),
+                mount_point.display()
+            ),
             Self::CommandRun(error) => error.fmt(f),
             Self::CommandFailed {
                 operation,
@@ -1714,12 +1744,19 @@ pub trait ApfsBackend {
         destination: &Path,
         capture: ImageCapture,
     ) -> Result<(), CloneFileError>;
-    /// Rename `attachment`'s volume through its device, never through a path: `diskutil
-    /// renameVolume` handed a path renames whatever volume holds it, and a path nothing is
-    /// mounted at lies on the host's own volume. Under the image's lease and a raw pin, the device
-    /// is proven still to be that image's before the rename runs, as an unmount proves it.
-    fn rename_volume(&self, attachment: &AttachedImage, volume_name: &str)
-    -> Result<(), ApfsError>;
+    /// Rename `attachment`'s volume, mounted at `mount_point`, through its device, never through
+    /// a path: `diskutil renameVolume` handed a path renames whatever volume holds it, and a path
+    /// nothing is mounted at lies on the host's own volume. Under the image's lease and a raw pin,
+    /// the device is proven still to be that image's, and `mount_point`, held open, proven still
+    /// to be that device's mount root, before the rename runs and until it returns: Disk
+    /// Arbitration renames a mounted volume through the mountpoint it recorded, so a volume
+    /// unmounted since would hand the rename to the directory beneath it.
+    fn rename_volume(
+        &self,
+        attachment: &AttachedImage,
+        mount_point: &Path,
+        volume_name: &str,
+    ) -> Result<(), ApfsError>;
     fn attach_verified(&self, image: &Path) -> Result<AttachedImage, ApfsError>;
     fn mount(
         &self,
@@ -2937,6 +2974,7 @@ impl<R: CommandRunner, S: Sleeper> ApfsBackend for MacOsApfsBackend<R, S> {
     fn rename_volume(
         &self,
         attachment: &AttachedImage,
+        mount_point: &Path,
         volume_name: &str,
     ) -> Result<(), ApfsError> {
         if !is_valid_apfs_volume_name(volume_name) {
@@ -2944,7 +2982,25 @@ impl<R: CommandRunner, S: Sleeper> ApfsBackend for MacOsApfsBackend<R, S> {
         }
         let _lease = self.image_lease(&attachment.image)?;
         let _pin = self.pin_attached_volume(attachment)?;
-        self.run_checked(
+        // Every cooperating unmount of this image waits on the lease held here; the held
+        // descriptor makes any other unforced unmount fail busy until the rename returns.
+        let held =
+            self.runner
+                .hold_mount(mount_point)
+                .map_err(|source| ApfsError::FileOperation {
+                    operation: "hold the renamed volume's mountpoint",
+                    path: mount_point.to_owned(),
+                    source,
+                })?;
+        if !held.is_root() || held.source_device() != attachment.volume_device {
+            return Err(ApfsError::RenameTargetNotMounted {
+                image: attachment.image.clone(),
+                volume_device: attachment.volume_device.clone(),
+                mount_point: mount_point.to_owned(),
+                found: held.source_device().to_owned(),
+            });
+        }
+        let renamed = self.run_checked(
             "rename APFS volume",
             CommandRequest::new(
                 DISKUTIL,
@@ -2954,8 +3010,9 @@ impl<R: CommandRunner, S: Sleeper> ApfsBackend for MacOsApfsBackend<R, S> {
                     OsString::from(volume_name),
                 ],
             ),
-        )
-        .map(|_| ())
+        );
+        drop(held);
+        renamed.map(|_| ())
     }
 
     fn attach_verified(&self, image: &Path) -> Result<AttachedImage, ApfsError> {
@@ -5205,6 +5262,8 @@ mod tests {
         Command(CommandOutput),
         Inventory(io::Result<Vec<AttachedDiskImage>>),
         Grow(io::Result<()>),
+        /// The device the kernel has at a held mountpoint, and whether it is that mount's root.
+        Mount(&'static str, bool),
     }
 
     /// One thing the backend asked the host, in order.
@@ -5213,6 +5272,7 @@ mod tests {
         Command(CommandRequest),
         Inventory,
         Grow(PathBuf, ImageCapacity),
+        HoldMount(PathBuf),
     }
 
     impl Seen {
@@ -5221,6 +5281,9 @@ mod tests {
                 Self::Command(request) => request,
                 Self::Inventory => panic!("expected a command, saw the kernel inventory read"),
                 Self::Grow(image, _) => panic!("expected a command, saw {} grow", image.display()),
+                Self::HoldMount(path) => {
+                    panic!("expected a command, saw {} held", path.display())
+                }
             }
         }
     }
@@ -5230,7 +5293,7 @@ mod tests {
             .iter()
             .filter_map(|step| match step {
                 Seen::Command(request) => Some(request.clone()),
-                Seen::Inventory | Seen::Grow(..) => None,
+                Seen::Inventory | Seen::Grow(..) | Seen::HoldMount(_) => None,
             })
             .collect()
     }
@@ -5302,6 +5365,15 @@ mod tests {
             match self.next_reply(Seen::Grow(image.to_owned(), capacity)) {
                 Reply::Grow(result) => result,
                 other => panic!("test scripted {other:?} where {} grew", image.display()),
+            }
+        }
+        fn hold_mount(&self, mount_point: &Path) -> io::Result<mounts::HeldMount> {
+            match self.next_reply(Seen::HoldMount(mount_point.to_owned())) {
+                Reply::Mount(device, root) => Ok(mounts::HeldMount::stated(device, root)),
+                other => panic!(
+                    "test scripted {other:?} where {} was held",
+                    mount_point.display()
+                ),
             }
         }
     }
@@ -7516,20 +7588,35 @@ mod tests {
             .collect()
     }
 
+    /// Where the scripted session's volume is mounted.
+    const SESSION_MOUNT: &str = "/private/tmp/cowshed-session-mount";
+
+    /// The session's volume still mounted at the root of [`SESSION_MOUNT`].
+    fn session_still_mounted() -> Reply {
+        Reply::Mount("/dev/disk5s1", true)
+    }
+
     #[test]
     fn rename_volume_names_the_attachments_pinned_volume_device() {
-        let (backend, attachment) =
-            attached_session([holding_verified_volume("session.dmg"), ok([])]);
+        let (backend, attachment) = attached_session([
+            holding_verified_volume("session.dmg"),
+            session_still_mounted(),
+            ok([]),
+        ]);
 
         backend
-            .rename_volume(&attachment, "cowshed.acme--widget.main")
+            .rename_volume(
+                &attachment,
+                Path::new(SESSION_MOUNT),
+                "cowshed.acme--widget.main",
+            )
             .unwrap();
 
         let steps = backend.runner().steps();
         assert_eq!(
-            steps[steps.len() - 2],
-            Seen::Inventory,
-            "the device is proven the image's before the rename"
+            steps[steps.len() - 3..steps.len() - 1],
+            [Seen::Inventory, Seen::HoldMount(SESSION_MOUNT.into())],
+            "the device is proven the image's, then its mount held, before the rename"
         );
         let rename = steps[steps.len() - 1].command();
         assert_eq!(rename.program, Path::new(DISKUTIL));
@@ -7539,13 +7626,49 @@ mod tests {
         );
     }
 
+    /// The mount a label found can be gone by the time the rename holds the image's lease, and
+    /// Disk Arbitration renames a mounted volume through the mountpoint it recorded: the bare
+    /// directory left there lies on the host's Data volume. A held mountpoint answering any other
+    /// device than the image's volume, or a directory inside that volume rather than its root,
+    /// refuses the rename before `diskutil` runs.
+    #[test]
+    fn rename_volume_refuses_a_mountpoint_its_volume_left_before_any_rename() {
+        for (found, root) in [("/dev/disk3s5", true), ("/dev/disk5s1", false)] {
+            let (backend, attachment) = attached_session([
+                holding_verified_volume("session.dmg"),
+                Reply::Mount(found, root),
+            ]);
+
+            let renamed = backend.rename_volume(
+                &attachment,
+                Path::new(SESSION_MOUNT),
+                "[cowshed] fixture · dispatch — main",
+            );
+
+            assert!(
+                matches!(
+                    &renamed,
+                    Err(ApfsError::RenameTargetNotMounted { volume_device, found: held, .. })
+                        if volume_device == "/dev/disk5s1" && held == found
+                ),
+                "{found} root={root}: {renamed:?}"
+            );
+            assert!(renames(&backend).is_empty(), "ran {:?}", renames(&backend));
+        }
+    }
+
     #[test]
     fn rename_volume_accepts_a_255_byte_path_safe_name() {
         let name = "a".repeat(255);
-        let (backend, attachment) =
-            attached_session([holding_verified_volume("session.dmg"), ok([])]);
+        let (backend, attachment) = attached_session([
+            holding_verified_volume("session.dmg"),
+            session_still_mounted(),
+            ok([]),
+        ]);
 
-        backend.rename_volume(&attachment, &name).unwrap();
+        backend
+            .rename_volume(&attachment, Path::new(SESSION_MOUNT), &name)
+            .unwrap();
 
         assert_eq!(renames(&backend)[0].args[2], OsString::from(name));
     }
@@ -7567,7 +7690,9 @@ mod tests {
         let (backend, attachment) = attached_session([]);
         let attached = backend.runner().steps().len();
         for name in invalid {
-            let error = backend.rename_volume(&attachment, &name).unwrap_err();
+            let error = backend
+                .rename_volume(&attachment, Path::new(SESSION_MOUNT), &name)
+                .unwrap_err();
             assert!(matches!(
                 error,
                 ApfsError::InvalidVolumeName(rejected) if rejected == name
@@ -7580,10 +7705,13 @@ mod tests {
     fn rename_volume_propagates_checked_diskutil_failure() {
         let (backend, attachment) = attached_session([
             holding_verified_volume("session.dmg"),
+            session_still_mounted(),
             failed(7, "rename failed"),
         ]);
 
-        let error = backend.rename_volume(&attachment, "main").unwrap_err();
+        let error = backend
+            .rename_volume(&attachment, Path::new(SESSION_MOUNT), "main")
+            .unwrap_err();
 
         assert!(matches!(
             error,
@@ -7614,8 +7742,11 @@ mod tests {
         for now in [no_images(), foreign()] {
             let (backend, attachment) = attached_session([now]);
 
-            let renamed =
-                backend.rename_volume(&attachment, "[cowshed] fixture · intents — slotted");
+            let renamed = backend.rename_volume(
+                &attachment,
+                Path::new(SESSION_MOUNT),
+                "[cowshed] fixture · intents — slotted",
+            );
 
             assert!(
                 matches!(renamed, Err(ApfsError::InvalidAttachmentInventory(_))),
@@ -7708,6 +7839,9 @@ mod tests {
         fn grow_image(&self, image: &Path, capacity: ImageCapacity) -> io::Result<()> {
             self.recorded.grow_image(image, capacity)
         }
+        fn hold_mount(&self, mount_point: &Path) -> io::Result<mounts::HeldMount> {
+            self.recorded.hold_mount(mount_point)
+        }
     }
 
     /// The rename's raw pin outlives the `diskutil` call. Dropped any earlier, the kernel could
@@ -7717,13 +7851,21 @@ mod tests {
         let backend = MacOsApfsBackend::new(PinWitness::new(RecordingRunner::with_outputs(
             verified_attachment_replies("session.dmg")
                 .into_iter()
-                .chain([holding_verified_volume("session.dmg"), ok([])]),
+                .chain([
+                    holding_verified_volume("session.dmg"),
+                    session_still_mounted(),
+                    ok([]),
+                ]),
         )));
         let attachment = backend
             .attach_verified(Path::new("session.dmg"))
             .expect("verified attachment");
 
-        let renamed = backend.rename_volume(&attachment, "cowshed.acme--widget.main");
+        let renamed = backend.rename_volume(
+            &attachment,
+            Path::new(SESSION_MOUNT),
+            "cowshed.acme--widget.main",
+        );
         let held = backend.runner().held_at_rename.take();
         drop(attachment);
         fs::remove_dir_all(&backend.runner().pins).expect("remove the pins");

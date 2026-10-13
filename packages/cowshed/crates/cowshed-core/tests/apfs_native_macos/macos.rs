@@ -122,6 +122,9 @@ struct RecordingRunner {
     requests: Arc<Mutex<Vec<CommandRequest>>>,
     volume_name: Arc<Mutex<String>>,
     inventory: FakeInventory,
+    /// The fake kernel's mounts, by mountpoint, as a held mountpoint answers them. A path not
+    /// listed is read from the real kernel, which answers the volume holding that directory.
+    mounted: Arc<Mutex<std::collections::BTreeMap<PathBuf, String>>>,
 }
 
 impl Default for RecordingRunner {
@@ -131,6 +134,7 @@ impl Default for RecordingRunner {
             requests: Arc::default(),
             volume_name: Arc::new(Mutex::new("cowshed.acme--widget.main".to_owned())),
             inventory: FakeInventory::default(),
+            mounted: Arc::default(),
         }
     }
 }
@@ -142,6 +146,11 @@ impl RecordingRunner {
 
     fn requests(&self) -> Vec<CommandRequest> {
         self.requests.lock().expect("requests").clone()
+    }
+
+    /// The fake kernel unmounts what was mounted at `mount_point`.
+    fn unmount(&self, mount_point: &Path) {
+        self.mounted.lock().expect("mounts").remove(mount_point);
     }
 }
 
@@ -202,6 +211,15 @@ impl CommandRunner for RecordingRunner {
             std::io::ErrorKind::Unsupported,
             format!("the recording runner grows no image: {}", image.display()),
         ))
+    }
+    fn hold_mount(&self, mount_point: &Path) -> std::io::Result<cowshed_apfs::mounts::HeldMount> {
+        match self.mounted.lock().expect("mounts").get(mount_point) {
+            Some(device) => Ok(cowshed_apfs::mounts::HeldMount::stated(
+                device.clone(),
+                true,
+            )),
+            None => cowshed_apfs::mounts::hold_mount(mount_point),
+        }
     }
 }
 /// Fails the first kernel disk-image inventory read, then reports nothing attached.
@@ -2617,12 +2635,18 @@ impl KernelMountSource for FixedMounts {
     }
 }
 
-/// A host over `runner` that sees `mounts` and nothing else mounted.
+/// A host over `runner` that sees `mounts` and nothing else mounted; a held mountpoint of
+/// `runner` answers the same mounts.
 fn host_seeing(
     fixture: &Fixture,
     runner: RecordingRunner,
     mounts: Vec<KernelMountSnapshot>,
 ) -> MacOsApfsExecutionHost<RecordingRunner> {
+    runner.mounted.lock().expect("mounts").extend(
+        mounts
+            .iter()
+            .map(|mount| (mount.mount_point.clone(), mount.source_device.clone())),
+    );
     MacOsApfsExecutionHost::with_mount_source(runner, fixture.config(), FixedMounts(mounts))
         .expect("native APFS host")
 }
@@ -2697,6 +2721,55 @@ fn native_volume_rename_names_the_image_volume_device_never_its_mount_path() {
             std::ffi::OsString::from("/dev/disk10s1"),
             std::ffi::OsString::from(SLOTTED),
         ]
+    );
+}
+
+/// The volume a label found mounted is unmounted before its rename runs: the mount table read
+/// still lists it, but its mountpoint is now the bare directory beneath, on the host's own Data
+/// volume, and Disk Arbitration renames a mounted volume through the mountpoint it recorded.
+/// Held under the image's lease, the mountpoint answers the host's device, the real kernel's
+/// answer for that directory, and the rename is refused before `diskutil` runs.
+#[test]
+fn a_volume_unmounted_before_its_rename_is_refused_before_any_rename() {
+    let fixture = Fixture::new("rename-unmounted-since");
+    let runner = RecordingRunner::default();
+    let image = slotted_image(&fixture);
+    attach(&runner, &image);
+    let mount = fixture.root.join("mount").join("slotted");
+    std::fs::create_dir_all(&mount).expect("mountpoint");
+    let host = host_seeing(
+        &fixture,
+        runner.clone(),
+        vec![KernelMountSnapshot::new(
+            7,
+            &mount,
+            "/dev/disk10s1",
+            true,
+            true,
+        )],
+    );
+    runner.unmount(&mount);
+    let beneath = cowshed_apfs::mounts::hold_mount(&mount).expect("the directory beneath");
+
+    let refused = host
+        .label_image_volume(&image, SLOTTED)
+        .expect_err("a volume unmounted since is no rename target");
+
+    assert!(
+        matches!(
+            &refused,
+            ApfsStorageError::Apfs(ApfsError::RenameTargetNotMounted {
+                volume_device,
+                found,
+                ..
+            }) if volume_device == "/dev/disk10s1" && found == beneath.source_device()
+        ),
+        "{refused}"
+    );
+    assert!(
+        renames(&runner).is_empty(),
+        "renamed {:?}",
+        renames(&runner)
     );
 }
 
@@ -2930,7 +3003,8 @@ fn the_host_rename_refuses_an_attachment_of_an_image_outside_the_store() {
         .attach_verified(&foreign)
         .expect("a verified attachment of a foreign image");
 
-    let refused = ApfsExecutionHost::rename_volume(&host, &attachment, SLOTTED).unwrap_err();
+    let refused =
+        ApfsExecutionHost::rename_volume(&host, &attachment, &fixture.root, SLOTTED).unwrap_err();
 
     assert!(
         matches!(

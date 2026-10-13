@@ -1319,6 +1319,7 @@ impl ApfsExecutionHost for DirectoryExecutionHost {
     fn rename_volume(
         &self,
         _attachment: &Self::Attachment,
+        _mount_point: &Path,
         _volume_name: &str,
     ) -> Result<(), ApfsStorageError> {
         Err(unsupported("volume labels"))

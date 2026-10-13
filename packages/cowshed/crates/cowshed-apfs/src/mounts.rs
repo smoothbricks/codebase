@@ -140,6 +140,81 @@ pub fn kernel_mounts() -> io::Result<Vec<KernelMountSnapshot>> {
     }
 }
 
+/// A directory descriptor held open on a path, and what the kernel says that descriptor is on:
+/// the device mounted there and whether the path is that mount's root. Held, it makes an unforced
+/// unmount of that filesystem fail busy, so the mount it proves stays put while it is held.
+pub struct HeldMount {
+    source_device: String,
+    is_root: bool,
+    _held: Option<cowshed_os::fork_lock::Fenced<std::fs::File>>,
+}
+
+impl HeldMount {
+    /// What a recording runner states the kernel answered, holding nothing.
+    pub fn stated(source_device: impl Into<String>, is_root: bool) -> Self {
+        Self {
+            source_device: source_device.into(),
+            is_root,
+            _held: None,
+        }
+    }
+
+    /// The device of the filesystem the held path lies on.
+    pub fn source_device(&self) -> &str {
+        &self.source_device
+    }
+
+    /// Whether the held path is that filesystem's mount root, not a directory inside it.
+    pub fn is_root(&self) -> bool {
+        self.is_root
+    }
+}
+
+/// Open `path` as a directory, without following a final symlink, and read the filesystem the
+/// descriptor lies on (`fstatfs`): never the path again, which an unmount can hand to whatever
+/// volume lies beneath it. A mountpoint nothing is mounted at answers the host volume holding
+/// that directory.
+pub fn hold_mount(path: &std::path::Path) -> io::Result<HeldMount> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::ffi::{CStr, OsStr};
+        use std::os::fd::AsRawFd;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(path)?;
+        // SAFETY: `statfs` is plain data, for which all zeroes is a value.
+        let mut filesystem: libc::statfs = unsafe { std::mem::zeroed() };
+        // SAFETY: `held` owns a live descriptor and `filesystem` is writable.
+        if unsafe { libc::fstatfs(held.as_raw_fd(), &mut filesystem) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: Darwin NUL-terminates both names, in a record this function owns.
+        let source_device = unsafe { CStr::from_ptr(filesystem.f_mntfromname.as_ptr()) }
+            .to_string_lossy()
+            .into_owned();
+        // SAFETY: as above.
+        let root = unsafe { CStr::from_ptr(filesystem.f_mntonname.as_ptr()) }.to_bytes();
+        let here = held.metadata()?;
+        let root = std::fs::metadata(OsStr::from_bytes(root))?;
+        Ok(HeldMount {
+            source_device,
+            is_root: (here.dev(), here.ino()) == (root.dev(), root.ino()),
+            _held: Some(cowshed_os::fork_lock::Fenced::new(held)),
+        })
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("no APFS volume is mounted off macOS: {}", path.display()),
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -149,5 +224,36 @@ mod tests {
         for (count, mounts) in [(-1, None), (0, None), (1, Some(1))] {
             assert_eq!(mount_count(count), mounts, "getfsstat count={count}");
         }
+    }
+
+    /// A mountpoint nothing is mounted at is a plain directory of the volume beneath it: held, it
+    /// answers that volume's device — the host's, for a directory under the temp root — and is
+    /// not a mount root. The volume's own root answers the same device as a root.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_held_mountpoint_nothing_is_mounted_at_answers_the_volume_beneath_it() {
+        let directory = std::env::temp_dir().join(format!(
+            "cowshed-unmounted-mountpoint-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let held = hold_mount(&directory).expect("hold the bare mountpoint");
+        use std::os::unix::fs::MetadataExt;
+        let device = std::fs::metadata(&directory).unwrap().dev();
+        // By device, not path prefix: a firmlinked temp root lies on the Data volume, not `/`.
+        let beneath = kernel_mounts()
+            .unwrap()
+            .into_iter()
+            .find(|mount| {
+                std::fs::metadata(&mount.mount_point).is_ok_and(|root| root.dev() == device)
+            })
+            .expect("the volume holding the temp root");
+        assert_eq!(held.source_device(), beneath.source_device);
+        assert!(!held.is_root(), "a bare mountpoint is not a mount root");
+        let root = hold_mount(&beneath.mount_point).expect("hold the volume's root");
+        assert_eq!(root.source_device(), beneath.source_device);
+        assert!(root.is_root());
+        drop(held);
+        std::fs::remove_dir(&directory).unwrap();
     }
 }

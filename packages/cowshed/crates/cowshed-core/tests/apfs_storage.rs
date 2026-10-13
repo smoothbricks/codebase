@@ -409,6 +409,7 @@ impl ApfsExecutionHost for FakeHost {
     fn rename_volume(
         &self,
         _: &Self::Attachment,
+        _: &Path,
         volume_key: &str,
     ) -> Result<(), ApfsStorageError> {
         self.record(format!("rename-volume:{volume_key}"));
