@@ -71,12 +71,19 @@ const smoothBricksNxPlugin = '@smoothbricks/nx-plugin';
 const cleanOutputsExecutor = '@smoothbricks/nx-plugin:clean-outputs';
 const ciWorkflowNamedInput = ['{workspaceRoot}/.github/workflows/ci.yml'];
 const inferredTestTypecheckTarget = 'typecheck-tests';
+/**
+ * Markdown is documentation: no inferred task reads it, so a README or spec edit must not re-key every task of the
+ * project and, through `^default`/`^production`, of every project depending on it. A target that does read Markdown
+ * (a docs site build, a binary that `include_str!`s a shipped skill) names those files in its own inputs.
+ */
+const MARKDOWN_EXCLUSION = '!{projectRoot}/**/*.md';
 const defaultProductionNamedInput = [
   '{projectRoot}/src/**/*',
   '{projectRoot}/package.json',
   '!{projectRoot}/**/__tests__/**',
   '!{projectRoot}/**/*.test.*',
   '!{projectRoot}/**/*.spec.*',
+  MARKDOWN_EXCLUSION,
 ];
 const impreciseProductionInputs = new Set(['default', '{projectRoot}/**/*', '{projectRoot}/**']);
 
@@ -332,6 +339,8 @@ function validateNamedInputDefaults(
       path: nxJsonPath,
       message: 'namedInputs.default must be an array; smoo allows it to remain broad for non-production tasks.',
     });
+  } else if (!namedInputs.default.includes(MARKDOWN_EXCLUSION)) {
+    issues.push({ path: nxJsonPath, message: markdownExclusionMessage('default') });
   }
   if (
     Array.isArray(namedInputs.default) &&
@@ -340,7 +349,8 @@ function validateNamedInputDefaults(
   ) {
     issues.push({
       path: nxJsonPath,
-      message: 'namedInputs.default must not include CI-only sharedGlobals; workflow targets declare their own inputs.',
+      message:
+        'namedInputs.default must not include CI-only sharedGlobals; workflow targets may name their CI inputs explicitly.',
     });
   }
   const production = namedInputs.production;
@@ -357,7 +367,13 @@ function validateNamedInputDefaults(
       message:
         'namedInputs.production must enumerate precise production inputs. Do not include default or broad {projectRoot}/** globs; use language/tool-specific paths such as {projectRoot}/src/**/*, {projectRoot}/Cargo.toml, or {projectRoot}/pyproject.toml.',
     });
+  } else if (!production.includes(MARKDOWN_EXCLUSION)) {
+    issues.push({ path: nxJsonPath, message: markdownExclusionMessage('production') });
   }
+}
+
+function markdownExclusionMessage(name: 'default' | 'production'): string {
+  return `namedInputs.${name} must exclude ${MARKDOWN_EXCLUSION.slice(1)}: Markdown is no task's input unless a target names it.`;
 }
 
 function applyBuildTargetDefault(nxJson: Record<string, unknown>): boolean {
@@ -443,7 +459,7 @@ function applyNamedInputDefaults(nxJson: Record<string, unknown>): boolean {
   let changed = false;
   const defaults = namedInputs.default;
   if (!Array.isArray(defaults)) {
-    namedInputs.default = ['{projectRoot}/**/*'];
+    namedInputs.default = ['{projectRoot}/**/*', MARKDOWN_EXCLUSION];
     changed = true;
   } else if (defaults.includes('sharedGlobals') && stringArrayEquals(namedInputs.sharedGlobals, ciWorkflowNamedInput)) {
     namedInputs.default = defaults.filter((input) => input !== 'sharedGlobals');
@@ -453,6 +469,13 @@ function applyNamedInputDefaults(nxJson: Record<string, unknown>): boolean {
   if (!Array.isArray(production) || !isPreciseProductionNamedInput(production)) {
     namedInputs.production = defaultProductionNamedInput;
     changed = true;
+  }
+  for (const name of ['default', 'production'] as const) {
+    const inputs = namedInputs[name];
+    if (Array.isArray(inputs) && !inputs.includes(MARKDOWN_EXCLUSION)) {
+      namedInputs[name] = [...inputs, MARKDOWN_EXCLUSION];
+      changed = true;
+    }
   }
   return changed;
 }

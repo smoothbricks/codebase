@@ -8,13 +8,14 @@
     "enabled": false
   },
   "namedInputs": {
-    "default": ["{projectRoot}/**/*"],
+    "default": ["{projectRoot}/**/*", "!{projectRoot}/**/*.md"],
     "production": [
       "{projectRoot}/src/**/*",
       "{projectRoot}/package.json",
       "!{projectRoot}/**/__tests__/**",
       "!{projectRoot}/**/*.test.*",
-      "!{projectRoot}/**/*.spec.*"
+      "!{projectRoot}/**/*.spec.*",
+      "!{projectRoot}/**/*.md"
     ],
     "externalRustCrates": [
       {
@@ -22,32 +23,32 @@
       }
     ],
     "rustWorkspace": [
-      "{workspaceRoot}/Cargo.toml",
-      "{workspaceRoot}/Cargo.lock",
+      "cargoClosure",
       "{workspaceRoot}/devenv.lock",
       "{workspaceRoot}/tooling/direnv/devenv.lock",
-      "{workspaceRoot}/.cargo/config.toml",
-      "{workspaceRoot}/packages/columine/crates/**/*.rs",
-      "{workspaceRoot}/packages/columine/crates/**/Cargo.toml",
-      "{workspaceRoot}/packages/cowshed/crates/**/*.rs",
-      "{workspaceRoot}/packages/cowshed/crates/**/Cargo.toml",
       "{workspaceRoot}/packages/cowshed/scripts/*.sh",
-      "{workspaceRoot}/packages/lmao/crates/**/*.rs",
-      "{workspaceRoot}/packages/lmao/crates/**/Cargo.toml",
       "{workspaceRoot}/packages/lmao/src/lib/schema/systemSchema.ts",
       "{workspaceRoot}/packages/lmao/src/lib/capacityTuning.ts"
     ]
   },
   "targetDefaults": {
     "build": {
-      "cache": true
+      "cache": true,
+      "inputs": ["default", "^default"]
     },
     "typecheck": {
       "cache": true,
       "outputs": []
     },
     "test": {
-      "cache": true
+      "cache": true,
+      "inputs": ["default", "^default"]
+    },
+    "cargo-test": {
+      "inputs": ["default", "^default"]
+    },
+    "cargo-lint": {
+      "inputs": ["default", "^default"]
     },
     "lint": {
       "cache": true

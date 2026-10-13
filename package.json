@@ -128,31 +128,7 @@
       },
       "cargo-test-archive": {
         "inputs": [
-          "rustWorkspace",
-          "{workspaceRoot}/packages/*/crates/**/*",
-          "{workspaceRoot}/.cargo/config",
-          "{workspaceRoot}/rust-toolchain",
-          "{workspaceRoot}/rust-toolchain.toml",
-          "{workspaceRoot}/rustfmt.toml",
-          "{workspaceRoot}/.rustfmt.toml",
-          "{workspaceRoot}/clippy.toml",
-          "{workspaceRoot}/.clippy.toml",
-          "!{workspaceRoot}/**/.git/**",
-          "!{workspaceRoot}/**/node_modules/**",
-          "!{workspaceRoot}/**/.nx/**",
-          "!{workspaceRoot}/**/target/**",
-          {
-            "dependentTasksOutputFiles": "**/*",
-            "transitive": false
-          },
-          "{projectRoot}/.config/nextest.toml",
-          "cargoToolchain",
-          {
-            "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh sh -c 'cd \"$0\" && rustc -vV && cargo -V && cargo nextest --version' ."
-          },
-          {
-            "externalDependencies": []
-          },
+          "...",
           {
             "env": "LMAO_GIT_REVISION"
           }

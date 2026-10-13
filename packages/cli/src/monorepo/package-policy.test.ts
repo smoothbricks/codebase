@@ -24,6 +24,7 @@ import {
   applyRootScriptDefaults,
   applyWorkspaceDependencyDefaults,
   listValidCommitScopes,
+  validateExplicitTaskInputs,
   validateNoStaleTestOutput,
   validateNxProjectNames,
   validateNxReleaseConfig,
@@ -52,6 +53,39 @@ const buildOutputDependencies = [
   '*-wasm',
 ];
 
+// Nx 23.2.1 hashes a cached target that names no inputs over every file under its project root, ignoring nx.json's
+// `default`: with Markdown excluded there, a README edit still re-keyed the project's tests and aggregates.
+describe('cached targets name their inputs', () => {
+  afterEach(() => {
+    console.error = originalConsoleError;
+  });
+
+  it('refuses a cached target that leaves its inputs to Nx, and nothing else', () => {
+    const errors = captureConsoleErrors();
+    const failures = validateExplicitTaskInputs([
+      {
+        project: 'app',
+        targets: ['build', 'lint', 'serve', 'test'],
+        targetCache: new Map([
+          ['build', true],
+          ['lint', true],
+          ['serve', false],
+          ['test', true],
+        ]),
+        // An all-object declaration (`[{ runtime: … }]`) projects to an empty list: still declared.
+        targetInputs: new Map([
+          ['build', ['default', '^default']],
+          ['lint', []],
+        ]),
+      },
+    ]);
+    expect(failures).toBe(1);
+    expect(errors).toEqual([
+      'app:test: cached target declares no inputs, so Nx hashes every file under its project root and ignores nx.json\'s default named input; declare its inputs, or give "test" a targetDefaults entry with "inputs": ["default", "^default"]',
+    ]);
+  });
+});
+
 describe('root smoo monorepo policy', () => {
   afterEach(() => {
     console.error = originalConsoleError;
@@ -67,7 +101,7 @@ describe('root smoo monorepo policy', () => {
       await writeJson(join(root, 'nx.json'), validNxJson());
 
       expect(validateRootPackagePolicy(root)).toBe(11);
-      expect(validateNxReleaseConfig(root)).toBe(8);
+      expect(validateNxReleaseConfig(root)).toBe(9);
 
       applyFixableMonorepoDefaults(root);
 
@@ -225,7 +259,7 @@ describe('root smoo monorepo policy', () => {
       await writeJson(join(root, 'nx.json'), {
         ...validConfiguredNxJson(),
         namedInputs: {
-          default: ['{projectRoot}/**/*'],
+          default: ['{projectRoot}/**/*', '!{projectRoot}/**/*.md'],
           production: ['default', '{projectRoot}/**/*'],
         },
       });
@@ -252,7 +286,7 @@ describe('root smoo monorepo policy', () => {
         ...validConfiguredNxJson(),
         namedInputs: {
           ...validNamedInputs(),
-          default: ['{projectRoot}/**/*', 'sharedGlobals', 'custom'],
+          default: ['{projectRoot}/**/*', 'sharedGlobals', 'custom', '!{projectRoot}/**/*.md'],
           sharedGlobals: ['{workspaceRoot}/.github/workflows/ci.yml'],
           custom: ['{workspaceRoot}/config/shared.json'],
         },
@@ -268,7 +302,7 @@ describe('root smoo monorepo policy', () => {
       const nxJson = await readJson(join(root, 'nx.json'));
       expect(nxJson.namedInputs).toEqual(
         expect.objectContaining({
-          default: ['{projectRoot}/**/*', 'custom'],
+          default: ['{projectRoot}/**/*', 'custom', '!{projectRoot}/**/*.md'],
           sharedGlobals: ['{workspaceRoot}/.github/workflows/ci.yml'],
           custom: ['{workspaceRoot}/config/shared.json'],
         }),
@@ -300,7 +334,6 @@ describe('root smoo monorepo policy', () => {
       await rm(root, { recursive: true, force: true });
     }
   });
-
   it('accepts custom precise production named inputs for non-TypeScript tools', async () => {
     const root = await mkdtemp(join(tmpdir(), 'smoo-package-policy-'));
     try {
@@ -308,12 +341,13 @@ describe('root smoo monorepo policy', () => {
       await writeJson(join(root, 'nx.json'), {
         ...validConfiguredNxJson(),
         namedInputs: {
-          default: ['{projectRoot}/**/*'],
+          default: ['{projectRoot}/**/*', '!{projectRoot}/**/*.md'],
           production: [
             '{projectRoot}/Cargo.toml',
             '{projectRoot}/src/**/*.rs',
             '{projectRoot}/pyproject.toml',
             '{projectRoot}/python/**/*.py',
+            '!{projectRoot}/**/*.md',
           ],
         },
       });
@@ -1781,13 +1815,14 @@ function validTargetDefaults(): Record<string, unknown> {
 
 function validNamedInputs(): Record<string, unknown> {
   return {
-    default: ['{projectRoot}/**/*'],
+    default: ['{projectRoot}/**/*', '!{projectRoot}/**/*.md'],
     production: [
       '{projectRoot}/src/**/*',
       '{projectRoot}/package.json',
       '!{projectRoot}/**/__tests__/**',
       '!{projectRoot}/**/*.test.*',
       '!{projectRoot}/**/*.spec.*',
+      '!{projectRoot}/**/*.md',
     ],
   };
 }
