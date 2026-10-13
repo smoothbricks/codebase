@@ -419,14 +419,36 @@ fn release_mount(image: &Path, intent: DetachIntent) -> Result<(), ApfsStorageEr
     }
 }
 
+/// Every process holding anything inside the tree at `root`, counted as a directory backend
+/// must count them: a census taken twice, keeping only the processes both censuses name. A
+/// child caught between fork and exec still carries its parent's descriptors — the parent's
+/// holds, not the child's — and drops them at exec, so the second census, a full scan later,
+/// no longer names it. A process that truly holds the tree is named by both.
+pub(super) fn confirmed_tree_holders(
+    root: &Path,
+) -> Result<Vec<cowshed_os::process::Holder>, ApfsStorageError> {
+    let census = |root: &Path| {
+        crate::build_volume::nx::tree_holders(root)
+            .map_err(|error| io_error("list the processes holding a tree", root, error))
+    };
+    let first = census(root)?;
+    if first.is_empty() {
+        return Ok(first);
+    }
+    let second = census(root)?;
+    Ok(first
+        .into_iter()
+        .filter(|holder| second.iter().any(|confirmed| confirmed.pid == holder.pid))
+        .collect())
+}
+
 /// Move a mounted payload back to its image path and leave the empty directory an unmounted
 /// mountpoint is. A mountpoint keeps no process out of a directory: whoever is inside the tree
 /// moves with it. So `WhenIdle` refuses, naming them, while any process holds anything in the
 /// tree - the refusal an unforced unmount of a busy volume gives - and `Release` goes ahead.
 fn move_home(image: &Path, mount_point: &Path, intent: DetachIntent) -> Result<(), ApfsStorageError> {
     if intent == DetachIntent::WhenIdle {
-        let open = crate::build_volume::nx::tree_holders(mount_point)
-            .map_err(|error| io_error("list the processes holding a payload", mount_point, error))?;
+        let open = confirmed_tree_holders(mount_point)?;
         if !open.is_empty() {
             return Err(ApfsStorageError::Host(format!(
                 "{} is in use and stays mounted: {open:?}",
