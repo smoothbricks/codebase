@@ -34,4 +34,5 @@ brush-parser = "0.4"
 async-trait = "0.1"
 bytes = "1"
 cowshed-gateway-types = { path = "../cowshed-gateway-types" }
+cowshed-os = { path = "../cowshed-os" }
 uuid = { version = "1", features = ["v4"] }

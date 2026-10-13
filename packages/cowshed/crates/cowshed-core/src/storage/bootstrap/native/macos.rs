@@ -34,14 +34,12 @@ use super::shared::{
     existing_host_storage_error, platform_host_error, provision_volumes_action,
     setup_execution_error, write_marker_action,
 };
-use cowshed_apfs::{RegisteredApfsContainer, registered_apfs_containers};
 use crate::error::CowshedError;
-use cowshed_os::fork_lock::{Run as _, Spawn as _};
-use cowshed_apfs::mounts::KernelMountSnapshot;
-use crate::storage::apfs::native::{
-    KernelMountSource, SystemKernelMountSource,
-};
+use crate::storage::apfs::native::{KernelMountSource, SystemKernelMountSource};
 use crate::storage::fstab::{COWSHED_FSTAB_TAG, FstabPin, build_fstab};
+use cowshed_apfs::mounts::KernelMountSnapshot;
+use cowshed_apfs::{RegisteredApfsContainer, registered_apfs_containers};
+use cowshed_os::fork_lock::{Run as _, Spawn as _};
 
 const DISKUTIL_PROBE_DEADLINE: Duration = Duration::from_secs(5);
 const DISKUTIL_MOUNT_DEADLINE: Duration = Duration::from_secs(30);
@@ -2434,15 +2432,16 @@ fn run_command_with(
             command.program()
         )));
     }
-    let output =
-        cowshed_apfs::disk_lease::leased(program, command.args(), || spawn(program, command.args()))
-            .map_err(|source| {
-                HostError::new(format!(
-                    "cannot execute {:?} with argv {:?}: {source}",
-                    command.program(),
-                    command.args()
-                ))
-            })?;
+    let output = cowshed_apfs::disk_lease::leased(program, command.args(), || {
+        spawn(program, command.args())
+    })
+    .map_err(|source| {
+        HostError::new(format!(
+            "cannot execute {:?} with argv {:?}: {source}",
+            command.program(),
+            command.args()
+        ))
+    })?;
     Ok(output.into())
 }
 
@@ -3511,8 +3510,9 @@ mod tests {
 
     use super::super::shared::mutating_setup_actions;
     use super::*;
-    use cowshed_apfs::RegisteredApfsVolume;
     use crate::storage::bootstrap::{BlockingJob, RETIRED_CACHES_MOUNTPOINT};
+    use cowshed_apfs::RegisteredApfsVolume;
+    use cowshed_gateway_types::STORE_ROOT;
     use uuid::Uuid;
 
     #[test]

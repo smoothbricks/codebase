@@ -19,7 +19,6 @@ use cowshed_core::api::{
     RunSandboxMode, ScriptCommand, ScriptValue, StdinSource, WorkspacePath,
 };
 use cowshed_core::error::Result;
-use cowshed_core::host_load::HostLoad;
 use cowshed_core::metadata::{PortBlock, WorkspaceIncarnation, WorkspaceName};
 use cowshed_core::repository::{OwnedRepoIds, RepoId};
 use cowshed_core::runtime::shell_host::ShellHostProgram;
@@ -33,6 +32,7 @@ use cowshed_core::sandbox::{SandboxConfig, SandboxGrants};
 use cowshed_core::storage::job_artifact::{ArtifactConfig, StreamKind};
 use cowshed_core::workspace_credentials::WORKSPACE_TOKEN_PATH;
 use cowshed_gateway_types::WorkspaceToken;
+use cowshed_os::host_load::HostLoad;
 
 const COUNT: &str = "printf 'activation\\n' >> \"$TMPDIR/activations\"\n";
 

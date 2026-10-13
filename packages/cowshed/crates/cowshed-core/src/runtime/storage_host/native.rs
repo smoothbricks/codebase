@@ -1,8 +1,8 @@
 //! Native delegations keep the shared runtime on the existing APFS implementation.
 
 use super::*;
-use cowshed_apfs::CommandRunner;
 use crate::storage::apfs::native::MacOsApfsExecutionHost;
+use cowshed_apfs::CommandRunner;
 
 impl<R> RuntimeStorageHost for MacOsApfsExecutionHost<R>
 where
@@ -99,17 +99,6 @@ where
         MacOsApfsExecutionHost::release_claimed(self, layout, claim)
     }
 
-    fn settle_build_link(
-        &self,
-        layout: &BuildVolumeLayout,
-        workspace: &WorkspaceName,
-        incarnation: &WorkspaceIncarnation,
-        checkout: &Path,
-        linked: &BuildVolumeId,
-    ) -> Result<(), ApfsStorageError> {
-        MacOsApfsExecutionHost::settle_build_link(self, layout, workspace, incarnation, checkout, linked)
-    }
-
     fn build_volume_capacity(
         &self,
         layout: &BuildVolumeLayout,
@@ -160,7 +149,12 @@ where
         retained: &Path,
         capacity_bytes: u64,
     ) -> Result<(u64, u64), ApfsStorageError> {
-        MacOsApfsExecutionHost::require_sparse_replacement(self, replacement, retained, capacity_bytes)
+        MacOsApfsExecutionHost::require_sparse_replacement(
+            self,
+            replacement,
+            retained,
+            capacity_bytes,
+        )
     }
 
     fn publish_re_adopt_build(

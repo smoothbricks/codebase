@@ -358,7 +358,7 @@ For every mounted attachment:
 ### Mount and per-volume policy
 
 Main/personal workspaces and live build targets share the
-[image backend](../../packages/cowshed/crates/cowshed-core/src/apfs.rs) (`MacOsApfsBackend::mount`); the
+[image backend](../../packages/cowshed/crates/cowshed-apfs/src/lib.rs) (`MacOsApfsBackend::mount`); the
 [build host](../../packages/cowshed/crates/cowshed-core/src/storage/apfs/native/build_volumes.rs) always passes
 `browse = false`. **Build seeds remain detached clones** of a quiet live volume, beside it in `build/` with a sidecar
 recording the tree it was built at: the landing workspace's at every land, whether through `cowshed land` or a

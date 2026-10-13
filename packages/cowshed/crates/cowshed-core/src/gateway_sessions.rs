@@ -16,7 +16,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use async_trait::async_trait;
 use cowshed_gateway_types::{
@@ -31,7 +31,6 @@ use crate::gateway_inventory::{GatewaySessionFact, NativeGatewayInventory};
 use crate::metadata::{EgressMode as CoreEgressMode, GrantSet, WorkspaceIncarnation};
 use crate::repository::RepoId;
 use crate::storage::bootstrap::ValidatedHostStorage;
-use cowshed_gateway_types::{STORE_ROOT, control_socket_path};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ReconcileReport {

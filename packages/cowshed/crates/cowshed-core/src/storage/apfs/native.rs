@@ -1,8 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{CString, OsStr, OsString};
-use std::fs::{self, File};
+use std::fs;
+#[cfg(test)]
+use std::fs::File;
 use std::io;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering as AtomicOrdering};
 use std::sync::mpsc::{self, Sender, SyncSender};
@@ -13,19 +15,11 @@ use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
-use cowshed_apfs::{
-    ApfsBackend, ApfsError, AttachedImage, CommandRunner, DetachIntent, MacOsApfsBackend,
-    MountAccess, RecoveredImageAttachment,
-};
 use crate::copy::copy_until_quiescent_blocking;
-#[cfg(target_os = "macos")]
-use cowshed_os::fsio::AnchoredDirectory;
-use cowshed_apfs::image::{IMAGE_EXTENSION, ImageCapacity, is_image_path};
 use crate::metadata::{
-    DetachedWorkspaceMetadata, GRANTS_SIDECAR_SUFFIX,
-    MARKER_VERSION, Platform, PublicationState, SIDECAR_VERSION, WorkspaceIncarnation,
-    WorkspaceInfoSnapshot, WorkspaceMarker, WorkspaceName, WorkspaceRole,
-    sidecar_path,
+    DetachedWorkspaceMetadata, GRANTS_SIDECAR_SUFFIX, MARKER_VERSION, Platform, PublicationState,
+    SIDECAR_VERSION, WorkspaceIncarnation, WorkspaceInfoSnapshot, WorkspaceMarker, WorkspaceName,
+    WorkspaceRole, sidecar_path,
 };
 use crate::repository::{
     CHECKPOINTS_DIRECTORY, EXEC_TEMP_DIRECTORY, OwnedRepoIds, RepoId, SESSIONS_DIRECTORY,
@@ -33,6 +27,13 @@ use crate::repository::{
 use crate::workspace_credentials::{
     mint_workspace_credentials, validate_private_key, validate_public_workspace_assets,
 };
+use cowshed_apfs::image::{IMAGE_EXTENSION, ImageCapacity, is_image_path};
+use cowshed_apfs::{
+    ApfsBackend, ApfsError, AttachedImage, CommandRunner, DetachIntent, MacOsApfsBackend,
+    MountAccess, RecoveredImageAttachment,
+};
+#[cfg(target_os = "macos")]
+use cowshed_os::fsio::AnchoredDirectory;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -59,15 +60,14 @@ mod blank_template;
 mod build_volumes;
 #[cfg(target_os = "macos")]
 mod re_adopt;
-use cowshed_apfs::mounts::{KernelMountSnapshot, kernel_mounts};
-use cowshed_apfs::store_lock::{ImageLockGuard, acquire_image_locks};
 pub use build_volumes::{
     Claim as BuildVolumeClaim, Refusal as BuildVolumeRefusal, Release as BuildVolumeRelease,
 };
+use cowshed_apfs::mounts::{KernelMountSnapshot, kernel_mounts};
+use cowshed_apfs::store_lock::{ImageLockGuard, acquire_image_locks};
 
 pub(in crate::storage) const CHECKPOINT_FACT_VERSION: u32 = 1;
 const CHECKPOINT_FACT_SUFFIX: &str = ".checkpoint.json";
-
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -567,7 +567,6 @@ pub(in crate::storage) fn restore_adopted_checkout_paths(
     remove_empty_mountpoint(pre_cowshed_checkout)
 }
 
-
 pub trait KernelMountSource: Send + Sync + 'static {
     fn mounts(&self) -> Result<Vec<KernelMountSnapshot>, ApfsStorageError>;
 }
@@ -583,7 +582,6 @@ impl KernelMountSource for SystemKernelMountSource {
         kernel_mounts().map_err(|error| ApfsStorageError::Host(error.to_string()))
     }
 }
-
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RestoreFailpoint {
@@ -1723,7 +1721,8 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
             Ok(Some(None))
         } else {
             acquire_image_locks(&self.config.store_root, &[lock], LockMode::Try)
-                .map(|guard| guard.map(Some)).map_err(Into::into)
+                .map(|guard| guard.map(Some))
+                .map_err(Into::into)
         }
     }
 
@@ -4150,9 +4149,7 @@ where
                     image.display()
                 ))
             })?;
-            if mount.source_device != attachment.volume_device()
-                || !mount.owners_honoured()
-            {
+            if mount.source_device != attachment.volume_device() || !mount.owners_honoured() {
                 return Err(ApfsStorageError::Host(format!(
                     "cannot resume pending clone at {}: mounted source {} does not match {} or canonical flags",
                     mount_point.display(),
@@ -6520,7 +6517,6 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn forming_re_adoption_fences_staging_gc_without_a_prefix_waiver() {
-        use cowshed_apfs::SystemCommandRunner;
         use crate::storage::StorageLayout;
         use crate::storage::apfs::ApfsExecutionHost;
         use crate::storage::host_config::HostConfig;
@@ -6528,6 +6524,7 @@ mod tests {
             LifecycleIntentCompletion, LifecycleIntentJournal, STAGING_NAMESPACE,
             re_adopt_tests::Fixture,
         };
+        use cowshed_apfs::SystemCommandRunner;
 
         let fixture = Fixture::new();
         let repo = RepoId::parse("acme/widget").unwrap();
@@ -6626,11 +6623,11 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn retained_companions_converge_on_replay_and_move_nothing_on_refusal() {
-        use cowshed_apfs::SystemCommandRunner;
         use crate::build_volume::RECORD_SUFFIX;
         use crate::metadata::{GRANTS_SIDECAR_SUFFIX, append_suffix};
         use crate::storage::apfs::COMPANION_SUFFIX;
         use crate::storage::recovery::re_adopt_tests::Fixture;
+        use cowshed_apfs::SystemCommandRunner;
         use std::os::unix::fs::symlink;
 
         #[derive(Clone, Copy)]
@@ -7146,7 +7143,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn session_enumeration_propagates_a_read_dir_entry_error() {
         let directory = Path::new("/sessions");
@@ -7424,7 +7420,10 @@ mod tests {
                 .push(request.clone());
             Ok(cowshed_apfs::CommandOutput::success([]))
         }
-        fn image_lease(&self, _: &Path) -> io::Result<Option<cowshed_os::fork_lock::Fenced<fs::File>>> {
+        fn image_lease(
+            &self,
+            _: &Path,
+        ) -> io::Result<Option<cowshed_os::fork_lock::Fenced<fs::File>>> {
             Ok(None)
         }
         fn pin_raw_device(
