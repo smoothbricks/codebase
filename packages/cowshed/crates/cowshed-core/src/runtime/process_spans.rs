@@ -926,6 +926,7 @@ mod tests {
                 .iter()
                 .map(|argument| CommandArg::from(*argument))
                 .collect(),
+            truncated: false,
             born_at: UtcTimestamp::new("2026-10-12T00:00:00Z").unwrap(),
             usage: None,
             blocked_on: None,
@@ -1498,6 +1499,7 @@ mod tests {
                         ppid: node.ppid,
                         program: node.image.program.clone(),
                         argv: node.image.argv.clone(),
+                        truncated: node.image.truncated,
                         born_at: node.born_at.clone(),
                         usage: None,
                         blocked_on: None,
