@@ -5099,7 +5099,7 @@ fn real_apfs_kernel_mount_flag_truth_table_allows_browse_but_requires_owners() {
         drop(mounted);
     }
 
-    let mounted = shared.mount_at(&mount, "noowners");
+    let _mounted = shared.mount_at(&mount, "noowners");
     let result = host.mounts(&repo());
     assert!(result.is_err(), "noowners: {result:?}");
     assert!(
