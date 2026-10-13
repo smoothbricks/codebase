@@ -5,6 +5,10 @@ tense. The items below list where the code does not do that yet. Items are indep
 depends on the per-op counters item. Work items come first. Items that needed a design choice are under Decisions; each
 ends with the choice made, and a kept spec carries its own Work and Acceptance bullets.
 
+- Context API owner: `packages/lmao/src/lib/opContext/contextTypes.ts:64,90,101` exports `NullKeys`, `ResolvedContext`
+  and `RequiredContextParams` without wiring them into `tracer.ts:153-155` or `opContext/spanContextTypes.ts:523`;
+  either wire the required/resolved contract into the public API with inference proofs or delete the unused exports.
+
 ## Warmed entry writes allocate nothing
 
 - Spec: `specs/lmao/01h_entry_types_and_logging_primitives.md:553`: a warmed entry write allocates nothing while

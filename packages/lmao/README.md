@@ -91,10 +91,20 @@ const { defineOp, defineOps } = opContext;
 
 `defineOp(name, fn)` creates a single op; `defineOps({ ... })` batches ops into a reusable group.
 
-Declare a required trace-time value with its nullable type, not a cast: for example,
-`const ctxDefaults: { env: Env | null } = { env: null }`. Passing that object as `ctx` preserves inference and makes
-`trace('request', { env }, requestOp)` require the real environment. Optional values retain `undefined`; real defaults
-can be overridden. See
+Require runtime dependencies at application setup and pass their real values through the factory:
+
+```ts
+import { defineOpContext, JsBufferStrategy, TestTracer } from '@smoothbricks/lmao';
+import { createTraceRoot } from '@smoothbricks/lmao/node';
+
+function createAppTracer(env: Env) {
+  const opContext = defineOpContext({ logSchema, ctx: { env } });
+  return new TestTracer(opContext, { bufferStrategy: new JsBufferStrategy(), createTraceRoot });
+}
+```
+
+`env` is required by the setup function and remains precisely typed in Ops. Trace overrides are partial replacements of
+real defaults, not a way to declare required fields with null sentinels or casts. See
 [the context contract](../../specs/lmao/01l_op_context_pattern.md#smoo/lmao!n/op-context-ctx-props).
 
 ### `SpanContext` (`ctx`)

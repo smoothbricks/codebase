@@ -3,7 +3,16 @@
 ## Quick Reference
 
 ```typescript
-import { defineOpContext, defineLogSchema, S, defineFeatureFlags } from '@smoothbricks/lmao';
+import {
+  defineOpContext,
+  defineLogSchema,
+  S,
+  defineFeatureFlags,
+  InMemoryFlagEvaluator,
+  JsBufferStrategy,
+  TestTracer,
+} from '@smoothbricks/lmao';
+import { createTraceRoot } from '@smoothbricks/lmao/node';
 
 // 1. Define your schema (columns use snake_case)
 const appSchema = defineLogSchema({
@@ -20,59 +29,40 @@ const flags = defineFeatureFlags({
   experimentGroup: S.category().default('control').sync(),
 });
 
-// 3. Create op context
-const ctxDefaults: {
-  env: Env | null;
-  requestId: string | null;
-  userId: string | undefined;
-  config: { retryCount: number };
-} = { env: null, requestId: null, userId: undefined, config: { retryCount: 3 } };
+// 3. Require real context when wiring the application.
+// Env is the application's own public environment type.
+export function createUserService(env: Env) {
+  const opContext = defineOpContext({
+    logSchema: appSchema,
+    deps: {
+      http: httpOps.prefix('http'),
+      db: dbOps.mapColumns({ query: 'query', rows: 'db_rows' }),
+    },
+    flags,
+    ctx: { env, config: { retryCount: 3 } },
+  });
+  const { defineOp, defineOps } = opContext;
 
-const opContext = defineOpContext({
-  logSchema: appSchema,
-  deps: {
-    http: httpOps.prefix('http'),
-    db: dbOps.mapColumns({ query: 'query', rows: 'db_rows' }),
-  },
-  flags,
-  ctx: ctxDefaults,
-});
+  // 4. Ops inherit the concrete context type without casts.
+  const fetchUser = defineOp('fetchUser', async (ctx, id: string) => {
+    ctx.tag.user_id(id).operation('read');
+    const user = await ctx.span('db-query', ctx.deps.db.query, `SELECT * FROM users WHERE id = ?`, [id]);
+    return user.isOk() ? ctx.ok(user.value) : ctx.err(user.error);
+  });
 
-const { defineOp, defineOps } = opContext;
+  // 5. Keep the full factory when creating a tracer.
+  const userOps = defineOps({ fetchUser });
+  const { trace } = new TestTracer(opContext, {
+    bufferStrategy: new JsBufferStrategy(),
+    createTraceRoot,
+    flagEvaluator: new InMemoryFlagEvaluator(flags.schema, { newCheckoutFlow: true }),
+  });
+  return { userOps, trace };
+}
 
-// 4. Define ops
-const fetchUser = defineOp('fetchUser', async (ctx, id: string) => {
-  ctx.tag.user_id(id).operation('read');
-  const user = await ctx.span('db-query', ctx.deps.db.query, `SELECT * FROM users WHERE id = ?`, [id]);
-  return user.isOk() ? ctx.ok(user.value) : ctx.err(user.error); // Rebuild the child's outcome on this context
-});
-
-// 5. Export as group (for other packages to use)
-export const userOps = defineOps({ fetchUser, updateUser, deleteUser });
-
-// 6. Create tracer and trace at request boundary; the flag evaluator is a TracerOptions value
-import { InMemoryFlagEvaluator, TestTracer } from '@smoothbricks/lmao';
-
-const { trace } = new TestTracer(opContext, {
-  flagEvaluator: new InMemoryFlagEvaluator(flags.schema, { newCheckoutFlow: true }),
-});
-
-export default {
-  async fetch(req: Request, env: Env) {
-    const user = await trace(
-      'request',
-      {
-        env, // required
-        requestId: crypto.randomUUID(), // required
-        userId: req.headers.get('x-user-id') ?? undefined, // optional
-        // config not provided - uses default { retryCount: 3 }
-      },
-      fetchUser,
-      req.params.id
-    );
-    return user.isOk() ? Response.json(user.value) : new Response('Not found', { status: 404 });
-  },
-};
+// 6. At application setup, supply its real environment once.
+const { userOps, trace } = createUserService(env);
+const user = await trace('request', userOps.fetchUser, userId);
 ```
 
 ## Core Concepts
@@ -85,7 +75,7 @@ export default {
 interface OpContextBinding<T, FF, Deps, UserCtx> {
   readonly [opContextType]: OpContext<T, FF, Deps, UserCtx>; // Phantom type for inference
   readonly logBinding: LogBinding<T>; // Schema + optional remap descriptor
-  readonly ctxDefaults: UserCtx; // User context defaults (with null sentinels)
+  readonly ctxDefaults: UserCtx; // Real user context defaults
   readonly deps: Deps; // Wired dependencies
 }
 
@@ -100,62 +90,41 @@ interface OpContextFactory<T, FF, Deps, UserCtx> extends OpContextBinding<T, FF,
 **Usage:**
 
 ```typescript
-// Store the full factory
-const ctxDefaults: { env: Env | null } = { env: null };
-const opContext = defineOpContext({
-  logSchema: mySchema,
-  ctx: ctxDefaults,
-});
-
-// Destructure what you need
-const { defineOp, defineOps, logSchema } = opContext;
-
-// Pass to Tracer (accepts OpContextBinding)
-const { trace } = new TestTracer(opContext);
+function createTracer(env: Env) {
+  const opContext = defineOpContext({
+    logSchema: mySchema,
+    ctx: { env },
+  });
+  return new TestTracer(opContext, { bufferStrategy: new JsBufferStrategy(), createTraceRoot });
+}
+const { trace } = createTracer(env);
 ```
 
 The phantom type `[opContextType]` enables TypeScript to infer the full context type from the factory, so
-`new TestTracer(opContext)` has fully typed `trace()` methods.
+`new TestTracer(opContext, options)` has fully typed `trace()` methods.
 
 ### Context Properties (`ctx`) - Runtime Context <a id="smoo/lmao!n/op-context-ctx-props"></a>
 
 **IMPORTANT**: `ctx` properties are **runtime context** (environment, config, services). They are NOT stored in Arrow
 columns. For column data, use `setScope()` or `tag`.
 
-Declare all properties upfront for stable hidden classes. Give the defaults object its authoritative context type,
-including the sentinel union, and let `defineOpContext` infer that type. A cast such as `null as Env` hides the null
-from the required-key calculation; it does not declare a required context property.
+Require non-optional runtime dependencies as typed arguments to the application's setup function, then pass their real
+values into `defineOpContext`. Declare every context key upfront for stable hidden classes. Optional values keep their
+union type; ordinary defaults remain available without trace-time overrides.
 
 ```typescript
-const ctxDefaults: {
-  env: Env | null;
-  requestId: string | null;
-  userId: string | undefined;
-  sessionId: string | undefined;
-  config: { retryCount: number; timeout: number };
-  debug: boolean;
-} = {
-  env: null, // required at trace(); resolved to Env inside the span
-  requestId: null, // required at trace(); resolved to string inside the span
-  userId: undefined, // optional; remains string | undefined inside the span
-  sessionId: undefined,
-  config: { retryCount: 3, timeout: 30000 },
-  debug: false,
-};
-const opContext = defineOpContext({ logSchema, ctx: ctxDefaults });
+function createAppContext(env: Env, userId?: string) {
+  return defineOpContext({
+    logSchema,
+    ctx: { env, userId, config: { retryCount: 3 }, debug: false },
+  });
+}
 ```
 
-| Pattern  | Declared property type and initial value | At trace()   | In SpanContext   |
-| -------- | ---------------------------------------- | ------------ | ---------------- |
-| Required | `T \| null`, initially `null`            | Must provide | `T`              |
-| Optional | `T \| undefined`, initially `undefined`  | Can omit     | `T \| undefined` |
-| Default  | `T`, initially a real `T` value          | Can override | `T`              |
-
-**Why all three?**
-
-- **Required**: Environment, request-scoped IDs that MUST exist
-- **Optional**: User ID after auth (may not be known yet), optional features
-- **Default**: Configuration with sensible defaults
+`env` is required by `createAppContext` and remains `Env` in Ops; `userId` remains `string | undefined`. Let that
+inference flow through the factory and tracer. `TraceOverrides` permits partial replacements of these real defaults; it
+does not make a missing constructor dependency safe. Neither a null sentinel nor a cast declares a required trace-time
+field.
 
 ### Scope vs Context Properties <a id="smoo/lmao!n/op-context-scope-vs-ctx"></a>
 
@@ -167,12 +136,8 @@ const opContext = defineOpContext({ logSchema, ctx: ctxDefaults });
 | `setScope({ col: v })` | Column values for ALL rows    | Arrow columns | `ctx.setScope({ request_id: 'abc' })` |
 
 ```typescript
-// Runtime context carries objects; it does not write columns.
-const ctxDefaults: { env: Env | null; config: { retries: number } } = {
-  env: null,
-  config: { retries: 3 },
-};
-const opContext = defineOpContext({ logSchema, ctx: ctxDefaults });
+// Runtime context carries real objects supplied by application setup.
+const opContext = createAppContext(env);
 
 // setScope - sets COLUMN values for ALL rows in this span
 // The column must exist in your logSchema!
@@ -596,37 +561,31 @@ trace<R>(line: number, name: string, overrides: TraceOverrides<UserCtx>, fn: (ct
 
 **TraceOverrides:**
 
-Allows providing required context and optional distributed trace ID:
-
-```typescript
-type TraceOverrides<UserCtx> = Partial<UserCtx> & { trace_id?: TraceId };
-```
-
-- All `ctx` properties with `null` sentinel must be provided
-- Optional properties (`undefined` sentinel) can be omitted
-- Default properties can be overridden
-- `trace_id` is optional (auto-generated if not provided)
+Overrides partially replace the factory's context defaults and may supply a distributed trace identity or remote parent.
+Import `TraceOverrides` from the public API instead of maintaining a second copy of its conditional type. The overload
+without overrides is valid, so required dependencies belong in the setup function's typed arguments. An omitted
+`trace_id` is generated by the tracer.
 
 ### Usage Examples
 
 **Basic usage with TestTracer:**
 
 ```typescript
-import { defineOpContext, defineLogSchema, S, TestTracer } from '@smoothbricks/lmao';
+import { defineOpContext, defineLogSchema, S, JsBufferStrategy, TestTracer } from '@smoothbricks/lmao';
+import { createTraceRoot } from '@smoothbricks/lmao/node';
 
-const ctxDefaults: { env: Env | null } = { env: null };
 const opContext = defineOpContext({
   logSchema: defineLogSchema({
     user_id: S.category(),
     operation: S.enum(['create', 'read', 'update', 'delete']),
   }),
-  ctx: ctxDefaults, // Env is required at trace time
+  ctx: { env }, // Real environment supplied by application setup
 });
 
-const tracer = new TestTracer(opContext);
+const tracer = new TestTracer(opContext, { bufferStrategy: new JsBufferStrategy(), createTraceRoot });
 const { trace } = tracer;
 
-await trace('fetch-user', { env }, fetchUserOp, userId);
+await trace('fetch-user', fetchUserOp, userId);
 
 // Inspect results
 const table = convertSpanTreeToArrowTable(tracer.rootBuffers[0]);
@@ -635,8 +594,8 @@ const table = convertSpanTreeToArrowTable(tracer.rootBuffers[0]);
 **With context overrides:**
 
 ```typescript
-// Required ctx properties must be provided in overrides
-await trace('handle-request', { env: myEnv, requestId: 'req-123' }, handleRequestOp);
+// Override already-defined context values for this trace.
+await trace('handle-request', { env: myEnv }, handleRequestOp);
 
 // With distributed tracing
 await trace('downstream', { env: myEnv, trace_id: incomingTraceId }, processOp);
@@ -748,7 +707,7 @@ const { defineOp } = defineOpContext({
     http: httpOps.prefix('http'),
     db: dbOps.mapColumns({ query: 'query', rows: 'db_rows' }),
   },
-  ctx: { env: null as Env },
+  ctx: { env }, // Real environment supplied by application setup
 });
 ```
 
@@ -801,11 +760,8 @@ All `ctx` properties must be declared upfront because:
 2. **Enumerable Keys**: `defineOpContext` reads all keys via `Object.keys()` to generate optimized classes
 3. **No Dynamic Properties**: Adding properties after creation de-optimizes the object
 
-The `null as T` / `undefined as T | undefined` patterns ensure:
-
-- All keys exist in the config object (enumerable)
-- TypeScript correctly infers required vs optional at `trace()`
-- Generated SpanContext class has stable hidden class
+Pass real defaults and explicitly present optional properties. This keeps keys enumerable and lets the factory infer
+their actual types without sentinel casts. The generated SpanContext class then has a stable hidden class.
 
 ## Metadata Injection (Transformer) <a id="smoo/lmao!n/metadata-injection"></a>
 
