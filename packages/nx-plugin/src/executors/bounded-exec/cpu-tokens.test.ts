@@ -58,6 +58,22 @@ describe('cowshed CPU budget client', () => {
     });
     expect(runnerDemand('cargo --frozen test --workspace', undefined, 18)).toEqual({ kind: 'cargo', want: 18 });
     expect(runnerDemand('napi build --platform --release', undefined, 8)).toEqual({ kind: 'cargo', want: 8 });
+    expect(
+      runnerDemand('sh ../../tooling/napi-build.sh x86_64-unknown-linux-gnu napi --bin cowshed', undefined, 18),
+    ).toEqual({
+      kind: 'cargo',
+      want: 18,
+    });
+    expect(
+      runnerDemand(
+        'sh tooling/napi-build.sh aarch64-apple-darwin packages/cowshed/node_modules/.bin/napi',
+        undefined,
+        8,
+      ),
+    ).toEqual({
+      kind: 'cargo',
+      want: 8,
+    });
     expect(runnerDemand('bun scripts/test-shard.ts 3', undefined, 18)).toEqual({ kind: 'process', want: 1 });
     // A declared parallelism outranks what the command names.
     expect(runnerDemand('bun scripts/test-shard.ts 3', 2, 18)).toEqual({ kind: 'process', want: 2 });

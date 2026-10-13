@@ -70,6 +70,7 @@ in {
       # `NX_USE_LOCAL=false nx migrate` restores that for the one command.
       NX_USE_LOCAL = "true";
       TTSC_TYPESCRIPT_GO_DIR = "${typescriptGo}";
+      SMOO_NAPI_TOOLCHAIN_MODE = "native";
     }
     # Playwright's downloaded Ubuntu browser has no runtime closure on NixOS
     # (CI reached the executable, then failed loading libglib-2.0.so.0). Use
@@ -145,15 +146,13 @@ in {
     ];
   };
 
-  # Opt-in Linux cross toolchain, activated by `devenv -P linux-cross` and driven
-  # by the root `check:linux` script. devenv 2.2.3 has first-class profiles, so
-  # this is one gated module in the shared file rather than a second config
-  # directory that would have to re-import and re-pin everything here.
+  # Opt-in Linux cross toolchains, shared by check:linux and foreign NAPI/CLI
+  # builds. The managed napi-build.sh entry enters this profile only when the
+  # requested Linux triple differs from the host. Native builds keep the normal
+  # shell's compiler; no build bootstraps a sysroot from the registry.
   #
-  # It is a profile and NOT a default package because pkgsCross.gnu64's cc
-  # closure is 0.4 GiB against a default shell closure of ~5.4 GiB — a 7% tax on
-  # every shell entry and every CI cache restore, to serve one command that a
-  # macOS laptop runs deliberately. Nothing on Darwin links a Linux object.
+  # Keep these compiler closures out of the default shell. Their packages and
+  # Rust standard libraries come from the same locked inputs as the native tools.
   #
   # Why a C compiler is needed at all, when rust-std above is already installed:
   # ring, openssl-sys, libgit2-sys and libz-sys compile C for the target from
@@ -162,9 +161,8 @@ in {
   # "x86_64-linux-gnu-gcc"`. The `cc` crate probes triple-prefixed tool names,
   # which is precisely what this wrapper's bin/ exports.
   #
-  # Each tool path is derived from the wrapper's own `targetPrefix` instead of
-  # being written out, so a nixpkgs bump that renames the prefix carries these
-  # with it rather than leaving four stale strings that fail at build-script time.
+  # Derive tool names from each wrapper's targetPrefix so a nixpkgs prefix change
+  # moves compiler, archiver and linker together.
   #
   # This profile supplies the toolchain and nothing else. CARGO_BUILD_TARGET is
   # deliberately NOT set: the triple belongs to the Nx target that asks for it
@@ -175,19 +173,58 @@ in {
   # With the flag on the target instead, running it outside this profile fails
   # loudly at `ToolNotFound` and a host lint can never be mistaken for a cross one.
   profiles.linux-cross.module = let
-    crossCC = pkgs.pkgsCross.gnu64.stdenv.cc;
-    crossLibc = lib.getDev crossCC.libc;
-    tool = name: "${crossCC}/bin/${crossCC.targetPrefix}${name}";
+    crossTargets = [
+      {
+        triple = "x86_64-unknown-linux-gnu";
+        compiler = pkgs.pkgsCross.gnu64.stdenv.cc;
+        headers = pkgs.pkgsCross.gnu64.linuxHeaders;
+      }
+      {
+        triple = "aarch64-unknown-linux-gnu";
+        compiler = pkgs.pkgsCross.aarch64-multiplatform.stdenv.cc;
+        headers = pkgs.pkgsCross.aarch64-multiplatform.linuxHeaders;
+      }
+    ];
+    targetEnv = target: let
+      suffix = builtins.replaceStrings ["-"] ["_"] target.triple;
+      upper = lib.toUpper suffix;
+      tool = name: "${target.compiler}/bin/${target.compiler.targetPrefix}${name}";
+      libc = lib.getDev target.compiler.libc;
+    in [
+      {
+        name = "CC_${suffix}";
+        value = lib.mkForce (tool "cc");
+      }
+      {
+        name = "CXX_${suffix}";
+        value = lib.mkForce (tool "c++");
+      }
+      {
+        name = "AR_${suffix}";
+        value = lib.mkForce (tool "ar");
+      }
+      {
+        name = "RANLIB_${suffix}";
+        value = lib.mkForce (tool "ranlib");
+      }
+      {
+        name = "CARGO_TARGET_${upper}_LINKER";
+        value = lib.mkForce (tool "cc");
+      }
+      # bindgen runs host libclang; give it the target's declared libc headers.
+      {
+        name = "BINDGEN_EXTRA_CLANG_ARGS_${suffix}";
+        value = "--target=${target.triple} -isystem ${libc}/include -isystem ${target.headers}/include";
+      }
+    ];
   in {
-    packages = [crossCC];
-    env = {
-      CC_x86_64_unknown_linux_gnu = tool "cc";
-      CXX_x86_64_unknown_linux_gnu = tool "c++";
-      AR_x86_64_unknown_linux_gnu = tool "ar";
-      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER = tool "cc";
-      # bindgen runs host libclang, which cannot infer the cross compiler's headers.
-      BINDGEN_EXTRA_CLANG_ARGS_x86_64_unknown_linux_gnu = "--target=x86_64-unknown-linux-gnu -isystem ${crossLibc}/include -isystem ${pkgs.pkgsCross.gnu64.linuxHeaders}/include";
-    };
+    packages = map (target: target.compiler) crossTargets;
+    languages.rust.targets = ["aarch64-unknown-linux-gnu"];
+    env =
+      (builtins.listToAttrs (lib.concatMap targetEnv crossTargets))
+      // {
+        SMOO_NAPI_TOOLCHAIN_MODE = lib.mkForce "linux-cross";
+      };
   };
 
   # linux-cross is the only profile here, and the shape of the publish job is

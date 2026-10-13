@@ -1,0 +1,49 @@
+#!/bin/sh
+# Managed by smoo. Native builds use the entered shell's compiler; foreign
+# Linux builds enter its locked linux-cross profile. No registry bootstrap.
+set -eu
+
+if [ "$#" -lt 2 ]; then
+  echo 'usage: napi-build.sh <target-triple|host> <napi-executable|--identity> [build-options...]' >&2
+  exit 2
+fi
+target="$1"
+action="$2"
+shift 2
+if [ "$target" = host ] && [ -n "${CARGO_BUILD_TARGET:-}" ]; then
+  echo "host NAPI build refuses CARGO_BUILD_TARGET=$CARGO_BUILD_TARGET; unset it or request an explicit platform target" >&2
+  exit 2
+fi
+
+host="$(uname -s):$(uname -m)"
+mode="${SMOO_NAPI_TOOLCHAIN_MODE:-unmanaged}"
+
+case "$target:$host" in
+  x86_64-unknown-linux-gnu:Linux:x86_64|aarch64-unknown-linux-gnu:Linux:aarch64|aarch64-unknown-linux-gnu:Linux:arm64)
+    ;;
+  *-unknown-linux-gnu:*)
+    mode=linux-cross
+    ;;
+esac
+
+if [ "$action" = --identity ]; then
+  printf '%s:%s\n' "$mode" "$host"
+  exit 0
+fi
+
+if [ "$mode" = unmanaged ]; then
+  echo 'native NAPI build needs the managed shell; run under direnv exec <checkout>' >&2
+  exit 2
+fi
+
+napi="$(realpath "$(command -v "$action")")"
+if [ "$mode" = linux-cross ] && [ "${SMOO_NAPI_TOOLCHAIN_MODE:-unmanaged}" != linux-cross ]; then
+  tooling_dir="$(CDPATH= cd "$(dirname "$0")" && pwd)"
+  exec "$tooling_dir/devenv" -P linux-cross shell -- "$napi" build --target "$target" "$@"
+fi
+
+if [ "$target" = host ]; then
+  exec "$napi" build "$@"
+fi
+
+exec "$napi" build --target "$target" "$@"

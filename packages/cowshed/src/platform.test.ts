@@ -43,7 +43,7 @@ describe('platform target table', () => {
       if (command === undefined || !command.includes('--bin cowshed')) {
         continue;
       }
-      const triple = /--target (\S+)/.exec(command)?.[1];
+      const triple = /^sh \.\.\/\.\.\/tooling\/napi-build\.sh (\S+) napi(?: |$)/.exec(command)?.[1];
       const outputDirectory = /--output-dir dist\/bin\/(\S+)/.exec(command)?.[1];
       if (triple === undefined || outputDirectory === undefined) {
         throw new Error(`a CLI build command names no target or no output directory: ${command}`);

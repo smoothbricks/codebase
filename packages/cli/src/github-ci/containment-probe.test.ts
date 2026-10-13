@@ -21,11 +21,7 @@ function cowshedShapedProject(): ProjectTargets {
       'napi-x64-linux',
       'napi-arm64-macos',
     ],
-    targetDependencies: new Map([
-      ['build', ['tsc-js', 'cli-arm64-macos', 'napi-arm64-macos']],
-      ['cli-x64-linux', ['napi-toolchain-x64-linux']],
-      ['napi-x64-linux', ['napi-toolchain-x64-linux']],
-    ]),
+    targetDependencies: new Map([['build', ['tsc-js', 'cli-arm64-macos', 'napi-arm64-macos']]]),
     targetOutputs: new Map([
       ['tsc-js', ['{projectRoot}/dist/ts']],
       ['cli-x64-linux', ['{projectRoot}/dist/bin/linux-x64-gnu']],

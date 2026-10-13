@@ -93,6 +93,12 @@ const managedFiles: ManagedFileDescriptor[] = [
   },
   {
     kind: 'raw',
+    source: 'tooling/napi-build.sh',
+    target: 'tooling/napi-build.sh',
+    executable: true,
+  },
+  {
+    kind: 'raw',
     source: 'tooling/direnv/repo-path',
     target: 'tooling/direnv/repo-path',
     executable: true,

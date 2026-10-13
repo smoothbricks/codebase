@@ -1,0 +1,1 @@
+../packages/nx-plugin/managed/raw/tooling/napi-build.sh

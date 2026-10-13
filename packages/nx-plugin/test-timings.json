@@ -9,7 +9,6 @@
     "src/typecheck-test-policy.test.ts": 7183,
     "src/executors/bounded-exec/executor.test.ts": 5980,
     "src/nextest-partitions.test.ts": 3481,
-    "src/executors/napi-cross-toolchain/executor.test.ts": 3336,
     "src/executors/typescript-emit/executor.test.ts": 2499,
     "src/cross-check-policy.test.ts": 2424,
     "src/nextest-extraction.test.ts": 1206,
