@@ -16,7 +16,7 @@ use sha2::{Digest, Sha256};
 
 use super::{
     DirectoryExecutionHost, MountPointState, allocated_tree_bytes, host_error, mount_point_state,
-    read_metadata,
+    observed_mount, read_metadata,
 };
 use cowshed_apfs::image::{IMAGE_EXTENSION, is_image_path};
 use cowshed_apfs::store_lock::{ImageLockGuard, LockMode, acquire_image_locks};
@@ -148,7 +148,13 @@ fn gc_candidate(
             let target = fs::read_link(item)
                 .map_err(|error| io_error("read GC candidate link", item, error))?;
             hasher.update(target.as_os_str().as_encoded_bytes());
-            metadata.blocks().saturating_mul(512)
+            // A mount record at an image path stands for the payload it names.
+            if is_image_path(item) {
+                allocated_tree_bytes(item)
+                    .map_err(|error| io_error("measure GC candidate", item, error))?
+            } else {
+                metadata.blocks().saturating_mul(512)
+            }
         } else if metadata.is_file() {
             hasher.update(b"file");
             hasher.update(metadata.len().to_le_bytes());
@@ -573,6 +579,15 @@ impl DirectoryExecutionHost {
                 return Ok(());
             }
         }
+        // Recovery renames and exchanges these payloads, and a rename moves a mount record, not
+        // the payload it names: every one present comes home first, as the executor unmounts
+        // before its own exchanges. The published canonical is left mounted; nothing below moves
+        // it.
+        for payload in [staged, undo] {
+            if path_exists(payload)? {
+                super::release_mount(payload, cowshed_apfs::DetachIntent::Release)?;
+            }
+        }
         let canonical_companion =
             self.recovery_companion(canonical, "restore recovery canonical payload")?;
         let undo_companion = self.recovery_companion(undo, "restore recovery undo metadata")?;
@@ -632,6 +647,7 @@ impl DirectoryExecutionHost {
                 staged.display()
             ));
         }
+        super::release_mount(canonical, cowshed_apfs::DetachIntent::Release)?;
         let incarnation = Self::payload_incarnation(canonical)?;
         let canonical_is_replacement = if incarnation == replacement_incarnation {
             true
@@ -959,8 +975,8 @@ impl DirectoryExecutionHost {
         Ok((images, expected.into_iter().collect()))
     }
 
-    /// The mountpoint a retirement may remove: an empty directory, or a binding of a payload
-    /// that no longer exists. Anything a late writer left there is named, never deleted.
+    /// The mountpoint a retirement may remove: an empty directory. Anything a late writer left
+    /// there is named, never deleted.
     fn retired_mount_point(&self, retired: &RetiredRef) -> Result<Option<PathBuf>, ApfsStorageError> {
         let mount_point = layout(&self.config, retired.workspace().repo())?
             .project()
@@ -969,11 +985,9 @@ impl DirectoryExecutionHost {
         match mount_point_state(&mount_point)? {
             MountPointState::Absent => Ok(None),
             MountPointState::Vacant => Ok(Some(mount_point)),
-            MountPointState::Bound(target) if !path_exists(&target)? => Ok(Some(mount_point)),
-            MountPointState::Bound(target) => Err(ApfsStorageError::Host(format!(
-                "retired mountpoint {} still binds {}",
-                mount_point.display(),
-                target.display()
+            MountPointState::Link => Err(ApfsStorageError::Host(format!(
+                "retired mountpoint {} is a symbolic link cowshed did not make",
+                mount_point.display()
             ))),
             MountPointState::Occupied => Err(ApfsStorageError::Host(format!(
                 "retired mountpoint {} holds files written after its workspace was retired; move or delete them",
@@ -1096,9 +1110,6 @@ impl DirectoryExecutionHost {
         if let Some(mount_point) = cleanup.mount_point {
             let removed = match mount_point_state(&mount_point)? {
                 MountPointState::Vacant => fs::remove_dir(&mount_point),
-                MountPointState::Bound(target) if !path_exists(&target)? => {
-                    fs::remove_file(&mount_point)
-                }
                 MountPointState::Absent => Ok(()),
                 other => {
                     return Err(ApfsStorageError::Host(format!(
@@ -1198,7 +1209,8 @@ impl DirectoryExecutionHost {
         }
 
         // Session payloads with no grants sidecar: never published, nothing names them.
-        for discovered in crate::storage::discover_session_images(directory_children(&sessions)?) {
+        let session_entries = super::read_dir_paths(&sessions, "enumerate session payloads")?;
+        for discovered in crate::storage::discover_session_images(session_entries) {
             if !grants_sidecar_missing(discovered.path())? {
                 continue;
             }
@@ -1207,16 +1219,13 @@ impl DirectoryExecutionHost {
                 checked_increment(&mut retained.active)?;
                 continue;
             }
-            let mount_point = crate::storage::apfs::main_aware_mount_point(
-                &self.config,
-                repo,
-                discovered.workspace(),
-            )?;
-            if matches!(mount_point_state(&mount_point)?, MountPointState::Bound(target) if target == discovered.path())
-            {
+            if let Some(mount_point) = observed_mount(discovered.path())? {
                 warn_session_image_issue(
                     discovered.path(),
-                    "payload without a grants sidecar is still bound; it is left in place",
+                    format!(
+                        "payload without a grants sidecar is still mounted at {}; it is left in place",
+                        mount_point.display()
+                    ),
                 );
                 continue;
             }
@@ -1234,9 +1243,8 @@ impl DirectoryExecutionHost {
         let storage = layout(&self.config, repo)?;
         let staging = project.join(STAGING_NAMESPACE);
         let recoverable = Self::recoverable_staged_stems(project)?;
-        let staged_entries = directory_children(&staging)?
-            .into_iter()
-            .chain(regular_file_children(&staging)?);
+        // A staged payload may be mounted, its image path a mount record: entries of every kind.
+        let staged_entries = read_entries(&staging)?;
         for path in staged_entries {
             let (image, reason) = if is_grants_sidecar(&path) {
                 let image = image_from_sidecar(&path)?;
@@ -1282,7 +1290,9 @@ impl DirectoryExecutionHost {
             candidates.push(gc_candidate(reason, &path, &associated, &[])?);
         }
 
-        // Staging mountpoints whose payload is gone: vacant directories and dangling bindings.
+        // Staging mountpoints nothing is mounted at: vacant directories. An empty payload
+        // mounted there looks the same, so a mountpoint a staged or canonical payload's mount
+        // record names is not an orphan.
         let staging_mounts = storage.project().mount_root.join(STAGING_NAMESPACE);
         for mount_point in read_entries(&staging_mounts)? {
             let Some(stem) = mount_point.file_name().and_then(|name| name.to_str()) else {
@@ -1291,10 +1301,13 @@ impl DirectoryExecutionHost {
             let Some(workspace) = staged_stem_workspace(stem) else {
                 continue;
             };
-            match mount_point_state(&mount_point)? {
-                MountPointState::Vacant => {}
-                MountPointState::Bound(target) if !path_exists(&target)? => {}
-                _ => continue,
+            if mount_point_state(&mount_point)? != MountPointState::Vacant {
+                continue;
+            }
+            let staged_image = staging.join(format!("{stem}.{IMAGE_EXTENSION}"));
+            let canonical = storage.canonical_image(&workspace)?.image().to_owned();
+            if names_mount(&staged_image, &mount_point)? || names_mount(&canonical, &mount_point)? {
+                continue;
             }
             let lock = workspace_lock_path(&self.config, repo, &workspace)?;
             if !self.lock_is_free(&lock, held_locks)? {
@@ -1435,11 +1448,10 @@ impl DirectoryExecutionHost {
                 StorageGcReason::OrphanStagingMount => {
                     let removed = match mount_point_state(path)? {
                         MountPointState::Vacant => fs::remove_dir(path),
-                        MountPointState::Bound(_) => fs::remove_file(path),
                         MountPointState::Absent => Ok(()),
-                        MountPointState::Occupied => Err(io::Error::other(
-                            "staging mountpoint is no longer vacant",
-                        )),
+                        MountPointState::Link | MountPointState::Occupied => Err(
+                            io::Error::other("staging mountpoint is no longer vacant"),
+                        ),
                     };
                     removed
                         .map_err(|error| io_error("remove orphan staging mount", path, error))
@@ -1495,5 +1507,17 @@ fn read_entries(directory: &Path) -> Result<Vec<PathBuf>, ApfsStorageError> {
             .collect(),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
         Err(error) => Err(io_error("enumerate directory", directory, error)),
+    }
+}
+
+/// Whether `image` is a mount record naming `mount_point`, read without following anything.
+fn names_mount(image: &Path, mount_point: &Path) -> Result<bool, ApfsStorageError> {
+    match fs::symlink_metadata(image) {
+        Ok(metadata) if metadata.file_type().is_symlink() => fs::read_link(image)
+            .map(|target| target == mount_point)
+            .map_err(|error| io_error("read mount record", image, error)),
+        Ok(_) => Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(io_error("inspect payload", image, error)),
     }
 }

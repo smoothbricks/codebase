@@ -12,8 +12,8 @@ use std::time::{Duration, SystemTime};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    DirectoryExecutionHost, MountPointState, bind, host_error, mount_point_state,
-    remove_payload_tree, unbind, unsupported,
+    DirectoryExecutionHost, MountPointState, bind, host_error, mount_point_state, observed_mount,
+    observed_payload_root, remove_payload_tree, unbind, unsupported,
 };
 use cowshed_os::process::Holder;
 use crate::build_volume::{
@@ -52,19 +52,23 @@ fn change_time(metadata: &fs::Metadata) -> SystemTime {
     SystemTime::UNIX_EPOCH + Duration::new(seconds, nanos)
 }
 
-/// The last change anywhere in the tree at `root`: the newest inode change time of every
-/// entry, the root included. A change time cannot be set back, so a write that preserves
-/// modification times (`cp -p`, an unpacked archive) still moves it, and so does a removal,
-/// through the directory that held the removed name.
+/// The last change anywhere in the tree at `root`: the newest inode change time of every entry
+/// below the root, and the root's own modification time. A change time cannot be set back, so a
+/// write that preserves modification times (`cp -p`, an unpacked archive) still moves it, and so
+/// does a removal, through the directory that held the removed name. The root's change time is
+/// left out because mounting and unmounting rename the root itself, which is no write to what
+/// the volume holds; an entry added to or removed from the root still moves its modification
+/// time.
 fn tree_change_clock(root: &Path) -> io::Result<SystemTime> {
-    let mut newest = SystemTime::UNIX_EPOCH;
+    let mut newest = fs::symlink_metadata(root)?.modified()?;
     let mut pending = vec![root.to_owned()];
     while let Some(path) = pending.pop() {
-        let metadata = fs::symlink_metadata(&path)?;
-        newest = newest.max(change_time(&metadata));
-        if metadata.is_dir() {
-            for entry in fs::read_dir(&path)? {
-                pending.push(entry?.path());
+        for entry in fs::read_dir(&path)? {
+            let child = entry?.path();
+            let metadata = fs::symlink_metadata(&child)?;
+            newest = newest.max(change_time(&metadata));
+            if metadata.is_dir() {
+                pending.push(child);
             }
         }
     }
@@ -105,28 +109,26 @@ fn journal_release(layout: &BuildVolumeLayout, image: &Path, recorded: Option<&B
 }
 
 impl DirectoryExecutionHost {
-    /// Whether build volume `id`'s payload is bound at its mountpoint. A binding of anything
-    /// else there refuses: the mountpoint is the volume's alone.
+    /// Whether build volume `id` is mounted at its mountpoint. Mounted anywhere else refuses:
+    /// the mountpoint is the volume's alone, and the volume mounts nowhere else.
     fn build_volume_bound(
         layout: &BuildVolumeLayout,
         id: &BuildVolumeId,
     ) -> Result<bool, ApfsStorageError> {
         let image = layout.image(id);
         let mount = layout.mount(id);
-        match mount_point_state(&mount)? {
-            MountPointState::Bound(target) if target == image => Ok(true),
-            MountPointState::Bound(target) => Err(ApfsStorageError::Host(format!(
-                "build volume {id}'s mountpoint {} binds {}",
-                mount.display(),
-                target.display()
+        match observed_mount(&image)? {
+            None => Ok(false),
+            Some(current) if current == mount => Ok(true),
+            Some(current) => Err(ApfsStorageError::Host(format!(
+                "build volume {id} is mounted at {}, not at {}",
+                current.display(),
+                mount.display()
             ))),
-            MountPointState::Absent | MountPointState::Vacant | MountPointState::Occupied => {
-                Ok(false)
-            }
         }
     }
 
-    /// Mint the empty build volume `id` and bind it, without a record. A directory has no
+    /// Mint the empty build volume `id` and mount it, without a record. A directory has no
     /// capacity; `capacity` bounds nothing here, the store's filesystem does.
     pub fn create_build_volume(
         &self,
@@ -149,7 +151,7 @@ impl DirectoryExecutionHost {
         let mount = layout.mount(id);
         if let Err(primary) = bind(&image, &mount) {
             return crate::storage::apfs::combine_cleanup(
-                "bind build volume",
+                "mount build volume",
                 primary,
                 remove_payload_tree(&image),
             );
@@ -232,8 +234,9 @@ impl DirectoryExecutionHost {
     ) -> Result<SystemTime, ApfsStorageError> {
         let image = layout.image(id);
         self.require_store_image(&image)?;
-        let clock = tree_change_clock(&image)
-            .map_err(|error| io_error("read a build volume's last change", &image, error))?;
+        let root = observed_payload_root(&image)?;
+        let clock = tree_change_clock(&root)
+            .map_err(|error| io_error("read a build volume's last change", &root, error))?;
         let mark = written_mark_path(&image);
         let mark_metadata = match fs::symlink_metadata(&mark) {
             Ok(metadata) => metadata,
@@ -381,7 +384,8 @@ impl DirectoryExecutionHost {
                 });
             }
         }
-        unbind(&image, &mount)?;
+        // Nothing holds the tree (just checked), so an unforced unmount is the whole release.
+        unbind(&image, &mount, cowshed_apfs::DetachIntent::Release)?;
         if present {
             remove_payload_tree(&image)?;
             journal_release(layout, &image, recorded.as_ref());
