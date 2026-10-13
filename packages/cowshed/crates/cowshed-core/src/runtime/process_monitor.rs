@@ -622,6 +622,7 @@ mod tests {
                     ppid: if index == 0 { 1 } else { 41 },
                     program: "/bin/cat".to_owned(),
                     argv: vec![CommandArg::from("/bin/cat")],
+                    truncated: index == 1,
                     born_at: UtcTimestamp::new("1970-01-01T00:00:01Z").unwrap(),
                     usage: None,
                     blocked_on: None,
@@ -655,6 +656,11 @@ mod tests {
             projection: ProcessSpanProjection::new("4bf92f3577b34da6a3ce929d0e0e4736", 9),
         };
         trace.replay(&journal);
+        for entry in &journal {
+            if let Ok(JobProcessEvent::Born { index, process }) = &entry.event {
+                assert_eq!(process.truncated, *index == 1);
+            }
+        }
         let health = publisher.health().await.unwrap();
         assert_eq!((health.recorded, health.failed), (2, 0), "{health:?}");
         let mut paths = std::fs::read_dir(root.join("1970-01-01"))
