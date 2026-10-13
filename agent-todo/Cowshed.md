@@ -1,5 +1,10 @@
 # Cowshed
 
+- Post-reboot proof owed for detached disk-image commands (landed): run
+  `real_apfs_a_disk_image_attach_survives_its_callers_kill` (cowshed-core lib) green. It is compile-verified and its
+  unit proofs pass, but new `diskutil image attach` calls hang host-wide until the attach pool recovers, so the
+  real-APFS run could not complete before the reboot.
+
 - Post-reboot proof owed for fixture-attach-pool (landed): run `COWSHED_TIMING=1` nextest `apfs_native` + `clone_intent`
   real-APFS subset and count `apfs-command attach.*start` lines (one shared attach in the flag table). New
   `diskutil image attach` calls hang host-wide until the attach pool recovers, so this proof could not run before the
