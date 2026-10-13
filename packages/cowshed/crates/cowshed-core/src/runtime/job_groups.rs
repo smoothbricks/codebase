@@ -1402,10 +1402,9 @@ mod tests {
             .expect("spawn a job group")
     }
 
-    #[cfg(target_os = "macos")]
+    /// A test's group, killed and its leader reaped however the test ends.
     struct OwnedGroup(std::process::Child);
 
-    #[cfg(target_os = "macos")]
     impl Drop for OwnedGroup {
         fn drop(&mut self) {
             let pgid = i32::try_from(self.0.id()).expect("owned child pid");
@@ -1416,13 +1415,14 @@ mod tests {
     }
 
     /// A group led by `sh` whose child is `script`'s last background job: the leader, held
-    /// unreaped by the test, and the child's pid, which `script` prints.
+    /// unreaped by the test, and the child's pid, which `script` prints. The leader's stdin is a
+    /// pipe the returned leader holds open, for a child that waits on it.
     fn group_with_child(script: &str) -> (std::process::Child, u32) {
         use std::io::BufRead as _;
 
         let mut child = Command::new("/bin/sh")
             .args(["-c", script])
-            .stdin(Stdio::null())
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .process_group(0)
             .spawn_locked()
@@ -1546,10 +1546,18 @@ mod tests {
 
     /// A member's resident memory is read while it runs; once it has exited -- reaped, or
     /// exited and not yet reaped -- it holds nothing, and that is no error.
+    ///
+    /// The child prints its own pid, so it has run before the read: a child forked and not yet
+    /// run, or one in the middle of an exec, truly holds no resident page yet (measured on macOS
+    /// under load: 4 of 300 reads of `sleep 300 &` straight after `echo $!` were 0). It then holds
+    /// in `sh`'s own `read` with no exec after, on the leader's stdin, which `sh` would otherwise
+    /// give a background job as `/dev/null`.
     #[test]
     fn a_member_s_resident_memory_is_read_while_it_runs_and_none_once_it_exited() {
-        let (mut job, sleeper) = group_with_child("sleep 300 & echo $!; wait");
-        let birth = super::Birth::of(job.id());
+        let (job, sleeper) =
+            group_with_child("exec 3<&0\n/bin/sh -c 'echo $$; read line' <&3 &\nwait");
+        let job = OwnedGroup(job);
+        let birth = super::Birth::of(job.0.id());
         let members = super::job_members(&birth).expect("members");
         assert_eq!(members.len(), 2, "the leader and its child");
         for member in &members {
@@ -1567,7 +1575,7 @@ mod tests {
             0
         );
         // The leader reaped its child, then exited; this test holds it unreaped.
-        super::await_exit_unreaped(i32::try_from(job.id()).unwrap()).expect("leader exit");
+        super::await_exit_unreaped(i32::try_from(job.0.id()).unwrap()).expect("leader exit");
         for member in &members {
             assert_eq!(
                 member
@@ -1578,7 +1586,8 @@ mod tests {
                 member.pid()
             );
         }
-        job.wait().expect("reap the leader");
+        // Ending the emptied group reaps its leader.
+        drop(job);
     }
 
     #[test]
