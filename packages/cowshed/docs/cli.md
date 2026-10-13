@@ -1321,9 +1321,10 @@ $ security find-generic-password -a cowshed.store -s cowshed.store -w \
     | cowshed disk-command diskutil -- apfs unlockVolume "$uuid" -nomount -stdinpassphrase
 ```
 
-Stdout and stderr are the tool's own bytes and the exit status is the tool's (128 + n when a signal ended it); nothing
-of cowshed's is mixed in except `cowshed:` warnings on stderr. Standard input is forwarded to the tool. The command runs
-under the host's disk-lifecycle lease, in its own session, from any directory, with no project and no daemon check.
+Stdout and stderr preserve the tool's own bytes and the exit status is the tool's (128 + n when a signal ended it).
+Stderr also carries cowshed's disk-lease progress and warnings; stdout carries no wrapper text. Standard input is
+forwarded to the tool. The command runs under the host's disk-lifecycle lease, in its own session, from any directory,
+with no project and no daemon check.
 
 A command that creates or releases a disk-image device — `diskutil image …`, `diskutil eject` and every `hdiutil` verb —
 is never killed: past 120 s it keeps running with a warning on stderr every 30 s, because one killed mid-operation can
