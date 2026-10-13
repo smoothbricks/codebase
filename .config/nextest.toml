@@ -26,9 +26,9 @@
 # one target. The platform is the one the plugin honours: the groups apply on macOS hosts,
 # where the host disk lease exists, and the planner infers no runner elsewhere.
 #
-# The exact-name clause is nextest's fully qualified name (module path included),
-# because `test(=…)` matches the whole name. Two inventory rows are deliberately
-# `#[ignore]`d host-controller and contention lanes and stay out of these groups.
+# An exact-name clause, when a group needs one, is nextest's fully qualified name
+# (module path included), because `test(=…)` matches the whole name. Two inventory rows are
+# deliberately `#[ignore]`d host-controller and contention lanes and stay out of these groups.
 # `clone_intent_recovery` runs on the directory substrate and belongs to neither group.
 #
 # A test's class is on its code time, not its wall time

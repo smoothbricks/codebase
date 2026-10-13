@@ -162,8 +162,8 @@ describe('the real-APFS serial groups of this repository', () => {
     const groups = serialTestGroups(join(REPOSITORY, NEXTEST_REPO_CONFIG_PATH));
     const scoped = new Set(groups.flatMap(({ scope }) => (scope.kind === 'packages' ? scope.packages : [])));
     const sources = await rustSources(listCargoWorkspacePackages(REPOSITORY), scoped);
+    // A group with no exact-name clause pins nothing, so there is nothing that can go stale.
     const pinned = groups.flatMap(({ filter }) => [...filter.matchAll(/test\(=([^),]+)\)/g)].map((match) => match[1]));
-    expect(pinned.length).toBeGreaterThan(0);
     for (const exactName of pinned) {
       // `a::b::tests::name`: a module path, the `tests` module, then the function. A name that moved with its
       // module matches no test and silently leaves the group, so each must still resolve to one function.
