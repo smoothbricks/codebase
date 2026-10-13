@@ -406,10 +406,21 @@ mod tests {
     use super::*;
     use std::os::unix::net::UnixListener;
 
-    const QUICK: Bounds = Bounds {
-        ack: Duration::from_millis(200),
-        after_close: Duration::from_secs(5),
-        grant: Duration::from_millis(500),
+    /// A wait only the peer ends: by answering, or by closing its socket, which it does when it
+    /// is dropped, its thread's panic included. The clock never decides it; a test stuck on it
+    /// meets the per-test hang backstop long before it elapses.
+    const PEER_ENDS: Duration = Duration::from_secs(3600);
+
+    /// The bound of the one wait a scenario is about, where no answer ever comes: its elapsing is
+    /// the scenario's event, and nothing else is in flight to race it.
+    const NO_ANSWER: Duration = Duration::from_millis(200);
+
+    /// Every answer the scenario needs is already in the client's receive buffer when it asks, so
+    /// no wait can time out, however late the scheduler runs anything.
+    const ANSWERED: Bounds = Bounds {
+        ack: PEER_ENDS,
+        after_close: PEER_ENDS,
+        grant: PEER_ENDS,
     };
 
     /// A listening socket the client is already connected to, removed on drop. Directly under
@@ -433,12 +444,11 @@ mod tests {
         (socket, listener, client)
     }
 
-    fn request_line(server: &UnixStream) -> String {
-        let mut line = String::new();
-        BufReader::new(server)
-            .read_line(&mut line)
-            .expect("request");
-        line
+    /// The gateway's end of the client's connection, holding `answers` before the client asks.
+    fn answering(listener: &UnixListener, answers: &[u8]) -> UnixStream {
+        let (mut server, _) = listener.accept().expect("accept");
+        server.write_all(answers).expect("answer");
+        server
     }
 
     #[test]
@@ -488,26 +498,29 @@ mod tests {
     #[test]
     fn a_lease_is_asked_by_one_line_queued_then_granted_and_held_until_dropped() {
         let (_socket, listener, client) = pair();
-        let server = std::thread::spawn(move || {
-            let (mut server, _) = listener.accept().expect("accept");
-            let line = request_line(&server);
-            server
-                .write_all(
-                    b"{\"ok\":true,\"lease\":\"queued\"}\n{\"ok\":true,\"lease\":\"granted\"}\n",
-                )
-                .expect("answer");
-            let mut rest = Vec::new();
-            io::Read::read_to_end(&mut server, &mut rest).expect("held until the client closes");
-            (line, rest)
-        });
+        let server = answering(
+            &listener,
+            b"{\"ok\":true,\"lease\":\"queued\"}\n{\"ok\":true,\"lease\":\"granted\"}\n",
+        );
         let lease =
-            acquire(client, DiskClass::Namespace, "/sbin/umount /x", QUICK).expect("granted");
-        drop(lease);
-        let (line, rest) = server.join().expect("server");
+            acquire(client, DiskClass::Namespace, "/sbin/umount /x", ANSWERED).expect("granted");
+        let mut sent = BufReader::new(&server);
+        let mut line = String::new();
+        sent.read_line(&mut line).expect("request");
         assert_eq!(
             line,
             "{\"op\":\"disk-lease\",\"class\":\"namespace\",\"command\":\"/sbin/umount /x\"}\n"
         );
+        server.set_nonblocking(true).expect("nonblocking");
+        let held = io::Read::read(&mut sent, &mut [0; 1]);
+        assert!(
+            matches!(&held, Err(error) if error.kind() == io::ErrorKind::WouldBlock),
+            "a held lease's connection stays open and silent: {held:?}"
+        );
+        drop(lease);
+        server.set_nonblocking(false).expect("blocking");
+        let mut rest = Vec::new();
+        io::Read::read_to_end(&mut sent, &mut rest).expect("held until the client closes");
         assert!(rest.is_empty(), "the client sends nothing after its line");
     }
 
@@ -524,48 +537,61 @@ mod tests {
                 )
                 .expect("answer");
         });
+        // The ack wait is the only one the clock may end; every later one waits for the old
+        // gateway's answer, which it writes on the half-close and nothing else.
         let started = Instant::now();
-        let unleased = acquire(client, DiskClass::Storage, "/usr/sbin/diskutil list", QUICK)
-            .expect_err("an old gateway grants nothing");
+        let unleased = acquire(
+            client,
+            DiskClass::Storage,
+            "/usr/sbin/diskutil list",
+            Bounds {
+                ack: NO_ANSWER,
+                ..ANSWERED
+            },
+        )
+        .expect_err("an old gateway grants nothing");
+        let waited = started.elapsed();
         server.join().expect("server");
         assert!(
             matches!(&unleased, Unleased::Predates(error) if error.contains("unknown")),
             "{unleased}"
         );
-        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(
+            waited >= NO_ANSWER,
+            "the client half-closed after {waited:?}, before its ack bound"
+        );
     }
 
     #[test]
     fn a_refusal_and_a_grant_that_never_comes_both_run_unleased() {
         let (_socket, listener, client) = pair();
-        let server = std::thread::spawn(move || {
-            let (mut server, _) = listener.accept().expect("accept");
-            request_line(&server);
-            server
-                .write_all(b"{\"ok\":false,\"code\":\"rejected\",\"error\":\"stopped\"}\n")
-                .expect("answer");
-        });
-        assert!(matches!(
-            acquire(client, DiskClass::Storage, "x", QUICK),
-            Err(Unleased::Refused { code, .. }) if code == "rejected"
-        ));
-        server.join().expect("server");
+        let _server = answering(
+            &listener,
+            b"{\"ok\":false,\"code\":\"rejected\",\"error\":\"stopped\"}\n",
+        );
+        let refused = acquire(client, DiskClass::Storage, "x", ANSWERED);
+        assert!(
+            matches!(&refused, Err(Unleased::Refused { code, .. }) if code == "rejected"),
+            "{refused:?}"
+        );
 
         let (_socket, listener, client) = pair();
-        let server = std::thread::spawn(move || {
-            let (mut server, _) = listener.accept().expect("accept");
-            request_line(&server);
-            server
-                .write_all(b"{\"ok\":true,\"lease\":\"queued\"}\n")
-                .expect("answer");
-            let mut rest = Vec::new();
-            io::Read::read_to_end(&mut server, &mut rest).expect("client closes");
-        });
-        assert!(matches!(
-            acquire(client, DiskClass::Storage, "x", QUICK),
-            Err(Unleased::NotGranted(_))
-        ));
-        server.join().expect("server");
+        let mut server = answering(&listener, b"{\"ok\":true,\"lease\":\"queued\"}\n");
+        let ungranted = acquire(
+            client,
+            DiskClass::Storage,
+            "x",
+            Bounds {
+                grant: NO_ANSWER,
+                ..ANSWERED
+            },
+        );
+        assert!(
+            matches!(&ungranted, Err(Unleased::NotGranted(waited)) if *waited == NO_ANSWER),
+            "{ungranted:?}"
+        );
+        let mut rest = Vec::new();
+        io::Read::read_to_end(&mut server, &mut rest).expect("client closes");
     }
 
     #[test]
