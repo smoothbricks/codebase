@@ -1822,25 +1822,19 @@ async fn eventually(what: &str, mut ready: impl FnMut() -> bool) {
     }
 }
 
-/// Run `cowshed gc` until build volume `id`'s image is gone: a running job's shared hold
-/// defers collection until its terminal event drops that hold.
-async fn collected(service: &mut ActorBridge, layout: &BuildVolumeLayout, id: &BuildVolumeId) {
-    let started = Instant::now();
-    while layout.image(id).exists() {
-        assert!(
-            started.elapsed() < PATIENCE,
-            "gc did not reclaim build volume {id} within {PATIENCE:?}"
-        );
-        let (_, stderr) = succeed(service, ["gc"]).await;
-        eprintln!("gc: {stderr}");
-        if layout.image(id).exists() {
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        }
-    }
-    assert!(
-        !layout.record(id).exists(),
-        "build volume {id}'s record outlives its image"
-    );
+/// Wait for the last job hold on build volume `id` to drop. Jobs hold the volume by a shared
+/// lock on its hold file ([`BuildVolumeLayout::hold`]), so an exclusive lock on it is granted at
+/// the very event: the last job's terminal event releasing its hold, or the kernel releasing a
+/// dead holder's. The lock is let go at once, leaving the volume for the gc after it.
+async fn job_holds_released(layout: &BuildVolumeLayout, id: &BuildVolumeId) {
+    let hold = layout.hold_path(id);
+    let released =
+        tokio::task::spawn_blocking(move || fs::File::open(&hold).and_then(|file| file.lock()));
+    tokio::time::timeout(PATIENCE, released)
+        .await
+        .unwrap_or_else(|_| panic!("a job hold on build volume {id} outlived {PATIENCE:?}"))
+        .expect("the hold wait's thread")
+        .expect("lock build volume's hold file");
 }
 
 fn file_len(path: &Path) -> u64 {
@@ -2908,9 +2902,17 @@ async fn directory_a_job_running_across_an_adoption_keeps_its_volume_and_later_j
     );
 
     fs::write(&stop, b"").unwrap();
-    let exited = old_mount.join("target/ticking/exited");
-    eventually("the job exits", || exited.is_file()).await;
-    collected(&mut service, &layout, &old).await;
+    job_holds_released(&layout, &old).await;
+    assert!(
+        old_mount.join("target/ticking/exited").is_file(),
+        "the job ran to its end in the previous volume"
+    );
+    let (_, stderr) = succeed(&mut service, ["gc"]).await;
+    assert!(
+        !layout.image(&old).exists() && !layout.record(&old).exists(),
+        "the first gc once the job's hold is gone reclaims the previous volume and its record: \
+         {stderr}"
+    );
     service.shutdown().await.expect("stop the runtime");
     fixture.stop_gateway().await;
 }
