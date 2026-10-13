@@ -10,7 +10,7 @@ import {
 import { validateConsumedScopedDependenciesExist, validateNoMachineLocalSpecifiers } from '../consumed-scope.js';
 import { validateGoToolchainAgreement } from '../go-toolchain.js';
 import { syncBunLockfileVersions, validateBunLockfileVersions } from '../lockfile.js';
-import { validateDevenvModuleImport, warnOnManagedFileDrift } from '../managed-files.js';
+import { validateDevenvModuleImport, validateDevenvReleaseLock, warnOnManagedFileDrift } from '../managed-files.js';
 import { fixNxSync, validateNxSync } from '../nx-sync.js';
 import { fixPackageHygiene, validatePackageHygiene } from '../package-hygiene.js';
 import {
@@ -136,7 +136,7 @@ const packs: MonorepoPack[] = [
   {
     name: 'devenv',
     validatePreBuild(ctx) {
-      return validateDevenvModuleImport(ctx.root);
+      return validateDevenvModuleImport(ctx.root) + validateDevenvReleaseLock(ctx.root);
     },
   },
   {

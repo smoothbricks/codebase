@@ -222,6 +222,41 @@ describe('monorepo validation pack phases', () => {
     }
   });
 
+  it('includes the devenv release lock in pre-build validation', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'smoo-validate-devenv-release-'));
+    try {
+      await mkdir(join(root, 'tooling/direnv'), { recursive: true });
+      await writeFile(join(root, 'tooling/direnv/devenv.nix'), '{...}: { imports = [./devenv.smoo.nix]; }\n');
+      // devenv's main as an undeclared input locks it: no ref in `original`.
+      const devenv = { dir: 'src/modules', owner: 'cachix', repo: 'devenv', type: 'github' };
+      await writeFile(
+        join(root, 'tooling/direnv/devenv.lock'),
+        JSON.stringify({
+          nodes: {
+            devenv: { locked: { ...devenv, rev: '190959a9a4bb52d4802f076a90c3c4e3aa2e6fa2' }, original: devenv },
+            root: { inputs: { devenv: 'devenv' } },
+          },
+          root: 'root',
+          version: 7,
+        }),
+      );
+      const devenvPack = packsForTest.find((pack) => pack.name === 'devenv');
+      if (!devenvPack) {
+        throw new Error('devenv validation pack not found');
+      }
+
+      const result = await runValidatePacks(
+        { root, syncRuntime: false },
+        { failFast: true },
+        { packs: [devenvPack], runBuild: () => 0 },
+      );
+
+      expect(result).toEqual({ failures: 1, failedChecks: 1 });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it('validates and fixes cargo workspace feature unification through its own pack', async () => {
     const root = await mkdtemp(join(tmpdir(), 'smoo-validate-cargo-'));
     try {

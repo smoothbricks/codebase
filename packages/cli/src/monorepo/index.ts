@@ -20,6 +20,7 @@ import {
   applyManagedFiles,
   printResults,
   validateDevenvModuleImport,
+  validateDevenvReleaseLock,
   warnOnManagedFileDrift,
 } from './managed-files.js';
 import {
@@ -166,6 +167,7 @@ export async function checkManagedFiles(root: string, options: { warn?: boolean 
     validateNoStaleTestOutput(root) +
     validateWorkspaceDependencies(root, { resolvedTargetsByProject: resolvedTargets }) +
     validateDevenvModuleImport(root) +
+    validateDevenvReleaseLock(root) +
     validateCargoCachePolicy(root) +
     validateCargoToolchainInputs(root, projectTargets) +
     validateSccachePatches(root);

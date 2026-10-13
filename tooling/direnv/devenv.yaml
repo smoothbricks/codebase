@@ -7,6 +7,18 @@ permittedInsecurePackages:
 inputs:
   nixpkgs:
     url: github:cachix/devenv-nixpkgs/rolling
+  # The devenv modules at a release tag, and with them the CLI: on a hosted
+  # runner, install-devenv installs the commit this input locks. Left undeclared,
+  # `devenv update` locks devenv's main as it is that minute, and
+  # devenv.cachix.org drops a main build after about six weeks, so a cold runner
+  # then compiles devenv from source. The aarch64-darwin, aarch64-linux and
+  # x86_64-linux builds of every release from v2.0.4 on are pinned there for
+  # good, and the x86_64-darwin builds up to v2.1.2, since from v2.2 on devenv
+  # builds nothing for x86_64-darwin; some older tags, such as v2.0.3, have no
+  # pin. `smoo monorepo check` refuses a lock that is not such a release; the tag
+  # moves when someone bumps it.
+  devenv:
+    url: github:cachix/devenv/v2.3.1?dir=src/modules
   # Go for devenv.smoo.nix, pinned to the patch release ttsc vendors inside its
   # native package (0.28.3 -> go1.26.7); `smoo monorepo check` fails when the two
   # disagree. Our curated channel above cannot supply it — rolling is at 1.26.5

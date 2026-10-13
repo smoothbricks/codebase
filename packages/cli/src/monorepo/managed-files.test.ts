@@ -22,6 +22,7 @@ import {
   releasePlatformTargetGlobsFor,
   renderManagedWorkflowForTest,
   validateDevenvModuleImport,
+  validateDevenvReleaseLock,
 } from './managed-files.js';
 
 const REPO_ROOT = join(import.meta.dir, '..', '..', '..', '..');
@@ -109,6 +110,97 @@ describe('managed devenv module import', () => {
     } finally {
       await rm(root, { recursive: true, force: true });
     }
+  });
+});
+
+describe('managed devenv release lock', () => {
+  // The devenv node as `devenv update` writes it: `original` is what devenv.yaml declared.
+  const lockWithDevenv = (rev: string, original: Record<string, string>): string =>
+    `${JSON.stringify(
+      {
+        nodes: {
+          devenv: {
+            locked: { dir: 'src/modules', owner: 'cachix', repo: 'devenv', rev, type: 'github' },
+            original: { dir: 'src/modules', owner: 'cachix', repo: 'devenv', type: 'github', ...original },
+          },
+          root: { inputs: { devenv: 'devenv' } },
+        },
+        root: 'root',
+        version: 7,
+      },
+      null,
+      2,
+    )}\n`;
+
+  const checkLock = async (lock: string | null): Promise<number> => {
+    const root = await mkdtemp(join(tmpdir(), 'smoo-devenv-release-'));
+    try {
+      if (lock !== null) {
+        await mkdir(join(root, 'tooling/direnv'), { recursive: true });
+        await writeFile(join(root, 'tooling/direnv/devenv.lock'), lock);
+      }
+      return validateDevenvReleaseLock(root);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  };
+
+  it('accepts a devenv input locked at latest or at a release from v2.0.4 on', async () => {
+    // github:cachix/devenv/v2.3.1?dir=src/modules and .../latest?dir=src/modules, as devenv 2.3.1 locks them.
+    expect(await checkLock(lockWithDevenv('2418e1b43797c44de5166176622c8d8fa0149871', { ref: 'v2.3.1' }))).toBe(0);
+    expect(await checkLock(lockWithDevenv('b904dcb51fe48c30db250038241507f60752f222', { ref: 'latest' }))).toBe(0);
+    // The oldest release whose builds are pinned, and a two-part tag after it.
+    expect(await checkLock(lockWithDevenv('fa25529c64880987081d5d9523fb6c4db244cb79', { ref: 'v2.0.4' }))).toBe(0);
+    expect(await checkLock(lockWithDevenv('2cf62a010000b70f15c78a72761fad7c9e6fb47a', { ref: 'v2.1' }))).toBe(0);
+  });
+
+  it('accepts a release declared as a git+https URL, which names the tag as refs/tags/<tag>', async () => {
+    // git+https://github.com/cachix/devenv?ref=refs/tags/v2.3.1&dir=src/modules, as devenv 2.3.1 locks it.
+    const original = {
+      dir: 'src/modules',
+      ref: 'refs/tags/v2.3.1',
+      type: 'git',
+      url: 'https://github.com/cachix/devenv',
+    };
+    const locked = { ...original, rev: '2418e1b43797c44de5166176622c8d8fa0149871' };
+    const nodes = { devenv: { locked, original }, root: { inputs: { devenv: 'devenv' } } };
+    expect(await checkLock(JSON.stringify({ nodes, root: 'root', version: 7 }))).toBe(0);
+  });
+
+  it('refuses a release older than v2.0.4, because some of those builds are already gone', async () => {
+    // v2.0.3 and v2.0 have no pin, and v2.0.3's build is no longer served.
+    expect(await checkLock(lockWithDevenv('9e5c17caf0ead1bb29d430d4c0a26a77bc5d374b', { ref: 'v2.0.3' }))).toBe(1);
+    expect(await checkLock(lockWithDevenv('fc38277c6a89226d1bafe2963e844485a4a01726', { ref: 'v2.0' }))).toBe(1);
+    const git = { ref: 'refs/tags/v2.0.3' };
+    expect(await checkLock(lockWithDevenv('9e5c17caf0ead1bb29d430d4c0a26a77bc5d374b', git))).toBe(1);
+  });
+
+  it('compares release numbers part by part as numbers, not as text', async () => {
+    // Tags that do not exist yet; the check does not read the rev of a release. As text, v10.0 and v2.0.10 would
+    // sort before v2.0.4.
+    const rev = 'b904dcb51fe48c30db250038241507f60752f222';
+    expect(await checkLock(lockWithDevenv(rev, { ref: 'v2.10' }))).toBe(0);
+    expect(await checkLock(lockWithDevenv(rev, { ref: 'v2.0.10' }))).toBe(0);
+    expect(await checkLock(lockWithDevenv(rev, { ref: 'v10.0' }))).toBe(0);
+    expect(await checkLock(lockWithDevenv(rev, { ref: 'v2' }))).toBe(1);
+  });
+
+  it('refuses a devenv input that follows main, a branch, or a commit, even one declared beside a tag', async () => {
+    // Undeclared, the input locks devenv's main as it was that minute, and `original` carries no ref.
+    expect(await checkLock(lockWithDevenv('190959a9a4bb52d4802f076a90c3c4e3aa2e6fa2', {}))).toBe(1);
+    expect(await checkLock(lockWithDevenv('190959a9a4bb52d4802f076a90c3c4e3aa2e6fa2', { ref: 'main' }))).toBe(1);
+    // A commit may happen to be a release, but nothing offline can tell.
+    const rev = '2418e1b43797c44de5166176622c8d8fa0149871';
+    expect(await checkLock(lockWithDevenv(rev, { rev }))).toBe(1);
+    // A git+https URL takes a rev beside the tag (`?ref=refs/tags/v2.3.1&rev=190959a…`), and Nix locks that rev.
+    const besideTag = { ref: 'refs/tags/v2.3.1', rev: '190959a9a4bb52d4802f076a90c3c4e3aa2e6fa2' };
+    expect(await checkLock(lockWithDevenv(besideTag.rev, besideTag))).toBe(1);
+  });
+
+  it('has nothing to check without a lock or a devenv node, and reports a lock it cannot read', async () => {
+    expect(await checkLock(null)).toBe(0);
+    expect(await checkLock('{"nodes":{"root":{"inputs":{}}},"root":"root","version":7}\n')).toBe(0);
+    expect(await checkLock('{"nodes":')).toBe(1);
   });
 });
 
