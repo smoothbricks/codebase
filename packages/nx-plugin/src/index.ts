@@ -502,14 +502,6 @@ const CARGO_INPUTS = [
 // build really reads is the package's `napi` block (binary name, targets) and
 // the `@napi-rs/cli` it runs; those are hashed as such by napiInputs().
 const CARGO_OUTPUT_INPUTS = CARGO_INPUTS;
-const REPO_ROOT_CARGO_OUTPUT_INPUTS = [
-  '{workspaceRoot}/**/*.rs',
-  '{workspaceRoot}/**/Cargo.toml',
-  '{workspaceRoot}/Cargo.lock',
-  '{workspaceRoot}/**/.cargo/config.toml',
-  '{workspaceRoot}/scripts/*.sh',
-  '!{workspaceRoot}/**/target/**',
-];
 // The toolchain half of a cargo task's identity lives in its own module
 // because `smoo monorepo validate` reads the same two constants to refuse a
 // declaration that drops it. See cargo-toolchain-policy.ts for why it is the
@@ -567,7 +559,9 @@ function napiInputs(projectRoot: string, repoRooted: boolean): TargetConfigurati
   // by its path from there whichever way the Cargo invocation is rooted.
   const packageJson = `./${posix.join(projectRoot, 'package.json')}`;
   return [
-    ...(repoRooted ? REPO_ROOT_CARGO_OUTPUT_INPUTS : CARGO_OUTPUT_INPUTS),
+    CARGO_CLOSURE_INPUT,
+    '{projectRoot}/scripts/*.sh',
+    ...(repoRooted ? ['{workspaceRoot}/scripts/*.sh'] : []),
     ...CARGO_TOOLCHAIN_PIN_INPUTS,
     runtimeInput(`bun -e 'console.log(JSON.stringify(require(${JSON.stringify(packageJson)}).napi ?? null))'`),
     { externalDependencies: ['@napi-rs/cli'] },
@@ -682,7 +676,9 @@ function createCargoWasmTarget(
     executor: 'nx:run-commands',
     cache: true,
     dependsOn: ['^build'],
-    inputs: repoRooted ? REPO_ROOT_CARGO_OUTPUT_INPUTS : CARGO_OUTPUT_INPUTS,
+    inputs: repoRooted
+      ? [CARGO_CLOSURE_INPUT, '{workspaceRoot}/scripts/*.sh', '{projectRoot}/scripts/*.sh']
+      : CARGO_OUTPUT_INPUTS,
     outputs: [`{projectRoot}/${config.outputDirectory}`],
     options: {
       command: buildCommand('dev'),
@@ -2540,6 +2536,7 @@ async function resolveCargoWorkspaces(
         posix.join(workspace.projectRoot, 'Cargo.toml'),
         workspaceRoot,
         indexedManifests,
+        workspace.inputsCache.compiledInFiles,
       ),
     })),
   );

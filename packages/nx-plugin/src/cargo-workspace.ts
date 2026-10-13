@@ -4,6 +4,8 @@ import { dirname, isAbsolute, join, normalize, posix, relative, resolve, sep } f
 import { readNxJson } from 'nx/src/config/nx-json.js';
 import { parse as parseToml, type TomlTable } from 'smol-toml';
 
+import { compiledInFiles } from './cargo-source-hash.js';
+
 export interface CargoWorkspacePackage {
   name: string;
   dir: string;
@@ -394,7 +396,7 @@ async function deriveCargoPackageTestInputs(
     // `include_str!("../../../skills/SKILL.md")` compiles a file the package's own
     // fileset does not reach; a target that does not hash it serves a binary
     // built from the file's old bytes.
-    for (const file of compiledInFiles(absoluteDir, cache)) {
+    for (const file of compiledInFiles(absoluteDir, cache.compiledInFiles)) {
       if (isOutsideRoot(relative(absoluteDir, file))) declaredSources.add(file);
     }
   }
@@ -483,45 +485,6 @@ function nestedCrateDirs(root: string, cache: CargoInputsCache): string[] {
   }
   cache.nestedCrateDirs.set(root, found);
   return found;
-}
-
-/** A literal `include_str!("…")` or `include_bytes!("…")` path without escapes, resolved from the naming file. */
-const COMPILED_IN_FILE = /\binclude_(?:str|bytes)!\s*\(\s*"([^"\\\n]*)"\s*\)/g;
-
-/**
- * Every existing file a Rust source of the package at `root` compiles in through a literal `include_str!` or
- * `include_bytes!`, the walk stopping at nested packages and skipped trees as {@link nestedCrateDirs} does. rustc
- * resolves the path against the naming file's directory and records it in the unit's dep-info, so Cargo rebuilds when
- * it changes; Nx hashes only what a target's inputs name. A path that names no file (a mention in a comment, say)
- * compiles nothing and is skipped; a computed path (`include_str!(env!(…))`) is the declaring target's own input.
- */
-function compiledInFiles(root: string, cache: CargoInputsCache): string[] {
-  const cached = cache.compiledInFiles.get(root);
-  if (cached !== undefined) return cached;
-  const found = new Set<string>();
-  const scan = [root];
-  while (scan.length > 0) {
-    const current = scan.pop();
-    if (current === undefined || !existsSync(current)) continue;
-    for (const entry of readdirSync(current, { withFileTypes: true })) {
-      const child = join(current, entry.name);
-      if (entry.isDirectory()) {
-        if (!['target', '.git', 'node_modules', '.nx'].includes(entry.name) && !existsSync(join(child, 'Cargo.toml'))) {
-          scan.push(child);
-        }
-      } else if (entry.isFile() && entry.name.endsWith('.rs')) {
-        const text = readFileSync(child, 'utf-8');
-        if (!text.includes('include_')) continue;
-        for (const [, path = ''] of text.matchAll(COMPILED_IN_FILE)) {
-          const file = resolve(current, path);
-          if (path !== '' && existsSync(file)) found.add(file);
-        }
-      }
-    }
-  }
-  const files = [...found].sort();
-  cache.compiledInFiles.set(root, files);
-  return files;
 }
 
 function enqueuePathDependencies(

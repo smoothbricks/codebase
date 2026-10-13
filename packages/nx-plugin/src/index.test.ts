@@ -21,6 +21,7 @@ import { resetWorkspaceContext } from 'nx/src/utils/workspace-context.js';
 import { useFixtureCargoHome } from './__tests__/fixture-cargo-home.js';
 import { runtimeInputValue } from './__tests__/runtime-input.js';
 import { BOUNDED_TEST_IDLE_TIMEOUT_MS, BOUNDED_TEST_KILL_AFTER_MS } from './bounded-test-policy.js';
+import { CARGO_CLOSURE_INPUT } from './cargo-closure-input.js';
 import { exceptionalTestFilter, packageNameFromCargoTestTarget } from './cargo-workspace.js';
 import { CARGO_CROSS_LINT_COMMAND, CARGO_CROSS_LINT_TARGET, CARGO_LINT_CLIPPY_COMMAND } from './cross-check-policy.js';
 import { cargoCommandNpmPackages, createNodesV2, createNodesV2ForPlatform } from './index.js';
@@ -1244,6 +1245,8 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(runtime.clean).toBeUndefined();
 
       expect(wasm['cargo-test-runtime-wasm']?.dependsOn).toEqual([rootFetch, rootArchive]);
+      expect(wasm['cargo-wasm']?.inputs).toContain(CARGO_CLOSURE_INPUT);
+      expect(wasm['cargo-wasm']?.inputs).not.toContain('{workspaceRoot}/**/*.rs');
       expect(wasm['cargo-wasm']?.options).toMatchObject({ cwd: '.' });
       // Dev by default, in the workspace's own `target/`; only the release
       // configuration compiles, and binds, the release artifact.
@@ -1279,6 +1282,18 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(
         napiInputs.some((input) => typeof input === 'object' && 'runtime' in input && input.runtime.includes('.napi')),
       ).toBe(true);
+      for (const [name, target] of Object.entries(native)) {
+        if (!name.startsWith('napi-') || target.cache !== true) continue;
+        expect(target.inputs).toContain(CARGO_CLOSURE_INPUT);
+        expect(target.inputs).not.toContain('{workspaceRoot}/**/*.rs');
+      }
+      const nativeClosure = projects.get('packages/native')?.namedInputs?.[CARGO_CLOSURE_INPUT] ?? [];
+      expect(nativeClosure).toContain(
+        '{workspaceRoot}/packages/native/crates/native-napi/**/{*.rs,Cargo.toml,.cargo/config,.cargo/config.toml}',
+      );
+      expect(nativeClosure.some((input) => typeof input === 'string' && input.includes('packages/runtime'))).toBe(
+        false,
+      );
       expect(napiInputs).not.toContain('{workspaceRoot}/bun.lock');
       expect(napiInputs.some((input) => typeof input === 'string' && input.endsWith('/package.json'))).toBe(false);
       // ... and on the toolchain pin, which it must state itself: `napi build`

@@ -6,6 +6,7 @@ import type { TargetConfiguration } from 'nx/src/devkit-exports.js';
 import {
   CARGO_ANCESTOR_INPUTS,
   type CargoResolve,
+  compiledInFiles,
   dependencyClosure,
   HASH_SKIPPED_DIRECTORIES,
   readCargoResolve,
@@ -63,6 +64,7 @@ export interface CargoClosureSource {
   readonly cargo: CargoResolve;
   /** Every `Cargo.toml` in Nx's file index, relative to the workspace root. */
   readonly indexed: ReadonlySet<string>;
+  readonly compiledFilesCache: Map<string, string[]>;
 }
 
 /**
@@ -83,10 +85,11 @@ export async function resolveCargoClosureSource(
   manifest: string,
   workspaceRoot: string,
   indexed: Promise<ReadonlySet<string>>,
+  compiledFilesCache: Map<string, string[]>,
 ): Promise<CargoClosureSource> {
   const [root, index] = await Promise.all([realpath(workspaceRoot), indexed]);
   const cargo = await readCargoResolve(join(root, manifest), root, index);
-  return { manifest, root, cargo, indexed: index };
+  return { manifest, root, cargo, indexed: index, compiledFilesCache };
 }
 
 /**
@@ -136,6 +139,7 @@ async function workspaceClosureInputs(projectRoot: string, source: CargoClosureS
   const { root, cargo, indexed } = source;
   const packageDirectories: string[] = [];
   const files: string[] = [];
+  const compiledFiles = new Set<string>();
   let external = false;
   try {
     const members = await dependencyClosure(cargo, join(root, projectRoot));
@@ -149,6 +153,11 @@ async function workspaceClosureInputs(projectRoot: string, source: CargoClosureS
       if (!indexed.has(posix.join(directory, 'Cargo.toml'))) {
         throw new Error(`the Cargo package ${directory} is not in Nx's file index (an ignored directory)`);
       }
+      for (const file of compiledInFiles(pkg.directory, source.compiledFilesCache)) {
+        const path = indexablePath(root, file);
+        if (path === null) throw new Error(`${directory} compiles ${file}, which Nx's file index cannot hold`);
+        compiledFiles.add(path);
+      }
       packageDirectories.push(directory);
       for (const file of [...pkg.sources, pkg.governingManifest]) {
         const path = indexablePath(root, file);
@@ -156,7 +165,7 @@ async function workspaceClosureInputs(projectRoot: string, source: CargoClosureS
         files.push(path);
       }
     }
-    const unglobbable = [...packageDirectories, ...files].find((path) => GLOB_SYNTAX.test(path));
+    const unglobbable = [...packageDirectories, ...files, ...compiledFiles].find((path) => GLOB_SYNTAX.test(path));
     if (unglobbable !== undefined) throw new Error(`${unglobbable} contains glob syntax, so no fileset can name it`);
   } catch (error) {
     throw new CargoClosureInputError(projectRoot, error);
@@ -201,6 +210,7 @@ async function workspaceClosureInputs(projectRoot: string, source: CargoClosureS
     ...packageGlobs.map((glob) => anchored(glob, PACKAGE_FILES)),
     ...packageGlobs.map((glob) => `!${anchored(glob, SKIPPED_TREES)}`),
     ...[...ancestors].sort().map((ancestor) => anchored(ancestor, ANCESTOR_FILES)),
+    ...[...compiledFiles].sort().map((file) => anchored(file)),
     ...[...loose].sort().map((file) => anchored(file)),
     ...(external ? [runtimeInput(`${CARGO_HASH_COMMAND} ${closureArguments}`)] : []),
   ];

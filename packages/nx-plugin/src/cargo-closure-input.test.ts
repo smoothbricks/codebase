@@ -6,7 +6,7 @@ import { dirname, join } from 'node:path';
 import { promisify } from 'node:util';
 
 import type { CreateNodesResultV2 } from 'nx/src/devkit-exports.js';
-import { Watcher } from 'nx/src/native/index.js';
+import { Watcher, WorkspaceContext } from 'nx/src/native/index.js';
 import { globWithWorkspaceContextSync, resetWorkspaceContext } from 'nx/src/utils/workspace-context.js';
 import {
   aggregateOf,
@@ -21,6 +21,7 @@ import {
 import { useFixtureCargoHome } from './__tests__/fixture-cargo-home.js';
 import { runtimeInputValue } from './__tests__/runtime-input.js';
 import { CARGO_CLOSURE_INPUT, indexedCargoManifests } from './cargo-closure-input.js';
+import { hashCargoPathInputs } from './cargo-source-hash.js';
 import { createNodesV2 } from './index.js';
 
 const repositoryRoot = join(import.meta.dir, '../../..');
@@ -146,6 +147,64 @@ it('keys a custom target on exactly its Cargo closure, inside the workspace and 
     // Outside the Nx workspace, where no fileset reaches: the runtime entry does.
     await edit('external/src/lib.rs', 'pub fn answer() -> u8 { 20 }\n');
     expect(await outside()).not.toBe(before);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+}, 120_000);
+
+it('keys literal compiled-in data inside and outside crate directories without keying comments or unrelated crates', async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'cargo-compiled-data-')));
+  try {
+    const { workspace, edit } = await closureFixture(root, undefined, {
+      'workspace/packages/app/src/main.rs':
+        'const LOCAL: &str = include_str!("data/local.txt");\nfn main() { println!("{}", bridge::answer()); }\n',
+      'workspace/packages/app/src/data/local.txt': 'local-one',
+      'workspace/crates/bridge/src/lib.rs':
+        'pub fn answer() -> u8 { leaf::answer() + external::answer() }\npub const DATA: &[u8] = include_bytes!("../../shared/config.json");\n',
+      'workspace/crates/shared/config.json': '{"value":1}',
+      'workspace/crates/leaf/src/lib.rs': [
+        'pub fn answer() -> u8 { 1 }',
+        'pub const SKILL: &str = include_str!(r#"../../../skills/SKILL.md"#,);',
+        '// include_str!("../../../comment-only.txt")',
+        '/* nested /* include_bytes!("../../../comment-only.txt") */ comment */',
+        'const EXAMPLE: &str = r#"include_str!("../../../example-only.txt")"#;',
+      ].join('\n'),
+      'workspace/skills/SKILL.md': 'skill-one',
+      'workspace/comment-only.txt': 'comment-one',
+      'workspace/example-only.txt': 'example-one',
+      'external/src/lib.rs': 'pub fn answer() -> u8 { 10 }\nconst DATA: &str = include_str!("../data.txt");\n',
+      'external/data.txt': 'external-one',
+    });
+    resetWorkspaceContext();
+    const inputs = closureOf(byFile(await graphComputation(workspace)()), 'packages/app');
+    const positive = inputs.flatMap((input) =>
+      typeof input === 'string' && !input.startsWith('!') ? [input.slice('{workspaceRoot}/'.length)] : [],
+    );
+    const negative = inputs.flatMap((input) =>
+      typeof input === 'string' && input.startsWith('!') ? [input.slice('!{workspaceRoot}/'.length)] : [],
+    );
+    const context = new WorkspaceContext(workspace, join(workspace, '.nx/compiled-data-context'));
+    const keyed = context.glob(positive, negative);
+    for (const path of ['packages/app/src/data/local.txt', 'crates/shared/config.json', 'skills/SKILL.md'])
+      expect(keyed).toContain(path);
+    for (const path of ['comment-only.txt', 'example-only.txt', 'crates/unrelated/src/lib.rs'])
+      expect(keyed).not.toContain(path);
+    const before = context.hashFilesMatchingGlob(positive, negative);
+    await edit('workspace/packages/app/src/data/local.txt', 'local-two');
+    context.incrementalUpdate(['packages/app/src/data/local.txt'], []);
+    const changed = context.hashFilesMatchingGlob(positive, negative);
+    expect(changed).not.toBe(before);
+    await edit('workspace/comment-only.txt', 'comment-two');
+    await edit('workspace/crates/unrelated/src/lib.rs', 'pub fn unrelated() -> u8 { 4 }\n');
+    context.incrementalUpdate(['comment-only.txt', 'crates/unrelated/src/lib.rs'], []);
+    expect(context.hashFilesMatchingGlob(positive, negative)).toBe(changed);
+    const outside = await hashCargoPathInputs(join(workspace, 'Cargo.toml'), workspace, {
+      closure: join(workspace, 'packages/app'),
+    });
+    await edit('external/data.txt', 'external-two');
+    expect(
+      await hashCargoPathInputs(join(workspace, 'Cargo.toml'), workspace, { closure: join(workspace, 'packages/app') }),
+    ).not.toBe(outside);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
