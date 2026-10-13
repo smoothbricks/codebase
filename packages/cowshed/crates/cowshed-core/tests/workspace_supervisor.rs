@@ -4917,12 +4917,35 @@ fn burner() -> String {
 }
 
 /// `script` run by `/bin/sh` leading a group of its own: the test is its parent, holds it
-/// unreaped, feeds its stdin and reads its stdout.
+/// unreaped, feeds its stdin and reads its stdout. A test that panics first ends the group, so
+/// no process of it outlives the test.
 #[cfg(target_os = "macos")]
 struct Scripted {
     child: std::process::Child,
     input: std::process::ChildStdin,
     lines: std::io::Lines<std::io::BufReader<std::process::ChildStdout>>,
+    _group: EndedOnPanic,
+}
+
+/// The process group a panicking test kills as it unwinds.
+#[cfg(target_os = "macos")]
+struct EndedOnPanic(libc::pid_t);
+
+#[cfg(target_os = "macos")]
+impl Drop for EndedOnPanic {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            return;
+        }
+        // SAFETY: the group is the test's own scripted child's, which it holds unreaped.
+        if unsafe { libc::killpg(self.0, libc::SIGKILL) } != 0 {
+            eprintln!(
+                "the panicking test could not end its scripted group {}: {}",
+                self.0,
+                std::io::Error::last_os_error()
+            );
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -4940,10 +4963,12 @@ impl Scripted {
             .expect("sh, and python3, which the development shell provides");
         let input = child.stdin.take().unwrap();
         let lines = std::io::BufReader::new(child.stdout.take().unwrap()).lines();
+        let group = EndedOnPanic(libc::pid_t::try_from(child.id()).unwrap());
         Self {
             child,
             input,
             lines,
+            _group: group,
         }
     }
 
@@ -4954,9 +4979,15 @@ impl Scripted {
 
     /// The CPU microseconds the next burner to report measured itself spending.
     fn burned(&mut self) -> u64 {
+        self.reported("burned")
+    }
+
+    /// The CPU microseconds of the next line, which must report them as `what <us>`.
+    fn reported(&mut self, what: &str) -> u64 {
         let line = self.lines.next().unwrap().unwrap();
-        line.strip_prefix("burned ")
-            .unwrap_or_else(|| panic!("a burner's report, not {line:?}"))
+        line.strip_prefix(what)
+            .and_then(|rest| rest.strip_prefix(' '))
+            .unwrap_or_else(|| panic!("a {what} report, not {line:?}"))
             .parse()
             .unwrap()
     }
@@ -5160,6 +5191,25 @@ fn spinner(seconds: f64) -> String {
     )
 }
 
+/// A command line that spins in the very process it runs in, reporting `spinning <pid>` as it
+/// starts. Once it has spent `pause` seconds of its own CPU it reports `paused <us>` and holds,
+/// live, until a line arrives on its stdin; then it spins on to `seconds` of its own CPU,
+/// reports `burned <us>` and exits.
+#[cfg(target_os = "macos")]
+fn pausing_spinner(pause: f64, seconds: f64) -> String {
+    format!(
+        "python3 -c 'import os, resource, sys\n\
+         def used():\n    u = resource.getrusage(resource.RUSAGE_SELF)\n    return u.ru_utime + u.ru_stime\n\
+         def spin(until):\n    x = 0\n    while used() < until:\n        for _ in range(10000):\n            x += 1\n\
+         print(\"spinning\", os.getpid(), flush=True)\n\
+         spin({pause})\n\
+         print(\"paused\", int(used() * 1e6), flush=True)\n\
+         sys.stdin.readline()\n\
+         spin({seconds})\n\
+         print(\"burned\", int(used() * 1e6), flush=True)\n'"
+    )
+}
+
 /// The pid a spinner reported as it started.
 #[cfg(target_os = "macos")]
 fn spinning(leader: &mut Scripted) -> u32 {
@@ -5269,6 +5319,12 @@ async fn a_busy_job_reads_its_measured_cpu_share_and_its_busy_leader_as_leaf() {
 /// own CPU, although the macOS source holds none of a live child's CPU yet. The reconciliation
 /// states that difference, signed. Once the child is reaped the source holds all of it while the
 /// census holds only what it read before the child left, so no leaf is named.
+///
+/// The test waits on the child's own CPU, never on the clock: a loaded host gives a spinning
+/// child any share of a core in a given wall time. The child holds, live and unreaped, once it
+/// has spent a second of its own CPU. The test reads its lines blocking the runtime the
+/// supervisor's actor runs on, so no sampling boundary reads the child between the test's own
+/// reads: the census holds the child at its pause, half of what it spends.
 #[cfg(target_os = "macos")]
 #[tokio::test]
 async fn a_busy_child_is_the_leaf_until_the_census_no_longer_covers_the_job() {
@@ -5281,9 +5337,11 @@ async fn a_busy_child_is_the_leaf_until_the_census_no_longer_covers_the_job() {
         .await
         .unwrap();
     let job = spawned.recv().await.unwrap();
+    // `sh` gives a background command `/dev/null` for its stdin unless told otherwise: the
+    // spinner reads the leader's own, through which the test releases it.
     let mut leader = Scripted::start(&format!(
-        "{} &\nwait\necho reaped\nread line\n",
-        spinner(2.0)
+        "exec 3<&0\n{} <&3 &\nwait\necho reaped\nread line\n",
+        pausing_spinner(1.0, 2.0)
     ));
     let pid = leader.child.id();
     let child = spinning(&mut leader);
@@ -5297,7 +5355,7 @@ async fn a_busy_child_is_the_leaf_until_the_census_no_longer_covers_the_job() {
         0,
     )
     .await;
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    let paused = leader.reported("paused");
     let busy = handle.resources(job_id).await.unwrap();
     assert!(busy.consistent(), "{busy:?}");
     assert!(busy.members.contains(&child), "{:?}", busy.members);
@@ -5311,7 +5369,8 @@ async fn a_busy_child_is_the_leaf_until_the_census_no_longer_covers_the_job() {
     let reconciliation = busy.accounting.reconciliation();
     assert!(
         reconciliation.cpu_us.get() < -300_000,
-        "the source lacks the live child's CPU, stated signed: {reconciliation:?}"
+        "the source lacks the live child's {paused} us of CPU, stated signed: \
+         {reconciliation:?}"
     );
     assert_eq!(
         reconciliation.coverage,
@@ -5320,6 +5379,7 @@ async fn a_busy_child_is_the_leaf_until_the_census_no_longer_covers_the_job() {
         }
     );
 
+    leader.send("spin on");
     let burned = leader.burned();
     leader.expect("reaped");
     let reaped = handle.resources(job_id).await.unwrap();
