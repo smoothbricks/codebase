@@ -57,6 +57,13 @@ workspace policy removes static lint executors, commands, dependencies, outputs 
 override source-aware inference for every project. Project-local `nx.targets.lint` declarations retain normal Nx
 override precedence.
 
+Smoo's workspace policy also sets `"cacheDirectory": ".nx/cache"` in the root `nx.json`, and `smoo monorepo check` fails
+without it. With no `NX_*_DIRECTORY` variable set, as in a host shell, the pinned Nx otherwise moves the task cache and
+its database to a per-user `~/.nx/<id>` keyed by the repository's remote, which every checkout of the repository shares.
+A configured `cacheDirectory` keeps the cache in the checkout's `.nx/cache` and the task database in its
+`.nx/workspace-data` (nx.json has no key for the database's directory). Cowshed links both into the checkout's build
+volume, and `src/nx-state-location.test.ts` checks where this repository's host Nx resolves them.
+
 The plugin's own `nx run nx-plugin:test` aggregates four bounded Bun targets. Each uses Bun's native
 `--timings=test-timings.json --shard=N/4` partition to balance measured per-file work, while normal discovery still runs
 every test file (including newly added files) exactly once. A failed shard fails the aggregate. The shard count and
@@ -962,10 +969,10 @@ binary the target named. A script that spawns the runner itself passes
 runner, or with two (they would write one report), is judged by its exit alone.
 
 `smoo-nx-bound-failures` reads the workspace's last Nx run (`run.json` in Nx's `cacheDir`, the directory
-`StoreRunInformationLifeCycle` writes, including the shared `~/.nx/<id>/cache` when checkouts share one cache) against
-those records and prints one line per failed task. It exits 0 only when the run failed and every failed task's record,
-for that task's hash, is a `bound`; a failed task without one is not. A merge queue uses it to re-run a gate that a
-loaded host failed, and to stop on anything else. The shared file is overwritten by every run of every checkout, so this
+`StoreRunInformationLifeCycle` writes: the checkout's own `.nx/cache` under smoo's workspace policy) against those
+records and prints one line per failed task. It exits 0 only when the run failed and every failed task's record, for
+that task's hash, is a `bound`; a failed task without one is not. A merge queue uses it to re-run a gate that a loaded
+host failed, and to stop on anything else. The file holds whichever Nx run of the checkout finished last, so this
 repository's merge queue, `tooling/land-host.sh`, judges the failed tasks its own gate run names in its output against
 the same records, refuses a timeout behind a panic or failed assertion, and lands a bound only once every test of the
 task ran (`tooling/land-judge.ts`).
