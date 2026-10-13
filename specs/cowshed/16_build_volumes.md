@@ -576,6 +576,11 @@ landing volume, every Nx cache entry the target's task database indexes and the 
 the landing volume and indexed there. Only Nx's state and an absent code-graph index (below) are carried: a Cargo target
 directory is per tree and mtime-fresh, so the landing volume's is the one that matches the landed tree.
 
+The staged carry owns a shared hold on the source build volume until commit finishes or staging is abandoned; the quiet
+landing volume already owns the destination hold. These holds protect both filesystems across the daemon-close interval,
+before the later target image lock is acquired. A lifecycle regression proves the source cannot be exclusively claimed
+while staging lives and is released after commit.
+
 Stock Nx (pinned 23.2.1, `native/cache/cache.rs`) keeps an entry in three places: the directory `<cache>/<hash>` with
 the task's outputs, the file `<cache>/terminalOutputs/<hash>`, and a `cache_outputs` row in the task database
 `<workspace-data>/<machine>-v<schema>.db`, which references a `task_details` row. `put` writes the files first and the
@@ -616,6 +621,11 @@ Only target entries with one of those current-tree hashes that the workspace lac
 hashes are not copied merely because main still indexes them. Each Nx root is selected independently. An unavailable or
 failed hash computation skips the carry with the root and reason; it never falls back to copying all rows. The target's
 volume is the source and the workspace's is the destination.
+
+Both volumes' shared build holds are acquired before staging and retained through commit, including while their Nx
+daemons stop. A reseed or release must not withdraw either filesystem in that interval: Nx open locks fence database
+openers, not volume capture or collection. A refused build hold fails the carry with its side and hold path; it does not
+clear cache state or retry without the hold.
 
 Selection covers cacheable, non-continuous tasks in each root, with no configuration and with each declared
 configuration, using Nx's own task graph, per-task environment and hasher. CLI overrides are not guessed: an invocation
@@ -696,6 +706,10 @@ state directories: no Nx run cached a task into the target's volume, so a `carri
   late-entry selection tests that preserve the completed prefix without a partial entry; and a unit test in which a
   target database without `cache_outputs`, with an empty one, or absent reports `unindexed` while one indexing only
   other hashes carries 0.
+
+A directory-host regression attempts both exclusive build claims during the recorded Nx daemon's shutdown. Both are
+refused, and carry still places and indexes the selected output. SQLite refusals retain the failed statement and
+extended result code; I/O/open failures also retain SQLite's OS errno, never a stale errno from a later lock refusal.
 
 ### Stacks and merge queues
 

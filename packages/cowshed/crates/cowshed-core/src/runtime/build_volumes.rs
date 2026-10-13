@@ -208,6 +208,8 @@ pub(crate) struct Unlinked {
 #[derive(Debug)]
 pub(crate) struct Staging {
     staged: carry::Staged,
+    // The source filesystem must survive the gap between stage and commit.
+    source_hold: Option<BuildVolumeHold>,
     elapsed: Duration,
 }
 
@@ -1089,7 +1091,9 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
     /// copies are staged while both sides run. Then each side's Nx state is closed as a land
     /// closes the target's (its idle daemon stopped, any other holder a skip), and the commit
     /// runs under both sides' Nx open locks once neither database has a holder, so nothing but
-    /// the carry writes either while it indexes. A skip deletes what was staged.
+    /// the carry writes either while it indexes. Both build holds span staging through
+    /// commit: Nx open locks do not fence a reseed or release of either filesystem.
+    /// A skip deletes what was staged.
     pub async fn rebase_carry(
         &self,
         checkout: PathBuf,
@@ -1110,6 +1114,20 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
                 Ok(selections) => selections,
                 Err(reason) => return skipped(reason),
             };
+            let _workspace_hold = layout.hold(&workspace).map_err(|error| {
+                io(
+                    "hold the rebase carry destination",
+                    &layout.hold_path(&workspace),
+                    &error,
+                )
+            })?;
+            let _target_hold = layout.hold(&target).map_err(|error| {
+                io(
+                    "hold the rebase carry source",
+                    &layout.hold_path(&target),
+                    &error,
+                )
+            })?;
             let started = Instant::now();
             let into = host
                 .mount_build_volume(layout, &workspace)
@@ -1295,6 +1313,18 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
         let target = self.layout.linked(&target_checkout)?;
         let quiet = quiet.clone();
         self.blocking(move |host, layout| {
+            let source_hold = target
+                .as_ref()
+                .map(|target| {
+                    layout.hold(target).map_err(|error| {
+                        io(
+                            "hold the land carry source",
+                            &layout.hold_path(target),
+                            &error,
+                        )
+                    })
+                })
+                .transpose()?;
             let started = Instant::now();
             let staged = match target {
                 Some(target) => {
@@ -1306,6 +1336,7 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
             };
             Ok(Staging {
                 staged,
+                source_hold,
                 elapsed: started.elapsed(),
             })
         })
@@ -1320,6 +1351,7 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
         self.blocking(move |_, _| {
             let started = Instant::now();
             let carried = carry::commit(staging.staged, &quiet.mount);
+            drop(staging.source_hold);
             Ok(nx_carry(
                 carried,
                 staging.elapsed + started.elapsed(),
@@ -4810,6 +4842,196 @@ fn main() {
         assert_eq!(after.as_deref(), Some("M"));
         assert_eq!(seed_tree(), Some(landed));
         scratch.release_all();
+    }
+    /// Land stages before taking the target image lock. Its staging value must keep
+    /// the source mounted through the separate close/commit calls, not just the copy.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn directory_land_carry_retains_source_hold_until_commit() {
+        let scratch = Scratch::directory("land-carry-hold");
+        let (source_checkout, source, _) = scratch.linked_checkout("main", 1);
+        let (checkout, destination, _) = scratch.linked_checkout("topic", 1);
+        let quiet = scratch
+            .volumes
+            .quiesce(
+                scratch.landing(&checkout),
+                scratch.stopped(&checkout).await,
+                source_checkout.clone(),
+            )
+            .await
+            .unwrap()
+            .expect("the landing volume is idle");
+        let staged = scratch
+            .volumes
+            .stage(&quiet, source_checkout)
+            .await
+            .unwrap();
+        let source_during = scratch.layout.claim_release(&source).unwrap().is_none();
+        let destination_during = scratch
+            .layout
+            .claim_release(&destination)
+            .unwrap()
+            .is_none();
+        let result = scratch.volumes.commit(staged, &quiet).await.unwrap();
+        let source_after = scratch.layout.claim_release(&source).unwrap().is_some();
+        drop(quiet);
+        let destination_after = scratch
+            .layout
+            .claim_release(&destination)
+            .unwrap()
+            .is_some();
+        scratch.release_all();
+        assert!(
+            source_during,
+            "staging must retain the source build hold until commit"
+        );
+        assert!(
+            destination_during,
+            "the quiet landing volume retains its existing hold"
+        );
+        assert!(
+            source_after && destination_after,
+            "finished carry releases its holds"
+        );
+        assert!(result.stopped.is_none(), "{result:?}");
+    }
+
+    /// Closing the idle Nx daemon creates a gap with no database holder. A reseed's
+    /// exclusive build claim must still fail on both volumes until carry commits.
+    /// On SIGTERM this fixture attempts exactly that claim, and hides only its own
+    /// source database when admitted, modeling the database path during a detached seal.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn directory_rebase_carry_holds_both_volumes_across_daemon_stop() {
+        use cowshed_os::fork_lock::{Run as _, Spawn as _};
+
+        let scratch = Scratch::directory("carry-seal");
+        let (source_checkout, source, from) = scratch.linked_checkout("main", 1);
+        let (checkout, destination, into) = scratch.linked_checkout("topic", 1);
+        let state = BuildVolumeState {
+            paths: vec![
+                BuildStatePath::new(".nx/cache", "nx/cache").unwrap(),
+                BuildStatePath::new(".nx/workspace-data", "nx/workspace-data").unwrap(),
+            ],
+            fingerprint: None,
+        };
+        let schema = "CREATE TABLE task_details (hash TEXT PRIMARY KEY NOT NULL, project TEXT NOT NULL, target TEXT NOT NULL, configuration TEXT); CREATE TABLE cache_outputs (hash TEXT PRIMARY KEY NOT NULL, code INTEGER NOT NULL, size INTEGER NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, accessed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY (hash) REFERENCES task_details(hash));";
+        for mount in [&from, &into] {
+            state.write(mount).unwrap();
+            fs::create_dir_all(mount.join("nx/workspace-data")).unwrap();
+            let made = std::process::Command::new("/usr/bin/sqlite3")
+                .arg(mount.join("nx/workspace-data/task.db"))
+                .arg(schema)
+                .output_locked()
+                .unwrap();
+            assert!(made.status.success(), "{made:?}");
+        }
+        let source_database = from.join("nx/workspace-data/task.db");
+        let seeded = std::process::Command::new("/usr/bin/sqlite3")
+            .arg(&source_database)
+            .arg("INSERT INTO task_details VALUES ('1', 'a', 'build', NULL); INSERT INTO cache_outputs (hash,code,size) VALUES ('1',0,4);")
+            .output_locked()
+            .unwrap();
+        assert!(seeded.status.success(), "{seeded:?}");
+        fs::create_dir_all(from.join("nx/cache/1")).unwrap();
+        fs::write(from.join("nx/cache/1/output"), b"warm").unwrap();
+        for id in [&source, &destination] {
+            drop(scratch.layout.hold(id).unwrap());
+        }
+        let sockets = Path::new("/tmp").join(format!(
+            "cs-carry-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..12]
+        ));
+        fs::create_dir_all(&sockets).unwrap();
+        let socket = sockets.join("d.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let admission = sockets.join("admission");
+        let data = from.join("nx/workspace-data");
+        fs::create_dir_all(data.join(nx::DAEMON_DIRECTORY)).unwrap();
+        let mut daemon = std::process::Command::new("/usr/bin/perl")
+            .args([
+                "-e",
+                r#"use Fcntl qw(:flock);
+                my ($source, $destination, $database, $out) = @ARGV;
+                $SIG{TERM} = sub {
+                    open(my $o, '>', $out) or die "open $out: $!";
+                    for my $hold ($source, $destination) {
+                        open(my $h, '+<', $hold) or die "open $hold: $!";
+                        if (flock($h, LOCK_EX | LOCK_NB)) {
+                            print $o "claimed\n";
+                            if ($hold eq $source) {
+                                rename($database, "$database.sealed") or die "hide $database: $!";
+                            }
+                        } else { print $o "refused\n"; }
+                    }
+                    close $o;
+                    exit 0;
+                };
+                $| = 1; print "ready\n";
+                select(undef, undef, undef, 600) while 1;"#,
+            ])
+            .arg(scratch.layout.hold_path(&source))
+            .arg(scratch.layout.hold_path(&destination))
+            .arg(&source_database)
+            .arg(&admission)
+            .current_dir(&data)
+            .stdout(std::process::Stdio::piped())
+            .spawn_locked()
+            .unwrap();
+        let mut ready = String::new();
+        std::io::BufRead::read_line(
+            &mut std::io::BufReader::new(daemon.stdout.take().unwrap()),
+            &mut ready,
+        )
+        .unwrap();
+        assert_eq!(ready, "ready\n");
+        fs::write(
+            data.join(nx::DAEMON_DIRECTORY).join("server-process.json"),
+            serde_json::json!({ "processId": daemon.id(), "socketPath": socket }).to_string(),
+        )
+        .unwrap();
+        let result = scratch
+            .volumes
+            .rebase_carry(
+                checkout,
+                source_checkout,
+                Ok(BTreeMap::from([(
+                    PathBuf::from(".nx"),
+                    nx::TaskSelection {
+                        hashes: BTreeSet::from(["1".to_owned()]),
+                        deferred: BTreeSet::new(),
+                    },
+                )])),
+            )
+            .await;
+        let stopped = daemon.try_wait().unwrap();
+        if stopped.is_none() {
+            daemon.kill().unwrap();
+            daemon.wait().unwrap();
+        }
+        let attempted = fs::read_to_string(&admission).unwrap_or_default();
+        let output = fs::read(into.join("nx/cache/1/output")).ok();
+        let rows = std::process::Command::new("/usr/bin/sqlite3")
+            .arg(into.join("nx/workspace-data/task.db"))
+            .arg("SELECT count(*) FROM cache_outputs WHERE hash = '1';")
+            .output_locked()
+            .unwrap();
+        drop(listener);
+        fs::remove_dir_all(sockets).unwrap();
+        scratch.release_all();
+        assert!(stopped.is_some(), "the carry stopped the recorded daemon");
+        assert_eq!(
+            attempted, "refused\nrefused\n",
+            "both volume claims must be refused; carry: {result:?}"
+        );
+        let RebaseBuildVolume::Carried { carried, .. } = result.unwrap() else {
+            panic!("carry was skipped")
+        };
+        assert_eq!(carried.entries, 1, "{carried:?}");
+        assert!(carried.stopped.is_none(), "{carried:?}");
+        assert_eq!(output.as_deref(), Some(b"warm".as_slice()));
+        assert!(rows.status.success(), "{rows:?}");
+        assert_eq!(rows.stdout, b"1\n");
     }
 
     /// A shed's daemon keeper answers the reseed's stop of its daemon by admitting a start job
