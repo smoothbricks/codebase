@@ -10,6 +10,7 @@ import {
   type CloudflareZone,
   type D1DatabaseRecord,
   type DnsRecord,
+  type DurableObjectNamespace,
   type R2Bucket,
   type WorkerDomain,
   type WorkerRoute,
@@ -269,6 +270,10 @@ class FakeCloudflare implements CloudflareClient {
   async listD1Databases(): Promise<D1DatabaseRecord[]> {
     this.reads.push('d1');
     return this.d1Databases;
+  }
+  async listDurableObjectNamespaces(): Promise<DurableObjectNamespace[]> {
+    this.reads.push('durable-objects');
+    return [];
   }
   async createD1Database(name: string): Promise<D1DatabaseRecord> {
     const record = { uuid: `d1-${name}`, name };

@@ -44,6 +44,11 @@ export interface D1DatabaseRecord {
   name: string;
 }
 
+/** One Durable Object namespace; the account holds at most 500 (Cloudflare error 10067 past that). */
+export interface DurableObjectNamespace {
+  id: string;
+}
+
 export interface CloudflareClient {
   listKvNamespaces(): Promise<LiveKvNamespace[]>;
   createKvNamespace(title: string): Promise<LiveKvNamespace>;
@@ -74,6 +79,8 @@ export interface CloudflareClient {
   listD1Databases(): Promise<D1DatabaseRecord[]>;
   createD1Database(name: string): Promise<D1DatabaseRecord>;
   deleteD1Database(uuid: string): Promise<void>;
+  /** Counted by the stage sweep: a Worker's namespaces outlive nothing but the Worker itself. */
+  listDurableObjectNamespaces(): Promise<DurableObjectNamespace[]>;
 }
 
 /**
@@ -116,6 +123,7 @@ const isDnsRecords = typia.createIs<DnsRecord[]>();
 const isD1Databases = typia.createIs<D1DatabaseRecord[]>();
 const isCreatedD1Database = typia.createIs<D1DatabaseRecord>();
 const isR2Objects = typia.createIs<Array<{ key: string }>>();
+const isDurableObjectNamespaces = typia.createIs<DurableObjectNamespace[]>();
 const isR2BucketPage = typia.createIs<{ buckets: R2Bucket[] }>();
 const isR2ObjectPage = typia.createIs<{ objects: Array<{ key: string }> }>();
 const isCreatedKvNamespace = typia.createIs<LiveKvNamespace>();
@@ -322,6 +330,14 @@ export class CloudflareRestClient implements CloudflareClient {
 
   listD1Databases(): Promise<D1DatabaseRecord[]> {
     return this.listPages(`${this.accountPath}/d1/database`, isD1Databases, PAGE_SIZE);
+  }
+
+  listDurableObjectNamespaces(): Promise<DurableObjectNamespace[]> {
+    return this.listPages(
+      `${this.accountPath}/workers/durable_objects/namespaces`,
+      isDurableObjectNamespaces,
+      PAGE_SIZE,
+    );
   }
 
   async createD1Database(name: string): Promise<D1DatabaseRecord> {
