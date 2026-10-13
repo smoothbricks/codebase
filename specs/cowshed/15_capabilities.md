@@ -65,10 +65,10 @@ fingerprint also folds in a discovery revision, so a cowshed that asks different
 earlier discovery's answer, findings included. Caller environment and untracked config are not fingerprint inputs.
 Cargo's contribution drops caller `CARGO_TARGET_DIR` so where a job writes depends on the tracked project files, exactly
 the fingerprint's inputs, not an unrelated shell's override. Forks inherit the snapshot and fixed links without
-rediscovery. Nx contributes `.nx/cache` and `.nx/workspace-data`. `.codegraph/` is an index on the source volume, not
-build state: an indexing server's long-lived database descriptors must not block every seed refresh. Existing owned
-fixed index links are migrated by the verified, writer-excluded cutover in 16_build_volumes.md §"One link per checkout";
-foreign links are never touched.
+rediscovery. Nx contributes `.nx/cache` and `.nx/workspace-data`. Codegraph contributes each detected project's
+`.codegraph/` index as build state, held at the project's `codegraph` path on the build volume. The root index uses the
+fixed link `.codegraph -> .cowshed/build/codegraph` and is cloned and adopted with that volume, not migrated to the
+source volume (16_build_volumes.md, "Owned index links").
 
 A detected JavaScript package manager (Bun, npm or pnpm) contributes the `node_modules/.cache` of every package it
 installed: a tracked `package.json` beside a real `node_modules` directory, below the capability's selected directory
