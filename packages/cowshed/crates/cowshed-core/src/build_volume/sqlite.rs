@@ -2,7 +2,7 @@
 //! system library macOS ships in `/usr/lib`. Nx keeps its cache index in SQLite; reading and
 //! extending it through SQLite itself is what keeps a database another process wrote, its
 //! write-ahead log included, consistent. A crate would add a C build or a second copy of the
-//! library for eleven functions.
+//! library for a small FFI surface.
 
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::io;
@@ -42,6 +42,8 @@ unsafe extern "C" {
     ) -> c_int;
     fn sqlite3_close_v2(database: *mut Sqlite3) -> c_int;
     fn sqlite3_errmsg(database: *mut Sqlite3) -> *const c_char;
+    fn sqlite3_extended_errcode(database: *mut Sqlite3) -> c_int;
+    fn sqlite3_system_errno(database: *mut Sqlite3) -> c_int;
     fn sqlite3_prepare_v2(
         database: *mut Sqlite3,
         sql: *const c_char,
@@ -57,6 +59,7 @@ unsafe extern "C" {
         destructor: Option<unsafe extern "C" fn(*mut c_void)>,
     ) -> c_int;
     fn sqlite3_step(statement: *mut Sqlite3Stmt) -> c_int;
+    fn sqlite3_sql(statement: *mut Sqlite3Stmt) -> *const c_char;
     fn sqlite3_column_text(statement: *mut Sqlite3Stmt, column: c_int) -> *const u8;
     fn sqlite3_column_bytes(statement: *mut Sqlite3Stmt, column: c_int) -> c_int;
     fn sqlite3_column_int64(statement: *mut Sqlite3Stmt, column: c_int) -> i64;
@@ -133,9 +136,23 @@ impl Connection {
     }
 
     fn error(&self, context: &str) -> io::Error {
-        // SAFETY: the handle is open; SQLite owns the message until the next call on it.
+        // SAFETY: the handle is open. SQLite retains an extended result code for
+        // this failure, unlike the thread's errno, which unrelated calls overwrite.
+        let code = unsafe { sqlite3_extended_errcode(self.database.as_ptr()) };
+        // SAFETY: SQLite owns this message until the next operation on the handle.
         let message = unsafe { CStr::from_ptr(sqlite3_errmsg(self.database.as_ptr())) };
-        io::Error::other(format!("sqlite: {context}: {}", message.to_string_lossy()))
+        let message = message.to_string_lossy();
+        if matches!(code & 0xff, 10 | 14) {
+            // SQLITE_IOERR / SQLITE_CANTOPEN: only these errors give system_errno
+            // meaning. A later SQLITE_BUSY can retain an older ENOENT in that slot.
+            // SAFETY: the handle is still open; this call only reads its error state.
+            let errno = unsafe { sqlite3_system_errno(self.database.as_ptr()) };
+            io::Error::other(format!(
+                "sqlite: {context}: {message} (code {code}, system errno {errno})"
+            ))
+        } else {
+            io::Error::other(format!("sqlite: {context}: {message} (code {code})"))
+        }
     }
 }
 
@@ -179,13 +196,19 @@ impl Statement<'_> {
         Ok(())
     }
 
-    /// Advance to the next row: `true` while one is current, `false` once the statement is done.
     pub fn step(&mut self) -> io::Result<bool> {
         // SAFETY: the statement is live.
         match unsafe { sqlite3_step(self.statement.as_ptr()) } {
             SQLITE_ROW => Ok(true),
             SQLITE_DONE => Ok(false),
-            _ => Err(self.connection.error("step")),
+            _ => {
+                // SAFETY: sqlite3_prepare_v2 retains the original SQL for this live
+                // statement. Bound parameter values are not expanded into it.
+                let sql = unsafe { CStr::from_ptr(sqlite3_sql(self.statement.as_ptr())) };
+                Err(self
+                    .connection
+                    .error(&format!("step {}", sql.to_string_lossy())))
+            }
         }
     }
 
@@ -226,4 +249,59 @@ pub(super) fn c_path(path: &Path) -> io::Result<CString> {
             format!("path contains an interior NUL: {}", path.display()),
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn errors_distinguish_missing_attach_from_busy_database() {
+        let root = std::env::temp_dir().join(format!(
+            "cowshed-sqlite-error-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("task.db");
+        std::fs::write(&path, b"").unwrap();
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute("CREATE TABLE witness (id INTEGER)", &[])
+            .unwrap();
+        let missing = root.join("missing/source.db");
+        let error = connection
+            .execute(
+                "ATTACH DATABASE ?1 AS previous",
+                &[&missing.to_string_lossy()],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("step ATTACH DATABASE ?1 AS previous"),
+            "{error}"
+        );
+        assert!(error.contains(&missing.display().to_string()), "{error}");
+        assert!(error.contains("code 14, system errno 2"), "{error}");
+
+        let mut insert = connection
+            .prepare("INSERT INTO witness VALUES (1)")
+            .unwrap();
+        let holder = Connection::open(&path).unwrap();
+        holder.execute("BEGIN EXCLUSIVE", &[]).unwrap();
+        let error = insert.step().unwrap_err().to_string();
+        assert!(
+            error.contains("step INSERT INTO witness VALUES (1)"),
+            "{error}"
+        );
+        assert!(error.contains("code 5"), "{error}");
+        assert!(
+            !error.contains("system errno"),
+            "a busy result must not report the earlier ENOENT: {error}"
+        );
+        holder.execute("ROLLBACK", &[]).unwrap();
+        drop(insert);
+        drop(holder);
+        drop(connection);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
