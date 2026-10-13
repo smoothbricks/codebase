@@ -125,38 +125,6 @@ fn finish_real_image_test(result: Result<(), ApfsError>, cleanup: RealImageClean
         }
     }
 }
-/// A real attachment holds its image file exclusively, so growing it is refused outright and
-/// nothing is written; once detached, the grow lands and Apple's own limits report it.
-#[cfg(target_os = "macos")]
-#[test]
-fn real_apfs_grow_refuses_an_attached_image_and_lands_once_detached() {
-    let root = ScratchRoot::new("image-grow").expect("scratch root");
-    let image = root.path().join("image").with_extension(IMAGE_EXTENSION);
-    let backend = MacOsApfsBackend::new(SystemCommandRunner);
-    let mut cleanup = RealImageCleanup::new(&backend, image.clone());
-    let result = (|| -> Result<(), ApfsError> {
-        crate::blank_image::blank_image(&image);
-        let created = image.as_path();
-        let attachment = cleanup.track(backend.attach_verified(created)?);
-        assert!(attachment.whole_device().starts_with("/dev/disk"));
-        assert!(attachment.volume_device().starts_with("/dev/disk"));
-        let refused = SystemCommandRunner
-            .grow_image(created, capacity("2g"))
-            .expect_err("an attached image's file is held exclusively");
-        assert_eq!(refused.kind(), io::ErrorKind::WouldBlock, "{refused}");
-        assert!(matches!(
-            backend.resize_image(created, capacity("2g")),
-            Err(ApfsError::FileOperation { operation: "grow RAW image", source, .. })
-                if source.kind() == io::ErrorKind::WouldBlock
-        ));
-        backend.detach(attachment, DetachIntent::Release)?;
-        assert_eq!(backend.image_capacity(created)?, capacity("1g"));
-        backend.resize_image(created, capacity("2g"))?;
-        assert_eq!(backend.image_capacity(created)?, capacity("2g"));
-        Ok(())
-    })();
-    finish_real_image_test(result, cleanup);
-}
 #[cfg(target_os = "macos")]
 fn lease_test_image(staged_stem: PathBuf, volume_name: &str) -> CreateImageRequest {
     CreateImageRequest {
@@ -216,9 +184,15 @@ impl Drop for TestPaths {
 /// mount; native unmount; detach — while a real detach of A, started first, waits. Under a
 /// host-wide lease B could not begin; without a per-image lease A's detach would not wait
 /// for the release. Aliases of A's file (a symlinked parent, a hard link) take other leases
-/// yet gain nothing: the inventory never maps them, so they can neither verify nor release
-/// A's device. Every wait is an event; the only deadline is the hang bound, and it names the
-/// step still open.
+/// yet gain nothing: the inventory never maps them, so they cannot release A's device, and A's
+/// attachment holds the file exclusively against an open through either of them, so neither
+/// can take it from A — checked without spending an attach of its own. Every wait is an
+/// event; the only deadline is the hang bound, and it names the step still open.
+///
+/// A's attachment is also the image-growth witness, so growth spends no attach of its own: a
+/// real attachment holds its image file exclusively (01_storage.md, "Images"), so growing A
+/// while attached is refused outright and nothing is written; once A is detached, the grow
+/// lands and A's capacity reports it.
 #[cfg(target_os = "macos")]
 #[test]
 fn real_apfs_image_leases_overlap_across_images_and_exclude_within_one() {
@@ -253,6 +227,18 @@ fn real_apfs_image_leases_overlap_across_images_and_exclude_within_one() {
     let result = (|| -> Result<(), ApfsError> {
         crate::blank_image::blank_image(&image_a);
         let attachment = cleanup_a.track(backend.attach_verified(&image_a)?);
+        assert!(attachment.whole_device().starts_with("/dev/disk"));
+        assert!(attachment.volume_device().starts_with("/dev/disk"));
+        // Before A's lease is held below, since resizing takes it.
+        let refused = SystemCommandRunner
+            .grow_image(&image_a, capacity("2g"))
+            .expect_err("an attached image's file is held exclusively");
+        assert_eq!(refused.kind(), io::ErrorKind::WouldBlock, "{refused}");
+        assert!(matches!(
+            backend.resize_image(&image_a, capacity("2g")),
+            Err(ApfsError::FileOperation { operation: "grow RAW image", source, .. })
+                if source.kind() == io::ErrorKind::WouldBlock
+        ));
 
         std::os::unix::fs::symlink(image_a.parent().expect("temp parent"), &alias_parent)
             .expect("symlinked-parent alias");
@@ -265,22 +251,27 @@ fn real_apfs_image_leases_overlap_across_images_and_exclude_within_one() {
             .expect("production takes a real lease");
         assert_lease_excludes_another_descriptor(&held);
 
-        // Each alias takes its own lease, so these run while A's is held; none may verify
-        // or disturb A's attachment.
+        // Each alias takes its own lease, so these run while A's is held; none may take A's
+        // file or disturb A's attachment. No alias is attached: its inventory key is its own
+        // path, so an attach would reach `diskutil image attach` and spend a host attach. The
+        // inventory shows no alias owns a device, and the exclusive open shows A holds the file.
         for alias in [&symlinked, &hard_link] {
             assert!(
                 backend.recovered_image_attachment(alias)?.is_none(),
                 "{} has an inventory mapping of its own",
                 alias.display()
             );
-            if let Ok(foreign) = backend.attach_verified(alias) {
-                let released = backend.detach(&foreign, DetachIntent::Release);
-                panic!(
-                    "{} verified device {}: {released:?}",
-                    alias.display(),
-                    foreign.whole_device()
-                );
-            }
+            let refused = SystemCommandRunner
+                .grow_image(alias, capacity("2g"))
+                .expect_err("A's attachment holds the file every alias names");
+            assert_eq!(
+                refused.kind(),
+                io::ErrorKind::WouldBlock,
+                "{}: {refused}",
+                alias.display()
+            );
+            // Releases only the alias's own (empty) inventory, never A's device.
+            backend.release_every_attachment(alias, DetachIntent::Release)?;
             match backend.recovered_image_attachment(&image_a)? {
                 Some(RecoveredImageAttachment::Apfs(still)) => assert_eq!(
                     (still.whole_device(), still.volume_device()),
@@ -363,6 +354,9 @@ fn real_apfs_image_leases_overlap_across_images_and_exclude_within_one() {
             backend.recovered_image_attachment(&image_a)?.is_none(),
             "A's detach released its own device"
         );
+        assert_eq!(backend.image_capacity(&image_a)?, capacity("1g"));
+        backend.resize_image(&image_a, capacity("2g"))?;
+        assert_eq!(backend.image_capacity(&image_a)?, capacity("2g"));
         Ok(())
     })();
     finish_real_image_test(result, cleanup_a);
@@ -388,7 +382,9 @@ const FIXTURE_WORKER: &str = "cowshed-test-fixture-worker=";
 /// timed-out test started kept running in its deleted root. The run's worker stands in for
 /// that daemon: a process the run started that outlives it, selected, as the daemon is, by its
 /// working directory alone. The run attaches one RAW image and one retained ASIF input, as
-/// a failed re-adoption leaves both formats, so teardown and sweep must release both.
+/// a failed re-adoption leaves both formats, so teardown and sweep must release both. The RAW
+/// image is mounted, so teardown also unmounts; the ASIF input is only attached, all its
+/// release needs, so it spends no mount.
 #[cfg(target_os = "macos")]
 #[test]
 fn real_apfs_fixture_runs_leave_nothing_attached_or_running_however_they_end() {
@@ -530,9 +526,10 @@ const FIXTURE_KILL_ROOT: &str = "COWSHED_TEST_FIXTURE_KILL_ROOT";
 /// kills a tree — SIGTERM to every process working in its root, then SIGKILL to the
 /// caller itself — mid-attach. The detached disk-image command finishes regardless, so
 /// the next invocation (this parent, after the kill) finds the image attached and
-/// releases it cleanly: no whole device of the image remains, nothing keeps running in its
-/// root, and no diskimagesiod is orphaned. The host's leaked-device count is the lane's
-/// check (specs/cowshed/08_testing.md, "Host limit"), not one test's on a shared host.
+/// releases it cleanly: no whole device of the image remains, no image driver still holds the
+/// file, nothing keeps running in its root, and no diskimagesiod is orphaned. The host's
+/// leaked-device count is the lane's check (specs/cowshed/08_testing.md, "Host limit"), not one
+/// test's on a shared host.
 #[cfg(target_os = "macos")]
 #[test]
 fn real_apfs_a_disk_image_attach_survives_its_callers_kill() {
@@ -548,7 +545,8 @@ fn real_apfs_a_disk_image_attach_survives_its_callers_kill() {
             .unwrap_or_default();
     let root = ScratchRoot::new_owned("fixture-kill").expect("owned scratch root");
     let image = root.path().join("attach.dmg");
-    let mut cleanup = RealImageCleanup::new(&backend, image.clone());
+    // Releases and deletes the image if the test fails before it does.
+    let _cleanup = RealImageCleanup::new(&backend, image.clone());
     let mut child = Command::new(std::env::current_exe().expect("test binary"))
         .args([
             "--exact",
@@ -638,16 +636,16 @@ fn real_apfs_a_disk_image_attach_survives_its_callers_kill() {
             .is_empty(),
         "the released image is still attached"
     );
-    // The lock is free: a fresh attach and detach of the same image both work, and the
-    // detached image is deleted.
-    cleanup.track(
-        backend
-            .attach_verified(&image)
-            .expect("attach the released image again"),
-    );
-    cleanup
-        .finish()
-        .expect("detach the released image and delete it");
+    // The image is free to attach again: an attachment holds its file exclusively
+    // (01_storage.md, "Images"), and detached growth's own nonblocking exclusive open
+    // succeeds, so no image driver still holds it — proved without another attach. The
+    // released image is then deleted, so a passing run retains no fixture.
+    SystemCommandRunner
+        .grow_image(&image, capacity("2g"))
+        .expect("no image driver still holds the released image");
+    backend
+        .delete_image(&image)
+        .expect("delete the released image");
     assert_eq!(
         crate::scratch_apfs::processes::processes_in(in_root).expect("list the root"),
         [],
@@ -730,14 +728,20 @@ fn real_apfs_fixture_run_ended_by_its_parent() {
     };
     let root = ScratchRoot::new_owned("fixture-run").expect("owned scratch root");
     let backend = MacOsApfsBackend::new(SystemCommandRunner);
-    for (name, extension, access) in [
-        ("first", IMAGE_EXTENSION, MountAccess::ReadWrite),
-        ("retained/second", "asif", MountAccess::ReadOnly),
-    ] {
+    for (name, extension) in [("first", IMAGE_EXTENSION), ("retained/second", "asif")] {
         let image = root.path().join(name).with_extension(extension);
         let raw = image.with_extension(IMAGE_EXTENSION);
         crate::blank_image::blank_image(&raw);
-        if extension != IMAGE_EXTENSION {
+        if extension == IMAGE_EXTENSION {
+            let mount = root.path().join(format!("{name}-volume"));
+            fs::create_dir(&mount).expect("a fixture mountpoint");
+            let attachment = backend
+                .attach_verified(&image)
+                .expect("attach a RAW fixture");
+            backend
+                .mount(&attachment, &mount, MountAccess::ReadWrite, false)
+                .expect("mount RAW fixture");
+        } else {
             let converted = SystemCommandRunner
                 .run(&CommandRequest::new(
                     "/usr/sbin/diskutil",
@@ -763,29 +767,13 @@ fn real_apfs_fixture_run_ended_by_its_parent() {
                 ),
                 "ordinary runtime attachment still refuses a retained ASIF input"
             );
-        }
-        let mount = root.path().join(format!("{name}-volume"));
-        fs::create_dir(&mount).expect("a fixture mountpoint");
-        match access {
-            MountAccess::ReadWrite => {
-                let attachment = backend
-                    .attach_verified(&image)
-                    .expect("attach a RAW fixture");
-                backend
-                    .mount(&attachment, &mount, access, false)
-                    .expect("mount RAW fixture");
-            }
-            MountAccess::ReadOnly => {
-                let record = FixtureRetainedInput(&image);
-                let input = RetainedInput::named_by(&record, &image)
-                    .expect("the fixture records only its own converted input");
-                let attachment = backend
-                    .attach_retained_verified(&input)
-                    .expect("attach the recorded historical input");
-                backend
-                    .mount_retained_read_only(&attachment, &mount)
-                    .expect("mount retained fixture read-only");
-            }
+            // Attached only: its release is the claim, and a mount would add none.
+            let record = FixtureRetainedInput(&image);
+            let input = RetainedInput::named_by(&record, &image)
+                .expect("the fixture records only its own converted input");
+            backend
+                .attach_retained_verified(&input)
+                .expect("attach the recorded historical input");
         }
         println!("{FIXTURE_IMAGE}{}", image.display());
     }
