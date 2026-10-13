@@ -18,6 +18,8 @@
 //! image is a deliberate registry entry, not an accident of a new test. The few tests that prove
 //! attach or detach behaviour itself drive the production host directly and name that in their
 //! docs. A later lane run detaches a previous run's pool images before attaching its own.
+//! Mount and unmount output capture uses the fork-safe `Run::output_locked` path, so fixture
+//! commands obey the same process-launch lock as production commands.
 //!
 //! `#[path]`-included beside [`super::scratch_apfs`]. The template directory spells no pid, so no
 //! sweep reclaims it.
