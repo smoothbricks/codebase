@@ -453,9 +453,7 @@ fn missing_revision() -> ForkOptions {
         ..ForkOptions::default()
     }
 }
-
 #[tokio::test]
-
 async fn a_create_interrupted_after_its_pending_clone_exists_still_resumes() {
     // One adopted project proves both journal spellings (08_testing.md, "Host limit"): the
     // current binary's `Mutating` create, and an older binary's `Prepared` one — binaries
@@ -463,42 +461,19 @@ async fn a_create_interrupted_after_its_pending_clone_exists_still_resumes() {
     // not its phase, is what recovery decides on.
     let fixture = Fixture::new("mutating-create");
     let runtime = fixture.adopt().await;
-    fixture.plant_workspace_branch("resumed");
-
-    fixture
-        .mint(&runtime, "resumed", ForkOptions::default())
-        .await
-        .expect_err("the clone's initializer refuses the inherited workspace branch");
+    for workspace in ["resumed", "legacy"] {
+        fixture.plant_workspace_branch(workspace);
+        fixture
+            .mint(&runtime, workspace, ForkOptions::default())
+            .await
+            .expect_err("the clone's initializer refuses the inherited workspace branch");
+    }
     let record = fixture
         .intent("resumed")
         .expect("the intent stays journaled");
     assert_eq!(record.phase, LifecycleIntentPhase::Mutating);
     assert_eq!(record.completion, None);
-    assert_eq!(fixture.listed(&runtime).await, ["main"]);
-    runtime
-        .shutdown()
-        .await
-        .expect("stop the interrupted runtime");
-
-    let gc = fixture.gc().await;
-    assert_eq!(fixture.listed(&gc).await, ["main", "resumed"]);
-    assert!(completed(fixture.intent("resumed")));
-    gc.shutdown().await.expect("stop gc");
-}
-
-/// Binaries before the `Mutating` mark journaled every create `Prepared`. Its pending clone,
-/// not its phase, is what recovery decides on.
-#[tokio::test]
-async fn an_older_binarys_prepared_create_with_a_pending_clone_still_resumes() {
-    let fixture = Fixture::new("legacy-create");
-    let runtime = fixture.adopt().await;
-    fixture.plant_workspace_branch("resumed");
-
-    fixture
-        .mint(&runtime, "resumed", ForkOptions::default())
-        .await
-        .expect_err("the clone's initializer refuses the inherited workspace branch");
-    fixture.strip_phase("resumed");
+    fixture.strip_phase("legacy");
     assert_eq!(
         fixture.intent("legacy").expect("legacy intent").phase,
         LifecycleIntentPhase::Prepared
