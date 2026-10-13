@@ -209,6 +209,16 @@ impl DirectoryExecutionHost {
         let from = layout.image(source);
         let to = layout.image(destination);
         self.require_store_image(&to)?;
+        // A tree copy of a held volume would capture a half-written state: refuse, naming
+        // the holders, as a non-forced detach of the mounted volume would.
+        let open = holders_of(&from)?;
+        if !open.is_empty() {
+            return Err(ApfsStorageError::BuildVolumeHeld {
+                image: from,
+                hold: layout.hold_path(source),
+                open,
+            });
+        }
         let hold = layout.hold_path(destination);
         let _creating = layout
             .hold_new(destination)

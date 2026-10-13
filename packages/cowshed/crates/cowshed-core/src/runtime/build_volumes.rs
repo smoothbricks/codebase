@@ -1738,6 +1738,9 @@ fn seal(
     drop(builds);
     match host.clone_quiet_build_volume(layout, quiet, &BuildVolumeId::mint(), record) {
         Ok(()) => Ok(Ok(Sealed::Captured)),
+        Err(ApfsStorageError::BuildVolumeHeld { image, open, .. }) => Ok(Ok(Sealed::Refused {
+            reason: volume_busy_reason(&image, &open),
+        })),
         Err(ApfsStorageError::Apfs(error)) if cowshed_apfs::detach_was_dissented(&error) => {
             Ok(Ok(Sealed::Refused {
                 reason: error.to_string(),
@@ -1745,6 +1748,20 @@ fn seal(
         }
         Err(error) => Err(storage(error)),
     }
+}
+
+/// Why a non-forced capture refused, naming every holder: the directory backend's form of a
+/// dissented detach, in the words the native capture refusal uses.
+fn volume_busy_reason(image: &Path, open: &[cowshed_os::process::Holder]) -> String {
+    let holders = open
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "build volume {} is in use by {holders}; nothing was forced: close what holds it and run the command again",
+        image.display()
+    )
 }
 
 /// Delete `previous`, the seeds of `target` a new one replaced. A seed is never mounted and no
@@ -1954,9 +1971,9 @@ fn reseed(host: &impl RuntimeStorageHost, layout: &BuildVolumeLayout, target: &O
         ),
     ) {
         Ok(()) => {}
-        Err(error @ ApfsStorageError::BuildVolumeHeld { .. }) => {
+        Err(ApfsStorageError::BuildVolumeHeld { image, open, .. }) => {
             return skipped(ReseedSkip::VolumeBusy {
-                reason: error.to_string(),
+                reason: volume_busy_reason(&image, &open),
             });
         }
         Err(ApfsStorageError::Apfs(error)) if cowshed_apfs::detach_was_dissented(&error) => {
@@ -2910,7 +2927,7 @@ fn main() {
     async fn freeze_with_running_cargo(profile: &str, enumerate_before_start: bool) {
         use tokio::io::AsyncWriteExt as _;
 
-        let scratch = Scratch::directory("seed-cargo-admission");
+        let scratch = Scratch::directory("seed-cargo");
         let (main_checkout, _, _) = scratch.linked_checkout("main", 1);
         let (topic_checkout, _, mount) = scratch.linked_checkout("topic", 1);
         let state = BuildVolumeState {
