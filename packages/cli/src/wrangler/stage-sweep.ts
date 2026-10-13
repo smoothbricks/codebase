@@ -163,12 +163,51 @@ export async function sweepRepositoryStages(
   const cloudflare =
     dependencies.cloudflare ??
     new CloudflareRestClient(accountId, apiToken, undefined, processEnv.CLOUDFLARE_API_BASE_URL);
+  // In CI the forge names the repository (and stageRecordScope has checked it against the manifest). A
+  // local run may infer it only for a github.com repository: asking GitHub about another forge's
+  // owner/repo would read an unrelated pull request's state and could delete a live stage.
+  const forgeNamed = Boolean(processEnv.GITHUB_REPOSITORY || processEnv.FORGEJO_REPOSITORY);
+  const github = /^github\.com\/([^/]+\/[^/]+)$/.exec(scope);
+  // Inference is for a plain local shell only: any forge setting means the shell already speaks to some
+  // forge, and guessing which one (or whose token GH_TOKEN holds) could read the wrong pull requests.
+  const forgeSettings = [
+    'FORGEJO_ACTIONS',
+    'FORGEJO_SERVER_URL',
+    'FORGEJO_API_URL',
+    'FORGEJO_TOKEN',
+    'GITHUB_SERVER_URL',
+    'GITHUB_API_URL',
+  ];
+  if (!forgeNamed && (!github || forgeSettings.some((name) => processEnv[name]))) {
+    throw new Error(
+      `Cannot tell which forge ${scope} is on; set GITHUB_REPOSITORY (or FORGEJO_SERVER_URL and FORGEJO_REPOSITORY) to name it.`,
+    );
+  }
+  const forgeEnv = forgeNamed || !github ? processEnv : { ...processEnv, GITHUB_REPOSITORY: github[1] };
+  // Whichever variable named it, the repository whose pull requests are read must be the one whose
+  // records are cleaned: another repository's closed #N says nothing about this repository's prN. In CI
+  // the runner may know its forge by an internal address, so the forge's host and path are compared only
+  // outside CI.
+  const { repository, htmlBase, apiBase } = ciApiContext(forgeEnv);
+  const forge = new URL(htmlBase);
+  const forgeScope = `${forge.hostname}${forge.pathname.replace(/\/+$/, '')}/${repository}`.toLowerCase();
+  // The API the lookups reach must be the forge's own, not a separately configured installation.
+  const forgeApi = forge.hostname === 'github.com' ? 'https://api.github.com' : `${htmlBase}/api/v1`;
+  const inCi = Boolean(processEnv.GITHUB_ACTIONS || processEnv.FORGEJO_ACTIONS);
+  const sameRepository = inCi
+    ? repository.toLowerCase() === scope.split('/').slice(-2).join('/')
+    : forgeScope === scope && apiBase === forgeApi;
+  if (!sameRepository) {
+    throw new Error(
+      `The forge names ${htmlBase}/${repository}, but the stage records belong to ${scope}; set FORGEJO_SERVER_URL or GITHUB_SERVER_URL and GITHUB_API_URL to its forge. Refusing to read one repository's pull requests to clean another's stages.`,
+    );
+  }
   return sweepPullRequestStages({
     cloudflare,
     scope,
-    repository: ciApiContext(processEnv).repository,
+    repository,
     ...(dependencies.only === undefined ? {} : { only: dependencies.only }),
-    pullRequestState: (pr) => fetchPullRequestState(pr, processEnv),
+    pullRequestState: (pr) => fetchPullRequestState(pr, forgeEnv),
     cleanup: (pr) => cleanupPullRequest(root, pr, { ...dependencies, cloudflare }),
   });
 }
