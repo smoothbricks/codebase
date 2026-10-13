@@ -16,6 +16,7 @@ import {
   SERIAL_TEST_GROUP_PLATFORM,
   serialTestGroups,
 } from './cargo-workspace.js';
+import { COWSHED_EXECUTABLE_ENV } from './executors/bounded-exec/ram-temp.js';
 import { isRecord } from './type-guards.js';
 
 /** The repository this package is built in: its own nextest config, nx.json and manifests are what these pin. */
@@ -23,6 +24,8 @@ const REPOSITORY = fileURLToPath(new URL('../../..', import.meta.url));
 const ROOT_PROJECT = '@smoothbricks/codebase';
 const DEVICE_GROUP = 'cargo-test-group-real-apfs';
 const HOST_GROUP = 'cargo-test-group-real-apfs-host';
+/** cowshed's build, which leaves the host's own CLI where the package's launcher finds it. */
+const CHECKOUT_COWSHED_BUILD = { projects: ['cowshed'], target: 'build' };
 
 describe('the real-APFS serial groups of this repository', () => {
   it('are exactly the device group and the host group, each scoped to the packages it holds', () => {
@@ -83,8 +86,26 @@ describe('the real-APFS serial groups of this repository', () => {
   it('run the host group after the device group, so two real-image runners never overlap', async () => {
     const nx = await readRecord('nx.json', JSON.parse);
     const host = child(child(nx, 'targetDefaults'), HOST_GROUP);
-    // `...` keeps the inferred archive and fetch edges ahead of the explicit one.
-    expect(host.dependsOn).toEqual(['...', DEVICE_GROUP]);
+    // `...` keeps the inferred archive and fetch edges ahead of the explicit ones.
+    expect(host.dependsOn).toEqual(['...', CHECKOUT_COWSHED_BUILD, DEVICE_GROUP]);
+  });
+
+  it("run this checkout's cowshed, built first, for every disk command the code under test makes", async () => {
+    const nx = await readRecord('nx.json', JSON.parse);
+    const plugin = await readRecord('packages/nx-plugin/package.json', JSON.parse);
+    // The groups and the RAM-volume host tests exercise the disk-command facade. An installed cowshed that predates a
+    // command this checkout added would fail them, so each names the checkout's launcher, after cowshed's build.
+    const targets = [
+      child(child(nx, 'targetDefaults'), DEVICE_GROUP),
+      child(child(nx, 'targetDefaults'), HOST_GROUP),
+      child(child(child(plugin, 'nx'), 'targets'), 'test-host'),
+    ];
+    for (const target of targets) {
+      expect(target.dependsOn).toContainEqual(CHECKOUT_COWSHED_BUILD);
+      expect(child(child(target, 'options'), 'env')).toEqual({
+        [COWSHED_EXECUTABLE_ENV]: '{workspaceRoot}/packages/cowshed/bin/cowshed',
+      });
+    }
   });
 
   it("are reached by no target of this repository's real task graph but the host group's edge to the device group", async () => {

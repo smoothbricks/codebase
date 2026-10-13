@@ -63,10 +63,12 @@
       "cache": false
     },
     "cargo-test-group-real-apfs": {
-      "dependsOn": ["..."]
+      "dependsOn": ["...", { "projects": ["cowshed"], "target": "build" }],
+      "options": { "env": { "COWSHED_EXECUTABLE": "{workspaceRoot}/packages/cowshed/bin/cowshed" } }
     },
     "cargo-test-group-real-apfs-host": {
-      "dependsOn": ["...", "cargo-test-group-real-apfs"]
+      "dependsOn": ["...", { "projects": ["cowshed"], "target": "build" }, "cargo-test-group-real-apfs"],
+      "options": { "env": { "COWSHED_EXECUTABLE": "{workspaceRoot}/packages/cowshed/bin/cowshed" } }
     }
   },
   "plugins": ["@smoothbricks/nx-plugin"],

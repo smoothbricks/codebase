@@ -1687,6 +1687,13 @@ export function diskCommand(file: string, args: readonly string[]): string[] | n
   return program === 'hdiutil' || program === 'diskutil' ? ['disk-command', program, '--', ...args] : null;
 }
 
+/**
+ * The variable naming the cowshed executable that runs `cowshed disk-command`. Unset, it is the installed `cowshed`
+ * on PATH. A repository that tests its own cowshed sets it, on the targets that test it, to that checkout's build:
+ * an installed cowshed that predates a command its own checkout added would fail the very code under test.
+ */
+export const COWSHED_EXECUTABLE_ENV = 'COWSHED_EXECUTABLE';
+
 /** Whether this process already said the cowshed gateway is not there to lease disk commands. */
 let gatewayAbsenceSaid = false;
 
@@ -1712,7 +1719,7 @@ export function createHostCommands(
   defaultDeadlineMs: number = HOST_COMMAND_DEADLINE_MS,
   gatewaySocket: string = GATEWAY_SOCKET,
   wantedShare: PhaseShare = recordedShare(),
-  cowshed = 'cowshed',
+  cowshed = process.env[COWSHED_EXECUTABLE_ENV] ?? 'cowshed',
 ): HostCommands {
   return {
     async run(file, args, callDeadlineMs) {
