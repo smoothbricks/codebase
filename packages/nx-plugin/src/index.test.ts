@@ -19,7 +19,7 @@ import { getOutputsForTargetAndConfiguration } from 'nx/src/tasks-runner/utils.j
 import { resetWorkspaceContext } from 'nx/src/utils/workspace-context.js';
 import { useFixtureCargoHome } from './__tests__/fixture-cargo-home.js';
 import { runtimeInputValue } from './__tests__/runtime-input.js';
-import { BOUNDED_TEST_KILL_AFTER_MS, BOUNDED_TEST_TIMEOUT_MS } from './bounded-test-policy.js';
+import { BOUNDED_TEST_IDLE_TIMEOUT_MS, BOUNDED_TEST_KILL_AFTER_MS } from './bounded-test-policy.js';
 import { exceptionalTestFilter, packageNameFromCargoTestTarget } from './cargo-workspace.js';
 import { CARGO_CROSS_LINT_COMMAND, CARGO_CROSS_LINT_TARGET, CARGO_LINT_CLIPPY_COMMAND } from './cross-check-policy.js';
 import { cargoCommandNpmPackages, createNodesV2, createNodesV2ForPlatform } from './index.js';
@@ -1925,7 +1925,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
           command: 'bun test --config=../bunfig.toml --timeout=30000 native.test.ts',
           cwd: 'packages/cowshed/src',
           env: { NAPI_DEBUG_ADDON: '1' },
-          timeoutMs: 120000,
+          idleTimeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
           killAfterMs: 10000,
         },
       });
@@ -2034,7 +2034,8 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         expect(targets[`cargo-test-big-shard${index}`]?.options?.command).toContain(
           `-E 'package(big) and not (${exceptional})' --partition hash:${index}/3 --no-fail-fast --no-tests=pass`,
         );
-        expect(targets[`cargo-test-big-shard${index}`]?.options?.timeoutMs).toBe(BOUNDED_TEST_TIMEOUT_MS);
+        expect(targets[`cargo-test-big-shard${index}`]?.options?.idleTimeoutMs).toBe(BOUNDED_TEST_IDLE_TIMEOUT_MS);
+        expect(targets[`cargo-test-big-shard${index}`]?.options).not.toHaveProperty('timeoutMs');
       }
       // Exceptional partitions are the exact complement, hashed by the same
       // declared count; each keeps the full bounded window.
@@ -2043,7 +2044,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         expect(targets[name]?.options?.command).toContain(
           `-E 'package(big) and (${exceptional})' --partition hash:${index}/3 --no-fail-fast --no-tests=pass`,
         );
-        expect(targets[name]?.options?.timeoutMs).toBe(BOUNDED_TEST_TIMEOUT_MS);
+        expect(targets[name]?.options?.idleTimeoutMs).toBe(BOUNDED_TEST_IDLE_TIMEOUT_MS);
         expect(packageNameFromCargoTestTarget(name)).toBe('big');
       }
       expect(targets['cargo-test-big-exceptions']).toBeUndefined();
@@ -2115,26 +2116,23 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       );
       const serial = '(test(/real_apfs_/))';
       const group = macos['cargo-test-group-real-apfs'];
-      // One runner for the workspace, owned by the cargo root beside the archive it executes. Its count
-      // stage sizes the bound, so it carries no fixed timeout, no partition and no thread flag.
-      expect(group?.executor).toBe('@smoothbricks/nx-plugin:nextest-group');
+      // One runner for the workspace, owned by the cargo root beside the archive it executes: a progress bound and no
+      // ceiling like every test target, one CPU token, no partition and no thread flag. A filter that selects
+      // nothing fails the run.
+      expect(group?.executor).toBe('@smoothbricks/nx-plugin:bounded-exec');
       expect(group?.dependsOn).toEqual(['cargo-fetch', 'cargo-test-archive']);
       expect(String(group?.options?.command)).toContain('nextest run ');
       expect(String(group?.options?.command)).toContain(
-        `-E '${serial}' --no-fail-fast --no-tests=pass --user-config-file none`,
-      );
-      expect(String(group?.options?.listCommand)).toContain('nextest list ');
-      expect(String(group?.options?.listCommand)).toContain(
-        `-E '${serial}' --message-format=json --user-config-file none`,
+        `-E '${serial}' --no-fail-fast --no-tests=fail --user-config-file none`,
       );
       expect(group?.options).not.toHaveProperty('timeoutMs');
+      expect(group?.options?.idleTimeoutMs).toBe(BOUNDED_TEST_IDLE_TIMEOUT_MS);
       expect(group?.options?.killAfterMs).toBe(BOUNDED_TEST_KILL_AFTER_MS);
+      expect(group?.options?.parallelism).toBe(1);
       expect(group?.inputs).toContain('{workspaceRoot}/packages/rusty/.config/nextest.toml');
       expect(JSON.stringify(group?.inputs)).toContain('nextest-code-bound.ts');
       expect(JSON.stringify(macos['cargo-test-small']?.inputs)).not.toContain('nextest-code-bound.ts');
-      for (const command of [group?.options?.command, group?.options?.listCommand]) {
-        expect(String(command)).not.toMatch(/--partition|test-threads|parallelism|max-fail/);
-      }
+      expect(String(group?.options?.command)).not.toMatch(/--partition|test-threads|max-fail/);
 
       // Every crate piece excludes the group's tests, so each test is selected by exactly one target.
       const exceptional = exceptionalTestFilter(fileURLToPath(new URL('../nextest.toml', import.meta.url)));
@@ -2551,7 +2549,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(cargoTest?.dependsOn).toEqual(['cargo-test-ferris-core', 'cargo-wasm']);
       expect(cargoTest?.options).toBeUndefined();
       expect(targets['cargo-test-ferris-core']?.options?.command).toContain("-E 'package(ferris-core)'");
-      expect(targets['cargo-test-ferris-core']?.options?.timeoutMs).toBe(120000);
+      expect(targets['cargo-test-ferris-core']?.options?.idleTimeoutMs).toBe(BOUNDED_TEST_IDLE_TIMEOUT_MS);
 
       const cargoTestCompile = resolveDeclaredOverInferred(targets, declared, 'cargo-test-compile');
       expect(cargoTestCompile?.executor).toBe('nx:run-commands');

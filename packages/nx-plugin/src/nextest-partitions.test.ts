@@ -6,8 +6,10 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { TargetConfiguration } from 'nx/src/devkit-exports.js';
 import { useFixtureCargoHome } from './__tests__/fixture-cargo-home.js';
+import { BOUNDED_TEST_IDLE_TIMEOUT_MS, BOUNDED_TEST_KILL_AFTER_MS } from './bounded-test-policy.js';
 import type { NxTaskContext } from './executors/bounded-exec/executor.js';
 import { hostLeaseProcesses } from './executors/bounded-exec/ram-temp.js';
+import type { BoundedExecOptions } from './executors/bounded-exec/schema.js';
 import {
   type BoundedExecRecord,
   JUNIT_FILE,
@@ -15,8 +17,6 @@ import {
   taskDirectory,
   writeRecord,
 } from './executors/bounded-exec/verdict.js';
-import { NEXTEST_GROUP_PER_TEST_MS, selectedRunnableTestCount } from './executors/nextest-group/executor.js';
-import type { NextestGroupOptions } from './executors/nextest-group/schema.js';
 import { createNodesV2ForPlatform } from './index.js';
 import { NEXTEST_EXTRACTION_DIRECTORY, nextestArchiveKey } from './nextest-extraction.js';
 
@@ -25,7 +25,7 @@ useFixtureCargoHome();
 const GROUP_TARGET = 'cargo-test-group-serial-probe';
 const GROUP_ID = `partition-fixture:${GROUP_TARGET}`;
 const GROUP_HASH = 'serial-probe-hash';
-// The filter the plugin's count stage carries; the empty-selection refusal replaces exactly this text.
+// The filter the plugin's group runner carries; the empty-selection case replaces exactly this text.
 const SERIAL_FILTER_ARG = "-E '(test(/serial_probe_/))'";
 
 const ordinary = Array.from({ length: 13 }, (_, index) => `ordinary_${index}`);
@@ -43,7 +43,6 @@ const expected = [...ordinary, ...exceptional, ...serial];
 interface SharedFixture {
   readonly root: string;
   readonly targets: Readonly<Record<string, TargetConfiguration>>;
-  readonly listCommand: string;
   readonly passingSeed: BoundedExecRecord;
 }
 
@@ -116,11 +115,9 @@ ${expected.map((name) => `    #[test] fn ${name}() { record("${name}");${serial.
     const result = await infer(['package.json'], undefined, { workspaceRoot: root, nxJsonConfiguration: {} });
     const targets = result[0]?.[1].projects?.['.']?.targets;
     if (targets === undefined) throw new Error('Cargo fixture inferred no targets');
-    const listCommand: unknown = targets[GROUP_TARGET]?.options?.listCommand;
-    if (typeof listCommand !== 'string') throw new Error(`${GROUP_TARGET} inferred no listCommand`);
     // The archive is the one real prerequisite: every runner executes its binaries.
     await run(root, ['sh', '-c', command(targets, 'cargo-test-archive')]);
-    const source = { root, targets, listCommand };
+    const source = { root, targets };
     const passingSeed = await groupSucceeds(source);
     shared = { ...source, passingSeed };
   }),
@@ -233,11 +230,29 @@ function groupDirectory(root: string): string {
   return taskDirectory(join(root, '.nx/workspace-data'), GROUP_ID);
 }
 
-/** The empty-selection listing: the plugin's own count stage with its serial filter replaced by `none()`. */
-function emptySelectionListing(listCommand: string): string {
-  const emptied = listCommand.replace(SERIAL_FILTER_ARG, "-E 'none()'");
-  if (emptied === listCommand) throw new Error(`the serial listing carries no ${SERIAL_FILTER_ARG} to empty`);
-  return emptied;
+/**
+ * The group's options as the plan infers them, run from the fixture root: the inferred cwd is the cargo root, which
+ * is the fixture root. `command` replaces the run's command, which stays the plan's byte-identical one otherwise.
+ */
+function groupOptions(
+  targets: Readonly<Record<string, TargetConfiguration>>,
+  root: string,
+  run = command(targets, GROUP_TARGET),
+): BoundedExecOptions {
+  // The group runner is bounded by progress like every test target: no ceiling, one runnable test at a time.
+  expect(targets[GROUP_TARGET]?.options).toMatchObject({
+    idleTimeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
+    killAfterMs: BOUNDED_TEST_KILL_AFTER_MS,
+    parallelism: 1,
+  });
+  expect(targets[GROUP_TARGET]?.options).not.toHaveProperty('timeoutMs');
+  return {
+    command: run,
+    cwd: root,
+    idleTimeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
+    killAfterMs: BOUNDED_TEST_KILL_AFTER_MS,
+    parallelism: 1,
+  };
 }
 
 /**
@@ -245,7 +260,7 @@ function emptySelectionListing(listCommand: string): string {
  * its probes. The runners are independent, so they run side by side exactly as Nx fans them out.
  */
 async function executesEveryTestOnce(): Promise<void> {
-  const { root, targets, listCommand } = fixture();
+  const { root, targets } = fixture();
   // One log per runner kind, so the proof is exact selection and not only coverage: the ordinary shards ran
   // every ordinary test once and nothing else, the exceptional shards did the same for theirs, and the serial
   // group ran its class once in one unpartitioned runner.
@@ -274,22 +289,16 @@ async function executesEveryTestOnce(): Promise<void> {
     await nextestArchiveKey(join(root, '.cache/nextest/archive.tar.zst')),
   ]);
   expect(await readdir(join(root, '.cache/nextest'))).toEqual(['archive.tar.zst']);
-  // The serial group is one unpartitioned runner. Its count stage lists exactly the probes, and the parser its
-  // executor sizes the bound with counts the same class the run executed.
+  // The serial group is one unpartitioned runner.
   expect(command(targets, GROUP_TARGET)).not.toContain('--partition');
-  const listing = join(root, 'serial-listing.json');
-  await run(root, ['sh', '-c', `${listCommand} > '${listing}'`]);
-  expect(selectedRunnableTestCount(await readFile(listing, 'utf8'))).toEqual({ ok: true, count: serial.length });
 }
 
 /**
- * The real default group executor, run for real on this fixture in a driver process. Its verdict is typed
+ * The real default executor, run for real on this fixture's group in a driver process. Its verdict is typed
  * passed and returned to its caller: fixture setup retains one real seed before any case runs.
  */
-async function groupSucceeds(
-  source: Pick<SharedFixture, 'root' | 'targets' | 'listCommand'> = fixture(),
-): Promise<BoundedExecRecord> {
-  const { root, targets, listCommand } = source;
+async function groupSucceeds(source: Pick<SharedFixture, 'root' | 'targets'> = fixture()): Promise<BoundedExecRecord> {
+  const { root, targets } = source;
   const directory = groupDirectory(root);
   const realCommand = command(targets, GROUP_TARGET);
   // Group policy requires --no-fail-fast: ordinary failures must not stop the remaining tests. Checked before any run.
@@ -300,14 +309,10 @@ async function groupSucceeds(
   // stays the byte-identical one the plan generates.
   const successLog = join(root, 'group-success.log');
   await rm(successLog, { force: true });
-  const success = await runGroupExecutor(root, { command: realCommand, listCommand, cwd: root }, groupContext(root), {
+  const success = await runGroupExecutor(root, groupOptions(targets, root), groupContext(root), {
     PARTITION_EXECUTIONS: successLog,
   });
   expect(success.code, success.output).toBe(0);
-  // The exact receipt line, not a prefix: the per-test share times the serial count.
-  expect(success.output).toContain(
-    `nextest-group: ${serial.length} selected tests, bounded at ${serial.length * NEXTEST_GROUP_PER_TEST_MS}ms`,
-  );
   const passed = await readRecord(directory);
   if (passed === null) throw new Error('a group run that passed wrote no verdict');
   expect(passed).toMatchObject({ task: GROUP_ID, hash: GROUP_HASH, verdict: { outcome: 'passed' } });
@@ -320,29 +325,27 @@ async function groupSucceeds(
 }
 
 /**
- * Refuses one listing before any probe runs. The fixture's real passing run seeds the stale
- * verdict and report whose removal each case observes, independent of every other case.
- * The per-case marker log proves the refused run started no probe.
+ * A group whose filter selects nothing fails rather than passing a run that ran no test. The fixture's real passing
+ * run seeds the stale verdict and report the run must replace; the marker log proves no probe ran.
  */
-async function refuses(listCommand: string, reason: string): Promise<void> {
+async function emptySelectionFails(): Promise<void> {
   const { root, targets, passingSeed } = fixture();
   const directory = groupDirectory(root);
   await writeRecord(directory, passingSeed);
   await writeFile(join(directory, JUNIT_FILE), 'stale report\n');
-  const refusalLog = join(root, 'group-refused.log');
-  await rm(refusalLog, { force: true });
-  const refused = await runGroupExecutor(
-    root,
-    { command: command(targets, GROUP_TARGET), listCommand, cwd: root },
-    groupContext(root),
-    { PARTITION_EXECUTIONS: refusalLog },
-  );
-  // The driver exits 2 on a refusal; the refusal reason is on its stderr, captured in `output`.
-  expect(refused.code, refused.output).toBe(2);
-  expect(refused.output).toContain(reason);
-  expect(await readRecord(directory)).toBeNull();
-  await expect(readFile(join(directory, JUNIT_FILE), 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
-  await expect(readFile(refusalLog, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
+  const realCommand = command(targets, GROUP_TARGET);
+  const emptied = realCommand.replace(SERIAL_FILTER_ARG, "-E 'none()'");
+  if (emptied === realCommand) throw new Error(`the group runner carries no ${SERIAL_FILTER_ARG} to empty`);
+  const emptyLog = join(root, 'group-empty.log');
+  await rm(emptyLog, { force: true });
+  const empty = await runGroupExecutor(root, groupOptions(targets, root, emptied), groupContext(root), {
+    PARTITION_EXECUTIONS: emptyLog,
+  });
+  expect(empty.code, empty.output).toBe(2);
+  const record = await readRecord(directory);
+  expect(record).toMatchObject({ task: GROUP_ID, hash: GROUP_HASH, verdict: { outcome: 'failed' } });
+  await expect(readFile(join(directory, JUNIT_FILE), 'utf8')).resolves.not.toBe('stale report\n');
+  await expect(readFile(emptyLog, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
 }
 
 /**
@@ -351,15 +354,13 @@ async function refuses(listCommand: string, reason: string): Promise<void> {
  * continuation, not a mutant count, and it says nothing about serialization: the override is macOS-only.
  */
 async function continuesPastFailures(): Promise<void> {
-  const { root, targets, listCommand } = fixture();
+  const { root, targets } = fixture();
   const directory = groupDirectory(root);
   const failureLog = join(root, 'group-failure.log');
-  const failed = await runGroupExecutor(
-    root,
-    { command: command(targets, GROUP_TARGET), listCommand, cwd: root },
-    groupContext(root),
-    { PARTITION_EXECUTIONS: failureLog, PARTITION_FAIL_SERIAL: '1' },
-  );
+  const failed = await runGroupExecutor(root, groupOptions(targets, root), groupContext(root), {
+    PARTITION_EXECUTIONS: failureLog,
+    PARTITION_FAIL_SERIAL: '1',
+  });
   expect(failed.code, failed.output).toBe(2);
   const failedRecord = await readRecord(directory);
   if (failedRecord === null) throw new Error('a group run that failed wrote no verdict');
@@ -386,18 +387,7 @@ it(
     await groupSucceeds();
   }),
 );
-it(
-  'refuses a failed listing before any run, clearing the previous verdict and report',
-  caseBody(() => refuses('exit 7', 'count stage failed')),
-);
-it(
-  'refuses an empty selection before any run, clearing the previous verdict and report',
-  caseBody(() => refuses(emptySelectionListing(fixture().listCommand), 'selects no runnable test')),
-);
-it(
-  'refuses a malformed listing before any run, clearing the previous verdict and report',
-  caseBody(() => refuses('echo not-json', 'printed no JSON listing')),
-);
+it('fails a serial group whose filter selects no test, replacing the previous verdict', caseBody(emptySelectionFails));
 it('runs the serial group past failing probes and reports all four', caseBody(continuesPastFailures));
 
 function command(targets: Readonly<Record<string, TargetConfiguration>>, name: string): string {
@@ -472,13 +462,13 @@ async function run(root: string, args: string[], overlay: Record<string, string>
   expect(code, `${args.join(' ')}\n${output}`).toBe(0);
 }
 
-/** The real default group executor, run in a driver process so its runner group can be ended by the lease owner. */
-const EXECUTOR_MODULE = fileURLToPath(new URL('./executors/nextest-group/executor.ts', import.meta.url));
+/** The real default executor, run in a driver process so its runner group can be ended by the lease owner. */
+const EXECUTOR_MODULE = fileURLToPath(new URL('./executors/bounded-exec/executor.ts', import.meta.url));
 // The driver runs outside this package's bunfig; use the same native transform preload as its test runner.
 const VALIDATION_PRELOAD = fileURLToPath(import.meta.resolve('@smoothbricks/validation/bun/preload'));
 
 /**
- * Exit 0 when the executor reports success, 2 when it refuses or its run fails. A crash in the driver
+ * Exit 0 when the executor reports success, 2 when its run fails. A crash in the driver
  * exits 1, with the stack in `output`. `process.exitCode`, not `process.exit`, so stdout and stderr flush.
  * Its stdout and stderr are teed live as they arrive, and the same text is returned in `output` for assertions.
  * `environment` carries a run's probe variables onto the driver's spawn. The workspace data key comes last, so
@@ -486,14 +476,14 @@ const VALIDATION_PRELOAD = fileURLToPath(import.meta.resolve('@smoothbricks/vali
  */
 async function runGroupExecutor(
   root: string,
-  options: NextestGroupOptions,
+  options: BoundedExecOptions,
   context: NxTaskContext,
   environment: Record<string, string> = {},
 ): Promise<Tracked> {
-  const script = `import nextestGroupExecutor from ${JSON.stringify(EXECUTOR_MODULE)};
-console.log('driver ready: calling the default group executor');
-const result = await nextestGroupExecutor(${JSON.stringify(options)}, ${JSON.stringify(context)});
-console.log('driver done: default group executor success=' + result.success);
+  const script = `import boundedExecExecutor from ${JSON.stringify(EXECUTOR_MODULE)};
+console.log('driver ready: calling the default executor');
+const result = await boundedExecExecutor(${JSON.stringify(options)}, ${JSON.stringify(context)});
+console.log('driver done: default executor success=' + result.success);
 process.exitCode = result.success ? 0 : 2;`;
   const result = await runTracked(root, [process.execPath, '--preload', VALIDATION_PRELOAD, '-e', script], {
     graceful: true,

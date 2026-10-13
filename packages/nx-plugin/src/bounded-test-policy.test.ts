@@ -7,9 +7,9 @@ import {
   applyBoundedTestTargetPolicy,
   applyWorkspaceBoundedTestTargetPolicy,
   BOUNDED_TEST_EXECUTOR,
+  BOUNDED_TEST_IDLE_TIMEOUT_MS,
   BOUNDED_TEST_KILL_AFTER_MS,
   BOUNDED_TEST_PER_TEST_TIMEOUT_MS,
-  BOUNDED_TEST_TIMEOUT_MS,
   type BoundedTestPolicyPackageJson,
   type BoundedTestPolicyProjectJson,
   boundedTestScriptAlias,
@@ -47,7 +47,7 @@ describe('bounded test target policy', () => {
       options: {
         command: `bun test ${TIMEOUT_FLAG} --coverage`,
         cwd: '{projectRoot}',
-        timeoutMs: BOUNDED_TEST_TIMEOUT_MS,
+        idleTimeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
         killAfterMs: BOUNDED_TEST_KILL_AFTER_MS,
       },
     });
@@ -66,7 +66,7 @@ describe('bounded test target policy', () => {
       options: {
         command: `bun test ${TIMEOUT_FLAG} --pass-with-no-tests`,
         cwd: '{projectRoot}',
-        timeoutMs: BOUNDED_TEST_TIMEOUT_MS,
+        idleTimeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
         killAfterMs: BOUNDED_TEST_KILL_AFTER_MS,
       },
     });
@@ -103,7 +103,7 @@ describe('bounded test target policy', () => {
       options: {
         command: `bun test ${TIMEOUT_FLAG} --project-target`,
         cwd: '{projectRoot}',
-        timeoutMs: BOUNDED_TEST_TIMEOUT_MS,
+        idleTimeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
         killAfterMs: BOUNDED_TEST_KILL_AFTER_MS,
       },
     });
@@ -129,7 +129,7 @@ describe('bounded test target policy', () => {
       options: {
         command: `bun test ${TIMEOUT_FLAG} --script`,
         cwd: '{projectRoot}',
-        timeoutMs: BOUNDED_TEST_TIMEOUT_MS,
+        idleTimeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
         killAfterMs: BOUNDED_TEST_KILL_AFTER_MS,
       },
     });
@@ -147,7 +147,7 @@ describe('bounded test target policy', () => {
             options: {
               command: 'bun test --package-target',
               cwd: '{projectRoot}',
-              timeoutMs: BOUNDED_TEST_TIMEOUT_MS,
+              idleTimeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
               killAfterMs: BOUNDED_TEST_KILL_AFTER_MS,
             },
           },
@@ -159,25 +159,26 @@ describe('bounded test target policy', () => {
     expect(checkBoundedTestTargetPolicy(packageJson, { projectName: 'example', projectJson })).toBe(false);
   });
 
-  it('accepts custom positive timeouts for bounded execution targets', () => {
-    const packageJson: BoundedTestPolicyPackageJson = {
+  it('accepts custom positive progress bounds for bounded execution targets', () => {
+    const target = (options: Record<string, unknown>): BoundedTestPolicyPackageJson => ({
       scripts: { test: boundedTestScriptAlias('example') },
       nx: {
         targets: {
           test: {
             executor: BOUNDED_TEST_EXECUTOR,
-            options: {
-              command: 'bun x vitest run',
-              cwd: '{projectRoot}',
-              timeoutMs: 300_000,
-              killAfterMs: 15_000,
-            },
+            options: { command: 'bun x vitest run', cwd: '{projectRoot}', killAfterMs: 15_000, ...options },
           },
         },
       },
-    };
+    });
 
-    expect(checkBoundedTestTargetPolicy(packageJson, { projectName: 'example' })).toBe(true);
+    expect(checkBoundedTestTargetPolicy(target({ idleTimeoutMs: 300_000 }), { projectName: 'example' })).toBe(true);
+    // A wall-clock ceiling fails a suite that is only slow: a test target names none, alone or beside its progress
+    // bound.
+    expect(checkBoundedTestTargetPolicy(target({ timeoutMs: 300_000 }), { projectName: 'example' })).toBe(false);
+    expect(
+      checkBoundedTestTargetPolicy(target({ timeoutMs: 300_000, idleTimeoutMs: 300_000 }), { projectName: 'example' }),
+    ).toBe(false);
   });
 
   it('accepts an executorless aggregate whose resolved execution target is bounded', () => {
@@ -225,14 +226,14 @@ describe('bounded test target policy', () => {
     }
   });
 
-  it('accepts explicit Bun per-test timeouts up to each bounded leg deadline', () => {
+  it("accepts explicit Bun per-test timeouts up to each bounded leg's progress bound", () => {
     const packageJson: BoundedTestPolicyPackageJson = {
       nx: { targets: { test: { executor: 'nx:noop', dependsOn: ['napi-test'] } } },
     };
-    const check = (command: string, timeoutMs = 600_000) => {
+    const check = (command: string, idleTimeoutMs = 600_000) => {
       const resolvedProject = resolvedAggregateProject();
       resolvedProject.targetOptions = new Map([
-        ['napi-test', { command, cwd: '{projectRoot}', timeoutMs, killAfterMs: BOUNDED_TEST_KILL_AFTER_MS }],
+        ['napi-test', { command, cwd: '{projectRoot}', idleTimeoutMs, killAfterMs: BOUNDED_TEST_KILL_AFTER_MS }],
       ]);
       return checkBoundedTestTargetPolicy(packageJson, { projectName: 'cowshed', resolvedProject });
     };
@@ -255,7 +256,7 @@ describe('bounded test target policy', () => {
     ]) {
       expect(check(command)).toBe(false);
     }
-    expect(check('bun test --timeout=600000', BOUNDED_TEST_TIMEOUT_MS)).toBe(false);
+    expect(check('bun test --timeout=600000', BOUNDED_TEST_IDLE_TIMEOUT_MS)).toBe(false);
   });
 
   it('checks every test leg selected by Nx target wildcards', () => {
@@ -265,7 +266,7 @@ describe('bounded test target policy', () => {
     const options = {
       command: `bun test ${TIMEOUT_FLAG}`,
       cwd: '{projectRoot}',
-      timeoutMs: BOUNDED_TEST_TIMEOUT_MS,
+      idleTimeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
       killAfterMs: BOUNDED_TEST_KILL_AFTER_MS,
     };
     const project: ResolvedProjectTargets = {
@@ -310,7 +311,7 @@ describe('bounded test target policy', () => {
     const options = {
       command: `bun test ${TIMEOUT_FLAG}`,
       cwd: '{projectRoot}',
-      timeoutMs: BOUNDED_TEST_TIMEOUT_MS,
+      idleTimeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
       killAfterMs: BOUNDED_TEST_KILL_AFTER_MS,
     };
     const project: ResolvedProjectTargets = {
@@ -359,7 +360,10 @@ describe('bounded test target policy', () => {
     const withLeg = (command: string, cwd: string): ResolvedProjectTargets => {
       const project = resolvedAggregateProject();
       project.targetOptions = new Map<string, Record<string, unknown>>([
-        ['napi-test', { command, cwd, timeoutMs: BOUNDED_TEST_TIMEOUT_MS, killAfterMs: BOUNDED_TEST_KILL_AFTER_MS }],
+        [
+          'napi-test',
+          { command, cwd, idleTimeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS, killAfterMs: BOUNDED_TEST_KILL_AFTER_MS },
+        ],
       ]);
       return project;
     };
@@ -469,7 +473,7 @@ describe('bounded test target policy', () => {
         options: {
           command: `bun test ${TIMEOUT_FLAG} --pass-with-no-tests`,
           cwd: '{projectRoot}',
-          timeoutMs: BOUNDED_TEST_TIMEOUT_MS,
+          idleTimeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
           killAfterMs: BOUNDED_TEST_KILL_AFTER_MS,
         },
       });
@@ -530,7 +534,7 @@ describe('bounded test target policy', () => {
         options: {
           command: 'bun test --timeout=600000 --shard=1/2',
           cwd: '{projectRoot}',
-          timeoutMs: 600_000,
+          idleTimeoutMs: 600_000,
           killAfterMs: BOUNDED_TEST_KILL_AFTER_MS,
         },
       };
@@ -635,7 +639,7 @@ describe('bounded test target policy', () => {
         options: {
           command: `bun test ${TIMEOUT_FLAG} --project`,
           cwd: '{projectRoot}',
-          timeoutMs: BOUNDED_TEST_TIMEOUT_MS,
+          idleTimeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
           killAfterMs: BOUNDED_TEST_KILL_AFTER_MS,
         },
       });
@@ -996,7 +1000,7 @@ function resolvedAggregateProject(): ResolvedProjectTargets {
         {
           command: `bun test ${TIMEOUT_FLAG} src/native.test.ts`,
           cwd: 'packages/cowshed',
-          timeoutMs: BOUNDED_TEST_TIMEOUT_MS,
+          idleTimeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
           killAfterMs: BOUNDED_TEST_KILL_AFTER_MS,
         },
       ],

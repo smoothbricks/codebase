@@ -7,19 +7,19 @@ import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 /**
- * A nextest run-wrapper that bounds a test's code time rather than its wall time
+ * A nextest run-wrapper that measures a test's code time rather than its wall time against its class
  * (specs/cowshed/08_testing.md, "Integration tests (real substrate)").
  *
  * A real-APFS test spends part of its wall time queued for the host disk-lifecycle lease, behind
  * every other cowshed process on the host (05_gateway.md, "Disk-lifecycle lease"). That queue is
- * the host's, not the test's code, so a wall-clock bound fails a fast test on a busy host. The
- * wrapper names a fresh lease-wait record in `COWSHED_LEASE_WAIT_RECORD`, runs the test binary,
- * which every disk-lease client of the test's process tree appends its waits to, and then judges
- * the test's code time, its wall time less the union of those waits, against the bound it was
- * configured with. It says the split on stderr after the test body, and fails a passing test whose
- * code time is over the bound. nextest's own slow-timeout stays the backstop that ends a hang.
+ * the host's, not the test's code. The wrapper names a fresh lease-wait record in
+ * `COWSHED_LEASE_WAIT_RECORD`, runs the test binary, which every disk-lease client of the test's
+ * process tree appends its waits to, and then measures the test's code time, its wall time less the
+ * union of those waits, against the class it was configured with. It says the split on stderr after
+ * the test body, and warns when the code time is over the class; the test keeps its own exit status.
+ * A class is a slow warning, never a kill or a failure: the run's no-progress bound ends a hang.
  *
- * Usage, as nextest invokes it: `nextest-code-bound.ts <bound-seconds> <test-binary> [args…]`.
+ * Usage, as nextest invokes it: `nextest-code-bound.ts <class-seconds> <test-binary> [args…]`.
  */
 
 /** The variable naming the record; the same name every disk-lease client reads. */
@@ -124,10 +124,10 @@ export function codeTime(edges: readonly WaitEdge[], startedUs: number, endedUs:
 const seconds = (us: number): string => `${(us / 1_000_000).toFixed(1)}s`;
 
 /** The one line the wrapper prints after the test body. */
-export function describeCodeTime(time: CodeTime, boundUs: number): string {
-  const verdict = time.codeUs > boundUs ? 'OVER its bound' : 'within its bound';
+export function describeCodeTime(time: CodeTime, classUs: number): string {
+  const verdict = time.codeUs > classUs ? 'OVER its class (a warning)' : 'within its class';
   const parts = [
-    `nextest-code-bound: code ${seconds(time.codeUs)} of ${seconds(boundUs)}, ${verdict}`,
+    `nextest-code-bound: code ${seconds(time.codeUs)} of ${seconds(classUs)}, ${verdict}`,
     `(wall ${seconds(time.wallUs)} less ${seconds(time.waitUs)} waiting for the host disk lease over ${time.waits} waits)`,
   ];
   for (const wait of time.open) {
@@ -139,19 +139,19 @@ export function describeCodeTime(time: CodeTime, boundUs: number): string {
   return parts.join(' ');
 }
 
-const BOUND_PATTERN = /^\d+(\.\d+)?$/;
+const CLASS_PATTERN = /^\d+(\.\d+)?$/;
 
 /** The signals the wrapper passes on to the test rather than dying of. */
 const FORWARDED: readonly NodeJS.Signals[] = ['SIGTERM', 'SIGINT', 'SIGHUP'];
 
-/** Runs the test under the record, judges it, and exits as the judgment says. */
+/** Runs the test under the record, reports its code time, and exits as the test did. */
 async function main(argv: readonly string[]): Promise<never> {
-  const [bound, binary, ...args] = argv;
-  if (bound === undefined || !BOUND_PATTERN.test(bound) || Number(bound) <= 0 || binary === undefined) {
-    process.stderr.write('nextest-code-bound: usage: nextest-code-bound.ts <bound-seconds> <test-binary> [args…]\n');
+  const [codeClass, binary, ...args] = argv;
+  if (codeClass === undefined || !CLASS_PATTERN.test(codeClass) || Number(codeClass) <= 0 || binary === undefined) {
+    process.stderr.write('nextest-code-bound: usage: nextest-code-bound.ts <class-seconds> <test-binary> [args…]\n');
     process.exit(2);
   }
-  const boundUs = Number(bound) * 1_000_000;
+  const classUs = Number(codeClass) * 1_000_000;
   const record = join(tmpdir(), `cowshed-lease-waits-${process.pid}-${randomUUID()}`);
   writeFileSync(record, '', { mode: 0o600, flag: 'wx' });
   const startedUs = Math.round((performance.timeOrigin + performance.now()) * 1000);
@@ -183,14 +183,11 @@ async function main(argv: readonly string[]): Promise<never> {
     process.exit(exit.code === 0 ? 1 : (exit.code ?? 1));
   }
   const time = codeTime(parsed.edges, startedUs, endedUs);
-  process.stderr.write(`${describeCodeTime(time, boundUs)}\n`);
+  process.stderr.write(`${describeCodeTime(time, classUs)}\n`);
   if (exit.signal !== null) {
     process.kill(process.pid, exit.signal);
   }
-  if (exit.code !== 0) {
-    process.exit(exit.code ?? 1);
-  }
-  process.exit(time.codeUs > boundUs ? 1 : 0);
+  process.exit(exit.code ?? 1);
 }
 
 if (process.argv[1] !== undefined && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

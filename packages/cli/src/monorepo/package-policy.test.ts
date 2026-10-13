@@ -4,9 +4,9 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import {
   BOUNDED_TEST_EXECUTOR,
+  BOUNDED_TEST_IDLE_TIMEOUT_MS,
   BOUNDED_TEST_KILL_AFTER_MS,
   BOUNDED_TEST_PER_TEST_TIMEOUT_MS,
-  BOUNDED_TEST_TIMEOUT_MS,
 } from '@smoothbricks/nx-plugin/bounded-test-policy';
 import { generateManagedFiles } from '@smoothbricks/nx-plugin/managed-files/generator';
 import { FsTree } from 'nx/src/generators/tree.js';
@@ -949,7 +949,7 @@ describe('workspace package script policy', () => {
                 options: {
                   command: `bun test ${TIMEOUT_FLAG}`,
                   cwd: '{projectRoot}',
-                  timeoutMs: BOUNDED_TEST_TIMEOUT_MS,
+                  idleTimeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
                   killAfterMs: BOUNDED_TEST_KILL_AFTER_MS,
                 },
               },
@@ -1217,7 +1217,7 @@ describe('workspace package script policy', () => {
             options: {
               command: `bun test ${TIMEOUT_FLAG} --pass-with-no-tests`,
               cwd: '{projectRoot}',
-              timeoutMs: BOUNDED_TEST_TIMEOUT_MS,
+              idleTimeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
               killAfterMs: BOUNDED_TEST_KILL_AFTER_MS,
             },
           },
@@ -1252,7 +1252,7 @@ describe('workspace package script policy', () => {
                 options: {
                   command: 'bun run test',
                   cwd: '{projectRoot}',
-                  timeoutMs: BOUNDED_TEST_TIMEOUT_MS,
+                  idleTimeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
                   killAfterMs: BOUNDED_TEST_KILL_AFTER_MS,
                 },
               },
@@ -1363,7 +1363,7 @@ describe('workspace package script policy', () => {
             options: {
               command: `bun test ${TIMEOUT_FLAG} --pass-with-no-tests`,
               cwd: '{projectRoot}',
-              timeoutMs: BOUNDED_TEST_TIMEOUT_MS,
+              idleTimeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
               killAfterMs: BOUNDED_TEST_KILL_AFTER_MS,
             },
           },

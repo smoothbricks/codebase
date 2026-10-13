@@ -69,12 +69,14 @@ describe('code time', () => {
     expect(codeTime([end(1, 0, 2_000)], 0, 10_000)).toMatchObject({ waitUs: 0, codeUs: 10_000, strayEnds: 1 });
   });
 
-  it('says whether the code time is within its bound', () => {
+  it('says whether the code time is within its class', () => {
     const time = codeTime([start(1, 0, 0), end(1, 0, 20_000_000)], 0, 45_000_000);
     expect(describeCodeTime(time, 30_000_000)).toBe(
-      'nextest-code-bound: code 25.0s of 30.0s, within its bound (wall 45.0s less 20.0s waiting for the host disk lease over 1 waits)',
+      'nextest-code-bound: code 25.0s of 30.0s, within its class (wall 45.0s less 20.0s waiting for the host disk lease over 1 waits)',
     );
-    expect(describeCodeTime(time, 20_000_000)).toStartWith('nextest-code-bound: code 25.0s of 20.0s, OVER its bound');
+    expect(describeCodeTime(time, 20_000_000)).toStartWith(
+      'nextest-code-bound: code 25.0s of 20.0s, OVER its class (a warning)',
+    );
   });
 });
 
@@ -114,29 +116,29 @@ describe('nextest-code-bound wrapper', () => {
   };
 
   // Real processes and real time, so the cases sleep as little as proves each verdict: 0.75s in all.
-  it('passes a test whose wall time is over the bound only by its lease waits', () => {
+  it('passes a test whose wall time is over its class only by its lease waits', () => {
     const run = runWrapped('0.3', 0.4, 0, 0);
     expect(run.stdout).toContain('argument --exact');
     expect(run.stderr).toMatch(
-      /nextest-code-bound: code 0\.\d+s of 0\.3s, within its bound \(wall \d+\.\d+s less \d+\.\ds waiting/,
+      /nextest-code-bound: code 0\.\d+s of 0\.3s, within its class \(wall \d+\.\d+s less \d+\.\ds waiting/,
     );
     expect(run.status).toBe(0);
     expect(run.recordsLeft).toBe(0);
   });
 
-  it('fails a passing test whose code time is over the bound', () => {
+  it('warns of a passing test whose code time is over its class, and still passes it', () => {
     const run = runWrapped('0.3', 0, 0.35, 0);
-    expect(run.stderr).toContain('OVER its bound');
-    expect(run.status).toBe(1);
+    expect(run.stderr).toContain('OVER its class (a warning)');
+    expect(run.status).toBe(0);
   });
 
   it("keeps a failing test's own exit status and still reports its split", () => {
     const run = runWrapped('30', 0, 0, 3);
-    expect(run.stderr).toContain('within its bound');
+    expect(run.stderr).toContain('within its class');
     expect(run.status).toBe(3);
   });
 
-  it('refuses to run without a bound', () => {
+  it('refuses to run without a class', () => {
     expect(spawnSync(WRAPPER, ['soon', '/bin/true'], { encoding: 'utf8' }).status).toBe(2);
   });
 });

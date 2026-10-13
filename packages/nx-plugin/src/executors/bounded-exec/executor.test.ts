@@ -117,11 +117,11 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     expect(result.terminalOutput).toContain(`cwd=${workspace.root}`);
   });
 
-  it('kills a silent command on the progress bound while the absolute ceiling is far away', async () => {
+  it('kills a silent command on the progress bound, with no ceiling at all', async () => {
     const workspace = await createWorkspace();
 
     const result = await runBoundedExec(
-      { command: 'node -e "setTimeout(() => {}, 30000)"', timeoutMs: 30_000, idleTimeoutMs: 100, killAfterMs: 0 },
+      { command: 'node -e "setTimeout(() => {}, 30000)"', idleTimeoutMs: 100, killAfterMs: 0 },
       workspace.context,
       createProcessTreeKiller(),
       null,
@@ -129,32 +129,77 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     );
 
     expect(result.success).toBe(false);
-    expect(result.terminalOutput).toContain('Command made no progress: no output for 100ms');
+    expect(result.terminalOutput).toContain('Command made no progress: no test finished for 100ms');
     expect(result.terminalOutput).toContain('idleTimeoutMs=100');
-    // The bound that fired is named, so a wedge is never reported as a slow run.
+    expect(result.terminalOutput).toContain('the runner named no test still running');
+    // The bound that fired is named, so a hang is never reported as a slow run.
     expect(result.terminalOutput).not.toContain('Command timed out after');
   });
 
-  it('lets a slow but talking command outlive its progress bound many times over', async () => {
+  it('kills a runner that keeps warning of a slow test but finishes none, and names the test', async () => {
     const workspace = await createWorkspace();
-    // Six 120ms gaps under a 400ms progress bound: total runtime is well past
-    // idleTimeoutMs, so passing proves the bound measures silence, not duration.
+    // nextest's own lines: one test finishes, then the other only ever says SLOW, every 50ms.
     await workspace.write(
-      'chatty.js',
+      'slow-runner.js',
       [
-        'let ticks = 0;',
+        "console.error('        PASS [   0.010s] (1/2) fake tests::quick');",
+        'let periods = 0;',
+        "setInterval(() => console.error('        SLOW [>  ' + ++periods * 0.05 + 's] (───) fake tests::hangs'), 50);",
+        '',
+      ].join('\n'),
+    );
+
+    const result = await runBoundedExec(
+      { command: 'node slow-runner.js', idleTimeoutMs: 400, killAfterMs: 0 },
+      workspace.context,
+      createProcessTreeKiller(),
+      null,
+      null,
+    );
+
+    expect(result.success).toBe(false);
+    expect(result.terminalOutput).toContain('SLOW [>');
+    expect(result.terminalOutput).toContain('Command made no progress: no test finished for 400ms (idleTimeoutMs=400)');
+    expect(result.terminalOutput).toContain('still running: fake tests::hangs (cwd=');
+    expect(result.terminalOutput).not.toContain('fake tests::quick (cwd=');
+  });
+
+  it('kills a command whose only output is a heartbeat', async () => {
+    const workspace = await createWorkspace();
+    await workspace.write('heartbeat.js', ["setInterval(() => console.log('still waiting...'), 20);", ''].join('\n'));
+
+    const result = await runBoundedExec(
+      { command: 'node heartbeat.js', idleTimeoutMs: 300, killAfterMs: 0 },
+      workspace.context,
+      createProcessTreeKiller(),
+      null,
+      null,
+    );
+
+    expect(result.success).toBe(false);
+    expect(result.terminalOutput).toContain('still waiting...');
+    expect(result.terminalOutput).toContain('Command made no progress: no test finished for 300ms');
+  });
+
+  it('lets a run that keeps finishing tests outlive its progress bound many times over', async () => {
+    const workspace = await createWorkspace();
+    // Ten tests 120ms apart under a 400ms progress bound and no ceiling: the run lasts three times the bound, so
+    // passing proves the bound measures the gap between finished tests, not duration.
+    await workspace.write(
+      'progressing.js',
+      [
+        'let done = 0;',
         'const timer = setInterval(() => {',
-        '  console.log("tick " + ++ticks);',
-        '  if (ticks === 6) {',
-        '    clearInterval(timer);',
-        '  }',
+        '  done += 1;',
+        "  console.error('        PASS [   0.120s] (' + done + '/10) fake tests::t' + done);",
+        '  if (done === 10) clearInterval(timer);',
         '}, 120);',
         '',
       ].join('\n'),
     );
 
     const result = await runBoundedExec(
-      { command: 'node chatty.js', timeoutMs: 30_000, idleTimeoutMs: 400 },
+      { command: 'node progressing.js', idleTimeoutMs: 400 },
       workspace.context,
       createProcessTreeKiller(),
       null,
@@ -162,28 +207,27 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     );
 
     expect(result.success).toBe(true);
-    expect(result.terminalOutput).toContain('tick 6');
+    expect(result.terminalOutput).toContain('(10/10) fake tests::t10');
     expect(result.terminalOutput).not.toContain('made no progress');
   });
 
-  it('treats output on stderr alone as progress', async () => {
+  it("counts bun's dots on stderr as finished tests", async () => {
     const workspace = await createWorkspace();
+    // bun --dots writes one dot per finished test and no newline until another stream writes.
     await workspace.write(
-      'chatty-stderr.js',
+      'dots.js',
       [
-        'let ticks = 0;',
+        'let done = 0;',
         'const timer = setInterval(() => {',
-        '  console.error("tick " + ++ticks);',
-        '  if (ticks === 5) {',
-        '    clearInterval(timer);',
-        '  }',
+        "  process.stderr.write('.');",
+        '  if (++done === 8) { clearInterval(timer); process.stderr.write("\\n"); }',
         '}, 120);',
         '',
       ].join('\n'),
     );
 
     const result = await runBoundedExec(
-      { command: 'node chatty-stderr.js', timeoutMs: 30_000, idleTimeoutMs: 400 },
+      { command: 'node dots.js', idleTimeoutMs: 400 },
       workspace.context,
       createProcessTreeKiller(),
       null,
@@ -191,7 +235,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     );
 
     expect(result.success).toBe(true);
-    expect(result.terminalOutput).toContain('tick 5');
+    expect(result.terminalOutput).toContain('........');
   });
 
   it('applies the absolute ceiling to a command that keeps talking forever', async () => {

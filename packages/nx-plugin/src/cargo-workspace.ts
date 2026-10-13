@@ -730,9 +730,6 @@ export const CARGO_TEST_EXCEPTIONS_SUFFIX = 'exceptions';
 /** Name prefix of the runner a serial test group gets; see `serialTestGroups`. */
 export const CARGO_TEST_GROUP_PREFIX = 'cargo-test-group-';
 
-/** The executor a serial group's runner uses: its bound is sized from the tests it selects. */
-export const NEXTEST_GROUP_EXECUTOR = '@smoothbricks/nx-plugin:nextest-group';
-
 /**
  * A crate on one target keeps the bare name; a split crate suffixes the piece,
  * so `cargo-test-example-core-shard2` still reads as "example-core's tests".

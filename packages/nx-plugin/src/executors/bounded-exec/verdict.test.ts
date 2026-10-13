@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
 import { type BoundedExecContext, createProcessTreeKiller, runBoundedExec } from './executor.js';
+import type { BoundedExecBounds } from './schema.js';
 import {
   type BoundedExecVerdict,
   failedTasksOfRun,
@@ -44,7 +45,7 @@ async function workspace(): Promise<{ root: string; data: string; context: Bound
  */
 async function verdictOf(
   command: string,
-  bounds: { timeoutMs: number; idleTimeoutMs?: number; killAfterMs?: number },
+  bounds: BoundedExecBounds & { killAfterMs?: number },
   files: Record<string, string> = {},
   links: Record<string, string> = {},
 ): Promise<BoundedExecVerdict | undefined> {
@@ -102,18 +103,43 @@ describe('bounded-exec verdicts', () => {
     ).toEqual({ outcome: 'failed', exitCode: 1, tests: ['wrong'] });
   });
 
-  it('records the total bound as a bound and the idle bound as a wedge', async () => {
+  it('records the total bound as a bound and the progress bound as a wedge', async () => {
     expect(await verdictOf('node -e "setInterval(() => console.log(1), 10)"', { timeoutMs: 200 })).toMatchObject({
       outcome: 'bound',
       bound: 'total',
       limitMs: 200,
     });
-    expect(
-      await verdictOf('node -e "setTimeout(() => {}, 30000)"', { timeoutMs: 30_000, idleTimeoutMs: 100 }),
-    ).toMatchObject({
+    expect(await verdictOf('node -e "setTimeout(() => {}, 30000)"', { idleTimeoutMs: 100 })).toMatchObject({
       outcome: 'wedged',
       idleMs: 100,
+      tests: [],
     });
+  });
+
+  it('records a runner that warns of a slow test but finishes none as a wedge naming that test', async () => {
+    // nextest's own lines: one test passes, the other only ever says SLOW. A bound on silence would never fire.
+    const runner = [
+      "console.error('        PASS [   0.010s] (1/2) fake tests::quick');",
+      "setInterval(() => console.error('        SLOW [>  0.050s] (───) fake tests::hangs'), 50);",
+      '',
+    ].join('\n');
+    expect(await verdictOf('node runner.js', { idleTimeoutMs: 400 }, { 'runner.js': runner })).toMatchObject({
+      outcome: 'wedged',
+      idleMs: 400,
+      tests: ['fake tests::hangs'],
+    });
+  });
+
+  it('names the tests nextest aborted at the progress bound beside those it said were running, once each', () => {
+    const report = { timedOut: [], cancelled: ['nt tests::hangs', 'nt tests::young'], failed: [] };
+    expect(
+      judgeRun({
+        exitCode: 100,
+        elapsedMs: 900,
+        expiry: { kind: 'idle', limitMs: 400, tests: ['nt tests::hangs'] },
+        report,
+      }),
+    ).toEqual({ outcome: 'wedged', idleMs: 400, elapsedMs: 900, tests: ['nt tests::hangs', 'nt tests::young'] });
   });
 
   it('records a failing command with no report as a failure, and a passing one as passed', async () => {
