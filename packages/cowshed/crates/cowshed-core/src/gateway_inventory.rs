@@ -535,6 +535,7 @@ impl NativeGatewayInventory {
         }
     }
 
+    #[cfg(target_os = "macos")]
     pub(crate) fn port_allocation(&self) -> crate::metadata::PortAllocation {
         self.storage.port_allocation()
     }
