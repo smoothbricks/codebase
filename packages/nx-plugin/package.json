@@ -245,21 +245,6 @@
       },
       "test-host": {
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
-        "dependsOn": [
-          "...",
-          {
-            "projects": [
-              "@smoothbricks/codebase"
-            ],
-            "target": "cargo-test-group-real-apfs"
-          },
-          {
-            "projects": [
-              "@smoothbricks/codebase"
-            ],
-            "target": "cargo-test-group-real-apfs-host"
-          }
-        ],
         "options": {
           "command": "bun test --timeout=30000 src/executors/bounded-exec/ram-temp-host.test.ts src/executors/bounded-exec/executor-host.test.ts",
           "cwd": "{projectRoot}",

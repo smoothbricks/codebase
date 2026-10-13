@@ -272,15 +272,16 @@ Native-host integration whose subject combines physical images with core lifecyc
 assertions, image resizing, legacy-image re-adoption and native recovery boundaries. The host target depends on the
 disk-image target: the two groups never run concurrently. Each nextest group declares `max-threads = 1`.
 `.config/nextest.toml` owns their package-scoped selection filters, and the code-time wrapper rules select the same
-tests. Ordinary and exceptions shards exclude those filters; ordinary `cargo-test` excludes both groups, while the full
-`test` aggregate reaches them. Every test has one runner, and non-macOS planning creates neither APFS group.
+tests. Ordinary and exceptions shards exclude those filters. No target depends on either group but the host group's edge
+to the device group: a group runs only as its own target, which the land gate names (`tooling/land-host.sh`), and only
+when its own inputs change. Every test has one runner, and non-macOS planning creates neither APFS group.
 
 Every test target, the groups included, is bounded by progress alone: the run ends when no test has finished for 180s,
 the hang backstop, and names the tests still running; it has no wall-clock ceiling, and no per-test bound kills a test
 (`packages/nx-plugin/README.md`, "Bounded Test Targets"). A group's runner carries `--no-tests=fail`, so a filter that
 selects nothing fails rather than passing a run of no test. The RAM host walk and real-process CPU-pool
-production-wiring proofs run after this group in `test-host`, outside the four pure Bun shards, with the existing case
-bounds. The shards exclude `*-host.test.ts`; the host target names both owned host files.
+production-wiring proofs run in `test-host`, outside the four pure Bun shards, with the existing case bounds. The shards
+exclude `*-host.test.ts`; the host target names both owned host files.
 
 **A real-APFS test's class is on its code time.** Every disk command a test's process tree runs first queues for the
 host-wide disk-lifecycle lease (05_gateway.md, "Disk-lifecycle lease") behind every other cowshed process on the host:

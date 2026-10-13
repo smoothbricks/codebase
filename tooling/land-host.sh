@@ -7,10 +7,12 @@
 #    that reason alone is retried against the newer head.
 # 2. Stop <workspace>'s Nx daemon. Its file map can be stale across a rebase (fseventsd drops events), and a gate
 #    that hashes a tree other than the rebased one proves nothing about it. The gate starts a fresh daemon.
-# 3. Gate the rebased tree on the host, in <workspace>: `nx run-many -t lint test build --nx-bail=false` over every
-#    project. Tasks main already ran at the tree they share replay from the cache the rebase carried over, so only
-#    what <workspace>'s change reaches runs. The gate runs on the host, not in `cowshed land --check`'s sandbox: some
-#    tasks hash differently there, and the sandbox cannot host the real-APFS tests.
+# 3. Gate the rebased tree on the host, in <workspace>:
+#    `nx run-many -t lint test build cargo-test-group-real-apfs cargo-test-group-real-apfs-host --nx-bail=false` over
+#    every project. No target depends on the two real-APFS groups (.config/nextest.toml), so the gate names them; each
+#    replays from the cache unless its own inputs changed. Tasks main already ran at the tree they share replay from the
+#    cache the rebase carried over, so only what <workspace>'s change reaches runs. The gate runs on the host, not in
+#    `cowshed land --check`'s sandbox: some tasks hash differently there, and the sandbox cannot host the real-APFS tests.
 # 4. `cowshed land` fast-forwards main to exactly the commit step 3 gated, onto exactly the head step 1 rebased
 #    onto. If main moved meanwhile the land is refused, and the script rebases and gates again; Nx replays what the
 #    new commits did not touch.
@@ -56,7 +58,7 @@ main=$(cowshed path main)
 checkout=$(cowshed path "$workspace")
 started=$(date +%s)
 
-gate_targets="lint test build"
+gate_targets="lint test build cargo-test-group-real-apfs cargo-test-group-real-apfs-host"
 ledger=agent-todo/land-ledger.md
 # The ledger lines of the failures this land tolerated, and the last run's verdict lines.
 tolerated=""
