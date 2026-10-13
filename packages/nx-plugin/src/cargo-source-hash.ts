@@ -1,4 +1,4 @@
-import { type ChildProcess, execFileSync, spawn, spawnSync } from 'node:child_process';
+import { type ChildProcess, type ChildProcessByStdio, execFileSync, spawn, spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { channel } from 'node:diagnostics_channel';
 import { constants, realpathSync, statSync } from 'node:fs';
@@ -17,6 +17,7 @@ import {
 } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { delimiter, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import type { Readable } from 'node:stream';
 import native from 'nx/src/native/index.js';
 import { workspaceDataDirectoryForWorkspace } from 'nx/src/utils/cache-directory.js';
 import { CARGO_TOOLCHAIN_PIN_INPUTS } from './cargo-toolchain-policy.js';
@@ -124,6 +125,9 @@ export interface CargoPathInputsOptions {
  * Cargo groups. Standalone callers need signal forwarding after detaching
  * Cargo from the terminal; handlers are installed only where the caller has
  * not already chosen a signal disposition, and removed after the last child.
+ * The hooks are in place before the first child is spawned: a child runs as
+ * soon as it is spawned, and a signal that reached this process before its
+ * hooks would end it on the default action with Cargo's group left running.
  * Uncatchable SIGKILL cannot execute either hook.
  */
 const cargoChildren = new Set<ChildProcess>();
@@ -172,6 +176,11 @@ function ownCargoChildren(): void {
   }
 }
 
+function disownCargoChildren(): void {
+  process.removeListener('exit', killCargoChildren);
+  removeCargoSignalHandlers();
+}
+
 /**
  * Cargo's stdout, or its failure with Cargo's stderr in the message. Not
  * `promisify` from `node:util`: importing that module makes Node probe color
@@ -184,11 +193,21 @@ function runCargo(args: readonly string[], cwd: string): Promise<string> {
   // spawn forwards detached groups; execFile does not. The public ES2022
   // library API requires the constructor form, not Promise.withResolvers.
   return new Promise((settle, reject) => {
-    const child = spawn('cargo', args, {
-      cwd,
-      detached: process.platform !== 'win32',
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
+    // Hooks first: a signal caught from here on runs its listener after this
+    // synchronous body, by which time the child is in `cargoChildren`.
+    if (cargoChildren.size === 0) ownCargoChildren();
+    let child: ChildProcessByStdio<null, Readable, Readable>;
+    try {
+      child = spawn('cargo', args, {
+        cwd,
+        detached: process.platform !== 'win32',
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+    } catch (error) {
+      if (cargoChildren.size === 0) disownCargoChildren();
+      throw error;
+    }
+    cargoChildren.add(child);
     let stdout = '';
     let stderr = '';
     let stdoutBytes = 0;
@@ -225,17 +244,12 @@ function runCargo(args: readonly string[], cwd: string): Promise<string> {
     child.stderr.on('error', fail);
     child.on('close', (code, signal) => {
       cargoChildren.delete(child);
-      if (cargoChildren.size === 0) {
-        process.removeListener('exit', killCargoChildren);
-        removeCargoSignalHandlers();
-      }
+      if (cargoChildren.size === 0) disownCargoChildren();
       if (failure !== undefined) reject(failure);
       else if (code !== 0) {
         reject(new Error(`cargo ${args.join(' ')} failed (${signal ?? code}): ${stderr.trim()}`));
       } else settle(stdout);
     });
-    if (cargoChildren.size === 0) ownCargoChildren();
-    cargoChildren.add(child);
   });
 }
 
