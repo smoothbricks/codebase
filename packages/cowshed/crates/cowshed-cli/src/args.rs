@@ -1333,7 +1333,7 @@ const DISK_COMMAND: CommandSpec = CommandSpec {
     missing: "disk-command requires a tool: diskutil or hdiutil",
     args: "<diskutil|hdiutil>",
     trailing: "-- <args...>",
-    summary: "run diskutil or hdiutil through cowshed's disk runner",
+    summary: "run diskutil/hdiutil via cowshed's disk runner",
     about: &[
         "Runs one `diskutil` or `hdiutil` argv — never a shell string — exactly as cowshed runs its own disk tools: under the host's disk-lifecycle lease, in its own session, with the tool's stdout and stderr passed through as its own bytes and its exit status as this command's (a signal ends it with 128 + the signal). The command's standard input is forwarded to the tool, so a passphrase can be piped to `diskutil apfs unlockVolume … -stdinpassphrase`. It needs no project and asks no daemon: scripts and other programs call it from any directory.",
         "A command that creates or releases a disk-image device — `diskutil image …`, `diskutil eject` and every `hdiutil` verb — is never killed: past 120 s it is waited for, with a `cowshed:` warning on stderr every 30 s, because one killed mid-operation can leak its kernel device until reboot. It also ignores hangup, interrupt and terminate and writes its output to files the runner reads back, so a caller that gives up and kills this command leaves the operation to finish. Every other verb is killed at 120 s.",
