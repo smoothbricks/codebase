@@ -45,7 +45,7 @@ use cowshed_core::storage::job_artifact::{ArtifactConfig, repair_workspace_recor
 use cowshed_core::storage::lifecycle::{DerivedWorkspace, MountIntent, MountState, Pin, Substrate};
 use cowshed_core::storage::{StorageLayout, discover_session_images};
 use cowshed_core::{
-    AdoptedProject, CowshedError, ErrorCode, GatewayInventoryError, JobHandle,
+    AdoptedProject, CowshedError, ErrorCode, GatewayInventoryError, GatewayStoreBackend, JobHandle,
     NativeGatewayInventory, Result, UnreachableMain, validate_existing_host_storage,
 };
 use cowshed_gateway_types::STORE_ROOT;
@@ -389,6 +389,7 @@ pub struct ActorBridge {
     coordinator: Option<Coordinator>,
     connection: Option<JoinHandle<Result<()>>>,
     runtime: Option<ProjectRuntime>,
+    backend: GatewayStoreBackend,
 }
 
 impl ActorBridge {
@@ -397,7 +398,7 @@ impl ActorBridge {
         requested_repo_id: Option<RepoId>,
     ) -> Result<Self> {
         let runtime = ProjectRuntime::open_for_adopt(project_root, requested_repo_id).await?;
-        Self::from_runtime(project_root, runtime).await
+        Self::from_runtime(project_root, runtime, GatewayStoreBackend::Native).await
     }
 
     /// Drive dispatch against caller-owned APFS images rather than machine-global storage.
@@ -412,7 +413,7 @@ impl ActorBridge {
             ProjectRuntime::open_for_adopt_at(project_root, requested_repo_id, storage),
         )
         .await?;
-        Self::from_runtime(project_root, runtime).await
+        Self::from_runtime(project_root, runtime, GatewayStoreBackend::Native).await
     }
 
     pub async fn open_existing_at(
@@ -421,7 +422,7 @@ impl ActorBridge {
         storage: ValidatedHostStorage,
     ) -> Result<Self> {
         let runtime = ProjectRuntime::open_existing_at(project_root, scope, storage).await?;
-        Self::from_runtime(project_root, runtime).await
+        Self::from_runtime(project_root, runtime, GatewayStoreBackend::Native).await
     }
 
     /// Drive the same dispatch workflow against a caller-owned directory store.
@@ -433,7 +434,7 @@ impl ActorBridge {
         let runtime =
             ProjectRuntime::open_directory_for_adopt_at(project_root, requested_repo_id, storage)
                 .await?;
-        Self::from_runtime(project_root, runtime).await
+        Self::from_runtime(project_root, runtime, GatewayStoreBackend::Directory).await
     }
 
     /// Reopen a directory store without acquiring disk-image capabilities.
@@ -444,21 +445,25 @@ impl ActorBridge {
     ) -> Result<Self> {
         let runtime =
             ProjectRuntime::open_directory_existing_at(project_root, scope, storage).await?;
-        Self::from_runtime(project_root, runtime).await
+        Self::from_runtime(project_root, runtime, GatewayStoreBackend::Directory).await
     }
 
     pub async fn open_existing(project_root: &Path, scope: RecoveryScope) -> Result<Self> {
         let runtime = ProjectRuntime::open_existing(project_root, scope).await?;
-        Self::from_runtime(project_root, runtime).await
+        Self::from_runtime(project_root, runtime, GatewayStoreBackend::Native).await
     }
 
     /// [`Self::open_existing`] for the identity-change verb alone (`cowshed mv … --repo-id`).
     pub async fn open_existing_for_identity_change(project_root: &Path) -> Result<Self> {
         let runtime = ProjectRuntime::open_existing_for_identity_change(project_root).await?;
-        Self::from_runtime(project_root, runtime).await
+        Self::from_runtime(project_root, runtime, GatewayStoreBackend::Native).await
     }
 
-    async fn from_runtime(project_root: &Path, runtime: ProjectRuntime) -> Result<Self> {
+    async fn from_runtime(
+        project_root: &Path,
+        runtime: ProjectRuntime,
+        backend: GatewayStoreBackend,
+    ) -> Result<Self> {
         let (client, server) = match std::os::unix::net::UnixStream::pair() {
             Ok(pair) => pair,
             Err(error) => {
@@ -520,6 +525,7 @@ impl ActorBridge {
             coordinator: Some(coordinator),
             connection: Some(connection),
             runtime: Some(runtime),
+            backend,
         })
     }
 
@@ -915,13 +921,22 @@ impl CliService for ActorBridge {
                 CowshedError::internal("the CLI project runtime has already been shut down")
             })?
             .descriptor();
-        gateway_service::reconcile_native_project(
-            &descriptor.repo_id,
-            &descriptor.storage,
-            self.coordinator()?,
-        )
-        .await
-        .map(|_| ())
+        match self.backend {
+            GatewayStoreBackend::Native => gateway_service::reconcile_native_project(
+                &descriptor.repo_id,
+                &descriptor.storage,
+                self.coordinator()?,
+            )
+            .await
+            .map(|_| ()),
+            GatewayStoreBackend::Directory => gateway_service::reconcile_directory_project(
+                &descriptor.repo_id,
+                &descriptor.storage,
+                self.coordinator()?,
+            )
+            .await
+            .map(|_| ()),
+        }
     }
     async fn shutdown(self) -> Result<()> {
         ActorBridge::shutdown(self).await

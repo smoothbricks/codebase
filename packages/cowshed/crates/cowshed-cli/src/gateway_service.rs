@@ -20,7 +20,7 @@ use cowshed_core::runtime::supervisor_manager::{
 };
 use cowshed_core::runtime::supervisor_socket;
 use cowshed_core::{
-    CowshedError, ErrorCode, NativeGatewayInventory, Result, StartupHealState,
+    CowshedError, ErrorCode, GatewayStoreBackend, NativeGatewayInventory, Result, StartupHealState,
     ValidatedHostStorage, validate_existing_host_storage,
 };
 use cowshed_gateway::{
@@ -36,15 +36,15 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-pub use cowshed_gateway_types::control_socket_path;
 pub use cowshed_core::gateway_sessions::{
     ControlRefusal, GATEWAY_START_HINT, GatewayControl, GatewayInstaller, GatewayPortReallocator,
     GatewayStatusError, NativeSessionInventory, ReconcileReport, SessionInventory, canonical_home,
-    control_error, effective_uid, gateway_absent, install_all_sessions,
-    policy_from_grants, project_session_prefix, reconcile_against_status, reconcile_project,
+    control_error, effective_uid, gateway_absent, install_all_sessions, policy_from_grants,
+    project_session_prefix, reconcile_against_status, reconcile_project,
     reconcile_project_with_reallocator, session_from_fact, sessions_from_facts,
     stable_workspace_id,
 };
+pub use cowshed_gateway_types::control_socket_path;
 use std::collections::BTreeSet;
 
 /// A running daemon reached over its control socket.
@@ -147,6 +147,7 @@ struct NativePortReallocator<'a> {
     storage: &'a ValidatedHostStorage,
     repo_id: &'a RepoId,
     assigner: &'a dyn PortSlotAssigner,
+    backend: GatewayStoreBackend,
 }
 
 #[async_trait]
@@ -156,7 +157,7 @@ impl GatewayPortReallocator for NativePortReallocator<'_> {
         session: &WorkspaceSession,
         rejected: &BTreeSet<u16>,
     ) -> Result<WorkspaceSession> {
-        let inventory = NativeGatewayInventory::new(self.storage.clone());
+        let inventory = NativeGatewayInventory::with_backend(self.storage.clone(), self.backend);
         let attached = inventory
             .project_attached(self.repo_id)
             .await
@@ -211,20 +212,23 @@ impl GatewayPortReallocator for NativePortReallocator<'_> {
                 .await
             {
                 Ok(()) => {
-                    return NativeSessionInventory::new(self.storage.clone())
-                        .project_sessions(self.repo_id)
-                        .await?
-                        .into_iter()
-                        .find(|current| current.workspace_id == session.workspace_id)
-                        .ok_or_else(|| {
-                            CowshedError::conflict(
-                                format!(
-                                    "gateway workspace {} disappeared during port reallocation",
-                                    session.workspace_id
-                                ),
-                                "retry against current workspace inventory",
-                            )
-                        });
+                    return NativeSessionInventory::with_backend(
+                        self.storage.clone(),
+                        self.backend,
+                    )
+                    .project_sessions(self.repo_id)
+                    .await?
+                    .into_iter()
+                    .find(|current| current.workspace_id == session.workspace_id)
+                    .ok_or_else(|| {
+                        CowshedError::conflict(
+                            format!(
+                                "gateway workspace {} disappeared during port reallocation",
+                                session.workspace_id
+                            ),
+                            "retry against current workspace inventory",
+                        )
+                    });
                 }
                 Err(error) if error.code == ErrorCode::Conflict => continue,
                 Err(error) => return Err(error),
@@ -245,12 +249,32 @@ pub async fn reconcile_native_project(
     storage: &ValidatedHostStorage,
     assigner: &dyn PortSlotAssigner,
 ) -> Result<ReconcileReport> {
-    let inventory = NativeSessionInventory::new(storage.clone());
+    reconcile_project_for_backend(repo_id, storage, assigner, GatewayStoreBackend::Native).await
+}
+
+/// Reconcile a caller-owned directory store's project: its sessions derive from the
+/// directory host's proven mount records, not the kernel mount table.
+pub async fn reconcile_directory_project(
+    repo_id: &RepoId,
+    storage: &ValidatedHostStorage,
+    assigner: &dyn PortSlotAssigner,
+) -> Result<ReconcileReport> {
+    reconcile_project_for_backend(repo_id, storage, assigner, GatewayStoreBackend::Directory).await
+}
+
+async fn reconcile_project_for_backend(
+    repo_id: &RepoId,
+    storage: &ValidatedHostStorage,
+    assigner: &dyn PortSlotAssigner,
+    backend: GatewayStoreBackend,
+) -> Result<ReconcileReport> {
+    let inventory = NativeSessionInventory::with_backend(storage.clone(), backend);
     let control = ControlSocket::at(storage.store().join("gateway.sock"))?;
     let reallocator = NativePortReallocator {
         storage,
         repo_id,
         assigner,
+        backend,
     };
     cowshed_os::timing::spanned(
         "reconcile",

@@ -9,7 +9,6 @@ use async_trait::async_trait;
 use cowshed_gateway_types::StartupHeal;
 use thiserror::Error;
 
-use cowshed_apfs::SystemCommandRunner;
 #[cfg(test)]
 use crate::api::dto::WorkspaceState;
 use crate::api::dto::{ProjectWorkspaces, WorkspaceInfo};
@@ -18,7 +17,6 @@ use crate::metadata::{
     WorkspaceIncarnation, WorkspaceName, sidecar_path,
 };
 use crate::repository::{OwnedRepoIds, RepoId, RepositoryBinding};
-use cowshed_apfs::mounts::KernelMountSnapshot;
 use crate::storage::apfs::native::{
     KernelMountSource, MacOsApfsExecutionHost, SystemKernelMountSource,
 };
@@ -26,6 +24,7 @@ use crate::storage::apfs::{
     ApfsExecutionHost, ApfsStorageError, ApfsSubstrate, ApfsSubstrateConfig,
 };
 use crate::storage::bootstrap::ValidatedHostStorage;
+use crate::storage::directory::DirectoryExecutionHost;
 use crate::storage::lifecycle::{
     CheckpointFact, DerivationError, KernelMountFact, LifecycleWorkspace, MountIntent, MountState,
     StorageFact, Substrate, derive_workspaces,
@@ -34,6 +33,8 @@ use crate::storage::{StorageLayout, verify_no_symlinks};
 use crate::workspace_credentials::{
     GatewayWorkspaceCredentials, WorkspaceCredentialError, read_gateway_workspace_credentials,
 };
+use cowshed_apfs::SystemCommandRunner;
+use cowshed_apfs::mounts::KernelMountSnapshot;
 
 pub(crate) const MAX_BINDING_BYTES: u64 = 1024 * 1024;
 const UNRESOLVED_CHECKOUT_PATH: &str = ".unresolved-main-mount";
@@ -312,6 +313,43 @@ impl InventorySource for NativeInventorySource {
     }
 }
 
+/// Inventory over a caller-owned directory store, selected explicitly by the directory
+/// runtime's caller rather than inferred from path shapes. A mounted directory payload
+/// produces no kernel mount: its mount fact is the image path's mount record, proven by
+/// the payload marker the directory host checks, so the kernel table is never consulted.
+#[derive(Clone, Copy, Debug, Default)]
+struct DirectoryInventorySource;
+
+impl InventorySource for DirectoryInventorySource {
+    fn project_storage(
+        &self,
+        storage: &ValidatedHostStorage,
+        repo: &RepoId,
+    ) -> Result<Vec<StorageFact>, GatewayInventoryError> {
+        let (_, config) = project_layout_and_config(storage, repo)?;
+        Ok(DirectoryExecutionHost::new(config)?.list(repo)?)
+    }
+
+    fn project_facts(
+        &self,
+        storage: &ValidatedHostStorage,
+        repo: &RepoId,
+    ) -> Result<ProjectInventoryFacts, GatewayInventoryError> {
+        let (layout, config) = project_layout_and_config(storage, repo)?;
+        let host = DirectoryExecutionHost::new(config.clone())?;
+        let storage_facts = host.list(repo)?;
+        let mount_paths = expected_mount_paths(&config, &layout, &storage_facts)?;
+        let mounts = host.mounts(repo)?;
+        let checkpoints = host.checkpoints(repo)?;
+        Ok(ProjectInventoryFacts {
+            storage: storage_facts,
+            mounts,
+            checkpoints,
+            mount_paths,
+        })
+    }
+}
+
 /// One project's layout and the substrate configuration for the checkout its records name.
 fn project_layout_and_config(
     storage: &ValidatedHostStorage,
@@ -480,12 +518,38 @@ fn reserve_port_block(
         })
 }
 
+/// Which store backend an inventory reads, chosen by the caller that opened the store:
+/// native APFS volumes, whose mounts the kernel reports, or directory payloads, whose
+/// mounts are the records the directory host proves. Never inferred from path shapes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GatewayStoreBackend {
+    Native,
+    Directory,
+}
 impl NativeGatewayInventory {
     pub fn new(storage: ValidatedHostStorage) -> Self {
         Self {
             storage,
             source: Arc::new(NativeInventorySource),
             heal: Arc::new(NativeHealSource),
+        }
+    }
+
+    /// Inventory over a caller-owned directory store: mount facts come from the mount
+    /// records the directory host proves, never from the kernel mount table. Only a
+    /// caller that opened a directory runtime selects this; native stores keep [`Self::new`].
+    pub fn for_directory_store(storage: ValidatedHostStorage) -> Self {
+        Self {
+            storage,
+            source: Arc::new(DirectoryInventorySource),
+            heal: Arc::new(NativeHealSource),
+        }
+    }
+
+    pub fn with_backend(storage: ValidatedHostStorage, backend: GatewayStoreBackend) -> Self {
+        match backend {
+            GatewayStoreBackend::Native => Self::new(storage),
+            GatewayStoreBackend::Directory => Self::for_directory_store(storage),
         }
     }
 
@@ -1951,13 +2015,17 @@ fn verify_image_path(store_root: &Path, image: &Path) -> Result<(), GatewayInven
             if !target.is_absolute() {
                 return Err(invalid(
                     image,
-                    format!("image mount record names the relative path {}", target.display()),
+                    format!(
+                        "image mount record names the relative path {}",
+                        target.display()
+                    ),
                 ));
             }
             let resolved = fs::canonicalize(&target)
                 .map_err(|source| io_error("resolve image mount target", &target, source))?;
             if resolved != target
-                || !fs::symlink_metadata(&target).is_ok_and(|metadata| metadata.file_type().is_dir())
+                || !fs::symlink_metadata(&target)
+                    .is_ok_and(|metadata| metadata.file_type().is_dir())
             {
                 return Err(invalid(
                     image,
@@ -1987,8 +2055,9 @@ fn verify_image_path(store_root: &Path, image: &Path) -> Result<(), GatewayInven
             }
             Ok(())
         }
-        _ => verify_no_symlinks(store_root, image)
-            .map_err(|error| invalid(image, error.to_string())),
+        _ => {
+            verify_no_symlinks(store_root, image).map_err(|error| invalid(image, error.to_string()))
+        }
     }
 }
 
