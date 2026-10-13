@@ -266,10 +266,18 @@ describe('root smoo monorepo policy', () => {
       expect(errors.join('\n')).toContain('CI-only sharedGlobals');
       applyNxPluginDefaults(root);
       const nxJson = await readJson(join(root, 'nx.json'));
-      expect(nxJson.namedInputs.default).toEqual(['{projectRoot}/**/*', 'custom']);
-      expect(nxJson.namedInputs.sharedGlobals).toEqual(['{workspaceRoot}/.github/workflows/ci.yml']);
-      expect(nxJson.namedInputs.custom).toEqual(['{workspaceRoot}/config/shared.json']);
-      expect(nxJson.targetDefaults.workflowLint.inputs).toEqual(['sharedGlobals']);
+      expect(nxJson.namedInputs).toEqual(
+        expect.objectContaining({
+          default: ['{projectRoot}/**/*', 'custom'],
+          sharedGlobals: ['{workspaceRoot}/.github/workflows/ci.yml'],
+          custom: ['{workspaceRoot}/config/shared.json'],
+        }),
+      );
+      expect(nxJson.targetDefaults).toEqual(
+        expect.objectContaining({
+          workflowLint: expect.objectContaining({ inputs: ['sharedGlobals'] }),
+        }),
+      );
       expect(validateNxReleaseConfig(root)).toBe(0);
     } finally {
       await rm(root, { recursive: true, force: true });
