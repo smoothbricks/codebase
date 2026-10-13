@@ -11,3 +11,4 @@ export PATH="$("$TOOLING/direnv/repo-path")"
 set -e -o pipefail
 
 smoo monorepo validate-commit-msg --fix "$1"
+smoo monorepo check-public-denylist --commit-message "$1"

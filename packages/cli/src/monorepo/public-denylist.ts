@@ -1,18 +1,13 @@
 /**
- * A public repository's tree and history must not name what is private to the people working on it,
- * and the list of those names cannot live in the tree without publishing them. So the list lives in
- * this clone's local git config (or the environment) and the repository carries only the guard:
- *
- *   git config --add smoothbricks.publicDenylist '<pattern>'
- *
- * Each value is one Perl-compatible regex, matched case-insensitively against every text file of
- * the revisions judged and against every line of the message of each commit being published. No
- * list configured means nothing to guard — CI and every clone that never set one pass silently.
+ * Pre-push judges published trees and messages using the clone's configured PCRE patterns.
+ * Commit hooks use the same patterns and regex engine, plus locally discovered sibling projects
+ * and HOME. Only added index lines are judged, so old private text can be removed incrementally.
  */
 
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { mkdtemp, readdir, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises';
+import { homedir, tmpdir } from 'node:os';
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
+import typia from 'typia';
 
 /** Local git config key: one pattern per value. */
 export const PUBLIC_DENYLIST_CONFIG_KEY = 'smoothbricks.publicDenylist';
@@ -49,14 +44,11 @@ export async function scanPublicDenylist(
   env: Environment = process.env,
   remote?: string,
 ): Promise<PublicDenylistScan> {
-  const config = git(root, ['config', '--get-all', PUBLIC_DENYLIST_CONFIG_KEY], env);
-  // git config --get-all: 0 = values printed, 1 = key unset, anything else = config unreadable.
-  if (config.exitCode > 1) {
-    return { outcome: 'failed', reason: `git config --get-all ${PUBLIC_DENYLIST_CONFIG_KEY}: ${config.stderr}` };
+  const configured = configuredPatterns(root, env);
+  if ('failure' in configured) {
+    return { outcome: 'failed', reason: configured.failure };
   }
-  const patterns = [...config.stdout.split('\n'), ...(env[PUBLIC_DENYLIST_ENV] ?? '').split('\n')].filter(
-    (line) => line.trim().length > 0,
-  );
+  const patterns = configured.patterns;
   if (patterns.length === 0) {
     return UNCONFIGURED;
   }
@@ -136,7 +128,7 @@ async function judgeMessages(
     const judged = grep(
       scratch,
       ['--no-index', '--no-exclude-standard', '-a', ...search, '--', '.'],
-      env,
+      standaloneGitEnvironment(env),
       'commit messages',
     );
     if ('failure' in judged) {
@@ -172,4 +164,380 @@ function grep(cwd: string, args: string[], env: Environment, subject: string): J
 function git(root: string, args: string[], env: Environment): { exitCode: number; stdout: string; stderr: string } {
   const child = Bun.spawnSync(['git', ...args], { cwd: root, env });
   return { exitCode: child.exitCode, stdout: child.stdout.toString(), stderr: child.stderr.toString() };
+}
+
+/** Tab-separated public-reference exemptions, read from the index rather than the working tree. */
+export const PUBLIC_DENYLIST_ALLOWLIST_PATH = 'tooling/public-denylist-allowlist.tsv';
+
+export type PublicCommitSubject = { readonly kind: 'staged' } | { readonly kind: 'message'; readonly path: string };
+
+type AddedLine = { readonly path: string; readonly line: number; readonly text: string };
+type Allowlist = {
+  readonly scopes: readonly string[];
+  readonly repositories: readonly string[];
+  readonly lines: readonly { readonly path: string; readonly text: string }[];
+};
+
+const parseWorkspaceMarker = typia.json.createValidateParse<{ projectRoot: string }>();
+
+function configuredPatterns(root: string, env: Environment): { patterns: string[] } | { failure: string } {
+  const config = git(root, ['config', '--get-all', PUBLIC_DENYLIST_CONFIG_KEY], env);
+  // An unset key is the only nonzero status that means no configuration.
+  if (config.exitCode !== 0 && config.exitCode !== 1) {
+    return { failure: `git config --get-all ${PUBLIC_DENYLIST_CONFIG_KEY}: ${config.stderr}` };
+  }
+  return {
+    patterns: [...config.stdout.split('\n'), ...(env[PUBLIC_DENYLIST_ENV] ?? '').split('\n')].filter(
+      (line) => line.trim().length > 0,
+    ),
+  };
+}
+
+/** Fail closed, including when local discovery, the index, or a configured regex cannot be read. */
+export async function scanPublicCommitDenylist(
+  root: string,
+  subject: PublicCommitSubject,
+  env: Environment = process.env,
+): Promise<PublicDenylistScan> {
+  try {
+    const configured = configuredPatterns(root, env);
+    if ('failure' in configured) return { outcome: 'failed', reason: configured.failure };
+    const siblings = await siblingPatterns(root, env);
+    if ('failure' in siblings) return { outcome: 'failed', reason: siblings.failure };
+    const allowlist = readAllowlist(root, env);
+    if ('failure' in allowlist) return { outcome: 'failed', reason: allowlist.failure };
+    const home = env.HOME ?? homedir();
+    if (!isAbsolute(home) || home === '/') {
+      return { outcome: 'failed', reason: 'HOME must name an absolute home directory, not the filesystem root' };
+    }
+    const homePattern = `${escapeRegex(home.replace(/\/+$/, ''))}(?![\\w.-])`;
+    let lines: AddedLine[];
+    if (subject.kind === 'message') {
+      const path = resolve(root, subject.path);
+      try {
+        lines = (await readFile(path, 'utf8')).split('\n').map((text, index) => ({
+          path: '',
+          line: index + 1,
+          text,
+        }));
+      } catch (error) {
+        return { outcome: 'failed', reason: `${path}: ${errorReason(error)}` };
+      }
+    } else {
+      const staged = addedIndexLines(root, env);
+      if ('failure' in staged) return { outcome: 'failed', reason: staged.failure };
+      lines = staged.lines;
+    }
+    const judged = await judgeAddedLines(lines, configured.patterns, siblings.patterns, homePattern, allowlist, env);
+    if ('failure' in judged) return { outcome: 'failed', reason: judged.failure };
+    return judged.rows === ''
+      ? { outcome: 'clean', patterns: configured.patterns.length + siblings.patterns.length + 1 }
+      : { outcome: 'denied', matches: judged.rows };
+  } catch (error) {
+    return { outcome: 'failed', reason: errorReason(error) };
+  }
+}
+
+/** Operational refusal is an exit status, not a thrown programmer error. */
+export async function checkPublicCommitDenylist(root: string, subject: PublicCommitSubject): Promise<void> {
+  const scan = await scanPublicCommitDenylist(root, subject);
+  if (scan.outcome === 'denied') {
+    console.error(scan.matches.trimEnd());
+    console.error('Refusing commit: reword the added lines or commit message matching the public denylist.');
+    process.exitCode = 1;
+  } else if (scan.outcome === 'failed') {
+    console.error(`public denylist check did not run: ${scan.reason.trimEnd()}`);
+    process.exitCode = 1;
+  }
+}
+
+async function siblingPatterns(root: string, env: Environment): Promise<{ patterns: string[] } | { failure: string }> {
+  const markerPath = join(root, '.cowshed', 'workspace.json');
+  let anchor = root;
+  let markerText: string | undefined;
+  try {
+    markerText = await readFile(markerPath, 'utf8');
+  } catch (error) {
+    if (!(error instanceof Error && 'code' in error && error.code === 'ENOENT')) {
+      return { failure: `${markerPath}: ${errorReason(error)}` };
+    }
+  }
+  if (markerText !== undefined) {
+    try {
+      const marker = parseWorkspaceMarker(markerText);
+      if (!marker.success || !isAbsolute(marker.data.projectRoot)) {
+        return { failure: `${markerPath}: expected an absolute projectRoot` };
+      }
+      anchor = marker.data.projectRoot;
+    } catch (error) {
+      return { failure: `${markerPath}: ${errorReason(error)}` };
+    }
+  }
+  anchor = await realpath(anchor);
+  if (!(await stat(anchor)).isDirectory()) return { failure: `${anchor}: projectRoot is not a directory` };
+  const parent = dirname(anchor);
+  // Git supplies GIT_DIR and GIT_INDEX_FILE to hooks. They describe the committing repository,
+  // not its siblings; never let a sibling probe accidentally query the current repository.
+  const probeEnv = standaloneGitEnvironment(env);
+  const patterns: string[] = [];
+  for (const entry of await readdir(parent, { withFileTypes: true })) {
+    if (!entry.isDirectory() || entry.name.startsWith('.') || entry.name === basename(anchor)) continue;
+    const sibling = join(parent, entry.name);
+    try {
+      await stat(join(sibling, '.git'));
+    } catch (error) {
+      if (error instanceof Error && 'code' in error && error.code === 'ENOENT') continue;
+      return { failure: `${sibling}/.git: ${errorReason(error)}` };
+    }
+    const probe = git(sibling, ['rev-parse', '--show-toplevel'], probeEnv);
+    if (probe.exitCode !== 0) {
+      return { failure: `${sibling}: git rev-parse --show-toplevel: ${probe.stderr}` };
+    }
+    if ((await realpath(probe.stdout.trimEnd())) !== (await realpath(sibling))) {
+      return { failure: `${sibling}: .git does not identify this sibling as a repository root` };
+    }
+    patterns.push(`(?<!\\w)${escapeRegex(entry.name)}(?!\\w)`);
+  }
+  return { patterns };
+}
+
+function readAllowlist(root: string, env: Environment): Allowlist | { failure: string } {
+  const listed = git(root, ['ls-files', '--stage', '--', PUBLIC_DENYLIST_ALLOWLIST_PATH], env);
+  if (listed.exitCode !== 0) return { failure: `git ls-files ${PUBLIC_DENYLIST_ALLOWLIST_PATH}: ${listed.stderr}` };
+  if (listed.stdout === '') return { scopes: [], repositories: [], lines: [] };
+  const content = git(root, ['show', `:${PUBLIC_DENYLIST_ALLOWLIST_PATH}`], env);
+  if (content.exitCode !== 0)
+    return { failure: `${PUBLIC_DENYLIST_ALLOWLIST_PATH}: git show index: ${content.stderr}` };
+  const scopes: string[] = [];
+  const repositories: string[] = [];
+  const lines: { path: string; text: string }[] = [];
+  for (const [index, row] of content.stdout.split('\n').entries()) {
+    if (row === '' || row.startsWith('#')) continue;
+    const [kind, value, text, ...extra] = row.split('\t');
+    if (
+      extra.length === 0 &&
+      kind === 'package-scope' &&
+      text === undefined &&
+      value?.match(/^@[a-z0-9][a-z0-9._-]*$/)
+    ) {
+      scopes.push(value);
+    } else if (
+      extra.length === 0 &&
+      kind === 'repository' &&
+      text === undefined &&
+      value?.match(/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/)
+    ) {
+      repositories.push(value);
+    } else if (
+      extra.length === 0 &&
+      kind === 'line' &&
+      value !== undefined &&
+      value !== '' &&
+      !isAbsolute(value) &&
+      !value.split('/').includes('..') &&
+      text !== undefined &&
+      text !== ''
+    ) {
+      lines.push({ path: value, text });
+    } else {
+      return { failure: `${PUBLIC_DENYLIST_ALLOWLIST_PATH}:${index + 1}: invalid tab-separated public reference rule` };
+    }
+  }
+  return { scopes, repositories, lines };
+}
+
+function addedIndexLines(root: string, env: Environment): { lines: AddedLine[] } | { failure: string } {
+  // Omitting HEAD makes git handle an unborn branch as the empty tree. All commands inherit
+  // GIT_INDEX_FILE, including a partial commit's temporary index.
+  const paths = git(root, ['diff', '--cached', '--name-only', '-z', '--no-renames', '--no-ext-diff', '--'], env);
+  if (paths.exitCode !== 0) return { failure: `git diff --cached --name-only: ${paths.stderr}` };
+  const lines: AddedLine[] = [];
+  for (const path of paths.stdout.split('\0')) {
+    if (path === '') continue;
+    const diff = git(
+      root,
+      [
+        '--literal-pathspecs',
+        'diff',
+        '--cached',
+        '--no-color',
+        '--no-ext-diff',
+        '--no-textconv',
+        '--no-renames',
+        '--unified=0',
+        '--',
+        path,
+      ],
+      env,
+    );
+    if (diff.exitCode !== 0) return { failure: `${path}: git diff --cached: ${diff.stderr}` };
+    let line = 0;
+    let inHunk = false;
+    for (const row of diff.stdout.split('\n')) {
+      const hunk = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(row);
+      if (hunk) {
+        line = Number(hunk[1]);
+        inHunk = true;
+      } else if (row.startsWith('diff --git ')) {
+        inHunk = false;
+      } else if (inHunk && row.startsWith('+')) {
+        lines.push({ path, line, text: row.slice(1) });
+        line++;
+      } else if (inHunk && row.startsWith(' ')) {
+        line++;
+      }
+    }
+  }
+  return { lines };
+}
+
+type Exemption =
+  | { readonly wholeLine: true }
+  | { readonly wholeLine: false; readonly spans: readonly { readonly start: number; readonly end: number }[] };
+
+const WHOLE_LINE_EXEMPTION: Exemption = { wholeLine: true };
+
+function referenceExemption(line: AddedLine, allowlist: Allowlist, references: readonly RegExp[]): Exemption {
+  for (const allowed of allowlist.lines) {
+    if (
+      (line.path === allowed.path && line.text === allowed.text) ||
+      (line.path === PUBLIC_DENYLIST_ALLOWLIST_PATH && line.text === `line\t${allowed.path}\t${allowed.text}`)
+    ) {
+      return WHOLE_LINE_EXEMPTION;
+    }
+  }
+  if (line.path === PUBLIC_DENYLIST_ALLOWLIST_PATH) {
+    for (const scope of allowlist.scopes) {
+      if (line.text === `package-scope\t${scope}`) return WHOLE_LINE_EXEMPTION;
+    }
+  }
+  const spans: { start: number; end: number }[] = [];
+  for (const reference of references) {
+    let match = reference.exec(line.text);
+    while (match !== null) {
+      // git's --column is a byte offset, not a JavaScript UTF-16 string index.
+      const start = Buffer.byteLength(line.text.slice(0, match.index));
+      spans.push({ start, end: start + Buffer.byteLength(match[0]) });
+      match = reference.exec(line.text);
+    }
+  }
+  return { wholeLine: false, spans };
+}
+
+async function judgeAddedLines(
+  lines: readonly AddedLine[],
+  configured: readonly string[],
+  siblings: readonly string[],
+  homePattern: string,
+  allowlist: Allowlist,
+  env: Environment,
+): Promise<Judged> {
+  const scratch = await mkdtemp(join(tmpdir(), 'smoo-public-denylist-'));
+  const scratchEnv = standaloneGitEnvironment(env);
+  try {
+    // Explicit PCRE policy and HOME are authoritative on original bytes. The repo allowlist
+    // exempts only automatically discovered sibling terms, never explicit clone configuration.
+    await writeFile(join(scratch, 'lines'), lines.map((line) => line.text).join('\n'));
+    const strict = grep(
+      scratch,
+      [
+        '--no-index',
+        '--no-exclude-standard',
+        '--color=never',
+        '-a',
+        '-i',
+        '-P',
+        '-n',
+        '-e',
+        homePattern,
+        ...configured.flatMap((pattern) => ['-e', pattern]),
+        '--',
+        'lines',
+      ],
+      scratchEnv,
+      'HOME / configured added lines / message',
+    );
+    if ('failure' in strict) return strict;
+    const matched = new Set<number>();
+    if (siblings.length > 0) {
+      // Every sibling regex consumes a nonempty, escaped directory name, so --only-matching
+      // enumerates real byte spans without the zero-width ambiguity of arbitrary user PCRE.
+      const spans = grep(
+        scratch,
+        [
+          '--no-index',
+          '--no-exclude-standard',
+          '--color=never',
+          '-a',
+          '-i',
+          '-P',
+          '-n',
+          '--column',
+          '--only-matching',
+          ...siblings.flatMap((pattern) => ['-e', pattern]),
+          '--',
+          'lines',
+        ],
+        scratchEnv,
+        'sibling reference spans',
+      );
+      if ('failure' in spans) return spans;
+      if (spans.rows !== '') {
+        const references = [
+          ...allowlist.scopes.map((scope) => new RegExp(`${escapeRegex(scope)}(?:/|%2[fF])[a-zA-Z0-9._-]+`, 'g')),
+          ...allowlist.repositories.map((repository) => new RegExp(`(?<!\\w)${escapeRegex(repository)}(?!\\w)`, 'g')),
+        ];
+        const exemptions = new Map<number, Exemption>();
+        for (const row of spans.rows.split('\n')) {
+          if (row === '') continue;
+          const found = /^lines:(\d+):(\d+):/.exec(row);
+          if (!found) return { failure: `git grep returned an unrecognized match diagnostic: ${row}` };
+          const index = Number(found[1]) - 1;
+          const line = lines[index];
+          if (!line) return { failure: `git grep returned an out-of-range line: ${index + 1}` };
+          let exemption = exemptions.get(index);
+          if (!exemption) {
+            exemption = referenceExemption(line, allowlist, references);
+            exemptions.set(index, exemption);
+          }
+          if (exemption.wholeLine) continue;
+          const start = Number(found[2]) - 1;
+          const end = start + Buffer.byteLength(row.slice(found[0].length));
+          if (!exemption.spans.some((allowed) => start >= allowed.start && end <= allowed.end)) matched.add(index);
+        }
+      }
+    }
+    for (const row of strict.rows.split('\n')) {
+      if (row === '') continue;
+      const found = /^lines:(\d+):/.exec(row);
+      if (!found) return { failure: `git grep returned an unrecognized line diagnostic: ${row}` };
+      matched.add(Number(found[1]) - 1);
+    }
+    let diagnostics = '';
+    for (const index of [...matched].sort((left, right) => left - right)) {
+      const line = lines[index];
+      if (!line) return { failure: `git grep returned an out-of-range line: ${index + 1}` };
+      diagnostics += `${line.path === '' ? 'message' : `staged:${line.path}`}:${line.line}:${line.text}\n`;
+    }
+    return { rows: diagnostics };
+  } finally {
+    await rm(scratch, { recursive: true, force: true });
+  }
+}
+
+function escapeRegex(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/** Repository pointers from a hook must not redirect probes or scratch-file grep commands. */
+function standaloneGitEnvironment(env: Environment): Environment {
+  const standalone = { ...env };
+  for (const key of ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_INDEX_FILE', 'GIT_PREFIX']) {
+    delete standalone[key];
+  }
+  return standalone;
+}
+
+function errorReason(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
