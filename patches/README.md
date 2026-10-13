@@ -129,6 +129,20 @@ drives an owned daemon RPC with the same root's trailing separator, then a genui
 daemon remains available to its own workspace. No caller root override, shared-socket allowance or namespace workaround
 replaces the guard. Drop this hunk only when upstream contains the same normalization, retaining the regression.
 
+## The installed Nx answers, never `nx@latest`
+
+Stock Nx answers the Nx Console and AI-agent status every `nx run` asks its daemon for by installing `nx@latest` from
+the registry into a temporary directory, unless the daemon's environment says `NX_USE_LOCAL=true`; the daemon takes that
+environment from whichever client spoke last. Agents, cowshed jobs, test fixtures and library clients (smoo, cowshed's
+task hashing, `ensureBuilt`) run without the variable. The `latest-nx` hunk makes the daemon resolve its own installed
+Nx instead, whatever a client sends, so it starts no package manager and asks no registry. The `bin/nx` hunk defaults
+`NX_USE_LOCAL` to `true` for every command and the processes it starts, so `nx configure-ai-agents`, `nx init` and
+`nx migrate` use the installed CLI; `NX_USE_LOCAL=false` restores the latest one for one command.
+
+`nx-use-local.test.ts` starts a fixture daemon from a library client without the variable and then runs the bare
+`node_modules/.bin/nx` entry against it, with every package manager on `PATH` replaced by one that records its run. The
+daemon must take the branch that pulled `nx@latest`, pull nothing, and start no package manager.
+
 ## Requested task closure after dummy normalization
 
 The `create-task-graph` hunk retains only the caller's initial tasks and the tasks reachable from them through the
