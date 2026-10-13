@@ -83,10 +83,10 @@ fn remove_if_present(path: &Path) -> Result<(), ApfsStorageError> {
     }
 }
 
-/// Every process holding anything inside the payload tree at `image`.
+/// Every process holding anything inside the payload tree at `image`, confirmed by a second
+/// census (see `confirmed_tree_holders`).
 fn holders_of(image: &Path) -> Result<Vec<Holder>, ApfsStorageError> {
-    crate::build_volume::nx::tree_holders(image)
-        .map_err(|error| io_error("list the processes holding a build volume", image, error))
+    super::confirmed_tree_holders(image)
 }
 
 fn journal_release(layout: &BuildVolumeLayout, image: &Path, recorded: Option<&BuildVolumeRole>) {
