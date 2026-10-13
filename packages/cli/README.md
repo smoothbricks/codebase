@@ -1406,6 +1406,9 @@ number). It lists every `prN` this repository holds records for, asks the forge 
 `GH_TOKEN`/`GITHUB_TOKEN`, and runs `cleanup-pr` for each one that is closed and whose head and base are this
 repository. An open pull request is kept; a state the forge cannot answer is a failure, never read as closed. One
 stage's failure does not stop the others. `--pr` restricts the sweep to that one pull request, still only if closed.
+Outside CI it needs the stage deploy's `CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_API_TOKEN` plus a `GH_TOKEN` that reads
+pull requests, and asks GitHub about the github.com repository the root `package.json` names; any other forge needs
+`FORGEJO_SERVER_URL` and `FORGEJO_REPOSITORY`.
 
 It then counts the account's Durable Object namespaces and writes a report to stdout and, in Actions, the job summary.
 It exits 1 when a stage could not be cleaned up or when more than 80% of the 500 namespaces are in use, so the scheduled
