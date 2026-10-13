@@ -3332,10 +3332,18 @@ async fn prove_re_adoption(proof: ReAdoptionProof) {
             b"untracked notes\n"
         );
         assert_eq!(git_stdout(&fixture.checkout, &["rev-parse", "HEAD"]), head);
+        // Read-only, as the product's own probes are: a status that refreshed the published
+        // index would change main's `.git` after publication, and the published-loss phase below
+        // replays the re-adoption's remount verification against the recorded before-state.
         assert_eq!(
             git_stdout(
                 &fixture.checkout,
-                &["status", "--porcelain", "--untracked-files=all"]
+                &[
+                    "--no-optional-locks",
+                    "status",
+                    "--porcelain",
+                    "--untracked-files=all"
+                ]
             ),
             status
         );
@@ -3856,19 +3864,24 @@ async fn real_apfs_missing_main_recovers_empty_and_surviving_builds_and_replays_
     let build_image = layout.image(&main_volume);
     host.detach_existing_image(&build_image, DetachIntent::WhenIdle)
         .expect("detach the build volume without force");
+    let retained_build = healthy_source
+        .build
+        .as_ref()
+        .expect("the old build is recorded")
+        .image
+        .retained
+        .clone();
+    // The retained build goes with its record companion, as the re-adoption's removal guidance
+    // names both: the later phases re-adopt this main again under the same build identity, and
+    // a stray retained record would stand beside the next retention's original.
     for lost in [
         main_image.clone(),
         cowshed_core::metadata::sidecar_path(&main_image),
         PathBuf::from(format!("{}.ca.key", main_image.display())),
         build_image.clone(),
         layout.record(&main_volume),
-        healthy_source
-            .build
-            .as_ref()
-            .expect("the old build is recorded")
-            .image
-            .retained
-            .clone(),
+        PathBuf::from(format!("{}.json", retained_build.display())),
+        retained_build,
     ] {
         fs::remove_file(&lost).unwrap_or_else(|error| panic!("lose {}: {error}", lost.display()));
     }
