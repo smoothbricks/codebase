@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 use cowshed_apfs::{CommandRequest, CommandRunner, ProcessStatus, SystemCommandRunner};
-use cowshed_os::fork_lock::Run as _;
+use cowshed_os::fork_lock::{Run as _, Spawn as _};
 
 /// The `cowshed` binary under test, read when the test runs (see `output_contracts.rs`).
 fn cowshed() -> PathBuf {
@@ -40,8 +40,8 @@ fn hdiutil_info_answers_through_the_facade() {
     );
 }
 
-/// A failing tool is the tool's failure: the facade's status and both streams are the bytes the
-/// shared runner answers for the same argv in-process.
+/// A failing tool keeps its status and bytes. Stderr also carries the runner's lease progress;
+/// those diagnostics precede the tool output, which is delivered verbatim after the run.
 #[test]
 fn a_failing_tool_passes_its_own_status_and_bytes_through() {
     let argv = ["info", "cowshed-disk-command-no-such-disk"];
@@ -55,7 +55,7 @@ fn a_failing_tool_passes_its_own_status_and_bytes_through() {
     let output = disk_command(&["diskutil", "--", argv[0], argv[1]]);
     assert_eq!(output.status.code(), Some(code), "{output:?}");
     assert_eq!(output.stdout, expected.stdout);
-    assert_eq!(output.stderr, expected.stderr);
+    assert!(output.stderr.ends_with(&expected.stderr), "{output:?}");
 }
 
 #[test]
@@ -105,8 +105,10 @@ fn output_to_a_reader_that_left_is_a_wrapper_failure() {
         .stdin(Stdio::null())
         .stdout(Stdio::from(writer))
         .stderr(Stdio::piped())
-        .output_locked()
-        .expect("run cowshed disk-command");
+        .spawn_locked()
+        .expect("spawn cowshed with the closed stdout pipe")
+        .wait_with_output()
+        .expect("wait for cowshed disk-command");
     assert_eq!(output.status.code(), Some(100), "{output:?}");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("could not be delivered"), "{stderr}");
