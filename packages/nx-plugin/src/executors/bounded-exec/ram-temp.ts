@@ -1768,8 +1768,6 @@ function runBounded(file: string, args: readonly string[], deadlineMs: number): 
   const timer = setTimeout(() => {
     if (detach) {
       child.unref();
-      child.stdout.unref();
-      child.stderr.unref();
       resolve({
         status: 1,
         stdout: text(stdout),
