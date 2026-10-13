@@ -90,6 +90,7 @@ impl Drop for ScratchRoot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cowshed_os::fork_lock::Spawn as _;
     use std::io::BufRead;
     use std::process::{Command, Stdio};
 
@@ -115,7 +116,7 @@ mod tests {
                 .args(["-c", "printf 'ready\\n'; exec /bin/sleep 60"])
                 .current_dir(cwd)
                 .stdout(Stdio::piped())
-                .spawn()
+                .spawn_locked()
                 .unwrap();
             let mut ready = String::new();
             std::io::BufReader::new(child.stdout.take().unwrap())
