@@ -191,13 +191,13 @@ impl Ledger {
                 .front()
                 .expect("chosen for its head waiter");
             let least = head.want.min(share.saturating_sub(checkout.held).max(1));
-            if self.free < least {
-                return;
-            }
             let peers_wait = self
                 .checkouts
                 .iter()
                 .any(|(other, peer)| other != name && !peer.waiting.is_empty());
+            if peers_wait && self.free < least {
+                return;
+            }
             let tokens = if peers_wait {
                 least
             } else {
@@ -493,6 +493,18 @@ mod tests {
         // The host is full now: a's second runner queues until b leaves.
         assert_eq!(clock.ask(2, 3, "a", 18), []);
         assert_eq!(clock.leave(3, 2), [(3, 13)]);
+        assert!(clock.balanced());
+    }
+
+    #[test]
+    fn a_lone_waiter_takes_idle_tokens_even_below_its_fair_share() {
+        let mut clock = Clock::new(18);
+        assert_eq!(clock.ask(0, 1, "a", 12), [(1, 12)]);
+        // b's fair share is 9, but no peer waits: the remaining 6 must not sit idle.
+        assert_eq!(clock.ask(1, 2, "b", 18), [(2, 6)]);
+        assert_eq!(clock.ledger.status().held, 18);
+        assert_eq!(clock.leave(2, 2), []);
+        assert_eq!(clock.leave(3, 1), []);
         assert!(clock.balanced());
     }
 
