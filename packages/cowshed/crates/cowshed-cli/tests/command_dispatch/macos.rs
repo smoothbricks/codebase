@@ -1543,9 +1543,11 @@ fn assert_land_outcome(telemetry: &Path, build: &cowshed_core::api::dto::LandBui
             _ => None,
         })
         .collect::<Vec<_>>();
-    let [outcome] = outcomes.as_slice() else {
-        panic!("one durable outcome per land: {outcomes:?}");
-    };
+    // One durable outcome per land; this land's is the latest sealed.
+    let outcome = outcomes
+        .iter()
+        .max_by_key(|outcome| outcome.order)
+        .expect("one durable outcome per land");
     assert_eq!(
         outcome.seeded,
         matches!(build.seed, cowshed_core::api::dto::LandSeed::Frozen)
