@@ -589,7 +589,9 @@ Its tab-separated rules are `package-scope<TAB>@scope`, `repository<TAB>public-n
 `line<TAB>repository-relative-path<TAB>exact-text`. A package-scope rule exempts only its package references, including
 encoded patch filenames; an exact-line rule applies only to its named path. An allowed reference does not exempt a
 different private name on the same line, and no rule exempts the real `HOME` path. Filesystem, Git, or policy errors
-refuse the commit with diagnostics rather than silently disabling the guard.
+refuse the commit with diagnostics rather than silently disabling the guard. The allowlist exempts discovered sibling
+names only. Explicit `smoothbricks.publicDenylist` or `SMOOTHBRICKS_PUBLIC_DENYLIST` patterns still judge the original
+text and remain authoritative, just as in the push gate.
 
 The generated post-commit hook restores the index for the paths the commit just wrote. `git commit --only -- <paths>` is
 a partial commit: git stages those paths from the working tree into the real index, locks it, and builds the commit from
