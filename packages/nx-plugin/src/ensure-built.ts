@@ -537,14 +537,17 @@ export function callerOwnsWorkspace(
  * up for this same root keeps its overrides: they are the owner's cache and
  * sandbox boundary. A caller set up for another root, or for none, passes none
  * of them on, so Nx falls back to the per-root defaults. Nothing is reset or
- * bypassed: the root's own daemon and cache are used as they stand.
+ * bypassed: the root's own daemon and cache are used as they stand. Every one of
+ * them answers from the root's installed Nx (`NX_USE_LOCAL=true`): a daemon
+ * otherwise installs `nx@latest` to answer Nx Console's status, and a client
+ * without the variable recomputes the daemon's graph.
  */
 export function workspaceEnvironment(
   callerEnv: Readonly<NodeJS.ProcessEnv>,
   workspaceRoot: string,
   callerOwnsRoot: boolean,
 ): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = { ...callerEnv, NX_WORKSPACE_ROOT_PATH: workspaceRoot };
+  const env: NodeJS.ProcessEnv = { ...callerEnv, NX_WORKSPACE_ROOT_PATH: workspaceRoot, NX_USE_LOCAL: 'true' };
   if (!callerOwnsRoot) {
     for (const key of WORKSPACE_STATE_ENV_KEYS) {
       delete env[key];

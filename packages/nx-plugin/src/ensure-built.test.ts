@@ -442,15 +442,17 @@ describe('the environment Nx runs under', () => {
     expect(workspaceEnvironment(caller, workspace(), owns)).toEqual({
       PATH: '/usr/bin',
       NX_WORKSPACE_ROOT_PATH: workspace(),
+      NX_USE_LOCAL: 'true',
     });
   });
 
   it('keeps the socket, database and cache of a caller standing in the root it was set up for', () => {
     const owns = callerOwnsWorkspace(caller, join(workspace(), 'packages'), workspace());
     expect(owns).toBe(true);
-    expect(workspaceEnvironment(caller, workspace(), owns)).toEqual({
+    expect(workspaceEnvironment({ ...caller, NX_USE_LOCAL: 'false' }, workspace(), owns)).toEqual({
       ...caller,
       NX_WORKSPACE_ROOT_PATH: workspace(),
+      NX_USE_LOCAL: 'true',
     });
   });
 

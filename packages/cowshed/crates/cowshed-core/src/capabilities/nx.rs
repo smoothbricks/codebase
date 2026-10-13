@@ -25,6 +25,10 @@
 //! A workspace is cloned from an image, so a daemon's rendezvous record arrives byte-identical and
 //! names the daemon still serving the source tree. It is discarded at mint; the warm cache,
 //! database and project graph beside it are kept.
+//!
+//! Every job's Nx answers from the checkout's installed Nx (`NX_USE_LOCAL=true`): without it the
+//! daemon installs `nx@latest` from the registry to answer Nx Console's and the AI agents' status,
+//! and a client without the variable changes the daemon's environment, which recomputes its graph.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -68,6 +72,7 @@ fn contribute(context: &DetectionContext<'_>) -> Result<CapabilityContribution> 
             (WORKSPACE_ROOT_ENV, own(context.project_root.into())),
             ("NX_DAEMON", EnvAction::Unset),
             ("NX_PROJECT_GRAPH_CACHE_DIRECTORY", EnvAction::Unset),
+            ("NX_USE_LOCAL", EnvAction::Own(OsString::from("true"))),
         ]
         .into(),
         build_state: ["cache", "workspace-data"]
@@ -172,6 +177,7 @@ mod tests {
                     ("NX_CACHE_DIRECTORY", own(state.join("cache"))),
                     ("NX_DAEMON", EnvAction::Unset),
                     ("NX_PROJECT_GRAPH_CACHE_DIRECTORY", EnvAction::Unset),
+                    ("NX_USE_LOCAL", EnvAction::Own(OsString::from("true"))),
                     ("NX_SOCKET_DIR", own(fixture.runtime.join("nx"))),
                     (
                         "NX_WORKSPACE_DATA_DIRECTORY",
