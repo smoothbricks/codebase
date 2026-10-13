@@ -2173,6 +2173,267 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
     }
   });
 
+  it("scopes each serial group's runner inputs to its packages and their closure, and keeps an unscoped group workspace-wide", async () => {
+    const workspace = await createWorkspace();
+    try {
+      await writeApfsSplitFixture(workspace, [
+        ...APFS_SPLIT_GROUPS,
+        '[test-groups.wide]',
+        'max-threads = 1',
+        '',
+        ...serialOverride('test(/wide_/)', 'wide'),
+      ]);
+      const root = (await inferApfsSplit(workspace)).get('.') ?? {};
+      const device = root['cargo-test-group-real-apfs'];
+      const host = root['cargo-test-group-real-apfs-host'];
+      const wide = root['cargo-test-group-wide'];
+
+      // A group scoped to packages hashes those crates and every crate they link, and no other.
+      expect(hashedCrates(device)).toEqual(['cowshed-apfs', 'cowshed-apfs-tests', 'cowshed-os']);
+      expect(hashedCrates(host)).toEqual(['cowshed-apfs', 'cowshed-cli', 'cowshed-core', 'cowshed-os']);
+      // A filter scoped to no package keeps every member's tree, as the archive hashes them.
+      expect(hashedCrates(wide)).toEqual([
+        'cowshed-apfs',
+        'cowshed-apfs-tests',
+        'cowshed-cli',
+        'cowshed-core',
+        'cowshed-os',
+        'lmao-core',
+      ]);
+
+      // The proof as the three cases it makes. An unrelated crate reruns neither scoped group. A scenario
+      // edit reruns the device group alone: the scenarios are a crate of their own that no host crate
+      // depends on. A change to the production substrate, or to what it links, reruns both, because the
+      // host crates link it too. Nothing here excludes a tests tree, and the test support every real-image
+      // binary compiles in stays hashed for both groups.
+      const hashedBy = (path: string) => ({
+        device: hashes(device, path),
+        host: hashes(host, path),
+        wide: hashes(wide, path),
+      });
+      expect(hashedBy('packages/lmao/crates/lmao-core/src/lib.rs')).toEqual({ device: false, host: false, wide: true });
+      expect(hashedBy('packages/cowshed/crates/cowshed-apfs-tests/src/tests.rs')).toEqual({
+        device: true,
+        host: false,
+        wide: true,
+      });
+      expect(hashedBy('packages/cowshed/crates/cowshed-core/src/lib.rs')).toEqual({
+        device: false,
+        host: true,
+        wide: true,
+      });
+      expect(hashedBy('packages/cowshed/crates/cowshed-cli/src/lib.rs')).toEqual({
+        device: false,
+        host: true,
+        wide: true,
+      });
+      for (const shared of [
+        'packages/cowshed/crates/cowshed-apfs/src/lib.rs',
+        'packages/cowshed/crates/cowshed-apfs/tests/support/blank_image.rs',
+        'packages/cowshed/crates/cowshed-os/src/lib.rs',
+      ]) {
+        expect(hashedBy(shared), shared).toEqual({ device: true, host: true, wide: true });
+      }
+      for (const group of [device, host]) {
+        const exclusions = (group?.inputs ?? []).filter(
+          (input): input is string => typeof input === 'string' && input.startsWith('!'),
+        );
+        expect(exclusions.filter((input) => /\btests?\b/.test(input))).toEqual([]);
+      }
+
+      // Every scoped group still hashes every member manifest, the repository's nextest config and the
+      // run-wrapper its tests are bounded by: those decide a verdict whichever crates it selects.
+      for (const group of [device, host, wide]) {
+        expect(group?.inputs).toContain('{workspaceRoot}/packages/lmao/crates/lmao-core/Cargo.toml');
+        expect(group?.inputs).toContain('{workspaceRoot}/.config/nextest.toml');
+        expect(JSON.stringify(group?.inputs)).toContain('nextest-code-bound.ts');
+      }
+    } finally {
+      await workspace.cleanup();
+    }
+  });
+
+  it('refuses a serial group scoped to a package that is not a member of the Cargo workspace', async () => {
+    const workspace = await createWorkspace();
+    try {
+      await writeApfsSplitFixture(workspace, [
+        '[test-groups.real-apfs]',
+        'max-threads = 1',
+        '',
+        ...serialOverride('package(cowshed-missing) and test(/real_apfs_/)', 'real-apfs'),
+      ]);
+      // Nx wraps a createNodes throw in AggregateCreateNodesError, so the reason is in the nested error.
+      const failure = await inferApfsSplit(workspace).then(
+        () => undefined,
+        (error: unknown) => error,
+      );
+      if (!(failure instanceof AggregateCreateNodesError)) {
+        throw new Error(`expected AggregateCreateNodesError, got ${String(failure)}`);
+      }
+      expect(failure.errors[0]?.[1]?.message).toMatch(
+        /test-group "real-apfs" selects package\(cowshed-missing\), which is not a member of the Cargo workspace/,
+      );
+    } finally {
+      await workspace.cleanup();
+    }
+  });
+
+  it('keeps cargo-test to the ordinary suite and reaches every serial group from the gate of the root and of each member', async () => {
+    const workspace = await createWorkspace();
+    try {
+      await writeApfsSplitFixture(workspace, APFS_SPLIT_GROUPS);
+      const macos = await inferApfsSplit(workspace);
+      const root = macos.get('.') ?? {};
+      const cowshed = macos.get('packages/cowshed') ?? {};
+      const lmao = macos.get('packages/lmao') ?? {};
+      const rootProject = '@fixture/codebase';
+      const groups = [
+        { projects: [rootProject], target: 'cargo-test-group-real-apfs' },
+        { projects: [rootProject], target: 'cargo-test-group-real-apfs-host' },
+      ];
+
+      // `cargo-test` is the ordinary suite alone, whichever project owns the aggregate.
+      expect(root['cargo-test']?.dependsOn).toEqual([
+        { projects: ['cowshed'], target: 'cargo-test-cowshed-apfs' },
+        { projects: ['cowshed'], target: 'cargo-test-cowshed-apfs-tests' },
+        { projects: ['cowshed'], target: 'cargo-test-cowshed-cli' },
+        { projects: ['cowshed'], target: 'cargo-test-cowshed-core' },
+        { projects: ['cowshed'], target: 'cargo-test-cowshed-os' },
+        { projects: ['lmao'], target: 'cargo-test-lmao-core' },
+      ]);
+      expect(cowshed['cargo-test']?.dependsOn).toEqual([
+        'cargo-test-cowshed-apfs',
+        'cargo-test-cowshed-apfs-tests',
+        'cargo-test-cowshed-cli',
+        'cargo-test-cowshed-core',
+        'cargo-test-cowshed-os',
+      ]);
+      expect(lmao['cargo-test']?.dependsOn).toEqual(['cargo-test-lmao-core']);
+
+      // The gate reaches the ordinary suite and both groups: by plain name at the root that owns the
+      // groups, across projects from a member, whether or not the member owns a crate the groups hold.
+      expect(root.test?.dependsOn).toEqual([
+        'cargo-test',
+        'cargo-test-group-real-apfs',
+        'cargo-test-group-real-apfs-host',
+      ]);
+      expect(cowshed.test?.dependsOn).toEqual(['cargo-test', ...groups]);
+      expect(lmao.test?.dependsOn).toEqual(['cargo-test', ...groups]);
+
+      // Inference orders nothing between the groups: that edge is the repository's explicit config.
+      for (const name of ['cargo-test-group-real-apfs', 'cargo-test-group-real-apfs-host']) {
+        expect(root[name]?.dependsOn).toEqual(['cargo-fetch', 'cargo-test-archive']);
+      }
+
+      // Every crate piece, scoped to a package the groups hold or not, excludes both groups' tests.
+      const exclusion =
+        'not ((package(cowshed-apfs-tests) and test(/real_apfs_/)) or ' +
+        '(package(cowshed-core) and (test(/real_apfs_/) or binary(apfs_native_macos))) or ' +
+        '(package(cowshed-cli) and test(/real_apfs_/)))';
+      const pieces: ReadonlyArray<readonly [TargetConfiguration | undefined, string]> = [
+        [cowshed['cargo-test-cowshed-apfs'], 'cowshed-apfs'],
+        [cowshed['cargo-test-cowshed-apfs-tests'], 'cowshed-apfs-tests'],
+        [lmao['cargo-test-lmao-core'], 'lmao-core'],
+      ];
+      for (const [piece, crate] of pieces) {
+        expect(piece?.options?.command, crate).toContain(
+          `-E 'package(${crate}) and ${exclusion}' --no-fail-fast --no-tests=pass`,
+        );
+      }
+
+      // Off macOS the groups are not inferred, so the gate is the ordinary suite alone.
+      const linux = await inferApfsSplit(workspace, createNodesV2ForPlatform('linux', 'x64'));
+      expect(linux.get('.')?.test?.dependsOn).toEqual(['cargo-test']);
+      expect(linux.get('packages/cowshed')?.test?.dependsOn).toEqual(['cargo-test']);
+      expect(linux.get('.')?.['cargo-test-group-real-apfs-host']).toBeUndefined();
+    } finally {
+      await workspace.cleanup();
+    }
+  });
+
+  it('runs the host group after the device group through the explicit targetDefaults edge, and the gate runs both', async () => {
+    const workspace = await createWorkspace();
+    try {
+      await writeApfsSplitFixture(workspace, APFS_SPLIT_GROUPS);
+      const macos = await inferApfsSplit(workspace);
+      const rootProject = '@fixture/codebase';
+      const rootTargets = macos.get('.') ?? {};
+
+      // The edge as the repository's nx.json states it. Nx expands `...` to the inferred list, so the
+      // archive and the locked fetch stay ahead of the host group beside the device group.
+      const nxJson = {
+        targetDefaults: { 'cargo-test-group-real-apfs-host': { dependsOn: ['...', 'cargo-test-group-real-apfs'] } },
+      };
+      let host = rootTargets['cargo-test-group-real-apfs-host'] ?? {};
+      for (const [, , result] of createTargetDefaultsResults(
+        { '.': { root: '.', targets: rootTargets } },
+        {},
+        nxJson,
+      )) {
+        const target = result.projects?.['.']?.targets?.['cargo-test-group-real-apfs-host'];
+        if (target) host = mergeTargetConfigurations(target, host);
+      }
+      expect(host.dependsOn).toEqual(['cargo-fetch', 'cargo-test-archive', 'cargo-test-group-real-apfs']);
+
+      const nodes: Record<string, ProjectGraphProjectNode> = {
+        [rootProject]: {
+          name: rootProject,
+          type: 'app',
+          data: { root: '.', targets: { ...rootTargets, 'cargo-test-group-real-apfs-host': host } },
+        },
+        cowshed: {
+          name: 'cowshed',
+          type: 'lib',
+          data: { root: 'packages/cowshed', targets: macos.get('packages/cowshed') ?? {} },
+        },
+        lmao: {
+          name: 'lmao',
+          type: 'lib',
+          data: { root: 'packages/lmao', targets: macos.get('packages/lmao') ?? {} },
+        },
+      };
+      const graph: ProjectGraph = { nodes, dependencies: { [rootProject]: [], cowshed: [], lmao: [] } };
+      const task = (project: string, target: string): string => `${project}:${target}`;
+      // Every task `from` waits on, directly or through the tasks it waits on.
+      const reached = (dependencies: Record<string, string[]>, from: string): string[] => {
+        const seen = new Set<string>();
+        const pending = [from];
+        while (pending.length > 0) {
+          const next = pending.pop();
+          if (next === undefined || seen.has(next)) continue;
+          seen.add(next);
+          pending.push(...(dependencies[next] ?? []));
+        }
+        return [...seen];
+      };
+      const groupsReached = (dependencies: Record<string, string[]>, from: string): string[] =>
+        reached(dependencies, from).filter((id) => id.includes(':cargo-test-group-'));
+      const device = task(rootProject, 'cargo-test-group-real-apfs');
+      const hosted = task(rootProject, 'cargo-test-group-real-apfs-host');
+
+      // The task graph `nx run-many -t test` runs: the host group starts only once the device group is done,
+      // so two real-image runners never overlap, and the ordinary suite reaches neither.
+      const gate = createTaskGraph(graph, {}, [rootProject], ['test'], undefined, {});
+      expect(gate.dependencies[task(rootProject, 'test')]).toEqual(
+        expect.arrayContaining([task(rootProject, 'cargo-test'), device, hosted]),
+      );
+      expect(gate.dependencies[hosted]).toContain(device);
+      expect(gate.dependencies[device]).not.toContain(hosted);
+      expect(reached(gate.dependencies, device)).not.toContain(hosted);
+      expect(groupsReached(gate.dependencies, task(rootProject, 'cargo-test'))).toEqual([]);
+
+      // A member's gate reaches both groups too, and the order between them holds for it.
+      const member = createTaskGraph(graph, {}, ['cowshed'], ['test'], undefined, {});
+      expect(member.dependencies[task('cowshed', 'test')]).toEqual(
+        expect.arrayContaining([task('cowshed', 'cargo-test'), device, hosted]),
+      );
+      expect(groupsReached(member.dependencies, task('cowshed', 'cargo-test'))).toEqual([]);
+      expect(member.dependencies[hosted]).toContain(device);
+    } finally {
+      await workspace.cleanup();
+    }
+  });
+
   it('rejects a shard count that cannot describe a partition', async () => {
     const workspace = await createWorkspace();
     try {
@@ -2841,4 +3102,114 @@ function expectNoSchedulerThrottle(targets: Record<string, TargetConfiguration>)
     expect(target.parallelism, `${name} parallelism`).toBeUndefined();
     expect(target.options?.parallel, `${name} options.parallel`).toBeUndefined();
   }
+}
+
+/** A default-profile override that puts the tests `filter` selects in `group`, on the platform serial groups run on. */
+function serialOverride(filter: string, group: string): string[] {
+  return [
+    '[[profile.default.overrides]]',
+    `filter = '${filter}'`,
+    `platform = 'cfg(target_os="macos")'`,
+    `test-group = '${group}'`,
+    '',
+  ];
+}
+
+/** The real-image split in miniature: a device group over one crate, a host group over the two crates above it. */
+const APFS_SPLIT_GROUPS: readonly string[] = [
+  '[test-groups.real-apfs]',
+  'max-threads = 1',
+  '',
+  '[test-groups.real-apfs-host]',
+  'max-threads = 1',
+  '',
+  ...serialOverride('package(cowshed-apfs-tests) and test(/real_apfs_/)', 'real-apfs'),
+  ...serialOverride('package(cowshed-core) and (test(/real_apfs_/) or binary(apfs_native_macos))', 'real-apfs-host'),
+  ...serialOverride('package(cowshed-cli) and test(/real_apfs_/)', 'real-apfs-host'),
+];
+
+/**
+ * A repository-root Cargo workspace with two projects: `cowshed` holds the production device layer (`cowshed-apfs`,
+ * which links `cowshed-os` and carries the test support the crates above it compile in), the real-image scenarios in a
+ * crate of their own (`cowshed-apfs-tests`, which nothing depends on) and the host crates, and `lmao` holds a crate no
+ * group can reach. `nextest` is the repository's `.config/nextest.toml`.
+ */
+async function writeApfsSplitFixture(workspace: WorkspaceFixture, nextest: readonly string[]): Promise<void> {
+  const crate = (
+    project: string,
+    name: string,
+    dependencies: readonly string[] = [],
+    section: 'dependencies' | 'dev-dependencies' = 'dependencies',
+  ): Promise<void> =>
+    workspace.write(
+      `packages/${project}/crates/${name}/Cargo.toml`,
+      [
+        '[package]',
+        `name = "${name}"`,
+        ...(dependencies.length === 0
+          ? []
+          : ['', `[${section}]`, ...dependencies.map((dependency) => `${dependency} = { path = "../${dependency}" }`)]),
+        '',
+      ].join('\n'),
+    );
+  await workspace.write('package.json', '{"name":"@fixture/codebase"}\n');
+  await workspace.write('packages/cowshed/package.json', '{"name":"@fixture/cowshed","nx":{"name":"cowshed"}}\n');
+  await workspace.write('packages/lmao/package.json', '{"name":"@fixture/lmao","nx":{"name":"lmao"}}\n');
+  await workspace.write('Cargo.toml', '[workspace]\nmembers = ["packages/*/crates/*"]\n');
+  await crate('cowshed', 'cowshed-os');
+  await crate('cowshed', 'cowshed-apfs', ['cowshed-os']);
+  await crate('cowshed', 'cowshed-apfs-tests', ['cowshed-apfs', 'cowshed-os'], 'dev-dependencies');
+  await crate('cowshed', 'cowshed-core', ['cowshed-apfs', 'cowshed-os']);
+  await crate('cowshed', 'cowshed-cli', ['cowshed-core']);
+  await crate('lmao', 'lmao-core');
+  await workspace.write(
+    'packages/cowshed/crates/cowshed-apfs/tests/support/blank_image.rs',
+    '// shared test support\n',
+  );
+  await workspace.write('.config/nextest.toml', nextest.join('\n'));
+}
+
+/** Inference over the split fixture's three projects in the one call Nx makes: project root to inferred targets. */
+async function inferApfsSplit(
+  workspace: WorkspaceFixture,
+  createNodes: CreateNodesV2 = createNodesV2ForPlatform('darwin', 'arm64'),
+): Promise<Map<string, Record<string, TargetConfiguration>>> {
+  const [, infer] = createNodes;
+  await prepareCargoFixture(workspace.context.workspaceRoot);
+  resetWorkspaceContext();
+  const inferred = await infer(
+    ['package.json', 'packages/cowshed/package.json', 'packages/lmao/package.json'],
+    undefined,
+    workspace.context,
+  );
+  return new Map(
+    inferred.flatMap(([, result]) =>
+      Object.entries(result.projects ?? {}).map(([root, project]): [string, Record<string, TargetConfiguration>] => [
+        root,
+        project.targets ?? {},
+      ]),
+    ),
+  );
+}
+
+/** The crates whose whole tree a target hashes: one `{workspaceRoot}/…/crates/<crate>/**\/*` fileset each. */
+function hashedCrates(target: TargetConfiguration | undefined): string[] {
+  const crates = (target?.inputs ?? []).flatMap((input) =>
+    typeof input === 'string'
+      ? (/^\{workspaceRoot\}\/packages\/[^/]+\/crates\/([^/]+)\/\*\*\/\*$/.exec(input)?.[1] ?? [])
+      : [],
+  );
+  return [...new Set(crates)].sort((left, right) => left.localeCompare(right));
+}
+
+/** Whether Nx would hash `path` (workspace-relative) under the `{workspaceRoot}` filesets of `target`'s inputs. */
+function hashes(target: TargetConfiguration | undefined, path: string): boolean {
+  const filesets = (target?.inputs ?? []).flatMap((input) =>
+    typeof input === 'string' && input.includes('{workspaceRoot}') ? [input] : [],
+  );
+  const matches = (fileset: string): boolean => new Bun.Glob(fileset.replace('{workspaceRoot}/', '')).match(path);
+  return (
+    filesets.some((input) => !input.startsWith('!') && matches(input)) &&
+    !filesets.some((input) => input.startsWith('!') && matches(input.slice(1)))
+  );
 }
