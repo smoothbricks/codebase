@@ -3231,6 +3231,7 @@ impl SupervisorActor {
     async fn run(mut self) {
         loop {
             if self.command_lane_closed && !self.has_running_jobs() {
+                self.release_kept_nx_daemon().await;
                 break;
             }
             tokio::select! {
@@ -3263,9 +3264,30 @@ impl SupervisorActor {
                 }
             }
             self.finish_ready_jobs().await;
+            if self.lifecycle == ActorLifecycle::Retiring && !self.has_running_jobs() {
+                self.release_kept_nx_daemon().await;
+            }
             self.finish_lifecycle_waiters();
         }
         self.labelling.abort_all();
+    }
+
+    /// End the Nx daemon this supervisor's keeper kept, once the supervisor is retiring or its
+    /// last handle is gone and no job of its runs: a supervisor retires only once its keeper
+    /// holds no daemon (04_sandbox.md), so none outlives the supervisor that watched it. The
+    /// keeper goes with it, so no later probe starts another.
+    async fn release_kept_nx_daemon(&mut self) {
+        if self.nx_daemon.take().is_none() {
+            return;
+        }
+        let (read_write, _) = self
+            .policy
+            .child(crate::api::dto::RunSandboxMode::ReadWrite);
+        if let Some(project_root) =
+            super::nx_daemon::kept_project(read_write).map(Path::to_path_buf)
+        {
+            super::nx_daemon::release(&project_root).await;
+        }
     }
 
     /// Arm the sampling clock, if it is not running: a job owns a process now. Its first tick
@@ -3559,10 +3581,16 @@ impl SupervisorActor {
                 } else {
                     self.lifecycle = ActorLifecycle::Retiring;
                     self.retire_waiters.push(reply);
+                    // The keeper's own start job is let finish: killed, it could leave the
+                    // detached daemon it was starting to write its record after the keeper's
+                    // stop read none. Finished, its daemon is recorded and the stop ends it.
+                    let starting = self.nx_daemon.as_ref().and_then(|keeper| keeper.starting);
                     let running = self
                         .jobs
                         .iter()
-                        .filter_map(|(id, job)| (!job.terminal()).then_some(*id))
+                        .filter_map(|(id, job)| {
+                            (!job.terminal() && Some(*id) != starting).then_some(*id)
+                        })
                         .collect::<Vec<_>>();
                     for job_id in running {
                         let _ = self.begin_kill(job_id, KillReason::Retire);

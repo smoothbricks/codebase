@@ -2234,7 +2234,31 @@ async fn directory_a_fork_of_a_workspace_reseeds_it_and_hits_its_latest_run_subs
         .expect("w2 is mounted")
         .mount;
     let hits = nx_statuses(&mut service, "w2", &w2, &nx_check).await;
+    // Each shed's keeper keeps an Nx daemon with its plugin workers. The runtime's shutdown
+    // retires the supervisors it serves, and a supervisor retires only once its keeper's daemon
+    // stopped (04_sandbox.md): shutdown returns after that stop saw the daemon exit, and the
+    // daemon's plugin workers follow it out.
+    let kept = recorded_daemon(&w2).expect("w2's run left its kept daemon recorded");
+    assert!(
+        cowshed_os::process::running(kept).expect("read the daemon's state"),
+        "w2's kept daemon {kept} runs before the shutdown"
+    );
+    let workers: Vec<libc::pid_t> = [&w1, &w2]
+        .into_iter()
+        .filter_map(|checkout| recorded_daemon(checkout))
+        .flat_map(children_of)
+        .collect();
     service.shutdown().await.expect("stop the runtime");
+    for checkout in [&w1, &w2] {
+        if let Some(daemon) = recorded_daemon(checkout) {
+            assert!(
+                !cowshed_os::process::running(daemon).expect("read the daemon's state"),
+                "{}'s kept Nx daemon {daemon} outlives the runtime",
+                checkout.display()
+            );
+        }
+    }
+    await_exits(&workers);
     fixture.stop_gateway().await;
     assert_eq!(hits.len(), 2, "{hits:?}");
     assert!(
@@ -2242,6 +2266,93 @@ async fn directory_a_fork_of_a_workspace_reseeds_it_and_hits_its_latest_run_subs
             .all(|(_, status)| *status == nx::CacheStatus::LocalHit),
         "a fork reseeds w1 first and hits w1's run: {hits:?}"
     );
+}
+
+/// The pid the Nx daemon record in `checkout` names, if there is a record.
+fn recorded_daemon(checkout: &Path) -> Option<libc::pid_t> {
+    let record = checkout.join(".nx/workspace-data/d/server-process.json");
+    let bytes = match fs::read(&record) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(error) => panic!("{}: {error}", record.display()),
+    };
+    let record: serde_json::Value =
+        serde_json::from_slice(&bytes).expect("the daemon record is JSON");
+    Some(
+        record["processId"]
+            .as_i64()
+            .and_then(|pid| libc::pid_t::try_from(pid).ok())
+            .expect("the record names the daemon's pid"),
+    )
+}
+
+/// The pids whose parent is `parent`: an Nx daemon's plugin workers.
+fn children_of(parent: libc::pid_t) -> Vec<libc::pid_t> {
+    let listed = Command::new("/bin/ps")
+        .args(["-Ao", "pid=,ppid="])
+        .output()
+        .expect("list processes");
+    String::from_utf8_lossy(&listed.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace().map(str::parse::<libc::pid_t>);
+            match (fields.next(), fields.next()) {
+                (Some(Ok(pid)), Some(Ok(ppid))) if ppid == parent => Some(pid),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+/// Wait on the kernel's exit event of each of `pids`, however long that takes; one already gone
+/// has nothing to wait for. A process that stays makes the test outlive its slow bound.
+fn await_exits(pids: &[libc::pid_t]) {
+    // SAFETY: kqueue takes nothing and returns a new descriptor or -1.
+    let queue = unsafe { libc::kqueue() };
+    assert!(queue >= 0, "kqueue: {}", std::io::Error::last_os_error());
+    // SAFETY: a fresh descriptor this function alone owns.
+    let queue = unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(queue) };
+    let raw = std::os::fd::AsRawFd::as_raw_fd(&queue);
+    let mut waiting = 0;
+    for &pid in pids {
+        let exit = libc::kevent {
+            ident: pid as libc::uintptr_t,
+            filter: libc::EVFILT_PROC,
+            flags: libc::EV_ADD | libc::EV_ONESHOT,
+            fflags: libc::NOTE_EXIT,
+            data: 0,
+            udata: std::ptr::null_mut(),
+        };
+        // SAFETY: one valid change, no events requested back.
+        if unsafe { libc::kevent(raw, &exit, 1, std::ptr::null_mut(), 0, std::ptr::null()) } == 0 {
+            waiting += 1;
+        } else {
+            let error = std::io::Error::last_os_error();
+            assert_eq!(
+                error.raw_os_error(),
+                Some(libc::ESRCH),
+                "watch {pid}: {error}"
+            );
+        }
+    }
+    while waiting > 0 {
+        // SAFETY: an all-zero kevent is a valid buffer for the kernel to fill.
+        let mut event: libc::kevent = unsafe { std::mem::zeroed() };
+        // SAFETY: room for exactly one event; no changes; no timeout.
+        let got =
+            unsafe { libc::kevent(raw, std::ptr::null(), 0, &mut event, 1, std::ptr::null()) };
+        match got {
+            1 => waiting -= 1,
+            _ => {
+                let error = std::io::Error::last_os_error();
+                assert_eq!(
+                    error.raw_os_error(),
+                    Some(libc::EINTR),
+                    "await exits: {error}"
+                );
+            }
+        }
+    }
 }
 
 /// Doctor's `build-link` findings: one message each.
