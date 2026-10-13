@@ -380,8 +380,8 @@ const FIXTURE_IMAGE: &str = "cowshed-test-fixture-image=";
 const FIXTURE_WORKER: &str = "cowshed-test-fixture-worker=";
 
 /// A real-image fixture leaves nothing attached and nothing running however its run ends. A
-/// panic unwinds through the scratch root's own teardown. A kill — nextest's
-/// `terminate-after`, a host-wide stop — runs no teardown at all, so its parent reclaims the
+/// panic unwinds through the scratch root's own teardown. A kill — the runner's no-progress
+/// bound, a host-wide stop — runs no teardown at all, so its parent reclaims the
 /// exact root after reaping the child. The same cleanup ends the dead owner's processes and
 /// releases its images without sweeping other host runs.
 /// Fixtures staged under `$TMPDIR` stayed attached after timed-out runs, and the stock Nx daemon a

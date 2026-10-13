@@ -31,13 +31,13 @@
 # `#[ignore]`d host-controller and contention lanes and stay out of these groups.
 # `clone_intent_recovery` runs on the directory substrate and belongs to neither group.
 #
-# A test's performance bound is on its code time, not its wall time
+# A test's class is on its code time, not its wall time
 # (specs/cowshed/08_testing.md, "Integration tests (real substrate)"): part of
 # its wall time is queued for the host-wide disk-lifecycle lease behind every
 # other cowshed process on the host. Its run-wrapper records those waits and
-# fails a test whose wall time less their union exceeds its class. The 180s
-# slow-timeout is the hang backstop that ends a test nextest would otherwise
-# wait on forever, not the performance bound.
+# warns of a test whose wall time less their union exceeds its class. No rule
+# here kills a test: the plugin's slow-timeout only warns, and the group's run
+# ends a test that never returns at its no-progress bound, naming it.
 experimental = ["wrapper-scripts"]
 
 [test-groups.real-apfs]
@@ -50,19 +50,16 @@ max-threads = 1
 filter = 'package(cowshed-apfs-tests) and test(/real_apfs_/)'
 platform = 'cfg(target_os="macos")'
 test-group = 'real-apfs'
-slow-timeout = { period = "180s", terminate-after = 1 }
 
 [[profile.default.overrides]]
 filter = 'package(cowshed-core) and (test(/real_apfs_/) or binary(apfs_native_macos) or test(=storage::apfs::native::build_volumes::tests::a_jobs_volumes_count_from_admission_through_its_command_to_its_sealed_record))'
 platform = 'cfg(target_os="macos")'
 test-group = 'real-apfs-host'
-slow-timeout = { period = "180s", terminate-after = 1 }
 
 [[profile.default.overrides]]
 filter = 'package(cowshed-cli) and test(/real_apfs_/)'
 platform = 'cfg(target_os="macos")'
 test-group = 'real-apfs-host'
-slow-timeout = { period = "180s", terminate-after = 1 }
 
 # The two performance classes. The wrapper is run from the plugin's shipped
 # source, which each group's runner hashes as an input.
