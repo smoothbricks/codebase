@@ -385,6 +385,9 @@ exclude each other rather than N interchangeable tokens.
 - **A test's waits are recorded.** When `COWSHED_LEASE_WAIT_RECORD` names a file, every client also appends each wait's
   start before it asks and its end once the wait is over, so the real-APFS lane can bound a test's code time without the
   host's queue (08_testing.md, "Integration tests (real substrate)"). Nothing on the wire changes.
+- **A run's commands are recorded.** When `COWSHED_DISK_COMMAND_RECORD` names a file, cowshed's `leased` also appends
+  every disk command as `<class> <argv>` before it runs, leased or not, so a test run counts the images it attached and
+  the volumes it mounted (08_testing.md, "Integration tests (real substrate)").
 
 The regression is `cowshed-gateway`'s `contention_attaches_stay_fast_beside_mount_churn_only_under_the_lease`, run by
 name with `--ignored`: eight real attach/detach loops beside two real mount loops for 40 s, first through a real
@@ -482,12 +485,12 @@ parallel, and the total runnable work stays near the core count.
   different job. The gateway answers `{"ok":true,"lease":"queued","id":"<lease id>"}` at once and
   `{"ok":true,"lease":"granted","id":"<lease id>","tokens":<g>}` when the runner may start. The same lease id identifies
   that admission until its connection closes. `want` 0, a missing or empty checkout, or one over 4096 bytes is refused
-  as `invalid-request`. `{"op":"cpu-budget"}` is one-shot and answers the ledger as `cpuBudget`: `total`, `held`, and per
-  checkout `held`, `running` and `waiting`.
+  as `invalid-request`. `{"op":"cpu-budget"}` is one-shot and answers the ledger as `cpuBudget`: `total`, `held`, and
+  per checkout `held`, `running` and `waiting`.
 - **Priority updates.** `{"op":"job-qos","job":{…}|"lease":"<lease id>","priority":<u32>}` is one-shot and answers
   `{"ok":true}`, or `not-found` for an admission that is not live. It re-keys the selected admission only while queued;
-  a granted job keeps its grant and band. The caller supplies the same coordinator priority on later admissions.
-  This control changes neither the token budget nor the dynamic-band rules and creates no separate resource ledger.
+  a granted job keeps its grant and band. The caller supplies the same coordinator priority on later admissions. This
+  control changes neither the token budget nor the dynamic-band rules and creates no separate resource ledger.
 - **The budget spaces runners out; it never decides whether one runs.** With no gateway listening (any host without
   cowshed, CI included) the command runs exactly as configured and nothing is said. A gateway that predates the budget
   refuses the unknown operation at once (an older one, silent until EOF, is half-closed after 2 s), and the command runs

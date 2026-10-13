@@ -291,7 +291,10 @@ scheduler flag. There is no measured attach-count constant and no pre-lane admis
 the first fixture that would spend into a spent pool is the fail-fast behaviour, and it needs no number from the lane.
 `attach-budget --clear` still ends a recorded 150 after the operator freed what spent it. The leaked-device delta across
 a lane run (`ioclasscount AppleDiskImageDevice` against the registered devices, before and after) is the check that no
-disk-image command still leaks on a clean run; it must be 0.
+disk-image command still leaks on a clean run; it must be 0. A run's spend is counted, not estimated: with
+`COWSHED_DISK_COMMAND_RECORD` set (05_gateway.md, "Disk-lifecycle lease"), its `diskutil image attach` lines are its
+attaches, and its `mount_apfs` and `diskutil mount` lines and its attaches without `--noMount` are its mounts. Ordinary
+`cargo-test` records neither.
 
 **The suite spends a finite host budget.** Every attach→detach cycle a test makes can leak an AppleDiskImages2 device
 that the host's live sheds lose until reboot (01_storage.md, "How the APFS host degrades" §2), so a test pays the fewest
