@@ -12,13 +12,13 @@ the data plane only as an intercepted fetch (Egress modes, below).
 
 On macOS the gateway runs as the `dev.cowshed.gateway` LaunchAgent at launchd `ProcessType` **Interactive**, the one
 type that runs at parity with the host's own processes (PRI 31). The type is the QoS band of the agent and every
-descendant, and a descendant cannot rise above it; the daemon's supervisor manager starts every workspace supervisor,
-which starts every shell host and job. Background runs them at priority 4 and Standard at priority 20 (the utility
-band), and both throttle their I/O behind the host's. Under Background on a host at load 80 a fresh workspace's
-supervisor took 115 s to answer and its first `cowshed exec` spent 537 s inside `direnv export json`; under the utility
-clamp at load 10–47 the first `codegraph status` over a fresh workspace's cold 1 GB SQLite index took 34.5 s and 54.5 s
-where the same cold run unclamped took 2.4 s and 2.7 s. The sccache LaunchAgent is Interactive for the same reason
-(launchd.rs `PROCESS_TYPE`).
+descendant, and a descendant cannot leave it; the daemon's supervisor manager starts every workspace supervisor, which
+starts every shell host and job. Background runs them at priority 4 and Standard at priority 20 (the utility band), and
+both throttle their I/O behind the host's. Under Background on a host at load 80 a fresh workspace's supervisor took 115
+s to answer and its first `cowshed exec` spent 537 s inside `direnv export json`; under the utility clamp at load 10–47
+the first `codegraph status` over a fresh workspace's cold 1 GB SQLite index took 34.5 s and 54.5 s where the same cold
+run unclamped took 2.4 s and 2.7 s. The sccache LaunchAgent is Interactive for the same reason (launchd.rs
+`PROCESS_TYPE`).
 
 The gateway's generated plist sets `SoftResourceLimits.NumberOfFiles` to the finite kernel-sized value `245760` and
 `HardResourceLimits.NumberOfFiles` to Darwin's `RLIM_INFINITY`. A finite soft limit keeps `sysconf(_SC_OPEN_MAX)` useful
@@ -64,10 +64,13 @@ Every data-plane request additionally carries exactly `Proxy-Authorization: Bear
 random bytes encoded as unpadded base64url, lives at `.cowshed/token` mode 0600, and is defense in depth rather than the
 workspace selector: the already-selected macOS listener or Linux socket chooses the workspace before comparison. A proxy
 client may present it as `Proxy-Authorization: Basic` with the token as password (what curl, libcurl, reqwest and Go
-send for proxy-URL userinfo). No other header carries it: a request's `Authorization` is the client's own and
-authenticates nothing. The gateway accepts no cookie, query parameter, URL userinfo, or path token; it strips
-`Proxy-Authorization` and `Authorization` before any upstream request. It decodes the presented value to bytes, rejects
-malformed or wrong-length values, and compares all 32 bytes in constant time. Missing or mismatched token is 401.
+send for proxy-URL userinfo). The Basic username authenticates nothing: `job-<job_id>` (a job's proxy URL, 03_caches.md)
+is recorded as the request's job attribution (13_telemetry.md "Attribution tiers"), and any other username, `cowshed`
+included, leaves the request to the query-time interval join. No other header carries the token: a request's
+`Authorization` is the client's own and authenticates nothing. The gateway accepts no cookie, query parameter, URL
+userinfo, or path token; it strips `Proxy-Authorization` and `Authorization` before any upstream request. It decodes the
+presented value to bytes, rejects malformed or wrong-length values, and compares all 32 bytes in constant time. Missing
+or mismatched token is 401.
 
 Create and fork mint a token. Restore stops admissions, drains the Linux connector and gateway connections, kills the
 connector cgroup, rotates the token, unlinks/recreates the Linux socket and namespace-local connector when applicable,
@@ -332,8 +335,8 @@ next attach. A write refused with `revision-fence` or `not-installed` lost a rac
 snapshot; that decision stands, and the write counts as superseded rather than failing the command that ran the
 reconcile.
 
-Every request is one line. A one-shot request is followed by the client's EOF and answered with one line; a `disk-lease`
-or `cpu-tokens` request is held for as long as its client keeps the connection open.
+Every request is one line. A one-shot request is followed by the client's EOF and answered with one line; a
+`disk-lease`, `cpu-tokens` or `jobserver` request is held for as long as its client keeps the connection open.
 
 ## Disk-lifecycle lease
 
@@ -379,6 +382,9 @@ exclude each other rather than N interchangeable tokens.
   with an `unleased=<reason>` line, when the command runs unleased), and `disk-lease <class> phase`, around the command
   the grant admitted. With `COWSHED_TIMING` set, the gateway prints each phase as it drains: its class, how long it ran,
   its members, and how many it evicted.
+- **A test's waits are recorded.** When `COWSHED_LEASE_WAIT_RECORD` names a file, every client also appends each wait's
+  start before it asks and its end once the wait is over, so the real-APFS lane can bound a test's code time without the
+  host's queue (08_testing.md, "Integration tests (real substrate)"). Nothing on the wire changes.
 
 The regression is `cowshed-gateway`'s `contention_attaches_stay_fast_beside_mount_churn_only_under_the_lease`, run by
 name with `--ignored`: eight real attach/detach loops beside two real mount loops for 40 s, first through a real
@@ -402,64 +408,86 @@ parallel, and the total runnable work stays near the core count.
   `--parallel` for one per core; a cargo build (`cargo build`/`test`/`clippy`/…, `nextest archive`, `napi build`) for
   one job per core; anything else, one `bun test` process included, for one. A target's `parallelism` option outranks
   all of these. `test.concurrent` inside one process is not another CPU.
-- **Sized to the grant.** A grant is between 1 and `want`, and `want` is capped at half the host (below). The executor
-  sets `NEXTEST_TEST_THREADS` for nextest, rewrites a `--test-threads=`/`--parallel=` count the command names (a flag
-  outranks the environment), sets `CARGO_BUILD_JOBS` and `RUST_TEST_THREADS` for cargo, and gives every command
-  `BOUNDED_EXEC_CPU_TOKENS`, so a script that starts a runner itself can size it.
+- **Sized to the grant.** A grant is between 1 and `want`. The executor sets `NEXTEST_TEST_THREADS` for nextest,
+  rewrites a `--test-threads=`/`--parallel=` count the command names (a flag outranks the environment), sets
+  `CARGO_BUILD_JOBS` and `RUST_TEST_THREADS` for cargo, and gives every command `BOUNDED_EXEC_CPU_TOKENS`, so a script
+  that starts a runner itself can size it.
 - **Nested runners use a parent-held sub-ledger.** A granted executor serves its T tokens on a private socket and
   publishes that endpoint as `BOUNDED_EXEC_CPU_POOL`, beside its `BOUNDED_EXEC_CPU_TOKENS` count. A default nested
-  executor connects to its immediate parent's live pool, requests at most `min(want, inherited, ceil(N/2))`, and holds
-  one complete local grant on that connection. The pool accounts for every holding sibling, so their sum never exceeds
-  T. It serves its own FIFO queue, granting the head `min(requested, free)` once at least one token is free; that count
-  is final, not a partial holding awaiting more tokens. Queued siblings wait only for that pool's own holders. Host
-  checkout fairness remains the upstream ledger's concern. An admitted child serves its granted count as its own pool,
-  and grandchildren draw only from that pool: no holder waits for another grant from an ancestor or the host. The parent
-  remains the owner of its upstream grant. A child returns only its local allocation by closing its connection; it never
-  releases the parent's connection. Upstream loss revokes the downstream pool and its connections, so a dead parent
-  cannot grant tokens to a descendant. Losing a borrowed grant ends its still-running command through the normal
-  TERM/grace/KILL path and reports an ordinary CPU-grant-loss failure, never a timeout. If a bound already started
-  terminating the command, the loss still makes its verdict an ordinary failure; the existing termination owns the
-  signals and grace, so losing the grant starts no second teardown. A bare or invalid count proves no allocation; an
-  absent endpoint follows normal host admission. Once connected to the parent, refusal, silence or protocol failure is
-  an ordinary admission failure, never a second host take while that parent may still hold its grant. A stale descriptor
-  whose endpoint no longer connects is treated as absent. Only the executor publishes its actual live pool;
-  `options.env` cannot inject either marker into a command. The span and `cpu.inherited: true` record identify a
-  parent-pool grant and its actual local wait. Pool setup or cleanup failure is an ordinary failure, never a successful
-  unaccounted run. Real-process default-runner proofs live in `executor-host.test.ts` under `test-host`, because the
-  default macOS runner acquires a real RAM volume. Node peers import the built executor artifact named by
-  `executors.json`; the host target's existing build dependency produces it, rather than compiling TypeScript inside a
-  test's guard. Pure pool and executor unit cases never attach images. **Known admission ambiguity:** a connect error is
-  currently classified as an absent endpoint. A full listen backlog or local file-descriptor exhaustion can also prevent
-  connection to a live pool, so this classification does not yet prove that its parent has released the upstream grant.
-  Distinguishing those cases before any host fallback remains an admission follow-up; connected refusals and protocol
-  errors already fail without a second take.
-- **Fair between checkouts.** The checkout is the Nx workspace root the request names. A checkout's share is N divided
-  among the checkouts holding or waiting (at least 1). The next grant goes to the waiting checkout that holds the fewest
-  tokens (the older head request on a tie), to its oldest request. While another checkout waits, that grant is
+  executor connects to its immediate parent's live pool, requests at most `min(want, inherited)`, and holds one complete
+  local grant on that connection. The pool accounts for every holding sibling, so their sum never exceeds T. It serves
+  its own FIFO queue, granting the head `min(requested, free)` once at least one token is free; that count is final, not
+  a partial holding awaiting more tokens. Queued siblings wait only for that pool's own holders. Host checkout fairness
+  remains the upstream ledger's concern. An admitted child serves its granted count as its own pool, and grandchildren
+  draw only from that pool: no holder waits for another grant from an ancestor or the host. The parent remains the owner
+  of its upstream grant. A child returns only its local allocation by closing its connection; it never releases the
+  parent's connection. Upstream loss revokes the downstream pool and its connections, so a dead parent cannot grant
+  tokens to a descendant. Losing a borrowed grant ends its still-running command through the normal TERM/grace/KILL path
+  and reports an ordinary CPU-grant-loss failure, never a timeout. If a bound already started terminating the command,
+  the loss still makes its verdict an ordinary failure; the existing termination owns the signals and grace, so losing
+  the grant starts no second teardown. A bare or invalid count proves no allocation; an absent endpoint follows normal
+  host admission. Once connected to the parent, refusal, silence or protocol failure is an ordinary admission failure,
+  never a second host take while that parent may still hold its grant. A stale descriptor whose endpoint no longer
+  connects is treated as absent. Only the executor publishes its actual live pool; `options.env` cannot inject either
+  marker into a command. The span and `cpu.inherited: true` record identify a parent-pool grant and its actual local
+  wait. Pool setup or cleanup failure is an ordinary failure, never a successful unaccounted run. Real-process
+  default-runner proofs live in `executor-host.test.ts` under `test-host`, because the default macOS runner acquires a
+  real RAM volume. Node peers import the built executor artifact named by `executors.json`; the host target's existing
+  build dependency produces it, rather than compiling TypeScript inside a test's guard. Pure pool and executor unit
+  cases never attach images. **Known admission ambiguity:** a connect error is currently classified as an absent
+  endpoint. A full listen backlog or local file-descriptor exhaustion can also prevent connection to a live pool, so
+  this classification does not yet prove that its parent has released the upstream grant. Distinguishing those cases
+  before any host fallback remains an admission follow-up; connected refusals and protocol errors already fail without a
+  second take.
+- **Queued priority** (2026-10-11). The coordinator supplies each job's priority, an unsigned 32-bit integer, higher
+  first, default 0. It orders queued bulk work and queued lands within their own queues; no value outranks the active
+  gate or manufactures gate authority. A priority change re-keys pending work, never interrupts, resizes or restarts an
+  already-running grant. Priority and the current OS band are independent.
+- **Fair between checkouts within one priority.** The checkout is the Nx workspace root the request names. A checkout's
+  share is N divided among the checkouts holding or waiting (at least 1). The next grant goes to the highest-priority
+  eligible waiting request; within that priority, to the waiting checkout that holds the fewest tokens (the older head
+  request on a tie), to its oldest request. While another checkout waits, that grant is
   `min(want, max(1, share − held))`; with nobody else waiting it is `min(want, free)`. A head request whose least grant
-  is not free yet waits for it, and so does everyone behind it, so a large request is never starved by a stream of small
-  ones. A gate with sixty runners queued cannot crowd out one with three.
+  is not free yet waits for it, and so does everyone behind it within the same priority. A large request is never
+  starved by a stream of smaller requests at that priority; a gate with sixty runners queued cannot crowd out one with
+  three at the same priority.
 - **All at once.** A request is granted once, in full, and never holds part of a grant while waiting for more, so no two
   requests can deadlock on each other's tokens.
-- **No grant exceeds half the host**, `ceil(N/2)`. Fairness acts only when a grant is made, and a running nextest or
-  cargo cannot hand tokens back. Uncapped, one checkout's single runner once held 17 of 18 tokens for its whole run, and
-  a second checkout's gate held 1 and waited it out. With the cap, a checkout arriving beside one runner finds the other
-  half, or the next runner's tokens. A checkout alone still fills the host, because each gate runs several runners.
-  - The cost: one runner alone on the host runs at most N/2 threads. Measured on 18 cores at host load 83–99 from other
-    work, with `cowshed-core`'s 903 non-APFS unit tests: 26 s at 18 threads (warm) against 31 s and 44 s at 9. A
-    newcomer behind an uncapped runner instead waits out that runner's whole run.
-  - Rejected alternative: reserving slots for a newcomer. It idles cores whenever no newcomer comes, and it still lets
-    two runners of one checkout hold everything else.
+- **Work-conserving.** No grant is capped below `want` for fairness' sake: with nobody else waiting, a grant is
+  `min(want, free)`, so a lone runner may hold all N tokens, because idle tokens help nobody and a gate's wall time is
+  what the budget buys. What a newcomer needs is not a reserved half — it never waits out a whole run — but the
+  foreground band (Dynamic QoS, below): a foreground arrival demotes running normal work to utility instead of queueing
+  behind its tokens. Fairness among checkouts (the share rule above) still bounds a grant while another checkout waits.
+- **Dynamic QoS.** A job's class states what it is; its band states how the host schedules it now, and the two move
+  independently. Four bands, in scheduler order: **foreground**, **normal**, **utility**, **background**. The land turn
+  — its holder and the gate lineage that follows it — and any job a model is waiting on run **foreground**. Ordinary
+  development work (builds and suites) starts **normal**. Opportunistic work — research models, prefetch and warmers an
+  operator names as such, never inferred from unattended, detached or long-running work — runs **background** from
+  admission. While a foreground job is starved (admitted or queued and not runnable at its grant), running normal jobs
+  are demoted to **utility**: their tokens and grants do not change, only their scheduling weight drops, so the
+  foreground job's threads win the cores its grant names. When no foreground job is starved, utility jobs are promoted
+  back to normal. A band change is a live transition on the job's retained process identities (the Darwin and Linux
+  placements of "Bands"); one that cannot cover a forked tree whole reports `IncompleteCoverage` and claims no
+  transition. Bands never admit, queue or size a job — the token ledger alone does that — so a demoted job holding many
+  tokens cannot starve a foreground job of cores, and an idle host leaves every band's work at full speed.
 - **Crash safety by connection.** The grant is tied to the connection: on exit, `SIGKILL` included, the kernel closes
   the socket and the gateway returns the tokens at once. A request that closes while queued leaves the queue. A gateway
   restart forgets every grant, so runners started under the old one overshoot until they finish.
 - **The bounds start at the grant.** The executor's `timeoutMs` and `idleTimeoutMs` start when the command starts, after
   the grant: a wait for the host is not the command's time.
-- **Wire.** The client writes `{"op":"cpu-tokens","want":<n>,"checkout":"<workspace root>","command":"<command>"}` and
-  does not half-close. The gateway answers `{"ok":true,"lease":"queued"}` at once and
-  `{"ok":true,"lease":"granted","tokens":<g>}` when the runner may start. `want` 0, a missing or empty checkout, or one
-  over 4096 bytes is refused as `invalid-request`. `{"op":"cpu-budget"}` is one-shot and answers the ledger as
-  `cpuBudget`: `total`, `held`, and per checkout `held`, `running` and `waiting`.
+- **Wire.** The client writes
+  `{"op":"cpu-tokens","want":<n>,"priority":<u32>,"checkout":"<workspace root>","command":"<command>"}` and does not
+  half-close. An omitted priority is 0. A named job also carries its existing
+  `job: { repoId, workspaceIncarnation, jobId }` identity, so its queued admission can be re-keyed without selecting a
+  different job. The gateway answers `{"ok":true,"lease":"queued","id":"<lease id>"}` at once and
+  `{"ok":true,"lease":"granted","id":"<lease id>","tokens":<g>}` when the runner may start. The same lease id identifies
+  that admission until its connection closes. `want` 0, a missing or empty checkout, or one over 4096 bytes is refused
+  as `invalid-request`. `{"op":"cpu-budget"}` is one-shot and answers the ledger as `cpuBudget`: `total`, `held`, and per
+  checkout `held`, `running` and `waiting`.
+- **Priority updates.** `{"op":"job-qos","job":{…}|"lease":"<lease id>","priority":<u32>}` is one-shot and answers
+  `{"ok":true}`, or `not-found` for an admission that is not live. It re-keys the selected admission only while queued;
+  a granted job keeps its grant and band. The caller supplies the same coordinator priority on later admissions.
+  This control changes neither the token budget nor the dynamic-band rules and creates no separate resource ledger.
 - **The budget spaces runners out; it never decides whether one runs.** With no gateway listening (any host without
   cowshed, CI included) the command runs exactly as configured and nothing is said. A gateway that predates the budget
   refuses the unknown operation at once (an older one, silent until EOF, is half-closed after 2 s), and the command runs
@@ -469,206 +497,54 @@ parallel, and the total runnable work stays near the core count.
   output (`status=err … runs unbudgeted: <reason>` without a grant), so a slow or failing task says how long it waited
   and how many threads it ran with. With `COWSHED_TIMING` set, the gateway prints each grant: tokens, want, the wait,
   the checkout, and the client's pid and command.
-- **Not budgeted.** Processes outside `bounded-exec` — Nx's own `nx:run-commands` builds, a host shell's `cargo` — run
-  as before. The unbuilt Workload classes and priority section admits those managed root runners through the same ledger
-  and leaves Cargo's internal jobserver under that root's grant; unmanaged host commands remain outside it.
+- **Outside `bounded-exec`.** Processes outside `bounded-exec` — Nx's own `nx:run-commands` builds, a host shell's
+  `cargo` — take the budget through Cargo's make-protocol jobserver, one fifo per client process. The managed
+  environment's `cargo` is cowshed's jobserver launcher (03_caches.md, "The `cargo` jobserver launcher"). It reads its
+  environment and its subcommand, the first argument after cargo's global options and a `+toolchain`, in this order:
+  - **An inherited jobserver** (`CARGO_MAKEFLAGS` names a live one; for a `fifo:` one, its path exists), as for a
+    `cargo` a build script starts: it runs `cargo` as asked, since that jobserver already counts it.
+  - **A `bounded-exec` grant** (`BOUNDED_EXEC_CPU_TOKENS` set): it takes no second grant and runs `cargo` with
+    `CARGO_BUILD_JOBS`, `RUST_TEST_THREADS` and `NEXTEST_TEST_THREADS` set to `BOUNDED_EXEC_CPU_TOKENS` where they are
+    unset. `bounded-exec` sets the cargo variables only for a cargo runner, so a `cargo` that a `process` runner's
+    script starts under a one-token grant would otherwise run one job per core.
+  - **A subcommand that compiles nothing** — `metadata`, `fmt`, `locate-project`, `tree`, `pkgid`, `read-manifest`,
+    `verify-project`, `version`, `help`, `config`, `search`, `info`, `new`, `init`, `add`, `remove`, `update`, `fetch`,
+    `vendor`, `generate-lockfile`, `clean`, `login`, `logout`, `owner`, `yank`, `report`, or none at all (`--version`,
+    `--list`): it runs `cargo` directly without asking. These runs are short and nearly idle, and a queue would make
+    rust-analyzer's frequent `cargo metadata` wait behind gates whenever the host is saturated.
+  - **Any other subcommand**, aliases and third-party `cargo-*` subcommands included, is a build. The launcher asks the
+    gateway on the control socket (`{"op":"jobserver","want":<n>,"checkout":"<workspace root>","command":"<command>"}`)
+    with `want` one per core, as for a cargo build under `bounded-exec`. The gateway queues and grants it like a
+    `cpu-tokens` request (fairness, all at once), refuses the same malformed requests, and answers
+    `{"ok":true,"lease":"granted","tokens":<g>,"fifo":"<path>"}`.
+- **The jobserver fifo.** On the grant the gateway creates that fifo in its private runtime directory, mode `0600` and
+  owned by the client's user (from the socket's peer credentials). It opens the fifo `O_RDWR` and keeps that descriptor
+  until the drain, so the bytes survive while no client has it open, and writes `g − 1` token bytes into it: the
+  client's implicit make token is the first. At startup the gateway removes every fifo left in that directory, since a
+  restart forgets every grant.
+- **The jobserver run.** The launcher spawns the real `cargo` with `CARGO_MAKEFLAGS` and `MAKEFLAGS` set to
+  `-j --jobserver-auth=fifo:<path>`, and with `RUST_TEST_THREADS`, `NEXTEST_TEST_THREADS` and `BOUNDED_EXEC_CPU_TOKENS`
+  set to `g` where they are unset: libtest and nextest test threads take no jobserver token, so without them a
+  `cargo test` or `cargo nextest run` holding `g` tokens still runs one test thread per core. A `--test-threads` count
+  the command names outranks them, as a flag outranks the environment. The launcher waits for `cargo` and exits with its
+  status, and keeps the connection open, close-on-exec, for as long as it lives. When the connection closes — the build
+  ended, or either process was killed, `SIGKILL` included — the gateway drains the bytes left in the fifo, unlinks it,
+  and returns all `g` tokens to the ledger, so tokens a killed process read and never wrote back are credited too. A
+  `cargo` that outlives a killed launcher keeps its open fifo and runs over budget until it finishes, as a runner does
+  across a gateway restart.
+- **Where the launcher cannot budget.** With no gateway listening it runs `cargo` unbudgeted, as `bounded-exec` does. A
+  sandboxed process cannot reach the control socket (above), so its `cargo` runs unbudgeted too. A daemon that inherited
+  `BOUNDED_EXEC_CPU_TOKENS` from a grant and outlives it starts later `cargo` runs capped to that count but outside any
+  grant; an inherited `CARGO_MAKEFLAGS` whose fifo is gone counts as no jobserver.
 
 Tests: `cowshed-gateway`'s `cpu_budget` ledger unit tests (fairness, share, starvation, leave) and `tests/cpu_budget.rs`
 over a real socket (`SIGKILL` of a holding client returns its tokens to the waiter at once; checkouts share the host;
 refusals); the plugin's `cpu-tokens.test.ts` (each runner's `want` and sizing, a killed holder closing its grant) and
-`executor.test.ts` (a granted run sized and released, a refused one run as asked).
-
-## Workload classes and priority
-
-> **Implementation status: unbuilt.** This section specifies the gate-first extension to the shipped Host CPU budget,
-> not measured performance of that extension. Its implementation and acceptance are in
-> `agent-todo/cowshed-workload-classes.md`. Package docs continue to describe shipped behaviour.
-
-The **current landing gate wins the host** over speculative implementation builds and suites. Class alone is not enough:
-a high numeric priority among background jobs still competes with already-running background jobs, and a reserve for
-small checks does not accelerate a gate incorrectly classified as bulk. One host-wide land turn identifies the current
-gate; the existing CPU ledger gives its work first admission, and macOS demotes competing bulk processes.
-
-- **`feedback`** is watched work: an incremental compile, a focused test, and the active land turn's rebase, gate and
-  land checks. Only descendants of the actual land-lock holder have the **gate role**. `--class feedback` or a high
-  priority does not manufacture that role. A queued land has no running gate.
-- **`bulk`** is speculative or unattended work: implementation builds, full writer suites, mutation sweeps and release
-  builds. Unclassified requests are bulk at priority 0. Bulk runs in the background band from its first instruction, not
-  only when a later feedback request oversubscribes the host.
-- **Priority** is a caller-supplied unsigned 32-bit integer, higher first, default 0. It orders queued lands and queued
-  bulk within their own queues; no value outranks the active gate or buys the feedback reserve.
-
-### Gate-first admission
-
-There is one CPU ledger, not a second gate semaphore or a second resource scheduler. For `N >= 2` cores,
-`R = min(ceil(N/8), N - 1)` tokens belong to ordinary feedback and `G = N - R` to the gate or bulk window. For one core,
-gate and ordinary feedback share one token, FIFO between their runnable requests; bulk uses it only without a land turn
-or waiting feedback. The one-core case never creates a zero-capacity queue.
-
-1. **Without a land turn**, ordinary feedback uses at most R tokens, bulk at most G. Feedback never waits behind bulk
-   but can wait behind other feedback; there is no unlimited one-token oversubscription per request. Bulk keeps the
-   existing half-host grant cap and checkout fairness within one priority. A bulk request is aged after `2N` bulk grants
-   pass it; aged requests go first by ticket, then higher priority, then fewer held tokens and ticket. Aging guarantees
-   service only when grants continue and older work terminates, not a wall-time bound or eventual finish under an
-   infinite sequence of land turns.
-2. **During the land turn**, no fresh bulk resource grant is made, even between the gate's tasks and even to aged or
-   urgent bulk. The gate's lineage can hold up to G tokens in total; an individual gate runner can use all G when its
-   demand allows, rather than inheriting the half-host cap. Other feedback remains bounded by R. The next gate grant
-   precedes any eligible bulk grant; FIFO within the gate and within ordinary feedback prevents a sibling from being
-   repeatedly passed. Queued bulk retains its ticket and age. It resumes when the turn ends.
-3. **Already-running bulk is demoted, not erased.** Its grant stays held until its command tree ends. Gate grants may
-   overlap those old background grants, so the gate does not wait out a long suite before starting. The ledger counts
-   the actual grants: `over = max(0, held - N)`, `free = max(0, N - held)`, `free + held = N + over`. This is bounded
-   transition debt: gate plus ordinary feedback holds at most N; fresh bulk cannot increase the debt. No token is
-   declared returned merely because a process was demoted. After the turn, no bulk is admitted until the actual holdings
-   fit the ordinary budget again.
-
-This is scheduler preemption through the OS band, not `SIGSTOP`, cancellation, command replay or live runner resizing.
-No lowest-priority completion guarantee is inferred from a nice value. Existing resource ownership and cancellation
-remain authoritative. QoS does **not** free resident memory or cap RSS: old bulk jobs retain RAM while they drain. The
-loaded acceptance below must expose swap pressure rather than call an unsuccessful policy a latency repair.
-
-### Bands
-
-**macOS.** The gateway, supervisors, activation (`direnv`), Nx daemon and shared cache service keep their Interactive
-launchd band (Placement and identity). Only work processes are demoted: before the bulk command executes, its child sets
-`PRIO_DARWIN_BG` with `setpriority(PRIO_DARWIN_PROCESS, 0, PRIO_DARWIN_BG)`, equivalent to `taskpolicy -b`. Feedback and
-the active gate run in the normal inherited band. There is no irreversible `taskpolicy -c background` clamp and no
-Background or Standard daemon `ProcessType`: demoting infrastructure would throttle the gate's own activation, hashing
-and cache service.
-
-A live change uses the same-user process API, equivalent to `taskpolicy -b -p <pid>` or `taskpolicy -B -p <pid>`. It
-covers every existing member and subsequently observed joiner using the complete process-tree identities already used
-for accounting and termination (11_shell.md), not a name-based host process scan. An exiting member is reconciled as an
-exit; permission, identity or application failure is a named error and no successful band-change receipt. A spawned
-child inherits its parent's band; clearing a parent does not clear children already forked, so every member must be
-covered. The acceptance reads scheduled priority and behaviour for live changes: self `getpriority` alone is not a
-reliable witness of an externally applied background policy.
-
-**Shared compilers.** A bulk compiler spawned by the shared sccache daemon must not escape demotion merely because its
-parent is infrastructure. Its compile request carries the requesting work's band through the existing single-flight
-owner, and the compiler starts in that band. A gate or feedback client joining that same compile lifts that compiler
-until the last such waiter leaves. This is a real blocking dependency, not promotion of every job sharing a cache or
-build volume. The service itself stays interactive.
-
-**Linux.** Every job cgroup is a direct child of the controller's one delegated cgroup, irrespective of workspace
-(07_api.md, Complete job accounting). Feedback uses `cpu.weight` 100 and `io.weight` 100; bulk uses 1 and 1. Changing
-weights is reversible without process migration or privileged nice restoration. Weights compare sibling job cgroups, not
-arbitrary operator processes outside their delegated parent; `io.weight` is effective only where the device's I/O
-controller supports it, including enabled `io.cost`. No Linux I/O or outside-cgroup guarantee is inferred from writing a
-weight ([cgroup v2](https://docs.kernel.org/admin-guide/cgroup-v2.html), Weights and IO). The macOS loaded acceptance is
-not evidence of Linux performance.
-
-### QoS leases
-
-A supervisor holds a `qos-lease` connection for each managed job, with the existing job identity, checkout, command,
-`want` and either its own `class`/`priority` or a `parent` lease id (07_api.md `JobQos`, `QosSource`). Queued and
-granted replies carry the stable lease id; a resource-consuming command starts only after its grant. A parent carries
-its class, priority and verified gate lineage to `cowshed exec`, `cowshed land` checks and `bounded-exec`. The CLI reads
-`COWSHED_QOS_LEASE`; the supervisor validates the lineage rather than trusting environment text as ownership.
-
-`want` is the positive root runner demand, sized to its actual grant. Zero is band and lineage only for idle services
-and orchestration: the holder, a shell, the Nx daemon or an Nx coordinator. It authorizes no unbudgeted heavy work. An
-orchestrator's heavy children take individual grants; a root that holds tokens never asks the host again for nested
-work. The admission key binds source kind, own class, want, stable parent id or land target as applicable, **not**
-mutable numeric priority. A repeated Start finds the same job after a priority change; a different parent is a conflict.
-
-`job-qos` changes an own lease's class and priority, or a land holder's queued priority, and applies the band to its
-work. Parent followers answer `follows-parent`. A running grant is not resized or retroactively placed in a smaller
-window: a class raise whose holdings cannot fit waits for its command to finish before the new admission class applies;
-a priority-only change can reorder pending requests immediately. No class change creates gate authority.
-
-**Restart.** Lease ids use a random gateway incarnation plus a counter. Supervisors retain the job, band, allocation and
-id on a gateway disconnect and reconnect with `resume` and the actual held count. Duplicate live ids answer
-`lease-live`; a queued request resumes with a new ticket and age zero. The gateway's recovery accounts surviving grants
-before admitting fresh bulk; an unavailable owner is a named recovering state, not proof that its tokens are free. A
-request whose parent has not resumed is recorded as bulk 0 with one stderr explanation; it follows the parent once the
-parent resumes, but cannot receive the gate role until the durable turn owner is verified. A resumed grant may create
-`over` and remains counted until its command ends. Connection loss never creates a duplicate job.
-
-### The land lock
-
-There is **one host-wide land turn across all repositories and targets**. It serializes rebase, merged-tip gate and
-land, not editing or already-running bulk work. The existing `land-lock` queue uses target identity, priority and
-ticket. A waiter ages after two completed turns; aged waiters precede other priorities by ticket. Thus a newly urgent
-land waits behind older aged waiters; changing priority never interrupts the current gate.
-
-The reply names the lease id and the single controller-owned `<host-store>/land.lock` file (01_storage.md). The gateway
-orders; every holder takes an exclusive `flock` on that same file before activation. The gateway marks the verified
-file-owning turn active before any gate child receives its role. Waiting for the grant or file holds no CPU, RAM-temp or
-disk-lifecycle lease. A caller under a live CPU pool or other CPU grant is refused as `Usage`, preventing the
-lock-waiter/token-holder cycle. Host turn → target lifecycle locks → CPU admission → temporary resources is the order;
-cleanup releases resources without re-entering admission.
-
-**Durable custody, including the verb.** `QosSource::LandLock { target, priority }` admits a keyed, want-0 holder job.
-Its existing workspace supervisor owns the file, not the executor or CLI. `cowshed land-lock <target> -- <cmd…>` uses
-the same holder and runs the command with `COWSHED_QOS_LEASE` and `COWSHED_LAND_LOCK` naming its canonical target.
-Same-target descendants reuse it only after their parent lineage is verified. A marker for another target is a `Usage`
-refusal, not recursive acquisition of the host file; a different land must be submitted outside that turn. With no
-gateway the same supervisor/file path still excludes, but reports that priority ordering and gate-first admission are
-unavailable; it never claims accelerated execution without a live ledger.
-
-The durable `land.turn` record beside the stable lock inode names the holder and each follower's existing job identity,
-registered **before spawn** through the existing atomic, synchronized record-commit mechanism. The locked inode is never
-replaced to update custody. A failed record commit starts no child and releases no unfinished turn. Normal completion or
-cancellation closes admission to new followers, ends or waits for the current followers through the existing termination
-path, and releases the turn only after they are terminal. A gateway restart does not release the supervisor's file. An
-executor restart reattaches by admission key. If the supervisor dies and the kernel releases the file, the successor
-that acquires it reconciles the unfinished turn's recorded jobs before activating a new one; unprovable liveness is
-`Conflict` with `admission: { reason: "turnRecovering", unproven }` (07_api.md), never an empty host. This also covers
-the CLI dying during a detached gate: ending a connection is not evidence that its descendants ended. Target ref
-compare-and-swap remains unchanged.
-
-Land checks inside the turn use `--no-retire` (`LandOptions.retire = false`), and a retire request there is `Usage`
-before target mutation (02_workspaces.md). After land and follower termination release the turn, its caller may retire
-the workspace normally. The land cannot wait on retirement of the same supervisor and holder waiting for it to finish.
-
-### `bounded-exec` under a class
-
-Reuse its shipped runner sizing, parent-held CPU pool, RAM-temp leases and the gateway's disk-lifecycle leases. A
-positive-want root's nested executors draw only from its existing pool, whose sibling allocations sum to its grant.
-Cargo/make use their normal jobserver inside that one sized root; there is no new per-job FIFO in which every
-independent executor invents an extra implicit token.
-
-A want-0 orchestrator's supervisor exposes a CPU-only admission endpoint, using the existing `cpu-tokens`/pool wire and
-an exact sandbox path grant. It forwards child requests with the supervisor-owned lineage and retains each host grant on
-that child's connection; it owns no root grant while doing so. This is not access to the gateway's other control
-operations. A nested executor under a positive grant cannot fall through to this endpoint and take twice. Grant loss and
-cleanup use the existing pool failure path.
-
-All resource-consuming tasks beneath an orchestrator use this admission path. Inferred and authored gate builds still
-using `nx:run-commands` migrate to `bounded-exec` or an explicitly sized managed root; a class marker on an Nx parent
-alone does not cover those tasks. The gate task graph is checked for escaping compute runners as part of acceptance.
-
-The class defaults to bulk; a verified parent wins over a target's own class option. CPU admission precedes RAM-temp
-acquisition, so a queued bulk task holds neither a RAM-temp volume nor a disk phase while the gate runs. A temporary
-resource failure returns the CPU grant exactly once; cancellation and exit close the child pool before returning its
-upstream grant. The RAM-temp lease is temporary storage, **not a host RSS budget**. Existing wall-clock bounds, per-test
-timeouts, verdicts and bound-only re-runs stay unchanged. No run clock or run estimate is required or claimed.
-
-### The live view and loaded acceptance
-
-`cpu-budget` adds the active gate's target and lease, G/R windows, actual held tokens and `over`, queue/admission
-reasons and pending band/recovery errors to its existing live view. Existing job CPU windows and transition spans remain
-the resource evidence. There is no sampled-metrics log or second monitoring daemon. Each gate's transition record
-reports request-to-terminal wall time (including turn wait), active-turn-to-terminal wall time, command wall time and
-CPU/RAM admission waits, cache hits and timeout outcomes; a queue wait is not hidden by starting the clock after
-admission.
-
-Acceptance is a real macOS run, not a scheduler simulation or a claim based on `ps`. On the same commit, command,
-toolchain, fixed task set and equivalently warm sheds, record at least three solo gates and three alternating matched
-policy-disabled/policy-enabled pairs. Start the gate only after 20 real parallel build/test workers are live; retain a
-pending backlog and enough real cache-miss work to overlap the gate, rather than replacing it with CPU spinners. Both
-arms retain the existing safety leases. Record all raw durations, workload/cache identity, bulk completions, feedback
-latency, timeouts, core count and start/end load, swap and resident-memory snapshots in the acceptance artifact. The
-small-sample p95 uses nearest rank (and is labelled with its sample count), not a population-confidence claim.
-
-The enabled loaded median active-turn wall time is at most twice the solo median and at most half the disabled loaded
-median, with no new gate timeout or failure. Ordinary feedback latency is reported beside its solo control; bulk resumes
-after release. Request-to-terminal and turn wait are reported independently so serialization cannot disguise starvation.
-Every failed arm is retained. Until that run passes, this is an unbuilt policy, not evidence that a 15–60-minute gate or
-swap pressure has been repaired. Unmanaged host processes are identified as outside coverage, not silently demoted by
-PID guesswork or omitted from the result.
+`executor.test.ts` (a granted run sized and released, a refused one run as asked); a jobserver test in which a
+`SIGKILL`ed `cargo` mid-build leaves the ledger whole and its fifo unlinked; the launcher's tests (each of its four
+cases, the `want` it sends, and the variables it sets or leaves on each path); and the dynamic-band tests: a starved
+foreground grant demotes a running normal job's band and restores it when the foreground job leaves, and an
+opportunistic job admitted in the background band never holds a foreground job's cores.
 
 ## Credentials
 
@@ -778,7 +654,10 @@ names the grant that would permit it — the audit store doubles as the debuggin
 
 **Per-workspace CA interception.** A workspace-scoped CA limits a signing-key compromise to one workspace and lives with
 the gateway, which already mediates upstream credentials. The explicit costs are per-tool trust-anchor wiring, opaque
-fallback for pinned clients, and gateway visibility into intercepted plaintext.
+fallback for pinned clients, and gateway visibility into intercepted plaintext. A single machine-wide CA trusted inside
+every workspace is rejected: one key whose compromise silently breaks all transport security, shared by every workspace.
+A MITM broker that substitutes placeholder tokens at that shared boundary is the same design and is rejected for the
+same reason.
 
 **Registry mirrors retained.** Protocol-aware mirrors provide digest validation, fleet-wide deduplication, bounded cache
 storage, and offline reads that generic interception cannot.
