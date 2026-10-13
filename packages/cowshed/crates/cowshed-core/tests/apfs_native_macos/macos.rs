@@ -8,30 +8,30 @@ use std::time::{Duration, Instant, SystemTime};
 
 use rcgen::{KeyPair, PKCS_ECDSA_P256_SHA256};
 
+use cowshed_apfs::attach_budget;
+use cowshed_apfs::image::ImageCapacity;
+use cowshed_apfs::mounts::KernelMountSnapshot;
+use cowshed_apfs::store_lock::LockMode;
+use cowshed_apfs::template::{blank_template, blank_template_path, blank_template_staged_stem};
 use cowshed_apfs::{
     ApfsBackend, ApfsError, AttachedDiskImage, AttachedImage, CommandOutput, CommandRequest,
     CommandRunError, CommandRunner, DetachIntent, DiskImageSource, ImageCapture, MacOsApfsBackend,
     MountAccess, SystemCommandRunner,
 };
-use cowshed_apfs::attach_budget;
-use cowshed_os::fork_lock::{Fenced, Spawn as _};
-use cowshed_apfs::image::ImageCapacity;
-use cowshed_apfs::mounts::KernelMountSnapshot;
-use cowshed_apfs::store_lock::LockMode;
-use cowshed_apfs::template::{blank_template, blank_template_path, blank_template_staged_stem};
+use cowshed_apfs::{mounts::kernel_mounts, store_lock::verify_no_symlinks};
 use cowshed_core::metadata::{
-    DetachedWorkspaceMetadata, GrantSet, MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE,
-    Platform, PortBlock, PublicationState, SIDECAR_VERSION, WorkspaceIncarnation,
-    WorkspaceInfoSnapshot, WorkspaceName, WorkspaceRole, sidecar_path,
+    DetachedWorkspaceMetadata, GrantSet, MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE, Platform, PortBlock,
+    PublicationState, SIDECAR_VERSION, WorkspaceIncarnation, WorkspaceInfoSnapshot, WorkspaceName,
+    WorkspaceRole, sidecar_path,
 };
 use cowshed_core::repository::{OwnedRepoIds, RepoId};
 use cowshed_core::storage::apfs::native::{
-    KernelMountSource, MacOsApfsExecutionHost, RecoveryMarkerSource,
-    RestoreFailpoint, SystemKernelMountSource,
+    KernelMountSource, MacOsApfsExecutionHost, RecoveryMarkerSource, RestoreFailpoint,
+    SystemKernelMountSource,
 };
 use cowshed_core::storage::apfs::{
-    ApfsExecutionHost, ApfsStorageError, ApfsSubstrateConfig, Labelled,
-    MarkerExpectation, MetadataPolicy,
+    ApfsExecutionHost, ApfsStorageError, ApfsSubstrateConfig, Labelled, MarkerExpectation,
+    MetadataPolicy,
 };
 use cowshed_core::storage::lifecycle::{
     LifecycleFact, LifecycleWorkspace, OperationIdentity, Pin, RetiredRef, Revision,
@@ -39,6 +39,7 @@ use cowshed_core::storage::lifecycle::{
 };
 use cowshed_core::storage::{CheckpointLabel, StorageLayout, StorageLayoutError};
 use cowshed_core::workspace_credentials::mint_workspace_credentials;
+use cowshed_os::fork_lock::{Fenced, Spawn as _};
 
 #[path = "../../../cowshed-apfs/tests/support/blank_image.rs"]
 mod blank_image;
@@ -2548,8 +2549,7 @@ fn real_apfs_rename_names_the_pinned_device_and_skips_what_is_not_mounted() {
         .expect("slotted image path");
     let refused_mount = fixture.root().join("mount").join("slotted");
     std::fs::create_dir_all(&refused_mount).expect("an empty mountpoint");
-    let holding_volume =
-        cowshed_apfs::volume_name(&refused_mount).expect("the volume holding it");
+    let holding_volume = cowshed_apfs::volume_name(&refused_mount).expect("the volume holding it");
     assert_eq!(
         host.label_image_volume(slotted.image(), label)
             .expect("a refused create is a typed skip"),

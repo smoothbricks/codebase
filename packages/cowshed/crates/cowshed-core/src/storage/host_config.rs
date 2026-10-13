@@ -10,7 +10,7 @@ use walkdir::WalkDir;
 use crate::metadata::{GRANTS_SIDECAR_SUFFIX, WorkspaceName};
 use crate::repository::RepoId;
 
-use super::bootstrap::STORE_ROOT;
+use cowshed_gateway_types::STORE_ROOT;
 
 pub const HOST_CONFIG_FILE: &str = "host.json";
 pub const RETIRED_LAYOUT_HINT: &str =

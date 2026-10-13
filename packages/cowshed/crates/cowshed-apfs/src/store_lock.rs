@@ -40,7 +40,11 @@ impl fmt::Display for StoreLockError {
         match self {
             Self::EscapesStoreRoot => formatter.write_str("lock path escapes the store root"),
             Self::InvalidPath(reason) => formatter.write_str(reason),
-            Self::Nul(path) => write!(formatter, "controller path contains NUL: {}", path.display()),
+            Self::Nul(path) => write!(
+                formatter,
+                "controller path contains NUL: {}",
+                path.display()
+            ),
             Self::SymlinkComponent(path) => write!(
                 formatter,
                 "storage path contains symbolic link component {}",
@@ -119,9 +123,7 @@ pub struct ImageLockGuard {
 }
 
 fn path_component(value: &std::ffi::OsStr, path: &Path) -> Result<CString, StoreLockError> {
-    CString::new(value.as_bytes()).map_err(|_| {
-        StoreLockError::Nul(path.to_owned())
-    })
+    CString::new(value.as_bytes()).map_err(|_| StoreLockError::Nul(path.to_owned()))
 }
 
 /// The lock file `name` in `directory`, created if it does not exist yet.
@@ -168,9 +170,9 @@ fn open_or_create_lock_at(
 }
 
 fn open_lock_file(root: &Path, path: &Path) -> Result<File, StoreLockError> {
-    let relative = path.strip_prefix(root).map_err(|_| {
-        StoreLockError::EscapesStoreRoot
-    })?;
+    let relative = path
+        .strip_prefix(root)
+        .map_err(|_| StoreLockError::EscapesStoreRoot)?;
     let mut components = relative.components().peekable();
     if components.peek().is_none() {
         return Err(StoreLockError::InvalidPath("lock path is the store root"));
@@ -348,9 +350,6 @@ mod tests {
         for (fd, failed) in [(-1, true), (0, false), (1, false)] {
             assert_eq!(fd_failed(fd), failed, "fd={fd}");
             assert_eq!(flock_succeeded(fd), fd == 0, "result={fd}");
-        }
-        for (count, mounts) in [(-1, None), (0, None), (1, Some(1))] {
-            assert_eq!(mount_count(count), mounts, "getfsstat count={count}");
         }
         for (mode, kind, busy) in [
             (LockMode::Try, io::ErrorKind::WouldBlock, true),

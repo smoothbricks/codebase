@@ -1,22 +1,23 @@
-use cowshed_cli::args::parse_args;
-use cowshed_cli::output::Output;
-use cowshed_cli::runtime::{ActorBridge, CliService, dispatch};
+use cowshed_apfs::attach_budget;
+use cowshed_apfs::image::ImageCapacity;
+use cowshed_apfs::template::{blank_template, blank_template_path};
 use cowshed_apfs::{
     ApfsBackend, CommandRunner, DetachIntent, DiskImageSource, ImageCapture, MacOsApfsBackend,
     SystemCommandRunner,
 };
+use cowshed_apfs::{mounts::kernel_mounts, store_lock::verify_no_symlinks};
+use cowshed_cli::args::parse_args;
+use cowshed_cli::output::Output;
+use cowshed_cli::runtime::{ActorBridge, CliService, dispatch};
 use cowshed_core::api::JsonEnvelope;
 use cowshed_core::api::dto::{
     Adoption, AdoptionSkip, CarrySide, DatabaseHolder, GcReport, LandReport, LandSeed,
     RebaseBuildVolume, RebaseCarrySkip, RebaseReport, Reseed, ReseedResult,
 };
-use cowshed_apfs::attach_budget;
 use cowshed_core::build_volume::{
     BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord, BuildVolumeRole, link, nx,
 };
-use cowshed_apfs::image::ImageCapacity;
 use cowshed_core::metadata::{PortBlock, WorkspaceName};
-use cowshed_apfs::template::{blank_template, blank_template_path};
 use cowshed_core::repository::RepoId;
 use cowshed_core::runtime::RecoveryScope;
 use cowshed_core::storage::apfs::native::{
@@ -2912,10 +2913,7 @@ async fn assert_build_label(layout: &BuildVolumeLayout, checkout: &Path, name: &
     );
     eventually(
         "the build volume has its checkout's descriptive label",
-        || {
-            cowshed_apfs::volume_name(&mount).expect("read build volume name")
-                == expected.as_str()
-        },
+        || cowshed_apfs::volume_name(&mount).expect("read build volume name") == expected.as_str(),
     )
     .await;
 }
@@ -3558,10 +3556,8 @@ async fn prove_re_adoption(proof: ReAdoptionProof) {
             .find(|mount| mount.mount_point == *from)
             .expect("the recorded retained fixture input is mounted")
             .source_device;
-        let unmount = cowshed_apfs::CommandRequest::new(
-            "/sbin/umount",
-            [from.as_os_str().to_os_string()],
-        );
+        let unmount =
+            cowshed_apfs::CommandRequest::new("/sbin/umount", [from.as_os_str().to_os_string()]);
         let result = SystemCommandRunner.run(&unmount).unwrap();
         assert!(
             result.succeeded(),

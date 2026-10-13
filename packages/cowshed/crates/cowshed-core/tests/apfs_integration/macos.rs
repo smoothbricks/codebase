@@ -7,19 +7,19 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use cowshed_apfs::{
-    ApfsBackend, AttachedImage, CommandRunner, CreateImageRequest, DetachIntent, DiskImageSource,
-    ImageCapture, MacOsApfsBackend, MountAccess, SystemCommandRunner, volume_name,
-};
 use cowshed_apfs::attach_budget;
-use cowshed_os::fork_lock::Run as _;
 use cowshed_apfs::image::ImageCapacity;
 use cowshed_apfs::template::{
     BLANK_TEMPLATE_LABEL, blank_template, blank_template_path, blank_template_staged_stem,
 };
+use cowshed_apfs::{
+    ApfsBackend, AttachedImage, CommandRunner, CreateImageRequest, DetachIntent, DiskImageSource,
+    ImageCapture, MacOsApfsBackend, MountAccess, SystemCommandRunner, volume_name,
+};
+use cowshed_apfs::{mounts::kernel_mounts, store_lock::verify_no_symlinks};
 use cowshed_core::metadata::{
-    GrantSet, MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE, PortBlock, WorkspaceIncarnation,
-    WorkspaceName, WorkspaceRole,
+    GrantSet, MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE, PortBlock, WorkspaceIncarnation, WorkspaceName,
+    WorkspaceRole,
 };
 use cowshed_core::repository::RepoId;
 use cowshed_core::storage::apfs::extents::{count_extents, rewrite_sibling};
@@ -35,6 +35,7 @@ use cowshed_core::storage::lifecycle::{
     MountState, OperationIdentity, Pin, RestoreMode, Revision, Substrate,
 };
 use cowshed_core::storage::{CheckpointLabel, StorageLayout, WORKSPACE_MARKER_PATH};
+use cowshed_os::fork_lock::Run as _;
 
 #[path = "../../../cowshed-apfs/tests/support/blank_image.rs"]
 mod blank_image;

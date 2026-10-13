@@ -22,7 +22,7 @@ pub const RUN_SUMMARY: &str = "run.json";
 /// How long a stopped daemon gets to exit after `SIGTERM`, as `nx daemon --stop` sends it.
 const DAEMON_EXIT_GRACE: Duration = Duration::from_secs(10);
 
-pub use cowshed_os::process::Holder;
+use cowshed_os::process::Holder;
 
 /// Every Nx task database in the volume rooted at `volume`: each `*.db` file directly in a
 /// `workspace-data` directory the volume holds.
@@ -1970,7 +1970,8 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn a_host_daemon_whose_record_is_handed_over_serves_on_across_the_move() {
-        let root = crate::scratch_directory::ScratchRoot::new("nx-hand-over").expect("scratch root");
+        let root =
+            crate::scratch_directory::ScratchRoot::new("nx-hand-over").expect("scratch root");
         let stock = StockNx::new(&root);
         let linked = Linked::new(&root, &stock);
         stock.daemon("--start");
@@ -2077,7 +2078,8 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn a_test_that_fails_with_a_live_nx_daemon_leaves_none_under_its_root() {
-        let root = crate::scratch_directory::ScratchRoot::new("nx-daemon-failed").expect("scratch root");
+        let root =
+            crate::scratch_directory::ScratchRoot::new("nx-daemon-failed").expect("scratch root");
         let path = root.path().to_path_buf();
         let daemon = std::cell::Cell::new(None);
         let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

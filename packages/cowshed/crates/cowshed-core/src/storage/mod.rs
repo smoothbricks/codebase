@@ -8,12 +8,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 
-use cowshed_apfs::image::IMAGE_EXTENSION;
 use crate::metadata::{
-    CheckoutRootRecord, MetadataError, SlotBindings, SlotBindingsRecord,
-    WorkspaceName, append_suffix, sidecar_path,
+    CheckoutRootRecord, MetadataError, SlotBindings, SlotBindingsRecord, WorkspaceName,
+    append_suffix, sidecar_path,
 };
 use crate::repository::{PathLayoutError, ProjectPaths, RepoId};
+use cowshed_apfs::image::IMAGE_EXTENSION;
 
 pub mod apfs;
 pub mod audit;
@@ -536,7 +536,7 @@ mod tests {
 
     fn layout() -> StorageLayout {
         StorageLayout::with_mount_root(
-            bootstrap::STORE_ROOT,
+            cowshed_gateway_types::STORE_ROOT,
             "/Users/test/.cowshed/mnt",
             &RepoId::parse("acme/widget").unwrap(),
         )

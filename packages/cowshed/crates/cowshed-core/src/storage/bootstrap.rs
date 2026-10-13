@@ -27,8 +27,7 @@ pub use native::{
 pub const VOLUME_MARKER_FILE: &str = ".cowshed-volume.json";
 pub const APFS_STORE_VOLUME: &str = "cowshed.store";
 pub const APFS_CACHES_VOLUME: &str = "cowshed.caches";
-// TEMPORARY (apfs split): removed by the closing path codemod.
-pub use cowshed_gateway_types::STORE_ROOT;
+use cowshed_gateway_types::STORE_ROOT;
 /// Where the retired `cowshed.caches` volume (or `<pool>/cowshed/caches` dataset) is mounted on a
 /// host that still has one. Nothing is provisioned there any more: setup moves what it holds into
 /// the host HOME and `setup --retire-caches-volume` deletes it (03_caches.md).
@@ -229,12 +228,12 @@ pub fn parse_cowshed_config(input: &str) -> Result<CowshedConfig, ConfigError> {
         Some(BuildSection { capacity, state }) => (
             capacity
                 .map(|capacity| {
-                    cowshed_apfs::image::ImageCapacity::parse(capacity.get_ref()).map_err(|reason| {
-                        ConfigError::InvalidBuildCapacity {
+                    cowshed_apfs::image::ImageCapacity::parse(capacity.get_ref()).map_err(
+                        |reason| ConfigError::InvalidBuildCapacity {
                             line: line_of(input, &capacity),
                             reason,
-                        }
-                    })
+                        },
+                    )
                 })
                 .transpose()?,
             match state {
