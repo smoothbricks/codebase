@@ -1,7 +1,10 @@
 /* biome-ignore-all lint/suspicious/noTemplateCurlyInString: Assertions verify emitted GitHub Actions expressions literally. */
 import { describe, expect, it } from 'bun:test';
 import { renderCiWorkflowYaml } from '@smoothbricks/nx-plugin/managed-files/ci-workflow';
-import { renderPrPreviewCleanupWorkflowYaml } from '@smoothbricks/nx-plugin/managed-files/pr-preview-cleanup-workflow';
+import {
+  renderPrPreviewCleanupWorkflowYaml,
+  renderPrStageSweepWorkflowYaml,
+} from '@smoothbricks/nx-plugin/managed-files/pr-preview-cleanup-workflow';
 import { managedFileTargetsForTest } from '../managed-files.js';
 
 const deployingCi = {
@@ -42,6 +45,9 @@ describe('PR preview cleanup workflow', () => {
     expect(rendered).toContain('smoo wrangler cleanup-pr --pr ${{ github.event.pull_request.number }}');
     expect(rendered).toContain('uses: ./.github/actions/setup-devenv');
     expect(rendered).toContain('CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}');
+    // A failure outlasting the retries is left to the scheduled sweep, not dropped.
+    expect(rendered).toContain('for attempt in 1 2 3; do');
+    expect(rendered).toContain('::error::cleanup failed 3 times; the scheduled PR Stage Sweep retries it');
   });
 
   // Sharing the pull request's CI group makes the close cancel a running stage
@@ -403,5 +409,32 @@ describe('PR preview cleanup workflow', () => {
 
     expect(publishOnly).toBe(renderPrPreviewCleanupWorkflowYaml({ runsOn: 'ubuntu-latest' }));
     expect(publishOnly).not.toMatch(/^ {4}env:/m);
+  });
+});
+
+describe('PR stage sweep workflow', () => {
+  const sweep = renderPrStageSweepWorkflowYaml({ runsOn: ['nixos-latest-x64', 'self-hosted'] });
+
+  it('runs on a schedule and by hand, never on a pull request event', () => {
+    expect(managedFileTargetsForTest).toContainEqual({
+      target: '.github/workflows/pr-stage-sweep.yml',
+      executable: undefined,
+    });
+    expect(sweep).toContain("schedule:\n    - cron: '17 */6 * * *'");
+    expect(sweep).toContain('workflow_dispatch:\n    inputs:\n      pr:');
+    expect(sweep).not.toContain('pull_request:');
+  });
+
+  it('sweeps through smoo, optionally for one pull request, with the forge token to read pull request states', () => {
+    const step = stepLines(sweep, 'Sweep closed PR stages');
+    expect(step).toContain('        run: smoo wrangler sweep-pr-stages ${PR:+--pr "$PR"}');
+    expect(secretLine(step, 'GH_TOKEN')).toBe('GH_TOKEN: ${{ github.token }}');
+    expect(secretLine(step, 'PR')).toBe('PR: ${{ inputs.pr }}');
+    expect(secretLine(step, 'CLOUDFLARE_API_TOKEN')).toBe('CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}');
+    expect(sweep).toContain('pull-requests: read');
+  });
+
+  it('runs one sweep at a time without cancelling one in progress', () => {
+    expect(sweep).toContain('concurrency:\n  group: pr-stage-sweep\n  cancel-in-progress: false');
   });
 });

@@ -12,7 +12,7 @@ import type {
 } from '../workspace-manifest.js';
 import { type CiCrossTestArchive, privateNpmReadTokenJobEnv, renderCiWorkflowYaml } from './ci-workflow.js';
 import { renderRunsOnLine } from './github-runs-on.js';
-import { renderPrPreviewCleanupWorkflowYaml } from './pr-preview-cleanup-workflow.js';
+import { renderPrPreviewCleanupWorkflowYaml, renderPrStageSweepWorkflowYaml } from './pr-preview-cleanup-workflow.js';
 import { renderPublishWorkflowYaml } from './publish-workflow.js';
 import type { ManagedFile } from './tree.js';
 
@@ -215,6 +215,12 @@ const managedFiles: ManagedFileDescriptor[] = [
   },
   {
     kind: 'generated',
+    source: 'pr-stage-sweep-workflow',
+    target: '.github/workflows/pr-stage-sweep.yml',
+    cloudflareDeployOnly: true,
+  },
+  {
+    kind: 'generated',
     source: 'publish-workflow',
     target: '.github/workflows/publish.yml',
     releasePackagesOnly: true,
@@ -311,7 +317,7 @@ export function renderManagedFiles(context: ManagedFileContext): ManagedFile[] {
 
 /** Renders a generated workflow through its real managed-file descriptor, so the context wiring is covered. */
 export function renderManagedWorkflowForTest(
-  source: 'ci-workflow' | 'publish-workflow' | 'pr-preview-cleanup-workflow',
+  source: 'ci-workflow' | 'publish-workflow' | 'pr-preview-cleanup-workflow' | 'pr-stage-sweep-workflow',
   context: ManagedFileContext,
 ): string {
   const file = managedFiles.find((candidate) => candidate.kind === 'generated' && candidate.source === source);
@@ -368,8 +374,12 @@ function getManagedContent(file: ManagedFileDescriptor, context: ManagedFileCont
         deploySecrets: context.ciDeploySecrets,
       });
     }
-    if (file.source === 'pr-preview-cleanup-workflow') {
-      return renderPrPreviewCleanupWorkflowYaml({
+    if (file.source === 'pr-preview-cleanup-workflow' || file.source === 'pr-stage-sweep-workflow') {
+      const render =
+        file.source === 'pr-preview-cleanup-workflow'
+          ? renderPrPreviewCleanupWorkflowYaml
+          : renderPrStageSweepWorkflowYaml;
+      return render({
         runsOn: context.ciRunsOn,
         privateNpm: context.privateNpm,
         sourceCheckouts: context.sourceCheckouts,
