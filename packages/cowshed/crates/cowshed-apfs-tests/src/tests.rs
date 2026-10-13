@@ -530,7 +530,9 @@ const FIXTURE_KILL_ROOT: &str = "COWSHED_TEST_FIXTURE_KILL_ROOT";
 /// kills a tree — SIGTERM to every process working in its root, then SIGKILL to the
 /// caller itself — mid-attach. The detached disk-image command finishes regardless, so
 /// the next invocation (this parent, after the kill) finds the image attached and
-/// releases it cleanly, no image device leaks, and no diskimagesiod is orphaned.
+/// releases it cleanly: no whole device of the image remains, nothing keeps running in its
+/// root, and no diskimagesiod is orphaned. The host's leaked-device count is the lane's
+/// check (specs/cowshed/08_testing.md, "Host limit"), not one test's on a shared host.
 #[cfg(target_os = "macos")]
 #[test]
 fn real_apfs_a_disk_image_attach_survives_its_callers_kill() {
@@ -538,11 +540,6 @@ fn real_apfs_a_disk_image_attach_survives_its_callers_kill() {
     use std::os::unix::process::CommandExt;
     use std::process::Stdio;
     let backend = MacOsApfsBackend::new(SystemCommandRunner);
-    let leaked_before = crate::attach_budget::observe()
-        .expect("attach pool before")
-        .reading
-        .image_devices
-        .leaked();
     let orphans_before: std::collections::BTreeSet<libc::pid_t> =
         crate::disk_image_helpers::OrphanedHelpers::read()
             .expect("helper reading before")
@@ -651,14 +648,10 @@ fn real_apfs_a_disk_image_attach_survives_its_callers_kill() {
     cleanup
         .finish()
         .expect("detach the released image and delete it");
-    let leaked_after = crate::attach_budget::observe()
-        .expect("attach pool after")
-        .reading
-        .image_devices
-        .leaked();
     assert_eq!(
-        leaked_after, leaked_before,
-        "the killed caller's attach leaked an image device"
+        crate::scratch_apfs::processes::processes_in(in_root).expect("list the root"),
+        [],
+        "a process outlived the released image in its root"
     );
     let orphans_after: std::collections::BTreeSet<libc::pid_t> =
         crate::disk_image_helpers::OrphanedHelpers::read()
