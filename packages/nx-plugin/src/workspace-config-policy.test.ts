@@ -25,6 +25,7 @@ import {
 
 function validNxJson(): Record<string, unknown> {
   return {
+    cacheDirectory: '.nx/cache',
     plugins: ['@smoothbricks/nx-plugin'],
     sync: { globalGenerators: ['@smoothbricks/nx-plugin:managed-files'] },
     targetDefaults: validTargetDefaults(),
@@ -95,6 +96,7 @@ describe('pure core: checkWorkspaceConfig', () => {
 
   it('detects missing plugins', () => {
     const issues = checkWorkspaceConfig({
+      cacheDirectory: '.nx/cache',
       plugins: [],
       targetDefaults: validTargetDefaults(),
       namedInputs: validNamedInputs(),
@@ -213,9 +215,29 @@ describe('pure core: checkWorkspaceConfig', () => {
     });
     expect(issues.some((i) => i.message.includes('sharedGlobals'))).toBe(true);
   });
+
+  it("requires the checkout's own Nx cache directory", () => {
+    for (const cacheDirectory of [undefined, '/tmp/nx-cache', '.cache/nx']) {
+      const issues = checkWorkspaceConfig({ ...validNxJson(), cacheDirectory });
+      expect(issues.map((issue) => issue.message)).toEqual([
+        'cacheDirectory must be ".nx/cache". ' +
+          "Without it Nx keeps the task cache and its database in a per-user ~/.nx/<id> shared by every checkout, not in the checkout's own .nx.",
+      ]);
+    }
+  });
 });
 
 describe('pure core: applyWorkspaceConfig', () => {
+  it("sets the checkout's own Nx cache directory, once", () => {
+    for (const cacheDirectory of [undefined, '/tmp/nx-cache']) {
+      const nxJson: Record<string, unknown> = { ...validNxJson(), cacheDirectory };
+      expect(applyWorkspaceConfig(nxJson)).toBe(true);
+      expect(nxJson.cacheDirectory).toBe('.nx/cache');
+      expect(checkWorkspaceConfig(nxJson)).toEqual([]);
+      expect(applyWorkspaceConfig(nxJson)).toBe(false);
+    }
+  });
+
   it('removes workspace-wide lint commands while preserving shared cache policy', () => {
     const nxJson = {
       ...validNxJson(),
@@ -413,6 +435,7 @@ describe('Tree: checkWorkspaceConfigTree', () => {
   it('detects missing plugins', () => {
     const tree = createTreeWithEmptyWorkspace();
     writeJson(tree, 'nx.json', {
+      cacheDirectory: '.nx/cache',
       plugins: [],
       targetDefaults: validTargetDefaults(),
       namedInputs: validNamedInputs(),
@@ -566,8 +589,8 @@ describe('filesystem: checkWorkspaceConfigPolicy / applyWorkspaceConfigPolicy', 
       const nxJson = expectRecord(JSON.parse(await readFile(join(root, 'nx.json'), 'utf8')));
       const pluginNames = readPluginNames(nxJson.plugins);
       expect(pluginNames).not.toContain('@nx/js/typescript');
-      expect(pluginNames).toContain('@smoothbricks/nx-plugin');
       expect(expectRecord(nxJson.targetDefaults)['typecheck-tests']).toBeUndefined();
+      expect(nxJson.cacheDirectory).toBe('.nx/cache');
 
       // No issues after fix
       expect(checkWorkspaceConfigPolicy(root)).toEqual([]);

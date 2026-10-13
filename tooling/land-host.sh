@@ -22,8 +22,8 @@
 # test whose own output shows a panic or failed assertion: a test thread can panic and then hang until the bound, and
 # nextest reports that test as a timeout. The records are this checkout's own and are cleared before each run, so a run
 # that dies before writing one is never judged by the run before it. Nx's own `run.json` (what
-# `smoo-nx-bound-failures` reads) is not used: this repository's patched Nx writes it to a per-user directory that every
-# checkout shares, so another gate's run overwrites it. A re-run that fails only on bounds again lands only if the
+# `smoo-nx-bound-failures` reads) is not used: it holds whichever Nx run in this checkout finished last, so any other
+# client's run overwrites the gate's. A re-run that fails only on bounds again lands only if the
 # failures are proven to hide nothing (tooling/land-judge.ts):
 #
 # - Every task that failed is re-run alone with every test running: nextest stops a run at its first failed test, and

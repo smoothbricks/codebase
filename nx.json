@@ -18,7 +18,9 @@
     ],
     "sharedGlobals": ["{workspaceRoot}/.github/workflows/ci.yml"],
     "externalRustCrates": [
-      { "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh smoo-nx-cargo-hash" }
+      {
+        "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh smoo-nx-cargo-hash"
+      }
     ],
     "rustWorkspace": [
       "{workspaceRoot}/Cargo.toml",
@@ -93,5 +95,6 @@
       }
     }
   },
-  "analytics": false
+  "analytics": false,
+  "cacheDirectory": ".nx/cache"
 }

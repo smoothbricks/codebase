@@ -81,6 +81,15 @@ const defaultProductionNamedInput = [
 const impreciseProductionInputs = new Set(['default', '{projectRoot}/**/*', '{projectRoot}/**']);
 
 /**
+ * Every checkout keeps its Nx state in its own `.nx` (specs/cowshed/16_build_volumes.md, "Every checkout has exactly
+ * one Nx state"). With no `NX_*_DIRECTORY` set, as in a host shell, the pinned Nx 23.2.1 otherwise moves the task cache
+ * and its database to a per-user `~/.nx/<id>` keyed by the repository's remote (`utils/cache-directory.js`,
+ * `computeSharedDataLocation`), shared by every checkout of the repository. A configured `cacheDirectory` keeps both
+ * local: the cache here, the task database in Nx's default `.nx/workspace-data`. nx.json has no key for the latter.
+ */
+export const CHECKOUT_NX_CACHE_DIRECTORY = '.nx/cache';
+
+/**
  * Check workspace config policy on an in-memory nx.json object.
  */
 export function checkWorkspaceConfig(nxJson: Record<string, unknown>): NxPolicyIssue[] {
@@ -123,6 +132,15 @@ export function checkWorkspaceConfig(nxJson: Record<string, unknown>): NxPolicyI
   // Named input defaults
   validateNamedInputDefaults(nxJson, 'nx.json', issues);
 
+  if (nxJson.cacheDirectory !== CHECKOUT_NX_CACHE_DIRECTORY) {
+    issues.push({
+      path: 'nx.json',
+      message:
+        `cacheDirectory must be "${CHECKOUT_NX_CACHE_DIRECTORY}". ` +
+        "Without it Nx keeps the task cache and its database in a per-user ~/.nx/<id> shared by every checkout, not in the checkout's own .nx.",
+    });
+  }
+
   // Plugin configuration
   const plugins = validatePlugins(nxJson.plugins === undefined ? [] : nxJson.plugins);
   if (!plugins.success) {
@@ -157,7 +175,8 @@ export function checkWorkspaceConfig(nxJson: Record<string, unknown>): NxPolicyI
  * Mutates in place, returns whether anything changed.
  */
 export function applyWorkspaceConfig(nxJson: Record<string, unknown>): boolean {
-  let changed = removeDisallowedTargetDefaults(nxJson);
+  let changed = setStringProperty(nxJson, 'cacheDirectory', CHECKOUT_NX_CACHE_DIRECTORY);
+  changed = removeDisallowedTargetDefaults(nxJson) || changed;
   changed = applyBuildTargetDefault(nxJson) || changed;
   changed = applyTestTargetDefault(nxJson) || changed;
   changed = applyLintTargetDefault(nxJson) || changed;

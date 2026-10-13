@@ -66,7 +66,7 @@ describe('root smoo monorepo policy', () => {
       await writeJson(join(root, 'nx.json'), validNxJson());
 
       expect(validateRootPackagePolicy(root)).toBe(11);
-      expect(validateNxReleaseConfig(root)).toBe(7);
+      expect(validateNxReleaseConfig(root)).toBe(8);
 
       applyFixableMonorepoDefaults(root);
 
@@ -89,6 +89,7 @@ describe('root smoo monorepo policy', () => {
       expect(nxJson.namedInputs).toEqual(validNamedInputs());
       expect(nxJson.targetDefaults).toEqual(validTargetDefaults());
       expect(nxJson.plugins).toEqual(['@smoothbricks/nx-plugin']);
+      expect(nxJson.cacheDirectory).toBe('.nx/cache');
       expect(validateRootPackagePolicy(root)).toBe(0);
       expect(validateNxReleaseConfig(root)).toBe(0);
     } finally {
@@ -1685,6 +1686,7 @@ function validNxJson(): Record<string, unknown> {
 function validConfiguredNxJson(): Record<string, unknown> {
   return {
     ...validNxJson(),
+    cacheDirectory: '.nx/cache',
     namedInputs: validNamedInputs(),
     targetDefaults: validTargetDefaults(),
     plugins: ['@smoothbricks/nx-plugin'],
