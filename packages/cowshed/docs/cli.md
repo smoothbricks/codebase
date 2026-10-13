@@ -1001,13 +1001,15 @@ independent for each Nx root, covering cacheable non-continuous tasks with defau
 guessing CLI overrides. Nx itself hashes a task with a custom hasher, or one whose inputs name
 `dependentTasksOutputFiles`, only after its dependencies ran, and the dependency outputs on disk in a rebased workspace
 are stale; such a deferred task takes, by its project, target and configuration, the one target entry Nx used last. A
-failed computation carries nothing and reports `{kind:"taskHashes", state, reason}` as the skip reason. A shared row and
-byte budget caps the carry and reserves free space in both the image and its backing store. Neither a failed store-space
-query nor a failed hash probe falls back to an unbounded copy. A bound or failed copy reports `carried.stopped`, keeps
-completed entries and removes the partial entry; the rebase stands. The new head prints on stdout and what was carried,
-by hash and by deferred task, on stderr; `--json` gives `RebaseReport { oid, buildVolume }` with `buildVolume.deferred`
-counting the entries carried by deferred task. The carry stops the idle Nx daemon of each side, which restarts on its
-next client. A side whose task database another process holds carries nothing and names that process.
+failed computation carries nothing and reports `{kind:"taskHashes", state, reason}` as the skip reason. A target whose
+task databases index no cache entry at all, because no Nx run cached a task into its build volume, carries nothing and
+reports `{kind:"unindexed", states}` rather than 0 carried entries. A shared row and byte budget caps the carry and
+reserves free space in both the image and its backing store. Neither a failed store-space query nor a failed hash probe
+falls back to an unbounded copy. A bound or failed copy reports `carried.stopped`, keeps completed entries and removes
+the partial entry; the rebase stands. The new head prints on stdout and what was carried, by hash and by deferred task,
+on stderr; `--json` gives `RebaseReport { oid, buildVolume }` with `buildVolume.deferred` counting the entries carried
+by deferred task. The carry stops the idle Nx daemon of each side, which restarts on its next client. A side whose task
+database another process holds carries nothing and names that process.
 
 ### `cowshed land <name> [--into <lane>] [--check <cmd>]`
 

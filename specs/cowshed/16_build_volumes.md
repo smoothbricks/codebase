@@ -639,14 +639,21 @@ The hash-probe skip is `buildVolume: {kind:"skipped", reason:{kind:"taskHashes",
 checkout-relative Nx state directory (`<root>/.nx`) and `reason` explains the failed process or unreadable/invalid
 output. This is a successful Git rebase with no carried entries, not a refused rebase.
 
+A target with nothing to select from is not a workspace missing nothing. When none of the target's task databases the
+carry reached indexes a cache entry (no `cache_outputs` rows, or no database) at any Nx root with a selection, the carry
+skips before either side is closed, with `reason:{kind:"unindexed", states}` naming those roots' checkout-relative Nx
+state directories: no Nx run cached a task into the target's volume, so a `carried` with 0 entries would hide it.
+
 - **Enforced by**: a real-APFS test in which a workspace forked before a land rebases after it, its report counts the
   land's entries carried, and its run of the landed check then hits every task; a real-APFS test in which a task hashes
   its dependency's outputs (`dependentTasksOutputFiles`), the rebased workspace's copy of those outputs on disk is
   stale, and the task is still carried by task and hits; a carry regression with a historical cache larger than the
   rebased tree's selected entries that asserts only selected files are written; a by-task selection test that carries
   one entry per deferred task out of several of its historical entries, and none when the destination holds the latest;
-  and row, recorded byte, actual copied byte, backing-store reserve/query failure, indexed-query plan (both classes) and
-  late-entry selection tests that preserve the completed prefix without a partial entry.
+  row, recorded byte, actual copied byte, backing-store reserve/query failure, indexed-query plan (both classes) and
+  late-entry selection tests that preserve the completed prefix without a partial entry; and a unit test in which a
+  target database without `cache_outputs`, with an empty one, or absent reports `unindexed` while one indexing only
+  other hashes carries 0.
 
 ### Stacks and merge queues
 
@@ -743,7 +750,11 @@ writes its checkout's build volume like any other job.
   cache private and cold). Danny, 2026-09-29: "isolated nx cache ARE YOU FUCKING KIDDING ME"; 2026-09-26: "why are you
   unsetting all the NX variables, why not configure nx correctly? Why are you scared of the cache?"
 - **Enforced by**: a capability test asserting every job environment of an Nx project names the checkout's own
-  `.nx/cache` and `.nx/workspace-data` and nothing else.
+  `.nx/cache` and `.nx/workspace-data` and nothing else, and a check that a host shell's Nx, with no `NX_*` variable
+  set, resolves its cache to `<checkout>/.nx/cache` and its task database to `<checkout>/.nx/workspace-data`: the pinned
+  Nx 23.2.1 otherwise moves both to a per-user `~/.nx/<id>` unless `nx.json` names `cacheDirectory`. Smoo's workspace
+  policy writes `"cacheDirectory": ".nx/cache"` into every managed `nx.json` (`smoo monorepo update`), and
+  `smoo monorepo check` and `smoo monorepo validate` fail on an `nx.json` without it.
 
 ### The Nx daemon stays on
 
