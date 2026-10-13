@@ -448,12 +448,16 @@ state = ["vendor/upstream"]    # declared build state no capability detects (16_
 keep = 5
 [gateway]
 port = 7644                    # macOS host control plane; Linux private-netns connector; never a service port
-port_range = "32768-49151"    # macOS only: reserved range workspace port blocks are carved from
 [cache]                        # extend (never replace) the convention table
 extra_workspace_dirs = ["build-out"]
 [shell]
 output_limit = "1GiB"         # combined stdout+stderr per job; explicit output-limit terminal state
 ```
+
+macOS port allocation is not a configuration setting. Fixture stores allocate from a reserved fixture partition of the
+validation range; the host never assigns there. The partition bounds are defined once in code. Allocation, growth, and
+explicit slot assignment use the store's partition, while persisted blocks validate against the full validation range
+(04_sandbox.md/05_gateway.md).
 
 Workspace environment lives inside the image as `.cowshed/env`: it exports `COWSHED_WORKSPACE_TOKEN` (controller-minted
 token), and on macOS `COWSHED_PORT_BASE` and `COWSHED_PORT_BLOCK_SIZE` (= the authoritative detached-metadata block base

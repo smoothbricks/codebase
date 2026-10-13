@@ -917,10 +917,12 @@ next: cowshed exec raven -- <retry your command>
   - The next exec starts a fresh supervisor under the new block: its jobs get the new
     `COWSHED_PORT_BASE`/`COWSHED_PORT_BLOCK_SIZE` and a Seatbelt profile that allows the new block and any retained
     ones.
-  - Ports are a host resource, not a per-workspace quota: every workspace's block, current or retained, comes from the
-    one reserved range (`32768–49151` by default, 16384 ports in all, so 256 workspaces at the initial 64-port size),
-    and a workspace keeps its blocks until it is removed, detached or not. A block that cannot be placed because the
-    range has no free aligned block that large is refused rather than waited for.
+  - Ports are a host resource, not a per-workspace quota: host workspaces allocate from the host partition of the macOS
+    validation range. Fixture stores allocate from a reserved fixture partition of that range; the host never assigns
+    there. The partition bounds are defined once in code. Initial allocation, growth, and explicit slot assignment stay
+    inside the store's partition; persisted blocks validate against the full validation range. A workspace keeps its
+    current and retained blocks until it is removed, detached or not. A block that cannot be placed because the
+    partition has no free aligned block that large is refused rather than waited for.
   - Linux refuses `--ports`: each workspace's private network namespace already gives it every loopback port.
 
   ```

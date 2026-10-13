@@ -535,6 +535,10 @@ impl NativeGatewayInventory {
         }
     }
 
+    pub(crate) fn port_allocation(&self) -> crate::metadata::PortAllocation {
+        self.storage.port_allocation()
+    }
+
     /// Inventory over a caller-owned directory store: mount facts come from the mount
     /// records the directory host proves, never from the kernel mount table. Only a
     /// caller that opened a directory runtime selects this; native stores keep [`Self::new`].

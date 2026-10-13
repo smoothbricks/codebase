@@ -741,24 +741,33 @@ pub enum MountGuardError {
     },
 }
 
-/// The store root one host serves: the machine-global volume ([`Self::global`]) in production, or
-/// a root a caller provisioned itself ([`Self::at`]), such as a scratch store of real APFS images.
+/// The machine-global host store, or a test fixture store with isolated port allocation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CanonicalRoots {
     store: Arc<Path>,
     telemetry: PathBuf,
+    port_allocation: crate::metadata::PortAllocation,
 }
 
 impl CanonicalRoots {
     pub fn global() -> Self {
-        Self::at(PathBuf::from(STORE_ROOT))
+        Self::new(
+            PathBuf::from(STORE_ROOT),
+            crate::metadata::PortAllocation::Host,
+        )
     }
 
+    /// A test fixture store; its ports never come from the host allocation partition.
     pub fn at(store: PathBuf) -> Self {
+        Self::new(store, crate::metadata::PortAllocation::Fixture)
+    }
+
+    fn new(store: PathBuf, port_allocation: crate::metadata::PortAllocation) -> Self {
         let telemetry = store.join("telemetry");
         Self {
             store: Arc::from(store),
             telemetry,
+            port_allocation,
         }
     }
 
@@ -773,6 +782,10 @@ impl CanonicalRoots {
 
     pub fn telemetry(&self) -> &Path {
         &self.telemetry
+    }
+
+    pub fn port_allocation(&self) -> crate::metadata::PortAllocation {
+        self.port_allocation
     }
 }
 
@@ -807,6 +820,10 @@ impl ValidatedHostStorage {
 
     pub fn telemetry(&self) -> &Path {
         self.roots.telemetry()
+    }
+
+    pub fn port_allocation(&self) -> crate::metadata::PortAllocation {
+        self.roots.port_allocation()
     }
 }
 
