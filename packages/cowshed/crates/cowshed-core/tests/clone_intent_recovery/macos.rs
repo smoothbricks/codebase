@@ -590,7 +590,7 @@ async fn rm_retires_a_clone_intent_that_left_no_clone_and_can_never_be_replayed(
     let fixture = Fixture::new("unreplayable-intent");
     let runtime = fixture.adopt().await;
     runtime.shutdown().await.expect("stop the adopting runtime");
-    fixture.journal_unreplayable_create("wedged");
+    fixture.journal_unreplayable_create("stranded");
     let rm = fixture
         .open_removing("stranded")
         .await
