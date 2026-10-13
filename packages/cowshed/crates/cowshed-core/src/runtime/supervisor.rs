@@ -277,6 +277,7 @@ impl Default for WorkspaceSupervisorConfig {
                 mount_root: PathBuf::from("/tmp/cowshed-mounts"),
                 workspace_mount: workspace_root,
                 exec_temp_dir: PathBuf::from("/tmp/cowshed-exec"),
+                profile_directory: crate::exec::profile_directory(Path::new("/tmp/cowshed-store")),
                 port_block: crate::metadata::PortBlock::new(49_136, 16).expect("static port block"),
                 retained_port_blocks: Vec::new(),
                 mode: crate::sandbox::RunSandboxMode::ReadWrite,
@@ -390,23 +391,32 @@ struct RenderedPolicy {
     read_only_child: ChildProfile,
 }
 
-/// An executed-child profile, rendered, the build volume its launches bind, and the file
-/// `sandbox-exec -f` reads it from, made sure of by the first spawn under the render. The text
-/// depends only on the workspace's authority, so renders before and after a build-volume pivot
-/// share one file and differ only in the binding.
-#[derive(Debug)]
+/// An executed-child profile, rendered, the store directory its file lives in, and the build
+/// volume its launches bind. The text depends only on the workspace's authority, so renders
+/// before and after a build-volume pivot share one file and differ only in the binding.
+#[derive(Clone, Debug)]
 pub struct ChildProfile {
     text: String,
+    directory: PathBuf,
     build_volume: Option<PathBuf>,
-    file: std::sync::OnceLock<ProfileFile>,
 }
 
 impl ChildProfile {
     fn new(text: String, sandbox: &SandboxConfig) -> Self {
         Self {
             text,
+            directory: sandbox.profile_directory.clone(),
             build_volume: sandbox.build_volume_mount.clone(),
-            file: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// `text`, kept in `directory`, bound to no build volume: a test's host profile.
+    #[cfg(test)]
+    pub(super) fn unbound(text: &str, directory: &Path) -> Self {
+        Self {
+            text: text.to_owned(),
+            directory: directory.to_owned(),
+            build_volume: None,
         }
     }
 
@@ -415,23 +425,18 @@ impl ChildProfile {
         &self.text
     }
 
-    /// How a launch is told this profile: its file, written now when absent, and its binding.
+    /// How a launch is told this profile: its file, made sure of now (written when `cowshed gc`
+    /// removed it or no launch wrote it yet, its mtime bumped otherwise), and its binding.
     pub fn launch(&self) -> Result<ProfileLaunch> {
-        let file = match self.file.get() {
-            Some(file) => file.clone(),
-            None => {
-                let written = ProfileFile::write(&self.text).map_err(|error| {
-                    CowshedError::environment_missing(
-                        format!(
-                            "cannot write the sandbox profile into {}: {error}",
-                            crate::exec::profile_directory().display()
-                        ),
-                        "run `cowshed setup` so the store's run directory exists and is yours",
-                    )
-                })?;
-                self.file.get_or_init(|| written).clone()
-            }
-        };
+        let file = ProfileFile::write(&self.directory, &self.text).map_err(|error| {
+            CowshedError::environment_missing(
+                format!(
+                    "cannot write the sandbox profile into {}: {error}",
+                    self.directory.display()
+                ),
+                "check the store's run directory exists and is yours",
+            )
+        })?;
         Ok(ProfileLaunch::bound(file, self.build_volume.clone()))
     }
 }
@@ -6038,6 +6043,7 @@ mod workspace_toolchain_tests {
             mount_root: mount.parent().expect("root").join("mounts"),
             workspace_mount: mount.to_path_buf(),
             exec_temp_dir: mount.parent().expect("root").join("tmp"),
+            profile_directory: mount.parent().expect("root").join("store/run/profiles"),
             port_block: crate::metadata::PortBlock::new(40_960, 16).expect("port block"),
             retained_port_blocks: Vec::new(),
             mode: RunSandboxMode::ReadWrite,

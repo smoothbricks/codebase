@@ -631,6 +631,20 @@ fn occupant(path: &Path) -> io::Result<Occupant> {
     }
 }
 
+/// When the supervisor serving the socket file at `path` started serving it -- the file's
+/// modification time, set when its listener was bound and never after -- or `None` when no
+/// socket is attached to it.
+pub(crate) fn serving_since(path: &Path) -> io::Result<Option<std::time::SystemTime>> {
+    match occupant(path)? {
+        Occupant::Live => match std::fs::symlink_metadata(path) {
+            Ok(metadata) => metadata.modified().map(Some),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        },
+        Occupant::Absent | Occupant::Stopped => Ok(None),
+    }
+}
+
 /// Rename `from` to `to` in one step the kernel performs whole, refusing an existing `to`:
 /// [`cowshed_os::fsio::rename_noreplace`] against the working directory, which `from` and `to` resolve
 /// from when relative. On Linux that is the `renameat2` system call itself, not glibc's wrapper,

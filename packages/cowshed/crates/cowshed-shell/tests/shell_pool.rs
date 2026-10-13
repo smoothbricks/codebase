@@ -81,6 +81,7 @@ impl Workspace {
             workspace_mount: mount_root.join("workspace"),
             mount_root,
             exec_temp_dir: root.join("tmp"),
+            profile_directory: root.join("store/run/profiles"),
             port_block: PortBlock::new(port_base, 16).expect("port block"),
             retained_port_blocks: Vec::new(),
             mode: cowshed_core::sandbox::RunSandboxMode::ReadWrite,

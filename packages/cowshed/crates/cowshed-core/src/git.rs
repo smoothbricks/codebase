@@ -2521,6 +2521,10 @@ fn sandboxed_git_command_with_paths(
         workspace_mount: canonical.clone(),
         shed_links: Vec::new(),
         exec_temp_dir: canonical.clone(),
+        // Controller Git serves the host store, the one it already names as its mount root.
+        profile_directory: crate::exec::profile_directory(Path::new(
+            cowshed_gateway_types::STORE_ROOT,
+        )),
         port_block: crate::metadata::PortBlock::new(40_960, 16).expect("static macOS port block"),
         retained_port_blocks: Vec::new(),
         mode: RunSandboxMode::ReadWrite,
@@ -2560,11 +2564,11 @@ fn sandboxed_git_command_with_paths(
             "repair the workspace Git path",
         )
     })?;
-    let profile = crate::exec::ProfileFile::write(&profile).map_err(|error| {
+    let profile = crate::exec::ProfileLaunch::write(&config, &profile).map_err(|error| {
         CowshedError::environment_missing(
             format!(
                 "cannot write controller git's sandbox profile into {}: {error}",
-                crate::exec::profile_directory().display()
+                config.profile_directory.display()
             ),
             "run `cowshed setup` so the store's run directory exists and is yours",
         )
@@ -2572,7 +2576,7 @@ fn sandboxed_git_command_with_paths(
     let git = git_command_at(&canonical);
     let mut command = std::process::Command::new(crate::exec::SANDBOX_EXEC);
     command
-        .args(crate::exec::ProfileLaunch::new(profile, &config).args())
+        .args(profile.args())
         .arg("/var/select/developer_dir/usr/bin/git");
     command.args(git.get_args());
     for (name, value) in git.get_envs() {

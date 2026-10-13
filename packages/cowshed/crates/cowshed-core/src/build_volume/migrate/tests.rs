@@ -91,6 +91,7 @@ fn sandbox(checkout: &Path) -> SandboxConfig {
         mount_root: checkout.join("other-mounts"),
         workspace_mount: checkout.to_owned(),
         exec_temp_dir: checkout.join("exec-temp"),
+        profile_directory: checkout.join("store/run/profiles"),
         port_block: crate::metadata::PortBlock::new(49_184, 16).unwrap(),
         retained_port_blocks: Vec::new(),
         mode: RunSandboxMode::ReadWrite,

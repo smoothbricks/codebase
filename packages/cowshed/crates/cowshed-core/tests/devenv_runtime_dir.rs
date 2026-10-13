@@ -99,6 +99,7 @@ fn workspace(root: &Path, port_base: u16) -> SandboxConfig {
         mount_root,
         workspace_mount: mount,
         exec_temp_dir,
+        profile_directory: root.join("store/run/profiles"),
         port_block: PortBlock::new(port_base, 16).expect("port block"),
         retained_port_blocks: Vec::new(),
         mode: RunSandboxMode::ReadWrite,
@@ -1708,6 +1709,7 @@ fn production_workspace(
         build_volume_mount: None,
         workspace_mount: mount,
         exec_temp_dir,
+        store_root: &root.join("store"),
     })
     .expect("production workspace sandbox")
 }

@@ -9783,6 +9783,20 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         let report = timed_async("gc", "substrate", self.substrate.execute_gc(plan))
             .await
             .map_err(native_storage_error)?;
+        // Profile files no live supervisor of the store can still launch from (04_sandbox.md,
+        // "Exec pipeline" step 4). A failure leaves them for the next gc and is said, never
+        // turned into a failed collection of everything else.
+        let store_root = self.layout.project().store_root.clone();
+        match crate::exec::collect_profiles(&store_root) {
+            Ok(0) => {}
+            Ok(removed) => eprintln!(
+                "cowshed: gc removed {removed} sandbox profile file(s) no live supervisor launches from"
+            ),
+            Err(error) => eprintln!(
+                "cowshed: gc left the sandbox profile files in {}: {error}",
+                crate::exec::profile_directory(&store_root).display()
+            ),
+        }
         Ok(GcReport {
             examined: u64::try_from(report.examined)
                 .map_err(|_| CowshedError::internal("GC count overflow"))?
@@ -14309,6 +14323,7 @@ mod grant_unit_tests {
             workspace_mount: workspace_mount.to_path_buf(),
             shed_links: Vec::new(),
             exec_temp_dir: PathBuf::from("/private/tmp/cowshed-grant-unit"),
+            profile_directory: mount_root.join("store/run/profiles"),
             port_block: crate::metadata::PortBlock::new(40_960, 16).unwrap(),
             retained_port_blocks: Vec::new(),
             mode: RunSandboxMode::ReadWrite,
@@ -14658,6 +14673,7 @@ fn supervisor_sandbox(
         exec_temp_dir: layout
             .exec_temp_dir(&current.metadata.workspace)
             .map_err(native_integrity_error)?,
+        store_root: &layout.project().store_root,
     })
 }
 

@@ -140,6 +140,10 @@ pub struct SandboxConfig {
     /// Operator-planted symlinks beside the workspace mount; see [`ShedLink`].
     pub shed_links: Vec<ShedLink>,
     pub exec_temp_dir: PathBuf,
+    /// Where launches under this sandbox keep their profile file: the `run/profiles` directory of
+    /// the store the launcher serves ([`crate::exec::profile_directory`]), so a fixture's
+    /// launches stay in its own store (04_sandbox.md, "Exec pipeline" step 4).
+    pub profile_directory: PathBuf,
     /// The block the workspace's environment names (`COWSHED_PORT_BASE`/`_SIZE`) and its
     /// gateway listens on.
     pub port_block: PortBlock,
@@ -206,6 +210,7 @@ impl SandboxConfig {
             workspace_mount: self.workspace_mount.clone(),
             shed_links: self.shed_links.clone(),
             exec_temp_dir: self.exec_temp_dir.clone(),
+            profile_directory: self.profile_directory.clone(),
             port_block: self.port_block,
             retained_port_blocks: self.retained_port_blocks.clone(),
             mode: self.mode,
@@ -313,6 +318,8 @@ pub struct WorkspaceSandbox<'a> {
     pub workspace_mount: PathBuf,
     /// The workspace's `TMPDIR`: [`crate::storage::StorageLayout::exec_temp_dir`].
     pub exec_temp_dir: PathBuf,
+    /// The store the workspace's supervisor serves, whose `run/profiles` its launches read.
+    pub store_root: &'a Path,
 }
 
 /// The sandbox a workspace's supervisor runs in and hands `plan_exec` for every child it
@@ -333,6 +340,7 @@ pub fn workspace_sandbox(workspace: WorkspaceSandbox<'_>) -> crate::Result<Sandb
         build_volume_mount,
         workspace_mount: mount,
         exec_temp_dir,
+        store_root,
     } = workspace;
     // Main's checkout lives at the operator's own path, outside the mount root, so the
     // sibling-mount deny never reaches it: it is denied by name, exactly like a sibling. Main
@@ -348,6 +356,7 @@ pub fn workspace_sandbox(workspace: WorkspaceSandbox<'_>) -> crate::Result<Sandb
         home: home.to_path_buf(),
         mount_root: mount_root.to_path_buf(),
         exec_temp_dir,
+        profile_directory: crate::exec::profile_directory(store_root),
         shed_links: shed_links(&mount).map_err(|error| {
             CowshedError::integrity(
                 format!("cannot read the shed beside {}: {error}", mount.display()),
@@ -1336,6 +1345,7 @@ mod tests {
             ),
             shed_links: Vec::new(),
             exec_temp_dir: PathBuf::from("/private/tmp/cowshed-raven"),
+            profile_directory: PathBuf::from("/private/tmp/cowshed-raven-store/run/profiles"),
             port_block: PortBlock::new(40_960, 16).unwrap(),
             retained_port_blocks: Vec::new(),
             mode,
@@ -1408,6 +1418,7 @@ mod tests {
         sandbox.mount_root = fixture.root.join("mounts");
         sandbox.workspace_mount = sandbox.mount_root.join("workspace");
         sandbox.exec_temp_dir = fixture.root.join("exec-temp");
+        sandbox.profile_directory = fixture.root.join("store/run/profiles");
         sandbox.grants = SandboxGrants::default();
         sandbox.allowed_unix_sockets.clear();
         let volumes = sandbox.mount_root.join(".build/example-org/example-app");
@@ -1432,8 +1443,10 @@ mod tests {
         // A launch as every launcher makes one: the profile's kept file, bound to the volume.
         let launch = |sandbox: &SandboxConfig| {
             let text = seatbelt_profile(sandbox, SandboxProfileRole::ExecutedChild).unwrap();
-            let file = crate::exec::ProfileFile::write(&text).unwrap();
-            (text, crate::exec::ProfileLaunch::new(file, sandbox))
+            (
+                text.clone(),
+                crate::exec::ProfileLaunch::write(sandbox, &text).unwrap(),
+            )
         };
         let (old_text, old) = launch(&sandbox);
         let touch = |profile: &crate::exec::ProfileLaunch, path: &Path| {
@@ -1537,6 +1550,7 @@ mod tests {
         sandbox.mount_root = fixture.root.join("mounts");
         sandbox.workspace_mount = sandbox.mount_root.join("workspace");
         sandbox.exec_temp_dir = fixture.root.join("exec-temp");
+        sandbox.profile_directory = fixture.root.join("store/run/profiles");
         sandbox.grants = SandboxGrants::default();
         sandbox.allowed_unix_sockets.clear();
         fs::create_dir_all(&sandbox.workspace_mount).unwrap();
@@ -1605,6 +1619,7 @@ mod tests {
         sandbox.mount_root = fixture.root.join("mounts");
         sandbox.workspace_mount = sandbox.mount_root.join("workspace");
         sandbox.exec_temp_dir = fixture.root.join("exec-temp");
+        sandbox.profile_directory = fixture.root.join("store/run/profiles");
         sandbox.grants = SandboxGrants::default();
         sandbox.allowed_unix_sockets.clear();
         let runtime = shared_daemon_runtime_dir(&sandbox);
@@ -1935,6 +1950,7 @@ mod tests {
                 build_volume_mount: None,
                 workspace_mount: mount.to_path_buf(),
                 exec_temp_dir: PathBuf::from("/private/tmp/cowshed-raven"),
+                store_root: Path::new("/private/tmp/cowshed-raven-store"),
             })
             .unwrap()
         };
@@ -2037,6 +2053,7 @@ mod tests {
             build_volume_mount: None,
             workspace_mount: PathBuf::from("/Users/tester/.cowshed/mnt/acme/widget/raven"),
             exec_temp_dir: PathBuf::from("/private/tmp/cowshed-raven"),
+            store_root: Path::new("/private/tmp/cowshed-raven-store"),
         })
         .unwrap();
         assert_eq!(
