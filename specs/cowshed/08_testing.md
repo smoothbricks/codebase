@@ -275,9 +275,9 @@ disk-image target: the two groups never run concurrently. Each nextest group dec
 tests. Ordinary and exceptions shards exclude those filters; ordinary `cargo-test` excludes both groups, while the full
 `test` aggregate reaches them. Every test has one runner, and non-macOS planning creates neither APFS group.
 
-Every test target, the group included, is bounded by progress alone: the run ends when no test has finished for 180s,
+Every test target, the groups included, is bounded by progress alone: the run ends when no test has finished for 180s,
 the hang backstop, and names the tests still running; it has no wall-clock ceiling, and no per-test bound kills a test
-(`packages/nx-plugin/README.md`, "Bounded Test Targets"). The group's runner carries `--no-tests=fail`, so a filter that
+(`packages/nx-plugin/README.md`, "Bounded Test Targets"). A group's runner carries `--no-tests=fail`, so a filter that
 selects nothing fails rather than passing a run of no test. The RAM host walk and real-process CPU-pool
 production-wiring proofs run after this group in `test-host`, outside the four pure Bun shards, with the existing case
 bounds. The shards exclude `*-host.test.ts`; the host target names both owned host files.
@@ -295,24 +295,23 @@ Each client asks for its phase `alone` (05_gateway.md, "Disk-lifecycle lease"): 
 `storagekitd` behind every other member's, and in one gate a detach that takes 0.3 s idle took 10.6 s there, so the
 queue is waited for before the grant, where the record counts it. After the test exits, the wrapper prints its wall
 time, the union of its waits clipped to the run (waits of concurrent threads and processes, as a sweep beside a
-teardown, count once) and their difference, its code time, and fails a passing test whose code time exceeds its class. A
-failing test keeps its own exit status. The record cannot undercount a wait whose process died: the start is written
-before the wait, so a start with no end — its process killed while waiting, or still waiting — counts to the test's end
-and is named. A record that cannot be written is said once per process and its waits then count as code time; an end
-with no start counts as code time and is named; a record the wrapper cannot parse fails the test. The classes are
-declared once, as the wrapper rules of `.config/nextest.toml`: 60s for `test(/real_apfs_.*_substrate_lifecycle/)`, and
-30s for every other group test; the 30s rule names exactly the group's filter. The 60s class is defined by what a test
-runs: the raw substrate lifecycle and every genuine-Nx CLI walk, a test whose fixture installs the repository's pinned
-Nx and runs it or its daemon (`Project::Nx`, or `Project::Build` with Nx), each named with the `_substrate_lifecycle`
-suffix. For the raw lifecycle, 3× its worst idle measurement, 14.8s, is 44.4s, rounded up. The genuine-Nx walks have no
-idle median; the warm-fork walk took about 25s when nothing waited. With their lease waits excluded, one full serial
-lane at load 15-84 (median 37) measured them at 2.3-45.4s of code time: land-carries 45.4s, the foreign database opener
-38.1s, rebase-carries 36.0s, warm fork 30.9s, the foreign database holder 30.2s, against at most 5.8s of lease wait
-each. Five were over 30s, so that class cannot hold them under ordinary host load; 60s holds every measurement. It is
-below 3× their ~25s idle floor (75s): a walk past it on a loaded host is a regression to find, not a bound to raise. The
-group's nextest `slow-timeout` is 180s with `terminate-after = 1`: the hang backstop that ends a test which never
-returns, not its performance bound. It is the only killer: a test over its class runs to its own teardown and fails
-after it, since a killed test leaves its images attached until the next run's sweep (01_storage.md, "How the APFS host
+teardown, count once) and their difference, its code time, and warns when that code time exceeds its class; the test
+keeps its own exit status. The record cannot undercount a wait whose process died: the start is written before the wait,
+so a start with no end — its process killed while waiting, or still waiting — counts to the test's end and is named. A
+record that cannot be written is said once per process and its waits then count as code time; an end with no start
+counts as code time and is named; a record the wrapper cannot parse fails the test. The classes are declared once, as
+the wrapper rules of `.config/nextest.toml`: 60s for `test(/real_apfs_.*_substrate_lifecycle/)`, and 30s for every other
+group test; the 30s rule names exactly the group's filter. The 60s class is defined by what a test runs: the raw
+substrate lifecycle and every genuine-Nx CLI walk, a test whose fixture installs the repository's pinned Nx and runs it
+or its daemon (`Project::Nx`, or `Project::Build` with Nx), each named with the `_substrate_lifecycle` suffix. For the
+raw lifecycle, 3× its worst idle measurement, 14.8s, is 44.4s, rounded up. The genuine-Nx walks have no idle median; the
+warm-fork walk took about 25s when nothing waited. With their lease waits excluded, one full serial lane at load 15-84
+(median 37) measured them at 2.3-45.4s of code time: land-carries 45.4s, the foreign database opener 38.1s,
+rebase-carries 36.0s, warm fork 30.9s, the foreign database holder 30.2s, against at most 5.8s of lease wait each. Five
+were over 30s, so that class cannot hold them under ordinary host load; 60s holds every measurement. It is below 3×
+their ~25s idle floor (75s): a walk past it on a loaded host is a regression to find, not a class to raise. A class is a
+warning, never a kill or a failure: a test that never returns is ended by its runner's 180s no-progress bound, which
+names it, and a killed test leaves its images attached until the next run's sweep (01_storage.md, "How the APFS host
 degrades" §2).
 
 The genuine-Nx CLI fixtures use the normal enabled daemon (16_build_volumes.md, "The Nx daemon stays on"). Both halves
