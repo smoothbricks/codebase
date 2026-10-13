@@ -87,8 +87,9 @@ async function rebuildNxPluginIfStale(): Promise<void> {
 }
 
 async function clearNxDaemonState(): Promise<void> {
-  // Only `.nx/workspace-data` — the daemon socket and project-graph DB, which is
-  // the state a rebuilt plugin actually invalidates. NOT `.nx/cache`.
+  // Only `.nx/workspace-data` — the daemon socket and project-graph files, which
+  // are the state a rebuilt plugin actually invalidates. NOT `.nx/cache`, and NOT
+  // the task database beside the graph files.
   //
   // `.nx/cache` holds task results and the `terminalOutputs/<hash>` files the task
   // orchestrator writes when a task exits. Deleting it here raced every concurrent
@@ -101,8 +102,17 @@ async function clearNxDaemonState(): Promise<void> {
   //
   // Keeping the task cache is safe, not merely cheaper: a target's hash covers its
   // resolved configuration, so entries produced by the previous plugin build are
-  // unreachable rather than wrong once inference changes. Clearing the graph DB is
-  // what makes the new plugin take effect; clearing results was only collateral.
+  // unreachable rather than wrong once inference changes. Clearing the graph files
+  // is what makes the new plugin take effect; clearing results was only collateral.
+  //
+  // The task database (`<machine>-v<schema>.db`, its SQLite `-wal`/`-shm`/`-journal`
+  // and the `.lock` Nx opens it under) is the cache's index: Nx answers a hit only
+  // for a `cache_outputs` row and evicts only by row, so deleting it leaves every
+  // entry in `.nx/cache` unreachable and never evicted. It went with the graph
+  // files once, on the first shell entry of a main whose land changed this plugin:
+  // the volume main had just adopted kept its gate's entries and lost their index,
+  // so every rebase onto main carried nothing (specs/cowshed/16_build_volumes.md,
+  // "Every checkout has exactly one Nx state").
   //
   // Deliberately the workspace-local path, NOT NX_WORKSPACE_DATA_DIRECTORY. Host
   // CI runners redirect that to a shared per-lane tree which also holds the cache
@@ -120,7 +130,26 @@ async function clearNxDaemonState(): Promise<void> {
     if (error.code === 'ENOENT') return [];
     throw error;
   });
-  await Promise.all(entries.map((entry) => rm(path.join(data, entry), { recursive: true, force: true })));
+  const kept = taskDatabaseEntries(entries);
+  await Promise.all(
+    entries
+      .filter((entry) => !kept.has(entry))
+      .map((entry) => rm(path.join(data, entry), { recursive: true, force: true })),
+  );
+}
+
+/** Nx's task databases in `entries`, with their SQLite sidecars and the `.lock` Nx opens each under. */
+function taskDatabaseEntries(entries: readonly string[]): ReadonlySet<string> {
+  const databases = entries.filter((entry) => entry.endsWith('.db')).map((entry) => entry.slice(0, -'.db'.length));
+  return new Set(
+    databases.flatMap((stem) => [
+      `${stem}.db`,
+      `${stem}.db-wal`,
+      `${stem}.db-shm`,
+      `${stem}.db-journal`,
+      `${stem}.lock`,
+    ]),
+  );
 }
 
 async function runQuietly(command: string, args: readonly string[], cwd: string): Promise<void> {
