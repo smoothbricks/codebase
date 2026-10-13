@@ -480,7 +480,9 @@ Whether a method reads or acts is not statically decidable. A method that acts i
 - **same-path:** the cases share at least two leading statements exactly, and one of them only purely asserts beyond
   them. Move its assertions into the other walk at the statement the diagnostic names.
 - **literal-twin:** two or more statements equal once literals are abstracted; identical bodies are reported as verbatim
-  repeats. Make one table or property over the values.
+  repeats. Make one table or property over the values. Keep each original case's label in its table row and include it
+  in assertion diagnostics; when rows need different numbers of checks, store all expected values per row and assert
+  every one in the common walk.
 
 It advises on a third with `warning[TEST-ONE-WALK]`, which never fails the run. The warning is for the writer and the
 reviewer, who decide whether the variants share one walk:
@@ -566,8 +568,8 @@ Concrete targets come from concrete files:
   partitioning the class keeps every target inside its progress bound without relaxing it. The remaining non-group
   exceptional tests stay normally schedulable. Every piece runs `--no-fail-fast`, so a failing test does not stop the
   rest of its piece. The exceptional filter is the union of the overrides in the plugin's own `nextest.toml`, so adding
-  one there is the whole change to that class. Serial groups are classified separately, by `test-group` overrides in
-  the workspace's `.config/nextest.toml`; the plugin's file declares none. Only sharded crates need these targets; an
+  one there is the whole change to that class. Serial groups are classified separately, by `test-group` overrides in the
+  workspace's `.config/nextest.toml`; the plugin's file declares none. Only sharded crates need these targets; an
   unsharded crate already runs all its non-group tests in one process. Empty partitions pass, including platforms where
   the tests are `cfg`-ed out. `nextest-partitions.test.ts` executes the inferred archive and shard commands over 29
   tests and asserts that the ordinary shards ran exactly the 13 ordinary tests once and the exceptional shards exactly

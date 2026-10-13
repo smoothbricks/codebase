@@ -1788,7 +1788,7 @@ mod tests {
         );
     }
     #[test]
-    fn extract_json_events_multiple_events() {
+    fn extract_json_events_multiple_events_with_declared_and_undeclared_fields() {
         let fields = [
             field(ArrowType::Utf8),
             field(ArrowType::Utf8),
@@ -1796,32 +1796,40 @@ mod tests {
             field(ArrowType::Utf8),
             field(ArrowType::Binary),
         ];
-        let mut c = DynamicColumns::new(&fields, 10).expect("column plane fits");
-        let mut work = [0; 1024];
-        assert_eq!(extract_json_events(br#"[{"id":"1","type":"order","timestamp":1000,"orderId":"A"},{"id":"2","type":"order","timestamp":2000,"orderId":"B"}]"#,&config(&fields,&["id","type","timestamp","orderId",crate::UNDECLARED_COLUMN_NAME]),&mut c,&mut work,&mut ExtractionDiagnostic::default()).unwrap(),2);
-    }
-    #[test]
-    fn extract_json_events_with_undeclared_fields() {
-        let fields = [
-            field(ArrowType::Utf8),
-            field(ArrowType::Utf8),
-            field(ArrowType::Int64),
-            field(ArrowType::Utf8),
-            field(ArrowType::Binary),
-        ];
-        let mut c = DynamicColumns::new(&fields, 10).expect("column plane fits");
-        let mut work = [0; 1024];
-        assert_eq!(
-            extract_json_events(
-                br#"[{"id":"1","type":"order","timestamp":1000,"orderId":"A","extra":"ignored"},{"id":"2","type":"order","timestamp":2000,"orderId":"B"}]"#,
-                &config(&fields, &["id", "type", "timestamp", "orderId", crate::UNDECLARED_COLUMN_NAME]),
-                &mut c,
-                &mut work,
-                &mut ExtractionDiagnostic::default()
-            )
-            .unwrap(),
-            2
+        let cfg = config(
+            &fields,
+            &[
+                "id",
+                "type",
+                "timestamp",
+                "orderId",
+                crate::UNDECLARED_COLUMN_NAME,
+            ],
         );
+        let mut work = [0; 1024];
+        for (label, json) in [
+            (
+                "extract_json_events_multiple_events",
+                br#"[{"id":"1","type":"order","timestamp":1000,"orderId":"A"},{"id":"2","type":"order","timestamp":2000,"orderId":"B"}]"#.as_slice(),
+            ),
+            (
+                "extract_json_events_with_undeclared_fields",
+                br#"[{"id":"1","type":"order","timestamp":1000,"orderId":"A","extra":"ignored"},{"id":"2","type":"order","timestamp":2000,"orderId":"B"}]"#.as_slice(),
+            ),
+        ] {
+            let mut c = DynamicColumns::new(&fields, 10).expect("column plane fits");
+            assert_eq!(
+                extract_json_events(
+                    json,
+                    &cfg,
+                    &mut c,
+                    &mut work,
+                    &mut ExtractionDiagnostic::default(),
+                ).unwrap(),
+                2,
+                "{label}",
+            );
+        }
     }
     #[test]
     fn extract_json_events_supports_schemas_wider_than_64_fields() {

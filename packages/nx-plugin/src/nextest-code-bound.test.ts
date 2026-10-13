@@ -126,16 +126,27 @@ describe('nextest-code-bound wrapper', () => {
     expect(run.recordsLeft).toBe(0);
   });
 
-  it('warns of a passing test whose code time is over its class, and still passes it', () => {
-    const run = runWrapped('0.3', 0, 0.35, 0);
-    expect(run.stderr).toContain('OVER its class (a warning)');
-    expect(run.status).toBe(0);
-  });
-
-  it("keeps a failing test's own exit status and still reports its split", () => {
-    const run = runWrapped('30', 0, 0, 3);
-    expect(run.stderr).toContain('within its class');
-    expect(run.status).toBe(3);
+  it('reports code-time verdicts without changing the test exit status', () => {
+    for (const { label, bound, work, status, verdict } of [
+      {
+        label: 'warns of a passing test whose code time is over its class, and still passes it',
+        bound: '0.3',
+        work: 0.35,
+        status: 0,
+        verdict: 'OVER its class (a warning)',
+      },
+      {
+        label: "keeps a failing test's own exit status and still reports its split",
+        bound: '30',
+        work: 0,
+        status: 3,
+        verdict: 'within its class',
+      },
+    ]) {
+      const run = runWrapped(bound, 0, work, status);
+      expect(run.stderr, label).toContain(verdict);
+      expect(run.status, label).toBe(status);
+    }
   });
 
   it('refuses to run without a class', () => {
