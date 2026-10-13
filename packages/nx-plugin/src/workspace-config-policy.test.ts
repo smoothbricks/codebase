@@ -40,15 +40,18 @@ function validTargetDefaults(): Record<string, unknown> {
   };
 }
 
+const MARKDOWN = '!{projectRoot}/**/*.md';
+
 function validNamedInputs(): Record<string, unknown> {
   return {
-    default: ['{projectRoot}/**/*'],
+    default: ['{projectRoot}/**/*', MARKDOWN],
     production: [
       '{projectRoot}/src/**/*',
       '{projectRoot}/package.json',
       '!{projectRoot}/**/__tests__/**',
       '!{projectRoot}/**/*.test.*',
       '!{projectRoot}/**/*.spec.*',
+      MARKDOWN,
     ],
   };
 }
@@ -208,7 +211,9 @@ describe('pure core: checkWorkspaceConfig', () => {
       const nxJson = validNxJson();
       nxJson.namedInputs = {
         ...validNamedInputs(),
-        ...(globals === undefined ? {} : { default: ['{projectRoot}/**/*', 'sharedGlobals'], sharedGlobals: globals }),
+        ...(globals === undefined
+          ? {}
+          : { default: ['{projectRoot}/**/*', 'sharedGlobals', MARKDOWN], sharedGlobals: globals }),
       };
       expect(checkWorkspaceConfig(nxJson)).toEqual([]);
     }
@@ -417,7 +422,35 @@ describe('pure core: applyWorkspaceConfig', () => {
       '!{projectRoot}/**/__tests__/**',
       '!{projectRoot}/**/*.test.*',
       '!{projectRoot}/**/*.spec.*',
+      MARKDOWN,
     ]);
+  });
+
+  // A README or spec edit re-keyed every task of its project and, through `^default`/`^production`, of every
+  // project depending on it: 39 tasks for one package README in this repository.
+  it('keeps Markdown out of default and production, appending the exclusion to custom definitions', () => {
+    const nxJson = validNxJson();
+    nxJson.namedInputs = {
+      default: ['{projectRoot}/**/*', 'custom'],
+      production: ['{projectRoot}/src/**/*.rs', '{projectRoot}/Cargo.toml'],
+      custom: ['{workspaceRoot}/config/shared.json'],
+    };
+    expect(checkWorkspaceConfig(nxJson).map((issue) => issue.message)).toEqual([
+      "namedInputs.default must exclude {projectRoot}/**/*.md: Markdown is no task's input unless a target names it.",
+      "namedInputs.production must exclude {projectRoot}/**/*.md: Markdown is no task's input unless a target names it.",
+    ]);
+    expect(applyWorkspaceConfig(nxJson)).toBe(true);
+    expect(nxJson.namedInputs).toEqual({
+      default: ['{projectRoot}/**/*', 'custom', MARKDOWN],
+      production: ['{projectRoot}/src/**/*.rs', '{projectRoot}/Cargo.toml', MARKDOWN],
+      custom: ['{workspaceRoot}/config/shared.json'],
+    });
+    expect(applyWorkspaceConfig(nxJson)).toBe(false);
+    expect(checkWorkspaceConfig(nxJson)).toEqual([]);
+
+    const fresh: Record<string, unknown> = { plugins: validPlugins(), targetDefaults: validTargetDefaults() };
+    applyWorkspaceConfig(fresh);
+    expect(fresh.namedInputs).toEqual(validNamedInputs());
   });
 
   it('accepts custom precise production inputs unchanged', () => {
@@ -425,17 +458,16 @@ describe('pure core: applyWorkspaceConfig', () => {
       ...validNxJson(),
       namedInputs: {
         ...validNamedInputs(),
-        production: ['{projectRoot}/src/**/*.rs', '{projectRoot}/Cargo.toml', '!{projectRoot}/**/*.test.*'],
+        production: ['{projectRoot}/src/**/*.rs', '{projectRoot}/Cargo.toml', '!{projectRoot}/**/*.test.*', MARKDOWN],
       },
     };
     expect(applyWorkspaceConfig(nxJson)).toBe(false);
   });
-
   it('migrates only a CI-only sharedGlobals reference and retains explicit workflow targets', () => {
     const nxJson = validNxJson();
     nxJson.namedInputs = {
       ...validNamedInputs(),
-      default: ['{projectRoot}/**/*', 'sharedGlobals', 'custom'],
+      default: ['{projectRoot}/**/*', 'sharedGlobals', 'custom', MARKDOWN],
       sharedGlobals: ['{workspaceRoot}/.github/workflows/ci.yml'],
       custom: ['{workspaceRoot}/config/shared.json'],
       lint: ['sharedGlobals'],
@@ -444,7 +476,7 @@ describe('pure core: applyWorkspaceConfig', () => {
     expect(applyWorkspaceConfig(nxJson)).toBe(true);
     expect(expectRecord(nxJson.namedInputs)).toEqual({
       ...validNamedInputs(),
-      default: ['{projectRoot}/**/*', 'custom'],
+      default: ['{projectRoot}/**/*', 'custom', MARKDOWN],
       sharedGlobals: ['{workspaceRoot}/.github/workflows/ci.yml'],
       custom: ['{workspaceRoot}/config/shared.json'],
       lint: ['sharedGlobals'],
@@ -459,12 +491,12 @@ describe('pure core: applyWorkspaceConfig', () => {
     const nxJson = validNxJson();
     nxJson.namedInputs = {
       ...validNamedInputs(),
-      default: ['{projectRoot}/**/*', 'sharedGlobals'],
+      default: ['{projectRoot}/**/*', 'sharedGlobals', MARKDOWN],
       sharedGlobals: ['{workspaceRoot}/config/shared.json'],
     };
     expect(applyWorkspaceConfig(nxJson)).toBe(false);
     expect(expectRecord(nxJson.namedInputs).sharedGlobals).toEqual(['{workspaceRoot}/config/shared.json']);
-    expect(expectRecord(nxJson.namedInputs).default).toEqual(['{projectRoot}/**/*', 'sharedGlobals']);
+    expect(expectRecord(nxJson.namedInputs).default).toEqual(['{projectRoot}/**/*', 'sharedGlobals', MARKDOWN]);
   });
 });
 

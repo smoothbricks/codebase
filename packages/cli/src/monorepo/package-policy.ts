@@ -58,6 +58,7 @@ import {
   sameRepositoryAfterNormalization,
   workspaceDependencyFields,
 } from '../lib/workspace.js';
+import type { ProjectTargets } from '../nx/index.js';
 
 /**
  * Packages that must exist exactly once in a consumer's module graph. A library
@@ -351,6 +352,26 @@ export function validateNxReleaseConfig(root: string): number {
   for (const issue of checkReleaseConfigPolicy(root)) {
     console.error(issue.message);
     failures++;
+  }
+  return failures;
+}
+
+/**
+ * A cached target with no `inputs` anywhere in its resolved configuration is hashed by Nx 23.2.1's native planner
+ * over every file under its project root, whatever nx.json's `default` named input excludes: a README edit re-keyed
+ * the project's tests and aggregates although `default` leaves Markdown out. Naming `default` (in the target, or in a
+ * `targetDefaults` entry for its name) makes the planner honour the named input.
+ */
+export function validateExplicitTaskInputs(projects: readonly ProjectTargets[]): number {
+  let failures = 0;
+  for (const project of projects) {
+    for (const target of [...project.targets].sort()) {
+      if (project.targetCache?.get(target) !== true || project.targetInputs?.has(target) === true) continue;
+      console.error(
+        `${project.project}:${target}: cached target declares no inputs, so Nx hashes every file under its project root and ignores nx.json's default named input; declare its inputs, or give "${target}" a targetDefaults entry with "inputs": ["default", "^default"]`,
+      );
+      failures++;
+    }
   }
   return failures;
 }

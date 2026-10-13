@@ -192,6 +192,8 @@
         "cache": true,
         "inputs": [
           "{projectRoot}/**/*.rs",
+          "{projectRoot}/skills/cowshed/SKILL.md",
+          "{projectRoot}/crates/cowshed-core/src/build_volume/task_hashes.js",
           "{projectRoot}/**/Cargo.toml",
           "{workspaceRoot}/Cargo.toml",
           "{workspaceRoot}/Cargo.lock",
@@ -221,6 +223,8 @@
         "cache": true,
         "inputs": [
           "{projectRoot}/**/*.rs",
+          "{projectRoot}/skills/cowshed/SKILL.md",
+          "{projectRoot}/crates/cowshed-core/src/build_volume/task_hashes.js",
           "{projectRoot}/**/Cargo.toml",
           "{workspaceRoot}/Cargo.toml",
           "{workspaceRoot}/Cargo.lock",
@@ -253,6 +257,8 @@
         ],
         "inputs": [
           "{projectRoot}/**/*.rs",
+          "{projectRoot}/skills/cowshed/SKILL.md",
+          "{projectRoot}/crates/cowshed-core/src/build_volume/task_hashes.js",
           "{projectRoot}/**/Cargo.toml",
           "{workspaceRoot}/Cargo.toml",
           "{workspaceRoot}/Cargo.lock",
@@ -287,6 +293,8 @@
         ],
         "inputs": [
           "{projectRoot}/**/*.rs",
+          "{projectRoot}/skills/cowshed/SKILL.md",
+          "{projectRoot}/crates/cowshed-core/src/build_volume/task_hashes.js",
           "{projectRoot}/**/Cargo.toml",
           "{workspaceRoot}/Cargo.toml",
           "{workspaceRoot}/Cargo.lock",
@@ -319,6 +327,10 @@
       "napi-test": {
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "cache": true,
+        "inputs": [
+          "default",
+          "^default"
+        ],
         "dependsOn": [
           "cargo-test",
           "napi-debug",
@@ -338,6 +350,10 @@
       "launcher-test": {
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "cache": true,
+        "inputs": [
+          "default",
+          "^default"
+        ],
         "//": "dependsOn ^build so lmao/dist exists: bunfig.napi-test.toml preloads ../../lmao/dist/ts/bun/trace-preload.js, and without the edge a cold cache runs this target before lmao:build.",
         "dependsOn": [
           "^build",
@@ -474,6 +490,10 @@
       "wire-test": {
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "cache": true,
+        "inputs": [
+          "default",
+          "^default"
+        ],
         "dependsOn": [
           "typecheck-tests",
           "wire-fixtures",

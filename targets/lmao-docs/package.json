@@ -49,6 +49,10 @@
         "options": {
           "cwd": "{projectRoot}"
         },
+        "inputs": [
+          "default",
+          "^default"
+        ],
         "outputs": [
           "{projectRoot}/dist"
         ],

@@ -187,10 +187,18 @@ configurations and parallelism of every target in the project, plus its tags and
 `dependsOn`, `cache` or `//`). An edit to one target's command therefore re-keys every target of that project, including
 each inferred `cargo-test-*` runner. Only the project a target lives in decides that sensitivity.
 
-Workspace policy defaults non-production tasks to `["{projectRoot}/**/*"]`, without a forced CI workflow input. It
-migrates the old CI-only `sharedGlobals` reference out of `default` and never re-injects that definition. Custom non-CI
-named globals and explicit workflow-target inputs remain repository-owned and unchanged; workflow checks can still name
-their own CI inputs.
+Workspace policy defaults non-production tasks to `["{projectRoot}/**/*", "!{projectRoot}/**/*.md"]`, without a forced
+CI workflow input. It migrates the old CI-only `sharedGlobals` reference out of `default` and never re-injects that
+definition. Custom non-CI named globals and explicit workflow-target inputs remain repository-owned and unchanged;
+workflow checks can still name their own CI inputs.
+
+Policy excludes incidental Markdown through `!{projectRoot}/**/*.md` in `default` and `production`. A task that consumes
+Markdown declares it through an input set without a matching negative: Nx exclusions win over positive paths in the same
+fileset, so a later explicit path cannot re-include it. Inferred Cargo package filesets remain broad for arbitrary
+compiled data, headers, schemas and build-script reads; incidental Markdown beneath a crate can therefore still
+invalidate those tasks conservatively. Nx 23.2.1 hashes a cached target that declares no `inputs` over every file under
+its project root and ignores the `default` named input, so `smoo monorepo check` refuses such a target: declare its
+inputs, or give its target name a `targetDefaults` entry with `"inputs": ["default", "^default"]`.
 
 Cargo keeps the caller's `CARGO_HOME`. Moving configuration into an isolated home can change relative paths or lose
 source replacement, credentials, and toolchain settings; forwarding it with `--config` changes precedence. Registry
