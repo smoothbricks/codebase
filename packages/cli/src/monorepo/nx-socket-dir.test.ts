@@ -1,3 +1,4 @@
+/* biome-ignore-all lint/suspicious/noTemplateCurlyInString: Shell parameter expansions are literal shell text. */
 import { describe, expect, it } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import {
