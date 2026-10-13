@@ -104,9 +104,8 @@ fn workspace_hooks_cannot_run_as_controller_on_rebase() {
                 "job wrote {name} inside the checkout"
             );
         }
-        let mut git = sandboxed_git_command_at(&workspace).expect("controller Git sandbox");
-        let rebase = git
-            .command
+        let rebase = sandboxed_git_command_at(&workspace)
+            .expect("controller Git sandbox")
             .args(["rebase", "target"])
             .env("GIT_AUTHOR_NAME", "fixture")
             .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
@@ -213,9 +212,8 @@ fn repository_filter_cannot_write_to_controller_home() {
         );
         fs::remove_file(&marker).expect("reset marker");
         fs::remove_file(checkout.join("data")).expect("force sandboxed checkout");
-        let mut git = sandboxed_git_command_at(&checkout).expect("sandboxed Git");
-        let output = git
-            .command
+        let output = sandboxed_git_command_at(&checkout)
+            .expect("sandboxed Git")
             .args(["checkout", "--", "data"])
             .output_locked()
             .expect("sandboxed checkout");

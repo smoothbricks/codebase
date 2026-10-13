@@ -1007,12 +1007,20 @@ async fn each_job_runs_with_the_build_volume_it_was_admitted_with() {
         assert_eq!(granted(&first_spawn, mode), Some(before.clone()));
         assert_eq!(granted(&second_spawn, mode), Some(adopted.clone()));
     }
+    let binding = |volume: &Path| OsString::from(format!("BUILD_VOLUME={}", volume.display()));
     let (_, first_profile) = first_spawn.request.policy.child(RunSandboxMode::ReadWrite);
-    assert!(first_profile.text().contains(before.to_str().unwrap()));
-    assert!(!first_profile.text().contains(adopted.to_str().unwrap()));
     let (_, second_profile) = second_spawn.request.policy.child(RunSandboxMode::ReadWrite);
-    assert!(second_profile.text().contains(adopted.to_str().unwrap()));
-    assert!(!second_profile.text().contains(before.to_str().unwrap()));
+    assert_eq!(
+        first_profile.text(),
+        second_profile.text(),
+        "a pivot binds the new volume to the same profile"
+    );
+    let first_args = first_profile.launch().unwrap().args();
+    let second_args = second_profile.launch().unwrap().args();
+    assert!(first_args.contains(&binding(&before)));
+    assert!(!first_args.contains(&binding(&adopted)));
+    assert!(second_args.contains(&binding(&adopted)));
+    assert!(!second_args.contains(&binding(&before)));
     // A checkout that links no volume grants none.
     let third = h
         .handle
@@ -5897,10 +5905,22 @@ async fn nx_daemon_restart_follows_a_build_volume_swap_without_an_exec() {
         let (second_config, second_profile) = second.request.policy.child(mode);
         assert_eq!(first_config.build_volume_mount.as_ref(), Some(&before));
         assert_eq!(second_config.build_volume_mount.as_ref(), Some(&adopted));
-        assert!(first_profile.text().contains(before.to_str().unwrap()));
-        assert!(!first_profile.text().contains(adopted.to_str().unwrap()));
-        assert!(second_profile.text().contains(adopted.to_str().unwrap()));
-        assert!(!second_profile.text().contains(before.to_str().unwrap()));
+        assert_eq!(first_profile.text(), second_profile.text());
+        let binding = |volume: &Path| OsString::from(format!("BUILD_VOLUME={}", volume.display()));
+        assert!(
+            first_profile
+                .launch()
+                .unwrap()
+                .args()
+                .contains(&binding(&before))
+        );
+        assert!(
+            second_profile
+                .launch()
+                .unwrap()
+                .args()
+                .contains(&binding(&adopted))
+        );
     }
     complete(&second, b"", b"", ExitStatus::Exited { code: 0 }).await;
     h.handle.wait(second.request.job_id).await.unwrap();

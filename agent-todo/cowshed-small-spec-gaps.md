@@ -3,22 +3,6 @@
 Each item names the spec text that states the design, the code that does not do it yet, and the test that proves it
 done. They are independent of each other.
 
-## One stable Seatbelt profile file per workspace profile
-
-- Spec: `specs/cowshed/04_sandbox.md` "Exec pipeline" step 4: one `<store>/run/profiles/<sha256>.sb` per distinct
-  profile, written once when absent and kept; paths that vary by job or build-volume pivot are `(param "NAME")` bound by
-  `sandbox-exec -D NAME=<path>`.
-- Code: `crates/cowshed-core/src/exec/profile_file.rs` writes `<sha256>.<pid>.<n>.sb` per render, removes it when its
-  last holder (a job's exit watcher, a host activator, a controller Git run) drops it, and sweeps dead pids' files on
-  every write; `sandbox.rs` `seatbelt_profile` inlines every path, so a build-volume pivot or capability re-render is a
-  new profile.
-- Work: render the profile with `(param …)` for the per-job and per-pivot paths (build volume mount, exec temp, cwd
-  capability roots), bind them with `-D` in `exec::sandbox_exec_args`, name the file by the template's SHA-256 alone,
-  write it if absent, and delete the holder lifetime and the sweep.
-- Acceptance: two jobs of one workspace before and after a build-volume pivot launch from the same `.sb` file; the old
-  job still cannot write the new volume (the `-D` binding, not the file, differs); `run/profiles` holds one file per
-  distinct workspace profile after any number of jobs.
-
 ## Go proxy and toolchain pins
 
 - Spec: `specs/cowshed/03_caches.md:115-126` and `:264`, `15_capabilities.md:31`. The Go capability exports

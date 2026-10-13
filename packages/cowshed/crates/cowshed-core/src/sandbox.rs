@@ -847,10 +847,19 @@ pub fn seatbelt_profile(
         push_capability_grant(&mut profile, &config.home, grant)?;
     }
     // Build state is not source. Grant only the controller-selected physical volume, after
-    // the store and mount-tree denies; sibling volumes and images remain inaccessible.
+    // the store and mount-tree denies; sibling volumes and images remain inaccessible. The volume
+    // is the profile's one parameter (`BUILD_VOLUME_PARAM`), so a build-volume pivot binds a new
+    // path to the same profile rather than rendering another.
     if let Some(volume) = &config.build_volume_mount {
-        push_readable_ancestors(&mut profile, volume)?;
-        push_exact_and_subpath_rule(&mut profile, "allow file-read* file-write*", volume)?;
+        if let Some(parent) = volume.parent() {
+            push_readable_ancestors(&mut profile, parent)?;
+        }
+        push_volume_exact_and_subpath_rule(
+            &mut profile,
+            "allow file-read* file-write*",
+            volume,
+            volume,
+        )?;
     }
     push_subpath_rule(&mut profile, "allow file-read*", &config.workspace_mount)?;
     if config.mode == RunSandboxMode::ReadWrite {
@@ -880,9 +889,20 @@ pub fn seatbelt_profile(
                     let mut parent = volume.clone();
                     for component in relative.components() {
                         parent.push(component);
-                        push_literal_rule(&mut profile, "deny file-write-unlink", &parent)?;
+                        push_line(
+                            &mut profile,
+                            &format!(
+                                "(deny file-write-unlink (literal {}))",
+                                volume_expression(volume, &parent)?
+                            ),
+                        );
                     }
-                    push_exact_and_subpath_rule(&mut profile, operations, &resolved)?;
+                    push_volume_exact_and_subpath_rule(
+                        &mut profile,
+                        operations,
+                        volume,
+                        &resolved,
+                    )?;
                 }
             }
         }
@@ -1233,6 +1253,46 @@ fn push_exact_and_subpath_rule(
     Ok(())
 }
 
+/// The Seatbelt parameter a profile names its build volume by; `sandbox-exec -D` binds it at
+/// launch (04_sandbox.md, "Exec pipeline" step 4).
+pub const BUILD_VOLUME_PARAM: &str = "BUILD_VOLUME";
+
+/// `path`, inside the build volume `volume`, as an SBPL string expression over the
+/// [`BUILD_VOLUME_PARAM`] parameter.
+fn volume_expression(volume: &Path, path: &Path) -> Result<String, SandboxError> {
+    sbpl_path(path)?;
+    let parameter = format!("(param \"{BUILD_VOLUME_PARAM}\")");
+    let relative = path
+        .strip_prefix(volume)
+        .map_err(|_| SandboxError::InvalidPath {
+            path: path.to_owned(),
+            reason: "a build volume rule must name a path inside the build volume",
+        })?;
+    if relative.as_os_str().is_empty() {
+        return Ok(parameter);
+    }
+    let relative = relative
+        .as_os_str()
+        .to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
+    Ok(format!("(string-append {parameter} \"/{relative}\")"))
+}
+
+fn push_volume_exact_and_subpath_rule(
+    profile: &mut String,
+    operation: &str,
+    volume: &Path,
+    path: &Path,
+) -> Result<(), SandboxError> {
+    let path = volume_expression(volume, path)?;
+    push_line(
+        profile,
+        &format!("({operation} (literal {path}) (subpath {path}))"),
+    );
+    Ok(())
+}
+
 fn push_line(profile: &mut String, line: &str) {
     profile.push_str(line);
     profile.push('\n');
@@ -1369,10 +1429,17 @@ mod tests {
             .grants
             .deny_write
             .push(PathBuf::from("target/blocked"));
-        let old = seatbelt_profile(&sandbox, SandboxProfileRole::ExecutedChild).unwrap();
-        let touch = |profile: &str, path: &Path| {
+        // A launch as every launcher makes one: the profile's kept file, bound to the volume.
+        let launch = |sandbox: &SandboxConfig| {
+            let text = seatbelt_profile(sandbox, SandboxProfileRole::ExecutedChild).unwrap();
+            let file = crate::exec::ProfileFile::write(&text).unwrap();
+            (text, crate::exec::ProfileLaunch::new(file, sandbox))
+        };
+        let (old_text, old) = launch(&sandbox);
+        let touch = |profile: &crate::exec::ProfileLaunch, path: &Path| {
             std::process::Command::new("/usr/bin/sandbox-exec")
-                .args(["-p", profile, "--", "/usr/bin/touch"])
+                .args(profile.args())
+                .arg("/usr/bin/touch")
                 .arg(path)
                 .output_locked()
                 .unwrap()
@@ -1410,7 +1477,12 @@ mod tests {
                 .success()
         );
         sandbox.build_volume_mount = Some(second.clone());
-        let new = seatbelt_profile(&sandbox, SandboxProfileRole::ExecutedChild).unwrap();
+        let (new_text, new) = launch(&sandbox);
+        assert_eq!(
+            new_text, old_text,
+            "a pivot binds the new volume to the same profile file"
+        );
+        assert_eq!(new.file(), old.file());
         assert!(
             touch(&new, &sandbox.workspace_mount.join("target/after-pivot"))
                 .status
@@ -1427,8 +1499,7 @@ mod tests {
                 .success()
         );
         sandbox.mode = RunSandboxMode::ReadWrite;
-        let writable_source =
-            seatbelt_profile(&sandbox, SandboxProfileRole::ExecutedChild).unwrap();
+        let (_, writable_source) = launch(&sandbox);
         assert!(
             touch(&writable_source, &sandbox.workspace_mount.join("source.rs"))
                 .status
@@ -1507,33 +1578,21 @@ mod tests {
             &sandbox,
         )
         .unwrap();
-        assert_eq!(
-            &plan.args[..3],
-            [
-                std::ffi::OsStr::new("-f"),
-                plan.profile.path().as_os_str(),
-                std::ffi::OsStr::new("--")
-            ]
-        );
+        assert_eq!(&plan.args[0], "-f");
+        assert_eq!(&plan.args[2], "--");
         assert!(
             plan.args
                 .iter()
                 .all(|argument| argument.len() <= MAX_COMMAND_ARG_BYTES),
             "no launch argument may exceed one argument's bound"
         );
-        assert_eq!(fs::read_to_string(plan.profile.path()).unwrap(), profile);
+        assert_eq!(fs::read_to_string(&plan.args[1]).unwrap(), profile);
         let status = SystemSpawnRunner.run(&plan).unwrap();
         assert!(status.success(), "the sandboxed script failed: {status:?}");
         assert!(written.is_file(), "the workspace is writable");
         assert!(
             !sandbox.grants.read[0].join("forbidden").exists(),
             "a read grant stays unwritable"
-        );
-        let file = plan.profile.path().to_owned();
-        drop(plan);
-        assert!(
-            !file.exists(),
-            "the plan was the profile file's last holder"
         );
     }
 
