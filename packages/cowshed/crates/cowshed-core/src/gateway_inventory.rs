@@ -996,12 +996,7 @@ impl NativeGatewayInventory {
                     .is_some_and(|root| root == expected)
             } else {
                 images.into_iter().try_fold(false, |claimed, image| {
-                    verify_no_symlinks(self.storage.store(), &image).map_err(|error| {
-                        GatewayInventoryError::InvalidMetadata {
-                            path: image.clone(),
-                            message: error.to_string(),
-                        }
-                    })?;
+                    verify_image_path(self.storage.store(), &image)?;
                     let metadata =
                         DetachedWorkspaceMetadata::read_for_image(&image).map_err(|error| {
                             GatewayInventoryError::InvalidMetadata {
@@ -1114,12 +1109,7 @@ impl NativeGatewayInventory {
             }
             Err(source) => return Err(io_error("inspecting main image", &image, source)),
         }
-        verify_no_symlinks(self.storage.store(), &image).map_err(|error| {
-            GatewayInventoryError::InvalidMetadata {
-                path: image.clone(),
-                message: error.to_string(),
-            }
-        })?;
+        verify_image_path(self.storage.store(), &image)?;
         let sidecar = sidecar_path(&image);
         let metadata = DetachedWorkspaceMetadata::read_for_image(&image).map_err(|error| {
             GatewayInventoryError::InvalidMetadata {
@@ -1252,12 +1242,7 @@ impl NativeGatewayInventory {
         image: &Path,
         blocks: &mut ReservedPortBlocks,
     ) -> Result<(), GatewayInventoryError> {
-        verify_no_symlinks(store_root, image).map_err(|error| {
-            GatewayInventoryError::InvalidMetadata {
-                path: image.to_owned(),
-                message: error.to_string(),
-            }
-        })?;
+        verify_image_path(store_root, image)?;
         let sidecar = sidecar_path(image);
         verify_no_symlinks(store_root, &sidecar).map_err(|error| {
             GatewayInventoryError::InvalidMetadata {
@@ -1943,6 +1928,70 @@ fn canonical_image_paths(
     })
 }
 
+/// Verify one inventory image path. The native rule stands: every component, the image
+/// included, must be reached through no symlink. The one explicit exception is a directory
+/// store's mount record: while a directory payload is mounted, its image path is a symlink
+/// naming the mountpoint, and inventory may follow it only when the binding proves itself —
+/// the record names an absolute directory that resolves to itself, and the workspace marker
+/// inside that directory names the same repo, workspace and incarnation as the sidecar beside
+/// the image. A symlink that proves none of this is refused exactly as a native one is.
+fn verify_image_path(store_root: &Path, image: &Path) -> Result<(), GatewayInventoryError> {
+    let invalid = |path: &Path, message: String| GatewayInventoryError::InvalidMetadata {
+        path: path.to_owned(),
+        message,
+    };
+    match fs::symlink_metadata(image) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            if let Some(parent) = image.parent() {
+                verify_no_symlinks(store_root, parent)
+                    .map_err(|error| invalid(image, error.to_string()))?;
+            }
+            let target = fs::read_link(image)
+                .map_err(|source| io_error("read image mount record", image, source))?;
+            if !target.is_absolute() {
+                return Err(invalid(
+                    image,
+                    format!("image mount record names the relative path {}", target.display()),
+                ));
+            }
+            let resolved = fs::canonicalize(&target)
+                .map_err(|source| io_error("resolve image mount target", &target, source))?;
+            if resolved != target
+                || !fs::symlink_metadata(&target).is_ok_and(|metadata| metadata.file_type().is_dir())
+            {
+                return Err(invalid(
+                    image,
+                    format!(
+                        "image mount record names {}, which is not the directory it resolves to",
+                        target.display()
+                    ),
+                ));
+            }
+            let sidecar = sidecar_path(image);
+            verify_no_symlinks(store_root, &sidecar)
+                .map_err(|error| invalid(&sidecar, error.to_string()))?;
+            let metadata = DetachedWorkspaceMetadata::read_for_image(image)
+                .map_err(|error| invalid(&sidecar, error.to_string()))?;
+            let marker = crate::metadata::WorkspaceMarker::read_from(
+                &target.join(crate::storage::WORKSPACE_MARKER_PATH),
+            )
+            .map_err(|error| invalid(image, error.to_string()))?;
+            if marker.repo_id != metadata.repo_id
+                || marker.workspace != metadata.workspace
+                || marker.workspace_incarnation != metadata.workspace_incarnation
+            {
+                return Err(invalid(
+                    image,
+                    "mounted payload marker does not match its image sidecar".to_owned(),
+                ));
+            }
+            Ok(())
+        }
+        _ => verify_no_symlinks(store_root, image)
+            .map_err(|error| invalid(image, error.to_string())),
+    }
+}
+
 /// Read one sidecar without following links and prove it describes the exact active lifecycle fact.
 ///
 /// This is the only admission path for projecting store metadata into `WorkspaceInfo`; callers
@@ -1952,12 +2001,7 @@ pub fn read_current_metadata(
     image: &Path,
     workspace: &crate::storage::lifecycle::LifecycleWorkspace,
 ) -> Result<DetachedWorkspaceMetadata, GatewayInventoryError> {
-    verify_no_symlinks(store_root, image).map_err(|error| {
-        GatewayInventoryError::InvalidMetadata {
-            path: image.to_owned(),
-            message: error.to_string(),
-        }
-    })?;
+    verify_image_path(store_root, image)?;
     verify_no_symlinks(store_root, &sidecar_path(image)).map_err(|error| {
         GatewayInventoryError::InvalidMetadata {
             path: sidecar_path(image),
