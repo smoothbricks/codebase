@@ -102,6 +102,10 @@ pub trait ProjectRuntimeHost: Send + 'static {
     /// release them, so an intent it left unfinished becomes crash residue for the next open
     /// rather than an operation this idle process still appears to be running.
     fn release_intent_leases(&mut self) {}
+    /// The project runtime is shutting down: retire every workspace supervisor this process
+    /// serves, each once its jobs ended and its keeper's Nx daemon stopped, so nothing they ran
+    /// outlives the runtime (04_sandbox.md). Supervisors another process serves are its own.
+    async fn shutdown(&mut self) {}
     async fn snapshots(&mut self) -> Result<Vec<WorkspaceSnapshot>>;
     async fn workspace_at(&mut self, path: PathBuf) -> Result<WorkspaceSnapshot>;
 
@@ -920,6 +924,7 @@ impl ProjectActor {
                 }
             }
         }
+        self.host.shutdown().await;
     }
 
     async fn route(&mut self, request: RouterRequest) -> Result<Routed> {
@@ -8174,6 +8179,30 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
 
     fn release_intent_leases(&mut self) {
         self.intent_leases.clear();
+    }
+
+    async fn shutdown(&mut self) {
+        let served: Vec<WorkspaceName> = self.served.keys().cloned().collect();
+        for name in served {
+            let retired = match self.served.get(&name) {
+                Some(served) => served.actor.retire().await,
+                None => continue,
+            };
+            if let Err(error) = retired {
+                eprintln!(
+                    "cowshed: workspace {name}'s supervisor did not retire as its runtime shut \
+                     down: {error}"
+                );
+            }
+            if let Err(error) = self.forget_served(&name).await {
+                eprintln!(
+                    "cowshed: workspace {name}'s supervisor socket did not close as its runtime \
+                     shut down: {error}"
+                );
+            }
+        }
+        self.supervisors.clear();
+        self.sessions.clear();
     }
 
     async fn recover(&mut self) -> Result<()> {

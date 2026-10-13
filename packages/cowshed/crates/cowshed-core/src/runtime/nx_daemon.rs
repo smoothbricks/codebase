@@ -336,7 +336,11 @@ impl NxDaemonKeeper {
             return Verdict::Release;
         }
         self.settled = false;
-        match stop(project_root).await {
+        let why = format!(
+            "the shed ran nothing and held no Nx database for {}s",
+            IDLE.as_secs()
+        );
+        match stop(project_root, &why).await {
             Stop::Stopped => Verdict::Release,
             Stop::InUse => {
                 self.last_use = Instant::now();
@@ -394,8 +398,9 @@ enum Stop {
 
 /// Stop the daemon of the Nx project at `project_root` as `nx daemon --stop` does, unless a
 /// process other than the daemon holds a task database open
-/// ([`crate::build_volume::nx::close_workspace_data`]), and say so on the supervisor's stderr.
-async fn stop(project_root: &Path) -> Stop {
+/// ([`crate::build_volume::nx::close_workspace_data`]), and say on the supervisor's stderr that
+/// it stopped and `why`.
+async fn stop(project_root: &Path, why: &str) -> Stop {
     let pid = live_pid(&nx::daemon_record(project_root));
     let data = nx::workspace_data(project_root);
     let closed =
@@ -405,10 +410,8 @@ async fn stop(project_root: &Path) -> Stop {
         Ok(Ok(Ok(()))) => {
             if let Some(pid) = pid {
                 eprintln!(
-                    "cowshed: stopped the Nx daemon (pid {pid}) of {}: the shed ran nothing and \
-                     held no Nx database for {}s",
+                    "cowshed: stopped the Nx daemon (pid {pid}) of {}: {why}",
                     project_root.display(),
-                    IDLE.as_secs()
                 );
             }
             Stop::Stopped
@@ -417,6 +420,24 @@ async fn stop(project_root: &Path) -> Stop {
         Ok(Ok(Err(busy))) => Stop::Failed(busy.to_string()),
         Ok(Err(error)) => Stop::Failed(error.to_string()),
         Err(error) => Stop::Failed(format!("the stop did not finish: {error}")),
+    }
+}
+
+/// End the daemon a retiring supervisor's keeper kept for the Nx project at `project_root`, so
+/// none outlives the supervisor that watched it (04_sandbox.md). Its jobs have ended by now; a
+/// host client still holding a task database keeps the daemon, and that is said.
+pub(crate) async fn release(project_root: &Path) {
+    match stop(project_root, "its supervisor retired").await {
+        Stop::Stopped => {}
+        Stop::InUse => eprintln!(
+            "cowshed: the Nx daemon of {} outlives its retired supervisor: a host client holds \
+             one of its task databases open",
+            project_root.display()
+        ),
+        Stop::Failed(why) => eprintln!(
+            "cowshed: the Nx daemon of {} did not stop as its supervisor retired: {why}",
+            project_root.display()
+        ),
     }
 }
 

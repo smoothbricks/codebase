@@ -192,7 +192,9 @@ into `OsString` for `plan_exec`; no `String`, lossy rendering, or alternate supe
 - It retires itself after 30 minutes with no named session open and no job running, freeing its warm hosts; the next
   command starts another. A shed's supervisor also waits for its Nx daemon to be gone, which its keeper stops five
   minutes after the shed was last in use (04_sandbox.md). `cowshed detach`/`cowshed rm` retire it before the substrate
-  changes (teardown below).
+  changes (teardown below). Every retirement, and a project runtime's shutdown, which retires each supervisor that
+  process serves, ends the supervisor's jobs except its keeper's start job, lets that one finish, and then stops the
+  keeper's daemon, so no daemon or plugin worker outlives the supervisor or the runtime.
 
 ## Protocol
 
