@@ -928,7 +928,14 @@ export type JobProcessEvent =
 export type JobProcessLeaf = {
   readonly pid: number & tags.Type<'uint32'>;
   readonly program: string;
+  /**
+   * The argv of that image, bounded as a process sample's is.
+   */
   readonly argv: ReadonlyArray<CommandArg>;
+  /**
+   * Whether that argv was cut to its bounds, as a process sample's says.
+   */
+  readonly truncated: boolean;
 };
 
 /**
@@ -946,9 +953,15 @@ export type JobProcessSample = {
    */
   readonly program: string;
   /**
-   * The byte-exact argv of that exec.
+   * The argv of that exec, byte-exact within a record's bounds: at most 128 KiB per argument
+   * and 1 MiB in all.
    */
   readonly argv: ReadonlyArray<CommandArg>;
+  /**
+   * Whether the exec's argv exceeded those bounds and `argv` holds only its first bytes. A
+   * record from before the bound was kept has no such field and was never cut.
+   */
+  readonly truncated: boolean;
   readonly bornAt: UtcTimestamp;
   /**
    * Absent until its counters are first read; never zeroes in their place.

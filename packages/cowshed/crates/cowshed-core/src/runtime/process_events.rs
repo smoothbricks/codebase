@@ -36,14 +36,11 @@
 //!   read never drops the exit coalesced beside it; the batch's failures are returned together.
 
 use std::collections::HashSet;
-use std::ffi::OsString;
 use std::fmt;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::os::unix::ffi::OsStringExt;
 use std::os::unix::process::ExitStatusExt;
 
-use crate::api::dto::CommandArg;
 use crate::api::process::ProcessCoverageGap;
 use crate::error::CowshedError;
 use crate::runtime::job_groups::{ProcessRecord, process_record};
@@ -164,14 +161,10 @@ impl ProcessReads for Darwin {
 
     fn image(&self, pid: u32) -> io::Result<ProcessImage> {
         let arguments = process_arguments(libc::pid_t::try_from(pid).map_err(io::Error::other)?)?;
-        Ok(ProcessImage {
-            program: String::from_utf8_lossy(&arguments.executable).into_owned(),
-            argv: arguments
-                .argv
-                .into_iter()
-                .map(|argument| CommandArg::new(OsString::from_vec(argument)))
-                .collect(),
-        })
+        Ok(ProcessImage::observed(
+            String::from_utf8_lossy(&arguments.executable).into_owned(),
+            arguments.argv,
+        ))
     }
 
     fn children(&self, pid: u32) -> io::Result<Vec<u32>> {
@@ -674,7 +667,7 @@ mod tests {
     use std::process::{Child, Command, Stdio};
 
     use super::*;
-    use crate::api::dto::ExitStatus;
+    use crate::api::dto::{CommandArg, ExitStatus};
     use crate::api::process::{ProcessCoverage, ProcessExit};
     use cowshed_os::fork_lock::Spawn;
 
@@ -1028,6 +1021,7 @@ mod tests {
         ProcessImage {
             program: program.to_owned(),
             argv: argv(&[program]),
+            truncated: false,
         }
     }
 

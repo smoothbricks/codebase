@@ -1232,6 +1232,7 @@ mod tests {
                     pid: 99,
                     program: "/usr/bin/cc".into(),
                     argv: vec!["/usr/bin/cc".into()],
+                    truncated: false,
                 },
                 observed_cpu_permille: 950,
             },
@@ -1286,7 +1287,12 @@ mod tests {
                 "members": [99, 100],
                 "leaf": {
                     "kind": "attributed",
-                    "leaf": {"pid": 99, "program": "/usr/bin/cc", "argv": [{"encoding": "utf8", "data": "/usr/bin/cc"}]},
+                    "leaf": {
+                        "pid": 99,
+                        "program": "/usr/bin/cc",
+                        "argv": [{"encoding": "utf8", "data": "/usr/bin/cc"}],
+                        "truncated": false,
+                    },
                     "observedCpuPermille": 950,
                 },
                 "cpuUserMs": 1_250,
@@ -1488,6 +1494,7 @@ mod tests {
                 pid: 99,
                 program: "cc".into(),
                 argv: vec!["cc".into()],
+                truncated: false,
             },
             observed_cpu_permille: 1_001,
         };

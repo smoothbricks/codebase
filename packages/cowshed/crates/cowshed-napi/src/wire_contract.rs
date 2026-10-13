@@ -270,6 +270,7 @@ fn job_infos() -> BTreeMap<&'static str, Value> {
                     pid: 4242,
                     program: "cargo".into(),
                     argv: vec![CommandArg::from("cargo")],
+                    truncated: false,
                 },
                 observed_cpu_permille: 950,
             },

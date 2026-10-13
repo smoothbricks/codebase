@@ -349,6 +349,7 @@ mod tests {
             argv: vec![CommandArg::new(OsString::from_vec(
                 program.as_bytes().to_vec(),
             ))],
+            truncated: false,
         }
     }
 
