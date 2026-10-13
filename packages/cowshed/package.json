@@ -497,12 +497,25 @@
       },
       "test": {
         "executor": "nx:noop",
+        "//": "Replaces the inferred test, which reaches cargo-test and then the root's serial real-image groups. cargo-test is the ordinary crate suite alone, reached here through napi-test, so the two groups are named: the gate still runs every real_apfs_ test. The host group depends on the device group (nx.json targetDefaults), so the two never run together.",
         "dependsOn": [
           "napi-test",
           "launcher-test",
           "wire-test",
           "declaration-model-test",
-          "verify-packaging"
+          "verify-packaging",
+          {
+            "target": "cargo-test-group-real-apfs",
+            "projects": [
+              "@smoothbricks/codebase"
+            ]
+          },
+          {
+            "target": "cargo-test-group-real-apfs-host",
+            "projects": [
+              "@smoothbricks/codebase"
+            ]
+          }
         ]
       },
       "host-controller-test": {

@@ -2152,8 +2152,9 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
           `-E 'package(big) and (${exceptional}) and not ((test(/real_apfs_/)))' --partition hash:${index}/3 --no-fail-fast --no-tests=pass`,
         );
       }
-      // The root's aggregate reaches the group beside every crate piece.
-      expect(macos['cargo-test']?.dependsOn).toContain('cargo-test-group-real-apfs');
+      // `cargo-test` is the ordinary suite alone; the gate (`test`) reaches the group beside it.
+      expect(macos['cargo-test']?.dependsOn).not.toContain('cargo-test-group-real-apfs');
+      expect(macos.test?.dependsOn).toEqual(['cargo-test', 'cargo-test-group-real-apfs']);
 
       // Off macOS nextest applies the group nowhere, so it is not inferred and no piece excludes its tests.
       const linux = await inferProjectTargets(
@@ -2166,6 +2167,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         `-E 'package(small)' --no-fail-fast --no-tests=pass`,
       );
       expect(linux['cargo-test']?.dependsOn).not.toContain('cargo-test-group-real-apfs');
+      expect(linux.test?.dependsOn).toEqual(['cargo-test']);
     } finally {
       await workspace.cleanup();
     }

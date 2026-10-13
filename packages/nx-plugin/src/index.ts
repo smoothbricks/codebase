@@ -1413,18 +1413,16 @@ async function createProjectTargets(
         group,
       );
     }
-    const aggregateDependencies = [
-      ...cargoWorkspace.packages.flatMap((plan) =>
-        plan.pieces.map((piece) =>
-          cargoTargetDependency(projectName, {
-            projectName: plan.package.projectName,
-            targetName: piece.targetName,
-          }),
-        ),
+    // Every project's crate pieces. The serial groups' runners are the gate's (`test`, below), so
+    // `cargo-test` is the ordinary suite alone and a run of it never reaches a group's real-image tests.
+    const aggregateDependencies = cargoWorkspace.packages.flatMap((plan) =>
+      plan.pieces.map((piece) =>
+        cargoTargetDependency(projectName, {
+          projectName: plan.package.projectName,
+          targetName: piece.targetName,
+        }),
       ),
-      // Reachable from the root's `test` aggregate: the root runs every member's tests.
-      ...cargoWorkspace.serialGroups.map((group) => cargoTestGroupTargetName(group.group)),
-    ];
+    );
     targets[CARGO_TEST_TARGET] =
       aggregateDependencies.length > 0
         ? { executor: 'nx:noop', cache: true, outputs: [], dependsOn: aggregateDependencies }
@@ -1523,22 +1521,21 @@ async function createProjectTargets(
       workspaceRoot,
       cargoWorkspace,
     );
+    // A serial group's runner belongs to the workspace root, whichever project is asked to test. The
+    // ordinary `cargo-test` leaves the groups out; this project's `test`, the gate, reaches each one.
+    const serialGroupDependencies = cargoWorkspace.serialGroups.map((group) =>
+      cargoTargetDependency(projectName, {
+        projectName: cargoWorkspace.rootProjectName,
+        targetName: cargoTestGroupTargetName(group.group),
+      }),
+    );
     if (!isCargoWorkspaceRoot) {
       targets[CARGO_TEST_TARGET] = {
         executor: 'nx:noop',
         cache: true,
         outputs: [],
-        // A member's `test` runs its own crates and reaches every serial group runner too, so its tests
-        // are never dropped from a member-level run.
-        dependsOn: [
-          ...packageTargetNames,
-          ...cargoWorkspace.serialGroups.map((group) =>
-            cargoTargetDependency(projectName, {
-              projectName: cargoWorkspace.rootProjectName,
-              targetName: cargoTestGroupTargetName(group.group),
-            }),
-          ),
-        ],
+        // The crates this project owns, as ordinary pieces; the serial groups are reached from `test`.
+        dependsOn: packageTargetNames,
       };
     }
     if (!isCargoWorkspaceRoot && cargoPackagePlans.length > 0) {
@@ -1561,7 +1558,8 @@ async function createProjectTargets(
       targets.test = {
         executor: 'nx:noop',
         cache: true,
-        dependsOn: [CARGO_TEST_TARGET],
+        // The gate: the ordinary suite, then every serial group, which `cargo-test` leaves out.
+        dependsOn: [CARGO_TEST_TARGET, ...serialGroupDependencies],
       };
     }
     for (const name of [CARGO_TEST_TARGET, 'test']) {
