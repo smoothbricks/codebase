@@ -12,19 +12,19 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use cowshed_apfs::disk_lease::leased_at;
+use cowshed_apfs::image::{IMAGE_EXTENSION, ImageCapacity};
 use cowshed_apfs::{
     ApfsBackend, AttachedImage, CreateImageRequest, DetachIntent, MacOsApfsBackend,
     SystemCommandRunner,
 };
-use cowshed_apfs::disk_lease::leased_at;
-use cowshed_os::fork_lock::Run as _;
-use cowshed_apfs::image::{IMAGE_EXTENSION, ImageCapacity};
 use cowshed_gateway::{
     AuditError, AuditEvent, AuditSink, AuthorizedTarget, ConnectError, CredentialError,
     CredentialProvider, CredentialQuery, CredentialRecord, DiskLeaseLimits, Gateway, GatewayConfig,
     MirrorCacheConfig, UpstreamConnection, UpstreamConnector, UpstreamHealth,
 };
 use cowshed_gateway_types::DiskClass;
+use cowshed_os::fork_lock::Run as _;
 use uuid::Uuid;
 
 struct NoCredentials;
