@@ -3175,6 +3175,15 @@ pub enum RebaseCarrySkip {
         state: PathBuf,
         reason: String,
     },
+    /// The target's task database indexes no cache entry at any Nx root the carry consulted:
+    /// stock Nx creates and fills `cache_outputs` only when a task runs through that cache, so
+    /// no Nx run cached a task into the target's volume. That is not "nothing missing": the
+    /// target's Nx ran its tasks through some other cache, such as a host shell's per-user
+    /// `~/.nx/<id>`, or ran none.
+    Unindexed {
+        /// Each such root's Nx state directory (`<root>/.nx`), relative to the workspace.
+        states: Vec<PathBuf>,
+    },
 }
 
 impl fmt::Display for RebaseCarrySkip {
@@ -3225,6 +3234,14 @@ impl fmt::Display for RebaseCarrySkip {
                 "stock Nx could not hash the rebased tree's tasks for {}: {reason}",
                 state.display()
             ),
+            Self::Unindexed { states } => {
+                formatter.write_str("the target's Nx task database indexes no cache entry for ")?;
+                for (index, state) in states.iter().enumerate() {
+                    let separator = if index == 0 { "" } else { ", " };
+                    write!(formatter, "{separator}{}", state.display())?;
+                }
+                formatter.write_str(": no Nx run cached a task into the target's build volume")
+            }
         }
     }
 }
