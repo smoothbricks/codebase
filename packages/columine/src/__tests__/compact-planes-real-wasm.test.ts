@@ -311,7 +311,7 @@ describe('Compact real-wasm flat planes', () => {
   });
 
   it('date64 rides i64', () => {
-    const schema = schemaMessage('v', 0n, dateMillisecond(), 6);
+    const schema = schemaMessage('v', 0, dateMillisecond(), 6);
     const values = encodeOne('v', schema, { kind: 'i64', data: new BigInt64Array([0n, 86_400_000n]) });
     expectNumeric(values[0], 0n);
     expectNumeric(values[1], 86_400_000n);
