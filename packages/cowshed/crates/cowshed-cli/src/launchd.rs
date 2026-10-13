@@ -21,6 +21,11 @@ pub const PRIVATE_PLIST_MODE: u32 = 0o600;
 /// Runnable, and writable only by the user launchd runs the agent as.
 pub const STABLE_BINARY_MODE: u32 = 0o755;
 pub const COWSHED_BINARY_NAME: &str = "cowshed";
+
+/// The name the jobserver launcher answers to beside the stable `cowshed` name:
+/// the same stored copy, reached as `cargo` (03_caches.md, "The `cargo`
+/// jobserver launcher").
+pub const JOBSERVER_LAUNCHER_NAME: &str = "cargo";
 pub const SCCACHE_BINARY_NAME: &str = "sccache";
 
 pub const LIBRARY_DIRECTORY: &str = "Library";
@@ -816,6 +821,38 @@ pub fn plan_executable_install(
 /// `~/Library/Application Support/dev.cowshed` is shared by every service and an empty directory
 /// costs nothing. No file to remove plans nothing, which is what makes a second uninstall a
 /// no-op rather than a failure.
+/// Plan the `cargo` link beside a cowshed stable name: the stored copy of the
+/// same build under the launcher's name, so the managed environment's first
+/// `cargo` on `PATH` is this build's jobserver launcher and moves with it in
+/// one rename. A link that already names that copy plans nothing.
+pub fn plan_launcher_link(
+    executable: &HostStableExecutable,
+    digest: &ExecutableDigest,
+    current: &StableLink,
+) -> InstallPlan {
+    let target = executable.stored_link(digest);
+    if *current == StableLink::To(target.clone()) {
+        return InstallPlan {
+            operations: Vec::new(),
+        };
+    }
+    InstallPlan {
+        operations: vec![
+            Mutation::CreateTemporarySymlink {
+                directory: executable.directory().to_path_buf(),
+                name_prefix: format!(".{JOBSERVER_LAUNCHER_NAME}.link."),
+                target,
+            },
+            Mutation::RenameTemporaryFile {
+                destination: executable.directory().join(JOBSERVER_LAUNCHER_NAME),
+            },
+            Mutation::SyncDirectory {
+                path: executable.directory().to_path_buf(),
+            },
+        ],
+    }
+}
+
 pub fn plan_executable_remove(
     executable: &HostStableExecutable,
     present: &[PathBuf],
