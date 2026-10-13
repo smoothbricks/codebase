@@ -439,8 +439,9 @@ Concrete targets come from concrete files:
   replace Cargo's `target` link. Its inputs, like every cargo-derived fileset, are anchored at `{workspaceRoot}`: Nx
   resolves a `{projectRoot}` glob against only the files its project owns, and a nested package owns the crates under
   it, so a root workspace's archive spelled that way hashes none of its members and replays stale binaries against
-  edited crates. Each member crate gets a cached `cargo-test-<package>` run (30s per-test timeout like
-  `bun test --timeout=30000`) whose inputs include that crate and its path dependencies, and whose command runs
+  edited crates. Each member crate gets a cached `cargo-test-<package>` run (30s slow-test warning like
+  `bun test --timeout=30000`, no per-test kill) whose inputs include that crate and its path dependencies, and whose
+  command runs
   `cargo --frozen nextest run --binaries-metadata … --cargo-metadata … --target-dir-remap … --workspace-remap . -E 'package(<crate>)'`
   from the archive's one extraction. Runners therefore execute rather than build: they compile nothing in cargo's build
   tree, and fan out instead of chaining. They do not unpack the archive each: before the run, `smoo-nx-nextest-extract`
@@ -470,29 +471,28 @@ Concrete targets come from concrete files:
   real location — keeps it identical for a plugin linked from a checkout outside the workspace, whatever depth each
   workspace sits at; `--user-config-file none` still holds, because a developer's `~/.config/nextest` must not decide a
   cached verdict.
-- A crate whose suite outgrows one bounded window declares `[package.metadata.smoothbricks.test] shards = N`, and gets
-  `cargo-test-<package>-shard1..N`, each running `--partition hash:i/N` with the full bound. nextest assigns a test to a
-  shard by hashing its name, so the shards stay an exact partition of the crate as tests and test binaries are added,
-  and a stale `N` can only make a target slow — never drop a test. Omitting the key means one target, as before.
+- A crate whose suite is better spread over several runners declares `[package.metadata.smoothbricks.test] shards = N`,
+  and gets `cargo-test-<package>-shard1..N`, each running `--partition hash:i/N` under the same progress bound. nextest
+  assigns a test to a shard by hashing its name, so the shards stay an exact partition of the crate as tests and test
+  binaries are added, and a stale `N` can only make a target slow — never drop a test. Omitting the key means one
+  target, as before.
 - Tests that a `nextest.toml` override singles out run separately in `cargo-test-<package>-exceptions-shard1..N`, using
   the same declared partition count. Ordinary shards run the complement of that class and of every declared serial group
-  (below), so the union still covers every test exactly once. The plugin's own override raises `slow-timeout` for
-  compile-fail tests; lifting them out keeps their raised bound from delaying an ordinary shard, and partitioning the
-  class keeps every target inside its deadline without relaxing it. The remaining non-group exceptional tests stay
-  normally schedulable under the existing bounds. Every piece runs `--no-fail-fast`, so a failing test does not stop the
-  rest of its piece. The exceptional filter is the union of the overrides in the plugin's own `nextest.toml`, so adding
-  one there is the whole change to that class. Serial groups are classified separately, by `test-group` overrides in the
-  workspace's `.config/nextest.toml`; the plugin's file declares none. Only sharded crates need these targets; an
-  unsharded crate already runs all its non-group tests in one process. Empty partitions pass, including platforms where
-  the tests are `cfg`-ed out. `nextest-partitions.test.ts` executes the inferred archive and shard commands over 29
-  tests and asserts that the ordinary shards ran exactly the 13 ordinary tests once and the exceptional shards exactly
-  the 12 exceptional ones. The suite builds one shared fixture and archive, then runs separate bounded cases through the
-  real default serial-group executor: a successful count and run with the group's probes exactly once each, three
-  refusals that run nothing and clear the task's previous verdict, and a failing run whose ordinary failures still run
-  the group's remaining probes. The shared fixture first produces one real passing verdict, before any case runs. Each
-  refusal copies that seed and removes its own marker log, so neither a timed-out success case nor a prior refusal that
-  wrongly ran can become another case's precondition. The success case still runs and verifies the real executor
-  independently. Each case settles its owned processes before the next case starts; the fixture is removed only after
+  (below), so the union still covers every test exactly once. The plugin's own override raises the `slow-timeout`
+  warning period for compile-fail tests; lifting them out keeps their long bodies from delaying an ordinary shard. The
+  remaining non-group exceptional tests stay normally schedulable. Every piece runs `--no-fail-fast`, so a failing test
+  does not stop the rest of its piece. The exceptional filter is the union of the overrides in the plugin's own
+  `nextest.toml`, so adding one there is the whole change to that class. Serial groups are classified separately, by
+  `test-group` overrides in the workspace's `.config/nextest.toml`; the plugin's file declares none. Only sharded crates
+  need these targets; an unsharded crate already runs all its non-group tests in one process. Empty partitions pass,
+  including platforms where the tests are `cfg`-ed out. `nextest-partitions.test.ts` executes the inferred archive and
+  shard commands over 29 tests and asserts that the ordinary shards ran exactly the 13 ordinary tests once and the
+  exceptional shards exactly the 12 exceptional ones. The suite builds one shared fixture and archive, then runs
+  separate cases through the real default executor on the serial group's inferred options: a successful run with the
+  group's probes exactly once each, an emptied filter that fails rather than passing a run of no test and replaces the
+  task's previous verdict, and a failing run whose ordinary failures still run the group's remaining probes. The shared
+  fixture first produces one real passing verdict, before any case runs; the empty case copies that seed and removes its
+  own marker log. Each case settles its owned processes before the next case starts; the fixture is removed only after
   the final settlement.
 - A repository's serial test groups each run in one runner, `cargo-test-group-<group>`, owned by the cargo workspace
   root beside `cargo-test-archive`. A group is declared once, in `<cargo-workspace>/.config/nextest.toml`: a
@@ -500,19 +500,15 @@ Concrete targets come from concrete files:
   `platform = 'cfg(target_os="macos")'`. The runner's filter is the union of those overrides, so the runner and the
   per-crate exclusions cannot drift; every crate piece excludes it with `not (…)`, so each test is selected by exactly
   one target. The runner is not inferred off macOS, where nextest applies the group nowhere and no piece excludes its
-  tests. Its executor, `@smoothbricks/nx-plugin:nextest-group`, lists the selection
-  (`nextest list --message-format=json`, same archive and reuse flags) under the existing bounded runner, counts the
-  matching non-ignored tests, and runs the group under a bound of that count × 30 s. Both stages ask the bounded
-  executor for one CPU token, matching the group's one runnable test process instead of reserving idle host capacity.
-  The bound is aggregate, not a per-test limit; the real-APFS lifecycle tests keep their 60 s code bound in the
-  repository's run-wrapper. The run carries `--no-fail-fast`: an ordinary test failure does not stop the group's
-  remaining tests, and a failed verdict lists the failed ones. A listing that fails, does not parse, or selects no test
-  refuses before anything runs, clears this task's previous verdict and report, and fails the group rather than running
-  it unbounded. Ignored tests keep their explicit lane. The root's `cargo-test` and every member's `cargo-test` depend
-  on the group. A crate named `group-*` is refused, since its runner name would collide. A repository's serial group may
-  bound each test's code time with a nextest run-wrapper from the plugin's source (`src/nextest-code-bound.ts`); the
-  group's target hashes that file as an input, so changing it reruns the group (`specs/cowshed/08_testing.md`,
-  "Integration tests (real substrate)").
+  tests. It is a `bounded-exec` run of the group's selection under the same progress bound as every test target, and
+  asks for one CPU token, matching the group's one runnable test process instead of reserving idle host capacity. The
+  run carries `--no-fail-fast`: an ordinary test failure does not stop the group's remaining tests, and a failed verdict
+  lists the failed ones. It carries `--no-tests=fail`, so a filter that selects no test fails the group. Ignored tests
+  keep their explicit lane. The root's `cargo-test` and every member's `cargo-test` depend on the group. A crate named
+  `group-*` is refused, since its runner name would collide. A repository's serial group may measure each test's code
+  time against a class with a nextest run-wrapper from the plugin's source (`src/nextest-code-bound.ts`), which warns of
+  a test over its class and never fails or kills it; the group's target hashes that file as an input, so changing it
+  reruns the group (`specs/cowshed/08_testing.md`, "Integration tests (real substrate)").
 - Canonical `napi` package metadata provides a host `cargo-napi` target and named release targets for each configured
   triple. Linux `--use-napi-cross` targets compile C/C++ dependencies with Clang; the NAPI CLI supplies its downloaded
   GNU sysroot and toolchain flags. This avoids the bundled GCC's unsupported diagnostics-color flag without disabling
@@ -836,8 +832,21 @@ What it wires:
 
 ## Bounded Test Targets
 
-`@smoothbricks/nx-plugin:bounded-exec` runs a shell command with a timeout and force-kill grace period. Test targets use
-this executor so hung test processes fail predictably instead of blocking Nx indefinitely.
+`@smoothbricks/nx-plugin:bounded-exec` runs a shell command under a no-progress bound or a wall-clock ceiling, with a
+force-kill grace period. Test targets use this executor so hung test processes fail predictably instead of blocking Nx
+indefinitely.
+
+A test target is bounded by progress alone: `idleTimeoutMs`, 180 s (`BOUNDED_TEST_IDLE_TIMEOUT_MS`, the hang backstop of
+`specs/cowshed/08_testing.md`), with no `timeoutMs`. The bound re-arms whenever the runner reports a finished test: a
+nextest status line carrying its run counter (`PASS [   0.438s] (1/4) …`), a libtest `test … ... ok` line, or a bun
+result line or dot. Output that finishes no test is not progress: nextest's `SLOW` warning, repeated every slow-timeout
+period for a test still running, and a hung test's heartbeat both keep printing. A suite that keeps finishing tests
+therefore runs as long as it needs, however slow the host, and a test that never returns ends the run 180 s after the
+last test that finished. bun prints nothing per passing test when it believes an agent runs it, so the executor asks a
+lone `bun test` for `--dots`, one dot per finished test. A command that reports no tests makes progress only by exiting.
+nextest's slow-timeout and the serial groups' code-time classes only warn; no per-test bound kills a test or fails one
+that passed. `timeoutMs`, an absolute ceiling, is for commands that report no tests; a target names at least one of the
+two.
 
 On a macOS host, every `bounded-exec` task runs with its own `TMPDIR` lease: a directory on one RAM-backed APFS volume
 per user, so test temp files never reach the SSD. The volume is created lazily by the first task that needs it and
@@ -886,7 +895,7 @@ instead of changing an attached volume. Held leases undergo no permission change
 The real RAM-volume regression walks one volume's lifecycle in a single test: unmarked debris and a live-lease refusal,
 recovery over the debris, concurrent leases, failed-acquire lease/claim rollback, read-only cleanup, a held dead lease,
 owner detach and reclaim, and the final detach. External symlink targets and held directory modes stay unchanged,
-without duplicate provision and teardown; its 60 s case and 120 s shard bounds are unchanged.
+without duplicate provision and teardown; its 60 s case bound is unchanged and its target has the progress bound.
 
 Whatever still works in a lease when its task ends is a leak, and is stopped before the lease goes. The usual one is a
 fixture's Nx daemon: Nx detaches it into a session of its own, so the process-group kill that ends a timed-out command
@@ -950,13 +959,16 @@ Every `bounded-exec` task records why it ended in `.nx/workspace-data/bounded-ex
 task id and the hash it ran at:
 
 - `bound`: nothing failed but a wall-clock bound. Either the command outlived `timeoutMs`, or every failing test in the
-  runner's JUnit report failed on its runner's per-test timeout (`cargo-nextest` writes `type="test timeout"`,
-  `bun test` writes `type="TimeoutError"`). A loaded host produces exactly these. When `timeoutMs` fires, the tests
-  `cargo-nextest` was still running are reported as failures of `type="test abort"`,
-  `process aborted with signal 15 (SIGTERM)` (SIGKILL once the force-kill follows); they are the bound's casualties and
-  do not make the run `failed`. A test that dies of any other signal, or that is aborted with no `timeoutMs` to explain
-  it, does.
-- `wedged`: `idleTimeoutMs` fired. Silence means a hang, never load.
+  runner's JUnit report failed on its runner's per-test timeout (`cargo-nextest` writes `type="test timeout"` where a
+  configuration still sets `terminate-after`, `bun test` writes `type="TimeoutError"`). A loaded host produces exactly
+  these. When `timeoutMs` fires, the tests `cargo-nextest` was still running are reported as failures of
+  `type="test abort"`, `process aborted with signal 15 (SIGTERM)` (SIGKILL once the force-kill follows); they are the
+  bound's casualties and do not make the run `failed`. A test that dies of any other signal, or that is aborted with no
+  bound to explain it, does.
+- `wedged`: `idleTimeoutMs` fired: no test finished for that long. A host that is only slow still finishes tests, so
+  this is a hang, never load. Its `tests` name the tests still running: those the runner said were running (nextest's
+  `SLOW`, libtest's `has been running for over`) and never said finished, and those the JUnit report says it aborted
+  when the bound stopped it.
 - `failed`: a test failed on its own, or the command exited non-zero with no report naming a timeout.
 - `passed`.
 
@@ -989,19 +1001,19 @@ The generator rewrites `package.json` so `nx.targets.test` uses:
 - executor `@smoothbricks/nx-plugin:bounded-exec`
 - command preserved from an existing `nx:run-commands` test target or direct `scripts.test`
 - `cwd: "{projectRoot}"`
-- `timeoutMs: 120000`
+- `idleTimeoutMs: 180000`
 - `killAfterMs: 10000`
 - package script alias `nx run <project>:test --outputStyle=stream`
 
 Workspace updates preserve no-op test targets rather than adding a second test runner. A no-op `test` aggregate passes
 the check when it reaches at least one local test execution leg and every such leg is bounded, including through nested
-no-op aggregates: `bounded-exec` with a command, a `cwd`, and positive `timeoutMs` and `killAfterMs`. Upstream and
-non-test prerequisites such as `^build`, `build`, `typecheck-tests`, and Cargo compilation/archive targets are ignored
-by this test-leg check. Each bounded Bun leg must declare a positive per-test `--timeout` no greater than its own
-`timeoutMs`; the migration's 30-second default is not a limit on explicitly bounded lanes. Only a leg that runs
-`bun test` must start in the project root or its `src/`, where Bun's test-file discovery is cheap; any other command (a
-cargo workspace's per-crate nextest legs run from the workspace root, a gate may run a script that lives in another
-project) may use any `cwd`.
+no-op aggregates: `bounded-exec` with a command, a `cwd`, a positive `idleTimeoutMs` and `killAfterMs`, and no
+`timeoutMs`. Upstream and non-test prerequisites such as `^build`, `build`, `typecheck-tests`, and Cargo
+compilation/archive targets are ignored by this test-leg check. Each bounded Bun leg must declare a positive per-test
+`--timeout` no greater than its own `idleTimeoutMs`; the migration's 30-second default is not a limit on explicitly
+bounded lanes. Only a leg that runs `bun test` must start in the project root or its `src/`, where Bun's test-file
+discovery is cheap; any other command (a cargo workspace's per-crate nextest legs run from the workspace root, a gate
+may run a script that lives in another project) may use any `cwd`.
 
 ## Test Fixtures That Run Nx
 
