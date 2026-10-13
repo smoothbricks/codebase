@@ -78,10 +78,19 @@
           "cwd": "{workspaceRoot}"
         }
       },
+      "lint-disk-commands": {
+        "executor": "nx:run-commands",
+        "cache": false,
+        "options": {
+          "command": "bun packages/nx-plugin/src/disk-command-policy.ts .",
+          "cwd": "{workspaceRoot}"
+        }
+      },
       "lint": {
         "dependsOn": [
           "...",
-          "lint-dot-inputs"
+          "lint-dot-inputs",
+          "lint-disk-commands"
         ]
       }
     }

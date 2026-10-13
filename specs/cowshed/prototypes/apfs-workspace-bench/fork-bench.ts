@@ -7,22 +7,23 @@ import { $ } from 'bun';
 // -nomount, fsck_apfs -q AND -n on the volume device, and confirm it mounts + reads.
 // Answers: is crash-consistent live cloning reliably fsck-clean; does sync-before-clone matter;
 // what should `cowshed new` require.
+// hdiutil and diskutil run only through `cowshed disk-command` (cowshed must be on PATH).
 
 const ROOT = '/private/tmp/cowshed-fork-bench';
 const mounted = new Set<string>();
 
 async function attachSparse(image: string, mnt: string) {
-  await $`hdiutil attach -quiet -nobrowse -owners on -mountpoint ${mnt} ${image}`.quiet();
+  await $`cowshed disk-command hdiutil -- attach -quiet -nobrowse -owners on -mountpoint ${mnt} ${image}`.quiet();
   mounted.add(mnt);
 }
 async function detachMnt(mnt: string) {
-  await $`hdiutil detach -quiet ${mnt}`.nothrow().quiet();
+  await $`cowshed disk-command hdiutil -- detach -quiet ${mnt}`.nothrow().quiet();
   mounted.delete(mnt);
 }
 
 // attach a clone WITHOUT mounting, return the APFS volume /dev node
 async function attachNoMount(image: string): Promise<{ container: string; vol: string }> {
-  const out = await $`hdiutil attach -nomount ${image}`.text();
+  const out = await $`cowshed disk-command hdiutil -- attach -nomount ${image}`.text();
   const devs = [...out.matchAll(/\/dev\/(disk\d+)(s\d+)?/g)].map((m) => m[0]);
   // find the APFS Volume device (last sN with Apple_APFS_Volume) — heuristic: last /dev/diskNsM
   const container = out.match(/\/dev\/disk\d+/)?.[0] ?? devs[0];
@@ -45,7 +46,7 @@ async function run() {
   await rm(ROOT, { recursive: true, force: true });
   await mkdir(ROOT, { recursive: true });
   const base = join(ROOT, 'base.sparseimage');
-  await $`hdiutil create -quiet -size 2g -type SPARSE -fs ${'APFS'} -volname ForkBench -nospotlight ${base}`.quiet();
+  await $`cowshed disk-command hdiutil -- create -quiet -size 2g -type SPARSE -fs ${'APFS'} -volname ForkBench -nospotlight ${base}`.quiet();
   const mnt = join(ROOT, 'mnt');
   await mkdir(mnt, { recursive: true });
   await attachSparse(base, mnt);
@@ -99,13 +100,13 @@ async function run() {
       fsckQ = q.exitCode === 0 ? 'pass' : `fail(${q.exitCode})`;
       const n = await $`fsck_apfs -n ${rvol}`.nothrow().quiet();
       fsckN = n.exitCode === 0 ? 'pass' : `fail(${n.exitCode})`;
-      await $`hdiutil detach -quiet ${container}`.nothrow().quiet();
+      await $`cowshed disk-command hdiutil -- detach -quiet ${container}`.nothrow().quiet();
 
       // now actually mount it and check readability + whether marker survived
       const cmnt = join(ROOT, `cmnt-${idx}`);
       await mkdir(cmnt, { recursive: true });
       try {
-        await $`hdiutil attach -quiet -nobrowse -owners on -mountpoint ${cmnt} ${clone}`.quiet();
+        await $`cowshed disk-command hdiutil -- attach -quiet -nobrowse -owners on -mountpoint ${cmnt} ${clone}`.quiet();
         mounted.add(cmnt);
         mountable = 'yes';
         const cmarker = await Bun.file(join(cmnt, 'ws', 'marker.txt'))
@@ -156,7 +157,9 @@ async function run() {
 try {
   await run();
 } finally {
-  for (const m of [...mounted].reverse()) await $`hdiutil detach -quiet -force ${m}`.nothrow().quiet();
+  for (const m of [...mounted].reverse()) {
+    await $`cowshed disk-command hdiutil -- detach -quiet -force ${m}`.nothrow().quiet();
+  }
   await rm(ROOT, { recursive: true, force: true });
   console.log('cleaned up', ROOT);
 }

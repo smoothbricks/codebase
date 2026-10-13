@@ -150,8 +150,9 @@ impl Exhaustion {
     }
 }
 
-/// Disk-image commands killed at their hard deadline during one boot: each probably left its
-/// device leaked (01_storage.md, "No disk-image command is killed at its deadline").
+/// Disk-image commands killed at a hard deadline during one boot: each probably left its device
+/// leaked. Cowshed no longer kills one (01_storage.md, "No disk-image command is killed"); the
+/// count is what an earlier build recorded this boot, still reported until the boot ends.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProbableLeaks {
@@ -223,7 +224,9 @@ impl PoolRecord {
         }
     }
 
-    /// The record after a disk-image command was killed at its hard deadline during `session`.
+    /// The record after a disk-image command was killed during `session`, as an earlier build
+    /// wrote it. Nothing in production kills one any more; tests build such a record.
+    #[cfg(test)]
     pub fn killed(self, session: &str) -> Self {
         let killed = match &self.probable_leaks {
             Some(leaks) if leaks.session == session => leaks.killed + 1,
@@ -319,7 +322,7 @@ pub struct Budget {
     pub ceiling: Ceiling,
     /// This boot's first 150, while nothing has attached since.
     pub spent: Option<Exhaustion>,
-    /// Disk-image commands killed at their hard deadline this boot.
+    /// Disk-image commands an earlier build killed at its hard deadline this boot.
     pub probable_leaks: u64,
 }
 
@@ -422,8 +425,8 @@ impl fmt::Display for Budget {
         if self.probable_leaks > 0 {
             write!(
                 f,
-                "; {} disk-image command(s) killed at their hard deadline this boot, each a \
-                 probable leaked device",
+                "; {} disk-image command(s) killed this boot by an earlier cowshed's hard \
+                 deadline, each a probable leaked device",
                 self.probable_leaks
             )?;
         }
@@ -685,11 +688,8 @@ pub fn record_attach_at(path: &Path, session: &str) -> io::Result<PoolRecord> {
     update(path, |record| record.attached(session))
 }
 
-/// Record a disk-image command killed at its hard deadline: a probable leaked device.
-pub fn record_killed() -> io::Result<PoolRecord> {
-    record_killed_at(&record_path()?, &boot()?.session)
-}
-
+/// Record a disk-image command killed during `session`, as an earlier build did.
+#[cfg(test)]
 pub fn record_killed_at(path: &Path, session: &str) -> io::Result<PoolRecord> {
     update(path, |record| record.killed(session))
 }

@@ -30,15 +30,18 @@ def free():
 
 def make(image, size):
     if fmt == 'C':
-        ms, _ = run(['hdiutil', 'create', '-quiet', '-size', str(size), '-type', 'SPARSE', '-fs',
+        ms, _ = run(['cowshed', 'disk-command', 'hdiutil', '--',
+                     'create', '-quiet', '-size', str(size), '-type', 'SPARSE', '-fs',
                      'Case-sensitive APFS', '-volname', 'proto' + fmt, '-nospotlight', image])
         return ms
-    a, _ = run(['diskutil', 'image', 'create', 'blank', '--format', 'ASIF', '--size', str(size),
+    a, _ = run(['cowshed', 'disk-command', 'diskutil', '--',
+                'image', 'create', 'blank', '--format', 'ASIF', '--size', str(size),
                 '--volumeName', 'proto' + fmt, '--fs', 'None', image])
-    b, o = run(['diskutil', 'image', 'attach', '--nobrowse', '--noMount', '--plist', image])
+    b, o = run(['cowshed', 'disk-command', 'diskutil', '--',
+                'image', 'attach', '--nobrowse', '--noMount', '--plist', image])
     dev = plistlib.loads(o)['system-entities'][0]['dev-entry']
     c, _ = run([NEWFS, '-U', str(os.getuid()), '-G', str(os.getgid()), '-e', '-v', 'proto' + fmt, '/dev/' + dev])
-    d, _ = run(['diskutil', 'eject', dev])
+    d, _ = run(['cowshed', 'disk-command', 'diskutil', '--', 'eject', dev])
     return round(a + b + c + d, 1)
 
 
@@ -46,7 +49,8 @@ def detach_logged(whole, log):
     """Detach, recording every refusal instead of dying on it; a huge SPARSE volume refused once here."""
     for attempt in range(5):
         t = time.monotonic()
-        p = subprocess.run(['hdiutil', 'detach', whole] if fmt == 'C' else ['diskutil', 'eject', whole],
+        p = subprocess.run(['cowshed', 'disk-command', 'hdiutil', '--', 'detach', whole] if fmt == 'C' else
+                           ['cowshed', 'disk-command', 'diskutil', '--', 'eject', whole],
                            capture_output=True, text=True)
         ms = round((time.monotonic() - t) * 1000, 1)
         if p.returncode == 0:
@@ -110,17 +114,19 @@ for label, size in CAPS.items():
 # Grow the 100 GiB image to the store's size, the way `cowshed resize` does: image resize detached, then container grow.
 img = f'{WORK}/100GiB-2.{EXT}'
 if fmt == 'C':
-    ms, _ = run(['hdiutil', 'resize', '-size', str(FULL), img])
+    ms, _ = run(['cowshed', 'disk-command', 'hdiutil', '--', 'resize', '-size', str(FULL), img])
 else:
-    ms, _ = run(['diskutil', 'image', 'resize', '--size', str(FULL), img])
+    ms, _ = run(['cowshed', 'disk-command', 'diskutil', '--', 'image', 'resize', '--size', str(FULL), img])
 g = {'resize_ms': ms}
 whole, att = attach(img, MNT)
 g['attach_total_ms'] = att['attach_total_ms']
 g['df_before_grow'] = df(MNT)
 container = next(line.split()[-1] for line in subprocess.run(
-    ['diskutil', 'info', MNT], capture_output=True, text=True).stdout.splitlines() if 'APFS Container:' in line)
+    ['cowshed', 'disk-command', 'diskutil', '--', 'info', MNT],
+    capture_output=True, text=True).stdout.splitlines() if 'APFS Container:' in line)
 t = time.monotonic()
-p = subprocess.run(['diskutil', 'apfs', 'resizeContainer', container, '0'], capture_output=True, text=True)
+p = subprocess.run(['cowshed', 'disk-command', 'diskutil', '--', 'apfs', 'resizeContainer', container, '0'],
+                   capture_output=True, text=True)
 g['grow_ms'] = round((time.monotonic() - t) * 1000, 1)
 g['grow_rc'] = p.returncode
 g['grow_tail'] = (p.stdout + p.stderr).strip()[-200:]

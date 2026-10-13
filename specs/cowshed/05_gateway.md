@@ -366,7 +366,7 @@ lease is two classes that exclude each other rather than N interchangeable token
   stderr names it — `disk-lease evicted a <class> holder after <held> while <class> waited`, with its pid and the
   command line it asked for. Its command may still be running beside the next phase; a hung `umount` costs that one
   overlap, not every attach on the host. A client's own deadline still kills its child at 120 s, except a disk-image
-  command (`diskutil image …`, `hdiutil`), which it warns about from 120 s every 30 s and kills only at 15 minutes,
+  command (`diskutil image …`, `diskutil eject`, `hdiutil`), which it warns about from 120 s every 30 s and never kills,
   because a killed one can leak its device until reboot (01_storage.md, "How the APFS host degrades" §2).
 - **Wire.** The client writes `{"op":"disk-lease","class":"storage"|"namespace","command":"<argv>"}`, with
   `"share":"alone"` when it asks for the whole phase, and does not half-close. The gateway answers

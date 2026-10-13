@@ -43,7 +43,7 @@ def plain_copy(source, destination):
 def verify(image):
     _, whole, volume = p.attach(image)
     elapsed = p.sh(["/sbin/fsck_apfs", "-q", "/dev/r" + volume])[0]
-    p.sh(["diskutil", "eject", whole])
+    p.sh(["cowshed", "disk-command", "diskutil", "--", "eject", whole])
     return elapsed
 
 
@@ -70,7 +70,8 @@ def measure(image, label, out):
         if method == "plain_copy":
             elapsed = plain_copy(image, dest)
         else:
-            elapsed = p.sh(["diskutil", "image", "create", "from", "--format", "ASIF", image, dest])[0]
+            elapsed = p.sh(["cowshed", "disk-command", "diskutil", "--",
+                            "image", "create", "from", "--format", "ASIF", image, dest])[0]
         row[method] = {"elapsed": elapsed, "extents_after": p.extents(dest),
                        "allocated_gib": p.allocated_gib(dest), "first_write_after": p.first_write(dest),
                        "attach_fsck": verify(dest)}

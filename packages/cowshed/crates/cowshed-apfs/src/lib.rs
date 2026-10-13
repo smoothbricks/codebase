@@ -56,6 +56,18 @@ pub const SECTOR_BYTES: u64 = 512;
 /// back out of the attachment inventory.
 const CONTAINER_ALREADY_SPANS_IMAGE: [&str; 2] = ["Error: -69743:", "Error: -69519:"];
 
+/// Where a disk child's standard input comes from. A parameter of the run, not of the
+/// [`CommandRequest`]: only [`SystemCommandRunner::run_with_inherited_input`] asks for anything
+/// but `/dev/null`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ChildInput {
+    /// `/dev/null`: every command cowshed runs on its own behalf.
+    Null,
+    /// This process's own standard input, for `cowshed disk-command`, whose caller may pipe a
+    /// passphrase to `diskutil apfs unlockVolume … -stdinpassphrase`.
+    Inherited,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommandRequest {
     pub program: PathBuf,
@@ -71,6 +83,39 @@ impl CommandRequest {
             program: program.into(),
             args: args.into_iter().map(Into::into).collect(),
         }
+    }
+}
+
+/// A disk tool the `cowshed disk-command` facade runs on a caller's behalf, through
+/// [`SystemCommandRunner`] exactly as cowshed runs its own.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DiskTool {
+    Diskutil,
+    Hdiutil,
+}
+
+impl DiskTool {
+    /// The tool a caller names: `diskutil` or `hdiutil`, never a path.
+    pub fn named(name: &str) -> Option<Self> {
+        match name {
+            "diskutil" => Some(Self::Diskutil),
+            "hdiutil" => Some(Self::Hdiutil),
+            _ => None,
+        }
+    }
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Diskutil => "diskutil",
+            Self::Hdiutil => "hdiutil",
+        }
+    }
+
+    pub fn program(self) -> &'static Path {
+        Path::new(match self {
+            Self::Diskutil => DISKUTIL,
+            Self::Hdiutil => HDIUTIL,
+        })
     }
 }
 
@@ -210,12 +255,11 @@ pub trait CommandRunner {
 /// [`timed_apfs_step`] span such a child was stuck inside terminates with `status=err` and
 /// the waited elapsed instead of never closing.
 ///
-/// A disk-image command (`diskutil image …`, `hdiutil`) is the exception: killed mid-operation,
-/// its device can stay leaked in the kernel until reboot (01_storage.md, "How the APFS host
-/// degrades" §2). For it this deadline is a warning point: it is waited for, still holding its
-/// leases, and says what it is waiting on every [`DISK_IMAGE_WARNING_INTERVAL`], until
-/// [`DISK_IMAGE_HARD_DEADLINE`] kills it and records a probable leaked device in the attach-pool
-/// record ([`crate::attach_budget`]).
+/// A disk-image command (`diskutil image …`, `hdiutil`) is the exception, and cowshed never kills
+/// one: killed mid-operation, its device can stay leaked in the kernel until reboot
+/// (01_storage.md, "How the APFS host degrades" §2). For it this deadline is a warning point: it
+/// is waited for until it ends on its own, still holding its leases, and says what it is waiting
+/// on every [`DISK_IMAGE_WARNING_INTERVAL`].
 ///
 /// 120 seconds is generous against normally sub-second disk children and stays inside the
 /// enclosing per-operation budgets even when a pass pays it once per workspace; tests
@@ -225,43 +269,46 @@ pub const DISK_CHILD_DEADLINE: Duration = Duration::from_secs(120);
 /// How often a disk-image command past [`DISK_CHILD_DEADLINE`] says what it is still waiting on.
 pub const DISK_IMAGE_WARNING_INTERVAL: Duration = Duration::from_secs(30);
 
-/// When a disk-image command is killed after all: past this a hung verb would wedge the gateway
-/// and its leases indefinitely, which costs more than the device its kill probably leaks.
-pub const DISK_IMAGE_HARD_DEADLINE: Duration = Duration::from_secs(15 * 60);
+/// What the waiter does with a disk child still running at its deadline.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PastDeadline {
+    /// Kill the child's process group and report [`CommandRunFailure::Deadline`].
+    Kill,
+    /// Say what is still running this often, and wait until the child ends on its own. A
+    /// disk-image command's policy: no deadline of cowshed's own kills one.
+    WarnEvery(Duration),
+}
 
-/// When a running disk child is warned about and when it is killed.
+/// When a running disk child is warned about, and whether it is ever killed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DeadlinePolicy {
-    /// Every child is killed here, except a disk-image command, which is warned about.
     pub deadline: Duration,
-    pub warn_every: Duration,
-    /// Where every child is killed.
-    pub hard: Duration,
+    pub past_deadline: PastDeadline,
 }
 
 impl DeadlinePolicy {
-    /// `request`'s policy at `deadline`: a disk-image command waits up to
-    /// [`DISK_IMAGE_HARD_DEADLINE`]; every other disk child is killed at `deadline`.
+    /// `request`'s policy at `deadline`: a disk-image command is warned about from `deadline`
+    /// every [`DISK_IMAGE_WARNING_INTERVAL`] and never killed; every other disk child is killed
+    /// at `deadline`.
     pub fn for_request(request: &CommandRequest, deadline: Duration) -> Self {
         Self {
             deadline,
-            warn_every: DISK_IMAGE_WARNING_INTERVAL,
-            hard: if is_disk_image_command(request) {
-                DISK_IMAGE_HARD_DEADLINE.max(deadline)
+            past_deadline: if is_disk_image_command(request) {
+                PastDeadline::WarnEvery(DISK_IMAGE_WARNING_INTERVAL)
             } else {
-                deadline
+                PastDeadline::Kill
             },
         }
     }
 
     /// What the waiter does `elapsed` into the child's run, having warned `warned` times.
     fn step(&self, elapsed: Duration, warned: u32) -> DeadlineStep {
-        if elapsed >= self.hard {
-            DeadlineStep::Kill
-        } else if elapsed >= self.deadline + self.warn_every * warned {
-            DeadlineStep::Warn
-        } else {
-            DeadlineStep::Wait
+        match self.past_deadline {
+            PastDeadline::Kill if elapsed >= self.deadline => DeadlineStep::Kill,
+            PastDeadline::WarnEvery(every) if elapsed >= self.deadline + every * warned => {
+                DeadlineStep::Warn
+            }
+            PastDeadline::Kill | PastDeadline::WarnEvery(_) => DeadlineStep::Wait,
         }
     }
 }
@@ -289,30 +336,70 @@ impl SystemCommandRunner {
         request: &CommandRequest,
         deadline: Duration,
     ) -> Result<CommandOutput, CommandRunError> {
+        self.run_admitted(request, deadline, ChildInput::Null, |run| {
+            crate::disk_lease::leased(&request.program, &request.args, run)
+        })
+    }
+
+    /// [`CommandRunner::run`] with the child reading this process's standard input instead of
+    /// `/dev/null`: the `cowshed disk-command` facade, whose caller may pipe a passphrase to the
+    /// tool. Everything else — lease, session, deadline policy, bookkeeping — is the same run.
+    pub fn run_with_inherited_input(
+        &self,
+        request: &CommandRequest,
+    ) -> Result<CommandOutput, CommandRunError> {
+        self.run_admitted(request, DISK_CHILD_DEADLINE, ChildInput::Inherited, |run| {
+            crate::disk_lease::leased(&request.program, &request.args, run)
+        })
+    }
+
+    /// [`Self::run_with_deadline`] admitted by `lease` instead of the host gateway's lease:
+    /// `lease` is handed the child's run and calls it once, inside whatever admission it grants.
+    /// A test gateway's lease (`|run| disk_lease::leased_at(socket, class, command, run)`) and a
+    /// measurement's deliberately free-for-all baseline (`|run| run()`) get the same spawn,
+    /// deadline policy and attach-pool bookkeeping as production; there is no second runner.
+    pub fn run_within(
+        &self,
+        request: &CommandRequest,
+        deadline: Duration,
+        lease: impl FnOnce(
+            &mut dyn FnMut() -> Result<CommandOutput, CommandRunError>,
+        ) -> Result<CommandOutput, CommandRunError>,
+    ) -> Result<CommandOutput, CommandRunError> {
+        self.run_admitted(request, deadline, ChildInput::Null, lease)
+    }
+
+    /// The one run every public entry point is: `request` reading `input`, admitted by `lease`,
+    /// under [`DeadlinePolicy::for_request`] at `deadline`.
+    fn run_admitted(
+        &self,
+        request: &CommandRequest,
+        deadline: Duration,
+        input: ChildInput,
+        lease: impl FnOnce(
+            &mut dyn FnMut() -> Result<CommandOutput, CommandRunError>,
+        ) -> Result<CommandOutput, CommandRunError>,
+    ) -> Result<CommandOutput, CommandRunError> {
         let policy = DeadlinePolicy::for_request(request, deadline);
-        let output = crate::disk_lease::leased(&request.program, &request.args, || {
-            Self::run_unleased(
-                request,
-                policy,
-                &mut |elapsed| warn_outlived(request, policy, elapsed),
-                &mut || record_killed(request),
-            )
+        let output = lease(&mut || {
+            Self::run_unleased(request, input, policy, &mut |elapsed| {
+                warn_outlived(request, deadline, elapsed)
+            })
         })?;
         record_pool_outcome(request, &output);
         Ok(output)
     }
 
-    /// Run `request` under `policy`, calling `warn` each time it is due and `killed` after a
-    /// kill.
+    /// Run `request` reading `input` under `policy`, calling `warn` each time a warning is due.
     fn run_unleased(
         request: &CommandRequest,
+        input: ChildInput,
         policy: DeadlinePolicy,
         warn: &mut dyn FnMut(Duration),
-        killed: &mut dyn FnMut(),
     ) -> Result<CommandOutput, CommandRunError> {
         use std::io::Read;
         let (mut child, output_files) =
-            spawn_disk_child(request).map_err(|source| CommandRunError {
+            spawn_disk_child(request, input).map_err(|source| CommandRunError {
                 request: request.clone(),
                 failure: CommandRunFailure::Spawn(source),
             })?;
@@ -392,13 +479,9 @@ impl SystemCommandRunner {
                         kill_disk_child_group(&mut child);
                         let _ = child.wait();
                         let _ = collect(stdout, stderr);
-                        if let Some(image) = deferred_image_target(request) {
-                            record_deferred_image(image);
-                        }
-                        killed();
                         return Err(CommandRunError {
                             request: request.clone(),
-                            failure: CommandRunFailure::Deadline(policy.hard),
+                            failure: CommandRunFailure::Deadline(policy.deadline),
                         });
                     }
                 },
@@ -408,29 +491,38 @@ impl SystemCommandRunner {
 }
 
 /// Say that a disk-image command outlived its deadline and is still waited for.
-fn warn_outlived(request: &CommandRequest, policy: DeadlinePolicy, elapsed: Duration) {
+///
+/// Written without `eprintln!`, which panics when stderr is gone: a caller that gave up and
+/// closed this process's stderr (an adapter past its own deadline) must not turn the warning
+/// into an unwind that abandons the wait, the lease, and the attach-pool bookkeeping. That
+/// caller cannot hear the warning any more; the wait goes on regardless.
+fn warn_outlived(request: &CommandRequest, deadline: Duration, elapsed: Duration) {
+    use std::io::Write;
     let target = request
         .args
         .last()
         .map_or_else(String::new, |target| target.to_string_lossy().into_owned());
-    eprintln!(
+    let _ = writeln!(
+        io::stderr(),
         "cowshed: warning: {} on {target} is still running after {}s, past its {}s deadline; \
-         a disk-image command killed mid-operation can leak its device until reboot, so it is \
-         waited for, holding its leases, until {}s",
+         a disk-image command killed mid-operation can leak its device until reboot, so cowshed \
+         never kills one: it is waited for, holding its leases, until it ends on its own",
         DiskImageVerb(request),
         elapsed.as_secs(),
-        policy.deadline.as_secs(),
-        policy.hard.as_secs()
+        deadline.as_secs(),
     );
 }
 
-/// The program and verb a disk-image command names: `diskutil image attach`, `hdiutil detach`.
+/// The program and verb a disk-image command names: `diskutil image attach`, `diskutil eject`,
+/// `hdiutil detach`.
 struct DiskImageVerb<'a>(&'a CommandRequest);
 
 impl fmt::Display for DiskImageVerb<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let request = self.0;
-        let words = if request.program == Path::new(DISKUTIL) {
+        let words = if request.program == Path::new(DISKUTIL)
+            && request.args.first().is_some_and(|verb| verb == "image")
+        {
             2
         } else {
             1
@@ -440,19 +532,6 @@ impl fmt::Display for DiskImageVerb<'_> {
             write!(f, " {}", word.display())?;
         }
         Ok(())
-    }
-}
-
-/// Record a disk-image command killed at its hard deadline as a probable leaked device.
-fn record_killed(request: &CommandRequest) {
-    if !is_disk_image_command(request) {
-        return;
-    }
-    if let Err(error) = attach_budget::record_killed() {
-        eprintln!(
-            "cowshed: warning: a disk-image command was killed at its hard deadline, and \
-             recording the probable leaked device failed: {error}"
-        );
     }
 }
 
@@ -493,12 +572,9 @@ impl CommandRunner for SystemCommandRunner {
             if !check()? {
                 return Ok(None);
             }
-            Self::run_unleased(
-                request,
-                policy,
-                &mut |elapsed| warn_outlived(request, policy, elapsed),
-                &mut || record_killed(request),
-            )
+            Self::run_unleased(request, ChildInput::Null, policy, &mut |elapsed| {
+                warn_outlived(request, DISK_CHILD_DEADLINE, elapsed)
+            })
             .map(Some)
             .map_err(E::from)
         })?;
@@ -789,25 +865,28 @@ fn lease_holder(lease: &Path) -> String {
 /// stays pending, never delivered, through any handler it installs. A caller killed
 /// mid-attach (an agent tool deadline, a process-group kill of `cowshed exec`) then leaves
 /// the command running to completion — no full pipe wedges it, no signal reaches it — and
-/// the next invocation reconciles the result from the kernel's attachment inventory. The
-/// runner's hard deadline (a SIGKILL of its group) is the only killer. The answered output
-/// directory travels with the child; reading it back removes it.
+/// the next invocation reconciles the result from the kernel's attachment inventory.
+/// Nothing in cowshed kills it either: its deadline only warns ([`PastDeadline::WarnEvery`]).
+/// The answered output directory travels with the child; reading it back removes it.
 fn spawn_disk_child(
     request: &CommandRequest,
+    input: ChildInput,
 ) -> io::Result<(std::process::Child, Option<PathBuf>)> {
-    spawn_disk_child_as(request, is_disk_image_command(request))
+    spawn_disk_child_as(request, input, is_disk_image_command(request))
 }
 
 /// `spawn_disk_child` with the detachment decided by the caller, so tests can detach a
 /// stand-in child without naming a real disk tool.
 fn spawn_disk_child_as(
     request: &CommandRequest,
+    input: ChildInput,
     detached: bool,
 ) -> io::Result<(std::process::Child, Option<PathBuf>)> {
     let mut command = Command::new(&request.program);
-    command
-        .args(&request.args)
-        .stdin(std::process::Stdio::null());
+    command.args(&request.args).stdin(match input {
+        ChildInput::Null => std::process::Stdio::null(),
+        ChildInput::Inherited => std::process::Stdio::inherit(),
+    });
     let output_files = if detached {
         let directory = std::env::temp_dir().join(format!(
             "cowshed-disk-image-{}",
@@ -870,55 +949,6 @@ fn kill_disk_child_group(child: &mut std::process::Child) {
         }
     }
     let _ = child.kill();
-}
-
-/// Images whose disk child was killed at its deadline ([`DISK_CHILD_DEADLINE`], or
-/// [`DISK_IMAGE_HARD_DEADLINE`] for a disk-image command), oldest first.
-///
-/// The daemon startup pass drains this at the start of each pass (see
-/// [`take_deferred_images`]) and heals the drained images before the rest, so a
-/// deferred workspace is retried first rather than in inventory order.
-static DEFERRED_IMAGES: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
-
-/// Cap on retained deferrals, so passes that never drain cannot grow memory without
-/// limit; entries past the cap evict the oldest first.
-const DEFERRED_IMAGES_CAP: usize = 1024;
-
-/// Record `path` for first-in-next-pass retry. Duplicate records collapse: one image
-/// is one early retry no matter how many of its children hit the deadline.
-pub(crate) fn record_deferred_image(path: PathBuf) {
-    let mut deferred = DEFERRED_IMAGES
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner());
-    if !deferred.contains(&path) {
-        if deferred.len() >= DEFERRED_IMAGES_CAP {
-            deferred.remove(0);
-        }
-        deferred.push(path);
-    }
-}
-
-/// Drain the images deferred since the last pass, oldest first. The startup pass calls
-/// this once per pass and heals the drained images before the rest.
-pub fn take_deferred_images() -> Vec<PathBuf> {
-    std::mem::take(
-        &mut *DEFERRED_IMAGES
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner()),
-    )
-}
-
-/// The image a disk child was working, when the argv names one.
-///
-/// Attach/detach argv carries its target last (the same convention the bootstrap mount
-/// path relies on); only an image path — not a `/dev/diskN` device — is a deferral key
-/// the startup pass can map back to a workspace.
-fn deferred_image_target(request: &CommandRequest) -> Option<PathBuf> {
-    if request.program != Path::new(DISKUTIL) {
-        return None;
-    }
-    let path = PathBuf::from(request.args.last()?);
-    is_image_path(&path).then_some(path)
 }
 
 /// The wait an unforced detach spends before it gives up on politeness.
@@ -3133,11 +3163,16 @@ fn command_failed(
     }
 }
 
-/// A DiskImages2 verb: `diskutil image …` or any `hdiutil`.
+/// A command that creates or releases a disk-image device: a DiskImages2 verb (`diskutil image …`
+/// or any `hdiutil`) or a `diskutil eject`, which releases an image through Disk Arbitration. An
+/// eject is classed this way whatever it targets: a physical disk's eject merely waits too.
 fn is_disk_image_command(request: &CommandRequest) -> bool {
     request.program == Path::new(HDIUTIL)
         || (request.program == Path::new(DISKUTIL)
-            && request.args.first().is_some_and(|verb| verb == "image"))
+            && request
+                .args
+                .first()
+                .is_some_and(|verb| verb == "image" || verb == "eject"))
 }
 
 /// `diskutil image attach …` or `hdiutil attach …`.
@@ -5667,9 +5702,8 @@ mod tests {
         // answers. Absolute coreutils paths (`/bin/sleep`, `/bin/echo`) do not exist on all
         // Linux runners (NixOS provides only `/bin/sh`), so the hang and the follow-up probe
         // must use `/bin/sh` builtins only. A child that is no disk-image command is killed at
-        // the deadline, its item marked deferred, and the queue continues; a disk-image command
-        // is waited for up to its hard deadline and then killed the same way (the tests below)
-        // — never wait forever.
+        // the deadline, and the queue continues; a disk-image command is never killed (the tests
+        // below), only warned about.
         let started = std::time::Instant::now();
         let error = SystemCommandRunner
             .run_with_deadline(
@@ -5716,7 +5750,8 @@ mod tests {
                 "kill -TERM $$; kill -HUP $$; printf done; printf err >&2",
             ],
         );
-        let (mut child, files) = spawn_disk_child_as(&request, true).expect("spawn detached");
+        let (mut child, files) =
+            spawn_disk_child_as(&request, ChildInput::Null, true).expect("spawn detached");
         let directory = files.expect("a detached child writes files");
         let status = child.wait().expect("reap the detached child");
         assert!(status.success(), "{status:?}");
@@ -5725,7 +5760,8 @@ mod tests {
         fs::remove_dir_all(directory).unwrap();
 
         let request = CommandRequest::new("/bin/sh", ["-c", "sleep 5"]);
-        let (mut child, _) = spawn_disk_child_as(&request, true).expect("spawn sleeper");
+        let (mut child, _) =
+            spawn_disk_child_as(&request, ChildInput::Null, true).expect("spawn sleeper");
         let pid = child.id() as libc::pid_t;
         // SAFETY: getpgid only reads the child's group; the child is ours, unreaped.
         assert_eq!(
@@ -5752,7 +5788,8 @@ mod tests {
                 "--nocapture",
             ],
         );
-        let (mut child, files) = spawn_disk_child_as(&request, true).expect("spawn detached");
+        let (mut child, files) =
+            spawn_disk_child_as(&request, ChildInput::Null, true).expect("spawn detached");
         let directory = files.expect("a detached child writes files");
         let status = child.wait().expect("reap the detached child");
         let stdout = fs::read_to_string(directory.join("stdout")).unwrap();
@@ -5799,104 +5836,150 @@ mod tests {
             DiskImageVerb(&CommandRequest::new(HDIUTIL, ["detach", "/dev/disk9"])).to_string(),
             "/usr/bin/hdiutil detach"
         );
+        assert_eq!(
+            DiskImageVerb(&CommandRequest::new(DISKUTIL, ["eject", "disk9"])).to_string(),
+            "/usr/sbin/diskutil eject"
+        );
     }
 
-    /// The policy itself, at its real constants: a disk-image command past the 120 s deadline
-    /// is warned about every 30 s and killed only at 15 minutes; every other disk child is
+    /// The policy itself, at its real constants: a disk-image command past the 120 s deadline is
+    /// warned about every 30 s and never killed, however long it runs; every other disk child is
     /// killed at the deadline.
     #[test]
-    fn a_disk_image_command_is_warned_about_at_the_deadline_and_killed_only_at_the_ceiling() {
-        let policy = DeadlinePolicy::for_request(&disk_image_request(), DISK_CHILD_DEADLINE);
+    fn a_disk_image_command_is_warned_about_at_the_deadline_and_never_killed() {
         let at = Duration::from_secs;
-        assert_eq!(policy.step(at(119), 0), DeadlineStep::Wait);
-        assert_eq!(policy.step(at(120), 0), DeadlineStep::Warn);
-        assert_eq!(policy.step(at(121), 1), DeadlineStep::Wait);
-        assert_eq!(policy.step(at(150), 1), DeadlineStep::Warn);
-        assert_eq!(policy.step(at(899), 26), DeadlineStep::Wait);
-        assert_eq!(policy.step(at(900), 26), DeadlineStep::Kill);
-        assert_eq!(DISK_IMAGE_HARD_DEADLINE, at(15 * 60));
-        for detach in [
-            CommandRequest::new(HDIUTIL, ["detach", "/dev/disk9"]),
+        for image in [
+            disk_image_request(),
             CommandRequest::new(DISKUTIL, ["image", "info", "/private/tmp/x.dmg"]),
+            CommandRequest::new(HDIUTIL, ["detach", "/dev/disk9"]),
+            CommandRequest::new(HDIUTIL, ["info"]),
+            // A Disk Arbitration release of an image device, and of a physical disk alike.
+            CommandRequest::new(DISKUTIL, ["eject", "disk9"]),
+            CommandRequest::new(DISKUTIL, ["eject", "force", "/dev/disk9"]),
         ] {
+            let policy = DeadlinePolicy::for_request(&image, DISK_CHILD_DEADLINE);
             assert_eq!(
-                DeadlinePolicy::for_request(&detach, DISK_CHILD_DEADLINE).hard,
-                DISK_IMAGE_HARD_DEADLINE
+                policy.past_deadline,
+                PastDeadline::WarnEvery(DISK_IMAGE_WARNING_INTERVAL),
+                "{image:?}"
             );
+            assert_eq!(policy.step(at(119), 0), DeadlineStep::Wait);
+            assert_eq!(policy.step(at(120), 0), DeadlineStep::Warn);
+            assert_eq!(policy.step(at(121), 1), DeadlineStep::Wait);
+            assert_eq!(policy.step(at(150), 1), DeadlineStep::Warn);
+            // Fifteen minutes, a day, a week: each is one more warning, never a kill.
+            for (elapsed, warned) in [(900, 26), (86_400, 2_876), (7 * 86_400, 20_156)] {
+                assert_eq!(
+                    policy.step(at(elapsed), warned),
+                    DeadlineStep::Warn,
+                    "{image:?} at {elapsed}s"
+                );
+                assert_eq!(
+                    policy.step(at(elapsed), warned + 1),
+                    DeadlineStep::Wait,
+                    "{image:?} at {elapsed}s"
+                );
+            }
         }
-        for other in [
+        for ordinary in [
             CommandRequest::new("/sbin/mount_apfs", ["-o", "nobrowse"]),
             CommandRequest::new(DISKUTIL, ["apfs", "resizeContainer", "disk9s1", "0"]),
+            CommandRequest::new(DISKUTIL, ["info", "-plist", "disk9s1"]),
         ] {
-            let policy = DeadlinePolicy::for_request(&other, DISK_CHILD_DEADLINE);
-            assert_eq!(policy.step(at(120), 0), DeadlineStep::Kill, "{other:?}");
+            let policy = DeadlinePolicy::for_request(&ordinary, DISK_CHILD_DEADLINE);
+            assert_eq!(policy.past_deadline, PastDeadline::Kill, "{ordinary:?}");
+            assert_eq!(policy.step(at(119), 0), DeadlineStep::Wait, "{ordinary:?}");
+            assert_eq!(policy.step(at(120), 0), DeadlineStep::Kill, "{ordinary:?}");
         }
     }
 
-    /// Past its deadline a disk-image command is not signalled: the waiter warns and the child
-    /// finishes on its own, exit status and output intact, returned as success. At the hard
-    /// deadline it is killed and the kill reported, which the runner records as a probable
-    /// leaked device.
+    /// A slow disk-image command is never signalled: the waiter warns past its deadline again
+    /// and again, and the child finishes on its own, exit status and output intact, returned as
+    /// its own outcome rather than a deadline failure.
     #[test]
-    fn a_disk_image_command_outliving_its_deadline_is_waited_for_then_killed_at_the_ceiling() {
-        let request = CommandRequest::new(
+    fn a_slow_disk_image_command_outliving_its_deadline_is_waited_for_never_killed() {
+        let deadline = Duration::from_millis(10);
+        assert!(matches!(
+            DeadlinePolicy::for_request(&disk_image_request(), deadline).past_deadline,
+            PastDeadline::WarnEvery(_)
+        ));
+        // The real policy at a warning interval a test can outlive many times over.
+        let policy = DeadlinePolicy {
+            deadline,
+            past_deadline: PastDeadline::WarnEvery(Duration::from_millis(50)),
+        };
+        let started = std::time::Instant::now();
+        let mut warnings = 0;
+        let output = SystemCommandRunner::run_unleased(
+            &CommandRequest::new("/bin/sh", ["-c", "sleep 1; printf done; exit 3"]),
+            ChildInput::Null,
+            policy,
+            &mut |_| warnings += 1,
+        )
+        .expect("a slow disk-image command ends on its own, never at a deadline");
+        assert!(started.elapsed() >= Duration::from_secs(1));
+        assert_eq!(output.status, ProcessStatus::Exit(3));
+        assert_eq!(output.stdout, b"done");
+        assert!(
+            warnings >= 5,
+            "only {warnings} warnings across a second past a 10 ms deadline"
+        );
+    }
+
+    const DISK_CHILD_INPUT_ROLE: &str = "COWSHED_TEST_DISK_CHILD_INPUT";
+
+    /// A disk child reads `/dev/null` unless it is run with this process's standard input
+    /// ([`SystemCommandRunner::run_with_inherited_input`]), which `cowshed disk-command` asks for
+    /// so a caller can pipe a passphrase to `diskutil apfs unlockVolume … -stdinpassphrase`. The
+    /// test re-executes itself with a passphrase on its standard input and reports what each
+    /// kind of run read.
+    #[test]
+    fn a_disk_child_reads_dev_null_unless_run_with_inherited_input() {
+        let read = CommandRequest::new(
             "/bin/sh",
             [
                 "-c",
-                "i=0; while [ $i -lt 20000 ]; do i=$((i+1)); done; printf done",
+                "if read line; then printf 'got %s' \"$line\"; else printf eof; fi",
             ],
         );
-        let waiting = DeadlinePolicy {
-            deadline: Duration::from_millis(1),
-            warn_every: Duration::from_millis(5),
-            hard: Duration::from_secs(60),
-        };
-        let mut warnings = 0;
-        let mut kills = 0;
-        let output = SystemCommandRunner::run_unleased(
-            &request,
-            waiting,
-            &mut |_| warnings += 1,
-            &mut || kills += 1,
-        )
-        .expect("the child finishes on its own");
-        assert_eq!(output.status, ProcessStatus::Exit(0));
-        assert_eq!(output.stdout, b"done");
-        assert!(warnings >= 1, "the deadline passed without a warning");
-        assert_eq!(kills, 0);
-
-        let ceiling = DeadlinePolicy {
-            deadline: Duration::from_millis(1),
-            warn_every: Duration::from_millis(50),
-            hard: Duration::from_millis(300),
-        };
-        let directory = std::env::temp_dir().join(format!(
-            "cowshed-apfs-hard-deadline-{}",
-            uuid::Uuid::new_v4().simple()
-        ));
-        fs::create_dir_all(&directory).unwrap();
-        let record = directory.join("pool.json");
-        let error = SystemCommandRunner::run_unleased(
-            &CommandRequest::new("/bin/sh", ["-c", "while true; do :; done"]),
-            ceiling,
-            &mut |_| {},
-            &mut || {
-                attach_budget::record_killed_at(&record, "this-boot").unwrap();
-            },
-        )
-        .unwrap_err();
+        if std::env::var_os(DISK_CHILD_INPUT_ROLE).is_some() {
+            let null = SystemCommandRunner.run(&read).expect("null-input child");
+            let inherited = SystemCommandRunner
+                .run_with_inherited_input(&read)
+                .expect("inheriting child");
+            println!(
+                "null={} inherited={}",
+                String::from_utf8_lossy(&null.stdout),
+                String::from_utf8_lossy(&inherited.stdout)
+            );
+            return;
+        }
+        let mut child = Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "tests::a_disk_child_reads_dev_null_unless_run_with_inherited_input",
+                "--nocapture",
+            ])
+            .env(DISK_CHILD_INPUT_ROLE, "1")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn_locked()
+            .expect("re-execute the test");
+        {
+            use std::io::Write;
+            let mut stdin = child.stdin.take().expect("piped stdin");
+            stdin
+                .write_all(b"passphrase\n")
+                .expect("write the passphrase");
+        }
+        let output = child.wait_with_output().expect("reap the re-executed test");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "{output:?}");
         assert!(
-            matches!(error.failure, CommandRunFailure::Deadline(hard) if hard == Duration::from_millis(300)),
-            "{error:?}"
+            stdout.contains("null=eof inherited=got passphrase"),
+            "{stdout}"
         );
-        assert_eq!(
-            attach_budget::load(&record)
-                .unwrap()
-                .probable_leaks
-                .map(|leaks| leaks.killed),
-            Some(1)
-        );
-        fs::remove_dir_all(&directory).unwrap();
     }
 
     #[test]
@@ -5939,56 +6022,6 @@ mod tests {
         assert_eq!(
             output.stdout.iter().filter(|byte| **byte == b'\n').count(),
             20_000
-        );
-    }
-
-    #[test]
-    fn deferred_images_roundtrip_dedup_and_drain_oldest_first() {
-        let _ = take_deferred_images();
-        let main = PathBuf::from("/store/acme/main.dmg");
-        let session = PathBuf::from("/store/acme/session.dmg");
-        record_deferred_image(main.clone());
-        record_deferred_image(main.clone());
-        record_deferred_image(session.clone());
-        assert_eq!(take_deferred_images(), vec![main, session]);
-        assert!(take_deferred_images().is_empty());
-    }
-
-    #[test]
-    fn deferred_image_target_only_names_disk_tool_image_argv() {
-        assert_eq!(
-            deferred_image_target(&CommandRequest::new(
-                DISKUTIL,
-                [
-                    "image",
-                    "attach",
-                    "--nobrowse",
-                    "--noMount",
-                    "--plist",
-                    "/store/acme/main.dmg"
-                ],
-            )),
-            Some(PathBuf::from("/store/acme/main.dmg"))
-        );
-        assert_eq!(
-            deferred_image_target(&CommandRequest::new(HDIUTIL, ["detach", "/dev/disk9"])),
-            None
-        );
-        assert_eq!(
-            deferred_image_target(&CommandRequest::new(HDIUTIL, ["info", "-plist"])),
-            None
-        );
-        assert_eq!(
-            deferred_image_target(&CommandRequest::new(
-                DISKUTIL,
-                ["image", "attach", "/store/acme/main.sparseimage"],
-            )),
-            None,
-            "only a .dmg image path is a workspace image"
-        );
-        assert_eq!(
-            deferred_image_target(&CommandRequest::new("/bin/sleep", ["30"])),
-            None
         );
     }
 

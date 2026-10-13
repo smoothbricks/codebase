@@ -4,6 +4,7 @@ import { $ } from 'bun';
 
 // Q1 + Q2 + Q4: ASIF vs SPARSE substrate comparison, attach-flag floor, tmutil default.
 // Focused harness; reuses tinybench. All under /private/tmp, cleaned up in finally.
+// hdiutil and diskutil run only through `cowshed disk-command` (cowshed must be on PATH); timings include that layer.
 
 const ROOT = '/private/tmp/cowshed-fmt-bench';
 const SIZE = '4g';
@@ -18,11 +19,11 @@ const mounted = new Set<string>();
 // Extension dispatch mirrors how cowshed-core will branch on the marker's imageFormat.
 async function attachOnce(image: string, mnt: string, extra: string[]) {
   if (image.endsWith('.asif')) {
-    await $`diskutil image attach --nobrowse --mountPoint ${mnt} ${image}`.quiet();
+    await $`cowshed disk-command diskutil -- image attach --nobrowse --mountPoint ${mnt} ${image}`.quiet();
   } else if (extra.length) {
-    await $`hdiutil attach -quiet -nobrowse -owners on -mountpoint ${mnt} ${extra} ${image}`.quiet();
+    await $`cowshed disk-command hdiutil -- attach -quiet -nobrowse -owners on -mountpoint ${mnt} ${extra} ${image}`.quiet();
   } else {
-    await $`hdiutil attach -quiet -nobrowse -owners on -mountpoint ${mnt} ${image}`.quiet();
+    await $`cowshed disk-command hdiutil -- attach -quiet -nobrowse -owners on -mountpoint ${mnt} ${image}`.quiet();
   }
 }
 async function attach(image: string, mnt: string, extra: string[] = []) {
@@ -42,14 +43,14 @@ async function attach(image: string, mnt: string, extra: string[] = []) {
 async function detach(mnt: string) {
   for (let tries = 0; tries < 3; tries++) {
     try {
-      await $`hdiutil detach -quiet ${mnt}`.quiet();
+      await $`cowshed disk-command hdiutil -- detach -quiet ${mnt}`.quiet();
       mounted.delete(mnt);
       return;
     } catch {
       await Bun.sleep(150);
     }
   }
-  await $`hdiutil detach -quiet -force ${mnt}`.nothrow().quiet();
+  await $`cowshed disk-command hdiutil -- detach -quiet -force ${mnt}`.nothrow().quiet();
   mounted.delete(mnt);
 }
 async function statBlocks(p: string): Promise<string> {
@@ -58,9 +59,9 @@ async function statBlocks(p: string): Promise<string> {
 
 async function createImage(format: 'SPARSE' | 'ASIF', path: string) {
   if (format === 'ASIF') {
-    await $`diskutil image create blank --format ASIF --size ${SIZE} --volumeName CowBench --fs APFS ${path}`.quiet();
+    await $`cowshed disk-command diskutil -- image create blank --format ASIF --size ${SIZE} --volumeName CowBench --fs APFS ${path}`.quiet();
   } else {
-    await $`hdiutil create -quiet -size ${SIZE} -type SPARSE -fs ${'APFS'} -volname CowBench -nospotlight ${path}`.quiet();
+    await $`cowshed disk-command hdiutil -- create -quiet -size ${SIZE} -type SPARSE -fs ${'APFS'} -volname CowBench -nospotlight ${path}`.quiet();
   }
 }
 
@@ -254,17 +255,21 @@ async function attachFlagFloor(format: 'SPARSE' | 'ASIF') {
     // ASIF: only diskutil image attach; measure plain and --noverify if accepted
     out['diskutil plain'] = med(
       await sample(10, async () => {
-        await $`diskutil image attach --nobrowse --mountPoint ${mnt} --mountOptions owners ${base}`.quiet();
+        await $`cowshed disk-command diskutil -- image attach --nobrowse --mountPoint ${mnt} --mountOptions owners ${base}`.quiet();
         await detach(mnt);
       }),
     );
     const hasNoverify =
-      (await $`diskutil image attach`.text().catch((e) => e.stdout?.toString() ?? '')).includes('noverify') ||
-      (await $`diskutil image attach`.text().catch((e) => e.stdout?.toString() ?? '')).includes('noVerify');
+      (await $`cowshed disk-command diskutil -- image attach`.text().catch((e) => e.stdout?.toString() ?? '')).includes(
+        'noverify',
+      ) ||
+      (await $`cowshed disk-command diskutil -- image attach`.text().catch((e) => e.stdout?.toString() ?? '')).includes(
+        'noVerify',
+      );
     if (hasNoverify) {
       out['diskutil noverify'] = med(
         await sample(10, async () => {
-          await $`diskutil image attach --nobrowse --noverify --mountPoint ${mnt} --mountOptions owners ${base}`.quiet();
+          await $`cowshed disk-command diskutil -- image attach --nobrowse --noverify --mountPoint ${mnt} --mountOptions owners ${base}`.quiet();
           await detach(mnt);
         }).catch(() => [-1]),
       );
@@ -325,7 +330,7 @@ try {
   console.log('\n=== Q4: tmutil defaults ===');
   console.log(await tmutilProbe());
 } finally {
-  for (const m of [...mounted].reverse()) await $`hdiutil detach -quiet ${m}`.nothrow().quiet();
+  for (const m of [...mounted].reverse()) await $`cowshed disk-command hdiutil -- detach -quiet ${m}`.nothrow().quiet();
   await rm(ROOT, { recursive: true, force: true });
   console.log('\ncleaned up', ROOT);
 }

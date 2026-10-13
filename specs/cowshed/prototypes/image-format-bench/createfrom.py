@@ -62,7 +62,7 @@ res['plain_copy'] = {'ms': cp['copy_ms'], 'extents': int(x['extents']), 'alloc_g
 os.unlink(plain)
 
 conv = f'{WORK}/converted.{EXT}'
-ms, _ = run(['diskutil', 'image', 'create', 'from', IMG, conv])
+ms, _ = run(['cowshed', 'disk-command', 'diskutil', '--', 'image', 'create', 'from', IMG, conv])
 x = extents(conv)
 res['create_from'] = {'ms': ms, 'extents': int(x['extents']), 'alloc_gib': round(x['alloc_bytes'] / 2**30, 3)}
 os.makedirs(f'{WORK}/mconv', exist_ok=True)

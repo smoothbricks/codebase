@@ -147,6 +147,13 @@ async fn run_command(parsed: args::Cli, interrupts: InterruptPolicy) -> Result<i
             }
         });
     }
+    // A disk tool for a caller that is not cowshed: no project and no daemon, so it is answered
+    // before anything asks the daemon and works on a host whose daemon runs another build or
+    // none at all. It writes the tool's bytes itself; only the runner's own failures are
+    // cowshed's to report.
+    if let args::Command::DiskCommand(disk) = &parsed.command {
+        return Ok(crate::disk_command::dispatch(disk, &mut output).await);
+    }
     if let args::Command::Skill(skill_args) = &parsed.command {
         let outcome = skill::dispatch(skill_args, &parsed.global, &mut output);
         return Ok(finish(outcome, &mut output, json));

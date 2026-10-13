@@ -52,7 +52,8 @@ if fmt == 'B':
     lit = []
     for i in range(5):
         p = f'{WORK}/lit{i}.asif'
-        ms, _ = run(['diskutil', 'image', 'create', 'blank', '--format', 'ASIF', '--size', '100g',
+        ms, _ = run(['cowshed', 'disk-command', 'diskutil', '--',
+                     'image', 'create', 'blank', '--format', 'ASIF', '--size', '100g',
                      '--volumeName', 'lit', '--fs', 'APFS', p])
         lit.append(ms)
         os.unlink(p)
@@ -94,12 +95,12 @@ rec = {'alloc_after_write_mib': a1, 'alloc_after_delete_mib': a2, 'alloc_after_r
        'regions_after_remount': x3['regions'], 'length_mib': round(x3['length'] / 2**20, 1)}
 if fmt != 'C':
     conv = f'{WORK}/converted.asif'
-    ms, _ = run(['diskutil', 'image', 'create', 'from', IMG, conv])
+    ms, _ = run(['cowshed', 'disk-command', 'diskutil', '--', 'image', 'create', 'from', IMG, conv])
     rec['diskutil_create_from_ms'] = ms
     rec['alloc_after_create_from_mib'] = alloc(conv)
     os.unlink(conv)
 if fmt == 'C':
-    ms, _ = run(['hdiutil', 'compact', '-quiet', IMG])
+    ms, _ = run(['cowshed', 'disk-command', 'hdiutil', '--', 'compact', '-quiet', IMG])
     rec['hdiutil_compact_ms'] = ms
     rec['alloc_after_compact_mib'] = alloc(IMG)
 out['reclaim'] = rec
@@ -108,9 +109,10 @@ print(json.dumps(rec), flush=True)
 # 3. Resize: attached (expected refusal) and detached grow 100g -> 200g.
 whole, _ = attach(IMG, MNT)
 if fmt == 'C':
-    out['resize_attached'] = trial(['hdiutil', 'resize', '-size', '200g', IMG])
+    out['resize_attached'] = trial(['cowshed', 'disk-command', 'hdiutil', '--', 'resize', '-size', '200g', IMG])
 else:
-    out['resize_attached'] = trial(['diskutil', 'image', 'resize', '--size', '200g', IMG])
+    out['resize_attached'] = trial(['cowshed', 'disk-command', 'diskutil', '--',
+                                    'image', 'resize', '--size', '200g', IMG])
 
 # 4. While attached: can another process lock or copy the backing file?
 locks = {}
@@ -123,13 +125,15 @@ for name, flag in (('shlock', os.O_SHLOCK), ('exlock', os.O_EXLOCK)):
         locks[name] = e.strerror
 out['attached_file_locks'] = locks
 out['convert_while_attached'] = trial(
-    ['diskutil', 'image', 'create', 'from', IMG, f'{WORK}/conv-attached.asif'] if fmt != 'C' else
-    ['hdiutil', 'convert', IMG, '-format', 'UDSP', '-o', f'{WORK}/conv-attached.sparseimage'])
+    ['cowshed', 'disk-command', 'diskutil', '--', 'image', 'create', 'from', IMG, f'{WORK}/conv-attached.asif']
+    if fmt != 'C' else
+    ['cowshed', 'disk-command', 'hdiutil', '--', 'convert', IMG, '-format', 'UDSP', '-o',
+     f'{WORK}/conv-attached.sparseimage'])
 detach(whole)
 if fmt == 'C':
-    ms, _ = run(['hdiutil', 'resize', '-size', '200g', IMG])
+    ms, _ = run(['cowshed', 'disk-command', 'hdiutil', '--', 'resize', '-size', '200g', IMG])
 else:
-    ms, _ = run(['diskutil', 'image', 'resize', '--size', '200g', IMG])
+    ms, _ = run(['cowshed', 'disk-command', 'diskutil', '--', 'image', 'resize', '--size', '200g', IMG])
 whole, _ = attach(IMG, MNT)
 cap = subprocess.run(['df', '-k', MNT], capture_output=True, text=True).stdout.split('\n')[1].split()[1]
 detach(whole)

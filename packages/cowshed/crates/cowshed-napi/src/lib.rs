@@ -712,6 +712,8 @@ mod parity_tests {
             | Command::Credential(_)
             | Command::Identity(_)
             | Command::Sccache(_)
+            // A host disk-tool facade for scripts; the addon's callers run cowshed's own verbs.
+            | Command::DiskCommand(_)
             | Command::Skill(_)
             | Command::Setup(_)
             | Command::Mount(_)
@@ -763,6 +765,7 @@ mod parity_tests {
         (&["credential", "status"], None),
         (&["identity", "add", "forge"], None),
         (&["sccache", "status"], None),
+        (&["disk-command", "hdiutil", "--", "info"], None),
         (&["skill", "install"], None),
         (&["mount", "main", "--repo-id", "acme/widget"], None),
         (&["rekey", "parity"], None),

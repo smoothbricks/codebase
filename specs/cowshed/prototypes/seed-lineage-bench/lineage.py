@@ -7,6 +7,7 @@ usage: PROTO_ROOT=<dir> PROTO_REPO=<checkout> lineage.py
   PROTO_MNT   where scratch volumes mount (default /private/tmp/seed-lineage-bench)
   GENERATIONS landed commits to replay (default 20)
   (build $PROTO_ROOT/xtool from ../image-format-bench/xtool.c first)
+  (`cowshed` must be on PATH: every hdiutil/diskutil call runs through `cowshed disk-command`; timings include it)
 
 Every image is case-sensitive ASIF, created the way cowshed creates one (blank --fs None, attach
 --noMount, newfs_apfs -e). Two tracks replay the same first-parent commits:
@@ -71,16 +72,19 @@ def allocated_gib(image):
 
 
 def create(image):
-    sh(["diskutil", "image", "create", "blank", "--format", "ASIF", "--size", "400G",
+    sh(["cowshed", "disk-command", "diskutil", "--",
+        "image", "create", "blank", "--format", "ASIF", "--size", "400G",
         "--volumeName", "seed", "--fs", "None", image])
-    out = sh(["diskutil", "image", "attach", "--nobrowse", "--noMount", "--plist", image])[1]
+    out = sh(["cowshed", "disk-command", "diskutil", "--",
+              "image", "attach", "--nobrowse", "--noMount", "--plist", image])[1]
     whole = plistlib.loads(out[out.index("<?xml"):].encode())["system-entities"][0]["dev-entry"]
     sh([NEWFS, "-U", str(os.getuid()), "-G", str(os.getgid()), "-e", "-v", "seed", "/dev/" + whole])
-    sh(["diskutil", "eject", whole])
+    sh(["cowshed", "disk-command", "diskutil", "--", "eject", whole])
 
 
 def attach(image):
-    elapsed, out = sh(["diskutil", "image", "attach", "--nobrowse", "--noMount", "--plist", image])
+    elapsed, out = sh(["cowshed", "disk-command", "diskutil", "--",
+                       "image", "attach", "--nobrowse", "--noMount", "--plist", image])
     entities = plistlib.loads(out[out.index("<?xml"):].encode())["system-entities"]
     whole = next(e["dev-entry"] for e in entities if not e.get("content-hint"))
     volume = next(e["dev-entry"] for e in entities if e.get("content-hint") == "Apple_APFS_Volume")
@@ -95,7 +99,7 @@ def mount(volume, point):
 def detach(point, whole):
     started = time.monotonic()
     sh(["/sbin/umount", point])
-    sh(["diskutil", "eject", whole])
+    sh(["cowshed", "disk-command", "diskutil", "--", "eject", whole])
     return time.monotonic() - started
 
 
