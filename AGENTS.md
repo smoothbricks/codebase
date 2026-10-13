@@ -436,6 +436,12 @@ until those tests miss their timeout — 62 images attached, only 27 this projec
 holding commits main lacks by ancestry or patch equivalence, which is the only check that catches a land you _think_
 succeeded. Piping `git merge --ff-only` through `tail` makes the exit status `tail`'s, so a failed merge prints success.
 
+**Markdown never travels in a shed, not even beside the code it describes.** Commit every `.md` edit straight on main
+(`<land-command> smoothbricks git -C <main> commit -m '…' -- <paths>`) and keep only code on the shed's branch; its
+next rebase drops the equivalent commits. A spec is the target design and is valid ahead of its code. Forking, gating
+and landing Markdown pays a fork, an image and a gate for nothing. A rebase over Markdown-only commits that misses the
+Nx cache for a task that does not read Markdown is a defect: fix its inputs in the same land.
+
 **A fleet touching `cfg(target_os)` code MUST run `bun run check:linux` before the last land, not after.** macOS gates
 cannot see the `not(target_os = "macos")` branch, so a green warnings-denied clippy on every branch still lands a red
 CI. One session put four regressions in that blind spot — a gated `impl` orphaning its imports, an ungated caller
