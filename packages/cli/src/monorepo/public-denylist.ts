@@ -31,6 +31,7 @@ type Judged = { readonly rows: string } | { readonly failure: string };
 type Environment = Readonly<Record<string, string | undefined>>;
 
 const UNCONFIGURED: PublicDenylistScan = { outcome: 'unconfigured' };
+const NUMERIC_REPOSITORY_NAME = /^\d+$/;
 
 /**
  * Judge what a push publishes, never the working tree: the message of every commit reachable from
@@ -296,7 +297,8 @@ async function siblingPatterns(root: string, env: Environment): Promise<{ patter
     if ((await realpath(probe.stdout.trimEnd())) !== (await realpath(sibling))) {
       return { failure: `${sibling}: .git does not identify this sibling as a repository root` };
     }
-    patterns.push(`(?<!\\w)${escapeRegex(entry.name)}(?!\\w)`);
+    const boundary = NUMERIC_REPOSITORY_NAME.test(entry.name) ? '[\\w.]' : '\\w';
+    patterns.push(`(?<!${boundary})${escapeRegex(entry.name)}(?!${boundary})`);
   }
   return { patterns };
 }
@@ -488,11 +490,17 @@ async function judgeAddedLines(
           ...allowlist.repositories.map((repository) => new RegExp(`(?<!\\w)${escapeRegex(repository)}(?!\\w)`, 'g')),
         ];
         const exemptions = new Map<number, Exemption>();
+        const siblingRegexes = siblings.map((pattern) => new RegExp(pattern, 'gi'));
+        const flagged = new Set<number>();
         for (const row of spans.rows.split('\n')) {
           if (row === '') continue;
           const found = /^lines:(\d+):(\d+):/.exec(row);
           if (!found) return { failure: `git grep returned an unrecognized match diagnostic: ${row}` };
           const index = Number(found[1]) - 1;
+          if (!lines[index]) return { failure: `git grep returned an out-of-range line: ${index + 1}` };
+          flagged.add(index);
+        }
+        for (const index of flagged) {
           const line = lines[index];
           if (!line) return { failure: `git grep returned an out-of-range line: ${index + 1}` };
           let exemption = exemptions.get(index);
@@ -501,9 +509,19 @@ async function judgeAddedLines(
             exemptions.set(index, exemption);
           }
           if (exemption.wholeLine) continue;
-          const start = Number(found[2]) - 1;
-          const end = start + Buffer.byteLength(row.slice(found[0].length));
-          if (!exemption.spans.some((allowed) => start >= allowed.start && end <= allowed.end)) matched.add(index);
+          // git grep's --column is unreliable for later matches on a line, so recompute
+          // sibling spans with the same patterns before judging allowlist containment.
+          let unexempted = false;
+          for (const siblingRegex of siblingRegexes) {
+            let match = siblingRegex.exec(line.text);
+            while (match !== null) {
+              const start = Buffer.byteLength(line.text.slice(0, match.index));
+              const end = start + Buffer.byteLength(match[0]);
+              if (!exemption.spans.some((allowed) => start >= allowed.start && end <= allowed.end)) unexempted = true;
+              match = siblingRegex.exec(line.text);
+            }
+          }
+          if (unexempted) matched.add(index);
         }
       }
     }
