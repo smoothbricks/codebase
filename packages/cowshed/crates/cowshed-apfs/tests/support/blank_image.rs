@@ -24,7 +24,8 @@
 //! `#[path]`-included beside [`super::scratch_apfs`]. The template directory spells no pid, so no
 //! sweep reclaims it.
 
-#![allow(dead_code)]
+// The pool's mount/umount run in the test process, not under a supervisor: no fork is in flight.
+#![allow(dead_code, clippy::disallowed_methods)]
 
 use std::fs;
 use std::path::{Path, PathBuf};

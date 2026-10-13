@@ -1389,14 +1389,14 @@ mod lifecycle_authority_tests {
         assert!(alive, "the forged nominee survives");
     }
 
-    /// The declared patched-Nx product this checkout resolves, and the node on the test's PATH.
+    /// The Bun-installed Nx product this checkout resolves, and the node on the test's PATH.
     fn declared_nx() -> (PathBuf, PathBuf) {
         let manifest = std::env::var_os("CARGO_MANIFEST_DIR")
             .expect("cargo exports CARGO_MANIFEST_DIR to the test process");
         let nx = PathBuf::from(manifest)
-            .join("../../../../.cache/patched-nx/node_modules/nx")
+            .join("../../../../node_modules/nx")
             .canonicalize()
-            .expect("the declared patched-nx product");
+            .expect("the Bun-installed Nx product");
         let node = std::env::var_os("PATH")
             .and_then(|path| {
                 std::env::split_paths(&path)
