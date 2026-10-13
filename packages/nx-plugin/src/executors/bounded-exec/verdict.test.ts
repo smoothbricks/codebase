@@ -3,6 +3,7 @@ import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promis
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
+import { onProgressClock } from '../../__tests__/progress-clock.js';
 import { type BoundedExecContext, createProcessTreeKiller, runBoundedExec } from './executor.js';
 import type { BoundedExecBounds } from './schema.js';
 import {
@@ -123,7 +124,22 @@ describe('bounded-exec verdicts', () => {
       "setInterval(() => console.error('        SLOW [>  0.050s] (───) fake tests::hangs'), 50);",
       '',
     ].join('\n');
-    expect(await verdictOf('node runner.js', { idleTimeoutMs: 400 }, { 'runner.js': runner })).toMatchObject({
+    const { root, context } = await workspace();
+    await writeFile(join(root, 'runner.js'), runner);
+    // The window ends only once the runner has said SLOW, however long node takes to start.
+    await onProgressClock(
+      (chunk) => chunk.includes('SLOW [>'),
+      400,
+      () =>
+        runBoundedExec(
+          { command: 'node runner.js', idleTimeoutMs: 400, killAfterMs: 0 },
+          context,
+          createProcessTreeKiller(),
+          null,
+          null,
+        ),
+    );
+    expect((await readRecord(context.record?.directory ?? ''))?.verdict).toMatchObject({
       outcome: 'wedged',
       idleMs: 400,
       tests: ['fake tests::hangs'],
