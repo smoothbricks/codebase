@@ -1628,8 +1628,9 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         }
         if !mount.owners_honoured() {
             return Err(ApfsStorageError::Host(format!(
-                "workspace mount ignores owners at {}",
-                expected_path.display()
+                "workspace mount has non-canonical flags at {}: it ignores owners, which every workspace mount must honour; flags={:#x}",
+                expected_path.display(),
+                mount.flags()
             )));
         }
         Ok(())

@@ -5104,12 +5104,10 @@ fn real_apfs_kernel_mount_flag_truth_table_allows_browse_but_requires_owners() {
 
     let _mounted = shared.mount_at(&mount, "noowners");
     let result = host.mounts(&repo());
-    assert!(result.is_err(), "noowners: {result:?}");
+    let wrong_flags = result.expect_err("wrong flags").to_string();
     assert!(
-        result
-            .expect_err("wrong flags")
-            .to_string()
-            .contains("non-canonical flags")
+        wrong_flags.contains("non-canonical flags"),
+        "noowners: {wrong_flags}"
     );
     host.heal_mount(&workspace(), &mount)
         .expect("heal by mountpoint");
