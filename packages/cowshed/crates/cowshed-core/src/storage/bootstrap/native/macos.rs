@@ -3627,69 +3627,56 @@ mod tests {
     use cowshed_os::fork_lock::Spawn as _;
     use uuid::Uuid;
 
+    /// The production read-only planner keeps the home device's container as its selection
+    /// anchor while an unrelated image tears down, whatever stage of that teardown the one kernel
+    /// snapshot it reads catches. `system_apfs_inventory` reads the IORegistry before the kernel
+    /// mount table, so a detach landing between the two leaves the image's volume registered with
+    /// no mount; `registered_apfs_containers` still reports container media whose volumes have
+    /// left the walk. Successive plans see the image mounted, registered with its mount gone, as
+    /// bare container media, and gone: present on one read, missing from the next. The registry
+    /// walk's own handling of an entry finalized mid-read is proven with dead-name ports and no
+    /// image in cowshed-apfs (`a_provider_chain_finalized_mid_walk_is_departing_not_an_inventory_failure`,
+    /// `a_finalized_entry_has_no_properties_rather_than_absent_ones`), so nothing here attaches
+    /// one (08_testing.md, "Host limit").
     #[test]
-    fn real_apfs_inventory_survives_concurrent_image_teardown() {
-        use cowshed_apfs::{ApfsBackend, DetachIntent, MacOsApfsBackend, SystemCommandRunner};
-
-        let root =
-            crate::scratch_apfs::ScratchRoot::new("inventory-teardown").expect("scratch root");
-        let backend = MacOsApfsBackend::new(SystemCommandRunner);
-        let image = root.path().join("transient.dmg");
-        crate::blank_image::blank_image(&image);
-
-        // Exercise the production read-only planner, not installation validation: a hosted
-        // runner need not have cowshed.store/cowshed.caches. The actual home device and its
-        // container must remain the selection anchor while an unrelated image disappears.
-        let home = std::env::home_dir().expect("home directory");
-        let snapshot = system_statfs(&home).expect("home filesystem");
-        assert_eq!(snapshot.fs_type, "apfs");
-        let device = exact_device_identifier(&snapshot.mount_source).expect("home device");
+    fn inventory_survives_concurrent_image_teardown() {
+        let teardown = [
+            (
+                "attached and mounted",
+                Some(container(
+                    "disk9",
+                    [volume("transient", "disk9s1", Some("/Volumes/transient"))],
+                )),
+            ),
+            (
+                "registered, mount already gone",
+                Some(container("disk9", [volume("transient", "disk9s1", None)])),
+            ),
+            (
+                "container media without volumes",
+                Some(container("disk9", [])),
+            ),
+            ("gone", None),
+        ];
         let expected = select_substrate(
             StatFsEvidence::Apfs {
-                mount_source: snapshot.mount_source,
-                container: Some(
-                    cowshed_apfs::device::container_of(&device)
-                        .expect("home container")
-                        .to_owned(),
-                ),
+                mount_source: PathBuf::from("/dev/disk3s5"),
+                container: Some("disk3".to_owned()),
             },
             None,
         )
         .expect("home APFS selection");
-        let mut source = SystemEvidenceSource {
-            host: &SystemBootstrapHost,
-        };
-        let attachment = backend.attach_verified(&image).expect("attach real image");
-        let start = std::sync::Arc::new(std::sync::Barrier::new(2));
-        let worker_start = std::sync::Arc::clone(&start);
-        let detach = std::thread::spawn(move || {
-            let backend = MacOsApfsBackend::new(SystemCommandRunner);
-            worker_start.wait();
-            let started = std::time::Instant::now();
-            let result = backend.detach(&attachment, DetachIntent::Release);
-            let finished = std::time::Instant::now();
-            result.expect("detach the fixture's image");
-            (started, finished)
-        });
-        start.wait();
-        let planner_started = std::time::Instant::now();
-        let plan = plan_existing_host_storage(&mut source, &home);
-        let planner_finished = std::time::Instant::now();
-        let (detach_started, detach_finished) = detach.join().expect("detach worker");
-        let overlap = planner_finished
-            .min(detach_finished)
-            .saturating_duration_since(planner_started.max(detach_started));
-        assert!(
-            !overlap.is_zero(),
-            "the production planner and real image teardown must execute concurrently"
-        );
-        eprintln!(
-            "inventory teardown race: planner={:?} detach={:?} overlap={overlap:?}",
-            planner_finished.duration_since(planner_started),
-            detach_finished.duration_since(detach_started),
-        );
-        let plan = plan.expect("home inventory must survive unrelated APFS teardown");
-        assert_eq!(plan.substrate(), &expected);
+        for (stage, departing) in teardown {
+            let mut source = healthy_existing_source();
+            let home = source.kernel.clone().expect("healthy kernel snapshot");
+            source.kernel = Ok(kernel(std::iter::once(home).chain(departing)));
+            let plan = plan_existing_host_storage(&mut source, Path::new("/Users/alice"))
+                .unwrap_or_else(|error| {
+                    panic!("home inventory must survive unrelated APFS teardown ({stage}): {error}")
+                });
+            assert_eq!(plan.substrate(), &expected, "{stage}");
+            assert_eq!(source.inventory_reads, 1, "{stage}");
+        }
     }
 
     /// Read-only host evidence that records every command validation asks for and refuses
