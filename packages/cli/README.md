@@ -874,12 +874,13 @@ Managed CI setup is split across local composite actions:
   name those global targets by absolute path, so archiving the aliases alone is incomplete. Both paths share one cache
   artifact and its path-versioned identity; ttsc plugins remain in their separate cache.
 
-The cache split is intentional. The store segment is large and keyed by the expensive shell closure inputs
-(`devenv.yaml`, `devenv.nix`, `devenv.lock`), and it carries store content only — never the Nix profiles, which exist to
-be gcroots: restoring a previous run's copies over a freshly installed Nix de-roots the running Nix binary, and the post
-phase then collects it. The `.devenv`/`.direnv` segment is small, but it holds absolute `/nix/store` pointers, so it
-restores on every ephemeral runner and devenv checks that the shell's derivation and output still exist on an eval-cache
-hit, re-evaluating when garbage collection removed them.
+The cache split is intentional. The store segment is large. Its key hashes the pins (`devenv.lock`, `devenv.yaml`), then
+the files that choose and override packages on top of them (`devenv.nix`, `devenv.smoo.nix`, `nixpkgs-overlay/`), and a
+miss falls back only to a store saved from the same pins, never to one built from other pins. It carries store content
+only — never the Nix profiles, which exist to be gcroots: restoring a previous run's copies over a freshly installed Nix
+de-roots the running Nix binary, and the post phase then collects it. The `.devenv`/`.direnv` segment is small, but it
+holds absolute `/nix/store` pointers, so it restores on every ephemeral runner and devenv checks that the shell's
+derivation and output still exist on an eval-cache hit, re-evaluating when garbage collection removed them.
 
 The bootstrap script is intentionally small. It only handles work required before `smoo` can run in GitHub Actions:
 

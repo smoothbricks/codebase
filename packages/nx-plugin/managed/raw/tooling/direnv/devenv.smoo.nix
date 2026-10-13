@@ -320,13 +320,13 @@ in {
   # before it is packed. A lean publish shell removes those tools silently, from
   # the one step that exists to refuse a bad artifact.
   #
-  # And it would not even pay: the Actions nix segment is keyed on
-  # os+arch+hash(devenv.yaml, devenv.nix, devenv.lock) and is blind to the
-  # profile, so a restore ships the whole NAR regardless, while the save exports
-  # the closure that job realized. A lean publish job that won that immutable
-  # key would hand the CI workflow a NAR with no toolchain in it. On any run
-  # where repair has work the saving is zero anyway, because repair realizes the
-  # historical default shell inside the same job.
+  # And it would not even pay: the Actions store cache is keyed on os+arch and
+  # the devenv files and is blind to the profile, so a restore ships the whole
+  # store regardless, while the save keeps the closure that job realized. A lean
+  # publish job that won that immutable key would hand the CI workflow a store
+  # with no toolchain in it. On any run where repair has work the saving is zero
+  # anyway, because repair realizes the historical default shell inside the
+  # same job.
 
   # One Go for every repository, same reasoning as the Rust toolchain: a compiler
   # is part of a cache key, so two of them mean two caches.
