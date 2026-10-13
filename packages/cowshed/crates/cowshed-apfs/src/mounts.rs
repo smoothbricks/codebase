@@ -54,6 +54,11 @@ impl KernelMountSnapshot {
     pub fn owners_honoured(&self) -> bool {
         self.flags & MNT_IGNORE_OWNERS == 0
     }
+
+    /// The kernel's raw `statfs` flags, so an error about this mount can show what it observed.
+    pub fn flags(&self) -> u64 {
+        self.flags
+    }
 }
 
 /// The mount count Darwin `getfsstat` answered, which is `-1` on error with `errno` set.
