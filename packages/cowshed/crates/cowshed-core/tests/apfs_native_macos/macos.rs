@@ -6133,7 +6133,7 @@ fn resize_refuses_an_image_still_attached_with_nothing_mounted_before_touching_i
             &error,
             ApfsStorageError::Host(message)
                 if message.contains(&image.image().display().to_string())
-                    && message.contains("hdiutil detach /dev/disk10")
+                    && message.contains("hdiutil detach /dev/disk9")
                     && message.contains("confirm its backing image is still this exact image")
         ),
         "unexpected refusal: {error}"

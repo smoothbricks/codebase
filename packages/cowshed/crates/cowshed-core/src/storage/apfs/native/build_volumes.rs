@@ -1442,7 +1442,14 @@ mod tests {
         host.backend
             .mount(&attachment, &checkout, MountAccess::ReadWrite, false)
             .expect("mount the image");
-        let sibling = add_volume(attachment.whole_device(), "sibling");
+        let container = cowshed_apfs::device::container_of(
+            attachment
+                .volume_device()
+                .strip_prefix("/dev/")
+                .expect("canonical volume device"),
+        )
+        .expect("APFS volume names its synthesized container");
+        let sibling = add_volume(container, "sibling");
         let sibling_mount = root.path().join("sibling");
         fs::create_dir_all(&sibling_mount).unwrap();
         diskutil(&[
