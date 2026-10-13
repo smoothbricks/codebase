@@ -2974,9 +2974,48 @@ async fn assert_build_label(layout: &BuildVolumeLayout, checkout: &Path, name: &
 /// and adopt/new/fork name every attached build volume (06_cli.md, "Build-volume names and
 /// reclamation"). Land renames the adopted volume even without a check, and rm/land reclaim
 /// unlinked volumes before returning, without a gc (16_build_volumes.md, "Garbage collection").
+/// The same sibling retirement holds a host process in that build volume and proves its
+/// forced release names the exact pid and command; no second project is adopted for that proof.
 #[tokio::test]
 async fn real_apfs_build_volume_names_follow_checkout_ownership_and_unlinked_mounts_are_reclaimed()
 {
+    const CHILD: &str = "COWSHED_TEST_BUILD_VOLUME_HOLDER_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        // Native release diagnostics use the process's stderr, not dispatch's Output writer.
+        // A separate test process captures them without redirecting descriptors shared by tests.
+        let output = tokio::process::Command::new(
+            std::env::current_exe().expect("test executable"),
+        )
+        .args([
+            "--exact",
+            "macos::real_apfs_build_volume_names_follow_checkout_ownership_and_unlinked_mounts_are_reclaimed",
+            "--nocapture",
+        ])
+        .env(CHILD, "1")
+        .output()
+        .await
+        .expect("run the APFS holder scenario in a child test process");
+        let stdout = String::from_utf8(output.stdout).expect("child test stdout");
+        let stderr = String::from_utf8(output.stderr).expect("child test stderr");
+        assert!(
+            output.status.success(),
+            "child scenario failed\n{stdout}\n{stderr}"
+        );
+        let pid = stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("build-volume-holder-pid="))
+            .and_then(|pid| pid.parse::<i32>().ok())
+            .expect("the child names its real holder pid");
+        assert!(
+            stderr.contains(&format!("pid {pid} (/bin/cat)")),
+            "forced release names the holder's pid and command: {stderr}"
+        );
+        assert!(
+            stderr.contains("forced"),
+            "forced release is explicit: {stderr}"
+        );
+        return;
+    }
     let mut fixture = Fixture::with(Project::Declared);
     assert!(fixture.checkout.join(DECLARED_STATE).join(".git").is_dir());
     let mut service = serve_project(&mut fixture, &[]).await;
@@ -3035,6 +3074,25 @@ async fn real_apfs_build_volume_names_follow_checkout_ownership_and_unlinked_mou
     let sibling_volume = linked_volume(&layout, &sibling);
     assert_build_label(&layout, &sibling, "sibling").await;
     assert_linked_build_mounts(&layout, &[&fixture.checkout, &topic, &sibling]);
+    let mount = layout.mount(&sibling_volume);
+    let holder = Holder(
+        Command::new("/bin/cat")
+            .current_dir(&mount)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("a host process with cwd in the build volume"),
+    );
+    let pid = i32::try_from(holder.0.id()).expect("a pid fits i32");
+    println!("build-volume-holder-pid={pid}");
+    eventually("cat holds the build volume as its cwd", || {
+        nx::volume_holders(&mount)
+            .expect("query build volume holders")
+            .iter()
+            .any(|holder| holder.pid == pid)
+    })
+    .await;
     succeed(&mut service, ["rm", "sibling"]).await;
     assert!(
         !layout.image(&sibling_volume).exists(),
@@ -3045,6 +3103,7 @@ async fn real_apfs_build_volume_names_follow_checkout_ownership_and_unlinked_mou
         "rm reclaims the unlinked record"
     );
     assert_linked_build_mounts(&layout, &[&fixture.checkout, &topic]);
+    drop(holder);
 
     fs::write(topic.join("tracked"), b"landed change\n").expect("change tracked source");
     git(&topic, &["commit", "-q", "-am", "change tracked source"]);
@@ -3076,84 +3135,6 @@ async fn real_apfs_build_volume_names_follow_checkout_ownership_and_unlinked_mou
     fixture.stop_gateway().await;
 }
 
-/// A host process's cwd is not a cowshed ownership hold: retirement force-unmounts the
-/// unlinked volume and reports exactly which live pid and command lost access.
-#[tokio::test]
-async fn real_apfs_rm_evicts_and_names_a_host_process_holding_an_unlinked_build_volume() {
-    const CHILD: &str = "COWSHED_TEST_BUILD_VOLUME_HOLDER_CHILD";
-    if std::env::var_os(CHILD).is_none() {
-        // Native release diagnostics use the process's stderr, not dispatch's Output writer.
-        // A separate test process captures them without redirecting descriptors shared by tests.
-        let output = tokio::process::Command::new(
-            std::env::current_exe().expect("test executable"),
-        )
-        .args([
-            "--exact",
-            "macos::real_apfs_rm_evicts_and_names_a_host_process_holding_an_unlinked_build_volume",
-            "--nocapture",
-        ])
-        .env(CHILD, "1")
-        .output()
-        .await
-        .expect("run the APFS holder scenario in a child test process");
-        let stdout = String::from_utf8(output.stdout).expect("child test stdout");
-        let stderr = String::from_utf8(output.stderr).expect("child test stderr");
-        assert!(
-            output.status.success(),
-            "child scenario failed\n{stdout}\n{stderr}"
-        );
-        let pid = stdout
-            .lines()
-            .find_map(|line| line.strip_prefix("build-volume-holder-pid="))
-            .and_then(|pid| pid.parse::<i32>().ok())
-            .expect("the child names its real holder pid");
-        assert!(
-            stderr.contains(&format!("pid {pid} (/bin/cat)")),
-            "forced release names the holder's pid and command: {stderr}"
-        );
-        assert!(
-            stderr.contains("forced"),
-            "forced release is explicit: {stderr}"
-        );
-        return;
-    }
-    let mut fixture = Fixture::with(Project::Declared);
-    let mut service = serve_project(&mut fixture, &[]).await;
-    let layout = build_volumes(&fixture);
-    let topic = new_workspace(&mut service, "topic").await;
-    let volume = linked_volume(&layout, &topic);
-    let mount = layout.mount(&volume);
-    let holder = Holder(
-        Command::new("/bin/cat")
-            .current_dir(&mount)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("a host process with cwd in the build volume"),
-    );
-    let pid = i32::try_from(holder.0.id()).expect("a pid fits i32");
-    println!("build-volume-holder-pid={pid}");
-    eventually("cat holds the build volume as its cwd", || {
-        nx::volume_holders(&mount)
-            .expect("query build volume holders")
-            .iter()
-            .any(|holder| holder.pid == pid)
-    })
-    .await;
-
-    let (_, stderr) = succeed(&mut service, ["rm", "topic"]).await;
-    assert!(
-        !layout.image(&volume).exists(),
-        "rm must reclaim a merely kernel-busy image: {stderr}"
-    );
-    assert!(!layout.record(&volume).exists(), "rm reclaims its record");
-    assert_linked_build_mounts(&layout, &[&fixture.checkout]);
-    drop(holder);
-    service.shutdown().await.expect("stop the runtime");
-    fixture.stop_gateway().await;
-}
-
 /// Re-adoption (02_workspaces.md, "Re-adoption: format transition and space reclamation"):
 /// RAW replacement and interrupted legacy recovery are independent real walks over fresh projects.
 /// - a default adopt over a main in a format this runtime only replaces refuses before it
@@ -3163,7 +3144,7 @@ async fn real_apfs_rm_evicts_and_names_a_host_process_holding_an_unlinked_build_
 ///   volume's identity, owner record and warm contents, and the original `.pre-cowshed` tree;
 /// - the replaced main and build images stay at their retained paths, in their own format.
 #[tokio::test]
-async fn real_apfs_re_adopt_replaces_main_keeps_its_build_identity_and_retains_the_old_image() {
+async fn real_apfs_raw_re_adoption_preserves_build_identity_and_replays_published_build_loss() {
     prove_re_adoption(ReAdoptionProof::RawReplacement).await;
 }
 
@@ -3212,7 +3193,7 @@ async fn prove_re_adoption(proof: ReAdoptionProof) {
             }
         }
     }
-    let fixture = Fixture::with(Project::Declared);
+    let mut fixture = Fixture::with(Project::Declared);
     let mut service = fixture.open().await;
     let storage = cowshed_core::storage::StorageLayout::new(
         fixture.storage.store(),
@@ -3250,7 +3231,7 @@ async fn prove_re_adoption(proof: ReAdoptionProof) {
     assert_eq!(result.expect("RAW adoption"), 0);
     let layout = build_volumes(&fixture);
     let main_volume = linked_volume(&layout, &fixture.checkout);
-    let record = layout
+    let mut record = layout
         .read_record(&main_volume)
         .expect("main's build record");
     let warm = fixture.checkout.join(DECLARED_STATE).join("build");
@@ -3269,7 +3250,22 @@ async fn prove_re_adoption(proof: ReAdoptionProof) {
     let head = git_stdout(&fixture.checkout, &["rev-parse", "HEAD"]);
     let pre_cowshed_head = fs::read(pre_cowshed.join(".git/HEAD")).expect("retained tree");
     let main_image = project_root.join("main.dmg");
+    record.tree = Some(
+        cowshed_core::api::GitOid::new(git_stdout(
+            &fixture.checkout,
+            &["rev-parse", "HEAD^{tree}"],
+        ))
+        .expect("a tree oid"),
+    );
+    layout
+        .write_record(&main_volume, &record)
+        .expect("record the warm build's tree before replacement");
     if let ReAdoptionProof::RawReplacement = proof {
+        fs::write(
+            layout.mount(&main_volume).join("published-cache"),
+            b"cached payload\n",
+        )
+        .expect("warm the build before replacement and the published-loss phase");
         let status = git_stdout(
             &fixture.checkout,
             &["status", "--porcelain", "--untracked-files=all"],
@@ -3380,6 +3376,7 @@ async fn prove_re_adoption(proof: ReAdoptionProof) {
             );
         }
         service.shutdown().await.expect("stop the runtime");
+        prove_published_build_loss(&mut fixture).await;
         return;
     }
     service.shutdown().await.expect("stop the runtime");
@@ -3766,11 +3763,11 @@ fn assert_host_sparse(path: &Path) {
     );
 }
 
-/// 02_workspaces.md, "Missing main image": main's image and its build volume are both gone, and
-/// a plain Git checkout of main's repository sits at main's path. `adopt --re-adopt` publishes a
-/// fresh RAW main from that checkout and an empty RAW build under the recorded id.
+/// One adopted fixture exercises the three missing-main transitions (02_workspaces.md,
+/// "Missing main image"): publish an empty build after loss, keep a surviving build under a
+/// new id after the next loss, then replay a refused copy after the user commits new work.
 #[tokio::test]
-async fn real_apfs_re_adopt_of_a_missing_main_publishes_its_plain_checkout_and_an_empty_build() {
+async fn real_apfs_missing_main_recovers_empty_and_surviving_builds_and_replays_live_work() {
     const REMOTE: &str = "https://github.com/fixture/dispatch.git";
     let mut fixture = Fixture::with(Project::Declared);
     let mut service = fixture.open().await;
@@ -3991,16 +3988,18 @@ async fn real_apfs_re_adopt_of_a_missing_main_publishes_its_plain_checkout_and_a
         .shutdown()
         .await
         .expect("stop the recovered runtime");
+    prove_missing_main_keeps_surviving_build(&mut fixture).await;
+    prove_missing_main_replays_live_work(&mut fixture).await;
     fixture.stop_gateway().await;
 }
 
 /// Main's image, sidecar and CA key lost after a completed healthy re-adoption, with a plain Git
 /// checkout of main's repository cloned at main's path in their place, its origin naming the
 /// project. The build volumes are left as the caller arranged them. Answers the plain HEAD.
-fn lose_main_to_a_plain_checkout(fixture: &Fixture, main_image: &Path) -> String {
+fn lose_main_to_a_plain_checkout(fixture: &Fixture, main_image: &Path, phase: &str) -> String {
     const REMOTE: &str = "https://github.com/fixture/dispatch.git";
     let scratch = fixture._scratch.path();
-    let plain_source = scratch.join("plain-source");
+    let plain_source = scratch.join(phase);
     git(
         scratch,
         &[
@@ -4044,18 +4043,15 @@ fn lose_main_to_a_plain_checkout(fixture: &Fixture, main_image: &Path) -> String
 /// recorded id names nothing while main's real volume survives. Re-adoption keeps that surviving
 /// volume, warm and with its owner record, links main to it and seeds it; it never mints an empty
 /// volume under the dead id.
-#[tokio::test]
-async fn real_apfs_re_adopt_of_a_missing_main_keeps_its_surviving_build_volume() {
-    let mut fixture = Fixture::with(Project::Declared);
+async fn prove_missing_main_keeps_surviving_build(fixture: &mut Fixture) {
     let mut service = fixture.open().await;
-    adopt(&fixture, &mut service).await;
     let storage = cowshed_core::storage::StorageLayout::new(
         fixture.storage.store(),
         &RepoId::parse("fixture/dispatch").expect("repository identity"),
     )
     .expect("fixture storage layout");
     let main_image = storage.project().project_root.join("main.dmg");
-    let layout = build_volumes(&fixture);
+    let layout = build_volumes(fixture);
     succeed(
         &mut service,
         [
@@ -4102,7 +4098,7 @@ async fn real_apfs_re_adopt_of_a_missing_main_keeps_its_surviving_build_volume()
         matches!(&owner.role, BuildVolumeRole::Linked { checkout } if checkout.is_main()),
         "the surviving volume is main's: {owner:?}"
     );
-    let plain_head = lose_main_to_a_plain_checkout(&fixture, &main_image);
+    let plain_head = lose_main_to_a_plain_checkout(fixture, &main_image, "surviving-source");
 
     let mut recovered = fixture.open().await;
     succeed(
@@ -4152,7 +4148,6 @@ async fn real_apfs_re_adopt_of_a_missing_main_keeps_its_surviving_build_volume()
         .shutdown()
         .await
         .expect("stop the recovered runtime");
-    fixture.stop_gateway().await;
 }
 
 /// 02_workspaces.md, "Missing main image": until the handoff swaps it aside, a missing main's copy
@@ -4160,11 +4155,8 @@ async fn real_apfs_re_adopt_of_a_missing_main_keeps_its_surviving_build_volume()
 /// anything is published (here, a file the copy cannot read) leaves the user free to commit; the
 /// replay records the checkout's Git state again before it copies, so it publishes the new HEAD
 /// instead of refusing against the state the first attempt recorded, on every run.
-#[tokio::test]
-async fn real_apfs_a_missing_main_replay_publishes_a_commit_made_after_a_refused_attempt() {
-    let mut fixture = Fixture::with(Project::Declared);
+async fn prove_missing_main_replays_live_work(fixture: &mut Fixture) {
     let mut service = fixture.open().await;
-    adopt(&fixture, &mut service).await;
     let storage = cowshed_core::storage::StorageLayout::new(
         fixture.storage.store(),
         &RepoId::parse("fixture/dispatch").expect("repository identity"),
@@ -4186,7 +4178,7 @@ async fn real_apfs_a_missing_main_replay_publishes_a_commit_made_after_a_refused
         .shutdown()
         .await
         .expect("stop the runtime before main is lost");
-    lose_main_to_a_plain_checkout(&fixture, &main_image);
+    lose_main_to_a_plain_checkout(fixture, &main_image, "replay-source");
 
     // An ignored file the copy cannot read: the attempt is journaled, then refuses at the copy.
     let excludes = fixture.checkout.join(".git/info/exclude");
@@ -4259,7 +4251,6 @@ async fn real_apfs_a_missing_main_replay_publishes_a_commit_made_after_a_refused
         "the replay completed"
     );
     resumed.shutdown().await.expect("stop the resumed runtime");
-    fixture.stop_gateway().await;
 }
 
 /// 02_workspaces.md, "Re-adoption" step 3: an interrupted re-adoption whose retained build image
@@ -4444,11 +4435,7 @@ async fn real_apfs_a_resumed_re_adopt_whose_retained_build_is_gone_publishes_it_
 /// even when its retained build image is lost after that publication. Nothing reads the retained
 /// image past publication: the published warm replacement and its owner record are kept, and the
 /// replacement's seed is captured from it under the source build claim.
-#[tokio::test]
-async fn real_apfs_a_re_adopt_whose_build_was_published_resumes_after_its_retained_build_is_lost() {
-    let mut fixture = Fixture::with(Project::Declared);
-    let mut service = fixture.open().await;
-    adopt(&fixture, &mut service).await;
+async fn prove_published_build_loss(fixture: &mut Fixture) {
     let storage = cowshed_core::storage::StorageLayout::new(
         fixture.storage.store(),
         &RepoId::parse("fixture/dispatch").expect("repository identity"),
@@ -4458,35 +4445,9 @@ async fn real_apfs_a_re_adopt_whose_build_was_published_resumes_after_its_retain
         .project()
         .project_root
         .join("lifecycle-intents.json");
-    let layout = build_volumes(&fixture);
+    let layout = build_volumes(fixture);
     let main_volume = linked_volume(&layout, &fixture.checkout);
     let cache_marker = layout.mount(&main_volume).join("published-cache");
-    fs::write(&cache_marker, b"cached payload\n").expect("warm the build cache");
-    // Main's volume was built at its tree, so its owner record differs from the empty record a lost
-    // build is published under, whose built-at tree is cleared.
-    let mut built = layout
-        .read_record(&main_volume)
-        .expect("main's build record");
-    built.tree = Some(
-        cowshed_core::api::GitOid::new(git_stdout(
-            &fixture.checkout,
-            &["rev-parse", "HEAD^{tree}"],
-        ))
-        .expect("a tree oid"),
-    );
-    layout
-        .write_record(&main_volume, &built)
-        .expect("record main's built-at tree");
-    succeed(
-        &mut service,
-        [
-            OsString::from("adopt"),
-            fixture.checkout.as_os_str().to_os_string(),
-            OsString::from("--re-adopt"),
-        ],
-    )
-    .await;
-    service.shutdown().await.expect("stop the runtime");
     let main = WorkspaceName::main();
     let journal = cowshed_core::storage::recovery::LifecycleIntentJournal::load(&journal_path)
         .expect("the completed journal");
@@ -4582,5 +4543,4 @@ async fn real_apfs_a_re_adopt_whose_build_was_published_resumes_after_its_retain
         "the replacement's seed is captured under the source build claim"
     );
     resumed.shutdown().await.expect("stop the resumed runtime");
-    fixture.stop_gateway().await;
 }
