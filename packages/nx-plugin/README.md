@@ -509,18 +509,15 @@ Concrete targets come from concrete files:
   `platform = 'cfg(target_os="macos")'`. The runner's filter is the union of those overrides, so the runner and the
   per-crate exclusions cannot drift; every crate piece excludes it with `not (…)`, so each test is selected by exactly
   one target. The runner is not inferred off macOS, where nextest applies the group nowhere and no piece excludes its
-  tests. Its executor, `@smoothbricks/nx-plugin:nextest-group`, lists the selection
-  (`nextest list --message-format=json`, same archive and reuse flags) under the existing bounded runner, counts the
-  matching non-ignored tests, and runs the group under a bound of that count × 30 s. Both stages ask the bounded
-  executor for one CPU token, matching the group's one runnable test process instead of reserving idle host capacity.
-  The bound is aggregate, not a per-test limit; the real-APFS lifecycle tests keep their 60 s code bound in the
-  repository's run-wrapper. The run carries `--no-fail-fast`: an ordinary test failure does not stop the group's
-  remaining tests, and a failed verdict lists the failed ones. A listing that fails, does not parse, or selects no test
-  refuses before anything runs, clears this task's previous verdict and report, and fails the group rather than running
-  it unbounded. Ignored tests keep their explicit lane. A crate named `group-*` is refused, since its runner name would
-  collide. A repository's serial group may bound each test's code time with a nextest run-wrapper from the plugin's
-  source (`src/nextest-code-bound.ts`); the group's target hashes that file as an input, so changing it reruns the group
-  (`specs/cowshed/08_testing.md`, "Integration tests (real substrate)").
+  tests. It is a `bounded-exec` run of the group's selection under the same progress bound as every test target, and
+  asks for one CPU token, matching the group's one runnable test process instead of reserving idle host capacity. The
+  run carries `--no-fail-fast`: an ordinary test failure does not stop the group's remaining tests, and a failed verdict
+  lists the failed ones. It carries `--no-tests=fail`, so a filter that selects no test fails the group. Ignored tests
+  keep their explicit lane. A crate named `group-*` is refused, since its runner name would collide. A repository's
+  serial group may measure each test's code time against a class with a nextest run-wrapper from the plugin's source
+  (`src/nextest-code-bound.ts`), which warns of a test over its class and never fails or kills it; the group's target
+  hashes that file as an input, so changing it reruns the group (`specs/cowshed/08_testing.md`, "Integration tests (real
+  substrate)").
 - `cargo-test` is the ordinary suite alone: it depends on the crate pieces and never on a serial group, so a run of it
   never reaches a group's real-image tests. The inferred `test`, the gate of the cargo workspace root and of every
   project that owns crates, depends on `cargo-test` and on every group's runner, by plain name at the root that owns
