@@ -10,6 +10,7 @@ use async_trait::async_trait;
 use base64::Engine as _;
 use bytes::Bytes;
 use cowshed_apfs::SystemCommandRunner;
+use cowshed_apfs::image::{IMAGE_EXTENSION, ImageCapacity};
 pub use cowshed_core::api::ProjectWorkspaces;
 use cowshed_core::api::server::{ConnectionAuthority, serve_controller_connection};
 use cowshed_core::api::{
@@ -25,11 +26,8 @@ use cowshed_core::api::{
     WorkspaceState, validate_command_argv,
 };
 use cowshed_core::git::GitRepository;
-use cowshed_apfs::image::{IMAGE_EXTENSION, ImageCapacity};
-use cowshed_gateway_types::STORE_ROOT;
 use cowshed_core::metadata::{
-    DetachedWorkspaceMetadata, SlotId, WorkspaceIncarnation,
-    WorkspaceName, WorkspaceRole,
+    DetachedWorkspaceMetadata, SlotId, WorkspaceIncarnation, WorkspaceName, WorkspaceRole,
 };
 use cowshed_core::metadata::{EgressMode, EgressRule};
 use cowshed_core::repository::RepoId;
@@ -39,8 +37,8 @@ use cowshed_core::storage::apfs::rekey::RekeyReport;
 use cowshed_core::storage::apfs::{ApfsSubstrate, ApfsSubstrateConfig, DEFAULT_IMAGE_CAPACITY};
 use cowshed_core::storage::bootstrap::{
     CachesVolume, CanonicalRoots, HostAction, HostSetupPlan, HostSetupReport, MOUNT_SERVICE_PLIST,
-    RETIRED_CACHES_MOUNTPOINT, VOLUME_MARKER_FILE, ValidatedHostStorage, VolumeRole,
-    VolumeState, execute_host_setup, plan_host_setup,
+    RETIRED_CACHES_MOUNTPOINT, VOLUME_MARKER_FILE, ValidatedHostStorage, VolumeRole, VolumeState,
+    execute_host_setup, plan_host_setup,
 };
 use cowshed_core::storage::host_config::{RETIRED_LAYOUT_HINT, retired_layout_paths};
 use cowshed_core::storage::job_artifact::{ArtifactConfig, repair_workspace_record_sequences};
@@ -50,6 +48,7 @@ use cowshed_core::{
     AdoptedProject, CowshedError, ErrorCode, GatewayInventoryError, JobHandle,
     NativeGatewayInventory, Result, UnreachableMain, validate_existing_host_storage,
 };
+use cowshed_gateway_types::STORE_ROOT;
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Write};
@@ -239,11 +238,7 @@ fn needs_daemon_of_this_build(command: &Command) -> bool {
 /// a workspace half removed. Asking first leaves the host as it was, with the refusal that names
 /// `cowshed setup`.
 pub async fn require_daemon_of_this_build(command: &Command) -> Result<()> {
-    require_daemon_of_this_build_at(
-        Path::new(cowshed_gateway_types::STORE_ROOT),
-        command,
-    )
-    .await
+    require_daemon_of_this_build_at(Path::new(cowshed_gateway_types::STORE_ROOT), command).await
 }
 
 async fn require_daemon_of_this_build_at(store_root: &Path, command: &Command) -> Result<()> {
@@ -435,12 +430,9 @@ impl ActorBridge {
         requested_repo_id: Option<RepoId>,
         storage: ValidatedHostStorage,
     ) -> Result<Self> {
-        let runtime = ProjectRuntime::open_directory_for_adopt_at(
-            project_root,
-            requested_repo_id,
-            storage,
-        )
-        .await?;
+        let runtime =
+            ProjectRuntime::open_directory_for_adopt_at(project_root, requested_repo_id, storage)
+                .await?;
         Self::from_runtime(project_root, runtime).await
     }
 

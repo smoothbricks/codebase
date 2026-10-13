@@ -74,10 +74,6 @@ struct Fixture {
 }
 
 impl Fixture {
-    fn new() -> Self {
-        Self::with(Project::Plain)
-    }
-
     fn directory() -> Self {
         Self::with_directory(Project::Plain)
     }
@@ -277,7 +273,10 @@ impl Project<'_> {
 fn checkout_template(project: Project<'_>) -> PathBuf {
     // SAFETY: `getppid` has no preconditions and cannot fail.
     let run = unsafe { libc::getppid() };
-    let directory = PathBuf::from(format!("{}{run}-templates", scratch_apfs::ROOT_PREFIX));
+    let directory = PathBuf::from(format!(
+        "/private/tmp/{}{run}-templates",
+        scratch_directory::ROOT_PREFIX
+    ));
     fs::create_dir_all(&directory)
         .unwrap_or_else(|error| panic!("template directory {}: {error}", directory.display()));
     let key = project.key();
