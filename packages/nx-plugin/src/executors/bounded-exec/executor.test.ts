@@ -4,6 +4,7 @@ import { access, mkdir, mkdtemp, open, readFile, rm, writeFile } from 'node:fs/p
 import { createServer } from 'node:net';
 import { availableParallelism, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { onProgressClock } from '../../__tests__/progress-clock.js';
 import { ownedSocketDirectory } from '../../testing.js';
 import { CPU_POOL_ENV, type CpuPool, createCpuPool, type InheritedCpuPool, readInheritedCpuPool } from './cpu-pool.js';
 import { CPU_TOKENS_ENV, type CpuBudget, type TokenGrant } from './cpu-tokens.js';
@@ -149,12 +150,18 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       ].join('\n'),
     );
 
-    const result = await runBoundedExec(
-      { command: 'node slow-runner.js', idleTimeoutMs: 400, killAfterMs: 0 },
-      workspace.context,
-      createProcessTreeKiller(),
-      null,
-      null,
+    // The window ends only once the runner has said SLOW, however long node takes to start.
+    const { result } = await onProgressClock(
+      (chunk) => chunk.includes('SLOW [>'),
+      400,
+      () =>
+        runBoundedExec(
+          { command: 'node slow-runner.js', idleTimeoutMs: 400, killAfterMs: 0 },
+          workspace.context,
+          createProcessTreeKiller(),
+          null,
+          null,
+        ),
     );
 
     expect(result.success).toBe(false);
@@ -168,12 +175,17 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     const workspace = await createWorkspace();
     await workspace.write('heartbeat.js', ["setInterval(() => console.log('still waiting...'), 20);", ''].join('\n'));
 
-    const result = await runBoundedExec(
-      { command: 'node heartbeat.js', idleTimeoutMs: 300, killAfterMs: 0 },
-      workspace.context,
-      createProcessTreeKiller(),
-      null,
-      null,
+    const { result } = await onProgressClock(
+      (chunk) => chunk.includes('still waiting...'),
+      300,
+      () =>
+        runBoundedExec(
+          { command: 'node heartbeat.js', idleTimeoutMs: 300, killAfterMs: 0 },
+          workspace.context,
+          createProcessTreeKiller(),
+          null,
+          null,
+        ),
     );
 
     expect(result.success).toBe(false);
@@ -181,10 +193,10 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     expect(result.terminalOutput).toContain('Command made no progress: no test finished for 300ms');
   });
 
-  it('lets a run that keeps finishing tests outlive its progress bound many times over', async () => {
+  it('lets a run that keeps finishing tests outlive its progress bound', async () => {
     const workspace = await createWorkspace();
-    // Ten tests 120ms apart under a 400ms progress bound and no ceiling: the run lasts three times the bound, so
-    // passing proves the bound measures the gap between finished tests, not duration.
+    // Ten tests under a 400ms progress bound and no ceiling, the clock moving 300ms at each: the run outlives the
+    // bound, so passing proves the bound measures the gap between finished tests, not duration.
     await workspace.write(
       'progressing.js',
       [
@@ -198,17 +210,23 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       ].join('\n'),
     );
 
-    const result = await runBoundedExec(
-      { command: 'node progressing.js', idleTimeoutMs: 400 },
-      workspace.context,
-      createProcessTreeKiller(),
-      null,
-      null,
+    const { result, movedMs } = await onProgressClock(
+      (chunk) => chunk.includes('PASS ['),
+      300,
+      () =>
+        runBoundedExec(
+          { command: 'node progressing.js', idleTimeoutMs: 400 },
+          workspace.context,
+          createProcessTreeKiller(),
+          null,
+          null,
+        ),
     );
 
     expect(result.success).toBe(true);
     expect(result.terminalOutput).toContain('(10/10) fake tests::t10');
     expect(result.terminalOutput).not.toContain('made no progress');
+    expect(movedMs).toBeGreaterThan(400);
   });
 
   it("counts bun's dots on stderr as finished tests", async () => {
@@ -226,12 +244,17 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       ].join('\n'),
     );
 
-    const result = await runBoundedExec(
-      { command: 'node dots.js', idleTimeoutMs: 400 },
-      workspace.context,
-      createProcessTreeKiller(),
-      null,
-      null,
+    const { result } = await onProgressClock(
+      (chunk) => /^\.+$/.test(chunk),
+      300,
+      () =>
+        runBoundedExec(
+          { command: 'node dots.js', idleTimeoutMs: 400 },
+          workspace.context,
+          createProcessTreeKiller(),
+          null,
+          null,
+        ),
     );
 
     expect(result.success).toBe(true);
