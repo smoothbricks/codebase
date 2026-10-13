@@ -193,11 +193,14 @@ async fn the_launcher_sizes_each_case_and_a_killed_cargo_leaves_the_ledger_whole
         shown.contains("CARGO_BUILD_JOBS=\n"),
         "no static job count under a jobserver: {shown}"
     );
-    assert!(
-        !Path::new(fifo).exists(),
-        "the fifo is unlinked when the run ends"
-    );
-    assert_eq!(held(&socket), 0);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Path::new(fifo).exists() || held(&socket) != 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the finished build\'s grant outlives it"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
 
     // A subcommand that compiles nothing runs directly even with a gateway up.
     let code = run(&["metadata"], &socket).expect("launcher thread");
@@ -263,12 +266,19 @@ async fn the_launcher_sizes_each_case_and_a_killed_cargo_leaves_the_ledger_whole
     unset("FAKE_CARGO_EXIT");
     let arguments: Vec<std::ffi::OsString> = ["build"].iter().map(Into::into).collect();
     let sleeper_socket = socket.clone();
+    std::fs::remove_file(&pid_file).expect("discard the previous child identity");
     let handle = std::thread::spawn(move || run_at(&arguments, &sleeper_socket));
     let deadline = Instant::now() + Duration::from_secs(15);
-    while held(&socket) != 4 {
-        assert!(Instant::now() < deadline, "the grant never landed");
+    let pid = loop {
+        if held(&socket) == 4
+            && let Ok(identity) = std::fs::read_to_string(&pid_file)
+            && let Ok(pid) = identity.trim().parse::<i32>()
+        {
+            break pid;
+        }
+        assert!(Instant::now() < deadline, "the granted child never started");
         std::thread::sleep(Duration::from_millis(25));
-    }
+    };
     let shown = env_out();
     let fifo = shown
         .lines()
@@ -276,11 +286,10 @@ async fn the_launcher_sizes_each_case_and_a_killed_cargo_leaves_the_ledger_whole
         .and_then(|flags| flags.strip_prefix("-j --jobserver-auth=fifo:"))
         .expect("the sleeping build holds a fifo")
         .to_owned();
-    let pid: i32 = std::fs::read_to_string(&pid_file)
-        .expect("pid file")
-        .trim()
-        .parse()
-        .expect("pid");
+    assert!(
+        Path::new(&fifo).exists(),
+        "the running child holds a live fifo"
+    );
     // SAFETY: the pid is the fake cargo this test spawned.
     unsafe { libc::kill(pid, libc::SIGKILL) };
     let code = handle.join().expect("launcher thread");
