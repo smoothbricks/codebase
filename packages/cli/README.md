@@ -35,6 +35,8 @@ smoo monorepo check
 smoo monorepo diff
 smoo monorepo validate-commit-msg <commit-msg-file>
 smoo monorepo check-public-denylist [--remote <name>] [revisions...]
+smoo monorepo check-public-denylist --staged
+smoo monorepo check-public-denylist --commit-message <commit-msg-file>
 smoo monorepo sync-bun-lockfile-versions [--mode <install|publish>] [--stage]
 smoo monorepo list-release-packages [--fail-empty] [--github-output <path>]
 smoo monorepo validate-public-tags
@@ -576,6 +578,19 @@ After formatting, the hook runs `smoo monorepo validate --fail-fast --only-if-ne
 commits fast while still catching incomplete package setup and conditional managed-file drift when a new workspace
 package manifest is staged.
 
+The hook also runs `smoo monorepo check-public-denylist --staged`. It rejects added staged lines containing the real
+`HOME` path or a case-insensitive whole-word name of a sibling Git repository. Removed lines, unchanged context,
+unstaged edits, and untracked files are not judged. The check uses the index Git supplies, including the temporary index
+used by a partial commit. A cowshed workspace discovers siblings beside its adopted checkout, not beside its mount.
+Dot-directories, plain directories, and the repository itself are excluded.
+
+Legitimate public references belong in the committed `tooling/public-denylist-allowlist.tsv`, read from that same index.
+Its tab-separated rules are `package-scope<TAB>@scope`, `repository<TAB>public-name`, or
+`line<TAB>repository-relative-path<TAB>exact-text`. A package-scope rule exempts only its package references, including
+encoded patch filenames; an exact-line rule applies only to its named path. An allowed reference does not exempt a
+different private name on the same line, and no rule exempts the real `HOME` path. Filesystem, Git, or policy errors
+refuse the commit with diagnostics rather than silently disabling the guard.
+
 The generated post-commit hook restores the index for the paths the commit just wrote. `git commit --only -- <paths>` is
 a partial commit: git stages those paths from the working tree into the real index, locks it, and builds the commit from
 a separate throwaway index it hands the pre-commit hook. The formatter's rewrite therefore reaches the commit and the
@@ -598,6 +613,10 @@ smoo monorepo validate-commit-msg --fix <commit-msg-file>
 This keeps hook behavior consistent with CI and avoids duplicating commit message parsing in shell. With `--fix`, smoo
 wraps prose body paragraphs through `fmt -w 72` while preserving fenced code blocks, quoted markdown, indented blocks,
 bullets, trailers, URLs, and comment lines.
+
+After conventional formatting, the commit-msg hook runs
+`smoo monorepo check-public-denylist --commit-message <commit-msg-file>` with the same sibling and `HOME` rules. It
+reports offending message lines before refusing the commit, so private references cannot enter new history.
 
 The generated pre-push hook runs two gates. The first runs on every OS and guards a public repository against naming
 what is private to the people working on it:
