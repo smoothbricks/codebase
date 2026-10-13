@@ -98,7 +98,7 @@ OpMetadata (object) - ONE per Op, injected by transformer
 
 LogBinding (object) - ONE per defineOpContext() call
 ├── logSchema: LogSchema (tag attribute definitions)
-└── remappedViewClass?: RemappedViewConstructor (for prefixed libraries)
+└── remapDescriptor?: RemapDescriptor (prefixed/remapped libraries; read at Arrow conversion)
 
 Tracer (abstract class) - ONE per application/test
 ├── binding: OpContextBinding (from defineOpContext)
@@ -111,7 +111,7 @@ SpanBuffer - ONE per span (internal)
 ├── _opMetadata: OpMetadata        ← THIS OP's metadata (for rows 1+)
 ├── message_values[0]: string      ← span name written by writeSpanStart()
 ├── _parent?: SpanBuffer           ← reference to parent
-├── _children: SpanBuffer[]        ← child spans
+├── _nodeIndex: number             ← node in _traceRoot._topology (child links live there)
 ├── _scopeValues: Record<string, unknown> ← scope values for this span
 ├── timestamp: BigInt64Array       ← nanosecond timestamps
 ├── entry_type: Uint8Array         ← entry type enum
@@ -266,7 +266,10 @@ trace('create-user', { env, requestId }, createUserOp, userData) creates:
 - `span(name, op, ...args)`: Invoke an op as a child span
 - `log`: SpanLogger for info/debug/warn/error
 - `tag`: TagWriter for span attributes
-- `deps`: Bound dependency ops (can be destructured: `const { retry } = deps`)
+- `deps`: Bound dependency ops (can be destructured: `const { retry } = deps`). Every span of a trace shares the root's
+  deps, so the root `defineOpContext` must wire, under the same key, a compatible group for every dep that any included
+  group declares, transitively. A missing or incompatible dep is a type error at the root wiring, never an `undefined`
+  read at runtime ([Library Integration](./01e_library_integration_pattern.md)).
 - `ff`: Feature flag evaluator bound to current span's buffer
 - User context properties (e.g., `env`, `requestId`, `userId` - defined via `ctx` in `defineOpContext()`)
 
@@ -396,118 +399,54 @@ The `Op<Ctx, Args, Result>` type parameters match the function signature order:
 
 ```typescript
 class Op<Ctx, Args extends unknown[], Result> {
-  constructor(
-    readonly name: string, // For Op metrics (invocations, errors, duration)
-    readonly metadata: OpMetadata, // For git_sha/package_name/package_file attribution (THIS op)
-    readonly logBinding: LogBinding, // LogBinding with schema and capacity stats
-    private fn: (ctx: Ctx, ...args: Args) => Promise<Result>
-  ) {}
+  readonly metadata: OpMetadata; // Op name + git_sha/package_name/package_file/line attribution (THIS op)
+  readonly callsitePlan: CallsitePlan; // Sealed startup plan: SpanBufferClass (owns SpanBufferClass.stats),
+  //                                      SpanContextClass, layout, remapDescriptor
+  readonly fn: (ctx: SpanContext<Ctx>, ...args: Args) => Result;
+}
+```
 
-  /**
-   * Internal invocation - called by span()
-   * @param parentSpanContext - The parent SpanContext (root context for first-level spans)
-   * @param parentBuffer - Parent span's buffer (null for root)
-   * @param _callsiteMetadata - The CALLER's metadata (where span() was invoked) - for row 0 attribution
-   * @param spanName - Name decided by caller
-   * @param lineNumber - Line number where span() was called (injected by transformer)
-   * @param args - User arguments to the op
-   */
-  /**
-   * NOTE: This is pseudo-code for illustration. The implementation is in:
-   * - Root spans: Tracer._createRootContext(); _executeResultWithContext() and _executeUnknownWithContext() (tracer.ts)
-   * - Child spans: SpanContextInstance._spanPre() and span0-span8 methods (spanContext.ts)
-   *
-   * The flow below shows the CONCEPTUAL structure. The implementation arranges the steps as follows:
-   * - Root spans create TraceRoot BEFORE createSpanBuffer (in Tracer)
-   * - Child spans use createChildSpanBuffer with SpanBufferClass from Op
-   * - Ok/Err detection happens in execution wrappers
-   * - Context setup happens via SpanContext class factory pattern
-   */
-  async _invoke(parentCtx: SpanContext | null, spanName: string, lineNumber: number, args: Args): Promise<Result> {
-    // 1. Create SpanBuffer - ROOT vs CHILD differ in TraceRoot creation:
-    let buffer: SpanBuffer;
+An `Op` carries data only. The span lifecycle lives in the Tracer for root spans and in `SpanContext` for child spans,
+and both run the same three steps.
 
-    if (!parentCtx) {
-      // ROOT SPAN (in Tracer.trace):
-      // TraceRoot created FIRST with trace_id, anchors, tracer reference
-      const traceRoot: TraceRoot = {
-        trace_id: generateTraceId(), // or from overrides for distributed tracing
-        anchorEpochNanos: BigInt(Date.now()) * 1_000_000n,
-        anchorPerfNow: process.hrtime?.bigint() ?? performance.now(),
-        tracer: this, // Reference to Tracer instance
-      };
+**1. Start.** Create the buffer, write row 0, and build the `SpanContext`. Root spans do this in
+`Tracer._createRootContext()`, which builds the `TraceRoot` (trace_id, anchors, tracer reference) before it calls
+`createSpanBuffer`. Child spans do it in `SpanContextInstance._spanPre()`:
 
-      // createSpanBuffer takes pre-built TraceRoot
-      buffer = createSpanBuffer(
-        schema,
-        spanName,
-        traceRoot, // Pre-built TraceRoot (NOT generated inside)
-        opMetadata, // OpMetadata for both callsite and op at root
-        capacity
-      );
-    } else {
-      // CHILD SPAN (in SpanContext.span):
-      // Extract TraceRoot from parent buffer (already exists)
-      // Use Op's SpanBufferClass for correct schema and shared stats
-      buffer = createChildSpanBuffer(
-        parentCtx._buffer, // Parent buffer provides TraceRoot via ._traceRoot
-        this.SpanBufferClass, // Op's buffer class (may have different schema)
-        spanName,
-        parentCtx._buffer._opMetadata, // Callsite metadata (WHO called span - for row 0)
-        this.metadata // Op metadata (WHICH op executes - for rows 1+)
-      );
+```typescript
+_spanPre(childCtx, line: number, name: string, callsitePlan: CallsitePlan): SpanContextInstance<Ctx> {
+  const childBuffer = tracer.bufferStrategy.createChildSpanBuffer(
+    this._spanBuffer, // Parent buffer: provides _traceRoot; the child is registered in _traceRoot._topology
+    this._spanBuffer._opMetadata, // Callsite metadata (WHO called span) - row 0
+    callsitePlan.metadata, // Op metadata (WHICH op executes) - rows 1+
+    callsitePlan.capacityTier,
+    callsitePlan.schema,
+    callsitePlan.SpanBufferClass // Op's buffer class (may have a different schema than the parent)
+  );
+  childBuffer._remapDescriptor = callsitePlan.remapDescriptor ?? undefined; // Prefixed ops; read by the tree walk
+  childBuffer._appenders.writeSpanStart(childBuffer, name); // Row 0 span-start; row 1 pre-initialized as span-exception
+  childBuffer.line(0, line); // Line number written directly to row 0
+  return new callsitePlan.SpanContextClass(childBuffer, callsitePlan.schema, callsitePlan, childCtx, undefined, this.deps, ff);
+}
+```
 
-      // Register with parent (wrap in RemappedBufferView if Op has prefix)
-      const view = this.remappedViewClass ? new this.remappedViewClass(buffer) : buffer;
-      parentCtx._buffer._children.push(view);
-    }
+**2. Run and 3. complete.** The `span0`-`span8` methods (child) and `_executeResultWithContext()` (root) call the
+function and write the span-end entry to row 1 for every completion (01l "Entry Type Detection"):
 
-    // 2. Write span-start entry (row 0) and pre-initialize row 1 as span-exception
-    writeSpanStart(buffer, spanName);
-    buffer.line(0, lineNumber); // Write line number to row 0
-
-    // 3. Create SpanContext instance
-    // In real code: SpanContextClass is created via createSpanContextClass(schema, logBinding)
-    // and instantiated with direct arguments (no temp object allocation)
-    const tagWriter = createTagWriter(schema, buffer);
-    const spanLogger = createSpanLogger(schema, buffer);
-    const spanCtx = new SpanContextClass(buffer, schema, spanLogger, tagWriter);
-
-    // Set up deps, ff, and user context properties
-    spanCtx.deps = this.deps;
-    spanCtx.ff = this.flagEvaluator?.forContext(spanCtx) ?? {};
-    Object.assign(spanCtx, resolvedUserCtx); // Spread user context (env, etc.)
-
-    // 4. Execute function with Ok/Err detection
-    // Tracer calls onSpanStart/onSpanEnd hooks for lifecycle events
-    try {
-      const result = await this.fn(spanCtx, ...args);
-
-      // If result is Ok/Err (from ctx.ok()/ctx.err()),
-      // entry type was already written by constructor. Skip overwriting.
-      if (!(result instanceof Ok || result instanceof Err)) {
-        // Fallback: write span-ok to row 1 for non-FluentResult returns
-        buffer.entry_type[1] = ENTRY_TYPE_SPAN_OK;
-        buffer.timestamp[1] = getTimestampNanos(buffer._traceRoot.anchorEpochNanos, buffer._traceRoot.anchorPerfNow);
-      }
-
-      return result;
-    } catch (error) {
-      // Write span-exception to row 1
-      buffer.entry_type[1] = ENTRY_TYPE_SPAN_EXCEPTION;
-      buffer.timestamp[1] = getTimestampNanos(buffer._traceRoot.anchorEpochNanos, buffer._traceRoot.anchorPerfNow);
-
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      const errorStack = error instanceof Error ? error.stack : undefined;
-
-      buffer.message(1, errorMessage);
-      if (errorStack) {
-        buffer.exception_stack(1, errorStack);
-      }
-
-      throw error;
-    }
-  }
+```typescript
+const ctx = this._spanPre(childCtx, line, name, op.callsitePlan);
+const buffer = ctx._spanBuffer;
+tracer.onSpanStart(buffer);
+try {
+  const result = await executeWithRetryN(buffer, op.fn, ctx, ...args); // Retries a TransientError per its policy
+  writeSpanEnd(buffer, result); // span-ok or span-err, timestamp, and error_code to row 1
+  return result;
+} catch (error) {
+  // Thrown errors, and the TypeError raised for a non-Result return or an Ok/Err owned by another context
+  ctx._spanException(buffer, error); // span-exception, message, and exception_stack to row 1
+  throw error;
+} finally {
+  tracer.onSpanEnd(buffer);
 }
 ```
 
@@ -550,7 +489,7 @@ type SpanContext<Ctx extends OpContext> = {
 
   // Result helpers
   ok<S>(value: S): OkResult<S, Ctx['logSchema']>;
-  err<E>(code: string, data?: E): ErrResult<E>;
+  err<E>(error: E): ErrResult<E, Ctx['logSchema']>;
 
   // Scoped attributes (read-only view)
   scope: Readonly<Partial<InferSchema<Ctx['logSchema']>>>;
@@ -611,7 +550,7 @@ const createUser = defineOp('createUser', async (ctx, userData: UserData) => {
   // Validate via child span
   const valid = await ctx.span('validate', validateUser, userData);
   if (!valid.success) {
-    return ctx.err('VALIDATION_FAILED');
+    return ctx.err(valid.error);
   }
 
   // Save via child span
@@ -628,10 +567,11 @@ const createUser = defineOp('createUser', async (ctx, userData: UserData) => {
 2. **Name provided by caller**: The span name - caller decides contextually
 3. **Op provided by caller**: The Op instance to invoke
 4. **Args passed through**: Remaining arguments go to the op function
-5. **lineNumber written directly**: Written to `line_values[0]` inside \_invoke() (NO intermediate object storage)
+5. **lineNumber written directly**: Written to `line_values[0]` inside `_spanPre()` (NO intermediate object storage)
 6. **SpanBuffer created with \_callsiteMetadata**: `_callsiteMetadata` for row 0's metadata, `metadata` for rows 1+
-7. **Buffer linking**: Child buffer registered with parent's children array
-8. **RemappedBufferView**: If op has prefix, view maps prefixed columns for Arrow
+7. **Buffer linking**: Child buffer registered in the trace topology (`_traceRoot._topology.registerChild`)
+8. **RemapDescriptor**: If op has prefix, the callsite plan's descriptor is attached to the child buffer and maps
+   prefixed columns for Arrow
 
 ### Example: Multiple Child Spans
 
@@ -794,7 +734,7 @@ const createUser = opContext.defineOp('createUser', async (ctx, userData: UserDa
   const validated = await ctx.span('validate', validateUser, userData);
   if (!validated.success) {
     ctx.log.warn('Validation failed');
-    return ctx.err('VALIDATION_FAILED', validated.error);
+    return ctx.err(validated.error);
   }
 
   const user = await ctx.span('save', saveUser, userData);
@@ -912,7 +852,7 @@ await trace('process-order', { env: myEnv }, processOrder, order);
 
 - **Shared references**: OpMetadata and deps shared across all ops
 - **Direct buffer access**: TagWriter/SpanLogger hold buffer reference directly
-- **Buffer management**: Self-tuning capacity per op context
+- **Buffer management**: Self-tuning capacity per generated span buffer class (`SpanBufferClass.stats`)
 
 ## Integration Points
 
@@ -948,7 +888,7 @@ await ctx.span(43, 'validate', validateUser, userData); // line number FIRST for
 
 **Row-based lineNumber storage:**
 
-- **Row 0 (span-start)**: lineNumber argument written directly to `line_values[0]` inside `_invoke()`
+- **Row 0 (span-start)**: lineNumber argument written directly to `line_values[0]` inside `_spanPre()` (child spans)
 - **Rows 1+ (logs, span-ok/err)**: lineNumber written to `line_values[writeIndex]` via `.line(N)` calls
 
 **SpanBuffer stores:**

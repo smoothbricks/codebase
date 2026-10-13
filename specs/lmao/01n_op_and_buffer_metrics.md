@@ -208,28 +208,28 @@ capacity tuning:
 ## Op Class Metrics Tracking <a id="smoo/lmao!n/op-metrics-collection"></a>
 
 The `Op` class maintains metrics counters that reset on each flush. Type parameters are ordered to match the function
-signature `(ctx, ...args) => Promise<Result>`:
+signature `(ctx, ...args) => Result`:
 
 ```typescript
-class Op<Ctx, Args extends unknown[], Result> {
-  readonly fn: (ctx: Ctx, ...args: Args) => Promise<Result>;
-  readonly module: Module;
-  readonly definitionLine?: number;
+class Op<Ctx extends OpContext, Args extends unknown[], S, E> {
+  readonly metadata: OpMetadata; // name, package_name, package_file, git_sha, line
+  readonly callsitePlan: CallsitePlan<Ctx['logSchema'], Ctx>;
+  readonly fn: (ctx: SpanContext<Ctx>, ...args: Args) => Result<S, E> | Promise<Result<S, E>>;
 
-  // Metrics (reset on flush)
-  private invocationCount: number = 0;
-  private errorCount: number = 0; // span-err outcomes
-  private exceptionCount: number = 0; // span-exception outcomes
+  // Metrics (reset on flush; written by the span envelope)
+  invocationCount: number = 0;
+  errorCount: number = 0; // span-err outcomes
+  exceptionCount: number = 0; // span-exception outcomes
 
   // Duration tracking (BigInt for nanosecond precision)
-  private totalDurationNs: bigint = 0n;
-  private okDurationNs: bigint = 0n;
-  private errDurationNs: bigint = 0n; // span-err + span-exception
-  private minDurationNs: bigint = BigInt(Number.MAX_SAFE_INTEGER);
-  private maxDurationNs: bigint = 0n;
+  totalDurationNs: bigint = 0n;
+  okDurationNs: bigint = 0n;
+  errDurationNs: bigint = 0n; // span-err + span-exception
+  minDurationNs: bigint = BigInt(Number.MAX_SAFE_INTEGER);
+  maxDurationNs: bigint = 0n;
 
   // Period tracking
-  private periodStartNs: bigint = hrtime.bigint();
+  periodStartNs: bigint = hrtime.bigint();
 }
 ```
 
@@ -239,42 +239,46 @@ class Op<Ctx, Args extends unknown[], Result> {
 - 9,007,199,254,740,991 ns = ~104 days
 - Summing many durations compounds quickly
 
-## Collecting Metrics (Inside Op's Invoke) <a id="smoo/lmao!n/op-metrics-collection.collecting-metrics-inside-ops-invoke"></a>
+## Collecting Metrics (In the Span Envelope) <a id="smoo/lmao!n/op-metrics-collection.collecting-metrics-inside-ops-invoke"></a>
+
+An `Op` holds no span logic: the tracer runs root spans and the SpanContext class runs child spans
+([Module Context](./01j_module_context_and_spanlogger_generation.md#smoo/lmao!n/op-class)). That span envelope updates
+the invoked op's counters around its existing span-start and span-end writes:
 
 ```typescript
-async invoke(parentCtx, spanName, line, ...args) {
-  this.invocationCount++;
+// Span envelope for `op` (root: Tracer; child: SpanContext span methods)
+op.invocationCount++;
 
-  // Buffer creation writes span-start timestamp to row 0
-  const buffer = createSpanBuffer(...);
-  const startTs = buffer.timestamp[0];  // Already captured!
+// Span setup writes the span-start timestamp to row 0
+const buffer = createSpanBuffer(...);
+const startTs = buffer.timestamp[0];  // Already captured!
 
-  try {
-    const result = await this.fn(ctx, ...args);
+try {
+  const result = await op.fn(ctx, ...args);
+  // writeSpanEnd writes the end timestamp to row 1 (span-ok, or span-err with op.errorCount++)
+  writeSpanEnd(buffer, result);
+  const endTs = buffer.timestamp[1];  // Already captured!
+  const durationNs = BigInt(endTs - startTs);
 
-    // span-ok writes end timestamp to row 1
-    const endTs = buffer.timestamp[1];  // Already captured!
-    const durationNs = BigInt(endTs - startTs);
+  op.totalDurationNs += durationNs;
+  op.okDurationNs += durationNs; // errDurationNs for span-err
+  if (durationNs < op.minDurationNs) op.minDurationNs = durationNs;
+  if (durationNs > op.maxDurationNs) op.maxDurationNs = durationNs;
 
-    this.totalDurationNs += durationNs;
-    this.okDurationNs += durationNs;
-    if (durationNs < this.minDurationNs) this.minDurationNs = durationNs;
-    if (durationNs > this.maxDurationNs) this.maxDurationNs = durationNs;
+  return result;
+} catch (e) {
+  op.exceptionCount++;
+  ctx._spanException(buffer, e); // Writes span-exception and the end timestamp to row 1
 
-    return result;
-  } catch (e) {
-    this.exceptionCount++;  // or errorCount for expected errors
+  const endTs = buffer.timestamp[1];
+  const durationNs = BigInt(endTs - startTs);
 
-    const endTs = buffer.timestamp[1];
-    const durationNs = BigInt(endTs - startTs);
+  op.totalDurationNs += durationNs;
+  op.errDurationNs += durationNs;
+  if (durationNs < op.minDurationNs) op.minDurationNs = durationNs;
+  if (durationNs > op.maxDurationNs) op.maxDurationNs = durationNs;
 
-    this.totalDurationNs += durationNs;
-    this.errDurationNs += durationNs;
-    if (durationNs < this.minDurationNs) this.minDurationNs = durationNs;
-    if (durationNs > this.maxDurationNs) this.maxDurationNs = durationNs;
-
-    throw e;
-  }
+  throw e;
 }
 ```
 
@@ -360,7 +364,7 @@ violate that convention).
 Users can write `uint64_value` for their own purposes using the `uint64_value()` method:
 
 ```typescript
-const processRecords = op(async ({ log, tag, ok }, records) => {
+const processRecords = defineOp('processRecords', async ({ log, tag, ok }, records) => {
   // Tag the span with a large count
   tag.batchId(batchId).uint64_value(BigInt(recordCount));
 
@@ -368,7 +372,7 @@ const processRecords = op(async ({ log, tag, ok }, records) => {
   log.info('Processing complete').uint64_value(BigInt(bytesProcessed));
 
   // Return with a large total
-  return ok({ success: true }).uint64_value(BigInt(totalRecords));
+  return ok({ processed: records.length }).uint64_value(BigInt(totalRecords));
 });
 ```
 
