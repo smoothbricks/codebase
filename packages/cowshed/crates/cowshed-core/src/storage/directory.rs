@@ -2,18 +2,23 @@
 //! runs over when a workspace is not a kernel volume.
 //!
 //! Every payload a native store keeps in an image - a workspace, a checkpoint, a staged
-//! restore, a retired workspace, a build volume - is here a real directory at exactly the path
-//! the layout gives that image. The payload never moves while it is mounted, so every path the
+//! restore, a retired workspace, a build volume - is here a real directory, found through
+//! exactly the path the layout gives that image. That path always exists, so every path the
 //! store's records, locks and recovery derive (`<image>.grants.json`, `<image>.ca.key`,
 //! `<image>.lock`, the trash and checkpoint grammars, a build volume's `<id>.dmg` and its hold)
 //! means the same thing it means for an image, and the production sidecar, marker, credential,
 //! lock and restore-recovery formats are used unchanged.
 //!
-//! Mounting is a symlink binding: the mountpoint becomes a symlink naming the payload directory,
-//! exchanged atomically with the empty directory an unmounted mountpoint is
-//! (`renameatx_np(RENAME_SWAP)`), and unmounting exchanges an empty directory back. The binding
-//! is the durable mount record: what the filesystem says is bound is what is mounted, across a
-//! crash or a restart, and nothing else claims a mount.
+//! Mounting puts the payload where a mounted volume's root is: the payload directory is renamed
+//! onto the mountpoint (the empty directory an unmounted mountpoint is, or no entry yet), and the
+//! image path becomes a symlink naming the mountpoint - the durable mount record. Everything that
+//! reaches the mounted tree resolves to the mountpoint itself: `getcwd`, `git rev-parse
+//! --show-toplevel` and Seatbelt's path rules see the checkout, never the store. Unmounting
+//! renames the payload back and leaves an empty mountpoint. A crash between a move's two steps
+//! leaves the payload at `<image>.cowshed-move` with the image path already naming the
+//! mountpoint; every operation on a payload first completes that move ([`settle`]). A payload
+//! moves by rename only, so the store and its mountpoints must share a filesystem; a mount across
+//! filesystems refuses.
 //!
 //! A directory is not a volume. Nothing here answers for a volume label, a device, a capacity, a
 //! read-only mount or an extent map: those requests are refused with
@@ -129,180 +134,307 @@ impl DirectoryAttachment {
 #[derive(Debug, Eq, PartialEq)]
 enum MountPointState {
     Absent,
-    /// An empty directory: an unmounted mountpoint.
+    /// An empty directory: an unmounted mountpoint, or a mounted payload with nothing in it.
     Vacant,
-    /// A symlink: a binding of whatever directory it names.
-    Bound(PathBuf),
-    /// Anything else: a non-empty directory, a file, a device. Never a mountpoint of ours.
+    /// A symbolic link. A directory store never puts one at a mountpoint.
+    Link,
+    /// Anything else: a directory with entries, a file, a device.
     Occupied,
 }
 
-fn mount_point_state(mount_point: &Path) -> Result<MountPointState, ApfsStorageError> {
-    let metadata = match fs::symlink_metadata(mount_point) {
+fn mount_point_state(path: &Path) -> Result<MountPointState, ApfsStorageError> {
+    let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             return Ok(MountPointState::Absent);
         }
-        Err(error) => return Err(io_error("inspect mountpoint", mount_point, error)),
+        Err(error) => return Err(io_error("inspect mountpoint", path, error)),
     };
     let file_type = metadata.file_type();
     if file_type.is_symlink() {
-        return fs::read_link(mount_point)
-            .map(MountPointState::Bound)
-            .map_err(|error| io_error("read mount binding", mount_point, error));
+        return Ok(MountPointState::Link);
     }
-    if file_type.is_dir() && empty_mountpoint(mount_point)? {
+    if file_type.is_dir() && empty_mountpoint(path)? {
         return Ok(MountPointState::Vacant);
     }
     Ok(MountPointState::Occupied)
 }
 
-/// The sibling a binding change stages its replacement entry under: `RENAME_SWAP` exchanges two
-/// entries of one filesystem, so it must sit beside the mountpoint.
-fn binding_sibling(mount_point: &Path, suffix: &str) -> PathBuf {
-    crate::metadata::append_suffix(mount_point, suffix)
+/// Where a payload is.
+#[derive(Debug, Eq, PartialEq)]
+enum Payload {
+    /// At its image path: not mounted.
+    Home,
+    /// At this mountpoint, which the image path's mount record names.
+    Mounted(PathBuf),
 }
 
-const BIND_SUFFIX: &str = ".cowshed-bind";
-const UNBIND_SUFFIX: &str = ".cowshed-unbind";
+const MOVE_SUFFIX: &str = ".cowshed-move";
 
-/// Clear a staging sibling a crash left: only a symlink or an empty directory, the only two
-/// things a binding change ever stages; anything else at that name is not ours and refuses.
-fn clear_binding_sibling(sibling: &Path) -> Result<(), ApfsStorageError> {
+/// The name beside its image path a payload passes through while it moves.
+fn move_sibling(image: &Path) -> PathBuf {
+    crate::metadata::append_suffix(image, MOVE_SUFFIX)
+}
+
+fn is_real_directory(path: &Path) -> Result<bool, ApfsStorageError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(metadata.file_type().is_dir()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(io_error("inspect payload", path, error)),
+    }
+}
+
+/// Clear the move sibling of `image`: only a stale mount record, the one thing a finished or
+/// rolled-back move can leave there. Anything else at that name refuses.
+fn clear_move_sibling(sibling: &Path) -> Result<(), ApfsStorageError> {
     match mount_point_state(sibling)? {
         MountPointState::Absent => Ok(()),
-        MountPointState::Bound(_) => fs::remove_file(sibling)
-            .map_err(|error| io_error("remove stale binding entry", sibling, error)),
-        MountPointState::Vacant => fs::remove_dir(sibling)
-            .map_err(|error| io_error("remove stale binding entry", sibling, error)),
-        MountPointState::Occupied => Err(ApfsStorageError::Host(format!(
-            "binding staging name {} holds something cowshed did not stage",
-            sibling.display()
-        ))),
+        MountPointState::Link => fs::remove_file(sibling)
+            .map_err(|error| io_error("remove stale mount record", sibling, error)),
+        MountPointState::Vacant | MountPointState::Occupied => Err(ApfsStorageError::Host(
+            format!(
+                "payload move name {} holds something cowshed did not leave there",
+                sibling.display()
+            ),
+        )),
     }
 }
 
-/// Bind `mount_point` to the payload directory `image`. Idempotent for an existing binding of
-/// the same payload; refuses a binding of anything else and any occupied path.
-fn bind(image: &Path, mount_point: &Path) -> Result<(), ApfsStorageError> {
-    require_payload_directory(image)?;
-    match mount_point_state(mount_point)? {
-        MountPointState::Bound(target) if target == image => Ok(()),
-        MountPointState::Bound(target) => Err(ApfsStorageError::Host(format!(
-            "mountpoint {} is already bound to {}",
-            mount_point.display(),
-            target.display()
-        ))),
-        MountPointState::Occupied => Err(ApfsStorageError::Host(format!(
-            "mountpoint {} is occupied: it is neither empty nor a binding",
+/// Where `image`'s payload is, after completing a move a crash interrupted.
+///
+/// A mount record whose mountpoint holds no directory, with no payload waiting beside it, names
+/// a payload that is gone: refused, never repaired by guessing.
+fn settle(image: &Path) -> Result<Payload, ApfsStorageError> {
+    let metadata = fs::symlink_metadata(image)
+        .map_err(|error| io_error("inspect payload", image, error))?;
+    let sibling = move_sibling(image);
+    if metadata.file_type().is_dir() {
+        // An unmount that died after its exchange leaves the old mount record beside the image.
+        if mount_point_state(&sibling)? == MountPointState::Link {
+            clear_move_sibling(&sibling)?;
+        }
+        return Ok(Payload::Home);
+    }
+    if !metadata.file_type().is_symlink() {
+        return Err(ApfsStorageError::Host(format!(
+            "payload is neither a directory nor a mount record: {}",
+            image.display()
+        )));
+    }
+    let mount_point = fs::read_link(image)
+        .map_err(|error| io_error("read mount record", image, error))?;
+    if !mount_point.is_absolute() {
+        return Err(ApfsStorageError::Host(format!(
+            "mount record {} names the relative path {}",
+            image.display(),
+            mount_point.display()
+        )));
+    }
+    if is_real_directory(&sibling)? {
+        // A mount stopped between its exchange and its rename, or an unmount between its rename
+        // and its exchange: the record names the mountpoint and the payload waits beside its
+        // image path. Finishing the mount is the one step both converge through.
+        match mount_point_state(&mount_point)? {
+            MountPointState::Absent | MountPointState::Vacant => {}
+            other => {
+                return Err(ApfsStorageError::Host(format!(
+                    "cannot finish moving {} onto {}: the mountpoint is {other:?}",
+                    sibling.display(),
+                    mount_point.display()
+                )));
+            }
+        }
+        fs::rename(&sibling, &mount_point)
+            .map_err(|error| io_error("finish mounting payload", &mount_point, error))?;
+        sync_parent_path(&mount_point)?;
+        sync_parent_path(image)?;
+    }
+    if !is_real_directory(&mount_point)? {
+        return Err(ApfsStorageError::Host(format!(
+            "mount record {} names {}, which holds no payload",
+            image.display(),
+            mount_point.display()
+        )));
+    }
+    Ok(Payload::Mounted(mount_point))
+}
+
+/// The directory `image`'s payload is at now: the image path, or the mountpoint it is mounted at.
+fn payload_root(image: &Path) -> Result<PathBuf, ApfsStorageError> {
+    Ok(match settle(image)? {
+        Payload::Home => image.to_owned(),
+        Payload::Mounted(mount_point) => mount_point,
+    })
+}
+
+/// Refuse unless `image`'s payload is at its image path: renaming a mount record into the
+/// trash or an undo generation would move a symlink and leave the payload behind.
+fn require_home(image: &Path) -> Result<(), ApfsStorageError> {
+    match settle(image)? {
+        Payload::Home => Ok(()),
+        Payload::Mounted(mount_point) => Err(ApfsStorageError::Host(format!(
+            "{} is still mounted at {}",
+            image.display(),
             mount_point.display()
         ))),
-        MountPointState::Absent => {
-            let parent = mount_point
-                .parent()
-                .ok_or(ApfsStorageError::InvalidPlan("mountpoint has no parent"))?;
-            fs::create_dir_all(parent)
-                .map_err(|error| io_error("create mountpoint parent", parent, error))?;
-            let staged = binding_sibling(mount_point, BIND_SUFFIX);
-            clear_binding_sibling(&staged)?;
-            symlink_dir(image, &staged)?;
-            if let Err(error) = fs::rename(&staged, mount_point) {
-                let primary = io_error("publish mount binding", mount_point, error);
-                return combine_cleanup(
-                    "publish mount binding",
-                    primary,
-                    fs::remove_file(&staged)
-                        .map_err(|error| io_error("remove staged binding", &staged, error)),
-                );
-            }
-            sync_parent_path(mount_point)
-        }
-        MountPointState::Vacant => {
-            let staged = binding_sibling(mount_point, BIND_SUFFIX);
-            clear_binding_sibling(&staged)?;
-            symlink_dir(image, &staged)?;
-            if let Err(primary) = swap_paths(mount_point, &staged) {
-                return combine_cleanup(
-                    "publish mount binding",
-                    primary,
-                    fs::remove_file(&staged)
-                        .map_err(|error| io_error("remove staged binding", &staged, error)),
-                );
-            }
-            // The swap left the vacant directory at the staged name.
-            fs::remove_dir(&staged)
-                .map_err(|error| io_error("remove displaced mountpoint", &staged, error))?;
-            sync_parent_path(mount_point)
-        }
     }
 }
 
-/// Unbind `mount_point` from `image`, leaving the empty directory an unmounted mountpoint is.
-/// Nothing bound there is nothing to unbind; a binding of anything else refuses.
-fn unbind(image: &Path, mount_point: &Path) -> Result<(), ApfsStorageError> {
+/// Mount `image`'s payload at `mount_point`. Idempotent where it is already mounted; refuses a
+/// payload mounted elsewhere, an occupied mountpoint and a mountpoint on another filesystem.
+fn bind(image: &Path, mount_point: &Path) -> Result<(), ApfsStorageError> {
+    if !mount_point.is_absolute() {
+        return Err(ApfsStorageError::InvalidPlan("mountpoint is not absolute"));
+    }
+    match settle(image)? {
+        Payload::Mounted(current) if current == mount_point => return Ok(()),
+        Payload::Mounted(current) => {
+            return Err(ApfsStorageError::Host(format!(
+                "{} is already mounted at {}",
+                image.display(),
+                current.display()
+            )));
+        }
+        Payload::Home => {}
+    }
+    let parent = mount_point
+        .parent()
+        .ok_or(ApfsStorageError::InvalidPlan("mountpoint has no parent"))?;
     match mount_point_state(mount_point)? {
-        MountPointState::Absent | MountPointState::Vacant | MountPointState::Occupied => Ok(()),
-        MountPointState::Bound(target) if target != image => Err(ApfsStorageError::Host(format!(
-            "refusing to unbind {}: it binds {}, not {}",
-            mount_point.display(),
-            target.display(),
-            image.display()
-        ))),
-        MountPointState::Bound(_) => {
-            let staged = binding_sibling(mount_point, UNBIND_SUFFIX);
-            clear_binding_sibling(&staged)?;
-            fs::create_dir(&staged)
-                .map_err(|error| io_error("stage vacant mountpoint", &staged, error))?;
-            if let Err(primary) = swap_paths(mount_point, &staged) {
-                return combine_cleanup(
-                    "release mount binding",
-                    primary,
-                    fs::remove_dir(&staged)
-                        .map_err(|error| io_error("remove staged mountpoint", &staged, error)),
-                );
-            }
-            // The swap left the binding at the staged name; it is a symlink, never followed.
-            match mount_point_state(&staged)? {
-                MountPointState::Bound(target) if target == image => fs::remove_file(&staged)
-                    .map_err(|error| io_error("remove released binding", &staged, error))?,
-                other => {
-                    return Err(ApfsStorageError::Host(format!(
-                        "released binding at {} is not the binding of {}: {other:?}",
-                        staged.display(),
-                        image.display()
-                    )));
-                }
-            }
-            sync_parent_path(mount_point)
+        MountPointState::Absent => fs::create_dir_all(parent)
+            .map_err(|error| io_error("create mountpoint parent", parent, error))?,
+        MountPointState::Vacant => {}
+        MountPointState::Link => {
+            return Err(ApfsStorageError::Host(format!(
+                "mountpoint {} is a symbolic link",
+                mount_point.display()
+            )));
+        }
+        MountPointState::Occupied => {
+            return Err(ApfsStorageError::Host(format!(
+                "mountpoint {} is occupied: it is not an empty directory",
+                mount_point.display()
+            )));
         }
     }
+    let store_device = fs::symlink_metadata(image)
+        .map_err(|error| io_error("inspect payload", image, error))?
+        .dev();
+    let mount_device = fs::metadata(parent)
+        .map_err(|error| io_error("inspect mountpoint parent", parent, error))?
+        .dev();
+    if store_device != mount_device {
+        return Err(ApfsStorageError::Host(format!(
+            "cannot mount {} at {}: a directory payload moves onto its mountpoint by rename, and \
+             the store and the mountpoint are on different filesystems",
+            image.display(),
+            mount_point.display()
+        )));
+    }
+    let sibling = move_sibling(image);
+    clear_move_sibling(&sibling)?;
+    std::os::unix::fs::symlink(mount_point, &sibling)
+        .map_err(|error| io_error("create mount record", &sibling, error))?;
+    // One exchange makes the image path the mount record and puts the payload beside it...
+    if let Err(primary) = swap_paths(image, &sibling) {
+        return combine_cleanup(
+            "record mount",
+            primary,
+            fs::remove_file(&sibling)
+                .map_err(|error| io_error("remove unused mount record", &sibling, error)),
+        );
+    }
+    // ...and one rename puts it on the mountpoint, replacing the empty directory there.
+    if let Err(error) = fs::rename(&sibling, mount_point) {
+        let primary = io_error("mount payload", mount_point, error);
+        let rollback = swap_paths(image, &sibling).and_then(|()| {
+            fs::remove_file(&sibling)
+                .map_err(|error| io_error("remove unused mount record", &sibling, error))
+        });
+        return combine_cleanup("mount payload", primary, rollback);
+    }
+    sync_parent_path(mount_point)?;
+    sync_parent_path(image)
 }
 
-fn symlink_dir(target: &Path, link: &Path) -> Result<(), ApfsStorageError> {
-    std::os::unix::fs::symlink(target, link)
-        .map_err(|error| io_error("create mount binding", link, error))
-}
-
-/// `image` is a real directory: not a symlink, not a file.
-fn require_payload_directory(image: &Path) -> Result<(), ApfsStorageError> {
-    let metadata = fs::symlink_metadata(image)
-        .map_err(|error| io_error("inspect payload directory", image, error))?;
-    if metadata.file_type().is_dir() {
-        Ok(())
-    } else {
-        Err(ApfsStorageError::Host(format!(
-            "payload is not a directory: {}",
-            image.display()
-        )))
+/// Unmount `image`'s payload from `mount_point`. Not mounted is nothing to do; mounted
+/// elsewhere refuses.
+fn unbind(image: &Path, mount_point: &Path, intent: DetachIntent) -> Result<(), ApfsStorageError> {
+    match settle(image)? {
+        Payload::Home => Ok(()),
+        Payload::Mounted(current) if current != mount_point => {
+            Err(ApfsStorageError::Host(format!(
+                "refusing to unmount {} from {}: it is mounted at {}",
+                image.display(),
+                mount_point.display(),
+                current.display()
+            )))
+        }
+        Payload::Mounted(_) => move_home(image, mount_point, intent),
     }
 }
 
-/// Bytes allocated to the tree at `root`, from an `lstat` walk: symlinks are counted, never
-/// followed, and an inode reachable by several names (a hard link) is counted once. A clone
-/// shares blocks with its source on a copy-on-write filesystem; like `st_blocks`, this reports
-/// each file's own allocation, not unique host blocks.
-pub(crate) fn allocated_tree_bytes(root: &Path) -> io::Result<u64> {
-    tree_usage(root).map(|usage| usage.allocated)
+/// Unmount `image`'s payload from wherever it is mounted.
+fn release_mount(image: &Path, intent: DetachIntent) -> Result<(), ApfsStorageError> {
+    match settle(image)? {
+        Payload::Home => Ok(()),
+        Payload::Mounted(mount_point) => move_home(image, &mount_point, intent),
+    }
+}
+
+/// Move a mounted payload back to its image path and leave the empty directory an unmounted
+/// mountpoint is. A mountpoint keeps no process out of a directory: whoever is inside the tree
+/// moves with it. So `WhenIdle` refuses, naming them, while any process holds anything in the
+/// tree - the refusal an unforced unmount of a busy volume gives - and `Release` goes ahead.
+fn move_home(image: &Path, mount_point: &Path, intent: DetachIntent) -> Result<(), ApfsStorageError> {
+    if intent == DetachIntent::WhenIdle {
+        let open = crate::build_volume::nx::tree_holders(mount_point)
+            .map_err(|error| io_error("list the processes holding a payload", mount_point, error))?;
+        if !open.is_empty() {
+            return Err(ApfsStorageError::Host(format!(
+                "{} is in use and stays mounted: {open:?}",
+                mount_point.display()
+            )));
+        }
+    }
+    let sibling = move_sibling(image);
+    clear_move_sibling(&sibling)?;
+    fs::rename(mount_point, &sibling)
+        .map_err(|error| io_error("unmount payload", mount_point, error))?;
+    if let Err(primary) = swap_paths(image, &sibling) {
+        let rollback = fs::rename(&sibling, mount_point)
+            .map_err(|error| io_error("remount payload", mount_point, error));
+        return combine_cleanup("unmount payload", primary, rollback);
+    }
+    // The exchange left the mount record at the sibling; it is a symlink, never followed.
+    fs::remove_file(&sibling)
+        .map_err(|error| io_error("remove released mount record", &sibling, error))?;
+    fs::create_dir(mount_point)
+        .map_err(|error| io_error("leave an empty mountpoint", mount_point, error))?;
+    sync_parent_path(mount_point)?;
+    sync_parent_path(image)
+}
+
+/// The identity of the mount of `image`: its mount record's inode, which every mount replaces,
+/// as a remount replaces a kernel mount id.
+fn binding_id(image: &Path) -> Result<u64, ApfsStorageError> {
+    fs::symlink_metadata(image)
+        .map(|metadata| metadata.ino())
+        .map_err(|error| io_error("inspect mount record", image, error))
+}
+
+/// Bytes allocated to the payload at `image`, from an `lstat` walk: symlinks inside are counted,
+/// never followed, and an inode reachable by several names (a hard link) is counted once. The
+/// one link followed is a mounted payload's mount record at `image` itself, which names where
+/// the payload is. A clone shares blocks with its source on a copy-on-write filesystem; like
+/// `st_blocks`, this reports each file's own allocation, not unique host blocks.
+pub(crate) fn allocated_tree_bytes(image: &Path) -> io::Result<u64> {
+    let root = if fs::symlink_metadata(image)?.file_type().is_symlink() {
+        fs::read_link(image)?
+    } else {
+        image.to_owned()
+    };
+    tree_usage(&root).map(|usage| usage.allocated)
 }
 
 #[derive(Clone, Copy, Debug, Default)]
