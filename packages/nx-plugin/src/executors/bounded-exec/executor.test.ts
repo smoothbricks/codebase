@@ -308,26 +308,20 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     }
 
     const workspace = await createWorkspace();
+    const ignoring = ignoresTerm(workspace.root);
     const calls: string[] = [];
     const killer: ProcessTreeKiller = {
       async kill(pid, signal) {
+        if (signal === 'SIGTERM') await ignoring.armed();
         calls.push(signal);
         process.kill(-pid, signal);
       },
     };
 
-    // `trap "" TERM` is a shell builtin, so the ignore disposition is in place
-    // within a few ms of `sh` starting and is inherited by `sleep`. The previous
-    // `node -e "process.on('SIGTERM', ...)"` needed p50 27.8ms just to reach
-    // handler-installed, against a 50ms timeout — 1.8x margin on an idle
-    // 18-core host, and none at all on a loaded or 3-core runner. When SIGTERM
-    // arrives first the child dies on the default disposition, the run settles,
-    // and the SIGKILL branch never executes, so `calls` is ['SIGTERM'] and the
-    // assertion below fails for a reason that has nothing to do with escalation.
     const result = await runBoundedExec(
       {
-        command: 'sh -c \'trap "" TERM; sleep 5\'',
-        timeoutMs: 250,
+        command: ignoring.command,
+        timeoutMs: 50,
         killAfterMs: 50,
       },
       workspace.context,
@@ -816,22 +810,24 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     if (process.platform === 'win32') return;
     const workspace = await createWorkspace();
     const directory = join(workspace.root, 'lost-during-timeout');
+    const ignoring = ignoresTerm(workspace.root);
     const calls: NodeJS.Signals[] = [];
     const result = await withPool(1, (pool) =>
       runBoundedExec(
         {
-          command: 'sh -c \'trap "" TERM; sleep 5\'',
-          timeoutMs: 250,
+          command: ignoring.command,
+          timeoutMs: 50,
           killAfterMs: 50,
         },
         { ...workspace.context, record: { task: { id: 'lost-during-timeout', hash: null }, directory } },
         {
           async kill(pid, signal) {
-            calls.push(signal);
             if (signal === 'SIGTERM') {
+              await ignoring.armed();
               const closed = await pool.close();
               if (!closed.ok) throw new Error(closed.error);
             }
+            calls.push(signal);
             await createProcessTreeKiller().kill(pid, signal);
           },
         },
@@ -1045,6 +1041,24 @@ async function readToEnd(path: string): Promise<string> {
   } finally {
     await handle.close();
   }
+}
+
+/**
+ * A command that ignores SIGTERM, a disposition its `sleep` inherits, and `armed`, which resolves once it does. A
+ * killer that awaits `armed` before the graceful signal sends it to a command that cannot die of it: a bound that fires
+ * before the command's shell has even run `trap` (a 250 ms timer lost that race in a loaded gate) ends it on the
+ * default disposition, and the escalation under test never runs. The command's FIFO write waits for the reader, so
+ * the announcement can neither precede the trap nor be missed.
+ */
+function ignoresTerm(root: string): { command: string; armed: () => Promise<void> } {
+  const fifo = join(root, 'armed.fifo');
+  expect(spawnSync('mkfifo', [fifo]).status).toBe(0);
+  return {
+    command: `sh -c 'trap "" TERM; echo armed > "$0"; exec sleep 5' '${fifo}'`,
+    armed: async () => {
+      expect(await readToEnd(fifo)).toBe('armed\n');
+    },
+  };
 }
 
 async function createWorkspace(): Promise<WorkspaceFixture> {
