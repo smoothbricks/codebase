@@ -80,7 +80,7 @@ pub fn invoked_as_cargo() -> bool {
 
 /// Run as `cargo`: the process exit code.
 pub fn run(arguments: &[OsString]) -> i32 {
-    let socket = PathBuf::from(cowshed_core::storage::bootstrap::STORE_ROOT).join("gateway.sock");
+    let socket = cowshed_gateway_types::control_socket_path();
     run_at(arguments, &socket)
 }
 
