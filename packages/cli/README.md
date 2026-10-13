@@ -432,10 +432,10 @@ smoo monorepo diff
 
 `check` fails when a managed file is missing or stale, and when a package policy fails (the devenv profile's Go against
 the Go SDK ttsc vendors, root package, Nx names and release config, public tags and metadata, test locations, workspace
-dependencies, the devenv import, the Cargo cache and toolchain policies, and, where `packages/cowshed` exists, the
-sccache patches). `check --warn` reports managed-file drift as warnings instead — CI runs it on every event and, on a
-default-branch push, dispatches the managed-files workflow to heal the drift — while a policy failure still fails it,
-because nothing heals one. `diff` reports drift without writing files.
+dependencies, the devenv import and release lock, the Cargo cache and toolchain policies, and, where `packages/cowshed`
+exists, the sccache patches). `check --warn` reports managed-file drift as warnings instead — CI runs it on every event
+and, on a default-branch push, dispatches the managed-files workflow to heal the drift — while a policy failure still
+fails it, because nothing heals one. `diff` reports drift without writing files.
 
 The generated publish workflow is canonical Prettier YAML. Running the repository formatter over
 `.github/workflows/publish.yml` is byte-stable and does not create managed-file drift.
@@ -883,7 +883,15 @@ hit, re-evaluating when garbage collection removed them.
 
 The bootstrap script is intentionally small. It only handles work required before `smoo` can run in GitHub Actions:
 
-- Install `devenv`, held to `devenv.lock`'s rev on an ephemeral runner.
+- Install `devenv`, held to `devenv.lock`'s rev on an ephemeral runner. `check` requires that rev to be a devenv release
+  whose build the binary cache keeps: the lock's `devenv` node must record `latest` or a tag from `v2.0.4` on, and no
+  `rev` beside it. `devenv.yaml` declares that as `inputs.devenv.url: github:cachix/devenv/v2.3.1?dir=src/modules` (a
+  `git+https` URL names the tag `ref=refs/tags/v2.3.1`). devenv.cachix.org has pinned the `aarch64-darwin`,
+  `aarch64-linux` and `x86_64-linux` builds of every release from `v2.0.4` on for good, and the `x86_64-darwin` builds
+  up to `v2.1.2`: from `v2.2` on devenv builds nothing for `x86_64-darwin`, so an Intel macOS runner cannot install
+  those releases at all. Some older tags, such as `v2.0.3`, have no pin, and their builds are already gone. An
+  undeclared input locks devenv's main instead, and the cache drops such a build after about six weeks, after which
+  every cold runner compiles devenv from source.
 - Build the devenv shell and add repo-local tooling to `GITHUB_PATH`.
 
 ### Deploy configuration (`package.json` → `smoo.github`)

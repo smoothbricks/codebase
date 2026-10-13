@@ -18,11 +18,20 @@ add_repo_paths() {
 }
 
 # The CLI that evaluates the shell must be the commit whose modules the shell is
-# locked to. devenv writes its own source rev into devenv.lock's `devenv` node,
-# so the lock already names one coherent pair (CLI 2.3.1+190959a evaluating the
-# 190959a modules) and nothing here restates it. Note `original` carries no rev:
-# that node is HEAD-at-lock-time rather than a release tag, so this pin buys
-# coherence, not blessing.
+# locked to, so this installs the commit devenv.lock's `devenv` node names and
+# nothing here restates it. `smoo monorepo check` holds that node to a release:
+# its `original.ref` is `latest` or a tag from v2.0.4 on, which devenv.yaml
+# declares as `github:cachix/devenv/v2.3.1?dir=src/modules`. devenv.cachix.org
+# has pinned the aarch64-darwin, aarch64-linux and x86_64-linux builds of every
+# release from v2.0.4 on for good, so on those three systems the install
+# substitutes rather than compiles. From v2.2 on devenv builds nothing for
+# x86_64-darwin, so on an Intel macOS runner installing such a release fails
+# rather than compiles; there only v2.0.4 to v2.1.2 are pinned. Some older tags,
+# such as v2.0.3, have no pin, and their builds are already gone. An input
+# nobody declared locks devenv's main as it was that minute, and the cache drops
+# such a build after about six weeks, after which every cold runner compiles
+# devenv from source (a build of main commit 4ed83c00, which reported 2.1.3 but
+# was never tagged, was pushed on 2026-07-15 and was gone by 2026-10-13).
 #
 # An unpinned `github:cachix/devenv` instead installs whatever HEAD is on the day
 # a cold runner misses the store cache — a version that moves with no commit
