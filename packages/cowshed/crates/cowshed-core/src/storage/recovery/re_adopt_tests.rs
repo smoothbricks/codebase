@@ -323,9 +323,10 @@ fn retained_input_refuses_an_unrecorded_path() {
             .iter()
             .flat_map(|seed| [&seed.original, &seed.retained]),
     ) {
-        source
+        let input = source
             .retained_input(path)
             .expect("recorded original and retained paths are inputs");
+        assert_eq!(input.path(), path);
     }
     let unrecorded = fixture.project.join("unrecorded.dmg");
     let error = source

@@ -1133,13 +1133,11 @@ pub trait RetainedInputs {
 /// A path named by a validated explicit re-adoption record, not another runtime image format.
 /// Ordinary operations still accept only RAW. This token enables identity inspection and
 /// read-only retained attachment, never image creation or growth.
-#[cfg(any(target_os = "macos", test))]
 #[derive(Clone, Copy, Debug)]
 pub struct RetainedInput<'a> {
     path: &'a Path,
 }
 
-#[cfg(any(target_os = "macos", test))]
 impl<'a> RetainedInput<'a> {
     /// `path` as a retained input, or `None` when `record` does not name it.
     pub fn named_by(record: &impl RetainedInputs, path: &'a Path) -> Option<Self> {

@@ -15,6 +15,10 @@ namespaces is a later platform goal; [zfs.md](zfs.md) records that contract but 
 | macOS    | APFS image per workspace        | Current implementation and integration target |
 | Linux    | ZFS dataset clone per workspace | Subsequent Linux goal                         |
 
+The workspace and test targets must still compile on Linux. Pure retained-input path witnesses are available across
+crate boundaries on every platform; disk-image attachment, native port allocation, and Darwin process-argument
+diagnostics remain macOS-only. From the repository root, `bun run check:linux` checks the full Linux target surface.
+
 ```sh
 $ cd ~/src/api
 $ cowshed new raven --json
