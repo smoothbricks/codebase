@@ -194,12 +194,16 @@ function metadataNamed(root: string, name: string) {
     packages: [
       {
         id: name,
+        name,
+        version: '0.1.0',
         source: null,
         manifest_path: join(workspace, 'crates/leaf/Cargo.toml'),
         targets: [{ src_path: join(workspace, 'crates/leaf/src/lib.rs') }],
       },
       {
         id: 'external',
+        name: 'external',
+        version: '0.1.0',
         source: null,
         manifest_path: join(root, 'external/Cargo.toml'),
         targets: [{ src_path: join(root, 'external/src/lib.rs') }],

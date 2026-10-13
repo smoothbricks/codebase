@@ -381,6 +381,12 @@ same literal data bytes. Inferred `napi-*` and repository-root `cargo-wasm` buil
 every Rust file in the workspace, while retaining their toolchain pins, wrapper scripts, N-API configuration and CLI
 version.
 
+Runtime file identities are rooted in Cargo package name/version and the declared input role, not in the consuming
+checkout's absolute path or depth. Source paths are package-relative; compiled-in data keeps its declaring source and
+literal path as its identity. Identical main/shed inputs therefore share a key, while changed bytes, module names and
+symlink targets still move it. Shared bytes are read once, and all identities are sorted before hashing. The Cargo
+resolution memo schema retains package names/versions; refreshing that memo does not reset the Nx task database.
+
 Members the file index cannot hold, outside the Nx workspace or under `node_modules`, are hashed by one runtime
 `smoo-nx-cargo-hash --closure <projectRoot> <Cargo.toml>` entry, present only while such members exist. Its cached
 resolution checks external manifests too, so a dependency introduced by an external manifest edit is still covered.

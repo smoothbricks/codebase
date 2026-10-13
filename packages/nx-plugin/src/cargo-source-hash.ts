@@ -31,6 +31,8 @@ const cargoResolveEvents = channel('@smoothbricks/nx-plugin:cargo-resolve');
 interface CargoMetadata {
   packages: {
     id: string;
+    name: string;
+    version: string;
     source: string | null;
     manifest_path: string;
     targets: { src_path: string }[];
@@ -63,6 +65,8 @@ function parseCargoMetadata(json: string): CargoMetadata {
   return {
     packages: list(member(document, 'packages'), 'packages').map((pkg) => ({
       id: text(member(pkg, 'id'), 'package id'),
+      name: text(member(pkg, 'name'), 'package name'),
+      version: text(member(pkg, 'version'), 'package version'),
       source: member(pkg, 'source') === null ? null : text(member(pkg, 'source'), 'package source'),
       manifest_path: text(member(pkg, 'manifest_path'), 'package manifest_path'),
       targets: list(member(pkg, 'targets'), 'package targets').map((target) => ({
@@ -93,6 +97,8 @@ function parseCargoMetadata(json: string): CargoMetadata {
 /** A mutable (path) package in Cargo's locked resolve. Every path is canonical. */
 export interface LocalCargoPackage {
   readonly id: string;
+  readonly name: string;
+  readonly version: string;
   readonly directory: string;
   readonly manifest: string;
   /** Every target's source file: library, binaries, tests, build script. A target may live outside `directory`. */
@@ -350,7 +356,8 @@ interface ResolveState {
   pending?: { readonly key: string; readonly promise: Promise<CargoResolve> };
 }
 const resolves = new Map<string, ResolveState>();
-const RESOLVE_CACHE_SCHEMA = 'cargo-resolve-v1';
+// v2 retains package name/version for checkout-independent artifact input identities.
+const RESOLVE_CACHE_SCHEMA = 'cargo-resolve-v2';
 
 /**
  * The longest one Cargo child, or one wait for a foreign resolve flight's lock, may take.
@@ -456,6 +463,8 @@ function cargoFromMetadata(metadata: CargoMetadata): CargoResolve {
         if (pkg.governing_manifest_path === undefined) throw new Error('Cargo cache omitted a governing manifest');
         return {
           id: pkg.id,
+          name: pkg.name,
+          version: pkg.version,
           directory: dirname(pkg.manifest_path),
           manifest: pkg.manifest_path,
           sources: pkg.targets.map((target) => target.src_path),
@@ -710,13 +719,32 @@ export async function hashCargoPathInputs(
   const root = await realpath(workspaceRoot);
   const cargo = await readCargoResolve(manifestPath, root);
   const members = options?.closure === undefined ? undefined : await dependencyClosure(cargo, resolve(options.closure));
-
-  const directories = new Set<string>();
-  const files = new Set<string>();
+  type InputRole = 'manifest' | 'workspace' | 'ancestor' | 'target' | 'file' | 'link' | 'include';
+  const inputKey = (pkg: LocalCargoPackage, role: InputRole, path: string) =>
+    JSON.stringify([pkg.name, pkg.version, role, path.split(sep).join('/')]);
+  const directories = new Map<string, LocalCargoPackage>();
+  const files = new Map<string, string>();
   const ancestors = new Set<string>();
-  const links = new Map<string, string>();
-  const packageSources: string[] = [];
-  for (const pkg of cargo.local) {
+  const links = new Map<string, { key: string; target: string }>();
+  const packageSources: { file: string; key: string }[] = [];
+  // Read shared bytes once. The smallest declared identity makes multiple owners
+  // deterministic without using a consuming checkout's mount path as an input.
+  const includeFile = (file: string, key: string) => {
+    const prior = files.get(file);
+    if (prior === undefined || key < prior) files.set(file, key);
+  };
+  const packages = [...cargo.local].sort((left, right) =>
+    left.name < right.name
+      ? -1
+      : left.name > right.name
+        ? 1
+        : left.version < right.version
+          ? -1
+          : left.version > right.version
+            ? 1
+            : 0,
+  );
+  for (const pkg of packages) {
     if (members !== undefined && !members.has(pkg.id)) continue;
     const directory = pkg.directory;
     if (!options?.includeWorkspace) {
@@ -724,37 +752,39 @@ export async function hashCargoPathInputs(
       const fromCargo = relative(cargo.root, directory);
       if (
         fromRoot !== '..' &&
-        !fromRoot.startsWith(`..${sep}`) &&
+        !fromRoot.startsWith('..' + sep) &&
         !isAbsolute(fromRoot) &&
         fromCargo !== '..' &&
-        !fromCargo.startsWith(`..${sep}`) &&
+        !fromCargo.startsWith('..' + sep) &&
         !isAbsolute(fromCargo) &&
         !fromRoot.split(sep).includes('node_modules')
       )
         continue;
     }
-    directories.add(directory);
-    files.add(pkg.manifest);
-    files.add(pkg.governingManifest);
-    packageSources.push(...pkg.sources);
-    // A member can inherit edition, lint policy, dependencies and
-    // profiles from a workspace above its package directory. Those manifests
-    // are not descendants of the source roots returned by Cargo metadata.
-    for (let ancestor = dirname(directory); !ancestors.has(ancestor); ancestor = dirname(ancestor)) {
+    directories.set(directory, pkg);
+    includeFile(pkg.manifest, inputKey(pkg, 'manifest', 'Cargo.toml'));
+    includeFile(pkg.governingManifest, inputKey(pkg, 'workspace', 'Cargo.toml'));
+    for (const [index, file] of pkg.sources.entries())
+      packageSources.push({ file, key: inputKey(pkg, 'target', String(index)) });
+    for (
+      let ancestor = dirname(directory), depth = 1;
+      !ancestors.has(ancestor);
+      ancestor = dirname(ancestor), depth += 1
+    ) {
       ancestors.add(ancestor);
       for (const name of CARGO_ANCESTOR_INPUTS) {
         const file = join(ancestor, name);
-        if (statSync(file, { throwIfNoEntry: false })?.isFile()) files.add(await realpath(file));
+        if (statSync(file, { throwIfNoEntry: false })?.isFile()) {
+          includeFile(await realpath(file), inputKey(pkg, 'ancestor', depth + '/' + name));
+        }
       }
     }
   }
-
-  const ignored = gitIgnoredBeneath([...directories]);
-  for (const source of packageSources) if (!ignored(source)) files.add(source);
+  const ignored = gitIgnoredBeneath([...directories.keys()]);
+  for (const { file, key } of packageSources) if (!ignored(file)) includeFile(file, key);
   const skipped: ReadonlySet<string> = new Set(HASH_SKIPPED_DIRECTORIES);
-  // Overlapping packages (a facade root plus its child crates) share one walk.
   const visited = new Set<string>();
-  async function walk(directory: string): Promise<void> {
+  async function walk(directory: string, owner: LocalCargoPackage, within: string): Promise<void> {
     const canonical = await realpath(directory);
     if (visited.has(canonical)) return;
     visited.add(canonical);
@@ -762,40 +792,48 @@ export async function hashCargoPathInputs(
       if (skipped.has(entry.name)) continue;
       const path = join(canonical, entry.name);
       if (ignored(path)) continue;
-      if (entry.isSymbolicLink()) links.set(path, await readlink(path));
+      const localPath = within === '' ? entry.name : within + '/' + entry.name;
+      if (entry.isSymbolicLink())
+        links.set(path, { key: inputKey(owner, 'link', localPath), target: await readlink(path) });
       const info = entry.isSymbolicLink() ? await lstat(await realpath(path)) : entry;
       if (info.isDirectory()) {
-        await walk(path);
+        await walk(path, owner, localPath);
       } else if (
         info.isFile() &&
         (entry.name.endsWith('.rs') ||
           entry.name === 'Cargo.toml' ||
-          (canonical.endsWith(`${sep}.cargo`) && (entry.name === 'config' || entry.name === 'config.toml')))
+          ((within === '.cargo' || within.endsWith('/.cargo')) &&
+            (entry.name === 'config' || entry.name === 'config.toml')))
       ) {
-        files.add(await realpath(path));
+        includeFile(await realpath(path), inputKey(owner, 'file', localPath));
       }
     }
   }
-  for (const directory of directories) await walk(directory);
-  const compiledCache = new Map<string, string[]>();
-  for (const directory of directories) {
-    for (const file of compiledInFiles(directory, compiledCache)) {
-      if (!ignored(file)) files.add(await realpath(file));
+  for (const [directory, owner] of directories) await walk(directory, owner, '');
+  const compiledCache = new Map<string, CompiledCargoInput[]>();
+  for (const [directory, owner] of directories) {
+    for (const input of compiledInFiles(directory, compiledCache)) {
+      if (!ignored(input.file)) {
+        includeFile(
+          await realpath(input.file),
+          inputKey(owner, 'include', relative(directory, input.source) + '\0' + input.literal),
+        );
+      }
     }
   }
   const hash = createHash('sha256');
-  hash.update('cargo-path-inputs-v1\0');
-  for (const [path, target] of [...links].sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))) {
-    hash.update(relative(root, path));
+  hash.update('cargo-path-inputs-v2\0');
+  for (const { key, target } of [...links.values()].sort((left, right) =>
+    left.key < right.key ? -1 : left.key > right.key ? 1 : 0,
+  )) {
+    hash.update(key);
     hash.update('\0symlink\0');
     hash.update(target);
     hash.update('\0');
   }
-  for (const file of [...files].sort()) {
+  for (const [file, key] of [...files].sort((left, right) => (left[1] < right[1] ? -1 : left[1] > right[1] ? 1 : 0))) {
     const bytes = await readFile(file);
-    // Both names and bytes matter: moving a module can change resolution even
-    // when its contents are unchanged. Length framing makes boundaries unique.
-    hash.update(relative(root, file));
+    hash.update(key);
     hash.update('\0');
     hash.update(String(bytes.length));
     hash.update('\0');
@@ -923,6 +961,13 @@ function gitRepository(directory: string): string | undefined {
   }
 }
 
+/** A compiled-in value, with the source spelling that identifies it across checkouts. */
+export interface CompiledCargoInput {
+  readonly file: string;
+  readonly source: string;
+  readonly literal: string;
+}
+
 // A tokenized literal macro, never text inside a comment or another string.
 const INCLUDE_CLOSERS: Readonly<Record<string, string>> = { '(': ')', '[': ']', '{': '}' };
 const INCLUDE_STRING = /^"([^"\\\r\n]*)"$/u;
@@ -933,10 +978,10 @@ const INCLUDE_RAW_STRING = /^r(#*)"([\s\S]*)"\1$/u;
  * One graph owns the memo; runtime hashes use a fresh memo. Nested packages own their
  * sources separately. Computed paths and arbitrary build-script reads remain explicit inputs.
  */
-export function compiledInFiles(root: string, cache: Map<string, string[]>): string[] {
+export function compiledInFiles(root: string, cache: Map<string, CompiledCargoInput[]>): CompiledCargoInput[] {
   const cached = cache.get(root);
   if (cached !== undefined) return cached;
-  const found = new Set<string>();
+  const found = new Map<string, CompiledCargoInput>();
   const skipped: readonly string[] = HASH_SKIPPED_DIRECTORIES;
   const scan = [root];
   while (scan.length > 0) {
@@ -960,12 +1005,19 @@ export function compiledInFiles(root: string, cache: Map<string, string[]>): str
           const path = INCLUDE_STRING.exec(literal)?.[1] ?? INCLUDE_RAW_STRING.exec(literal)?.[2];
           if (path === undefined || path === '') continue;
           const file = resolve(current, path);
-          if (statSync(file, { throwIfNoEntry: false })?.isFile()) found.add(file);
+          if (statSync(file, { throwIfNoEntry: false })?.isFile()) {
+            const prior = found.get(file);
+            if (prior === undefined || child < prior.source || (child === prior.source && path < prior.literal)) {
+              found.set(file, { file, source: child, literal: path });
+            }
+          }
         }
       }
     }
   }
-  const files = [...found].sort();
+  const files = [...found.values()].sort((left, right) =>
+    left.file < right.file ? -1 : left.file > right.file ? 1 : 0,
+  );
   cache.set(root, files);
   return files;
 }

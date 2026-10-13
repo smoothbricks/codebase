@@ -6,6 +6,7 @@ import type { TargetConfiguration } from 'nx/src/devkit-exports.js';
 import {
   CARGO_ANCESTOR_INPUTS,
   type CargoResolve,
+  type CompiledCargoInput,
   compiledInFiles,
   dependencyClosure,
   HASH_SKIPPED_DIRECTORIES,
@@ -64,7 +65,7 @@ export interface CargoClosureSource {
   readonly cargo: CargoResolve;
   /** Every `Cargo.toml` in Nx's file index, relative to the workspace root. */
   readonly indexed: ReadonlySet<string>;
-  readonly compiledFilesCache: Map<string, string[]>;
+  readonly compiledFilesCache: Map<string, CompiledCargoInput[]>;
 }
 
 /**
@@ -85,7 +86,7 @@ export async function resolveCargoClosureSource(
   manifest: string,
   workspaceRoot: string,
   indexed: Promise<ReadonlySet<string>>,
-  compiledFilesCache: Map<string, string[]>,
+  compiledFilesCache: Map<string, CompiledCargoInput[]>,
 ): Promise<CargoClosureSource> {
   const [root, index] = await Promise.all([realpath(workspaceRoot), indexed]);
   const cargo = await readCargoResolve(join(root, manifest), root, index);
@@ -153,7 +154,7 @@ async function workspaceClosureInputs(projectRoot: string, source: CargoClosureS
       if (!indexed.has(posix.join(directory, 'Cargo.toml'))) {
         throw new Error(`the Cargo package ${directory} is not in Nx's file index (an ignored directory)`);
       }
-      for (const file of compiledInFiles(pkg.directory, source.compiledFilesCache)) {
+      for (const { file } of compiledInFiles(pkg.directory, source.compiledFilesCache)) {
         const path = indexablePath(root, file);
         if (path === null) throw new Error(`${directory} compiles ${file}, which Nx's file index cannot hold`);
         compiledFiles.add(path);
