@@ -660,25 +660,27 @@ These anchors are trust configuration, not secrets, so they are exported/written
    `ControllerCommitment::Admission(AdmissionCommitment)` before process creation. Only the trusted supervisor opens the
    protected record stream; the audit record is telemetry and gates nothing.
 4. Compile the child profile before starting shell activation. Every `sandbox-exec` launch reads its profile from a
-   file, `sandbox-exec -f <store>/run/profiles/<sha256>.<pid>.<n>.sb` (mode 0400, inside the cowshed root every profile
-   denies to every role), never from an argument: a profile passes the 128 KiB a command argument may hold, and a job's
-   process observation reads the launch argv back; the launcher holds the file until its child exits, and a write
-   removes the files of launchers that no longer run. The trusted parent contributes identity, cache wiring
-   (03_caches.md), `TRACEPARENT`, and caller env filtered to build-configuration variables, then sets the private
-   HOME/XDG directories, proxy credentials, runtime directory, and bootstrap PATH. Inside that restriction, canonical
-   shell activation owns the environment the command sees. A command under the nearest workspace-contained `.envrc` runs
-   in a warm exec host (11_shell.md): a process started under the same child profile that approved and evaluated that
-   `.envrc` once and forks the command into the job's own process group, with the job's own pipes, the requested cwd,
-   the literal argv, and the caller env laid over the activated environment. A host that activates for a job belongs to
-   that job until its command starts, so the activation's output, failure and kill are the job's. Without a contained
-   `.envrc` the command runs in the plain sandbox environment. The supervisor neither evaluates repository shell code
-   nor parses and reconstructs its exported environment; it reads only the watch list direnv recorded, to decide when a
-   host is stale. Failed activation prevents command execution. The child profile's final rule denies every mutation
-   beneath `.cowshed/job/**`; no startup hook, exec host, one-shot, or descendant receives supervisor artifact-write
-   authority. Request-specific `--ro` narrows only that job's child profile, never the supervisor's artifact-write
-   authority or later jobs, and a read-only job runs only in a host started under the read-only profile. The effective
-   mode is read-only whenever either the request or the configured workspace ceiling is read-only; a read-write request
-   cannot widen a read-only ceiling.
+   file, `sandbox-exec -f <store>/run/profiles/<sha256>.sb`, never from an argument: a profile passes the 128 KiB a
+   command argument may hold, and a job's process observation reads the launch argv back. The profile text is a pure
+   function of the workspace's authority (grants, mode, capabilities); every path that varies by job or by a build
+   volume pivot is a `(param "NAME")` the launch binds with `sandbox-exec -D NAME=<path>`. One file per distinct
+   profile, named by its SHA-256, is written once, mode 0400, when absent, inside the cowshed root every profile denies
+   to every role, and kept: no launch writes or removes a file of its own. The trusted parent contributes identity,
+   cache wiring (03_caches.md), `TRACEPARENT`, and caller env filtered to build-configuration variables, then sets the
+   private HOME/XDG directories, proxy credentials, runtime directory, and bootstrap PATH. Inside that restriction,
+   canonical shell activation owns the environment the command sees. A command under the nearest workspace-contained
+   `.envrc` runs in a warm exec host (11_shell.md): a process started under the same child profile that approved and
+   evaluated that `.envrc` once and forks the command into the job's own process group, with the job's own pipes, the
+   requested cwd, the literal argv, and the caller env laid over the activated environment. A host that activates for a
+   job belongs to that job until its command starts, so the activation's output, failure and kill are the job's. Without
+   a contained `.envrc` the command runs in the plain sandbox environment. The supervisor neither evaluates repository
+   shell code nor parses and reconstructs its exported environment; it reads only the watch list direnv recorded, to
+   decide when a host is stale. Failed activation prevents command execution. The child profile's final rule denies
+   every mutation beneath `.cowshed/job/**`; no startup hook, exec host, one-shot, or descendant receives supervisor
+   artifact-write authority. Request-specific `--ro` narrows only that job's child profile, never the supervisor's
+   artifact-write authority or later jobs, and a read-only job runs only in a host started under the read-only profile.
+   The effective mode is read-only whenever either the request or the configured workspace ceiling is read-only; a
+   read-write request cannot widen a read-only ceiling.
 5. Read stdout and stderr as separate opaque byte streams, incrementally hash and quota-account them, and begin in
    bounded memory. Terminal streams at or below the inline limit are stored as Arrow Binary in a complete protected
    batch. A stream creates `.cowshed/job/<numeric-id>/out` or `err` only when it crosses that limit or a checkpoint/live
