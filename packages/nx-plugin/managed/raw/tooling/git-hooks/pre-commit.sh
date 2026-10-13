@@ -17,6 +17,9 @@ set -e -o pipefail
 # pre-format entry a partial commit strands in the real index.
 git-format-staged
 
+# Judge the formatted added lines from that same index, not unstaged edits.
+smoo monorepo check-public-denylist --staged
+
 # Adding a workspace package is rare and easy to leave half-wired. Run the
 # full monorepo validator only for newly staged package manifests.
 smoo monorepo validate --fail-fast --only-if-new-workspace-package

@@ -4,7 +4,7 @@ import { variants } from './generate/index.js';
 import { dispatchCiWorkflow, ensureCiPullRequest } from './github-ci/api.js';
 import { cliPackageVersion } from './lib/cli-package.js';
 import { decode, findRepoRoot, printCommandOutput } from './lib/run.js';
-import { checkPublicDenylist } from './monorepo/public-denylist.js';
+import { checkPublicCommitDenylist, checkPublicDenylist } from './monorepo/public-denylist.js';
 import { ensureChromium, runWithChromium } from './playwright/index.js';
 import { resolvePrConflicts } from './pr/index.js';
 import { RELEASE_BUMPS } from './release/core.js';
@@ -157,14 +157,34 @@ function buildProgram(): Command {
   monorepo
     .command('check-public-denylist [revisions...]')
     .description(
-      'refuse revisions (default HEAD) whose tree, or the message of any commit behind them, matches the local smoothbricks.publicDenylist git config or SMOOTHBRICKS_PUBLIC_DENYLIST; silent when neither is set',
+      'check public text using local denylist patterns; --staged and --commit-message also guard sibling projects and HOME',
     )
     .option(
       '--remote <name>',
       'judge only the commit messages <name> does not already hold (its remote-tracking branches); default: all history behind the revisions',
     )
-    .action(async (revisions: string[], options: { remote?: string }) => {
-      await checkPublicDenylist(await findRepoRoot(), revisions.length > 0 ? revisions : ['HEAD'], options.remote);
+    .addOption(
+      new Option('--staged', 'judge only added lines in the index git supplied').conflicts(['remote', 'commitMessage']),
+    )
+    .addOption(
+      new Option('--commit-message <path>', 'judge the commit message after conventional formatting').conflicts([
+        'remote',
+        'staged',
+      ]),
+    )
+    .action(async (revisions: string[], options: { remote?: string; staged?: boolean; commitMessage?: string }) => {
+      const root = await findRepoRoot();
+      if (options.staged || options.commitMessage !== undefined) {
+        if (revisions.length > 0) {
+          throw new InvalidArgumentError('revisions cannot be combined with --staged or --commit-message');
+        }
+        await checkPublicCommitDenylist(
+          root,
+          options.commitMessage === undefined ? { kind: 'staged' } : { kind: 'message', path: options.commitMessage },
+        );
+        return;
+      }
+      await checkPublicDenylist(root, revisions.length > 0 ? revisions : ['HEAD'], options.remote);
     });
   monorepo
     .command('sync-bun-lockfile-versions')

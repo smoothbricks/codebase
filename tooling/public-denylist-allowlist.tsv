@@ -1,0 +1,9 @@
+# Public references only. Fields are separated by literal tabs.
+# Exempts discovered sibling terms only; configured PCRE and HOME remain authoritative.
+# package-scope permits package references, including encoded patch paths, not prose.
+# repository permits that public repository token, not other words on its line.
+# line permits exact text only in the named file (and its declaration here).
+package-scope	@conloca
+repository	git-format-staged
+repository	git-backup
+line	packages/bitmosaic/crates/bitmosaic/README.md	MIT OR Apache-2.0. The component was extracted from the minigraf fork; the original license notices and attribution are
