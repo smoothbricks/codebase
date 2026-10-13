@@ -643,13 +643,85 @@ mod tests {
     }
 
     #[test]
-    fn empty_record_is_not_the_non_null_any_type() {
-        let output = render("#[derive(Serialize)] pub struct Empty {}");
-        assert!(
-            output
-                .types
-                .contains("export type Empty = { readonly [key in string]: never };")
-        );
+    fn wire_type_projections_follow_their_declarations() {
+        let cases: [(&str, &str, &[&str]); 7] = [
+            (
+                "empty_record_is_not_the_non_null_any_type",
+                "#[derive(Serialize)] pub struct Empty {}",
+                &["export type Empty = { readonly [key in string]: never };"],
+            ),
+            (
+                "nonzero_integers_project_their_primitive_with_a_minimum",
+                "#[derive(Serialize)] pub struct Id { pub value: NonZeroU8 }",
+                &[
+                    "readonly 'value': number & tags.Type<'uint32'> & tags.Maximum<255> & tags.Minimum<1>;",
+                ],
+            ),
+            (
+                "sets_project_as_readonly_arrays",
+                r#"
+            #[derive(Serialize)]
+            pub struct Sets {
+                pub ordered: BTreeSet<String>,
+                pub hashed: HashSet<u32>,
+            }
+        "#,
+                &[
+                    "readonly 'ordered': ReadonlyArray<string>;",
+                    "readonly 'hashed': ReadonlyArray<number & tags.Type<'uint32'>>;",
+                ],
+            ),
+            (
+                "record_named_like_the_utility_type_projects_beside_mapped_types",
+                r#"
+            #[derive(Serialize)] pub struct Record { pub value: String }
+            #[derive(Serialize)] pub struct Index { pub records: BTreeMap<String, Record> }
+        "#,
+                &[
+                    "export type Record = {\n  readonly 'value': string;\n};\n",
+                    "readonly 'records': { readonly [key in string]: Record };",
+                ],
+            ),
+            (
+                "adjacent_tags_render_unit_and_payload_variants_as_their_wire_shape",
+                r#"
+            #[derive(Serialize)] #[serde(tag = "kind", content = "data", rename_all = "camelCase")]
+            pub enum Mode { Off, On(String) }
+        "#,
+                &[
+                    "export type Mode = { readonly 'kind': 'off' } | { readonly 'kind': 'on' } & { readonly 'data': string };\n",
+                ],
+            ),
+            (
+                "internal_tags_keep_struct_variant_field_names_and_optionality",
+                r#"
+            #[derive(Serialize)] #[serde(tag = "kind", rename_all = "camelCase", rename_all_fields = "camelCase")]
+            pub enum Target { Named { target_name: String, lifetime: Option<String> } }
+        "#,
+                &[
+                    "export type Target = { readonly 'kind': 'named' } & {\n  readonly 'targetName': string;\n  readonly 'lifetime': string | null;\n};\n",
+                ],
+            ),
+            (
+                "fixed_arrays_keep_the_existing_serde_array_projection",
+                r#"
+                #[derive(Serialize)]
+                pub struct Fixed { pub digest: [u8; 32] }
+            "#,
+                &[
+                    "readonly 'digest': ReadonlyArray<number & tags.Type<'uint32'> & tags.Maximum<255>>;",
+                ],
+            ),
+        ];
+        for (label, source, expected) in cases {
+            let output = render(source);
+            for expected in expected {
+                assert!(
+                    output.types.contains(expected),
+                    "{label}: missing {expected}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -756,29 +828,6 @@ mod tests {
         assert!(!output.types.contains("Record<"));
     }
 
-    #[test]
-    fn sets_project_as_readonly_arrays() {
-        let output = render(
-            r#"
-            #[derive(Serialize)]
-            pub struct Sets {
-                pub ordered: BTreeSet<String>,
-                pub hashed: HashSet<u32>,
-            }
-        "#,
-        );
-        assert!(
-            output
-                .types
-                .contains("readonly 'ordered': ReadonlyArray<string>;")
-        );
-        assert!(
-            output
-                .types
-                .contains("readonly 'hashed': ReadonlyArray<number & tags.Type<'uint32'>>;")
-        );
-    }
-
     fn refusal(source: &str) -> String {
         let mut api = Api::default();
         records::parse(source, &mut api, "cowshed_core::api::fixture").unwrap();
@@ -809,66 +858,12 @@ mod tests {
     }
 
     #[test]
-    fn record_named_like_the_utility_type_projects_beside_mapped_types() {
-        let output = render(
-            r#"
-            #[derive(Serialize)] pub struct Record { pub value: String }
-            #[derive(Serialize)] pub struct Index { pub records: BTreeMap<String, Record> }
-        "#,
-        );
-        assert!(
-            output
-                .types
-                .contains("export type Record = {\n  readonly 'value': string;\n};\n")
-        );
-        assert!(
-            output
-                .types
-                .contains("readonly 'records': { readonly [key in string]: Record };")
-        );
-    }
-
-    #[test]
     fn generated_projection_keywords_are_not_shadowed_by_declarations() {
         let error = refusal("#[derive(Serialize)] pub struct ReadonlyArray { pub value: String }");
         assert!(
             error.contains("ReadonlyArray: declaration shadows"),
             "{error}"
         );
-    }
-
-    #[test]
-    fn nonzero_integers_project_their_primitive_with_a_minimum() {
-        let output = render("#[derive(Serialize)] pub struct Id { pub value: NonZeroU8 }");
-        assert!(output.types.contains(
-            "readonly 'value': number & tags.Type<'uint32'> & tags.Maximum<255> & tags.Minimum<1>;"
-        ));
-    }
-
-    #[test]
-    fn adjacent_tags_render_unit_and_payload_variants_as_their_wire_shape() {
-        let output = render(
-            r#"
-            #[derive(Serialize)] #[serde(tag = "kind", content = "data", rename_all = "camelCase")]
-            pub enum Mode { Off, On(String) }
-        "#,
-        );
-        assert!(output.types.contains(
-            "export type Mode = { readonly 'kind': 'off' } | { readonly 'kind': 'on' } & { readonly 'data': string };\n"
-        ));
-    }
-
-    #[test]
-    fn internal_tags_keep_struct_variant_field_names_and_optionality() {
-        let output = render(
-            r#"
-            #[derive(Serialize)] #[serde(tag = "kind", rename_all = "camelCase", rename_all_fields = "camelCase")]
-            pub enum Target { Named { target_name: String, lifetime: Option<String> } }
-        "#,
-        );
-        assert!(output.types.contains(
-            "export type Target = { readonly 'kind': 'named' } & {\n  readonly 'targetName': string;\n  readonly 'lifetime': string | null;\n};\n"
-        ));
     }
 
     #[test]
@@ -900,18 +895,5 @@ mod tests {
                 arguments: Vec::new(),
             }
         );
-    }
-
-    #[test]
-    fn fixed_arrays_keep_the_existing_serde_array_projection() {
-        let output = render(
-            r#"
-                #[derive(Serialize)]
-                pub struct Fixed { pub digest: [u8; 32] }
-            "#,
-        );
-        assert!(output.types.contains(
-            "readonly 'digest': ReadonlyArray<number & tags.Type<'uint32'> & tags.Maximum<255>>;"
-        ));
     }
 }
