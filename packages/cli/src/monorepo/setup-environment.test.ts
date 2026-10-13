@@ -433,6 +433,42 @@ describe('what shell entry installs', () => {
     );
   });
 
+  // An unfrozen entry install re-resolved a consumer's ranges and migrated its lockfile format: a bun.lock rewrite of
+  // thousands of lines that nobody asked for. Shell entry installs what bun.lock records, or fails saying why.
+  it('never rewrites bun.lock, failing the install of a manifest the lockfile does not record', async () => {
+    const vendored = (name: string) => JSON.stringify({ name, version: '1.0.0' });
+    const member = (...dependencies: string[]) =>
+      JSON.stringify({
+        name: 'member',
+        version: '0.0.0',
+        dependencies: Object.fromEntries(dependencies.map((name) => [name, `file:../../vendor/${name}`])),
+      });
+    await withManagedRepository(
+      {
+        workspaces: ['packages/*'],
+        files: {
+          'vendor/dep/package.json': vendored('dep'),
+          'vendor/dep2/package.json': vendored('dep2'),
+          [MEMBER]: member('dep'),
+        },
+      },
+      async ({ root, enterShell: enter }) => {
+        const lock = Bun.spawnSync(['bun', 'install', '--no-summary'], { cwd: root, stdout: 'ignore', stderr: 'pipe' });
+        expect(lock.exitCode, lock.stderr.toString()).toBe(0);
+        const locked = readFileSync(join(root, 'bun.lock'), 'utf8');
+        expect(await enter()).toEqual(HEALTHY);
+
+        await edit(join(root, MEMBER), member('dep', 'dep2'));
+        const { exitCode, stderr } = await enter();
+        // A failed install degrades the shell; it does not take it down.
+        expect(exitCode).toBe(0);
+        expect(stderr).toContain('bun install --frozen-lockfile');
+        expect(readFileSync(join(root, 'bun.lock'), 'utf8')).toBe(locked);
+        expect(existsSync(join(root, 'node_modules', 'dep2'))).toBe(false);
+      },
+    );
+  });
+
   it('installs once when two shell entries start together', async () => {
     // A shell pool warms two shells at once in one checkout. The second must
     // wait for the first install and then find nothing left to do, not run a

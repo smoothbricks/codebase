@@ -448,6 +448,11 @@ function bunInstallStamp(inputs: readonly string[]): { isCurrent(): boolean; rec
  * one package every managed repository installs, which catches a cache that
  * was pruned out from under node_modules. A dangling developer target, or a live link to Nx, also invalidates a
  * matching stamp, so the normal install replaces it: Nx is the lockfile's, and the install relinks it.
+ *
+ * Frozen: shell entry installs what bun.lock records and never rewrites it. An unfrozen install migrated a
+ * repository's lockfile format and re-resolved its ranges, a lockfile diff nobody asked for. A manifest that needs a
+ * lockfile change fails the entry with Bun's reason; `bun install` run on purpose writes that change. A checkout with
+ * no bun.lock yet has nothing to rewrite, and its first install writes it.
  */
 function bunInstaller(inputs: readonly string[]): Installer {
   const stamp = bunInstallStamp(inputs);
@@ -459,7 +464,14 @@ function bunInstaller(inputs: readonly string[]): Installer {
     install: async ({ quiet }) => {
       await keepDeveloperLinks(
         projectRoot,
-        () => runSetupCommand('bun install --no-summary', $`bun install --no-summary`, { quiet }),
+        () =>
+          existsSync(path.join(projectRoot, 'bun.lock'))
+            ? runSetupCommand(
+                'bun install --frozen-lockfile --no-summary',
+                $`bun install --frozen-lockfile --no-summary`,
+                { quiet },
+              )
+            : runSetupCommand('bun install --no-summary', $`bun install --no-summary`, { quiet }),
         { relink: ['nx'] },
       );
       stamp.record();
