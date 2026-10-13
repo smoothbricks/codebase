@@ -126,6 +126,14 @@ where
         MacOsApfsExecutionHost::resize_build_volume(self, layout, id, capacity)
     }
 
+    fn re_adopt_volume_holders(
+        &self,
+        image: &Path,
+        mount: &Path,
+    ) -> Result<Vec<cowshed_os::process::Holder>, ApfsStorageError> {
+        MacOsApfsExecutionHost::re_adopt_volume_holders(self, image, mount)
+    }
+
     fn retain_re_adopt_source(&self, source: &ReAdoptSource) -> Result<(), ApfsStorageError> {
         MacOsApfsExecutionHost::retain_re_adopt_source(self, source)
     }

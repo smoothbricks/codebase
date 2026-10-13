@@ -60,6 +60,26 @@ impl<R> MacOsApfsExecutionHost<R>
 where
     R: CommandRunner + Send + Sync + 'static,
 {
+    /// Source census follows recovery's image-lease ordering (01_storage.md, "Mounts" and
+    /// "Ownership, identity, and the volume label"). A supervisor's started blocking rename
+    /// outlives retirement and holds a normal mount descriptor until its command returns. The
+    /// image lease lets that descriptor close before census, without waiting in the supervisor
+    /// or excluding the caller's PID. Retention still performs its own non-forced kernel seal.
+    pub(crate) fn re_adopt_volume_holders(
+        &self,
+        image: &Path,
+        mount: &Path,
+    ) -> Result<Vec<cowshed_os::process::Holder>, ApfsStorageError> {
+        self.verify_controller_path(image)?;
+        let _lease = self.backend.image_lease(image)?;
+        // A bare mountpoint is on the volume beneath it, not the input being recovered.
+        if self.mounted_at(mount)?.is_none() {
+            return Ok(Vec::new());
+        }
+        crate::build_volume::nx::volume_holders(mount)
+            .map_err(|error| io_error("list a re-adoption source's holders", mount, error))
+    }
+
     /// Move every input `source` replaces to its recorded retained path: main's image with its
     /// sidecar and companion, main's build volume with its record, and each old-incarnation
     /// seed with its record. A mounted image is unmounted and detached without force first; a

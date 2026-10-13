@@ -81,23 +81,28 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         };
         let volumes = self.build_volumes()?;
         let build = volumes.layout.linked(&checkout)?;
-        let mut held = vec![checkout.clone()];
-        if let Some(id) = &build {
-            held.push(volumes.layout.mount(id));
-        }
-        for mount in &held {
-            let holders = crate::build_volume::nx::volume_holders(mount).map_err(|error| {
-                CowshedError::environment_missing(
-                    format!("cannot list what holds {}: {error}", mount.display()),
-                    "cowshed doctor --json",
-                )
-            })?;
-            refuse_held(mount, &holders)?;
-        }
+        self.refuse_re_adopt_volume_held(&replaced.image, &checkout)
+            .await?;
         let source = self
             .record_re_adopt_source(&replaced, &checkout, build.as_ref())
             .await?;
         self.begin_re_adopt(options, source, supervisor).await
+    }
+
+    /// A mounted source's census runs in the storage host under its image lease: a started
+    /// cosmetic rename can outlive supervisor retirement, but must close its mount descriptor
+    /// before this gate. Every remaining holder, including this process, still refuses.
+    async fn refuse_re_adopt_volume_held(&self, image: &Path, mount: &Path) -> Result<()> {
+        let host = self.substrate.shared_host();
+        let image = image.to_owned();
+        let held_mount = mount.to_owned();
+        let holders = crate::storage::lifecycle::dispatch_blocking(move || {
+            host.re_adopt_volume_holders(&image, &held_mount)
+        })
+        .await
+        .map_err(|error| CowshedError::internal(error.to_string()))?
+        .map_err(native_storage_error)?;
+        refuse_held(mount, &holders)
     }
 
     /// Record `source` and mark it mutating in one journal update, then run it. `supervisor` is
@@ -253,14 +258,8 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                 // process on the volume holding it, so only a mounted volume is censused.
                 let mount = layout.mount(kept);
                 if super::is_mount_point(&mount).map_err(|error| inspect(&mount, error))? {
-                    let holders =
-                        crate::build_volume::nx::volume_holders(&mount).map_err(|error| {
-                            CowshedError::environment_missing(
-                                format!("cannot list what holds {}: {error}", mount.display()),
-                                "cowshed doctor --json",
-                            )
-                        })?;
-                    refuse_held(&mount, &holders)?;
+                    self.refuse_re_adopt_volume_held(&layout.image(kept), &mount)
+                        .await?;
                 }
                 Some(MissingMainBuild::Kept(ReAdoptKeptBuild {
                     kept: kept.clone(),
@@ -402,6 +401,8 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                         "cowshed doctor --json",
                     ));
                 };
+                self.refuse_re_adopt_volume_held(image, &images.mount(id))
+                    .await?;
                 let image = image.clone();
                 let capacity_bytes = crate::storage::lifecycle::dispatch_blocking({
                     let capacity_of = capacity_of.clone();

@@ -104,6 +104,14 @@ pub(crate) trait RuntimeStorageHost: ApfsExecutionHost<LockGuard: Sync> {
         capacity: ImageCapacity,
     ) -> Result<ResizeOutcome, ApfsStorageError>;
 
+    /// Census a mounted re-adoption input under its image lease, excluding in-flight cosmetic
+    /// rename descriptors without exempting any actual filesystem holder.
+    fn re_adopt_volume_holders(
+        &self,
+        image: &Path,
+        mount: &Path,
+    ) -> Result<Vec<cowshed_os::process::Holder>, ApfsStorageError>;
+
     fn retain_re_adopt_source(&self, source: &ReAdoptSource) -> Result<(), ApfsStorageError>;
     fn attached_capacity_bytes(&self, image: &Path) -> Result<u64, ApfsStorageError>;
     fn retained_re_adopt_main_is_mounted(
