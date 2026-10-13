@@ -17,10 +17,10 @@ use cowshed_core::api::{ExecRequest, JobId, JobInfo};
 use cowshed_core::metadata::WorkspaceName;
 use cowshed_core::resident::{Decline, HostProbe, Resident, resolve};
 use cowshed_core::runtime::supervisor::WorkspaceSupervisorHandle;
-use cowshed_gateway_types::STORE_ROOT;
 use cowshed_core::storage::job_artifact::StreamKind;
-use cowshed_os::timing::{event, span, spanned};
 use cowshed_core::{CowshedError, ErrorCode, JobStream, Result};
+use cowshed_gateway_types::STORE_ROOT;
+use cowshed_os::timing::{event, span, spanned};
 use tokio::io::AsyncRead;
 
 use crate::args::{Cli, Command};

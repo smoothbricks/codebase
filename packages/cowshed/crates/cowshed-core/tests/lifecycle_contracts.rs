@@ -5,8 +5,8 @@ use std::thread::ThreadId;
 use async_trait::async_trait;
 use cowshed_apfs::image::ImageCapacity;
 use cowshed_core::metadata::{
-    GrantSet, MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE, PortBlock, WorkspaceIncarnation,
-    WorkspaceName, WorkspaceRole,
+    GrantSet, MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE, PortBlock, WorkspaceIncarnation, WorkspaceName,
+    WorkspaceRole,
 };
 use cowshed_core::repository::RepoId;
 use cowshed_core::storage::CheckpointLabel;

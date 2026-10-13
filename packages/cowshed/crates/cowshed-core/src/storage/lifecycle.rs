@@ -6,11 +6,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use thiserror::Error;
 
-use cowshed_apfs::image::ImageCapacity;
-use crate::metadata::{
-    GrantSet, WorkspaceIncarnation, WorkspaceName, WorkspaceRole,
-};
+use crate::metadata::{GrantSet, WorkspaceIncarnation, WorkspaceName, WorkspaceRole};
 use crate::repository::RepoId;
+use cowshed_apfs::image::ImageCapacity;
 
 use super::CheckpointLabel;
 

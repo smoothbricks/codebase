@@ -14,7 +14,6 @@
 use std::path::Path;
 
 use cowshed_core::api::{CredentialReport, CredentialRoute as CredentialRouteReport};
-use cowshed_os::fork_lock::RunAsync as _;
 use cowshed_core::repository::RepoId;
 use cowshed_core::runtime::project::{ProjectRuntime, RecoveryScope};
 use cowshed_core::storage::host_config::{CredentialRoute, HostConfig};
@@ -23,6 +22,7 @@ use cowshed_gateway::{
     CanonicalTarget, CredentialPresence, CredentialProtocol, ScopedCredential,
     remove_scoped_credential, scoped_credential_scope, store_scoped_credential, validate_scope,
 };
+use cowshed_os::fork_lock::RunAsync as _;
 use zeroize::Zeroizing;
 
 use crate::args::{CredentialAddArgs, CredentialCommand};

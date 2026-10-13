@@ -5,6 +5,7 @@ use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
+use cowshed_apfs::image::ImageCapacity;
 use cowshed_cli::launchd::{
     COWSHED_BINARY_NAME, CommandStatus, ControlAction, ControlExecutionError, ControlPlan,
     ExecutableDigest, ExecutableInstallState, ExistingPlist, FilesystemOperation, GATEWAY_LABEL,
@@ -15,7 +16,6 @@ use cowshed_cli::launchd::{
     StableLink, StoreBackedProgram, plan_executable_install, plan_executable_remove, plan_install,
     plan_remove, replace_symlink,
 };
-use cowshed_apfs::image::ImageCapacity;
 
 #[cfg(target_os = "macos")]
 use cowshed_apfs::{

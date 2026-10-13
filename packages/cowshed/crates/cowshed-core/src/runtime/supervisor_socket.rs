@@ -35,8 +35,8 @@ use crate::api::dto::{
     WorkspacePath,
 };
 use crate::error::{CowshedError, Result};
-use cowshed_os::fork_lock::Fenced;
 use crate::storage::job_artifact::StreamKind;
+use cowshed_os::fork_lock::Fenced;
 
 /// The identity of a cowshed build: the Mach-O `LC_UUID` the linker derives from the image's
 /// contents on macOS, the SHA-256 of the executable elsewhere. Two binaries share one only when

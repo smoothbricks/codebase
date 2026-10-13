@@ -4,9 +4,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use cowshed_apfs::{DetachIntent, MountAccess};
 use cowshed_apfs::image::{ImageCapacity, is_image_path};
 use cowshed_apfs::store_lock::LockMode;
+use cowshed_apfs::{DetachIntent, MountAccess};
 use cowshed_core::metadata::{
     GrantSet, MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE, PortBlock, WorkspaceIncarnation,
     WorkspaceInfoSnapshot, WorkspaceName, WorkspaceRole,

@@ -1,11 +1,11 @@
 use super::*;
 use crate::build_volume::BuildVolumeRole;
-use cowshed_os::fork_lock::Run as _;
 use crate::metadata::WorkspaceName;
 use crate::repository::{ProjectPaths, RepoId};
 use crate::sandbox::{RunSandboxMode, SandboxConfig, SandboxGrants};
 use crate::storage::apfs::ApfsSubstrateConfig;
 use crate::storage::directory::DirectoryExecutionHost;
+use cowshed_os::fork_lock::Run as _;
 use std::path::PathBuf;
 
 struct Scratch(PathBuf);
@@ -80,9 +80,8 @@ fn host(root: &Path) -> (DirectoryExecutionHost, BuildVolumeLayout) {
         &RepoId::parse("example-org/example-app").unwrap(),
     )
     .unwrap();
-    let host =
-        DirectoryExecutionHost::new(ApfsSubstrateConfig::new(&store, root.join("checkout")))
-            .unwrap();
+    let host = DirectoryExecutionHost::new(ApfsSubstrateConfig::new(&store, root.join("checkout")))
+        .unwrap();
     (host, BuildVolumeLayout::new(&project).unwrap())
 }
 

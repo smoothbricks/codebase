@@ -51,7 +51,10 @@ impl fmt::Display for TemplateError {
                 operation,
                 primary,
                 cleanup,
-            } => write!(formatter, "{operation} failed: {primary}; cleanup failed: {cleanup}"),
+            } => write!(
+                formatter,
+                "{operation} failed: {primary}; cleanup failed: {cleanup}"
+            ),
         }
     }
 }

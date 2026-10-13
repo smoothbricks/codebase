@@ -22,8 +22,8 @@ use super::{
     CapabilityContribution, CapabilityGrant, CapabilityId, DetectionContext, DetectionScope,
     Detector, EnvAction, GrantAccess, GrantScope,
 };
-use cowshed_os::fork_lock::Fenced;
 use crate::{CowshedError, Result};
+use cowshed_os::fork_lock::Fenced;
 
 pub const DETECTOR: Detector = Detector {
     id: CapabilityId::Cargo,

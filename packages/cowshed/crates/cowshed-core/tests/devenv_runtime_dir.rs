@@ -15,7 +15,6 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use cowshed_core::api::{ExitStatus, JobId};
-use cowshed_os::fork_lock::Run as _;
 use cowshed_core::metadata::{
     GrantSet, MACOS_PORT_MIN, PortBlock, WorkspaceIncarnation, WorkspaceName,
 };
@@ -32,6 +31,7 @@ use cowshed_core::storage::job_artifact::StreamKind;
 use cowshed_core::workspace_credentials::WORKSPACE_TOKEN_PATH;
 use cowshed_core::workspace_environment::{PORT_BASE_ENV, PORT_BLOCK_SIZE_ENV};
 use cowshed_gateway_types::WorkspaceToken;
+use cowshed_os::fork_lock::Run as _;
 
 use tokio::sync::mpsc;
 

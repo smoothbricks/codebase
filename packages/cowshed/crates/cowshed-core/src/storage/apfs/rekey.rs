@@ -321,12 +321,14 @@ pub fn rekey_workspace(
                 workspace: workspace.to_string(),
                 detail: format!("remove quarantine entry {}: {error}", entry.display()),
             })?;
-            cowshed_os::fsio::sync_directory(&project.quarantine).map_err(|error| RekeyError::Io {
-                workspace: workspace.to_string(),
-                detail: format!(
-                    "sync quarantine root {}: {error}",
-                    project.quarantine.display()
-                ),
+            cowshed_os::fsio::sync_directory(&project.quarantine).map_err(|error| {
+                RekeyError::Io {
+                    workspace: workspace.to_string(),
+                    detail: format!(
+                        "sync quarantine root {}: {error}",
+                        project.quarantine.display()
+                    ),
+                }
             })?;
             Some(entry)
         }

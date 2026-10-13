@@ -3,12 +3,12 @@ mod macos {
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
 
+    use cowshed_apfs::image::{IMAGE_EXTENSION, ImageCapacity};
     use cowshed_apfs::{
         ApfsBackend, AttachedImage, CreateImageRequest, DetachIntent, MacOsApfsBackend,
         SystemCommandRunner,
     };
     use cowshed_core::copy::copy_until_quiescent_blocking;
-    use cowshed_apfs::image::{IMAGE_EXTENSION, ImageCapacity};
 
     pub fn run() {
         let mut arguments = std::env::args_os();
@@ -112,11 +112,7 @@ mod macos {
             for index in 0..21 {
                 let clone = root.0.join(format!("clone-{index}.{IMAGE_EXTENSION}"));
                 let started = Instant::now();
-                backend.clone_image(
-                    &created,
-                    &clone,
-                    cowshed_apfs::ImageCapture::Detached,
-                )?;
+                backend.clone_image(&created, &clone, cowshed_apfs::ImageCapture::Detached)?;
                 clone_samples.push(started.elapsed());
                 backend.delete_image(&clone)?;
             }

@@ -46,13 +46,13 @@ use std::os::unix::process::ExitStatusExt;
 use crate::api::dto::CommandArg;
 use crate::api::process::ProcessCoverageGap;
 use crate::error::CowshedError;
-use cowshed_os::process::process_arguments;
 use crate::runtime::job_groups::{ProcessRecord, process_record};
 use crate::runtime::process_tree::{
     BirthToken, ProcessFoldError, ProcessIdentity, ProcessImage, ProcessObservation,
     ProcessTreeFold,
 };
 use crate::runtime::supervisor::{process_termination_from_wait, utc_at_second, utc_now};
+use cowshed_os::process::process_arguments;
 
 const WATCHED: u32 = libc::NOTE_FORK | libc::NOTE_EXEC | libc::NOTE_EXIT | libc::NOTE_EXITSTATUS;
 

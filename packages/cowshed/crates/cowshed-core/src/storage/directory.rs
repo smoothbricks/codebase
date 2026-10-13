@@ -38,32 +38,31 @@ use std::sync::{Mutex, PoisonError};
 
 use cowshed_apfs::{DetachIntent, MountAccess};
 
-use cowshed_apfs::image::{ImageCapacity, is_image_path};
-use cowshed_apfs::store_lock::{ImageLockGuard, LockMode, acquire_image_locks};
 use crate::metadata::{
-    DetachedWorkspaceMetadata, MARKER_VERSION, Platform,
-    PublicationState, SIDECAR_VERSION, WorkspaceIncarnation, WorkspaceInfoSnapshot,
-    WorkspaceMarker, WorkspaceName, WorkspaceRole, sidecar_path,
+    DetachedWorkspaceMetadata, MARKER_VERSION, Platform, PublicationState, SIDECAR_VERSION,
+    WorkspaceIncarnation, WorkspaceInfoSnapshot, WorkspaceMarker, WorkspaceName, WorkspaceRole,
+    sidecar_path,
 };
 use crate::repository::{OwnedRepoIds, RepoId};
 use crate::workspace_credentials::{
     mint_workspace_credentials, validate_private_key, validate_public_workspace_assets,
 };
+use cowshed_apfs::image::{ImageCapacity, is_image_path};
+use cowshed_apfs::store_lock::{ImageLockGuard, LockMode, acquire_image_locks};
 
 use super::apfs::native::{
-    CHECKPOINT_FACT_VERSION, CheckpointFactWire, CheckpointPinWire,
-    RESTORE_RECOVERY_FACT_VERSION, RestoreRecoveryFactWire,
-    checkout_mountpoint_staging_path, checkpoint_fact_path, clone_lineage_from,
-    directory_children, empty_mountpoint, grants_sidecar_missing, io_error,
+    CHECKPOINT_FACT_VERSION, CheckpointFactWire, CheckpointPinWire, RESTORE_RECOVERY_FACT_VERSION,
+    RestoreRecoveryFactWire, checkout_mountpoint_staging_path, checkpoint_fact_path,
+    clone_lineage_from, directory_children, empty_mountpoint, grants_sidecar_missing, io_error,
     metadata_workspace_ref, path_exists, pre_cowshed_path, read_dir_paths,
     remove_checkout_staging_mountpoint, restore_adopted_checkout_paths, restore_recovery_fact,
     restore_recovery_fact_path, swap_paths, sync_parent_path, warn_missing_session_sidecar,
     warn_session_image_issue,
 };
 use super::apfs::{
-    ApfsExecutionHost, ApfsStorageError, ApfsSubstrateConfig, MarkerExpectation,
-    MetadataPolicy, PendingAdoption, PendingPublicationFact, PublicationError, ResumableClone,
-    combine_cleanup, companion_path, layout, main_aware_mount_point, volume_key,
+    ApfsExecutionHost, ApfsStorageError, ApfsSubstrateConfig, MarkerExpectation, MetadataPolicy,
+    PendingAdoption, PendingPublicationFact, PublicationError, ResumableClone, combine_cleanup,
+    companion_path, layout, main_aware_mount_point, volume_key,
 };
 use super::lifecycle::{
     CheckpointFact, DefragmentOutcome, KernelMountFact, LifecycleFact, LifecycleWorkspace,
@@ -191,12 +190,12 @@ fn clear_move_sibling(sibling: &Path) -> Result<(), ApfsStorageError> {
         MountPointState::Absent => Ok(()),
         MountPointState::Link => fs::remove_file(sibling)
             .map_err(|error| io_error("remove stale mount record", sibling, error)),
-        MountPointState::Vacant | MountPointState::Occupied => Err(ApfsStorageError::Host(
-            format!(
+        MountPointState::Vacant | MountPointState::Occupied => {
+            Err(ApfsStorageError::Host(format!(
                 "payload move name {} holds something cowshed did not leave there",
                 sibling.display()
-            ),
-        )),
+            )))
+        }
     }
 }
 
@@ -205,8 +204,8 @@ fn clear_move_sibling(sibling: &Path) -> Result<(), ApfsStorageError> {
 /// A mount record whose mountpoint holds no directory, with no payload waiting beside it, names
 /// a payload that is gone: refused, never repaired by guessing.
 fn settle(image: &Path) -> Result<Payload, ApfsStorageError> {
-    let metadata = fs::symlink_metadata(image)
-        .map_err(|error| io_error("inspect payload", image, error))?;
+    let metadata =
+        fs::symlink_metadata(image).map_err(|error| io_error("inspect payload", image, error))?;
     let sibling = move_sibling(image);
     if metadata.file_type().is_dir() {
         // An unmount that died after its exchange leaves the old mount record beside the image.
@@ -221,8 +220,8 @@ fn settle(image: &Path) -> Result<Payload, ApfsStorageError> {
             image.display()
         )));
     }
-    let mount_point = fs::read_link(image)
-        .map_err(|error| io_error("read mount record", image, error))?;
+    let mount_point =
+        fs::read_link(image).map_err(|error| io_error("read mount record", image, error))?;
     if !mount_point.is_absolute() {
         return Err(ApfsStorageError::Host(format!(
             "mount record {} names the relative path {}",
@@ -279,16 +278,16 @@ fn observed_mount(image: &Path) -> Result<Option<PathBuf>, ApfsStorageError> {
     if !metadata.file_type().is_symlink() || is_real_directory(&move_sibling(image))? {
         return Ok(None);
     }
-    let mount_point = fs::read_link(image)
-        .map_err(|error| io_error("read mount record", image, error))?;
+    let mount_point =
+        fs::read_link(image).map_err(|error| io_error("read mount record", image, error))?;
     Ok(is_real_directory(&mount_point)?.then_some(mount_point))
 }
 
 /// Where `image`'s payload directory is now, read without changing anything: its image path,
 /// its move sibling while it moves, or its mountpoint.
 fn observed_payload_root(image: &Path) -> Result<PathBuf, ApfsStorageError> {
-    let metadata = fs::symlink_metadata(image)
-        .map_err(|error| io_error("inspect payload", image, error))?;
+    let metadata =
+        fs::symlink_metadata(image).map_err(|error| io_error("inspect payload", image, error))?;
     if metadata.file_type().is_dir() {
         return Ok(image.to_owned());
     }
@@ -297,10 +296,7 @@ fn observed_payload_root(image: &Path) -> Result<PathBuf, ApfsStorageError> {
         return Ok(sibling);
     }
     observed_mount(image)?.ok_or_else(|| {
-        ApfsStorageError::Host(format!(
-            "mount record {} names no payload",
-            image.display()
-        ))
+        ApfsStorageError::Host(format!("mount record {} names no payload", image.display()))
     })
 }
 
@@ -446,7 +442,11 @@ pub(super) fn confirmed_tree_holders(
 /// mountpoint is. A mountpoint keeps no process out of a directory: whoever is inside the tree
 /// moves with it. So `WhenIdle` refuses, naming them, while any process holds anything in the
 /// tree - the refusal an unforced unmount of a busy volume gives - and `Release` goes ahead.
-fn move_home(image: &Path, mount_point: &Path, intent: DetachIntent) -> Result<(), ApfsStorageError> {
+fn move_home(
+    image: &Path,
+    mount_point: &Path,
+    intent: DetachIntent,
+) -> Result<(), ApfsStorageError> {
     if intent == DetachIntent::WhenIdle {
         let open = confirmed_tree_holders(mount_point)?;
         if !open.is_empty() {
@@ -518,7 +518,10 @@ fn tree_usage(root: &Path) -> io::Result<TreeUsage> {
         }
         let overflow = || io::Error::other("tree byte accounting overflow");
         if metadata.is_file() {
-            usage.logical = usage.logical.checked_add(metadata.len()).ok_or_else(overflow)?;
+            usage.logical = usage
+                .logical
+                .checked_add(metadata.len())
+                .ok_or_else(overflow)?;
         }
         usage.allocated = metadata
             .blocks()
@@ -883,7 +886,10 @@ impl DirectoryExecutionHost {
         }
     }
 
-    fn rename_sidecar(source_image: &Path, destination_image: &Path) -> Result<(), ApfsStorageError> {
+    fn rename_sidecar(
+        source_image: &Path,
+        destination_image: &Path,
+    ) -> Result<(), ApfsStorageError> {
         let source = sidecar_path(source_image);
         if !path_exists(&source)? {
             return Ok(());
@@ -981,16 +987,15 @@ impl ApfsExecutionHost for DirectoryExecutionHost {
     }
 
     fn observe(&self, expected: &[LifecycleFact]) -> Result<Vec<LifecycleFact>, ApfsStorageError> {
-        let observed = |metadata: &DetachedWorkspaceMetadata, topology_revision| {
-            LifecycleFact::Exists {
+        let observed =
+            |metadata: &DetachedWorkspaceMetadata, topology_revision| LifecycleFact::Exists {
                 repo: metadata.repo_id.clone(),
                 name: metadata.workspace.clone(),
                 incarnation: metadata.workspace_incarnation.clone(),
                 revision: Revision::new(metadata.grants.revision),
                 topology_revision,
                 retired: false,
-            }
-        };
+            };
         expected
             .iter()
             .map(|fact| match fact {
@@ -1523,8 +1528,7 @@ impl ApfsExecutionHost for DirectoryExecutionHost {
         if !path_exists(&canonical)? {
             return Ok(());
         }
-        let mount_point =
-            main_aware_mount_point(&self.config, workspace.repo(), workspace.name())?;
+        let mount_point = main_aware_mount_point(&self.config, workspace.repo(), workspace.name())?;
         unbind(&canonical, &mount_point, intent)
     }
 
@@ -1851,8 +1855,8 @@ impl ApfsExecutionHost for DirectoryExecutionHost {
             self.verify_controller_path(path)?;
         }
         let source_metadata = read_metadata(source_image)?;
-        let source_checkpoint = CheckpointLabel::new(Self::checkpoint_label(source_image)?)
-            .map_err(host_error)?;
+        let source_checkpoint =
+            CheckpointLabel::new(Self::checkpoint_label(source_image)?).map_err(host_error)?;
         if source_metadata.repo_id != *workspace.repo()
             || source_metadata.workspace != *workspace.name()
             || source_metadata.workspace_incarnation == *workspace.incarnation()
@@ -1951,7 +1955,8 @@ impl ApfsExecutionHost for DirectoryExecutionHost {
         let canonical_sidecar = sidecar_path(canonical);
         let undo_sidecar = sidecar_path(undo);
         let staged_sidecar = sidecar_path(staged);
-        let canonical_companion = self.recovery_companion(canonical, "restore rollback canonical")?;
+        let canonical_companion =
+            self.recovery_companion(canonical, "restore rollback canonical")?;
         let undo_companion = self.recovery_companion(undo, "restore rollback undo")?;
         let staged_companion = companion_path(staged);
         if path_exists(&staged_companion)? {
@@ -2144,7 +2149,10 @@ impl ApfsExecutionHost for DirectoryExecutionHost {
         let mut mounts = Vec::new();
         for fact in self.published_facts(repo)? {
             let workspace = &fact.workspace;
-            let canonical = storage.canonical_image(workspace.name())?.image().to_owned();
+            let canonical = storage
+                .canonical_image(workspace.name())?
+                .image()
+                .to_owned();
             let Some(current) = observed_mount(&canonical)? else {
                 continue;
             };
@@ -2251,8 +2259,7 @@ impl ApfsExecutionHost for DirectoryExecutionHost {
             )));
         }
         let root = observed_payload_root(image)?;
-        let usage =
-            tree_usage(&root).map_err(|error| io_error("measure payload", &root, error))?;
+        let usage = tree_usage(&root).map_err(|error| io_error("measure payload", &root, error))?;
         let checkpoint_directory = layout(&self.config, workspace.repo())?
             .project()
             .checkpoints
@@ -2302,9 +2309,10 @@ impl ApfsExecutionHost for DirectoryExecutionHost {
             };
             let bytes = allocated_tree_bytes(&checkpoint)
                 .map_err(|error| io_error("measure checkpoint", &checkpoint, error))?;
-            stats.checkpoint_count = stats.checkpoint_count.checked_add(1).ok_or(
-                ApfsStorageError::InvalidPlan("checkpoint count overflow"),
-            )?;
+            stats.checkpoint_count = stats
+                .checkpoint_count
+                .checked_add(1)
+                .ok_or(ApfsStorageError::InvalidPlan("checkpoint count overflow"))?;
             stats.checkpoint_bytes = stats
                 .checkpoint_bytes
                 .checked_add(bytes)

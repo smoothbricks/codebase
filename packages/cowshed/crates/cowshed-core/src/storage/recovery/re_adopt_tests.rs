@@ -20,7 +20,6 @@ use crate::ErrorCode;
 use crate::api::GitOid;
 use crate::api::dto::{AdoptOptions, RemoveReport};
 use crate::build_volume::{BuildVolumeId, BuildVolumeRecord, BuildVolumeRole};
-use cowshed_os::fork_lock::Run as _;
 use crate::git_preservation::{self, GitPreservationSnapshot};
 use crate::metadata::{
     DetachedWorkspaceMetadata, GrantSet, MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE, Platform, PortBlock,
@@ -29,6 +28,7 @@ use crate::metadata::{
 };
 use crate::repository::RepoId;
 use crate::temp_root::TempRoot;
+use cowshed_os::fork_lock::Run as _;
 
 use super::{
     LIFECYCLE_INTENTS_FILE, LifecycleIntent, LifecycleIntentCompletion, LifecycleIntentJournal,
@@ -310,16 +310,33 @@ fn retained_input_refuses_an_unrecorded_path() {
     source.validate().expect("valid retained source record");
     let main = source.main.retained().expect("retained main");
     let build = source.build.as_ref().expect("retained build");
-    for path in [&main.original, &main.retained, &build.image.original, &build.image.retained]
-        .into_iter()
-        .chain(source.old_seeds.iter().flat_map(|seed| [&seed.original, &seed.retained]))
-    {
-        source.retained_input(path).expect("recorded original and retained paths are inputs");
+    for path in [
+        &main.original,
+        &main.retained,
+        &build.image.original,
+        &build.image.retained,
+    ]
+    .into_iter()
+    .chain(
+        source
+            .old_seeds
+            .iter()
+            .flat_map(|seed| [&seed.original, &seed.retained]),
+    ) {
+        source
+            .retained_input(path)
+            .expect("recorded original and retained paths are inputs");
     }
     let unrecorded = fixture.project.join("unrecorded.dmg");
-    let error = source.retained_input(&unrecorded).expect_err("an unrecorded image is not an input");
+    let error = source
+        .retained_input(&unrecorded)
+        .expect_err("an unrecorded image is not an input");
     assert_eq!(error.code, ErrorCode::Integrity);
-    assert!(error.message.contains("is not an input named by this re-adoption record"));
+    assert!(
+        error
+            .message
+            .contains("is not an input named by this re-adoption record")
+    );
 }
 
 #[test]

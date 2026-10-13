@@ -36,8 +36,8 @@ use cowshed_core::runtime::{
 use cowshed_core::sandbox::{SandboxConfig, SandboxGrants};
 use cowshed_core::storage::job_artifact::{ArtifactConfig, StreamKind};
 use cowshed_core::storage::lifecycle::{Conflict, LifecycleFact, Revision};
-use cowshed_os::timing::{timed, timed_async};
 use cowshed_core::{Cowshed, CowshedError, ErrorCode, JobStream, Result, Retry};
+use cowshed_os::timing::{timed, timed_async};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::{Notify, mpsc};

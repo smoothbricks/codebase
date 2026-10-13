@@ -9,9 +9,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::api::dto::{AdoptOptions, CreateOptions, RemoveOptions, RemoveReport};
 use crate::error::{CowshedError, Result as CowshedResult};
-use cowshed_os::fork_lock::Fenced;
 use crate::metadata::{MetadataError, WorkspaceIncarnation, WorkspaceName, read_json, write_json};
 use crate::repository::RepoId;
+use cowshed_os::fork_lock::Fenced;
 /// Objects in these namespaces are controller implementation details and never canonical listings.
 pub const STAGING_NAMESPACE: &str = ".staging";
 pub const TRASH_NAMESPACE: &str = ".trash";
@@ -377,9 +377,17 @@ impl ReAdoptSource {
 impl cowshed_apfs::RetainedInputs for ReAdoptSource {
     fn names(&self, path: &Path) -> bool {
         let named = |original: &Path, retained: &Path| path == original || path == retained;
-        self.main.retained().is_some_and(|image| named(&image.original, &image.retained))
-            || self.build.as_ref().is_some_and(|build| named(&build.image.original, &build.image.retained))
-            || self.old_seeds.iter().any(|seed| named(&seed.original, &seed.retained))
+        self.main
+            .retained()
+            .is_some_and(|image| named(&image.original, &image.retained))
+            || self
+                .build
+                .as_ref()
+                .is_some_and(|build| named(&build.image.original, &build.image.retained))
+            || self
+                .old_seeds
+                .iter()
+                .any(|seed| named(&seed.original, &seed.retained))
     }
 }
 

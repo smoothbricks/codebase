@@ -36,9 +36,9 @@ use crate::api::resources::{
     ResourceUnitError, StorageIoBytes, StorageIoTotals, StreamBytes, StreamLines,
     UsageReconciliation, VolumeUsage, WallMicros,
 };
-use cowshed_os::fsio::Durability;
 use crate::metadata::WorkspaceIncarnation;
 use crate::repository::{OwnedRepoIds, RepoId};
+use cowshed_os::fsio::Durability;
 mod publication;
 use crate::storage::verify_no_symlinks;
 
@@ -566,9 +566,10 @@ fn record_set_aside_incarnation(
     set_aside: &SetAsideStore,
     incarnation: &WorkspaceIncarnation,
 ) -> Result<(), ArtifactError> {
-    cowshed_os::fsio::publish_private_file(&set_aside.path.join(SET_ASIDE_INCARNATION_FILE), |writer| {
-        writer.write_all(incarnation.as_str().as_bytes())
-    })
+    cowshed_os::fsio::publish_private_file(
+        &set_aside.path.join(SET_ASIDE_INCARNATION_FILE),
+        |writer| writer.write_all(incarnation.as_str().as_bytes()),
+    )
     .map_err(|error| match error {
         cowshed_os::fsio::PublishError::Io { path, source } => io_error(&path, source),
         cowshed_os::fsio::PublishError::Write(source) => io_error(&set_aside.path, source),

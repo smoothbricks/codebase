@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
-use cowshed_apfs::SystemCommandRunner;
+use super::storage_host::RuntimeStorageHost;
 use crate::api::dto::{
     AdoptionSkip, CarrySide, DatabaseHolder, GcCandidate, GcDeferred, GcReason, GitOid, LandSeed,
     NxCarry, RebaseBuildVolume, RebaseCarrySkip, Reseed, ReseedSkip, Sha256Digest,
@@ -26,18 +26,18 @@ use crate::build_volume::{
     BuildVolumeRole, BuildVolumeState, TrackedBuildStateRefusal, cargo, carry, link, nx,
 };
 use crate::capabilities::BuildStatePath;
-use cowshed_apfs::image::ImageCapacity;
 use crate::metadata::{WorkspaceIncarnation, WorkspaceName};
+#[cfg(test)]
+use crate::storage::apfs::ApfsExecutionHost;
+use crate::storage::apfs::ApfsStorageError;
 use crate::storage::apfs::native::{
     BuildVolumeClaim, BuildVolumeRefusal, BuildVolumeRelease, MacOsApfsExecutionHost,
 };
-#[cfg(test)]
-use crate::storage::apfs::ApfsExecutionHost;
-use cowshed_apfs::store_lock::LockMode;
-use crate::storage::apfs::ApfsStorageError;
 use crate::storage::lifecycle::ResizeOutcome;
 use crate::{CowshedError, Result};
-use super::storage_host::RuntimeStorageHost;
+use cowshed_apfs::SystemCommandRunner;
+use cowshed_apfs::image::ImageCapacity;
+use cowshed_apfs::store_lock::LockMode;
 
 type Host = MacOsApfsExecutionHost<SystemCommandRunner>;
 
@@ -447,7 +447,10 @@ pub(crate) struct BuildVolumes<H: RuntimeStorageHost = Host> {
 
 impl<H: RuntimeStorageHost> Clone for BuildVolumes<H> {
     fn clone(&self) -> Self {
-        Self { host: Arc::clone(&self.host), layout: self.layout.clone() }
+        Self {
+            host: Arc::clone(&self.host),
+            layout: self.layout.clone(),
+        }
     }
 }
 
@@ -1922,7 +1925,12 @@ fn seed_age(
 /// Refreeze an out-of-date seed after Nx and existing Cargo profiles admit capture. The
 /// non-forced detach, not profile enumeration or a later holder probe, excludes filesystem
 /// writers while the image is validated and cloned.
-fn reseed(host: &impl RuntimeStorageHost, layout: &BuildVolumeLayout, target: &Owner, age: SeedAge) -> Result<Reseed> {
+fn reseed(
+    host: &impl RuntimeStorageHost,
+    layout: &BuildVolumeLayout,
+    target: &Owner,
+    age: SeedAge,
+) -> Result<Reseed> {
     if !age.stale() {
         return Ok(Reseed::Fresh);
     }
@@ -2605,9 +2613,9 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn real_apfs_build_resize_grows_the_volume_and_seed_so_a_later_fork_inherits_it() {
-        use cowshed_apfs::SystemCommandRunner;
         use crate::capabilities::BuildStatePath;
         use crate::storage::apfs::ApfsSubstrateConfig;
+        use cowshed_apfs::SystemCommandRunner;
         const GIB: u64 = ImageCapacity::GIBIBYTE;
 
         let root = crate::scratch_apfs::ScratchRoot::new("build-resize").expect("scratch root");
@@ -2750,7 +2758,9 @@ mod tests {
     impl Scratch {
         fn new(name: &str) -> Self {
             Self::with_root(
-                FixtureRoot::Apfs(crate::scratch_apfs::ScratchRoot::new(name).expect("scratch APFS root")),
+                FixtureRoot::Apfs(
+                    crate::scratch_apfs::ScratchRoot::new(name).expect("scratch APFS root"),
+                ),
                 |config| MacOsApfsExecutionHost::new(SystemCommandRunner, config),
                 test_volume,
             )
@@ -2761,7 +2771,10 @@ mod tests {
     impl Scratch<crate::storage::directory::DirectoryExecutionHost> {
         fn directory(name: &str) -> Self {
             Self::with_root(
-                FixtureRoot::Directory(crate::scratch_directory::ScratchRoot::new(name).expect("scratch directory root")),
+                FixtureRoot::Directory(
+                    crate::scratch_directory::ScratchRoot::new(name)
+                        .expect("scratch directory root"),
+                ),
                 crate::storage::directory::DirectoryExecutionHost::new,
                 |host, layout, id, gib| {
                     host.create_build_volume(layout, id, ImageCapacity::from_gibibytes(gib))
@@ -2775,7 +2788,9 @@ mod tests {
     impl<H: RuntimeStorageHost> Scratch<H> {
         fn with_root(
             root: FixtureRoot,
-            make_host: impl FnOnce(crate::storage::apfs::ApfsSubstrateConfig) -> std::result::Result<H, ApfsStorageError>,
+            make_host: impl FnOnce(
+                crate::storage::apfs::ApfsSubstrateConfig,
+            ) -> std::result::Result<H, ApfsStorageError>,
             mint: fn(&H, &BuildVolumeLayout, &BuildVolumeId, u64) -> PathBuf,
         ) -> Self {
             use crate::storage::apfs::ApfsSubstrateConfig;
@@ -2787,10 +2802,22 @@ mod tests {
                 &RepoId::parse("acme/widget").unwrap(),
             )
             .unwrap();
-            let host = Arc::new(make_host(ApfsSubstrateConfig::new(&store, root.path().join("checkout"))).unwrap());
+            let host = Arc::new(
+                make_host(ApfsSubstrateConfig::new(
+                    &store,
+                    root.path().join("checkout"),
+                ))
+                .unwrap(),
+            );
             let layout = BuildVolumeLayout::new(&project).unwrap();
             let volumes = BuildVolumes::new(Arc::clone(&host), layout.clone());
-            Self { root, host, layout, volumes, mint }
+            Self {
+                root,
+                host,
+                layout,
+                volumes,
+                mint,
+            }
         }
 
         /// `name`'s checkout, linked to a new live volume recorded as its own.

@@ -602,7 +602,10 @@ impl CowshedError {
                 error.downcast_ref::<cowshed_apfs::ApfsError>()
             {
                 // The host's finding, not storage's: no storage repair frees the attach pool.
-                return Self::environment_missing(message, cowshed_apfs::attach_budget::EXHAUSTED_HINT);
+                return Self::environment_missing(
+                    message,
+                    cowshed_apfs::attach_budget::EXHAUSTED_HINT,
+                );
             }
             starved |= errno == Some(libc::ENFILE)
                 || error.is::<cowshed_apfs::CommandRunError>()
@@ -929,8 +932,8 @@ mod tests {
 
     #[test]
     fn a_disk_child_starved_by_a_saturated_vnode_table_names_the_limit() {
-        use cowshed_apfs::{ApfsError, CommandRequest, CommandRunError, CommandRunFailure};
         use crate::vnodes::VnodeTable;
+        use cowshed_apfs::{ApfsError, CommandRequest, CommandRunError, CommandRunFailure};
         let saturated = || {
             Some(VnodeTable {
                 allocated: 272_631,
