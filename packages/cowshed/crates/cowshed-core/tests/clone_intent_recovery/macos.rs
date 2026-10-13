@@ -239,7 +239,7 @@ impl Fixture {
         fs::create_dir_all(&staging).expect("reservation directory");
         let owner = std::process::id().to_string();
         PortClaims(
-            PortBlock::macos_candidates()
+            PortBlock::macos_candidates(self.storage.port_allocation())
                 .map(|block| {
                     let marker = staging.join(format!("port-{}.reservation", block.base()));
                     std::os::unix::fs::symlink(&owner, &marker).expect("port reservation marker");

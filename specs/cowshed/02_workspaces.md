@@ -454,13 +454,14 @@ image remains live and mounted throughout capture.
 5. Rewrite `.cowshed/workspace.json` (`role: "workspace"`, `baseCommit` = source HEAD), mint a fresh `.cowshed/token`,
    mint a fresh per-workspace CA (private key controller-side next to the grant file; CA cert placed in-image as a trust
    anchor with the tool anchors wired — 04_sandbox.md/05_gateway.md), and complete platform wiring. On macOS, use the
-   sidecar's allocated contiguous `portBlock` from the reserved range (default `32768–49151`; its size is recorded with
-   it, 04_sandbox.md): the gateway binds `base`, and `base+1 … base+size-1` are workspace service ports. On Linux, omit
-   `portBlock`; after the dataset is mounted, create and bind-mount the per-incarnation Unix gateway socket and launch
-   the trusted connector inside the workspace's private netns on `127.0.0.1:7644` (04_sandbox.md/05_gateway.md). Mark
-   `<mount>/.envrc` direnv-trusted. In-image Bun, Cargo, Go, and proxy wiring uses the platform endpoint, and tool shims
-   are placed at `.cowshed/bin/`; git reaches the network only through the gateway, like every other client (see "Remote
-   code ingress").
+   sidecar's allocated contiguous `portBlock` from the host partition of the macOS validation range; its size is
+   recorded with it (04_sandbox.md). Fixture stores allocate from a reserved fixture partition of that validation range;
+   the host never assigns there. The partition bounds are defined once in code. The gateway binds `base`, and
+   `base+1 … base+size-1` are workspace service ports. On Linux, omit `portBlock`; after the dataset is mounted, create
+   and bind-mount the per-incarnation Unix gateway socket and launch the trusted connector inside the workspace's
+   private netns on `127.0.0.1:7644` (04_sandbox.md/05_gateway.md). Mark `<mount>/.envrc` direnv-trusted. In-image Bun,
+   Cargo, Go, and proxy wiring uses the platform endpoint, and tool shims are placed at `.cowshed/bin/`; git reaches the
+   network only through the gateway, like every other client (see "Remote code ingress").
 6. Drop what the clone inherited that names a process in main rather than content, before any Git or daemon runs in the
    clone: every lock file in the workspace's own `.git` directory, and the Nx daemon's rendezvous directory
    (`.nx/workspace-data/d`, which every boundary of the checkout shares, 04_sandbox.md). Git takes `<file>.lock`

@@ -690,6 +690,30 @@ pub enum Platform {
     Linux,
 }
 
+/// Allocation partitions share the macOS validation grammar, but never share a port.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PortAllocation {
+    Host,
+    Fixture,
+}
+
+impl PortAllocation {
+    pub fn range(self) -> RangeInclusive<u16> {
+        const FIXTURE_MIN: u16 = 45_056;
+        match self {
+            Self::Host => MACOS_PORT_MIN..=FIXTURE_MIN - 1,
+            Self::Fixture => FIXTURE_MIN..=MACOS_PORT_MAX,
+        }
+    }
+
+    pub fn contains(self, block: PortBlock) -> bool {
+        let range = self.range();
+        is_macos_port_block(block.base, block.size)
+            && range.contains(&block.base)
+            && range.contains(&block.last())
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PortBlock {
@@ -708,23 +732,23 @@ impl PortBlock {
         }
     }
 
-    /// Every new-size block of the macOS range, lowest first.
-    pub fn macos_candidates() -> impl Iterator<Item = Self> {
-        Self::macos_candidates_with_size(NEW_PORT_BLOCK_SIZE)
-            .expect("the initial block size fits the macOS workspace range")
+    /// Every new-size block of the store's allocation partition, lowest first.
+    pub fn macos_candidates(allocation: PortAllocation) -> impl Iterator<Item = Self> {
+        Self::macos_candidates_with_size(allocation, NEW_PORT_BLOCK_SIZE)
+            .expect("the initial block size fits either macOS allocation partition")
     }
 
     /// Growable allocations use the same aligned, disjoint-block grammar as initial ones.
     pub fn macos_candidates_with_size(
+        allocation: PortAllocation,
         size: u16,
     ) -> Result<impl Iterator<Item = Self>, MetadataError> {
-        if !is_macos_port_block(MACOS_PORT_MIN, size) {
-            return Err(MetadataError::InvalidPortBlock {
-                base: MACOS_PORT_MIN,
-                size,
-            });
+        let range = allocation.range();
+        let base = *range.start();
+        if !allocation.contains(Self { base, size }) {
+            return Err(MetadataError::InvalidPortBlock { base, size });
         }
-        Ok((MACOS_PORT_MIN..=MACOS_PORT_MAX - (size - 1))
+        Ok((base..=*range.end() - (size - 1))
             .step_by(usize::from(size))
             .map(move |base| Self { base, size }))
     }
@@ -1778,6 +1802,53 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn host_and_fixture_allocations_never_share_ports() {
+        use crate::storage::bootstrap::{CanonicalRoots, ValidatedHostStorage};
+
+        let host = ValidatedHostStorage::new(PathBuf::from("/home"), CanonicalRoots::global());
+        let fixture = ValidatedHostStorage::new(
+            PathBuf::from("/fixture"),
+            CanonicalRoots::at(PathBuf::from("/fixture/store")),
+        );
+        assert_eq!(host.port_allocation(), PortAllocation::Host);
+        assert_eq!(fixture.port_allocation(), PortAllocation::Fixture);
+        assert_eq!(*host.port_allocation().range().start(), MACOS_PORT_MIN);
+        assert_eq!(
+            *host.port_allocation().range().end() + 1,
+            *fixture.port_allocation().range().start()
+        );
+        assert_eq!(*fixture.port_allocation().range().end(), MACOS_PORT_MAX);
+        for (allocation, other) in [
+            (host.port_allocation(), fixture.port_allocation()),
+            (fixture.port_allocation(), host.port_allocation()),
+        ] {
+            assert!(PortBlock::macos_candidates(allocation).next().is_some());
+            for exponent in 1..=14 {
+                let size = 1 << exponent;
+                let first = PortBlock::new(*allocation.range().start(), size);
+                let fits = first.is_ok_and(|block| allocation.contains(block));
+                let candidates = PortBlock::macos_candidates_with_size(allocation, size);
+                assert_eq!(candidates.is_ok(), fits);
+                if let Ok(candidates) = candidates {
+                    let blocks: Vec<_> = candidates.collect();
+                    assert!(!blocks.is_empty());
+                    assert!(blocks.windows(2).all(|pair| !pair[0].overlaps(pair[1])));
+                    for block in blocks {
+                        assert!(allocation.contains(block));
+                        assert!(!other.contains(block));
+                        assert!(is_macos_port_block(block.base(), block.size()));
+                    }
+                }
+            }
+        }
+        for size in [0, 1, 3, u16::MAX] {
+            for allocation in [PortAllocation::Host, PortAllocation::Fixture] {
+                assert!(PortBlock::macos_candidates_with_size(allocation, size).is_err());
+            }
+        }
+    }
+
     /// Live blocks of several sizes share the store; the reserved set holds any of them and
     /// refuses exactly the blocks that share a port with a held one, naming that one.
     #[test]
@@ -1801,7 +1872,7 @@ mod tests {
             Err(block(MACOS_PORT_MIN + 64, NEW_PORT_BLOCK_SIZE))
         );
         assert_eq!(
-            PortBlock::macos_candidates()
+            PortBlock::macos_candidates(PortAllocation::Host)
                 .find(|candidate| reserved.overlapping(*candidate).is_none()),
             Some(block(MACOS_PORT_MIN + 192, NEW_PORT_BLOCK_SIZE))
         );

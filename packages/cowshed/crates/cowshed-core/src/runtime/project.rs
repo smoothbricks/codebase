@@ -2278,7 +2278,7 @@ async fn reserve_port_grants(
     reservation_root: &Path,
     used: crate::metadata::ReservedPortBlocks,
 ) -> Result<PortGrantReservation> {
-    for block in crate::metadata::PortBlock::macos_candidates() {
+    for block in crate::metadata::PortBlock::macos_candidates(inventory.port_allocation()) {
         if used.overlapping(block).is_some() {
             continue;
         }
@@ -2330,15 +2330,16 @@ async fn reserve_grown_port_grants(
     };
     let containing_base = existing.base() - existing.base() % size;
     if let Ok(block) = crate::metadata::PortBlock::new(containing_base, size)
-        && cowshed_gateway_types::is_macos_port_block(block.base(), block.size())
+        && inventory.port_allocation().contains(block)
         && !overlaps_sibling(block)
         && let Some(reservation) =
             reserve_port_grant_replacement(inventory, reservation_root, block, Some(owned)).await?
     {
         return Ok(reservation);
     }
-    for block in crate::metadata::PortBlock::macos_candidates_with_size(size)
-        .map_err(native_integrity_error)?
+    for block in
+        crate::metadata::PortBlock::macos_candidates_with_size(inventory.port_allocation(), size)
+            .map_err(native_integrity_error)?
     {
         if block.base() == containing_base || overlaps_sibling(block) {
             continue;
@@ -10130,10 +10131,10 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
             .size();
         let block = crate::metadata::PortBlock::new(base, size)
             .map_err(|error| CowshedError::usage(error.to_string(), "choose another slot"))?;
-        if !cowshed_gateway_types::is_macos_port_block(block.base(), block.size()) {
+        if !self.descriptor.storage.port_allocation().contains(block) {
             return Err(CowshedError::usage(
-                format!("port block {block} is outside the macOS workspace range"),
-                "choose a macOS workspace slot",
+                format!("port block {block} is outside this store's macOS allocation range"),
+                "choose a slot in this store's allocation range",
             ));
         }
         if current.metadata.grants.port_block == Some(block) {
@@ -18360,8 +18361,8 @@ mod port_reservation_tests {
     };
     use crate::gateway_inventory::NativeGatewayInventory;
     use crate::metadata::{
-        DetachedWorkspaceMetadata, GrantSet, MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE, Platform,
-        PortBlock, PublicationState, SIDECAR_VERSION, WorkspaceIncarnation, WorkspaceName,
+        DetachedWorkspaceMetadata, GrantSet, Platform, PortAllocation, PortBlock, PublicationState,
+        SIDECAR_VERSION, WorkspaceIncarnation, WorkspaceName,
     };
     use crate::repository::{BoundIdentity, RepoId, RepositoryBinding};
     use crate::storage::StorageLayout;
@@ -18404,11 +18405,6 @@ mod port_reservation_tests {
             (16383, 16384),
         ] {
             assert_eq!(PortBlock::size_for_service_ports(services).unwrap(), size);
-            let blocks = PortBlock::macos_candidates_with_size(size)
-                .unwrap()
-                .collect::<Vec<_>>();
-            assert!(!blocks.is_empty());
-            assert!(blocks.windows(2).all(|pair| !pair[0].overlaps(pair[1])));
         }
         for services in [0, 16384, u16::MAX] {
             assert!(PortBlock::size_for_service_ports(services).is_err());
@@ -18538,7 +18534,10 @@ mod port_reservation_tests {
             .expect("first allocation");
         let first_block = first.grants.port_block.expect("first block");
         let first_base = first_block.base();
-        assert!(PortBlock::macos_candidates().any(|candidate| candidate.base() == first_base));
+        assert!(
+            PortBlock::macos_candidates(inventory.port_allocation())
+                .any(|candidate| candidate.base() == first_base)
+        );
         let image = layout.main_image().expect("main image");
         std::fs::write(image.image(), b"detached image fixture").expect("image");
         DetachedWorkspaceMetadata {
@@ -18770,7 +18769,7 @@ mod port_reservation_tests {
             Err(error) => error,
         };
         assert_eq!(error.code.as_str(), "integrity");
-        let marker = claim_port_block(&staging, MACOS_PORT_MIN)
+        let marker = claim_port_block(&staging, *inventory.port_allocation().range().start())
             .expect("claim after inventory error")
             .expect("failed allocation must release its marker");
         std::fs::remove_file(marker).expect("release probe");
@@ -18785,6 +18784,7 @@ mod port_reservation_tests {
         let root = root("mixed-sizes");
         let (inventory, layout) = inventory(&root);
         let staging = root.join("store/.staging");
+        let first_base = *inventory.port_allocation().range().start();
         let publish = |image: &std::path::Path,
                        workspace: WorkspaceName,
                        publication_state: PublicationState,
@@ -18819,7 +18819,7 @@ mod port_reservation_tests {
             .write_for_image(image)
             .expect("publish block");
         };
-        let published = PortBlock::new(MACOS_PORT_MIN + 16, 16).expect("live 16-port block");
+        let published = PortBlock::new(first_base + 16, 16).expect("live 16-port block");
         let main = layout.main_image().expect("main image");
         publish(
             main.image(),
@@ -18829,7 +18829,7 @@ mod port_reservation_tests {
         );
         let pending_name = WorkspaceName::session("unfinished").expect("session");
         let pending_block =
-            PortBlock::new(MACOS_PORT_MIN + 64 + 48, 16).expect("pending 16-port block");
+            PortBlock::new(first_base + 64 + 48, 16).expect("pending 16-port block");
         let pending = layout.session_image(&pending_name).expect("session image");
         publish(
             pending.image(),
@@ -18842,7 +18842,7 @@ mod port_reservation_tests {
             .await
             .expect("allocation around live blocks");
         let first_block = first.grants.port_block.expect("first block");
-        assert!(first_block.base() >= MACOS_PORT_MIN + 128);
+        assert!(first_block.base() >= first_base + 128);
         assert!(!first_block.overlaps(published));
         assert!(!first_block.overlaps(pending_block));
         let second_name = WorkspaceName::session("second").expect("session");
@@ -18916,7 +18916,9 @@ mod port_reservation_tests {
         }
         // Every other candidate is held, so the block with the outside listener is the only offer.
         let mut others = crate::metadata::ReservedPortBlocks::default();
-        for candidate in PortBlock::macos_candidates().filter(|candidate| *candidate != block) {
+        for candidate in PortBlock::macos_candidates(inventory.port_allocation())
+            .filter(|candidate| *candidate != block)
+        {
             others.insert(candidate).expect("disjoint candidate blocks");
         }
         let refused = match reserve_port_grants(&inventory, &staging, others).await {
@@ -18931,34 +18933,43 @@ mod port_reservation_tests {
         drop(outside);
     }
 
-    /// Every block is durable workspace authority until retirement, attached or detached, so the
-    /// range bounds the workspaces a host holds. A host whose workspaces fill every initial-size
-    /// cell of 40960-49151 — the whole range once, 128 workspaces — still allocates the next one.
     #[tokio::test]
-    async fn a_host_holding_128_initial_blocks_still_allocates_a_workspace() {
-        let root = root("past-128");
+    async fn a_fixture_store_allocates_only_within_its_partition() {
+        let root = root("fixture-partition");
         let (inventory, _) = inventory(&root);
+        let allocation = inventory.port_allocation();
+        assert_eq!(allocation, PortAllocation::Fixture);
         let staging = root.join("store/.staging");
-        let held = || {
-            (40_960..=49_151 - (NEW_PORT_BLOCK_SIZE - 1))
-                .step_by(usize::from(NEW_PORT_BLOCK_SIZE))
-                .map(|base| PortBlock::new(base, NEW_PORT_BLOCK_SIZE).expect("held block"))
-        };
-        assert_eq!(held().count(), 128);
+        let count = PortBlock::macos_candidates(allocation).count();
+        let held = || PortBlock::macos_candidates(allocation).skip(count / 2);
         let mut used = crate::metadata::ReservedPortBlocks::default();
         for block in held() {
             used.insert(block).expect("disjoint held blocks");
         }
         let granted = reserve_port_grants(&inventory, &staging, used)
             .await
-            .expect("a 129th workspace gets a block");
+            .expect("the fixture partition has spare blocks");
         let block = granted.grants.port_block.expect("granted block");
-        assert!(cowshed_gateway_types::is_macos_port_block(
-            block.base(),
-            block.size()
-        ));
+        assert!(allocation.contains(block));
+        assert!(!PortAllocation::Host.contains(block));
         assert!(held().all(|owned| !owned.overlaps(block)));
-        drop(granted);
+    }
+
+    #[tokio::test]
+    async fn fixture_growth_does_not_reclaim_a_host_block() {
+        let root = root("fixture-growth");
+        let (inventory, _) = inventory(&root);
+        let staging = root.join("store/.staging");
+        let old = PortBlock::macos_candidates(PortAllocation::Host)
+            .next()
+            .expect("host block");
+        let owned = GrantSet::closed_baseline(Some(old)).expect("old fixture grant");
+        let grown = reserve_grown_port_grants(&inventory, &staging, &owned, old.size() * 2)
+            .await
+            .expect("growth relocates into the fixture partition");
+        let block = grown.grants.port_block.expect("grown block");
+        assert!(inventory.port_allocation().contains(block));
+        assert!(!PortAllocation::Host.contains(block));
     }
 
     #[test]

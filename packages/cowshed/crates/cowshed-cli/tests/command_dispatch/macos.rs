@@ -416,7 +416,7 @@ async fn directory_dispatch_grant_persists_across_runtime_restart() {
     // hold the same low block, and the other's gateway took this test's port before this test
     // could ("claim published port: AddrInUse"). Adoption here is steered to the highest free
     // block, which no other store reaches, by claiming every other block in this store.
-    let steered = highest_free_port_block();
+    let steered = highest_free_port_block(&fixture);
     let claims = PortClaims::all_but(&fixture, steered);
     let mut service = fixture.open().await;
     adopt(&fixture, &mut service).await;
@@ -500,6 +500,12 @@ async fn directory_dispatch_grant_persists_across_runtime_restart() {
         .port_block
         .expect("allocated macOS block");
     assert_eq!(original, steered);
+    assert!(fixture.storage.port_allocation().contains(original));
+    assert!(
+        !CanonicalRoots::global()
+            .port_allocation()
+            .contains(original)
+    );
     let original_port = original.base();
     // Take the port after allocation and image publication, before gateway installation. This
     // cannot be solved by probing in the allocator: the listener must trigger a real bind refusal.
@@ -512,13 +518,19 @@ async fn directory_dispatch_grant_persists_across_runtime_restart() {
         .reconcile_gateway()
         .await
         .expect("install main from real inventory");
-    let reallocated_port = service
+    let reallocated = service
         .grants("main")
         .await
         .expect("reallocated durable block")
         .port_block
-        .expect("replacement macOS block")
-        .base();
+        .expect("replacement macOS block");
+    assert!(fixture.storage.port_allocation().contains(reallocated));
+    assert!(
+        !CanonicalRoots::global()
+            .port_allocation()
+            .contains(reallocated)
+    );
+    let reallocated_port = reallocated.base();
     assert_ne!(reallocated_port, original_port);
     let gateway = fixture
         .gateway
@@ -551,6 +563,25 @@ async fn directory_dispatch_grant_persists_across_runtime_restart() {
         after.sessions[0].revision > before.sessions[0].revision,
         "gateway must replace the old session with the persisted grant revision"
     );
+    fixture.stop_gateway().await;
+    fixture.start_gateway().await;
+    service
+        .reconcile_gateway()
+        .await
+        .expect("restore sessions after fixture gateway restart");
+    let (result, _, _) = run(&mut service, ["grant", "main"]).await;
+    assert_eq!(result.expect("CLI remains live after gateway restart"), 0);
+    let restarted = fixture
+        .gateway
+        .as_ref()
+        .expect("restarted fixture gateway")
+        .handle()
+        .status()
+        .await
+        .expect("gateway responds after restart and CLI dispatch");
+    assert_eq!(restarted.sessions.len(), 1);
+    assert_eq!(restarted.sessions[0].endpoint, after.sessions[0].endpoint);
+    assert_eq!(restarted.sessions[0].revision, after.sessions[0].revision);
     service.shutdown().await.expect("shutdown runtime");
     fixture.stop_gateway().await;
     drop(competing_listener);
@@ -566,7 +597,7 @@ impl PortClaims {
         fs::create_dir_all(&staging).expect("reservation directory");
         let owner = std::process::id().to_string();
         Self(
-            PortBlock::macos_candidates()
+            PortBlock::macos_candidates(fixture.storage.port_allocation())
                 .filter(|block| *block != kept)
                 .map(|block| {
                     let marker = staging.join(format!("port-{}.reservation", block.base()));
@@ -588,9 +619,10 @@ impl Drop for PortClaims {
     }
 }
 
-/// The highest macOS port block whose every port the host has free right now.
-fn highest_free_port_block() -> PortBlock {
-    let candidates: Vec<PortBlock> = PortBlock::macos_candidates().collect();
+/// The highest block in the fixture partition whose every port is free right now.
+fn highest_free_port_block(fixture: &Fixture) -> PortBlock {
+    let candidates: Vec<PortBlock> =
+        PortBlock::macos_candidates(fixture.storage.port_allocation()).collect();
     candidates
         .into_iter()
         .rev()
