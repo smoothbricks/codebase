@@ -127,6 +127,49 @@ describe('Cargo workspace layouts', () => {
     }
   });
 
+  // rustc compiles an `include_str!`/`include_bytes!` file into the unit and Cargo rebuilds when it changes, but the
+  // package fileset stops at the package directory: a shipped skill or corpus beside the crates changed nothing in
+  // the archive's key, and the runner replayed a verdict about the old bytes.
+  it("hashes the files a package's sources compile in from outside its directory", async () => {
+    const root = await mkdtemp(join(tmpdir(), 'nx-cargo-compiled-in-'));
+    try {
+      await write(root, 'Cargo.toml', '[workspace]\nmembers=["crates/app"]\n');
+      await write(root, 'crates/app/Cargo.toml', '[package]\nname="app"\n');
+      await write(
+        root,
+        'crates/app/src/lib.rs',
+        [
+          'pub const SKILL: &str = include_str!("../../../skills/SKILL.md");',
+          '#[cfg(test)] const CORPUS: &[u8] = include_bytes! ( "../../../corpus.json" );',
+          'const INSIDE: &str = include_str!("data/inside.txt");',
+          '// Not compiled: include_str!("../../../missing.txt")',
+          'const COMPUTED: &str = include_str!(env!("DATA"));',
+        ].join('\n'),
+      );
+      await write(root, 'crates/app/src/data/inside.txt', 'inside');
+      await write(root, 'skills/SKILL.md', 'skill');
+      await write(root, 'skills/OTHER.md', 'unrelated');
+      await write(root, 'corpus.json', '[]');
+      await write(root, 'crates/app/nested/Cargo.toml', '[package]\nname="nested"\n');
+      await write(root, 'crates/app/nested/src/lib.rs', 'const N: &str = include_str!("../../../../nested.txt");');
+      await write(root, 'nested.txt', 'another package compiles this');
+
+      const inputs = await cargoPackageTestInputs({
+        workspaceRoot: root,
+        absoluteProjectRoot: root,
+        memberDir: 'crates/app',
+      });
+      for (const path of ['skills/SKILL.md', 'corpus.json', 'crates/app/src/data/inside.txt']) {
+        expect(matches(inputs, path)).toBe(true);
+      }
+      for (const path of ['skills/OTHER.md', 'missing.txt', 'nested.txt']) {
+        expect(matches(inputs, path)).toBe(false);
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it('keeps dependencies outside Cargo but inside Nx as ordinary files and includes ancestor config', async () => {
     const root = await mkdtemp(join(tmpdir(), 'nx-cargo-nested-'));
     try {
