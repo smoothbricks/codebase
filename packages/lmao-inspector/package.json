@@ -22,7 +22,7 @@
   ],
   "dependencies": {
     "@duckdb/duckdb-wasm": "1.33.1-dev20.0",
-    "@uwdata/flechette": "^2.3.0"
+    "@uwdata/flechette": "^2.7.0"
   },
   "peerDependencies": {
     "react": ">=18.0.0",

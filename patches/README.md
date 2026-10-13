@@ -5,6 +5,18 @@ Patches this repository applies to its dependencies. `bun install` applies the r
 `bun.lock` is written by Bun and records that version, registry integrity and patch path. The root `overrides["@nx/js"]`
 likewise pins `23.2.1`, the version its patch applies to.
 
+## Flechette factory declarations
+
+All Flechette consumers use the 2.7 series. `@uwdata/flechette@2.7.0.patch` is the reviewed declaration repair shared
+with strict external consumers: the upstream source declares the generic row factory as private and readonly, and its
+owner-generated `table.d.ts` preserves that field. Runtime factory logic is unchanged. Do not cast tables or relax a
+consumer's `skipLibCheck` to hide a factory declaration mismatch. Apply this patch through root `patchedDependencies`
+and ordinary `bun install`; rebuild lmao's declarations from the installed product. Retire the patch only when the
+upstream declaration preserves the same contract.
+
+Flechette 2.7 builds Date64 metadata from numeric millisecond inputs. The Compact fixture seeds only that schema with a
+number; its physical payload remains `BigInt64Array`, with the same i64 round-trip assertions.
+
 ## Activating a patch change
 
 Generate Nx changes with `bun patch nx@23.2.1` and `bun patch --commit nx@23.2.1`, against the pinned registry package.

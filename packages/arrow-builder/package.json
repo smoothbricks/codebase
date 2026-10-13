@@ -33,7 +33,7 @@
     "!**/*.tsbuildinfo"
   ],
   "dependencies": {
-    "@uwdata/flechette": "^2.3.0",
+    "@uwdata/flechette": "^2.7.0",
     "tslib": "^2.8.1"
   },
   "devDependencies": {

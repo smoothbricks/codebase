@@ -1,0 +1,55 @@
+Subject: Fix upstream Flechette 2.7.0 TypeScript 7 factory declaration emission
+Upstream: https://github.com/uwdata/flechette/tree/6616b73cf873bd20c90f84b8428a28913546c1fd
+The constructor-assigned private readonly row factory emitted as public untyped getFactory;
+explicit owner field annotations restore its declaration. Generated with the owner types config.
+Runtime factory logic is unchanged; strict external consumers must keep skipLibCheck false.
+
+diff --git a/src/table.js b/src/table.js
+--- a/src/table.js
++++ b/src/table.js
+@@ -15,6 +15,14 @@
+  */
+ export class Table {
+   /**
++   * Returns a row object generator for the given batch index.
++   * @private
++   * @readonly
++   * @type {(batch: number) => (index: number) => { [P in keyof T]: T[P] }}
++   */
++  getFactory;
++
++  /**
+    * Create a new table with the given schema and columns (children).
+    * @param {Schema} schema The table schema.
+    * @param {Column[]} children The table columns.
+@@ -48,13 +56,7 @@
+     // lazily created row object generators
+     const gen = [];
+ 
+-    /**
+-     * Returns a row object generator for the given batch index.
+-     * @private
+-     * @readonly
+-     * @param {number} b The batch index.
+-     * @returns {(index: number) => { [P in keyof T]: T[P] }}
+-     */
++    /** @param {number} b The batch index. */
+     this.getFactory = b => gen[b]
+       ?? (gen[b] = this.factory(names, children.map(c => c.data[b])));
+   }
+diff --git a/dist/types/table.d.ts b/dist/types/table.d.ts
+--- a/dist/types/table.d.ts
++++ b/dist/types/table.d.ts
+@@ -33,10 +33,9 @@
+      * Returns a row object generator for the given batch index.
+      * @private
+      * @readonly
+-     * @param {number} b The batch index.
+-     * @returns {(index: number) => { [P in keyof T]: T[P] }}
++     * @type {(batch: number) => (index: number) => { [P in keyof T]: T[P] }}
+      */
+-    getFactory;
++    private readonly getFactory;
+     /**
+      * Create a new table with the given schema and columns (children).
+      * @param {Schema} schema The table schema.

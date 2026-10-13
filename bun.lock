@@ -37,7 +37,7 @@
       "name": "@smoothbricks/arrow-builder",
       "version": "0.1.10-next.0",
       "dependencies": {
-        "@uwdata/flechette": "^2.3.0",
+        "@uwdata/flechette": "^2.7.0",
         "tslib": "^2.8.1",
       },
       "devDependencies": {
@@ -77,7 +77,7 @@
       "version": "0.2.1-next.0",
       "devDependencies": {
         "@smoothbricks/validation": "workspace:*",
-        "@uwdata/flechette": "^2.3.0",
+        "@uwdata/flechette": "^2.7.0",
         "typescript": "^6.0.3",
       },
     },
@@ -135,7 +135,7 @@
         "@neophi/sieve-cache": "^1.5.0",
         "@smoothbricks/arrow-builder": "workspace:*",
         "@smoothbricks/validation": "workspace:*",
-        "@uwdata/flechette": "^2.3.0",
+        "@uwdata/flechette": "^2.7.0",
         "tslib": "^2.8.1",
         "typia": "14.0.6",
       },
@@ -177,7 +177,7 @@
       "version": "0.1.14-next.0",
       "dependencies": {
         "@duckdb/duckdb-wasm": "1.33.1-dev20.0",
-        "@uwdata/flechette": "^2.3.0",
+        "@uwdata/flechette": "^2.7.0",
       },
       "devDependencies": {
         "@smoothbricks/lmao": "workspace:*",
@@ -404,11 +404,12 @@
     },
   },
   "patchedDependencies": {
+    "@uwdata/flechette@2.7.0": "patches/@uwdata%2Fflechette@2.7.0.patch",
+    "nx@23.2.1": "patches/nx@23.2.1.patch",
+    "bun-types@1.4.2": "patches/bun-types@1.4.2.patch",
     "@nx/js@23.2.1": "patches/@nx%2Fjs@23.2.1.patch",
     "@conloca/content-api@0.1.16": "patches/@conloca%2Fcontent-api@0.1.16.patch",
     "ttsc@0.30.4": "patches/ttsc@0.30.4.patch",
-    "nx@23.2.1": "patches/nx@23.2.1.patch",
-    "bun-types@1.4.2": "patches/bun-types@1.4.2.patch",
     "@conloca/astro-cms@0.1.16": "patches/@conloca%2Fastro-cms@0.1.16.patch",
   },
   "overrides": {
@@ -2309,7 +2310,9 @@
 
     "@unrs/resolver-binding-win32-x64-msvc": ["@unrs/resolver-binding-win32-x64-msvc@1.12.2", "", { "os": "win32", "cpu": "x64" }, "sha512-nAB74NfSNKknqQ1RrYj6uz8FcXEomu/MATJZxh/x+BArzN2U3JbOYC0APYzUIGhVY3m5hRxA8VPNdPBoG8txlA=="],
 
-    "@uwdata/flechette": ["@uwdata/flechette@2.5.0", "", {}, "sha512-NSB9xIPVsxpEcnEvtLfbvH/tEqZWiD4bfdz/yBUAUBEe0Z0C3zmA/Y4GOCsLZe4ChxiHaedFBZzVdUxQ+NVcMA=="],
+    "@uwdata/flechette": ["@uwdata/flechette@2.7.0", "", { "dependencies": { "@uwdata/wk-geojson": "^0.0.1" } }, "sha512-+d4JwDnBJsxjH7zMz5QSDOVQQYqFdAQYSaR6lfBazFz28C5eIBiL5s4jqLEWJKcc43fSU1m6yHMcWeRUCTNH+g=="],
+
+    "@uwdata/wk-geojson": ["@uwdata/wk-geojson@0.0.1", "", {}, "sha512-4RpnKbdrphwzP+BwgzuGRqA/s03oT1rzHAKdU43Ozn8J1BCTwS+2iAGQ7YQAnrCkCi213WtQ7VYaFjVtvZotPQ=="],
 
     "@verdaccio/auth": ["@verdaccio/auth@8.0.4", "", { "dependencies": { "@verdaccio/config": "8.1.2", "@verdaccio/core": "8.1.2", "@verdaccio/loaders": "8.0.3", "@verdaccio/signature": "8.0.3", "debug": "4.4.3", "lodash": "4.18.1", "verdaccio-htpasswd": "13.0.3" } }, "sha512-hB7LU0Et6l3zkVmGV2SBEcMLCixUR26otiJVb7CpxnU1/j8BxWNVX9/HnwG16vLwXsSICUq4Ez+qROE/GdxLgQ=="],
 
