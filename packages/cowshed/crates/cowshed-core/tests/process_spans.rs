@@ -986,24 +986,31 @@ async fn a_job_s_charged_memory_and_its_process_s_resident_memory_are_recorded_a
         job.publisher
             .record(&ended, JobSpanEdge::end(JobState::Exited, Some(&exit)));
         let health = job.publisher.health().await.unwrap();
+        let job_rows = if charged.is_some() { 2 } else { 3 };
         assert_eq!(
             (health.recorded, health.failed),
-            (u64::try_from(job.batches).unwrap() + 2, 0),
-            "{label}: the process segments and the job's two rows: {health:?}"
+            (u64::try_from(job.batches + job_rows).unwrap(), 0),
+            "{label}: process segments, job edges and any unattributed row: {health:?}"
         );
 
         // The job span: its end row states the source's pair, or nothing.
         let jobs = sealed_segments_among_kinds(&telemetry, "job-");
-        assert_eq!(jobs.len(), 2);
+        assert_eq!(jobs.len(), job_rows);
         let cells = |batch: &RecordBatch| {
             (
                 number_cell::<UInt64Type>(batch, "charged_memory_current_bytes", 0),
                 number_cell::<UInt64Type>(batch, "charged_memory_peak_bytes", 0),
             )
         };
-        assert_eq!(cells(&jobs[0].1), (None, None), "{label}: the start row");
+        for (_, batch) in &jobs[..job_rows - 1] {
+            assert_eq!(
+                cells(batch),
+                (None, None),
+                "{label}: only the end row is charged"
+            );
+        }
         assert_eq!(
-            cells(&jobs[1].1),
+            cells(&jobs[job_rows - 1].1),
             charged.map_or((None, None), |(current, peak)| (Some(current), Some(peak))),
             "{label}: the end row"
         );
@@ -1029,7 +1036,7 @@ async fn a_job_s_charged_memory_and_its_process_s_resident_memory_are_recorded_a
         }
         let thread = job.thread();
         assert_eq!(
-            number_cell::<UInt64Type>(&jobs[1].1, "thread_id", 0),
+            number_cell::<UInt64Type>(&jobs[job_rows - 1].1, "thread_id", 0),
             Some(thread)
         );
         assert!(
