@@ -159,12 +159,13 @@ Cargo's shared mutable build directory before the bounded runner, even if that d
 successful run. Cargo's own incremental cache avoids recompiling unchanged code. Nx never restores or collects shared
 Cargo build directories; lint and test **results**, and dedicated Wasm/N-API **outputs**, remain cacheable.
 
-Validation inputs include the crate's files, local dependency closure, governing manifests and configuration, the
-declared toolchain pin, and the toolchain's own reported versions. The pin is `devenv.lock`, hashed as an ordinary file
-input at both `{workspaceRoot}/devenv.lock` and `{workspaceRoot}/tooling/direnv/devenv.lock` — devenv resolves it into
-the rustc, cargo, linker, C toolchain and SDK every cargo command inherits, so bumping it invalidates every cached cargo
-target. Workspace test runners additionally hash all workspace member manifests because those affect unified features,
-and the nextest executable/configuration.
+Validation inputs include the crate's files, every file its sources compile in through a literal `include_str!` or
+`include_bytes!` path outside the crate's directory (a shipped skill or a shared corpus beside the crates), local
+dependency closure, governing manifests and configuration, the declared toolchain pin, and the toolchain's own reported
+versions. The pin is `devenv.lock`, hashed as an ordinary file input at both `{workspaceRoot}/devenv.lock` and
+`{workspaceRoot}/tooling/direnv/devenv.lock` — devenv resolves it into the rustc, cargo, linker, C toolchain and SDK
+every cargo command inherits, so bumping it invalidates every cached cargo target. Workspace test runners additionally
+hash all workspace member manifests because those affect unified features, and the nextest executable/configuration.
 
 Nothing machine-local takes part. The ambient cargo environment and the global `$CARGO_HOME/config.toml` are
 deliberately not hashed: their values carry absolute store paths and per-checkout state directories, which would make
