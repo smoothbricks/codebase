@@ -1,3 +1,4 @@
+/* biome-ignore-all lint/suspicious/noTemplateCurlyInString: Shell probes are literal shell text. */
 import { afterEach, describe, expect, it } from 'bun:test';
 import { runResult } from './run.js';
 
