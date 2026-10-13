@@ -44,8 +44,8 @@ use super::supervisor::{
 use crate::api::dto::{ExitStatus, JobId, Sha256Digest};
 use crate::error::{CowshedError, Result};
 use crate::exec::{ExecError, SANDBOX_EXEC, classify_spawn_error, prepare_child_descriptors};
-use cowshed_os::fork_lock::Spawn as _;
 use crate::storage::job_artifact::StreamKind;
+use cowshed_os::fork_lock::Spawn as _;
 
 /// Everything that makes one warm shell interchangeable with another: the same profile (mode
 /// and grants), the same sandbox environment, the same `.envrc` or none, the same host program.

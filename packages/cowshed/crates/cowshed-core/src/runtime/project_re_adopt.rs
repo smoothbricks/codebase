@@ -12,12 +12,11 @@ use std::path::{Path, PathBuf};
 
 use super::{StorageProjectRuntimeHost, close_checkout_nx, main_name, native_integrity_error};
 use super::{WorkspaceSnapshot, native_staged_error, native_storage_error};
-use crate::runtime::storage_host::RuntimeStorageHost;
 use crate::api::dto::AdoptOptions;
 use crate::build_volume::BuildVolumeId;
 use crate::error::{CowshedError, ErrorCode, Result};
-use cowshed_apfs::image::IMAGE_EXTENSION;
 use crate::metadata::WorkspaceName;
+use crate::runtime::storage_host::RuntimeStorageHost;
 use crate::storage::apfs::COMPANION_SUFFIX;
 use crate::storage::lifecycle::AdoptHandoff;
 use crate::storage::recovery::{
@@ -25,6 +24,7 @@ use crate::storage::recovery::{
     ReAdoptEmptyBuild, ReAdoptImage, ReAdoptKeptBuild, ReAdoptMain, ReAdoptMissingMain,
     ReAdoptRetained, ReAdoptSource, STAGING_NAMESPACE,
 };
+use cowshed_apfs::image::IMAGE_EXTENSION;
 
 impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
     /// Re-adopt main: gate, record, then run the replacement (step 1 of the spec, then 2-5).

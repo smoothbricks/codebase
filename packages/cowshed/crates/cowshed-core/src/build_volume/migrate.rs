@@ -13,9 +13,9 @@ use super::{
     DisplacedBuildStateFinding, TrackedBuildStateRefusal, discard, link, nx, tracked_source,
 };
 use crate::capabilities::BuildStatePath;
-use cowshed_apfs::image::ImageCapacity;
 use crate::runtime::storage_host::RuntimeStorageHost;
 use crate::{CowshedError, Result};
+use cowshed_apfs::image::ImageCapacity;
 
 pub struct FirstTouch<'a> {
     pub checkout: &'a Path,

@@ -16,9 +16,6 @@ use cowshed_core::api::{
 #[cfg(target_os = "macos")]
 use cowshed_core::api::{JobLeafAttribution, ProcessCoverage, ProcessCoverageGap};
 use cowshed_core::error::{AdmissionField, AdmissionRefusal, CowshedError, ErrorCode, Result};
-#[cfg(target_os = "macos")]
-use cowshed_os::fork_lock::Run as _;
-use cowshed_os::fork_lock::Spawn as _;
 use cowshed_core::metadata::{PortBlock, WorkspaceIncarnation, WorkspaceName};
 use cowshed_core::repository::{OwnedRepoIds, RepoId};
 use cowshed_core::runtime::job_groups::Birth;
@@ -28,6 +25,9 @@ use cowshed_core::storage::job_artifact::{
     AdmissionLookup, ArtifactConfig, ArtifactStore, FIRST_KEYED_LAYOUT, JobAdmission, JobEnding,
     StreamKind,
 };
+#[cfg(target_os = "macos")]
+use cowshed_os::fork_lock::Run as _;
+use cowshed_os::fork_lock::Spawn as _;
 use tokio::sync::mpsc;
 
 use cowshed_core::runtime::supervisor::{

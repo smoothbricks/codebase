@@ -24,8 +24,8 @@ use std::process::Command;
 
 use crate::capabilities::cache::SharedToolHome;
 use crate::capabilities::{bun, cargo, go, gradle, nix, npm, pnpm, sccache, uv, zig};
-use cowshed_os::fork_lock::Run as _;
 use crate::storage::bootstrap::VOLUME_MARKER_FILE;
+use cowshed_os::fork_lock::Run as _;
 
 /// The suffix of a copy that is not yet published: `.<name>.cowshed-retiring` beside `<name>`.
 pub const STAGING_SUFFIX: &str = ".cowshed-retiring";

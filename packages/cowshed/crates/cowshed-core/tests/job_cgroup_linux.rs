@@ -28,12 +28,12 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 use cowshed_core::api::dto::JobId;
-use cowshed_os::fork_lock::{Run as _, Spawn as _};
 use cowshed_core::metadata::WorkspaceIncarnation;
 use cowshed_core::runtime::job_cgroup::{
     CGROUP_MOUNT, CONTROLLER_LEAF, CgroupAuthority, CgroupError, IncarnationCgroups, JobCgroup,
     JobCgroupIdentity,
 };
+use cowshed_os::fork_lock::{Run as _, Spawn as _};
 use serde::{Deserialize, Serialize};
 
 const ROLE: &str = "COWSHED_JOB_CGROUP_ROLE";

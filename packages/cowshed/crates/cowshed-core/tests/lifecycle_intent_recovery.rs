@@ -5,12 +5,12 @@ use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cowshed_core::api::{AdoptOptions, CreateOptions, RemoveOptions, RemoveReport};
-use cowshed_os::fork_lock::{Run as _, Spawn as _};
 use cowshed_core::metadata::{WorkspaceIncarnation, WorkspaceName};
 use cowshed_core::storage::recovery::{
     IntentLease, LIFECYCLE_INTENTS_FILE, LifecycleIntent, LifecycleIntentCompletion,
     LifecycleIntentJournal, LifecycleIntentPhase,
 };
+use cowshed_os::fork_lock::{Run as _, Spawn as _};
 
 const CHILD_MODE: &str = "COWSHED_LIFECYCLE_CRASH_CHILD";
 const CHILD_ROOT: &str = "COWSHED_LIFECYCLE_CRASH_ROOT";

@@ -2,8 +2,8 @@ use super::{
     CapabilityContribution, CapabilityGrant, CapabilityId, DetectionContext, Detector, EnvAction,
     GrantAccess, GrantScope,
 };
-use cowshed_gateway_types::STORE_ROOT;
 use crate::{CowshedError, Result};
+use cowshed_gateway_types::STORE_ROOT;
 use std::path::{Path, PathBuf};
 
 pub const DETECTOR: Detector = Detector {

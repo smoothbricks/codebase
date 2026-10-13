@@ -4,9 +4,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 
-use cowshed_os::fork_lock::Spawn as _;
 use crate::repository::is_lexically_canonical;
 use crate::sandbox::{SandboxConfig, SandboxError, SandboxProfileRole, seatbelt_profile};
+use cowshed_os::fork_lock::Spawn as _;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "macos")]

@@ -16,8 +16,8 @@ use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use super::ApfsStorageError;
-use cowshed_apfs::SECTOR_BYTES;
 use crate::storage::lifecycle::ExtentCount;
+use cowshed_apfs::SECTOR_BYTES;
 
 /// The rewrite's read/write unit: large enough that the allocator lays each write out as one run,
 /// small enough to stay one reusable buffer.

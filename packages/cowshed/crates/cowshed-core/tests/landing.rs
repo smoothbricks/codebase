@@ -16,8 +16,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use cowshed_core::api::{LandingCommits, WorkspaceLanding};
-use cowshed_os::fork_lock::Run as _;
 use cowshed_core::landing::{measure, resolve_target};
+use cowshed_os::fork_lock::Run as _;
 
 #[path = "support/temp_root.rs"]
 mod temp_root;

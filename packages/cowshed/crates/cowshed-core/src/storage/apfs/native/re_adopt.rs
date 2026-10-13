@@ -11,17 +11,17 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use super::{MacOsApfsExecutionHost, allocated_file_bytes, io_error, sync_parent_path};
-use cowshed_apfs::{ApfsBackend, CommandRunner, DetachIntent, MountAccess, RetainedInput};
 use crate::build_volume::{
     BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord, BuildVolumeRole, RECORD_SUFFIX,
     ReleaseClaim,
 };
-use cowshed_apfs::image::ImageCapacity;
 use crate::metadata::append_suffix;
 use crate::storage::apfs::{ApfsExecutionHost, ApfsStorageError, COMPANION_SUFFIX};
 use crate::storage::recovery::{
     MissingMainBuild, ReAdoptBuild, ReAdoptEmptyBuild, ReAdoptMain, ReAdoptSource,
 };
+use cowshed_apfs::image::ImageCapacity;
+use cowshed_apfs::{ApfsBackend, CommandRunner, DetachIntent, MountAccess, RetainedInput};
 
 /// The files beside a workspace image: its grants sidecar and its CA companion.
 const MAIN_COMPANION_SUFFIXES: [&str; 2] =
@@ -895,16 +895,16 @@ fn replacement_published(
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
-    use cowshed_apfs::{
-        AttachedDiskImage, CommandOutput, CommandRequest, CommandRunError, CommandRunFailure,
-    };
-    use cowshed_os::fork_lock::Fenced;
     use crate::metadata::{WorkspaceIncarnation, WorkspaceName};
     use crate::storage::StorageLayout;
     use crate::storage::apfs::ApfsSubstrateConfig;
     use crate::storage::recovery::{
         ReAdoptKeptBuild, ReAdoptMissingMain, preserved_checkout, re_adopt_tests::Fixture,
     };
+    use cowshed_apfs::{
+        AttachedDiskImage, CommandOutput, CommandRequest, CommandRunError, CommandRunFailure,
+    };
+    use cowshed_os::fork_lock::Fenced;
 
     struct RefuseFirstMount {
         layout: BuildVolumeLayout,

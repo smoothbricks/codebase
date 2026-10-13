@@ -28,8 +28,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cowshed_gateway_types::{DiskClass, DiskLeaseAnswer, DiskLeaseRequest, LeaseState};
 
-use crate::{DISK_CHILD_DEADLINE, HDIUTIL, MOUNT_APFS, NEWFS_APFS, UMOUNT};
 use crate::device::DISKUTIL;
+use crate::{DISK_CHILD_DEADLINE, HDIUTIL, MOUNT_APFS, NEWFS_APFS, UMOUNT};
 
 /// Classify disk-changing commands, not cosmetic labels. `diskutil renameVolume` changes
 /// neither the mount table nor st_dev; concurrent renames did not slow five attach or

@@ -19,7 +19,6 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use cowshed_core::checkout::CheckoutRecord;
-use cowshed_os::fork_lock::Run as _;
 use cowshed_core::git::{GitRepository, MainRemote, MergeDriverState};
 use cowshed_core::metadata::{
     DetachedWorkspaceMetadata, MARKER_VERSION, Platform, PortBlock, PublicationState,
@@ -28,6 +27,7 @@ use cowshed_core::metadata::{
 };
 use cowshed_core::repository::RepoId;
 use cowshed_core::storage::WORKSPACE_MARKER_PATH;
+use cowshed_os::fork_lock::Run as _;
 
 const INCARNATION: &str = "0198f2c0b7e34dc795f17b238b331c80";
 

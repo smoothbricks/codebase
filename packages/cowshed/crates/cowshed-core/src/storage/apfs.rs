@@ -9,12 +9,10 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use thiserror::Error;
 
-use cowshed_apfs::{ApfsError, DetachIntent, MountAccess, timed_apfs_step};
-use cowshed_apfs::image::{IMAGE_EXTENSION, ImageCapacity};
-use crate::metadata::{
-    WorkspaceIncarnation, WorkspaceName, WorkspaceRole,
-};
+use crate::metadata::{WorkspaceIncarnation, WorkspaceName, WorkspaceRole};
 use crate::repository::{OwnedRepoIds, RepoId};
+use cowshed_apfs::image::{IMAGE_EXTENSION, ImageCapacity};
+use cowshed_apfs::{ApfsError, DetachIntent, MountAccess, timed_apfs_step};
 use cowshed_os::timing::timed_async;
 
 use super::lifecycle::{
@@ -822,9 +820,21 @@ impl From<cowshed_apfs::store_lock::StoreLockError> for ApfsStorageError {
         match error {
             StoreLockError::EscapesStoreRoot => Self::Layout(StorageLayoutError::EscapesStoreRoot),
             StoreLockError::InvalidPath(reason) => Self::InvalidPlan(reason),
-            StoreLockError::Nul(path) => Self::Host(format!("controller path contains NUL: {}", path.display())),
-            StoreLockError::SymlinkComponent(path) => Self::Layout(StorageLayoutError::SymlinkComponent(path)),
-            StoreLockError::Io { operation, path, source } => Self::Io { operation, path, source },
+            StoreLockError::Nul(path) => {
+                Self::Host(format!("controller path contains NUL: {}", path.display()))
+            }
+            StoreLockError::SymlinkComponent(path) => {
+                Self::Layout(StorageLayoutError::SymlinkComponent(path))
+            }
+            StoreLockError::Io {
+                operation,
+                path,
+                source,
+            } => Self::Io {
+                operation,
+                path,
+                source,
+            },
         }
     }
 }
@@ -835,9 +845,21 @@ impl From<cowshed_apfs::template::TemplateError> for ApfsStorageError {
         match error {
             TemplateError::Apfs(error) => error.into(),
             TemplateError::Lock(error) => error.into(),
-            TemplateError::Io { operation, path, source } => Self::Io { operation, path, source },
+            TemplateError::Io {
+                operation,
+                path,
+                source,
+            } => Self::Io {
+                operation,
+                path,
+                source,
+            },
             TemplateError::InvalidPlan(reason) => Self::InvalidPlan(reason),
-            TemplateError::Cleanup { operation, primary, cleanup } => Self::Cleanup {
+            TemplateError::Cleanup {
+                operation,
+                primary,
+                cleanup,
+            } => Self::Cleanup {
                 operation,
                 primary: Box::new((*primary).into()),
                 cleanup: Box::new((*cleanup).into()),

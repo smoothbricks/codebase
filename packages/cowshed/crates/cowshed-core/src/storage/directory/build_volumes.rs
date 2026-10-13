@@ -15,19 +15,19 @@ use super::{
     DirectoryExecutionHost, MountPointState, bind, host_error, mount_point_state, observed_mount,
     observed_payload_root, remove_payload_tree, unbind, unsupported,
 };
-use cowshed_os::process::Holder;
 use crate::build_volume::{
     BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord, BuildVolumeRole, LinkResolution,
     ReleaseClaim, link,
 };
-use cowshed_apfs::image::ImageCapacity;
 use crate::metadata::{WorkspaceIncarnation, WorkspaceName};
+use crate::storage::apfs::ApfsStorageError;
 use crate::storage::apfs::native::{
     BuildVolumeClaim, BuildVolumeRefusal, BuildVolumeRelease, io_error, path_exists,
     sync_parent_path,
 };
-use crate::storage::apfs::ApfsStorageError;
 use crate::storage::lifecycle::ResizeOutcome;
+use cowshed_apfs::image::ImageCapacity;
+use cowshed_os::process::Holder;
 
 /// The record beside a build volume of the write instant it holds everything up to
 /// (`mark_seed_written`). It speaks only while the tree is unchanged since it was written.
@@ -251,7 +251,13 @@ impl DirectoryExecutionHost {
         let mark_metadata = match fs::symlink_metadata(&mark) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(clock),
-            Err(error) => return Err(io_error("inspect a build volume's written mark", &mark, error)),
+            Err(error) => {
+                return Err(io_error(
+                    "inspect a build volume's written mark",
+                    &mark,
+                    error,
+                ));
+            }
         };
         if clock > change_time(&mark_metadata) {
             return Ok(clock);
@@ -275,9 +281,11 @@ impl DirectoryExecutionHost {
     ) -> Result<(), ApfsStorageError> {
         let image = layout.image(seed);
         self.require_store_image(&image)?;
-        let since_epoch = written.duration_since(SystemTime::UNIX_EPOCH).map_err(|_| {
-            ApfsStorageError::InvalidPlan("build volume write instant precedes the epoch")
-        })?;
+        let since_epoch = written
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_err(|_| {
+                ApfsStorageError::InvalidPlan("build volume write instant precedes the epoch")
+            })?;
         let mark = written_mark_path(&image);
         crate::metadata::write_json(
             &mark,

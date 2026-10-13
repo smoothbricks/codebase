@@ -4,12 +4,12 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use cowshed_os::fork_lock::Run as _;
 use cowshed_core::git::{git_command_at, sandboxed_git_command_at};
 use cowshed_core::metadata::PortBlock;
 use cowshed_core::sandbox::{
     RunSandboxMode, SandboxConfig, SandboxGrants, SandboxProfileRole, seatbelt_profile,
 };
+use cowshed_os::fork_lock::Run as _;
 
 fn git(root: &Path, args: &[&str]) {
     let output = git_command_at(root)

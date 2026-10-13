@@ -34,8 +34,6 @@ use crate::exec::{
     ExecError, SandboxExecRequest, SpawnPlan, classify_spawn_error, plan_exec_under,
     prepare_child_descriptors,
 };
-use cowshed_os::fork_lock::Spawn as _;
-use cowshed_os::fsio::AnchoredDirectory;
 use crate::metadata::{WorkspaceIncarnation, WorkspaceName, WorkspaceRole};
 use crate::repository::{OwnedRepoIds, RepoId};
 use crate::sandbox::{
@@ -46,6 +44,8 @@ use crate::storage::apfs::Labelled;
 use crate::storage::audit::AuditSinkError;
 use crate::workspace_environment::{PORT_BASE_ENV, PORT_BLOCK_SIZE_ENV, WORKSPACE_TOKEN_ENV};
 use cowshed_gateway_types::WorkspaceToken;
+use cowshed_os::fork_lock::Spawn as _;
+use cowshed_os::fsio::AnchoredDirectory;
 
 use crate::runtime::job_groups::Birth;
 use crate::runtime::job_progress::{JobProgressStream, ProgressRead};
@@ -631,8 +631,8 @@ pub trait ArtifactSink: Send {
     fn sealed(&self, job_id: JobId) -> Option<SealedJob>;
 }
 
-pub use cowshed_os::process::ProcessStatus;
 pub use crate::storage::audit::CommitmentDraft;
+pub use cowshed_os::process::ProcessStatus;
 
 /// Where a supervisor sends its audit records. Recording is best effort by contract: the act a
 /// record describes has already happened, and a sink that cannot write is a `doctor` finding
@@ -5967,9 +5967,9 @@ fn label_report(
 mod workspace_toolchain_tests {
     use super::*;
     #[cfg(target_os = "macos")]
-    use cowshed_os::fork_lock::Run as _;
-    #[cfg(target_os = "macos")]
     use crate::sandbox::{RunSandboxMode, SandboxConfig, SandboxGrants};
+    #[cfg(target_os = "macos")]
+    use cowshed_os::fork_lock::Run as _;
 
     // Only macOS tests build a sandbox; on the Linux cross lint the helper would be dead code.
     // The mount root is a sibling of the fixture's home and stores, as it is on a host: its deny

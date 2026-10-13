@@ -203,11 +203,7 @@ impl AnchoredDirectory {
 
     /// Both names resolve against this held parent; an existing destination is never replaced.
     #[cfg(target_os = "macos")]
-    pub fn rename_child_noreplace(
-        &self,
-        source: &CStr,
-        destination: &CStr,
-    ) -> io::Result<()> {
+    pub fn rename_child_noreplace(&self, source: &CStr, destination: &CStr) -> io::Result<()> {
         validate_directory_leaf(source)?;
         validate_directory_leaf(destination)?;
         rename_noreplace(self.0.as_raw_fd(), source, destination)?;
@@ -711,10 +707,7 @@ pub fn open_directory_nofollow(path: &Path) -> io::Result<File> {
 /// Create the child directory `name` of `parent` with mode 0700, or open the one already there,
 /// refusing a symlink or a non-directory at `name`. `true` when this call created it: the parent
 /// then gained an entry its writer may have to make durable.
-pub fn open_or_create_child_directory(
-    parent: &File,
-    name: &CStr,
-) -> io::Result<(File, bool)> {
+pub fn open_or_create_child_directory(parent: &File, name: &CStr) -> io::Result<(File, bool)> {
     validate_directory_leaf(name)?;
     // SAFETY: mkdirat resolves one leaf beneath the held parent fd; both outlive the call.
     let created = if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) } == 0 {

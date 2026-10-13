@@ -52,7 +52,10 @@ fn a_mounted_payload_resolves_to_its_mountpoint_not_the_store() {
     bind(&image, &mount).unwrap();
     // The tree physically lives at the mountpoint: realpath (what getcwd, git and Seatbelt
     // see) is the mountpoint itself.
-    assert_eq!(fs::canonicalize(mount.join("src")).unwrap(), mount.join("src"));
+    assert_eq!(
+        fs::canonicalize(mount.join("src")).unwrap(),
+        mount.join("src")
+    );
     assert!(fs::symlink_metadata(&mount).unwrap().is_dir());
     assert_eq!(fs::read(mount.join("src/lib.rs")).unwrap(), SOURCE);
     // The image path is the mount record naming it.
@@ -112,7 +115,11 @@ fn a_mount_interrupted_between_its_steps_is_finished() {
     let sibling = move_sibling(&image);
     fs::rename(&image, &sibling).unwrap();
     std::os::unix::fs::symlink(&mount, &image).unwrap();
-    assert_eq!(observed_mount(&image).unwrap(), None, "a fact pass sees no mount yet");
+    assert_eq!(
+        observed_mount(&image).unwrap(),
+        None,
+        "a fact pass sees no mount yet"
+    );
 
     assert_eq!(settle(&image).unwrap(), Payload::Mounted(mount.clone()));
     assert_eq!(fs::read(mount.join("src/lib.rs")).unwrap(), SOURCE);

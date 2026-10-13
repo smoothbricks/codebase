@@ -46,7 +46,8 @@ mod tests {
 
     #[test]
     fn resource_load_matches_independent_kernel_reads() {
-        let before = cowshed_os::host_load::HostLoad::read().expect("independent getloadavg before");
+        let before =
+            cowshed_os::host_load::HostLoad::read().expect("independent getloadavg before");
         let sample = read_host_load().expect("the host reports load and cores");
         let after = cowshed_os::host_load::HostLoad::read().expect("independent getloadavg after");
         let load = sample.load1.get();
