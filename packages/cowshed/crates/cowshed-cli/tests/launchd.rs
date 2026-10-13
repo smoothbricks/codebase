@@ -9,12 +9,13 @@ use cowshed_apfs::image::ImageCapacity;
 use cowshed_cli::launchd::{
     COWSHED_BINARY_NAME, CommandStatus, ControlAction, ControlExecutionError, ControlPlan,
     ExecutableDigest, ExecutableInstallState, ExistingPlist, FilesystemOperation, GATEWAY_LABEL,
-    HostStableExecutable, InstallOutcome, InstallState, InstalledExecutable, LAUNCHCTL_EXECUTABLE,
-    LaunchAgentSpec, LaunchctlCommand, LaunchctlOutput, LaunchdError, LaunchdExecutor,
-    LaunchdFilesystem, LaunchdServiceStatus, Mutation, NativeFilesystem, PRIVATE_DIRECTORY_MODE,
-    PRIVATE_PLIST_MODE, SCCACHE_BINARY_NAME, SCCACHE_LABEL, STABLE_BINARY_MODE, ServiceLifecycle,
-    StableLink, StoreBackedProgram, plan_executable_install, plan_executable_remove, plan_install,
-    plan_remove, replace_symlink,
+    HostStableExecutable, InstallOutcome, InstallState, InstalledExecutable,
+    JOBSERVER_LAUNCHER_NAME, LAUNCHCTL_EXECUTABLE, LaunchAgentSpec, LaunchctlCommand,
+    LaunchctlOutput, LaunchdError, LaunchdExecutor, LaunchdFilesystem, LaunchdServiceStatus,
+    Mutation, NativeFilesystem, PRIVATE_DIRECTORY_MODE, PRIVATE_PLIST_MODE, SCCACHE_BINARY_NAME,
+    SCCACHE_LABEL, STABLE_BINARY_MODE, ServiceLifecycle, StableLink, StoreBackedProgram,
+    plan_executable_install, plan_executable_remove, plan_install, plan_launcher_link, plan_remove,
+    replace_symlink,
 };
 
 #[cfg(target_os = "macos")]
@@ -1089,6 +1090,33 @@ fn current_install() -> ExecutableInstallState {
         }),
         link: StableLink::To(stored_name()),
     }
+}
+
+/// The `cargo` link beside the stable name names the same stored copy, so the
+/// managed environment's jobserver launcher is the build `cowshed setup`
+/// installed and moves with it; a link that already names it plans nothing.
+#[test]
+fn launcher_link_plan_names_the_stored_copy_beside_the_stable_name() {
+    let executable = cowshed_binary();
+    let binary_directory = PathBuf::from(BINARY_DIRECTORY);
+
+    assert_eq!(
+        plan_launcher_link(&executable, &digest(), &StableLink::Absent).operations(),
+        [
+            Mutation::CreateTemporarySymlink {
+                directory: binary_directory.clone(),
+                name_prefix: format!(".{JOBSERVER_LAUNCHER_NAME}.link."),
+                target: stored_name(),
+            },
+            Mutation::RenameTemporaryFile {
+                destination: binary_directory.join(JOBSERVER_LAUNCHER_NAME),
+            },
+            Mutation::SyncDirectory {
+                path: binary_directory,
+            },
+        ]
+    );
+    assert!(plan_launcher_link(&executable, &digest(), &StableLink::To(stored_name())).is_noop());
 }
 
 /// A copy of the build is stored once under the name its bytes give it, and the stable name moves

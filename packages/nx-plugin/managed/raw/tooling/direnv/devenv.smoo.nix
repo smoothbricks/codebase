@@ -535,7 +535,9 @@ in {
     #    use, so a hook and a shell resolve one binary the same way. The Rust
     #    toolchain's store bin then goes ahead of all of it (rustToolchainBin
     #    above): the same files the profile links, named by a path no checkout
-    #    owns.
+    #    owns. Ahead of even that goes the installed cowshed's bin, whose
+    #    `cargo` link is the jobserver launcher, so the budget reaches builds
+    #    no Nx executor started.
     # 3. ttsc drives the native TypeScript 7 binary while Nx imports the TypeScript
     #    6 API, so the two must be named separately.
     # 4. ttsc caches in the checkout's .cache/ttsc (the path the CI ttsc-plugin
@@ -623,6 +625,12 @@ in {
       fi
       export PATH="$("$PWD/tooling/direnv/repo-path")"
       export PATH="${rustToolchainBin}:$PATH"
+      # The installed cowshed's bin goes ahead of the toolchain's: its `cargo`
+      # is the jobserver launcher for the build the host runs (03_caches.md),
+      # and it must win over every directory that can hold a real cargo. The
+      # link exists only after `cowshed setup` from a build that has it;
+      # absent, the name falls through to the toolchain's cargo unchanged.
+      export PATH="$HOME/Library/Application Support/dev.cowshed/bin:$PATH"
       # devenv enters the shell with TMPDIR unset (not empty) on every platform.
       # Tools then fall back to /tmp, which on Darwin is not the per-user
       # temporary directory the OS hands out, and a test that asserts the

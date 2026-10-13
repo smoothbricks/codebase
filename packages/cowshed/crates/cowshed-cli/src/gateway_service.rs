@@ -2,11 +2,11 @@ use crate::args::GatewayCommand;
 use crate::build_record::{BuildRecord, downgrade_refusal, is_downgrade};
 use crate::launchd::{
     COWSHED_BINARY_NAME, ExecutableDigest, ExecutableInstallState, ExistingPlist, GATEWAY_LABEL,
-    HostStableExecutable, InstallOutcome, InstallState, InstalledExecutable, LaunchAgentSpec,
-    LaunchAgentTarget, LaunchctlCommand, LaunchdExecutor, LaunchdFilesystem, LaunchdServiceStatus,
-    NativeFilesystem, NativeLaunchctlCommand, PRIVATE_DIRECTORY_MODE, RemovalOutcome, StableLink,
-    kickstart_hint, plan_executable_install, plan_executable_remove, plan_install, plan_remove,
-    replace_symlink,
+    HostStableExecutable, InstallOutcome, InstallState, InstalledExecutable,
+    JOBSERVER_LAUNCHER_NAME, LaunchAgentSpec, LaunchAgentTarget, LaunchctlCommand, LaunchdExecutor,
+    LaunchdFilesystem, LaunchdServiceStatus, NativeFilesystem, NativeLaunchctlCommand,
+    PRIVATE_DIRECTORY_MODE, RemovalOutcome, StableLink, kickstart_hint, plan_executable_install,
+    plan_executable_remove, plan_install, plan_launcher_link, plan_remove, replace_symlink,
 };
 use crate::output::Output;
 use crate::path_entry::PathEntryOutcome;
@@ -752,10 +752,14 @@ pub fn remove_host_stable_executable(executable: &HostStableExecutable) -> Resul
 }
 
 /// Everything an install of cowshed leaves in the host-stable directory, in the order to remove
-/// it: the stable name, so nothing launchd could start dangles, then each stored copy and the
-/// build record beside it.
+/// it: the links (the jobserver launcher's, then the stable name, so nothing launchd could start
+/// dangles), then each stored copy and the build record beside it.
 pub(crate) fn installed_files(executable: &HostStableExecutable) -> Result<Vec<PathBuf>> {
     let mut present = Vec::new();
+    let launcher = executable.directory().join(JOBSERVER_LAUNCHER_NAME);
+    if inspect_existing(&launcher)?.is_some() {
+        present.push(launcher);
+    }
     if inspect_existing(executable.path())?.is_some() {
         present.push(executable.path().to_path_buf());
     }
@@ -1268,7 +1272,43 @@ where
     executor
         .execute_install(&plan_executable_install(executable, digest, source, &state))
         .map_err(launchd_error)?;
+    // The same build under the launcher's name, beside the stable name.
+    let launcher = observe_launcher_link(executable)?;
+    executor
+        .execute_install(&plan_launcher_link(executable, digest, &launcher))
+        .map_err(launchd_error)?;
     Ok(())
+}
+
+/// What the `cargo` link beside the stable name currently is.
+fn observe_launcher_link(executable: &HostStableExecutable) -> Result<StableLink> {
+    let path = executable.directory().join(JOBSERVER_LAUNCHER_NAME);
+    match inspect_existing(&path)? {
+        None => Ok(StableLink::Absent),
+        Some(metadata) if metadata.uid() != effective_uid() => Err(CowshedError::integrity(
+            format!(
+                "the installed {JOBSERVER_LAUNCHER_NAME} launcher is not owned by this user: {}",
+                path.display()
+            ),
+            "remove it and rerun the service start command",
+        )),
+        Some(metadata) if metadata.file_type().is_symlink() => {
+            Ok(StableLink::To(fs::read_link(&path).map_err(|error| {
+                CowshedError::internal(format!(
+                    "could not read the link {}: {error}",
+                    path.display()
+                ))
+            })?))
+        }
+        Some(metadata) if metadata.is_file() => Ok(StableLink::Foreign),
+        Some(_) => Err(CowshedError::integrity(
+            format!(
+                "the installed {JOBSERVER_LAUNCHER_NAME} launcher is not a regular file or a link: {}",
+                path.display()
+            ),
+            "remove it and rerun the service start command",
+        )),
+    }
 }
 
 /// Where the provenance of the installed cowshed is written down.
